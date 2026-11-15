@@ -9,6 +9,7 @@ from process import provider_directory_profile_initial as initial
 from process import provider_directory_profile_initial_contract as initial_contract
 from process import provider_directory_profile_selection as selection
 from process import provider_directory_profile_selection_contract as contract
+from process.provider_directory_profile_capacity_geometry_contract import validated_capacity_targets
 
 
 def _stale(fhir, reason):
@@ -58,6 +59,17 @@ async def _historical_common(fhir, schema, generation_id, *, publication_xid=Non
     return result_by_field
 
 
+def _expected_profile_targets(fhir, profile, delta):
+    """Named receipts record qualified targets; receipts stored before the upgrade keep their recorded fields."""
+    if "evidence_target" in profile:
+        targets = validated_capacity_targets(delta.get("targets") or fhir._json_object(delta.get("targets_json")))
+        return {
+            role + "_target": {"schema_name": coordinate["schema"], "relation_name": coordinate["name"]}
+            for role, coordinate in targets.items()
+        }
+    return {"evidence_target_oid": delta["evidence_target_oid"], "profile_target_oid": delta["profile_target_oid"]}
+
+
 def _assert_common_execution(fhir, execution, delta, receipt):
     """Match historical native fields and exact source pins to the authenticated delta."""
     attestation, payload_by_field = execution.attestation, receipt["payload"]
@@ -78,12 +90,11 @@ def _assert_common_execution(fhir, execution, delta, receipt):
             "authority_revision",
             "profile_as_of",
             "executable_plan_hash",
-            "evidence_target_oid",
-            "profile_target_oid",
             "evidence_rows",
             "profile_rows",
         )
     }
+    expected_profile_by_field.update(_expected_profile_targets(fhir, payload_by_field["profile"], delta))
     expected_profile_by_field.update(
         status="purged" if attestation.operation == "purge" else "published",
         profile_schema_version=attestation.profile_schema_version,
@@ -117,20 +128,6 @@ def _assert_common_execution(fhir, execution, delta, receipt):
     if payload_by_field["cms"]["proof_version"] != 2:
         raise _stale(fhir, "coverage_version_changed")
     return source_pairs
-
-
-async def _assert_database(fhir, lease):
-    """Check cluster/database authority without requiring superseded relation OIDs to survive."""
-    row = await fhir.db.first(
-        "SELECT c.system_identifier::text AS database_system_identifier, "
-        "d.oid::bigint AS database_oid,d.datname::text AS database_name "
-        "FROM pg_database d CROSS JOIN pg_control_system() c WHERE d.datname=current_database();"
-    )
-    expected_by_field = {
-        key: getattr(lease, key) for key in ("database_system_identifier", "database_oid", "database_name")
-    }
-    if row is None or dict(fhir._pagination_checkpoint_row_mapping(row)) != expected_by_field:
-        raise _stale(fhir, "database_changed")
 
 
 async def _replay(fhir, execution, run_id, metrics):
@@ -168,14 +165,11 @@ async def _replay(fhir, execution, run_id, metrics):
     await fhir._assert_replay_owner(schema, owner, run_id)
     geometry, lease = fhir._replay_capacity_artifacts(consumption, delta, execution)
     fhir._assert_replay_timeline(consumption, delta, lease)
-    await _assert_database(fhir, lease)
     source_pairs = _assert_common_execution(fhir, execution, delta, receipt)
     serving = SimpleNamespace(
         generation_id=delta["generation_id"], profile_as_of=delta["profile_as_of"], source_vector=source_pairs
     )
-    profile = fhir._provider_directory_profile_replay_metrics(
-        delta, serving, geometry, lease, owner, run_id
-    )
+    profile = fhir._provider_directory_profile_replay_metrics(delta, serving, geometry, lease, owner, run_id)
     return _result(fhir, execution, metrics, profile, receipt)
 
 

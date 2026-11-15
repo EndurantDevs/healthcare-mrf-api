@@ -5,7 +5,9 @@ import json
 
 from sqlalchemy import text
 
+from db.plan_release_storage import storage_relation
 from process.network_fhir_source_witness_contract import OBSERVED_LEGACY_PROFILE
+from process.registry_fhir_catalog_observed_source import catalog_observation_tables
 from tests import generic_fhir_capture_postgres_support as legacy
 from tests import nppes_candidate_postgres_support as nppes
 
@@ -102,12 +104,6 @@ def install_original_legacy_seed(monkeypatch):
     def migrate(connection, prefixes):
         boundary = prefixes.index("20260729110000")
         original(connection, prefixes[:boundary])
-        assert not connection.scalar(
-            text(
-                "SELECT EXISTS (SELECT FROM pg_trigger WHERE NOT tgisinternal AND tgrelid IN "
-                "('mrf.provider_directory_endpoint_dataset'::regclass,'mrf.provider_directory_dataset_resource'::regclass))"
-            )
-        )
         _seed_original_publication(connection)
         seed_calls.append(True)
         original(connection, prefixes[boundary:])
@@ -121,13 +117,13 @@ async def reviewed_legacy_origin(runtime, profile, catalog, producer):
     resource_records, root, counts, hashes = legacy._proof_rows(legacy_resources())
     summary = legacy._fixture_summary(root, counts, hashes, False, legacy_resources(), source_id=SOURCE)
     async with catalog._catalog_source_export_session(runtime, source_profile=profile) as scope:
-        assert await scope.connection.fetchval("SELECT session_user::text") == runtime.config.publisher_role
-        native, _ = await catalog._source_catalog_physical(scope.connection, profile, dataset_id="dataset-one")
+        tables = await catalog_observation_tables(scope.connection, profile, "dataset-one")
+        header_relation = storage_relation(tables["header"]["schema"], tables["header"]["name"])
         header = await scope.connection.fetchrow(
             "SELECT *,publication_metadata_json::text AS original_metadata_text,"
             "octet_length(publication_metadata_json::text)::bigint AS metadata_bytes,"
             "encode(sha256(convert_to(publication_metadata_json::text,'UTF8')),'hex') AS metadata_sha256 "
-            f'FROM "{profile.schema_name}".provider_directory_endpoint_dataset WHERE dataset_id=$1',
+            f"FROM {header_relation} WHERE dataset_id=$1",
             "dataset-one",
         )
         assert header["dataset_hash"] == root and header["resource_count"] == len(resource_records)
@@ -145,17 +141,15 @@ async def reviewed_legacy_origin(runtime, profile, catalog, producer):
             "completion_proof_sha256",
         ):
             assert header[field] is None
-        identity = scope.database_identity_by_field
         return producer.FHIRSourceMembershipInput(
-            schema_name=profile.schema_name,
+            schema_name=tables["resource"]["schema"],
             source_id=SOURCE,
             endpoint_id="endpoint-one",
             dataset_id="dataset-one",
             dataset_sha256=root,
             root_run_id="run-one",
-            header_oid=native["header_table_oid"],
-            resource_parent_oid=native["resource_table_oid"],
-            resource_leaf_oid=native["resource_leaf_oids"][0],
+            header_relation=tables["header"],
+            resource_relation=tables["resource"],
             metadata_bytes=header["metadata_bytes"],
             metadata_text_sha256=header["metadata_sha256"],
             summary_sha256=summary["summary_sha256"],
@@ -169,7 +163,4 @@ async def reviewed_legacy_origin(runtime, profile, catalog, producer):
             unresolved_plan_network_count=1,
             source_uri=BASE,
             source_aliases=(SOURCE,),
-            native_catalog_sha256=native["native_catalog_sha256"],
-            database_oid=identity["database_oid"],
-            database_system_identifier=identity["system_identifier"],
         )

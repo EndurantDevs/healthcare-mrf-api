@@ -15,7 +15,7 @@ class _ServingRelationLockTimeout(TimeoutError):
     sqlstate = "55P03"
 
 
-async def lock_live_serving_relations(execute, schema, relation_names):
+async def lock_live_serving_relations(execute, schema, relation_names, *, read_only=False):
     """Drain current readers in their lock order, with one short total wait budget.
 
     Private stages and retired tables still require NOWAIT ownership checks. The
@@ -26,9 +26,17 @@ async def lock_live_serving_relations(execute, schema, relation_names):
     quoted_schema = schema.replace('"', '""')
     quoted_names = [name.replace('"', '""') for name in sorted(set(relation_names))]
     qualified_names = ", ".join(f'"{quoted_schema}"."{name}"' for name in quoted_names)
+    async with serving_relation_lock_window():
+        mode = "ACCESS SHARE" if read_only else "ACCESS EXCLUSIVE"
+        await execute(f"LOCK TABLE {qualified_names} IN {mode} MODE")
+
+
+@asynccontextmanager
+async def serving_relation_lock_window():
+    """Use the common short total wait bound for native publication locks and renames."""
     try:
         async with asyncio.timeout(0.1):
-            await execute(f"LOCK TABLE {qualified_names} IN ACCESS EXCLUSIVE MODE")
+            yield
     except TimeoutError as error:
         raise _ServingRelationLockTimeout("serving_relation_lock_timeout") from error
 
@@ -216,3 +224,44 @@ async def wait_for_publication_lock(error: Exception, attempt: int, *, max_attem
     if attempt >= max_attempts or postgres_sqlstate(error) != "55P03":
         raise error
     await asyncio.sleep(min(25 * (2 ** (attempt - 1)), 100) / 1000)
+
+
+def require_geo_candidate_stage(native, db_schema, swaps, context):
+    """Require the validated candidate name to be the main relation in this atomic swap."""
+    main_stage_names = [
+        swap.stage_cls.__tablename__
+        for swap in swaps
+        if swap.live_cls.__main_table__ == native.EntityAddressUnified.__main_table__
+    ]
+    if len(main_stage_names) != 1 or context.get("geo_assurance_candidate_relation") != {
+        "schema_name": db_schema,
+        "relation_name": main_stage_names[0],
+    }:
+        raise RuntimeError("geo assurance candidate does not match the published table and sources")
+
+
+async def activate_named_geo_candidate(native, db_schema, context):
+    """Activate the current logical geo version and record its published relation name."""
+    from process.entity_address_dependency_bindings import activate_geo_assurance_candidate
+
+    active_version = await activate_geo_assurance_candidate(native.db, db_schema)
+    if active_version is None:
+        raise RuntimeError("geo assurance candidate does not match the published table and sources")
+    context["geo_assurance_active_version"] = int(active_version)
+    context["geo_assurance_active_relation"] = {
+        "schema_name": db_schema,
+        "relation_name": native.EntityAddressUnified.__main_table__,
+    }
+
+
+async def apply_cutover_support_patches(native, patch_statements, context):
+    """Apply and account every support patch inside the existing atomic cutover transaction."""
+    for label, statement in patch_statements:
+        started = native.time.monotonic()
+        rowcount = await native.db.status(statement)
+        native._record_phase_timing(
+            context,
+            f"entity-address-unified patching support {label}",
+            native.time.monotonic() - started,
+            native._coerce_rowcount(rowcount),
+        )

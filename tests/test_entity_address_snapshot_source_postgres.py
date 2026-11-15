@@ -157,12 +157,12 @@ async def _create_selected_inputs(database):
         await database.status(f"CREATE TABLE {name} (marker text)")
     await database.status("CREATE TABLE mrf.publication (marker text)")
     await database.status("INSERT INTO mrf.publication VALUES ('old')")
-    relations = await database.all(
-        "SELECT n.nspname AS schema_name,c.relname AS relation_name,c.oid::bigint AS relation_oid,"
-        "pg_relation_filenode(c.oid)::bigint AS relfilenode "
-        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='tiger'"
-    )
-    return names, {"relations": [dict(relation._mapping) for relation in relations]}
+    inventory_by_field = {
+        "relations": [
+            {"schema_name": "tiger", "relation_name": name.split(".")[1]} for name in names if name.startswith("tiger.")
+        ]
+    }
+    return names, inventory_by_field
 
 
 @asynccontextmanager
@@ -218,7 +218,7 @@ async def _selected_inputs(monkeypatch):
 async def test_native_guard_survives_idle_timeout_and_overlaps_complete_family_locks(monkeypatch):
     async with _selected_inputs(monkeypatch) as (database, selected, names, guard_engine):
         held = dependencies._HELD_PUBLICATION_DEPENDENCIES.get()
-        assert len(selected) == 6 and len(held.relations_by_name) == 7
+        assert len(selected) == 6 and len(held.relation_names) == 7
         assert await held.session.scalar(text("SHOW idle_in_transaction_session_timeout")) == "0"
         assert await held.session.scalar(text("SHOW transaction_timeout")) == "0"
         await asyncio.sleep(2.2)
@@ -232,44 +232,43 @@ async def test_native_guard_survives_idle_timeout_and_overlaps_complete_family_l
             )
             assert owner_count == 2
             await database.status("UPDATE mrf.publication SET marker='new'")
-        assert await held.session.scalar(text("SELECT pg_backend_pid()")) == held.backend_id
+        assert await held.session.scalar(text("SELECT 1")) == 1
         assert await database.scalar("SELECT marker FROM mrf.publication") == "new"
         assert len(names) == 7
     assert dependencies._HELD_PUBLICATION_DEPENDENCIES.get() is None
 
 
+async def _disconnect_preparation_reader(observer, held):
+    """Terminate only the fixture's actual read backend, without retaining an identity token."""
+    reader_pid = await held.session.scalar(text("SELECT pg_backend_pid()"))
+    assert await observer.scalar(text("SELECT pg_terminate_backend(:pid)"), {"pid": reader_pid})
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("after_overlap", (False, True))
-async def test_native_lost_dependency_owner_prevents_publication(monkeypatch, after_overlap):
-    async with (
-        _selected_inputs(monkeypatch) as (database, _selected, _names, _engine),
-        database.engine.connect() as observer,
-    ):
-        held = dependencies._HELD_PUBLICATION_DEPENDENCIES.get()
-
-        async def terminate():
-            assert await observer.scalar(text("SELECT pg_terminate_backend(:pid)"), {"pid": held.backend_id})
-
-        if not after_overlap:
-            await terminate()
-        with pytest.raises(DBAPIError) as disconnected:
-            async with database.transaction() as cutover:
-                execute = cutover.execute
-
-                async def overlap_then_terminate(statement, *args, **kwargs):
-                    result = await execute(statement, *args, **kwargs)
-                    if str(statement).startswith("LOCK TABLE"):
-                        await terminate()
-                    return result
-
-                if after_overlap:
-                    monkeypatch.setattr(cutover, "execute", overlap_then_terminate)
+async def test_native_named_cutover_uses_its_own_locks_after_preparation_disconnect(monkeypatch, after_overlap):
+    is_completed = False
+    with pytest.raises(DBAPIError) as disconnected:
+        async with (
+            _selected_inputs(monkeypatch) as (database, _selected, _names, _engine),
+            database.engine.connect() as observer,
+        ):
+            held = dependencies._HELD_PUBLICATION_DEPENDENCIES.get()
+            if not after_overlap:
+                await _disconnect_preparation_reader(observer, held)
+            async with database.transaction():
                 await dependencies.lock_selected_publication_dependencies(database, "mrf")
+                if after_overlap:
+                    await _disconnect_preparation_reader(observer, held)
+                with pytest.raises(DBAPIError) as blocked:
+                    await observer.execute(text("LOCK TABLE tiger.captured_support IN ACCESS EXCLUSIVE MODE NOWAIT"))
+                assert blocked.value.orig.sqlstate == "55P03"
+                await observer.rollback()
                 await database.status("UPDATE mrf.publication SET marker='new'")
-        assert disconnected.value.connection_invalidated
-        assert await database.scalar("SELECT marker FROM mrf.publication") == "old"
-        # End the failed, read-only owner transaction without attempting its COMMIT.
-        await held.session.rollback()
+            assert await database.scalar("SELECT marker FROM mrf.publication") == "new"
+            is_completed = True
+    assert is_completed and disconnected.value.connection_invalidated
+    assert dependencies._HELD_PUBLICATION_DEPENDENCIES.get() is None
 
 
 @pytest.mark.asyncio
@@ -283,7 +282,7 @@ async def test_native_cutover_retains_family_locks_after_original_owner_disconne
             held = dependencies._HELD_PUBLICATION_DEPENDENCIES.get()
             async with database.transaction():
                 await dependencies.lock_selected_publication_dependencies(database, "mrf")
-                assert await observer.scalar(text("SELECT pg_terminate_backend(:pid)"), {"pid": held.backend_id})
+                await _disconnect_preparation_reader(observer, held)
                 with pytest.raises(DBAPIError) as blocked:
                     await observer.execute(text("LOCK TABLE tiger.captured_support IN ACCESS EXCLUSIVE MODE NOWAIT"))
                 assert blocked.value.orig.sqlstate == "55P03"

@@ -30,13 +30,14 @@ from process.registry_publication_ptg_runtime import RegistryPublicationSQLLimit
 from process.registry_publication_worker import (
     _BoundedPool,
     _close_pool,
+    _configured_worker_runtime,
     _custody_config_url,
     _pool_options,
+    _preparation_role_profile,
     _ptg_config,
     _PTGWorkerConfig,
-    _qualified_worker_runtime,
     _sql_limits,
-    _verify_custody_config,
+    _validate_legacy_preparation_url,
 )
 
 CONFIG_ENV = "HLTHPRT_REGISTRY_CMS_SOURCE_WORKER"
@@ -134,6 +135,7 @@ class RegistryCMSSourceWorkerConfig:
     source_endpoint_id: str | None = None
     ptg: _PTGWorkerConfig | None = field(default=None, repr=False)
     custody_url: object | None = field(default=None, repr=False)
+    preparation_roles: dict | None = field(default=None, repr=False)
 
     def __post_init__(self):
         if (
@@ -154,7 +156,8 @@ class RegistryCMSSourceWorkerConfig:
             or self.execution_url.username in {self.consumer.owner_role, self.notification_store.owner_role}
         ):
             _invalid()
-        _verify_custody_config(self)
+        _validate_legacy_preparation_url(self)
+        object.__setattr__(self, "preparation_roles", _preparation_role_profile(self))
         _identifier(self.source_schema)
         if self.source_endpoint_id is not None:
             from process.registry_cms_source_consumer import _endpoint_id
@@ -208,7 +211,9 @@ def parse_registry_cms_source_worker_config(encoded):
             "receipt_id",
             "notification_sha256",
         }
-        _object(document, required_fields, {"sql_limits", "source_endpoint_id", "ptg", "custody_dsn"})
+        _object(
+            document, required_fields, {"sql_limits", "source_endpoint_id", "ptg", "custody_dsn", "preparation_roles"}
+        )
         urls = []
         for name in ("execution_dsn", "notification_dsn"):
             dsn = document[name]
@@ -227,6 +232,7 @@ def parse_registry_cms_source_worker_config(encoded):
             document.get("source_endpoint_id"),
             _ptg_config(document["ptg"], consumer.control_schema) if "ptg" in document else None,
             custody_url=_custody_config_url(document["custody_dsn"]) if "custody_dsn" in document else None,
+            preparation_roles=document.get("preparation_roles"),
         )
     except ValueError, TypeError, KeyError, UnicodeError, RecursionError, ArgumentError, AttributeError:
         _invalid()
@@ -318,7 +324,7 @@ async def run_registry_cms_source_worker(config, *, event=None):
         async with _BoundedPool(pool, config.sql_limits.connect_timeout_seconds).acquire() as connection:
             if await _identity(connection, config, config.consumer.execution_role) != identity:
                 raise ValueError("registry_cms_source_worker_connection_invalid")
-            consumer = await _qualified_worker_runtime(config, stack, connection)
+            consumer = await _configured_worker_runtime(config, stack)
             if consumer.composition_runtime is not None:
                 await consumer.composition_runtime.qualify()
             result_by_name = await consume_registry_cms_source_notification_once(

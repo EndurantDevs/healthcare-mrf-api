@@ -29,9 +29,15 @@ def _header(values):
     }
 
 
-def _outputs(before):
+def _outputs(before, schema=None):
+    """Bind only explicit named snapshots and their complete data accounting."""
     return {
-        root: {"oid": item["native"]["oid"], "rows": item["rows"], "data_sha256": item["data_sha256"]}
+        root: {
+            "schema": item["native"].get("schema", schema),
+            "relation": item["native"]["relname"],
+            "rows": item["rows"],
+            "data_sha256": item["data_sha256"],
+        }
         for root, item in before["roots"].items()
     }
 
@@ -60,7 +66,7 @@ def capture(directory, fence, before):
             source_ids=list(dataset.verification_source_ids),
             completion_proof_cutoff=dataset.completion_proof_cutoff,
         ),
-        retained_outputs=_outputs(before),
+        retained_outputs=_outputs(before, directory._schema()),
         serving_inputs=decoded(encoded(snapshot)),
     )
 
@@ -146,22 +152,41 @@ def validate(binding_by_field, pin, *, before=None):
         == (pin["dataset_id"], pin["endpoint_id"], pin["parent_run_id"], pin["dataset_hash"]),
         "replacement_publication_changed",
     )
-    outputs = binding_by_field["retained_outputs"]
+    _validate_outputs(binding_by_field["retained_outputs"], before=before)
+
+
+def _validate_outputs(outputs, *, before=None):
+    """Check named coordinates plus full row/hash accounting; saved IDs stay opaque."""
     receipts.require(type(outputs) is dict and set(outputs) == set(receipts.ROOTS), "replacement_outputs_invalid")
-    for entry in outputs.values():
+    for root, entry in outputs.items():
+        is_legacy = isinstance(entry, dict) and set(entry) == {"oid", "rows", "data_sha256"}
         receipts.require(
-            type(entry) is dict
-            and set(entry) == {"oid", "rows", "data_sha256"}
-            and type(entry["oid"]) is int
-            and 0 < entry["oid"] < 2**32
+            isinstance(entry, dict)
+            and (is_legacy or set(entry) == {"schema", "relation", "rows", "data_sha256"})
             and type(entry["rows"]) is int
             and entry["rows"] >= 0
             and type(entry["data_sha256"]) is str
             and receipts._HASH.fullmatch(entry["data_sha256"]) is not None,
             "replacement_outputs_invalid",
         )
-    if before is not None:
-        receipts.require(outputs == _outputs(before), "replacement_output_binding_changed")
+        if not is_legacy:
+            from db.plan_release_storage import storage_identifier
+
+            receipts.require(type(entry["schema"]) is str, "replacement_outputs_invalid")
+            storage_identifier(entry["schema"])
+            receipts.require(entry["relation"] == root, "replacement_outputs_invalid")
+        if before is not None:
+            current = before["roots"][root]
+            receipts.require(
+                (entry["rows"], entry["data_sha256"]) == (current["rows"], current["data_sha256"]),
+                "replacement_output_binding_changed",
+            )
+            if not is_legacy:
+                receipts.require(
+                    entry["schema"] == current["native"].get("schema")
+                    and entry["relation"] == current["native"]["relname"],
+                    "replacement_output_binding_changed",
+                )
 
 
 async def check(directory, pin, binding_by_field, *, restored=False):

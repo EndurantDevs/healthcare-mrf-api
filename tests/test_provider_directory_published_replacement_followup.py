@@ -15,7 +15,7 @@ def test_serving_peer_inputs_cannot_borrow_an_unrelated_preparation_scope():
 
     pin = preparation.ProviderDirectoryAddressDatasetPin("peer", "endpoint", "dataset", "a" * 64, "root")
     inputs = preparation.ProviderDirectoryAddressPreparationInput(
-        (pin,), "overlay_next", 1, 0, ordinary_serving_peer_pins=(pin,)
+        (pin,), "overlay_next", 0, ordinary_serving_peer_pins=(pin,)
     )
     with pytest.raises(ValueError, match="replacement_inputs_"):
         preparation.validate_preparation_input(inputs)

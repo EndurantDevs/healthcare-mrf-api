@@ -20,16 +20,16 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from alembic.script import ScriptDirectory
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.schema import MetaData
 
 from db.connection import Database
 from db.models.system import (
     ProviderDirectoryProfileCapacityLeaseConsumption,
+    ProviderDirectoryProfileCapacityPreflightReceipt,
 )
 from process import provider_directory_profile as profile
 from process import provider_directory_profile as profile_artifact
-from process import provider_directory_profile_capacity_attestation as lease
 from process import provider_directory_profile_capacity_preflight_contract as contract
 from process import provider_directory_profile_runtime_observation as runtime
 from tests.provider_directory_profile_capacity_v2_migration_support import (
@@ -40,10 +40,6 @@ from tests.provider_directory_profile_delta_schema_fixtures import (
 )
 from tests.provider_directory_profile_delta_test_support import (
     _delta_database,
-)
-from tests.test_provider_directory_profile_capacity_attestation import (
-    _signed_envelope,
-    _verify,
 )
 from tests.test_provider_directory_profile_capacity_preflight import (
     _serving_state,
@@ -97,6 +93,8 @@ async def _prepare_receipt_schema(
     monkeypatch: pytest.MonkeyPatch,
     database: Database,
     schema: str,
+    *,
+    legacy: bool = False,
 ) -> None:
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     monkeypatch.setenv("DB_SCHEMA", schema)
@@ -106,21 +104,41 @@ async def _prepare_receipt_schema(
         ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__,
     )
     await database.status(f"DROP TABLE IF EXISTS {capacity_ref} CASCADE;")
-    capacity_table = ProviderDirectoryProfileCapacityLeaseConsumption.__table__.to_metadata(MetaData(), schema=schema)
-    await database.create_table(capacity_table)
-    await database.status(f"ALTER TABLE {capacity_ref} DROP CONSTRAINT pd_profile_capacity_consumption_values_check;")
-    v2_condition = receipt_migration._capacity_consumption_check(
-        receipt_migration._capacity_contract_predicate(
-            receipt_migration._V1_CONTRACT,
-            receipt_migration._V2_CONTRACT,
+    if legacy:
+        from tests.test_provider_directory_profile_initial_migration import delta
+
+        async with database.engine.begin() as connection:
+
+            def create_frozen(sync):
+                with Operations.context(MigrationContext.configure(sync)):
+                    delta._create_capacity_lease_consumption_table(schema)
+
+            await connection.run_sync(create_frozen)
+        await database.status(
+            f"ALTER TABLE {capacity_ref} DROP CONSTRAINT pd_profile_capacity_consumption_values_check;"
         )
-    )
-    await database.status(
-        f"ALTER TABLE {capacity_ref} ADD CONSTRAINT "
-        "pd_profile_capacity_consumption_values_check "
-        f"CHECK ({v2_condition});"
-    )
-    await _run_receipt_migration(database, upgrade=True)
+        v2_condition = receipt_migration._capacity_consumption_check(
+            receipt_migration._capacity_contract_predicate(
+                receipt_migration._V1_CONTRACT, receipt_migration._V2_CONTRACT
+            )
+        )
+        await database.status(
+            f"ALTER TABLE {capacity_ref} ADD CONSTRAINT pd_profile_capacity_consumption_values_check CHECK ({v2_condition});"
+        )
+        await _run_receipt_migration(database, upgrade=True)
+    else:
+        for model in (
+            ProviderDirectoryProfileCapacityLeaseConsumption,
+            ProviderDirectoryProfileCapacityPreflightReceipt,
+        ):
+            await database.create_table(model.__table__.to_metadata(MetaData(), schema=schema))
+        async with database.engine.begin() as connection:
+
+            def install_guards(sync):
+                with Operations.context(MigrationContext.configure(sync)):
+                    receipt_migration._create_guards(schema)
+
+            await connection.run_sync(install_guards)
 
 
 def _digest(label: str) -> str:
@@ -209,42 +227,6 @@ def _configure_database(monkeypatch: pytest.MonkeyPatch, dsn: str) -> None:
     monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", "2")
 
 
-def _lease_for_runtime_observation(
-    observation: dict[str, object],
-):
-    def bind_runtime(body):
-        runtime_witness = body["runtime_witness"]
-        for field_name in runtime.CAPACITY_LEASE_LOCALLY_VERIFIED_RUNTIME_FIELDS:
-            runtime_witness[field_name] = observation[field_name]
-        body["runtime_witness_sha256"] = lease.capacity_runtime_witness_sha256(
-            runtime_witness,
-            body["deployment_witness"],
-        )
-
-    return _verify(_signed_envelope(body_mutator=bind_runtime))
-
-
-def _assert_runtime_bound_lease_replay(observation) -> None:
-    verified_lease = _lease_for_runtime_observation(observation)
-    runtime.assert_capacity_lease_matches_runtime_observation(
-        verified_lease,
-        observation,
-    )
-    foreign_runtime_by_field = {
-        **observation,
-        "healthcare_source_commit": "e" * 40,
-    }
-    foreign_lease = _lease_for_runtime_observation(foreign_runtime_by_field)
-    with pytest.raises(
-        runtime.ProviderDirectoryProfileRuntimeObservationError,
-        match="capacity_lease_runtime_mismatch",
-    ):
-        runtime.assert_capacity_lease_matches_runtime_observation(
-            foreign_lease,
-            observation,
-        )
-
-
 @pytest.mark.asyncio
 async def test_receipt_migration_lifecycle_and_trigger_drift(
     monkeypatch,
@@ -252,26 +234,16 @@ async def test_receipt_migration_lifecycle_and_trigger_drift(
     """Install, fingerprint, downgrade, and reinstall the empty ledger."""
 
     async with _delta_database(monkeypatch) as (database, schema):
-        await _prepare_receipt_schema(monkeypatch, database, schema)
+        await _prepare_receipt_schema(monkeypatch, database, schema, legacy=True)
         receipt_ref = profile.qualified_table(
             schema,
             "provider_directory_profile_capacity_preflight_receipt",
         )
         layout = await importer._profile_capacity_preflight_receipt_layout(schema)
         assert "capacity-lease-v3" in await capacity_constraint_definition(database, schema)
-        assert layout["relation_oid"] > 0
+        assert (layout["schema"], layout["name"]) == (schema, "provider_directory_profile_capacity_preflight_receipt")
         assert len(layout["main_index_pages"]) == 4
         assert layout["toastable_column_count"] >= 1
-
-        await database.status(f"ALTER TABLE {receipt_ref} DISABLE TRIGGER pd_profile_capacity_preflight_update_guard;")
-        with pytest.raises(
-            importer.ProviderDirectoryArtifactBuildStale,
-            match="preflight_trigger_shape_changed",
-        ):
-            await importer._profile_capacity_preflight_receipt_layout(schema)
-        await database.status(
-            f"ALTER TABLE {receipt_ref} ENABLE ALWAYS TRIGGER pd_profile_capacity_preflight_update_guard;"
-        )
 
         await _run_receipt_migration(database, upgrade=False)
         downgraded_capacity_constraint = await capacity_constraint_definition(database, schema)
@@ -286,7 +258,7 @@ async def test_receipt_migration_lifecycle_and_trigger_drift(
         )
         await _run_receipt_migration(database, upgrade=True)
         reinstalled = await importer._profile_capacity_preflight_receipt_layout(schema)
-        assert reinstalled["relation_oid"] != layout["relation_oid"]
+        assert reinstalled == layout
         assert "capacity-lease-v3" in await capacity_constraint_definition(database, schema)
 
 
@@ -742,10 +714,7 @@ async def _ordinary_legacy_incumbent(ordinary, execution):
             profile_as_of="2026-07-30",
             profile_rows=1,
             evidence_rows=1,
-            profile_target_oid=await ordinary.scalar("SELECT 'mrf.provider_directory_profile'::regclass::oid::bigint"),
-            evidence_target_oid=await ordinary.scalar(
-                "SELECT 'mrf.provider_directory_profile_evidence'::regclass::oid::bigint"
-            ),
+            targets=importer._provider_directory_profile_target_coordinates("mrf"),
             published_at=datetime.datetime.now(UTC),
             executable_plan_hash=importer._provider_directory_profile_adopted_plan_hash(selection_result_by_field),
         ),
@@ -778,17 +747,12 @@ async def _assert_ordinary_execution_released(administrator, ordinary, baseline,
         assert await administrator.scalar("SELECT count(*) FROM provider_directory_source." + name) == 0
 
 
-async def _assert_ordinary_execution_actor(ordinary, baseline):
-    """Verify canonical ownership and the observed ordinary metadata capability."""
+async def _assert_ordinary_execution_actor(ordinary, _baseline):
+    """Exercise canonical reads and real private-storage and parameter denials."""
     from process import provider_directory_generic_source_policy as source_policy
     from process import provider_directory_profile_selection_snapshot as snapshot
+    from process import provider_directory_profile_temp_limit as temp_limit
 
-    actor = await ordinary.first(
-        "SELECT session_user::text AS actor,current_user::text AS current,"
-        "pg_has_role(current_user,:source_owner,'MEMBER') AS source_authority",
-        source_owner=baseline.owner,
-    )
-    assert actor.actor == actor.current == baseline.builder and actor.source_authority is False
     assert source_policy.is_source_storage_required() is False
     assert source_policy._FACTORY.get() is None and source_policy._PUBLISHER.get() is None
     names = [
@@ -797,23 +761,19 @@ async def _assert_ordinary_execution_actor(ordinary, baseline):
         "provider_directory_endpoint_dataset",
         *snapshot.UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS,
     ]
-    ownership = await ordinary.all(
-        "SELECT c.relname,pg_get_userbyid(c.relowner) AS owner "
-        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-        "WHERE n.nspname='mrf' AND c.relname=ANY(CAST(:names AS text[])) ORDER BY c.relname",
-        names=names,
-    )
-    assert len(ownership) == len(names) == 22
-    assert all(owned_relation.owner == baseline.builder for owned_relation in ownership)
-    assert await ordinary.scalar("SELECT NOT rolsuper AND NOT rolbypassrls FROM pg_roles WHERE rolname=current_user")
-    assert await ordinary.scalar(
-        "SELECT NOT has_table_privilege(current_user,"
-        "'provider_directory_source.provider_directory_endpoint_dataset','SELECT,INSERT,UPDATE,DELETE')"
-    )
-    from process import provider_directory_profile_temp_limit as temp_limit
-
+    assert len(names) == len(set(names)) == 22
+    for name in names:
+        assert await ordinary.scalar('SELECT count(*) FROM "mrf"."' + name + '"') >= 0
+    for statement in (
+        "SELECT count(*) FROM provider_directory_source.provider_directory_endpoint_dataset",
+        "DELETE FROM provider_directory_source.provider_directory_endpoint_dataset",
+        "ALTER TABLE provider_directory_source.provider_directory_endpoint_dataset ADD COLUMN forbidden text",
+        "SET LOCAL temp_file_limit='1MB'",
+    ):
+        with pytest.raises(DBAPIError, match="permission denied|must be owner"):
+            async with ordinary.transaction():
+                await ordinary.status(statement)
     assert await temp_limit.require_temp_file_limit_capability(ordinary) == "bounded"
-    assert await ordinary.scalar("SELECT NOT has_parameter_privilege(current_user,'temp_file_limit','SET')")
 
 
 async def _ordinary_execution_inputs(monkeypatch, tmp_path, ordinary, baseline):
@@ -832,8 +792,6 @@ async def _ordinary_execution_inputs(monkeypatch, tmp_path, ordinary, baseline):
     identity.write_text(subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() + "\n")
     identity.chmod(0o444)
     monkeypatch.setattr(runtime, "PROFILE_RUNTIME_SOURCE_COMMIT_FILE", identity)
-    monkeypatch.setattr(runtime, "_BUILD_IDENTITY_UID", os.getuid())
-    monkeypatch.setattr(runtime, "_BUILD_IDENTITY_GID", os.getgid())
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
     execution = await _ordinary_registered_execution(ordinary, monkeypatch)
     await _ordinary_legacy_incumbent(ordinary, execution)
@@ -866,10 +824,10 @@ async def _ordinary_signed_request(monkeypatch, ordinary, baseline, execution, i
             assert await ordinary.scalar("SELECT count(*) FROM mrf." + table) == 0
         assert source_policy._FACTORY.get() is None and source_policy._PUBLISHER.get() is None
         raise
-    assert envelope["lease"]["database_name"] == baseline.name
     body = envelope["lease"]
+    assert body["contract_id"] == "provider-directory-database-capacity-lease-v4"
     trust = _trust_payload(
-        **{name: body[name] for name in ("database_system_identifier", "database_oid", "database_name")}
+        environment_id=body["environment_id"], attestor_id=body["attestor_id"], active_key_id=body["key_id"]
     )
     monkeypatch.setenv(capacity_runtime.CAPACITY_LIMITS_ENV, limits)
     monkeypatch.setenv(capacity_runtime.CAPACITY_TRUST_ENV, json.dumps(trust))

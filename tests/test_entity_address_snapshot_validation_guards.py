@@ -106,7 +106,7 @@ def test_serving_oid_guard_rejects_non_postgres_identity(invalid):
         },
         lambda value: {**value, "alias_state": {**value["alias_state"], "generation": -1}},
         lambda value: {**value, "geo_assurance": {**value["geo_assurance"], "version": 999}},
-        lambda value: {**value, "geo_assurance": {**value["geo_assurance"], "active_table_oid": 999}},
+        lambda value: {**value, "geo_assurance": {**value["geo_assurance"], "active_relation_signature": {}}},
     ],
 )
 def test_serving_capture_rejects_malformed_or_drifted_identity(mutation):
@@ -141,7 +141,9 @@ def test_serving_schema_and_observed_alias_guards_reject_wrong_types():
 async def test_serving_database_guards_reject_missing_state_and_bad_geo_signature():
     """Reject absent relation/state rows and malformed current assurance evidence."""
 
-    session = SimpleNamespace(execute=AsyncMock(return_value=_mapped_result(row=None)))
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=_mapped_result(row=None)), scalar=AsyncMock(return_value=None)
+    )
     with pytest.raises(RuntimeError, match="relation is unavailable"):
         await serving._relation_oid(session, "mrf", "entity_address_unified")
 
@@ -320,7 +322,7 @@ async def test_source_cleanup_drains_after_repeated_cancellation():
 
 
 def test_destination_transaction_geo_and_stage_identity_guards():
-    """Reject missing transaction, malformed geo receipts, and substituted stage OIDs."""
+    """Reject missing transactions and malformed signature or stage-name declarations."""
 
     with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="caller transaction"):
         destination._require_caller_transaction(SimpleNamespace(in_transaction=lambda: False))
@@ -333,12 +335,15 @@ def test_destination_transaction_geo_and_stage_identity_guards():
     with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="preparation receipt"):
         destination._validated_geo_preparation({}, db_schema="mrf")
 
-    prepared = SimpleNamespace(stage_cls=SimpleNamespace(__tablename__="entity_address_unified_stage"))
-    with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="stage identity is invalid"):
-        destination._prepared_main_stage_oid({"restored": {"stage_relation_oids": []}}, prepared=prepared)
-    stored_by_field = {"restored": {"stage_relation_oids": [{"table_name": "entity_address_unified_stage", "oid": 0}]}}
-    with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="stage identity is invalid"):
-        destination._prepared_main_stage_oid(stored_by_field, prepared=prepared)
+    stage_by_field = {
+        "contract": destination.GEO_NAMED_PREPARATION_CONTRACT,
+        "geo_assurance_version": 1,
+        "stage_relation": {"schema_name": "mrf", "relation_name": "stage; SELECT 1"},
+        "projected_rows": 0,
+        "relation_signature": {name: name.split(".") for name in _geo_signature()},
+    }
+    with pytest.raises(destination.EntityAddressSnapshotDestinationError, match="preparation receipt"):
+        destination._validated_geo_preparation(stage_by_field, db_schema="mrf")
 
 
 @pytest.mark.asyncio
@@ -444,14 +449,17 @@ def test_destination_metadata_and_remap_receipts_reject_substitution():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["alias", "stage_oid", "geo"])
+@pytest.mark.parametrize("drift", ["alias", "stage_name", "geo"])
 async def test_destination_activation_rechecks_alias_stage_and_geo_cas(monkeypatch, drift):
     """Reject each destination-local identity if it changes after preparation."""
 
     source_alias = alias.EntityAddressAliasSemanticReceipt(2, 1, 1, 0, "a" * 64)
     local_alias = replace(source_alias, local_generation=2)
     remap = destination.EntityAddressBaseVersionRemapEvidence(1, 2, 0, 0, 0, 0, "b" * 64, "c" * 64)
-    expected_geo = destination.EntityAddressGeoAssurancePreparation(10, 0, ())
+    signature_entries = tuple((name, *name.split(".", 1)) for name in sorted(_geo_signature()))
+    expected_geo = destination.EntityAddressGeoAssurancePreparation(
+        None, 0, signature_entries, stage_relation=("mrf", "different_stage" if drift == "stage_name" else "stage")
+    )
 
     @asynccontextmanager
     async def preserve_settings():
@@ -473,16 +481,13 @@ async def test_destination_activation_rechecks_alias_stage_and_geo_cas(monkeypat
     )
     monkeypatch.setattr(destination, "_require_prepared_base_versions", AsyncMock())
     monkeypatch.setattr(destination, "_validated_geo_preparation", lambda *_args, **_kwargs: expected_geo)
-    monkeypatch.setattr(
-        destination, "_prepared_main_stage_oid", lambda *_args, **_kwargs: 11 if drift == "stage_oid" else 10
-    )
     actual_geo = replace(expected_geo, projected_rows=1) if drift == "geo" else expected_geo
     monkeypatch.setattr(destination, "_capture_geo_preparation", AsyncMock(return_value=actual_geo))
     monkeypatch.setattr(destination.adoption, "adopt_prepared_entity_address_snapshot", AsyncMock())
     session = SimpleNamespace(execute=AsyncMock())
     message = {
         "alias": "alias generation changed",
-        "stage_oid": "stage identity differs",
+        "stage_name": "stage name differs",
         "geo": "preparation changed",
     }[drift]
     with pytest.raises(destination.EntityAddressSnapshotDestinationError, match=message):
@@ -492,3 +497,13 @@ async def test_destination_activation_rechecks_alias_stage_and_geo_cas(monkeypat
             callbacks=SimpleNamespace(),
         )
     destination.adoption.adopt_prepared_entity_address_snapshot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_only,mode", [(False, "SHARE"), (True, "ACCESS SHARE")])
+async def test_frozen_receipt_scan_uses_native_read_lock_without_changing_writer_default(read_only, mode):
+    from process import entity_address_snapshot_receipt as receipts
+
+    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(side_effect=["off", "read committed"]))
+    await receipts._lock_relation_family(session, "candidate", ("entity_address_unified",), read_only=read_only)
+    assert str(session.execute.await_args.args[0]) == f'LOCK TABLE "candidate"."entity_address_unified" IN {mode} MODE'

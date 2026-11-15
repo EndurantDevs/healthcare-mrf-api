@@ -82,8 +82,8 @@ async def provider_only_source(cms_recipe_database, serving_schema, monkeypatch,
 
 
 async def _assert_seal_required(fixture, copy_target, addresses, expected_head):
-    """Preparation may complete, but missing custody cannot move the serving head."""
-    with pytest.raises(NetworkPublicationError, match="independent physical custody"):
+    """Preparation may complete, but missing data validation cannot move the serving head."""
+    with pytest.raises(NetworkPublicationError, match="Generation data validation is incomplete"):
         await prepare_and_publish_network_candidate(
             fixture.connection, copy_target, addresses, **fixture.writer_roles, control_schema=fixture.control_schema
         )
@@ -95,10 +95,11 @@ async def _assert_seal_required(fixture, copy_target, addresses, expected_head):
     )
     assert (
         await fixture.connection.fetchval(
-            f'SELECT count(*) FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
+            f"SELECT validation_json->'final_validation' FROM \"{fixture.control_schema}\".network_membership_candidate "
+            "WHERE candidate_id=$1",
             UUID(copy_target.candidate_id),
         )
-        == 0
+        is None
     )
 
 
@@ -138,13 +139,12 @@ async def _compose(context, *, revision, source_manifest):
     )
     async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
         manifest = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
-        assert (
-            await fixture.connection.fetchval(
-                f'SELECT count(*) FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
-                UUID(copy_target.candidate_id),
-            )
-            == 1
+        validation = await fixture.connection.fetchval(
+            f"SELECT validation_json->'final_validation' FROM \"{fixture.control_schema}\".network_membership_candidate "
+            "WHERE candidate_id=$1",
+            UUID(copy_target.candidate_id),
         )
+        assert json.loads(validation)["complete"] is True
         return manifest
 
 
@@ -217,7 +217,8 @@ async def test_explicit_provider_evidence_is_distinct_before_pagination(provider
     assert "location" not in json.dumps(page) and "location" not in json.dumps(second)
 
 
-async def _assert_inherited_fact_leak(connection, current, query, read_relations, network_id):
+async def _assert_inherited_fact_leak(connection, current, query, network_id):
+    """Prove the attached child would be visible without ONLY, so the page result really excludes it."""
     inherited_query, arguments = query
     inherited = await connection.fetchrow(
         inherited_query.replace("FROM ONLY ", "FROM ").replace("JOIN ONLY ", "JOIN "),
@@ -229,27 +230,15 @@ async def _assert_inherited_fact_leak(connection, current, query, read_relations
         readers.MAX_RESPONSE_BYTES,
         current.generation_id,
     )
-    await readers.verify_consumed_network_relations(
-        connection, tuple(read_relations), expected_backend_pid=connection.get_server_pid()
-    )
     assert "1234567893" in inherited["result"] and inherited["valid"] is True
 
 
 async def test_provider_only_read_excludes_fact_child_attached_after_metadata(provider_only_db, monkeypatch):
     context = provider_only_db
     original_query = readers._page_query
-    parent_pins = []
-
-    async def observe_query(connection, current, control_schema, *, read_relations):
-        query = await original_query(connection, current, control_schema, read_relations=read_relations)
-        parent_pins.extend(pin for pin in read_relations if pin.table_name == "network_source_contribution")
-        return query
-
-    monkeypatch.setattr(readers, "_page_query", observe_query)
     baseline = await _read(context)
-    assert baseline["total_count"] == 2 and len(parent_pins) == 1
-    pin = parent_pins[0]
-    parent = f'"{pin.schema_name}"."{pin.table_name}"'
+    assert baseline["total_count"] == 2
+    parent = f'"{context.manifest.schema_name}".network_source_contribution'
     child = f'"{context.fixture.source_schema}".provider_only_fact_child'
     url = context.fixture.engine.url.set(drivername="postgresql").render_as_string(hide_password=False)
     admin = await asyncpg.connect(url)
@@ -266,12 +255,11 @@ async def test_provider_only_read_excludes_fact_child_attached_after_metadata(pr
         )
         attached_relations = []
 
-        async def attach_after_metadata(connection, current, control_schema, *, read_relations):
-            query = await original_query(connection, current, control_schema, read_relations=read_relations)
-            assert pin in read_relations
+        async def attach_after_metadata(connection, current, control_schema):
+            query = await original_query(connection, current, control_schema)
             await admin.execute(f"ALTER TABLE {child} INHERIT {parent}")
             attached_relations.append(child)
-            await _assert_inherited_fact_leak(connection, current, query, read_relations, context.network_id)
+            await _assert_inherited_fact_leak(connection, current, query, context.network_id)
             return query
 
         monkeypatch.setattr(readers, "_page_query", attach_after_metadata)

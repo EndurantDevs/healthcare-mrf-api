@@ -52,6 +52,8 @@ from tests.test_provider_directory_rooted_graph_native_adapter import (
 from tests.test_provider_directory_rooted_graph_publication_freeze import SCHEMA, _current_bodies
 from tests.test_provider_directory_rooted_graph_store_contract import API_BASE, _claim, _scope
 
+_VALIDATE_QUERY_RECIPES = candidate.validate_rooted_query_filter_recipes
+
 
 def _result(resource_type="OrganizationAffiliation", *, empty=False):
     query = (
@@ -124,8 +126,13 @@ def test_other_query_terminal_formula_remains_compatible():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("receipt", [False, None, 1, {"closed": True, "valid": False, "rows": 1}])
-async def test_old_sealed_source_stops_before_candidate_lookup_or_writes(materialization, receipt):
+async def test_old_sealed_source_stops_before_candidate_lookup_or_writes(materialization, monkeypatch, receipt):
+    from process import provider_directory_rooted_graph_source_runtime as source_runtime
+
     scope = materialization
+    relation_by_name = {"provider_directory_rooted_graph_work": {"schema": scope.runtime.catalog_schema}}
+    monkeypatch.setattr(source_runtime, "rooted_input_relations", AsyncMock(return_value=relation_by_name))
+    monkeypatch.setattr(candidate, "validate_rooted_query_filter_recipes", _VALIDATE_QUERY_RECIPES)
     scope.runtime.connection.fetchval.return_value = receipt
     with pytest.raises(GenericCandidateError, match="rooted_query_recipe_changed"):
         await _materialize(scope)
@@ -189,14 +196,17 @@ async def test_recipe_audit_pages_single_or_comparison_roots_without_resource_re
     ]
 
 
-def test_final_and_ancestor_proofs_require_recipe_in_existing_protected_handoff():
+def test_final_and_ancestor_proofs_require_recipe_in_recorded_parent_handoff():
     final = freeze.native_receipt_sql("sample")
-    ancestor = root_input_fence_sql("sample", "$1", "$2::jsonb", variant="rooted_combined")
+    ancestor = freeze.native_receipt_sql("sample", ":dataset_id")
     for query in (final, ancestor):
         assert "->'identity'->'metadata'->>'query_filter_recipe_id'" in query
         assert PROVIDER_DIRECTORY_ROOTED_GRAPH_AFFILIATION_FILTER_RECIPE_ID in query
-        assert "preparation.handoff=" in query
-        assert "preparation.preparation_id" not in query
+        assert "(SELECT p.candidate_storage_json AS b)" in query
+        assert "hp_snapshot_retention" not in query
+    assert "WHERE h.dataset_id=:dataset_id" in ancestor
+    fence = root_input_fence_sql("sample", "$1", "$2::jsonb", variant="rooted_combined")
+    assert "'candidate_storage_json'" in fence and "hp_snapshot_retention" not in fence
     audit = rooted_graph_query_filter_validation_sql("sample")
     assert "acquisition_id=$1 AND query_id>$2 ORDER BY query_id LIMIT $3" in audit
     assert '"sample"."provider_directory_rooted_graph_work"' in audit

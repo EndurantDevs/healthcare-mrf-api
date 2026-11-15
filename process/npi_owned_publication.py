@@ -11,7 +11,7 @@ from process import mrf_address_publication as canonical
 from process import npi_result_archive as archive
 from process.npi_canonical_publication import validate_npi_canonical_publication_receipt
 from process.npi_result_generation import (
-    current_npi_relation_oids,
+    RELATION_NAMES,
     read_npi_result_generation_authority,
     validate_npi_result_generation_authority,
 )
@@ -134,15 +134,7 @@ async def _same_transaction(session, callback, *arguments):
     return result
 
 
-async def _require_inert_owned_stage(session, ownership, owner_oid):
-    await archive._verify_stage_owner(session, ownership, owner_oid)
-    protected_owner = await session.scalar(
-        text(
-            "SELECT NOT (rolcanlogin OR rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls) "
-            "FROM pg_catalog.pg_roles WHERE oid=CAST(:owner AS oid)"
-        ),
-        {"owner": owner_oid},
-    )
+async def _require_inert_owned_stage(session, ownership):
     unsafe = await session.scalar(
         text(
             "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_trigger "
@@ -153,31 +145,32 @@ async def _require_inert_owned_stage(session, ownership, owner_oid):
         ),
         {"oids": [oid for _name, oid in ownership.relation_oids]},
     )
-    if protected_owner is not True or unsafe is not False:
+    if unsafe is not False:
         raise archive.NpiResultArchiveError("NPI output custody differs")
 
 
 async def _publish_generation(session, incumbent, previous, publication):
     """Advance real local history only after the output relations have been adopted."""
     schema = archive._quoted(incumbent.schema_name)
-    oids = await current_npi_relation_oids(session, schema_name=incumbent.schema_name)
     authority_row = (
         (
             await session.execute(
                 text(
                     f"UPDATE {schema}.npi_result_generation SET local_generation=local_generation+1,"
                     "origin_lineage_id=local_lineage_id,origin_generation=local_generation+1,"
-                    "published_at=clock_timestamp(),relation_oids=CAST(:oids AS bigint[]),"
+                    "published_at=clock_timestamp(),serving_schema=:serving_schema,"
+                    "serving_relation_names=CAST(:relation_names AS text[]),"
                     "canonical_publication_ref=:publication_ref,canonical_publication_generation=:publication_generation,"
                     "canonical_chain_ref=:chain_ref,canonical_import_date=CAST(:import_date AS date) "
                     "WHERE singleton IS TRUE AND local_lineage_id=CAST(:lineage AS uuid) "
                     "AND local_generation=:generation AND local_generation < 9223372036854775807 "
                     "RETURNING singleton,local_lineage_id,local_generation,origin_lineage_id,origin_generation,"
-                    "published_at,relation_oids,canonical_publication_ref,canonical_publication_generation,"
-                    "canonical_chain_ref,canonical_import_date"
+                    "published_at,serving_schema,serving_relation_names,canonical_publication_ref,"
+                    "canonical_publication_generation,canonical_chain_ref,canonical_import_date"
                 ),
                 {
-                    "oids": list(oids),
+                    "serving_schema": incumbent.schema_name,
+                    "relation_names": list(RELATION_NAMES),
                     "lineage": previous.local_lineage_id,
                     "generation": previous.local_generation,
                     "publication_ref": publication.publication_ref,
@@ -219,7 +212,6 @@ def _activation_contract(ownership, manifest, incumbent, validation_receipt, aut
     if (
         not isinstance(cutover, archive.NpiCutoverAuthority)
         or cutover.authority != "manual"
-        or cutover.expected_stage_owner_oid != cutover.sealed_owner_oid
         or ownership.sequence_oids
         or ownership.freeze_function_oid is not None
         or ownership.freeze_trigger_oids
@@ -234,7 +226,7 @@ def _activation_contract(ownership, manifest, incumbent, validation_receipt, aut
         or validated.capture_authority != "legacy-manual"
         or validated.source_serving_generation is not None
         or validated.canonical_provenance is not None
-        or tuple(name for name, _oid in incumbent.relation_oids) != names
+        or tuple(name for name, _present in incumbent.relations) != names
         or tuple(name for name, _oid in ownership.relation_oids) != tuple(sorted(names))
     ):
         raise archive.NpiResultArchiveError("NPI direct output contract differs")
@@ -254,11 +246,11 @@ async def activate_ownership_sealed_npi_stage(
     validated, validation, names = _activation_contract(ownership, manifest, incumbent, validation_receipt, authority)
     await archive._alias_arguments(session, validated, authority.npi_alias_authority)
     cutover = authority.cutover
-    await archive._lock_and_verify_activation(session, ownership, incumbent)
-    await _require_inert_owned_stage(session, ownership, cutover.sealed_owner_oid)
+    ownership = await archive._lock_and_verify_activation(session, ownership, incumbent)
+    await _require_inert_owned_stage(session, ownership)
     await _same_transaction(session, authority.verify_custody, ownership, validated, incumbent, validation, cutover)
     previous = await read_npi_result_generation_authority(session, schema_name=incumbent.schema_name, lock=True)
-    await archive._preserve_npi_input_reads(session, ownership, incumbent, cutover.sealed_owner_oid)
+    await archive._preserve_npi_input_reads(session, ownership, incumbent)
     predecessor = await archive._rotate_relations(session, ownership, incumbent)
     pairs = await archive._relation_pairs(session, incumbent.schema_name, names)
     if tuple(sorted(pairs)) != ownership.relation_oids or any(oid is None for _name, oid in pairs):
@@ -273,7 +265,12 @@ async def activate_ownership_sealed_npi_stage(
         raise archive.NpiResultArchiveError("NPI canonical attachment output differs")
     generation = await _publish_generation(session, incumbent, previous, canonical)
     receipt = archive.NpiActivationReceipt(
-        pairs, incumbent.relation_oids, predecessor, validation.tables, generation, canonical._asdict()
+        tuple((incumbent.schema_name, name) for name, _oid in pairs),
+        tuple((predecessor, name) for name, present in incumbent.relations if present),
+        predecessor,
+        validation.tables,
+        generation,
+        canonical._asdict(),
     )
     await _same_transaction(session, authority.on_activated, receipt)
     return receipt

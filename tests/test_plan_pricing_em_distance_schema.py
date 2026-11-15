@@ -35,8 +35,10 @@ def _migration():
 def test_location_copy_uses_shared_geo_and_taxonomy_contracts():
     sql = projection_build._store_locations_sql()
     for marker in (
-        "geo_evidence_source_id",
-        "geo_identity_coherent",
+        "geo_evidence_level",
+        "geo_nppes.address_key = addr.address_key",
+        "geo_mrf.address_key = addr.address_key",
+        "geo_doctor.address_key = addr.address_key",
         "geo_point_coherent",
         "npi_taxonomy",
         "address_precision",

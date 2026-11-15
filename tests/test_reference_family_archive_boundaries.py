@@ -181,7 +181,8 @@ async def test_capture_rejects_incomplete_or_drifted_source_generation(monkeypat
     monkeypatch.setattr(archive, "_lock_source_family", AsyncMock())
     monkeypatch.setattr(archive, "_has_source_generation_authority", AsyncMock(return_value=state != "untracked"))
     authority = SimpleNamespace(
-        serving_generation=None if state == "incomplete" else _serving_generation(), relation_oids=(99,)
+        serving_generation=None if state == "incomplete" else _serving_generation(),
+        relations=(("synthetic", "zcta5"),),
     )
     monkeypatch.setattr(archive, "read_reference_family_result_generation_authority", AsyncMock(return_value=authority))
     capture_generation = AsyncMock(
@@ -225,7 +226,11 @@ async def test_sequence_rebase_locks_and_verifies_retained_ownership(monkeypatch
     else:
         await archive._rebase_owned_sequences(session, ownership.schema_name, "tiger", ownership=ownership)
         verify.assert_awaited_once_with(session, ownership)
-        assert session.execute.await_args.args[1] == {"sequence": "99", "value": 17, "called": True}
+        assert session.execute.await_args.args[1] == {
+            "sequence": f'"{ownership.schema_name}"."zcta5_gid_seq"',
+            "value": 17,
+            "called": True,
+        }
         assert "SELECT last_value" in str(session.execute.await_args_list[0].args[0])
 
 
@@ -266,11 +271,11 @@ async def test_canonical_merge_rejects_invalid_sources_and_preserves_strict_bits
 
 
 @pytest.mark.asyncio
-async def test_validated_cutover_rejects_post_rotation_oid_drift(monkeypatch):
+async def test_validated_cutover_rejects_post_rotation_relation_drift(monkeypatch):
     monkeypatch.setattr(archive, "_rotate_family_relations", AsyncMock(return_value=None))
     monkeypatch.setattr(archive, "_drop_empty_stage_schema", AsyncMock())
-    monkeypatch.setattr(archive, "_incumbent_pairs", AsyncMock(return_value=[("pricing_places_zcta", 99)]))
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="activated relation OID differs"):
+    monkeypatch.setattr(archive, "_incumbent_pairs", AsyncMock(return_value=[("pricing_places_zcta", None)]))
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="activated relation declaration differs"):
         await archive._complete_validated_stage_activation(
             object(),
             archive.reference_family_spec("places-zcta"),
@@ -406,8 +411,8 @@ async def test_captured_owned_sequence_set_still_rejects_drift(monkeypatch, incl
 
 def _finite_tiger_capture():
     projection = (
-        ("zip_state", (("tiger", "zip_state", 101, 1101), ("tiger_data", "fixed_zip", 103, 1103))),
-        ("zcta5", (("tiger", "zcta5", 102, 1102), ("tiger_data", "fixed_zcta", 104, 1104))),
+        ("zip_state", (("tiger", "zip_state"), ("tiger_data", "fixed_zip"))),
+        ("zcta5", (("tiger", "zcta5"), ("tiger_data", "fixed_zcta"))),
     )
     tables = tuple(
         archive.ReferenceTableReceipt(model.__name__, model.__tablename__, "a" * 64, 1)
@@ -574,3 +579,31 @@ def test_captured_origin_versions_cannot_relabel_snapshot_or_writer_fenced_evide
     ]:
         with pytest.raises(archive.ReferenceFamilyArchiveError, match="origin and snapshot"):
             changed.as_dict()
+
+
+@pytest.mark.asyncio
+async def test_populated_legacy_family_with_generation_zero_row_captures_without_generation(monkeypatch):
+    @asynccontextmanager
+    async def bounded(_session):
+        yield
+
+    session = SimpleNamespace(
+        in_transaction=lambda: True,
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: "00000001-00000001-1")),
+    )
+    monkeypatch.setattr(archive, "_bounded_capture", bounded)
+    monkeypatch.setattr(archive, "_lock_source_family", AsyncMock())
+    monkeypatch.setattr(archive, "_has_source_generation_authority", AsyncMock(return_value=True))
+    # The upgrade keeps a generation-zero row for a populated legacy family: no served origin or names yet.
+    authority = SimpleNamespace(serving_generation=None, relations=None)
+    monkeypatch.setattr(archive, "read_reference_family_result_generation_authority", AsyncMock(return_value=authority))
+    capture_generation = AsyncMock()
+    monkeypatch.setattr(archive, "capture_reference_family_serving_generation", capture_generation)
+    manifest = AsyncMock(return_value=_manifest())
+    monkeypatch.setattr(archive, "_family_manifest", manifest)
+    capture = await archive._capture_reference_family_source(
+        session, importer_id="places-zcta", schema_name="synthetic", source_metadata={"release": "synthetic"}
+    )
+    assert capture.manifest == _manifest()
+    assert manifest.await_args.kwargs["source_serving_generation"] is None
+    capture_generation.assert_not_awaited()

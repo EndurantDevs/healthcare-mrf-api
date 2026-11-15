@@ -17,7 +17,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db.models import db
 from process.facility_address_contribution_capture import require_local_family_publication
-from tests.test_provider_directory_cms_serving_receipt_postgres import _apply, _migration
+from tests.cms_named_revision_postgres_support import upgrade_named_native_counter
+from tests.test_provider_directory_cms_serving_receipt_postgres import _apply
 
 anchors = importlib.import_module("process.facility_anchors")
 
@@ -64,7 +65,7 @@ async def _seed_worker_stage(connection, schema: str) -> None:
     )
     await connection.execute(text(f'CREATE TABLE "{schema}".facility_address_contribution_20260923 (kind text)'))
     await connection.run_sync(lambda session: _apply(session.connection(), "20260930120000"))
-    await connection.execute(text(_migration("20261019130000")._counter_sql(schema)))
+    await upgrade_named_native_counter(connection, schema)
 
 
 @pytest.mark.asyncio

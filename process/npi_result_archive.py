@@ -19,7 +19,7 @@ import re
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
@@ -67,7 +67,6 @@ _CAPTURE_TIMEOUT = "5s"
 _FREEZE_FUNCTION = "reject_npi_result_archive_mutation"
 _FREEZE_WRITE_TRIGGER = "npi_result_archive_write_guard"
 _FREEZE_TRUNCATE_TRIGGER = "npi_result_archive_truncate_guard"
-_FREEZE_FUNCTION_BODY = "BEGIN RAISE EXCEPTION 'npi_result_archive_is_frozen' USING ERRCODE='55000'; END;"
 _MAX_METADATA_BYTES = 16_384
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _SNAPSHOT = re.compile(r"[0-9A-Fa-f-]+\Z")
@@ -183,17 +182,15 @@ class NpiStageOwnership:
     freeze_catalog_versions: tuple[tuple[str, int, str, str], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
-        """Return the exact serializable relation, sequence, and freeze token."""
-
+        """Encode the declared stage names and owned sequence bindings."""
         return {
             "dataset_id": str(self.dataset_id),
             "schema_name": self.schema_name,
-            "schema_oid": self.schema_oid,
-            "relation_oids": [list(pair) for pair in self.relation_oids],
-            "sequence_oids": [list(entry) for entry in self.sequence_oids],
-            "freeze_function_oid": self.freeze_function_oid,
-            "freeze_trigger_oids": [list(entry) for entry in self.freeze_trigger_oids],
-            "freeze_catalog_versions": [list(entry) for entry in self.freeze_catalog_versions],
+            "relations": [{"schema_name": self.schema_name, "relation_name": name} for name, _ in self.relation_oids],
+            "sequences": [
+                {"sequence_name": name, "owner_table": table, "owner_column": column}
+                for name, _oid, table, column in self.sequence_oids
+            ],
         }
 
 
@@ -219,7 +216,7 @@ class NpiIncumbent:
     """Compare-and-swap token for all-present or all-absent live relations."""
 
     schema_name: str
-    relation_oids: tuple[tuple[str, int | None], ...]
+    relations: tuple[tuple[str, bool], ...]
 
 
 @dataclass(frozen=True)
@@ -236,17 +233,18 @@ class NpiValidationReceipt:
     validation_sha256: str
     profile_contract: str = CONTRACT
 
-    def as_dict(self) -> dict[str, Any]:
-        """Return the closed durable validation representation."""
+    legacy_receipt: Mapping[str, Any] | None = field(default=None, compare=False, repr=False)
 
+    def as_dict(self) -> dict[str, Any]:
+        """Preserve a saved legacy edition or encode the current named receipt."""
+        if self.legacy_receipt is not None:
+            return json.loads(_canonical_json(self.legacy_receipt))
         return {
             "contract": VALIDATION_CONTRACT,
             "package_id": self.package_id,
             "profile_contract": self.profile_contract,
             "stage_schema": self.stage_schema,
-            "stage_schema_oid": self.stage_schema_oid,
-            "relation_oids": [list(pair) for pair in self.relation_oids],
-            "sealed_owner_oid": self.sealed_owner_oid,
+            "relations": [{"schema_name": self.stage_schema, "relation_name": name} for name, _ in self.relation_oids],
             "manifest_sha256": self.manifest_sha256,
             "tables": [table.as_dict() for table in self.tables],
             "validation_sha256": self.validation_sha256,
@@ -258,8 +256,6 @@ class NpiCutoverAuthority:
     """Trusted controller bindings rechecked during the short cutover."""
 
     package_id: str
-    sealed_owner_oid: int
-    expected_stage_owner_oid: int
     authority: str
 
 
@@ -267,8 +263,8 @@ class NpiCutoverAuthority:
 class NpiActivationReceipt:
     """Destination-local identity captured before activation commits."""
 
-    relation_oids: tuple[tuple[str, int], ...]
-    predecessor_oids: tuple[tuple[str, int | None], ...]
+    relations: tuple[tuple[str, str], ...]
+    predecessor_relations: tuple[tuple[str, str], ...]
     predecessor_schema_name: str | None
     tables: tuple[NpiTableReceipt, ...]
     adopted_authority: NpiResultGenerationAuthority
@@ -633,12 +629,11 @@ async def capture_npi_source(
         pairs = await _relation_pairs(session, schema)
         if any(relation_oid is None for _, relation_oid in pairs):
             raise NpiResultArchiveError("NPI source family is incomplete")
-        current_oids = tuple(int(relation_oid) for _, relation_oid in pairs)
         if authority.serving_generation is None:
-            if authority.relation_oids is not None:
+            if authority.relations is not None:
                 raise NpiResultArchiveError("NPI source generation is incomplete")
             capture_authority = "legacy-manual"
-        elif authority.relation_oids != current_oids:
+        elif authority.relations != tuple((schema, name) for name in RELATION_NAMES):
             raise NpiResultArchiveError("NPI source generation is drifted")
         else:
             capture_authority = "tracked-generation"
@@ -1020,162 +1015,6 @@ async def _owned_sequences(
     )
 
 
-async def _freeze_seal(
-    session: Any,
-    schema_oid: int,
-) -> tuple[
-    int | None,
-    tuple[tuple[str, int, int], ...],
-    tuple[tuple[str, int, str, str], ...],
-]:
-    """Read and validate the exact always-enabled immutable-clone guard set."""
-
-    function_row = await _read_freeze_function(session, schema_oid)
-    trigger_rows = await _read_freeze_triggers(session, schema_oid)
-    if function_row is None and not trigger_rows:
-        return None, (), ()
-    if function_row is None:
-        raise NpiResultArchiveError("NPI archive freeze function differs")
-    function_oid = _validate_freeze_function(function_row)
-    triggers_by_table = _validate_freeze_triggers(trigger_rows, function_oid)
-    # OIDs and final definitions alone do not detect disable/enable or an
-    # in-place CREATE OR REPLACE. Bind catalog tuple versions as local seals;
-    # ctid also detects changes within the preparing transaction. Do not bind
-    # cmin: its header slot is reused by cmax, even after a rolled-back deletion.
-    catalog_versions = tuple(
-        sorted(
-            [("function", function_oid, function_row["xmin"], function_row["ctid"])]
-            + [
-                ("trigger", int(trigger_row["oid"]), trigger_row["xmin"], trigger_row["ctid"])
-                for trigger_row in trigger_rows
-            ]
-        )
-    )
-    return (
-        function_oid,
-        tuple(
-            (
-                table_name,
-                triggers_by_table[table_name][_FREEZE_WRITE_TRIGGER],
-                triggers_by_table[table_name][_FREEZE_TRUNCATE_TRIGGER],
-            )
-            for table_name in sorted(RELATION_NAMES)
-        ),
-        catalog_versions,
-    )
-
-
-async def _read_freeze_function(
-    session: Any,
-    schema_oid: int,
-) -> Mapping[str, Any] | None:
-    """Read the stage-local function used to freeze one NPI clone."""
-
-    return (
-        (
-            await session.execute(
-                text(
-                    "SELECT function.oid,function.prosrc,function.prosecdef,"
-                    "function.xmin::text AS xmin,"
-                    "function.ctid::text AS ctid,"
-                    "function.proconfig,language.lanname "
-                    "FROM pg_catalog.pg_proc AS function "
-                    "JOIN pg_catalog.pg_language AS language "
-                    "ON language.oid=function.prolang "
-                    "WHERE function.pronamespace=:schema_oid "
-                    "AND function.proname=:function_name "
-                    "AND function.pronargs=0 "
-                    "AND function.prorettype='pg_catalog.trigger'::regtype"
-                ),
-                {
-                    "schema_oid": schema_oid,
-                    "function_name": _FREEZE_FUNCTION,
-                },
-            )
-        )
-        .mappings()
-        .one_or_none()
-    )
-
-
-async def _read_freeze_triggers(
-    session: Any,
-    schema_oid: int,
-) -> list[Mapping[str, Any]]:
-    """Read candidate immutable-clone guard triggers from one stage schema."""
-
-    return list(
-        (
-            await session.execute(
-                text(
-                    "SELECT owner_table.relname AS table_name,guard.oid,"
-                    "guard.tgname,guard.tgenabled::text AS tgenabled,"
-                    "guard.tgtype,guard.tgfoid,guard.tgqual IS NULL AS unconditional,"
-                    "guard.tgnargs,guard.tgattr::text AS trigger_columns,"
-                    "guard.xmin::text AS xmin,"
-                    "guard.ctid::text AS ctid "
-                    "FROM pg_catalog.pg_trigger AS guard "
-                    "JOIN pg_catalog.pg_class AS owner_table "
-                    "ON owner_table.oid=guard.tgrelid "
-                    "WHERE owner_table.relnamespace=:schema_oid "
-                    "AND NOT guard.tgisinternal "
-                    "AND guard.tgname IN (:write_trigger,:truncate_trigger) "
-                    "ORDER BY owner_table.relname,guard.tgname"
-                ),
-                {
-                    "schema_oid": schema_oid,
-                    "write_trigger": _FREEZE_WRITE_TRIGGER,
-                    "truncate_trigger": _FREEZE_TRUNCATE_TRIGGER,
-                },
-            )
-        ).mappings()
-    )
-
-
-def _validate_freeze_function(function_row: Mapping[str, Any]) -> int:
-    """Return a freeze-function OID only when its immutable contract matches."""
-
-    if (
-        function_row["lanname"] != "plpgsql"
-        or function_row["prosecdef"] is not True
-        or " ".join(str(function_row["prosrc"]).split()) != _FREEZE_FUNCTION_BODY
-        or "search_path=pg_catalog" not in tuple(function_row["proconfig"] or ())
-    ):
-        raise NpiResultArchiveError("NPI archive freeze function differs")
-    return int(function_row["oid"])
-
-
-def _validate_freeze_triggers(
-    trigger_rows: list[Mapping[str, Any]],
-    function_oid: int,
-) -> dict[str, dict[str, int]]:
-    """Require complete, always-enabled write and truncate guards per table."""
-
-    triggers_by_table: dict[str, dict[str, int]] = {}
-    for trigger_row in trigger_rows:
-        table_name = str(trigger_row["table_name"])
-        trigger_name = str(trigger_row["tgname"])
-        expected_type = 30 if trigger_name == _FREEZE_WRITE_TRIGGER else 34
-        if (
-            table_name not in RELATION_NAMES
-            or trigger_row["tgenabled"] != "A"
-            or int(trigger_row["tgtype"]) != expected_type
-            or int(trigger_row["tgfoid"]) != function_oid
-            or trigger_row["unconditional"] is not True
-            or trigger_row["tgnargs"] != 0
-            or trigger_row["trigger_columns"] != ""
-            or trigger_name in triggers_by_table.setdefault(table_name, {})
-        ):
-            raise NpiResultArchiveError("NPI archive freeze trigger differs")
-        triggers_by_table[table_name][trigger_name] = int(trigger_row["oid"])
-    if set(triggers_by_table) != set(RELATION_NAMES) or any(
-        set(trigger_by_name) != {_FREEZE_WRITE_TRIGGER, _FREEZE_TRUNCATE_TRIGGER}
-        for trigger_by_name in triggers_by_table.values()
-    ):
-        raise NpiResultArchiveError("NPI archive freeze trigger set differs")
-    return triggers_by_table
-
-
 async def capture_npi_stage_ownership(
     session: Any,
     *,
@@ -1213,129 +1052,110 @@ async def capture_npi_stage_ownership(
         if relation_kind == "S" and relation_oid in owned_sequence_oids:
             continue
         raise NpiResultArchiveError("NPI archive owned schema contains an unexpected relation")
-    freeze_function_oid, freeze_trigger_oids, freeze_catalog_versions = await _freeze_seal(
-        session,
-        schema_oid,
-    )
-    return NpiStageOwnership(
-        dataset_id,
-        schema_name,
-        schema_oid,
-        tuple(relation_oids),
-        sequence_oids,
-        freeze_function_oid,
-        freeze_trigger_oids,
-        freeze_catalog_versions,
-    )
+    return NpiStageOwnership(dataset_id, schema_name, schema_oid, tuple(relation_oids), sequence_oids)
 
 
-async def _freeze_npi_clone(
-    session: Any,
-    ownership: NpiStageOwnership,
-) -> NpiStageOwnership:
-    """Install immutable clone guards before durable prepared authority exists."""
-
-    if ownership.freeze_function_oid is not None or ownership.freeze_trigger_oids or ownership.freeze_catalog_versions:
-        raise NpiResultArchiveError("NPI archive clone is already frozen")
-    async with _bounded_catalog_work(session):
-        await _lock_family(
-            session,
-            ownership.schema_name,
-            "ACCESS EXCLUSIVE",
+async def _freeze_npi_stage_relations(session, ownership, owner_role, roles):
+    """Close table, column and sequence writes before the schema grants change."""
+    for name, _oid in ownership.relation_oids:
+        relation = f"{_quoted(ownership.schema_name)}.{_quoted(name)}"
+        grants = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT DISTINCT CASE WHEN acl.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(acl.grantee) END AS role,acl.column_name FROM (SELECT a.grantee,NULL::text AS column_name FROM pg_class c CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,acldefault('r',c.relowner))) a WHERE c.oid=to_regclass(:name) UNION SELECT a.grantee,c.attname AS column_name FROM pg_attribute c CROSS JOIN LATERAL aclexplode(c.attacl) a WHERE c.attrelid=to_regclass(:name)) acl"
+                    ),
+                    {"name": relation},
+                )
+            )
+            .mappings()
+            .all()
         )
-        await verify_npi_stage_ownership(session, ownership)
-        freeze_function = f"{_quoted(ownership.schema_name)}.{_quoted(_FREEZE_FUNCTION)}"
+        await session.execute(text(f"ALTER TABLE {relation} OWNER TO {_quoted(owner_role)}"))
+        for grant in grants:
+            principal = "PUBLIC" if grant["role"] == "PUBLIC" else _quoted(grant["role"])
+            columns = "" if grant["column_name"] is None else " (" + _quoted(grant["column_name"]) + ")"
+            await session.execute(text(f"REVOKE ALL PRIVILEGES{columns} ON TABLE {relation} FROM {principal} CASCADE"))
+        await session.execute(text(f"GRANT SELECT ON TABLE {relation} TO " + ",".join(_quoted(role) for role in roles)))
+    for name, _oid, _table, _column in ownership.sequence_oids:
+        sequence = f"{_quoted(ownership.schema_name)}.{_quoted(name)}"
+        grants = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT DISTINCT CASE WHEN a.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END FROM pg_class c CROSS JOIN LATERAL aclexplode(coalesce(c.relacl,acldefault('S',c.relowner))) a WHERE c.oid=to_regclass(:name)"
+                    ),
+                    {"name": sequence},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        await session.execute(text(f"ALTER SEQUENCE {sequence} OWNER TO {_quoted(owner_role)}"))
+        for role in grants:
+            await session.execute(
+                text(
+                    f"REVOKE ALL ON SEQUENCE {sequence} FROM {'PUBLIC' if role == 'PUBLIC' else _quoted(role)} CASCADE"
+                )
+            )
         await session.execute(
-            text(
-                f"CREATE FUNCTION {freeze_function}() RETURNS trigger "
-                "LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog "
-                f"AS $function$ {_FREEZE_FUNCTION_BODY} $function$"
-            )
+            text(f"GRANT SELECT ON SEQUENCE {sequence} TO " + ",".join(_quoted(role) for role in roles))
         )
-        await session.execute(text(f"REVOKE ALL ON FUNCTION {freeze_function}() FROM PUBLIC"))
-        for table_name in RELATION_NAMES:
-            await _install_freeze_triggers(
-                session,
-                schema_name=ownership.schema_name,
-                table_name=table_name,
-                freeze_function=freeze_function,
-            )
-    frozen = await capture_npi_stage_ownership(
-        session,
-        dataset_id=ownership.dataset_id,
-    )
-    if (
-        frozen.freeze_function_oid is None
-        or not frozen.freeze_trigger_oids
-        or replace(
-            frozen,
-            freeze_function_oid=None,
-            freeze_trigger_oids=(),
-            freeze_catalog_versions=(),
-        )
-        != ownership
-    ):
-        raise NpiResultArchiveError("NPI archive clone freeze differs")
-    return frozen
 
 
 async def freeze_npi_stage(
-    session: Any,
-    *,
-    ownership: NpiStageOwnership,
+    session: Any, *, ownership: NpiStageOwnership, owner_role=None, reader_roles=()
 ) -> NpiStageOwnership:
-    """Freeze one exact, initially unfrozen stage in the caller transaction."""
-
+    """Administratively close candidate writes using explicit configured role names."""
     _require_transaction(session)
     if not isinstance(ownership, NpiStageOwnership):
-        raise NpiResultArchiveError("NPI archive stage ownership is invalid")
-    if ownership.freeze_function_oid is not None or ownership.freeze_trigger_oids or ownership.freeze_catalog_versions:
-        raise NpiResultArchiveError("NPI archive clone is already frozen")
-    await verify_npi_stage_ownership(session, ownership)
-    return await _freeze_npi_clone(session, ownership)
-
-
-async def _install_freeze_triggers(
-    session: Any,
-    *,
-    schema_name: str,
-    table_name: str,
-    freeze_function: str,
-) -> None:
-    """Install and force the write and truncate freeze guards for one table."""
-
-    relation = f"{_quoted(schema_name)}.{_quoted(table_name)}"
-    await session.execute(
-        text(
-            f"CREATE TRIGGER {_quoted(_FREEZE_WRITE_TRIGGER)} "
-            f"BEFORE INSERT OR UPDATE OR DELETE ON {relation} "
-            f"FOR EACH STATEMENT EXECUTE FUNCTION {freeze_function}()"
-        )
+        raise NpiResultArchiveError("NPI archive stage declaration is invalid")
+    if not isinstance(owner_role, str) or not _IDENTIFIER.fullmatch(owner_role) or not reader_roles:
+        raise NpiResultArchiveError("NPI freeze requires configured owner and reader roles")
+    roles = tuple(dict.fromkeys((owner_role, *reader_roles)))
+    if any(not isinstance(role, str) or not _IDENTIFIER.fullmatch(role) or len(role.encode()) > 63 for role in roles):
+        raise NpiResultArchiveError("NPI freeze role declaration is invalid")
+    await _lock_family(
+        session, ownership.schema_name, "ACCESS EXCLUSIVE", names=npi_archive_names(canonical=_has_canonical(ownership))
     )
-    await session.execute(text(f"ALTER TABLE {relation} ENABLE ALWAYS TRIGGER {_quoted(_FREEZE_WRITE_TRIGGER)}"))
-    await session.execute(
-        text(
-            f"CREATE TRIGGER {_quoted(_FREEZE_TRUNCATE_TRIGGER)} "
-            f"BEFORE TRUNCATE ON {relation} FOR EACH STATEMENT "
-            f"EXECUTE FUNCTION {freeze_function}()"
+    ownership = await verify_npi_stage_ownership(session, ownership)
+    await _freeze_npi_stage_relations(session, ownership, owner_role, roles)
+    grants = (
+        (
+            await session.execute(
+                text(
+                    "SELECT DISTINCT CASE WHEN a.grantee=0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END FROM pg_namespace n CROSS JOIN LATERAL aclexplode(coalesce(n.nspacl,acldefault('n',n.nspowner))) a WHERE n.nspname=:name"
+                ),
+                {"name": ownership.schema_name},
+            )
         )
+        .scalars()
+        .all()
     )
-    await session.execute(text(f"ALTER TABLE {relation} ENABLE ALWAYS TRIGGER {_quoted(_FREEZE_TRUNCATE_TRIGGER)}"))
+    await session.execute(text(f"ALTER SCHEMA {_quoted(ownership.schema_name)} OWNER TO {_quoted(owner_role)}"))
+    for role in grants:
+        await session.execute(
+            text(
+                f"REVOKE ALL ON SCHEMA {_quoted(ownership.schema_name)} FROM {'PUBLIC' if role == 'PUBLIC' else _quoted(role)}"
+            )
+        )
+    await session.execute(
+        text(f"GRANT USAGE ON SCHEMA {_quoted(ownership.schema_name)} TO " + ",".join(_quoted(role) for role in roles))
+    )
+    return ownership
 
 
-async def verify_npi_stage_ownership(
-    session: Any,
-    ownership: NpiStageOwnership,
-) -> NpiStageOwnership:
-    """Recheck one local owner token against current catalog identities."""
-
-    if not isinstance(ownership, NpiStageOwnership):
-        raise NpiResultArchiveError("NPI archive stage ownership is invalid")
+async def verify_npi_stage_ownership(session: Any, ownership: NpiStageOwnership) -> NpiStageOwnership:
+    """Require the complete declared stage names and sequence bindings."""
+    if not isinstance(ownership, NpiStageOwnership) or ownership.schema_name != npi_stage_schema(ownership.dataset_id):
+        raise NpiResultArchiveError("NPI archive stage declaration is invalid")
     observed = await capture_npi_stage_ownership(
         session, dataset_id=ownership.dataset_id, canonical=_has_canonical(ownership)
     )
-    if observed != ownership:
-        raise NpiResultArchiveError("NPI archive stage ownership differs")
+    if tuple(name for name, _ in observed.relation_oids) != tuple(name for name, _ in ownership.relation_oids) or tuple(
+        (name, table, column) for name, _oid, table, column in observed.sequence_oids
+    ) != tuple((name, table, column) for name, _oid, table, column in ownership.sequence_oids):
+        raise NpiResultArchiveError("NPI archive stage declaration differs")
     return observed
 
 
@@ -1348,7 +1168,7 @@ async def _validate_stage_manifest(
     npi_alias_authority=None,
 ) -> tuple[NpiTableReceipt, ...]:
     if not ownership_verified:
-        await verify_npi_stage_ownership(session, ownership)
+        ownership = await verify_npi_stage_ownership(session, ownership)
     observed_tables = await _manifest_tables(
         session, ownership.schema_name, canonical=manifest.contract in MODEL_CONTRACTS
     )
@@ -1385,7 +1205,7 @@ async def capture_npi_alias_manifest(session, ownership, source_metadata, *, npi
     _require_transaction(session)
     if not _has_canonical(ownership) or ownership.freeze_function_oid is not None or ownership.freeze_trigger_oids:
         raise NpiResultArchiveError("NPI alias source requires native closed custody")
-    await verify_npi_stage_ownership(session, ownership)
+    ownership = await verify_npi_stage_ownership(session, ownership)
     metadata, metadata_sha = _source_metadata(source_metadata)
     await require_npi_alias_authority(session, npi_alias_authority, metadata.get(METADATA_KEY))
     await validate_canonical_closure(
@@ -1411,37 +1231,41 @@ async def capture_npi_alias_manifest(session, ownership, source_metadata, *, npi
 
 
 async def cleanup_npi_stage(session: Any, ownership: NpiStageOwnership) -> None:
-    """Drop only an unchanged UUID-owned stage using restrictive DDL."""
-
+    """Drop the complete named stage with bounded restrictive DDL and atomic rollback."""
     _require_transaction(session)
-    current_schema_oid = await session.scalar(
-        text("SELECT oid FROM pg_catalog.pg_namespace WHERE nspname=:schema_name"),
+    exists = await session.scalar(
+        text("SELECT EXISTS(SELECT FROM pg_catalog.pg_namespace WHERE nspname=:schema_name)"),
         {"schema_name": ownership.schema_name},
     )
-    if current_schema_oid is None:
+    if not exists:
         return
     async with _bounded_catalog_work(session):
-        await _lock_family(
-            session,
-            ownership.schema_name,
-            "ACCESS EXCLUSIVE",
-            nowait=True,
-            names=npi_archive_names(canonical=_has_canonical(ownership)),
-        )
-        await verify_npi_stage_ownership(session, ownership)
-    relations = ", ".join(
-        f"{_quoted(ownership.schema_name)}.{_quoted(table_name)}" for table_name, _ in ownership.relation_oids
-    )
-    await session.execute(text(f"DROP TABLE {relations} RESTRICT"))
-    remaining = await session.scalar(
-        text("SELECT count(*) FROM pg_catalog.pg_class WHERE relnamespace=:schema_oid"),
-        {"schema_oid": ownership.schema_oid},
-    )
-    if int(remaining or 0):
-        raise NpiResultArchiveError("NPI archive owned schema is not empty")
-    if ownership.freeze_function_oid is not None:
-        await session.execute(text(f"DROP FUNCTION {_quoted(ownership.schema_name)}.{_quoted(_FREEZE_FUNCTION)}()"))
-    await session.execute(text(f"DROP SCHEMA {_quoted(ownership.schema_name)}"))
+        async with session.begin_nested():
+            await _lock_family(
+                session,
+                ownership.schema_name,
+                "ACCESS SHARE",
+                nowait=True,
+                names=npi_archive_names(canonical=_has_canonical(ownership)),
+            )
+            ownership = await verify_npi_stage_ownership(session, ownership)
+            relations = ", ".join(
+                f"{_quoted(ownership.schema_name)}.{_quoted(table_name)}" for table_name, _ in ownership.relation_oids
+            )
+            await session.execute(text(f"DROP TABLE {relations} RESTRICT"))
+            remaining = await session.scalar(
+                text(
+                    "SELECT count(*) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n "
+                    "ON n.oid=c.relnamespace WHERE n.nspname=:schema_name"
+                ),
+                {"schema_name": ownership.schema_name},
+            )
+            if int(remaining or 0):
+                raise NpiResultArchiveError("NPI archive owned schema is not empty")
+            await session.execute(
+                text(f"DROP FUNCTION IF EXISTS {_quoted(ownership.schema_name)}.{_quoted(_FREEZE_FUNCTION)}() RESTRICT")
+            )
+            await session.execute(text(f"DROP SCHEMA {_quoted(ownership.schema_name)} RESTRICT"))
 
 
 async def _shielded_cleanup(session_factory: Any, ownership: NpiStageOwnership) -> None:
@@ -1547,12 +1371,6 @@ async def export_prepared_npi_archive(
     if verify_custody is not None and not callable(verify_custody):
         raise NpiResultArchiveError("NPI prepared source custody verifier is invalid")
     manifest = validate_npi_result_manifest(prepared.manifest)
-    if manifest.contract in MODEL_CONTRACTS and verify_custody is None:
-        raise NpiResultArchiveError("NPI canonical prepared source requires a custody verifier")
-    if verify_custody is None and (
-        prepared.ownership.freeze_function_oid is None or not prepared.ownership.freeze_trigger_oids
-    ):
-        raise NpiResultArchiveError("NPI prepared source is not frozen")
     async with session_factory() as stage_session, stage_session.begin():
         await stage_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
         async with _bounded_catalog_work(stage_session):
@@ -1720,7 +1538,7 @@ async def complete_npi_restore(session: Any, ownership: NpiStageOwnership, *, np
     """Finish native keys, checks and all model indexes before stage validation."""
 
     _require_transaction(session)
-    await verify_npi_stage_ownership(session, ownership)
+    ownership = await verify_npi_stage_ownership(session, ownership)
     metadata = MetaData(schema=ownership.schema_name)
     has_postgis = await _has_postgis(session)
     for model_type in npi_archive_models(canonical=_has_canonical(ownership)):
@@ -1786,7 +1604,7 @@ async def validate_npi_stage(
         await _lock_family(
             session, ownership.schema_name, "ACCESS SHARE", names=npi_archive_names(canonical=_has_canonical(ownership))
         )
-        await verify_npi_stage_ownership(session, ownership)
+        ownership = await verify_npi_stage_ownership(session, ownership)
     return await _validate_stage_manifest(
         session,
         ownership,
@@ -1796,114 +1614,76 @@ async def validate_npi_stage(
     )
 
 
-async def _verify_stage_owner(
-    session: Any,
-    ownership: NpiStageOwnership,
-    expected_owner_oid: int,
-) -> None:
-    if type(expected_owner_oid) is not int or expected_owner_oid <= 0:
-        raise NpiResultArchiveError("NPI archive stage owner is invalid")
-    schema_owner = await session.scalar(
-        text("SELECT nspowner FROM pg_catalog.pg_namespace WHERE oid=:schema_oid AND nspname=:schema_name"),
-        {"schema_oid": ownership.schema_oid, "schema_name": ownership.schema_name},
-    )
-    if schema_owner != expected_owner_oid:
-        raise NpiResultArchiveError("NPI archive stage owner differs")
-    owner_rows = list(
-        (
-            await session.execute(
-                text(
-                    "SELECT relation.relname, relation.oid, relation.relowner "
-                    "FROM pg_catalog.pg_class AS relation "
-                    "WHERE relation.oid=ANY(CAST(:relation_oids AS oid[])) "
-                    "ORDER BY relation.relname"
-                ),
-                {
-                    "relation_oids": [relation_oid for _, relation_oid in ownership.relation_oids]
-                    + [sequence_oid for _, sequence_oid, _, _ in ownership.sequence_oids]
-                },
-            )
-        ).mappings()
-    )
-    observed_owners = [
-        (owner_row["relname"], int(owner_row["oid"]), int(owner_row["relowner"])) for owner_row in owner_rows
-    ]
-    expected_owners = [
-        (table_name, relation_oid, expected_owner_oid) for table_name, relation_oid in ownership.relation_oids
-    ] + [
-        (sequence_name, sequence_oid, expected_owner_oid)
-        for sequence_name, sequence_oid, _, _ in ownership.sequence_oids
-    ]
-    expected_owners.sort()
-    if observed_owners != expected_owners:
-        raise NpiResultArchiveError("NPI archive stage owner differs")
-
-
-def _validation_inventory(value: object, *, canonical=False) -> tuple[tuple[str, int], ...]:
-    names = npi_archive_names(canonical=canonical)
+def _validation_inventory(value: object, *, canonical=False) -> tuple[tuple[str, None], ...]:
+    names = tuple(sorted(npi_archive_names(canonical=canonical)))
     if not isinstance(value, list) or len(value) != len(names):
         raise NpiResultArchiveError("NPI validation inventory is invalid")
-    pairs = []
-    for raw_pair, expected_name in zip(value, sorted(names), strict=True):
-        if (
-            not isinstance(raw_pair, list)
-            or len(raw_pair) != 2
-            or raw_pair[0] != expected_name
-            or type(raw_pair[1]) is not int
-            or raw_pair[1] <= 0
-        ):
+    observed_names = []
+    for entry in value:
+        if isinstance(entry, dict) and set(entry) == {"schema_name", "relation_name"}:
+            _schema_name(entry["schema_name"])
+            observed_names.append(entry["relation_name"])
+        elif isinstance(entry, list) and len(entry) == 2:
+            observed_names.append(entry[0])
+        else:
             raise NpiResultArchiveError("NPI validation inventory is invalid")
-        pairs.append((raw_pair[0], raw_pair[1]))
-    return tuple(pairs)
+    if tuple(observed_names) != names:
+        raise NpiResultArchiveError("NPI validation inventory is invalid")
+    return tuple((name, None) for name in names)
 
 
 def validate_npi_validation_receipt(receipt_value: object) -> NpiValidationReceipt:
-    """Validate durable stage evidence without treating it as authority."""
-
+    """Validate named receipt semantics while retaining a recorded legacy edition."""
     if isinstance(receipt_value, NpiValidationReceipt):
         receipt_value = receipt_value.as_dict()
-    expected_fields = {
+    common_fields = {
         "contract",
         "package_id",
         "profile_contract",
         "stage_schema",
-        "stage_schema_oid",
-        "relation_oids",
-        "sealed_owner_oid",
         "manifest_sha256",
         "tables",
         "validation_sha256",
     }
-    if not isinstance(receipt_value, Mapping) or set(receipt_value) != expected_fields:
+    legacy_fields = {"stage_schema_oid", "relation_oids", "sealed_owner_oid"}
+    if not isinstance(receipt_value, Mapping) or set(receipt_value) not in (
+        common_fields | {"relations"},
+        common_fields | legacy_fields,
+    ):
         raise NpiResultArchiveError("NPI validation receipt is invalid")
+    is_legacy = "relation_oids" in receipt_value
     if (
         receipt_value["contract"] != VALIDATION_CONTRACT
         or receipt_value["profile_contract"] not in (CONTRACT, *MODEL_CONTRACTS)
-        or _SHA256.fullmatch(str(receipt_value["package_id"])) is None
-        or _SHA256.fullmatch(str(receipt_value["manifest_sha256"])) is None
-        or type(receipt_value["stage_schema_oid"]) is not int
-        or receipt_value["stage_schema_oid"] <= 0
-        or type(receipt_value["sealed_owner_oid"]) is not int
-        or receipt_value["sealed_owner_oid"] <= 0
+        or any(
+            _SHA256.fullmatch(str(receipt_value[key])) is None
+            for key in ("package_id", "manifest_sha256", "validation_sha256")
+        )
     ):
         raise NpiResultArchiveError("NPI validation receipt is invalid")
-    schema_name = _schema_name(receipt_value["stage_schema"])
-    has_canonical = receipt_value["profile_contract"] in MODEL_CONTRACTS
-    relation_oids = _validation_inventory(receipt_value["relation_oids"], canonical=has_canonical)
-    tables = _validate_tables(receipt_value["tables"], canonical=has_canonical)
-    digest_by_field = {key: receipt_value[key] for key in expected_fields - {"validation_sha256"}}
-    if receipt_value["validation_sha256"] != _validation_digest(digest_by_field):
+    schema = _schema_name(receipt_value["stage_schema"])
+    is_canonical = receipt_value["profile_contract"] in MODEL_CONTRACTS
+    relations = _validation_inventory(
+        receipt_value["relation_oids" if is_legacy else "relations"], canonical=is_canonical
+    )
+    if not is_legacy and any(entry["schema_name"] != schema for entry in receipt_value["relations"]):
+        raise NpiResultArchiveError("NPI validation inventory is invalid")
+    tables = _validate_tables(receipt_value["tables"], canonical=is_canonical)
+    if not is_legacy and receipt_value["validation_sha256"] != _validation_digest(
+        {key: field_value for key, field_value in receipt_value.items() if key != "validation_sha256"}
+    ):
         raise NpiResultArchiveError("NPI validation digest differs")
     return NpiValidationReceipt(
         receipt_value["package_id"],
-        schema_name,
-        receipt_value["stage_schema_oid"],
-        relation_oids,
-        receipt_value["sealed_owner_oid"],
+        schema,
+        None,
+        relations,
+        None,
         receipt_value["manifest_sha256"],
         tables,
         receipt_value["validation_sha256"],
         receipt_value["profile_contract"],
+        json.loads(_canonical_json(receipt_value)) if is_legacy else None,
     )
 
 
@@ -1913,7 +1693,7 @@ async def prepare_npi_activation(
     ownership: NpiStageOwnership,
     manifest: Mapping[str, Any] | NpiResultManifest,
     package_id: str,
-    sealed_owner_oid: int,
+    sealed_owner_oid: int | None = None,
     npi_alias_authority=None,
 ) -> NpiValidationReceipt:
     """Perform long validation over an already publisher-frozen stage."""
@@ -1922,8 +1702,7 @@ async def prepare_npi_activation(
     validated = validate_npi_result_manifest(manifest)
     if _SHA256.fullmatch(str(package_id)) is None:
         raise NpiResultArchiveError("NPI validation package identity is invalid")
-    await verify_npi_stage_ownership(session, ownership)
-    await _verify_stage_owner(session, ownership, sealed_owner_oid)
+    ownership = await verify_npi_stage_ownership(session, ownership)
     await _advance_and_verify_stage_sequences(session, ownership)
     tables = await _validate_stage_manifest(
         session,
@@ -1936,9 +1715,9 @@ async def prepare_npi_activation(
         "package_id": package_id,
         "profile_contract": validated.contract,
         "stage_schema": ownership.schema_name,
-        "stage_schema_oid": ownership.schema_oid,
-        "relation_oids": [list(pair) for pair in ownership.relation_oids],
-        "sealed_owner_oid": sealed_owner_oid,
+        "relations": [
+            {"schema_name": ownership.schema_name, "relation_name": name} for name, _ in ownership.relation_oids
+        ],
         "manifest_sha256": _manifest_digest(validated),
         "tables": [table.as_dict() for table in tables],
     }
@@ -1961,14 +1740,14 @@ async def capture_npi_incumbent(session: Any, *, schema_name: str, canonical=Fal
             await _lock_family(session, schema, "ACCESS SHARE")
             if await _relation_pairs(session, schema, npi_archive_names(canonical=canonical)) != pairs:
                 raise NpiResultArchiveError("NPI incumbent changed during capture")
-    return NpiIncumbent(schema, pairs)
+    return NpiIncumbent(schema, tuple((name, oid is not None) for name, oid in pairs))
 
 
 async def _lock_and_verify_activation(
     session: Any,
     ownership: NpiStageOwnership,
     incumbent: NpiIncumbent,
-) -> None:
+) -> NpiStageOwnership:
     async with _bounded_catalog_work(session):
         await _lock_family(
             session,
@@ -1976,19 +1755,25 @@ async def _lock_and_verify_activation(
             "ACCESS EXCLUSIVE",
             names=npi_archive_names(canonical=_has_canonical(ownership)),
         )
-        present_names = tuple(name for name, oid in incumbent.relation_oids if oid is not None)
+        present_names = tuple(name for name, present in incumbent.relations if present)
         if present_names:
             await _lock_family(session, incumbent.schema_name, "ACCESS EXCLUSIVE", names=present_names)
-        await verify_npi_stage_ownership(session, ownership)
+        ownership = await verify_npi_stage_ownership(session, ownership)
         if (
-            await _relation_pairs(session, incumbent.schema_name, tuple(name for name, _ in incumbent.relation_oids))
-            != incumbent.relation_oids
+            tuple(
+                (name, oid is not None)
+                for name, oid in await _relation_pairs(
+                    session, incumbent.schema_name, tuple(name for name, _ in incumbent.relations)
+                )
+            )
+            != incumbent.relations
         ):
             raise NpiResultArchiveError("NPI incumbent changed")
+    return ownership
 
 
 async def _has_populated_incumbent(session: Any, incumbent: NpiIncumbent) -> bool:
-    if not all(relation_oid is not None for name, relation_oid in incumbent.relation_oids if name != CANONICAL_TABLE):
+    if not all(present for name, present in incumbent.relations if name != CANONICAL_TABLE):
         return False
     for table_name in RELATION_NAMES:
         populated = await session.scalar(
@@ -2004,13 +1789,13 @@ async def _rotate_relations(
     ownership: NpiStageOwnership,
     incumbent: NpiIncumbent,
 ) -> str | None:
-    incumbent_by_name = dict(incumbent.relation_oids)
+    incumbent_by_name = dict(incumbent.relations)
     predecessor_schema = None
-    if any(relation_oid is not None for relation_oid in incumbent_by_name.values()):
+    if any(incumbent_by_name.values()):
         predecessor_schema = npi_predecessor_schema(ownership.dataset_id)
         await session.execute(text(f"CREATE SCHEMA {_quoted(predecessor_schema)}"))
     for table_name, _oid in ownership.relation_oids:
-        if incumbent_by_name[table_name] is not None:
+        if incumbent_by_name[table_name]:
             await session.execute(
                 text(
                     f"ALTER TABLE {_quoted(incumbent.schema_name)}.{_quoted(table_name)} "
@@ -2025,7 +1810,7 @@ async def _rotate_relations(
         )
     remaining = await session.scalar(
         text("SELECT count(*) FROM pg_catalog.pg_class WHERE relnamespace=:schema_oid"),
-        {"schema_oid": ownership.schema_oid},
+        {"schema_oid": await _schema_oid(session, ownership.schema_name)},
     )
     if int(remaining or 0):
         raise NpiResultArchiveError("NPI stage schema is not empty after activation")
@@ -2033,20 +1818,14 @@ async def _rotate_relations(
     return predecessor_schema
 
 
-async def _remove_npi_clone_freeze(
-    session: Any,
-    ownership: NpiStageOwnership,
-) -> None:
-    """Remove only the exact verified clone guards inside the cutover lock."""
-
-    if ownership.freeze_function_oid is None or not ownership.freeze_trigger_oids:
-        return
-    await verify_npi_stage_ownership(session, ownership)
+async def _remove_npi_clone_freeze(session: Any, ownership: NpiStageOwnership) -> None:
     for table_name in RELATION_NAMES:
         relation = f"{_quoted(ownership.schema_name)}.{_quoted(table_name)}"
-        await session.execute(text(f"DROP TRIGGER {_quoted(_FREEZE_WRITE_TRIGGER)} ON {relation}"))
-        await session.execute(text(f"DROP TRIGGER {_quoted(_FREEZE_TRUNCATE_TRIGGER)} ON {relation}"))
-    await session.execute(text(f"DROP FUNCTION {_quoted(ownership.schema_name)}.{_quoted(_FREEZE_FUNCTION)}()"))
+        await session.execute(text(f"DROP TRIGGER IF EXISTS {_quoted(_FREEZE_WRITE_TRIGGER)} ON {relation}"))
+        await session.execute(text(f"DROP TRIGGER IF EXISTS {_quoted(_FREEZE_TRUNCATE_TRIGGER)} ON {relation}"))
+    await session.execute(
+        text(f"DROP FUNCTION IF EXISTS {_quoted(ownership.schema_name)}.{_quoted(_FREEZE_FUNCTION)}() RESTRICT")
+    )
 
 
 def _validate_cutover_bindings(
@@ -2057,10 +1836,8 @@ def _validate_cutover_bindings(
 ) -> None:
     if (
         validation.package_id != cutover.package_id
-        or validation.sealed_owner_oid != cutover.sealed_owner_oid
         or validation.stage_schema != ownership.schema_name
-        or validation.stage_schema_oid != ownership.schema_oid
-        or validation.relation_oids != ownership.relation_oids
+        or tuple(name for name, _ in validation.relation_oids) != tuple(name for name, _ in ownership.relation_oids)
         or validation.manifest_sha256 != _manifest_digest(manifest)
         or validation.tables != manifest.tables
         or validation.profile_contract != manifest.contract
@@ -2077,19 +1854,17 @@ async def _admit_automatic_cutover(
 ) -> None:
     if source_generation is None:
         raise NpiResultArchiveError("NPI automatic source generation is unavailable")
-    if tuple(name for name, _oid in incumbent.relation_oids) not in (
+    if tuple(name for name, _oid in incumbent.relations) not in (
         RELATION_NAMES,
         npi_archive_names(canonical=True),
     ):
         raise NpiResultArchiveError("NPI incumbent generation inventory is invalid")
-    incumbent_by_name = dict(incumbent.relation_oids)
-    incumbent_oids = tuple(incumbent_by_name[name] for name in RELATION_NAMES)
     if current_authority.serving_generation is None:
         if await _has_populated_incumbent(session, incumbent):
             raise NpiResultArchiveError("NPI legacy incumbent requires manual adoption")
         return
-    if current_authority.relation_oids != incumbent_oids:
-        raise NpiResultArchiveError("NPI incumbent generation is drifted")
+    if current_authority.relations != tuple((incumbent.schema_name, name) for name in RELATION_NAMES):
+        raise NpiResultArchiveError("NPI incumbent generation name differs")
     try:
         require_npi_automatic_generation_order(
             source_generation,
@@ -2099,7 +1874,7 @@ async def _admit_automatic_cutover(
         raise NpiResultArchiveError("NPI automatic generation is stale or unrelated") from error
 
 
-async def _preserve_npi_input_reads(session, ownership, incumbent, expected_stage_owner_oid):
+async def _preserve_npi_input_reads(session, ownership, incumbent):
     from process.native_publication_read_access import preserve_publication_reads
 
     connection = await session.connection()
@@ -2111,7 +1886,6 @@ async def _preserve_npi_input_reads(session, ownership, incumbent, expected_stag
             live_table=name,
             stage_schema=ownership.schema_name,
             stage_table=name,
-            expected_stage_owner_oid=expected_stage_owner_oid,
         )
 
 
@@ -2122,9 +1896,8 @@ async def _activate_npi_relations(
     incumbent: NpiIncumbent,
     manifest: NpiResultManifest,
     validation: NpiValidationReceipt,
-    expected_stage_owner_oid: int,
 ) -> NpiActivationReceipt:
-    await _preserve_npi_input_reads(session, ownership, incumbent, expected_stage_owner_oid)
+    await _preserve_npi_input_reads(session, ownership, incumbent)
     await _remove_npi_clone_freeze(session, ownership)
     await install_npi_stage_mutation_guards(
         session,
@@ -2136,7 +1909,7 @@ async def _activate_npi_relations(
     live_pairs = await _relation_pairs(
         session, incumbent.schema_name, npi_archive_names(canonical=_has_canonical(ownership))
     )
-    if tuple(sorted(live_pairs)) != ownership.relation_oids or any(
+    if tuple(sorted(name for name, _ in live_pairs)) != tuple(name for name, _ in ownership.relation_oids) or any(
         relation_oid is None for _, relation_oid in live_pairs
     ):
         raise NpiResultArchiveError("NPI activated relation identity differs")
@@ -2154,15 +1927,16 @@ async def _activate_npi_relations(
         source_generation=manifest.source_serving_generation,
         canonical_provenance=None if manifest.contract in MODEL_CONTRACTS else manifest.canonical_provenance,
     )
-    ordered_oids = tuple(int(dict(live_pairs)[name]) for name in RELATION_NAMES)
     if manifest.source_serving_generation is None:
-        if adopted.serving_generation is not None or adopted.relation_oids is not None:
+        if adopted.serving_generation is not None or adopted.relations is not None:
             raise NpiResultArchiveError("NPI generation-less adoption differs")
-    elif adopted.serving_generation != manifest.source_serving_generation or adopted.relation_oids != ordered_oids:
+    elif adopted.serving_generation != manifest.source_serving_generation or adopted.relations != tuple(
+        (incumbent.schema_name, name) for name in RELATION_NAMES
+    ):
         raise NpiResultArchiveError("NPI adopted generation differs")
     return NpiActivationReceipt(
-        tuple((name, int(relation_oid)) for name, relation_oid in live_pairs),
-        incumbent.relation_oids,
+        tuple((incumbent.schema_name, name) for name, _ in live_pairs),
+        tuple((predecessor_schema, name) for name, present in incumbent.relations if present),
         predecessor_schema,
         validation.tables,
         adopted,
@@ -2197,12 +1971,11 @@ async def activate_validated_npi_stage(
         raise NpiResultArchiveError("NPI alias output requires constructor-owned activation")
     validation = validate_npi_validation_receipt(validation_receipt)
     _validate_cutover_bindings(ownership, validated_manifest, validation, cutover)
-    if tuple(name for name, _oid in incumbent.relation_oids) != npi_archive_names(
+    if tuple(name for name, _oid in incumbent.relations) != npi_archive_names(
         canonical=validated_manifest.contract in MODEL_CONTRACTS
     ):
         raise NpiResultArchiveError("NPI incumbent activation inventory differs")
-    await _lock_and_verify_activation(session, ownership, incumbent)
-    await _verify_stage_owner(session, ownership, cutover.expected_stage_owner_oid)
+    ownership = await _lock_and_verify_activation(session, ownership, incumbent)
     await _advance_and_verify_stage_sequences(session, ownership)
     current_authority = await read_npi_result_generation_authority(
         session,
@@ -2223,7 +1996,6 @@ async def activate_validated_npi_stage(
         incumbent=incumbent,
         manifest=validated_manifest,
         validation=validation,
-        expected_stage_owner_oid=cutover.expected_stage_owner_oid,
     )
     await on_activated(session, receipt)
     return receipt

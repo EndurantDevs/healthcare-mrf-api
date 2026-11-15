@@ -72,6 +72,7 @@ def legacy_function_rows(monkeypatch):
         name + "(" + ",".join(arg.strip().split(None, 1)[1] for arg in args.split(",") if arg) + ")": body
         for name, args, _returns, _options, _delimiter, body in pattern.findall("\n".join(statements))
     }
+    bodies_by_signature.pop("guard_pd_dataset_migration_owner()")
     assert bodies_by_signature.keys() == checks._LEGACY_FUNCTIONS.keys()
     return [
         legacy_catalog_entry(index, signature, spec, bodies_by_signature[signature])
@@ -134,7 +135,7 @@ async def test_candidate_callable_contract_and_exact_writer_acl(monkeypatch, dam
     harness.connection.fetch.return_value = function_rows
     if damage is None:
         actual = await harness.verifier._candidate_functions(plan_by_field)
-        assert len(actual) == 17 and actual.keys() == {int(row["definition"]["oid"]) for row in function_rows}
+        assert len(actual) == 16 and actual.keys() == {int(row["definition"]["oid"]) for row in function_rows}
     else:
         with pytest.raises(ValueError if damage == "body" else GenericCandidateError):
             await harness.verifier._candidate_functions(plan_by_field)

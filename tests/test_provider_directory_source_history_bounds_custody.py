@@ -13,18 +13,13 @@ from process import provider_directory_generic_source_provision as provision
 from process import provider_directory_source_storage_binding as binding
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
-from tests.test_provider_directory_cms_history_bounds import _observed_bound
 
 
 @pytest.fixture
 def inventory_case(monkeypatch):
-    expected_by_root = {}
-    for number, root in enumerate(bounds.history.ROOTS):
-        native = _observed_bound([])
-        native["constraints"][0]["oid"] += number
-        expected_by_root[root] = dict(
-            old_oid=701 + number, dataset_ids=[], native=bounds.require_cms_history_bound(native, [])
-        )
+    expected_by_root = {
+        root: {"relation": {"schema": "catalog", "name": root}, "dataset_ids": []} for root in bounds.history.ROOTS
+    }
     policy = GenericSourcePolicy("private_source", "source_owner", "source_publisher", ("source_reader",))
     evidence_by_field = dict(
         catalog=[], templates=[], layouts=[], physical=[], checkpoints=[], readers_closed=True, dependencies_closed=True
@@ -40,8 +35,6 @@ def inventory_case(monkeypatch):
             if schema == "catalog":
                 layout_by_field["oid"] += 1000
                 if root in expected_by_root:
-                    entry = expected_by_root[root]
-                    layout_by_field["oid"] = entry["old_oid"]
                     layout_by_field["constraints"] = [
                         [
                             "cms_history_bound",
@@ -51,7 +44,7 @@ def inventory_case(monkeypatch):
                             False,
                             False,
                             True,
-                            entry["native"]["constraint"]["oid"],
+                            901 + number,
                         ]
                     ]
             evidence_by_field["layouts"].append(layout_by_field)
@@ -93,9 +86,7 @@ def test_only_explicit_authenticated_bound_delta_is_projected(inventory_case):
     assert _inventory(case) == observed
 
 
-@pytest.mark.parametrize(
-    "fault", ["private", "other_root", "oid", "constraint_oid", "flags", "kind", "missing", "duplicate"]
-)
+@pytest.mark.parametrize("fault", ["private", "other_root", "flags", "kind", "duplicate"])
 def test_projection_cannot_hide_an_unrelated_or_private_check(inventory_case, fault):
     case = inventory_case
     canonical = _layout(case)
@@ -103,11 +94,8 @@ def test_projection_cannot_hide_an_unrelated_or_private_check(inventory_case, fa
     faults_by_name = dict(
         private=(_layout(case, private=True), "constraints", [deepcopy(check)]),
         other_root=(_layout(case, provision.HEADER), "constraints", [deepcopy(check)]),
-        oid=(canonical, "oid", canonical["oid"] + 1),
-        constraint_oid=(check, -1, check[-1] + 1),
         flags=(check, 3, False),
         kind=(check, 1, "u"),
-        missing=(canonical, "constraints", []),
         duplicate=(canonical, "constraints", [deepcopy(check), deepcopy(check)]),
     )
     changed, key, replacement = faults_by_name[fault]
@@ -220,3 +208,13 @@ async def test_native_bound_refusal_prevents_catalog_projection(inventory_case, 
             expected_history_bounds=inventory_case.expected,
         )
     catalog.assert_not_awaited()
+
+
+def test_equivalent_named_bound_projection_ignores_recreated_object_ids(inventory_case):
+    case = inventory_case
+    original = _inventory(case)
+    for root in bounds.history.ROOTS:
+        canonical = _layout(case, root)
+        canonical["oid"] += 10000
+        canonical["constraints"][0][-1] += 10000
+    assert _inventory(case) == original

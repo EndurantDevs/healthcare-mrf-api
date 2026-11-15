@@ -1,19 +1,19 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """An original Reader pins a locally published CMS candidate before retention."""
 
-import asyncio
 import copy
 import sys
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from weakref import WeakKeyDictionary
 
+from sqlalchemy import text
+
 from db.connection import Database
 from db.plan_release_storage import storage_relation
 from process import network_fhir_source_custody as custody
 from process import network_fhir_source_epoch as epoch
 from process import provider_directory_generic_source_storage as storage
-from process.provider_directory_dataset_rehydrate_pin import _close_reader, _require_reader, _same_database
 from process.provider_directory_generic_source_policy import (
     bound_publisher,
     source_transaction,
@@ -56,7 +56,7 @@ class _CopyConnections:
 
 @dataclass(eq=False, frozen=True)
 class PinnedCMSFHIRSourceEpochInput:
-    """Only the issuing context, original task and open Reader may use this input."""
+    """Named immutable inputs and their active native read-only transaction."""
 
     source_pin: object
     admission_sha256: str
@@ -67,21 +67,27 @@ class PinnedCMSFHIRSourceEpochInput:
         receipt = _INPUTS.get(self)
         _require(
             receipt is not None
-            and receipt["task"] is asyncio.current_task()
-            and receipt["connection"] is self.connection
             and self.connection.is_in_transaction()
             and receipt["identity"] == (self.source_pin, self.admission_sha256, self.metadata_sha256)
         )
         return receipt
 
     def require_active(self):
-        """Reject forged, expired, cross-task or changed native input handles."""
+        """Require the active input lifetime and unchanged logical source selection."""
         self._receipt()
 
     async def verify_transaction(self):
-        """A committed and reopened Reader cannot reuse the original physical pins."""
-        receipt = self._receipt()
-        _require(await _virtual_xid(self.connection) == receipt["virtual_xid"])
+        """Require an actual stable read-only transaction without retaining its identity."""
+        self._receipt()
+        settings = await self.connection.fetchrow(
+            "SELECT current_setting('transaction_isolation') AS isolation,"
+            "current_setting('transaction_read_only') AS readonly"
+        )
+        _require(
+            settings is not None
+            and settings["isolation"] in {"repeatable read", "serializable"}
+            and settings["readonly"] == "on"
+        )
 
     def relation(self, table):
         """Return only a fixed root's authenticated pinned native relation."""
@@ -97,31 +103,9 @@ class PinnedCMSFHIRSourceEpochInput:
         return self._receipt()["columns"][table]
 
     def copy_connections(self, target):
-        """Pair the existing bounded spool with its distinct retained writer."""
-        _require(target is not self.connection)
+        """Route the existing bounded spool through native source and target access."""
         self.require_active()
         return _CopyConnections(self, target)
-
-    async def require_target(self, connection, owner_role):
-        """Reject SourceOwner reachability and a different physical database."""
-        receipt = self._receipt()
-        await self.verify_transaction()
-        _require(owner_role != receipt["policy"].owner_role and connection is not self.connection)
-        actor = await connection.fetchrow(
-            "SELECT session_user::text AS login,current_user::text AS actor,"
-            "pg_has_role(session_user,$1,'USAGE') OR pg_has_role(session_user,$1,'SET') AS source_owner",
-            receipt["policy"].owner_role,
-        )
-        _require(actor["login"] == actor["actor"] and not actor["source_owner"])
-        await _same_database(self.connection, connection)
-
-
-async def _virtual_xid(connection):
-    value = await connection.fetchval(
-        "SELECT virtualxid FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='virtualxid' AND granted"
-    )
-    _require(type(value) is str and bool(value))
-    return value
 
 
 async def _header(connection, pin, *, lock=False):
@@ -237,17 +221,6 @@ async def _pin(driver, policy, native, relations):
         record["relname"]: dict(record) for record in await verify_generic_source_family(driver, policy)
     }
     _require(all(observed_by_name[root] == captured_by_name[root] for root in storage.CMS_IDENTITY_ROOTS))
-    oids = await driver.fetch(
-        "SELECT name,to_regclass(name)::oid::bigint AS oid FROM unnest($1::text[]) n(name)", locks
-    )
-    _require(
-        await driver.fetchval(
-            "SELECT count(*)=$2 FROM pg_locks WHERE pid=pg_backend_pid() AND granted "
-            "AND mode='AccessShareLock' AND relation=ANY($1::oid[])",
-            [row["oid"] for row in oids],
-            len(oids),
-        )
-    )
 
 
 @asynccontextmanager
@@ -272,9 +245,10 @@ async def pinned_cms_source_epoch(directory, source_pin, *, expected_admission_s
             )
             reader_database = await directory.db._connect_reader()
             session = reader_database.session_factory()
-            cleanup.push_async_callback(_close_reader, session)
-            driver = await _require_reader(session, reader_database, policy)
-            await _same_database(publisher.connection, driver)
+            cleanup.push_async_callback(session.close)
+            await cleanup.enter_async_context(session.begin())
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            driver = (await (await session.connection()).get_raw_connection()).driver_connection
             await _pin(driver, policy, native, relations)
             _require(await _header(driver, source_pin) == header)
             _require(await _control_custody(driver, policy) == controls)
@@ -289,12 +263,9 @@ async def pinned_cms_source_epoch(directory, source_pin, *, expected_admission_s
         columns = await _columns(driver, relations)
         issued = PinnedCMSFHIRSourceEpochInput(source_pin, expected_admission_sha256, expected_metadata_sha256, driver)
         _INPUTS[issued] = dict(
-            task=asyncio.current_task(),
-            connection=driver,
             policy=policy,
             relations=relations,
             columns=columns,
-            virtual_xid=await _virtual_xid(driver),
             identity=(source_pin, expected_admission_sha256, expected_metadata_sha256),
         )
         cleanup.callback(_INPUTS.pop, issued)

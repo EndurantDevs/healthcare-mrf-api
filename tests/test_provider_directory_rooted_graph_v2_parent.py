@@ -125,14 +125,16 @@ class _ProofDatabase:
     def __init__(self, *, valid=True):
         self.valid = valid
         self.proof_reads = 0
+        self.proof_statements = []
 
-    async def scalar(self, _statement, **_parameters):
+    async def scalar(self, statement, **parameters):
         self.proof_reads += 1
+        self.proof_statements.append((statement, parameters))
         return self.valid
 
 
 @pytest.mark.asyncio
-async def test_v2_current_requires_database_identity_and_ready_proofs(
+async def test_v2_current_requires_the_combined_receipt_proof(
     monkeypatch,
 ) -> None:
     current = replace(exact_current(variant="rooted_combined"), root_publication_contract_id=ROOTED_V2)
@@ -154,7 +156,16 @@ async def test_v2_current_requires_database_identity_and_ready_proofs(
     database = _ProofDatabase()
     observed = await publication.lock_exact_current_dataset(database, pair=publication.exact_uhc_dataset_pair())
     assert observed == current
+    from db.migration_rooted_publication_freeze import native_receipt_sql
+
     assert database.proof_reads == 2
+    assert database.proof_statements == [
+        (
+            native_receipt_sql(publication._schema_name(), ":dataset_id", official_current=False),
+            {"dataset_id": current.dataset_id},
+        ),
+        (native_receipt_sql(publication._schema_name(), ":dataset_id"), {"dataset_id": current.dataset_id}),
+    ]
     with pytest.raises(publication.ProviderDirectoryDatasetScopedPublicationError):
         await publication.lock_exact_current_dataset(
             _ProofDatabase(valid=False), pair=publication.exact_uhc_dataset_pair()

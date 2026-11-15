@@ -124,8 +124,8 @@ async def test_missing_group_is_not_found_even_if_candidate_binding_exists(monke
         "UPDATE reference_family_result_generation SET origin_lineage_id = NULL",
         "UPDATE reference_family_result_generation SET origin_generation = 0",
         "UPDATE reference_family_result_generation SET published_at = NULL",
-        "UPDATE reference_family_result_generation SET relation_oids = relation_oids[1:2]",
-        "UPDATE reference_family_result_generation SET relation_oids[3] = 1",
+        "UPDATE reference_family_result_generation SET serving_relation_names = serving_relation_names[1:2]",
+        "UPDATE reference_family_result_generation SET serving_relation_names[3] = 'other_site'",
         "DELETE FROM provider_directory_cms_doctors_group_binding WHERE org_pac_id = 'synthetic-pac-beta'",
         "DELETE FROM provider_directory_cms_doctors_site_binding WHERE adrs_id = 'synthetic-address-beta'",
     ],
@@ -135,6 +135,22 @@ async def test_unaccepted_or_incompletely_bound_source_never_returns_partial_pag
         await _change(sessions, mutation)
         with pytest.raises(DirectoryReadError) as caught:
             await _read(sessions, directory_query())
+        assert caught.value.status == 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["medical-groups", "sites"])
+@pytest.mark.parametrize("recorded_schema", ["another_schema", None])
+async def test_ledger_for_another_schema_cannot_serve_configured_rows(monkeypatch, kind, recorded_schema):
+    """Same generation id, but the recorded serving names point elsewhere: both reads refuse."""
+    async with directory_database(monkeypatch) as sessions:
+        query = replace(directory_query(), kind=kind)
+        assert (await _read(sessions, query))["items"]
+        if recorded_schema is None:
+            return
+        await _change(sessions, f"UPDATE reference_family_result_generation SET serving_schema = '{recorded_schema}'")
+        with pytest.raises(DirectoryReadError) as caught:
+            await _read(sessions, query)
         assert caught.value.status == 503
 
 
@@ -206,16 +222,6 @@ async def test_cutover_lock_contention_fails_closed_and_releases_transaction(mon
                 assert result.status == 503
                 assert not reader.in_transaction()
         assert len((await _read(sessions, directory_query()))["items"]) == 2
-
-
-@pytest.mark.asyncio
-async def test_relation_replacement_without_matching_authority_is_unavailable(monkeypatch):
-    async with directory_database(monkeypatch) as sessions:
-        await _change(sessions, "ALTER TABLE cms_doctor_group_site RENAME TO former_group_site")
-        await _change(sessions, "CREATE TABLE cms_doctor_group_site (LIKE former_group_site INCLUDING ALL)")
-        with pytest.raises(DirectoryReadError) as caught:
-            await _read(sessions, directory_query())
-        assert caught.value.status == 503
 
 
 @pytest.mark.asyncio

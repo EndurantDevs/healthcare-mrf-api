@@ -28,13 +28,13 @@ def test_witness_receipt_rejects_missing_original_anchor_fields(anchored, missin
 def test_witness_receipt_never_turns_partial_retained_anchors_into_local_ownership():
     recipe, descriptor, derivation = rows(anchored=True)
     root, _ = prepared([(recipe, descriptor, derivation)])
-    descriptor.pop("fact_table_oid")
+    descriptor.pop("fact_table_name")
     stage = SimpleNamespace(contribution_receipts=(descriptor,), contribution_revision=2)
     with pytest.raises(store.RegistrySourceContributionError, match="witness_descriptor_invalid"):
         store.registry_source_contribution_receipt(stage, inventory_root=root)
     assert descriptor["fact_candidate_id"] == str(UUID(int=9))
-    assert descriptor["fact_seal_sha256"] == "f" * 64
-    assert "fact_table_oid" not in descriptor
+    assert descriptor["fact_generation_id"] == "f" * 64
+    assert "fact_table_name" not in descriptor
 
 
 @pytest.mark.parametrize("version", [True, 3])
@@ -42,7 +42,7 @@ def test_receipt_rejects_unknown_explicit_versions_before_anchor_backfill(versio
     recipe, descriptor, derivation = rows()
     root, _ = prepared([(recipe, descriptor, derivation)])
     descriptor["descriptor_version"] = version
-    descriptor.pop("fact_table_oid")
+    descriptor.pop("fact_table_name")
     stage = SimpleNamespace(contribution_receipts=(descriptor,), contribution_revision=2)
     with pytest.raises(store.RegistrySourceContributionError, match="witness_descriptor_invalid"):
         store.registry_source_contribution_receipt(stage, inventory_root=root)
@@ -52,8 +52,12 @@ def test_receipt_rejects_unknown_explicit_versions_before_anchor_backfill(versio
 def test_legacy_receipt_anchor_backfill_stays_exact(include_partial):
     descriptor = _descriptor(_recipe())
     if include_partial:
-        descriptor.update(fact_candidate_id=str(UUID(int=9)), fact_seal_sha256="f" * 64)
+        descriptor.update(fact_candidate_id=str(UUID(int=9)), fact_generation_id="f" * 64)
     stage = SimpleNamespace(contribution_receipts=(descriptor,), contribution_revision=2)
+    if include_partial:
+        with pytest.raises(store.RegistrySourceContributionError):
+            store.registry_source_contribution_receipt(stage)
+        return
     receipt = store.registry_source_contribution_receipt(stage)
     assert receipt["revision"] == 2
     assert all(receipt["sources"][0][field] is None for field in store.FACT_ANCHOR_FIELDS)

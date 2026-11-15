@@ -18,8 +18,10 @@ from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Mapping
+from uuid import uuid4
 
 from process import entity_address_result_generation as result_generation
+from process.entity_address_retained_names import retained_address_name
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
@@ -186,8 +188,8 @@ async def prepare_completed_entity_address_snapshot_adoption(
     """Prepare one result, preserving its origin or explicitly adopting legacy input.
 
     A missing ``source_serving_generation`` denotes a generation-less manual
-    archive and causes activation to clear the destination serving tuple while
-    leaving its local generation counter unchanged.
+    archive. Activation clears the source serving tuple and advances the local
+    generation counter to distinguish that adopted edition from its predecessor.
     """
 
     normalized_schema, normalized_import_date = _validated_snapshot_destination(
@@ -347,42 +349,27 @@ async def adopt_prepared_entity_address_snapshot(
 
 
 async def prepare_entity_address_publisher_reimport(session, *, db_schema, import_date, dependency_bindings=None):
-    """Freeze a completed ordinary seven-table stage before its publisher set validation."""
+    """Finish projection, close native writes, and validate the complete named stage."""
     from process import entity_address_snapshot_preparation as protected
+    from process import reference_family_archive as archive
+    from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
 
-    owner_oid = await protected._publisher_authority(session)
+    await protected._publisher_authority(session)
     schema, date = _validated_snapshot_destination(db_schema=db_schema, import_date=import_date)
-    await protected._require_alias_authority(session, schema, owner_oid)
+    await protected._require_alias_authority(session, schema)
     stage, _support, swaps, _patches, _relations, _required = _prepared_full_result_stage(
         db_schema=schema, import_date=date
     )
-    tables = ",".join(f'"{schema}"."{swap.stage_cls.__tablename__}"' for swap in swaps)
+    stage_names = tuple(swap.stage_cls.__tablename__ for swap in swaps)
+    tables = ",".join(f'"{schema}"."{name}"' for name in stage_names)
     await session.execute(protected.text(f"LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE NOWAIT"))
-    stage_oid_by_name = {}
-    for swap in swaps:
-        oid = await session.scalar(
-            protected.text("SELECT to_regclass(:relation)::oid"),
-            {"relation": f'"{schema}"."{swap.stage_cls.__tablename__}"'},
-        )
-        await protected._seal_published_relation(session, oid, owner_oid)
-        stage_oid_by_name[swap.stage_cls.__tablename__] = oid
     binding = entity_address_unified.db._transaction_binding()
     if binding is not None and binding.session is not session:
         raise RuntimeError("address publisher reimport session differs")
     geo_context_by_field = {}
     async with entity_address_unified.db.bind_existing_session(session) if binding is None else nullcontext():
         if dependency_bindings is not None:
-            await protected._lock_publication_state(session, schema, owner_oid)
-            geo_state_oid = await session.scalar(
-                protected.text("SELECT oid FROM pg_class WHERE oid=to_regclass(:relation) AND relowner=:owner"),
-                {
-                    "relation": f'"{schema}"."{entity_address_unified.geo_projection.GEO_ASSURANCE_STATE_TABLE}"',
-                    "owner": owner_oid,
-                },
-            )
-            if type(geo_state_oid) is not int or geo_state_oid <= 0:
-                raise RuntimeError("address publisher geo state owner differs")
-            await protected._require_no_untrusted_mutation(session, [geo_state_oid], owner_oid)
+            await protected._lock_publication_state(session, schema)
             geo_context_by_field[
                 "geo_assurance_projected_rows"
             ] = await entity_address_unified._materialize_geo_assurance(
@@ -394,75 +381,159 @@ async def prepare_entity_address_publisher_reimport(session, *, db_schema, impor
                 stage_rows=0,
                 dependency_bindings=dependency_bindings,
             )
-            if geo_context_by_field["geo_assurance_candidate_table_oid"] != stage_oid_by_name[stage.__tablename__]:
+            if geo_context_by_field.get("geo_assurance_candidate_relation") != {
+                "schema_name": schema,
+                "relation_name": stage.__tablename__,
+            }:
                 raise RuntimeError("address publisher projection stage differs")
+        owner, readers = archive.model_family_roles()
+        driver = await archive._native_model_copy_driver(session, ("execute", "fetch", "is_in_transaction"))
+        await freeze_fhir_source_snapshot(
+            driver,
+            schema,
+            namespace_owner=owner,
+            reader_roles=readers,
+            application_roles=(),
+            relation_names=stage_names,
+            freeze_schema=False,
+        )
         prepared = await prepare_completed_entity_address_snapshot_adoption(db_schema=schema, import_date=date)
     prepared.context.update(geo_context_by_field)
     prepared.context.update(
         snapshot_contract="entity_address_unified.postgres.v2",
-        protected_owner_oid=owner_oid,
-        protected_stage_oids=stage_oid_by_name,
+        stage_relations=[{"schema_name": schema, "relation_name": name} for name in stage_names],
         result_generation_mode="ordinary",
         source_serving_generation=None,
     )
     return prepared
 
 
-async def _prepare_protected_ordinary_rotation(db_schema, stage_cls, partial_support_patch, context):
-    """Require publisher custody when an ordinary import replaces a protected result."""
-    db = entity_address_unified.db
-    protected_owner = await db.scalar(
-        "SELECT c.relowner FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-        "JOIN pg_namespace authority ON authority.nspname='hp_snapshot_retention' AND authority.nspowner=c.relowner "
-        "WHERE n.nspname=:schema AND c.relname='entity_address_unified'",
-        schema=db_schema,
-    )
-    if type(protected_owner) is not int:
-        return
-    if partial_support_patch:
-        raise RuntimeError("protected address reimport requires a full isolated replacement")
-    async with db.transaction() as publisher_session:
-        sealed = await prepare_entity_address_publisher_reimport(
-            publisher_session,
-            db_schema=db_schema,
-            import_date=stage_cls.__tablename__.removeprefix(
-                entity_address_unified.EntityAddressUnified.__tablename__ + "_"
-            ),
+async def _is_registered_snapshot(db, db_schema, names):
+    """A protected snapshot is registered in the retention claims; table ownership does not decide it."""
+    from process.nucc_retention_read_view import _CLAIM_SOURCE_SQL, NuccRetentionReadError, claim_relations_source
+
+    if await db.scalar("SELECT pg_catalog.to_regnamespace('hp_snapshot_retention') IS NULL") is not False:
+        return False
+    try:
+        claims = claim_relations_source(await db.scalar(_CLAIM_SOURCE_SQL))
+    except NuccRetentionReadError:
+        # An incomplete catalogue cannot show that the table is unprotected.
+        return True
+    return (
+        await db.scalar(
+            f"SELECT EXISTS(SELECT 1 FROM {claims} claims "
+            "WHERE claims.schema_name=:schema AND claims.relation_name=ANY(CAST(:names AS text[])))",
+            schema=db_schema,
+            names=list(names),
         )
-    context.update(sealed.context)
+        is True
+    )
+
+
+async def _retained_serving_generation(session, db_schema):
+    """Read only the portable incumbent once while the publisher holds its cutover fence."""
+    from sqlalchemy import text
+
+    schema = result_generation._schema_name(db_schema)
+    state = await session.scalar(
+        text("SELECT to_regclass(:relation)"),
+        {
+            "relation": f'"{schema}"."{result_generation.TABLE_NAME}"',
+        },
+    )
+    origin_row = (
+        None
+        if state is None
+        else (
+            (
+                await session.execute(
+                    text(
+                        f'SELECT origin_lineage_id,origin_generation,published_at FROM "{schema}".entity_address_result_generation '
+                        "WHERE singleton IS TRUE"
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    )
+    if state is not None and origin_row is None:
+        raise RuntimeError("retained address generation is unavailable")
+    generation_by_field = {} if origin_row is None else dict(origin_row)
+    if not generation_by_field or all(field_value is None for field_value in generation_by_field.values()):
+        return None
+    return result_generation.validate_entity_address_serving_generation(generation_by_field)
+
+
+async def _prepare_protected_ordinary_rotation(db_schema, swaps, partial_support_patch, context):
+    """Capture the locked incumbent once without invoking full-family preparation."""
+    from process.network_compact_layout import CompactAddressRelation
+    from process.network_compact_retention import require_network_compact_artifacts_unreferenced
+    from process.provider_directory_serving_recovery import GENERATION_PARAM
+    from process.reference_family_archive import _native_model_copy_driver
+
+    binding = entity_address_unified.db._transaction_binding()
+    if binding is None:
+        raise RuntimeError("address rotation requires a publisher transaction")
+    generation = await _retained_serving_generation(binding.session, db_schema)
+    if "stage_relations" in context or context.get("snapshot_contract") == "entity_address_unified.postgres.v2":
+        return generation
+    if partial_support_patch:
+        raise RuntimeError("retained address reimport requires a full isolated replacement")
+    if generation is None or context.get(GENERATION_PARAM) is not None:
+        driver = await _native_model_copy_driver(binding.session, ("execute", "fetch", "is_in_transaction"))
+        names = [
+            CompactAddressRelation(db_schema, name)
+            for swap in swaps
+            for name in (swap.live_cls.__main_table__, swap.live_cls.__main_table__ + "_old")
+        ]
+        projection = await require_network_compact_artifacts_unreferenced(driver, names)
+        await require_network_compact_artifacts_unreferenced(driver, names, expected_projection=projection)
+    return generation
 
 
 async def _require_protected_cutover(db_schema, swaps, context):
-    """Bind frozen stage OIDs and reject a legacy destructive rotation of protected history."""
+    """Bind the exact declared named stage before replacing a retained generation."""
     db = entity_address_unified.db
-    if context.get("snapshot_contract") == "entity_address_unified.postgres.v2":
-        expected = context.get("protected_stage_oids")
-        if not isinstance(expected, Mapping) or set(expected) != {swap.stage_cls.__tablename__ for swap in swaps}:
+    if "stage_relations" in context or context.get("snapshot_contract") == "entity_address_unified.postgres.v2":
+        expected_names = {swap.stage_cls.__tablename__ for swap in swaps}
+        entries = context.get("stage_relations")
+        if entries is None and isinstance(context.get("protected_stage_oids"), Mapping):
+            # Historical addresses remain opaque; only their declared names select tables.
+            entries = [{"schema_name": db_schema, "relation_name": name} for name in context["protected_stage_oids"]]
+        if (
+            not isinstance(entries, list)
+            or len(entries) != len(expected_names)
+            or any(
+                not isinstance(entry, Mapping)
+                or set(entry) != {"schema_name", "relation_name"}
+                or entry["schema_name"] != db_schema
+                for entry in entries
+            )
+            or {entry["relation_name"] for entry in entries} != expected_names
+        ):
             raise RuntimeError("protected address stage inventory differs")
-        for stage_name, oid in expected.items():
-            actual = await db.scalar("SELECT to_regclass(:relation)::oid", relation=f'"{db_schema}"."{stage_name}"')
-            if actual != oid:
-                raise RuntimeError("protected address stage OID differs")
+        for name in expected_names:
+            await db.scalar(f'SELECT count(*) FROM (SELECT 1 FROM "{db_schema}"."{name}" LIMIT 0) AS stage')
         context["retained_relations"] = []
         return
-    protected = await db.scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-        "JOIN pg_namespace authority ON authority.nspname='hp_snapshot_retention' AND authority.nspowner=c.relowner "
-        "WHERE n.nspname=:schema AND c.relname=ANY(:names))",
-        schema=db_schema,
-        names=[swap.live_cls.__main_table__ for swap in swaps],
-    )
-    if protected is True:
+    if await _is_registered_snapshot(
+        db,
+        db_schema,
+        [name for swap in swaps for name in (swap.live_cls.__main_table__, swap.live_cls.__main_table__ + "_old")],
+    ):
         raise RuntimeError("legacy address rotation cannot replace a protected snapshot")
 
 
-async def _swap_sealed_stage_table(db_schema, live_cls, stage_cls, owner_oid):
-    """Rotate immutable tables by OID without overwriting a retained predecessor."""
-    from process import entity_address_snapshot_preparation as protected
+async def _swap_sealed_stage_table(db_schema, live_cls, stage_cls, owner_oid=None, *, serving_generation=...):
+    """Rotate immutable named tables without overwriting a retained generation."""
+    from process import entity_address_publication_permissions as permissions
+    from process.native_publication_read_access import preserve_publication_reads
+    from process.reference_family_archive import _native_model_copy_driver
 
     db = entity_address_unified.db
     binding = db._transaction_binding()
-    if binding is None or await protected._publisher_authority(binding.session) != owner_oid:
+    if binding is None:
         raise RuntimeError("protected address rotation requires a publisher transaction")
     table = live_cls.__main_table__
     stage = stage_cls.__tablename__
@@ -470,21 +541,31 @@ async def _swap_sealed_stage_table(db_schema, live_cls, stage_cls, owner_oid):
     stage_oid = await db.scalar("SELECT to_regclass(:relation)::oid", relation=f'"{db_schema}"."{stage}"')
     if stage_oid is None:
         raise RuntimeError("protected address stage is missing")
-    await protected._seal_published_relation(binding.session, stage_oid, owner_oid)
+    if serving_generation is ...:
+        serving_generation = await _retained_serving_generation(binding.session, db_schema)
+    if serving_generation is not None and oid is None:
+        raise RuntimeError("serving address relation is missing")
+    driver = await _native_model_copy_driver(binding.session, ("execute", "fetch", "is_in_transaction"))
+    await preserve_publication_reads(driver, schema=db_schema, live_table=table, stage_table=stage)
+    await permissions.make_relation_read_only(binding.session, db_schema, stage)
     retained_by_field = None
     if oid is not None:
-        await protected._seal_published_relation(binding.session, oid, owner_oid)
-        name = entity_address_unified._archived_identifier(f"{table}_retained_{oid:x}", suffix="")
+        await permissions.make_relation_read_only(binding.session, db_schema, table)
+        name = (
+            retained_address_name(table, serving_generation)
+            if serving_generation is not None
+            else entity_address_unified._archived_identifier(f"{table}_retained_{uuid4().hex}", suffix="")
+        )
         if await db.scalar("SELECT to_regclass(:relation)", relation=f'"{db_schema}"."{name}"') is not None:
             raise RuntimeError("protected address retained name already exists")
         index_entries = await db.all(
             "SELECT c.oid,c.relname FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid WHERE i.indrelid=:oid",
             oid=oid,
         )
-        for index_oid, index_name in index_entries:
-            await db.status(f'ALTER INDEX "{db_schema}"."{index_name}" RENAME TO "address_retained_idx_{index_oid:x}"')
+        for _index_handle, index_name in index_entries:
+            await db.status(f'ALTER INDEX "{db_schema}"."{index_name}" RENAME TO "address_retained_idx_{uuid4().hex}"')
         await db.status(f'ALTER TABLE "{db_schema}"."{table}" RENAME TO "{name}"')
-        retained_by_field = {"table_name": table, "relation_oid": oid, "retained_name": name}
+        retained_by_field = {"schema_name": db_schema, "relation_name": name}
     await db.status(f'ALTER TABLE "{db_schema}"."{stage}" RENAME TO "{table}"')
     index_names = [("primary", f"{table}_idx_primary")]
     index_names.extend(
@@ -501,17 +582,31 @@ async def _swap_sealed_stage_table(db_schema, live_cls, stage_cls, owner_oid):
     return retained_by_field
 
 
-async def _publish_result_swaps(db_schema, swaps, context):
-    """Dispatch the exact recorded publication mode without destructive v2 old-table reuse."""
+async def _publish_result_swaps(db_schema, swaps, context, *, serving_generation=...):
+    """Retain ordinary replacements without changing the marked recovery protocol."""
+    from process.provider_directory_serving_recovery import GENERATION_PARAM
+
+    if serving_generation is ...:
+        binding = entity_address_unified.db._transaction_binding()
+        if binding is None:
+            raise RuntimeError("address rotation requires a publisher transaction")
+        serving_generation = await _retained_serving_generation(binding.session, db_schema)
+    is_controlled = (
+        "stage_relations" in context or context.get("snapshot_contract") == "entity_address_unified.postgres.v2"
+    )
+    should_retain = is_controlled or context.get(GENERATION_PARAM) is None
+    retained_entries = []
+    context["retained_relations"] = []
     for swap in swaps:
-        if context.get("snapshot_contract") == "entity_address_unified.postgres.v2":
+        if should_retain:
             retained = await _swap_sealed_stage_table(
-                db_schema, swap.live_cls, swap.stage_cls, context["protected_owner_oid"]
+                db_schema, swap.live_cls, swap.stage_cls, serving_generation=serving_generation
             )
             if retained is not None:
-                context.setdefault("retained_relations", []).append(retained)
+                retained_entries.append(retained)
         else:
             await entity_address_unified._swap_stage_table(db_schema, swap.live_cls, swap.stage_cls)
+    context["retained_relations"] = retained_entries
 
 
 def _entity_address_cutover_plan(

@@ -17,7 +17,6 @@ from process import provider_directory_generic_source_storage as source_storage
 from process import provider_directory_output_snapshot_custody as custody
 from process import provider_directory_output_snapshot_journal as journal
 from process import provider_directory_output_snapshot_stage as stages
-from process.plan_release_storage_custody import storage_roles
 from process.provider_directory_admission_seal import (
     ADMISSION_KIND_GENERIC,
     ADMISSION_KIND_UHC_CANONICAL,
@@ -148,9 +147,8 @@ def _layout_scope(directory):
     require_output(
         issued is not None
         and asyncio.current_task() in worker.worker_tasks
-        and issued.task is scope.task
         and issued.admission is scope.admission
-        and not issued.task.done(),
+        and not scope.task.done(),
         "scratch_scope_required",
     )
     return scope
@@ -481,20 +479,8 @@ async def _verify_projection_counts(directory, fence, resource_types, projection
 
 
 async def _source_catalog(session, publisher, names, *, private):
-    from process.mrf_address_publication import require_native_read_catalog
-
-    owner, readers = await storage_roles(
-        publisher.connection, publisher.policy.schema, **publisher.policy.role_arguments()
-    )
-    rows = await publisher.connection.fetch(
-        _SOURCE_CATALOG_SQL, publisher.policy.schema, list(names), owner, [] if private else readers
-    )
+    rows = await publisher.connection.fetch(_SOURCE_CATALOG_SQL, publisher.policy.schema, list(names))
     require_output({row["relname"] for row in rows} == set(names), "scratch_source_copy_missing")
-    await require_native_read_catalog(
-        session,
-        tuple(row["oid"] for row in rows),
-        executable_roles=(publisher.policy.owner_role, publisher.policy.publisher_role),
-    )
     return rows
 
 
@@ -514,13 +500,11 @@ def _source_copy_shape(directory, catalog_row, original, *, indexed):
         topology["kind"] == "r"
         and topology["persistence"] == "p"
         and not any(topology[key] for key in ("partition", "rls", "force_rls", "parents", "children", "hooks", "rules"))
-        and catalog_row["acl_closed"]
-        and not decoded(catalog_row["acl"])["columns"]
         and all(
             column["default"] is None and column["identity"] == column["generated"] == "" and column["native_collation"]
             for column in columns
         ),
-        "scratch_source_copy_custody_changed",
+        "scratch_source_copy_shape_changed",
     )
     constraints = decoded(catalog_row["constraints"])
     require_output(
@@ -550,7 +534,6 @@ def _source_copy_shape(directory, catalog_row, original, *, indexed):
             and index["live"]
             and index["immediate"]
             and index["native"]
-            and index["owner"] == catalog_row["relowner"]
             for index in indexes
         ),
         "scratch_source_copy_indexes_changed",
@@ -558,11 +541,9 @@ def _source_copy_shape(directory, catalog_row, original, *, indexed):
 
 
 def _catalog_payload(row):
-    return {
-        key: decoded(value) if key in {"topology", "columns", "constraints", "indexes", "acl"} else value
-        for key, value in dict(row).items()
-        if key != "descriptor"
-    }
+    from process.provider_directory_output_snapshot_catalog import portable_catalog_payload
+
+    return portable_catalog_payload(row)
 
 
 async def _source_pages(directory, statement, source_ids):
@@ -671,13 +652,6 @@ async def _prepare_source_copy(directory, admission, session, publisher, fence):
     await source_storage._close_grants(publisher.connection, publisher.policy, name)
     created = (await _source_catalog(session, publisher, [name], private=True))[0]
     _source_copy_shape(directory, created, original, indexed=False)
-    require_output(
-        created["relowner"]
-        == await publisher.connection.fetchval(
-            "SELECT oid::bigint FROM pg_roles WHERE rolname=$1", publisher.policy.owner_role
-        ),
-        "scratch_source_copy_owner_changed",
-    )
     source_ids = sorted(dataset.source_id for dataset in fence.datasets)
     statement = directory._provider_directory_artifact_source_select_sql(
         directory.ProviderDirectorySource, publisher.policy.schema
@@ -689,6 +663,16 @@ async def _prepare_source_copy(directory, admission, session, publisher, fence):
     require_output(copied == len(source_ids), "scratch_source_copy_incomplete")
     await publisher.connection.execute(
         f"ALTER TABLE {relation} ADD CONSTRAINT {storage_identifier(name + '_pk')} PRIMARY KEY(source_id)"
+    )
+    from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
+
+    await freeze_fhir_source_snapshot(
+        publisher.connection,
+        publisher.policy.schema,
+        namespace_owner=publisher.policy.owner_role,
+        reader_roles=(publisher.policy.owner_role, publisher.policy.publisher_role),
+        relation_names=(name,),
+        freeze_schema=False,
     )
     for offset in range(0, len(source_ids), 512):
         await _verify_set_parity(
@@ -702,7 +686,6 @@ async def _prepare_source_copy(directory, admission, session, publisher, fence):
     _source_copy_shape(directory, finished, original, indexed=True)
     return dict(
         name=name,
-        oid=finished["oid"],
         original=_catalog_payload(original),
         copy=_catalog_payload(finished),
         rows=copied,
@@ -1107,10 +1090,11 @@ async def discard_scratch_inputs(directory, scope):
         ) as capability:
             source_copy = decoded(scope.source_copy_json)
             names = [source_copy["name"], *(stage.relation for stage in scope.stages)]
+            await capability.connection.execute("SET LOCAL lock_timeout='100ms'")
             await capability.connection.execute(
                 "LOCK TABLE "
                 + ",".join(storage_relation(capability.policy.schema, name) for name in sorted(names))
-                + " IN ACCESS EXCLUSIVE MODE NOWAIT"
+                + " IN ACCESS SHARE MODE NOWAIT"
             )
             catalog_rows = await _source_catalog(
                 capability.session, bound_publisher(), [source_copy["name"]], private=True
@@ -1327,24 +1311,21 @@ async def fence_scratch_enrichment(directory):
         directory, operation=decoded(scope.operation_json), targets=TYPED_ROOTS, isolation="read committed"
     ) as capability:
         await _verify_membership(directory, scope, capability)
-        require_output(capability.session is binding.session, "scratch_original_cut_changed")
         from process.provider_directory_output_address_key_backfill import _lock_geo_cut
 
         await _lock_geo_cut(capability, geo)
 
 
 async def scratch_input_metadata(directory, scope):
-    """Return navigation identities only after native original-task membership verification."""
+    """Return qualified navigation names after complete data and scope validation."""
     async with scratch_input_transaction(directory, scope):
         source_copy = decoded(scope.source_copy_json)
         relation_by_table = {SOURCE: source_copy["name"], **{stage.target: stage.relation for stage in scope.stages}}
-        oids_by_table = {SOURCE: source_copy["copy"]["oid"], **{stage.target: stage.oid for stage in scope.stages}}
         require_output(
-            set(relation_by_table) == set(oids_by_table) == {SOURCE, *TYPED_ROOTS}
-            and all(type(oid) is int and oid > 0 for oid in oids_by_table.values()),
+            set(relation_by_table) == {SOURCE, *TYPED_ROOTS},
             "scratch_membership_changed",
         )
-        return dict(relation_by_table=relation_by_table, relation_oids=oids_by_table)
+        return dict(relation_by_table=relation_by_table)
 
 
 def _scratch_relation_member(scope, relation):
@@ -1359,9 +1340,7 @@ def _scratch_relation_member(scope, relation):
     require_output(len(matches) == 1, "scratch_stage_changed")
     stage, expected = matches[0]
     require_output(expected.target == stage.target and stage.target in TYPED_ROOTS, "scratch_stage_changed")
-    require_output(
-        (relation.schema, relation.oid, relation.persistence) == (stage.schema, stage.oid, "p"), "scratch_stage_changed"
-    )
+    require_output((relation.schema, relation.persistence) == (stage.schema, "p"), "scratch_stage_changed")
     return stage, expected
 
 
@@ -1371,18 +1350,15 @@ def _scratch_catalog_statement():
     for parameter, replacement in (
         ("$1", "CAST(:schema AS text)"),
         ("$2", "CAST(:names AS text[])"),
-        ("$3", "CAST(:owner AS oid)"),
-        ("$4", "CAST(:readers AS oid[])"),
     ):
         statement = statement.replace(parameter, replacement)
     return statement
 
 
 def _assert_scratch_catalog_row(directory, expected, catalog_row):
-    """Retain every original shape, ACL and exact native receipt check."""
+    """Require the complete fixed logical layout and exact named receipt."""
     require_output(catalog_row is not None, "scratch_stage_changed")
     catalog_row = directory._pagination_checkpoint_row_mapping(catalog_row)
-    require_output(catalog_row["acl_closed"] and catalog_row["readers_closed"], "scratch_stage_changed")
     require_output_shape(catalog_row, expected.target)
     require_output(custody._native_receipt(expected, catalog_row, expected.target) == expected, "scratch_stage_changed")
 
@@ -1395,16 +1371,14 @@ async def scratch_relation_proof(directory, relation, *, database=None):
         return None
     stage, expected = member
     executor = directory.db if database is None else database
-    catalog_row = await executor.first(
-        _scratch_catalog_statement(), schema=stage.schema, names=[stage.relation], owner=expected.owner_oid, readers=[]
-    )
+    catalog_row = await executor.first(_scratch_catalog_statement(), schema=stage.schema, names=[stage.relation])
     _assert_scratch_catalog_row(directory, expected, catalog_row)
     require_output(_layout_scope(directory) is scope, "scratch_scope_required")
     return expected
 
 
 def _scratch_relation_groups(directory, scope, relations, database_for):
-    """Group only members sharing their exact executor, schema and admitted owner."""
+    """Batch named members by executor and schema without changing their layout checks."""
     groups, coordinates = {}, set()
     for relation in relations:
         member = _scratch_relation_member(scope, relation)
@@ -1416,7 +1390,7 @@ def _scratch_relation_groups(directory, scope, relations, database_for):
         coordinates.add(coordinate)
         database = None if database_for is None else database_for(relation)
         executor = directory.db if database is None else database
-        key = (id(executor), stage.schema, expected.owner_oid)
+        key = (id(executor), stage.schema)
         group = groups.setdefault(key, (database, executor, {}))
         group[2][stage.relation] = (relation, expected)
     return groups
@@ -1426,8 +1400,8 @@ async def _capture_scratch_group(directory, scope, key, group):
     """Freshly recapture every grouped member at this original proof boundary."""
     require_output(_layout_scope(directory) is scope, "scratch_scope_required")
     _database, executor, members = group
-    _actor, schema, owner = key
-    rows = await executor.all(_scratch_catalog_statement(), schema=schema, names=list(members), owner=owner, readers=[])
+    _executor_key, schema = key
+    rows = await executor.all(_scratch_catalog_statement(), schema=schema, names=list(members))
     observed_names = set()
     for row in rows:
         row = directory._pagination_checkpoint_row_mapping(row)

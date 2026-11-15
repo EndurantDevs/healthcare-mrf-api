@@ -9,12 +9,10 @@ closure through the later history/ATTACH/accounting cut and outer commit.
 from datetime import timezone
 from types import SimpleNamespace
 
-from db.migration_cms_snapshot_allocator import _ADMIN_SQL
 from db.plan_release_storage import storage_relation
-from process import provider_directory_cms_preparation_custody as custody
 from process import provider_directory_cms_prepared_candidate as candidate
+from process import provider_directory_cms_prepared_context as context
 from process import provider_directory_cms_prepared_payload_publication as payloads
-from process.network_cms_registry_address_capture import NativeReceiptSession
 from process.provider_directory_cms_prepared_identity_publication import (
     publish_prepared_cms_identities,
     read_prepared_cms_identity_publication,
@@ -32,8 +30,7 @@ async def seal_allocated_cms_generic_candidate(workspace, handoff, *, allocation
     canonical postimage parity remain the protected finisher's responsibility.
     """
     connection = workspace.connection
-    candidate._require(await NativeReceiptSession(connection).scalar(_ADMIN_SQL) is True, "original_admin_required")
-    actor_by_field = dict(await connection.fetchrow(custody._ACTOR_SQL))
+    origin_by_field = await context._origin(connection, workspace.source_binding, workspace.policy)
     async with _savepoint(connection):
         private = await read_prepared_cms_outputs(workspace, handoff)
         await publish_prepared_cms_identities(workspace, handoff)
@@ -69,9 +66,8 @@ async def seal_allocated_cms_generic_candidate(workspace, handoff, *, allocation
         )
         await workspace.verify_current()
         candidate._require(
-            await NativeReceiptSession(connection).scalar(_ADMIN_SQL) is True
-            and dict(await connection.fetchrow(custody._ACTOR_SQL)) == actor_by_field,
-            "original_admin_changed",
+            await context._origin(connection, workspace.source_binding, workspace.policy) == origin_by_field,
+            "transaction_mode_changed",
         )
     return {
         "header": header,

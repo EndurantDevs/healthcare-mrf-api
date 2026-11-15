@@ -17,6 +17,7 @@ from tests import cms_npd_admission_postgres_support as source
 from tests import test_provider_directory_cms_resource_batch_postgres as resource_batch
 from tests import test_provider_directory_import_run_guards as run_guards
 from tests import test_provider_directory_profile_capacity_preflight_postgres as receipt_support
+from tests.test_cms_capacity_preflight_receipt_migration import _row as historical_receipt
 
 # Host regressions do not require the native database template.
 cms_resource_template = pytest_asyncio.fixture(scope="module", loop_scope="module")(
@@ -151,29 +152,21 @@ async def test_native_receipt_first_write_and_growth(monkeypatch):
     async with source.admission_database(monkeypatch) as database:
         empty = await source.fhir._profile_capacity_preflight_receipt_layout("mrf")
         assert set(empty["main_index_pages"]) == {2}
-        now = datetime.datetime.now(datetime.timezone.utc)
-        receipt_values_by_field = receipt_support._receipt_values(
-            "first-write", issued_at=now, expires_at=now + datetime.timedelta(minutes=10)
-        )
+        receipt_values_by_field = historical_receipt("first-write")
         await receipt_support._insert_receipt(database, "mrf", receipt_values_by_field)
         first = await source.fhir._profile_capacity_preflight_receipt_layout("mrf")
         assert first == empty
         await source.fhir._assert_profile_capacity_receipt_storage("mrf", {"preflight_receipt_storage": empty})
         async with database.session_factory() as session, session.begin():
             table = source.fhir.ProviderDirectoryProfileCapacityPreflightReceipt.__table__
-            receipt_rows = [
-                receipt_support._receipt_values(
-                    f"growth-{index}", issued_at=now, expires_at=now + datetime.timedelta(minutes=10)
-                )
-                for index in range(1000)
-            ]
+            receipt_rows = [historical_receipt(f"growth-{index}") for index in range(1000)]
             for receipt_by_field in receipt_rows:
                 receipt_by_field["receipt_json"] = json.loads(receipt_by_field["receipt_json"])
             await session.execute(table.insert(), receipt_rows)
         grown = await source.fhir._profile_capacity_preflight_receipt_layout("mrf")
         assert max(grown["main_index_pages"]) > 2
-        assert grown["relation_oid"] == empty["relation_oid"]
-        assert grown["exact_fingerprint"] == empty["exact_fingerprint"]
+        assert (grown["schema"], grown["name"]) == (empty["schema"], empty["name"])
+        assert grown["toastable_column_count"] == empty["toastable_column_count"]
         with pytest.raises(source.fhir.ProviderDirectoryArtifactBuildStale, match="preflight_storage_changed"):
             await source.fhir._assert_profile_capacity_receipt_storage("mrf", {"preflight_receipt_storage": empty})
 
@@ -200,9 +193,9 @@ async def test_native_scope_declared_gin_and_catalog_drift(monkeypatch):
         create_index = f"CREATE INDEX {index_name} ON {reference} USING gin ({fhir._provider_directory_index_elements_sql(model, declaration)})"
         await database.status(create_index)
         oid = await database.scalar("SELECT to_regclass(:name)::oid::bigint", name=reference)
-        relation = OwnedRelation("mrf", name, oid, 0, "u")
+        relation = OwnedRelation("mrf", name, 0, "u")
         accepted = await layout.capture_scope_layout(fhir, relation)
-        assert accepted.relation_oid == oid
+        assert (accepted.schema_name, accepted.relation_name) == (relation.schema, relation.relation)
         assert not layout.is_scope_relation(fhir, name[:-8] + "00000000")
         await database.status(f"CREATE INDEX unknown_scope_idx ON {reference}(resource_id)")
         with pytest.raises(RuntimeError, match="storage_shape_unsupported"):
@@ -219,8 +212,7 @@ async def test_native_scope_declared_gin_and_catalog_drift(monkeypatch):
         await database.status(f"DROP INDEX mrf.{index_name}")
         await database.status(create_index)
         rebuilt = await layout.capture_scope_layout(fhir, relation)
-        assert rebuilt.relation_oid == accepted.relation_oid
-        assert rebuilt.exact_fingerprint != accepted.exact_fingerprint
+        assert rebuilt == accepted
         await database.status(f'DROP INDEX mrf."{bucket_name}"')
         await database.status(
             f'CREATE INDEX "{bucket_name}" ON {reference}(source_id,(mod(hashtextextended(resource_id,0),16)))'

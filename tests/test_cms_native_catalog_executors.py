@@ -14,7 +14,7 @@ from tests.test_provider_directory_cms_nonprofile_capacity import _producer
 async def test_native_catalog_census_groups_only_the_same_executor_and_refreshes(monkeypatch):
     producer = _producer()
     reader, controls = object(), object()
-    members = tuple(OwnedRelation("synthetic", name, oid, 100, "p") for oid, name in enumerate("abcde", 1))
+    members = tuple(OwnedRelation("synthetic", name, 100, "p") for oid, name in enumerate("abcde", 1))
     native_by_coordinate = {(member.schema, member.relation): object() for member in members[:4]}
     executor_by_name = {"a": reader, "b": reader, "c": None, "d": controls}
     observers = SimpleNamespace(database_for=lambda member: executor_by_name[member.relation])
@@ -23,21 +23,21 @@ async def test_native_catalog_census_groups_only_the_same_executor_and_refreshes
     async def capture(directory, group, *, database):
         assert directory is producer.fhir
         calls.append((database, tuple(member.relation for member in group)))
-        return {(member.schema, member.relation, member.oid): (len(calls), None) for member in group}
+        return {(member.schema, member.relation): (len(calls), None) for member in group}
 
     monkeypatch.setattr(layout, "observe_native_catalog_batch", capture)
     first = await producer._native_catalog_observations(members, native_by_coordinate, observers=observers)
     second = await producer._native_catalog_observations(members, native_by_coordinate, observers=observers)
     assert calls == [(reader, ("a", "b")), (producer.fhir.db, ("c",)), (controls, ("d",))] * 2
-    assert first.keys() == second.keys() == {("synthetic", member.relation, member.oid) for member in members[:4]}
+    assert first.keys() == second.keys() == {("synthetic", member.relation) for member in members[:4]}
     assert first != second
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["missing", "foreign", "replaced"])
+@pytest.mark.parametrize("damage", ["missing", "foreign", "extra"])
 async def test_native_catalog_census_rejects_changed_complete_inventory(monkeypatch, damage):
     producer = _producer()
-    member = OwnedRelation("synthetic", "retained", 11, 100, "p")
+    member = OwnedRelation("synthetic", "retained", 100, "p")
 
     async def capture(_directory, _members, *, database):
         assert database is producer.fhir.db
@@ -46,9 +46,11 @@ async def test_native_catalog_census_rejects_changed_complete_inventory(monkeypa
         coordinate = (
             member.schema,
             "foreign" if damage == "foreign" else member.relation,
-            12 if damage == "replaced" else 11,
         )
-        return {coordinate: ({}, None)}
+        captured_by_coordinate = {coordinate: ({}, None)}
+        if damage == "extra":
+            captured_by_coordinate[("synthetic", "unexpected")] = ({}, None)
+        return captured_by_coordinate
 
     monkeypatch.setattr(layout, "observe_native_catalog_batch", capture)
     with pytest.raises(RuntimeError, match="native_identity_changed"):

@@ -2,7 +2,6 @@
 """Durable exact-request office preparation through installed distinct writers."""
 
 import asyncio
-import json
 from dataclasses import dataclass, field
 from uuid import UUID, uuid4
 
@@ -16,9 +15,6 @@ from process.network_cms_registry_address_capture import native_driver
 from process.registry_company_approval_fence import (
     registry_company_approval_transaction,
 )
-from process.registry_management_permissions import (
-    verify_registry_management_permissions,
-)
 from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
 from process.registry_ptg_office_intent import (
     OPERATION,
@@ -29,7 +25,6 @@ from process.registry_ptg_office_intent import (
 )
 from process.registry_ptg_office_preparation import (
     RegistryPTGOfficePreparationService,
-    _database_identity,
 )
 from process.registry_ptg_published_plan_scope import (
     read_registry_ptg_published_plan_scope,
@@ -44,7 +39,6 @@ from process.registry_ptg_scope_engine import (
 )
 from process.registry_publication_permissions import (
     LIFECYCLE_COLUMNS,
-    verify_registry_publication_lifecycle_permissions,
 )
 from process.registry_publication_queue import (
     _document,
@@ -92,57 +86,6 @@ def _writer_engine(sessions):
     return engine
 
 
-async def _native_identity(connection):
-    identity = await connection.fetchrow(
-        "SELECT d.oid::bigint AS database_oid,c.system_identifier::text AS system_identifier "
-        "FROM pg_catalog.pg_database d CROSS JOIN pg_catalog.pg_control_system() c "
-        "WHERE d.datname=pg_catalog.current_database()"
-    )
-    if identity is None or type(identity["database_oid"]) is not int or identity["database_oid"] <= 0:
-        raise ValueError("registry_ptg_office_database_unavailable")
-    system = identity["system_identifier"]
-    if type(system) is not str or not system.isascii() or not system.isdecimal() or int(system) <= 0:
-        raise ValueError("registry_ptg_office_database_unavailable")
-    return identity["database_oid"], system
-
-
-async def _role(connection, expected):
-    role = await connection.fetchrow(
-        "SELECT current_user AS role,session_user AS login,rolcanlogin,rolsuper,rolcreatedb,"
-        "rolcreaterole,rolreplication,rolbypassrls FROM pg_catalog.pg_roles WHERE rolname=current_user"
-    )
-    if role is None or role["role"] != expected or role["login"] != expected or role["rolcanlogin"] is not True:
-        raise ValueError("registry_ptg_office_writer_unavailable")
-    if any(
-        role[name] is not False
-        for name in (
-            "rolsuper",
-            "rolcreatedb",
-            "rolcreaterole",
-            "rolreplication",
-            "rolbypassrls",
-        )
-    ):
-        raise ValueError("registry_ptg_office_writer_unavailable")
-
-
-async def _queue_permissions(connection, coordinator, identity):
-    """Require actual column-only lifecycle rights; immutable audit stays unwritable."""
-    await connection.execute("SET LOCAL search_path TO pg_catalog,pg_temp")
-    await _role(connection, coordinator.queue_role)
-    if await _native_identity(connection) != identity:
-        raise ValueError("registry_ptg_office_database_changed")
-    try:
-        await verify_registry_publication_lifecycle_permissions(
-            connection,
-            control_schema=coordinator.schema,
-            role=coordinator.queue_role,
-            owner_role=coordinator.owner_role,
-        )
-    except ValueError:
-        raise ValueError("registry_ptg_office_queue_permissions_unavailable") from None
-
-
 async def _approved_source(coordinator, envelope, deadline):
     scope = coordinator.preparation.scope_service
     async with registry_company_approval_transaction(
@@ -171,26 +114,17 @@ async def _approved_source(coordinator, envelope, deadline):
             deadline=deadline,
         )
         _remaining(deadline)
-        return await _native_identity(await native_driver(session))
+        return approved_scope
 
 
-async def _reserve(coordinator, envelope, actor, identity, deadline, progress):
+async def _reserve(coordinator, envelope, actor, approved_scope, deadline, progress):
     async with coordinator.management_sessions() as session, session.begin():
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE"))
         await session.execute(text("SELECT pg_catalog.set_config('search_path','pg_catalog,pg_temp',true)"))
         connection = await native_driver(session)
-        await _role(connection, coordinator.management_role)
-        await verify_registry_management_permissions(
-            connection,
-            api_role=coordinator.management_role,
-            owner_role=coordinator.owner_role,
-            control_schema=coordinator.schema,
-        )
-        if await _native_identity(connection) != identity:
-            raise ValueError("registry_ptg_office_database_changed")
-        # Re-read actual source/approval after writer verification and before INSERT.
-        if await _approved_source(coordinator, envelope, deadline) != identity:
-            raise ValueError("registry_ptg_office_database_changed")
+        # Re-read the source authorization before the intent INSERT.
+        if await _approved_source(coordinator, envelope, deadline) != approved_scope:
+            raise ValueError("registry_ptg_office_intent_source_changed")
         receipt = await reserve_registry_ptg_office_prepare_intent(
             connection,
             envelope["source_command"],
@@ -199,8 +133,8 @@ async def _reserve(coordinator, envelope, actor, identity, deadline, progress):
             session_token_sha256=envelope["session_token_sha256"],
             control_schema=coordinator.schema,
         )
-        if await _approved_source(coordinator, envelope, deadline) != identity:
-            raise ValueError("registry_ptg_office_database_changed")
+        if await _approved_source(coordinator, envelope, deadline) != approved_scope:
+            raise ValueError("registry_ptg_office_intent_source_changed")
         progress["commit_started"] = True
     return receipt
 
@@ -215,12 +149,12 @@ async def _request(connection, coordinator, request_id, semantic):
     return record, _stored_receipt(record, semantic, True)
 
 
-async def _claim(coordinator, receipt, semantic, identity):
+async def _claim(coordinator, receipt, semantic):
     async with (
         coordinator.queue_pool.acquire() as connection,
         connection.transaction(isolation="read_committed"),
     ):
-        await _queue_permissions(connection, coordinator, identity)
+        await connection.execute("SET LOCAL search_path TO pg_catalog,pg_temp")
         request_record, current = await _request(connection, coordinator, receipt["request_id"], semantic)
         if current["command_sha256"] != receipt["command_sha256"]:
             raise ValueError("registry_ptg_office_intent_stored_invalid")
@@ -289,9 +223,10 @@ def _completion(prepared, receipt):
         raise ValueError("registry_ptg_office_intent_result_changed")
     from process.registry_ptg_office_capture import _digest
     from process.registry_ptg_office_preparation import _checked_command
+    from process.registry_ptg_office_review_contract import is_legacy_office_review_command
 
     command = _checked_command(prepared["command"], receipt["command"]["selector"])
-    if _digest(command) != prepared["command_sha256"]:
+    if not is_legacy_office_review_command(prepared["command"]) and _digest(command) != prepared["command_sha256"]:
         raise ValueError("registry_ptg_office_intent_result_changed")
     if any(command[name] != receipt["command"]["selector"][name] for name in ("reason", "retained_generation_id")):
         raise ValueError("registry_ptg_office_intent_result_changed")
@@ -303,12 +238,12 @@ def _completion(prepared, receipt):
     }
 
 
-async def _finish(coordinator, receipt, semantic, identity, lease, result):
+async def _finish(coordinator, receipt, semantic, lease, result):
     async with (
         coordinator.queue_pool.acquire() as connection,
         connection.transaction(isolation="read_committed"),
     ):
-        await _queue_permissions(connection, coordinator, identity)
+        await connection.execute("SET LOCAL search_path TO pg_catalog,pg_temp")
         _, current = await _request(connection, coordinator, receipt["request_id"], semantic)
         if current["command_sha256"] != receipt["command_sha256"]:
             raise ValueError("registry_ptg_office_intent_stored_invalid")
@@ -322,15 +257,26 @@ async def _finish(coordinator, receipt, semantic, identity, lease, result):
         )
 
 
+async def _yield_pending(coordinator, receipt, semantic, lease):
+    """Keep the exact durable request resumable after the independent administrator step."""
+    async with coordinator.queue_pool.acquire() as connection, connection.transaction(isolation="read_committed"):
+        await connection.execute("SET LOCAL search_path TO pg_catalog,pg_temp")
+        _, current = await _request(connection, coordinator, receipt["request_id"], semantic)
+        if current["command_sha256"] != receipt["command_sha256"]:
+            raise ValueError("registry_ptg_office_intent_stored_invalid")
+        updated = await connection.fetchval(
+            f"UPDATE {_namespace(coordinator.schema)}.registry_publication_request SET lease_expires_at=clock_timestamp(),updated_at=now() "
+            "WHERE request_id=$1 AND lease_id=$2 AND state='running' RETURNING lease_id",
+            UUID(receipt["request_id"]),
+            lease,
+        )
+        if updated != lease:
+            raise ValueError("registry_queue_lease_invalid")
+
+
 @dataclass(frozen=True)
 class RegistryPTGOfficeIntentCoordinator:
-    """Installed factories only; no pool creation, grants or alternate physical writer.
-
-    Installation must supply the actual management writer and a separately
-    verified queue-control pool. The queue role needs lifecycle-column UPDATE
-    only, never immutable audit UPDATE. Every native role must read database
-    identity through pg_control_system(); missing authority refuses activation.
-    """
+    """Use configured management and queue factories with fresh client/source authorization."""
 
     preparation: RegistryPTGOfficePreparationService
     management_sessions: object = field(repr=False)
@@ -365,11 +311,9 @@ class RegistryPTGOfficeIntentCoordinator:
         forbidden_roles.add(reader.url.username)
         if len(set(roles)) != 3 or set(roles[:2]) & forbidden_roles or writer.url.username != self.management_role:
             raise ValueError("registry_ptg_office_coordinator_unconfigured")
-        if writer is reader or _database_identity(writer) != _database_identity(reader):
-            raise ValueError("registry_ptg_office_coordinator_unconfigured")
 
     async def list(self, document, *, deadline=None):
-        """Read one source/actor page under fresh authority and global queue custody."""
+        """Read one source/actor page under fresh client/source authorization."""
         from process.registry_ptg_office_intent_view import (
             list_registry_ptg_office_prepare_intents,
             validated_office_intent_list_envelope,
@@ -381,12 +325,12 @@ class RegistryPTGOfficeIntentCoordinator:
         deadline = _deadline(deadline)
         try:
             async with asyncio.timeout_at(deadline):
-                identity = await _approved_source(self, envelope, deadline)
+                approved_scope = await _approved_source(self, envelope, deadline)
                 async with (
                     self.queue_pool.acquire() as connection,
                     connection.transaction(isolation="read_committed", readonly=True),
                 ):
-                    await _queue_permissions(connection, self, identity)
+                    await connection.execute("SET LOCAL search_path TO pg_catalog,pg_temp")
                     selection = envelope["selector"]
                     page = await list_registry_ptg_office_prepare_intents(
                         connection,
@@ -397,29 +341,24 @@ class RegistryPTGOfficeIntentCoordinator:
                         limit=selection["limit"],
                         control_schema=self.schema,
                     )
-                if await _approved_source(self, envelope, deadline) != identity:
-                    raise ValueError("registry_ptg_office_database_changed")
+                if await _approved_source(self, envelope, deadline) != approved_scope:
+                    raise ValueError("registry_ptg_office_intent_source_changed")
                 _remaining(deadline)
                 return page
         except TimeoutError:
             raise RegistryPTGScopeDeadlineExpired(outcome_unknown=False) from None
 
     async def prepare(self, document, *, deadline=None):
-        """Commit intent and exact lease before physical handoff; retries retain handles."""
+        """Commit intent and its exact lease before preparation; retries retain handles."""
         envelope, actor, semantic = _envelope(document)
         deadline, progress = _deadline(deadline), {"commit_started": False}
         try:
             async with asyncio.timeout_at(deadline):
-                identity = await _approved_source(self, envelope, deadline)
-                async with (
-                    self.queue_pool.acquire() as connection,
-                    connection.transaction(isolation="read_committed", readonly=True),
-                ):
-                    await _queue_permissions(connection, self, identity)
-                receipt = await _reserve(self, envelope, actor, identity, deadline, progress)
-                if await _approved_source(self, envelope, deadline) != identity:
-                    raise ValueError("registry_ptg_office_database_changed")
-                receipt, lease, completed = await _claim(self, receipt, semantic, identity)
+                approved_scope = await _approved_source(self, envelope, deadline)
+                receipt = await _reserve(self, envelope, actor, approved_scope, deadline, progress)
+                if await _approved_source(self, envelope, deadline) != approved_scope:
+                    raise ValueError("registry_ptg_office_intent_source_changed")
+                receipt, lease, completed = await _claim(self, receipt, semantic)
                 if lease is None and receipt["state"] != "completed":
                     return {"intent": receipt, "preparation": None}
                 method = self.preparation.read if completed is not None else self.preparation.prepare
@@ -427,14 +366,31 @@ class RegistryPTGOfficeIntentCoordinator:
                     _physical_envelope(envelope, receipt, read=completed is not None),
                     deadline=deadline,
                 )
+                if prepared.get("state") == "handed_off":
+                    if completed is not None:
+                        raise ValueError("registry_ptg_office_intent_result_changed")
+                    from process.registry_ptg_office_preparation import _checked_command
+
+                    _object(prepared, {"capture_id", "state", "command", "command_sha256", "manifest_sha256"})
+                    _checked_command(prepared["command"], receipt["command"]["selector"])
+                    if any(
+                        prepared["command"][name] != receipt["command"]["selector"][name]
+                        for name in ("reason", "retained_generation_id")
+                    ):
+                        raise ValueError("registry_ptg_office_intent_result_changed")
+                    if await _approved_source(self, envelope, deadline) != approved_scope:
+                        raise ValueError("registry_ptg_office_intent_source_changed")
+                    await _yield_pending(self, receipt, semantic, lease)
+                    _remaining(deadline)
+                    return {"intent": receipt, "preparation": prepared}
                 completion_receipt = _completion(prepared, receipt)
-                if await _approved_source(self, envelope, deadline) != identity:
-                    raise ValueError("registry_ptg_office_database_changed")
+                if await _approved_source(self, envelope, deadline) != approved_scope:
+                    raise ValueError("registry_ptg_office_intent_source_changed")
                 if completed is not None:
                     if completed != completion_receipt:
                         raise ValueError("registry_ptg_office_intent_result_changed")
                 else:
-                    await _finish(self, receipt, semantic, identity, lease, completion_receipt)
+                    await _finish(self, receipt, semantic, lease, completion_receipt)
                 _remaining(deadline)
                 return {
                     "intent": {**receipt, "state": "completed"},

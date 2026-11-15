@@ -3,6 +3,7 @@
 
 import asyncio
 import hashlib
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime
 from types import SimpleNamespace
@@ -13,6 +14,23 @@ import pytest
 
 from process import source_profile_result_archive as archive
 from tests.source_profile_archive_support import retained_run
+
+
+@pytest.fixture(autouse=True)
+def configured_native_role_names(monkeypatch, tmp_path):
+    """Supply the existing static role-policy interface for component tests."""
+    path = tmp_path / "role-policy.json"
+    path.write_text(
+        json.dumps(
+            {
+                "owner_role": "synthetic_namespace_owner",
+                "migration_role": "synthetic_migration",
+                "preparation_owner_role": "synthetic_snapshot_owner",
+                "runtime_roles": ["synthetic_worker", "synthetic_reader"],
+            }
+        )
+    )
+    monkeypatch.setenv(archive.pins.ROLE_POLICY_ENVIRONMENT, str(path))
 
 
 def maintenance_run(importer):
@@ -233,7 +251,8 @@ async def test_native_maintenance_refuses_control_or_pin_substitution(monkeypatc
     authority = AsyncMock(side_effect=ValueError("pin policy differs") if changed == "authority" else None)
     monkeypatch.setattr(archive.pins, "require_worker_authority", authority)
     with pytest.raises(
-        archive.SourceProfileArchiveError, match="maintenance attempt|adoption authority|pin policy differs"
+        archive.SourceProfileArchiveError,
+        match="maintenance attempt|adoption authority|pin policy differs|source validation",
     ):
         await archive.require_native_maintenance(session, run)
     if changed in {"attempt", "authority"}:
@@ -332,7 +351,6 @@ def test_first_use_capture_is_closed_and_requires_actual_predecessor(importer):
     assert archive.validate_native_capture(capture) == capture
     for field, replacement in (
         ("run_id", "invented_attempt"),
-        ("database_oid", True),
         ("source_run_id", "b" * 32),
         ("source_manifest_sha256", "bad"),
         ("expected", {"current_run_id": "a" * 32}),
@@ -348,9 +366,9 @@ async def test_first_use_capture_requires_exact_single_transaction_continuation(
     capture = native_capture(importer)
     run = retained_run(importer)
     capture["source_manifest_sha256"] = archive._digest(run["source_manifest"])
+    transaction_by_field = {"current": object()}
     session = SimpleNamespace(
-        in_transaction=lambda: True,
-        scalar=AsyncMock(side_effect=[10, "70", "71" if boundary == "changed_transaction" else "70"]),
+        in_transaction=lambda: True, scalar=AsyncMock(), get_transaction=lambda: transaction_by_field["current"]
     )
     prepared = SimpleNamespace(manifest={"run_ids": [capture["source_run_id"]]}, ownership=object())
     for name in ("_source_lock", "require_pin_guards"):
@@ -371,6 +389,8 @@ async def test_first_use_capture_requires_exact_single_transaction_continuation(
     async def continuation(actual_session, receipt, publish):
         """Exercise the exact callback contract, without pretending to prove PostgreSQL custody."""
         assert actual_session is session
+        if boundary == "changed_transaction":
+            transaction_by_field["current"] = object()
         if boundary != "missing":
             await publish()
         if boundary == "reused":
@@ -386,7 +406,10 @@ async def test_first_use_capture_requires_exact_single_transaction_continuation(
     )
     if boundary == "success":
         receipt = await pending
-        assert receipt["capture"] == capture and "handoff" not in receipt
+        assert (
+            receipt["capture"] == {key: field_value for key, field_value in capture.items() if key != "database_oid"}
+            and "handoff" not in receipt
+        )
         assert receipt["validation_sha256"] == archive._digest(
             {key: field_value for key, field_value in receipt.items() if key != "validation_sha256"}
         )
@@ -724,30 +747,31 @@ async def test_worker_cancel_losing_handoff_race_uses_publisher_cancellation(mon
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state", ["unchanged", "replaced_after_lock", "absent", "moved"])
-async def test_canceled_projection_cleanup_rechecks_exact_oid_after_lock(monkeypatch, state):
-    """A Runtime-owned candidate cannot redirect Publisher cleanup between lookup and lock."""
-    seal = native_handoff(archive.PROJECTION_IMPORTER)["projection"]
-    has_candidate = state in {"unchanged", "replaced_after_lock"}
-    observed_oids = (
-        [seal["relation_oid"], seal["relation_oid"] + (state == "replaced_after_lock")] if has_candidate else [None]
-    )
-    monkeypatch.setattr(archive.native, "_relation_oid", AsyncMock(side_effect=observed_oids))
+@pytest.mark.parametrize("state", ["unchanged", "recreated", "absent", "shape", "scope"])
+async def test_canceled_projection_cleanup_checks_named_shape_and_logical_run(monkeypatch, state):
+    from process import florida_projection_named_source as projection
+
+    handoff = native_handoff(archive.PROJECTION_IMPORTER)
+    seal = handoff["projection"]
+    monkeypatch.setattr(archive.native, "_relation_oid", AsyncMock(return_value=None if state == "absent" else 201))
     locked = AsyncMock()
     monkeypatch.setattr(archive.native, "_lock_family", locked)
-    session = SimpleNamespace(
-        scalar=AsyncMock(return_value=seal["owner_oid"] if has_candidate else state == "moved"), execute=AsyncMock()
+    shape = AsyncMock(
+        side_effect=archive.SourceProfileArchiveError("candidate shape differs") if state == "shape" else None
     )
-    pending = archive._drop_native_projection_candidate(session, "mrf", seal, 99)
-    if state in {"replaced_after_lock", "moved"}:
-        with pytest.raises(archive.SourceProfileArchiveError, match="ownership changed|candidate moved"):
+    monkeypatch.setattr(projection, "named_projection_seal", shape)
+    session = SimpleNamespace(scalar=AsyncMock(return_value=state != "scope"), execute=AsyncMock())
+    pending = archive._drop_native_projection_candidate(session, "mrf", seal, source_run_id=handoff["source_run_id"])
+    if state in {"shape", "scope"}:
+        with pytest.raises(archive.SourceProfileArchiveError, match="shape|scope"):
             await pending
     else:
         await pending
-    assert locked.await_count == has_candidate
-    assert session.execute.await_count == (state == "unchanged")
-    if state == "unchanged":
+    assert locked.await_count == (state != "absent")
+    assert session.execute.await_count == (state in {"unchanged", "recreated"})
+    if state in {"unchanged", "recreated"}:
         assert str(session.execute.call_args.args[0]) == f'DROP TABLE "mrf"."{seal["table_name"]}" RESTRICT'
+        assert session.scalar.await_args.args[1] == {"run": handoff["source_run_id"]}
 
 
 def test_historical_pin_guard_ddl_is_unchanged():
@@ -909,9 +933,7 @@ async def test_source_export_copies_every_supported_contract_before_index_and_va
 async def test_publication_copies_only_novel_model_runs_with_one_remaining_budget(importer):
     prepared = SimpleNamespace(
         manifest=_versioned_manifest(archive.CONTRACT, importer),
-        ownership=SimpleNamespace(
-            schema_name="isolated_source", relation_oids=tuple(zip(archive.PUBLICATION_TABLES, range(1, 5)))
-        ),
+        ownership=SimpleNamespace(schema_name="isolated_source", relation_names=archive.PUBLICATION_TABLES),
     )
     copy_rows = AsyncMock(return_value=10)
     session = SimpleNamespace(scalar=AsyncMock(return_value=True), execute=AsyncMock())
@@ -938,9 +960,7 @@ async def test_publication_copies_only_novel_model_runs_with_one_remaining_budge
 @pytest.mark.parametrize("fault", ["missing", "invalid", "overflow", "cancel"])
 async def test_isolated_copy_failure_never_inserts_or_finishes_indexes(monkeypatch, phase, fault):
     importer = "massachusetts-borim-profile"
-    ownership = SimpleNamespace(
-        schema_name="isolated_source", relation_oids=tuple(zip(archive.PUBLICATION_TABLES, range(1, 5)))
-    )
+    ownership = SimpleNamespace(schema_name="isolated_source", relation_names=archive.PUBLICATION_TABLES)
     prepared = SimpleNamespace(manifest=_versioned_manifest(archive.CONTRACT), ownership=ownership)
     copy_rows = AsyncMock(return_value=1001, side_effect=asyncio.CancelledError if fault == "cancel" else None)
     source_copy = archive.native.ReferenceFamilySourceCopy(copy_rows, 1000, 300)
@@ -1008,7 +1028,7 @@ def test_legacy_adoption_does_not_invent_isolated_publication_storage(importer):
 
 @pytest.mark.parametrize("importer", tuple(archive.SOURCES))
 async def test_adoption_preserves_one_copy_deadline_and_projection_remainder(monkeypatch, importer):
-    from process import florida_projection_archive as projection
+    from process import florida_projection_named_source as projection
 
     source_copy = archive.native.ReferenceFamilySourceCopy(AsyncMock(), 1000, 300)
     request_by_field = {
@@ -1018,23 +1038,26 @@ async def test_adoption_preserves_one_copy_deadline_and_projection_remainder(mon
     publication = AsyncMock(return_value=({"synthetic": "publication"}, 400))
     cutover = AsyncMock(return_value={"synthetic": "projection"})
     monkeypatch.setattr(archive, "_prepare_publication", publication)
-    monkeypatch.setattr(projection, "prepare_native_cutover", cutover)
-    prepared = SimpleNamespace(manifest=_versioned_manifest(archive.CONTRACT, importer))
+    monkeypatch.setattr(projection, "prepare_named_cutover", cutover)
+    prepared = SimpleNamespace(manifest=_versioned_manifest(archive.CONTRACT, importer), ownership=object())
+    monkeypatch.setattr(archive.native, "seal_model_family_storage", AsyncMock())
     session, pin_id = object(), uuid4()
     before = asyncio.get_running_loop().time()
-    result = await archive._prepare_adoption_storage(session, prepared, "destination", 41, pin_id, request_by_field)
+    publication_result = await archive._prepare_adoption_storage(
+        session, prepared, "destination", pin_id, request_by_field
+    )
     call = publication.await_args
     assert call.args == (session, prepared, "destination") and call.kwargs["source_copy"] is source_copy
     assert before < call.kwargs["deadline"] <= asyncio.get_running_loop().time() + source_copy.timeout
-    assert result[0] == {"synthetic": "publication"}
+    assert publication_result[0] == {"synthetic": "publication"}
     if importer == archive.PROJECTION_IMPORTER:
-        assert result[1] == {"synthetic": "projection"}
+        assert publication_result[1] == {"synthetic": "projection"}
         assert cutover.await_args.kwargs["source_copy"].copy_rows is source_copy.copy_rows
         assert cutover.await_args.kwargs["source_copy"].max_bytes == 400
         assert cutover.await_args.kwargs["deadline"] == call.kwargs["deadline"]
         assert cutover.await_args.kwargs["expected"] is request_by_field["expected"]
     else:
-        assert result[1] is None
+        assert publication_result[1] is None
         cutover.assert_not_awaited()
 
 

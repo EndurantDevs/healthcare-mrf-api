@@ -77,81 +77,17 @@ def test_role_policy_accepts_the_existing_optional_fields_at_the_byte_limit(poli
     assert pins.load_role_policy() == ("synthetic_snapshot_owner", ("synthetic_worker", "synthetic_reader"))
 
 
-def role_closure():
-    return [
-        {
-            "role_oid": oid,
-            "principal_oid": oid,
-            "owner_member": False,
-            "database_owner_member": False,
-            "elevated_member": False,
-        }
-        for oid in (42, 43)
-    ]
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "fault",
-    [None, "owner", "missing_role", "owner_member", "database_owner_member", "elevated_member", "closure_bound"],
-)
-async def test_role_closure_checks_every_configured_principal(fault):
-    owner_by_field = dict.fromkeys(
-        ("rolcanlogin", "rolsuper", "rolcreaterole", "rolcreatedb", "rolreplication", "rolbypassrls"), False
-    )
-    memberships = role_closure()
-    if fault == "owner":
-        owner_by_field["rolcanlogin"] = True
-    if fault == "missing_role":
-        memberships.pop()
-    if fault in {"owner_member", "database_owner_member", "elevated_member"}:
-        memberships[-1][fault] = True
-    if fault == "closure_bound":
-        memberships.extend({**memberships[0], "principal_oid": oid} for oid in range(100, 165))
-    connection = SimpleNamespace(
-        fetchrow=AsyncMock(return_value=owner_by_field), fetch=AsyncMock(return_value=memberships)
-    )
-    if fault is None:
-        assert await pins.require_role_principals(connection, 41, [42, 43]) == [42, 43]
-        query, owner_oid, runtime_oids = connection.fetch.await_args.args
-        assert "'MEMBER'" in query and "LIMIT 1025" in query
-        assert (owner_oid, runtime_oids) == (41, [42, 43])
-    else:
-        with pytest.raises(ValueError, match="snapshot_generation_owner_unprotected|snapshot_runtime_role_unprotected"):
-            await pins.require_role_principals(connection, 41, [42, 43])
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("scope", [[], [True], [0], [2**32], [43, 42], [42, 42], list(range(1, 18))])
-async def test_role_scope_is_bounded_before_catalog_work(scope):
-    connection = SimpleNamespace(fetchrow=AsyncMock())
-    with pytest.raises(ValueError, match="snapshot_runtime_role_unprotected"):
-        await pins.require_role_principals(connection, 41, scope)
-    connection.fetchrow.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("owner_oid", [None, True, 0, 2**32])
-async def test_missing_or_invalid_owner_fails_before_catalog_work(owner_oid):
-    connection = SimpleNamespace(fetchrow=AsyncMock())
-    with pytest.raises(ValueError, match="snapshot_generation_owner_unprotected"):
-        await pins.require_role_principals(connection, owner_oid, [42, 43])
-    connection.fetchrow.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("fault", [None, "owner", "rls", "force_rls", "unsafe", "payload_rls", "missing"])
+@pytest.mark.parametrize("fault", [None, "rls", "force_rls", "payload_rls", "missing", "partition", "persistence"])
 async def test_pin_table_authority_checks_owners_rls_and_inherited_privileges(fault):
     relations = [
         {
             "relname": name,
-            "relowner": 41,
             "relkind": "r",
             "relpersistence": "p",
             "relispartition": False,
             "relrowsecurity": name == pins.TABLE,
             "relforcerowsecurity": name == pins.TABLE,
-            "unsafe": False,
         }
         for name in (*pins.PAYLOAD_TABLES, pins.TABLE)
     ]
@@ -161,20 +97,20 @@ async def test_pin_table_authority_checks_owners_rls_and_inherited_privileges(fa
         relations[0]["relrowsecurity"] = True
     elif fault is not None:
         field, changed = {
-            "owner": ("relowner", 42),
             "rls": ("relrowsecurity", False),
             "force_rls": ("relforcerowsecurity", False),
-            "unsafe": ("unsafe", True),
+            "partition": ("relispartition", True),
+            "persistence": ("relpersistence", "u"),
         }[fault]
         relations[-1][field] = changed
     connection = SimpleNamespace(fetch=AsyncMock(return_value=relations))
     if fault is None:
         await pins.require_pin_tables(connection, "mrf", 41, [42, 43])
-        query, schema, principals, names = connection.fetch.await_args.args
-        assert schema == "mrf" and principals == [42, 43] and len(names) == 5
-        assert "TRIGGER,MAINTAIN" in query and "'TRUNCATE'" in query and "'MEMBER'" in query
+        query, schema, names = connection.fetch.await_args.args
+        assert schema == "mrf" and len(names) == 5
+        assert "relowner" not in query and "pg_has_role" not in query
     else:
-        with pytest.raises(ValueError, match="ownership is unprotected"):
+        with pytest.raises(ValueError, match="pin table layout differs"):
             await pins.require_pin_tables(connection, "mrf", 41, [42, 43])
 
 
@@ -221,7 +157,7 @@ async def test_pin_policies_require_the_exact_migration_contract(fault):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", [None, "owner", "security", "configuration", "volatility", "body", "missing"])
+@pytest.mark.parametrize("fault", [None, "security", "configuration", "volatility", "body", "missing"])
 async def test_pin_functions_require_every_original_invoker_definition(fault):
     async def fetchrow(_query, name):
         definition = next(
@@ -230,7 +166,6 @@ async def test_pin_functions_require_every_original_invoker_definition(fault):
             if statement.startswith("CREATE OR REPLACE FUNCTION " + name + " RETURNS")
         )
         function_by_field = {
-            "proowner": 41,
             "prosecdef": False,
             "proconfig": ["search_path=pg_catalog, pg_temp"],
             "provolatile": "v",
@@ -240,7 +175,6 @@ async def test_pin_functions_require_every_original_invoker_definition(fault):
             return None
         if fault is not None:
             field, value = {
-                "owner": ("proowner", 42),
                 "security": ("prosecdef", True),
                 "configuration": ("proconfig", None),
                 "volatility": ("provolatile", "s"),
@@ -259,44 +193,29 @@ async def test_pin_functions_require_every_original_invoker_definition(fault):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "fault", [None, "assumed", "unknown_worker", "replica", "other_owner", "omitted_role", "missing_policy"]
-)
-async def test_worker_authority_uses_policy_not_receipt_or_current_role_alone(monkeypatch, policy_file, fault):
-    identity_by_field = {"session": "synthetic_worker", "current": "synthetic_worker", "replication": "origin"}
-    if fault == "assumed":
-        identity_by_field["session"] = "synthetic_admin"
-    if fault == "unknown_worker":
-        identity_by_field["session"] = identity_by_field["current"] = "unconfigured_worker"
-    if fault == "replica":
-        identity_by_field["replication"] = "replica"
+@pytest.mark.parametrize("fault", [None, "replica", "missing_policy", "transaction"])
+async def test_worker_checks_configured_policy_transaction_and_pin_semantics(monkeypatch, policy_file, fault):
     if fault == "missing_policy":
         policy_file.unlink()
-    driver = SimpleNamespace(
-        fetchval=AsyncMock(return_value=40 if fault == "other_owner" else 41),
-        fetch=AsyncMock(return_value=[{"oid": 42}] if fault == "omitted_role" else [{"oid": 43}, {"oid": 42}]),
-        fetchrow=AsyncMock(return_value=identity_by_field),
-    )
+    driver = SimpleNamespace(fetchval=AsyncMock(return_value="replica" if fault == "replica" else "origin"))
     connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver)))
     session = SimpleNamespace(
-        in_transaction=lambda: True, execute=AsyncMock(), connection=AsyncMock(return_value=connection)
+        in_transaction=lambda: fault != "transaction",
+        execute=AsyncMock(),
+        connection=AsyncMock(return_value=connection),
     )
-    principals = AsyncMock(return_value=[42, 43, 44])
-    monkeypatch.setattr(pins, "require_role_principals", principals)
     checks = [AsyncMock() for _ in range(3)]
     for name, check in zip(
         ("require_pin_tables", "require_pin_policies", "require_pin_functions"), checks, strict=True
     ):
         monkeypatch.setattr(pins, name, check)
     if fault is None:
-        await pins.require_worker_authority(session, "mrf", 41)
-        principals.assert_awaited_once_with(driver, 41, [42, 43])
-        checks[0].assert_awaited_once_with(driver, "mrf", 41, [42, 43, 44])
-        checks[1].assert_awaited_once_with(driver, "mrf")
-        checks[2].assert_awaited_once_with(driver, "mrf", 41)
+        await pins.require_worker_authority(session, "mrf")
+        for check in checks:
+            check.assert_awaited_once_with(driver, "mrf")
     else:
         with pytest.raises(ValueError):
-            await pins.require_worker_authority(session, "mrf", 41)
+            await pins.require_worker_authority(session, "mrf")
         assert all(check.await_count == 0 for check in checks)
 
 
@@ -327,7 +246,7 @@ def test_attached_collision_keys_cover_each_installed_model_unique_constraint():
     assert "md5(" not in statements and "to_jsonb(" not in statements
 
 
-def test_attachment_seal_guard_uses_old_metadata_and_exact_child_oids():
+def test_attachment_seal_guard_uses_saved_schema_and_child_names():
     statements = tuple(pins.statement_pin_guard_statements("fixture"))
     function = next(
         statement for statement in statements if 'FUNCTION "fixture".provider_profile_attached_pin_guard' in statement
@@ -337,7 +256,9 @@ def test_attachment_seal_guard_uses_old_metadata_and_exact_child_oids():
     assert "FROM profile_pin_old" in function
     assert "authority_json::jsonb->'created_here'='true'::jsonb" in function
     assert "source-profile-attachment.v2" in function
-    assert "inherited.inhrelid::text=child.value->>2" in function
+    assert "validation,ownership,schema_name" in function and "relation.relname=child.value->>1" in function
+    assert "inherited.inhrelid=relation.oid" in function
+    assert "inhrelid::text=child.value->>2" not in function
     assert function.index("require read committed") < function.index("pg_catalog.pg_inherits")
     assert any(
         "BEFORE TRUNCATE" in statement and '"fixture".provider_profile_source_pin' in statement

@@ -136,7 +136,7 @@ async def test_cancel_drains_copy_owner_and_closes_source_cursor(monkeypatch):
 @pytest.mark.asyncio
 async def test_finish_indexes_precede_complete_parity_and_seal(monkeypatch):
     driver = Driver()
-    capture = AsyncMock(return_value={"private_child": {"oid": 71}})
+    capture = AsyncMock(return_value={"private_child": {"schema": "sample", "name": "private_child"}})
     monkeypatch.setattr(snapshot, "_capture", capture)
     proof = await snapshot._finish(
         driver,
@@ -150,7 +150,7 @@ async def test_finish_indexes_precede_complete_parity_and_seal(monkeypatch):
     assert "expected_count" in sql and "WHERE NOT EXISTS" in sql
     assert "m.cohort_id=$3 AND m.npi=e.npi" in sql
     assert "FOREIGN KEY" not in sql and "CREATE FUNCTION" not in sql and "CREATE TRIGGER" not in sql
-    assert proof == {"oid": 71}
+    assert proof == {"schema": "sample", "name": "private_child"}
 
 
 @pytest.mark.asyncio
@@ -238,12 +238,11 @@ def publication(monkeypatch):
     directory = SimpleNamespace(_schema=lambda: "sample")
     publisher = SimpleNamespace(connection=driver, policy=policy)
     source = SimpleNamespace(dataset_id="dataset")
-    prepared_by_field = {"oid": 31}
+    prepared_by_field = {"schema": "sample", "name": "loading"}
     pin = SimpleNamespace(scope=SimpleNamespace(fence_identity=("published",)))
     monkeypatch.setattr(snapshot, "bound_publisher", lambda: publisher)
     monkeypatch.setattr(snapshot, "_load_dataset_scope", AsyncMock(return_value=pin.scope))
     monkeypatch.setattr(snapshot, "_request", lambda _source: object())
-    monkeypatch.setattr(snapshot, "_custody", AsyncMock(return_value={"qualified": "unit-scope-only"}))
     monkeypatch.setattr(snapshot, "_capture", AsyncMock(return_value={"loading": prepared_by_field}))
     monkeypatch.setattr(snapshot, "_close_grants", AsyncMock())
     monkeypatch.setattr(snapshot, "_issue", AsyncMock())
@@ -335,63 +334,45 @@ async def test_late_header_failure_escapes_to_original_owner_rollback(publicatio
 
 
 @pytest.mark.asyncio
-async def test_issued_replay_detaches_namespace_and_native_proof(monkeypatch):
-    custody_by_field = {"namespace_roles": ("migration", "namespace_owner"), "selected": {"oid": 12}}
-    monkeypatch.setattr(snapshot, "_custody", AsyncMock(return_value=custody_by_field))
-    driver = SimpleNamespace(fetchval=AsyncMock(return_value=41))
-    publisher = SimpleNamespace(policy=object())
+async def test_issued_replay_records_logical_cohort_and_snapshot():
     value = cohort()
+    selected = SimpleNamespace(dataset_id=value.official_dataset_id)
     task = asyncio.current_task()
     try:
-        await snapshot._issue(driver, publisher, value, object())
-        custody_by_field["selected"]["oid"] = 99
+        await snapshot._issue(object(), object(), value, selected)
         issued = snapshot._ISSUED[task][value.cohort_id]
-        assert issued.custody["selected"]["oid"] == 12
-        assert issued.custody["namespace_roles"] == ("migration", "namespace_owner")
-        assert issued.database_oid == 41
+        assert issued == snapshot._Replay(value, selected)
+        assert set(vars(issued)) == {"cohort", "snapshot"}
     finally:
         snapshot._ISSUED.pop(task, None)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", [None, "xid", "backend", "binding"])
-async def test_builder_replay_uses_only_issued_namespace_and_original_transaction(monkeypatch, changed):
-    from process import provider_directory_source_acquisition_custody as custody
-
-    expected_cohort = cohort()
-    current = SimpleNamespace(dataset_id=expected_cohort.official_dataset_id)
-    policy = object()
-    custody_by_field = {"namespace_roles": ("migration", "namespace_owner")}
-    issued = snapshot._Replay(expected_cohort, current, policy, custody_by_field, 41)
+@pytest.mark.parametrize("changed", [None, "dataset", "cohort", "refresh"])
+async def test_builder_replay_checks_logical_dataset_header_and_final_source(monkeypatch, changed):
+    expected = cohort()
+    current = SimpleNamespace(dataset_id=expected.official_dataset_id, endpoint_id="e" * 64)
+    other = SimpleNamespace(dataset_id="different-dataset", endpoint_id="f" * 64)
     task = asyncio.current_task()
-    snapshot._ISSUED[task] = {expected_cohort.cohort_id: issued}
-    binding, driver = object(), object()
-    actor_by_field = {"backend": 7, "xid": "23"}
-    final_actor_by_field = {**actor_by_field, **({changed: "changed"} if changed in {"xid", "backend"} else {})}
-    origins = [
-        (binding, driver, actor_by_field),
-        (object() if changed == "binding" else binding, driver, final_actor_by_field),
-    ]
-    monkeypatch.setattr(snapshot, "_replay_origin", AsyncMock(side_effect=origins))
-    raw_capture = AsyncMock(return_value=custody_by_field)
-    monkeypatch.setattr(custody, "capture_cohort_snapshot_custody", raw_capture)
-    fresh_capture = AsyncMock(side_effect=AssertionError("Builder replay cannot bind Publisher"))
-    monkeypatch.setattr(snapshot, "_custody", fresh_capture)
-    monkeypatch.setattr(store, "_current_official_snapshot", AsyncMock(return_value=current))
-    monkeypatch.setattr(store, "_stored_cohort_for_dataset", AsyncMock(return_value=expected_cohort))
+    snapshot._ISSUED[task] = {expected.cohort_id: snapshot._Replay(expected, current)}
+    source = AsyncMock(
+        side_effect=[other if changed == "dataset" else current, other if changed == "refresh" else current]
+    )
+    stored = AsyncMock(return_value=cohort(3) if changed == "cohort" else expected)
+    monkeypatch.setattr(store, "_current_official_snapshot", source)
+    monkeypatch.setattr(store, "_stored_cohort_for_dataset", stored)
+    database = object()
     try:
         if changed is None:
-            assert (await snapshot.replay_cohort(object(), expected_cohort)).cohort == expected_cohort
+            result = await snapshot.replay_cohort(database, expected)
+            assert result.cohort == expected and not result.created
+            assert source.await_count == 2
         else:
             with pytest.raises(UHCFlexOfficialCohortError):
-                await snapshot.replay_cohort(object(), expected_cohort)
-        raw_capture.assert_awaited_once_with(
-            driver,
-            policy,
-            migration_role="migration",
-            namespace_owner_role="namespace_owner",
-            cohort_id=expected_cohort.cohort_id,
-        )
-        fresh_capture.assert_not_awaited()
+                await snapshot.replay_cohort(database, expected)
+        if changed == "dataset":
+            stored.assert_not_awaited()
+        else:
+            stored.assert_awaited_once_with(database, current.dataset_id)
     finally:
         snapshot._ISSUED.pop(task, None)

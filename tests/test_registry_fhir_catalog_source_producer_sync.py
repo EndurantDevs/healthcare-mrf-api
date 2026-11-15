@@ -16,14 +16,13 @@ from process import registry_fhir_catalog_sync as sync
 from process.registry_fhir_catalog_extraction import fhir_catalog_json_bytes
 from process.registry_fhir_catalog_observation import CATALOG_OBSERVATION_CONTRACT
 from process.registry_fhir_catalog_source_producer import (
-    CATALOG_DATABASE_IDENTITY_SQL,
     iter_source_owned_observation_batches,
 )
 from tests.test_registry_fhir_catalog_grant import snapshot, standing_grant
 from tests.test_registry_fhir_catalog_reporting import disposition
 from tests.test_registry_fhir_catalog_source_producer import _boundary
 from tests.test_registry_fhir_catalog_source_producer_grant import observed_descriptor
-from tests.test_registry_fhir_catalog_sources import descriptor, read_profile, scoped_read_profile
+from tests.test_registry_fhir_catalog_sources import descriptor, read_profile
 
 LEGACY_ONE = "11111111-1111-4111-8111-111111111111"
 LEGACY_TWO = "22222222-2222-4222-8222-222222222222"
@@ -56,7 +55,6 @@ def reconciliation_case(monkeypatch, source_case):
             events.append("closed")
 
     monkeypatch.setattr(sync.asyncpg, "create_pool", Mock(side_effect=open_pool))
-    monkeypatch.setattr(sync, "verify_fhir_catalog_preparation_permissions", AsyncMock())
     monkeypatch.setattr(sync, "_catalog_registry_head", AsyncMock())
     runtime = FHIRCatalogPublicationRuntime(AsyncMock(), AsyncMock(), AsyncMock())
     monkeypatch.setattr(sync, "build_fhir_catalog_publication_runtime", Mock(return_value=runtime))
@@ -180,12 +178,10 @@ async def test_current_recipe_replay_checks_current_source_before_reading(monkey
     selected = descriptor()
     connection = object()
     observe = AsyncMock()
-    monkeypatch.setattr(sync, "require_current_fhir_catalog_sources", AsyncMock())
-    monkeypatch.setattr(sync, "_published_read", AsyncMock(return_value=None))
     monkeypatch.setattr(sync, "_stage_plan_observations", AsyncMock(return_value=3))
     monkeypatch.setattr(sync, "_stage_reference_observations", AsyncMock(return_value=2))
     assert await sync.replay_fhir_catalog_observations(connection, selected, observe) == 5
-    sync.require_current_fhir_catalog_sources.assert_awaited_once_with(connection, (selected,))
+    assert sync._stage_plan_observations.await_args.args[4] == selected["tables"]["resource"]
     assert sync._stage_plan_observations.await_args.args[2] == selected["coordinates"]["dataset_id"]
     observe.assert_not_awaited()
 
@@ -245,7 +241,15 @@ def source_case():
     loader.execute = AsyncMock()
     loader.fetch = AsyncMock(return_value=[])
     grant = standing_grant(observation_contract=CATALOG_OBSERVATION_CONTRACT)
-    config = SimpleNamespace(grant=grant, loader_role="catalog_loader")
+    config = SimpleNamespace(
+        grant=grant,
+        loader_role="catalog_loader",
+        preparation_roles={
+            "namespace_owner_role": "catalog_owner",
+            "publisher_role": "catalog_sealer",
+            "application_roles": ["catalog_loader", "catalog_reader", "catalog_sealer"],
+        },
+    )
     return SimpleNamespace(
         factory=factory,
         export=export,
@@ -266,6 +270,7 @@ def _preparation(monkeypatch, case):
     monkeypatch.setattr(sync, "_retained_catalog_sources", AsyncMock(return_value=[]))
     monkeypatch.setattr(sync, "_catalog_snapshot_inputs", AsyncMock(return_value=(selected, current_by_generation)))
     monkeypatch.setattr(sync, "_reusable_catalog_snapshot", AsyncMock(return_value=None))
+    monkeypatch.setattr(sync, "checkpoint_fhir_catalog_snapshot", AsyncMock())
 
     async def build(*arguments):
         assert case.events == [("enter", read_profile())]
@@ -278,6 +283,7 @@ def _preparation(monkeypatch, case):
         assert options == {"source_pool": None, "source_export": case.factory}
         if report := reporting.current_fhir_catalog_report():
             assert report.document["phase"] == "sealing"
+        return "validated"
 
     monkeypatch.setattr(sync, "_build_source_catalog_candidate", AsyncMock(side_effect=build))
     monkeypatch.setattr(sync, "_seal_catalog_snapshot", AsyncMock(side_effect=seal))
@@ -301,11 +307,18 @@ async def test_preparation_closes_source_before_sealing_and_records_inventory(mo
     source_case.factory.assert_called_once_with(source_profile=read_profile())
     source_case.export["inventory"].assert_called_once_with()
     source_case.loader.fetchrow.assert_not_awaited()
-    source_case.identity_probe.fetchrow.assert_awaited_once_with(CATALOG_DATABASE_IDENTITY_SQL)
-    source_case.identity_probe.transaction.assert_called_once_with(isolation="repeatable_read", readonly=True)
+    assert source_case.identity_probe.transaction.call_args_list[0].kwargs == {
+        "isolation": "repeatable_read",
+        "readonly": True,
+    }
+    assert source_case.identity_probe.transaction.call_args_list[1].kwargs == {}
     assert source_case.probe_events == [
         "acquire",
         ("begin", {"isolation": "repeatable_read", "readonly": True}),
+        ("commit",),
+        "release",
+        "acquire",
+        ("begin", {}),
         ("commit",),
         "release",
     ]
@@ -440,17 +453,6 @@ async def test_multiple_producer_profiles_refuse_before_opening_any_context(sour
             pytest.fail("multiple contexts would wait for the same bounded registry pool")
     source_case.factory.assert_not_called()
     source_pool.acquire.assert_not_called()
-    source_case.sealer_pool.acquire.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_scoped_profile_requires_native_reader_without_substitution(source_case):
-    grant = replace(source_case.config.grant, source_profiles=(scoped_read_profile(),))
-    with pytest.raises(ValueError, match="source_reader_required"):
-        async with sync._catalog_source_reads(None, source_case.sealer_pool, grant, source_case.factory):
-            pytest.fail("scoped profile admitted without Reader")
-    source_case.factory.assert_not_called()
-    source_case.loader.fetchrow.assert_not_awaited()
     source_case.sealer_pool.acquire.assert_not_called()
 
 
@@ -727,7 +729,6 @@ async def test_binding_conflicts_or_incomplete_pages_fail_before_allocator(monke
     source_case.loader.fetch.side_effect = [[_alias()], second_page_aliases]
     monkeypatch.setattr(sync, "_network_organization_page", AsyncMock(return_value=[{"resource_id": "network-one"}]))
     monkeypatch.setattr(sync, "allocate_fhir_catalog_network_ids", AsyncMock())
-    monkeypatch.setattr(sync, "_published_read", AsyncMock(side_effect=AssertionError("native published read")))
     expected_error = ValueError if failure in {"uuid-change", "registry-conflict"} else type(error)
     with pytest.raises(expected_error) as caught:
         await sync.project_fhir_catalog_source(
@@ -742,7 +743,6 @@ async def test_binding_conflicts_or_incomplete_pages_fail_before_allocator(monke
     if failure in {"incomplete", "cancel"}:
         assert caught.value is error
     sync.allocate_fhir_catalog_network_ids.assert_not_awaited()
-    sync._published_read.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -766,9 +766,8 @@ async def test_producer_only_reconcile_omits_source_pool_and_preserves_publicati
     source_case.loader.fetchval = AsyncMock(return_value=True)
     pool = SimpleNamespace(acquire=lambda: _scope(source_case.loader))
     monkeypatch.setattr(sync.asyncpg, "create_pool", Mock(side_effect=lambda *_args, **_kwargs: _scope(pool)))
-    monkeypatch.setattr(sync, "verify_fhir_catalog_preparation_permissions", AsyncMock())
     monkeypatch.setattr(sync, "_catalog_registry_head", AsyncMock())
-    runtime = object()
+    runtime = SimpleNamespace()
     monkeypatch.setattr(sync, "build_fhir_catalog_publication_runtime", Mock(return_value=runtime))
     monkeypatch.setattr(sync, "prepare_fhir_catalog_snapshot", AsyncMock(return_value=({"sealed": True}, None, {})))
     monkeypatch.setattr(sync, "_publish_catalog_snapshot", AsyncMock(return_value={"state": "completed"}))
@@ -780,24 +779,4 @@ async def test_producer_only_reconcile_omits_source_pool_and_preserves_publicati
     sync.prepare_fhir_catalog_snapshot.assert_awaited_once_with(
         config, source_case.loader, None, pool, source_export=source_case.factory
     )
-    assert sync._publish_catalog_snapshot.await_args.args[4] is runtime
-
-
-@pytest.mark.asyncio
-async def test_sealing_verifier_receives_source_factory(monkeypatch, source_case):
-    reader = SimpleNamespace(transaction=lambda **_options: _scope())
-    sealer = SimpleNamespace(transaction=lambda: _scope(), execute=AsyncMock())
-    actors = iter((reader, sealer))
-    pool = SimpleNamespace(acquire=lambda: _scope(next(actors)))
-    workspace = object()
-    monkeypatch.setattr(sync, "fhir_catalog_reference_workspace", lambda connection: _scope(workspace))
-    monkeypatch.setattr(sync, "build_fhir_catalog_observation_verifier", Mock(return_value=object()))
-    monkeypatch.setattr(sync, "freeze_fhir_catalog_snapshot", AsyncMock(return_value={"validation": {"tables": {}}}))
-    config = source_case.config
-    config.consumer = SimpleNamespace(physical_owner_role="catalog_owner")
-    config.reader_roles = ("catalog_reader",)
-    await sync._seal_catalog_snapshot(config, object(), snapshot(config.grant), pool, source_export=source_case.factory)
-    sync.build_fhir_catalog_observation_verifier.assert_called_once_with(
-        config.grant, None, registry_reader=reader, registry_workspace=workspace, source_export=source_case.factory
-    )
-    sealer.execute.assert_awaited_once()
+    assert sync._publish_catalog_snapshot.await_args.args[4].preparation_roles == config.preparation_roles

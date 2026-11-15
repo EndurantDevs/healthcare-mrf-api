@@ -116,6 +116,8 @@ async def _raw_batch_snapshot(database, dataset_id, *, candidate=None):
     if candidate is not None:
         async with source_transaction(fhir.db, isolation="repeatable read") as session:
             async with session.begin_nested() as savepoint:
+                # Emit this SAVEPOINT now; lazily, it would open inside the publisher savepoint and be released with it.
+                await session.connection()
                 async with completed_source_scope(fhir, candidate):
                     snapshot = await _raw_batch_snapshot(fhir.db, dataset_id)
                 await savepoint.rollback()

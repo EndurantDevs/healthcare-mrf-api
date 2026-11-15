@@ -3,6 +3,8 @@
 
 import contextvars
 import datetime
+import importlib
+import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
@@ -44,7 +46,7 @@ def configured_node(monkeypatch):
 
 
 def _snapshot(payload):
-    return deepcopy({key: payload[key] for key in ("profile", "address", "doctors", "alias_generation", "overlay_oid")})
+    return deepcopy({key: payload[key] for key in ("profile", "address", "doctors", "alias_generation", "overlay")})
 
 
 def _native_payload():
@@ -564,7 +566,7 @@ def _assert_composite_completion(fhir, session, prepared, has_doctors, forecast)
     ]
 
 
-def _observe_composite_read_access(monkeypatch, session, events, stages, prior_events):
+def _observe_composite_read_access(monkeypatch, session, events, stages, prior_events, address):
     """Require the original owner and the complete live lock set before preserving reads."""
 
     async def preserve_reads(driver, **coordinates):
@@ -576,6 +578,11 @@ def _observe_composite_read_access(monkeypatch, session, events, stages, prior_e
 
     monkeypatch.setattr(publication, "_copy_driver", AsyncMock(return_value=session))
     monkeypatch.setattr(publication, "preserve_publication_reads", AsyncMock(side_effect=preserve_reads))
+
+    async def bind_overlay(actual, published_stages):
+        assert actual is address and published_stages is stages
+
+    monkeypatch.setattr(publication, "bind_published_overlay", bind_overlay)
 
 
 @pytest.mark.parametrize("with_doctors,with_forecast", [(False, False), (False, True), (True, False), (True, True)])
@@ -595,6 +602,7 @@ async def test_composite_publication_locks_live_set_before_swaps_and_receipt(mon
     async def apply_bundle(_fhir, stages, **options):
         assert stages is prepared.stages
         assert options["settings_configured"] is True
+        assert options["read_only"] is True
         assert options["cutover_timeout"] is (None if with_forecast else timeout)
         if with_forecast:
             await _lock_composite_delta(monkeypatch, session, prepared.profile_delta)
@@ -619,7 +627,7 @@ async def test_composite_publication_locks_live_set_before_swaps_and_receipt(mon
         assert actual is address and events[-1] == (last_delta_event if with_forecast else "profile-applied")
         events.append("address-applied")
 
-    _observe_composite_read_access(monkeypatch, session, events, prepared.stages, prior_events)
+    _observe_composite_read_access(monkeypatch, session, events, prepared.stages, prior_events, address)
     monkeypatch.setattr(publication, "apply_prepared_artifact_bundle", apply_bundle)
     monkeypatch.setattr(publication, "apply_prepared_cms_doctors_generation", apply_doctors)
     monkeypatch.setattr(publication, "publish_prepared_entity_address_generation", apply_address)
@@ -942,22 +950,22 @@ async def test_paired_preflight_checks_complete_receipt_before_open_authority(fa
     assert fhir.db.first.await_args.args[0].endswith(" FOR UPDATE")
 
 
-async def test_missing_quiescence_observation_never_becomes_zero_counts():
+async def test_missing_quiescence_observation_never_becomes_zero_counts(monkeypatch):
     request = _request()
     profile_lease = cms_plan()[2]
-    fhir = SimpleNamespace(
-        db=SimpleNamespace(first=AsyncMock(return_value=None)),
-        _schema=lambda: "synthetic",
-        _profile_capacity_quiescence_sql=lambda _schema: "SELECT :request_sha256",
-        _PROFILE_ACTIVE_RUN_STATUSES=("running",),
-        PROFILE_EXECUTION_CONTRACT_ID="synthetic-contract",
-    )
+    directory = importlib.import_module("process.provider_directory_fhir")
+    database = SimpleNamespace(first=AsyncMock(return_value=None))
+    quiescence = AsyncMock(wraps=directory._profile_capacity_quiescence)
+    monkeypatch.setattr(directory, "db", database)
+    monkeypatch.setattr(directory, "_schema", lambda: "synthetic")
+    monkeypatch.setattr(directory, "_profile_capacity_quiescence", quiescence)
     with pytest.raises(RuntimeError, match="quiescence_missing"):
-        await preflight._quiescence(fhir, request, profile_lease, VALIDATION_TIME)
-    assert (
-        fhir.db.first.await_args.kwargs["paired_request_sha256"]
-        == profile_lease.signing_preflight_guard["healthcare_receipt"]["request_sha256"]
-    )
+        await preflight._quiescence(directory, request, profile_lease, VALIDATION_TIME)
+    assert quiescence.await_args.kwargs["request_sha256"] == request.request_sha256
+    receipt = profile_lease.signing_preflight_guard["healthcare_receipt"]
+    assert quiescence.await_args.kwargs["verified_receipts"] == (receipt,)
+    observed_receipts = json.loads(database.first.await_args.kwargs["verified_receipts"])
+    assert [entry["request_sha256"] for entry in observed_receipts] == [receipt["request_sha256"]]
 
 
 @pytest.mark.parametrize("outlives_pair", [False, True])

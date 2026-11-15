@@ -1,11 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Existing group grants remain bounded across inherited and SET role paths."""
 
-import asyncio
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -351,75 +348,6 @@ def test_acquisition_guard_preserves_each_exact_existing_builder_grant_category(
                 loading=True,
                 delegation=delegation.builder_delegation(receipt),
             )
-
-
-@pytest.mark.parametrize("position", range(10))
-def test_cms_guard_preserves_every_exact_existing_builder_control_grant(position):
-    from process import provider_directory_cms_control_custody as custody
-
-    root = custody.CONTROL_ROOTS[position]
-    columns = (
-        list(custody._models()[root].__table__.columns.keys())
-        if root in custody._models()
-        else [name for name, _, _ in custody._EXTRA_COLUMNS[root]]
-    )
-    receipt, catalog, native = _control_catalog(columns, custody._writer_rights(root, columns))
-    native["relname"] = root
-    proof = delegation.builder_delegation(receipt)
-    custody._require_relation_acl(root, catalog, native, OWNER, BUILDER, legacy=False, delegation=proof)
-    catalog["column_acl"].append([1, READER, OWNER, "UPDATE", False])
-    with pytest.raises(ValueError, match="relation_acl_changed"):
-        custody._require_relation_acl(root, catalog, native, OWNER, BUILDER, legacy=False, delegation=proof)
-
-
-@pytest.mark.asyncio
-async def test_legacy_observation_uses_actual_locks_and_rechecks_original_transaction(monkeypatch):
-    from process import provider_directory_cms_control_custody as custody
-
-    actor_by_field = dict(session="administrator", current="administrator", backend=1, xid="123", native_admin=True)
-    connection = SimpleNamespace(
-        is_in_transaction=lambda: True,
-        fetch=AsyncMock(return_value=[dict(oid=901)]),
-        fetchrow=AsyncMock(return_value=actor_by_field),
-    )
-    policy = SimpleNamespace(owner_role="owner", publisher_role="publisher", runtime_roles=("builder", "reader"))
-    monkeypatch.setattr(custody, "_admin_identity", AsyncMock(return_value=actor_by_field))
-    proof = await custody._control_delegation(connection, policy, _receipt(), True)
-    assert proof.locked_relations == frozenset({901})
-    query = connection.fetch.await_args.args[0]
-    assert "pid=pg_backend_pid()" in query and "mode='AccessExclusiveLock' AND granted" in query
-    assert "database=(SELECT oid FROM pg_database WHERE datname=current_database())" in query
-    await custody._require_legacy_observation(connection, policy, (actor_by_field, asyncio.current_task()), proof)
-    connection.fetch.return_value = []
-    with pytest.raises(ValueError, match="legacy_locks_changed"):
-        await custody._require_legacy_observation(connection, policy, (actor_by_field, asyncio.current_task()), proof)
-    connection.fetch.return_value = [dict(oid=901)]
-    custody._admin_identity.return_value = dict(actor_by_field, backend=2)
-    with pytest.raises(ValueError, match="admin_transaction_changed"):
-        await custody._require_legacy_observation(connection, policy, (actor_by_field, asyncio.current_task()), proof)
-
-
-@pytest.mark.asyncio
-async def test_legacy_control_capture_refuses_nonadmin_before_other_io(monkeypatch):
-    from process import provider_directory_cms_control_custody as custody
-    from process import provider_directory_generic_source_provision as provision
-    from process.provider_directory_generic_source_policy import GenericSourcePolicy
-
-    connection = SimpleNamespace(is_in_transaction=lambda: True, fetch=AsyncMock(), fetchval=AsyncMock())
-    monkeypatch.setattr(custody, "_admin_identity", AsyncMock(side_effect=ValueError("independent_admin_required")))
-    monkeypatch.setattr(provision, "_verify_control_closure", AsyncMock())
-    policy = GenericSourcePolicy("sample", "owner", "publisher", ("builder", "reader"), ("builder",))
-    with pytest.raises(ValueError, match="independent_admin_required"):
-        await custody.capture_cms_control_custody(
-            connection,
-            policy,
-            migration_role="migrator",
-            namespace_owner_role="namespace",
-            legacy=True,
-        )
-    provision._verify_control_closure.assert_not_awaited()
-    connection.fetch.assert_not_awaited()
-    connection.fetchval.assert_not_awaited()
 
 
 def test_unbound_legacy_acquisition_guard_keeps_original_inherited_writer_refusal():

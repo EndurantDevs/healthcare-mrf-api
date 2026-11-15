@@ -46,24 +46,24 @@ async def _profile_layout_pair(
     target_oid = await _relation_oid(database, profile.qualified_table(schema, target_table))
     stage_ref = profile.qualified_table(schema, stage_table)
     stage_oid = await _relation_oid(database, stage_ref)
-    target_layout = await importer._provider_directory_profile_relation_storage_fingerprint(
+    target_layout = await importer._provider_directory_profile_capacity_relation_layout(
         target_oid, expected_persistence="p"
     )
-    stage_layout = await importer._provider_directory_profile_relation_storage_fingerprint(
+    stage_layout = await importer._provider_directory_profile_capacity_relation_layout(
         stage_oid, expected_persistence="p"
     )
     return target_layout, stage_layout, stage_ref
 
 
 def _assert_profile_layout_parity(target_layout, stage_layout) -> None:
-    """Assert structural parity while retaining exact OID identity."""
-    assert target_layout.exact_fingerprint != stage_layout.exact_fingerprint
-    assert target_layout.structural_fingerprint == stage_layout.structural_fingerprint
+    """Compare numeric projection inputs without treating physical identity as authority."""
+    assert target_layout.schema_name == stage_layout.schema_name
+    assert target_layout.relation_name != stage_layout.relation_name
     assert target_layout.toastable_columns == stage_layout.toastable_columns
     assert target_layout.main_index_pages
     assert stage_layout.toast_oid is not None
-    assert target_layout.effective_tablespace_oids
-    assert stage_layout.effective_tablespace_oids == target_layout.effective_tablespace_oids
+    assert target_layout.main_index_pages == stage_layout.main_index_pages
+    assert target_layout.toast_index_pages == stage_layout.toast_index_pages
 
 
 async def _insert_toasted_profile(database: Database, stage_ref: str) -> None:
@@ -136,7 +136,7 @@ async def test_pg18_capacity_identity_refuses_disabled_immutable_trigger(
                 relation_ref=consumption_ref,
             )
         )
-        await importer._provider_directory_profile_relation_storage_fingerprint(
+        await importer._provider_directory_profile_capacity_relation_layout(
             consumption_oid,
             expected_persistence="p",
             expected_user_trigger_count=2,
@@ -150,7 +150,7 @@ async def test_pg18_capacity_identity_refuses_disabled_immutable_trigger(
             importer.ProviderDirectoryArtifactBuildStale,
             match="immutable_trigger_shape_changed",
         ):
-            await importer._provider_directory_profile_relation_storage_fingerprint(
+            await importer._provider_directory_profile_capacity_relation_layout(
                 consumption_oid,
                 expected_persistence="p",
                 expected_user_trigger_count=2,
@@ -177,7 +177,7 @@ async def _control_update_projection(
         run_id=run_id,
     )
     import_run_oid = await _relation_oid(database, import_run_ref)
-    layout = await importer._provider_directory_profile_relation_storage_fingerprint(
+    layout = await importer._provider_directory_profile_capacity_relation_layout(
         import_run_oid,
         expected_persistence="p",
     )

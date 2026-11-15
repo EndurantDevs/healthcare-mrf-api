@@ -112,7 +112,6 @@ async def _desired_input(case, snapshot, monkeypatch):
     return address.ProviderDirectoryAddressPreparationInput(
         inputs.desired_pins(snapshot),
         "desired_overlay",
-        await database.scalar(f"SELECT '{schema}.desired_overlay'::regclass::oid::bigint"),
         0,
         ordinary_serving_peer_pins=inputs.peer_pins(snapshot),
     )

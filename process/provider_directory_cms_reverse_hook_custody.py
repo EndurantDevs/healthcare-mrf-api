@@ -194,21 +194,7 @@ async def _history_projection(connection, inventory, binding, history_bounds):
     from process.provider_directory_cms_history_postimage import _without_history_bounds
 
     checked = bounds.require_cms_history_expectations(history_bounds)
-    _require(
-        await connection.fetchval(
-            custody._ALLOCATION_LOCKS_SQL,
-            sorted(entry["old_oid"] for entry in checked.values()),
-            ["ShareLock"],
-        )
-        is True,
-        "history_locks_required",
-    )
-    await bounds.require_cms_source_history_bounds(
-        connection,
-        catalog_schema=binding.catalog_schema,
-        expected=checked,
-        owner_oid=binding.namespace_owner_oid,
-    )
+    await bounds.require_cms_source_history_bounds(connection, catalog_schema=binding.catalog_schema, expected=checked)
     return _without_history_bounds(inventory, checked)
 
 

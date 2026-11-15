@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Bound admitted native address execution and retain exact scratch ownership."""
+"""Bound native Address execution and track declared temporary names."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-from weakref import WeakKeyDictionary
 
 from process import entity_address_ordinary_preparation as ordinary_preparation
 from process import entity_address_source_preparation as source_preparation
@@ -41,110 +40,82 @@ class _AdmittedPreparation:
     workers: asyncio.Semaphore
     worker_tasks: set[asyncio.Task] = field(default_factory=set)
     db_schema: str | None = None
-    stage_oids: tuple[tuple[str, str, int], ...] = ()
-    owned_oids: dict[str, int] = field(default_factory=dict)
-    row_scratch_owners: dict[str, tuple[int, object]] = field(default_factory=dict)
-    retired_oids: list[tuple[str, str, int]] = field(default_factory=list)
+    stage_relations: tuple[tuple[str, str], ...] = ()
+    owned_relations: set[str] = field(default_factory=set)
+    row_scratch_owners: dict[str, object] = field(default_factory=dict)
+    retired_relations: list[tuple[str, str]] = field(default_factory=list)
     source_preparation: object = None
 
     @property
-    def cleanup_oids(self) -> tuple[tuple[str, str, int], ...]:
+    def cleanup_relations(self) -> tuple[tuple[str, str], ...]:
         """Retain every created relation, including unfinished and intermediate heaps."""
-        return tuple((name, name, oid) for name, oid in self.owned_oids.items()) + tuple(self.retired_oids)
+        return tuple((name, name) for name in sorted(self.owned_relations)) + tuple(self.retired_relations)
 
 
 _ADMISSION: ContextVar[_AdmittedPreparation | None] = ContextVar("entity_address_preparation_admission", default=None)
 _ROW_SCRATCH: ContextVar[object | None] = ContextVar("entity_address_row_scratch", default=None)
-_ROW_SCRATCH_STATES = WeakKeyDictionary()
 
 
-class _RowScratchCapability:
-    __slots__ = ("__weakref__",)
-
-
-@dataclass
+@dataclass(eq=False)
 class _RowScratchState:
     scope: _AdmittedPreparation
-    task: asyncio.Task
-    owned_oids: dict[str, int] = field(default_factory=dict)
+    owned_relations: set[str] = field(default_factory=set)
+    active: bool = True
 
 
 def issue_row_scratch():
-    """Issue an opaque row-runner capability only to its original admitted task."""
+    """Track each row runner's exact temporary names for concurrent cleanup."""
     _validate_row_context()
     scope = _ADMISSION.get()
     source_preparation.require_building(scope)
-    if scope is None:
-        return None
-    capability = _RowScratchCapability()
-    _ROW_SCRATCH_STATES[capability] = _RowScratchState(scope, asyncio.current_task())
-    return capability
+    return None if scope is None else _RowScratchState(scope)
 
 
-def _row_scratch_state(capability):
-    state = _ROW_SCRATCH_STATES.get(capability) if type(capability) is _RowScratchCapability else None
-    if state is None or state.scope is not _ADMISSION.get() or state.task is not asyncio.current_task():
-        raise RuntimeError("entity-address row scratch capability is invalid")
-    for name, oid in state.owned_oids.items():
-        if state.scope.owned_oids.get(name) != oid or state.scope.row_scratch_owners.get(name) != (oid, capability):
-            raise RuntimeError("entity-address row scratch identity changed")
+def _row_scratch_state(state):
+    if not isinstance(state, _RowScratchState) or not state.active:
+        raise RuntimeError("entity-address row scratch scope is inactive")
     return state
 
 
 def _validate_row_context():
-    capability = _ROW_SCRATCH.get()
-    return None if capability is None else _row_scratch_state(capability)
+    state = _ROW_SCRATCH.get()
+    return None if state is None else _row_scratch_state(state)
 
 
-def finish_row_scratch(capability):
-    """Retire a runner capability only after every exact scratch relation was removed."""
-    if capability is None:
-        return
-    state = _row_scratch_state(capability)
-    if state.owned_oids:
-        raise RuntimeError("entity-address row scratch remains owned")
-    del _ROW_SCRATCH_STATES[capability]
-
-
-def _register_row_scratch(scope, name, oid, capability, state):
+def finish_row_scratch(state):
+    """Release bookkeeping only after every named temporary relation was removed."""
     if state is None:
         return
-    if state.scope is not scope or _ROW_SCRATCH_STATES.get(capability) is not state or name in scope.row_scratch_owners:
-        raise RuntimeError("entity-address row scratch registration changed")
-    scope.row_scratch_owners[name] = (oid, capability)
-    state.owned_oids[name] = oid
+    state = _row_scratch_state(state)
+    if state.owned_relations:
+        raise RuntimeError("entity-address row scratch remains owned")
+    state.active = False
 
 
-def _retire_row_scratch(scope, name, oid):
-    registered = scope.row_scratch_owners.get(name)
-    if registered is None:
+def _register_row_scratch(scope, name, row_scratch, state):
+    if state is None:
         return
-    registered_oid, capability = registered
-    state = _ROW_SCRATCH_STATES.get(capability)
-    if registered_oid != oid or state is None or state.scope is not scope or state.owned_oids.get(name) != oid:
-        raise RuntimeError("entity-address row scratch retirement changed")
-    del state.owned_oids[name]
-    del scope.row_scratch_owners[name]
+    if name in scope.row_scratch_owners:
+        raise RuntimeError("entity-address row scratch registration changed")
+    scope.row_scratch_owners[name] = row_scratch
+    state.owned_relations.add(name)
+
+
+def _retire_row_scratch(scope, name):
+    state = scope.row_scratch_owners.pop(name, None)
+    if state is not None:
+        _row_scratch_state(state).owned_relations.discard(name)
 
 
 def _locked_stage_names(scope):
     current = _ROW_SCRATCH.get()
     if current is None:
-        return sorted(scope.owned_oids)
+        return sorted(scope.owned_relations)
     _row_scratch_state(current)
-    for name, (oid, capability) in scope.row_scratch_owners.items():
-        state = _ROW_SCRATCH_STATES.get(capability)
-        if (
-            state is None
-            or state.scope is not scope
-            or state.owned_oids.get(name) != oid
-            or scope.owned_oids.get(name) != oid
-        ):
-            raise RuntimeError("entity-address row scratch inventory changed")
     return sorted(
         name
-        for name in scope.owned_oids
-        if name not in scope.row_scratch_owners or scope.row_scratch_owners[name][1] is current
+        for name in scope.owned_relations
+        if name not in scope.row_scratch_owners or scope.row_scratch_owners[name] is current
     )
 
 
@@ -205,9 +176,9 @@ async def check_owned_storage() -> None:
     scope = _ADMISSION.get()
     if scope is not None:
         async with scope.admission.inventory_transition():
-            if scope.owned_oids:
-                name, oid = next(iter(scope.owned_oids.items()))
-                await scope.admission.assert_external_relation(_fhir(), scope.db_schema, name, oid)
+            if scope.owned_relations:
+                name = next(iter(scope.owned_relations))
+                await scope.admission.assert_external_relation(_fhir(), scope.db_schema, name)
 
 
 async def lock_owned_relations(database) -> None:
@@ -216,7 +187,7 @@ async def lock_owned_relations(database) -> None:
     await _native().candidate_preparation.lock_prepared_doctors(database)
     scope = _ADMISSION.get()
     source_preparation.require_building(scope)
-    if scope is None or not scope.owned_oids:
+    if scope is None or not scope.owned_relations:
         return
     async with scope.admission.inventory_transition():
         await _lock_stage_inventory(database, scope)
@@ -224,19 +195,12 @@ async def lock_owned_relations(database) -> None:
 
 async def _lock_stage_inventory(database, scope):
     names = _locked_stage_names(scope)
-    expected_identities = [(f"{scope.db_schema}.{name}", scope.owned_oids[name]) for name in names]
+    if not names:
+        return
     for name in names:
-        source_preparation.require_owned_relation(scope, name, scope.owned_oids[name])
-    relations = ", ".join(f"{scope.db_schema}.{name}" for name in names)
+        source_preparation.require_owned_relation(scope, name)
+    relations = ", ".join(f"{_identifier(scope.db_schema)}.{_identifier(name)}" for name in names)
     await database.status(f"LOCK TABLE {relations} IN ACCESS SHARE MODE NOWAIT")
-    observed_rows = await database.all(
-        "SELECT requested.relation,c.oid::bigint AS oid "
-        "FROM unnest(CAST(:relations AS text[])) WITH ORDINALITY AS requested(relation,ordinal) "
-        "LEFT JOIN pg_class c ON c.oid=to_regclass(requested.relation) ORDER BY requested.ordinal",
-        relations=[relation for relation, _oid in expected_identities],
-    )
-    if [(row[0], row[1]) for row in observed_rows] != expected_identities:
-        raise RuntimeError("entity-address owned stage changed")
 
 
 async def _finish_owned_operation(operation):
@@ -260,13 +224,13 @@ async def _bounded_owned_operation(operation):
 
 
 async def create_stage_table(db_schema, stage_cls, *, unlogged=False):
-    """Create the native model exactly once and capture its OID before releasing DDL locks."""
+    """Create the native model exactly once and record its declared candidate name atomically."""
     _validate_row_context()
     native = _native()
     name = stage_cls.__tablename__
 
     async def create(session):
-        """Capture model creation on the same transaction as its physical identity."""
+        """Keep model creation and candidate registration in the same native transaction."""
         connection = await session.connection()
         await connection.run_sync(stage_cls.__table__.create, checkfirst=False)
         if unlogged or _ADMISSION.get() is not None:
@@ -315,7 +279,7 @@ async def _create_owned_relation(db_schema, name, create, row_scratch=None, row_
     """Never adopt or delete an existing relation when a candidate name collides."""
     scope, native = _ADMISSION.get(), _native()
     db_schema, name = _identifier(db_schema), _identifier(name)
-    if scope.db_schema not in (None, db_schema) or name in scope.owned_oids:
+    if scope.db_schema not in (None, db_schema) or name in scope.owned_relations:
         raise RuntimeError("entity-address candidate stage ownership changed")
     scope.db_schema = db_schema
     async with _worker_slot():
@@ -326,36 +290,32 @@ async def _create_owned_relation(db_schema, name, create, row_scratch=None, row_
                 await _apply_owned_temp_entry(native.db, is_transaction_owner)
                 await native._apply_entity_address_transaction_settings()
                 await create(session)
-                oid = await native.db.scalar(
-                    "SELECT to_regclass(:relation)::oid::bigint", relation=f"{db_schema}.{name}"
+                exists = await native.db.scalar(
+                    "SELECT to_regclass(:relation) IS NOT NULL", relation=f"{db_schema}.{name}"
                 )
-                if oid is None:
+                if not exists:
                     raise RuntimeError("entity-address created stage is missing")
-                await source_preparation.register_source_relation(scope, name, int(oid))
-                scope.owned_oids[name] = int(oid)
-                _register_row_scratch(scope, name, int(oid), row_scratch, row_state)
-                scope.admission._record_external_identity(db_schema, name, int(oid))
-            await scope.admission.register_external_relation(_fhir(), db_schema, name, int(oid))
+                await source_preparation.register_source_relation(scope, name)
+                scope.owned_relations.add(name)
+                _register_row_scratch(scope, name, row_scratch, row_state)
+                scope.admission._record_external_identity(db_schema, name)
+            await scope.admission.register_external_relation(_fhir(), db_schema, name)
 
 
 async def _lock_owned_stage(db_schema, name):
-    """Hold an exclusive native DDL lock and require the creation-time physical identity."""
+    """Pin a declared stage; actual native DDL controls its later mutation."""
     scope, native = _ADMISSION.get(), _native()
-    expected_oid = scope.owned_oids.get(name)
-    if scope.db_schema != db_schema or expected_oid is None:
+    if scope.db_schema != db_schema or name not in scope.owned_relations:
         raise RuntimeError("entity-address stage was not created by this build")
-    source_preparation.require_owned_relation(scope, name, expected_oid)
+    source_preparation.require_owned_relation(scope, name)
     await native.db.status("SET LOCAL lock_timeout='500ms'")
     await native.db.status("SET LOCAL statement_timeout='5s'")
-    await native.db.status(f"LOCK TABLE {db_schema}.{_identifier(name)} IN ACCESS EXCLUSIVE MODE NOWAIT")
-    actual_oid = await native.db.scalar("SELECT to_regclass(:relation)::oid::bigint", relation=f"{db_schema}.{name}")
-    if actual_oid != expected_oid:
-        raise RuntimeError("entity-address owned stage changed")
-    return expected_oid
+    await native.db.status(f"LOCK TABLE {db_schema}.{_identifier(name)} IN ACCESS SHARE MODE NOWAIT")
+    return name
 
 
 async def drop_stage(db_schema, name, **phase_options):
-    """Retire an intermediate heap only under its exact captured physical ownership."""
+    """Retire only a declared intermediate heap through its native transaction."""
     _validate_row_context()
     if _ADMISSION.get() is None:
         if await ordinary_preparation.drop(db_schema, name):
@@ -370,15 +330,15 @@ async def drop_stage(db_schema, name, **phase_options):
 
 
 async def _drop_owned_relation(db_schema, name):
-    """Commit removal before forgetting the owned OID or its storage registration."""
+    """Commit native removal before retiring the declared name and storage reservation."""
     scope, native = _ADMISSION.get(), _native()
     async with scope.admission.inventory_transition():
         async with source_preparation.preparation_transaction(native.db, scope):
-            oid = await _lock_owned_stage(db_schema, name)
+            await _lock_owned_stage(db_schema, name)
             await native.db.status(f"DROP TABLE {db_schema}.{name} RESTRICT")
-        await scope.admission.retire_external_relation(_fhir(), db_schema, name, oid)
-        _retire_row_scratch(scope, name, oid)
-        scope.owned_oids.pop(name)
+        await scope.admission.retire_external_relation(_fhir(), db_schema, name)
+        _retire_row_scratch(scope, name)
+        scope.owned_relations.discard(name)
 
 
 async def replace_compacted_stage(db_schema, stage, compact, context):
@@ -409,14 +369,14 @@ async def _replace_stage_inventory(scope, native, db_schema, stage, compact):
     async with source_preparation.preparation_transaction(native.db, scope):
         for name in sorted((stage, compact)):
             await _lock_owned_stage(db_schema, name)
-        old_oid, new_oid = scope.owned_oids[stage], scope.owned_oids[compact]
-        scope.retired_oids.extend(((stage, stage, old_oid), (compact, compact, new_oid)))
+        scope.retired_relations.extend(((stage, stage), (compact, compact)))
         await native.db.status(f"DROP TABLE {db_schema}.{stage} RESTRICT")
-        await scope.admission.retire_external_relation(_fhir(), db_schema, stage, old_oid)
+        await scope.admission.retire_external_relation(_fhir(), db_schema, stage)
         await native.db.status(f"ALTER TABLE {db_schema}.{compact} RENAME TO {stage}")
-        source_preparation.record_source_rename(scope, compact, stage, new_oid)
-        await scope.admission.rename_external_relation(_fhir(), db_schema, compact, stage, new_oid)
-        scope.owned_oids[stage] = scope.owned_oids.pop(compact)
+        source_preparation.record_source_rename(scope, compact, stage)
+        await scope.admission.rename_external_relation(_fhir(), db_schema, compact, stage)
+        scope.owned_relations.discard(compact)
+        scope.owned_relations.add(stage)
 
 
 @asynccontextmanager
@@ -474,7 +434,7 @@ async def native_transaction(*, row_scratch=None):
     database = _native().db
     current = _ROW_SCRATCH.get()
     if row_scratch is not None:
-        if not _row_scratch_state(row_scratch).owned_oids:
+        if not _row_scratch_state(row_scratch).owned_relations:
             raise RuntimeError("entity-address row scratch capability is unregistered")
         if current not in (None, row_scratch) or (
             database._transaction_binding() is not None and current is not row_scratch
@@ -708,7 +668,7 @@ async def before_stage_logging(db_schema: str, stage: str) -> None:
     scope = _ADMISSION.get()
     if scope is None:
         return
-    if db_schema != scope.db_schema or stage not in {name for _target, name, _oid in scope.stage_oids}:
+    if db_schema != scope.db_schema or stage not in {name for _target, name in scope.stage_relations}:
         raise RuntimeError("entity-address logging stage is not admitted")
     fhir = importlib.import_module("process.provider_directory_fhir")
     await scope.admission.before_logging(fhir, db_schema, stage)
@@ -716,7 +676,7 @@ async def before_stage_logging(db_schema: str, stage: str) -> None:
 
 @asynccontextmanager
 async def stage_logging_scope(db_schema: str, stage: str):
-    """Bind logging to one budgeted backend and the captured physical stage under lock."""
+    """Keep native logging within the signed budget and selected name under a read pin."""
     scope = _ADMISSION.get()
     if scope is None:
         yield
@@ -729,8 +689,5 @@ async def stage_logging_scope(db_schema: str, stage: str):
             native.db, native_sql_settings(), native._sql_literal, native.logger, **_admitted_temp_options()
         ):
             await verify_sql_settings(native.db)
-            await native.db.status(f"LOCK TABLE {relation} IN ACCESS EXCLUSIVE MODE NOWAIT")
-            actual_oid = await native.db.scalar("SELECT to_regclass(:relation)::oid::bigint", relation=relation)
-            if actual_oid != next(oid for _target, name, oid in scope.stage_oids if name == stage):
-                raise RuntimeError("entity-address logging stage changed")
+            await native.db.status(f"LOCK TABLE {relation} IN ACCESS SHARE MODE NOWAIT")
             yield

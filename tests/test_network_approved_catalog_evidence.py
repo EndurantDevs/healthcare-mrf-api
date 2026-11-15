@@ -63,6 +63,7 @@ class Connection:
                 "isolation": self.isolation,
                 "approved_revision": SOURCE.approved_revision,
                 "is_bounded": True,
+                "edition_valid": True,
                 "invalid_documents": 0,
                 "unresolved_rows": 0,
                 "generation_id": self.generation,

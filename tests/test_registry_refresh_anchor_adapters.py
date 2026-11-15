@@ -354,27 +354,37 @@ async def test_cms_successor_cannot_change_the_enrolled_organization_or_producer
     changed_organization.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "fault", [None, "absent", "pending", "generation", "relations", "summary_inputs", "summary_oid"]
-)
-async def test_aca_current_publication_requires_completed_generation_and_exact_relations(monkeypatch, fault):
+def _aca_publication_fixture():
+    """Keep the original receipt fields while declaring current Reference serving names."""
     from process.mrf_publication_receipt import SUMMARY_INPUTS
     from process.reference_family_result_generation import (
         ReferenceFamilyResultGenerationAuthority,
+        declared_reference_family_relations,
         validate_reference_family_serving_generation,
     )
-    from tests.test_registry_aca_global_epoch import _global_completion
+    from tests.test_registry_aca_source_recipe import _DATASET, _completed
 
-    completion = _global_completion()
-    fields = completion["generation"]
+    completion_by_field = _completed()
     generation = ReferenceFamilyResultGenerationAuthority(
-        fields["importer_id"],
-        fields["local_lineage_id"],
-        fields["local_generation"],
-        validate_reference_family_serving_generation(fields["serving_generation"]),
-        tuple(fields["relation_oids"]),
+        "mrf",
+        str(_DATASET),
+        2,
+        validate_reference_family_serving_generation(completion_by_field["generation"]["serving_generation"]),
+        declared_reference_family_relations("mrf", "source"),
     )
+    completion_by_field["generation"] = generation.as_dict()
+    completion_by_field["summary_inputs"] = {name: index + 200 for index, name in enumerate(SUMMARY_INPUTS)}
+    return completion_by_field, generation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault", [None, "legacy", "absent", "pending", "generation", "relations", "summary_inputs", "summary_oid"]
+)
+async def test_aca_current_publication_requires_completed_generation_and_exact_relations(monkeypatch, fault):
+    from process.mrf_publication_receipt import SUMMARY_INPUTS
+
+    completion, generation = _aca_publication_fixture()
     publication_by_field = {
         "contract_version": 1,
         "state": "complete",
@@ -383,8 +393,11 @@ async def test_aca_current_publication_requires_completed_generation_and_exact_r
         "summary_inputs": json.dumps(completion["summary_inputs"]),
     }
     current_relations = list({**completion["summary_inputs"], "plan_search_summary": completion["summary_oid"]}.items())
-    relation_oids = generation.relation_oids
     match fault:
+        case "legacy":
+            legacy_by_field = dict(completion["generation"])
+            legacy_by_field["relation_oids"] = ["opaque prior token"] * len(legacy_by_field.pop("relations"))
+            publication_by_field["generation"] = json.dumps(legacy_by_field)
         case "absent":
             publication_by_field = None
         case "pending":
@@ -394,7 +407,7 @@ async def test_aca_current_publication_requires_completed_generation_and_exact_r
                 {**generation.as_dict(), "local_generation": generation.local_generation + 1}
             )
         case "relations":
-            relation_oids = tuple(oid + 1 for oid in relation_oids)
+            generation = replace(generation, relations=(("other", "plan"),))
         case "summary_inputs":
             publication_by_field["summary_inputs"] = json.dumps({name: 10 for name in SUMMARY_INPUTS if name != "plan"})
         case "summary_oid":
@@ -405,12 +418,12 @@ async def test_aca_current_publication_requires_completed_generation_and_exact_r
     monkeypatch.setattr(
         accepted_aca, "read_reference_family_result_generation_authority", AsyncMock(return_value=generation)
     )
-    monkeypatch.setattr(accepted_aca, "current_reference_family_relation_oids", AsyncMock(return_value=relation_oids))
-    if fault is None:
+    monkeypatch.setattr(accepted_aca, "current_reference_family_relation_oids", AsyncMock())
+    if fault in (None, "legacy"):
         completed, serving = await accepted_aca._current_publication(object(), driver, "source")
         assert completed == {
-            name: completion[name]
-            for name in ("attempt_id", "import_id", "summary_oid", "generation", "summary_inputs")
+            **{name: completion[name] for name in ("attempt_id", "import_id", "summary_oid", "summary_inputs")},
+            "generation": generation.as_dict(),
         }
         assert serving == generation.serving_generation.as_dict()
     else:
@@ -476,3 +489,49 @@ async def test_source_derivation_requires_the_installed_family_reader(system):
             (_binding(system),),
             RegistryPTGGraphReadBudget(100000),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edition", ["named", "legacy"])
+@pytest.mark.parametrize("changed", [False, True])
+async def test_aca_accepted_generation_keeps_logical_revision_and_raw_history(edition, changed):
+    from copy import deepcopy
+
+    completion, generation = _aca_publication_fixture()
+    native_by_field = deepcopy(completion)
+    if edition == "legacy":
+        native_by_field["generation"]["relation_oids"] = ["opaque prior token"] * len(
+            native_by_field["generation"].pop("relations")
+        )
+    if changed:
+        native_by_field["generation"]["local_generation"] += 1
+    before = deepcopy(native_by_field)
+    manifest = SimpleNamespace(
+        source_metadata={"aca_completed_publication": native_by_field},
+        source_serving_generation=generation.serving_generation,
+    )
+    subject = SimpleNamespace(source_pin=SimpleNamespace(prepared=SimpleNamespace(manifest=manifest)))
+    store = SimpleNamespace(
+        control_schema="control", qualify=AsyncMock(), accepted=AsyncMock(return_value={"recipe": subject})
+    )
+    driver = SimpleNamespace(fetch=AsyncMock(return_value=[{"capture_id": "accepted", "raw_byte_count": 100}]))
+    if changed:
+        with pytest.raises(RegistryRefreshAnchorUnavailable, match="current_aca_unavailable"):
+            await accepted_aca._current_accepted(
+                object(),
+                driver,
+                store,
+                completion,
+                generation.serving_generation.as_dict(),
+                RegistryPTGGraphReadBudget(100000),
+            )
+    else:
+        assert await accepted_aca._current_accepted(
+            object(),
+            driver,
+            store,
+            completion,
+            generation.serving_generation.as_dict(),
+            RegistryPTGGraphReadBudget(100000),
+        ) == (subject,)
+    assert native_by_field == before

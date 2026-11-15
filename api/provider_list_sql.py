@@ -21,7 +21,6 @@ from api.network_address_scope import (
     is_scoped_address_relation,
     scoped_address_parameters,
 )
-from api.network_read_execution import NetworkReadConnectionProxy
 from api.provider_directory_dataset_sql import named_source_data_sql
 from api.provider_profile_snapshot import provider_read_savepoint
 from db.connection import ConnectionProxy
@@ -303,7 +302,7 @@ async def _provider_list_connection(
         if import_context is not None:
             raise RuntimeError("custom-import provider query requires a request session")
         raise RuntimeError("canonical provider query requires a request session")
-    yield NetworkReadConnectionProxy(database, request_session, None)
+    yield ConnectionProxy(database, request_session, None)
 
 
 async def _npi_count_read(read: Callable[[], Awaitable[Any]]):

@@ -9,6 +9,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -148,6 +149,10 @@ async def _create_fixture_tables(
         schema=schema,
     )
     await database.create_table(checkpoint_table)
+    consumption_table = importer.ProviderDirectoryProfileCapacityLeaseConsumption.__table__.to_metadata(
+        MetaData(), schema=schema
+    )
+    await database.create_table(consumption_table)
 
 
 async def _insert_typed_resource(
@@ -1765,7 +1770,7 @@ async def test_existing_global_refresh_replaces_without_copy_batches(
 
         monkeypatch.setattr(database, "status", recording_status)
         monkeypatch.setattr(importer, "db", database)
-        fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+        fence = importer.ProviderDirectoryArtifactBuildFence()
         metrics, _stages = await importer._build_provider_directory_profile_stages(
             build,
             fence,
@@ -1808,7 +1813,7 @@ def _empty_target_profile_build(
     schema: str,
 ) -> importer._ProviderDirectoryProfileBuild:
     """Return the deterministic build used against an empty serving pair."""
-    return importer._ProviderDirectoryProfileBuild(
+    build = importer._ProviderDirectoryProfileBuild(
         schema=schema,
         generation_id="profile-affiliation-test",
         source_ids=("profile-source-a", "profile-source-b"),
@@ -1819,6 +1824,13 @@ def _empty_target_profile_build(
         profile_stage="profile_empty_target_stage",
         build_id="profile-empty-target-build",
         owner_run_id="profile-empty-target-run",
+    )
+
+    return replace(
+        build,
+        batch_plan=importer._provider_directory_profile_batch_plan(
+            build.source_ids, build.retained_source_ids, build.dataset_ids, has_existing_artifacts=False
+        ),
     )
 
 
@@ -1871,7 +1883,7 @@ async def test_bounded_build_populates_an_initial_empty_serving_pair(
         monkeypatch.setattr(importer, "db", database)
         await _create_empty_profile_targets(database, schema)
         build = _empty_target_profile_build(schema)
-        fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+        fence = importer.ProviderDirectoryArtifactBuildFence()
         metrics, _stages = await importer._build_provider_directory_profile_stages(
             build,
             fence,
@@ -2297,7 +2309,7 @@ async def _seed_stale_and_current_profile_builds(
         dataset_id="profile-dataset-b",
         owner_run_id="profile-run-current",
     )
-    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    fence = importer.ProviderDirectoryArtifactBuildFence()
     await importer._claim_provider_directory_profile_build_checkpoint(
         stale_build,
         has_existing_artifacts=False,

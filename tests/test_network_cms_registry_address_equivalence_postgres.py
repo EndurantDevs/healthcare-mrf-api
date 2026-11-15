@@ -95,6 +95,19 @@ async def _clone(session, source_schema, dataset_id):
 
 
 async def _assert_native_rejections(session, clone_schema, source_capture, owner, source_schema):
+    nested = await session.begin_nested()
+    try:
+        await session.execute(
+            text(
+                f'CREATE TRIGGER selected_invalid_guard BEFORE UPDATE ON "{source_schema}".entity_address_unified FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger()'
+            )
+        )
+        with pytest.raises(ValueError, match="registry_cms_address_custody_invalid"):
+            await equivalence.capture_registry_cms_address_copy_source(
+                session, source_schema=source_schema, expected_relation_names=source_capture.relation_names
+            )
+    finally:
+        await nested.rollback()
     mutations = (
         f'ALTER TABLE "{clone_schema}".entity_address_unified ADD COLUMN unknown_column integer',
         f'ALTER TABLE "{clone_schema}".entity_address_unified ALTER COLUMN entity_id TYPE varchar(64)',
@@ -134,6 +147,12 @@ async def test_native_copy_preserves_receipts_and_rejects_drift():
     try:
         async with sessions() as session, session.begin():
             oids = await _source(session, source_schema)
+            await session.execute(text(f'CREATE TABLE "{source_schema}".unrelated_control (value integer)'))
+            await session.execute(
+                text(
+                    f'CREATE TRIGGER unrelated_control_guard BEFORE UPDATE ON "{source_schema}".unrelated_control FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger()'
+                )
+            )
             source_capture = await equivalence.capture_registry_cms_address_copy_source(
                 session, source_schema=source_schema, expected_relation_oids=oids
             )
@@ -142,7 +161,7 @@ async def test_native_copy_preserves_receipts_and_rejects_drift():
             witness = await equivalence.validate_registry_cms_address_copy(
                 session, source_capture=source_capture, clone_ownership=owner
             )
-            await verify_native_unique_trigger_predicate(await native_driver(session), owner.schema_oid)
+            await verify_native_unique_trigger_predicate(await native_driver(session), owner.schema_name)
             assert witness.source.semantic_receipt.schema_sha256 != witness.clone_receipt.schema_sha256
             assert witness.source.semantic_receipt.main_input_sha256 == witness.clone_receipt.main_input_sha256
             assert [table_receipt.row_count for table_receipt in witness.clone_receipt.tables][:2] == [1, 1]
@@ -150,15 +169,17 @@ async def test_native_copy_preserves_receipts_and_rejects_drift():
             assert len(json.dumps(witness.as_dict()).encode()) < 65536
             assert dict(source_capture.ordinals)["entity_address_unified"][0][1:] == (2, 1)
             assert dict(witness.clone_ordinals)["entity_address_unified"][0][1:] == (1, 1)
-            assert (
-                json.loads(source_capture.sequence_json)["sequence_oid"]
-                != json.loads(witness.clone_sequence_json)["sequence_oid"]
+            assert "sequence_oid" not in json.loads(source_capture.sequence_json)
+            assert source_capture.relation_names == tuple(name for name, _opaque in oids)
+            copied = await equivalence.capture_registry_cms_address_copy_source(
+                session,
+                source_schema=source_schema,
+                expected_relation_oids=tuple((name, {"opaque": "copied"}) for name, _token in oids),
             )
-            with pytest.raises(equivalence.RegistryCMSAddressEquivalenceError, match="OID"):
+            assert copied == source_capture
+            with pytest.raises(equivalence.RegistryCMSAddressEquivalenceError, match="named family"):
                 await equivalence.capture_registry_cms_address_copy_source(
-                    session,
-                    source_schema=source_schema,
-                    expected_relation_oids=tuple((name, oid + 1) for name, oid in oids),
+                    session, source_schema=source_schema, expected_relation_names=source_capture.relation_names[:-1]
                 )
             await _assert_native_rejections(session, clone_schema, source_capture, owner, source_schema)
             assert (
@@ -168,6 +189,79 @@ async def test_native_copy_preserves_receipts_and_rejects_drift():
             ).as_dict() == witness.as_dict()
     finally:
         # Creation and all mutations occur in one transaction; rollback also owns cleanup on failure.
+        async with engine.begin() as connection:
+            for schema in (clone_schema, source_schema):
+                await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await engine.dispose()
+
+
+def _legacy_wire(witness):
+    """Keep the old semantic commitments while its physical tokens are opaque."""
+    document = json.loads(json.dumps(witness.as_dict()))
+    document["version"] = "registry_cms_address_copy.v1"
+    for side in (document["source"], document["clone"]):
+        side["schema_oid"] = {"copied": "opaque namespace"}
+        side["relation_oids"] = [[entry["logical_name"], {"copied": "opaque table"}] for entry in side.pop("relations")]
+        side["catalog_sha256"] = "e" * 64
+        sequence = side["sequence"]
+        sequence.pop("table_name")
+        sequence.update(sequence_oid={"copied": "opaque sequence"}, table_oid=None)
+        sequence["settings"].pop("type")
+        sequence["settings"]["type_oid"] = {"copied": "opaque type"}
+    return document
+
+
+async def _assert_old_layout_refusals(session, clone_schema, old, owner):
+    """Keep the custom default/index/CHECK commitment after portable slot projection."""
+    for mutation in (
+        f'ALTER TABLE "{clone_schema}".entity_address_unified ALTER COLUMN checksum SET DEFAULT 123',
+        f'CREATE INDEX unexpected_copy_index ON "{clone_schema}".entity_address_unified (entity_id)',
+        f'ALTER TABLE "{clone_schema}".entity_address_unified ADD CONSTRAINT unexpected_copy_check CHECK(checksum>0)',
+    ):
+        nested = await session.begin_nested()
+        try:
+            await session.execute(text(mutation))
+            with pytest.raises(equivalence.RegistryCMSAddressEquivalenceError, match="layout"):
+                await equivalence.require_registry_cms_address_copy_witness(session, old, clone_ownership=owner)
+        finally:
+            await nested.rollback()
+
+
+@pytest.mark.asyncio
+async def test_named_and_old_receipts_survive_copy_and_refuse_layout_drift():
+    engine = _engine()
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    source_schema = "synthetic_address_" + uuid4().hex
+    dataset_id = uuid4()
+    clone_schema = entity_address_archive_stage_schema(dataset_id)
+    try:
+        async with sessions() as session, session.begin():
+            names = tuple(name for name, _old in await _source(session, source_schema))
+            source_capture = await equivalence.capture_registry_cms_address_copy_source(
+                session, source_schema=source_schema, expected_relation_names=names
+            )
+            owner = await _clone(session, source_schema, dataset_id)
+            witness = await equivalence.validate_registry_cms_address_copy(
+                session, source_capture=source_capture, clone_ownership=owner
+            )
+            old = _legacy_wire(witness)
+            old_bytes = equivalence.decode_registry_cms_address_copy_witness(old)
+            await session.execute(
+                text(
+                    f'CREATE TABLE "{clone_schema}".copied_main (discarded integer, LIKE "{clone_schema}".entity_address_unified INCLUDING ALL)'
+                )
+            )
+            await session.execute(text(f'ALTER TABLE "{clone_schema}".copied_main DROP COLUMN discarded'))
+            await session.execute(
+                text(f'INSERT INTO "{clone_schema}".copied_main SELECT * FROM "{clone_schema}".entity_address_unified')
+            )
+            await session.execute(text(f'DROP TABLE "{clone_schema}".entity_address_unified'))
+            await session.execute(text(f'ALTER TABLE "{clone_schema}".copied_main RENAME TO entity_address_unified'))
+            for document in (witness.as_dict(), old):
+                await equivalence.require_registry_cms_address_copy_witness(session, document, clone_ownership=owner)
+            await _assert_old_layout_refusals(session, clone_schema, old, owner)
+            assert equivalence.decode_registry_cms_address_copy_witness(old) == old_bytes
+    finally:
         async with engine.begin() as connection:
             for schema in (clone_schema, source_schema):
                 await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))

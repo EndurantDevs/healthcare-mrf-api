@@ -106,13 +106,7 @@ async def _initial_registry(fixture, old):
     )
     identity = uuid4()
     fixture.composition_ids.append(uuid5(identity, "address:" + approved.generation_id))
-    address_sources = await fixture.prepare_address_sources(
-        request_id=identity,
-        approved_revision=approved.approved_revision,
-        source_manifest=None,
-        expected_head=0,
-        address_sources=RegistryCompositionAddressSources(old.address_source, initial_source_recipes=(old.recipe,)),
-    )
+    address_sources = RegistryCompositionAddressSources(old.address_source, initial_source_recipes=(old.recipe,))
     copy_target, address = await compose_registry_membership_candidate(
         fixture.execution_connection,
         request_id=identity,

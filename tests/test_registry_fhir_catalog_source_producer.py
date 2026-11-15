@@ -3,7 +3,6 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -11,22 +10,14 @@ import pytest
 
 from process.registry_fhir_catalog_extraction import fhir_catalog_json_bytes
 from process.registry_fhir_catalog_source_producer import (
-    CATALOG_DATABASE_IDENTITY_SQL,
     iter_source_owned_observation_batches,
     open_source_owned_catalog_export,
 )
-from tests.test_registry_fhir_catalog_sources import read_profile, scoped_read_profile
+from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
+from tests.test_registry_fhir_catalog_sources import read_profile
 
 
 def _boundary():
-    identity_by_field = {
-        "database_name": "synthetic_catalog",
-        "database_oid": 104,
-        "system_identifier": "123456789",
-        "postmaster_started": datetime(2026, 1, 1, tzinfo=timezone.utc),
-        "recovering": False,
-    }
-
     async def inventory():
         yield ("source-page",)
 
@@ -34,12 +25,11 @@ def _boundary():
         yield (descriptor, organization_ids)
 
     export_by_name = {
-        "database_identity": identity_by_field,
         "inventory": Mock(side_effect=inventory),
         "replay": AsyncMock(),
         "legacy_bindings": Mock(side_effect=legacy_bindings),
     }
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=dict(identity_by_field)))
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value={}))
     events = []
 
     @asynccontextmanager
@@ -82,7 +72,7 @@ async def test_export_keeps_exact_profile_mapping_and_source_lifetime():
         ]
     assert events == [("enter", profile), ("exit",)]
     factory.assert_called_once_with(source_profile=profile)
-    connection.fetchrow.assert_awaited_once_with(CATALOG_DATABASE_IDENTITY_SQL)
+    connection.fetchrow.assert_not_awaited()
     export["inventory"].assert_called_once_with()
     export["replay"].assert_awaited_once_with("descriptor", collector)
     batches = [call.args[0] for call in collector.await_args_list]
@@ -133,7 +123,7 @@ def test_observation_batches_refuse_caps_above_the_contract_or_invalid_bounds(bo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("profile", [None, {}, scoped_read_profile()])
+@pytest.mark.parametrize("profile", [None, {}])
 async def test_invalid_or_scoped_profile_refuses_before_source_entry(profile):
     factory, _, connection, events = _boundary()
     with pytest.raises(ValueError, match="profile_invalid"):
@@ -174,9 +164,7 @@ async def test_nonmapping_export_refuses_and_exits_the_source(export):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "damage", ["missing", "extra", "inventory", "replay", "legacy_bindings", "source_companies", "identity_shape"]
-)
+@pytest.mark.parametrize("damage", ["missing", "extra", "inventory", "replay", "legacy_bindings", "source_companies"])
 async def test_invalid_export_refuses_before_inventory_and_closes_source(damage):
     factory, export, connection, events = _boundary()
     inventory = export["inventory"]
@@ -184,8 +172,6 @@ async def test_invalid_export_refuses_before_inventory_and_closes_source(damage)
         del export["replay"]
     elif damage == "extra":
         export["reader"] = object()
-    elif damage == "identity_shape":
-        export["database_identity"] = tuple(export["database_identity"].values())
     else:
         export[damage] = None
     with pytest.raises(ValueError):
@@ -208,64 +194,43 @@ async def test_export_accepts_only_the_optional_source_company_callback_without_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "field", ["database_name", "database_oid", "system_identifier", "postmaster_started", "recovering"]
-)
-async def test_each_database_identity_mismatch_refuses_before_inventory(field):
+@pytest.mark.parametrize("fallback_catalog", [False, True])
+async def test_export_accepts_normalized_logical_profile_metadata_and_preserves_callbacks(fallback_catalog):
     factory, export, connection, events = _boundary()
-    connection.fetchrow.return_value[field] = {
-        "database_name": "other_catalog",
-        "database_oid": 105,
-        "system_identifier": "987654321",
-        "postmaster_started": datetime(2026, 1, 2, tzinfo=timezone.utc),
-        "recovering": True,
-    }[field]
-    with pytest.raises(ValueError, match="database_changed"):
-        async with open_source_owned_catalog_export(factory, read_profile(), connection):
-            pytest.fail("mismatched database yielded")
+    profile = FHIRCatalogSourceReadProfile("source_payload") if fallback_catalog else read_profile()
+    export["native_read_profile"] = {**profile.document(), "owner_role": "retired_owner"}
+    export["source_companies"] = AsyncMock(return_value=())
+    async with open_source_owned_catalog_export(factory, profile, connection) as selected:
+        assert selected is export
+        assert events == [("enter", profile)]
     export["inventory"].assert_not_called()
-    assert [event[0] for event in events] == ["enter", "error", "exit"]
+    export["source_companies"].assert_not_awaited()
+    assert [event[0] for event in events] == ["enter", "exit"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["missing_field", "extra_field", "recovering", "missing_registry_identity"])
-async def test_identity_shape_recovery_and_missing_registry_row_refuse(damage):
+@pytest.mark.parametrize("damage", ["schema", "catalog", "unknown", "nonmapping"])
+async def test_export_refuses_invalid_logical_profile_metadata_before_callbacks_and_closes_source(damage):
     factory, export, connection, events = _boundary()
-    identity = export["database_identity"]
-    if damage == "missing_field":
-        del identity["database_oid"]
-    elif damage == "extra_field":
-        identity["actor"] = "source_reader"
-    elif damage == "recovering":
-        identity["recovering"] = connection.fetchrow.return_value["recovering"] = True
+    export["native_read_profile"] = read_profile().document()
+    if damage == "schema":
+        export["native_read_profile"]["schema_name"] = "different_payload"
+    elif damage == "catalog":
+        export["native_read_profile"]["catalog_schema_name"] = "different_catalog"
+    elif damage == "unknown":
+        export["native_read_profile"]["unexpected"] = True
     else:
-        connection.fetchrow.return_value = None
-    with pytest.raises(ValueError, match="database_changed"):
+        export["native_read_profile"] = None
+    with pytest.raises(ValueError, match="source_export_invalid"):
         async with open_source_owned_catalog_export(factory, read_profile(), connection):
-            pytest.fail("invalid identity yielded")
+            pytest.fail("invalid logical profile yielded")
     export["inventory"].assert_not_called()
+    connection.fetchrow.assert_not_awaited()
     assert [event[0] for event in events] == ["enter", "error", "exit"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("registry_side", [False, True])
-@pytest.mark.parametrize(
-    "field,value", [("database_oid", True), ("postmaster_started", "2026-01-01"), ("recovering", 0)]
-)
-async def test_native_identity_types_cannot_pass_through_value_equality(registry_side, field, value):
-    factory, export, connection, events = _boundary()
-    export["database_identity"]["database_oid"] = connection.fetchrow.return_value["database_oid"] = 1
-    identity = connection.fetchrow.return_value if registry_side else export["database_identity"]
-    identity[field] = value
-    with pytest.raises(ValueError, match="database_changed"):
-        async with open_source_owned_catalog_export(factory, read_profile(), connection):
-            pytest.fail("wrong identity type yielded")
-    export["inventory"].assert_not_called()
-    assert [event[0] for event in events] == ["enter", "error", "exit"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure_at", ["registry", "replay", "consumer"])
+@pytest.mark.parametrize("failure_at", ["replay", "consumer"])
 @pytest.mark.parametrize("cancelled", [False, True])
 async def test_original_error_or_cancellation_reaches_source_exit_once(failure_at, cancelled):
     factory, export, connection, events = _boundary()

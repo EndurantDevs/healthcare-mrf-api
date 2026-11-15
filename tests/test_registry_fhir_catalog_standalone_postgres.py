@@ -1,7 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Standalone split-revision enqueue retains genuine Reader custody through commit."""
+"""Standalone split-revision enqueue retains the pinned Reader transaction through commit."""
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -14,9 +15,7 @@ from process.registry_fhir_catalog_publication import OPERATION, enqueue_fhir_ca
 from process.registry_fhir_catalog_registry_reader import (
     fhir_catalog_registry_connection,
     fhir_catalog_registry_reads,
-    verify_fhir_catalog_registry_reads,
 )
-from process.registry_fhir_catalog_sync import prepare_fhir_catalog_snapshot
 from tests.fhir_catalog_registry_reader_support import configured_catalog_reader
 from tests.registry_candidate_custody_split_postgres_support import _login
 from tests.registry_candidate_custody_split_postgres_support import split_db as split_db
@@ -27,9 +26,11 @@ from tests.test_registry_fhir_catalog_sealed_attachment_postgres import (
     _catalog_pool,
     _catalog_roles,
     _observed_reader,
+    _prepare_observed_catalog,
     _prepare_observed_catalog_roles,
     _publish_sealed_attachment,
 )
+from tests.test_registry_fhir_catalog_sealed_attachment_postgres import catalog_directory as catalog_directory
 
 
 async def _pending_approval(fixture, revision):
@@ -86,7 +87,8 @@ async def _pending_approval(fixture, revision):
 
 
 @pytest.fixture
-async def standalone_catalog(split_db, observed_source_db, monkeypatch):
+async def standalone_catalog(catalog_directory, observed_source_db, monkeypatch):
+    split_db = catalog_directory
     manifest, directory_target = await _publish_sealed_attachment(split_db)
     async with _catalog_roles(split_db) as roles_by_kind:
         config = await _prepare_observed_catalog_roles(split_db, observed_source_db, roles_by_kind)
@@ -99,7 +101,7 @@ async def standalone_catalog(split_db, observed_source_db, monkeypatch):
             _login(logins, "loader") as loader,
             _catalog_pool(split_db, roles_by_kind["sealer"], 2) as sealer_pool,
         ):
-            snapshot, previous, _ = await prepare_fhir_catalog_snapshot(config, loader, source_pool, sealer_pool)
+            snapshot, previous, _ = await _prepare_observed_catalog(split_db, config, loader, source_pool, sealer_pool)
             assert previous is None and snapshot["metadata_approved_revision"] == manifest["approved_custom_revision"]
             revision = await _pending_approval(split_db, snapshot["metadata_approved_revision"])
             command_by_field = {
@@ -115,7 +117,10 @@ async def standalone_catalog(split_db, observed_source_db, monkeypatch):
                 writer=loader,
                 relation=f'"{directory_target.schema_name}".network_membership',
                 command=command_by_field,
-                runtime=build_fhir_catalog_publication_runtime(config.grant, source_pool),
+                runtime=replace(
+                    build_fhir_catalog_publication_runtime(config.grant, source_pool),
+                    preparation_roles=config.preparation_roles,
+                ),
             )
 
 
@@ -129,20 +134,17 @@ async def _enqueue(case):
 
 
 async def _scoped_enqueue(case, *, end_reader):
-    lock_query = "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=$1 AND relation=to_regclass($2) AND mode='AccessShareLock' AND granted)"
-    admin = case.fixture.fixture.connection
     async with fhir_catalog_registry_reads(case.writer):
         async with case.writer.transaction(isolation="repeatable_read"):
             receipt = await _enqueue(case)
             reader = await fhir_catalog_registry_connection(case.writer)
-            reader_pid = reader.get_server_pid()
-            assert await admin.fetchval(lock_query, reader_pid, case.relation)
+            assert reader.is_in_transaction()
             if end_reader:
                 await reader.execute("ROLLBACK")
-            await verify_fhir_catalog_registry_reads()
+            await fhir_catalog_registry_connection(case.writer)
         assert not case.writer.is_in_transaction()
-        assert await admin.fetchval(lock_query, reader_pid, case.relation)
-    assert not await admin.fetchval(lock_query, reader_pid, case.relation)
+        assert reader.is_in_transaction()
+    assert not reader.is_in_transaction()
     return receipt
 
 

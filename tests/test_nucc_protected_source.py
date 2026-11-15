@@ -93,17 +93,15 @@ def copying_marker():
     marker_by_field.update(
         contract=source.STAGE_CONTRACT,
         phase="copying",
-        publisher_oid=109,
-        builder_oid=110,
+        publisher_role="publisher",
+        builder_role="source_builder",
         handoff=None,
         ownership={
             "importer_id": "nucc",
             "dataset_id": "11111111-1111-1111-1111-111111111111",
-            "schema_name": value["child_schema"],
-            "schema_oid": value["child_schema_oid"],
-            "relation_oids": [["nucc_taxonomy", value["child_oid"]]],
-            "sequence_oids": [],
-            "auxiliary_oid": None,
+            "schema_name": value["child"][0],
+            "relations": [{"table_name": "nucc_taxonomy"}],
+            "sequences": [],
         },
     )
     marker_by_field["source_contract_sha256"] = source.control.source_contract_digest(marker_by_field, {})
@@ -117,14 +115,9 @@ def ready_input(marker):
     }
     ready_by_field.update(
         contract=source.READY_CONTRACT,
-        stage_oid=105,
+        stage=list(source._marker_locations(marker)["child"]),
         source_files=[
-            {
-                "url": "https://example.invalid/taxonomy.csv",
-                "sha256": "a" * 64,
-                "bytes": 200,
-                "row_count": 42,
-            }
+            {"url": "https://example.invalid/taxonomy.csv", "sha256": "a" * 64, "bytes": 200, "row_count": 42}
         ],
         total_rows=42,
     )
@@ -253,13 +246,20 @@ def test_stage_and_ready_codecs_are_closed_local_copies():
     ready = ready_input(marker)
     assert source.validate_source_ready(ready, marker) == ready
     assert stage.marker == marker and stage.marker is not marker
-    assert stage.ownership.relation_oids == (("nucc_taxonomy", 105),)
+    assert stage.ownership.relation_names == ("nucc_taxonomy",)
+    assert stage.ownership.schema_oid is None and stage.ownership.relation_oids == (("nucc_taxonomy", None),)
     assert source.validate_source_stage_marker(closed_marker())["phase"] == "closed"
 
 
 @pytest.mark.parametrize(
     "field,value",
-    [("extra", True), ("publisher_oid", True), ("phase", "ready"), ("builder_oid", 0), ("marker_sha256", "f" * 64)],
+    [
+        ("extra", True),
+        ("publisher_role", True),
+        ("phase", "ready"),
+        ("builder_role", "bad;role"),
+        ("marker_sha256", "f" * 64),
+    ],
 )
 def test_stage_codec_refuses_changed_shape_or_digest(field, value):
     marker = copying_marker()
@@ -270,7 +270,13 @@ def test_stage_codec_refuses_changed_shape_or_digest(field, value):
 
 @pytest.mark.parametrize(
     "field,value",
-    [("extra", True), ("stage_oid", True), ("total_rows", 41), ("attempt_id", "foreign"), ("ready_sha256", "f" * 64)],
+    [
+        ("extra", True),
+        ("stage", ["other", "nucc_taxonomy"]),
+        ("total_rows", 41),
+        ("attempt_id", "foreign"),
+        ("ready_sha256", "f" * 64),
+    ],
 )
 def test_ready_codec_refuses_changed_shape_identity_or_census(field, value):
     marker = copying_marker()
@@ -280,30 +286,28 @@ def test_ready_codec_refuses_changed_shape_identity_or_census(field, value):
         source.validate_source_ready(ready, marker)
 
 
-@pytest.mark.parametrize("publisher_safe", [False, True])
-@pytest.mark.parametrize("extra_source_select", [False, True])
-async def test_copy_grants_allow_only_the_original_safe_publisher_read_edge(
-    monkeypatch, publisher_safe, extra_source_select
-):
+@pytest.mark.parametrize("granted", (True, False, None))
+async def test_copy_requires_native_insert_and_isolated_schema_access_without_acl_closure(monkeypatch, granted):
     stage = source.NuccSourceStage.from_wire(copying_marker())
-    owner = stage.marker["owner_oid"]
-    entries = [(owner, owner, right, False) for right in source.partition._OWNER_RIGHTS]
-    entries += [(109, owner, "SELECT", False), (110, owner, "INSERT", False)]
-    if extra_source_select:
-        entries += [(110, owner, "SELECT", False)]
-    session = SimpleNamespace(
-        execute=AsyncMock(return_value=SimpleNamespace(all=lambda: entries)),
-        scalar=AsyncMock(side_effect=[publisher_safe, True]),
-    )
+    session = SimpleNamespace(scalar=AsyncMock(return_value=granted))
     catalog = AsyncMock()
     monkeypatch.setattr(source.native, "require_native_read_catalog", catalog)
-    if publisher_safe and not extra_source_select:
+    monkeypatch.setattr(source.native, "_relation_oid", AsyncMock(return_value=42))
+    if granted is True:
         await source._copying_grants(session, stage)
-        catalog.assert_awaited_once_with(session, (105,))
+        catalog.assert_awaited_once_with(session, (42,))
     else:
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="COPY grant unavailable"):
             await source._copying_grants(session, stage)
         catalog.assert_not_awaited()
+    query, params = session.scalar.await_args.args
+    assert "has_table_privilege(current_user,:relation,'INSERT')" in str(query)
+    assert "NOT has_schema_privilege(current_user,:schema,'CREATE')" in str(query)
+    assert params == {
+        "schema": stage.ownership.schema_name,
+        "relation": f'"{stage.ownership.schema_name}"."nucc_taxonomy"',
+    }
+    assert "aclexplode" not in str(query)
 
 
 @pytest.mark.parametrize("size", [0, 5001])
@@ -557,7 +561,7 @@ async def test_raw_job_only_admits_without_shared_context_mutation(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "fault", [None, "foreign-native-marker", "changed-attempt", "changed-params", "foreign-actor", "changed-history"]
+    "fault", [None, "foreign-native-marker", "changed-attempt", "changed-params", "foreign-actor", "changed-node"]
 )
 async def test_actual_source_state_checks_full_original_binding_before_any_cas(monkeypatch, fault):
     from copy import deepcopy
@@ -566,7 +570,7 @@ async def test_actual_source_state_checks_full_original_binding_before_any_cas(m
     stage = source.NuccSourceStage.from_wire(marker)
     observed = deepcopy(marker)
     run = source_run(marker)
-    actor_by_field = {"database_oid": 100, "owner_oid": 102, "node_id": marker["node_id"], "actor_oid": 110}
+    actor_by_field = {"role": "source_builder", "node_id": marker["node_id"]}
     if fault == "foreign-native-marker":
         observed["preparation_id"] = "99999999-9999-4999-8999-999999999999"
     if fault == "changed-attempt":
@@ -574,8 +578,10 @@ async def test_actual_source_state_checks_full_original_binding_before_any_cas(m
     if fault == "changed-params":
         run["params"] = {"foreign": True}
     if fault == "foreign-actor":
-        actor_by_field["actor_oid"] = 111
-    session = SimpleNamespace(scalar=AsyncMock(return_value=999 if fault == "changed-history" else 101))
+        actor_by_field["role"] = "other_builder"
+    if fault == "changed-node":
+        actor_by_field["node_id"] = "other-node"
+    session = SimpleNamespace(scalar=AsyncMock())
     monkeypatch.setattr(source.control, "_source_transaction", AsyncMock(return_value=actor_by_field))
     monkeypatch.setattr(source.control, "reconcile_source_publication", AsyncMock(return_value=None))
     monkeypatch.setattr(source.control, "_locked_source_run", AsyncMock(return_value=run))
@@ -601,7 +607,7 @@ async def test_copy_authentication_has_no_action_row_or_shared_parent_fence(monk
         run_by_field["progress"]["attempt_id"] = marker["run_id"] + ":" + "f" * 32
     if fault == "already-ready":
         run_by_field["metrics"]["nucc_source_ready"] = ready_input(marker)
-    actor_by_field = {"database_oid": 100, "owner_oid": 102, "node_id": marker["node_id"], "actor_oid": 110}
+    actor_by_field = {"role": "source_builder", "node_id": marker["node_id"]}
     statements = []
 
     async def execute(statement, _parameters):
@@ -642,7 +648,7 @@ async def test_cancel_requires_cleanup_and_committed_publication_wins(monkeypatc
     ready = ready_input(marker)
     run = source_run(marker, ready=ready, status=status)
     run["metrics"]["nucc_handoff"] = marker["handoff"]
-    actor_by_field = {"database_oid": 100, "owner_oid": 102, "node_id": marker["node_id"], "actor_oid": 110}
+    actor_by_field = {"role": "source_builder", "node_id": marker["node_id"]}
     session = SimpleNamespace(scalar=AsyncMock(side_effect=[removed, marker["run_id"]]))
     monkeypatch.setattr(source.control, "_source_transaction", AsyncMock(return_value=actor_by_field))
     monkeypatch.setattr(
@@ -700,7 +706,7 @@ async def test_cancel_after_lost_locator_ack_is_ordinary_cancellation_without_pu
     stage = source.NuccSourceStage.from_wire(marker)
     run = source_run(marker, status="canceling")
     run["metrics"] = {}
-    actor_by_field = {"database_oid": 100, "owner_oid": 102, "node_id": marker["node_id"], "actor_oid": 110}
+    actor_by_field = {"role": "source_builder", "node_id": marker["node_id"]}
     session = SimpleNamespace(scalar=AsyncMock(side_effect=[True, marker["run_id"]]))
     monkeypatch.setattr(source.control, "_source_transaction", AsyncMock(return_value=actor_by_field))
     monkeypatch.setattr(source.control, "reconcile_source_publication", AsyncMock(return_value=None))
@@ -708,7 +714,8 @@ async def test_cancel_after_lost_locator_ack_is_ordinary_cancellation_without_pu
     monkeypatch.setattr(source.control, "_recheck_source_transaction", AsyncMock())
     assert await source.consume_nucc_source_cancel(session, stage) is run
     absence, parameters = session.scalar.await_args_list[0].args
-    assert "history_oid" in str(absence) and parameters["history_oid"] == marker["history_oid"]
+    assert str(absence) == "SELECT to_regclass(:relation) IS NULL"
+    assert parameters == {"relation": f'"{stage.ownership.schema_name}"."nucc_taxonomy"'}
     update, parameters = session.scalar.await_args_list[1].args
     assert "status='canceled'" in str(update) and "finalizing" not in str(update) and "succeeded" not in str(update)
     assert "nucc_handoff" not in parameters["metrics"]
@@ -742,7 +749,7 @@ async def test_plain_validation_failure_cleans_only_its_unpublished_candidate(mo
 
     @asynccontextmanager
     async def transaction():
-        yield "original-session"
+        yield SimpleNamespace(execute=AsyncMock())
 
     monkeypatch.setattr(nucc.db, "transaction", transaction)
     monkeypatch.setattr(nucc, "_plain_run", AsyncMock())
@@ -765,7 +772,7 @@ def _canceled_retry(monkeypatch, *, removed=True, changed=True):
         attempt_started_at="2026-10-17T05:00:00.000000+00:00",
         detail="current attempt",
     )
-    actor_by_field = {"database_oid": 100, "owner_oid": 102, "node_id": marker["node_id"], "actor_oid": 110}
+    actor_by_field = {"role": "source_builder", "node_id": marker["node_id"]}
     session = SimpleNamespace(scalar=AsyncMock(side_effect=[removed, marker["run_id"] if changed else None]))
     monkeypatch.setattr(source.control, "_source_transaction", AsyncMock(return_value=actor_by_field))
     monkeypatch.setattr(source.control, "reconcile_source_publication", AsyncMock(return_value=None))
@@ -785,8 +792,8 @@ async def test_retry_cancel_consumes_current_attempt_after_old_copying_cleanup(m
     before = deepcopy(stage.marker)
     assert await source.consume_nucc_source_cancel(session, stage) is run
     absence, absence_parameters = session.scalar.await_args_list[0].args
-    assert "NOT EXISTS" in str(absence) and "to_regclass(:relation) IS NULL" in str(absence)
-    assert absence_parameters["oid"] == stage.ownership.relation_oids[0][1]
+    assert str(absence) == "SELECT to_regclass(:relation) IS NULL"
+    assert absence_parameters == {"relation": f'"{stage.ownership.schema_name}"."nucc_taxonomy"'}
     statement, parameters = session.scalar.await_args_list[1].args
     assert parameters["attempt_id"] == run["progress"]["attempt_id"] != stage.marker["attempt_id"]
     assert parameters["attempt_started_at"] == run["progress"]["attempt_started_at"]
@@ -854,8 +861,10 @@ async def test_retry_cancel_refuses_changed_or_incomplete_stage_or_current_attem
             run["metrics"].clear()
         case "current_ready" | "foreign_ready":
             ready = ready_input(stage.marker)
-            ready["attempt_id" if fault == "current_ready" else "stage_oid"] = (
-                run["progress"]["attempt_id"] if fault == "current_ready" else 106
+            ready["attempt_id" if fault == "current_ready" else "stage"] = (
+                run["progress"]["attempt_id"]
+                if fault == "current_ready"
+                else ["reference_family_archive_" + "2" * 32, "nucc_taxonomy"]
             )
             ready["ready_sha256"] = source.ready_digest(ready)
             run["metrics"]["nucc_source_ready"] = ready
@@ -885,7 +894,7 @@ async def test_retry_cancel_cannot_acknowledge_a_different_native_cleanup_target
     from dataclasses import replace
 
     session, stage, _run = _canceled_retry(monkeypatch)
-    other_ownership = replace(stage.ownership, relation_oids=(("nucc_taxonomy", 106),))
+    other_ownership = replace(stage.ownership, schema_name="reference_family_archive_" + "2" * 32)
     with pytest.raises(RuntimeError, match="ownership differs"):
         await source.consume_nucc_source_cancel(session, replace(stage, ownership=other_ownership))
     session.scalar.assert_not_awaited()
@@ -895,13 +904,12 @@ async def test_retry_cancel_cannot_acknowledge_a_different_native_cleanup_target
 async def test_dispatch_authenticates_old_copying_input_only_as_pending_allocation(monkeypatch, old_ready):
     session, stage, run = _canceled_retry(monkeypatch)
     run["status"] = "running"
-    session.scalar = AsyncMock(return_value=stage.marker["history_oid"])
+    session.scalar = AsyncMock(side_effect=AssertionError("no physical history query"))
     if old_ready:
         run["metrics"]["nucc_source_ready"] = ready_input(stage.marker)
     monkeypatch.setattr(source, "_native_stage_marker", AsyncMock(return_value=(stage.marker, False)))
     assert await source.reconcile_nucc_source_handoff(session, run["run_id"]) is None
-    assert session.scalar.await_count == 1
-    assert "to_regclass('mrf.import_run')" in str(session.scalar.await_args.args[0])
+    session.scalar.assert_not_awaited()
     assert "nucc_handoff" not in run["metrics"] and run["status"] == "running"
 
 
@@ -932,9 +940,8 @@ async def test_new_worker_waits_outside_its_transaction_for_a_fresh_attempt_stag
     current["ownership"].update(
         dataset_id="22222222-2222-2222-2222-222222222222",
         schema_name="reference_family_archive_" + "2" * 32,
-        schema_oid=107,
-        relation_oids=[["nucc_taxonomy", 106]],
     )
+    current["child"] = ["reference_family_archive_" + "2" * 32, "nucc_taxonomy"]
     current["source_contract_sha256"] = source.control.source_contract_digest(current, {})
     current["marker_sha256"] = source.marker_digest(current)
     transaction_state = SimpleNamespace(in_transaction=False)
@@ -966,3 +973,42 @@ async def test_new_worker_waits_outside_its_transaction_for_a_fresh_attempt_stag
     assert received_stage.marker == current and received_stage.marker != old_stage.marker
     assert state.await_count == 2
     assert all(call.kwargs == {"copying": True, "allow_pending_retry": True} for call in state.await_args_list)
+
+
+def _legacy_marker():
+    """An explicit saved wire edition, never a source of current object addresses."""
+    marker = copying_marker()
+    for key in source.MARKER_FIELDS - source._LEGACY_MARKER_FIELDS:
+        marker.pop(key)
+    for key in source._LEGACY_MARKER_FIELDS - source.MARKER_FIELDS:
+        marker[key] = "opaque original " + key
+    marker["ownership"] = {
+        "importer_id": "nucc",
+        "dataset_id": "11111111-1111-1111-1111-111111111111",
+        "schema_name": "reference_family_archive_" + "1" * 32,
+        "schema_oid": "opaque original namespace",
+        "relation_oids": [["nucc_taxonomy", "opaque original heap"]],
+        "sequence_oids": [],
+        "auxiliary_oid": None,
+    }
+    marker["marker_sha256"] = "f" * 64
+    return marker
+
+
+async def test_legacy_ready_replay_returns_exact_old_body_and_token_without_rewriting(monkeypatch):
+    from copy import deepcopy
+
+    marker = _legacy_marker()
+    stage = source.NuccSourceStage.from_wire(marker)
+    current = ready_input(marker)
+    previous_by_field = {key: value for key, value in current.items() if key != "stage"}
+    previous_by_field.update(stage_oid="opaque original heap", ready_sha256="e" * 64)
+    before_marker, before_ready = deepcopy(marker), deepcopy(previous_by_field)
+    session = SimpleNamespace(scalar=AsyncMock())
+    run = source_run(marker, ready=previous_by_field)
+    monkeypatch.setattr(source, "_source_stage_state", AsyncMock(return_value=(run, marker)))
+    result = await source.record_nucc_source_ready(session, stage, previous_by_field["source_files"])
+    assert result == before_ready == previous_by_field
+    assert stage.marker == before_marker == marker
+    assert stage.ownership.relation_names == ("nucc_taxonomy",)
+    session.scalar.assert_not_awaited()

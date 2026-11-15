@@ -15,16 +15,11 @@ from process.provider_directory_profile_capacity_preflight_contract import (
     preflight_domain_sha256,
     validated_capacity_preflight_request,
 )
-from process.provider_directory_profile_capacity_signing_receipts import (
-    _validated_healthcare_receipt,
-    _validated_control_plane_receipt,
-    _validated_control_plane_request,
-)
 from process.provider_directory_profile_capacity_signing_guard_contract import (
+    _GUARD_FIELDS,
     CAPACITY_BUNDLE_VALIDATION_PATH,
     CAPACITY_SIGNING_PREFLIGHT_GUARD_CONTRACT_ID,
     CAPACITY_SIGNING_PREFLIGHT_GUARD_DIGEST_DOMAIN,
-    HEALTHCARE_PREFLIGHT_PATH,
     CONTROL_PLANE_PREFLIGHT_CONTRACT_ID,
     CONTROL_PLANE_PREFLIGHT_PATH,
     CONTROL_PLANE_PREFLIGHT_PATH_FIELD,
@@ -37,13 +32,18 @@ from process.provider_directory_profile_capacity_signing_guard_contract import (
     CONTROL_PLANE_REQUEST_SHA256_FIELD,
     CONTROL_PLANE_SIGNING_INTENT_CONTRACT_ID,
     CONTROL_PLANE_STORAGE_OBSERVATION_DIGEST_DOMAIN,
+    HEALTHCARE_PREFLIGHT_PATH,
     ProfileCapacitySigningGuardError,
-    _GUARD_FIELDS,
     _exact,
     _fail,
     _hex,
     _plain_json,
     _timestamp,
+)
+from process.provider_directory_profile_capacity_signing_receipts import (
+    _validated_control_plane_receipt,
+    _validated_control_plane_request,
+    _validated_healthcare_receipt,
 )
 
 
@@ -84,21 +84,13 @@ def _assert_guard_hash_links(
     """Require every redundant guard digest to match its closed object."""
 
     expected_hash_by_field = {
-        CONTROL_PLANE_REQUEST_SHA256_FIELD: control_plane_receipt_by_field[
-            "request_sha256"
-        ],
-        CAPACITY_CONTROL_PLANE_RECEIPT_SHA256_FIELD: control_plane_receipt_by_field[
-            "receipt_sha256"
-        ],
+        CONTROL_PLANE_REQUEST_SHA256_FIELD: control_plane_receipt_by_field["request_sha256"],
+        CAPACITY_CONTROL_PLANE_RECEIPT_SHA256_FIELD: control_plane_receipt_by_field["receipt_sha256"],
         "healthcare_request_sha256": healthcare_request.request_sha256,
         "healthcare_receipt_sha256": healthcare_receipt_by_field["receipt_sha256"],
         "capacity_limits_sha256": healthcare_request.limits_sha256,
-        "storage_observation_sha256": control_plane_receipt_by_field[
-            "storage_observation_sha256"
-        ],
-        "held_followup_preimage_sha256": control_plane_receipt_by_field[
-            "held_followup"
-        ]["followup_preimage_sha256"],
+        "storage_observation_sha256": control_plane_receipt_by_field["storage_observation_sha256"],
+        "held_followup_preimage_sha256": control_plane_receipt_by_field["held_followup"]["followup_preimage_sha256"],
     }
     for field_name, expected_hash in expected_hash_by_field.items():
         observed_hash = _hex(guard_by_field.get(field_name), f"{field_name}_invalid")
@@ -116,9 +108,7 @@ def _assert_guard_lease_links(
     """Require the replay chain to bind the exact signed lease interval."""
 
     storage_time_by_name = {
-        field_name: _timestamp(
-            storage_by_field[field_name], f"storage_{field_name}_invalid"
-        )
+        field_name: _timestamp(storage_by_field[field_name], f"storage_{field_name}_invalid")
         for field_name in (
             "observed_at",
             "issued_at",
@@ -127,17 +117,11 @@ def _assert_guard_lease_links(
         )
     }
     if (
-        healthcare_request.control_plane_receipt_sha256
-        != control_plane_receipt_by_field["receipt_sha256"]
-        or healthcare_request.request_nonce
-        != control_plane_receipt_by_field["request_nonce"]
+        healthcare_request.control_plane_receipt_sha256 != control_plane_receipt_by_field["receipt_sha256"]
+        or healthcare_request.request_nonce != control_plane_receipt_by_field["request_nonce"]
         or healthcare_receipt_by_field["receipt_sha256"] != lease_by_field["nonce"]
-        or healthcare_receipt_by_field["capacity_geometry_hash"]
-        != lease_by_field["capacity_geometry_hash"]
-        or any(
-            storage_time_by_name[field_name] != lease_by_field[field_name]
-            for field_name in storage_time_by_name
-        )
+        or healthcare_receipt_by_field["capacity_geometry_hash"] != lease_by_field["capacity_geometry_hash"]
+        or any(storage_time_by_name[field_name] != lease_by_field[field_name] for field_name in storage_time_by_name)
         or healthcare_request.expires_at != lease_by_field["expires_at"]
     ):
         _fail("lease_binding_invalid")
@@ -161,9 +145,7 @@ def validated_capacity_signing_preflight_guard(
         supplied_sha256,
     )
     try:
-        healthcare_request = validated_capacity_preflight_request(
-            guard_by_field.get("healthcare_request")
-        )
+        healthcare_request = validated_capacity_preflight_request(guard_by_field.get("healthcare_request"))
     except ProviderDirectoryProfileCapacityPreflightError:
         _fail("healthcare_request_invalid")
     control_plane_request, storage_by_field = _validated_control_plane_request(
@@ -220,23 +202,30 @@ def validated_capacity_signing_guard_fields(
         lease_expires_at=parsed_by_field["expires_at"],
         lease_max_build_deadline=parsed_by_field["max_build_deadline"],
     )
-    binding = signing_guard["healthcare_receipt"].get("database_binding")
-    if binding is not None:
-        data_tablespace = next(
-            entry for entry in parsed_by_field["tablespaces"] if entry.usage == "data"
+    observed_storage = signing_guard["control_plane_request"]["storage_observation"]["storage_classes"]
+    expected_storage_rows = [
+        {
+            "storage_class": storage_class.storage_class,
+            "available_bytes": storage_class.available_bytes,
+            "available_after_all_reservations_bytes": storage_class.available_after_all_reservations_bytes,
+        }
+        for storage_class in parsed_by_field["storage_classes"]
+    ]
+    if observed_storage != expected_storage_rows:
+        _fail("storage_binding_invalid")
+    observation = signing_guard["healthcare_receipt"]["runtime_observation"]
+    runtime = parsed_by_field["runtime"]
+    if any(
+        observation.get(name) != getattr(runtime, name)
+        for name in (
+            "healthcare_source_commit",
+            "profile_migration_revision",
+            "profile_schema_version",
+            "profile_strategy_version",
+            "postgres_server_version_num",
         )
-        if any(
-            binding[name] != parsed_by_field[name]
-            for name in (
-                "database_system_identifier",
-                "database_oid",
-                "database_name",
-            )
-        ) or (binding["tablespace_oid"], binding["tablespace_name"]) != (
-            data_tablespace.tablespace_oid,
-            data_tablespace.tablespace_name,
-        ):
-            _fail("cms_database_binding_invalid")
+    ):
+        _fail("runtime_binding_invalid")
     return {
         **parsed_by_field,
         "signing_preflight_guard": signing_guard,
@@ -254,3 +243,66 @@ __all__ = (
     "validated_capacity_signing_guard_fields",
     "validated_capacity_signing_preflight_guard",
 )
+
+
+def validated_historical_replay_guard(lease, geometry):
+    """Authenticate original replay links before using separately retained semantic evidence."""
+    guard, digest = _validated_historical_guard_header(lease)
+    receipt = guard["healthcare_receipt"]
+    request = guard["healthcare_request"]
+    control = guard[CONTROL_PLANE_RECEIPT_FIELD]
+    control_request = guard[CONTROL_PLANE_REQUEST_FIELD]
+    is_initial = geometry.legacy_payload["contract_id"].endswith("initial-capacity-geometry.v1")
+    request_version, control_version = (5, 3) if is_initial else (3, 1)
+    healthcare_contract = f"healthporta.provider-directory-profile-capacity-preflight.v{request_version}"
+    control_contract = f"healthporta.provider-directory-profile-capacity-control-plane-preflight.v{control_version}"
+    expected_contracts = (
+        (receipt, healthcare_contract),
+        (request, healthcare_contract.replace("preflight.v", "preflight-request.v")),
+        (control, control_contract),
+        (control_request, control_contract.replace("preflight.v", "preflight-request.v")),
+    )
+    if any(not isinstance(raw, Mapping) or raw.get("contract_id") != contract for raw, contract in expected_contracts):
+        _fail("legacy_replay_contract_invalid")
+    for raw, contract in ((receipt, healthcare_contract), (control, control_contract)):
+        if raw.get("receipt_sha256") != preflight_domain_sha256(
+            contract, {key: field_value for key, field_value in raw.items() if key != "receipt_sha256"}
+        ):
+            _fail("legacy_replay_receipt_hash_invalid")
+    request_hash = preflight_domain_sha256(request["contract_id"], request)
+    control_request_hash = preflight_domain_sha256(
+        "healthporta.provider-directory-profile-capacity-control-plane-preflight-request-digest.v1", control_request
+    )
+    identity = receipt.get("profile_execution_identity")
+    if (
+        not isinstance(identity, Mapping)
+        or receipt.get("capacity_geometry") != geometry.legacy_payload
+        or receipt.get("capacity_geometry_hash") != lease.capacity_geometry_hash
+        or receipt.get("receipt_sha256") != lease.nonce
+        or receipt.get("request_sha256") != request_hash
+        or guard["healthcare_request_sha256"] != request_hash
+        or guard["healthcare_receipt_sha256"] != lease.nonce
+        or control.get("request_sha256") != control_request_hash
+        or guard[CONTROL_PLANE_REQUEST_SHA256_FIELD] != control_request_hash
+        or guard[CAPACITY_CONTROL_PLANE_RECEIPT_SHA256_FIELD] != control["receipt_sha256"]
+        or receipt.get("control_plane_receipt_sha256") != control["receipt_sha256"]
+        or any(identity.get(key) != getattr(geometry, key) for key in ("selection_proof_id", "profile_input_digest"))
+    ):
+        _fail("legacy_replay_semantic_evidence_required")
+    return guard, digest
+
+
+def _validated_historical_guard_header(lease):
+    if lease.runtime is None or lease.signing_preflight_guard is None:
+        _fail("legacy_replay_semantic_evidence_required")
+    guard = _exact(lease.signing_preflight_guard, _GUARD_FIELDS, "legacy_fields_invalid")
+    domain = "healthporta.provider-directory-profile-capacity-signing-preflight-guard.v1"
+    if (
+        guard["contract_id"] != domain
+        or guard["bundle_validation_path"] != CAPACITY_BUNDLE_VALIDATION_PATH
+        or guard[CONTROL_PLANE_PREFLIGHT_PATH_FIELD] != CONTROL_PLANE_PREFLIGHT_PATH
+        or guard["healthcare_preflight_path"] != HEALTHCARE_PREFLIGHT_PATH
+        or preflight_domain_sha256(domain, guard) != lease.signing_preflight_guard_sha256
+    ):
+        _fail("legacy_replay_guard_invalid")
+    return guard, lease.signing_preflight_guard_sha256

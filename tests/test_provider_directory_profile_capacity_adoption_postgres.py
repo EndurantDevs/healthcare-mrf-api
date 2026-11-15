@@ -26,11 +26,11 @@ from tests.provider_directory_profile_delta_schema_fixtures import (
 )
 from tests.provider_directory_profile_delta_test_support import _delta_database
 from tests.test_company_registry_group_assertion_migration import _assert_source_inventory_migration_head
+from tests.test_provider_directory_profile_capacity_attestation import _signed_envelope, _verify
 from tests.test_provider_directory_profile_capacity_preflight import _serving_state
 from tests.test_provider_directory_profile_capacity_preflight_postgres import (
     _POSTGRES_DSN_ENV,
     UTC,
-    _assert_runtime_bound_lease_replay,
     _configure_database,
     importer,
 )
@@ -162,8 +162,7 @@ def _adoption_candidate(template):
         source_vector=template.source_vector,
         source_context_vector=template.source_context_vector,
         profile_as_of=template.profile_as_of,
-        profile_target_oid=template.profile_target_oid,
-        evidence_target_oid=template.evidence_target_oid,
+        targets=template.targets,
         profile_rows=template.profile_rows,
         evidence_rows=template.evidence_rows,
         published_at=template.published_at,
@@ -231,7 +230,10 @@ async def test_missing_state_adoption_is_exact_and_concurrency_safe(monkeypatch)
             affected_stage="adoption_affected_stage",
         )
         monkeypatch.setattr(importer, "db", database)
-        template = _serving_state(published_at=datetime.datetime(2026, 8, 9, 8, 0, tzinfo=UTC))
+        template = _serving_state(
+            published_at=datetime.datetime(2026, 8, 9, 8, 0, tzinfo=UTC),
+            targets=importer._provider_directory_profile_target_coordinates(schema),
+        )
         candidate_loader = AsyncMock(return_value=_adoption_candidate(template))
         monkeypatch.setattr(importer, "_profile_adoption_candidate_from_legacy", candidate_loader)
         projected = await importer._profile_capacity_preflight_serving(schema)
@@ -250,39 +252,67 @@ async def test_missing_state_adoption_is_exact_and_concurrency_safe(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_adoption_target_oid_drift_fails_before_insert(monkeypatch):
-    """A drop/recreate between target reads must trip the exact OID fence."""
+async def test_adoption_target_locks_preserve_named_relations(monkeypatch):
+    """Native target locks block concurrent replacement throughout adoption."""
+    from sqlalchemy.exc import DBAPIError
+
+    from db.connection import Database
 
     async with _delta_database(monkeypatch) as (database, schema):
         await _create_delta_contract_tables(
             database,
             schema,
-            evidence_stage="oid_evidence_stage",
-            profile_stage="oid_profile_stage",
-            affected_stage="oid_affected_stage",
+            evidence_stage="lock_evidence_stage",
+            profile_stage="lock_profile_stage",
+            affected_stage="lock_affected_stage",
         )
         monkeypatch.setattr(importer, "db", database)
-        original_relation_oid = importer._provider_directory_relation_oid
-        relation_read_counts = [0]
+        independent = Database()
+        await independent.connect()
+        profile_ref = profile.qualified_table(schema, profile.PROFILE_TABLE)
+        evidence_ref = profile.qualified_table(schema, profile.PROFILE_EVIDENCE_TABLE)
+        try:
+            async with database.transaction(), independent.transaction():
+                target_oids = await importer._locked_profile_adoption_target_oids(schema, profile_ref, evidence_ref)
+                assert all(relation_oid > 0 for relation_oid in target_oids)
+                await independent.status("SET LOCAL lock_timeout='100ms';")
+                with pytest.raises(DBAPIError, match="lock timeout"):
+                    await independent.status(f"DROP TABLE {profile_ref};")
+            assert await database.scalar("SELECT to_regclass(:relation) IS NOT NULL", relation=profile_ref)
+            assert await database.scalar("SELECT to_regclass(:relation) IS NOT NULL", relation=evidence_ref)
+        finally:
+            await independent.disconnect()
 
-        async def relation_oid_with_drift(schema_name, relation_name):
-            relation_oid = await original_relation_oid(schema_name, relation_name)
-            relation_read_counts[0] += 1
-            if relation_read_counts[0] == 2:
-                profile_ref = profile.qualified_table(schema, profile.PROFILE_TABLE)
-                await database.status(f"DROP TABLE {profile_ref};")
-                await database.status(profile.profile_table_sql(schema, profile.PROFILE_TABLE, logged=True))
-                for statement in profile.profile_index_statements(schema, profile.PROFILE_TABLE, evidence=False):
-                    await database.status(statement)
-            return relation_oid
 
-        monkeypatch.setattr(importer, "_provider_directory_relation_oid", relation_oid_with_drift)
-        with pytest.raises(RuntimeError, match="adoption_target_changed"):
-            await importer._locked_profile_adoption_target_oids(
-                schema,
-                profile.qualified_table(schema, profile.PROFILE_TABLE),
-                profile.qualified_table(schema, profile.PROFILE_EVIDENCE_TABLE),
-            )
+def _assert_observed_runtime_lease_replay(observation):
+    """Bind the real observation into the current signed logical lease and reject changed runtime."""
+
+    def _bind_runtime(body):
+        from process.provider_directory_profile_capacity_preflight_contract import preflight_domain_sha256
+        from process.provider_directory_profile_capacity_signing_guard_contract import (
+            CAPACITY_SIGNING_PREFLIGHT_GUARD_DIGEST_DOMAIN,
+        )
+        from tests.provider_directory_cms_capacity_test_support import rehash_guard
+
+        body["runtime"].update(
+            {name: observation[name] for name in runtime.CAPACITY_LEASE_LOCALLY_VERIFIED_RUNTIME_FIELDS}
+        )
+        signing_guard = body["signing_preflight_guard"]
+        signing_guard["healthcare_receipt"]["runtime_observation"].update(observation)
+        rehash_guard(signing_guard)
+        body["nonce"] = signing_guard["healthcare_receipt_sha256"]
+        body["signing_preflight_guard_sha256"] = preflight_domain_sha256(
+            CAPACITY_SIGNING_PREFLIGHT_GUARD_DIGEST_DOMAIN, signing_guard
+        )
+
+    verified_lease = _verify(_signed_envelope(body_mutator=_bind_runtime))
+    runtime.assert_capacity_lease_matches_runtime_observation(verified_lease, observation)
+    with pytest.raises(
+        runtime.ProviderDirectoryProfileRuntimeObservationError, match="capacity_lease_runtime_mismatch"
+    ):
+        runtime.assert_capacity_lease_matches_runtime_observation(
+            verified_lease, {**observation, "healthcare_source_commit": "e" * 40}
+        )
 
 
 @pytest.mark.asyncio
@@ -301,7 +331,7 @@ async def test_runtime_observation_reads_migrated_postgres_snapshot(monkeypatch)
         async with database.transaction():
             await database.status("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;")
             observation = await runtime.observe_profile_runtime(database)
-            _assert_runtime_bound_lease_replay(observation)
+            _assert_observed_runtime_lease_replay(observation)
             transaction_read_only = await database.scalar("SELECT current_setting('transaction_read_only')::boolean;")
     assert transaction_read_only is True
     assert observation == {

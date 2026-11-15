@@ -21,24 +21,35 @@ from typing import Any
 from urllib.parse import quote
 
 import aiohttp
-from aiofile import async_open
 from aiocsv import AsyncDictReader
+from aiofile import async_open
 from arq import Retry, create_pool
 
 from db.connection import db
-from db.models import (CodeCatalog, CodeCrosswalk, PricingPrescription,
-                       PricingProviderPrescription,
-                       PricingProviderPrescriptionAutocomplete)
+from db.models import (
+    CodeCatalog,
+    CodeCrosswalk,
+    PricingPrescription,
+    PricingProviderPrescription,
+    PricingProviderPrescriptionAutocomplete,
+)
 from db.prescription_autocomplete_rollup_sql import (
     prescription_autocomplete_rollup_insert_sql,
+    prescription_autocomplete_source_fingerprint_sql,
 )
-from process.ext.utils import (download_it_and_save, ensure_database,
-                               get_http_client, get_import_schema, make_class,
-                               push_objects, return_checksum)
+from process.control_lifecycle import mark_control_run
+from process.ext.utils import (
+    download_it_and_save,
+    ensure_database,
+    get_http_client,
+    get_import_schema,
+    make_class,
+    push_objects,
+    return_checksum,
+)
+from process.live_progress import enqueue_live_progress
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
-from process.control_lifecycle import mark_control_run
-from process.live_progress import enqueue_live_progress
 
 logger = logging.getLogger(__name__)
 
@@ -67,18 +78,33 @@ RX_INTERNAL_CODE_SYSTEM = "HP_RX_CODE"
 
 
 TEST_PROVIDER_DRUG_ROW_LIMIT = int(
-    os.getenv("HLTHPRT_DRUG_CLAIMS_TEST_PROVIDER_DRUG_ROWS", os.getenv("HLTHPRT_CLAIMS_TEST_PROVIDER_DRUG_ROWS", "10000"))
+    os.getenv(
+        "HLTHPRT_DRUG_CLAIMS_TEST_PROVIDER_DRUG_ROWS", os.getenv("HLTHPRT_CLAIMS_TEST_PROVIDER_DRUG_ROWS", "10000")
+    )
 )
 TEST_DRUG_SPENDING_ROW_LIMIT = int(
     os.getenv("HLTHPRT_DRUG_CLAIMS_TEST_SPENDING_ROWS", os.getenv("HLTHPRT_CLAIMS_TEST_DRUG_SPENDING_ROWS", "2000"))
 )
 TEST_MAX_DOWNLOAD_BYTES = int(
-    os.getenv("HLTHPRT_DRUG_CLAIMS_TEST_MAX_DOWNLOAD_BYTES", os.getenv("HLTHPRT_CLAIMS_TEST_MAX_DOWNLOAD_BYTES", str(25 * 1024 * 1024)))
+    os.getenv(
+        "HLTHPRT_DRUG_CLAIMS_TEST_MAX_DOWNLOAD_BYTES",
+        os.getenv("HLTHPRT_CLAIMS_TEST_MAX_DOWNLOAD_BYTES", str(25 * 1024 * 1024)),
+    )
 )
-IMPORT_BATCH_SIZE = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_IMPORT_BATCH_SIZE", os.getenv("HLTHPRT_CLAIMS_IMPORT_BATCH_SIZE", "100000"))), 100)
-DOWNLOAD_RETRIES = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_DOWNLOAD_RETRIES", os.getenv("HLTHPRT_CLAIMS_DOWNLOAD_RETRIES", "3"))), 1)
-ROW_PROGRESS_INTERVAL_SECONDS = max(float(os.getenv("HLTHPRT_DRUG_CLAIMS_ROW_PROGRESS_SECONDS", os.getenv("HLTHPRT_CLAIMS_ROW_PROGRESS_SECONDS", "2"))), 0.5)
-DRUG_CLAIMS_USE_PROXY = os.getenv("HLTHPRT_DRUG_CLAIMS_USE_PROXY", os.getenv("HLTHPRT_CLAIMS_USE_PROXY", "false")).strip().lower() in {"1", "true", "yes", "on"}
+IMPORT_BATCH_SIZE = max(
+    int(os.getenv("HLTHPRT_DRUG_CLAIMS_IMPORT_BATCH_SIZE", os.getenv("HLTHPRT_CLAIMS_IMPORT_BATCH_SIZE", "100000"))),
+    100,
+)
+DOWNLOAD_RETRIES = max(
+    int(os.getenv("HLTHPRT_DRUG_CLAIMS_DOWNLOAD_RETRIES", os.getenv("HLTHPRT_CLAIMS_DOWNLOAD_RETRIES", "3"))), 1
+)
+ROW_PROGRESS_INTERVAL_SECONDS = max(
+    float(os.getenv("HLTHPRT_DRUG_CLAIMS_ROW_PROGRESS_SECONDS", os.getenv("HLTHPRT_CLAIMS_ROW_PROGRESS_SECONDS", "2"))),
+    0.5,
+)
+DRUG_CLAIMS_USE_PROXY = os.getenv(
+    "HLTHPRT_DRUG_CLAIMS_USE_PROXY", os.getenv("HLTHPRT_CLAIMS_USE_PROXY", "false")
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _is_env_enabled(name: str, default: bool = False) -> bool:
@@ -90,28 +116,51 @@ def _is_env_enabled(name: str, default: bool = False) -> bool:
 
 DRUG_CLAIMS_QUEUE_NAME = "arq:DrugClaims"
 DRUG_CLAIMS_FINISH_QUEUE_NAME = "arq:DrugClaims_finish"
-DRUG_CLAIMS_CHUNK_TARGET_MB = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_CHUNK_TARGET_MB", os.getenv("HLTHPRT_CLAIMS_CHUNK_TARGET_MB", "128"))), 4)
+DRUG_CLAIMS_CHUNK_TARGET_MB = max(
+    int(os.getenv("HLTHPRT_DRUG_CLAIMS_CHUNK_TARGET_MB", os.getenv("HLTHPRT_CLAIMS_CHUNK_TARGET_MB", "128"))), 4
+)
 DRUG_CLAIMS_CHUNK_TARGET_BYTES = DRUG_CLAIMS_CHUNK_TARGET_MB * 1024 * 1024
-DRUG_CLAIMS_FINISH_RETRY_SECONDS = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_FINISH_RETRY_SECONDS", os.getenv("HLTHPRT_CLAIMS_FINISH_RETRY_SECONDS", "15"))), 1)
-DRUG_CLAIMS_REDIS_TTL_SECONDS = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_REDIS_TTL_SECONDS", os.getenv("HLTHPRT_CLAIMS_REDIS_TTL_SECONDS", "172800"))), 3600)
-DRUG_CLAIMS_WORKDIR = os.getenv("HLTHPRT_DRUG_CLAIMS_WORKDIR", os.getenv("HLTHPRT_CLAIMS_WORKDIR", "/tmp/healthporta_claims"))
+DRUG_CLAIMS_FINISH_RETRY_SECONDS = max(
+    int(os.getenv("HLTHPRT_DRUG_CLAIMS_FINISH_RETRY_SECONDS", os.getenv("HLTHPRT_CLAIMS_FINISH_RETRY_SECONDS", "15"))),
+    1,
+)
+DRUG_CLAIMS_REDIS_TTL_SECONDS = max(
+    int(os.getenv("HLTHPRT_DRUG_CLAIMS_REDIS_TTL_SECONDS", os.getenv("HLTHPRT_CLAIMS_REDIS_TTL_SECONDS", "172800"))),
+    3600,
+)
+DRUG_CLAIMS_WORKDIR = os.getenv(
+    "HLTHPRT_DRUG_CLAIMS_WORKDIR", os.getenv("HLTHPRT_CLAIMS_WORKDIR", "/tmp/healthporta_claims")
+)
 DRUG_CLAIMS_KEEP_WORKDIR = _is_env_enabled(
     "HLTHPRT_DRUG_CLAIMS_KEEP_WORKDIR",
     default=_is_env_enabled("HLTHPRT_CLAIMS_KEEP_WORKDIR", default=False),
 )
-DRUG_CLAIMS_DOWNLOAD_CONCURRENCY = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_DOWNLOAD_CONCURRENCY", os.getenv("HLTHPRT_CLAIMS_DOWNLOAD_CONCURRENCY", "3"))), 1)
+DRUG_CLAIMS_DOWNLOAD_CONCURRENCY = max(
+    int(os.getenv("HLTHPRT_DRUG_CLAIMS_DOWNLOAD_CONCURRENCY", os.getenv("HLTHPRT_CLAIMS_DOWNLOAD_CONCURRENCY", "3"))), 1
+)
 DRUG_CLAIMS_PREFER_STREAM_DOWNLOAD = _is_env_enabled("HLTHPRT_DRUG_CLAIMS_PREFER_STREAM_DOWNLOAD", default=True)
 DRUG_CLAIMS_DEFER_STAGE_INDEXES = _is_env_enabled(
     "HLTHPRT_DRUG_CLAIMS_DEFER_STAGE_INDEXES",
     default=_is_env_enabled("HLTHPRT_CLAIMS_DEFER_STAGE_INDEXES", default=True),
 )
-DRUG_CLAIMS_DB_DEADLOCK_RETRIES = max(int(os.getenv("HLTHPRT_DRUG_CLAIMS_DB_DEADLOCK_RETRIES", os.getenv("HLTHPRT_CLAIMS_DB_DEADLOCK_RETRIES", "6"))), 1)
+DRUG_CLAIMS_DB_DEADLOCK_RETRIES = max(
+    int(os.getenv("HLTHPRT_DRUG_CLAIMS_DB_DEADLOCK_RETRIES", os.getenv("HLTHPRT_CLAIMS_DB_DEADLOCK_RETRIES", "6"))), 1
+)
 DRUG_CLAIMS_DB_DEADLOCK_BASE_DELAY_SECONDS = max(
-    float(os.getenv("HLTHPRT_DRUG_CLAIMS_DB_DEADLOCK_BASE_DELAY_SECONDS", os.getenv("HLTHPRT_CLAIMS_DB_DEADLOCK_BASE_DELAY_SECONDS", "0.25"))),
+    float(
+        os.getenv(
+            "HLTHPRT_DRUG_CLAIMS_DB_DEADLOCK_BASE_DELAY_SECONDS",
+            os.getenv("HLTHPRT_CLAIMS_DB_DEADLOCK_BASE_DELAY_SECONDS", "0.25"),
+        )
+    ),
     0.05,
 )
 DRUG_CLAIMS_PROVIDER_DRUG_MAX_BUCKETS = max(
-    int(os.getenv("HLTHPRT_DRUG_CLAIMS_PROVIDER_DRUG_MAX_BUCKETS", os.getenv("HLTHPRT_CLAIMS_PROVIDER_DRUG_MAX_BUCKETS", "64"))),
+    int(
+        os.getenv(
+            "HLTHPRT_DRUG_CLAIMS_PROVIDER_DRUG_MAX_BUCKETS", os.getenv("HLTHPRT_CLAIMS_PROVIDER_DRUG_MAX_BUCKETS", "64")
+        )
+    ),
     1,
 )
 DRUG_CLAIMS_MARK_DONE_RETRIES = max(
@@ -192,9 +241,13 @@ RX_CROSSWALK_SNAPSHOT_PACKAGE_TABLE = _sanitize_identifier(
     "package",
     "HLTHPRT_RX_CROSSWALK_SNAPSHOT_PACKAGE_TABLE",
 )
-RX_CROSSWALK_LIVE_BASE_URL = str(
-    os.getenv("HLTHPRT_RX_CROSSWALK_LIVE_BASE_URL", os.getenv("HLTHPRT_DRUG_API_BASE_URL", "http://127.0.0.1:8087"))
-).strip().rstrip("/")
+RX_CROSSWALK_LIVE_BASE_URL = (
+    str(
+        os.getenv("HLTHPRT_RX_CROSSWALK_LIVE_BASE_URL", os.getenv("HLTHPRT_DRUG_API_BASE_URL", "http://127.0.0.1:8087"))
+    )
+    .strip()
+    .rstrip("/")
+)
 
 
 @dataclass(frozen=True)
@@ -336,7 +389,7 @@ def _safe_int(raw: Any, default: int = 0) -> int:
         raw = raw.decode("utf-8")
     try:
         return int(raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 
@@ -428,10 +481,7 @@ async def _is_finalize_lock_released(
     if redis is None or not run_id or not owner_token:
         return False
     lock_key = _state_key(run_id, "finalize_lock")
-    release_script = (
-        "if redis.call('get', KEYS[1]) == ARGV[1] then "
-        "return redis.call('del', KEYS[1]) else return 0 end"
-    )
+    release_script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
     released = await redis.eval(
         release_script,
         1,
@@ -463,10 +513,7 @@ async def _release_finalize_lock_safely(
 def _print_row_progress(stage: str, parsed: int, accepted: int, start_time: float, final: bool = False) -> None:
     elapsed = max(time.monotonic() - start_time, 0.001)
     rate = parsed / elapsed
-    line = (
-        f"\r[rows:{stage}] parsed={parsed:,} accepted={accepted:,} "
-        f"rate={rate:,.0f} rows/s"
-    )
+    line = f"\r[rows:{stage}] parsed={parsed:,} accepted={accepted:,} rate={rate:,.0f} rows/s"
     print(line, end="\n" if final else "", flush=True)
 
 
@@ -504,7 +551,7 @@ def _dedupe_rows(rows: list[dict[str, Any]], key_fields: tuple[str, ...]) -> lis
 def _chunk_rows(rows: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
     if not rows:
         return []
-    return [rows[idx: idx + size] for idx in range(0, len(rows), size)]
+    return [rows[idx : idx + size] for idx in range(0, len(rows), size)]
 
 
 def _sum_optional(a: float | None, b: float | None) -> float | None:
@@ -580,12 +627,7 @@ def _csv_distributions(dataset: dict[str, Any]) -> list[dict[str, Any]]:
         media_type = str(distribution.get("mediaType") or "").lower()
         fmt = str(distribution.get("format") or "").lower()
         lower_url = url.lower()
-        if not (
-            "csv" in media_type
-            or fmt == "csv"
-            or lower_url.endswith(".csv")
-            or lower_url.endswith(".csv.gz")
-        ):
+        if not ("csv" in media_type or fmt == "csv" or lower_url.endswith(".csv") or lower_url.endswith(".csv.gz")):
             continue
         candidates.append(distribution)
     return candidates
@@ -623,7 +665,7 @@ def _to_float(value: Any) -> float | None:
         return None
     try:
         return float(str(value).replace(",", ""))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -796,9 +838,7 @@ async def _ensure_indexes(model: type, db_schema: str) -> None:
         elements = index_definition.get("index_elements")
         if not elements:
             continue
-        if trigram_operator_schema and any(
-            " gin_trgm_ops" in element for element in elements
-        ):
+        if trigram_operator_schema and any(" gin_trgm_ops" in element for element in elements):
             elements = tuple(
                 element.replace(
                     " gin_trgm_ops",
@@ -1500,7 +1540,9 @@ def _spending_prescription_from_row(
         "total_claims": _to_float(_row_value(spending_row, "Tot_Clms", "TOT_CLAIMS", "Tot_Rx")),
         "total_30day_fills": _to_float(_row_value(spending_row, "Tot_30day_Fills", "TOT_30DAY_FILLS")),
         "total_day_supply": _to_float(_row_value(spending_row, "Tot_Day_Suply", "TOT_DAY_SUPLY", "Tot_Day_Supply")),
-        "total_drug_cost": _to_float(_row_value(spending_row, "Tot_Drug_Cst", "TOT_DRUG_CST", "Tot_Spndng", "TOT_SPNDG")),
+        "total_drug_cost": _to_float(
+            _row_value(spending_row, "Tot_Drug_Cst", "TOT_DRUG_CST", "Tot_Spndng", "TOT_SPNDG")
+        ),
         "total_benes": _to_float(_row_value(spending_row, "Tot_Benes", "TOT_BENES", "Bene_Cnt", "BENE_CNT")),
         "source_year": year,
     }
@@ -1576,9 +1618,7 @@ async def _materialize_prescription_and_code_rows(classes: dict[str, type], sche
 
     prescription_table = classes["PricingPrescription"].__tablename__
     provider_prescription_table = classes["PricingProviderPrescription"].__tablename__
-    autocomplete_table = classes[
-        "PricingProviderPrescriptionAutocomplete"
-    ].__tablename__
+    autocomplete_table = classes["PricingProviderPrescriptionAutocomplete"].__tablename__
     code_catalog_table = CodeCatalog.__tablename__
     code_crosswalk_table = CodeCrosswalk.__tablename__
     await _materialize_prescription_rollup(
@@ -1807,8 +1847,7 @@ async def _snapshot_rxnorm_fragments(
 
     if await _is_column_present(snapshot_schema, product_table, "rxnorm_ids"):
         return (
-            "LEFT JOIN LATERAL unnest(COALESCE(p.rxnorm_ids, ARRAY[]::varchar[])) "
-            "AS rx(rxnorm_id) ON TRUE",
+            "LEFT JOIN LATERAL unnest(COALESCE(p.rxnorm_ids, ARRAY[]::varchar[])) AS rx(rxnorm_id) ON TRUE",
             "COALESCE(BTRIM(rx.rxnorm_id), '')",
         )
     for candidate_column in ("rxnorm_id", "rxnorm", "rxcui"):
@@ -1839,10 +1878,7 @@ async def _snapshot_ndc_fragments(
     has_package_ndc = await _is_column_present(snapshot_schema, package_table, "package_ndc")
     ndc_sources: list[str] = ["p.product_ndc"]
     if has_product_ndc and (has_ndc11 or has_package_ndc):
-        package_join_sql = (
-            f"LEFT JOIN {snapshot_schema}.{package_table} pkg "
-            "ON pkg.product_ndc = p.product_ndc"
-        )
+        package_join_sql = f"LEFT JOIN {snapshot_schema}.{package_table} pkg ON pkg.product_ndc = p.product_ndc"
         if has_ndc11:
             ndc_sources.insert(0, "pkg.ndc11")
         if has_package_ndc:
@@ -2071,9 +2107,7 @@ async def _create_snapshot_candidate_stage(stage_tables: SnapshotStageTables) ->
         max_rxnorm_per_code=RX_CROSSWALK_MAX_RXNORM_PER_CODE,
     )
     await db.status(f"CREATE INDEX ON {stage_tables.crosswalk_candidates} (rx_code);")
-    await db.status(
-        f"CREATE INDEX ON {stage_tables.crosswalk_candidates} (to_system, to_code);"
-    )
+    await db.status(f"CREATE INDEX ON {stage_tables.crosswalk_candidates} (to_system, to_code);")
 
 
 async def _prepare_snapshot_candidate_tables(
@@ -2376,7 +2410,9 @@ async def _resolve_live_external_codes_for_entry(
 
     rxnorm_codes: set[str] = set()
     ndc_codes: set[str] = set()
-    display_name = str(entry.get("generic_name") or entry.get("brand_name") or entry.get("rx_name") or "").strip() or None
+    display_name = (
+        str(entry.get("generic_name") or entry.get("brand_name") or entry.get("rx_name") or "").strip() or None
+    )
 
     for product_ndc in product_ndcs:
         encoded_ndc = quote(str(product_ndc), safe="")
@@ -2384,10 +2420,7 @@ async def _resolve_live_external_codes_for_entry(
         if isinstance(product_payload, dict):
             display_name = (
                 str(
-                    product_payload.get("generic_name")
-                    or product_payload.get("brand_name")
-                    or display_name
-                    or ""
+                    product_payload.get("generic_name") or product_payload.get("brand_name") or display_name or ""
                 ).strip()
                 or display_name
             )
@@ -2678,10 +2711,7 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
             staging_class = classes[cls.__name__]
             table = cls.__main_table__
             await db.status(f"DROP TABLE IF EXISTS {schema}.{table};")
-            await db.status(
-                f"ALTER TABLE {schema}.{staging_class.__tablename__} "
-                f"RENAME TO {table};"
-            )
+            await db.status(f"ALTER TABLE {schema}.{staging_class.__tablename__} RENAME TO {table};")
 
             await db.status(
                 f"ALTER INDEX IF EXISTS {schema}.{staging_class.__tablename__}_idx_primary "
@@ -2703,6 +2733,14 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                 await db.status(
                     f"ALTER INDEX IF EXISTS {schema}.{staging_class.__tablename__}_{staging_name} RENAME TO {base_name};"
                 )
+
+        provider_name = prescription_autocomplete_source_fingerprint_sql(
+            schema=schema, provider_table=PricingProviderPrescription.__main_table__
+        )
+        await db.status(
+            f"UPDATE {schema}.{PricingProviderPrescriptionAutocomplete.__main_table__} "
+            f"SET source_relation_fingerprint={provider_name};"
+        )
 
 
 def _drug_claims_start_request(
@@ -2796,9 +2834,7 @@ async def _enqueue_drug_claims_chunk(
     reporting_year = max(_safe_int(chunk_manifest.get("reporting_year"), 2013), 2013)
     source_index = max(_safe_int(chunk_manifest.get("source_index"), 0), 0)
     chunk_index = max(_safe_int(chunk_manifest.get("chunk_index"), 0), 0)
-    unique_chunk_id = (
-        f"{chunk_manifest['dataset_key']}:{reporting_year}:{source_index}:{chunk_index}"
-    )
+    unique_chunk_id = f"{chunk_manifest['dataset_key']}:{reporting_year}:{source_index}:{chunk_index}"
     chunk_job_by_field = {
         "import_id": request.import_id,
         "run_id": request.run_id,
@@ -2832,13 +2868,8 @@ async def _collect_and_enqueue_source_chunks(
 ) -> list[dict[str, Any]]:
     """Run bounded source work and enqueue chunks as each source completes."""
 
-    source_count = sum(
-        len(source_descriptors_by_dataset.get(dataset.key, []))
-        for dataset in DATASETS
-    )
-    semaphore = asyncio.Semaphore(
-        min(DRUG_CLAIMS_DOWNLOAD_CONCURRENCY, max(source_count, 1))
-    )
+    source_count = sum(len(source_descriptors_by_dataset.get(dataset.key, [])) for dataset in DATASETS)
+    semaphore = asyncio.Semaphore(min(DRUG_CLAIMS_DOWNLOAD_CONCURRENCY, max(source_count, 1)))
     source_tasks = [
         asyncio.create_task(
             _download_split_drug_claims_source(
@@ -2851,9 +2882,7 @@ async def _collect_and_enqueue_source_chunks(
             )
         )
         for dataset in DATASETS
-        for source_index, source_descriptor in enumerate(
-            source_descriptors_by_dataset.get(dataset.key, [])
-        )
+        for source_index, source_descriptor in enumerate(source_descriptors_by_dataset.get(dataset.key, []))
     ]
     all_chunks: list[dict[str, Any]] = []
     try:
@@ -2980,35 +3009,23 @@ def _validate_drug_claims_finalize_manifest(
     source_descriptors_by_dataset = request.manifest.get("sources")
     total_chunks = _safe_int(request.manifest.get("total_chunks"), -1)
     if not isinstance(chunk_manifests, list) or not chunk_manifests:
-        raise RuntimeError(
-            "Drug claims finalize requires a nonempty chunk manifest."
-        )
+        raise RuntimeError("Drug claims finalize requires a nonempty chunk manifest.")
     if total_chunks != len(chunk_manifests):
-        raise RuntimeError(
-            "Drug claims finalize chunk count does not match its manifest."
-        )
+        raise RuntimeError("Drug claims finalize chunk count does not match its manifest.")
     if not isinstance(source_descriptors_by_dataset, dict):
-        raise RuntimeError(
-            "Drug claims finalize requires source descriptors."
-        )
+        raise RuntimeError("Drug claims finalize requires source descriptors.")
     missing_sources = _find_missing_drug_claim_sources(
         source_descriptors_by_dataset,
         chunk_manifests,
     )
     if missing_sources:
-        raise RuntimeError(
-            "Drug claims finalize is missing required source chunks: "
-            f"{', '.join(missing_sources)}"
-        )
+        raise RuntimeError(f"Drug claims finalize is missing required source chunks: {', '.join(missing_sources)}")
     if (
         str(request.manifest.get("import_id") or "") != request.import_id
         or str(request.manifest.get("run_id") or "") != request.run_id
-        or str(request.manifest.get("stage_suffix") or "")
-        != request.stage_suffix
+        or str(request.manifest.get("stage_suffix") or "") != request.stage_suffix
     ):
-        raise RuntimeError(
-            "Drug claims finalize identity does not match its manifest."
-        )
+        raise RuntimeError("Drug claims finalize identity does not match its manifest.")
 
 
 async def _fail_empty_drug_claims_sources(
@@ -3041,9 +3058,7 @@ async def drug_claims_start(ctx, task: dict[str, Any] | None = None) -> dict[str
         phase_detail="drug-claims split running",
         progress_message="splitting source files",
     )
-    schema, source_descriptors_by_dataset, workspace = await _prepare_drug_claims_sources(
-        request
-    )
+    schema, source_descriptors_by_dataset, workspace = await _prepare_drug_claims_sources(request)
     chunk_enqueue_started_at = _step_start("download+split+enqueue chunks (streaming)")
     chunks = await _collect_and_enqueue_source_chunks(
         request,
@@ -3059,8 +3074,7 @@ async def drug_claims_start(ctx, task: dict[str, Any] | None = None) -> dict[str
     if missing_sources:
         await _fail_empty_drug_claims_sources(request, missing_sources)
         raise RuntimeError(
-            "Drug claims import produced no processable rows for required "
-            f"sources: {', '.join(missing_sources)}"
+            f"Drug claims import produced no processable rows for required sources: {', '.join(missing_sources)}"
         )
     manifest_path = _persist_drug_claims_manifest(
         request,
@@ -3161,14 +3175,9 @@ def _drug_claims_finalize_request(
     manifest = _read_manifest(manifest_path) if manifest_path else {}
     run_id = str(task.get("run_id") or manifest.get("run_id") or "")
     stage_suffix = str(
-        task.get("stage_suffix")
-        or manifest.get("stage_suffix")
-        or _build_stage_suffix(import_id, run_id)
+        task.get("stage_suffix") or manifest.get("stage_suffix") or _build_stage_suffix(import_id, run_id)
     )
-    schema = str(
-        task.get("schema")
-        or get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode)
-    )
+    schema = str(task.get("schema") or get_import_schema("HLTHPRT_DB_SCHEMA", "mrf", test_mode))
     expected_chunks = _safe_int(
         manifest.get("total_chunks"),
         _safe_int(task.get("total_chunks"), 0),
@@ -3191,9 +3200,7 @@ async def _await_drug_claims_finalize_permission(
     """Wait for all chunks and acquire the single-publisher lock."""
 
     if request.redis is None:
-        raise RuntimeError(
-            "ARQ redis context is unavailable for drug claims finalize job."
-        )
+        raise RuntimeError("ARQ redis context is unavailable for drug claims finalize job.")
     if not request.run_id:
         raise RuntimeError("Drug claims finalize run_id is required.")
     finalized_key = _state_key(request.run_id, "finalized")
@@ -3221,8 +3228,7 @@ async def _await_drug_claims_finalize_permission(
             message=f"waiting for chunks {done_chunks}/{total_chunks}",
         )
         print(
-            f"[finalize] waiting for chunks: done={done_chunks}/{total_chunks} "
-            f"run_id={request.run_id}",
+            f"[finalize] waiting for chunks: done={done_chunks}/{total_chunks} run_id={request.run_id}",
             flush=True,
         )
         raise Retry(defer=DRUG_CLAIMS_FINISH_RETRY_SECONDS)
@@ -3311,9 +3317,7 @@ def _cleanup_drug_claims_workdir(request: DrugClaimsFinalizeRequest) -> None:
     if not work_dir_text or DRUG_CLAIMS_KEEP_WORKDIR:
         return
     work_dir_root = Path(DRUG_CLAIMS_WORKDIR).expanduser().resolve()
-    expected_work_dir = (
-        work_dir_root / request.import_id / request.run_id
-    ).resolve()
+    expected_work_dir = (work_dir_root / request.import_id / request.run_id).resolve()
     run_work_dir = Path(work_dir_text).expanduser().resolve()
     try:
         expected_work_dir.relative_to(work_dir_root)
@@ -3338,18 +3342,12 @@ async def drug_claims_finalize(ctx, task: dict[str, Any] | None = None) -> dict[
     finalize_task = task or {}
     redis = ctx.get("redis")
     task_run_id = str(finalize_task.get("run_id") or "")
-    if (
-        redis is not None
-        and task_run_id
-        and await redis.get(_state_key(task_run_id, "finalized"))
-    ):
+    if redis is not None and task_run_id and await redis.get(_state_key(task_run_id, "finalized")):
         return {
             "ok": True,
             "already_finalized": True,
             "run_id": task_run_id,
-            "import_id": _normalize_import_id(
-                finalize_task.get("import_id")
-            ),
+            "import_id": _normalize_import_id(finalize_task.get("import_id")),
         }
     test_mode = bool(finalize_task.get("test_mode", False))
     await ensure_database(test_mode)
@@ -3436,9 +3434,7 @@ async def finish_main(
     redis = await create_pool(build_redis_settings(), job_serializer=serialize_job, job_deserializer=deserialize_job)
     normalized_import_id = _normalize_import_id(import_id)
     stage_suffix = _build_stage_suffix(normalized_import_id, run_id)
-    resolved_manifest_path = manifest_path or str(
-        _manifest_path(_run_dir(normalized_import_id, run_id))
-    )
+    resolved_manifest_path = manifest_path or str(_manifest_path(_run_dir(normalized_import_id, run_id)))
     finalize_job_by_field = {
         "import_id": import_id,
         "run_id": run_id,

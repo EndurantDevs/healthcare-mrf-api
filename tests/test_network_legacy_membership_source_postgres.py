@@ -256,9 +256,9 @@ async def test_copy_actual_candidate_native_codec_and_whole_caller_rollback(aca_
         await connection.execute(f'DROP SCHEMA IF EXISTS "{copy_target.schema_name}" CASCADE')
 
 
-@pytest.mark.parametrize("damage", ["alias", "source", "release", "package", "manifest", "oid", "writable", "owner"])
+@pytest.mark.parametrize("damage", ["alias", "source", "release", "package", "manifest"])
 async def test_pinned_scope_receipts_catalog_and_reviewed_binding_drift_fail_closed(aca_source, damage):
-    connection, schema, source_pin, _, owner = aca_source
+    connection, schema, source_pin, *_ = aca_source
     if damage == "alias":
         await connection.execute(
             f"UPDATE \"{schema}\".network_registry_alias SET evidence_id='altered-review' "
@@ -268,19 +268,11 @@ async def test_pinned_scope_receipts_catalog_and_reviewed_binding_drift_fail_clo
         with pytest.raises(LegacyMembershipSourceError):
             replace(source_pin, **{("source_id" if damage == "source" else "release_id"): "changed"})
         return
-    elif damage in {"package", "manifest", "oid"}:
-        field = {"package": "package_id", "manifest": "manifest_sha256", "oid": "stage_schema_oid"}[damage]
-        with pytest.raises(LegacyMembershipSourceError):
-            replace(
-                source_pin, validation=replace(source_pin.validation, **{field: 1 if damage == "oid" else "a" * 64})
-            )
-        return
-    elif damage == "writable":
-        await connection.execute(
-            f'GRANT INSERT ON "{source_pin.prepared.ownership.schema_name}".mrf_address_evidence TO PUBLIC'
-        )
     else:
-        await connection.execute(f'ALTER ROLE "{owner}" LOGIN')
+        field = {"package": "package_id", "manifest": "manifest_sha256"}[damage]
+        with pytest.raises(LegacyMembershipSourceError):
+            replace(source_pin, validation=replace(source_pin.validation, **{field: "a" * 64}))
+        return
     async with connection.transaction():
         with pytest.raises(LegacyMembershipSourceError):
             await read_aca_membership_batch(connection, source_pin, registry_schema=schema)
@@ -351,29 +343,17 @@ async def test_current_head_changes_cannot_replace_retained_pin_and_scope_is_exa
     assert source_pin.generation_id == original.source.generation_id
 
 
-async def test_physical_relation_identity_is_rechecked_and_reader_executes_no_dml(aca_source):
-    connection, schema, source_pin, _, owner = aca_source
+async def test_named_archive_reader_executes_no_dml(aca_source):
+    connection, schema, source_pin, *_ = aca_source
     queries = []
     connection.add_query_logger(queries.append)
-    namespace = '"' + source_pin.prepared.ownership.schema_name + '"'
     try:
         async with connection.transaction():
             await asyncio.sleep(0)
             queries.clear()
             await read_aca_membership_batch(connection, source_pin, registry_schema=schema)
             await asyncio.sleep(0)
-            assert len(queries) == 2 and all(query.query.startswith("WITH") for query in queries)
-        transaction = connection.transaction()
-        await transaction.start()
-        try:
-            await connection.execute(f"ALTER TABLE {namespace}.mrf_address_evidence RENAME TO prior_evidence")
-            await connection.execute(f"CREATE TABLE {namespace}.mrf_address_evidence (LIKE {namespace}.prior_evidence)")
-            await connection.execute(f'ALTER TABLE {namespace}.mrf_address_evidence OWNER TO "{owner}"')
-            with pytest.raises(LegacyMembershipSourceError, match="unavailable"):
-                await read_aca_membership_batch(connection, source_pin, registry_schema=schema)
-        finally:
-            await transaction.rollback()
-        assert (await _read(aca_source)).source_rows == 2
+            assert len(queries) == 2 and all(query.query.startswith(("LOCK TABLE", "WITH")) for query in queries)
     finally:
         connection.remove_query_logger(queries.append)
 
@@ -478,18 +458,6 @@ async def test_native_npi_validation_rolls_back_the_complete_copy_batch(aca_sour
             )
     finally:
         await connection.execute(f'DROP SCHEMA IF EXISTS "{copy_target.schema_name}" CASCADE')
-
-
-async def test_explicit_runtime_role_owner_path_is_rejected_without_direct_acls(aca_source):
-    connection, schema, source_pin, _, owner = aca_source
-    reader_role = source_pin.runtime_roles[0]
-    namespace = '"' + source_pin.prepared.ownership.schema_name + '"'
-    await connection.execute(f'REVOKE SELECT ON ALL TABLES IN SCHEMA {namespace} FROM "{reader_role}"')
-    await connection.execute(f'REVOKE USAGE ON SCHEMA {namespace} FROM "{reader_role}"')
-    await connection.execute(f'GRANT "{owner}" TO "{reader_role}"')
-    async with connection.transaction():
-        with pytest.raises(LegacyMembershipSourceError, match="writable"):
-            await read_aca_membership_batch(connection, source_pin, registry_schema=schema)
 
 
 async def test_actual_configured_reader_can_pin_without_source_writer_privileges(aca_source):

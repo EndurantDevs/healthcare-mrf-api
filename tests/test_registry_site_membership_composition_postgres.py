@@ -140,7 +140,12 @@ async def test_retained_site_full_publication_preserves_only_approved_custom_off
     fixture.copy_targets.append(copy_target)
     assert await compose_registry_membership_candidate(fixture.connection, **arguments) == (copy_target, addresses)
     await prepare_and_publish_network_candidate(
-        fixture.connection, copy_target, addresses, **_roles(fixture), control_schema=fixture.control_schema
+        fixture.connection,
+        copy_target,
+        addresses,
+        **_roles(fixture),
+        control_schema=fixture.control_schema,
+        seal_candidate=fixture.seal_candidate,
     )
     members = await fixture.connection.fetch(f'SELECT * FROM "{copy_target.schema_name}".network_membership')
     custom_members = [dict(member) for member in members if member["network_id"] == seed.network["record_id"]]
@@ -299,7 +304,7 @@ async def test_restore_requires_unchanged_server_sealed_proof(site_db):
     assert len(receipts) == 1 and len(receipts[0].records) == 1
 
 
-@pytest.mark.parametrize("damage", [None, "source", "hash", "oid", "acl", "ineligible"])
+@pytest.mark.parametrize("damage", [None, "source", "hash", "oid", "ineligible"])
 async def test_preparation_is_caller_atomic_and_source_tampering_fails_closed(site_db, damage):
     fixture = site_db
     seed = await _seed(fixture)
@@ -314,7 +319,6 @@ async def test_preparation_is_caller_atomic_and_source_tampering_fails_closed(si
             "source": f'''UPDATE "{fixture.control_schema}".network_membership_candidate SET source_generations='{{"fhir":"changed"}}'::jsonb''',
             "hash": f"UPDATE {source_namespace}.entity_address_unified SET second_line='Suite changed'",
             "oid": f"ALTER TABLE {source_namespace}.provider_location_binding RENAME TO old_binding",
-            "acl": f'GRANT UPDATE ON {source_namespace}.entity_address_unified TO "{fixture.roles["reader"]}"',
             "ineligible": f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false',
         }
         if damage is not None:
@@ -372,7 +376,7 @@ async def _source_read_count(fixture, revision):
             )
             await asyncio.sleep(0)
             assert all(query.query.lstrip().split()[0] in ("SELECT", "WITH", "SHOW") for query in queries)
-            assert sum("network_candidate_custody" in query.query for query in queries) == 2
+            assert not any("network_candidate_custody" in query.query for query in queries)
             return len(queries), sum(len(receipt.records) for receipt in receipts)
     finally:
         fixture.connection.remove_query_logger(queries.append)
@@ -400,7 +404,7 @@ async def test_same_generation_bulk_revalidation_uses_fixed_queries(site_db):
     )
     approval = await _approval(fixture, seed.actor, second, corrected)
     two = await _source_read_count(fixture, approval["approved_revision"])
-    assert one == (11, 1) and two == (11, 2)
+    assert one == (7, 1) and two == (7, 2)
 
 
 async def test_approval_is_caller_atomic_and_only_seals_explicit_records(site_db):

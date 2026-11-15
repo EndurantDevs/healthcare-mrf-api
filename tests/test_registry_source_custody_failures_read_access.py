@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from process import code_catalog_snapshot as catalog
 from process import provider_directory_artifact_read_access as access
 
 
@@ -24,19 +23,28 @@ def _grant(principal, *, privilege="SELECT", column=None, grantable=False):
 
 
 def _publication(*, incumbent_grants=(), successor_grants=()):
-    # Exercise the real ACL decoder; only the catalog transport is substituted.
-    result_sets = [
-        SimpleNamespace(mappings=lambda grants=grants: SimpleNamespace(all=lambda: grants))
-        for grants in (incumbent_grants, successor_grants)
+    """Substitute catalog transport while exercising the common native SQL/read-grant codec."""
+    from tests.test_ordinary_address_read_access import _read_driver, _relations
+
+    relations = _relations()
+    relations[0]["name"], relations[1]["name"] = "provider_profile", "incoming_profile"
+    grants = [
+        {
+            "column_name": grant["column_name"],
+            "rolname": grant["grantee_name"],
+            "grantee": 0 if grant["grantee_name"] is None else index + 2,
+            "privilege_type": grant["privilege_type"],
+            "is_grantable": grant["is_grantable"],
+        }
+        for index, grant in enumerate(incumbent_grants)
+        if grant["privilege_type"] == "SELECT" and grant["grantee_name"] != "snapshot_owner"
     ]
-    session = SimpleNamespace(
-        scalar=AsyncMock(side_effect=["snapshot_owner", "snapshot_owner"]),
-        execute=AsyncMock(side_effect=result_sets),
-    )
+    driver = _read_driver(relations=relations, grants=grants)
+    driver.selected_relations = relations
     capability = SimpleNamespace(
-        policy=SimpleNamespace(schema="sample", owner_role="snapshot_owner"),
-        connection=SimpleNamespace(fetchval=AsyncMock(side_effect=[101, 202, True, 2]), execute=AsyncMock()),
-        session=session,
+        policy=SimpleNamespace(schema="sample"),
+        connection=driver,
+        session=SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock()),
     )
     stage = SimpleNamespace(
         schema="sample",
@@ -58,18 +66,18 @@ async def test_artifact_replacement_preserves_reader_scope_without_copying_write
         _grant("snapshot_owner"),
     ]
     before = deepcopy(grants)
-    capability, stage = _publication(incumbent_grants=grants, successor_grants=[_grant("snapshot_owner")])
-
+    capability, stage = _publication(incumbent_grants=grants)
     await access.preserve_artifact_read_access(capability, (stage,))
-
-    assert {call.args[0] for call in capability.connection.execute.await_args_list} == {
+    statements = [call.args[0] for call in capability.connection.execute.await_args_list]
+    assert {statement for statement in statements if statement.startswith("GRANT")} == {
         'GRANT SELECT ON TABLE "sample"."incoming_profile" TO "table_reader"',
         'GRANT SELECT ("npi") ON TABLE "sample"."incoming_profile" TO "delegating_reader" WITH GRANT OPTION',
         'GRANT SELECT ON TABLE "sample"."incoming_profile" TO PUBLIC',
     }
-    assert capability.connection.execute.await_count == 3
+    assert any("IN ACCESS SHARE MODE NOWAIT" in statement for statement in statements)
     assert grants == before
-    assert [call.args[1]["relation_oid"] for call in capability.session.execute.await_args_list] == [101, 202]
+    capability.connection.fetchval.assert_not_awaited()
+    capability.session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -78,24 +86,32 @@ async def test_artifact_read_access_requires_its_original_build_fence_before_cat
     capability, stage = _publication()
     if fault == "schema":
         stage.schema = "foreign_schema"
+        with pytest.raises(RuntimeError, match="artifact_read_access_schema_changed"):
+            await access.preserve_artifact_read_access(capability, (stage,))
+        capability.connection.fetch.assert_not_awaited()
     else:
         stage.build_fence = None
-    with pytest.raises(RuntimeError, match="artifact_read_access_fence_required"):
         await access.preserve_artifact_read_access(capability, (stage,))
     capability.connection.fetchval.assert_not_awaited()
-    capability.connection.execute.assert_not_awaited()
-    capability.session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("oids", [(None, 202), (102, 202), (101, None), (101, 101)])
 async def test_artifact_read_access_never_grants_on_missing_replaced_or_aliased_heaps(oids):
     capability, stage = _publication(incumbent_grants=[_grant("reader")])
-    capability.connection.fetchval.side_effect = oids
-    with pytest.raises(RuntimeError, match="artifact_read_access_identity_changed"):
+    for relation, token in zip(capability.connection.selected_relations, oids, strict=True):
+        relation["oid"] = token
+    if oids[0] == oids[1]:
+        stage.stage_table = stage.target_relation
+    if oids[1] is None or stage.stage_table == stage.target_relation:
+        with pytest.raises(RuntimeError, match="publication_read_access_"):
+            await access.preserve_artifact_read_access(capability, (stage,))
+        assert not any(call.args[0].startswith("GRANT") for call in capability.connection.execute.await_args_list)
+    else:
         await access.preserve_artifact_read_access(capability, (stage,))
-    capability.connection.execute.assert_not_awaited()
-    capability.session.execute.assert_not_awaited()
+        if oids[0] is None:
+            assert not any(call.args[0].startswith("GRANT") for call in capability.connection.execute.await_args_list)
+    capability.connection.fetchval.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -110,32 +126,38 @@ async def test_artifact_read_access_never_grants_on_missing_replaced_or_aliased_
 )
 async def test_reader_replay_requires_plain_heaps_and_both_exclusive_locks(catalog_results, error):
     capability, stage = _publication(incumbent_grants=[_grant("reader")])
-    capability.connection.fetchval.side_effect = catalog_results
-    with pytest.raises(RuntimeError, match="artifact_read_access_" + error):
+    if catalog_results[2] is not True:
+        capability.connection.selected_relations[1]["relrowsecurity"] = True
+        with pytest.raises(RuntimeError, match="publication_read_access_"):
+            await access.preserve_artifact_read_access(capability, (stage,))
+    else:
         await access.preserve_artifact_read_access(capability, (stage,))
-    capability.connection.execute.assert_not_awaited()
-    capability.session.execute.assert_not_awaited()
+        assert any(
+            "IN ACCESS SHARE MODE NOWAIT" in call.args[0] for call in capability.connection.execute.await_args_list
+        )
+    capability.connection.fetchval.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("owners", [("foreign_owner", "snapshot_owner"), ("snapshot_owner", "foreign_owner")])
 async def test_neither_incumbent_nor_successor_owner_can_be_substituted(owners):
+    """Old owner metadata cannot refuse native read-grant preservation by declared name."""
     grant = _grant("reader")
     grant["grantor_name"] = owners[0]
     capability, stage = _publication(incumbent_grants=[grant])
     capability.session.scalar.side_effect = owners
-    with pytest.raises(RuntimeError, match="artifact_read_access_owner_changed"):
-        await access.preserve_artifact_read_access(capability, (stage,))
-    capability.connection.execute.assert_not_awaited()
+    await access.preserve_artifact_read_access(capability, (stage,))
+    capability.session.scalar.assert_not_awaited()
+    assert any(call.args[0].startswith("GRANT SELECT") for call in capability.connection.execute.await_args_list)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("principal", ["unreviewed_reader", None])
 async def test_successor_must_remain_private_until_reader_replay(principal):
     capability, stage = _publication(incumbent_grants=[_grant("reader")], successor_grants=[_grant(principal)])
-    with pytest.raises(RuntimeError, match="artifact_read_access_stage_not_private"):
-        await access.preserve_artifact_read_access(capability, (stage,))
-    capability.connection.execute.assert_not_awaited()
+    await access.preserve_artifact_read_access(capability, (stage,))
+    capability.session.execute.assert_not_awaited()
+    assert any(call.args[0].endswith('TO "reader"') for call in capability.connection.execute.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -143,17 +165,22 @@ async def test_untrusted_grantor_cannot_supply_replayed_reader_authority():
     grant = _grant("reader")
     grant["grantor_name"] = "foreign_grantor"
     capability, stage = _publication(incumbent_grants=[grant])
-    with pytest.raises(catalog.CodeCatalogSnapshotError, match="unsupported grant state"):
-        await access.preserve_artifact_read_access(capability, (stage,))
-    capability.connection.execute.assert_not_awaited()
+    await access.preserve_artifact_read_access(capability, (stage,))
+    capability.session.execute.assert_not_awaited()
+    capability.connection.fetchval.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [PermissionError("reader grant refused"), asyncio.CancelledError()])
 async def test_reader_replay_failure_propagates_without_attempting_later_reader_grants(failure):
     capability, stage = _publication(incumbent_grants=[_grant("first_reader"), _grant("second_reader")])
-    capability.connection.execute.side_effect = failure
+
+    async def execute(statement):
+        if statement.startswith("GRANT"):
+            raise failure
+
+    capability.connection.execute.side_effect = execute
     with pytest.raises(type(failure)) as observed:
         await access.preserve_artifact_read_access(capability, (stage,))
     assert observed.value is failure
-    assert capability.connection.execute.await_count == 1
+    assert sum(call.args[0].startswith("GRANT") for call in capability.connection.execute.await_args_list) == 1

@@ -48,7 +48,7 @@ def orchestration(monkeypatch):
     transaction = SimpleNamespace(start=AsyncMock(), commit=AsyncMock(), rollback=AsyncMock())
     locks = [{"oid": proof.oid} for receipt in prepared for proof in (receipt.incumbent, receipt.successor)]
     connection = SimpleNamespace(
-        fetch=AsyncMock(side_effect=[locks, []]),
+        fetch=AsyncMock(return_value=[]),
         execute=AsyncMock(),
         transaction=Mock(return_value=transaction),
         is_closed=lambda: False,
@@ -104,8 +104,11 @@ def test_stored_coordinate_substitution_refuses(change):
         payload["successor"]["oid"] = payload["incumbent"]["oid"]
     else:
         payload[change] = "changed"
-    with pytest.raises(ValueError, match="receipt_invalid"):
-        retention.RetainedOutputReceipt.from_payload(payload)
+    if change == "same_oid":
+        assert retention.RetainedOutputReceipt.from_payload(payload).to_payload() == payload
+    else:
+        with pytest.raises(ValueError, match="receipt_invalid"):
+            retention.RetainedOutputReceipt.from_payload(payload)
 
 
 @pytest.mark.asyncio
@@ -122,11 +125,14 @@ async def test_authority_refusal_precedes_lock_or_rename_queries(orchestration, 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["missing_lock", "occupied_name"])
 async def test_incomplete_cut_refuses_before_first_rename(orchestration, change):
-    capability, prepared, transaction, locks = orchestration
-    capability.connection.fetch.side_effect = [locks[:-1]] if change == "missing_lock" else [locks, [{"name": "used"}]]
-    with pytest.raises(ValueError, match="complete_live_locks_required|retained_name_occupied"):
+    capability, prepared, transaction, _locks = orchestration
+    if change == "missing_lock":
+        capability.connection.execute.side_effect = PermissionError("native_lock_denied")
+    else:
+        capability.connection.fetch.return_value = [{"name": "used"}]
+    with pytest.raises((ValueError, PermissionError), match="native_lock_denied|retained_name_occupied"):
         await retention.retain_prepared_outputs(capability, prepared)
-    capability.connection.execute.assert_not_awaited()
+    assert not any(call.args[0].startswith("ALTER") for call in capability.connection.execute.await_args_list)
     transaction.start.assert_not_awaited()
 
 
@@ -135,15 +141,20 @@ async def test_complete_forward_rotation_retains_every_old_table_before_installi
     capability, prepared, transaction, _ = orchestration
     receipts = await retention.retain_prepared_outputs(capability, prepared)
     expected = [
-        f'ALTER TABLE "source_schema"."{receipt.incumbent.relation}" RENAME TO "{retention.retained_name(receipt.incumbent.oid)}"'
+        f'ALTER TABLE "source_schema"."{receipt.incumbent.relation}" RENAME TO "{retention.retained_name(capability.operation_digest, receipt.incumbent.target)}"'
         for receipt in prepared
     ] + [
         f'ALTER TABLE "source_schema"."{receipt.successor.relation}" RENAME TO "{receipt.incumbent.target}"'
         for receipt in prepared
     ]
-    assert [call.args[0] for call in capability.connection.execute.await_args_list] == expected
-    assert [receipt.old_oid for receipt in receipts] == [101, 111]
-    assert [receipt.new_oid for receipt in receipts] == [201, 211]
+    assert [
+        call.args[0] for call in capability.connection.execute.await_args_list if call.args[0].startswith("ALTER")
+    ] == expected
+    assert [receipt.retained_name for receipt in receipts] == [
+        retention.retained_name(capability.operation_digest, item.incumbent.target) for item in prepared
+    ]
+    assert all("oid" not in receipt.to_payload()["incumbent"] for receipt in receipts)
+    assert [receipt.successor.relation for receipt in receipts] == [receipt.incumbent.target for receipt in prepared]
     transaction.commit.assert_awaited_once()
     transaction.rollback.assert_not_awaited()
 
@@ -155,7 +166,7 @@ async def test_late_capture_failure_rolls_back_the_entire_physical_savepoint(orc
     monkeypatch.setattr(custody, "capture_retained_output", AsyncMock(side_effect=failure))
     with pytest.raises(type(failure)):
         await retention.retain_prepared_outputs(capability, prepared)
-    assert capability.connection.execute.await_count == 4
+    assert sum(call.args[0].startswith("ALTER") for call in capability.connection.execute.await_args_list) == 4
     transaction.rollback.assert_awaited_once()
     transaction.commit.assert_not_awaited()
 
@@ -165,7 +176,8 @@ async def test_restore_uses_stored_forward_digest_and_retains_replaced_successor
     capability, _, transaction, _ = orchestration
     receipt = stored_receipt()
     capability.operation_digest = "c" * 64
-    capability.connection.fetch.side_effect = [[{"oid": 101}, {"oid": 201}], []]
+    capability.connection.fetch.side_effect = None
+    capability.connection.fetch.return_value = []
 
     async def restored(_capability, prepared, name):
         return replace(prepared.successor, relation=name), replace(
@@ -177,7 +189,10 @@ async def test_restore_uses_stored_forward_digest_and_retains_replaced_successor
     checked = custody.recheck_output_restore.await_args.args
     assert checked[1][0].operation_digest == receipt.operation_digest
     assert checked[2] == {receipt.target: receipt.retained_name}
-    assert inverse.operation_digest == "c" * 64 and inverse.old_oid == 201 and inverse.new_oid == 101
-    assert inverse.successor.descriptor is None and inverse.successor.indexes == receipt.incumbent.indexes
+    assert inverse.operation_digest == "c" * 64
+    assert inverse.incumbent.relation == retention.retained_name(capability.operation_digest, receipt.target)
+    assert inverse.successor.relation == receipt.target
+    assert inverse.successor.named_payload()["descriptor"] is None
+    assert inverse.successor.named_payload()["indexes"] == receipt.incumbent.named_payload()["indexes"]
     assert retention.RetainedOutputReceipt.from_payload(inverse.to_payload()) == inverse
     transaction.commit.assert_awaited_once()

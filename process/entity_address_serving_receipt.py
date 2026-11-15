@@ -62,8 +62,10 @@ def ordinary_address_receipt_callbacks(database, schema, quote_literal):
             or address["origin_generation"] != address["local_generation"]
         ):
             raise RuntimeError("entity_address_common_receipt_address_not_advanced")
+        # A predecessor stored before the upgrade also carries retired fields; keep only the common ones.
+        common_fields = receipts._PAYLOAD_FIELDS | {"archive"}
         payload = {
-            **predecessor["payload"],
+            **{key: value for key, value in predecessor["payload"].items() if key in common_fields},
             **result,
             "predecessor_receipt_id": predecessor["receipt_id"],
             "expected_incumbent": {key: predecessor["payload"]["cms"][key] for key in receipts._PIN_FIELDS},

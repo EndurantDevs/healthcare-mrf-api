@@ -33,6 +33,43 @@ from process.provider_directory_generic_source_storage import (
 )
 
 
+def named_artifact_input_relation(directory, root, scoped_relation):
+    """Allow an explicit input QName only for the ordinary artifact resource table."""
+    if (
+        type(scoped_relation) is not tuple
+        or len(scoped_relation) != 2
+        or root != directory.ProviderDirectoryDatasetResource.__tablename__
+        or is_source_storage_required()
+    ):
+        raise directory.ProviderDirectoryArtifactBuildStale("provider_directory_artifact_input_relation_invalid")
+    return storage_relation(*scoped_relation)
+
+
+async def lock_endpoint_dataset_candidate_admission(directory, connection, endpoint_id):
+    """Serialize candidate intake within its configured storage scope without waiting."""
+    from process.provider_directory_generic_source_policy import bound_publisher, current_source_storage_binding
+    from process.provider_directory_source_storage_binding import require_storage_schema
+
+    catalog_schema = directory._schema()
+    binding = current_source_storage_binding()
+    scope = endpoint_id
+    if binding is not None:
+        binding = require_storage_schema(bound_publisher(), catalog_schema)
+        scope = f"provider-directory-source-candidate:{binding.catalog_schema}:{binding.storage_schema}:{endpoint_id}"
+    acquired = await connection.scalar(
+        "SELECT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtextextended(:admission_scope, 0));",
+        admission_scope=scope,
+    )
+    if acquired is not True:
+        raise RuntimeError("provider_directory_endpoint_dataset_candidate_admission_busy")
+    relation = directory._qt(catalog_schema, directory.ProviderDirectoryAPIEndpoint.__tablename__)
+    row_lock = " FOR UPDATE NOWAIT" if binding is None else ""
+    return await connection.first(
+        f"SELECT endpoint_id FROM {relation} WHERE endpoint_id = :endpoint_id{row_lock};",
+        endpoint_id=endpoint_id,
+    )
+
+
 def require_source_transaction(*, repeatable_read=False):
     """Refuse before target IO; isolation is established by the trusted broker."""
     publisher = source_transaction_available()
@@ -91,6 +128,7 @@ async def candidate_resource_count(directory, context, resource_type):
     """Count exact active loading identities without exposing or preparing an input heap."""
     if not is_source_storage_required():
         return await _legacy_candidate_count(directory, context, resource_type)
+    from process.provider_directory_generic_source_policy import _publisher_scope, _require_active_source_session
     from process.provider_directory_source_checkpoint_control import require_checkpoint_executor
 
     async with source_transaction(directory.db):
@@ -121,9 +159,11 @@ async def candidate_resource_count(directory, context, resource_type):
             binding["ordinal"],
         )
         _require(type(count) is int and 0 <= count < 2**63, "resource_count_invalid")
-        _require(await require_checkpoint_executor(directory.db) is publisher, "count_transaction_changed")
+        current = await require_checkpoint_executor(directory.db)
+        _require(_publisher_scope(current) == _publisher_scope(publisher), "count_transaction_changed")
+        _require_active_source_session(connection)
         async with source_owner_transaction(directory.db) as current:
-            _require(current is publisher, "count_transaction_changed")
+            _require(_publisher_scope(current) == _publisher_scope(publisher), "count_transaction_changed")
         return count
 
 
@@ -455,3 +495,60 @@ async def resource_scan_estimates(directory, source_record):
         for resource, count in count_by_resource.items()
         if resource in directory.DEFAULT_RESOURCES and type(count) is int and count >= 0
     }
+
+
+async def lock_validated_candidate_sources(directory, connection, candidate):
+    """Validate the declared source set and retain legacy artifact-cutover fencing."""
+
+    from process.provider_directory_generic_source_policy import current_source_storage_binding
+
+    source_ref = directory._qt(directory._schema(), directory.ProviderDirectorySource.__tablename__)
+    expected_source_ids = tuple(sorted(set(candidate.source_ids)))
+    row_lock = "FOR NO KEY UPDATE OF source" if current_source_storage_binding() is None else ""
+    source_rows = await connection.all(
+        f"""
+        SELECT source.source_id
+          FROM {source_ref} AS source
+         WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
+         ORDER BY source.source_id
+         {row_lock};
+        """,
+        source_ids=list(expected_source_ids),
+    )
+    locked_source_ids = tuple(
+        source_id
+        for source_row in source_rows
+        if (
+            source_id := directory._clean_text(
+                directory._pagination_checkpoint_row_mapping(source_row).get("source_id")
+            )
+        )
+    )
+    if locked_source_ids != expected_source_ids:
+        raise RuntimeError("provider_directory_endpoint_dataset_source_changed")
+
+
+async def locked_endpoint_dataset_candidate_record(directory, connection, candidate):
+    """Serialize within the configured storage scope and return the mutable candidate row."""
+
+    endpoint_record = await lock_endpoint_dataset_candidate_admission(directory, connection, candidate.endpoint_id)
+    if endpoint_record is None:
+        raise RuntimeError("provider_directory_api_endpoint_missing_during_validation")
+    dataset_ref = directory._qt(directory._schema(), directory.ProviderDirectoryEndpointDataset.__tablename__)
+    candidate_record = await connection.first(
+        f"""
+        SELECT dataset_id, acquisition_root_run_id, is_current, status,
+               previous_dataset_id, completion_proof_required_version,
+               completion_proof_json, completion_proof_sha256,
+               publication_metadata_json
+          FROM {dataset_ref}
+         WHERE dataset_id = :dataset_id
+           AND endpoint_id = :endpoint_id
+         FOR UPDATE;
+        """,
+        dataset_id=candidate.dataset_id,
+        endpoint_id=candidate.endpoint_id,
+    )
+    if candidate_record is None:
+        raise RuntimeError("provider_directory_endpoint_dataset_candidate_missing")
+    return directory._pagination_checkpoint_row_mapping(candidate_record)

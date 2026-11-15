@@ -178,24 +178,19 @@ def _runtime_recipe() -> dict[str, str]:
 
 
 def _desired_doctors(fhir, doctors):
-    """Bind the prepared source evidence and all sealed heaps without granting native acceptance."""
+    """Bind complete source evidence and declared prepared names without physical metadata."""
     if doctors is None:
         return None
     source_dependencies._validate_doctors(fhir.db, fhir._schema(), doctors, doctors.relation_overrides)
-    if tuple(oid for oid, _filenode in doctors.sealed_filenodes) != tuple(
-        oid for _target, _stage, oid in doctors.stage_oids
-    ) or any(type(filenode) is not int or not 0 < filenode < 2**32 for _oid, filenode in doctors.sealed_filenodes):
-        raise RuntimeError("cms_address_doctors_physical_seal_required")
     return {
         "source_provenance": read_doctors_source_provenance(doctors.source_provenance_json),
         "source_provenance_sha256": doctors_source_provenance_digest(doctors.source_provenance_json),
-        "stage_oids": doctors.stage_oids,
-        "sealed_filenodes": doctors.sealed_filenodes,
+        "stage_relations": source_dependencies._doctors_preparation().prepared_stage_relations(doctors),
     }
 
 
 def _desired_geo_bindings(schema, native_input_fence, doctors, dependency_bindings):
-    """Keep the incumbent physical fence intact and substitute only the exact sealed source."""
+    """Keep the incumbent logical fence and substitute only the declared prepared source."""
     expected_by_name = source_dependencies._validate_bindings(
         schema,
         None,
@@ -203,16 +198,11 @@ def _desired_geo_bindings(schema, native_input_fence, doctors, dependency_bindin
         **({"tiger_captured": native_input_fence["tiger_captured"]} if "tiger_captured" in native_input_fence else {}),
     )
     if doctors is not None:
-        _target, stage, oid = doctors.stage_oids[0]
-        expected_by_name[f"{schema}.doctor_clinician_address"] = {
-            "schema_name": schema,
-            "table_name": stage,
-            "relation_oid": oid,
-            "relfilenode": dict(doctors.sealed_filenodes)[oid],
-        }
+        _target, stage = source_dependencies._doctors_preparation().prepared_stage_relations(doctors)[0]
+        expected_by_name[f"{schema}.doctor_clinician_address"] = {"schema_name": schema, "table_name": stage}
         if dependency_bindings is None:
             raise RuntimeError("cms_address_desired_geo_bindings_required")
-    supplied_by_name = validate_projection_dependency_bindings(
+    supplied_by_name = source_dependencies._named_bindings(
         schema, expected_by_name if dependency_bindings is None else dependency_bindings
     )
     if supplied_by_name != expected_by_name:
@@ -327,7 +317,12 @@ class CMSAddressPreparation:
     def source_relation_overrides(self) -> dict[str, str]:
         """Expose all three signed source inputs for full/Profile preparation."""
         desired = json.loads(self.input_json)["desired_doctors"]
-        return {} if desired is None else {target: stage for target, stage, _oid in desired["stage_oids"]}
+        if desired is None:
+            return {}
+        relations = desired.get("stage_relations")
+        if relations is None:
+            relations = tuple((target, stage) for target, stage, _old in desired["stage_oids"])
+        return dict(relations)
 
     def with_prepared_doctors(self, doctors, dependency_bindings) -> CMSAddressPreparation:
         """Bind independently prepared source inputs before the serving capacity plan is signed."""
@@ -438,7 +433,7 @@ class CMSAddressPreparation:
         try:
             self._assert_inputs(fence, admission)
             await self._assert_dependencies(expected, admission)
-            if tuple(sorted(table for table, _stage, _oid in prepared.stage_oids)) != self.native_targets:
+            if tuple(sorted(table for table, _stage in prepared.stage_relations)) != self.native_targets:
                 raise RuntimeError("cms_address_native_targets_changed")
             prepared.context["cms_native_address_input_json"] = self.input_json
             from process.provider_directory_generic_source_policy import is_source_storage_required
@@ -472,12 +467,11 @@ class CMSAddressPreparation:
 
 
 def _preparation_inputs(fence, overrides, overlay, dependencies, semantic_as_of):
-    if overlay is None or type(overlay.oid) is not int or overlay.oid <= 0:
+    if overlay is None or type(overlay.relation) is not str or not overlay.relation:
         raise RuntimeError("cms_address_staged_overlay_required")
     inputs = ProviderDirectoryAddressPreparationInput(
         _dataset_pins(fence),
         overlay.relation,
-        overlay.oid,
         dependencies["alias_generation"],
         tuple((name, overrides[name]) for name in sorted(_RELATION_OVERRIDES) if name in overrides),
         semantic_as_of=semantic_as_of,

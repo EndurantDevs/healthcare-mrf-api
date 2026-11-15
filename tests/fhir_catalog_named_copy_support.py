@@ -2,6 +2,7 @@
 """Native copied metadata and attached directory reads through the public API contract."""
 
 import json
+import os
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -152,8 +153,12 @@ async def _native_refusals(held, metadata, snapshot):
 async def assert_copied_fhir_view(held, monkeypatch):
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-catalog-control-token")
     monkeypatch.setattr(reader_context, "db", held.database)
-    async with asynccontextmanager(metadata_custody.__wrapped__)() as metadata:
+    reader_setting_by_name = {key: os.environ[key] for key in ("HLTHPRT_DB_READER_USER", "HLTHPRT_DB_READER_PASSWORD")}
+    async with asynccontextmanager(metadata_custody.__wrapped__)(monkeypatch) as metadata:
         snapshot = await _publish_metadata(held, metadata)
+        # Metadata preparation borrows its own Reader; API requests use the enrolled API Reader.
+        for key, setting_text in reader_setting_by_name.items():
+            monkeypatch.setenv(key, setting_text)
         before = await _response(held)
         assert before[0] == 200 and before[1]["total"] == 1
         assert before[1]["items"][0]["directory_available"] is True

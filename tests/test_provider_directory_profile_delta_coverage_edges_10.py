@@ -17,34 +17,6 @@ from tests.provider_directory_profile_delta_coverage_support import (
     pytest,
 )
 
-_REPLAY_GEOMETRY_FIELDS = (
-    "database_system_identifier",
-    "database_oid",
-    "database_name",
-    "tablespace_oid",
-    "tablespace_name",
-    "postgres_server_version_num",
-    "postgres_block_size_bytes",
-    "postgres_wal_block_size_bytes",
-    "postgres_wal_segment_size_bytes",
-    "postgres_full_page_writes",
-    "postgres_wal_compression",
-    "postgres_wal_level",
-    "postgres_wal_log_hints",
-    "postgres_data_checksums",
-    "postgres_default_toast_compression",
-    "postgres_checkpoint_timeout_seconds",
-    "postgres_max_wal_size_bytes",
-    "evidence_target_storage_fingerprint",
-    "profile_target_storage_fingerprint",
-    "build_checkpoint_oid",
-    "serving_generation_oid",
-    "delta_receipt_oid",
-    "build_checkpoint_storage_fingerprint",
-    "serving_generation_storage_fingerprint",
-    "delta_receipt_storage_fingerprint",
-)
-
 
 def _capacity_build():
     return SimpleNamespace(
@@ -115,9 +87,7 @@ def test_capacity_build_execution_digest_edge(monkeypatch):
         matching=True,
     )
     token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
-        SimpleNamespace(
-            attestation=SimpleNamespace(profile_input_digest="wrong")
-        )
+        SimpleNamespace(attestation=SimpleNamespace(profile_input_digest="wrong"))
     )
     try:
         with pytest.raises(
@@ -140,11 +110,7 @@ def test_capacity_build_geometry_edge(monkeypatch):
         matching=True,
     )
     token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
-        SimpleNamespace(
-            attestation=SimpleNamespace(
-                profile_input_digest=geometry.profile_input_digest
-            )
-        )
+        SimpleNamespace(attestation=SimpleNamespace(profile_input_digest=geometry.profile_input_digest))
     )
     monkeypatch.setattr(
         importer,
@@ -183,9 +149,7 @@ def test_replay_owner_cutover_and_json_edges(monkeypatch):
         importer.ProviderDirectoryArtifactBuildStale,
         match="owner_invalid",
     ):
-        importer._profile_replay_owner_run_id(
-            {"cutover_forecast_json": "{"}
-        )
+        importer._profile_replay_owner_run_id({"cutover_forecast_json": "{"})
 
 
 def test_replay_owner_mapping_and_success_edges(monkeypatch):
@@ -198,17 +162,12 @@ def test_replay_owner_mapping_and_success_edges(monkeypatch):
         importer.ProviderDirectoryArtifactBuildStale,
         match="owner_invalid",
     ):
-        importer._profile_replay_owner_run_id(
-            {"cutover_forecast_json": {}}
-        )
+        importer._profile_replay_owner_run_id({"cutover_forecast_json": {}})
     owner_run_id = "run_" + "1" * 32
-    assert importer._profile_replay_owner_run_id(
-        {
-            "cutover_forecast_json": json.dumps(
-                {"run_id": owner_run_id}
-            )
-        }
-    ) == owner_run_id
+    assert (
+        importer._profile_replay_owner_run_id({"cutover_forecast_json": json.dumps({"run_id": owner_run_id})})
+        == owner_run_id
+    )
 
 
 @pytest.mark.asyncio
@@ -231,16 +190,10 @@ async def test_replay_source_context_scope_edges(monkeypatch):
         importer.ProviderDirectoryArtifactBuildStale,
         match="source_scope_changed",
     ):
-        await importer._provider_directory_profile_replay_source_context(
-            execution
-        )
+        await importer._provider_directory_profile_replay_source_context(execution)
     source_id = execution.attestation.pairs[0]["source_id"]
     scope.return_value = ([source_id], [source_id], (context,))
-    source_vector, context_vector = (
-        await importer._provider_directory_profile_replay_source_context(
-            execution
-        )
-    )
+    source_vector, context_vector = await importer._provider_directory_profile_replay_source_context(execution)
     assert source_vector[0][0] == source_id
     assert context_vector[0][0] == "source-a"
 
@@ -266,37 +219,13 @@ def test_replay_serving_values_missing_cutover_edge(monkeypatch):
 @pytest.mark.asyncio
 async def test_replay_database_matching_and_changed_edges(monkeypatch):
     geometry = _wal_tracker_admission().geometry
-    identity_by_field = {
-        field_name: getattr(geometry, field_name)
-        for field_name in _REPLAY_GEOMETRY_FIELDS
-    }
-    resolver = AsyncMock(return_value=SimpleNamespace(**identity_by_field))
-    monkeypatch.setattr(
-        importer, "_provider_directory_profile_capacity_database_identity", resolver
-    )
-    tablespaces = Mock()
-    monkeypatch.setattr(
-        importer, "_assert_provider_directory_profile_capacity_tablespaces", tablespaces
-    )
-    await importer._assert_replay_database(
-        "mrf",
-        object(),
-        geometry,
-        object(),
-    )
-    resolver.return_value = SimpleNamespace(
-        **(identity_by_field | {"database_oid": -1})
-    )
-    with pytest.raises(
-        importer.ProviderDirectoryArtifactBuildStale,
-        match="database_changed",
-    ):
-        await importer._assert_replay_database(
-            "mrf",
-            object(),
-            geometry,
-            object(),
-        )
+    relation_by_role = {role: dict(row) for role, row in geometry.relations.items()}
+    resolver = AsyncMock(return_value=SimpleNamespace(relations=relation_by_role))
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_database_identity", resolver)
+    await importer._assert_replay_database("fixture", object(), geometry, object())
+    relation_by_role["profile_target"]["name"] = "other_profile"
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="replay_target_changed"):
+        await importer._assert_replay_database("fixture", object(), geometry, object())
 
 
 def test_replay_timeline_invalid_edge():
@@ -321,6 +250,11 @@ def test_replay_timeline_invalid_edge():
 
 
 def _patch_committed_replay_dependencies(monkeypatch, receipt):
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_capacity_database_identity",
+        AsyncMock(return_value=SimpleNamespace(relations={})),
+    )
     monkeypatch.setattr(importer, "_replay_control_run", AsyncMock())
     monkeypatch.setattr(
         importer,
@@ -338,13 +272,16 @@ def _patch_committed_replay_dependencies(monkeypatch, receipt):
 async def test_committed_replay_none_and_current_conflict_edges(monkeypatch):
     execution = _execution()
     _patch_committed_replay_dependencies(monkeypatch, None)
-    assert await importer._committed_replay_result(
-        "mrf",
-        "consumption",
-        "run_" + "1" * 32,
-        execution,
-        object(),
-    ) is None
+    assert (
+        await importer._committed_replay_result(
+            "mrf",
+            "consumption",
+            "run_" + "1" * 32,
+            execution,
+            object(),
+        )
+        is None
+    )
     importer._replay_exact_receipt.return_value = {"build_id": "build"}
     importer._replay_current_consumption.return_value = {}
     monkeypatch.setattr(
@@ -384,7 +321,7 @@ async def test_committed_replay_pointer_and_success_edges(monkeypatch):
     monkeypatch.setattr(
         importer,
         "_replay_capacity_artifacts",
-        lambda *_args: (object(), object()),
+        lambda *_args, **_kwargs: (object(), object()),
     )
     monkeypatch.setattr(
         importer,
@@ -437,13 +374,11 @@ async def test_committed_run_replay_valid_path_edge(monkeypatch):
     replay = AsyncMock(return_value={"incremental": True})
     monkeypatch.setattr(importer, "_committed_replay_result", replay)
     run_id = "run_" + "1" * 32
-    result_by_field = (
-        await importer._provider_directory_profile_committed_run_replay(
-            run_id=run_id,
-            control_run_id=run_id,
-            execution=_execution(),
-            fence=object(),
-        )
+    result_by_field = await importer._provider_directory_profile_committed_run_replay(
+        run_id=run_id,
+        control_run_id=run_id,
+        execution=_execution(),
+        fence=object(),
     )
     assert result_by_field["incremental"] is True
 
@@ -452,14 +387,11 @@ def test_profile_build_admission_identity_and_target_edges(monkeypatch):
     identity = SimpleNamespace(
         materialization_mode="source_delta",
         serving_state=SimpleNamespace(
-            evidence_target_oid=11,
-            profile_target_oid=12,
+            targets=importer._provider_directory_profile_target_coordinates("mrf"),
         ),
     )
     admission = _wal_tracker_admission()
-    token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
-        admission
-    )
+    token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(admission)
     try:
         with pytest.raises(
             importer.ProviderDirectoryArtifactBuildStale,
@@ -469,6 +401,7 @@ def test_profile_build_admission_identity_and_target_edges(monkeypatch):
                 identity,
                 SimpleNamespace(target_oid=11),
                 SimpleNamespace(target_oid=12),
+                schema="mrf",
             )
     finally:
         importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(token)
@@ -480,4 +413,5 @@ def test_profile_build_admission_identity_and_target_edges(monkeypatch):
             identity,
             SimpleNamespace(target_oid=99),
             SimpleNamespace(target_oid=12),
+            schema="other_schema",
         )

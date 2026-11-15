@@ -11,9 +11,6 @@ from db.connection import Database
 from process.provider_directory_dataset_scoped_publication import (
     exact_uhc_dataset_pair,
 )
-from process.uhc_flex_practitioner_registration import (
-    uhc_flex_practitioner_endpoint_identity,
-)
 from process.provider_directory_rooted_graph_contract import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_PLAN_NET_NETWORK_EXTENSION_URLS,
 )
@@ -27,8 +24,10 @@ from process.provider_directory_rooted_graph_source_contract import (
 from process.provider_directory_rooted_graph_store_contract import (
     build_provider_directory_rooted_graph_acquisition_identity,
 )
+from process.uhc_flex_practitioner_registration import (
+    uhc_flex_practitioner_endpoint_identity,
+)
 from tests.formulary_fhir_twin_admission_pg_support import quoted
-
 
 ENDPOINT_ID = "a" * 64
 ENDPOINT_SIGNATURE = "b" * 64
@@ -346,10 +345,10 @@ def acquisition_identity(
 async def work_rows(database: Database, acquisition_id: str):
     """Return the deterministic initial work census for one acquisition."""
 
-    schema = quoted(os.environ["HLTHPRT_DB_SCHEMA"])
+    from process.provider_directory_rooted_graph_store_support import table_ref
+
     return await database.all(
-        f"SELECT query_id, kind FROM {schema}.{WORK_TABLE} "
-        "WHERE acquisition_id = :acquisition_id ORDER BY kind",
+        f"SELECT query_id, kind FROM {table_ref(WORK_TABLE)} WHERE acquisition_id = :acquisition_id ORDER BY kind",
         acquisition_id=acquisition_id,
     )
 
@@ -358,9 +357,7 @@ async def expire_claim(connection, schema_name: str, acquisition_id: str) -> Non
     """Simulate elapsed wall time without weakening the production trigger."""
 
     schema = quoted(schema_name)
-    await connection.execute(
-        f"ALTER TABLE {schema}.{WORK_TABLE} DISABLE TRIGGER {WORK_TRIGGER}"
-    )
+    await connection.execute(f"ALTER TABLE {schema}.{WORK_TABLE} DISABLE TRIGGER {WORK_TRIGGER}")
     try:
         await connection.execute(
             f"UPDATE {schema}.{WORK_TABLE} SET lease_expires_at = "
@@ -369,9 +366,7 @@ async def expire_claim(connection, schema_name: str, acquisition_id: str) -> Non
             acquisition_id,
         )
     finally:
-        await connection.execute(
-            f"ALTER TABLE {schema}.{WORK_TABLE} ENABLE ALWAYS TRIGGER {WORK_TRIGGER}"
-        )
+        await connection.execute(f"ALTER TABLE {schema}.{WORK_TABLE} ENABLE ALWAYS TRIGGER {WORK_TRIGGER}")
 
 
 def resources_for_kind(kind: str):
@@ -399,11 +394,7 @@ def resources_for_kind(kind: str):
             "endpoint": [{"reference": "Endpoint/endpoint.synthetic-missing"}],
             "extension": [
                 {
-                    "url": (
-                        PROVIDER_DIRECTORY_ROOTED_GRAPH_PLAN_NET_NETWORK_EXTENSION_URLS[
-                            0
-                        ]
-                    ),
+                    "url": (PROVIDER_DIRECTORY_ROOTED_GRAPH_PLAN_NET_NETWORK_EXTENSION_URLS[0]),
                     "valueReference": {"reference": "Organization/org.synthetic-1"},
                 }
             ],

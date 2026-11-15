@@ -479,9 +479,6 @@ def _verified_profile_capacity_lease(envelope, *, require_fresh_observation):
         now=datetime.now(UTC),
         require_fresh_observation=require_fresh_observation,
         expected_capacity_geometry_hash=body.get("capacity_geometry_hash") if isinstance(body, dict) else None,
-        expected_database_system_identifier=trust.database_system_identifier,
-        expected_database_oid=trust.database_oid,
-        expected_database_name=trust.database_name,
     )
 
 

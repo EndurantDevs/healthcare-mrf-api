@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-
 import json
 import types
 from copy import deepcopy
@@ -14,6 +13,7 @@ from sanic.exceptions import InvalidUsage
 
 from api.endpoint import npi as npi_module
 from api.network_address_scope import network_address_read_scope
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests.provider_profile_snapshot_test_support import (
     stub_provider_profile_snapshot as stub_provider_profile_snapshot,
@@ -557,7 +557,14 @@ async def test_internal_detail_scoped_write_options_refuse_before_loading(monkey
     monkeypatch.setattr(npi_module, "run_as_writer", writer)
     candidate_id = "11111111-1111-4111-8111-111111111111"
     manifest = PinnedNetworkServingManifest(
-        9, candidate_id, "network_candidate_" + candidate_id.replace("-", ""), 1, {}, 4, "a" * 64, 123
+        9,
+        candidate_id,
+        "network_candidate_" + candidate_id.replace("-", ""),
+        1,
+        {},
+        4,
+        "a" * 64,
+        CompactAddressRelation("network_candidate_" + candidate_id.replace("-", ""), "entity_address_unified"),
     )
     request = _real_detail_request({write_option: "false"})
     with network_address_read_scope(manifest, (7,)):

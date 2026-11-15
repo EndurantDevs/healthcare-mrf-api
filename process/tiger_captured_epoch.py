@@ -40,82 +40,39 @@ _GRAPH_SQL = """
         WITH RECURSIVE graph(oid) AS (
           SELECT unnest(ARRAY['tiger.zip_state'::regclass::oid,'tiger.zcta5'::regclass::oid])
           UNION SELECT inheritance.inhrelid FROM pg_catalog.pg_inherits inheritance JOIN graph ON graph.oid=inheritance.inhparent
-        ) SELECT c.oid::bigint AS relation_oid,n.nspname AS schema_name,c.relname AS table_name,
-          c.relowner::bigint AS owner_oid,pg_relation_filenode(c.oid)::bigint AS relfilenode,
+        ) SELECT n.nspname AS schema_name,c.relname AS table_name,
           c.relkind::text,c.relpersistence::text,c.relispartition,c.relrowsecurity,c.relforcerowsecurity,
-          EXISTS(SELECT 1 FROM pg_catalog.pg_locks l WHERE l.pid=pg_backend_pid()
-            AND l.locktype='relation' AND l.relation=c.oid AND l.granted
-            AND l.mode IN ('ShareLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock')) AS writer_fenced,
-          (SELECT jsonb_agg(jsonb_build_array(a.attnum,a.attname,a.atttypid,a.atttypmod,a.attnotnull,
-            a.attcollation,a.attisdropped,a.attgenerated,a.attidentity) ORDER BY a.attnum)
-            FROM pg_catalog.pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0) AS attributes,
-          ARRAY(SELECT i.inhparent::bigint FROM pg_catalog.pg_inherits i WHERE i.inhrelid=c.oid ORDER BY i.inhparent) AS parents,
-          ARRAY(SELECT e.extname||':'||e.extversion FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_extension e
+          (SELECT jsonb_agg(jsonb_build_array(a.attnum,a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,
+            cn.nspname,co.collname,a.attisdropped,a.attgenerated,a.attidentity) ORDER BY a.attnum)
+            FROM pg_catalog.pg_attribute a LEFT JOIN pg_collation co ON co.oid=a.attcollation
+            LEFT JOIN pg_namespace cn ON cn.oid=co.collnamespace
+            WHERE a.attrelid=c.oid AND a.attnum>0) AS attributes,
+          COALESCE((SELECT jsonb_agg(jsonb_build_array(pn.nspname,p.relname) ORDER BY pn.nspname,p.relname)
+            FROM pg_inherits i JOIN pg_class p ON p.oid=i.inhparent JOIN pg_namespace pn ON pn.oid=p.relnamespace
+            WHERE i.inhrelid=c.oid),'[]'::jsonb) AS parents,
+          ARRAY(SELECT e.extname FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_extension e
             ON d.refclassid='pg_extension'::regclass AND d.refobjid=e.oid
             WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.objsubid=0 AND d.deptype='e'
             ORDER BY e.extname) AS extensions
         FROM graph JOIN pg_catalog.pg_class c ON c.oid=graph.oid
-        JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace ORDER BY c.oid
+        JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace ORDER BY n.nspname,c.relname
     """
 
 
 async def read_locked_tiger_graph(session):
-    """Read complete parent/child identity only after the recursive SHARE fence."""
-    catalog_rows = (await session.execute(text(_GRAPH_SQL))).mappings().all()
-    oids = {catalog_row["relation_oid"] for catalog_row in catalog_rows}
-    roots = {
-        catalog_row["table_name"]
-        for catalog_row in catalog_rows
-        if catalog_row["schema_name"] == "tiger" and not catalog_row["parents"]
-    }
-    if (
-        not 2 <= len(catalog_rows) <= 4096
-        or roots != {"zip_state", "zcta5"}
-        or any(
-            catalog_row["relkind"] != "r"
-            or catalog_row["relpersistence"] != "p"
-            or catalog_row["relispartition"]
-            or catalog_row["relrowsecurity"]
-            or catalog_row["relforcerowsecurity"]
-            or not catalog_row["writer_fenced"]
-            or not set(catalog_row["parents"]) <= oids
-            for catalog_row in catalog_rows
-        )
-    ):
-        raise archive.ReferenceFamilyArchiveError("TIGER source graph is not a closed persistent heap family")
-    for root in (catalog_row for catalog_row in catalog_rows if not catalog_row["parents"]):
-        if not any(extension.startswith("postgis_tiger_geocoder:") for extension in root["extensions"]):
-            raise archive.ReferenceFamilyArchiveError("TIGER capture requires genuine geocoder roots")
-    return {
-        "contract": GRAPH_CONTRACT,
-        "database_oid": await session.scalar(
-            text("SELECT oid::bigint FROM pg_catalog.pg_database WHERE datname=current_database()")
-        ),
-        "relations": [dict(catalog_row) for catalog_row in catalog_rows],
-    }
+    """Read the complete named graph after the caller's recursive SHARE locks."""
+    rows = (await session.execute(text(_GRAPH_SQL))).mappings().all()
+    _snapshot_graph(rows, pinned=True)
+    return {"contract": GRAPH_CONTRACT, "relations": [dict(row) for row in rows]}
 
 
-async def has_attested_inherited_tiger_source_capture(session, *, owner_oid):
-    """Attest the existing source fence; protected or empty targets use target admission."""
+async def has_attested_inherited_tiger_source_capture(session, *, owner_oid=None):
+    """Use actual native locks and reads; no role or catalog identity is attested."""
     archive._require_transaction(session)
     async with archive._bounded_capture(session):
         await archive._lock_family(session, "tiger", archive.reference_family_spec("tiger").table_names, "SHARE")
         graph = await read_locked_tiger_graph(session)
-        relations = graph["relations"]
-        if len(relations) <= 2 or any(relation["owner_oid"] == owner_oid for relation in relations):
-            return False
-        roots = [relation["relation_oid"] for relation in relations if not relation["parents"]]
-        capable = await session.scalar(
-            text("""SELECT bool_and(has_table_privilege(current_user,oid,'SELECT')
-                AND has_table_privilege(current_user,oid,'MAINTAIN')
-                AND NOT has_table_privilege(current_user,oid,'INSERT,UPDATE,DELETE,TRUNCATE')
-                AND NOT has_any_column_privilege(current_user,oid,'INSERT,UPDATE'))
-                FROM unnest(CAST(:oids AS oid[])) AS roots(oid)"""),
-            {"oids": roots},
-        )
-        if capable is not True:
-            raise archive.ReferenceFamilyArchiveError("TIGER source capture fence privilege is unavailable")
-        return True
+        return len(graph["relations"]) > 2
 
 
 async def prepare_captured_tiger_epoch(
@@ -192,9 +149,6 @@ async def _clone_captured_model(
     source_copy = source_options.get("source_copy")
     stage_schema = archive.reference_family_stage_schema(epoch_id)
     async with publisher_sessions() as session, session.begin():
-        publisher_url = session.get_bind().url
-        if any(getattr(source_url, field) != getattr(publisher_url, field) for field in ("host", "port", "database")):
-            raise archive.ReferenceFamilyArchiveError("TIGER capture source and publisher databases differ")
         await archive._clone_source(
             session,
             capture,
@@ -232,78 +186,66 @@ async def _clone_captured_model(
         return prepared
 
 
-_SNAPSHOT_GRAPH_SQL = _GRAPH_SQL.replace(
-    "('ShareLock','ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock')", "('AccessShareLock')"
-).replace("AS writer_fenced", "AS read_pinned")
+_SNAPSHOT_GRAPH_SQL = _GRAPH_SQL
 
 
 def _snapshot_graph(catalog_rows, *, pinned):
-    """A finite native graph is distinct from the legacy writer-fenced graph."""
+    """A finite named graph must be closed, reachable and have unambiguous model membership."""
     if not 2 <= len(catalog_rows) <= 4096:
         raise archive.ReferenceFamilyArchiveError("TIGER snapshot graph is unbounded")
-    relations_by_oid = {catalog_row["relation_oid"]: dict(catalog_row) for catalog_row in catalog_rows}
-    if len(relations_by_oid) != len(catalog_rows):
-        raise archive.ReferenceFamilyArchiveError("TIGER snapshot graph repeats a relation")
-    for catalog_row in catalog_rows:
-        if (
-            catalog_row["relkind"] != "r"
-            or catalog_row["relpersistence"] != "p"
-            or catalog_row["relispartition"]
-            or catalog_row["relrowsecurity"]
-            or catalog_row["relforcerowsecurity"]
-            or not set(catalog_row["parents"]) <= relations_by_oid.keys()
-            or any(
-                type(catalog_row[key]) is not int or not 0 < catalog_row[key] < 2**32
-                for key in ("relation_oid", "owner_oid", "relfilenode")
-            )
-            or (pinned and catalog_row["read_pinned"] is not True)
-        ):
-            raise archive.ReferenceFamilyArchiveError("TIGER snapshot graph is not a closed read-pinned heap family")
-        archive._quoted(catalog_row["schema_name"])
-        archive._quoted(catalog_row["table_name"])
-    roots_by_name = {
-        catalog_row["table_name"]: catalog_row for catalog_row in catalog_rows if not catalog_row["parents"]
+    by_name = {
+        (relation_record["schema_name"], relation_record["table_name"]): dict(relation_record)
+        for relation_record in catalog_rows
     }
-    if set(roots_by_name) != {"zip_state", "zcta5"} or any(
-        catalog_row["schema_name"] != "tiger"
-        or not any(extension.startswith("postgis_tiger_geocoder:") for extension in catalog_row["extensions"])
-        for catalog_row in roots_by_name.values()
-    ):
-        raise archive.ReferenceFamilyArchiveError("TIGER snapshot requires genuine geocoder roots_by_name")
-    projection = _snapshot_projection(relations_by_oid, roots_by_name)
-    return relations_by_oid, projection
-
-
-def _snapshot_projection(relations_by_oid, roots_by_name):
-    projection, all_oids = [], set()
-    for table in ("zip_state", "zcta5"):
-        root = roots_by_name[table]
-        oids = {root["relation_oid"]}
-        while True:
-            expanded = oids | {
-                oid for oid, catalog_row in relations_by_oid.items() if set(catalog_row["parents"]) & oids
-            }
-            if expanded == oids:
-                break
-            oids = expanded
-        if oids & all_oids or any(relations_by_oid[oid]["attributes"] != root["attributes"] for oid in oids):
-            raise archive.ReferenceFamilyArchiveError("TIGER snapshot has ambiguous model membership")
-        all_oids.update(oids)
-        projection.append(
-            (
-                table,
-                tuple(
-                    (
-                        relations_by_oid[oid]["schema_name"],
-                        relations_by_oid[oid]["table_name"],
-                        oid,
-                        relations_by_oid[oid]["relfilenode"],
-                    )
-                    for oid in sorted(oids)
-                ),
-            )
+    if len(by_name) != len(catalog_rows):
+        raise archive.ReferenceFamilyArchiveError("TIGER snapshot graph repeats a relation")
+    for relation_record in catalog_rows:
+        parents = {tuple(pair) for pair in relation_record["parents"]}
+        if (
+            relation_record["relkind"] != "r"
+            or relation_record["relpersistence"] != "p"
+            or relation_record["relispartition"]
+            or relation_record["relrowsecurity"]
+            or relation_record["relforcerowsecurity"]
+            or not parents <= by_name.keys()
+        ):
+            raise archive.ReferenceFamilyArchiveError("TIGER source graph is not a closed persistent heap family")
+        archive._quoted(relation_record["schema_name"])
+        archive._quoted(relation_record["table_name"])
+    roots_by_table = {
+        relation_record["table_name"]: relation_record
+        for relation_record in catalog_rows
+        if not relation_record["parents"]
+    }
+    if (
+        len([relation_record for relation_record in catalog_rows if not relation_record["parents"]]) != 2
+        or set(roots_by_table) != {"zip_state", "zcta5"}
+        or any(
+            relation_record["schema_name"] != "tiger" or "postgis_tiger_geocoder" not in relation_record["extensions"]
+            for relation_record in roots_by_table.values()
         )
-    if all_oids != relations_by_oid.keys():
+    ):
+        raise archive.ReferenceFamilyArchiveError("TIGER snapshot requires genuine geocoder roots")
+    return by_name, _snapshot_projection(by_name, roots_by_table)
+
+
+def _snapshot_projection(by_name, roots):
+    projection, all_names = [], set()
+    for table in ("zip_state", "zcta5"):
+        root = roots[table]
+        names = {("tiger", table)}
+        while True:
+            expanded = names | {
+                name for name, row in by_name.items() if {tuple(pair) for pair in row["parents"]} & names
+            }
+            if expanded == names:
+                break
+            names = expanded
+        if names & all_names or any(by_name[name]["attributes"] != root["attributes"] for name in names):
+            raise archive.ReferenceFamilyArchiveError("TIGER snapshot has ambiguous model membership")
+        all_names.update(names)
+        projection.append((table, tuple(sorted(names))))
+    if all_names != by_name.keys():
         raise archive.ReferenceFamilyArchiveError("TIGER snapshot graph contains unreachable relations")
     return tuple(projection)
 
@@ -326,20 +268,15 @@ async def _pin_snapshot_graph(session, discovered):
     )
     await session.execute(text(f"LOCK TABLE {physical} IN ACCESS SHARE MODE NOWAIT"))
     catalog_rows = (await session.execute(text(_SNAPSHOT_GRAPH_SQL))).mappings().all()
-    relation_by_oid, projection = _snapshot_graph(catalog_rows, pinned=True)
+    _by_name, projection = _snapshot_graph(catalog_rows, pinned=True)
     comparable = lambda rows: [{key: item for key, item in row.items() if key != "read_pinned"} for row in rows]
     if comparable(discovered) != comparable(catalog_rows):
         raise archive.ReferenceFamilyArchiveError("TIGER snapshot graph changed before read locks")
-    oids = sorted(relation_by_oid)
-    capable = await _snapshot_read_capability(session, oids)
-    if capable is not True:
-        raise archive.ReferenceFamilyArchiveError("TIGER snapshot requires a read-only source principal")
-    return dict(
-        contract=SNAPSHOT_GRAPH_CONTRACT,
-        database_oid=await session.scalar(text("SELECT oid::bigint FROM pg_database WHERE datname=current_database()")),
-        relations=[dict(row) for row in catalog_rows],
-        projection_oids={name: [physical[2] for physical in relations] for name, relations in projection},
-    ), projection
+    return {
+        "contract": SNAPSHOT_GRAPH_CONTRACT,
+        "relations": [dict(row) for row in catalog_rows],
+        "projection": {name: [list(pair) for pair in relations] for name, relations in projection},
+    }, projection
 
 
 async def prepare_snapshot_tiger_epoch(
@@ -395,27 +332,10 @@ async def prepare_snapshot_tiger_epoch(
             )
 
 
-async def _snapshot_read_capability(session, oids):
-    return await session.scalar(
-        text("""SELECT bool_and(
-        has_schema_privilege(current_user,n.oid,'USAGE') AND has_table_privilege(current_user,c.oid,'SELECT')
-        AND NOT pg_has_role(current_user,c.relowner,'USAGE')
-        AND NOT has_table_privilege(current_user,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE')
-        AND NOT has_any_column_privilege(current_user,c.oid,'INSERT,UPDATE'))
-        FROM unnest(CAST(:oids AS oid[])) roots(oid) JOIN pg_class c ON c.oid=roots.oid
-        JOIN pg_namespace n ON n.oid=c.relnamespace"""),
-        {"oids": oids},
-    )
-
-
-async def can_prepare_snapshot_tiger_epoch(session, *, owner_oid):
-    """Capability preflight only; no held snapshot or protected epoch is admitted."""
+async def can_prepare_snapshot_tiger_epoch(session, *, owner_oid=None):
+    """Validate bounded model shape; native SELECT and COPY enforce source access."""
     archive._require_transaction(session)
     async with archive._bounded_capture(session):
         rows = (await session.execute(text(_SNAPSHOT_GRAPH_SQL))).mappings().all()
-        by_oid, _ = _snapshot_graph(rows, pinned=False)
-        if len(rows) <= 2 or any(row["owner_oid"] == owner_oid for row in rows):
-            return False
-        if await _snapshot_read_capability(session, sorted(by_oid)) is not True:
-            raise archive.ReferenceFamilyArchiveError("TIGER snapshot read capability is unavailable")
-        return True
+        _snapshot_graph(rows, pinned=False)
+        return len(rows) > 2

@@ -469,7 +469,7 @@ def test_public_test_matrices_preserve_independent_database_shards():
                 rows, key=lambda row: row["shard"]
             )
         else:
-            assert job["strategy"] == {"fail-fast": job_id == "python-tests", "matrix": {"include": rows}}
+            assert job["strategy"] == {"fail-fast": False, "matrix": {"include": rows}}
         assert job["env"]["CI_SHARD"] == "${{ matrix.shard }}"
         stage = next(step for step in job["steps"] if step.get("name") == "Run complete validation stage")
         mode = "python-main" if job_id == "python-tests" else "postgres"

@@ -103,7 +103,7 @@ def _preparation_observations():
     }
     columns = _local_catalog_columns()
     objects = [
-        {"kind": "relation", "oid": oid, "name": name, "owner": physical.owner_oid, "definition": "r:p:1:0"}
+        {"kind": "relation", "oid": oid, "name": name, "owner": 102, "definition": "r:p:1:0"}
         for name, oid in ownership.relation_oids
     ]
     protected["catalog_sha256"] = native._local_catalog_digest(ownership, objects, columns)
@@ -154,7 +154,7 @@ def _preparation_session(monkeypatch, observed):
         if sql.startswith("LOCK TABLE"):
             return _query_result()
         if "c.relowner::bigint AS owner_oid" in sql:
-            return _query_result([{"owner_oid": observed.physical.owner_oid, "protected": True}])
+            return _query_result([{"owner_oid": 102, "protected": True}])
         if sql.startswith("SELECT * FROM hp_snapshot_retention.reference_preparation"):
             return _query_result([observed.header])
         if sql.startswith("SELECT ordinal,table_name"):
@@ -268,9 +268,7 @@ async def test_prepared_header_rejects_unbound_inventory_before_any_heap_lock(mo
         observed.header["inventory_sha256"] = observed.header["validation"]["inventory_sha256"] = "0" * 64
         observed.header["validation_sha256"] = native._native_metadata_digest(observed.header["validation"])
     with pytest.raises(native.PTG2PhysicalBindingError, match="preparation is unavailable|protected inventory"):
-        await native._prepared_local_header(
-            session, observed.physical.snapshot_id, owner_oid=observed.physical.owner_oid
-        )
+        await native._prepared_local_header(session, observed.physical.snapshot_id, owner_oid=102)
     assert not any(str(call.args[0]).startswith("LOCK TABLE") for call in session.execute.await_args_list)
 
 
@@ -283,14 +281,16 @@ def test_prepared_descriptor_cannot_relabel_or_truncate_a_family(fault):
         "extra": ("extra", True),
         "uuid": ("dataset_id", "invalid"),
         "importer": ("importer_id", "nucc"),
-        "schema": ("schema_name", "other"),
+        "schema": ("schema_name", "invalid.schema"),
         "relations": ("relation_oids", ownership["relation_oids"][:-1]),
         "sequence": ("sequence_oids", ()),
     }
     field, value = mutations_by_fault[fault]
     ownership[field] = value
-    with pytest.raises(native.PTG2PhysicalBindingError, match="descriptor differs|sequence inventory differs"):
-        native._prepared_local_binding(evidence, physical.snapshot_id, physical.owner_oid)
+    with pytest.raises(
+        native.PTG2PhysicalBindingError, match="descriptor differs|sequence inventory differs|schema is invalid"
+    ):
+        native._prepared_local_binding(evidence, physical.snapshot_id, 102)
 
 
 @pytest.mark.asyncio
@@ -328,36 +328,31 @@ async def test_driver_custody_refuses_no_transaction_or_missing_catalog_row(in_t
 @pytest.mark.asyncio
 @pytest.mark.parametrize("in_transaction", (False, True))
 async def test_published_control_refuses_missing_transaction_or_actual_control(monkeypatch, in_transaction):
-    physical, _candidate, evidence, publication = _published_control_fixture()
-    ownership = _ownership(physical)
-    observed = _preparation_observations()
-    evidence["catalog_sha256"] = native._local_catalog_digest(ownership, observed.objects, observed.columns)
+    _physical, _candidate, evidence, publication = _published_control_fixture()
     connection = SimpleNamespace(
         is_in_transaction=lambda: in_transaction,
-        fetchrow=AsyncMock(side_effect=[{"object_count": 43, "closed": True}, None]),
-        fetch=AsyncMock(side_effect=[observed.objects, observed.columns]),
+        fetchrow=AsyncMock(return_value=None),
+        fetch=AsyncMock(),
     )
     with pytest.raises(native.PTG2PhysicalBindingError, match="requires a transaction|control is unavailable"):
         await native.require_local_published_control(connection, evidence=evidence, publication=publication)
-    assert connection.fetchrow.await_count == 2 * int(in_transaction)
-    assert connection.fetch.await_count == 2 * int(in_transaction)
+    assert connection.fetchrow.await_count == int(in_transaction)
+    connection.fetch.assert_not_awaited()
 
 
-@pytest.mark.parametrize("fault", ("contract", "extra", "payload-key", "schema-oid", "dataset"))
+@pytest.mark.parametrize("fault", ("contract", "extra", "payload-key", "schema-name", "dataset"))
 def test_publication_binding_rejects_valid_shape_with_different_physical_custody(fault):
     _physical, _candidate, evidence, publication = _published_control_fixture()
     changes_by_fault = {
         "contract": ("contract", "other"),
         "extra": ("extra", True),
         "payload-key": ("payload_snapshot_key", 20),
-        "schema-oid": ("schema_oid", 103),
+        "schema-name": ("schema_name", "other_snapshot"),
         "dataset": ("dataset_id", str(UUID(int=2))),
     }
     field, value = changes_by_fault[fault]
     publication[field] = value
-    with pytest.raises(
-        native.PTG2PhysicalBindingError, match="publication receipt differs|published inventory differs"
-    ):
+    with pytest.raises(native.PTG2PhysicalBindingError, match="publication fields differ|logical publication differs"):
         native._local_publication_binding(evidence, publication)
 
 
@@ -402,23 +397,6 @@ async def test_audit_selector_never_chooses_ambiguous_or_foreign_local_authority
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("safe", (False, None, 1))
-async def test_read_view_cannot_promote_owner_membership_or_schema_create(monkeypatch, safe):
-    session = SimpleNamespace(
-        in_transaction=lambda: True,
-        execute=AsyncMock(return_value=_query_result([{"owner_oid": 102, "protected": True}])),
-        scalar=AsyncMock(return_value=safe),
-    )
-    with pytest.raises(native.PTG2PhysicalBindingError, match="reader privileges differ"):
-        await native.require_local_physical_read_view(session, is_prepared=False)
-    assert session.execute.await_count == 3
-    assert not any(str(call.args[0]).startswith("LOCK") for call in session.execute.await_args_list)
-    assert "'MEMBER'" in str(session.scalar.await_args.args[0])
-    assert "publication_sha256" in native._local_read_view_columns(False)
-    assert "publication_sha256" not in native._local_read_view_columns(True)
-
-
-@pytest.mark.asyncio
 async def test_local_family_wrappers_keep_identity_and_restrictive_cleanup(monkeypatch):
     ownership = _ownership(_binding())
     _observe_family(monkeypatch, ownership)
@@ -434,7 +412,8 @@ async def test_local_family_wrappers_keep_identity_and_restrictive_cleanup(monke
     session.execute.reset_mock()
     await native.cleanup_local_data_family(session, ownership)
     statements = [str(call.args[0]) for call in session.execute.await_args_list]
-    assert "ACCESS EXCLUSIVE MODE NOWAIT" in statements[0]
+    assert statements[0] == "SET LOCAL lock_timeout='1s'"
+    assert not any(statement.startswith("LOCK TABLE") for statement in statements)
     assert statements[1].endswith(" RESTRICT") and "CASCADE" not in "\n".join(statements)
     assert statements[2] == f'DROP SCHEMA "{ownership.schema_name}"'
 
@@ -511,7 +490,8 @@ def _canonical_observations():
         relation=relation_by_field,
         receipt=receipt_by_field,
         publisher_oid=45,
-        is_custody_closed=True,
+        is_execution_layout_valid=True,
+        is_heap_plain=True,
         is_enum_accepted=True,
         is_shape_changed=False,
         is_code_owned=False,
@@ -533,12 +513,20 @@ def _canonical_execute(observed, statement, parameters=None):
         return _query_result()
     if "AS owner_safe" in sql:
         return _query_result([{"owner_oid": observed.publisher_oid, "owner_safe": True, "caller_safe": True}])
-    if sql.startswith("SELECT c.relname,c.oid::bigint"):
-        return _query_result([{"relname": "address_archive_v2", "oid": 43, "relfilenode": 44}])
+    if sql.startswith("SELECT c.relname FROM pg_class"):
+        return _query_result([{"relname": "address_archive_v2"}] if observed.is_heap_plain else [])
+    if sql.startswith("SELECT n.nspname AS schema_name,c.relname AS relation_name"):
+        return _query_result(
+            [
+                {
+                    "schema_name": observed.ownership.schema_name,
+                    "relation_name": "address_archive_v2",
+                    "supported": observed.is_heap_plain,
+                }
+            ]
+        )
     if "AS relation_oid,c.relname::text AS relation_name" in sql:
         return _query_result([{**observed.relation, "closed": True}])
-    if "AS object_count,bool_and" in sql:
-        return _query_result([{"object_count": 1, "closed": observed.is_custody_closed}])
     if "t.typtype='e'" in sql:
         return _query_result([{"oid": 500, "accepted": observed.is_enum_accepted}])
     raise AssertionError("unexpected query: " + sql)
@@ -557,8 +545,12 @@ def _canonical_scalar(observed, statement, parameters=None):
     }
     if sql in fixed_by_sql:
         return fixed_by_sql[sql]
-    if sql.startswith(("SELECT count(*)=cardinality", "SELECT NOT EXISTS(SELECT 1 FROM pg_index")):
+    if sql.startswith("SELECT NOT EXISTS(SELECT 1 FROM pg_index"):
+        return observed.is_execution_layout_valid
+    if sql.startswith("SELECT count(*)=cardinality"):
         return True
+    if sql.lstrip().startswith("SELECT c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition"):
+        return observed.is_heap_plain
     if sql.startswith("WITH objects(classid,objid)"):
         return observed.is_code_owned
     if sql.startswith("SELECT to_regtype('public.geography')"):
@@ -653,13 +645,14 @@ async def test_canonical_source_missing_oid_refuses_before_enum_or_shape(oid):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("row", (None, {"oid": 500, "accepted": False}, {"oid": 500, "accepted": 1}))
-async def test_canonical_enum_requires_exact_native_labels_and_non_member_owner(row):
+async def test_canonical_enum_requires_exact_native_labels_and_enum_kind(row):
     session = SimpleNamespace(execute=AsyncMock(return_value=_query_result([] if row is None else [row])))
     with pytest.raises(RuntimeError, match="source enum differs"):
         await canonical._canonical_enum_oid(session)
     query = str(session.execute.await_args.args[0])
     assert "array_agg(e.enumlabel ORDER BY e.enumsortorder)" in query
-    assert "NOT pg_catalog.pg_has_role(current_user,t.typowner,'MEMBER')" in query
+    assert "t.typtype='e'" in query
+    assert "pg_has_role" not in query
 
 
 @pytest.mark.asyncio
@@ -672,13 +665,11 @@ async def test_native_source_catalog_rejects_incomplete_oid_scope_before_queries
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ("relationships", "code-owner"))
-async def test_canonical_source_refuses_relationship_or_callable_ownership_before_temp_ddl(monkeypatch, fault):
+async def test_canonical_source_refuses_a_changed_relationship_before_temp_ddl(monkeypatch):
     observed = _canonical_observations()
-    observed.is_relationship_invalid = fault == "relationships"
-    observed.is_code_owned = fault == "code-owner"
+    observed.is_relationship_invalid = True
     session = _canonical_session(monkeypatch, observed)
-    with pytest.raises(RuntimeError, match="relationship differs|executable ownership is unsupported"):
+    with pytest.raises(RuntimeError, match="relationship differs"):
         await canonical.require_canonical_source_model(session, "mrf", canonical._qualified)
     assert not any("CREATE" in str(call.args[0]) for call in session.execute.await_args_list)
     assert canonical.catalog_identity._catalog_columns.await_count == 0
@@ -749,50 +740,64 @@ def test_resolution_projection_preserves_incumbents_alias_identity_and_noop_time
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", (None, "rebound", "custody", "enum"))
-async def test_canonical_output_custody_authenticates_whole_heap_before_native_reads(monkeypatch, fault):
+@pytest.mark.parametrize("fault", (None, "rebound", "heap", "layout", "enum"))
+async def test_canonical_output_validates_named_whole_heap_before_native_reads(monkeypatch, fault):
     observed = _canonical_observations()
-    observed.is_custody_closed = fault != "custody"
+    observed.is_heap_plain = fault != "heap"
+    observed.is_execution_layout_valid = fault != "layout"
     observed.is_enum_accepted = fault != "enum"
     session = _canonical_session(monkeypatch, observed)
-    ownership = replace(observed.ownership, schema_oid=42) if fault == "rebound" else observed.ownership
+    ownership = replace(
+        observed.ownership,
+        schema_name="foreign" if fault == "rebound" else observed.ownership.schema_name,
+        schema_oid=999,
+        relation_oids=(("address_archive_v2", 1000),),
+    )
     if fault:
-        with pytest.raises(RuntimeError, match="inventory changed|not closed|source enum differs"):
-            await canonical._require_canonical_custody(session, ownership, 45)
-        session.scalar.assert_not_awaited()
+        with pytest.raises(
+            RuntimeError, match="inventory changed|stage catalog differs|executable catalog differs|source enum differs"
+        ):
+            await canonical._require_canonical_output_layout(session, ownership)
     else:
-        await canonical._require_canonical_custody(session, ownership, 45)
-        assert session.scalar.await_count == 3
-        assert session.scalar.await_args_list[1].args[1]["allowed_type_oids"] == [500]
-    assert session.execute.await_count == {"rebound": 0, "custody": 3, "enum": 4, None: 4}[fault]
+        assert await canonical._require_canonical_output_layout(session, ownership) == 43
+        typed_calls = [call.args[1] for call in session.scalar.await_args_list if "allowed_type_oids" in call.args[1]]
+        assert [parameters["allowed_type_oids"] for parameters in typed_calls] == [[500]]
+    assert str(session.execute.await_args_list[0].args[0]) == (
+        f'LOCK TABLE "{ownership.schema_name}"."address_archive_v2" IN ACCESS SHARE MODE NOWAIT'
+    )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", (None, "contract", "scope", "inventory", "owner", "catalog"))
-async def test_canonical_retained_base_requires_live_custody_and_exact_receipt_before_shape(monkeypatch, fault):
+@pytest.mark.parametrize("fault", (None, "contract", "scope", "inventory", "legacy", "catalog"))
+async def test_canonical_retained_base_validates_named_receipt_and_model_shape(monkeypatch, fault):
     observed = _canonical_observations()
     session = _canonical_session(monkeypatch, observed)
     evidence = observed.receipt
     if fault == "contract":
         evidence["contract"] = "foreign"
     elif fault == "inventory":
-        evidence["inventory"]["relations"][0]["relfilenode"] += 1
-    elif fault == "owner":
-        observed.publisher_oid += 1
+        evidence["inventory"]["relations"][0]["relation_name"] = "foreign"
+    elif fault == "legacy":
+        evidence["inventory"]["database_oid"] = None
+        evidence["inventory"]["relations"][0].update(
+            owner_oid=None, schema_oid=False, relation_oid="old", relfilenode=[]
+        )
     elif fault == "catalog":
         evidence["catalog_sha256"] = "0" * 64
     qualified = canonical._qualified(
         "foreign" if fault == "scope" else observed.ownership.schema_name, "address_archive_v2"
     )
-    if fault:
+    before = deepcopy(evidence)
+    if fault not in (None, "legacy"):
         with pytest.raises(RuntimeError, match="retained base .* differs"):
             await canonical.require_canonical_output_base(session, qualified, evidence)
     else:
         await canonical.require_canonical_output_base(session, qualified, evidence)
+    assert evidence == before
     queries = [str(call.args[0]) for call in session.execute.await_args_list]
     assert not any(sql.startswith(("INSERT", "UPDATE", "DELETE")) for sql in queries)
-    assert sum("CREATE TEMPORARY TABLE" in sql for sql in queries) == int(fault is None)
-    if fault in {"contract", "scope"}:
+    assert sum("CREATE TEMPORARY TABLE" in sql for sql in queries) == int(fault in (None, "legacy"))
+    if fault in {"contract", "scope", "inventory"}:
         session.execute.assert_not_awaited()
         session.scalar.assert_not_awaited()
 

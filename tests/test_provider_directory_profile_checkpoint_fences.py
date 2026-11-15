@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import importlib
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from process import provider_directory_profile as profile
-
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -51,12 +51,7 @@ def _checkpoint_map(
         "dataset_ids": list(build.dataset_ids),
         "evidence_stage": build.evidence_stage,
         "profile_stage": build.profile_stage,
-        "evidence_stage_oid": 31,
-        "profile_stage_oid": 32,
-        "evidence_stage_storage_fingerprint": "e" * 64,
-        "profile_stage_storage_fingerprint": "d" * 64,
-        "evidence_target_oid": None,
-        "profile_target_oid": None,
+        "targets_json": importer._profile_build_target_coordinates(build),
         "executable_plan_hash": "f" * 64,
         "materialization_mode": "full_swap",
         "capacity_geometry_status": "legacy_unavailable",
@@ -72,7 +67,29 @@ def _checkpoint_map(
 
 
 @pytest.mark.asyncio
-async def test_profile_stage_pair_requires_checkpointed_oids(monkeypatch):
+async def test_checkpoint_advance_uses_the_frozen_plan_and_complete_named_cas(monkeypatch):
+    build = _build()
+    execute = AsyncMock(return_value=1)
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_status", execute)
+    await importer._advance_provider_directory_profile_build_checkpoint(
+        build, phase="profile", expected_batch=0, total_batches=1
+    )
+    statement = execute.await_args.args[0]
+    bindings = execute.await_args.kwargs
+    assert bindings["executable_plan_hash"] == build.batch_plan.fingerprint
+    assert bindings["targets_json"] == importer._stable_identity_json(importer._profile_build_target_coordinates(build))
+    assert "targets_json::jsonb = CAST(:targets_json AS jsonb)" in statement
+    assert "resume_lineage_hash = :resume_lineage_hash" in statement
+    execute.reset_mock()
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="checkpoint_plan_missing"):
+        await importer._advance_provider_directory_profile_build_checkpoint(
+            replace(build, batch_plan=None), phase="profile", expected_batch=0, total_batches=1
+        )
+    execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_profile_stage_pair_requires_checkpointed_names(monkeypatch):
     stage_identity = AsyncMock()
     monkeypatch.setattr(
         importer,
@@ -81,13 +98,13 @@ async def test_profile_stage_pair_requires_checkpointed_oids(monkeypatch):
     )
     monkeypatch.setattr(
         importer,
-        "_provider_directory_profile_stage_storage_fingerprint",
+        "_provider_directory_profile_stage_layout",
         AsyncMock(side_effect=["e" * 64, "d" * 64]),
     )
 
     assert not await importer._is_profile_stage_pair_matching(
         "mrf",
-        {"evidence_stage_oid": None, "profile_stage_oid": 32},
+        {"evidence_stage": None, "profile_stage": "profile_stage"},
         "evidence_stage",
         "profile_stage",
     )
@@ -109,9 +126,7 @@ async def test_ready_profile_checkpoint_requires_complete_logged_stage_pair(
         "first",
         AsyncMock(return_value=checkpoint_map),
     )
-    stage_identity = AsyncMock(
-        side_effect=[(31, "r", "p"), (32, "r", "p")]
-    )
+    stage_identity = AsyncMock(side_effect=[(31, "r", "p"), (32, "r", "p")])
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_stage_relation_identity",
@@ -119,16 +134,17 @@ async def test_ready_profile_checkpoint_requires_complete_logged_stage_pair(
     )
     monkeypatch.setattr(
         importer,
-        "_provider_directory_profile_stage_storage_fingerprint",
+        "_provider_directory_profile_stage_layout",
         AsyncMock(side_effect=["e" * 64, "d" * 64]),
     )
 
     await importer._assert_provider_directory_profile_checkpoint_ready(
         build,
-        importer.ProviderDirectoryArtifactBuildFence(None),
-        importer.ProviderDirectoryArtifactBuildFence(None),
+        importer.ProviderDirectoryArtifactBuildFence(),
+        importer.ProviderDirectoryArtifactBuildFence(),
     )
-    assert stage_identity.await_count == 2
+    importer._provider_directory_profile_stage_layout.assert_awaited()
+    stage_identity.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -142,8 +158,8 @@ async def test_ready_profile_checkpoint_rejects_missing_or_stale_state(
     with pytest.raises(RuntimeError, match="ready_checkpoint_missing"):
         await importer._assert_provider_directory_profile_checkpoint_ready(
             build,
-            importer.ProviderDirectoryArtifactBuildFence(None),
-            importer.ProviderDirectoryArtifactBuildFence(None),
+            importer.ProviderDirectoryArtifactBuildFence(),
+            importer.ProviderDirectoryArtifactBuildFence(),
         )
 
     first.return_value = _checkpoint_map(build)
@@ -156,14 +172,14 @@ async def test_ready_profile_checkpoint_rejects_missing_or_stale_state(
     with pytest.raises(RuntimeError, match="ready_checkpoint_stale"):
         await importer._assert_provider_directory_profile_checkpoint_ready(
             build,
-            importer.ProviderDirectoryArtifactBuildFence(None),
-            importer.ProviderDirectoryArtifactBuildFence(None),
+            importer.ProviderDirectoryArtifactBuildFence(),
+            importer.ProviderDirectoryArtifactBuildFence(),
         )
     stage_identity.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_ready_profile_checkpoint_rejects_replaced_stage_oid(monkeypatch):
+async def test_ready_profile_checkpoint_rejects_unsupported_stage_shape(monkeypatch):
     build = _build()
     checkpoint_map = {
         **_checkpoint_map(build),
@@ -182,15 +198,15 @@ async def test_ready_profile_checkpoint_rejects_replaced_stage_oid(monkeypatch):
     )
     monkeypatch.setattr(
         importer,
-        "_provider_directory_profile_stage_storage_fingerprint",
-        AsyncMock(return_value="e" * 64),
+        "_provider_directory_profile_stage_layout",
+        AsyncMock(side_effect=importer.ProviderDirectoryArtifactBuildStale("unsupported_shape")),
     )
 
     with pytest.raises(RuntimeError, match="ready_checkpoint_stale"):
         await importer._assert_provider_directory_profile_checkpoint_ready(
             build,
-            importer.ProviderDirectoryArtifactBuildFence(None),
-            importer.ProviderDirectoryArtifactBuildFence(None),
+            importer.ProviderDirectoryArtifactBuildFence(),
+            importer.ProviderDirectoryArtifactBuildFence(),
         )
 
 
@@ -266,20 +282,14 @@ async def test_profile_reinitialize_locks_rechecks_and_drops_owned_stages(
 ):
     build = _build()
     checkpoint_map = _checkpoint_map(build)
-    stage_identity = AsyncMock(
-        side_effect=[
-            (32, "r", "p"),
-            (32, "r", "p"),
-            (31, "r", "p"),
-            (31, "r", "p"),
-        ]
-    )
+    stage_identity = AsyncMock(side_effect=[(32, "r", "p"), (31, "r", "p")])
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_stage_relation_identity",
         stage_identity,
     )
+    monkeypatch.setattr(importer, "_provider_directory_profile_stage_layout", AsyncMock())
     monkeypatch.setattr(importer.db, "status", status)
 
     await importer._drop_profile_stages_for_reinitialize(
@@ -287,20 +297,18 @@ async def test_profile_reinitialize_locks_rechecks_and_drops_owned_stages(
         checkpoint_map,
     )
 
-    assert stage_identity.await_count == 4
+    assert stage_identity.await_count == 2
     assert status.await_count == 4
     assert "LOCK TABLE" in str(status.await_args_list[0].args[0])
     assert "DROP TABLE" in str(status.await_args_list[-1].args[0])
 
 
 @pytest.mark.asyncio
-async def test_profile_reinitialize_rejects_identity_change_after_lock(
+async def test_profile_reinitialize_rejects_unsupported_shape_after_lock(
     monkeypatch,
 ):
     build = _build()
-    stage_identity = AsyncMock(
-        side_effect=[(32, "r", "p"), (999, "r", "p")]
-    )
+    stage_identity = AsyncMock(side_effect=[(32, "r", "p"), (999, "r", "p")])
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(
         importer,
@@ -309,7 +317,12 @@ async def test_profile_reinitialize_rejects_identity_change_after_lock(
     )
     monkeypatch.setattr(importer.db, "status", status)
 
-    with pytest.raises(RuntimeError, match="stage_identity_changed"):
+    monkeypatch.setattr(
+        importer,
+        "_provider_directory_profile_stage_layout",
+        AsyncMock(side_effect=importer.ProviderDirectoryArtifactBuildStale("stage_shape_invalid")),
+    )
+    with pytest.raises(RuntimeError, match="stage_shape_invalid"):
         await importer._drop_profile_stages_for_reinitialize(
             build,
             _checkpoint_map(build),

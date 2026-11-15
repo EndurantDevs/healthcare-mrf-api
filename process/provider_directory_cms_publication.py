@@ -14,6 +14,7 @@ from process import provider_directory_cms_serving_coverage as coverage
 from process import provider_directory_cms_serving_receipt as receipts
 from process.cms_doctors_preparation import apply_prepared_cms_doctors_generation
 from process.entity_address_candidate_preparation import (
+    bind_published_overlay,
     publish_prepared_entity_address_generation,
 )
 from process.native_publication_read_access import preserve_publication_reads
@@ -390,9 +391,11 @@ async def _apply_prepared_results(
         settings_configured=True,
         before_swaps=before_swaps,
         extra_live_relations=_live_swap_relations(prepared, address, doctors),
+        read_only=True,
     )
     await _seal_published_coverage(fhir, session, proof)
     if address is not None:
+        await bind_published_overlay(address, prepared.stages)
         await publish_prepared_entity_address_generation(address)
     snapshot = await receipts.capture_native_dependencies(session, fhir._schema())
     receipt_payload = _receipt_payload(execution, proof, predecessor, snapshot, archive_result)

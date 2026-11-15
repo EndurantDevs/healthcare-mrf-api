@@ -146,14 +146,15 @@ async def test_missing_first_live_heap_uses_existing_native_preserver(publicatio
         )
         for name, oid in (("plan_search_summary", None), ("plan_search_summary_refresh", 42))
     ]
-    context.native.fetch = AsyncMock(side_effect=[relations, relations])
+    context.native.fetch = AsyncMock(side_effect=[relations, relations, []])
     context.native.execute = AsyncMock()
     monkeypatch.setattr(summary, "preserve_publication_reads", access.preserve_publication_reads)
     assert await summary.rebuild_plan_search_summary() == 3
     context.native.execute.assert_awaited_once_with(
-        f'LOCK TABLE "{schema}"."plan_search_summary_refresh" IN ACCESS EXCLUSIVE MODE'
+        f'LOCK TABLE "{schema}"."plan_search_summary_refresh" IN ACCESS SHARE MODE NOWAIT'
     )
-    assert context.native.fetch.await_count == 2 and context.events == ["begin", "commit"]
+    assert context.native.fetch.await_count == 3 and context.events == ["begin", "commit"]
+    assert context.native.fetch.await_args_list[2].args[1:] == (f'"{schema}"."plan_search_summary_refresh"',)
 
 
 @pytest.mark.asyncio

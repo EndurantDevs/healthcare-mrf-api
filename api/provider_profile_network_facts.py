@@ -8,7 +8,6 @@ from uuid import UUID
 
 from sqlalchemy import text
 
-from api.network_read_execution import execute_network_read, network_read_name_inventory
 from api.provider_directory_cms_network_scope import CMSNetworkScope, _mapped_networks, _membership_pairs
 from api.provider_directory_entities_contract import DirectoryReadError
 from db.registry_schema import registry_schema
@@ -207,9 +206,7 @@ async def execute_cms_profile_read(session, scope, statement, parameters):
     """Verify the complete fixed-name scope before any scalar or resource is decoded."""
     if type(scope) is not CMSNetworkScope or not scope.read_relations:
         raise DirectoryReadError(503)
-    driver = (await (await session.connection()).get_raw_connection()).driver_connection
-    with network_read_name_inventory(driver, scope.read_relations):
-        return await execute_network_read(session, statement, parameters)
+    return await session.execute(statement, parameters)
 
 
 async def read_cms_profile_plan_inputs(

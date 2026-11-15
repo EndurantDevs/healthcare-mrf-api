@@ -3,23 +3,11 @@
 
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime
 from uuid import UUID
 
 from process.registry_fhir_catalog_extraction import DEFAULT_BYTES, MAX_ROWS, fhir_catalog_json_bytes, fhir_catalog_text
-from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
+from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile, parse_fhir_catalog_source_profile
 
-CATALOG_DATABASE_IDENTITY_SQL = """SELECT pg_catalog.current_database()::text AS database_name,
- (SELECT oid::bigint FROM pg_catalog.pg_database WHERE datname=pg_catalog.current_database()) AS database_oid,
- (pg_catalog.pg_control_system()).system_identifier::text AS system_identifier,
- pg_catalog.pg_postmaster_start_time() AS postmaster_started,pg_catalog.pg_is_in_recovery() AS recovering"""
-_IDENTITY_TYPES = {
-    "database_name": str,
-    "database_oid": int,
-    "system_identifier": str,
-    "postmaster_started": datetime,
-    "recovering": bool,
-}
 _OPERATIONS = {"inventory", "replay", "legacy_bindings"}
 
 
@@ -93,40 +81,25 @@ async def iter_source_owned_catalog_legacy_bindings(source_export, descriptor, o
 
 @asynccontextmanager
 async def open_source_owned_catalog_export(factory, profile, registry_connection):
-    """Keep source-owned validation and cleanup around a profile-scoped export."""
-    if type(profile) is not FHIRCatalogSourceReadProfile or profile.published_read_scope is not None:
+    """Keep configured logical profile agreement and Source cleanup around its export."""
+    if type(profile) is not FHIRCatalogSourceReadProfile:
         raise ValueError("registry_fhir_catalog_source_export_profile_invalid")
     if not callable(factory):
         raise ValueError("registry_fhir_catalog_source_export_factory_invalid")
     async with factory(source_profile=profile) as export:
-        if type(export) is dict and "native_read_profile" in export:
-            required = _OPERATIONS | {"native_read_profile"}
-            if (
-                set(export) not in (required, required | {"source_companies"})
-                or export["native_read_profile"] != profile.document()
-                or any(not callable(callback) for name, callback in export.items() if name != "native_read_profile")
-            ):
+        if (
+            type(export) is not dict
+            or not _OPERATIONS <= set(export)
+            or not set(export) <= _OPERATIONS | {"source_companies", "native_read_profile"}
+        ):
+            raise ValueError("registry_fhir_catalog_source_export_invalid")
+        if "native_read_profile" in export:
+            try:
+                declared_profile = parse_fhir_catalog_source_profile(export["native_read_profile"])
+            except ValueError, TypeError:
+                raise ValueError("registry_fhir_catalog_source_export_invalid") from None
+            if declared_profile.document() != profile.document():
                 raise ValueError("registry_fhir_catalog_source_export_invalid")
-            yield export
-            return
-        required = _OPERATIONS | {"database_identity"}
-        if type(export) is not dict or set(export) not in (required, required | {"source_companies"}):
+        if any(not callable(callback) for name, callback in export.items() if name != "native_read_profile"):
             raise ValueError("registry_fhir_catalog_source_export_invalid")
-        if any(not callable(callback) for name, callback in export.items() if name != "database_identity"):
-            raise ValueError("registry_fhir_catalog_source_export_invalid")
-        identity = export["database_identity"]
-        if (
-            type(identity) is not dict
-            or set(identity) != _IDENTITY_TYPES.keys()
-            or any(type(identity[name]) is not field_type for name, field_type in _IDENTITY_TYPES.items())
-            or identity["recovering"] is not False
-        ):
-            raise ValueError("registry_fhir_catalog_source_export_database_changed")
-        registry_identity = await registry_connection.fetchrow(CATALOG_DATABASE_IDENTITY_SQL)
-        if (
-            registry_identity is None
-            or dict(registry_identity) != identity
-            or any(type(registry_identity[name]) is not field_type for name, field_type in _IDENTITY_TYPES.items())
-        ):
-            raise ValueError("registry_fhir_catalog_source_export_database_changed")
         yield export

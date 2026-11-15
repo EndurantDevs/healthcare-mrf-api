@@ -4,7 +4,6 @@
 import asyncio
 import hashlib
 import json
-from contextlib import AsyncExitStack
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -21,8 +20,6 @@ from process.network_membership_copy import MAX_INPUT_BYTES, MembershipCopyTarge
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_retained_site_adoption import RetainedSiteAdoptionError, resolve_retained_site_adoptions
-from tests import registry_candidate_custody_postgres_support as custody
-from tests.registry_candidate_custody_postgres_support import install_candidate_custody
 from tests.test_network_custom_address_source_postgres import _draft, custom_db
 from tests.test_network_serving_schema_postgres import serving_schema
 from tests.test_registry_approval_store_postgres import _actor, _create
@@ -63,16 +60,10 @@ async def _source_addresses(fixture, count, provider_system):
     return provider_id, source_table
 
 
-async def _published(fixture, count, provider_system, copy_targets):
-    """Publish full model addresses through the actual index and closure gates."""
+async def _admit_bindings(fixture, copy_target, network, binding_values, count):
+    """Create one candidate whose bindings cover every synthetic office and close its writes."""
     connection = fixture.connection
-    provider_id, source_table = await _source_addresses(fixture, count, provider_system)
-    network = await _draft(fixture, _create("network"), _actor())
-    candidate_id = uuid4()
-    copy_target = MembershipCopyTarget(
-        *(str(uuid4()) for _ in range(3)), str(candidate_id), "network_candidate_" + candidate_id.hex
-    )
-    copy_targets.append(copy_target)
+    source_table, provider_system, provider_id = binding_values
     async with connection.transaction():
         await create_network_candidate(
             connection,
@@ -115,8 +106,26 @@ async def _published(fixture, count, provider_system, copy_targets):
             control_schema=fixture.control_schema,
         )
         await seal_network_candidate(connection, copy_target, control_schema=fixture.control_schema)
+
+
+async def _published(fixture, count, provider_system, copy_targets):
+    """Publish full model addresses through the actual index and closure gates."""
+    connection = fixture.connection
+    provider_id, source_table = await _source_addresses(fixture, count, provider_system)
+    network = await _draft(fixture, _create("network"), _actor())
+    candidate_id = uuid4()
+    copy_target = MembershipCopyTarget(
+        *(str(uuid4()) for _ in range(3)), str(candidate_id), "network_candidate_" + candidate_id.hex
+    )
+    copy_targets.append(copy_target)
+    await _admit_bindings(fixture, copy_target, network, (source_table, provider_system, provider_id), count)
     await prepare_and_publish_network_candidate(
-        connection, copy_target, fixture.base, **_roles(fixture), control_schema=fixture.control_schema
+        connection,
+        copy_target,
+        fixture.base,
+        **_roles(fixture),
+        control_schema=fixture.control_schema,
+        seal_candidate=fixture.seal_candidate,
     )
     async with connection.transaction(readonly=True):
         return await resolve_network_serving_manifest(connection, control_schema=fixture.control_schema)
@@ -252,8 +261,8 @@ async def test_selected_office_only_and_deterministic_immutable_receipt(retained
     assert receipt == await _resolve(fixture, isolation="serializable")
     assert len(receipt.records) == 1 and receipt.records[0].location_id == fixture.rows[0]["location_id"]
     assert fixture.rows[1]["location_id"] not in json.dumps(receipt.as_dict())
-    assert receipt.address_table_oid == fixture.source.address_table_oid
-    assert receipt.schema_oid > 0 and receipt.binding_table_oid > 0 and receipt.owner_role_oid > 0
+    assert receipt.address_relation == fixture.source.address_relation
+    assert receipt.schema_name == fixture.source.schema_name
     assert dict(receipt.source_generations) == fixture.source.source_generations
     assert receipt.records[0].entity_type == fixture.rows[0]["provider_system"]
     assert receipt.records[0].entity_id == fixture.rows[0]["provider_id"]
@@ -284,12 +293,12 @@ async def test_selection_rejects_whole_batch(retained_db, damage):
         await _resolve(fixture, [fixture.rows[0], row] if damage == "duplicate" else [fixture.rows[1], row])
 
 
-@pytest.mark.parametrize("field", ["generation_id", "address_table_oid", "source_generations", "manifest_sha256"])
+@pytest.mark.parametrize("field", ["generation_id", "address_relation", "source_generations", "manifest_sha256"])
 async def test_supplied_source_must_equal_verified_manifest(retained_db, field):
     fixture = retained_db
     changes_by_field = {
         "generation_id": fixture.source.generation_id + 1,
-        "address_table_oid": fixture.source.address_table_oid + 1,
+        "address_relation": replace(fixture.source.address_relation, table_name="other_address"),
         "source_generations": {"fhir": "changed-retained-edition"},
         "manifest_sha256": "0" * 64,
     }
@@ -297,7 +306,7 @@ async def test_supplied_source_must_equal_verified_manifest(retained_db, field):
         await _resolve(fixture, source=replace(fixture.source, **{field: changes_by_field[field]}))
 
 
-@pytest.mark.parametrize("damage", ["acl", "ineligible", "source_fingerprint", "row_fingerprint", "binding_oid"])
+@pytest.mark.parametrize("damage", ["ineligible", "source_fingerprint", "row_fingerprint", "binding_oid"])
 async def test_native_tampering_fails_closed_and_caller_rollback_restores(retained_db, damage):
     fixture = retained_db
     connection = fixture.connection
@@ -306,7 +315,6 @@ async def test_native_tampering_fails_closed_and_caller_rollback_restores(retain
     await transaction.start()
     try:
         statement_by_damage = {
-            "acl": f'GRANT UPDATE ON {namespace}.provider_location_binding TO "{fixture.roles["reader"]}"',
             "ineligible": f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false',
             "source_fingerprint": f'''UPDATE "{fixture.control_schema}".network_membership_candidate
               SET source_generations='{{"fhir":"changed"}}'::jsonb''',
@@ -377,15 +385,15 @@ async def test_transaction_contract_and_readonly_query_count(retained_db):
                 control_schema=fixture.control_schema,
             )
             await asyncio.sleep(0)
-            assert len(queries) == 5
-            assert sum("network_candidate_custody" in query.query for query in queries) == 1
+            assert len(queries) == 3
+            assert not any("network_candidate_custody" in query.query for query in queries)
             assert all(query.query.lstrip().split()[0] in ("SELECT", "WITH") for query in queries)
     finally:
         fixture.connection.remove_query_logger(queries.append)
 
 
 @pytest.mark.parametrize("retained_db", [(5000, "npi")], indirect=True)
-async def test_maximum_batch_has_the_same_five_native_queries(retained_db):
+async def test_maximum_batch_has_the_same_three_native_queries(retained_db):
     fixture = retained_db
     queries = []
     fixture.connection.add_query_logger(queries.append)
@@ -400,43 +408,7 @@ async def test_maximum_batch_has_the_same_five_native_queries(retained_db):
                 control_schema=fixture.control_schema,
             )
             await asyncio.sleep(0)
-            assert len(receipt.records) == 5000 and len(queries) == 5
-            assert sum("network_candidate_custody" in query.query for query in queries) == 1
+            assert len(receipt.records) == 5000 and len(queries) == 3
+            assert not any("network_candidate_custody" in query.query for query in queries)
     finally:
         fixture.connection.remove_query_logger(queries.append)
-
-
-@pytest.mark.asyncio
-async def test_candidate_custody_restores_schema_owner_without_dropping_notification(custom_db):
-    """A protected table owned by the original role survives custody and role cleanup."""
-    fixture = custom_db
-    original = await fixture.connection.fetchrow(
-        "SELECT n.oid,n.nspowner,c.oid AS table_oid,c.relowner FROM pg_namespace n "
-        "JOIN pg_class c ON c.relnamespace=n.oid "
-        "WHERE n.nspname=$1 AND c.relname='registry_aca_source_notification'",
-        fixture.control_schema,
-    )
-    assert original is not None and original["nspowner"] == original["relowner"]
-    async with AsyncExitStack() as stack:
-        await install_candidate_custody(fixture, stack)
-        assert (
-            await fixture.connection.fetchval(
-                "SELECT r.rolname FROM pg_namespace n JOIN pg_roles r ON r.oid=n.nspowner WHERE n.oid=$1",
-                original["oid"],
-            )
-            == fixture.roles["owner"]
-        )
-        inbox = await custody._aca_controls(fixture.connection, fixture.control_schema)
-        assert len(inbox) == 1 and inbox[0]["oid"] == original["table_oid"]
-        assert inbox[0]["relowner"] == inbox[0]["head_owner"]
-        assert inbox[0]["relowner"] != original["relowner"]
-    retained = await fixture.connection.fetchrow(
-        "SELECT n.oid,n.nspowner,c.oid AS table_oid,c.relowner FROM pg_namespace n "
-        "JOIN pg_class c ON c.relnamespace=n.oid "
-        "WHERE n.nspname=$1 AND c.relname='registry_aca_source_notification'",
-        fixture.control_schema,
-    )
-    assert retained == original
-    assert not await fixture.connection.fetchval(
-        "SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=ANY($1::text[]))", list(fixture.custody_roles.values())
-    )

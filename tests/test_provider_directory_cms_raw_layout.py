@@ -32,7 +32,7 @@ def _index(relation, name, keys, primary, attributes, index_oid):
     attributes_by_name = {attribute["attname"]: attribute for attribute in attributes}
     key_attributes = [attributes_by_name[key] for key in keys]
     return {
-        "relation_oid": relation.oid,
+        "relation_oid": (12 if relation.schema == "pg_toast" else 11),
         "index_oid": index_oid,
         "index_name": name,
         "index_am": "btree",
@@ -72,15 +72,16 @@ def _classes():
 
 
 def _fixture(prefix=0, toast=False):
+    """Model complete source/raw column and index metadata without native allocation authority."""
     policy = _retention_policy()
     name = layout._TABLES[1] if toast else layout._TABLES[2]
-    relation = OwnedRelation("registry_cms_epoch_" + "0" * 31 + "1", name, 11, 8192, "p")
+    relation = OwnedRelation("registry_cms_epoch_" + "0" * 31 + "1", name, 8192, "p")
     profiles = layout._raw_profiles(name)
     names = tuple(profile[0] for profile in profiles[:prefix])
     columns = tuple(dict.fromkeys(key for _, keys, _ in profiles for key in keys))
-    attributes = [_attribute(relation.oid, ordinal, column) for ordinal, column in enumerate(columns, 1)]
+    attributes = [_attribute(11, ordinal, column) for ordinal, column in enumerate(columns, 1)]
     if toast:
-        attributes.append(_attribute(relation.oid, len(attributes) + 1, "payload_json", 114))
+        attributes.append(_attribute(11, len(attributes) + 1, "payload_json", 114))
     source_attributes = [{**attribute, "relation_oid": 123} for attribute in attributes]
     indexes = [
         _index(relation, index, keys, primary, attributes, ordinal)
@@ -91,7 +92,7 @@ def _fixture(prefix=0, toast=False):
         if not prefix
         else [
             {
-                "relation_oid": relation.oid,
+                "relation_oid": 11,
                 "constraint_type": "p",
                 "condeferrable": False,
                 "condeferred": False,
@@ -101,7 +102,7 @@ def _fixture(prefix=0, toast=False):
         ]
     )
     relation_map = {
-        "relation_oid": relation.oid,
+        "relation_oid": 11,
         "schema_name": relation.schema,
         "relation_name": name,
         "relreplident": "d",
@@ -134,7 +135,7 @@ def _add_toast(attributes, indexes, relation):
         for ordinal, (name, type_oid) in enumerate((("chunk_id", 26), ("chunk_seq", 23), ("chunk_data", 17)), 1)
     ]
     attributes.extend(toast_columns)
-    toast_relation = replace(relation, schema="pg_toast", oid=12)
+    toast_relation = replace(relation, schema="pg_toast")
     index = _index(toast_relation, "pg_toast_11_index", ("chunk_id", "chunk_seq"), True, toast_columns, 301)
     indexes.append(index)
 
@@ -146,7 +147,7 @@ def _fhir(fixture):
         return deepcopy(fixture.attributes), deepcopy(fixture.indexes), fixture.constraints, fixture.triggers
 
     async def scalar(query, **parameters):
-        return 123 if "FROM pg_class" in query else 7
+        return 11 if parameters.get("name") == f'"{fixture.relation.schema}"."{fixture.relation.relation}"' else 123
 
     async def all_indexes(query, **parameters):
         if "operator.opcdefault" in query:
@@ -187,21 +188,21 @@ async def _capture(fixture):
 async def test_raw_heap_and_every_index_prefix(prefix):
     fixture = _fixture(prefix)
     captured = await _capture(fixture)
-    assert captured == layout.NativeRelationLayout(11, (42,), "a" * 64)
+    assert captured == layout.NativeRelationLayout(fixture.relation.schema, fixture.relation.relation)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("prefix", [0, 1])
 async def test_toast_heap_and_index_remain_measured(prefix):
     fixture = _fixture(prefix, toast=True)
-    assert (await _capture(fixture)).effective_tablespace_oids == (42,)
+    assert (await _capture(fixture)).relation_name == fixture.relation.relation
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mutation", ["schema", "logical", "persistence", "oid", "policy", "prefix", "gap"])
+@pytest.mark.parametrize("mutation", ["schema", "logical", "persistence", "policy", "prefix", "gap"])
 async def test_raw_coordinates_and_prefix_rejected(mutation):
     fixture = _fixture(2)
-    if mutation in {"schema", "logical", "persistence", "oid"}:
+    if mutation in {"schema", "logical", "persistence"}:
         field = "relation" if mutation == "logical" else mutation
         fixture.relation = replace(fixture.relation, **{field: 0 if field == "oid" else "unexpected"})
     elif mutation == "policy":
@@ -267,7 +268,7 @@ async def test_pinned_source_oid_rejected():
 async def test_only_payload_roots_permit_partitioned_source_column_metadata(root):
     """Logical payload parents supply column ABI after the original child pin closes."""
     fixture = _fixture()
-    relation = replace(fixture.relation, relation=root)
+    relation = SimpleNamespace(**dict(vars(fixture.relation), relation=root), oid=11)
     directory = _fhir(fixture)
     directory.db.scalar = AsyncMock(wraps=directory.db.scalar)
     await layout._require_source_columns(directory, relation, fixture.policy, fixture.attributes)
@@ -288,7 +289,12 @@ async def test_source_column_metadata_still_requires_a_native_oid(source_oid):
     directory.db.scalar = AsyncMock(return_value=source_oid)
     directory._profile_capacity_relation_catalog = AsyncMock()
     with pytest.raises(RuntimeError, match="raw_storage_shape_unsupported"):
-        await layout._require_source_columns(directory, fixture.relation, fixture.policy, fixture.attributes)
+        await layout._require_source_columns(
+            directory,
+            SimpleNamespace(**vars(fixture.relation), oid=fixture.relation_map["relation_oid"]),
+            fixture.policy,
+            fixture.attributes,
+        )
     directory._profile_capacity_relation_catalog.assert_not_awaited()
 
 
@@ -314,7 +320,6 @@ async def test_source_column_metadata_still_requires_a_native_oid(source_oid):
         ("indimmediate", False),
         ("index_persistence", "u"),
         ("index_schema", "unexpected"),
-        ("effective_tablespace_oid", 43),
         ("reloptions", ["fillfactor=50"]),
     ],
 )
@@ -326,7 +331,7 @@ async def test_raw_index_mutations_rejected(field, replacement):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mutation", ["missing", "extra", "wrong_type", "wrong_key", "tablespace"])
+@pytest.mark.parametrize("mutation", ["missing", "extra", "wrong_type", "wrong_key"])
 async def test_toast_mutations_rejected(mutation):
     fixture = _fixture(toast=True)
     if mutation == "missing":
@@ -379,3 +384,68 @@ async def test_unowned_catalog_changes_rejected(mutation):
         fixture.indexes.append({**fixture.indexes[0], "index_name": "unexpected"})
     with pytest.raises(RuntimeError, match="raw_storage_shape_unsupported"):
         await _capture(fixture)
+
+
+@pytest.mark.asyncio
+async def test_resource_column_template_uses_current_policy_qualified_relation():
+    fixture = _fixture(toast=True)
+    fixture.policy["source_pin"]["resource_relation"]["name"] = "retained_resource"
+    directory = _fhir(fixture)
+    directory.db.scalar = AsyncMock(return_value=123)
+    await layout._require_source_columns(
+        directory,
+        SimpleNamespace(**vars(fixture.relation), oid=fixture.relation_map["relation_oid"]),
+        fixture.policy,
+        fixture.attributes,
+    )
+    assert directory.db.scalar.await_args.kwargs["name"] == '"fixture"."retained_resource"'
+
+
+@pytest.mark.asyncio
+async def test_resource_column_template_refuses_missing_qualified_relation():
+    fixture = _fixture(toast=True)
+    fixture.policy["source_pin"]["resource_relation"]["name"] = "missing_resource"
+    directory = _fhir(fixture)
+    directory.db.scalar = AsyncMock(return_value=None)
+    directory._profile_capacity_relation_catalog = AsyncMock()
+    with pytest.raises(RuntimeError, match="raw_storage_shape_unsupported"):
+        await layout._require_source_columns(
+            directory,
+            SimpleNamespace(**vars(fixture.relation), oid=fixture.relation_map["relation_oid"]),
+            fixture.policy,
+            fixture.attributes,
+        )
+    assert directory.db.scalar.await_args.kwargs["name"] == '"fixture"."missing_resource"'
+    directory._profile_capacity_relation_catalog.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource_relation",
+    [
+        None,
+        123,
+        {},
+        {"schema": "source_example"},
+        {"schema": "other", "name": "resource"},
+        {"schema": "source_example", "name": "unsafe.name"},
+    ],
+)
+async def test_resource_column_template_rejects_malformed_policy_relation(resource_relation):
+    fixture = _fixture(toast=True)
+    fixture.policy["source_pin"]["resource_relation"] = resource_relation
+    with pytest.raises(RuntimeError, match="raw_storage_shape_unsupported"):
+        await _capture(fixture)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("toast", [False, True])
+async def test_raw_named_layout_is_independent_of_native_allocation(toast):
+    """Unchanged column/index semantics remain valid after portable allocation changes."""
+    fixture = _fixture(1, toast=toast)
+    fixture.relation_map.update(
+        relfilenode=0, toast_relfilenode=0, effective_tablespace_oid=777, toast_effective_tablespace_oid=888
+    )
+    for index in fixture.indexes:
+        index.update(relfilenode=0, effective_tablespace_oid=999)
+    assert await _capture(fixture) == layout.NativeRelationLayout(fixture.relation.schema, fixture.relation.relation)

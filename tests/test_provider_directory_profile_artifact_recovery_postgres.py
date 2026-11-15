@@ -62,16 +62,7 @@ async def _create_recovery_metadata_tables(fixture) -> None:
         );
         """
     )
-    checkpoint_columns = ", ".join(
-        f"{column_name} bigint"
-        for column_name in (
-            "evidence_stage_oid",
-            "profile_stage_oid",
-            "affected_npi_stage_oid",
-            "evidence_target_oid",
-            "profile_target_oid",
-        )
-    )
+    checkpoint_columns = "evidence_stage text,profile_stage text,affected_npi_stage text,targets_json jsonb"
     await fixture.database.status(
         f"CREATE TABLE {importer._unscoped_qt(schema, 'provider_directory_profile_build_checkpoint')} "
         f"({checkpoint_columns});"
@@ -80,10 +71,7 @@ async def _create_recovery_metadata_tables(fixture) -> None:
         "provider_directory_profile_serving_generation",
         "provider_directory_profile_delta_receipt",
     ):
-        await fixture.database.status(
-            f"CREATE TABLE {importer._unscoped_qt(schema, table_name)} "
-            "(evidence_target_oid bigint, profile_target_oid bigint);"
-        )
+        await fixture.database.status(f"CREATE TABLE {importer._unscoped_qt(schema, table_name)} (targets_json jsonb);")
 
 
 async def _insert_owner(
@@ -131,9 +119,9 @@ async def _create_owner_scope(
     owner_run_id: str,
     *,
     index_phase: str = "heap",
-) -> tuple[dict[str, str], dict[str, int]]:
+) -> tuple[dict[str, str], dict[str, list]]:
     relation_by_base: dict[str, str] = {}
-    oid_by_base: dict[str, int] = {}
+    rows_by_base: dict[str, list] = {}
     for model in (importer.ProviderDirectorySource, *importer.RESOURCE_MODELS):
         base_name = model.__tablename__
         relation_name = importer._owned_artifact_scope_name(
@@ -156,16 +144,23 @@ async def _create_owner_scope(
             _name, statement = importer._provider_directory_profile_bucket_index_sql(fixture.schema, relation_name)
             await fixture.database.status(statement)
         relation_by_base[base_name] = relation_name
-        oid_by_base[base_name] = int(
-            await fixture.database.scalar(
-                "SELECT to_regclass(:relation_ref)::oid::bigint;",
-                relation_ref=importer._unscoped_qt(
-                    fixture.schema,
-                    relation_name,
-                ),
-            )
+        is_source = model is importer.ProviderDirectorySource
+        columns = "source_id,org_name,requires_registration,requires_api_key" if is_source else "source_id,resource_id"
+        value_sql = ":source,:value,false,false" if is_source else ":source,:value"
+        await fixture.database.status(
+            f"INSERT INTO {importer._unscoped_qt(fixture.schema, relation_name)} ({columns}) VALUES ({value_sql})",
+            source="terminal_scope",
+            value=base_name,
         )
-    return relation_by_base, oid_by_base
+        rows_by_base[base_name] = await _scope_rows(fixture, relation_name)
+    return relation_by_base, rows_by_base
+
+
+async def _scope_rows(fixture, relation_name):
+    rows = await fixture.database.all(
+        f"SELECT to_jsonb(snapshot) AS contents FROM {importer._unscoped_qt(fixture.schema, relation_name)} snapshot ORDER BY to_jsonb(snapshot)::text"
+    )
+    return [importer._pagination_checkpoint_row_mapping(row)["contents"] for row in rows]
 
 
 async def _recovery_admission(fixture):
@@ -178,37 +173,18 @@ async def _recovery_admission(fixture):
     return _admission(geometry, initial_wal_lsn)
 
 
-async def _assert_scope_replaced(
-    fixture,
-    prior_relations: dict[str, str],
-    prior_oids: dict[str, int],
-    current_relations: dict[str, str],
-) -> None:
-    for base_name, prior_oid in prior_oids.items():
-        prior_ref = importer._unscoped_qt(
-            fixture.schema,
-            prior_relations[base_name],
-        )
-        current_ref = importer._unscoped_qt(
-            fixture.schema,
-            current_relations[base_name],
-        )
+async def _assert_scope_replaced(fixture, prior_relations, prior_rows, current_relations):
+    """Only exact terminal scratch names retire; the replacement starts empty for normal COPY."""
+    for base_name, rows in prior_rows.items():
+        assert rows
         assert (
             await fixture.database.scalar(
-                "SELECT to_regclass(:relation_ref);",
-                relation_ref=prior_ref,
+                "SELECT to_regclass(:relation_ref)",
+                relation_ref=importer._unscoped_qt(fixture.schema, prior_relations[base_name]),
             )
             is None
         )
-        assert (
-            int(
-                await fixture.database.scalar(
-                    "SELECT to_regclass(:relation_ref)::oid::bigint;",
-                    relation_ref=current_ref,
-                )
-            )
-            != prior_oid
-        )
+        assert await _scope_rows(fixture, current_relations[base_name]) == []
 
 
 @pytest.mark.asyncio
@@ -220,7 +196,7 @@ async def test_pg18_fresh_child_recovers_only_terminal_parent_scope(
     async with _artifact_fixture(monkeypatch) as fixture:
         await _drop_fixture_scope(fixture)
         await _create_recovery_metadata_tables(fixture)
-        prior_relations, prior_oids = await _create_owner_scope(
+        prior_relations, prior_rows = await _create_owner_scope(
             fixture,
             _PRIOR_RUN_ID,
             index_phase=index_phase,
@@ -255,7 +231,7 @@ async def test_pg18_fresh_child_recovers_only_terminal_parent_scope(
         await _assert_scope_replaced(
             fixture,
             prior_relations,
-            prior_oids,
+            prior_rows,
             plan.relation_by_table,
         )
 
@@ -267,7 +243,7 @@ async def test_pg18_current_owner_refusal_preserves_every_scope_oid(
     async with _artifact_fixture(monkeypatch) as fixture:
         await _drop_fixture_scope(fixture)
         await _create_recovery_metadata_tables(fixture)
-        current_relations, current_oids = await _create_owner_scope(
+        current_relations, current_rows = await _create_owner_scope(
             fixture,
             _CURRENT_RUN_ID,
         )
@@ -295,15 +271,56 @@ async def test_pg18_current_owner_refusal_preserves_every_scope_oid(
 
         assert plan.created_tables == []
         for base_name, relation_name in current_relations.items():
-            assert (
-                int(
-                    await fixture.database.scalar(
-                        "SELECT to_regclass(:relation_ref)::oid::bigint;",
-                        relation_ref=importer._unscoped_qt(
-                            fixture.schema,
-                            relation_name,
-                        ),
+            assert await _scope_rows(fixture, relation_name) == current_rows[base_name]
+
+
+async def _assert_native_heap_drift(fixture, prior, coordinates, identities):
+    """Keep complete heap/default/index refusals under real rollback boundaries."""
+    async with fixture.database.transaction() as session:
+        for statement in (
+            f'ALTER TABLE "{fixture.schema}"."{prior}" ADD COLUMN unexpected text',
+            f'ALTER TABLE "{fixture.schema}"."{prior}" ALTER COLUMN source_id SET DEFAULT \'changed\'',
+            f'CREATE INDEX unexpected_recovery_index ON "{fixture.schema}"."{prior}" (resource_id)',
+        ):
+            nested = await session.begin_nested()
+            try:
+                await fixture.database.status(statement)
+                with pytest.raises(importer.ProviderDirectoryArtifactBuildStale):
+                    await importer._assert_artifact_scope_recovery_layouts(
+                        fixture.schema, coordinates, identities, None
                     )
-                )
-                == current_oids[base_name]
+            finally:
+                await nested.rollback()
+
+
+@pytest.mark.asyncio
+async def test_native_named_recovery_preserves_index_phases_and_refuses_heap_drift(monkeypatch):
+    """Exercise real heap/default/column/index catalogs independently of admission metadata."""
+    from types import SimpleNamespace
+
+    async with _artifact_fixture(monkeypatch) as fixture:
+        model = importer.ProviderDirectoryPractitionerRole
+        prior, current = "named_recovery_prior", "named_recovery_current"
+        for name in (prior, current):
+            await importer._create_provider_directory_artifact_scope_layout(
+                model, fixture.schema, name, status_executor=fixture.database.status
             )
+        coordinates = (
+            SimpleNamespace(base_table_name=model.__tablename__, prior_table_name=prior, current_table_name=current),
+        )
+        identities = await importer._artifact_scope_relation_identities(fixture.schema, [prior])
+        await fixture.database.status(
+            f'CREATE UNLOGGED TABLE "{fixture.schema}".copied_scope (discarded integer,LIKE "{fixture.schema}"."{prior}" INCLUDING ALL)'
+        )
+        await fixture.database.status(f'ALTER TABLE "{fixture.schema}".copied_scope DROP COLUMN discarded')
+        await fixture.database.status(f'DROP TABLE "{fixture.schema}"."{prior}" RESTRICT')
+        await fixture.database.status(f'ALTER TABLE "{fixture.schema}".copied_scope RENAME TO "{prior}"')
+        await importer._assert_artifact_scope_recovery_layouts(fixture.schema, coordinates, identities, None)
+        statements = importer._artifact_scope_pk_sql(model, fixture.schema, prior)
+        for statement in statements:
+            await fixture.database.status(statement)
+            await importer._assert_artifact_scope_recovery_layouts(fixture.schema, coordinates, identities, None)
+        _bucket, bucket_sql = importer._provider_directory_profile_bucket_index_sql(fixture.schema, prior)
+        await fixture.database.status(bucket_sql)
+        await importer._assert_artifact_scope_recovery_layouts(fixture.schema, coordinates, identities, None)
+        await _assert_native_heap_drift(fixture, prior, coordinates, identities)

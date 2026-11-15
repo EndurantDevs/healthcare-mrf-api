@@ -1194,16 +1194,11 @@ async def _replayed_source_registry_admission(fhir, candidate):
         driver = publisher.connection
         dataset_row = await driver.fetchrow(_source_registry_replay_sql(fhir), candidate.dataset_id)
         seal = _source_registry_replay_seal(candidate, dataset_row)
-        resource_oid = await driver.fetchval(
-            "SELECT to_regclass($1)::oid::bigint",
-            storage_relation(publisher.policy.schema, "provider_directory_dataset_resource"),
-        )
         pin = SimpleNamespace(
             schema_name=publisher.policy.schema,
             dataset_id=candidate.dataset_id,
             endpoint_id=candidate.endpoint_id,
             dataset_sha256=dataset_row["dataset_hash"],
-            resource_table_oid=resource_oid,
             release_id=candidate.source_release["vector_sha256"],
         )
         custody = await _generic_partitioned_custody(
@@ -1590,7 +1585,7 @@ def _isolated_candidate_result(candidate, identity, finalization):
     )
 
     handoff = finalization.get("source_candidate_handoff")
-    if type(handoff) is not dict or set(handoff) != {"document", "sha256"}:
+    if type(handoff) is not dict or set(handoff) - {"producer"} != {"document", "sha256"}:
         raise RuntimeError("cms_npd_isolated_handoff_required")
     document = handoff["document"]
     validate_handoff_document(document, document.get("storage"))

@@ -243,7 +243,7 @@ async def test_native_null_session_exception_is_only_exact_service_operation(ref
     )
 
 
-async def test_missing_profile_and_unsafe_native_address_subject_fail_closed(refresh_queue_db):
+async def test_missing_address_profile_fails_closed_before_enqueue(refresh_queue_db):
     fixture = refresh_queue_db
     async with authorize() as client:
         async with fixture.connection.transaction(isolation="repeatable_read"):
@@ -255,11 +255,6 @@ async def test_missing_profile_and_unsafe_native_address_subject_fail_closed(ref
                     address_profile=None,
                     control_schema=fixture.schema,
                 )
-        await fixture.admin.execute(
-            f'GRANT UPDATE ON "{fixture.source.schema}".entity_address_unified TO "{fixture.source.roles["reader"]}"'
-        )
-        with pytest.raises(RegistryMembershipRefreshUnavailable):
-            await enqueue(fixture, client)
     assert await stored(fixture) is None
 
 

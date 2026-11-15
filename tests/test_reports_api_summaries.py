@@ -123,9 +123,9 @@ async def test_query_pharmacy_state_stats_normalizes_and_zero_fills_states(monke
     ]
 
     class Session:
-        async def execute(self, stmt, params):
+        async def execute(self, stmt, params=None):
             assert "WITH pharmacy_taxonomy AS" in stmt.text
-            assert params == {}
+            assert params is None
             return _FakeMappingsResult(pharmacy_rows)
 
     state_summaries, has_helper = await reports._query_pharmacy_state_stats(Session())

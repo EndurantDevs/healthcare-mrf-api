@@ -88,19 +88,21 @@ async def test_prepare_uses_exact_main_and_support_stage_set_without_worker_shut
 
 
 def _publisher_reimport_callbacks(session, stage, selected, events, failure):
-    """Observe the exact protected seal, projection and validation order."""
+    """Observe real semantic preparation, native write closure and validation order."""
 
-    async def seal(actual, oid, owner):
-        assert actual is session and (oid, owner) == (42, 31)
-        events.append("seal")
+    async def freeze(driver, schema, **options):
+        assert driver == "driver" and schema == "mrf"
+        assert options["relation_names"][0] == stage.__tablename__
+        assert options["namespace_owner"] == "snapshot_owner"
+        assert options["reader_roles"] == ("snapshot_reader",)
+        assert options["freeze_schema"] is False
+        events.append("freeze")
+        if failure == "permission":
+            raise PermissionError("native write closure denied")
 
-    async def state_lock(actual, schema, owner):
-        assert actual is session and (schema, owner) == ("mrf", 31)
+    async def state_lock(actual, schema):
+        assert actual is session and schema == "mrf"
         events.append("state lock")
-
-    async def mutation(actual, oids, owner):
-        assert actual is session and (oids, owner) == ([99], 31)
-        events.append("ordinary denial")
 
     async def project(schema, table, **options):
         assert (schema, table) == ("mrf", stage.__tablename__)
@@ -109,37 +111,33 @@ def _publisher_reimport_callbacks(session, stage, selected, events, failure):
         events.append("projection")
         if failure == "projection":
             raise RuntimeError("projection failed")
-        options["context"]["geo_assurance_candidate_table_oid"] = 43 if failure == "oid" else 42
+        options["context"]["geo_assurance_candidate_relation"] = {
+            "schema_name": schema,
+            "relation_name": "foreign" if failure == "relation" else table,
+        }
         return 7
 
-    return seal, state_lock, mutation, project
+    return freeze, state_lock, project
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", (None, "owner", "projection", "oid"))
-async def test_publisher_reimport_seals_before_projection_and_receipt(monkeypatch, failure):
-    """Only the authenticated Publisher may receipt the exact sealed, selected stage."""
+@pytest.mark.parametrize("failure", (None, "permission", "projection", "relation"))
+async def test_publisher_reimport_closes_native_writes_after_projection_before_validation(monkeypatch, failure):
     from process import entity_address_snapshot_preparation as protected
+    from process import provider_directory_generic_source_provision as provision
+    from process import reference_family_archive as archive
     from tests.test_geo_assurance_dependency_bindings import _example_bindings
 
     events, selected = [], _example_bindings()
     stage = SimpleNamespace(__tablename__="entity_address_unified_synthetic")
     swaps = [SimpleNamespace(stage_cls=stage)]
     swaps.extend(SimpleNamespace(stage_cls=SimpleNamespace(__tablename__=f"support_{i}")) for i in range(6))
-
-    async def scalar(statement, parameters):
-        if "relowner=:owner" in str(statement):
-            assert parameters == {"relation": '"mrf"."entity_address_geo_assurance_state"', "owner": 31}
-            events.append("owner")
-            return None if failure == "owner" else 99
-        return 42
-
-    session = SimpleNamespace(execute=AsyncMock(), scalar=scalar)
+    session = SimpleNamespace(execute=AsyncMock())
     monkeypatch.setattr(native.db, "_transaction_binding", lambda: SimpleNamespace(session=session))
-    monkeypatch.setattr(protected, "_publisher_authority", AsyncMock(return_value=31))
+    monkeypatch.setattr(protected, "_publisher_authority", AsyncMock())
     monkeypatch.setattr(protected, "_require_alias_authority", AsyncMock())
     monkeypatch.setattr(adoption, "_prepared_full_result_stage", lambda **_: (stage, {}, swaps, [], [], []))
-    seal, state_lock, mutation, project = _publisher_reimport_callbacks(session, stage, selected, events, failure)
+    freeze, state_lock, project = _publisher_reimport_callbacks(session, stage, selected, events, failure)
     prepared = SimpleNamespace(context={})
 
     async def validate(**options):
@@ -147,30 +145,42 @@ async def test_publisher_reimport_seals_before_projection_and_receipt(monkeypatc
         events.append("validation")
         return prepared
 
-    monkeypatch.setattr(protected, "_seal_published_relation", seal)
+    monkeypatch.setattr(provision, "freeze_fhir_source_snapshot", freeze)
+    monkeypatch.setattr(archive, "model_family_roles", lambda: ("snapshot_owner", ("snapshot_reader",)))
+    monkeypatch.setattr(archive, "_native_model_copy_driver", AsyncMock(return_value="driver"))
     monkeypatch.setattr(protected, "_lock_publication_state", state_lock)
-    monkeypatch.setattr(protected, "_require_no_untrusted_mutation", mutation)
     monkeypatch.setattr(native, "_materialize_geo_assurance", project)
     monkeypatch.setattr(adoption, "prepare_completed_entity_address_snapshot_adoption", validate)
     if failure:
         with pytest.raises(
-            RuntimeError,
-            match={"owner": "geo state owner", "projection": "projection failed", "oid": "projection stage"}[failure],
+            (RuntimeError, PermissionError),
+            match={
+                "permission": "native write closure denied",
+                "projection": "projection failed",
+                "relation": "projection stage",
+            }[failure],
         ):
             await adoption.prepare_entity_address_publisher_reimport(
                 session, db_schema="mrf", import_date="synthetic", dependency_bindings=selected
             )
         assert "validation" not in events
-        if failure == "owner":
-            assert "projection" not in events
+        if failure in {"projection", "relation"}:
+            assert "freeze" not in events
     else:
         actual = await adoption.prepare_entity_address_publisher_reimport(
             session, db_schema="mrf", import_date="synthetic", dependency_bindings=selected
         )
         assert actual is prepared
-        assert events == ["seal"] * 7 + ["state lock", "owner", "ordinary denial", "projection", "validation"]
+        assert events == ["state lock", "projection", "freeze", "validation"]
         assert actual.context["geo_assurance_projected_rows"] == 7
-        assert actual.context["geo_assurance_candidate_table_oid"] == 42
+        assert actual.context["geo_assurance_candidate_relation"] == {
+            "schema_name": "mrf",
+            "relation_name": stage.__tablename__,
+        }
+        assert actual.context["stage_relations"] == [
+            {"schema_name": "mrf", "relation_name": swap.stage_cls.__tablename__} for swap in swaps
+        ]
+        assert "protected_owner_oid" not in actual.context
 
 
 @pytest.mark.asyncio
@@ -460,10 +470,53 @@ async def test_native_cutover_rejects_adoption_without_a_bound_caller_transactio
     with pytest.raises(RuntimeError, match="caller-owned database transaction"):
         await native._run_entity_address_cutover(
             "mrf",
+            [
+                SimpleNamespace(
+                    stage_cls=SimpleNamespace(__tablename__="entity_address_unified_stage"),
+                    live_cls=SimpleNamespace(__main_table__="entity_address_unified"),
+                )
+            ],
             [],
             [],
             [],
-            [],
-            {},
+            {
+                "geo_assurance_candidate_relation": {
+                    "schema_name": "mrf",
+                    "relation_name": "entity_address_unified_stage",
+                }
+            },
             require_caller_owned_transaction=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_validated_legacy_data_uses_closed_named_rotation_without_relabeling(monkeypatch):
+    stage, supports, swaps, _patches, _relations, _required = adoption._prepared_full_result_stage(
+        db_schema="mrf", import_date="20260913"
+    )
+    assert len(swaps) == 7 and len(supports) == 6
+    context_by_field = {
+        "stage_relations": [{"schema_name": "mrf", "relation_name": swap.stage_cls.__tablename__} for swap in swaps]
+    }
+    reads = AsyncMock(return_value=0)
+    monkeypatch.setattr(native.db, "scalar", reads)
+    legacy_lookup = AsyncMock(side_effect=AssertionError("validated named data must use immutable rotation"))
+    monkeypatch.setattr(adoption, "_is_registered_snapshot", legacy_lookup)
+    retained_names = []
+
+    async def rotate(schema, live, actual_stage, *, serving_generation):
+        assert serving_generation == _source_generation()
+        assert schema == "mrf"
+        assert actual_stage.__tablename__ in {swap.stage_cls.__tablename__ for swap in swaps}
+        previous_by_field = {"schema_name": schema, "relation_name": live.__main_table__ + "_retained_previous"}
+        retained_names.append(previous_by_field)
+        return previous_by_field
+
+    monkeypatch.setattr(adoption, "_swap_sealed_stage_table", rotate)
+    await adoption._require_protected_cutover("mrf", swaps, context_by_field)
+    await adoption._publish_result_swaps("mrf", swaps, context_by_field, serving_generation=_source_generation())
+    assert context_by_field["retained_relations"] == retained_names and len(retained_names) == 7
+    assert "snapshot_contract" not in context_by_field
+    assert reads.await_count == 7
+    legacy_lookup.assert_not_awaited()
+    assert stage.__tablename__ == "entity_address_unified_20260913"

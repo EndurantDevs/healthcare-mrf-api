@@ -120,8 +120,6 @@ async def test_finish_detaches_allocation_before_awaiting_frozen_inputs(monkeypa
     allocation_by_field = {
         "contract": CONTRACT,
         "workspace": deepcopy(binding_by_field),
-        "transaction": "100",
-        "header_xmin": "101",
         "inventory": [],
     }
     connection = SimpleNamespace(fetchval=AsyncMock(return_value=False), execute=AsyncMock())
@@ -135,10 +133,15 @@ async def test_finish_detaches_allocation_before_awaiting_frozen_inputs(monkeypa
     async def savepoint(_):
         yield
 
+    async def refuse_adoption(workspace, handoff, allocation):
+        assert allocation["workspace"] == binding_by_field
+        raise ValueError("allocation_header_changed")
+
+    monkeypatch.setattr(candidate, "adopt_prepared_cms_allocation", refuse_adoption)
     monkeypatch.setattr(candidate, "_inputs", change_caller_receipt)
     monkeypatch.setattr(candidate, "_savepoint", savepoint)
-    with pytest.raises(ValueError, match="allocation_not_committed"):
+    with pytest.raises(ValueError, match="allocation_header_changed"):
         await candidate.finish_prepared_cms_candidate(workspace, None, allocation=allocation_by_field)
     assert allocation_by_field["workspace"] != binding_by_field
-    connection.fetchval.assert_awaited_once()
+    connection.fetchval.assert_not_awaited()
     connection.execute.assert_not_called()

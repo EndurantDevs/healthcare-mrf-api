@@ -60,24 +60,6 @@ async def _publish_historical_practitioner(candidate_acquisition_id, endpoint_id
         )
 
 
-async def _publish_historical_rooted(publication_acquisition_id, *, database, batch_size=4096):
-    if (
-        type(batch_size) is not int
-        or not 1 <= batch_size <= rooted.PROVIDER_DIRECTORY_ROOTED_GRAPH_MATERIALIZATION_MAX_BATCH_ROWS
-    ):
-        raise ValueError("provider_directory_rooted_graph_batch_size_invalid")
-    try:
-        async with database.transaction():
-            await database.scalar(
-                "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:lock_identity, 0))",
-                lock_identity=rooted.EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
-            )
-            return await rooted._locked_publication_result(database, publication_acquisition_id, batch_size)
-    except rooted.ProviderDirectoryDatasetScopedPublicationError as error:
-        code = error.code if error.code in {"foreign_current", "source_drift"} else "state"
-        raise rooted.ProviderDirectoryRootedGraphPublicationError(code) from error
-
-
 @contextmanager
 def historical_publication_scope(monkeypatch):
     """Keep old storage and its real validators confined to migration proofs."""
@@ -88,7 +70,6 @@ def historical_publication_scope(monkeypatch):
         patch.setattr(terminal, "PROVIDER_DIRECTORY_ROOTED_GRAPH_AFFILIATION_FILTER_RECIPE_ID", "")
         patch.setattr(practitioner, "publish_registered_uhc_flex_dataset", _publish_historical_practitioner)
         patch.setattr(rotation, "publish_registered_uhc_flex_dataset", _publish_historical_practitioner)
-        patch.setattr(rooted, "publish_admitted_rooted_graph_dataset", _publish_historical_rooted)
         for store in (practitioner, rooted):
             patch.setattr(store, "prepare_dataset_candidate", _historical_candidate)
         patch.setattr(candidates, "copy_dataset_candidate_rows", _copy_historical_candidate)

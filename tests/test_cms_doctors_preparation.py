@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Small preparation preconditions and shared source-validation contracts."""
 
+import asyncio
 import importlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -51,3 +52,98 @@ async def test_source_preparation_reuses_validation_without_publication(monkeypa
     assert metrics["organization_groups"] == 101 and metrics["sites"] == 71
     native._publish_cms_doctors_stage.assert_not_awaited()
     native.mark_control_run.assert_not_awaited()
+
+
+def test_prepared_stage_names_project_saved_tokens_without_mutating_them():
+    from copy import deepcopy
+
+    stages = tuple(
+        (model.__tablename__, native.make_class(model, "synthetic").__tablename__) for model in preparation._models()
+    )
+    saved = SimpleNamespace(
+        import_date="synthetic", stage_oids=tuple((*entry, {"opaque": index}) for index, entry in enumerate(stages))
+    )
+    before = deepcopy(vars(saved))
+    assert preparation.prepared_stage_relations(saved) == stages
+    assert vars(saved) == before
+    assert (
+        preparation.prepared_stage_relations(SimpleNamespace(import_date="synthetic", stage_relations=stages)) == stages
+    )
+
+
+@pytest.mark.parametrize("fault", ["missing", "duplicate", "target", "stage", "extra", "physical"])
+def test_prepared_stage_names_require_complete_declared_model_family(fault):
+    stages = tuple(
+        (model.__tablename__, native.make_class(model, "synthetic").__tablename__) for model in preparation._models()
+    )
+    match fault:
+        case "missing":
+            stages = stages[:1]
+        case "duplicate":
+            stages = (stages[0],) * 3
+        case "target":
+            stages = (("other", stages[0][1]), *stages[1:])
+        case "stage":
+            stages = ((stages[0][0], "other"), *stages[1:])
+        case "extra":
+            stages = (*stages, ("other", "other"))
+        case "physical":
+            stages = tuple((*entry, 41) for entry in stages)
+    with pytest.raises(RuntimeError, match="family_incomplete"):
+        preparation.prepared_stage_relations(SimpleNamespace(import_date="synthetic", stage_relations=stages))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_only", [False, True])
+async def test_publication_read_locks_frozen_heaps_and_preserves_mutable_stage_lock(monkeypatch, read_only):
+    """Inspection keeps read rights; native DDL closes cutover locks in the reader's order."""
+    names = tuple(model.__main_table__ for model in preparation._models())
+    existing = (*names, *(name + "_old" for name in names))
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: existing)))
+    )
+    stage = native.make_class(native.DoctorClinicianAddress, "synthetic")
+    locks = AsyncMock()
+    monkeypatch.setattr(native, "_lock_family", locks)
+    await native._lock_cms_doctors_publication(session, stage, "mrf", "synthetic", stage_read_only=read_only)
+    stages = tuple(sorted(native.make_class(model, "synthetic").__tablename__ for model in preparation._models()))
+    assert locks.await_args_list[0].args == (
+        session,
+        "mrf",
+        stages,
+        "ACCESS SHARE" if read_only else "ACCESS EXCLUSIVE",
+    )
+    assert locks.await_args_list[1].args == (session, "mrf", tuple(sorted(existing)), "ACCESS SHARE")
+    assert all(call.kwargs == {"nowait": True} for call in locks.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_publication_rejects_nonboolean_frozen_stage_flag(monkeypatch):
+    session = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])))
+    )
+    locks = AsyncMock()
+    monkeypatch.setattr(native, "_lock_family", locks)
+    with pytest.raises(RuntimeError, match="lock_scope_invalid"):
+        await native._lock_cms_doctors_publication(
+            session,
+            native.make_class(native.DoctorClinicianAddress, "synthetic"),
+            "mrf",
+            "synthetic",
+            stage_read_only="true",
+        )
+    locks.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cutover_wait_spends_one_shared_budget_across_live_tables(monkeypatch):
+    session = SimpleNamespace(execute=AsyncMock())
+    monkeypatch.setattr(native.db, "_transaction_binding", lambda: SimpleNamespace(session=session))
+    await native._bound_cutover_wait(None)
+    session.execute.assert_not_awaited()
+    loop_time = asyncio.get_running_loop().time()
+    await native._bound_cutover_wait(loop_time + 0.06)
+    await native._bound_cutover_wait(loop_time - 1)
+    values = [call.args[1]["value"] for call in session.execute.await_args_list]
+    # Later live tables wait only for what remains of the 100 ms budget, never less than 1 ms.
+    assert int(values[0].removesuffix("ms")) <= 60 and values[1] == "1ms"

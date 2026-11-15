@@ -4,6 +4,8 @@
 
 import json
 from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 import asyncpg
@@ -11,9 +13,11 @@ import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import MetaData, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db.connection import Database, db
+from process import entity_address_alias_guard as alias_guard
 from process import entity_address_snapshot_preparation as preparation
 from tests import test_address_numeric_grid_alias_db as numeric
 from tests import test_entity_address_snapshot_destination as fixture
@@ -22,7 +26,7 @@ from tests.test_entity_address_alias_guard_postgres import _admin_url, _owned_gu
 from tests.test_provider_directory_profile_capacity_adoption_postgres import _upgrade_disposable_schema_to_head
 
 _SCHEMA = "migrated_address"
-_HEAD = "20261114020000_custom_import_snapshot_metadata"
+_HEAD = "20261116090000_profile_capacity_logical_names"
 _ROLE_SCHEMA_REVISION = "20261019030000_provider_directory_role_schema"
 
 
@@ -154,11 +158,11 @@ async def _provision_migrated_roles(resources, database_name):
             else roles["writer"]
         )
         await admin.execute(f'ALTER TABLE "{_SCHEMA}"."{catalog_row["relname"]}" OWNER TO "{owner}"')
-    for function in (*preparation.alias_guard.GUARDS, *preparation._cms_guard_bodies(_SCHEMA)):
+    for function in alias_guard.GUARDS:
         await admin.execute(f'ALTER FUNCTION "{_SCHEMA}"."{function}"() OWNER TO "{roles["owner"]}"')
     await admin.execute(f'GRANT SELECT ON "{_SCHEMA}".address_alias_state_v1 TO "{roles["writer"]}"')
     await admin.execute(
-        f"GRANT SELECT,INSERT,UPDATE ({','.join(preparation.alias_guard.REVOCATION_COLUMNS)}) "
+        f"GRANT SELECT,INSERT,UPDATE ({','.join(alias_guard.REVOCATION_COLUMNS)}) "
         f'ON "{_SCHEMA}".address_alias_v1 TO "{roles["writer"]}"'
     )
     await admin.execute(f'GRANT USAGE ON SCHEMA tiger TO "{roles["writer"]}"')
@@ -235,8 +239,9 @@ async def _prepared_candidate():
             )
             == 1
         )
-        assert await db.scalar(native._activate_geo_assurance_candidate_sql(_SCHEMA)) == await db.scalar(
-            "SELECT to_regclass(:name)::oid", name=f"{_SCHEMA}.entity_address_unified"
+        assert (
+            await db.scalar(native._activate_geo_assurance_candidate_sql(_SCHEMA))
+            == native.geo_projection.GEO_ASSURANCE_VERSION
         )
     async with db.transaction() as session:
         incumbent = await preparation.serving.capture_entity_address_receive_admission(session, schema_name=_SCHEMA)
@@ -258,22 +263,21 @@ async def _prepared_candidate():
 
 
 async def _freeze_candidate(resources, owner):
-    admin, roles = resources.admin, resources.roles
-    await admin.execute(f'ALTER SCHEMA "{owner.schema_name}" OWNER TO "{roles["owner"]}"')
-    await admin.execute(f'REVOKE ALL ON SCHEMA "{owner.schema_name}" FROM "{roles["writer"]}",PUBLIC')
-    for table, _oid in owner.relation_oids:
-        await admin.execute(f'ALTER TABLE "{owner.schema_name}"."{table}" OWNER TO "{roles["owner"]}"')
-        await admin.execute(f'REVOKE ALL ON "{owner.schema_name}"."{table}" FROM "{roles["writer"]}",PUBLIC')
-    sequence = preparation._EVIDENCE_SEQUENCE
-    await admin.execute(f'REVOKE ALL ON SEQUENCE "{owner.schema_name}"."{sequence}" FROM "{roles["writer"]}",PUBLIC')
+    from process.cms_doctors_immutable import _freeze_named_model_relations
+
+    async with resources.publisher.session_factory() as session, session.begin():
+        await session.execute(text(f'ALTER SCHEMA "{owner.schema_name}" OWNER TO "{resources.roles["owner"]}"'))
+        await _freeze_named_model_relations(session, owner.schema_name, owner.relation_names)
+        await session.execute(text(f'GRANT USAGE ON SCHEMA "{owner.schema_name}" TO "{resources.roles["writer"]}"'))
+        await session.execute(
+            text(f'REVOKE CREATE ON SCHEMA "{owner.schema_name}" FROM "{resources.roles["writer"]}",PUBLIC')
+        )
     inventory_by_field = {
         "schema_name": owner.schema_name,
-        "schema_oid": owner.schema_oid,
-        "relations": [{"table_name": table, "relation_oid": oid} for table, oid in owner.relation_oids],
+        "relations": [{"schema_name": owner.schema_name, "relation_name": name} for name in owner.relation_names],
         "sequences": [
             {
-                "sequence_name": sequence,
-                "sequence_oid": await admin.fetchval("SELECT to_regclass($1)::oid", f"{owner.schema_name}.{sequence}"),
+                "sequence_name": preparation._EVIDENCE_SEQUENCE,
                 "owner_table": "entity_address_evidence",
                 "owner_column": "evidence_id",
             }
@@ -283,15 +287,13 @@ async def _freeze_candidate(resources, owner):
         "state": "frozen",
         "inventory": inventory_by_field,
         "inventory_sha256": preparation._digest(inventory_by_field),
-        "builder_oid": await admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", roles["writer"]),
-        "frozen_owner_oid": await admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", roles["owner"]),
     }
 
 
 async def _activate(resources, stored, proof, incumbent, events, *, fail_after_publish=False):
     async def authenticate(session, supplied, validation):
         assert supplied == proof
-        assert await session.scalar(text("SELECT session_user=current_user")) is True
+        assert session.in_transaction()
         assert validation == proof.get("validation", {}).get("evidence")
         return proof
 
@@ -303,7 +305,7 @@ async def _activate(resources, stored, proof, incumbent, events, *, fail_after_p
         proof.update(state="validated", validation={"evidence": validation})
 
     async def before():
-        assert await db.scalar("SELECT current_user") == resources.roles["publisher"]
+        assert db._transaction_binding().session.in_transaction()
         events.append("before")
 
     async def after():
@@ -331,31 +333,20 @@ async def _activate(resources, stored, proof, incumbent, events, *, fail_after_p
 
 
 async def _guard_refusals(resources, proof):
+    """Prove frozen data is readable while real runtime DML and DDL are denied."""
+    inventory = proof["inventory"]
+    for relation in inventory["relations"]:
+        table = f'"{inventory["schema_name"]}"."{relation["relation_name"]}"'
+        assert await db.scalar(f"SELECT count(*) FROM {table}") >= 0
+        for statement in (
+            f"DELETE FROM {table} WHERE FALSE",
+            f"ALTER TABLE {table} ADD COLUMN forbidden_write integer",
+        ):
+            with pytest.raises(DBAPIError) as caught:
+                async with db.transaction() as session:
+                    await session.execute(text(statement))
+            assert caught.value.orig.sqlstate == "42501"
     schema = f'"{_SCHEMA}"'
-    cases = (
-        (f'ALTER FUNCTION {schema}.cms_serving_address_transition() OWNER TO "{resources.roles["writer"]}"', "guards"),
-        (
-            f"CREATE OR REPLACE FUNCTION {schema}.cms_serving_no_truncate() RETURNS trigger LANGUAGE plpgsql "
-            "SET search_path=pg_catalog AS $$ BEGIN RETURN NULL; END $$",
-            "guards",
-        ),
-        (
-            f"ALTER TABLE {schema}.entity_address_result_generation DISABLE TRIGGER cms_serving_address_transition",
-            "guards",
-        ),
-        (
-            f"CREATE TRIGGER unexpected_guard BEFORE TRUNCATE ON {schema}.entity_address_result_generation "
-            f"FOR EACH STATEMENT EXECUTE FUNCTION {schema}.cms_serving_no_truncate()",
-            "guards",
-        ),
-    )
-    for statement, message in cases:
-        with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match=message):
-            async with resources.publisher.transaction() as session:
-                await session.execute(text(statement))
-                await preparation._lock_publication_state(session, _SCHEMA, proof["frozen_owner_oid"])
-    # A transaction-local synthetic receipt proves the nonempty branch without
-    # claiming a valid composite publication or bypassing its deferred guards.
     receipt_payload = json.dumps(
         {
             "address": {"local_lineage_id": str(uuid4()), "local_generation": 0},
@@ -366,79 +357,86 @@ async def _guard_refusals(resources, proof):
         async with resources.publisher.transaction() as session:
             await session.execute(
                 text(
-                    f"INSERT INTO {schema}.provider_directory_cms_serving_receipt(receipt_id,payload) "
-                    "SELECT encode(sha256(convert_to(value::text,'UTF8')),'hex'),value "
-                    "FROM (SELECT CAST(:payload AS jsonb) AS value) input"
+                    f"INSERT INTO {schema}.provider_directory_cms_serving_receipt(receipt_id,payload) SELECT encode(sha256(convert_to(value::text,'UTF8')),'hex'),value FROM (SELECT CAST(:payload AS jsonb) AS value) input"
                 ),
                 {"payload": receipt_payload},
             )
-            await preparation._lock_publication_state(session, _SCHEMA, proof["frozen_owner_oid"])
+            await preparation._lock_publication_state(session, _SCHEMA)
 
 
 async def _receipt_index_refusals(resources, proof):
-    schema = f'"{_SCHEMA}"'
-    index = preparation.REGISTRY_CAPTURE_INDEX
-    for unique, expression, predicate, include in (
-        ("UNIQUE", "registry_source_pair_json->>'protocol'", "registry_source_pair_json IS NOT NULL", ""),
-        ("", "registry_source_pair_json->>'capture_id'", "registry_source_pair_json IS NOT NULL", ""),
-        ("UNIQUE", "registry_source_pair_json->>'capture_id'", "registry_source_pair_json IS NULL", ""),
-        ("UNIQUE", "registry_source_pair_json->>'capture_id'", None, ""),
-        (
-            "UNIQUE",
-            "registry_source_pair_json->>'capture_id'",
-            "registry_source_pair_json IS NOT NULL",
-            " INCLUDE (receipt_id)",
-        ),
+    """Reject actual unsupported mutable-state topology rather than retired catalog seals."""
+    for table, alteration in (
+        ("entity_address_geo_assurance_state", "ENABLE ROW LEVEL SECURITY"),
+        ("entity_address_geo_assurance_state", "FORCE ROW LEVEL SECURITY"),
+        ("entity_address_geo_assurance_state", "SET UNLOGGED"),
+        ("entity_address_result_generation", "ENABLE ROW LEVEL SECURITY"),
+        ("entity_address_result_generation", "SET UNLOGGED"),
     ):
-        with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="CMS receipt catalog"):
+        with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="publication state layout differs"):
             async with resources.publisher.transaction() as session:
-                await session.execute(text(f'DROP INDEX {schema}."{index}"'))
-                await session.execute(
-                    text(
-                        f'CREATE {unique} INDEX "{index}" ON {schema}.{preparation._CMS_RECEIPT_TABLE} (({expression}))'
-                        + include
-                        + (f" WHERE {predicate}" if predicate is not None else "")
-                    )
-                )
-                await preparation._lock_publication_state(session, _SCHEMA, proof["frozen_owner_oid"])
+                await session.execute(text(f'ALTER TABLE "{_SCHEMA}"."{table}" {alteration}'))
+                await preparation._lock_publication_state(session, _SCHEMA)
 
 
 async def migrated_head_sealed_activation(monkeypatch):
-    async with _owned_guard_database(monkeypatch) as resources:
-        await _migrated_tables(resources, monkeypatch)
-        owner, stored, incumbent = await _prepared_candidate()
-        proof = await _freeze_candidate(resources, owner)
-        await _receipt_index_refusals(resources, proof)
-        await _guard_refusals(resources, proof)
-        events = []
-        with pytest.raises(RuntimeError, match="synthetic late publication failure"):
-            await _activate(resources, stored, proof, incumbent, events, fail_after_publish=True)
-        assert events == ["before", "after"]
-        async with db.transaction() as session:
-            unchanged = await preparation.serving.capture_entity_address_receive_admission(session, schema_name=_SCHEMA)
-            assert unchanged.as_dict() == incumbent
-        async with resources.publisher.session_factory() as session, session.begin():
+    with TemporaryDirectory(prefix="migrated_address_policy_") as folder:
+        async with _owned_guard_database(monkeypatch) as resources:
+            policy = Path(folder) / "roles.json"
+            policy.write_text(
+                json.dumps(
+                    {
+                        "owner_role": resources.admin_role,
+                        "migration_role": resources.roles["publisher"],
+                        "preparation_owner_role": resources.roles["owner"],
+                        "runtime_roles": [resources.roles["writer"]],
+                    }
+                )
+            )
+            monkeypatch.setenv("HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE", str(policy))
+            await _migrated_tables(resources, monkeypatch)
+            owner, stored, incumbent = await _prepared_candidate()
+            proof = await _freeze_candidate(resources, owner)
+            await _receipt_index_refusals(resources, proof)
+            await _guard_refusals(resources, proof)
+            events = []
+            with pytest.raises(RuntimeError, match="synthetic late publication failure"):
+                await _activate(resources, stored, proof, incumbent, events, fail_after_publish=True)
+            assert events == ["before", "after"]
+            async with db.transaction() as session:
+                unchanged = await preparation.serving.capture_entity_address_receive_admission(
+                    session, schema_name=_SCHEMA
+                )
+                assert unchanged.as_dict() == incumbent
+            async with resources.publisher.session_factory() as session, session.begin():
+                assert (
+                    await preparation._protected_catalog(session, proof, owner, read_only=True)
+                    == proof["validation"]["evidence"]["inventory"]
+                )
+            events.clear()
+            await _activate(resources, stored, proof, incumbent, events)
+            assert events == ["before", "after"]
             assert (
-                await preparation._protected_catalog(session, proof, owner)
-                == proof["validation"]["evidence"]["catalog_sha256"]
+                await resources.admin.fetchval(
+                    f'SELECT count(*) FROM "{_SCHEMA}".provider_directory_cms_serving_receipt'
+                )
+                == 0
             )
-        events.clear()
-        await _activate(resources, stored, proof, incumbent, events)
-        assert events == ["before", "after"]
-        assert (
-            await resources.admin.fetchval(f'SELECT count(*) FROM "{_SCHEMA}".provider_directory_cms_serving_receipt')
-            == 0
-        )
-        assert await resources.admin.fetchval("SELECT to_regnamespace($1)", owner.schema_name) is None
-        for table, oid in owner.relation_oids:
-            catalog = await resources.admin.fetchrow(
-                "SELECT c.oid,c.relowner FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-                "WHERE n.nspname=$1 AND c.relname=$2",
-                _SCHEMA,
-                table,
-            )
-            assert (catalog["oid"], catalog["relowner"]) == (oid, proof["builder_oid"])
-        authority = await resources.admin.fetchrow(f'SELECT * FROM "{_SCHEMA}".entity_address_result_generation')
-        assert authority["local_generation"] == 0
-        assert authority["origin_generation"] == 27
-        assert str(authority["origin_lineage_id"]) == fixture._source_serving_generation()["origin_lineage_id"]
+            assert await resources.admin.fetchval("SELECT to_regnamespace($1)", owner.schema_name) is None
+            await _assert_published_runtime_denials(resources, owner.relation_names)
+            authority = await resources.admin.fetchrow(f'SELECT * FROM "{_SCHEMA}".entity_address_result_generation')
+            assert authority["local_generation"] == 0
+            assert authority["origin_generation"] == 27
+            assert str(authority["origin_lineage_id"]) == fixture._source_serving_generation()["origin_lineage_id"]
+
+
+async def _assert_published_runtime_denials(resources, relation_names):
+    """Read published names while genuine runtime DML remains denied."""
+    for name in relation_names:
+        if name == "entity_address_alias_authority":
+            continue
+        assert await resources.admin.fetchval("SELECT to_regclass($1) IS NOT NULL", f'{_SCHEMA}."{name}"')
+        with pytest.raises(DBAPIError) as caught:
+            async with db.transaction() as session:
+                await session.execute(text(f'DELETE FROM "{_SCHEMA}"."{name}" WHERE FALSE'))
+        assert caught.value.orig.sqlstate == "42501"

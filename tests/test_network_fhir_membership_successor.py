@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Flat capture selection and old wire compatibility; no native admission claim."""
 
+import hashlib
 import json
 from dataclasses import asdict, replace
 from types import SimpleNamespace
@@ -41,7 +42,7 @@ def test_successor_keeps_original_scope_and_replaces_without_a_chain():
     wrapped = fhir.with_fhir_successor(original, physical)
     assert wrapped.dataset_id == original.dataset_id
     assert wrapped.read_schema_name == physical.read_schema_name
-    assert wrapped.read_resource_table_oid == physical.read_resource_table_oid
+    assert wrapped.read_resource_relation == physical.read_resource_relation
     assert fhir.fhir_physical_source(wrapped) == physical
     assert fhir.with_fhir_successor(wrapped, physical) is wrapped
     next_physical = _successor(original, "accepted-third")
@@ -77,6 +78,59 @@ def test_recipe_roundtrip_preserves_old_bytes_and_binds_both_captures():
         decode_registry_source_recipes(json.dumps(document))
 
 
+def _digest(document):
+    return hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _generic_recipe_and_successor():
+    from tests.test_registry_generic_accepted_capture import _recipe, pin, semantic_capture
+
+    successor = replace(pin(semantic_capture("dataset-next", "2026-02-01")), as_of="2026-02-01")
+    return _recipe(pin(semantic_capture())), successor
+
+
+def _cms_recipe_and_successor():
+    recipe = _cms_epoch_recipe()
+    return recipe, _successor(recipe.source_pin)
+
+
+@pytest.mark.parametrize("saved_recipe", [_cms_recipe_and_successor, _generic_recipe_and_successor])
+def test_recipe_saved_with_a_successor_replays_its_own_three_generations(saved_recipe):
+    recipe, successor = saved_recipe()
+    wrapped = replace(recipe, source_pin=fhir.with_fhir_successor(recipe.source_pin, successor))
+    saved = json.loads(canonical_registry_source_recipes((wrapped,)))
+    saved_pin = saved[0]["source_pin"]
+    # The previous version recorded each resource table by identifier instead of by name.
+    for table_identifier, flat_pin in enumerate((saved_pin, saved_pin["retained_successor"]), 16400):
+        del flat_pin["resource_relation"]
+        flat_pin["resource_table_oid"] = table_identifier
+    saved_id_by_generation = {
+        "logical_generation_id": _digest(saved_pin),
+        "original_generation_id": _digest({key: saved_pin[key] for key in saved_pin if key != "retained_successor"}),
+        "physical_generation_id": _digest(saved_pin["retained_successor"]),
+    }
+    assert len(set(saved_id_by_generation.values())) == 3
+    (decoded,) = decode_registry_source_recipes(json.dumps(saved))
+    assert fhir.fhir_source_witness_binding_v2(decoded.source_pin) == saved_id_by_generation
+    # This version saves names; a later replay still presents the binding saved by the previous one.
+    current_wire = canonical_registry_source_recipes((decoded,))
+    assert "resource_table_oid" not in current_wire
+    (replayed,) = decode_registry_source_recipes(current_wire)
+    assert replayed == decoded
+    assert fhir.fhir_source_witness_binding_v2(replayed.source_pin) == saved_id_by_generation
+    # Another successor is a new recipe: the original keeps its saved generation, the recipe gets a new one.
+    original = replace(decoded.source_pin, retained_successor=None)
+    assert original.logical_edition_id is None
+    assert original.generation_id == saved_id_by_generation["original_generation_id"]
+    advanced = fhir.with_fhir_successor(decoded.source_pin, successor)
+    assert advanced.generation_id not in saved_id_by_generation.values()
+    assert replace(advanced, retained_successor=None) == original
+    saved_pin["logical_edition_id"] = "0" * 64
+    del saved_pin["retained_successor"]
+    with pytest.raises(RegistrySourceRecipeError):
+        decode_registry_source_recipes(json.dumps(saved))
+
+
 def test_producer_request_wire_stays_flat_and_rejects_successor():
     pair = _prepared()
     document = pair.as_dict()
@@ -85,6 +139,7 @@ def test_producer_request_wire_stays_flat_and_rejects_successor():
     assert set(document["request"]["source_pin"]) == set(asdict(pair.request.source_pin)) - {
         "retained_successor",
         "retained_capture",
+        "logical_edition_id",
     }
     wrapped = fhir.with_fhir_successor(pair.recipe.source_pin, _successor(pair.recipe.source_pin))
     with pytest.raises(ValueError, match="registry_cms_retention_request_invalid"):

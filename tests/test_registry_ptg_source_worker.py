@@ -39,6 +39,11 @@ def configuration():
             "approval_role": "office_approver",
             "read_limits": {"maximum_bytes": 1048576, "maximum_pages": 10, "maximum_coordinates": 100},
         },
+        "preparation_roles": {
+            "namespace_owner_role": "snapshot_owner",
+            "publisher_role": "executor",
+            "application_roles": ["executor", "physical_owner", "office_reader", "office_owner", "office_approver"],
+        },
         "event": event(),
     }
 
@@ -263,6 +268,9 @@ def resources(monkeypatch, failure=None):
             raise RuntimeError("synthetic failure")
         harness.options.append(options)
         connection = harness.execution if options["user"] == "executor" else harness.reader
+        if len(harness.options) == 3:
+            assert options["user"] == "executor"
+            connection = Connection("preparation", harness.events)
         return Pool(connection, harness, options)
 
     async def qualify_notifications(connection, store, *, reader_role):
@@ -325,11 +333,12 @@ async def test_typed_event_consumption_qualifies_before_work_and_closes_owned_re
         "runtime qualified",
         "consume",
         "executor released",
+        "preparation closed",
         "runtime disposed",
         "executor closed",
         "office_reader closed",
     ]
-    assert [pool_options["user"] for pool_options in harness.options] == ["office_reader", "executor"]
+    assert [pool_options["user"] for pool_options in harness.options] == ["office_reader", "executor", "executor"]
     assert all(
         pool_options["min_size"] == pool_options["max_size"] == 1 and pool_options["timeout"] == 5
         for pool_options in harness.options
@@ -375,6 +384,14 @@ async def test_runner_failures_drain_and_release_owned_pools_and_runtime(monkeyp
         )
     if failure == "startup":
         assert not harness.events and not harness.options
+    elif failure == "office_reader checkout":
+        assert harness.events == [
+            "executor checkout",
+            "office_reader checkout",
+            "executor released",
+            "executor closed",
+            "office_reader closed",
+        ]
     else:
         assert harness.events[-2:] == ["executor closed", "office_reader closed"]
     if failure in {"runtime qualification", "consume", "cancel", "result"}:
@@ -431,6 +448,7 @@ def test_direct_configuration_refuses_privileged_executor_even_with_matching_dsn
             configured,
             execution_url=configured.execution_url.set(username=role),
             consumer=replace(configured.consumer, execution_role=role),
+            preparation_roles={**configured.preparation_roles, "publisher_role": role},
         )
 
 

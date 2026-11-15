@@ -737,15 +737,11 @@ def _assert_npi_generation_published(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("corruption", ("transaction", "owner", "rls", "grantor", "stage_missing"))
+@pytest.mark.parametrize("corruption", ("transaction", "rls", "stage_missing"))
 async def test_npi_rotation_refuses_unproven_reader_preservation(npi_module, corruption):
     connection = _ShutdownRawConnection({"npi_20251108": 1})
-    if corruption == "owner":
-        connection.read_relation_overrides["npi"] = {"owned": False}
-    elif corruption == "rls":
+    if corruption == "rls":
         connection.read_relation_overrides["npi"] = {"relrowsecurity": True}
-    elif corruption == "grantor":
-        connection.read_grants[0]["grantor"] = 99
     elif corruption == "stage_missing":
         connection.read_relation_overrides["npi_20251108"] = {"oid": None}
 

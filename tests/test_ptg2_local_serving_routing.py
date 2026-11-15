@@ -358,7 +358,7 @@ async def test_provenance_forwards_only_explicit_local_audit_access(monkeypatch)
 def test_all_payload_caches_distinguish_same_key_native_families(monkeypatch, same_namespace):
     first, second = _local_tables(1), _local_tables(2)
     if same_namespace:
-        second = replace(first, physical_binding=replace(first.physical_binding, schema_oid=1001))
+        second = replace(first, physical_binding=replace(first.physical_binding, dataset_id=UUID(int=1001)))
     monkeypatch.setattr(serving, "_PTG2_PROVIDER_NPI_PREFIX_CACHE", OrderedDict())
     monkeypatch.setattr(serving, "_PTG2_PROVIDER_SET_IDS_BY_NPI_CACHE", OrderedDict())
     serving._cache_provider_npi_prefix(first, "set", 1, (1234567890,), is_complete=True)

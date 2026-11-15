@@ -24,19 +24,9 @@ def test_landing_migration_extends_the_unique_current_head():
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["20261114020000_custom_import_snapshot_metadata"]
-    assert script.get_revision("20261114020000_custom_import_snapshot_metadata").down_revision == (
-        "20261114010000_custom_import_snapshot_names"
-    )
-    assert script.get_revision("20261114010000_custom_import_snapshot_names").down_revision == (
-        "20261115010000_ms_drg_companion_tables"
-    )
-    assert script.get_revision("20261115010000_ms_drg_companion_tables").down_revision == (
-        "20261113010000_address_canonical_space_normalization"
-    )
-    assert script.get_revision("20261113010000_address_canonical_space_normalization").down_revision == (
-        "20261111010000_code_sets_publication_idempotency"
-    )
+    from tests.test_company_registry_group_assertion_migration import _assert_source_inventory_migration_head
+
+    _assert_source_inventory_migration_head(script)
     assert (
         script.get_revision("20261107010000_custom_import_child_reference_aggregate").down_revision
         == migration.revision

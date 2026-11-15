@@ -7,6 +7,8 @@ import os
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
+from sqlalchemy import text
+
 from process.provider_directory_generic_source_policy import source_transaction
 from process.uhc_flex_official_cohort_snapshot import prepare_cohort
 from tests import provider_directory_uhc_flex_npi_cohort_pg_support as official
@@ -135,6 +137,27 @@ async def _publish_official_header(database, candidate, proof):
         await directory._publish_validated_artifact_dataset(publication)
 
 
+async def _register_official_source(engine):
+    """The Source publisher only reads registration rows, so the test administrator registers them."""
+    async with engine.begin() as registration:
+        await registration.execute(
+            text(
+                "INSERT INTO mrf.provider_directory_api_endpoint "
+                "(endpoint_id,canonical_api_base,credential_descriptor_hash,endpoint_signature_hash) "
+                "VALUES (:endpoint,:base,repeat('c',64),repeat('d',64))"
+            ),
+            {"endpoint": official.ENDPOINT_ID, "base": BASE},
+        )
+        await registration.execute(
+            text(
+                "INSERT INTO mrf.provider_directory_source "
+                "(source_id,org_name,endpoint_id,canonical_api_base,requires_registration,requires_api_key) "
+                "VALUES (:source,'Official fixture',:endpoint,:base,false,false)"
+            ),
+            {"source": official.UHC_PROVIDER_FILE_SOURCE_ID, "endpoint": official.ENDPOINT_ID, "base": BASE},
+        )
+
+
 @asynccontextmanager
 async def specialized_source_scope(monkeypatch):
     """Reuse the full native callable/namespace/acquisition fixture and its cleanup."""
@@ -162,22 +185,7 @@ async def specialized_source_scope(monkeypatch):
                 settings.setenv("HLTHPRT_DB_" + name, str(setting_value))
             settings.delenv("HLTHPRT_DB_DATABASE_OVERRIDE", raising=False)
             await database._connect_reader()
-            async with source_transaction(database):
-                await database.status(
-                    "INSERT INTO mrf.provider_directory_api_endpoint "
-                    "(endpoint_id,canonical_api_base,credential_descriptor_hash,endpoint_signature_hash) "
-                    "VALUES (:endpoint,:base,repeat('c',64),repeat('d',64))",
-                    endpoint=official.ENDPOINT_ID,
-                    base=BASE,
-                )
-                await database.status(
-                    "INSERT INTO mrf.provider_directory_source "
-                    "(source_id,org_name,endpoint_id,canonical_api_base,requires_registration,requires_api_key) "
-                    "VALUES (:source,'Official fixture',:endpoint,:base,false,false)",
-                    source=official.UHC_PROVIDER_FILE_SOURCE_ID,
-                    endpoint=official.ENDPOINT_ID,
-                    base=BASE,
-                )
+            await _register_official_source(engine)
             cohort = await publish_official_source(database)
             settings.setattr(official, "DATASET_HASH", cohort.official_dataset_hash)
             settings.setattr(official, "CONTENT_PROOF_SHA256", cohort.official_content_proof_sha256)

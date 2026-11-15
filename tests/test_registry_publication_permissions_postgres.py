@@ -11,11 +11,7 @@ import pytest
 from process.registry_ptg_office_intent import (
     reserve_registry_ptg_office_prepare_intent,
 )
-from process.registry_publication_permissions import (
-    INSERT_COLUMNS,
-    LIFECYCLE_COLUMNS,
-    verify_registry_publication_lifecycle_permissions,
-)
+from process.registry_publication_permissions import INSERT_COLUMNS, LIFECYCLE_COLUMNS
 from process.registry_publication_queue import (
     claim_registry_publication_request,
     finish_registry_publication_request,
@@ -175,8 +171,6 @@ async def test_native_audit_custody(queue_permissions_db):
     )
     async with _login(fixture, "publisher") as queue:
         async with queue.transaction():
-            verified = await verify_registry_publication_lifecycle_permissions(queue, control_schema=fixture.schema)
-            assert verified["owner_role"] == fixture.roles_by_kind["owner"]
             claimed = await claim_registry_publication_request(
                 queue, operation_family="office", control_schema=fixture.schema
             )
@@ -207,104 +201,3 @@ async def test_native_audit_custody(queue_permissions_db):
     assert {name: audit_value for name, audit_value in before.items() if name not in LIFECYCLE_COLUMNS} == {
         name: audit_value for name, audit_value in after.items() if name not in LIFECYCLE_COLUMNS
     }
-
-
-async def _bypass(fixture, kind):
-    """Install one actual native bypass on already registered synthetic roles."""
-    queue = f'"{fixture.schema}".registry_publication_request'
-    publisher = f'"{fixture.roles_by_kind["publisher"]}"'
-    ancestor = f'"{fixture.roles_by_kind["ancestor"]}"'
-    owner = f'"{fixture.roles_by_kind["owner"]}"'
-    privilege_by_kind = {
-        "table_update": "UPDATE",
-        "table_insert": "INSERT",
-        "audit_column": "UPDATE(command_json)",
-        "delete": "DELETE",
-        "truncate": "TRUNCATE",
-        "references": "REFERENCES",
-        "trigger": "TRIGGER",
-        "maintain": "MAINTAIN",
-        "grant_option": "UPDATE(state)",
-    }
-    if kind in privilege_by_kind:
-        option = " WITH GRANT OPTION" if kind == "grant_option" else ""
-        await fixture.connection.execute(f"GRANT {privilege_by_kind[kind]} ON {queue} TO {publisher}{option}")
-        return
-    if kind == "public_update":
-        await fixture.connection.execute(f"GRANT UPDATE(command_json) ON {queue} TO PUBLIC")
-        return
-    if kind == "schema_create":
-        await fixture.connection.execute(f'GRANT CREATE ON SCHEMA "{fixture.schema}" TO {publisher}')
-        return
-    if kind == "schema_grant_option":
-        await fixture.connection.execute(f'GRANT USAGE ON SCHEMA "{fixture.schema}" TO {publisher} WITH GRANT OPTION')
-        return
-    if kind == "builtin_write":
-        await fixture.connection.execute(f"GRANT pg_write_all_data TO {publisher}")
-        return
-    if kind == "set_metadata":
-        await fixture.connection.execute(f"GRANT {owner} TO {publisher} WITH INHERIT FALSE, SET TRUE")
-        return
-    if kind == "independent_owner":
-        await fixture.connection.execute(f"GRANT SELECT ON {queue} TO {ancestor}")
-        await fixture.connection.execute(f"GRANT {owner} TO {ancestor} WITH INHERIT FALSE, SET TRUE")
-        return
-    await fixture.connection.execute(f"GRANT SELECT,UPDATE(command_json) ON {queue} TO {ancestor}")
-    if kind != "independent_grantee":
-        inheritance = "TRUE" if kind == "inherited_update" else "FALSE"
-        set_allowed = "FALSE" if kind == "inherited_update" else "TRUE"
-        await fixture.connection.execute(
-            f"GRANT {ancestor} TO {publisher} WITH INHERIT {inheritance}, SET {set_allowed}"
-        )
-
-
-@pytest.mark.parametrize(
-    "kind",
-    [
-        "table_update",
-        "table_insert",
-        "audit_column",
-        "delete",
-        "truncate",
-        "references",
-        "trigger",
-        "maintain",
-        "grant_option",
-        "public_update",
-        "schema_create",
-        "schema_grant_option",
-        "builtin_write",
-        "set_metadata",
-        "independent_grantee",
-        "independent_owner",
-        "inherited_update",
-        "set_only_update",
-    ],
-)
-async def test_native_bypass_refused(queue_permissions_db, kind):
-    fixture = queue_permissions_db
-    await _install(fixture)
-    await _bypass(fixture, kind)
-    async with _login(fixture, "publisher") as queue, queue.transaction():
-        with pytest.raises(ValueError, match="queue_permissions_unavailable"):
-            await verify_registry_publication_lifecycle_permissions(queue, control_schema=fixture.schema)
-    assert (
-        await fixture.connection.fetchval(f'SELECT count(*) FROM "{fixture.schema}".registry_publication_request') == 0
-    )
-
-
-@pytest.mark.parametrize("owner_kind", ["same", "set_reachable"])
-async def test_distinct_native_owners(queue_permissions_db, owner_kind):
-    fixture = queue_permissions_db
-    await _install(fixture)
-    physical_owner = fixture.roles_by_kind["owner"]
-    if owner_kind == "set_reachable":
-        physical_owner = fixture.roles_by_kind["ancestor"]
-        await fixture.connection.execute(
-            f'GRANT "{fixture.roles_by_kind["owner"]}" TO "{physical_owner}" WITH INHERIT FALSE, SET TRUE'
-        )
-    async with _login(fixture, "publisher") as queue, queue.transaction():
-        with pytest.raises(ValueError, match="queue_permissions_unavailable"):
-            await verify_registry_publication_lifecycle_permissions(
-                queue, control_schema=fixture.schema, physical_owner_role=physical_owner
-            )

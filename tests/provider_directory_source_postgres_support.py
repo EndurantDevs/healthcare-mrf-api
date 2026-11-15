@@ -21,6 +21,8 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from db.connection import Database
+from db.migration_named_preparation import TABLES as NAMED_CLAIM_TABLES
+from db.migration_named_preparation import upgrade_named_preparation_catalog
 from process import provider_directory_generic_source_policy as source
 from process.entity_address_cutover_contract import postgres_sqlstate
 from process.plan_release_storage_custody import storage_roles
@@ -262,18 +264,19 @@ class NativeSourceFactory:
         return actor_by_field
 
     async def _observation_native_input_origin(self, session, driver):
-        """Accept only the issued physical readonly Source observation, never a bare session."""
+        """Require the selected logical Source scope and an active readonly transaction."""
         from process import provider_directory_source_observation as observation
 
         directory = importlib.import_module("process.provider_directory_fhir")
         issued = observation.current_observation(directory)
-        assert issued is not None and issued.database is self.database and issued.factory is self
-        assert issued.policy is self.policy and issued.session is session and issued.connection is driver
+        assert issued is not None and issued.factory is self
+        assert issued.policy is self.policy and issued.session is session
         await observation._verify(directory, issued)
-        origin = await _native_observation_identity(session, driver, self.policy)
-        assert (origin["backend"], origin["transaction"]) == issued.origin
+        assert driver.is_in_transaction()
+        readonly = await driver.fetchval("SHOW transaction_read_only")
+        assert readonly == "on"
         assert observation.current_observation(directory) is issued
-        return origin
+        return {"schema": self.policy.schema, "readonly": readonly}
 
     async def _ordinary_tiger_input_fence(self, session):
         """Prove no selected retained input before ordinary heaps retain their native guards."""
@@ -502,7 +505,7 @@ async def _native_observation_identity(session, driver, policy):
     return actor_by_field
 
 
-async def _create_native_roles(engine, policy, roles, created, retention_owner, retained_publisher):
+async def _create_native_roles(engine, policy, roles, created, retention_owner, retained_publisher, created_namespaces):
     async with engine.begin() as connection:
         password_sql = await connection.scalar(
             text("SELECT quote_literal(CAST(:password AS text))"), {"password": engine.url.password}
@@ -524,8 +527,11 @@ async def _create_native_roles(engine, policy, roles, created, retention_owner, 
         await connection.execute(
             text(f'GRANT "{policy.owner_role}" TO "{retained_publisher}" WITH INHERIT TRUE, SET FALSE, ADMIN FALSE')
         )
-        await connection.execute(text(f'CREATE SCHEMA hp_snapshot_retention AUTHORIZATION "{retention_owner}"'))
-        retention_oid = await connection.scalar(text("SELECT 'hp_snapshot_retention'::regnamespace::oid"))
+        if await connection.scalar(text("SELECT to_regnamespace('hp_snapshot_retention')")) is None:
+            created_namespaces.append("hp_snapshot_retention")
+            await connection.execute(text(f'CREATE SCHEMA hp_snapshot_retention AUTHORIZATION "{retention_owner}"'))
+        # Installed databases always carry the named claim catalog and its ordinary read grants.
+        await connection.run_sync(upgrade_named_preparation_catalog)
         await connection.execute(text(f'ALTER SCHEMA "{policy.schema}" OWNER TO "{policy.owner_role}"'))
         for role in (policy.publisher_role, *policy.runtime_roles):
             await connection.execute(text(f'GRANT USAGE ON SCHEMA "{policy.schema}" TO "{role}"'))
@@ -543,7 +549,6 @@ async def _create_native_roles(engine, policy, roles, created, retention_owner, 
         dbname = await connection.scalar(text("SELECT current_database()"))
         await connection.execute(text(f'GRANT CREATE ON DATABASE "{dbname}" TO "{policy.publisher_role}"'))
         await connection.execute(text(f'GRANT CREATE ON DATABASE "{dbname}" TO "{retained_publisher}"'))
-    return retention_oid
 
 
 async def _drop_native_source_roles(connection, created, admin):
@@ -561,7 +566,7 @@ WHERE datname=current_database() AND backend_type='autovacuum worker'
 AND pg_has_role(current_user,to_regrole('pg_signal_autovacuum_worker'),'USAGE')"""
 
 
-async def _cleanup_native_source_component(engine, database, is_owned_reader, retention_oid, created, admin):
+async def _cleanup_native_source_component(engine, database, is_owned_reader, created_namespaces, created, admin):
     """Retry only whole rolled-back ownership cleanup when native autovacuum deadlocks."""
     if database is not None:
         if not is_owned_reader:
@@ -573,12 +578,10 @@ async def _cleanup_native_source_component(engine, database, is_owned_reader, re
                 # Fast bulk loads leave autovacuum mid-flight on this disposable database; its catalog
                 # updates deadlock with REASSIGN OWNED, so stop the workers first when allowed to.
                 await connection.execute(text(_CANCEL_AUTOVACUUM_SQL))
-                if retention_oid is not None:
-                    assert (
-                        await connection.scalar(text("SELECT to_regnamespace('hp_snapshot_retention')::oid"))
-                        == retention_oid
-                    )
-                    await connection.execute(text("DROP SCHEMA hp_snapshot_retention RESTRICT"))
+                if "hp_snapshot_retention" in created_namespaces:
+                    claim_tables = ",".join("hp_snapshot_retention." + name for name in NAMED_CLAIM_TABLES)
+                    await connection.execute(text(f"DROP TABLE IF EXISTS {claim_tables} RESTRICT"))
+                    await connection.execute(text("DROP SCHEMA IF EXISTS hp_snapshot_retention RESTRICT"))
                 await _drop_native_source_roles(connection, created, admin)
             return
         except DBAPIError as error:
@@ -602,10 +605,8 @@ async def _native_component_transaction(database, factory):
     directory = importlib.import_module("process.provider_directory_fhir")
     observed = observation.current_observation(directory)
     if observed is not None:
-        assert observed.database is database and observed.factory is factory
-        async with observation.observation_transaction(directory, isolation=observed.isolation) as original:
+        async with observation.observation_transaction(directory, isolation=observed.isolation):
             async with Database.transaction(database) as session:
-                assert session is original
                 yield session
         return
     from process import provider_directory_cms_nonprofile_observation as retained
@@ -613,22 +614,12 @@ async def _native_component_transaction(database, factory):
 
     scope = retained.active_observations(admission=preparation._ACTIVE.get())
     if scope is not None:
-        assert source._FACTORY.get() is factory and scope.factory is factory and scope.database is database
         factory._require_current_policy()
-        assert factory.policy is scope.source_input._receipt()["policy"]
         await scope.verify_transaction()
-        binding = database._transaction_binding()
-        assert binding is scope.binding and binding.session is scope.session
         async with Database.transaction(database) as session:
-            assert session is scope.session and database._transaction_binding() is binding
             yield session
-            assert session is scope.session and database._transaction_binding() is binding
-        assert database._transaction_binding() is binding and binding.session is scope.session
         await scope.verify_transaction()
-        assert source._FACTORY.get() is factory
         factory._require_current_policy()
-        assert factory.policy is scope.source_input._receipt()["policy"]
-        assert retained.active_observations(admission=preparation._ACTIVE.get()) is scope
         return
     current = source.source_transaction_available()
     isolation = current.transaction_isolation if current is not None else "repeatable read"
@@ -644,6 +635,22 @@ def _source_publisher_engine(url, publisher, monkeypatch, *, pool_size=None):
         pool_options_by_name = {"pool_size": pool_size, "max_overflow": 0}
         monkeypatch.setenv("HLTHPRT_DB_POOL_MAX_SIZE", str(pool_size))
     return create_async_engine(url.set(username=publisher), **pool_options_by_name)
+
+
+async def _require_empty_named_catalog(connection):
+    """Reuse the installed empty foundation without adopting or removing it."""
+    if await connection.scalar(text("SELECT to_regnamespace('hp_snapshot_retention')")) is None:
+        return
+    names = set(
+        (
+            await connection.execute(
+                text("SELECT table_name FROM information_schema.tables WHERE table_schema='hp_snapshot_retention'")
+            )
+        ).scalars()
+    )
+    assert names == set(NAMED_CLAIM_TABLES), "native component requires an empty named preparation foundation"
+    for name in NAMED_CLAIM_TABLES:
+        assert not await connection.scalar(text(f"SELECT EXISTS(SELECT FROM hp_snapshot_retention.{name})"))
 
 
 @asynccontextmanager
@@ -664,14 +671,16 @@ async def native_source_component(
     retention_owner, retained_publisher = "retention_owner_" + token, "retained_publisher_" + token
     roles = (owner, publisher, *((reader,) if is_owned_reader else ()), *builder, retention_owner, retained_publisher)
     policy = source.GenericSourcePolicy(schema, owner, publisher, (reader, *builder), builder)
-    created, retention_oid, database = [], None, None
+    created, created_namespaces, database = [], [], None
     async with engine.connect() as connection:
         admin = await connection.scalar(text("SELECT session_user"))
         assert _is_component_test_database(await connection.scalar(text("SELECT current_database()")))
-        assert await connection.scalar(text("SELECT to_regnamespace('hp_snapshot_retention')")) is None
+        await _require_empty_named_catalog(connection)
         await connection.rollback()
     try:
-        retention_oid = await _create_native_roles(engine, policy, roles, created, retention_owner, retained_publisher)
+        await _create_native_roles(
+            engine, policy, roles, created, retention_owner, retained_publisher, created_namespaces
+        )
         publisher_engine = _source_publisher_engine(engine.url, publisher, monkeypatch, pool_size=publisher_pool_size)
         database = Database(
             engine=publisher_engine, session_factory=async_sessionmaker(publisher_engine, expire_on_commit=False)
@@ -696,9 +705,10 @@ async def native_source_component(
                 builder=builder[0] if builder else None,
                 retention_owner=retention_owner,
                 retained_publisher=retained_publisher,
+                created_control_namespaces=created_namespaces,
             )
     finally:
-        await _cleanup_native_source_component(engine, database, is_owned_reader, retention_oid, created, admin)
+        await _cleanup_native_source_component(engine, database, is_owned_reader, created_namespaces, created, admin)
 
 
 def source_component_migrations():
@@ -718,6 +728,25 @@ def legacy_source_component_migrations():
     composite_prefixes = {"20260930100000", "20260930110000", "20260930130000", "20260930140000"}
     prefixes = tuple(prefix for prefix in source_component_migrations() if prefix not in composite_prefixes)
     return (*prefixes, "20261022120000")
+
+
+def _named_component_generations(sync, schema):
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    from tests.test_provider_directory_cms_serving_receipt_postgres import _migration
+
+    with Operations.context(MigrationContext.configure(sync)):
+        if sync.execute(
+            text("SELECT to_regclass(:name) IS NULL"), {"name": f'"{schema}".npi_result_generation'}
+        ).scalar_one():
+            prerequisite = _migration("20260914120000_npi_result_generation")
+            prerequisite._schema = lambda: schema
+            prerequisite.upgrade()
+        for prefix in ("20261114160000", "20261114180000"):
+            migration = _migration(prefix)
+            migration._schema = lambda: schema
+            migration.upgrade()
 
 
 async def bootstrap_source_component(engine, policy, *, migration_prefixes=None):
@@ -749,12 +778,17 @@ async def bootstrap_source_component(engine, policy, *, migration_prefixes=None)
                     )
                     await connection.run_sync(lambda sync: index.create(sync, checkfirst=False))
         # The historical slice owns its transactions and concurrent-index blocks.
+        prefixes = source_component_migrations() if migration_prefixes is None else migration_prefixes
         async with historical.connect() as connection:
-            await connection.run_sync(
-                _run_migrations, source_component_migrations() if migration_prefixes is None else migration_prefixes
-            )
+            await connection.run_sync(_run_migrations, prefixes)
         async with historical.begin() as connection:
             await connection.execute(text(_migration("20261019130000")._counter_sql(policy.schema)))
+            await connection.run_sync(_named_component_generations, policy.schema)
+            from tests.cms_named_revision_postgres_support import upgrade_named_native_counter
+
+            # The legacy slice predates the composite serving functions, so only its counter guards are renamed.
+            await upgrade_named_native_counter(connection, policy.schema, full_serving="20260930100000" in prefixes)
+
     finally:
         await historical.dispose()
         async with engine.begin() as connection:

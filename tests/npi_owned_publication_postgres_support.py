@@ -105,7 +105,7 @@ async def test_native_output_custody(native_runtime):
             await session.execute(text(f'ALTER TABLE "{schema}"."{name}" OWNER TO "{runtime.owner}"'))
         await session.execute(text(f'REVOKE ALL ON SCHEMA "{schema}" FROM "{runtime.builder}"'))
         owner_oid = await session.scalar(text("SELECT CAST(:role AS regrole)::oid"), {"role": runtime.owner})
-        await owned._require_inert_owned_stage(session, output, owner_oid)
+        await owned._require_inert_owned_stage(session, output)
         validation = await archive.prepare_npi_activation(
             session,
             ownership=output,

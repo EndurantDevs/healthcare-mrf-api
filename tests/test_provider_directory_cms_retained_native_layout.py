@@ -51,6 +51,8 @@ def _index_fixture(name, keys, **options):
         "index_predicate": options.get("predicate", ""),
         "index_expressions": options.get("expression", ""),
         "opclass_names": list(options.get("opclasses", ())),
+        "opclasses": [{"schema": "pg_catalog", "name": name} for name in options.get("opclasses", ())],
+        "collations": [None for _key in keys],
         "indclass": " ".join("42" for _key in keys),
         "indcollation": " ".join("0" for _key in keys),
         "indoption": " ".join("0" for _key in keys),
@@ -114,15 +116,15 @@ def _clone_catalog_fixture(catalog_by_field, model_name):
 def _native_catalog_transport(catalog):
     """Return fresh transport fields while preserving fixture mutation visibility."""
     return {
-        **{name: catalog[name] for name in ("attributes", "constraints", "triggers", "database_oid")},
-        "indexes": [dict(index, physical_present=True) for index in catalog["indexes"]],
+        **{name: catalog[name] for name in ("attributes", "constraints", "triggers")},
+        "indexes": [dict(index, catalog_present=True) for index in catalog["indexes"]],
     }
 
 
 def _fixture(model_name="entity_address_unified", *, database_oid=3):
     """Use real declarations with synthetic PostgreSQL catalog identities."""
     model = next(model for model in layout.ENTITY_ADDRESS_RESULT_MODELS if model.__tablename__ == model_name)
-    source_relation = OwnedRelation("fixture", model_name + "_cms" + "a" * 20, 11, 0, "p")
+    source_relation = OwnedRelation("fixture", model_name + "_cms" + "a" * 20, 0, "p")
     attribute_number_by_name = {column.name: number for number, column in enumerate(model.__table__.columns, 1)}
     attributes = [
         {"relation_oid": 11, "attnum": number, "attname": name, "default_expression": ""}
@@ -135,7 +137,7 @@ def _fixture(model_name="entity_address_unified", *, database_oid=3):
 
     indexes = _declared_index_fixture(source_relation, model, attribute_number_by_name)
     catalog_by_field = {
-        "contract": "cms-native-observed-layout.v1",
+        "contract": "cms-native-observed-layout.v2",
         "database_oid": database_oid,
         "relation": {
             "relation_oid": 11,
@@ -165,11 +167,16 @@ def _fixture(model_name="entity_address_unified", *, database_oid=3):
     clone = _clone_catalog_fixture(catalog_by_field, model_name)
     fhir = SimpleNamespace(
         _identity_hash=_hash,
+        _unscoped_qt=lambda schema, name: schema + "." + name,
         _pagination_checkpoint_row_mapping=lambda row: row,
         _profile_capacity_relation_row=AsyncMock(return_value=(catalog_by_field["relation"], 12)),
         _profile_capacity_tablespaces=lambda *_args: (42,),
         db=SimpleNamespace(
-            scalar=AsyncMock(return_value=database_oid),
+            scalar=AsyncMock(
+                side_effect=lambda *_args, **_kwargs: fhir._profile_capacity_relation_row.return_value[0][
+                    "relation_oid"
+                ]
+            ),
             first=AsyncMock(side_effect=lambda *_args, **_kwargs: _native_catalog_transport(catalog_by_field)),
         ),
     )
@@ -211,7 +218,7 @@ async def _source_and_clone(monkeypatch, model_name="entity_address_unified"):
             else _native_catalog_transport(original)
         )
     source = await layout.capture_retained_native_source(fhir, source_relation, (model_name,))
-    relation = OwnedRelation(clone["relation"]["schema_name"], model_name, 21, 0, "p")
+    relation = OwnedRelation(clone["relation"]["schema_name"], model_name, 0, "p")
     if model_name == "entity_address_evidence":
         fhir.db.evidence_sequences = [clone_sequence]
     fhir._profile_capacity_relation_row.return_value = (clone["relation"], 22)
@@ -228,7 +235,7 @@ async def _source_and_clone(monkeypatch, model_name="entity_address_unified"):
 async def test_complete_declared_family_has_exact_clone_compatibility(monkeypatch, model_name):
     fhir, source, relation, _original, _clone = await _source_and_clone(monkeypatch, model_name)
     captured = await layout.capture_retained_native_layout(fhir, relation, source, (model_name,))
-    assert captured.relation_oid == relation.oid
+    assert (captured.schema_name, captured.relation_name) == (relation.schema, relation.relation)
 
 
 @pytest.mark.asyncio
@@ -261,7 +268,7 @@ async def test_declared_native_clone_accepts_generated_names_and_physical_identi
     fhir, source, relation, original, _clone = await _source_and_clone(monkeypatch)
     assert {index["index_am"] for index in original["indexes"]} == {"btree", "gin", "gist"}
     captured = await layout.capture_retained_native_layout(fhir, relation, source, ("entity_address_unified",))
-    assert captured.relation_oid == 21 and captured.effective_tablespace_oids == (42,)
+    assert (captured.schema_name, captured.relation_name) == (relation.schema, relation.relation)
 
 
 def test_retained_column_coordinates_preserve_order_and_index_keys():
@@ -288,8 +295,8 @@ def _mutate_clone_catalog(clone, mutation):
         "method": "index_am",
         "predicate": "index_predicate",
         "expression": "index_expressions",
-        "opclass": "indclass",
-        "collation": "indcollation",
+        "opclass": "opclasses",
+        "collation": "collations",
     }
     if mutation in field_by_mutation:
         index[field_by_mutation[mutation]] = "changed"
@@ -327,10 +334,10 @@ async def test_clone_rejects_any_nonphysical_catalog_difference(monkeypatch, mut
     [
         {"model_name": "unknown"},
         {"relation": "entity_address_unified"},
-        {"oid": True},
-        {"database_oid": 0},
+        {"schema": "invalid schema"},
+        {"catalog_json": '{"contract":"unknown"}'},
         {"catalog_json": "{}"},
-        {"exact_fingerprint": "0" * 64},
+        {"catalog_json": " {} "},
     ],
 )
 async def test_source_evidence_refuses_wrong_model_or_malformed_identity(monkeypatch, change):
@@ -374,21 +381,17 @@ def _annotated_producer():
     producer = _producer()
     policy = _retention_policy()
     producer.lease = signed_cms_plan(producer.plan, retention_policy=policy)
-    _fhir, source_relation, original, clone = _fixture(database_oid=producer.lease.database_oid)
+    _fhir, source_relation, original, clone = _fixture()
     source = layout.RetainedNativeSourceLayout(
         "entity_address_unified",
         source_relation.schema,
         source_relation.relation,
-        source_relation.oid,
-        producer.lease.database_oid,
-        layout._canonical_catalog(original),
-        _hash(original),
+        layout._canonical_catalog(layout._structural_catalog(original)),
     )
-    relation = OwnedRelation(clone["relation"]["schema_name"], "entity_address_unified", 21, 0, "p")
+    relation = OwnedRelation(clone["relation"]["schema_name"], "entity_address_unified", 0, "p")
     annotation = RetainedNativeRelation(
         relation.schema,
         relation.relation,
-        relation.oid,
         json.dumps(policy, sort_keys=True, separators=(",", ":")),
         source,
     )
@@ -399,10 +402,10 @@ def _annotated_producer():
 @pytest.mark.asyncio
 async def test_signed_clone_dispatch_preserves_profile_default(monkeypatch):
     producer, relation, annotation, request = _annotated_producer()
-    capture = AsyncMock(return_value=layout.NativeRelationLayout(21, (42,), "a" * 64))
+    capture = AsyncMock(return_value=layout.NativeRelationLayout(relation.schema, relation.relation))
     monkeypatch.setattr(layout, "capture_retained_native_layout", capture)
-    observed_catalog = ({"relation": {"relation_oid": relation.oid}}, None)
-    batch = AsyncMock(return_value={(relation.schema, relation.relation, relation.oid): observed_catalog})
+    observed_catalog = ({"relation": {"relation_oid": 21}}, None)
+    batch = AsyncMock(return_value={(relation.schema, relation.relation): observed_catalog})
     monkeypatch.setattr(layout, "observe_native_catalog_batch", batch)
     producer._current_wal_bytes = AsyncMock(return_value=0)
     await producer._assert_physical(request, {"data_tablespace_oid": 42})
@@ -414,17 +417,19 @@ async def test_signed_clone_dispatch_preserves_profile_default(monkeypatch):
         observed_catalog=observed_catalog,
     )
     batch.assert_awaited_once_with(producer.fhir, [relation], database=producer.fhir.db)
-    profile = AsyncMock(return_value=SimpleNamespace(relation_oid=21, effective_tablespace_oids=(42,)))
-    producer.fhir._provider_directory_profile_relation_storage_fingerprint = profile
+    profile = AsyncMock(return_value=layout.NativeRelationLayout(relation.schema, relation.relation))
+    producer.fhir._provider_directory_profile_capacity_relation_layout = profile
+    producer.fhir.db.scalar.return_value = 21
     await producer._assert_physical(replace(request, native_relations=()), {"data_tablespace_oid": 42})
     profile.assert_awaited_once_with(21, expected_persistence="p")
     assert batch.await_count == 1
 
 
 @pytest.mark.parametrize(
-    "change", [{"schema": "wrong_capture"}, {"relation": "unknown"}, {"oid": 22}, {"oid": True}, {"policy_json": "{}"}]
+    "change",
+    [{"schema": "wrong_capture"}, {"relation": "unknown"}, {"schema": True}, {"relation": ""}, {"policy_json": "{}"}],
 )
-def test_annotation_refuses_wrong_signed_capture_or_original_oid(change):
+def test_annotation_refuses_wrong_signed_capture_or_named_source(change):
     producer, _relation, annotation, request = _annotated_producer()
     with pytest.raises(RuntimeError, match="native_identity_changed"):
         producer._native_relation_policies(replace(request, native_relations=(replace(annotation, **change),)))
@@ -444,39 +449,36 @@ async def test_registration_rechecks_source_once_and_survives_source_rename(monk
     producer, relation, annotation, _request = _annotated_producer()
     admission = NonprofileAdmission(producer.lease, producer.plan, AsyncMock())
     source_layout = annotation.source_layout
-    admission._relations[(source_layout.schema, source_layout.relation)] = source_layout.oid
+    admission._relations.add((source_layout.schema, source_layout.relation))
     admission._external_relations.add((source_layout.schema, source_layout.relation))
     admission._started = True
-    source_relation = OwnedRelation(source_layout.schema, source_layout.relation, source_layout.oid, 0, "p")
+    source_relation = OwnedRelation(source_layout.schema, source_layout.relation, 0, "p")
     admission.measure = AsyncMock(return_value=(source_relation, relation))
     admission._check = AsyncMock()
     capture = AsyncMock(return_value=source_layout)
     monkeypatch.setattr(layout, "capture_retained_native_source", capture)
     await admission.register_external_relation(
-        producer.fhir, relation.schema, relation.relation, relation.oid, native_relation=annotation
+        producer.fhir, relation.schema, relation.relation, native_relation=annotation
     )
-    del admission._relations[(source_layout.schema, source_layout.relation)]
+    admission._relations.remove((source_layout.schema, source_layout.relation))
     await admission.assert_external_relation(
-        producer.fhir, relation.schema, relation.relation, relation.oid, native_relation=annotation
+        producer.fhir, relation.schema, relation.relation, native_relation=annotation
     )
     capture.assert_awaited_once()
     with pytest.raises(RuntimeError, match="native_identity_invalid"):
-        await admission.assert_external_relation(producer.fhir, relation.schema, relation.relation, relation.oid)
+        await admission.assert_external_relation(producer.fhir, relation.schema, relation.relation)
     with pytest.raises(RuntimeError, match="native_identity_invalid"):
         await admission.assert_external_relation(
             producer.fhir,
             relation.schema,
             relation.relation,
-            relation.oid,
             native_relation=replace(annotation, policy_json="{}"),
         )
     with pytest.raises(RuntimeError, match="raw_identity_invalid"):
-        await admission.rename_external_relation(
-            producer.fhir, relation.schema, relation.relation, "renamed", relation.oid
-        )
+        await admission.rename_external_relation(producer.fhir, relation.schema, relation.relation, "renamed")
     producer.fhir._unscoped_qt = lambda schema, name: schema + "." + name
     producer.fhir.db.scalar.return_value = None
-    await admission.retire_external_relation(producer.fhir, relation.schema, relation.relation, relation.oid)
+    await admission.retire_external_relation(producer.fhir, relation.schema, relation.relation)
     assert not admission._native_relations
 
 
@@ -491,9 +493,9 @@ async def test_native_registration_rejects_unadmitted_or_conflicting_source(monk
     producer, relation, annotation, _request = _annotated_producer()
     admission = NonprofileAdmission(producer.lease, producer.plan, AsyncMock())
     source_layout = annotation.source_layout
-    source_relation = OwnedRelation(source_layout.schema, source_layout.relation, source_layout.oid, 0, "p")
+    source_relation = OwnedRelation(source_layout.schema, source_layout.relation, 0, "p")
     admission._started = True
-    admission._relations[(source_layout.schema, source_layout.relation)] = source_layout.oid
+    admission._relations.add((source_layout.schema, source_layout.relation))
     admission._external_relations.add((source_layout.schema, source_layout.relation))
     admission.measure = AsyncMock(return_value=(source_relation, relation))
     admission._check = AsyncMock()
@@ -501,13 +503,13 @@ async def test_native_registration_rejects_unadmitted_or_conflicting_source(monk
     if change == "unregistered":
         admission._external_relations.clear()
     if change == "source_oid":
-        admission._relations[(source_layout.schema, source_layout.relation)] += 1
+        admission._relations.remove((source_layout.schema, source_layout.relation))
     if change == "source_evidence":
-        captured_source = replace(source_layout, exact_fingerprint="0" * 64)
+        captured_source = replace(source_layout, catalog_json="{}")
     if change == "conflicting_clone":
-        admission._native_relations[(relation.schema, relation.relation)] = replace(annotation, oid=22)
+        admission._native_relations[(relation.schema, relation.relation)] = replace(annotation, phase="loading")
     monkeypatch.setattr(layout, "capture_retained_native_source", AsyncMock(return_value=captured_source))
     with pytest.raises(RuntimeError, match="native_identity_invalid"):
         await admission.register_external_relation(
-            producer.fhir, relation.schema, relation.relation, relation.oid, native_relation=annotation
+            producer.fhir, relation.schema, relation.relation, native_relation=annotation
         )

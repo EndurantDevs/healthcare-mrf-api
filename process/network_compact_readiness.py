@@ -53,20 +53,30 @@ def _digest(value):
     ).hexdigest()
 
 
+def has_named_compact_index_proof(serving):
+    """Distinguish a rebuilt named proof from retained unversioned index evidence."""
+    revision = serving.get("index_definition_revision")
+    _require("index_definition_revision" not in serving or type(revision) is int and revision == 2)
+    return revision == 2
+
+
 def compact_readiness(candidate, report, scope):
     """Validate the compact branch without accepting an old address-copy receipt."""
-    canonical = report.get("candidate_readiness")
+    from process.network_compact_custom_offices import logical_compact_custom_scope
+
+    canonical_by_field = report.get("candidate_readiness")
     serving = report.get("serving_readiness")
-    _require(type(canonical) is dict and type(serving) is dict and candidate["index_ready"] is True)
-    for receipt, component in ((canonical, "compact_office_slices"), (serving, COMPONENT)):
+    _require(type(canonical_by_field) is dict and type(serving) is dict and candidate["index_ready"] is True)
+    for receipt, component in ((canonical_by_field, "compact_office_slices"), (serving, COMPONENT)):
         _require(
             receipt.get("component") == component
             and type(receipt.get("readiness_revision")) is int
             and receipt["readiness_revision"] == 1
             and receipt.get("ready") is True
-            and receipt.get("scope") == scope
+            and logical_compact_custom_scope(receipt.get("scope")) == logical_compact_custom_scope(scope)
         )
     _require(serving.get("index_profile") == "compact_membership")
+    has_named_compact_index_proof(serving)
     from process.network_geo_search import geo_search_receipt
 
     geo_search_receipt(candidate)
@@ -80,22 +90,40 @@ def compact_readiness(candidate, report, scope):
     )
     counts = ("membership_rows", "distinct_memberships", "projected_locations", "orphan_bindings")
     _require(
-        all(type(canonical.get(field)) is int and canonical[field] == report[field] for field in counts)
-        and type(canonical.get("ref_map_oid")) is int
-        and 0 < canonical["ref_map_oid"] <= 4294967295
-        and type(canonical.get("edge_heap_oid")) is int
-        and 0 < canonical["edge_heap_oid"] <= 4294967295
-        and canonical["ref_map_oid"] != canonical["edge_heap_oid"]
+        all(
+            type(canonical_by_field.get(field)) is int and canonical_by_field[field] == report[field]
+            for field in counts
+        )
     )
-    return canonical, serving
+    relations_by_kind = {
+        "ref_map": {"schema_name": candidate["schema_name"], "table_name": "network_slice_ref"},
+        "edge_heap": {"schema_name": candidate["schema_name"], "table_name": "network_office_edge"},
+    }
+    if "ref_map" in canonical_by_field or "edge_heap" in canonical_by_field:
+        _require(all(canonical_by_field.get(kind) == relation for kind, relation in relations_by_kind.items()))
+    else:
+        _require({"ref_map_oid", "edge_heap_oid"} <= set(canonical_by_field))
+    canonical_by_field = {
+        key: field_value
+        for key, field_value in canonical_by_field.items()
+        if key not in {"ref_map_oid", "edge_heap_oid"}
+    }
+    canonical_by_field.update(relations_by_kind)
+    if type(canonical_by_field.get("slices")) is dict:
+        canonical_by_field["slices"] = {
+            key: field_value
+            for key, field_value in canonical_by_field["slices"].items()
+            if key not in {"ref_map_oid", "edge_heap_oid"}
+        }
+        canonical_by_field["slices"].update(relations_by_kind)
+    return canonical_by_field, serving
 
 
 async def compact_index_digest(connection, schema_name, *, candidate=None):
     """Bind every native candidate index and require the two compact lookup paths."""
     _identifier(schema_name)
     statement = index_catalog_statement(
-        """SELECT c.relname AS table_name,i.indexrelid::bigint AS index_oid,
-        i.indrelid::bigint AS table_oid,i.indisvalid,i.indisready,i.indislive,
+        """SELECT c.relname AS table_name,ic.relname AS index_name,i.indisvalid,i.indisready,i.indislive,
         i.indisprimary,i.indisunique,i.indnkeyatts,i.indnatts,am.amname,
         i.indpred IS NULL AS no_predicate,i.indexprs IS NULL AS no_expressions,
         ARRAY(SELECT a.attname FROM unnest(i.indkey::smallint[]) WITH ORDINALITY key(attnum,position)
@@ -103,7 +131,7 @@ async def compact_index_digest(connection, schema_name, *, candidate=None):
         pg_get_indexdef(i.indexrelid) AS definition
         FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid AND c.relkind='r'
         JOIN pg_index i ON i.indrelid=c.oid JOIN pg_class ic ON ic.oid=i.indexrelid
-        JOIN pg_am am ON am.oid=ic.relam WHERE n.nspname=$1 ORDER BY i.indexrelid""",
+        JOIN pg_am am ON am.oid=ic.relam WHERE n.nspname=$1 ORDER BY c.relname,ic.relname""",
         geo_present="EXISTS(SELECT FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n "
         "ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname='network_geo_search' AND c.relkind='r')",
     )
@@ -120,13 +148,48 @@ async def compact_index_digest(connection, schema_name, *, candidate=None):
     return _digest([dict(index_record) for index_record in indexes])
 
 
+async def require_compact_native_layout(connection, schema_name):
+    """Require the declared compact heap columns, native types and ordinary non-null values."""
+    expected_by_table = {
+        "network_office_edge": (("slice_id", "uuid"), ("location_key", "character varying(64)")),
+        "network_slice_ref": (
+            ("network_id", "integer"),
+            ("office_bucket", "integer"),
+            ("artifact_candidate_id", "uuid"),
+            ("slice_id", "uuid"),
+            ("row_count", "bigint"),
+            ("content_sha256", "character varying(64)"),
+        ),
+    }
+    column_records = await connection.fetch(
+        "SELECT c.relname,a.attname,pg_catalog.format_type(a.atttypid,a.atttypmod) AS data_type,a.attnotnull,"
+        "a.attgenerated='' AND a.attidentity='' AND d.oid IS NULL AS ordinary "
+        "FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid "
+        "JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped "
+        "LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum "
+        "WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind='r' ORDER BY c.relname,a.attnum",
+        schema_name,
+        sorted(expected_by_table),
+    )
+    _require(
+        [tuple(column_record) for column_record in column_records]
+        == [
+            (table, column, data_type, True, True)
+            for table, columns in sorted(expected_by_table.items())
+            for column, data_type in columns
+        ]
+    )
+
+
 def _require_index_paths(indexes, candidate):
     if candidate is not None:
         from process.network_geo_search import geo_search_receipt, require_geo_search_index_records
 
         search = geo_search_receipt(candidate)
         if search is not None:
-            require_geo_search_index_records(indexes, search)
+            require_geo_search_index_records(
+                [{**index_record, "name": index_record["index_name"]} for index_record in indexes], search
+            )
     required_paths = [
         ("network_slice_ref", ["network_id", "office_bucket"], True, True),
         ("network_office_edge", ["slice_id", "location_key"], True, True),

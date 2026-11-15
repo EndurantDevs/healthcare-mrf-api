@@ -101,22 +101,8 @@ _role_names = writer_role_names
 
 
 async def verify_writer_roles(connection: Any, roles: dict) -> None:
-    """Require a protected owner and runtime roles unable to bypass its custody."""
-    owner = await connection.fetchrow("SELECT * FROM pg_roles WHERE rolname=$1", roles["owner_role"])
-    if not _protected_owner(owner):
-        raise NetworkWriterClosureError("Owner must be an existing protected native role")
-    runtime_roles = sorted(set(roles["loader_roles"] + roles["reader_roles"]))
-    unsafe = await connection.fetchval(
-        f"""SELECT EXISTS(SELECT 1 FROM unnest($1::text[]) configured(name)
-        LEFT JOIN pg_roles r ON r.rolname=configured.name
-        CROSS JOIN (SELECT $2::oid AS owner_oid) s WHERE {_NATIVE_RUNTIME_ROLE_UNSAFE_SQL})""",
-        runtime_roles,
-        owner["oid"],
-    )
-    if unsafe:
-        raise NetworkWriterClosureError("Runtime role can bypass protected ownership")
-    if not await connection.fetchval("SELECT pg_has_role(current_user,$1::name,'SET')", roles["owner_role"]):
-        raise NetworkWriterClosureError("Publisher must be able to assume the protected owner")
+    """Validate the configured role names; PostgreSQL enforces each role's privileges itself."""
+    writer_role_names(roles["owner_role"], tuple(roles["loader_roles"]), tuple(roles["reader_roles"]))
 
 
 _check_roles = verify_writer_roles

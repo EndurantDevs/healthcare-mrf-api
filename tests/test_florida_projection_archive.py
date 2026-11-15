@@ -200,6 +200,8 @@ async def test_native_five_model_copy_reuses_one_bounded_copier(monkeypatch):
 def _native_deadline_case(monkeypatch, precheck_seconds):
     """Keep the real evidence and projection copy chain on one deterministic clock."""
     native, profiles = archive.native, archive.profiles
+    from process import florida_projection_named_source as named
+
     clock = SimpleNamespace(now=0.0)
     clock_api = SimpleNamespace(get_running_loop=lambda: SimpleNamespace(time=lambda: clock.now))
     monkeypatch.setattr(native, "asyncio", clock_api)
@@ -216,31 +218,27 @@ def _native_deadline_case(monkeypatch, precheck_seconds):
     monkeypatch.setattr(profiles, "_require_stage_topology", AsyncMock())
     monkeypatch.setattr(profiles, "_validate_publication_sets", AsyncMock())
     monkeypatch.setattr(profiles, "_run", AsyncMock(return_value=None))
-    monkeypatch.setattr(archive, "require_native_publication_order", precheck)
+    monkeypatch.setattr(named, "require_native_publication_order", precheck)
+    monkeypatch.setattr(named, "_publication_lock", AsyncMock())
+    monkeypatch.setattr(native, "seal_model_family_storage", AsyncMock())
+    monkeypatch.setattr(
+        named, "named_publication_pointer", AsyncMock(return_value={"current_run_id": None, "previous_run_id": None})
+    )
     monkeypatch.setattr(native, "_relation_oid", AsyncMock(return_value=None))
     monkeypatch.setattr(native, "_create_model_indexes", AsyncMock())
     monkeypatch.setattr(native, "_is_model_table_equal", AsyncMock(return_value=True))
     monkeypatch.setattr(archive, "_clear_stage_grants", AsyncMock())
     pin_id = uuid4()
     monkeypatch.setattr(
-        archive,
-        "_candidate_seal",
-        AsyncMock(
-            return_value={
-                "relation_oid": 99,
-                "owner_oid": 2,
-                "table_name": archive._cutover_name(pin_id),
-            }
-        ),
+        named,
+        "freeze_named_projection",
+        AsyncMock(return_value={"schema": "destination", "table_name": archive._cutover_name(pin_id)}),
     )
     prepared = SimpleNamespace(
         manifest={"importer_id": archive.IMPORTER_ID, "run_id": "a" * 32, "run_ids": ["a" * 32]},
         ownership=SimpleNamespace(
             schema_name="stage",
-            relation_oids=tuple(
-                (name, index + 10)
-                for index, name in enumerate(profiles.source_spec(archive.IMPORTER_ID, publication=True).table_names)
-            ),
+            relation_names=profiles.source_spec(archive.IMPORTER_ID, publication=True).table_names,
         ),
     )
     session = SimpleNamespace(
@@ -269,7 +267,6 @@ async def test_projection_copy_keeps_original_deadline_after_evidence_and_preche
         session,
         prepared,
         "destination",
-        2,
         pin_id,
         projection_by_field,
     )

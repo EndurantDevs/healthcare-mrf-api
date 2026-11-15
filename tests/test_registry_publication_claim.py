@@ -1012,11 +1012,12 @@ async def test_source_batch_endpoint_fallback_preview_is_summary_only_and_head_b
         preview.assert_awaited_once_with(
             fixture.driver, fixture.command, fixture.actor, office_authority=None, summary_only=True
         )
-        assert fixture.session.events == ["begin", "commit", "begin", "commit"]
+        # One request transaction both resolves the selection and previews it.
+        assert fixture.session.events == ["begin", "commit"]
     else:
         assert response_message.status == 409
         preview.assert_not_awaited()
-        assert fixture.session.events == ["begin", "commit", "begin", "rollback"]
+        assert fixture.session.events == ["begin", "rollback"]
     assert response_message.headers["Cache-Control"] == "private, no-store"
     fixture.enqueue.assert_not_awaited()
     fixture.resolve.assert_awaited_once_with(fixture.driver, fixture.compact, fixture.actor, allow_unbound=True)
@@ -1033,29 +1034,25 @@ async def test_source_batch_endpoint_configured_summary_uses_fenced_source_sessi
 
     fixture = source_batch_http
     sessions, driver, events = _bridge_owner(monkeypatch)
-    identity_by_field = {
-        "database_name": "synthetic",
-        "database_oid": 1,
-        "control_oid": 2,
-        "current_role": "api",
-        "session_role": "api",
-    }
-    driver.fetchrow = AsyncMock(
-        side_effect=[identity_by_field, {**identity_by_field, "current_role": "synthetic", "session_role": "synthetic"}]
-    )
     driver.fetchval = AsyncMock(return_value=1)
     service = object.__new__(RegistryPTGScopeEngineService)
     object.__setattr__(service, "reader_sessions", sessions)
     object.__setattr__(service, "store", RegistryPTGProducerScopeStore("owner", "approver", "synthetic_control"))
     fixture.request.app.ctx.registry_ptg_scope_engine = service
     monkeypatch.setattr(fixture.endpoint, "_namespace", lambda _: '"synthetic_control"')
-    monkeypatch.setattr(fixture.endpoint, "_driver", AsyncMock(return_value=driver))
+    # The request database is another registry: only the fenced session may supply the selection.
+    monkeypatch.setattr(
+        fixture.endpoint,
+        "_driver",
+        AsyncMock(side_effect=lambda session: fixture.driver if session is fixture.session else driver),
+    )
 
     async def preview(connection, command, actor, *, office_authority, summary_only):
         assert connection is driver and command is fixture.command and actor == fixture.actor
         assert summary_only is True and type(office_authority[0]) is AsyncSession
         assert office_authority[0].in_transaction() and office_authority[1] is service.store
-        assert events.index("lock") < events.index("native_fence")
+        # The approval lock is held, and not yet released, while the summary is read.
+        assert "lock" in events and "unlock" not in events
         return {"selected_count": 101, "records": []}
 
     observed = AsyncMock(side_effect=preview)
@@ -1065,7 +1062,9 @@ async def test_source_batch_endpoint_configured_summary_uses_fenced_source_sessi
     assert json.loads(response_message.body)["records"] == []
     observed.assert_awaited_once()
     fixture.enqueue.assert_not_awaited()
-    assert fixture.session.events == ["begin", "commit", "begin", "commit"]
+    # The fenced session resolves and summarizes the batch; the request database is never read.
+    assert fixture.session.events == []
+    fixture.resolve.assert_awaited_once_with(driver, fixture.compact, fixture.actor, allow_unbound=True)
     assert events[-1] == "close" and events.count("checkout") == events.count("unlock") == 1
 
 
@@ -1096,4 +1095,4 @@ async def test_source_batch_endpoint_preview_failure_is_sanitized_or_cancelled(m
         assert b"synthetic private" not in response_message.body
         assert response_message.headers["Cache-Control"] == "private, no-store"
     fixture.enqueue.assert_not_awaited()
-    assert fixture.session.events == ["begin", "commit"] and not fixture.session.active
+    assert fixture.session.events == [] and not fixture.session.active

@@ -291,8 +291,8 @@ async def test_wrong_identity_or_loading_scope_refuses_before_payload_io(payload
         payloads.workspace._binding["identity"]["dataset_id"] = "another-dataset"
     elif change.endswith("_alias"):
         root = _RESOURCE if change == "resource_alias" else _WITNESS
-        payloads.workspace._receipts[root]["oid"] = payloads.workspace._inputs["frozen_inventory"]["relations"][0][
-            "relation_oid"
+        payloads.workspace._receipts[root]["name"] = payloads.workspace._inputs["frozen_inventory"]["relations"][0][
+            "relation_name"
         ]
     elif change == "frozen":
         payloads.drift = True

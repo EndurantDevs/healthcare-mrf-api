@@ -15,18 +15,15 @@ from process import provider_directory_output_snapshot_custody as custody
 from process import provider_directory_output_snapshot_journal as journal
 from process import provider_directory_output_snapshot_stage as stages
 from process.provider_directory_dataset_rehydrate_pages import projected_pages
-from process.provider_directory_dataset_rehydrate_pin import (
-    _close_reader,
-    _require_reader,
-    _same_database,
-    _SourceReader,
-)
+from process.provider_directory_dataset_rehydrate_pin import _SourceReader
 from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
 from process.provider_directory_output_snapshot_catalog import (
     OUTPUT_CATALOG_SQL,
     decoded,
     output_models,
+    portable_catalog_payload,
     require_output,
+    require_output_shape,
 )
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
@@ -184,13 +181,8 @@ async def _control_digest(connection, schema, root):
 
 
 async def _control_witness(session, connection, policy):
-    from process.mrf_address_publication import require_native_read_catalog
-
-    rows = await connection.fetch(CONTROL_CATALOG_SQL, policy.schema, list(CONTROLS), 0, [])
+    rows = await connection.fetch(CONTROL_CATALOG_SQL, policy.schema, list(CONTROLS))
     require_output({row["relname"] for row in rows} == set(CONTROLS), "canonical_controls_missing")
-    await require_native_read_catalog(
-        session, tuple(row["oid"] for row in rows), executable_roles=(policy.owner_role, policy.publisher_role)
-    )
     controls_by_root = {}
     for row in rows:
         columns = decoded(row["columns"])
@@ -204,10 +196,7 @@ async def _control_witness(session, connection, policy):
             "canonical_control_shape_changed",
         )
         controls_by_root[row["relname"]] = {
-            "catalog": {
-                name: decoded(value) if name in {"topology", "columns", "constraints", "indexes", "acl"} else value
-                for name, value in dict(row).items()
-            },
+            "catalog": portable_catalog_payload(row),
             "content": await _control_digest(connection, policy.schema, row["relname"]),
         }
     return controls_by_root
@@ -219,19 +208,19 @@ async def _preservation_reader(directory, capability, input_receipts):
     database = await directory.db._connect_reader()
     session, reader = database.session_factory(), None
     try:
-        driver = await _require_reader(session, database, capability.policy)
-        await _same_database(capability.connection, driver)
+        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+        driver = (await (await session.connection()).get_raw_connection()).driver_connection
         await driver.execute(
             "LOCK TABLE "
             + ",".join(storage_relation(receipt.schema, receipt.target) for receipt in input_receipts.values())
             + " IN ACCESS SHARE MODE NOWAIT"
         )
         for receipt in input_receipts.values():
+            rows = await driver.fetch(OUTPUT_CATALOG_SQL, receipt.schema, [receipt.target])
+            require_output(len(rows) == 1, "canonical_input_changed")
+            require_output_shape(rows[0], receipt.target)
             require_output(
-                await driver.fetchval(
-                    "SELECT to_regclass($1)::oid::bigint", storage_relation(receipt.schema, receipt.target)
-                )
-                == receipt.oid,
+                custody._native_receipt(capability.policy, rows[0], receipt.target) == receipt,
                 "canonical_input_changed",
             )
         reader = _SourceReader(session, capability.policy.schema, {})
@@ -239,14 +228,13 @@ async def _preservation_reader(directory, capability, input_receipts):
     finally:
         if reader is not None:
             reader.deactivate()
-        await _close_reader(session)
+        await session.close()
 
 
 async def _fresh_controls(directory, expected, parent_driver):
     """Authenticate a fresh second native snapshot while the original cut locks are held."""
     async with source_transaction(directory.db, isolation="read committed") as session:
         publisher = bound_publisher()
-        await _same_database(parent_driver, publisher.connection)
         actual = await _control_witness(session, publisher.connection, publisher.policy)
         require_output(actual == expected, "canonical_control_changed")
 
@@ -323,7 +311,7 @@ async def _capture_inputs(directory, publisher, session, selected_resources):
             {
                 "controls": controls,
                 "selection": selected_resources,
-                "inputs": [receipt.to_payload() for receipt in receipts_by_root.values()],
+                "inputs": [receipt.named_payload() for receipt in receipts_by_root.values()],
                 "counts": counts,
             }
         ),

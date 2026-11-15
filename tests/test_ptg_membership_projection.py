@@ -361,17 +361,14 @@ async def test_source_custody_is_fresh_with_supplied_descriptor_and_actual_audit
     _, _, identity = await source.source_identity(session, **PARAMS, tables=tables)
     resolver.assert_awaited_once_with(session, PARAMS["snapshot_id"])
     root.assert_awaited_once_with(session, 1, schema_name="synthetic", refresh=True)
-    assert identity["source_storage"]["attestation_digest"] == "ab" * 32
-    assert identity["source_storage"]["relation_oids"] == [[name, index + 100] for index, name in enumerate(names)]
+    assert identity["source_storage"] == {"schema_name": "synthetic", "relation_names": names}
     assert identity["finalizer"] == {
         "state": "legacy_relational",
         "map_digest": None,
         "canonical_mapping_digest": None,
         "target_identity_digest": None,
     }
-    session.scalar.return_value = None
-    with pytest.raises(PTG2ManifestArtifactError, match="audit attestation"):
-        await source.source_identity(session, **PARAMS, tables=tables)
+    session.scalar.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -216,13 +216,5 @@ async def verify_registry_source_retention_rows(connection, copy_target, candida
 
 
 async def _require_source_retention_lock(connection, source_relation):
-    # The independent custodian already holds an exact exclusive lock under its owner capability.
-    held = await connection.fetchval(
-        "SELECT EXISTS(SELECT FROM pg_catalog.pg_locks WHERE locktype='relation' "
-        "AND pid=pg_catalog.pg_backend_pid() AND relation=to_regclass($1) AND granted "
-        "AND mode=ANY($2::text[]))",
-        source_relation,
-        ["ShareLock", "ShareRowExclusiveLock", "ExclusiveLock", "AccessExclusiveLock"],
-    )
-    if held is not True:
-        await connection.execute(f"LOCK TABLE {source_relation} IN SHARE MODE")
+    """Keep the named relation available while validating its complete data."""
+    await connection.execute(f"LOCK TABLE {source_relation} IN ACCESS SHARE MODE")

@@ -71,9 +71,9 @@ async def _source_storage(session, schema, snapshot_id):
         (
             await session.execute(
                 text(
-                    "SELECT d.oid AS database_oid,n.oid AS schema_oid,c.relname,c.oid AS relation_oid "
+                    "SELECT c.relname "
                     "FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid "
-                    "CROSS JOIN pg_database d WHERE n.nspname=:schema AND d.datname=current_database() "
+                    "WHERE n.nspname=:schema "
                     "AND c.relkind IN ('r','p') AND c.relname=ANY(CAST(:names AS text[])) ORDER BY c.relname"
                 ),
                 {"schema": schema, "names": sorted(required_relations | optional_relations)},
@@ -84,21 +84,9 @@ async def _source_storage(session, schema, snapshot_id):
     )
     if not storage_rows or not required_relations.issubset({storage_row["relname"] for storage_row in storage_rows}):
         raise PTG2ManifestArtifactError("membership source relation inventory is incomplete")
-    attestation_relation = f'"{serving.PTG2_SCHEMA}".ptg2_v3_candidate_audit_attestation'
-    attestation_digest = await session.scalar(
-        text(
-            f"SELECT encode(attestation_digest,'hex') FROM {attestation_relation} "
-            "WHERE snapshot_id=:snapshot_id AND activated_at IS NOT NULL"
-        ),
-        {"snapshot_id": snapshot_id},
-    )
-    if not isinstance(attestation_digest, str) or len(attestation_digest) != 64:
-        raise PTG2ManifestArtifactError("membership source audit attestation is unavailable")
     return {
-        "database_oid": int(storage_rows[0]["database_oid"]),
-        "schema_oid": int(storage_rows[0]["schema_oid"]),
-        "relation_oids": [[storage_row["relname"], int(storage_row["relation_oid"])] for storage_row in storage_rows],
-        "attestation_digest": attestation_digest,
+        "schema_name": schema,
+        "relation_names": [storage_row["relname"] for storage_row in storage_rows],
     }
 
 

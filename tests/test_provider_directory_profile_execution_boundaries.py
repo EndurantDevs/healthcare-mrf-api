@@ -38,11 +38,6 @@ def test_verified_admission_uses_execution_capacity_attestation(monkeypatch):
         _execution(),
         capacity_attestation={"contract_id": "capacity-test"},
     )
-    database_identity = SimpleNamespace(
-        database_system_identifier="system-1",
-        database_oid=42,
-        database_name="healthporta",
-    )
     verify_lease = Mock(return_value=verified_lease)
     monkeypatch.setattr(
         importer.profile_capacity,
@@ -61,11 +56,6 @@ def test_verified_admission_uses_execution_capacity_attestation(monkeypatch):
     )
     monkeypatch.setattr(
         importer,
-        "_assert_provider_directory_profile_capacity_tablespaces",
-        Mock(),
-    )
-    monkeypatch.setattr(
-        importer,
         "assert_database_capacity_lease_reservation",
         Mock(),
     )
@@ -73,7 +63,7 @@ def test_verified_admission_uses_execution_capacity_attestation(monkeypatch):
     assert (
         importer._verified_admission_lease(
             execution,
-            database_identity,
+            None,
             geometry,
         )
         is verified_lease
@@ -83,10 +73,8 @@ def test_verified_admission_uses_execution_capacity_attestation(monkeypatch):
         trust=ANY,
         now=ANY,
         expected_capacity_geometry_hash="1" * 64,
-        expected_database_system_identifier="system-1",
-        expected_database_oid=42,
-        expected_database_name="healthporta",
     )
+    assert verify_lease.call_args.kwargs["now"].utcoffset() == datetime.timedelta(0)
 
 
 def test_capacity_geometry_persistence_recomputes_hash_and_rejects_drift():

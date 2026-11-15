@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Native ACL/catalog custody survives publication and retained predecessors."""
+"""Native write denial and named model layout survive publication and retained predecessors."""
 
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -31,28 +31,28 @@ async def test_each_finalized_table_denies_unprivileged_data_writes(monkeypatch,
     async with doctors_database(monkeypatch, cms_active=False) as fixture:
         ctx = await stage_family(fixture.database, fixture.schema)
         async with preparation.prepare_cms_doctors_generation(ctx) as prepared:
-            _target, stage, oid = prepared.stage_oids[table_index]
+            _target, stage = prepared.stage_relations[table_index]
             relation = f'"{fixture.schema}"."{stage}"'
             async with ordinary_doctors_reader(fixture.database) as session:
                 with pytest.raises(DBAPIError) as denied:
                     await session.execute(text(statement.format(relation=relation)))
                 assert denied.value.orig.sqlstate == "42501"
-            assert await fixture.database.scalar("SELECT to_regclass(:name)::oid::bigint", name=relation) == oid
             assert await fixture.database.scalar(f"SELECT count(*) FROM {relation}") == 1
             assert not await fixture.database.scalar(
-                "SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=:oid AND NOT tgisinternal)", oid=oid
+                "SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=to_regclass(:name) AND NOT tgisinternal)",
+                name=relation,
             )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["update", "column", "truncate", "owner", "index", "column_shape", "rls", "rule"])
-async def test_changed_native_custody_rejects_apply(monkeypatch, change):
-    """Changing effective writer authority or native storage invalidates the seal."""
+@pytest.mark.parametrize("change", ["owner", "index", "column_shape", "rls", "rule"])
+async def test_changed_named_layout_or_denied_native_ddl_rejects_apply(monkeypatch, change):
+    """Require the full model layout and let PostgreSQL authorize actual publication DDL."""
     async with doctors_database(monkeypatch, cms_active=False) as fixture:
         ctx = await stage_family(fixture.database, fixture.schema)
         async with preparation.prepare_cms_doctors_generation(ctx) as prepared:
-            async with _changed_native_custody(fixture, prepared, change):
-                await _assert_custody_rejected(fixture, prepared, change)
+            async with _changed_named_storage(fixture, prepared, change):
+                await _assert_storage_rejected(fixture, prepared, change)
             assert (
                 await fixture.database.scalar(f'SELECT city FROM "{fixture.schema}".doctor_clinician_address')
                 == "incumbent"
@@ -62,22 +62,13 @@ async def test_changed_native_custody_rejects_apply(monkeypatch, change):
 
 
 @asynccontextmanager
-async def _changed_native_custody(fixture, prepared, change):
-    relation = f'"{fixture.schema}"."{prepared.stage_oids[0][1]}"'
+async def _changed_named_storage(fixture, prepared, change):
+    relation = f'"{fixture.schema}"."{prepared.stage_relations[0][1]}"'
     reader, owner = fixture.component.reader, fixture.component.owner
     async with fixture.engine.connect() as admin:
         actor = await admin.scalar(text("SELECT session_user"))
         await admin.rollback()
         alter, restore = {
-            "update": (f'GRANT UPDATE ON {relation} TO "{reader}"', f'REVOKE UPDATE ON {relation} FROM "{reader}"'),
-            "column": (
-                f'GRANT INSERT(city) ON {relation} TO "{reader}"',
-                f'REVOKE INSERT(city) ON {relation} FROM "{reader}"',
-            ),
-            "truncate": (
-                f'GRANT TRUNCATE ON {relation} TO "{reader}"',
-                f'REVOKE TRUNCATE ON {relation} FROM "{reader}"',
-            ),
             "owner": (f'ALTER TABLE {relation} OWNER TO "{actor}"', f'ALTER TABLE {relation} OWNER TO "{owner}"'),
             "index": (
                 f"CREATE INDEX extra_custody_index ON {relation} (city)",
@@ -105,33 +96,39 @@ async def _changed_native_custody(fixture, prepared, change):
             await admin.commit()
 
 
-async def _assert_custody_rejected(fixture, prepared, change):
+async def _assert_storage_rejected(fixture, prepared, change):
     if change == "owner":
         with pytest.raises(DBAPIError) as denied:
             async with fixture.database.transaction():
                 await preparation.apply_prepared_cms_doctors_generation(prepared)
         assert denied.value.orig.sqlstate == "42501"
     else:
-        with pytest.raises(RuntimeError, match="ordinary mutation|cms_doctors_immutable_"):
+        reason = "cms_doctors_prepared_stage_changed" if change == "rls" else "cms_doctors_immutable_"
+        with pytest.raises(RuntimeError, match=reason):
             async with fixture.database.transaction():
                 await preparation.apply_prepared_cms_doctors_generation(prepared)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("table_index", range(3))
-async def test_post_seal_rewrite_of_any_family_heap_rejects_publication(monkeypatch, table_index):
-    """The source proof includes all three final filenodes, not only the address used by geometry."""
+async def test_named_family_rewrite_preserves_content_and_publication(monkeypatch, table_index):
+    """A storage rewrite changes no declared snapshot name or source data."""
     async with doctors_database(monkeypatch, cms_active=False) as fixture:
         ctx = await stage_family(fixture.database, fixture.schema)
         async with preparation.prepare_cms_doctors_generation(ctx) as prepared:
-            _target, stage, oid = prepared.stage_oids[table_index]
+            _target, stage = prepared.stage_relations[table_index]
             relation = f'"{fixture.schema}"."{stage}"'
-            await fixture.database.status(f"ALTER TABLE {relation} SET UNLOGGED")
-            await fixture.database.status(f"ALTER TABLE {relation} SET LOGGED")
-            assert await fixture.database.scalar("SELECT to_regclass(:name)::oid::bigint", name=relation) == oid
-            with pytest.raises(RuntimeError, match="physical_seal_changed"):
-                async with fixture.database.transaction():
-                    await preparation.apply_prepared_cms_doctors_generation(prepared)
+            content_sql = f"SELECT jsonb_agg(to_jsonb(r) ORDER BY npi) FROM {relation} r"
+            async with fixture.engine.begin() as admin:
+                before = await admin.scalar(text(content_sql))
+                await admin.execute(text(f"ALTER TABLE {relation} SET UNLOGGED"))
+                await admin.execute(text(f"ALTER TABLE {relation} SET LOGGED"))
+                assert await admin.scalar(text(content_sql)) == before
+            async with fixture.database.transaction() as session:
+                await preparation.assert_prepared_cms_doctors_seal(session, prepared)
+                result = await preparation.apply_prepared_cms_doctors_generation(prepared)
+                assert result.relations == tuple((fixture.schema, target) for target, _ in prepared.stage_relations)
+                assert result.local_generation == prepared.incumbent_authority.local_generation + 1
 
 
 @pytest.mark.asyncio
@@ -148,14 +145,15 @@ async def test_future_import_has_mutable_new_heaps_and_retained_generations_stay
                 if expected_generation == 3:
                     await _assert_named_family_sealed(fixture, prepared, "_old")
         assert not await fixture.database.scalar(
-            "SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=ANY(CAST(:oids AS oid[])) AND NOT tgisinternal)",
-            oids=[oid for _, _, oid in prepared.stage_oids],
+            "SELECT EXISTS(SELECT FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=:schema AND c.relname=ANY(CAST(:names AS text[])) AND NOT t.tgisinternal)",
+            schema=fixture.schema,
+            names=[target for target, _stage in prepared.stage_relations],
         )
 
 
 async def _assert_named_family_sealed(fixture, prepared, suffix):
     """Every surviving heap remains closed to ordinary write authority after rename."""
-    for target, _stage, _oid in prepared.stage_oids:
+    for target, _stage in prepared.stage_relations:
         async with ordinary_doctors_reader(fixture.database) as session:
             with pytest.raises(DBAPIError) as denied:
                 await session.execute(text(f'DELETE FROM "{fixture.schema}"."{target}{suffix}" WHERE FALSE'))
@@ -181,7 +179,7 @@ async def _assert_fresh_restore(fixture, prepared):
             ownership = await archive.precreate_reference_family_restore(
                 session, importer_id="cms-doctors", dataset_id=uuid4()
             )
-            for target, _stage, _oid in prepared.stage_oids:
+            for target, _stage in prepared.stage_relations:
                 relation = f'"{ownership.schema_name}"."{target}"'
                 await session.execute(text(f'INSERT INTO {relation} SELECT * FROM "{fixture.schema}"."{target}"'))
                 assert (await session.execute(text(f"UPDATE {relation} SET npi=npi"))).rowcount == 1

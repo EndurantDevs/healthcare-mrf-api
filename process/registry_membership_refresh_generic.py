@@ -31,22 +31,22 @@ async def generic_refresh_endpoints(driver, bindings, read_budget):
     endpoints = set()
     for coordinates in _capture_groups(bindings):
         capture = await read_original_generic_capture_metadata(driver, coordinates, read_budget)
-        endpoints.add((capture.origin.schema_name, capture.origin.source_id, capture.origin.endpoint_id))
+        endpoints.add((capture.origin.header_relation["schema"], capture.origin.source_id, capture.origin.endpoint_id))
     return tuple(sorted(endpoints))
 
 
 def _original_pin(capture, coordinates, retained_recipes):
-    matches = set()
+    matched = None
     for recipe in retained_recipes:
         pin = recipe.source_pin
         if recipe.binding_coordinates == coordinates and type(pin) is PinnedFHIRMembershipSource:
             original = replace(pin, retained_successor=None)
             if original.retained_capture == capture:
-                matches.add(original)
-    if len(matches) > 1:
-        raise RegistryRefreshAnchorUnavailable("registry_refresh_generic_recipe_ambiguous")
-    if matches:
-        return next(iter(matches))
+                if matched is not None and original != matched:
+                    raise RegistryRefreshAnchorUnavailable("registry_refresh_generic_recipe_ambiguous")
+                matched = original
+    if matched is not None:
+        return matched
     if capture.origin.admission_profile != SEMANTIC_PROFILE:
         raise RegistryRefreshAnchorUnavailable("registry_refresh_generic_semantic_date_unavailable")
     return _capture_pin(capture, PRODUCER, capture.origin.semantic_projection_as_of)
@@ -61,7 +61,7 @@ def _capture_pin(capture, alias_scope, as_of):
         origin.dataset_id,
         origin.dataset_sha256,
         capture.release_id,
-        origin.resource_parent_oid,
+        origin.resource_relation,
         alias_scope,
         as_of,
         retained_capture=capture,
@@ -97,7 +97,7 @@ async def _accepted_capture(driver, original, budget):
     budget.reserve(({"raw_byte_count": ADMISSION_METADATA_SUMMARY_MAX_BYTES},))
     head = await read_current_generic_fhir_head(
         driver,
-        schema_name=original.origin.schema_name,
+        schema_name=original.origin.header_relation["schema"],
         source_id=original.origin.source_id,
         endpoint_id=original.origin.endpoint_id,
     )

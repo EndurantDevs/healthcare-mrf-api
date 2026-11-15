@@ -30,6 +30,11 @@ from tests.test_address_numeric_grid_alias_db import (
     suppress,
 )
 
+
+class _CutoverProbeStage:
+    __tablename__ = "cutover_probe"
+
+
 @pytest.mark.asyncio(loop_scope="session")
 async def test_alias_change_blocks_unified_cutover_and_stale_overlay_next_build():
     _requires_test_database()
@@ -40,10 +45,11 @@ async def test_alias_change_blocks_unified_cutover_and_stale_overlay_next_build(
         overlay_generation=1,
         corroboration_generation=1,
     )
-    source_selects = [
-        f"SELECT * FROM {schema}.provider_directory_address_overlay AS overlay"
-    ]
-    fence_context_by_field = {"address_alias_generation": 1}
+    source_selects = [f"SELECT * FROM {schema}.provider_directory_address_overlay AS overlay"]
+    fence_context_by_field = {
+        "address_alias_generation": 1,
+        "geo_assurance_candidate_relation": {"schema_name": schema, "relation_name": "cutover_probe"},
+    }
     try:
         await entity_address_unified._capture_provider_directory_overlay_alias_fence(
             schema,
@@ -61,15 +67,17 @@ async def test_alias_change_blocks_unified_cutover_and_stale_overlay_next_build(
         with pytest.raises(RuntimeError, match="alias generation changed"):
             await entity_address_unified._run_entity_address_cutover(
                 schema,
-                [],
+                [
+                    entity_address_unified._StageTableSwap(
+                        entity_address_unified.EntityAddressUnified, _CutoverProbeStage
+                    )
+                ],
                 [],
                 ["cutover_probe"],
                 ["cutover_probe"],
                 fence_context_by_field,
             )
-        assert await db.scalar(
-            f'SELECT marker FROM "{schema}".cutover_probe;'
-        ) == "untouched"
+        assert await db.scalar(f'SELECT marker FROM "{schema}".cutover_probe;') == "untouched"
 
         with pytest.raises(RuntimeError, match="stale address alias generation"):
             await entity_address_unified._capture_provider_directory_overlay_alias_fence(
@@ -82,46 +90,28 @@ async def test_alias_change_blocks_unified_cutover_and_stale_overlay_next_build(
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_same_generation_overlay_oid_swap_blocks_unified_cutover():
+async def test_named_overlay_metadata_survives_equivalent_copy():
     _requires_test_database()
-    schema = "address_alias_unified_oid_probe"
-    await _prepare_serving_fence_schema(
-        schema,
-        generation=2,
-        overlay_generation=2,
-        corroboration_generation=2,
-    )
-    fence_context_by_field = {"address_alias_generation": 2}
+    schema = "address_alias_unified_named_probe"
+    await _prepare_serving_fence_schema(schema, generation=2, overlay_generation=2, corroboration_generation=2)
+    context_by_field = {"address_alias_generation": 2}
     try:
         await entity_address_unified._capture_provider_directory_overlay_alias_fence(
-            schema,
-            [
-                f"SELECT * FROM {schema}.provider_directory_address_overlay AS overlay"
-            ],
-            fence_context_by_field,
+            schema, [f"SELECT * FROM {schema}.provider_directory_address_overlay AS overlay"], context_by_field
         )
-        old_oid = fence_context_by_field[
-            "provider_directory_overlay_relation_oid"
-        ]
-        await _replace_overlay_relation(schema)
-        new_oid = await provider_directory._provider_directory_relation_oid(
-            schema,
-            provider_directory.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-        )
-        assert new_oid is not None and new_oid != old_oid
-
-        with pytest.raises(RuntimeError, match="overlay changed"):
-            await entity_address_unified._run_entity_address_cutover(
-                schema,
-                [],
-                [],
-                ["cutover_probe"],
-                ["cutover_probe"],
-                fence_context_by_field,
+        original_metadata = json.dumps(context_by_field, sort_keys=True)
+        async with db.transaction():
+            await db.status(f'ALTER TABLE "{schema}".provider_directory_address_overlay RENAME TO retained_overlay')
+            await db.status(
+                f'CREATE TABLE "{schema}".provider_directory_address_overlay (LIKE "{schema}".retained_overlay INCLUDING ALL)'
             )
-        assert await db.scalar(
-            f'SELECT marker FROM "{schema}".cutover_probe;'
-        ) == "untouched"
+            await db.status(
+                f'INSERT INTO "{schema}".provider_directory_address_overlay SELECT * FROM "{schema}".retained_overlay'
+            )
+        await entity_address_unified._assert_provider_directory_overlay_alias_fence(schema, context_by_field)
+        assert json.dumps(context_by_field, sort_keys=True) == original_metadata
+        assert await db.scalar(f'SELECT marker FROM "{schema}".provider_directory_address_overlay') == "overlay-old"
+        assert await db.scalar(f'SELECT marker FROM "{schema}".cutover_probe') == "untouched"
     finally:
         await db.status(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
 
@@ -169,31 +159,28 @@ async def _prepare_corroboration_cutover_probe(
 ) -> provider_directory.ProviderDirectoryArtifactBuildFence:
     """Create a staged corroboration row and capture its dependency fence."""
     await db.status(f'CREATE TABLE "{schema}"."{stage}" (marker text NOT NULL);')
-    await db.status(
-        f'INSERT INTO "{schema}"."{stage}" VALUES (\'corroboration-new\');'
-    )
-    target_oid = await provider_directory._provider_directory_relation_oid(
-        schema,
-        provider_directory.PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW,
-    )
-    overlay_oid = await provider_directory._provider_directory_relation_oid(
-        schema,
-        provider_directory.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-    )
-    assert target_oid is not None and overlay_oid is not None
+    await db.status(f'INSERT INTO "{schema}"."{stage}" VALUES (\'corroboration-new\');')
+    from process.provider_directory_artifact_bundle_preparation import address_overlay_publication, artifact_publication
+
+    relation = provider_directory.PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
+    publication = await artifact_publication(provider_directory, schema, relation)
+    overlay = await address_overlay_publication(provider_directory, schema)
+    assert publication[0] is True and overlay is not None
     return provider_directory.ProviderDirectoryArtifactBuildFence(
-        target_oid=target_oid,
+        target_name=(schema, relation),
+        target_publication=publication,
         alias_generation=2,
         dependency_relation=provider_directory.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-        dependency_relation_oid=overlay_oid,
+        dependency_publication=overlay,
     )
 
 
 async def _assert_rejected_corroboration_cutover(schema: str, stage: str) -> None:
     """Assert a stale dependency leaves the old target and removes the stage."""
-    assert await db.scalar(
-        f'SELECT marker FROM "{schema}".provider_directory_address_corroboration;'
-    ) == "corroboration-old"
+    assert (
+        await db.scalar(f'SELECT marker FROM "{schema}".provider_directory_address_corroboration;')
+        == "corroboration-old"
+    )
     assert await db.scalar(
         "SELECT to_regclass(:relation_name) IS NULL;",
         relation_name=f"{schema}.provider_directory_address_corroboration_old",
@@ -220,6 +207,10 @@ async def test_corroboration_cutover_rejects_changed_overlay_oid():
     try:
         build_fence = await _prepare_corroboration_cutover_probe(schema, stage)
         await _replace_overlay_relation(schema)
+        await db.status(
+            f"UPDATE \"{schema}\".address_alias_artifact_state_v1 SET updated_at=updated_at+interval '1 second' "
+            "WHERE artifact_name='provider_directory_address_overlay'"
+        )
 
         with pytest.raises(
             provider_directory.ProviderDirectoryArtifactBuildStale,
@@ -228,9 +219,7 @@ async def test_corroboration_cutover_rejects_changed_overlay_oid():
             await provider_directory._cutover_provider_directory_artifact_stage(
                 schema=schema,
                 stage_table=stage,
-                target_relation=(
-                    provider_directory.PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
-                ),
+                target_relation=(provider_directory.PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW),
                 rename_stage_indexes=_rename_noop,
                 build_fence=build_fence,
             )

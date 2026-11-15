@@ -3,7 +3,7 @@
 
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -165,6 +165,27 @@ async def test_composition_refuses_different_producer_before_current_state(monke
 
 
 @pytest.mark.asyncio
+async def test_configured_transaction_uses_declared_roles_without_operator_connection_settings(monkeypatch):
+    configured = publication.CatalogPublicationPolicy("serving", "snapshot_owner", ("publisher", "reader"))
+    environment = Mock(side_effect=AssertionError("operator connection settings must remain unused"))
+    monkeypatch.setattr(publication.PublisherSettings, "from_environment", environment)
+    current = AsyncMock()
+    monkeypatch.setattr(storage, "current_models", current)
+    with pytest.raises(RuntimeError, match="input differs"):
+        await publication.compose_catalog_family(
+            _session(), "serving", "ms-drg", _input("code-sets"), (), object(), publication_policy=configured
+        )
+    environment.assert_not_called()
+    current.assert_not_awaited()
+
+
+@pytest.mark.parametrize("readers", [(), [], ("reader", "reader"), ("snapshot_owner",), ('unsafe"reader',)])
+def test_transaction_publication_roles_refuse_incomplete_or_unsafe_declarations(readers):
+    with pytest.raises(ValueError, match="configuration|schema name"):
+        publication.CatalogPublicationPolicy("serving", "snapshot_owner", readers)
+
+
+@pytest.mark.asyncio
 async def test_records_copy_before_complete_native_indexes(monkeypatch):
     incoming = _input("code-sets")
     session, events = _session(), []
@@ -283,7 +304,7 @@ async def test_native_fixture_refuses_preexisting_names_before_registering_clean
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("importer", ["code-sets", "ms-drg"])
-async def test_native_fixture_supplies_exact_importer_to_real_custody_guard(monkeypatch, importer):
+async def test_native_fixture_preserves_declared_importer_and_complete_table_set(monkeypatch, importer):
     from process import ms_drg_result_generation as drg
     from tests import scoped_catalog_native_fixture as fixture
 
@@ -302,12 +323,21 @@ async def test_native_fixture_supplies_exact_importer_to_real_custody_guard(monk
     )
     monkeypatch.setattr(native, "_schema_oid", AsyncMock(return_value=9))
     monkeypatch.setattr(native, "_relation_oid", AsyncMock(side_effect=[10, 11]))
-    owner = AsyncMock(return_value=77)
-    monkeypatch.setattr(native, "model_family_publisher_owner", owner)
-    monkeypatch.setattr(native, "protected_publisher_owner", AsyncMock(return_value=77))
-    with pytest.raises(native.ReferenceFamilyArchiveError, match="schema identity differs"):
-        await fixture.seal_catalog(actors, "synthetic_live", (CodeCatalog,), generation)
-    owner.assert_awaited_once_with(connection, importer)
+    seal = AsyncMock()
+    monkeypatch.setattr(native, "seal_model_family_storage", seal)
+    await fixture.seal_catalog(actors, "synthetic_live", (CodeCatalog,), generation)
+    statements = [str(call.args[0]) for call in connection.execute.await_args_list]
+    for name in ("code_catalog", generation):
+        assert f'ALTER TABLE "synthetic_live"."{name}" OWNER TO "synthetic_owner"' in statements
+        assert f'GRANT SELECT ON "synthetic_live"."{name}" TO "synthetic_builder"' in statements
+    assert all(
+        "GRANT" not in statement or "GRANT SELECT" in statement or "GRANT USAGE" in statement
+        for statement in statements
+    )
+    assert all("GRANT INSERT" not in statement and "GRANT UPDATE" not in statement for statement in statements)
+    seal.assert_not_awaited()
+    native._schema_oid.assert_not_awaited()
+    native._relation_oid.assert_not_awaited()
 
 
 @pytest.mark.asyncio

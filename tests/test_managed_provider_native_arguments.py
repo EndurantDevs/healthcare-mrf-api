@@ -9,6 +9,7 @@ from sanic.exceptions import InvalidUsage
 
 from api.endpoint import npi as provider
 from api.network_address_scope import network_address_read_scope
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 
 
@@ -20,7 +21,14 @@ class ReachedNativeReader(Exception):
 def native_boundary(monkeypatch):
     candidate = uuid4()
     manifest = PinnedNetworkServingManifest(
-        9, str(candidate), "network_candidate_" + candidate.hex, 1, {}, 4, "b" * 64, 123
+        9,
+        str(candidate),
+        "network_candidate_" + candidate.hex,
+        1,
+        {},
+        4,
+        "b" * 64,
+        CompactAddressRelation("network_candidate_" + candidate.hex, "entity_address_unified"),
     )
     request = SimpleNamespace(args={}, query_string="", ctx=SimpleNamespace())
 

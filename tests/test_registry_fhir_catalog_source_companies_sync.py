@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Source labels refresh metadata while committed source facts and identities stay pinned."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
@@ -52,7 +53,7 @@ def _typed_source(case):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_verification", [False, True])
-async def test_label_refresh_verifies_registry_reader_before_writer_commit(monkeypatch, source_case, fail_verification):
+async def test_label_refresh_validates_source_labels_before_writer_commit(monkeypatch, source_case, fail_verification):
     events = []
 
     @asynccontextmanager
@@ -65,7 +66,8 @@ async def test_label_refresh_verifies_registry_reader_before_writer_commit(monke
             events.append("reader-close")
 
     @asynccontextmanager
-    async def writer_transaction(**_options):
+    async def writer_transaction(**options):
+        assert options == {"isolation": "repeatable_read"}
         events.append("writer-open")
         try:
             yield
@@ -75,15 +77,17 @@ async def test_label_refresh_verifies_registry_reader_before_writer_commit(monke
         else:
             events.append("writer-commit")
 
-    async def verify_reader():
-        events.append("reader-verify")
+    async def stage_candidate(*arguments, **options):
+        assert arguments[0] is source_case.config and arguments[1] is source_case.loader
+        assert options == {"source_export": source_case.factory, "source_companies_only": True}
+        events.append("source-verify")
         if fail_verification:
-            raise ValueError("registry_fhir_catalog_registry_reader_changed")
+            raise ValueError("registry_fhir_catalog_source_companies_invalid")
+        return None, {}, {}, None
 
     source_case.loader.transaction = writer_transaction
     monkeypatch.setattr(sync, "fhir_catalog_registry_reads", registry_reads)
-    monkeypatch.setattr(sync, "verify_fhir_catalog_registry_reads", verify_reader)
-    monkeypatch.setattr(sync, "_stage_catalog_candidate", AsyncMock(return_value=(None, {}, {}, None)))
+    monkeypatch.setattr(sync, "_stage_catalog_candidate", stage_candidate)
     operation = sync.prepare_fhir_catalog_snapshot(
         source_case.config,
         source_case.loader,
@@ -93,14 +97,14 @@ async def test_label_refresh_verifies_registry_reader_before_writer_commit(monke
         source_companies_only=True,
     )
     if fail_verification:
-        with pytest.raises(ValueError, match="registry_reader_changed"):
+        with pytest.raises(ValueError, match="source_companies_invalid"):
             await operation
     else:
         assert await operation == (None, {}, {})
     assert events == [
         "reader-open",
         "writer-open",
-        "reader-verify",
+        "source-verify",
         "writer-rollback" if fail_verification else "writer-commit",
         "reader-close",
     ]
@@ -533,13 +537,33 @@ async def test_reused_unlabeled_candidate_needs_no_label_reader_or_rebuild(monke
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [ValueError, asyncio.CancelledError])
+async def test_failed_seal_preserves_checkpointed_candidate_and_original_error(monkeypatch, source_case, failure):
+    _preparation(monkeypatch, source_case)
+    original = failure("independent seal refused")
+    sync._seal_catalog_snapshot.side_effect = original
+    with pytest.raises(failure) as caught:
+        await sync.prepare_fhir_catalog_snapshot(
+            source_case.config, source_case.loader, None, source_case.sealer_pool, source_export=source_case.factory
+        )
+    assert caught.value is original
+    target = sync._build_source_catalog_candidate.await_args.args[3]
+    sync.checkpoint_fhir_catalog_snapshot.assert_awaited_once()
+    assert sync.checkpoint_fhir_catalog_snapshot.await_args.args[1] is target
+    assert sync._seal_catalog_snapshot.await_args.args[1] is target
+    sync.discard_fhir_catalog_candidate.assert_not_awaited()
+    assert getattr(original, "__notes__", []) == []
+    assert source_case.events[-1] == ("exit",)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cleanup_fails", [False, True])
-async def test_failed_seal_cleans_only_its_candidate_and_preserves_original_error(
+async def test_failed_checkpoint_cleans_only_its_candidate_and_preserves_original_error(
     monkeypatch, source_case, cleanup_fails
 ):
     _preparation(monkeypatch, source_case)
-    original = ValueError("independent seal refused")
-    sync._seal_catalog_snapshot.side_effect = original
+    original = ValueError("checkpoint refused")
+    sync.checkpoint_fhir_catalog_snapshot.side_effect = original
     if cleanup_fails:
         sync.discard_fhir_catalog_candidate.side_effect = PermissionError("cleanup refused")
     with pytest.raises(ValueError) as caught:
@@ -554,8 +578,9 @@ async def test_failed_seal_cleans_only_its_candidate_and_preserves_original_erro
         loader_role=source_case.config.loader_role,
         control_schema=source_case.config.grant.control_schema,
     )
+    sync._seal_catalog_snapshot.assert_not_awaited()
     assert getattr(original, "__notes__", []) == (
-        ["Unsealed catalog candidate cleanup failed: " + target.schema_name] if cleanup_fails else []
+        ["Catalog candidate cleanup failed: " + target.schema_name] if cleanup_fails else []
     )
     assert source_case.events[-1] == ("exit",)
 
@@ -607,26 +632,45 @@ async def test_retained_labels_and_last_good_status_survive_committed_metadata_r
 
 
 @pytest.mark.asyncio
-async def test_scoped_source_export_still_requires_and_pins_its_native_reader(monkeypatch, source_case):
+async def test_named_source_export_pins_source_and_registry_reads(monkeypatch, source_case):
     from tests.test_registry_fhir_catalog_source_producer_grant import scoped_observed_descriptor
     from tests.test_registry_fhir_catalog_source_producer_sync import _scope
 
     selected, profile = scoped_observed_descriptor()
     grant = replace(source_case.config.grant, source_profiles=(profile,))
-    reader = SimpleNamespace(execute=AsyncMock(), transaction=lambda **_options: _scope())
-    pool = SimpleNamespace(acquire=lambda: _scope(reader))
+    reader = SimpleNamespace(execute=AsyncMock(), transaction=Mock(side_effect=lambda **_options: _scope()))
+    events = []
+
+    @asynccontextmanager
+    async def acquire():
+        events.append("source-open")
+        try:
+            yield reader
+        finally:
+            events.append("source-close")
+
+    pool = SimpleNamespace(acquire=acquire)
     workspace = object()
-    monkeypatch.setattr(sync, "fhir_catalog_reference_workspace", lambda actual: _scope(workspace))
+    reference = Mock(side_effect=lambda actual: _scope(workspace))
+    monkeypatch.setattr(sync, "fhir_catalog_reference_workspace", reference)
     async with sync._catalog_source_reads(pool, source_case.sealer_pool, grant, source_case.factory) as reads:
-        assert reads == (reader, workspace, {})
-        assert sync._source_catalog_export(selected, reads[2]) is None
-    source_case.factory.assert_not_called()
-    source_case.sealer_pool.acquire.assert_not_called()
-    with pytest.raises(ValueError, match="published_reader_required"):
-        await sync._published_read(None, selected)
-    with pytest.raises(ValueError, match="published_reader_required"):
-        await sync._legacy_identity_inputs(reader, source_case.loader, selected, ("network-one",), '"catalog_control"')
+        assert reads == (reader, workspace, {sync.canonical_json(profile.document()): source_case.export})
+        assert sync._source_catalog_export(selected, reads[2]) is source_case.export
+        assert events == ["source-open"] and source_case.events == [("enter", profile)]
+        with pytest.raises(ValueError, match="source_export_required"):
+            sync._source_catalog_export(selected, {})
+    reference.assert_called_once_with(reader)
+    reader.transaction.assert_called_once_with(isolation="repeatable_read", readonly=True)
+    reader.execute.assert_awaited_once_with("SET LOCAL search_path = pg_catalog, pg_temp, public")
+    source_case.factory.assert_called_once_with(source_profile=profile)
+    source_case.sealer_pool.acquire.assert_called_once_with()
+    assert source_case.identity_probe.transaction.call_args.kwargs == {"isolation": "repeatable_read", "readonly": True}
+    assert source_case.events == [("enter", profile), ("exit",)]
+    assert source_case.probe_events[-2:] == [("commit",), "release"]
+    assert events == ["source-open", "source-close"]
     source_case.loader.fetch.assert_not_awaited()
+    source_case.export["inventory"].assert_not_called()
+    source_case.export["replay"].assert_not_awaited()
 
 
 @pytest.mark.asyncio

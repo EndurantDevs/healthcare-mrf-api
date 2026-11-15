@@ -22,16 +22,10 @@ from tests.ptg2_serving_address_evidence_postgres_support import (
     _temporary_schema,
 )
 
-
 MIGRATION_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "alembic"
-    / "versions"
-    / "20260825090000_geo_assurance_projection.py"
+    Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20260825090000_geo_assurance_projection.py"
 )
-entity_address_unified = importlib.import_module(
-    "process.entity_address_unified"
-)
+entity_address_unified = importlib.import_module("process.entity_address_unified")
 
 
 def _load_migration():
@@ -85,8 +79,8 @@ def test_runtime_uses_projection_and_falls_back_to_exact_legacy_predicates():
         radius_predicates=["ST_DWithin(TRUE)"],
     )
 
-    assert "addr.geo_assurance_version = 1" in evidence_sql
-    assert "addr.geo_evidence_source_id IN (0, 1, 2, 3)" in evidence_sql
+    assert "addr.geo_evidence_source_id" not in evidence_sql
+    assert projection.projected_evidence_available_sql("addr", schema_name="mrf") == "FALSE"
     assert {
         "geo_evidence_source_id",
         "geo_identity_coherent",
@@ -96,10 +90,9 @@ def test_runtime_uses_projection_and_falls_back_to_exact_legacy_predicates():
     assert "FROM mrf.npi_address AS geo_nppes" in evidence_sql
     assert "FROM mrf.mrf_address AS geo_mrf" in evidence_sql
     assert "FROM mrf.doctor_clinician_address AS geo_doctor" in evidence_sql
-    assert "FROM mrf.entity_address_geo_assurance_state" in evidence_sql
-    assert "active_relation_signature" in evidence_sql
-    assert "pg_relation_filenode" in evidence_sql
-    assert "addr.geo_identity_coherent" in location_sql
+    assert "entity_address_geo_assurance_state" not in evidence_sql
+    assert "pg_relation_filenode" not in evidence_sql
+    assert "addr.geo_identity_coherent" not in location_sql
     assert "addr.geo_point_coherent" in location_sql
     assert "mrf.geo_zip_lookup" in location_sql
     assert "tiger.zcta5" in location_sql
@@ -144,8 +137,7 @@ async def test_legacy_reused_stage_adds_projection_columns_before_reuse(monkeypa
     async with _temporary_schema() as (database, schema):
         stage_table = "entity_address_unified_reused"
         await database.status(
-            f"CREATE TABLE {schema}.{stage_table} "
-            f"(LIKE {schema}.entity_address_unified INCLUDING ALL)"
+            f"CREATE TABLE {schema}.{stage_table} (LIKE {schema}.entity_address_unified INCLUDING ALL)"
         )
         for column_name in (
             "geo_evidence_source_id",
@@ -153,9 +145,7 @@ async def test_legacy_reused_stage_adds_projection_columns_before_reuse(monkeypa
             "geo_point_coherent",
             "geo_assurance_version",
         ):
-            await database.status(
-                f"ALTER TABLE {schema}.{stage_table} DROP COLUMN {column_name}"
-            )
+            await database.status(f"ALTER TABLE {schema}.{stage_table} DROP COLUMN {column_name}")
         monkeypatch.setattr(entity_address_unified, "db", database)
 
         await entity_address_unified._ensure_entity_address_unified_live_columns(
@@ -163,8 +153,9 @@ async def test_legacy_reused_stage_adds_projection_columns_before_reuse(monkeypa
             stage_table,
         )
 
-        assert await database.scalar(
-            """
+        assert (
+            await database.scalar(
+                """
             SELECT COUNT(*)
               FROM information_schema.columns
              WHERE table_schema = :schema
@@ -176,9 +167,11 @@ async def test_legacy_reused_stage_adds_projection_columns_before_reuse(monkeypa
                    'geo_assurance_version'
                )
             """,
-            schema=schema,
-            table_name=stage_table,
-        ) == 4
+                schema=schema,
+                table_name=stage_table,
+            )
+            == 4
+        )
 
 
 def test_projection_validation_rejects_every_transitional_or_invalid_row():
@@ -345,14 +338,15 @@ async def _assert_stored_projection(
         for address_record in stored_records
     }
     assert stored_by_key == legacy_by_key
-    assert {
-        location_key: assurance_fields[0]
-        for location_key, assurance_fields in stored_by_key.items()
-    } == {"cms": 3, "mrf": 2, "none": 0, "nppes": 1}
+    assert {location_key: assurance_fields[0] for location_key, assurance_fields in stored_by_key.items()} == {
+        "cms": 3,
+        "mrf": 2,
+        "none": 0,
+        "nppes": 1,
+    }
     assert stored_by_key["none"][2] is False
     assert all(
-        address_record._mapping["geo_assurance_version"]
-        == projection.GEO_ASSURANCE_VERSION
+        address_record._mapping["geo_assurance_version"] == projection.GEO_ASSURANCE_VERSION
         for address_record in stored_records
     )
 
@@ -377,13 +371,16 @@ async def _assert_forced_projection_refresh(database, schema: str) -> None:
         schema,
     )
     assert await database.status(forced_materialize_sql) == 5
-    assert await database.scalar(
-        f"""
+    assert (
+        await database.scalar(
+            f"""
         SELECT geo_point_coherent
           FROM {schema}.entity_address_unified
          WHERE location_key = 'nppes'
         """
-    ) is False
+        )
+        is False
+    )
 
 
 async def _assert_stale_projection_refresh(
@@ -404,13 +401,16 @@ async def _assert_stale_projection_refresh(
         """
     )
     assert await database.status(materialize_sql) == 1
-    assert await database.scalar(
-        f"""
+    assert (
+        await database.scalar(
+            f"""
         SELECT geo_evidence_source_id
           FROM {schema}.entity_address_unified
          WHERE location_key = 'mrf'
         """
-    ) == 2
+        )
+        == 2
+    )
 
 
 async def _assert_validation_and_runtime_fallback(
@@ -421,10 +421,13 @@ async def _assert_validation_and_runtime_fallback(
     """Assert NULL rollout rows fall back yet fail pre-cutover validation."""
 
     monkeypatch.setattr(entity_address_unified, "db", database)
-    assert await entity_address_unified._validate_geo_assurance_projection(
-        schema,
-        "entity_address_unified",
-    ) == 0
+    assert (
+        await entity_address_unified._validate_geo_assurance_projection(
+            schema,
+            "entity_address_unified",
+        )
+        == 0
+    )
     await database.status(
         f"""
         UPDATE {schema}.entity_address_unified

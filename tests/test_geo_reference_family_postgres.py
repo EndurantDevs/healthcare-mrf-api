@@ -13,7 +13,6 @@ from sqlalchemy import text
 from process import geo_import, geo_source_archive, geo_source_storage
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
-from process.cms_doctors_immutable import _writer
 from process.geo_source_storage import require_geo_storage
 from process.provider_directory_generic_source_policy import source_transaction
 from tests.geo_source_postgres_support import geo_source_component_database
@@ -68,6 +67,12 @@ async def _load_snapshot(component, tmp_path, city):
         )
 
 
+async def _serving_geo_oid(component):
+    """Observe the heap currently serving by its qualified name, as the test's own reference."""
+    async with source_transaction(component.database, isolation="repeatable read") as session:
+        return await session.scalar(text("SELECT 'mrf.geo_zip_lookup'::regclass::oid::bigint"))
+
+
 async def _assert_bootstrap_archive_transition(component, index_profile):
     """Validate actual old/new catalogs without inventing a published source generation."""
     spec = archive.reference_family_spec("geo")
@@ -82,10 +87,11 @@ async def _assert_bootstrap_archive_transition(component, index_profile):
             with pytest.raises(RuntimeError, match="indexes_incomplete"):
                 await require_geo_storage(session, schema_name="mrf")
         async with session.begin_nested() as rollback:
+            # Emit this SAVEPOINT now; lazily, it would open inside the publisher savepoint and be released with it.
+            await session.connection()
             ownership = await archive.precreate_reference_family_restore(session, importer_id="geo", dataset_id=uuid4())
             await archive.complete_reference_family_restore(session, ownership)
-            owner = await _writer(session)
-            await archive.seal_model_family_storage(session, ownership, owner)
+            await archive.seal_model_family_storage(session, ownership, roles=component.policy)
             receipts = await archive._validate_stage_manifest(session, ownership=ownership, manifest=original)
             assert (
                 original.tables[0].schema_sha256,
@@ -105,16 +111,12 @@ async def _retain_geo_heap(session, oid):
     """Move only the actual predecessor heap, preserving its original file and indexes."""
     schema = archive.reference_family_predecessor_schema(uuid4())
     await archive.create_model_family_predecessor_schema(session, "geo", schema)
-    name, filenode = (
-        await session.execute(
-            text("SELECT relname,pg_relation_filenode(oid)::bigint FROM pg_class WHERE oid=:oid"), {"oid": oid}
-        )
-    ).one()
+    name = await session.scalar(text("SELECT relname FROM pg_class WHERE oid=:oid"), {"oid": oid})
     await session.execute(text(f'ALTER TABLE "mrf".{archive._quoted(name)} SET SCHEMA {archive._quoted(schema)}'))
     await session.execute(
         text(f'ALTER TABLE {archive._quoted(schema)}.{archive._quoted(name)} RENAME TO "geo_zip_lookup"')
     )
-    return schema, filenode
+    return schema
 
 
 async def _capture_geo_manifest(component):
@@ -124,79 +126,49 @@ async def _capture_geo_manifest(component):
         capture = await archive.capture_reference_family_source(
             session, importer_id="geo", schema_name="mrf", source_metadata={"source_release": "synthetic"}
         )
-        return capture.manifest, session
+        return capture.manifest
 
 
-async def _refuse_stale_geo_storage(session, schema, oid, filenode, manifest):
-    """Invalidate only private retained identity inside savepoints, preserving original payloads."""
+async def _refuse_stale_geo_storage(session, schema, manifest):
+    """Swap in a keyless copy of the rows, then change the row set; neither matches the manifest any more."""
     relation = f'{archive._quoted(schema)}."geo_zip_lookup"'
     before = f'{archive._quoted(schema)}."geo_before"'
     async with session.begin_nested() as rollback:
         await session.execute(text(f'ALTER TABLE {relation} RENAME TO "geo_before"'))
         await session.execute(text(f"CREATE TABLE {relation} (LIKE {before})"))
-        with pytest.raises(RuntimeError, match="retained_identity_changed"):
-            await geo_source_storage.capture_geo_retained_cut(
-                session,
-                schema_name=schema,
-                expected_relation_oid=oid,
-                expected_relfilenode=filenode,
-                manifest=manifest,
-            )
+        await session.execute(text(f"INSERT INTO {relation} SELECT * FROM {before}"))
+        with pytest.raises(RuntimeError, match="primary_key_changed"):
+            await geo_source_storage.capture_geo_retained_cut(session, schema_name=schema, manifest=manifest)
         await rollback.rollback()
     async with session.begin_nested() as rollback:
-        await session.execute(text(f"TRUNCATE {relation}"))
-        assert (
-            await session.scalar(text("SELECT pg_relation_filenode(CAST(:oid AS oid))::bigint"), {"oid": oid})
-            != filenode
-        )
-        with pytest.raises(RuntimeError, match="retained_identity_changed"):
-            await geo_source_storage.capture_geo_retained_cut(
-                session,
-                schema_name=schema,
-                expected_relation_oid=oid,
-                expected_relfilenode=filenode,
-                manifest=manifest,
+        if manifest.tables[0].row_count:
+            await session.execute(text(f"TRUNCATE {relation}"))
+        else:
+            projected = ",".join(archive._quoted(column.name) for column in geo_import.GeoZipLookup.__table__.columns)
+            await session.execute(
+                text(f'INSERT INTO {relation} ({projected}) SELECT {projected} FROM "mrf".geo_zip_lookup')
             )
+        with pytest.raises(RuntimeError, match="retained_(manifest|rows)_changed"):
+            await geo_source_storage.capture_geo_retained_cut(session, schema_name=schema, manifest=manifest)
         await rollback.rollback()
 
 
-async def _refuse_geo_retained_drift(session, schema, oid, filenode, manifest, serving_oid, former_session):
-    """Reject changed retained inputs before touching the serving heap or generation."""
+async def _refuse_geo_retained_drift(session, schema, manifest):
+    """Reject a changed retained manifest or content before touching the serving heap or generation."""
     await session.execute(
         text(f'LOCK TABLE ONLY "mrf".geo_zip_lookup,{archive._quoted(schema)}.geo_zip_lookup IN ACCESS EXCLUSIVE MODE')
     )
+    serving_oid = await session.scalar(text("SELECT 'mrf.geo_zip_lookup'::regclass::oid::bigint"))
     baseline = await generation.read_reference_family_result_generation_authority(
         session, importer_id="geo", schema_name="mrf"
-    )
-    other_file = await session.scalar(
-        text("SELECT pg_relation_filenode(CAST(:oid AS oid))::bigint"), {"oid": serving_oid}
     )
     changed_table = replace(manifest.tables[0], schema_sha256="f" * 64)
     changed_manifest = replace(
         manifest, tables=(changed_table,), schema_sha256=archive._schema_digest((changed_table,))
     )
-    for wrong_oid, wrong_file, wrong_manifest in (
-        (serving_oid, filenode, manifest),
-        (oid, other_file, manifest),
-        (oid, filenode, changed_manifest),
-    ):
-        with pytest.raises(RuntimeError, match="retained_(identity|manifest)_changed"):
-            await geo_source_storage.capture_geo_retained_cut(
-                session,
-                schema_name=schema,
-                expected_relation_oid=wrong_oid,
-                expected_relfilenode=wrong_file,
-                manifest=wrong_manifest,
-            )
-    with pytest.raises(RuntimeError, match="original_session_changed"):
-        await geo_source_storage.capture_geo_retained_cut(
-            former_session,
-            schema_name=schema,
-            expected_relation_oid=oid,
-            expected_relfilenode=filenode,
-            manifest=manifest,
-        )
-    await _refuse_stale_geo_storage(session, schema, oid, filenode, manifest)
+    with pytest.raises(RuntimeError, match="retained_manifest_changed"):
+        await geo_source_storage.capture_geo_retained_cut(session, schema_name=schema, manifest=changed_manifest)
+    await _refuse_stale_geo_storage(session, schema, manifest)
     assert await session.scalar(text("SELECT 'mrf.geo_zip_lookup'::regclass::oid::bigint")) == serving_oid
     assert (
         await generation.read_reference_family_result_generation_authority(
@@ -206,21 +178,14 @@ async def _refuse_geo_retained_drift(session, schema, oid, filenode, manifest, s
     )
 
 
-async def _exchange_retained_geo(session, manifest, schema, oid, filenode):
+async def _exchange_retained_geo(session, manifest, schema, oid):
     """Adopt the same authenticated retained heap through the normal generation CAS."""
     await session.execute(
         text(f'LOCK TABLE ONLY "mrf".geo_zip_lookup,{archive._quoted(schema)}.geo_zip_lookup IN ACCESS EXCLUSIVE MODE')
     )
-    current_oid, current_file = (
-        await session.execute(
-            text(
-                "SELECT 'mrf.geo_zip_lookup'::regclass::oid::bigint,pg_relation_filenode('mrf.geo_zip_lookup')::bigint"
-            )
-        )
-    ).one()
-    cut = await geo_source_storage.capture_geo_retained_cut(
-        session, schema_name=schema, expected_relation_oid=oid, expected_relfilenode=filenode, manifest=manifest
-    )
+    current_oid = await session.scalar(text("SELECT 'mrf.geo_zip_lookup'::regclass::oid::bigint"))
+    cut = await geo_source_storage.capture_geo_retained_cut(session, schema_name=schema, manifest=manifest)
+    assert (cut.source_schema, cut.row_count) == (schema, manifest.tables[0].row_count)
     incumbent = archive.ReferenceFamilyIncumbent("geo", "mrf", (("geo_zip_lookup", current_oid),))
     predecessor = await generation._read_immutable_activation_predecessor(session, manifest, incumbent)
     displaced = archive.reference_family_predecessor_schema(uuid4())
@@ -235,7 +200,9 @@ async def _exchange_retained_geo(session, manifest, schema, oid, filenode):
         (("geo_zip_lookup", oid),),
         predecessor,
     )
-    if len(cut.index_oids) != 6:
+    indexes = text("SELECT count(*) FROM pg_indexes WHERE schemaname='mrf' AND tablename='geo_zip_lookup'")
+    if await session.scalar(indexes) != len(_EXPECTED_INDEX_NAMES):
+        # Without the retained cut, a legacy index profile is still not publishable.
         with pytest.raises(RuntimeError, match="indexes_incomplete"):
             await generation._adopt_validated_family_generation(*arguments)
     adopted = await generation._adopt_validated_family_generation(*arguments, geo_retained_cut=cut)
@@ -243,25 +210,25 @@ async def _exchange_retained_geo(session, manifest, schema, oid, filenode):
     assert adopted.serving_generation == manifest.source_serving_generation
     assert await session.scalar(text("SELECT 'mrf.geo_zip_lookup'::regclass::oid::bigint")) == oid
     assert await session.scalar(text("SELECT count(*) FROM mrf.geo_zip_lookup")) == manifest.tables[0].row_count
-    return displaced, current_oid, current_file, cut
+    return displaced, current_oid, cut
 
 
 async def _assert_retained_cut_roundtrip(component, manifest, retained_oid, serving):
     """Commit both directions of a retained exchange using actual captured provenance."""
-    original_manifest, former_session = await _capture_geo_manifest(component)
+    original_manifest = await _capture_geo_manifest(component)
     async with source_transaction(component.database, isolation="repeatable read") as session:
-        schema, filenode = await _retain_geo_heap(session, retained_oid)
-        await _refuse_geo_retained_drift(
-            session, schema, retained_oid, filenode, manifest, serving.relation_oids[0], former_session
-        )
-        displaced, current_oid, current_file, cut = await _exchange_retained_geo(
-            session, manifest, schema, retained_oid, filenode
-        )
+        schema = await _retain_geo_heap(session, retained_oid)
+        await _refuse_geo_retained_drift(session, schema, manifest)
+        displaced, current_oid, cut = await _exchange_retained_geo(session, manifest, schema, retained_oid)
     async with source_transaction(component.database, isolation="repeatable read") as session:
         assert await session.scalar(text("SELECT 'mrf.geo_zip_lookup'::regclass::oid::bigint")) == retained_oid
-        with pytest.raises(RuntimeError, match="retained_cut_required"):
-            await geo_source_storage._consume_geo_retained_cut(session, "mrf", manifest.source_serving_generation, cut)
-        await _exchange_retained_geo(session, original_manifest, displaced, current_oid, current_file)
+        # The cut binds the heap content to its origin generation; another generation cannot reuse it.
+        assert original_manifest.source_serving_generation != manifest.source_serving_generation
+        with pytest.raises(RuntimeError, match="retained_generation_changed"):
+            await geo_source_storage._consume_geo_retained_cut(
+                session, "mrf", original_manifest.source_serving_generation, cut
+            )
+        await _exchange_retained_geo(session, original_manifest, displaced, current_oid)
     async with source_transaction(component.database, isolation="repeatable read") as session:
         assert (
             await generation.read_reference_family_result_generation_authority(
@@ -293,8 +260,6 @@ async def _prepare_geo_candidate(component):
         assert capture.manifest.source_capture_contract == archive.IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT
         async with source_transaction(component.database, isolation="repeatable read") as session:
             ownership = await archive.precreate_reference_family_restore(session, importer_id="geo", dataset_id=uuid4())
-            owner = await _writer(session)
-            await archive.seal_model_family_storage(session, ownership, owner, require_empty=True)
             columns = tuple(str(column.name) for column in geo_import.GeoZipLookup.__table__.columns)
             projected = ",".join(archive._quoted(name) for name in columns)
             await archive.native_copy_projection(
@@ -307,7 +272,8 @@ async def _prepare_geo_candidate(component):
                 timeout=30,
             )
             await archive.complete_reference_family_restore(session, ownership)
-            await archive.seal_model_family_storage(session, ownership, owner)
+            # The stage freezes only after the payload COPY and index build have finished.
+            await archive.seal_model_family_storage(session, ownership, roles=component.policy)
             indexes = await _index_names(session, ownership.schema_name)
             assert indexes == {
                 name
@@ -339,9 +305,8 @@ async def _roundtrip_native_archive(component, ownership, path):
         assert await session.scalar(text(f'SELECT city FROM "{schema}".geo_zip_lookup')) == "New York"
 
 
-async def _activate(session, ownership, manifest, *, mode, incoming=None):
+async def _activate(session, ownership, manifest, *, mode, roles, incoming=None):
     incumbent = await archive.capture_reference_family_incumbent(session, importer_id="geo", schema_name="mrf")
-    owner = await _writer(session)
     package = "a" * 64
     receipt = await archive.prepare_reference_family_activation(
         session,
@@ -349,7 +314,7 @@ async def _activate(session, ownership, manifest, *, mode, incoming=None):
         manifest=manifest,
         package_id=package,
         profile_contract=archive.CONTRACT,
-        sealed_owner_oid=owner,
+        roles=roles,
     )
     source_generation = manifest.source_serving_generation.as_dict() if incoming is None else incoming
     return await archive.activate_validated_reference_family_stage(
@@ -358,8 +323,9 @@ async def _activate(session, ownership, manifest, *, mode, incoming=None):
         manifest=manifest,
         expected_incumbent=incumbent,
         validation_receipt=receipt,
+        # The stage was frozen after its COPY, so activation only read-locks it.
         cutover=archive.ReferenceFamilyCutoverAuthority(
-            package, archive.CONTRACT, owner, owner, mode, source_generation
+            package, archive.CONTRACT, mode, source_generation, roles=roles, stage_read_only=True
         ),
     )
 
@@ -368,7 +334,7 @@ async def _assert_atomic_activation(component, old_stage, new_stage, initial_aut
     old_ownership, old_manifest, _ = old_stage
     ownership, manifest, stage_indexes = new_stage
     async with source_transaction(component.database, isolation="repeatable read") as session:
-        await _activate(session, old_ownership, old_manifest, mode="manual")
+        await _activate(session, old_ownership, old_manifest, mode="manual", roles=component.policy)
     async with source_transaction(component.database, isolation="repeatable read") as session:
         baseline = await generation.read_reference_family_result_generation_authority(
             session, importer_id="geo", schema_name="mrf"
@@ -380,11 +346,12 @@ async def _assert_atomic_activation(component, old_stage, new_stage, initial_aut
                 ownership,
                 manifest,
                 mode="automatic",
+                roles=component.policy,
                 incoming=old_manifest.source_serving_generation.as_dict(),
             )
     async with source_transaction(component.database, isolation="repeatable read") as session:
         async with session.begin_nested() as rollback:
-            await _activate(session, ownership, manifest, mode="automatic")
+            await _activate(session, ownership, manifest, mode="automatic", roles=component.policy)
             assert await session.scalar(text("SELECT city FROM mrf.geo_zip_lookup")) == "New York"
             await rollback.rollback()
     async with source_transaction(component.database, isolation="repeatable read") as session:
@@ -395,7 +362,7 @@ async def _assert_atomic_activation(component, old_stage, new_stage, initial_aut
             )
             == baseline
         )
-        await _activate(session, ownership, manifest, mode="automatic")
+        await _activate(session, ownership, manifest, mode="automatic", roles=component.policy)
     async with source_transaction(component.database, isolation="repeatable read") as session:
         assert await session.scalar(text("SELECT city FROM mrf.geo_zip_lookup")) == "New York"
         authority = await generation.read_reference_family_result_generation_authority(
@@ -416,12 +383,11 @@ async def test_geo_replacement_keeps_indexes_and_fences_generation_and_failure(t
         bootstrap_manifest, bootstrap_oid = await _assert_bootstrap_archive_transition(component, index_profile)
         monkeypatch.setattr(geo_import, "db", component.database)
         initial_authority = await _load_snapshot(component, tmp_path, "Old City")
+        initial_oid = await _serving_geo_oid(component)
         await _assert_retained_cut_roundtrip(component, bootstrap_manifest, bootstrap_oid, initial_authority)
         old_stage = await _prepare_geo_candidate(component)
         successor_authority = await _load_snapshot(component, tmp_path, "New York")
-        await _assert_retained_cut_roundtrip(
-            component, old_stage[1], initial_authority.relation_oids[0], successor_authority
-        )
+        await _assert_retained_cut_roundtrip(component, old_stage[1], initial_oid, successor_authority)
         new_stage = await _prepare_geo_candidate(component)
         await _roundtrip_native_archive(component, new_stage[0], tmp_path / "geo.dump")
         await _assert_atomic_activation(component, old_stage, new_stage, initial_authority, successor_authority)

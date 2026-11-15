@@ -41,8 +41,8 @@ async def _coordinates(workspace, handoff, roots):
     )
     _require(observed == workspace._inputs["native_coordinates"], "frozen_coordinates_changed")
     _require(
-        not {receipts[root]["oid"] for root in roots}
-        & {row["relation_oid"] for row in workspace._inputs["frozen_inventory"]["relations"]},
+        not {(receipts[root]["schema"], receipts[root]["name"]) for root in roots}
+        & {(row["schema_name"], row["relation_name"]) for row in workspace._inputs["frozen_inventory"]["relations"]},
         "input_output_alias",
     )
     return document, {root: receipts[root] for root in roots}

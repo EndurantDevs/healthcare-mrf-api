@@ -29,22 +29,21 @@ pytestmark = pytest.mark.asyncio
 
 async def _register_second_source(fixture):
     """Only synthetic Source/endpoint configuration is seeded; publication/admission remain production-owned."""
-    database = fixture.component.database
-    async with source.source.source_transaction(database):
-        await database.status(
+    async with fixture.admin.transaction():
+        await fixture.admin.execute(
             "INSERT INTO mrf.provider_directory_api_endpoint "
             "(endpoint_id,canonical_api_base,credential_descriptor_hash,endpoint_signature_hash) "
-            "VALUES (:endpoint,:base,repeat('c',64),repeat('d',64))",
-            endpoint=source.ENDPOINT,
-            base=source.BASE,
+            "VALUES ($1,$2,repeat('c',64),repeat('d',64))",
+            source.ENDPOINT,
+            source.BASE,
         )
-        await database.status(
+        await fixture.admin.execute(
             "INSERT INTO mrf.provider_directory_source "
             "(source_id,org_name,endpoint_id,canonical_api_base,requires_registration,requires_api_key) "
-            "VALUES (:source,'Synthetic independent alias',:endpoint,:base,false,false)",
-            source=source.SOURCE,
-            endpoint=source.ENDPOINT,
-            base=source.BASE,
+            "VALUES ($1,'Synthetic independent alias',$2,$3,false,false)",
+            source.SOURCE,
+            source.ENDPOINT,
+            source.BASE,
         )
 
 
@@ -95,6 +94,7 @@ async def _publish_independent_source(fixture):
         await source.artifacts.publish_source_candidate(source.directory, candidate)
     assert database._transaction_binding() is None and source.source._PUBLISHER.get() is None
     capture = fixture.captures[-1]
+    await source._assert_source_writer_excluded(fixture.component, fixture, capture)
     assert capture.origin.dataset_id == candidate.dataset_id and capture.origin.source_id == source.SOURCE
     assert (
         capture.origin.endpoint_id == source.ENDPOINT

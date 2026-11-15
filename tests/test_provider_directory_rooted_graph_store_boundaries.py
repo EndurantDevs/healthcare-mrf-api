@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import json
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -53,8 +54,8 @@ from process.provider_directory_rooted_graph_store_support import (
     schema_name,
 )
 from tests.test_provider_directory_rooted_graph_store import (
-    _Database,
     _claim_row,
+    _Database,
     _header,
 )
 from tests.test_provider_directory_rooted_graph_store_contract import (
@@ -90,11 +91,7 @@ def _role_claim_and_query_result():
 
 def _discovered_direct_spec(identity):
     claim, query_result = _role_claim_and_query_result()
-    organization_edge = next(
-        edge
-        for edge in query_result.edges
-        if edge.target_resource_type == "Organization"
-    )
+    organization_edge = next(edge for edge in query_result.edges if edge.target_resource_type == "Organization")
     return build_provider_directory_rooted_graph_work_spec(
         identity.scope_id,
         build_rooted_graph_direct_read(
@@ -111,23 +108,6 @@ def _discovered_direct_spec(identity):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("inserted_count", (None, True, -1, 2))
-async def test_work_admission_rejects_invalid_native_count(monkeypatch, inserted_count):
-    """A malformed admission count escapes the transaction as an error."""
-    identity = _identity()
-    database = _Database()
-    database.scalar = AsyncMock(side_effect=[None, inserted_count])
-    driver = SimpleNamespace(copy_records_to_table=AsyncMock(return_value="COPY 1"))
-    monkeypatch.setattr(bulk, "_copy_driver", AsyncMock(return_value=driver))
-    with pytest.raises(ProviderDirectoryRootedGraphStoreError, match="state"):
-        await bulk.admit_work_specs(database, identity.acquisition_id, [_discovered_direct_spec(identity)], action="frontier")
-    assert database.transaction_count == 1
-    assert database.scalar.await_count == 2
-    assert "admit_provider_directory_rooted_graph_work" in database.scalar.call_args.args[0]
-    driver.copy_records_to_table.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_work_short_second_copy_stops_before_admission(monkeypatch):
     """A truncated later batch neither admits the prefix nor copies subsequent rows."""
     identity = _identity()
@@ -137,9 +117,12 @@ async def test_work_short_second_copy_stops_before_admission(monkeypatch):
     monkeypatch.setattr(bulk, "_copy_driver", AsyncMock(return_value=driver))
     monkeypatch.setattr(bulk, "_COPY_ROWS", 1)
     with pytest.raises(ProviderDirectoryRootedGraphStoreError, match="state"):
-        await bulk.admit_work_specs(database, identity.acquisition_id, [_discovered_direct_spec(identity)] * 3, action="frontier")
-    database.scalar.assert_awaited_once()
-    assert "prepare_provider_directory_rooted_graph_work_stage" in database.scalar.call_args.args[0]
+        await bulk.admit_work_specs(
+            database, identity.acquisition_id, [_discovered_direct_spec(identity)] * 3, action="frontier"
+        )
+    database.scalar.assert_not_awaited()
+    assert any(statement.startswith('CREATE TEMP TABLE "pdrg_work_stage"') for statement, _ in database.statements)
+    assert not any(statement.startswith("INSERT INTO") for statement, _ in database.statements)
     assert driver.copy_records_to_table.await_count == 2
 
 
@@ -239,9 +222,7 @@ def test_schema_and_row_helpers_fail_closed(monkeypatch) -> None:
     with pytest.raises(ProviderDirectoryRootedGraphStoreError):
         schema_name()
     monkeypatch.setenv("DB_SCHEMA", "synthetic_schema")
-    assert function_ref("synthetic_function") == (
-        '"synthetic_schema"."synthetic_function"'
-    )
+    assert function_ref("synthetic_function") == ('"synthetic_schema"."synthetic_function"')
     assert row_fields(None) == {}
 
     class MappingRow:
@@ -264,7 +245,11 @@ def test_schema_and_row_helpers_fail_closed(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_initialization_rejects_root_drift_and_incomplete_work_census() -> None:
+async def test_initialization_rejects_root_drift_and_incomplete_work_census(monkeypatch) -> None:
+    from process import provider_directory_rooted_graph_store as store
+
+    initial_work = AsyncMock(return_value=0)
+    monkeypatch.setattr(store, "_insert_initial_root_work", initial_work)
     identity = _identity()
     with pytest.raises(ValueError, match="identity_invalid"):
         await initialize_provider_directory_rooted_graph_acquisition("bad")
@@ -310,9 +295,7 @@ async def test_claim_and_heartbeat_boundaries() -> None:
         {"acquisition_id": identity.acquisition_id, "lease_seconds": 1},
     ):
         with pytest.raises(ValueError):
-            await claim_provider_directory_rooted_graph_work(
-                database=_Database(), **kwargs
-            )
+            await claim_provider_directory_rooted_graph_work(database=_Database(), **kwargs)
     assert (
         await claim_provider_directory_rooted_graph_work(
             identity.acquisition_id,
@@ -342,47 +325,63 @@ async def test_claim_and_heartbeat_boundaries() -> None:
 
 
 @pytest.mark.asyncio
-async def test_result_storage_is_count_fenced_and_frontier_is_atomic() -> None:
-    """Reject partial writes and register the frontier in one transaction."""
+async def test_result_storage_is_count_fenced_and_frontier_is_atomic(monkeypatch) -> None:
+    """Reject partial validated counts and derive the frontier before the transaction exits."""
+    from process import provider_directory_rooted_graph_frontier as frontier
 
     claim, query_result = _role_claim_and_query_result()
+    bytes_count = sum(len(resource_by_field.payload_json_text.encode()) for resource_by_field in query_result.resources)
+
+    def result_database(resource_count, edge_count):
+        return _Database(
+            first_rows=(
+                {"acquisition_id": claim.acquisition_id},
+                {"query_id": claim.query_id},
+                {"status": "leased"},
+                (resource_count, bytes_count, False),
+                (edge_count, False),
+                {"canonical_api_base": API_BASE},
+            )
+        )
+
+    monkeypatch.setattr(bulk, "_copy_driver", AsyncMock(side_effect=lambda database: database))
+    derived_calls = []
+
+    async def admit_frontier(database, acquisition_id, specs, *, action):
+        assert database.active_rooted_transaction
+        assert acquisition_id == claim.acquisition_id and action == "derive" and specs
+        derived_calls.append((database, specs))
+        database.statements.append(("frontier admitted", {"action": action}))
+        return len(specs)
+
+    monkeypatch.setattr(frontier, "admit_work_specs", admit_frontier)
     with pytest.raises(ProviderDirectoryRootedGraphStoreError) as resource_error:
         await complete_provider_directory_rooted_graph_result(
-            claim,
-            query_result,
-            database=_Database(admit_counts=(0, len(query_result.edges))),
+            claim, query_result, database=result_database(0, len(query_result.edges))
         )
     assert resource_error.value.code == "state"
     with pytest.raises(ProviderDirectoryRootedGraphStoreError) as edge_error:
         await complete_provider_directory_rooted_graph_result(
-            claim,
-            query_result,
-            database=_Database(admit_counts=(len(query_result.resources), 0)),
+            claim, query_result, database=result_database(len(query_result.resources), 0)
         )
-    assert edge_error.value.code == "state"
-    success_database = _Database(
-        first_rows=({"canonical_api_base": API_BASE},),
-        status_counts=(1, 1, 1, 1, 1),
-    )
-    await complete_provider_directory_rooted_graph_result(
-        claim,
-        query_result,
-        database=success_database,
-    )
+    assert edge_error.value.code == "state" and derived_calls == []
+    success_database = result_database(len(query_result.resources), len(query_result.edges))
+    await complete_provider_directory_rooted_graph_result(claim, query_result, database=success_database)
     terminal_index = next(
         index
         for index, (statement, _) in enumerate(success_database.statements)
         if "SET status = 'completed'" in statement
     )
     derived_index = next(
-        index
-        for index, (statement, parameters) in enumerate(success_database.statements)
-        if "admit_provider_directory_rooted_graph_work" in statement and parameters.get("action") == "derive"
+        index for index, (statement, _) in enumerate(success_database.statements) if statement == "frontier admitted"
     )
     assert terminal_index < derived_index
-    assert success_database.transaction_count == 2
+    assert success_database.transaction_count == 1 and not success_database.active_rooted_transaction
+    assert len(derived_calls) == 1 and derived_calls[0][0] is success_database
     assert any(
-        parameters.get("action") == "derive"
+        parameters.get("resources") == len(query_result.resources)
+        and parameters.get("edges") == len(query_result.edges)
+        and parameters.get("payload_bytes") == bytes_count
         for _, parameters in success_database.statements
     )
 
@@ -416,7 +415,7 @@ async def test_error_terminalization_is_lease_fenced() -> None:
 @pytest.mark.asyncio
 async def test_direct_missing_terminalization_is_lease_fenced_and_non_error() -> None:
     direct_claim = _claim(_discovered_direct_spec(_identity()))
-    database = _Database(status_counts=(1,))
+    database = _Database(first_rows=({}, {}, {}), status_counts=(1, 1))
     missing_response_json_text = json.dumps(
         {
             "resourceType": "OperationOutcome",
@@ -439,6 +438,9 @@ async def test_direct_missing_terminalization_is_lease_fenced_and_non_error() ->
     assert "missing_http_status = :missing_http_status" in sql
     assert "error_code = NULL" in sql
     assert parameters["missing_http_status"] == 404
+    assert "FOR UPDATE" in database.statements[0][0]
+    assert "lease_expires_at>clock_timestamp()" in database.statements[2][0]
+    assert database.statements[3][1]["response_bytes"] == missing_response_bytes
     with pytest.raises(ValueError, match="missing_invalid"):
         await complete_provider_directory_rooted_graph_missing(
             direct_claim,
@@ -451,9 +453,7 @@ async def test_direct_missing_terminalization_is_lease_fenced_and_non_error() ->
 
 
 @pytest.mark.asyncio
-async def test_sealing_handles_idempotence_invalid_rows_and_missing_fixed_point() -> (
-    None
-):
+async def test_sealing_handles_idempotence_invalid_rows_and_missing_fixed_point() -> None:
     identity = _identity()
     sealed_row = _sealed_row(identity)
     sealed_summary = await seal_provider_directory_rooted_graph_acquisition(
@@ -467,7 +467,19 @@ async def test_sealing_handles_idempotence_invalid_rows_and_missing_fixed_point(
             identity,
             database=building_database,
         )
-    completed_database = _Database(first_rows=(_header(identity), sealed_row))
+    completed_database = _Database(
+        first_rows=(
+            _header(identity),
+            {
+                "npi_count": 1,
+                "cohort_complete": True,
+                "metadata": {"retry_exhausted_count": 0, "cohort_complete": True},
+            },
+            {"total": 1, "failed": 0, "incomplete": 0, "invalid_errors": 0},
+            sealed_row,
+        )
+    )
+    completed_database.scalar = AsyncMock(side_effect=[None, True, "1" * 64, "2" * 64, "3" * 64, identity.scope_id])
     completed_summary = await seal_provider_directory_rooted_graph_acquisition(
         identity,
         database=completed_database,
@@ -477,3 +489,25 @@ async def test_sealing_handles_idempotence_invalid_rows_and_missing_fixed_point(
         await seal_provider_directory_rooted_graph_acquisition("bad")
     with pytest.raises(ProviderDirectoryRootedGraphStoreError):
         _summary_from_row({})
+
+
+@pytest.fixture(autouse=True)
+def _configured_rooted_generation(monkeypatch):
+    from process import provider_directory_rooted_graph_source_runtime as source_runtime
+
+    @asynccontextmanager
+    async def transaction(database, **options):
+        async with database.transaction() as session:
+            database.active_rooted_transaction = True
+            try:
+                yield SimpleNamespace(session=session)
+            finally:
+                database.active_rooted_transaction = False
+
+    runtime = SimpleNamespace(
+        transaction=transaction,
+        catalog_schema="mrf",
+        candidate_schema="mrf",
+        relation_coordinates=lambda schema, root, scoped_name: (schema, scoped_name),
+    )
+    monkeypatch.setattr(source_runtime, "current_rooted_graph_runtime", lambda database=None: runtime)

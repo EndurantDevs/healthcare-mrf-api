@@ -111,28 +111,22 @@ async def pin_catalog_source(session, schema, models, generation_table):
 
 
 async def require_closed_catalog_read_binding(session, schema, pairs):
-    """Authenticate immutable storage without conferring publisher authority on its reader."""
-    from types import SimpleNamespace
-
+    """Validate the named native read shape; PostgreSQL enforces SELECT access."""
     from process import reference_family_archive as native
-    from process.ptg_parts.ptg2_physical_binding import _require_closed_local_custody
 
-    owner_oid = await session.scalar(
-        text(
-            "SELECT owner.oid FROM pg_catalog.pg_namespace namespace "
-            "JOIN pg_catalog.pg_roles owner ON owner.oid=namespace.nspowner "
-            "WHERE namespace.nspname='hp_snapshot_retention' AND NOT owner.rolcanlogin "
-            "AND NOT owner.rolsuper AND NOT owner.rolcreaterole AND NOT owner.rolcreatedb "
-            "AND NOT owner.rolreplication AND NOT owner.rolbypassrls"
-        )
-    )
-    if type(owner_oid) is not int or owner_oid <= 0:
-        raise native.ReferenceFamilyArchiveError("catalog protected read owner is unavailable")
-    ownership = SimpleNamespace(
-        schema_oid=await native._schema_oid(session, schema), relation_oids=pairs, sequence_oids=()
-    )
-    await _require_closed_local_custody(session, ownership, owner_oid)
-    return owner_oid
+    native._require_transaction(session)
+    native._schema_name(schema)
+    names = tuple(name for name, _old_address in pairs)
+    if not names or len(set(names)) != len(names):
+        raise native.ReferenceFamilyArchiveError("catalog family declaration differs")
+    addresses = []
+    for name in names:
+        native._schema_name(name)
+        address = await native._relation_oid(session, schema, name)
+        if address is None:
+            raise native.ReferenceFamilyArchiveError("catalog family is incomplete")
+        addresses.append(address)
+    await native.require_native_read_catalog(session, tuple(addresses))
 
 
 async def _require_model_columns(session, oid, model):
@@ -277,18 +271,11 @@ async def require_ms_drg_binding(session, schema, installed):
 
 
 async def require_closed_catalog_binding(session, schema, pairs):
-    """A relocated heap needs protected native custody, not just matching source rows."""
-    from types import SimpleNamespace
-
+    """Use configured DCL names without interpreting physical ownership."""
     from process import reference_family_archive as native
-    from process.ptg_parts.ptg2_physical_binding import _require_closed_local_custody
 
-    owner = await native.protected_publisher_owner(session)
-    ownership = SimpleNamespace(
-        schema_oid=await native._schema_oid(session, schema), relation_oids=pairs, sequence_oids=()
-    )
-    await _require_closed_local_custody(session, ownership, owner)
-    return owner
+    await require_closed_catalog_read_binding(session, schema, pairs)
+    return native.model_family_roles()[0]
 
 
 async def _lock_generation(session, schema, table, *, required=False, read_only=False):

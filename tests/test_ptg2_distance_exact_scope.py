@@ -235,7 +235,7 @@ async def test_overflow_knn_projects_before_limit_and_filters_exactly_after(
         AsyncMock(return_value=True),
     )
     query = await serving._membership_location_query(
-        object(),
+        SimpleNamespace(scalar=AsyncMock(return_value=False)),
         _local_distance_tables(),
         {
             "classification": "Psychiatry & Neurology",

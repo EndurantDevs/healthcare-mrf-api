@@ -43,12 +43,14 @@ async def test_original_admin_closes_only_payloads_and_publisher_independently_r
     async with publisher(case) as (_session, driver):
         await driver.execute("SET LOCAL search_path=pg_catalog,pg_temp")
         assert await _check(case, driver) == evidence
-    selected_oids = {item["oid"] for item in evidence["tables"].values()}
+    selected_oids = {
+        await case.admin.fetchval("SELECT to_regclass($1)::oid", storage_relation(item["schema"], item["name"]))
+        for item in evidence["tables"].values()
+    }
+    owner_oid = await case.admin.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", case.roles["namespace"])
     for before, after in zip(original, await _owners(case), strict=True):
         assert before["oid"] == after["oid"]
-        assert after["relowner"] == (
-            case.storage.namespace_owner_oid if before["oid"] in selected_oids else before["relowner"]
-        )
+        assert after["relowner"] == (owner_oid if before["oid"] in selected_oids else before["relowner"])
 
 
 async def test_outer_rollback_restores_all_original_owners_and_acl(private_payload_case):
@@ -67,7 +69,7 @@ async def test_ordinary_publisher_cannot_invoke_admin_primitive(private_payload_
     before = await _owners(case)
     async with publisher(case) as (_session, driver):
         await driver.execute("SET LOCAL search_path=pg_catalog,pg_temp")
-        with pytest.raises(ValueError, match="independent_original_admin_required"):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
             await seal.seal_prepared_cms_payload_snapshots(driver, **seal_options(case))
     assert await _owners(case) == before
 
@@ -125,28 +127,25 @@ async def test_late_failure_restores_every_owner_and_original_admin_role(private
         assert await case.admin.fetchval("SELECT session_user=current_user") is True
 
 
-@pytest.mark.parametrize("changed", ["grant", "index", "destination"])
-async def test_drift_or_unprotected_destination_refuses_without_repair(private_payload_case, changed):
+async def test_configured_destination_cannot_be_an_application_writer(private_payload_case):
     case = private_payload_case
-    changes_by_name = {}
-    if changed == "grant":
-        await case.admin.execute(
-            f"GRANT UPDATE(payload_hash) ON {_relation(case)} TO {storage_identifier(case.policy.publisher_role)}"
-        )
-    elif changed == "index":
-        name = case.snapshot_workspace["tables"][seal.workspace.storage.RESOURCE]["name"] + "_i0"
-        await case.admin.execute("DROP INDEX " + storage_relation(case.policy.schema, name))
-    else:
-        changes_by_name = dict(
-            owner_role=case.policy.publisher_role,
-            owner_oid=await case.admin.fetchval(
-                "SELECT oid::bigint FROM pg_roles WHERE rolname=$1", case.policy.publisher_role
-            ),
-        )
     before = await _owners(case)
     async with case.admin.transaction():
         await case.admin.execute("SET LOCAL search_path=pg_catalog,pg_temp")
-        options_by_name = {**seal_options(case), **changes_by_name}
-        with pytest.raises(ValueError, match="storage_custody_changed|layout_changed|principals_changed"):
+        options_by_name = {**seal_options(case), "owner_role": case.policy.publisher_role}
+        with pytest.raises(ValueError, match="destination_role_invalid"):
             await seal.seal_prepared_cms_payload_snapshots(case.admin, **options_by_name)
         assert await _owners(case) == before
+
+
+@pytest.mark.parametrize("column", [False, True])
+async def test_native_freeze_closes_existing_application_write_grants(private_payload_case, column):
+    case = private_payload_case
+    privilege = "UPDATE(payload_hash)" if column else "UPDATE"
+    await case.admin.execute(f"GRANT {privilege} ON {_relation(case)} TO PUBLIC")
+    async with case.admin.transaction():
+        await case.admin.execute("SET LOCAL search_path=pg_catalog,pg_temp")
+        await seal.seal_prepared_cms_payload_snapshots(case.admin, **seal_options(case))
+    async with publisher(case) as (_session, driver):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await driver.execute("UPDATE " + _relation(case) + " SET payload_hash=payload_hash")

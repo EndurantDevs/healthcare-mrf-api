@@ -17,6 +17,7 @@ from alembic.operations import Operations
 from sqlalchemy import MetaData, text
 
 from process import provider_directory_profile_capacity_attestation as leases
+from process import provider_directory_profile_capacity_preflight_contract as capacity_preflight
 from process import provider_directory_profile_initial as initial
 from process import provider_directory_profile_initial_contract as contract
 from process import provider_directory_profile_selection as selection
@@ -29,6 +30,7 @@ from tests.provider_directory_profile_capacity_trust_fixtures import capacity_tr
 from tests.provider_directory_profile_delta_test_support import _prepared_delta
 from tests.provider_directory_profile_initial_test_support import signed_initial_envelope
 from tests.provider_directory_profile_replay_test_support import _capacity_guard_statements
+from tests.reference_family_generation_fixture import install_named_generation
 from tests.test_provider_directory_cms_replay_postgres import _register
 from tests.test_provider_directory_profile_selection_desired import _selection_rows
 
@@ -71,25 +73,7 @@ async def _metadata(database, engine):
         # Replace only this fixture's empty three-column run stub before authority is seeded.
         await connection.execute(text(f'DROP TABLE "{schema}".import_run'))
         await connection.run_sync(lambda sync: _delta_metadata(sync, schema))
-        for sql in _capacity_guard_statements(schema):
-            await connection.execute(text(sql))
-        names = tuple(
-            name
-            for name in common.receipts._NATIVE_RELATIONS
-            if name not in {fhir.profile_artifact.PROFILE_TABLE, fhir.profile_artifact.PROFILE_EVIDENCE_TABLE}
-        )
-        with patch.object(common.receipts, "_NATIVE_RELATIONS", names):
-            await common._create_scalar_tables(connection, schema)
-        await common._create_native_tables(connection, schema)
         await connection.run_sync(lambda sync: run_guards._install(sync, schema, create_schema=False))
-        for trigger in ("cms_serving_profile_transition", "cms_serving_no_truncate"):
-            await connection.execute(
-                text(f'DROP TRIGGER {trigger} ON "{schema}".provider_directory_profile_serving_generation')
-            )
-            await connection.execute(text(f'DROP FUNCTION "{schema}".{trigger}()'))
-        await connection.execute(text(f'DROP TABLE "{schema}".provider_directory_cms_serving_receipt'))
-        await connection.execute(text(f'DROP FUNCTION "{schema}".cms_serving_receipt_immutable()'))
-        await connection.run_sync(lambda sync: common._apply(sync, "20260930100000"))
         await connection.execute(
             text(
                 f'ALTER TABLE "{schema}".provider_directory_source ADD COLUMN canonical_api_base text, ADD COLUMN org_name text, ADD COLUMN plan_name text'
@@ -98,8 +82,9 @@ async def _metadata(database, engine):
 
 
 def _delta_metadata(connection, schema):
-    with Operations.context(MigrationContext.configure(connection)):
-        fixture.delta._create_delta_receipt_table(schema)
+    if connection.scalar(text(f"SELECT to_regclass('{schema}.provider_directory_profile_delta_receipt')")) is None:
+        with Operations.context(MigrationContext.configure(connection)):
+            fixture.delta._create_delta_receipt_table(schema)
 
 
 async def _authority(database, engine, consumed, preflight, geometry, projection):
@@ -181,13 +166,8 @@ async def _advance_delta(database, cutover):
         selection_proof_id=execution.attestation.proof_id,
         profile_input_digest=execution.attestation.profile_input_digest,
         profile_as_of=execution.attestation.desired_profile_as_of,
-        evidence_target_oid=old.evidence_target_oid,
-        profile_target_oid=old.profile_target_oid,
     )
-    for role, oid in (("evidence", old.evidence_target_oid), ("profile", old.profile_target_oid)):
-        raw[role + "_target_storage_fingerprint"] = (
-            await fhir._provider_directory_profile_relation_storage_fingerprint(oid, expected_persistence="p")
-        ).exact_fingerprint
+    raw["relations"].pop("initial_receipt")
     geometry = capacity.validated_capacity_geometry(raw)
     build_id = "pdpb_" + "9" * 32
     generation = "pdprofile_" + fhir.hashlib.sha256(f"{build_id}:{geometry.profile_as_of}".encode()).hexdigest()[:32]
@@ -213,8 +193,10 @@ async def _advance_delta(database, cutover):
 
 async def _publish_initial_fixture(database, cutover, stages, admission, execution, fence):
     """Commit the initial Profile and common receipt in the production owner transaction."""
+    identities = await fhir._capture_provider_directory_artifact_promotion_identities(stages)
     async with database.transaction() as connection:
         await fhir._apply_provider_directory_profile_capacity_settings(admission)
+        await fhir._observe_provider_directory_artifact_promotion_revisions(identities, before=True)
         async with initial.swap_window(fhir, cutover):
             for stage in stages:
                 await fhir._install_provider_directory_prepared_stage(stage)
@@ -235,10 +217,9 @@ async def _publish_initial_fixture(database, cutover, stages, admission, executi
         }
         await common.receipts.append_serving_receipt(connection, fixture._SCHEMA, receipt_payload)
         await database.status("SET CONSTRAINTS ALL IMMEDIATE")
-    identities = tuple(
-        fhir.ProviderDirectoryArtifactPromotionIdentity(stage, cutover["oids"][stage.target_relation])
-        for stage in stages
-    )
+        await fhir._observe_provider_directory_artifact_promotion_revisions(identities)
+    committed = await initial._committed_receipt(fhir, fixture._SCHEMA, admission.build_id)
+    await initial._assert_current_receipt(fhir, fixture._SCHEMA, committed)
     assert await initial.resolve_completion(fhir, stages, fence, identities)
 
 
@@ -256,6 +237,7 @@ async def _assert_current_replay(database, cutover, stages, admission, execution
         )
         assert replay["committed_replay"]["current"] is True
         assert await initial.is_committed(fhir, stages)
+        await _assert_receipt_serving_fieldset(admission)
     with patch.object(fhir, "_provider_directory_profile_replay_source_context", mutable_context):
         replayed_result = await fhir._publish_attested_provider_directory_profile(
             run_id=admission.run_id,
@@ -266,21 +248,46 @@ async def _assert_current_replay(database, cutover, stages, admission, execution
     assert replayed_result["marker"] == "retained"
     assert replayed_result["profile"]["committed_replay"]["status"] == "current"
     assert replayed_result["cms_serving"]["profile_generation_id"] == cutover["build"].generation_id
-    for ddl in (
-        f'ALTER TABLE "{fixture._SCHEMA}".{contract.RECEIPT_TABLE} SET (fillfactor=80)',
-        f'ALTER TABLE "{fixture._SCHEMA}".{contract.RECEIPT_TABLE} RENAME TO replaced_receipt',
-    ):
-        with pytest.raises(Exception, match="initial_receipt|does not exist"):
-            async with database.transaction():
-                await database.status(ddl)
-                await initial.committed_replay(
-                    fhir,
-                    fixture._SCHEMA,
-                    f'"{fixture._SCHEMA}".provider_directory_profile_capacity_lease_consumption',
-                    admission.run_id,
-                    execution,
-                    fence,
-                )
+    async with database.transaction():
+        await database.status(f'ALTER TABLE "{fixture._SCHEMA}".{contract.RECEIPT_TABLE} SET (fillfactor=80)')
+        replay = await initial.committed_replay(
+            fhir,
+            fixture._SCHEMA,
+            f'"{fixture._SCHEMA}".provider_directory_profile_capacity_lease_consumption',
+            admission.run_id,
+            execution,
+            fence,
+        )
+        assert replay["committed_replay"]["current"] is True
+    with pytest.raises(Exception, match="initial_receipt|does not exist"):
+        async with database.transaction():
+            await database.status(
+                f'ALTER TABLE "{fixture._SCHEMA}".{contract.RECEIPT_TABLE} RENAME TO replaced_receipt'
+            )
+            await initial.committed_replay(
+                fhir,
+                fixture._SCHEMA,
+                f'"{fixture._SCHEMA}".provider_directory_profile_capacity_lease_consumption',
+                admission.run_id,
+                execution,
+                fence,
+            )
+
+
+async def _assert_receipt_serving_fieldset(admission):
+    """The real current receipt accepts exactly its semantic fields and named targets."""
+    from copy import deepcopy
+
+    receipt = await initial._committed_receipt(fhir, fixture._SCHEMA, admission.build_id)
+    assert "targets" in receipt["payload"]["serving"]
+    for change in ("missing_targets", "unknown_field"):
+        payload = deepcopy(receipt["payload"])
+        if change == "missing_targets":
+            payload["serving"].pop("targets")
+        else:
+            payload["serving"]["unknown_field"] = "unrecognized"
+        with pytest.raises(RuntimeError, match="receipt_binding_changed"):
+            initial._assert_receipt_payload(fhir, receipt, payload, receipt["_validated_geometry"])
 
 
 async def _assert_superseded_replay(database, engine, cutover, admission, execution, fence, mutable_context):
@@ -379,9 +386,6 @@ def _consume_replay_authority(envelope, trust, accepted, geometry, consumed_by_f
         trust=trust,
         now=accepted,
         expected_capacity_geometry_hash=capacity.capacity_geometry_hash(geometry),
-        expected_database_name=geometry.database_name,
-        expected_database_oid=geometry.database_oid,
-        expected_database_system_identifier=geometry.database_system_identifier,
     )
     binding = fhir.CapacityLeaseConsumptionBinding(
         run_id=consumed_by_field["run_id"],
@@ -393,12 +397,19 @@ def _consume_replay_authority(envelope, trust, accepted, geometry, consumed_by_f
         profile_as_of=geometry.profile_as_of,
     )
     consumed_by_field = dict(fhir.capacity_lease_consumption_values(verified, binding, accepted_at=accepted))
+    request = capacity_preflight.validated_capacity_preflight_request(
+        envelope["lease"]["signing_preflight_guard"]["healthcare_request"]
+    )
+    preflight.update(
+        fhir._profile_capacity_preflight_receipt_values(
+            request, receipt, issued_at=capacity_preflight._utc_timestamp(receipt["issued_at"])
+        )
+    )
     preflight.update(
         receipt_sha256=verified.nonce,
         request_sha256=receipt["request_sha256"],
         request_nonce=receipt["request_nonce"],
         control_plane_receipt_sha256=receipt["control_plane_receipt_sha256"],
-        issued_at=accepted,
         expires_at=verified.expires_at,
         consumed_at=accepted,
         consumed_run_id=consumed_by_field["run_id"],
@@ -411,15 +422,11 @@ def _consume_replay_authority(envelope, trust, accepted, geometry, consumed_by_f
 
 async def _bind_replay_geometry(database, schema, geometry, execution, projection):
     """Bind canonical selected vectors and observed target layouts before signing fixture authority."""
-    initial_targets = contract.InitialTargets(geometry.evidence_target_oid, geometry.profile_target_oid, {})
+    initial_targets = contract.InitialTargets(fhir._provider_directory_profile_target_coordinates(schema), {})
     database_identity = await fhir._provider_directory_profile_capacity_database_identity(schema, initial_targets)
     geometry = replace(
         geometry,
-        **{
-            key: context_value
-            for key, context_value in vars(database_identity).items()
-            if key in vars(geometry) and key not in {"evidence_target_oid", "profile_target_oid"}
-        },
+        **{key: context_value for key, context_value in vars(database_identity).items() if key in vars(geometry)},
     )
     layout = await initial.receipt_layout(fhir, schema)
     async with database.transaction():
@@ -453,7 +460,16 @@ async def _bind_replay_geometry(database, schema, geometry, execution, projectio
         desired_context_vector_hash=fhir._provider_directory_profile_source_context_vector_hash(contexts),
         sql_contract_digest=fhir._provider_directory_profile_sql_contract_digest(),
         initial_target_state_sha256=contract.target_state_sha256(target_snapshot),
-        initial_receipt_storage_fingerprint=layout.exact_fingerprint,
+        relations={
+            **geometry.relations,
+            "initial_receipt": {
+                "schema": layout.schema_name,
+                "name": layout.relation_name,
+                "main_index_pages": list(fhir._profile_capacity_index_page_union_bound(layout.main_index_pages)),
+                "toast_index_pages": list(fhir._profile_capacity_index_page_union_bound(layout.toast_index_pages)),
+                "toastable_column_count": len(layout.toastable_columns),
+            },
+        },
     )
     projection = replace(projection, capacity_geometry_hash=capacity.capacity_geometry_hash(geometry))
     return database_identity, geometry, source_pairs, contexts, target_snapshot, projection
@@ -526,8 +542,7 @@ def _successor_delta(schema, build_id, generation, old, execution, geometry):
         from_source_context_vector_hash=old.source_context_vector_hash,
         to_source_context_vector_hash=old.source_context_vector_hash,
         to_source_context_vector=old.source_context_vector,
-        evidence_target_oid=old.evidence_target_oid,
-        profile_target_oid=old.profile_target_oid,
+        targets=old.targets,
         profile_as_of=geometry.profile_as_of,
         from_profile_as_of=old.profile_as_of,
         executable_plan_hash=geometry.executable_plan_hash,

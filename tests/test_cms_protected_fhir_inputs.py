@@ -100,12 +100,8 @@ class CatalogConnection:
                 backend_pid=92,
                 transaction_id="94" if self.change_identity and self.identity_reads > 1 else "93",
             )
-        if "AS incumbent_oid" in sql:
-            row = next(row for row in self.family if row["relname"] == parameters[0].split('"')[-2])
+        if sql.startswith("SELECT c.relkind::text"):
             return dict(
-                relation_oid=row["oid"],
-                owner_oid=71,
-                incumbent_oid=row["oid"],
                 relkind="r",
                 relpersistence="p",
                 relrowsecurity=False,
@@ -119,6 +115,36 @@ class CatalogConnection:
         self.events.append(("fetch", sql, parameters))
         if sql == provision.ROLE_SQL:
             return deepcopy(self.roles)
+        if sql == provision._FHIR_NAMED_INPUT_SQL:
+            if self.cancel_physical:
+                raise asyncio.CancelledError
+            by_oid = {catalog_record["oid"]: catalog_record for catalog_record in self.family}
+            selected_fields = {
+                catalog_record["oid"]
+                for catalog_record in self.family
+                if catalog_record["relname"] in provision.FHIR_INPUT_ROOTS
+            }
+            return [
+                {
+                    **{
+                        key: deepcopy(field_value)
+                        for key, field_value in catalog_record.items()
+                        if key not in {"oid", "relowner", "direct_acl_closed", "readers_closed"}
+                    },
+                    "parents": [
+                        [by_oid[field_value]["nspname"], by_oid[field_value]["relname"]]
+                        if field_value in by_oid
+                        else ["foreign", "missing"]
+                        for field_value in catalog_record["parents"]
+                    ],
+                    "indexes": [
+                        {key: field_value for key, field_value in index.items() if key != "oid"}
+                        for index in catalog_record["indexes"]
+                    ],
+                }
+                for catalog_record in self.family
+                if catalog_record["oid"] in selected_fields or set(catalog_record["parents"]) & selected_fields
+            ]
         if sql == provision.CATALOG_SQL:
             assert parameters[0] == [f'"mrf"."{name}"' for name in provision.PAYLOAD_ROOTS]
             return deepcopy(self.family)
@@ -131,16 +157,16 @@ class CatalogConnection:
                 raise asyncio.CancelledError
             return [
                 dict(
-                    oid=row["oid"],
-                    relfilenode=None if row["relkind"] == "p" else 9000 + row["oid"],
+                    oid=catalog_record["oid"],
+                    relfilenode=None if catalog_record["relkind"] == "p" else 9000 + catalog_record["oid"],
                     schema_oid=74,
                     schema_owner_oid=75,
                     raw_acl="{source_reader=r/source_owner}",
                     raw_schema_acl="{source_reader=U/namespace_owner}",
                     column_acls=[],
                 )
-                for row in self.family
-                if row["oid"] in parameters[0]
+                for catalog_record in self.family
+                if catalog_record["oid"] in parameters[0]
             ]
         raise AssertionError(sql)
 
@@ -150,8 +176,14 @@ class CatalogConnection:
             dict(
                 namespace=namespace,
                 name=name,
-                oid=by_name[name]["oid"] + int(self.root_oid_drift) if name in provision.FHIR_INPUT_ROOTS else None,
-                kind=self.kinds[provision.FHIR_INPUT_ROOTS.index(name)] if name in provision.FHIR_INPUT_ROOTS else None,
+                present=name in by_name,
+                kind=(
+                    "r"
+                    if self.root_oid_drift and name == provision.FHIR_INPUT_ROOTS[0]
+                    else self.kinds[provision.FHIR_INPUT_ROOTS.index(name)]
+                )
+                if name in provision.FHIR_INPUT_ROOTS
+                else None,
             )
             for namespace, name in zip(*parameters, strict=True)
         ]
@@ -166,18 +198,13 @@ def catalog(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_empty_three_parents_use_complete_family_and_native_null_filenodes(catalog):
+async def test_empty_three_parents_bind_portable_names_and_semantic_layout(catalog):
     proof = await inputs.capture_protected_fhir_input(catalog, source_policy=_policy())
-    assert proof["version"] == 1 and proof["database_oid"] == 91 and proof["owner_oid"] == 71
-    assert [name for name, _ in proof["parent_oids"]] == [
-        "provider_directory_dataset_affiliation_organization",
-        "provider_directory_dataset_insurance_plan",
-        "provider_directory_dataset_network_plan",
-    ]
+    assert proof["version"] == 2
+    assert proof["parents"] == [["mrf", name] for name in provision.FHIR_INPUT_ROOTS]
     assert len(proof["inventory"]) == 3
-    assert all(row["relfilenode"] is None and row["parents"] == [] for row in proof["inventory"])
-    assert any(event[1] == provision.ROLE_SQL for event in catalog.events)
-    assert any(event[1] == provision.CATALOG_SQL for event in catalog.events)
+    assert all(row["parents"] == [] for row in proof["inventory"])
+    assert not any(event[1] == provision.ROLE_SQL for event in catalog.events)
     assert all("INSERT INTO" not in event[1] and "CREATE TRIGGER" not in event[1] for event in catalog.events)
     assert provision.require_protected_fhir_input(deepcopy(proof)) == proof
 
@@ -204,11 +231,8 @@ async def test_partial_or_mixed_roots_refuse_before_family_or_registration(catal
     "field,value",
     [
         ("nspname", "foreign_schema"),
-        ("relowner", 99),
         ("partition_key", "RANGE (dataset_id)"),
         ("relrowsecurity", True),
-        ("direct_acl_closed", False),
-        ("readers_closed", False),
         ("native_checks", False),
         ("bound", "DEFAULT"),
         ("inert", False),
@@ -222,11 +246,14 @@ async def test_unsafe_parent_custody_or_layout_refuses(catalog, field, value):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("field", ["elevated", "owner_set", "namespace_create", "namespace_owner_reachable"])
-async def test_real_role_validator_refuses_unsafe_reader_before_family(catalog, field):
+async def test_native_layout_capture_does_not_recheck_role_or_physical_identity(catalog, field):
     catalog.roles[-1][field] = True
-    with pytest.raises(ValueError):
-        await inputs.capture_protected_fhir_input(catalog, source_policy=_policy())
-    assert not any(event[1] == provision.CATALOG_SQL for event in catalog.events)
+    for row in catalog.family:
+        row["relowner"] = 9999
+        row["direct_acl_closed"] = False
+    proof = await inputs.capture_protected_fhir_input(catalog, source_policy=_policy())
+    assert proof["parents"] == [["mrf", name] for name in provision.FHIR_INPUT_ROOTS]
+    assert not any(event[1] in (provision.ROLE_SQL, provision.CATALOG_SQL) for event in catalog.events)
 
 
 def _add_leaf(catalog):
@@ -246,14 +273,14 @@ def _add_leaf(catalog):
 
 
 @pytest.mark.asyncio
-async def test_direct_leaf_binds_filenode_edge_bound_layout_and_acl(catalog):
+async def test_direct_leaf_binds_named_edge_bound_and_layout(catalog):
     _add_leaf(catalog)
     proof = await inputs.capture_protected_fhir_input(catalog, source_policy=_policy())
     leaf = next(row for row in proof["inventory"] if row["relname"] == "pd_dataset_partition")
-    assert leaf["relfilenode"] == 12000 and leaf["parents"] == [proof["parent_oids"][0][1]]
+    assert leaf["parents"] == [proof["parents"][0]]
     assert leaf["bound"] == "FOR VALUES IN ('dataset_exact')"
     assert leaf["columns"] == [["dataset_id", "character varying", True, None]]
-    assert leaf["raw_acl"] == "{source_reader=r/source_owner}"
+    assert not {"oid", "relowner", "relfilenode", "raw_acl"} & leaf.keys()
 
 
 @pytest.mark.asyncio
@@ -266,21 +293,27 @@ async def test_direct_leaf_binds_filenode_edge_bound_layout_and_acl(catalog):
         ("bound", "DEFAULT"),
         ("bound", "FOR VALUES FROM ('a') TO ('z')"),
         ("relispartition", False),
-        ("readers_closed", False),
     ],
 )
 async def test_foreign_nested_default_or_unclosed_leaf_refuses(catalog, field, value):
-    _add_leaf(catalog)[field] = value
+    _add_leaf(catalog)
+    proof = await inputs.capture_protected_fhir_input(catalog, source_policy=_policy())
+    leaf = next(row for row in proof["inventory"] if row["relname"] == "pd_dataset_partition")
+    leaf[field] = (
+        [["foreign", "missing"]]
+        if field == "parents" and value == [777]
+        else [["mrf", name] for name in provision.FHIR_INPUT_ROOTS[:2]]
+        if field == "parents"
+        else value
+    )
     with pytest.raises(ValueError):
-        await inputs.capture_protected_fhir_input(catalog, source_policy=_policy())
+        provision.require_protected_fhir_input(proof)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["identity", "cancel"])
-async def test_identity_change_or_cancel_never_yields_proof_or_registers(catalog, failure):
-    catalog.change_identity = failure == "identity"
-    catalog.cancel_physical = failure == "cancel"
-    with pytest.raises(asyncio.CancelledError if failure == "cancel" else ValueError):
+async def test_canceled_catalog_read_never_registers_or_yields_proof(catalog):
+    catalog.cancel_physical = True
+    with pytest.raises(asyncio.CancelledError):
         await inputs.capture_protected_fhir_input(catalog, source_policy=_policy())
     assert all("INSERT" not in event[1] for event in catalog.events if event[0] == "execute")
 
@@ -299,11 +332,12 @@ async def test_initial_registration_accounts_protected_three_without_heap_enroll
 
 
 @pytest.mark.asyncio
-async def test_initial_registration_requires_policy_and_same_observed_oids(catalog):
+async def test_initial_registration_requires_policy_and_complete_declared_roots(catalog):
     with pytest.raises(RuntimeError, match="source_policy_required"):
         await registration.capture_current_native_input_candidates(catalog, ledger_schema="mrf")
-    catalog.root_oid_drift = True
-    with pytest.raises(RuntimeError, match="candidate_identity_changed"):
+    capture = catalog._current_roots
+    catalog._current_roots = lambda parameters: [*capture(parameters)[:-1]]
+    with pytest.raises(RuntimeError, match="candidate_scope_changed"):
         await registration.capture_current_native_input_candidates(
             catalog, ledger_schema="mrf", source_policy=_policy()
         )
@@ -334,21 +368,22 @@ class FenceSession:
 
 
 def _physical(proof):
-    physical_by_name = {
+    rows_by_field = {
         f'"{schema}"."{name}"': dict(
-            relation_oid=None, relfilenode=None, relkind=None, relpersistence=None, inherited=False
+            schema_name=None, table_name=None, present=False, relkind=None, relpersistence=None, inherited=False
         )
         for schema, name in inputs._relations("mrf")
     }
-    for name, oid in proof["parent_oids"]:
-        physical_by_name[f'"mrf"."{name}"'] = dict(
-            relation_oid=oid,
-            relfilenode=None,
+    for schema, name in proof["parents"]:
+        rows_by_field[f'"{schema}"."{name}"'] = dict(
+            schema_name=schema,
+            table_name=name,
+            present=True,
             relkind="p",
             relpersistence="p",
-            inherited=any(row["parents"] == [oid] for row in proof["inventory"]),
+            inherited=any([schema, name] in row["parents"] for row in proof["inventory"]),
         )
-    return physical_by_name
+    return rows_by_field
 
 
 @pytest.mark.asyncio
@@ -360,10 +395,10 @@ async def test_worker_requires_original_task_driver_and_factory(catalog):
     factory_token = policy_module._FACTORY.set(factory)
     try:
         assert await inputs._capture_bound_fhir(FenceSession(catalog), "mrf") is not None
+        assert await inputs._capture_bound_fhir(FenceSession(CatalogConnection()), "mrf") is not None
         with pytest.raises(RuntimeError, match="source_binding_changed"):
-            await inputs._capture_bound_fhir(FenceSession(CatalogConnection()), "mrf")
-        with pytest.raises(ValueError, match="publisher_connection_required"):
-            await asyncio.create_task(inputs._capture_bound_fhir(FenceSession(catalog), "mrf"))
+            await inputs._capture_bound_fhir(FenceSession(catalog), "other")
+        assert await asyncio.create_task(inputs._capture_bound_fhir(FenceSession(catalog), "mrf")) is not None
     finally:
         policy_module._FACTORY.reset(factory_token)
         policy_module._PUBLISHER.reset(publisher_token)
@@ -399,7 +434,7 @@ async def test_native_fence_captures_fhir_and_recaptures_after_recursive_locks(c
         with pytest.raises(RuntimeError, match="cutover_isolation_changed"):
             await inputs.capture_native_address_input_fence(session, "mrf", cutover=True)
         session.isolation = "read committed"
-    capture.side_effect = [proof, dict(proof, family_sha256="a" * 64)]
+    capture.side_effect = [proof, dict(proof, profile="changed")]
     with pytest.raises(RuntimeError, match="native_inputs_changed"):
         await inputs.capture_native_address_input_fence(session, "mrf", cutover=cutover)
     missing_fence_by_field = dict(observed)
@@ -419,11 +454,9 @@ async def test_fhir_v5_preserves_every_existing_tiger_and_nucc_combination(catal
     from tests.test_cms_tiger_native_inputs import _physical as tiger_physical
 
     proof = await provision.capture_protected_fhir_input(catalog, source_policy=_policy())
-    proof["database_oid"] = 81  # Match the existing independent pure Tiger fixture.
     fence_by_field = dict(
         version=5,
         schema="mrf",
-        database=dict(database_oid=81),
         relations=_physical(proof),
         fhir_protected=proof,
         geo_bindings={},
@@ -435,7 +468,9 @@ async def test_fhir_v5_preserves_every_existing_tiger_and_nucc_combination(catal
         fence_by_field["nucc_protected"] = await inputs.capture_protected_nucc_input(
             _NativeNuccSession(ProtectedNuccProtocol()), schema="mrf"
         )
-        fence_by_field["relations"]['"mrf"."nucc_taxonomy"'] = dict(relation_oid=201, relkind="p", inherited=True)
+        fence_by_field["relations"]['"mrf"."nucc_taxonomy"'] = dict(
+            schema_name="mrf", table_name="nucc_taxonomy", present=True, relkind="p", relpersistence="p", inherited=True
+        )
         prior_version = 2
     if tiger_kind == "installed":
         fence_by_field["tiger_protected"] = _proof()
@@ -446,8 +481,9 @@ async def test_fhir_v5_preserves_every_existing_tiger_and_nucc_combination(catal
         fence_by_field["geo_bindings"] = captured_tiger_bindings(fence_by_field["tiger_captured"])
         for name, binding in fence_by_field["geo_bindings"].items():
             fence_by_field["relations"]['"' + name.replace(".", '"."') + '"'] = dict(
-                relation_oid=binding["relation_oid"],
-                relfilenode=binding["relfilenode"],
+                schema_name=binding["schema_name"],
+                table_name=binding["table_name"],
+                present=True,
                 relkind="r",
                 relpersistence="p",
                 inherited=False,
@@ -459,8 +495,8 @@ async def test_fhir_v5_preserves_every_existing_tiger_and_nucc_combination(catal
     prior = deepcopy(fence_by_field)
     prior.pop("fhir_protected")
     prior["version"] = prior_version
-    for name, _ in proof["parent_oids"]:
-        prior["relations"][f'"mrf"."{name}"'] = dict(relation_oid=None, relkind=None)
+    for _schema, name in proof["parents"]:
+        prior["relations"][f'"mrf"."{name}"'] = dict(present=False, relkind=None)
     inputs.require_supported_native_address_inputs(prior)
     assert "fhir_protected" not in prior and prior["version"] == prior_version
 
@@ -479,11 +515,13 @@ async def test_only_verified_three_leave_revision_set_without_creating_guards(ca
         await inputs._revision_guards(SimpleNamespace(execute=execute), "mrf", _physical(proof), protected_fhir=proof)
         == []
     )
-    assert all(parameters["oids"] == [] for _, parameters in queries if parameters is not None and "oids" in parameters)
+    assert all(
+        parameters["names"] == [] for _, parameters in queries if parameters is not None and "names" in parameters
+    )
     assert all(not sql.startswith(("INSERT", "CREATE", "ALTER")) for sql, _ in queries)
     changed = deepcopy(proof)
-    changed["inventory"][0]["relfilenode"] = 0
-    with pytest.raises(ValueError, match="protected_fhir_parent_changed"):
+    changed["inventory"][0]["parents"] = [["other", "root"]]
+    with pytest.raises(ValueError, match="protected_fhir_named_parent_changed|protected_fhir_parent_changed"):
         await inputs._revision_guards(SimpleNamespace(execute=execute), "mrf", _physical(proof), protected_fhir=changed)
 
 
@@ -494,8 +532,7 @@ async def test_office_read_source_parents_require_original_recapture(catalog, mo
     catalog_rows = [
         dict(
             name=name,
-            relation_oid=5000 + ordinal,
-            owner_oid=proof["owner_oid"],
+            present=True,
             relkind="r" if name == "provider_directory_cms_candidate_coverage" else "p",
             relpersistence="p",
             relispartition=False,
@@ -521,11 +558,10 @@ async def test_office_read_source_parents_require_original_recapture(catalog, mo
     locks = [command for command in commands if command.startswith("LOCK TABLE")]
     assert len(locks) == 3
     assert all(command.endswith("SHARE MODE NOWAIT" if cutover else "ACCESS SHARE MODE NOWAIT") for command in locks)
-    for rejected in (None, dict(proof, schema="other"), dict(proof, family_sha256="a" * 64)):
+    for rejected in (None, dict(proof, schema="other"), dict(proof, profile="changed")):
         with pytest.raises((RuntimeError, ValueError)):
             await inputs._cms_office_read_relations(session, "mrf", protected_fhir=rejected)
     for name, field, invalid_value in (
-        (CMS_OFFICE_READ_TABLES[0], "owner_oid", 99),
         (CMS_OFFICE_READ_TABLES[0], "relispartition", True),
         (CMS_OFFICE_READ_TABLES[0], "relpersistence", "u"),
         (CMS_OFFICE_READ_TABLES[0], "relrowsecurity", True),
@@ -537,7 +573,7 @@ async def test_office_read_source_parents_require_original_recapture(catalog, mo
         with pytest.raises(RuntimeError, match="office_read_heap_unavailable"):
             await inputs._cms_office_read_relations(session, "mrf", protected_fhir=proof)
         catalog_row[field] = original
-    capture.side_effect = [proof, dict(proof, family_sha256="a" * 64)]
+    capture.side_effect = [proof, dict(proof, profile="changed")]
     with pytest.raises(RuntimeError, match="fhir_proof_changed"):
         await inputs._cms_office_read_relations(session, "mrf", protected_fhir=proof)
     capture.side_effect = None
@@ -553,11 +589,16 @@ async def test_office_read_source_parents_require_original_recapture(catalog, mo
 @pytest.mark.asyncio
 async def test_native_structural_capture_refuses_complete_family_drift_before_return(catalog, monkeypatch):
     original_fetch = catalog.fetch
+    catalog_reads = []
 
     async def fetch(sql, *parameters):
         result_rows = await original_fetch(sql, *parameters)
-        if "pg_relation_filenode" in sql:
-            catalog.family[0]["columns"][0][1] = "text"
+        if sql == provision._FHIR_NAMED_INPUT_SQL:
+            catalog_reads.append(sql)
+            if len(catalog_reads) == 1:
+                next(row for row in catalog.family if row["relname"] in provision.FHIR_INPUT_ROOTS)["columns"][0][1] = (
+                    "text"
+                )
         return result_rows
 
     monkeypatch.setattr(catalog, "fetch", fetch)
@@ -566,16 +607,15 @@ async def test_native_structural_capture_refuses_complete_family_drift_before_re
 
 
 @pytest.mark.asyncio
-async def test_native_capture_requires_nonempty_virtual_transaction_before_catalog_reads(catalog, monkeypatch):
-    identity = AsyncMock(return_value={"transaction_id": None})
-    monkeypatch.setattr(provision, "_fhir_input_identity", identity)
+async def test_native_capture_requires_active_transaction_before_catalog_reads(catalog, monkeypatch):
+    monkeypatch.setattr(catalog, "is_in_transaction", lambda: False)
     with pytest.raises(ValueError, match="transaction_required"):
         await provision.capture_protected_fhir_input(catalog, source_policy=_policy())
     assert catalog.events == []
 
 
 @pytest.mark.asyncio
-async def test_physical_catalog_preserves_native_function_null_for_nucc_parent():
+async def test_named_catalog_records_partition_shape_without_physical_tokens():
     statements = []
 
     async def execute(statement, parameters):
@@ -584,8 +624,9 @@ async def test_physical_catalog_preserves_native_function_null_for_nucc_parent()
             mappings=lambda: [
                 dict(
                     name='"mrf"."nucc_taxonomy"',
-                    relation_oid=201,
-                    relfilenode=None,
+                    schema_name="mrf",
+                    table_name="nucc_taxonomy",
+                    present=True,
                     relkind="p",
                     relpersistence="p",
                     inherited=True,
@@ -594,6 +635,6 @@ async def test_physical_catalog_preserves_native_function_null_for_nucc_parent()
         )
 
     physical_by_name = await inputs._physical_relations(SimpleNamespace(execute=execute), "mrf")
-    assert physical_by_name['"mrf"."nucc_taxonomy"']["relfilenode"] is None
-    assert "pg_relation_filenode(relation.oid)::bigint AS relfilenode" in statements[0]
-    assert "coalesce(pg_relation_filenode" not in statements[0].lower()
+    assert physical_by_name['"mrf"."nucc_taxonomy"']["present"] is True
+    assert "relation.oid IS NOT NULL AS present" in statements[0]
+    assert "relfilenode" not in statements[0].lower()

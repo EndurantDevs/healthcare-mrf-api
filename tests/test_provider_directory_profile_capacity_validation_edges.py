@@ -52,7 +52,6 @@ from tests.test_provider_directory_profile_capacity_trust import (
     _trust_payload,
 )
 
-
 UTC = datetime.timezone.utc
 
 
@@ -100,9 +99,7 @@ def test_capacity_limit_configuration_rejects_invalid_edges(operation, error):
 def test_runtime_geometry_requires_typed_limits_and_inputs():
     limits = runtime_config.validated_capacity_limits(_limits_payload())
     inputs = _geometry_inputs()
-    error_type = (
-        runtime_config.ProviderDirectoryProfileCapacityConfigurationError
-    )
+    error_type = runtime_config.ProviderDirectoryProfileCapacityConfigurationError
 
     with pytest.raises(error_type, match="limits_type_invalid"):
         runtime_geometry.build_capacity_geometry({}, inputs)
@@ -128,14 +125,6 @@ def test_runtime_geometry_requires_typed_limits_and_inputs():
             "trust_release_digest_invalid",
         ),
         (
-            lambda: trust_config._trust_database_name(None),
-            "trust_database_name_invalid",
-        ),
-        (
-            lambda: trust_config._trust_system_identifier("0"),
-            "trust_database_system_identifier_invalid",
-        ),
-        (
             lambda: trust_config._trust_public_key("z" * 64),
             "trust_public_key_invalid",
         ),
@@ -156,7 +145,7 @@ def test_trust_configuration_rejects_noncanonical_scalars(operation, error):
         operation()
 
 
-def test_trust_configuration_rejects_rotation_and_storage_drift():
+def test_trust_configuration_rejects_rotation_drift():
     active_key_by_field = {
         **_active_key(),
         "retired_at": "2026-07-30T12:00:00Z",
@@ -172,46 +161,11 @@ def test_trust_configuration_rejects_rotation_and_storage_drift():
         ({**_active_key(), "status": "unknown"}, "status_invalid"),
         (retired_key_by_field, "retirement_window_invalid"),
     )
-    error_type = (
-        runtime_config.ProviderDirectoryProfileCapacityConfigurationError
-    )
+    error_type = runtime_config.ProviderDirectoryProfileCapacityConfigurationError
 
     for key_by_field, error in rotation_cases:
         with pytest.raises(error_type, match=error):
             trust_config._trust_rotation(key_by_field)
-    _assert_capacity_errors(
-        error_type,
-        (
-            lambda: trust_config._trust_tablespace_entry(
-                {},
-                expected_usage="data",
-            ),
-            lambda: trust_config._validated_trust_tablespaces([]),
-            lambda: trust_config._validated_trust_volumes([]),
-        ),
-    )
-
-
-def test_trust_configuration_rejects_storage_binding_mismatch():
-    tablespace = attestation.CapacityLeaseTrustTablespace(
-        tablespace_name="pg_default",
-        tablespace_oid=1663,
-        usage="data",
-        volume_digest="11" * 32,
-    )
-    volume = attestation.CapacityLeaseTrustVolume(
-        volume_class="data",
-        volume_digest="22" * 32,
-    )
-
-    with pytest.raises(
-        runtime_config.ProviderDirectoryProfileCapacityConfigurationError,
-        match="storage_binding_invalid",
-    ):
-        trust_config._assert_trust_storage_binding(
-            (tablespace,),
-            (volume,),
-        )
 
 
 def test_validated_trust_rejects_unsorted_active_identity():
@@ -243,12 +197,8 @@ def test_runtime_trust_rejects_key_and_rotation_drift():
         attestation.ProviderDirectoryCapacityLeaseError,
         (
             lambda: trust_validation._trust_key_entry(None),
-            lambda: trust_validation._trust_key_entry(
-                dataclasses.replace(valid_key, status="unknown")
-            ),
-            lambda: trust_validation._trust_key_entry(
-                dataclasses.replace(valid_key, public_key=b"short")
-            ),
+            lambda: trust_validation._trust_key_entry(dataclasses.replace(valid_key, status="unknown")),
+            lambda: trust_validation._trust_key_entry(dataclasses.replace(valid_key, public_key=b"short")),
             lambda: trust_validation._assert_rotation_metadata(
                 dataclasses.replace(
                     valid_key,
@@ -256,83 +206,22 @@ def test_runtime_trust_rejects_key_and_rotation_drift():
                 )
             ),
             lambda: trust_validation._assert_rotation_metadata(retired_key),
-            lambda: trust_validation._validated_trust_keys(
-                dataclasses.replace(valid_trust, keys=())
-            ),
-            lambda: trust_validation._validated_trust_keys(
-                dataclasses.replace(valid_trust, keys=("not-a-key",))
-            ),
+            lambda: trust_validation._validated_trust_keys(dataclasses.replace(valid_trust, keys=())),
+            lambda: trust_validation._validated_trust_keys(dataclasses.replace(valid_trust, keys=("not-a-key",))),
             lambda: trust_validation._validated_trust_keys(
                 dataclasses.replace(
                     valid_trust,
                     keys=(late_key, unsorted_key),
                 )
             ),
-            lambda: trust_validation._assert_active_key(
-                dataclasses.replace(valid_trust, active_key_id="other-key")
-            ),
+            lambda: trust_validation._assert_active_key(dataclasses.replace(valid_trust, active_key_id="other-key")),
         ),
     )
 
 
-def test_runtime_trust_rejects_storage_identity_drift():
-    valid_trust = capacity_trust()
-    data_tablespace, temp_tablespace = valid_trust.tablespaces
-    data_volume, temp_volume, wal_volume = valid_trust.volumes
-    failure_operations = (
-        lambda: trust_validation._validated_trust_tablespace(
-            None,
-            expected_usage="data",
-        ),
-        lambda: trust_validation._validated_trust_tablespace(
-            temp_tablespace,
-            expected_usage="data",
-        ),
-        lambda: trust_validation._validated_trust_volume(
-            None,
-            expected_class="data",
-        ),
-        lambda: trust_validation._assert_trust_storage(
-            dataclasses.replace(valid_trust, tablespaces=())
-        ),
-        lambda: trust_validation._assert_trust_storage(
-            dataclasses.replace(valid_trust, volumes=())
-        ),
-        lambda: trust_validation._assert_trust_storage(
-            dataclasses.replace(
-                valid_trust,
-                tablespaces=(
-                    data_tablespace,
-                    dataclasses.replace(
-                        temp_tablespace,
-                        tablespace_name="other_space",
-                    ),
-                ),
-            )
-        ),
-        lambda: trust_validation._assert_trust_storage(
-            dataclasses.replace(
-                valid_trust,
-                volumes=(
-                    data_volume,
-                    dataclasses.replace(
-                        temp_volume,
-                        volume_digest="99" * 32,
-                    ),
-                    wal_volume,
-                ),
-            )
-        ),
-        lambda: trust_validation.capacity_trust_key_for_assigned_lease(
-            object(),
-            {},
-            now=VALIDATION_TIME,
-        ),
-    )
-    _assert_capacity_errors(
-        attestation.ProviderDirectoryCapacityLeaseError,
-        failure_operations,
-    )
+def test_runtime_trust_rejects_invalid_assigned_lease():
+    with pytest.raises(attestation.ProviderDirectoryCapacityLeaseError):
+        trust_validation.capacity_trust_key_for_assigned_lease(object(), {}, now=VALIDATION_TIME)
 
 
 @pytest.mark.parametrize(
@@ -345,12 +234,6 @@ def test_runtime_trust_rejects_storage_identity_drift():
                 maximum_length=20,
             ),
             "field_invalid",
-        ),
-        (
-            lambda: geometry_contract._database_system_identifier(
-                {"database_system_identifier": "0"}
-            ),
-            "database_system_identifier_invalid",
         ),
         (
             lambda: geometry_contract._assert_relation_cap_shape(
@@ -396,9 +279,7 @@ def test_geometry_rechecks_session_and_postgres_runtime():
                 postgres_full_page_writes=False,
             )
         ),
-        lambda: geometry._assert_postgres_wal_limits(
-            dataclasses.replace(valid_geometry, postgres_wal_level="minimal")
-        ),
+        lambda: geometry._assert_postgres_wal_limits(dataclasses.replace(valid_geometry, postgres_wal_level="minimal")),
         lambda: geometry._assert_postgres_wal_limits(
             dataclasses.replace(
                 valid_geometry,

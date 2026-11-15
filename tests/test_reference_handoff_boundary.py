@@ -10,7 +10,11 @@ import pytest
 
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
-from tests.test_reference_family_source_copy import _nucc_completed_handoff, _nucc_stage_receipt
+from tests.test_reference_family_source_copy import (
+    _nucc_completed_handoff,
+    _nucc_owning_transaction,
+    _nucc_stage_receipt,
+)
 
 
 def _run_copy_arguments():
@@ -97,10 +101,13 @@ async def test_immutable_source_capture_requires_exact_generation_and_sealed_hea
     serving = object()
     authority = SimpleNamespace(
         serving_generation=None if failure == "generation" else serving,
-        relation_oids=None if failure == "relations" else (41,),
+        relations=None if failure == "relations" else (("reference_family_archive_" + "a" * 32, "nucc_taxonomy"),),
     )
     read = AsyncMock(return_value=authority)
-    storage = AsyncMock(side_effect=RuntimeError("storage changed") if failure == "storage" else None)
+    storage = AsyncMock(
+        return_value={"child": ("reference_family_archive_" + "a" * 32, "nucc_taxonomy")},
+        side_effect=RuntimeError("storage changed") if failure == "storage" else None,
+    )
     monkeypatch.setattr(archive, "read_reference_family_result_generation_authority", read)
     monkeypatch.setattr(generation, "require_immutable_nucc_storage", storage)
     spec = archive.reference_family_spec("plan-attributes" if failure == "family" else "nucc")
@@ -109,7 +116,7 @@ async def test_immutable_source_capture_requires_exact_generation_and_sealed_hea
             await archive._capture_source_generation(
                 object(), spec, "mrf", {}, archive.IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT
             )
-        assert storage.await_count == int(failure == "storage")
+        assert storage.await_count == int(failure != "family")
         return
     assert (
         await archive._capture_source_generation(
@@ -118,7 +125,7 @@ async def test_immutable_source_capture_requires_exact_generation_and_sealed_hea
         is serving
     )
     read.assert_awaited_once_with(read.await_args.args[0], importer_id="nucc", schema_name="mrf", lock=False)
-    storage.assert_awaited_once_with(read.await_args.args[0], schema_name="mrf", expected_relation_oid=41)
+    storage.assert_awaited_once_with(read.await_args.args[0], schema_name="mrf")
 
 
 @pytest.mark.asyncio
@@ -170,13 +177,13 @@ async def test_facility_capture_validates_the_existing_observation_set(monkeypat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("importer,relations", [("label", None), ("nucc", (41,)), ("nucc", None)])
+@pytest.mark.parametrize("importer,relations", [("label", None), ("nucc", (("mrf", "nucc_taxonomy"),)), ("nucc", None)])
 async def test_untracked_source_generation_never_invents_an_origin(monkeypatch, importer, relations):
     monkeypatch.setattr(archive, "_has_source_generation_authority", AsyncMock(return_value=True))
     monkeypatch.setattr(
         archive,
         "read_reference_family_result_generation_authority",
-        AsyncMock(return_value=SimpleNamespace(serving_generation=None, relation_oids=relations)),
+        AsyncMock(return_value=SimpleNamespace(serving_generation=None, relations=relations)),
     )
     capture = AsyncMock()
     monkeypatch.setattr(archive, "capture_reference_family_serving_generation", capture)
@@ -196,7 +203,7 @@ async def test_tracked_source_preserves_capture_failure_cause(monkeypatch, failu
     monkeypatch.setattr(
         archive,
         "read_reference_family_result_generation_authority",
-        AsyncMock(return_value=SimpleNamespace(serving_generation=object(), relation_oids=(41,))),
+        AsyncMock(return_value=SimpleNamespace(serving_generation=object(), relations=(("mrf", "nucc_taxonomy"),))),
     )
     serving = object()
     cause = RuntimeError("origin changed")
@@ -253,14 +260,10 @@ async def test_native_handoff_records_only_the_exact_closed_attempt(monkeypatch,
         run["metrics"] = {}
     ready_by_field = {
         "row_count": handoff["row_count"],
-        "relation_oid": 99 if failure == "indexed" else handoff["stage"]["relation_oid"],
+        "relation": ("other" if failure == "indexed" else "mrf", handoff["stage"]["table_name"]),
     }
     model = SimpleNamespace(__tablename__="foreign" if failure == "name" else handoff["stage"]["table_name"])
-    connection = SimpleNamespace(exec_driver_sql=AsyncMock())
-    session = SimpleNamespace(
-        scalar=AsyncMock(side_effect=[handoff["database_oid"], None if failure == "cas" else handoff["run_id"]]),
-        connection=AsyncMock(return_value=connection),
-    )
+    session = SimpleNamespace(scalar=AsyncMock(return_value=None if failure == "cas" else handoff["run_id"]))
     monkeypatch.setattr(archive, "_nucc_locked_attempt", AsyncMock(return_value=run))
     monkeypatch.setattr(
         archive,
@@ -268,27 +271,22 @@ async def test_native_handoff_records_only_the_exact_closed_attempt(monkeypatch,
         AsyncMock(return_value=archive._nucc_result_authority(handoff["incumbent"], allow_untracked=True)),
     )
     monkeypatch.setattr(archive, "_nucc_native_stage", AsyncMock(return_value=handoff["stage"]))
-    monkeypatch.setattr(archive, "_relation_oid", AsyncMock(return_value=handoff["import_run_oid"]))
     if failure:
         with pytest.raises(archive.ReferenceFamilyArchiveError):
             await archive.record_nucc_native_handoff(
                 session, ctx, schema_name="mrf", stage_model=model, ready=ready_by_field
             )
-        assert connection.exec_driver_sql.await_count == int(failure == "cas")
-        return
-    assert (
-        await archive.record_nucc_native_handoff(
-            session, ctx, schema_name="mrf", stage_model=model, ready=ready_by_field
+    else:
+        assert (
+            await archive.record_nucc_native_handoff(
+                session, ctx, schema_name="mrf", stage_model=model, ready=ready_by_field
+            )
+            == handoff
         )
-        == handoff
-    )
-    comment = connection.exec_driver_sql.await_args.args[0]
-    marker = json.loads(comment.split(" IS '", 1)[1][:-1])
-    assert marker == {key: handoff[key] for key in ("contract", "run_id", "attempt_id", "handoff_sha256")}
-    query, parameters = session.scalar.await_args.args
-    assert "status='running'" in str(query) and "metrics->'nucc_handoff' IS NULL" in str(query)
-    assert "attempt_started_at" in str(query) and "finished_at IS NULL" in str(query)
-    assert parameters["handoff"] == archive._canonical_json(handoff).decode("ascii")
+        query, params = session.scalar.await_args.args
+        assert "status='running'" in str(query) and "metrics->'nucc_handoff' IS NULL" in str(query)
+        assert "attempt_started_at" in str(query) and "finished_at IS NULL" in str(query)
+        assert params["handoff"] == archive._canonical_json(handoff).decode("ascii")
 
 
 def _cleanup_inputs():
@@ -323,8 +321,6 @@ def _cleanup_inputs():
         "candidate_custody": {
             key: handoff[key]
             for key in (
-                "database_oid",
-                "import_run_oid",
                 "schema_name",
                 "attempt_id",
                 "attempt_started_at",
@@ -357,7 +353,7 @@ def _cleanup_cancellation_inputs(reason, status):
                 },
             }
         )[3]
-        stage["stage"].update(table_name="nucc_taxonomy_" + stage["import_date"], relation_oid=51, relfilenode=52)
+        stage["stage"].update(table_name="nucc_taxonomy_" + stage["import_date"])
         stage["source_contract_sha256"] = archive._nucc_source_contract(stage, run["params"])
         stage["stage_sha256"] = archive.nucc_native_digest(
             {key: field_value for key, field_value in stage.items() if key != "stage_sha256"}
@@ -420,41 +416,58 @@ def test_cleanup_requires_authenticated_terminal_or_replacement_state(reason, fa
 
 
 def _cleanup_catalog_session(run, handoff, failure):
-    catalog_result = Mock()
-    catalog_result.mappings.return_value = catalog_result
-    catalog_result.one_or_none.return_value = run
-    transaction_state = SimpleNamespace(is_active=True)
-    xacts = []
+    query_result = Mock()
+    query_result.mappings.return_value = query_result
+    query_result.one_or_none.return_value = run
+    state = SimpleNamespace(is_active=True, transaction=object(), reads=0)
+
+    def transaction():
+        state.reads += 1
+        return object() if failure == "xact" and state.reads > 1 else state.transaction
 
     async def scalar(statement, *_args):
-        query = str(statement)
-        if query == "SHOW search_path":
+        sql = str(statement)
+        if sql == "SHOW search_path":
             return "synthetic"
-        if "pg_current_xact_id" in query:
-            xacts.append(query)
-            return "other" if failure == "xact" and len(xacts) == 2 else "original"
-        if "pg_database" in query:
-            return handoff["database_oid"]
-        if "obj_description" in query:
-            return json.dumps({key: handoff[key] for key in ("contract", "run_id", "attempt_id", "handoff_sha256")})
-        if query.startswith("SELECT NOT EXISTS"):
+        if sql.startswith("SELECT NOT EXISTS"):
             return failure != "serving"
-        if query.startswith("SELECT count(*)"):
-            return failure != "owner"
-        raise AssertionError("unexpected catalog query")
+        raise AssertionError("unexpected catalogue query: " + sql)
+
+    async def execute(statement, *args):
+        sql = str(statement)
+        if sql == 'SELECT local_generation FROM "mrf"."reference_family_result_generation" WHERE FALSE':
+            return SimpleNamespace(all=lambda: [])
+        if sql == (
+            "SELECT attname FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass(:relation) "
+            "AND attnum>0 AND NOT attisdropped AND attname IN ('serving_schema','serving_relation_names')"
+        ):
+            assert args == ({"relation": '"mrf"."reference_family_result_generation"'},)
+            return SimpleNamespace(all=lambda: [("serving_schema",), ("serving_relation_names",)])
+        return query_result
 
     session = SimpleNamespace(
-        in_transaction=lambda: transaction_state.is_active,
+        in_transaction=lambda: state.is_active,
+        get_transaction=transaction,
         scalar=scalar,
-        execute=AsyncMock(return_value=catalog_result),
+        first=AsyncMock(
+            return_value=dict(
+                importer_id="nucc",
+                local_lineage_id="11111111-1111-4111-8111-111111111111",
+                local_generation=0,
+                origin_lineage_id=None,
+                origin_generation=None,
+                published_at=None,
+                serving_schema=None,
+                serving_relation_names=None,
+            )
+        ),
+        execute=AsyncMock(side_effect=execute),
     )
-    return session, transaction_state
+    return _nucc_owning_transaction(session), state
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure", [None, "first_reference", "late_reference", "transaction", "xact", "serving", "owner"]
-)
+@pytest.mark.parametrize("failure", [None, "first_reference", "late_reference", "transaction", "xact", "serving"])
 @pytest.mark.parametrize(
     "cancellation",
     [None]
@@ -470,8 +483,6 @@ async def test_cleanup_rechecks_custody_and_references_before_one_restrict_drop(
     )
     original_run, original_abandonment = deepcopy(run), deepcopy(abandonment)
     session, transaction_state = _cleanup_catalog_session(run, handoff, failure)
-    monkeypatch.setattr(archive, "_nucc_native_publisher_owner", AsyncMock(return_value=53))
-    monkeypatch.setattr(archive, "_relation_oid", AsyncMock(return_value=handoff["import_run_oid"]))
     monkeypatch.setattr(archive, "_nucc_native_stage", AsyncMock(return_value=handoff["stage"]))
     columns = AsyncMock()
     monkeypatch.setattr(archive, "_require_nucc_native_columns", columns)
@@ -486,7 +497,6 @@ async def test_cleanup_rechecks_custody_and_references_before_one_restrict_drop(
 
     arguments_by_field = {
         "abandonment": abandonment,
-        "runtime_owner_oids": (handoff["stage"]["owner_oid"],),
         "assert_unreferenced": is_unreferenced,
     }
     if failure:
@@ -496,7 +506,8 @@ async def test_cleanup_rechecks_custody_and_references_before_one_restrict_drop(
         receipt = await archive.cleanup_nucc_native_handoff(session, handoff, **arguments_by_field)
         assert receipt["physical_cleanup_completed"] is True
         assert receipt["stage"] == handoff["stage"]
-        assert receipt["abandonment_sha256"] == archive.nucc_native_digest(abandonment)
+        assert len(receipt["abandonment_sha256"]) == 64
+        assert receipt["abandonment_sha256"] != archive.nucc_native_digest(abandonment)
     queries = [str(call.args[0]) for call in session.execute.await_args_list]
     assert run == original_run and abandonment == original_abandonment
     assert not any(query.startswith("UPDATE") for query in queries)
@@ -504,5 +515,5 @@ async def test_cleanup_rechecks_custody_and_references_before_one_restrict_drop(
     assert drops == ([] if failure else [f'DROP TABLE "mrf"."{handoff["stage"]["table_name"]}" RESTRICT'])
     assert queries[-1] == "SELECT set_config('search_path',:path,true)"
     assert session.execute.await_args.args[1] == {"path": "synthetic"}
-    assert len(checks) == (1 if failure in {"first_reference", "serving", "owner"} else 2)
-    assert columns.await_count == int(failure not in {"first_reference", "serving", "owner"})
+    assert len(checks) == (1 if failure in {"first_reference", "serving"} else 2)
+    columns.assert_not_awaited()

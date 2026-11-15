@@ -6,9 +6,9 @@ import datetime
 import hashlib
 import json
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import fields, replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import DEFAULT, AsyncMock, Mock, call
 
 import pytest
 
@@ -19,10 +19,10 @@ from process import provider_directory_profile_initial as initial
 from process import provider_directory_profile_initial_contract as contract
 from process import provider_directory_profile_initial_guards as guards
 from process import provider_directory_profile_selection as selection
+from process.provider_directory_profile_capacity_runtime_types import ProviderDirectoryProfileCapacityGeometryInputs
 from tests.provider_directory_profile_capacity_signing_guard_test_support import synthetic_profile_execution
 from tests.test_provider_directory_profile_bounded_capacity import admitted_window as admitted_window
 from tests.test_provider_directory_profile_capacity import _geometry_payload
-from tests.test_provider_directory_profile_capacity_runtime import _geometry_inputs
 from tests.test_provider_directory_profile_control_capacity import _control_wal_plan_input
 from tests.test_provider_directory_profile_initial import _geometry, _target, fhir
 from tests.test_provider_directory_profile_initial_replay import _selection
@@ -31,6 +31,7 @@ from tests.test_provider_directory_profile_initial_replay import _selection
 def _initial_geometry(execution, initial_targets):
     geometry = replace(
         _geometry(),
+        relations={role: {**entry, "schema": "synthetic"} for role, entry in _geometry().relations.items()},
         initial_target_state_sha256=contract.target_state_sha256(initial_targets.payload),
         selection_proof_id=execution.attestation.proof_id,
         profile_input_digest=execution.attestation.profile_input_digest,
@@ -81,43 +82,76 @@ def _initial_stages(build, initial_targets):
             table,
             relation,
             AsyncMock(),
-            fhir.ProviderDirectoryArtifactBuildFence(oid),
+            fhir.ProviderDirectoryArtifactBuildFence(),
             profile_initial_build=build,
         )
-        for table, relation, oid in (
-            (build.evidence_stage, fhir.profile_artifact.PROFILE_EVIDENCE_TABLE, initial_targets.evidence_target_oid),
-            (build.profile_stage, fhir.profile_artifact.PROFILE_TABLE, initial_targets.profile_target_oid),
+        for table, relation in (
+            (build.evidence_stage, fhir.profile_artifact.PROFILE_EVIDENCE_TABLE),
+            (build.profile_stage, fhir.profile_artifact.PROFILE_TABLE),
         )
     ]
 
 
 def _initial_layouts(geometry):
     return {
-        oid: SimpleNamespace(
-            relation_oid=oid,
-            exact_fingerprint=fingerprint,
-            effective_tablespace_oids=(geometry.tablespace_oid,),
-            main_index_pages=(1,),
-            toast_index_pages=(1,),
+        (entry["schema"], entry["name"]): SimpleNamespace(
+            schema_name=entry["schema"],
+            relation_name=entry["name"],
+            main_index_pages=tuple(entry["main_index_pages"]),
+            toast_index_pages=tuple(entry["toast_index_pages"]),
+            toastable_columns=tuple("payload_" + str(index) for index in range(entry["toastable_column_count"])),
         )
-        for oid, fingerprint in (
-            (20001, "aa" * 32),
-            (20002, "bb" * 32),
-            (30001, "ee" * 32),
-            (30002, "ff" * 32),
-            (geometry.initial_receipt_oid, geometry.initial_receipt_storage_fingerprint),
-            (geometry.serving_generation_oid, "78" * 32),
-        )
+        for entry in geometry.relations.values()
     }
 
 
+def _initial_target_attributes():
+    columns_by_table = {
+        fhir.profile_artifact.PROFILE_TABLE: (
+            fhir.profile_artifact.profile_columns(),
+            "bigint|jsonb|jsonb|character varying[]|character varying[]|character varying[]|integer|integer|integer|character varying(64)|timestamp without time zone".split(
+                "|"
+            ),
+        ),
+        fhir.profile_artifact.PROFILE_EVIDENCE_TABLE: (
+            fhir.profile_artifact.profile_evidence_columns(),
+            "character(32)|bigint|character varying(64)|character(32)|jsonb|character varying(64)|character varying(64)|character varying(96)|text|character varying(256)|character varying(512)|character varying(64)|character varying(256)|character varying(256)|boolean|character varying(64)|character varying(64)|timestamp without time zone".split(
+                "|"
+            ),
+        ),
+    }
+    evidence_required_names = {*fhir.profile_artifact.profile_evidence_columns()[:8], "resource_type", "resource_id"}
+    return [
+        dict(
+            relname=table,
+            attname=name,
+            type_name=kind,
+            attnotnull=table == fhir.profile_artifact.PROFILE_TABLE or name in evidence_required_names,
+            default_expression="",
+            attgenerated="",
+            attidentity="",
+        )
+        for table, (names, types) in columns_by_table.items()
+        for name, kind in zip(names, types, strict=True)
+    ]
+
+
 def _initial_database(geometry):
+    target_attribute_rows = _initial_target_attributes()
+
+    async def all_rows(statement, **values):
+        if statement.startswith("SELECT c.relname,a.attname,format_type"):
+            assert values["schema"] == "synthetic"
+            assert set(values["names"]) == {
+                fhir.profile_artifact.PROFILE_TABLE,
+                fhir.profile_artifact.PROFILE_EVIDENCE_TABLE,
+            }
+            return target_attribute_rows
+        return DEFAULT
 
     async def scalar(statement, **values):
         if "pg_total_relation_size" in statement:
             return 8192
-        if "AS regclass" in statement:
-            return geometry.initial_receipt_oid
         if "pg_current_wal_insert_lsn" in statement:
             return "0/1"
         return False
@@ -125,28 +159,36 @@ def _initial_database(geometry):
     return SimpleNamespace(
         scalar=AsyncMock(side_effect=scalar),
         first=AsyncMock(return_value=None),
-        all=AsyncMock(return_value=[]),
+        all=AsyncMock(side_effect=all_rows, return_value=[]),
+        target_attribute_rows=target_attribute_rows,
         status=AsyncMock(return_value="INSERT 0 1"),
     )
 
 
-def _install_initial_relation_mocks(monkeypatch, build, layout_by_oid):
-    stage_oid_by_table = {
-        build.evidence_stage: 30001,
-        build.profile_stage: 30002,
-        fhir.profile_artifact.PROFILE_EVIDENCE_TABLE: 30001,
-        fhir.profile_artifact.PROFILE_TABLE: 30002,
-    }
+def _install_initial_relation_mocks(monkeypatch, build, layout_by_name, geometry):
+    async def named_layout(observed_geometry, role):
+        entry = observed_geometry.relations[role]
+        layout = layout_by_name[(entry["schema"], entry["name"])]
+        fhir._assert_profile_capacity_layout_bounds(layout, observed_geometry, role)
+        return layout
+
+    async def stage_layout(schema, name, **options):
+        assert options == {"lock_relation": False}
+        return SimpleNamespace(schema_name=schema, relation_name=name)
+
+    monkeypatch.setattr(fhir, "_provider_directory_relation_oid", AsyncMock(return_value=None))
+    monkeypatch.setattr(fhir, "_profile_capacity_named_layout", AsyncMock(side_effect=named_layout))
+    monkeypatch.setattr(fhir, "_provider_directory_profile_stage_layout", AsyncMock(side_effect=stage_layout))
+    entry = geometry.relations["initial_receipt"]
     monkeypatch.setattr(
-        fhir,
-        "_provider_directory_relation_oid",
-        AsyncMock(side_effect=lambda _schema, table: stage_oid_by_table.get(table)),
+        initial, "receipt_layout", AsyncMock(return_value=layout_by_name[(entry["schema"], entry["name"])])
     )
-    monkeypatch.setattr(
-        fhir,
-        "_provider_directory_profile_relation_storage_fingerprint",
-        AsyncMock(side_effect=lambda oid, **_kwargs: layout_by_oid[oid]),
-    )
+
+
+def _initial_targets(schema):
+    payload = _target()
+    payload["targets"] = {role: {**entry, "schema": schema} for role, entry in payload["targets"].items()}
+    return contract.InitialTargets(payload["targets"], payload)
 
 
 @pytest.fixture
@@ -154,7 +196,7 @@ def initial_case(admitted_window, monkeypatch):
     """Bind a synthetic initial admission and restore its executor context after each case."""
     admission, _state = admitted_window
     execution = _selection("2026-07-30")
-    initial_targets = contract.InitialTargets(20001, 20002, _target())
+    initial_targets = _initial_targets("synthetic")
     geometry, projection = _initial_geometry(execution, initial_targets)
     build = _initial_build(execution, geometry)
     admission = replace(
@@ -166,7 +208,7 @@ def initial_case(admitted_window, monkeypatch):
         admitted_identity=SimpleNamespace(initial_targets=initial_targets),
         lease=SimpleNamespace(attestation_id="synthetic-attestation", lease_digest="34" * 32, nonce="56" * 32),
     )
-    layout_by_oid = _initial_layouts(geometry)
+    layout_by_name = _initial_layouts(geometry)
     database = _initial_database(geometry)
     monkeypatch.setattr(fhir, "db", database)
     monkeypatch.setattr(
@@ -174,8 +216,8 @@ def initial_case(admitted_window, monkeypatch):
     )
     monkeypatch.setattr(fhir, "_apply_provider_directory_profile_capacity_settings", AsyncMock())
     monkeypatch.setattr(fhir, "_provider_directory_profile_serving_state", AsyncMock(return_value=None))
-    monkeypatch.setattr(fhir, "_locked_profile_adoption_target_oids", AsyncMock(return_value=(20002, 20001)))
-    _install_initial_relation_mocks(monkeypatch, build, layout_by_oid)
+    monkeypatch.setattr(fhir, "_locked_profile_adoption_target_oids", AsyncMock(return_value=None))
+    _install_initial_relation_mocks(monkeypatch, build, layout_by_name, geometry)
     monkeypatch.setattr(
         fhir,
         "_provider_directory_profile_stage_metrics",
@@ -202,7 +244,7 @@ def initial_case(admitted_window, monkeypatch):
             stages=_initial_stages(build, initial_targets),
             fence=fhir.ProviderDirectoryArtifactDatasetFence(()),
             db=database,
-            layout_by_oid=layout_by_oid,
+            layout_by_name=layout_by_name,
             execution=execution,
         )
     finally:
@@ -223,6 +265,7 @@ async def _receipt(case):
         "generation_id": case.build.generation_id,
         "attestation_id": case.admission.lease.attestation_id,
         "payload": payload,
+        "_validated_geometry": case.geometry,
         "valid_hash": True,
         "publication_xid": 123,
         "committed_at": datetime.datetime(2026, 7, 30, tzinfo=datetime.timezone.utc),
@@ -284,7 +327,9 @@ async def test_metadata_lock_and_forecast_bind_both_replacement_stages(initial_c
     await initial.lock_metadata(fhir, case.stages)
     assert "NOWAIT" in case.db.status.await_args.args[0]
     cutover = await initial.prepare_cutover(fhir, case.stages, case.fence)
-    assert cutover["oids"] == {stage.target_relation: oid for stage, oid in zip(case.stages, (30001, 30002))}
+    assert cutover["stages"] == {
+        stage.target_relation: {"schema": stage.schema, "name": stage.stage_table} for stage in case.stages
+    }
     assert cutover["counts"] == {"evidence_rows": 2, "profile_rows": 1}
     assert cutover["forecast"]["initial_target_state_sha256"] == contract.target_state_sha256(case.target.payload)
     assert cutover["forecast_hash"] == fhir._identity_hash(cutover["forecast"])
@@ -310,17 +355,23 @@ async def test_metadata_lock_and_forecast_bind_both_replacement_stages(initial_c
             ),
         ]
     )
+    case.db.target_attribute_rows[0]["type_name"] = "integer"
+    with pytest.raises(RuntimeError, match="^provider_directory_profile_initial_target_changed$"):
+        await initial.prepare_cutover(fhir, case.stages, case.fence)
 
 
 def test_initial_geometry_inputs_bind_the_snapshot_and_receipt_storage(initial_case):
     case = initial_case
-    ordinary = _geometry_inputs(tablespace_oid=case.geometry.tablespace_oid)
+    payload = {**_geometry_payload(), "artifact_scope_projected_rows": 250_000}
+    ordinary = ProviderDirectoryProfileCapacityGeometryInputs(
+        **{field.name: payload[field.name] for field in fields(ProviderDirectoryProfileCapacityGeometryInputs)}
+    )
+    receipt = case.geometry.relations["initial_receipt"]
     inputs = initial.geometry_inputs(
-        fhir, case.admission.admitted_identity, ordinary, case.layout_by_oid[case.geometry.initial_receipt_oid]
+        fhir, case.admission.admitted_identity, ordinary, case.layout_by_name[(receipt["schema"], receipt["name"])]
     )
     assert inputs.initial_target_state_sha256 == contract.target_state_sha256(case.target.payload)
-    assert inputs.initial_receipt_oid == case.geometry.initial_receipt_oid
-    assert inputs.initial_receipt_storage_fingerprint == case.geometry.initial_receipt_storage_fingerprint
+    assert inputs.relations["initial_receipt"] == {**receipt, "toast_index_pages": [2]}
     assert inputs.selection_proof_id == ordinary.selection_proof_id
 
 
@@ -377,14 +428,16 @@ async def test_initial_live_guards_refuse_drift_without_repeating_census(initial
     capture = AsyncMock(wraps=initial.capture_targets)
     monkeypatch.setattr(initial, "capture_targets", capture)
     cutover = await initial.prepare_cutover(fhir, case.stages, case.fence)
-    live_oid_by_target = {stage.target_relation: stage.build_fence.target_oid for stage in case.stages}
-    stage_oid_by_table = {stage.stage_table: cutover["oids"][stage.target_relation] for stage in case.stages}
+    stages = case.stages
     if fault == "target":
-        live_oid_by_target[case.stages[0].target_relation] += 1
+        changed_by_role = {role: dict(entry) for role, entry in case.target.targets.items()}
+        changed_by_role["evidence"]["name"] = "replacement_target"
+        monkeypatch.setattr(fhir, "_provider_directory_profile_target_coordinates", lambda _schema: changed_by_role)
     if fault == "layout":
-        case.layout_by_oid[20001].exact_fingerprint = "90" * 32
+        entry = case.geometry.relations["evidence_target"]
+        case.layout_by_name[(entry["schema"], entry["name"])].main_index_pages = (100,)
     if fault == "stage":
-        stage_oid_by_table[case.stages[0].stage_table] += 1
+        stages = [replace(stages[0], stage_table="changed_stage"), stages[1]]
     if fault in {"checkpoint", "consumption", "database"}:
         name = {
             "checkpoint": "_assert_provider_directory_profile_checkpoint_ready",
@@ -394,10 +447,6 @@ async def test_initial_live_guards_refuse_drift_without_repeating_census(initial
         getattr(fhir, name).side_effect = RuntimeError("synthetic_guard_refused")
     if fault == "serving":
         fhir._provider_directory_profile_serving_state.return_value = object()
-    fhir._provider_directory_relation_oid.side_effect = lambda _schema, name: {
-        **live_oid_by_target,
-        **stage_oid_by_table,
-    }.get(name)
     wal_read = case.db.scalar.side_effect
 
     async def scalar(statement, **values):
@@ -405,20 +454,20 @@ async def test_initial_live_guards_refuse_drift_without_repeating_census(initial
 
     case.db.scalar.side_effect = scalar
     if fault:
-        error_by_fault = {
-            "target": "provider_directory_profile_initial_targets_changed",
-            "layout": "provider_directory_profile_initial_targets_changed",
-            "stage": "provider_directory_profile_initial_stage_changed",
+        error = {
+            "target": "initial_targets_changed",
+            "layout": "capacity_index_bound_changed",
+            "stage": "initial_stage_changed",
             "checkpoint": "synthetic_guard_refused",
             "consumption": "synthetic_guard_refused",
             "database": "synthetic_guard_refused",
-            "serving": "provider_directory_profile_initial_serving_exists",
-        }
-        with pytest.raises(RuntimeError, match="^" + error_by_fault[fault] + "$"):
-            await initial.begin_cutover(fhir, cutover, case.stages)
+            "serving": "initial_serving_exists",
+        }[fault]
+        with pytest.raises(RuntimeError, match=error):
+            await initial.begin_cutover(fhir, cutover, stages)
         assert cutover["wal_start"] == "0/1"
     else:
-        await initial.begin_cutover(fhir, cutover, case.stages)
+        await initial.begin_cutover(fhir, cutover, stages)
         assert cutover["wal_start"] == "0/2"
     capture.assert_awaited_once()
     fhir._provider_directory_profile_stage_metrics.assert_awaited_once()
@@ -492,9 +541,9 @@ async def test_initial_composite_refuses_expired_witness_before_live_locks(initi
     "fault",
     [
         "targets",
-        "receipt_oid",
-        "receipt_fingerprint",
-        "tablespace",
+        "receipt_name",
+        "receipt_indexes",
+        "receipt_columns",
         "old_target",
         "checkpoint",
         "consumption",
@@ -505,23 +554,26 @@ async def test_cutover_refuses_drift_before_publication(initial_case, monkeypatc
     case = initial_case
     error = fault
     if fault == "targets":
-        case.layout_by_oid[20001].exact_fingerprint = "90" * 32
-        error = "targets_changed"
-    elif fault.startswith("receipt_") or fault == "tablespace":
-        layout = case.layout_by_oid[case.geometry.initial_receipt_oid]
-        setattr(
-            layout,
-            {
-                "receipt_oid": "relation_oid",
-                "receipt_fingerprint": "exact_fingerprint",
-                "tablespace": "effective_tablespace_oids",
-            }[fault],
-            {"receipt_oid": 29001, "receipt_fingerprint": "90" * 32, "tablespace": (20001,)}[fault],
+        monkeypatch.setattr(
+            initial,
+            "capture_targets",
+            AsyncMock(
+                return_value=replace(case.target, payload={**case.target.payload, "evidence_target_bytes": 16_384})
+            ),
         )
-        error = "receipt_storage_changed"
+        error = "targets_changed"
+    elif fault.startswith("receipt_"):
+        entry = case.geometry.relations["initial_receipt"]
+        layout = case.layout_by_name[(entry["schema"], entry["name"])]
+        if fault == "receipt_name":
+            layout.relation_name = "other_receipt"
+        elif fault == "receipt_indexes":
+            layout.main_index_pages = (100,)
+        else:
+            layout.toastable_columns += ("unfunded_payload",)
+        error = "capacity_(layout_scope|index_bound)_changed"
     elif fault == "old_target":
-        fhir._provider_directory_relation_oid.side_effect = None
-        fhir._provider_directory_relation_oid.return_value = 40001
+        fhir._provider_directory_relation_oid.return_value = True
         error = "old_target_conflict"
     elif fault == "unresolved":
         case.admission.wal_tracker.unresolved_window = True
@@ -593,7 +645,7 @@ async def test_committed_receipt_requires_retired_checkpoint_and_closed_provenan
         receipt_payload["common_receipt_required"] = True
     receipt["payload"] = contract.canonical_json(receipt_payload)
     case.db.first.return_value = None if fault == "missing" else receipt
-    case.db.scalar.side_effect = [case.geometry.initial_receipt_oid, fault == "checkpoint", fault != "common"]
+    case.db.scalar.side_effect = [fault == "checkpoint", fault != "common"]
     error_by_fault = {
         "hash": "receipt_invalid",
         "contract": "receipt_invalid",
@@ -633,18 +685,24 @@ async def test_completion_refuses_unbound_receipts_and_propagates_cancellation(i
     case.db.status.assert_not_awaited()
 
 
-@pytest.mark.parametrize("fault", ["missing", "target_oid", "fingerprint"])
+@pytest.mark.parametrize("fault", ["missing", "target_name", "layout"])
 async def test_current_receipt_rejects_missing_serving_or_replaced_targets(initial_case, fault):
     case = initial_case
     receipt = await _receipt(case)
     if fault != "missing":
-        if fault == "target_oid":
-            receipt["payload"]["serving"]["evidence_target_oid"] = 30002
+        if fault == "target_name":
+            receipt["payload"]["serving"]["targets"]["evidence"]["name"] = "changed_target"
         fhir._provider_directory_profile_serving_state.return_value = _current_serving(case, receipt)
-        if fault == "fingerprint":
-            case.layout_by_oid[30001].exact_fingerprint = "90" * 32
-    error = "receipt_not_current" if fault == "missing" else "receipt_targets_changed"
-    with pytest.raises(RuntimeError, match="^provider_directory_profile_initial_" + error + "$"):
+        if fault == "layout":
+            fhir._provider_directory_profile_stage_layout.side_effect = fhir.ProviderDirectoryArtifactBuildStale(
+                "stage_storage_shape_invalid"
+            )
+    error = {
+        "missing": "receipt_not_current",
+        "target_name": "receipt_targets_changed",
+        "layout": "stage_storage_shape_invalid",
+    }[fault]
+    with pytest.raises(RuntimeError, match=error):
         await initial._assert_current_receipt(fhir, case.build.schema, receipt)
     case.db.status.assert_not_awaited()
 
@@ -736,7 +794,7 @@ async def test_replay_binds_original_owner_geometry_and_consumed_lease(initial_c
     monkeypatch.setattr(fhir, "_replay_bound_consumption", consumed)
     monkeypatch.setattr(fhir, "_assert_replay_owner", AsyncMock())
     if fault == "geometry":
-        receipt["payload"]["capacity_geometry"] = _geometry_payload()
+        receipt["_validated_geometry"] = capacity.validated_capacity_geometry(_geometry_payload())
     lease = SimpleNamespace(
         attestation_id="different-attestation" if fault == "lease" else case.admission.lease.attestation_id,
         lease_digest=case.admission.lease.lease_digest,
@@ -787,7 +845,7 @@ async def test_current_replay_requires_the_exact_committed_dataset_fence(initial
         receipt["payload"]["actual"]["forecast_hash"] = fhir._identity_hash(receipt["payload"]["forecast"])
     case.db.first.return_value = receipt
     case.db.all.return_value = [{"build_id": receipt["build_id"]}]
-    case.db.scalar.side_effect = [case.geometry.initial_receipt_oid, False, True]
+    case.db.scalar.side_effect = [False, True]
     fhir._provider_directory_profile_serving_state.return_value = _current_serving(case, receipt)
     for name, observation in (
         ("_replay_control_run", None),
@@ -807,7 +865,6 @@ async def test_current_replay_requires_the_exact_committed_dataset_fence(initial
         signing_preflight_guard={"healthcare_receipt": {"capacity_geometry": receipt["payload"]["capacity_geometry"]}},
     )
     monkeypatch.setattr(fhir, "_verified_provider_directory_profile_replay_lease", Mock(return_value=lease))
-    monkeypatch.setattr(fhir, "_assert_provider_directory_profile_capacity_tablespaces", Mock())
     monkeypatch.setattr(fhir, "_assert_replay_timeline", Mock())
     with pytest.raises(RuntimeError, match="initial_replay_dataset_changed"):
         await initial.committed_replay(
@@ -825,18 +882,12 @@ async def test_replay_selection_and_database_identity_must_still_match(initial_c
     case = initial_case
     receipt = await _receipt(case)
     if fault == "database":
-        tablespaces = Mock()
-        monkeypatch.setattr(fhir, "_assert_provider_directory_profile_capacity_tablespaces", tablespaces)
-        with pytest.raises(RuntimeError, match="replay_database_changed"):
+        relations_by_role = {role: dict(entry) for role, entry in case.geometry.relations.items()}
+        relations_by_role["profile_target"]["name"] = "other_profile"
+        with pytest.raises(RuntimeError, match="replay_target_changed"):
             initial._assert_replay_database(
-                fhir,
-                replace(case.geometry, database_oid=case.geometry.database_oid + 1),
-                case.geometry,
-                case.admission.lease,
-                {},
-                {},
+                fhir, replace(case.geometry, relations=relations_by_role), case.geometry, case.admission.lease, {}, {}
             )
-        tablespaces.assert_not_called()
     else:
         if fault == "selection":
             receipt["payload"]["serving"]["control_generation"] += 1
@@ -866,11 +917,23 @@ def test_legacy_result_rejects_ambiguous_completion(change, error):
     [
         ({"extra": 1}, "target_fields_invalid"),
         ({"serving_singleton_absent": 1}, "target_absence_invalid"),
-        ({"evidence_target_oid": True}, "target_oid_invalid"),
-        ({"profile_target_oid": 2**32}, "target_oid_invalid"),
-        ({"profile_target_oid": 20001}, "target_oid_collision"),
+        (
+            {"targets": {"evidence": {"schema": "fixture", "name": True}, "profile": _target()["targets"]["profile"]}},
+            "name_invalid",
+        ),
+        (
+            {"targets": {**_target()["targets"], "profile": {"schema": "fixture", "name": "unsafe\x00name"}}},
+            "target_coordinate_invalid",
+        ),
+        (
+            {"targets": {"evidence": _target()["targets"]["evidence"], "profile": _target()["targets"]["evidence"]}},
+            "target_coordinate_collision",
+        ),
         ({"resolution": "inferred"}, "resolution_invalid"),
-        ({"profile_target_storage_fingerprint": "not-a-fingerprint"}, "target_fingerprint_invalid"),
+        (
+            {"targets": {**_target()["targets"], "profile": {"schema": "fixture", "name": "valid", "extra": 1}}},
+            "target_fields_invalid",
+        ),
         ({"evidence_target_bytes": True}, "target_size_invalid"),
     ],
 )

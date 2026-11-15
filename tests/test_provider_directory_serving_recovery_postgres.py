@@ -41,9 +41,13 @@ async def _publish_overlay(case, generation):
     )
     async with database.transaction():
         await recovery.begin_overlay(case.directory, selected_by_field)
-        await receipts.lock(database, schema, (*receipts.ROOTS, "overlay_next"))
+        await receipts.lock(database, schema, (*receipts.ROOTS, "overlay_next"), mode="ACCESS SHARE")
         await read_access.recheck_ordinary_read_access(database, selected_by_field["read_access"])
-        await receipts.retain(database, schema, selected_by_field["before"]["roots"][receipts.ROOTS[0]])
+        selected_by_field["retained_relations"] = {
+            receipts.ROOTS[0]: await receipts.retain(
+                database, schema, selected_by_field["before"]["roots"][receipts.ROOTS[0]], generation=generation
+            )
+        }
         await receipts.rename(database, schema, "overlay_next", receipts.ROOTS[0])
         await recovery.finish_overlay(case.directory, selected_by_field)
     resumed = await recovery.resume_overlay(case.directory, case.fence, request)
@@ -69,7 +73,7 @@ async def _publish_address(case, generation):
     }
     async with recovery.address_transaction(database, "50ms", _sql_literal, context_by_field):
         await recovery.prepare_address(database, schema, swaps, context_by_field)
-        await receipts.lock(database, schema, (*receipts.ROOTS, "address_next"))
+        await receipts.lock(database, schema, (*receipts.ROOTS, "address_next"), mode="ACCESS SHARE")
         await recovery.before_address(database, schema, swaps, context_by_field)
         await receipts.rename(database, schema, "address_next", receipts.ROOTS[1])
         await generations.publish_local_entity_address_generation(database, schema_name=schema)
@@ -99,10 +103,29 @@ async def _forward(case, generation):
     return await _state(case)
 
 
+async def _assert_native_published_reads_only(case, expected):
+    for root in receipts.ROOTS:
+        async with case.administrator.begin() as connection:
+            await connection.execute(text(f'SET LOCAL ROLE "{case.reader_role}"'))
+            assert (
+                await connection.scalar(text(f'SELECT count(*) FROM "{case.schema}"."{root}"'))
+                == expected["roots"][root]["rows"]
+            )
+        for command in (
+            f'UPDATE "{case.schema}"."{root}" SET marker=marker',
+            f'ALTER TABLE "{case.schema}"."{root}" ADD COLUMN forbidden text',
+        ):
+            with pytest.raises(DBAPIError):
+                async with case.administrator.begin() as connection:
+                    await connection.execute(text(f'SET LOCAL ROLE "{case.reader_role}"'))
+                    await connection.execute(text(command))
+
+
 @pytest.mark.asyncio
 async def test_native_ordinary_recovery_replays_and_preserves_failed_transaction(monkeypatch):
     async with ordinary_serving_case(monkeypatch) as case:
         baseline = await _state(case)
+        await _assert_native_published_reads_only(case, baseline)
         generation = recovery.publication_generation(case.pin)
         forward = await _forward(case, generation)
         task_by_field = {
@@ -139,6 +162,7 @@ async def test_native_ordinary_recovery_replays_and_preserves_failed_transaction
             outcome_by_field = await recovery._recover(case.directory, task_by_field)
         restored = await _state(case)
         assert restored["roots"] == baseline["roots"]
+        await _assert_native_published_reads_only(case, restored)
         assert (
             restored["metadata"]["address"]["local_generation"]
             == forward["metadata"]["address"]["local_generation"] + 1
@@ -217,7 +241,7 @@ async def test_native_access_and_cleanup_refuse_substituted_relations(monkeypatc
         await database.status(f"INSERT INTO {table} VALUES ('replacement')")
         replacement = await artifacts._catalog(directory, name)
         assert tuple(replacement) != created_by_relation[name]
-        with pytest.raises(RuntimeError, match="rest_artifact_cleanup_custody_changed"):
+        with pytest.raises(RuntimeError, match="rest_artifact_cleanup_layout_changed"):
             await artifacts._cleanup(directory, created_by_relation)
         assert await artifacts._catalog(directory, name) == replacement
         assert await database.scalar(f"SELECT marker FROM {table}") == "replacement"
@@ -237,6 +261,27 @@ async def test_native_geo_restore_accepts_absent_optional_table(monkeypatch):
         assert await _state(case) == without_geo
 
 
+@pytest.mark.parametrize("version", [None, 1])
+async def test_native_geo_restore_preserves_unprojected_null_and_refuses_active_null(monkeypatch, version):
+    """A null signature is valid only when no active projection is declared."""
+    async with ordinary_serving_case(monkeypatch) as case:
+        baseline = await _state(case)
+        assert baseline["metadata"]["geo"]["version"] is None
+        assert baseline["metadata"]["geo"]["signature"] is None
+        requested_by_field = {
+            **baseline,
+            "metadata": {**baseline["metadata"], "geo": {**baseline["metadata"]["geo"], "version": version}},
+        }
+        if version is None:
+            async with case.database.transaction():
+                await recovery._restore_geo(case.database, case.schema, requested_by_field)
+        else:
+            with pytest.raises(ValueError, match="geo_dependencies_changed"):
+                async with case.database.transaction():
+                    await recovery._restore_geo(case.database, case.schema, requested_by_field)
+        assert await _state(case) == baseline
+
+
 async def _refuse_late_source(case, task_by_field, restored):
     await case.database.status(
         f"UPDATE \"{case.schema}\".provider_directory_endpoint_dataset SET dataset_hash=repeat('b',64) "
@@ -249,21 +294,22 @@ async def _refuse_late_source(case, task_by_field, restored):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["content", "acl", "occupied"])
+@pytest.mark.parametrize("damage", ["content", "layout", "occupied"])
 async def test_native_recovery_refuses_retained_drift(monkeypatch, damage):
     async with ordinary_serving_case(monkeypatch) as case:
         baseline = await _state(case)
         generation = recovery.publication_generation(case.pin)
         forward = await _forward(case, generation)
-        previous = receipts.retained_name(baseline["roots"][receipts.ROOTS[0]]["native"]["oid"])
+        previous = receipts.retained_name(generation, receipts.ROOTS[0])
         if damage == "content":
-            await case.database.status(f'UPDATE "{case.schema}"."{previous}" SET marker=\'changed\'')
+            async with case.administrator.begin() as connection:
+                await connection.execute(text(f'UPDATE "{case.schema}"."{previous}" SET marker=\'changed\''))
             error = "content_changed"
-        elif damage == "acl":
-            await case.database.status(f'GRANT UPDATE(marker) ON "{case.schema}"."{previous}" TO PUBLIC')
-            error = "native_acl_changed"
+        elif damage == "layout":
+            await case.database.status(f'ALTER TABLE "{case.schema}"."{previous}" ADD COLUMN extra text')
+            error = "relation_changed"
         else:
-            occupied = receipts.retained_name(forward["roots"][receipts.ROOTS[0]]["native"]["oid"])
+            occupied = receipts.retained_name(generation, receipts.ROOTS[0], phase="recovered")
             await case.database.status(f'CREATE TABLE "{case.schema}"."{occupied}" (marker text)')
             error = "retained_name_occupied"
         task_by_field = {
@@ -355,13 +401,13 @@ async def test_native_metadata_refuses_ambiguous_receipt_tips(monkeypatch):
                 await receipts.metadata(case.database, case.schema)
 
 
-async def _wait_for_lock(database, relation_oid):
+async def _wait_for_lock(database, relation_name):
     async with asyncio.timeout(3):
         while not await database.scalar(
             "SELECT EXISTS(SELECT FROM pg_locks pending JOIN pg_stat_activity activity ON activity.pid=pending.pid "
             "WHERE activity.usename=current_user AND pending.pid<>pg_backend_pid() "
-            "AND pending.relation=CAST(:relation_oid AS oid) AND NOT pending.granted)",
-            relation_oid=relation_oid,
+            "AND pending.relation=to_regclass(:relation_name) AND NOT pending.granted)",
+            relation_name=relation_name,
         ):
             await asyncio.sleep(0.01)
 
@@ -401,7 +447,7 @@ async def test_native_cancellation_drains_owned_copy_and_cleanup(monkeypatch, op
                     else _copy_again(case, name, admission)
                 )
                 operation = asyncio.create_task(pending)
-                await _wait_for_lock(database, created_by_relation[name][0])
+                await _wait_for_lock(database, receipts.qualified(schema, name))
                 operation.cancel()
                 await asyncio.sleep(0)
                 if operation_kind == "cleanup":
@@ -418,3 +464,58 @@ async def test_native_cancellation_drains_owned_copy_and_cleanup(monkeypatch, op
             assert await database.scalar(f'SELECT count(*) FROM "{schema}"."{name}"') == 1
             await artifacts._cleanup(directory, created_by_relation)
             assert await artifacts._catalog(directory, name) is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_recovery_resolves_named_data_without_rewriting_original_document(monkeypatch):
+    """An old saved chain remains raw while its unique retained data works on this database."""
+    async with ordinary_serving_case(monkeypatch) as case:
+        baseline = await _state(case)
+        generation = recovery.publication_generation(case.pin)
+        await _publish_overlay(case, generation)
+        async with case.database.transaction():
+            await receipts.rename(
+                case.database, case.schema, receipts.retained_name(generation, receipts.ROOTS[0]), "pdsrv_r_a1"
+            )
+        table = receipts.qualified(case.schema, receipts.JOURNAL)
+        async with case.database.transaction():
+            _session, driver, _actor = await receipts.ordinary(case.database)
+            old = await driver.fetchval(
+                f"SELECT document FROM {table} WHERE generation=$1::uuid AND phase='overlay'", generation
+            )
+            old = recovery.decoded(old)
+            old["version"] = 1
+            old["writer"] = {"backend": "copied opaque token", "xid": None}
+            old["preparation"].pop("retained_relations", None)
+            for state in (old["before"], old["after"]):
+                state.pop("protocol", None)
+                state["metadata"]["relations"] = [0, 0, 0, 0, 0, 0, 0]
+                for relation_by_field in state["roots"].values():
+                    relation_by_field["native"].pop("schema", None)
+                    relation_by_field["native"].update(oid="copied opaque table", relowner=None, acl={})
+            await driver.execute(
+                f"UPDATE {table} SET document=$2::jsonb,document_sha256=encode(sha256(convert_to(($2::jsonb)::text,'UTF8')),'hex') WHERE generation=$1::uuid AND phase='overlay'",
+                generation,
+                recovery.encoded(old),
+            )
+            saved = await driver.fetchrow(
+                f"SELECT document::text,document_sha256 FROM {table} WHERE generation=$1::uuid AND phase='overlay'",
+                generation,
+            )
+        await recovery._recover(
+            case.directory,
+            {
+                recovery.OPERATION_PARAM: "recover",
+                recovery.GENERATION_PARAM: generation,
+                "source_ids": [case.pin["source_id"]],
+            },
+        )
+        assert (await _state(case))["roots"] == baseline["roots"]
+        async with case.database.transaction():
+            _session, driver, _actor = await receipts.ordinary(case.database)
+            assert tuple(
+                await driver.fetchrow(
+                    f"SELECT document::text,document_sha256 FROM {table} WHERE generation=$1::uuid AND phase='overlay'",
+                    generation,
+                )
+            ) == tuple(saved)

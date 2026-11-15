@@ -25,7 +25,7 @@ OWNER = "run_" + "a" * 32
 
 def _original_authority(geometry, target_by_field):
     """Use a genuine signed initial guard and its immutable, now expired consumption."""
-    execution = _selection()
+    execution = _selection(geometry.profile_as_of)
     source_pairs = tuple((pair["source_id"], pair["dataset_id"]) for pair in execution.attestation.pairs)
     geometry = replace(
         geometry,
@@ -36,6 +36,7 @@ def _original_authority(geometry, target_by_field):
         profile_strategy_version=execution.attestation.profile_strategy_version,
         desired_source_vector_hash=fhir._provider_directory_profile_source_vector_hash(source_pairs),
         initial_target_state_sha256=contract.target_state_sha256(target_by_field),
+        relations={**geometry.relations, "initial_receipt": {**geometry.relations["initial_receipt"], "schema": "mrf"}},
         **{
             name: observed
             for name, observed in target_by_field.items()
@@ -43,9 +44,7 @@ def _original_authority(geometry, target_by_field):
         },
     )
     accepted = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=2)
-    database = SimpleNamespace(
-        **vars(geometry), temp_tablespace_oid=geometry.tablespace_oid, temp_tablespace_name=geometry.tablespace_name
-    )
+    database = SimpleNamespace(**vars(geometry))
     envelope, receipt = signed_initial_envelope(geometry, database, target_by_field, execution, accepted)
     trust = capacity_trust_from_envelope(envelope)
     lease, consumed = _consume_replay_authority(
@@ -71,19 +70,8 @@ def _manifest_fixture(monkeypatch, *, drift=True):
     original = _target()
     geometry, checkpoint, owner, consumed, trust = _original_authority(_geometry(), original)
     current = {**original, "profile_target_bytes": original["profile_target_bytes"] + 8192} if drift else original
-    targets = contract.InitialTargets(current["evidence_target_oid"], current["profile_target_oid"], current)
+    targets = contract.InitialTargets(targets=current["targets"], payload=current)
     monkeypatch.setattr(initial, "capture_targets", AsyncMock(return_value=targets))
-    monkeypatch.setattr(
-        initial,
-        "receipt_layout",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                relation_oid=geometry.initial_receipt_oid,
-                exact_fingerprint=geometry.initial_receipt_storage_fingerprint,
-                effective_tablespace_oids=(geometry.tablespace_oid,),
-            )
-        ),
-    )
     rows = [SimpleNamespace(_mapping=consumed)]
     monkeypatch.setattr(fhir.db, "all", AsyncMock(return_value=rows))
     monkeypatch.setattr(fhir.db, "scalar", AsyncMock(return_value=False))
@@ -126,7 +114,7 @@ async def test_exact_target_fast_path_requires_no_historical_trust(monkeypatch):
         ("ambiguous", "replay_consumption_ambiguous"),
         ("signature", "replay_capacity_invalid"),
         ("guard", "replay_capacity_invalid"),
-        ("database", "replay_capacity_invalid"),
+        ("runtime", "replay_capacity_invalid"),
         ("geometry", "replay_capacity_invalid"),
         ("source", "replay_capacity_consumption_changed"),
         ("context", "replay_capacity_consumption_changed"),
@@ -149,19 +137,25 @@ async def test_size_drift_refuses_unbound_or_forged_original_authority(monkeypat
             consumption_rows.clear()
         case "ambiguous":
             consumption_rows.append(consumption_rows[0])
-        case "guard" | "database":
+        case "guard" | "runtime":
             body = json.loads(consumed["canonical_lease_json"])
             if fault == "guard":
                 body["signing_preflight_guard"]["healthcare_receipt"]["serving_generation_preflight"][
                     "profile_rows"
                 ] = 1
             else:
-                body["database_oid"] += 1
+                body["runtime"]["healthcare_source_commit"] = "0" * 40
             consumed["canonical_lease_json"] = cleanup.canonical(body)
         case "signature":
             consumed["signature"] = "A" * 86
         case "geometry":
-            geometry = replace(geometry, initial_receipt_oid=geometry.initial_receipt_oid + 1)
+            geometry = replace(
+                geometry,
+                relations={
+                    **geometry.relations,
+                    "initial_receipt": {**geometry.relations["initial_receipt"], "name": "other_receipt"},
+                },
+            )
         case "source" | "context":
             consumed["source_vector_hash" if fault == "source" else "source_context_vector_hash"] = "ff" * 32
         case "purpose":
@@ -192,10 +186,10 @@ async def test_size_drift_refuses_unbound_or_forged_original_authority(monkeypat
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("evidence_target_oid", 20003),
-        ("profile_target_oid", 20004),
-        ("evidence_target_storage_fingerprint", "00" * 32),
-        ("profile_target_storage_fingerprint", "00" * 32),
+        ("targets", {**_target()["targets"], "evidence": {"schema": "other_results", "name": "evidence"}}),
+        ("targets", {**_target()["targets"], "profile": {"schema": "mrf", "name": "other_profile"}}),
+        ("contract_id", "healthporta.provider-directory-profile-initial-target-state.v1"),
+        ("targets", {role: _target()["targets"]["evidence"] for role in ("evidence", "profile")}),
         ("evidence_rows", 1),
         ("profile_rows", 1),
         ("serving_singleton_absent", False),

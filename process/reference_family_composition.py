@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 class ReferenceModelContribution:
     """Compiled source replacement or exact-key effects, never caller-supplied SQL.
 
-    Effects use the declared primary key plus destination_oid, before_image and
+    Effects use the declared destination and primary key plus before_image and
     after_image. A NULL after_image deletes that key; rollback callers must
     supply authenticated inverse effects rather than restore an old whole family.
     """
@@ -89,9 +89,7 @@ def _require_composition_effect_model(contribution, incoming_spec):
     keys = tuple(contribution.model_type.__table__.primary_key.columns.keys())
     if (
         tuple(effects.primary_key.columns.keys()) != keys
-        or not {"destination_oid", "before_image", "after_image"}.issubset(effects.c.keys())
-        or not isinstance(effects.c.destination_oid.type, postgresql.OID)
-        or effects.c.destination_oid.nullable
+        or not {"before_image", "after_image"}.issubset(effects.c.keys())
         or any(not isinstance(effects.c[name].type, postgresql.JSONB) for name in ("before_image", "after_image"))
         or tuple(column for column in _composition_columns(effect_model) if column[0] in keys)
         != tuple(column for column in _composition_columns(contribution.model_type) if column[0] in keys)
@@ -110,14 +108,12 @@ def _require_composition_custody(spec, ownership, incumbent, incoming_spec, inco
         or incumbent.importer_id != spec.importer_id
         or incoming.importer_id != incoming_spec.importer_id
         or tuple(name for name, _ in incumbent.relation_oids) != spec.table_names
-        or any(type(oid) is not int or oid <= 0 for _, oid in incumbent.relation_oids)
+        or ownership.relation_names != tuple(sorted(spec.table_names))
+        or incoming.relation_names != tuple(sorted(incoming_spec.table_names))
+        or any(address is None for _name, address in incumbent.relation_oids)
         or len({ownership.schema_name, incoming.schema_name, incumbent.schema_name}) != 3
     ):
         raise native.ReferenceFamilyArchiveError("model composition custody differs")
-    inventories = (ownership.relation_oids, incoming.relation_oids, incumbent.relation_oids)
-    all_oids = [oid for inventory in inventories for _, oid in inventory]
-    if any(type(oid) is not int or oid <= 0 for oid in all_oids) or len(set(all_oids)) != len(all_oids):
-        raise native.ReferenceFamilyArchiveError("model composition relations overlap")
     for schema_name in (ownership.schema_name, incoming.schema_name, incumbent.schema_name):
         native._schema_name(schema_name)
 
@@ -128,14 +124,17 @@ async def _lock_composition_inputs(session, spec, ownership, incumbent, incoming
 
     lock_groups = (
         (ownership.schema_name, spec.table_names, "ACCESS EXCLUSIVE"),
-        (incoming.schema_name, incoming_spec.table_names, "SHARE"),
-        (incumbent.schema_name, spec.table_names, "SHARE"),
+        (incoming.schema_name, incoming_spec.table_names, "ACCESS SHARE"),
+        (incumbent.schema_name, spec.table_names, "ACCESS SHARE"),
     )
     for schema_name, table_names, mode in sorted(lock_groups):
         await native._lock_family(session, schema_name, tuple(sorted(table_names)), mode, nowait=True)
     await native.verify_model_family_stage_ownership(session, spec, ownership)
     await native.verify_model_family_stage_ownership(session, incoming_spec, incoming)
-    if await native._incumbent_pairs(session, spec, incumbent.schema_name) != incumbent.relation_oids:
+    if tuple(
+        (name, address is not None)
+        for name, address in await native._incumbent_pairs(session, spec, incumbent.schema_name)
+    ) != tuple((name, address is not None) for name, address in incumbent.relation_oids):
         raise native.ReferenceFamilyArchiveError("model composition incumbent changed")
     await native.require_native_read_catalog(
         session,
@@ -231,19 +230,21 @@ async def _validate_composition_effects(session, contribution, live, incoming, i
     effects = f"{native._quoted(incoming_schema)}.{native._quoted(contribution.effect_model.__tablename__)}"
     keys = tuple(model.__table__.primary_key.columns.keys())
     null_keys = " OR ".join(f"effect.{native._quoted(name)} IS NULL" for name in keys)
+    destination = f"{native._quoted(native._schema_name(incumbent.schema_name))}.{native._quoted(model.__tablename__)}"
+    source = f"{native._quoted(native._schema_name(incoming_schema))}.{native._quoted(contribution.incoming_model.__tablename__)}"
+    if live != destination or incoming != source:
+        raise native.ReferenceFamilyArchiveError("model composition effect destination differs")
     violates = await session.scalar(
         text(
             f"SELECT EXISTS(SELECT 1 FROM {effects} effect LEFT JOIN {live} live "
             f"ON {native._dictionary_key_join(model, 'effect', 'live')} "
-            "WHERE effect.destination_oid IS DISTINCT FROM :incumbent_oid "
-            "OR effect.before_image IS DISTINCT FROM pg_catalog.to_jsonb(live)) "
+            "WHERE effect.before_image IS DISTINCT FROM pg_catalog.to_jsonb(live)) "
             f"OR EXISTS(SELECT 1 FROM {effects} effect FULL JOIN {incoming} incoming "
             f"ON {native._dictionary_key_join(model, 'effect', 'incoming')} "
-            f"WHERE effect.destination_oid IS NULL OR {null_keys} "
+            f"WHERE {null_keys} "
             "OR effect.after_image IS DISTINCT FROM pg_catalog.to_jsonb(incoming)) "
             f"OR EXISTS(SELECT 1 FROM {effects} GROUP BY {','.join(native._quoted(name) for name in keys)} HAVING count(*)>1)"
         ),
-        {"incumbent_oid": dict(incumbent.relation_oids)[model.__tablename__]},
     )
     if violates is not False:
         raise native.ReferenceFamilyArchiveError("model composition effect preimage or payload differs")
@@ -268,10 +269,9 @@ async def compose_model_family_stage(
     if not isinstance(source_copy, native.ReferenceFamilySourceCopy) or source_copy.timeout > 86400:
         raise native.ReferenceFamilyArchiveError("model composition COPY capability is unavailable")
     async with asyncio.timeout(source_copy.timeout) as deadline, native._bounded_capture(session):
+        ownership = await native.verify_model_family_stage_ownership(session, spec, ownership)
+        incoming = await native.verify_model_family_stage_ownership(session, incoming_spec, incoming)
         await _lock_composition_inputs(session, spec, ownership, incumbent, incoming_spec, incoming)
-        transaction_id = await session.scalar(text("SELECT pg_current_xact_id()::text"))
-        if not isinstance(transaction_id, str) or not transaction_id.isdecimal():
-            raise native.ReferenceFamilyArchiveError("model composition transaction is unavailable")
         for contribution in contributions:
             await _validate_composition_scope(session, contribution, incumbent, incoming.schema_name)
         projections = tuple(
@@ -292,11 +292,10 @@ async def compose_model_family_stage(
                 parameters_by_field,
             ):
                 raise native.ReferenceFamilyArchiveError("model composition candidate rows differ")
-        if (
-            not session.in_transaction()
-            or await session.scalar(text("SELECT pg_current_xact_id()::text")) != transaction_id
-            or await native._incumbent_pairs(session, spec, incumbent.schema_name) != incumbent.relation_oids
-        ):
+        if not session.in_transaction() or tuple(
+            (name, address is not None)
+            for name, address in await native._incumbent_pairs(session, spec, incumbent.schema_name)
+        ) != tuple((name, address is not None) for name, address in incumbent.relation_oids):
             raise native.ReferenceFamilyArchiveError("model composition transaction or incumbent changed")
         await native.verify_model_family_stage_ownership(session, incoming_spec, incoming)
         await native.verify_model_family_stage_ownership(session, spec, ownership)

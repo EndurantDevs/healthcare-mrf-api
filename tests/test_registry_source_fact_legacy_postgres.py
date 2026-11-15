@@ -23,6 +23,7 @@ from process.registry_membership_composition_stage import (
     materialize_registry_composition,
     stage_approved_membership_commands,
 )
+from process.registry_named_preparation_records import SnapshotContractError
 from process.registry_source_contribution_store import (
     SUMMARY_KEY,
     contribution_fact_sha256,
@@ -179,13 +180,22 @@ async def _restore_pending(context, copy_target, original):
     )
 
 
-async def test_registered_v1_pending_candidate_rejects_forgery_and_finishes_exactly(provider_only_db, monkeypatch):
-    context, fixture = provider_only_db, provider_only_db.fixture
-    identity = uuid4()
+async def _prepared_pending_candidate(context, address):
+    """Register and prepare one legacy pending candidate under its own identity."""
+    fixture, identity = context.fixture, uuid4()
     copy_target = MembershipCopyTarget(
         *(str(uuid4()) for _ in range(3)), str(identity), "network_candidate_" + identity.hex
     )
     context.copy_targets.append(copy_target)
+    await _register_pending(context, copy_target, address)
+    await prepare_network_candidate(
+        fixture.connection, copy_target, address, **fixture.writer_roles, control_schema=fixture.control_schema
+    )
+    return copy_target
+
+
+async def test_registered_v1_pending_candidate_rejects_forgery_and_finishes_exactly(provider_only_db, monkeypatch):
+    context, fixture = provider_only_db, provider_only_db.fixture
     address = PinnedAddressSource(
         context.manifest.schema_name, "entity_address_unified", context.manifest.manifest_sha256
     )
@@ -194,25 +204,22 @@ async def test_registered_v1_pending_candidate_rejects_forgery_and_finishes_exac
         pytest.fail("legacy pending resume reread unchanged FHIR payloads")
 
     monkeypatch.setattr(composition, "_read_recipe_page", forbidden)
-    await _register_pending(context, copy_target, address)
-    await prepare_network_candidate(
-        fixture.connection, copy_target, address, **fixture.writer_roles, control_schema=fixture.control_schema
-    )
+    copy_target = await _prepared_pending_candidate(context, address)
     original = await _candidate(context, copy_target)
     await _forge_receipt(context, copy_target, original)
     with pytest.raises(ValueError):
         await fixture.seal_candidate(copy_target)
-    assert (
-        await fixture.connection.fetchval(
-            f'SELECT count(*) FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1', identity
-        )
-        == 0
-    )
+    assert (await _candidate(context, copy_target))["state"] != "published"
+    # The handed-off generation was admitted with the forged receipt; restoring rows cannot re-admit it.
     await _restore_pending(context, copy_target, original)
-    await fixture.seal_candidate(copy_target)
+    with pytest.raises(SnapshotContractError, match="admission_changed"):
+        await fixture.seal_candidate(copy_target)
+    replacement = await _prepared_pending_candidate(context, address)
+    expected = await _candidate(context, replacement)
+    await fixture.seal_candidate(replacement)
     await prepare_and_publish_network_candidate(
         fixture.connection,
-        copy_target,
+        replacement,
         address,
         **fixture.writer_roles,
         control_schema=fixture.control_schema,
@@ -220,8 +227,8 @@ async def test_registered_v1_pending_candidate_rejects_forgery_and_finishes_exac
     )
     async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
         current = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
-    assert current.candidate_id == copy_target.candidate_id
-    restored = await _candidate(context, copy_target)
-    assert restored["source_generations"] == original["source_generations"]
-    assert verify_registry_source_contributions(restored)["revision"] == 1
+    assert current.candidate_id == replacement.candidate_id
+    published = await _candidate(context, replacement)
+    assert published["source_generations"] == expected["source_generations"]
+    assert verify_registry_source_contributions(published)["revision"] == 1
     assert (await _read(context, manifest=current))["total_count"] == 2

@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
 import importlib
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 
 import pytest
+from sqlalchemy.exc import DBAPIError
 
 from db.connection import Database
 from tests.ptg2_serving_address_evidence_postgres_support import (
     _create_geo_assurance_state_table,
 )
-
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
@@ -111,27 +111,36 @@ async def _temporary_schema():
 
 
 async def _prepare_live_and_stage(database: Database, schema: str) -> None:
-    await database.status(
-        f"CREATE TABLE {schema}.entity_address_unified "
-        "(marker text NOT NULL);"
-    )
-    await database.status(
-        f"INSERT INTO {schema}.entity_address_unified (marker) VALUES ('old');"
-    )
-    await database.status(
-        f"CREATE UNLOGGED TABLE {schema}.entity_address_unified_stage "
-        "(marker text NOT NULL);"
-    )
-    await database.status(
-        f"INSERT INTO {schema}.entity_address_unified_stage (marker) VALUES ('new');"
-    )
-    assert await database.scalar(
-        entity_address_unified._record_geo_assurance_candidate_sql(
-            schema,
-            "entity_address_unified_stage",
-            1,
+    from tests.test_entity_address_snapshot_destination import _publish_npi_fixture_generation
+
+    await database.status(f"CREATE TABLE {schema}.entity_address_unified (marker text NOT NULL);")
+    await database.status(f"INSERT INTO {schema}.entity_address_unified (marker) VALUES ('old');")
+    await database.status(f"CREATE UNLOGGED TABLE {schema}.entity_address_unified_stage (marker text NOT NULL);")
+    await database.status(f"INSERT INTO {schema}.entity_address_unified_stage (marker) VALUES ('new');")
+    await _publish_npi_fixture_generation(database, schema)
+    assert (
+        await database.scalar(
+            entity_address_unified._record_geo_assurance_candidate_sql(
+                schema,
+                "entity_address_unified_stage",
+                1,
+            )
         )
-    ) is not None
+        is not None
+    )
+
+
+async def _prepare_complete_live_and_stage(database: Database, schema: str) -> None:
+    from tests.test_entity_address_candidate_preparation_postgres import _prepare_geo_inputs
+
+    await _prepare_live_and_stage(database, schema)
+    await _prepare_geo_inputs(database, schema)
+
+
+def _candidate_context(schema):
+    return {
+        "geo_assurance_candidate_relation": {"schema_name": schema, "relation_name": "entity_address_unified_stage"}
+    }
 
 
 async def _relation_persistence(database: Database, schema: str, table_name: str) -> str | None:
@@ -155,9 +164,7 @@ async def _hold_access_share_lock(
     release_reader: asyncio.Event,
 ) -> None:
     async with database.transaction():
-        await database.status(
-            f"LOCK TABLE {schema}.entity_address_unified IN ACCESS SHARE MODE;"
-        )
+        await database.status(f"LOCK TABLE {schema}.entity_address_unified IN ACCESS SHARE MODE;")
         reader_ready.set()
         await release_reader.wait()
 
@@ -171,11 +178,7 @@ async def _observe_live_relation(
 ) -> None:
     while not stop_observer.is_set():
         try:
-            observed_marker_list.append(
-                await database.scalar(
-                    f"SELECT marker FROM {schema}.entity_address_unified;"
-                )
-            )
+            observed_marker_list.append(await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified;"))
         except Exception as exc:  # pragma: no cover - asserted empty
             observed_error_list.append(exc)
         await asyncio.sleep(0.002)
@@ -187,9 +190,7 @@ async def _start_reader_blocked_cutover(
 ) -> tuple[asyncio.Event, asyncio.Task, asyncio.Task]:
     reader_ready = asyncio.Event()
     release_reader = asyncio.Event()
-    reader_task = asyncio.create_task(
-        _hold_access_share_lock(reader_database, schema, reader_ready, release_reader)
-    )
+    reader_task = asyncio.create_task(_hold_access_share_lock(reader_database, schema, reader_ready, release_reader))
     await reader_ready.wait()
     publish_task = asyncio.create_task(
         entity_address_unified._publish_staged_entity_address_tables(
@@ -198,7 +199,7 @@ async def _start_reader_blocked_cutover(
             {},
             partial_support_patch=False,
             affected_group_table="",
-            context={},
+            context=_candidate_context(schema),
         )
     )
     return release_reader, reader_task, publish_task
@@ -241,13 +242,8 @@ async def _observe_completed_cutover(
 async def test_real_postgres_mid_swap_failure_restores_live_relation(monkeypatch):
     async with _temporary_schema() as (database, schema):
         monkeypatch.setattr(entity_address_unified, "db", database)
-        await database.status(
-            f"CREATE TABLE {schema}.entity_address_unified "
-            "(marker text NOT NULL);"
-        )
-        await database.status(
-            f"INSERT INTO {schema}.entity_address_unified (marker) VALUES ('old');"
-        )
+        await database.status(f"CREATE TABLE {schema}.entity_address_unified (marker text NOT NULL);")
+        await database.status(f"INSERT INTO {schema}.entity_address_unified (marker) VALUES ('old');")
 
         with pytest.raises(Exception, match="entity_address_unified_missing_stage"):
             async with database.transaction():
@@ -257,66 +253,127 @@ async def test_real_postgres_mid_swap_failure_restores_live_relation(monkeypatch
                     _MissingStageTable,
                 )
 
-        assert await database.scalar(
-            f"SELECT marker FROM {schema}.entity_address_unified;"
-        ) == "old"
-        assert await database.scalar(
-            "SELECT to_regclass(:relation_name) IS NULL;",
-            relation_name=f"{schema}.entity_address_unified_old",
-        ) is True
+        assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified;") == "old"
+        assert (
+            await database.scalar(
+                "SELECT to_regclass(:relation_name) IS NULL;",
+                relation_name=f"{schema}.entity_address_unified_old",
+            )
+            is True
+        )
 
 
 @pytest.mark.asyncio
 async def test_real_postgres_cutover_promotes_logged_relation(monkeypatch):
     async with _temporary_schema() as (database, schema):
         monkeypatch.setattr(entity_address_unified, "db", database)
-        await _prepare_live_and_stage(database, schema)
+        await _prepare_complete_live_and_stage(database, schema)
 
-        cutover_context_map = {}
-        await entity_address_unified._publish_staged_entity_address_tables(
-            schema,
-            _StageTable,
-            {},
-            partial_support_patch=False,
-            affected_group_table="",
-            context=cutover_context_map,
+        cutover_context_map = _candidate_context(schema)
+        async with _publication_actor(database, schema) as role:
+            await entity_address_unified._publish_staged_entity_address_tables(
+                schema,
+                _StageTable,
+                {},
+                partial_support_patch=False,
+                affected_group_table="",
+                context=cutover_context_map,
+            )
+            await _assert_retained_publication(database, schema, cutover_context_map, role)
+
+        assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified;") == "new"
+        assert (
+            await _relation_persistence(
+                database,
+                schema,
+                "entity_address_unified",
+            )
+            == "p"
         )
-
-        assert await database.scalar(
-            f"SELECT marker FROM {schema}.entity_address_unified;"
-        ) == "new"
-        assert await database.scalar(
-            f"SELECT marker FROM {schema}.entity_address_unified_old;"
-        ) == "old"
-        assert await _relation_persistence(
-            database,
-            schema,
-            "entity_address_unified",
-        ) == "p"
-        assert await database.scalar(
-            """
+        assert (
+            await database.scalar(
+                """
             SELECT last_analyze IS NOT NULL
               FROM pg_stat_all_tables
              WHERE schemaname = :schema
                AND relname = 'entity_address_unified';
             """,
-            schema=schema,
-        ) is True
-        assert await database.scalar(
-            f"SELECT candidate_table_oid IS NULL "
-            f"FROM {schema}.entity_address_geo_assurance_state"
-        ) is True
-        assert cutover_context_map["geo_assurance_active_table_oid"] == await database.scalar(
-            f"SELECT '{schema}.entity_address_unified'::regclass::oid::bigint"
+                schema=schema,
+            )
+            is True
         )
+        assert (
+            await database.scalar(
+                f"SELECT candidate_table_oid IS NULL FROM {schema}.entity_address_geo_assurance_state"
+            )
+            is True
+        )
+        assert cutover_context_map["geo_assurance_active_version"] == await database.scalar(
+            f"SELECT active_geo_assurance_version FROM {schema}.entity_address_geo_assurance_state"
+        )
+        assert cutover_context_map["geo_assurance_active_relation"] == {
+            "schema_name": schema,
+            "relation_name": "entity_address_unified",
+        }
+
+
+@asynccontextmanager
+async def _publication_actor(database, schema):
+    """Give a real ordinary actor writes before publication and clean its exact grants."""
+    role = "address_reader_" + uuid.uuid4().hex
+    assert not await database.scalar("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=:role)", role=role)
+    has_attempted_creation = False
+    try:
+        has_attempted_creation = True
+        await database.status(f'CREATE ROLE "{role}" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE')
+        await database.status(f'GRANT USAGE ON SCHEMA "{schema}" TO "{role}"')
+        await database.status(
+            f'GRANT SELECT,INSERT,UPDATE,DELETE,TRUNCATE ON "{schema}".entity_address_unified,'
+            f'"{schema}".entity_address_unified_stage TO "{role}"'
+        )
+        yield role
+    finally:
+        if has_attempted_creation and await database.scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=:role)", role=role
+        ):
+            await database.status(f'DROP OWNED BY "{role}"')
+            await database.status(f'DROP ROLE "{role}"')
+            assert not await database.scalar("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=:role)", role=role)
+
+
+async def _assert_retained_publication(database, schema, context, role):
+    """The previous snapshot stays readable under its exact name while both copies reject writes."""
+    (retained,) = context["retained_relations"]
+    assert retained["schema_name"] == schema
+    assert retained["relation_name"].startswith("entity_address_unified_retained_")
+    async with database.transaction():
+        await database.status(f'SET LOCAL ROLE "{role}"')
+        for name, marker in ((retained["relation_name"], "old"), ("entity_address_unified", "new")):
+            relation = f'"{schema}"."{name}"'
+            assert await database.scalar(f"SELECT marker FROM {relation}") == marker
+            for statement in (
+                f"INSERT INTO {relation} VALUES('changed')",
+                f"UPDATE {relation} SET marker='changed'",
+                f"DELETE FROM {relation}",
+                f"TRUNCATE {relation}",
+            ):
+                await _assert_publication_write_denied(database, statement)
+            assert await database.scalar(f"SELECT marker FROM {relation}") == marker
+
+
+async def _assert_publication_write_denied(database, statement):
+    with pytest.raises(DBAPIError) as denied:
+        async with database.transaction():
+            await database.status(statement)
+    assert getattr(denied.value.orig, "sqlstate", None) == "42501"
 
 
 @pytest.mark.asyncio
 async def test_stale_geo_receipt_rolls_back_cutover_and_activation(monkeypatch):
     async with _temporary_schema() as (database, schema):
         monkeypatch.setattr(entity_address_unified, "db", database)
-        await _prepare_live_and_stage(database, schema)
-        await database.status(f"CREATE TABLE {schema}.npi_address (npi bigint)")
+        await _prepare_complete_live_and_stage(database, schema)
+        await database.status(f"DROP TABLE {schema}.npi_address")
 
         with pytest.raises(
             RuntimeError,
@@ -328,66 +385,58 @@ async def test_stale_geo_receipt_rolls_back_cutover_and_activation(monkeypatch):
                 {},
                 partial_support_patch=False,
                 affected_group_table="",
-                context={},
+                context=_candidate_context(schema),
             )
 
-        assert await database.scalar(
-            f"SELECT marker FROM {schema}.entity_address_unified"
-        ) == "old"
-        assert await database.scalar(
-            f"SELECT marker FROM {schema}.entity_address_unified_stage"
-        ) == "new"
-        assert await database.scalar(
-            f"SELECT to_regclass('{schema}.entity_address_unified_old') IS NULL"
-        ) is True
+        assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified") == "old"
+        assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified_stage") == "new"
+        assert await database.scalar(f"SELECT to_regclass('{schema}.entity_address_unified_old') IS NULL") is True
         state = await database.first(
-            f"SELECT active_table_oid, candidate_table_oid "
-            f"FROM {schema}.entity_address_geo_assurance_state"
+            f"SELECT active_geo_assurance_version, candidate_geo_assurance_version FROM {schema}.entity_address_geo_assurance_state"
         )
-        assert state.active_table_oid is None
-        assert state.candidate_table_oid is not None
+        assert state.active_geo_assurance_version is None
+        assert state.candidate_geo_assurance_version is not None
 
 
 @pytest.mark.asyncio
 async def test_real_postgres_cutover_promotes_logged_support_relation(monkeypatch):
     async with _temporary_schema() as (database, schema):
         monkeypatch.setattr(entity_address_unified, "db", database)
-        await _prepare_live_and_stage(database, schema)
-        await database.status(
-            f"CREATE TABLE {schema}.entity_address_evidence (marker text NOT NULL);"
-        )
-        await database.status(
-            f"INSERT INTO {schema}.entity_address_evidence (marker) VALUES ('old-support');"
-        )
-        await database.status(
-            f"CREATE UNLOGGED TABLE {schema}.entity_address_evidence_stage "
-            "(marker text NOT NULL);"
-        )
-        await database.status(
-            f"INSERT INTO {schema}.entity_address_evidence_stage (marker) "
-            "VALUES ('new-support');"
-        )
+        await _prepare_complete_live_and_stage(database, schema)
+        await database.status(f"CREATE TABLE {schema}.entity_address_evidence (marker text NOT NULL);")
+        await database.status(f"INSERT INTO {schema}.entity_address_evidence (marker) VALUES ('old-support');")
+        await database.status(f"CREATE UNLOGGED TABLE {schema}.entity_address_evidence_stage (marker text NOT NULL);")
+        await database.status(f"INSERT INTO {schema}.entity_address_evidence_stage (marker) VALUES ('new-support');")
 
+        cutover_context = _candidate_context(schema)
         await entity_address_unified._publish_staged_entity_address_tables(
             schema,
             _StageTable,
             {_SupportLiveTable: _SupportStageTable},
             partial_support_patch=False,
             affected_group_table="",
-            context={},
+            context=cutover_context,
         )
 
-        assert await database.scalar(
-            f"SELECT marker FROM {schema}.entity_address_evidence;"
-        ) == "new-support"
-        assert await database.scalar(
-            f"SELECT marker FROM {schema}.entity_address_evidence_old;"
-        ) == "old-support"
-        assert await _relation_persistence(
-            database,
-            schema,
-            "entity_address_evidence",
-        ) == "p"
+        assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_evidence;") == "new-support"
+        retained_by_target = {
+            entry["relation_name"].split("_retained_", 1)[0]: entry for entry in cutover_context["retained_relations"]
+        }
+        assert set(retained_by_target) == {"entity_address_unified", "entity_address_evidence"}
+        retained_support = retained_by_target["entity_address_evidence"]
+        assert retained_support["schema_name"] == schema
+        assert (
+            await database.scalar(f'SELECT marker FROM "{schema}"."{retained_support["relation_name"]}"')
+            == "old-support"
+        )
+        assert (
+            await _relation_persistence(
+                database,
+                schema,
+                "entity_address_evidence",
+            )
+            == "p"
+        )
 
 
 @pytest.mark.asyncio
@@ -404,7 +453,7 @@ async def test_real_postgres_reader_does_not_create_missing_relation_window(
         monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_ATTEMPTS", "20")
         monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_BACKOFF_MS", "20")
         monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_MAX_BACKOFF_MS", "50")
-        await _prepare_live_and_stage(publisher_database, schema)
+        await _prepare_complete_live_and_stage(publisher_database, schema)
         release_reader, reader_task, publish_task = await _start_reader_blocked_cutover(
             reader_database,
             schema,
@@ -414,9 +463,7 @@ async def test_real_postgres_reader_does_not_create_missing_relation_window(
             await asyncio.sleep(0.05)
             assert not publish_task.done()
             started = time.monotonic()
-            assert await observer_database.scalar(
-                f"SELECT marker FROM {schema}.entity_address_unified;"
-            ) == "old"
+            assert await observer_database.scalar(f"SELECT marker FROM {schema}.entity_address_unified;") == "old"
             assert time.monotonic() - started < 0.5
             observed_marker_list, observed_error_list = await _observe_completed_cutover(
                 observer_database,
@@ -429,11 +476,14 @@ async def test_real_postgres_reader_does_not_create_missing_relation_window(
             assert observed_error_list == []
             assert set(observed_marker_list) <= {"old", "new"}
             assert "new" in observed_marker_list
-            assert await _relation_persistence(
-                publisher_database,
-                schema,
-                "entity_address_unified",
-            ) == "p"
+            assert (
+                await _relation_persistence(
+                    publisher_database,
+                    schema,
+                    "entity_address_unified",
+                )
+                == "p"
+            )
         finally:
             release_reader.set()
             if not reader_task.done():

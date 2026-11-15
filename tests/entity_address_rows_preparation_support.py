@@ -218,6 +218,6 @@ async def preparation_admission(sql, database, schema, monkeypatch, inventories,
     try:
         yield authority, scope
     finally:
-        for name in tuple(scope.owned_oids):
+        for name in tuple(scope.owned_relations):
             await admitted.drop_stage(schema, name)
         admitted._ADMISSION.reset(token)

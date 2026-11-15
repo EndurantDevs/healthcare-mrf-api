@@ -12,15 +12,15 @@ import pytest
 from process import registry_candidate_composition as composition
 from process import registry_publication_worker as worker
 from process.network_address_projection import PinnedAddressSource
+from process.network_compact_layout import CompactAddressRelation
 from process.network_em_provider_inputs import _ROLES, EMProviderInputRelation, EMProviderInputs
 from process.network_serving_read import PinnedNetworkServingManifest
-from process.registry_source_recipe_composition import RegistrySourceRecipeStage
 
 
 def _inputs():
     return EMProviderInputs(
         tuple(
-            EMProviderInputRelation(role, "retained_provider", "held_" + str(i), "edition-one", 100 + i, 200 + i)
+            EMProviderInputRelation(role, "retained_provider", "held_" + str(i), "edition-one")
             for i, role in enumerate(_ROLES)
         )
     )
@@ -35,7 +35,14 @@ def _sources(inputs=None):
 def _manifest(generations):
     identity = UUID("11111111-1111-4111-8111-111111111111")
     return PinnedNetworkServingManifest(
-        3, str(identity), "network_candidate_" + identity.hex, 1, generations, 2, "f" * 64, 1000
+        3,
+        str(identity),
+        "network_candidate_" + identity.hex,
+        1,
+        generations,
+        2,
+        "f" * 64,
+        CompactAddressRelation("network_candidate_" + identity.hex, "entity_address_unified"),
     )
 
 
@@ -131,7 +138,7 @@ async def test_stale_retained_dependencies_cannot_be_silently_dropped(monkeypatc
 
 @pytest.mark.asyncio
 async def test_provider_digest_enters_identity_before_candidate_creation_and_record(monkeypatch):
-    connection = SimpleNamespace(execute=AsyncMock())
+    connection = SimpleNamespace(execute=AsyncMock(), fetch=AsyncMock(return_value=[{"recorded": True}]))
     request_id = UUID("22222222-2222-4222-8222-222222222222")
     address_sources = _sources(_inputs())
     receipt_by_field = {"receipt_sha256": "a" * 64}
@@ -177,6 +184,8 @@ async def test_provider_digest_enters_identity_before_candidate_creation_and_rec
         connection, request_id, 2, 0, address_sources, None, roles_by_kind, "registry"
     )
     assert calls == [("create", prepared_snapshot[0]), ("record", prepared_snapshot[0])]
+    # The open admission also records its qualified address binding once.
+    assert connection.fetch.await_args.args[3] == address_sources.base_source.generation_id
     connection.execute.assert_awaited_once_with(
         "CREATE INDEX IF NOT EXISTS provider_location_binding_location_idx "
         f'ON "{prepared_snapshot[0].schema_name}".provider_location_binding USING hash(location_key)'

@@ -10,9 +10,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import asyncpg
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from tests.test_prescription_autocomplete_postgres import _AsyncpgDatabase
@@ -21,12 +21,8 @@ from tests.test_prescription_autocomplete_rollup_postgres import (
     _create_provider_table,
 )
 
-
 MIGRATION_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "alembic"
-    / "versions"
-    / "20260820140000_prescription_autocomplete_rollup.py"
+    Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20260820140000_prescription_autocomplete_rollup.py"
 )
 drug_claims = importlib.import_module("process.drug_claims")
 
@@ -106,39 +102,29 @@ async def _assert_migration_rollup(connection, schema):
     ]
 
 
-async def _assert_provider_swap_invalidates_rollup(connection, schema):
+async def _assert_named_snapshot_copy_keeps_rollup(connection, schema):
     guarded_count_sql = (
         f'SELECT COUNT(*) FROM "{schema}".{ROLLUP_TABLE} '
         "WHERE source_relation_fingerprint = "
-        f"to_regclass('\"{schema}\".\"pricing_provider_prescription\"')::oid::text"
+        f"'{schema}.pricing_provider_prescription'"
     )
     assert await connection.fetchval(guarded_count_sql) == 4
     transaction = connection.transaction()
     await transaction.start()
     try:
-        await connection.execute(
-            f'CREATE TABLE "{schema}".provider_replacement '
-            f'(LIKE "{schema}".pricing_provider_prescription)'
-        )
-        await connection.execute(
-            f'ALTER TABLE "{schema}".pricing_provider_prescription '
-            "RENAME TO provider_previous"
-        )
-        await connection.execute(
-            f'ALTER TABLE "{schema}".provider_replacement '
-            "RENAME TO pricing_provider_prescription"
-        )
-        assert await connection.fetchval(guarded_count_sql) == 0
+        for name in ("pricing_provider_prescription", ROLLUP_TABLE):
+            await connection.execute(f'CREATE TABLE "{schema}"."{name}_copy" AS TABLE "{schema}"."{name}"')
+            await connection.execute(f'DROP TABLE "{schema}"."{name}"')
+            await connection.execute(f'ALTER TABLE "{schema}"."{name}_copy" RENAME TO "{name}"')
+        assert await connection.fetchval(guarded_count_sql) == 4
+        await _assert_migration_rollup(connection, schema)
     finally:
         await transaction.rollback()
 
 
 async def _create_publication_fixture(connection, migration, schema, staged):
     await connection.execute(f'CREATE SCHEMA "{schema}"')
-    await connection.execute(
-        f'CREATE TABLE "{schema}".pricing_prescription '
-        "(rx_code_system text, rx_code text)"
-    )
+    await connection.execute(f'CREATE TABLE "{schema}".pricing_prescription (rx_code_system text, rx_code text)')
     await _create_provider_table(
         connection,
         f'"{schema}".pricing_provider_prescription',
@@ -151,8 +137,7 @@ async def _create_publication_fixture(connection, migration, schema, staged):
     ):
         stage_table = staged[model_name].__tablename__
         await connection.execute(
-            f'CREATE TABLE "{schema}"."{stage_table}" '
-            f'(LIKE "{schema}"."{live_table}" INCLUDING ALL)'
+            f'CREATE TABLE "{schema}"."{stage_table}" (LIKE "{schema}"."{live_table}" INCLUDING ALL)'
         )
 
 
@@ -182,7 +167,7 @@ async def _seed_live_publication_generation(connection, schema):
         INSERT INTO "{schema}".{ROLLUP_TABLE} VALUES
             (2023, 'HP_RX_CODE', 'RX-A', 1,
              'Prior name', 'Prior generic', 'Prior brand', 1, 10, 1,
-             to_regclass('"{schema}"."pricing_provider_prescription"')::oid::text)
+             '{schema}.pricing_provider_prescription')
         """
     )
 
@@ -192,7 +177,7 @@ async def _publication_generation(connection, schema):
         f"""
         SELECT provider.rx_name, rollup.rx_name,
                rollup.source_relation_fingerprint =
-                   to_regclass('"{schema}"."pricing_provider_prescription"')::oid::text
+                   '{schema}.pricing_provider_prescription'
         FROM "{schema}".pricing_provider_prescription AS provider
         JOIN "{schema}".{ROLLUP_TABLE} AS rollup
           USING (year, rx_code_system, rx_code)
@@ -225,9 +210,7 @@ async def _assert_atomic_publication_reader(
             "Prior name",
             True,
         )
-        publication = asyncio.create_task(
-            drug_claims._publish_by_table_rename(staged, schema)
-        )
+        publication = asyncio.create_task(drug_claims._publish_by_table_rename(staged, schema))
         await _wait_for_publication_lock(reader, writer.get_server_pid())
         assert not publication.done()
         assert await _publication_generation(reader, schema) == (
@@ -261,20 +244,12 @@ async def test_rollup_migration_backfills_and_tracks_provider_swap(monkeypatch):
     )
     try:
         await _create_migration_source(connection, schema)
-        await _run_rollup_migration(
-            engine, migration, monkeypatch, schema, "upgrade"
-        )
+        await _run_rollup_migration(engine, migration, monkeypatch, schema, "upgrade")
         await _assert_migration_rollup(connection, schema)
-        await _assert_provider_swap_invalidates_rollup(connection, schema)
-        await _run_rollup_migration(
-            engine, migration, monkeypatch, schema, "downgrade"
-        )
-        assert not await connection.fetchval(
-            "SELECT to_regclass($1)", f"{schema}.{ROLLUP_TABLE}"
-        )
-        await _run_rollup_migration(
-            engine, migration, monkeypatch, schema, "upgrade"
-        )
+        await _assert_named_snapshot_copy_keeps_rollup(connection, schema)
+        await _run_rollup_migration(engine, migration, monkeypatch, schema, "downgrade")
+        assert not await connection.fetchval("SELECT to_regclass($1)", f"{schema}.{ROLLUP_TABLE}")
+        await _run_rollup_migration(engine, migration, monkeypatch, schema, "upgrade")
         await _assert_migration_rollup(connection, schema)
     finally:
         await engine.dispose()
@@ -298,15 +273,9 @@ async def test_rollup_migration_supports_missing_provider_table(monkeypatch):
     )
     try:
         await connection.execute(f'CREATE SCHEMA "{schema}"')
-        await _run_rollup_migration(
-            engine, migration, monkeypatch, schema, "upgrade"
-        )
-        assert await connection.fetchval(
-            "SELECT to_regclass($1)", f"{schema}.{ROLLUP_TABLE}"
-        )
-        assert await connection.fetchval(
-            f'SELECT COUNT(*) FROM "{schema}".{ROLLUP_TABLE}'
-        ) == 0
+        await _run_rollup_migration(engine, migration, monkeypatch, schema, "upgrade")
+        assert await connection.fetchval("SELECT to_regclass($1)", f"{schema}.{ROLLUP_TABLE}")
+        assert await connection.fetchval(f'SELECT COUNT(*) FROM "{schema}".{ROLLUP_TABLE}') == 0
     finally:
         await engine.dispose()
         await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
@@ -359,9 +328,7 @@ async def test_rollup_migration_rejects_incompatible_existing_table(
                 schema,
                 "upgrade",
             )
-        assert await connection.fetchval(
-            f'SELECT year FROM "{schema}".{ROLLUP_TABLE}'
-        ) == "sentinel"
+        assert await connection.fetchval(f'SELECT year FROM "{schema}".{ROLLUP_TABLE}') == "sentinel"
     finally:
         await engine.dispose()
         await connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
@@ -409,11 +376,14 @@ async def test_staged_drug_claims_publication_keeps_current_rollup(monkeypatch):
             schema,
         )
 
-        assert await connection.fetchval(
-            f'SELECT COUNT(*) FROM "{schema}".{ROLLUP_TABLE} '
-            "WHERE source_relation_fingerprint = "
-            f"to_regclass('\"{schema}\".\"pricing_provider_prescription\"')::oid::text"
-        ) == 1
+        assert (
+            await connection.fetchval(
+                f'SELECT COUNT(*) FROM "{schema}".{ROLLUP_TABLE} '
+                "WHERE source_relation_fingerprint = "
+                f"'{schema}.pricing_provider_prescription'"
+            )
+            == 1
+        )
         assert await connection.fetchval(
             "SELECT to_regclass($1)",
             f"{schema}.{ROLLUP_TABLE}_idx_primary",

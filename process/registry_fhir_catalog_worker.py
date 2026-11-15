@@ -39,6 +39,7 @@ class RegistryFHIRCatalogSyncConfig:
     reader_roles: tuple[str, ...]
     operation_seconds: int | None = None
     source_endpoint_ids: tuple[str, ...] | None = None
+    preparation_roles: dict | None = None
 
 
 @dataclass(repr=False)
@@ -70,7 +71,10 @@ def _validated_fhir_catalog_sync_config(encoded):
         if type(encoded) is not str or not 0 < len(encoded.encode()) <= 1048576:
             _invalid()
         document = json.loads(encoded, object_pairs_hook=unique_json_fields, parse_constant=lambda _value: _invalid())
-        if type(document) is not dict or not _FIELDS <= document.keys() <= _FIELDS | {"source_endpoint_ids"}:
+        if type(document) is not dict or not _FIELDS <= document.keys() <= _FIELDS | {
+            "source_endpoint_ids",
+            "preparation_roles",
+        }:
             _invalid()
         urls = tuple(
             None
@@ -101,22 +105,51 @@ def _validated_fhir_catalog_sync_config(encoded):
         seconds = document["operation_seconds"]
         if seconds is not None and (type(seconds) is not int or not 60 <= seconds <= 86400):
             _invalid()
-        endpoints = document.get("source_endpoint_ids")
-        if endpoints is not None and (
-            urls[0] is not None
-            or type(endpoints) is not list
-            or not 1 <= len(endpoints) <= 1000
-            or any(
-                type(endpoint) is not str or re.fullmatch(r"[0-9a-f]{64}", endpoint) is None for endpoint in endpoints
-            )
-            or sorted(set(endpoints)) != endpoints
-        ):
-            _invalid()
+        endpoints = _catalog_source_endpoint_ids(document, urls[0])
+        roles = _catalog_preparation_roles(document, urls, consumer, loader, readers)
         return RegistryFHIRCatalogSyncConfig(
-            *urls, consumer, grant, loader, tuple(readers), seconds, None if endpoints is None else tuple(endpoints)
+            *urls,
+            consumer,
+            grant,
+            loader,
+            tuple(readers),
+            seconds,
+            None if endpoints is None else tuple(endpoints),
+            roles,
         )
     except ValueError, TypeError, KeyError, UnicodeError, RecursionError:
         _invalid()
+
+
+def _catalog_source_endpoint_ids(document, source_url):
+    """Accept an ordered bounded endpoint scope only for the Source-owned reader runtime."""
+    endpoints = document.get("source_endpoint_ids")
+    if endpoints is not None and (
+        source_url is not None
+        or type(endpoints) is not list
+        or not 1 <= len(endpoints) <= 1000
+        or any(type(endpoint) is not str or re.fullmatch(r"[0-9a-f]{64}", endpoint) is None for endpoint in endpoints)
+        or sorted(set(endpoints)) != endpoints
+    ):
+        _invalid()
+    return endpoints
+
+
+def _catalog_preparation_roles(document, urls, consumer, loader, readers):
+    """Validate the configured preparation actors against all existing connection roles."""
+    roles = document.get("preparation_roles")
+    if roles is not None:
+        from process.registry_fhir_catalog_store import named_catalog_preparation_roles
+
+        roles = named_catalog_preparation_roles(roles)
+        required_roles = {loader, urls[2].username, urls[3].username, urls[4].username, *readers}
+        if (
+            roles["namespace_owner_role"] != consumer.physical_owner_role
+            or roles["publisher_role"] != urls[2].username
+            or not required_roles <= set(roles["application_roles"])
+        ):
+            _invalid()
+    return roles
 
 
 def validate_fhir_catalog_sync_params(params):

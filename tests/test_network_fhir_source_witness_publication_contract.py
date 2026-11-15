@@ -83,7 +83,6 @@ def test_original_header_routes_all_supported_profiles_without_rewriting(header,
         (_header(), {"proof_absent": False, "proof_sha256": None}),
         (_header(), {"proof_sha256": "b" * 64}),
         (_header(), {"uhc_proof_absent": False}),
-        (_header(), {"candidate_storage_json": {}}),
         (_header(), {"completion_absent": False}),
         (_header(), {"semantic_as_of_absent": False, "semantic_as_of": "2026-01-01"}),
         (

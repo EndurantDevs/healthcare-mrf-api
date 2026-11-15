@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Pure trust and memory contracts for closed-candidate projection replay."""
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -127,65 +128,152 @@ def _sealing_actor(name, events):
     return SimpleNamespace(transaction=transaction, execute=AsyncMock())
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("fails", [False, True])
-async def test_directory_pin_outlives_candidate_sealing_commit_or_failure(monkeypatch, fails):
-    from process import registry_fhir_catalog_sync as sync
+def _sealing_case(monkeypatch, events):
+    """Supply real configured roles and the current logical preparation lifecycle."""
+    from uuid import uuid4
 
-    events = []
-    reader, sealer = _sealing_actor("reader", events), _sealing_actor("sealer", events)
-    actors = iter((reader, sealer))
+    from process import registry_fhir_catalog_sync as sync
+    from process import registry_fhir_catalog_worker as worker
+    from process.registry_fhir_catalog_custody import FHIRCatalogTarget
+    from tests.test_registry_fhir_catalog_worker_activation import _configuration
+
+    config = worker.parse_fhir_catalog_sync_config(json.dumps(_configuration()))
+    candidate = uuid4()
+    copy_target = FHIRCatalogTarget(*(str(uuid4()) for _ in range(3)), str(candidate), "fhir_catalog_" + candidate.hex)
+    selected = snapshot(config.grant, schema_name=copy_target.schema_name)
+    selected["schema_name"] = copy_target.schema_name
+    selected["custody_json"] = {
+        "preparation": {"target": asdict(copy_target), "previous_metadata_generation": None, "accounting": {}}
+    }
+    actors_by_name = {name: _sealing_actor(name, events) for name in ("preparation", "reader", "sealer", "completion")}
+    acquisitions = iter(actors_by_name.values())
 
     @asynccontextmanager
     async def acquire():
-        yield next(actors)
+        yield next(acquisitions)
 
     workspace_token = object()
 
     @asynccontextmanager
     async def workspace(connection):
-        assert connection is reader
+        assert connection is actors_by_name["reader"]
         events.append(("reader", "workspace"))
         try:
             yield workspace_token
         finally:
             events.append(("reader", "workspace-drop"))
 
+    store = SimpleNamespace(yield_named_claim=AsyncMock(), validate_named=AsyncMock())
+    claim = object()
+    admission = AsyncMock(return_value=(store, {"state": "frozen"}, claim))
     monkeypatch.setattr(sync, "fhir_catalog_reference_workspace", workspace)
-
-    grant = standing_grant()
-    config = SimpleNamespace(
-        grant=grant,
-        consumer=SimpleNamespace(physical_owner_role="catalog_owner"),
-        loader_role="catalog_loader",
-        reader_roles=("catalog_reader",),
+    monkeypatch.setattr(sync, "admit_catalog_preparation", admission)
+    return SimpleNamespace(
+        config=config,
+        target=copy_target,
+        snapshot=selected,
+        actors=actors_by_name,
+        workspace=workspace_token,
+        pool=SimpleNamespace(acquire=acquire),
+        store=store,
+        claim=claim,
+        admission=admission,
     )
+
+
+def _assert_sealing_outcome(case, events, failure, receipt):
+    """Require pinned-reader cleanup before successful completion, with no completion on failure."""
+    outcome = "rollback" if failure else "commit"
+    expected_events = [
+        ("preparation", "begin", {}),
+        ("preparation", "commit"),
+        ("reader", "workspace"),
+        ("reader", "begin", {"isolation": "repeatable_read", "readonly": True}),
+        ("sealer", "begin", {}),
+        ("sealer", outcome),
+        ("reader", outcome),
+        ("reader", "workspace-drop"),
+    ]
+    if not failure:
+        expected_events.extend([("completion", "begin", {}), ("completion", "commit")])
+    assert events == expected_events
+    assert case.admission.await_count == case.store.yield_named_claim.await_count == (1 if failure else 2)
+    roles_by_name = {
+        "namespace_owner_role": "registry_snapshot_owner",
+        "publisher_role": "catalog_sealer",
+        "application_roles": [
+            "catalog_loader",
+            "catalog_sealer",
+            "registry_reader",
+            "worker_execution",
+            "worker_lifecycle",
+        ],
+    }
+    for request in case.admission.await_args_list:
+        assert request.kwargs == {"control_schema": "registry", "roles": roles_by_name}
+    if failure:
+        case.store.validate_named.assert_not_awaited()
+        case.actors["completion"].execute.assert_not_awaited()
+    else:
+        case.store.validate_named.assert_awaited_once_with(
+            case.claim,
+            {
+                "kind": "catalog",
+                "candidate_id": case.target.candidate_id,
+                "data": {key: receipt[key] for key in ("metadata_generation", "tables", "content_sha256")},
+            },
+        )
+        case.actors["completion"].execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, RuntimeError, asyncio.CancelledError], ids=["success", "failure", "cancel"])
+async def test_directory_pin_outlives_candidate_sealing_commit_or_failure(monkeypatch, failure):
+    """Keep the independent readonly snapshot pinned through sealing and settle it before completion."""
+    from process import registry_fhir_catalog_sync as sync
+
+    events = []
+    case = _sealing_case(monkeypatch, events)
     build = Mock(return_value=object())
     monkeypatch.setattr(sync, "build_fhir_catalog_observation_verifier", build)
+    receipt_by_field = {
+        "metadata_generation": case.snapshot["metadata_generation"],
+        "inputs": [],
+        "tables": {},
+        "content_sha256": "a" * 64,
+    }
 
-    async def freeze(*args, **options):
-        assert events == [
+    async def freeze(connection, target, **options):
+        assert events[-3:] == [
             ("reader", "workspace"),
             ("reader", "begin", {"isolation": "repeatable_read", "readonly": True}),
             ("sealer", "begin", {}),
         ]
-        assert args[0] is sealer
-        if fails:
-            raise RuntimeError("synthetic sealing failure")
-        return {"validation": {"tables": {}}}
+        assert connection is case.actors["sealer"] and target is case.target
+        assert options == {
+            "expected_snapshot": case.snapshot,
+            "control_schema": case.config.grant.control_schema,
+            "standing_grant": case.config.grant,
+            "observation_verifier": build.return_value,
+        }
+        if failure:
+            raise failure("synthetic sealing failure")
+        return receipt_by_field
 
-    monkeypatch.setattr(sync, "freeze_fhir_catalog_snapshot", freeze)
-    operation = sync._seal_catalog_snapshot(
-        config, object(), snapshot(grant), SimpleNamespace(acquire=acquire), source_pool=None
-    )
-    if fails:
-        with pytest.raises(RuntimeError, match="synthetic sealing failure"):
+    monkeypatch.setattr(sync, "validate_fhir_catalog_snapshot_data", freeze)
+    operation = sync._seal_catalog_snapshot(case.config, case.target, case.snapshot, case.pool, source_pool=None)
+    if failure:
+        with pytest.raises(failure, match="synthetic sealing failure"):
             await operation
     else:
-        await operation
-    build.assert_called_once_with(grant, None, registry_reader=reader, registry_workspace=workspace_token)
-    outcome = "rollback" if fails else "commit"
-    assert events[-3:] == [("sealer", outcome), ("reader", outcome), ("reader", "workspace-drop")]
+        assert await operation == "validated"
+    build.assert_called_once_with(
+        case.config.grant,
+        None,
+        registry_reader=case.actors["reader"],
+        registry_workspace=case.workspace,
+    )
+    _assert_sealing_outcome(case, events, failure, receipt_by_field)
 
 
 def projected_documents():

@@ -62,11 +62,16 @@ async def test_authenticated_proof_drift_fails_before_relocation(monkeypatch, da
         proof[field] = changed_value
     monkeypatch.setattr(preparation.destination, "_validated_destination_metadata", Mock())
     session = _session({"owner_oid": 31, "owner_safe": True, "caller_safe": True})
-    with pytest.raises(preparation.EntityAddressSnapshotDestinationError):
-        await preparation._authenticated_preparation(
-            session, stored_by_field, {}, seal_by_field, AsyncMock(return_value=proof)
-        )
-    assert session.execute.await_count == 1
+    operation = preparation._authenticated_preparation(
+        session, stored_by_field, {}, seal_by_field, AsyncMock(return_value=proof)
+    )
+    if damage in {"owner", "same_builder", "builder_type", "oid"}:
+        actual, _ = await operation
+        assert actual == proof
+    else:
+        with pytest.raises(preparation.EntityAddressSnapshotDestinationError):
+            await operation
+    session.execute.assert_not_awaited()
 
 
 async def test_missing_authentication_is_not_ordinary_authority():
@@ -76,11 +81,12 @@ async def test_missing_authentication_is_not_ordinary_authority():
 
 
 async def test_publisher_uses_authenticated_namespace_owner(monkeypatch):
-    session = _session({"owner_oid": 31, "owner_safe": True, "caller_safe": True})
-    guard = AsyncMock(return_value="a" * 64)
-    monkeypatch.setattr(preparation.alias_guard, "require_entity_address_alias_guard", guard)
-    assert await preparation.require_entity_address_archive_publisher(session, db_schema="example") == 31
-    guard.assert_awaited_once_with(session, schema="example", owner_oid=31)
+    session = _session()
+    read_state = AsyncMock(return_value=(2, 1, 7))
+    monkeypatch.setattr(preparation.alias, "_alias_state", read_state)
+    assert await preparation.require_entity_address_archive_publisher(session, db_schema="example") is None
+    read_state.assert_awaited_once_with(session, "example")
+    session.execute.assert_not_awaited()
 
 
 @pytest.mark.parametrize("value", [{"not_serializable": object()}, {"not_finite": float("nan")}])
@@ -100,7 +106,7 @@ async def test_private_prepare_preserves_inventory_and_dependency_binding(monkey
     normalize = Mock(return_value={"normalized": [1, 2]})
     monkeypatch.setattr(preparation.destination, "_prepare_bound_destination", callback)
     monkeypatch.setattr(preparation.destination.db, "bind_existing_session", _bound)
-    monkeypatch.setattr(preparation.destination.geo_projection, "validate_projection_dependency_bindings", normalize)
+    monkeypatch.setattr(preparation.destination, "_geo_binding_names", normalize)
     destination_by_field = {"db_schema": "example", "import_date": "20260913", "dependency_bindings": bindings}
     assert (
         await preparation.prepare_private_entity_address_archive_destination(
@@ -131,15 +137,9 @@ async def test_private_prepare_rejects_unbounded_destination(destination):
 async def test_relocation_requires_exact_persisted_stage_oids(monkeypatch, changed):
     owner, _proof = _inventory()
     schema, _date, names = preparation.destination.restore._stage_plan(db_schema="example", import_date="20260913")
-    pairs = tuple(sorted((names[name], oid) for name, oid in owner.relation_oids))
-    stored_by_field = {
-        "restored": {
-            "db_schema": schema,
-            "import_date": "20260913",
-            "stage_relation_oids": [{"table_name": name, "oid": oid} for name, oid in pairs],
-        }
-    }
-    move = AsyncMock(return_value=pairs[:-1] if changed else pairs)
+    stage_relations = tuple(sorted((schema, names[name]) for name in owner.relation_names))
+    stored_by_field = {"restored": {"db_schema": schema, "import_date": "20260913"}}
+    move = AsyncMock(return_value=stage_relations[:-1] if changed else stage_relations)
     monkeypatch.setattr(preparation.destination.restore, "_move_owned_relations", move)
     if changed:
         with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="relocation differs"):
@@ -153,24 +153,16 @@ async def test_relocation_requires_exact_persisted_stage_oids(monkeypatch, chang
 async def test_alias_fence_binds_catalog_and_local_generation(monkeypatch, changed, contract):
     _owner, proof = _inventory()
     alias = preparation.alias.EntityAddressAliasSemanticReceipt(2, 1, 7, 0, "a" * 64)
-    validation_by_field = {
-        "contract": contract,
-        "alias": alias.as_dict(),
-        "alias_catalog_sha256": "b" * 64,
-    }
+    validation_by_field = {"contract": contract, "alias": alias.as_dict(), "alias_catalog_sha256": "opaque"}
     monkeypatch.setattr(preparation.alias, "_lock_alias_relations", AsyncMock())
-    monkeypatch.setattr(
-        preparation, "_require_alias_authority", AsyncMock(return_value="c" * 64 if changed == "catalog" else "b" * 64)
-    )
     state = AsyncMock(return_value=(2, 1, 8 if changed == "generation" else 7))
     monkeypatch.setattr(preparation.alias, "_alias_state", state)
-    if changed:
-        with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="alias .* changed"):
+    if changed == "generation":
+        with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="alias generation changed"):
             await preparation._require_alias_fence(object(), "example", proof, validation_by_field)
-        assert state.await_count == (0 if changed == "catalog" else 1)
     else:
         await preparation._require_alias_fence(object(), "example", proof, validation_by_field)
-    assert preparation._require_alias_authority.await_args.kwargs == {}
+    state.assert_awaited_once()
 
 
 def test_adoption_rehydrates_sealed_context_without_rescanning(monkeypatch):
@@ -234,7 +226,7 @@ async def test_private_preparation_returns_exact_inventory_after_complete_eviden
     destination = preparation.destination
     owner, _proof = _inventory()
     schema, import_date, names = destination.restore._stage_plan(db_schema="example", import_date="20260913")
-    stage_oids = tuple(sorted((names[name], oid) for name, oid in owner.relation_oids))
+    stage_relations = tuple(sorted((schema, names[name]) for name in owner.relation_names))
     alias = preparation.alias.EntityAddressAliasSemanticReceipt(2, 1, 7, 0, "a" * 64)
     semantic_receipt, remap, integrity, geo = object(), object(), object(), object()
     prepared = SimpleNamespace(db_schema=schema, context={"source": "synthetic"}, publish_validation={"row_count": 4})
@@ -245,7 +237,7 @@ async def test_private_preparation_returns_exact_inventory_after_complete_eviden
         AsyncMock(return_value=(owner, semantic_receipt, schema, import_date, names)),
     )
     monkeypatch.setattr(destination, "_remap_base_versions", AsyncMock(return_value=(remap, semantic_receipt)))
-    monkeypatch.setattr(destination, "_move_remapped_destination", AsyncMock(return_value=stage_oids))
+    monkeypatch.setattr(destination, "_move_remapped_destination", AsyncMock(return_value=stage_relations))
     monkeypatch.setattr(destination, "_prepare_moved_destination", AsyncMock(return_value=(prepared, geo, integrity)))
     handback = AsyncMock(side_effect=RuntimeError("handback refused") if late_failure else None)
     monkeypatch.setattr(destination.restore, "_return_owned_relations", handback)
@@ -265,7 +257,7 @@ async def test_private_preparation_returns_exact_inventory_after_complete_eviden
         )
         assert (
             prepared_destination.restored.ownership is owner
-            and prepared_destination.restored.stage_relation_oids == stage_oids
+            and prepared_destination.restored.stage_relations == stage_relations
         )
         assert (
             prepared_destination.restored.semantic_receipt is semantic_receipt
@@ -281,7 +273,8 @@ async def test_sequence_handback_drift_refuses_before_any_ddl(monkeypatch):
     owner, _proof = _inventory()
     names_by_table = {name: name + "_candidate" for name, _oid in owner.relation_oids}
     monkeypatch.setattr(restore, "_require_empty_owned_schema", AsyncMock())
-    monkeypatch.setattr(restore, "_verify_moved_stage_oids", AsyncMock())
+    monkeypatch.setattr(restore, "_verify_moved_stage_relations", AsyncMock())
+    monkeypatch.setattr(restore, "_local_relation_handle", AsyncMock(return_value=1))
     monkeypatch.setattr(restore, "_owned_sequence_names", AsyncMock(return_value=("substituted_sequence",)))
     verified = AsyncMock()
     monkeypatch.setattr(restore, "verify_entity_address_archive_stage_ownership", verified)

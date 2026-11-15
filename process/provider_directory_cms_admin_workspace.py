@@ -12,7 +12,6 @@ from contextlib import asynccontextmanager
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_cms_prepared_context as context
 from process import provider_directory_cms_prepared_workspace as workspace
-from process import provider_directory_cms_snapshot_seal as seal
 
 
 def _require(condition, code):
@@ -37,13 +36,8 @@ def _inputs(source_binding, prepared_inputs):
 async def _observe_native(
     connection, source_binding, expected, handoff, expected_workspace, migration_role, *, reader=False
 ):
-    """Recompute actual input custody, retained output identity and independent admin origin."""
+    """Read exact named input/output groups through native SQL permissions."""
     _require(await connection.fetchval("SHOW search_path") in {"pg_catalog", "pg_catalog, pg_temp"}, "search_path")
-    namespace_role = await connection.fetchval(
-        "SELECT rolname::text FROM pg_catalog.pg_roles WHERE oid=$1::oid", source_binding.namespace_owner_oid
-    )
-    _require(type(namespace_role) is str, "namespace_owner_missing")
-    storage_identifier(namespace_role)
     source_policy = workspace._policy(expected["source_policy"])
     policy = workspace._policy(expected["prepared_policy"])
     coordinates = await context._observe(
@@ -53,15 +47,9 @@ async def _observe_native(
     retained, binding, receipts = workspace._retained_workspace(
         source_binding, native_inputs_by_field, handoff, expected_workspace
     )
-    actor_reader = seal._reader_admin if reader else seal._admin
-    actor = await actor_reader(
-        connection, source_binding, native_inputs_by_field, retained, namespace_role, migration_role
-    )
-    _require(
-        actor["current"] not in {*source_policy.control_runtime_roles, *policy.control_runtime_roles},
-        "independent_original_admin_required",
-    )
-    return {**native_inputs_by_field, "origin": actor}, retained, binding, receipts
+    if not reader:
+        native_inputs_by_field["origin"] = await context._origin(connection, source_binding, policy)
+    return native_inputs_by_field, retained, binding, receipts
 
 
 async def _pin_relations(connection, policy, expected, receipts):

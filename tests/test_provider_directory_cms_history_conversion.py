@@ -43,57 +43,42 @@ def test_history_foreign_keys_use_native_postgresql_identifier_spelling(schema, 
 
 def _request(*, same_schema=False):
     request_by_field = {
-        "database_oid": 1,
         "catalog_schema": "catalog",
-        "catalog_schema_oid": 2,
         "future_schema": "catalog" if same_schema else "future",
-        "future_schema_oid": 2 if same_schema else 3,
-        "owner_oid": 4,
         "heaps": {},
     }
     for ordinal, root in enumerate(history.ROOTS):
-        base = 100 * (ordinal + 1)
         name = "future_payload_" + str(ordinal)
         expected = history.cms_history_dependencies("catalog", root)
         old_by_field = {
-            "oid": base,
+            "schema": "catalog",
             "name": root,
-            "schema_oid": 2,
-            "owner_oid": 4,
             "kind": "r",
-            "indexes": {index[0]: base + 1 + position for position, index in enumerate(_LAYOUTS[root]["indexes"])},
-            "foreign_keys": {
-                key: {"oid": base + 10 + position, "definition": definition}
-                for position, (key, definition) in enumerate(expected["foreign_keys"].items())
-            },
-            "hooks": {
-                key: {"oid": base + 20 + position, "function_oid": base + 30 + position, **semantics}
-                for position, (key, semantics) in enumerate(expected["hooks"].items())
-            },
+            "indexes": [index[0] for index in _LAYOUTS[root]["indexes"]],
+            **expected,
         }
         parent_by_field = {
-            "oid": base + 50,
+            "schema": request_by_field["future_schema"],
             "name": name,
-            "schema_oid": request_by_field["future_schema_oid"],
-            "owner_oid": 4,
             "kind": "p",
-            "indexes": {
-                name + "_pkey" if index[-1] else name + "_i" + str(position): base + 51 + position
+            "indexes": [
+                name + "_pkey" if index[-1] else name + "_i" + str(position)
                 for position, index in enumerate(_LAYOUTS[root]["indexes"])
-            },
+            ],
             "foreign_keys": {},
             "hooks": {},
         }
         request_by_field["heaps"][root] = {
             "old": old_by_field,
             "parent": parent_by_field,
+            "history_name": "retained_payload_" + str(ordinal),
             "dataset_ids": ["retained-one", "retained-two"],
         }
     return request_by_field
 
 
 @pytest.mark.parametrize("same_schema", [False, True])
-def test_plan_preserves_old_heap_and_all_index_oids(same_schema):
+def test_plan_preserves_declared_heap_and_index_names(same_schema):
     request_by_field = _request(same_schema=same_schema)
     before = deepcopy(request_by_field)
     plan = history.plan_cms_history_conversion(request_by_field)
@@ -103,15 +88,12 @@ def test_plan_preserves_old_heap_and_all_index_oids(same_schema):
     assert sum("SET SCHEMA" in statement for statement in plan["critical"]["parents"]) == (0 if same_schema else 2)
     for root, entry in request_by_field["heaps"].items():
         expected = plan["expected"][root]
-        assert expected["old"]["oid"] == entry["old"]["oid"]
         assert expected["old"]["indexes"] == entry["old"]["indexes"]
-        assert expected["old"]["name"] == "cms_history_" + str(entry["old"]["oid"])
-        assert expected["old"]["parents"] == [entry["parent"]["oid"]]
-        assert expected["parent"]["oid"] == entry["parent"]["oid"]
+        assert expected["old"]["name"] == entry["history_name"]
+        assert expected["old"]["parents"] == [{"schema": "catalog", "name": root}]
         assert expected["parent"]["indexes"] == entry["parent"]["indexes"]
-        assert expected["parent"]["schema_oid"] == request_by_field["catalog_schema_oid"]
+        assert expected["parent"]["schema"] == request_by_field["catalog_schema"]
         assert expected["parent"]["name"] == root
-        assert expected["old"]["owner_oid"] == expected["parent"]["owner_oid"] == request_by_field["owner_oid"]
         assert expected["old"]["foreign_keys"] == expected["old"]["hooks"] == {}
         assert expected["acl_change"] is expected["callable_change"] is False
     sql = "\n".join(statement for phase in plan["critical"].values() for statement in phase)
@@ -121,7 +103,7 @@ def test_plan_preserves_old_heap_and_all_index_oids(same_schema):
     assert sum("VALIDATE CONSTRAINT" in statement for statement in plan["prework"]) == 2
 
 
-def test_empty_history_keeps_old_oid_detached_with_validated_false_bound():
+def test_empty_history_keeps_named_heap_detached_with_validated_false_bound():
     request_by_field = _request()
     for entry in request_by_field["heaps"].values():
         entry["dataset_ids"] = []
@@ -152,14 +134,6 @@ def test_bounds_must_be_exact_sorted_unique_text(bounds):
         history.plan_cms_history_conversion(request_by_field)
 
 
-@pytest.mark.parametrize("oid", [True, 0, -1, 2**32, "100"])
-def test_native_oid_types_are_strict(oid):
-    request_by_field = _request()
-    request_by_field["heaps"][history.ROOTS[0]]["old"]["oid"] = oid
-    with pytest.raises(ValueError, match="oid_required"):
-        history.plan_cms_history_conversion(request_by_field)
-
-
 def _change(target, path, value):
     for key in path[:-1]:
         target = target[key]
@@ -170,12 +144,10 @@ def _change(target, path, value):
     ("path", "value"),
     [
         (("heaps", "other"), {}),
-        (("parent", "owner_oid"), 5),
-        (("parent", "schema_oid"), 2),
+        (("parent", "schema"), "unrelated"),
         (("old", "kind"), "p"),
         (("old", "callback"), "untrusted"),
-        (("parent", "oid"), 100),
-        (("parent", "indexes", "future_payload_0_pkey"), 100),
+        (("parent", "indexes"), ["unrelated_pkey"]),
         (("old", "name"), "other_heap"),
     ],
 )
@@ -192,7 +164,7 @@ def test_unrelated_or_inconsistent_native_identities_refuse(path, value):
     [
         (("foreign_keys", "unrelated_fk"), {}),
         (("foreign_keys",), {}),
-        (("foreign_keys", "provider_directory_cms_npd_re_dataset_id_resource_type_res_fkey", "definition"), "OTHER"),
+        (("foreign_keys", "provider_directory_cms_npd_re_dataset_id_resource_type_res_fkey"), "OTHER"),
         (("hooks", "unrelated_hook"), {}),
         (("hooks", "cms_npd_resource_witness_insert_guard", "function"), "other_function"),
         (("hooks", "cms_npd_resource_witness_insert_guard", "enabled"), "D"),
@@ -215,19 +187,23 @@ def test_identifiers_cannot_escape_the_sql_plan(name):
         history.plan_cms_history_conversion(request_by_field)
 
 
-@pytest.mark.parametrize(("future_schema", "future_oid"), [("catalog", 3), ("future", 2)])
-def test_mismatched_namespace_name_and_oid_refuse(future_schema, future_oid):
-    request_by_field = _request()
-    request_by_field.update(future_schema=future_schema, future_schema_oid=future_oid)
-    with pytest.raises(ValueError, match="namespace_identity_changed"):
-        history.plan_cms_history_conversion(request_by_field)
-
-
 @pytest.mark.parametrize("same_schema", [False, True])
 def test_catalog_name_collisions_refuse(same_schema):
     request_by_field = _request(same_schema=same_schema)
     entry = request_by_field["heaps"][history.ROOTS[0]]
-    entry["parent"]["name"] = history.ROOTS[1]
-    entry["parent"]["indexes"] = {history.ROOTS[1] + "_pkey": 151}
+    entry["history_name"] = history.ROOTS[1]
     with pytest.raises(ValueError, match="name_collision"):
         history.plan_cms_history_conversion(request_by_field)
+
+
+@pytest.mark.parametrize("parent_root", history.ROOTS)
+@pytest.mark.parametrize("relation", ["table", "index"])
+def test_incoming_parent_destinations_cannot_collide_with_retained_heaps(parent_root, relation):
+    request_by_field = _request()
+    parent = request_by_field["heaps"][parent_root]["parent"]
+    history_name = parent["name"] if relation == "table" else parent["indexes"][0]
+    request_by_field["heaps"][history.ROOTS[0]]["history_name"] = history_name
+    before = deepcopy(request_by_field)
+    with pytest.raises(ValueError, match="name_collision"):
+        history.plan_cms_history_conversion(request_by_field)
+    assert request_by_field == before

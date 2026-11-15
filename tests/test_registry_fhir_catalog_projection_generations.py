@@ -58,23 +58,23 @@ async def test_projection_rejects_an_omitted_actively_granted_generation(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state", ["no_generation", "missing", "sealed", "broken_custody"])
-async def test_candidate_reuse_requires_a_present_snapshot_and_its_existing_custody(monkeypatch, state):
+@pytest.mark.parametrize("state", ["no_generation", "missing", "sealed", "invalid_accounting"])
+async def test_candidate_reuse_requires_present_snapshot_and_validated_accounting(monkeypatch, state):
     from tests.test_registry_fhir_catalog_grant import snapshot, standing_grant
 
     grant = standing_grant()
     selected = snapshot(grant)
     loader = SimpleNamespace(fetchrow=AsyncMock(return_value=None if state == "missing" else selected))
     verify = AsyncMock()
-    if state == "broken_custody":
-        verify.side_effect = ValueError("sealed custody changed")
-    monkeypatch.setattr(sync, "verify_fhir_catalog_snapshot", verify)
+    if state == "invalid_accounting":
+        verify.side_effect = ValueError("content accounting changed")
+    monkeypatch.setattr(sync, "validate_fhir_catalog_snapshot_record", verify)
     generation = None if state == "no_generation" else selected["metadata_generation"]
-    if state == "broken_custody":
-        with pytest.raises(ValueError, match="sealed custody changed"):
+    if state == "invalid_accounting":
+        with pytest.raises(ValueError, match="content accounting changed"):
             await sync._reusable_catalog_snapshot(loader, grant, generation)
     else:
         result = await sync._reusable_catalog_snapshot(loader, grant, generation)
         assert result == (selected if state == "sealed" else None)
-    assert verify.await_count == int(state in {"sealed", "broken_custody"})
+    assert verify.await_count == int(state in {"sealed", "invalid_accounting"})
     assert loader.fetchrow.await_count == int(generation is not None)

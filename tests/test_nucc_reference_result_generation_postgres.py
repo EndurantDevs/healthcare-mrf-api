@@ -14,15 +14,34 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from process import nucc_protected_source as source
+from process import reference_family_result_generation as generation
 from tests.test_nucc_protected_source import closed_marker, copying_marker, ready_input, source_run
 from tests.test_reference_source_generation_postgres import (
     _observe,
-    _read_authority,
     _run_migration,
     _source_family,
 )
 
 _MIGRATION = Path(__file__).resolve().parents[1] / "alembic/versions/20261006010000_nucc_reference_result_generation.py"
+
+_NAMED_MIGRATION = _MIGRATION.with_name("20261114180000_reference_family_named_generation.py")
+
+
+async def _historical_authority(connection, schema):
+    row = (
+        (
+            await connection.execute(
+                text(f"""SELECT * FROM "{schema}".reference_family_result_generation WHERE importer_id='nucc'""")
+            )
+        )
+        .mappings()
+        .one()
+    )
+    return generation.validate_reference_family_result_generation_authority(row, declared_schema=schema)
+
+
+async def _prepare_current_generation(connection):
+    await _run_migration(connection, _NAMED_MIGRATION, "upgrade")
 
 
 def test_taxonomy_migration_extends_one_linear_history():
@@ -41,7 +60,7 @@ async def _install_taxonomy(connection, schema):
 
 @pytest.mark.asyncio
 async def test_taxonomy_seed_preserves_prior_rows_and_does_not_attest_legacy_data(monkeypatch):
-    async with _source_family(monkeypatch) as (engine, schema, sessions):
+    async with _source_family(monkeypatch, named=False) as (engine, schema, sessions):
         table = f'"{schema}".reference_family_result_generation'
         async with engine.begin() as connection:
             before = (await connection.execute(text(f"SELECT * FROM {table} ORDER BY importer_id"))).all()
@@ -50,19 +69,21 @@ async def test_taxonomy_seed_preserves_prior_rows_and_does_not_attest_legacy_dat
                 await connection.execute(text(f"SELECT * FROM {table} WHERE importer_id<>'nucc' ORDER BY importer_id"))
             ).all()
             assert after == before
-            seed = await _read_authority(connection, schema, "nucc")
-            assert seed.local_generation == 0 and seed.serving_generation is None and seed.relation_oids is None
+            seed = await _historical_authority(connection, schema)
+            assert seed.local_generation == 0 and seed.serving_generation is None and seed.relations is None
             assert (
                 await connection.scalar(text(f"SELECT source_revision_tracked FROM {table} WHERE importer_id='nucc'"))
                 is False
             )
-        with pytest.raises(RuntimeError, match="tracking is unavailable"):
-            async with sessions.begin() as session:
-                await _observe(session, schema, "nucc")
         async with engine.begin() as connection:
             await _run_migration(connection, _MIGRATION, "downgrade")
             assert (await connection.execute(text(f"SELECT * FROM {table} ORDER BY importer_id"))).all() == before
             assert await connection.scalar(text(f'SELECT marker FROM "{schema}".nucc_taxonomy')) == "legacy"
+            await _run_migration(connection, _MIGRATION, "upgrade")
+            await _prepare_current_generation(connection)
+        with pytest.raises(RuntimeError, match="tracking is unavailable"):
+            async with sessions.begin() as session:
+                await _observe(session, schema, "nucc")
 
 
 @pytest.mark.asyncio
@@ -76,12 +97,13 @@ async def test_taxonomy_seed_preserves_prior_rows_and_does_not_attest_legacy_dat
     ),
 )
 async def test_taxonomy_source_boundary_installs_statement_guards_and_preserves_evidence(monkeypatch, statement):
-    async with _source_family(monkeypatch) as (engine, schema, sessions):
+    async with _source_family(monkeypatch, named=False) as (engine, schema, sessions):
         async with engine.begin() as connection:
             await _install_taxonomy(connection, schema)
+            await _prepare_current_generation(connection)
         async with sessions.begin() as session:
             first = await _observe(session, schema, "nucc", bootstrap=True)
-            assert first.local_generation == 1 and len(first.relation_oids) == 1
+            assert first.local_generation == 1 and first.relations == ((schema, "nucc_taxonomy"),)
         async with engine.begin() as connection:
             guard_type = await connection.scalar(
                 text(
@@ -94,22 +116,40 @@ async def test_taxonomy_source_boundary_installs_statement_guards_and_preserves_
         async with sessions.begin() as session:
             updated = await _observe(session, schema, "nucc")
             assert updated.local_generation == first.local_generation + 1
-            assert updated.relation_oids == first.relation_oids
+            assert updated.relations == first.relations
+            assert updated.serving_generation.origin_generation == updated.local_generation
+
+
+@pytest.mark.asyncio
+async def test_historical_taxonomy_downgrade_preserves_recorded_generation_evidence(monkeypatch):
+    async with _source_family(monkeypatch, named=False) as (engine, schema, _sessions):
+        async with engine.begin() as connection:
+            await _install_taxonomy(connection, schema)
+            await connection.execute(
+                text(
+                    f"""UPDATE "{schema}".reference_family_result_generation SET local_generation=1 WHERE importer_id='nucc'"""
+                )
+            )
+            before = await _historical_authority(connection, schema)
             with pytest.raises(RuntimeError, match="evidence prevents downgrade"):
-                await _run_migration(await session.connection(), _MIGRATION, "downgrade")
+                await _run_migration(connection, _MIGRATION, "downgrade")
+            assert await _historical_authority(connection, schema) == before
 
 
 @pytest.mark.asyncio
 async def test_taxonomy_generation_rejects_a_multi_relation_identity(monkeypatch):
-    async with _source_family(monkeypatch) as (engine, schema, _sessions):
+    async with _source_family(monkeypatch, named=False) as (engine, schema, _sessions):
         async with engine.begin() as connection:
             await _install_taxonomy(connection, schema)
+            await _prepare_current_generation(connection)
         with pytest.raises(DBAPIError) as rejected:
             async with engine.begin() as connection:
                 await connection.execute(
                     text(
                         f'UPDATE "{schema}".reference_family_result_generation SET origin_lineage_id=local_lineage_id, '
-                        "origin_generation=1,published_at=transaction_timestamp(),relation_oids=ARRAY[1,2] "
+                        "origin_generation=1,published_at=transaction_timestamp(),serving_schema='"
+                        + schema
+                        + "',serving_relation_names=ARRAY['nucc_taxonomy','other'] "
                         "WHERE importer_id='nucc'"
                     )
                 )

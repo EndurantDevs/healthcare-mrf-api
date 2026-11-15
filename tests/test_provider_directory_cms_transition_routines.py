@@ -22,7 +22,6 @@ from tests.test_provider_directory_cms_allocation_guard_contracts import origina
 from tests.test_provider_directory_cms_callee_custody import (
     _authentic_functions,
     _catalog_definition,
-    _catalog_rows,
     _parse_statements,
 )
 from tests.test_provider_directory_generic_source_release_checks import legacy_function_rows
@@ -104,7 +103,7 @@ def _verify(routines, schema=_SCHEMA):
 def test_all_sixteen_additions_match_exact_source_constructor_body_and_abi(monkeypatch, schema):
     specifications = transition._contracts(schema, _PREPARATION_SCHEMA)
     functions = _migration_functions(monkeypatch, schema)
-    assert len(functions) == 16 and len(specifications) == 155
+    assert len(functions) == 16 and len(specifications) == 154
     for name, spec in functions.items():
         assert specifications[name] == (*spec[:-2], callables._body_digest(spec[-1], schema))
     routines = _extra_rows(monkeypatch, schema)

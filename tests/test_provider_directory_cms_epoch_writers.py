@@ -188,22 +188,6 @@ async def test_factory_alone_cannot_open_a_new_final_publication_transaction(ent
     directory.db.first.assert_not_awaited()
 
 
-async def test_inherited_publisher_task_cannot_reuse_the_final_source_body(monkeypatch):
-    directory = SimpleNamespace(db=SimpleNamespace(first=AsyncMock()))
-    transaction = AsyncMock(side_effect=AssertionError("transaction reached"))
-    monkeypatch.setattr(policy, "source_transaction", transaction)
-    token = policy._PUBLISHER.set(SimpleNamespace(task=asyncio.current_task()))
-    try:
-        with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
-            await asyncio.create_task(
-                coverage.seal_cms_candidate_coverage(directory, SimpleNamespace(**_proof()), "a" * 64, "b" * 64)
-            )
-    finally:
-        policy._PUBLISHER.reset(token)
-    transaction.assert_not_called()
-    directory.db.first.assert_not_awaited()
-
-
 async def test_legacy_coverage_sealer_keeps_existing_sql_without_source_authority(monkeypatch):
     monkeypatch.setattr(policy, "is_source_storage_required", lambda: False)
     authenticate = AsyncMock(side_effect=AssertionError("source authority reached"))
@@ -440,7 +424,8 @@ async def test_source_replay_borrows_owner_and_native_custody_without_legacy_reh
 
     async def custody(connection, pin, owner, readers, *, source_policy):
         assert connection is driver and source_policy is source_body.publisher.policy
-        assert pin.dataset_id == "candidate" and pin.resource_table_oid == 42 and pin.release_id == "a" * 64
+        assert pin.dataset_id == "candidate" and pin.release_id == "a" * 64
+        assert not hasattr(pin, "resource_table_oid")
         assert owner == "source_owner" and readers == ("source_reader",)
         return {"binding": {"identity": {} if changed_custody else expected_by_field}}
 

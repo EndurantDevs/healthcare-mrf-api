@@ -14,9 +14,9 @@ from uuid import UUID
 from sqlalchemy import text
 
 from process.npi_canonical_publication import (
+    NPI_CANONICAL_PUBLICATION_CONTRACT,
     NPI_CANONICAL_TABLES,
     NpiCanonicalPublicationReceipt,
-    validate_npi_canonical_publication_receipt,
 )
 
 TABLE_NAME = "npi_result_generation"
@@ -69,12 +69,12 @@ class NpiServingGeneration:
 
 @dataclass(frozen=True)
 class NpiResultGenerationAuthority:
-    """Local counter, current portable origin, OIDs, and import provenance."""
+    """Local counter, portable origin, declared names and import provenance."""
 
     local_lineage_id: str
     local_generation: int
     serving_generation: NpiServingGeneration | None
-    relation_oids: tuple[int, ...] | None
+    relations: tuple[tuple[str, str], ...] | None
     canonical_provenance: NpiCanonicalProvenance | None
 
     def as_dict(self) -> dict[str, Any]:
@@ -84,7 +84,9 @@ class NpiResultGenerationAuthority:
             "local_lineage_id": self.local_lineage_id,
             "local_generation": self.local_generation,
             "serving_generation": (None if self.serving_generation is None else self.serving_generation.as_dict()),
-            "relation_oids": None if self.relation_oids is None else list(self.relation_oids),
+            "relations": None
+            if self.relations is None
+            else [{"schema_name": schema, "relation_name": name} for schema, name in self.relations],
             "canonical_provenance": (
                 None if self.canonical_provenance is None else self.canonical_provenance.as_dict()
             ),
@@ -208,7 +210,51 @@ def _row_mapping(row: object) -> Mapping[str, Any]:
     raise RuntimeError("NPI result generation authority is unavailable")
 
 
-def validate_npi_result_generation_authority(authority_row: object) -> NpiResultGenerationAuthority:
+def _serving_authority_values(authority_values, declared_schema):
+    """Parse the complete optional serving origin and its declared relation names."""
+    if ("serving_schema" in authority_values) != ("serving_relation_names" in authority_values):
+        raise ValueError("incomplete named serving generation")
+    origin_values = (
+        authority_values.get("origin_lineage_id"),
+        authority_values.get("origin_generation"),
+        authority_values.get("published_at"),
+    )
+    if all(origin_value is None for origin_value in origin_values):
+        if (
+            authority_values.get("serving_schema") is not None
+            or authority_values.get("serving_relation_names") is not None
+        ):
+            raise ValueError("incomplete serving generation")
+        serving_generation = None
+        relations = None
+    elif any(origin_value is None for origin_value in origin_values):
+        raise ValueError("incomplete serving generation")
+    else:
+        serving_generation = validate_npi_serving_generation(
+            {
+                "origin_lineage_id": authority_values["origin_lineage_id"],
+                "origin_generation": authority_values["origin_generation"],
+                "published_at": authority_values["published_at"],
+            }
+        )
+        if "serving_relation_names" in authority_values:
+            schema = _schema_name(authority_values["serving_schema"])
+            if declared_schema is not None and schema != _schema_name(declared_schema):
+                raise ValueError("NPI serving schema declaration differs")
+            names = authority_values["serving_relation_names"]
+            if not isinstance(names, (list, tuple)) or tuple(names) != RELATION_NAMES:
+                raise ValueError("NPI serving names differ")
+        elif declared_schema is not None:
+            schema = _schema_name(declared_schema)
+        else:
+            raise ValueError("NPI legacy serving schema declaration is required")
+        relations = tuple((schema, name) for name in RELATION_NAMES)
+    return serving_generation, relations
+
+
+def validate_npi_result_generation_authority(
+    authority_row: object, *, declared_schema: str | None = None
+) -> NpiResultGenerationAuthority:
     """Validate the migration-installed singleton and its optional authority."""
 
     authority_values = _row_mapping(authority_row)
@@ -219,26 +265,7 @@ def validate_npi_result_generation_authority(authority_row: object) -> NpiResult
         raise RuntimeError("NPI local result generation is invalid")
     try:
         lineage_id = _uuid_text(authority_values.get("local_lineage_id"))
-        origin_values = (
-            authority_values.get("origin_lineage_id"),
-            authority_values.get("origin_generation"),
-            authority_values.get("published_at"),
-            authority_values.get("relation_oids"),
-        )
-        if all(origin_value is None for origin_value in origin_values):
-            serving_generation = None
-            relation_oids = None
-        elif any(origin_value is None for origin_value in origin_values):
-            raise ValueError("incomplete serving generation")
-        else:
-            serving_generation = validate_npi_serving_generation(
-                {
-                    "origin_lineage_id": authority_values["origin_lineage_id"],
-                    "origin_generation": authority_values["origin_generation"],
-                    "published_at": authority_values["published_at"],
-                }
-            )
-            relation_oids = _relation_oids(authority_values["relation_oids"])
+        serving_generation, relations = _serving_authority_values(authority_values, declared_schema)
         provenance_values = (
             authority_values.get("canonical_publication_ref"),
             authority_values.get("canonical_publication_generation"),
@@ -264,20 +291,43 @@ def validate_npi_result_generation_authority(authority_row: object) -> NpiResult
         lineage_id,
         local_generation,
         serving_generation,
-        relation_oids,
+        relations,
         provenance,
     )
 
 
-def _state_projection(schema_name: str, *, lock: bool) -> str:
+def _state_projection(schema_name: str, *, lock: bool, named: bool = True) -> str:
     suffix = " FOR UPDATE" if lock else ""
+    named_columns = "serving_schema, serving_relation_names, " if named else ""
     return (
         "SELECT singleton, local_lineage_id, local_generation, origin_lineage_id, "
-        "origin_generation, published_at, relation_oids, canonical_publication_ref, "
+        f"origin_generation, published_at, {named_columns}canonical_publication_ref, "
         "canonical_publication_generation, canonical_chain_ref, canonical_import_date "
         f"FROM {_quoted(schema_name)}.{_quoted(TABLE_NAME)} "
         f"WHERE singleton IS TRUE{suffix}"
     )
+
+
+async def _has_named_generation_columns(session, schema):
+    """Select the live metadata edition while a native read lock prevents DDL."""
+    relation = f"{_quoted(schema)}.{_quoted(TABLE_NAME)}"
+    await session.execute(text(f"SELECT local_generation FROM {relation} WHERE FALSE"))
+    columns = set(
+        (
+            await session.execute(
+                text(
+                    "SELECT attname FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass(:relation) "
+                    "AND attnum>0 AND NOT attisdropped AND attname IN ('serving_schema','serving_relation_names')"
+                ),
+                {"relation": relation},
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if columns not in (set(), {"serving_schema", "serving_relation_names"}):
+        raise RuntimeError("NPI result generation authority is invalid")
+    return bool(columns)
 
 
 async def read_npi_result_generation_authority(
@@ -289,10 +339,13 @@ async def read_npi_result_generation_authority(
     """Read the one durable NPI result authority in a caller transaction."""
 
     schema = _schema_name(schema_name)
-    authority_row = (await session.execute(text(_state_projection(schema, lock=lock)))).mappings().one_or_none()
+    named = await _has_named_generation_columns(session, schema)
+    authority_row = (
+        (await session.execute(text(_state_projection(schema, lock=lock, named=named)))).mappings().one_or_none()
+    )
     if authority_row is None:
         raise RuntimeError("NPI result generation authority is unavailable")
-    return validate_npi_result_generation_authority(authority_row)
+    return validate_npi_result_generation_authority(authority_row, declared_schema=schema)
 
 
 async def current_npi_relation_oids(session: Any, *, schema_name: str) -> tuple[int, ...]:
@@ -326,43 +379,38 @@ async def _matching_canonical_provenance(
     session: Any,
     *,
     schema_name: str,
-    relation_oids: tuple[int, ...],
 ) -> NpiCanonicalProvenance | None:
-    """Return only a sealed receipt for the same physical family as provenance."""
+    """Return the newest sealed receipt only when its recorded table counts match the bootstrapped family."""
 
     schema = _schema_name(schema_name)
-    oid_predicates = " AND ".join(
-        f"receipt.{column_name}=:relation_{ordinal}"
-        for ordinal, column_name in enumerate(
-            (
-                "npi_table_oid",
-                "npi_address_table_oid",
-                "npi_taxonomy_table_oid",
-                "npi_taxonomy_group_table_oid",
-                "npi_other_identifier_table_oid",
-                "npi_phone_staffing_table_oid",
-            ),
-            1,
-        )
-    )
+    receipt_counts = ", ".join(f"receipt.{name}_row_count" for name in RELATION_NAMES)
     receipt_row = (
         (
             await session.execute(
                 text(
                     "SELECT receipt.publication_ref, receipt.publication_generation, "
-                    "receipt.chain_ref, receipt.import_date FROM "
+                    f"receipt.chain_ref, receipt.import_date, {receipt_counts} FROM "
                     f"{_quoted(schema)}.{_quoted('npi_canonical_publication_receipt')} AS receipt "
                     f"JOIN {_quoted(schema)}.{_quoted('npi_canonical_publication_receipt_seal')} "
-                    "AS sealed USING (publication_ref) WHERE "
-                    f"{oid_predicates} ORDER BY receipt.publication_generation DESC LIMIT 1"
+                    "AS sealed USING (publication_ref) ORDER BY receipt.publication_generation DESC LIMIT 1"
                 ),
-                {f"relation_{ordinal}": relation_oid for ordinal, relation_oid in enumerate(relation_oids, 1)},
             )
         )
         .mappings()
         .one_or_none()
     )
     if receipt_row is None:
+        return None
+    current_counts = (
+        await session.execute(
+            text(
+                "SELECT "
+                + ", ".join(f"(SELECT count(*) FROM {_quoted(schema)}.{_quoted(name)})" for name in RELATION_NAMES)
+            )
+        )
+    ).one()
+    # A newer receipt for another family must not lend its publication reference to these tables.
+    if tuple(receipt_row[f"{name}_row_count"] for name in RELATION_NAMES) != tuple(current_counts):
         return None
     return validate_npi_canonical_provenance(
         {
@@ -379,12 +427,11 @@ async def capture_npi_serving_generation(
     *,
     schema_name: str,
 ) -> NpiResultGenerationAuthority:
-    """Require a tracked generation bound to the current exact six OIDs."""
+    """Require a tracked generation serving the six declared relation names."""
 
     schema = _schema_name(schema_name)
     authority = await read_npi_result_generation_authority(session, schema_name=schema)
-    current_oids = await current_npi_relation_oids(session, schema_name=schema)
-    if authority.serving_generation is None or authority.relation_oids != current_oids:
+    if authority.serving_generation is None or authority.relations != tuple((schema, name) for name in RELATION_NAMES):
         raise RuntimeError("NPI serving generation is unavailable or drifted")
     return authority
 
@@ -404,18 +451,19 @@ async def _write_bootstrap_authority(
                     f"UPDATE {_quoted(schema_name)}.{_quoted(TABLE_NAME)} SET "
                     "local_generation=:next_generation, origin_lineage_id=local_lineage_id, "
                     "origin_generation=:next_generation, published_at=transaction_timestamp(), "
-                    "relation_oids=CAST(:relation_oids AS bigint[]), "
+                    "serving_schema=:serving_schema, serving_relation_names=CAST(:serving_relation_names AS text[]), "
                     "canonical_publication_ref=:publication_ref, "
                     "canonical_publication_generation=:publication_generation, "
                     "canonical_chain_ref=:chain_ref, canonical_import_date=CAST(:import_date AS date) "
                     "WHERE singleton IS TRUE RETURNING singleton, local_lineage_id, local_generation, "
-                    "origin_lineage_id, origin_generation, published_at, relation_oids, "
+                    "origin_lineage_id, origin_generation, published_at, serving_schema, serving_relation_names, "
                     "canonical_publication_ref, canonical_publication_generation, "
                     "canonical_chain_ref, canonical_import_date"
                 ),
                 {
                     "next_generation": next_generation,
-                    "relation_oids": list(relation_oids),
+                    "serving_schema": schema_name,
+                    "serving_relation_names": list(RELATION_NAMES),
                     "publication_ref": None if provenance is None else provenance.publication_ref,
                     "publication_generation": (None if provenance is None else provenance.publication_generation),
                     "chain_ref": None if provenance is None else provenance.chain_ref,
@@ -457,16 +505,12 @@ async def bootstrap_npi_result_generation(
             lock=True,
         )
     if current.serving_generation is not None:
-        if current.relation_oids != relation_oids:
+        if current.relations != tuple((schema, name) for name in RELATION_NAMES):
             raise RuntimeError("NPI serving generation is unavailable or drifted")
         return current
     if current.local_generation >= _MAX_GENERATION:
         raise RuntimeError("NPI local result generation is exhausted")
-    provenance = await _matching_canonical_provenance(
-        session,
-        schema_name=schema,
-        relation_oids=relation_oids,
-    )
+    provenance = await _matching_canonical_provenance(session, schema_name=schema)
     return await _write_bootstrap_authority(
         session,
         schema_name=schema,
@@ -630,22 +674,39 @@ async def publish_unreceipted_npi_result_generation(
     current = validate_npi_result_generation_authority(current_row)
     if current.local_generation >= _MAX_GENERATION:
         raise RuntimeError("NPI local result generation is exhausted")
-    relation_oids = await _live_relation_oids(connection, schema)
+    await _live_relation_oids(connection, schema)
     updated = await connection.fetchrow(
         f"UPDATE {_quoted(schema)}.{_quoted(TABLE_NAME)} SET "
         "local_generation=$1, origin_lineage_id=local_lineage_id, "
-        "origin_generation=$1, published_at=transaction_timestamp(), relation_oids=$2::bigint[], "
+        "origin_generation=$1, published_at=transaction_timestamp(), serving_schema=$2, serving_relation_names=$3::text[], "
         "canonical_publication_ref=NULL, canonical_publication_generation=NULL, "
         "canonical_chain_ref=NULL, canonical_import_date=NULL WHERE singleton IS TRUE "
         "RETURNING singleton, local_lineage_id, local_generation, origin_lineage_id, "
-        "origin_generation, published_at, relation_oids, canonical_publication_ref, "
+        "origin_generation, published_at, serving_schema, serving_relation_names, canonical_publication_ref, "
         "canonical_publication_generation, canonical_chain_ref, canonical_import_date",
         current.local_generation + 1,
-        list(relation_oids),
+        schema,
+        list(RELATION_NAMES),
     )
     if updated is None:
         raise RuntimeError("NPI result generation authority is unavailable")
     return validate_npi_result_generation_authority(updated)
+
+
+def _require_local_publication_receipt(receipt):
+    """Reject incomplete canonical publication receipts before reading serving state."""
+    if (
+        type(receipt) is not NpiCanonicalPublicationReceipt
+        or receipt.contract != NPI_CANONICAL_PUBLICATION_CONTRACT
+        or receipt.publication_state != "canonical_api_published"
+        or receipt.evidence_serving_authority != "none"
+        or receipt.evidence_publication_enabled is not False
+        or not isinstance(receipt.contract_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt.contract_sha256) is None
+        or len(receipt.row_counts) != len(RELATION_NAMES)
+        or any(type(count) is not int or not 0 <= count <= _MAX_CANONICAL_GENERATION for count in receipt.row_counts)
+    ):
+        raise ValueError("NPI canonical publication receipt is invalid")
 
 
 async def publish_local_npi_result_generation(
@@ -657,29 +718,41 @@ async def publish_local_npi_result_generation(
     """Advance and bind the result revision inside ordinary publication."""
 
     schema = _schema_name(schema_name)
-    fixed_receipt = validate_npi_canonical_publication_receipt(receipt)
+    _require_local_publication_receipt(receipt)
+    fixed_receipt = receipt
+    validate_npi_canonical_provenance(_provenance(fixed_receipt))
     current_row = await connection.fetchrow(_state_projection(schema, lock=True))
     if current_row is None:
         raise RuntimeError("NPI result generation authority is unavailable")
     current = validate_npi_result_generation_authority(current_row)
     if current.local_generation >= _MAX_GENERATION:
         raise RuntimeError("NPI local result generation is exhausted")
-    relation_oids = await _live_relation_oids(connection, schema)
-    if relation_oids != fixed_receipt.relation_oids:
-        raise RuntimeError("NPI publication relation identity differs")
+    await _live_relation_oids(connection, schema)
+    counts = await connection.fetchrow(
+        "SELECT "
+        + ",".join(
+            f"(SELECT count(*)::bigint FROM {_quoted(schema)}.{_quoted(name)}) AS count_{ordinal}"
+            for ordinal, name in enumerate(RELATION_NAMES)
+        )
+    )
+    if counts is None or tuple(counts[f"count_{ordinal}"] for ordinal in range(len(RELATION_NAMES))) != tuple(
+        fixed_receipt.row_counts
+    ):
+        raise RuntimeError("NPI publication row counts differ")
     provenance = _provenance(fixed_receipt)
     updated = await connection.fetchrow(
         f"UPDATE {_quoted(schema)}.{_quoted(TABLE_NAME)} SET "
         "local_generation=$1, origin_lineage_id=local_lineage_id, "
-        "origin_generation=$1, published_at=$2::timestamptz, relation_oids=$3::bigint[], "
-        "canonical_publication_ref=$4, canonical_publication_generation=$5, "
-        "canonical_chain_ref=$6, canonical_import_date=$7::date WHERE singleton IS TRUE "
+        "origin_generation=$1, published_at=$2::timestamptz, serving_schema=$3, serving_relation_names=$4::text[], "
+        "canonical_publication_ref=$5, canonical_publication_generation=$6, "
+        "canonical_chain_ref=$7, canonical_import_date=$8::date WHERE singleton IS TRUE "
         "RETURNING singleton, local_lineage_id, local_generation, origin_lineage_id, "
-        "origin_generation, published_at, relation_oids, canonical_publication_ref, "
+        "origin_generation, published_at, serving_schema, serving_relation_names, canonical_publication_ref, "
         "canonical_publication_generation, canonical_chain_ref, canonical_import_date",
         current.local_generation + 1,
         _timestamp(fixed_receipt.created_at),
-        list(relation_oids),
+        schema,
+        list(RELATION_NAMES),
         provenance.publication_ref,
         provenance.publication_generation,
         provenance.chain_ref,
@@ -701,14 +774,16 @@ async def _adopted_generation_parameters(
             "origin_lineage_id": None,
             "origin_generation": None,
             "published_at": None,
-            "relation_oids": None,
+            "serving_schema": None,
+            "serving_relation_names": None,
         }
     validated_source = validate_npi_serving_generation(source_generation)
     return {
         "origin_lineage_id": validated_source.origin_lineage_id,
         "origin_generation": validated_source.origin_generation,
         "published_at": validated_source.published_at,
-        "relation_oids": list(await current_npi_relation_oids(session, schema_name=schema_name)),
+        "serving_schema": schema_name,
+        "serving_relation_names": list(RELATION_NAMES),
     }
 
 
@@ -736,12 +811,12 @@ async def publish_adopted_npi_result_generation(
                     f"UPDATE {_quoted(schema)}.{_quoted(TABLE_NAME)} SET "
                     "origin_lineage_id=CAST(:origin_lineage_id AS uuid), "
                     "origin_generation=:origin_generation, published_at=CAST(:published_at AS timestamptz), "
-                    "relation_oids=CAST(:relation_oids AS bigint[]), "
+                    "serving_schema=:serving_schema, serving_relation_names=CAST(:serving_relation_names AS text[]), "
                     "canonical_publication_ref=:publication_ref, "
                     "canonical_publication_generation=:publication_generation, "
                     "canonical_chain_ref=:chain_ref, canonical_import_date=CAST(:import_date AS date) "
                     "WHERE singleton IS TRUE RETURNING singleton, local_lineage_id, local_generation, "
-                    "origin_lineage_id, origin_generation, published_at, relation_oids, "
+                    "origin_lineage_id, origin_generation, published_at, serving_schema, serving_relation_names, "
                     "canonical_publication_ref, canonical_publication_generation, "
                     "canonical_chain_ref, canonical_import_date"
                 ),

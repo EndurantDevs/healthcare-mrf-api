@@ -19,6 +19,7 @@ from db.connection import Database, init_db
 from db.models import NUCCTaxonomy, db
 from process import nucc_protected_source as protected_source
 from process import reference_family_archive as native
+from process import reference_family_result_generation as generation
 from process.control_cancel import raise_if_cancelled
 from process.ext.utils import (
     download_it,
@@ -30,7 +31,10 @@ from process.ext.utils import (
 )
 from process.import_status_events import isoformat_utc
 from process.live_progress import enqueue_live_progress
-from process.provider_directory_cms_native_inputs import prepare_local_native_input_publication
+from process.provider_directory_cms_native_inputs import (
+    finish_local_native_input_publication,
+    prepare_local_native_input_publication,
+)
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -410,6 +414,55 @@ async def _plain_run(session, ctx):
     return observed
 
 
+async def _plain_predecessor(session, schema, *, lock=False):
+    """Capture existing named counter authority before a private candidate can replace it."""
+    from process import provider_directory_cms_native_registration as registration
+
+    if not await session.scalar(
+        text("SELECT to_regclass(:relation) IS NOT NULL"),
+        {"relation": f"{native._quoted(schema)}.reference_family_result_generation"},
+    ):
+        raise native.ReferenceFamilyArchiveError(
+            "prepare-nucc-source-generation: existing family authority is required"
+        )
+    authority = await native.read_reference_family_result_generation_authority(
+        session, importer_id="nucc", schema_name=schema, lock=lock
+    )
+    driver = await native._native_model_copy_driver(
+        session, ("fetch", "fetchrow", "fetchval", "execute", "is_in_transaction")
+    )
+    evidence = await registration.capture_native_input_adoption(
+        driver,
+        ledger_schema=schema,
+        candidate=registration.NativeInputCandidate(schema, "nucc_taxonomy", schema, "nucc_taxonomy"),
+    )
+    if (
+        authority.relations not in (None, ((schema, "nucc_taxonomy"),))
+        or evidence is None
+        and authority.serving_generation is None
+    ):
+        raise native.ReferenceFamilyArchiveError(
+            "prepare-nucc-source-generation: recorded predecessor authority is required"
+        )
+    return {"native_input": evidence, "family_generation": authority.as_dict()}
+
+
+async def _freeze_plain_publication(session, schema):
+    from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
+
+    owner, readers = native.model_family_roles()
+    driver = await native._native_model_copy_driver(session, ("execute", "fetch", "fetchval"))
+    await freeze_fhir_source_snapshot(
+        driver,
+        schema,
+        namespace_owner=owner,
+        reader_roles=readers,
+        application_roles=(),
+        relation_names=("nucc_taxonomy",),
+        freeze_schema=False,
+    )
+
+
 async def _prepare_plain_stage(ctx):
     """Allocate only this actual attempt's ordinary heap; defer every index until COPY completes."""
     context = ctx["context"]
@@ -419,6 +472,7 @@ async def _prepare_plain_stage(ctx):
     async with _nucc_database(ctx).transaction() as session:
         await _plain_run(session, ctx)
         await native.require_nucc_unretained_rotation(session, schema_name=stage_by_field["schema"])
+        stage_by_field["predecessor"] = await _plain_predecessor(session, stage_by_field["schema"])
         await native._create_model_heaps(
             session,
             native.reference_family_spec("nucc"),
@@ -427,31 +481,42 @@ async def _prepare_plain_stage(ctx):
             ordinary_heaps=True,
             physical_names={"nucc_taxonomy": stage_by_field["name"]},
         )
-        stage_by_field["oid"] = await native._relation_oid(session, stage_by_field["schema"], stage_by_field["name"])
-        stage_by_field["owner_oid"] = await session.scalar(
-            text("SELECT (SELECT oid FROM pg_roles WHERE rolname=current_user)::bigint")
-        )
-        if await native._relation_oid(session, stage_by_field["schema"], "nucc_taxonomy") is None:
-            await _nucc_database(ctx).create_table(NUCCTaxonomy.__table__, checkfirst=True)
-        stage_by_field["previous_oid"] = await native._relation_oid(session, stage_by_field["schema"], "nucc_taxonomy")
         await _require_plain_stage(session, stage_by_field)
         context["nucc_plain_stage"] = stage_by_field
     ctx["import_date"] = stage_by_field["name"].removeprefix("nucc_taxonomy_")
 
 
 async def _require_plain_stage(session, stage):
-    """Reject a changed, attached, inherited, hooked or differently owned ordinary candidate."""
-    observed = await session.scalar(
-        text("""SELECT c.oid=:oid AND c.relowner=:owner AND c.relkind='r'
- AND c.relpersistence='p' AND NOT c.relispartition AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
- AND c.relowner=(SELECT oid FROM pg_roles WHERE rolname=current_user) AND session_user=current_user
- AND NOT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)
- FROM pg_class c WHERE c.oid=to_regclass(:relation)"""),
-        {"oid": stage["oid"], "owner": stage["owner_oid"], "relation": _plain_relation(stage)},
+    """Read the declared permanent model and dependencies using native privileges."""
+    schema, name = native._schema_name(stage["schema"]), native._schema_name(stage["name"])
+    if name != "nucc_taxonomy" and re.fullmatch(r"nucc_taxonomy_s_[a-z0-9]+", name) is None:
+        raise native.ReferenceFamilyArchiveError("NUCC ordinary candidate name differs")
+    await session.execute(text(f"LOCK TABLE ONLY {_plain_relation(stage)} IN ACCESS SHARE MODE NOWAIT"))
+    address = await session.scalar(
+        text("""SELECT c.oid::bigint FROM pg_class c WHERE c.oid=to_regclass(:relation)
+ AND c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+ AND NOT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)"""),
+        {"relation": _plain_relation(stage)},
     )
-    if observed is not True:
-        raise native.ReferenceFamilyArchiveError("NUCC ordinary candidate identity changed")
-    await native.require_native_read_catalog(session, (stage["oid"],))
+    if type(address) is not int or address <= 0:
+        raise native.ReferenceFamilyArchiveError("NUCC ordinary candidate layout changed")
+    await native._require_nucc_native_columns(session, address)
+    await native.require_native_read_catalog(session, (address,))
+    # A published plain heap may retain its existing named native revision hook.
+    from process import provider_directory_cms_native_registration as registration
+
+    driver = await native._native_model_copy_driver(
+        session, ("fetch", "fetchrow", "fetchval", "execute", "is_in_transaction")
+    )
+    if name == "nucc_taxonomy":
+        await registration.capture_native_input_adoption(
+            driver, ledger_schema=schema, candidate=registration.NativeInputCandidate(schema, name, schema, name)
+        )
+    elif await session.scalar(
+        text("SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=to_regclass(:relation) AND NOT tgisinternal)"),
+        {"relation": _plain_relation(stage)},
+    ):
+        raise native.ReferenceFamilyArchiveError("NUCC ordinary candidate hooks differ")
 
 
 def _plain_result(rows):
@@ -488,7 +553,8 @@ async def _commit_plain_run(session, ctx, result_by_field):
             await session.execute(
                 text(f"""UPDATE {native._quoted(_nucc_schema())}.import_run SET
  status='succeeded',phase_detail='nucc published',progress=CAST(:progress AS json),error=NULL,
- metrics=(COALESCE(metrics::jsonb,'{{}}'::jsonb)||jsonb_build_object('rows',CAST(:rows AS bigint)))::json,
+ metrics=(COALESCE(metrics::jsonb,'{{}}'::jsonb)||jsonb_build_object('rows',CAST(:rows AS bigint),
+ 'nucc_named_publication',CAST(:publication AS jsonb)))::json,
  heartbeat_at=clock_timestamp() AT TIME ZONE 'UTC',finished_at=clock_timestamp() AT TIME ZONE 'UTC'
  WHERE run_id=:run AND importer='nucc' AND engine='healthcare-mrf-api' AND status='running'
  AND progress->>'attempt_id'=:attempt AND progress->>'attempt_started_at'=:started
@@ -499,6 +565,7 @@ async def _commit_plain_run(session, ctx, result_by_field):
                     "started": started,
                     "progress": json.dumps(progress_by_field),
                     "rows": result_by_field["rows"],
+                    "publication": json.dumps(result_by_field.get("publication")),
                 },
             )
         )
@@ -532,7 +599,7 @@ async def _read_plain_commit(ctx, stage, result_by_field):
             observed["status"] == "running"
             and (observed["progress"] or {}).get("attempt_id") == attempt
             and (observed["progress"] or {}).get("attempt_started_at") == started
-            and await native._relation_oid(session, stage["schema"], stage["name"]) == stage["oid"]
+            and await native._relation_oid(session, stage["schema"], stage["name"]) is not None
         ):
             return None
         if (
@@ -543,9 +610,16 @@ async def _read_plain_commit(ctx, stage, result_by_field):
             or (observed["progress"] or {}).get("attempt_id") != attempt
             or (observed["progress"] or {}).get("attempt_started_at") != started
             or (observed["progress"] or {}).get("phase") != "nucc published"
-            or await native._relation_oid(session, stage["schema"], "nucc_taxonomy") != stage["oid"]
+            or await native._relation_oid(session, stage["schema"], stage["name"]) is not None
         ):
             raise native.ReferenceFamilyArchiveError("NUCC publication readback differs")
+        saved = result_by_field.get("publication")
+        if saved is None or (observed["metrics"] or {}).get("nucc_named_publication") != saved:
+            raise native.ReferenceFamilyArchiveError(
+                "transition-legacy-nucc-publication: recorded named generation required"
+            )
+        if await _plain_predecessor(session, stage["schema"], lock=True) != saved:
+            raise native.ReferenceFamilyArchiveError("NUCC publication named generation changed")
         published_by_field = {**stage, "name": "nucc_taxonomy"}
         await _require_plain_stage(session, published_by_field)
         if (await native._validate_nucc_table_set(session, stage["schema"], "nucc_taxonomy"))[
@@ -557,6 +631,10 @@ async def _read_plain_commit(ctx, stage, result_by_field):
 
 async def _finish_plain_stage(session, stage, expected_rows):
     """Finish indexes and set checks under the isolated candidate lock before the short serving-table cutover."""
+    if type(stage.get("predecessor")) is not dict or set(stage["predecessor"]) != {"native_input", "family_generation"}:
+        raise native.ReferenceFamilyArchiveError(
+            "transition-legacy-nucc-stage: recorded predecessor authority is required"
+        )
     await _require_plain_stage(session, stage)
     await session.execute(text(f"LOCK TABLE ONLY {_plain_relation(stage)} IN ACCESS EXCLUSIVE MODE NOWAIT"))
     await native._create_model_indexes(
@@ -570,11 +648,11 @@ async def _finish_plain_stage(session, stage, expected_rows):
     if count != expected_rows:
         raise native.ReferenceFamilyArchiveError("NUCC parsed and staged census differ")
     await native.require_nucc_unretained_rotation(session, schema_name=stage["schema"])
-    await session.execute(
-        text(f"LOCK TABLE ONLY {native._quoted(stage['schema'])}.nucc_taxonomy IN ACCESS EXCLUSIVE MODE")
-    )
-    if await native._relation_oid(session, stage["schema"], "nucc_taxonomy") != stage["previous_oid"]:
+    if await _plain_predecessor(session, stage["schema"], lock=True) != stage["predecessor"]:
         raise native.ReferenceFamilyArchiveError("NUCC plain predecessor changed")
+    await session.execute(
+        text(f"LOCK TABLE ONLY {native._quoted(stage['schema'])}.nucc_taxonomy IN ACCESS SHARE MODE NOWAIT")
+    )
     return count
 
 
@@ -586,9 +664,10 @@ async def _publish_plain_generation(ctx):
     times = None
     try:
         async with _nucc_database(ctx).transaction() as session:
+            await session.execute(text("SET LOCAL lock_timeout='100ms'"))
             await _plain_run(session, ctx)
             count = await _finish_plain_stage(session, stage, context["rows"])
-            await prepare_local_native_input_publication(
+            native_input_publication = await prepare_local_native_input_publication(
                 session,
                 ledger_schema=stage["schema"],
                 relations=(("nucc_taxonomy", stage["name"]),),
@@ -597,7 +676,19 @@ async def _publish_plain_generation(ctx):
             await session.execute(text(f"DROP TABLE IF EXISTS {schema}.nucc_taxonomy_old"))
             await session.execute(text(f"ALTER TABLE IF EXISTS {schema}.nucc_taxonomy RENAME TO nucc_taxonomy_old"))
             await session.execute(text(f"ALTER TABLE {_plain_relation(stage)} RENAME TO nucc_taxonomy"))
-            result_by_field = _plain_result(count)
+            await finish_local_native_input_publication(session, prepared=native_input_publication)
+            await _freeze_plain_publication(session, stage["schema"])
+            published_by_field = {**stage, "name": "nucc_taxonomy"}
+            await _require_plain_stage(session, published_by_field)
+            if (await native._validate_nucc_table_set(session, stage["schema"], "nucc_taxonomy"))["row_count"] != count:
+                raise native.ReferenceFamilyArchiveError("NUCC frozen published census changed")
+            authority = await generation.publish_immutable_nucc_generation(
+                session, schema_name=stage["schema"], expected_authority=stage["predecessor"]["family_generation"]
+            )
+            publication = await _plain_predecessor(session, stage["schema"], lock=True)
+            if publication["family_generation"] != authority.as_dict():
+                raise native.ReferenceFamilyArchiveError("NUCC published generation changed")
+            result_by_field = {**_plain_result(count), "publication": publication}
             times = await _commit_plain_run(session, ctx, result_by_field)
     except BaseException:
         if result_by_field is None or not context.get("_control_attempt_id"):
@@ -630,10 +721,10 @@ async def _cleanup_plain_stage(ctx):
     stage = (ctx.get("context") or {}).get("nucc_plain_stage")
     if stage is None:
         return
+    if stage["name"] == "nucc_taxonomy":
+        raise native.ReferenceFamilyArchiveError("NUCC ordinary cleanup requires an unpublished candidate name")
     async with _nucc_database(ctx).transaction() as session:
         if await native._relation_oid(session, stage["schema"], stage["name"]) is None:
-            return
-        if await native._relation_oid(session, stage["schema"], "nucc_taxonomy") == stage["oid"]:
             return
         await _require_plain_stage(session, stage)
         await session.execute(text(f"DROP TABLE {_plain_relation(stage)}"))

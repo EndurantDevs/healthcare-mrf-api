@@ -25,7 +25,7 @@ async def test_endpoint_native_limits_and_cleanup_on_all_exits(monkeypatch, outc
         async def execute(self, statement, *args, **kwargs):
             executed_sql_statements.append(str(statement))
             result = await super().execute(statement, *args, **kwargs)
-            if "pg_current_snapshot()" in str(statement):
+            if "transaction_timestamp() AS observed_at" in str(statement):
                 observed_rows.append((await super().execute(text(_SETTINGS))).one())
                 if outcome == "timeout":
                     await super().execute(text("SELECT pg_sleep(1)"))

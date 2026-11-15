@@ -192,11 +192,7 @@ _SESSION: contextvars.ContextVar[Optional[AsyncSession]] = contextvars.ContextVa
 
 
 async def _execute_buffered_reader_statement(session, statement, parameters):
-    """Guard active fixed-name inventories on the original buffered execution seam."""
-    from api.network_read_execution import execute_network_read, has_network_read_inventory
-
-    if has_network_read_inventory(session):
-        return await execute_network_read(session, statement, parameters)
+    """Execute through the configured request session."""
     return await session.execute(statement, parameters)
 
 
@@ -652,7 +648,6 @@ class Database:
                 else reader.session()
             )
             async with self._verified_reader_session(
-                reader,
                 scope,
                 temporary_setup=temporary_setup is not None,
                 prepare_plan_workspace=prepare_plan_workspace,
@@ -660,24 +655,14 @@ class Database:
                 yield session
 
     @asynccontextmanager
-    async def _verified_reader_session(self, reader, scope, *, temporary_setup, prepare_plan_workspace):
-        """Verify login and prepared modes while owning binding cleanup and cancellation."""
+    async def _verified_reader_session(self, scope, *, temporary_setup, prepare_plan_workspace):
+        """Bind configured Reader transactions and preserve cleanup and cancellation."""
         prepared = temporary_setup or prepare_plan_workspace
         async with scope as session:
             reader_context_token = None
             try:
-                identity_result = await session.execute(
-                    sa_text(
-                        "SELECT session_user, current_user, "
-                        "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user), "
-                        "(SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database()), "
-                        "host(inet_server_addr()), inet_server_port(), pg_backend_pid()"
-                    )
-                )
-                identity_values = tuple(identity_result.first())
-                if identity_values[:2] != (reader._reader_login[0], reader._reader_login[0]):
-                    raise RuntimeError("Reader session login identity differs")
                 if prepared:
+                    await self._pin_provider_reader(session)
                     modes = await session.execute(
                         sa_text(
                             "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')"
@@ -685,13 +670,9 @@ class Database:
                     )
                     if tuple(modes.first()) != ("repeatable read", "on"):
                         raise RuntimeError("Prepared Reader must remain repeatable read and read only")
-                session.info["api_reader_identity"] = dict(
-                    zip(
-                        ("role_oid", "database_oid", "server_address", "server_port", "backend_pid"),
-                        identity_values[2:],
-                        strict=True,
-                    )
-                )
+                else:
+                    # Start the transaction without fixing a data snapshot before named locks.
+                    await session.execute(sa_text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
                 session.info["api_reader_verified"] = True
                 if prepare_plan_workspace:
                     session.info["native_plan_workspace"] = True
@@ -705,16 +686,16 @@ class Database:
                 if reader_context_token is not None:
                     _READER.reset(reader_context_token)
                 session.info.pop("api_reader_verified", None)
-                session.info.pop("api_reader_identity", None)
                 session.info.pop("native_plan_workspace", None)
-                session.info.pop("api_network_read_inventory", None)
+                session.info.pop("provider_profile_relations", None)
+                session.info.pop("snapshot_claims_dictionary_tables", None)
 
     async def bind_request_reader(self, request):
         """Replace only this request's unused ordinary session with a genuine Reader."""
         session = getattr(request.ctx, "sa_session", None)
         if session is not None and self.has_reader_session() and current_session() is session:
             if session.info.get("api_reader_verified") is not True:
-                raise RuntimeError("Request Reader identity is unavailable")
+                raise RuntimeError("Request Reader binding is unavailable")
             return session
         if (
             session is None
@@ -729,14 +710,33 @@ class Database:
         session = await scope.__aenter__()
         request.ctx._sa_reader_scope = scope
         request.ctx.sa_session = request.ctx.session = session
-        from api.reference_family_reads import pin_claims_reader
-
         try:
-            await pin_claims_reader(session)
+            await self._pin_request_reader(request, session)
         except BaseException:
             await self._close_request_session(request, success=False)
             raise
         return session
+
+    async def _pin_request_reader(self, request, session):
+        """Pin provider names before claims setup freezes the request snapshot."""
+        from api.reference_family_reads import pin_claims_reader
+
+        if getattr(request, "path", "").startswith(
+            (
+                "/api/v1/npi",
+                "/api/v1/extensions/custom-import/providers",
+                "/api/v1/pricing/providers/search-by-procedure",
+            )
+        ):
+            await self._pin_provider_reader(session)
+        await pin_claims_reader(session)
+
+    async def _pin_provider_reader(self, session):
+        """Pin serving names while the owning Reader has not taken a data snapshot."""
+        from api.endpoint.npi import _runtime_db_schema
+        from api.provider_profile_snapshot import _prepare_provider_reader
+
+        await _prepare_provider_reader(session, _runtime_db_schema(), fresh=True)
 
     @asynccontextmanager
     async def _prepared_reader_session(self, reader, temporary_setup):
@@ -747,6 +747,7 @@ class Database:
         primary_failure = None
         try:
             await session.execute(sa_text("SET TRANSACTION READ WRITE"))
+            await self._pin_provider_reader(session)
             await temporary_setup(session)
             await session.execute(sa_text("SET TRANSACTION READ ONLY"))
             yield session
@@ -764,6 +765,8 @@ class Database:
                     raise
                 primary_failure.add_note("Reader cleanup failed: " + type(cleanup_failure).__name__)
             finally:
+                session.info.pop("provider_profile_relations", None)
+                session.info.pop("snapshot_claims_dictionary_tables", None)
                 _SESSION.reset(session_token)
 
     @staticmethod
@@ -981,10 +984,8 @@ class Database:
                 from sanic.exceptions import ServiceUnavailable
                 from sqlalchemy.exc import SQLAlchemyError
 
-                from api.reference_family_reads import pin_claims_reader
-
                 try:
-                    await pin_claims_reader(session)
+                    await self._pin_request_reader(request, session)
                 except (RuntimeError, SQLAlchemyError) as failure:
                     from api.custom_import_read_http import _log_failure
                     from api.signed_request_reader import _remember_reader_failure

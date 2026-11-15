@@ -18,14 +18,13 @@ from process.provider_directory_rooted_graph_terminal import (
 )
 from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding
 from tests.provider_directory_rooted_graph_publication_test_support import twin_admission
-from tests.test_provider_directory_rooted_graph_publication_freeze import _current_bodies
 
 
 @pytest.fixture
 def rooted_handoff():
-    binding = FHIRSourceStorageBinding("catalog", "candidate", 1, 2, 3, 4, 5, "a" * 64)
+    binding = FHIRSourceStorageBinding("catalog", "candidate")
     issued = SimpleNamespace(storage_binding=binding, producer_identity=("b" * 40, "c" * 40))
-    storage_by_field = {**asdict(binding), "producer": list(issued.producer_identity)}
+    storage_by_field = asdict(binding)
     handoff_by_field = {
         "contract": freeze.CONTRACT,
         "phase": "ready_for_freeze",
@@ -44,10 +43,16 @@ def rooted_handoff():
         },
         "admission": json.loads(candidate.candidate_json(asdict(twin_admission()))),
         "tables": {
-            root: {"oid": 100 + index, "name": "pdgs_" + "f" * 32 + "_" + chr(97 + index), "owner": 4}
+            root: {"schema": "candidate", "name": "pdgs_" + "f" * 32 + "_" + chr(97 + index)}
             for index, root in enumerate(candidate.ROOTS)
         },
-        "catalog": [],
+        "inputs": {
+            "provider_directory_rooted_graph_" + name: {
+                "schema": "candidate",
+                "name": "provider_directory_rooted_graph_" + name,
+            }
+            for name in ("acquisition", "work", "resource", "edge", "twin_attempt", "twin_admission")
+        },
         "dataset_hash": "1" * 64,
         "counts": {"Practitioner": 1},
         "snapshot": {},
@@ -57,7 +62,7 @@ def rooted_handoff():
     return SimpleNamespace(
         document=handoff_by_field,
         storage=storage_by_field,
-        runtime=SimpleNamespace(manifest=issued, candidate_schema="candidate"),
+        runtime=SimpleNamespace(manifest=issued, candidate_schema="candidate", operation={}),
     )
 
 
@@ -82,10 +87,8 @@ def test_handoff_has_canonical_dates_and_detached_json(rooted_handoff):
         ("phase", "handoff"),
         ("storage", "storage"),
         ("missing-table", "inventory"),
-        ("duplicate-oid", "inventory"),
         ("duplicate-name", "inventory"),
         ("unsafe-name", "inventory"),
-        ("owner", "inventory"),
         ("identity", "identity"),
         ("hash", "hash"),
         ("source", "source_attempt"),
@@ -105,10 +108,8 @@ def test_handoff_rejects_changed_identity_inventory_and_unbounded_evidence(roote
         "phase": lambda: document.update(phase="published"),
         "storage": lambda: document.update(storage={}),
         "missing-table": lambda: document["tables"].pop(candidate.HEADER),
-        "duplicate-oid": lambda: second.update(oid=first["oid"]),
         "duplicate-name": lambda: second.update(name=first["name"]),
-        "unsafe-name": lambda: first.update(name="unrelated"),
-        "owner": lambda: first.update(owner=9),
+        "unsafe-name": lambda: first.update(name="unsafe.name"),
         "identity": lambda: document["identity"].update(dataset_id="unrelated"),
         "hash": lambda: document.update(dataset_hash="invalid"),
         "source": lambda: document["identity"]["metadata"].update(source_ids=["other-source"]),
@@ -120,7 +121,7 @@ def test_handoff_rejects_changed_identity_inventory_and_unbounded_evidence(roote
         "large": lambda: document["snapshot"].update(padding="x" * 262144),
     }
     mutations_by_name[mutation]()
-    with pytest.raises(GenericCandidateError, match=code):
+    with pytest.raises((GenericCandidateError, ValueError), match=code if mutation != "unsafe-name" else "identifier"):
         candidate.validate_rooted_handoff_document(document, rooted_handoff.storage)
 
 
@@ -193,13 +194,13 @@ async def test_lineage_depth_is_bounded():
     assert connection.fetchrow.await_count == 1024
 
 
-def test_frozen_query_preserves_reviewed_predicates_and_pinned_root_reads(rooted_handoff):
-    original = _current_bodies()[freeze.ROOTED]
-    successor = freeze.wrapped_body(freeze.ROOTED, "snapshot_schema", original)
-    query = candidate._frozen_validation_query(original, "snapshot_schema", rooted_handoff.document)
-    assert candidate._frozen_validation_query(successor, "snapshot_schema", rooted_handoff.document) == query
+def test_frozen_query_preserves_named_pinned_reads(rooted_handoff):
+    predecessor = '"prior_snapshot"."resources"'
+    query = candidate._frozen_validation_query(
+        None, "snapshot_schema", rooted_handoff.document, predecessor_resource=predecessor
+    )
     assert "UNION ALL" in query and "WHERE dataset_id=$2" in query
     assert "candidate_dataset_id" not in query
-    for body in ("SELECT true;", original + "\n-- changed validator\n"):
-        with pytest.raises(GenericCandidateError, match="validator_changed"):
-            candidate._frozen_validation_query(body, "snapshot_schema", rooted_handoff.document)
+    assert predecessor in query
+    for table in rooted_handoff.document["tables"].values():
+        assert '"' + table["schema"] + '"."' + table["name"] + '"' in query

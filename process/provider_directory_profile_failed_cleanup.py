@@ -11,20 +11,20 @@ from datetime import datetime, timedelta, timezone
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-CONTRACT = "healthporta.provider-directory.failed-profile-cleanup-authorization.v1"
-LEGACY_CONTRACT = "healthporta.provider-directory.failed-profile-cleanup-authorization.v2"
-LEGACY_RECEIPT_CONTRACT = "healthporta.provider-directory.failed-profile-cleanup-receipt.v2"
-INITIAL_CONTRACT = "healthporta.provider-directory.failed-profile-cleanup-authorization.v3"
-INITIAL_RECEIPT_CONTRACT = "healthporta.provider-directory.failed-profile-cleanup-receipt.v3"
+CONTRACT = "healthporta.provider-directory.failed-profile-cleanup-authorization.v4"
+LEGACY_CONTRACT = "healthporta.provider-directory.failed-profile-cleanup-authorization.v5"
+LEGACY_RECEIPT_CONTRACT = "healthporta.provider-directory.failed-profile-cleanup-receipt.v5"
+INITIAL_CONTRACT = "healthporta.provider-directory.failed-profile-cleanup-authorization.v6"
+INITIAL_RECEIPT_CONTRACT = "healthporta.provider-directory.failed-profile-cleanup-receipt.v6"
 SIGNATURE_DOMAIN = CONTRACT + ".signature"
 DIGEST_DOMAIN = CONTRACT + ".digest"
-RECEIPT_CONTRACT = "healthporta.provider-directory.failed-profile-cleanup-receipt.v1"
+RECEIPT_CONTRACT = "healthporta.provider-directory.failed-profile-cleanup-receipt.v4"
 MARKER = "\n[provider_directory_failed_profile_cleanup_v1 "
 MAX_BYTES = 64 * 1024
 BODY_FIELDS = frozenset(
-    "contract_id purpose authorization_id operation_id reservation_id nonce issued_at expires_at max_operation_deadline attestor_id key_id environment_id attestor_release_digest executor_identity database checkpoint stages observations volumes limits".split()
+    "contract_id purpose authorization_id operation_id reservation_id nonce issued_at expires_at max_operation_deadline attestor_id key_id environment_id attestor_release_digest executor_identity database checkpoint stages observations storage_classes limits".split()
 )
-DATABASE_FIELDS = frozenset("database_system_identifier database_oid database_name schema tablespaces".split())
+DATABASE_FIELDS = frozenset({"schema"})
 CHECKPOINT_FIELDS = frozenset(
     "build_id owner_run_id preimage_sha256 original_error_sha256 resume_lineage_hash capacity_geometry_hash executable_plan_hash selection_proof_id authority_revision control_generation".split()
 )
@@ -39,15 +39,28 @@ RECEIPT_FIELDS = frozenset(
 )
 
 
-LEGACY_BODY_FIELDS = BODY_FIELDS | {"variant", "physical", "publication"}
-INITIAL_BODY_FIELDS = BODY_FIELDS | {"variant", "physical", "initial"}
+LEGACY_BODY_FIELDS = BODY_FIELDS | {"variant", "capacity", "publication"}
+INITIAL_BODY_FIELDS = BODY_FIELDS | {"variant", "capacity", "initial"}
 LEGACY_CHECKPOINT_FIELDS = CHECKPOINT_FIELDS | {"lineage_kind", "owner_params_sha256"}
 POSTGRES_FIELDS = frozenset(
-    "database_system_identifier database_oid database_name tablespace_oid tablespace_name temp_tablespace_oid temp_tablespace_name postgres_server_version_num postgres_block_size_bytes postgres_wal_block_size_bytes postgres_wal_segment_size_bytes postgres_full_page_writes postgres_wal_compression postgres_wal_level postgres_wal_log_hints postgres_data_checksums postgres_default_toast_compression postgres_checkpoint_timeout_seconds postgres_max_wal_size_bytes postgres_toast_max_chunk_size_bytes postgres_maxalign_bytes postgres_btree_version".split()
+    "postgres_server_version_num postgres_block_size_bytes postgres_wal_block_size_bytes postgres_wal_segment_size_bytes postgres_full_page_writes postgres_wal_compression postgres_wal_level postgres_wal_log_hints postgres_data_checksums postgres_default_toast_compression postgres_checkpoint_timeout_seconds postgres_max_wal_size_bytes postgres_toast_max_chunk_size_bytes postgres_maxalign_bytes postgres_btree_version".split()
 )
 PUBLICATION_FIELDS = frozenset(
-    "serving_state serving_table_oid delta_receipt_table_oid cms_receipt_table_oid targets published_run_id published_run_preimage_sha256 published_result_sha256 published_generation_id published_proof_id published_control_generation".split()
+    "serving_state relations targets published_run_id published_run_preimage_sha256 published_result_sha256 published_generation_id published_proof_id published_control_generation".split()
 )
+
+
+HISTORICAL_CONTRACTS = frozenset(
+    f"healthporta.provider-directory.failed-profile-cleanup-authorization.v{version}" for version in (1, 2, 3)
+)
+_HISTORICAL_BASE_FIELDS = (BODY_FIELDS - {"storage_classes"}) | {"volumes"}
+_HISTORICAL_FIELDS = {
+    "healthporta.provider-directory.failed-profile-cleanup-authorization.v1": _HISTORICAL_BASE_FIELDS,
+    "healthporta.provider-directory.failed-profile-cleanup-authorization.v2": _HISTORICAL_BASE_FIELDS
+    | {"variant", "physical", "publication"},
+    "healthporta.provider-directory.failed-profile-cleanup-authorization.v3": _HISTORICAL_BASE_FIELDS
+    | {"variant", "physical", "initial"},
+}
 
 
 def signature_domain(body):
@@ -129,25 +142,16 @@ def integer(value, minimum=0, maximum=(1 << 63) - 1):
 
 
 def _validate_coordinates(body):
-    exact(body["database"], DATABASE_FIELDS)
-    database = body["database"]
-    for field in ("database_system_identifier", "database_name", "schema"):
-        text(database[field])
-    integer(database["database_oid"], 1, (1 << 32) - 1)
-    if not isinstance(database["tablespaces"], list) or len(database["tablespaces"]) != 2:
-        fail("tablespaces_invalid")
-    for entry, usage in zip(database["tablespaces"], ("data", "temp"), strict=True):
-        exact(entry, {"usage", "tablespace_oid", "tablespace_name", "volume_digest"})
-        if entry["usage"] != usage:
-            fail("tablespaces_invalid")
-        integer(entry["tablespace_oid"], 1, (1 << 32) - 1)
-        text(entry["tablespace_name"])
-        hash64(entry["volume_digest"])
+    database = exact(body["database"], DATABASE_FIELDS)
+    text(database["schema"], 63)
     if body.get("variant") == "legacy_full_swap":
         _validate_legacy_coordinates(body)
         return
     checkpoint = exact(body["checkpoint"], CHECKPOINT_FIELDS)
-    if re.fullmatch(r"pdpb_[0-9a-f]{32}", checkpoint["build_id"]) is None:
+    if (
+        not isinstance(checkpoint["build_id"], str)
+        or re.fullmatch(r"pdpb_[0-9a-f]{32}", checkpoint["build_id"]) is None
+    ):
         fail("build_invalid")
     for field in ("owner_run_id", "selection_proof_id"):
         text(checkpoint[field])
@@ -196,37 +200,30 @@ def _validate_legacy_coordinates(body):
 
 
 def _validate_legacy_manifests(body):
-    """Validate legacy physical, dependency and publication witnesses in their fixed order."""
-    _validate_physical_dependencies(body)
+    """Validate named publication data and numeric disposal limits."""
+    _validate_capacity_dependencies(body)
     publication = exact(body["publication"], PUBLICATION_FIELDS)
     if publication["serving_state"] not in {"empty", "singleton"}:
         fail("publication_invalid")
-    for field in ("serving_table_oid", "delta_receipt_table_oid", "cms_receipt_table_oid"):
-        integer(publication[field], 1, (1 << 32) - 1)
+    relations = exact(publication["relations"], {"serving_generation", "delta_receipt", "cms_receipt"})
+    for coordinate in relations.values():
+        _named_coordinate(coordinate)
     for field in ("published_run_id", "published_generation_id", "published_proof_id"):
         text(publication[field], 128)
     for field in ("published_run_preimage_sha256", "published_result_sha256"):
         hash64(publication[field])
     integer(publication["published_control_generation"], 1)
-    target_entries = publication["targets"]
-    if not isinstance(target_entries, list) or len(target_entries) != 2:
-        fail("publication_invalid")
-    for target_entry, role in zip(target_entries, ("evidence", "profile"), strict=True):
-        exact(target_entry, {"role", "oid", "storage_fingerprint"})
-        if target_entry["role"] != role:
-            fail("publication_invalid")
-        integer(target_entry["oid"], 1, (1 << 32) - 1)
-        hash64(target_entry["storage_fingerprint"])
-    if len({target_entry["oid"] for target_entry in target_entries}) != 2 or {
-        entry["oid"] for entry in body["stages"]
-    } & {target_entry["oid"] for target_entry in target_entries}:
+    _validate_named_stages(publication["targets"], ("evidence", "profile"))
+    if {_coordinate_key(stage) for stage in body["stages"]} & {
+        _coordinate_key(target) for target in publication["targets"]
+    }:
         fail("stage_is_serving")
 
 
-def _validate_physical_dependencies(body):
-    """Validate both bounded stage DROP dependencies independently of publication mode."""
-    physical = _validated_legacy_physical(body)
-    dependencies = physical["stage_dependencies"]
+def _validate_capacity_dependencies(body):
+    """Check bounded native catalog deletion counters without dependency identity."""
+    capacity = _validated_cleanup_capacity(body)
+    dependencies = capacity["stage_dependencies"]
     if not isinstance(dependencies, list) or len(dependencies) != 2:
         fail("dependencies_invalid")
     for entry, role in zip(dependencies, ("evidence", "profile"), strict=True):
@@ -237,7 +234,6 @@ def _validate_physical_dependencies(body):
                 "object_count",
                 "relation_count",
                 "catalog_tuple_count",
-                "fingerprint",
                 "catalog_deletions",
                 "drop_wal_upper_bytes",
             },
@@ -247,7 +243,6 @@ def _validate_physical_dependencies(body):
         integer(entry["object_count"], 1, 128)
         integer(entry["relation_count"], 1, 32)
         integer(entry["catalog_tuple_count"], 1, 8192)
-        hash64(entry["fingerprint"])
     _validate_catalog_deletions(dependencies)
 
 
@@ -273,12 +268,12 @@ def _validate_catalog_deletions(dependencies):
         for deletion, catalog in zip(deletions, catalogs, strict=True):
             exact(
                 deletion,
-                {"catalog", "oid", "storage_fingerprint", "deleted_rows", "deleted_toast_chunks", "wal_upper_bytes"},
+                {"catalog", "schema", "name", "deleted_rows", "deleted_toast_chunks", "wal_upper_bytes"},
             )
             if deletion["catalog"] != catalog:
                 fail("catalog_deletions_invalid")
-            integer(deletion["oid"], 1, (1 << 32) - 1)
-            hash64(deletion["storage_fingerprint"])
+            if deletion["schema"] != "pg_catalog" or deletion["name"] != catalog:
+                fail("catalog_deletions_invalid")
             for field in ("deleted_rows", "deleted_toast_chunks", "wal_upper_bytes"):
                 integer(deletion[field])
         variable_wal = sum(deletion["wal_upper_bytes"] for deletion in deletions)
@@ -291,17 +286,30 @@ def _validate_catalog_deletions(dependencies):
 
 
 def _validate_stages(body):
-    roles = stage_roles(body)
-    if not isinstance(body["stages"], list) or len(body["stages"]) != len(roles):
+    _validate_named_stages(body["stages"], stage_roles(body))
+
+
+def _named_coordinate(coordinate):
+    exact(coordinate, {"schema", "name"})
+    text(coordinate["schema"], 63)
+    text(coordinate["name"], 63)
+    return coordinate
+
+
+def _coordinate_key(coordinate):
+    return coordinate["schema"], coordinate["name"]
+
+
+def _validate_named_stages(stages, roles):
+    if not isinstance(stages, list) or len(stages) != len(roles):
         fail("stages_invalid")
-    for item, role in zip(body["stages"], roles, strict=True):
-        exact(item, {"role", "oid", "storage_fingerprint"})
-        if item["role"] != role:
+    for stage, role in zip(stages, roles, strict=True):
+        exact(stage, {"role", "schema", "name"})
+        if stage["role"] != role:
             fail("stages_invalid")
-        integer(item["oid"], 1, (1 << 32) - 1)
-        hash64(item["storage_fingerprint"])
-    if len({item["oid"] for item in body["stages"]}) != len(roles):
-        fail("stage_oid_reused")
+        _named_coordinate({name: stage[name] for name in ("schema", "name")})
+    if len({_coordinate_key(stage) for stage in stages}) != len(roles):
+        fail("stage_name_reused")
 
 
 def _validate_limits(body):
@@ -312,47 +320,34 @@ def _validate_limits(body):
         fail("operation_limit_invalid")
     if not 1 <= limits["lock_timeout_ms"] <= limits["statement_timeout_ms"] <= 30000:
         fail("timeout_invalid")
-    volumes = body["volumes"]
-    if not isinstance(volumes, list) or len(volumes) != 3:
-        fail("volumes_invalid")
-    totals, free = {}, {}
-    for entry, role in zip(volumes, ("data", "temp", "wal"), strict=True):
-        exact(
-            entry,
-            {
-                "volume_class",
-                "volume_digest",
-                "reserved_bytes",
-                "available_bytes",
-                "available_after_all_reservations_bytes",
-            },
-        )
-        if entry["volume_class"] != role or entry["reserved_bytes"] != limits[role + "_bytes"]:
-            fail("volume_limit_invalid")
-        volume_digest = hash64(entry["volume_digest"])
+    classes = body["storage_classes"]
+    if not isinstance(classes, list) or len(classes) != 3:
+        fail("storage_classes_invalid")
+    outstanding = 0
+    for entry, role in zip(classes, ("data", "temp", "wal"), strict=True):
+        exact(entry, {"storage_class", "reserved_bytes", "available_bytes", "available_after_all_reservations_bytes"})
+        if entry["storage_class"] != role or entry["reserved_bytes"] != limits[role + "_bytes"]:
+            fail("storage_limit_invalid")
         for field in ("reserved_bytes", "available_bytes", "available_after_all_reservations_bytes"):
             integer(entry[field])
-        remaining = entry["available_after_all_reservations_bytes"]
-        if remaining > entry["available_bytes"]:
-            fail("volume_remaining_invalid")
-        identity = (entry["available_bytes"], remaining)
-        if free.setdefault(volume_digest, identity) != identity:
-            fail("colocated_volume_invalid")
-        totals[volume_digest] = totals.get(volume_digest, 0) + entry["reserved_bytes"]
-    if any(free[key][0] - free[key][1] < field_value for key, field_value in totals.items()):
+        deficit = entry["available_bytes"] - entry["reserved_bytes"] - entry["available_after_all_reservations_bytes"]
+        if deficit < 0:
+            fail("reservation_accounting_invalid")
+        outstanding += deficit
+    if (
+        min(entry["available_bytes"] for entry in classes)
+        < sum(entry["reserved_bytes"] for entry in classes) + outstanding
+    ):
         fail("reservation_accounting_invalid")
-    by_role = {entry["volume_class"]: entry["volume_digest"] for entry in volumes}
-    if any(entry["volume_digest"] != by_role[entry["usage"]] for entry in body["database"]["tablespaces"]):
-        fail("tablespace_volume_invalid")
 
 
 def _validate_observations(body, *, at, fresh):
     if (
         body.get("variant") in {"legacy_full_swap", "initial_full_swap"}
         and fresh
-        and not at - timedelta(seconds=5) <= timestamp(body["physical"]["observed_at"]) <= at
+        and not at - timedelta(seconds=5) <= timestamp(body["capacity"]["observed_at"]) <= at
     ):
-        fail("physical_observation_stale")
+        fail("capacity_observation_stale")
     observations = exact(body["observations"], OBSERVATION_FIELDS)
     for kind in ("host", "control", "healthcare"):
         hash64(observations[kind + "_sha256"])
@@ -367,8 +362,12 @@ def _validate_observations(body, *, at, fresh):
 
 
 def _authorization_body(candidate):
-    """Select one closed version before interpreting variant-specific coordinates."""
+    """Select an exact current version; old signatures confer no new disposal authority."""
     contract = candidate.get("contract_id") if isinstance(candidate, dict) else None
+    if not isinstance(contract, str):
+        fail("purpose_invalid")
+    if contract in HISTORICAL_CONTRACTS:
+        fail("legacy_semantic_evidence_required")
     fields_by_contract = {
         CONTRACT: BODY_FIELDS,
         LEGACY_CONTRACT: LEGACY_BODY_FIELDS,
@@ -410,48 +409,36 @@ def _validate_initial_request(body):
 
 
 def _validate_initial_manifest(body):
-    """Validate compact signed initial bindings without borrowing original build capacity."""
-    manifest = exact(
-        body["initial"],
-        {"target_state", "initial_target_state_sha256", "initial_receipt_oid", "initial_receipt_storage_fingerprint"},
-    )
+    """Bind the logical initial target state and independent disposal capacity."""
+    manifest = exact(body["initial"], {"target_state", "initial_target_state_sha256", "receipt"})
     target, target_hash = _validated_initial_target(manifest["target_state"])
     if manifest["initial_target_state_sha256"] != target_hash:
         fail("initial_target_changed")
-    integer(manifest["initial_receipt_oid"], 1, (1 << 32) - 1)
-    hash64(manifest["initial_receipt_storage_fingerprint"])
-    _validate_physical_dependencies(body)
-    forbidden_oids = {
-        target["evidence_target_oid"],
-        target["profile_target_oid"],
-        manifest["initial_receipt_oid"],
-        body["physical"]["checkpoint_layout"]["oid"],
-        body["physical"]["claim_layout"]["oid"],
-    }
-    if len(forbidden_oids) != 5 or any(stage["oid"] in forbidden_oids for stage in body["stages"]):
+    _named_coordinate(manifest["receipt"])
+    _validate_capacity_dependencies(body)
+    forbidden_names = {_coordinate_key(coordinate) for coordinate in target["targets"].values()}
+    forbidden_names.add(_coordinate_key(manifest["receipt"]))
+    forbidden_names.update(_coordinate_key(body["capacity"][name]) for name in ("checkpoint_layout", "claim_layout"))
+    if len(forbidden_names) != 5 or any(_coordinate_key(stage) in forbidden_names for stage in body["stages"]):
         fail("stage_is_serving")
 
 
 def _validate_initial_bindings(body, geometry, target_state, geometry_hash, target_hash):
-    """Bind verified original capacity, initial target state and independent cleanup physics."""
+    """Bind original semantic geometry and target names to separately funded cleanup."""
     checkpoint = body["checkpoint"]
-    if any(
-        body["initial"][name] != geometry[name]
-        for name in ("initial_target_state_sha256", "initial_receipt_oid", "initial_receipt_storage_fingerprint")
-    ):
-        fail("initial_geometry_changed")
     if (
-        geometry_hash != checkpoint["capacity_geometry_hash"]
+        body["initial"]["initial_target_state_sha256"] != geometry["initial_target_state_sha256"]
+        or geometry_hash != checkpoint["capacity_geometry_hash"]
         or target_hash != geometry["initial_target_state_sha256"]
         or geometry["selection_proof_id"] != checkpoint["selection_proof_id"]
         or geometry["executable_plan_hash"] != checkpoint["executable_plan_hash"]
     ):
         fail("initial_geometry_changed")
     for role in ("evidence", "profile"):
-        for suffix in ("oid", "storage_fingerprint"):
-            field = role + "_target_" + suffix
-            if geometry[field] != target_state[field]:
-                fail("initial_target_changed")
+        if {name: geometry["relations"][role + "_target"][name] for name in ("schema", "name")} != target_state[
+            "targets"
+        ][role]:
+            fail("initial_target_changed")
     history = target_state["historical_publication"]
     if history is not None and (
         history["run_id"] == checkpoint["owner_run_id"]
@@ -459,18 +446,15 @@ def _validate_initial_bindings(body, geometry, target_state, geometry_hash, targ
         or history["result"]["generation"] == checkpoint["control_generation"]
     ):
         fail("build_is_serving")
-    physical = body["physical"]
-    if any(geometry[field] != field_value for field, field_value in physical["postgres"].items() if field in geometry):
-        fail("physical_runtime_changed")
-    if (
-        geometry["build_checkpoint_oid"] != physical["checkpoint_layout"]["oid"]
-        or geometry["build_checkpoint_storage_fingerprint"] != physical["checkpoint_layout"]["storage_fingerprint"]
-    ):
+    if any(geometry[name] != observed_setting for name, observed_setting in body["capacity"]["postgres"].items()):
+        fail("capacity_runtime_changed")
+    expected = geometry["relations"]["build_checkpoint"]
+    if any(expected[name] != body["capacity"]["checkpoint_layout"][name] for name in ("schema", "name")):
         fail("initial_checkpoint_layout_changed")
-    forbidden_oids = {field_value for field, field_value in geometry.items() if field.endswith("_oid")}
-    forbidden_oids.add(physical["claim_layout"]["oid"])
-    if any(stage["oid"] in forbidden_oids for stage in body["stages"]):
-        fail("stage_is_serving")
+    if {name: geometry["relations"]["initial_receipt"][name] for name in ("schema", "name")} != body["initial"][
+        "receipt"
+    ]:
+        fail("initial_receipt_layout_changed")
 
 
 def validate_authorization(envelope, *, trust, now, claimed_at=None):
@@ -509,6 +493,10 @@ def validate_authorization(envelope, *, trust, now, claimed_at=None):
     if claimed_at is None:
         _validate_observations(body, at=at, fresh=True)
     _validate_trust(body, trust=trust, now=now, claimed_at=claimed_at)
+    return _verify_signature(envelope, body, trust)
+
+
+def _verify_signature(envelope, body, trust):
     key = next(entry for entry in trust.keys if entry.key_id == body["key_id"])
     from cryptography.exceptions import InvalidSignature
 
@@ -527,8 +515,47 @@ def validate_authorization(envelope, *, trust, now, claimed_at=None):
     return body
 
 
-def _storage_values(entries):
-    return [dict(item) if isinstance(item, dict) else vars(item) for item in entries]
+def authenticate_historical_authorization(envelope, *, trust, now, claimed_at):
+    """Authenticate original1/2/3 bytes and full ceilings, without semantic disposal authority."""
+    exact(envelope, {"authorization", "signature"})
+    candidate = envelope["authorization"]
+    contract = candidate.get("contract_id") if isinstance(candidate, dict) else None
+    if not isinstance(contract, str) or contract not in _HISTORICAL_FIELDS:
+        fail("purpose_invalid")
+    body = exact(candidate, _HISTORICAL_FIELDS[contract])
+    if body["purpose"] != "failed_profile_cleanup" or len(canonical(envelope).encode()) > MAX_BYTES:
+        fail("purpose_invalid")
+    for field in (
+        "authorization_id",
+        "operation_id",
+        "reservation_id",
+        "nonce",
+        "attestor_id",
+        "key_id",
+        "environment_id",
+    ):
+        text(body[field])
+    hash64(body["attestor_release_digest"])
+    limits = exact(body["limits"], LIMIT_FIELDS)
+    for name, ceiling in limits.items():
+        integer(ceiling, 0 if name in {"data_bytes", "temp_bytes"} else 1)
+    issued = timestamp(body["issued_at"])
+    expires = timestamp(body["expires_at"])
+    deadline = timestamp(body["max_operation_deadline"])
+    if (
+        not isinstance(claimed_at, datetime)
+        or claimed_at.tzinfo is None
+        or not issued <= claimed_at < min(expires, deadline)
+    ):
+        fail("authorization_expired")
+    if expires - issued > timedelta(minutes=15) or deadline - issued > timedelta(
+        seconds=limits["max_operation_seconds"]
+    ):
+        fail("deadline_invalid")
+    # Retained semantic/physical documents remain opaque original signed history.
+    # Current key retirement is evaluated at the claim's original acceptance time.
+    _validate_trust(body, trust=trust, now=claimed_at, claimed_at=claimed_at)
+    return _verify_signature(envelope, body, trust)
 
 
 def _validate_trust(body, *, trust, now, claimed_at):
@@ -537,14 +564,6 @@ def _validate_trust(body, *, trust, now, claimed_at):
     for name in ("attestor_id", "environment_id"):
         if body[name] != getattr(trust, name):
             fail("trust_binding_invalid")
-    for name in ("database_system_identifier", "database_oid", "database_name"):
-        if body["database"][name] != getattr(trust, name):
-            fail("trust_database_invalid")
-    if body["database"]["tablespaces"] != _storage_values(trust.tablespaces):
-        fail("trust_tablespaces_invalid")
-    pins = [{"volume_class": item["volume_class"], "volume_digest": item["volume_digest"]} for item in body["volumes"]]
-    if pins != _storage_values(trust.volumes):
-        fail("trust_volumes_invalid")
     keys = [item for item in trust.keys if item.key_id == body["key_id"]]
     if len(keys) != 1 or keys[0].attestor_release_digest != body["attestor_release_digest"]:
         fail("trust_key_invalid")
@@ -587,23 +606,12 @@ def _refuse_inherited_authority(fhir):
 
 
 async def _database_binding(fhir, schema):
-    row = await fhir.db.first(
-        "SELECT system_identifier::text AS database_system_identifier, "
-        "d.oid::bigint AS database_oid,datname AS database_name FROM pg_control_system(),pg_database d "
-        "WHERE datname=current_database()"
-    )
-    result_by_field = dict(row._mapping)
-    result_by_field["schema"] = schema
-    return result_by_field
+    return {"schema": schema}
 
 
-async def _physical_identity(fhir, schema, serving):
-    """Read physical identity without granting write authority to the terminal owner."""
-    from types import SimpleNamespace
-
-    row = await fhir._profile_capacity_database_row(serving)
-    layouts = await fhir._profile_capacity_target_layouts(row, schema, serving)
-    return SimpleNamespace(**fhir._profile_capacity_postgres_values(row, layouts))
+async def _capacity_identity(fhir, schema, serving):
+    """Read logical target names and numeric PostgreSQL capacity assumptions."""
+    return await fhir._provider_directory_profile_capacity_database_identity(schema, serving)
 
 
 async def _checkpoint_and_owner(fhir, schema, build_id, owner_run_id, *, locked, variant=None):
@@ -634,7 +642,6 @@ async def _checkpoint_and_owner(fhir, schema, build_id, owner_run_id, *, locked,
         fail("variant_changed")
     if observed_variant in {"legacy_full_swap", "initial_full_swap"} and (
         checkpoint_by_field["affected_npi_stage"] is not None
-        or checkpoint_by_field["affected_npi_stage_oid"] is not None
     ):
         fail("legacy_affected_stage_present")
     return checkpoint_by_field, owner_by_field
@@ -680,25 +687,17 @@ def _checkpoint_coordinates(checkpoint, owner):
 
 
 async def _stage_manifest(fhir, schema, checkpoint, *, locked):
-    names = fhir._validated_profile_checkpoint_stage_names(checkpoint)
+    names = tuple(name for name in fhir._validated_profile_checkpoint_stage_names(checkpoint) if name is not None)
     manifest_values = []
-    is_legacy = _cleanup_variant(checkpoint) == "legacy_full_swap"
     roles = stage_roles({"variant": _cleanup_variant(checkpoint)})
-    names = tuple(name for name in names if name is not None)
     for name, role in zip(names, roles, strict=True):
-        oid = integer(checkpoint[role + "_stage_oid"], 1, (1 << 32) - 1)
-        identity = await fhir._provider_directory_profile_stage_relation_identity(schema, name)
-        if identity != (oid, "r", "p"):
-            fail("stage_identity_changed")
+        oid = await fhir._provider_directory_relation_oid(schema, name)
+        if oid is None:
+            fail("stage_missing")
         if locked:
             await fhir.db.status(f"LOCK TABLE {fhir._unscoped_qt(schema, name)} IN ACCESS EXCLUSIVE MODE NOWAIT")
-        fingerprint = await fhir._provider_directory_profile_stage_storage_fingerprint(
-            schema, name, expected_oid=oid, lock_relation=False
-        )
-        original = checkpoint[role + "_stage_storage_fingerprint"]
-        if fingerprint != original and not (is_legacy and original is None):
-            fail("stage_storage_changed")
-        manifest_values.append({"role": role, "oid": oid, "storage_fingerprint": fingerprint})
+        await fhir._provider_directory_profile_capacity_relation_layout(oid, expected_persistence="p")
+        manifest_values.append({"role": role, "schema": schema, "name": name})
     return manifest_values
 
 
@@ -762,57 +761,60 @@ def _legacy_checkpoint_coordinates(checkpoint, owner):
 
 
 async def _publication_manifest(fhir, schema, checkpoint, coordinates, published_run_id, *, locked):
-    """Fence real history and raw targets, including an actually empty serving table."""
+    """Fence named published targets and the latest genuine result without adopting it."""
     from types import SimpleNamespace
 
-    names = (
-        "provider_directory_profile_serving_generation",
-        "provider_directory_profile_delta_receipt",
-        "provider_directory_cms_serving_receipt",
-    )
-    table_oids = [
-        await fhir.db.scalar("SELECT to_regclass(:name)::oid::bigint", name=schema + "." + name) for name in names
-    ]
-    if any(oid is None for oid in table_oids):
-        fail("installed_publication_metadata_missing")
+    relations_by_role = {
+        "serving_generation": {"schema": schema, "name": "provider_directory_profile_serving_generation"},
+        "delta_receipt": {"schema": schema, "name": "provider_directory_profile_delta_receipt"},
+        "cms_receipt": {"schema": schema, "name": "provider_directory_cms_serving_receipt"},
+    }
+    for coordinate in relations_by_role.values():
+        if not await fhir.db.scalar(
+            "SELECT to_regclass(:name) IS NOT NULL", name=fhir._unscoped_qt(coordinate["schema"], coordinate["name"])
+        ):
+            fail("installed_publication_metadata_missing")
     if locked:
         await fhir.db.status(
             "LOCK TABLE "
-            + ",".join(fhir._unscoped_qt(schema, name) for name in names)
+            + ",".join(fhir._unscoped_qt(entry["schema"], entry["name"]) for entry in relations_by_role.values())
             + " IN SHARE ROW EXCLUSIVE MODE NOWAIT"
         )
     serving_rows = await fhir.db.all(f"SELECT * FROM {fhir._provider_directory_profile_serving_generation_ref(schema)}")
     if len(serving_rows) > 1:
         fail("publication_ambiguous")
+    targets_by_role = dict(serving_rows[0]._mapping).get("targets_json") if serving_rows else None
+    if isinstance(targets_by_role, str):
+        targets_by_role = json.loads(targets_by_role)
+    if targets_by_role is None:
+        targets_by_role = {
+            "evidence": {"schema": schema, "name": "provider_directory_profile_evidence"},
+            "profile": {"schema": schema, "name": "provider_directory_profile"},
+        }
     target_entries = []
-    for role, name in (("evidence", "provider_directory_profile_evidence"), ("profile", "provider_directory_profile")):
-        identity = await fhir._provider_directory_profile_stage_relation_identity(schema, name)
-        if identity is None or identity[1:] != ("r", "p"):
+    for role in ("evidence", "profile"):
+        coordinate = _named_coordinate(targets_by_role[role])
+        if not await fhir.db.scalar(
+            "SELECT to_regclass(:name) IS NOT NULL", name=fhir._unscoped_qt(coordinate["schema"], coordinate["name"])
+        ):
             fail("published_target_missing")
         if locked:
-            await fhir.db.status(f"LOCK TABLE {fhir._unscoped_qt(schema, name)} IN ACCESS SHARE MODE NOWAIT")
-        fingerprint = await fhir._provider_directory_profile_stage_storage_fingerprint(
-            schema, name, expected_oid=identity[0], lock_relation=False
-        )
-        target_entries.append({"role": role, "oid": identity[0], "storage_fingerprint": fingerprint})
+            await fhir.db.status(
+                f"LOCK TABLE {fhir._unscoped_qt(coordinate['schema'], coordinate['name'])} IN ACCESS SHARE MODE NOWAIT"
+            )
+        target_entries.append({"role": role, **coordinate})
     publication = await _published_history_manifest(fhir, schema, coordinates, published_run_id, locked=locked)
+    profile = targets_by_role["profile"]
     if not await fhir.db.scalar(
-        f"SELECT EXISTS(SELECT 1 FROM {fhir._unscoped_qt(schema, 'provider_directory_profile')} "
-        "WHERE generation_id=:generation)",
+        f"SELECT EXISTS(SELECT 1 FROM {fhir._unscoped_qt(profile['schema'], profile['name'])} WHERE generation_id=:generation)",
         generation=publication["published_generation_id"],
     ):
         fail("published_target_generation_missing")
     publication.update(
-        serving_state="singleton" if serving_rows else "empty",
-        serving_table_oid=table_oids[0],
-        delta_receipt_table_oid=table_oids[1],
-        cms_receipt_table_oid=table_oids[2],
-        targets=target_entries,
+        serving_state="singleton" if serving_rows else "empty", relations=relations_by_role, targets=target_entries
     )
     await _exclude_legacy_history(fhir, schema, coordinates, serving_rows, publication)
-    return publication, SimpleNamespace(
-        evidence_target_oid=target_entries[0]["oid"], profile_target_oid=target_entries[1]["oid"]
-    )
+    return publication, SimpleNamespace(targets=targets_by_role)
 
 
 async def _published_history_manifest(fhir, schema, coordinates, published_run_id, *, locked):
@@ -892,9 +894,6 @@ async def _exclude_legacy_history(fhir, schema, coordinates, serving_rows, publi
             or serving_by_field["control_generation"] != publication["published_control_generation"]
         ):
             fail("published_history_mismatch")
-    target_oids = {target_entry["oid"] for target_entry in publication["targets"]}
-    if any(checkpoint_oid in target_oids for checkpoint_oid in coordinates.get("stage_oids", ())):
-        fail("stage_is_serving")
     delta = fhir._unscoped_qt(schema, "provider_directory_profile_delta_receipt")
     cms = fhir._unscoped_qt(schema, "provider_directory_cms_serving_receipt")
     if await fhir.db.scalar(
@@ -913,79 +912,24 @@ async def _exclude_legacy_history(fhir, schema, coordinates, serving_rows, publi
         fail("historical_cms_publication")
 
 
-# Stock PG18 catalogs from the checkpoint and cleanup-claim migrations. The
-# checkpoint also permits the exact inert initial-publication CHECK replacement.
-# Pin columns, defaults, CHECKs and every index/opclass/collation, including TOAST.
-# Effective tablespaces are validated separately against the funded data space.
-_METADATA_SHAPE_SHA256 = {
-    "checkpoint": (
-        "a25388a4a0404f411990d92ba2d3a63c4e3e90a4f0abe16daafdab1158c8dff7",
-        "9dba293dfcb99a053ed506e1f7f97a7fef82ab93a19becf862acd9ec40e10c4d",
-    ),
-    "claim": ("be5bada596b8258019671322e633c3fc6366ba3bd2c399242ace90a7edfefef7",),
-}
-
-
-def _assert_metadata_catalog(role, structural):
-    supported_by_field = dict(
-        structural,
-        indexes=sorted(
-            [
-                {field: value for field, value in index.items() if field != "effective_tablespace_oid"}
-                for index in structural["indexes"]
-            ],
-            key=canonical,
-        ),
-    )
-    if hashlib.sha256(canonical(supported_by_field).encode()).hexdigest() not in _METADATA_SHAPE_SHA256[role]:
-        fail("metadata_catalog_unsupported")
-
-
-async def _metadata_layouts(fhir, schema, *, locked, tablespace_oid):
+async def _metadata_layouts(fhir, schema, *, locked):
     if locked:
         await fhir.db.status(f"LOCK TABLE {claim_ref(fhir, schema)} IN SHARE UPDATE EXCLUSIVE MODE NOWAIT")
-    result_by_field = {}
+    layouts_by_role = {}
     for role, name in (
         ("checkpoint", "provider_directory_profile_build_checkpoint"),
         ("claim", "provider_directory_profile_failed_cleanup_claim"),
     ):
-        oid = await fhir.db.scalar("SELECT to_regclass(:name)::oid::bigint", name=schema + "." + name)
+        oid = await fhir._provider_directory_relation_oid(schema, name)
         if oid is None:
             fail("installed_schema_missing")
-        relation, toast_oid = await fhir._profile_capacity_relation_row(oid, "p", 2 if role == "claim" else 0)
-        attributes, indexes, constraints, triggers = await fhir._profile_capacity_relation_catalog(
-            [oid] + ([toast_oid] if toast_oid else [])
+        layouts_by_role[role] = await fhir._provider_directory_profile_capacity_relation_layout(
+            oid,
+            expected_persistence="p",
+            expected_user_trigger_count=2 if role == "claim" else 0,
+            expected_immutable_trigger_error="failed_profile_cleanup_claim_immutable" if role == "claim" else None,
         )
-        fhir._assert_profile_capacity_trigger_shape(
-            triggers, 2 if role == "claim" else 0, "failed_profile_cleanup_claim_immutable" if role == "claim" else None
-        )
-        exact, structural = fhir._profile_capacity_fingerprint_payloads(
-            relation, attributes, indexes, constraints, triggers, oid
-        )
-        _assert_metadata_catalog(role, structural)
-        # Deparsing can omit a visible function's schema. Do not accept a custom
-        # implementation that happens to print like an allowed built-in default.
-        if await fhir.db.scalar(
-            """SELECT EXISTS(SELECT 1 FROM pg_depend d
-            LEFT JOIN pg_operator o ON d.refclassid='pg_operator'::regclass AND o.oid=d.refobjid
-            JOIN pg_proc p ON (d.refclassid='pg_proc'::regclass AND p.oid=d.refobjid) OR p.oid=o.oprcode
-            JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_language l ON l.oid=p.prolang
-            WHERE ((d.classid='pg_attrdef'::regclass AND d.objid IN
-                (SELECT oid FROM pg_attrdef WHERE adrelid=:oid)) OR
-                (d.classid='pg_constraint'::regclass AND d.objid IN
-                (SELECT oid FROM pg_constraint WHERE conrelid=:oid)) OR
-                (d.classid='pg_class'::regclass AND d.objid IN
-                (SELECT indexrelid FROM pg_index WHERE indrelid=:oid)))
-            AND (n.nspname<>'pg_catalog' OR l.lanname NOT IN ('internal','c') OR
-                (o.oid IS NOT NULL AND o.oprnamespace<>'pg_catalog'::regnamespace)))""",
-            oid=oid,
-        ):
-            fail("metadata_executable_dependency_unsupported")
-        layout = fhir._profile_capacity_storage_layout(oid, toast_oid, relation, attributes, indexes, exact, structural)
-        if layout.effective_tablespace_oids != (tablespace_oid,):
-            fail("metadata_tablespace_unsupported")
-        result_by_field[role] = layout
-    return result_by_field
+    return layouts_by_role
 
 
 # These are the catalog mutations in PG18's closed heap/index/type/constraint/
@@ -1011,26 +955,8 @@ _DROP_CATALOG_SCOPES = (
 )
 
 
-async def _require_drop_catalog_role(fhir, *, locking):
-    """Require genuine catalog/TOAST observation and the PG18 SHARE-lock privilege."""
-    record = await fhir.db.first(
-        """SELECT count(*),bool_and(
-        has_table_privilege(c.oid,'SELECT') AND
-        (NOT :locking OR has_table_privilege(c.oid,'MAINTAIN,UPDATE,DELETE,TRUNCATE')) AND
-        (c.reltoastrelid=0 OR (has_schema_privilege('pg_toast','USAGE') AND
-            has_table_privilege(c.reltoastrelid,'SELECT'))))
-        FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-        WHERE n.nspname='pg_catalog' AND c.relname=ANY(CAST(:names AS text[]))""",
-        locking=locking,
-        names=[name for name, _predicate in _DROP_CATALOG_SCOPES],
-    )
-    if record is None or record[0] != len(_DROP_CATALOG_SCOPES) or record[1] is not True:
-        fail("catalog_role_unsupported")
-
-
 async def _lock_drop_catalogs(fhir):
     """Freeze auxiliary payload/TOAST before spending authority; no privilege elevation."""
-    await _require_drop_catalog_role(fhir, locking=True)
     await fhir.db.status(
         "LOCK TABLE "
         + ",".join("pg_catalog." + name for name, _predicate in _DROP_CATALOG_SCOPES)
@@ -1049,7 +975,7 @@ async def _catalog_deletion_manifest(fhir, relation_oids, object_oids):
     compression = await fhir.db.scalar("SHOW default_toast_compression")
     for name, predicate in _DROP_CATALOG_SCOPES:
         oid = await fhir.db.scalar("SELECT CAST(CAST(:name AS regclass) AS oid)::bigint", name="pg_catalog." + name)
-        layout = await fhir._provider_directory_profile_relation_storage_fingerprint(oid, expected_persistence="p")
+        layout = await fhir._provider_directory_profile_capacity_relation_layout(oid, expected_persistence="p")
         source_sql = "SELECT * FROM pg_catalog." + name + " WHERE " + predicate
         deleted_rows = await fhir.db.scalar("SELECT count(*) FROM (" + source_sql + ") AS scoped", **params_by_field)
         toast_chunks = await fhir._provider_directory_profile_toast_chunk_count(
@@ -1074,8 +1000,8 @@ async def _catalog_deletion_manifest(fhir, relation_oids, object_oids):
         manifests.append(
             {
                 "catalog": name,
-                "oid": oid,
-                "storage_fingerprint": layout.exact_fingerprint,
+                "schema": "pg_catalog",
+                "name": name,
                 "deleted_rows": deleted_rows,
                 "deleted_toast_chunks": toast_chunks,
                 "wal_upper_bytes": wal_bytes,
@@ -1094,6 +1020,10 @@ async def _require_supported_drop_catalogs(fhir, relation_oids):
         EXISTS(SELECT 1 FROM pg_rewrite WHERE ev_class=ANY(CAST(:oids AS oid[]))) OR
         EXISTS(SELECT 1 FROM pg_statistic_ext WHERE stxrelid=ANY(CAST(:oids AS oid[]))) OR
         EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=ANY(CAST(:oids AS oid[]))) OR
+        EXISTS(SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid
+            JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE a.attrelid=ANY(CAST(:oids AS oid[])) AND a.attnum>0 AND NOT a.attisdropped
+              AND pg_get_serial_sequence(format('%I.%I',n.nspname,c.relname),a.attname) IS NOT NULL) OR
         EXISTS(SELECT 1 FROM pg_class WHERE oid=ANY(CAST(:oids AS oid[])) AND (relkind NOT IN ('r','i','t') OR relispartition))""",
         oids=relation_oids,
     ):
@@ -1101,62 +1031,43 @@ async def _require_supported_drop_catalogs(fhir, relation_oids):
 
 
 async def _stage_dependency_manifest(fhir, schema, stage):
-    """Permit only bounded automatic/internal DROP closures; normal dependencies refuse."""
-    database_records = await fhir.db.all(
-        """WITH RECURSIVE closure(classid,objid,objsubid) AS (
-        SELECT 'pg_class'::regclass::oid,CAST(:oid AS oid),0
-        UNION SELECT d.classid,d.objid,d.objsubid FROM pg_depend d JOIN closure c
-        ON (d.refclassid,d.refobjid)=(c.classid,c.objid) AND (c.objsubid=0 OR d.refobjsubid=c.objsubid)
-        WHERE d.deptype IN ('a','i')) SELECT classid::bigint,objid::bigint,objsubid FROM closure ORDER BY classid,objid,objsubid""",
-        oid=stage["oid"],
-    )
-    objects = [list(database_record) for database_record in database_records]
-    if not 1 <= len(objects) <= 128:
+    """Measure bounded native DROP catalog costs; RESTRICT enforces external dependencies."""
+    oid = await fhir._provider_directory_relation_oid(stage["schema"], stage["name"])
+    if oid is None:
+        fail("stage_missing")
+    layout = await fhir._provider_directory_profile_capacity_relation_layout(oid, expected_persistence="p")
+    relation_oids = [oid, *layout.main_index_oids, *layout.toast_index_oids]
+    if layout.toast_oid is not None:
+        relation_oids.append(layout.toast_oid)
+    if not 1 <= len(relation_oids) <= 32:
         fail("drop_dependency_bound_unsupported")
-    if any(entry[0] not in {1259, 1247, 2606, 2604} for entry in objects):
-        fail("drop_object_kind_unsupported")
-    normal = await fhir.db.scalar(
-        """WITH RECURSIVE closure(classid,objid,objsubid) AS (
-        SELECT 'pg_class'::regclass::oid,CAST(:oid AS oid),0 UNION SELECT d.classid,d.objid,d.objsubid
-        FROM pg_depend d JOIN closure c ON (d.refclassid,d.refobjid)=(c.classid,c.objid)
-        WHERE d.deptype IN ('a','i')) SELECT EXISTS(SELECT 1 FROM pg_depend d JOIN closure c
-        ON (d.refclassid,d.refobjid)=(c.classid,c.objid) WHERE d.deptype NOT IN ('a','i')
-        AND NOT EXISTS(SELECT 1 FROM closure own WHERE (own.classid,own.objid)=(d.classid,d.objid)))
-        OR EXISTS(SELECT 1 FROM pg_depend d JOIN closure c ON (d.classid,d.objid)=(c.classid,c.objid) WHERE d.deptype='e')
-        OR EXISTS(SELECT 1 FROM pg_event_trigger WHERE evtenabled<>'D')""",
-        oid=stage["oid"],
-    )
-    if normal:
-        fail("drop_external_dependency")
-    relation_count = await fhir.db.scalar(
-        "SELECT count(*) FROM pg_class WHERE oid=ANY(CAST(:oids AS oid[]))",
-        oids=[entry[1] for entry in objects if entry[0] == 1259],
-    )
-    if not 1 <= relation_count <= 32:
-        fail("drop_dependency_bound_unsupported")
-    relation_oids = [entry[1] for entry in objects if entry[0] == 1259]
-    object_oids = [entry[1] for entry in objects]
     await _require_supported_drop_catalogs(fhir, relation_oids)
+    if await fhir.db.scalar("SELECT EXISTS(SELECT 1 FROM pg_event_trigger WHERE evtenabled<>'D')"):
+        fail("drop_event_trigger_unsupported")
+    object_rows = await fhir.db.all(
+        """SELECT oid::bigint FROM pg_type WHERE typrelid=ANY(CAST(:oids AS oid[]))
+        UNION SELECT typarray::bigint FROM pg_type WHERE typrelid=ANY(CAST(:oids AS oid[])) AND typarray<>0
+        UNION SELECT oid::bigint FROM pg_constraint WHERE conrelid=ANY(CAST(:oids AS oid[]))
+        UNION SELECT oid::bigint FROM pg_attrdef WHERE adrelid=ANY(CAST(:oids AS oid[]))""",
+        oids=relation_oids,
+    )
+    object_oids = [*relation_oids, *(int(catalog_row[0]) for catalog_row in object_rows)]
+    if not 1 <= len(object_oids) <= 128:
+        fail("drop_dependency_bound_unsupported")
     catalog_deletions = await _catalog_deletion_manifest(fhir, relation_oids, object_oids)
     catalog_rows = sum(entry["deleted_rows"] for entry in catalog_deletions)
     if catalog_rows > 8192:
         fail("drop_catalog_bound_unsupported")
-    # Preserve the whole existing fixed DROP allowance, adding the observed
-    # catalog deletion projection without subtracting any overlapping cost.
     variable_wal = sum(entry["wal_upper_bytes"] for entry in catalog_deletions)
     if variable_wal > 32 * 1024 * 1024:
         fail("drop_catalog_wal_exceeded")
-    drop_wal = 32 * 1024 * 1024 + variable_wal
     return {
         "role": stage["role"],
-        "object_count": len(objects),
-        "relation_count": relation_count,
+        "object_count": len(object_oids),
+        "relation_count": len(relation_oids),
         "catalog_tuple_count": catalog_rows,
         "catalog_deletions": catalog_deletions,
-        "drop_wal_upper_bytes": drop_wal,
-        "fingerprint": digest(
-            {"objects": objects, "catalog_deletions": catalog_deletions}, LEGACY_CONTRACT + ".drop-closure"
-        ),
+        "drop_wal_upper_bytes": 32 * 1024 * 1024 + variable_wal,
     }
 
 
@@ -1187,7 +1098,7 @@ async def _complete_checkpoint_payload_bound(fhir, schema, checkpoint):
     return 4 * json_bytes + 8192
 
 
-async def _legacy_physical_manifest(fhir, schema, checkpoint, serving, stages, *, locked):
+async def _cleanup_capacity_manifest(fhir, schema, checkpoint, serving, stages, *, locked):
     from types import SimpleNamespace
 
     from process.provider_directory_profile_capacity_geometry import (
@@ -1195,47 +1106,51 @@ async def _legacy_physical_manifest(fhir, schema, checkpoint, serving, stages, *
         _assert_postgres_wal_limits,
     )
 
-    observed = await _physical_identity(fhir, schema, serving)
-    postgres_by_field = {key: field_value for key, field_value in vars(observed).items() if key != "wal_lsn"}
+    observed = await _capacity_identity(fhir, schema, serving)
+    postgres_by_field = {name: getattr(observed, name) for name in POSTGRES_FIELDS if hasattr(observed, name)}
     postgres_by_field.update(
         postgres_toast_max_chunk_size_bytes=1996, postgres_maxalign_bytes=8, postgres_btree_version=4
     )
-    physical = SimpleNamespace(**postgres_by_field, statement_timeout_ms=30000, lock_timeout_ms=5000)
-    _assert_postgres_storage_limits(physical)
-    _assert_postgres_wal_limits(physical)
-    layouts = await _metadata_layouts(fhir, schema, locked=locked, tablespace_oid=observed.tablespace_oid)
+    runtime = SimpleNamespace(**postgres_by_field, statement_timeout_ms=30000, lock_timeout_ms=5000)
+    _assert_postgres_storage_limits(runtime)
+    _assert_postgres_wal_limits(runtime)
+    layouts = await _metadata_layouts(fhir, schema, locked=locked)
     layout = layouts["checkpoint"]
     old_toast = await fhir._provider_directory_profile_toast_chunk_count(
         source_sql=f"SELECT * FROM {fhir._provider_directory_profile_checkpoint_ref(schema)} WHERE build_id=:build",
         relation_oid=layout.relation_oid,
         toast_oid=layout.toast_oid,
         toastable_columns=layout.toastable_columns,
-        expected_compression=postgres_by_field["postgres_default_toast_compression"],
+        expected_compression=runtime.postgres_default_toast_compression,
         params={"build": checkpoint["build_id"]},
     )
-    row_bound = await _complete_checkpoint_payload_bound(fhir, schema, checkpoint)
     dependencies = [await _stage_dependency_manifest(fhir, schema, stage) for stage in stages]
-    commit_bound = _commit_wal_bound(dependencies, physical)
     manifest_by_field = {
         "observed_at": _now_utc().isoformat(),
         "postgres": postgres_by_field,
         "checkpoint_layout": {
-            "oid": layout.relation_oid,
-            "storage_fingerprint": layout.exact_fingerprint,
+            **_layout_coordinates(layout),
             "old_toast_chunks": old_toast,
-            "row_payload_upper_bytes": row_bound,
+            "row_payload_upper_bytes": await _complete_checkpoint_payload_bound(fhir, schema, checkpoint),
         },
-        "claim_layout": {
-            "oid": layouts["claim"].relation_oid,
-            "storage_fingerprint": layouts["claim"].exact_fingerprint,
-        },
+        "claim_layout": _layout_coordinates(layouts["claim"]),
         "stage_dependencies": dependencies,
-        "commit_wal_upper_bytes": commit_bound,
+        "commit_wal_upper_bytes": _commit_wal_bound(dependencies, runtime),
     }
-    return manifest_by_field, physical, layouts
+    return manifest_by_field, runtime, layouts
 
 
-async def project_cleanup_budget(fhir, schema, checkpoint, geometry, *, physical=None, layouts=None):
+def _layout_coordinates(layout):
+    return {
+        "schema": layout.schema_name,
+        "name": layout.relation_name,
+        "main_index_pages": list(layout.main_index_pages),
+        "toast_index_pages": list(layout.toast_index_pages),
+        "toastable_column_count": len(layout.toastable_columns),
+    }
+
+
+async def project_cleanup_budget(fhir, schema, checkpoint, geometry, *, capacity_snapshot=None, layouts=None):
     """Project actual checkpoint/claim heaps, indexes, TOAST, locks, DROP and both commits."""
     from process.provider_directory_profile_capacity_physical import _metadata_mutation_projection
     from process.provider_directory_profile_capacity_types import (
@@ -1243,15 +1158,15 @@ async def project_cleanup_budget(fhir, schema, checkpoint, geometry, *, physical
         CONTROL_WAL_ROW_LOCK_UPPER_BOUND_BYTES_PER_TUPLE,
     )
 
-    if physical is None:
+    if capacity_snapshot is None:
         await _complete_checkpoint_payload_bound(fhir, schema, checkpoint)
         stages = await _stage_manifest(fhir, schema, checkpoint, locked=False)
         dependencies = [await _stage_dependency_manifest(fhir, schema, stage) for stage in stages]
         commit_bound = _commit_wal_bound(dependencies, geometry)
     else:
-        commit_bound = physical["commit_wal_upper_bytes"]
+        commit_bound = capacity_snapshot["commit_wal_upper_bytes"]
     if layouts is None:
-        layouts = await _metadata_layouts(fhir, schema, locked=False, tablespace_oid=geometry.tablespace_oid)
+        layouts = await _metadata_layouts(fhir, schema, locked=False)
     projections = []
     for role, name, operation in (
         ("checkpoint", "provider_directory_profile_build_checkpoint", "update"),
@@ -1273,13 +1188,13 @@ async def project_cleanup_budget(fhir, schema, checkpoint, geometry, *, physical
         )
         projections.append(_metadata_mutation_projection(geometry, mutation))
     # Failure reserve covers abort/catalog work; rollback never refunds emitted WAL.
-    stage_count = 2 if physical is not None else 3
-    if physical is not None:
-        dependencies = physical["stage_dependencies"]
+    stage_count = 2 if capacity_snapshot is not None else 3
+    if capacity_snapshot is not None:
+        dependencies = capacity_snapshot["stage_dependencies"]
     wal = sum(projection[1] for projection in projections) + sum(
         entry["drop_wal_upper_bytes"] for entry in dependencies
     )
-    wal += (4 if physical is not None else 3) * CONTROL_WAL_ROW_LOCK_UPPER_BOUND_BYTES_PER_TUPLE + commit_bound
+    wal += (4 if capacity_snapshot is not None else 3) * CONTROL_WAL_ROW_LOCK_UPPER_BOUND_BYTES_PER_TUPLE + commit_bound
     wal += CONTROL_WAL_DROP_UPPER_BOUND_BYTES_PER_STATEMENT
     return {
         "data_bytes": sum(projection[0] for projection in projections),
@@ -1369,6 +1284,8 @@ async def _initial_manifest(fhir, schema, geometry, *, locked, checkpoint, owner
 
     if not isinstance(geometry, contract.InitialCapacityGeometry):
         fail("initial_geometry_required")
+    if await fhir._provider_directory_relation_oid(schema, contract.RECEIPT_TABLE) is None:
+        fail("initial_receipt_layout_changed")
     if locked:
         names = (
             contract.RECEIPT_TABLE,
@@ -1386,7 +1303,10 @@ async def _initial_manifest(fhir, schema, geometry, *, locked, checkpoint, owner
     if await fhir.db.scalar(f"SELECT EXISTS (SELECT 1 FROM {delta})"):
         fail("initial_delta_history")
     initial_targets = await initial.capture_targets(fhir, schema)
-    target_by_field = initial_targets.payload
+    try:
+        target_by_field = contract.validated_target_state(initial_targets.payload)
+    except ValueError:
+        fail("initial_target_changed")
     if contract.target_state_sha256(target_by_field) != geometry.initial_target_state_sha256:
         original = await _original_initial_target(fhir, schema, checkpoint, owner, geometry)
         if any(
@@ -1396,18 +1316,14 @@ async def _initial_manifest(fhir, schema, geometry, *, locked, checkpoint, owner
         ):
             fail("initial_target_changed")
         target_by_field = original
-    layout = await initial.receipt_layout(fhir, schema)
-    if (
-        layout.relation_oid != geometry.initial_receipt_oid
-        or layout.exact_fingerprint != geometry.initial_receipt_storage_fingerprint
-        or layout.effective_tablespace_oids != (geometry.tablespace_oid,)
-    ):
+    receipt_coordinate_by_field = {"schema": schema, "name": contract.RECEIPT_TABLE}
+    expected = geometry.relations.get("initial_receipt")
+    if expected is None or any(expected[name] != receipt_coordinate_by_field[name] for name in ("schema", "name")):
         fail("initial_receipt_layout_changed")
     return {
         "target_state": target_by_field,
         "initial_target_state_sha256": geometry.initial_target_state_sha256,
-        "initial_receipt_oid": geometry.initial_receipt_oid,
-        "initial_receipt_storage_fingerprint": geometry.initial_receipt_storage_fingerprint,
+        "receipt": receipt_coordinate_by_field,
     }, initial_targets
 
 
@@ -1416,7 +1332,7 @@ async def _inspect_initial_cleanup(fhir, schema, checkpoint, coordinates, geomet
     from process import provider_directory_profile_capacity as capacity
 
     initial, targets = await _initial_manifest(fhir, schema, geometry, locked=False, checkpoint=checkpoint, owner=owner)
-    physical, runtime, layouts = await _legacy_physical_manifest(
+    capacity_snapshot, runtime, layouts = await _cleanup_capacity_manifest(
         fhir, schema, checkpoint, targets, stages, locked=False
     )
     report_by_field = {
@@ -1425,9 +1341,11 @@ async def _inspect_initial_cleanup(fhir, schema, checkpoint, coordinates, geomet
         "stages": stages,
         "database": binding,
         "initial": initial,
-        "physical": physical,
+        "capacity": capacity_snapshot,
         "capacity_geometry": capacity.capacity_geometry_payload(geometry),
-        "limits": await project_cleanup_budget(fhir, schema, checkpoint, runtime, physical=physical, layouts=layouts),
+        "limits": await project_cleanup_budget(
+            fhir, schema, checkpoint, runtime, capacity_snapshot=capacity_snapshot, layouts=layouts
+        ),
     }
     _validate_initial_request(report_by_field)
     return report_by_field
@@ -1442,7 +1360,6 @@ async def inspect_failed_profile_cleanup(fhir, *, build_id, owner_run_id, publis
     async with fhir.db.transaction() as session:
         await session.execute(sql_text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
         await session.execute(sql_text("SET LOCAL statement_timeout='30s'"))
-        await _require_drop_catalog_role(fhir, locking=False)
         checkpoint, owner = await _checkpoint_and_owner(fhir, schema, build_id, owner_run_id, locked=False)
         coordinates, geometry = _checkpoint_coordinates(checkpoint, owner)
         manifest = await _stage_manifest(fhir, schema, checkpoint, locked=False)
@@ -1451,9 +1368,11 @@ async def inspect_failed_profile_cleanup(fhir, *, build_id, owner_run_id, publis
             publication, serving = await _publication_manifest(
                 fhir, schema, checkpoint, coordinates, published_run_id, locked=False
             )
-            if {stage["oid"] for stage in manifest} & {target_entry["oid"] for target_entry in publication["targets"]}:
+            if {_coordinate_key(stage) for stage in manifest} & {
+                _coordinate_key(target_entry) for target_entry in publication["targets"]
+            }:
                 fail("stage_is_serving")
-            physical, geometry, layouts = await _legacy_physical_manifest(
+            capacity_snapshot, geometry, layouts = await _cleanup_capacity_manifest(
                 fhir, schema, checkpoint, serving, manifest, locked=False
             )
             return {
@@ -1461,10 +1380,10 @@ async def inspect_failed_profile_cleanup(fhir, *, build_id, owner_run_id, publis
                 "checkpoint": coordinates,
                 "stages": manifest,
                 "database": binding,
-                "physical": physical,
+                "capacity": capacity_snapshot,
                 "publication": publication,
                 "limits": await project_cleanup_budget(
-                    fhir, schema, checkpoint, geometry, physical=physical, layouts=layouts
+                    fhir, schema, checkpoint, geometry, capacity_snapshot=capacity_snapshot, layouts=layouts
                 ),
             }
         if published_run_id is not None:
@@ -1486,41 +1405,39 @@ async def _exclude_publication(fhir, schema, checkpoint, coordinates):
     cms = fhir._unscoped_qt(schema, "provider_directory_cms_serving_receipt")
     await fhir.db.status(f"LOCK TABLE {delta},{cms} IN SHARE ROW EXCLUSIVE MODE NOWAIT")
     serving_row = await fhir.db.first(
-        f"SELECT * FROM {fhir._provider_directory_profile_serving_generation_ref(schema)} "
-        "WHERE singleton_key='global' FOR UPDATE NOWAIT"
+        f"SELECT * FROM {fhir._provider_directory_profile_serving_generation_ref(schema)} WHERE singleton_key='global' FOR UPDATE NOWAIT"
     )
     if serving_row is None:
         fail("existing_serving_prerequisite_missing")
     serving_by_field = dict(serving_row._mapping)
     if any(serving_by_field.get(field) == coordinates[field] for field in ("selection_proof_id", "control_generation")):
         fail("build_is_serving")
-    live_oids = {serving_by_field.get(field) for field in ("evidence_target_oid", "profile_target_oid")}
-    for target_oid in ("provider_directory_profile_evidence", "provider_directory_profile"):
-        oid = await fhir.db.scalar("SELECT to_regclass(:name)::oid::bigint", name=schema + "." + target_oid)
-        if oid is not None:
-            await fhir.db.status(f"LOCK TABLE {fhir._unscoped_qt(schema, target_oid)} IN ACCESS SHARE MODE NOWAIT")
-            live_oids.add(oid)
+    serving = fhir._profile_serving_state_from_row(serving_row)
+    live_names = {_coordinate_key(entry) for entry in serving.targets.values()}
+    for coordinate in serving.targets.values():
+        await fhir.db.status(
+            f"LOCK TABLE {fhir._unscoped_qt(coordinate['schema'], coordinate['name'])} IN ACCESS SHARE MODE NOWAIT"
+        )
     if any(
-        checkpoint[field] in live_oids
-        for field in ("evidence_stage_oid", "profile_stage_oid", "affected_npi_stage_oid")
+        (schema, name) in live_names
+        for name in fhir._validated_profile_checkpoint_stage_names(checkpoint)
+        if name is not None
     ):
         fail("stage_is_serving")
     if await fhir.db.scalar(
-        f"SELECT EXISTS(SELECT 1 FROM {delta} WHERE build_id=:build "
-        "OR selection_proof_id=:proof OR control_generation=:generation)",
+        f"SELECT EXISTS(SELECT 1 FROM {delta} WHERE build_id=:build OR selection_proof_id=:proof OR control_generation=:generation)",
         build=coordinates["build_id"],
         proof=coordinates["selection_proof_id"],
         generation=coordinates["control_generation"],
     ):
         fail("historical_delta_publication")
     if await fhir.db.scalar(
-        f"SELECT EXISTS(SELECT 1 FROM {cms} WHERE payload->'profile'->>'selection_proof_id'=:proof "
-        "OR payload->'profile'->>'control_generation'=:generation)",
+        f"SELECT EXISTS(SELECT 1 FROM {cms} WHERE payload->'profile'->>'selection_proof_id'=:proof OR payload->'profile'->>'control_generation'=:generation)",
         proof=coordinates["selection_proof_id"],
         generation=str(coordinates["control_generation"]),
     ):
         fail("historical_cms_publication")
-    return fhir._profile_serving_state_from_row(serving_row)
+    return serving
 
 
 async def _exclude_competitors(fhir, schema, owner_run_id):
@@ -1757,8 +1674,7 @@ async def _accept_fenced_request(fhir, schema, body):
     coordinates, geometry = _checkpoint_coordinates(checkpoint, owner)
     if coordinates != body["checkpoint"]:
         fail("checkpoint_preimage_changed")
-    binding = await _database_binding(fhir, schema)
-    if any(body["database"][field] != field_value for field, field_value in binding.items()):
+    if body["database"] != await _database_binding(fhir, schema):
         fail("database_changed")
     if body.get("variant") == "legacy_full_swap":
         return await _accept_legacy_fenced_request(fhir, schema, body, checkpoint, owner, coordinates)
@@ -1771,38 +1687,33 @@ async def _accept_fenced_request(fhir, schema, body):
         )
         if initial != body["initial"]:
             fail("initial_preimage_changed")
-        return await _accept_physical_fenced_stages(fhir, schema, body, checkpoint, owner, initial_targets)
+        return await _accept_capacity_fenced_stages(fhir, schema, body, checkpoint, owner, initial_targets)
     serving = await _exclude_publication(fhir, schema, checkpoint, coordinates)
-    observed = await _physical_identity(fhir, schema, serving)
-    for field, field_value in fhir._geometry_postgres_values(observed).items():
-        if getattr(geometry, field) != field_value:
-            fail("physical_runtime_changed")
-    tablespaces = body["database"]["tablespaces"]
-    if [(entry["tablespace_oid"], entry["tablespace_name"]) for entry in tablespaces] != [
-        (observed.tablespace_oid, observed.tablespace_name),
-        (observed.temp_tablespace_oid, observed.temp_tablespace_name),
-    ]:
-        fail("physical_tablespace_changed")
+    observed = await _capacity_identity(fhir, schema, serving)
+    if any(
+        getattr(geometry, field) != observed_setting
+        for field, observed_setting in fhir._geometry_postgres_values(observed).items()
+    ):
+        fail("capacity_runtime_changed")
     await _exclude_competitors(fhir, schema, owner["run_id"])
     if await _stage_manifest(fhir, schema, checkpoint, locked=True) != body["stages"]:
         fail("stage_manifest_changed")
-    layouts = await _metadata_layouts(fhir, schema, locked=True, tablespace_oid=observed.tablespace_oid)
+    layouts = await _metadata_layouts(fhir, schema, locked=True)
     projection = await project_cleanup_budget(fhir, schema, checkpoint, geometry, layouts=layouts)
-    if any(body["limits"][field] < projection[field] for field in ("data_bytes", "temp_bytes", "wal_bytes")):
-        fail("budget_exceeded")
-    database_records = await fhir.db.all(
-        f"SELECT reservation_id FROM {fhir._unscoped_qt(schema, 'provider_directory_profile_capacity_lease_consumption')} "
-        "WHERE expires_at>clock_timestamp() UNION SELECT reservation_id FROM "
-        + claim_ref(fhir, schema)
-        + " WHERE expires_at>clock_timestamp()"
-    )
-    if not {database_record[0] for database_record in database_records}.issubset(
-        set(body["observations"]["accounted_reservation_ids"])
-    ):
-        fail("original_reservation_unaccounted")
+    await _assert_cleanup_budget(fhir, schema, body, projection)
     if len((checkpoint["last_error"] or "").encode()) + 8192 > MAX_BYTES:
         fail("complete_error_exceeds_budget")
     return checkpoint
+
+
+async def _assert_cleanup_budget(fhir, schema, body, projection):
+    if any(body["limits"][field] < projection[field] for field in ("data_bytes", "temp_bytes", "wal_bytes")):
+        fail("budget_exceeded")
+    reservation_rows = await fhir.db.all(
+        f"SELECT reservation_id FROM {fhir._unscoped_qt(schema, 'provider_directory_profile_capacity_lease_consumption')} WHERE expires_at>clock_timestamp() UNION SELECT reservation_id FROM {claim_ref(fhir, schema)} WHERE expires_at>clock_timestamp()"
+    )
+    if not {row[0] for row in reservation_rows}.issubset(set(body["observations"]["accounted_reservation_ids"])):
+        fail("original_reservation_unaccounted")
 
 
 async def _accept_legacy_fenced_request(fhir, schema, body, checkpoint, owner, coordinates):
@@ -1811,41 +1722,30 @@ async def _accept_legacy_fenced_request(fhir, schema, body, checkpoint, owner, c
     )
     if publication != body["publication"]:
         fail("publication_preimage_changed")
-    if {stage["oid"] for stage in body["stages"]} & {target["oid"] for target in publication["targets"]}:
+    if {_coordinate_key(stage) for stage in body["stages"]} & {
+        _coordinate_key(target) for target in publication["targets"]
+    }:
         fail("stage_is_serving")
-    return await _accept_physical_fenced_stages(fhir, schema, body, checkpoint, owner, serving)
+    return await _accept_capacity_fenced_stages(fhir, schema, body, checkpoint, owner, serving)
 
 
-async def _accept_physical_fenced_stages(fhir, schema, body, checkpoint, owner, serving):
-    """Recheck exact stage dependencies and independently funded metadata under fences."""
+async def _accept_capacity_fenced_stages(fhir, schema, body, checkpoint, owner, serving):
+    """Recheck named stages, numeric catalog costs and independently reserved ceilings."""
     await _exclude_competitors(fhir, schema, owner["run_id"])
     stages = await _stage_manifest(fhir, schema, checkpoint, locked=True)
     if stages != body["stages"]:
         fail("stage_manifest_changed")
-    physical, runtime, layouts = await _legacy_physical_manifest(fhir, schema, checkpoint, serving, stages, locked=True)
-    if {key: manifest_value for key, manifest_value in physical.items() if key != "observed_at"} != {
-        key: manifest_value for key, manifest_value in body["physical"].items() if key != "observed_at"
-    }:
-        fail("physical_preimage_changed")
-    spaces = body["database"]["tablespaces"]
-    if [(stage_entry["tablespace_oid"], stage_entry["tablespace_name"]) for stage_entry in spaces] != [
-        (runtime.tablespace_oid, runtime.tablespace_name),
-        (runtime.temp_tablespace_oid, runtime.temp_tablespace_name),
-    ]:
-        fail("physical_tablespace_changed")
-    projection = await project_cleanup_budget(fhir, schema, checkpoint, runtime, physical=physical, layouts=layouts)
-    if any(body["limits"][field] < projection[field] for field in ("data_bytes", "temp_bytes", "wal_bytes")):
-        fail("budget_exceeded")
-    reservation_rows = await fhir.db.all(
-        f"SELECT reservation_id FROM {fhir._unscoped_qt(schema, 'provider_directory_profile_capacity_lease_consumption')} "
-        "WHERE expires_at>clock_timestamp() UNION SELECT reservation_id FROM "
-        + claim_ref(fhir, schema)
-        + " WHERE expires_at>clock_timestamp()"
+    capacity_snapshot, runtime, layouts = await _cleanup_capacity_manifest(
+        fhir, schema, checkpoint, serving, stages, locked=True
     )
-    if not {reservation_row[0] for reservation_row in reservation_rows}.issubset(
-        set(body["observations"]["accounted_reservation_ids"])
-    ):
-        fail("original_reservation_unaccounted")
+    if {key: value for key, value in capacity_snapshot.items() if key != "observed_at"} != {
+        key: value for key, value in body["capacity"].items() if key != "observed_at"
+    }:
+        fail("capacity_preimage_changed")
+    projection = await project_cleanup_budget(
+        fhir, schema, checkpoint, runtime, capacity_snapshot=capacity_snapshot, layouts=layouts
+    )
+    await _assert_cleanup_budget(fhir, schema, body, projection)
     return checkpoint
 
 
@@ -1855,16 +1755,13 @@ async def _receipt_tail_bound(fhir, schema, body, checkpoint):
     from process import provider_directory_profile_capacity as capacity
     from process.provider_directory_profile_capacity_physical import _metadata_mutation_projection
 
-    has_physical = body.get("variant") in {"legacy_full_swap", "initial_full_swap"}
-    if has_physical:
-        runtime = SimpleNamespace(**body["physical"]["postgres"])
-        checkpoint_oid = body["physical"]["checkpoint_layout"]["oid"]
-    else:
-        runtime = capacity.validated_capacity_geometry(checkpoint["capacity_geometry_json"])
-        checkpoint_oid = runtime.build_checkpoint_oid
-    layout = await fhir._provider_directory_profile_relation_storage_fingerprint(
-        checkpoint_oid, expected_persistence="p"
+    has_capacity = body.get("variant") in {"legacy_full_swap", "initial_full_swap"}
+    runtime = (
+        SimpleNamespace(**body["capacity"]["postgres"])
+        if has_capacity
+        else capacity.validated_capacity_geometry(checkpoint["capacity_geometry_json"])
     )
+    layout = (await _metadata_layouts(fhir, schema, locked=False))["checkpoint"]
     old_toast = await fhir._provider_directory_profile_toast_chunk_count(
         source_sql=f"SELECT * FROM {fhir._provider_directory_profile_checkpoint_ref(schema)} WHERE build_id=:build",
         relation_oid=layout.relation_oid,
@@ -1878,7 +1775,7 @@ async def _receipt_tail_bound(fhir, schema, body, checkpoint):
     )
     stages = await _stage_manifest(fhir, schema, checkpoint, locked=False)
     dependencies = [await _stage_dependency_manifest(fhir, schema, stage) for stage in stages]
-    return _metadata_mutation_projection(runtime, mutation)[1] + _commit_wal_bound(dependencies, runtime), has_physical
+    return _metadata_mutation_projection(runtime, mutation)[1] + _commit_wal_bound(dependencies, runtime), has_capacity
 
 
 async def _dispose_claimed_stages(fhir, schema, envelope, checkpoint, start_lsn):
@@ -1889,9 +1786,9 @@ async def _dispose_claimed_stages(fhir, schema, envelope, checkpoint, start_lsn)
     )
     if database_record is None or _claim_envelope(dict(database_record._mapping)) != envelope:
         fail("claim_not_visible")
-    tail_wal, has_physical = await _receipt_tail_bound(fhir, schema, body, checkpoint)
+    tail_wal, has_capacity = await _receipt_tail_bound(fhir, schema, body, checkpoint)
     for name in (name for name in fhir._validated_profile_checkpoint_stage_names(checkpoint) if name is not None):
-        await fhir.db.status(f"DROP TABLE {fhir._unscoped_qt(schema, name)}")
+        await fhir.db.status(f"DROP TABLE {fhir._unscoped_qt(schema, name)} RESTRICT")
     observation = await fhir.db.first(
         "SELECT clock_timestamp() AS completed_at, pg_current_wal_insert_lsn()::text AS lsn, "
         "pg_wal_lsn_diff(pg_current_wal_insert_lsn(),CAST(CAST(:start AS text) AS pg_lsn))::bigint AS bytes",
@@ -1913,11 +1810,11 @@ async def _dispose_claimed_stages(fhir, schema, envelope, checkpoint, start_lsn)
         "wal_precommit_lsn": values_by_field["lsn"],
         "wal_precommit_bytes": values_by_field["bytes"],
     }
-    if has_physical:
+    if has_capacity:
         receipt_by_field["variant"] = body["variant"]
     complete_error = (checkpoint["last_error"] or "") + completion_suffix(receipt_by_field)
     if len(complete_error.encode()) > MAX_BYTES or (
-        has_physical
+        has_capacity
         and 4 * len(canonical(json_values(dict(checkpoint, last_error=complete_error))).encode()) > MAX_BYTES
     ):
         fail("complete_error_exceeds_budget")
@@ -2102,7 +1999,20 @@ def _configured_cleanup_history():
         fail("history_trust_epochs_invalid")
     if len({canonical(epoch) for epoch in epochs}) != len(epochs):
         fail("history_trust_epochs_invalid")
-    return tuple(validated_capacity_lease_trust(epoch) for epoch in epochs)
+    return tuple(_historical_cleanup_trust(epoch, validated_capacity_lease_trust) for epoch in epochs)
+
+
+def _historical_cleanup_trust(document, validator):
+    """Read original pinned key epochs without importing their retired physical bindings."""
+    fields = {"contract_id", "signature_algorithm", "environment_id", "attestor_id", "active_key_id", "keys"}
+    if isinstance(document, dict) and document.get("contract_id") == "provider-directory-database-capacity-trust-v2":
+        exact(
+            document, fields | {"database_system_identifier", "database_oid", "database_name", "tablespaces", "volumes"}
+        )
+        authority_by_field = {name: document[name] for name in fields}
+        authority_by_field["contract_id"] = "provider-directory-database-capacity-trust-v3"
+        return validator(authority_by_field)
+    return validator(document)
 
 
 def _validate_completed_authorization(envelope, claim, trust):
@@ -2122,9 +2032,6 @@ def _validate_completed_authorization(envelope, claim, trust):
             for reason in (
                 "independent_trust_missing",
                 "trust_binding_invalid",
-                "trust_database_invalid",
-                "trust_tablespaces_invalid",
-                "trust_volumes_invalid",
                 "trust_key_invalid",
                 "trust_key_retired_invalid",
                 "signature_invalid",
@@ -2145,12 +2052,15 @@ def _validate_completed_authorization(envelope, claim, trust):
 async def _completed_claim_receipt(fhir, schema, checkpoint, claim, trust):
     """Historical verification cannot precede exact completion, database and absent-stage proof."""
     envelope = _claim_envelope(claim)
+    if envelope["authorization"].get("contract_id") in HISTORICAL_CONTRACTS:
+        authenticate_historical_authorization(envelope, trust=trust, now=_now_utc(), claimed_at=claim["claimed_at"])
+        fail("legacy_semantic_evidence_required")
     receipt = validate_completion_preimage(checkpoint, claim)
     binding = await _database_binding(fhir, schema)
     if any(envelope["authorization"]["database"][field] != value for field, value in binding.items()):
         fail("database_changed")
     for name in (name for name in fhir._validated_profile_checkpoint_stage_names(checkpoint) if name is not None):
-        if await fhir._provider_directory_profile_stage_relation_identity(schema, name) is not None:
+        if await fhir.db.scalar("SELECT to_regclass(:name) IS NOT NULL", name=fhir._unscoped_qt(schema, name)):
             fail("disposed_stage_present")
     _validate_completed_authorization(envelope, claim, trust)
     return receipt
@@ -2169,9 +2079,7 @@ async def validate_disposed_checkpoint(fhir, schema, checkpoint):
 
 
 def _executor_source_manifest(root):
-    """Bind the fixed cleanup entrypoint and its local import closure to stable bytes."""
-    import os
-
+    """Bind the fixed entrypoint/import closure to content bytes, independent of file identity."""
     pending_paths = [
         "process/provider_directory_profile_failed_cleanup.py",
         "process/provider_directory_fhir.py",
@@ -2183,26 +2091,28 @@ def _executor_source_manifest(root):
         name = pending_paths.pop()
         if name in manifest_by_path:
             continue
-        path = root / name
-        before = path.stat(follow_symlinks=False)
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        try:
-            source_bytes = bytearray()
-            while chunk := os.read(descriptor, 65536):
-                source_bytes.extend(chunk)
-                if len(source_bytes) > 8 * 1024 * 1024:
-                    fail("executor_source_unsupported")
-            identity = _file_identity(before)
-            if identity != _file_identity(os.fstat(descriptor)) or identity != _file_identity(
-                path.stat(follow_symlinks=False)
-            ):
-                fail("executor_source_changed")
-        finally:
-            os.close(descriptor)
+        source_bytes = _executor_source_bytes(root / name)
+        if source_bytes != _executor_source_bytes(root / name):
+            fail("executor_source_changed")
         manifest_by_path[name] = hashlib.sha256(source_bytes).hexdigest()
         if name.endswith(".py"):
             pending_paths.extend(_executor_local_import_paths(root, name, source_bytes))
     return dict(sorted(manifest_by_path.items()))
+
+
+def _executor_source_bytes(path):
+    import os
+
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        content = os.read(descriptor, 8 * 1024 * 1024 + 1)
+        if len(content) > 8 * 1024 * 1024:
+            fail("executor_source_unsupported")
+        if os.read(descriptor, 1):
+            fail("executor_source_changed")
+        return content
+    finally:
+        os.close(descriptor)
 
 
 def _executor_local_import_paths(root, name, source_bytes):
@@ -2295,10 +2205,10 @@ def main():
     print(canonical(asyncio.run(_operator(parser.parse_args()))))
 
 
-def _validated_legacy_physical(body):
-    """Validate database settings and metadata layout before stage or publication facts."""
-    physical = exact(
-        body["physical"],
+def _validated_cleanup_capacity(body):
+    """Validate numeric runtime/layout bounds and named metadata coordinates."""
+    capacity = exact(
+        body["capacity"],
         {
             "observed_at",
             "postgres",
@@ -2308,36 +2218,33 @@ def _validated_legacy_physical(body):
             "commit_wal_upper_bytes",
         },
     )
-    timestamp(physical["observed_at"])
-    postgres = exact(physical["postgres"], POSTGRES_FIELDS)
-    for name in ("database_system_identifier", "database_oid", "database_name"):
-        if postgres[name] != body["database"][name]:
-            fail("physical_database_changed")
-    for field in POSTGRES_FIELDS:
-        field_value = postgres[field]
+    timestamp(capacity["observed_at"])
+    postgres = exact(capacity["postgres"], POSTGRES_FIELDS)
+    for field, observed_setting in postgres.items():
         if field in {"postgres_full_page_writes", "postgres_wal_log_hints", "postgres_data_checksums"}:
-            if type(field_value) is not bool:
-                fail("physical_invalid")
-        elif field.endswith("name") or field in {
-            "database_system_identifier",
-            "postgres_wal_level",
-            "postgres_wal_compression",
-            "postgres_default_toast_compression",
-        }:
-            text(field_value)
+            if type(observed_setting) is not bool:
+                fail("capacity_invalid")
+        elif field in {"postgres_wal_level", "postgres_wal_compression", "postgres_default_toast_compression"}:
+            text(observed_setting)
         else:
-            integer(field_value, 1)
-    for name in ("checkpoint_layout", "claim_layout"):
-        fields = {"oid", "storage_fingerprint"} | (
-            {"old_toast_chunks", "row_payload_upper_bytes"} if name == "checkpoint_layout" else set()
-        )
-        layout = exact(physical[name], fields)
-        integer(layout["oid"], 1, (1 << 32) - 1)
-        hash64(layout["storage_fingerprint"])
-    integer(physical["checkpoint_layout"]["old_toast_chunks"])
-    integer(physical["checkpoint_layout"]["row_payload_upper_bytes"], 1, MAX_BYTES)
-    integer(physical["commit_wal_upper_bytes"], 1)
-    return physical
+            integer(observed_setting, 1)
+    for role in ("checkpoint_layout", "claim_layout"):
+        fields = {"schema", "name", "main_index_pages", "toast_index_pages", "toastable_column_count"}
+        if role == "checkpoint_layout":
+            fields |= {"old_toast_chunks", "row_payload_upper_bytes"}
+        layout = exact(capacity[role], fields)
+        _named_coordinate({key: layout[key] for key in ("schema", "name")})
+        for name in ("main_index_pages", "toast_index_pages"):
+            pages = layout[name]
+            if not isinstance(pages, list) or len(pages) > 64 or (name == "main_index_pages" and not pages):
+                fail("capacity_layout_invalid")
+            for page in pages:
+                integer(page, 1)
+        integer(layout["toastable_column_count"], 0, 128)
+    integer(capacity["checkpoint_layout"]["old_toast_chunks"])
+    integer(capacity["checkpoint_layout"]["row_payload_upper_bytes"], 1, MAX_BYTES)
+    integer(capacity["commit_wal_upper_bytes"], 1)
+    return capacity
 
 
 if __name__ == "__main__":

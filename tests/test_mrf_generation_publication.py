@@ -96,7 +96,7 @@ async def test_mrf_finalizer_records_exact_family_generation_in_rotation_transac
 async def test_mrf_finalizer_generation_failure_rolls_back_rotation(monkeypatch):
     database = _Database()
     observed_importers = []
-    monkeypatch.setattr(initial, "prepare_local_native_input_publication", AsyncMock())
+    monkeypatch.setattr(initial, "prepare_local_native_input_publication", AsyncMock(return_value=None))
 
     async def generation_writer(_session, *, importer_id, **_scope):
         assert database.in_transaction

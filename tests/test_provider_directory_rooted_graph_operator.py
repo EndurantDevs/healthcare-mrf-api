@@ -5,20 +5,21 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 import json
 import math
 import sys
+from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
 from process import provider_directory_rooted_graph_operator as operator
 from process import provider_directory_rooted_graph_operator_contract as contract
 from process.provider_directory_dataset_scoped_publication_contract import (
-    ExactCurrentDataset,
     LEGACY_PRACTITIONER_VARIANT,
+    ExactCurrentDataset,
     exact_uhc_dataset_pair,
 )
 from process.provider_directory_rooted_graph_contract import (
@@ -30,7 +31,7 @@ from process.provider_directory_rooted_graph_source_contract import (
 from process.uhc_flex_official_cohort_contract import (
     UHC_FLEX_OFFICIAL_AUTHORITY_ID,
 )
-
+from tests.provider_directory_rooted_graph_runtime_test_support import configure_rooted_generation
 
 OPERATION_KEY = "a" * 64
 SECOND_OPERATION_KEY = "b" * 64
@@ -63,9 +64,7 @@ def _legacy_current() -> ExactCurrentDataset:
         practitioner_origin_source_id=pair.legacy_source_id,
         practitioner_origin_endpoint_id=pair.legacy_endpoint_id,
         source_authority_id=UHC_FLEX_OFFICIAL_AUTHORITY_ID,
-        endpoint_signature_sha256=(
-            PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256
-        ),
+        endpoint_signature_sha256=(PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256),
         dataset_hash="2" * 64,
         resource_count=3,
         practitioner_resource_count=3,
@@ -77,9 +76,7 @@ def _legacy_current() -> ExactCurrentDataset:
         operation_key="4" * 64,
         acquisition_root_run_id="pdufpar_" + "5" * 48,
         variant=LEGACY_PRACTITIONER_VARIANT,
-        root_publication_contract_id=(
-            PROVIDER_DIRECTORY_ROOTED_GRAPH_LEGACY_ROOT_PUBLICATION_CONTRACT_ID
-        ),
+        root_publication_contract_id=(PROVIDER_DIRECTORY_ROOTED_GRAPH_LEGACY_ROOT_PUBLICATION_CONTRACT_ID),
     )
 
 
@@ -93,9 +90,7 @@ def test_active_gates_are_exact_and_retired_acquisition_stays_closed(
     gate_by_phase = {
         "register": contract.REGISTRATION_ENABLED_ENV,
         "acquire": contract.ACQUISITION_ENABLED_ENV,
-        contract.SINGLE_ROOT_ACQUISITION_PHASE: (
-            contract.SINGLE_ROOT_ACQUISITION_ENABLED_ENV
-        ),
+        contract.SINGLE_ROOT_ACQUISITION_PHASE: (contract.SINGLE_ROOT_ACQUISITION_ENABLED_ENV),
         "publish": contract.PUBLICATION_ENABLED_ENV,
     }
     assert contract.OPERATOR_PHASES == tuple(gate_by_phase)
@@ -217,9 +212,7 @@ async def test_invalid_publication_selector_fails_before_database(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _enable_only(monkeypatch, contract.PUBLICATION_ENABLED_ENV)
-    publication_module = ModuleType(
-        "process.provider_directory_rooted_graph_publication"
-    )
+    publication_module = ModuleType("process.provider_directory_rooted_graph_publication")
 
     async def reject_call(*_args: Any, **_kwargs: Any) -> Any:
         pytest.fail("invalid publication selector reached database")
@@ -271,45 +264,46 @@ class _Transaction:
 
 
 @pytest.mark.asyncio
-async def test_current_selector_uses_shared_lock_and_exact_pair(
+async def test_current_selector_fences_validated_root_under_shared_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from process import provider_directory_rooted_graph_current_preflight as preflight
+
+    configure_rooted_generation(monkeypatch)
     current = _legacy_current()
+    proof = object()
     calls: list[tuple[str, Any]] = []
 
     class Database:
+        lock_acquired = True
+
         def transaction(self) -> _Transaction:
             calls.append(("transaction", None))
             return _Transaction()
 
-        async def scalar(self, _query: str, **values: Any) -> None:
-            calls.append(("lock", values["lock_identity"]))
+        async def status(self, statement: str) -> None:
+            calls.append(("timeout", statement))
 
-    selection_module = ModuleType(
-        "process.provider_directory_dataset_scoped_publication"
-    )
+        async def scalar(self, _query: str, **values: Any) -> object:
+            calls.append(("lock", values["identity"]))
+            return self.lock_acquired
 
-    def exact_pair() -> object:
-        calls.append(("pair", None))
-        return "exact-pair"
-
-    async def lock_current(database: Any, *, pair: object) -> ExactCurrentDataset:
-        assert isinstance(database, Database)
-        calls.append(("select", pair))
+    async def fence(database: Any, validated: object, *, lock_rows: bool) -> ExactCurrentDataset:
+        assert isinstance(database, Database) and validated is proof
+        calls.append(("fence", lock_rows))
         return current
 
-    selection_module.exact_uhc_dataset_pair = exact_pair
-    selection_module.lock_exact_current_dataset = lock_current
-    monkeypatch.setitem(sys.modules, selection_module.__name__, selection_module)
+    monkeypatch.setattr(preflight, "prepare_current_root", AsyncMock(return_value=proof))
+    monkeypatch.setattr(preflight, "require_current_root_fence", fence)
 
     selected = await operator._select_exact_current_root(Database())
 
     assert selected is current
     assert calls == [
         ("transaction", None),
+        ("timeout", "SET LOCAL lock_timeout='1500ms'"),
         ("lock", contract_module_lock_identity()),
-        ("pair", None),
-        ("select", "exact-pair"),
+        ("fence", False),
     ]
 
 
@@ -324,9 +318,7 @@ def contract_module_lock_identity() -> str:
 def _fake_acquisition_module(calls: list[Any], *, cancel: bool) -> ModuleType:
     """Build a bounded twin-acquisition module for operation composition."""
 
-    acquisition_module = ModuleType(
-        "process.provider_directory_rooted_graph_acquisition"
-    )
+    acquisition_module = ModuleType("process.provider_directory_rooted_graph_acquisition")
 
     class Config:
         def __init__(self, **values: Any) -> None:
@@ -435,12 +427,8 @@ async def test_acquisition_replays_deterministically_and_never_publishes(
         "root_timeout_seconds": 604_800.0,
         "database": object(),
     }
-    first = json.loads(
-        await operator.acquire_admit_rooted_graph_operation(**arguments_by_name)
-    )
-    replay = json.loads(
-        await operator.acquire_admit_rooted_graph_operation(**arguments_by_name)
-    )
+    first = json.loads(await operator.acquire_admit_rooted_graph_operation(**arguments_by_name))
+    replay = json.loads(await operator.acquire_admit_rooted_graph_operation(**arguments_by_name))
 
     assert first == replay
     assert first["operation_key"] == OPERATION_KEY

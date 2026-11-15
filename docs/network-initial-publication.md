@@ -95,10 +95,8 @@ partitions or rewrite rules. Managed E&M pricing reads locate the attribution
 rates table and the nine retained provider input tables by name without
 comparing recorded identifiers, and refuse them as unavailable under the same
 conditions or when a table lacks a column or type the read uses; a retained
-TIGER input may inherit only its canonical parent. After an address table rotation a generation keeps
-reading its own table under the retained name `<table>_retained_<oid hex>`; the
-recorded name then belongs to the replacement. Callers outside API reads keep
-the strict check.
+TIGER input may inherit only its canonical parent. A generation reads its
+address tables under the schema-qualified names it recorded.
 
 Directory inventory alone does not establish pricing availability or nationwide
 network coverage.

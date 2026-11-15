@@ -17,6 +17,7 @@ import math
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Mapping
 from uuid import UUID
 
@@ -38,6 +39,7 @@ from process.entity_address_snapshot_receipt import (
 from process.entity_address_snapshot_serving import (
     EntityAddressObservedServingCapture,
     capture_entity_address_observed_serving,
+    logical_entity_address_serving_capture,
     observe_entity_address_serving,
     validate_entity_address_observed_serving_capture,
 )
@@ -120,6 +122,7 @@ class EntityAddressArchiveStageHooks:
     archive_copy: Callable[[EntityAddressArchiveStageCapture], Awaitable[None]]
     stage_created: Callable[[object], Awaitable[None]]
     source_captured: Callable[[object, EntityAddressArchiveSourceCapture], Awaitable[None]] | None = None
+    _clone_outcome_by_field: dict[str, bool] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         if not callable(self.archive_copy) or not callable(self.stage_created):
@@ -309,7 +312,7 @@ async def capture_entity_address_archive_source(
         schema_name=schema,
         apply_queue_bounds=False,
     )
-    if observed != queued:
+    if logical_entity_address_serving_capture(observed) != logical_entity_address_serving_capture(queued):
         raise RuntimeError("entity-address queued serving identity changed")
     if contract == CONTRACT:
         await alias_authority._lock_alias_relations(session, schema)
@@ -386,9 +389,8 @@ def native_entity_address_source_copy(*, max_bytes, timeout):
 
 
 _LEGACY_SOURCE_CATALOG_SQL = text(
-    "SELECT c.oid::bigint AS relation_oid, c.relname::text AS relation_name, n.oid::bigint AS schema_oid,"
-    "n.nspname::text AS schema_name,n.nspowner::bigint AS schema_owner_oid, c.relowner::bigint AS owner_o"
-    "id,pg_catalog.pg_relation_filenode(c.oid)::bigint AS relfilenode, ARRAY(SELECT a.attname::text FROM "
+    "SELECT c.oid::bigint AS relation_oid, c.relname::text AS relation_name, "
+    "n.nspname::text AS schema_name, ARRAY(SELECT a.attname::text FROM "
     "pg_catalog.pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.at"
     "tnum) AS columns FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace W"
     "HERE c.oid=pg_catalog.to_regclass(:relation) AND c.relkind='r' AND c.relpersistence='p' AND NOT c.re"
@@ -418,7 +420,7 @@ _LEGACY_SOURCE_CATALOG_SQL = text(
 
 async def _legacy_source_catalog(session, capture):
     """Admit only the fixed native model family before cloning executable structure."""
-    from process.entity_address_native_publication import _require_stage_execution_catalog
+    from process.entity_address_native_publication import _require_named_execution_catalog
 
     models = (entity_address_unified.EntityAddressUnified, *entity_address_unified.SUPPORT_TABLE_MODELS)
     relation_records = []
@@ -443,8 +445,8 @@ async def _legacy_source_catalog(session, capture):
         ):
             raise RuntimeError("entity-address source native relation_records differs")
         relation_records.append({"model": model, "source_ref": source_ref, **dict(relation_record)})
-    await _require_stage_execution_catalog(
-        session, {"stage_relations": [{"relation_oid": entry["relation_oid"]} for entry in relation_records]}
+    await _require_named_execution_catalog(
+        session, tuple((capture.schema_name, model.__tablename__) for model in models)
     )
     return relation_records
 
@@ -583,25 +585,34 @@ def _source_index_statements(index_by_field, *, schema, table, source_stage=None
     return _legacy_index_statements(index_by_field, schema=schema, table=table)
 
 
-async def _require_legacy_target_custody(session, capture, schema):
-    """Refuse callback or DDL-hook side effects and every foreign payload writer."""
+async def _require_legacy_target_layout(session, capture, schema):
+    """Validate the named empty clone after the caller's precreation callback."""
     from dataclasses import replace
 
-    targets = await _legacy_source_catalog(session, replace(capture, schema_name=schema))
-    owner_oid = await session.scalar(text("SELECT current_user::regrole::oid::bigint"))
-    if any(entry["owner_oid"] != owner_oid or entry["schema_owner_oid"] != owner_oid for entry in targets):
-        raise RuntimeError("entity-address source clone owner differs")
-    await family_archive._require_selected_mrf_catalog(session, targets, owner_oid)
-    closed = await session.scalar(
-        text(
-            "SELECT NOT EXISTS(SELECT 1 FROM pg_catalog.pg_namespace n, "
-            "LATERAL pg_catalog.aclexplode(COALESCE(n.nspacl,pg_catalog.acldefault('n',n.nspowner))) acl "
-            "WHERE n.oid=:schema_oid AND acl.grantee<>CAST(:owner AS oid) AND acl.privilege_type='CREATE')"
-        ),
-        {"schema_oid": targets[0]["schema_oid"], "owner": owner_oid},
-    )
-    if closed is not True:
-        raise RuntimeError("entity-address source clone namespace writers differ")
+    await _legacy_source_catalog(session, replace(capture, schema_name=schema))
+
+
+async def _close_clone_grants(connection, schema, table_names):
+    """Close creation/default grants before a clone can become visible to readers."""
+    from process.provider_directory_generic_source_storage import _close_grants
+
+    policy = SimpleNamespace(schema=schema)
+    for name in table_names:
+        await _close_grants(connection, policy, name)
+    for sequence in await connection.fetch(
+        "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname=$1 AND c.relkind='S'",
+        schema,
+    ):
+        await _close_grants(connection, policy, sequence["relname"], sequence=True)
+    for grant in await connection.fetch(
+        "SELECT DISTINCT CASE WHEN a.grantee=0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END AS principal "
+        "FROM pg_namespace n "
+        "CROSS JOIN LATERAL aclexplode(coalesce(n.nspacl,acldefault('n',n.nspowner))) a "
+        "LEFT JOIN pg_roles r ON r.oid=a.grantee WHERE n.nspname=$1 AND a.grantee<>n.nspowner",
+        schema,
+    ):
+        await connection.execute(f"REVOKE ALL ON SCHEMA {_quoted_identifier(schema)} FROM {grant['principal']} CASCADE")
 
 
 async def _clone_legacy_source(session, capture, schema, source_copy, deadline, on_precreated):
@@ -617,7 +628,9 @@ async def _clone_legacy_source(session, capture, schema, source_copy, deadline, 
         )
     await _clone_entity_address_evidence_sequence(session, stage_schema=schema)
     await on_precreated(session)
-    await _require_legacy_target_custody(session, capture, schema)
+    await _require_legacy_target_layout(session, capture, schema)
+    connection = await family_archive._native_model_copy_driver(session, ("fetch", "fetchval", "execute"))
+    await _close_clone_grants(connection, schema, (entry["model"].__tablename__ for entry in catalog))
     remaining = source_copy.max_bytes
     for entry in catalog:
         remaining = await _copy_pinned_model_rows(
@@ -897,6 +910,7 @@ async def export_entity_address_archive_stage(
 async def _export_archive_stage(session_factory, schema_name, dataset_id, queued_serving_capture, source_copy, hooks):
     """Keep capture, clone, complete validation and dump inside one absolute deadline."""
     stage_schema = entity_address_archive_stage_schema(dataset_id)
+    hooks._clone_outcome_by_field.clear()
     async with asyncio.timeout(source_copy.timeout) as deadline:
         async with session_factory() as source_session, source_session.begin():
             source_capture = await capture_entity_address_archive_source(
@@ -907,15 +921,17 @@ async def _export_archive_stage(session_factory, schema_name, dataset_id, queued
             )
             if hooks.source_captured is not None:
                 await hooks.source_captured(source_session, source_capture)
-            async with session_factory() as clone_session, clone_session.begin():
-                await _clone_entity_address_archive_source(
-                    clone_session,
-                    source_capture=source_capture,
-                    stage_schema=stage_schema,
-                    source_copy=source_copy,
-                    copy_deadline=deadline.when(),
-                    on_precreated=hooks.stage_created,
-                )
+            async with session_factory() as clone_session:
+                async with clone_session.begin():
+                    await _clone_entity_address_archive_source(
+                        clone_session,
+                        source_capture=source_capture,
+                        stage_schema=stage_schema,
+                        source_copy=source_copy,
+                        copy_deadline=deadline.when(),
+                        on_precreated=hooks.stage_created,
+                    )
+                hooks._clone_outcome_by_field["committed"] = True
         async with session_factory() as stage_session, stage_session.begin():
             capture = await _capture_entity_address_archive_stage(
                 stage_session,
@@ -963,20 +979,23 @@ async def export_entity_address_archive_with_receipt(
         contract=contract,
     )
 
+    hooks = EntityAddressArchiveStageHooks(
+        archive_copy=evidence.capture_stage_and_copy,
+        stage_created=evidence.record_created_stage,
+        source_captured=evidence.capture_source_aliases,
+    )
     try:
         manifest = await export_entity_address_archive_stage(
             session_factory,
             schema_name=schema_name,
             dataset_id=dataset_id,
             queued_serving_capture=queued_serving_capture,
-            archive_copy=evidence.capture_stage_and_copy,
-            stage_created=evidence.record_created_stage,
-            source_captured=evidence.capture_source_aliases,
+            hooks=hooks,
             contract=contract,
             source_copy=source_copy,
         )
     finally:
-        if evidence.owned_stages:
+        if hooks._clone_outcome_by_field.get("committed") and evidence.owned_stages:
             await _cleanup_owned_archive_stage(session_factory, ownership, evidence.owned_stages[0])
     return evidence.bound_receipts(manifest)
 
@@ -1012,6 +1031,7 @@ __all__ = [
     "EntityAddressObservedServingCapture",
     "capture_entity_address_archive_source",
     "capture_entity_address_observed_serving",
+    "logical_entity_address_serving_capture",
     "entity_address_archive_stage_schema",
     "entity_address_archive_relations",
     "export_entity_address_archive_source",

@@ -131,8 +131,17 @@ def _em_heap_resources(failure):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("caller", ("published", "native"))
-@pytest.mark.parametrize("failure", ("preexisting", "partial", "replacement"))
+# The published fixture drops its created schemas by name, so a same-name replacement is not distinguished there.
+@pytest.mark.parametrize(
+    ("failure", "caller"),
+    [
+        ("preexisting", "published"),
+        ("preexisting", "native"),
+        ("partial", "published"),
+        ("partial", "native"),
+        ("replacement", "native"),
+    ],
+)
 async def test_em_heap_cleanup_preserves_unowned_schema(monkeypatch, caller, failure):
     """Failed creation and same-name replacements never authorize schema cleanup."""
     import asyncpg
@@ -144,6 +153,8 @@ async def test_em_heap_cleanup_preserves_unowned_schema(monkeypatch, caller, fai
     connection, schemas, statements, sentinel_by_field = _em_heap_resources(failure)
     monkeypatch.setenv("NETWORK_REGISTRY_TEST_DSN", "postgresql://synthetic@127.0.0.1/postgres")
     monkeypatch.setattr(resolver_fixture, "_allow_composition_owner", AsyncMock())
+    # Named preparation bootstrap is a separate fixture; this case covers only EM heap cleanup.
+    monkeypatch.setattr(resolver_fixture, "_named_compact_runtime", AsyncMock())
     monkeypatch.setattr(provider_fixture, "_em_provider_create_roles", AsyncMock())
     monkeypatch.setattr(asyncpg, "connect", AsyncMock(return_value=connection))
     monkeypatch.setattr(database_module, "Database", lambda: SimpleNamespace(_reader_database=None))

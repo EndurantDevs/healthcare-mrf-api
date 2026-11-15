@@ -9,16 +9,15 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
+import asyncpg
 import pytest
 
 from api import network_provider_only_read as readers
 from api.network_address_scope import NetworkAddressReadScope
 from api.network_provider_read import NetworkProviderReadError, NetworkProviderReadUnavailable
-from process import network_candidate_custody as custody
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_compact_layout import CompactAddressRelation
 from process.network_provider_only_projection import provider_only_page_sql
-from process.network_read_identity import NetworkReadIdentityError
 from process.network_serving_read import NetworkServingReadUnavailable, PinnedNetworkServingManifest
 from process.registry_source_contribution_store import (
     SUMMARY_KEY,
@@ -29,14 +28,12 @@ from process.registry_source_inventory_contract import make_source_inventory_ent
 from process.registry_source_inventory_reference import INVENTORY_DIGEST_KEY, SourceInventoryReference
 from process.registry_source_inventory_summaries import contribution_summary_v3
 from process.registry_source_recipe_store import RECIPE_DIGEST_KEY, canonical_registry_source_recipes
+from tests.registry_source_recipe_support import _example
 from tests.test_registry_source_contributions import _descriptor
-from tests.test_registry_source_recipe_store_postgres import _example
 
 CONTROL = "synthetic_control"
 APPROVED = ApprovedMembershipSource(3, "b" * 64, 0)
-_PID = 77
-_CANDIDATE_RELATION = CompactAddressRelation(CONTROL, "network_membership_candidate", 11)
-_APPROVED_RELATION = CompactAddressRelation(CONTROL, "registry_approved_record", 13)
+_APPROVED_RELATION = CompactAddressRelation(CONTROL, "registry_approved_record")
 
 
 def _fixture(count=1, *, legacy=False):
@@ -85,9 +82,8 @@ def _fixture(count=1, *, legacy=False):
         copy.deepcopy(generations_by_name),
         APPROVED.approved_revision,
         "d" * 64,
-        42,
+        CompactAddressRelation("network_candidate_" + identity.replace("-", ""), "entity_address_unified"),
     )
-    _pin_provider_fixture_relations(manifest, legacy)
     return SimpleNamespace(
         candidate=candidate_by_field, manifest=manifest, scope=NetworkAddressReadScope(manifest, (11,), None)
     )
@@ -129,7 +125,6 @@ def _spies(monkeypatch, fixture, *, receipt=None, refusal_at=None):
     connection = AsyncMock()
     connection.is_in_transaction = lambda: True
     connection.fetchval.return_value = "repeatable read"
-    connection.get_server_pid = lambda: _PID
 
     async def resolve(actual, *, generation_id, control_schema, api_read):
         assert actual is connection and api_read is True
@@ -137,47 +132,28 @@ def _spies(monkeypatch, fixture, *, receipt=None, refusal_at=None):
         events.append("resolve")
         return fixture.manifest
 
-    async def control(actual, names, *, control_schema):
-        assert actual is connection and names == ("network_membership_candidate",)
-        assert control_schema == CONTROL
-        return (_CANDIDATE_RELATION,)
-
     class PageReceipt(dict):
         def __getitem__(self, key):
-            assert events[-1] == "page_guard"
+            assert events[-1] == "page"
             return super().__getitem__(key)
 
     async def row(query, *arguments):
         assert events and events[0] == "resolve"
-        events.append("candidate" if len(arguments) == 2 else "page")
-        return (
-            fixture.candidate
-            if len(arguments) == 2
-            else PageReceipt(receipt if receipt is not None else _result(fixture))
-        )
-
-    async def guard(actual, relations, *, expected_backend_pid):
-        assert actual is connection and expected_backend_pid == _PID
-        stage = events[-1]
-        assert stage in {"candidate", "page"}
-        if stage == "candidate":
-            assert relations == (_CANDIDATE_RELATION,)
-        else:
-            expected = fixture.manifest.candidate_relation_pins
-            if "network_source_inventory" in {pin.table_name for pin in expected}:
-                expected += (_APPROVED_RELATION,)
-            assert relations == expected
+        stage = "candidate" if "network_membership_candidate" in query else "page"
+        events.append(stage)
         if refusal_at == stage:
-            raise NetworkReadIdentityError("synthetic identity refusal")
-        events.append(stage + "_guard")
+            raise asyncpg.InsufficientPrivilegeError("synthetic named relation denied")
+        if stage == "candidate":
+            assert "state='published'" in query and "schema_name=$3" in query
+            assert arguments[2] == fixture.manifest.schema_name
+            return fixture.candidate
+        return PageReceipt(receipt if receipt is not None else _result(fixture))
 
     resolver = AsyncMock(side_effect=resolve)
     approved = AsyncMock(return_value=(APPROVED, _APPROVED_RELATION))
     connection.fetchrow.side_effect = row
     monkeypatch.setattr(readers, "resolve_network_serving_manifest", resolver)
-    monkeypatch.setattr(custody, "read_network_control_relation_pins", AsyncMock(side_effect=control))
     monkeypatch.setattr(readers, "pin_api_retained_approved_membership_source", approved)
-    monkeypatch.setattr(readers, "verify_consumed_network_relations", AsyncMock(side_effect=guard))
     return connection, resolver, approved, events
 
 
@@ -193,7 +169,7 @@ async def test_reference_read_uses_one_fixed_query_after_actual_resolver(monkeyp
     monkeypatch.setattr(readers, "require_retained_approved_network_source_bindings", bindings)
     result = await readers.read_network_provider_only_page(connection, fixture.scope, control_schema=CONTROL)
     assert result["membership_level"] == "provider" and "locations" not in json.dumps(result)
-    assert events == ["resolve", "candidate", "candidate_guard", "page", "page_guard"]
+    assert events == ["resolve", "candidate", "page"]
     resolver.assert_awaited_once()
     approved.assert_awaited_once_with(connection, fixture.manifest, control_schema=CONTROL)
     query, *arguments = connection.fetchrow.await_args.args
@@ -277,17 +253,14 @@ async def test_reference_approval_and_generation_drift_are_terminal(monkeypatch,
 @pytest.mark.asyncio
 @pytest.mark.parametrize("missing", ["network_provider_only_evidence", "network_source_inventory"])
 async def test_missing_read_identity_refuses_before_page(monkeypatch, missing):
+    """A missing selected QName is refused by its native query before response decoding."""
     fixture = _fixture()
-    object.__setattr__(
-        fixture.manifest,
-        "_candidate_relation_pins",
-        tuple(pin for pin in fixture.manifest.candidate_relation_pins if pin.table_name != missing),
-    )
-    connection, _, _, events = _spies(monkeypatch, fixture)
+    connection, _, _, events = _spies(monkeypatch, fixture, refusal_at="page")
     with pytest.raises(NetworkProviderReadUnavailable):
         await readers.read_network_provider_only_page(connection, fixture.scope, control_schema=CONTROL)
-    assert "page" not in events
-    assert connection.fetchrow.await_count == 1
+    query = connection.fetchrow.await_args.args[0]
+    assert missing in query and events == ["resolve", "candidate", "page"]
+    assert connection.fetchrow.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -335,10 +308,9 @@ async def test_legacy_metadata_keeps_legacy_source_query_branch(monkeypatch):
     connection, _, _, _ = _spies(monkeypatch, fixture)
     legacy_result = (["synthetic_bindings AS (SELECT 1)"], ["SELECT 1"], ["legacy-argument"])
 
-    async def source_bindings(actual, current, control_schema, *, candidate, read_relations):
+    async def source_bindings(actual, current, control_schema, *, candidate):
         assert actual is connection and current is fixture.manifest and control_schema == CONTROL
         assert candidate == fixture.candidate
-        read_relations.extend(current.candidate_relation_pins)
         return legacy_result
 
     legacy = AsyncMock(side_effect=source_bindings)
@@ -349,27 +321,10 @@ async def test_legacy_metadata_keeps_legacy_source_query_branch(monkeypatch):
         fixture.manifest,
         CONTROL,
         candidate=fixture.candidate,
-        read_relations=list(fixture.manifest.candidate_relation_pins),
     )
     query, *arguments = connection.fetchrow.await_args.args
     assert query == readers._query(fixture.manifest, *legacy_result)
     assert arguments[0] == "legacy-argument"
-
-
-def _pin_provider_fixture_relations(manifest, legacy):
-    """Attach the same authenticated physical relation pins to the synthetic manifest."""
-    object.__setattr__(
-        manifest,
-        "_candidate_relation_pins",
-        tuple(
-            CompactAddressRelation(manifest.schema_name, name, oid)
-            for name, oid in (
-                (("network_source_contribution", 23),)
-                if legacy
-                else (("network_provider_only_evidence", 21), ("network_source_inventory", 22))
-            )
-        ),
-    )
 
 
 def _damaged_provider_receipt(fixture, damage):
@@ -426,7 +381,7 @@ async def test_provider_projection_refuses_unbound_fields_and_duplicate_identity
     connection, _, _, events = _spies(monkeypatch, fixture, receipt=receipt)
     with pytest.raises(NetworkProviderReadUnavailable):
         await readers.read_network_provider_only_page(connection, fixture.scope, control_schema=CONTROL)
-    assert events[-1] == "page_guard"
+    assert events[-1] == "page"
 
 
 @pytest.mark.asyncio

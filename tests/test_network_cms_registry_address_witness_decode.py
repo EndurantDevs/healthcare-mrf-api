@@ -97,12 +97,9 @@ def test_decoder_rejects_unknown_keys(path):
 @pytest.mark.parametrize(
     "path,key,value",
     [
-        (("source",), "schema_oid", True),
         (("clone",), "catalog_sha256", "bad"),
-        (("source", "relation_oids", 0), 1, 0),
         (("source", "ordinals", 0, 1, 0), 0, "unknown_column"),
         (("source", "ordinals", 0, 1, 0), 2, 2),
-        (("source", "sequence"), "table_oid", 999),
         (("source", "sequence"), "default_expression", "nextval('foreign_sequence'::regclass)"),
         (("clone", "sequence", "settings"), "seqincrement", 2),
         (("source", "receipt", "tables", 0), "row_count", 1),
@@ -141,4 +138,75 @@ def test_decoder_rejects_integer_hash_even_with_consistent_legacy_digest():
         tables = tuple(equivalence.receipt.EntityAddressArchiveTableReceipt(**table) for table in raw["tables"])
         raw["content_sha256"] = equivalence.receipt._content_identity(tables, raw["main_input_sha256"])
     with pytest.raises(ValueError, match="scalar type"):
+        equivalence.decode_registry_cms_address_copy_witness(document)
+
+
+@pytest.mark.parametrize(
+    "target,key",
+    [
+        ("source", "schema_oid"),
+        ("relation", "token"),
+        ("sequence", "table_oid"),
+        ("sequence", "sequence_oid"),
+        ("settings", "type_oid"),
+    ],
+)
+def test_old_physical_tokens_are_opaque_and_raw_bytes_stable(target, key):
+    document = _witness()
+    if target == "relation":
+        document["source"]["relation_oids"][0][1] = {"copied": "opaque"}
+    else:
+        destination = document["source"]
+        if target == "sequence":
+            destination = destination["sequence"]
+        elif target == "settings":
+            destination = destination["sequence"]["settings"]
+        destination[key] = {"copied": "opaque"}
+    wire = equivalence.decode_registry_cms_address_copy_witness(document)
+    assert json.loads(wire) == document
+    assert equivalence.decode_registry_cms_address_copy_witness(json.loads(wire)) == wire
+
+
+def _named_witness():
+    document = _witness()
+    document["version"] = "registry_cms_address_copy.v2"
+    for side in (document["source"], document["clone"]):
+        side.pop("schema_oid")
+        side["relations"] = [
+            {"logical_name": name, "schema_name": side["schema_name"], "relation_name": name}
+            for name, _opaque in side.pop("relation_oids")
+        ]
+        side["sequence"].pop("sequence_oid")
+        side["sequence"].pop("table_oid")
+        side["sequence"]["table_name"] = "entity_address_evidence"
+        side["sequence"]["settings"].pop("type_oid")
+        side["sequence"]["settings"]["type"] = "bigint"
+    return document
+
+
+def test_named_witness_is_portable_and_contains_no_physical_fields():
+    document = _named_witness()
+    wire = equivalence.decode_registry_cms_address_copy_witness(document)
+    assert json.loads(wire) == document
+    assert all(
+        token not in wire
+        for token in ('"schema_oid"', '"relation_oids"', '"sequence_oid"', '"table_oid"', '"type_oid"')
+    )
+
+
+@pytest.mark.parametrize("damage", ["duplicate", "crossed_schema", "unsafe_name", "missing", "extra"])
+def test_named_witness_refuses_incomplete_or_crossed_coordinates(damage):
+    document = _named_witness()
+    relations = document["clone"]["relations"]
+    if damage == "duplicate":
+        relations[0]["relation_name"] = relations[1]["relation_name"]
+    elif damage == "crossed_schema":
+        relations[0]["schema_name"] = "unselected_schema"
+    elif damage == "unsafe_name":
+        relations[0]["relation_name"] = "unsafe.name"
+    elif damage == "missing":
+        relations.pop()
+    else:
+        relations[0]["catalog_token"] = "ignored-by-mistake"
+    with pytest.raises(ValueError):
         equivalence.decode_registry_cms_address_copy_witness(document)

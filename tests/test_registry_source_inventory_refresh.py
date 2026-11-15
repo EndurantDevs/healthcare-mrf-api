@@ -23,11 +23,10 @@ from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_candidate_composition import RegistryCompositionAddressSources
 from process.registry_refresh_anchor_contract import RegistryRefreshAnchorUnavailable
 from process.registry_source_inventory_preparation import SourceInventoryPreparation
-from process.registry_source_inventory_reference import SourceInventoryReference
 from tests.registry_membership_refresh_runtime_support import ObservationCase
+from tests.registry_source_recipe_support import _derivation
 from tests.test_registry_membership_refresh_runtime import scope as enrolled_scope
 from tests.test_registry_ptg_office_membership_recipe import _recipe as _ptg_recipe
-from tests.test_registry_source_inventory_preparation import _derivation
 
 _ADDRESS = PinnedAddressSource("synthetic_addresses", "entity_address_unified", "a" * 64)
 
@@ -109,7 +108,7 @@ def test_final_complete_equality_never_hydrates(monkeypatch, count):
     def forbidden(*_arguments, **_options):
         pytest.fail("Complete commitment equality must not hydrate registered inventory or decode legacy arrays")
 
-    for name in ("read_source_inventory_page", "verify_source_inventory", "_load_locked_source_inventory"):
+    for name in ("read_source_inventory_page", "verify_source_inventory", "load_source_inventory"):
         monkeypatch.setattr(inventory_store, name, forbidden)
     monkeypatch.setattr(recipe_store, "verify_registry_source_recipes", forbidden)
     execution._require_prepared_recipes(candidate_by_field, original, final)

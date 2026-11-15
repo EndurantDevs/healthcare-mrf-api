@@ -35,7 +35,10 @@ async def places_database():
         async with engine.begin() as connection:
             await connection.run_sync(ImportRun.__table__.create)
         await database.status(f'CREATE TABLE "{schema}".pricing_places_zcta (zcta text PRIMARY KEY)')
-        await database.status(f'CREATE TABLE "{schema}".reference_family_result_generation (relation_oids bigint[])')
+        await database.status(
+            f'CREATE TABLE "{schema}".reference_family_result_generation '
+            "(serving_schema varchar(63), serving_relation_names text[])"
+        )
         await database.status(f"INSERT INTO \"{schema}\".pricing_places_zcta VALUES ('00001')")
         yield database, schema
     finally:
@@ -222,9 +225,11 @@ async def test_cleanup_removes_only_original_unpublished_stage(places_database, 
     elif stage_state == "marked":
         await database.status(f'COMMENT ON TABLE "{schema}"."{table}" IS \'publication pending\'')
     elif stage_state == "current_bound":
+        # A generation that names the stage as served keeps it, whatever its catalog identity.
         await database.status(
-            f'INSERT INTO "{schema}".reference_family_result_generation VALUES (ARRAY[:stage_oid]::bigint[])',
-            stage_oid=ctx["context"]["_places_stage_oid"],
+            f'INSERT INTO "{schema}".reference_family_result_generation VALUES (:schema, ARRAY[:table]::text[])',
+            schema=schema,
+            table=table,
         )
     has_cleaned = await handoff.cleanup_places_attempt(database, ctx)
     assert has_cleaned is (stage_state == "unpublished")

@@ -15,7 +15,12 @@ from process.network_address_projection import project_network_address_arrays
 from process.network_membership_candidate_indexes import prepare_network_candidate_indexes
 from process.network_membership_candidate_lifecycle import _create_raw_membership
 from process.network_membership_publication import NetworkPublicationError, publish_network_candidate
-from process.network_membership_serving_indexes import _build_serving_indexes, _index_digest, _serving_plan
+from process.network_membership_serving_indexes import (
+    _build_serving_indexes,
+    _index_digest,
+    _serving_plan,
+    _source_semantics,
+)
 from process.network_membership_validation import validate_network_membership_candidate
 from process.network_membership_writer_closure import freeze_network_candidate_writers
 from process.network_serving_reactivation import (
@@ -24,6 +29,8 @@ from process.network_serving_reactivation import (
     reactivate_network_serving_generation,
 )
 from process.network_serving_read import resolve_network_serving_manifest
+from process.registry_fhir_catalog_permissions import _grant_named_preparation_control
+from tests.registry_named_preparation_postgres_support import network_publication_lifecycle
 from tests.test_network_address_projection_postgres import projection_db
 from tests.test_network_membership_candidate_indexes_postgres import indexed_db
 from tests.test_network_membership_serving_indexes_postgres import _full_source, _more_source_rows
@@ -60,6 +67,13 @@ async def _synthetic_serving_receipt(fixture):
         f'UPDATE "{fixture.copy_target.schema_name}".entity_address_unified projected '
         f"SET address_key=source.address_key,premise_key=source.premise_key "
         f'FROM "{fixture.control_schema}".retained_addresses source WHERE source.location_key=projected.location_key'
+    )
+    # Align projected column semantics with the pinned source, as serving preparation does.
+    await _source_semantics(
+        fixture.connection,
+        f'"{fixture.address_source.schema_name}"."{fixture.address_source.table_name}"',
+        f'"{fixture.copy_target.schema_name}".entity_address_unified',
+        replay=False,
     )
     plan = _serving_plan(fixture.copy_target.schema_name)
     await _build_serving_indexes(fixture.connection, fixture.copy_target.schema_name, plan)
@@ -112,7 +126,7 @@ async def _candidate_writer_roles(fixture, *, freeze=True):
         yield fixture
         return
     suffix = uuid4().hex
-    role_by_kind = {kind: "nw_" + kind + "_" + suffix for kind in ("owner", "loader", "reader", "publisher")}
+    role_by_kind = {kind: "nw_" + kind + "_" + suffix for kind in ("owner", "loader", "reader", "publisher", "frozen")}
     created_roles = []
     original_owner = await fixture.connection.fetchval("SELECT quote_ident(current_user)")
     fixture.additional_schemas = getattr(fixture, "additional_schemas", [])
@@ -127,7 +141,12 @@ async def _candidate_writer_roles(fixture, *, freeze=True):
             await _freeze_fixture(fixture)
         else:
             await _loader_owned_candidate(fixture)
-        yield fixture
+        async with network_publication_lifecycle(fixture, _preparation_roles(fixture)) as lifecycle:
+            await _grant_named_preparation_control(fixture.connection, role_by_kind["publisher"])
+            fixture.seal_candidate, fixture.preparation_roles = lifecycle.seal_candidate, lifecycle.preparation_roles
+            if freeze:
+                await fixture.seal_candidate(fixture.copy_target)
+            yield fixture
     finally:
         await fixture.connection.execute("RESET ROLE")
         await fixture.observer.execute("RESET ROLE")
@@ -139,6 +158,17 @@ async def _candidate_writer_roles(fixture, *, freeze=True):
         assert not await fixture.connection.fetchval(
             "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=ANY($1::text[]))", created_roles
         )
+
+
+def _preparation_roles(fixture):
+    """Name the frozen owner and the application roles the administrator step grants."""
+    roles = fixture.writer_roles
+    # The freeze revokes the frozen owner from application roles, so it is not the writer owner.
+    return {
+        "namespace_owner_role": roles["frozen"],
+        "publisher_role": roles["publisher"],
+        "application_roles": sorted({roles["publisher"], roles["loader"], roles["reader"]}),
+    }
 
 
 async def _drop_writer_role(connection, role_name):
@@ -278,6 +308,7 @@ async def _second_candidate(fixture, *, expected_head=0, approved_revision=0):
         )
         await _synthetic_serving_receipt(second_fixture)
     await _freeze_fixture(second_fixture)
+    await fixture.seal_candidate(copy_target)
     return second_fixture
 
 
@@ -588,13 +619,8 @@ async def test_projection_row_count_does_not_add_publication_queries(publication
         await _publish(successor)
         await asyncio.sleep(0)
         publication_queries = [entry.query for entry in logged_queries]
-        # Successors authenticate their predecessor with one manifest and two optional custody queries.
-        predecessor_queries = (
-            "SELECT to_jsonb(candidate)::text AS candidate_json,to_jsonb(manifest)::text AS manifest_json,",
-            "SELECT to_regclass($1)::oid",
-            f'SELECT seal_sha256,receipt_json::text AS receipt_json FROM "{fixture.control_schema}".'
-            "network_candidate_custody WHERE candidate_id=$1",
-        )
+        # Successors read their named predecessor with one manifest query.
+        predecessor_queries = ("SELECT jsonb_build_object(\n 'candidate_id',candidate.candidate_id,",)
         for prefix in predecessor_queries:
             assert sum(query.startswith(prefix) for query in publication_queries) == (
                 sum(query.startswith(prefix) for query in baseline_queries) + 1
@@ -604,73 +630,18 @@ async def test_projection_row_count_does_not_add_publication_queries(publication
     assert report["candidate_readiness"]["address_rows"] == 20004
 
 
-@pytest.mark.parametrize("replayed", [False, True])
-@pytest.mark.parametrize(
-    "damage", ["missing", "raw_only", "table_acl", "column_acl", "owner_member", "owner_login", "heap_oid"]
-)
-async def test_publication_verifies_native_final_closure(publication_db, replayed, damage):
+@pytest.mark.parametrize("change", ["ENABLE", "FORCE"])
+async def test_publication_refuses_row_filtered_address_heap(publication_db, change):
+    """Served heaps are frozen once published, so publication itself refuses row filtering."""
     fixture = publication_db
-    if replayed:
-        async with fixture.connection.transaction():
-            await _publish(fixture)
-    report = json.loads((await _snapshot(fixture))["validation_json"])
-    await _damage_writer_closure(fixture, report, damage)
-    await _write_report(fixture, report)
+    table = f'"{fixture.copy_target.schema_name}".entity_address_unified'
+    await fixture.connection.execute(f"ALTER TABLE {table} {change} ROW LEVEL SECURITY")
     before, sequence_before = await _snapshot(fixture), await _sequence_state(fixture)
     async with fixture.connection.transaction():
-        with pytest.raises(NetworkPublicationError):
+        with pytest.raises(NetworkPublicationError, match="row filtered"):
             await _publish(fixture)
     assert await _snapshot(fixture) == before
     assert await _sequence_state(fixture) == sequence_before
-
-
-async def _damage_writer_closure(fixture, report, damage):
-    namespace = f'"{fixture.copy_target.schema_name}"'
-    if damage == "missing":
-        report.pop("writer_closure")
-        return
-    if damage == "raw_only":
-        report["writer_closure"]["relation_oids"].pop("entity_address_unified")
-        return
-    if damage == "table_acl":
-        await fixture.connection.execute(
-            f'GRANT UPDATE ON {namespace}.network_membership TO "{fixture.writer_roles["loader"]}"'
-        )
-        return
-    if damage == "column_acl":
-        await fixture.connection.execute(f"GRANT UPDATE(network_id) ON {namespace}.network_membership TO PUBLIC")
-        return
-    if damage == "owner_member":
-        await fixture.connection.execute(
-            f'GRANT "{fixture.writer_roles["owner"]}" TO "{fixture.writer_roles["reader"]}"'
-        )
-        return
-    if damage == "owner_login":
-        await fixture.connection.execute(f'ALTER ROLE "{fixture.writer_roles["owner"]}" LOGIN')
-        return
-    if damage == "heap_oid":
-        await fixture.connection.execute(f"ALTER TABLE {namespace}.entity_address_unified RENAME TO replaced_addresses")
-        await fixture.connection.execute(
-            f"CREATE TABLE {namespace}.entity_address_unified AS SELECT * FROM {namespace}.replaced_addresses"
-        )
-
-
-async def test_manifest_digest_binds_closure_role_identity(publication_db):
-    fixture = publication_db
-    async with fixture.connection.transaction():
-        manifest = await _publish(fixture)
-    report = json.loads((await _snapshot(fixture))["validation_json"])
-    report["writer_closure"]["loader_roles"], report["writer_closure"]["reader_roles"] = (
-        report["writer_closure"]["reader_roles"],
-        report["writer_closure"]["loader_roles"],
-    )
-    await _write_report(fixture, report)
-    before = await _snapshot(fixture)
-    async with fixture.connection.transaction():
-        with pytest.raises(NetworkPublicationError, match="immutable candidate"):
-            await _publish(fixture)
-    assert await _snapshot(fixture) == before
-    assert before["generation_id"] == manifest["generation_id"]
 
 
 @pytest.mark.asyncio
@@ -742,8 +713,10 @@ async def test_published_replay_requires_immutable_manifest(publication_db, dama
     elif damage == "retained_sources":
         await fixture.connection.execute(f"UPDATE {namespace}.network_serving_manifest SET source_generations='{{}}'")
     else:
+        # A consistent but different logical accounting is still a different published edition.
         report = json.loads((await _snapshot(fixture))["validation_json"])
-        report["serving_readiness"]["index_definition_sha256"] = "d" * 64
+        for scope in (report, report["candidate_readiness"]):
+            scope["projected_locations"] -= 1
         await _write_report(fixture, report)
     original_state = await _snapshot(fixture)
     async with fixture.connection.transaction():
@@ -860,12 +833,6 @@ async def test_reactivation_rejects_stale_controls_or_older_approval(publication
         "sources",
         "retired",
         "state",
-        "table_acl",
-        "column_acl",
-        "owner_member",
-        "owner_login",
-        "heap_oid",
-        "index_oid",
     ],
 )
 async def test_reactivation_verifies_retained_native_identity_and_closure(publication_db, damage):
@@ -897,20 +864,6 @@ async def _damage_reactivation_target(fixture, manifest, damage):
             f"UPDATE {namespace}.network_membership_candidate SET state='ready' WHERE candidate_id=$1",
             UUID(fixture.copy_target.candidate_id),
         )
-    elif damage == "index_oid":
-        index_definition = await fixture.connection.fetchval(
-            "SELECT indexdef FROM pg_indexes WHERE schemaname=$1 ORDER BY indexname LIMIT 1",
-            fixture.copy_target.schema_name,
-        )
-        index_name = await fixture.connection.fetchval(
-            "SELECT indexname FROM pg_indexes WHERE schemaname=$1 ORDER BY indexname LIMIT 1",
-            fixture.copy_target.schema_name,
-        )
-        await fixture.connection.execute(f'DROP INDEX "{fixture.copy_target.schema_name}"."{index_name}"')
-        await fixture.connection.execute(index_definition)
-    else:
-        report = json.loads((await _snapshot(fixture))["validation_json"])
-        await _damage_writer_closure(fixture, report, damage)
 
 
 class _FailAfterReactivation:
@@ -1115,40 +1068,3 @@ async def test_publication_preserves_queue_audit(publication_db):
                     )
         receipt = await _publish(fixture)
         assert receipt["generation_id"] > 0
-
-
-@pytest.fixture
-async def qualified_publication_db(indexed_db):
-    """Real publication guards with seeded qualification and the existing serving fixture."""
-    from tests.test_network_membership_writer_closure_postgres import _qualified_source_heap
-
-    fixture = indexed_db
-    fixture.additional_schemas = []
-    await _qualified_source_heap(fixture)
-    async with fixture.connection.transaction():
-        await prepare_network_candidate_indexes(
-            fixture.connection, fixture.copy_target, fixture.address_source, control_schema=fixture.control_schema
-        )
-        await _synthetic_serving_receipt(fixture)
-    async with _candidate_writer_roles(fixture):
-        yield fixture
-
-
-async def test_qualified_publication_requires_exact_four_heap_closure(qualified_publication_db):
-    fixture = qualified_publication_db
-    report = json.loads(
-        await fixture.connection.fetchval(
-            f'SELECT validation_json FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
-            fixture.copy_target.candidate_id,
-        )
-    )
-    assert set(report["writer_closure"]["relation_oids"]) == {
-        "network_membership",
-        "provider_location_binding",
-        "network_membership_source",
-        "entity_address_unified",
-    }
-    async with fixture.connection.transaction():
-        manifest = await _publish(fixture)
-    assert manifest["source_generations"]["registry_source_retention"]
-    assert (await _snapshot(fixture))["generation_id"] == manifest["generation_id"]

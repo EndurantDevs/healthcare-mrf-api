@@ -18,12 +18,7 @@ from process import provider_directory_output_snapshot_journal as journal
 from process import provider_directory_output_snapshot_stage as stages
 from process.ext import address_fast
 from process.provider_directory_dataset_rehydrate_pages import projected_pages
-from process.provider_directory_dataset_rehydrate_pin import (
-    _close_reader,
-    _require_reader,
-    _same_database,
-    _SourceReader,
-)
+from process.provider_directory_dataset_rehydrate_pin import _SourceReader
 from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
 from process.provider_directory_output_snapshot_catalog import output_models, require_output
 from process.uhc_flex_practitioner_async_safety import drain_operation
@@ -153,43 +148,34 @@ def _digest_rows(digest, rows):
 
 
 async def _geo_snapshot(session, schema):
-    """Require actual current origin, guarded revision and complete native lookup identity."""
+    """Fence the declared lookup's layout, full contents and logical generations."""
     from db.models import GeoZipLookup
     from process import reference_family_archive as archive
-    from process.mrf_address_publication import require_native_read_catalog
+    from process.entity_address_snapshot_receipt import _row_identity
     from process.reference_family_result_generation import (
         capture_reference_family_serving_generation,
         read_reference_family_result_generation_authority,
     )
 
     relation = storage_relation(schema, GEO)
-    oid = await session.scalar(text("SELECT to_regclass(:relation)::oid::bigint"), {"relation": relation})
-    require_output(type(oid) is int and oid > 0, "address_geo_snapshot_required")
+    exists = await session.scalar(text("SELECT to_regclass(:relation) IS NOT NULL"), {"relation": relation})
+    require_output(exists is True, "address_geo_snapshot_required")
     await session.execute(text(f"LOCK TABLE ONLY {relation} IN ACCESS SHARE MODE NOWAIT"))
-    await require_native_read_catalog(session, (oid,))
-    await _geo_model_shape(session, oid, GeoZipLookup)
+    await _geo_model_shape(session, relation, GeoZipLookup)
     await capture_reference_family_serving_generation(session, importer_id="geo", schema_name=schema)
     authority = await read_reference_family_result_generation_authority(session, importer_id="geo", schema_name=schema)
-    require_output(authority.relation_oids == (oid,), "address_geo_changed")
+    require_output(authority.relations == ((schema, GEO),), "address_geo_changed")
     shape = await archive._table_receipt(session, importer_id="geo", schema_name=schema, model_type=GeoZipLookup)
-    catalog = (
-        (
-            await session.execute(
-                text(
-                    "SELECT c.relowner::bigint AS owner,c.relfilenode::bigint AS filenode,"
-                    "c.relacl::text AS acl,n.oid::bigint AS schema_oid,n.nspowner::bigint AS schema_owner,n.nspacl::text AS schema_acl "
-                    "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=:oid"
-                ),
-                {"oid": oid},
-            )
-        )
-        .mappings()
-        .one()
-    )
-    return {"oid": oid, "catalog": dict(catalog), "shape": shape.as_dict(), "authority": authority.as_dict()}
+    row_count, content_sha256 = await _row_identity(session, schema, GEO)
+    require_output(row_count == shape.row_count, "address_geo_changed")
+    return {
+        "relation": {"schema_name": schema, "relation_name": GEO},
+        "shape": {**shape.as_dict(), "content_sha256": content_sha256},
+        "authority": authority.as_dict(),
+    }
 
 
-async def _geo_model_shape(session, oid, model):
+async def _geo_model_shape(session, relation, model):
     from sqlalchemy.dialects import postgresql
 
     expected_columns = [
@@ -200,9 +186,9 @@ async def _geo_model_shape(session, oid, model):
         await session.execute(
             text(
                 "SELECT attname,format_type(atttypid,atttypmod),attnotnull "
-                "FROM pg_attribute WHERE attrelid=:oid AND attnum>0 AND NOT attisdropped ORDER BY attnum"
+                "FROM pg_attribute WHERE attrelid=to_regclass(:relation) AND attnum>0 AND NOT attisdropped ORDER BY attnum"
             ),
-            {"oid": oid},
+            {"relation": relation},
         )
     ).all()
     normalize = lambda value: value.replace("character varying", "varchar").replace("float", "double precision")
@@ -217,9 +203,9 @@ async def _geo_model_shape(session, oid, model):
                 text(
                     "SELECT a.attname FROM pg_constraint c CROSS JOIN LATERAL "
                     "unnest(c.conkey) WITH ORDINALITY k(num,pos) JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=k.num "
-                    "WHERE c.conrelid=:oid AND c.contype='p' AND c.convalidated AND NOT c.condeferrable ORDER BY k.pos"
+                    "WHERE c.conrelid=to_regclass(:relation) AND c.contype='p' AND c.convalidated AND NOT c.condeferrable ORDER BY k.pos"
                 ),
-                {"oid": oid},
+                {"relation": relation},
             )
         )
         .scalars()
@@ -238,21 +224,14 @@ async def _require_geo_fence_rights(session, schema):
         ),
         "address_geo_snapshot_required",
     )
-    allowed = await session.scalar(
-        text(
-            "SELECT has_table_privilege(current_user,:geo,'MAINTAIN,UPDATE,DELETE,TRUNCATE') "
-            "AND has_table_privilege(current_user,:ledger,'SELECT') AND (has_table_privilege(current_user,:ledger,'UPDATE') "
-            "OR has_any_column_privilege(current_user,:ledger,'UPDATE'))"
-        ),
-        {"geo": relation, "ledger": ledger},
-    )
-    require_output(allowed is True, "address_geo_cut_fence_required")
+    await session.execute(text(f"LOCK TABLE ONLY {relation} IN ACCESS SHARE MODE NOWAIT"))
+    await session.execute(text(f"SELECT importer_id FROM {ledger} WHERE importer_id='geo' FOR SHARE NOWAIT"))
 
 
 async def _lock_geo_cut(capability, expected):
     """Keep mutation/DDL and one native revision row fenced through the original commit."""
     schema, session = capability.policy.schema, capability.session
-    await session.execute(text(f"LOCK TABLE ONLY {storage_relation(schema, GEO)} IN SHARE MODE NOWAIT"))
+    await session.execute(text(f"LOCK TABLE ONLY {storage_relation(schema, GEO)} IN ACCESS SHARE MODE NOWAIT"))
     await session.execute(
         text(f"SELECT importer_id FROM {storage_relation(schema, LEDGER)} WHERE importer_id='geo' FOR SHARE NOWAIT")
     )
@@ -269,7 +248,7 @@ def _address_backfill_operation(incumbent, geo, selector, digest, decision_at):
         resource_types=["Location"],
         source_fence_digest=custody._digest(
             {
-                "incumbent": incumbent.to_payload(),
+                "incumbent": incumbent.named_payload(),
                 "geo": geo,
                 "selector": selector,
                 "input_digest": digest.hexdigest(),
@@ -298,14 +277,13 @@ async def _pinned_inputs(directory, selector, native, batch_size):
             catalog_by_target = await _capture(owner_session, policy)
             incumbent = custody._native_receipt(policy, catalog_by_target[TARGET], TARGET)
             await _require_geo_fence_rights(owner_session, policy.schema)
-            driver = await _require_reader(session, database, policy)
-            await _same_database(publisher.connection, driver)
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            driver = (await (await session.connection()).get_raw_connection()).driver_connection
             await driver.execute(
                 f"LOCK TABLE ONLY {storage_relation(policy.schema, TARGET)} IN ACCESS SHARE MODE NOWAIT"
             )
             require_output(
-                await driver.fetchval("SELECT to_regclass($1)::oid::bigint", storage_relation(policy.schema, TARGET))
-                == incumbent.oid,
+                (await custody.read_output_relations(driver, policy, {TARGET: TARGET}))[TARGET] == incumbent,
                 "address_incumbent_changed",
             )
             geo = await _geo_snapshot(session, policy.schema)
@@ -334,7 +312,7 @@ async def _pinned_inputs(directory, selector, native, batch_size):
     finally:
         if reader is not None:
             reader.deactivate()
-        await _close_reader(session)
+        await session.close()
 
 
 async def _verify_candidate(directory, capability, stage, expected_digest, copied, changed):
@@ -393,11 +371,8 @@ async def _fill(directory, inputs, stage, selector):
 async def _discard(directory, operation, prepared_stages):
     async with custody.output_snapshot_transaction(directory, operation=operation, targets=(TARGET,)) as capability:
         for stage in reversed(prepared_stages):
-            if (
-                await capability.connection.fetchval(
-                    "SELECT to_regclass($1)::oid", storage_relation(stage.schema, stage.relation)
-                )
-                is not None
+            if await capability.connection.fetchval(
+                "SELECT to_regclass($1) IS NOT NULL", storage_relation(stage.schema, stage.relation)
             ):
                 await stages.discard_output_stage(capability, stage)
 

@@ -16,12 +16,15 @@ from sqlalchemy import column, select, table
 from api import provider_list_sql
 from api.endpoint import npi as npi_module
 from api.network_address_scope import network_address_read_scope
+from process.network_compact_layout import CompactAddressRelation
+from process.network_published_api_pin import _decode_published_pin
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests.npi_location_hydration_support import unified_location_mapping
 from tests.provider_profile_snapshot_test_support import (
     stub_provider_profile_snapshot as stub_provider_profile_snapshot,
 )
 from tests.test_custom_import_provider_geo_sql import _context as imported_geo_context
+from tests.test_network_published_api_pin import published_entry as published_entry
 from tests.test_npi_api_extended import FakeAcquire
 from tests.test_npi_batch import _ResultRows
 from tests.test_npi_canonical_publication_api_cache import _ScalarResult
@@ -899,7 +902,7 @@ async def test_ordinary_list_serializes_reads_on_a_request_session(monkeypatch, 
 
     connection = SimpleNamespace(all=query)
     proxy = Mock(return_value=connection)
-    monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", proxy)
+    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", proxy)
     monkeypatch.setattr(npi_module, "db", SimpleNamespace(acquire=lambda: FakeAcquire(connection)))
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.npi_address"))
     monkeypatch.setattr(npi_module, "_plan_release_npi_scope", AsyncMock(return_value=(None, {})))
@@ -922,9 +925,9 @@ async def test_ordinary_list_serializes_reads_on_a_request_session(monkeypatch, 
 async def test_canonical_all_binds_count_and_late_hydration_on_pinned_session(monkeypatch, count_only):
     """Raw list branches keep the selector, office contacts and pinned transaction."""
     candidate_id = uuid4()
-    manifest = PinnedNetworkServingManifest(
-        1, str(candidate_id), "network_candidate_" + candidate_id.hex, 1, {}, 0, "c" * 64, 1
-    )
+    schema_name = "network_candidate_" + candidate_id.hex
+    address_relation = CompactAddressRelation(schema_name, "entity_address_unified")
+    manifest = PinnedNetworkServingManifest(1, str(candidate_id), schema_name, 1, {}, 0, "c" * 64, address_relation)
     session = object()
     location_by_field = {**unified_location_mapping(), "npi": 1234567890, "inferred_npi": None}
     location_by_field["location_key"] = "a" * 64
@@ -954,7 +957,7 @@ async def test_canonical_all_binds_count_and_late_hydration_on_pinned_session(mo
 
     connection = SimpleNamespace(all=query)
     proxy = Mock(return_value=connection)
-    monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", proxy)
+    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", proxy)
     monkeypatch.setattr(npi_module, "db", SimpleNamespace(acquire=Mock(side_effect=AssertionError("unpinned query"))))
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
     monkeypatch.setattr(npi_module, "_plan_release_npi_scope", AsyncMock(return_value=(None, {})))
@@ -1125,53 +1128,50 @@ async def test_classification_counts_keep_optional_predicates(monkeypatch, uses_
 
 
 @pytest.mark.parametrize("has_session", [False, True])
-async def test_canonical_statement_requires_the_original_request_reader(monkeypatch, has_session):
-    from api import network_read_execution
+async def test_canonical_statement_requires_the_original_request_reader(monkeypatch, published_entry, has_session):
     from db import connection
     from db.models import EntityAddressUnified
-    from tests.test_network_optional_sql_recovery import _Session
-    from tests.test_network_read_execution import _manifest
 
-    session = _Session()
+    query_result = object()
+    session = SimpleNamespace(execute=AsyncMock(return_value=query_result))
     selected = Mock(return_value=session) if has_session else Mock(side_effect=RuntimeError("no reader bound"))
     monkeypatch.setattr(connection, "current_session", selected)
-    verify = AsyncMock()
-    monkeypatch.setattr(network_read_execution, "verify_consumed_network_relations", verify)
     unpinned = AsyncMock(side_effect=AssertionError("canonical query escaped its request reader"))
     monkeypatch.setattr(npi_module, "db", SimpleNamespace(execute=unpinned))
     statement = select(EntityAddressUnified.__table__.c.npi)
-    with network_address_read_scope(_manifest(), (42,)):
+    manifest, _approved, _relation = _decode_published_pin(published_entry, "registry_control")
+    with network_address_read_scope(manifest, (42,)):
         if has_session:
-            assert await npi_module._execute_stmt(statement) is session.result
+            assert await npi_module._execute_stmt(statement) is query_result
         else:
             with pytest.raises(ServiceUnavailable, match="Reader is unavailable") as caught:
                 await npi_module._execute_stmt(statement)
             assert isinstance(caught.value.__cause__, RuntimeError)
     selected.assert_called_once_with()
     unpinned.assert_not_awaited()
-    assert verify.await_count == int(has_session)
+    assert session.execute.await_count == int(has_session)
+    if has_session:
+        assert session.execute.await_args.args[1]["_canonical_network_ids"] == [42]
 
 
 @pytest.mark.parametrize("write_option", ["force_address_update", "sync_geocode"])
-async def test_canonical_detail_cannot_mutate_geocode_even_with_debug(monkeypatch, write_option):
-    from tests.test_network_read_execution import _manifest
-
+async def test_canonical_detail_cannot_mutate_geocode_even_with_debug(monkeypatch, published_entry, write_option):
     lookup = AsyncMock(side_effect=AssertionError("write request reached storage"))
     monkeypatch.setattr(npi_module, "_execute_stmt", lookup)
     request = SimpleNamespace(args={write_option: "1", "debug": "1"}, app=SimpleNamespace())
-    with network_address_read_scope(_manifest(), (42,)), pytest.raises(InvalidUsage, match="cannot update"):
+    manifest, _approved, _relation = _decode_published_pin(published_entry, "registry_control")
+    with network_address_read_scope(manifest, (42,)), pytest.raises(InvalidUsage, match="cannot update"):
         await npi_module.read_npi_detail(request, "1000000004")
     lookup.assert_not_awaited()
 
 
 @pytest.mark.parametrize("limit", ["invalid", "1.5", "all", "0", "-1", "6"])
-async def test_network_detail_premise_paging_rejects_unbounded_or_invalid_limits(monkeypatch, limit):
-    from tests.test_network_read_execution import _manifest
-
+async def test_network_detail_premise_paging_rejects_unbounded_or_invalid_limits(monkeypatch, published_entry, limit):
     lookup = AsyncMock(side_effect=AssertionError("invalid page reached storage"))
     monkeypatch.setattr(npi_module, "_execute_stmt", lookup)
     request = SimpleNamespace(args={"address_grouping": "premise", "address_limit": limit}, app=SimpleNamespace())
-    with network_address_read_scope(_manifest(), (42,)), pytest.raises(InvalidUsage, match="between 1 and 5"):
+    manifest, _approved, _relation = _decode_published_pin(published_entry, "registry_control")
+    with network_address_read_scope(manifest, (42,)), pytest.raises(InvalidUsage, match="between 1 and 5"):
         await npi_module.read_npi_detail(request, "1000000004")
     lookup.assert_not_awaited()
 
@@ -1196,8 +1196,7 @@ async def test_count_cache_has_no_identity_for_non_address_models(monkeypatch):
 
 
 @pytest.mark.parametrize("failure", [asyncio.TimeoutError, ServiceUnavailable])
-async def test_canonical_provider_count_timeout_differs_from_identity_refusal(monkeypatch, failure):
-    from tests.test_network_read_execution import _manifest
+async def test_canonical_provider_count_timeout_differs_from_identity_refusal(monkeypatch, published_entry, failure):
     from tests.test_npi_network_geo_query_contract import _guarded_query_session
 
     statements = []
@@ -1226,7 +1225,8 @@ async def test_canonical_provider_count_timeout_differs_from_identity_refusal(mo
         app=SimpleNamespace(),
         ctx=SimpleNamespace(sa_session=session),
     )
-    with network_address_read_scope(_manifest(), (42,)):
+    manifest, _approved, _relation = _decode_published_pin(published_entry, "registry_control")
+    with network_address_read_scope(manifest, (42,)):
         if failure is ServiceUnavailable:
             with pytest.raises(ServiceUnavailable) as caught:
                 await npi_module.list_providers(request)

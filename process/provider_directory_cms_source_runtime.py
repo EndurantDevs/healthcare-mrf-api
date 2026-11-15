@@ -251,54 +251,31 @@ def _assert_selected_source(execution, request, policy, expected_profile_as_of):
             raise ValueError("cms_registry_source_selection_changed")
 
 
-_PUBLICATION_BRAND = object()
 _REGISTRY_PUBLICATION = contextvars.ContextVar("cms_registry_source_publication", default=None)
-_CAPTURE_LOCK_SQL = """SELECT EXISTS(SELECT FROM pg_locks WHERE locktype='advisory'
- AND pid=pg_backend_pid() AND mode='ExclusiveLock' AND granted AND objsubid=1
- AND classid=$1::oid AND objid=$2::oid)"""
-_PUBLICATION_IDENTITY_SQL = """SELECT pg_backend_pid() AS pid,pg_current_xact_id()::text AS xid,
- session_user::text AS session,current_user::text AS current,
- current_setting('transaction_isolation') AS isolation,
+_CAPTURE_LOCK_SQL = "SELECT pg_try_advisory_xact_lock($1::bigint)"
+_PUBLICATION_IDENTITY_SQL = """SELECT current_setting('transaction_isolation') AS isolation,
  current_setting('transaction_read_only') AS readonly"""
 
 
 @dataclass(frozen=True)
 class _RegistryPublication:
-    task: object
     prepared: object
     job: BoundCMSRegistrySourceJob
     prepared_pair: object
-    publisher: object
-    outcome: object
-    group: object
-    session: object
-    driver: object
-    origin: tuple
     receipt_id: str
     receipt_payload: object
     expected_pair: object
-    brand: object = field(repr=False, compare=False)
 
 
 def _publication_invalid():
     raise ValueError("cms_registry_source_publication_invalid")
 
 
-def _publication_group(prepared, session, job):
-    from process.provider_directory_owned_wal_transaction import (
-        current_owned_wal_transaction,
-    )
-
+def _publication_group(prepared, job):
+    """Keep the logical capture and its pending accounting state together."""
     fhir = prepared.fhir
     admission = fhir._provider_directory_profile_capacity_admission()
-    outcome = current_owned_wal_transaction(fhir.db)
-    if (
-        outcome is None
-        or admission is None
-        or outcome.session is not session
-        or outcome.commit_state != "not_attempted"
-        or outcome.cleanup_complete is not False
-    ):
+    if admission is None or prepared.nonprofile_admission.registry_source_job != job:
         _publication_invalid()
     groups = [
         group
@@ -306,34 +283,42 @@ def _publication_group(prepared, session, job):
         if type(group.get("identity")) is tuple
         and len(group["identity"]) == 5
         and group["identity"][0] == "cms_publication_source"
-        and group["original_outcome"] is outcome
+        and group["identity"][2] == job.capture_id
     ]
     if len(groups) != 1:
         _publication_invalid()
     group = groups[0]
-    identity = group["identity"]
+    group_admission = group["admission"]
+    identity, original = group["identity"], group["original_identity"]
+    outcome = group["outcome"]
     if not (
-        group["task"] is asyncio.current_task()
-        and group["admission"] is admission
-        and group["window"] is fhir._PROFILE_CAPACITY_MUTATION_WINDOW.get()
-        and identity is group["original_identity"]
-        and identity[1] is job.source_session_factory
-        and identity[2] == job.capture_id
-        and identity[3] is session
-        and identity[4] is prepared.fence is fhir._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
-        and group["outcome"] is outcome
-        and group["session"] is session
-        and group["connection"] is outcome.connection
-        and group["driver"] is outcome.retained_driver
-        and group["pid"] == outcome.retained_pid
-        and type(group["pid"]) is int
+        outcome is not None
+        and outcome.commit_state == "not_attempted"
+        and outcome.cleanup_complete is False
+        and type(original) is tuple
+        and len(original) == 5
+        and (identity[0], identity[2], identity[4]) == (original[0], original[2], original[4])
+        and identity[4] == prepared.fence == fhir._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get()
+        and (
+            group_admission.geometry,
+            group_admission.control_wal_projection,
+            group_admission.lease.lease_digest,
+            group_admission.build_id,
+            group_admission.run_id,
+        )
+        == (
+            admission.geometry,
+            admission.control_wal_projection,
+            admission.lease.lease_digest,
+            admission.build_id,
+            admission.run_id,
+        )
         and group["body_complete"] is False
         and group["consumed"] is False
         and group["failure"] is None
         and group["status"] == "incomplete"
         and group["accounting_authority"] is False
         and group["reservation_refund"] is False
-        and group.get("statement_custody") is group.get("original_statement_custody") is None
     ):
         _publication_invalid()
     return outcome, group
@@ -363,45 +348,27 @@ async def _own_registry_pair(session, prepared_pair, receipt_id, receipt_payload
 
 async def _require_registry_publication(scope, connection):
     from process import provider_directory_generic_source_policy as policy
+    from process.network_cms_registry_address_capture import NativeReceiptSession
 
+    if type(scope) is not _RegistryPublication or not connection.is_in_transaction():
+        _publication_invalid()
+    _publication_group(scope.prepared, scope.job)
+    publisher = policy.bound_publisher()
     if (
-        type(scope) is not _RegistryPublication
-        or scope.brand is not _PUBLICATION_BRAND
-        or scope.task is not asyncio.current_task()
-        or connection is not scope.driver
-        or not connection.is_in_transaction()
-        or scope.session.in_nested_transaction()
-        or policy.bound_publisher() is not scope.publisher
-        or scope.publisher.connection is not connection
+        publisher.policy.schema != scope.prepared_pair.request.source_pin.schema_name
+        or scope.prepared.nonprofile_admission.registry_source_job != scope.job
     ):
         _publication_invalid()
-    outcome, group = _publication_group(scope.prepared, scope.session, scope.job)
-    if outcome is not scope.outcome or group is not scope.group:
+    settings = await connection.fetchrow(_PUBLICATION_IDENTITY_SQL)
+    if settings["isolation"] != "read committed" or settings["readonly"] != "off":
         _publication_invalid()
-    if (await scope.session.connection()) is not outcome.connection:
-        _publication_invalid()
-    identity = await connection.fetchrow(_PUBLICATION_IDENTITY_SQL)
-    roles = scope.publisher.policy
-    if (
-        (identity["pid"], identity["xid"]) != scope.origin
-        or identity["pid"] != outcome.retained_pid
-        or outcome.retained_driver is not connection
-        or identity["session"] != roles.publisher_role
-        or identity["current"] not in (roles.owner_role, roles.publisher_role)
-        or identity["isolation"] != "read committed"
-        or identity["readonly"] != "off"
-    ):
-        _publication_invalid()
-    if identity["current"] == roles.owner_role:
-        if await policy.require_source_publication_transaction(scope.prepared.fhir.db) is not scope.publisher:
-            _publication_invalid()
-    elif policy._OWNER.get() is not None:
-        _publication_invalid()
-    key = int.from_bytes(scope.job.capture_id.bytes[:8], "big")
-    if await connection.fetchval(_CAPTURE_LOCK_SQL, key >> 32, key & (2**32 - 1)) is not True:
+    key = int.from_bytes(scope.job.capture_id.bytes[:8], "big", signed=True)
+    if await connection.fetchval(_CAPTURE_LOCK_SQL, key) is not True:
         _publication_invalid()
     if (
-        await _own_registry_pair(scope.session, scope.prepared_pair, scope.receipt_id, scope.receipt_payload)
+        await _own_registry_pair(
+            NativeReceiptSession(connection), scope.prepared_pair, scope.receipt_id, scope.receipt_payload
+        )
         != scope.expected_pair
     ):
         _publication_invalid()
@@ -409,7 +376,7 @@ async def _require_registry_publication(scope, connection):
 
 @asynccontextmanager
 async def registry_source_publication(session, prepared, receipt_id, receipt_payload):
-    """Bind retained verification to this genuine original SOURCE publication only."""
+    """Carry one validated logical publication through native transaction checks."""
     from process import provider_directory_generic_source_policy as policy
     from process.network_cms_registry_address_capture import native_driver
     from process.provider_directory_cms_publication import _registry_preparation
@@ -424,35 +391,17 @@ async def registry_source_publication(session, prepared, receipt_id, receipt_pay
         or not callable(job.read_receipt)
     ):
         _publication_invalid()
-    publisher = await policy.require_source_publication_transaction(prepared.fhir.db)
+    publisher = policy.bound_publisher()
     if publisher.policy.schema != prepared_pair.request.source_pin.schema_name:
         _publication_invalid()
     connection = await native_driver(session)
-    outcome, group = _publication_group(prepared, session, job)
-    identity = await connection.fetchrow(_PUBLICATION_IDENTITY_SQL)
+    _publication_group(prepared, job)
     expected_pair = await _own_registry_pair(session, prepared_pair, receipt_id, receipt_payload)
-    scope = _RegistryPublication(
-        asyncio.current_task(),
-        prepared,
-        job,
-        prepared_pair,
-        publisher,
-        outcome,
-        group,
-        session,
-        connection,
-        (identity["pid"], identity["xid"]),
-        receipt_id,
-        deepcopy(receipt_payload),
-        expected_pair,
-        _PUBLICATION_BRAND,
-    )
+    scope = _RegistryPublication(prepared, job, prepared_pair, receipt_id, deepcopy(receipt_payload), expected_pair)
     await _require_registry_publication(scope, connection)
     token = _REGISTRY_PUBLICATION.set(scope)
     try:
         yield expected_pair
-        if await policy.require_source_publication_transaction(prepared.fhir.db) is not publisher:
-            _publication_invalid()
         await _require_registry_publication(scope, connection)
     finally:
         _REGISTRY_PUBLICATION.reset(token)
@@ -488,8 +437,6 @@ async def require_registry_notification_publication(session, source_attempt, pai
     ):
         _publication_invalid()
     await _require_registry_publication(scope, await native_driver(session))
-    if session is not scope.session:
-        _publication_invalid()
 
 
 async def _current_registry_prepared_pair(session, prepared_pair, pair, comment):
@@ -502,7 +449,6 @@ async def _current_registry_prepared_pair(session, prepared_pair, pair, comment)
         return None
     if (
         type(scope) is not _RegistryPublication
-        or session is not scope.session
         or prepared_pair != scope.prepared_pair
         or pair != scope.expected_pair
         or comment != _prepared_comment_prefix(scope.prepared_pair) + _json(scope.prepared_pair.as_dict())

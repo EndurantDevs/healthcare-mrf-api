@@ -176,8 +176,9 @@ async def test_membership_location_query_builds_bounded_context(monkeypatch, uni
     if unified:
         args_by_name.update(lat="41.9", long="-87.6")
 
+    session = SimpleNamespace(scalar=AsyncMock(return_value=False))
     query = await serving._membership_location_query(
-        object(),
+        session,
         strict_v3_tables(),
         args_by_name,
         candidate_npis=None,
@@ -191,6 +192,7 @@ async def test_membership_location_query_builds_bounded_context(monkeypatch, uni
     assert query.parameter_map["offset"] == 0
     assert query.parameter_map["shared_snapshot_key"] == 41
     assert "npi_scope.snapshot_key = :shared_snapshot_key" in query.filter_sql
+    assert session.scalar.await_count == (2 if unified else 0)
     if unified:
         assert query.knn_order_sql is not None
         assert "ST_DWithin" in query.filter_sql
@@ -223,7 +225,7 @@ async def test_membership_location_query_does_not_let_exact_zip_bypass_assurance
     )
 
     query = await serving._membership_location_query(
-        object(),
+        SimpleNamespace(scalar=AsyncMock(return_value=False)),
         strict_v3_tables(),
         {
             "zip5": "00000",
@@ -307,7 +309,7 @@ async def test_exact_npi_scope_skips_redundant_taxonomy_index_union(monkeypatch)
     )
 
     query = await serving._membership_location_query(
-        object(),
+        SimpleNamespace(scalar=AsyncMock(return_value=False)),
         strict_v3_tables(),
         {
             "classification": "Orthopaedic Surgery",

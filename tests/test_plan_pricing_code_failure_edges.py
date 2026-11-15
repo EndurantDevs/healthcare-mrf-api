@@ -115,22 +115,14 @@ async def test_missing_retention_pin_never_creates_one_during_read():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("attachment", [None, (7, 99, True, True), (7, 42, False, True), (7, 42, True, False)])
-async def test_attachment_custody_refuses_before_storage_access(monkeypatch, attachment):
-    monkeypatch.setattr(storage, "protected_owner", AsyncMock(return_value=42))
+async def test_absent_named_attachment_does_not_query_storage(monkeypatch):
     family = AsyncMock()
     monkeypatch.setattr(storage, "_storage", family)
-    session = SimpleNamespace(
-        execute=AsyncMock(return_value=SimpleNamespace(first=lambda: attachment)), commit=AsyncMock()
-    )
-    if attachment is None:
-        assert await storage.locate(session, _identity()) is None
-    else:
-        with pytest.raises(PTG2ManifestArtifactError, match="attachment custody"):
-            await storage.locate(session, _identity())
+    session = SimpleNamespace(scalar=AsyncMock(return_value=False), execute=AsyncMock(), commit=AsyncMock())
+    assert await storage.locate(session, _identity()) is None
     family.assert_not_awaited()
+    session.execute.assert_not_awaited()
     session.commit.assert_not_awaited()
-    assert session.execute.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -147,18 +139,12 @@ async def test_stale_storage_never_authorizes_ready_access(monkeypatch, drift):
         "content_digest": "invalid" if drift == "invalid_digest" else "d" * 64,
         "counts": {},
     }
-    monkeypatch.setattr(storage, "protected_owner", AsyncMock(return_value=42))
-    monkeypatch.setattr(storage, "_require_no_untrusted_mutation", AsyncMock())
     monkeypatch.setattr(storage, "_storage", AsyncMock(return_value=SimpleNamespace(schema_name="synthetic_archive")))
     pins = AsyncMock()
     monkeypatch.setattr(storage, "source_pins", pins)
     session = SimpleNamespace(
-        execute=AsyncMock(
-            side_effect=[
-                SimpleNamespace(first=lambda: (7, 42, True, True)),
-                SimpleNamespace(mappings=lambda: SimpleNamespace(one=lambda: header_map)),
-            ]
-        ),
+        scalar=AsyncMock(return_value=True),
+        execute=AsyncMock(return_value=SimpleNamespace(mappings=lambda: SimpleNamespace(one=lambda: header_map))),
         commit=AsyncMock(),
     )
     if drift == "provider":
@@ -177,12 +163,9 @@ async def test_stale_storage_never_authorizes_ready_access(monkeypatch, drift):
     "bad_ready", [{"identity": {"contract": "unknown"}}, {"identity": _identity(), "projection_id": "f" * 64}]
 )
 async def test_retirement_refuses_forged_identity_before_any_mutation(monkeypatch, bad_ready):
-    publisher = AsyncMock()
-    monkeypatch.setattr(storage.native, "protected_publisher_owner", publisher)
     session = SimpleNamespace(execute=AsyncMock(), commit=AsyncMock())
     with pytest.raises(PTG2ManifestArtifactError, match="retirement identity"):
         await storage.retire_unreferenced(session, bad_ready)
-    publisher.assert_not_awaited()
     session.execute.assert_not_awaited()
     session.commit.assert_not_awaited()
 
@@ -346,7 +329,7 @@ async def test_occurrence_overflow_refuses_before_provider_reads_or_writes(monke
     member = _source()["membership"] | {
         "projection_id": "a" * 64,
         "content_digest": "b" * 64,
-        "storage": {"schema_oid": 2},
+        "storage": _source()["membership"]["storage"],
         "code_coverage": [{"code_key": 1, "occurrence_count": count}],
     }
     monkeypatch.setattr(build, "membership_receipt", lambda _found: member)
@@ -361,12 +344,13 @@ async def test_occurrence_overflow_refuses_before_provider_reads_or_writes(monke
 
 
 @pytest.mark.asyncio
-async def test_missing_protected_owner_never_queries_attachment(monkeypatch):
-    monkeypatch.setattr(storage, "protected_owner", AsyncMock(return_value=None))
-    session = SimpleNamespace(execute=AsyncMock(), commit=AsyncMock())
-    assert await storage.locate(session, _identity()) is None
-    session.execute.assert_not_awaited()
-    session.commit.assert_not_awaited()
+async def test_native_attachment_read_denial_is_not_treated_as_absence(monkeypatch):
+    family = AsyncMock()
+    monkeypatch.setattr(storage, "_storage", family)
+    session = SimpleNamespace(scalar=AsyncMock(side_effect=PermissionError("native read denied")))
+    with pytest.raises(PermissionError, match="native read denied"):
+        await storage.locate(session, _identity())
+    family.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -391,50 +375,25 @@ def _storage_capture():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["dependency", "split_schema", "prefix", "uuid", "schema_oid", "relation_oid"])
-async def test_storage_refuses_untrusted_catalog_capture(monkeypatch, drift):
-    """Reject mismatched dependencies before custody acceptance or any mutation."""
+async def test_storage_reuses_named_common_family_and_membership_contract(monkeypatch):
     ownership = _storage_capture()
-    namespace = {"prefix": "synthetic_namespace", "uuid": "reference_family_archive_invalid"}.get(
-        drift, ownership.schema_name
-    )
-    dependencies = [(oid, 11, namespace, name) for name, oid in ownership.relation_oids]
-    dependencies.append((1001, 12, "hp_snapshot_retention", "pm_" + "a" * 52))
-    captured = ownership
-    if drift == "dependency":
-        dependencies.pop()
-    elif drift == "split_schema":
-        oid, _schema_oid, schema, name = dependencies[0]
-        dependencies[0] = (oid, 99, schema, name)
-    elif drift == "schema_oid":
-        captured = replace(ownership, schema_oid=99)
-    elif drift == "relation_oid":
-        captured = replace(ownership, relation_oids=ownership.relation_oids[:-1])
-    lock, capture, custody = AsyncMock(), AsyncMock(return_value=captured), AsyncMock()
-    monkeypatch.setattr(storage.native, "_lock_family", lock)
-    monkeypatch.setattr(storage.native, "capture_model_family_stage_ownership", capture)
-    monkeypatch.setattr(storage, "_require_closed_local_custody", custody)
-    session = SimpleNamespace(
-        execute=AsyncMock(return_value=SimpleNamespace(all=lambda: dependencies)), commit=AsyncMock()
-    )
-    with pytest.raises(
-        PTG2ManifestArtifactError, match="dependencies differ|family differs|namespace differs|identity changed"
-    ):
-        await storage._storage(session, 900, 42, _identity())
-    custody.assert_not_awaited()
-    if drift in {"schema_oid", "relation_oid"}:
-        lock.assert_awaited_once()
-        capture.assert_awaited_once_with(session, storage.SPEC, ownership.dataset_id)
-    else:
-        lock.assert_not_awaited()
-        capture.assert_not_awaited()
-    assert session.execute.await_count == 1
-    assert str(session.execute.await_args.args[0]).startswith("SELECT")
-    session.commit.assert_not_awaited()
+    shared = AsyncMock(return_value=ownership)
+    monkeypatch.setattr(storage.attachments, "attachment_storage", shared)
+    session, view = object(), "hp_snapshot_retention." + storage.attachment_name(_identity())
+    assert await storage._storage(session, view, _identity()) is ownership
+    shared.assert_awaited_once_with(session, view, storage.SPEC, membership_names=("pm_" + "a" * 52,))
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["schema_oid", "relation_oid", "owner_oid", "identity", "digest"])
+async def test_storage_preserves_common_layout_refusal_without_fallback(monkeypatch):
+    shared = AsyncMock(side_effect=PTG2ManifestArtifactError("attachment dependencies differ"))
+    monkeypatch.setattr(storage.attachments, "attachment_storage", shared)
+    with pytest.raises(PTG2ManifestArtifactError, match="dependencies differ"):
+        await storage._storage(object(), "hp_snapshot_retention." + storage.attachment_name(_identity()), _identity())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["schema_name", "relation_name", "identity", "digest"])
 async def test_retirement_drift_preserves_storage_and_source_pins(monkeypatch, drift):
     """Retirement cannot remove attachments or source pins from stale evidence."""
     from process.ptg_parts import ptg2_lifecycle_lock
@@ -444,21 +403,17 @@ async def test_retirement_drift_preserves_storage_and_source_pins(monkeypatch, d
     ready = storage.receipt((ownership, {"identity": identity, "content_digest": "d" * 64, "counts": {}}, 42, 900))
     header_map = {"identity": copy.deepcopy(identity), "content_digest": ready["content_digest"]}
     captured = ownership
-    if drift == "schema_oid":
-        captured = replace(ownership, schema_oid=99)
-    elif drift == "relation_oid":
+    if drift == "schema_name":
+        captured = replace(ownership, schema_name="different_schema")
+    elif drift == "relation_name":
         captured = replace(ownership, relation_oids=ownership.relation_oids[:-1])
     elif drift == "identity":
         header_map["identity"]["code"] = "99213"
     elif drift == "digest":
         header_map["content_digest"] = "e" * 64
-    monkeypatch.setattr(
-        storage.native, "protected_publisher_owner", AsyncMock(return_value=43 if drift == "owner_oid" else 42)
-    )
     monkeypatch.setattr(ptg2_lifecycle_lock, "acquire_ptg2_lifecycle_lock", AsyncMock())
     monkeypatch.setattr(storage, "lock_identity", AsyncMock())
     monkeypatch.setattr(storage.native, "capture_model_family_stage_ownership", AsyncMock(return_value=captured))
-    monkeypatch.setattr(storage, "_require_closed_local_custody", AsyncMock())
     references, cleanup, lock = AsyncMock(), AsyncMock(), AsyncMock()
     monkeypatch.setattr(storage, "_unreferenced_source_schema", references)
     monkeypatch.setattr(storage.native, "cleanup_model_family_stage", cleanup)
@@ -479,3 +434,78 @@ async def test_retirement_drift_preserves_storage_and_source_pins(monkeypatch, d
     session.commit.assert_not_awaited()
     assert session.execute.await_count == (1 if drift in {"identity", "digest"} else 0)
     assert all(str(call.args[0]).startswith("SELECT") for call in session.execute.await_args_list)
+
+
+def _retained_legacy_identity():
+    """Keep original token bytes available for retained pin accounting only."""
+    identity = copy.deepcopy(_identity())
+    member = identity["sources"][0]["membership"]
+    member["active_attachment"].pop("schema_name")
+    member["active_attachment"]["relation_oid"] = None
+    original = member["storage"]
+    member["storage"] = {
+        "dataset_id": original["dataset_id"],
+        "schema_oid": False,
+        "relation_oids": [[name, None] for name in original["relation_names"]],
+        "owner_oid": True,
+    }
+    return identity
+
+
+@pytest.mark.asyncio
+async def test_named_locate_preserves_original_retained_pin_identity_and_emits_names(monkeypatch):
+    stored_identity = _retained_legacy_identity()
+    header_by_field = {"identity": stored_identity, "content_digest": "d" * 64, "counts": {}}
+    original = copy.deepcopy(header_by_field)
+    ownership = _storage_capture()
+    monkeypatch.setattr(storage, "_storage", AsyncMock(return_value=ownership))
+    pins = AsyncMock()
+    monkeypatch.setattr(storage, "source_pins", pins)
+    session = SimpleNamespace(
+        scalar=AsyncMock(return_value=True),
+        execute=AsyncMock(return_value=SimpleNamespace(mappings=lambda: SimpleNamespace(one=lambda: header_by_field))),
+    )
+    found = await storage.locate(session, _identity())
+    pins.assert_awaited_once_with(session, stored_identity)
+    ready = storage.receipt(found)
+    assert ready["identity"] == _identity()
+    assert ready["active_attachment"] == {
+        "schema_name": "hp_snapshot_retention",
+        "name": storage.attachment_name(_identity()),
+    }
+    assert ready["storage"] == {
+        "dataset_id": str(ownership.dataset_id),
+        "schema_name": ownership.schema_name,
+        "relation_names": list(ownership.relation_names),
+    }
+    assert header_by_field == original
+
+
+@pytest.mark.asyncio
+async def test_named_retirement_removes_only_original_retained_pin_digest(monkeypatch):
+    from process.ptg_parts import ptg2_lifecycle_lock
+
+    stored_identity = _retained_legacy_identity()
+    header_by_field = {"identity": stored_identity, "content_digest": "d" * 64, "counts": {}}
+    ownership = _storage_capture()
+    ready = storage.receipt(
+        (ownership, header_by_field, None, "hp_snapshot_retention." + storage.attachment_name(_identity()))
+    )
+    monkeypatch.setattr(ptg2_lifecycle_lock, "acquire_ptg2_lifecycle_lock", AsyncMock())
+    monkeypatch.setattr(storage, "lock_identity", AsyncMock())
+    monkeypatch.setattr(storage.native, "capture_model_family_stage_ownership", AsyncMock(return_value=ownership))
+    references = AsyncMock(return_value='"mrf"')
+    monkeypatch.setattr(storage, "_unreferenced_source_schema", references)
+    monkeypatch.setattr(storage.native, "_lock_family", AsyncMock())
+    cleanup = AsyncMock()
+    monkeypatch.setattr(storage.native, "cleanup_model_family_stage", cleanup)
+    session = SimpleNamespace(
+        scalar=AsyncMock(return_value=False),
+        execute=AsyncMock(return_value=SimpleNamespace(mappings=lambda: SimpleNamespace(one=lambda: header_by_field))),
+    )
+    assert await storage.retire_unreferenced(session, ready)
+    references.assert_awaited_once_with(session, stored_identity)
+    deletes = [call for call in session.execute.await_args_list if str(call.args[0]).startswith("DELETE")]
+    assert len(deletes) == 1 and deletes[0].args[1]["owner_id"] == storage.identity_digest(stored_identity)
+    assert deletes[0].args[1]["owner_id"] != ready["projection_id"]
+    cleanup.assert_awaited_once_with(session, storage.SPEC, ownership)

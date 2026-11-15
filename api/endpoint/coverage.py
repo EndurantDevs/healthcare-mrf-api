@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from sanic import Blueprint, response
 from sqlalchemy import func, select, text
 
-from api.network_read_execution import execute_network_read
 from db.models import (
     ImportHistory,
     Issuer,
@@ -52,8 +51,7 @@ def _qualified_table_name(table) -> str:
 
 
 async def _is_table_available(session, table) -> bool:
-    result = await execute_network_read(
-        session,
+    result = await session.execute(
         text("SELECT to_regclass(:name)"),
         {"name": _qualified_table_name(table)},
     )
@@ -61,15 +59,15 @@ async def _is_table_available(session, table) -> bool:
 
 
 async def _scalar_int(session, stmt) -> int:
-    result = await execute_network_read(session, stmt)
+    result = await session.execute(stmt)
     return int(result.scalar() or 0)
 
 
 async def _latest_snapshot_date(session, table_exists: dict[str, bool]) -> str:
     if table_exists.get(import_history_table.name):
         latest_when = (
-            await execute_network_read(
-                session, select(import_history_table.c.when).order_by(import_history_table.c.when.desc()).limit(1)
+            await session.execute(
+                select(import_history_table.c.when).order_by(import_history_table.c.when.desc()).limit(1)
             )
         ).scalar()
         if latest_when is not None:

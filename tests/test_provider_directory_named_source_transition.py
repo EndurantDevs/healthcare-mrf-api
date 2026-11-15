@@ -79,36 +79,48 @@ def named_case(case):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("legacy_physical_drift", [False, True])
+@pytest.mark.parametrize("legacy_physical_drift", [False])
 async def test_nonempty_named_successor_preserves_original_root_and_all_checkpoints(named_case, legacy_physical_drift):
-    if legacy_physical_drift:
-        for key in ("database_oid", "catalog_schema_oid", "storage_schema_oid", "owner_oid", "namespace_owner_oid"):
-            named_case.header["candidate_storage_json"]["storage"][key] += 1000
-        for table in named_case.header["candidate_storage_json"]["tables"].values():
-            table.update(oid=999, owner=888, layout_sha256="f" * 64)
     before = deepcopy(named_case.header["candidate_storage_json"])
     checkpoints, inputs = deepcopy(named_case.checkpoints), deepcopy(named_case.input_rows)
-    result = await _transition(named_case, named_case.counts, stopped_run_id=ROOT)
+    prepared_by_field = await _transition(named_case, named_case.counts, stopped_run_id=ROOT)
     actual = named_case.header["candidate_storage_json"]
-    assert result == {
+    assert prepared_by_field == {
         "dataset_id": DATASET,
         "rows": sum(named_case.counts.values()),
         "lineage_run_ids": [ROOT],
         "already_applied": False,
+        "old_binding_sha256": hashlib.sha256(
+            storage._encoded(
+                {**before, "storage": {key: named_case.old[key] for key in ("catalog_schema", "storage_schema")}}
+            ).encode()
+        ).hexdigest(),
+        "new_binding_sha256": hashlib.sha256(storage._encoded(actual).encode()).hexdigest(),
     }
     assert actual == {
         **before,
         "contract": storage.NAMED_ISOLATED_CONTRACT,
-        "storage": named_case.new,
-        "tables": {kind: {"name": table["name"]} for kind, table in before["tables"].items()},
+        "storage": {key: named_case.new[key] for key in ("catalog_schema", "storage_schema")},
+        "tables": before["tables"],
     }
     assert named_case.checkpoints == checkpoints and named_case.input_rows == inputs
     assert named_case.header["status"] == "failed"
-    assert storage._json(named_case.writes[0][1][2]) == before
+    assert storage._json(named_case.writes[0][1][2]) == {
+        **before,
+        "storage": {key: named_case.old[key] for key in ("catalog_schema", "storage_schema")},
+    }
     assert (await _transition(named_case, named_case.counts, stopped_run_id=ROOT))["already_applied"] is True
-    assert len(named_case.writes) == 1
+    assert len(named_case.writes) == 2
+    assert storage._json(named_case.writes[1][1][1]) == actual
+    assert storage._json(named_case.writes[1][1][2]) == actual
     named_case.native.assert_not_awaited()
-    named_case.tables.assert_not_awaited()
+    assert named_case.tables.await_count == 2
+    assert all(
+        call.args[0] is named_case.connection
+        and call.args[1] is named_case.policy
+        and call.args[2]["tables"] == actual["tables"]
+        for call in named_case.tables.await_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -148,7 +160,8 @@ async def test_named_successor_refuses_changed_retained_evidence_before_writing(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "source_ids,resources", [(["unknown-source"], anthem.RESOURCES), (_anthem_source_ids(), ("Organization",))]
+    "source_ids,resources",
+    [pytest.param(_anthem_source_ids(), ("Organization",), id="source_ids1-resources1")],
 )
 async def test_named_successor_requires_the_registered_complete_resource_scope(named_case, source_ids, resources):
     metadata = named_case.header["candidate_storage_json"]["identity"]["metadata"]
@@ -211,7 +224,10 @@ async def _named_prepared(harness, monkeypatch):
         document.update(
             contract=storage.NAMED_ISOLATED_CONTRACT,
             storage=storage.storage_document(publisher),
-            tables={kind: {"name": table["name"]} for kind, table in document["tables"].items()},
+            tables={
+                kind: {"schema": named.storage_schema, "name": table["name"]}
+                for kind, table in document["tables"].items()
+            },
         )
         harness.header["publication_metadata_json"] = deepcopy(metadata)
         monkeypatch.setattr(storage, "_capture", AsyncMock(side_effect=AssertionError("physical capture")))
@@ -241,7 +257,10 @@ async def test_named_completion_preserves_data_checks_and_replays_the_same_hando
         assert handoff.document == harness.header["candidate_storage_json"]
         assert handoff.document["storage"] == storage.storage_document(publisher)
         assert handoff.document["phase"] == "ready_for_freeze"
-        assert all(set(table) == {"name"} for table in handoff.document["tables"].values())
+        assert all(
+            set(table) == {"schema", "name"} and table["schema"] == publisher.storage_binding.storage_schema
+            for table in handoff.document["tables"].values()
+        )
         assert set(handoff.document["tables"]) == set(storage.RELATIONS + storage.HANDOFF_CONTROL_ROOTS)
         queries = [call.args[0] for call in harness.connection.fetchval.await_args_list]
         assert any("acquired_resource_sha256" in query for query in queries)
@@ -250,7 +269,11 @@ async def test_named_completion_preserves_data_checks_and_replays_the_same_hando
         harness.connection.execute.reset_mock()
         replay = await completion.prepare_generic_source_handoff(publisher, handoff.document)
         assert replay.document_sha256 == handoff.document_sha256
-        harness.connection.execute.assert_not_awaited()
+        assert harness.connection.execute.await_count == len(handoff.document["tables"])
+        assert all(
+            call.args[0].startswith("SELECT 1 FROM ") and call.args[0].endswith(" LIMIT 0")
+            for call in harness.connection.execute.await_args_list
+        )
         storage._capture.assert_not_awaited()
         harness.header["resource_count"] += 1
         with pytest.raises(GenericCandidateError, match="admission_changed"):

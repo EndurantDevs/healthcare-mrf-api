@@ -50,6 +50,41 @@ async def grant_source_admission_controls(connection, policy):
             f"GRANT EXECUTE ON FUNCTION {storage_relation(policy.schema, name)}({arguments} TO {owner}"
         )
 
+    await grant_address_artifact_revision(connection, policy)
+    await grant_npi_generation_read(connection, policy)
+
+
+async def grant_npi_generation_read(connection, policy):
+    """Read installed canonical NPI origin metadata through the configured Source Owner."""
+    installed = await connection.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class relation "
+        "JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace "
+        "WHERE namespace.nspname=$1 AND relation.relname='npi_result_generation')",
+        policy.schema,
+    )
+    if installed:
+        await connection.execute(
+            "GRANT SELECT(origin_lineage_id,origin_generation) ON "
+            f"{storage_relation(policy.schema, 'npi_result_generation')} TO {storage_identifier(policy.owner_role)}"
+        )
+
+
+async def grant_address_artifact_revision(connection, policy):
+    """Maintain installed logical artifact revisions through the configured Source Owner."""
+    installed = await connection.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class relation "
+        "JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace "
+        "WHERE namespace.nspname=$1 AND relation.relname='address_alias_artifact_state_v1')",
+        policy.schema,
+    )
+    if installed:
+        await connection.execute(
+            "GRANT SELECT(artifact_name,generation,updated_at),INSERT(artifact_name,generation,updated_at),"
+            "UPDATE(generation,updated_at) ON "
+            f"{storage_relation(policy.schema, 'address_alias_artifact_state_v1')} "
+            f"TO {storage_identifier(policy.owner_role)}"
+        )
+
 
 async def _grant_control_reads(connection, policy):
     owner = storage_identifier(policy.owner_role)

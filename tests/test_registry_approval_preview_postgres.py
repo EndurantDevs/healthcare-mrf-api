@@ -40,6 +40,7 @@ from tests.test_registry_approval_store_postgres import (
 )
 from tests.test_registry_candidate_composition_postgres import (
     _initial_arguments,
+    _publish_composition_target,
     _remove_candidates,
     _roles,
     initial_composition,
@@ -417,9 +418,7 @@ async def retained_aca_preview(initial_composition):
     try:
         target, addresses = await compose_registry_membership_candidate(fixture.connection, **arguments)
         copy_targets.append(target)
-        await prepare_and_publish_network_candidate(
-            fixture.connection, target, addresses, **_roles(fixture), control_schema=fixture.control_schema
-        )
+        await _publish_composition_target(fixture, target, addresses)
         yield fixture
     finally:
         await _remove_candidates(fixture, copy_targets, arguments["request_id"])
@@ -521,19 +520,6 @@ async def test_unselected_pending_close_never_enters_imported_preview(retained_a
     }
 
 
-async def test_writable_retained_source_is_explicitly_unavailable(retained_aca_preview):
-    fixture = retained_aca_preview
-    command = await _pending_aca_operation(fixture, "close")
-    source = fixture.recipes[0].source_pin
-    schema, reader = source.prepared.ownership.schema_name, source.runtime_roles[0]
-    await fixture.connection.execute(f'GRANT UPDATE ON "{schema}".mrf_address_evidence TO "{reader}"')
-    try:
-        preview = await _repeatable_preview(fixture, command)
-        assert preview["source_selection"] == {"status": "unavailable"}
-    finally:
-        await fixture.connection.execute(f'REVOKE UPDATE ON "{schema}".mrf_address_evidence FROM "{reader}"')
-
-
 async def test_bad_mapped_office_counts_unresolved_before_approval(retained_aca_preview):
     fixture = retained_aca_preview
     source = fixture.recipes[0].source_pin
@@ -613,7 +599,7 @@ async def test_complete_imported_counts_above_copy_page(expanded_aca_preview, op
         "omitted_rows": omitted,
         "unresolved_rows": 0,
     }
-    assert counted.statements == 21  # Includes the fixed retained-candidate custody reads.
+    assert counted.statements == 17
     assert preview["unresolved_count"] == 0
     assert await _durable_state(fixture.connection, fixture.control_schema) == initial_state
     await _assert_staging_removed(fixture.connection)
@@ -633,7 +619,7 @@ async def test_imported_preview_query_count_is_fixed_per_recipe(retained_aca_pre
         "omitted_rows": 0,
         "unresolved_rows": 0,
     }
-    assert counted.statements == 21  # Includes the fixed retained-candidate custody reads.
+    assert counted.statements == 17
 
 
 async def test_bootstrap_binding_preview_has_no_invented_source_count(office_db):
@@ -645,54 +631,6 @@ async def test_bootstrap_binding_preview_has_no_invented_source_count(office_db)
     command = await _command(connection, schema, selection=selected_records)
     preview = await _preview(connection, schema, command, _actor())
     assert preview["source_selection"] == {"status": "unavailable"}
-
-
-async def test_retained_fhir_preview_requires_complete_custody(custom_db, reviewed_fhir_source):
-    fixture = custom_db
-    copy_targets = []
-    try:
-        await _publish_raw_recipe(fixture, reviewed_fhir_source, copy_targets)
-        unrelated = await _draft(fixture.engine, fixture.control_schema, _create(), _actor())
-        command = await _command(fixture.connection, fixture.control_schema, unrelated)
-        initial_state = await _durable_state(fixture.connection, fixture.control_schema)
-        preview = await _repeatable_preview(fixture, command)
-        assert preview["source_selection"] == {"status": "unavailable"}
-        assert await _durable_state(fixture.connection, fixture.control_schema) == initial_state
-    finally:
-        await _remove_candidates(fixture, copy_targets, uuid4())
-
-
-async def test_mixed_retained_recipe_preview_never_reports_partial_aca_counts(
-    office_db, custom_db, reviewed_fhir_source, monkeypatch
-):
-    fixture = custom_db
-    copy_targets = []
-    actual_create = recipe_tests.create_network_candidate
-
-    async def create_mixed(connection, target, **options):
-        # Provision two actual raw pins through the ordinary candidate codec;
-        # publication and manifest custody remain the real protected pipeline.
-        options["source_recipes"] += (
-            RegistrySourceMembershipRecipe(office_db.source, office_db.batch.binding_coordinates),
-        )
-        return await actual_create(connection, target, **options)
-
-    monkeypatch.setattr(recipe_tests, "create_network_candidate", create_mixed)
-    try:
-        await _publish_raw_recipe(fixture, reviewed_fhir_source, copy_targets)
-        unrelated = await _draft(fixture.engine, fixture.control_schema, _create(), _actor())
-        command = await _command(fixture.connection, fixture.control_schema, unrelated)
-        preview = await _repeatable_preview(fixture, command)
-        assert preview["source_selection"] == {"status": "unavailable"}
-        assert (
-            await fixture.connection.fetchval(
-                f'SELECT jsonb_array_length(source_recipes_json) FROM "{fixture.control_schema}".network_membership_candidate WHERE state=$1',
-                "published",
-            )
-            == 2
-        )
-    finally:
-        await _remove_candidates(fixture, copy_targets, uuid4())
 
 
 async def test_imported_preview_checks_the_aggregate_limit(retained_aca_preview, monkeypatch):
@@ -732,19 +670,6 @@ def _expand_cms_roles(monkeypatch, count):
     monkeypatch.setattr(cms_recipes, "_membership_resource_rows", resource_rows)
 
 
-def _add_aca_recipe(monkeypatch, offices):
-    """Persist both actual immutable pins through ordinary candidate creation."""
-    actual_create = recipe_tests.create_network_candidate
-
-    async def create_mixed(connection, target, **options):
-        options["source_recipes"] += (
-            RegistrySourceMembershipRecipe(offices.source, offices.batch.binding_coordinates),
-        )
-        return await actual_create(connection, target, **options)
-
-    monkeypatch.setattr(recipe_tests, "create_network_candidate", create_mixed)
-
-
 @pytest.fixture
 async def retained_cms_preview(cms_preview_template, monkeypatch, tmp_path, request):
     """Publish closed CMS custody and optional ACA recipes, retaining exact cleanup."""
@@ -755,15 +680,17 @@ async def retained_cms_preview(cms_preview_template, monkeypatch, tmp_path, requ
         database = await _fixture_value(stack, cms_recipes.cms_recipe_database.__wrapped__(monkeypatch))
         registry = await _fixture_value(stack, cms_recipes.serving_schema.__wrapped__(database, monkeypatch))
         fixture = await _fixture_value(stack, custom_db.__wrapped__(registry))
+        extra_recipes = ()
         if options_by_kind.get("mixed"):
             offices = await _fixture_value(stack, office_db.__wrapped__(registry, SimpleNamespace(param=2)))
-            _add_aca_recipe(monkeypatch, offices)
-        reviewed = await _fixture_value(
-            stack, cms_recipes.reviewed_cms_source.__wrapped__(database, registry, monkeypatch, tmp_path)
+            extra_recipes = (RegistrySourceMembershipRecipe(offices.source, offices.batch.binding_coordinates),)
+        # Ordinary composition proves office correspondence, so the reviewed office carries a full street address.
+        reviewed = await stack.enter_async_context(
+            recipe_tests._complete_cms_office_source(database, registry, monkeypatch, tmp_path)
         )
         copy_targets = []
         try:
-            await _publish_raw_recipe(fixture, reviewed, copy_targets)
+            await _publish_raw_recipe(fixture, reviewed, copy_targets, extra_recipes=extra_recipes)
             yield fixture, reviewed
         finally:
             await _remove_candidates(fixture, copy_targets, uuid4())
@@ -867,8 +794,7 @@ async def test_cms_preview_counts_all_source_rows_above_both_native_page_limits(
             sort_keys=True,
         ),
     )
-    assert counted.statements <= 51  # Preserve the existing complete native epoch and custody ceiling.
-    assert counted.statements == 49  # Rollback-only setting scopes remove redundant reads and restores.
+    assert counted.statements <= 51  # Preserve the existing bounded native-read ceiling.
     assert len(counted.office_selection_queries) == 1
     selection_sql, *_parameters, limit = counted.office_selection_queries[0]
     assert "LIMIT $3" in selection_sql and limit == 101
@@ -877,17 +803,24 @@ async def test_cms_preview_counts_all_source_rows_above_both_native_page_limits(
 
 
 @pytest.mark.parametrize("retained_cms_preview", [{"mixed": True}], indirect=True)
-async def test_cms_custody_drift_makes_entire_mixed_preview_unavailable(retained_cms_preview):
-    """A lost protected source owner cannot expose partial ACA counts as complete."""
+async def test_cms_metadata_drift_makes_entire_mixed_preview_unavailable(retained_cms_preview):
+    """A changed retained dataset declaration cannot expose partial mixed-source counts."""
     fixture, reviewed = retained_cms_preview
     command = await _pending_cms_command(fixture, reviewed, "close")
-    owner = reviewed[0][2].retained_epoch.owner_role
+    pin = reviewed[0][2]
+    table = f'"{pin.retained_epoch.schema_name}".provider_directory_endpoint_dataset'
     try:
-        await fixture.connection.execute(f'ALTER ROLE "{owner}" LOGIN')
+        await fixture.connection.execute(
+            f"UPDATE {table} SET publication_metadata_sha256=$2 WHERE dataset_id=$1", pin.dataset_id, "0" * 64
+        )
         preview = await _repeatable_preview(fixture, command)
         assert preview["source_selection"] == {"status": "unavailable"}
     finally:
-        await fixture.connection.execute(f'ALTER ROLE "{owner}" NOLOGIN')
+        await fixture.connection.execute(
+            f"UPDATE {table} SET publication_metadata_sha256=$2 WHERE dataset_id=$1",
+            pin.dataset_id,
+            pin.retained_epoch.metadata_sha256,
+        )
     await _assert_staging_removed(fixture.connection)
 
 

@@ -13,8 +13,16 @@ from process import entity_address_candidate_preparation as preparation
 from process import entity_address_prepared_doctors as dependencies
 from process.provider_directory_cms_archive import PreparedArchiveDelta
 from tests.test_entity_address_candidate_preparation_postgres import _inputs, native
-from tests.test_entity_address_prepared_doctors_postgres import _example_bindings
+from tests.test_entity_address_prepared_doctors_postgres import _example_bindings as _legacy_example_bindings
 from tests.test_provider_directory_cms_preparation import _admission
+
+
+def _example_bindings():
+    """Use the complete prepared read contract, independently of global assurance state."""
+    return {
+        name: {field: binding[field] for field in ("schema_name", "table_name")}
+        for name, binding in _legacy_example_bindings().items()
+    }
 
 
 def _archive():
@@ -23,17 +31,13 @@ def _archive():
     return PreparedArchiveDelta(
         schema="mrf",
         delta_table="prepared_archive_delta",
-        delta_oid=101,
         effective_relation="prepared_archive_view",
-        effective_oid=102,
-        target_oid=100,
         from_revision=7,
         native_input_hash=admission.plan.native_address_input_hash,
         columns=("address_key",),
         delta_rows=1,
         delta_sha256="a" * 64,
         effective_definition="SELECT address_key FROM mrf.prepared_archive_delta",
-        sealed_filenode=103,
         admission=admission,
     )
 
@@ -125,7 +129,7 @@ async def test_capture_keeps_archive_separate_from_geo_heap_bindings(monkeypatch
         archive=archive,
     )
     assert captured.archive is archive
-    assert captured.doctors is None and captured.stage_oids == ()
+    assert captured.doctors is None and captured.stage_relations == ()
     assert captured.dependency_bindings == _example_bindings()
     assert "mrf.address_archive_v2" not in captured.dependency_bindings
     check.assert_awaited_once_with(backend, captured)
@@ -264,7 +268,7 @@ async def test_native_preparation_threads_archive_and_restores_scope_after_inter
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", [None, "no_factory", "wrong_oid", "wrong_file", "one_canonical", "other_source"])
+@pytest.mark.parametrize("fault", [None, "no_factory", "wrong_name", "wrong_schema", "one_canonical", "other_source"])
 async def test_captured_tiger_dependencies_require_fresh_factory_native_proof(monkeypatch, fault):
     from process import provider_directory_cms_tiger_inputs as tiger
     from process import provider_directory_generic_source_policy as policy
@@ -272,10 +276,10 @@ async def test_captured_tiger_dependencies_require_fresh_factory_native_proof(mo
 
     bindings = _example_bindings()
     bindings.update(tiger.captured_tiger_bindings(_captured_proof()))
-    if fault == "wrong_oid":
-        bindings["tiger.zcta5"]["relation_oid"] += 100
-    elif fault == "wrong_file":
-        bindings["tiger.zcta5"]["relfilenode"] += 1
+    if fault == "wrong_name":
+        bindings["tiger.zcta5"]["table_name"] = "another_table"
+    elif fault == "wrong_schema":
+        bindings["tiger.zcta5"]["schema_name"] = "reference_family_archive_" + "f" * 32
     elif fault == "one_canonical":
         bindings["tiger.zip_state"]["schema_name"] = "tiger"
     elif fault == "other_source":
@@ -313,3 +317,57 @@ def test_captured_tiger_linkage_does_not_allow_foreign_bindings_without_native_m
     with pytest.raises(RuntimeError, match="not a proven input"):
         dependencies._validate_bindings("mrf", None, bindings)
     assert dependencies._validate_bindings("mrf", None, bindings, tiger_captured=_captured_proof()) == bindings
+
+
+def test_named_dependencies_ignore_saved_tokens_and_do_not_rewrite_the_map():
+    from copy import deepcopy
+
+    saved = _legacy_example_bindings()
+    for binding in saved.values():
+        binding["relation_oid"] = {"old": "opaque"}
+        binding["relfilenode"] = None
+    before = deepcopy(saved)
+    expected = _example_bindings()
+    assert dependencies._validate_bindings("mrf", None, saved) == expected
+    captured = dependencies.PreparedAddressDependencies("mrf", None, (), saved)
+    token = preparation._NATIVE_DEPENDENCIES.set(captured)
+    try:
+        emitted = preparation.geo_dependency_options()["dependency_bindings"]
+        assert emitted == expected
+        emitted["mrf.npi_address"]["table_name"] = "another"
+        assert saved == before
+    finally:
+        preparation._NATIVE_DEPENDENCIES.reset(token)
+
+
+@pytest.mark.parametrize("fault", ["missing", "extra", "duplicate", "field", "identifier"])
+def test_named_dependency_contract_rejects_incomplete_or_ambiguous_maps(fault):
+    bindings = _example_bindings()
+    if fault == "missing":
+        del bindings["mrf.npi_address"]
+    elif fault == "extra":
+        bindings["mrf.extra"] = {"schema_name": "mrf", "table_name": "extra"}
+    elif fault == "duplicate":
+        bindings["mrf.npi_address"] = dict(bindings["mrf.mrf_address"])
+    elif fault == "field":
+        bindings["mrf.npi_address"]["extra"] = 1
+    else:
+        bindings["mrf.npi_address"]["table_name"] = 'unsafe"name'
+    with pytest.raises(ValueError):
+        dependencies._named_bindings("mrf", bindings)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matched", [False, True])
+async def test_named_dependencies_lock_actual_inputs_and_reject_changed_native_shape(matched):
+    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(return_value=matched))
+    if matched:
+        await dependencies._assert_bindings(session, "mrf", _example_bindings())
+    else:
+        with pytest.raises(RuntimeError, match="binding changed"):
+            await dependencies._assert_bindings(session, "mrf", _example_bindings())
+    lock = str(session.execute.await_args.args[0])
+    assert "ACCESS SHARE" in lock and all(value["table_name"] in lock for value in _example_bindings().values())
+    match_sql = str(session.scalar.await_args.args[0])
+    assert "relkind='r'" in match_sql and "relpersistence='p'" in match_sql
+    assert "pg_relation_filenode" not in match_sql

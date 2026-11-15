@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Issued physical SOURCE inputs for the original signed Profile workload."""
+"""Issued named SOURCE inputs for the original signed Profile workload."""
 
 import asyncio
 import contextvars
@@ -8,7 +8,6 @@ import inspect
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from uuid import uuid4
 from weakref import WeakKeyDictionary
 
 from db import connection as database_context
@@ -41,7 +40,6 @@ class _Inputs:
     full_json: str
     resource_json: str
     producer: tuple
-    probe: int
 
 
 def _fence_json(fence):
@@ -161,7 +159,7 @@ async def _capture(scope, coordinates):
     bindings_by_key = {}
     for key, dataset in coordinates.items():
         header = headers_by_id[dataset.dataset_id]
-        captured = decoded(header["candidate_storage_json"])
+        captured = storage._binding_json(header["candidate_storage_json"], scope.policy.schema)
         require_output(type(captured) is dict, "profile_input_binding_required")
         storage._validate_binding(captured, captured.get("identity"), phases=("published",))
         _source_pin(dataset, header, captured)
@@ -211,7 +209,7 @@ async def _drain(state_by_field):
 
 @asynccontextmanager
 async def profile_source_input_scope(directory, full_fence, resource_fence):
-    """Pin original physical inputs independently of every small payload transaction."""
+    """Pin original named inputs independently of every small payload transaction."""
     if not source.is_source_storage_required():
         yield
         return
@@ -231,13 +229,8 @@ async def profile_source_input_scope(directory, full_fence, resource_fence):
             _fence_json(full_fence),
             _fence_json(resource_fence),
             producer,
-            int.from_bytes(uuid4().bytes[:8], "big", signed=True),
         )
         require_output(scope.policy.schema == directory._schema(), "profile_input_schema_changed")
-        require_output(
-            await driver.fetchval("SELECT pg_try_advisory_xact_lock($1::bigint)", scope.probe),
-            "profile_input_probe_busy",
-        )
         await verify_generic_source_family(driver, scope.policy)
         captured, header_digests = await _capture(scope, full_by_key)
         state_by_field = dict(
@@ -279,16 +272,17 @@ async def _read_actor(directory):
         require_output(observation.current_observation(directory) is observed, "profile_input_observer_changed")
     elif source._PUBLISHER.get() is not None:
         publisher = source.bound_publisher()
-        binding = directory.db._transaction_binding()
         require_output(
-            binding is not None and binding.session is source.source_copy_session(),
-            "profile_input_original_session_required",
+            source.source_copy_session().in_transaction()
+            and publisher.transaction_isolation in {"read committed", "repeatable read", "serializable"},
+            "profile_input_transaction_required",
         )
         yield publisher
+        current = source.bound_publisher()
         require_output(
-            source.bound_publisher() is publisher
-            and directory.db._transaction_binding() is binding
-            and source.source_copy_session() is binding.session,
+            current.factory is publisher.factory
+            and current.policy is publisher.policy
+            and source.source_copy_session().in_transaction(),
             "profile_input_publisher_changed",
         )
     else:
@@ -308,10 +302,6 @@ async def read_transaction(directory):
         require_output(
             publisher.factory is scope.factory and publisher.policy is scope.policy, "profile_input_publisher_changed"
         )
-        require_output(
-            not await publisher.connection.fetchval("SELECT pg_try_advisory_xact_lock($1::bigint)", scope.probe),
-            "profile_input_database_changed",
-        )
         observed = _Inputs(
             directory,
             scope.factory,
@@ -321,7 +311,6 @@ async def read_transaction(directory):
             scope.full_json,
             scope.resource_json,
             scope.producer,
-            scope.probe,
         )
         require_output(
             await _capture(observed, state_by_field["coordinates"])

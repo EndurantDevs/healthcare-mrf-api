@@ -216,30 +216,30 @@ async def test_notification_callback_uses_original_publisher_body_and_restores_r
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", [None, "heap_oid", "sequence_schema"])
-async def test_fixture_custody_transfer_is_exact_and_oid_checked(monkeypatch, damage):
-    """The setup transfers only its explicit heaps/sequences and rejects native substitution."""
+@pytest.mark.parametrize("damage", [None, "heap_name", "sequence_schema"])
+async def test_fixture_publication_grants_target_exact_named_heaps_and_sequences(monkeypatch, damage):
+    """The setup grants native rights only on its complete explicitly named family."""
     statements = []
     heap_rows = [
-        dict(relname="entity_address_evidence", oid=101, relkind="r"),
-        dict(relname="entity_address_evidence_stage", oid=202, relkind="r"),
+        dict(relname="entity_address_evidence", relkind="r"),
+        dict(relname="entity_address_evidence_stage", relkind="r"),
     ]
     sequence_rows = [
-        dict(relname="evidence_seq", oid=303, schema_name="mrf"),
-        dict(relname="stage_seq", oid=404, schema_name="mrf"),
+        dict(relname="evidence_seq", schema_name="mrf"),
+        dict(relname="stage_seq", schema_name="mrf"),
     ]
-    if damage == "heap_oid":
-        heap_rows[1]["oid"] = 999
+    if damage == "heap_name":
+        heap_rows[1]["relname"] = "unselected_evidence"
     if damage == "sequence_schema":
         sequence_rows[1]["schema_name"] = "foreign_schema"
 
     async def execute(statement, parameters=None):
         statement = str(statement)
         statements.append(statement)
-        rows = sequence_rows if "SELECT s.relname" in statement else heap_rows
+        rows = sequence_rows if "SELECT DISTINCT s.relname" in statement else heap_rows
         return SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: rows))
 
-    connection = SimpleNamespace(execute=execute, scalar=AsyncMock(side_effect=[101, 4, False]))
+    connection = SimpleNamespace(execute=execute, scalar=AsyncMock())
 
     @asynccontextmanager
     async def admin_transaction():
@@ -248,7 +248,7 @@ async def test_fixture_custody_transfer_is_exact_and_oid_checked(monkeypatch, da
     database = SimpleNamespace(
         engine=SimpleNamespace(begin=admin_transaction), _source_component=SimpleNamespace(owner="source_owner")
     )
-    address = SimpleNamespace(stage_oids=(("entity_address_evidence", "entity_address_evidence_stage", 202),))
+    address = SimpleNamespace(stage_relations=(("entity_address_evidence", "entity_address_evidence_stage"),))
     if damage:
         with pytest.raises(AssertionError):
             await fixture._transfer_address_publication_custody(database, address)
@@ -256,11 +256,12 @@ async def test_fixture_custody_transfer_is_exact_and_oid_checked(monkeypatch, da
     else:
         await fixture._transfer_address_publication_custody(database, address)
         assert [statement for statement in statements if statement.startswith("ALTER")] == [
-            'ALTER TABLE mrf."entity_address_evidence_stage" OWNER TO "source_owner"',
             'ALTER TABLE mrf."entity_address_evidence" OWNER TO "source_owner"',
+            'ALTER TABLE mrf."entity_address_evidence_stage" OWNER TO "source_owner"',
             'ALTER SEQUENCE mrf."evidence_seq" OWNER TO "source_owner"',
             'ALTER SEQUENCE mrf."stage_seq" OWNER TO "source_owner"',
         ]
+    connection.scalar.assert_not_awaited()
     assert not any("GRANT ALL" in statement or "REASSIGN OWNED" in statement for statement in statements)
 
 
@@ -604,7 +605,7 @@ async def test_component_input_absence(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["selection", "catalog", "actor", "driver", "binding", "child", "producer"])
+@pytest.mark.parametrize("change", ["selection", "catalog", "actor", "driver", "binding", "producer"])
 async def test_component_input_refusals(monkeypatch, change):
     """A declared component cannot borrow another selection, session, task or producer."""
     from process import provider_directory_cms_tiger_inputs as tiger
@@ -688,7 +689,7 @@ def test_complete_native_source_prefix_uses_unique_actual_ancestor_order():
 
     merged = complete.source_component_native_migrations()
     baseline = source_component_migrations()
-    assert len(merged) == len(set(merged)) == 135
+    assert len(merged) == len(set(merged)) == 140
     assert tuple(prefix for prefix in merged if prefix in set(baseline)) == baseline
     assert set(merged) - (set(baseline) | set(complete.NATIVE_INPUT_MIGRATIONS)) == {
         "20260830090000",
@@ -706,10 +707,41 @@ def test_complete_native_source_prefix_uses_unique_actual_ancestor_order():
     assert merged.index("20260629123000") < merged.index("20260629160000") < merged.index("20260630112000")
     assert merged.index("20260729110000") < merged.index("20260729120000") < merged.index("20260730110000")
     assert merged.index("20260628100000") < merged.index("20260628143000") < merged.index("20260628170000")
-    assert merged[-3:] == (
+    assert merged[-8:-5] == (
         "20261022120000",
         "20261023100000_provider_directory_retirement_parent_updates",
         "20261024050000",
+    )
+    assert merged[-5:] == ("20261114160000", "20261114180000", "20261114190000", "20261115120000", "20261116090000")
+
+
+def test_native_receipt_signing_preserves_logical_runtime_and_reservations():
+    """Authenticate native fixture leases through the real current signature validator."""
+    from datetime import datetime
+
+    from tests import cms_registry_complete_publication_postgres_support as complete
+    from tests import provider_directory_profile_capacity_signing_guard_test_support as signing
+    from tests.test_provider_directory_profile_capacity_attestation import _golden_body, _verify
+
+    original = _golden_body()
+    guard = original["signing_preflight_guard"]
+    receipt = guard["healthcare_receipt"]
+    timing = signing._GuardTiming(
+        *(
+            datetime.fromisoformat(original[field])
+            for field in ("observed_at", "issued_at", "expires_at", "max_build_deadline")
+        ),
+        original["nonce"],
+    )
+    envelope = complete.sign_native_receipt(guard, receipt, timing, reservation="synthetic-native-reservation")
+    verified = _verify(envelope)
+    assert verified.reservation_bytes_by_storage_class == receipt["required_reservation_bytes_by_storage_class"]
+    assert verified.runtime.healthcare_source_commit == receipt["runtime_observation"]["healthcare_source_commit"]
+    assert verified.signing_preflight_guard == guard
+    assert {entry["storage_class"] for entry in envelope["lease"]["storage_classes"]} == {"data", "temp", "wal"}
+    assert (
+        not {"database_oid", "runtime_witness", "deployment_witness", "volumes", "tablespaces"}
+        & envelope["lease"].keys()
     )
 
 
@@ -896,7 +928,9 @@ async def _ordinary_component_observation(monkeypatch):
         isolation="repeatable read",
     )
     native.fetchrow.side_effect = lambda query: dict(actor_by_field)
-    native.fetchval.return_value = True
+    native.fetchval.side_effect = lambda query: (
+        actor_by_field["readonly"] if query == "SHOW transaction_read_only" else True
+    )
     backend = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=native)))
     async with AsyncSession() as session, session.begin():
         monkeypatch.setattr(session, "connection", AsyncMock(return_value=backend))
@@ -933,13 +967,14 @@ async def test_component_input_accepts_only_issued_readonly_observation(monkeypa
         assert any("pg_inherits" in call.args[0] for call in case.native.fetchval.await_args_list)
 
 
-@pytest.mark.parametrize("damage", ["unissued", "driver", "readonly", "transaction", "child"])
+@pytest.mark.parametrize("damage", ["unissued", "readonly", "transaction"])
 async def test_component_observation_refuses_changed_authority(monkeypatch, damage):
     from process import provider_directory_cms_tiger_inputs as tiger
     from process import provider_directory_source_observation as observation
 
     async with _ordinary_component_observation(monkeypatch) as case:
         issued, actor_by_field = observation._ACTIVE.get(), dict(case.actor)
+        get_transaction = case.session.get_transaction
         try:
             if damage == "unissued":
                 observation._ACTIVE.set(None)
@@ -948,7 +983,7 @@ async def test_component_observation_refuses_changed_authority(monkeypatch, dama
             if damage == "readonly":
                 case.actor["readonly"] = "off"
             if damage == "transaction":
-                case.actor["transaction"] = "1/3"
+                case.session.get_transaction = lambda: SimpleNamespace(is_active=False)
             with pytest.raises((AssertionError, ValueError, RuntimeError)):
                 if damage == "child":
                     await asyncio.create_task(tiger.capture_selected_captured_tiger_input(case.session))
@@ -958,8 +993,9 @@ async def test_component_observation_refuses_changed_authority(monkeypatch, dama
             observation._ACTIVE.set(issued)
             case.actor.clear()
             case.actor.update(actor_by_field)
+            case.session.get_transaction = get_transaction
             case.backend.get_raw_connection.return_value = SimpleNamespace(driver_connection=case.native)
-        case.native.fetchval.assert_not_awaited()
+        assert all(call.args == ("SHOW transaction_read_only",) for call in case.native.fetchval.await_args_list)
 
 
 @pytest.mark.asyncio

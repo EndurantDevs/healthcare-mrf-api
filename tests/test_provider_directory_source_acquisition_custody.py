@@ -415,19 +415,6 @@ def test_native_history_scope_requires_complete_exact_safe_bound(values):
         custody._require_acquisition_scope("checktrue", values)
 
 
-@pytest.mark.asyncio
-async def test_external_fk_on_private_child_refuses_before_any_native_allowance():
-    private_name = "pdrgw_" + "1" * 48
-    proof_by_field = dict(catalog=dict(classes=[dict(relname=private_name, oid="71")]))
-    unknown_by_field = dict(constraint=dict(oid="99"))
-    native = SimpleNamespace(fetch=AsyncMock(return_value=[unknown_by_field]), fetchval=AsyncMock())
-    family_by_field = dict(relations={private_name: proof_by_field}, foreign=[], cohort=dict(relations={}))
-    with pytest.raises(ValueError, match="external_foreign_authority_changed"):
-        await controls._capture_complete_foreign(native, {}, family_by_field, [])
-    assert native.fetch.await_args.args[1] == [71]
-    native.fetchval.assert_not_awaited()
-
-
 def test_equal_check_text_cannot_mask_a_substituted_function_oid():
     root = custody.ACQUISITION_ROOTS[2]
     entry_by_field = dict(
@@ -839,3 +826,48 @@ def test_joint_cut_refuses_unrelated_foreign_parent_changes(monkeypatch, change)
         edge["parent"][3] = 29
     with pytest.raises(ValueError, match="adoption_family_changed"):
         custody.require_source_acquisition_delta(before, after, {"owner": 23}, {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("crossed_schema", [False, True])
+async def test_dataset_plan_preserves_relationships_without_owner_hook(monkeypatch, crossed_schema):
+    from db.migration_provider_dataset_online import _expected_bulk_relationships
+    from process import provider_directory_generic_source_provision as provision
+
+    plan_by_field = {
+        "relationships": [
+            dict(
+                source_table=source_table,
+                target_table=target_table,
+                target_schema="snapshot_schema",
+                source_columns=list(source_columns),
+                target_columns=list(target_columns),
+                delete_action=action,
+            )
+            for source_table, target_table, source_columns, target_columns, action in sorted(
+                _expected_bulk_relationships()
+            )
+        ]
+    }
+    if crossed_schema:
+        plan_by_field["relationships"][0]["target_schema"] = "unselected_schema"
+    monkeypatch.setattr(provision, "_completed_legacy_dataset_plan", AsyncMock(return_value=plan_by_field))
+    catalog_by_field = {
+        "classes": [{"relname": "pd_dataset_migration_plan", "relowner": {"copied": "opaque"}}],
+        "triggers": None,
+    }
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=catalog_by_field))
+    if crossed_schema:
+        with pytest.raises(ValueError, match="dataset_relationships_changed"):
+            await custody._capture_dataset_plan(
+                connection,
+                SimpleNamespace(schema="snapshot_schema"),
+                {"roles": {"owner": 17, "builder": 18}, "functions": {}},
+            )
+        connection.fetchval.assert_not_awaited()
+    else:
+        assert await custody._capture_dataset_plan(
+            connection,
+            SimpleNamespace(schema="snapshot_schema"),
+            {"roles": {"owner": 17, "builder": 18}, "functions": {}},
+        ) == {"plan": plan_by_field, "catalog": catalog_by_field}

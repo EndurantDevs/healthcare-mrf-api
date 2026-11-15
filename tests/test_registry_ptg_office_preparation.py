@@ -240,13 +240,24 @@ def _service(monkeypatch, *, commit_failure=False):
 
     async def prepare(*args):
         calls.append("prepare")
-        return object(), "e" * 64, 1
+        return (
+            {
+                "capture_id": ID,
+                "state": "handed_off",
+                "command": {"operation": "office"},
+                "command_sha256": "e" * 64,
+                "manifest_sha256": "f" * 64,
+            },
+            "e" * 64,
+            1,
+        )
 
     monkeypatch.setattr(preparation, "registry_company_approval_transaction", transaction)
     monkeypatch.setattr(preparation, "_source_context", context)
     monkeypatch.setattr(preparation, "_authorize", authorize)
     monkeypatch.setattr(preparation, "_prepare_capture", prepare)
     monkeypatch.setattr(preparation, "_reserve_capacity", AsyncMock())
+    monkeypatch.setattr(preparation, "_retain_validation", AsyncMock())
     monkeypatch.setattr(preparation, "_reply", lambda descriptor: {"command": {"operation": "office"}})
     return service, calls
 
@@ -283,7 +294,7 @@ async def test_existing_capture_recovery_uses_reader_and_never_recreates_it(monk
         calls.append("exists")
         return None, "e" * 64, 1
 
-    read = AsyncMock(return_value=object())
+    read = AsyncMock(return_value=(object(), object()))
     monkeypatch.setattr(preparation, "_prepare_capture", exists)
     monkeypatch.setattr(preparation, "_read_capture", read)
     monkeypatch.setattr(preparation, "_checked_selection", lambda descriptor, *args: descriptor)
@@ -308,7 +319,7 @@ async def test_read_recovers_under_reader_and_fresh_authority(monkeypatch):
     service, calls = _service(monkeypatch)
     document = envelope()
     document["selector"] = {name: document["selector"][name] for name in contract._HANDLES}
-    read_capture = AsyncMock(return_value=object())
+    read_capture = AsyncMock(return_value=(object(), object()))
     monkeypatch.setattr(preparation, "_read_capture", read_capture)
     await service.read(document)
     assert calls == ["reader", "context", "authorize-source", "authorize-office", "commit"]
@@ -362,22 +373,24 @@ async def test_authorization_binds_original_actor_and_command():
 
 
 @pytest.mark.asyncio
-async def test_recovery_checks_custody_before_manifest(monkeypatch):
+async def test_recovery_requires_real_frozen_phase_before_descriptor(monkeypatch):
     calls = []
 
     async def fetch(*args):
         calls.append("manifest")
         return None
 
-    async def custody(*args):
-        calls.append("custody")
+    async def frozen(*args, **kwargs):
+        calls.append("frozen")
 
     driver = SimpleNamespace(execute=AsyncMock(), fetchval=fetch)
     monkeypatch.setattr(capture, "_office_driver", AsyncMock(return_value=driver))
-    monkeypatch.setattr(capture, "_custody", custody)
+    monkeypatch.setattr(preparation, "require_office_preparation_frozen", frozen)
     with pytest.raises(ValueError, match="manifest_changed"):
-        await preparation._read_capture(object(), object(), selector(), RegistryPTGGraphReadBudget(1024))
-    assert calls == ["custody", "manifest"]
+        await preparation._read_capture(
+            object(), SimpleNamespace(control_schema="synthetic_control"), selector(), RegistryPTGGraphReadBudget(1024)
+        )
+    assert calls == ["frozen", "manifest"]
 
 
 def test_produced_rows_match_compiled_native_codec():
@@ -413,7 +426,7 @@ def test_produced_rows_match_compiled_native_codec():
 
 
 @pytest.mark.asyncio
-async def test_installed_sessions_require_distinct_roles_same_database():
+async def test_installed_sessions_use_configured_roles_without_database_identity():
     from dataclasses import replace
 
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -438,8 +451,8 @@ async def test_installed_sessions_require_distinct_roles_same_database():
         )
         service = preparation.RegistryPTGOfficePreparationService(scope, async_sessionmaker(engines[1]))
         assert service.scope_service is scope
-        with pytest.raises(ValueError, match="service_unconfigured"):
-            preparation.RegistryPTGOfficePreparationService(scope, async_sessionmaker(engines[2]))
+        copied_service = preparation.RegistryPTGOfficePreparationService(scope, async_sessionmaker(engines[2]))
+        assert copied_service.scope_service is scope
         with pytest.raises(ValueError, match="service_unconfigured"):
             preparation.RegistryPTGOfficePreparationService(scope, scope.reader_sessions)
     finally:
@@ -486,7 +499,8 @@ async def test_capacity_uses_fresh_reader_with_owner_lock(monkeypatch, families,
         == "SELECT pg_catalog.set_config('search_path','pg_catalog,pg_temp',true)"
     )
     assert not reader_driver.execute.await_count
-    assert "SELECT pg_catalog.count(*)" in reader_driver.fetchrow.await_args.args[0]
+    assert "FROM hp_snapshot_retention.preparation" in reader_driver.fetchrow.await_args.args[0]
+    assert reader_driver.fetchrow.await_args.args[1:] == (context.control_schema, UUID(ID))
 
 
 @pytest.mark.asyncio
@@ -513,3 +527,132 @@ async def test_capacity_lock_covers_owner_across_control_schemas(monkeypatch):
         )
     keys = [call.args[1] for call in publisher_driver.fetchval.await_args_list]
     assert keys[0] == keys[1] and keys[0] != keys[2]
+
+
+def _persisted_named_office():
+    """Use produced reviewed-office rows and their real canonical new-format manifest."""
+    from process import registry_ptg_published_office_scope as published
+    from tests.test_registry_ptg_office_capture import _adoption_receipt, _request
+    from tests.test_registry_ptg_office_witness import _Driver, _prepared
+    from tests.test_registry_ptg_published_office_capture import _fixture
+
+    _, context, document = _fixture()
+    scope_by_field = published._office_scope(document, context.graph_identity, [0])
+    selected = selector()
+    selected.update(
+        scope_id=scope_by_field["scope_id"],
+        client_id=scope_by_field["client_id"],
+        scope_approval_sha256=scope_by_field["approval_sha256"],
+    )
+    selected_by_field = selected_record()
+    fields = producer._site(selected_by_field, selected["selections"][0], selected["retained_generation_id"], 1)
+    office_rows = [producer._office_row(selected_by_field, fields, scope_by_field, selected, 1)]
+    request = _request(office_rows)
+    from dataclasses import replace
+
+    request = replace(
+        request,
+        reason=selected["reason"],
+        idempotency_key=selected["idempotency_key"],
+        office_evidence_kind="reviewed_exact_office",
+    )
+    _, _, serving, _ = _prepared(office_rows)
+    digest = hashlib.sha256()
+    retained_identity = capture._retained_accounting(_adoption_receipt(office_rows), office_rows, digest, None)
+    accounting_by_field = {
+        "input_row_count": len(office_rows),
+        "canonical_input_sha256": request.canonical_input_sha256,
+        "retained_site_rows_sha256": digest.hexdigest(),
+        "retained_site_identity": retained_identity,
+    }
+    manifest = capture._prepared_capture_manifest(
+        request, scope_by_field, serving, accounting_by_field, capture._digest(selected)
+    )
+    manifest_sha256 = capture._digest(manifest)
+    schema = "registry_ptg_office_" + request.capture_id.hex
+    descriptor = capture.RegistryPTGOfficeCaptureDescriptor(
+        request.capture_id,
+        schema,
+        manifest_sha256,
+        capture._canonical(manifest),
+        capture._canonical(capture.office_storage(schema, manifest_sha256)),
+    )
+    return _Driver(office_rows, descriptor), request, selected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "rows", "manifest", "columns", "capture"])
+async def test_named_loader_requires_persisted_manifest_layout_and_actual_rows(change):
+    driver, request, _ = _persisted_named_office()
+    if change == "rows":
+        driver.rows.clear()
+    elif change == "manifest":
+        driver.manifest_changed = True
+    elif change == "columns":
+        fetch = driver.fetch
+
+        async def changed_columns(query, *arguments):
+            values = await fetch(query, *arguments)
+            return values[:-1] if "FROM pg_attribute" in query else values
+
+        driver.fetch = changed_columns
+    candidate_id = str(UUID(int=900)) if change == "capture" else str(request.capture_id)
+    if change:
+        with pytest.raises(ValueError, match="manifest_changed|layout_invalid|accounting_invalid"):
+            await preparation.load_named_office_preparation(driver, candidate_id, control_schema="synthetic_control")
+    else:
+        document = await preparation.load_named_office_preparation(
+            driver, candidate_id, control_schema="synthetic_control"
+        )
+        assert document["kind"] == "office" and document["candidate_id"] == candidate_id
+        assert document["tables"] == capture.office_storage(driver.descriptor.schema_name)["tables"]
+        assert document["snapshot"]["input_row_count"] == len(driver.rows)
+        assert "custody" not in capture._canonical(document).decode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["handed_off", "frozen", "validated"])
+async def test_same_capture_resume_uses_recorded_request_without_producing_again(monkeypatch, state):
+    driver, request, selected = _persisted_named_office()
+    fetchval = driver.fetchval
+
+    async def lifecycle_value(query, *arguments):
+        if "pg_try_advisory_xact_lock" in query:
+            return True
+        if query.startswith("SELECT state FROM"):
+            return state
+        if "manifest_json->'command'" in query:
+            return json.loads(driver.descriptor.manifest_json)["command"]
+        return await fetchval(query, *arguments)
+
+    driver.fetchval = lifecycle_value
+    monkeypatch.setattr(capture, "_office_driver", AsyncMock(return_value=driver))
+    produce = AsyncMock(side_effect=AssertionError("resumed office rows were fetched again"))
+    copy = AsyncMock(side_effect=AssertionError("resumed office rows were copied again"))
+    monkeypatch.setattr(preparation, "produce_reviewed_office_rows", produce)
+    monkeypatch.setattr(capture, "prepare_registry_ptg_office_capture", copy)
+    context = SimpleNamespace(control_schema="synthetic_control")
+    pending, digest, count = await preparation._prepare_capture(
+        object(), context, selected, RegistryPTGGraphReadBudget(1024)
+    )
+    assert digest is None and count is None
+    assert pending is None if state != "handed_off" else pending["state"] == "handed_off"
+    selected["selections"][0]["binding_revision"] += 1
+    with pytest.raises(ValueError, match="idempotency_conflict"):
+        await preparation._prepare_capture(object(), context, selected, RegistryPTGGraphReadBudget(1024))
+    produce.assert_not_awaited()
+    copy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_abandoned_capture_refuses_before_manifest_or_producer_fetch(monkeypatch):
+    driver = SimpleNamespace(fetchval=AsyncMock(side_effect=[True, "abandoned"]))
+    monkeypatch.setattr(capture, "_office_driver", AsyncMock(return_value=driver))
+    manifest = AsyncMock(side_effect=AssertionError("abandoned candidate inspected"))
+    produce = AsyncMock(side_effect=AssertionError("abandoned source regenerated"))
+    monkeypatch.setattr(preparation, "load_named_office_preparation", manifest)
+    monkeypatch.setattr(preparation, "produce_reviewed_office_rows", produce)
+    with pytest.raises(ValueError, match="preparation_abandoned"):
+        await preparation._prepare_capture(object(), object(), selector(), RegistryPTGGraphReadBudget(1024))
+    manifest.assert_not_awaited()
+    produce.assert_not_awaited()

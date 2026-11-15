@@ -93,15 +93,12 @@ def _native_indexes(phase):
     names = [] if phase == "heap" else [build if phase == "build" else primary]
     if phase == "bucket":
         names.append(bucket)
-    indexes = [
-        dict(relation_oid=100, index_name=name, index_oid=101 + n, reloptions=[]) for n, name in enumerate(names)
-    ]
+    indexes = [dict(index_name=name, reloptions=[]) for name in names]
     constraints = (
         []
         if phase in {"heap", "build"}
         else [
             dict(
-                relation_oid=100,
                 constraint_type="p",
                 condeferrable=False,
                 condeferred=False,
@@ -119,10 +116,8 @@ def _native_indexes(phase):
     for index in indexes:
         is_bucket = index["index_name"] == bucket
         native_by_name[index["index_name"]] = dict(
-            table_oid=100,
             table_kind="r",
             table_persistence="u",
-            index_oid=index["index_oid"],
             index_am="btree",
             indnatts=2,
             indnkeyatts=2,
@@ -153,7 +148,7 @@ async def test_exact_prior_index_prefix_is_authenticated(monkeypatch, phase):
         return native_by_name[name]
 
     monkeypatch.setattr(fhir, "_profile_bucket_index_row", row)
-    await fhir._artifact_scope_recovery_index_phase("fixture", relation, 100, model, indexes, constraints)
+    await fhir._artifact_scope_recovery_index_phase("fixture", relation, model, indexes, constraints)
 
 
 @pytest.mark.parametrize("is_attached", [False, True])
@@ -170,31 +165,33 @@ def test_source_recovery_primary_key_requires_native_absent_second_key(is_attach
 
 
 @pytest.mark.parametrize(
-    "fault", ["extra", "definition", "invalid", "constraint", "options", "oid", "bucket_before_pk"]
+    "fault", ["extra", "definition", "invalid", "constraint", "options", "duplicate", "bucket_before_pk"]
 )
 async def test_changed_prior_index_or_constraint_is_refused(monkeypatch, fault):
     model, relation, indexes, constraints, native_by_name = _native_indexes("bucket")
-    if fault == "extra":
-        indexes.append(dict(relation_oid=100, index_name="foreign", index_oid=999, reloptions=[]))
-    elif fault == "constraint":
-        constraints[0]["condeferrable"] = True
-    elif fault == "options":
-        indexes[0]["reloptions"] = ["fillfactor=80"]
-    elif fault == "bucket_before_pk":
-        indexes.pop(0)
-        constraints.clear()
-    else:
-        first = native_by_name[indexes[0]["index_name"]]
-        first[{"definition": "second_key", "invalid": "indisvalid", "oid": "table_oid"}[fault]] = {
-            "definition": "other_id",
-            "invalid": False,
-            "oid": 999,
-        }[fault]
+    match fault:
+        case "extra":
+            indexes.append(dict(index_name="foreign", reloptions=[]))
+        case "duplicate":
+            indexes.append(dict(indexes[0]))
+        case "constraint":
+            constraints[0]["condeferrable"] = True
+        case "options":
+            indexes[0]["reloptions"] = ["fillfactor=80"]
+        case "bucket_before_pk":
+            indexes.pop(0)
+            constraints.clear()
+        case _:
+            first = native_by_name[indexes[0]["index_name"]]
+            first[{"definition": "second_key", "invalid": "indisvalid"}[fault]] = {
+                "definition": "other_id",
+                "invalid": False,
+            }[fault]
     monkeypatch.setattr(
         fhir, "_profile_bucket_index_row", AsyncMock(side_effect=lambda _s, _t, name, _r: native_by_name[name])
     )
     with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale):
-        await fhir._artifact_scope_recovery_index_phase("fixture", relation, 100, model, indexes, constraints)
+        await fhir._artifact_scope_recovery_index_phase("fixture", relation, model, indexes, constraints)
 
 
 def test_actual_signed_control_ledger_accepts_nine_then_twenty_only():

@@ -3,6 +3,7 @@
 
 import importlib
 import importlib.util
+import json
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -14,9 +15,14 @@ import pytest
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.schema import MetaData
 
-from db.models.system import ImportRun, ProviderDirectoryProfileCapacityLeaseConsumption
+from db.models.system import (
+    ImportRun,
+    ProviderDirectoryProfileBuildCheckpoint,
+    ProviderDirectoryProfileCapacityLeaseConsumption,
+)
 from process import provider_directory_cms_nonprofile_capacity as capacity
 from process import provider_directory_profile_capacity as profile_capacity
+from process import provider_directory_profile_capacity_preflight_contract as preflight
 from process import provider_directory_profile_initial as initial
 from process import provider_directory_profile_initial_contract as initial_contract
 from process.provider_directory_profile_capacity_attestation import (
@@ -143,6 +149,93 @@ async def _assert_native_conflicts(database, schema, run_id, table, nonprofile):
             await database.status(statement)
 
 
+def _quiescence_authorities(nonce="33" * 32):
+    """Authenticate independent CMS and paired Profile receipts through current leases."""
+    from process import provider_directory_cms_capacity_contract as cms
+    from tests.provider_directory_cms_capacity_test_support import cms_guard, cms_plan, rehash_guard, sign_guard
+
+    plan = cms_plan()[0]
+    guard = cms_guard(plan)
+    guard["control_plane_request"]["signing_intent"]["request_nonce"] = nonce
+    guard["control_plane_receipt"]["request_nonce"] = nonce
+    guard["healthcare_request"]["signing_guard"]["request_nonce"] = nonce
+    guard["healthcare_receipt"]["request_nonce"] = nonce
+    rehash_guard(guard)
+    own = _verify(sign_guard(guard, cms=True), expected_capacity_geometry_hash=plan.capacity_geometry_hash)
+    paired_envelope = guard["healthcare_request"][cms.CMS_ADMISSION_FIELD]["paired_profile_lease"]
+    paired = _verify(
+        paired_envelope, expected_capacity_geometry_hash=paired_envelope["lease"]["capacity_geometry_hash"]
+    )
+    return own, paired
+
+
+async def _quiescence_schema(monkeypatch, database, schema):
+    """Install existing control tables and immutable guards for the real aggregate query."""
+    from tests.test_provider_directory_profile_capacity_preflight_postgres import _prepare_receipt_schema
+
+    await _prepare_receipt_schema(monkeypatch, database, schema)
+    for model in (ImportRun, ProviderDirectoryProfileBuildCheckpoint):
+        await database.create_table(model.__table__.to_metadata(MetaData(), schema=schema))
+    path = Path(__file__).resolve().parents[1] / "alembic/versions/20261001100000_profile_failed_cleanup_claim.py"
+    spec = importlib.util.spec_from_file_location("cleanup_claim_test_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    recorder = _OperationsRecorder()
+    migration.op = recorder
+    migration.upgrade()
+    for statement in recorder.statements:
+        await database.status(statement)
+
+
+async def _insert_authenticated_preflight(database, schema, lease, *, drift=None):
+    """Retain an authenticated body, or a separately corrupted pending-row preimage."""
+    from tests.test_provider_directory_profile_capacity_preflight_postgres import _insert_receipt
+
+    guard = lease.signing_preflight_guard
+    request = preflight.validated_capacity_preflight_request(guard["healthcare_request"])
+    receipt = guard["healthcare_receipt"]
+    values = fhir._profile_capacity_preflight_receipt_values(request, receipt, issued_at=lease.issued_at)
+    if drift == "body":
+        values["receipt_json"] = json.dumps(
+            {**receipt, "quiescence": {**receipt["quiescence"], "active_profile_run_count": 1}}
+        )
+    elif drift in {"request_sha256", "receipt_sha256"}:
+        values[drift] = "ff" * 32
+    await _insert_receipt(database, schema, values)
+    return receipt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", ["pair", "own_only", "third", "body", "request_sha256", "receipt_sha256"])
+async def test_native_quiescence_exempts_only_exact_authenticated_pair(monkeypatch, pending):
+    """Only both authenticated pending receipts match the native three-part exemption."""
+    from tests.test_provider_directory_dataset_artifact_db import _dataset_database
+
+    monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
+    own, paired = _quiescence_authorities()
+    async with _dataset_database(monkeypatch) as (database, schema):
+        await _quiescence_schema(monkeypatch, database, schema)
+        own_receipt = await _insert_authenticated_preflight(database, schema, own, drift=pending)
+        paired_receipt = await _insert_authenticated_preflight(database, schema, paired)
+        if pending == "third":
+            await _insert_authenticated_preflight(database, schema, _quiescence_authorities("44" * 32)[0])
+        verified = (own_receipt,) if pending == "own_only" else (own_receipt, paired_receipt)
+        argument_by_name = dict(
+            observed_at=VALIDATION_TIME, request_sha256=own_receipt["request_sha256"], verified_receipts=verified
+        )
+        if pending == "pair":
+            observed, digest = await fhir._profile_capacity_quiescence(schema, **argument_by_name)
+            assert observed["outstanding_preflight_receipt_count"] == 0
+            assert digest == preflight.preflight_domain_sha256(fhir.CAPACITY_QUIESCENCE_DIGEST_DOMAIN, observed)
+        else:
+            with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match="preflight_not_quiescent"):
+                await fhir._profile_capacity_quiescence(schema, **argument_by_name)
+        table = fhir._profile_capacity_preflight_receipt_ref(schema)
+        assert await database.scalar(f"SELECT count(*) FROM {table} WHERE consumed_at IS NULL;") == (
+            3 if pending == "third" else 2
+        )
+
+
 @pytest.mark.asyncio
 async def test_profile_wal_offset_retains_admission_spend(monkeypatch):
     admission = SimpleNamespace(initial_wal_lsn="0/20", initial_wal_offset_bytes=73)
@@ -264,6 +357,16 @@ def _resume_geometry(initial_mode):
         if initial_mode
         else _bounded_geometry()[0]
     )
+    execution = _selection(geometry.profile_as_of)
+    source_pairs = tuple((pair["source_id"], pair["dataset_id"]) for pair in execution.attestation.pairs)
+    geometry = replace(
+        geometry,
+        selection_proof_id=execution.attestation.proof_id,
+        profile_input_digest=execution.attestation.profile_input_digest,
+        profile_schema_version=execution.attestation.profile_schema_version,
+        profile_strategy_version=execution.attestation.profile_strategy_version,
+        desired_source_vector_hash=fhir._provider_directory_profile_source_vector_hash(source_pairs),
+    )
     plan = _control_wal_plan_input(admission_row_lock_count=fhir.PROVIDER_DIRECTORY_PROFILE_ADMISSION_ROW_LOCK_COUNT)
     geometry = replace(geometry, control_wal_plan_input_hash=profile_capacity.profile_control_wal_plan_input_hash(plan))
     projection = profile_capacity.project_profile_control_wal_capacity(geometry, plan)
@@ -295,34 +398,22 @@ def _resume_source_identity(geometry, initial_mode):
         current_source_context_vector_hash=geometry.current_context_vector_hash,
         desired_source_context_vector_hash=geometry.desired_context_vector_hash,
         removed_source_ids=(),
-        serving_state=None if initial_mode else _serving_state_for_identity(20001, 20002),
+        serving_state=None
+        if initial_mode
+        else _serving_state_for_identity(geometry.relations["profile_target"]["schema"]),
     )
 
 
 def _resume_authority(geometry, execution, initial_mode):
     """Verify a real synthetic signature without issuing a runtime reservation."""
-    database_identity = SimpleNamespace(
-        database_name=geometry.database_name,
-        database_oid=geometry.database_oid,
-        database_system_identifier=geometry.database_system_identifier,
-        tablespace_oid=geometry.tablespace_oid,
-        tablespace_name=geometry.tablespace_name,
-        temp_tablespace_oid=geometry.tablespace_oid,
-        temp_tablespace_name=geometry.tablespace_name,
-    )
     if initial_mode:
-        envelope, _receipt = signed_initial_envelope(geometry, database_identity, _target(), execution, VALIDATION_TIME)
+        envelope, _receipt = signed_initial_envelope(geometry, SimpleNamespace(), _target(), execution, VALIDATION_TIME)
     else:
-        envelope = _capacity_envelope(
-            profile_capacity.capacity_geometry_hash(geometry), database_identity, VALIDATION_TIME
-        )
+        envelope = _capacity_envelope(geometry, execution, VALIDATION_TIME)
     lease = _verify(
         envelope,
         trust=capacity_trust_from_envelope(envelope),
         expected_capacity_geometry_hash=profile_capacity.capacity_geometry_hash(geometry),
-        expected_database_name=geometry.database_name,
-        expected_database_oid=geometry.database_oid,
-        expected_database_system_identifier=geometry.database_system_identifier,
     )
     return replace(execution, capacity_attestation=envelope), lease
 
@@ -334,7 +425,9 @@ async def _admitted_resume_fixture(monkeypatch, initial_mode):
     source_identity = _resume_source_identity(geometry, initial_mode)
     execution, lease = _resume_authority(geometry, _selection(geometry.profile_as_of), initial_mode)
     admission_state = (
-        initial_contract.InitialTargets(20001, 20002, _target()) if initial_mode else source_identity.serving_state
+        initial_contract.InitialTargets(targets=_target()["targets"], payload=_target())
+        if initial_mode
+        else source_identity.serving_state
     )
     database_identity = SimpleNamespace(wal_lsn="0/10")
     template, _ = _resume_fixture()
@@ -376,7 +469,7 @@ async def _admitted_resume_fixture(monkeypatch, initial_mode):
 
 
 def _install_initial_resume_observations(monkeypatch, target, geometry):
-    """Keep physical observations replaceable while retaining the production state comparison."""
+    """Observe named targets while retaining the production state comparison."""
     monkeypatch.setattr(fhir, "_lock_profile_capacity_preflight_state", AsyncMock())
     monkeypatch.setattr(initial, "capture_targets", AsyncMock(return_value=target))
     monkeypatch.setattr(
@@ -384,8 +477,8 @@ def _install_initial_resume_observations(monkeypatch, target, geometry):
         "receipt_layout",
         AsyncMock(
             return_value=SimpleNamespace(
-                relation_oid=getattr(geometry, "initial_receipt_oid", None),
-                exact_fingerprint=getattr(geometry, "initial_receipt_storage_fingerprint", None),
+                schema_name=geometry.relations.get("initial_receipt", {}).get("schema"),
+                relation_name=geometry.relations.get("initial_receipt", {}).get("name"),
             )
         ),
     )
@@ -458,27 +551,23 @@ async def test_admitted_profile_pause_resume_keeps_signed_identity(monkeypatch, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["target_oid", "target_fingerprint", "receipt_oid", "receipt_fingerprint"])
+@pytest.mark.parametrize("drift", ["target_schema", "target_name", "receipt_schema", "receipt_name"])
 async def test_initial_resume_refuses_fresh_locked_target_or_receipt_drift(monkeypatch, drift):
-    """Changed physical identities cannot reuse the original signed initial admission."""
+    """Changed qualified names cannot reuse the original signed initial admission."""
     paused, execution = await _admitted_resume_fixture(monkeypatch, True)
     original = paused.admission
     if drift.startswith("target"):
         target = original.admitted_identity.initial_targets
-        payload = dict(target.payload)
-        if drift == "target_oid":
-            payload["profile_target_oid"] += 1
-        else:
-            payload["profile_target_storage_fingerprint"] = "ee" * 32
+        target_by_role = {
+            **target.targets,
+            "profile": {**target.targets["profile"], drift.removeprefix("target_"): "changed"},
+        }
         initial.capture_targets.return_value = replace(
-            target, profile_target_oid=payload["profile_target_oid"], payload=payload
+            target, targets=target_by_role, payload={**target.payload, "targets": target_by_role}
         )
     else:
         layout = initial.receipt_layout.return_value
-        if drift == "receipt_oid":
-            layout.relation_oid += 1
-        else:
-            layout.exact_fingerprint = "ee" * 32
+        setattr(layout, "schema_name" if drift == "receipt_schema" else "relation_name", "changed")
     with pytest.raises(RuntimeError, match="initial_target_changed"):
         await capacity.resume_profile_capacity(
             fhir, paused, execution, "fence", "resource-fence", frozenset({"Practitioner"})

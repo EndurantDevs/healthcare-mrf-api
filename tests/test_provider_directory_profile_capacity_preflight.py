@@ -21,16 +21,15 @@ from process import provider_directory_profile_capacity_preflight_contract as co
 from process import provider_directory_profile_capacity_runtime as capacity_runtime
 from process import provider_directory_profile_runtime_observation as runtime
 from process import provider_directory_profile_selection as selection
-from tests.test_provider_directory_profile_capacity import _geometry_payload
-from tests.test_provider_directory_profile_capacity_runtime import _limits_payload
+from tests.provider_directory_profile_capacity_runtime_test_support import (
+    PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION,
+)
 from tests.provider_directory_profile_capacity_signing_guard_test_support import (
     SYNTHETIC_PROFILE_SOURCE_ID,
     synthetic_profile_execution,
 )
-from tests.provider_directory_profile_capacity_runtime_test_support import (
-    PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION,
-)
-
+from tests.test_provider_directory_profile_capacity import _geometry_payload
+from tests.test_provider_directory_profile_capacity_runtime import _limits_payload
 
 importer = importlib.import_module("process.provider_directory_fhir")
 UTC = datetime.timezone.utc
@@ -43,9 +42,7 @@ def _execution_payload() -> dict[str, object]:
     return {
         **selection._GLOBAL_PROFILE_PARAMS,
         "provider_directory_profile_generation": execution.generation,
-        "provider_directory_profile_selection_attestation": (
-            execution.attestation.payload
-        ),
+        "provider_directory_profile_selection_attestation": (execution.attestation.payload),
         "provider_directory_profile_capacity_attestation": {},
     }
 
@@ -67,9 +64,7 @@ def _request_payload(**guard_overrides: object) -> dict[str, object]:
 
 
 def _request(**guard_overrides: object):
-    return contract.validated_capacity_preflight_request(
-        _request_payload(**guard_overrides)
-    )
+    return contract.validated_capacity_preflight_request(_request_payload(**guard_overrides))
 
 
 def _geometry():
@@ -103,26 +98,17 @@ def _serving_state(**overrides: object):
         "profile_schema_version": profile_artifact.PROFILE_SCHEMA_VERSION,
         "profile_strategy_version": (profile_artifact.PROFILE_BUILD_STRATEGY_VERSION),
         "source_vector": source_vector,
-        "source_vector_hash": (
-            importer._provider_directory_profile_source_vector_hash(source_vector)
-        ),
+        "source_vector_hash": (importer._provider_directory_profile_source_vector_hash(source_vector)),
         "source_context_vector": context_vector,
-        "source_context_vector_hash": (
-            importer._provider_directory_profile_source_context_vector_hash(
-                context_vector
-            )
-        ),
+        "source_context_vector_hash": (importer._provider_directory_profile_source_context_vector_hash(context_vector)),
         "executable_plan_hash": "5" * 64,
-        "evidence_target_oid": 20_001,
-        "profile_target_oid": 20_002,
+        "targets": importer._provider_directory_profile_target_coordinates("fixture"),
         "evidence_rows": 67,
         "profile_rows": 45,
         "profile_as_of": "2026-08-09",
         "published_at": "2026-08-09T08:00:00+00:00",
     }
-    return importer._ProviderDirectoryProfileServingState(
-        **{**state_by_field, **overrides}
-    )
+    return importer._ProviderDirectoryProfileServingState(**{**state_by_field, **overrides})
 
 
 def _serving(resolution: str = "existing"):
@@ -166,16 +152,12 @@ def _quiescence() -> tuple[dict[str, object], str]:
 
 def _receipt_storage(**overrides: object) -> dict[str, object]:
     return {
-        "contract_id": (
-            "healthporta.provider-directory-profile-capacity-" "preflight-storage.v1"
-        ),
-        "relation_oid": 20_008,
-        "exact_fingerprint": "6" * 64,
-        "structural_fingerprint": "7" * 64,
-        "main_index_pages": [1, 1, 1, 1],
-        "toast_index_pages": [1],
+        "contract_id": "healthporta.provider-directory-profile-capacity-preflight-storage.v2",
+        "schema": "fixture",
+        "name": "provider_directory_profile_capacity_preflight_receipt",
+        "main_index_pages": [2, 2, 2, 2],
+        "toast_index_pages": [2],
         "toastable_column_count": 1,
-        "effective_tablespace_oids": [1663],
         **overrides,
     }
 
@@ -207,9 +189,7 @@ def _receipt():
         issued_at=ISSUED_AT,
         observed_at=ISSUED_AT,
     )
-    return importer._provider_directory_profile_capacity_preflight_receipt(
-        request, context
-    )
+    return importer._provider_directory_profile_capacity_preflight_receipt(request, context)
 
 
 def test_request_binds_closed_limits_and_exact_v6_source_delta_identity(
@@ -218,13 +198,8 @@ def test_request_binds_closed_limits_and_exact_v6_source_delta_identity(
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
     request = _request()
 
-    assert request.execution.attestation.profile_strategy_version == (
-        profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
-    )
-    assert (
-        contract.profile_execution_identity_payload(request)["materialization_mode"]
-        == "source_delta"
-    )
+    assert request.execution.attestation.profile_strategy_version == (profile_artifact.PROFILE_BUILD_STRATEGY_VERSION)
+    assert contract.profile_execution_identity_payload(request)["materialization_mode"] == "source_delta"
     assert request.limits_payload == _limits_payload()
     assert request.limits_sha256 == contract.capacity_limits_sha256(_limits_payload())
     assert request.request_sha256 == contract.preflight_domain_sha256(
@@ -234,9 +209,7 @@ def test_request_binds_closed_limits_and_exact_v6_source_delta_identity(
     contract.assert_preflight_expiry(request, issued_at=ISSUED_AT)
 
     changed_payload = _request_payload()
-    changed_payload["provider_directory_profile_capacity_limits"][
-        "minimum_remaining_bytes"
-    ] += 1
+    changed_payload["provider_directory_profile_capacity_limits"]["minimum_remaining_bytes"] += 1
     changed = contract.validated_capacity_preflight_request(changed_payload)
     assert changed.limits_sha256 != request.limits_sha256
     assert changed.request_sha256 != request.request_sha256
@@ -249,9 +222,7 @@ def test_request_rejects_open_or_noncanonical_input(monkeypatch, mutation):
     if mutation == "extra":
         payload["unexpected"] = True
     elif mutation == "lease":
-        payload["profile_execution"][
-            "provider_directory_profile_capacity_attestation"
-        ] = {"lease": {}}
+        payload["profile_execution"]["provider_directory_profile_capacity_attestation"] = {"lease": {}}
     else:
         payload["signing_guard"]["expires_at"] = "2026-08-10T09:00:00+00:00"
 
@@ -269,24 +240,18 @@ def test_receipt_hash_binds_limits_quiescence_and_storage(monkeypatch):
     receipt = _receipt()
     supplied_sha256 = receipt.pop("receipt_sha256")
 
-    assert set(receipt) | {"receipt_sha256"} == (
-        importer._PROFILE_CAPACITY_PREFLIGHT_RECEIPT_FIELDS
-    )
+    assert set(receipt) | {"receipt_sha256"} == (importer._PROFILE_CAPACITY_PREFLIGHT_RECEIPT_FIELDS)
     assert supplied_sha256 == contract.preflight_domain_sha256(
         contract.CAPACITY_PREFLIGHT_CONTRACT_ID,
         receipt,
     )
-    assert receipt["capacity_limits_sha256"] == (
-        contract.capacity_limits_sha256(receipt["capacity_limits"])
-    )
+    assert receipt["capacity_limits_sha256"] == (contract.capacity_limits_sha256(receipt["capacity_limits"]))
     assert (
         receipt["profile_execution_identity"]["profile_strategy_version"]
         == profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
     )
-    assert (
-        receipt["profile_execution_identity"]["materialization_mode"] == "source_delta"
-    )
-    assert receipt["preflight_receipt_storage"]["relation_oid"] == 20_008
+    assert receipt["profile_execution_identity"]["materialization_mode"] == "source_delta"
+    assert receipt["preflight_receipt_storage"]["name"] == "provider_directory_profile_capacity_preflight_receipt"
 
 
 @pytest.mark.asyncio
@@ -306,8 +271,7 @@ async def test_missing_serving_state_projects_exact_legacy_adoption(
         source_vector=state.source_vector,
         source_context_vector=state.source_context_vector,
         profile_as_of=state.profile_as_of,
-        profile_target_oid=state.profile_target_oid,
-        evidence_target_oid=state.evidence_target_oid,
+        targets=state.targets,
         profile_rows=state.profile_rows,
         evidence_rows=state.evidence_rows,
         published_at=state.published_at,
@@ -331,7 +295,7 @@ async def test_missing_serving_state_projects_exact_legacy_adoption(
 
     assert serving.state == state
     assert serving.payload["resolution"] == "legacy_adoption"
-    assert serving.payload["profile_target_oid"] == state.profile_target_oid
+    assert serving.payload["targets"] == state.targets
     assert serving.payload_sha256 == contract.preflight_domain_sha256(
         contract.CAPACITY_SERVING_PREFLIGHT_DIGEST_DOMAIN,
         serving.payload,
@@ -352,11 +316,7 @@ async def test_missing_serving_state_without_legacy_success_fails_closed(
     monkeypatch.setattr(
         importer,
         "_profile_adoption_candidate_from_legacy",
-        AsyncMock(
-            side_effect=RuntimeError(
-                "provider_directory_profile_serving_adoption_missing"
-            )
-        ),
+        AsyncMock(side_effect=RuntimeError("provider_directory_profile_serving_adoption_missing")),
     )
 
     with pytest.raises(RuntimeError, match="serving_adoption_missing"):
@@ -448,3 +408,66 @@ async def test_exact_open_receipt_replays_and_nonce_reuse_fails(
             "mrf",
             changed_request,
         )
+
+
+@pytest.mark.asyncio
+async def test_quiescence_keeps_outstanding_ceiling_observation_and_exact_receipts(monkeypatch):
+    from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME, _golden_body
+
+    receipt = _golden_body()["signing_preflight_guard"]["healthcare_receipt"]
+    first = AsyncMock(
+        return_value={
+            "active_profile_run_count": 0,
+            "claimed_profile_checkpoint_count": 0,
+            "unexpired_capacity_consumption_count": 2,
+            "outstanding_preflight_receipt_count": 0,
+        }
+    )
+    monkeypatch.setattr(importer.db, "first", first)
+    observed, _digest = await importer._profile_capacity_quiescence(
+        "fixture",
+        observed_at=VALIDATION_TIME,
+        request_sha256=receipt["request_sha256"],
+        verified_receipts=(receipt, receipt),
+    )
+    assert observed["unexpired_capacity_consumption_count"] == 2
+    assert observed["contract_id"] == contract.CAPACITY_QUIESCENCE_CONTRACT_ID
+    assert json.loads(first.await_args.kwargs["verified_receipts"]) == [receipt]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field", ["active_profile_run_count", "claimed_profile_checkpoint_count", "outstanding_preflight_receipt_count"]
+)
+async def test_quiescence_refuses_other_active_or_pending_authority(monkeypatch, field):
+    from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME
+
+    count_by_field = {
+        name: 0
+        for name in (
+            "active_profile_run_count",
+            "claimed_profile_checkpoint_count",
+            "unexpired_capacity_consumption_count",
+            "outstanding_preflight_receipt_count",
+        )
+    }
+    count_by_field[field] = 1
+    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=count_by_field))
+    with pytest.raises(RuntimeError, match="not_quiescent"):
+        await importer._profile_capacity_quiescence("fixture", observed_at=VALIDATION_TIME, request_sha256="a" * 64)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"receipt_sha256": "0" * 64},
+        {"request_sha256": "not-a-hash"},
+        {"unknown": True},
+    ],
+)
+def test_quiescence_exemption_refuses_changed_receipt_bytes(change):
+    from tests.test_provider_directory_profile_capacity_attestation import _golden_body
+
+    receipt = _golden_body()["signing_preflight_guard"]["healthcare_receipt"]
+    with pytest.raises(RuntimeError, match="exemptions_invalid"):
+        importer._validated_quiescence_receipts(({**receipt, **change},))

@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
 
@@ -115,9 +114,7 @@ def test_provider_directory_source_selects_keep_keyable_address_and_phone_filter
     assert "COALESCE(loc.state_name, loc.state_code)" in sql
     assert "loc.postal_code" in sql
     assert "loc.address_key ~* '^[0-9a-f]{8}-" in sql
-    assert (
-        "WHEN loc.phone_number IS NOT NULL THEN loc.telephone_number" in sql
-    )
+    assert "WHEN loc.phone_number IS NOT NULL THEN loc.telephone_number" in sql
     assert "role_phone.telephone_number" in sql
     assert "loc.telephone_number::varchar AS telephone_number" in sql
     assert "pd.latitude" in sql
@@ -174,12 +171,10 @@ def test_unified_contact_aggregation_prefers_present_lower_priority_evidence():
             "fax_extension",
         ):
             assert (
-                f"ARRAY_AGG({column_name} ORDER BY ({column_name} IS NULL), "
-                "source_priority ASC"
+                f"ARRAY_AGG({column_name} ORDER BY ({column_name} IS NULL), source_priority ASC"
             ) in materialization_sql
             assert (
-                f"ARRAY_AGG({column_name} ORDER BY source_priority ASC, "
-                f"({column_name} IS NULL)"
+                f"ARRAY_AGG({column_name} ORDER BY source_priority ASC, ({column_name} IS NULL)"
             ) not in materialization_sql
 
 
@@ -238,6 +233,24 @@ def test_provider_directory_partial_scope_selects_only_current_published_dataset
     assert "ORDER BY dataset.created_at" not in sql
 
 
+@pytest.mark.parametrize(
+    ("schema", "index", "schema_literal", "index_literal"),
+    [
+        ("mrf", "scope_index", "'mrf'", "'scope_index'"),
+        ("reader's schema", "scope'index", "'reader''s schema'", "'scope''index'"),
+    ],
+)
+def test_provider_directory_partial_scope_index_sql_quotes_names(
+    schema, index, schema_literal, index_literal, monkeypatch
+):
+    monkeypatch.setattr(entity_address_unified, "PROVIDER_DIRECTORY_PARTIAL_SCOPE_INDEX", index)
+
+    sql = entity_address_unified._partial_scope_index_preflight_sql(schema)
+
+    assert f"namespace_meta.nspname = {schema_literal}" in sql
+    assert f"index_relation.relname = {index_literal}" in sql
+
+
 @pytest.mark.asyncio
 async def test_provider_directory_partial_scope_index_preflight_accepts_valid_index(monkeypatch):
     scalar = AsyncMock(return_value=True)
@@ -249,7 +262,12 @@ async def test_provider_directory_partial_scope_index_preflight_accepts_valid_in
     assert "FROM pg_catalog.pg_index AS index_meta" in sql
     assert "index_meta.indisvalid IS TRUE" in sql
     assert "index_meta.indisready IS TRUE" in sql
+    assert "index_meta.indislive IS TRUE" in sql
+    assert "index_meta.indpred IS NULL" in sql
+    assert "index_meta.indexprs IS NULL" in sql
     assert "provider_directory_address_overlay_source_run_resource_idx" in sql
+    assert "array_agg(attribute_meta.attname::text ORDER BY index_column.ordinality)" in sql
+    assert "unnest(index_meta.indkey) WITH ORDINALITY" in sql
     assert "ARRAY['source_id', 'last_seen_run_id', 'resource_type', 'resource_id']" in sql
     assert "CREATE INDEX" not in sql
 
@@ -353,13 +371,11 @@ def test_provider_directory_partial_replacement_retains_all_current_source_evide
     available = _provider_directory_fenced_available()
     base_source_selects = entity_address_unified._source_selects("mrf", available)
 
-    replacement_selects = (
-        entity_address_unified._provider_directory_partial_replacement_source_selects(
-            "mrf",
-            available,
-            base_source_selects,
-            affected_group_table="entity_address_unified_pd_groups",
-        )
+    replacement_selects = entity_address_unified._provider_directory_partial_replacement_source_selects(
+        "mrf",
+        available,
+        base_source_selects,
+        affected_group_table="entity_address_unified_pd_groups",
     )
     sql = "\n".join(replacement_selects)
 
@@ -420,23 +436,14 @@ def test_provider_directory_source_id_batches_are_bounded():
 
 def test_provider_directory_source_batch_size_accepts_task_and_env(monkeypatch):
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE", raising=False)
-    assert (
-        entity_address_unified._provider_directory_source_batch_size({})
-        == 100
-    )
+    assert entity_address_unified._provider_directory_source_batch_size({}) == 100
 
     assert (
-        entity_address_unified._provider_directory_source_batch_size(
-            {"provider_directory_source_batch_size": 4}
-        )
-        == 4
+        entity_address_unified._provider_directory_source_batch_size({"provider_directory_source_batch_size": 4}) == 4
     )
 
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROVIDER_DIRECTORY_SOURCE_BATCH_SIZE", "5")
-    assert (
-        entity_address_unified._provider_directory_source_batch_size({})
-        == 5
-    )
+    assert entity_address_unified._provider_directory_source_batch_size({}) == 5
 
 
 def test_provider_directory_source_selects_are_guarded_by_table_availability():

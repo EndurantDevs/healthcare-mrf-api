@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import sys
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -248,23 +247,35 @@ def test_candidate_controls_keep_immutable_and_chain_guards_but_reject_archive_v
 
 
 @pytest.mark.asyncio
-async def test_candidate_catalog_requires_authenticated_custody_before_absent_archive_guard(monkeypatch):
-    custody = AsyncMock()
-    monkeypatch.setitem(
-        sys.modules,
-        "process.nppes_public_evidence_control_custody",
-        SimpleNamespace(assert_nppes_control_custody=custody),
-    )
-    columns = AsyncMock(return_value=_control_columns())
+@pytest.mark.parametrize("change", [None, "columns", "constraints", "triggers"])
+async def test_candidate_catalog_requires_data_checks(monkeypatch, change):
+    columns = AsyncMock(return_value=[] if change == "columns" else _control_columns())
     monkeypatch.setattr(catalog, "_column_records", columns)
-    monkeypatch.setattr(catalog, "_candidate_constraints", AsyncMock(return_value=_control_constraints()))
-    monkeypatch.setattr(catalog, "_trigger_records", AsyncMock(return_value=_control_triggers()))
-    connection, policy = object(), object()
-    await catalog.assert_nppes_candidate_catalog(connection, "source_schema", policy)
-    custody.assert_awaited_once_with(connection, "source_schema", policy)
-    custody.side_effect = RuntimeError("untrusted custody")
-    columns.reset_mock()
-    with pytest.raises(catalog.writer_error().__class__, match="nppes_public_evidence_writer_invalid"):
+    monkeypatch.setattr(
+        catalog,
+        "_candidate_constraints",
+        AsyncMock(return_value=[] if change == "constraints" else _control_constraints()),
+    )
+    monkeypatch.setattr(
+        catalog, "_trigger_records", AsyncMock(return_value=[] if change == "triggers" else _control_triggers())
+    )
+    connection = SimpleNamespace(is_in_transaction=lambda: True)
+    policy = SimpleNamespace(schema="source_schema")
+    if change is None:
+        await catalog.assert_nppes_candidate_catalog(connection, "source_schema", policy)
+    else:
+        with pytest.raises(catalog.writer_error().__class__, match="nppes_public_evidence_writer_invalid"):
+            await catalog.assert_nppes_candidate_catalog(connection, "source_schema", policy)
+    columns.assert_awaited_once_with(connection, "source_schema", catalog._CONTROL_COLUMNS)
+
+
+@pytest.mark.parametrize("change", ["schema", "transaction"])
+async def test_candidate_scope_precedes_data_reads(monkeypatch, change):
+    columns = AsyncMock()
+    monkeypatch.setattr(catalog, "_column_records", columns)
+    connection = SimpleNamespace(is_in_transaction=lambda: change != "transaction")
+    policy = SimpleNamespace(schema="other_schema" if change == "schema" else "source_schema")
+    with pytest.raises(catalog.writer_error().__class__):
         await catalog.assert_nppes_candidate_catalog(connection, "source_schema", policy)
     columns.assert_not_awaited()
 

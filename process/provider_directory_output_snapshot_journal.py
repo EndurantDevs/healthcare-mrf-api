@@ -6,11 +6,9 @@ from dataclasses import replace
 
 import asyncpg
 
-from db.migration_provider_directory_dataset_candidates import TABLES, candidate_functions
+from db.migration_provider_directory_dataset_candidates import TABLES
 from db.plan_release_storage import storage_relation
 from process import provider_directory_output_snapshot_custody as custody
-from process.plan_release_storage_custody import storage_roles
-from process.provider_directory_cms_routine_settings import approved_cms_routine_settings
 from process.provider_directory_output_snapshot_catalog import (
     OUTPUT_CATALOG_SQL,
     OUTPUT_ROOTS,
@@ -96,7 +94,8 @@ def _entry(digest, entry_by_field):
             stage = OutputStage.from_payload(entry_by_field["stages"][receipt.incumbent.target]["stage"])
             _require(
                 stage.incumbent == receipt.incumbent
-                and stage.oid == receipt.successor.oid
+                and stage.schema == receipt.successor.schema
+                and stage.target == receipt.successor.target
                 and stage.relation == receipt.successor.relation,
                 "prepared_changed",
             )
@@ -146,12 +145,12 @@ def _journal(plan):
         and set(plan["tables"]) == set(TABLES),
         "plan_changed",
     )
-    journal = plan.get(_KEY, {"protocol": 1, "operations": {}})
+    journal = plan.get(_KEY, {"protocol": 2, "operations": {}})
     _require(
         type(journal) is dict
         and set(journal) == {"protocol", "operations"}
         and type(journal["protocol"]) is int
-        and journal["protocol"] == 1
+        and journal["protocol"] in (1, 2)
         and type(journal["operations"]) is dict,
         "invalid",
     )
@@ -164,11 +163,6 @@ def _require_plan_layout(catalog_entry, owner):
     topology, columns = decoded(catalog_entry["topology"]), decoded(catalog_entry["columns"])
     _require(
         catalog_entry["relname"] == PLAN_ROOT
-        and catalog_entry["relowner"] == owner
-        and catalog_entry["acl_closed"]
-        and catalog_entry["readers_closed"]
-        and catalog_entry["readers_select"]
-        and not decoded(catalog_entry["acl"])["columns"]
         and topology["kind"] == "r"
         and topology["persistence"] == "p"
         and not topology["partition"]
@@ -176,13 +170,11 @@ def _require_plan_layout(catalog_entry, owner):
         and not topology["force_rls"]
         and not topology["parents"]
         and not topology["children"]
-        and topology["hooks"] == 1
         and topology["rules"] == 0,
         "custody_changed",
     )
     _require(
-        [(column["name"], column["type"], column["type_oid"]) for column in columns]
-        == [("singleton", "boolean", 16), ("plan", "jsonb", 3802)]
+        [(column["name"], column["type"]) for column in columns] == [("singleton", "boolean"), ("plan", "jsonb")]
         and all(
             column["required"]
             and column["default"] is None
@@ -216,8 +208,7 @@ def _require_plan_indexes(catalog_entry, owner):
     _require(
         len(indexes) == 1
         and all(
-            index["owner"] == owner
-            and index["method"] == "btree"
+            index["method"] == "btree"
             and index["primary"]
             and index["unique"]
             and index["valid"]
@@ -242,51 +233,9 @@ async def _plan(capability):
         custody._operation_digest(capability.operation, capability.targets) == capability.operation_digest,
         "operation_changed",
     )
-    owner, readers = await storage_roles(
-        capability.connection, capability.policy.schema, **capability.policy.role_arguments()
-    )
-    catalog_entries = await capability.connection.fetch(
-        OUTPUT_CATALOG_SQL, capability.policy.schema, [PLAN_ROOT], owner, readers
-    )
-    _require(len(catalog_entries) == 1, "missing")
-    _require_plan_layout(catalog_entries[0], owner)
-    hooks = await capability.connection.fetch(
-        "SELECT t.tgname,t.tgtype,t.tgenabled::text,t.tgisinternal,t.tgconstraint,t.tgargs,t.tgqual::text,"
-        "t.tgoldtable,t.tgnewtable,p.proname,n.nspname,p.prosrc,p.prosecdef,p.proconfig,p.pronargs,"
-        "p.prorettype='pg_catalog.trigger'::regtype AS trigger_result,l.lanname,"
-        "r.rolname AS function_owner,(SELECT amname FROM pg_class c JOIN pg_am a ON a.oid=c.relam "
-        "WHERE c.oid=t.tgrelid) AS table_method FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid "
-        "JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_roles r ON r.oid=p.proowner "
-        "JOIN pg_language l ON l.oid=p.prolang WHERE t.tgrelid=$1::oid",
-        catalog_entries[0]["oid"],
-    )
-    expected_body = candidate_functions(capability.policy.schema).split("$fn$", 2)[1]
-    _require(
-        len(hooks) == 1
-        and all(
-            hook["tgname"] == "pd_dataset_plan_owner"
-            and hook["tgtype"] == 62
-            and hook["tgenabled"] == "A"
-            and not hook["tgisinternal"]
-            and hook["tgconstraint"] == 0
-            and not hook["tgargs"]
-            and hook["tgqual"] is None
-            and hook["tgoldtable"] is None
-            and hook["tgnewtable"] is None
-            and hook["proname"] == "guard_pd_dataset_migration_owner"
-            and hook["nspname"] == capability.policy.schema
-            and hook["prosrc"] == expected_body
-            and not hook["prosecdef"]
-            and hook["proconfig"] in approved_cms_routine_settings(["search_path=pg_catalog"])
-            and hook["pronargs"] == 0
-            and hook["trigger_result"]
-            and hook["lanname"] == "plpgsql"
-            and hook["table_method"] == "heap"
-            and hook["function_owner"] in (capability.policy.owner_role, *capability.policy.control_runtime_roles)
-            for hook in hooks
-        ),
-        "owner_hook_changed",
-    )
+    rows = await capability.connection.fetch(OUTPUT_CATALOG_SQL, capability.policy.schema, [PLAN_ROOT])
+    _require(len(rows) == 1, "missing")
+    _require_plan_layout(rows[0], None)
     plan = decoded(
         await capability.connection.fetchval(
             f"SELECT plan FROM {storage_relation(capability.policy.schema, PLAN_ROOT)} WHERE singleton"
@@ -320,6 +269,7 @@ async def _cas(capability, prior, updated):
 def _forward_entry(capability, updated):
     _require(capability.operation["kind"] in _KINDS and capability.reference is None, "maintenance_required")
     journal = deepcopy(_journal(updated))
+    journal["protocol"] = 2
     updated[_KEY] = journal
     entry = journal["operations"].setdefault(
         capability.operation_digest,
@@ -347,7 +297,9 @@ async def record_output_progress(capability, stage, copied_rows):
     previous = entry["stages"].get(stage.target)
     progress_by_field = {"stage": stage.to_payload(), "copied_rows": copied_rows}
     _require(
-        previous is None or previous["stage"] == progress_by_field["stage"] and previous["copied_rows"] <= copied_rows,
+        previous is None
+        or OutputStage.from_payload(previous["stage"]) == stage
+        and previous["copied_rows"] <= copied_rows,
         "progress_changed",
     )
     entry["stages"][stage.target] = progress_by_field
@@ -372,8 +324,14 @@ async def record_output_prepared(capability, receipts):
             capability, receipt.incumbent.target, receipt.successor.relation, expected_incumbent=receipt.incumbent
         )
         _require(actual == receipt, "prepared_changed")
-    _require(not entry["prepared"] or entry["prepared"] == values, "prepared_changed")
-    entry["phase"], entry["prepared"] = "prepared", values
+    _require(
+        not entry["prepared"]
+        or _receipt_set(entry["prepared"], capability.targets, custody.PreparedOutputReceipt.from_payload) == parsed,
+        "prepared_changed",
+    )
+    entry["phase"] = "prepared"
+    if not entry["prepared"]:
+        entry["prepared"] = values
     _entry(capability.operation_digest, entry)
     await _cas(capability, prior, updated)
 
@@ -407,6 +365,7 @@ async def append_output_history(capability, prepared_receipts, retained_receipts
     prior = await _plan(capability)
     updated = deepcopy(prior)
     journal = deepcopy(_journal(updated))
+    journal["protocol"] = 2
     updated[_KEY] = journal
     if capability.reference is None:
         digest = capability.operation_digest
@@ -428,7 +387,8 @@ async def append_output_history(capability, prepared_receipts, retained_receipts
         ]
     _require(
         tuple(entry["targets"]) == capability.targets
-        and [receipt.to_payload() for receipt in prepared_receipts] == expected_preparations,
+        and prepared_receipts
+        == _receipt_set(expected_preparations, capability.targets, custody.PreparedOutputReceipt.from_payload),
         "prepared_changed",
     )
     receipt_payloads = [receipt.to_payload() for receipt in retained_receipts]

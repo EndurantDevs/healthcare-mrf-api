@@ -12,6 +12,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from string import Template
 from typing import Any, Mapping
+from uuid import UUID
 
 from sqlalchemy import text
 
@@ -26,7 +27,9 @@ from api.ptg2_candidate_audit import PTG2CandidateAuditAccess
 LEGACY_PROJECTION_CONTRACT = "plan_pricing_card_v2"
 FACTORIZED_V3_PROJECTION_CONTRACT = "plan_pricing_factorized_v3"
 PROJECTION_CONTRACT = "plan_pricing_factorized_v4"
-PROJECTION_BUILD_REVISION = "sealed-physical-read-dedup-v2"
+PROJECTION_BUILD_REVISION = "logical-provider-generations-v3"
+_PROVIDER_SIGNATURE_CONTRACT = "plan-pricing-provider-inputs.v2"
+_PROVIDER_GENERATIONS = ("address", "geo", "npi", "nucc")
 FACTORIZED_PROJECTION_CONTRACTS = frozenset({FACTORIZED_V3_PROJECTION_CONTRACT, PROJECTION_CONTRACT})
 _CODE_RELATIONS = ContextVar("plan_pricing_code_relations", default=None)
 
@@ -99,45 +102,63 @@ _CANDIDATE_PROVIDER_RELATIONS = (
 
 @dataclass(frozen=True)
 class ProjectionCandidateInputs:
-    """Pinned local inputs supplied by a trusted publisher, never request metadata.
+    """Named local inputs and portable origins supplied by the publisher.
 
-    The caller authenticates the frozen candidate and dependency custody before
-    constructing this carrier. Native readers still verify candidate authority;
-    the builder locks and recaptures these exact physical dependency identities.
+    Origins describe the validated candidate families and transfer at publication.
+    Read names may change during that cut; held geo dependency names stay fixed.
+    A different address snapshot requires its own validated geo preparation.
     """
 
     candidate_access: tuple[PTG2CandidateAuditAccess, ...]
-    relations: tuple[tuple[str, str, str, int, int], ...]
+    relations: tuple[tuple[str, str, str], ...]
     geo_preparation: Any = None
+    provider_generations: tuple[tuple[str, str, int], ...] = ()
 
     def __post_init__(self):
-        """Refuse partial, duplicate or open-ended physical input mappings."""
+        """Normalize legacy tuple tails and require a complete named input family."""
         if (
             type(self.candidate_access) is not tuple
             or not 1 <= len(self.candidate_access) <= 128
             or any(type(access) is not PTG2CandidateAuditAccess for access in self.candidate_access)
             or len(set(self.candidate_access)) != len(self.candidate_access)
             or type(self.relations) is not tuple
-            or any(type(entry) is not tuple or len(entry) != 5 for entry in self.relations)
+            or any(type(entry) is not tuple or len(entry) not in (3, 5) for entry in self.relations)
         ):
             raise ValueError("pricing projection candidate inputs are invalid")
         if tuple(entry[0] for entry in self.relations) != _CANDIDATE_PROVIDER_RELATIONS:
             raise ValueError("pricing projection candidate relation family differs")
-        for _name, schema, relation, oid, filenode in self.relations:
+        object.__setattr__(self, "relations", tuple(entry[:3] for entry in self.relations))
+        for _name, schema, relation in self.relations:
             for identifier in (schema, relation):
                 if type(identifier) is not str:
                     raise ValueError("pricing projection candidate relation identifier is invalid")
                 geo_projection._sql_identifier(identifier, field_name="projection relation")
-            if any(type(value) is not int or not 0 < value < 2**32 for value in (oid, filenode)):
-                raise ValueError("pricing projection candidate relation identity is invalid")
-        if len({entry[3] for entry in self.relations}) != len(self.relations) or len(
-            {entry[1:3] for entry in self.relations}
-        ) != len(self.relations):
+        if len({entry[1:3] for entry in self.relations}) != len(self.relations):
             raise ValueError("pricing projection candidate relations are duplicated")
+        if (
+            type(self.provider_generations) is not tuple
+            or any(type(entry) is not tuple or len(entry) != 3 for entry in self.provider_generations)
+            or tuple(entry[0] for entry in self.provider_generations) != _PROVIDER_GENERATIONS
+        ):
+            raise ValueError("pricing projection provider generations are incomplete")
+        generations_by_family = _validated_provider_generations(
+            {
+                family: {"origin_lineage_id": lineage, "origin_generation": generation}
+                for family, lineage, generation in self.provider_generations
+            }
+        )
+        object.__setattr__(
+            self,
+            "provider_generations",
+            tuple(
+                (family, origin["origin_lineage_id"], origin["origin_generation"])
+                for family, origin in generations_by_family.items()
+            ),
+        )
 
     def relation(self, name: str) -> str:
         """Render only a fixed role's validated identifiers, never caller SQL."""
-        for role, schema, relation, _oid, _filenode in self.relations:
+        for role, schema, relation in self.relations:
             if role == name:
                 return f'"{schema}"."{relation}"'
         raise ValueError("pricing projection candidate relation is unsupported")
@@ -159,18 +180,16 @@ class ProjectionCandidateInputs:
         return matches[0]
 
     def geo_bindings(self):
-        """Reuse the closed native geo dependency identity contract."""
+        """Reuse the closed six-relation geo dependency name contract."""
         names = {f"{schema or SCHEMA}.{relation}" for schema, relation in geo_projection._PROJECTION_DEPENDENCIES}
-        return geo_projection.validate_projection_dependency_bindings(
+        return geo_projection.validate_projection_dependency_qnames(
             SCHEMA,
             {
                 name if name.startswith("tiger.") else f"{SCHEMA}.{name}": {
                     "schema_name": schema,
                     "table_name": relation,
-                    "relation_oid": oid,
-                    "relfilenode": filenode,
                 }
-                for name, schema, relation, oid, filenode in self.relations
+                for name, schema, relation in self.relations
                 if (name if name.startswith("tiger.") else f"{SCHEMA}.{name}") in names
             },
         )
@@ -258,50 +277,76 @@ def normalized_bindings(bindings: Any) -> list[dict[str, Any]]:
     return normalized_bindings_list
 
 
-def _provider_signature_sql(*, candidate_inputs=None) -> str:
+def _published_provider_generations_sql() -> str:
+    """Read only the portable origins advanced by the four family publishers."""
+    fields = []
+    for family, ledger, predicate in (
+        ("address", "entity_address_result_generation", "singleton"),
+        ("geo", "reference_family_result_generation", "importer_id='geo'"),
+        ("npi", "npi_result_generation", None),
+        ("nucc", "reference_family_result_generation", "importer_id='nucc'"),
+    ):
+        fields.append(
+            f"'{family}', (SELECT jsonb_build_object('origin_lineage_id', origin_lineage_id, "
+            f"'origin_generation', origin_generation) FROM {table(ledger)}"
+            + (f" WHERE {predicate}" if predicate else "")
+            + ")"
+        )
+    return "jsonb_build_object(" + ", ".join(fields) + ")"
+
+
+def _provider_signature_sql(*, candidate_inputs=None, dependency_bindings=None) -> str:
     state_relation = table("entity_address_geo_assurance_state")
     geo_identity = f"""COALESCE((
         SELECT jsonb_build_object(
             'version', active_geo_assurance_version,
-            'table_oid', active_table_oid,
-            'signature', active_relation_signature
+            'signature', CAST(:geo_bindings AS jsonb)
         ) FROM {state_relation} WHERE singleton
     ), '{{}}'::jsonb)"""
-    geo_ready = geo_projection.projection_state_available_sql(SCHEMA)
+    geo_ready = geo_projection.projection_state_available_sql(SCHEMA, dependency_bindings=dependency_bindings)
+    generations = _published_provider_generations_sql()
     if candidate_inputs is not None:
         geo_identity, geo_ready = "CAST(:candidate_geo AS jsonb)", "TRUE"
+        generations = "CAST(:candidate_generations AS jsonb)"
     return f"""
         SELECT jsonb_build_object(
-            'npi', jsonb_build_array(
-                to_regclass(:npi_relation)::oid,
-                pg_relation_filenode(to_regclass(:npi_relation))
-            ),
-            'taxonomy', jsonb_build_array(
-                to_regclass(:taxonomy_relation)::oid,
-                pg_relation_filenode(to_regclass(:taxonomy_relation))
-            ),
-            'vocabulary', jsonb_build_array(
-                to_regclass(:vocabulary_relation)::oid,
-                pg_relation_filenode(to_regclass(:vocabulary_relation))
-            ),
-            'address', jsonb_build_array(
-                to_regclass(:address_relation)::oid,
-                pg_relation_filenode(to_regclass(:address_relation))
-            ),
-            'address_evidence', jsonb_build_array(
-                to_regclass(:evidence_relation)::oid,
-                pg_relation_filenode(to_regclass(:evidence_relation)),
-                to_regclass(:address_relation)::oid,
-                pg_relation_filenode(to_regclass(:address_relation))
-            ),
-            'zip', jsonb_build_array(
-                to_regclass(:zip_relation)::oid,
-                pg_relation_filenode(to_regclass(:zip_relation))
-            ),
+            'contract', '{_PROVIDER_SIGNATURE_CONTRACT}',
+            'generations', {generations},
+            'relations_available', to_regclass(:npi_relation) IS NOT NULL
+                AND to_regclass(:taxonomy_relation) IS NOT NULL
+                AND to_regclass(:vocabulary_relation) IS NOT NULL
+                AND to_regclass(:address_relation) IS NOT NULL
+                AND to_regclass(:evidence_relation) IS NOT NULL
+                AND to_regclass(:zip_relation) IS NOT NULL,
             'geo_assurance', {geo_identity},
             'geo_assurance_ready', {geo_ready}
         )::text
     """
+
+
+def _validated_provider_generations(value):
+    """Require complete portable origins, without inventing historical generations."""
+    if not isinstance(value, Mapping) or set(value) != set(_PROVIDER_GENERATIONS):
+        raise ValueError("pricing projection provider generations are incomplete")
+    generations_by_family = {}
+    for family in _PROVIDER_GENERATIONS:
+        origin = value[family]
+        if (
+            not isinstance(origin, Mapping)
+            or set(origin) != {"origin_lineage_id", "origin_generation"}
+            or type(origin["origin_generation"]) is not int
+            or not 0 < origin["origin_generation"] < 2**63
+        ):
+            raise ValueError("pricing projection provider generations are incomplete")
+        try:
+            lineage = str(UUID(origin["origin_lineage_id"]))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError("pricing projection provider lineage is invalid") from error
+        generations_by_family[family] = {
+            "origin_lineage_id": lineage,
+            "origin_generation": origin["origin_generation"],
+        }
+    return generations_by_family
 
 
 def _validated_provider_signature(signature_text: Any) -> str:
@@ -309,27 +354,26 @@ def _validated_provider_signature(signature_text: Any) -> str:
         signature_by_relation = json.loads(str(signature_text))
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("pricing projection provider relations are incomplete") from exc
-    if not isinstance(signature_by_relation, dict):
+    if not isinstance(signature_by_relation, dict) or set(signature_by_relation) != {
+        "contract",
+        "generations",
+        "relations_available",
+        "geo_assurance",
+        "geo_assurance_ready",
+    }:
         raise ValueError("pricing projection provider relations are incomplete")
-    relation_signatures = (
-        (signature_by_relation.get(name), expected_length)
-        for name, expected_length in (
-            ("npi", 2),
-            ("taxonomy", 2),
-            ("vocabulary", 2),
-            ("address", 2),
-            ("address_evidence", 4),
-            ("zip", 2),
-        )
-    )
-    relation_is_incomplete = any(
-        not isinstance(relation_signature, list)
-        or len(relation_signature) != expected_length
-        or any(component is None for component in relation_signature)
-        for relation_signature, expected_length in relation_signatures
-    )
-    if signature_by_relation.get("geo_assurance_ready") is not True or relation_is_incomplete:
+    geo = signature_by_relation["geo_assurance"]
+    if (
+        signature_by_relation["contract"] != _PROVIDER_SIGNATURE_CONTRACT
+        or signature_by_relation["geo_assurance_ready"] is not True
+        or signature_by_relation["relations_available"] is not True
+        or not isinstance(geo, dict)
+        or set(geo) != {"version", "signature"}
+        or geo["version"] != geo_projection.GEO_ASSURANCE_VERSION
+    ):
         raise ValueError("pricing projection provider relations are incomplete")
+    signature_by_relation["generations"] = _validated_provider_generations(signature_by_relation["generations"])
+    geo["signature"] = geo_projection.validate_projection_dependency_qnames(SCHEMA, geo["signature"])
     return hashlib.sha256(canonical_json(signature_by_relation).encode("utf-8")).hexdigest()
 
 
@@ -344,21 +388,40 @@ async def provider_signature(session: Any, *, candidate_inputs=None) -> str:
         "evidence_relation": f"{SCHEMA}.entity_address_evidence",
         "zip_relation": f"{SCHEMA}.geo_zip_lookup",
     }
+    dependency_bindings = None
     if candidate_inputs is not None:
         geo_identity = await _lock_candidate_provider_inputs(session, candidate_inputs)
         parameters_by_name = {
-            key: candidate_inputs.relation(value.split(".", 1)[1]) for key, value in parameters_by_name.items()
+            key: candidate_inputs.relation(relation.split(".", 1)[1]) for key, relation in parameters_by_name.items()
         }
         parameters_by_name["candidate_geo"] = canonical_json(geo_identity)
+        parameters_by_name["candidate_generations"] = canonical_json(
+            {
+                family: {"origin_lineage_id": lineage, "origin_generation": generation}
+                for family, lineage, generation in candidate_inputs.provider_generations
+            }
+        )
+    else:
+        from process.entity_address_dependency_bindings import read_active_bindings
+
+        dependency_bindings = await read_active_bindings(session, SCHEMA)
+        parameters_by_name["geo_bindings"] = canonical_json(
+            dependency_bindings
+            if dependency_bindings is not None
+            else {
+                f"{schema or SCHEMA}.{relation}": {"schema_name": schema or SCHEMA, "table_name": relation}
+                for schema, relation in geo_projection._PROJECTION_DEPENDENCIES
+            }
+        )
     signature_result = await session.execute(
-        text(_provider_signature_sql(candidate_inputs=candidate_inputs)),
+        text(_provider_signature_sql(candidate_inputs=candidate_inputs, dependency_bindings=dependency_bindings)),
         parameters_by_name,
     )
     return _validated_provider_signature(signature_result.scalar_one())
 
 
 async def _lock_candidate_provider_inputs(session, inputs):
-    """Recheck pinned physical identity before using any staged provider payload."""
+    """Pin the named persistent inputs before using any staged provider payload."""
     if type(inputs) is not ProjectionCandidateInputs or not session.in_transaction():
         raise ValueError("pricing projection candidate inputs require a caller transaction")
     isolation = (await session.execute(text("SHOW transaction_isolation"))).scalar_one()
@@ -367,28 +430,34 @@ async def _lock_candidate_provider_inputs(session, inputs):
     await session.execute(
         text(
             "LOCK TABLE "
-            + ", ".join("ONLY " + inputs.relation(role) for role, *_identity in inputs.relations)
+            + ", ".join(
+                ("" if role == f"{schema}.{relation}" and role.startswith("tiger.") else "ONLY ")
+                + inputs.relation(role)
+                for role, schema, relation in inputs.relations
+            )
             + " IN ACCESS SHARE MODE"
         )
     )
     observed = await session.execute(
         text("""
-        SELECT namespace.nspname, relation.relname, relation.oid::bigint,
-               pg_catalog.pg_relation_filenode(relation.oid)::bigint
+        SELECT namespace.nspname, relation.relname
         FROM pg_catalog.pg_class relation
         JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace
-        WHERE relation.oid=ANY(CAST(:oids AS oid[])) AND relation.relkind='r'
+        WHERE namespace.nspname||'.'||relation.relname=ANY(CAST(:names AS text[])) AND relation.relkind='r'
           AND relation.relpersistence='p'
-          AND (NOT relation.relispartition OR relation.oid=ANY(CAST(:tiger_oids AS oid[])))
+          AND (NOT relation.relispartition OR
+               namespace.nspname||'.'||relation.relname=ANY(CAST(:tiger_names AS text[])))
           AND NOT relation.relrowsecurity AND NOT relation.relforcerowsecurity
     """),
         {
-            "oids": [entry[3] for entry in inputs.relations],
-            "tiger_oids": [entry[3] for entry in inputs.relations if entry[0].startswith("tiger.")],
+            "names": [f"{schema}.{relation}" for _role, schema, relation in inputs.relations],
+            "tiger_names": [
+                f"{schema}.{relation}" for role, schema, relation in inputs.relations if role.startswith("tiger.")
+            ],
         },
     )
     if {tuple(relation_row) for relation_row in observed} != {entry[1:] for entry in inputs.relations}:
-        raise ValueError("pricing projection candidate dependency identity changed")
+        raise ValueError("pricing projection candidate dependency layout changed")
     state = (
         (
             await session.execute(
@@ -402,23 +471,28 @@ async def _lock_candidate_provider_inputs(session, inputs):
 
 
 async def _candidate_geo_identity(session, inputs, state):
-    """Recapture the native candidate, or require the exact retained active geo state."""
+    """Use prepared geo authority or the current active address and named inputs."""
     from process.entity_address_snapshot_destination import (
         EntityAddressGeoAssurancePreparation,
         _capture_geo_preparation,
     )
 
     bindings = inputs.geo_bindings()
-    address_oid = next(entry[3] for entry in inputs.relations if entry[0] == "entity_address_unified")
-    signature_by_relation = {name: [entry["relation_oid"], entry["relfilenode"]] for name, entry in bindings.items()}
+    signature_by_relation = bindings
     expected = inputs.geo_preparation
     if expected is not None:
-        if type(expected) is not EntityAddressGeoAssurancePreparation or expected.stage_table_oid != address_oid:
+        if type(expected) is not EntityAddressGeoAssurancePreparation:
             raise ValueError("pricing projection candidate geo authority differs")
+        address_name = next(
+            (schema, relation) for role, schema, relation in inputs.relations if role == "entity_address_unified"
+        )
+        if expected.stage_relation != address_name:
+            raise ValueError("pricing projection candidate geo stage differs")
         captured = await _capture_geo_preparation(
             session,
             db_schema=SCHEMA,
-            stage_table_oid=address_oid,
+            stage_table_oid=None,
+            stage_relation_name=address_name[1],
             projected_rows=expected.projected_rows,
             dependency_bindings=bindings,
             **(
@@ -430,22 +504,42 @@ async def _candidate_geo_identity(session, inputs, state):
         if captured != expected:
             raise ValueError("pricing projection candidate geo authority changed")
     else:
-        ready = (
-            await session.execute(text(f"SELECT {geo_projection.projection_state_available_sql(SCHEMA)}"))
-        ).scalar_one()
-        if (
-            not state
-            or ready is not True
-            or state["active_geo_assurance_version"] != geo_projection.GEO_ASSURANCE_VERSION
-            or state["active_table_oid"] != address_oid
-            or state["active_relation_signature"] != signature_by_relation
-        ):
-            raise ValueError("pricing projection retained geo authority changed")
+        await _require_retained_geo_inputs(session, inputs, state, bindings)
     return {
         "version": geo_projection.GEO_ASSURANCE_VERSION,
-        "table_oid": str(address_oid),
         "signature": signature_by_relation,
     }
+
+
+async def _require_retained_geo_inputs(session, inputs, state, bindings):
+    """Borrow active geo authority only for its address and all six published inputs."""
+    if (
+        not state
+        or state["active_geo_assurance_version"] != geo_projection.GEO_ASSURANCE_VERSION
+        or inputs.relation("entity_address_unified") != f'"{SCHEMA}"."entity_address_unified"'
+    ):
+        raise ValueError("pricing projection retained geo authority changed")
+    active_bindings_by_name = state["active_dependency_bindings"]
+    if active_bindings_by_name is None:
+        active_bindings_by_name = {
+            f"{schema or SCHEMA}.{relation}": {"schema_name": schema or SCHEMA, "table_name": relation}
+            for schema, relation in geo_projection._PROJECTION_DEPENDENCIES
+        }
+    if bindings != geo_projection.validate_projection_dependency_qnames(
+        SCHEMA,
+        {
+            name: {field: entry[field] for field in ("schema_name", "table_name")}
+            for name, entry in active_bindings_by_name.items()
+        },
+    ):
+        raise ValueError("pricing projection retained geo authority changed")
+    ready = (
+        await session.execute(
+            text(f"SELECT {geo_projection.projection_state_available_sql(SCHEMA, dependency_bindings=bindings)}")
+        )
+    ).scalar_one()
+    if ready is not True:
+        raise ValueError("pricing projection retained geo authority changed")
 
 
 def address_provenance_sql(template: str, schema: str, candidate_inputs=None) -> str:
@@ -474,7 +568,7 @@ async def lock_provider_generation(session: Any) -> None:
 
 
 async def _lock_provider_relations(session: Any) -> None:
-    """Pin the ordinary physical inputs without changing the caller's transaction."""
+    """Pin the named published inputs without changing the caller's transaction."""
     await session.execute(text(geo_projection.projection_dependency_lock_sql(SCHEMA)))
     await session.execute(
         text("LOCK TABLE " + ", ".join(table(relation) for relation in PROVIDER_RELATIONS) + " IN ACCESS SHARE MODE")
@@ -482,7 +576,7 @@ async def _lock_provider_relations(session: Any) -> None:
 
 
 async def require_published_provider_generation(session: Any, *, expected_signature: str) -> None:
-    """Verify a prepared generation after physical publication in the caller's cut."""
+    """Verify transferred logical origins after publication in the caller's cut."""
     if (
         not session.in_transaction()
         or not isinstance(expected_signature, str)

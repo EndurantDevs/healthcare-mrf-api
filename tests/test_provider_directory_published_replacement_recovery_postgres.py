@@ -16,6 +16,7 @@ from process import provider_directory_published_source_replacement as replaceme
 from process import provider_directory_serving_recovery as recovery
 from process import provider_directory_serving_recovery_receipts as receipts
 from tests.provider_directory_serving_recovery_postgres_support import ordinary_serving_case
+from tests.test_entity_address_candidate_preparation_postgres import _prepare_geo_inputs
 from tests.test_provider_directory_published_replacement_postgres import _alias, _apply_drift, _markers, _prepare
 from tests.test_provider_directory_serving_recovery_postgres import _publish_address, _state
 
@@ -36,18 +37,18 @@ async def _prepared_address(case, fence, stage):
     await database.status(f"INSERT INTO \"{schema}\".entity_address_unified_stage VALUES ('new')")
     index_name = native._stage_index_name(_PreparedAddressStage.__tablename__, "marker")
     await database.status(f'CREATE INDEX "{index_name}" ON "{schema}".entity_address_unified_stage(marker)')
-    assert await database.scalar(native._record_geo_assurance_candidate_sql(schema, "entity_address_unified_stage", 1))
+    await _prepare_geo_inputs(database, schema)
     dataset = fence.datasets[0]
     snapshot = await serving_inputs.capture(case.directory, fence)
     inputs = preparation.ProviderDirectoryAddressPreparationInput(
         dataset_pins=serving_inputs.desired_pins(snapshot),
         overlay_table=stage.stage_table,
-        overlay_relation_oid=await database.scalar(f"SELECT '{schema}.{stage.stage_table}'::regclass::oid::bigint"),
         address_alias_generation=0,
         ordinary_serving_peer_pins=serving_inputs.peer_pins(snapshot),
     )
     context_by_field = dict(
         address_alias_generation=0,
+        geo_assurance_candidate_relation={"schema_name": schema, "relation_name": _PreparedAddressStage.__tablename__},
         publish_validation={},
         staged_rows=1,
         partial_provider_directory_source_ids=[dataset.source_id],
@@ -89,8 +90,12 @@ async def _forward(case, fence, generation):
             await serving_inputs.lock_and_check(directory, recovery_by_field["serving_inputs"])
             await directory._lock_and_verify_artifact_dataset_fence(fence, database)
             await recovery.begin_overlay(directory, recovery_by_field)
-            await receipts.lock(database, schema, (*receipts.ROOTS, "overlay_next"))
-            await receipts.retain(database, schema, recovery_by_field["before"]["roots"][receipts.ROOTS[0]])
+            await receipts.lock(database, schema, (*receipts.ROOTS, "overlay_next"), mode="ACCESS SHARE")
+            recovery_by_field["retained_relations"] = {
+                receipts.ROOTS[0]: await receipts.retain(
+                    database, schema, recovery_by_field["before"]["roots"][receipts.ROOTS[0]], generation=generation
+                )
+            }
             await receipts.rename(database, schema, "overlay_next", receipts.ROOTS[0])
             await directory._cutover_provider_directory_artifact_sources(fence)
             await recovery.finish_overlay(directory, recovery_by_field)
@@ -384,7 +389,10 @@ async def test_native_prepared_owner_commits_overlay_address_alias_and_journal_t
             async with database.transaction():
                 history = await recovery._load_history(database, schema, generation)
             assert set(history) == {"overlay", "published"}
-            assert history["overlay"]["document"]["writer"] == history["published"]["document"]["writer"]
+            for phase in ("overlay", "published"):
+                document = history[phase]["document"]
+                assert document["version"] == 2 and "writer" not in document
+                assert document["generation"] == generation and document["source"] == case.pin
             recovery_request_by_field = {
                 recovery.OPERATION_PARAM: "recover",
                 recovery.GENERATION_PARAM: generation,
@@ -441,7 +449,7 @@ async def _reject_coupled_context(case, address, stale):
 
 @pytest.mark.parametrize("stale", ["admission", "session", "task", "generation", "context", "prepared"])
 async def test_native_coupled_preparation_refuses_transplanted_writer_or_context(monkeypatch, stale):
-    """A real inserted overlay cannot authorize another session, task, admission or prepared context."""
+    """Equivalent copies remain portable; logical drift and child-task connection reuse still refuse."""
     from process import entity_address_candidate_preparation as preparation
 
     native = importlib.import_module("process.entity_address_unified")
@@ -458,8 +466,22 @@ async def test_native_coupled_preparation_refuses_transplanted_writer_or_context
                 state = recovery._COUPLED_ADDRESS.get()
                 assert state is not None and type(state["document"]) is str
                 original_deadline = address.context["serving_recovery_wall"].when()
-                with pytest.raises(ValueError, match="coupled_preparation_changed"):
+                if stale == "task":
+                    with pytest.raises(RuntimeError, match="child asyncio task"):
+                        await _reject_coupled_context(case, address, stale)
+                elif stale == "generation":
+                    with pytest.raises(ValueError, match="coupled_preparation_changed"):
+                        await _reject_coupled_context(case, address, stale)
+                else:
                     await _reject_coupled_context(case, address, stale)
+                    changed_context_by_field = {
+                        **address.context,
+                        "partial_provider_directory_dataset_id": "another_dataset",
+                    }
+                    with pytest.raises(ValueError, match="coupled_preparation_changed"):
+                        await recovery.prepare_address(
+                            case.database, case.schema, address.swaps, changed_context_by_field
+                        )
                 assert recovery._COUPLED_ADDRESS.get() is state
                 assert address.context["serving_recovery_wall"].when() == original_deadline
                 raise RuntimeError("after coupled refusal")

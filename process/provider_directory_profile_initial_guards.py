@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Shared initial receipt guards and exact native catalog recognition."""
+"""Shared semantic guards for immutable first Profile publication receipts."""
 
 import hashlib
 
@@ -22,8 +22,6 @@ _PROFILE_FIELDS = (
     "source_context_vector_hash",
     "executable_plan_hash",
     "profile_as_of",
-    "evidence_target_oid",
-    "profile_target_oid",
     "evidence_rows",
     "profile_rows",
 )
@@ -43,7 +41,8 @@ def _literal(value):
 
 
 def _serving_snapshot(alias):
-    return "jsonb_build_object(" + ",".join(f"'{name}',{alias}.{name}" for name in _PROFILE_FIELDS) + ")"
+    fields = ",".join(f"'{name}',{alias}.{name}" for name in _PROFILE_FIELDS)
+    return f"jsonb_build_object({fields},'targets',{alias}.targets_json)"
 
 
 def _receipt_matches_sql(schema):
@@ -59,10 +58,19 @@ def _receipt_matches_sql(schema):
         WHERE serving.singleton_key='global' AND serving.status='published' AND serving.operation='publish'
           AND serving.generation_id=receipt.generation_id AND receipt.publication_xid=pg_current_xact_id()
           AND serving.capacity_geometry_status='verified'
-          AND serving.capacity_geometry_json->>'contract_id'={_literal(_GEOMETRY)}
-          AND receipt.payload->'serving'={_serving_snapshot("serving")}
-          AND serving.evidence_target_oid=to_regclass({_literal(_qt(schema, "provider_directory_profile_evidence"))})::oid::bigint
-          AND serving.profile_target_oid=to_regclass({_literal(_qt(schema, "provider_directory_profile"))})::oid::bigint
+          AND ((receipt.contract_id='healthporta.provider-directory-profile-initial-receipt.v1'
+            AND serving.capacity_geometry_json->>'contract_id'='healthporta.provider-directory-profile-initial-capacity-geometry.v1'
+            AND consumed.contract_id='provider-directory-database-capacity-lease-v3'
+            AND preflight.contract_id='healthporta.provider-directory-profile-capacity-preflight.v5'
+            AND preflight.request_contract_id='healthporta.provider-directory-profile-capacity-preflight-request.v5'
+            AND (receipt.payload->'serving') - ARRAY['evidence_target_oid','profile_target_oid']
+                =({_serving_snapshot("serving")}) - 'targets')
+          OR (receipt.contract_id='healthporta.provider-directory-profile-initial-receipt.v2'
+            AND serving.capacity_geometry_json->>'contract_id'={_literal(_GEOMETRY)}
+            AND consumed.contract_id='provider-directory-database-capacity-lease-v4'
+            AND preflight.contract_id='healthporta.provider-directory-profile-capacity-preflight.v7'
+            AND preflight.request_contract_id='healthporta.provider-directory-profile-capacity-preflight-request.v7'
+            AND receipt.payload->'serving'={_serving_snapshot("serving")}))
           AND receipt.payload->>'contract_id'=receipt.contract_id
           AND receipt.payload->>'build_id'=receipt.build_id AND receipt.payload->>'run_id'=receipt.run_id
           AND receipt.payload->>'attestation_id'=receipt.attestation_id
@@ -72,7 +80,6 @@ def _receipt_matches_sql(schema):
           AND receipt.payload->'source_vector'=serving.source_vector_json
           AND receipt.payload->'source_context_vector'=serving.source_context_vector_json
           AND receipt.payload->>'executable_plan_hash'=serving.executable_plan_hash
-          AND consumed.contract_id='provider-directory-database-capacity-lease-v3'
           AND consumed.lease_digest=receipt.payload->>'lease_digest'
           AND consumed.capacity_geometry_hash=serving.capacity_geometry_hash
           AND consumed.executable_plan_hash=serving.executable_plan_hash
@@ -84,10 +91,9 @@ def _receipt_matches_sql(schema):
           AND consumed.max_build_deadline<=consumed.expires_at AND clock_timestamp()<consumed.max_build_deadline
           AND consumed.canonical_lease_json::jsonb->>'nonce'=preflight.receipt_sha256
           AND preflight.consumed_at<=receipt.committed_at AND receipt.committed_at<preflight.expires_at
-          AND preflight.contract_id='healthporta.provider-directory-profile-capacity-preflight.v5'
           AND preflight.capacity_geometry_hash=serving.capacity_geometry_hash
           AND consumed.canonical_lease_json::jsonb->'signing_preflight_guard'->'healthcare_request'->>'contract_id'
-              ='healthporta.provider-directory-profile-capacity-preflight-request.v5'
+              =preflight.request_contract_id
           AND consumed.canonical_lease_json::jsonb->'signing_preflight_guard'->'healthcare_request'->>'profile_materialization'
               ='initial_full_swap'
           AND consumed.canonical_lease_json::jsonb->'signing_preflight_guard'->'healthcare_receipt'->'capacity_geometry'
@@ -108,7 +114,8 @@ def _receipt_insert_body(schema):
 
 def _serving_insert_body(schema):
     return f"""BEGIN
-        IF NEW.capacity_geometry_json->>'contract_id'={_literal(_GEOMETRY)} AND NOT EXISTS (
+        IF NEW.capacity_geometry_json->>'contract_id' IN (
+            'healthporta.provider-directory-profile-initial-capacity-geometry.v1',{_literal(_GEOMETRY)}) AND NOT EXISTS (
             SELECT 1 FROM {_qt(schema, _TABLE)} receipt
             WHERE receipt.generation_id=NEW.generation_id AND receipt.publication_xid=pg_current_xact_id()
               AND {_qt(schema, "pd_profile_initial_receipt_matches")}(receipt)
@@ -258,10 +265,17 @@ def assert_initial_receipt_catalog(oid, attributes, indexes, constraints):
         | {("t", "TRIGGER DEFERRABLE INITIALLY DEFERRED", True, True, True)}
     )
     primary_constraints = [entry for entry in constraints if entry["relation_oid"] == oid]
+    old_contract_check = "CHECK (contract_id = 'healthporta.provider-directory-profile-initial-receipt.v1'::text)"
+    current_contract_check = (
+        "CHECK (contract_id = ANY (ARRAY['healthporta.provider-directory-profile-initial-receipt.v1'::text, "
+        "'healthporta.provider-directory-profile-initial-receipt.v2'::text]))"
+    )
     actual_constraints = {
         (
             entry["constraint_type"],
-            entry["constraint_definition"],
+            old_contract_check
+            if entry["constraint_definition"] == current_contract_check
+            else entry["constraint_definition"],
             entry["condeferrable"],
             entry["condeferred"],
             entry["connoinherit"],

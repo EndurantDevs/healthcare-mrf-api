@@ -45,17 +45,19 @@ def _capability(intent=None):
 def _prepared(capability):
     old = relation(OUTPUT_ROOTS[0], 101)
     new = relation("private_a", 201, descriptor={"phase": "sealed"}, readable=False)
-    return custody.PreparedOutputReceipt(1, capability.operation_digest, old, new)
+    return custody.PreparedOutputReceipt(2, capability.operation_digest, old, new)
 
 
 def _forward(capability, preparation):
     return RetainedOutputReceipt(
-        1,
+        2,
         capability.operation_digest,
         preparation.incumbent.schema,
         preparation.incumbent.target,
-        retained_name(preparation.incumbent.oid),
-        replace(preparation.incumbent, relation=retained_name(preparation.incumbent.oid)),
+        retained_name(capability.operation_digest, preparation.incumbent.target),
+        replace(
+            preparation.incumbent, relation=retained_name(capability.operation_digest, preparation.incumbent.target)
+        ),
         replace(preparation.successor, relation=preparation.incumbent.target, acl=preparation.incumbent.acl),
     )
 
@@ -141,12 +143,12 @@ async def test_forward_inverse_and_redo_append_exact_history_under_original_key(
         stored = await journal.read_output_history(rollback, original_digest)
         assert stored == (previous,)
         inverse = RetainedOutputReceipt(
-            1,
+            2,
             rollback.operation_digest,
             previous.schema,
             previous.target,
-            retained_name(previous.successor.oid),
-            replace(previous.successor, relation=retained_name(previous.successor.oid)),
+            retained_name(rollback.operation_digest, previous.target),
+            replace(previous.successor, relation=retained_name(rollback.operation_digest, previous.target)),
             replace(previous.incumbent, relation=previous.target),
         )
         monkeypatch.setattr(
@@ -161,7 +163,9 @@ async def test_forward_inverse_and_redo_append_exact_history_under_original_key(
         key: field_value for key, field_value in original_base.items() if key != journal._KEY
     }
     changed = deepcopy(plan)
-    changed[journal._KEY]["operations"][original_digest]["history"][1]["receipts"][0]["successor"]["oid"] = 777
+    changed[journal._KEY]["operations"][original_digest]["history"][1]["receipts"][0]["successor"]["columns"][0][
+        "name"
+    ] = "foreign"
     with pytest.raises(RuntimeError, match="history_continuity_changed"):
         journal._journal(changed)
 

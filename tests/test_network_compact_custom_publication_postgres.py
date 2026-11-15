@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Manual offices publish compactly while old readers retain their exact generation."""
 
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
@@ -15,6 +16,7 @@ from process.registry_candidate_composition import (
     compose_registry_membership_candidate,
 )
 from process.registry_publication_execution import _source_rollback_address_sources
+from process.registry_publication_worker import CONFIG_ENV
 from tests.test_network_compact_publication_postgres import _assert_readonly_replay, _read, _reader, _seal
 from tests.test_network_compact_publication_postgres import compact_publication_db as compact_publication_db
 from tests.test_network_custom_address_source_postgres import _draft, _seed
@@ -48,14 +50,17 @@ async def _publish_registered(fixture, copy_target):
     async def seal(target):
         return await _seal(fixture, target)
 
-    return await prepare_and_publish_network_candidate(
-        fixture.execution_connection,
-        copy_target,
-        fixture.source,
-        **fixture.writer_roles,
-        control_schema=fixture.control_schema,
-        seal_candidate=seal,
-    )
+    # Like the worker, publication reads the administrator freeze roles from its configuration.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv(CONFIG_ENV, json.dumps({"preparation_roles": fixture.preparation_roles}))
+        return await prepare_and_publish_network_candidate(
+            fixture.execution_connection,
+            copy_target,
+            fixture.source,
+            **fixture.writer_roles,
+            control_schema=fixture.control_schema,
+            seal_candidate=seal,
+        )
 
 
 async def _assert_manual_provider_reads(fixture, manifest, network_id, seed):
@@ -97,7 +102,7 @@ async def test_manual_office_publication_removal_and_pinned_old_reader(compact_p
     assert len(office_rows) == 1 and office_rows[0]["entity_type"] == "manual"
     assert office_rows[0]["npi"] is None and office_rows[0]["canonical_network_ids"] == [network]
     assert office_rows[0]["second_line"] == "Suite 2"
-    assert pin.compact_layout.custom.table_oid != pin.compact_layout.base.table_oid
+    assert pin.compact_layout.custom != pin.compact_layout.base
     await _assert_manual_provider_reads(fixture, pin, network, seed)
     await _assert_readonly_replay(fixture, first, publication)
     corrected = await _draft(

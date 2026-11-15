@@ -234,10 +234,10 @@ def test_database_url_uses_pinned_ci_lifecycle_configuration(monkeypatch) -> Non
     assert database_url.database == _CI_DATABASE
 
 
-def _migration_module():
+def _migration_module(path=_MIGRATION_PATH):
     module_spec = importlib.util.spec_from_file_location(
         "npi_result_generation_postgres_proof",
-        _MIGRATION_PATH,
+        path,
     )
     assert module_spec is not None and module_spec.loader is not None
     migration = importlib.util.module_from_spec(module_spec)
@@ -246,14 +246,19 @@ def _migration_module():
 
 
 async def _run_migration(connection, schema_name: str) -> None:
-    migration = _migration_module()
+    # The table is created in its first shape and then moved to named publication columns, as an upgrade does.
+    migrations = (
+        _migration_module(),
+        _migration_module(_MIGRATION_PATH.with_name("20261114160000_npi_named_generation.py")),
+    )
 
     def apply(sync_connection) -> None:
-        migration.op = Operations(MigrationContext.configure(sync_connection))
         with pytest.MonkeyPatch.context() as monkeypatch:
             monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema_name)
             monkeypatch.delenv("DB_SCHEMA", raising=False)
-            migration.upgrade()
+            for migration in migrations:
+                migration.op = Operations(MigrationContext.configure(sync_connection))
+                migration.upgrade()
 
     await connection.run_sync(apply)
 
@@ -311,7 +316,10 @@ async def _create_family(connection, schema_name: str, *, populated: bool) -> No
             f'CREATE TABLE "{schema_name}".npi_canonical_publication_receipt ('
             "publication_ref text PRIMARY KEY, publication_generation bigint NOT NULL, "
             "chain_ref text NOT NULL, import_date date NOT NULL, "
-            + ", ".join(f"{table_name}_table_oid bigint NOT NULL" for table_name in generation.RELATION_NAMES)
+            + ", ".join(
+                f"{table_name}_table_oid bigint NOT NULL, {table_name}_row_count bigint NOT NULL"
+                for table_name in generation.RELATION_NAMES
+            )
             + ")"
         )
     )
@@ -491,7 +499,7 @@ async def _activate(
         manifest=prepared.manifest,
         incumbent=incumbent,
         validation_receipt=validation,
-        cutover=archive.NpiCutoverAuthority("a" * 64, owner_oid, owner_oid, "automatic"),
+        cutover=archive.NpiCutoverAuthority("a" * 64, "automatic"),
         on_activated=record_activation,
     )
 
@@ -573,8 +581,6 @@ async def _assert_legacy_automatic_rejected(
                 validation_receipt=validation,
                 cutover=archive.NpiCutoverAuthority(
                     "a" * 64,
-                    owner_oid,
-                    owner_oid,
                     "automatic",
                 ),
                 on_activated=reject_unexpected_activation,
@@ -684,7 +690,7 @@ async def test_ordinary_publication_generation_is_transactional() -> None:
             receipt=receipt,
         )
         assert advanced.local_generation == 1
-        assert advanced.relation_oids == receipt.relation_oids
+        assert advanced.relations == tuple((schema_name, name) for name in generation.RELATION_NAMES)
         await transaction.rollback()
         authority_row = await connection.fetchrow(f'SELECT * FROM "{schema_name}".npi_result_generation')
         assert authority_row["local_generation"] == 0
@@ -721,20 +727,14 @@ async def test_owned_publication_binds_iso_import_date_and_rolls_back_generation
                 connection, archive.NpiIncumbent(schema_name, ()), previous, receipt
             )
             assert advanced.local_generation == previous.local_generation + 1
-            assert advanced.relation_oids == receipt.relation_oids
+            assert advanced.relations == tuple((schema_name, name) for name in generation.RELATION_NAMES)
             assert advanced.canonical_provenance.import_date.isoformat() == receipt.import_date
 
             async def execute(statement, *, session=None, params=None):
                 """Read through the same actual native transaction used for publication."""
                 return await connection.execute(statement, params or {})
 
-            expected_key = f"native:{advanced.local_lineage_id}:{advanced.local_generation}:{receipt.publication_ref}"
-            assert await npi_native_cache_identity(execute, schema_name) == expected_key
-            async with connection.begin_nested() as savepoint:
-                await connection.execute(text(f'ALTER TABLE "{schema_name}".npi RENAME TO previous_npi'))
-                await connection.execute(text(f'CREATE TABLE "{schema_name}".npi (npi bigint)'))
-                assert await npi_native_cache_identity(execute, schema_name) is None
-                await savepoint.rollback()
+            assert await npi_native_cache_identity(execute, schema_name) is None
             await transaction.rollback()
         async with engine.connect() as connection:
             assert (
@@ -761,7 +761,12 @@ async def test_result_generation_migration_accepts_an_empty_schema() -> None:
         async with engine.begin() as connection:
             await connection.execute(text(f'CREATE SCHEMA "{schema_name}"'))
             await _run_migration(connection, schema_name)
-            assert await connection.scalar(text(f"SELECT relation_oids FROM {relation}")) is None
+            assert tuple(
+                (await connection.execute(text(f"SELECT serving_schema,serving_relation_names FROM {relation}"))).one()
+            ) == (
+                None,
+                None,
+            )
             assert await connection.scalar(text("SELECT to_regprocedure(:function_name)"), {"function_name": function})
             await _run_migration_downgrade(connection, schema_name)
             assert (
@@ -1369,28 +1374,86 @@ async def test_npi_model_restore_layout_has_exact_owned_relations() -> None:
 
 
 @pytest.mark.asyncio
-async def test_public_freeze_captures_full_token_and_rejects_refreeze() -> None:
-    """Expose the complete immutable stage token and reject a second freeze."""
+async def test_old_stage_cleanup_restricts_dependencies_and_removes_named_legacy_function():
+    """Old function metadata is opaque; restrictive cleanup rolls back before its named retry."""
+    engine = create_async_engine(_database_url(), poolclass=NullPool)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    stage_schema = archive.npi_stage_schema(uuid4())
+    dependency = "npi_cleanup_dependency_" + uuid4().hex
+    try:
+        async with sessions() as session, session.begin():
+            await _ensure_model_extensions(session)
+            ownership = await archive.precreate_npi_restore(
+                session, dataset_id=UUID(stage_schema.removeprefix("npi_result_archive_"))
+            )
+            await session.execute(
+                text(
+                    f'CREATE FUNCTION "{stage_schema}".reject_npi_result_archive_mutation() RETURNS trigger '
+                    "LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'"
+                )
+            )
+            ownership = await archive.verify_npi_stage_ownership(session, ownership)
+            assert ownership.freeze_function_oid is None
+            await session.execute(
+                text(
+                    f'CREATE VIEW public."{dependency}" AS SELECT * FROM "{stage_schema}"."{archive.RELATION_NAMES[0]}"'
+                )
+            )
+        async with sessions() as session, session.begin():
+            await session.execute(text("SET LOCAL lock_timeout='1700ms'"))
+            with pytest.raises(DBAPIError, match="depend"):
+                await archive.cleanup_npi_stage(session, ownership)
+            assert await session.scalar(text("SHOW lock_timeout")) == "1700ms"
+            assert await session.scalar(text("SELECT to_regnamespace(:schema) IS NOT NULL"), {"schema": stage_schema})
+            assert await session.scalar(
+                text("SELECT to_regprocedure(:function) IS NOT NULL"),
+                {"function": stage_schema + ".reject_npi_result_archive_mutation()"},
+            )
+            await archive.verify_npi_stage_ownership(session, ownership)
+            await session.execute(text(f'DROP VIEW public."{dependency}" RESTRICT'))
+            await archive.cleanup_npi_stage(session, ownership)
+            assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": stage_schema}) is None
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP VIEW IF EXISTS public."{dependency}" RESTRICT'))
+        await _drop_schemas(engine, {stage_schema})
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_public_freeze_closes_writes_for_configured_roles_and_repeats() -> None:
+    """Freeze with configured role names keeps the declared stage names and can be repeated."""
 
     engine = create_async_engine(_database_url(), poolclass=NullPool)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     dataset_id = uuid4()
+    stage_schema = archive.npi_stage_schema(dataset_id)
     try:
         async with sessions() as session, session.begin():
             await _ensure_model_extensions(session)
             initial = await archive.precreate_npi_restore(session, dataset_id=dataset_id)
-            frozen = await archive.freeze_npi_stage(session, ownership=initial)
-            assert frozen.freeze_function_oid is not None
-            assert len(frozen.freeze_trigger_oids) == len(generation.RELATION_NAMES)
-            assert len(frozen.freeze_catalog_versions) == 1 + 2 * len(generation.RELATION_NAMES)
-            assert await archive.verify_npi_stage_ownership(session, frozen) == frozen
-            with pytest.raises(archive.NpiResultArchiveError, match="already frozen"):
-                await archive.freeze_npi_stage(session, ownership=frozen)
+            with pytest.raises(archive.NpiResultArchiveError, match="configured owner and reader roles"):
+                await archive.freeze_npi_stage(session, ownership=initial)
+            role = await session.scalar(text("SELECT current_user"))
+            frozen = await archive.freeze_npi_stage(session, ownership=initial, owner_role=role, reader_roles=(role,))
+            assert frozen == await archive.verify_npi_stage_ownership(session, initial)
+            assert tuple(name for name, _ in frozen.relation_oids) == tuple(sorted(generation.RELATION_NAMES))
+            assert (
+                await session.scalar(
+                    text("SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname=:name"),
+                    {"name": stage_schema},
+                )
+                == role
+            )
+            assert (
+                await archive.freeze_npi_stage(session, ownership=frozen, owner_role=role, reader_roles=(role,))
+                == frozen
+            )
         async with sessions() as session, session.begin():
             await archive.cleanup_npi_stage(session, frozen)
     finally:
         try:
-            await _drop_schemas(engine, {archive.npi_stage_schema(dataset_id)})
+            await _drop_schemas(engine, {stage_schema})
         finally:
             await engine.dispose()
 
@@ -1412,8 +1475,9 @@ async def test_public_freeze_rejects_changed_initial_ownership() -> None:
             await session.execute(
                 text(f'ALTER SEQUENCE "{stage_schema}"."{sequence_name}" RENAME TO "changed_sequence"')
             )
-            with pytest.raises(archive.NpiResultArchiveError, match="stage ownership differs"):
-                await archive.freeze_npi_stage(session, ownership=initial)
+            role = await session.scalar(text("SELECT current_user"))
+            with pytest.raises(archive.NpiResultArchiveError, match="stage declaration differs"):
+                await archive.freeze_npi_stage(session, ownership=initial, owner_role=role, reader_roles=(role,))
     finally:
         try:
             await _drop_schemas(engine, {stage_schema})
@@ -1548,7 +1612,7 @@ async def _activate_and_assert_restored_sequence(
             manifest=manifest,
             incumbent=incumbent,
             validation_receipt=validation,
-            cutover=archive.NpiCutoverAuthority("b" * 64, owner_oid, owner_oid, "manual"),
+            cutover=archive.NpiCutoverAuthority("b" * 64, "manual"),
             on_activated=record_activation,
         )
     async with sessions() as session:

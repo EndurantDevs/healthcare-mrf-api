@@ -110,13 +110,11 @@ def _prepared_delta(
         "resume_lineage_hash": "2" * 64,
         "owner_run_id": "run-delta",
         "evidence_stage": "evidence_stage",
-        "evidence_stage_oid": 11,
         "profile_stage": "profile_stage",
-        "profile_stage_oid": 12,
         "affected_npi_stage": "affected_stage",
-        "affected_npi_stage_oid": 13,
-        "evidence_target_oid": 21,
-        "profile_target_oid": 22,
+        "targets": importer._provider_directory_profile_target_coordinates(
+            str(overrides.get("schema", "profile_delta_test"))
+        ),
         "from_generation_id": "pdprofile_" + "3" * 32,
         "generation_id": "pdprofile_" + "4" * 32,
         "operation": "publish",

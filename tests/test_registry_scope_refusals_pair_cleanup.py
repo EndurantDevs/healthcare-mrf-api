@@ -61,7 +61,7 @@ async def test_unstamped_capture_requires_explicit_source_before_cleanup(monkeyp
             await retained._cleanup_capture(case.sessions, pair.address_ownership, **arguments_by_name)
         case.receipts.assert_not_awaited()
         case.cleanup.assert_not_awaited()
-    assert case.session.scalar.await_args.args[1] == {"oid": pair.address_ownership.schema_oid}
+    assert case.session.scalar.await_args.args[1] == {"schema": pair.address_ownership.schema_name}
     assert case.events == ["open", "begin", "end", "close"]
 
 

@@ -143,6 +143,7 @@ async def test_native_installer_refuses_other_admin_transaction_modes(retirement
 
 async def test_native_import_run_successor_preserves_observation_and_ordinary_update(retirement_corpus):
     """The capacity observer must report actual typed fingerprints and retain hook checks."""
+    from db.connection import ConnectionProxy
     from db.migration_provider_directory_terminal_root_retirement_guards import IMPORT_RUN_GUARD
     from process import provider_directory_import_run_guards as guards
     from tests.test_provider_directory_import_run_guards import (
@@ -150,7 +151,6 @@ async def test_native_import_run_successor_preserves_observation_and_ordinary_up
         _install,
         _measure_ordinary_update,
     )
-    from tests.test_provider_directory_profile_initial_migration import _CatalogDatabase
 
     schema = "import_guards"
     async with _operator() as (connection, driver):
@@ -159,7 +159,7 @@ async def test_native_import_run_successor_preserves_observation_and_ordinary_up
             schema_name=schema,
             relation_oid=await driver.fetchval("SELECT 'import_guards.import_run'::regclass::oid::bigint"),
         )
-        database = _CatalogDatabase(connection)
+        database = ConnectionProxy(None, connection, None)
         original = await guards.assert_import_run_guards(database, relation_by_field)
         signature = schema + "." + IMPORT_RUN_GUARD + "()"
         definition = await driver.fetchval("SELECT pg_catalog.pg_get_functiondef($1::regprocedure)", signature)

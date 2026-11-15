@@ -456,11 +456,18 @@ class _ShutdownRawConnection:
         return "OK"
 
     async def fetch(self, statement: object, *args):
-        from process.native_publication_read_access import _READS_SQL, _RELATIONS_SQL
+        from process.native_publication_read_access import _READS_SQL, _RELATIONS_SQL, _TARGET_READS_SQL
 
+        nonowner_reads_sql = (
+            "SELECT * FROM (" + _TARGET_READS_SQL + ") AS read_grants "
+            "WHERE grantee<>(SELECT relowner FROM pg_class WHERE oid=to_regclass($1::text))"
+        )
         self.events.append(str(statement))
         if statement == _READS_SQL:
             assert len(args) == 1 and args[0] in self.read_relation_oids.values()
+            return [dict(grant) for grant in self.read_grants]
+        if statement == _TARGET_READS_SQL or statement == nonowner_reads_sql:
+            assert len(args) == 1 and args[0] in {f'"testschema"."{name}"' for name in self.read_relation_oids}
             return [dict(grant) for grant in self.read_grants]
         if statement == _RELATIONS_SQL:
             schema, names = args

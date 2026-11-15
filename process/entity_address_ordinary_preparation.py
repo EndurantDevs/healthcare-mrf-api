@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Retain exact ordinary scratch ownership without issuing publication authority."""
+"""Track temporary names for ordinary Address preparation and bounded cleanup."""
 
 import asyncio
 import importlib
@@ -51,40 +51,35 @@ class OrdinaryPreparation:
     database: object
     owner: object
     db_schema: str
-    actor_identity: tuple
     allowed_names: set = field(default_factory=set)
-    owned_oids: dict = field(default_factory=dict)
-    retired_oids: list = field(default_factory=list)
-    kept_oids: set = field(default_factory=set)
+    owned_relations: set = field(default_factory=set)
+    retired_relations: list = field(default_factory=list)
+    kept_relations: set = field(default_factory=set)
     children: set = field(default_factory=set)
     pending_names: set = field(default_factory=set)
     active: bool = True
 
     @property
-    def cleanup_oids(self):
-        """Keep all physical identities and possible rename destinations through acknowledgement."""
-        return tuple((name, name, oid) for name, oid in sorted(self.owned_oids.items())) + tuple(self.retired_oids)
+    def cleanup_relations(self):
+        """Keep declared names and possible rename destinations through acknowledgement."""
+        return tuple((name, name) for name in sorted(self.owned_relations)) + tuple(self.retired_relations)
 
     def declare(self, names):
         """Register exact internal UUID scratch names before any CREATE, never a name prefix."""
         _require(current() is self, "scope_changed")
         self.allowed_names.update(admitted._identifier(name) for name in names)
 
-    def keep(self, stage_oids):
-        """Transfer only genuinely created finalized heaps to the existing prepared object."""
-        _require(current() is self and asyncio.current_task() is self.owner and not self.pending_names, "owner_changed")
-        _require(type(stage_oids) is tuple and bool(stage_oids), "finalized_invalid")
-        preserved_oids = set()
-        for identity in stage_oids:
-            _require(type(identity) is tuple and len(identity) == 3, "finalized_invalid")
-            target, name, oid = identity
+    def keep(self, stage_relations):
+        """Preserve the declared finalized names after the normal preparation lifecycle."""
+        _require(self.active and not self.pending_names, "scope_changed")
+        _require(type(stage_relations) is tuple and bool(stage_relations), "finalized_invalid")
+        preserved_names = set()
+        for target, name in stage_relations:
             admitted._identifier(target)
-            _require(
-                type(oid) is int and oid > 0 and self.owned_oids.get(name) == oid and oid not in preserved_oids,
-                "finalized_changed",
-            )
-            preserved_oids.add(oid)
-        self.kept_oids = preserved_oids
+            admitted._identifier(name)
+            _require(name in self.owned_relations and name not in preserved_names, "finalized_changed")
+            preserved_names.add(name)
+        self.kept_relations = preserved_names
 
 
 def current():
@@ -93,11 +88,7 @@ def current():
     if owned is None:
         return None
     _require(
-        owned.active
-        and not owned.owner.done()
-        and _native().db is owned.database
-        and admitted._ADMISSION.get() is None
-        and source._FACTORY.get() is None,
+        owned.active and admitted._ADMISSION.get() is None and source._FACTORY.get() is None,
         "scope_changed",
     )
     task = asyncio.current_task()
@@ -107,14 +98,8 @@ def current():
     return owned
 
 
-def _actor_identity(actor):
-    return tuple(actor[name] for name in ("session", "current", "owner", "database_oid"))
-
-
 async def _ordinary(owned):
-    _require(_native().db is owned.database and source._FACTORY.get() is None, "database_changed")
-    session, _driver, actor = await receipts.ordinary(owned.database)
-    _require(_actor_identity(actor) == owned.actor_identity, "actor_changed")
+    session, _driver, _actor = await receipts.ordinary(owned.database)
     return session
 
 
@@ -130,7 +115,9 @@ async def _cleanup(owned, *, preserve_finalized=False):
     candidate = importlib.import_module("process.entity_address_candidate_preparation")
     await admitted._finish_owned_operation(lambda: _settle_children(owned))
     identities = tuple(
-        identity for identity in owned.cleanup_oids if not preserve_finalized or identity[2] not in owned.kept_oids
+        relation
+        for relation in owned.cleanup_relations
+        if not preserve_finalized or relation[1] not in owned.kept_relations
     )
     await candidate._drain_owned_stages(owned.db_schema, identities)
 
@@ -145,9 +132,7 @@ async def scope(db_schema, allowed_names):
     native = _native()
     _require(native.db._transaction_binding() is None, "outer_transaction_present")
     db_schema = admitted._identifier(db_schema)
-    async with native.db.transaction():
-        _session, _driver, actor = await receipts.ordinary(native.db)
-    owned = OrdinaryPreparation(native.db, asyncio.current_task(), db_schema, _actor_identity(actor))
+    owned = OrdinaryPreparation(native.db, asyncio.current_task(), db_schema)
     token = _ACTIVE.set(owned)
     try:
         owned.declare(allowed_names)
@@ -181,15 +166,15 @@ def _names_in_use(owned, db_schema, names):
         owned.pending_names.difference_update(names)
 
 
-async def _oid(owned, name):
+async def _exists(owned, name):
     return await owned.database.scalar(
-        "SELECT oid::bigint FROM pg_class WHERE oid=to_regclass(:relation) AND relkind='r' AND NOT relispartition",
+        "SELECT EXISTS(SELECT FROM pg_class WHERE oid=to_regclass(:relation) AND relkind='r' AND NOT relispartition)",
         relation=receipts.qualified(owned.db_schema, name),
     )
 
 
 async def create(db_schema, name, create_callback):
-    """Return the handling scope after atomic CREATE/OID capture, or None outside preparation."""
+    """Return the handling scope after atomic candidate creation, or None outside preparation."""
     owned = current()
     if owned is None:
         return None
@@ -204,22 +189,14 @@ async def create(db_schema, name, create_callback):
                 "name_occupied",
             )
             await create_callback(session)
-            oid = await _oid(owned, name)
-            _require(type(oid) is int and oid > 0, "created_stage_missing")
-            if name in owned.owned_oids:
-                owned.retired_oids.append((name, name, owned.owned_oids[name]))
-            owned.owned_oids[name] = oid
+            _require(await _exists(owned, name), "created_stage_missing")
+            owned.owned_relations.add(name)
     return owned
 
 
 async def _lock_owned(owned, name):
-    expected = owned.owned_oids.get(name)
-    _require(expected is not None, "stage_unowned")
-    await owned.database.status(
-        f"LOCK TABLE {receipts.qualified(owned.db_schema, name)} IN ACCESS EXCLUSIVE MODE NOWAIT"
-    )
-    _require(await _oid(owned, name) == expected, "stage_changed")
-    return expected
+    _require(name in owned.owned_relations, "stage_undeclared")
+    await owned.database.status(f"LOCK TABLE {receipts.qualified(owned.db_schema, name)} IN ACCESS SHARE MODE NOWAIT")
 
 
 async def _drop(owned, name):
@@ -227,13 +204,14 @@ async def _drop(owned, name):
         await _ordinary(owned)
         await owned.database.status("SET LOCAL lock_timeout='500ms'")
         await owned.database.status("SET LOCAL statement_timeout='5s'")
-        actual = await _oid(owned, name)
-        if actual is None:
+        exists = await _exists(owned, name)
+        if not exists:
+            owned.owned_relations.discard(name)
             return
-        expected = await _lock_owned(owned, name)
-        owned.retired_oids.append((name, name, expected))
+        await _lock_owned(owned, name)
+        owned.retired_relations.append((name, name))
         await owned.database.status(f"DROP TABLE {receipts.qualified(owned.db_schema, name)} RESTRICT")
-    owned.owned_oids.pop(name, None)
+    owned.owned_relations.discard(name)
 
 
 async def drop(db_schema, name):
@@ -253,13 +231,13 @@ async def _replace(owned, stage, compact):
         await owned.database.status("SET LOCAL statement_timeout='5s'")
         for name in sorted((stage, compact)):
             await _lock_owned(owned, name)
-        old_oid, new_oid = owned.owned_oids[stage], owned.owned_oids[compact]
-        owned.retired_oids.extend(((stage, stage, old_oid), (compact, compact, new_oid), (stage, stage, new_oid)))
+        owned.retired_relations.extend(((stage, stage), (compact, compact)))
         await owned.database.status(f"DROP TABLE {receipts.qualified(owned.db_schema, stage)} RESTRICT")
         await owned.database.status(
             f"ALTER TABLE {receipts.qualified(owned.db_schema, compact)} RENAME TO {admitted._identifier(stage)}"
         )
-    owned.owned_oids[stage] = owned.owned_oids.pop(compact)
+    owned.owned_relations.discard(compact)
+    owned.owned_relations.add(stage)
 
 
 async def replace(db_schema, stage, compact):

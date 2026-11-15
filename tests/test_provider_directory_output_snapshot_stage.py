@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Bound actual encoded COPY bytes and preserve the original incumbent proof."""
 
+from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -72,7 +74,8 @@ async def test_native_copy_status_must_match_the_complete_batch(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_late_capture_cannot_adopt_an_incumbent_that_changed_after_preservation(monkeypatch):
-    old, changed = relation(OUTPUT_ROOTS[0], 101), relation(OUTPUT_ROOTS[0], 501)
+    old = relation(OUTPUT_ROOTS[0], 101)
+    changed = replace(old, columns=(custody.encoded({"name": "different", "type": "text"}),))
     capability = SimpleNamespace(reference=None, targets=(OUTPUT_ROOTS[0],))
     capture = AsyncMock(return_value={OUTPUT_ROOTS[0]: changed})
     monkeypatch.setattr(custody, "_capture", capture)
@@ -87,6 +90,29 @@ def test_private_descriptor_binds_the_original_incumbent_without_nested_receipts
     payload = private.to_payload()
     assert stage.OutputStage.from_payload(payload) == private
     descriptor = stage._descriptor(private, "sealed")
-    assert descriptor["incumbent_oid"] == old.oid
-    assert descriptor["incumbent_digest"] == custody._digest(old.to_payload())
+    assert payload["protocol"] == descriptor["protocol"] == 2
+    assert "oid" not in payload and "incumbent_oid" not in descriptor
+    assert descriptor["incumbent_digest"] == custody._digest(old.named_payload())
     assert "incumbent" not in descriptor
+
+
+def test_old_stage_tokens_preserve_raw_bytes_and_logical_resume():
+    incumbent = relation(OUTPUT_ROOTS[0], 101)
+    old_by_field = {
+        "schema": "source_schema",
+        "target": OUTPUT_ROOTS[0],
+        "relation": "private_a",
+        "oid": 201,
+        "operation_digest": "b" * 64,
+        "incumbent": incumbent.to_payload(),
+    }
+    copied = deepcopy(old_by_field)
+    copied["oid"] = 901
+    copied["incumbent"]["schema_oid"] = 902
+    copied["incumbent"]["oid"] = 903
+    copied["incumbent"]["owner_oid"] = 904
+    originals = [custody.encoded(value) for value in (old_by_field, copied)]
+    assert stage.OutputStage.from_payload(old_by_field) == stage.OutputStage.from_payload(copied)
+    assert [
+        custody.encoded(stage.OutputStage.from_payload(value).to_payload()) for value in (old_by_field, copied)
+    ] == originals

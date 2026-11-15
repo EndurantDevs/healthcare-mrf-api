@@ -1,39 +1,53 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Read published routing metadata from the candidate's own validation report."""
+"""Read published network routing using schema-qualified relation names."""
 
-import json
-
-from process.network_address_projection import PinnedAddressSource, _identifier
+from process.network_address_projection import _identifier
 from process.network_approved_membership_source import ApprovedMembershipSource
-from process.network_compact_custom_preparation import compact_carrier_receipt, compact_custom_receipt
 from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
-from process.network_compact_readiness import is_compact_candidate
-from process.network_serving_read import NetworkServingReadUnavailable, _pinned_manifest
+from process.network_serving_read import NetworkServingReadUnavailable, _object, _pinned_manifest
 
-_PUBLISHED_SQL = """SELECT to_jsonb(candidate)::text AS candidate_json,
- to_jsonb(manifest)::text AS manifest_json,
- physical.relname AS base_name,space.nspname AS base_schema,
- (physical.relrowsecurity OR physical.relforcerowsecurity OR pg_catalog.row_security_active(physical.oid)) AS base_rls,
- (SELECT own.relrowsecurity OR own.relforcerowsecurity OR pg_catalog.row_security_active(own.oid)
-   FROM pg_catalog.pg_class own WHERE own.oid=
-   pg_catalog.to_regclass(pg_catalog.format('%I.entity_address_unified',candidate.schema_name))) AS own_rls,
- to_regclass('{control}.registry_approved_record')::oid::bigint AS approved_oid,
- {approved_rows} AS approved_rows
+_PUBLISHED_SQL = """SELECT jsonb_build_object(
+ 'candidate_id',candidate.candidate_id,'dataset_id',candidate.dataset_id,
+ 'schema_id',candidate.schema_id,'producer_id',candidate.producer_id,
+ 'schema_name',candidate.schema_name,'schema_revision',candidate.schema_revision,
+ 'source_generations',candidate.source_generations,
+ 'approved_custom_revision',candidate.approved_custom_revision,
+ 'expected_head',candidate.expected_head,'expected_rows',candidate.expected_rows,
+ 'accepted_rows',candidate.accepted_rows,'index_ready',candidate.index_ready,
+ 'source_recipes_json',candidate.source_recipes_json,
+ 'validation_json',candidate.validation_json)::text AS candidate_json,
+ jsonb_build_object('candidate_id',manifest.candidate_id,'generation_id',manifest.generation_id,
+ 'schema_revision',manifest.schema_revision,'source_generations',manifest.source_generations,
+ 'approved_custom_revision',manifest.approved_custom_revision,
+ 'manifest_sha256',manifest.manifest_sha256,'eligible',manifest.eligible)::text AS manifest_json,
+ {approved_rows} AS approved_rows,
+ (SELECT {address_heap} FROM (SELECT candidate.validation_json#>'{{serving_readiness,address_artifact}}' AS artifact) a
+  WHERE a.artifact->>'contract'='network_address_artifact.postgres.v1' AND a.artifact->>'revision'='2') AS address_heap
  FROM {control}.network_serving_manifest manifest
  JOIN {control}.network_membership_candidate candidate USING(candidate_id)
- LEFT JOIN pg_catalog.pg_class physical ON physical.oid=(
-  -- Rotation keeps a published heap under its retained name and gives the recorded name to the replacement.
-  SELECT named.oid FROM pg_catalog.pg_class named
-   JOIN pg_catalog.pg_namespace home ON home.oid=named.relnamespace
-  WHERE home.nspname=candidate.validation_json->'address_source'->>'schema_name' AND named.relkind='r'
-   AND named.relname IN (candidate.validation_json->'address_source'->>'table_name',
-    (candidate.validation_json->'address_source'->>'table_name')||'_retained_'||pg_catalog.to_hex(
-     (candidate.validation_json->'serving_readiness'->'address_artifact'->'table'->>'oid')::bigint))
-  ORDER BY named.relname=candidate.validation_json->'address_source'->>'table_name' LIMIT 1)
- LEFT JOIN pg_catalog.pg_namespace space ON space.oid=physical.relnamespace
  WHERE manifest.generation_id=coalesce($1::bigint,
   (SELECT generation_id FROM {control}.network_serving_control WHERE id=1))
- AND manifest.eligible AND candidate.state='published'"""
+ AND manifest.eligible AND candidate.state='published'
+ AND coalesce(octet_length(candidate.validation_json::text),0)<=1048576
+ AND octet_length(candidate.source_generations::text)<=1048576
+ AND coalesce(octet_length(candidate.source_recipes_json::text),0)<=1048576
+ AND octet_length(manifest.source_generations::text)<=1048576"""
+
+# Read the saved schema's logical generation inside the pin's existing statement budget.
+_ADDRESS_HEAP_SQL = """jsonb_build_object(
+ 'authority',to_regclass(format('%I.entity_address_result_generation',a.artifact#>>'{table,schema_name}')) IS NOT NULL,
+ 'current',CASE WHEN to_regclass(format('%I.entity_address_result_generation',
+  a.artifact#>>'{table,schema_name}')) IS NOT NULL THEN coalesce((xpath('/row/is_current/text()',query_to_xml(format(
+  'SELECT local_lineage_id=%L::uuid AND local_generation=%L::bigint AND origin_lineage_id=%L::uuid '
+  'AND origin_generation=%L::bigint AND published_at=%L::timestamptz AS is_current '
+  'FROM %I.entity_address_result_generation WHERE singleton',
+  a.artifact#>>'{authority,local_lineage_id}',a.artifact#>>'{authority,local_generation}',
+  a.artifact#>>'{authority,origin_lineage_id}',a.artifact#>>'{authority,origin_generation}',
+  a.artifact#>>'{authority,published_at}',a.artifact#>>'{table,schema_name}'),true,true,'')))[1]::text::boolean,false)
+  ELSE false END,
+ 'live',to_regclass(format('%I.%I',a.artifact#>>'{table,schema_name}',a.artifact#>>'{table,table_name}')) IS NOT NULL,
+ 'retained',to_regclass(format('%I.%I',a.artifact#>>'{retained_table,schema_name}',
+  a.artifact#>>'{retained_table,table_name}')) IS NOT NULL)"""
 
 
 _APPROVED_ROWS_SQL = """(SELECT coalesce(sum(jsonb_array_length(record_json->'memberships_json')),0)::bigint
@@ -42,96 +56,114 @@ _APPROVED_ROWS_SQL = """(SELECT coalesce(sum(jsonb_array_length(record_json->'me
 
 
 def published_api_pin_statement(control_schema, *, approved=True):
-    """Select the published pointer, never an uncommitted maximum generation."""
+    """Select the published pointer, optionally including its approved membership rows."""
     control = _identifier(control_schema)
-    # A manifest-only reader holds no privilege on approved records.
     approved_rows = _APPROVED_ROWS_SQL.format(control=control) if approved else "NULL::bigint"
-    return _PUBLISHED_SQL.format(control=control, approved_rows=approved_rows)
+    return _PUBLISHED_SQL.format(control=control, approved_rows=approved_rows, address_heap=_ADDRESS_HEAP_SQL)
 
 
-def _require(condition):
-    if condition is not True:
-        raise NetworkServingReadUnavailable("Protected API serving metadata is unavailable")
+def _named_relation(document):
+    return CompactAddressRelation(document["schema_name"], document["table_name"])
 
 
-def _custom_address_relation(candidate, descriptor):
-    report = candidate["validation_json"]
-    closure = report["writer_closure"]
-    custom, carrier = compact_custom_receipt(candidate), compact_carrier_receipt(candidate)
-    if custom is None:
+def published_network_layout(candidate, *, retained_base_name=None):
+    """Decode the published layout while accepting historical metadata's extra fields."""
+    if candidate["validation_json"] is None:
         return None
-    _require(custom.base_source == PinnedAddressSource(**report["address_source"]))
-    _require(custom.base_artifact_sha256 == descriptor["descriptor_sha256"])
-    _require(custom.binding_table_oid == closure["relation_oids"].get("provider_location_binding"))
-    _require(custom.runtime_roles == tuple(sorted(set(closure["loader_roles"] + closure["reader_roles"]))))
-    address_oid = custom.address_table_oid
-    if carrier is not None:
-        _require(carrier.base_source == custom.base_source and carrier.runtime_roles == custom.runtime_roles)
-        _require(
-            carrier.base_artifact_sha256 == custom.base_artifact_sha256
-            and carrier.binding_table_oid == custom.binding_table_oid
-        )
-        _require(not custom.custom_pair_count or address_oid == carrier.address_table_oid)
-        address_oid = carrier.address_table_oid
-    if custom.custom_pair_count or carrier is not None and carrier.materialized_address_rows:
-        _require(address_oid == closure["relation_oids"].get("entity_address_unified"))
-        return CompactAddressRelation(candidate["schema_name"], "entity_address_unified", address_oid)
-    return None
-
-
-def _published_layout(entry, candidate):
-    """Name the retained dependencies of a compact generation from its own validation report."""
-    report = candidate["validation_json"]
-    descriptor = report["serving_readiness"]["address_artifact"]
-    if entry["base_rls"] is not False:
-        raise NetworkServingReadUnavailable("Published network address rows are unavailable")
-    canonical = report["candidate_readiness"]
-    custom = _custom_address_relation(candidate, descriptor)
-    if custom is not None and entry["own_rls"] is not False:
-        # Custom and carrier addresses are read from the candidate's own table; a row filter would hide them.
-        raise NetworkServingReadUnavailable("Published network address rows are unavailable")
+    report = _object(candidate["validation_json"])
+    serving = _object(report["serving_readiness"])
+    if serving.get("component") != "compact_network_serving":
+        return None
+    schema = candidate["schema_name"]
+    search = serving.get("geo_search")
+    sources_by_kind = search.get("sources") if type(search) is dict else None
+    address = _object(report["address_source"])
+    artifact = _object(serving["address_artifact"])
+    namespace = artifact.get("namespace", {})
+    table = artifact.get("table", {})
+    artifact_base = CompactAddressRelation(
+        namespace.get("name", address["schema_name"]), table.get("table_name", table.get("name", address["table_name"]))
+    )
+    if type(sources_by_kind) is dict:
+        base = _named_relation(sources_by_kind["base"])
+        custom = None if sources_by_kind.get("custom") is None else _named_relation(sources_by_kind["custom"])
+    else:
+        base = artifact_base
+        direct = report.get("compact_custom_offices") or {}
+        carriers = report.get("compact_address_carriers") or {}
+        has_custom = direct.get("custom_pair_count", 0) > 0 or carriers.get("materialized_address_rows", 0) > 0
+        custom = CompactAddressRelation(schema, "entity_address_unified") if has_custom else None
+    if retained_base_name is not None and base == artifact_base:
+        # A pinned generation keeps reading the heap that rotation retained for it.
+        base = CompactAddressRelation(base.schema_name, retained_base_name)
     layout = CompactNetworkLayout(
-        CompactAddressRelation(candidate["schema_name"], "network_slice_ref", canonical["ref_map_oid"]),
-        CompactAddressRelation(entry["base_schema"], entry["base_name"], descriptor["table"]["oid"]),
+        CompactAddressRelation(schema, "network_slice_ref"),
+        base,
         tuple(
-            CompactEdgeArtifact(artifact["candidate_id"], artifact["schema_name"], artifact["table_oid"])
-            for artifact in report["serving_readiness"]["edge_artifacts"]
+            CompactEdgeArtifact(artifact["candidate_id"], artifact["schema_name"])
+            for artifact in serving["edge_artifacts"]
         ),
         custom,
     )
-    from process.network_compact_layout import bind_compact_geo_search_candidate
+    if type(search) is dict:
+        from process.network_compact_layout import bind_compact_geo_search
 
-    return bind_compact_geo_search_candidate(layout, candidate)
+        bind_compact_geo_search(layout, CompactAddressRelation(schema, search["table_name"]))
+    return layout
 
 
-def _decode_published_pin(entry, schema, *, approved=True):
+def _saved_address_artifact(candidate):
+    if candidate is None or candidate["validation_json"] is None:
+        return None
+    return _object(_object(candidate["validation_json"]).get("serving_readiness") or {}).get("address_artifact")
+
+
+def _historical_retained_base(candidate):
+    """Name the heap rotation keeps for a report that still records the old base table identity."""
+    report = _object(candidate["validation_json"]) if candidate["validation_json"] is not None else {}
+    artifact = _object(report.get("serving_readiness") or {}).get("address_artifact")
+    table = artifact.get("table") if type(artifact) is dict else None
+    if type(table) is not dict or type(table.get("oid")) is not int:
+        return None
+    address = _object(report["address_source"])
+    schema = artifact.get("namespace", {}).get("name", address["schema_name"])
+    return CompactAddressRelation(
+        schema, table.get("name", address["table_name"]) + "_retained_" + format(table["oid"], "x")
+    )
+
+
+async def _rotated_base_name(connection, entry):
+    """Return the retained name when rotation has moved a historical report's base heap."""
+    from process.network_address_artifact import CONTRACT, _descriptor, _require, pinned_address_heap
+
+    candidate = None if entry is None else _object(entry["candidate_json"])
+    artifact = _saved_address_artifact(candidate)
+    if type(artifact) is dict and artifact.get("contract") == CONTRACT and artifact.get("revision") == 2:
+        if "address_heap" not in entry.keys():
+            relation = await pinned_address_heap(connection, artifact)
+            return None if relation.table_name == artifact["table"]["table_name"] else relation.table_name
+        descriptor, presence = _descriptor(artifact), _object(entry["address_heap"])
+        is_current = presence["live"] is True and presence["current"] is True
+        _require(is_current != (presence["retained"] is True), "retained_table_unavailable")
+        return None if is_current else descriptor["retained_table"]["table_name"]
+    retained = None if candidate is None else _historical_retained_base(candidate)
+    if retained is None or not await connection.fetchval(
+        "SELECT to_regclass($1) IS NOT NULL", _identifier(retained.schema_name) + "." + _identifier(retained.table_name)
+    ):
+        return None
+    return retained.table_name
+
+
+def _decode_published_pin(entry, schema, *, approved=True, retained_base_name=None):
     if entry is None:
         raise NetworkServingReadUnavailable("Published network generation is unavailable")
-    candidate = json.loads(entry["candidate_json"])
-    report = candidate["validation_json"]
-    layout = None
-    if is_compact_candidate(candidate):
-        layout = _published_layout(entry, candidate)
-    elif entry["own_rls"] is not False:
-        # Without a compact layout the generation serves its own address table; row filtering would hide rows.
-        raise NetworkServingReadUnavailable("Published network address rows are unavailable")
+    candidate = _object(entry["candidate_json"])
     manifest = _pinned_manifest(
-        entry,
-        custody={
-            # The validation report names the candidate's relations; no ledger row is read.
-            "receipt": {
-                "closure": report["writer_closure"],
-                "control": {},
-                "index_definition_sha256": report["serving_readiness"]["index_definition_sha256"],
-            },
-            "seal_sha256": None,
-            "compact_layout": layout,
-        },
+        entry, layout=published_network_layout(candidate, retained_base_name=retained_base_name)
     )
     if not approved:
         return manifest, None, None
-    relation = CompactAddressRelation(schema, "registry_approved_record", entry["approved_oid"])
-    # Published approved revisions are append-only; approval creates a new revision.
+    relation = CompactAddressRelation(schema, "registry_approved_record")
     approved = ApprovedMembershipSource(
         manifest.approved_custom_revision, manifest.source_generations["custom_membership"], entry["approved_rows"]
     )
@@ -142,27 +174,26 @@ def _decode_published_pin(entry, schema, *, approved=True):
 
 
 async def read_published_api_pin(connection, generation_id, schema, *, approved=True):
-    """Use stored publication evidence; actual data queries report missing objects or access."""
+    """Read the requested or current logical generation in the caller's snapshot."""
     if generation_id is not None and (type(generation_id) is not int or not 0 < generation_id < 2**63):
         raise NetworkServingReadUnavailable("Published network generation selector is invalid")
     entry = await connection.fetchrow(published_api_pin_statement(schema, approved=approved), generation_id)
-    return _decode_published_pin(entry, schema, approved=approved)
+    # Publication refuses row filtered address heaps and they stay frozen, so reads need no re-check.
+    return _decode_published_pin(
+        entry, schema, approved=approved, retained_base_name=await _rotated_base_name(connection, entry)
+    )
 
 
 def active_published_api_pin(connection, manifest=None, *, control_schema=None):
-    """Reuse only the exact manifest issued inside this connection's active API scope."""
+    """Reuse the logical generation selected by this request's read context."""
     from process.registry_network_catalog_read import _PINNED_READ
 
     pinned = _PINNED_READ.get()
-    if pinned is None or pinned[0] is not connection or getattr(pinned[1], "_published_api_request", False) is not True:
+    if pinned is None:
         return None
-    session = getattr(pinned[1], "_api_request_session", None)
-    if (
-        (manifest is not None and manifest is not pinned[1])
-        or (control_schema is not None and control_schema != pinned[2])
-        or not connection.is_in_transaction()
-        or session is None
-        or session.get_transaction() is not getattr(pinned[1], "_api_request_transaction", None)
-    ):
-        raise NetworkServingReadUnavailable("Published network request snapshot differs")
-    return pinned[1]
+    current, schema = pinned[-2:]
+    if getattr(current, "_published_api_request", False) is not True:
+        return None
+    if manifest is not None and manifest != current or control_schema is not None and control_schema != schema:
+        raise NetworkServingReadUnavailable("Published network generation differs from the request")
+    return current

@@ -215,10 +215,14 @@ async def test_compact_header_is_validated_before_exposure():
         assert not pages
 
 
-def test_control_catalog_preserves_native_hooks_fks_owner_and_acl():
-    added = "WHERE k.conindid=i.indexrelid AND k.conrelid=c.oid)"
-    assert scratch.OUTPUT_CATALOG_SQL.count(added) == 1
+def test_control_catalog_reuses_complete_named_layout_without_custody_fields():
     assert scratch._SOURCE_CATALOG_SQL == scratch.OUTPUT_CATALOG_SQL
+    assert "WHERE k.conrelid=c.oid" in scratch._SOURCE_CATALOG_SQL
+    assert "pg_get_constraintdef" in scratch._SOURCE_CATALOG_SQL
+    assert "pg_trigger" in scratch._SOURCE_CATALOG_SQL
+    assert not any(
+        field in scratch._SOURCE_CATALOG_SQL for field in (" AS oid", "AS acl", "relowner", "constraint_oid")
+    )
 
 
 @pytest.mark.parametrize("change", [None, "projection", "source_fence", "resource_types"])
@@ -662,9 +666,7 @@ def _metadata_scope():
         )
         for index, name in enumerate(scratch.TYPED_ROOTS, 2)
     )
-    return replace(
-        scope, stages=owned_stages, source_copy_json=scratch.encoded(dict(name="owned_control", copy=dict(oid=1)))
-    )
+    return replace(scope, stages=owned_stages, source_copy_json=scratch.encoded(dict(name="owned_control", copy={})))
 
 
 async def test_discard_enters_the_required_output_isolation_before_cleanup(monkeypatch):
@@ -726,10 +728,9 @@ async def test_metadata_reverifies_same_task_without_nesting_lifetime_scope(monk
                     await scratch.scratch_input_metadata(directory, scope)
             else:
                 metadata = await scratch.scratch_input_metadata(directory, scope)
-                assert set(metadata) == {"relation_by_table", "relation_oids"}
+                assert set(metadata) == {"relation_by_table"}
                 assert metadata["relation_by_table"][scratch.SOURCE] == "owned_control"
-                assert metadata["relation_oids"][scratch.SOURCE] == 1
-                assert all(metadata["relation_oids"][stage.target] == stage.oid for stage in scope.stages)
+                assert all(metadata["relation_by_table"][stage.target] == stage.relation for stage in scope.stages)
             verify.assert_awaited_once_with(directory, scope, capability)
             assert scratch._ACTIVE.get() is (scope if active else None)
             assert scratch._VERIFIED.get() is None
@@ -1069,21 +1070,25 @@ def _layout_scope():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", [None, "oid", "schema", "persistence", "owner", "acl", "index", "child"])
+@pytest.mark.parametrize(
+    "change", [None, "oid", "schema", "persistence", "owner", "acl", "index_oid", "index", "child"]
+)
 async def test_scratch_native_layout_requires_original_scope_and_exact_catalog(monkeypatch, change):
     """Pure boundary checks delegate model validation and compare the complete issued receipt."""
     scope, expected, catalog_row_by_field = _layout_scope()
-    from process.provider_directory_cms_preparation import OwnedRelation
-
-    owned = OwnedRelation(expected.schema, expected.relation, expected.oid, 100, "p")
-    if change in {"oid", "schema", "persistence"}:
-        owned = replace(owned, **{change: {"oid": 999, "schema": "foreign", "persistence": "u"}[change]})
+    owned = SimpleNamespace(schema=expected.schema, relation=expected.relation, persistence="p")
+    if change in {"schema", "persistence"}:
+        setattr(owned, change, {"schema": "foreign", "persistence": "u"}[change])
+    if change == "oid":
+        catalog_row_by_field["oid"] += 1
     if change == "owner":
         catalog_row_by_field["relowner"] += 1
     if change == "acl":
         catalog_row_by_field["acl_closed"] = False
-    if change == "index":
+    if change == "index_oid":
         catalog_row_by_field["indexes"][0]["oid"] += 1
+    if change == "index":
+        catalog_row_by_field["indexes"][0]["keys"] = ["different"]
     fetch = AsyncMock(return_value=SimpleNamespace(_mapping=catalog_row_by_field))
     shape = Mock()
     monkeypatch.setattr(scratch, "require_output_shape", shape)
@@ -1092,7 +1097,7 @@ async def test_scratch_native_layout_requires_original_scope_and_exact_catalog(m
     scratch._ISSUED[scope] = (scope.directory, scope.admission, scope.task, "{}", scratch._scope_state(scope))
     try:
         with scratch.scratch_input_scope(scope):
-            if change:
+            if change in {"schema", "persistence", "index", "child"}:
                 invocation = scratch.scratch_relation_proof(directory, owned, database=executor)
                 if change == "child":
                     invocation = asyncio.create_task(invocation)
@@ -1100,20 +1105,17 @@ async def test_scratch_native_layout_requires_original_scope_and_exact_catalog(m
                     await invocation
             else:
                 assert await scratch.scratch_relation_proof(directory, owned, database=executor) == expected
-                assert fetch.await_args.kwargs == dict(
-                    schema=expected.schema, names=[expected.relation], owner=expected.owner_oid, readers=[]
-                )
+                assert fetch.await_args.kwargs == dict(schema=expected.schema, names=[expected.relation])
                 shape.assert_called_once_with(catalog_row_by_field, expected.target)
     finally:
         del scratch._ISSUED[scope]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "unregistered", "foreign_task", "foreign_admission", "revoked"])
+@pytest.mark.parametrize("failure", [None, "unregistered", "same_admission_child", "foreign_admission", "revoked"])
 @pytest.mark.parametrize("batch", [False, True])
 async def test_layout_recapture_accepts_only_same_issued_source_worker(source_case, monkeypatch, failure, batch):
     from process import entity_address_preparation_admission as address_admission
-    from process.provider_directory_cms_preparation import OwnedRelation
 
     case = source_case
     original_worker = address_admission._admitted_preparation(
@@ -1121,7 +1123,7 @@ async def test_layout_recapture_accepts_only_same_issued_source_worker(source_ca
     )
     scope, expected, catalog_by_field = _layout_scope()
     scope = replace(scope, admission=case.admission)
-    owned = OwnedRelation(expected.schema, expected.relation, expected.oid, 100, "p")
+    owned = SimpleNamespace(schema=expected.schema, relation=expected.relation, persistence="p")
     fetch = AsyncMock(return_value=SimpleNamespace(_mapping=catalog_by_field))
 
     async def all_rows(*args, **kwargs):
@@ -1133,8 +1135,8 @@ async def test_layout_recapture_accepts_only_same_issued_source_worker(source_ca
 
     async def recapture():
         worker = original_worker
-        if failure in {"foreign_task", "foreign_admission"}:
-            admission = case.admission if failure == "foreign_task" else _admission()
+        if failure in {"same_admission_child", "foreign_admission"}:
+            admission = case.admission if failure == "same_admission_child" else _admission()
             admission._started = True
             token = preparation._ACTIVE.set(admission)
             worker = address_admission._admitted_preparation(admission, admission.plan.native_address_input_hash)
@@ -1155,7 +1157,8 @@ async def test_layout_recapture_accepts_only_same_issued_source_worker(source_ca
     try:
         with scratch.scratch_input_scope(scope):
             await asyncio.create_task(recapture())
-        assert fetch.await_count == (1 + int(batch and failure is None) if failure in {None, "revoked"} else 0)
+        is_permitted = failure in {None, "same_admission_child", "revoked"}
+        assert fetch.await_count == (1 + int(batch and failure != "revoked") if is_permitted else 0)
     finally:
         del scratch._ISSUED[scope]
 
@@ -1178,7 +1181,7 @@ async def _recapture_worker_layout(owned, executor, expected, worker, fetch, fai
 
         fetch.side_effect = revoke
     try:
-        if failure is not None:
+        if failure not in (None, "same_admission_child"):
             with pytest.raises(RuntimeError, match="scratch_scope_required"):
                 await _worker_relation_proof(owned, executor, batch)
         else:
@@ -1283,7 +1286,6 @@ async def test_issued_state_preserves_json_array_identity_and_exact_atoms(change
 
 def _batch_members(split=None):
     """Keep the complete real receipt shape while varying one grouping coordinate."""
-    from process.provider_directory_cms_preparation import OwnedRelation
 
     scope, first, catalog_row_by_field = _layout_scope()
     second = replace(
@@ -1312,13 +1314,15 @@ def _batch_members(split=None):
             "relname": receipt.relation,
             "relowner": receipt.owner_oid,
         }
-    relations = tuple(OwnedRelation(receipt.schema, receipt.relation, receipt.oid, 100, "p") for receipt in members)
+    relations = tuple(
+        SimpleNamespace(schema=receipt.schema, relation=receipt.relation, persistence="p") for receipt in members
+    )
     return scope, members, row_by_name, relations
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("split", [None, "actor", "schema", "owner"])
-async def test_scratch_batch_groups_exact_actor_schema_owner_and_clears_proofs(monkeypatch, split):
+async def test_scratch_batch_groups_by_executor_schema_and_ignores_old_owner_tokens(monkeypatch, split):
     scope, members, row_by_name, relations = _batch_members(split)
     fetch = AsyncMock(side_effect=lambda _sql, **params: [row_by_name[name] for name in params["names"]])
     executors = (SimpleNamespace(all=fetch), SimpleNamespace(all=fetch))
@@ -1334,16 +1338,18 @@ async def test_scratch_batch_groups_exact_actor_schema_owner_and_clears_proofs(m
                 assert {key: value[0] for key, value in proofs.items()} == {
                     (item.schema, item.relation): item for item in members
                 }
-                assert fetch.await_count == (1 if split is None else 2)
+                assert fetch.await_count == (2 if split in {"actor", "schema"} else 1)
             assert proofs == {}
-        assert fetch.await_count == (2 if split is None else 4)
-        assert all(len(call.kwargs["names"]) == (2 if split is None else 1) for call in fetch.await_args_list)
+        assert fetch.await_count == (4 if split in {"actor", "schema"} else 2)
+        assert all(
+            len(call.kwargs["names"]) == (1 if split in {"actor", "schema"} else 2) for call in fetch.await_args_list
+        )
     finally:
         del scratch._ISSUED[scope]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["missing", "duplicate", "foreign", "oid", "owner", "acl", "index"])
+@pytest.mark.parametrize("change", ["missing", "duplicate", "foreign", "index"])
 async def test_scratch_batch_refuses_changed_member_at_exit(monkeypatch, change):
     scope, members, row_by_name, relations = _batch_members()
     has_changed_members = False
@@ -1357,12 +1363,8 @@ async def test_scratch_batch_refuses_changed_member_at_exit(monkeypatch, change)
                 return [*captured_rows, captured_rows[0]]
             if change == "foreign":
                 captured_rows[0]["relname"] = "unissued"
-            elif change in {"oid", "owner"}:
-                captured_rows[0]["oid" if change == "oid" else "relowner"] += 1
-            elif change == "acl":
-                captured_rows[0]["acl_closed"] = False
             else:
-                captured_rows[0]["indexes"][0]["oid"] += 1
+                captured_rows[0]["indexes"][0]["keys"] = ["different"]
         return captured_rows
 
     database = SimpleNamespace(all=AsyncMock(side_effect=fetch))

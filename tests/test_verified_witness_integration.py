@@ -17,6 +17,8 @@ from process import registry_membership_refresh_runtime as runtime
 from process import registry_source_office_custody as office_custody
 from process import registry_source_recipe_composition as composition
 from process import registry_verified_witness_offices as offices
+from process import registry_verified_witness_stage as witness_stage
+from process.network_approved_membership_source import ApprovedMembershipSource
 from tests.test_verified_inventory_v2 import context, rows
 
 
@@ -90,13 +92,20 @@ async def test_compact_v2_preserves_direct_origin(monkeypatch):
     pin = SimpleNamespace(generation_id="a" * 64)
     manifest = SimpleNamespace(
         manifest_sha256="b" * 64,
-        compact_layout=SimpleNamespace(base=SimpleNamespace(table_oid=12)),
+        compact_layout=SimpleNamespace(
+            base=SimpleNamespace(schema_name="retained", table_name="entity_address_unified")
+        ),
         source_generations={"unified_address": "a" * 64},
     )
     monkeypatch.setattr(
         compact,
         "resolve_compact_address_origin",
-        AsyncMock(return_value=({"descriptor_sha256": "c" * 64}, SimpleNamespace(table_oid=12))),
+        AsyncMock(
+            return_value=(
+                {"descriptor_sha256": "c" * 64},
+                SimpleNamespace(schema_name="retained", table_name="entity_address_unified"),
+            )
+        ),
     )
     verified = AsyncMock()
     strict = AsyncMock()
@@ -119,21 +128,36 @@ async def test_compact_v2_preserves_direct_origin(monkeypatch):
 async def test_independent_v2_reuse_follows_declared_source_not_publication_fence(monkeypatch):
     previous = SimpleNamespace(generation_id=UUID(int=1))
     recipe, _, _ = rows()
-    address_inputs = (object(), ("reader",))
     monkeypatch.setattr(office_records, "verify_initial_source_office_receipt", lambda candidate: {"revision": 5})
-    monkeypatch.setattr(office_custody, "_office_inputs", lambda candidate: address_inputs)
     lineage = AsyncMock(return_value=(previous, object()))
     head = AsyncMock()
-    stage = AsyncMock(return_value=object())
+
+    async def require_scope(_connection, recipes, approved, **options):
+        witness_stage._require_witness_scope(recipes, approved, options["read_context"].verified_office_inputs)
+        return object()
+
+    stage = AsyncMock(side_effect=require_scope)
     monkeypatch.setattr(custody, "resolve_registry_retained_generation", lineage)
     monkeypatch.setattr(custody, "resolve_network_serving_manifest", head)
     monkeypatch.setattr(custody, "stage_registry_source_recipes", stage)
-    candidate_by_field = {"candidate_id": str(UUID(int=3)), "expected_head": str(UUID(int=2))}
+    candidate_by_field = {
+        "candidate_id": str(UUID(int=3)),
+        "expected_head": str(UUID(int=2)),
+        "validation_json": {
+            "address_source": {
+                "schema_name": "named_addresses",
+                "table_name": "entity_address_unified",
+                "generation_id": "b" * 64,
+            }
+        },
+    }
+    address_inputs = office_custody._office_inputs(candidate_by_field)
+    assert address_inputs[1] == ()
     await custody._independent_source_stage(
         object(),
         SimpleNamespace(candidate_id=str(UUID(int=3))),
         candidate_by_field,
-        object(),
+        ApprovedMembershipSource(7, "a" * 64),
         expected={"revision": 4},
         control_schema="registry",
         office_authority=None,
@@ -157,7 +181,7 @@ async def test_readiness_checks_policy_without_staging_and_propagates_every_fail
     monkeypatch.setattr(runtime, "_driver", AsyncMock(return_value=driver))
     stage = AsyncMock()
     monkeypatch.setattr(composition, "stage_registry_source_recipes", stage)
-    policy = AsyncMock(return_value=(context(), ()), side_effect=failure)
+    policy = AsyncMock(return_value=context(), side_effect=failure)
     monkeypatch.setattr(offices, "_policy_context", policy)
     reviewed_arguments = []
     monkeypatch.setattr(fhir, "_reviewed_descriptor", lambda *arguments: reviewed_arguments.append(arguments))
@@ -202,7 +226,7 @@ async def test_witness_policy_requires_full_source_fence_and_never_caches_failur
         assert case.events[-1] == "address_fenced"
         if failure is not None:
             raise failure
-        return context(), ()
+        return context()
 
     policy = AsyncMock(side_effect=check_policy)
     monkeypatch.setattr(offices, "_policy_context", policy)
@@ -285,3 +309,40 @@ async def test_witness_readiness_refuses_changed_full_source_before_policy(monke
     case.prepare.assert_not_awaited()
     assert "full_source_pin" in case.events and "address_fenced" not in case.events
     assert case.service._readiness_key is None and not case.service._is_ready
+
+
+@pytest.mark.parametrize("damage", [None, "schema", "table", "generation"])
+async def test_compact_origin_binds_named_relation_and_logical_generation(monkeypatch, damage):
+    from dataclasses import replace
+
+    from process.network_address_projection import PinnedAddressSource
+    from process.network_compact_layout import CompactAddressRelation
+
+    address = PinnedAddressSource("retained_addresses", "entity_address_unified", "a" * 64)
+    relation = CompactAddressRelation(address.schema_name, address.table_name)
+    base = replace(relation, schema_name="another_snapshot") if damage == "schema" else relation
+    base = replace(base, table_name="other_addresses") if damage == "table" else base
+    manifest = SimpleNamespace(
+        manifest_sha256="b" * 64,
+        compact_layout=SimpleNamespace(base=base),
+        source_generations={"unified_address": "c" * 64 if damage == "generation" else address.generation_id},
+    )
+    resolve = AsyncMock(return_value=({"descriptor_sha256": "d" * 64}, relation))
+    monkeypatch.setattr(compact, "resolve_compact_address_origin", resolve)
+    artifact, summary = await compact.prepare_compact_composition_source(
+        object(),
+        SimpleNamespace(base_source=address),
+        object(),
+        {"loader_roles": (), "reader_roles": ()},
+        (),
+        SimpleNamespace(source_manifest=manifest, control_schema="registry"),
+    )
+    assert artifact.origin_manifest_sha256 == (manifest.manifest_sha256 if damage is None else None)
+    assert artifact.address_source == address and summary is None
+    assert resolve.await_args.args[1] == {
+        "source_generations": {
+            "unified_address": address.generation_id,
+            "retained_network_source": manifest.manifest_sha256,
+        },
+        "validation_json": {},
+    }

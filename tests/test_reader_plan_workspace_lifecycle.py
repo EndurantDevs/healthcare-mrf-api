@@ -16,13 +16,6 @@ def workspace_case(monkeypatch, outcome):
     events = []
     connection = SimpleNamespace()
 
-    async def execute(_query):
-        events.append("identity")
-        return SimpleNamespace(first=lambda: ("foreign" if outcome == "foreign_login" else "reader", "reader"))
-
-    async def rollback():
-        events.append("rollback")
-
     async def options(**kwargs):
         events.append(("readonly", kwargs["postgresql_readonly"]))
         return connection
@@ -49,8 +42,6 @@ def workspace_case(monkeypatch, outcome):
         if outcome == "prepare_failure":
             raise RuntimeError("preparation failed")
 
-    connection.execute = execute
-    connection.rollback = rollback
     connection.execution_options = options
     connection.begin = begin
     connection.invalidate = invalidate
@@ -60,15 +51,13 @@ def workspace_case(monkeypatch, outcome):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["success", "foreign_login", "prepare_failure"])
-async def test_workspace_keeps_login_and_retires_connection_on_every_exit(monkeypatch, outcome):
+@pytest.mark.parametrize("outcome", ["success", "prepare_failure"])
+async def test_workspace_prepares_before_read_only_and_retires_connection_on_every_exit(monkeypatch, outcome):
     reader, connection, events = workspace_case(monkeypatch, outcome)
     if outcome == "success":
         async with plan_reader_connection(reader) as actual:
             assert actual is connection
             assert events == [
-                "identity",
-                "rollback",
                 ("readonly", False),
                 "begin",
                 "prepared",
@@ -76,14 +65,10 @@ async def test_workspace_keeps_login_and_retires_connection_on_every_exit(monkey
                 ("readonly", True),
             ]
     else:
-        with pytest.raises(
-            RuntimeError, match="identity differs" if outcome == "foreign_login" else "preparation failed"
-        ):
+        with pytest.raises(RuntimeError, match="preparation failed"):
             async with plan_reader_connection(reader):
                 pytest.fail("An invalid workspace was returned")
     assert events[-2:] == ["invalidated", "closed"]
-    if outcome == "foreign_login":
-        assert "prepared" not in events and "rollback" not in events
 
 
 @pytest.mark.asyncio
@@ -92,10 +77,7 @@ async def test_cancelled_reader_waits_for_connection_retirement(monkeypatch):
     invalidation_started = asyncio.Event()
     invalidation_finished = asyncio.Event()
     release_invalidation = asyncio.Event()
-    connection = SimpleNamespace(
-        execute=AsyncMock(return_value=SimpleNamespace(first=lambda: ("reader", "reader"))),
-        rollback=AsyncMock(),
-    )
+    connection = SimpleNamespace()
     connection.execution_options = AsyncMock(return_value=connection)
 
     @asynccontextmanager

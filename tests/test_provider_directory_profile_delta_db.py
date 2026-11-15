@@ -24,7 +24,6 @@ from tests.test_provider_directory_profile_control_capacity import (
     _control_wal_plan_input,
 )
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 from tests.provider_directory_profile_delta_publication import (
     _assert_delta_post_commit_scenario,
@@ -52,26 +51,26 @@ def test_profile_delta_receipt_matching_accepts_zero_counts() -> None:
 
     prepared_delta = _prepared_delta()
     receipt_by_field = {
-        **importer._provider_directory_profile_delta_receipt_static_values(
-            prepared_delta
-        ),
+        **importer._provider_directory_profile_delta_receipt_static_values(prepared_delta),
+        "targets_json": prepared_delta.targets,
         "evidence_rows": 0,
         "profile_rows": 0,
         "evidence_inserted": 0,
         "evidence_deleted": 0,
         "profile_inserted": 0,
         "profile_deleted": 0,
-        "from_capacity_geometry_json": (
-            prepared_delta.from_capacity_geometry_json
-        ),
-        "capacity_geometry_json": (
-            prepared_delta.capacity_geometry_json
-        ),
+        "from_capacity_geometry_json": (prepared_delta.from_capacity_geometry_json),
+        "capacity_geometry_json": (prepared_delta.capacity_geometry_json),
     }
 
     assert importer._is_provider_directory_profile_delta_receipt_matching(
         receipt_by_field,
         prepared_delta,
+    )
+    changed_coordinates_by_role = {role: dict(coordinate) for role, coordinate in prepared_delta.targets.items()}
+    changed_coordinates_by_role["evidence"]["name"] = "other_evidence_target"
+    assert not importer._is_provider_directory_profile_delta_receipt_matching(
+        {**receipt_by_field, "targets_json": changed_coordinates_by_role}, prepared_delta
     )
 
 
@@ -90,21 +89,10 @@ async def test_profile_delta_preserves_retained_facts_and_replays(
         scenario = await _delta_relation_scenario(database, schema)
         lineage = _delta_lineage()
         oid_by_name = await _delta_relation_oid_by_name(database, scenario)
-        seed_geometry = capacity.validated_capacity_geometry(
-            _geometry_payload(
-                evidence_target_oid=oid_by_name["evidence_target"],
-                profile_target_oid=oid_by_name["profile_target"],
-            )
-        )
-        await _insert_delta_checkpoint(
-            database, scenario, lineage, oid_by_name, seed_geometry
-        )
-        await _insert_delta_serving_generation(
-            database, scenario, lineage, oid_by_name
-        )
-        capacity_context = await _delta_capacity_context(
-            database, scenario, lineage, oid_by_name
-        )
+        seed_geometry = capacity.validated_capacity_geometry(_geometry_payload())
+        await _insert_delta_checkpoint(database, scenario, lineage, oid_by_name, seed_geometry)
+        await _insert_delta_serving_generation(database, scenario, lineage, oid_by_name)
+        capacity_context = await _delta_capacity_context(database, scenario, lineage, oid_by_name)
         geometry = capacity_context.geometry
         await database.status(
             f"UPDATE {scenario.checkpoint_ref} "
@@ -115,16 +103,10 @@ async def test_profile_delta_preserves_retained_facts_and_replays(
             geometry_json=capacity.canonical_capacity_geometry_json(geometry),
             build_id=lineage.build_id,
         )
-        profile_delta = _prepared_scenario_delta(
-            scenario, lineage, oid_by_name, geometry
-        )
-        admission = await _delta_capacity_admission(
-            database, lineage, capacity_context
-        )
+        profile_delta = _prepared_scenario_delta(scenario, lineage, oid_by_name, geometry)
+        admission = await _delta_capacity_admission(database, lineage, capacity_context)
         await _publish_prepared_delta(profile_delta, admission)
-        await _assert_delta_publication(
-            database, scenario, lineage, profile_delta
-        )
+        await _assert_delta_publication(database, scenario, lineage, profile_delta)
         await _assert_delta_post_commit_scenario(
             database,
             scenario,

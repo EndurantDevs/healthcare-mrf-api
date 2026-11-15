@@ -115,14 +115,12 @@ def _support_tables(schema):
     ]
 
 
-def _install(connection, schema="import_guards", *, create_schema=True):
+def _install_guard_tables(connection, schema, functions):
+    """Create the real guard dependency tables while retaining existing fixture rows and native layout."""
     import sqlalchemy as sa
 
     from db.models import Base
 
-    if create_schema:
-        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
-    functions, triggers = _migration_statements(schema)
     needed = set().union(
         *(set(re.findall(r'"' + re.escape(schema) + r'"\."([^"]+)"', sql)) for sql in functions.values())
     )
@@ -138,13 +136,42 @@ def _install(connection, schema="import_guards", *, create_schema=True):
         models_by_name[name].to_metadata(metadata, schema=schema, referred_schema_fn=lambda *_: schema)
     metadata.create_all(connection)
     for sql in _support_tables(schema):
-        connection.execute(sa.text(sql))
+        table_name = re.search(r'CREATE TABLE "[^"]+"\."([^"]+)"', sql)[1]
+        if not sa.inspect(connection).has_table(table_name, schema=schema):
+            connection.execute(sa.text(sql))
+    return metadata
+
+
+def _install_guard_family(connection, schema):
+    """Apply the complete frozen function revision while retaining existing hook objects and data."""
+    import sqlalchemy as sa
+
+    functions, triggers = _migration_statements(schema)
+    metadata = _install_guard_tables(connection, schema, functions)
     for sql in functions.values():
-        connection.execute(sa.text(sql))
+        current_revision = re.sub(r"CREATE(?: OR REPLACE)? FUNCTION", "CREATE OR REPLACE FUNCTION", sql, count=1)
+        connection.execute(sa.text(current_revision))
     for sql in triggers:
-        connection.execute(sa.text(sql))
         trigger = re.search(r'CREATE TRIGGER "?([^"\s]+)"?', sql)[1]
+        present = connection.scalar(
+            sa.text(
+                "SELECT EXISTS(SELECT FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=:schema AND c.relname='import_run' AND t.tgname=:name)"
+            ),
+            {"schema": schema, "name": trigger},
+        )
+        if not present:
+            connection.execute(sa.text(sql))
         connection.execute(sa.text(f'ALTER TABLE "{schema}".import_run ENABLE ALWAYS TRIGGER "{trigger}"'))
+    return metadata
+
+
+def _install(connection, schema="import_guards", *, create_schema=True):
+    """Install the genuine complete dependency/guard family and one ordinary mutable run."""
+    import sqlalchemy as sa
+
+    if create_schema:
+        connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+    metadata = _install_guard_family(connection, schema)
     connection.execute(
         metadata.tables[f"{schema}.import_run"]
         .insert()
@@ -227,10 +254,17 @@ async def _assert_captured_guards(database, relation_by_field, dependencies):
             )
             == dependencies
         )
+        copied_triggers = [dict(trigger_by_field) for trigger_by_field in captured]
+        copied_triggers[0]["trigger_function_oid"] = -1
+        assert (
+            await fhir.profile_capacity_projection.assert_relation_guards(
+                fhir, relation_map, copied_triggers, oid, attributes, indexes, constraints, (0, None, False)
+            )
+            == dependencies
+        )
         for name, changed_value in (
             ("tgtype", captured[0]["tgtype"] ^ 1),
             ("trigger_enabled", "O"),
-            ("trigger_function_oid", captured[0]["trigger_function_oid"] + 1),
             ("trigger_function_source", "BEGIN RETURN NEW; END;"),
         ):
             changed_triggers = [dict(catalog_row) for catalog_row in captured]
@@ -252,15 +286,15 @@ async def _native_proof(engine):
     import pytest
     import sqlalchemy as sa
 
+    from db.connection import ConnectionProxy
     from process import provider_directory_import_run_guards as guards
-    from tests.test_provider_directory_profile_initial_migration import _CatalogDatabase
 
     async with engine.begin() as connection:
         await connection.run_sync(_install)
     async with engine.begin() as connection:
         oid = await connection.scalar(sa.text("SELECT 'import_guards.import_run'::regclass::oid::bigint"))
         relation_by_field = {"schema_name": "import_guards", "relation_oid": oid}
-        database = _CatalogDatabase(connection)
+        database = ConnectionProxy(None, connection, None)
         for catalog_result in await database.all(
             guards._FUNCTION_CATALOG, schema="import_guards", names=list(guards._FUNCTIONS)
         ):
@@ -297,11 +331,14 @@ async def _native_proof(engine):
             try:
                 await connection.execute(sa.text(sql))
                 with pytest.raises(RuntimeError, match="import_run_guard_shape_changed"):
-                    await guards.assert_import_run_guards(_CatalogDatabase(connection), relation_by_field)
+                    await guards.assert_import_run_guards(ConnectionProxy(None, connection, None), relation_by_field)
             finally:
                 await transaction.rollback()
     async with engine.connect() as connection:
-        assert await guards.assert_import_run_guards(_CatalogDatabase(connection), relation_by_field) == dependencies
+        assert (
+            await guards.assert_import_run_guards(ConnectionProxy(None, connection, None), relation_by_field)
+            == dependencies
+        )
 
 
 def test_native_complete_guard_catalog_and_ordinary_update():

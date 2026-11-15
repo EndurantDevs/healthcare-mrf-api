@@ -14,7 +14,11 @@ from process.registry_fhir_catalog_reference_rollup import fhir_catalog_referenc
 from process.registry_fhir_catalog_sources import fhir_catalog_source_generation
 from tests.test_registry_fhir_catalog_observation_sync_postgres import (
     metadata_custody as metadata_custody,
+)
+from tests.test_registry_fhir_catalog_observation_sync_postgres import (
     observation_case as observation_case,
+)
+from tests.test_registry_fhir_catalog_observation_sync_postgres import (
     observed_source_db as observed_source_db,
 )
 
@@ -41,7 +45,7 @@ async def _replace_plan_resources(case, plan_count, reference_count):
         "provider_directory_dataset_resource", schema_name=case.source.schema, records=source_records
     )
     await case.source.admin.execute(
-        f'UPDATE "{case.source.schema}".provider_directory_endpoint_dataset SET resource_count=$1 '
+        f'UPDATE "{case.source.header_schema}".provider_directory_endpoint_dataset SET resource_count=$1 '
         "WHERE dataset_id='dataset-one'",
         len(source_records),
     )

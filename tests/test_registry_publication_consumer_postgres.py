@@ -39,7 +39,6 @@ from process.registry_candidate_composition import (
     compose_registry_membership_candidate,
     prepare_registry_composition_address_artifact,
 )
-from process.registry_candidate_custody_preparation import split_registry_candidate_custody
 from process.registry_publication_authority import RegistryPublicationAuthorityClient
 from process.registry_publication_consumer import RegistryPublicationConsumerConfig, consume_registry_publication_once
 from process.registry_publication_execution import _source_rollback_address_sources
@@ -59,7 +58,6 @@ from tests.test_network_custom_address_source_postgres import _draft
 from tests.test_network_fhir_membership_source_postgres import fhir_source as fhir_source
 from tests.test_network_fhir_membership_source_postgres import reviewed_fhir_source as reviewed_fhir_source
 from tests.test_registry_approval_store_postgres import _command, _create
-from tests.test_registry_candidate_composition_postgres import _seal_composition_target
 from tests.test_registry_publication_authority import _reply
 from tests.test_registry_publication_worker_permissions_postgres import (
     _fixture_dsn,
@@ -82,13 +80,32 @@ from tests.test_registry_source_retention import candidate_receipt
 pytestmark = pytest.mark.asyncio
 
 
+async def _consumer_pool(fixture, kind, dsn):
+    """Create the existing role pool with its configured SQL and checkout limits."""
+    limits = getattr(fixture, "sql_limits", None)
+    if limits is None:
+        return await asyncpg.create_pool(
+            dsn, user=fixture.roles_by_kind[kind], password=fixture.role_password, min_size=1, max_size=2
+        )
+    from process.registry_publication_worker import _BoundedPool, _pool_options
+
+    url = fixture.fixture.engine.url.set(username=fixture.roles_by_kind[kind], password=fixture.role_password)
+    pool = await asyncpg.create_pool(**_pool_options(url, 2, limits))
+    return _BoundedPool(pool, limits.connect_timeout_seconds)
+
+
 @asynccontextmanager
 async def _consumer(fixture, *, authority_hook=None):
+    """Run the existing authority client with both role pools and guaranteed cleanup."""
     await _install(fixture)
-    config = RegistryPublicationConsumerConfig(
-        **_options(fixture),
-        reader_roles=(fixture.fixture.roles["reader"],),
+    # Like the configured worker, publication runs the named preparation step before the head switch.
+    custody_by_name = {
+        "seal_candidate": getattr(fixture.fixture, "seal_candidate", None),
+        "preparation_roles": getattr(fixture.fixture, "preparation_roles", None),
         **getattr(fixture, "publication_custody_by_name", {}),
+    }
+    config = RegistryPublicationConsumerConfig(
+        **_options(fixture), reader_roles=(fixture.fixture.roles["reader"],), **custody_by_name
     )
     dsn = _fixture_dsn()
     pools = []
@@ -116,11 +133,7 @@ async def _consumer(fixture, *, authority_hook=None):
 
     try:
         for kind in ("lifecycle", "execution"):
-            pools.append(
-                await asyncpg.create_pool(
-                    dsn, user=fixture.roles_by_kind[kind], password=fixture.role_password, min_size=1, max_size=2
-                )
-            )
+            pools.append(await _consumer_pool(fixture, kind, dsn))
         async with RegistryPublicationAuthorityClient(
             "https://authority.example.test", "synthetic-service-token", transport=httpx.MockTransport(authority)
         ) as authorize:
@@ -183,7 +196,12 @@ async def _publish_same_approval(fixture, config):
         control_schema=config.control_schema,
     )
     await prepare_and_publish_network_candidate(
-        connection, copy_target, address_source, **config.writer_roles, control_schema=config.control_schema
+        connection,
+        copy_target,
+        address_source,
+        **config.writer_roles,
+        control_schema=config.control_schema,
+        seal_candidate=config.seal_candidate,
     )
     return await _head(fixture)
 
@@ -362,7 +380,31 @@ def _exact_worker_config(fixture, arguments, request_id):
         },
         "initial_address_sources": {"base_source": asdict(arguments["initial_address_sources"].base_source)},
         "operation_seconds": 30,
+        "preparation_roles": _worker_preparation_roles(fixture),
     }
+
+
+def _worker_preparation_roles(fixture):
+    """Name the worker publisher and every configured application role for the administrator freeze."""
+    owner = fixture.fixture.preparation_roles["namespace_owner_role"]
+    return {
+        "namespace_owner_role": owner,
+        "publisher_role": fixture.roles_by_kind["execution"],
+        "application_roles": sorted(
+            (set(fixture.fixture.roles.values()) | set(fixture.roles_by_kind.values())) - {owner}
+        ),
+    }
+
+
+async def _operator_freeze(fixture, candidate_id):
+    """Run the separately owned administrator freeze for the candidate a worker handed off."""
+    from process.network_membership_publication import load_named_network_preparation
+    from tests.registry_named_preparation_postgres_support import freeze_named_preparation
+
+    handoff = await load_named_network_preparation(
+        fixture.fixture.connection, candidate_id, control_schema=fixture.fixture.control_schema
+    )
+    await freeze_named_preparation(fixture.fixture.engine, handoff, _worker_preparation_roles(fixture))
 
 
 async def _assert_request_rows_preserved(fixture, queued, other, immutable, untouched):
@@ -438,6 +480,11 @@ async def test_expired_lease_restarts_exact_request_after_transient_authority_fa
         failure = None
         assert await asyncio.to_thread(worker.run_command) == 0
         output = capsys.readouterr()
+        waiting = json.loads(output.out)
+        assert output.err == "" and waiting["state"] == "waiting_admin_freeze"
+        await _operator_freeze(fixture, waiting["candidate_id"])
+        assert await asyncio.to_thread(worker.run_command) == 0
+        output = capsys.readouterr()
         assert output.err == "" and json.loads(output.out) == {"state": "completed", "request_id": queued["request_id"]}
         assert (await _status(fixture, queued))["state"] == "completed" and await _head(fixture) > 0
         await _assert_request_rows_preserved(fixture, queued, other, immutable, untouched)
@@ -489,10 +536,8 @@ async def test_provider_custody_timeout_retains_lease_and_resumes_exact_request(
     original = provider_inputs.verify_candidate_em_provider_inputs
     observations = []
 
-    async def timeout(connection, candidate, *, runtime_roles):
-        return await original(
-            _CustodyTimeoutConnection(connection, observations), candidate, runtime_roles=runtime_roles
-        )
+    async def timeout(connection, candidate, **options):
+        return await original(_CustodyTimeoutConnection(connection, observations), candidate, **options)
 
     async with _worker_provider_inputs(fixture) as inputs, _consumer(fixture) as (arguments, calls):
         arguments["initial_address_sources"] = replace(arguments["initial_address_sources"], em_provider_inputs=inputs)
@@ -728,29 +773,19 @@ def _cms_storage_failure_pin(*, is_epoch):
         "source_example", "cms-npd", "endpoint", "dataset", "a" * 64, "release", 100, "cms-npd", "2026-01-01"
     )
     if not is_epoch:
-        return replace(
-            membership_pin,
-            custody_owner_role="protected_owner",
-            custody_runtime_roles=("runtime_reader",),
-            custody_proof_sha256="b" * 64,
-            custody_catalog_sha256="c" * 64,
-        )
+        return membership_pin
     epoch_id = uuid4()
     epoch = fhir_epochs.RetainedCMSFHIRSourceEpoch(
         fhir_epochs._origin(membership_pin),
         epoch_id,
         "registry_cms_epoch_" + epoch_id.hex,
-        100,
-        tuple((name, index + 100) for index, name in enumerate(sorted(fhir_epochs._TABLES))),
-        "protected_owner",
-        ("runtime_reader",),
-        *("a" * 64 for _ in range(4)),
+        *("a" * 64 for _ in range(3)),
     )
     return replace(membership_pin, retained_epoch=epoch)
 
 
 @pytest.mark.parametrize("is_database_failure", [True, False])
-@pytest.mark.parametrize("stage", ["address", "custody", "epoch", "recipe_custody", "recipe_epoch", "fhir_epoch"])
+@pytest.mark.parametrize("stage", ["address", "custody", "epoch", "recipe_flat", "recipe_epoch", "fhir_epoch"])
 async def test_reachable_preparation_storage_cause_remains_distinct(stage, is_database_failure):
     failure = (
         asyncpg.CannotConnectNowError("temporary database outage")
@@ -780,7 +815,8 @@ async def test_reachable_preparation_storage_cause_remains_distinct(stage, is_da
         operation = source_recipes._require_recipe_custody(connection, SimpleNamespace(source_pin=membership_pin))
     else:
         operation = fhir_sources._require_pinned_source(connection, membership_pin)
-    with pytest.raises(ValueError) as caught:
+    # A flat pin and the named address receipt probe read storage directly, so a storage failure stays unwrapped.
+    with pytest.raises(type(failure) if stage in {"recipe_flat", "address"} else ValueError) as caught:
         await operation
     assert consumer._has_database_cause(caught.value) is is_database_failure
 
@@ -924,51 +960,39 @@ async def test_independent_heartbeat_or_cancel_fences_execution(worker_permissio
         assert (await _status(fixture, queued))["state"] == "running"
 
 
-def _pause_heartbeat_verification(monkeypatch, boundary):
+def _pause_heartbeat_renewal(monkeypatch):
     entered = asyncio.Event()
     checkpoint = asyncio.Event()
     release = asyncio.Event()
     hold = asyncio.Event()
     sql_denied = asyncio.Event()
-    original_verify, original_renew = consumer._verify_lifecycle, consumer.renew_registry_publication_lease
-    checks = []
+    original_renew = consumer.renew_registry_publication_lease
 
     async def wait_for_heartbeat(_payload, _count):
         entered.set()
         await hold.wait()
 
-    async def verify_at_boundary(connection, config):
-        checks.append(None)
-        if len(checks) == 2:
-            await entered.wait()
-            if boundary == "after_check":
-                await original_verify(connection, config)
-            checkpoint.set()
-            await release.wait()
-            if boundary == "after_check":
-                return
-        await original_verify(connection, config)
-
-    async def record_sql_refusal(*arguments, **options):
+    async def renew_after_release(*arguments, **options):
+        await entered.wait()
+        checkpoint.set()
+        await release.wait()
         try:
             return await original_renew(*arguments, **options)
         except asyncpg.InsufficientPrivilegeError:
             sql_denied.set()
             raise
 
-    monkeypatch.setattr(consumer, "_verify_lifecycle", verify_at_boundary)
-    monkeypatch.setattr(consumer, "renew_registry_publication_lease", record_sql_refusal)
+    monkeypatch.setattr(consumer, "renew_registry_publication_lease", renew_after_release)
     monkeypatch.setattr(consumer, "_HEARTBEAT_SECONDS", 0.01)
     return SimpleNamespace(
         checkpoint=checkpoint, release=release, hold=hold, sql_denied=sql_denied, authorize=wait_for_heartbeat
     )
 
 
-@pytest.mark.parametrize("boundary", ["before_check", "after_check"])
-async def test_heartbeat_revocation_retains_lease(worker_permissions, monkeypatch, boundary):
+async def test_heartbeat_revocation_retains_lease(worker_permissions, monkeypatch):
     fixture = worker_permissions
     heartbeat_seconds = consumer._HEARTBEAT_SECONDS
-    paused = _pause_heartbeat_verification(monkeypatch, boundary)
+    paused = _pause_heartbeat_renewal(monkeypatch)
     async with _consumer(fixture, authority_hook=paused.authorize) as (arguments, _):
         queued = await _enqueue_ordinary(fixture)
         pending = asyncio.create_task(consume_registry_publication_once(**arguments))
@@ -981,15 +1005,9 @@ async def test_heartbeat_revocation_retains_lease(worker_permissions, monkeypatc
             role = f'"{fixture.roles_by_kind["lifecycle"]}"'
             await fixture.fixture.connection.execute(f"REVOKE UPDATE(lease_expires_at) ON {table} FROM {role}")
             paused.release.set()
-            error = RuntimeError if boundary == "after_check" else ValueError
-            code = (
-                "registry_publication_consumer_unavailable"
-                if boundary == "after_check"
-                else "registry_publication_queue_permissions_unavailable"
-            )
-            with pytest.raises(error, match="^" + code + "$"):
+            with pytest.raises(RuntimeError, match="^registry_publication_consumer_unavailable$"):
                 await asyncio.wait_for(pending, 5)
-            assert paused.sql_denied.is_set() == (boundary == "after_check")
+            assert paused.sql_denied.is_set()
             retained = await fixture.fixture.connection.fetchrow(lease_query, UUID(queued["request_id"]))
             assert retained["state"] == "running" and await _head(fixture) is None
             for key in ("request_id", "lease_id", "lease_expires_at"):
@@ -1033,25 +1051,24 @@ async def test_nonmatching_authority_receipt_is_rejected_by_actual_execution(wor
         assert await _head(fixture) is None and (await _status(fixture, queued))["state"] == "rejected"
 
 
-@pytest.mark.parametrize("identity", ["claim", "execution"])
-async def test_wrong_direct_login_pool_refuses_before_authorized_work(worker_permissions, identity):
+async def test_lifecycle_login_cannot_execute_publication_writes(worker_permissions):
+    """PostgreSQL refuses execution writes through a pool that logs in as the lifecycle role."""
     fixture = worker_permissions
     async with _consumer(fixture) as (arguments, calls):
         queued = await _enqueue_ordinary(fixture)
-        wrong_kind = "execution" if identity == "claim" else "lifecycle"
         wrong_pool = await asyncpg.create_pool(
             _fixture_dsn(),
-            user=fixture.roles_by_kind[wrong_kind],
+            user=fixture.roles_by_kind["lifecycle"],
             password=fixture.role_password,
             min_size=1,
             max_size=1,
         )
         try:
-            arguments["lifecycle_pool" if identity == "claim" else "execution_pool"] = wrong_pool
-            with pytest.raises(ValueError):
+            arguments["execution_pool"] = wrong_pool
+            with pytest.raises(RuntimeError, match="registry_publication_consumer_unavailable"):
                 await consume_registry_publication_once(**arguments)
-            assert not calls and await _head(fixture) is None
-            assert (await _status(fixture, queued))["state"] == "queued"
+            assert calls and await _head(fixture) is None
+            assert (await _status(fixture, queued))["state"] == "running"
         finally:
             await wrong_pool.close()
 
@@ -1172,25 +1189,26 @@ async def retained_recipe_worker(cms_recipe_template, cms_recipe_database, monke
             _complete_cms_office_source(cms_recipe_database, registry_schema, monkeypatch, tmp_path)
         )
         source_pin = reviewed_source[0][2]
-        reader = source_pin.retained_epoch.runtime_roles[0]
+        reader = cms_recipes.retained_fixture_roles(source_pin)[1]
         await fixture.fixture.connection.execute(
             f'GRANT "{reader}" TO "{fixture.roles_by_kind["execution"]}" WITH ADMIN FALSE, INHERIT TRUE, SET FALSE'
         )
-        operator = await stack.enter_async_context(_retained_recipe_custodian(fixture))
+        operator = await stack.enter_async_context(
+            _retained_recipe_custodian(fixture, cms_recipes.retained_fixture_roles(source_pin)[1:])
+        )
         fixture.publication_custody_by_name = _retained_recipe_custody(fixture, operator)
+        # The seal-selected raw recipe head reads its executor and loading readers from these fixture roles.
+        fixture.fixture.executor_role = fixture.roles_by_kind["execution"]
+        fixture.fixture.custody_roles = {"loading": fixture.roles_by_kind["execution"], "custodian": operator.custodian}
         yield fixture, reviewed_source
 
 
 async def _remove_retained_recipe_custodian(fixture, roles_by_kind):
     admin = fixture.fixture.connection
-    schema = fixture.fixture.control_schema
-    await admin.execute(f'ALTER TABLE "{schema}".network_candidate_custody OWNER TO "{fixture.roles_by_kind["queue"]}"')
-    schemas = await admin.fetch(
-        "SELECT nspname FROM pg_namespace WHERE nspowner=(SELECT oid FROM pg_roles WHERE rolname=$1)",
-        roles_by_kind["custody"],
-    )
-    for owned_schema in schemas:
-        await admin.execute('DROP SCHEMA "' + owned_schema["nspname"] + '" CASCADE')
+    for identity in fixture.fixture.preparation_ids:
+        await admin.execute(f'DROP SCHEMA IF EXISTS "network_candidate_{UUID(identity).hex}" CASCADE')
+    for identity in fixture.fixture.composition_ids:
+        await admin.execute(f'DROP SCHEMA IF EXISTS "network_composition_{identity.hex}" CASCADE')
     for role in reversed(tuple(roles_by_kind.values())):
         if await admin.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", role):
             await admin.execute(f'DROP OWNED BY "{role}"')
@@ -1198,27 +1216,26 @@ async def _remove_retained_recipe_custodian(fixture, roles_by_kind):
 
 
 @asynccontextmanager
-async def _retained_recipe_custodian(fixture):
-    """Split the empty seal ledger before the retained predecessor or successor exists."""
+async def _retained_recipe_custodian(fixture, source_readers):
+    """Retain the address actor and configure the normal separate administrator freeze."""
     admin = fixture.fixture.connection
     schema = fixture.fixture.control_schema
     roles_by_kind = {kind: "recipe_" + kind + "_" + uuid4().hex for kind in ("custodian", "custody")}
     password = uuid4().hex
     async with AsyncExitStack() as stack:
+        from tests.registry_named_preparation_postgres_support import prepare_registry_catalog_foundation
+        from tests.test_network_compact_publication_postgres import _cleanup_named_preparations
+
+        fixture.fixture.created_control_namespaces, fixture.fixture.preparation_ids = [], []
+        stack.push_async_callback(_cleanup_named_preparations, fixture.fixture)
         stack.push_async_callback(_remove_retained_recipe_custodian, fixture, roles_by_kind)
+        monkeypatch = stack.enter_context(pytest.MonkeyPatch.context())
+        await prepare_registry_catalog_foundation(fixture.fixture, monkeypatch)
         await _install(fixture)
         for kind, role in roles_by_kind.items():
             options = f"LOGIN PASSWORD '{password}'" if kind == "custodian" else "NOLOGIN"
             await admin.execute(
                 f'CREATE ROLE "{role}" {options} NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS'
-            )
-        await admin.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO "{roles_by_kind["custody"]}"')
-        async with fixture.fixture.engine.begin() as original_admin:
-            await split_registry_candidate_custody(
-                original_admin,
-                owner_role=fixture.roles_by_kind["queue"],
-                custody_owner_role=roles_by_kind["custody"],
-                control_schema=schema,
             )
         database = await admin.fetchval("SELECT quote_ident(current_database())")
         for role in roles_by_kind.values():
@@ -1226,24 +1243,81 @@ async def _retained_recipe_custodian(fixture):
         for role, inherit, assume in (
             (fixture.roles_by_kind["execution"], "TRUE", "FALSE"),
             (fixture.roles_by_kind["physical"], "TRUE", "TRUE"),
-            (roles_by_kind["custody"], "FALSE", "TRUE"),
         ):
             await admin.execute(
                 f'GRANT "{role}" TO "{roles_by_kind["custodian"]}" WITH ADMIN FALSE, INHERIT {inherit}, SET {assume}'
             )
-        custodian = await asyncpg.connect(_fixture_dsn(), user=roles_by_kind["custodian"], password=password)
+        validate = await _retained_recipe_preparation(fixture, roles_by_kind, source_readers, stack)
+        custodian = await asyncpg.connect(
+            _fixture_dsn(),
+            user=roles_by_kind["custodian"],
+            password=password,
+            timeout=fixture.sql_limits.connect_timeout_seconds,
+            server_settings=fixture.sql_limits.server_settings(),
+        )
         stack.push_async_callback(custodian.close)
-        yield SimpleNamespace(connection=custodian, control_schema=schema, owner_role=roles_by_kind["custody"])
+        yield SimpleNamespace(
+            connection=custodian,
+            control_schema=schema,
+            owner_role=fixture.roles_by_kind["physical"],
+            custodian=roles_by_kind["custodian"],
+            seal_candidate=validate,
+        )
+
+
+async def _retained_recipe_preparation(fixture, roles_by_kind, source_readers, stack):
+    """Use the configured SDK validator with the existing worker roles and source readers."""
+    from process.registry_fhir_catalog_permissions import _grant_named_preparation_control
+    from process.registry_publication_ptg_runtime import RegistryPublicationSQLLimits
+    from process.registry_publication_worker import _configured_worker_runtime
+    from tests.registry_candidate_custody_postgres_support import administrative_freeze_callback
+
+    limits = RegistryPublicationSQLLimits()
+    fixture.sql_limits = limits
+    await _grant_named_preparation_control(fixture.fixture.connection, fixture.roles_by_kind["execution"])
+    for kind in ("execution", "lifecycle"):
+        await fixture.fixture.connection.execute(
+            f'ALTER ROLE "{fixture.roles_by_kind[kind]}" '
+            f"SET temp_file_limit='{limits.temp_file_limit_bytes // 1024}kB'"
+        )
+    preparation_roles_by_name = {
+        "namespace_owner_role": roles_by_kind["custody"],
+        "publisher_role": fixture.roles_by_kind["execution"],
+        "application_roles": sorted(
+            set(fixture.roles_by_kind.values())
+            | set(fixture.fixture.roles.values())
+            | set(source_readers)
+            | {roles_by_kind["custodian"]}
+        ),
+    }
+    config = SimpleNamespace(
+        consumer=RegistryPublicationConsumerConfig(
+            **_options(fixture), reader_roles=(fixture.fixture.roles["reader"],)
+        ),
+        execution_url=fixture.fixture.engine.url.set(
+            username=fixture.roles_by_kind["execution"], password=fixture.role_password
+        ),
+        sql_limits=limits,
+        ptg=None,
+        preparation_roles=preparation_roles_by_name,
+    )
+    consumer = await _configured_worker_runtime(config, stack)
+    fixture.fixture.preparation_roles = consumer.preparation_roles
+    validate = administrative_freeze_callback(fixture.fixture, consumer)
+
+    async def validate_candidate(target):
+        if target.candidate_id not in fixture.fixture.preparation_ids:
+            fixture.fixture.preparation_ids.append(target.candidate_id)
+        return await validate(target)
+
+    return validate_candidate
 
 
 def _retained_recipe_custody(fixture, operator):
-    """Keep native preparation and sealing independent of the actual worker actors."""
+    """Reuse the installed preparation callback and the actual address preparation actor."""
     config = RegistryPublicationConsumerConfig(**_options(fixture), reader_roles=(fixture.fixture.roles["reader"],))
-    runtime_roles = config.custody_roles
+    runtime_roles = tuple(sorted({*config.reader_roles, config.execution_role, config.physical_owner_role}))
     custody = RegistryAddressArtifactCustody(operator.owner_role, runtime_roles, fixture.fixture.control_schema)
-
-    async def seal_candidate(target):
-        return await _seal_composition_target(operator, target, runtime_roles)
 
     async def prepare_address_sources(**arguments):
         address_sources = arguments["address_sources"]
@@ -1257,7 +1331,11 @@ def _retained_recipe_custody(fixture, operator):
         fixture.fixture.composition_ids.append(UUID(artifact.composition_id))
         return replace(address_sources, prepared_address_artifact=artifact)
 
-    return dict(seal_candidate=seal_candidate, prepare_address_sources=prepare_address_sources)
+    return dict(
+        seal_candidate=operator.seal_candidate,
+        prepare_address_sources=prepare_address_sources,
+        preparation_roles=fixture.fixture.preparation_roles,
+    )
 
 
 async def _retained_recipe_head(fixture, reviewed_source):
@@ -1327,7 +1405,7 @@ async def test_retained_recipe_database_failure_resumes_exact_request(retained_r
         await _resume_source_failure(fixture, arguments, queued, head, revision_query, committed_revision)
 
 
-@pytest.mark.parametrize("stage", ["custody", "epoch", "recipe_custody", "recipe_epoch", "fhir_epoch"])
+@pytest.mark.parametrize("stage", ["custody", "epoch", "recipe_flat", "recipe_epoch", "fhir_epoch"])
 @pytest.mark.parametrize(
     "failure",
     [
@@ -1349,7 +1427,8 @@ async def test_closed_storage_cause_remains_retryable(stage, failure):
         operation = source_recipes._require_recipe_custody(connection, SimpleNamespace(source_pin=pin))
     else:
         operation = fhir_sources._require_pinned_source(connection, pin)
-    with pytest.raises(ValueError) as caught:
+    # A flat pin reads its publication row directly, so a storage failure reaches the consumer unwrapped.
+    with pytest.raises(type(failure) if stage == "recipe_flat" else ValueError) as caught:
         await operation
     assert consumer._has_database_cause(caught.value)
 
@@ -1399,13 +1478,29 @@ def _deadline_worker_config(fixture, arguments):
         arguments["config"],
         arguments["initial_address_sources"],
         operation_seconds=3,
+        preparation_roles=_worker_preparation_roles(fixture),
     )
+
+
+async def _run_worker_through_operator_freeze(fixture, arguments, queued, candidate_id):
+    """Resume until the handoff, run the separate administrator freeze, then finish the same request."""
+    from process import registry_publication_worker as worker
+
+    waiting = await worker.run_registry_publication_worker(_deadline_worker_config(fixture, arguments))
+    assert waiting == {
+        "request_id": queued["request_id"],
+        "state": "waiting_admin_freeze",
+        "candidate_id": str(candidate_id),
+    }
+    await _operator_freeze(fixture, waiting["candidate_id"])
+    return await worker.run_registry_publication_worker(_deadline_worker_config(fixture, arguments))
 
 
 @pytest.mark.parametrize("failure", ["operation", "statement"])
 async def test_worker_operation_deadline_drains_native_query_and_resumes_exact_request(
     bounded_worker_permissions, monkeypatch, failure
 ):
+    """A deadline drains the native query and keeps the lease; expiry later resumes the exact request."""
     from process import registry_publication_worker as worker
 
     fixture = bounded_worker_permissions
@@ -1457,7 +1552,7 @@ async def test_worker_operation_deadline_drains_native_query_and_resumes_exact_r
             request_id,
         )
         before_calls = len(calls)
-        completed = await worker.run_registry_publication_worker(_deadline_worker_config(fixture, arguments))
+        completed = await _run_worker_through_operator_freeze(fixture, arguments, queued, candidate_id)
         assert completed == {"request_id": queued["request_id"], "state": "completed"} and len(calls) > before_calls
         assert await fixture.fixture.connection.fetchrow(identity_sql, request_id) == immutable
         assert await fixture.fixture.connection.fetchval(state_sql, candidate_id) == "published"
@@ -1813,7 +1908,7 @@ async def test_ordinary_replacement_cannot_change_retained_address_authority(mon
             "em_provider_inputs": provider_inputs.EMProviderInputs(
                 tuple(
                     provider_inputs.EMProviderInputRelation(
-                        role, "provider_example", "relation_" + str(index), "edition", index + 1, index + 1
+                        role, "provider_example", "relation_" + str(index), "edition"
                     )
                     for index, role in enumerate(provider_inputs._ROLES)
                 )

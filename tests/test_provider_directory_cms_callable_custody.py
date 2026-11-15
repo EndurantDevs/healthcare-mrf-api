@@ -17,7 +17,7 @@ from process import provider_directory_cms_callable_custody as custody
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 
 
-def _migration_functions():
+def _migration_functions(*, named=True):
     path = Path(__file__).parents[1] / "alembic/versions/20260930100000_cms_npd_serving_receipt.py"
     spec = importlib.util.spec_from_file_location("callable_custody_migration", path)
     migration = importlib.util.module_from_spec(spec)
@@ -63,7 +63,24 @@ def _migration_functions():
         assert custody._body_digest(replacement, "snapshot_schema") == next_hash
         function_by_name[name] = (*attributes, replacement)
     _repair_archive_body(path, function_by_name)
+    if named:
+        _apply_named_function_bodies(function_by_name)
     return function_by_name
+
+
+def _apply_named_function_bodies(function_by_name):
+    from tests.test_cms_archive_transaction_migration import _load
+
+    named = _load("20261114190000")
+    for name, pairs in named._replacements("snapshot_schema").items():
+        if name not in function_by_name:
+            continue
+        *attributes, body = function_by_name[name]
+        for pair in pairs:
+            previous, current = pair[:2]
+            assert body.count(previous) == (pair[2] if len(pair) == 3 else 1)
+            body = body.replace(previous, current)
+        function_by_name[name] = (*attributes, body)
 
 
 def _repair_archive_body(path, function_by_name):
@@ -196,7 +213,31 @@ def catalog(monkeypatch):
     return SimpleNamespace(policy=policy, driver=driver, rows=function_rows, graph=graph_by_field, events=events)
 
 
-def test_exact_sixteen_contracts_match_current_authentic_migration_chain():
+def _named_profile_constructors(monkeypatch):
+    from process.provider_directory_cms_receipt_guard import named_profile_transition_body
+    from tests.test_cms_archive_transaction_migration import _load
+
+    named = _load("20261116090000")
+    statements = []
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "snapshot_schema")
+    monkeypatch.setenv("DB_SCHEMA", "snapshot_schema")
+    monkeypatch.setattr(named, "op", SimpleNamespace(execute=statements.append))
+    named.upgrade()
+    constructors = [
+        statement for statement in statements if re.search(r'"snapshot_schema"\."cms_serving_\w+"\(', statement)
+    ]
+    assert len(constructors) == 6
+    assert named.named_profile_transition_body('"snapshot_schema"') == named_profile_transition_body(
+        '"snapshot_schema"'
+    )
+    return {
+        name
+        for statement in constructors
+        for name in re.findall(r'"snapshot_schema"\."(cms_serving_\w+)"\(', statement)
+    }
+
+
+def test_exact_sixteen_contracts_match_current_authentic_migration_chain(monkeypatch):
     functions = _migration_functions()
     assert functions.keys() == custody._CONTRACTS.keys() and len(functions) == 16
     for name, (arguments, returns, language, volatility, body) in functions.items():
@@ -208,10 +249,19 @@ def test_exact_sixteen_contracts_match_current_authentic_migration_chain():
             custody._body_digest(body, "snapshot_schema"),
         )
     versions = Path(__file__).parents[1] / "alembic/versions"
+    named_revision = "20261116090000_profile_capacity_logical_names.py"
+    assert _named_profile_constructors(monkeypatch) == {
+        "cms_serving_native_snapshot",
+        "cms_serving_native_matches",
+        "cms_serving_snapshot_receipt_matches",
+        "cms_serving_current_receipt_matches",
+        "cms_serving_require_fresh",
+        "cms_serving_profile_transition",
+    }
     for path in versions.glob("*.py"):
-        if path.name > "20260930100000_cms_npd_serving_receipt.py":
+        if path.name > "20260930100000_cms_npd_serving_receipt.py" and path.name != named_revision:
             source = path.read_text()
-            assert not ("cms_serving_" in source and re.search(r"(?:CREATE|ALTER).*FUNCTION", source)), path.name
+            assert not re.search(r"(?:CREATE(?: OR REPLACE)?|ALTER)\s+FUNCTION[^\n]*cms_serving_", source), path.name
 
 
 @pytest.mark.asyncio

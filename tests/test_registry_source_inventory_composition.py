@@ -18,9 +18,8 @@ from process.registry_compact_composition import CompactCompositionAddressSource
 from process.registry_source_inventory_preparation import SourceInventoryPreparation
 from process.registry_source_inventory_reference import INVENTORY_DIGEST_KEY, verify_source_recipe_metadata
 from process.registry_source_recipe_store import RegistrySourceRecipeError, canonical_registry_source_recipes
+from tests.registry_source_recipe_support import _derivation, _descriptor, _example
 from tests.test_registry_composition_resume import _connection, _registered
-from tests.test_registry_source_inventory_preparation import _derivation, _descriptor
-from tests.test_registry_source_recipe_store_postgres import _example
 
 
 @asynccontextmanager
@@ -99,6 +98,11 @@ async def test_invalid_inventory_stage_mode_never_touches_source_storage(monkeyp
     retained.assert_not_awaited()
 
 
+def _recording_connection():
+    """Accept the admission's address-binding record, which retirement later relies on."""
+    return SimpleNamespace(execute=AsyncMock(), fetch=AsyncMock(return_value=[{"recorded": True}]))
+
+
 @pytest.mark.parametrize("count,office_revision", [(0, None), (0, 1), (101, None), (101, 4)])
 async def test_actual_registration_orchestration_finishes_inventory_before_candidate_identity(
     monkeypatch, count, office_revision
@@ -108,7 +112,7 @@ async def test_actual_registration_orchestration_finishes_inventory_before_candi
     address = PinnedAddressSource("address_fixture", "entity_address_unified", "b" * 64)
     artifact = CompactCompositionAddressSource(address, (), "c" * 64)
     approved = SimpleNamespace(approved_revision=7, generation_id="d" * 64)
-    inputs = composition._CompositionInputs(SimpleNamespace(execute=AsyncMock()), None, approved, None, None)
+    inputs = composition._CompositionInputs(_recording_connection(), None, approved, None, None)
     calls, generations_by_name = [], {}
     monkeypatch.setattr(
         composition, "resolve_registered_office_summary_revision", AsyncMock(return_value=office_revision)

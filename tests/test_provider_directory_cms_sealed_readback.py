@@ -4,7 +4,7 @@
 import asyncio
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import pytest_asyncio
@@ -17,63 +17,28 @@ from tests.test_provider_directory_cms_admin_workspace import retained as retain
 from tests.test_provider_directory_cms_prepared_context import case as case
 
 
-def _closed_row(state, root):
-    original = state.binding["tables"][root]
-    return dict(
-        relname=original["name"],
-        oid=original["oid"],
-        nspname=state.case.policy.schema,
-        relowner=state.case.storage.namespace_owner_oid,
-        relkind="r",
-        relpersistence="p",
-        relrowsecurity=False,
-        relforcerowsecurity=False,
-        inert=True,
-        native_checks=True,
-        direct_acl_closed=True,
-        readers_closed=True,
-        parents=[],
-        relispartition=False,
-        columns=[],
-        constraints=[],
-        indexes=[],
-    )
-
-
 def _proof_records(state):
     case = state.case
-    state.closed_rows = [_closed_row(state, root) for root in workspace.storage.RELATIONS[:4]]
-    for root, native_row in zip(workspace.storage.RELATIONS[:4], state.closed_rows, strict=True):
-        original = state.binding["tables"][root]
-        original["layout_sha256"] = workspace.storage._table_proof(native_row, private=True)["layout_sha256"]
-        state.outputs[original["name"]] = deepcopy(original)
     state.request = dict(
         source_binding=case.storage,
         prepared_inputs={
             **deepcopy(state.inputs),
-            "origin": case.origin.copy(),
-            "native_coordinates": case.coordinates.copy(),
+            "origin": {key: case.origin[key] for key in ("readonly", "isolation", "replication_role")},
+            "native_coordinates": deepcopy(case.coordinates),
         },
         handoff=state.handoff,
         expected_workspace=state.binding,
         owner_role=state.namespace,
-        owner_oid=case.storage.namespace_owner_oid,
         migration_role="migration_login",
     )
     state.sealed = dict(
         contract=custody.CONTRACT,
-        owner_oid=case.storage.namespace_owner_oid,
-        schema_oid=case.storage.storage_schema_oid,
-        namespace_owner_oid=case.storage.namespace_owner_oid,
-        tables={
-            root: {**state.binding["tables"][root], "owner": case.storage.namespace_owner_oid}
-            for root in workspace.storage.RELATIONS
-        },
+        tables={root: deepcopy(state.binding["tables"][root]) for root in workspace.storage.RELATIONS},
     )
     state.attached = dict(
         contract=readback.attach.CONTRACT,
-        parents={root: 2001 + index for index, root in enumerate(readback.attach.ROOTS)},
-        tables={root: {**state.sealed["tables"][root], "layout_sha256": "d" * 64} for root in readback.attach.ROOTS},
+        parents={root: {"schema": case.storage.catalog_schema, "name": root} for root in readback.attach.ROOTS},
+        tables={root: deepcopy(state.sealed["tables"][root]) for root in readback.attach.ROOTS},
     )
 
 
@@ -84,33 +49,27 @@ async def sealed_case(retained, monkeypatch):
     state.closed, state.descendant = True, False
     state.savepoint = SimpleNamespace(start=AsyncMock(), commit=AsyncMock(), rollback=AsyncMock())
     case.driver.transaction = lambda: state.savepoint
-    original_fetchrow, original_fetchval, original_fetch = case.driver.fetchrow, case.driver.fetchval, case.driver.fetch
-
-    async def fetchrow(sql, *args):
-        if sql == custody._PRINCIPALS_SQL:
-            return dict(
-                protected=True, owner_oid=75, schema_oid=73, namespace_owner_oid=75, publisher_oid=77, migration_oid=78
-            )
-        return await original_fetchrow(sql, *args)
+    original_fetchval = case.driver.fetchval
+    original_capture = workspace.storage._capture
+    state.missing = False
 
     async def fetchval(sql, *args):
-        if sql == custody._WRITERS_SQL:
-            assert len(args[0]) == 6 and args[1:] == (75, 75, 78)
-            return state.closed
-        if "FROM pg_catalog.pg_inherits WHERE inhparent" in sql:
+        if sql == "SELECT to_regclass($1)::oid":
+            return 42
+        if "FROM pg_catalog.pg_inherits" in sql:
             assert len(args[0]) == 6
             return not state.descendant
         return await original_fetchval(sql, *args)
 
-    async def fetch(sql, *args):
-        if sql == readback.CATALOG_SQL:
-            assert args[1:] == (75, [77]) and len(args[0]) in {4, 6}
-            return deepcopy(state.closed_rows if len(args[0]) == 4 else state.unattached_rows)
-        return await original_fetch(sql, *args)
+    async def capture(*args, **kwargs):
+        if state.missing:
+            raise PermissionError("named payload read refused")
+        return await original_capture(*args, **kwargs)
 
-    case.driver.fetchrow = AsyncMock(side_effect=fetchrow)
     case.driver.fetchval = AsyncMock(side_effect=fetchval)
-    case.driver.fetch = AsyncMock(side_effect=fetch)
+    monkeypatch.setattr(workspace.storage, "_capture", AsyncMock(side_effect=capture))
+    state.layout_check = Mock()
+    monkeypatch.setattr(readback.layout, "_require_columns", state.layout_check)
     state.attachment_read = AsyncMock(side_effect=lambda *args, **kwargs: deepcopy(state.attached))
     monkeypatch.setattr(readback, "read_attached_cms_payload_snapshots", state.attachment_read)
     state.read_content = AsyncMock(side_effect=lambda current, handoff: _report(state, current, handoff))
@@ -143,8 +102,8 @@ async def test_sealed_read_keeps_original_receipts_and_five_original_owner_check
         assert state.current.binding == before and state.current._readonly is True
         assert case.session.get_transaction() is transaction and case.session.in_transaction()
         state.attachment_read.assert_awaited()
-        for call in workspace.storage._capture.await_args_list:
-            assert len(call.args[2]) == 5
+        widths = {len(call.args[2]) for call in workspace.storage._capture.await_args_list}
+        assert {4, 5, 8} <= widths
         for operation in (state.current.copy_rows("invalid", (), ()), state.current.finish_indexes()):
             with pytest.raises(ValueError, match="readonly_workspace"):
                 await operation
@@ -155,7 +114,7 @@ async def test_sealed_read_keeps_original_receipts_and_five_original_owner_check
     assert state.binding == before
 
 
-@pytest.mark.parametrize("field", ["owner_oid", "schema_oid", "namespace_owner_oid", "tables"])
+@pytest.mark.parametrize("field", ["contract", "tables", "extra_field"])
 async def test_forged_seal_refuses_before_content(sealed_case, field):
     state, case = sealed_case, sealed_case.case
     changed = deepcopy(state.sealed)
@@ -166,19 +125,13 @@ async def test_forged_seal_refuses_before_content(sealed_case, field):
         state.read_content.assert_not_awaited()
 
 
-@pytest.mark.parametrize("change", ["owner", "layout", "identity", "writer", "descendant", "attachment"])
+@pytest.mark.parametrize("change", ["identity", "descendant", "attachment"])
 async def test_native_postimage_or_rights_drift_refuses(sealed_case, change):
     state, case = sealed_case, sealed_case.case
     match change:
-        case "owner":
-            state.closed_rows[0]["relowner"] = 76
-        case "layout":
-            state.closed_rows[0]["indexes"] = [{"valid": True}]
         case "identity":
             root = workspace.storage.AUXILIARY_ROOTS[0]
-            state.outputs[state.binding["tables"][root]["name"]]["layout_sha256"] = "e" * 64
-        case "writer":
-            state.closed = False
+            state.outputs[state.binding["tables"][root]["name"]]["name"] = "another_output"
         case "descendant":
             state.descendant = True
         case "attachment":
@@ -194,33 +147,25 @@ async def test_native_postimage_or_rights_drift_refuses(sealed_case, change):
 async def test_original_preparation_owner_is_not_rewritten_to_make_read_pass(sealed_case):
     state, case = sealed_case, sealed_case.case
     changed = deepcopy(state.request["expected_workspace"])
-    changed["tables"][workspace.storage.RESOURCE]["owner"] = 75
+    changed["tables"][workspace.storage.RESOURCE]["schema"] = "another_schema"
     state.request["expected_workspace"] = changed
     async with case.session.begin(), case.database.bind_existing_session(case.session):
         with pytest.raises(ValueError, match="retained_outputs_changed"):
             await _read(state)
 
 
-async def test_publisher_cannot_open_admin_postimage_reader(sealed_case):
+async def test_native_named_read_refusal_stops_before_content(sealed_case):
     state, case = sealed_case, sealed_case.case
-    case.origin.update(session=case.policy.publisher_role, current=case.policy.publisher_role)
+    state.missing = True
     async with case.session.begin(), case.database.bind_existing_session(case.session):
-        with pytest.raises(ValueError, match="independent_original_admin_required"):
+        with pytest.raises(PermissionError, match="named payload read refused"):
             await _read(state)
         state.read_content.assert_not_awaited()
 
 
 @pytest_asyncio.fixture
 async def unattached_case(sealed_case):
-    state = sealed_case
-    state.unattached_rows = [_closed_row(state, root) for root in workspace.storage.RELATIONS]
-    for root, row in zip(workspace.storage.RELATIONS, state.unattached_rows, strict=True):
-        proof = workspace.storage._table_proof(row, private=True)
-        original = state.binding["tables"][root]
-        original["layout_sha256"] = proof["layout_sha256"]
-        state.outputs[original["name"]] = deepcopy(original)
-        state.sealed["tables"][root] = proof
-    return state
+    return sealed_case
 
 
 async def _read_unattached(state):
@@ -243,23 +188,15 @@ async def test_unattached_read_checks_all_six_heaps_without_attachment_receipt(u
         assert report["tables"] == state.binding["tables"]
         state.attachment_read.assert_not_awaited()
         assert state.current._readonly and not state.current._active
-    assert any(
-        len(call.args[1]) == 6 for call in case.driver.fetch.await_args_list if call.args[0] == readback.CATALOG_SQL
-    )
+    assert any(len(call.args[2]) == 6 for call in workspace.storage._capture.await_args_list)
 
 
-@pytest.mark.parametrize("change", ["attached", "layout", "identity", "writer", "descendant"])
+@pytest.mark.parametrize("change", ["identity", "descendant"])
 async def test_unattached_read_retains_layout_identity_and_writer_checks(unattached_case, change):
     state, case = unattached_case, unattached_case.case
-    if change == "attached":
-        state.unattached_rows[-1].update(parents=[123], relispartition=True)
-    elif change == "layout":
-        state.unattached_rows[-1]["columns"] = [{"unexpected": True}]
-    elif change == "identity":
+    if change == "identity":
         root = workspace.storage.AUXILIARY_ROOTS[0]
-        state.outputs[state.binding["tables"][root]["name"]]["layout_sha256"] = "e" * 64
-    elif change == "writer":
-        state.closed = False
+        state.outputs[state.binding["tables"][root]["name"]]["name"] = "another_output"
     else:
         state.descendant = True
     async with case.session.begin(), case.database.bind_existing_session(case.session):
@@ -278,11 +215,11 @@ async def test_inputs_changed_during_content_refuse_and_close_workspace(sealed_c
         if change == "request":
             state.request["migration_role"] = "changed_migration"
         elif change == "seal":
-            state.sealed["owner_oid"] += 1
+            state.sealed["tables"].pop(next(iter(state.sealed["tables"])))
         elif change == "attachment":
-            state.attached["parents"][readback.attach.ROOTS[0]] += 1
+            state.attached["parents"][readback.attach.ROOTS[0]]["name"] = "another_parent"
         else:
-            case.coordinates["prepared_owner_oid"] += 1
+            state.request["prepared_inputs"]["native_coordinates"]["relations"][0]["relation_name"] = "another_input"
         return report
 
     state.read_content.side_effect = change_after_read

@@ -4,7 +4,6 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -38,12 +37,10 @@ def configured():
 
 @pytest.fixture
 async def durable_app(owned, monkeypatch):
-    native_probe = AsyncMock()
-    monkeypatch.setattr(runtime, "_check_office_coordinator", native_probe)
     app, _ = _app(configured())
     await runtime._start_runtime(app)
     try:
-        yield app, native_probe
+        yield app, app.ctx.registry_ptg_office_coordinator.queue_pool
     finally:
         await runtime._stop_runtime(app)
 
@@ -62,7 +59,7 @@ async def test_installed_coordinator_owns_distinct_factories_pool_and_exact_shut
         and installed.queue_pool.get_max_size() == 1
     )
     assert installed.queue_pool.get_size() == 0
-    probe.assert_awaited_once_with(installed)
+    assert probe is installed.queue_pool and probe.get_size() == 0
     await runtime._stop_runtime(app)
     assert installed.queue_pool.is_closing() and owned.disposed == list(reversed(owned.engines))
     assert app.ctx.registry_ptg_office_coordinator is None
@@ -83,9 +80,6 @@ async def test_installed_coordinator_owns_distinct_factories_pool_and_exact_shut
         ),
         lambda document: document["office_intents"].update(
             management_dsn="postgresql://office_owner@database.example/synthetic?ssl=require"
-        ),
-        lambda document: document["office_intents"].update(
-            queue_dsn="postgresql://office_queue@different.example/synthetic?ssl=require"
         ),
         lambda document: document["office_intents"].update(queue_dsn=True),
     ],
@@ -110,18 +104,15 @@ async def test_constructor_native_failure_and_cancellation_close_pool_and_engine
         return pool
 
     monkeypatch.setattr(runtime.asyncpg, "create_pool", create)
-    if failure == "constructor":
-        monkeypatch.setattr(
-            coordinator.RegistryPTGOfficeIntentCoordinator,
-            "__post_init__",
-            lambda _self: (_ for _ in ()).throw(ValueError("denied")),
-        )
-    else:
-        monkeypatch.setattr(
-            runtime,
-            "_check_office_coordinator",
-            AsyncMock(side_effect=asyncio.CancelledError() if failure == "cancel" else PermissionError("denied")),
-        )
+
+    def refuse(_self):
+        if failure == "cancel":
+            raise asyncio.CancelledError()
+        if failure == "native":
+            raise PermissionError("denied")
+        raise ValueError("denied")
+
+    monkeypatch.setattr(coordinator.RegistryPTGOfficeIntentCoordinator, "__post_init__", refuse)
     with pytest.raises(asyncio.CancelledError if failure == "cancel" else ValueError):
         await runtime.build_registry_ptg_scope_runtime(configured())
     assert len(pools) == 1 and pools[0].is_closing()
@@ -256,6 +247,7 @@ class ListConnection:
         self.request_records = request_records
         self.transactions = []
         self.fetch = AsyncMock(return_value=request_records)
+        self.execute = AsyncMock()
 
     def is_in_transaction(self):
         return True
@@ -276,7 +268,7 @@ class ListPool:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "pre_auth", "custody", "post_auth", "identity", "timeout"])
+@pytest.mark.parametrize("failure", [None, "pre_auth", "post_auth", "identity", "timeout"])
 async def test_list_method_reauthorizes_actual_source_before_and_after_bounded_read(monkeypatch, failure):
     connection = ListConnection(await records())
     installed = object.__new__(coordinator.RegistryPTGOfficeIntentCoordinator)
@@ -296,9 +288,7 @@ async def test_list_method_reauthorizes_actual_source_before_and_after_bounded_r
         else identity,
     ]
     approved_source_mock = AsyncMock(side_effect=identities)
-    custody = AsyncMock(side_effect=ValueError("custody") if failure == "custody" else None)
     monkeypatch.setattr(coordinator, "_approved_source", approved_source_mock)
-    monkeypatch.setattr(coordinator, "_queue_permissions", custody)
     if failure == "timeout":
         connection.fetch.side_effect = TimeoutError()
     if failure:
@@ -314,11 +304,11 @@ async def test_list_method_reauthorizes_actual_source_before_and_after_bounded_r
             assert not error.value.outcome_unknown
     else:
         assert len((await installed.list(list_envelope()))["items"]) == 1
-    assert connection.fetch.await_count == (0 if failure in {"pre_auth", "custody"} else 1)
+    assert connection.fetch.await_count == (0 if failure == "pre_auth" else 1)
     if connection.transactions:
         assert connection.transactions == [{"isolation": "read_committed", "readonly": True}]
     if not failure:
-        assert approved_source_mock.await_count == 2 and custody.await_count == 1
+        assert approved_source_mock.await_count == 2
 
 
 def startup_factories(events):
@@ -327,68 +317,6 @@ def startup_factories(events):
         factory.kw = {"bind": SimpleNamespace(url=SimpleNamespace(username=factory.name))}
         factory.session.name = factory.name
     return factories
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "management", "identity", "queue"])
-async def test_startup_proves_readonly_native_role_identity_and_global_queue_custody(monkeypatch, failure):
-    """All native profiles are read-only, ordered and required before exposure."""
-    from process import network_cms_registry_address_capture as capture
-    from process import registry_management_permissions as permissions
-
-    events = []
-    factories = startup_factories(events)
-    native = ("123456", 42)
-
-    async def role(connection, expected):
-        assert connection.name == expected
-        events.append((expected, "role"))
-
-    async def identity(connection):
-        events.append((connection.name, "identity"))
-        return ("different", 42) if failure == "identity" and connection.name == "publisher" else native
-
-    async def management(connection, **options):
-        events.append((connection.name, "management_profile"))
-        assert options == {"api_role": "management", "owner_role": "owner", "control_schema": "control"}
-        if failure == "management":
-            raise PermissionError("management denied")
-
-    async def queue(connection, installed, expected):
-        events.append(("queue", "global_profile"))
-        assert expected == native and connection.transactions == [{"isolation": "read_committed", "readonly": True}]
-        if failure == "queue":
-            raise PermissionError("queue denied")
-
-    pool = ListPool(ListConnection([]))
-    installed = SimpleNamespace(
-        preparation=SimpleNamespace(
-            scope_service=SimpleNamespace(reader_sessions=factories[0]), publisher_sessions=factories[1]
-        ),
-        management_sessions=factories[2],
-        management_role="management",
-        owner_role="owner",
-        schema="control",
-        queue_pool=pool,
-    )
-    monkeypatch.setattr(capture, "native_driver", AsyncMock(side_effect=lambda session: session))
-    monkeypatch.setattr(coordinator, "_role", role)
-    monkeypatch.setattr(coordinator, "_native_identity", identity)
-    monkeypatch.setattr(coordinator, "_queue_permissions", queue)
-    monkeypatch.setattr(permissions, "verify_registry_management_permissions", management)
-    if failure:
-        with pytest.raises(ValueError if failure == "identity" else PermissionError):
-            await runtime._check_office_coordinator(installed)
-    else:
-        await runtime._check_office_coordinator(installed)
-    for factory in factories:
-        statements = [event[2] for event in events if event[:2] == (factory.name, "sql")]
-        assert statements[:2] == [
-            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY",
-            "SELECT pg_catalog.set_config('search_path','pg_catalog,pg_temp',true)",
-        ]
-    assert ("management", "management_profile") in events
-    assert (("queue", "global_profile") in events) == (failure not in {"management", "identity"})
 
 
 @pytest.mark.asyncio
@@ -405,7 +333,6 @@ async def test_installer_failure_disposes_exact_owned_pool_and_all_engines(owned
         raise ValueError("installation refused")
 
     monkeypatch.setattr(runtime.asyncpg, "create_pool", create)
-    monkeypatch.setattr(runtime, "_check_office_coordinator", AsyncMock())
     monkeypatch.setattr(routes, "install_registry_ptg_scope_engine", refuse)
     app, _ = _app(configured())
     with pytest.raises(ValueError, match="installation refused"):

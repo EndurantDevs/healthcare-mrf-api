@@ -50,7 +50,7 @@ def _profile_source_scope(
 
 
 def _patch_fresh_profile_stage_identity(monkeypatch) -> None:
-    """Install deterministic physical identities for a mocked fresh build."""
+    """Supply native kind/persistence observations for a mocked fresh build."""
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_stage_relation_identity",
@@ -62,9 +62,14 @@ def _patch_fresh_profile_stage_identity(monkeypatch) -> None:
         AsyncMock(),
     )
     monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_stage_storage_fingerprint",
-        AsyncMock(side_effect=("e" * 64, "f" * 64)),
+        importer, "_provider_directory_profile_capacity_relation_layout", AsyncMock(return_value=SimpleNamespace())
+    )
+
+
+def _planned_fresh_profile_build(build):
+    """Use the production batch plan required by fresh checkpoint progress CAS."""
+    return importer.replace(
+        build, batch_plan=importer._provider_directory_profile_build_plan(build, has_existing_artifacts=False)
     )
 
 
@@ -80,8 +85,8 @@ def _profile_build_identity_fixture():
     )
     return (
         importer.ProviderDirectoryArtifactDatasetFence((dataset,)),
-        importer.ProviderDirectoryArtifactBuildFence(target_oid=11),
-        importer.ProviderDirectoryArtifactBuildFence(target_oid=12),
+        importer.ProviderDirectoryArtifactBuildFence(target_publication=(True, ("synthetic-11", "revision-11"))),
+        importer.ProviderDirectoryArtifactBuildFence(target_publication=(True, ("synthetic-12", "revision-12"))),
     )
 
 
@@ -123,6 +128,7 @@ def _resumable_profile_checkpoint(
         "affected_npi_stage_storage_fingerprint": None,
         "evidence_target_oid": 11,
         "profile_target_oid": 12,
+        "targets_json": importer._profile_build_target_coordinates(build),
         "current_source_vector_hash": None,
         "desired_source_vector_hash": None,
         "refresh_source_ids": [],
@@ -165,17 +171,8 @@ async def test_profile_build_identity_resumes_original_as_of_across_days(
         profile_fence,
     )
     checkpoint.return_value = _resumable_profile_checkpoint(initial_build)
-    stage_identity = AsyncMock(side_effect=[(21, "r", "p"), (22, "r", "p")])
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_stage_relation_identity",
-        stage_identity,
-    )
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_stage_storage_fingerprint",
-        AsyncMock(side_effect=("e" * 64, "f" * 64)),
-    )
+    stage_layout = AsyncMock()
+    monkeypatch.setattr(importer, "_provider_directory_profile_stage_layout", stage_layout)
     monkeypatch.setattr(
         importer,
         "_now",
@@ -193,7 +190,10 @@ async def test_profile_build_identity_resumes_original_as_of_across_days(
     assert resumed_build.build_id == initial_build.build_id
     assert resumed_build.profile_as_of == "2026-07-19"
     assert resumed_build.owner_run_id == "run-retry"
-    assert stage_identity.await_count == 2
+    assert stage_layout.await_args_list == [
+        (("mrf", initial_build.evidence_stage), {"lock_relation": False}),
+        (("mrf", initial_build.profile_stage), {"lock_relation": False}),
+    ]
 
 
 def test_profile_source_spec_matches_reviewed_and_retained_entries():
@@ -905,8 +905,9 @@ async def test_profile_stage_build_creates_logged_tables_without_rewrite(
         evidence_stage="evidence_stage",
         profile_stage="profile_stage",
     )
-    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    fence = importer.ProviderDirectoryArtifactBuildFence()
 
+    build = _planned_fresh_profile_build(build)
     _metrics, stages = await importer._build_provider_directory_profile_stages(
         build,
         fence,
@@ -969,7 +970,7 @@ async def test_profile_stages_are_logged_at_creation_without_set_logged(
         evidence_stage="evidence_stage",
         profile_stage="profile_stage",
     )
-    build_fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    build_fence = importer.ProviderDirectoryArtifactBuildFence()
     status = AsyncMock(return_value=1)
     assert_logged = AsyncMock()
 
@@ -992,6 +993,7 @@ async def test_profile_stages_are_logged_at_creation_without_set_logged(
         "_assert_provider_directory_logged_relation",
         assert_logged,
     )
+    build = _planned_fresh_profile_build(build)
     _metrics, stages = await importer._build_provider_directory_profile_stages(
         build,
         build_fence,
@@ -1291,7 +1293,7 @@ async def test_profile_population_failure_is_retained_in_checkpoint(
         evidence_stage="evidence_stage",
         profile_stage="profile_stage",
     )
-    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    fence = importer.ProviderDirectoryArtifactBuildFence()
 
     with pytest.raises(RuntimeError, match="forced evidence failure"):
         await importer._build_provider_directory_profile_stages(
@@ -1345,7 +1347,7 @@ async def test_profile_cancellation_waits_for_failure_marker(monkeypatch):
         mark_failed,
     )
     build = _single_source_stage_build()
-    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    fence = importer.ProviderDirectoryArtifactBuildFence()
     task = asyncio.create_task(
         importer._build_provider_directory_profile_stages(
             build,
@@ -1423,7 +1425,7 @@ async def test_profile_resume_does_not_reopen_completed_evidence_phase(
         "_mark_profile_build_checkpoint_failed",
         mark_failed,
     )
-    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    fence = importer.ProviderDirectoryArtifactBuildFence()
 
     with pytest.raises(
         RuntimeError,
@@ -1455,7 +1457,7 @@ async def test_profile_publish_refuses_a_partial_artifact_pair(monkeypatch):
 
     @contextlib.asynccontextmanager
     async def fake_build_guard(_schema, _target):
-        yield importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+        yield importer.ProviderDirectoryArtifactBuildFence()
 
     monkeypatch.setattr(
         importer,

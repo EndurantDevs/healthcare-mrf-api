@@ -1,0 +1,29 @@
+{
+  "address_table_oid": null,
+  "approved_records_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "approved_revision": 0,
+  "base_artifact_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "base_source": {
+    "generation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "schema_name": "retained_example",
+    "table_name": "entity_address_unified"
+  },
+  "binding_table_oid": 123,
+  "component": "network_compact_custom_offices",
+  "control_schema": "network_control",
+  "custom_pair_count": 0,
+  "npi_identity": null,
+  "npi_source": null,
+  "revision": 1,
+  "runtime_roles": [
+    "example_reader"
+  ],
+  "target": {
+    "candidate_id": "00000000-0000-0000-0000-000000000004",
+    "dataset_id": "00000000-0000-0000-0000-000000000001",
+    "producer_id": "00000000-0000-0000-0000-000000000003",
+    "schema_id": "00000000-0000-0000-0000-000000000002",
+    "schema_name": "network_candidate_00000000000000000000000000000004",
+    "table_name": "network_membership"
+  }
+}

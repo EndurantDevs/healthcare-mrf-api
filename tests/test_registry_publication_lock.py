@@ -23,6 +23,13 @@ class _Connection:
         self.rollback_stays_active = rollback_stays_active
         self.commit_error = commit_error
         self.attempts = self.rollbacks = self.commits = 0
+        self.limits = []
+
+    async def execute(self, statement):
+        assert self.active and "set_config" in statement
+        assert "('statement_timeout',3000)" in statement and "('lock_timeout',250)" in statement
+        self.limits.append(statement)
+        return "SELECT 2"
 
     def is_in_transaction(self):
         return self.active
@@ -66,6 +73,7 @@ async def test_initial_serialization_failures_retry_before_yielding_once(request
         failures + 1
     )
     assert (connection.attempts, connection.rollbacks, connection.commits) == (failures + 1, failures, 1)
+    assert len(connection.limits) == connection.attempts
     assert not connection.active
 
 

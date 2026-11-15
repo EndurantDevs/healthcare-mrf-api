@@ -3,7 +3,7 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
@@ -40,27 +40,53 @@ def test_v2_owner_closed_inventory():
         ownership.validate_entity_address_archive_stage_ownership(forged)
 
 
-async def test_v2_retirement_rechecks_catalog_under_locks_before_any_drop(monkeypatch):
-    from process import entity_address_snapshot_preparation as protected
+async def test_retained_catalog_reads_native_flags_as_text():
+    names = [{"schema_name": "example", "relation_name": "retained_example"}]
+    catalog_rows = [
+        {"nspname": "example", "relname": "retained_example", "relkind": "r", "relpersistence": "p", "inherited": False}
+    ]
+    result = Mock()
+    result.mappings.return_value.all.return_value = catalog_rows
+    session = SimpleNamespace(execute=AsyncMock(return_value=result))
+    assert await ownership._retained_relation_catalog(session, names) == catalog_rows
+    statement, parameters = session.execute.await_args.args
+    assert "c.relkind::text AS relkind,c.relpersistence::text AS relpersistence" in str(statement)
+    assert parameters == {"names": ['"example"."retained_example"']}
+    ownership._require_retained_catalog(catalog_rows, None, names)
+
+
+async def test_retirement_rechecks_complete_named_inventory_under_locks_before_drop(monkeypatch):
     from process import network_cms_registry_address_capture as capture
     from process import network_compact_retention as retention
 
     monkeypatch.setattr(capture, "native_driver", AsyncMock(return_value=object()))
     monkeypatch.setattr(retention, "require_network_compact_artifacts_unreferenced", AsyncMock(return_value=True))
-
     owner = _set_owner()
-    monkeypatch.setattr(protected, "_publisher_authority", AsyncMock(return_value=31))
-    monkeypatch.setattr(ownership, "_validated_publication_owner", lambda *_: ("example", [], {"relation_oid": 8}))
-    monkeypatch.setattr(ownership, "_require_retained_catalog", lambda *_: None)
-    catalog = AsyncMock(side_effect=[[{"nspname": "example", "relname": "retained"}], []])
-    monkeypatch.setattr(ownership, "_retained_relation_catalog", catalog)
+    relations = [
+        {"schema_name": "example", "relation_name": name + "_retained_example"} for name in _owner().relation_names
+    ]
+    authority_by_field = {"schema_name": owner.schema_name, "relation_name": "entity_address_alias_authority"}
+    monkeypatch.setattr(
+        ownership, "_validated_publication_owner", lambda *_: ("example", relations, authority_by_field)
+    )
+    catalog_rows = [
+        {
+            "nspname": entry["schema_name"],
+            "relname": entry["relation_name"],
+            "relkind": "r",
+            "relpersistence": "p",
+            "inherited": False,
+        }
+        for entry in [*relations, authority_by_field]
+    ]
+    monkeypatch.setattr(ownership, "_retained_relation_catalog", AsyncMock(side_effect=[catalog_rows, []]))
     session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
-    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="catalog changed"):
+    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="named catalog differs"):
         await ownership.cleanup_entity_address_archive_publication(
             session, owner=owner, publication={}, assert_unreferenced=AsyncMock(return_value=True)
         )
     statements = [str(call.args[0]) for call in session.execute.await_args_list]
-    assert len(statements) == 1 and "ACCESS EXCLUSIVE MODE NOWAIT" in statements[0]
+    assert len(statements) == 1 and "ACCESS SHARE MODE NOWAIT" in statements[0]
     assert not any("DROP" in statement for statement in statements)
 
 
@@ -69,8 +95,8 @@ async def test_v2_retirement_rechecks_catalog_under_locks_before_any_drop(monkey
     [
         {"dataset_id": "not-a-uuid"},
         {"schema_name": "another_stage"},
-        {"schema_oid": True},
-        {"schema_oid": 0},
+        {"dataset_id": None},
+        {"relation_oids": []},
         {"relation_oids": {}},
         {"extra": "field"},
     ],
@@ -80,9 +106,7 @@ def test_owner_token_rejects_substituted_identity(changes):
         ownership.validate_entity_address_archive_stage_ownership({**_owner().as_dict(), **changes})
 
 
-@pytest.mark.parametrize(
-    "entry", [None, {}, {"table_name": 1, "oid": 1}, {"table_name": "entity_address_unified", "oid": True}]
-)
+@pytest.mark.parametrize("entry", [None, {}, {"table_name": 1, "oid": 1}, {"table_name": False, "oid": True}])
 def test_owner_token_rejects_malformed_relation_identity(entry):
     stored = _owner().as_dict()
     stored["relation_oids"][0] = entry
@@ -90,11 +114,11 @@ def test_owner_token_rejects_malformed_relation_identity(entry):
         ownership.validate_entity_address_archive_stage_ownership(stored)
 
 
-@pytest.mark.parametrize("mutation", ["duplicate_oid", "missing_relation", "order"])
+@pytest.mark.parametrize("mutation", ["duplicate_name", "missing_relation", "order"])
 def test_owner_token_requires_exact_unique_model_family(mutation):
     stored = _owner().as_dict()
-    if mutation == "duplicate_oid":
-        stored["relation_oids"][0]["oid"] = stored["relation_oids"][1]["oid"]
+    if mutation == "duplicate_name":
+        stored["relation_oids"][0]["table_name"] = stored["relation_oids"][1]["table_name"]
     elif mutation == "missing_relation":
         stored["relation_oids"].pop()
     else:
@@ -182,23 +206,28 @@ async def test_namespace_cleanup_admits_only_owned_relations(monkeypatch, kind, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("substitution", ["schema", "table"])
-async def test_revalidation_rejects_same_name_replacement(monkeypatch, substitution):
+async def test_revalidation_accepts_same_named_family_with_fresh_native_handles(monkeypatch, substitution):
     owner = _owner()
     monkeypatch.setattr(ownership, "_schema_oid", AsyncMock(return_value=100 if substitution == "schema" else 99))
-    changed = replace(owner, relation_oids=((owner.relation_oids[0][0], 100), *owner.relation_oids[1:]))
-    monkeypatch.setattr(ownership, "_table_oids", AsyncMock(return_value=changed.relation_oids))
+    changed = ((owner.relation_names[0], 100), *owner.relation_oids[1:])
+    monkeypatch.setattr(ownership, "_table_oids", AsyncMock(return_value=changed))
+    structural = AsyncMock()
+    monkeypatch.setattr(ownership, "_assert_namespace_is_owned", structural)
     session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
-    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="OID differs"):
-        await ownership.verify_entity_address_archive_stage_ownership(session, owner=owner)
-    session.execute.assert_not_awaited()
+    assert await ownership.verify_entity_address_archive_stage_ownership(session, owner=owner) == owner
+    assert structural.await_args.kwargs["relation_oids"] == changed
 
 
 @pytest.mark.asyncio
-async def test_cleanup_does_not_lock_or_delete_a_replacement_namespace():
-    session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value=100), execute=AsyncMock())
-    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="schema OID differs"):
+async def test_cleanup_refuses_an_incomplete_named_family_before_delete(monkeypatch):
+    monkeypatch.setattr(ownership, "_schema_oid", AsyncMock(return_value=100))
+    monkeypatch.setattr(ownership, "_table_oids", AsyncMock(return_value=_owner().relation_oids[:-1]))
+    session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value=True), execute=AsyncMock())
+    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="relation family differs"):
         await ownership.cleanup_entity_address_archive_stage(session, owner=_owner())
-    session.execute.assert_not_awaited()
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert len(statements) == 1 and "ACCESS EXCLUSIVE MODE NOWAIT" in statements[0]
+    assert not any("DROP" in statement for statement in statements)
 
 
 @pytest.mark.asyncio
@@ -215,3 +244,63 @@ async def test_cleanup_never_drops_namespace_with_remaining_objects(monkeypatch)
     assert statements[1].startswith("DROP TABLE ") and statements[1].endswith("RESTRICT")
     assert all("DROP SCHEMA" not in statement and "CASCADE" not in statement for statement in statements)
     verified.assert_awaited_once_with(session, owner=owner)
+
+
+def test_fresh_owner_emits_only_names_and_old_tokens_roundtrip_without_authority():
+    old = _owner().as_dict()
+    copied_by_field = {
+        **old,
+        "schema_oid": 10000,
+        "relation_oids": [{**entry, "oid": 10000 + index} for index, entry in enumerate(old["relation_oids"])],
+    }
+    assert ownership.validate_entity_address_archive_stage_ownership(copied_by_field) == _owner()
+    assert ownership.validate_entity_address_archive_stage_ownership(copied_by_field).as_dict() == copied_by_field
+    named = ownership.EntityAddressArchiveStageOwnership(
+        _owner().dataset_id, _owner().schema_name, named_relations=_owner().relation_names
+    )
+    assert set(named.as_dict()) == {"dataset_id", "schema_name", "relations"}
+    assert ownership.validate_entity_address_archive_stage_ownership(named.as_dict()) == _owner()
+
+
+def test_current_canonical_publication_names_are_never_retirement_targets():
+    owner = _set_owner()
+    publication_by_field = {
+        "contract": "entity-address-table-publication.v3",
+        "schema_name": "mrf",
+        "relations": [{"schema_name": "mrf", "relation_name": name} for name in _owner().relation_names],
+        "retained_relations": [],
+        "alias_authority": {"schema_name": owner.schema_name, "relation_name": "entity_address_alias_authority"},
+    }
+    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="remains serving"):
+        ownership._validated_publication_owner(owner, publication_by_field)
+
+
+@pytest.mark.parametrize("has_alias", [False, True])
+def test_retirement_alias_matches_the_declared_seven_or_eight_table_edition(has_alias):
+    owner = _set_owner() if has_alias else _owner()
+    relation_names = [model.__tablename__ + "_retained_previous" for model in ownership._models()]
+    publication_by_field = {
+        "contract": "entity-address-table-publication.v3",
+        "schema_name": "mrf",
+        "relations": [{"schema_name": "mrf", "relation_name": name} for name in relation_names],
+        "retained_relations": [],
+        "alias_authority": None,
+    }
+    if has_alias:
+        with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="inventory differs"):
+            ownership._validated_publication_owner(owner, publication_by_field)
+        publication_by_field["alias_authority"] = {
+            "schema_name": owner.schema_name,
+            "relation_name": "entity_address_alias_authority",
+        }
+    assert (
+        ownership._validated_publication_owner(owner, publication_by_field)[2]
+        == publication_by_field["alias_authority"]
+    )
+    if not has_alias:
+        publication_by_field["alias_authority"] = {
+            "schema_name": owner.schema_name,
+            "relation_name": "entity_address_alias_authority",
+        }
+        with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="inventory differs"):
+            ownership._validated_publication_owner(owner, publication_by_field)

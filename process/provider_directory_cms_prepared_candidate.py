@@ -136,30 +136,48 @@ async def _read_header(workspace, expected_by_field):
     return actual
 
 
-async def _native_component(workspace, handoff, header, payloads, native):
-    """Compare native-four data; Control separately authenticates its claim and authority."""
+async def _native_tables(workspace, handoff, native, is_named, roots):
+    """Compare declared names while accepting the old stored-name receipt shape."""
     from process.provider_directory_cms_prepared_allocation import read_cms_generic_copy_tables
 
+    if is_named:
+        expected_by_root = {root: handoff.document["tables"][root] for root in roots}
+        observed_by_root = native["tables"]
+    else:
+        expected_by_root = await read_cms_generic_copy_tables(workspace)
+        observed_by_root = {}
+        for root, table in native["tables"].items():
+            _require(
+                type(table) is dict and set(table) in ({"schema", "name"}, {"name", "oid", "owner", "layout_sha256"}),
+                "native_publication_changed",
+            )
+            observed_by_root[root] = {"schema": table.get("schema", workspace.catalog_schema), "name": table["name"]}
+    _require(observed_by_root == expected_by_root, "native_publication_changed")
+
+
+async def _native_component(workspace, handoff, header, payloads, native):
+    """Compare native-four data; Control separately authenticates its claim and authority."""
     _require(type(native) is dict, "native_publication_required")
     native = json.loads(json.dumps(native, allow_nan=False))
     roots = storage.RELATIONS[:4]
     counts_by_root = {root: payloads["row_counts"][root] for root in roots}
+    is_named = native.get("contract") == "generic-source-named-publication-v1"
+    fields = {
+        "contract",
+        "dataset_id",
+        "endpoint_id",
+        "run_id",
+        "attempt_id",
+        "source_handoff_sha256",
+        "tables",
+        "counts",
+        "completed_at",
+    }
+    if not is_named:
+        fields.update({"frozen_sha256", "validation_sha256"})
     _require(
-        set(native)
-        == {
-            "contract",
-            "dataset_id",
-            "endpoint_id",
-            "run_id",
-            "attempt_id",
-            "source_handoff_sha256",
-            "frozen_sha256",
-            "validation_sha256",
-            "tables",
-            "counts",
-            "completed_at",
-        }
-        and native.get("contract") == "generic-source-canonical-copy-v1"
+        set(native) == fields
+        and native.get("contract") in {"generic-source-canonical-copy-v1", "generic-source-named-publication-v1"}
         and native.get("dataset_id") == workspace.identity["dataset_id"]
         and native.get("endpoint_id") == workspace.identity["endpoint_id"]
         and native.get("source_handoff_sha256") == handoff.document_sha256
@@ -167,9 +185,12 @@ async def _native_component(workspace, handoff, header, payloads, native):
         and all(type(count) is int and count >= 0 for count in native["counts"].values())
         and counts_by_root[storage.RESOURCE] == handoff.document["admission"]["resource_count"]
         and all(type(native.get(key)) is str and 0 < len(native[key]) <= 128 for key in ("run_id", "attempt_id"))
-        and all(
-            type(native.get(key)) is str and re.fullmatch(r"[0-9a-f]{64}", native[key])
-            for key in ("frozen_sha256", "validation_sha256")
+        and (
+            is_named
+            or all(
+                type(native.get(key)) is str and re.fullmatch(r"[0-9a-f]{64}", native[key])
+                for key in ("frozen_sha256", "validation_sha256")
+            )
         )
         and type(native.get("tables")) is dict
         and set(native["tables"]) == set(roots),
@@ -183,7 +204,7 @@ async def _native_component(workspace, handoff, header, payloads, native):
     _require(
         stamp.astimezone(timezone.utc).replace(tzinfo=None) == header["published_at"], "native_publication_changed"
     )
-    _require(await read_cms_generic_copy_tables(workspace) == native["tables"], "native_publication_changed")
+    await _native_tables(workspace, handoff, native, is_named, roots)
     return native
 
 
@@ -277,9 +298,9 @@ async def read_prepared_cms_generic_candidate(workspace, handoff, *, allocation,
 async def finish_prepared_cms_candidate(workspace, handoff, *, allocation):
     """Copy verified data and return a noncurrent descriptor in one savepoint.
 
-    Existing canonical guards stay enabled. Adopt only the exact authenticated
-    allocation from an earlier committed transaction. The real protected finisher
-    owns allocation provenance, terminal receipt retry and its writer fence.
+    Existing canonical guards stay enabled. Adopt the visible candidate under a
+    row lock and pin its declared target names. The caller owns authorization,
+    terminal receipt retry and the transaction boundary.
     All writes here roll back together on failure/cancel. The caller commits.
     """
     allocation = json.loads(json.dumps(allocation, allow_nan=False))

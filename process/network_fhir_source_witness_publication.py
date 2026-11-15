@@ -4,7 +4,7 @@
 import hashlib
 import json
 import struct
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 from ijson.backends import python as ijson_python
 
@@ -122,7 +122,6 @@ def publication_profile(header):
     if contract == "semantic_content_v4":
         require(completion is None)
         return SEMANTIC_PROFILE
-    require(header["candidate_storage_json"] is None)
     has_no_admission = header["admission_absent"] is True
     if has_no_admission and contract == "semantic_content_v3":
         require(not has_generic_proof and not has_uhc_proof and header["proof_sha256"] is None)
@@ -200,9 +199,8 @@ def rooted_observation_summary(header, hashes):
 
 
 async def verify_rooted_publication(reader, origin, header):
-    """Authenticate the actual rooted native proof and its complete immutable header."""
+    """Validate rooted lineage, logical publication fields and complete family counts."""
     from db.plan_release_storage import storage_relation
-    from process.provider_directory_dataset_scoped_publication import ROOTED_INTRINSIC_VALID_FUNCTION
 
     metadata = rooted_publication_metadata(header)
     encoded = header["rooted_metadata"].encode()
@@ -214,14 +212,12 @@ async def verify_rooted_publication(reader, origin, header):
         == (origin.source_id, origin.endpoint_id, origin.root_run_id)
     )
     native = await reader.fetchrow(
-        "SELECT to_jsonb(rooted) AS document,"
-        + storage_relation(origin.schema_name, ROOTED_INTRINSIC_VALID_FUNCTION)
-        + "(rooted.dataset_id) AS intrinsic_valid FROM "
-        + storage_relation(origin.schema_name, "provider_directory_rooted_graph_dataset")
+        "SELECT to_jsonb(rooted) AS document FROM "
+        + storage_relation(origin.header_relation["schema"], "provider_directory_rooted_graph_dataset")
         + " rooted WHERE rooted.dataset_id=$1",
         origin.dataset_id,
     )
-    require(native is not None and native["intrinsic_valid"] is True)
+    require(native is not None)
     actual = native["document"]
     actual = json.loads(actual) if type(actual) is str else actual
     require(type(actual) is dict)
@@ -406,14 +402,55 @@ def _plan_summary(metadata, origin):
         retained._require_plan_summary(metadata, origin)
 
 
+@contextmanager
+def _metadata_output():
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    with TemporaryDirectory(prefix="source-metadata-") as directory:
+        yield Path(directory) / "metadata.copy"
+
+
+@asynccontextmanager
+async def _publication_metadata_copy(reader, origin):
+    from db.plan_release_storage import storage_relation
+
+    with _metadata_output() as path:
+        with path.open("wb") as output:
+
+            async def bounded_write(block):
+                """Copy only within the reviewed publication metadata byte budget."""
+                require(output.tell() + len(block) <= origin.metadata_bytes + 27)
+                output.write(block)
+
+            status = await retained._reader_export(
+                reader,
+                "SELECT publication_metadata_json::text FROM "
+                + storage_relation(origin.header_relation["schema"], origin.header_relation["name"])
+                + " WHERE dataset_id=$1",
+                origin.dataset_id,
+                output=bounded_write,
+                format="binary",
+            )
+        require(status == "COPY 1" and path.stat().st_size == origin.metadata_bytes + 27)
+        with path.open("rb") as raw:
+            raw.seek(25)
+            metadata_digest, remaining = hashlib.sha256(), origin.metadata_bytes
+            while remaining:
+                block = raw.read(min(1024 * 1024, remaining))
+                require(block)
+                metadata_digest.update(block)
+                remaining -= len(block)
+        require(metadata_digest.hexdigest() == origin.metadata_text_sha256)
+        yield path
+
+
 async def verify_publication(reader, declaration, header):
     """Revalidate original publication bytes; resource EOF and fresh replay remain independent."""
     origin = source_origin(declaration)
     require(publication_profile(header) == origin.admission_profile)
-    require(header["candidate_storage_json"] is None or origin.admission_profile == OBSERVED_ROOTED_PROFILE)
     require(
         (
-            header["oid"],
             header["dataset_id"],
             header["endpoint_id"],
             header["acquisition_root_run_id"],
@@ -425,7 +462,6 @@ async def verify_publication(reader, declaration, header):
             header["publication_metadata_sha256"],
         )
         == (
-            origin.header_oid,
             origin.dataset_id,
             origin.endpoint_id,
             origin.root_run_id,
@@ -451,6 +487,9 @@ async def verify_publication(reader, declaration, header):
         validate_handoff_completion(header)
     else:
         require(header["completion_proof_required_version"] is None and header["completion_absent"] is True)
-    async with retained._publication_metadata_copy(reader, origin) as path:
-        with _metadata_stream(path, admission_profile=origin.admission_profile) as stream:
-            _validate_metadata(stream, origin, header)
+    try:
+        async with _publication_metadata_copy(reader, origin) as path:
+            with _metadata_stream(path, admission_profile=origin.admission_profile) as stream:
+                _validate_metadata(stream, origin, header)
+    except AdmissionSealError:
+        require(False)

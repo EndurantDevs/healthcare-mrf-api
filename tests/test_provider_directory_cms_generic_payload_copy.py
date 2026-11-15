@@ -21,23 +21,18 @@ from tests.test_provider_directory_cms_prepared_candidate import _header
 from tests.test_provider_directory_cms_prepared_context import case as case
 
 
-def _inventory(schema):
-    parents = [
-        dict(oid=300 + index, nspname=schema, relname=root, relkind="p", relowner=41, native={"parents": []})
-        for index, root in enumerate(payloads.ROOTS[:4])
+def _inventory(schema, dataset):
+    parents = [{"schema": schema, "name": root, "kind": "p", "parent": None} for root in payloads.ROOTS[:4]]
+    child_entries = [
+        {
+            "schema": schema,
+            "name": payloads.allocations.generic_leaf_name(parent["name"], dataset),
+            "kind": "r",
+            "parent": {"schema": schema, "name": parent["name"]},
+        }
+        for parent in parents
     ]
-    child_tables = [
-        dict(
-            oid=400 + index,
-            nspname=schema,
-            relname="allocated_leaf_" + str(index),
-            relkind="r",
-            relowner=41,
-            native={"parents": [parent["oid"]]},
-        )
-        for index, parent in enumerate(parents)
-    ]
-    return parents + child_tables
+    return parents + child_entries
 
 
 def _transaction(state):
@@ -59,12 +54,10 @@ def _transaction(state):
 @pytest_asyncio.fixture
 async def generic_copy(retained, monkeypatch):
     state, case = retained, retained.case
-    state.inventory = _inventory(case.storage.catalog_schema)
+    state.inventory = _inventory(case.storage.catalog_schema, state.handoff.document["identity"]["dataset_id"])
     state.allocation = dict(
         contract=payloads.allocations.CONTRACT,
         workspace=deepcopy(state.binding),
-        transaction="100",
-        header_xmin="101",
         inventory=deepcopy(state.inventory),
     )
     state.events, state.copied, state.inventory_reads = [], {}, 0
@@ -87,7 +80,11 @@ def _configure_allocation(state, monkeypatch):
     async def fetchrow(sql, *arguments):
         if "FOR UPDATE NOWAIT" in sql:
             state.events.append("header_lock")
-            return {**expected_header, "status": "acquiring", "validated_at": None, "candidate_storage_json": None}
+            return (
+                {**expected_header, "status": "acquiring", "validated_at": None, "candidate_storage_json": None}
+                if state.committed
+                else None
+            )
         return await original_fetchrow(sql, *arguments)
 
     async def fetchval(sql, *arguments):
@@ -108,7 +105,7 @@ def _configure_allocation(state, monkeypatch):
         state.inventory_reads += 1
         observed = deepcopy(state.inventory)
         if (state.fault, state.inventory_reads) in {("postlock_inventory", 3), ("postcopy_inventory", 4)}:
-            observed[-1]["relowner"] = 99
+            observed[-1]["name"] = "another_candidate"
         return observed
 
     monkeypatch.setattr(candidate, "_inputs", header_inputs)
@@ -165,7 +162,11 @@ async def test_four_targets_pin_before_scans(generic_copy):
             await current.copy_rows("invalid", (), ())
     locks = [event for event in state.events if event.startswith("LOCK TABLE")]
     expected = sorted(
-        payloads.storage_relation(case.storage.catalog_schema, "allocated_leaf_" + str(index)) for index in range(4)
+        payloads.storage_relation(
+            case.storage.catalog_schema,
+            payloads.allocations.generic_leaf_name(root, state.handoff.document["identity"]["dataset_id"]),
+        )
+        for root in payloads.ROOTS[:4]
     )
     assert locks == [
         "LOCK TABLE " + ",".join("ONLY " + name for name in expected) + " IN SHARE UPDATE EXCLUSIVE MODE NOWAIT"
@@ -179,16 +180,19 @@ async def test_four_targets_pin_before_scans(generic_copy):
     assert state.events.count("release") == 1 and "rollback" not in state.events
 
 
-@pytest.mark.parametrize("fault", ["heap", "missing", "alias", "owner", "wrong_parent", "extra"])
+@pytest.mark.parametrize("fault", ["heap", "missing", "alias", "schema", "wrong_parent", "extra"])
 async def test_wrong_allocated_shape_refuses_copy(generic_copy, fault):
     state, case = generic_copy, generic_copy.case
     variants_by_fault = {
-        "heap": [{**state.inventory[0], "relkind": "r"}, *state.inventory[1:]],
+        "heap": [{**state.inventory[0], "kind": "r"}, *state.inventory[1:]],
         "missing": state.inventory[:-1],
-        "alias": [*state.inventory[:-1], {**state.inventory[-1], "oid": state.inventory[0]["oid"]}],
-        "owner": [*state.inventory[:-1], {**state.inventory[-1], "relowner": 99}],
-        "wrong_parent": [*state.inventory[:-1], {**state.inventory[-1], "native": {"parents": [99]}}],
-        "extra": [*state.inventory, {**state.inventory[-1], "oid": 99, "relname": "unexpected"}],
+        "alias": [*state.inventory[:-1], {**state.inventory[-1], "name": state.inventory[0]["name"]}],
+        "schema": [*state.inventory[:-1], {**state.inventory[-1], "schema": "another_catalog"}],
+        "wrong_parent": [
+            *state.inventory[:-1],
+            {**state.inventory[-1], "parent": {"schema": "catalog", "name": "another_parent"}},
+        ],
+        "extra": [*state.inventory, {**state.inventory[-1], "name": "unexpected"}],
     }
     state.inventory = variants_by_fault[fault]
     state.allocation["inventory"] = deepcopy(state.inventory)
@@ -209,7 +213,7 @@ async def test_preconditions_refuse_before_copy(generic_copy, fault):
     if fault == "uncommitted":
         state.committed = False
     elif fault == "inventory":
-        state.inventory[0]["relowner"] = 99
+        state.inventory[0]["name"] = "another_parent"
     else:
         state.occupied = True
     async with (
@@ -217,7 +221,7 @@ async def test_preconditions_refuse_before_copy(generic_copy, fault):
         case.database.bind_existing_session(case.session),
         open_workspace(state) as current,
     ):
-        with pytest.raises(ValueError, match="allocation_not_committed|inventory_changed|target_not_empty"):
+        with pytest.raises(ValueError, match="header_changed|inventory_changed|target_not_empty"):
             await _copy(state, current)
     payloads._copy_table.assert_not_awaited()
     assert not state.copied and "rollback" in state.events
@@ -290,14 +294,14 @@ async def test_four_target_read_refuses_drift(generic_copy, monkeypatch, change)
         open_workspace(state) as current,
     ):
         if change == "initial_inventory":
-            state.inventory[0]["relowner"] = 99
+            state.inventory[0]["name"] = "another_parent"
         elif change == "final_inventory":
             payloads.allocations._inventory.side_effect = [deepcopy(state.inventory), []]
         elif change == "coordinates":
             original = payloads._coordinates
             sources = await original(current, state.handoff)
             changed = deepcopy(sources)
-            changed[payloads.ROOTS[0]]["oid"] += 1
+            changed[payloads.ROOTS[0]]["name"] = "another_input"
             monkeypatch.setattr(payloads, "_coordinates", AsyncMock(side_effect=[sources, changed]))
         else:
             payloads._parity.side_effect = ValueError("cms_prepared_payloads_content_changed")

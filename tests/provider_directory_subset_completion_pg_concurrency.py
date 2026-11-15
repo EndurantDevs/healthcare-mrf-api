@@ -5,17 +5,21 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-import uuid
+from urllib.parse import urlsplit
 
 from tests.provider_directory_subset_completion_pg_setup import (
     extend_source_fixture_table,
     insert_subset_candidate,
     insert_valid_subset_resources,
-    load_migration as load_subset_migration,
     replace_subset_source,
     run_subset_migration,
+)
+from tests.provider_directory_subset_completion_pg_setup import (
+    load_migration as load_subset_migration,
 )
 from tests.provider_directory_subset_completion_pg_support import (
     terminal_metadata,
@@ -24,6 +28,7 @@ from tests.provider_directory_subset_completion_pg_support import (
     valid_evidence_pairs,
 )
 from tests.tin_npi_connector_postgres_support import (
+    POSTGRES_DSN_ENV,
     asyncpg,
     create_cms_stale_candidate_fixture,
     create_fence_tables,
@@ -38,13 +43,47 @@ from tests.tin_npi_connector_postgres_support import (
 class _ScenarioView:
     connection: object
     schema: str
+    owned_database: tuple[str, str] | None = None
 
     @property
     def quoted_schema(self) -> str:
         return f'"{self.schema}"'
 
 
-async def create_committed_subset_schema(monkeypatch):
+async def _create_owned_database(monkeypatch) -> tuple[str, str]:
+    """Create a fresh test database and point every scenario connection at it."""
+    administrator = await open_test_connection()
+    lane_dsn = os.environ[POSTGRES_DSN_ENV]
+    name = f"pd_subset_writer_test_{uuid.uuid4().hex}"
+    try:
+        await administrator.execute(f'CREATE DATABASE "{name}"')
+    finally:
+        await administrator.close()
+    monkeypatch.setenv(POSTGRES_DSN_ENV, urlsplit(lane_dsn)._replace(path="/" + name).geturl())
+    return lane_dsn, name
+
+
+async def drop_owned_database(owned_database: tuple[str, str]) -> None:
+    lane_dsn, name = owned_database
+    administrator = await asyncpg.connect(lane_dsn)
+    try:
+        await administrator.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+    finally:
+        await administrator.close()
+
+
+async def create_committed_subset_schema(monkeypatch, *, owned_database=False):
+    """Commit one subset schema; an owned database lets native retention setup start from absence."""
+    database = await _create_owned_database(monkeypatch) if owned_database else None
+    try:
+        return await _create_committed_subset_schema(monkeypatch, database)
+    except BaseException:
+        if database is not None:
+            await drop_owned_database(database)
+        raise
+
+
+async def _create_committed_subset_schema(monkeypatch, database):
     connection = await open_test_connection()
     schema = f"provider_subset_race_test_{uuid.uuid4().hex}"
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
@@ -54,7 +93,7 @@ async def create_committed_subset_schema(monkeypatch):
     await create_cms_stale_candidate_fixture(connection, schema)
     await run_migration(load_migration(), "upgrade", connection)
     await run_migration(load_guard_migration(), "upgrade", connection)
-    scenario = _ScenarioView(connection, schema)
+    scenario = _ScenarioView(connection, schema, database)
     await extend_source_fixture_table(scenario)
     async with connection.transaction():
         await run_subset_migration(
@@ -151,10 +190,7 @@ async def _run_baseline_race(scenario, second_connection):
         try:
             await asyncio.wait_for(competing_task, timeout=5)
         except asyncpg.UniqueViolationError as error:
-            assert (
-                "pd_endpoint_dataset_subset_baseline_generation_key"
-                in str(error)
-            )
+            assert "pd_endpoint_dataset_subset_baseline_generation_key" in str(error)
         else:
             raise AssertionError("concurrent subset baseline was accepted")
         await second_transaction.rollback()
@@ -190,7 +226,5 @@ async def prove_concurrent_baseline_generation_is_unique(monkeypatch):
         assert baseline_count == 1
     finally:
         await second_connection.close()
-        await first_connection.execute(
-            f'DROP SCHEMA IF EXISTS "{scenario.schema}" CASCADE'
-        )
+        await first_connection.execute(f'DROP SCHEMA IF EXISTS "{scenario.schema}" CASCADE')
         await first_connection.close()

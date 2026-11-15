@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Shared Profile transition SQL and exact catalog recognition for its read-only receipt guards."""
+"""Shared semantic transition SQL for immutable serving receipts."""
 
 import re
 
@@ -11,6 +11,7 @@ _CMS_SETTINGS_FUNCTIONS = {
     "cms_serving_receipt_immutable",
     "cms_serving_receipt_insert",
 }
+
 
 PROFILE_FIELDS = (
     "status",
@@ -45,6 +46,27 @@ def profile_transition_body(schema):
             PERFORM {schema}.cms_serving_require_fresh('profile',CASE WHEN TG_OP='INSERT' THEN NULL ELSE {old_sql} END);
         END IF;
         RETURN NULL; END"""
+
+
+def _named_profile_snapshot(alias):
+    semantic_fields = [name for name in PROFILE_FIELDS if not name.endswith("_target_oid")]
+    fields = ",".join(f"'{field}',{alias}.{field}" for field in semantic_fields)
+    for role in ("evidence", "profile"):
+        fields += (
+            f",'{role}_target',jsonb_build_object('schema_name',"
+            f"{alias}.targets_json->'{role}'->>'schema','relation_name',"
+            f"{alias}.targets_json->'{role}'->>'name')"
+        )
+    return f"jsonb_build_object({fields})"
+
+
+def named_profile_transition_body(schema):
+    """Retain data transition checks while using the stored schema-qualified targets."""
+    body = profile_transition_body(schema)
+    for alias in ("OLD", "NEW"):
+        previous = "jsonb_build_object(" + ",".join(f"'{name}',{alias}.{name}" for name in PROFILE_FIELDS) + ")"
+        body = body.replace(previous, _named_profile_snapshot(alias))
+    return body
 
 
 _GUARD_CATALOG_SQL = """
@@ -84,7 +106,7 @@ async def assert_profile_receipt_guards(database, relation_by_field, captured_tr
     schema = relation_by_field["schema_name"]
     quoted_schema = '"' + schema.replace('"', '""') + '"'
     expected_by_name = {
-        "cms_serving_profile_transition": (29, True, profile_transition_body(quoted_schema)),
+        "cms_serving_profile_transition": (29, True, named_profile_transition_body(quoted_schema)),
         "cms_serving_no_truncate": (
             34,
             False,

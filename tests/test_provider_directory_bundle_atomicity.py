@@ -2,6 +2,7 @@
 """Common output savepoint contracts with explicit host custody transports."""
 
 import re
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -78,6 +79,8 @@ def _catalog_transport(monkeypatch, capability, prepared_receipts, catalog_by_na
             catalog_by_name[replacement] = replace(catalog_by_name.pop(original), relation=replacement)
             return
         grant = re.fullmatch(r'GRANT SELECT ON TABLE "source_schema"\."([^"]+)" TO "source_reader"', statement)
+        if statement.startswith("LOCK TABLE"):
+            return
         assert grant, statement
         name = grant.group(1)
         acl = decoded(catalog_by_name[name].acl)
@@ -85,7 +88,6 @@ def _catalog_transport(monkeypatch, capability, prepared_receipts, catalog_by_na
         catalog_by_name[name] = replace(catalog_by_name[name], acl=encoded(acl))
 
     monkeypatch.setattr(custody, "_capture", AsyncMock(side_effect=capture))
-    monkeypatch.setattr(custody, "storage_roles", AsyncMock(return_value=(17, [18])))
     capability.connection.fetch = AsyncMock(side_effect=fetch)
     capability.connection.execute = AsyncMock(side_effect=execute)
 
@@ -95,6 +97,9 @@ def output_bundle(bound_capability, monkeypatch):
     def bind_bundle_case():
         # The existing unit fixture doubles native actor/custody observations.
         capability = replace(bound_capability(), targets=OUTPUT_ROOTS[:2])
+        capability = replace(
+            capability, operation_digest=custody._operation_digest(capability.operation, capability.targets)
+        )
         monkeypatch.setattr(custody, "_OUTPUT", SimpleNamespace(get=lambda: capability))
         prepared_receipts = _prepared_outputs(capability)
         catalog_by_name = {
@@ -105,9 +110,23 @@ def output_bundle(bound_capability, monkeypatch):
         capability.connection.transaction.side_effect = _savepoint_transport(catalog_by_name, journal, transactions)
         capability.connection.is_closed = lambda: False
         _catalog_transport(monkeypatch, capability, prepared_receipts, catalog_by_name)
-        binding = SimpleNamespace(session=capability.session)
+        binding = SimpleNamespace(session=capability.session, active=True, bind_count=0)
+
+        @asynccontextmanager
+        async def bind_existing_session(session):
+            previous, was_active = binding.session, binding.active
+            binding.session, binding.active = session, True
+            binding.bind_count += 1
+            try:
+                yield session
+            finally:
+                binding.session, binding.active = previous, was_active
+
         directory = SimpleNamespace(
-            db=SimpleNamespace(_transaction_binding=lambda: binding),
+            db=SimpleNamespace(
+                _transaction_binding=lambda: binding if binding.active else None,
+                bind_existing_session=bind_existing_session,
+            ),
             _ordered_provider_directory_artifact_bundle=lambda stages: stages,
             _lock_provider_directory_artifact_tables=AsyncMock(),
             _lock_provider_directory_artifact_live_tables=AsyncMock(),
@@ -139,12 +158,14 @@ async def test_complete_bundle_rotates_both_families_and_journals_inside_outer_s
         case.directory, case.capability, case.prepared_receipts, after_output_publish=case.record_history
     )
     assert forecast is None and len(retained) == 2
-    assert [receipt.new_oid for receipt in retained] == [201, 211]
+    assert [receipt.successor.relation for receipt in retained] == list(case.capability.targets)
     assert len(case.journal) == 1 and len(case.journal[0]) == 2
+    assert case.binding.bind_count == 0
     for receipt in retained:
         assert case.catalog_by_name[receipt.target] == receipt.successor
         assert case.catalog_by_name[receipt.retained_name] == receipt.incumbent
-        assert [18, 17, "SELECT", False] in decoded(receipt.successor.acl)["table"]
+        assert [18, 17, "SELECT", False] in decoded(case.catalog_by_name[receipt.target].acl)["table"]
+        assert "oid" not in receipt.to_payload()["successor"]
     assert len(case.transactions) == 2
     for transaction in case.transactions:
         transaction.commit.assert_awaited_once()
@@ -170,16 +191,21 @@ async def test_duplicate_artifact_target_refuses_before_any_rotation_or_publicat
 
 
 @pytest.mark.asyncio
-async def test_original_session_substitution_refuses_before_bundle_mutation(output_bundle):
+async def test_unbound_bundle_borrows_publication_transaction_and_restores_context(output_bundle):
+    """Bind the actual publication session for atomic work without an identity attestation."""
     case = output_bundle()
-    case.binding.session = object()
-    before_by_name = dict(case.catalog_by_name)
-    with pytest.raises(RuntimeError, match="output_bundle_original_session_required"):
-        await bundle.apply_prepared_output_bundle(
-            case.directory, case.capability, case.prepared_receipts, after_output_publish=case.record_history
-        )
-    assert case.catalog_by_name == before_by_name and case.journal == [] and case.transactions == []
-    case.capability.connection.execute.assert_not_awaited()
+    previous_session = object()
+    case.binding.session, case.binding.active = previous_session, False
+
+    async def history(original, receipts):
+        assert case.binding.session is case.capability.session
+        await case.record_history(original, receipts)
+
+    await bundle.apply_prepared_output_bundle(
+        case.directory, case.capability, case.prepared_receipts, after_output_publish=history
+    )
+    assert case.binding.session is previous_session and not case.binding.active
+    assert case.binding.bind_count == 1 and len(case.journal) == 1
 
 
 @pytest.mark.asyncio
@@ -222,3 +248,14 @@ async def test_incomplete_publication_receipts_roll_back_already_rotated_familie
     case.transactions[1].commit.assert_awaited_once()
     case.transactions[0].rollback.assert_awaited_once()
     case.transactions[0].commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_only", [False, True])
+async def test_publication_options_keep_live_names_out_of_candidate_prelocks(read_only):
+    lock = AsyncMock()
+    directory = SimpleNamespace(_lock_provider_directory_artifact_tables=lock)
+    publication = bundle.ArtifactBundlePublication(extra_live_relations=("retained",), read_only=read_only)
+    await publication.lock_candidates(directory, "sample", ("stage", "live"), {"live"})
+    lock.assert_awaited_once_with("sample", ("stage",), **({"read_only": True} if read_only else {}))
+    assert publication.extra_live_relations == ("retained",)

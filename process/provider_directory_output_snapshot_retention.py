@@ -1,10 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Rotate verified output heaps without deleting their readable predecessors."""
 
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_output_snapshot_custody as custody
+from process.entity_address_cutover_contract import serving_relation_lock_window
 from process.provider_directory_generic_source_policy import _savepoint
 
 
@@ -13,15 +15,24 @@ def _require(condition, code):
         raise ValueError("provider_directory_output_retention_" + code)
 
 
-def retained_name(oid):
-    """A native table OID gives each retained predecessor a unique name."""
-    _require(type(oid) is int and 0 < oid < 2**32, "oid_invalid")
-    return f"pdout_retained_{oid:x}"
+def retained_name(operation, target=None):
+    """Name new retained generations by logical operation; old numeric names remain a codec only."""
+    if target is None:
+        _require(type(operation) is int and 0 < operation < 2**32, "oid_invalid")
+        return f"pdout_retained_{operation:x}"
+    _require(
+        type(operation) is str
+        and len(operation) == 64
+        and set(operation) <= set("0123456789abcdef")
+        and target in custody.OUTPUT_ROOTS,
+        "operation_invalid",
+    )
+    return "pdout_retained_" + custody._digest({"operation_digest": operation, "target": target})[:32]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class RetainedOutputReceipt:
-    """Actual post-cut native proofs; persistence alone grants no authority."""
+    """Explicit readable predecessor and successor names with logical layout/generation metadata."""
 
     protocol: int
     operation_digest: str
@@ -30,69 +41,88 @@ class RetainedOutputReceipt:
     retained_name: str
     incumbent: custody.NativeOutputRelation
     successor: custody.NativeOutputRelation
+    legacy_payload: dict | None = field(default=None, compare=False, repr=False)
 
     @property
     def old_oid(self):
-        """Return the preserved predecessor table identity."""
+        """Expose only saved compatibility data; current callers must use declared names."""
         return self.incumbent.oid
 
     @property
     def new_oid(self):
-        """Return the installed successor table identity."""
+        """Expose only saved compatibility data; current callers must use declared names."""
         return self.successor.oid
 
-    def to_payload(self):
-        """Store exact native receipts in the existing protected publication record."""
+    def named_payload(self):
+        """Serialize portable rollback coordinates and complete logical output metadata."""
         return {
-            "protocol": self.protocol,
+            "protocol": 2,
             "operation_digest": self.operation_digest,
             "schema": self.schema,
             "target": self.target,
             "retained_name": self.retained_name,
+            "incumbent": self.incumbent.named_payload(),
+            "successor": self.successor.named_payload(),
+        }
+
+    def to_payload(self):
+        """Preserve original retained records; new publication stores only portable metadata."""
+        if self.legacy_payload is not None:
+            return deepcopy(self.legacy_payload)
+        if self.protocol == 2:
+            return self.named_payload()
+        return {
+            **self.named_payload(),
+            "protocol": 1,
             "incumbent": self.incumbent.to_payload(),
             "successor": self.successor.to_payload(),
         }
 
+    def __eq__(self, other):
+        return isinstance(other, RetainedOutputReceipt) and self.named_payload() == other.named_payload()
+
     @classmethod
-    def from_payload(cls, payload):
-        """Decode structure only; a fresh native capability must recheck the cut."""
+    def from_payload(cls, payload_by_field):
+        """Decode the declared coordinates, never recomputing old locations from physical tokens."""
         _require(
-            type(payload) is dict
-            and set(payload)
+            isinstance(payload_by_field, dict)
+            and set(payload_by_field)
             == {"protocol", "operation_digest", "schema", "target", "retained_name", "incumbent", "successor"},
             "receipt_invalid",
         )
         prepared = custody.PreparedOutputReceipt.from_payload(
-            {key: payload[key] for key in ("protocol", "operation_digest", "incumbent", "successor")}
+            {key: payload_by_field[key] for key in ("protocol", "operation_digest", "incumbent", "successor")}
         )
-        incumbent, successor = prepared.incumbent, prepared.successor
+        old, new = prepared.incumbent, prepared.successor
+        storage_identifier(payload_by_field["retained_name"])
         _require(
-            payload["schema"] == incumbent.schema == successor.schema
-            and payload["target"] == incumbent.target == successor.target == successor.relation
-            and payload["retained_name"] == incumbent.relation == retained_name(incumbent.oid)
-            and incumbent.schema_oid == successor.schema_oid
-            and incumbent.oid != successor.oid,
+            payload_by_field["schema"] == old.schema == new.schema
+            and payload_by_field["target"] == old.target == new.target == new.relation
+            and payload_by_field["retained_name"] == old.relation
+            and old.relation != new.relation
+            and payload_by_field["retained_name"] not in custody.OUTPUT_ROOTS,
             "receipt_invalid",
         )
         return cls(
-            1,
+            payload_by_field["protocol"],
             prepared.operation_digest,
-            incumbent.schema,
-            incumbent.target,
-            incumbent.relation,
-            incumbent,
-            successor,
+            old.schema,
+            old.target,
+            old.relation,
+            old,
+            new,
+            deepcopy(payload_by_field) if payload_by_field["protocol"] == 1 else None,
         )
 
 
 async def _require_locks(capability, preparations):
-    required_oids = {proof.oid for receipt in preparations for proof in (receipt.incumbent, receipt.successor)}
-    locks = await capability.connection.fetch(
-        "SELECT relation::bigint AS oid FROM pg_locks WHERE pid=pg_backend_pid() "
-        "AND locktype='relation' AND mode='AccessExclusiveLock' AND granted AND relation=ANY($1::oid[])",
-        sorted(required_oids),
+    """Pin every named heap; actual ALTER takes its bounded exclusive native DDL lock."""
+    names = sorted({proof.relation for receipt in preparations for proof in (receipt.incumbent, receipt.successor)})
+    await capability.connection.execute(
+        "LOCK TABLE "
+        + ",".join(storage_relation(capability.policy.schema, name) for name in names)
+        + " IN ACCESS SHARE MODE NOWAIT"
     )
-    _require({row["oid"] for row in locks} == required_oids, "complete_live_locks_required")
 
 
 async def _require_vacant(capability, names):
@@ -111,7 +141,7 @@ async def _rename(capability, original, replacement):
 
 def _receipt(capability, name, incumbent, successor):
     receipt = RetainedOutputReceipt(
-        1, capability.operation_digest, incumbent.schema, incumbent.target, name, incumbent, successor
+        2, capability.operation_digest, incumbent.schema, incumbent.target, name, incumbent, successor
     )
     # The decoder also checks that post-cut coordinates match both native proofs.
     return RetainedOutputReceipt.from_payload(receipt.to_payload())
@@ -122,13 +152,14 @@ async def retain_prepared_outputs(capability, prepared_receipts):
     preparations = tuple(prepared_receipts)
     await custody.recheck_output_cut(capability, preparations)
     await _require_locks(capability, preparations)
-    names = tuple(retained_name(receipt.incumbent.oid) for receipt in preparations)
+    names = tuple(retained_name(capability.operation_digest, receipt.incumbent.target) for receipt in preparations)
     await _require_vacant(capability, names)
     async with _savepoint(capability.connection):
-        for receipt, name in zip(preparations, names, strict=True):
-            await _rename(capability, receipt.incumbent.relation, name)
-        for receipt in preparations:
-            await _rename(capability, receipt.successor.relation, receipt.successor.target)
+        async with serving_relation_lock_window():
+            for receipt, name in zip(preparations, names, strict=True):
+                await _rename(capability, receipt.incumbent.relation, name)
+            for receipt in preparations:
+                await _rename(capability, receipt.successor.relation, receipt.successor.target)
         results = []
         for receipt, name in zip(preparations, names, strict=True):
             await custody.publish_output_read_access(capability, receipt)
@@ -142,20 +173,21 @@ async def restore_retained_outputs(capability, retained_receipts):
     retained_outputs = tuple(retained_receipts)
     _require(all(type(receipt) is RetainedOutputReceipt for receipt in retained_outputs), "receipt_invalid")
     preparations = tuple(
-        custody.PreparedOutputReceipt(1, receipt.operation_digest, receipt.incumbent, receipt.successor)
+        custody.PreparedOutputReceipt(2, receipt.operation_digest, receipt.incumbent, receipt.successor)
         for receipt in retained_outputs
     )
     await custody.recheck_output_restore(
         capability, preparations, {receipt.target: receipt.retained_name for receipt in retained_outputs}
     )
     await _require_locks(capability, preparations)
-    names = tuple(retained_name(receipt.successor.oid) for receipt in retained_outputs)
+    names = tuple(retained_name(capability.operation_digest, receipt.target) for receipt in retained_outputs)
     await _require_vacant(capability, names)
     async with _savepoint(capability.connection):
-        for receipt, name in zip(retained_outputs, names, strict=True):
-            await _rename(capability, receipt.successor.relation, name)
-        for receipt in retained_outputs:
-            await _rename(capability, receipt.incumbent.relation, receipt.target)
+        async with serving_relation_lock_window():
+            for receipt, name in zip(retained_outputs, names, strict=True):
+                await _rename(capability, receipt.successor.relation, name)
+            for receipt in retained_outputs:
+                await _rename(capability, receipt.incumbent.relation, receipt.target)
         results = []
         for receipt, name in zip(preparations, names, strict=True):
             incumbent, successor = await custody.capture_restored_output(capability, receipt, name)

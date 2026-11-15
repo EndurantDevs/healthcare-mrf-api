@@ -6,8 +6,9 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import MetaData, text
 
+from db.models import AddressAliasArtifactStateV1
 from process import provider_directory_cms_publication as publication
 from process.provider_directory_artifact_bundle_preparation import apply_prepared_artifact_bundle
 from tests.provider_directory_profile_delta_publication import (
@@ -34,11 +35,7 @@ async def _prepared_delta(monkeypatch):
         scenario = await _delta_relation_scenario(database, schema)
         lineage = _delta_lineage()
         oid_by_name = await _delta_relation_oid_by_name(database, scenario)
-        geometry = capacity.validated_capacity_geometry(
-            _geometry_payload(
-                evidence_target_oid=oid_by_name["evidence_target"], profile_target_oid=oid_by_name["profile_target"]
-            )
-        )
+        geometry = capacity.validated_capacity_geometry(_geometry_payload())
         await _insert_delta_checkpoint(database, scenario, lineage, oid_by_name, geometry)
         await _insert_delta_serving_generation(database, scenario, lineage, oid_by_name)
         context = await _delta_capacity_context(database, scenario, lineage, oid_by_name)
@@ -70,7 +67,15 @@ async def _prepared_delta(monkeypatch):
             importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(token)
 
 
+async def _alias_artifact_state(database, schema):
+    async with database.engine.begin() as connection:
+        metadata = MetaData(schema=schema)
+        AddressAliasArtifactStateV1.__table__.to_metadata(metadata, schema=schema)
+        await connection.run_sync(metadata.create_all)
+
+
 async def _companion_relations(fixture):
+    await _alias_artifact_state(fixture.database, fixture.schema)
     for name in ("entity_address_unified", "provider_directory_address_overlay"):
         for suffix, marker in (("", "old"), ("_next", "new")):
             await fixture.database.status(f'CREATE TABLE "{fixture.schema}".{name}{suffix} (marker text)')
@@ -259,6 +264,7 @@ async def test_live_prelocks_preserve_legacy_view_conversion(monkeypatch, kind, 
     """Legacy view replacement must not issue unsupported or recursive table locks."""
     async with _delta_database(monkeypatch) as (database, schema):
         monkeypatch.setattr(importer, "db", database)
+        await _alias_artifact_state(database, schema)
         target_name = importer.PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
         await database.status(f'CREATE {kind} "{schema}".{target_name} AS SELECT 1 AS marker')
         await database.status(f'CREATE TABLE "{schema}".replacement (marker integer)')

@@ -73,9 +73,7 @@ def _readiness_from_row(
             root_content_proof_sha256=fields.get("root_content_proof_sha256"),
             root_cohort_id=fields.get("root_cohort_id"),
             practitioner_resource_count=fields.get("practitioner_resource_count"),
-            semantic_projection_as_of=_projection_text(
-                fields.get("semantic_projection_as_of")
-            ),
+            semantic_projection_as_of=_projection_text(fields.get("semantic_projection_as_of")),
             operation_key=fields.get("operation_key"),
             dataset_hash=fields.get("dataset_hash"),
             resource_count=fields.get("resource_count"),
@@ -89,11 +87,13 @@ def _readiness_from_row(
             request_failure_coverage=fields.get("request_failure_coverage"),
             publication_contract_id=fields.get("publication_contract_id"),
         )
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise ProviderDirectoryRootedGraphPublicationError("state") from None
 
 
 def _readiness_select(filter_sql: str) -> str:
+    from db.migration_rooted_publication_freeze import native_receipt_sql
+
     counts = (
         "jsonb_build_object("
         + ",".join(
@@ -104,8 +104,7 @@ def _readiness_select(filter_sql: str) -> str:
                 "'Organization', header.organization_resource_count",
                 "'Location', header.location_resource_count",
                 "'HealthcareService', header.healthcare_service_resource_count",
-                "'OrganizationAffiliation', "
-                "header.organization_affiliation_resource_count",
+                "'OrganizationAffiliation', header.organization_affiliation_resource_count",
                 "'Endpoint', header.endpoint_resource_count",
             )
         )
@@ -130,14 +129,13 @@ def _readiness_select(filter_sql: str) -> str:
                header.rooted_graph_complete, header.publication_contract_id,
                header.request_failure_coverage,
                header.endpoint_collection_complete, header.endpoint_complete
-          FROM {_table('provider_directory_rooted_graph_dataset')} AS header
-          JOIN {_table('provider_directory_endpoint_dataset')} AS parent
+          FROM {_table("provider_directory_rooted_graph_dataset")} AS header
+          JOIN {_table("provider_directory_endpoint_dataset")} AS parent
             ON parent.dataset_id = header.dataset_id
          WHERE {filter_sql}
            AND header.status = 'published'
            AND header.is_current IS TRUE
-           AND {_table('provider_directory_rooted_graph_dataset_ready')}(
-                   header.dataset_id);
+           AND ({native_receipt_sql(_schema(), "header.dataset_id")});
     """
 
 
@@ -162,9 +160,7 @@ async def load_replay_readiness(
     """Load a current rooted publication by its acquisition replay key."""
 
     row = await database.first(
-        _readiness_select(
-            "header.publication_acquisition_id = :publication_acquisition_id"
-        ),
+        _readiness_select("header.publication_acquisition_id = :publication_acquisition_id"),
         publication_acquisition_id=publication_acquisition_id,
     )
     return None if row is None else _readiness_from_row(row)

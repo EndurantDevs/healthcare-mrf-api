@@ -23,22 +23,15 @@ class Projection:
 class Driver:
     def __init__(self):
         self.in_transaction = True
-        self.probe_free = False
         self.commands = []
-        self.actor = dict(session="publisher", current="owner", backend=123, xid="456", readonly="off")
+        self.isolation = "repeatable read"
 
     def is_in_transaction(self):
         return self.in_transaction
 
-    async def fetchrow(self, sql):
-        assert sql.startswith("SELECT session_user")
-        return dict(self.actor)
-
-    async def fetchval(self, sql, probe=None):
-        if sql == "SHOW transaction_isolation":
-            return "repeatable read"
-        assert "pg_try_advisory_xact_lock" in sql and probe == 42
-        return self.probe_free
+    async def fetchval(self, sql):
+        assert sql == "SHOW transaction_isolation"
+        return self.isolation
 
     async def execute(self, sql):
         assert sql.startswith("LOCK TABLE") and sql.endswith("ACCESS SHARE MODE NOWAIT")
@@ -67,9 +60,9 @@ def _fixture_facts():
     """Construct native-shaped transport facts and the real admission dataclass."""
     models = tuple(type("Model" + str(number), (), {"__tablename__": "root_" + str(number)}) for number in range(9))
     policy = GenericSourcePolicy("synthetic", "owner", "publisher", ("reader",), ())
-    factory = SimpleNamespace(policy=policy)
+    factory = SimpleNamespace(policy=policy, _require_current_policy=lambda: None)
     driver = Driver()
-    session = SimpleNamespace(driver=driver)
+    session = SimpleNamespace(driver=driver, in_transaction=driver.is_in_transaction)
     binding = ContextVar("profile_reads_host_binding", default=None)
     lease_checks = []
     fhir = importlib.import_module("process.provider_directory_fhir")
@@ -135,17 +128,11 @@ def _install_transports(monkeypatch, facts):
     # This test installs only the transport/native catalog boundaries, not read guards.
     monkeypatch.setattr(reads.source, "is_source_storage_required", lambda: True)
     monkeypatch.setattr(reads.source, "source_producer_identity", lambda: ("a" * 40, "sha256:" + "b" * 64))
-    monkeypatch.setattr(reads, "_copy_driver", AsyncMock(side_effect=lambda value: value.driver))
-    catalog_by_root = {
-        root: dict(oid=oid, name=facts.name_by_root[root], phase="completed") for root, oid in facts.oid_by_root.items()
-    }
+    catalog_by_root = {root: dict(name=facts.name_by_root[root], phase="completed") for root in facts.name_by_root}
 
     async def targets(actual, publisher, selected, *, phase):
         assert actual is facts.directory and publisher.connection is facts.driver and phase == "completed"
-        assert selected == tuple(
-            (model, facts.name_by_root[model.__tablename__], facts.oid_by_root[model.__tablename__])
-            for model in facts.models
-        )
+        assert selected == tuple((model, facts.name_by_root[model.__tablename__]) for model in facts.models)
         return {root: dict(catalog) for root, catalog in catalog_by_root.items()}
 
     monkeypatch.setattr(reads.native_copy, "_target_family_catalog", targets)
@@ -198,7 +185,6 @@ async def case(monkeypatch):
         reads.inputs._fence_json(facts.full),
         reads.inputs._fence_json(facts.resource),
         reads.source.source_producer_identity(),
-        42,
     )
     pin_state_by_field = dict(active=True, full=facts.full, resource=facts.resource, tasks={})
     reads.inputs._ISSUED[pin] = pin_state_by_field
@@ -224,9 +210,7 @@ async def prepared(case):
     reads.inputs._ISSUED[pin] = case.pin_state_by_field
     token = reads.inputs._ACTIVE.set(pin)
     try:
-        async with reads.prepared_scope(
-            case.directory, case.projection, case.name_by_root, case.oid_by_root, case.full, case.resource
-        ):
+        async with reads.prepared_scope(case.directory, case.projection, case.name_by_root, case.full, case.resource):
             yield
     finally:
         reads.inputs._ACTIVE.reset(token)
@@ -272,11 +256,11 @@ async def test_nested_read_reuses_catalog_but_rechecks_native_origin_and_lease(c
         async with reads.read_transaction(case.directory) as outer:
             active = reads._READ.get()
             async with reads.read_transaction(case.directory) as inner:
-                assert inner is outer and reads._READ.get()[2] is active[2]
+                assert inner is outer and reads._READ.get() == active
             assert reads._READ.get() is active
         assert family.await_count == 2 and native_actor.await_count == 4
         assert len(case.lease_checks) == lease_checks + 4
-        assert sum("pg_try_advisory_xact_lock" in call.args[0] for call in probes.await_args_list) == 4
+        assert all(call.args == ("SHOW transaction_isolation",) for call in probes.await_args_list)
         assert len(case.transactions) == transactions + 2
         assert reads._READ.get() is None
 
@@ -294,25 +278,22 @@ def _changed_nested_origin(case, monkeypatch, change):
 
 
 def _install_nested_read_mutation(case, changed, change):
-    """Alter one selector or original native actor without changing unrelated facts."""
-    if change in {"xid", "backend", "actor"}:
-        field = "current" if change == "actor" else change
-        changed.setitem(case.driver.actor, field, 456 if change == "backend" else "changed")
-        return None
-    if change == "driver":
-        changed.setattr(reads, "_copy_driver", AsyncMock(return_value=Driver()))
-        return None
-    if change == "binding":
-        changed.setattr(case.directory.db, "_transaction_binding", lambda: SimpleNamespace(session=object()))
-        return None
-    if change == "publisher":
-        return reads.source._PUBLISHER.set(replace(reads.source.bound_publisher()))
-    changed.setitem(case.oid_by_root, "root_0", case.oid_by_root["root_0"] + 1)
+    """Alter a native execution setting or the approved logical data scope."""
+    if change == "isolation":
+        changed.setattr(case.driver, "isolation", "read uncommitted")
+    elif change == "transaction":
+        changed.setattr(case.driver, "in_transaction", False)
+    elif change == "publisher":
+        return reads.source._PUBLISHER.set(
+            replace(reads.source.bound_publisher(), policy=replace(case.policy, schema="other"))
+        )
+    else:
+        changed.setitem(case.name_by_root, "root_0", "changed")
     return None
 
 
-@pytest.mark.parametrize("change", ["xid", "backend", "actor", "driver", "binding", "publisher", "selector"])
-async def test_nested_read_refuses_changed_origin_without_accepting_a_new_catalog(case, monkeypatch, change):
+@pytest.mark.parametrize("change", ["isolation", "transaction", "publisher", "selector"])
+async def test_nested_read_refuses_changed_scope_without_accepting_a_new_catalog(case, monkeypatch, change):
     family = AsyncMock(wraps=reads.native_copy._target_family_catalog)
     monkeypatch.setattr(reads.native_copy, "_target_family_catalog", family)
     async with prepared(case):
@@ -320,7 +301,7 @@ async def test_nested_read_refuses_changed_origin_without_accepting_a_new_catalo
         async with reads.read_transaction(case.directory):
             with _changed_nested_origin(case, monkeypatch, change), pytest.raises((RuntimeError, ValueError)):
                 async with reads.read_transaction(case.directory):
-                    pytest.fail("changed nested origin exposed")
+                    pytest.fail("changed scope exposed")
             assert family.await_count == 1
         assert family.await_count == 2
 
@@ -340,7 +321,7 @@ async def test_nested_read_keeps_outer_catalog_drift_refusal_before_owner_commit
 async def _drift_nested_catalog(case):
     """Change physical metadata inside a nested read for the outer fresh postcheck."""
     async with reads.read_transaction(case.directory):
-        case.catalog_by_root["root_0"]["oid"] += 1
+        case.catalog_by_root["root_0"]["phase"] = "loading"
 
 
 async def test_nested_read_marker_cannot_be_inherited_by_child_task(case):
@@ -362,7 +343,7 @@ async def test_nested_cancellation_preserves_primary_and_restores_outer_marker(c
         with monkeypatch.context() as changed:
             with pytest.raises(asyncio.CancelledError) as caught:
                 async with reads.read_transaction(case.directory):
-                    changed.setitem(case.driver.actor, "xid", "changed")
+                    changed.setattr(case.driver, "isolation", "read uncommitted")
                     raise original
             assert caught.value is original
             assert isinstance(caught.value.__cause__, BaseExceptionGroup)
@@ -384,9 +365,6 @@ def _mutate_case(case, change):
     if change == "name_by_root":
         case.name_by_root["root_0"] = "different"
         return
-    if change == "oid_by_root":
-        case.oid_by_root["root_0"] += 1
-        return
     if change == "full":
         case.full.datasets = case.full.datasets[1:]
         return
@@ -397,16 +375,16 @@ def _mutate_case(case, change):
         case.pin_state_by_field["active"] = False
         return
     if change == "catalog_by_root":
-        case.catalog_by_root["root_0"]["oid"] += 1
+        case.catalog_by_root["root_0"]["phase"] = "loading"
         return
-    if change == "database":
-        case.driver.probe_free = True
+    if change == "transaction":
+        case.driver.in_transaction = False
         return
-    case.driver.actor["current"] = "reader"
+    case.driver.isolation = "read uncommitted"
 
 
 @pytest.mark.parametrize(
-    "change", ["name_by_root", "oid_by_root", "full", "resource", "pin", "catalog_by_root", "database", "actor"]
+    "change", ["name_by_root", "full", "resource", "pin", "catalog_by_root", "transaction", "isolation"]
 )
 async def test_snapshot_or_native_identity_change_refuses(case, change):
     with pytest.raises(ExpectedRefusal):
@@ -490,7 +468,7 @@ async def test_cancellation_remains_cancellation_when_postcheck_also_refuses(cas
             original = asyncio.CancelledError("original")
             with pytest.raises(asyncio.CancelledError) as caught:
                 async with reads.read_transaction(case.directory):
-                    case.driver.actor["current"] = "reader"
+                    case.driver.isolation = "read uncommitted"
                     raise original
             assert caught.value is original
             assert isinstance(caught.value.__cause__, BaseExceptionGroup)

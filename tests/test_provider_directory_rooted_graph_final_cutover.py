@@ -13,11 +13,16 @@ from process.provider_directory_generic_candidate import GenericCandidateError
 
 @pytest.fixture
 def cutover():
-    connection = SimpleNamespace(execute=AsyncMock(), fetch=AsyncMock(), fetchval=AsyncMock())
+    connection = SimpleNamespace(
+        execute=AsyncMock(), fetch=AsyncMock(), fetchval=AsyncMock(), is_in_transaction=lambda: True
+    )
     handoff_by_field = {
         "identity": {"dataset_id": "candidate", "root_dataset_id": "predecessor", "endpoint_id": "endpoint"},
         "operation": {"publication_acquisition_id": "operation"},
-        "tables": {root: {"name": "candidate_" + str(index)} for index, root in enumerate(finalize.ROOTS)},
+        "tables": {
+            root: {"schema": "candidate", "name": "candidate_" + str(index)}
+            for index, root in enumerate((finalize.PARENT, finalize.HEADER))
+        },
         "dataset_hash": "a" * 64,
         "preparation_id": "preparation",
         "counts": {"Practitioner": 2, "Location": 1},
@@ -100,12 +105,10 @@ def _publication_seams(cutover, monkeypatch):
         previous=previous,
         fence=AsyncMock(return_value=previous),
         insert=AsyncMock(),
-        attach=AsyncMock(),
         switch=AsyncMock(),
     )
     monkeypatch.setattr(finalize, "require_current_root_fence", seams.fence)
     monkeypatch.setattr(finalize, "_insert_frozen_header", seams.insert)
-    monkeypatch.setattr(finalize, "_attach_frozen_group", seams.attach)
     monkeypatch.setattr(finalize, "_switch_frozen_headers", seams.switch)
     monkeypatch.setattr(finalize, "capture_root_input_fence", AsyncMock(return_value='{"post":"generation"}'))
     return seams
@@ -120,7 +123,6 @@ async def test_cutover_refuses_busy_publication_before_touching_headers(cutover,
             cutover.preparations, "claim", {"state": "validated"}, database=cutover.database
         )
     seams.insert.assert_not_awaited()
-    seams.attach.assert_not_awaited()
     seams.switch.assert_not_awaited()
     assert "pg_try_advisory_xact_lock" in cutover.connection.fetchval.call_args.args[0]
 
@@ -142,12 +144,13 @@ async def test_cutover_receipt_binds_exact_handoff_and_post_switch_fence(cutover
     seams.fence.assert_awaited_once()
     seams.switch.assert_awaited_once_with(cutover.database, cutover.document, seams.previous)
     statements = [call.args[0] for call in cutover.connection.execute.await_args_list]
-    assert statements[:2] == ["SET LOCAL lock_timeout='1s'", "SET LOCAL statement_timeout='3s'"]
+    assert statements[:2] == ["SET LOCAL lock_timeout='250ms'", "SET LOCAL statement_timeout='3s'"]
     assert statements[-1].startswith("SELECT set_config(")
+    assert all("ATTACH" not in statement and "ALTER TABLE" not in statement for statement in statements)
 
 
 @pytest.mark.asyncio
-async def test_cutover_requires_same_transaction_and_exact_predecessor_before_locks(cutover, monkeypatch):
+async def test_cutover_requires_active_transaction_and_exact_predecessor_before_locks(cutover, monkeypatch):
     _publication_seams(cutover, monkeypatch)
     cutover.document["identity"]["root_dataset_id"] = "other"
     with pytest.raises(GenericCandidateError, match="predecessor_changed"):
@@ -155,7 +158,7 @@ async def test_cutover_requires_same_transaction_and_exact_predecessor_before_lo
             cutover.preparations, "claim", {"state": "validated"}, database=cutover.database
         )
     cutover.document["identity"]["root_dataset_id"] = "predecessor"
-    cutover.preparations.connection = object()
+    cutover.connection.is_in_transaction = lambda: False
     with pytest.raises(GenericCandidateError, match="transaction_changed"):
         await finalize.publish_prepared_rooted_graph_dataset(
             cutover.preparations, "claim", {"state": "validated"}, database=cutover.database

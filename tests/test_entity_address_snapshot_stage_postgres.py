@@ -11,6 +11,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -386,8 +387,12 @@ async def _assert_unsupported_alias_shape(engine, sessions, schema_name: str) ->
 async def _seed_live_sentinel(engine, live_schema: str, relations) -> None:
     """Create the live model family with one value that must survive staging."""
 
+    from tests.test_entity_address_snapshot_destination import _publish_npi_fixture_generation
+
     async with engine.begin() as connection:
         await _create_model_family(connection, live_schema)
+    await _publish_npi_fixture_generation(SimpleNamespace(engine=engine), live_schema)
+    async with engine.begin() as connection:
         alias_metadata = MetaData(schema=live_schema)
         for model in (models.AddressAliasStateV1, models.AddressAliasV1):
             model.__table__.to_metadata(alias_metadata, schema=live_schema)
@@ -399,7 +404,7 @@ async def _seed_live_sentinel(engine, live_schema: str, relations) -> None:
                 "VALUES (true, 2, 1, 0, TIMESTAMPTZ '2026-01-01 00:00:00+00')"
             )
         )
-        for table_name in ("npi_address", "mrf_address", "doctor_clinician_address", "geo_zip_lookup"):
+        for table_name in ("mrf_address", "doctor_clinician_address", "geo_zip_lookup"):
             await connection.execute(text(f'CREATE TABLE "{live_schema}"."{table_name}" (value integer)'))
         await connection.execute(text("CREATE SCHEMA IF NOT EXISTS tiger"))
         await connection.execute(text("CREATE TABLE IF NOT EXISTS tiger.zip_state (value integer)"))
@@ -690,10 +695,36 @@ async def test_native_stage_archive_preserves_live_sentinel(tmp_path: Path):
         await engine.dispose()
 
 
+async def _copy_named_serving_without_metadata_rewrite(engine, sessions, schema, relations, queued_serving):
+    """Equivalent native copies preserve full content and the queued logical capture."""
+    expected_receipt = await _capture_receipt(sessions, schema, "UTC")
+    queued_document = queued_serving.as_dict()
+    table_name = relations[0].table_name
+    prior_name = table_name + "_prior"
+    async with engine.begin() as connection:
+        await connection.execute(text(f'ALTER TABLE "{schema}"."{table_name}" RENAME TO "{prior_name}"'))
+        await connection.execute(
+            text(f'CREATE TABLE "{schema}"."{table_name}" (LIKE "{schema}"."{prior_name}" INCLUDING ALL)')
+        )
+        await connection.execute(text(f'INSERT INTO "{schema}"."{table_name}" SELECT * FROM "{schema}"."{prior_name}"'))
+        await connection.execute(text(f'DROP TABLE "{schema}"."{prior_name}"'))
+    actual_receipt = await _capture_receipt(sessions, schema, "UTC")
+    assert actual_receipt.as_dict() == expected_receipt.as_dict()
+    async with sessions() as session, session.begin():
+        archive_capture = await source.capture_entity_address_archive_source(
+            session, schema_name=schema, queued_serving_capture=queued_document
+        )
+        assert archive_capture.relations == relations
+        assert archive_capture.postgres_snapshot
+        assert archive_capture.observed_serving.as_dict() == queued_document
+        await _assert_live_sentinel(session, schema, table_name)
+    assert queued_serving.as_dict() == queued_document
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed_identity", ("serving", "alias", "geo"))
 async def test_queued_serving_identity_rejects_source_drift(changed_identity: str):
-    """A queued export cannot silently follow later serving authority."""
+    """Equivalent named copies work, but later logical serving, alias or geo state refuses."""
 
     async_dsn, _ = _native_test_connection()
     engine = create_async_engine(async_dsn, max_overflow=0, pool_size=2)
@@ -706,20 +737,18 @@ async def test_queued_serving_identity_rejects_source_drift(changed_identity: st
     try:
         await _seed_live_sentinel(engine, live_schema, relations)
         queued_serving = await _capture_observed_serving(sessions, live_schema)
+        if changed_identity == "serving":
+            await _copy_named_serving_without_metadata_rewrite(engine, sessions, live_schema, relations, queued_serving)
         async with engine.begin() as connection:
             if changed_identity == "serving":
-                table_name = relations[5].table_name
-                prior_table_name = f"{table_name}_prior"
-                await connection.execute(
-                    text(f'ALTER TABLE "{live_schema}"."{table_name}" RENAME TO "{prior_table_name}"')
-                )
-                await connection.execute(
-                    text(
-                        f'CREATE TABLE "{live_schema}"."{table_name}" '
-                        f'(LIKE "{live_schema}"."{prior_table_name}" INCLUDING ALL)'
+                from tests.test_entity_address_result_generation_postgres import _ConnectionDatabase
+
+                published = (
+                    await source.entity_address_unified.result_generation.publish_local_entity_address_generation(
+                        _ConnectionDatabase(connection), schema_name=live_schema
                     )
                 )
-                await connection.execute(text(f'DROP TABLE "{live_schema}"."{prior_table_name}"'))
+                assert published.local_generation == 1
             elif changed_identity == "alias":
                 await connection.execute(
                     text(f'UPDATE "{live_schema}"."address_alias_state_v1" SET generation = generation + 1')
@@ -1032,7 +1061,12 @@ async def test_native_owned_export_never_cleans_a_preexisting_collision():
 async def _prepare_nonempty_restore_fixture(engine, sessions, destination_schema: str, dataset_id):
     """Create incumbent and owned staged rows that use the actual native model family."""
 
+    from tests.test_npi_result_archive_postgres import _ensure_model_extensions
+
     async with engine.begin() as connection:
+        await _ensure_model_extensions(connection)
+        for extension in ("btree_gin", "postgis"):
+            await connection.execute(text(f'CREATE EXTENSION IF NOT EXISTS "{extension}"'))
         await _create_model_family(connection, destination_schema)
         await _create_alias_validation_relations(connection, destination_schema)
         incumbent_relation_oid = await connection.scalar(
@@ -1067,7 +1101,7 @@ async def _assert_rehydrated_evidence_sequence(session, destination_schema: str,
 
     evidence_stage_name = next(
         table_name
-        for table_name, _ in prepared_restore.stage_relation_oids
+        for _schema_name, table_name in prepared_restore.stage_relations
         if table_name.startswith("entity_address_evidence_")
     )
     highest_evidence_id = await session.scalar(
@@ -1121,10 +1155,8 @@ async def _assert_rehydrated_restore_state(
             == 2
         )
         await _assert_rehydrated_evidence_sequence(session, destination_schema, prepared_restore)
-        await _assert_stage_share_pins_block_ddl(
-            sessions, destination_schema, prepared_restore.stage_relation_oids[0][0]
-        )
-        assert {table_name for table_name, _ in prepared_restore.stage_relation_oids} == {
+        await _assert_stage_share_pins_block_ddl(sessions, destination_schema, prepared_restore.stage_relations[0][1])
+        assert {table_name for _schema_name, table_name in prepared_restore.stage_relations} == {
             f"{relation.table_name}_20260913" for relation in source.entity_address_archive_relations()
         }
         assert (
@@ -1159,6 +1191,8 @@ async def test_native_restore_finalization_rehydrates_pinned_stage():
                 import_date="20260913",
             )
             stored = prepared_restore.as_dict()
+            assert "stage_relation_oids" not in stored
+            assert set(stored["ownership"]) == {"dataset_id", "schema_name", "relations"}
             assert stored["stage_integrity"] == prepared_restore.stage_integrity.as_dict()
         await _assert_rehydrated_restore_state(
             sessions,
@@ -1173,11 +1207,9 @@ async def test_native_restore_finalization_rehydrates_pinned_stage():
         await engine.dispose()
 
 
-def _prepared_main_stage(prepared_restore) -> tuple[str, int]:
+def _prepared_main_stage(prepared_restore) -> str:
     return next(
-        (table_name, oid)
-        for table_name, oid in prepared_restore.stage_relation_oids
-        if table_name.startswith("entity_address_unified_")
+        name for _schema, name in prepared_restore.stage_relations if name.startswith("entity_address_unified_")
     )
 
 
@@ -1223,7 +1255,7 @@ async def _drop_prepared_stage_index(session, destination_schema: str, main_stag
 
 
 async def _mutate_prepared_stage(session, destination_schema: str, prepared_restore, mutation: str) -> None:
-    main_stage_name, _main_stage_oid = _prepared_main_stage(prepared_restore)
+    main_stage_name = _prepared_main_stage(prepared_restore)
     operations_by_mutation = {
         "insert": _insert_prepared_stage_row,
         "update": _update_prepared_stage_row,
@@ -1254,13 +1286,13 @@ async def _finalize_restore_fixture(engine, sessions, destination_schema: str):
 
 
 async def _assert_prepared_stage_oid(session, destination_schema: str, prepared_restore) -> None:
-    main_stage_name, main_stage_oid = _prepared_main_stage(prepared_restore)
+    main_stage_name = _prepared_main_stage(prepared_restore)
     assert (
         await session.scalar(
-            text("SELECT to_regclass(:table_reference)::oid"),
+            text("SELECT to_regclass(:table_reference) IS NOT NULL"),
             {"table_reference": f"{destination_schema}.{main_stage_name}"},
         )
-        == main_stage_oid
+        is True
     )
 
 
@@ -1326,7 +1358,12 @@ async def test_native_restore_precreate_and_cleanup_retain_exact_owned_family():
     destination_schema = "address_restore_destination_" + uuid4().hex
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     try:
+        from tests.test_npi_result_archive_postgres import _ensure_model_extensions
+
         async with engine.begin() as connection:
+            await _ensure_model_extensions(connection)
+            for extension in ("btree_gin", "postgis"):
+                await connection.execute(text(f'CREATE EXTENSION IF NOT EXISTS "{extension}"'))
             await connection.execute(text(f'CREATE SCHEMA "{destination_schema}"'))
         async with sessions() as session, session.begin():
             owner = await restore.precreate_entity_address_archive_restore(
@@ -1336,7 +1373,7 @@ async def test_native_restore_precreate_and_cleanup_retain_exact_owned_family():
                 import_date="20260913",
             )
             assert owner.schema_name == ownership.entity_address_archive_stage_schema(dataset_id)
-            assert {table_name for table_name, _ in owner.relation_oids} == {
+            assert set(owner.relation_names) == {
                 relation.table_name for relation in source.entity_address_archive_relations()
             }
             await ownership.cleanup_entity_address_archive_stage(session, owner=owner)

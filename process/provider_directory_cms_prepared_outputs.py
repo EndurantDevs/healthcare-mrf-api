@@ -38,9 +38,9 @@ async def _copy_native_content(connection, session, *, schema, receipt):
         "SELECT a.attname::text AS name FROM pg_catalog.pg_index i "
         "CROSS JOIN LATERAL unnest(i.indkey::smallint[]) WITH ORDINALITY k(attnum,ordinal) "
         "JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum "
-        "WHERE i.indrelid=$1::oid AND i.indisprimary AND i.indisvalid AND i.indisready "
+        "WHERE i.indrelid=to_regclass($1) AND i.indisprimary AND i.indisvalid AND i.indisready "
         "AND k.ordinal<=i.indnkeyatts AND NOT a.attisdropped ORDER BY k.ordinal",
-        receipt["oid"],
+        storage_relation(schema, receipt["name"]),
     )
     if not keys:
         raise ValueError("cms_prepared_outputs_frozen_key_required")

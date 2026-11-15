@@ -18,6 +18,7 @@ from alembic.operations import Operations
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from db.models import ProviderDirectoryProfileCapacityPreflightReceipt
 from process import provider_directory_cms_capacity_contract as contract
 from tests.cms_npd_admission_postgres_support import _database_url
 from tests.test_provider_directory_cms_capacity_contract import _cms_receipt_row
@@ -75,17 +76,22 @@ def test_schema_mismatch_fails_before_lock(monkeypatch):
         migration.upgrade()
 
 
-def _apply(connection, schema, direction):
+def _apply(connection, schema, direction, current=False):
     with Operations.context(MigrationContext.configure(connection)):
         if direction == "bootstrap":
-            original._create_table(schema)
+            if current:
+                metadata = sa.MetaData()
+                ProviderDirectoryProfileCapacityPreflightReceipt.__table__.to_metadata(metadata, schema=schema)
+                metadata.create_all(connection)
+            else:
+                original._create_table(schema)
             original._create_guards(schema)
         else:
             getattr(migration, direction)()
 
 
 @asynccontextmanager
-async def _ledger(monkeypatch):
+async def _ledger(monkeypatch, *, current=False):
     """Create only a task-owned schema within the strict UUID test database."""
     engine = create_async_engine(_database_url())
     schema = "cms_receipt_" + uuid4().hex
@@ -94,7 +100,7 @@ async def _ledger(monkeypatch):
     try:
         async with engine.begin() as connection:
             await connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
-            await connection.run_sync(_apply, schema, "bootstrap")
+            await connection.run_sync(_apply, schema, "bootstrap", current)
         yield engine, schema
     finally:
         try:
@@ -326,8 +332,7 @@ def test_native_signed_receipt_roundtrip(monkeypatch):
     assert row == contract.capacity_preflight_receipt_row_values(request, receipt, issued_at=row["issued_at"])
 
     async def exercise():
-        async with _ledger(monkeypatch) as (engine, schema):
-            await _migrate(engine, schema, "upgrade")
+        async with _ledger(monkeypatch, current=True) as (engine, schema):
             await _insert(engine, schema, row)
             async with engine.connect() as connection:
                 result = await connection.execute(

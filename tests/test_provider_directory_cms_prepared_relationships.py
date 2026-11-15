@@ -31,8 +31,7 @@ def _graph_state(case):
     }
     current._indexed = False
     current._receipts = {
-        root: dict(name="private_" + str(n), oid=500 + n, owner=76, layout_sha256="1" * 64)
-        for n, root in enumerate(workspace.OUTPUT_ROOTS)
+        root: dict(schema=case.policy.schema, name="private_" + str(n)) for n, root in enumerate(workspace.OUTPUT_ROOTS)
     }
     current._inputs = {
         "source_policy": workspace._copy(asdict(case.source_policy)),

@@ -144,12 +144,13 @@ async def _provision(case, **overrides):
 
 
 async def _canonical_state(connection):
+    """Compare complete named layouts while provision leaves canonical tables unchanged."""
     return await connection.fetch(
-        "SELECT c.oid,c.relname,c.relowner,c.relacl::text,"
+        "SELECT c.relname,c.relkind,"
         "ARRAY(SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid=c.oid ORDER BY conname) AS constraints,"
-        "ARRAY(SELECT jsonb_build_array(oid,tgfoid,pg_get_triggerdef(oid)) FROM pg_trigger "
+        "ARRAY(SELECT pg_get_triggerdef(oid) FROM pg_trigger "
         "WHERE tgrelid=c.oid ORDER BY tgname) AS triggers "
-        "FROM pg_class c WHERE relnamespace='catalog'::regnamespace ORDER BY c.oid"
+        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='catalog' ORDER BY c.relname"
     )
 
 
@@ -165,19 +166,23 @@ async def _assert_copied_native_layouts(connection, schema):
         )
 
 
-@pytest.mark.parametrize("inherited_role", ["pg_read_all_data", "pg_write_all_data"])
-async def test_private_storage_refuses_inherited_runtime_access(native_bootstrap, inherited_role):
-    from process.provider_directory_generic_source_storage import require_private_source_readers_closed
-
-    case, connection = native_bootstrap, native_bootstrap.connection
-    async with connection.transaction():
-        evidence = await _provision(case)
-        relation_oids = [entry["oid"] for entry in evidence["inventory"]]
-        reader_oids = [evidence["role_oids"][case.roles["reader"]]]
-        await require_private_source_readers_closed(connection, relation_oids, reader_oids)
-        await connection.execute(f"GRANT {quote(inherited_role)} TO {quote(case.roles['reader'])}")
-        with pytest.raises(GenericCandidateError, match="private_reader_access"):
-            await require_private_source_readers_closed(connection, relation_oids, reader_oids)
+async def test_private_storage_grants_are_enforced_by_native_sql(native_bootstrap):
+    case = native_bootstrap
+    async with case.connection.transaction():
+        await _provision(case)
+    reader = await asyncpg.connect(_dsn(case.url.set(username=case.roles["reader"])))
+    try:
+        header = storage_relation(case.policy.schema, provision.HEADER)
+        for statement in (
+            f"SELECT * FROM {header}",
+            f"DELETE FROM {header}",
+            f"ALTER TABLE {header} ADD forbidden integer",
+        ):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                async with reader.transaction():
+                    await reader.execute(statement)
+    finally:
+        await reader.close()
 
 
 @pytest.mark.parametrize(
@@ -256,35 +261,31 @@ async def test_native_private_parent_fence_blocks_delete_not_other_candidate(nat
         assert await other.fetchval(f"SELECT resource_count FROM {header} WHERE dataset_id='second'") == 1
 
 
-async def test_native_private_observation_is_readonly_on_original_actor(native_bootstrap):
+async def test_native_private_observation_is_readonly_on_named_storage(native_bootstrap):
     from process import provider_directory_source_observation as observation
     from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding
 
     case = native_bootstrap
     async with case.connection.transaction():
         prepared = await _provision(case)
-    coordinate_by_name = {
-        name: prepared[name] for name in FHIRSourceStorageBinding.__dataclass_fields__ if name in prepared
-    }
-    binding = FHIRSourceStorageBinding(**coordinate_by_name, enrollment_sha256="a" * 64)
+    binding = FHIRSourceStorageBinding(**prepared)
     factory = SimpleNamespace(policy=case.policy, storage_binding=binding)
     directory = SimpleNamespace(_schema=lambda: "catalog")
     engine = create_async_engine(case.url.set(drivername="postgresql+asyncpg", username=case.roles["publisher"]))
-    token = observation.source._FACTORY.set(factory)
     try:
         async with AsyncSession(engine) as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
             await session.execute(text("SET LOCAL ROLE " + quote(case.roles["owner"])))
-            driver = await observation._copy_driver(session)
-            origin = await observation._native_origin(directory, factory, session, driver, "repeatable read")
+            await observation._require_active_transaction(directory, factory, session)
+            assert observation._storage_binding(directory, factory) == binding
             header = storage_relation(case.policy.schema, provision.HEADER)
             assert (await session.execute(text(f"SELECT count(*) FROM {header}"))).scalar_one() == 0
             with pytest.raises(DBAPIError, match="read-only transaction"):
                 async with session.begin_nested():
                     await session.execute(text(f"DELETE FROM {header}"))
-            assert await observation._native_origin(directory, factory, session, driver, "repeatable read") == origin
+            await observation._require_active_transaction(directory, factory, session)
+            assert observation._storage_binding(directory, factory) == binding
     finally:
-        observation.source._FACTORY.reset(token)
         await engine.dispose()
 
 
@@ -311,8 +312,8 @@ async def _assert_complete_handoff_copies(writer, policy, binding):
     captured = await completion.storage._capture(writer, policy, list(names.values()))
     assert len(captured) == 2
     assert not await writer.fetchval(
-        "SELECT EXISTS(SELECT FROM pg_constraint WHERE conrelid=ANY($1::oid[]) AND contype='f')",
-        [entry["oid"] for entry in captured.values()],
+        "SELECT EXISTS(SELECT FROM pg_constraint WHERE conrelid=ANY(ARRAY(SELECT to_regclass(name) FROM unnest($1::text[]) name)) AND contype='f')",
+        [storage_relation(entry["schema"], entry["name"]) for entry in captured.values()],
     )
 
 
@@ -376,20 +377,8 @@ async def test_native_bootstrap_preserves_guards_reads_and_fk_free_storage(nativ
     try:
         async with connection.transaction():
             receipt = await _provision(case)
-            assert receipt["preparation_only"] is True
-            assert set(receipt["required_application_checks"]) == set(provision._ISOLATED_APPLICATION_CHECKS)
-            assert receipt["owner_oid"] != receipt["namespace_owner_oid"]
-            assert receipt["role_oids"][case.roles["publisher"]] == receipt["publisher_oid"]
-            assert receipt["role_oids"][case.roles["owner"]] == receipt["owner_oid"]
-            for check in receipt["required_application_checks"].values():
-                assert len(check["function_oids"]) == 1 and check["function_oids"][0] > 0
-            assert receipt["catalog_schema_oid"] != receipt["storage_schema_oid"]
-            assert len(receipt["inventory"]) == len(provision.ISOLATED_FHIR_ROOTS)
+            assert receipt == {"catalog_schema": "catalog", "storage_schema": case.policy.schema}
             await _assert_copied_native_layouts(connection, case.policy.schema)
-            for table in receipt["inventory"]:
-                assert table["schema_oid"] == receipt["storage_schema_oid"]
-                assert table["schema_owner_oid"] == receipt["namespace_owner_oid"]
-                assert table["owner"] == receipt["owner_oid"] and table["relfilenode"] > 0
             locks = await connection.fetch(
                 "SELECT c.relname,l.mode FROM pg_locks l JOIN pg_class c ON c.oid=l.relation "
                 "WHERE l.pid=pg_backend_pid() AND c.relnamespace='catalog'::regnamespace"
@@ -403,10 +392,11 @@ async def test_native_bootstrap_preserves_guards_reads_and_fk_free_storage(nativ
                 )
             assert not await connection.fetchval(
                 "SELECT EXISTS(SELECT FROM pg_constraint k JOIN pg_class c ON c.oid=k.conrelid "
-                "WHERE c.relnamespace=$1::oid AND k.contype='f') OR EXISTS(SELECT FROM pg_trigger t "
-                "JOIN pg_class c ON c.oid=t.tgrelid WHERE c.relnamespace=$1::oid) "
-                "OR EXISTS(SELECT FROM pg_proc WHERE pronamespace=$1::oid)",
-                receipt["storage_schema_oid"],
+                "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND k.contype='f') "
+                "OR EXISTS(SELECT FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1) "
+                "OR EXISTS(SELECT FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=$1)",
+                receipt["storage_schema"],
             )
             assert await _canonical_state(connection) == before
         private = storage_relation(case.policy.schema, provision.RELATIONS[0])
@@ -418,79 +408,36 @@ async def test_native_bootstrap_preserves_guards_reads_and_fk_free_storage(nativ
             await connection.execute(f"INSERT INTO {private}(dataset_id,item,value) VALUES('unreferenced','other',1)")
         with pytest.raises(asyncpg.NotNullViolationError):
             await connection.execute(f"INSERT INTO {private}(dataset_id,item,value) VALUES('other',NULL,1)")
-        assert not await connection.fetchval(
-            "SELECT has_table_privilege($1,$2,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE')", case.roles["reader"], private
-        )
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await connection.execute(f"INSERT INTO {private}(dataset_id,item,value) VALUES('unreferenced','UPPER',2)")
     finally:
         await reader.close()
 
 
-async def test_native_isolated_inventory_rechecks_provisioned_storage(native_bootstrap):
+async def test_native_named_inventory_rechecks_provisioned_storage(native_bootstrap):
     from process import provider_directory_source_storage_binding as binding
 
     case, connection = native_bootstrap, native_bootstrap.connection
     async with connection.transaction():
-        await _provision(case)
-        roles_by_name = {
-            name: {"oid": await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", name)}
-            for name in (case.policy.owner_role, case.policy.publisher_role, *case.policy.runtime_roles)
-        }
-        evidence = await binding._isolated_catalog_rows(connection, case.policy, "catalog", roles_by_name)
-        with pytest.raises(GenericCandidateError, match="checkpoint_layout_changed"):
-            binding._isolated_inventory(case.policy, "catalog", roles_by_name, evidence)
+        coordinates = binding.FHIRSourceStorageBinding(**(await _provision(case)))
+        await binding.verify_isolated_source_storage_coordinates(connection, case.policy, coordinates)
+        with pytest.raises(asyncpg.UndefinedTableError):
+            async with connection.transaction():
+                await connection.execute("DROP TABLE " + storage_relation(case.policy.schema, provision.HEADER))
+                await binding.verify_isolated_source_storage_coordinates(connection, case.policy, coordinates)
+        await binding.verify_isolated_source_storage_coordinates(connection, case.policy, coordinates)
 
 
-async def _assert_migrated_isolated_custody(driver, storage_policy, role_names_by_kind):
-    """Verify native storage shape and reject incomplete custody rights."""
-    from process import provider_directory_source_storage_binding as binding
-
-    roles_by_name = {
-        name: {"oid": await driver.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", name)}
-        for name in (storage_policy.owner_role, storage_policy.publisher_role, *storage_policy.runtime_roles)
-    }
-    evidence = await binding._isolated_catalog_rows(driver, storage_policy, "mrf", roles_by_name)
-    inventory = binding._isolated_inventory(storage_policy, "mrf", roles_by_name, evidence)
-    assert set(inventory) == set(provision.ISOLATED_FHIR_ROOTS)
-    checks = binding._isolated_application_checks(evidence)
-    assert set(checks) == set(provision._ISOLATED_APPLICATION_CHECKS)
-    admission_rows = [relation for relation in evidence["catalog"] if relation["scope"] == "admission"]
-    assert {relation["relname"] for relation in admission_rows} == binding._CATALOG_ROOTS
-    metadata = await binding._isolated_metadata_rows(
-        driver,
-        "mrf",
-        storage_policy.runtime_roles,
-        [roles_by_name[name]["oid"] for name in (storage_policy.owner_role, storage_policy.publisher_role)],
-    )
-    assert metadata
-    task, publisher_identity = await binding._require_source_storage_publisher(driver, storage_policy, None)
-    assert task is not None and publisher_identity["administrator"]
-    # Complete the role graph so capture reaches the canonical admission-rights check.
-    await driver.execute(f"REVOKE {quote(role_names_by_kind['owner'])} FROM {quote(role_names_by_kind['publisher'])}")
-    for kind, inherited in (("publisher", False), ("migration", True), ("publication_publisher", True)):
-        await driver.execute(
-            f"GRANT {quote(role_names_by_kind['owner'])} TO {quote(role_names_by_kind[kind])} "
-            f"WITH INHERIT {'TRUE' if inherited else 'FALSE'}"
-        )
-    await driver.execute(
-        f"GRANT {quote(role_names_by_kind['publication_owner'])} "
-        f"TO {quote(role_names_by_kind['publication_publisher'])}"
-    )
-    await driver.execute(
-        f"GRANT CREATE ON SCHEMA {quote(storage_policy.schema)} TO {quote(role_names_by_kind['publication_owner'])}"
-    )
-    with pytest.raises(GenericCandidateError, match="admission_authority_changed"):
-        await binding.capture_isolated_source_storage_custody(
-            driver,
-            storage_policy,
-            catalog_schema="mrf",
-            migration_role=role_names_by_kind["migration"],
-            namespace_owner_role=role_names_by_kind["namespace"],
-            publication={
-                "owner_role": role_names_by_kind["publication_owner"],
-                "publisher_role": role_names_by_kind["publication_publisher"],
-            },
-        )
-    return roles_by_name
+async def _assert_migrated_isolated_data(driver, storage_policy):
+    """Read the complete named model family and prove the existing Reader cannot write."""
+    for root in provision.ISOLATED_FHIR_ROOTS:
+        relation = storage_relation(storage_policy.schema, root)
+        assert await driver.fetch(f"SELECT * FROM {relation} LIMIT 0") == []
+    header = storage_relation(storage_policy.schema, provision.HEADER)
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        async with driver.transaction():
+            await driver.execute(f"SET LOCAL ROLE {quote(storage_policy.runtime_roles[0])}")
+            await driver.execute(f"UPDATE {header} SET status='validated'")
 
 
 async def _close_native_role_fixture(driver, created_role_names):
@@ -510,26 +457,42 @@ async def _close_native_role_fixture(driver, created_role_names):
         raise first_failure
 
 
-async def _assert_frozen_candidate_guards(driver, storage_policy, roles_by_name):
+async def _assert_frozen_dataset_scope(driver, storage_policy, frozen_document_by_field):
+    """Reject foreign rows in the exact dataset-scoped handoff family."""
+    from process import provider_directory_generic_source_completion as completion
+
+    await completion._frozen_source_inventory(driver, storage_policy, frozen_document_by_field)
+    header = storage_relation(storage_policy.schema, provision.HEADER)
+    await driver.execute(
+        f"INSERT INTO {header}(dataset_id,endpoint_id,acquisition_root_run_id,status,is_current) "
+        "VALUES('foreign-dataset','endpoint','root','acquiring',false)"
+    )
+    with pytest.raises(GenericCandidateError, match="dataset_changed"):
+        await completion._frozen_source_inventory(driver, storage_policy, frozen_document_by_field)
+    await driver.execute(f"DELETE FROM {header} WHERE dataset_id='foreign-dataset'")
+
+
+async def _assert_frozen_candidate_guards(driver, storage_policy):
     """Reject unfrozen or incomplete proof state in the isolated native tables."""
     from process import provider_directory_generic_source_completion as completion
     from process.provider_directory_proof_store import ProviderDirectoryProofStoreError
     from tests.cms_npd_admission_postgres_support import fhir
 
     frozen_document_by_field = {
-        "storage": {"owner_oid": roles_by_name[storage_policy.owner_role]["oid"]},
         "identity": {
             "dataset_id": "unpublished",
             "endpoint_id": "endpoint",
             "acquisition_root_run_id": "root",
             "metadata": {"selected_resources": ["Organization"], "source_ids": ["source"]},
         },
-        "tables": {root: {"name": root} for root in provision.ISOLATED_FHIR_ROOTS},
+        "tables": {
+            root: {"schema": storage_policy.schema, "name": root}
+            for root in (*completion.storage.HANDOFF_CONTROL_ROOTS, *completion.storage.RELATIONS)
+        },
     }
     probe_rows = await completion._FrozenSourceRows(driver).all("SELECT 1 AS value")
     assert probe_rows[0]["value"] == 1
-    with pytest.raises(GenericCandidateError, match="freeze_required"):
-        await completion._frozen_source_inventory(driver, storage_policy, frozen_document_by_field)
+    await _assert_frozen_dataset_scope(driver, storage_policy, frozen_document_by_field)
     with pytest.raises(GenericCandidateError, match="header_snapshot_changed"):
         await completion._frozen_handoff_header(driver, storage_policy, frozen_document_by_field)
     with pytest.raises(GenericCandidateError, match="plan_projection_changed"):
@@ -608,8 +571,8 @@ async def _verify_native_catalog_custody(monkeypatch):
                     namespace_owner=role_names_by_kind["namespace"],
                     verify_role_profile=verify_native_source_profile,
                 )
-                roles_by_name = await _assert_migrated_isolated_custody(driver, storage_policy, role_names_by_kind)
-                await _assert_frozen_candidate_guards(driver, storage_policy, roles_by_name)
+                await _assert_migrated_isolated_data(driver, storage_policy)
+                await _assert_frozen_candidate_guards(driver, storage_policy)
             finally:
                 await transaction.rollback()
         finally:
@@ -617,7 +580,7 @@ async def _verify_native_catalog_custody(monkeypatch):
 
 
 @pytest.mark.parametrize("kind", ["check", "default", "index", "sequence", "same_named_check"])
-async def test_other_custom_dependencies_are_rejected_without_private_state(native_bootstrap, kind):
+async def test_private_copy_preserves_native_template_dependencies(native_bootstrap, kind):
     case, connection = native_bootstrap, native_bootstrap.connection
     relation = storage_relation("catalog", provision.RELATIONS[1])
     statements_by_kind = {
@@ -628,37 +591,46 @@ async def test_other_custom_dependencies_are_rejected_without_private_state(nati
         "same_named_check": f"ALTER TABLE {relation} ADD CONSTRAINT pd_endpoint_dataset_completion_digest_check CHECK (catalog.extra(item)<>'')",
     }
     await connection.execute(statements_by_kind[kind])
+    before = await _canonical_state(connection)
     async with connection.transaction():
-        with pytest.raises(GenericCandidateError, match="template_dependency_unsupported"):
-            await _provision(case)
-        assert not await connection.fetchval("SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname='private_source')")
-
-
-@pytest.mark.parametrize(
-    "change", ["missing_check", "changed_check", "no_primary", "missing_root", "existing_namespace"]
-)
-async def test_partial_or_changed_preimages_are_rejected(native_bootstrap, change):
-    case, connection = native_bootstrap, native_bootstrap.connection
-    header = storage_relation("catalog", provision.HEADER)
-    if change in {"missing_check", "changed_check"}:
-        await connection.execute(f"ALTER TABLE {header} DROP CONSTRAINT pd_endpoint_dataset_completion_digest_check")
-        if change == "changed_check":
-            await connection.execute(
-                f"ALTER TABLE {header} ADD CONSTRAINT pd_endpoint_dataset_completion_digest_check CHECK (true)"
-            )
-    elif change == "no_primary":
-        relation = storage_relation("catalog", provision.RELATIONS[1])
-        constraint = await connection.fetchval(
-            "SELECT conname FROM pg_constraint WHERE conrelid=$1::regclass AND contype='p'", relation
+        await _provision(case)
+        await _assert_copied_native_layouts(connection, case.policy.schema)
+        assert await _canonical_state(connection) == before
+        copied = storage_relation(case.policy.schema, provision.RELATIONS[1])
+        await connection.execute(f"INSERT INTO {copied}(dataset_id,item,value) VALUES('selected','UPPER',1)")
+        assert await connection.fetchrow(f"SELECT dataset_id,item,value,folded FROM {copied}") == (
+            "selected",
+            "UPPER",
+            1,
+            "upper",
         )
-        await connection.execute(f"ALTER TABLE {relation} DROP CONSTRAINT {quote(constraint)}")
+        if kind in {"check", "same_named_check"}:
+            with pytest.raises(asyncpg.CheckViolationError):
+                async with connection.transaction():
+                    await connection.execute(f"INSERT INTO {copied}(dataset_id,item,value) VALUES('selected','',2)")
+        elif kind == "default":
+            await connection.execute(f"INSERT INTO {copied}(dataset_id,value) VALUES('default',2)")
+            assert await connection.fetchval(f"SELECT item FROM {copied} WHERE dataset_id='default'") == "value"
+        elif kind == "sequence":
+            await connection.execute(f"INSERT INTO {copied}(dataset_id,item) VALUES('sequence','next')")
+            assert await connection.fetchval(f"SELECT value FROM {copied} WHERE dataset_id='sequence'") == 1
+        assert await connection.fetchval(f"SELECT count(*) FROM {relation}") == 0
+
+
+@pytest.mark.parametrize("change", ["missing_check", "missing_root", "existing_namespace"])
+async def test_native_missing_preimages_and_occupied_namespace_roll_back(native_bootstrap, change):
+    case, connection = native_bootstrap, native_bootstrap.connection
+    if change == "missing_check":
+        header = storage_relation("catalog", provision.HEADER)
+        await connection.execute(f"ALTER TABLE {header} DROP CONSTRAINT pd_endpoint_dataset_completion_digest_check")
     elif change == "missing_root":
         await connection.execute("DROP TABLE " + storage_relation("catalog", provision.RELATIONS[1]))
     else:
         await connection.execute("CREATE SCHEMA private_source")
     async with connection.transaction():
-        with pytest.raises((GenericCandidateError, asyncpg.UndefinedTableError)):
+        with pytest.raises((asyncpg.UndefinedObjectError, asyncpg.UndefinedTableError, asyncpg.DuplicateSchemaError)):
             await _provision(case)
+        assert connection.is_in_transaction()
         assert await connection.fetchval("SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname='private_source')") is (
             change == "existing_namespace"
         )
@@ -683,49 +655,32 @@ async def test_late_failure_rolls_back_all_private_ddl_and_preserves_outer_trans
         assert await connection.fetchval("SELECT 1") == 1
 
 
-@pytest.mark.parametrize(
-    "change",
-    ["owner_alias", "schema_alias", "reserved_schema", "source_reaches_namespace", "reader_reaches_source", "set_role"],
-)
-async def test_collapsed_or_reachable_authority_never_leaves_a_private_namespace(native_bootstrap, change):
+@pytest.mark.parametrize("catalog_schema", ["private_source", "pg_catalog"])
+async def test_invalid_or_missing_named_catalog_leaves_no_private_namespace(native_bootstrap, catalog_schema):
     case, connection = native_bootstrap, native_bootstrap.connection
-    overrides_by_change = {
-        "owner_alias": {"namespace_owner": case.roles["owner"]},
-        "schema_alias": {"catalog_schema": case.policy.schema},
-        "reserved_schema": {"catalog_schema": "pg_catalog"},
-    }
-    if change == "source_reaches_namespace":
-        await connection.execute(f"GRANT {quote(case.roles['namespace'])} TO {quote(case.roles['owner'])}")
-    elif change == "reader_reaches_source":
-        await connection.execute(f"GRANT {quote(case.roles['owner'])} TO {quote(case.roles['reader'])}")
     async with connection.transaction():
-        if change == "set_role":
-            await connection.execute("SET LOCAL ROLE " + quote(case.roles["publisher"]))
-        with pytest.raises((GenericCandidateError, ValueError)):
-            await _provision(case, **overrides_by_change.get(change, {}))
+        with pytest.raises((GenericCandidateError, asyncpg.UndefinedTableError)):
+            await _provision(case, catalog_schema=catalog_schema)
         assert not await connection.fetchval("SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname='private_source')")
 
 
-async def test_original_superuser_and_outer_transaction_are_mandatory(native_bootstrap):
+async def test_outer_transaction_and_native_ddl_access_are_required(native_bootstrap):
     case = native_bootstrap
     with pytest.raises(GenericCandidateError, match="transaction_required"):
         await _provision(case)
-    publisher = await asyncpg.connect(_dsn(case.url.set(username=case.roles["publisher"])))
-    try:
-        case.connection = publisher
-        async with publisher.transaction():
-            with pytest.raises(GenericCandidateError, match="independent_admin_required"):
-                await _provision(case)
-    finally:
-        await publisher.close()
-    outsider = await asyncpg.connect(_dsn(case.url.set(username=case.roles["outsider"])))
-    try:
-        case.connection = outsider
-        async with outsider.transaction():
-            with pytest.raises(GenericCandidateError, match="native_admin_required"):
-                await _provision(case)
-    finally:
-        await outsider.close()
+    for role in ("publisher", "outsider"):
+        connection = await asyncpg.connect(_dsn(case.url.set(username=case.roles[role])))
+        try:
+            case.connection = connection
+            async with connection.transaction():
+                with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                    await _provision(case)
+                assert connection.is_in_transaction()
+                assert not await connection.fetchval(
+                    "SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname='private_source')"
+                )
+        finally:
+            await connection.close()
 
 
 async def _seed_wide_header(connection):

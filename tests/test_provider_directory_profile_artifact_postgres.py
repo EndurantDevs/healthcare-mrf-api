@@ -129,7 +129,7 @@ async def test_pg18_missing_bucket_index_has_no_populated_repair_path(
 
 
 @pytest.mark.asyncio
-async def test_pg18_stage_storage_fingerprint_detects_dropped_index(
+async def test_pg18_named_stage_layout_detects_dropped_index(
     monkeypatch,
 ):
     async with _artifact_fixture(monkeypatch) as fixture:
@@ -147,36 +147,30 @@ async def test_pg18_stage_storage_fingerprint_detects_dropped_index(
             evidence=True,
         ):
             await fixture.database.status(statement)
-        stage_oid = int(
-            await fixture.database.scalar(
-                "SELECT to_regclass(:relation_ref)::oid::bigint;",
-                relation_ref=importer._unscoped_qt(
-                    fixture.schema,
-                    stage_table,
-                ),
-            )
-            or 0
+        before = await importer._provider_directory_profile_stage_layout(
+            fixture.schema, stage_table, lock_relation=False
         )
-        before = await importer._provider_directory_profile_stage_storage_fingerprint(
-            fixture.schema,
-            stage_table,
-            expected_oid=stage_oid,
-            lock_relation=False,
+        rows_before = await fixture.database.scalar(
+            f"SELECT count(*) FROM {importer._unscoped_qt(fixture.schema, stage_table)}"
         )
         dropped_index = importer.profile_artifact.profile_index_name(
             stage_table,
             "npi_fact_idx",
         )
         await fixture.database.status(f"DROP INDEX {importer._unscoped_qt(fixture.schema, dropped_index)};")
-        after = await importer._provider_directory_profile_stage_storage_fingerprint(
-            fixture.schema,
-            stage_table,
-            expected_oid=stage_oid,
-            lock_relation=False,
+        after = await importer._provider_directory_profile_stage_layout(
+            fixture.schema, stage_table, lock_relation=False
         )
-
-        assert before != after
-        assert len(before) == len(after) == 64
+        assert (before.schema_name, before.relation_name) == (fixture.schema, stage_table)
+        assert (after.schema_name, after.relation_name) == (fixture.schema, stage_table)
+        assert len(after.main_index_pages) == len(before.main_index_pages) - 1
+        assert await fixture.database.scalar(
+            "SELECT to_regclass(:relation) IS NULL", relation=importer._unscoped_qt(fixture.schema, dropped_index)
+        )
+        assert (
+            await fixture.database.scalar(f"SELECT count(*) FROM {importer._unscoped_qt(fixture.schema, stage_table)}")
+            == rows_before
+        )
 
 
 @pytest.mark.asyncio

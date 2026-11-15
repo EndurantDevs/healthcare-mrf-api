@@ -24,6 +24,7 @@ from tests.provider_directory_rooted_graph_publication_test_support import (
     resource_counts,
     twin_admission,
 )
+from tests.test_named_fhir_source_batches import named_runtime as named_runtime
 
 directory = import_module("process.provider_directory_fhir")
 
@@ -60,37 +61,45 @@ def test_candidate_copy_reserves_binary_framing_and_jsonb_version(monkeypatch):
 
 
 @asynccontextmanager
-async def _candidate_catalog(monkeypatch, database, catalog):
-    """Supply only native catalog data while retaining the real Source owner guards."""
-    from process import provider_directory_generic_source_kind_candidate as native
-    from process.provider_directory_generic_source_storage import CATALOG_SQL
+async def _candidate_catalog(monkeypatch, database):
+    """Route real candidate SQL through the existing configured publisher fixture."""
     from tests.test_provider_directory_generic_source_policy import synthetic_source_publisher
-    from tests.test_provider_directory_generic_source_storage import _catalog_row
 
     async with synthetic_source_publisher(monkeypatch, database, schema=directory._schema()) as (connection, _):
-        fetch, fetchval = connection.fetch, connection.fetchval.side_effect
-
-        async def catalog_rows(query, *args):
-            if query == CATALOG_SQL:
-                if catalog != "complete":
-                    return catalog
-                return [
-                    _catalog_row() | {"relname": name.split('"')[3], "nspname": directory._schema(), "oid": index + 1}
-                    for index, name in enumerate(args[0])
-                ]
-            return await fetch(query, *args)
 
         async def header_or_actor(query, *args):
             if query.startswith("SELECT status,is_current"):
                 return {"status": "building", "is_current": False}
             return connection.fetchrow.return_value
 
-        connection.fetch = AsyncMock(side_effect=catalog_rows)
+        from process.provider_directory_generic_source_storage import _GRANTEES_SQL
+
+        async def grant_rows(query, *args):
+            assert query == _GRANTEES_SQL
+            return []
+
+        connection.fetch.side_effect = grant_rows
         connection.fetchrow.side_effect = header_or_actor
-        connection.fetchval.side_effect = lambda query, *args: (
-            100 if query.startswith("SELECT oid::bigint FROM pg_roles") else fetchval(query, *args)
-        )
-        monkeypatch.setattr(native, "_close_grants", AsyncMock())
+        from process.provider_directory_generic_source_policy import bound_publisher
+        from process.provider_directory_generic_source_storage import _copy
+        from process.provider_directory_rooted_graph_source_runtime import current_rooted_graph_runtime
+
+        runtime = current_rooted_graph_runtime()
+        if runtime is not None:
+            runtime.candidate_schema = directory._schema()
+            runtime.candidate_policy = bound_publisher().policy
+
+            @asynccontextmanager
+            async def transaction(selected):
+                assert selected is database
+                yield SimpleNamespace(connection=connection)
+
+            async def copy_records(selected, root, relation, columns, records):
+                assert selected is database
+                return await _copy(connection, runtime.candidate_policy, relation, columns, records)
+
+            runtime.transaction = transaction
+            runtime.copy_candidate_records = copy_records
         yield connection
 
 
@@ -105,7 +114,7 @@ async def _candidate_catalog(monkeypatch, database, catalog):
 async def test_candidate_prepare_rejects_missing_authority_before_sql(kind, binding, message):
     """An invalid caller cannot allocate a candidate or enter materialization."""
     database = SimpleNamespace(_transaction_binding=lambda: binding, scalar=AsyncMock())
-    expected = message if kind == "unsupported" else "publisher_connection_required"
+    expected = message if kind == "unsupported" else "configured isolated generation"
     with pytest.raises((ValueError, RuntimeError), match=expected):
         async with candidate.prepare_dataset_candidate(database, "dataset", kind=kind):
             pytest.fail("invalid candidate preparation entered materialization")
@@ -113,31 +122,14 @@ async def test_candidate_prepare_rejects_missing_authority_before_sql(kind, bind
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("relations", (None, [], {}, "[]", "{}"))
-async def test_candidate_prepare_rejects_malformed_mapping_without_finish(monkeypatch, relations):
-    """Malformed native catalog data cannot route writes or attach a partition."""
-    database = SimpleNamespace(scalar=AsyncMock())
-    original = directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()
-    async with _candidate_catalog(monkeypatch, database, relations) as connection:
-        with pytest.raises((ValueError, RuntimeError, TypeError), match="storage_missing|object of type"):
-            async with candidate.prepare_dataset_candidate(database, "dataset", kind="rooted"):
-                pytest.fail("invalid relation response entered materialization")
-        assert sum(call.args[0].startswith("CREATE TABLE") for call in connection.execute.await_args_list) == 5
-        assert not any("ATTACH PARTITION" in call.args[0] for call in connection.execute.await_args_list)
-        connection.copy_records_to_table.assert_not_awaited()
-    database.scalar.assert_not_awaited()
-    assert directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get() == original
-
-
-@pytest.mark.asyncio
-async def test_candidate_short_copy_restores_scope_without_finish(monkeypatch):
+async def test_candidate_short_copy_restores_scope_without_finish(monkeypatch, named_runtime):
     """A short native COPY aborts the prepared family before finish can run."""
     database = SimpleNamespace(scalar=AsyncMock())
     original = directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()
-    async with _candidate_catalog(monkeypatch, database, "complete") as connection:
+    async with _candidate_catalog(monkeypatch, database) as connection:
         connection.copy_records_to_table.return_value = "COPY 0"
         with pytest.raises((ValueError, RuntimeError), match="copy_incomplete"):
-            async with candidate.prepare_dataset_candidate(database, "dataset", kind="rooted"):
+            async with candidate.prepare_dataset_candidate(database, "dataset", kind="rooted", detached=True):
                 await candidate.copy_dataset_candidate_rows(
                     database, "provider_directory_dataset_resource", ("id",), [("one",)]
                 )
@@ -157,14 +149,18 @@ async def test_candidate_short_copy_restores_scope_without_finish(monkeypatch):
         (True, True, 4097),
     ),
 )
-async def test_candidate_copy_rejects_invalid_context_and_bounds(monkeypatch, has_transaction, has_relation, count):
+async def test_candidate_copy_rejects_invalid_context_and_bounds(
+    monkeypatch, named_runtime, has_transaction, has_relation, count
+):
     """Context and row bounds are rejected before resolving a native connection."""
     root = "provider_directory_dataset_resource"
     database = SimpleNamespace()
     copier = AsyncMock()
-    async with _candidate_catalog(monkeypatch, database, "complete") as connection:
+    async with _candidate_catalog(monkeypatch, database) as connection:
         with pytest.raises(RuntimeError, match="^provider_directory_candidate_copy_invalid$"):
-            async with candidate.prepare_dataset_candidate(database, "dataset", kind="rooted") as prepared:
+            async with candidate.prepare_dataset_candidate(
+                database, "dataset", kind="rooted", detached=True
+            ) as prepared:
                 assert root in prepared and directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()[root]
                 overrides = {} if has_relation else {root: None}
                 with monkeypatch.context() as changed, directory._provider_directory_artifact_relation_scope(overrides):
@@ -178,15 +174,17 @@ async def test_candidate_copy_rejects_invalid_context_and_bounds(monkeypatch, ha
 
 
 @pytest.mark.asyncio
-async def test_candidate_copy_uses_the_prepared_native_binding(monkeypatch):
+async def test_candidate_copy_uses_the_prepared_native_binding(monkeypatch, named_runtime):
     """A valid row reaches COPY in the same physical Source session and exact private heap."""
     root = "provider_directory_dataset_resource"
     database = SimpleNamespace()
     columns, records = ("dataset_id", "resource_type", "resource_id"), [("dataset", "Organization", "org")]
-    async with _candidate_catalog(monkeypatch, database, "complete") as connection:
+    async with _candidate_catalog(monkeypatch, database) as connection:
         connection.copy_records_to_table.return_value = "COPY 1"
         with pytest.raises(RuntimeError, match="^unit_stop_after_copy$"):
-            async with candidate.prepare_dataset_candidate(database, "dataset", kind="rooted") as prepared:
+            async with candidate.prepare_dataset_candidate(
+                database, "dataset", kind="rooted", detached=True
+            ) as prepared:
                 assert await candidate.copy_dataset_candidate_rows(database, root, columns, records) == 1
                 connection.copy_records_to_table.assert_awaited_once_with(
                     prepared[root], schema_name=directory._schema(), columns=columns, records=records
@@ -288,6 +286,12 @@ async def test_bounded_bulk_insert_counts_are_exact(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_root_practitioner_copy_requires_both_exact_counts(monkeypatch) -> None:
     identity = dataset_identity()
+    from process import provider_directory_source_storage_binding as source_binding
+
+    resolver = AsyncMock(
+        return_value={"provider_directory_dataset_resource": {"schema": "retained_root", "name": "root_resources"}}
+    )
+    monkeypatch.setattr(source_binding, "dataset_source_relations", resolver)
     batches = []
 
     async def insert_rows(_database, pairs):
@@ -303,6 +307,7 @@ async def test_root_practitioner_copy_requires_both_exact_counts(monkeypatch) ->
     assert await materialization._copy_root_practitioners(database, identity) == 1
     assert batches[0][0][1]["root_dataset_id"] == identity.root_dataset_id
     assert batches[0][0][1]["published_payload_hash"] == "a" * 64
+    assert 'FROM "retained_root"."root_resources"' in database.all_calls[0][0]
     assert database.all_calls[0][1]["byte_limit"] == 32 * 1024 * 1024
     assert database.all_calls[1][1]["after_id"] == "synthetic-root"
     with pytest.raises(ProviderDirectoryRootedGraphPublicationError):

@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from db.migration_provider_directory_dataset_candidates import TABLES
 from process import provider_directory_generic_source_kind_candidate as candidate
 from process.provider_directory_generic_candidate import GenericCandidateError
 
@@ -47,7 +46,7 @@ def _setup(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["rooted", "practitioner"])
+@pytest.mark.parametrize("kind", ["practitioner"])
 async def test_whole_group_copy_then_indexes_then_set_checks_then_attach(monkeypatch, kind):
     directory, connection, events = _setup(monkeypatch)
     connection.fetchrow.side_effect = [{"status": "building", "is_current": False}, ("0", 0)]
@@ -72,7 +71,7 @@ async def test_failed_relationship_validation_never_attaches_any_group_member(mo
     directory, _, events = _setup(monkeypatch)
     monkeypatch.setattr(candidate, "_validate_relationships", AsyncMock(side_effect=ValueError("orphan")))
     with pytest.raises(ValueError, match="orphan"):
-        async with candidate.native_kind_candidate(object(), directory, "source-dataset", kind="rooted"):
+        async with candidate.native_kind_candidate(object(), directory, "source-dataset", kind="practitioner"):
             events.append("copy")
     assert not any("ATTACH PARTITION" in event for event in events)
 
@@ -102,144 +101,44 @@ async def test_failed_original_checks_never_check_relationships_or_attach(monkey
     assert not any("ATTACH PARTITION" in event for event in events)
 
 
-def _original_check_setup(checks=(), *, keys=()):
-    identity_by_root = {
-        root: {"original_oid": index, "parent_oid": index + 100, "keys": list(keys)}
-        for index, root in enumerate(TABLES, 1)
-    }
+def _original_check_setup(checks=()):
     provenance = candidate._PROVENANCE["practitioner"]
-    identity = identity_by_root[provenance]
-    history_by_field = {
-        "oid": identity["original_oid"],
-        "relname": "pd_dataset_history_" + str(identity["original_oid"]),
-        "nspname": "source_schema",
-        "relkind": "r",
-        "is_owned": True,
-        "current_parent": identity["parent_oid"],
-        "parents": [identity["parent_oid"]] if keys else [],
-        "checks": list(checks),
-    }
-    plan_by_field = {"complete": True, "tables": identity_by_root}
     connection = SimpleNamespace(
-        fetchval=AsyncMock(side_effect=[plan_by_field, False]), fetchrow=AsyncMock(return_value=history_by_field)
+        fetch=AsyncMock(return_value=[{"expression": expression} for _, expression in checks]),
+        fetchval=AsyncMock(return_value=False),
     )
-    return (
-        connection,
-        SimpleNamespace(schema="source_schema"),
-        {provenance: "private_candidate"},
-        plan_by_field,
-        history_by_field,
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("keys", [(), ("older-dataset",)])
-async def test_original_checks_use_exact_plan_heap_for_attached_or_empty_history(keys):
-    connection, policy, relations, plan, history = _original_check_setup(
-        [("content_check", "requested_npi > 0")], keys=keys
-    )
-    await candidate._validate_original_checks(connection, policy, relations, "dataset")
-    assert connection.fetchval.await_args_list[0].args == (
-        'SELECT plan FROM "source_schema"."pd_dataset_migration_plan" WHERE singleton',
-    )
-    connection.fetchrow.assert_awaited_once_with(
-        candidate._ORIGINAL_CHECKS_SQL, history["oid"], '"source_schema"."' + next(iter(relations)) + '"', None
-    )
-    assert history["oid"] == plan["tables"][next(iter(relations))]["original_oid"]
-    assert connection.fetchval.await_args.args == (
-        'SELECT EXISTS(SELECT FROM "source_schema"."private_candidate" WHERE dataset_id=$1 AND (NOT (requested_npi > 0)))',
-        "dataset",
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("checks", [[], [("pd_dataset_history_bound", "false")]])
-async def test_original_checks_allow_empty_predicates_and_skip_only_named_bound(checks):
-    connection, policy, relations, _, _ = _original_check_setup(checks)
-    await candidate._validate_original_checks(connection, policy, relations, "dataset")
-    assert connection.fetchval.await_count == 1
-    connection.fetchrow.assert_awaited_once()
+    return connection, SimpleNamespace(schema="source_schema"), {provenance: "private_candidate"}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("check_name", ["content_check", "pd_dataset_history_bound_extra"])
 async def test_original_checks_keep_false_data_predicates(check_name):
-    connection, policy, relations, plan, _ = _original_check_setup(
-        [("pd_dataset_history_bound", "false"), (check_name, "false")]
-    )
-    connection.fetchval.side_effect = [plan, True]
+    connection, policy, relations = _original_check_setup([(check_name, "false")])
+    connection.fetchval.return_value = True
     with pytest.raises(GenericCandidateError, match="candidate_content_changed"):
         await candidate._validate_original_checks(connection, policy, relations, "dataset")
-    assert connection.fetchval.await_args.args[0].endswith("AND (NOT (false)))")
+    assert connection.fetchval.await_args.args == (
+        'SELECT EXISTS(SELECT FROM "source_schema"."private_candidate" WHERE dataset_id=$1 AND ((false) IS FALSE))',
+        "dataset",
+    )
 
 
 @pytest.mark.asyncio
 async def test_original_checks_preserve_nullable_check_semantics():
-    connection, policy, relations, _, _ = _original_check_setup([("nullable_check", "NULL::boolean")])
+    connection, policy, relations = _original_check_setup([("nullable_check", "NULL::boolean")])
     await candidate._validate_original_checks(connection, policy, relations, "dataset")
     statement = connection.fetchval.await_args.args[0]
-    assert statement.endswith("AND (NOT (NULL::boolean)))")
+    assert statement.endswith("AND ((NULL::boolean) IS FALSE))")
     assert "IS NOT TRUE" not in statement
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("invalid", [True, None, 0])
 async def test_original_checks_refuse_any_non_false_query_result(invalid):
-    connection, policy, relations, plan, _ = _original_check_setup([("content_check", "true")])
-    connection.fetchval.side_effect = [plan, invalid]
+    connection, policy, relations = _original_check_setup([("content_check", "true")])
+    connection.fetchval.return_value = invalid
     with pytest.raises(GenericCandidateError, match="candidate_content_changed"):
         await candidate._validate_original_checks(connection, policy, relations, "dataset")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "field_name,changed_identity",
-    [
-        ("oid", 999),
-        ("relname", "replaced_history"),
-        ("nspname", "other_schema"),
-        ("relkind", "p"),
-        ("is_owned", False),
-        ("current_parent", 999),
-        ("parents", [999]),
-    ],
-)
-async def test_original_checks_refuse_changed_history_identity(field_name, changed_identity):
-    connection, policy, relations, _, history = _original_check_setup()
-    history[field_name] = changed_identity
-    with pytest.raises(GenericCandidateError, match="legacy_history_identity_changed"):
-        await candidate._validate_original_checks(connection, policy, relations, "dataset")
-    assert connection.fetchval.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_original_checks_refuse_absent_heap_even_without_predicates():
-    connection, policy, relations, _, _ = _original_check_setup()
-    connection.fetchrow.return_value = None
-    with pytest.raises(GenericCandidateError, match="legacy_history_identity_changed"):
-        await candidate._validate_original_checks(connection, policy, relations, "dataset")
-    assert connection.fetchval.await_count == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("plan_fault", ["missing_plan", "incomplete", "missing_identity", "missing_oid", "bool_oid"])
-async def test_original_checks_refuse_absent_or_invalid_plan_identity(plan_fault):
-    connection, policy, relations, plan, _ = _original_check_setup()
-    provenance = next(iter(relations))
-    if plan_fault == "missing_plan":
-        plan = None
-    elif plan_fault == "incomplete":
-        plan["complete"] = False
-    elif plan_fault == "missing_identity":
-        del plan["tables"][provenance]
-    elif plan_fault == "missing_oid":
-        del plan["tables"][provenance]["original_oid"]
-    else:
-        plan["tables"][provenance]["original_oid"] = True
-    connection.fetchval.side_effect = [plan]
-    with pytest.raises(GenericCandidateError, match="legacy_(?:plan|history_identity)_changed"):
-        await candidate._validate_original_checks(connection, policy, relations, "dataset")
-    connection.fetchrow.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -247,7 +146,7 @@ async def test_sealed_parent_refuses_before_heap_creation(monkeypatch):
     directory, connection, events = _setup(monkeypatch)
     connection.fetchrow.return_value = {"status": "published", "is_current": True}
     with pytest.raises(GenericCandidateError, match="header_sealed"):
-        async with candidate.native_kind_candidate(object(), directory, "source-dataset", kind="rooted"):
+        async with candidate.native_kind_candidate(object(), directory, "source-dataset", kind="practitioner"):
             pytest.fail("sealed parent admitted")
     assert events == []
 
@@ -286,3 +185,44 @@ async def test_attach_lock_failure_preserves_original_error_for_savepoint_rollba
         "SET LOCAL lock_timeout='1s'",
         'LOCK TABLE "source_schema"."parent" IN SHARE UPDATE EXCLUSIVE MODE',
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("canonical_schema", [None, "canonical_schema"])
+async def test_original_checks_read_named_canonical_predicates(canonical_schema):
+    connection, policy, relations = _original_check_setup([("content_check", "requested_npi > 0")])
+    await candidate._validate_original_checks(
+        connection, policy, relations, "dataset", canonical_schema=canonical_schema
+    )
+    connection.fetch.assert_awaited_once_with(
+        "SELECT pg_get_expr(conbin,conrelid) AS expression FROM pg_constraint "
+        "WHERE conrelid=to_regclass($1) AND contype='c'",
+        '"' + (canonical_schema or policy.schema) + '"."' + next(iter(relations)) + '"',
+    )
+    assert connection.fetchval.await_args.args == (
+        'SELECT EXISTS(SELECT FROM "source_schema"."private_candidate" WHERE dataset_id=$1 AND ((requested_npi > 0) IS FALSE))',
+        "dataset",
+    )
+
+
+@pytest.mark.asyncio
+async def test_original_checks_allow_no_canonical_predicates():
+    connection, policy, relations = _original_check_setup()
+    await candidate._validate_original_checks(connection, policy, relations, "dataset")
+    connection.fetch.assert_awaited_once()
+    connection.fetchval.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured", [False, True])
+async def test_rooted_group_requires_configured_detached_generation(monkeypatch, configured):
+    from process import provider_directory_rooted_graph_source_runtime as source_runtime
+
+    directory, _, events = _setup(monkeypatch)
+    monkeypatch.setattr(source_runtime, "current_rooted_graph_runtime", lambda _: object() if configured else None)
+    error = GenericCandidateError if configured else RuntimeError
+    reason = "rooted_preparation_required" if configured else "configured isolated generation"
+    with pytest.raises(error, match=reason):
+        async with candidate.native_kind_candidate(object(), directory, "source-dataset", kind="rooted"):
+            pytest.fail("Rooted writes admitted without a detached prepared generation")
+    assert events == []

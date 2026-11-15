@@ -17,6 +17,7 @@ import math
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from tempfile import TemporaryFile
 from typing import Any
@@ -79,6 +80,7 @@ from process.mrf_address_publication import (
 )
 from process.mrf_publication_receipt import require_completed_publication
 from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner, native_model_copy_driver
+from process.nucc_retention_read_view import require_nucc_unretained_rotation as require_nucc_unretained_rotation
 from process.provider_quality_parts.table_helpers import _index_name_for_table
 from process.reference_family_composition import (
     ReferenceModelContribution as ReferenceModelContribution,
@@ -274,6 +276,8 @@ _SNAPSHOT = re.compile(r"^[0-9A-Fa-f-]+$")
 _STAGE_PREFIX = "reference_family_archive_"
 _PREDECESSOR_PREFIX = "reference_family_predecessor_"
 _LOCK_TIMEOUT = "500ms"
+_CUTOVER_WAIT_SECONDS = 0.1
+_FROZEN_CUTOVER = ContextVar("reference_family_frozen_cutover", default=False)
 _CAPTURE_TIMEOUT = "5s"
 _MAX_METADATA_BYTES = 16_384
 _CLAIMS_DICTIONARY_SOURCE = "cms_physician_provider_service"
@@ -396,6 +400,16 @@ class ReferenceFamilyStageOwnership:
     sequence_oids: tuple[tuple[str, int, str, str], ...] = ()
     auxiliary_oid: int | None = None
 
+    @property
+    def relation_names(self):
+        """Expose only the recorded logical relation names."""
+        return tuple(name for name, _address in self.relation_oids)
+
+    @property
+    def sequence_names(self):
+        """Expose recorded sequence names and their declared table columns."""
+        return tuple((name, table, column) for name, _address, table, column in self.sequence_oids)
+
 
 @dataclass(frozen=True)
 class ReferenceFamilyStageCapture:
@@ -439,31 +453,29 @@ class ReferenceFamilyActivationReceipt:
 
 @dataclass(frozen=True)
 class ReferenceFamilyValidationReceipt:
-    """Publisher-minted evidence for one immutable protected stage."""
+    """Content evidence for one named protected stage, with opaque old editions."""
 
     importer_id: str
     package_id: str
     profile_contract: str
     stage_schema: str
-    stage_schema_oid: int
-    relation_oids: tuple[tuple[str, int], ...]
-    sealed_owner_oid: int
+    relations: tuple[tuple[str, str], ...]
     manifest_sha256: str
     tables: tuple[ReferenceTableReceipt, ...]
     validation_sha256: str
+    legacy_receipt: Mapping[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        """Return the closed durable representation stored by the controller."""
-
+        """Return current named metadata or an unchanged historical receipt edition."""
+        if self.legacy_receipt is not None:
+            return json.loads(json.dumps(self.legacy_receipt))
         return {
             "contract": VALIDATION_CONTRACT,
             "importer_id": self.importer_id,
             "package_id": self.package_id,
             "profile_contract": self.profile_contract,
             "stage_schema": self.stage_schema,
-            "stage_schema_oid": self.stage_schema_oid,
-            "relation_oids": [list(pair) for pair in self.relation_oids],
-            "sealed_owner_oid": self.sealed_owner_oid,
+            "relations": [{"schema_name": schema, "relation_name": name} for schema, name in self.relations],
             "manifest_sha256": self.manifest_sha256,
             "tables": [table.as_dict() for table in self.tables],
             "validation_sha256": self.validation_sha256,
@@ -476,10 +488,10 @@ class ReferenceFamilyCutoverAuthority:
 
     package_id: str
     profile_contract: str
-    sealed_owner_oid: int
-    expected_stage_owner_oid: int
     authority: str
     source_serving_generation: Mapping[str, Any] | None = None
+    roles: object = None
+    stage_read_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -1261,26 +1273,7 @@ def _validation_tables(value: Mapping[str, Any], spec: ReferenceFamilySpec) -> t
     return tuple(table_receipts)
 
 
-def validate_reference_family_validation_receipt(receipt_value: object) -> ReferenceFamilyValidationReceipt:
-    """Validate a durable receipt without treating it as publication authority."""
-
-    if isinstance(receipt_value, ReferenceFamilyValidationReceipt):
-        receipt_value = receipt_value.as_dict()
-    expected_fields = {
-        "contract",
-        "importer_id",
-        "package_id",
-        "profile_contract",
-        "stage_schema",
-        "stage_schema_oid",
-        "relation_oids",
-        "sealed_owner_oid",
-        "manifest_sha256",
-        "tables",
-        "validation_sha256",
-    }
-    if not isinstance(receipt_value, Mapping) or set(receipt_value) != expected_fields:
-        raise ReferenceFamilyArchiveError("reference family validation receipt is invalid")
+def _validation_receipt_spec(receipt_value):
     spec = reference_family_spec(
         receipt_value["importer_id"], canonical=receipt_value["profile_contract"] == TYPED_MRF_CONTRACT
     )
@@ -1294,31 +1287,73 @@ def validate_reference_family_validation_receipt(receipt_value: object) -> Refer
             if spec.importer_id == "mrf"
             else (NUCC_CONTRACT if spec.importer_id == "nucc" else CONTRACT,)
         )
-        or re.fullmatch(r"[0-9a-f]{64}", str(receipt_value["package_id"])) is None
-        or re.fullmatch(r"[0-9a-f]{64}", str(receipt_value["manifest_sha256"])) is None
-        or type(receipt_value["stage_schema_oid"]) is not int
-        or receipt_value["stage_schema_oid"] <= 0
-        or type(receipt_value["sealed_owner_oid"]) is not int
-        or receipt_value["sealed_owner_oid"] <= 0
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", str(receipt_value[key])) is None
+            for key in ("package_id", "manifest_sha256", "validation_sha256")
+        )
     ):
         raise ReferenceFamilyArchiveError("reference family validation receipt is invalid")
-    stage_schema = _schema_name(receipt_value["stage_schema"])
-    relation_oids = _validation_inventory(receipt_value, spec)
-    table_receipts = _validation_tables(receipt_value, spec)
-    digest_by_field = {key: receipt_value[key] for key in expected_fields - {"validation_sha256"}}
-    if receipt_value["validation_sha256"] != _validation_digest(digest_by_field):
+    return spec
+
+
+def _validation_receipt_names(receipt_value, spec, schema, is_legacy):
+    try:
+        if is_legacy:
+            names = tuple(entry[0] for entry in receipt_value["relation_oids"])
+        else:
+            entries = receipt_value["relations"]
+            if not isinstance(entries, list) or any(
+                not isinstance(entry, Mapping)
+                or set(entry) != {"schema_name", "relation_name"}
+                or entry["schema_name"] != schema
+                for entry in entries
+            ):
+                raise ValueError
+            names = tuple(entry["relation_name"] for entry in entries)
+        if names != tuple(sorted(spec.table_names)):
+            raise ValueError
+    except IndexError, KeyError, TypeError, ValueError:
+        raise ReferenceFamilyArchiveError("reference family validation inventory is invalid") from None
+    return names
+
+
+def validate_reference_family_validation_receipt(receipt_value: object) -> ReferenceFamilyValidationReceipt:
+    """Check full semantic scope; historical physical tokens remain opaque editions."""
+    if isinstance(receipt_value, ReferenceFamilyValidationReceipt):
+        receipt_value = receipt_value.as_dict()
+    common_fields = {
+        "contract",
+        "importer_id",
+        "package_id",
+        "profile_contract",
+        "stage_schema",
+        "manifest_sha256",
+        "tables",
+        "validation_sha256",
+    }
+    if not isinstance(receipt_value, Mapping):
+        raise ReferenceFamilyArchiveError("reference family validation receipt is invalid")
+    is_legacy = set(receipt_value) == common_fields | {"stage_schema_oid", "relation_oids", "sealed_owner_oid"}
+    if not is_legacy and set(receipt_value) != common_fields | {"relations"}:
+        raise ReferenceFamilyArchiveError("reference family validation receipt is invalid")
+    spec = _validation_receipt_spec(receipt_value)
+    schema = _schema_name(receipt_value["stage_schema"])
+    names = _validation_receipt_names(receipt_value, spec, schema, is_legacy)
+    tables = _validation_tables(receipt_value, spec)
+    if not is_legacy and receipt_value["validation_sha256"] != _validation_digest(
+        {key: field_value for key, field_value in receipt_value.items() if key != "validation_sha256"}
+    ):
         raise ReferenceFamilyArchiveError("reference family validation digest differs")
     return ReferenceFamilyValidationReceipt(
         spec.importer_id,
         receipt_value["package_id"],
         receipt_value["profile_contract"],
-        stage_schema,
-        receipt_value["stage_schema_oid"],
-        relation_oids,
-        receipt_value["sealed_owner_oid"],
+        schema,
+        tuple((schema, name) for name in names),
         receipt_value["manifest_sha256"],
-        table_receipts,
+        tables,
         receipt_value["validation_sha256"],
+        json.loads(json.dumps(dict(receipt_value))) if is_legacy else None,
     )
 
 
@@ -1424,7 +1459,6 @@ async def capture_terminal_reference_source(session, *, importer_id, schema_name
     if importer_id not in TERMINAL_CAPTURE_IMPORTERS or not isinstance(run_id, str) or not run_id:
         raise ReferenceFamilyArchiveError("terminal reference source selector is invalid")
     schema = _schema_name(schema_name)
-    await protected_publisher_owner(session)
     spec = reference_family_spec(importer_id)
     capability = TERMINAL_CAPABILITIES[importer_id]
     await _lock_source_family(session, spec, schema)
@@ -1488,11 +1522,10 @@ async def _capture_source_generation(session, spec, schema, source_metadata, sou
         authority = await read_reference_family_result_generation_authority(
             session, importer_id="nucc", schema_name=schema, lock=False
         )
-        if authority.serving_generation is None or authority.relation_oids is None:
-            raise ReferenceFamilyArchiveError("immutable NUCC generation is unavailable")
-        await require_immutable_nucc_storage(
-            session, schema_name=schema, expected_relation_oid=authority.relation_oids[0]
-        )
+        storage = await require_immutable_nucc_storage(session, schema_name=schema)
+        relation = storage["child"] if "child" in storage else (schema, "nucc_taxonomy")
+        if authority.serving_generation is None or authority.relations != (relation,):
+            raise ReferenceFamilyArchiveError("immutable NUCC generation is unavailable or its selected child changed")
         return authority.serving_generation
     if spec.importer_id in TERMINAL_CAPTURE_IMPORTERS:
         if source_capture_contract is not None or not isinstance(source_metadata, Mapping):
@@ -1533,7 +1566,7 @@ async def _source_serving_generation(session, spec, schema):
         session, importer_id=spec.importer_id, schema_name=schema
     )
     if authority.serving_generation is None:
-        if spec.importer_id == "label" or authority.relation_oids is not None:
+        if spec.importer_id == "label" or authority.relations is not None:
             raise ReferenceFamilyArchiveError("reference family source generation is incomplete")
         return None
     try:
@@ -1745,45 +1778,93 @@ async def native_copy_record_batch(session, model_type, *, schema_name, table_na
     return len(records)
 
 
-async def seal_model_family_storage(session, ownership, owner_oid, *, require_empty=False):
-    """Close real model heaps/sequences with the existing native owner/ACL attester."""
-    from process.ptg_parts.ptg2_physical_binding import _require_closed_local_custody
+def model_family_roles(roles=None):
+    """Read configured administrative role names without inspecting database identities."""
+    if roles is None:
+        from process.source_profile_result_pins import load_role_policy
 
-    if await model_family_publisher_owner(session, ownership.importer_id) != owner_oid:
-        raise ReferenceFamilyArchiveError("native model publisher owner differs")
-    if (
-        await session.scalar(
-            text("SELECT nspowner FROM pg_catalog.pg_namespace WHERE oid=:schema AND nspname=:name"),
-            {"schema": ownership.schema_oid, "name": ownership.schema_name},
-        )
-        != owner_oid
+        owner, readers = load_role_policy()
+    else:
+        owner = roles.owner_role
+        readers = (roles.publisher_role, *roles.runtime_roles)
+    if not isinstance(owner, str) or not _IDENTIFIER.fullmatch(owner):
+        raise ReferenceFamilyArchiveError("native model owner role declaration is required")
+    readers = tuple(dict.fromkeys((owner, *readers)))
+    if not readers or any(
+        not isinstance(role, str) or not _IDENTIFIER.fullmatch(role) or len(role.encode()) > 63 for role in readers
     ):
-        raise ReferenceFamilyArchiveError("native model schema identity differs")
-    schema = _quoted(ownership.schema_name)
-    for name, oid in ownership.relation_oids:
-        if await _relation_oid(session, ownership.schema_name, name) != oid:
-            raise ReferenceFamilyArchiveError("native model heap identity differs")
-        if require_empty and await session.scalar(text(f"SELECT EXISTS(SELECT 1 FROM {schema}.{_quoted(name)})")):
-            raise ReferenceFamilyArchiveError("native model heap is not empty")
-        await seal_model_family_relation(session, ownership, oid, owner_oid)
-    grantees = (
-        (
-            await session.execute(
-                text(
-                    "SELECT DISTINCT CASE WHEN a.grantee=0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END "
-                    "FROM pg_namespace n,LATERAL aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a "
-                    "LEFT JOIN pg_roles r ON r.oid=a.grantee "
-                    "WHERE n.oid=:schema AND a.grantee<>:owner AND a.privilege_type='CREATE'"
-                ),
-                {"schema": ownership.schema_oid, "owner": owner_oid},
-            )
+        raise ReferenceFamilyArchiveError("native model reader role declaration is invalid")
+    return owner, readers
+
+
+def _model_family_names(ownership):
+    names = getattr(ownership, "relation_names", None)
+    if names is None:
+        names = tuple(name for name, _legacy in ownership.relation_oids)
+    names = tuple(names)
+    if ownership.importer_id == "mrf" and STAGE_TABLE not in names:
+        names = (*names, STAGE_TABLE)
+    if not names or len(set(names)) != len(names) or any(not _IDENTIFIER.fullmatch(name) for name in names):
+        raise ReferenceFamilyArchiveError("native model family declaration differs")
+    return names
+
+
+async def _require_model_family_namespace(session, ownership, schema, local_pairs):
+    local_sequences = await _owned_sequences(session, await _schema_oid(session, schema), include_identity=True)
+    sequence_names = getattr(ownership, "sequence_names", None)
+    if sequence_names is None:
+        sequence_names = tuple(
+            (name, table, column) for name, _legacy, table, column in getattr(ownership, "sequence_oids", ())
         )
-        .scalars()
-        .all()
+    owned_sequences = {(name, table, column) for name, _oid, table, column in local_sequences}
+    family_tables = {name for name, _oid in local_pairs}
+    # A migrated table owns its serial or identity sequence by name; each must belong to a family column.
+    if any(table not in family_tables for _name, table, _column in owned_sequences) or not (
+        set(sequence_names) <= owned_sequences
+    ):
+        raise ReferenceFamilyArchiveError("native model sequence declaration differs")
+    expected = {oid for _name, oid in local_pairs} | {oid for _name, oid, _table, _column in local_sequences}
+    for relation in await _namespace_relations(session, await _schema_oid(session, schema)):
+        kind = relation["relkind"].decode() if isinstance(relation["relkind"], bytes) else relation["relkind"]
+        if not (
+            (kind in {"r", "S"} and relation["oid"] in expected)
+            or (kind == "i" and relation["index_table_oid"] in expected)
+        ):
+            raise ReferenceFamilyArchiveError("native model namespace contains an unexpected relation")
+
+
+async def seal_model_family_storage(
+    session, ownership, legacy_owner=None, *, require_empty=False, roles=None, freeze_schema=True
+):
+    """Close named candidate writes using the existing configured administrative freeze."""
+    from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
+
+    _require_transaction(session)
+    if type(freeze_schema) is not bool:
+        raise ReferenceFamilyArchiveError("native model freeze phase is invalid")
+    owner, readers = model_family_roles(roles)
+    schema = _schema_name(ownership.schema_name)
+    names = _model_family_names(ownership)
+    local_pairs = tuple([(name, await _relation_oid(session, schema, name)) for name in names])
+    if any(oid is None for _name, oid in local_pairs):
+        raise ReferenceFamilyArchiveError("native model family is incomplete")
+    for name, _oid in local_pairs:
+        if require_empty and await session.scalar(
+            text(f"SELECT EXISTS(SELECT 1 FROM {_quoted(schema)}.{_quoted(name)})")
+        ):
+            raise ReferenceFamilyArchiveError("native model heap is not empty")
+    await _require_model_family_namespace(session, ownership, schema, local_pairs)
+    driver = await _native_model_copy_driver(session, ("execute", "fetch", "fetchval"))
+    await driver.execute(f"ALTER SCHEMA {_quoted(schema)} OWNER TO {_quoted(owner)}")
+    await freeze_fhir_source_snapshot(
+        driver,
+        schema,
+        namespace_owner=owner,
+        reader_roles=readers,
+        application_roles=(),
+        relation_names=None if freeze_schema else names,
+        freeze_schema=freeze_schema,
     )
-    for grantee in grantees:
-        await session.execute(text(f"REVOKE CREATE ON SCHEMA {schema} FROM {grantee}"))
-    await _require_closed_local_custody(session, ownership, owner_oid)
 
 
 async def _copy_model_run_scope(
@@ -1901,8 +1982,8 @@ async def _rebase_owned_sequences(
         # Reading each sequence retains a relation lock; verify the locked OIDs before nontransactional setval.
         for name, oid, _table, _column in ownership.sequence_oids:
             await session.execute(text(f"SELECT last_value FROM {_quoted(stage_schema)}.{_quoted(name)}"))
-            sequence_oid_by_name[name] = str(oid)
-        await verify_reference_family_stage_ownership(session, ownership)
+            sequence_oid_by_name[name] = f"{_quoted(stage_schema)}.{_quoted(name)}"
+        ownership = await verify_reference_family_stage_ownership(session, ownership)
     for sequence_name, table_name, column_name in _OWNED_SEQUENCES.get(importer_id, ()):
         maximum_value = await session.scalar(
             text(f"SELECT max({_quoted(column_name)})::bigint FROM {_quoted(stage_schema)}.{_quoted(table_name)}")
@@ -2128,8 +2209,14 @@ async def verify_model_family_stage_ownership(
     observed = await capture_model_family_stage_ownership(
         session, spec, ownership.dataset_id, include_identity=include_identity
     )
-    if observed != ownership:
-        raise ReferenceFamilyArchiveError("reference family stage ownership differs")
+    if (
+        observed.importer_id != ownership.importer_id
+        or observed.schema_name != ownership.schema_name
+        or tuple(name for name, _ in observed.relation_oids) != tuple(name for name, _ in ownership.relation_oids)
+        or tuple((name, table, column) for name, _oid, table, column in observed.sequence_oids)
+        != tuple((name, table, column) for name, _oid, table, column in ownership.sequence_oids)
+    ):
+        raise ReferenceFamilyArchiveError("reference family stage declaration differs")
     return observed
 
 
@@ -2388,7 +2475,7 @@ async def validate_nucc_reference_set(session: Any, *, ownership: ReferenceFamil
     _require_transaction(session)
     if not isinstance(ownership, ReferenceFamilyStageOwnership) or ownership.importer_id != "nucc":
         raise ReferenceFamilyArchiveError("NUCC set ownership is invalid")
-    await verify_reference_family_stage_ownership(session, ownership)
+    ownership = await verify_reference_family_stage_ownership(session, ownership)
     model = reference_family_spec("nucc").model_types[0]
     return await _validate_nucc_table_set(session, ownership.schema_name, model.__tablename__)
 
@@ -2431,57 +2518,60 @@ async def _validate_nucc_table_set(session, schema_name, table_name):
 
 
 async def prepare_nucc_native_publication_stage(session, *, stage_model, schema_name, native_stage=None):
-    """Fence a real native candidate and complete every model index before cutover."""
+    """Complete and validate the isolated named model before atomic cutover."""
     _require_transaction(session)
-    schema = _schema_name(schema_name)
-    table = stage_model.__tablename__
+    schema, table = _schema_name(schema_name), stage_model.__tablename__
     if (
         not isinstance(table, str)
         or not table.startswith(models.NUCCTaxonomy.__tablename__ + "_")
         or _IDENTIFIER.fullmatch(table) is None
     ):
-        raise ReferenceFamilyArchiveError("NUCC native candidate identity is invalid")
+        raise ReferenceFamilyArchiveError("NUCC native candidate name is invalid")
+    await session.execute(text(f"LOCK TABLE ONLY {_quoted(schema)}.{_quoted(table)} IN SHARE MODE NOWAIT"))
     oid = await _relation_oid(session, schema, table)
     if oid is None:
         raise ReferenceFamilyArchiveError("NUCC native candidate is missing")
-    await session.execute(text(f"LOCK TABLE ONLY {_quoted(schema)}.{_quoted(table)} IN SHARE MODE NOWAIT"))
     if native_stage is not None:
         await _require_nucc_precreated_stage(session, native_stage)
-        if native_stage["schema_name"] != schema or native_stage["stage"]["relation_oid"] != oid:
-            raise ReferenceFamilyArchiveError("NUCC native candidate differs from attempt custody")
-    key_predicate = (
+        if (native_stage["schema_name"], native_stage["stage"]["table_name"]) != (schema, table):
+            raise ReferenceFamilyArchiveError("NUCC native candidate differs from attempt declaration")
+    predicate = (
         "NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=relation.oid AND contype!='n') "
         if native_stage is not None
-        else "EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=relation.oid AND contype='p' "
-        "AND conkey=ARRAY[CAST(:code_attnum AS smallint)] AND convalidated AND NOT condeferrable AND NOT condeferred) "
+        else "EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=relation.oid AND contype='p' AND conkey=ARRAY[CAST(:code_attnum AS smallint)] AND convalidated AND NOT condeferrable AND NOT condeferred) "
     )
     accepted = await session.scalar(
         text(
             "SELECT relkind='r' AND relpersistence='p' AND NOT relispartition AND NOT relrowsecurity AND NOT relforcerowsecurity "
             "AND NOT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=relation.oid OR inhparent=relation.oid) "
             "AND NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=relation.oid AND NOT tgisinternal) "
-            "AND NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=relation.oid AND contype NOT IN ('p','n')) "
-            "AND " + key_predicate + "FROM pg_class relation WHERE relation.oid=:oid"
+            "AND NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=relation.oid AND contype NOT IN ('p','n')) AND "
+            + predicate
+            + "FROM pg_class relation WHERE relation.oid=:oid"
         ),
         {"oid": oid, "code_attnum": list(models.NUCCTaxonomy.__table__.columns.keys()).index("code") + 1},
     )
     if accepted is not True:
         raise ReferenceFamilyArchiveError("NUCC native candidate catalog differs")
     await _require_nucc_native_columns(session, oid)
-    if native_stage is None:
-        await _create_model_indexes(session, ReferenceFamilySpec("nucc", (stage_model,)), schema)
-    else:
-        await _create_model_indexes(
-            session, ReferenceFamilySpec("nucc", (stage_model,)), schema, create_constraints=True
-        )
-    evidence = await _validate_nucc_table_set(session, schema, table)
-    ready = await session.scalar(
-        text("SELECT NOT EXISTS(SELECT 1 FROM pg_index WHERE indrelid=:oid AND (NOT indisvalid OR NOT indisready))"),
-        {"oid": oid},
+    await _create_model_indexes(
+        session,
+        ReferenceFamilySpec("nucc", (stage_model,)),
+        schema,
+        **({"create_constraints": True} if native_stage is not None else {}),
     )
-    if ready is not True or await _relation_oid(session, schema, table) != oid:
-        raise ReferenceFamilyArchiveError("NUCC native candidate indexes or identity differ")
-    return {"relation_oid": oid, "row_count": evidence["row_count"]}
+    evidence = await _validate_nucc_table_set(session, schema, table)
+    if (
+        await session.scalar(
+            text(
+                "SELECT NOT EXISTS(SELECT 1 FROM pg_index WHERE indrelid=:oid AND (NOT indisvalid OR NOT indisready))"
+            ),
+            {"oid": oid},
+        )
+        is not True
+    ):
+        raise ReferenceFamilyArchiveError("NUCC native candidate indexes differ")
+    return {"relation": (schema, table), "row_count": evidence["row_count"]}
 
 
 async def _require_nucc_native_columns(session, relation_oid):
@@ -2498,57 +2588,27 @@ async def _require_nucc_native_columns(session, relation_oid):
         raise ReferenceFamilyArchiveError("NUCC native candidate columns differ")
 
 
-async def rename_nucc_published_indexes(session, *, schema_name, expected_relation_oid):
-    """Free dynamic stage index names without rebuilding or dropping any index."""
+async def rename_nucc_published_indexes(session, *, schema_name, expected_relation_oid=None):
+    """Free attempt index names using native named DDL; old address arguments are opaque."""
     _require_transaction(session)
     schema = _schema_name(schema_name)
-    if await _relation_oid(session, schema, models.NUCCTaxonomy.__tablename__) != expected_relation_oid:
-        raise ReferenceFamilyArchiveError("NUCC published candidate identity differs")
-    indexes = list(
-        (
-            await session.execute(
-                text(
-                    "SELECT index_relation.oid,index_relation.relname FROM pg_catalog.pg_index index_entry "
-                    "JOIN pg_catalog.pg_class index_relation ON index_relation.oid=index_entry.indexrelid "
-                    "WHERE index_entry.indrelid=:oid ORDER BY index_relation.oid"
-                ),
-                {"oid": expected_relation_oid},
-            )
-        ).all()
-    )
+    indexes = (
+        await session.execute(
+            text(
+                "SELECT index_relation.relname FROM pg_catalog.pg_index index_entry "
+                "JOIN pg_catalog.pg_class index_relation ON index_relation.oid=index_entry.indexrelid "
+                "WHERE index_entry.indrelid=to_regclass(:relation) ORDER BY index_relation.relname"
+            ),
+            {"relation": f'{_quoted(schema)}."nucc_taxonomy"'},
+        )
+    ).all()
     if not 1 <= len(indexes) <= 16:
         raise ReferenceFamilyArchiveError("NUCC published index inventory differs")
-    for oid, name in indexes:
+    suffix = uuid4().hex
+    for position, (name,) in enumerate(indexes):
         await session.execute(
-            text(f"ALTER INDEX {_quoted(schema)}.{_quoted(name)} RENAME TO {_quoted(f'nucc_published_idx_{oid:x}')}")
+            text(f"ALTER INDEX {_quoted(schema)}.{_quoted(name)} RENAME TO {_quoted(f'nucc_idx_{suffix}_{position}')}")
         )
-
-
-async def require_nucc_unretained_rotation(session, *, schema_name):
-    """Legacy rotation cannot erase serving or predecessor heaps in protected custody."""
-    _require_transaction(session)
-    schema = _schema_name(schema_name)
-    if await is_nucc_native_handoff_required(session, schema_name=schema):
-        raise ReferenceFamilyArchiveError("NUCC protected custody requires publisher rotation")
-    oids = []
-    for table in (models.NUCCTaxonomy.__tablename__, models.NUCCTaxonomy.__tablename__ + "_old"):
-        oid = await _relation_oid(session, schema, table)
-        if oid is None:
-            continue
-        await session.execute(
-            text(f"LOCK TABLE ONLY {_quoted(schema)}.{_quoted(table)} IN ACCESS EXCLUSIVE MODE NOWAIT")
-        )
-        if await _relation_oid(session, schema, table) != oid:
-            raise ReferenceFamilyArchiveError("NUCC incumbent identity differs")
-        oids.append(oid)
-    if not oids:
-        return
-    from process.nucc_retention_read_view import NuccRetentionReadError, require_unretained_nucc_oids
-
-    try:
-        await require_unretained_nucc_oids(session, oids)
-    except NuccRetentionReadError as error:
-        raise ReferenceFamilyArchiveError(str(error)) from error
 
 
 def nucc_native_digest(value):
@@ -2560,49 +2620,38 @@ def nucc_native_digest(value):
 
 
 async def is_nucc_native_handoff_required(session, *, schema_name):
-    """An owner-sealed serving heap must never enter the ordinary destructive rotation."""
+    """Route the fixed partitioned serving name through its atomic publisher path."""
     _require_transaction(session)
-    requires_handoff = await session.scalar(
-        text(
-            "SELECT relowner=(SELECT nspowner FROM pg_namespace WHERE nspname='hp_snapshot_retention') "
-            "OR NOT pg_catalog.pg_has_role(current_user,relowner,'USAGE') FROM pg_catalog.pg_class "
-            "WHERE oid=pg_catalog.to_regclass(:relation)"
-        ),
+    kind = await session.scalar(
+        text("SELECT relkind::text FROM pg_catalog.pg_class WHERE oid=to_regclass(:relation)"),
         {"relation": f'{_quoted(_schema_name(schema_name))}."nucc_taxonomy"'},
     )
-    return requires_handoff is True
+    if kind not in (None, "r", "p"):
+        raise ReferenceFamilyArchiveError("NUCC serving relation kind differs")
+    return kind == "p"
 
 
 async def bind_nucc_native_attempt(session, ctx, *, schema_name):
-    """Observe predecessor identity before DDL; the publisher owns the authoritative lock."""
+    """Record logical predecessor provenance before creating an isolated attempt."""
     if not await is_nucc_native_handoff_required(session, schema_name=schema_name):
         return None
-    run_id, attempt_id, attempt_started_at, suffix = _nucc_attempt(ctx)
+    run_id, attempt_id, started, suffix = _nucc_attempt(ctx)
     authority = await read_reference_family_result_generation_authority(
         session, importer_id="nucc", schema_name=schema_name, lock=False
     )
-    incumbent_oid = await _relation_oid(session, schema_name, "nucc_taxonomy")
-    if authority.serving_generation is None:
-        raise ReferenceFamilyArchiveError("NUCC native predecessor is untracked")
-    if authority.relation_oids is not None and incumbent_oid != authority.relation_oids[0]:
-        raise ReferenceFamilyArchiveError("NUCC native predecessor differs")
     from process.reference_family_result_generation import require_nucc_native_predecessor_storage
 
-    await require_nucc_native_predecessor_storage(session, schema_name=schema_name, expected_relation_oid=incumbent_oid)
+    storage = await require_nucc_native_predecessor_storage(session, schema_name=schema_name)
+    relation = storage["child"] if storage is not None and "child" in storage else (schema_name, "nucc_taxonomy")
+    if authority.serving_generation is None or authority.relations != (relation,):
+        raise ReferenceFamilyArchiveError("NUCC native predecessor is untracked or its selected child changed")
     ctx["import_date"] = suffix
     ctx.setdefault("context", {})["nucc_native_predecessor"] = authority.as_dict()
-    stage_by_field = await _precreate_nucc_attempt(
-        session,
-        schema_name,
-        run_id,
-        attempt_id,
-        attempt_started_at,
-        suffix,
-        incumbent=authority.as_dict(),
-        incumbent_relation_oid=incumbent_oid,
+    stage = await _precreate_nucc_attempt(
+        session, schema_name, run_id, attempt_id, started, suffix, incumbent=authority.as_dict()
     )
-    ctx["context"]["nucc_native_stage"] = stage_by_field
-    return stage_by_field
+    ctx["context"]["nucc_native_stage"] = stage
+    return stage
 
 
 async def copy_nucc_native_batch(session, stage_receipt, stage_model, rows):
@@ -2622,77 +2671,91 @@ async def copy_nucc_native_batch(session, stage_receipt, stage_model, rows):
 
 
 def validate_nucc_native_handoff(handoff_by_field):
-    """Decode one closed physical attempt receipt without granting it authority."""
+    """Decode current named or unchanged historical receipts without physical authority."""
     _require_nucc_handoff_fields(handoff_by_field)
-    handoff_by_field = json.loads(_canonical_json(handoff_by_field))
+    if len(_canonical_json(handoff_by_field)) > 131072:
+        raise ReferenceFamilyArchiveError("NUCC native handoff metadata exceeds its bound")
+    handoff = json.loads(_canonical_json(handoff_by_field))
     _run, _attempt, _started, suffix = _nucc_attempt(
         {
-            "control_run_id": handoff_by_field["run_id"],
+            "control_run_id": handoff["run_id"],
             "context": {
-                "_control_attempt_id": handoff_by_field["attempt_id"],
-                "_control_attempt_started_at": handoff_by_field["attempt_started_at"],
+                "_control_attempt_id": handoff["attempt_id"],
+                "_control_attempt_started_at": handoff["attempt_started_at"],
             },
         }
     )
-    stage = handoff_by_field["stage"]
     if (
-        handoff_by_field["import_date"] != suffix
-        or _schema_name(handoff_by_field["schema_name"]) != handoff_by_field["schema_name"]
-        or type(handoff_by_field["node_id"]) is not str
-        or not 0 < len(handoff_by_field["node_id"]) <= 128
-        or type(handoff_by_field["row_count"]) is not int
-        or not 0 < handoff_by_field["row_count"] <= 10_000
+        handoff["import_date"] != suffix
+        or _schema_name(handoff["schema_name"]) != handoff["schema_name"]
+        or type(handoff["node_id"]) is not str
+        or not 0 < len(handoff["node_id"]) <= 128
+        or type(handoff["row_count"]) is not int
+        or not 0 < handoff["row_count"] <= 10_000
         or any(
-            type(handoff_by_field[key]) is not int or not 0 < handoff_by_field[key] < 2**32
-            for key in ("database_oid", "import_run_oid")
+            type(handoff[key]) is not str or re.fullmatch(r"[0-9a-f]{64}", handoff[key]) is None
+            for key in ("source_contract_sha256", "handoff_sha256")
         )
-        or type(handoff_by_field["source_contract_sha256"]) is not str
-        or re.fullmatch(r"[0-9a-f]{64}", handoff_by_field["source_contract_sha256"]) is None
-        or nucc_native_digest({key: field for key, field in handoff_by_field.items() if key != "handoff_sha256"})
-        != handoff_by_field["handoff_sha256"]
     ):
-        raise ReferenceFamilyArchiveError("NUCC native handoff identity differs")
-    _validate_nucc_native_relation(stage, suffix)
-    is_immutable = handoff_by_field["contract"] == NUCC_IMMUTABLE_HANDOFF_CONTRACT
-    _nucc_result_authority(handoff_by_field["incumbent"], allow_untracked=is_immutable)
+        raise ReferenceFamilyArchiveError("NUCC native handoff scope differs")
+    _validate_nucc_native_relation(handoff["stage"], suffix)
+    if ("database_oid" in handoff) != ("relation_oid" in handoff["stage"]):
+        raise ReferenceFamilyArchiveError("NUCC native handoff edition differs")
+    is_immutable = handoff["contract"] == NUCC_IMMUTABLE_HANDOFF_CONTRACT
+    authority = _nucc_result_authority(
+        handoff["incumbent"], allow_untracked=is_immutable, declared_schema=handoff["schema_name"]
+    )
+    if authority.relations is not None:
+        relation = authority.relations[0]
+        if (
+            relation != (handoff["schema_name"], "nucc_taxonomy")
+            and re.fullmatch(r"reference_family_archive_[0-9a-f]{32}", relation[0]) is None
+        ):
+            raise ReferenceFamilyArchiveError("NUCC native predecessor location differs")
     if is_immutable:
-        _require_nucc_precreated_handoff_binding(handoff_by_field)
-    if handoff_by_field["stage"]["relation_oid"] in (handoff_by_field["incumbent"]["relation_oids"] or []):
-        raise ReferenceFamilyArchiveError("NUCC native stage reuses its predecessor")
-    return handoff_by_field
+        _require_nucc_precreated_handoff_binding(handoff)
+    if (
+        "database_oid" not in handoff
+        and nucc_native_digest({key: field_value for key, field_value in handoff.items() if key != "handoff_sha256"})
+        != handoff["handoff_sha256"]
+    ):
+        raise ReferenceFamilyArchiveError("NUCC native handoff digest differs")
+    return handoff
 
 
 def _validate_nucc_native_relation(stage, suffix):
-    """Require the exact isolated model heap and every recorded native index identity."""
+    """Validate the recorded isolated name and bounded semantic index definitions."""
+    fields = {"table_name", "indexes"}
     if (
         type(stage) is not dict
-        or set(stage) != {"table_name", "relation_oid", "relfilenode", "owner_oid", "indexes"}
+        or set(stage) not in (fields, fields | {"relation_oid", "relfilenode", "owner_oid"})
         or stage["table_name"] != "nucc_taxonomy_" + suffix
-        or any(
-            type(stage[key]) is not int or not 0 < stage[key] < 2**32
-            for key in ("relation_oid", "relfilenode", "owner_oid")
-        )
     ):
         raise ReferenceFamilyArchiveError("NUCC native relation differs")
     _validate_nucc_native_indexes(stage)
 
 
 def _validate_nucc_native_indexes(stage):
-    """Keep exact bounded index OIDs and storage identities as metadata only."""
     indexes = stage["indexes"]
     if type(indexes) is not list or not 1 <= len(indexes) <= 16:
         raise ReferenceFamilyArchiveError("NUCC native indexes differ")
+    definitions = []
+    names = []
     for index in indexes:
         if (
             type(index) is not dict
-            or set(index) != {"index_oid", "relfilenode", "definition"}
-            or any(type(index[key]) is not int or not 0 < index[key] < 2**32 for key in ("index_oid", "relfilenode"))
+            or set(index) not in ({"index_name", "definition"}, {"index_oid", "relfilenode", "definition"})
             or type(index["definition"]) is not str
             or not 0 < len(index["definition"]) <= 8192
         ):
             raise ReferenceFamilyArchiveError("NUCC native indexes differ")
-    if [index["index_oid"] for index in indexes] != sorted({index["index_oid"] for index in indexes}):
+        definitions.append(index["definition"])
+        if "index_name" in index:
+            names.append(_schema_name(index["index_name"]))
+    if len(definitions) != len(set(definitions)) or len(names) != len(set(names)):
         raise ReferenceFamilyArchiveError("NUCC native indexes repeat")
+    if names and names != sorted(names):
+        raise ReferenceFamilyArchiveError("NUCC native indexes are unordered")
 
 
 @asynccontextmanager
@@ -2718,41 +2781,55 @@ async def _nucc_native_stage(session, schema_name, table_name):
         return await _observe_nucc_native_stage(session, schema_name, table_name)
 
 
-async def _observe_nucc_native_stage(session, schema_name, table_name):
-    """Capture index definitions consistently, independent of the caller's search path."""
-    relation = (
+async def _observe_nucc_native_stage(session, schema_name, table_name, *, native_revision=False):
+    """Observe native layout and index definitions by the declared relation name."""
+    schema, table = _schema_name(schema_name), _schema_name(table_name)
+    hook_name = None
+    has_native_hook = native_revision and await session.scalar(
+        text("SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=to_regclass(:relation) AND NOT tgisinternal)"),
+        {"relation": f"{_quoted(schema)}.{_quoted(table)}"},
+    )
+    if has_native_hook:
+        from process import provider_directory_cms_native_registration as registration
+
+        driver = await _native_model_copy_driver(
+            session, ("fetch", "fetchrow", "fetchval", "execute", "is_in_transaction")
+        )
+        evidence = await registration.capture_native_input_adoption(
+            driver, ledger_schema=schema, candidate=registration.NativeInputCandidate(schema, table, schema, table)
+        )
+        if evidence is not None:
+            hook_name = "cms_native_input_mutation"
+    oid = await session.scalar(
+        text(
+            "SELECT oid::bigint FROM pg_catalog.pg_class candidate WHERE oid=to_regclass(:relation) "
+            "AND relkind='r' AND relpersistence='p' AND NOT relispartition AND NOT relrowsecurity AND NOT relforcerowsecurity "
+            "AND NOT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=candidate.oid OR inhparent=candidate.oid) "
+            "AND NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=candidate.oid AND NOT tgisinternal AND tgname IS DISTINCT FROM :hook) "
+            "AND NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=candidate.oid AND contype NOT IN ('p','n')) "
+            "AND NOT EXISTS(SELECT 1 FROM pg_index WHERE indrelid=candidate.oid AND (NOT indisvalid OR NOT indisready OR NOT indislive))"
+        ),
+        {"relation": f"{_quoted(schema)}.{_quoted(table)}", "hook": hook_name},
+    )
+    if oid is None:
+        raise ReferenceFamilyArchiveError("NUCC native candidate is missing")
+    await _require_nucc_native_columns(session, oid)
+    await require_native_read_catalog(session, (oid,), allowed_type_oids=())
+    indexes = (
         (
             await session.execute(
                 text(
-                    "SELECT oid::bigint AS relation_oid,relfilenode::bigint,relowner::bigint AS owner_oid "
-                    "FROM pg_catalog.pg_class candidate WHERE oid=pg_catalog.to_regclass(:relation) "
-                    "AND relkind='r' AND relpersistence='p' AND NOT relispartition AND NOT relrowsecurity AND NOT relforcerowsecurity "
-                    "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid=candidate.oid OR inhparent=candidate.oid) "
-                    "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid=candidate.oid AND NOT tgisinternal) "
-                    "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid=candidate.oid AND contype NOT IN ('p','n')) "
-                    "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_index WHERE indrelid=candidate.oid AND (NOT indisvalid OR NOT indisready OR NOT indislive))"
+                    "SELECT relation.relname AS index_name,pg_catalog.pg_get_indexdef(indexrelid) AS definition "
+                    "FROM pg_catalog.pg_index index_entry JOIN pg_catalog.pg_class relation ON relation.oid=indexrelid "
+                    "WHERE indrelid=:oid ORDER BY relation.relname"
                 ),
-                {"relation": f"{_quoted(schema_name)}.{_quoted(table_name)}"},
+                {"oid": oid},
             )
         )
         .mappings()
-        .one_or_none()
+        .all()
     )
-    if relation is None:
-        raise ReferenceFamilyArchiveError("NUCC native candidate is missing")
-    indexes = list(
-        (
-            await session.execute(
-                text(
-                    "SELECT indexrelid::bigint AS index_oid,relation.relfilenode::bigint,pg_catalog.pg_get_indexdef(indexrelid) AS definition "
-                    "FROM pg_catalog.pg_index index_entry JOIN pg_catalog.pg_class relation ON relation.oid=indexrelid "
-                    "WHERE indrelid=:oid ORDER BY indexrelid"
-                ),
-                {"oid": relation["relation_oid"]},
-            )
-        ).mappings()
-    )
-    return {"table_name": table_name, **dict(relation), "indexes": [dict(index) for index in indexes]}
+    return {"table_name": table, "indexes": [dict(index) for index in indexes]}
 
 
 async def _nucc_locked_attempt(session, handoff, statuses):
@@ -2799,54 +2876,42 @@ def _nucc_source_contract(handoff, params):
 
 
 async def record_nucc_native_handoff(session, ctx, *, schema_name, stage_model, ready):
-    """Record observed predecessor and exact attempt; publication rechecks under its own locks."""
+    """Persist the named complete candidate and exact logical attempt/source preimage."""
     run_id, attempt, started, suffix = _nucc_attempt(ctx)
-    handoff_by_field = {
-        "contract": NUCC_HANDOFF_CONTRACT,
-        "run_id": run_id,
-        "attempt_id": attempt,
-        "attempt_started_at": started,
-        "schema_name": _schema_name(schema_name),
-        "import_date": suffix,
-    }
+    handoff_by_field = dict(
+        contract=NUCC_HANDOFF_CONTRACT,
+        run_id=run_id,
+        attempt_id=attempt,
+        attempt_started_at=started,
+        schema_name=_schema_name(schema_name),
+        import_date=suffix,
+    )
     if ctx["import_date"] != suffix or stage_model.__tablename__ != "nucc_taxonomy_" + suffix:
         raise ReferenceFamilyArchiveError("NUCC native stage attempt differs")
     run = await _nucc_locked_attempt(session, handoff_by_field, ("running",))
     actual = await read_reference_family_result_generation_authority(
         session, importer_id="nucc", schema_name=schema_name, lock=False
     )
-    if actual.as_dict() != ctx["context"].get("nucc_native_predecessor"):
+    if actual != _nucc_result_authority(
+        ctx["context"].get("nucc_native_predecessor"), allow_untracked=True, declared_schema=schema_name
+    ):
         raise ReferenceFamilyArchiveError("NUCC native predecessor changed")
     handoff_by_field.update(
         node_id=run["node_id"],
         incumbent=actual.as_dict(),
         row_count=ready["row_count"],
         stage=await _nucc_native_stage(session, schema_name, stage_model.__tablename__),
-        database_oid=await session.scalar(
-            text("SELECT oid::bigint FROM pg_catalog.pg_database WHERE datname=current_database()")
-        ),
-        import_run_oid=await _relation_oid(session, schema_name, "import_run"),
         source_contract_sha256=_nucc_source_contract(handoff_by_field, run["params"]),
     )
     original = ctx["context"].get("nucc_native_stage")
     if original is not None and original.get("contract") == "nucc-native-stage.v2":
         if (run["metrics"] or {}).get("nucc_native_stage") != original:
-            raise ReferenceFamilyArchiveError("NUCC native persisted custody differs")
+            raise ReferenceFamilyArchiveError("NUCC native persisted attempt differs")
         handoff_by_field.update(contract=NUCC_IMMUTABLE_HANDOFF_CONTRACT, precreated_stage=original)
-    if handoff_by_field["stage"]["relation_oid"] != ready["relation_oid"]:
+    if tuple(ready["relation"]) != (schema_name, stage_model.__tablename__):
         raise ReferenceFamilyArchiveError("NUCC native indexed stage changed")
     handoff_by_field["handoff_sha256"] = nucc_native_digest(handoff_by_field)
     handoff_by_field = validate_nucc_native_handoff(handoff_by_field)
-    marker = _canonical_json(
-        {key: handoff_by_field[key] for key in ("contract", "run_id", "attempt_id", "handoff_sha256")}
-    ).decode("ascii")
-    connection = await session.connection()
-    await connection.exec_driver_sql(
-        f"COMMENT ON TABLE {_quoted(schema_name)}.{_quoted(stage_model.__tablename__)} IS "
-        + "'"
-        + marker.replace("'", "''")
-        + "'"
-    )
     await _nucc_record_handoff_run(session, handoff_by_field)
     return handoff_by_field
 
@@ -2869,23 +2934,19 @@ async def _nucc_record_handoff_run(session, handoff):
 
 
 async def _require_nucc_native_location(session, handoff, run):
-    """Authenticate the actual database/history/node and original source preimage."""
+    """Bind the logical worker run and exact original source parameters."""
+    _require_transaction(session)
     if (
         run["node_id"] != handoff["node_id"]
         or _nucc_source_contract(handoff, run["params"]) != handoff["source_contract_sha256"]
-        or await session.scalar(text("SELECT oid::bigint FROM pg_catalog.pg_database WHERE datname=current_database()"))
-        != handoff["database_oid"]
-        or await _relation_oid(session, handoff["schema_name"], "import_run") != handoff["import_run_oid"]
     ):
         raise ReferenceFamilyArchiveError("NUCC native source or location differs")
 
 
 async def _nucc_native_publisher_owner(session):
-    """Root sealed ownership in the actual protected namespace and publisher role."""
-    try:
-        return await protected_publisher_owner(session)
-    except ReferenceFamilyArchiveError as error:
-        raise ReferenceFamilyArchiveError("NUCC native protected publisher is unavailable") from error
+    """Return the existing configured administrative role name; native DDL enforces access."""
+    _require_transaction(session)
+    return model_family_roles()[0]
 
 
 async def protected_publisher_owner(session):
@@ -2915,21 +2976,17 @@ async def require_nucc_native_handoff(session, value):
 
 
 async def _require_nucc_handoff_stage(session, handoff):
-    """The immutable completed candidate is independent of its run's later cancellation."""
+    """Lock the named complete candidate and compare semantic index definitions."""
     table = handoff["stage"]["table_name"]
     await session.execute(
-        text(f"LOCK TABLE ONLY {_quoted(handoff['schema_name'])}.{_quoted(table)} IN ACCESS EXCLUSIVE MODE NOWAIT")
+        text(f"LOCK TABLE ONLY {_quoted(handoff['schema_name'])}.{_quoted(table)} IN ACCESS SHARE MODE NOWAIT")
     )
-    if await _nucc_native_stage(session, handoff["schema_name"], table) != handoff["stage"]:
-        raise ReferenceFamilyArchiveError("NUCC native stage identity differs")
-    marker = await session.scalar(
-        text("SELECT pg_catalog.obj_description(CAST(:oid AS oid),'pg_class')"),
-        {"oid": handoff["stage"]["relation_oid"]},
-    )
-    if marker is None or json.loads(marker) != {
-        key: handoff[key] for key in ("contract", "run_id", "attempt_id", "handoff_sha256")
-    }:
-        raise ReferenceFamilyArchiveError("NUCC native stage marker differs")
+    observed = await _nucc_native_stage(session, handoff["schema_name"], table)
+    expected = handoff["stage"]
+    if observed["table_name"] != expected["table_name"] or sorted(
+        index["definition"] for index in observed["indexes"]
+    ) != sorted(index["definition"] for index in expected["indexes"]):
+        raise ReferenceFamilyArchiveError("NUCC native stage layout differs")
 
 
 def _nucc_abandonment(handoff, abandonment):
@@ -2960,15 +3017,16 @@ def _nucc_abandonment(handoff, abandonment):
         != {
             key: handoff[key]
             for key in (
-                "database_oid",
-                "import_run_oid",
                 "schema_name",
                 "attempt_id",
                 "attempt_started_at",
                 "handoff_sha256",
                 "source_contract_sha256",
                 "stage",
+                "database_oid",
+                "import_run_oid",
             )
+            if key in handoff
         }
     ):
         raise ReferenceFamilyArchiveError("NUCC abandonment custody differs")
@@ -2980,7 +3038,8 @@ def _nucc_abandonment(handoff, abandonment):
         or re.fullmatch(r"[0-9a-f]{64}", abandonment["admission_sha256"]) is None
     ):
         raise ReferenceFamilyArchiveError("NUCC abandonment digest differs")
-    nucc_native_digest(abandonment)
+    if len(_canonical_json(abandonment)) > 131072:
+        raise ReferenceFamilyArchiveError("NUCC abandonment metadata exceeds its bound")
     return abandonment
 
 
@@ -3020,10 +3079,7 @@ async def _require_nucc_cleanup_run(session, handoff, abandonment):
         or (metrics.get("nucc_native_abandonments") or {}).get(abandonment["preparation_id"]) != abandonment
         or (metrics.get("nucc_native_candidate_cleanups") or {}).get(abandonment["preparation_id"]) is not None
         or abandonment["observed_run"] != observed_by_field
-        or any(
-            current[key] != handoff[key]
-            for key in ("run_id", "node_id", "schema_name", "database_oid", "import_run_oid")
-        )
+        or any(current[key] != handoff[key] for key in ("run_id", "node_id", "schema_name"))
     ):
         raise ReferenceFamilyArchiveError("NUCC cleanup receipt differs")
     _require_nucc_cleanup_terminal(run, handoff, current, abandonment["reason"])
@@ -3063,200 +3119,192 @@ def _require_nucc_cleanup_terminal(run, handoff, current, reason):
         raise ReferenceFamilyArchiveError("NUCC cancellation is not authenticated")
 
 
-async def _require_nucc_cleanup_custody(session, handoff, protected_owner_oid):
-    """The complete model and its owned indexes remain exclusively runtime-owned and non-serving."""
-    stage = handoff["stage"]
+async def _require_nucc_cleanup_custody(session, handoff, protected_owner_oid=None):
+    """Keep an isolated candidate out of every named serving projection before DROP."""
+    schema, table = handoff["schema_name"], handoff["stage"]["table_name"]
+    await read_reference_family_result_generation_authority(session, importer_id="nucc", schema_name=schema, lock=True)
     await session.execute(
-        text("LOCK TABLE ONLY mrf.nucc_taxonomy,mrf.reference_family_result_generation IN SHARE MODE NOWAIT")
+        text(
+            f"LOCK TABLE ONLY {_quoted(schema)}.nucc_taxonomy,{_quoted(schema)}.reference_family_result_generation IN ACCESS SHARE MODE NOWAIT"
+        )
     )
     safe = await session.scalar(
         text(
-            "SELECT NOT EXISTS(SELECT 1 FROM mrf.reference_family_result_generation WHERE :oid=ANY(relation_oids)) "
-            "AND pg_catalog.to_regclass('mrf.nucc_taxonomy')::oid<>:oid "
-            "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_depend WHERE refobjid=:oid AND classid='pg_catalog.pg_class'::regclass "
-            "AND objid IN (SELECT oid FROM pg_catalog.pg_class WHERE relkind='S'))"
+            "SELECT NOT EXISTS(SELECT 1 FROM " + _quoted(schema) + ".reference_family_result_generation "
+            "WHERE serving_schema=:schema AND :name=ANY(serving_relation_names)) "
+            "AND :name<>'nucc_taxonomy' AND NOT EXISTS(SELECT 1 FROM pg_depend d JOIN pg_class c ON c.oid=d.objid "
+            "WHERE d.refobjid=to_regclass(:relation) AND d.classid='pg_class'::regclass AND c.relkind='S')"
         ),
-        {"oid": stage["relation_oid"]},
+        {"schema": schema, "name": table, "relation": f"{_quoted(schema)}.{_quoted(table)}"},
     )
     if safe is not True:
         raise ReferenceFamilyArchiveError("NUCC candidate is serving or owns a sequence")
-    safe = await session.scalar(
-        text(
-            "SELECT count(*)=:count AND bool_and(relation.relowner=:builder AND NOT owner.rolsuper AND NOT owner.rolcreaterole "
-            "AND NOT owner.rolcreatedb AND NOT owner.rolreplication AND NOT owner.rolbypassrls "
-            "AND NOT pg_catalog.pg_has_role(owner.oid,CAST(:protected AS oid),'USAGE') "
-            "AND pg_catalog.pg_has_role(session_user,owner.oid,'USAGE')) "
-            "FROM pg_catalog.pg_class relation JOIN pg_catalog.pg_roles owner ON owner.oid=relation.relowner WHERE relation.oid=ANY(:oids)"
-        ),
-        {
-            "count": 1 + len(stage["indexes"]),
-            "builder": stage["owner_oid"],
-            "protected": protected_owner_oid,
-            "oids": [stage["relation_oid"], *(index["index_oid"] for index in stage["indexes"])],
-        },
-    )
-    if safe is not True or stage["owner_oid"] == protected_owner_oid:
-        raise ReferenceFamilyArchiveError("NUCC cleanup owner differs")
-    await _require_nucc_native_columns(session, stage["relation_oid"])
+    await _nucc_native_stage(session, schema, table)
 
 
-async def cleanup_nucc_native_handoff(session, handoff, *, abandonment, runtime_owner_oids, assert_unreferenced):
-    """Restrictively remove one exact abandoned heap; caller owns retirement and COMMIT."""
+async def cleanup_nucc_native_handoff(session, handoff, *, abandonment, runtime_owner_oids=None, assert_unreferenced):
+    """Restrictively remove only the unreferenced named abandoned candidate."""
     _require_transaction(session)
     handoff = validate_nucc_native_handoff(handoff)
     abandonment = _nucc_abandonment(handoff, abandonment)
-    if runtime_owner_oids != (handoff["stage"]["owner_oid"],) or not callable(assert_unreferenced):
+    if not callable(assert_unreferenced):
         raise ReferenceFamilyArchiveError("NUCC trusted cleanup authority is required")
-    async with _nucc_catalog_search_path(session):
-        transaction_id = await session.scalar(text("SELECT pg_current_xact_id()::text"))
-        owner_oid = await _nucc_native_publisher_owner(session)
-        await _require_nucc_cleanup_run(session, handoff, abandonment)
-        if await assert_unreferenced(session, handoff, abandonment) is not True:
-            raise ReferenceFamilyArchiveError("NUCC candidate remains referenced")
-        await _require_nucc_handoff_stage(session, handoff)
-        await _require_nucc_cleanup_custody(session, handoff, owner_oid)
-        if (
-            await assert_unreferenced(session, handoff, abandonment) is not True
-            or not session.in_transaction()
-            or await session.scalar(text("SELECT pg_current_xact_id()::text")) != transaction_id
-        ):
-            raise ReferenceFamilyArchiveError("NUCC cleanup transaction or references changed")
-        await session.execute(
-            text(f"DROP TABLE {_quoted(handoff['schema_name'])}.{_quoted(handoff['stage']['table_name'])} RESTRICT")
+    async with session.begin_nested():
+        await session.connection()
+        transaction = session.get_transaction()
+        async with _nucc_catalog_search_path(session):
+            await _require_nucc_cleanup_run(session, handoff, abandonment)
+            if await assert_unreferenced(session, handoff, abandonment) is not True:
+                raise ReferenceFamilyArchiveError("NUCC candidate remains referenced")
+            await _require_nucc_handoff_stage(session, handoff)
+            await _require_nucc_cleanup_custody(session, handoff)
+            if (
+                await assert_unreferenced(session, handoff, abandonment) is not True
+                or not session.in_transaction()
+                or session.get_transaction() is not transaction
+            ):
+                raise ReferenceFamilyArchiveError("NUCC cleanup transaction or references changed")
+            await session.execute(
+                text(f"DROP TABLE {_quoted(handoff['schema_name'])}.{_quoted(handoff['stage']['table_name'])} RESTRICT")
+            )
+        return dict(
+            contract=NUCC_CLEANUP_CONTRACT,
+            preparation_id=abandonment["preparation_id"],
+            abandonment_sha256=nucc_native_digest(
+                {
+                    **{
+                        key: abandonment[key]
+                        for key in ("contract", "preparation_id", "generation_id", "publication_fence", "reason")
+                    },
+                    **{
+                        key: handoff[key]
+                        for key in ("run_id", "node_id", "attempt_id", "attempt_started_at", "row_count")
+                    },
+                    "relation": [handoff["schema_name"], handoff["stage"]["table_name"]],
+                }
+            ),
+            handoff_sha256=handoff["handoff_sha256"],
+            stage=handoff["stage"],
+            stage_disposition="removed-unpublished",
+            physical_cleanup_completed=True,
         )
-    return {
-        "contract": NUCC_CLEANUP_CONTRACT,
-        "preparation_id": abandonment["preparation_id"],
-        "abandonment_sha256": nucc_native_digest(abandonment),
-        "handoff_sha256": handoff["handoff_sha256"],
-        "database_oid": handoff["database_oid"],
-        "stage": handoff["stage"],
-        "stage_disposition": "removed-unpublished",
-        "physical_cleanup_completed": True,
-    }
 
 
-async def _require_nucc_sealed_handoff(session, handoff, sealed_owner_oid):
-    """Recheck exact stage identity with only the authentic publisher ownership transition."""
+async def _require_nucc_sealed_handoff(session, handoff, legacy_owner=None):
+    """Recheck the persisted attempt and named candidate after native write closure."""
     run = await _nucc_locked_attempt(session, handoff, ("finalizing",))
     await _require_nucc_native_location(session, handoff, run)
-    if (run["metrics"] or {}).get("nucc_handoff") != handoff or run["finished_at"] is not None:
-        raise ReferenceFamilyArchiveError("NUCC native sealed attempt differs")
-    if run["phase_detail"] != NUCC_HANDOFF_PHASE or await _nucc_native_publisher_owner(session) != sealed_owner_oid:
-        raise ReferenceFamilyArchiveError("NUCC native sealed publisher differs")
-    expected_stage_by_field = {**handoff["stage"], "owner_oid": sealed_owner_oid}
     if (
-        await _nucc_native_stage(session, handoff["schema_name"], expected_stage_by_field["table_name"])
-        != expected_stage_by_field
+        (run["metrics"] or {}).get("nucc_handoff") != handoff
+        or run["finished_at"] is not None
+        or run["phase_detail"] != NUCC_HANDOFF_PHASE
     ):
-        raise ReferenceFamilyArchiveError("NUCC native sealed custody differs")
-    marker = await session.scalar(
-        text("SELECT pg_catalog.obj_description(CAST(:oid AS oid),'pg_class')"),
-        {"oid": expected_stage_by_field["relation_oid"]},
-    )
-    if marker is None or json.loads(marker) != {
-        key: handoff[key] for key in ("contract", "run_id", "attempt_id", "handoff_sha256")
-    }:
-        raise ReferenceFamilyArchiveError("NUCC native sealed marker differs")
+        raise ReferenceFamilyArchiveError("NUCC native sealed attempt differs")
+    await _require_nucc_handoff_stage(session, handoff)
 
 
 async def complete_nucc_native_handoff(session, handoff_by_field, *, publication_continuation):
-    """Seal and independently validate before ONE caller-owned publication continuation."""
+    """Close writes and validate before the once-only atomic named publication."""
     if not callable(publication_continuation):
         raise ReferenceFamilyArchiveError("NUCC trusted publication continuation is required")
-    handoff = await require_nucc_native_handoff(session, handoff_by_field)
-    table_name = handoff["stage"]["table_name"]
-    sealed_owner_oid = await _nucc_native_publisher_owner(session)
-    transaction_id = await session.scalar(text("SELECT pg_current_xact_id()::text"))
-    await _require_nucc_native_columns(session, handoff["stage"]["relation_oid"])
-    validation = await _validate_nucc_table_set(session, handoff["schema_name"], table_name)
-    if validation["row_count"] != handoff["row_count"]:
-        raise ReferenceFamilyArchiveError("NUCC native row accounting changed")
-    prepared_by_field = {
-        "handoff": handoff,
-        "sealed_owner_oid": sealed_owner_oid,
-        "validation": validation,
-        "validation_sha256": nucc_native_digest(validation),
-    }
-    cutover_transactions = []
+    _require_transaction(session)
+    async with session.begin_nested():
+        await session.connection()
+        handoff = await require_nucc_native_handoff(session, handoff_by_field)
+        schema, table = handoff["schema_name"], handoff["stage"]["table_name"]
+        transaction = session.get_transaction()
+        from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
 
-    async def cutover():
-        """Commit exact native success only with the physical and generation mutation."""
-        if cutover_transactions:
-            raise ReferenceFamilyArchiveError("NUCC native cutover already used")
-        cutover_transactions.append(transaction_id)
-        if (
-            not session.in_transaction()
-            or await session.scalar(text("SELECT pg_current_xact_id()::text")) != transaction_id
-        ):
-            raise ReferenceFamilyArchiveError("NUCC native publisher transaction changed")
-        await _require_nucc_sealed_handoff(session, handoff, sealed_owner_oid)
-        if await _relation_oid(session, handoff["schema_name"], "nucc_taxonomy") is not None:
-            raise ReferenceFamilyArchiveError("NUCC retained predecessor was not relocated")
-        schema = _quoted(handoff["schema_name"])
-        await session.execute(text(f"ALTER TABLE {schema}.{_quoted(table_name)} RENAME TO nucc_taxonomy"))
-        await rename_nucc_published_indexes(
-            session, schema_name=handoff["schema_name"], expected_relation_oid=handoff["stage"]["relation_oid"]
+        owner, readers = model_family_roles()
+        driver = await _native_model_copy_driver(session, ("execute", "fetch", "fetchval"))
+        await freeze_fhir_source_snapshot(
+            driver,
+            schema,
+            namespace_owner=owner,
+            reader_roles=readers,
+            application_roles=(),
+            relation_names=(table,),
+            freeze_schema=False,
         )
-        is_immutable = handoff["contract"] == NUCC_IMMUTABLE_HANDOFF_CONTRACT
-        published = await _publish_nucc_handoff_generation(session, handoff)
-        if published.relation_oids != (handoff["stage"]["relation_oid"],):
-            raise ReferenceFamilyArchiveError("NUCC native published OID differs")
-        receipt_by_field = {
-            "contract": NUCC_IMMUTABLE_PUBLICATION_CONTRACT if is_immutable else NUCC_PUBLICATION_CONTRACT,
-            **prepared_by_field,
-            "result_generation": published.as_dict(),
-        }
-        validate_nucc_native_publication(receipt_by_field)
-        await _finish_nucc_native_attempt(session, receipt_by_field)
-        return receipt_by_field
+        validation = await _validate_nucc_table_set(session, schema, table)
+        if validation["row_count"] != handoff["row_count"]:
+            raise ReferenceFamilyArchiveError("NUCC native row accounting changed")
+        prepared_dict = dict(handoff=handoff, validation=validation, validation_sha256=nucc_native_digest(validation))
+        cutover_by_field = {"has_run": False}
 
-    publication_result = await publication_continuation(session, prepared_by_field, cutover)
-    if not cutover_transactions:
-        raise ReferenceFamilyArchiveError("NUCC native cutover was not completed")
-    return publication_result
+        async def cutover():
+            """Run the once-only named rename and generation CAS in the owning transaction."""
+            if cutover_by_field["has_run"]:
+                raise ReferenceFamilyArchiveError("NUCC native cutover already used")
+            cutover_by_field["has_run"] = True
+            if not session.in_transaction() or session.get_transaction() is not transaction:
+                raise ReferenceFamilyArchiveError("NUCC native publisher transaction changed")
+            await _require_nucc_sealed_handoff(session, handoff)
+            if await _relation_oid(session, schema, "nucc_taxonomy") is not None:
+                raise ReferenceFamilyArchiveError("NUCC retained predecessor was not relocated")
+            await session.execute(text(f"ALTER TABLE {_quoted(schema)}.{_quoted(table)} RENAME TO nucc_taxonomy"))
+            await rename_nucc_published_indexes(session, schema_name=schema)
+            published = await _publish_nucc_handoff_generation(session, handoff)
+            if published.relations != ((schema, "nucc_taxonomy"),):
+                raise ReferenceFamilyArchiveError("NUCC native published relation differs")
+            receipt_by_field = dict(
+                contract=NUCC_IMMUTABLE_PUBLICATION_CONTRACT
+                if handoff["contract"] == NUCC_IMMUTABLE_HANDOFF_CONTRACT
+                else NUCC_PUBLICATION_CONTRACT,
+                **prepared_dict,
+                result_generation=published.as_dict(),
+            )
+            validate_nucc_native_publication(receipt_by_field)
+            await _finish_nucc_native_attempt(session, receipt_by_field)
+            return receipt_by_field
+
+        publication_result = await publication_continuation(session, prepared_dict, cutover)
+        if not cutover_by_field["has_run"]:
+            raise ReferenceFamilyArchiveError("NUCC native cutover was not completed")
+        return publication_result
 
 
 def validate_nucc_native_publication(receipt_by_field):
-    """Decode exact committed native metadata; no historical run/count is authority."""
+    """Preserve historical bytes while validating semantic data and generation progress."""
+    fields = {"contract", "handoff", "validation", "validation_sha256", "result_generation"}
     if (
         type(receipt_by_field) is not dict
-        or set(receipt_by_field)
-        != {"contract", "handoff", "sealed_owner_oid", "validation", "validation_sha256", "result_generation"}
+        or set(receipt_by_field) not in (fields, fields | {"sealed_owner_oid"})
         or receipt_by_field["contract"] not in {NUCC_PUBLICATION_CONTRACT, NUCC_IMMUTABLE_PUBLICATION_CONTRACT}
     ):
         raise ReferenceFamilyArchiveError("NUCC native publication differs")
-    receipt_by_field = json.loads(_canonical_json(receipt_by_field))
-    handoff = validate_nucc_native_handoff(receipt_by_field["handoff"])
-    is_immutable = receipt_by_field["contract"] == NUCC_IMMUTABLE_PUBLICATION_CONTRACT
+    receipt = json.loads(_canonical_json(receipt_by_field))
+    handoff = validate_nucc_native_handoff(receipt["handoff"])
+    if ("sealed_owner_oid" in receipt) != ("database_oid" in handoff):
+        raise ReferenceFamilyArchiveError("NUCC native publication edition differs")
+    is_immutable = receipt["contract"] == NUCC_IMMUTABLE_PUBLICATION_CONTRACT
     if is_immutable != (handoff["contract"] == NUCC_IMMUTABLE_HANDOFF_CONTRACT):
         raise ReferenceFamilyArchiveError("NUCC native publication contract differs")
-    validation = receipt_by_field["validation"]
+    validation = receipt["validation"]
     if (
-        type(receipt_by_field["sealed_owner_oid"]) is not int
-        or not 0 < receipt_by_field["sealed_owner_oid"] < 2**32
-        or type(validation) is not dict
+        type(validation) is not dict
         or set(validation) != {"contract", "row_count", "csv_upper_bound"}
         or validation["contract"] != "nucc-indexed-set.v1"
         or type(validation["row_count"]) is not int
         or validation["row_count"] != handoff["row_count"]
         or type(validation["csv_upper_bound"]) is not int
         or not 0 < validation["csv_upper_bound"] <= 8 * 1024**2
-        or nucc_native_digest(validation) != receipt_by_field["validation_sha256"]
+        or nucc_native_digest(validation) != receipt["validation_sha256"]
     ):
         raise ReferenceFamilyArchiveError("NUCC native publication validation differs")
-    authority = _nucc_result_authority(receipt_by_field["result_generation"])
-    incumbent = _nucc_result_authority(handoff["incumbent"], allow_untracked=is_immutable)
+    authority = _nucc_result_authority(receipt["result_generation"], declared_schema=handoff["schema_name"])
+    incumbent = _nucc_result_authority(
+        handoff["incumbent"], allow_untracked=is_immutable, declared_schema=handoff["schema_name"]
+    )
     if (
         authority.local_lineage_id != incumbent.local_lineage_id
         or authority.local_generation != incumbent.local_generation + 1
         or authority.serving_generation.origin_lineage_id != authority.local_lineage_id
         or authority.serving_generation.origin_generation != authority.local_generation
-        or authority.relation_oids != (handoff["stage"]["relation_oid"],)
+        or authority.relations != ((handoff["schema_name"], "nucc_taxonomy"),)
     ):
         raise ReferenceFamilyArchiveError("NUCC native publication generation differs")
-    nucc_native_digest(receipt_by_field)
-    return receipt_by_field
+    return receipt
 
 
 async def _finish_nucc_native_attempt(session, receipt):
@@ -3377,24 +3425,15 @@ async def _cleanup_model_family_stage(session, ownership, spec, *, include_ident
     )
     if current_schema_oid is None:
         return
-    await _lock_family(
-        session,
-        ownership.schema_name,
-        spec.archive_names,
-        "ACCESS EXCLUSIVE",
-        nowait=True,
-    )
-    observed = await _capture_model_family_ownership(
-        session, spec, ownership.dataset_id, include_identity=include_identity
-    )
-    if observed != ownership:
-        raise ReferenceFamilyArchiveError("reference family stage ownership differs")
+    ownership = await verify_model_family_stage_ownership(session, spec, ownership, include_identity=include_identity)
     relations = ", ".join(f"{_quoted(ownership.schema_name)}.{_quoted(name)}" for name in spec.archive_names)
+    # A sealed stage keeps SELECT only, even for its owner; DROP takes its own lock through ownership.
+    await session.execute(text("SET LOCAL lock_timeout='1s'"))
     await session.execute(text(f"DROP TABLE {relations} RESTRICT"))
     if int(
         await session.scalar(
-            text("SELECT count(*) FROM pg_catalog.pg_class WHERE relnamespace=:schema_oid"),
-            {"schema_oid": ownership.schema_oid},
+            text("SELECT count(*) FROM pg_catalog.pg_class WHERE relnamespace=to_regnamespace(:schema_name)"),
+            {"schema_name": ownership.schema_name},
         )
         or 0
     ):
@@ -3403,104 +3442,90 @@ async def _cleanup_model_family_stage(session, ownership, spec, *, include_ident
 
 
 def _nucc_retained_inventory(inventory):
-    """Accept only a closed physical preimage; the trusted caller proves its publication authority."""
-    fields = {
-        "schema_name",
-        "relation_name",
-        "relation_oid",
-        "relfilenode",
-        "owner_oid",
-        "schema_oid",
-        "schema_owner_oid",
-    }
-    if type(inventory) is not dict or set(inventory) != {"database_oid", "relations"}:
+    """Decode one recorded retained QName; old physical fields remain opaque."""
+    fields = {"schema_name", "relation_name"}
+    legacy_fields = {"relation_oid", "relfilenode", "owner_oid", "schema_oid", "schema_owner_oid"}
+    if type(inventory) is not dict or set(inventory) not in ({"relations"}, {"database_oid", "relations"}):
         raise ReferenceFamilyArchiveError("NUCC retained inventory differs")
     relations = inventory["relations"]
     if (
         type(relations) is not list
         or len(relations) != 1
         or type(relations[0]) is not dict
-        or set(relations[0]) != fields
+        or set(relations[0]) not in (fields, fields | legacy_fields)
     ):
         raise ReferenceFamilyArchiveError("NUCC retained family differs")
     relation = relations[0]
     if (
         relation["relation_name"] != models.NUCCTaxonomy.__tablename__
-        or not isinstance(relation["schema_name"], str)
+        or type(relation["schema_name"]) is not str
         or re.fullmatch(_PREDECESSOR_PREFIX + r"[0-9a-f]{32}", relation["schema_name"]) is None
-        or any(
-            type(relation[key]) is not int or not 0 < relation[key] < 2**32
-            for key in fields - {"schema_name", "relation_name"}
-        )
-        or type(inventory["database_oid"]) is not int
-        or not 0 < inventory["database_oid"] < 2**32
     ):
         raise ReferenceFamilyArchiveError("NUCC retained location differs")
     return json.loads(_canonical_json(inventory))
 
 
-async def _require_nucc_retained_physical(session, inventory, owner_oid):
-    """Recheck closed protected heap/index custody and actual native non-serving authority under locks."""
+async def _require_nucc_retained_physical(session, inventory, owner_oid=None):
+    """Validate the named native retained model and its complete isolated namespace."""
     relation = inventory["relations"][0]
-    if relation["owner_oid"] != owner_oid:
-        raise ReferenceFamilyArchiveError("NUCC retained owner differs")
+    schema, table = relation["schema_name"], relation["relation_name"]
     safe = await session.scalar(
         text(
-            "SELECT relation.oid=:relation_oid AND relation.relfilenode=:relfilenode AND relation.relowner=:owner_oid "
-            "AND namespace.oid=:schema_oid AND namespace.nspowner=:schema_owner_oid "
-            "AND namespace.nspowner IN (:owner_oid,(SELECT oid FROM pg_catalog.pg_roles WHERE rolname=session_user)) "
-            "AND relation.relkind='r' AND relation.relpersistence='p' AND NOT relation.relispartition "
-            "AND NOT relation.relrowsecurity AND NOT relation.relforcerowsecurity "
-            "AND (SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database())=:database_oid "
-            "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid=relation.oid OR inhparent=relation.oid) "
-            "AND NOT EXISTS(SELECT 1 FROM mrf.reference_family_result_generation WHERE relation.oid=ANY(relation_oids)) "
-            "AND pg_catalog.to_regclass('mrf.nucc_taxonomy')::oid<>relation.oid "
-            "AND (SELECT count(*) FROM pg_catalog.pg_index WHERE indrelid=relation.oid) BETWEEN 1 AND 16 "
-            "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid "
-            "WHERE i.indrelid=relation.oid AND (NOT i.indisvalid OR NOT i.indisready OR NOT i.indislive "
-            "OR c.relowner<>:owner_oid OR c.relnamespace<>namespace.oid OR c.relkind<>'i')) "
-            "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_class c WHERE c.relnamespace=namespace.oid "
-            "AND c.oid<>relation.oid AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_index i "
-            "WHERE i.indrelid=relation.oid AND i.indexrelid=c.oid)) "
-            "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class c ON c.oid=d.objid "
-            "WHERE d.refobjid=relation.oid AND d.classid='pg_catalog.pg_class'::regclass AND c.relkind='S') "
-            "FROM pg_catalog.pg_class relation JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace "
-            "WHERE namespace.nspname=:schema_name AND relation.relname=:relation_name"
+            "SELECT relkind='r' AND relpersistence='p' AND NOT relispartition AND NOT relrowsecurity AND NOT relforcerowsecurity "
+            "AND NOT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) "
+            "AND NOT EXISTS(SELECT FROM mrf.reference_family_result_generation WHERE serving_schema=:schema AND :name=ANY(serving_relation_names)) "
+            "AND (SELECT count(*) FROM pg_index WHERE indrelid=c.oid) BETWEEN 1 AND 16 "
+            "AND NOT EXISTS(SELECT FROM pg_index i WHERE i.indrelid=c.oid AND (NOT i.indisvalid OR NOT i.indisready OR NOT i.indislive)) "
+            "AND NOT EXISTS(SELECT FROM pg_class other WHERE other.relnamespace=c.relnamespace AND other.oid<>c.oid "
+            "AND NOT EXISTS(SELECT FROM pg_index i WHERE i.indrelid=c.oid AND i.indexrelid=other.oid)) "
+            "FROM pg_class c WHERE c.oid=to_regclass(:relation)"
         ),
-        {**relation, "database_oid": inventory["database_oid"]},
+        {"schema": schema, "name": table, "relation": f"{_quoted(schema)}.{_quoted(table)}"},
     )
     if safe is not True:
-        raise ReferenceFamilyArchiveError("NUCC retained custody or serving authority differs")
-    await _require_nucc_native_columns(session, relation["relation_oid"])
+        raise ReferenceFamilyArchiveError("NUCC retained layout or serving authority differs")
+    await _nucc_native_stage(session, schema, table)
 
 
 async def cleanup_nucc_retained_publication(session, *, inventory, assert_unreferenced):
-    """Remove only a claimed native predecessor; caller proves ledger/catalog authority and owns COMMIT."""
+    """Drop a named predecessor; the trusted callback holds its reference-claim locks through COMMIT."""
     _require_transaction(session)
     inventory = _nucc_retained_inventory(inventory)
     if not callable(assert_unreferenced):
         raise ReferenceFamilyArchiveError("NUCC trusted retirement authority is required")
-    relation = inventory["relations"][0]
-    qualified = f"{_quoted(relation['schema_name'])}.{_quoted(relation['relation_name'])}"
-    async with _nucc_catalog_search_path(session):
-        transaction_id = await session.scalar(text("SELECT pg_current_xact_id()::text"))
-        owner_oid = await _nucc_native_publisher_owner(session)
-        if await assert_unreferenced(session, inventory) is not True:
-            raise ReferenceFamilyArchiveError("NUCC retained publication remains referenced")
-        await session.execute(text(f"LOCK TABLE ONLY {qualified} IN ACCESS EXCLUSIVE MODE NOWAIT"))
-        await session.execute(
-            text("LOCK TABLE ONLY mrf.nucc_taxonomy,mrf.reference_family_result_generation IN SHARE MODE NOWAIT")
-        )
-        await _require_nucc_retained_physical(session, inventory, owner_oid)
-        if (
-            await assert_unreferenced(session, inventory) is not True
-            or not session.in_transaction()
-            or await session.scalar(text("SELECT pg_current_xact_id()::text")) != transaction_id
-        ):
-            raise ReferenceFamilyArchiveError("NUCC retirement transaction or references changed")
-        await session.execute(text(f"DROP TABLE {qualified} RESTRICT"))
-        await session.execute(text(f"DROP SCHEMA {_quoted(relation['schema_name'])} RESTRICT"))
-    return {"inventory_sha256": nucc_native_digest(inventory), "removed_schema_oid": relation["schema_oid"]}
+    async with session.begin_nested():
+        await session.connection()
+        transaction = session.get_transaction()
+        relation = inventory["relations"][0]
+        qualified = f"{_quoted(relation['schema_name'])}.{_quoted(relation['relation_name'])}"
+        async with _nucc_catalog_search_path(session):
+            await read_reference_family_result_generation_authority(
+                session, importer_id="nucc", schema_name="mrf", lock=True
+            )
+            if await assert_unreferenced(session, inventory) is not True:
+                raise ReferenceFamilyArchiveError("NUCC retained publication remains referenced")
+            await session.execute(text(f"LOCK TABLE ONLY {qualified} IN ACCESS SHARE MODE NOWAIT"))
+            await session.execute(
+                text(
+                    "LOCK TABLE ONLY mrf.nucc_taxonomy,mrf.reference_family_result_generation IN ACCESS SHARE MODE NOWAIT"
+                )
+            )
+            await _require_nucc_retained_physical(session, inventory)
+            if (
+                await assert_unreferenced(session, inventory) is not True
+                or not session.in_transaction()
+                or session.get_transaction() is not transaction
+            ):
+                raise ReferenceFamilyArchiveError("NUCC retirement transaction or references changed")
+            await session.execute(text(f"DROP TABLE {qualified} RESTRICT"))
+            await session.execute(text(f"DROP SCHEMA {_quoted(relation['schema_name'])} RESTRICT"))
+        named_inventory_by_field = {
+            "relations": [{"schema_name": relation["schema_name"], "relation_name": relation["relation_name"]}]
+        }
+        return {
+            "inventory_sha256": nucc_native_digest(named_inventory_by_field),
+            "removed_schema": relation["schema_name"],
+        }
 
 
 async def _shielded_cleanup(session_factory: Any, ownership: ReferenceFamilyStageOwnership) -> None:
@@ -3836,17 +3861,13 @@ async def export_prepared_reference_family_archive(
     async with session_factory() as stage_session, stage_session.begin():
         await stage_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
         async with _bounded_capture(stage_session):
+            # The frozen clone is read-only for every role, its owner included; a read lock pins its names.
             await _lock_family(
-                stage_session,
-                stage_schema,
-                _ownership_spec(prepared.ownership).archive_names,
-                "ACCESS SHARE"
-                if verify_custody is not None or manifest.publication_authority == "captured-epoch"
-                else "SHARE",
+                stage_session, stage_schema, _ownership_spec(prepared.ownership).archive_names, "ACCESS SHARE"
             )
             if verify_custody is not None:
                 await verify_custody(stage_session, prepared)
-            await verify_reference_family_stage_ownership(stage_session, ownership)
+            ownership = await verify_reference_family_stage_ownership(stage_session, ownership)
             await _validate_stage_manifest(stage_session, ownership=ownership, manifest=manifest)
             snapshot = (await stage_session.execute(text("SELECT pg_export_snapshot()"))).scalar_one()
             if not isinstance(snapshot, str) or _SNAPSHOT.fullmatch(snapshot) is None:
@@ -3933,12 +3954,8 @@ async def _create_model_family(
         return
     authorization = ""
     if protected_owner_oid is not None:
-        if await protected_publisher_owner(session) != protected_owner_oid:
-            raise ReferenceFamilyArchiveError("native model publisher owner differs")
-        owner_name = await session.scalar(
-            text("SELECT quote_ident(rolname) FROM pg_roles WHERE oid=:owner"), {"owner": protected_owner_oid}
-        )
-        authorization = f" AUTHORIZATION {owner_name}"
+        owner_name, _readers = model_family_roles()
+        authorization = f" AUTHORIZATION {_quoted(owner_name)}"
     await session.execute(text(f"CREATE SCHEMA {_quoted(schema_name)}{authorization}"))
     await _create_model_heaps(session, spec, schema_name, create_indexes=create_indexes, ordinary_heaps=ordinary_heaps)
 
@@ -4153,72 +4170,14 @@ async def validate_reference_family_stage(
             session,
             ownership.schema_name,
             _ownership_spec(ownership).archive_names,
-            "SHARE",
+            "ACCESS SHARE",
         )
-        await verify_reference_family_stage_ownership(session, ownership)
+        ownership = await verify_reference_family_stage_ownership(session, ownership)
     return await _validate_stage_manifest(
         session,
         ownership=ownership,
         manifest=validated_manifest,
     )
-
-
-async def _verify_stage_owner(
-    session: Any,
-    ownership: ReferenceFamilyStageOwnership,
-    expected_owner_oid: int,
-) -> None:
-    if type(expected_owner_oid) is not int or expected_owner_oid <= 0:
-        raise ReferenceFamilyArchiveError("reference family stage owner is invalid")
-    schema_owner = await session.scalar(
-        text("SELECT nspowner FROM pg_catalog.pg_namespace WHERE oid=:schema_oid AND nspname=:schema_name"),
-        {"schema_oid": ownership.schema_oid, "schema_name": ownership.schema_name},
-    )
-    if schema_owner != expected_owner_oid:
-        raise ReferenceFamilyArchiveError("reference family stage owner differs")
-    relation_oids = tuple(
-        sorted(
-            ownership.relation_oids
-            + (((STAGE_TABLE, ownership.auxiliary_oid),) if ownership.auxiliary_oid is not None else ())
-        )
-    )
-    relation_rows = list(
-        (
-            await session.execute(
-                text(
-                    "SELECT relation.relname, relation.oid, relation.relowner "
-                    "FROM pg_catalog.pg_class AS relation "
-                    "WHERE relation.oid=ANY(CAST(:relation_oids AS oid[])) ORDER BY relation.relname"
-                ),
-                {"relation_oids": [relation_oid for _, relation_oid in relation_oids]},
-            )
-        ).mappings()
-    )
-    if [
-        (relation_record["relname"], int(relation_record["oid"]), int(relation_record["relowner"]))
-        for relation_record in relation_rows
-    ] != [(table_name, relation_oid, expected_owner_oid) for table_name, relation_oid in relation_oids]:
-        raise ReferenceFamilyArchiveError("reference family stage owner differs")
-    if ownership.sequence_oids:
-        sequence_rows = list(
-            (
-                await session.execute(
-                    text(
-                        "SELECT relname, oid, relowner FROM pg_catalog.pg_class "
-                        "WHERE oid=ANY(CAST(:sequence_oids AS oid[])) ORDER BY relname"
-                    ),
-                    {"sequence_oids": [sequence_oid for _, sequence_oid, _, _ in ownership.sequence_oids]},
-                )
-            ).mappings()
-        )
-        if [
-            (sequence_record["relname"], int(sequence_record["oid"]), int(sequence_record["relowner"]))
-            for sequence_record in sequence_rows
-        ] != [
-            (sequence_name, sequence_oid, expected_owner_oid)
-            for sequence_name, sequence_oid, _, _ in ownership.sequence_oids
-        ]:
-            raise ReferenceFamilyArchiveError("reference family stage sequence owner differs")
 
 
 async def prepare_reference_family_activation(
@@ -4228,7 +4187,8 @@ async def prepare_reference_family_activation(
     manifest: Mapping[str, Any] | ReferenceFamilyManifest,
     package_id: str,
     profile_contract: str,
-    sealed_owner_oid: int,
+    sealed_owner_oid=None,
+    roles=None,
 ) -> ReferenceFamilyValidationReceipt:
     """Perform long validation over an already publisher-frozen stage."""
 
@@ -4240,8 +4200,7 @@ async def prepare_reference_family_activation(
         or validated_manifest.importer_id != ownership.importer_id
     ):
         raise ReferenceFamilyArchiveError("reference family validation scope differs")
-    await verify_reference_family_stage_ownership(session, ownership)
-    await _verify_stage_owner(session, ownership, sealed_owner_oid)
+    ownership = await verify_reference_family_stage_ownership(session, ownership)
     table_receipts = await _validate_stage_manifest(session, ownership=ownership, manifest=validated_manifest)
     validation_by_field = {
         "contract": VALIDATION_CONTRACT,
@@ -4249,9 +4208,9 @@ async def prepare_reference_family_activation(
         "package_id": package_id,
         "profile_contract": profile_contract,
         "stage_schema": ownership.schema_name,
-        "stage_schema_oid": ownership.schema_oid,
-        "relation_oids": [list(pair) for pair in ownership.relation_oids],
-        "sealed_owner_oid": sealed_owner_oid,
+        "relations": [
+            {"schema_name": ownership.schema_name, "relation_name": name} for name in ownership.relation_names
+        ],
         "manifest_sha256": hashlib.sha256(_canonical_json(validated_manifest.as_dict())).hexdigest(),
         "tables": [table.as_dict() for table in table_receipts],
     }
@@ -4283,7 +4242,9 @@ async def capture_reference_family_incumbent(
             raise ReferenceFamilyArchiveError("reference family incumbent is incomplete")
         if all(present_flags):
             await _lock_family(session, schema, tuple(name for name, oid in pairs if oid is not None), "ACCESS SHARE")
-            if await _incumbent_pairs(session, spec, schema) != pairs:
+            if tuple((name, oid is not None) for name, oid in await _incumbent_pairs(session, spec, schema)) != tuple(
+                (name, oid is not None) for name, oid in pairs
+            ):
                 raise ReferenceFamilyArchiveError("reference family incumbent changed during capture")
     return ReferenceFamilyIncumbent(spec.importer_id, schema, pairs)
 
@@ -4306,7 +4267,9 @@ async def _verify_incumbent(session: Any, expected: ReferenceFamilyIncumbent) ->
     if expected.importer_id == "drug-claims":
         spec = reference_family_receive_spec(expected.importer_id)
     observed_oids = await _incumbent_pairs(session, spec, expected.schema_name)
-    if observed_oids != expected.relation_oids:
+    if tuple((name, oid is not None) for name, oid in observed_oids) != tuple(
+        (name, oid is not None) for name, oid in expected.relation_oids
+    ):
         raise ReferenceFamilyArchiveError("reference family incumbent changed")
 
 
@@ -4325,22 +4288,24 @@ async def _lock_and_verify_activation(
     expected_incumbent: ReferenceFamilyIncumbent,
     *,
     wait_for_readers: bool = False,
-) -> None:
+    stage_read_only: bool = False,
+) -> ReferenceFamilyStageOwnership:
+    """Read-lock frozen stages; mutable/manual callers retain exclusive verification."""
+    lock_mode = "ACCESS SHARE" if stage_read_only else "ACCESS EXCLUSIVE"
     async with _bounded_capture(session):
-        await _lock_family(session, ownership.schema_name, spec.archive_names, "ACCESS EXCLUSIVE", nowait=True)
+        await _lock_family(session, ownership.schema_name, spec.archive_names, lock_mode, nowait=True)
         incumbent_names = tuple(name for name, oid in expected_incumbent.relation_oids if oid is not None)
-        if incumbent_names and wait_for_readers:
+        if incumbent_names and wait_for_readers and not stage_read_only:
             from process.entity_address_cutover_contract import lock_live_serving_relations
 
             await lock_live_serving_relations(
                 lambda sql: session.execute(text(sql)), expected_incumbent.schema_name, incumbent_names
             )
         elif incumbent_names:
-            await _lock_family(
-                session, expected_incumbent.schema_name, incumbent_names, "ACCESS EXCLUSIVE", nowait=True
-            )
-        await verify_reference_family_stage_ownership(session, ownership)
+            await _lock_family(session, expected_incumbent.schema_name, incumbent_names, lock_mode, nowait=True)
+        ownership = await verify_reference_family_stage_ownership(session, ownership)
         await _verify_incumbent(session, expected_incumbent)
+    return ownership
 
 
 async def _validate_mrf_canonical_address_merge(session, stage, archive) -> None:
@@ -4453,27 +4418,20 @@ def _selected_canonical_sources(inventories, selected_relations, owner_oid):
 
 
 def _selected_canonical_relations(inventory, selected, owner_oid, expected_names):
-    """Bind the complete protected physical family to its existing admitted Address role."""
+    """Bind the complete named family to its admitted logical Address role."""
     relations = inventory["relations"]
     if (
         len(relations) != len(expected_names)
-        or {relation["relation_name"] for relation in relations} != set(expected_names)
-        or len({relation["relation_oid"] for relation in relations}) != len(expected_names)
-        or len({relation["schema_oid"] for relation in relations}) != 1
-        or len({relation["schema_name"] for relation in relations}) != 1
-        or any(
-            relation["owner_oid"] != owner_oid or relation["schema_owner_oid"] != owner_oid for relation in relations
-        )
+        or {entry["relation_name"] for entry in relations} != set(expected_names)
+        or len({entry["schema_name"] for entry in relations}) != 1
     ):
-        raise ReferenceFamilyArchiveError("selected canonical complete custody differs")
-    match = next(relation for relation in relations if relation["relation_name"] == selected["table_name"])
-    if (match["relation_oid"], match["relfilenode"], match["schema_name"]) != (
-        selected["relation_oid"],
-        selected["relfilenode"],
-        selected["schema_name"],
-    ):
+        raise ReferenceFamilyArchiveError("selected canonical complete family differs")
+    for entry in relations:
+        _schema_name(entry["schema_name"])
+    match = next((entry for entry in relations if entry["relation_name"] == selected["table_name"]), None)
+    if match is None or match["schema_name"] != selected["schema_name"]:
         raise ReferenceFamilyArchiveError("selected canonical role identity differs")
-    return relations
+    return [{"schema_name": entry["schema_name"], "relation_name": entry["relation_name"]} for entry in relations]
 
 
 @asynccontextmanager
@@ -4485,14 +4443,12 @@ async def selected_mrf_canonical_archive(session, *, schema_name, owner_oid, sel
     readers. A failed validation rolls back its private view with the caller's
     transaction; success drops it before returning. No shared heap/index changes.
     """
-    from process.entity_address_snapshot_preparation import _publisher_authority
-
     _require_transaction(session)
-    if not callable(authenticate_inventory) or await _publisher_authority(session) != owner_oid:
+    if not callable(authenticate_inventory):
         raise ReferenceFamilyArchiveError("selected MRF publisher authority differs")
     inventory = await authenticate_inventory(session)
     archive = f"{_quoted(schema_name)}.{_quoted(archive_table_name())}"
-    await session.execute(text(f"LOCK TABLE {archive} IN SHARE MODE NOWAIT"))
+    await session.execute(text(f"LOCK TABLE {archive} IN ACCESS SHARE MODE NOWAIT"))
     if inventory is None:
         # Only the authenticating callback may select an already-installed MRF.
         yield None
@@ -4504,14 +4460,14 @@ async def selected_mrf_canonical_archive(session, *, schema_name, owner_oid, sel
             + ", ".join(
                 f"{_quoted(relation['schema_name'])}.{_quoted(relation['relation_name'])}" for relation in relations
             )
-            + " IN SHARE MODE NOWAIT"
+            + " IN ACCESS SHARE MODE NOWAIT"
         )
     )
     await _require_selected_mrf_catalog(session, relations, owner_oid)
     auxiliary = next(relation for relation in relations if relation["relation_name"] == STAGE_TABLE)
     stage = f"{_quoted(auxiliary['schema_name'])}.{_quoted(STAGE_TABLE)}"
     await _validate_mrf_canonical_address_merge(session, stage, archive)
-    view_name = "address_mrf_archive_validation_" + format(auxiliary["relation_oid"], "x")
+    view_name = "address_mrf_archive_validation"
     await session.execute(
         text(f"CREATE TEMP VIEW {_quoted(view_name)} AS " + _mrf_archive_projection_sql(stage, archive))
     )
@@ -4543,78 +4499,31 @@ def _mrf_archive_projection_sql(stage, archive):
 
 
 def _selected_mrf_relations(inventory, selected_relation, owner_oid):
-    """Resolve only the complete model family and auxiliary already authenticated by the caller."""
-    relations = inventory["relations"]
-    expected_names = set(reference_family_spec("mrf").archive_names)
-    if (
-        len(relations) != len(expected_names)
-        or {relation["relation_name"] for relation in relations} != expected_names
-        or len({relation["relation_oid"] for relation in relations}) != len(expected_names)
-        or len({relation["schema_oid"] for relation in relations}) != 1
-        or len({relation["schema_name"] for relation in relations}) != 1
-        or any(
-            relation["owner_oid"] != owner_oid or relation["schema_owner_oid"] != owner_oid for relation in relations
-        )
-    ):
-        raise ReferenceFamilyArchiveError("selected MRF complete custody differs")
-    mrf = next(relation for relation in relations if relation["relation_name"] == models.MRFAddress.__tablename__)
-    if (
-        mrf["relation_oid"] != selected_relation["relation_oid"]
-        or mrf["relfilenode"] != selected_relation["relfilenode"]
-        or mrf["schema_name"] != selected_relation["schema_name"]
-        or mrf["relation_name"] != selected_relation["table_name"]
-    ):
-        raise ReferenceFamilyArchiveError("selected MRF role identity differs")
-    return sorted(relations, key=lambda relation: relation["relation_oid"])
+    return sorted(
+        _selected_canonical_relations(
+            inventory, selected_relation, owner_oid, reference_family_spec("mrf").archive_names
+        ),
+        key=lambda entry: (entry["schema_name"], entry["relation_name"]),
+    )
 
 
 async def _require_selected_mrf_catalog(session, relations, owner_oid):
-    """Recheck exact names/OIDs/files after locks and reject foreign write/structural drift."""
-    observed = (
-        (
-            await session.execute(
-                text("""
-        SELECT c.oid::bigint AS relation_oid,c.relname::text AS relation_name,
-               n.oid::bigint AS schema_oid,n.nspname::text AS schema_name,
-               c.relowner::bigint AS owner_oid,n.nspowner::bigint AS schema_owner_oid,
-               pg_catalog.pg_relation_filenode(c.oid)::bigint AS relfilenode,
-               c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition
-                 AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
-                 AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)
-                 AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_index WHERE indrelid=c.oid
-                     AND (NOT indisvalid OR NOT indisready OR NOT indislive))
-                 AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid=c.oid
-                     AND contype NOT IN ('p','u','n','c'))
-                 AND NOT EXISTS(SELECT 1 FROM pg_catalog.aclexplode(COALESCE(c.relacl,pg_catalog.acldefault('r',c.relowner))) acl
-                     WHERE acl.grantee<>CAST(:owner_oid AS oid) AND acl.privilege_type IN
-                       ('INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER','MAINTAIN'))
-                 AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_attribute a,
-                     LATERAL pg_catalog.aclexplode(a.attacl) acl WHERE a.attrelid=c.oid
-                     AND acl.grantee<>CAST(:owner_oid AS oid) AND acl.privilege_type IN ('INSERT','UPDATE','REFERENCES'))
-                 AS closed
-          FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
-         WHERE c.oid=ANY(CAST(:oids AS oid[])) ORDER BY c.oid
-    """),
-                {"oids": [relation["relation_oid"] for relation in relations], "owner_oid": owner_oid},
-            )
+    """Check complete named heap/index shape after reader locks, without ACL identity checks."""
+    for relation in relations:
+        name = f"{_quoted(_schema_name(relation['schema_name']))}.{_quoted(relation['relation_name'])}"
+        accepted = await session.scalar(
+            text("""
+            SELECT c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition
+              AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+              AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)
+              AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_index WHERE indrelid=c.oid AND (NOT indisvalid OR NOT indisready OR NOT indislive))
+              AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_constraint WHERE conrelid=c.oid AND contype NOT IN ('p','u','n','c'))
+            FROM pg_catalog.pg_class c WHERE c.oid=pg_catalog.to_regclass(:relation)
+        """),
+            {"relation": name},
         )
-        .mappings()
-        .all()
-    )
-    fields = (
-        "relation_oid",
-        "relation_name",
-        "schema_oid",
-        "schema_name",
-        "owner_oid",
-        "schema_owner_oid",
-        "relfilenode",
-    )
-    if len(observed) != len(relations) or any(
-        not actual["closed"] or any(actual[field] != expected[field] for field in fields)
-        for actual, expected in zip(observed, relations, strict=True)
-    ):
-        raise ReferenceFamilyArchiveError("selected MRF locked catalog differs")
+        if accepted is not True:
+            raise ReferenceFamilyArchiveError("selected MRF locked catalog differs")
 
 
 async def _drop_empty_stage_schema(session: Any, ownership: ReferenceFamilyStageOwnership) -> None:
@@ -4643,8 +4552,8 @@ async def _activation_receipt(
     live_pairs = await _incumbent_pairs(session, spec, expected_incumbent.schema_name)
     if any(type(oid) is not int or oid <= 0 for _, oid in live_pairs):
         raise ReferenceFamilyArchiveError("reference family activated relation is unavailable")
-    if tuple(sorted(live_pairs)) != ownership.relation_oids:
-        raise ReferenceFamilyArchiveError("reference family activated relation OID differs")
+    if tuple(sorted(name for name, oid in live_pairs if oid is not None)) != ownership.relation_names:
+        raise ReferenceFamilyArchiveError("reference family activated relation declaration differs")
     if spec.importer_id == "mrf":
         observed_tables = tuple(
             [
@@ -4725,7 +4634,7 @@ async def activate_reference_family_stage(
         session, schema_name=expected_incumbent.schema_name
     ):
         raise ReferenceFamilyArchiveError("NUCC protected custody requires validated publisher activation")
-    await _lock_and_verify_activation(session, spec, ownership, expected_incumbent)
+    ownership = await _lock_and_verify_activation(session, spec, ownership, expected_incumbent)
     tables = await _validate_stage_manifest(session, ownership=ownership, manifest=validated_manifest)
     predecessor_schema_name, _live_pairs, canonical_publication = await _complete_validated_stage_activation(
         session, spec, ownership, expected_incumbent, validated_manifest
@@ -4756,6 +4665,8 @@ async def _complete_validated_stage_activation(
     ownership: ReferenceFamilyStageOwnership,
     expected_incumbent: ReferenceFamilyIncumbent,
     manifest: ReferenceFamilyManifest,
+    *,
+    roles=None,
 ) -> tuple[str | None, list[tuple[str, int | None]], Mapping[str, Any] | None]:
     """Rotate, merge MRF canonical rows, and verify the activated relation OIDs."""
 
@@ -4779,14 +4690,16 @@ async def _complete_validated_stage_activation(
             current_schema=expected_incumbent.schema_name,
             destination_schema=expected_incumbent.schema_name,
         )
-    predecessor_schema_name = await _rotate_family_relations(session, spec, ownership, expected_incumbent)
+    predecessor_schema_name = await _rotate_family_relations(
+        session, spec, ownership, expected_incumbent, **({"roles": roles} if spec.importer_id == "nucc" else {})
+    )
     canonical_publication = await _publish_canonical_contribution(
         session, spec, ownership, expected_incumbent, manifest
     )
     await _drop_empty_stage_schema(session, ownership)
     live_pairs = await _incumbent_pairs(session, spec, expected_incumbent.schema_name)
-    if tuple(sorted(live_pairs)) != ownership.relation_oids:
-        raise ReferenceFamilyArchiveError("reference family activated relation OID differs")
+    if tuple(sorted(name for name, oid in live_pairs if oid is not None)) != ownership.relation_names:
+        raise ReferenceFamilyArchiveError("reference family activated relation declaration differs")
     return predecessor_schema_name, live_pairs, canonical_publication
 
 
@@ -4810,6 +4723,8 @@ def _require_cutover_authority(ownership, expected_incumbent, cutover) -> None:
 
     if not isinstance(cutover, ReferenceFamilyCutoverAuthority):
         raise ReferenceFamilyArchiveError("reference family cutover authority is invalid")
+    if type(cutover.stage_read_only) is not bool:
+        raise ReferenceFamilyArchiveError("reference family read-only stage declaration is invalid")
     if cutover.authority not in {"manual", "automatic"}:
         raise ReferenceFamilyArchiveError("reference family activation authority is unsupported")
     if not isinstance(ownership, ReferenceFamilyStageOwnership) or not isinstance(
@@ -4845,25 +4760,58 @@ async def activate_validated_reference_family_stage(
     validated_manifest, validation, spec = _validated_activation_inputs(
         session, ownership, manifest, expected_incumbent, validation_receipt, cutover
     )
-    await _lock_and_verify_activation(
-        session,
-        spec,
-        ownership,
-        expected_incumbent,
-        wait_for_readers=spec.importer_id not in {"mrf", "facility-anchors"},
-    )
-    await _verify_stage_owner(session, ownership, cutover.expected_stage_owner_oid)
-    async with _validated_reference_publication(session, spec, expected_incumbent, cutover):
-        return await _activate_verified_reference_family(
+    async with _frozen_activation_lock_wait(session, cutover.stage_read_only):
+        ownership = await _lock_and_verify_activation(
             session,
             spec,
             ownership,
             expected_incumbent,
-            validated_manifest,
-            validation,
-            cutover,
-            contribution_effect_receipt,
+            wait_for_readers=spec.importer_id not in {"mrf", "facility-anchors"},
+            stage_read_only=cutover.stage_read_only,
         )
+        async with _validated_reference_publication(session, spec, expected_incumbent, cutover):
+            return await _activate_verified_reference_family(
+                session,
+                spec,
+                ownership,
+                expected_incumbent,
+                validated_manifest,
+                validation,
+                cutover,
+                contribution_effect_receipt,
+            )
+
+
+@asynccontextmanager
+async def _frozen_activation_lock_wait(session, stage_read_only):
+    """Let native DDL take swap locks without granting DML or changing the scan timeout."""
+    if not stage_read_only:
+        yield
+        return
+    previous_lock = await _timeout_value(session, "lock_timeout")
+    await _set_local_timeout(session, "lock_timeout", _LOCK_TIMEOUT)
+    token = _FROZEN_CUTOVER.set(True)
+    try:
+        yield
+    except BaseException:
+        # A failed transaction rolls back SET LOCAL; preserve the original exception.
+        raise
+    else:
+        await _set_local_timeout(session, "lock_timeout", previous_lock)
+    finally:
+        _FROZEN_CUTOVER.reset(token)
+
+
+def cutover_wait_deadline():
+    """Start one shared exclusive-lock budget for the live tables of a frozen cutover."""
+    return asyncio.get_running_loop().time() + _CUTOVER_WAIT_SECONDS if _FROZEN_CUTOVER.get() else None
+
+
+async def bound_cutover_wait(session, deadline):
+    """Each later live-table lock waits only for what remains of the shared budget, never less than 1 ms."""
+    if deadline is not None:
+        remaining_ms = max(1, int((deadline - asyncio.get_running_loop().time()) * 1000))
+        await _set_local_timeout(session, "lock_timeout", f"{remaining_ms}ms")
 
 
 @asynccontextmanager
@@ -4877,7 +4825,7 @@ async def _validated_reference_publication(session, spec, incumbent, cutover):
         session,
         importer_id=spec.importer_id,
         schema_name=incumbent.schema_name,
-        expected_owner_oid=cutover.expected_stage_owner_oid,
+        roles=getattr(cutover, "roles", None),
     ):
         yield
 
@@ -4906,8 +4854,9 @@ async def _apply_validated_contribution(session, ownership, expected_incumbent, 
         if (
             receipt["schema"] != expected_incumbent.schema_name
             or receipt["stage_schema"] != ownership.schema_name
-            or receipt["stage_schema_oid"] != ownership.schema_oid
-            or receipt["contribution_oid"] != dict(ownership.relation_oids).get("facility_address_contribution")
+            or "facility_address_contribution" not in ownership.relation_names
+            or receipt.get("contribution_relation_name", "facility_address_contribution")
+            != "facility_address_contribution"
         ):
             raise ReferenceFamilyArchiveError("facility contribution stage or destination differs")
         await apply_facility_address_effects(session, receipt)
@@ -4937,10 +4886,8 @@ def _require_validated_cutover_binding(ownership, expected_incumbent, manifest, 
         or validation.importer_id != ownership.importer_id
         or validation.package_id != cutover.package_id
         or validation.profile_contract != cutover.profile_contract
-        or validation.sealed_owner_oid != cutover.sealed_owner_oid
         or validation.stage_schema != ownership.schema_name
-        or validation.stage_schema_oid != ownership.schema_oid
-        or validation.relation_oids != ownership.relation_oids
+        or validation.relations != tuple((ownership.schema_name, name) for name in ownership.relation_names)
         or validation.manifest_sha256 != manifest_sha256
         or not _has_matching_manifest_stage_tables(
             manifest,
@@ -5016,7 +4963,9 @@ async def _require_automatic_cutover_generation(
             if populated:
                 raise ReferenceFamilyArchiveError("reference family legacy incumbent requires manual adoption")
         return
-    if current_authority.relation_oids != generation_incumbent_oids:
+    if current_authority.relations != tuple(
+        (expected_incumbent.schema_name, name) for name in RELATION_NAMES_BY_IMPORTER[spec.importer_id]
+    ):
         raise ReferenceFamilyArchiveError("reference family incumbent generation drifted")
     if spec.importer_id == "nucc" and source_capture_contract == IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT:
         from process.reference_family_result_generation import require_nucc_native_predecessor_storage
@@ -5024,7 +4973,7 @@ async def _require_automatic_cutover_generation(
         await require_nucc_native_predecessor_storage(
             session,
             schema_name=expected_incumbent.schema_name,
-            expected_relation_oid=current_authority.relation_oids[0],
+            expected_relation_oid=dict(expected_incumbent.relation_oids)["nucc_taxonomy"],
         )
     elif spec.importer_id == "geo":
         from process.geo_source_storage import capture_geo_generation
@@ -5044,14 +4993,23 @@ async def _require_automatic_cutover_generation(
         raise ReferenceFamilyArchiveError("reference family automatic generation is stale or unrelated") from error
 
 
-def _require_published_generation_binding(spec, live_pairs, incoming_generation, published_authority) -> None:
-    """Verify adopted authority names the exact activated relation OIDs."""
-
+def _require_published_generation_binding(
+    spec, live_pairs, incoming_generation, published_authority, *, schema_name=None
+) -> None:
+    """Bind adopted authority to the complete declared serving location."""
     if incoming_generation is not None:
-        ordered_live_oids = _generation_relation_oids(spec, live_pairs)
-        if published_authority.relation_oids != ordered_live_oids:
-            raise ReferenceFamilyArchiveError("reference family adopted generation OIDs differ")
-    elif published_authority.serving_generation is not None or published_authority.relation_oids is not None:
+        relations = published_authority.relations
+        if (
+            relations is None
+            or tuple(name for _schema, name in relations) != RELATION_NAMES_BY_IMPORTER[spec.importer_id]
+            or len({schema for schema, _name in relations}) != 1
+            or (
+                schema_name is not None
+                and relations != tuple((schema_name, name) for name in RELATION_NAMES_BY_IMPORTER[spec.importer_id])
+            )
+        ):
+            raise ReferenceFamilyArchiveError("reference family adopted generation names differ")
+    elif published_authority.serving_generation is not None or published_authority.relations is not None:
         raise ReferenceFamilyArchiveError("reference family generation-less adoption differs")
 
 
@@ -5103,7 +5061,7 @@ __all__ = [
 
 
 def _frozen_source_query(projection, model):
-    """Render only a finite native TIGER projection, never recursive canonical reads."""
+    """Render only a finite ordered TIGER projection of qualified names."""
     if (
         type(projection) is not tuple
         or len(projection) != 2
@@ -5111,34 +5069,27 @@ def _frozen_source_query(projection, model):
         or tuple(pair[0] for pair in projection) != ("zip_state", "zcta5")
     ):
         raise ReferenceFamilyArchiveError("frozen TIGER projection is invalid")
-    statements, oids, names = [], set(), set()
+    statements, names = [], set()
     columns = ", ".join(_quoted(column.name) for column in model.__table__.columns)
     for logical_table, relations in projection:
         if not 1 <= len(relations) <= 4096:
             raise ReferenceFamilyArchiveError("frozen TIGER projection is empty or unbounded")
-        group_oids = []
-        for physical in relations:
-            if type(physical) is not tuple or len(physical) != 4:
-                raise ReferenceFamilyArchiveError("frozen TIGER physical identity is invalid")
-            schema, table, oid, filenode = physical
+        for relation in relations:
             if (
-                any(type(number) is not int or not 0 < number < 2**32 for number in (oid, filenode))
-                or oid in oids
-                or (schema, table) in names
+                type(relation) is not tuple
+                or len(relation) != 2
+                or any(type(part) is not str for part in relation)
+                or relation in names
             ):
-                raise ReferenceFamilyArchiveError("frozen TIGER physical identity is invalid")
+                raise ReferenceFamilyArchiveError("frozen TIGER qualified name is invalid")
+            schema, table = relation
             qualified = _quoted(schema) + "." + _quoted(table)
-            oids.add(oid)
-            names.add((schema, table))
-            group_oids.append(oid)
+            names.add(relation)
             if logical_table == model.__tablename__:
                 statements.append(f"SELECT {columns} FROM ONLY {qualified}")
-        if (
-            group_oids != sorted(group_oids)
-            or sum(physical[:2] == ("tiger", logical_table) for physical in relations) != 1
-        ):
+        if tuple(sorted(relations)) != relations or relations.count(("tiger", logical_table)) != 1:
             raise ReferenceFamilyArchiveError("frozen TIGER canonical root differs")
-    if not statements or len(oids) > 4096:
+    if not statements or len(names) > 4096:
         raise ReferenceFamilyArchiveError("frozen TIGER projection is empty or unbounded")
     return " UNION ALL ".join(statements)
 

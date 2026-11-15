@@ -11,6 +11,7 @@ import pytest
 
 from process import provider_directory_profile_capacity as capacity
 
+
 def _relation_byte_caps():
     caps_by_name = {
         "artifact_scope": (100, 0, 0, 1024, 5),
@@ -36,13 +37,6 @@ def _relation_byte_caps():
 def _postgres_geometry_by_field() -> dict[str, object]:
     """Return the PostgreSQL ABI identity used by capacity fixtures."""
     return {
-        "database_system_identifier": "7527713908662902214",
-        "database_oid": 16401,
-        "database_name": "healthporta",
-        "tablespace_oid": 1663,
-        "tablespace_name": "pg_default",
-        "evidence_target_oid": 199329911,
-        "profile_target_oid": 199329928,
         "postgres_server_version_num": 180002,
         "postgres_block_size_bytes": 8192,
         "postgres_toast_max_chunk_size_bytes": 1996,
@@ -62,20 +56,26 @@ def _postgres_geometry_by_field() -> dict[str, object]:
 
 
 def _relation_geometry_by_field() -> dict[str, object]:
-    """Return physical relation and metadata projection identities."""
+    """Return named relation bounds and numeric metadata projections."""
     return {
-        "evidence_target_storage_fingerprint": "2" * 64,
-        "profile_target_storage_fingerprint": "3" * 64,
-        "build_checkpoint_oid": 199329935,
-        "serving_generation_oid": 199329940,
-        "delta_receipt_oid": 199329950,
-        "import_run_oid": 199329960,
-        "capacity_consumption_oid": 199329970,
-        "build_checkpoint_storage_fingerprint": "6" * 64,
-        "serving_generation_storage_fingerprint": "4" * 64,
-        "delta_receipt_storage_fingerprint": "5" * 64,
-        "import_run_storage_fingerprint": "8" * 64,
-        "capacity_consumption_storage_fingerprint": "9" * 64,
+        "relations": {
+            role: {
+                "schema": "fixture",
+                "name": name,
+                "main_index_pages": [3],
+                "toast_index_pages": [2],
+                "toastable_column_count": 2,
+            }
+            for role, name in (
+                ("evidence_target", "provider_directory_profile_evidence"),
+                ("profile_target", "provider_directory_profile"),
+                ("build_checkpoint", "provider_directory_profile_build_checkpoint"),
+                ("serving_generation", "provider_directory_profile_serving_generation"),
+                ("delta_receipt", "provider_directory_profile_delta_receipt"),
+                ("import_run", "import_run"),
+                ("capacity_consumption", "provider_directory_profile_capacity_lease_consumption"),
+            )
+        },
         "control_wal_plan_input_hash": "a" * 64,
         "control_wal_upper_bound_bytes": 12_345,
         "control_metadata_data_upper_bound_bytes": 23_456,
@@ -142,24 +142,14 @@ def _geometry_payload(**overrides):
 
 def test_valid_geometry_binds_executable_plan_and_storage_classes():
     geometry_map = _geometry_payload()
-    geometry = capacity.validated_capacity_geometry(
-        dict(reversed(tuple(geometry_map.items())))
-    )
+    geometry = capacity.validated_capacity_geometry(dict(reversed(tuple(geometry_map.items()))))
 
     assert geometry.materialization_mode == "source_delta"
     assert geometry.maximum_worker_count == 2
     assert geometry.reservation_bytes_by_storage_class == {
-        "data": (
-            2_100
-            + capacity.METADATA_DATA_UPPER_BOUND_BYTES
-            + 23_456
-        ),
+        "data": (2_100 + capacity.METADATA_DATA_UPPER_BOUND_BYTES + 23_456),
         "temp": 2_048,
-        "wal": (
-            105
-            + capacity.METADATA_WAL_UPPER_BOUND_BYTES
-            + 12_345
-        ),
+        "wal": (105 + capacity.METADATA_WAL_UPPER_BOUND_BYTES + 12_345),
     }
     assert capacity.capacity_geometry_payload(geometry) == geometry_map
     canonical_json = capacity.canonical_capacity_geometry_json(geometry)
@@ -188,15 +178,11 @@ def test_geometry_rejects_non_kib_aligned_temp_limit():
         capacity.ProviderDirectoryProfileCapacityError,
         match="memory_setting_not_kib_aligned",
     ):
-        capacity.validated_capacity_geometry(
-            _geometry_payload(temp_file_limit_bytes=1025)
-        )
+        capacity.validated_capacity_geometry(_geometry_payload(temp_file_limit_bytes=1025))
 
 
 def test_temp_reservation_covers_each_concurrent_backend():
-    geometry = capacity.validated_capacity_geometry(
-        _geometry_payload()
-    )
+    geometry = capacity.validated_capacity_geometry(_geometry_payload())
 
     assert geometry.maximum_worker_count == 2
     assert geometry.reservation_bytes_by_storage_class["temp"] == 2 * 1024
@@ -214,8 +200,8 @@ def test_temp_reservation_covers_each_concurrent_backend():
         ("current_context_vector_hash", "2" * 64),
         ("desired_context_vector_hash", "2" * 64),
         ("sql_contract_digest", "2" * 64),
-        ("evidence_target_oid", 199329912),
-        ("profile_target_oid", 199329929),
+        ("relations.evidence_target.name", "replacement_evidence"),
+        ("relations.profile_target.schema", "replacement_schema"),
         ("evidence_wave_count", 31),
         ("compact_worker_count", 1),
         ("artifact_scope_wave_count", 15),
@@ -226,10 +212,10 @@ def test_temp_reservation_covers_each_concurrent_backend():
         ("control_wal_plan_input_hash", "b" * 64),
         ("control_wal_upper_bound_bytes", 12_346),
         ("control_metadata_data_upper_bound_bytes", 23_457),
-        ("import_run_oid", 199329961),
-        ("capacity_consumption_oid", 199329971),
-        ("import_run_storage_fingerprint", "b" * 64),
-        ("capacity_consumption_storage_fingerprint", "c" * 64),
+        ("relations.import_run.name", "replacement_import_run"),
+        ("relations.capacity_consumption.name", "replacement_consumption"),
+        ("relations.import_run.main_index_pages", [4]),
+        ("relations.capacity_consumption.toast_index_pages", [3]),
         ("max_build_seconds", 21_599),
         ("statement_timeout_ms", 899_999),
         ("lock_timeout_ms", 4_999),
@@ -242,13 +228,15 @@ def test_geometry_hash_changes_for_execution_identity_drift(
     replacement,
 ):
     baseline = capacity.validated_capacity_geometry(_geometry_payload())
-    changed = capacity.validated_capacity_geometry(
-        _geometry_payload(**{field_name: replacement})
-    )
+    payload = _geometry_payload()
+    if field_name.startswith("relations."):
+        _, role, name = field_name.split(".")
+        payload["relations"][role][name] = replacement
+    else:
+        payload[field_name] = replacement
+    changed = capacity.validated_capacity_geometry(payload)
 
-    assert capacity.capacity_geometry_hash(changed) != (
-        capacity.capacity_geometry_hash(baseline)
-    )
+    assert capacity.capacity_geometry_hash(changed) != (capacity.capacity_geometry_hash(baseline))
 
 
 @pytest.mark.parametrize(
@@ -260,11 +248,11 @@ def test_geometry_hash_changes_for_execution_identity_drift(
         ({"profile_schema_version": 0}, "profile_schema_version_invalid"),
         ({"profile_as_of": "2026-7-30"}, "profile_as_of_invalid"),
         ({"profile_as_of": "2026-02-30"}, "profile_as_of_invalid"),
-        ({"evidence_target_oid": 199329928}, "target_oid_collision"),
-        ({"import_run_oid": 199329950}, "target_oid_collision"),
+        ({"evidence_target_oid": 199329928}, "geometry_fields_invalid"),
+        ({"import_run_oid": 199329950}, "geometry_fields_invalid"),
         (
             {"capacity_consumption_oid": 199329960},
-            "target_oid_collision",
+            "geometry_fields_invalid",
         ),
         (
             {"control_wal_plan_input_hash": "not-a-hash"},
@@ -386,11 +374,7 @@ def test_two_workers_fit_six_connection_pool_with_four_reserved():
     )
 
     assert geometry.maximum_worker_count == 2
-    assert (
-        geometry.database_pool_size
-        - geometry.pool_reserve_connections
-        == geometry.maximum_worker_count
-    )
+    assert geometry.database_pool_size - geometry.pool_reserve_connections == geometry.maximum_worker_count
     assert (
         capacity.PROFILE_DEDICATED_ADVISORY_LOCK_CONNECTIONS
         + capacity.PROFILE_CONTROL_CONNECTION_RESERVE
@@ -417,9 +401,7 @@ def test_relation_caps_require_exact_fields_and_order(mutation):
         capacity.ProviderDirectoryProfileCapacityError,
         match=reason,
     ):
-        capacity.validated_capacity_geometry(
-            _geometry_payload(relation_byte_caps=relation_caps)
-        )
+        capacity.validated_capacity_geometry(_geometry_payload(relation_byte_caps=relation_caps))
 
 
 @pytest.mark.parametrize(
@@ -469,9 +451,7 @@ def test_relation_caps_fail_closed(
         capacity.ProviderDirectoryProfileCapacityError,
         match=reason,
     ):
-        capacity.validated_capacity_geometry(
-            _geometry_payload(relation_byte_caps=relation_caps)
-        )
+        capacity.validated_capacity_geometry(_geometry_payload(relation_byte_caps=relation_caps))
 
 
 def test_revalidation_rejects_tampered_immutable_geometry():
@@ -492,3 +472,98 @@ def test_revalidation_rejects_tampered_immutable_geometry():
         match="relation_byte_caps_invalid",
     ):
         capacity.capacity_geometry_hash(tampered_geometry)
+
+
+@pytest.mark.parametrize("role", ["evidence_target", "import_run", "capacity_consumption"])
+def test_geometry_rejects_aliasing_named_relations(role):
+    payload = _geometry_payload()
+    payload["relations"][role] = copy.deepcopy(payload["relations"]["profile_target"])
+    with pytest.raises(capacity.ProviderDirectoryProfileCapacityError, match="logical_relation_coordinate_invalid"):
+        capacity.validated_capacity_geometry(payload)
+
+
+@pytest.mark.parametrize("pages", [[], [0], [True], [None]])
+def test_geometry_requires_bounded_numeric_index_pages(pages):
+    payload = _geometry_payload()
+    payload["relations"]["evidence_target"]["main_index_pages"] = pages
+    with pytest.raises(capacity.ProviderDirectoryProfileCapacityError, match="logical_relation_pages_invalid"):
+        capacity.validated_capacity_geometry(payload)
+
+
+def _legacy_geometry_projection_inputs():
+    import json
+    from pathlib import Path
+
+    original = json.loads(
+        (
+            Path(__file__).parent / "fixtures/provider_directory_profile_capacity_authority_projection_v1.json"
+        ).read_text()
+    )["projection"]
+    legacy_geometry = copy.deepcopy(original["capacity_geometry"])
+    legacy_geometry.pop("relations")
+    legacy_geometry.update(
+        contract_id="healthporta.provider-directory-profile-capacity-geometry.v5",
+        database_system_identifier="1234567890123456789",
+        database_oid=1,
+        database_name="fixture",
+        tablespace_oid=1663,
+        tablespace_name="pg_default",
+    )
+    for ordinal, role in enumerate(original["capacity_geometry"]["relations"], 100):
+        legacy_geometry[role + "_oid"] = ordinal
+        legacy_geometry[role + "_storage_fingerprint"] = f"{ordinal:064x}"
+    from hashlib import sha256
+
+    geometry_hash = sha256(
+        (
+            "provider_directory_profile_capacity_geometry.v5:"
+            + json.dumps(legacy_geometry, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        ).encode()
+    ).hexdigest()
+    retained_by_field = {
+        "selection_proof_id": legacy_geometry["selection_proof_id"],
+        "profile_input_digest": legacy_geometry["profile_input_digest"],
+        "executable_plan_hash": legacy_geometry["executable_plan_hash"],
+        "profile_as_of": legacy_geometry["profile_as_of"],
+        "source_vector_hash": legacy_geometry["desired_source_vector_hash"],
+        "source_context_vector_hash": legacy_geometry["desired_context_vector_hash"],
+        "evidence_rows": 67,
+        "profile_rows": 45,
+    }
+    return legacy_geometry, geometry_hash, retained_by_field
+
+
+def test_retained_geometry_projection_preserves_original_bytes_and_uses_named_targets():
+    from process.provider_directory_profile_capacity_geometry import project_legacy_capacity_geometry
+
+    payload, expected_hash, evidence = _legacy_geometry_projection_inputs()
+    original = copy.deepcopy(payload)
+    relations = _geometry_payload()["relations"]
+    projected = project_legacy_capacity_geometry(
+        payload, expected_hash, relations=relations, retained_evidence=evidence
+    )
+    assert projected.relations == relations
+    assert not hasattr(projected, "database_oid")
+    assert capacity.capacity_geometry_payload(projected) == original == payload
+    assert capacity.capacity_geometry_hash(projected) == expected_hash
+    assert projected.reservation_bytes_by_storage_class == {"data": 33657888, "temp": 2048, "wal": 67361209}
+
+
+@pytest.mark.parametrize("change", ["missing", "source", "raw_bytes"])
+def test_retained_geometry_projection_requires_original_hash_and_semantic_evidence(change):
+    from process.provider_directory_profile_capacity_geometry import project_legacy_capacity_geometry
+
+    payload, expected_hash, retained_by_field = _legacy_geometry_projection_inputs()
+    if change == "missing":
+        retained_by_field = {}
+    elif change == "source":
+        retained_by_field["source_vector_hash"] = "f" * 64
+    else:
+        payload["database_oid"] += 1
+    with pytest.raises(
+        capacity.ProviderDirectoryProfileCapacityError,
+        match="legacy_(semantic_evidence_required|geometry_hash_invalid)",
+    ):
+        project_legacy_capacity_geometry(
+            payload, expected_hash, relations=_geometry_payload()["relations"], retained_evidence=retained_by_field
+        )

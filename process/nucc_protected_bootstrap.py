@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""One-time preserved-heap NUCC adoption; a native Owner comment is not a publication."""
+"""Preserved NUCC adoption with named snapshots and complete content validation."""
 
 from __future__ import annotations
 
@@ -43,6 +43,22 @@ FIELDS = frozenset(
     }
 )
 
+_LEGACY_FIELDS = FIELDS
+FIELDS = frozenset(
+    {
+        "contract",
+        "parent",
+        "parent_index",
+        "child",
+        "semantic_sha256",
+        "row_count",
+        "source_authority",
+        "source_revision_tracked",
+        "adopted_at",
+        "baseline_sha256",
+    }
+)
+
 
 def _require(condition, reason):
     if not condition:
@@ -50,63 +66,50 @@ def _require(condition, reason):
 
 
 def validate_baseline(baseline_by_field, physical, source_authority):
-    """A closed comment can select the initial child only under fresh native custody and zero events."""
+    """Preserve old documents and validate saved names, content and logical provenance."""
+    from process.nucc_protected_control import _digests, _source_generation
+
     baseline_by_field = partition.decode_catalog(baseline_by_field)
     _require(type(baseline_by_field) is dict, "fields differ")
-    is_native_baseline = baseline_by_field.get("contract") == NATIVE_CONTRACT
-    _require(
-        set(baseline_by_field) == FIELDS | ({"native_registration"} if is_native_baseline else set()), "fields differ"
-    )
+    is_native = baseline_by_field.get("contract") == NATIVE_CONTRACT
+    extra = {"native_registration"} if is_native else set()
+    _require(set(baseline_by_field) in (FIELDS | extra, _LEGACY_FIELDS | extra), "fields differ")
     _require(baseline_by_field["contract"] in (CONTRACT, NATIVE_CONTRACT), "contract differs")
-    if is_native_baseline:
+    child = (
+        partition.qualified(baseline_by_field["child"])
+        if "child" in baseline_by_field
+        else (baseline_by_field["child_schema"], partition.CHILD_TABLE)
+    )
+    _require(child == physical["child"], "named predecessor differs")
+    if "parent" in baseline_by_field:
+        _require(
+            partition.qualified(baseline_by_field["parent"]) == physical["parent"]
+            and partition.qualified(baseline_by_field["parent_index"]) == physical["parent_index"],
+            "named parent differs",
+        )
+        _require(
+            baseline_by_field["baseline_sha256"]
+            == receipt_digest({key: field for key, field in baseline_by_field.items() if key != "baseline_sha256"}),
+            "digest differs",
+        )
+    if is_native:
         try:
             registration.validate_native_input_adoption(
-                baseline_by_field["native_registration"], schema="mrf", relation_oid=physical["child_oid"]
+                baseline_by_field["native_registration"], schema="mrf", table_name="nucc_taxonomy"
             )
         except RuntimeError as error:
             raise native.ReferenceFamilyArchiveError("NUCC protected baseline native registration differs") from error
-    _require(baseline_by_field["source_authority"] == source_authority, "Source predecessor differs")
     _require(
-        all(
-            baseline_by_field[key] == physical[key]
-            for key in (
-                "owner_oid",
-                "parent_oid",
-                "parent_index_oid",
-                "child_oid",
-                "child_schema",
-                "child_schema_oid",
-                "child_filenode",
-            )
-        ),
-        "physical predecessor differs",
-    )
-    _require(
-        baseline_by_field["baseline_sha256"]
-        == receipt_digest({key: field for key, field in baseline_by_field.items() if key != "baseline_sha256"}),
-        "digest differs",
+        _source_generation(baseline_by_field["source_authority"], predecessor=True, declared_schema=child[0])
+        == _source_generation(source_authority, predecessor=True),
+        "Source predecessor differs",
     )
     _require(
         type(baseline_by_field["row_count"]) is int and 0 <= baseline_by_field["row_count"] <= 10000, "census differs"
     )
-    for key in ("database_oid", "old_owner_oid", "old_schema_oid", "old_schema_owner_oid"):
-        _require(type(baseline_by_field[key]) is int and 0 < baseline_by_field[key] < 2**32, "identity differs")
-    for key in ("old_native_sha256", "protected_native_sha256", "protected_child_sha256", "semantic_sha256"):
-        _require(
-            type(baseline_by_field[key]) is str
-            and len(baseline_by_field[key]) == 64
-            and all(character in "0123456789abcdef" for character in baseline_by_field[key]),
-            "hash differs",
-        )
     _require(type(baseline_by_field["source_revision_tracked"]) is bool, "tracking differs")
-    _require(
-        type(baseline_by_field["child_index_oids"]) is list
-        and len(baseline_by_field["child_index_oids"]) == len(set(baseline_by_field["child_index_oids"]))
-        and len(baseline_by_field["child_index_oids"]) in (2, 4)
-        and all(type(oid) is int and 0 < oid < 2**32 for oid in baseline_by_field["child_index_oids"]),
-        "indexes differ",
-    )
-    return baseline_by_field
+    _digests(baseline_by_field, ("semantic_sha256", "baseline_sha256"))
+    return json.loads(json.dumps(baseline_by_field))
 
 
 async def _original_admin(session):
@@ -118,23 +121,11 @@ async def _original_admin(session):
 
 
 async def _native_admin(session):
-    native_record = (
-        (
-            await session.execute(
-                text("""SELECT pg_backend_pid() AS pid,pg_current_xact_id()::text AS xid,
- (SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid,
- session_user=current_user AND caller.rolsuper
- AND current_setting('transaction_isolation')='read committed'
- AND current_setting('transaction_read_only')='off'
- AND current_setting('session_replication_role')='origin' AS admitted
- FROM pg_roles caller WHERE caller.rolname=session_user""")
-            )
-        )
-        .mappings()
-        .one()
-    )
-    _require(native_record["admitted"] is True, "original administrator required")
-    return dict(native_record)
+    """Materialize the administrative transaction; native DDL supplies its authorization."""
+    _require(session.in_transaction(), "administrator transaction required")
+    native.model_family_roles()
+    await session.execute(text("SELECT 1"))
+    return {"transaction": session.get_transaction()}
 
 
 async def _legacy_hook(session, oid, owner_oid):
@@ -149,7 +140,7 @@ async def _legacy_hook(session, oid, owner_oid):
  AND t.tgattr::text='' AND t.tgqual IS NULL AND t.tgoldtable IS NULL AND t.tgnewtable IS NULL
  AND p.prorettype='trigger'::regtype AND p.pronargs=0 AND p.prokind='f' AND p.prosecdef
  AND p.proconfig=ARRAY['search_path=pg_catalog']::text[] AND l.lanname='plpgsql'
- AND p.pronamespace='mrf'::regnamespace AND p.proowner=n.nspowner AS shape
+ AND p.pronamespace='mrf'::regnamespace AS shape
  FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid JOIN pg_language l ON l.oid=p.prolang,
  pg_namespace n WHERE t.tgrelid=:oid AND n.nspname='mrf' ORDER BY t.oid"""),
                 {"oid": oid},
@@ -162,9 +153,7 @@ async def _legacy_hook(session, oid, owner_oid):
     native_registration = await _capture_native_registration(session, oid, owner_oid)
     if native_registration is not None:
         _require(
-            len(hook_records) == 1
-            and hook_records[0]["tgname"] == "cms_native_input_mutation"
-            and hook_records[0]["oid"] == native_registration["trigger_oid"],
+            len(hook_records) == 1 and hook_records[0]["tgname"] == "cms_native_input_mutation",
             "native hook differs",
         )
         return {**dict(hook_records[0]), "native_registration": native_registration}
@@ -187,10 +176,8 @@ async def _registration_driver(session):
     return (await connection.get_raw_connection()).driver_connection
 
 
-async def _capture_native_registration(session, oid, owner_oid):
-    candidate = registration.NativeInputCandidate(
-        "mrf", partition.CHILD_TABLE, "mrf", partition.CHILD_TABLE, oid, owner_oid, oid
-    )
+async def _capture_native_registration(session, oid=None, owner_oid=None):
+    candidate = registration.NativeInputCandidate("mrf", partition.CHILD_TABLE, "mrf", partition.CHILD_TABLE)
     return await registration.capture_native_input_adoption(
         await _registration_driver(session), ledger_schema="mrf", candidate=candidate
     )
@@ -200,7 +187,9 @@ async def _old_heap(session):
     oid = await session.scalar(text("SELECT to_regclass('mrf.nucc_taxonomy')::oid::bigint"))
     _require(type(oid) is int, "legacy heap missing")
     await session.execute(text(f"LOCK TABLE ONLY {partition.PARENT} IN ACCESS EXCLUSIVE MODE NOWAIT"))
-    child = partition.decode_catalog(await session.scalar(text(partition.CHILD_CATALOG_SQL), {"child_oid": oid}))
+    child = partition.decode_catalog(
+        await session.scalar(text(partition.CHILD_CATALOG_SQL), {"child": partition.PARENT})
+    )
     _require(
         child is not None
         and child["kind"] == "r"
@@ -209,14 +198,13 @@ async def _old_heap(session):
         and child["is_partition"] is False
         and child["bound"] is None
         and child["options"] is None
-        and child["persistence"] == "p"
-        and child["filenode"] > 0,
+        and child["persistence"] == "p",
         "legacy heap differs",
     )
     partition._require_columns(child["columns"])
-    partition._primary_index(child, child["owner"])
+    partition._primary_index(child)
     partition._require_original_indexes(child)
-    hook = await _legacy_hook(session, oid, child["owner"])
+    hook = await _legacy_hook(session, oid, None)
     _require(
         not await session.scalar(
             text("""SELECT EXISTS(SELECT FROM pg_depend d
@@ -237,82 +225,49 @@ async def _old_heap(session):
 
 
 async def _owner(session):
-    native_record = (
-        (
-            await session.execute(
-                text("""SELECT r.oid::bigint AS oid,quote_ident(r.rolname) AS name,
- NOT (r.rolcanlogin OR r.rolsuper OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication OR r.rolbypassrls) AS safe
- FROM pg_namespace n JOIN pg_roles r ON r.oid=n.nspowner WHERE n.nspname='hp_snapshot_retention'""")
-            )
-        )
-        .mappings()
-        .one()
-    )
-    _require(native_record["safe"] is True, "Owner differs")
-    return dict(native_record)
+    native._require_transaction(session)
+    owner, readers = native.model_family_roles()
+    return {"name": native._quoted(owner), "role": owner, "readers": readers}
 
 
 async def _preserve_reads(session, child, owner, incoming):
-    """Replay only actual nondelegable legacy reads; ordinary mutation never follows the preserved heap."""
-    reader_oids = set()
-    for grantee, _grantor, privilege, grantable in child["acl"]:
-        if privilege != "SELECT" or grantee == owner["oid"]:
-            continue
-        _require(grantable is False, "delegable legacy read differs")
-        if grantee in reader_oids:
-            continue
-        reader_oids.add(grantee)
-        role = (
-            "PUBLIC"
-            if grantee == 0
-            else await session.scalar(
-                text("SELECT quote_ident(rolname) FROM pg_roles WHERE oid=:oid"),
-                {"oid": grantee},
-            )
-        )
-        _require(type(role) is str, "legacy reader missing")
-        schema = incoming.split(".", 1)[0]
-        await session.execute(text(f"GRANT USAGE ON SCHEMA {schema} TO {role}"))
-        await session.execute(text(f"GRANT SELECT ON {partition.PARENT},{incoming} TO {role}"))
+    schema = incoming.split(".", 1)[0]
+    for role in owner["readers"]:
+        await session.execute(text(f"GRANT USAGE ON SCHEMA {schema} TO {native._quoted(role)}"))
+        await session.execute(text(f"GRANT SELECT ON {partition.PARENT},{incoming} TO {native._quoted(role)}"))
 
 
 async def _adopt_heap(session, child, hook, owner, dataset_id):
     schema = native.reference_family_stage_schema(dataset_id)
     incoming = f'"{schema}"."{partition.CHILD_TABLE}"'
     await session.execute(text(f'CREATE SCHEMA "{schema}" AUTHORIZATION {owner["name"]}'))
-    native_registration = None if hook is None else hook.get("native_registration")
-    if hook is not None and native_registration is None:
-        await session.execute(text(f'DROP TRIGGER "{hook["tgname"]}" ON {partition.PARENT}'))
+    adoption = None if hook is None else hook.get("native_registration")
     await session.execute(text(f'ALTER TABLE {partition.PARENT} SET SCHEMA "{schema}"'))
-    await session.execute(text(f"ALTER TABLE {incoming} OWNER TO {owner['name']}"))
     ownership = await native.capture_model_family_stage_ownership(
-        session,
-        native.reference_family_spec("nucc"),
-        dataset_id,
+        session, native.reference_family_spec("nucc"), dataset_id
     )
-    # The original administrator preserves read ACLs, while closing every former direct heap grant.
-    grantees = {entry[0] for entry in child["acl"] if entry[0] != owner["oid"]}
-    for grantee in sorted(grantees):
-        role = (
-            "PUBLIC"
-            if grantee == 0
-            else await session.scalar(
-                text("SELECT quote_ident(rolname) FROM pg_roles WHERE oid=:oid"),
-                {"oid": grantee},
-            )
-        )
-        _require(type(role) is str, "legacy grant role missing")
-        await session.execute(text(f"REVOKE ALL ON {incoming} FROM {role}"))
-    if native_registration is not None:
-        await _retire_native_guard(session, child, owner, incoming, native_registration)
+    await native.seal_model_family_storage(session, ownership)
+    if adoption is not None:
+        await _retire_native_guard(session, child, owner, incoming, adoption)
+    elif hook is not None:
+        await session.execute(text(f'DROP TRIGGER "{hook["tgname"]}" ON {incoming}'))
     await session.execute(
         text(
-            f"CREATE TABLE {partition.PARENT} (LIKE {incoming} INCLUDING DEFAULTS "
-            "INCLUDING GENERATED INCLUDING IDENTITY INCLUDING STORAGE) PARTITION BY RANGE(code)"
+            f"CREATE TABLE {partition.PARENT} (LIKE {incoming} INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING IDENTITY INCLUDING STORAGE) PARTITION BY RANGE(code)"
         )
     )
     await session.execute(text(f"ALTER TABLE {partition.PARENT} OWNER TO {owner['name']}"))
     await session.execute(text(f"ALTER TABLE {partition.PARENT} ADD PRIMARY KEY(code)"))
+    from process.provider_directory_generic_source_provision import _freeze_snapshot_relation
+
+    driver = await _registration_driver(session)
+    await _freeze_snapshot_relation(
+        driver,
+        "mrf",
+        {"relname": partition.CHILD_TABLE, "relkind": "p"},
+        owner["name"],
+        tuple(native._quoted(reader) for reader in owner["readers"]),
+    )
     await _preserve_reads(session, child, owner, incoming)
     await session.execute(
         text(f"ALTER TABLE {partition.PARENT} ATTACH PARTITION {incoming} FOR VALUES FROM (MINVALUE) TO (MAXVALUE)")
@@ -321,33 +276,25 @@ async def _adopt_heap(session, child, hook, owner, dataset_id):
 
 
 async def _retire_native_guard(session, child, owner, incoming, native_registration):
-    closed_child = partition.decode_catalog(
-        await session.scalar(text(partition.CHILD_CATALOG_SQL), {"child_oid": child["oid"]})
-    )
+    """Retire the existing semantic guard after closing every application writer."""
+    driver = await _registration_driver(session)
+    schema = incoming.split('"')[1]
+    guards = await registration._native_relation_guards(driver, schema, partition.CHILD_TABLE, "mrf")
     _require(
-        closed_child["owner"] == owner["oid"] and closed_child["ordinary_write"] is False,
-        "native writer custody differs",
-    )
-    _require(
-        await _capture_native_registration(session, child["oid"], owner["oid"]) == native_registration,
-        "native registration changed",
+        len(guards) == 1 and guards[0]["tgname"] == "cms_native_input_mutation" and guards[0]["safe"] is True,
+        "native guard changed",
     )
     await session.execute(text(f'DROP TRIGGER "cms_native_input_mutation" ON {incoming}'))
-    await registration.verify_retired_native_input_adoption(
-        await _registration_driver(session), evidence=native_registration
-    )
+    await registration.verify_retired_native_input_adoption(driver, evidence=native_registration)
 
 
-async def _require_adoptable_source(session, source_authority, child):
-    _require(
-        source_authority.relation_oids is None or source_authority.relation_oids == (child["oid"],),
-        "Source relation differs",
-    )
-    # The protected four-ledger projection must be installed by its existing genuine operator first.
-    claims = await session.scalar(
-        text("SELECT count(*) FROM mrf.nucc_retained_relation_claims WHERE relation_oid=:oid"), {"oid": child["oid"]}
-    )
-    _require(claims == 0, "legacy heap has retained claims")
+async def _require_adoptable_source(session, child):
+    from process.nucc_retention_read_view import NuccRetentionReadError, require_unretained_nucc_relations
+
+    try:
+        await require_unretained_nucc_relations(session, schema_name=child["schema"], relation_names=(child["name"],))
+    except NuccRetentionReadError as error:
+        raise native.ReferenceFamilyArchiveError("NUCC protected baseline legacy heap has retained claims") from error
     _require(
         not await session.scalar(
             text(
@@ -357,6 +304,28 @@ async def _require_adoptable_source(session, source_authority, child):
         ),
         "Owner event already exists",
     )
+
+
+async def _relocate_source_generation(session, source_authority, physical):
+    """Relocate recorded names under the existing lineage/counter CAS without changing provenance."""
+    if source_authority.serving_generation is not None:
+        _require(source_authority.relations == (("mrf", partition.CHILD_TABLE),), "Source predecessor name differs")
+        changed = await session.scalar(
+            text(
+                "UPDATE mrf.reference_family_result_generation\n SET serving_schema=:schema,serving_relation_names=ARRAY['nucc_taxonomy']::text[]\n WHERE importer_id='nucc' AND local_lineage_id=CAST(:lineage AS uuid) AND local_generation=:generation\n AND serving_schema='mrf' AND serving_relation_names=ARRAY['nucc_taxonomy']::text[] RETURNING importer_id"
+            ),
+            {
+                "schema": physical["child"][0],
+                "lineage": source_authority.local_lineage_id,
+                "generation": source_authority.local_generation,
+            },
+        )
+        _require(changed == "nucc", "Source name relocation changed")
+        source_authority = await native.read_reference_family_result_generation_authority(
+            session, importer_id="nucc", schema_name="mrf", lock=True
+        )
+        _require(source_authority.relations == (physical["child"],), "Source child relocation differs")
+    return source_authority
 
 
 async def adopt_nucc_parent(session, *, dataset_id):
@@ -370,7 +339,7 @@ async def adopt_nucc_parent(session, *, dataset_id):
         lock=True,
     )
     child, hook = await _old_heap(session)
-    await _require_adoptable_source(session, source_authority, child)
+    await _require_adoptable_source(session, child)
     owner = await _owner(session)
     old_count, old_semantic = await _legacy_contents(session)
     async with session.begin_nested():
@@ -384,6 +353,7 @@ async def adopt_nucc_parent(session, *, dataset_id):
             row_json_sql="to_jsonb(row_value)",
         )
         await _prove_preserved(session, child, physical, (old_count, old_semantic), (count, semantic))
+        source_authority = await _relocate_source_generation(session, source_authority, physical)
         baseline_by_field = await _marker(
             session,
             admin,
@@ -392,7 +362,7 @@ async def adopt_nucc_parent(session, *, dataset_id):
             source_authority,
             count,
             semantic,
-            (receipt_digest({"heap": child, "hook": hook}), None if hook is None else hook.get("native_registration")),
+            (None, None if hook is None else hook.get("native_registration")),
         )
         comment = await session.scalar(
             text("SELECT quote_literal(:comment)"), {"comment": json.dumps(baseline_by_field, sort_keys=True)}
@@ -418,16 +388,8 @@ async def adopt_nucc_parent(session, *, dataset_id):
 
 async def _prove_preserved(session, child, physical, before_content, after_content):
     _require(before_content == after_content, "preserved content changed")
-    _require(
-        physical["child_oid"] == child["oid"] and physical["child_filenode"] == child["filenode"],
-        "preserved storage changed",
-    )
     catalog = partition.decode_catalog(await session.scalar(text(partition.CATALOG_SQL)))
-    _require(
-        sorted(index["oid"] for index in catalog["children"][0]["relation"]["indexes"])
-        == sorted(index["oid"] for index in child["indexes"]),
-        "preserved indexes changed",
-    )
+    _require(partition.validate_preserved_parent_catalog(catalog, child) == physical, "preserved model/indexes changed")
 
 
 async def _legacy_contents(session):
@@ -462,41 +424,24 @@ async def _legacy_contents(session):
 
 
 async def _marker(session, admin, child, physical, source_authority, count, semantic, old_native_preimage):
-    old_native_sha256, native_registration = old_native_preimage
-    catalog = partition.decode_catalog(await session.scalar(text(partition.CATALOG_SQL)))
-    tracked = await session.scalar(
-        text("SELECT source_revision_tracked FROM mrf.reference_family_result_generation WHERE importer_id='nucc'")
+    _old_token, adoption = old_native_preimage
+    baseline_by_field = dict(
+        contract=CONTRACT if adoption is None else NATIVE_CONTRACT,
+        parent=list(physical["parent"]),
+        parent_index=list(physical["parent_index"]),
+        child=list(physical["child"]),
+        semantic_sha256=semantic,
+        row_count=count,
+        source_authority=source_authority.as_dict(),
+        source_revision_tracked=await session.scalar(
+            text("SELECT source_revision_tracked FROM mrf.reference_family_result_generation WHERE importer_id='nucc'")
+        ),
+        adopted_at=(await session.scalar(text("SELECT clock_timestamp() AT TIME ZONE 'UTC'"))).isoformat(
+            timespec="microseconds"
+        )
+        + "Z",
     )
-    baseline_by_field = {
-        "contract": CONTRACT if native_registration is None else NATIVE_CONTRACT,
-        "database_oid": admin["database_oid"],
-        **{
-            key: physical[key]
-            for key in (
-                "owner_oid",
-                "parent_oid",
-                "parent_index_oid",
-                "child_oid",
-                "child_schema",
-                "child_schema_oid",
-                "child_filenode",
-            )
-        },
-        "child_index_oids": sorted(index["oid"] for index in child["indexes"]),
-        "old_owner_oid": child["owner"],
-        "old_schema_oid": child["schema_oid"],
-        "old_schema_owner_oid": child["schema_owner"],
-        "old_native_sha256": old_native_sha256,
-        "protected_native_sha256": partition.catalog_digest(catalog),
-        "protected_child_sha256": receipt_digest(catalog["children"][0]["relation"]),
-        "semantic_sha256": semantic,
-        "row_count": count,
-        "source_authority": source_authority.as_dict(),
-        "source_revision_tracked": tracked,
-        "adopted_at": await session.scalar(text("SELECT clock_timestamp() AT TIME ZONE 'UTC'")),
-    }
-    if native_registration is not None:
-        baseline_by_field["native_registration"] = native_registration
-    baseline_by_field["adopted_at"] = baseline_by_field["adopted_at"].isoformat(timespec="microseconds") + "Z"
+    if adoption is not None:
+        baseline_by_field["native_registration"] = adoption
     baseline_by_field["baseline_sha256"] = receipt_digest(baseline_by_field)
     return validate_baseline(baseline_by_field, physical, source_authority.as_dict())

@@ -7,68 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from process import provider_directory_cms_control_custody as controls
 from process import provider_directory_source_acquisition_custody as acquisitions
-from tests.test_provider_directory_cms_control_custody import _authentic_entry
-
-
-def _callable_acl(*, owner=17, public=False):
-    name = (
-        "provider_directory_uhc_flex_practitioner_dataset_valid"
-        if public
-        else "provider_directory_reviewed_subset_activation_valid"
-    )
-    entry_by_field = _authentic_entry(name)
-    entry_by_field["definition"]["proowner"] = str(owner)
-    entry_by_field["acl"] = [[owner, owner, "EXECUTE", False]]
-    if public:
-        entry_by_field["acl"].append([0, owner, "EXECUTE", False])
-    return entry_by_field
-
-
-@pytest.mark.parametrize("public", [False, True])
-def test_control_callable_preserves_declared_execute_scope_without_changing_acl(public):
-    entry_by_field = _callable_acl(public=public)
-    entry_by_field["acl"].append([19, 17, "EXECUTE", False])
-    before = deepcopy(entry_by_field)
-    controls._require_callable_acl(entry_by_field, 17, 19, legacy=False)
-    assert entry_by_field == before
-
-
-@pytest.mark.parametrize("grant", [[23, 17, "EXECUTE", False], [19, 17, "EXECUTE", True], [0, 17, "EXECUTE", False]])
-def test_private_control_callable_refuses_foreign_public_or_delegable_execute(grant):
-    entry_by_field = _callable_acl()
-    entry_by_field["acl"].append(grant)
-    before = deepcopy(entry_by_field)
-    with pytest.raises(ValueError, match="cms_control_callable_acl_changed"):
-        controls._require_callable_acl(entry_by_field, 17, 19, legacy=False)
-    assert entry_by_field == before
-
-
-def test_control_callable_builder_ownership_is_only_a_legacy_adoption_input():
-    entry_by_field = _callable_acl(owner=19)
-    controls._require_callable_acl(entry_by_field, 17, 19, legacy=True)
-    with pytest.raises(ValueError, match="cms_control_callable_owner_changed"):
-        controls._require_callable_acl(entry_by_field, 17, 19, legacy=False)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["missing", "foreign_signature"])
-async def test_control_callable_census_refuses_partial_or_substituted_contracts_before_adoption(fault):
-    catalog_records = [dict(signature=signature) for signature in controls._signatures("sample")]
-    if fault == "missing":
-        catalog_records.pop()
-    else:
-        catalog_records[0]["signature"] = '"sample"."foreign_callable"()'
-    connection = SimpleNamespace(
-        fetch=AsyncMock(return_value=catalog_records), fetchval=AsyncMock(), execute=AsyncMock()
-    )
-    with pytest.raises(ValueError, match="cms_control_callable_set_changed"):
-        await controls._capture_callables(
-            connection, SimpleNamespace(schema="sample", runtime_roles=()), {}, 17, 19, 23
-        )
-    connection.fetchval.assert_not_awaited()
-    connection.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ from api import provider_directory_source_publication as publication
 from api import provider_directory_source_worker as source
 from process import provider_directory_generic_source_storage as storage
 from process.control_lifecycle import _terminal_metrics_from_result
+from process.provider_directory_source_storage_binding import named_source_document
 from tests.test_provider_directory_source_worker_launch import _change_job_bindings
 
 RUN_ID = "run_" + "a" * 32
@@ -72,9 +73,20 @@ def _handoff():
     }
 
 
+def _named_handoff():
+    document = named_source_document(_handoff())
+    document["contract"] = storage.NAMED_ISOLATED_CONTRACT
+    document["identity"]["metadata"].update(selected_resources=["Practitioner"], expected_resources=["Practitioner"])
+    return document
+
+
 def _receipt(document):
+    """Digest the stored document as both writers do; current writers keep the producer beside it."""
     encoded = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
-    return {"document": document, "sha256": hashlib.sha256(encoded).hexdigest()}
+    receipt_by_field = {"document": document, "sha256": hashlib.sha256(encoded).hexdigest()}
+    if "producer" not in document["storage"]:
+        receipt_by_field["producer"] = ["a" * 40, "sha256:" + "a" * 64]
+    return receipt_by_field
 
 
 def _recorded():
@@ -414,6 +426,10 @@ async def test_publication_rejects_changed_handoff(runtime, fault):
     receipt = runtime.recorded["metrics"]["source_candidate_handoffs"]["dataset"]
     document = receipt["document"]
     if fault == "hash":
+        document["contract"] = storage.NAMED_ISOLATED_CONTRACT
+        document["identity"]["metadata"].update(
+            selected_resources=["Practitioner"], expected_resources=["Practitioner"]
+        )
         receipt["sha256"] = "0" * 64
     if fault == "root":
         document["identity"]["acquisition_root_run_id"] = "run_" + "d" * 32
@@ -533,3 +549,184 @@ async def test_publication_cannot_borrow_a_wildcard_acquisition_route(runtime, m
         await publication.admit_launch(runtime.native, request)
     assert (await workers.guarded_ensure_worker(_request()))["status"] == "failed"
     assert runtime.recorded == before and not runtime.calls
+
+
+@pytest.mark.parametrize("physical_drift", [False, True])
+async def test_legacy_publication_keeps_native_token_and_ignores_retired_coordinates(runtime, physical_drift):
+    receipt = runtime.recorded["metrics"]["source_candidate_handoffs"]["dataset"]
+    receipt["sha256"] = "7" * 64
+    if physical_drift:
+        document = receipt["document"]
+        document["storage"].update(database_oid=991, owner_oid=992, enrollment_sha256="0" * 64)
+        for table in document["tables"].values():
+            table.update(oid=993, owner=994, layout_sha256="0" * 64)
+        document["relationship_sha256"] = "5" * 64
+        document["admission"]["content_proof_admission_sha256"] = "6" * 64
+    before = deepcopy(runtime.recorded)
+    attempt, token, identity = publication._completed_proof(runtime.recorded)
+    assert attempt == runtime.recorded["progress"]["attempt_id"] and token == "7" * 64
+    assert identity == publication.original_job_identity(runtime.recorded)
+    assert (await workers.guarded_ensure_worker(_request()))["status"] == "started"
+    environment = runtime.jobs[0]["spec"]["template"]["spec"]["containers"][0]["env"]
+    assert next(entry["value"] for entry in environment if entry["name"] == publication.HANDOFF_ENV) == token
+    assert runtime.recorded == before
+
+
+@pytest.mark.parametrize("physical_drift", [False, True])
+async def test_named_publication_uses_strict_logical_digest_with_separate_raw_producer(runtime, physical_drift):
+    receipt = _receipt(_named_handoff())
+    runtime.recorded["metrics"]["source_candidate_handoffs"]["dataset"] = receipt
+    if physical_drift:
+        receipt["document"]["storage"].update(database_oid=999, owner_oid=998)
+        for table in receipt["document"]["tables"].values():
+            table.update(oid=997, owner=996)
+    before = deepcopy(runtime.recorded)
+    assert publication._completed_proof(runtime.recorded)[1] == receipt["sha256"]
+    assert (await workers.guarded_ensure_worker(_request()))["status"] == "started"
+    assert runtime.recorded == before
+
+
+@pytest.mark.parametrize("current_named", [False, True])
+@pytest.mark.parametrize("token", [None, True, [], "", "A" * 64, "g" * 64, "a" * 63, "a" * 65])
+async def test_publication_requires_a_closed_native_edition_token(runtime, current_named, token):
+    receipt = _receipt(_named_handoff() if current_named else _handoff())
+    receipt["sha256"] = token
+    runtime.recorded["metrics"]["source_candidate_handoffs"]["dataset"] = receipt
+    before = deepcopy(runtime.recorded)
+    with pytest.raises(ValueError, match="^fhir_source_publication_handoff_changed$"):
+        publication._completed_proof(runtime.recorded)
+    assert (await workers.guarded_ensure_worker(_request()))["status"] == "failed"
+    assert runtime.recorded == before and runtime.calls == []
+
+
+@pytest.mark.parametrize("field", ["dataset_hash", "resource_count", "root", "source", "table"])
+async def test_named_publication_refuses_logical_drift_without_a_new_digest(runtime, field):
+    receipt = _receipt(_named_handoff())
+    document = receipt["document"]
+    if field == "dataset_hash":
+        document["admission"]["dataset_hash"] = "8" * 64
+    elif field == "resource_count":
+        document["admission"]["resource_count"] += 1
+    elif field == "root":
+        document["identity"]["acquisition_root_run_id"] = "run_" + "d" * 32
+    elif field == "source":
+        document["identity"]["metadata"]["source_ids"] = ["other-source"]
+    else:
+        next(iter(document["tables"].values()))["name"] = "different_resource"
+    runtime.recorded["metrics"]["source_candidate_handoffs"]["dataset"] = receipt
+    with pytest.raises(ValueError, match="^fhir_source_publication_handoff_changed$"):
+        publication._completed_proof(runtime.recorded)
+    assert (await workers.guarded_ensure_worker(_request()))["status"] == "failed"
+    assert runtime.calls == []
+
+
+@pytest.mark.parametrize("damage", ["dataset_hash", "resource_count", "completion", "table_schema"])
+async def test_legacy_native_token_does_not_waive_logical_data_validation(runtime, damage):
+    receipt = runtime.recorded["metrics"]["source_candidate_handoffs"]["dataset"]
+    receipt["sha256"] = "7" * 64
+    document = receipt["document"]
+    if damage == "dataset_hash":
+        document["admission"]["dataset_hash"] = "invalid"
+    elif damage == "resource_count":
+        document["admission"]["resource_count"] = True
+    elif damage == "completion":
+        document["admission"]["completion_proof_required_version"] = 3
+    else:
+        next(iter(document["tables"].values()))["schema"] = "other_schema"
+    assert (await workers.guarded_ensure_worker(_request()))["status"] == "failed"
+    assert runtime.calls == []
+
+
+async def test_named_handoff_without_raw_producer_cannot_borrow_executor_provenance(runtime):
+    document = named_source_document(_named_handoff())
+    assert set(document["storage"]) == {"catalog_schema", "storage_schema"}
+    receipt = _receipt(document)
+    del receipt["producer"]
+    runtime.recorded["metrics"]["source_candidate_handoffs"]["dataset"] = receipt
+    before = deepcopy(runtime.recorded)
+    assert (await workers.guarded_ensure_worker(_request()))["status"] == "failed"
+    assert runtime.recorded == before and runtime.calls == []
+
+
+@pytest.mark.parametrize("valid_logical_digest", [False, True])
+async def test_rooted_handoff_retains_strict_digest_and_existing_scope_refusal(runtime, valid_logical_digest):
+    document = _handoff()
+    document["contract"] = "healthporta.provider-directory.rooted-candidate.v1"
+    receipt = _receipt(document)
+    if not valid_logical_digest:
+        receipt["sha256"] = "7" * 64
+    runtime.recorded["metrics"]["source_candidate_handoffs"]["dataset"] = receipt
+    reason = "isolated_storage_required" if valid_logical_digest else "handoff_changed"
+    with pytest.raises(ValueError, match=reason):
+        publication._completed_proof(runtime.recorded)
+    assert (await workers.guarded_ensure_worker(_request()))["status"] == "failed"
+    assert runtime.calls == []
+
+
+@pytest.mark.parametrize(
+    "producer",
+    [None, [], ["a" * 40], ["not-a-commit", "sha256:" + "a" * 64], ["a" * 40, "tag"], ["a" * 40, "sha256:" + "g" * 64]],
+)
+@pytest.mark.parametrize("stored_before_upgrade", [False, True])
+async def test_named_logical_digest_does_not_replace_raw_producer_validation(runtime, producer, stored_before_upgrade):
+    document = _named_handoff()
+    if stored_before_upgrade:
+        document["storage"]["producer"] = producer
+    receipt = _receipt(document)
+    if not stored_before_upgrade:
+        receipt["producer"] = producer
+    runtime.recorded["metrics"]["source_candidate_handoffs"]["dataset"] = receipt
+    before = deepcopy(runtime.recorded)
+    assert (await workers.guarded_ensure_worker(_request()))["status"] == "failed"
+    assert runtime.recorded == before and runtime.calls == []
+
+
+async def test_publication_admits_the_receipt_recorded_by_acquisition(runtime, monkeypatch):
+    from process import provider_directory_generic_source_completion as completion
+    from process import provider_directory_generic_source_policy as policy
+    from process.provider_directory_source_storage_binding import FHIRSourceCandidateHandoff
+    from tests.test_provider_directory_generic_source_policy import _named_factory
+
+    document = _named_handoff()
+    handoff = FHIRSourceCandidateHandoff(storage._encoded(document))
+
+    @asynccontextmanager
+    async def transaction(*args, **kwargs):
+        yield SimpleNamespace(connection=object(), policy=object())
+
+    monkeypatch.setattr(policy, "source_transaction", transaction)
+    monkeypatch.setattr(completion, "source_owner_transaction", transaction)
+    monkeypatch.setattr(completion.storage, "candidate_identity", lambda *_: document["identity"])
+    monkeypatch.setattr(completion.storage, "_locked", AsyncMock(return_value=document))
+    monkeypatch.setattr(completion, "prepare_generic_source_handoff", AsyncMock(return_value=handoff))
+    handoffs_by_dataset = {}
+    async with policy.bind_generic_source_transaction_factory(_named_factory()):
+        await completion.record_candidate_handoff(
+            SimpleNamespace(db=object()), SimpleNamespace(dataset_id="dataset"), handoffs_by_dataset
+        )
+    assert set(handoffs_by_dataset["dataset"]) == {"document", "sha256", "producer"}
+    runtime.recorded["metrics"]["source_candidate_handoffs"] = handoffs_by_dataset
+    assert (await workers.guarded_ensure_worker(_request()))["status"] == "started"
+    environment = runtime.jobs[0]["spec"]["template"]["spec"]["containers"][0]["env"]
+    token = next(entry["value"] for entry in environment if entry["name"] == publication.HANDOFF_ENV)
+    assert token == handoff.document_sha256 == handoffs_by_dataset["dataset"]["sha256"]
+
+
+async def test_named_receipt_stored_before_upgrade_keeps_its_raw_digest(runtime):
+    document = _named_handoff()
+    document["storage"]["producer"] = ["a" * 40, "sha256:" + "a" * 64]
+    receipt = _receipt(document)
+    assert set(receipt) == {"document", "sha256"}
+    runtime.recorded["metrics"]["source_candidate_handoffs"]["dataset"] = receipt
+    assert publication._completed_proof(runtime.recorded)[1] == receipt["sha256"]
+    assert (await workers.guarded_ensure_worker(_request()))["status"] == "started"
+
+
+async def test_publication_refuses_a_producer_recorded_twice(runtime):
+    document = _named_handoff()
+    document["storage"]["producer"] = ["a" * 40, "sha256:" + "a" * 64]
+    receipt_by_field = {**_receipt(document), "producer": ["a" * 40, "sha256:" + "a" * 64]}
+    runtime.recorded["metrics"]["source_candidate_handoffs"]["dataset"] = receipt_by_field
+    with pytest.raises(ValueError, match="^fhir_source_publication_handoff_invalid$"):
+        publication._completed_proof(runtime.recorded)
+    assert (await workers.guarded_ensure_worker(_request()))["status"] == "failed" and runtime.calls == []

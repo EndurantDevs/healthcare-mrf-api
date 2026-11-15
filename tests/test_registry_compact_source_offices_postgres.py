@@ -9,6 +9,7 @@ import pytest
 from api.network_address_scope import network_address_read_scope
 from api.network_compact_address import compact_address_native_sql
 from api.network_provider_only_read import read_network_provider_only_page
+from process.network_compact_layout import CompactAddressRelation
 from process.network_membership_pipeline import prepare_and_publish_network_candidate, prepare_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_composition import (
@@ -188,6 +189,12 @@ async def _assert_rotated_rebind(context, manifest, monkeypatch):
     original_network = context.reviewed[2][0]["record_id"]
     expected = await _read_generation(context, manifest, original_network)
     await _rotate(context, monkeypatch, old_key="a" * 64, new_key="c" * 64)
+    # Rotation moves the pinned generation's heap to its retained name; resolve that same generation again.
+    fixture = context.fixture
+    async with fixture.execution_connection.transaction(isolation="repeatable_read", readonly=True):
+        manifest = await resolve_network_serving_manifest(
+            fixture.execution_connection, generation_id=manifest.generation_id, control_schema=fixture.control_schema
+        )
     revision = await _rebind(context)
     second = await _compose(context, revision, manifest)
     candidate_by_field, summary = await _assert_summary(context, second, 4)
@@ -203,7 +210,8 @@ async def _assert_rotated_rebind(context, manifest, monkeypatch):
         == 0
     )
     current = await _publish(context, second)
-    assert current.compact_layout.base.table_oid == manifest.compact_layout.base.table_oid
+    # The successor reuses the heap rotation retained for the original generation, by its recorded name.
+    assert current.compact_layout.base.table_name == context.address.descriptor["retained_table"]["table_name"]
     assert "entity_address_unified_retained_" in current.compact_layout.base.table_name
     assert await _read_generation(context, manifest, original_network) == expected
     await _read_generation(context, current, context.reviewed[2][1]["record_id"])
@@ -215,6 +223,6 @@ async def test_first_compact_cms_source_offices_have_independent_correspondence(
     await _assert_summary(context, first, 4)
     await _wrong_office_refusal(context, first)
     manifest = await _publish(context, first)
-    assert manifest.compact_layout.base.table_oid == context.address.descriptor["table"]["oid"]
+    assert manifest.compact_layout.base == CompactAddressRelation(**context.address.descriptor["table"])
     assert manifest.compact_layout.custom is None
     await _assert_rotated_rebind(context, manifest, monkeypatch)

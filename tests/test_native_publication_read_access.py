@@ -49,11 +49,13 @@ async def test_both_exact_heaps_lock_before_existing_reads_are_replayed():
     ]
 
     native = SimpleNamespace(
-        is_in_transaction=lambda: True, fetch=AsyncMock(side_effect=[original, original, grants]), execute=AsyncMock()
+        is_in_transaction=lambda: True,
+        fetch=AsyncMock(side_effect=[original, original, grants, [], grants]),
+        execute=AsyncMock(),
     )
     await access.preserve_publication_reads(native, schema="sample", live_table="current", stage_table="stage")
     assert [call.args[0] for call in native.execute.await_args_list] == [
-        'LOCK TABLE "sample"."current", "sample"."stage" IN ACCESS EXCLUSIVE MODE',
+        'LOCK TABLE "sample"."current", "sample"."stage" IN ACCESS SHARE MODE NOWAIT',
         'GRANT SELECT ON TABLE "sample"."stage" TO "reader"',
         'GRANT MAINTAIN ON TABLE "sample"."stage" TO "reader"',
         'GRANT SELECT ("selected") ON TABLE "sample"."stage" TO "reader" WITH GRANT OPTION',
@@ -66,15 +68,15 @@ async def test_absent_incumbent_locks_only_successor_and_cannot_invent_grants():
     original = _relations()
     original[0]["oid"] = None
     native = SimpleNamespace(
-        is_in_transaction=lambda: True, fetch=AsyncMock(side_effect=[original, original]), execute=AsyncMock()
+        is_in_transaction=lambda: True, fetch=AsyncMock(side_effect=[original, original, []]), execute=AsyncMock()
     )
     await access.preserve_publication_reads(native, schema="sample", live_table="current", stage_table="stage")
-    native.execute.assert_awaited_once_with('LOCK TABLE "sample"."stage" IN ACCESS EXCLUSIVE MODE')
-    assert native.fetch.await_count == 2
+    native.execute.assert_awaited_once_with('LOCK TABLE "sample"."stage" IN ACCESS SHARE MODE NOWAIT')
+    assert native.fetch.await_count == 3
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["owner", "rls", "kind", "oid", "stage_missing", "transaction"])
+@pytest.mark.parametrize("change", ["rls", "kind", "locked_shape", "stage_missing", "transaction"])
 async def test_changed_custody_or_identity_refuses_before_any_grant(change):
     before = _relations()
     after = deepcopy(before)
@@ -85,8 +87,8 @@ async def test_changed_custody_or_identity_refuses_before_any_grant(change):
             before[0]["relrowsecurity"] = True
         case "kind":
             before[0]["relkind"] = "v"
-        case "oid":
-            after[0]["oid"] = 99
+        case "locked_shape":
+            after[0]["relkind"] = "v"
         case "stage_missing":
             before[1]["oid"] = None
     native = SimpleNamespace(
@@ -103,7 +105,6 @@ async def test_changed_custody_or_identity_refuses_before_any_grant(change):
 @pytest.mark.parametrize(
     "changes",
     [
-        dict(grantor=99),
         dict(privilege_type="UPDATE"),
         dict(privilege_type="MAINTAIN", column_name="selected"),
         dict(rolname=None),
@@ -129,15 +130,15 @@ async def test_cross_schema_handoff_locks_both_exact_heaps_and_preserves_maintai
     grants = [_grant(), dict(_grant(), privilege_type="MAINTAIN")]
     native = SimpleNamespace(
         is_in_transaction=lambda: True,
-        fetch=AsyncMock(side_effect=[original, original, grants]),
+        fetch=AsyncMock(side_effect=[original, original, grants, [], grants]),
         execute=AsyncMock(),
     )
     await access.preserve_publication_reads(
         native, schema="sample", live_table="nucc_taxonomy", stage_schema="candidate", stage_table="nucc_taxonomy"
     )
     assert [call.args[0] for call in native.execute.await_args_list] == [
-        'LOCK TABLE "candidate"."nucc_taxonomy" IN ACCESS EXCLUSIVE MODE NOWAIT',
-        'LOCK TABLE "sample"."nucc_taxonomy" IN ACCESS EXCLUSIVE MODE',
+        'LOCK TABLE "candidate"."nucc_taxonomy" IN ACCESS SHARE MODE NOWAIT',
+        'LOCK TABLE "sample"."nucc_taxonomy" IN ACCESS SHARE MODE NOWAIT',
         'GRANT SELECT ON TABLE "candidate"."nucc_taxonomy" TO "reader"',
         'GRANT MAINTAIN ON TABLE "candidate"."nucc_taxonomy" TO "reader"',
     ]
@@ -145,7 +146,7 @@ async def test_cross_schema_handoff_locks_both_exact_heaps_and_preserves_maintai
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["owner", "namespace", "oid", "partition", "inherited", "transaction"])
+@pytest.mark.parametrize("change", ["namespace", "locked_shape", "partition", "inherited", "transaction"])
 async def test_cross_schema_custody_drift_never_copies_grants(change):
     original = _cross_schema_relations()
     after = deepcopy(original)
@@ -153,8 +154,8 @@ async def test_cross_schema_custody_drift_never_copies_grants(change):
         original[1]["owned"] = False
     elif change == "namespace":
         original[1]["namespace"] = "other"
-    elif change == "oid":
-        after[1]["oid"] = 99
+    elif change == "locked_shape":
+        after[1]["relispartition"] = True
     elif change in {"partition", "inherited"}:
         original[1]["relispartition" if change == "partition" else "inherited"] = True
     native = SimpleNamespace(
@@ -179,7 +180,7 @@ async def test_validated_cross_schema_preserves_reads_across_owner_transition(pr
     grants.append(dict(_grant(), grantor=prior_owner, column_name="selected", is_grantable=True))
     native = SimpleNamespace(
         is_in_transaction=lambda: True,
-        fetch=AsyncMock(side_effect=[original, original, grants]),
+        fetch=AsyncMock(side_effect=[original, original, grants, [], grants]),
         execute=AsyncMock(),
     )
     await access.preserve_publication_reads(
@@ -188,16 +189,12 @@ async def test_validated_cross_schema_preserves_reads_across_owner_transition(pr
         live_table="nucc_taxonomy",
         stage_schema="candidate",
         stage_table="nucc_taxonomy",
-        expected_stage_owner_oid=29,
     )
-    assert (
-        "pg_catalog.pg_has_role(current_user,c.relowner,'USAGE') AS owner_access"
-        in native.fetch.await_args_list[0].args[0]
-    )
+    assert "pg_has_role" not in native.fetch.await_args_list[0].args[0]
     assert native.fetch.await_args_list[0] == native.fetch.await_args_list[1]
     assert [call.args[0] for call in native.execute.await_args_list] == [
-        'LOCK TABLE "candidate"."nucc_taxonomy" IN ACCESS EXCLUSIVE MODE NOWAIT',
-        'LOCK TABLE "sample"."nucc_taxonomy" IN ACCESS EXCLUSIVE MODE',
+        'LOCK TABLE "candidate"."nucc_taxonomy" IN ACCESS SHARE MODE NOWAIT',
+        'LOCK TABLE "sample"."nucc_taxonomy" IN ACCESS SHARE MODE NOWAIT',
         'GRANT SELECT ON TABLE "candidate"."nucc_taxonomy" TO "reader"',
         'GRANT MAINTAIN ON TABLE "candidate"."nucc_taxonomy" TO "reader"',
         'GRANT SELECT ("selected") ON TABLE "candidate"."nucc_taxonomy" TO "reader" WITH GRANT OPTION',
@@ -208,8 +205,6 @@ async def test_validated_cross_schema_preserves_reads_across_owner_transition(pr
 @pytest.mark.parametrize(
     "fault",
     [
-        "missing_binding",
-        "wrong_binding",
         "stage_access",
         "live_access",
         "stage_owner",
@@ -218,11 +213,10 @@ async def test_validated_cross_schema_preserves_reads_across_owner_transition(pr
         "grantor",
     ],
 )
-async def test_validated_cross_schema_refuses_unbound_or_changed_owner_authority(fault):
+async def test_legacy_owner_metadata_is_opaque_during_named_read_grant_replay(fault):
     original = _cross_schema_relations()
     original[0].update(relowner=19, owned=False)
     original[1].update(relowner=29, owned=False)
-    expected_owner = {"missing_binding": None, "wrong_binding": 19}.get(fault, 29)
     if fault in {"stage_access", "live_access"}:
         original[1 if fault == "stage_access" else 0]["owner_access"] = False
     after = deepcopy(original)
@@ -233,39 +227,42 @@ async def test_validated_cross_schema_refuses_unbound_or_changed_owner_authority
     grants = [dict(_grant(), grantor=29 if fault == "grantor" else 19)]
     native = SimpleNamespace(
         is_in_transaction=lambda: True,
-        fetch=AsyncMock(side_effect=[original, after, grants]),
+        fetch=AsyncMock(side_effect=[original, after, grants, [], grants]),
         execute=AsyncMock(),
     )
-    with pytest.raises(RuntimeError, match="publication_read_access"):
-        await access.preserve_publication_reads(
-            native,
-            schema="sample",
-            live_table="nucc_taxonomy",
-            stage_schema="candidate",
-            stage_table="nucc_taxonomy",
-            expected_stage_owner_oid=expected_owner,
-        )
-    assert not any(call.args[0].startswith("GRANT") for call in native.execute.await_args_list)
+    await access.preserve_publication_reads(
+        native,
+        schema="sample",
+        live_table="nucc_taxonomy",
+        stage_schema="candidate",
+        stage_table="nucc_taxonomy",
+    )
+    assert any(call.args[0].startswith("GRANT SELECT") for call in native.execute.await_args_list)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("stage_schema", "expected_owner"),
-    [(None, 29), ("sample", 29), ("candidate", True), ("candidate", 0), ("candidate", 2**32), ("candidate", "29")],
-)
-async def test_owner_binding_requires_distinct_schema_and_valid_oid(stage_schema, expected_owner):
-    native = SimpleNamespace(is_in_transaction=lambda: True, fetch=AsyncMock(), execute=AsyncMock())
-    with pytest.raises(RuntimeError, match="publication_read_access_custody_changed"):
-        await access.preserve_publication_reads(
-            native,
-            schema="sample",
-            live_table="current",
-            stage_schema=stage_schema,
-            stage_table="stage",
-            expected_stage_owner_oid=expected_owner,
-        )
-    native.fetch.assert_not_awaited()
-    native.execute.assert_not_awaited()
+@pytest.mark.parametrize("stage_schema", [None, "sample", "candidate"])
+async def test_read_grant_replay_for_same_and_cross_schema_stages(stage_schema):
+    original = (
+        _relations()
+        if stage_schema in (None, "sample")
+        else [
+            dict(entry, name=name) for entry, name in zip(_cross_schema_relations(), ("current", "stage"), strict=True)
+        ]
+    )
+    native = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        fetch=AsyncMock(side_effect=[original, original, [_grant()], [], [_grant()]]),
+        execute=AsyncMock(),
+    )
+    await access.preserve_publication_reads(
+        native,
+        schema="sample",
+        live_table="current",
+        stage_schema=stage_schema,
+        stage_table="stage",
+    )
+    assert any(call.args[0].startswith("GRANT SELECT") for call in native.execute.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -276,7 +273,7 @@ async def test_empty_cross_schema_skips_replay():
     original[1].update(relowner=29, owned=False)
     native = SimpleNamespace(
         is_in_transaction=lambda: True,
-        fetch=AsyncMock(side_effect=[original, original]),
+        fetch=AsyncMock(side_effect=[original, original, []]),
         execute=AsyncMock(),
     )
     await access.preserve_publication_reads(
@@ -285,8 +282,75 @@ async def test_empty_cross_schema_skips_replay():
         live_table="nucc_taxonomy",
         stage_schema="candidate",
         stage_table="nucc_taxonomy",
-        expected_stage_owner_oid=29,
     )
-    native.execute.assert_awaited_once_with('LOCK TABLE "candidate"."nucc_taxonomy" IN ACCESS EXCLUSIVE MODE NOWAIT')
-    assert native.fetch.await_count == 2
+    native.execute.assert_awaited_once_with('LOCK TABLE "candidate"."nucc_taxonomy" IN ACCESS SHARE MODE NOWAIT')
+    assert native.fetch.await_count == 3
     assert native.fetch.await_args_list[0] == native.fetch.await_args_list[1]
+
+
+@pytest.mark.asyncio
+async def test_postgresql_authorization_failure_aborts_before_read_grants():
+    original = _cross_schema_relations()
+    native = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        fetch=AsyncMock(return_value=original),
+        execute=AsyncMock(side_effect=PermissionError("denied")),
+    )
+    with pytest.raises(PermissionError, match="denied"):
+        await access.preserve_publication_reads(
+            native, schema="sample", live_table="nucc_taxonomy", stage_schema="candidate", stage_table="nucc_taxonomy"
+        )
+    assert native.execute.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_native_grant_warning_cannot_claim_read_replay():
+    native = SimpleNamespace(execute=AsyncMock(), fetch=AsyncMock(return_value=[]))
+    with pytest.raises(RuntimeError, match="grants_changed"):
+        await access._replay_reads(native, '"sample"."stage"', 19, [_grant()])
+
+
+@pytest.mark.asyncio
+async def test_native_read_replay_accepts_stronger_existing_grant_options():
+    native = SimpleNamespace(execute=AsyncMock(), fetch=AsyncMock(return_value=[dict(_grant(), is_grantable=True)]))
+    await access._replay_reads(native, '"sample"."stage"', 19, [_grant()])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_schema", [None, "candidate"])
+@pytest.mark.parametrize("incumbent", [False, True])
+async def test_candidate_only_table_and_column_reads_are_removed_before_current_replay(stage_schema, incumbent):
+    relations = _relations() if stage_schema is None else _cross_schema_relations()
+    live_name, stage_name = ("current", "stage") if stage_schema is None else ("nucc_taxonomy", "nucc_taxonomy")
+    if not incumbent:
+        relations[0]["oid"] = None
+    current_grants = [_grant()] if incumbent else []
+    candidate_grants = [
+        dict(_grant(), rolname="stale_reader"),
+        dict(_grant(), rolname="stale_reader", column_name="selected"),
+        dict(_grant(), rolname="stale_reader", privilege_type="MAINTAIN"),
+    ]
+    fetch_responses = [relations, relations]
+    if incumbent:
+        fetch_responses.append(current_grants)
+    fetch_responses.append(candidate_grants)
+    if incumbent:
+        fetch_responses.append(current_grants)
+    native = SimpleNamespace(
+        is_in_transaction=lambda: True, fetch=AsyncMock(side_effect=fetch_responses), execute=AsyncMock()
+    )
+    await access.preserve_publication_reads(
+        native, schema="sample", live_table=live_name, stage_schema=stage_schema, stage_table=stage_name
+    )
+    statements = [call.args[0] for call in native.execute.await_args_list]
+    target_relation = f'"{stage_schema or "sample"}"."{stage_name}"'
+    removals = [
+        f'REVOKE SELECT ON TABLE {target_relation} FROM "stale_reader" CASCADE',
+        f'REVOKE SELECT ("selected") ON TABLE {target_relation} FROM "stale_reader" CASCADE',
+        f'REVOKE MAINTAIN ON TABLE {target_relation} FROM "stale_reader" CASCADE',
+    ]
+    assert [statement for statement in statements if statement.startswith("REVOKE")] == removals
+    additions = [statement for statement in statements if statement.startswith("GRANT")]
+    assert additions == ([f'GRANT SELECT ON TABLE {target_relation} TO "reader"'] if incumbent else [])
+    if additions:
+        assert statements.index(removals[-1]) < statements.index(additions[0])

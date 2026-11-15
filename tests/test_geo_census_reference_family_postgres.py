@@ -160,7 +160,7 @@ async def _census_activation_binding(sessions, live, stage, manifest, ownership)
         "manifest": manifest,
         "expected_incumbent": incumbent,
         "validation_receipt": validation,
-        "cutover": archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, owner, owner, "manual"),
+        "cutover": archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, "manual"),
     }
     return activation_by_field, initial
 

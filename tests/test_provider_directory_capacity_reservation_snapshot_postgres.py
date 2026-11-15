@@ -3,16 +3,16 @@
 
 import asyncio
 import datetime
-import json
 import importlib.util
-from pathlib import Path
-from alembic.migration import MigrationContext
-from alembic.operations import Operations
+import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from sqlalchemy import MetaData, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -25,7 +25,11 @@ from db.models.system import (
 from process import provider_directory_capacity_reservation_snapshot as snapshot
 from tests.cms_npd_admission_postgres_support import _database_url
 from tests.test_provider_directory_capacity_reservation_snapshot import (
-    RUN_ID, _consumption, _initial_envelope, _preflight, _run,
+    RUN_ID,
+    _consumption,
+    _initial_envelope,
+    _preflight,
+    _run,
 )
 from tests.test_provider_directory_profile_capacity_attestation import _signed_envelope
 
@@ -33,18 +37,12 @@ from tests.test_provider_directory_profile_capacity_attestation import _signed_e
 def _install_cleanup_claim(connection):
     """Install the real immutable cleanup ledger in this isolated fixture schema."""
     directory = Path(__file__).resolve().parents[1] / "alembic/versions"
-    for name in ("20260930140000_cms_capacity_preflight_receipt.py", "20261001100000_profile_failed_cleanup_claim.py",
-                 "20261001110000_profile_initial_publication.py"):
-        spec = importlib.util.spec_from_file_location("snapshot_" + name[:-3], directory / name)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        with Operations.context(MigrationContext.configure(connection)):
-            if name == "20261001110000_profile_initial_publication.py":
-                schema = module._PREVIOUS._locked_schema()
-                module._PREVIOUS._assert_exact_check(schema, module._PREVIOUS._cms_values_check())
-                module._PREVIOUS._replace_check(schema, module._initial_preflight_check())
-            else:
-                module.upgrade()
+    name = "20261001100000_profile_failed_cleanup_claim.py"
+    spec = importlib.util.spec_from_file_location("snapshot_" + name[:-3], directory / name)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with Operations.context(MigrationContext.configure(connection)):
+        module.upgrade()
 
 
 @asynccontextmanager
@@ -88,7 +86,7 @@ async def _fixture(monkeypatch, session_type=AsyncSession):
             await connection.execute(
                 text(f"""CREATE TABLE {fhir._provider_directory_profile_checkpoint_ref(schema)} (
                 build_id text,owner_run_id text,state text,evidence_stage text,profile_stage text,
-                evidence_stage_oid bigint,profile_stage_oid bigint,affected_npi_stage text,affected_npi_stage_oid bigint
+                affected_npi_stage text
             )""")
             )
         yield fhir, engine, tables_by_name
@@ -106,7 +104,7 @@ def _pinned_snapshot_session(pinned, resume, settings):
     class SnapshotSession(AsyncSession):
         async def execute(self, statement, *args, **kwargs):
             result = await super().execute(statement, *args, **kwargs)
-            if "pg_current_snapshot()" in str(statement):
+            if "transaction_timestamp() AS observed_at" in str(statement):
                 settings.append(
                     (
                         await super().execute(
@@ -137,8 +135,9 @@ async def test_native_initial_receipt_is_visible_in_migrated_snapshot(monkeypatc
             receipt = _preflight(envelope)
             receipt["receipt_json"] = json.loads(receipt["receipt_json"])
             if state == "consumed":
-                receipt.update(consumed_at=now, consumed_run_id=RUN_ID,
-                               consumed_attestation_id=envelope["lease"]["attestation_id"])
+                receipt.update(
+                    consumed_at=now, consumed_run_id=RUN_ID, consumed_attestation_id=envelope["lease"]["attestation_id"]
+                )
             await connection.execute(
                 tables[ProviderDirectoryProfileCapacityPreflightReceipt.__tablename__].insert().values(**receipt)
             )
@@ -195,33 +194,31 @@ async def test_native_snapshot_cannot_mix_pending_and_consumed_transactions(monk
         assert len(after["reservations"]) == len(after["owners"]) == 1
         assert after["preflight_receipts"][0]["record"]["consumed_at"] == consumption["accepted_at"].isoformat()
         assert after["reservations"][0]["envelope"] == envelope
-        assert after["database_binding"]["database_name"] == engine.url.database
+        assert before["schema"] == after["schema"] == fhir._schema()
         assert all(tuple(setting_row) == ("repeatable read", "on", "64MB", "30s", "0") for setting_row in settings)
         assert before["capacity_complete"] is after["capacity_complete"] is False
 
 
 @pytest.mark.asyncio
-async def test_native_stage_oid_observation_and_nested_transaction_refusal(monkeypatch):
+async def test_native_named_stage_observation_and_nested_transaction_refusal(monkeypatch):
     async with _fixture(monkeypatch) as (fhir, engine, _):
         schema = fhir._schema()
         original = fhir._unscoped_qt(schema, "original_stage")
         async with engine.begin() as connection:
             await connection.execute(text(f"CREATE TABLE {original} (value int)"))
-            oid = (
-                await connection.execute(text("SELECT to_regclass(:name)::oid::bigint"), {"name": original})
-            ).scalar_one()
             await connection.execute(
                 text(f"""INSERT INTO {fhir._provider_directory_profile_checkpoint_ref(schema)}
-                (build_id,owner_run_id,state,evidence_stage,evidence_stage_oid)
-                VALUES ('build',:run,'failed','original_stage',:oid)
+                (build_id,owner_run_id,state,evidence_stage)
+                VALUES ('build',:run,'failed','original_stage')
             """),
-                {"run": RUN_ID, "oid": oid},
+                {"run": RUN_ID},
             )
             await connection.execute(text(f"ALTER TABLE {original} RENAME TO published_relation"))
         result = await snapshot.capacity_reservation_snapshot(fhir)
         stage = result["profile_stage_observations"][0]
-        assert stage["expected_oid"] == oid and stage["current_name_oid"] is None
-        assert stage["expected_oid_current_name"] == "published_relation"
+        assert stage["schema"] == schema and stage["stage_name"] == "original_stage"
+        assert stage["relation_kind"] is stage["persistence"] is None
+        assert await fhir.db.scalar("SELECT to_regclass(:name) IS NOT NULL", name=f"{schema}.published_relation")
         assert result["release_proof_available"] is False
         assert datetime.datetime.fromisoformat(result["observed_at"]).tzinfo is not None
         async with fhir.db.transaction():

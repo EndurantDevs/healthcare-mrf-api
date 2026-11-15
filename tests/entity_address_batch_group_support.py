@@ -42,7 +42,11 @@ async def group_database(monkeypatch):
             pin("other", "endpoint-b", "dataset-b", "hash-b", "run-b"),
         )
         inputs = preparation.ProviderDirectoryAddressPreparationInput(
-            pins, "desired_overlay", 1, 0, semantic_as_of="2026-01-03", ordinary_serving_peer_pins=(pins[2],)
+            dataset_pins=pins,
+            overlay_table="desired_overlay",
+            address_alias_generation=0,
+            semantic_as_of="2026-01-03",
+            ordinary_serving_peer_pins=(pins[2],),
         )
         token = preparation._PREPARATION.set(inputs)
         try:

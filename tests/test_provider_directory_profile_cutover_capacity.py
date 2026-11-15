@@ -13,6 +13,7 @@ from process import provider_directory_profile_capacity as capacity
 from tests.test_provider_directory_profile_capacity import _geometry_payload
 from tests.test_provider_directory_profile_capacity_projection import _projection_geometry
 
+
 def _cutover_target_projection(geometry):
     """Project one evidence insert and one no-op profile target."""
     target_inputs = (
@@ -75,51 +76,18 @@ def _cutover_metadata_projection(geometry):
     )
 
 
-def _metadata_layout_by_field(fingerprint: str, oid: int) -> dict[str, object]:
-    """Return one exact metadata relation layout."""
-    return {
-        "exact_fingerprint": fingerprint,
-        "main_index_oids": [oid],
-        "main_index_pages": [1],
-        "toast_index_oids": [oid + 1],
-        "toast_index_pages": [1],
-        "deleted_toast_chunks": 0,
-    }
-
-
 def _cutover_layout_by_name(geometry) -> dict[str, dict[str, object]]:
-    """Return exact target and metadata layouts keyed by relation role."""
-    evidence_target_by_field = {
-        "exact_fingerprint": (
-            geometry.evidence_target_storage_fingerprint
-        ),
-        "main_index_oids": [1],
-        "main_index_pages": [1],
-        "toast_index_oids": [2],
-        "toast_index_pages": [1],
-        "inserted_toast_chunks": 0,
-        "deleted_toast_chunks": 0,
-    }
-    profile_target_by_field = {
-        **evidence_target_by_field,
-        "exact_fingerprint": (
-            geometry.profile_target_storage_fingerprint
-        ),
-        "main_index_oids": [3],
-        "toast_index_oids": [4],
-    }
+    """Retain named target coordinates and all numeric replay formula inputs."""
     return {
-        "evidence_target": evidence_target_by_field,
-        "profile_target": profile_target_by_field,
-        "build_checkpoint": _metadata_layout_by_field(
-            geometry.build_checkpoint_storage_fingerprint, 5
-        ),
-        "serving_generation": _metadata_layout_by_field(
-            geometry.serving_generation_storage_fingerprint, 7
-        ),
-        "delta_receipt": _metadata_layout_by_field(
-            geometry.delta_receipt_storage_fingerprint, 9
-        ),
+        role: {
+            "schema": geometry.relations[role]["schema"],
+            "name": geometry.relations[role]["name"],
+            "main_index_pages": [1],
+            "toast_index_pages": [1],
+            "deleted_toast_chunks": 0,
+            **({"inserted_toast_chunks": 0} if role.endswith("_target") else {}),
+        }
+        for role in ("evidence_target", "profile_target", "build_checkpoint", "serving_generation", "delta_receipt")
     }
 
 
@@ -195,9 +163,7 @@ def _cutover_evidence_fixture():
 
 
 def test_cutover_replay_recomputes_target_and_metadata_formulas():
-    geometry, forecast, actual, forecast_hash = (
-        _cutover_evidence_fixture()
-    )
+    geometry, forecast, actual, forecast_hash = _cutover_evidence_fixture()
 
     capacity.validate_profile_delta_cutover_evidence(
         geometry,
@@ -215,15 +181,11 @@ def test_cutover_replay_recomputes_target_and_metadata_formulas():
 
 @pytest.mark.parametrize("tamper", ["target", "metadata"])
 def test_cutover_replay_rejects_self_consistent_underforecast(tamper):
-    geometry, forecast, actual, forecast_hash = (
-        _cutover_evidence_fixture()
-    )
+    geometry, forecast, actual, forecast_hash = _cutover_evidence_fixture()
     tampered_forecast = copy.deepcopy(forecast)
     tampered_actual = copy.deepcopy(actual)
     if tamper == "target":
-        evidence_projection = tampered_forecast["target_projection"][
-            "targets"
-        ][0]
+        evidence_projection = tampered_forecast["target_projection"]["targets"][0]
         evidence_projection["target_growth_bytes"] = 0
         evidence_projection["wal_bytes"] = 0
         tampered_forecast["target_projection"]["target_data_bytes"] = 0
@@ -271,6 +233,32 @@ def test_geometry_rejects_unproved_postgres_storage_abi(overrides):
         capacity.ProviderDirectoryProfileCapacityError,
         match="postgres_storage_abi_unsupported",
     ):
-        capacity.validated_capacity_geometry(
-            _geometry_payload(**overrides)
+        capacity.validated_capacity_geometry(_geometry_payload(**overrides))
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"schema": "other"},
+        {"name": "other"},
+        {"main_index_pages": [0]},
+        {"main_index_pages": []},
+        {"exact_fingerprint": "a" * 64},
+    ],
+)
+def test_current_cutover_replay_refuses_wrong_target_or_invalid_numeric_layout(change):
+    geometry, forecast, actual, forecast_hash = _cutover_evidence_fixture()
+    forecast["evidence_target_layout"].update(change)
+    with pytest.raises(capacity.ProviderDirectoryProfileCapacityError):
+        capacity.validate_profile_delta_cutover_evidence(
+            geometry,
+            forecast,
+            actual,
+            build_id=forecast["build_id"],
+            run_id=forecast["run_id"],
+            forecast_hash=forecast_hash,
+            evidence_inserted=1,
+            evidence_deleted=0,
+            profile_inserted=0,
+            profile_deleted=0,
         )

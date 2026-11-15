@@ -4,10 +4,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 import pytest
 
+from process import provider_directory_generic_source_storage as source_storage
 from process.provider_directory_fhir_census_binding import (
     current_version_census_count_url,
 )
@@ -16,9 +19,11 @@ from process.provider_directory_fhir_census_execution import (
     CURRENT_VERSION_CENSUS_RETRYABLE_ERROR,
     current_version_census_proof_identity,
 )
-from process.provider_directory_generic_source_policy import source_transaction
+from process.provider_directory_generic_candidate import GenericCandidateError
+from process.provider_directory_generic_source_policy import source_owner_transaction, source_transaction
 from tests.provider_directory_current_census_postgres_support import (
     CUTOFF,
+    DATASET_ID,
     ENDPOINT_ID,
     NEXT_URL,
     RESOURCE_TYPE,
@@ -253,6 +258,89 @@ async def test_postgres_resumes_transient_exact_census_failure(
             count_url,
             contract,
         )
+
+
+async def _stored_binding(database: Any, schema: str) -> dict[str, Any]:
+    async with source_transaction(database), source_owner_transaction(database) as publisher:
+        stored = await publisher.connection.fetchval(
+            f'SELECT candidate_storage_json FROM "{schema}".{source_storage.HEADER} WHERE dataset_id=$1', DATASET_ID
+        )
+    return json.loads(stored) if isinstance(stored, str) else stored
+
+
+async def _store_pre_upgrade_binding(database: Any, schema: str, *, is_tampered: bool = False) -> dict[str, Any]:
+    """Rewrite the committed binding exactly as the previous shared-schema writer stored it."""
+    async with source_transaction(database), source_owner_transaction(database) as publisher:
+        connection = publisher.connection
+        stored = await connection.fetchval(
+            f'SELECT candidate_storage_json FROM "{schema}".{source_storage.HEADER} WHERE dataset_id=$1', DATASET_ID
+        )
+        binding_by_field = json.loads(stored) if isinstance(stored, str) else stored
+        legacy_table_by_root = {}
+        for root, table in binding_by_field["tables"].items():
+            relation_oid, owner_oid = await connection.fetchrow(
+                "SELECT oid::bigint,relowner::bigint FROM pg_class WHERE oid=to_regclass($1)",
+                f'"{table["schema"]}"."{table["name"]}"',
+            )
+            legacy_table_by_root[root] = {
+                "name": table["name"],
+                "oid": relation_oid,
+                "owner": owner_oid,
+                "layout_sha256": hashlib.sha256(table["name"].encode()).hexdigest(),
+            }
+        if is_tampered:
+            legacy_table_by_root["resource_input"]["name"] = legacy_table_by_root["witness_input"]["name"]
+        binding_by_field["tables"] = legacy_table_by_root
+        await connection.execute(
+            f'UPDATE "{schema}".{source_storage.HEADER} SET candidate_storage_json=$2::jsonb WHERE dataset_id=$1',
+            DATASET_ID,
+            json.dumps(binding_by_field),
+        )
+    return binding_by_field
+
+
+@pytest.mark.asyncio
+async def test_postgres_resumes_a_pre_upgrade_shared_candidate_at_its_committed_ordinal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The next page appends to a binding saved before the upgrade and stores it by qualified name."""
+
+    contract = census_contract()
+    source_record = census_source_record(contract)
+    start_url = importer._resource_start_url(source_record, RESOURCE_TYPE, page_count=1)
+    assert start_url is not None
+    count_url = current_version_census_count_url(start_url)
+    async with census_database(monkeypatch) as (database, schema):
+        await _run_initial_interrupted_phase(
+            monkeypatch, source_record, database, schema, start_url, count_url, contract
+        )
+        legacy = await _store_pre_upgrade_binding(database, schema)
+        await _run_completed_phase(monkeypatch, source_record, database, schema, count_url, contract)
+        stored = await _stored_binding(database, schema)
+    assert stored["tables"] == {
+        root: {"schema": schema, "name": table["name"]} for root, table in legacy["tables"].items()
+    }
+    assert stored["ordinal"] > legacy["ordinal"] and stored["identity"] == legacy["identity"]
+
+
+@pytest.mark.asyncio
+async def test_postgres_refuses_a_tampered_pre_upgrade_shared_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A legacy binding that does not validate is refused and stays as stored."""
+
+    contract = census_contract()
+    source_record = census_source_record(contract)
+    start_url = importer._resource_start_url(source_record, RESOURCE_TYPE, page_count=1)
+    assert start_url is not None
+    count_url = current_version_census_count_url(start_url)
+    async with census_database(monkeypatch) as (database, schema):
+        await _run_initial_interrupted_phase(
+            monkeypatch, source_record, database, schema, start_url, count_url, contract
+        )
+        tampered = await _store_pre_upgrade_binding(database, schema, is_tampered=True)
+        with pytest.raises(GenericCandidateError, match="table_binding_changed"):
+            async with source_transaction(database), source_owner_transaction(database) as publisher:
+                await source_storage._locked(publisher.connection, publisher.policy, tampered["identity"])
+        assert await _stored_binding(database, schema) == tampered
 
 
 async def _run_outer_import(

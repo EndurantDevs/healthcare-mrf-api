@@ -349,25 +349,3 @@ async def test_native_protected_post_retained_source_does_not_borrow_new_source_
             if await fixture.connection.fetchval("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)", role_name):
                 await fixture.connection.execute(f'DROP OWNED BY "{role_name}"')
                 await fixture.connection.execute(f'DROP ROLE "{role_name}"')
-
-
-async def test_native_plan_catalog_drift_refuses_even_empty_filtered_source(transport_db):
-    """A zero-row year filter never certifies a source with changed native custody."""
-    context = transport_db
-    schema = context.source_pin.prepared.ownership.schema_name
-    original_owner = await context.fixture.connection.fetchval(
-        "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname=$1", schema
-    )
-    try:
-        await context.fixture.connection.execute(
-            f'ALTER SCHEMA "{schema}" OWNER TO "{context.fixture.roles["reader"]}"'
-        )
-        document = v2_envelope({"npi": "1000000491", "year": 2025})
-        reply, transactions = await _post(context, document)
-        assert reply.status == 503 and transactions == 1
-        assert "npi_data" not in reply.json and "X-Network-Generation" not in reply.headers
-        assert reply.headers["X-Network-Access-Scope"] == document["access_scope_sha256"]
-    finally:
-        await context.fixture.connection.execute(f'ALTER SCHEMA "{schema}" OWNER TO "{original_owner}"')
-    healthy, transactions = await _post(context, v2_envelope({"npi": "1000000491", "year": 2025}))
-    assert healthy.status == 200 and transactions == 1 and healthy.json["npi_data"] == []

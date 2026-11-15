@@ -9,7 +9,6 @@ from api import provider_profile as profile_api
 from api.endpoint import npi as npi_module
 from api.provider_profile_display import display_value
 
-
 VALID_NPI = "1000000004"
 
 
@@ -34,14 +33,8 @@ def test_profile_row_decoding_rejects_malformed_values_and_normalizes_time():
     assert npi_module._provider_directory_profile_json("{malformed") is None
     assert npi_module._provider_directory_profile_json(["not", "a", "map"]) is None
     assert npi_module._serialize_utc_rfc3339_datetime(None) is None
-    assert (
-        npi_module._serialize_utc_rfc3339_datetime("2026-07-27T12:30:00z")
-        == "2026-07-27T12:30:00Z"
-    )
-    assert (
-        npi_module._serialize_utc_rfc3339_datetime("2026-07-27T12:30:00")
-        == "2026-07-27T12:30:00Z"
-    )
+    assert npi_module._serialize_utc_rfc3339_datetime("2026-07-27T12:30:00z") == "2026-07-27T12:30:00Z"
+    assert npi_module._serialize_utc_rfc3339_datetime("2026-07-27T12:30:00") == "2026-07-27T12:30:00Z"
     with pytest.raises(TypeError, match="published_at must be"):
         npi_module._serialize_utc_rfc3339_datetime(123)
 
@@ -86,12 +79,8 @@ async def test_profile_table_and_column_capability_queries_are_cached(
     monkeypatch.setattr(npi_module, "_TABLE_COLUMNS_CACHE", {})
     monkeypatch.setattr(npi_module, "ENABLE_NPI_SCHEMA_CACHE", True)
 
-    assert await npi_module._is_provider_directory_profile_table_available(
-        "mrf.provider_directory_profile"
-    )
-    assert await npi_module._is_provider_directory_profile_table_available(
-        "mrf.provider_directory_profile"
-    )
+    assert await npi_module._is_provider_directory_profile_table_available("mrf.provider_directory_profile")
+    assert await npi_module._is_provider_directory_profile_table_available("mrf.provider_directory_profile")
     assert await npi_module._table_columns("provider_directory_profile") == {
         "generation_id",
         "profile_json",
@@ -107,6 +96,7 @@ async def test_profile_table_and_column_capability_queries_are_cached(
 async def test_profile_fetch_skips_malformed_rows_and_accepts_mapping_rows(
     monkeypatch,
 ):
+    """Skip malformed profiles while preserving valid payloads and publication time."""
     source_rows = [
         _Row(
             npi=int(VALID_NPI),
@@ -121,7 +111,13 @@ async def test_profile_fetch_skips_malformed_rows_and_accepts_mapping_rows(
             "published_at": datetime(2026, 7, 27, 12, 0),
         },
     ]
-    execute = AsyncMock(return_value=_Result(rows=source_rows))
+    execute = AsyncMock(
+        side_effect=[
+            _Result(rows=[]),
+            _Result(rows=[("targets_json",)]),
+            _Result(rows=source_rows),
+        ]
+    )
     monkeypatch.setattr(npi_module, "_execute_stmt", execute)
     monkeypatch.setattr(
         npi_module,
@@ -135,9 +131,14 @@ async def test_profile_fetch_skips_malformed_rows_and_accepts_mapping_rows(
 
     assert list(profiles) == [1588616783]
     assert profiles[1588616783]["profile"]["generation_id"] == "valid-row"
-    assert profiles[1588616783]["profile"]["published_at"] == (
-        "2026-07-27T12:00:00Z"
+    assert profiles[1588616783]["profile"]["published_at"] == ("2026-07-27T12:00:00Z")
+    assert execute.await_count == 3
+    assert str(execute.await_args_list[0].args[0]) == (
+        "SELECT generation_id FROM mrf.provider_directory_profile_serving_generation WHERE FALSE"
     )
+    catalog_query = execute.await_args_list[1]
+    assert "pg_catalog.pg_attribute" in str(catalog_query.args[0])
+    assert catalog_query.kwargs["params"] == {"table_ref": "mrf.provider_directory_profile_serving_generation"}
     assert "evidence_json" not in str(execute.await_args.args[0])
 
 
@@ -252,9 +253,7 @@ def test_evidence_composer_preserves_source_payloads_without_profile_filter():
 
 
 def test_profile_composer_handles_nonmapping_display_and_unkeyed_state_fact():
-    assert display_value("provider_detail", ["unstructured", "value"]) == (
-        "unstructured; value"
-    )
+    assert display_value("provider_detail", ["unstructured", "value"]) == ("unstructured; value")
     profile = profile_api.compose_provider_profile(
         int(VALID_NPI),
         state_projection={

@@ -6,6 +6,7 @@ from uuid import UUID
 
 from sqlalchemy import text
 
+from db.plan_release_storage import storage_identifier
 from process.entity_address_snapshot_alias import capture_entity_address_alias_semantic_receipt
 from process.ext.address_alias_sql import alias_advisory_xact_lock_sql
 from process.ext.address_canon import _archive_lock_key, _qtable, archive_table_name
@@ -81,15 +82,9 @@ async def _lock_archive(session, schema, mode):
 async def prepare_facility_address_effects(session, *, operation_id, stage_schema, schema="mrf"):
     """Plan bounded changes under native locks; never mutate the live archive."""
     operation_id = str(UUID(str(operation_id)))
-    archive, archive_oid = await _lock_archive(session, schema, "SHARE")
+    archive, _local_address = await _lock_archive(session, schema, "SHARE")
     contribution = _qtable(stage_schema, "facility_address_contribution")
-    await session.execute(text(f"LOCK TABLE ONLY {contribution} IN SHARE MODE"))
-    stage_schema_oid, contribution_oid = (
-        await session.execute(
-            text("SELECT relnamespace,oid FROM pg_class WHERE oid=to_regclass(:relation)"),
-            {"relation": contribution},
-        )
-    ).one()
+    await session.execute(text(f"LOCK TABLE ONLY {contribution} IN ACCESS SHARE MODE"))
     metadata, alias = await validate_observations(session, stage_schema=stage_schema, schema=schema)
     existing = await session.scalar(
         text(f"SELECT EXISTS(SELECT 1 FROM {LEDGER} WHERE operation_id=:operation)"), {"operation": UUID(operation_id)}
@@ -100,8 +95,8 @@ async def prepare_facility_address_effects(session, *, operation_id, stage_schem
         await project_observations(session, stage_schema=stage_schema, schema=schema)
         await session.execute(
             text(f"""
-            INSERT INTO {LEDGER}(operation_id,address_key,before_image,after_image,before_xmin)
-            SELECT :operation,k.address_key,to_jsonb(a),to_jsonb(p),a.xmin::text
+            INSERT INTO {LEDGER}(operation_id,address_key,before_image,after_image)
+            SELECT :operation,k.address_key,to_jsonb(a),to_jsonb(p)
             FROM {KEYS} k LEFT JOIN {archive} a USING(address_key) LEFT JOIN {SCRATCH} p USING(address_key)
         """),
             {"operation": UUID(operation_id)},
@@ -112,55 +107,50 @@ async def prepare_facility_address_effects(session, *, operation_id, stage_schem
     return {
         "contract": CONTRACT,
         "operation_id": operation_id,
-        "archive_oid": archive_oid,
+        "archive_relation_name": archive_table_name(),
         "schema": schema,
         "stage_schema": stage_schema,
-        "stage_schema_oid": stage_schema_oid,
-        "contribution_oid": contribution_oid,
+        "contribution_relation_name": "facility_address_contribution",
         "alias": alias,
         "row_count": count,
     }
 
 
 def validate_effect_receipt(receipt):
-    """Validate fixed local scope and resource limits before any catalog lookup."""
+    """Keep old editions opaque while checking the declared targets and bounded plan."""
+    common_fields = {"contract", "operation_id", "schema", "stage_schema", "alias", "row_count"}
     require(
         isinstance(receipt, dict)
         and set(receipt)
-        == {
-            "contract",
-            "operation_id",
-            "archive_oid",
-            "schema",
-            "stage_schema",
-            "stage_schema_oid",
-            "contribution_oid",
-            "alias",
-            "row_count",
-        },
+        in (
+            common_fields | {"archive_oid", "stage_schema_oid", "contribution_oid"},
+            common_fields | {"archive_relation_name", "contribution_relation_name"},
+        ),
         "effect receipt is invalid",
     )
     require(
         receipt["contract"] == CONTRACT
         and receipt["schema"] == "mrf"
         and isinstance(receipt["stage_schema"], str)
-        and 0 < len(receipt["stage_schema"]) <= 63
-        and all(
-            type(receipt[key]) is int and 0 < receipt[key] < 2**32
-            for key in ("archive_oid", "stage_schema_oid", "contribution_oid")
-        )
+        and 0 < len(receipt["stage_schema"].encode()) <= 63
         and type(receipt["row_count"]) is int
         and 0 <= receipt["row_count"] <= 4_000_000,
         "effect receipt is invalid",
     )
+    storage_identifier(receipt["stage_schema"])
+    if "archive_relation_name" in receipt:
+        require(
+            receipt["archive_relation_name"] == archive_table_name() == "address_archive_v2"
+            and receipt["contribution_relation_name"] == "facility_address_contribution",
+            "effect receipt is invalid",
+        )
     UUID(receipt["operation_id"])
     return receipt
 
 
 async def _fenced_effects(session, receipt, *, rollback):
     receipt = validate_effect_receipt(receipt)
-    archive, oid = await _lock_archive(session, receipt["schema"], "SHARE ROW EXCLUSIVE")
-    require(oid == receipt["archive_oid"], "archive identity changed")
+    archive, _local_address = await _lock_archive(session, receipt["schema"], "SHARE ROW EXCLUSIVE")
     if receipt["alias"] is not None:
         alias = await capture_entity_address_alias_semantic_receipt(session, schema_name=receipt["schema"])
         require(alias.as_dict() == receipt["alias"], "alias identity changed")
@@ -169,12 +159,12 @@ async def _fenced_effects(session, receipt, *, rollback):
         text(f"SELECT count(*) FROM {LEDGER} WHERE operation_id=:operation"), parameter_by_name
     )
     require(count == receipt["row_count"], "plan inventory changed")
-    image, xmin = ("after_image", "after_xmin") if rollback else ("before_image", "before_xmin")
+    image = "after_image" if rollback else "before_image"
     invalid = await session.scalar(
         text(f"""
         SELECT EXISTS(SELECT 1 FROM {LEDGER} e LEFT JOIN {archive} a USING(address_key)
           WHERE e.operation_id=:operation AND (
-            e.{image} IS DISTINCT FROM to_jsonb(a) OR e.{xmin} IS DISTINCT FROM a.xmin::text
+            e.{image} IS DISTINCT FROM to_jsonb(a)
             OR e.applied IS DISTINCT FROM :applied OR e.reverted))
     """),
         {**parameter_by_name, "applied": rollback},
@@ -189,7 +179,7 @@ async def apply_facility_address_effects(session, receipt):
     await _write_images(session, archive, parameter_by_name, rollback=False)
     await session.execute(
         text(f"""
-        UPDATE {LEDGER} e SET applied=true,after_xmin=a.xmin::text
+        UPDATE {LEDGER} e SET applied=true
         FROM {archive} a WHERE e.operation_id=:operation AND a.address_key=e.address_key
     """),
         parameter_by_name,

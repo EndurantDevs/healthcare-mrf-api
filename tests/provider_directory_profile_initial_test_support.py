@@ -7,7 +7,6 @@ from process import provider_directory_profile_capacity as capacity
 from process import provider_directory_profile_capacity_preflight_contract as preflight
 from process import provider_directory_profile_initial_contract as initial
 from tests import provider_directory_profile_capacity_signing_guard_test_support as support
-from tests.provider_directory_profile_replay_test_support import _capacity_storage_rows
 from tests.test_provider_directory_profile_capacity_attestation import _signed_envelope
 
 
@@ -34,11 +33,15 @@ def _signed_preflight_inputs(execution, execution_payload, limits, storage, timi
     return control_request, control, healthcare_request, validated, identity, followup
 
 
-def signed_initial_envelope(geometry, database_identity, target, execution, accepted_at):
+def signed_initial_envelope(geometry, database_identity, target_payload, execution, accepted_at):
     """Sign a test lease; this does not issue a runtime reservation or attest Linux admission."""
     timing = _initial_signing_timing(accepted_at, geometry)
     execution_payload = support._execution_by_field(execution)
     limits = support._limits_payload()
+    geometry_payload = capacity.capacity_geometry_payload(geometry)
+    for key in limits:
+        if key != "contract_id":
+            limits[key] = geometry_payload[key]
     storage = support._storage_observation(timing)
     control_request, control, healthcare_request, validated, identity, followup = _signed_preflight_inputs(
         execution, execution_payload, limits, storage, timing
@@ -50,10 +53,12 @@ def signed_initial_envelope(geometry, database_identity, target, execution, acce
         request_contract_id=initial.REQUEST_CONTRACT,
         profile_materialization=initial.MATERIALIZATION,
         capacity_geometry=capacity.capacity_geometry_payload(geometry),
-        serving_generation_preflight=target,
-        serving_generation_preflight_sha256=initial.target_state_sha256(target),
+        serving_generation_preflight=target_payload,
+        serving_generation_preflight_sha256=initial.target_state_sha256(target_payload),
         required_reservation_bytes_by_storage_class=geometry.reservation_bytes_by_storage_class,
     )
+    for key in ("profile_schema_version", "profile_strategy_version", "postgres_server_version_num"):
+        receipt["runtime_observation"][key] = getattr(geometry, key)
     receipt.pop("receipt_sha256")
     receipt["receipt_sha256"] = preflight.preflight_domain_sha256(initial.RECEIPT_CONTRACT, receipt)
     guard = support._guard_payload(control_request, control, healthcare_request, validated, receipt, followup)
@@ -65,14 +70,13 @@ def _signed_initial_result(guard, geometry_hash, database_identity, timing, rece
     guard_hash = preflight.preflight_domain_sha256(
         support.guard_contract.CAPACITY_SIGNING_PREFLIGHT_GUARD_DIGEST_DOMAIN, guard
     )
-    tablespaces, volumes = _capacity_storage_rows(database_identity)
 
     def body(body):
+        body["runtime"].update(
+            {key: value for key, value in receipt["runtime_observation"].items() if key != "contract_id"}
+        )
         body.update(
             capacity_geometry_hash=geometry_hash,
-            database_name=database_identity.database_name,
-            database_oid=database_identity.database_oid,
-            database_system_identifier=database_identity.database_system_identifier,
             observed_at=support._utc(timing.observed_at),
             issued_at=support._utc(timing.issued_at),
             max_build_deadline=support._utc(timing.max_build_deadline),
@@ -80,8 +84,6 @@ def _signed_initial_result(guard, geometry_hash, database_identity, timing, rece
             signing_preflight_guard=guard,
             signing_preflight_guard_sha256=guard_hash,
             nonce=receipt["receipt_sha256"],
-            tablespaces=tablespaces,
-            volumes=volumes,
         )
 
     return _signed_envelope(body_mutator=body), receipt
@@ -95,4 +97,27 @@ def _initial_signing_timing(accepted_at, geometry):
         accepted_at + timedelta(seconds=geometry.max_build_seconds + 30),
         accepted_at + timedelta(seconds=geometry.max_build_seconds + 10),
         "22" * 32,
+    )
+
+
+def synthetic_initial_execution(day="2026-07-30"):
+    """Use the existing desired-selection builder with an explicit date and ordinary source."""
+    from process import provider_directory_profile_selection as selection
+    from process import provider_directory_profile_selection_snapshot as snapshot
+    from tests.test_provider_directory_profile_selection_desired import _selection_rows
+
+    desired_by_field = {"desired_profile_as_of": day, "desired_cms_dataset": None, "expected_cms_incumbent": None}
+    catalog, sources, rows, candidate = _selection_rows(desired_by_field)
+    computed = snapshot._computed_desired_selection_from_rows(
+        catalog,
+        node_id="dev-node",
+        source_rows=sources,
+        dataset_rows=rows,
+        desired_dataset_row=candidate,
+        desired_selection=desired_by_field,
+    )
+    identity_by_field = {**computed.identity_payload, "authority_revision": 2}
+    identity_by_field["proof_id"] = selection._proof_id(identity_by_field)
+    return selection.ProviderDirectoryProfileExecution(
+        attestation=selection.validated_profile_selection_attestation(identity_by_field), generation=7
     )

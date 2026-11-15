@@ -8,17 +8,17 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import event, text
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from process import registry_ptg_office_capture as capture
 from process import registry_ptg_office_custody as custody
 from process.registry_ptg_published_plan_contract import RegistryPTGPublishedPlanSourceSpecification
 from process.registry_ptg_published_provisioning import HEADER_TABLES, LOCK_COLUMN
 from tests.test_registry_management_permissions_postgres import permissions_db as permissions_db
 from tests.test_registry_management_permissions_postgres import provider_db as provider_db
 from tests.test_registry_management_permissions_postgres import serving_schema as serving_schema
-from tests.test_registry_ptg_office_capture import _context, _request
+from tests.test_registry_ptg_office_capture import _context
 
 
 @asynccontextmanager
@@ -108,73 +108,14 @@ async def empty_office_owner(permissions_db, tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("inherited", [False, True])
-async def test_native_empty_owner_requires_set_only_membership_before_capture_ddl(empty_office_owner, inherited):
+async def test_native_publisher_writes_only_granted_header_lock_columns(empty_office_owner):
     fixture = empty_office_owner
-    await fixture.connection.execute(
-        f'GRANT "{fixture.owner}" TO "{fixture.publisher}" WITH INHERIT {"TRUE" if inherited else "FALSE"}, SET TRUE'
-    )
-    statements = []
-
-    def observed(connection, cursor, statement, parameters, context, many):
-        statements.append(statement)
-
-    event.listen(fixture.engine.sync_engine, "before_cursor_execute", observed)
-    try:
-        async with fixture.sessions() as session, session.begin():
-            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-            await session.execute(text("SET LOCAL search_path=pg_catalog,pg_temp"))
-            driver = await capture._driver(session)
-            profile = await driver.fetchrow(
-                custody._PROFILE_SQL,
-                fixture.owner,
-                fixture.publisher,
-                list(fixture.context.reader_roles),
-                True,
-                fixture.context.scope_store.owner_role,
-                fixture.context.source_specification.ptg_schema_name,
-            )
-            assert profile["schema_count"] == 0 and profile["schemas"] == []
-            guard_by_name = {
-                name: profile[name]
-                for name in ("genuine", "flags", "readers_closed", "office_only", "publisher_writes_closed")
-            }
-            assert all(is_guard_satisfied is True for is_guard_satisfied in guard_by_name.values()), guard_by_name
-            assert await driver.fetchval("SELECT pg_catalog.pg_has_role(current_user,$1::name,'SET')", fixture.owner)
-            assert (
-                await driver.fetchval("SELECT pg_catalog.pg_has_role(current_user,$1::name,'USAGE')", fixture.owner)
-                is inherited
-            )
-            if inherited:
-                assert profile["set_closed"] is False
-                with pytest.raises(ValueError, match="profile_unavailable"):
-                    await capture.prepare_registry_ptg_office_capture(session, fixture.context, _request(), object())
-            else:
-                assert profile["set_closed"] is True
-                assert (
-                    await custody.verify_registry_ptg_office_custody(driver, fixture.context, publisher=True)
-                    == fixture.owner
-                )
-            assert not any(statement.lstrip().upper().startswith("CREATE ") for statement in statements)
-    finally:
-        event.remove(fixture.engine.sync_engine, "before_cursor_execute", observed)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("role_kind", ["owner", "publisher"])
-async def test_native_custody_rejects_updates_through_user_created_view(empty_office_owner, role_kind):
-    fixture = empty_office_owner
-    await fixture.connection.execute(f'GRANT "{fixture.owner}" TO "{fixture.publisher}" WITH INHERIT FALSE, SET TRUE')
-    schema = fixture.context.source_specification.ptg_schema_name
-    await fixture.connection.execute(f'CREATE TABLE "{schema}".foreign_fact (value integer NOT NULL)')
-    await fixture.connection.execute(
-        f'CREATE VIEW "{schema}".foreign_view AS SELECT value FROM "{schema}".foreign_fact'
-    )
-    await fixture.connection.execute(f'GRANT UPDATE ON "{schema}".foreign_view TO "{getattr(fixture, role_kind)}"')
+    roles = custody.office_preparation_roles(fixture.context)
+    assert roles["namespace_owner_role"] == fixture.owner and roles["publisher_role"] == fixture.publisher
+    table = f'"{fixture.context.source_specification.ptg_schema_name}"."{HEADER_TABLES[0]}"'
     async with fixture.sessions() as session, session.begin():
-        await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-        await session.execute(text("SET LOCAL search_path=pg_catalog,pg_temp"))
-        with pytest.raises(ValueError, match="profile_unavailable"):
-            await custody.verify_registry_ptg_office_custody(
-                await capture._driver(session), fixture.context, publisher=True
-            )
+        await session.execute(text(f"UPDATE {table} SET {LOCK_COLUMN}=0"))
+    with pytest.raises(DBAPIError) as refused:
+        async with fixture.sessions() as session, session.begin():
+            await session.execute(text(f"INSERT INTO {table} DEFAULT VALUES"))
+    assert refused.value.orig.sqlstate == "42501"

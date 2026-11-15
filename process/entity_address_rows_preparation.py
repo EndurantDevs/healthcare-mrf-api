@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Prepare one source snapshot through admitted, identity-owned address scratch."""
+"""Prepare one source snapshot through admitted, named Address scratch."""
 
 from __future__ import annotations
 
@@ -44,47 +44,28 @@ def _prepared_schema_select(sql, candidate, include_base_address_version):
     )
 
 
-async def _create_scratch(sql, schema, name, statement, oid_by_name, row_scratch):
-    if row_scratch is not None:
-        await admission.create_stage_sql(schema, name, statement, row_scratch=row_scratch)
-        oid_by_name[name] = admission._ADMISSION.get().owned_oids[name]
-        return
-
+async def _create_scratch(sql, schema, name, statement, created_names, row_scratch):
     async def create():
-        """Capture successful creation before forwarding any pending cancellation."""
-        await admission.create_stage_sql(schema, name, statement)
-        scope = admission._ADMISSION.get()
-        oid = (
-            scope.owned_oids.get(name)
-            if scope is not None
-            else await admission.read_scalar(
-                sql.db, "SELECT to_regclass(:relation)::oid::bigint", relation=f"{schema}.{name}"
-            )
-        )
-        if type(oid) is not int or oid <= 0:
-            raise RuntimeError("address row scratch identity is missing")
-        oid_by_name[name] = oid
+        """Record the candidate name before forwarding pending create cancellation."""
+        await admission.create_stage_sql(schema, name, statement, row_scratch=row_scratch)
+        created_names.add(name)
 
     await admission._finish_owned_operation(create)
 
 
-async def _drop_scratch(sql, schema, names, oid_by_name):
+async def _drop_scratch(sql, schema, names, created_names):
     scope = admission._ADMISSION.get() or ordinary_preparation.current()
     for name in reversed(names):
         if scope is not None:
-            if name in scope.owned_oids:
+            if name in scope.owned_relations:
                 await admission.drop_stage(schema, name)
             continue
-        expected_oid = oid_by_name.get(name)
-        if expected_oid is None:
+        if name not in created_names:
             continue
         async with admission.native_transaction():
             relation = storage_relation(schema, name)
             await sql.db.status("SET LOCAL lock_timeout='500ms'")
-            await sql.db.status(f"LOCK TABLE {relation} IN ACCESS EXCLUSIVE MODE NOWAIT")
-            actual_oid = await sql.db.scalar("SELECT to_regclass(:relation)::oid::bigint", relation=f"{schema}.{name}")
-            if actual_oid != expected_oid:
-                raise RuntimeError("address row scratch identity changed")
+            await sql.db.status(f"LOCK TABLE {relation} IN ACCESS SHARE MODE NOWAIT")
             await admission.drop_stage(schema, name)
 
 
@@ -96,7 +77,7 @@ async def _scratch_tables(sql, schema, source_select, include_base_address_versi
         owned.declare(names)
     candidate = storage_relation(schema, names[0])
     prepared = storage_relation(schema, names[1])
-    oid_by_name = {}
+    created_names = set()
     try:
         await _create_scratch(
             sql,
@@ -104,16 +85,21 @@ async def _scratch_tables(sql, schema, source_select, include_base_address_versi
             names[0],
             f"CREATE TABLE {candidate} AS SELECT row_number() OVER ()::bigint AS row_id, b.* "
             f"FROM ({source_select}) b WITH NO DATA",
-            oid_by_name,
+            created_names,
             row_scratch,
         )
         schema_select = _prepared_schema_select(sql, candidate, include_base_address_version)
         await _create_scratch(
-            sql, schema, names[1], f"CREATE TABLE {prepared} AS {schema_select} WITH NO DATA", oid_by_name, row_scratch
+            sql,
+            schema,
+            names[1],
+            f"CREATE TABLE {prepared} AS {schema_select} WITH NO DATA",
+            created_names,
+            row_scratch,
         )
-        yield names, oid_by_name, schema_select
+        yield names, created_names, schema_select
     finally:
-        await admission._finish_owned_operation(lambda: _drop_scratch(sql, schema, names, oid_by_name))
+        await admission._finish_owned_operation(lambda: _drop_scratch(sql, schema, names, created_names))
         admission.finish_row_scratch(row_scratch)
 
 
@@ -288,7 +274,7 @@ async def run_prepared_source(sql, schema, source_select, consume, *, include_ba
     row_scratch = admission.issue_row_scratch()
     async with _scratch_tables(sql, schema, source_select, include_base_address_version, row_scratch) as (
         names,
-        _oids,
+        _created_names,
         schema_select,
     ):
         return await _consume_candidate(

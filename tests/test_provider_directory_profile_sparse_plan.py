@@ -12,8 +12,8 @@ from tests.provider_directory_profile_execution_test_support import _wal_tracker
 from tests.test_provider_directory_profile_control_capacity import _bound_control_wal_projection
 from tests.test_provider_directory_profile_control_plan_boundaries import (
     _control_artifact_projection,
-    _control_layout_by_oid,
     _control_plan_context,
+    _install_control_layouts,
 )
 from tests.test_provider_directory_profile_resume_lineage import _dataset, _source_context
 
@@ -97,13 +97,7 @@ def test_sparse_ranges_require_canonical_batch_size_and_bind_sql_hash(monkeypatc
 @pytest.mark.asyncio
 async def test_control_wal_counts_exact_sparse_coordinates(monkeypatch):
     """Checkpoint, payload, and progress bounds use the exact signed series."""
-    layout_by_oid = _control_layout_by_oid()
-    monkeypatch.setattr(
-        fhir,
-        "_provider_directory_profile_relation_storage_fingerprint",
-        AsyncMock(side_effect=lambda relation_oid, **_: layout_by_oid[relation_oid]),
-    )
-    monkeypatch.setattr(fhir, "_provider_directory_relation_oid", AsyncMock(return_value=15))
+    _install_control_layouts(monkeypatch)
     monkeypatch.setattr(fhir, "_provider_directory_profile_toast_chunk_count", AsyncMock(return_value=0))
     database, _, identity, fence = _control_plan_context()
     for ranges in (_ranges(), ()):
@@ -142,9 +136,9 @@ async def test_identity_rederives_inventory_and_refuses_admission_drift(monkeypa
         replace(_wal_tracker_admission(), admitted_identity=first)
     )
     try:
-        fhir._validate_profile_build_admission(same, object(), object())
+        fhir._validate_profile_build_admission(same, object(), object(), schema="example")
         with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match="admitted_identity_changed"):
-            fhir._validate_profile_build_admission(changed, object(), object())
+            fhir._validate_profile_build_admission(changed, object(), object(), schema="example")
     finally:
         fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(token)
 

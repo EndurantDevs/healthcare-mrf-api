@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import re
 from copy import deepcopy
 from uuid import UUID
@@ -13,49 +11,19 @@ from uuid import UUID
 from sqlalchemy import text
 
 ROOTS = ("zcta5", "zip_state")
-_FIELDS = {
-    "version",
-    "database_oid",
-    "node_id",
-    "generation_id",
-    "installation_id",
-    "package_id",
-    "fence_token",
-    "registration_sha256",
-    "receipt_sha256",
-    "parent_inventory_sha256",
-    "parent_oids",
-    "inventory",
-}
-_INVENTORY_FIELDS = {
-    "schema_name",
-    "relation_name",
-    "relation_oid",
-    "schema_oid",
-    "schema_owner_oid",
-    "owner_oid",
-    "relfilenode",
-}
-CATALOG_SQL = """SELECT requested.name AS parent_name,parent.oid::bigint AS parent_oid,
+_INVENTORY_FIELDS = {"schema_name", "relation_name"}
+CATALOG_SQL = """SELECT requested.name AS parent_name,
     parent.relkind::text AS parent_kind,parent.relpersistence::text AS parent_persistence,
-    pg_relation_filenode(parent.oid)::bigint AS parent_filenode,parent.relowner::bigint AS parent_owner,
     parent.relispartition AS parent_partition,parent.relrowsecurity AS parent_rls,
     parent.relforcerowsecurity AS parent_force_rls,
     (SELECT count(*) FROM pg_inherits WHERE inhparent=parent.oid) AS child_count,
     EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=parent.oid) AS parent_is_child,
-    namespace.nspname AS schema_name,child.relname AS relation_name,child.oid::bigint AS relation_oid,
-    namespace.oid::bigint AS schema_oid,namespace.nspowner::bigint AS schema_owner_oid,
-    child.relowner::bigint AS owner_oid,pg_relation_filenode(child.oid)::bigint AS relfilenode,
+    namespace.nspname AS schema_name,child.relname AS relation_name,
     child.relkind::text AS child_kind,child.relpersistence::text AS child_persistence,
     child.relispartition AS child_partition,child.relrowsecurity AS child_rls,
     child.relforcerowsecurity AS child_force_rls,
     EXISTS(SELECT 1 FROM pg_inherits WHERE inhparent=child.oid) AS child_has_children,
-    (SELECT count(*) FROM pg_inherits WHERE inhrelid=child.oid) AS child_parent_count,
-    (SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid,
-    EXISTS(SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='relation'
-      AND relation=parent.oid AND mode='AccessShareLock' AND granted) AS parent_read_lock,
-    EXISTS(SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='relation'
-      AND relation=child.oid AND mode='AccessShareLock' AND granted) AS child_read_lock
+    (SELECT count(*) FROM pg_inherits WHERE inhrelid=child.oid) AS child_parent_count
     FROM (VALUES ('zcta5'),('zip_state')) requested(name)
     LEFT JOIN pg_class parent ON parent.oid=to_regclass('tiger.'||requested.name)
     LEFT JOIN pg_inherits edge ON edge.inhparent=parent.oid
@@ -68,10 +36,6 @@ def _require(condition):
         raise RuntimeError("cms_address_native_tiger_proof_changed")
 
 
-def _is_oid(number):
-    return type(number) is int and 0 < number < 2**32
-
-
 def _identifier(identifier, maximum):
     return (
         type(identifier) is str
@@ -80,86 +44,108 @@ def _identifier(identifier, maximum):
     )
 
 
+def _uuid(value):
+    try:
+        _require(type(value) is str and str(UUID(value)) == value)
+    except (ValueError, AttributeError, TypeError) as error:
+        raise RuntimeError("cms_address_native_tiger_proof_changed") from error
+
+
+def _parents(proof):
+    if "parents" in proof:
+        _require(proof["parents"] == [["tiger", name] for name in ROOTS])
+    else:
+        pairs = proof.get("parent_oids")
+        _require(
+            type(pairs) is list
+            and len(pairs) == 2
+            and all(type(pair) is list and len(pair) == 2 and pair[0] == name for pair, name in zip(pairs, ROOTS))
+        )
+    return [("tiger", name) for name in ROOTS]
+
+
 def require_protected_tiger_proof(proof):
-    """Validate serialized linkage; only an admitted native callback grants authority."""
-    if type(proof) is dict and type(proof.get("version")) is int and proof["version"] == 2:
+    """Validate logical selection fields; saved physical tokens are never authority."""
+    _require(type(proof) is dict and type(proof.get("version")) is int and proof["version"] in (1, 2))
+    if proof["version"] == 2:
         _require_captured_tiger_proof(proof)
         return
-    _require(type(proof) is dict and set(proof) == _FIELDS)
-    _require(type(proof["version"]) is int and proof["version"] == 1 and _is_oid(proof["database_oid"]))
+    required_fields = {
+        "version",
+        "node_id",
+        "generation_id",
+        "installation_id",
+        "package_id",
+        "fence_token",
+        "registration_sha256",
+        "inventory",
+    }
+    legacy_fields = {"database_oid", "receipt_sha256", "parent_inventory_sha256", "parent_oids"}
+    _require(required_fields <= proof.keys() and proof.keys() <= required_fields | legacy_fields | {"parents"})
     _require(_identifier(proof["node_id"], 128) and _identifier(proof["package_id"], 256))
     for field in ("generation_id", "installation_id", "fence_token"):
-        try:
-            _require(type(proof[field]) is str and str(UUID(proof[field])) == proof[field])
-        except (ValueError, AttributeError, TypeError) as exc:
-            raise RuntimeError("cms_address_native_tiger_proof_changed") from exc
+        _uuid(proof[field])
     for field in ("registration_sha256", "receipt_sha256", "parent_inventory_sha256"):
-        _require(type(proof[field]) is str and re.fullmatch(r"[0-9a-f]{64}", proof[field]))
-    parents = proof["parent_oids"]
-    _require(type(parents) is list and len(parents) == 2)
-    _require(
-        all(
-            type(pair) is list and len(pair) == 2 and pair[0] == name and _is_oid(pair[1])
-            for pair, name in zip(parents, ROOTS)
-        )
-    )
-    _require(parents[0][1] != parents[1][1])
+        if field in proof:
+            _require(type(proof[field]) is str and re.fullmatch(r"[0-9a-f]{64}", proof[field]))
+    _parents(proof)
     _require_inventory(proof)
 
 
 def _require_inventory(proof):
     inventory = proof["inventory"]
-    _require(type(inventory) is dict and set(inventory) == {"database_oid", "relations"})
-    _require(inventory["database_oid"] == proof["database_oid"] and _is_oid(inventory["database_oid"]))
+    _require(type(inventory) is dict and set(inventory) <= {"database_oid", "relations"})
     children = inventory["relations"]
     _require(type(children) is list and len(children) == 2)
     for child in children:
-        _require(type(child) is dict and set(child) == _INVENTORY_FIELDS)
-        _require(all(_is_oid(child[field]) for field in _INVENTORY_FIELDS - {"schema_name", "relation_name"}))
+        _require(
+            type(child) is dict
+            and set(child)
+            in (
+                _INVENTORY_FIELDS,
+                _INVENTORY_FIELDS | {"relation_oid", "schema_oid", "schema_owner_oid", "owner_oid", "relfilenode"},
+            )
+        )
         _require(
             type(child["schema_name"]) is str
             and re.fullmatch(r"reference_family_archive_[0-9a-f]{32}", child["schema_name"])
         )
         _require(type(child["relation_name"]) is str and child["relation_name"] in ROOTS)
-        _require(child["schema_owner_oid"] == child["owner_oid"])
-    _require({child["relation_name"] for child in children} == set(ROOTS))
-    _require(len({(child["schema_name"], child["schema_oid"], child["owner_oid"]) for child in children}) == 1)
-    _require(children[0]["relation_oid"] < children[1]["relation_oid"])
-    _require(len({child["relfilenode"] for child in children}) == 2)
-    if proof["version"] == 1:
-        _require(not {child["relation_oid"] for child in children} & {pair[1] for pair in proof["parent_oids"]})
+    _require(tuple(child["relation_name"] for child in sorted(children, key=lambda row: row["relation_name"])) == ROOTS)
+    _require(len({child["schema_name"] for child in children}) == 1)
+    if all(set(child) == _INVENTORY_FIELDS for child in children):
+        _require(tuple(child["relation_name"] for child in children) == ROOTS)
 
 
 def protected_tiger_relations(proof, relations):
-    """Exclude only both fixed persistent inherited parents matching typed evidence."""
+    """Exclude the fixed named inherited parents from mutable input handling."""
     if proof is None:
         _require(not any(relations.get(f'"tiger"."{name}"', {}).get("inherited") for name in ROOTS))
         return set()
     require_protected_tiger_proof(proof)
     _require(proof["version"] == 1)
     names = set()
-    for name, oid in proof["parent_oids"]:
-        quoted = f'"tiger"."{name}"'
-        physical = relations.get(quoted, {})
-        _require(physical.get("relation_oid") == oid and physical.get("relkind") == "r")
-        _require(physical.get("relpersistence") == "p" and physical.get("inherited") is True)
-        _require(_is_oid(physical.get("relfilenode")))
+    for schema, name in _parents(proof):
+        quoted = f'"{schema}"."{name}"'
+        observed = relations.get(quoted, {})
+        _require(
+            observed.get("relkind") == "r"
+            and observed.get("relpersistence") == "p"
+            and observed.get("inherited") is True
+        )
         names.add(quoted)
     return names
 
 
 def require_tiger_catalog(proof, catalog_rows):
-    """Reobserve exact native edges, ownership, files and held Source read locks."""
+    """Require exact named edges and native heap shape."""
     require_protected_tiger_proof(proof)
-    _require(proof["version"] == 1)
-    _require(len(catalog_rows) == 2)
-    children_by_name = {child["relation_name"]: child for child in proof["inventory"]["relations"]}
-    for catalog, (name, oid) in zip(catalog_rows, proof["parent_oids"]):
-        _require(catalog["parent_name"] == name and catalog["parent_oid"] == oid)
-        _require(catalog["database_oid"] == proof["database_oid"] and _is_oid(catalog["database_oid"]))
+    _require(proof["version"] == 1 and len(catalog_rows) == 2)
+    children_by_table = {row["relation_name"]: row for row in proof["inventory"]["relations"]}
+    for catalog, (_schema, name) in zip(catalog_rows, _parents(proof)):
+        _require(catalog["parent_name"] == name)
         _require(catalog["parent_kind"] == catalog["child_kind"] == "r")
         _require(catalog["parent_persistence"] == catalog["child_persistence"] == "p")
-        _require(_is_oid(catalog["parent_filenode"]) and catalog["parent_owner"] == catalog["owner_oid"])
         _require(catalog["child_count"] == catalog["child_parent_count"] == 1)
         _require(
             all(
@@ -176,8 +162,17 @@ def require_tiger_catalog(proof, catalog_rows):
                 )
             )
         )
-        _require(catalog["parent_read_lock"] is True and catalog["child_read_lock"] is True)
-        _require({field: catalog[field] for field in _INVENTORY_FIELDS} == children_by_name[name])
+        _require(
+            {field: catalog[field] for field in _INVENTORY_FIELDS}
+            == {field: children_by_table[name][field] for field in _INVENTORY_FIELDS}
+        )
+
+
+async def _lock_names(session, proof):
+    names = captured_tiger_names(proof)
+    if proof["version"] == 1:
+        names += [f'"tiger"."{name}"' for name in ROOTS]
+    await session.execute(text("LOCK TABLE ONLY " + ", ONLY ".join(sorted(names)) + " IN ACCESS SHARE MODE NOWAIT"))
 
 
 async def capture_protected_tiger_input(session, relations):
@@ -193,13 +188,11 @@ async def capture_protected_tiger_input(session, relations):
     _require(asyncio.current_task() is task and source_policy._FACTORY.get() is factory and session.in_transaction())
     _require(source_policy.source_producer_identity() == producer)
     protected_tiger_relations(proof, relations)
+    await _lock_names(session, proof)
     catalog = (await session.execute(text(CATALOG_SQL))).mappings().all()
     require_tiger_catalog(proof, catalog)
     _require(source_policy._FACTORY.get() is factory and session.in_transaction())
     _require(source_policy.source_producer_identity() == producer)
-    _require(
-        all(relations[f'"tiger"."{row["parent_name"]}"']["relfilenode"] == row["parent_filenode"] for row in catalog)
-    )
     return proof
 
 
@@ -209,6 +202,10 @@ async def verify_raw_protected_tiger_input(connection, proof):
     task = asyncio.current_task()
     frozen_proof = deepcopy(proof)
     require_protected_tiger_proof(frozen_proof)
+    names = captured_tiger_names(frozen_proof)
+    if frozen_proof["version"] == 1:
+        names += [f'"tiger"."{name}"' for name in ROOTS]
+    await connection.execute("LOCK TABLE ONLY " + ", ONLY ".join(sorted(names)) + " IN ACCESS SHARE MODE NOWAIT")
     if frozen_proof["version"] == 2:
         from process.provider_directory_cms_native_registration import _NativeNuccSession
 
@@ -223,34 +220,22 @@ async def verify_raw_protected_tiger_input(connection, proof):
 
 
 def _require_captured_tiger_proof(proof):
-    _require(
-        set(proof)
-        == {
-            "version",
-            "database_oid",
-            "node_id",
-            "selection_kind",
-            "source_id",
-            "package_id",
-            "registration_sha256",
-            "selection_sha256",
-            "inventory",
-        }
-    )
-    _require(_is_oid(proof["database_oid"]) and _identifier(proof["node_id"], 128))
-    _require(proof["selection_kind"] in {"captured-source", "captured-epoch"})
-    try:
-        _require(type(proof["source_id"]) is str and str(UUID(proof["source_id"])) == proof["source_id"])
-    except (ValueError, TypeError, AttributeError) as exc:
-        raise RuntimeError("cms_address_native_tiger_proof_changed") from exc
+    required_fields = {
+        "version",
+        "node_id",
+        "selection_kind",
+        "source_id",
+        "package_id",
+        "registration_sha256",
+        "selection_sha256",
+        "inventory",
+    }
+    _require(required_fields <= proof.keys() and proof.keys() <= required_fields | {"database_oid"})
+    _require(_identifier(proof["node_id"], 128) and proof["selection_kind"] in {"captured-source", "captured-epoch"})
+    _uuid(proof["source_id"])
     for field in ("package_id", "registration_sha256", "selection_sha256"):
         _require(type(proof[field]) is str and re.fullmatch(r"[0-9a-f]{64}", proof[field]))
     _require_inventory(proof)
-    payload = {field: attribute for field, attribute in proof.items() if field != "selection_sha256"}
-    _require(
-        hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        == proof["selection_sha256"]
-    )
 
 
 def captured_tiger_bindings(proof):
@@ -261,8 +246,6 @@ def captured_tiger_bindings(proof):
         "tiger." + child["relation_name"]: dict(
             schema_name=child["schema_name"],
             table_name=child["relation_name"],
-            relation_oid=child["relation_oid"],
-            relfilenode=child["relfilenode"],
         )
         for child in proof["inventory"]["relations"]
     }
@@ -287,6 +270,7 @@ async def capture_selected_captured_tiger_input(session):
     require_protected_tiger_proof(proof)
     if proof["version"] == 1:
         return None
+    await _lock_names(session, proof)
     catalog = (
         (await session.execute(text(CAPTURED_CATALOG_SQL), {"names": captured_tiger_names(proof)})).mappings().all()
     )
@@ -297,28 +281,15 @@ async def capture_selected_captured_tiger_input(session):
     return proof
 
 
-CAPTURED_CATALOG_SQL = """SELECT c.oid::bigint AS relation_oid,c.relowner::bigint AS owner_oid,
-    n.oid::bigint AS schema_oid,n.nspowner::bigint AS schema_owner_oid,
-    pg_relation_filenode(c.oid)::bigint AS relfilenode,n.nspname AS schema_name,c.relname AS relation_name,
-    (SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid,
+CAPTURED_CATALOG_SQL = """SELECT n.nspname AS schema_name,c.relname AS relation_name,
     EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) AS inherited,
-    EXISTS(SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='relation'
-      AND relation=c.oid AND mode='AccessShareLock' AND granted) AS read_lock,
     c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition
-      AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity AND c.relowner=n.nspowner
-      AND NOT r.rolcanlogin AND NOT r.rolsuper AND NOT r.rolcreaterole AND NOT r.rolcreatedb
-      AND NOT r.rolreplication AND NOT r.rolbypassrls
-      AND NOT EXISTS(SELECT 1 FROM aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a
-        WHERE a.grantee<>n.nspowner AND a.privilege_type='CREATE')
-      AND NOT EXISTS(SELECT 1 FROM (
-        SELECT a.grantee,a.privilege_type FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) a
-        UNION ALL SELECT a.grantee,a.privilege_type FROM pg_attribute col,
-          LATERAL aclexplode(col.attacl) a WHERE col.attrelid=c.oid) grants
-        WHERE grantee<>c.relowner AND privilege_type<>'SELECT')
-      AND NOT EXISTS(SELECT 1 FROM pg_rewrite WHERE ev_class=c.oid) AS protected
+      AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+      AND NOT EXISTS(SELECT 1 FROM pg_rewrite WHERE ev_class=c.oid)
+      AND NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=c.oid) AS valid
     FROM unnest(CAST(:names AS text[])) requested(name)
     JOIN pg_class c ON c.oid=to_regclass(requested.name)
-    JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_roles r ON r.oid=c.relowner ORDER BY c.oid"""
+    JOIN pg_namespace n ON n.oid=c.relnamespace ORDER BY n.nspname,c.relname"""
 
 
 def captured_tiger_names(proof):
@@ -332,10 +303,14 @@ def require_captured_tiger_catalog(proof, catalog_rows):
     """Verify exact closed native data heaps, independent of the observing actor's privileges."""
     require_protected_tiger_proof(proof)
     _require(proof["version"] == 2 and len(catalog_rows) == 2)
-    for expected, actual in zip(proof["inventory"]["relations"], catalog_rows):
-        _require({field: actual[field] for field in _INVENTORY_FIELDS} == expected)
-        _require(actual["database_oid"] == proof["database_oid"])
-        _require(actual["protected"] is True and actual["inherited"] is False and actual["read_lock"] is True)
+    expected = sorted(
+        ({field: row[field] for field in _INVENTORY_FIELDS} for row in proof["inventory"]["relations"]),
+        key=lambda row: row["relation_name"],
+    )
+    actual = sorted(catalog_rows, key=lambda row: row["relation_name"])
+    for saved, row in zip(expected, actual):
+        _require({field: row[field] for field in _INVENTORY_FIELDS} == saved)
+        _require(row["valid"] is True and row["inherited"] is False)
 
 
 def captured_tiger_relations(proof, relations):
@@ -346,8 +321,8 @@ def captured_tiger_relations(proof, relations):
     for canonical, binding in bindings.items():
         observed = relations.get('"' + canonical.replace(".", '"."') + '"', {})
         _require(
-            observed.get("relation_oid") == binding["relation_oid"]
-            and observed.get("relfilenode") == binding["relfilenode"]
+            observed.get("schema_name") == binding["schema_name"]
+            and observed.get("table_name", observed.get("relation_name")) == binding["table_name"]
         )
         _require(
             observed.get("relkind") == "r"

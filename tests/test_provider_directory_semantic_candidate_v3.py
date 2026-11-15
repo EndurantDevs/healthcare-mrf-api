@@ -271,6 +271,7 @@ async def test_finalization_lock_rejects_projection_date_tamper():
         proof_resource_scope=("Practitioner",),
     )
     connection = SimpleNamespace(
+        scalar=AsyncMock(return_value=True),
         first=AsyncMock(
             side_effect=[
                 {"endpoint_id": "endpoint-1"},
@@ -291,7 +292,7 @@ async def test_finalization_lock_rejects_projection_date_tamper():
                     },
                 },
             ]
-        )
+        ),
     )
 
     with pytest.raises(

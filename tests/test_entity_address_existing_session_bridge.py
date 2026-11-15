@@ -13,7 +13,8 @@ from sqlalchemy.exc import DBAPIError
 
 from db.connection import Database
 from tests.test_entity_address_unified_publication_db import (
-    _prepare_live_and_stage,
+    _candidate_context,
+    _prepare_complete_live_and_stage,
     _StageTable,
     _temporary_schema,
 )
@@ -139,7 +140,7 @@ async def _assert_cutover_setting_preserved(
         patches,
         relation_names,
         required_names,
-        {"address_alias_generation": 0},
+        {"address_alias_generation": 0, **_candidate_context(schema)},
         callbacks=_callbacks(
             database,
             schema,
@@ -256,7 +257,7 @@ async def _assert_existing_binding_rejections(database: Database) -> None:
 async def test_borrowed_session_keeps_native_cutover_and_outer_rollback_atomic(monkeypatch):
     async with _temporary_schema() as (database, schema):
         monkeypatch.setattr(entity_address_unified, "db", database)
-        await _prepare_live_and_stage(database, schema)
+        await _prepare_complete_live_and_stage(database, schema)
         await entity_address_unified._ensure_promoted_stage_logged(schema, _StageTable.__tablename__)
         await database.status(f"CREATE TABLE {schema}.adoption_receipt (marker text NOT NULL);")
         await database.status(

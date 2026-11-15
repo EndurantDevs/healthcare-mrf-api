@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -20,7 +22,9 @@ from api.ptg2_geo_policy import (
 from db.connection import Database
 from tests.ptg2_serving_address_evidence_postgres_support import (
     _schema_sql,
-    _temporary_schema,
+)
+from tests.ptg2_serving_address_evidence_postgres_support import (
+    _temporary_schema as _temporary_evidence_schema,
 )
 from tests.test_geo_assurance_projection import (
     _insert_projection_addresses,
@@ -93,7 +97,7 @@ def _receipt_database(current_projection_available, events, projected_rows):
 @pytest.mark.parametrize("projected_rows", (0, 2, 7))
 @pytest.mark.parametrize(
     ("current_projection_available", "expected_force"),
-    ((True, False), (False, True)),
+    ((True, True), (False, True)),
 )
 async def test_projection_receipt_locks_sources_and_forces_stale_reimports(
     monkeypatch,
@@ -215,10 +219,20 @@ async def test_projection_stage_housekeeping_is_fail_closed(monkeypatch):
     execute_ddl.assert_awaited_once_with("VACUUM (FULL, ANALYZE) fixture.entity_address_unified_stage;")
 
 
+@asynccontextmanager
+async def _temporary_schema():
+    """Publish the genuine NPI generation used by each projection signature."""
+    from tests.test_entity_address_snapshot_destination import _publish_npi_fixture_generation
+
+    async with _temporary_evidence_schema() as (database, schema):
+        await _publish_npi_fixture_generation(database, schema)
+        yield database, schema
+
+
 async def _activate_projection_state(database, schema: str, projected_rows: int) -> None:
     """Record and activate one projection candidate."""
 
-    candidate_oid = await database.scalar(
+    candidate_result = await database.scalar(
         _schema_sql(
             entity_address_unified._record_geo_assurance_candidate_sql(
                 schema,
@@ -228,14 +242,17 @@ async def _activate_projection_state(database, schema: str, projected_rows: int)
             schema,
         )
     )
-    assert candidate_oid is not None
-    active_oid = await database.scalar(
+    assert candidate_result is not None
+    candidate_version = await database.scalar(
+        f"SELECT candidate_geo_assurance_version FROM {schema}.entity_address_geo_assurance_state"
+    )
+    active_version = await database.scalar(
         _schema_sql(
             entity_address_unified._activate_geo_assurance_candidate_sql(schema),
             schema,
         )
     )
-    assert active_oid == candidate_oid
+    assert active_version == candidate_version
     assert (
         await database.scalar(f"SELECT candidate_table_oid IS NULL FROM {schema}.entity_address_geo_assurance_state")
         is True
@@ -243,8 +260,10 @@ async def _activate_projection_state(database, schema: str, projected_rows: int)
 
 
 def _runtime_assurance_sql(schema: str) -> tuple[str, str, str]:
+    with patch.object(serving, "PTG2_SCHEMA", schema):
+        evidence = serving._ptg2_geo_evidence_level_sql("addr")
     return (
-        _schema_sql(serving._ptg2_geo_evidence_level_sql("addr"), schema),
+        _schema_sql(evidence, schema),
         _schema_sql(
             provider_address_identity_coherence_sql("addr", schema_name=schema),
             schema,
@@ -289,8 +308,8 @@ async def _replace_npi_source_table(database, schema: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_reimport_invalidates_and_recovers_projection():
-    """Prove a source-table swap cannot leave stale projected assurance live."""
+async def test_identical_named_reimport_preserves_and_rematerializes_projection():
+    """Identical copies preserve semantic results; cached cells cannot override current data."""
 
     async with _temporary_schema() as (database, schema):
         await _insert_projection_references(database, schema)
@@ -304,9 +323,9 @@ async def test_reimport_invalidates_and_recovers_projection():
             "geo_point_coherent = false WHERE location_key = 'nppes'"
         )
         assert await _runtime_assurance(database, schema, runtime_sql) == (
-            "multi_issuer_marketplace_address",
-            False,
-            False,
+            "nppes_registry_address",
+            True,
+            True,
         )
         assert (
             await database.scalar(
@@ -329,7 +348,7 @@ async def test_reimport_invalidates_and_recovers_projection():
             True,
         )
         activation_sql = entity_address_unified._activate_geo_assurance_candidate_sql(schema)
-        assert await database.scalar(_schema_sql(activation_sql, schema)) is None
+        assert await database.scalar(_schema_sql(activation_sql, schema)) is not None
         await _materialize_active_projection(database, schema)
         assert await _runtime_assurance(database, schema, runtime_sql) == (
             "nppes_registry_address",
@@ -496,3 +515,88 @@ async def test_snapshot_publication_progress_tracks_operation_completion(monkeyp
     from tests.entity_address_progress_support import assert_snapshot_publication_progress
 
     await assert_snapshot_publication_progress(monkeypatch, entity_address_unified, is_failed=is_failed)
+
+
+@pytest.mark.asyncio
+async def test_logical_source_replacement_at_same_names_cannot_keep_old_projection():
+    """The ordinary NPI rotation and changed reference data must govern public predicates."""
+    from process.npi import _rotate_npi_canonical_table
+
+    async with _temporary_schema() as (database, schema):
+        await _insert_projection_references(database, schema)
+        await _insert_projection_addresses(database, schema)
+        await _insert_projection_evidence(database, schema)
+        await _materialize_active_projection(database, schema)
+        runtime_sql = _runtime_assurance_sql(schema)
+        assert await _runtime_assurance(database, schema, runtime_sql) == ("nppes_registry_address", True, True)
+        await database.status(f"CREATE TABLE {schema}.npi_address_reimported (LIKE {schema}.npi_address INCLUDING ALL)")
+        await database.status(
+            f"INSERT INTO {schema}.npi_address_reimported SELECT * FROM {schema}.npi_address WHERE npi<>7001"
+        )
+        async with database.transaction() as session:
+            connection = await session.connection()
+            await connection.exec_driver_sql("SELECT 1")
+            native = (await connection.get_raw_connection()).driver_connection
+            await _rotate_npi_canonical_table(
+                native, schema=schema, live_table="npi_address", stage_table="npi_address_reimported", index_suffixes=()
+            )
+        assert await database.scalar(f"SELECT count(*) FROM {schema}.npi_address WHERE npi=7001") == 0
+        assert await _runtime_assurance(database, schema, runtime_sql) == (None, True, True)
+        assert (
+            await database.scalar(
+                f"SELECT geo_evidence_source_id FROM {schema}.entity_address_unified WHERE location_key='nppes'"
+            )
+            == 1
+        )
+        for table, column in (("geo_zip_lookup", "zip_code"), ("zip_state", "zip"), ("zcta5", "zcta5ce")):
+            await database.status(f"UPDATE {schema}.{table} SET {column}='99999'")
+        assert await _runtime_assurance(database, schema, runtime_sql) == (None, False, False)
+        await _materialize_active_projection(database, schema)
+        assert await _runtime_assurance(database, schema, runtime_sql) == (None, False, False)
+        assert tuple(
+            await database.first(
+                f"SELECT geo_evidence_source_id,geo_identity_coherent,geo_point_coherent "
+                f"FROM {schema}.entity_address_unified WHERE location_key='nppes'"
+            )
+        ) == (0, False, False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["arbitrary-schema", "wrong-point-table", "split-family"])
+async def test_cached_point_rejects_unsupported_held_snapshot_names(damage):
+    """A complete named map cannot turn an arbitrary relation into the supported held family."""
+    async with _temporary_schema() as (database, schema):
+        held = ("arbitrary_geo_" if damage == "arbitrary-schema" else "reference_family_archive_") + uuid4().hex
+        point_table = "other_zcta" if damage == "wrong-point-table" else "zcta5"
+        await database.status(f"CREATE SCHEMA {held}")
+        try:
+            for source_table, target_table in (("zcta5", point_table), ("zip_state", "zip_state")):
+                await database.status(
+                    f"CREATE TABLE {held}.{target_table} (LIKE {schema}.{source_table} INCLUDING ALL)"
+                )
+            binding_by_name = {
+                f"{namespace or schema}.{name}": {"schema_name": schema, "table_name": name}
+                for namespace, name in projection._PROJECTION_DEPENDENCIES
+            }
+            binding_by_name["tiger.zcta5"] = {"schema_name": held, "table_name": point_table}
+            binding_by_name["tiger.zip_state"] = {
+                "schema_name": schema if damage == "split-family" else held,
+                "table_name": "zip_state",
+            }
+            await database.status(
+                f"UPDATE {schema}.entity_address_geo_assurance_state SET active_geo_assurance_version=1,"
+                f"active_relation_signature={projection.projection_relation_signature_sql(schema, dependency_bindings=binding_by_name)},"
+                "active_dependency_bindings=CAST(:bindings AS jsonb)",
+                bindings=json.dumps(binding_by_name),
+            )
+            assert await database.scalar("SELECT " + projection.projection_state_available_sql(schema)) is True
+            await database.status(
+                f"INSERT INTO {schema}.entity_address_unified "
+                "(location_key,geo_point_coherent,geo_assurance_version) VALUES ('point',true,1)"
+            )
+            point = projection.projected_boolean_sql(
+                "address", "geo_point_coherent", schema_name=schema, legacy_sql="FALSE"
+            )
+            assert await database.scalar(f"SELECT {point} FROM {schema}.entity_address_unified address") is False
+        finally:
+            await database.status(f"DROP SCHEMA {held} CASCADE")

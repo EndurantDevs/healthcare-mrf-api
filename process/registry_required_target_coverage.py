@@ -445,7 +445,10 @@ def _coverage_report(manifest, ledger, approved, candidate_by_field, bundle, evi
             "producer_id": str(candidate_by_field["producer_id"]),
             "source_recipes": json.loads(candidate_by_field["source_recipes_json"]),
             "source_selection": verify_registry_source_selection_receipt(candidate_by_field),
-            "writer_closure": json.loads(candidate_by_field["writer_closure"]),
+            # Only candidates sealed before named publication retained a writer closure.
+            "writer_closure": None
+            if candidate_by_field["writer_closure"] is None
+            else json.loads(candidate_by_field["writer_closure"]),
             "current_head_in_snapshot": candidate_by_field["current_head_in_snapshot"],
             "target_evidence": _json(evidence_entry["provenance"], MAX_REPORT_BYTES),
         },

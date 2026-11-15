@@ -71,9 +71,6 @@ class _Session:
 @pytest.fixture(autouse=True)
 def _no_custody(monkeypatch):
     refuse = AsyncMock(side_effect=AssertionError("custody is not part of API reads"))
-    monkeypatch.setattr(storage, "protected_owner", refuse)
-    monkeypatch.setattr(storage, "_require_no_untrusted_mutation", refuse)
-    monkeypatch.setattr(storage, "_require_closed_local_custody", refuse)
     monkeypatch.setattr(storage.native, "capture_model_family_stage_ownership", refuse)
     monkeypatch.setattr(storage.native, "_lock_family", refuse)
 

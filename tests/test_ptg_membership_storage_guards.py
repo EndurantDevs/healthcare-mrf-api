@@ -19,22 +19,21 @@ def _session(*, row=None, rows=None, scalar=None):
 
 
 @pytest.mark.asyncio
-async def test_unsafe_namespace_owner_never_authorizes_attachment_lookup(monkeypatch):
-    session = _session(row=(101, False))
-    view = AsyncMock()
+async def test_lookup_uses_the_named_attachment_without_role_census(monkeypatch):
+    session = _session()
+    view = AsyncMock(return_value=None)
     monkeypatch.setattr(storage, "_active_view", view)
-    with pytest.raises(PTG2ManifestArtifactError, match="namespace owner"):
-        await storage.locate(session, PARAMS)
-    view.assert_not_awaited()
-    assert "NOT owner.rolcanlogin" in str(session.execute.call_args.args[0])
+    assert await storage.locate(session, PARAMS) is None
+    view.assert_awaited_once_with(session, PARAMS)
+    session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_absent_protected_namespace_has_no_active_index(monkeypatch):
-    view = AsyncMock()
-    monkeypatch.setattr(storage, "_active_view", view)
-    assert await storage.locate(_session(), PARAMS) is None
-    view.assert_not_awaited()
+async def test_absent_named_attachment_has_no_active_index():
+    session = _session()
+    assert await storage.locate(session, PARAMS) is None
+    assert "relkind='v'" in str(session.execute.await_args.args[0])
+    assert "pg_roles" not in str(session.execute.await_args.args[0])
 
 
 @pytest.mark.asyncio
@@ -50,17 +49,14 @@ async def test_missing_durable_source_pin_is_fail_closed(value):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("row", [(12, 999, True, True), (12, 101, False, True), (12, 101, True, False)])
-async def test_attachment_requires_protected_persistent_view_before_acl_check(monkeypatch, row):
-    check = AsyncMock()
-    monkeypatch.setattr(storage, "_require_no_untrusted_mutation", check)
-    with pytest.raises(PTG2ManifestArtifactError, match="attachment custody"):
-        await storage._active_view(_session(row=row), PARAMS, 101)
-    check.assert_not_awaited()
+@pytest.mark.parametrize("row", [(False, True), (True, False), (False, False)])
+async def test_attachment_requires_a_persistent_native_view(row):
+    with pytest.raises(PTG2ManifestArtifactError, match="attachment layout"):
+        await storage._active_view(_session(row=row), PARAMS)
 
 
 def _dependencies(schema="reference_family_archive_00000000000000000000000000000001"):
-    return [(index + 200, 100, schema, table) for index, table in enumerate(SPEC.table_names)]
+    return [(schema, table) for table in SPEC.table_names]
 
 
 @pytest.mark.asyncio
@@ -70,9 +66,9 @@ async def test_attachment_dependency_and_namespace_drift_refuses_before_storage_
     if mutation == "missing_table":
         rows.pop()
     elif mutation == "extra_table":
-        rows.append((999, 100, rows[0][2], "unexpected_table"))
+        rows.append((rows[0][0], "unexpected_table"))
     elif mutation == "two_schemas":
-        rows[-1] = (rows[-1][0], 999, "other_schema", rows[-1][3])
+        rows[-1] = ("other_schema", rows[-1][1])
     else:
         schema = "other_" + "0" * 32 if mutation == "wrong_prefix" else "reference_family_archive_invalid"
         rows = _dependencies(schema)
@@ -80,32 +76,32 @@ async def test_attachment_dependency_and_namespace_drift_refuses_before_storage_
     monkeypatch.setattr(storage.native, "_lock_family", lock)
     message = "namespace" if mutation in {"wrong_prefix", "invalid_uuid"} else "dependencies"
     with pytest.raises(PTG2ManifestArtifactError, match=message):
-        await storage._attachment_storage(_session(rows=rows), 12, 101)
+        await storage._attachment_storage(
+            _session(rows=rows), "hp_snapshot_retention." + storage.attachment_name(PARAMS)
+        )
     lock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("drift", [None, "schema", "relation"])
-async def test_attachment_locks_exact_dependencies_and_checks_recaptured_custody(monkeypatch, drift):
+async def test_attachment_locks_complete_names_and_checks_recaptured_layout(monkeypatch, drift):
     rows = _dependencies()
-    ownership = SimpleNamespace(schema_oid=100, relation_oids=tuple((row[3], row[0]) for row in rows))
+    ownership = SimpleNamespace(schema_name=rows[0][0], relation_names=tuple(row[1] for row in rows))
     if drift == "schema":
-        ownership.schema_oid += 1
+        ownership.schema_name = "other_schema"
     elif drift == "relation":
-        ownership.relation_oids = ownership.relation_oids[:-1] + ((rows[-1][3], 999),)
-    lock, capture, closed = AsyncMock(), AsyncMock(return_value=ownership), AsyncMock()
+        ownership.relation_names = ownership.relation_names[:-1] + ("other_table",)
+    lock, capture = AsyncMock(), AsyncMock(return_value=ownership)
     monkeypatch.setattr(storage.native, "_lock_family", lock)
     monkeypatch.setattr(storage.native, "capture_model_family_stage_ownership", capture)
-    monkeypatch.setattr(storage, "_require_closed_local_custody", closed)
     session = _session(rows=rows)
+    view = "hp_snapshot_retention." + storage.attachment_name(PARAMS)
     if drift:
-        with pytest.raises(PTG2ManifestArtifactError, match="storage identity changed"):
-            await storage._attachment_storage(session, 12, 101)
-        closed.assert_not_awaited()
+        with pytest.raises(PTG2ManifestArtifactError, match="storage names changed"):
+            await storage._attachment_storage(session, view)
     else:
-        assert await storage._attachment_storage(session, 12, 101) is ownership
-        closed.assert_awaited_once_with(session, ownership, 101)
-    lock.assert_awaited_once_with(session, rows[0][2], SPEC.table_names, "ACCESS SHARE", nowait=True)
+        assert await storage._attachment_storage(session, view) is ownership
+    lock.assert_awaited_once_with(session, rows[0][0], SPEC.table_names, "ACCESS SHARE", nowait=True)
     capture.assert_awaited_once_with(session, SPEC, UUID(int=1))
 
 

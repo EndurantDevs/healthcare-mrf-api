@@ -54,8 +54,7 @@ async def _prepare_effects(actors, schema):
             )
         )
         for mirror, effect in zip(dictionary._DRUG_SCOPED_MODELS, dictionary._DRUG_EFFECT_MODELS, strict=True):
-            oid = await native._relation_oid(session, schema, mirror.__source_table__)
-            await dictionary._capture_dictionary_effect_table(session, incoming, schema, mirror, effect, oid, False)
+            await dictionary._capture_dictionary_effect_table(session, incoming, schema, mirror, effect, False)
     return incoming, previous
 
 

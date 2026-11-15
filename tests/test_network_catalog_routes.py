@@ -24,9 +24,11 @@ _PATH = "/api/v1/registry/serving/catalog"
 _OWNED_READ_EVENTS = [
     "begin",
     "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
-    *["connection", "driver"] * 2,
+    "connection",
+    "driver",
+    _SNAPSHOT_SQL,
     "SET LOCAL lock_timeout='1s'",
-    *["connection", "driver"] * 4,
+    _SNAPSHOT_SQL,
     ("exit", None),
 ]
 
@@ -70,7 +72,7 @@ class Session:
         """Separate native snapshot checks from the existing catalog SQL observations."""
         if sql == _SNAPSHOT_SQL:
             self.snapshot_queries.append(sql)
-            return self.driver.isolation, self.driver.read_only, True, 11, 22, "127.0.0.1", 5432, 42
+            return self.driver.isolation, self.driver.read_only
         return await self.original_fetchrow(sql, *parameters)
 
     def begin(self):
@@ -89,6 +91,9 @@ class Session:
 
     async def execute(self, statement):
         self.events.append(str(statement))
+        if str(statement) == _SNAPSHOT_SQL:
+            self.snapshot_queries.append(str(statement))
+            return SimpleNamespace(first=lambda: (self.driver.isolation, self.driver.read_only))
         if self.failure is not None:
             raise self.failure
 
@@ -121,6 +126,7 @@ def context(batch_boundary, monkeypatch):
 
     monkeypatch.setattr(endpoint, "api_catalog_read_snapshot", api_snapshot)
     app = Sanic("catalog_routes_" + uuid4().hex)
+    app.config.AUTO_EXTEND = False
     app.blueprint(Blueprint.group([endpoint.blueprint], version_prefix="/api/v"))
     endpoint.register_network_catalog_private_responses(app)
 
@@ -200,7 +206,7 @@ async def test_actual_reader_pins_retained_revision_and_policy_before_count_page
     assert http_response.headers["X-Network-Access-Scope"] == expected
     assert context.session.events == _OWNED_READ_EVENTS
     context.bind_reader.assert_awaited_once()
-    assert len(context.session.snapshot_queries) == 3
+    assert len(context.session.snapshot_queries) == 2
     sql, parameters = context.driver.calls[-1]
     assert parameters == (4, (2, 5), None, "Alias", source_coordinates().sql_parameters, None, 0, 1, 1048576, None)
     assert sql.index("NOT record_key::integer=ANY") < sql.index("filtered AS") < sql.index("OFFSET $7")
@@ -755,7 +761,7 @@ async def test_autocomplete_full_policy_pins_one_transaction_and_keeps_metadata_
     assert len(context.autocomplete_calls) == 1 and context.api_pins == [9] and context.revisions == [4]
     assert catalog._PINNED_READ.get() is None
     assert context.session.events == _OWNED_READ_EVENTS
-    assert len(context.session.snapshot_queries) == 3
+    assert len(context.session.snapshot_queries) == 2
 
 
 @pytest.mark.asyncio

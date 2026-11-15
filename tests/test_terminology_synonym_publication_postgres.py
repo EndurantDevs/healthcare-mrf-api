@@ -25,7 +25,6 @@ from tests.reference_family_generation_fixture import (
     install_source_generation_guards_from_dsn,
 )
 
-
 terminology_synonyms = importlib.import_module("process.terminology_synonyms")
 generation = importlib.import_module("process.reference_family_result_generation")
 archive = importlib.import_module("process.reference_family_archive")
@@ -72,11 +71,7 @@ async def _relation_state(connection, schema, table):
     )
     if relation_oid is None:
         return None
-    markers = tuple(
-        await connection.fetch(
-            f"SELECT marker FROM {_qualified(schema, table)} ORDER BY marker"
-        )
-    )
+    markers = tuple(await connection.fetch(f"SELECT marker FROM {_qualified(schema, table)} ORDER BY marker"))
     return relation_oid, tuple(row["marker"] for row in markers)
 
 
@@ -101,7 +96,8 @@ async def _prepare_relations(
     )
     await connection.execute(
         f'INSERT INTO "{schema}".reference_family_result_generation VALUES ($1,$2,0)',
-        "terminology-synonyms", uuid.uuid4(),
+        "terminology-synonyms",
+        uuid.uuid4(),
     )
     for table, marker_list in marker_list_by_table.items():
         await connection.execute(f"CREATE TABLE {_qualified(schema, table)} (marker text NOT NULL)")
@@ -110,10 +106,7 @@ async def _prepare_relations(
             [(marker,) for marker in marker_list],
         )
     await install_source_generation_guards_from_dsn(os.environ["HLTHPRT_TERMINOLOGY_PUBLICATION_POSTGRES_DSN"], schema)
-    return {
-        table: await _relation_state(connection, schema, table)
-        for table in marker_list_by_table
-    }
+    return {table: await _relation_state(connection, schema, table) for table in marker_list_by_table}
 
 
 @pytest.mark.asyncio
@@ -153,16 +146,15 @@ async def test_terminology_generation_migration_admits_one_exact_relation(monkey
             await connection.execute(text(f'CREATE TABLE "{schema}".terminology_synonym (value text)'))
             for filename in migrations:
                 await apply(connection, filename, "upgrade")
-            assert await connection.scalar(text(
-                f'SELECT count(*) FROM "{schema}".reference_family_result_generation'
-            )) == 11
+            assert (
+                await connection.scalar(text(f'SELECT count(*) FROM "{schema}".reference_family_result_generation'))
+                == 11
+            )
             await install_source_generation_guards(connection, schema)
             published = await generation.publish_local_reference_family_generation(
                 connection, importer_id="terminology-synonyms", schema_name=schema
             )
-            assert published.relation_oids == (
-                await connection.scalar(text(f"SELECT '{schema}.terminology_synonym'::regclass::oid::bigint")),
-            )
+            assert published.relations == ((schema, "terminology_synonym"),)
             with pytest.raises(RuntimeError, match="prevents downgrade"):
                 await apply(connection, migrations[-1], "downgrade")
     finally:
@@ -186,9 +178,15 @@ async def test_terminology_reference_stage_has_complete_model_indexes():
             )
             assert ownership.relation_oids[0][0] == LIVE_TABLE
             await archive.complete_reference_family_restore(connection, ownership)
-            indexes = (await connection.execute(text(
-                "SELECT indexname FROM pg_indexes WHERE schemaname=:schema"
-            ), {"schema": stage_schema})).scalars().all()
+            indexes = (
+                (
+                    await connection.execute(
+                        text("SELECT indexname FROM pg_indexes WHERE schemaname=:schema"), {"schema": stage_schema}
+                    )
+                )
+                .scalars()
+                .all()
+            )
             assert len(indexes) >= 5
     finally:
         async with engine.begin() as connection:
@@ -279,7 +277,7 @@ async def test_terminology_rollback_reverses_relation_oids_and_content(monkeypat
             terminology_synonyms.db, importer_id="terminology-synonyms", schema_name=schema
         )
         assert authority.local_generation == 2
-        assert authority.relation_oids == (original_state_by_table[LIVE_TABLE][0],)
+        assert authority.relations == ((schema, LIVE_TABLE),)
 
 
 @pytest.mark.asyncio

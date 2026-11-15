@@ -12,7 +12,6 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy.exc import OperationalError
 
-from api import network_read_execution as execution
 from api import reference_family_reads as reads
 from api.endpoint import npi
 from db.models import CodeCatalog
@@ -76,8 +75,8 @@ async def test_pin_share_locks_installed_families_before_one_catalog_check(famil
     catalog, crosswalk = reads.claims_dictionary_tables(session)
     assert ("drug_claims_code_catalog" in str(catalog)) is ("drug-claims" in families)
     assert ("claims_code_crosswalk" in str(crosswalk)) is True
-    # No inventory is installed, yet the verified Reader keeps process caches off.
-    assert execution._SESSION_INVENTORY_KEY not in session.info and execution.has_network_read_inventory(session)
+    # The pin adds only the dictionary overlay; the verified Reader flag keeps process caches off.
+    assert set(session.info) == {"api_reader_verified", "unrelated", "snapshot_claims_dictionary_tables"}
     assert session.info["unrelated"] == "preserved" and session.info["api_reader_verified"] is True
 
 

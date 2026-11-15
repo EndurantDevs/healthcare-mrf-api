@@ -171,14 +171,22 @@ async def test_fhir_dispatch_preserves_all_value_filters(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "exists,rights,code", [(False, False, "snapshot_required"), (True, False, "cut_fence_required")]
-)
-async def test_missing_native_geo_or_fence_refuses_before_mutation(exists, rights, code):
-    session = SimpleNamespace(scalar=AsyncMock(side_effect=[exists, rights]))
-    with pytest.raises(RuntimeError, match=code):
+@pytest.mark.parametrize("fault", ["missing", "denied", None])
+async def test_missing_or_unreadable_geo_refuses_through_native_access(fault):
+    session = SimpleNamespace(scalar=AsyncMock(return_value=fault != "missing"), execute=AsyncMock())
+    if fault == "denied":
+        session.execute.side_effect = PermissionError("native read denied")
+    if fault == "missing":
+        with pytest.raises(RuntimeError, match="snapshot_required"):
+            await repair._require_geo_fence_rights(session, "mrf")
+        session.execute.assert_not_awaited()
+    elif fault == "denied":
+        with pytest.raises(PermissionError, match="native read denied"):
+            await repair._require_geo_fence_rights(session, "mrf")
+    else:
         await repair._require_geo_fence_rights(session, "mrf")
-    assert session.scalar.await_count == (2 if exists else 1)
+        assert session.execute.await_count == 2
+    session.scalar.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -190,7 +198,7 @@ async def test_final_cut_locks_heap_and_revision_before_recheck(monkeypatch):
     monkeypatch.setattr(repair, "_geo_snapshot", recheck)
     await repair._lock_geo_cut(capability, expected_by_field)
     statements = [str(call.args[0]) for call in session.execute.await_args_list]
-    assert "IN SHARE MODE NOWAIT" in statements[0] and "FOR SHARE NOWAIT" in statements[1]
+    assert "IN ACCESS SHARE MODE NOWAIT" in statements[0] and "FOR SHARE NOWAIT" in statements[1]
     recheck.assert_awaited_once_with(session, "mrf")
 
 
@@ -257,22 +265,33 @@ async def test_failed_attempt_cleans_only_issued_stage_and_never_publishes(monke
     publish.assert_not_awaited()
 
 
+def _pinned_location_reader(original):
+    """Expose actual read-only setup and bounded page results on a native connection seam."""
+    headers = [SimpleNamespace(_mapping={"source_id": "source-a", "resource_id": "loc-a", "record_bytes": 100})]
+    location_rows = [SimpleNamespace(_mapping=original)]
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[SimpleNamespace(all=lambda batch=batch: batch) for batch in ([], headers, location_rows, [])]
+        ),
+        in_transaction=lambda: True,
+        close=AsyncMock(),
+    )
+    driver = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(return_value=41))
+    session.connection = AsyncMock(
+        return_value=SimpleNamespace(
+            get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver))
+        )
+    )
+    return session, driver
+
+
 @pytest.mark.asyncio
 async def test_pinned_inputs_keep_canonicalizer_through_first_page(monkeypatch):
     """The actual pinned reader and page boundary retain the supplied canonicalizer."""
     provision = importlib.import_module("process.provider_directory_output_snapshot_provision")
     owner, original = _directory(), _row()
     owner._location_key_inputs = directory._location_key_inputs
-    headers = [SimpleNamespace(_mapping={"source_id": "source-a", "resource_id": "loc-a", "record_bytes": 100})]
-    location_rows = [SimpleNamespace(_mapping=original)]
-    session = SimpleNamespace(
-        execute=AsyncMock(
-            side_effect=[SimpleNamespace(all=lambda batch=batch: batch) for batch in (headers, location_rows, [])]
-        ),
-        in_transaction=lambda: True,
-        rollback=AsyncMock(),
-        close=AsyncMock(),
-    )
+    session, driver = _pinned_location_reader(original)
     database = SimpleNamespace(session_factory=lambda: session)
     owner.db = SimpleNamespace(
         _transaction_binding=lambda: None,
@@ -283,8 +302,7 @@ async def test_pinned_inputs_keep_canonicalizer_through_first_page(monkeypatch):
     publisher = SimpleNamespace(
         policy=SimpleNamespace(schema="mrf"), connection=SimpleNamespace(fetchval=AsyncMock(return_value=decision_at))
     )
-    driver = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(return_value=41))
-    incumbent = SimpleNamespace(oid=41, to_payload=lambda: {"oid": 41})
+    incumbent = SimpleNamespace(named_payload=lambda: {"schema": "mrf", "relation": repair.TARGET})
     batches = []
 
     def canonicalize(batch):
@@ -300,9 +318,8 @@ async def test_pinned_inputs_keep_canonicalizer_through_first_page(monkeypatch):
     monkeypatch.setattr(repair, "bound_publisher", lambda: publisher)
     monkeypatch.setattr(provision, "_capture", AsyncMock(return_value={repair.TARGET: {"oid": 41}}))
     monkeypatch.setattr(repair.custody, "_native_receipt", lambda *args: incumbent)
+    monkeypatch.setattr(repair.custody, "read_output_relations", AsyncMock(return_value={repair.TARGET: incumbent}))
     monkeypatch.setattr(repair, "_require_geo_fence_rights", AsyncMock())
-    monkeypatch.setattr(repair, "_require_reader", AsyncMock(return_value=driver))
-    monkeypatch.setattr(repair, "_same_database", AsyncMock())
     monkeypatch.setattr(repair, "_geo_snapshot", AsyncMock(return_value={"oid": 42}))
     async with repair._pinned_inputs(owner, {"run_id": None, "source_ids": None}, native, 1) as pinned:
         assert pinned.native is native and pinned.incumbent is incumbent
@@ -312,6 +329,11 @@ async def test_pinned_inputs_keep_canonicalizer_through_first_page(monkeypatch):
         repair._digest_rows(expected, repaired)
         assert pinned.expected_digest == expected.hexdigest()
     assert batches == [directory._location_key_inputs([original])]
-    assert not pinned.reader.is_active and session.execute.await_count == 3
-    session.rollback.assert_awaited_once()
+    assert not pinned.reader.is_active and session.execute.await_count == 4
+    assert (
+        str(session.execute.await_args_list[0].args[0]) == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+    )
+    driver.execute.assert_awaited_once_with(
+        'LOCK TABLE ONLY "mrf"."provider_directory_location" IN ACCESS SHARE MODE NOWAIT'
+    )
     session.close.assert_awaited_once()

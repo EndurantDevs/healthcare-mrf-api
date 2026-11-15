@@ -290,7 +290,9 @@ async def test_sample_is_deterministic_and_accounts_for_coverage(monkeypatch, ca
     assert f"population={population} sampled={len(sample_rows)} seed=" in caplog.text
 
 
-@pytest.mark.parametrize("damage", [None, "extra", "physical", "suffix"])
+@pytest.mark.parametrize(
+    "damage", [None, "legacy", "extra", "physical", "suffix", "wrong-schema", "mixed", "unknown-field"]
+)
 def test_prepared_compact_inventory_is_closed_by_name(damage):
     suffixes_by_root = {
         **layout.TABLE_SUFFIXES,
@@ -299,17 +301,30 @@ def test_prepared_compact_inventory_is_closed_by_name(damage):
     }
     binding_by_field = {
         "phase": "prepared",
+        "storage": {"storage_schema": "source_schema"},
         "auxiliary": None,
         "relationship_sha256": None,
-        "tables": {root: {"name": "pdgs_" + "a" * 32 + "_" + suffix} for root, suffix in suffixes_by_root.items()},
+        "tables": {
+            root: {"schema": "source_schema", "name": "pdgs_" + "a" * 32 + "_" + suffix}
+            for root, suffix in suffixes_by_root.items()
+        },
     }
+    if damage == "legacy":
+        for table in binding_by_field["tables"].values():
+            table.pop("schema")
     if damage == "extra":
         binding_by_field["tables"]["unexpected"] = {"name": "extra"}
-    elif damage == "physical":
+    if damage == "physical":
         binding_by_field["tables"]["resource_output_aliases"]["oid"] = 1
-    elif damage == "suffix":
+    if damage == "suffix":
         binding_by_field["tables"][storage.RESOURCE]["name"] = "pdgs_" + "a" * 32 + "_ri"
-    if damage is None:
+    if damage in {"wrong-schema", "mixed"}:
+        binding_by_field["tables"][storage.RESOURCE]["schema"] = "other_schema"
+        if damage == "mixed":
+            binding_by_field["tables"]["resource_input"].pop("schema")
+    if damage == "unknown-field":
+        binding_by_field["tables"][storage.RESOURCE]["unexpected"] = "value"
+    if damage in {None, "legacy"}:
         layout.validate_tables(binding_by_field)
         return
     with pytest.raises(ValueError):

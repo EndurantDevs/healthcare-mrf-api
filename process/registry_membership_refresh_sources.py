@@ -73,14 +73,10 @@ class RegistryMembershipRefreshSourceReaders:
                 raise RegistryRefreshAnchorUnavailable("registry_refresh_source_reader_invalid")
         if type(self.head_fences) is not RegistryMembershipRefreshHeadFences:
             raise RegistryRefreshAnchorUnavailable("registry_refresh_source_reader_invalid")
+        # Single-connection pools need separate capacity while head locks and source snapshots overlap.
         for sessions in (self.head_fences.aca_sessions, self.head_fences.generic_sessions):
             if sessions is not None and _read_engine(sessions).pool is _read_engine(self.source_reader_sessions).pool:
                 raise RegistryRefreshAnchorUnavailable("registry_refresh_source_reader_invalid")
-        generic = self.head_fences.generic_sessions
-        if generic is not None and (
-            _read_engine(generic).url.username == _read_engine(self.source_reader_sessions).url.username
-        ):
-            raise RegistryRefreshAnchorUnavailable("registry_refresh_source_reader_invalid")
 
     @property
     def aca_head_fence_sessions(self):

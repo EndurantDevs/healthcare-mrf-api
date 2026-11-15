@@ -13,7 +13,7 @@ from db.models import CodeCatalog, CodeRelationship, CodeSynonym
 from process import reference_family_archive as native
 from process import scoped_catalog_binding as binding
 from process.reference_family_composition import ReferenceModelContribution
-from process.scoped_catalog_publisher import PublisherSettings
+from process.scoped_catalog_publisher import _IDENTIFIER, PublisherSettings
 
 MODELS = (CodeCatalog, CodeSynonym, CodeRelationship)
 
@@ -25,6 +25,26 @@ class CatalogInput:
 
 
 @dataclass(frozen=True)
+class CatalogPublicationPolicy:
+    """Use an existing caller's configured native grants on its current transaction."""
+
+    schema: str
+    owner_role: str
+    reader_roles: tuple[str, ...]
+
+    def __post_init__(self):
+        if type(self.reader_roles) is not tuple or not 1 <= len(self.reader_roles) <= 32:
+            raise ValueError("catalog publication role configuration differs")
+        names = (self.schema, self.owner_role, *self.reader_roles)
+        if (
+            any(type(name) is not str or not _IDENTIFIER.fullmatch(name) or name.lower() == "public" for name in names)
+            or len(set(self.reader_roles)) != len(self.reader_roles)
+            or self.owner_role in self.reader_roles
+        ):
+            raise ValueError("catalog publication role configuration differs")
+
+
+@dataclass(frozen=True)
 class ComposedCatalog:
     importer: str
     spec: native.ReferenceFamilySpec
@@ -32,7 +52,7 @@ class ComposedCatalog:
     incumbent: native.ReferenceFamilyIncumbent
     generations: dict
     logical_handoff: dict
-    settings: PublisherSettings
+    settings: PublisherSettings | CatalogPublicationPolicy
 
 
 def input_spec(importer):
@@ -197,7 +217,7 @@ async def copy_received_input(session, importer, destination, source_schema, sou
     ) or not isinstance(source_copy, native.ReferenceFamilySourceCopy):
         raise RuntimeError("received catalog COPY scope differs")
     incoming = await precreate_catalog_input(session, importer, destination)
-    await native._lock_family(session, source_schema, source_tables, "SHARE", nowait=True)
+    await native._lock_family(session, source_schema, source_tables, "ACCESS SHARE", nowait=True)
     oids = tuple([await native._relation_oid(session, source_schema, name) for name in source_tables])
     await _require_native_read_structure(session, oids, ())
     remaining = source_copy.max_bytes
@@ -239,7 +259,7 @@ async def copy_received_input(session, importer, destination, source_schema, sou
     return incoming
 
 
-async def compose_catalog_family(session, schema, importer, incoming, rules, source_copy):
+async def compose_catalog_family(session, schema, importer, incoming, rules, source_copy, *, publication_policy=None):
     """Use explicit protected settings and fence every installed logical source generation."""
     from process import code_sets_result_archive as codes
     from process import ms_drg_result_archive as drg
@@ -247,7 +267,9 @@ async def compose_catalog_family(session, schema, importer, incoming, rules, sou
     from process import scoped_catalog_named_generation as generations
     from process import scoped_catalog_named_storage as storage
 
-    settings = PublisherSettings.from_environment()
+    if publication_policy is not None and type(publication_policy) is not CatalogPublicationPolicy:
+        raise ValueError("catalog publication configuration differs")
+    settings = publication_policy if publication_policy is not None else PublisherSettings.from_environment()
     if settings.schema != schema or incoming.spec != input_spec(importer):
         raise RuntimeError("catalog operator destination or input differs")
     await _input_handles(session, incoming.spec, incoming.ownership.dataset_id, incoming.ownership.schema_name)

@@ -19,7 +19,6 @@ from process.uhc_flex_practitioner_contract import (
 )
 from tests.test_provider_directory_profile_selection_attestation import _execution
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -70,14 +69,10 @@ def _desired_identity():
         source_ids=[source_id for source_id, _dataset_id in source_vector],
         dataset_ids=[dataset_id for _source_id, dataset_id in source_vector],
         source_vector=source_vector,
-        source_vector_hash=(
-            importer._provider_directory_profile_source_vector_hash(source_vector)
-        ),
+        source_vector_hash=(importer._provider_directory_profile_source_vector_hash(source_vector)),
         source_context_vector=source_context_vector,
         source_context_vector_hash=(
-            importer._provider_directory_profile_source_context_vector_hash(
-                source_context_vector
-            )
+            importer._provider_directory_profile_source_context_vector_hash(source_context_vector)
         ),
     )
 
@@ -101,18 +96,13 @@ def _legacy_serving_state():
         profile_schema_version=1,
         profile_strategy_version=LEGACY_V4_STRATEGY,
         source_vector=source_vector,
-        source_vector_hash=(
-            importer._provider_directory_profile_source_vector_hash(source_vector)
-        ),
+        source_vector_hash=(importer._provider_directory_profile_source_vector_hash(source_vector)),
         source_context_vector=source_context_vector,
         source_context_vector_hash=(
-            importer._provider_directory_profile_source_context_vector_hash(
-                source_context_vector
-            )
+            importer._provider_directory_profile_source_context_vector_hash(source_context_vector)
         ),
         executable_plan_hash="3" * 64,
-        evidence_target_oid=11,
-        profile_target_oid=12,
+        targets=importer._provider_directory_profile_target_coordinates("mrf"),
         evidence_rows=10,
         profile_rows=5,
         profile_as_of="2026-08-09",
@@ -124,10 +114,7 @@ def test_v4_contexts_refresh_every_v6_source() -> None:
     serving_state = _legacy_serving_state()
     desired = _desired_identity()
 
-    assert (
-        serving_state.source_context_vector[0][1]
-        != dict(desired.source_context_vector)["source-a"]
-    )
+    assert serving_state.source_context_vector[0][1] != dict(desired.source_context_vector)["source-a"]
     assert importer._provider_directory_profile_delta_sources(
         serving_state,
         desired.source_vector,
@@ -136,9 +123,7 @@ def test_v4_contexts_refresh_every_v6_source() -> None:
 
 
 def _canonical_dataset_context(source_id: str):
-    endpoint_id = dict(profile_artifact.configured_dataset_scoped_profile_endpoints())[
-        source_id
-    ]
+    endpoint_id = dict(profile_artifact.configured_dataset_scoped_profile_endpoints())[source_id]
     return importer._provider_directory_profile_source_context_vector(
         (
             importer._ProviderDirectoryProfileSourceContext(
@@ -147,9 +132,7 @@ def _canonical_dataset_context(source_id: str):
                 canonical_api_base="https://synthetic.invalid/R4",
                 org_name="Synthetic dataset variant",
                 plan_name=None,
-                authority_id=(
-                    profile_artifact.profile_reviewed_source_authority_id(source_id)
-                ),
+                authority_id=(profile_artifact.profile_reviewed_source_authority_id(source_id)),
             ),
         )
     )
@@ -162,14 +145,10 @@ def _v5_dataset_serving_state(source_id: str, dataset_id: str):
         _legacy_serving_state(),
         profile_strategy_version=LEGACY_V5_STRATEGY,
         source_vector=source_vector,
-        source_vector_hash=(
-            importer._provider_directory_profile_source_vector_hash(source_vector)
-        ),
+        source_vector_hash=(importer._provider_directory_profile_source_vector_hash(source_vector)),
         source_context_vector=source_context_vector,
         source_context_vector_hash=(
-            importer._provider_directory_profile_source_context_vector_hash(
-                source_context_vector
-            )
+            importer._provider_directory_profile_source_context_vector_hash(source_context_vector)
         ),
     )
 
@@ -178,9 +157,7 @@ def test_v5_to_v6_variants_refresh_and_remove_old_generation() -> None:
     legacy_dataset = "pdufpd_" + "1" * 48
     rooted_dataset = "pdrgpd_" + "2" * 48
     legacy_context = _canonical_dataset_context(UHC_FLEX_PRACTITIONER_SOURCE_ID)
-    rooted_context = _canonical_dataset_context(
-        PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID
-    )
+    rooted_context = _canonical_dataset_context(PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID)
 
     legacy_serving = _v5_dataset_serving_state(
         UHC_FLEX_PRACTITIONER_SOURCE_ID,
@@ -223,9 +200,7 @@ async def test_v4_serving_generation_uses_v6_source_delta(monkeypatch) -> None:
         "_provider_directory_profile_delta_serving_state",
         AsyncMock(return_value=serving_state),
     )
-    execution_token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
-        _execution()
-    )
+    execution_token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(_execution())
     try:
         materialization = await importer._profile_materialization_identity(
             "mrf",

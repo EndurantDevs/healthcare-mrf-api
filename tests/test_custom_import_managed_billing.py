@@ -91,10 +91,10 @@ def _signed(*, client="sample-client", include_filter=True, damage=None):
 
 def _install(monkeypatch, boundary):
     session = Session()
+    install_pipeline(monkeypatch, session)
     session.connection = boundary.session.connection
     session.get_transaction = boundary.session.get_transaction
     session.get_nested_transaction = boundary.session.get_nested_transaction
-    install_pipeline(monkeypatch, session)
 
     @asynccontextmanager
     async def snapshot(*_args, **_kwargs):

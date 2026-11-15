@@ -3,14 +3,25 @@ import types
 from unittest.mock import AsyncMock
 
 import pytest
-
-from tests.provider_profile_snapshot_test_support import stub_provider_profile_snapshot as stub_provider_profile_snapshot
 import sanic.exceptions
+
+from tests.provider_profile_snapshot_test_support import (
+    stub_provider_profile_snapshot as stub_provider_profile_snapshot,
+)
 
 pytest.importorskip("pytz")
 
 from api.endpoint import npi as npi_module
 from db.models import NPIAddress, NPIDataTaxonomy
+
+
+@pytest.fixture(autouse=True)
+def _stub_optional_metadata(monkeypatch):
+    monkeypatch.setattr(npi_module, "_fetch_provider_directory_profile_map", AsyncMock(return_value={}))
+    monkeypatch.setattr(npi_module, "_npi_canonical_publication_identity", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        npi_module, "_provider_directory_address_overlay_serving_identity", AsyncMock(return_value="offline")
+    )
 
 
 class FakeConnection:
@@ -362,9 +373,7 @@ async def test_get_all_degrades_when_provider_enrichment_summary_fails(monkeypat
         AsyncMock(side_effect=RuntimeError("transient")),
     )
 
-    response = await npi_module.get_all(
-        types.SimpleNamespace(args={"limit": "1"}, app=types.SimpleNamespace())
-    )
+    response = await npi_module.get_all(types.SimpleNamespace(args={"limit": "1"}, app=types.SimpleNamespace()))
     response_payload = json.loads(response.body)
 
     assert response_payload["total"] == 1
@@ -401,30 +410,51 @@ async def test_get_all_can_include_chain_provider_enrichment(monkeypatch):
 
     assert response_payload["rows"][0]["provider_enrichment_summary"]["status"] == "enriched"
     fetch_summary.assert_awaited_once_with([1234567890], include_chain=True, session=None)
+
+
 async def _build_npi_street_city_details(npi, **_kwargs):
     """Return the address fixture used to check default and expanded output."""
     return {
-        "npi": npi, "taxonomy_list": [], "taxonomy_group_list": [],
+        "npi": npi,
+        "taxonomy_list": [],
+        "taxonomy_group_list": [],
         "do_business_as": [],
         "address_list": [
             {
-                "type": "primary", "first_line": "1200 1ST ST NE",
-                "city_name": "WASHINGTON", "state_name": "DC", "postal_code": "20002",
+                "type": "primary",
+                "first_line": "1200 1ST ST NE",
+                "city_name": "WASHINGTON",
+                "state_name": "DC",
+                "postal_code": "20002",
                 "address_key": "3a47e595-03bf-597d-8825-04b75d783fc9",
-                "address_precision": "street", "address_sources": ["nppes"],
-                "source_count": 1, "lat": 38.0, "long": -77.0,
+                "address_precision": "street",
+                "address_sources": ["nppes"],
+                "source_count": 1,
+                "lat": 38.0,
+                "long": -77.0,
             },
             {
-                "type": "practice", "first_line": "1200 First Street, NE",
-                "city_name": "WASHINGTON", "state_name": "DC", "postal_code": "20002",
+                "type": "practice",
+                "first_line": "1200 First Street, NE",
+                "city_name": "WASHINGTON",
+                "state_name": "DC",
+                "postal_code": "20002",
                 "address_key": "3a47e595-03bf-597d-8825-04b75d783fc9",
-                "address_precision": "street", "address_sources": ["mrf"],
-                "source_count": 1, "lat": 38.0, "long": -77.0,
+                "address_precision": "street",
+                "address_sources": ["mrf"],
+                "source_count": 1,
+                "lat": 38.0,
+                "long": -77.0,
             },
             {
-                "type": "secondary", "first_line": None, "city_name": "WASHINGTON",
-                "state_name": "DC", "postal_code": "20002", "address_precision": "city_zip",
-                "lat": 38.0, "long": -77.0,
+                "type": "secondary",
+                "first_line": None,
+                "city_name": "WASHINGTON",
+                "state_name": "DC",
+                "postal_code": "20002",
+                "address_precision": "city_zip",
+                "lat": 38.0,
+                "long": -77.0,
             },
         ],
     }

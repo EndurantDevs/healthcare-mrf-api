@@ -59,15 +59,48 @@ def required_geo_taxonomy_index_sql(schema_literal, table_literal, required_lite
     """Bind SQL literals quoted by the existing stage helper and a closed native OID."""
     if table_oid is not None and (type(table_oid) is not int or not 0 < table_oid <= 4294967295):
         raise ValueError("Geo search table identity is invalid")
-    required_selector = (
-        f"AND required_index.relname = {required_literal}"
-        if table_oid is None
-        else f"AND stage_table.oid = {table_oid}"
-    )
-    geo_selector = f"AND geo_index.relname = {geo_literal}" if table_oid is None else ""
+    if table_oid is not None:
+        required_selector, geo_selector = f"AND stage_table.oid = {table_oid}", ""
+    elif required_literal is None:
+        # A rotated heap keeps its original index names, so its qualified table name selects the indexes.
+        required_selector, geo_selector = "", ""
+    else:
+        required_selector = f"AND required_index.relname = {required_literal}"
+        geo_selector = f"AND geo_index.relname = {geo_literal}"
     return _GEO_TAXONOMY_INDEX_SQL.format(
         schema_literal=schema_literal,
         table_literal=table_literal,
         required_selector=required_selector,
         geo_selector=geo_selector,
     )
+
+
+def partial_scope_index_sql(schema_literal: str, index_literal: str) -> str:
+    """Check the complete ordered partial-refresh index using prequoted literals."""
+    return f"""
+    SELECT EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_index AS index_meta
+          JOIN pg_catalog.pg_class AS table_meta
+            ON table_meta.oid = index_meta.indrelid
+          JOIN pg_catalog.pg_namespace AS namespace_meta
+            ON namespace_meta.oid = table_meta.relnamespace
+          JOIN pg_catalog.pg_class AS index_relation
+            ON index_relation.oid = index_meta.indexrelid
+         WHERE namespace_meta.nspname = {schema_literal}
+           AND table_meta.relname = 'provider_directory_address_overlay'
+           AND index_relation.relname = {index_literal}
+           AND index_meta.indisvalid IS TRUE
+           AND index_meta.indisready IS TRUE
+           AND index_meta.indislive IS TRUE
+           AND index_meta.indpred IS NULL
+           AND index_meta.indexprs IS NULL
+           AND (
+                SELECT array_agg(attribute_meta.attname::text ORDER BY index_column.ordinality)
+                  FROM unnest(index_meta.indkey) WITH ORDINALITY AS index_column(attnum, ordinality)
+                  JOIN pg_catalog.pg_attribute AS attribute_meta
+                    ON attribute_meta.attrelid = table_meta.oid
+                   AND attribute_meta.attnum = index_column.attnum
+               ) = ARRAY['source_id', 'last_seen_run_id', 'resource_type', 'resource_id']::text[]
+    );
+    """

@@ -22,10 +22,10 @@ from process.network_membership_copy import MembershipCopyTarget
 from process.registry_source_contribution_store import _COUNTERS, locally_owned_source_descriptor
 from process.registry_source_recipe_composition import RegistrySourceRecipeStage
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+from tests.registry_source_recipe_support import _example
 from tests.test_network_fhir_retained_capture import pin, retained
 from tests.test_registry_ptg_office_membership_recipe import _recipe as ptg_recipe
 from tests.test_registry_source_contributions import _descriptor, _fact, _recipe
-from tests.test_registry_source_recipe_store_postgres import _example
 
 
 def _target():
@@ -530,7 +530,12 @@ async def test_builder_authenticates_fact_origin_but_only_prepares_rows(monkeypa
     recipe, target = _recipe(), _target()
     descriptor = _descriptor(recipe)
     if anchored:
-        descriptor |= {"fact_candidate_id": str(uuid4()), "fact_table_oid": 123, "fact_seal_sha256": "c" * 64}
+        descriptor |= {
+            "fact_candidate_id": str(uuid4()),
+            "fact_schema_name": "original",
+            "fact_table_name": "network_source_contribution",
+            "fact_generation_id": "c" * 64,
+        }
     native = projection._validated_descriptor(descriptor)
     verify = AsyncMock(return_value={native["recipe_sha256"]: SimpleNamespace(relation='"original".facts')})
     monkeypatch.setattr(projection, "_candidate", AsyncMock())
@@ -565,7 +570,12 @@ def _staged_descriptors(recipes, *, anchored=False, zero=False):
     descriptors = [locally_owned_source_descriptor(_descriptor(recipe)) for recipe in recipes]
     for descriptor in descriptors:
         if anchored:
-            descriptor.update(fact_candidate_id=str(uuid4()), fact_table_oid=123, fact_seal_sha256="c" * 64)
+            descriptor.update(
+                fact_candidate_id=str(uuid4()),
+                fact_schema_name="original",
+                fact_table_name="network_source_contribution",
+                fact_generation_id="c" * 64,
+            )
         if zero:
             descriptor.update(dict.fromkeys(_COUNTERS, 0))
             descriptor["fact_sha256"] = hashlib.sha256(b"").hexdigest()

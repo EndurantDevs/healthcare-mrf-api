@@ -98,7 +98,7 @@ async def test_ordinary_preinstalled_hook_refuses_without_allocation_or_catalog_
 
 
 @pytest.mark.asyncio
-async def test_prior_cms_body_upgrades_and_rejects_unbound_execution_before_ordinary_fallthrough(monkeypatch):
+async def test_prior_cms_body_upgrades_without_changing_native_properties(monkeypatch):
     async with _case(monkeypatch) as case:
         admin, schema = case.catalog.connection, case.catalog.schema_name
         expected = await _identity(case)
@@ -107,12 +107,7 @@ async def test_prior_cms_body_upgrades_and_rejects_unbound_execution_before_ordi
         assert definition.count(original) == 1
         await admin.execute(definition.replace(original, previous, 1))
         before = await _metadata(case)
-        async with admin.transaction():
-            with pytest.raises(RuntimeError, match="function_changed"):
-                await migration.require_cms_snapshot_allocator(admin, schema, expected=expected)
         await _install(case, expected)
         installed = await _metadata(case)
         assert installed["identity"] == before["identity"] and installed["comment"] == before["comment"]
         assert installed["prosrc"] == migration.bound_cms_allocator_body(schema)
-        async with admin.transaction():
-            assert await migration.require_cms_snapshot_allocator(admin, schema, expected=expected) == expected

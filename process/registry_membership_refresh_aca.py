@@ -4,11 +4,12 @@
 import json
 from dataclasses import replace
 
-from process.mrf_publication_receipt import SUMMARY_INPUTS
+from process.mrf_publication_receipt import SUMMARY_INPUTS, _is_reference_generation_current
 from process.network_address_projection import _identifier
 from process.network_legacy_membership_source import with_aca_global_epoch, with_aca_successor
 from process.reference_family_result_generation import (
     current_reference_family_relation_oids,
+    declared_reference_family_relations,
     read_reference_family_result_generation_authority,
 )
 from process.registry_aca_global_epoch import PinnedACAGlobalEpoch
@@ -32,8 +33,12 @@ async def _current_publication(session, driver, source_schema):
     generation = await read_reference_family_result_generation_authority(
         session, importer_id="mrf", schema_name=source_schema
     )
-    physical = await current_reference_family_relation_oids(session, importer_id="mrf", schema_name=source_schema)
-    if json.loads(publication["generation"]) != generation.as_dict() or generation.relation_oids != physical:
+    await current_reference_family_relation_oids(session, importer_id="mrf", schema_name=source_schema)
+    if generation.relations != declared_reference_family_relations(
+        "mrf", source_schema
+    ) or not _is_reference_generation_current(
+        json.loads(publication["generation"]), generation.as_dict(), source_schema
+    ):
         _unavailable()
     completion_by_field = {name: publication[name] for name in ("attempt_id", "import_id", "summary_oid")}
     completion_by_field["generation"] = generation.as_dict()
@@ -92,7 +97,12 @@ async def _current_accepted(session, driver, store, completion, serving, budget)
             else pin.prepared.manifest.source_metadata.get("aca_completed_publication")
         )
         if type(native) is not dict or any(
-            native.get(key) != expected_value for key, expected_value in completion.items()
+            native.get(key) != expected_value for key, expected_value in completion.items() if key != "generation"
+        ):
+            _unavailable()
+        current_generation = completion["generation"]
+        if not _is_reference_generation_current(
+            native.get("generation"), current_generation, current_generation["relations"][0]["schema_name"]
         ):
             _unavailable()
         if pin.prepared.manifest.source_serving_generation.as_dict() != serving:

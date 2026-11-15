@@ -10,7 +10,7 @@ from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 
 from api.code_systems import canonical_catalog_code
-from api.network_read_execution import direct_heap_relation_sql, execute_network_read, has_network_read_inventory
+from api.network_read_execution import qualified_relation_sql
 from api.ptg2_code_filters import (
     INTERNAL_PROCEDURE_CODE_SYSTEM,
     PROCEDURE_CODE_SYSTEMS,
@@ -51,11 +51,10 @@ async def _query_ptg2_code_crosswalk_edges(session, pairs: set[tuple[str, str]])
             """
         )
     relation = f"{PTG2_SCHEMA}.code_crosswalk"
-    if has_network_read_inventory(session):
-        relation = direct_heap_relation_sql(session, PTG2_SCHEMA, "code_crosswalk")
+    if getattr(session, "info", {}).get("api_reader_verified") is True:
+        relation = qualified_relation_sql(PTG2_SCHEMA, "code_crosswalk")
     try:
-        query_result = await execute_network_read(
-            session,
+        query_result = await session.execute(
             text(
                 f"""
                 SELECT from_system, from_code, to_system, to_code, match_type, confidence, source

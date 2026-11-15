@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Original artifact layouts, index phases and authenticated recovery."""
+"""Artifact layouts, native index phases and qualified-name recovery."""
 
 
 def _artifact_scope_pk_names(fhir, table_name):
@@ -24,39 +24,59 @@ async def _build_artifact_scope_pk(fhir, model, schema, table_name, *, status_ex
         await execute_status(statement)
 
 
-async def _artifact_scope_recovery_heap_fingerprint(fhir, schema, relation_name, relation_oid, model):
-    """Remove only independently verified index phases from native heap comparison."""
-    from process.provider_directory_cms_nonprofile_observation import catalog_observation
+async def _artifact_scope_recovery_heap_fingerprint(fhir, schema, relation_name, model):
+    """Validate the actual named heap and return portable structure, not catalog identity."""
+    from process.provider_directory_output_snapshot_catalog import OUTPUT_CATALOG_SQL, decoded, portable_catalog_payload
 
-    layout = await fhir._provider_directory_profile_relation_storage_fingerprint(relation_oid, expected_persistence="u")
-    reader = catalog_observation(fhir, None)
-    relation, toast_oid = await reader._profile_capacity_relation_row(relation_oid, "u", 0)
-    owned = await fhir.db.scalar(
-        "SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=CAST(:relation_oid AS oid) AND n.nspname=:schema AND c.relname=:name AND c.relowner=(SELECT oid FROM pg_roles WHERE rolname=current_user))",
-        relation_oid=relation_oid,
-        schema=schema,
-        name=relation_name,
+    statement = OUTPUT_CATALOG_SQL.replace("$1", ":schema_name").replace(
+        "$2::text[]", "CAST(:relation_names AS text[])"
     )
-    if owned is not True or relation["schema_name"] != schema or relation["relation_name"] != relation_name:
-        raise fhir.ProviderDirectoryArtifactBuildStale("provider_directory_artifact_scope_recovery_owner_changed")
-    relation_oids = [relation_oid] + ([toast_oid] if toast_oid is not None else [])
-    attributes, indexes, constraints, triggers = await reader._profile_capacity_relation_catalog(relation_oids)
-    await fhir._artifact_scope_recovery_index_phase(schema, relation_name, relation_oid, model, indexes, constraints)
-    toast_indexes = [index for index in indexes if int(index["relation_oid"]) != relation_oid]
-    heap_constraints = [
-        entry for entry in constraints if int(entry["relation_oid"]) != relation_oid or entry["constraint_type"] != "p"
+    catalog_row = await fhir.db.first(statement, schema_name=schema, relation_names=[relation_name])
+    if catalog_row is None:
+        raise fhir.ProviderDirectoryArtifactBuildStale("provider_directory_artifact_scope_recovery_heap_missing")
+    native = fhir._pagination_checkpoint_row_mapping(catalog_row)
+    topology = decoded(native["topology"])
+    if (
+        native["relname"] != relation_name
+        or topology["kind"] != "r"
+        or topology["persistence"] != "u"
+        or topology["access_method"] != "heap"
+        or any(topology[key] for key in ("partition", "rls", "force_rls", "parents", "children", "hooks", "rules"))
+    ):
+        raise fhir.ProviderDirectoryArtifactBuildStale("provider_directory_artifact_scope_recovery_heap_changed")
+    indexes, constraints = await _recovery_index_catalog(fhir, schema, relation_name)
+    await fhir._artifact_scope_recovery_index_phase(schema, relation_name, model, indexes, constraints)
+    heap = portable_catalog_payload(native)
+    heap.pop("relname")
+    heap.pop("indexes")
+    column_by_number = {column["number"]: column["name"] for column in heap["columns"]}
+    heap["columns"] = [
+        {key: column_value for key, column_value in column.items() if key != "number"} for column in heap["columns"]
     ]
-    _exact, heap = fhir._profile_capacity_fingerprint_payloads(
-        relation, attributes, toast_indexes, heap_constraints, triggers, relation_oid
+    heap["constraints"] = [
+        {
+            **entry,
+            "keys": [column_by_number[number] for number in entry["keys"]] if entry.get("keys") is not None else None,
+        }
+        for entry in heap["constraints"]
+        if entry["type"] != "p"
+    ]
+    return tuple(index["index_name"] for index in indexes), heap
+
+
+async def _artifact_scope_recovery_index_phase(fhir, schema, relation_name, model, indexes, constraints):
+    """Require the exact allowed heap/PK-build/attached-PK/bucket index prefix."""
+    main_indexes = [dict(index) for index in indexes]
+    fields = (
+        "constraint_type",
+        "condeferrable",
+        "condeferred",
+        "convalidated",
+        "connoinherit",
+        "constraint_definition",
     )
-    return (layout, fhir._identity_hash(heap))
-
-
-async def _artifact_scope_recovery_index_phase(fhir, schema, relation_name, relation_oid, model, indexes, constraints):
-    """Allow only the exact heap, PK-build, is_attached-PK and optional bucket prefix."""
-    main_indexes = [index for index in indexes if int(index["relation_oid"]) == relation_oid]
-    main_constraints = [entry for entry in constraints if int(entry["relation_oid"]) == relation_oid]
-    fhir._assert_artifact_scope_native_not_null(model, relation_oid, main_constraints)
+    main_constraints = [{key: entry[key] for key in fields} for entry in constraints]
+    fhir._assert_artifact_scope_native_not_null(model, main_constraints)
     main_constraints = [entry for entry in main_constraints if entry["constraint_type"] != "n"]
     build_name, pk_name = fhir._artifact_scope_pk_names(relation_name)
     bucket_name, _statement = fhir._provider_directory_profile_bucket_index_sql(schema, relation_name)
@@ -71,39 +91,35 @@ async def _artifact_scope_recovery_index_phase(fhir, schema, relation_name, rela
     expected_constraints = (
         [
             {
-                "relation_oid": relation_oid,
                 "constraint_type": "p",
                 "condeferrable": False,
                 "condeferred": False,
                 "convalidated": True,
                 "connoinherit": True,
                 "constraint_definition": "PRIMARY KEY ("
-                + ", ".join((column.name for column in model.__table__.primary_key.columns))
+                + ", ".join(column.name for column in model.__table__.primary_key.columns)
                 + ")",
             }
         ]
         if is_attached
         else []
     )
-    if main_constraints != expected_constraints or (bucket_name in by_name and (not is_attached)):
+    if main_constraints != expected_constraints or (bucket_name in by_name and not is_attached):
         raise fhir.ProviderDirectoryArtifactBuildStale("provider_directory_artifact_scope_recovery_constraints_changed")
     for name, index in by_name.items():
         if index["reloptions"] != []:
             raise fhir.ProviderDirectoryArtifactBuildStale("provider_directory_artifact_scope_recovery_indexes_changed")
         native = await fhir._profile_bucket_index_row(schema, relation_name, name, relation_name)
-        if native["table_oid"] != relation_oid or native["index_oid"] != index["index_oid"]:
-            raise fhir.ProviderDirectoryArtifactBuildStale("provider_directory_artifact_scope_recovery_oid_changed")
         if name == bucket_name:
             fhir._validate_profile_bucket_index_shape(native, relation_name)
         else:
             fhir._artifact_scope_recovery_pk_shape(native, model, is_attached)
 
 
-def _assert_artifact_scope_native_not_null(fhir, model, relation_oid, constraints):
-    """Retain native NOT NULL enforcement while comparing permitted index phases."""
+def _assert_artifact_scope_native_not_null(fhir, model, constraints):
+    """Keep complete native NOT NULL semantics for the declared model columns."""
     expected_constraints = [
         dict(
-            relation_oid=relation_oid,
             constraint_type="n",
             condeferrable=False,
             condeferred=False,
@@ -114,7 +130,21 @@ def _assert_artifact_scope_native_not_null(fhir, model, relation_oid, constraint
         for column in model.__table__.columns
         if not column.nullable
     ]
-    observed_constraints = [entry for entry in constraints if entry["constraint_type"] == "n"]
+    observed_constraints = [
+        {
+            key: entry[key]
+            for key in (
+                "constraint_type",
+                "condeferrable",
+                "condeferred",
+                "convalidated",
+                "connoinherit",
+                "constraint_definition",
+            )
+        }
+        for entry in constraints
+        if entry["constraint_type"] == "n"
+    ]
     definitions = [entry["constraint_definition"] for entry in observed_constraints]
     if len(definitions) != len(set(definitions)) or (
         observed_constraints
@@ -204,59 +234,33 @@ async def _reserve_artifact_scope_layout_wal(fhir, *, statement_count=None):
         )
 
 
-async def _is_artifact_scope_recovery_referenced(fhir, schema, relation_oids):
-    """Return whether serving or checkpoint state retains any scratch OID."""
+async def _is_artifact_scope_recovery_referenced(fhir, schema, relation_names):
+    """Refuse native cleanup while a logical checkpoint or serving record retains a name."""
     checkpoint_ref = fhir._provider_directory_profile_checkpoint_ref(schema)
     serving_ref = fhir._provider_directory_profile_serving_generation_ref(schema)
     receipt_ref = fhir._provider_directory_profile_delta_receipt_ref(schema)
+    targets = " OR ".join(
+        f"(targets_json->'{role}'->>'schema'=:schema AND "
+        f"targets_json->'{role}'->>'name'=ANY(CAST(:relation_names AS text[])))"
+        for role in ("evidence", "profile")
+    )
+    stages = " OR ".join(
+        f"{column}=ANY(CAST(:relation_names AS text[]))"
+        for column in ("evidence_stage", "profile_stage", "affected_npi_stage")
+    )
     return bool(
         await fhir.db.scalar(
-            f"""
-            SELECT EXISTS (
-                SELECT 1
-                  FROM {checkpoint_ref}
-                 WHERE evidence_stage_oid = ANY(
-                           CAST(:relation_oids AS bigint[])
-                       )
-                    OR profile_stage_oid = ANY(
-                           CAST(:relation_oids AS bigint[])
-                       )
-                    OR affected_npi_stage_oid = ANY(
-                           CAST(:relation_oids AS bigint[])
-                       )
-                    OR evidence_target_oid = ANY(
-                           CAST(:relation_oids AS bigint[])
-                       )
-                    OR profile_target_oid = ANY(
-                           CAST(:relation_oids AS bigint[])
-                       )
-                UNION ALL
-                SELECT 1
-                  FROM {serving_ref}
-                 WHERE evidence_target_oid = ANY(
-                           CAST(:relation_oids AS bigint[])
-                       )
-                    OR profile_target_oid = ANY(
-                           CAST(:relation_oids AS bigint[])
-                       )
-                UNION ALL
-                SELECT 1
-                  FROM {receipt_ref}
-                 WHERE evidence_target_oid = ANY(
-                           CAST(:relation_oids AS bigint[])
-                       )
-                    OR profile_target_oid = ANY(
-                           CAST(:relation_oids AS bigint[])
-                       )
-            );
-            """,
-            relation_oids=relation_oids,
+            f"SELECT EXISTS(SELECT 1 FROM {checkpoint_ref} WHERE {stages} OR {targets} "
+            f"UNION ALL SELECT 1 FROM {serving_ref} WHERE {targets} "
+            f"UNION ALL SELECT 1 FROM {receipt_ref} WHERE {targets})",
+            schema=schema,
+            relation_names=relation_names,
         )
     )
 
 
 async def _assert_artifact_scope_recovery_layouts(fhir, schema, coordinates, prior_identities, admission):
-    """Authenticate exact old index phases before comparing fresh heap layouts."""
+    """Compare complete named heap structure after validating every permitted prior phase."""
     current_identities = await fhir._artifact_scope_relation_identities(
         schema, (coordinate.current_table_name for coordinate in coordinates)
     )
@@ -266,18 +270,13 @@ async def _assert_artifact_scope_recovery_layouts(fhir, schema, coordinates, pri
     models_by_name = {model.__tablename__: model for model in (fhir.ProviderDirectorySource, *fhir.RESOURCE_MODELS)}
     for coordinate in coordinates:
         model = models_by_name[coordinate.base_table_name]
-        prior_layout, prior_heap = await fhir._artifact_scope_recovery_heap_fingerprint(
-            schema, coordinate.prior_table_name, prior_identities[coordinate.prior_table_name][0], model
+        _prior_indexes, prior_heap = await fhir._artifact_scope_recovery_heap_fingerprint(
+            schema, coordinate.prior_table_name, model
         )
-        current_layout, current_heap = await fhir._artifact_scope_recovery_heap_fingerprint(
-            schema, coordinate.current_table_name, current_identities[coordinate.current_table_name][0], model
+        current_indexes, current_heap = await fhir._artifact_scope_recovery_heap_fingerprint(
+            schema, coordinate.current_table_name, model
         )
-        if (
-            current_layout.main_index_oids
-            or prior_heap != current_heap
-            or prior_layout.effective_tablespace_oids != (admission.geometry.tablespace_oid,)
-            or (current_layout.effective_tablespace_oids != (admission.geometry.tablespace_oid,))
-        ):
+        if current_indexes or prior_heap != current_heap:
             raise fhir.ProviderDirectoryArtifactBuildStale("provider_directory_artifact_scope_recovery_layout_changed")
 
 
@@ -322,10 +321,29 @@ async def _replace_terminal_artifact_scope(fhir, schema, plan, coordinates, prio
         locked_identities = await fhir._artifact_scope_relation_identities(schema, prior_names)
         if locked_identities != initial_identities:
             raise fhir.ProviderDirectoryArtifactBuildStale("provider_directory_artifact_scope_recovery_oid_changed")
-        await fhir._assert_artifact_scope_recovery_unreferenced(
-            schema, [identity[0] for identity in locked_identities.values()], admission
-        )
+        await fhir._assert_artifact_scope_recovery_unreferenced(schema, list(locked_identities), admission)
         await fhir._create_recovery_artifact_scope_layouts(schema, plan)
         await fhir._assert_artifact_scope_recovery_layouts(schema, coordinates, locked_identities, admission)
         for prior_name in reversed(sorted(prior_names)):
-            await fhir.profile_artifact_custody.recovery_status(fhir, f"DROP TABLE {fhir._qt(schema, prior_name)};")
+            await fhir.profile_artifact_custody.recovery_status(
+                fhir, f"DROP TABLE {fhir._qt(schema, prior_name)} RESTRICT;"
+            )
+
+
+async def _recovery_index_catalog(fhir, schema, relation_name):
+    """Read complete native index phases by qualified names, without stored handles."""
+    relation = fhir._unscoped_qt(schema, relation_name)
+    indexes = await fhir.db.all(
+        "SELECT idx.relname AS index_name,COALESCE(idx.reloptions,ARRAY[]::text[]) AS reloptions "
+        "FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid WHERE i.indrelid=to_regclass(:relation) ORDER BY idx.relname",
+        relation=relation,
+    )
+    constraints = await fhir.db.all(
+        "SELECT k.contype::text AS constraint_type,k.condeferrable,k.condeferred,k.convalidated,k.connoinherit,"
+        "pg_get_constraintdef(k.oid) AS constraint_definition FROM pg_constraint k WHERE k.conrelid=to_regclass(:relation) ORDER BY k.contype,pg_get_constraintdef(k.oid)",
+        relation=relation,
+    )
+    return (
+        [fhir._pagination_checkpoint_row_mapping(row) for row in indexes],
+        [fhir._pagination_checkpoint_row_mapping(row) for row in constraints],
+    )

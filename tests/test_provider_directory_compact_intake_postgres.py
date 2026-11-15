@@ -295,7 +295,12 @@ async def test_compact_intake_closes_default_table_column_and_sequence_grants(in
     await _append_checkpoint(case, "PractitionerRole", _rows(case, "PractitionerRole"))
     assert await case.connection.fetchval(f"SELECT count(*) FROM {view}") == 1
     assert (await _binding(case))["ordinal"] == 1
-    assert all(set(table) == {"name"} for table in binding_by_field["tables"].values())
+    assert all(set(table) == {"schema", "name"} for table in binding_by_field["tables"].values())
+    assert (
+        {table["schema"] for table in binding_by_field["tables"].values()}
+        == {binding_by_field["storage"]["storage_schema"]}
+        == {"source_schema"}
+    )
 
 
 @pytest.mark.asyncio

@@ -663,15 +663,6 @@ def _require_relations(source_pin, owner, relations, *, partitioned=False):
         for relation_record in relations
     ):
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
-    if (
-        next(
-            relation_record["oid"]
-            for relation_record in relations
-            if relation_record["relname"] == "provider_directory_dataset_resource"
-        )
-        != source_pin.resource_table_oid
-    ):
-        raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
 
 
 async def _roles(connection, schema_oid, owner_oid, names, oids, *, namespace_owner_oid=None):
@@ -1013,9 +1004,7 @@ async def _generic_partitioned_custody(connection, source_pin, owner_role, runti
     from process.provider_directory_generic_source_storage import (
         HEADER,
         RELATIONS,
-        RESOURCE,
         _json,
-        _table_proof,
         _validate_binding,
     )
 
@@ -1043,15 +1032,9 @@ async def _generic_partitioned_custody(connection, source_pin, owner_role, runti
     ):
         raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
     by_name = {relation_by_field["relname"]: relation_by_field for relation_by_field in family_rows}
-    if by_name[RESOURCE]["oid"] != source_pin.resource_table_oid:
-        raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
     for root in RELATIONS:
-        proof = binding["tables"][root]
-        relation_by_field = by_name.get(proof["name"])
-        if (
-            relation_by_field is None
-            or list(relation_by_field["parents"]) != [by_name[root]["oid"]]
-            or _table_proof(relation_by_field, private=False) != proof
-        ):
+        # Named and stored legacy proofs both bind each published child by its recorded name.
+        relation_by_field = by_name.get(binding["tables"][root]["name"])
+        if relation_by_field is None or list(relation_by_field["parents"]) != [by_name[root]["oid"]]:
             raise FHIRSourceCustodyError("fhir_source_custody_unavailable")
     return {"binding": binding, "family": [dict(relation_by_field) for relation_by_field in family_rows]}

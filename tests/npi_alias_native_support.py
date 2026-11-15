@@ -573,7 +573,6 @@ async def test_native_alias_export_reauthenticates_closed_seven_heap_output(nati
             session, output, {witnesses.METADATA_KEY: prepared.address_witness}, npi_alias_authority=cap
         )
     async with runtime.administrator.begin() as connection:
-        owner_oid = await connection.scalar(text("SELECT CAST(:role AS regrole)::oid"), {"role": runtime.owner})
         for name, _ in output.relation_oids:
             await connection.execute(text(f'ALTER TABLE "{output.schema_name}"."{name}" OWNER TO "{runtime.owner}"'))
             await connection.execute(text(f'GRANT SELECT ON "{output.schema_name}"."{name}" TO "{runtime.publisher}"'))
@@ -581,7 +580,7 @@ async def test_native_alias_export_reauthenticates_closed_seven_heap_output(nati
 
     async def verify_custody(session, prepared_source):
         assert prepared_source.ownership == output
-        await owned._require_inert_owned_stage(session, output, owner_oid)
+        await owned._require_inert_owned_stage(session, output)
 
     async def authenticate(session, witness):
         assert witness == prepared.address_witness

@@ -27,7 +27,8 @@ _PHYSICAL_FIELDS = {
 def _named_descriptor():
     descriptor = observed_descriptor()
     for name in _PHYSICAL_FIELDS:
-        descriptor.pop(name)
+        descriptor.pop(name, None)
+    descriptor.pop("tables")
     descriptor["catalog_schema"] = read_profile().catalog_schema
     descriptor["coordinates"]["dataset_schema"] = "copied_snapshot"
     digest = catalog_observation_descriptor_digest(descriptor)
@@ -38,10 +39,10 @@ def _named_descriptor():
 def test_named_descriptor_discards_legacy_physical_fields_before_hashing():
     descriptor = _named_descriptor()
     # These fields are ignored at the input boundary, including values that cannot be serialized.
-    assert (
-        validate_fhir_catalog_source_descriptor({**descriptor, **dict.fromkeys(_PHYSICAL_FIELDS, object())})
-        == descriptor
-    )
+    legacy_by_field = {key: value for key, value in descriptor.items() if key != "tables"}
+    legacy_by_field.update(catalog_schema=descriptor["tables"]["header"]["schema"])
+    legacy_by_field.update(dict.fromkeys(_PHYSICAL_FIELDS, object()))
+    assert validate_fhir_catalog_source_descriptor(legacy_by_field) == descriptor
     assert descriptor["coordinates"]["dataset_schema"] == "copied_snapshot"
     assert _PHYSICAL_FIELDS.isdisjoint(descriptor)
 
@@ -58,7 +59,7 @@ def test_named_descriptor_still_checks_policy_scope_and_semantic_receipt(field):
 async def test_named_registry_replay_uses_policy_and_semantics_without_database_identity(monkeypatch):
     descriptor = _named_descriptor()
     case = verifier_case(monkeypatch, (descriptor,))
-    case.export.pop("database_identity")
+    case.export.pop("database_identity", None)
     case.export["native_read_profile"] = read_profile().document()
     case.connection.fetchrow.side_effect = AssertionError("logical source replay must not read connection identity")
     await verify(case)
@@ -70,7 +71,7 @@ async def test_named_registry_replay_uses_policy_and_semantics_without_database_
 @pytest.mark.asyncio
 async def test_named_registry_replay_refuses_a_changed_configured_profile(monkeypatch):
     case = verifier_case(monkeypatch, (_named_descriptor(),))
-    case.export.pop("database_identity")
+    case.export.pop("database_identity", None)
     case.export["native_read_profile"] = {**read_profile().document(), "schema_name": "other_configured_source"}
     with pytest.raises(ValueError, match="source_export_invalid"):
         await verify(case)
@@ -95,7 +96,7 @@ async def test_grant_export_variant_matches_descriptor_before_callbacks(monkeypa
     case = verifier_case(monkeypatch, (descriptor,))
     case.export["source_companies"] = AsyncMock(return_value=(source_company(),))
     if variant != "legacy_old":
-        case.export.pop("database_identity")
+        case.export.pop("database_identity", None)
         case.export["native_read_profile"] = read_profile().document()
         case.connection.fetchrow.side_effect = AssertionError("profile-scoped export must not read physical identity")
     # A profile-scoped export re-observes saved legacy descriptors semantically, so they stay refreshable.

@@ -19,7 +19,7 @@ from process.entity_address_snapshot_alias import EntityAddressAliasAuthority
 from process.entity_address_snapshot_ownership import EntityAddressArchiveStageOwnership
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
-from process.network_fhir_source_epoch import _ORIGIN_FIELDS, _TABLES, RetainedCMSFHIRSourceEpoch
+from process.network_fhir_source_epoch import _ORIGIN_FIELDS, RetainedCMSFHIRSourceEpoch
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests.provider_directory_cms_capacity_test_support import cms_execution
 from tests.test_provider_directory_cms_preflight import _retention_policy
@@ -45,14 +45,9 @@ def _prepared():
         tuple(getattr(pin, field) for field in _ORIGIN_FIELDS),
         capture,
         "registry_cms_epoch_" + capture.hex,
-        98,
-        tuple((name, index) for index, name in enumerate(sorted(_TABLES), 100)),
-        policy["owner_role"],
-        tuple(policy["runtime_roles"]),
         request.expected_admission_sha256,
         request.expected_metadata_sha256,
         "a" * 64,
-        "b" * 64,
     )
     models = (*address._models(), EntityAddressAliasAuthority)
     tables = tuple(
@@ -64,8 +59,7 @@ def _prepared():
     ownership = EntityAddressArchiveStageOwnership(
         capture,
         "entity_address_archive_" + capture.hex,
-        99,
-        tuple((name, index) for index, name in enumerate(sorted(model.__tablename__ for model in models), 200)),
+        named_relations=tuple(sorted(model.__tablename__ for model in models)),
     )
     return prepared.PreparedRegistryCMSSourcePair(
         request,
@@ -73,9 +67,9 @@ def _prepared():
         ownership,
         receipt,
         "d" * 64,
-        tuple((name, name + "_candidate", index) for index, name in enumerate(sorted(prepared.RELATION_NAMES), 300)),
-        epoch.owner_role,
-        epoch.runtime_roles,
+        tuple((name, name + "_candidate") for name in sorted(prepared.RELATION_NAMES)),
+        policy["owner_role"],
+        tuple(policy["runtime_roles"]),
         "e" * 64,
         "f" * 64,
         "a" * 64,
@@ -108,7 +102,10 @@ def _row(pair):
 
 
 def test_closed_slot_roundtrip_preserves_prepared_capture():
+    from tests.test_network_registry_cms_prepared_cleanup_postgres import _reject_documents
+
     pair = _prepared()
+    _reject_documents(pair)
     document = receipts.registry_source_pair_document(pair)
     assert receipts.decode_registry_source_pair_document(document) == pair
     assert set(document) == {"protocol", "capture_id", "prepared_pair"}
@@ -167,10 +164,6 @@ async def test_own_receipt_binding_uses_slot_and_never_comments_retained_schema(
     monkeypatch.setattr(receipts, "require_registry_receipt_owner", AsyncMock(return_value=connection))
     monkeypatch.setattr(prepared, "_require_prepared_pair", AsyncMock(return_value=connection))
     monkeypatch.setattr(prepared, "_require_retained_authority", AsyncMock())
-    row["payload"]["address"]["relation_oids"] = [
-        dict((logical, oid) for logical, _stage, oid in source_pair.address_stages)[name]
-        for name in prepared.RELATION_NAMES
-    ]
     monkeypatch.setattr(receipts, "capture_native_dependencies", AsyncMock(return_value=row["payload"]))
     row["payload"] = json.dumps(row["payload"])
     bound = await prepared.bind_prepared_registry_cms_source_pair(
@@ -445,12 +438,12 @@ async def test_committed_resolver_preserves_prepared_stamp_and_binds_exact_recei
     row = _row(pair)
     comment = prepared._prepared_comment_prefix(pair) + retained._json(pair.as_dict())
     driver = SimpleNamespace(
-        fetchrow=AsyncMock(return_value=dict(schema_oid=pair.address_ownership.schema_oid, comment=comment))
+        fetchrow=AsyncMock(return_value=dict(schema_name=pair.address_ownership.schema_name, comment=comment))
     )
     reader = AsyncMock(return_value=row)
     monkeypatch.setattr(receipts, "read_registry_source_pair_receipt", reader)
-    actual, oid = await retained._read_committed_pair(driver, pair.address_ownership.schema_name)
-    assert actual == prepared._pair_from_prepared_receipt(pair, row) and oid == pair.address_ownership.schema_oid
+    actual, schema = await retained._read_committed_pair(driver, pair.address_ownership.schema_name)
+    assert actual == prepared._pair_from_prepared_receipt(pair, row) and schema == pair.address_ownership.schema_name
     receipt_session, schema, capture_id = reader.await_args.args
     assert type(receipt_session) is NativeReceiptSession and receipt_session.native_connection is driver
     assert (
@@ -466,7 +459,7 @@ async def test_prepared_committed_resolver_refuses_changed_identity_or_uncommitt
     pair = _prepared()
     receipt_row = _row(pair)
     comment = prepared._prepared_comment_prefix(pair) + retained._json(pair.as_dict())
-    metadata = dict(schema_oid=pair.address_ownership.schema_oid, comment=comment)
+    metadata = dict(schema_name=pair.address_ownership.schema_name, comment=comment)
     schema = pair.address_ownership.schema_name
     if changed == "schema":
         schema += "_foreign"
@@ -564,10 +557,8 @@ async def test_unscoped_prepared_pair_keeps_the_committed_reader_boundary(regist
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["attempt", "pair", "xid", "task", "session", "stamp"])
+@pytest.mark.parametrize("changed", ["attempt", "pair", "stamp"])
 async def test_original_prepared_pair_refuses_changed_scope_or_stamp(registry_publication_case, monkeypatch, changed):
-    import asyncio
-
     from process import provider_directory_cms_source_runtime as runtime
 
     async with registry_publication_case() as case:
@@ -583,18 +574,36 @@ async def test_original_prepared_pair_refuses_changed_scope_or_stamp(registry_pu
                 boundary.comment.value = prepared._prepared_comment_prefix(foreign) + retained._json(foreign.as_dict())
             if changed == "pair":
                 supplied = replace(bound, cms_receipt_payload=bound.cms_receipt_payload + " ")
-            if changed == "xid":
-                case.native.xid = "43"
-            if changed == "session":
-                actual_session = SimpleNamespace(**vars(case.session))
             if changed == "stamp":
                 boundary.comment.value += " "
             operation = retained.require_registry_cms_source_pair(actual_session, supplied, verify_content=False)
-            if changed == "task":
-                operation = asyncio.create_task(operation)
             try:
                 with pytest.raises(ValueError, match="^cms_registry_source_publication_invalid$"):
                     await operation
             finally:
                 case.native.xid = "42"
         boundary.committed.assert_not_awaited()
+
+
+def test_legacy_prepared_capture_preserves_opaque_tokens_and_named_scope():
+    pair = _prepared()
+    document = pair.as_dict()
+    owner = document["address_ownership"]
+    document["address_ownership"] = {
+        "dataset_id": owner["dataset_id"],
+        "schema_name": owner["schema_name"],
+        "schema_oid": 77,
+        "relation_oids": [[entry["relation_name"], 100 + number] for number, entry in enumerate(owner["relations"])],
+    }
+    document["address_stages"] = [entry + [500 + number] for number, entry in enumerate(document["address_stages"])]
+    prefix = prepared._prepared_comment_prefix(pair)
+    original = retained._json(document)
+    decoded = cleanup.decode_prepared_registry_cms_source_pair(prefix + original)
+    assert retained._json(decoded.as_dict()) == original
+    assert decoded.address_ownership.relation_names == pair.address_ownership.relation_names
+    assert tuple(entry[:2] for entry in decoded.address_stages) == pair.address_stages
+    document["address_ownership"]["schema_oid"] += 1000
+    document["address_stages"][0][2] += 1000
+    rebound = cleanup.decode_prepared_registry_cms_source_pair(prefix + retained._json(document))
+    assert rebound.address_ownership == decoded.address_ownership
+    assert rebound.as_dict() == document

@@ -6,7 +6,6 @@ import json
 from dataclasses import asdict, make_dataclass, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -151,7 +150,6 @@ async def test_original_capture_intake_uses_the_same_completion_marker_gate(monk
     origin = replace(
         origin, dataset_sha256=root.hexdigest(), resource_hashes=(("Location", hashes["Location"].hexdigest()),)
     )
-    monkeypatch.setattr(capture, "_virtual_xid", AsyncMock(return_value="1/2"))
 
     async def fold_batch(state, rows):
         return retained._fold_rows(

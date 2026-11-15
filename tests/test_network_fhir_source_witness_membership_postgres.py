@@ -48,7 +48,7 @@ def _source_recipe(capture, anchor):
         origin.dataset_id,
         origin.dataset_sha256,
         capture.release_id,
-        origin.resource_parent_oid,
+        origin.resource_relation,
         PRODUCER,
         source_witness_membership_date(capture, anchor),
         source_witness_capture=capture,
@@ -246,8 +246,7 @@ async def test_source_witness_capture_maps_only_approved_exact_offices_and_provi
 
 
 async def _preview_counts(case, recipe, approved, control_schema, monkeypatch):
-    """Count through genuine Source custody using the existing test runtime and approved pin."""
-    capture = recipe.source_pin.source_witness_capture
+    """Count through the configured Source exporter and approved recipe pin."""
     with monkeypatch.context() as preview_runtime:
         preview_runtime.setattr(
             preview,
@@ -257,7 +256,10 @@ async def _preview_counts(case, recipe, approved, control_schema, monkeypatch):
                 approved=approved,
                 control_schema=control_schema,
                 source_witness_runtime=SourceWitnessRuntime(
-                    case.source_export, (case.source_profile,), capture.owner_role, capture.runtime_roles
+                    case.source_export,
+                    (case.source_profile,),
+                    case.fixture.role_by_kind["owner"],
+                    (case.fixture.component.reader,),
                 ),
             ),
         )

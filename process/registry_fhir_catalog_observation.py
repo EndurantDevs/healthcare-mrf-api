@@ -33,10 +33,6 @@ _PUBLICATION_FIELDS = {
     "root_run_id",
     "published_at",
     "resource_hash_contract",
-    "original_admission_version",
-    "original_admission_kind",
-    "original_admission_sha256",
-    "original_metadata_sha256",
     "claimed_resource_count",
 }
 
@@ -250,17 +246,9 @@ def validate_catalog_observation_receipt(receipt):
         _fail()
     _text(publication["root_run_id"], 64)
     _published_at(publication["published_at"])
-    for field, maximum in (("resource_hash_contract", 128), ("original_admission_kind", 64)):
+    for field, maximum in (("resource_hash_contract", 128),):
         if publication[field] is not None:
             _text(publication[field], maximum)
-    version = publication["original_admission_version"]
-    if version is not None:
-        _count(version)
-        if version == 0:
-            _fail()
-    for field in ("original_admission_sha256", "original_metadata_sha256"):
-        if publication[field] is not None:
-            _digest(publication[field])
     _count(publication["claimed_resource_count"])
     families = receipt["families"]
     if type(families) is not dict or set(families) != set(RESOURCE_TYPES):

@@ -25,7 +25,7 @@ class GenerationInputs(ClosedInputs):
     def __init__(self):
         super().__init__()
         self.original_generation = self.generation
-        self.active_descriptor = _descriptor(self.recipe, None, 105, None)
+        self.active_descriptor = _descriptor(self.recipe, None, "https://example.test/fhir")
         self.sources.append(self._source(self.active_descriptor))
         self.sources.sort(key=lambda source: source["generation"])
         self.generation = self._source(self.active_descriptor)["generation"]
@@ -124,7 +124,7 @@ async def test_inactive_rows_cannot_escape_source_validation(damage):
     inactive = next(source for source in connection.sources if source["generation"] == connection.original_generation)
     match damage:
         case "descriptor":
-            inactive["descriptor"]["resource_table_oid"] += 1
+            inactive["descriptor"]["tables"]["resource"]["name"] = "different_resource"
         case "profile" | "source_id" | "generation" | "accepted_at":
             inactive[damage] = {
                 "profile": "raw_fhir",
@@ -155,7 +155,7 @@ async def test_unavailable_active_product_never_falls_back_to_history(missing):
     connection = GenerationInputs()
     generations = (connection.generation,)
     if missing == "approval_key":
-        descriptor = _descriptor(recipe_fixture(), None, 105, None)
+        descriptor = _descriptor(recipe_fixture(), None, None)
         connection.sources = [connection._source(connection.descriptor), connection._source(descriptor)]
         connection.sources.sort(key=lambda source: source["generation"])
         connection.generation = connection._source(descriptor)["generation"]

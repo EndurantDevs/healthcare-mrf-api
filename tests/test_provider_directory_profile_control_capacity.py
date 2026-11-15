@@ -409,3 +409,188 @@ def test_checkpoint_payload_checked_product_rejects_signed_overflow():
     assert operation.wal_bytes == largest_count * 73728
     with pytest.raises(capacity.ProviderDirectoryProfileCapacityError, match="control_wal_projection_overflow"):
         _checkpoint_payload_control_operation(geometry, "evidence_payload", largest_count + 1)
+
+
+def _control_layout_growth_case(*, initial=False, evidence_batches=4, compact_batches=3):
+    """Match real measured role counts while the admission mutation covers a larger union."""
+    from copy import deepcopy
+
+    from tests.test_provider_directory_profile_initial import _geometry as initial_geometry
+
+    plan = _control_wal_plan_input(
+        evidence_batch_count=evidence_batches,
+        compact_batch_count=compact_batches,
+        build_checkpoint_insert=_control_metadata_input(
+            "build_checkpoint", "insert", main_index_pages=(2, 2), toast_index_pages=(2,)
+        ),
+        build_checkpoint_update=_control_metadata_input(
+            "build_checkpoint", "update", main_index_pages=(2, 2), toast_index_pages=(2,)
+        ),
+        import_run_update=_control_metadata_input(
+            "import_run", "update", payload_upper_bytes=65_536, main_index_pages=(2,) * 8, toast_index_pages=(2,)
+        ),
+        capacity_consumption_insert=_control_metadata_input(
+            "capacity_consumption", "insert", main_index_pages=(5, 3, 2, 2), toast_index_pages=(3, 2)
+        ),
+    )
+    base = (
+        initial_geometry()
+        if initial
+        else dataclasses.replace(
+            _projection_geometry(), physical_projection_contract_id=capacity.BOUNDED_ADMISSION_CONTRACT_ID
+        )
+    )
+    relations_by_role = deepcopy(base.relations)
+    for role, index_count in (("build_checkpoint", 2), ("import_run", 8), ("capacity_consumption", 2)):
+        relations_by_role[role].update(main_index_pages=[2] * index_count, toast_index_pages=[2])
+    relations_by_role["import_run"]["toastable_column_count"] = 19
+    seed = dataclasses.replace(
+        base,
+        relations=relations_by_role,
+        control_wal_plan_input_hash=capacity.profile_control_wal_plan_input_hash(plan),
+        control_wal_upper_bound_bytes=1,
+        control_metadata_data_upper_bound_bytes=1,
+    )
+    projected = capacity.project_profile_control_wal_capacity(seed, plan)
+    geometry = dataclasses.replace(
+        seed,
+        control_wal_upper_bound_bytes=projected.total_control_wal_bytes,
+        control_metadata_data_upper_bound_bytes=projected.total_control_metadata_data_bytes,
+    )
+    return geometry, plan, capacity.project_profile_control_wal_capacity(geometry, plan)
+
+
+@pytest.mark.parametrize("evidence_batches,compact_batches", [(0, 0), (1, 2), (4, 3)])
+def test_control_relation_limits_reuse_the_funded_sequence_without_extra_reservation(evidence_batches, compact_batches):
+    from copy import deepcopy
+
+    from process.provider_directory_profile_capacity_control_budget import (
+        _final_control_index_page_bounds,
+        control_relation_index_page_bounds,
+    )
+
+    geometry, plan, original_projection = _control_layout_growth_case(
+        evidence_batches=evidence_batches,
+        compact_batches=compact_batches,
+    )
+    original_payload = capacity.profile_control_wal_plan_input_payload(plan)
+    limits_by_role = control_relation_index_page_bounds(geometry, plan)
+    sequence_count = evidence_batches + compact_batches + 2
+    assert limits_by_role["import_run"]["main_index_pages"] == list(
+        _final_control_index_page_bounds((2,) * 8, sequence_count)
+    )
+    assert len(limits_by_role["capacity_consumption"]["main_index_pages"]) == 2
+    assert len(plan.capacity_consumption_insert.main_index_pages) == 4
+    assert len(limits_by_role["capacity_consumption"]["toast_index_pages"]) == 1
+    assert len(plan.capacity_consumption_insert.toast_index_pages) == 2
+    relations_by_role = deepcopy(geometry.relations)
+    for role, limits in limits_by_role.items():
+        relations_by_role[role].update(limits)
+    funded_geometry = dataclasses.replace(geometry, relations=relations_by_role)
+    funded_projection = capacity.project_profile_control_wal_capacity(funded_geometry, plan)
+    assert funded_projection.operations == original_projection.operations
+    assert funded_geometry.reservation_bytes_by_storage_class == geometry.reservation_bytes_by_storage_class
+    assert capacity.profile_control_wal_plan_input_payload(plan) == original_payload
+    assert capacity.capacity_geometry_hash(funded_geometry) != capacity.capacity_geometry_hash(geometry)
+
+
+@pytest.mark.parametrize("initial", [False, True])
+def test_admission_producer_signs_funded_control_limits_from_the_original_plan(initial):
+    import importlib
+    from types import SimpleNamespace
+
+    from process import provider_directory_profile_initial_contract as initial_contract
+    from process.provider_directory_profile_capacity_control_budget import control_relation_index_page_bounds
+
+    fhir = importlib.import_module("process.provider_directory_fhir")
+    geometry, plan, original_projection = _control_layout_growth_case(initial=initial)
+    runtime = fhir.profile_capacity_runtime
+    limits = runtime.ProviderDirectoryProfileCapacityLimits(
+        **{
+            field.name: getattr(geometry, field.name)
+            for field in dataclasses.fields(runtime.ProviderDirectoryProfileCapacityLimits)
+        }
+    )
+    input_type = (
+        initial_contract.InitialCapacityGeometryInputs
+        if initial
+        else runtime.ProviderDirectoryProfileCapacityGeometryInputs
+    )
+    input_by_field = {
+        field.name: getattr(geometry, field.name)
+        for field in dataclasses.fields(input_type)
+        if field.name != "artifact_scope_projected_rows"
+    }
+    inputs = input_type(**input_by_field, artifact_scope_projected_rows=geometry.max_artifact_scope_rows)
+    producer_state = fhir._profile_admission_geometry(
+        SimpleNamespace(limits=limits, control_wal_plan_input=plan), inputs
+    )
+    for role, expected in control_relation_index_page_bounds(geometry, plan).items():
+        for field, bound in expected.items():
+            assert producer_state.geometry.relations[role][field] == bound
+    assert inputs.relations == geometry.relations
+    assert producer_state.control_wal_projection.plan_input == plan
+    assert producer_state.control_wal_projection.operations == original_projection.operations
+    assert producer_state.geometry.reservation_bytes_by_storage_class == geometry.reservation_bytes_by_storage_class
+    assert producer_state.geometry.control_wal_plan_input_hash == geometry.control_wal_plan_input_hash
+    assert capacity.capacity_geometry_hash(producer_state.geometry) != capacity.capacity_geometry_hash(geometry)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["old_two", "funded", "over_bound", "extra_index", "missing_index", "schema", "name", "toast_columns"]
+)
+def test_signed_control_layout_limits_stay_closed_after_funded_growth(mutation):
+    import importlib
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    from process.provider_directory_profile_capacity_control_budget import control_relation_index_page_bounds
+
+    fhir = importlib.import_module("process.provider_directory_fhir")
+    old_geometry, plan, _projection = _control_layout_growth_case()
+    relations_by_role = deepcopy(old_geometry.relations)
+    for role, limits in control_relation_index_page_bounds(old_geometry, plan).items():
+        relations_by_role[role].update(limits)
+    geometry = old_geometry if mutation == "old_two" else dataclasses.replace(old_geometry, relations=relations_by_role)
+    expected = geometry.relations["import_run"]
+    actual_by_field = {
+        "schema_name": expected["schema"],
+        "relation_name": expected["name"],
+        "main_index_pages": (4,) + (2,) * 7,
+        "toast_index_pages": (2,),
+        "toastable_columns": tuple(str(index) for index in range(19)),
+    }
+    overrides_by_mutation = {
+        "over_bound": {"main_index_pages": (max(expected["main_index_pages"]) + 1,) + (2,) * 7},
+        "extra_index": {"main_index_pages": actual_by_field["main_index_pages"] + (2,)},
+        "missing_index": {"main_index_pages": actual_by_field["main_index_pages"][:-1]},
+        "schema": {"schema_name": "other"},
+        "name": {"relation_name": "other"},
+        "toast_columns": {"toastable_columns": actual_by_field["toastable_columns"] + ("unexpected",)},
+    }
+    actual_by_field.update(overrides_by_mutation.get(mutation, {}))
+    if mutation == "funded":
+        fhir._assert_profile_capacity_layout_bounds(SimpleNamespace(**actual_by_field), geometry, "import_run")
+    else:
+        with pytest.raises(
+            fhir.ProviderDirectoryArtifactBuildStale, match="capacity_(index_bound|layout_scope)_changed"
+        ):
+            fhir._assert_profile_capacity_layout_bounds(SimpleNamespace(**actual_by_field), geometry, "import_run")
+    assert old_geometry.relations["import_run"]["main_index_pages"] == [2] * 8
+
+
+@pytest.mark.parametrize(
+    "field,unfunded", [("main_index_pages", [6] * 5), ("main_index_pages", [1000, 2]), ("toast_index_pages", [2, 2, 2])]
+)
+def test_role_page_bounds_cannot_borrow_unfunded_union_indexes(field, unfunded):
+    from copy import deepcopy
+
+    from process.provider_directory_profile_capacity_control_budget import control_relation_index_page_bounds
+
+    geometry, plan, _projection = _control_layout_growth_case()
+    relations_by_role = deepcopy(geometry.relations)
+    relations_by_role["capacity_consumption"][field] = unfunded
+    with pytest.raises(
+        capacity.ProviderDirectoryProfileCapacityError, match="control_relation_index_projection_unfunded"
+    ):
+        control_relation_index_page_bounds(dataclasses.replace(geometry, relations=relations_by_role), plan)

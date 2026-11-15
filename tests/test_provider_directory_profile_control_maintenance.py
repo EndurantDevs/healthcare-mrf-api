@@ -30,6 +30,7 @@ class Connection:
         self.held_count = 5
 
     def in_transaction(self):
+        self.events.append("transaction_state")
         return self.active
 
     async def begin(self):
@@ -56,21 +57,8 @@ class Connection:
 
 
 def _maintenance_identity(geometry):
-    """Keep all native fence OIDs and database identity in the synthetic fixture."""
-    identity = SimpleNamespace(
-        **{
-            name + "_oid": getattr(geometry, name + "_oid")
-            for name in (
-                "build_checkpoint",
-                "serving_generation",
-                "delta_receipt",
-                "import_run",
-                "capacity_consumption",
-            )
-        }
-    )
-    identity.database_name = geometry.database_name
-    return identity
+    """Use the admitted logical control names, independently of database object IDs."""
+    return SimpleNamespace(relations={name: dict(values) for name, values in geometry.relations.items()})
 
 
 def fixture():
@@ -140,7 +128,7 @@ async def test_independent_advisory_connection_spans_every_preparation_phase_and
         events.append("stronger_cutover_locks")
     lock_sql = next(x[0] for x in events if isinstance(x, tuple) and x[0].startswith("LOCK TABLE"))
     assert "IN SHARE UPDATE EXCLUSIVE MODE NOWAIT" in lock_sql
-    assert lock_sql.count('"sample".') == 5
+    assert lock_sql.count('"fixture".') == 5
     assert events.index("admitted_identity_verified") < events.index("artifact")
     assert events.index("profile") < events.index("commit") < events.index("stronger_cutover_locks")
     assert events.count("commit") == 1 and "rollback_start" not in events
@@ -149,7 +137,7 @@ async def test_independent_advisory_connection_spans_every_preparation_phase_and
 
 
 @pytest.mark.parametrize(
-    "change", ["digest", "pool", "engine_pool", "active_transaction", "oid", "duplicate_oid", "old_pool_reserve"]
+    "change", ["digest", "pool", "engine_pool", "active_transaction", "name", "duplicate_name", "old_pool_reserve"]
 )
 async def test_invalid_custody_refuses_before_native_lock_or_payload(change):
     fhir, connection, events, admission = fixture()
@@ -161,10 +149,13 @@ async def test_invalid_custody_refuses_before_native_lock_or_payload(change):
         fhir.db.engine.pool._max_overflow = 99
     if change == "active_transaction":
         connection.active = True
-    if change == "oid":
-        admission.database_identity.import_run_oid += 1
-    if change == "duplicate_oid":
-        admission.database_identity.import_run_oid = admission.database_identity.build_checkpoint_oid
+    if change == "name":
+        admission.database_identity.relations["import_run"]["name"] = "different_run"
+    if change == "duplicate_name":
+        relation_by_role = {name: dict(entry) for name, entry in admission.geometry.relations.items()}
+        relation_by_role["import_run"] = dict(relation_by_role["build_checkpoint"])
+        admission.geometry = dataclasses.replace(admission.geometry, relations=relation_by_role)
+        admission.database_identity.relations = relation_by_role
     if change == "old_pool_reserve":
         admission.geometry = dataclasses.replace(admission.geometry, pool_reserve_connections=3)
     with pytest.raises((RuntimeError, capacity.ProviderDirectoryProfileCapacityError)):
@@ -264,13 +255,14 @@ def test_signed_fence_plan_preserves_pool_and_native_envelopes():
         )
 
 
-async def test_wrong_actual_name_oid_database_or_schema_refuses_before_table_lock():
+async def test_unsupported_native_shape_refuses_before_payload_and_rolls_back():
     fhir, connection, events, _ = fixture()
     connection.identity_count = 4
     with pytest.raises(RuntimeError, match="relation_changed"):
         async with maintenance.control_maintenance_fence(fhir, connection):
             pytest.fail("payload entered")
-    assert not any(isinstance(x, tuple) and x[0].startswith("LOCK TABLE") for x in events)
+    assert any(isinstance(x, tuple) and x[0].startswith("LOCK TABLE") for x in events)
+    assert "admitted_identity_verified" not in events
     assert events[-1] == "rollback_done"
 
 
@@ -336,16 +328,12 @@ async def test_expired_deadline_prevents_begin_and_lock():
     assert "begin" not in events and "rollback_done" in events
 
 
-@pytest.mark.parametrize("loss", ["transaction", "native_locks"])
-async def test_lost_native_lease_refuses_while_lifecycle_flag_still_claims_acquisition(loss):
+async def test_ended_native_transaction_refuses_while_lifecycle_flag_still_claims_acquisition():
     fhir, connection, events, _ = fixture()
     with pytest.raises(RuntimeError, match="lease_lost"):
         async with maintenance.control_maintenance_fence(fhir, connection):
             await maintenance.assert_held(fhir)
-            if loss == "transaction":
-                connection.active = False
-            else:
-                connection.held_count = 4
+            connection.active = False
             await maintenance.assert_held(fhir)
             pytest.fail("lost lease allowed payload")
     assert events[-1] == "rollback_done"
@@ -369,6 +357,6 @@ async def test_real_mutation_facade_checks_native_lease_inside_original_window(m
         async with importer._profile_capacity_mutation_window("profile_stage"):
             events.append("actual_window_payload")
         lease.fhir = fhir
-    lock_observation = next(i for i, event in enumerate(events) if isinstance(event, tuple) and "pg_locks" in event[0])
+    lock_observation = max(i for i, event in enumerate(events) if event == "transaction_state")
     assert events[lock_observation - 1] == "window_start"
     assert lock_observation < events.index("actual_window_payload")

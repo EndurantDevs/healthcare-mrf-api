@@ -22,9 +22,9 @@ _CAPTURE_FAMILIES = ("npi", "mrf-address", "cms-doctors", "geo", "tiger")
 
 async def selected_captured_inventories(session, *, node_id=None):
     """Hold complete sealed families using the existing exact source selection."""
-    owner, selected = await _selected_captured_generations(session, node_id=node_id, families=_CAPTURE_FAMILIES)
+    _catalog, selected = await _selected_captured_generations(session, node_id=node_id, families=_CAPTURE_FAMILIES)
     return {
-        generation_row["importer_id"]: await _require_model_capture(session, generation_row, owner["owner_oid"])
+        generation_row["importer_id"]: await _require_model_capture(session, generation_row)
         for generation_row in selected
     }
 
@@ -35,7 +35,7 @@ async def _selected_captured_generations(session, *, node_id, families):
     if relations is None:
         return None, []
     archive._require_transaction(session)
-    owner = await _protected_relation(session, _GENERATION, catalog=True)
+    catalog = await _protected_relation(session, _GENERATION, catalog=True)
     binding, package = relations
     selected = (
         (
@@ -60,25 +60,16 @@ async def _selected_captured_generations(session, *, node_id, families):
         .all()
     )
     _require(len({generation_row["importer_id"] for generation_row in selected}) == len(selected))
-    return owner, selected
+    return catalog, selected
 
 
-async def _require_model_capture(session, generation, owner_oid):
-    """A catalog hint never replaces protected registration or same-transaction heap locks."""
+async def _require_model_capture(session, generation):
+    """Keep exact package/scope selection while admitting saved inventories by name."""
     capture = generation["source_capture"]
     _require(isinstance(capture, dict) and capture.get("contract") == "snapshot-captured-source.v1")
-    registration_by_field = {
-        "generation_id": str(generation["generation_id"]),
-        "origin_kind": "captured",
-        **{key: generation[key] for key in ("node_id", "importer_id", "dataset_key", "validation_sha256", "inventory")},
-        "source_operation_id": str(generation["source_operation_id"]),
-        "source_capture": capture,
-    }
     authority, manifest = capture["source_authority"], generation["selected_manifest"]
     _require(
-        _digest(registration_by_field) == generation["registration_sha256"]
-        and _digest(authority) == generation["validation_sha256"]
-        and _digest(manifest) == generation["selected_package_id"]
+        _digest(manifest) == generation["selected_package_id"]
         and manifest["producer_node_id"] == generation["node_id"]
         and manifest["importer_id"] == manifest["dataset_key"] == generation["importer_id"] == generation["dataset_key"]
         and manifest["contract_version"] == authority["contract"]
@@ -89,32 +80,30 @@ async def _require_model_capture(session, generation, owner_oid):
         and generation["current_location_fence"] is None
         and generation["state"] == "retained"
     )
-    inventory = generation["inventory"]
-    _require(
-        inventory["database_oid"]
-        == await session.scalar(text("SELECT oid::bigint FROM pg_database WHERE datname=current_database()"))
-    )
+    inventory = _named_inventory(generation["inventory"])
     ownership = authority["ownership"]
-    _require(
-        sorted((relation_row["relation_name"], relation_row["relation_oid"]) for relation_row in inventory["relations"])
-        == sorted(map(tuple, ownership["relation_oids"]))
+    recorded = (
+        sorted(
+            relation_record.get("table_name", relation_record.get("relation_name"))
+            for relation_record in ownership["relations"]
+        )
+        if "relations" in ownership
+        else sorted(pair[0] for pair in ownership["relation_oids"])
     )
-    schema_identities = []
-    for relation in sorted(inventory["relations"], key=lambda relation_row: relation_row["relation_name"]):
-        _require(
-            relation["schema_name"] == ownership["schema_name"] and relation["schema_oid"] == ownership["schema_oid"]
+    _require(
+        recorded == sorted(relation_record["relation_name"] for relation_record in inventory["relations"])
+        and all(
+            relation_record["schema_name"] == ownership["schema_name"] for relation_record in inventory["relations"]
         )
-        _require(
-            await _protected_relation(
-                session, f'"{relation["schema_name"]}"."{relation["relation_name"]}"', expected_owner=owner_oid
-            )
-            == relation
+    )
+    for relation_record in inventory["relations"]:
+        await _protected_relation(
+            session,
+            archive._quoted(relation_record["schema_name"]) + "." + archive._quoted(relation_record["relation_name"]),
         )
-        schema_identities.append(await _captured_schema_identity(session, generation["importer_id"], relation))
-    if "custody" in authority:
-        _require(_digest(schema_identities) == authority["custody"]["catalog_sha256"])
-    else:
-        _require(generation["importer_id"] == "tiger")
+    if generation["importer_id"] != "tiger":
+        await _require_model_schema(session, generation["importer_id"], inventory, authority["manifest"])
+    if generation["importer_id"] == "tiger":
         await _require_captured_selection(
             session, {"node_id": generation["node_id"], "inventory": inventory}, authority["manifest"]
         )
@@ -122,13 +111,22 @@ async def _require_model_capture(session, generation, owner_oid):
 
 
 async def _captured_schema_identity(session, importer_id, relation):
-    """Reuse the model family's existing schema semantics, not payload revalidation."""
-    arguments = (relation["relation_oid"], relation["schema_name"], relation["relation_name"])
+    """Reuse normalized column/key/sequence semantics, resolving only the recorded name."""
+    schema, name = relation["schema_name"], relation["relation_name"]
+    address = await archive._relation_oid(session, schema, name)
+    _require(address is not None)
     if importer_id == "npi":
         from process import npi_result_archive
 
-        return await npi_result_archive._npi_schema_identity(session, *arguments)
-    return await archive._family_schema_identity(session, importer_id, *arguments)
+        return await npi_result_archive._npi_schema_identity(session, address, schema, name)
+    return await archive._family_schema_identity(session, importer_id, address, schema, name)
+
+
+async def _require_model_schema(session, importer_id, inventory, manifest):
+    tables_by_name = {table["table_name"]: table["schema_sha256"] for table in manifest["tables"]}
+    _require(set(tables_by_name) == {row["relation_name"] for row in inventory["relations"]})
+    for row in inventory["relations"]:
+        _require(await _captured_schema_identity(session, importer_id, row) == tables_by_name[row["relation_name"]])
 
 
 def _require(condition):
@@ -161,49 +159,43 @@ async def _scope(session, value):
     )
 
 
-async def _protected_relation(session, qualified, *, expected_owner=None, catalog=False):
-    """Require immutable ordinary-reader access, not a writable look-alike catalog."""
+async def _protected_relation(session, qualified, *, catalog=False):
+    """Read and lock the configured relation; PostgreSQL enforces access.
+
+    Retention catalog tables carry the internal triggers of their existing foreign keys; user triggers still refuse.
+    """
     await session.execute(text(f"LOCK TABLE ONLY {qualified} IN ACCESS SHARE MODE NOWAIT"))
     relation = (
         (
             await session.execute(
-                text("""
-        SELECT c.oid::bigint AS relation_oid,c.relowner::bigint AS owner_oid,
-          c.relnamespace::bigint AS schema_oid,n.nspowner::bigint AS schema_owner_oid,
-          pg_relation_filenode(c.oid)::bigint AS relfilenode,
-          n.nspname AS schema_name,c.relname AS relation_name,
-          c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition
-            AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
-            AND NOT r.rolcanlogin AND NOT r.rolsuper AND NOT r.rolcreaterole
-            AND NOT r.rolcreatedb AND NOT r.rolreplication AND NOT r.rolbypassrls
-            AND c.relowner=n.nspowner
-            AND NOT EXISTS(SELECT 1 FROM aclexplode(COALESCE(n.nspacl,acldefault('n',n.nspowner))) a
-              WHERE a.grantee<>n.nspowner AND a.privilege_type='CREATE')
-            AND NOT EXISTS(SELECT 1 FROM (
-              SELECT a.grantee,a.privilege_type FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) a
-              UNION ALL SELECT a.grantee,a.privilege_type FROM pg_attribute col,
-                LATERAL aclexplode(col.attacl) a WHERE col.attrelid=c.oid
-            ) grants WHERE grantee<>c.relowner AND privilege_type<>'SELECT')
-            AND NOT EXISTS(SELECT 1 FROM pg_rewrite WHERE ev_class=c.oid) AS protected
-        FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-        JOIN pg_roles r ON r.oid=c.relowner WHERE c.oid=to_regclass(:name)
-    """),
-                {"name": qualified},
+                text("""SELECT n.nspname AS schema_name,c.relname AS relation_name,
+        c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition
+          AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+          AND NOT EXISTS(SELECT 1 FROM pg_rewrite WHERE ev_class=c.oid)
+          AND NOT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=c.oid AND NOT (:catalog AND tgisinternal))
+          AND (NOT :catalog OR NOT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)) AS valid
+        FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=to_regclass(:name)"""),
+                {"name": qualified, "catalog": catalog},
             )
         )
         .mappings()
         .one_or_none()
     )
-    _require(relation is not None and relation["protected"])
-    _require(expected_owner is None or relation["owner_oid"] == expected_owner)
-    if catalog:
-        _require(
-            not await session.scalar(
-                text("SELECT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=:oid OR inhparent=:oid)"),
-                {"oid": relation["relation_oid"]},
-            )
-        )
-    return {key: attribute for key, attribute in relation.items() if key != "protected"}
+    _require(relation is not None and relation["valid"])
+    await session.execute(text(f"SELECT * FROM ONLY {qualified} LIMIT 0"))
+    return {key: relation[key] for key in ("schema_name", "relation_name")}
+
+
+def _named_inventory(inventory):
+    _require(
+        isinstance(inventory, dict) and isinstance(inventory.get("relations"), list) and bool(inventory["relations"])
+    )
+    names = [(row["schema_name"], row["relation_name"]) for row in inventory["relations"]]
+    _require(len(set(names)) == len(names))
+    for schema, name in names:
+        archive._quoted(schema)
+        archive._quoted(name)
+    return {"relations": [{"schema_name": schema, "relation_name": name} for schema, name in sorted(names)]}
 
 
 async def _selected_tiger_observation(session, *, node_id=None, observe=False):
@@ -252,7 +244,7 @@ async def _selected_tiger_observation(session, *, node_id=None, observe=False):
 async def _require_captured_selection(session, selected, family, *, observe=False):
     origin = validate_captured_origin(family["source_metadata"])
     await _scope(session, "tiger-captured-epoch:" + origin["epoch_id"])
-    owner = await _protected_relation(session, _CAPTURE, catalog=True)
+    await _protected_relation(session, _CAPTURE, catalog=True)
     epoch = (
         (
             await session.execute(
@@ -264,13 +256,13 @@ async def _require_captured_selection(session, selected, family, *, observe=Fals
         .one_or_none()
     )
     _require(epoch is not None and epoch["state"] == "retained" and epoch["origin_kind"] == "captured")
-    registration_by_field = {key: epoch[key] for key in ("node_id", "authority", "source_graph", "inventory")}
-    registration_by_field["epoch_id"] = str(epoch["epoch_id"])
-    _require(_digest(registration_by_field) == epoch["registration_sha256"])
-    _require(_digest(epoch["source_graph"]) == origin["source_graph_sha256"])
-    _require(epoch["authority"]["manifest"] == family and epoch["inventory"] == selected["inventory"])
+    _require(
+        epoch["authority"]["manifest"] == family
+        and _named_inventory(epoch["inventory"]) == _named_inventory(selected["inventory"])
+    )
     archive.validate_reference_family_manifest(family)
-    inventory = await _require_inventory(session, epoch["inventory"], owner["owner_oid"])
+    inventory = await _require_inventory(session, epoch["inventory"])
+    await _require_model_schema(session, "tiger", inventory, family)
     if observe:
         _require(_digest(selected["manifest"]) == selected["selected_package_id"])
         return _captured_tiger_proof(
@@ -284,25 +276,26 @@ async def _require_captured_selection(session, selected, family, *, observe=Fals
     return inventory
 
 
-async def _require_inventory(session, inventory, owner_oid):
-    _require(isinstance(inventory, dict) and set(inventory) == {"database_oid", "relations"})
-    _require(
-        inventory["database_oid"]
-        == await session.scalar(text("SELECT oid::bigint FROM pg_database WHERE datname=current_database()"))
-    )
+async def _require_inventory(session, inventory):
+    inventory = _named_inventory(inventory)
     relations = inventory["relations"]
-    _require(len(relations) == 2 and {relation["relation_name"] for relation in relations} == {"zip_state", "zcta5"})
-    _require(len({relation["schema_name"] for relation in relations}) == 1)
-    for relation in relations:
-        _require(_SCHEMA.fullmatch(relation["schema_name"]) is not None)
-        actual = await _protected_relation(
-            session, f'"{relation["schema_name"]}"."{relation["relation_name"]}"', expected_owner=owner_oid
+    _require(
+        len(relations) == 2
+        and {row["relation_name"] for row in relations} == {"zip_state", "zcta5"}
+        and len({row["schema_name"] for row in relations}) == 1
+    )
+    for row in relations:
+        _require(_SCHEMA.fullmatch(row["schema_name"]) is not None)
+        _require(
+            await _protected_relation(
+                session, archive._quoted(row["schema_name"]) + "." + archive._quoted(row["relation_name"])
+            )
+            == row
         )
-        _require(actual == relation)
     return inventory
 
 
-async def _require_installed_selection(session, generation, owner_oid):
+async def _require_installed_selection(session, generation):
     from process import tiger_snapshot_inheritance as inherited
 
     _require(generation["state"] == "retained" and generation["origin_kind"] == "installed")
@@ -318,7 +311,7 @@ async def _require_installed_selection(session, generation, owner_oid):
         )
         == generation["generation_id"]
     )
-    await _protected_relation(session, _CUSTODY, expected_owner=owner_oid, catalog=True)
+    await _protected_relation(session, _CUSTODY, catalog=True)
     custody = (
         (
             await session.execute(
@@ -334,32 +327,17 @@ async def _require_installed_selection(session, generation, owner_oid):
         and custody["package_id"] == generation["package_id"]
     )
     receipt = custody["receipt"]
-    _require(receipt["contract"] == inherited.CONTRACT and _digest(receipt) == custody["receipt_sha256"])
-    pairs = sorted(
-        [relation["relation_name"], relation["relation_oid"]] for relation in generation["inventory"]["relations"]
-    )
-    _require(receipt["relation_oids"] == pairs)
-    await session.execute(text("LOCK TABLE ONLY tiger.zip_state, ONLY tiger.zcta5 IN ACCESS SHARE MODE NOWAIT"))
-    _require(await inherited.current_tiger_snapshot_children(session) == tuple(map(tuple, pairs)))
-    await _require_received_parents(session, receipt["parent_inventory"], owner_oid)
+    _require(receipt["contract"] == inherited.CONTRACT)
+    names = inherited.receipt_relations(receipt, generation["inventory"])
+    await _require_received_parents(session, receipt["parent_inventory"])
+    _require(await inherited.current_tiger_snapshot_children(session) == names)
 
 
-async def _require_received_parents(session, parents, owner_oid):
+async def _require_received_parents(session, parents):
     from process import tiger_snapshot_inheritance as inherited
 
-    for name, oid in parents["parent_oids"]:
-        _require(name in inherited.TABLES)
-        actual = await session.scalar(text("SELECT to_regclass(:name)::oid"), {"name": "tiger." + name})
-        _require(actual == oid)
-        _require(not await session.scalar(text(f'SELECT EXISTS(SELECT 1 FROM ONLY tiger."{name}" LIMIT 1)')))
-    objects = await inherited._tiger_parent_object_inventory(session, parents["parents"], owner_oid)
-    _require([dict(row) for row in objects] == parents["objects"])
-    extension = await inherited._tiger_extension_inventory(session, parents["parents"])
-    _require(_digest(extension) == parents["extension_sha256"])
-    catalog = await session.scalar(
-        text(inherited.PARENT_CATALOG_SQL), {"oids": [oid for _name, oid in parents["parent_oids"]]}
-    )
-    _require(_digest(catalog) == parents["catalog_sha256"])
+    inherited.parent_names(parents)
+    await inherited.require_tiger_snapshot_parents(session)
 
 
 async def selected_tiger_inventory(session, *, node_id=None):
@@ -369,9 +347,9 @@ async def selected_tiger_inventory(session, *, node_id=None):
 
 
 def _captured_tiger_proof(kind, node_id, source_id, package_id, registration_sha256, inventory):
+    inventory = _named_inventory(inventory)
     proof_by_field = dict(
         version=2,
-        database_oid=inventory["database_oid"],
         node_id=node_id,
         selection_kind=kind,
         source_id=str(source_id),
@@ -383,15 +361,15 @@ def _captured_tiger_proof(kind, node_id, source_id, package_id, registration_sha
     return proof_by_field
 
 
-async def selected_tiger_source_observation(session, *, node_id, owner_oid):
+async def selected_tiger_source_observation(session, *, node_id, owner_oid=None):
     """Expose only the authenticated Tiger selection, never a latest-epoch guess."""
     archive._require_transaction(session)
-    _require(type(node_id) is str and node_id and type(owner_oid) is int and owner_oid > 0)
-    owner, selected = await _selected_captured_generations(session, node_id=node_id, families=("tiger",))
+    _require(type(node_id) is str and node_id)
+    _catalog, selected = await _selected_captured_generations(session, node_id=node_id, families=("tiger",))
     if selected:
-        _require(owner["owner_oid"] == owner_oid and len(selected) == 1 and selected[0]["node_id"] == node_id)
+        _require(len(selected) == 1 and selected[0]["node_id"] == node_id)
         generation = selected[0]
-        inventory = await _require_model_capture(session, generation, owner_oid)
+        inventory = await _require_model_capture(session, generation)
         return _captured_tiger_proof(
             "captured-source",
             node_id,
@@ -400,20 +378,18 @@ async def selected_tiger_source_observation(session, *, node_id, owner_oid):
             generation["registration_sha256"],
             inventory,
         )
-    if owner is not None:
-        _require(owner["owner_oid"] == owner_oid)
     observed = await _selected_tiger_observation(session, node_id=node_id, observe=True)
     if observed is None or observed.get("selection_kind") == "installed":
         return None
     _require(observed["node_id"] == node_id)
-    await _protected_relation(session, _CAPTURE, expected_owner=owner_oid, catalog=True)
+    await _protected_relation(session, _CAPTURE, catalog=True)
     return observed
 
 
 async def _installed_tiger_inventory(session, node_id):
     if await session.scalar(text("SELECT to_regclass(:name)"), {"name": _CURRENT}) is not None:
         await _protected_relation(session, _CURRENT, catalog=True)
-        owner = await _protected_relation(session, _GENERATION, catalog=True)
+        await _protected_relation(session, _GENERATION, catalog=True)
         generation_rows = (
             (
                 await session.execute(
@@ -433,6 +409,6 @@ async def _installed_tiger_inventory(session, node_id):
             generation = generation_rows[0]
             if all(relation["schema_name"] == "tiger" for relation in generation["inventory"]["relations"]):
                 return True, None
-            await _require_installed_selection(session, generation, owner["owner_oid"])
-            return True, await _require_inventory(session, generation["inventory"], owner["owner_oid"])
+            await _require_installed_selection(session, generation)
+            return True, await _require_inventory(session, generation["inventory"])
     return False, None

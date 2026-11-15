@@ -13,7 +13,6 @@ import pytest
 
 from process import provider_directory_profile as profile
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
@@ -231,53 +230,53 @@ def test_profile_checkpoint_oid_accepts_positive_integer():
 def test_profile_checkpoint_migration_is_strict_and_chained_after_catalog():
     migration_source = MIGRATION_PATH.read_text(encoding="utf-8")
 
-    assert (
-        'down_revision = "20260720110000_uhc_provider_file_catalog"'
-        in migration_source
-    )
+    assert 'down_revision = "20260720110000_uhc_provider_file_catalog"' in migration_source
     assert "op.create_table(" in migration_source
     assert "create_table_or_validate" not in migration_source
     assert "create_index_if_missing" not in migration_source
 
 
 @pytest.mark.asyncio
-async def test_same_name_replacement_oid_is_never_reused_or_deleted(
-    monkeypatch,
-):
+async def test_named_logged_stage_ignores_old_tokens_and_refuses_unsafe_shape(monkeypatch):
     build = _build()
     checkpoint = _checkpoint(build)
+    plan = importer._provider_directory_profile_build_plan(build, has_existing_artifacts=False)
+    checkpoint.update(
+        targets_json=importer._profile_build_target_coordinates(build),
+        executable_plan_hash=plan.fingerprint,
+        materialization_mode=build.materialization_mode,
+        capacity_geometry_status=build.capacity_geometry_status,
+        capacity_geometry_hash=build.capacity_geometry_hash,
+        capacity_geometry_json=build.capacity_geometry_json,
+        evidence_next_batch=len(plan.evidence_batches),
+        evidence_total_batches=len(plan.evidence_batches),
+        profile_total_batches=len(plan.compact_batches),
+    )
     stage_identity = AsyncMock(return_value=(999, "r", "p"))
     status = AsyncMock(return_value=1)
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_stage_relation_identity",
-        stage_identity,
-    )
+    layout_read = AsyncMock(return_value=None)
+    monkeypatch.setattr(importer, "_provider_directory_profile_stage_relation_identity", stage_identity)
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_relation_layout", layout_read)
     monkeypatch.setattr(importer.db, "status", status)
-
-    reusable = await importer._is_profile_build_checkpoint_reusable(
-        build,
-        checkpoint,
+    options_by_name = dict(
         has_existing_artifacts=False,
-        evidence_build_fence=importer.ProviderDirectoryArtifactBuildFence(
-            None
-        ),
-        profile_build_fence=importer.ProviderDirectoryArtifactBuildFence(None),
-        evidence_total_batches=1,
-        profile_total_batches=1,
+        evidence_build_fence=importer.ProviderDirectoryArtifactBuildFence(),
+        profile_build_fence=importer.ProviderDirectoryArtifactBuildFence(),
+        evidence_total_batches=len(plan.evidence_batches),
+        profile_total_batches=len(plan.compact_batches),
     )
-    assert reusable is False
-
-    with pytest.raises(RuntimeError, match="reinitialize_stage_oid_mismatch"):
-        await importer._drop_profile_stages_for_reinitialize(
-            build,
-            checkpoint,
-        )
+    assert await importer._is_profile_build_checkpoint_reusable(build, checkpoint, **options_by_name)
+    assert layout_read.await_count == 2
+    stage_identity.return_value = (999, "r", "u")
+    assert not await importer._is_profile_build_checkpoint_reusable(build, checkpoint, **options_by_name)
+    checkpoint["profile_stage"] = "unrelated_stage"
+    with pytest.raises(RuntimeError, match="reinitialize_stage_name_mismatch"):
+        await importer._drop_profile_stages_for_reinitialize(build, checkpoint)
     status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_stale_reaper_rejects_same_name_replacement_oid(monkeypatch):
+async def test_stale_reaper_uses_declared_names_and_refuses_wrong_stage(monkeypatch):
     build = _build()
     checkpoint = _checkpoint(build)
 
@@ -301,14 +300,24 @@ async def test_stale_reaper_rejects_same_name_replacement_oid(monkeypatch):
         "_provider_directory_profile_stage_relation_identity",
         AsyncMock(return_value=(999, "r", "p")),
     )
+    monkeypatch.setattr(importer, "_provider_directory_profile_stage_layout", AsyncMock())
+    monkeypatch.setattr(importer, "_assert_profile_capacity_build_unconsumed", AsyncMock())
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status)
 
-    with pytest.raises(RuntimeError, match="stale_stage_oid_mismatch"):
+    assert (
         await importer._reap_stale_provider_directory_profile_builds(
             "mrf",
             current_build_id=f"pdpb_{'b' * 32}",
         )
+        == 1
+    )
+    drops = [str(call.args[0]) for call in status.await_args_list if str(call.args[0]).startswith("DROP TABLE")]
+    assert len(drops) == 2 and all(statement.endswith(" RESTRICT;") for statement in drops)
+    checkpoint["evidence_stage"] = "wrong_stage"
+    status.reset_mock()
+    with pytest.raises(RuntimeError, match="stale_checkpoint_stage_invalid"):
+        await importer._reap_stale_provider_directory_profile_builds("mrf", current_build_id=f"pdpb_{'b' * 32}")
     status.assert_not_awaited()
 
 
@@ -454,11 +463,6 @@ async def test_fact_failure_stops_later_sources_and_preserves_checkpoint(
         )
 
     assert visited_dataset_ids == ["dataset-a"] * 115 + ["dataset-b"]
-    assert [
-        call.kwargs["expected_batch"] for call in advance.await_args_list
-    ] == list(range(115))
-    assert all(
-        call.kwargs["total_batches"] == 345
-        for call in advance.await_args_list
-    )
+    assert [call.kwargs["expected_batch"] for call in advance.await_args_list] == list(range(115))
+    assert all(call.kwargs["total_batches"] == 345 for call in advance.await_args_list)
     mark_state.assert_not_awaited()

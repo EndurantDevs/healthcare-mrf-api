@@ -140,67 +140,67 @@ def test_prepared_schema_keeps_the_callers_address_version_intent(include_versio
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("oid", [None, False, 0, "12", 12])
-async def test_unadmitted_scratch_requires_an_actual_positive_relation_oid(monkeypatch, oid):
-    monkeypatch.setattr(preparation.admission, "create_stage_sql", AsyncMock())
-    read = AsyncMock(return_value=oid)
-    monkeypatch.setattr(preparation.admission, "read_scalar", read)
-    token = preparation.admission._ADMISSION.set(None)
-    owned_by_name = {}
-    database = object()
-    try:
-        operation = preparation._create_scratch(
-            SimpleNamespace(db=database), "registry", "input_rows", "CREATE TABLE input_rows()", owned_by_name, None
-        )
-        if type(oid) is int and oid > 0:
-            await operation
-            assert owned_by_name == {"input_rows": oid}
-        else:
-            with pytest.raises(RuntimeError, match="scratch identity is missing"):
-                await operation
-            assert not owned_by_name
-    finally:
-        preparation.admission._ADMISSION.reset(token)
-    read.assert_awaited_once_with(
-        database, "SELECT to_regclass(:relation)::oid::bigint", relation="registry.input_rows"
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None,
+        RuntimeError("native CREATE denied"),
+        asyncio.CancelledError(),
+        PermissionError("schema denied"),
+        ValueError("bad native layout"),
+    ],
+)
+async def test_scratch_creation_records_names_after_native_success(monkeypatch, failure):
+    create = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(preparation.admission, "create_stage_sql", create)
+    created_names = set()
+    operation = preparation._create_scratch(
+        SimpleNamespace(), "registry", "input_rows", "CREATE TABLE input_rows()", created_names, None
     )
+    if failure is None:
+        await operation
+        assert created_names == {"input_rows"}
+    else:
+        with pytest.raises(type(failure)) as raised:
+            await operation
+        assert raised.value is failure and not created_names
+    create.assert_awaited_once_with("registry", "input_rows", "CREATE TABLE input_rows()", row_scratch=None)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed_oid", [False, True])
-async def test_scratch_cleanup_locks_and_rechecks_identity_before_drop(monkeypatch, changed_oid):
-    entered, dropped = [], []
+@pytest.mark.parametrize("denied", [False, True])
+async def test_scratch_cleanup_uses_declared_names_and_native_read_locks(monkeypatch, denied):
+    dropped_relations = []
 
     @asynccontextmanager
     async def transaction():
-        entered.append(True)
         yield
 
     async def drop(schema, name):
-        dropped.append((schema, name))
+        dropped_relations.append((schema, name))
 
     monkeypatch.setattr(preparation.admission, "native_transaction", transaction)
     monkeypatch.setattr(preparation.admission, "drop_stage", drop)
-    database = SimpleNamespace(status=AsyncMock(), scalar=AsyncMock(return_value=99 if changed_oid else 12))
+    database = SimpleNamespace(
+        status=AsyncMock(), scalar=AsyncMock(side_effect=AssertionError("physical lookup reached"))
+    )
+    if denied:
+        database.status.side_effect = PermissionError("native lock denied")
     token = preparation.admission._ADMISSION.set(None)
     try:
         operation = preparation._drop_scratch(
-            SimpleNamespace(db=database), "registry", ("never_created", "input_rows"), {"input_rows": 12}
+            SimpleNamespace(db=database), "registry", ("never_created", "input_rows"), {"input_rows"}
         )
-        if changed_oid:
-            with pytest.raises(RuntimeError, match="scratch identity changed"):
+        if denied:
+            with pytest.raises(PermissionError, match="native lock denied"):
                 await operation
-            assert dropped == []
+            assert not dropped_relations
         else:
             await operation
-            assert dropped == [("registry", "input_rows")]
+            assert dropped_relations == [("registry", "input_rows")]
+        database.scalar.assert_not_awaited()
     finally:
         preparation.admission._ADMISSION.reset(token)
-    assert entered == [True]
-    assert [call.args[0] for call in database.status.await_args_list] == [
-        "SET LOCAL lock_timeout='500ms'",
-        'LOCK TABLE "registry"."input_rows" IN ACCESS EXCLUSIVE MODE NOWAIT',
-    ]
 
 
 @pytest.mark.asyncio
@@ -310,85 +310,56 @@ async def test_candidate_copy_refuses_a_driver_outside_the_executing_transaction
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["scope", "task", "owner_oid", "scratch_oid", "missing_registration"])
-async def test_row_scratch_cannot_cross_tasks_scopes_or_relation_identities(drift):
+@pytest.mark.parametrize("invalid", [None, object(), {}, "scratch", False])
+async def test_row_scratch_state_requires_active_bookkeeping(invalid):
     admitted = preparation.admission
+    with pytest.raises(RuntimeError, match="scratch scope is inactive"):
+        admitted._row_scratch_state(invalid)
     scope = admitted._AdmittedPreparation(object(), "0" * 64, asyncio.Semaphore(1))
-    capability = admitted._RowScratchCapability()
-    state = admitted._RowScratchState(scope, asyncio.current_task(), {"input_rows": 12})
-    scope.owned_oids["input_rows"] = 12
-    scope.row_scratch_owners["input_rows"] = (12, capability)
-    admitted._ROW_SCRATCH_STATES[capability] = state
-    token = admitted._ADMISSION.set(scope)
-    try:
-        assert admitted._row_scratch_state(capability) is state
-        if drift == "scope":
-            admitted._ADMISSION.set(None)
-        if drift == "task":
-            state.task = None
-        if drift == "owner_oid":
-            scope.owned_oids["input_rows"] = 13
-        if drift == "scratch_oid":
-            scope.row_scratch_owners["input_rows"] = (13, capability)
-        if drift == "missing_registration":
-            del scope.row_scratch_owners["input_rows"]
-        with pytest.raises(RuntimeError, match="scratch (capability is invalid|identity changed)"):
-            admitted._row_scratch_state(capability)
-    finally:
-        admitted._ADMISSION.reset(token)
-        admitted._ROW_SCRATCH_STATES.pop(capability, None)
+    state = admitted._RowScratchState(scope)
+    assert admitted._row_scratch_state(state) is state
+    admitted.finish_row_scratch(state)
+    with pytest.raises(RuntimeError, match="scratch scope is inactive"):
+        admitted._row_scratch_state(state)
 
 
 @pytest.mark.asyncio
-async def test_row_scratch_retirement_requires_the_complete_owned_relation_identity():
+async def test_row_scratch_retirement_tracks_exact_remaining_names():
     admitted = preparation.admission
     scope = admitted._AdmittedPreparation(object(), "0" * 64, asyncio.Semaphore(1))
-    capability = admitted._RowScratchCapability()
-    state = admitted._RowScratchState(scope, asyncio.current_task())
-    admitted._ROW_SCRATCH_STATES[capability] = state
-    token = admitted._ADMISSION.set(scope)
-    try:
-        scope.owned_oids["input_rows"] = 12
-        admitted._register_row_scratch(scope, "input_rows", 12, capability, state)
-        with pytest.raises(RuntimeError, match="remains owned"):
-            admitted.finish_row_scratch(capability)
-        with pytest.raises(RuntimeError, match="registration changed"):
-            admitted._register_row_scratch(scope, "input_rows", 12, capability, state)
-        with pytest.raises(RuntimeError, match="retirement changed"):
-            admitted._retire_row_scratch(scope, "input_rows", 13)
-        assert state.owned_oids == {"input_rows": 12}
-        admitted._retire_row_scratch(scope, "input_rows", 12)
-        assert not state.owned_oids and not scope.row_scratch_owners
-        admitted.finish_row_scratch(capability)
-        with pytest.raises(RuntimeError, match="capability is invalid"):
-            admitted._row_scratch_state(capability)
-    finally:
-        admitted._ADMISSION.reset(token)
-        admitted._ROW_SCRATCH_STATES.pop(capability, None)
+    state = admitted._RowScratchState(scope)
+    admitted._register_row_scratch(scope, "input_rows", state, state)
+    with pytest.raises(RuntimeError, match="remains owned"):
+        admitted.finish_row_scratch(state)
+    with pytest.raises(RuntimeError, match="registration changed"):
+        admitted._register_row_scratch(scope, "input_rows", state, state)
+    assert state.owned_relations == {"input_rows"}
+    admitted._retire_row_scratch(scope, "unrelated")
+    assert state.owned_relations == {"input_rows"}
+    admitted._retire_row_scratch(scope, "input_rows")
+    assert not state.owned_relations and not scope.row_scratch_owners
+    admitted.finish_row_scratch(state)
+    with pytest.raises(RuntimeError, match="scope is inactive"):
+        admitted._row_scratch_state(state)
 
 
 @pytest.mark.asyncio
-async def test_row_scratch_inventory_excludes_other_runners_and_rejects_their_drift():
+async def test_row_scratch_locks_exclude_other_live_runners():
     admitted = preparation.admission
     scope = admitted._AdmittedPreparation(object(), "0" * 64, asyncio.Semaphore(1))
-    capabilities = [admitted._RowScratchCapability(), admitted._RowScratchCapability()]
-    scope.owned_oids.update(common=10, first=11, second=12)
-    for capability, name in zip(capabilities, ("first", "second"), strict=True):
-        state = admitted._RowScratchState(scope, asyncio.current_task(), {name: scope.owned_oids[name]})
-        admitted._ROW_SCRATCH_STATES[capability] = state
-        scope.row_scratch_owners[name] = (scope.owned_oids[name], capability)
-    scope_token = admitted._ADMISSION.set(scope)
-    row_token = admitted._ROW_SCRATCH.set(capabilities[0])
+    states = [admitted._RowScratchState(scope), admitted._RowScratchState(scope)]
+    scope.owned_relations.update(("common", "first", "second"))
+    for state, name in zip(states, ("first", "second"), strict=True):
+        admitted._register_row_scratch(scope, name, state, state)
+    token = admitted._ROW_SCRATCH.set(states[0])
     try:
         assert admitted._locked_stage_names(scope) == ["common", "first"]
-        scope.owned_oids["second"] = 99
-        with pytest.raises(RuntimeError, match="inventory changed"):
-            admitted._locked_stage_names(scope)
+        admitted._retire_row_scratch(scope, "second")
+        scope.owned_relations.discard("second")
+        assert admitted._locked_stage_names(scope) == ["common", "first"]
+        assert states[0].owned_relations == {"first"} and not states[1].owned_relations
     finally:
-        admitted._ROW_SCRATCH.reset(row_token)
-        admitted._ADMISSION.reset(scope_token)
-        for capability in capabilities:
-            admitted._ROW_SCRATCH_STATES.pop(capability, None)
+        admitted._ROW_SCRATCH.reset(token)
 
 
 @pytest.mark.asyncio
@@ -571,7 +542,7 @@ async def test_admitted_runner_accounts_both_heaps_on_its_single_worker(monkeypa
 
             async def consume(select_sql, *, native_prepared):
                 """Keep both intermediate OIDs and target under the current real reservation."""
-                assert len(scope.owned_oids) == 3
+                assert len(scope.owned_relations) == 3
                 return await sql._run_sql_phase(
                     sql._insert_raw_from_source_sql(schema, "raw_actual", select_sql, native_prepared=native_prepared),
                     context={},
@@ -580,7 +551,7 @@ async def test_admitted_runner_accounts_both_heaps_on_its_single_worker(monkeypa
 
             async with asyncio.timeout(20):
                 await preparation.run_prepared_source(sql, schema, source_select_sql(schema), consume)
-            assert set(scope.owned_oids) == {"raw_actual"}
+            assert set(scope.owned_relations) == {"raw_actual"}
             assert authority._external_relations == {(schema, "raw_actual")}
             assert any(len(inventory) == 3 for inventory in inventories)
             assert await database.scalar(f"SELECT count(*) FROM {schema}.raw_actual") == 4

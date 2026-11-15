@@ -13,6 +13,7 @@ from process import provider_directory_compact_source_completion as compact_comp
 from process import provider_directory_compact_source_migration as migration
 from process import provider_directory_generic_candidate as candidate_rows
 from process import provider_directory_generic_source_storage as storage
+from process.provider_directory_source_storage_binding import named_source_document
 from tests.test_provider_directory_compact_payload import resource
 from tests.test_provider_directory_generic_source_transition import ROOT, _transition
 from tests.test_provider_directory_generic_source_transition import case as case
@@ -109,6 +110,8 @@ def compact_candidate(named_case):
     prefix = "pdgs_" + "c" * 32 + "_"
     tables_by_root = {root: {"name": prefix + suffix} for root, suffix in storage._COMPACT_SUFFIXES.items()}
     binding.update(contract=storage.NAMED_COMPACT_CONTRACT, payload_format=compact.FORMAT, tables=tables_by_root)
+    named_case.allowed_tables.clear()
+    named_case.allowed_tables.update(table["name"] for table in tables_by_root.values())
     # This fixture begins with legacy physical inventory, as the earlier named tests do.
     binding["storage"] = deepcopy(named_case.old)
     binding["resets"] = {"PractitionerRole": 1}
@@ -128,7 +131,7 @@ async def test_full_successor_preserves_compact_format_tables_and_reset_retired_
     result = await _transition(named_case, named_case.counts, stopped_run_id=ROOT)
     actual = named_case.header["candidate_storage_json"]
     assert result["rows"] == sum(named_case.counts.values())
-    assert actual == {**before, "storage": named_case.new}
+    assert actual == named_source_document({**before, "storage": named_case.new})
     assert named_case.checkpoints == checkpoints
     assert (await _transition(named_case, named_case.counts, stopped_run_id=ROOT))["already_applied"]
 

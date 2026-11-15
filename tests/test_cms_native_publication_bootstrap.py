@@ -2,6 +2,8 @@
 """Record bootstrap actor boundaries; these host doubles prove no database authority."""
 
 import asyncio
+import json
+import re
 from contextlib import asynccontextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -285,7 +287,11 @@ def test_historical_profile_seed_uses_canonical_current_lineage():
         )
         for pair in execution.attestation.pairs
     )
-    targets_by_field = {"evidence_target_oid": 71, "profile_target_oid": 72, "evidence_rows": 0, "profile_rows": 0}
+    targets_by_role = {
+        "evidence": {"schema": "mrf", "name": "provider_directory_profile_evidence"},
+        "profile": {"schema": "mrf", "name": "provider_directory_profile"},
+    }
+    targets_by_field = {"targets_json": json.dumps(targets_by_role), "evidence_rows": 0, "profile_rows": 0}
     profile_by_field = producer._historical_profile_values(execution, contexts, targets_by_field)
     state = fhir._profile_serving_state_from_row(
         {
@@ -303,7 +309,7 @@ def test_historical_profile_seed_uses_canonical_current_lineage():
     assert {source_id for source_id, _digest in state.source_context_vector} == {
         source_id for source_id, _dataset in state.source_vector
     }
-    assert state.evidence_target_oid == 71 and state.profile_target_oid == 72
+    assert state.targets == targets_by_role
     assert state.capacity_geometry_status == "legacy_unavailable"
 
 
@@ -315,22 +321,20 @@ async def test_native_sql_observers_accept_native_row_mappings():
         "sequence": "mrf.synthetic_sequence",
     }
     sequence_by_field = {"last_value": 7, "is_called": True}
-    identity_by_field = {"database_oid": 73, "database_name": "synthetic", "database_system_identifier": "71"}
     first = AsyncMock(
         side_effect=[
             SimpleNamespace(_mapping=default_by_field),
             SimpleNamespace(_mapping=sequence_by_field),
-            SimpleNamespace(_mapping=identity_by_field),
         ]
     )
     prepared = SimpleNamespace(
-        address=SimpleNamespace(db_schema="mrf", stage_oids=(("entity_address_evidence", "synthetic_evidence", 71),)),
+        address=SimpleNamespace(db_schema="mrf", stage_relations=(("entity_address_evidence", "synthetic_evidence"),)),
         fhir=SimpleNamespace(db=SimpleNamespace(first=first)),
     )
     assert await retained._source_evidence_sequence_state(prepared) == (default_by_field, sequence_by_field)
     assert first.await_args_list[0].kwargs == {"relation": "mrf.synthetic_evidence"}
     assert first.await_args_list[1].args == ("SELECT last_value,is_called FROM mrf.synthetic_sequence",)
-    assert await retained._native_database_identity(prepared.fhir) == identity_by_field
+    assert first.await_count == 2
 
 
 def _split_native_copy_probe(counts):
@@ -363,7 +367,7 @@ async def test_native_address_copy_observers_use_import_writer(monkeypatch, inte
     schema, table = "synthetic_retained", "entity_address_unified"
     transport = _split_native_copy_probe([1, 1] if interrupted else [0, 1])
     admission = SimpleNamespace(
-        _relations={},
+        _relations=set(),
         _external_relations=set(),
         _native_relations={(schema, name): object() for name in retained.RELATION_NAMES},
         plan=SimpleNamespace(batch_size=32),
@@ -395,7 +399,7 @@ async def test_native_address_copy_observers_use_import_writer(monkeypatch, inte
         )
         assert transport.target.copy_to_table.await_count == 2
     else:
-        created_relations = [(schema, name, index) for index, name in enumerate(retained.RELATION_NAMES, 1)]
+        created_relations = [(schema, name) for name in retained.RELATION_NAMES]
         observe = retained._address_copy_observer(prepared, created_relations, imported, phases)
         await observe(
             transport,
@@ -504,7 +508,7 @@ async def test_native_preparation_failure_sentinel_requires_selected_probes_and_
 
     names = (
         "_reject_preparation",
-        "_reject_raw_oid",
+        "_reject_raw_layout",
         "_reject_copy_batch_interruptions",
         "_reject_address_copy_interruptions",
     )
@@ -703,7 +707,7 @@ async def test_native_registration_proves_partition_roots_before_enrolling_heaps
     monkeypatch.setattr(registration, "register_native_input_candidates", register)
     await fixture._register_native_heaps(database, component)
     capture.assert_awaited_once_with(driver, ledger_schema="mrf", source_policy=component.policy)
-    register.assert_awaited_once_with(driver, ledger_schema="mrf", candidates=candidates, expected_actor_oid=71)
+    register.assert_awaited_once_with(driver, ledger_schema="mrf", candidates=candidates)
     assert [call.args[0] for call in driver.execute.await_args_list] == [
         'REVOKE ALL ON TABLE "mrf"."address_alias_v1" FROM "source_owner"',
         'GRANT SELECT,MAINTAIN ON TABLE "mrf"."address_alias_v1" TO "source_owner"',
@@ -749,20 +753,86 @@ async def test_builder_migrations_wrap_authentic_canonical_install(monkeypatch):
     historical.dispose.assert_awaited_once()
 
 
+def _assert_selection_input_grants(statements):
+    """Require the fixed canonical lock inventory without snapshot heap or DML grants."""
+    selection_inputs = fixture.selection_snapshot.UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS
+    assert {statement for statement in statements if statement.startswith("GRANT SELECT,MAINTAIN ON ")} == {
+        f'GRANT SELECT,MAINTAIN ON "mrf"."{name}" TO "source_owner"'
+        for name in (*selection_inputs, "npi_result_generation")
+    }
+    assert all(
+        not any(privilege in statement.split(" ON ")[0] for privilege in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"))
+        for statement in statements
+        if any(f'ON "mrf"."{name}"' in statement for name in selection_inputs)
+    )
+
+
+def _assert_profile_read_grants(statements, driver, policy):
+    """Match both SQL readiness calls and the existing configured metadata reader projection."""
+    from db.plan_release_storage import storage_identifier
+    from process.provider_directory_cms_control_privileges import READ_COLUMN_GRANTS, cms_control_read_roles
+    from process.provider_directory_profile_uhc_flex_store import _profile_selection_dataset_sql
+
+    query = _profile_selection_dataset_sql('"mrf"."provider_directory_endpoint_dataset"', '"mrf"')
+    readiness_names = set(re.findall(r'"([^\"]+)"\(dataset\.dataset_id\)', query))
+    assert readiness_names == {
+        "provider_directory_uhc_flex_practitioner_dataset_ready",
+        "provider_directory_rooted_graph_dataset_ready",
+    }
+    assert {statement for statement in statements if statement.startswith("GRANT EXECUTE")} == {
+        f'GRANT EXECUTE ON FUNCTION "mrf"."{name}"(text) TO "source_owner"' for name in readiness_names
+    }
+    grantees = cms_control_read_roles(policy)
+    assert {
+        call.args[0]
+        for call in driver.execute.await_args_list
+        if any(call.args[0].endswith(f'TO "{role}"') for role in grantees)
+    } == {
+        f'GRANT SELECT({",".join(map(storage_identifier, columns))}) ON "mrf"."{root}" TO "{role}"'
+        for root, columns in READ_COLUMN_GRANTS.items()
+        for role in grantees
+    }
+    assert [
+        call.args[0] for call in driver.execute.await_args_list if 'ON "mrf"."npi_result_generation"' in call.args[0]
+    ] == ['GRANT SELECT(origin_lineage_id,origin_generation) ON "mrf"."npi_result_generation" TO "source_owner"']
+    driver.fetchval.assert_awaited_once()
+    assert [statement for statement in statements if 'ON "mrf"."cms_native_input_revision"' in statement] == [
+        'GRANT SELECT("schema_name","table_name","revision","mutation_xid") '
+        'ON "mrf"."cms_native_input_revision" TO "source_owner"'
+    ]
+    receipt_columns = ",".join(map(storage_identifier, READ_COLUMN_GRANTS[fixture.serving_receipt._TABLE]))
+    assert {
+        statement for statement in statements if 'ON "mrf"."provider_directory_cms_serving_receipt"' in statement
+    } == {
+        f'GRANT SELECT({receipt_columns}) ON "mrf"."provider_directory_cms_serving_receipt" TO "source_owner"',
+        'GRANT INSERT("receipt_id","payload","registry_source_pair_json") '
+        'ON "mrf"."provider_directory_cms_serving_receipt" TO "source_owner"',
+    }
+
+
+async def _is_profile_origin_metadata_installed(query, schema):
+    assert "relation.relname='npi_result_generation'" in query and schema == "mrf"
+    return True
+
+
 async def test_profile_controls_have_only_protocol_dml_grants():
     toast_rows = [SimpleNamespace(relname="pg_toast_71"), SimpleNamespace(relname="pg_toast_72")]
-    driver = SimpleNamespace(execute=AsyncMock())
+    driver = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(side_effect=_is_profile_origin_metadata_installed))
     connection = SimpleNamespace(
         execute=AsyncMock(return_value=SimpleNamespace(all=lambda: toast_rows)),
         scalar=AsyncMock(return_value=True),
         get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver)),
     )
     database = SimpleNamespace(engine=SimpleNamespace(begin=lambda: _context(connection)))
-    await fixture._grant_profile_controls(database, SimpleNamespace(schema="mrf", owner_role="source_owner"))
+    policy = fixture.source_policy.GenericSourcePolicy("mrf", "source_owner", "source_publisher", ("source_reader",))
+    await fixture._grant_profile_controls(database, policy)
     statements = [
         str(call.args[0]) for call in connection.execute.await_args_list if str(call.args[0]).startswith("GRANT")
     ]
-    assert len(statements) == 14 + len(fixture.addresses.RELATION_NAMES)
+    selection_inputs = fixture.selection_snapshot.UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS
+    assert len(statements) == 19 + len(fixture.addresses.RELATION_NAMES) + len(selection_inputs)
+    _assert_selection_input_grants(statements)
+    _assert_profile_read_grants(statements, driver, policy)
     assert all(statement.endswith('TO "source_owner"') for statement in statements)
     assert all("ALL" not in statement and "ALL TABLES" not in statement for statement in statements)
     assert 'GRANT SELECT,UPDATE ON "mrf"."import_run" TO "source_owner"' not in statements
@@ -795,36 +865,44 @@ async def test_profile_controls_have_only_protocol_dml_grants():
     assert 'GRANT SELECT(chunk_id) ON "pg_toast"."pg_toast_72" TO "source_owner"' in statements
     selection = next(call for call in connection.execute.await_args_list if str(call.args[0]).startswith("SELECT"))
     assert "relation.relname=ANY(:names)" in str(selection.args[0])
-    assert selection.args[1]["schema"] == "mrf" and selection.args[1]["names"] == ["import_run"]
+    assert selection.args[1]["schema"] == "mrf"
+    assert selection.args[1]["names"] == [
+        "import_run",
+        "provider_directory_profile_build_checkpoint",
+        "provider_directory_profile_serving_generation",
+    ]
     assert "toast.relowner<>" in str(selection.args[0])
     assert selection.args[1]["owner"] == "source_owner"
 
 
-@pytest.mark.parametrize("damage", ["trigger", "body", "namespace", "defaults", "composite"])
-def test_counter_custody_projection_preserves_all_other_metadata(damage):
-    from copy import deepcopy
+@pytest.mark.parametrize(
+    "function_name",
+    [
+        "provider_directory_uhc_flex_practitioner_dataset_ready",
+        "provider_directory_rooted_graph_dataset_ready",
+        "provider_directory_cms_serving_receipt",
+    ],
+)
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_profile_read_grant_refusal_propagates(function_name, failure):
+    """A denied readonly entry point aborts setup rather than omitting native readiness checks."""
+    recorded_statements = []
 
-    from tests.test_native_counter_callable_capability import CounterProtocol
+    async def execute(statement):
+        recorded_statements.append(str(statement))
+        if (
+            str(statement).startswith(f'GRANT EXECUTE ON FUNCTION "mrf"."{function_name}"')
+            or str(statement).startswith("GRANT SELECT(")
+            and f'ON "mrf"."{function_name}"' in str(statement)
+        ):
+            raise failure("readiness_grant_refused")
 
-    protocol = CounterProtocol(owner=103)
-    previous_by_field = dict(
-        catalog=dict(ledger=dict(catalog=protocol.catalog, composite=protocol.composite), functions=protocol.functions),
-        namespace=dict(oid=201),
-        defaults=[],
-    )
-    changed = deepcopy(previous_by_field)
-    match damage:
-        case "trigger":
-            changed["catalog"]["ledger"]["catalog"]["triggers"][0]["tgenabled"] = "D"
-        case "body":
-            changed["catalog"]["functions"]["cms_native_input_advance"]["definition"]["prosrc"] = "different"
-        case "namespace":
-            changed["namespace"]["oid"] = 202
-        case "defaults":
-            changed["defaults"].append({"defaclrole": 101})
-        case _:
-            changed["catalog"]["ledger"]["composite"]["oid"] = "14"
-    assert fixture._counter_immutable_inventory(changed) != fixture._counter_immutable_inventory(previous_by_field)
+    driver = SimpleNamespace(execute=AsyncMock())
+    policy = fixture.source_policy.GenericSourcePolicy("mrf", "source_owner", "source_publisher", ("source_reader",))
+    with pytest.raises(failure, match="readiness_grant_refused"):
+        await fixture._grant_profile_read_protocol(SimpleNamespace(execute=execute), driver, policy)
+    assert len(recorded_statements) > len(fixture.selection_snapshot.UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS)
+    driver.execute.assert_not_awaited()
 
 
 async def test_all_four_serving_targets_are_empty_and_source_owned_before_attestation():
@@ -879,7 +957,7 @@ async def test_all_four_serving_targets_are_empty_and_source_owned_before_attest
     assert connection.run_sync.await_count == 2
 
 
-@pytest.mark.parametrize("replace_profile_target", [False, True], ids=["original-source", "profile-oid"])
+@pytest.mark.parametrize("replace_profile_target", [False, True], ids=["original-source", "profile-data"])
 async def test_resume_probes_open_source_after_mutation_and_close_before_restore(monkeypatch, replace_profile_target):
     """Record transaction order only; these doubles confer no native authority."""
     from process import provider_directory_profile_scope_copy as scope_copy
@@ -900,12 +978,13 @@ async def test_resume_probes_open_source_after_mutation_and_close_before_restore
 
     database = SimpleNamespace(
         transaction=lambda: _context(None),
-        scalar=AsyncMock(side_effect=[11, 12, 12, 11] if replace_profile_target else ["Original"]),
+        scalar=AsyncMock(return_value="Original"),
+        all=AsyncMock(side_effect=[[{"npi": 1234567890}], [], [{"npi": 1234567890}]]),
         status=status,
     )
     arguments = (directory, object(), object(), object(), object(), frozenset({"Practitioner"}))
     reason = (
-        "provider_directory_profile_capacity_target_identity_changed"
+        "provider_directory_nonprofile_capacity_profile_geometry_changed"
         if replace_profile_target
         else "provider_directory_nonprofile_capacity_profile_geometry_changed"
     )
@@ -935,10 +1014,8 @@ async def test_native_registration_enrolls_only_archive_writer_before_registerin
     database = SimpleNamespace(session_factory=lambda: _context(session))
     session.begin = lambda: _context(None)
     component = SimpleNamespace(policy=SimpleNamespace(schema="mrf", owner_role="source_owner"))
-    previous = registration.NativeInputCandidate(
-        "mrf", "address_archive_v2", "mrf", "address_archive_v2", 100, 200, 100
-    )
-    current = registration.NativeInputCandidate("mrf", "address_archive_v2", "mrf", "address_archive_v2", 100, 300, 100)
+    previous = registration.NativeInputCandidate("mrf", "address_archive_v2", "mrf", "address_archive_v2")
+    current = registration.NativeInputCandidate("mrf", "address_archive_v2", "mrf", "address_archive_v2")
     capture = AsyncMock(return_value={"protected_fhir": object(), "candidates": (previous,)})
     enroll, register = AsyncMock(return_value=current), AsyncMock()
     monkeypatch.setattr(stage, "_copy_driver", AsyncMock(return_value=driver))
@@ -947,5 +1024,170 @@ async def test_native_registration_enrolls_only_archive_writer_before_registerin
     monkeypatch.setattr(archive_writer, "enroll_archive_writer", enroll)
     await fixture._register_native_heaps(database, component)
     enroll.assert_awaited_once_with(driver, component.policy, previous)
-    register.assert_awaited_once_with(driver, ledger_schema="mrf", candidates=(current,), expected_actor_oid=71)
+    register.assert_awaited_once_with(driver, ledger_schema="mrf", candidates=(current,))
     driver.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize("readers", [(), ("metadata_reader",)])
+@pytest.mark.parametrize("invalid", [False, True])
+async def test_named_source_fixture_requires_current_guards_before_metadata_grants(monkeypatch, readers, invalid):
+    from process import provider_directory_cms_control_privileges as controls
+    from process import provider_directory_cms_native_registration as registration
+
+    events = []
+    driver = object()
+
+    async def start_transaction(statement):
+        assert str(statement) == "SELECT 1"
+        events.append("transaction")
+
+    connection = SimpleNamespace(
+        execute=AsyncMock(side_effect=start_transaction),
+        get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver)),
+    )
+    policy = SimpleNamespace(schema="mrf")
+    factory = SimpleNamespace(_native_input_producer=object(), _require_current_policy=lambda: events.append("policy"))
+    component = SimpleNamespace(
+        factory=factory, policy=policy, admin_engine=SimpleNamespace(begin=lambda: _context(connection))
+    )
+    ledger_by_field = {"schema_name": "mrf", "table_name": "cms_native_input_revision"}
+
+    async def require_ledger(actual, schema):
+        assert actual is driver and schema == policy.schema
+        events.append("ledger")
+        return ledger_by_field
+
+    async def require_function(actual, schema, actual_ledger):
+        assert actual is driver and schema == policy.schema and actual_ledger is ledger_by_field
+        events.append("function")
+        if invalid:
+            raise RuntimeError("cms_address_native_revision_guard_unavailable")
+
+    async def grant(actual, configured_policy, *, metadata_read_roles):
+        assert actual is driver and configured_policy is policy and metadata_read_roles == readers
+        assert events == ["policy", "transaction", "ledger", "function"]
+        events.append("grant")
+
+    monkeypatch.setattr(registration, "_native_registration_ledger", require_ledger)
+    monkeypatch.setattr(registration, "_native_registration_function", require_function)
+    grant_readers = AsyncMock(side_effect=grant)
+    monkeypatch.setattr(controls, "grant_cms_origin_metadata_read_privileges", grant_readers)
+    if invalid:
+        with pytest.raises(RuntimeError, match="native_revision_guard_unavailable"):
+            await fixture._require_named_native_controls(component, readers)
+        grant_readers.assert_not_awaited()
+        assert events == ["policy", "transaction", "ledger", "function"]
+    else:
+        await fixture._require_named_native_controls(component, readers)
+        assert events == ["policy", "transaction", "ledger", "function", *(["grant"] if readers else []), "policy"]
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError, asyncio.CancelledError])
+async def test_catalog_registration_uses_fixture_administrator(monkeypatch, failure):
+    """Registration retains its semantic rows while the publisher never receives catalog DML."""
+    from process import provider_directory_cms_npd as cms
+
+    engine = object()
+    database = SimpleNamespace(engine=engine, _source_component=SimpleNamespace(admin_engine=engine))
+    fhir = fixture.source.fhir
+    publisher_database = fhir.db
+    publisher_upsert = fhir._upsert_rows
+    publisher_execution = AsyncMock(side_effect=AssertionError("publisher_catalog_write"))
+    monkeypatch.setattr(fhir, "_upsert_normalized_rows", publisher_execution)
+    recorded_rows = []
+
+    async def seed(actual_database, model, fields):
+        assert actual_database is database and fhir.db is publisher_database
+        assert fhir._upsert_rows is publisher_upsert and fhir._upsert_normalized_rows is not publisher_execution
+        recorded_rows.append((model, fields))
+        if failure:
+            raise failure("catalog_seed_interrupted")
+
+    monkeypatch.setattr(fixture, "_seed_selection_row", seed)
+    factory = SimpleNamespace(transaction=lambda: None)
+    async with fixture.source_policy.bind_generic_source_transaction_factory(factory):
+        if failure:
+            with pytest.raises(failure, match="catalog_seed_interrupted"):
+                await fixture._register_source_catalog(database, monkeypatch, cms._register_source, fhir)
+        else:
+            endpoint_id = await fixture._register_source_catalog(database, monkeypatch, cms._register_source, fhir)
+            endpoint_row, source_row = recorded_rows
+            assert endpoint_row[0] is fhir.ProviderDirectoryAPIEndpoint
+            assert source_row[0] is fhir.ProviderDirectorySource
+            expected_endpoint_by_field = {
+                name: field_value
+                for name, field_value in cms._source_endpoint(fhir).items()
+                if name in fhir.ProviderDirectoryAPIEndpoint.__table__.columns
+            }
+            assert endpoint_id == expected_endpoint_by_field["endpoint_id"]
+            assert {key: endpoint_row[1][key] for key in expected_endpoint_by_field} == expected_endpoint_by_field
+            expected_source = cms._source_row(fhir, endpoint_id, source_row[1]["created_at"])
+            assert source_row[1] == {
+                column.name: expected_source.get(column.name)
+                for column in fhir.ProviderDirectorySource.__table__.columns
+            }
+    publisher_execution.assert_not_awaited()
+    assert fhir.db is publisher_database and fhir._upsert_rows is publisher_upsert
+    assert fhir._upsert_normalized_rows is publisher_execution
+
+
+@pytest.mark.parametrize("substitution", ["administrator", "transaction", "payload"])
+async def test_catalog_setup_refuses_invalid_context(monkeypatch, substitution):
+    """This setup seam cannot write candidate payloads or enter an existing Source transaction."""
+    engine = object()
+    database = SimpleNamespace(engine=engine, _source_component=SimpleNamespace(admin_engine=engine))
+    fhir = fixture.source.fhir
+    seed = AsyncMock()
+    monkeypatch.setattr(fixture, "_seed_selection_row", seed)
+    if substitution == "administrator":
+        database.engine = object()
+    elif substitution == "transaction":
+        monkeypatch.setattr(fixture.source_policy, "source_transaction_available", lambda: object())
+
+    async def register(catalog_setup):
+        await catalog_setup._upsert_rows(fhir.ProviderDirectoryEndpointDataset, [{"dataset_id": "candidate"}])
+
+    factory = SimpleNamespace(transaction=lambda: None)
+    async with fixture.source_policy.bind_generic_source_transaction_factory(factory):
+        with pytest.raises(AssertionError):
+            await fixture._register_source_catalog(database, monkeypatch, register, fhir)
+    seed.assert_not_awaited()
+
+
+async def test_registration_normalizes_full_catalog_records(monkeypatch):
+    """Real registration and normalization build executable upserts for both complete models."""
+    from process import provider_directory_cms_npd as cms
+
+    engine = object()
+    session = SimpleNamespace(execute=AsyncMock(), begin=lambda: _context(None))
+    database = SimpleNamespace(
+        engine=engine,
+        _source_component=SimpleNamespace(admin_engine=engine),
+        session_factory=lambda: _context(session),
+    )
+    fhir = fixture.source.fhir
+    original_upsert = fhir._upsert_rows
+    registration_rows = []
+
+    async def record_registration(model, resource_rows):
+        registration_rows.append((model, resource_rows[0]))
+        return await original_upsert(model, resource_rows)
+
+    monkeypatch.setattr(fhir, "_upsert_rows", record_registration)
+    factory = SimpleNamespace(transaction=lambda: None)
+    async with fixture.source_policy.bind_generic_source_transaction_factory(factory):
+        endpoint_id = await fixture._register_source_catalog(database, monkeypatch, cms._register_source, fhir)
+    assert len(registration_rows) == session.execute.await_count == 2
+    assert [model for model, _ in registration_rows] == [
+        fhir.ProviderDirectoryAPIEndpoint,
+        fhir.ProviderDirectorySource,
+    ]
+    assert registration_rows[0][1]["endpoint_id"] == endpoint_id
+    assert "credential_descriptor_canonical_json" in registration_rows[0][1]
+    for (model, resource_row), executed in zip(registration_rows, session.execute.await_args_list, strict=True):
+        statement = executed.args[0]
+        assert statement.table is model.__table__
+        assert statement.compile().params == {
+            column.name: resource_row.get(column.name) for column in model.__table__.columns
+        }
+        assert "ON CONFLICT" in str(statement)

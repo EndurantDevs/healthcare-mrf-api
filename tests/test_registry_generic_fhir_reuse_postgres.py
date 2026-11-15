@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Generic captures retain complete facts through independent seal and replay."""
+"""Generic captures retain complete facts through data validation and replay."""
 
 import json
 from contextlib import AsyncExitStack, aclosing, asynccontextmanager
@@ -12,9 +12,9 @@ import pytest
 
 from db.models import EntityAddressUnified
 from process.network_address_projection import PinnedAddressSource
-from process.network_candidate_custody import NetworkCandidateCustodyError, seal_network_candidate_custody
 from process.network_fhir_retained_capture_contract import GENERIC_UNVERIFIED_NETWORK
-from process.network_membership_pipeline import prepare_and_publish_network_candidate
+from process.network_membership_pipeline import prepare_and_publish_network_candidate, prepare_network_candidate
+from process.network_membership_publication import NetworkPublicationError, publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.network_source_binding_store import apply_network_source_binding_batch
 from process.registry_candidate_composition import (
@@ -34,11 +34,11 @@ from process.registry_source_inventory_summaries import (
 )
 from process.registry_source_recipe_composition import (
     RegistrySourceCompositionError,
-    SourceRecipeReadContext,
     stage_registry_source_recipes,
 )
 from tests import generic_fhir_capture_postgres_support as support
-from tests.registry_candidate_custody_postgres_support import install_candidate_custody
+from tests.source_contribution_custody_postgres_support import publish_source_contribution_candidate
+from tests.test_network_compact_publication_postgres import _named_compact_runtime
 from tests.test_network_custom_address_source_postgres import (
     bootstrap_db as bootstrap_db,
 )
@@ -184,14 +184,11 @@ async def _native_generic_offices(fixture, source_fixture, serving, runtime_role
     )
     stack.push_async_callback(publisher.close)
     async with publisher.transaction(isolation="repeatable_read", readonly=True):
-        authority = await artifact.generation.read_entity_address_result_generation_authority(
-            artifact._CatalogSession(publisher),
-            schema_name=schema,
-        )
+        authority, _legacy_key = await artifact._current_authority(publisher, schema)
         address_source = PinnedAddressSource(
             schema,
             "entity_address_unified",
-            artifact._digest(artifact._authority_document(authority)),
+            artifact._digest(authority),
         )
         await artifact.capture_network_address_artifact(publisher, address_source, runtime_roles=runtime_roles)
     return address_source
@@ -271,26 +268,28 @@ async def _publish(context, copy_target, *, first=False):
     fixture = context.fixture
     arguments_by_name = dict(**fixture.writer_roles, control_schema=fixture.control_schema)
     if first:
-        with pytest.raises(NetworkCandidateCustodyError, match="network_candidate_custody_unavailable"):
-            await prepare_and_publish_network_candidate(
-                fixture.execution_connection,
-                copy_target,
-                context.address,
-                **arguments_by_name,
-            )
+        await prepare_network_candidate(fixture.execution_connection, copy_target, context.address, **arguments_by_name)
+        with pytest.raises(NetworkPublicationError, match="Generation data validation is incomplete"):
+            async with fixture.execution_connection.transaction(isolation="repeatable_read"):
+                await publish_network_candidate(
+                    fixture.execution_connection,
+                    copy_target,
+                    control_schema=fixture.control_schema,
+                    preparation_roles=fixture.preparation_roles,
+                )
         assert (
             await fixture.connection.fetchval(
                 f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control'
             )
             is None
         )
-        await context.seal(copy_target)
-    operation_result = await prepare_and_publish_network_candidate(
+    operation_result = await publish_source_contribution_candidate(
+        fixture,
         fixture.execution_connection,
         copy_target,
         context.address,
         seal_candidate=context.seal,
-        **arguments_by_name,
+        writer_roles=fixture.writer_roles,
     )
     async with fixture.execution_connection.transaction(isolation="repeatable_read", readonly=True):
         manifest = await resolve_network_serving_manifest(
@@ -453,15 +452,14 @@ async def _assert_missing_approval_boundary(context, original, monkeypatch):
 
 @pytest.fixture
 async def generic_composition_db(generic_capture_db, serving_schema, custom_db):
-    """Keep source, address, loading and custody roles independent with exact cleanup."""
+    """Keep genuine Source and address inputs with configured preparation and exact cleanup."""
     from tests.test_registry_candidate_composition_postgres import _remove_candidates
 
     source_fixture, fixture = generic_capture_db, custom_db
     context = SimpleNamespace(fixture=fixture, requests=[], targets=[])
     async with AsyncExitStack() as stack:
-        for extension in ("intarray", "btree_gin", "postgis"):
-            await fixture.connection.execute(f'CREATE EXTENSION IF NOT EXISTS "{extension}"')
-        await install_candidate_custody(fixture, stack)
+        monkeypatch = stack.enter_context(pytest.MonkeyPatch.context())
+        await _named_compact_runtime(fixture, stack, monkeypatch)
         runtime_roles = tuple(
             sorted((fixture.executor_role, fixture.roles["reader"], fixture.custody_roles["custodian"]))
         )
@@ -474,25 +472,7 @@ async def generic_composition_db(generic_capture_db, serving_schema, custom_db):
         )
         context.revision = approved.approved_revision
         context.address = await _native_generic_offices(fixture, source_fixture, serving_schema, runtime_roles, stack)
-        custodian = await asyncpg.connect(
-            fixture.custody_url.set(drivername="postgresql").render_as_string(hide_password=False)
-        )
-        stack.push_async_callback(custodian.close)
-
-        async def seal(target):
-            async def authorize(connection, supplied):
-                assert connection is custodian and supplied == target
-                return await connection.fetchval("SELECT current_user=session_user")
-
-            return await seal_network_candidate_custody(
-                custodian,
-                target,
-                control_schema=fixture.control_schema,
-                runtime_roles=(fixture.roles["reader"],),
-                authorize=authorize,
-            )
-
-        context.seal = seal
+        context.seal = fixture.seal_candidate
         try:
             yield context
         finally:
@@ -549,7 +529,6 @@ def _fold_office_metadata(candidate, root, office, derivation, *, witness, addre
             "approved_revision",
             "approved_generation_sha256",
             "address_source",
-            "address_identity",
             "origin_manifest_sha256",
             "canonicalizer_version",
         )
@@ -572,15 +551,7 @@ async def _inventory_metadata(fixture, manifest, *, witness, address_source=None
         assert descriptor["descriptor_version"] == 2
         assert contribution_summary_v4(root, (descriptor,)) == contribution
         assert office["origin_manifest_sha256"] is None and derivation["origin_manifest_sha256"] is None
-        identity = derivation["address_identity"]
-        source = derivation["address_source"]
-        native_identity = await fixture.connection.fetchrow(
-            "SELECT n.oid AS schema_oid,c.oid AS table_oid,c.relowner AS owner_oid "
-            "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=$2",
-            source["schema_name"],
-            source["table_name"],
-        )
-        assert dict(native_identity) == {key: identity[key] for key in ("schema_oid", "table_oid", "owner_oid")}
+        assert "address_identity" not in derivation
     else:
         assert "descriptor_version" not in descriptor
         assert contribution_summary_v3(root, (descriptor,)) == contribution
@@ -593,8 +564,7 @@ async def _inventory_metadata(fixture, manifest, *, witness, address_source=None
 
 async def _descriptor(context, manifest):
     _contribution, _office, descriptor, _derivation = await _inventory_metadata(context.fixture, manifest, witness=True)
-    owner = descriptor["fact_candidate_id"] or manifest.candidate_id
-    schema = "network_candidate_" + UUID(owner).hex
+    schema = descriptor["fact_schema_name"] or manifest.schema_name
     fact_kinds = await context.fixture.connection.fetch(
         "SELECT fact_json->>'kind' AS kind,count(*) AS fact_rows,"
         "bool_and(fact_json->'fact_version'='2'::jsonb) AS witness_v2 "
@@ -604,23 +574,6 @@ async def _descriptor(context, manifest):
     assert all(fact_kind["witness_v2"] for fact_kind in fact_kinds)
     assert descriptor["fact_rows"] == 14
     return descriptor
-
-
-async def _assert_independent_owners(context):
-    fixture = context.fixture
-    source_owner = await fixture.connection.fetchval(
-        "SELECT nspowner FROM pg_namespace WHERE nspname=$1",
-        context.recipe.source_pin.retained_capture.schema_name,
-    )
-    office_owner = await fixture.connection.fetchval(
-        "SELECT nspowner FROM pg_namespace WHERE nspname=$1",
-        context.address.schema_name,
-    )
-    loading_owner = await fixture.connection.fetchval(
-        "SELECT oid FROM pg_roles WHERE rolname=$1",
-        fixture.writer_roles["owner_role"],
-    )
-    assert len({source_owner, office_owner, loading_owner}) == 3
 
 
 @asynccontextmanager
@@ -641,6 +594,11 @@ async def _assert_reused_facts(context, original, rebound):
     descriptor = await _descriptor(context, rebound)
     original_descriptor = await _descriptor(context, original)
     assert descriptor["fact_candidate_id"] == original.candidate_id
+    assert tuple(descriptor[field] for field in ("fact_schema_name", "fact_table_name", "fact_generation_id")) == (
+        original.schema_name,
+        "network_source_contribution",
+        original.manifest_sha256,
+    )
     assert descriptor["fact_sha256"] == original_descriptor["fact_sha256"]
     assert tuple(
         descriptor[field]
@@ -655,8 +613,10 @@ async def _assert_reused_facts(context, original, rebound):
 
 
 @pytest.mark.parametrize("generic_capture_db", ["legacy", "modern"], indirect=True)
-async def test_genuine_generic_capture_composes_seals_reuses_and_keeps_old_readers(generic_composition_db, monkeypatch):
-    """Use actual capture, separate seal, native facts and pinned readers across head changes."""
+async def test_genuine_generic_capture_composes_validates_reuses_and_keeps_old_readers(
+    generic_composition_db, monkeypatch
+):
+    """Use actual capture, complete validation, native facts and pinned readers across head changes."""
     from process import registry_source_recipe_composition as composition
 
     context, fixture = generic_composition_db, generic_composition_db.fixture
@@ -666,7 +626,6 @@ async def test_genuine_generic_capture_composes_seals_reuses_and_keeps_old_reade
     before = await _read(context, original)
     descriptor = await _descriptor(context, original)
     assert (descriptor["fact_rows"], descriptor["omitted_rows"], descriptor["provider_only_rows"]) == (14, 6, 1)
-    await _assert_independent_owners(context)
 
     async def forbidden(*arguments, **options):
         pytest.fail("unchanged retained source facts must not be re-extracted or copied")

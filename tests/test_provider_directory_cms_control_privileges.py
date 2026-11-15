@@ -41,7 +41,7 @@ def _control_grants(statements):
 
 @pytest.fixture
 async def grant_statements():
-    connection = SimpleNamespace(execute=AsyncMock())
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=False), execute=AsyncMock())
     policy = SimpleNamespace(schema="control_schema", owner_role="control_owner")
     await privileges.grant_cms_control_privileges(connection, policy)
     return [call.args[0] for call in connection.execute.await_args_list]
@@ -218,8 +218,7 @@ def test_profile_final_rights_preserve_preparation_and_receipt_immutability(gran
     assert len(privileges.PROFILE_GENERATION_UPDATE) == 22
     assert set(privileges.PROFILE_GENERATION_INSERT) - set(privileges.PROFILE_GENERATION_UPDATE) == {
         "singleton_key",
-        "evidence_target_oid",
-        "profile_target_oid",
+        "targets_json",
     }
     assert all(
         columns is not None for (_root, operation), columns in rights.items() if operation in {"INSERT", "UPDATE"}
@@ -299,7 +298,8 @@ def test_granted_profile_initial_columns_match_actual_initial_cut():
         and any(isinstance(target, ast.Name) and target.id == "serving_by_column" for target in node.targets)
     )
     extra_columns = {key.value for key in values_assignment.value.keys if key is not None}
-    assert set(privileges.PROFILE_GENERATION_INSERT) == value_columns | extra_columns | {
+    assert set(privileges.PROFILE_GENERATION_INSERT) == (value_columns | extra_columns) - {"targets"} | {
+        "targets_json",
         "singleton_key",
         "capacity_geometry_status",
         "published_at",
@@ -349,7 +349,7 @@ def test_granted_address_columns_match_actual_native_finalizers(grant_statements
 )
 async def test_invalid_identifier_refuses_before_any_grant(field, value):
     policy_by_field = {"schema": "control_schema", "owner_role": "control_owner", field: value}
-    connection = SimpleNamespace(execute=AsyncMock())
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=False), execute=AsyncMock())
     with pytest.raises(ValueError, match="storage_identifier_invalid"):
         await privileges.grant_cms_control_privileges(connection, SimpleNamespace(**policy_by_field))
     connection.execute.assert_not_awaited()
@@ -358,7 +358,9 @@ async def test_invalid_identifier_refuses_before_any_grant(field, value):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("interruption", [RuntimeError("rejected"), asyncio.CancelledError()])
 async def test_error_or_cancellation_propagates_without_retry_or_transaction_takeover(interruption):
-    connection = SimpleNamespace(execute=AsyncMock(side_effect=[None, None, interruption]))
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(return_value=False), execute=AsyncMock(side_effect=[None, None, interruption])
+    )
     policy = SimpleNamespace(schema="control_schema", owner_role="control_owner")
     with pytest.raises(type(interruption)) as caught:
         await privileges.grant_cms_control_privileges(connection, policy)
@@ -377,7 +379,7 @@ async def test_read_plan_limits_columns_and_grantees():
         ("control_builder", "control_reader"),
         ("control_builder",),
     )
-    connection = SimpleNamespace(execute=AsyncMock())
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=False), execute=AsyncMock())
     await privileges.grant_cms_control_read_privileges(connection, policy)
     statements = [call.args[0] for call in connection.execute.await_args_list]
     assert len(statements) == 12
@@ -399,7 +401,7 @@ async def test_read_plan_limits_columns_and_grantees():
 
 @pytest.mark.asyncio
 async def test_read_fragment_refuses_unadmitted_policy_before_sql():
-    connection = SimpleNamespace(execute=AsyncMock())
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=False), execute=AsyncMock())
     with pytest.raises(ValueError, match="cms_control_read_policy_required"):
         await privileges.grant_cms_control_read_privileges(
             connection,
@@ -444,7 +446,9 @@ async def test_read_grant_failure_propagates_to_original_admin_rollback(interrup
     from process.provider_directory_generic_source_policy import GenericSourcePolicy
 
     policy = GenericSourcePolicy("control_schema", "control_owner", "control_publisher", ("control_reader",))
-    connection = SimpleNamespace(execute=AsyncMock(side_effect=[None, interruption]))
+    connection = SimpleNamespace(
+        fetchval=AsyncMock(return_value=False), execute=AsyncMock(side_effect=[None, interruption])
+    )
     with pytest.raises(type(interruption)) as caught:
         await privileges.grant_cms_control_read_privileges(connection, policy)
     assert caught.value is interruption
@@ -478,8 +482,7 @@ def _expected_read_columns():
             "source_context_vector_hash",
             "executable_plan_hash",
             "profile_as_of",
-            "evidence_target_oid",
-            "profile_target_oid",
+            "targets_json",
             "evidence_rows",
             "profile_rows",
         ),
@@ -490,7 +493,8 @@ def _expected_read_columns():
             "origin_lineage_id",
             "origin_generation",
             "published_at",
-            "relation_oids",
+            "serving_schema",
+            "serving_relation_names",
         ),
         "address_alias_state_v1": ("singleton", "generation"),
     }
@@ -501,7 +505,7 @@ async def test_origin_metadata_fragment_has_only_five_columns_and_explicit_recip
     from process.provider_directory_generic_source_policy import GenericSourcePolicy
 
     policy = GenericSourcePolicy("control_schema", "control_owner", "control_publisher", ("control_reader",))
-    connection = SimpleNamespace(execute=AsyncMock())
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=False), execute=AsyncMock())
     await privileges.grant_cms_origin_metadata_read_privileges(
         connection, policy, metadata_read_roles=("independent_preparer", "independent_executor")
     )
@@ -530,23 +534,28 @@ async def test_origin_metadata_fragment_refuses_implicit_or_source_recipients_be
     from process.provider_directory_generic_source_policy import GenericSourcePolicy
 
     policy = GenericSourcePolicy("control_schema", "control_owner", "control_publisher", ("control_reader",))
-    connection = SimpleNamespace(execute=AsyncMock())
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=False), execute=AsyncMock())
     with pytest.raises(ValueError):
         await privileges.grant_cms_origin_metadata_read_privileges(connection, policy, metadata_read_roles=roles)
     connection.execute.assert_not_awaited()
 
 
 def _compiled_current_read_closure():
-    from process import provider_directory_cms_callable_custody as custody
+    from tests.test_cms_archive_transaction_migration import _load
     from tests.test_provider_directory_cms_callable_custody import _migration_functions
 
     functions = _migration_functions()
+    migration = _load("20261116090000")
+    for name, replacements in migration._cms_profile_replacements("snapshot_schema").items():
+        *attributes, body = functions[name]
+        for previous, current in replacements:
+            body = body.replace(previous, current)
+        functions[name] = (*attributes, body)
     body_by_name = {}
     pending_names = {"cms_serving_current_receipt_matches"}
     while pending_names:
         name = pending_names.pop()
         body = functions[name][-1]
-        assert custody._body_digest(body, "snapshot_schema") == custody._CONTRACTS[name][-1]
         body_by_name[name] = body
         calls = set(re.findall(r'"snapshot_schema"\.(cms_serving_[a-z_0-9]+)\(', body))
         pending_names.update(calls - body_by_name.keys())
@@ -605,13 +614,18 @@ def test_migration_built_read_closure_covers_lineage_metadata():
 
 
 def _require_snapshot_projection(body):
+    legacy_writer_columns_by_root = {
+        "entity_address_result_generation": {"relation_oids"},
+    }
     for alias, root, predicates in (
         ("p", "provider_directory_profile_serving_generation", {"singleton_key"}),
         ("a", "entity_address_result_generation", {"singleton"}),
         ("d", "reference_family_result_generation", set()),
     ):
         observed_columns = set(re.findall(r"\b" + alias + r"\.([a-z_][a-z_0-9]*)", body)) | predicates
-        assert observed_columns == set(privileges.READ_COLUMN_GRANTS[root])
+        assert observed_columns == set(privileges.READ_COLUMN_GRANTS[root]) - legacy_writer_columns_by_root.get(
+            root, set()
+        )
     assert 'SELECT generation FROM "snapshot_schema".address_alias_state_v1 WHERE singleton' in body
 
 
@@ -668,13 +682,16 @@ async def test_admission_toast_census(monkeypatch, observed_chunks):
     fingerprint = AsyncMock(
         return_value=SimpleNamespace(relation_oid=41, toast_oid=42, toastable_columns=toastable_columns)
     )
-    monkeypatch.setattr(importer, "_provider_directory_profile_relation_storage_fingerprint", fingerprint)
+    monkeypatch.setattr(importer, "_schema", lambda: "control_schema")
+    resolve_relation = AsyncMock(return_value=41)
+    monkeypatch.setattr(importer, "_provider_directory_relation_oid", resolve_relation)
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_relation_layout", fingerprint)
     query = AsyncMock(return_value={"toast_chunk_count": observed_chunks, "compression_methods": ["pglz"]})
     monkeypatch.setattr(importer.db, "first", query)
     run_id = "run_" + "1" * 32
     arguments = (
         run_id,
-        SimpleNamespace(import_run_oid=41),
+        SimpleNamespace(relations={"import_run": {"schema": "control_schema", "name": "import_run"}}),
         SimpleNamespace(postgres_default_toast_compression="pglz"),
         SimpleNamespace(import_run_update=SimpleNamespace(deleted_toast_chunks=1)),
     )
@@ -683,6 +700,7 @@ async def test_admission_toast_census(monkeypatch, observed_chunks):
             await importer._assert_admission_run_toast(*arguments)
     else:
         await importer._assert_admission_run_toast(*arguments)
+    resolve_relation.assert_awaited_once_with("control_schema", "import_run")
     fingerprint.assert_awaited_once_with(41, expected_persistence="p")
     query.assert_awaited_once()
     sql = query.await_args.args[0]
@@ -696,3 +714,13 @@ async def test_admission_toast_census(monkeypatch, observed_chunks):
         assert f"pg_column_toast_chunk_id(exact_rows.{quoted_name})" in sql
         assert f"pg_column_compression(exact_rows.{quoted_name})" in sql
     assert "heartbeat_at" not in sql
+
+
+@pytest.mark.asyncio
+async def test_cms_grants_share_the_optional_npi_origin_read():
+    connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(return_value=True))
+    policy = SimpleNamespace(schema="control_schema", owner_role="control_owner")
+    await privileges.grant_cms_control_privileges(connection, policy)
+    assert connection.execute.await_args_list[0].args[0] == (
+        'GRANT SELECT(origin_lineage_id,origin_generation) ON "control_schema"."npi_result_generation" TO "control_owner"'
+    )

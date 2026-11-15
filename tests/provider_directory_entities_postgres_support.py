@@ -51,17 +51,15 @@ async def _create_tables(session):
         "site_id uuid NOT NULL UNIQUE)",
         "CREATE TABLE reference_family_result_generation (importer_id text PRIMARY KEY, local_lineage_id uuid, "
         "local_generation bigint, origin_lineage_id uuid, origin_generation bigint, "
-        "published_at timestamptz, relation_oids bigint[])",
+        "published_at timestamptz, serving_schema text, serving_relation_names text[])",
     ]
     for statement in statements:
         await session.execute(text(statement))
     await session.execute(
         text("""
         INSERT INTO reference_family_result_generation VALUES
-        ('cms-doctors', :lineage, 1, :lineage, 1, now(),
-         ARRAY['doctor_clinician_address'::regclass::oid::bigint,
-               'cms_doctor_education'::regclass::oid::bigint,
-               'cms_doctor_group_site'::regclass::oid::bigint])
+        ('cms-doctors', :lineage, 1, :lineage, 1, now(), current_schema(),
+         ARRAY['doctor_clinician_address','cms_doctor_education','cms_doctor_group_site'])
     """),
         {"lineage": uuid4()},
     )

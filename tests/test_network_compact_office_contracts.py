@@ -34,9 +34,7 @@ def test_office_sources_require_exact_supported_component_types(office_inputs, f
 
 def test_physical_alias_must_remain_in_original_source_namespace(office_inputs):
     _target, base = office_inputs
-    sources = compact.CompactOfficeSources(
-        base, physical_base=CompactAddressRelation("other_source", "address_heap", 11)
-    )
+    sources = compact.CompactOfficeSources(base, physical_base=CompactAddressRelation("other_source", "address_heap"))
     with pytest.raises(compact.CompactOfficeSourceError, match="namespace differs"):
         compact.compact_office_relation_sql(sources)
     with pytest.raises(compact.CompactOfficeSourceError, match="Exact compact"):
@@ -57,17 +55,16 @@ async def test_compact_pin_requires_transaction_and_external_retained_schema(off
 
 
 @pytest.mark.asyncio
-async def test_compact_physical_oid_drift_refuses_before_column_access(monkeypatch, office_inputs):
+async def test_compact_retained_name_requires_complete_projection_columns(monkeypatch, office_inputs):
     target, base = office_inputs
-    connection = SimpleNamespace(
-        is_in_transaction=lambda: True, execute=AsyncMock(), fetchval=AsyncMock(return_value=12)
-    )
-    sources = compact.CompactOfficeSources(base, physical_base=CompactAddressRelation(base.schema_name, "old_heap", 11))
+    connection = SimpleNamespace(is_in_transaction=lambda: True, execute=AsyncMock(), fetch=AsyncMock(return_value=[]))
+    sources = compact.CompactOfficeSources(base, physical_base=CompactAddressRelation(base.schema_name, "old_heap"))
     monkeypatch.setattr(compact, "_projection_columns", AsyncMock())
-    with pytest.raises(compact.CompactOfficeSourceError, match="identity changed"):
+    with pytest.raises(compact.CompactOfficeSourceError, match="explicit row origin"):
         await compact.pin_compact_office_sources(connection, target, sources)
-    compact._projection_columns.assert_not_awaited()
-    assert "LOCK TABLE ONLY" in connection.execute.await_args.args[0]
+    compact._projection_columns.assert_awaited_once_with(connection, '"retained_example"."old_heap"')
+    connection.execute.assert_awaited_once_with('SELECT * FROM "retained_example"."old_heap" LIMIT 0')
+    assert connection.fetch.await_args.args[1] == '"retained_example"."old_heap"'
 
 
 @pytest.mark.asyncio

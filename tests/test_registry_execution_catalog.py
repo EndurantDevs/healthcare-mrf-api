@@ -15,6 +15,7 @@ from process import reference_family_archive as archive
 from process import registry_aca_source_recipe as aca_recipe
 from process import registry_execution_catalog as catalog
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.network_fhir_retained_capture_contract import TABLES
 from process.network_legacy_membership_source import PinnedACAMembershipSource
 from process.registry_ptg_office_membership_contract import PinnedPTGOfficeMembershipSource
 from process.registry_source_recipe_store import (
@@ -71,28 +72,16 @@ def test_private_catalog_requires_a_bounded_native_receipt_before_admission(monk
 def _bootstrap_surface():
     """Bind an encoded receipt to observations of its two protected native heaps."""
     specification = bootstrap.NetworkBootstrapSourceSpecification(
-        "10000000-0000-0000-0000-000000000001", "source_addresses", "source_npi", 30003, 30004
+        "10000000-0000-0000-0000-000000000001", "source_addresses", "source_npi"
     )
     parents = tuple(
-        bootstrap.BootstrapParentReceipt(schema, table, 30001, oid, 30002, 30005, "{}", "a" * 64, 0, "b" * 64)
+        bootstrap.BootstrapParentReceipt(schema, table, 0, "b" * 64)
         for schema, table, oid in (
             ("source_addresses", "entity_address_unified", 30003),
             ("source_npi", "npi", 30004),
         )
     )
-    receipt = bootstrap.NetworkBootstrapSourceReceipt(
-        specification,
-        "capture_owner",
-        ("capture_reader",),
-        parents,
-        "42:42:",
-        "2026-01-01T00:00:00Z",
-        20001,
-        20002,
-        (("entity_address_unified", 20003), ("npi", 20004)),
-        (),
-        "",
-    )
+    receipt = bootstrap.NetworkBootstrapSourceReceipt(specification, parents, "2026-01-01T00:00:00Z", "")
     receipt = replace(receipt, generation_sha256=bootstrap._generation(receipt))
     observed = _private_surface(
         bootstrap._schema_name(specification), [{"objoid": "20001", "description": json.dumps(receipt.as_dict())}]
@@ -109,19 +98,19 @@ def _bootstrap_surface():
             relforcerowsecurity=False,
             relispartition=False,
         )
-        for name, oid in receipt.relation_oids
+        for name, oid in (("entity_address_unified", 20003), ("npi", 20004))
     }
     return observed, relations_by_oid
 
 
-def test_private_bootstrap_certificate_preserves_exact_receipt_and_native_heap_identity():
+def test_private_bootstrap_preserves_named_receipt_and_data_scope():
     observed, relations_by_oid = _bootstrap_surface()
     before = deepcopy((observed, relations_by_oid))
     assert catalog._require_private_read_surfaces(observed, relations_by_oid) is None
     assert (observed, relations_by_oid) == before
 
 
-@pytest.mark.parametrize("mutation", ["missing_heap", "owner", "unlogged", "rls", "function", "trigger", "rule"])
+@pytest.mark.parametrize("mutation", ["missing_heap", "unlogged", "rls", "function", "trigger", "rule"])
 def test_private_bootstrap_cannot_gain_new_storage_or_callback_authority(mutation):
     observed, relations_by_oid = _bootstrap_surface()
     reason = "private_storage"
@@ -202,9 +191,7 @@ def _archive_recipe(canonical=False):
         "package_id": "e" * 64,
         "profile_contract": archive.reference_family_profile_contract(manifest),
         "stage_schema": ownership.schema_name,
-        "stage_schema_oid": ownership.schema_oid,
-        "relation_oids": [list(pair) for pair in relation_oids],
-        "sealed_owner_oid": 20002,
+        "relations": [{"schema_name": ownership.schema_name, "relation_name": name} for name, _oid in relation_oids],
         "manifest_sha256": hashlib.sha256(archive._canonical_json(manifest.as_dict())).hexdigest(),
         "tables": [table.as_dict() for table in manifest.tables],
     }
@@ -265,7 +252,6 @@ def test_private_archive_accepts_exact_typed_receipt_and_native_catalog(canonica
     "target,field,value",
     [
         ("namespace", "nspname", "reference_family_archive_" + "f" * 32),
-        ("namespace", "nspowner", "20999"),
         ("20010", "oid", "20999"),
         ("20010", "relname", "unrecorded_heap"),
         ("20100", "oid", "20999"),
@@ -341,3 +327,282 @@ def test_private_archive_refuses_valid_recipe_for_another_source_kind():
     observed["private_comments"][0]["description"] = aca_recipe._PREFIX + document
     with pytest.raises(catalog.RegistryExecutionCatalogError, match="archive_kind"):
         catalog._require_private_read_surfaces(observed, relations_by_oid)
+
+
+def _relation_columns():
+    """Describe every native column in the synthetic retained metadata catalog."""
+    return {
+        TABLES[0]: [("dataset_id", "character varying(96)", True), ("publication_metadata_json", "json", False)],
+        TABLES[1]: [
+            ("dataset_id", "character varying(96)", True),
+            ("resource_type", "character varying(64)", True),
+            ("resource_id", "character varying(256)", True),
+            ("payload_hash", "character varying(64)", True),
+            ("payload_json", "json", True),
+        ],
+        TABLES[2]: [
+            ("source_id", "character varying(64)", True),
+            ("resource_type", "character varying(16)", True),
+            ("resource_id", "character varying(256)", True),
+            ("organization_id", "uuid", False),
+            ("site_id", "uuid", False),
+            ("created_at", "timestamp with time zone", True),
+        ],
+        TABLES[3]: [
+            ("source_id", "character varying(64)", True),
+            ("resource_type", "character varying(16)", True),
+            ("resource_id", "character varying(256)", True),
+            ("release_id", "character varying(256)", True),
+            ("payload_sha256", "character varying(64)", True),
+            ("payload_json", "jsonb", True),
+            ("observed_at", "timestamp with time zone", True),
+        ],
+        TABLES[4]: [
+            ("source_id", "character varying(64)", True),
+            ("release_id", "character varying(256)", True),
+            ("network_resource_type", "character varying(16)", True),
+            ("network_resource_id", "character varying(256)", True),
+            ("insurance_plan_resource_id", "character varying(256)", True),
+            ("network_refs", "jsonb", True),
+            ("owned_by_ref", "text", False),
+            ("administered_by_ref", "text", False),
+            ("plan_payload_sha256", "character varying(64)", True),
+            ("plan_payload_json", "jsonb", True),
+            ("observed_at", "timestamp with time zone", True),
+        ],
+    }
+
+
+def _relations(capture):
+    keys_by_table = {
+        TABLES[0]: [("dataset_id",)],
+        TABLES[1]: [("dataset_id", "resource_type", "resource_id")] * 2,
+        TABLES[2]: [("source_id", "resource_type", "resource_id"), ("site_id",)],
+        TABLES[3]: [("source_id", "resource_type", "resource_id", "release_id"), ("source_id", "release_id")],
+        TABLES[4]: [
+            ("source_id", "release_id", "network_resource_id", "insurance_plan_resource_id"),
+            ("source_id", "release_id", "insurance_plan_resource_id"),
+        ],
+    }
+    columns_by_table = _relation_columns()
+    relation_rows = []
+    for table in sorted(TABLES):
+        indexes = [
+            {
+                "name": table + "_pkey" if ordinal == 0 else "retained_lookup_" + str(TABLES.index(table)) + "_0",
+                "columns": list(keys),
+                "collations": ["native", "C", "C"] if table == TABLES[1] and ordinal else ["native"] * len(keys),
+                "primary": ordinal == 0,
+                "unique": ordinal == 0,
+                "valid": True,
+                "ready": True,
+                "live": True,
+                "method": "btree",
+                "native": True,
+            }
+            for ordinal, keys in enumerate(keys_by_table[table])
+        ]
+        relation_rows.append(
+            dict(
+                schema_name=capture.schema_name,
+                relname=table,
+                relkind="r",
+                relpersistence="p",
+                relispartition=False,
+                relhastriggers=False,
+                relrowsecurity=False,
+                relforcerowsecurity=False,
+                inherited=False,
+                defaults=False,
+                columns=[
+                    dict(name=name, type=kind, required=required, native=True, generated="", identity="")
+                    for name, kind, required in columns_by_table[table]
+                ],
+                indexes=indexes,
+                constraints=[
+                    dict(
+                        type="p",
+                        columns=list(keys_by_table[table][0]),
+                        validated=True,
+                        deferrable=False,
+                        deferred=False,
+                    )
+                ],
+            )
+        )
+    return relation_rows
+
+
+def _legacy_document(capture):
+    """Keep saved physical fields only as discarded historical wire bytes."""
+    saved = capture.as_dict()
+    for name in ("tables", "contract"):
+        saved.pop(name)
+    saved.update(
+        schema_oid=101,
+        relation_oids=[[table, 200 + number] for number, table in enumerate(TABLES)],
+        owner_role="saved_owner",
+        runtime_roles=["saved_reader"],
+        catalog_sha256="9" * 64,
+    )
+    saved["capture_sha256"] = "8" * 64
+    return saved
+
+
+def _named_fhir_surface(*, legacy=False):
+    from process.network_fhir_retained_capture_contract import canonical, validate_capture
+    from tests.test_network_fhir_retained_capture import retained
+
+    capture = retained()
+    saved = _legacy_document(capture) if legacy else capture.as_dict()
+    capture = validate_capture(saved)
+    observed = _private_surface(
+        capture.schema_name,
+        [{"objoid": "20001", "description": "retained-normalized-fhir-v1:" + canonical(saved)}],
+    )
+    observed["retained_fhir_catalogs"] = {capture.schema_name: {"catalog": _relations(capture)}}
+    relations_by_oid = {
+        str(30000 + ordinal): dict(
+            oid=str(30000 + ordinal),
+            relname=name,
+            relnamespace="20001",
+            relowner="different_owner",
+            relkind="r",
+            relpersistence="p",
+            relrowsecurity=False,
+            relforcerowsecurity=False,
+            relispartition=False,
+        )
+        for ordinal, name in enumerate(capture.tables)
+    }
+    return observed, relations_by_oid
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_named_fhir_metadata_preserves_saved_edition_without_owner_or_physical_identity(legacy):
+    observed, relations = _named_fhir_surface(legacy=legacy)
+    before = deepcopy((observed, relations))
+    assert catalog._require_private_read_surfaces(observed, relations) is None
+    assert (observed, relations) == before
+
+
+def _mutate_named_catalog(relation_rows, damage):
+    if damage == "missing":
+        relation_rows.pop()
+        return
+    if damage == "duplicate":
+        relation_rows.append(deepcopy(relation_rows[-1]))
+        return
+    if damage == "order":
+        relation_rows.reverse()
+        return
+    if damage == "schema":
+        relation_rows[0]["schema_name"] = "other_schema"
+        return
+    if damage in {"type", "nullable", "column", "generated", "native"}:
+        key, column_value = {
+            "type": ("type", "integer"),
+            "nullable": ("required", False),
+            "column": ("name", "unrecorded"),
+            "generated": ("generated", "s"),
+            "native": ("native", False),
+        }[damage]
+        relation_rows[0]["columns"][0][key] = column_value
+        return
+    if damage == "extra_constraint":
+        relation_rows[0]["constraints"].append(
+            dict(type="f", columns=[], validated=True, deferrable=False, deferred=False)
+        )
+        return
+    if damage == "primary":
+        relation_rows[0]["constraints"][0]["columns"] = ["other"]
+        return
+    if damage == "lookup":
+        relation_rows[0]["indexes"].pop()
+        return
+    if damage == "cursor":
+        next(
+            relation_by_field
+            for relation_by_field in relation_rows
+            if relation_by_field["relname"] == "provider_directory_dataset_resource"
+        )["indexes"][1]["collations"] = ["native"] * 3
+        return
+    relation_rows[0]["indexes"][0]["valid" if damage == "invalid_index" else "native"] = False
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing",
+        "duplicate",
+        "order",
+        "schema",
+        "type",
+        "nullable",
+        "column",
+        "generated",
+        "native",
+        "extra_constraint",
+        "primary",
+        "lookup",
+        "cursor",
+        "invalid_index",
+        "index_native",
+    ],
+)
+def test_named_fhir_catalog_requires_complete_native_data_keys_and_lookup_shape(damage):
+    observed, relations = _named_fhir_surface()
+    relation_rows = next(iter(observed["retained_fhir_catalogs"].values()))["catalog"]
+    _mutate_named_catalog(relation_rows, damage)
+    with pytest.raises(catalog.RegistryExecutionCatalogError, match="fhir_"):
+        catalog._require_private_read_surfaces(observed, relations)
+
+
+@pytest.mark.parametrize("named", [False, True])
+def test_only_named_fhir_storage_leaves_owner_enforcement_to_postgres(named):
+    namespace = "registry_fhir_capture_" + "a" * 32 if named else "network_bootstrap_" + "a" * 32
+    observed_by_field = {
+        "private_namespaces": [{"oid": "20001", "nspname": namespace}],
+        "indexes": [{"indexrelid": "30002", "indrelid": "30001"}],
+    }
+    relations_by_oid = {
+        "30001": dict(relnamespace="20001", relowner="owner_one", reltoastrelid="30003"),
+        "30002": dict(relnamespace="20001", relowner="owner_two", reltoastrelid="0"),
+        "30003": dict(relnamespace="20002", relowner="owner_three", reltoastrelid="0"),
+    }
+    if named:
+        assert catalog._require_storage_owners(observed_by_field, relations_by_oid) is None
+        del relations_by_oid["30002"]
+        with pytest.raises(catalog.RegistryExecutionCatalogError, match="index_custody"):
+            catalog._require_storage_owners(observed_by_field, relations_by_oid)
+    else:
+        with pytest.raises(catalog.RegistryExecutionCatalogError, match="index_custody"):
+            catalog._require_storage_owners(observed_by_field, relations_by_oid)
+
+
+def test_retained_fhir_query_has_no_physical_fingerprint_or_permission_census():
+    sql = catalog._RETAINED_FHIR_RELATIONS_SQL + catalog._RETAINED_FHIR_CERTIFICATE_SQL
+    for forbidden in (
+        "filenode",
+        "owner_oid",
+        "relowner",
+        "pg_roles",
+        "pg_has_role",
+        "has_table_privilege",
+        "pg_get_indexdef",
+        "pg_get_constraintdef",
+    ):
+        assert forbidden not in sql
+    assert "jsonb_object_agg(schema_name" in catalog.REGISTRY_EXECUTION_CATALOG_SQL
+    assert catalog._RETAINED_FHIR_RELATIONS_SQL.count("n.nspname=$1") == 1
+
+
+def test_private_bootstrap_does_not_pin_owner_or_relation_ids():
+    observed, relations_by_oid = _bootstrap_surface()
+    observed["private_namespaces"][0]["nspowner"] = "29999"
+    for row in relations_by_oid.values():
+        row["relowner"] = "29998"
+    remapped_by_oid = {
+        str(int(key) + 100): {**row, "oid": str(int(key) + 100)} for key, row in relations_by_oid.items()
+    }
+    catalog._require_private_read_surfaces(observed, remapped_by_oid)

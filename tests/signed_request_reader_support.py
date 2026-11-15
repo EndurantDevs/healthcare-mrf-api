@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock
 from api import signed_request_reader as boundary
 from db.connection import Database
 from tests.test_api_reader_sessions import ReaderSession
-from tests.test_db_connection import _FakeResult
 
 
 def cold_caller():
@@ -20,17 +19,38 @@ def _transport_session(session):
     original_in_transaction = session.in_transaction
     state_by_field = {"scope": None, "active": False}
     session.info = {}
+    session.reader_setup = ReaderSession()
+    session.begin_nested = session.reader_setup.begin_nested
 
-    async def execute(statement, params=None):
-        if str(statement).startswith("SELECT session_user, current_user"):
+    original_connection = getattr(session, "connection", None)
+
+    async def start():
+        if not state_by_field["active"]:
             scope = session.begin()
             await scope.__aenter__()
             state_by_field.update(scope=scope, active=True)
             await original_execute(
                 getattr(session, "snapshot_sql", "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             )
-            return _FakeResult(("reader_test", "reader_test", 12345, 23456, "192.0.2.1", 5432, 34567))
-        return await original_execute(statement) if params is None else await original_execute(statement, params)
+
+    async def connection():
+        await start()
+        return await original_connection() if original_connection is not None else None
+
+    async def execute(statement, *arguments, **options):
+        if str(statement) in {"SELECT 1", "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"}:
+            # Start the configured Reader without taking a data snapshot.
+            await start()
+            return None
+        sql = str(statement)
+        if sql in {
+            "SET LOCAL lock_timeout = '250ms'",
+            "SET LOCAL statement_timeout = '5s'",
+            "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')",
+        } or (sql.startswith("LOCK TABLE ") and sql.endswith(" IN ACCESS SHARE MODE")):
+            await start()
+            return await session.reader_setup.execute(statement, *arguments, **options)
+        return await original_execute(statement, *arguments, **options)
 
     async def finish(failure=None):
         if state_by_field["active"]:
@@ -46,7 +66,7 @@ def _transport_session(session):
     async def close():
         await finish()
 
-    session.execute = execute
+    session.connection, session.execute = connection, execute
     session.in_transaction = lambda: state_by_field["active"] or original_in_transaction()
     session.commit, session.rollback, session.close = commit, rollback, close
     return session

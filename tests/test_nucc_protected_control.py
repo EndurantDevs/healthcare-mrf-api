@@ -17,16 +17,11 @@ def publication():
         "node_id": "test-node",
         "run_id": "test-run",
         "attempt_id": "test-run:" + "1" * 32,
-        "database_oid": 100,
-        "history_oid": 101,
-        "owner_oid": 102,
-        "parent_oid": 103,
-        "parent_index_oid": 104,
-        "child_oid": 105,
-        "child_schema": "reference_family_archive_" + "1" * 32,
-        "child_schema_oid": 106,
-        "child_filenode": 107,
-        "previous_child_oid": 108,
+        "history": ["mrf", "import_run"],
+        "parent": ["mrf", "nucc_taxonomy"],
+        "parent_index": ["mrf", "nucc_taxonomy_pkey"],
+        "child": ["reference_family_archive_" + "1" * 32, "nucc_taxonomy"],
+        "previous_child": ["reference_family_archive_" + "0" * 32, "nucc_taxonomy"],
         "generation_id": "22222222-2222-4222-8222-222222222222",
         "publication_fence": "33333333-3333-4333-8333-333333333333",
         "admission_sha256": "a" * 64,
@@ -36,9 +31,8 @@ def publication():
         "row_count": 42,
         "semantic_sha256": "e" * 64,
         "schema_sha256": "f" * 64,
-        "transaction_id": "1234",
-        "source_predecessor": source_generation(4, 108),
-        "source_authority": source_generation(5, 105),
+        "source_predecessor": source_generation(4, schema="reference_family_archive_" + "0" * 32),
+        "source_authority": source_generation(5, schema="reference_family_archive_" + "1" * 32),
         "published_at": "2026-10-17T05:00:00Z",
         "purpose": "source",
         "operation_id": None,
@@ -46,18 +40,16 @@ def publication():
     }
 
 
-def source_generation(counter, oid):
+def source_generation(counter, _legacy_address=None, *, schema="reference_family_archive_" + "a" * 32):
     lineage = "44444444-4444-4444-8444-444444444444"
     return {
         "importer_id": "nucc",
         "local_lineage_id": lineage,
         "local_generation": counter,
-        "serving_generation": {
-            "origin_lineage_id": lineage,
-            "origin_generation": counter,
-            "published_at": "2026-10-17T05:00:00Z",
-        },
-        "relation_oids": [oid],
+        "serving_generation": None
+        if counter == 0
+        else {"origin_lineage_id": lineage, "origin_generation": counter, "published_at": "2026-10-17T05:00:00Z"},
+        "relations": None if counter == 0 else [{"schema_name": schema, "relation_name": "nucc_taxonomy"}],
     }
 
 
@@ -114,20 +106,20 @@ def test_publication_is_closed_and_stable():
     ("field", "value"),
     [
         ("contract", "nucc-native-publication.v2"),
-        ("database_oid", True),
-        ("child_oid", "105"),
-        ("previous_child_oid", 105),
-        ("parent_index_oid", 103),
-        ("owner_oid", 0),
-        ("history_oid", 2**32),
+        ("history", ["other", "import_run"]),
+        ("child", "invalid"),
+        ("previous_child", ["reference_family_archive_" + "1" * 32, "nucc_taxonomy"]),
+        ("parent_index", ["mrf", "nucc_taxonomy"]),
+        ("parent", ["other", "nucc_taxonomy"]),
+        ("history", ["mrf", "other"]),
         ("row_count", False),
         ("row_count", 10001),
-        ("transaction_id", "01234"),
-        ("transaction_id", str(2**64)),
-        ("transaction_id", 1234),
+        ("parent_index", ["other", "index"]),
+        ("child", ["reference_family_archive_" + "1" * 32, "other"]),
+        ("previous_child", ["mrf", "nucc_taxonomy"]),
         ("attempt_id", "other-run:" + "1" * 32),
         ("node_id", " test-node"),
-        ("child_schema", "mrf"),
+        ("child", ["mrf", "nucc_taxonomy"]),
         ("semantic_sha256", "A" * 64),
         ("generation_id", "{22222222-2222-4222-8222-222222222222}"),
     ],
@@ -189,7 +181,7 @@ def test_publication_rejects_wrong_generation(field, change):
     elif change == "counter":
         generation["local_generation"] += 2
     elif change == "child":
-        generation["relation_oids"] = [999]
+        generation["relations"] = [{"schema_name": "other", "relation_name": "nucc_taxonomy"}]
     else:
         generation["importer_id"] = "geo"
     with pytest.raises(control.NuccProtectedControlError):
@@ -269,49 +261,6 @@ def test_event_rejects_partial_predecessor():
         control.validate_event_ack(captured)
 
 
-def custody():
-    return {
-        "oid": 100,
-        "owner_oid": 101,
-        "schema_owner_oid": 101,
-        "acl": [
-            [101, 101, privilege, False]
-            for privilege in (
-                "SELECT",
-                "INSERT",
-                "UPDATE",
-                "DELETE",
-                "TRUNCATE",
-                "REFERENCES",
-                "TRIGGER",
-                "MAINTAIN",
-            )
-        ],
-        "column_acl": [[name, 102, 101, "SELECT", False] for name in control.SOURCE_ACK_COLUMNS],
-    }
-
-
-def test_custody_requires_exact_column_grants():
-    control.validate_event_custody(custody(), owner_oid=101, builder_oid=102)
-
-
-@pytest.mark.parametrize(("column", "replacement"), [(3, "UPDATE"), (4, True), (2, 102), (1, 103)])
-def test_custody_rejects_column_authority(column, replacement):
-    captured = custody()
-    captured["column_acl"][0][column] = replacement
-    with pytest.raises(control.NuccProtectedControlError):
-        control.validate_event_custody(captured, owner_oid=101, builder_oid=102)
-
-
-@pytest.mark.parametrize("surface", ["acl", "column_acl"])
-def test_custody_rejects_added_grants(surface):
-    captured = custody()
-    extra_entries = [102, 101, "SELECT", False]
-    captured[surface].append(extra_entries if surface == "acl" else ["created_at", *extra_entries])
-    with pytest.raises(control.NuccProtectedControlError):
-        control.validate_event_custody(captured, owner_oid=101, builder_oid=102)
-
-
 def test_source_run_binds_real_parameters():
     candidate = handoff()
     params_by_name = {"test_mode": False, "source": "synthetic"}
@@ -340,155 +289,105 @@ async def test_publisher_authority_rejects_serialized_actor():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "xid,expected_xid",
-    [
-        ("0", 0),
-        ("1", 1),
-        (str(2**32 - 1), 2**32 - 1),
-        (str(2**32), 0),
-        (str(2**32 + 1), 1),
-        (str(2**32 + 321), 321),
-        (str(2**64 - 1), 2**32 - 1),
-    ],
+    "source_active,publisher_active,changed",
+    [(True, True, False), (False, True, False), (True, False, False), (True, True, True)],
 )
-async def test_native_fence_binds_exact_backend_transaction_without_parent_ax(xid, expected_xid):
-    queries = []
-
-    class Connection:
-        is_held = True
-
-        async def scalar(self, statement, parameters):
-            assert type(parameters["xid"]) is int
-            queries.append((str(statement), parameters))
-            return self.is_held
-
-    source_actor_by_field = {"database_oid": 100, "owner_oid": 102, "pid": 201}
-    publisher_actor_by_field = {
-        "database_oid": 100,
-        "owner_oid": 102,
-        "pid": 202,
-        "xid": xid,
-        "virtualtransaction": "4/99",
-    }
-    await control._require_publisher_fence(
-        Connection(),
-        source_actor_by_field,
-        publisher_actor_by_field,
-        103,
-        run_id="test-run",
+async def test_pre_cutover_requires_live_owning_transactions_without_database_identity(
+    source_active, publisher_active, changed
+):
+    source_transaction = object()
+    publisher_transaction = SimpleNamespace(is_active=publisher_active)
+    session = SimpleNamespace(
+        in_transaction=lambda: source_active,
+        get_transaction=lambda: object() if changed else source_transaction,
+        execute=AsyncMock(),
+        scalar=AsyncMock(),
     )
-    sql, parameters = queries[0]
-    assert parameters == {
-        "pid": 202,
-        "virtualtransaction": "4/99",
-        "xid": expected_xid,
-        "database": 100,
-        "parent": 103,
-        "name": "control-run-worker-action:v1:test-run",
-    }
-    assert "transaction_lock.transactionid=CAST(:xid AS xid)" in sql
-    assert "action_lock.virtualtransaction=:virtualtransaction" in sql
-    assert "AND NOT EXISTS(SELECT FROM pg_locks parent_lock" in sql
-    assert "parent_lock.mode='AccessExclusiveLock'" in sql
+    arguments = (
+        session,
+        {"transaction": source_transaction},
+        {"transaction": publisher_transaction},
+        ("mrf", "nucc_taxonomy"),
+    )
+    if source_active and publisher_active and not changed:
+        await control._require_publisher_fence(*arguments, run_id="test-run")
+    else:
+        with pytest.raises(control.NuccProtectedControlError, match="pre-cutover transaction"):
+            await control._require_publisher_fence(*arguments, run_id="test-run")
+    session.execute.assert_not_awaited()
+    session.scalar.assert_not_awaited()
 
 
 def _eligibility_connection(events, expected):
-    from process import nucc_snapshot_partition as partition
+    from tests.test_nucc_snapshot_partition import parent_catalog
 
     class Connection:
         async def scalar(self, statement):
-            sql = str(statement)
-            if sql == partition.CATALOG_SQL:
-                events.append("catalog")
-                return {"parent_oid": 103, "child_oid": 108}
-            return 103 if "nucc_taxonomy" in sql else 101
+            events.append("catalog")
+            return parent_catalog()
 
-    class Generation:
-        relation_oids = (108,)
-
-        def as_dict(self):
-            return expected
-
-    return Connection(), Generation()
+    return Connection(), control._source_generation(expected, predecessor=True)
 
 
 @pytest.mark.asyncio
-async def test_source_catalog_runs_before_publisher_parent_ax(monkeypatch):
-    from process import nucc_snapshot_partition as partition
+async def test_source_generation_row_is_locked_after_named_catalog_and_before_publication(monkeypatch):
     from process import reference_family_result_generation as generations
 
     events = []
+    expected = source_generation(4)
+    connection, current = _eligibility_connection(events, expected)
     source_actor_by_field = {"node_id": "test-node"}
-    publisher_actor_by_field = {"pid": 202}
-    expected = source_generation(4, 108)
+    publisher_actor_by_field = {"role": "publisher"}
+    publisher_session = object()
+    monkeypatch.setattr(control, "_source_transaction", AsyncMock(return_value=source_actor_by_field))
+    monkeypatch.setattr(control, "_publisher_transaction", AsyncMock(return_value=publisher_actor_by_field))
 
-    connection, generation_row = _eligibility_connection(events, expected)
+    async def fence(_session, source, publisher, parent):
+        assert (source, publisher, parent) == (
+            source_actor_by_field,
+            publisher_actor_by_field,
+            ("mrf", "nucc_taxonomy"),
+        )
+        events.append("before-cutover")
 
-    async def actor(_session):
-        return source_actor_by_field
-
-    async def publisher_actor(_session):
-        return publisher_actor_by_field
-
-    async def fence(_session, source_actor, publisher_actor, parent_oid):
-        assert source_actor is source_actor_by_field and publisher_actor is publisher_actor_by_field
-        assert parent_oid == 103
-        events.append("pre-ax-fence")
-
-    async def controls(*_arguments):
+    async def controls(*_args):
         events.append("controls")
 
     async def generation(_session, **options):
         assert options == {"importer_id": "nucc", "schema_name": "mrf", "lock": True}
         events.append("generation-row-lock")
-        return generation_row
+        return current
 
-    async def prior(*_arguments):
+    async def prior(*_args, **kwargs):
+        assert kwargs == {"publisher_session": publisher_session}
         events.append("prior-ack")
 
-    async def unchanged(*_arguments):
-        return None
-
-    monkeypatch.setattr(control, "_source_transaction", actor)
-    monkeypatch.setattr(control, "_publisher_transaction", publisher_actor)
     monkeypatch.setattr(control, "_require_publisher_fence", fence)
     monkeypatch.setattr(control, "_require_source_controls", controls)
     monkeypatch.setattr(control, "_require_prior_owner_ack", prior)
-    monkeypatch.setattr(control, "_recheck_source_transaction", unchanged)
-    monkeypatch.setattr(control, "_recheck_publisher_transaction", unchanged)
-    monkeypatch.setattr(partition, "validate_parent_catalog", lambda catalog: catalog)
+    monkeypatch.setattr(control, "_recheck_source_transaction", AsyncMock())
+    monkeypatch.setattr(control, "_recheck_publisher_transaction", AsyncMock())
     monkeypatch.setattr(generations, "read_reference_family_result_generation_authority", generation)
     assert (
         await control.lock_generation_eligibility(
             connection,
             expected,
-            expected_child_oid=108,
-            publisher_session=object(),
+            expected_child=("reference_family_archive_" + "a" * 32, "nucc_taxonomy"),
+            publisher_session=publisher_session,
         )
         == expected
     )
-    assert events == ["pre-ax-fence", "catalog", "pre-ax-fence", "controls", "generation-row-lock", "prior-ack"]
+    assert events == ["before-cutover", "catalog", "controls", "generation-row-lock", "prior-ack"]
 
 
 @pytest.mark.asyncio
-async def test_parent_ax_refusal_precedes_catalog_deparser():
-    class Connection:
-        is_held = False
-
-        async def scalar(self, statement, parameters):
-            assert "pg_get_partkeydef" not in str(statement)
-            return self.is_held
-
-    source_actor_by_field = {"database_oid": 100, "owner_oid": 102, "pid": 201}
-    publisher_actor_by_field = {
-        "database_oid": 100,
-        "owner_oid": 102,
-        "pid": 202,
-        "xid": "321",
-        "virtualtransaction": "4/99",
-    }
-    with pytest.raises(control.NuccProtectedControlError, match="pre-cutover fence"):
-        await control._require_publisher_fence(Connection(), source_actor_by_field, publisher_actor_by_field, 103)
+async def test_publisher_transaction_refusal_precedes_catalog_deparser():
+    session = SimpleNamespace(in_transaction=lambda: True, get_transaction=lambda: None, scalar=AsyncMock())
+    with pytest.raises(control.NuccProtectedControlError, match="pre-cutover transaction"):
+        await control._require_publisher_fence(
+            session, {"transaction": None}, {"transaction": SimpleNamespace(is_active=False)}, ("mrf", "nucc_taxonomy")
+        )
+    session.scalar.assert_not_awaited()
 
 
 def _reconciliation_run():
@@ -733,85 +632,116 @@ async def test_generation_ack_projects_signed_origin_time_not_receive_clock(monk
 
 @pytest.fixture
 def initial_baseline_case(monkeypatch):
-    import json
-
-    from process import nucc_snapshot_partition as partition
     from tests.test_nucc_protected_bootstrap import baseline
     from tests.test_nucc_snapshot_partition import parent_catalog
 
-    marker, _physical, source_authority = baseline()
-    source_authority.update(local_generation=0, serving_generation=None, relation_oids=None)
-    captured = parent_catalog()
-    marker.update(
-        source_authority=source_authority,
-        source_revision_tracked=False,
-        protected_native_sha256=partition.catalog_digest(captured),
-    )
+    catalog = parent_catalog()
+    marker, names, _authority = baseline()
+    authority = source_generation(0)
+    marker["source_authority"] = authority
+    marker["source_revision_tracked"] = False
     marker["baseline_sha256"] = control.receipt_digest(
-        {key: field_value for key, field_value in marker.items() if key != "baseline_sha256"}
+        {k: field_value for k, field_value in marker.items() if k != "baseline_sha256"}
     )
-    captured["parent"]["baseline"] = {"database_oid": 100, "comment": json.dumps(marker)}
-    evidence_by_field = dict(catalog=captured, marker=marker, no_events=True, tracked=False)
-    actor_by_field = {"database_oid": 100}
-
-    async def actor(_session):
-        return actor_by_field
+    evidence_by_field = {"marker": marker, "no_events": True, "tracked": False, "content": (4, "c" * 64)}
+    actor_by_field = {"node_id": "test-node"}
 
     class Session:
         async def scalar(self, statement, parameters=None):
             sql = str(statement)
-            if "SELECT NOT EXISTS" in sql:
+            if "NOT EXISTS(SELECT FROM hp_snapshot_retention.publication" in sql:
                 return evidence_by_field["no_events"]
             if sql.startswith("SELECT obj_description"):
-                assert parameters == {"oid": 201}
-                return json.dumps(evidence_by_field["marker"])
-            if "SELECT source_revision_tracked" in sql:
+                assert parameters == {"parent": '"mrf"."nucc_taxonomy"'}
+                return evidence_by_field["marker"]
+            if "source_revision_tracked" in sql:
                 return evidence_by_field["tracked"]
-            return evidence_by_field["catalog"]
+            raise AssertionError(sql)
 
-    monkeypatch.setattr(control, "_source_transaction", actor)
-    return Session(), actor_by_field, source_authority, captured, evidence_by_field
+    from process import reference_family_archive as native
+
+    publisher_session = object()
+
+    async def content(selected, schema, relation, **kwargs):
+        assert selected is publisher_session
+        assert (schema, relation) == names["child"]
+        assert kwargs == {"row_json_sql": "to_jsonb(row_value)"}
+        return evidence_by_field["content"]
+
+    monkeypatch.setattr(native, "_projected_row_identity", content)
+    monkeypatch.setattr(control, "_recheck_source_transaction", AsyncMock())
+    return Session(), actor_by_field, authority, catalog, evidence_by_field, publisher_session
 
 
 @pytest.mark.asyncio
-async def test_initial_baseline_allows_real_untracked_zero_without_inventing_origin(initial_baseline_case):
-    session, actor, source_authority, captured, _evidence = initial_baseline_case
-    await control._require_initial_baseline(session, actor, source_authority, captured)
-    assert source_authority["local_generation"] == 0
-    assert source_authority["serving_generation"] is source_authority["relation_oids"] is None
+async def test_initial_baseline_preserves_untracked_zero_and_compares_complete_content(initial_baseline_case):
+    session, actor, authority, catalog, _evidence, publisher_session = initial_baseline_case
+    await control._require_initial_baseline(session, actor, authority, catalog, publisher_session=publisher_session)
+    assert authority["local_generation"] == 0 and authority["serving_generation"] is authority["relations"] is None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["event", "source", "native_hash", "database", "tracking"])
-async def test_initial_baseline_refuses_other_or_consumed_authority(initial_baseline_case, change):
-    session, actor, source_authority, captured, evidence_by_field = initial_baseline_case
+@pytest.mark.parametrize("change", ("event", "source", "content", "scope", "tracking"))
+async def test_initial_baseline_refuses_consumed_changed_source_content_scope_or_tracking(
+    initial_baseline_case, change
+):
+    session, actor, authority_by_field, catalog, evidence, publisher_session = initial_baseline_case
     if change == "event":
-        evidence_by_field["no_events"] = False
+        evidence["no_events"] = False
     elif change == "source":
-        changed_authority_by_field = dict(source_authority)
-        changed_authority_by_field["local_generation"] = 1
-        source_authority = changed_authority_by_field
+        authority_by_field = {**authority_by_field, "local_generation": 1}
+    elif change == "content":
+        evidence["content"] = (4, "d" * 64)
+    elif change == "scope":
+        evidence["marker"]["child"] = ["reference_family_archive_" + "b" * 32, "nucc_taxonomy"]
     else:
-        marker = evidence_by_field["marker"]
-        if change == "native_hash":
-            marker["protected_native_sha256"] = "a" * 64
-        elif change == "database":
-            marker["database_oid"] += 1
-        else:
-            evidence_by_field["tracked"] = True
-        marker["baseline_sha256"] = control.receipt_digest(
-            {key: field_value for key, field_value in marker.items() if key != "baseline_sha256"}
-        )
+        evidence["tracked"] = True
+    evidence["marker"]["baseline_sha256"] = control.receipt_digest(
+        {k: field_value for k, field_value in evidence["marker"].items() if k != "baseline_sha256"}
+    )
     with pytest.raises((control.NuccProtectedControlError, RuntimeError)):
-        await control._require_initial_baseline(session, actor, source_authority, captured)
+        await control._require_initial_baseline(
+            session, actor, authority_by_field, catalog, publisher_session=publisher_session
+        )
 
 
 @pytest.mark.asyncio
-async def test_initial_baseline_excludes_only_actual_native_comment_from_its_digest(initial_baseline_case):
-    session, actor, source_authority, captured, evidence_by_field = initial_baseline_case
-    assert captured["parent"]["baseline"]["database_oid"] == 100
-    assert isinstance(captured["parent"]["baseline"]["comment"], str)
-    await control._require_initial_baseline(session, actor, source_authority, captured)
-    captured["parent"]["acl"].append([104, 101, "SELECT", False])
-    with pytest.raises(control.NuccProtectedControlError, match="initial Owner baseline differs"):
-        await control._require_initial_baseline(session, actor, source_authority, captured)
+@pytest.mark.parametrize("denied", (False, True))
+async def test_event_access_uses_only_declared_columns_and_propagates_native_permission_denial(denied):
+    session = SimpleNamespace(
+        in_transaction=lambda: True, execute=AsyncMock(side_effect=PermissionError("SELECT denied") if denied else None)
+    )
+    if denied:
+        with pytest.raises(PermissionError, match="SELECT denied"):
+            await control._lock_event_custody(session, {})
+    else:
+        await control._lock_event_custody(session, {})
+    sql = str(session.execute.await_args.args[0])
+    assert (
+        sql == "SELECT " + ",".join(control.SOURCE_ACK_COLUMNS) + " FROM hp_snapshot_retention.publication WHERE false"
+    )
+    assert "aclexplode" not in sql and "oid" not in sql
+
+
+@pytest.mark.asyncio
+async def test_initial_ack_forwards_publisher_only_for_baseline_content(monkeypatch):
+    result = SimpleNamespace(mappings=lambda: SimpleNamespace(one_or_none=lambda: None))
+    source_session = SimpleNamespace(execute=AsyncMock(return_value=result))
+    publisher_session = object()
+    actor_by_field, authority_by_field, parent_catalog = {}, source_generation(0), {}
+    event_lock, baseline = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(control, "_lock_event_custody", event_lock)
+    monkeypatch.setattr(control, "_require_initial_baseline", baseline)
+    await control._require_prior_owner_ack(
+        source_session,
+        actor_by_field,
+        authority_by_field,
+        "test-node",
+        parent_catalog,
+        publisher_session=publisher_session,
+    )
+    event_lock.assert_awaited_once_with(source_session, actor_by_field)
+    assert source_session.execute.await_args.args[1] == {"node": "test-node"}
+    baseline.assert_awaited_once_with(
+        source_session, actor_by_field, authority_by_field, parent_catalog, publisher_session=publisher_session
+    )

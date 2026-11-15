@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -73,6 +73,7 @@ async def source_case(monkeypatch):
     admission = _admission()
     admission._started = True
     admission.register_external_relation = AsyncMock()
+    admission._record_external_identity = Mock()
     admission.assert_ready = AsyncMock()
     monkeypatch.setattr(source, "source_transaction", factory.transaction)
     monkeypatch.setattr(
@@ -109,7 +110,7 @@ async def test_first_ddl_uses_source_original_session_and_closes_before_commit(s
     assert observed_sessions == [case.factory.events[0][3]]
     assert [event[0] for event in case.factory.events] == ["begin", "commit"]
     preparation._close_grants.assert_awaited_once_with(case.factory.connection, case.factory.policy, "stage_a")
-    assert case.scope.owned_oids == {"stage_a": 41}
+    assert case.scope.owned_relations == {"stage_a"}
     case.admission.register_external_relation.assert_awaited_once()
     assert case.factory.binding.get() is None
 
@@ -119,7 +120,7 @@ async def test_failed_first_ddl_keeps_exact_cleanup_identity_without_registering
     case.factory.fail_commit = True
     with pytest.raises(RuntimeError, match="commit failure"):
         await admitted._create_owned_relation("test_schema", "stage_a", AsyncMock())
-    assert case.scope.cleanup_oids == (("stage_a", "stage_a", 41),)
+    assert case.scope.cleanup_relations == (("stage_a", "stage_a"),)
     assert [event[0] for event in case.factory.events] == ["begin", "rollback"]
     case.admission.register_external_relation.assert_not_awaited()
     assert not case.scope.worker_tasks and case.factory.binding.get() is None
@@ -155,36 +156,34 @@ async def test_source_issuer_requires_active_exact_signed_admission_before_io(so
         cms._ACTIVE.reset(token)
 
 
-async def test_constructed_or_different_factory_scope_cannot_open_source_io(source_case):
+async def test_source_context_uses_logical_phase_and_input_instead_of_object_brand(source_case):
     case = source_case
-    forged = preparation._SourcePreparation(
-        case.factory, case.admission, case.scope.native_input_hash, asyncio.current_task()
-    )
+    context = preparation._SourcePreparation(case.factory, case.admission, case.scope.native_input_hash)
+    assert preparation._issued(context, phases={"building"}) is context
+    context.input_hash = "f" * 64
     with pytest.raises(RuntimeError, match="source_preparation_invalid"):
-        preparation._issued(forged, phases={"building"})
-    token = source._FACTORY.set(_Factory())
-    try:
-        with pytest.raises(RuntimeError, match="source_preparation_invalid"):
-            async with preparation.preparation_transaction(case.database, case.scope):
-                pytest.fail("different factory was admitted")
-        assert not case.factory.events
-    finally:
-        source._FACTORY.reset(token)
+        preparation._issued(context, phases={"building"})
+    context.input_hash, context.phase = case.scope.native_input_hash, "failed"
+    with pytest.raises(RuntimeError, match="source_preparation_invalid"):
+        preparation._issued(context, phases={"building"})
+    assert not case.factory.events
 
 
 def _prepared(case):
     case.scope.source_preparation = preparation.issue_source_preparation(case.admission, case.scope.native_input_hash)
-    stages = tuple(("logical_" + str(index), "stage_" + str(index), index + 41) for index in range(7))
-    case.scope.stage_oids = stages
-    case.scope.owned_oids = {name: oid for _, name, oid in stages}
-    case.scope.source_preparation.original_relations = {(name, oid) for _, name, oid in stages}
+    stages = tuple(("logical_" + str(index), "stage_" + str(index)) for index in range(7))
+    case.scope.stage_relations = stages
+    case.scope.owned_relations = {name for _, name in stages}
+    case.scope.source_preparation.original_relations = {name for _, name in stages}
     return candidate.PreparedEntityAddressGeneration("test_schema", [], [], [], [], stages, {}, {"rows": 1}, None, None)
 
 
 async def test_complete_handoff_is_issued_only_after_original_commit(source_case, monkeypatch):
     case, observed = source_case, []
     prepared = _prepared(case)
-    capture = SimpleNamespace(relation_oids=tuple((logical, oid) for logical, _, oid in prepared.stage_oids))
+    capture = SimpleNamespace(
+        relations=tuple((logical, prepared.db_schema, name) for logical, name in prepared.stage_relations)
+    )
 
     async def close(database, actual, scope, issued):
         assert database is case.database and actual is prepared and scope is case.scope
@@ -233,7 +232,7 @@ async def test_closed_candidate_cannot_reenter_write_or_budget_io(source_case, m
 async def test_incomplete_family_refuses_before_reader_grants(source_case):
     case = source_case
     prepared = _prepared(case)
-    prepared.stage_oids = prepared.stage_oids[:-1]
+    prepared.stage_relations = prepared.stage_relations[:-1]
     with pytest.raises(ValueError, match="prepared_address_invalid"):
         await preparation.freeze_source_generation(case.database, prepared, case.scope)
     case.factory.connection.execute.assert_not_awaited()
@@ -251,12 +250,17 @@ async def test_source_parameter_refusal_never_executes_payload(source_case, monk
     assert case.factory.events[-1][0] == "rollback" and not case.scope.worker_tasks
 
 
-async def test_other_task_cannot_finalize_the_issued_preparation(source_case):
+async def test_closed_native_handoff_can_finalize_on_an_independent_task(source_case, monkeypatch):
     case = source_case
     prepared = _prepared(case)
-    with pytest.raises(RuntimeError, match="source_preparation_invalid"):
-        await asyncio.create_task(preparation.freeze_source_generation(case.database, prepared, case.scope))
-    assert not case.factory.events and case.scope.source_preparation.phase == "building"
+    capture = SimpleNamespace(
+        relations=tuple((logical, prepared.db_schema, name) for logical, name in prepared.stage_relations)
+    )
+    monkeypatch.setattr(preparation, "_freeze_native", AsyncMock(return_value=("test_reader", capture)))
+    await asyncio.create_task(preparation.freeze_source_generation(case.database, prepared, case.scope))
+    assert case.scope.source_preparation.phase == "prepared"
+    assert preparation.require_source_generation(prepared, case.admission) is capture
+    assert case.factory.binding.get() is None
 
 
 async def test_cleanup_of_original_candidates_does_not_request_a_new_spend_lease(source_case, monkeypatch):
@@ -265,9 +269,9 @@ async def test_cleanup_of_original_candidates_does_not_request_a_new_spend_lease
     with pytest.raises(RuntimeError, match="expired lease"):
         async with preparation.preparation_transaction(case.database, case.scope):
             pytest.fail("expired admission authorized preparation")
-    case.scope.source_preparation.original_relations.add(("stage_a", 41))
+    case.scope.source_preparation.original_relations.add("stage_a")
     async with preparation.cleanup_transaction(
-        case.database, case.scope.source_preparation, relation=("test_schema", "stage_a", 41)
+        case.database, case.scope.source_preparation, relation=("test_schema", "stage_a")
     ):
         assert case.factory.binding.get() is not None
     assert case.factory.events[-1][0] == "commit" and case.factory.binding.get() is None
@@ -276,10 +280,12 @@ async def test_cleanup_of_original_candidates_does_not_request_a_new_spend_lease
 async def test_expired_lease_cleanup_entrypoint_drains_exact_issued_family(source_case, monkeypatch):
     case = source_case
     prepared = _prepared(case)
-    capture = SimpleNamespace(relation_oids=tuple((logical, oid) for logical, _, oid in prepared.stage_oids))
+    capture = SimpleNamespace(
+        relations=tuple((logical, prepared.db_schema, name) for logical, name in prepared.stage_relations)
+    )
     monkeypatch.setattr(preparation, "_freeze_native", AsyncMock(return_value=("test_reader", capture)))
     await preparation.freeze_source_generation(case.database, prepared, case.scope)
-    owned_by_name = {f"test_schema.{name}": oid for _, name, oid in prepared.stage_oids}
+    owned_by_name = {f"test_schema.{name}": True for _, name in prepared.stage_relations}
 
     async def actual_oid(_statement, *, relation):
         return owned_by_name[relation]
@@ -293,18 +299,17 @@ async def test_expired_lease_cleanup_entrypoint_drains_exact_issued_family(sourc
     dropped_statements = [
         call.args[0] for call in case.database.status.await_args_list if call.args[0].startswith("DROP")
     ]
-    assert dropped_statements == [f"DROP TABLE test_schema.{name} RESTRICT" for _, name, _ in prepared.stage_oids]
+    assert dropped_statements == [f"DROP TABLE test_schema.{name} RESTRICT" for _, name in prepared.stage_relations]
     assert case.database._transaction_binding() is None
 
 
-@pytest.mark.parametrize("failure", ["schema", "name", "oid"])
+@pytest.mark.parametrize("failure", ["schema", "name"])
 async def test_cleanup_refuses_unissued_source_identity_before_factory_io(source_case, failure):
     case = source_case
-    case.scope.source_preparation.original_relations.add(("stage_a", 41))
+    case.scope.source_preparation.original_relations.add("stage_a")
     relation = (
         "other_schema" if failure == "schema" else "test_schema",
         "other_stage" if failure == "name" else "stage_a",
-        99 if failure == "oid" else 41,
     )
     with pytest.raises(RuntimeError, match="source_preparation_invalid"):
         async with preparation.cleanup_transaction(case.database, case.scope.source_preparation, relation=relation):
@@ -312,23 +317,22 @@ async def test_cleanup_refuses_unissued_source_identity_before_factory_io(source
     assert case.factory.events == []
 
 
-async def test_late_name_replacement_is_preserved_by_exact_source_cleanup(source_case, monkeypatch):
+async def test_native_cleanup_denial_preserves_declared_relation(source_case, monkeypatch):
     case = source_case
-    case.scope.source_preparation.original_relations.add(("stage_a", 41))
-    case.database.scalar.return_value = 99
-    lock = AsyncMock()
+    case.scope.source_preparation.original_relations.add("stage_a")
+    lock = AsyncMock(side_effect=PermissionError("native lock denied"))
     monkeypatch.setattr(admitted._native(), "_acquire_cutover_locks", lock)
-    await candidate._drop_owned_stage("test_schema", "stage_a", 41, source_input=case.scope.source_preparation)
-    lock.assert_not_awaited()
+    with pytest.raises(PermissionError, match="native lock denied"):
+        await candidate._drop_owned_stage("test_schema", "stage_a", source_input=case.scope.source_preparation)
     assert not any(call.args[0].startswith("DROP") for call in case.database.status.await_args_list)
-    assert case.factory.binding.get() is None
+    assert case.factory.events[-1][0] == "rollback" and case.factory.binding.get() is None
 
 
 def _source_cleanup_case(case, monkeypatch):
     """Keep the real cleanup dispatch and model only PostgreSQL result rows."""
     relations_by_name = {"stage_a": 41, "stage_b": 42}
-    case.scope.owned_oids.update(relations_by_name)
-    case.scope.source_preparation.original_relations.update(relations_by_name.items())
+    case.scope.owned_relations.update(relations_by_name)
+    case.scope.source_preparation.original_relations.update(relations_by_name)
 
     async def scalar(statement, **parameters):
         assert case.database._transaction_binding() is not None
@@ -365,15 +369,15 @@ async def test_source_cleanup_clears_only_build_contexts_and_keeps_original_proo
     token = candidate._NATIVE_DEPENDENCIES.set(dependencies)
     try:
         assert candidate.has_prepared_doctors()
-        await candidate._drain_owned_stages("test_schema", case.scope.cleanup_oids, source_input=issued)
+        await candidate._drain_owned_stages("test_schema", case.scope.cleanup_relations, source_input=issued)
         assert not relations_by_name and issued.phase == phase
         assert admitted._ADMISSION.get() is case.scope
         assert candidate._NATIVE_DEPENDENCIES.get() is dependencies
         dependencies.archive.lock_read_backend.assert_not_awaited()
         statements = [call.args[0] for call in case.database.status.await_args_list]
         assert [sql for sql in statements if sql.startswith("LOCK TABLE")] == [
-            "LOCK TABLE test_schema.stage_a IN ACCESS EXCLUSIVE MODE NOWAIT;",
-            "LOCK TABLE test_schema.stage_b IN ACCESS EXCLUSIVE MODE NOWAIT;",
+            "LOCK TABLE test_schema.stage_a IN ACCESS SHARE MODE NOWAIT;",
+            "LOCK TABLE test_schema.stage_b IN ACCESS SHARE MODE NOWAIT;",
         ]
         assert sum("pg_try_advisory_xact_lock" in call.args[0] for call in case.database.scalar.await_args_list) == 2
         assert [event[0] for event in case.factory.events] == ["begin", "commit", "begin", "commit"]
@@ -391,21 +395,16 @@ async def test_source_cleanup_refusals_preserve_context_and_unowned_relations(so
         "test_schema", None, (), {}, SimpleNamespace(lock_read_backend=AsyncMock())
     )
     if failure == "proof":
-        issued = preparation._SourcePreparation(
-            case.factory, case.admission, case.scope.native_input_hash, asyncio.current_task()
-        )
+        issued = preparation._SourcePreparation(case.factory, case.admission, case.scope.native_input_hash)
     elif failure == "replacement":
-        relations_by_name["stage_a"] = 99
+        issued.original_relations.discard("stage_a")
     else:
         case.database.all.side_effect = RuntimeError("unit lock failure")
     token = candidate._NATIVE_DEPENDENCIES.set(dependencies)
     try:
-        operation = candidate._cleanup_stage_family("test_schema", (("stage_a", "stage_a", 41),), source_input=issued)
-        if failure == "replacement":
+        operation = candidate._cleanup_stage_family("test_schema", (("stage_a", "stage_a"),), source_input=issued)
+        with pytest.raises(RuntimeError):
             await operation
-        else:
-            with pytest.raises(RuntimeError):
-                await operation
         assert set(relations_by_name) == {"stage_a", "stage_b"}
         assert admitted._ADMISSION.get() is case.scope
         assert candidate._NATIVE_DEPENDENCIES.get() is dependencies
@@ -440,7 +439,7 @@ async def test_source_cleanup_drains_original_transaction_before_owner_cancellat
         token = candidate._NATIVE_DEPENDENCIES.set(dependencies)
         try:
             await candidate._drain_owned_stages(
-                "test_schema", case.scope.cleanup_oids, source_input=case.scope.source_preparation
+                "test_schema", case.scope.cleanup_relations, source_input=case.scope.source_preparation
             )
         finally:
             assert admitted._ADMISSION.get() is case.scope
@@ -472,7 +471,7 @@ async def test_failed_source_build_keeps_original_error_after_exact_cleanup(sour
     monkeypatch.setattr(candidate, "_capture_dependencies", AsyncMock(return_value=dependencies))
     monkeypatch.setattr(admitted._native(), "process_entity_address_unified_data", AsyncMock(side_effect=failure))
     inputs = candidate.ProviderDirectoryAddressPreparationInput(
-        (), "overlay_stage", 12, 0, semantic_as_of=case.admission.plan.desired_profile_as_of
+        (), "overlay_stage", 0, semantic_as_of=case.admission.plan.desired_profile_as_of
     )
     with pytest.raises(type(failure)) as caught:
         await candidate.prepare_provider_directory_entity_address(
@@ -568,25 +567,26 @@ async def _native_freeze_case(case, monkeypatch, failure):
     case.admission.plan = replace(case.admission.plan, native_address_targets=roots)
     case.admission.lease = _signed_lease(case.admission.plan)
     prepared = _prepared(case)
-    stages = tuple((root, root + "_cms" + "a" * 20, index + 41) for index, root in enumerate(roots))
-    prepared.stage_oids = case.scope.stage_oids = stages
-    case.scope.owned_oids = {name: oid for _, name, oid in stages}
-    case.scope.source_preparation.original_relations = {(name, oid) for _, name, oid in stages}
-    case.scope.source_preparation.sequences = {name: () for _, name, _ in stages}
-    measured_relations = [SimpleNamespace(relation=name, oid=oid) for _, name, oid in stages]
+    stages = tuple((root, root + "_cms" + "a" * 20) for root in roots)
+    prepared.stage_relations = case.scope.stage_relations = stages
+    case.scope.owned_relations = {name for _, name in stages}
+    case.scope.source_preparation.original_relations = {name for _, name in stages}
+    measured_relations = [SimpleNamespace(relation=name) for _, name in stages]
     case.admission.measure = AsyncMock(return_value=measured_relations)
     monkeypatch.setattr(modules.directory, "db", case.database)
     case.database._connect_reader = AsyncMock(
         return_value=SimpleNamespace(_reader_login=("test_builder" if failure == "reader" else "test_reader", ""))
     )
     model_check = AsyncMock(side_effect=ValueError("index changed") if failure == "index" else None)
-    custody_check = AsyncMock(side_effect=ValueError("custody changed") if failure == "custody" else None)
+    provision = importlib.import_module("process.provider_directory_generic_source_provision")
+    freeze = AsyncMock(side_effect=PermissionError("native freeze denied") if failure == "reader" else None)
+    monkeypatch.setattr(provision, "freeze_fhir_source_snapshot", freeze)
     monkeypatch.setattr(modules.native_layout, "capture_retained_native_source", model_check)
-    monkeypatch.setattr(modules.pins, "_custody", custody_check)
-    monkeypatch.setattr(modules.read_catalog, "require_native_read_catalog", AsyncMock())
-    captured = SimpleNamespace(relation_oids=tuple((logical, oid) for logical, _, oid in stages))
+    captured = SimpleNamespace(relations=tuple((logical, prepared.db_schema, name) for logical, name in stages))
     monkeypatch.setattr(
-        modules.equivalence, "capture_registry_cms_address_copy_source", AsyncMock(return_value=captured)
+        modules.equivalence,
+        "capture_registry_cms_address_copy_source",
+        AsyncMock(side_effect=ValueError("layout changed") if failure == "custody" else None, return_value=captured),
     )
     if failure == "budget":
         case.admission.assert_ready.side_effect = RuntimeError("budget refused")
@@ -602,16 +602,10 @@ async def test_exact_seven_reader_handoff_follows_full_native_models_and_commit(
         await preparation.freeze_source_generation(case.database, prepared, case.scope)
         assert preparation.require_source_generation(prepared, case.admission) is captured
     else:
-        with pytest.raises((ValueError, RuntimeError)):
+        with pytest.raises((ValueError, RuntimeError, PermissionError)):
             await preparation.freeze_source_generation(case.database, prepared, case.scope)
         assert prepared.source_preparation is None
-    statements = [call.args[0] for call in case.factory.connection.execute.await_args_list]
-    grants = [statement for statement in statements if statement.startswith("GRANT")]
-    if failure in {"index", "reader"}:
-        assert grants == []
-    else:
-        assert len(grants) == 7 and all('TO "test_reader"' in statement for statement in grants)
-        assert model_check.await_count == 7
+    assert model_check.await_count == (1 if failure == "index" else 7)
     if failure == "budget":
         assert case.factory.events[-1][0] == "commit"
     elif failure is not None:

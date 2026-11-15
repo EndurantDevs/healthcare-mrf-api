@@ -16,11 +16,10 @@ from tests.test_provider_directory_output_snapshot_custody import relation
 
 
 @contextmanager
-def _tokens(case, fence, resource_fence, names, oids):
+def _tokens(case, fence, resource_fence, names):
     assert fence is resource_fence is case.fence
     variables = (
         (case.directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES, names),
-        (case.directory._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS, oids),
         (case.directory._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE, fence),
         (case.directory._PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS, tuple(fence.source_ids)),
     )
@@ -36,7 +35,6 @@ def _case():
     directory = SimpleNamespace(db=SimpleNamespace(_transaction_binding=lambda: None))
     for name, default in (
         ("RELATION_OVERRIDES", {}),
-        ("OWNED_RELATION_OIDS", {}),
         ("DATASET_FENCE", None),
         ("RESOURCE_SCOPE_SOURCE_IDS", ()),
     ):
@@ -158,7 +156,7 @@ def _issued(state):
     factory = reader.source._FACTORY.set(state.factory)
     projection = scratch._PROJECTION.set((state.scope, state.projection))
     try:
-        with reader.inputs.scratch_input_scope(state.scope), _tokens(state, state.fence, state.fence, {}, {}):
+        with reader.inputs.scratch_input_scope(state.scope), _tokens(state, state.fence, state.fence, {}):
             yield
     finally:
         scratch._PROJECTION.reset(projection)

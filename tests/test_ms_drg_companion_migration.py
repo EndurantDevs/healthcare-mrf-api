@@ -47,7 +47,22 @@ def test_companion_migration_matches_models_without_runtime_imports(monkeypatch)
 
 def test_companion_migration_keeps_prior_head_and_refuses_destructive_downgrade():
     scripts = ScriptDirectory(str(ROOT / "alembic"))
-    assert scripts.get_heads() == ["20261114020000_custom_import_snapshot_metadata"]
+    assert scripts.get_heads() == ["20261116090000_profile_capacity_logical_names"]
+    assert (
+        scripts.get_revision("20261116090000_profile_capacity_logical_names").down_revision
+        == "20261115120000_named_output_recovery_document"
+    )
+    assert (
+        scripts.get_revision("20261115120000_named_output_recovery_document").down_revision
+        == "20261115110000_network_retained_read_grant_ledger"
+    )
+    assert scripts.get_revision("20261114130000_named_preparation_catalog").down_revision == (
+        "20261114020000_custom_import_snapshot_metadata"
+    )
+    assert scripts.get_revision("20261114020000_custom_import_snapshot_metadata").down_revision == (
+        "20261114010000_custom_import_snapshot_names"
+    )
+    assert scripts.get_revision("20261114010000_custom_import_snapshot_names").down_revision == REVISION
     assert scripts.get_revision(REVISION).down_revision == "20261113010000_address_canonical_space_normalization"
     with pytest.raises(RuntimeError, match="retained-data migration"):
         migration().downgrade()

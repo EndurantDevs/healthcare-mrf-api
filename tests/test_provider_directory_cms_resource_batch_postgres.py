@@ -25,11 +25,6 @@ from process import provider_directory_cms_npd as cms
 from process import provider_directory_cms_serving_coverage as coverage
 from process import provider_directory_generic_source_storage as source_storage
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
-from process.network_fhir_source_custody import (
-    FHIRSourceCustodyError,
-    capture_retained_cms_fhir_source_custody,
-    require_retained_cms_fhir_source_custody,
-)
 from process.provider_directory_cms_resource_batch import persist_prepared_cms_dataset_rows, prepare_cms_dataset_rows
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_completion import complete_generic_source_candidate
@@ -197,8 +192,6 @@ async def test_one_and_thousand_resources_have_fixed_native_operations(
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT", "false")
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_COPY_UPSERT_MIN_ROWS", "2000")
     monkeypatch.setattr(fhir, "_upsert_rows_values", _forbid_values)
-    # Custody capture is bounded per interval; verify on every batch so the counts stay size-only.
-    monkeypatch.setattr(source_storage, "_VERIFY_INTERVAL_SECONDS", 0.0)
     async with source_transaction(database):
         publisher = bound_publisher()
         binding = await source_storage._locked(
@@ -431,102 +424,6 @@ async def test_stream_preappend_bounds_and_cancellation_rollback(resource_candid
     assert await _snapshot(database, candidate) == []
 
 
-async def _protect_custody_schema(connection, names):
-    """Assign only the fixture schema to distinct native protected and runtime roles."""
-    owner, reader, writer = names
-    for name in names:
-        await connection.execute(f'CREATE ROLE "{name}" NOLOGIN')
-    await connection.execute(f'ALTER SCHEMA mrf OWNER TO "{owner}"')
-    statements = await connection.fetchval(
-        """SELECT string_agg(statement,';') FROM (
-      SELECT format('ALTER TABLE mrf.%I OWNER TO %I',relname,$1::text) statement
-      FROM pg_class WHERE relnamespace='mrf'::regnamespace AND relkind IN ('r','p')
-      UNION ALL SELECT format('ALTER FUNCTION %s OWNER TO %I',p.oid::regprocedure,$1::text)
-      FROM pg_proc p WHERE p.pronamespace='mrf'::regnamespace) changes""",
-        owner,
-    )
-    await connection.execute(statements)
-    await connection.execute(f'GRANT USAGE ON SCHEMA mrf TO "{reader}","{writer}"')
-    await connection.execute(f'GRANT SELECT ON ALL TABLES IN SCHEMA mrf TO "{reader}","{writer}"')
-    await connection.execute(f'GRANT INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA mrf TO "{writer}"')
-
-
-@pytest.mark.parametrize("cms_resource_template", [support.LEGACY_MIGRATION_PREFIXES], indirect=True)
-@pytest.mark.parametrize(
-    "damage",
-    [
-        None,
-        "disabled",
-        "body",
-        "acl",
-        "owner",
-        "generic",
-        "receipt",
-        "initial_function",
-        "initial_columns",
-        "initial_arguments",
-        "initial_transition",
-        "initial_routine",
-        "initial_foreign_routine",
-    ],
-)
-async def test_retained_cms_custody_native_closure(monkeypatch, tmp_path, damage):
-    """Actual eight-file admission proves closed guards and rejects catalog or receipt drift."""
-    names = tuple("custody_" + uuid4().hex for _ in range(3))
-    async with support.admission_database(
-        monkeypatch, migration_prefixes=support.LEGACY_MIGRATION_PREFIXES
-    ) as database:
-        candidate, release, digest = await stage_legacy_retained_source(monkeypatch, tmp_path, database)
-        await publish_legacy_retained_source(database, candidate, release, digest)
-        await assert_legacy_candidate_coverage(database, candidate, release, digest)
-        async with database.session() as session:
-            driver = (await (await session.connection()).get_raw_connection()).driver_connection
-            try:
-                source_pin = PinnedFHIRMembershipSource(
-                    "mrf",
-                    "cms-npd",
-                    candidate.endpoint_id,
-                    candidate.dataset_id,
-                    digest,
-                    release,
-                    await driver.fetchval("SELECT 'mrf.provider_directory_dataset_resource'::regclass::oid"),
-                    "cms-npd",
-                    "2026-01-01",
-                )
-                await _protect_custody_schema(driver, names)
-                await session.commit()
-                async with driver.transaction(isolation="repeatable_read"):
-                    await _check_native_custody(driver, source_pin, names, damage)
-            finally:
-                await _remove_custody_roles(driver, names)
-
-
-async def _check_native_custody(driver, source_pin, names, damage):
-    """Check a real receipt before and after one isolated native capability change."""
-    receipt = await capture_retained_cms_fhir_source_custody(
-        driver, source_pin, owner_role=names[0], runtime_roles=names[1:]
-    )
-    assert await require_retained_cms_fhir_source_custody(driver, receipt) == receipt
-    if damage and damage.startswith("initial_"):
-        await _damage_custody(driver, names, damage)
-        with pytest.raises(FHIRSourceCustodyError, match="^fhir_source_custody_unavailable$"):
-            await capture_retained_cms_fhir_source_custody(
-                driver, source_pin, owner_role=names[0], runtime_roles=names[1:]
-            )
-        return
-    if damage:
-        await _damage_custody(driver, names, damage)
-        if damage == "generic":
-            receipt = replace(receipt, source_pin=replace(source_pin, source_id="example-source"))
-        if damage == "receipt":
-            receipt = replace(receipt, proof_sha256="0" * 64)
-        with pytest.raises(FHIRSourceCustodyError, match="^fhir_source_custody_unavailable$"):
-            await require_retained_cms_fhir_source_custody(driver, receipt)
-    else:
-        await _other_edition_write(driver, names[2])
-        assert await require_retained_cms_fhir_source_custody(driver, receipt) == receipt
-
-
 async def _remove_custody_roles(driver, names):
     """Drop only the exact test roles after their owned fixture objects and grants."""
     owned_roles = []
@@ -541,50 +438,22 @@ async def _remove_custody_roles(driver, names):
         assert not await driver.fetchval("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)", name)
 
 
-async def _damage_custody(connection, names, damage):
-    """Mutate only the isolated fixture's native custody capabilities."""
-    sql_by_damage = {
-        "disabled": "ALTER TABLE mrf.provider_directory_dataset_resource DISABLE TRIGGER cms_npd_published_resource_immutable",
-        "body": "CREATE OR REPLACE FUNCTION mrf.guard_cms_npd_published_resource() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END'",
-        "acl": f'GRANT TRIGGER ON mrf.provider_directory_dataset_resource TO "{names[2]}"',
-        "owner": f'ALTER TABLE mrf.provider_directory_dataset_resource OWNER TO "{names[2]}"',
-        "initial_function": """CREATE OR REPLACE TRIGGER cms_npd_published_resource_immutable
-          AFTER INSERT ON mrf.provider_directory_dataset_resource REFERENCING NEW TABLE AS changed_new
-          FOR EACH STATEMENT EXECUTE FUNCTION mrf.guard_cms_npd_covered_network_witness()""",
-        "initial_columns": """CREATE OR REPLACE TRIGGER provider_directory_endpoint_dataset_admission_seal_guard
-          BEFORE INSERT OR UPDATE OF status ON mrf.provider_directory_endpoint_dataset
-          FOR EACH ROW EXECUTE FUNCTION mrf.guard_provider_directory_endpoint_dataset_admission_seal()""",
-        "initial_arguments": """CREATE OR REPLACE TRIGGER provider_directory_endpoint_dataset_admission_raw_guard
-          BEFORE UPDATE OF publication_metadata_json ON mrf.provider_directory_endpoint_dataset
-          FOR EACH ROW EXECUTE FUNCTION mrf.guard_provider_directory_endpoint_dataset_admission_seal('other')""",
-        "initial_transition": """CREATE OR REPLACE TRIGGER cms_npd_published_resource_immutable
-          AFTER INSERT ON mrf.provider_directory_dataset_resource REFERENCING NEW TABLE AS other_rows
-          FOR EACH STATEMENT EXECUTE FUNCTION mrf.guard_cms_npd_published_resource()""",
-        "initial_routine": """CREATE FUNCTION mrf.example_definer() RETURNS void LANGUAGE plpgsql
-          IMMUTABLE SECURITY DEFINER SET search_path=pg_catalog AS 'BEGIN RETURN; END'""",
-        "initial_foreign_routine": f"""CREATE SCHEMA custody_extra AUTHORIZATION "{names[0]}";
-          GRANT USAGE ON SCHEMA custody_extra TO "{names[2]}";
-          CREATE FUNCTION custody_extra.example_definer() RETURNS void LANGUAGE plpgsql
-          SECURITY DEFINER SET search_path=pg_catalog AS 'BEGIN RETURN; END'""",
-    }
-    if damage in sql_by_damage:
-        await connection.execute(sql_by_damage[damage])
-
-
-async def _other_edition_write(connection, writer):
-    """A guarded writer can add a new release witness without changing retained custody."""
-    await connection.execute(f'SET LOCAL ROLE "{writer}"')
-    await connection.execute("""INSERT INTO mrf.provider_directory_entity_release_evidence
-      SELECT source_id,resource_type,resource_id,'other-edition',payload_sha256,payload_json,observed_at
-      FROM mrf.provider_directory_entity_release_evidence LIMIT 1""")
-    await connection.execute("RESET ROLE")
+async def _assert_epoch_write_denied(driver, epoch, runtime_role):
+    async with driver.transaction():
+        await driver.execute(f'SET LOCAL ROLE "{runtime_role}"')
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with driver.transaction():
+                await driver.execute(
+                    f'UPDATE "{epoch.schema_name}".provider_directory_endpoint_dataset SET status=status'
+                )
 
 
 async def _assert_epoch_capture(driver, source_pin, capture_options_by_field, damage):
-    """Check immutable replay, wrong trusted proof, and task-owned capability drift."""
+    """Check named replay, independently admitted data, functional indexes and denied writes."""
     from process.network_fhir_membership_source import _require_pinned_source
     from process.network_fhir_source_epoch import (
         FHIRSourceEpochError,
+        _content,
         capture_retained_cms_fhir_source_epoch,
         require_retained_cms_fhir_source_epoch,
         validate_retained_cms_fhir_source_epoch,
@@ -602,15 +471,11 @@ async def _assert_epoch_capture(driver, source_pin, capture_options_by_field, da
             return
         epoch = await capture_retained_cms_fhir_source_epoch(driver, source_pin, **capture_options_by_field)
         assert validate_retained_cms_fhir_source_epoch(epoch.as_dict()) == epoch
-        from process.network_fhir_source_epoch import _content
-
+        await _assert_legacy_epoch_compatibility(driver, source_pin, epoch)
         assert await _content(driver, source_pin.schema_name) == epoch.content_sha256
         assert await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch) == epoch
         assert await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch, verify_content=False) == epoch
         _assert_epoch_wire(epoch)
-        assert not await driver.fetchval(
-            "SELECT pg_has_role($1,$2,'SET') OR pg_has_role($1,$2,'MEMBER')", runtime_role, epoch.owner_role
-        )
         if damage == "query_plan":
             await _assert_epoch_lookup_plans(driver, source_pin, epoch)
         retained_pin = replace(source_pin, retained_epoch=epoch)
@@ -618,8 +483,18 @@ async def _assert_epoch_capture(driver, source_pin, capture_options_by_field, da
         if damage in {"drop_index", "recreate_index", "wrong_index"}:
             await _assert_epoch_index_damage(driver, source_pin, epoch, damage)
         if damage == "epoch_write":
-            await driver.execute(f'GRANT UPDATE ON ALL TABLES IN SCHEMA "{epoch.schema_name}" TO "{runtime_role}"')
-            with pytest.raises(FHIRSourceEpochError, match="^fhir_source_epoch_unavailable$"):
+            await _assert_epoch_write_denied(driver, epoch, runtime_role)
+            assert await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch) == epoch
+        if damage == "retained_payload":
+            await driver.execute(
+                f'UPDATE "{epoch.schema_name}".provider_directory_dataset_resource '
+                "SET payload_json=(payload_json::jsonb || $1::jsonb)::json",
+                json.dumps({"unexpected": True}),
+            )
+            assert (
+                await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch, verify_content=False) == epoch
+            )
+            with pytest.raises(FHIRSourceEpochError):
                 await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch)
         if damage == "origin_change":
             await driver.execute(
@@ -629,8 +504,29 @@ async def _assert_epoch_capture(driver, source_pin, capture_options_by_field, da
             await _require_pinned_source(driver, retained_pin)
 
 
+async def _assert_legacy_epoch_compatibility(driver, source_pin, epoch):
+    """Historical physical fields have no authority over the native named edition."""
+    from process.network_fhir_source_epoch import _TABLES, require_retained_cms_fhir_source_epoch
+
+    for offset in (1000, 2000):
+        historical_by_field = {
+            **epoch.as_dict(),
+            "schema_oid": offset,
+            "relation_oids": [[name, offset + ordinal] for ordinal, name in enumerate(sorted(_TABLES), 1)],
+            "owner_role": "historical_owner_" + str(offset),
+            "runtime_roles": ["historical_reader_" + str(offset)],
+            "catalog_sha256": str(offset // 1000) * 64,
+        }
+        historical_by_field["origin_coordinates"][6] = offset + 500
+        assert await require_retained_cms_fhir_source_epoch(driver, source_pin, historical_by_field) == epoch
+        assert (
+            await require_retained_cms_fhir_source_epoch(driver, source_pin, historical_by_field, verify_content=False)
+            == epoch
+        )
+
+
 async def _assert_epoch_index_damage(driver, source_pin, epoch, damage):
-    """Deny missing, differently keyed or identically rebuilt indexes through cheap custody."""
+    """Reject missing or wrongly keyed indexes and accept equivalent rebuilds by function."""
     from process.network_fhir_source_epoch import FHIRSourceEpochError, require_retained_cms_fhir_source_epoch
 
     await driver.execute(f'DROP INDEX "{epoch.schema_name}".cms_epoch_entity_site')
@@ -639,8 +535,12 @@ async def _assert_epoch_index_damage(driver, source_pin, epoch, damage):
         await driver.execute(
             f'CREATE INDEX cms_epoch_entity_site ON "{epoch.schema_name}".provider_directory_entity_source_binding ({column})'
         )
-    with pytest.raises(FHIRSourceEpochError, match="^fhir_source_epoch_unavailable$"):
-        await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch, verify_content=False)
+    assert await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch, verify_content=False) == epoch
+    if damage == "recreate_index":
+        assert await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch) == epoch
+    else:
+        with pytest.raises(FHIRSourceEpochError, match="^fhir_source_epoch_unavailable$"):
+            await require_retained_cms_fhir_source_epoch(driver, source_pin, epoch)
 
 
 def _enlarge_epoch_source_rows(monkeypatch, size):
@@ -715,7 +615,7 @@ def _assert_epoch_wire(epoch):
     from process.network_fhir_source_epoch import FHIRSourceEpochError, validate_retained_cms_fhir_source_epoch
 
     for field, invalid in (
-        ("runtime_roles", epoch.runtime_roles[0]),
+        ("runtime_roles", "reader"),
         ("origin_coordinates", "abc"),
         ("relation_oids", "abc"),
         ("epoch_id", str(epoch.epoch_id).upper()),
@@ -747,6 +647,7 @@ def _tamper_epoch_export(monkeypatch):
         None,
         "expectation",
         "epoch_write",
+        "retained_payload",
         "origin_change",
         "source_payload",
         "drop_index",

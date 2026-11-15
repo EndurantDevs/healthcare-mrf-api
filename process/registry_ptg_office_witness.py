@@ -14,6 +14,7 @@ from process import registry_ptg_cohort_authority as source
 from process import registry_ptg_graph_reader as graph
 from process import registry_ptg_office_capture as capture
 from process.network_address_projection import _identifier
+from process.registry_ptg_office_review_contract import named_office_review_command
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 _PAGE_ROWS = 1024
@@ -46,19 +47,33 @@ def _descriptor(descriptor, request, context):
         or descriptor.schema_name != schema_name
         or type(descriptor.manifest_json) is not bytes
         or not 1 <= len(descriptor.manifest_json) <= capture.MAX_INPUT_BYTES
-        or type(descriptor.custody_json) is not bytes
-        or not 1 <= len(descriptor.custody_json) <= 16384
+        or type(descriptor.storage_json) is not bytes
+        or not 1 <= len(descriptor.storage_json) <= 16384
     ):
         raise RegistryPTGOfficeWitnessError("registry_ptg_office_descriptor_invalid")
     manifest = json.loads(descriptor.manifest_json)
     if (
         type(manifest) is not dict
-        or set(manifest) != {"contract", "state", "command", "command_sha256", "accounting"}
+        or set(manifest)
+        not in (
+            {"contract", "state", "command", "command_sha256", "accounting"},
+            {"contract", "state", "command", "command_sha256", "accounting", "storage", "preparation_request_sha256"},
+        )
         or manifest["contract"] != "registry_ptg_office_capture.v1"
         or manifest["state"] != "prepared"
-        or capture._digest(manifest) != descriptor.manifest_sha256
-        or capture._digest(manifest["command"]) != manifest["command_sha256"]
         or capture._canonical(manifest) != descriptor.manifest_json
+    ):
+        raise RegistryPTGOfficeWitnessError("registry_ptg_office_descriptor_invalid")
+    from process.registry_ptg_office_review_contract import named_office_review_command
+    from process.registry_ptg_scope_engine import _sha256
+
+    _sha256(descriptor.manifest_sha256)
+    _sha256(manifest["command_sha256"])
+    named_office_review_command(manifest["command"])
+    capture.descriptor_storage(descriptor)
+    if "storage" in manifest and (
+        capture._digest(manifest) != descriptor.manifest_sha256
+        or capture._digest(manifest["command"]) != manifest["command_sha256"]
     ):
         raise RegistryPTGOfficeWitnessError("registry_ptg_office_descriptor_invalid")
     return schema_name, manifest
@@ -69,9 +84,11 @@ async def _family(driver, schema_name, descriptor, context):
     await driver.execute(
         f"LOCK TABLE {namespace}.office_assertion,{namespace}.capture_manifest IN ACCESS SHARE MODE NOWAIT"
     )
-    custody = await capture._custody(driver, schema_name, context)
-    if capture._canonical(custody) != descriptor.custody_json:
-        raise RegistryPTGOfficeWitnessError("registry_ptg_office_custody_changed")
+    from process.registry_ptg_office_preparation import require_office_preparation_frozen
+
+    await require_office_preparation_frozen(driver, str(descriptor.capture_id), control_schema=context.control_schema)
+    await capture._require_office_layout(driver, schema_name, is_published=capture.is_published_office_context(context))
+    storage = capture.descriptor_storage(descriptor)
     rows = await driver.fetch(f"SELECT id,manifest_sha256,manifest_json FROM {namespace}.capture_manifest LIMIT 2")
     if len(rows) != 1 or rows[0]["id"] != 1 or rows[0]["manifest_sha256"] != descriptor.manifest_sha256:
         raise RegistryPTGOfficeWitnessError("registry_ptg_office_manifest_changed")
@@ -80,7 +97,7 @@ async def _family(driver, schema_name, descriptor, context):
         manifest = json.loads(manifest)
     if capture._canonical(manifest) != descriptor.manifest_json:
         raise RegistryPTGOfficeWitnessError("registry_ptg_office_manifest_changed")
-    return custody
+    return storage
 
 
 async def _office_rows(driver, namespace, after):
@@ -154,24 +171,47 @@ async def _sources(session, context, scope):
     return identity
 
 
-def _is_retained_review_command_match(expected, original, current_revision):
+def _is_retained_review_command_match(expected_by_field, original, current_revision):
+    from process.registry_ptg_office_review_contract import is_legacy_office_review_command, named_office_review_command
+
+    if (
+        isinstance(expected_by_field, dict)
+        and isinstance(original, dict)
+        and "retained_serving" in expected_by_field
+        and "retained_serving" in original
+    ):
+        is_legacy = is_legacy_office_review_command(original)
+        expected_by_field = named_office_review_command(expected_by_field)
+        original = named_office_review_command(original)
+        if is_legacy:
+            expected_by_field = {
+                name: coordinate for name, coordinate in expected_by_field.items() if name != "retained_serving_sha256"
+            }
+            expected_by_field["retained_serving"] = {
+                name: coordinate
+                for name, coordinate in expected_by_field["retained_serving"].items()
+                if name != "address_relation"
+            }
     if current_revision is None:
-        return expected == original
+        return expected_by_field == original
     if type(current_revision) is not int or not 0 < current_revision < 2**63:
         return False
-    if type(expected) is not dict or type(original) is not dict:
+    if type(expected_by_field) is not dict or type(original) is not dict:
         return False
-    if type(expected.get("source")) is not dict or type(original.get("source")) is not dict:
+    if type(expected_by_field.get("source")) is not dict or type(original.get("source")) is not dict:
         return False
     historical_revision = original["source"].get("approved_revision")
     if (
         type(historical_revision) is not int
         or not 0 < historical_revision <= current_revision
-        or type(expected["source"].get("approved_revision")) is not int
-        or expected["source"]["approved_revision"] != current_revision
+        or type(expected_by_field["source"].get("approved_revision")) is not int
+        or expected_by_field["source"]["approved_revision"] != current_revision
     ):
         return False
-    comparison_by_name = {**expected, "source": {**expected["source"], "approved_revision": historical_revision}}
+    comparison_by_name = {
+        **expected_by_field,
+        "source": {**expected_by_field["source"], "approved_revision": historical_revision},
+    }
     return comparison_by_name == original
 
 
@@ -277,7 +317,7 @@ async def verify_registry_ptg_office_witness(
     driver, transaction = await capture._office_driver(session, context), session.get_transaction()
     guard = lambda: capture._same_transaction(session, driver, transaction)
     guard()
-    custody = await _family(driver, schema_name, descriptor, context)
+    storage = await _family(driver, schema_name, descriptor, context)
     guard()
     scope, serving, identity = await _prepared(session, driver, context, request, manifest, retained_approved_revision)
     await capture._validate_rows(driver, schema_name, scope, request.input_row_count)
@@ -299,8 +339,8 @@ async def verify_registry_ptg_office_witness(
         identity,
     ):
         raise RegistryPTGOfficeWitnessError("registry_ptg_office_source_changed")
-    if await _family(driver, schema_name, descriptor, context) != custody:
-        raise RegistryPTGOfficeWitnessError("registry_ptg_office_custody_changed")
+    if await _family(driver, schema_name, descriptor, context) != storage:
+        raise RegistryPTGOfficeWitnessError("registry_ptg_office_manifest_changed")
     guard()
     return RegistryPTGOfficeWitnessEvidence(
         capture._canonical(
@@ -316,9 +356,9 @@ async def verify_registry_ptg_office_witness(
                 "graph_identity": identity,
                 "accounting": accounting_by_field,
                 "source": manifest["command"]["source"],
-                "retained_serving": manifest["command"]["retained_serving"],
+                "retained_serving": named_office_review_command(manifest["command"])["retained_serving"],
                 "source_witness_census": census,
-                "custody": custody,
+                "storage": storage,
                 "graph_budget": _graph_budget_usage(read_budget),
             }
         )

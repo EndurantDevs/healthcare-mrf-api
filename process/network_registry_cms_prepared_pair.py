@@ -20,6 +20,7 @@ from process.network_cms_registry_source_pair import (
     RegistryCMSRetainedSourcePair,
     _digest,
     _json,
+    _require_address_pair_layout,
     require_registry_cms_source_pair,
 )
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
@@ -127,6 +128,7 @@ class PreparedRegistryCMSSourcePair:
         request_document = asdict(self.request)
         request_document["source_pin"].pop("retained_successor")
         request_document["source_pin"].pop("retained_capture")
+        request_document["source_pin"].pop("logical_edition_id")
         document_dict = {
             "request": request_document,
             "recipe": json.loads(canonical_registry_source_recipes((self.recipe,)))[0],
@@ -178,7 +180,7 @@ async def _retention_admission(prepared, factory, request, capture_id, owner_rol
 
 
 def _validate_preparation_request(request, capture_id, owner_role, runtime_roles):
-    """Keep the signed request and immutable custody roles closed."""
+    """Keep the signed request and configured native grant roles closed."""
     if (
         type(request) is not RegistryCMSRetentionRequest
         or type(capture_id) is not UUID
@@ -281,12 +283,10 @@ class RegistryCMSRawEpochAdmission:
             copy_admission=self,
         )
 
-    async def __call__(self, phase, schema, logical, oid):
+    async def __call__(self, phase, schema, logical):
         if (
             schema != self.schema_name
             or logical not in _TABLES
-            or type(oid) is not int
-            or not 0 < oid < 2**32
             or phase
             not in {
                 "created",
@@ -300,17 +300,14 @@ class RegistryCMSRawEpochAdmission:
         ):
             raise ValueError("registry_cms_retention_admission_required")
         admission = self.prepared.nonprofile_admission
-        raw_relation = RetainedRawRelation(schema, logical, oid, self.policy_json, self._phase_indexes(phase, logical))
+        raw_relation = RetainedRawRelation(schema, logical, self.policy_json, self._phase_indexes(phase, logical))
         if phase == "created":
-            await admission.register_external_relation(
-                self.prepared.fhir, schema, logical, oid, raw_relation=raw_relation
-            )
+            await admission.register_external_relation(self.prepared.fhir, schema, logical, raw_relation=raw_relation)
         else:
             await admission.assert_external_relation(
                 self.prepared.fhir,
                 schema,
                 logical,
-                oid,
                 raw_relation=raw_relation,
                 require_ready=phase in {"after_copy_batch", "after_insert", "after_index"},
             )
@@ -494,8 +491,7 @@ async def _retire_rolled_back(prepared, registered_before):
     """Retire only registered copy OIDs whose creating transaction rolled back."""
     admission = prepared.nonprofile_admission
     for schema, logical in sorted(admission._external_relations - registered_before):
-        oid = admission._relations[(schema, logical)]
-        await admission.retire_external_relation(prepared.fhir, schema, logical, oid)
+        await admission.retire_external_relation(prepared.fhir, schema, logical)
 
 
 async def _stamp_prepared(connection, prepared_pair):
@@ -510,7 +506,7 @@ async def _stamp_prepared(connection, prepared_pair):
 
 
 async def _require_prepared_pair(session, prepared_pair):
-    """Validate only exact closed OIDs, indexes, custody and stamped policy."""
+    """Validate the named frozen layout and complete stamped preparation."""
     if type(prepared_pair) is not PreparedRegistryCMSSourcePair:
         raise ValueError("registry_cms_prepared_pair_invalid")
     connection = await native_driver(session)
@@ -528,11 +524,11 @@ async def _require_prepared_pair(session, prepared_pair):
         verify_content=False,
     )
     comment = await connection.fetchval(
-        "SELECT obj_description($1::oid,'pg_namespace')", prepared_pair.address_ownership.schema_oid
+        "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1",
+        prepared_pair.address_ownership.schema_name,
     )
-    if catalog != prepared_pair.address_catalog_sha256 or comment != (
-        _prepared_comment_prefix(prepared_pair) + _json(prepared_pair.as_dict())
-    ):
+    await _require_address_pair_layout(session, prepared_pair, catalog, verify_content=False)
+    if comment != _prepared_comment_prefix(prepared_pair) + _json(prepared_pair.as_dict()):
         raise ValueError("registry_cms_prepared_pair_invalid")
     return connection
 
@@ -585,12 +581,9 @@ async def bind_prepared_registry_cms_source_pair(session, prepared_pair, *, rece
     pair = _pair_from_prepared_receipt(prepared_pair, receipt_row)
     await _require_retained_authority(connection, prepared_pair, publication_document)
     current = await serving.capture_native_dependencies(session, request.source_pin.schema_name, lock=True)
-    expected_oid_by_logical = {logical: oid for logical, _stage, oid in prepared_pair.address_stages}
     if (
         publication_document["address"] != current["address"]
         or publication_document["profile"] != current["profile"]
-        or publication_document["address"]["relation_oids"]
-        != [expected_oid_by_logical[logical] for logical in RELATION_NAMES]
         or publication_document["selection"]["proof_id"] != request.selection_proof_id
     ):
         raise ValueError("registry_cms_prepared_receipt_invalid")
@@ -598,7 +591,7 @@ async def bind_prepared_registry_cms_source_pair(session, prepared_pair, *, rece
 
 
 def _pair_from_prepared_receipt(prepared_pair, receipt_row):
-    """Construct identity from actual row fields; callers must prove row visibility and custody."""
+    """Construct the logical pair from actual committed row fields and visibility."""
     document = receipt_row["registry_source_pair_json"]
     if isinstance(document, str):
         document = json.loads(document)

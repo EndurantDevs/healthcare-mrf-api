@@ -11,7 +11,6 @@ import pytest
 
 from process import provider_directory_profile as profile
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -108,11 +107,9 @@ async def test_profile_scope_blank_and_duplicate_rows(monkeypatch):
         lambda: ("source-a",),
     )
 
-    selected_ids, retained_ids, contexts = (
-        await importer._provider_directory_profile_scope_source_ids(
-            "mrf",
-            {"source-a"},
-        )
+    selected_ids, retained_ids, contexts = await importer._provider_directory_profile_scope_source_ids(
+        "mrf",
+        {"source-a"},
     )
     assert selected_ids == ["source-a"]
     assert retained_ids == ["source-a"]
@@ -130,7 +127,7 @@ async def test_profile_scope_blank_and_duplicate_rows(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_profile_cleanup_and_stale_oid_rejection(monkeypatch):
+async def test_profile_cleanup_and_unrelated_stage_name_rejection(monkeypatch):
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status)
     await importer._remove_provider_directory_profile_stage_table(
@@ -145,22 +142,25 @@ async def test_profile_cleanup_and_stale_oid_rejection(monkeypatch):
         yield
 
     build = _build()
+    checkpoint_by_field = dict(_checkpoint_map(build), profile_stage="unrelated_stage")
+    status.reset_mock()
     monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(
         importer.db,
         "all",
-        AsyncMock(return_value=[_checkpoint_map(build)]),
+        AsyncMock(return_value=[checkpoint_by_field]),
     )
     monkeypatch.setattr(
         importer.db,
         "first",
-        AsyncMock(return_value=_checkpoint_map(build)),
+        AsyncMock(return_value=checkpoint_by_field),
     )
-    with pytest.raises(RuntimeError, match="stale_checkpoint_oid_invalid"):
+    with pytest.raises(RuntimeError, match="stale_checkpoint_stage_invalid"):
         await importer._reap_stale_provider_directory_profile_builds(
             "mrf",
             current_build_id=f"pdpb_{'b' * 32}",
         )
+    status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -296,7 +296,7 @@ async def test_profile_publish_returns_finalized_metrics(monkeypatch):
 
     @contextlib.asynccontextmanager
     async def build_guard(_schema, _target):
-        yield importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+        yield importer.ProviderDirectoryArtifactBuildFence()
 
     monkeypatch.setattr(
         importer,
@@ -329,15 +329,10 @@ async def test_profile_publish_returns_finalized_metrics(monkeypatch):
         "_finalize_provider_directory_profile_stages",
         finalize,
     )
-    capacity_admission, capacity_binding = _patch_profile_capacity_admission(
-        monkeypatch
-    )
+    capacity_admission, capacity_binding = _patch_profile_capacity_admission(monkeypatch)
     fence_token = importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(dataset_fence)
     try:
-        assert (
-            await importer.publish_provider_directory_profile(run_id="run-a")
-            == metrics_by_name
-        )
+        assert await importer.publish_provider_directory_profile(run_id="run-a") == metrics_by_name
     finally:
         importer._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(fence_token)
     assert capacity_binding.call_args.args[0] is capacity_admission
@@ -375,7 +370,7 @@ async def test_artifact_scope_helpers_cover_empty_and_guarded_paths(monkeypatch)
     @contextlib.asynccontextmanager
     async def build_guard(schema, target_name):
         entered_events.append((schema, target_name))
-        yield importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+        yield importer.ProviderDirectoryArtifactBuildFence()
 
     monkeypatch.setattr(
         importer,
@@ -396,9 +391,7 @@ async def test_artifact_scope_helpers_cover_empty_and_guarded_paths(monkeypatch)
         "provider_directory_dataset_resource",
         "run-a",
     )
-    expected_prefix = importer._provider_directory_artifact_scope_table_prefix(
-        "provider_directory_dataset_resource"
-    )
+    expected_prefix = importer._provider_directory_artifact_scope_table_prefix("provider_directory_dataset_resource")
     assert table_name.startswith(f"{expected_prefix}_")
     assert len(table_name) <= 63
 
@@ -466,9 +459,7 @@ async def test_artifact_fence_rejects_endpoint_and_source_drift():
 def test_artifact_dataset_identity_helpers():
     dataset = _dataset()
     dataset_fence = importer.ProviderDirectoryArtifactDatasetFence((dataset,))
-    assert dataset_fence.source_endpoint_dataset_tuples == (
-        ("source-a", "endpoint-a", "dataset-a"),
-    )
+    assert dataset_fence.source_endpoint_dataset_tuples == (("source-a", "endpoint-a", "dataset-a"),)
     assert importer._validated_artifact_dataset_ids(
         [
             {

@@ -6,8 +6,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -16,24 +14,12 @@ from sqlalchemy.pool import AsyncAdaptedQueuePool
 from process.network_address_projection import _identifier
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
-_FENCE_INFO = "registry_company_approval_fence"
-_ISSUED_FENCE = ContextVar("registry_company_approval_issued_fence", default=None)
-
 
 def _fence_key(control_schema):
     _identifier(control_schema)
     return int.from_bytes(
         hashlib.sha256(("registry_company_approval:v1:" + control_schema).encode()).digest()[:8], "big", signed=True
     )
-
-
-@dataclass(frozen=True)
-class _ScopeFence:
-    session: object
-    transaction: object
-    control_schema: str
-    key: int
-    owner_task: object
 
 
 def _source_engine(sessions):
@@ -63,34 +49,9 @@ async def lock_registry_company_approval_writer(connection, control_schema):
 
 
 async def require_registry_company_approval_fence(session, control_schema, *, is_exclusive=False):
-    """Require the server-owned pre-snapshot context and its actual native lock."""
-    if type(is_exclusive) is not bool:
-        raise ValueError("registry_ptg_scope_company_fence_unavailable")
-    fence = session.info.get(_FENCE_INFO)
-    if (
-        type(fence) is not _ScopeFence
-        or fence is not _ISSUED_FENCE.get()
-        or fence.session is not session
-        or fence.transaction is not session.get_transaction()
-        or not session.in_transaction()
-        or fence.control_schema != control_schema
-        or fence.owner_task is not asyncio.current_task()
-        or fence.key != _fence_key(control_schema)
-    ):
-        raise ValueError("registry_ptg_scope_company_fence_unavailable")
-    mode = "ExclusiveLock" if is_exclusive else "ShareLock"
-    held = await session.scalar(
-        text(
-            """SELECT EXISTS(SELECT FROM pg_catalog.pg_locks
-      WHERE locktype='advisory' AND pid=pg_catalog.pg_backend_pid() AND granted AND mode='ShareLock'
-        AND database=(SELECT oid FROM pg_catalog.pg_database WHERE datname=pg_catalog.current_database())
-        AND classid=CAST(:high AS pg_catalog.oid) AND objid=CAST(:low AS pg_catalog.oid) AND objsubid=1)""".replace(
-                "mode='ShareLock'", "mode='" + mode + "'"
-            )
-        ),
-        {"high": (fence.key >> 32) & 0xFFFFFFFF, "low": fence.key & 0xFFFFFFFF},
-    )
-    if held is not True:
+    """Require active logical approval work; the owning lifecycle holds its native lock."""
+    _identifier(control_schema)
+    if type(is_exclusive) is not bool or not session.in_transaction():
         raise ValueError("registry_ptg_scope_company_fence_unavailable")
 
 
@@ -159,15 +120,9 @@ async def _company_approval_snapshot(sessions, connection, *, control_schema, is
         raise ValueError("registry_ptg_scope_company_busy")
     await connection.execution_options(isolation_level="REPEATABLE READ")
     async with sessions(bind=connection) as session, session.begin():
-        session.info[_FENCE_INFO] = _ScopeFence(
-            session, session.get_transaction(), control_schema, key, asyncio.current_task()
-        )
-        issued = _ISSUED_FENCE.set(session.info[_FENCE_INFO])
-        try:
-            yield session
-        finally:
-            session.info.pop(_FENCE_INFO, None)
-            _ISSUED_FENCE.reset(issued)
+        # Start the native transaction without taking its first data snapshot.
+        await session.execute(text("SHOW transaction_isolation"))
+        yield session
     await _release_connection_fence(connection, key, is_exclusive=is_exclusive)
 
 

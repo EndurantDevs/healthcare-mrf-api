@@ -13,9 +13,9 @@ from process.provider_directory_rooted_graph_acquisition import (
     ProviderDirectoryRootedGraphAcquisitionError,
 )
 from process.provider_directory_rooted_graph_acquisition_worker import (
+    _cancel_and_drain,
     _ClaimState,
     _RootRunner,
-    _cancel_and_drain,
     drain_operation,
 )
 from process.provider_directory_rooted_graph_http import (
@@ -35,9 +35,7 @@ from tests.provider_directory_rooted_graph_runtime_test_support import (
 )
 
 
-def _runner(
-    harness: RuntimeHarness, *, dependencies=None, **config_changes
-) -> _RootRunner:
+def _runner(harness: RuntimeHarness, *, dependencies=None, **config_changes) -> _RootRunner:
     return _RootRunner(
         identity(),
         snapshot(),
@@ -67,9 +65,7 @@ async def test_drain_operation_preserves_repeated_cancellation() -> None:
         await allow_completion.wait()
         return "finished"
 
-    task = asyncio.create_task(
-        drain_operation(finish_after_gate(), preserve_cancellation=True)
-    )
+    task = asyncio.create_task(drain_operation(finish_after_gate(), preserve_cancellation=True))
     await started.wait()
     task.cancel()
     await asyncio.sleep(0)
@@ -124,8 +120,9 @@ class _BlockingExitLock:
         return self
 
     async def __aexit__(self, *_args):
-        self.exit_started.set()
-        await self.allow_exit.wait()
+        if not self.exit_started.is_set():
+            self.exit_started.set()
+            await self.allow_exit.wait()
         return False
 
 

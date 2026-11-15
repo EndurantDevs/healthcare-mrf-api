@@ -20,6 +20,7 @@ from process.network_compact_address_carriers import (
 )
 from process.network_custom_office_rows import _insert_custom_rows
 from process.registry_record_store import RegistryRecordCommand, apply_registry_record_command
+from tests.registry_named_preparation_postgres_support import network_publication_lifecycle
 from tests.test_network_compact_custom_offices_postgres import (
     _target,
 )
@@ -77,7 +78,7 @@ async def _registered(fixture, revision=0, *, direct=False):
 @asynccontextmanager
 async def _retained_office(fixture):
     namespace = "carrier_source_" + uuid4().hex
-    source_targets = []
+    source_targets, cleanup_roles = [], []
     try:
         for extension in ("intarray", "btree_gin"):
             await fixture.connection.execute(f"CREATE EXTENSION IF NOT EXISTS {extension}")
@@ -104,18 +105,33 @@ async def _retained_office(fixture):
                 "base": PinnedAddressSource(namespace, "entity_address_unified", "retained-carrier-source"),
             }
         )
-        retained_source = await _published(source_fixture, 1, "provider_directory", source_targets)
-        office_row = await fixture.connection.fetchrow(
-            f'''SELECT provider_system,provider_id,location_id::text,location_key,
-            encode(sha256(convert_to(to_jsonb(address)::text,'UTF8')),'hex') AS address_row_sha256
-            FROM "{retained_source.schema_name}".provider_location_binding JOIN "{retained_source.schema_name}".entity_address_unified address USING(location_key)'''
-        )
-        yield retained_source, dict(office_row)
+        # The freeze revokes its owner from application roles, so the frozen owner is a separate role,
+        # and the publisher reads the frozen retained source as one of the application roles.
+        frozen_owner = "carrier_frozen_" + uuid4().hex
+        await fixture.connection.execute(f'CREATE ROLE "{frozen_owner}" NOLOGIN')
+        cleanup_roles.append(frozen_owner)
+        role_by_field = {
+            "namespace_owner_role": frozen_owner,
+            "publisher_role": fixture.roles["reader"],
+            "application_roles": sorted({fixture.roles["reader"], fixture.publisher_role}),
+        }
+        async with network_publication_lifecycle(source_fixture, role_by_field) as lifecycle:
+            source_fixture.seal_candidate = lifecycle.seal_candidate
+            retained_source = await _published(source_fixture, 1, "provider_directory", source_targets)
+            office_row = await fixture.connection.fetchrow(
+                f'''SELECT provider_system,provider_id,location_id::text,location_key,
+                encode(sha256(convert_to(to_jsonb(address)::text,'UTF8')),'hex') AS address_row_sha256
+                FROM "{retained_source.schema_name}".provider_location_binding JOIN "{retained_source.schema_name}".entity_address_unified address USING(location_key)'''
+            )
+            yield retained_source, dict(office_row)
     finally:
         for copy_target in reversed(source_targets):
             await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{copy_target.schema_name}" CASCADE')
         await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{namespace}" CASCADE')
         assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", namespace) is None
+        for role in cleanup_roles:
+            await fixture.connection.execute(f'DROP OWNED BY "{role}"')
+            await fixture.connection.execute(f'DROP ROLE "{role}"')
 
 
 async def _approve_retained_pair(fixture, seed, retained_source, office):
@@ -187,24 +203,24 @@ async def test_empty_native_carrier_keeps_base_external_and_verifies_receipt(com
     async with fixture.publisher.transaction(isolation="repeatable_read"):
         receipt = await _prepare(fixture, copy_target, approved, _NoBaseCopy(fixture.publisher))
         assert receipt.selected_address_rows == receipt.materialized_address_rows == 0
-        assert receipt.address_table_oid is None and receipt.origin_references == ()
+        assert receipt.address_relation is None and receipt.origin_references == ()
         await _assert_scratch_empty(fixture.publisher)
     async with fixture.publisher.transaction(isolation="repeatable_read"):
         assert (
             await verify_compact_address_carriers(
                 fixture.publisher,
                 receipt,
-                runtime_roles=receipt.runtime_roles,
+                runtime_roles=(fixture.roles["reader"],),
                 control_schema=fixture.control_schema,
             )
             == receipt
         )
         await _assert_scratch_empty(fixture.publisher)
-        with pytest.raises(CompactAddressCarrierError, match="native_receipt_changed"):
+        with pytest.raises(CompactAddressCarrierError, match="receipt_data_changed"):
             await verify_compact_address_carriers(
                 fixture.publisher,
                 replace(receipt, approved_site_sha256="0" * 64),
-                runtime_roles=receipt.runtime_roles,
+                runtime_roles=(fixture.roles["reader"],),
             )
         await _assert_scratch_empty(fixture.publisher)
 
@@ -231,7 +247,7 @@ async def _remove_retained_carrier(fixture, seed, receipt):
             == 1
         )
         assert (
-            await verify_compact_address_carriers(fixture.publisher, receipt, runtime_roles=receipt.runtime_roles)
+            await verify_compact_address_carriers(fixture.publisher, receipt, runtime_roles=(fixture.roles["reader"],))
             == receipt
         )
 
@@ -247,7 +263,8 @@ async def test_selected_retained_office_preserves_direct_manual_and_full_row_pro
         assert receipt.selected_address_rows == receipt.selected_binding_rows == receipt.materialized_address_rows == 1
         assert len(receipt.origin_references) == 1
         assert receipt.origin_references[0][:2] == (retained_source.generation_id, retained_source.manifest_sha256)
-        assert receipt.origin_references[0][6] == 1
+        # Named origin references are (generation, manifest digest, selected rows, rows digest).
+        assert receipt.origin_references[0][2] == 1
         namespace = '"' + copy_target.schema_name + '"'
         assert await fixture.publisher.fetchval(f"SELECT count(*) FROM {namespace}.entity_address_unified") == 2
         assert await fixture.publisher.fetchval(f"SELECT count(*) FROM {namespace}.provider_location_binding") == 2
@@ -257,7 +274,9 @@ async def test_selected_retained_office_preserves_direct_manual_and_full_row_pro
         )
         async with fixture.publisher.transaction(isolation="repeatable_read"):
             assert (
-                await verify_compact_address_carriers(fixture.publisher, receipt, runtime_roles=receipt.runtime_roles)
+                await verify_compact_address_carriers(
+                    fixture.publisher, receipt, runtime_roles=(fixture.roles["reader"],)
+                )
                 == receipt
             )
             await _assert_scratch_empty(fixture.publisher)
@@ -270,7 +289,9 @@ async def test_selected_retained_office_preserves_direct_manual_and_full_row_pro
                 office["location_key"],
             )
             with pytest.raises(CompactAddressCarrierError, match="expected_rows_differ"):
-                await verify_compact_address_carriers(fixture.publisher, receipt, runtime_roles=receipt.runtime_roles)
+                await verify_compact_address_carriers(
+                    fixture.publisher, receipt, runtime_roles=(fixture.roles["reader"],)
+                )
             await _assert_scratch_empty(fixture.publisher)
         finally:
             await transaction.rollback()

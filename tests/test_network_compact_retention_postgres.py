@@ -3,12 +3,14 @@
 
 import asyncio
 import json
-from uuid import UUID
+import os
+from uuid import uuid4
 
+import asyncpg
 import pytest
 
-from process import network_candidate_custody as custody
 from process import network_compact_retention as retention
+from process.network_compact_layout import CompactAddressRelation
 from tests.test_network_address_artifact_postgres import address_db
 from tests.test_network_compact_publication_postgres import (
     _candidate,
@@ -37,7 +39,7 @@ async def _guard(fixture, oids):
 
 @pytest.mark.parametrize("state", ["ready", "published", "ineligible"])
 async def test_sealed_candidates_retain_rollback_dependencies(sealed_compact, state):
-    fixture, target, seal = sealed_compact
+    fixture, target, _ = sealed_compact
     if state != "ready":
         publication = await _publish(fixture, target)
         if state == "ineligible":
@@ -45,182 +47,138 @@ async def test_sealed_candidates_retain_rollback_dependencies(sealed_compact, st
                 f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false WHERE generation_id=$1',
                 publication["generation_id"],
             )
-    source_oid = fixture.address.descriptor["table"]["oid"]
-    edge_oid = seal["receipt"]["closure"]["relation_oids"]["network_office_edge"]
-    for oid in (source_oid, edge_oid, fixture.address.descriptor["authority_table_oid"]):
+    descriptor = fixture.address.descriptor
+    for relation in (
+        CompactAddressRelation(**descriptor["table"]),
+        CompactAddressRelation(**descriptor["retained_table"]),
+        CompactAddressRelation(target.schema_name, "network_office_edge"),
+    ):
         with pytest.raises(retention.NetworkCompactRetentionError, match="artifact_referenced"):
-            await _guard(fixture, [oid])
-    unrelated = await fixture.connection.fetchval("SELECT 'pg_catalog.pg_class'::regclass::oid::bigint")
-    assert await _guard(fixture, [unrelated]) is None
+            await _guard(fixture, [relation])
+    assert (await _guard(fixture, [CompactAddressRelation("pg_catalog", "pg_class")]))["relations"] == [
+        ("pg_catalog", "pg_class")
+    ]
 
 
-async def _alter_candidate_metadata(fixture, copy_target, damage, original):
-    connection = fixture.connection
-    namespace = '"' + fixture.control_schema + '"'
-    if damage in {"erased_descriptor", "erased_component"}:
-        report = json.loads(original["report"])
-        if damage == "erased_descriptor":
-            report["serving_readiness"].pop("address_artifact")
-        else:
-            report["serving_readiness"]["component"] = "legacy"
-        await connection.execute(
-            f"UPDATE {namespace}.network_membership_candidate SET validation_json=$2::jsonb WHERE candidate_id=$1",
-            UUID(copy_target.candidate_id),
-            json.dumps(report),
-        )
-    elif damage == "seal_digest":
-        await connection.execute(
-            f"UPDATE {namespace}.network_candidate_custody SET seal_sha256=$2 WHERE candidate_id=$1",
-            UUID(copy_target.candidate_id),
-            "0" * 64,
-        )
-    elif damage == "ledger_owner":
-        await connection.execute(
-            f'ALTER TABLE {namespace}.network_candidate_custody OWNER TO "{fixture.address.roles["outsider"]}"'
-        )
-    elif damage == "missing_ready_seal":
-        await connection.execute(
-            f"DELETE FROM {namespace}.network_candidate_custody WHERE candidate_id=$1", UUID(copy_target.candidate_id)
-        )
-    else:
-        await connection.execute(
-            f"UPDATE {namespace}.network_membership_candidate SET state='rejected' WHERE candidate_id=$1",
-            UUID(copy_target.candidate_id),
-        )
-
-
-@pytest.mark.parametrize(
-    "damage",
-    ["erased_descriptor", "erased_component", "seal_digest", "ledger_owner", "missing_ready_seal", "demoted_state"],
-)
-async def test_mutable_metadata_cannot_erase_a_sealed_pin(sealed_compact, damage):
+async def test_second_check_sees_a_concurrently_committed_reference_change(sealed_compact):
     fixture, copy_target, _ = sealed_compact
-    connection = fixture.connection
-    namespace = '"' + fixture.control_schema + '"'
-    original = await connection.fetchrow(
-        f"SELECT state,validation_json::text AS report FROM {namespace}.network_membership_candidate WHERE candidate_id=$1",
-        UUID(copy_target.candidate_id),
+    retired = CompactAddressRelation(fixture.address.schema, "retired_offices")
+    table = f'"{retired.schema_name}"."{retired.table_name}"'
+    await fixture.connection.execute(f"CREATE TABLE {table}(location_key text)")
+    cleanup_connection = await asyncpg.connect(
+        os.environ["NETWORK_REGISTRY_TEST_DSN"].replace("postgresql+asyncpg://", "postgresql://")
     )
-    stored = await connection.fetchrow(
-        f"SELECT * FROM {namespace}.network_candidate_custody WHERE candidate_id=$1", UUID(copy_target.candidate_id)
-    )
-    owner = await connection.fetchval(
-        "SELECT quote_ident(r.rolname) FROM pg_class c JOIN pg_roles r ON r.oid=c.relowner WHERE c.oid=to_regclass($1)",
-        namespace + ".network_candidate_custody",
-    )
-    try:
-        await _alter_candidate_metadata(fixture, copy_target, damage, original)
-        with pytest.raises((retention.NetworkCompactRetentionError, custody.NetworkCandidateCustodyError)):
-            await _guard(fixture, [fixture.address.descriptor["table"]["oid"]])
-    finally:
-        await connection.execute(f"ALTER TABLE {namespace}.network_candidate_custody OWNER TO {owner}")
-        await connection.execute(
-            f"UPDATE {namespace}.network_membership_candidate SET state=$2,validation_json=$3::jsonb WHERE candidate_id=$1",
-            UUID(copy_target.candidate_id),
-            original["state"],
-            original["report"],
-        )
-        await connection.execute(
-            f"INSERT INTO {namespace}.network_candidate_custody(candidate_id,seal_sha256,receipt_json,created_at) VALUES($1,$2,$3::jsonb,$4) ON CONFLICT(candidate_id) DO UPDATE SET seal_sha256=excluded.seal_sha256,receipt_json=excluded.receipt_json",
-            stored["candidate_id"],
-            stored["seal_sha256"],
-            stored["receipt_json"],
-            stored["created_at"],
-        )
-
-
-async def test_missing_published_seal_is_not_retirement(sealed_compact):
-    fixture, target, _ = sealed_compact
-    await _publish(fixture, target)
-    namespace = '"' + fixture.control_schema + '"'
-    row = await fixture.connection.fetchrow(
-        f"SELECT * FROM {namespace}.network_candidate_custody WHERE candidate_id=$1", UUID(target.candidate_id)
-    )
-    try:
-        await fixture.connection.execute(
-            f"DELETE FROM {namespace}.network_candidate_custody WHERE candidate_id=$1", UUID(target.candidate_id)
-        )
-        with pytest.raises(retention.NetworkCompactRetentionError, match="published_seal_missing"):
-            await _guard(fixture, [fixture.address.descriptor["table"]["oid"]])
-    finally:
-        await fixture.connection.execute(
-            f"INSERT INTO {namespace}.network_candidate_custody(candidate_id,seal_sha256,receipt_json,created_at) VALUES($1,$2,$3::jsonb,$4)",
-            row["candidate_id"],
-            row["seal_sha256"],
-            row["receipt_json"],
-            row["created_at"],
-        )
-
-
-async def test_retained_name_cannot_release_a_physical_pin(sealed_compact):
-    fixture, _, _ = sealed_compact
-    oid = fixture.address.descriptor["table"]["oid"]
-    retained = f"entity_address_unified_retained_{oid:x}"
-    await fixture.connection.execute(
-        f'ALTER TABLE "{fixture.address.schema}".entity_address_unified RENAME TO "{retained}"'
-    )
-    assert (
-        await fixture.connection.fetchval(
-            "SELECT to_regclass($1)::oid::bigint", f'"{fixture.address.schema}"."{retained}"'
-        )
-        == oid
-    )
-    with pytest.raises(retention.NetworkCompactRetentionError, match="artifact_referenced"):
-        await _guard(fixture, [oid])
-
-
-async def test_second_check_sees_a_concurrently_committed_seal(compact_publication_db):
-    fixture = compact_publication_db
-    copy_target = await _candidate(fixture, (42, 88), 0)
-    await _prepare(fixture, copy_target)
-    oid = fixture.address.descriptor["table"]["oid"]
     first_check, committed = asyncio.Event(), asyncio.Event()
 
     async def cleanup():
-        async with fixture.connection.transaction(isolation="read_committed"):
-            await retention.require_network_compact_artifacts_unreferenced(
-                fixture.connection, [oid], control_schema=fixture.control_schema
+        async with cleanup_connection.transaction(isolation="read_committed"):
+            expected = await retention.require_network_compact_artifacts_unreferenced(
+                cleanup_connection, [retired], control_schema=fixture.control_schema
             )
             first_check.set()
             await committed.wait()
-            await fixture.connection.execute(
-                f'LOCK TABLE ONLY "{fixture.address.schema}".entity_address_unified IN ACCESS EXCLUSIVE MODE NOWAIT'
-            )
+            await cleanup_connection.execute(f"LOCK TABLE ONLY {table} IN ACCESS EXCLUSIVE MODE NOWAIT")
             await retention.require_network_compact_artifacts_unreferenced(
-                fixture.connection, [oid], control_schema=fixture.control_schema
+                cleanup_connection, [retired], control_schema=fixture.control_schema, expected_projection=expected
             )
-            await fixture.connection.execute(f'DROP TABLE "{fixture.address.schema}".entity_address_unified RESTRICT')
+            await cleanup_connection.execute(f"DROP TABLE {table} RESTRICT")
 
     operation = asyncio.create_task(cleanup())
     try:
         await asyncio.wait_for(first_check.wait(), 10)
-        await _seal(fixture, copy_target)
+        await _publish(fixture, copy_target)
     finally:
         committed.set()
-    with pytest.raises(retention.NetworkCompactRetentionError, match="artifact_referenced"):
-        await operation
-    assert (
-        await fixture.connection.fetchval(
-            "SELECT to_regclass($1)::oid::bigint", f'"{fixture.address.schema}".entity_address_unified'
-        )
-        == oid
-    )
+    try:
+        with pytest.raises(retention.NetworkCompactRetentionError, match="references_changed"):
+            await operation
+    finally:
+        await cleanup_connection.close()
+    assert await fixture.connection.fetchval("SELECT to_regclass($1) IS NOT NULL", table)
 
 
 async def test_repeatable_read_cannot_hide_a_new_seal(compact_publication_db):
     fixture = compact_publication_db
+    relation = CompactAddressRelation(fixture.address.schema, "entity_address_unified")
     async with fixture.connection.transaction(isolation="repeatable_read"):
         with pytest.raises(retention.NetworkCompactRetentionError, match="fresh_snapshot_required"):
             await retention.require_network_compact_artifacts_unreferenced(
-                fixture.connection, [fixture.address.descriptor["table"]["oid"]], control_schema=fixture.control_schema
+                fixture.connection, [relation], control_schema=fixture.control_schema
             )
 
 
 async def test_legacy_cleanup_without_registry_stays_available(address_db):
+    relation = CompactAddressRelation(address_db.schema, "entity_address_unified")
+    # Without registry controls, a standalone cleanup needs no fresh snapshot.
     async with address_db.admin.transaction(isolation="repeatable_read"):
-        assert (
-            await retention.require_network_compact_artifacts_unreferenced(
-                address_db.admin, [address_db.descriptor["table"]["oid"]], control_schema="absent_registry"
+        assert await retention.require_network_compact_artifacts_unreferenced(
+            address_db.admin, [relation], control_schema="absent_registry"
+        ) == {
+            "schema": "absent_registry",
+            "relations": [(address_db.schema, "entity_address_unified")],
+            "projection": None,
+        }
+
+
+async def _open_candidate_controls(connection, control, address_source):
+    """Install the three logical controls with one open candidate admitted before validation."""
+    await connection.execute(f'CREATE SCHEMA "{control}"')
+    await connection.execute(f"""CREATE TABLE "{control}".network_membership_candidate(
+        dataset_id uuid,schema_id uuid,producer_id uuid,candidate_id uuid PRIMARY KEY,schema_name text,state text,
+        source_generations jsonb,source_recipes_json jsonb,validation_json jsonb,schema_revision integer,
+        approved_custom_revision bigint,expected_head bigint,expected_rows bigint,accepted_rows bigint,index_ready boolean)""")
+    await connection.execute(
+        f'CREATE TABLE "{control}".network_serving_manifest(generation_id bigint,candidate_id uuid,'
+        "manifest_sha256 text,eligible boolean)"
+    )
+    await connection.execute(
+        f'CREATE TABLE "{control}".network_serving_control(id integer,generation_id bigint,metadata_generation bigint)'
+    )
+    await connection.execute(f'INSERT INTO "{control}".network_serving_control VALUES(1,NULL,0)')
+    candidate_id = uuid4()
+    report = None if address_source is None else {"address_source": address_source}
+    await connection.execute(
+        f'INSERT INTO "{control}".network_membership_candidate VALUES'
+        "($1,$1,$1,$1,$2,'open',$3::jsonb,'[]'::jsonb,$4::jsonb,1,0,0,0,0,false)",
+        candidate_id,
+        "network_candidate_" + candidate_id.hex,
+        json.dumps({"unified_address": "a" * 64}),
+        None if report is None else json.dumps(report),
+    )
+
+
+async def _assert_retirement(connection, control, requested, expected):
+    """Run the guard in a fresh snapshot; ``None`` means the retirement is allowed."""
+    async with connection.transaction(isolation="read_committed"):
+        if expected is None:
+            projection = await retention.require_network_compact_artifacts_unreferenced(
+                connection, [requested], control_schema=control
             )
-            is None
+            assert projection["relations"] == [(requested.schema_name, requested.table_name)]
+            return
+        with pytest.raises(retention.NetworkCompactRetentionError, match=expected):
+            await retention.require_network_compact_artifacts_unreferenced(
+                connection, [requested], control_schema=control
+            )
+
+
+@pytest.mark.parametrize("recorded", [True, False])
+async def test_open_candidate_protects_only_its_admitted_address_generation(recorded):
+    raw = os.environ.get("NETWORK_REGISTRY_TEST_DSN")
+    if not raw:
+        pytest.skip("NETWORK_REGISTRY_TEST_DSN is not set")
+    connection = await asyncpg.connect(raw.replace("postgresql+asyncpg://", "postgresql://"))
+    suffix = uuid4().hex
+    control, own = "retention_control_" + suffix, CompactAddressRelation("address_" + suffix, "entity_address_unified")
+    unrelated = CompactAddressRelation("unrelated_" + suffix, "entity_address_unified")
+    address_by_field = {"schema_name": own.schema_name, "table_name": own.table_name, "generation_id": "a" * 64}
+    try:
+        await _open_candidate_controls(connection, control, address_by_field if recorded else None)
+        # Without a recorded binding the guard cannot tell its generation apart, so it refuses every target.
+        await _assert_retirement(
+            connection, control, own, "artifact_referenced" if recorded else "references_incomplete"
         )
+        await _assert_retirement(connection, control, unrelated, None if recorded else "references_incomplete")
+    finally:
+        await connection.execute(f'DROP SCHEMA IF EXISTS "{control}" CASCADE')
+        await connection.close()

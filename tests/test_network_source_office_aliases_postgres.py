@@ -203,13 +203,13 @@ async def _assert_adopted_alias_copy(context, manifest, receipt):
 async def test_old_sealed_receipt_still_refuses_removal_of_its_native_unique_guard(custom_db):
     fixture = custom_db
     receipt = await _prepare(fixture, (await _seed(fixture)).revision)
-    assert receipt.as_dict()["revision"] == 2 and not receipt.source_aliases
+    assert receipt.as_dict()["revision"] == 7 and not receipt.source_aliases
     transaction = fixture.connection.transaction(isolation="repeatable_read")
     await transaction.start()
     try:
         name = await fixture.connection.fetchval(
-            "SELECT quote_ident(conname) FROM pg_constraint WHERE conrelid=$1::oid AND contype='u'",
-            receipt.binding_table_oid,
+            "SELECT quote_ident(conname) FROM pg_constraint WHERE conrelid=to_regclass($1) AND contype='u'",
+            f'"{receipt.address_source.schema_name}".provider_location_binding',
         )
         await fixture.connection.execute(
             f'ALTER TABLE "{receipt.address_source.schema_name}".provider_location_binding DROP CONSTRAINT {name}'
@@ -254,8 +254,8 @@ async def test_native_layout_refuses_incoherent_aliases_before_sealing(serving_s
                 await _source_alias_layout(connection, namespace, writing=True)
         else:
             assert await _source_alias_layout(connection, namespace, writing=True) is (mode == "aliases")
-            oid = await connection.fetchval("SELECT to_regclass($1)::oid", namespace + ".provider_location_binding")
-            await _binding_shape(connection, oid, source_aliases=mode == "aliases")
+            relation = f'"{namespace}".provider_location_binding'
+            await _binding_shape(connection, relation, source_aliases=mode == "aliases")
     finally:
         await connection.execute(f'DROP SCHEMA "{namespace}" CASCADE')
         assert await connection.fetchval("SELECT to_regnamespace($1)", namespace) is None
@@ -490,7 +490,7 @@ async def test_v5_recipe_preserves_both_aliases_and_one_office(alias_sources_db)
     network_id, revision = await _approve_retained_aliases(context, manifest)
     arguments = _arguments(fixture, revision, owner_role=fixture.writer_roles["owner_role"])
     receipt = await _prepare_alias_artifact(context, arguments)
-    assert receipt.as_dict()["revision"] == 5 and receipt.source_aliases
+    assert receipt.as_dict()["revision"] == 7 and receipt.source_aliases
     assert await _verify_alias_artifact(context, receipt) == receipt
     assert await _prepare_alias_artifact(context, arguments) == receipt
     namespace = '"' + receipt.address_source.schema_name + '"'

@@ -26,10 +26,16 @@ def _migration_functions():
     migration.op = SimpleNamespace(execute=statements.append)
     migration._create_receipt("snapshot_schema")
     migration._create_deferred_guards("snapshot_schema")
+    named_path = path.with_name("20261116090000_profile_capacity_logical_names.py")
+    named_spec = importlib.util.spec_from_file_location("initial_named_migration", named_path)
+    named = importlib.util.module_from_spec(named_spec)
+    named_spec.loader.exec_module(named)
+    named.op = SimpleNamespace(execute=statements.append)
+    named._replace_initial_guards("snapshot_schema")
     function_by_name = {}
     for statement in statements:
         found = re.search(
-            r'CREATE FUNCTION "snapshot_schema"\."(pd_profile_initial_\w+)"\((.*?)\) RETURNS (\w+) '
+            r'CREATE(?: OR REPLACE)? FUNCTION "snapshot_schema"\."(pd_profile_initial_\w+)"\((.*?)\) RETURNS (\w+) '
             r"LANGUAGE (\w+).*?AS \$\$(.*)\$\$",
             statement,
             re.S,

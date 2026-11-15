@@ -32,16 +32,15 @@ from process.provider_directory_profile_selection_contract import (
     ProviderDirectoryProfileExecution,
     ProviderDirectoryProfileSelectionAttestation,
 )
+from tests.provider_directory_profile_capacity_signing_guard_test_support import (
+    capacity_signing_guard,
+)
+from tests.provider_directory_profile_delta_test_support import _delta_database
 from tests.test_provider_directory_profile_capacity import _geometry_payload
 from tests.test_provider_directory_profile_capacity_attestation import (
     _signed_envelope,
     _trust,
 )
-from tests.provider_directory_profile_delta_test_support import _delta_database
-from tests.provider_directory_profile_capacity_signing_guard_test_support import (
-    capacity_signing_guard,
-)
-
 
 importer = importlib.import_module("process.provider_directory_fhir")
 UTC = datetime.timezone.utc
@@ -62,11 +61,9 @@ async def _create_replay_import_run_table(database, schema) -> None:
 
 async def _create_replay_model_tables(database, schema):
     """Create control models and return the three seeded table objects."""
-    checkpoint_table = (
-        ProviderDirectoryProfileBuildCheckpoint.__table__.to_metadata(
-            MetaData(),
-            schema=schema,
-        )
+    checkpoint_table = ProviderDirectoryProfileBuildCheckpoint.__table__.to_metadata(
+        MetaData(),
+        schema=schema,
     )
     await database.create_table(checkpoint_table)
     tables = []
@@ -177,9 +174,7 @@ def _capacity_guard_statements(schema: str) -> tuple[str, ...]:
 
 def _replay_immutable_guard_statements(schema: str) -> tuple[str, ...]:
     """Return all immutable replay-control guard DDL."""
-    return _receipt_guard_statements(schema) + _capacity_guard_statements(
-        schema
-    )
+    return _receipt_guard_statements(schema) + _capacity_guard_statements(schema)
 
 
 async def _create_replay_target_tables(database, schema) -> None:
@@ -209,10 +204,7 @@ async def _create_replay_tables(database, schema):
     return tables
 
 
-def _serving_state_for_identity(
-    evidence_target_oid: int,
-    profile_target_oid: int,
-):
+def _serving_state_for_identity(schema):
     return importer._ProviderDirectoryProfileServingState(
         status="published",
         operation="publish",
@@ -223,18 +215,11 @@ def _serving_state_for_identity(
         profile_schema_version=profile.PROFILE_SCHEMA_VERSION,
         profile_strategy_version=profile.PROFILE_BUILD_STRATEGY_VERSION,
         source_vector=(),
-        source_vector_hash=(
-            importer._provider_directory_profile_source_vector_hash(())
-        ),
+        source_vector_hash=(importer._provider_directory_profile_source_vector_hash(())),
         source_context_vector=(),
-        source_context_vector_hash=(
-            importer._provider_directory_profile_source_context_vector_hash(
-                ()
-            )
-        ),
+        source_context_vector_hash=(importer._provider_directory_profile_source_context_vector_hash(())),
         executable_plan_hash="1" * 64,
-        evidence_target_oid=evidence_target_oid,
-        profile_target_oid=profile_target_oid,
+        targets=importer._provider_directory_profile_target_coordinates(schema),
         evidence_rows=0,
         profile_rows=0,
         profile_as_of="2026-07-30",
@@ -242,91 +227,63 @@ def _serving_state_for_identity(
     )
 
 
-def _capacity_envelope(
-    geometry_hash: str,
-    database_identity,
-    accepted_at: datetime.datetime,
-):
-    """Build a replay lease bound to the disposable database identity."""
+def _capacity_envelope(geometry, execution, accepted_at):
+    """Sign complete current geometry and its real preflight chain for replay."""
+    from process import provider_directory_profile_capacity_preflight_contract as preflight
+    from tests import provider_directory_profile_capacity_signing_guard_test_support as support
+    from tests.provider_directory_profile_capacity_signing_guard_builder import (
+        _capacity_receipt_material,
+        _serving_generation_payload,
+    )
+
     observed_at = accepted_at - datetime.timedelta(seconds=2)
     issued_at = accepted_at - datetime.timedelta(seconds=1)
     deadline = accepted_at + datetime.timedelta(hours=7)
     expires_at = accepted_at + datetime.timedelta(hours=8)
-    tablespace_rows, volume_rows = _capacity_storage_rows(database_identity)
+    control_request, control, healthcare_request, validated, receipt, followup = _capacity_receipt_material(
+        capacity_geometry_hash=None,
+        observed_at=observed_at,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        max_build_deadline=deadline,
+        request_nonce="22" * 32,
+        execution=execution,
+    )
+    guard = support._guard_payload(control_request, control, healthcare_request, validated, receipt, followup)
+    receipt = guard["healthcare_receipt"]
+    geometry_payload = capacity.capacity_geometry_payload(geometry)
+    receipt.update(
+        capacity_geometry=geometry_payload,
+        capacity_geometry_hash=capacity.capacity_geometry_hash(geometry),
+        serving_generation_preflight=_serving_generation_payload(geometry_payload),
+        required_reservation_bytes_by_storage_class=geometry.reservation_bytes_by_storage_class,
+    )
+    receipt["serving_generation_preflight_sha256"] = preflight.preflight_domain_sha256(
+        "healthporta.provider-directory-profile-serving-generation-preflight.v2",
+        receipt["serving_generation_preflight"],
+    )
+    receipt["runtime_observation"]["postgres_server_version_num"] = geometry.postgres_server_version_num
+    receipt["receipt_sha256"] = preflight.preflight_domain_sha256(
+        receipt["contract_id"], {name: field_value for name, field_value in receipt.items() if name != "receipt_sha256"}
+    )
+    guard["healthcare_receipt_sha256"] = receipt["receipt_sha256"]
+    guard_hash = preflight.preflight_domain_sha256(guard["contract_id"], guard)
 
     def mutate(body):
-        signing_guard, signing_guard_sha256, receipt_sha256 = (
-            capacity_signing_guard(
-                capacity_geometry_hash=geometry_hash,
-                observed_at=observed_at,
-                issued_at=issued_at,
-                expires_at=expires_at,
-                max_build_deadline=deadline,
-            )
-        )
         body.update(
-            {
-                "capacity_geometry_hash": geometry_hash,
-                "database_name": database_identity.database_name,
-                "database_oid": database_identity.database_oid,
-                "database_system_identifier": (
-                    database_identity.database_system_identifier
-                ),
-                "observed_at": _utc_text(observed_at),
-                "issued_at": _utc_text(issued_at),
-                "max_build_deadline": _utc_text(deadline),
-                "expires_at": _utc_text(expires_at),
-                "reservation_id": "pd-capacity-replay-postgres",
-                "signing_preflight_guard": signing_guard,
-                "signing_preflight_guard_sha256": signing_guard_sha256,
-                "nonce": receipt_sha256,
-            }
+            capacity_geometry_hash=capacity.capacity_geometry_hash(geometry),
+            observed_at=_utc_text(observed_at),
+            issued_at=_utc_text(issued_at),
+            max_build_deadline=_utc_text(deadline),
+            expires_at=_utc_text(expires_at),
+            reservation_id="pd-capacity-replay-postgres",
+            signing_preflight_guard=guard,
+            signing_preflight_guard_sha256=guard_hash,
+            nonce=receipt["receipt_sha256"],
         )
-        body["tablespaces"] = tablespace_rows
-        body["volumes"] = volume_rows
+        body["runtime"]["postgres_server_version_num"] = geometry.postgres_server_version_num
 
     return _signed_envelope(body_mutator=mutate)
-
-
-def _capacity_storage_rows(database_identity):
-    """Return exact tablespace and volume rows for the replay lease."""
-    data_digest = "31" * 32
-    temp_digest = (
-        data_digest
-        if database_identity.temp_tablespace_oid
-        == database_identity.tablespace_oid
-        else "32" * 32
-    )
-    tablespace_rows = [
-        {
-            "tablespace_name": database_identity.tablespace_name,
-            "tablespace_oid": database_identity.tablespace_oid,
-            "usage": "data",
-            "volume_digest": data_digest,
-        },
-        {
-            "tablespace_name": database_identity.temp_tablespace_name,
-            "tablespace_oid": database_identity.temp_tablespace_oid,
-            "usage": "temp",
-            "volume_digest": temp_digest,
-        },
-    ]
-    volume_rows = [
-        _volume("data", data_digest, 200_000_000_000),
-        _volume("temp", temp_digest, 20_000_000_000),
-        _volume("wal", "33" * 32, 150_000_000_000),
-    ]
-    return tablespace_rows, volume_rows
-
-
-def _volume(volume_class: str, digest: str, reserved_bytes: int):
-    return {
-        "available_after_all_reservations_bytes": 700_000_000_000,
-        "available_bytes": 1_000_000_000_000,
-        "reserved_bytes": reserved_bytes,
-        "volume_class": volume_class,
-        "volume_digest": digest,
-    }
 
 
 def _utc_text(value: datetime.datetime) -> str:

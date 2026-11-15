@@ -3,23 +3,24 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
-from dataclasses import replace
 import importlib
 import json
 import uuid
+from contextlib import asynccontextmanager
+from dataclasses import replace
 
 import pytest
+from sqlalchemy import MetaData
 from sqlalchemy.exc import OperationalError
 
 from db.connection import Database
-from tests.provider_directory_subset_completion_pg_setup import (
-    install_subset_canonical_functions,
-)
+from db.models import AddressAliasArtifactStateV1
 from tests.provider_directory_dataset_artifact_pg_support import (
     insert_validated_shared_dataset as _insert_validated_shared_dataset,
 )
-
+from tests.provider_directory_subset_completion_pg_setup import (
+    install_subset_canonical_functions,
+)
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -27,7 +28,7 @@ importer = importlib.import_module("process.provider_directory_fhir")
 async def _require_disposable_postgres(database: Database) -> None:
     try:
         database_name = str(await database.scalar("SELECT current_database();") or "")
-    except (OSError, OperationalError):
+    except OSError, OperationalError:
         pytest.skip("Provider Directory artifact DB tests require a reachable disposable database")
     if "test" not in database_name.lower():
         pytest.skip("Provider Directory artifact DB tests require a disposable test database")
@@ -49,8 +50,7 @@ def _source_metadata(resources: list[str]) -> str:
 async def _create_artifact_tables(database: Database, schema: str) -> None:
     """Create one disposable schema with the exact resolver columns."""
     await database.status(
-        f"CREATE TABLE {schema}.provider_directory_api_endpoint "
-        "(endpoint_id varchar(64) PRIMARY KEY);"
+        f"CREATE TABLE {schema}.provider_directory_api_endpoint (endpoint_id varchar(64) PRIMARY KEY);"
     )
     await database.status(
         f"CREATE TABLE {schema}.provider_directory_endpoint_dataset ("
@@ -81,8 +81,7 @@ async def _create_artifact_tables(database: Database, schema: str) -> None:
         ");"
     )
     await database.status(
-        f"CREATE TABLE {schema}.provider_directory_cms_npd_stale_candidate "
-        "(dataset_id varchar(96) PRIMARY KEY);"
+        f"CREATE TABLE {schema}.provider_directory_cms_npd_stale_candidate (dataset_id varchar(96) PRIMARY KEY);"
     )
     await database.status(
         f"CREATE TABLE {schema}.provider_directory_dataset_resource ("
@@ -137,7 +136,9 @@ async def _create_artifact_scope_tables(database: Database, schema: str) -> None
     for model in (importer.ProviderDirectorySource, *importer.RESOURCE_MODELS):
         await database.status(
             importer._provider_directory_artifact_scope_table_sql(
-                model, schema, model.__tablename__,
+                model,
+                schema,
+                model.__tablename__,
             )
         )
         for statement in importer._artifact_scope_pk_sql(
@@ -261,6 +262,10 @@ async def _dataset_database(monkeypatch):
         await database.status(f"CREATE SCHEMA {schema};")
         is_schema_created = True
         await _create_artifact_tables(database, schema)
+        async with database.engine.begin() as connection:
+            metadata = MetaData(schema=schema)
+            AddressAliasArtifactStateV1.__table__.to_metadata(metadata, schema=schema)
+            await connection.run_sync(metadata.create_all)
         await _insert_fixture_rows(database, schema)
         monkeypatch.setattr(importer, "db", database)
         yield database, schema
@@ -293,12 +298,53 @@ async def _insert_next_shared_dataset(database: Database, schema: str) -> None:
     )
 
 
+async def _assert_selected_location_scope(database, schema):
+    """Require selected-source location fields and their original evidence in the scope."""
+    scope_table = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()["provider_directory_location"]
+    scope_location_row_list = await database.all(
+        f"SELECT source_id, resource_id, status, name, type_codes, "
+        f"latitude, longitude, telecom, last_seen_run_id, observed_at "
+        f"FROM {schema}.{scope_table} ORDER BY source_id;"
+    )
+    materialized_location_row_list = [
+        dict(scope_location_row._mapping) for scope_location_row in scope_location_row_list
+    ]
+    assert [location_row_by_field["source_id"] for location_row_by_field in materialized_location_row_list] == [
+        "source_primary",
+    ]
+    assert {location_row_by_field["resource_id"] for location_row_by_field in materialized_location_row_list} == {
+        "location-1"
+    }
+    assert {location_row_by_field["status"] for location_row_by_field in materialized_location_row_list} == {"active"}
+    assert {location_row_by_field["name"] for location_row_by_field in materialized_location_row_list} == {
+        "Scope Clinic"
+    }
+    assert {tuple(location_row_by_field["type_codes"]) for location_row_by_field in materialized_location_row_list} == {
+        ("clinic",)
+    }
+    assert {location_row_by_field["latitude"] for location_row_by_field in materialized_location_row_list} == {
+        "30.2672"
+    }
+    assert {location_row_by_field["longitude"] for location_row_by_field in materialized_location_row_list} == {
+        "-97.7431"
+    }
+    assert {location_row_by_field["last_seen_run_id"] for location_row_by_field in materialized_location_row_list} == {
+        "root-shared"
+    }
+    assert all(
+        location_row_by_field["observed_at"] is not None for location_row_by_field in materialized_location_row_list
+    )
+    assert all(
+        location_row_by_field["telecom"][0]["value"] == "555-0100"
+        for location_row_by_field in materialized_location_row_list
+    )
+
+
 @pytest.mark.asyncio
 async def test_real_postgres_dataset_scope_keeps_explicit_sources_and_cleans(monkeypatch):
+    """Keep explicit-source rows coherent and remove temporary scopes after use."""
     async with _dataset_database(monkeypatch) as (database, schema):
-        explicit_fence = await importer._resolve_provider_directory_artifact_datasets(
-            ["source_primary"]
-        )
+        explicit_fence = await importer._resolve_provider_directory_artifact_datasets(["source_primary"])
         all_source_fence = await importer._resolve_provider_directory_artifact_datasets(None)
 
         assert explicit_fence.source_ids == ["source_primary"]
@@ -310,38 +356,11 @@ async def test_real_postgres_dataset_scope_keeps_explicit_sources_and_cleans(mon
             fence=explicit_fence,
             metrics=artifact_scope_metrics_by_name,
         ):
-            scope_table = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()[
-                "provider_directory_location"
+            await _assert_selected_location_scope(database, schema)
+            practitioner_scope_table = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()[
+                "provider_directory_practitioner"
             ]
-            scope_location_row_list = await database.all(
-                f"SELECT source_id, resource_id, status, name, type_codes, "
-                f"latitude, longitude, telecom, last_seen_run_id, observed_at "
-                f"FROM {schema}.{scope_table} ORDER BY source_id;"
-            )
-            materialized_location_row_list = [
-                dict(scope_location_row._mapping)
-                for scope_location_row in scope_location_row_list
-            ]
-            assert [location_row_by_field["source_id"] for location_row_by_field in materialized_location_row_list] == [
-                "source_primary",
-            ]
-            assert {location_row_by_field["resource_id"] for location_row_by_field in materialized_location_row_list} == {"location-1"}
-            assert {location_row_by_field["status"] for location_row_by_field in materialized_location_row_list} == {"active"}
-            assert {location_row_by_field["name"] for location_row_by_field in materialized_location_row_list} == {"Scope Clinic"}
-            assert {tuple(location_row_by_field["type_codes"]) for location_row_by_field in materialized_location_row_list} == {("clinic",)}
-            assert {location_row_by_field["latitude"] for location_row_by_field in materialized_location_row_list} == {"30.2672"}
-            assert {location_row_by_field["longitude"] for location_row_by_field in materialized_location_row_list} == {"-97.7431"}
-            assert {location_row_by_field["last_seen_run_id"] for location_row_by_field in materialized_location_row_list} == {"root-shared"}
-            assert all(location_row_by_field["observed_at"] is not None for location_row_by_field in materialized_location_row_list)
-            assert all(location_row_by_field["telecom"][0]["value"] == "555-0100" for location_row_by_field in materialized_location_row_list)
-            practitioner_scope_table = (
-                importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()[
-                    "provider_directory_practitioner"
-                ]
-            )
-            assert await database.scalar(
-                f"SELECT COUNT(*) FROM {schema}.{practitioner_scope_table};"
-            ) == 0
+            assert await database.scalar(f"SELECT COUNT(*) FROM {schema}.{practitioner_scope_table};") == 0
 
         assert artifact_scope_metrics_by_name["artifact_scope_dataset_count"] == 1
         assert artifact_scope_metrics_by_name["artifact_scope_alias_count"] == 1
@@ -371,11 +390,7 @@ async def test_real_postgres_scope_materializes_a_proven_linked_family(
     monkeypatch,
 ):
     async with _dataset_database(monkeypatch) as (database, schema):
-        selected_fence = (
-            await importer._resolve_provider_directory_artifact_datasets(
-                ["source_primary"]
-            )
-        )
+        selected_fence = await importer._resolve_provider_directory_artifact_datasets(["source_primary"])
         selected_dataset = selected_fence.datasets[0]
         retained_dataset = replace(
             selected_dataset,
@@ -392,19 +407,13 @@ async def test_real_postgres_scope_materializes_a_proven_linked_family(
             fence=retained_fence,
             metrics={},
         ):
-            practitioner_scope_table = (
-                importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()[
-                    "provider_directory_practitioner"
-                ]
-            )
+            practitioner_scope_table = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()[
+                "provider_directory_practitioner"
+            ]
             practitioner_rows = await database.all(
-                f"SELECT source_id, resource_id, full_name "
-                f"FROM {schema}.{practitioner_scope_table};"
+                f"SELECT source_id, resource_id, full_name FROM {schema}.{practitioner_scope_table};"
             )
-            assert [
-                dict(practitioner_row._mapping)
-                for practitioner_row in practitioner_rows
-            ] == [
+            assert [dict(practitioner_row._mapping) for practitioner_row in practitioner_rows] == [
                 {
                     "source_id": "source_primary",
                     "resource_id": "linked-practitioner-1",
@@ -452,9 +461,7 @@ async def test_real_postgres_dataset_fence_rejects_alias_repoint_and_current_cha
 @pytest.mark.asyncio
 async def test_real_postgres_dataset_fence_reads_live_alias_during_artifact_scope(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
-        fence = await importer._resolve_provider_directory_artifact_datasets(
-            ["source_primary"]
-        )
+        fence = await importer._resolve_provider_directory_artifact_datasets(["source_primary"])
 
         async with importer._provider_directory_artifact_dataset_scope(
             run_id="artifact-run",
@@ -476,9 +483,7 @@ async def test_real_postgres_dataset_fence_reads_live_alias_during_artifact_scop
 @pytest.mark.asyncio
 async def test_real_postgres_explicit_dataset_fence_ignores_unselected_alias_join(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
-        fence = await importer._resolve_provider_directory_artifact_datasets(
-            ["source_primary"]
-        )
+        fence = await importer._resolve_provider_directory_artifact_datasets(["source_primary"])
         await database.status(
             f"UPDATE {schema}.provider_directory_source "
             "SET endpoint_id = 'endpoint_shared' "

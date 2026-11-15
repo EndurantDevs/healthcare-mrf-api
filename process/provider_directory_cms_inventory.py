@@ -1,6 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
-"""Capture the complete native physical inventory under its caller-owned guard."""
+"""Capture the complete native named storage inventory under its caller-owned guard."""
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def inventory_transition(admission):
-    """Serialize short physical inventory transitions with their exact catalog checks."""
+    """Serialize short named storage inventory transitions with their numeric catalog checks."""
     task = asyncio.current_task()
     if admission._inventory_task is task:
         yield
@@ -21,13 +21,11 @@ async def inventory_transition(admission):
             admission._inventory_task = None
 
 
-def record_external_identity(admission, schema, name, oid):
-    """Retain a captured identity even when DDL commit acknowledgement is uncertain."""
-    if admission._inventory_task is not asyncio.current_task() or type(oid) is not int or oid <= 0:
+def record_external_identity(admission, schema, name):
+    """Retain a created name even when DDL commit acknowledgement is uncertain."""
+    if admission._inventory_task is not asyncio.current_task():
         raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
-    if admission._relations.get((schema, name), oid) != oid:
-        raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
-    admission._relations[(schema, name)] = oid
+    admission._relations.add((schema, name))
     admission._external_relations.add((schema, name))
 
 
@@ -38,15 +36,11 @@ async def measure_inventory(admission, fhir, schema, names, *, observers=None):
     if not admission._started:
         raise RuntimeError("provider_directory_nonprofile_admission_not_started")
     for name in names:
-        admission._relations.setdefault((schema, name), 0)
-    inventory = sorted(admission._relations.items())
+        admission._relations.add((schema, name))
+    inventory = sorted(admission._relations)
     group_by_executor_id = {}
-    for (relation_schema, name), previous_oid in inventory:
-        database = (
-            None
-            if observers is None
-            else observers.database_for(OwnedRelation(relation_schema, name, previous_oid, 0, "p"))
-        )
+    for relation_schema, name in inventory:
+        database = None if observers is None else observers.database_for(OwnedRelation(relation_schema, name, 0, "p"))
         database = fhir.db if database is None else database
         group_by_executor_id.setdefault(id(database), (database, []))[1].append((relation_schema, name))
     measured_by_coordinate = {}
@@ -55,7 +49,7 @@ async def measure_inventory(admission, fhir, schema, names, *, observers=None):
         if len(coordinate_by_ref) != len(coordinates):
             raise RuntimeError("provider_directory_nonprofile_relation_changed")
         catalog_records = await database.all(
-            "SELECT requested.relation_ref, relation.oid::bigint AS oid, "
+            "SELECT requested.relation_ref, "
             "pg_total_relation_size(relation.oid)::bigint AS total_bytes, "
             "relation.relpersistence::text AS persistence "
             "FROM unnest(CAST(:relation_refs AS text[])) AS requested(relation_ref) "
@@ -73,15 +67,12 @@ async def measure_inventory(admission, fhir, schema, names, *, observers=None):
         if observed_refs != coordinate_by_ref.keys():
             raise RuntimeError("provider_directory_nonprofile_relation_changed")
     measured_relations = []
-    for (relation_schema, name), previous_oid in inventory:
+    for relation_schema, name in inventory:
         relation_values = measured_by_coordinate[(relation_schema, name)]
-        oid, total_bytes = relation_values.get("oid"), relation_values.get("total_bytes")
-        if type(oid) is not int or oid <= 0 or (previous_oid and previous_oid != oid):
-            raise RuntimeError("provider_directory_nonprofile_relation_changed")
+        total_bytes = relation_values.get("total_bytes")
         if type(total_bytes) is not int or total_bytes < 0 or relation_values.get("persistence") not in {"u", "p"}:
             raise RuntimeError("provider_directory_nonprofile_relation_storage_invalid")
-        admission._relations[(relation_schema, name)] = oid
-        measured = OwnedRelation(relation_schema, name, oid, total_bytes, relation_values["persistence"])
+        measured = OwnedRelation(relation_schema, name, total_bytes, relation_values["persistence"])
         if observers is not None:
             observers.record(measured)
         measured_relations.append(measured)

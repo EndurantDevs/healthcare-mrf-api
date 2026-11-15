@@ -63,22 +63,20 @@ def _sequence(owner):
 
 @pytest.mark.parametrize("read_only", (False, True))
 async def test_catalog_seal_binds_all_heaps_sequence_and_schema(monkeypatch, read_only):
+    """Pin the complete declared family without deriving identity fingerprints."""
     owner, proof = _inventory()
-    rows = [_heap(oid) for _name, oid in owner.relation_oids]
+    original = preparation._digest(proof)
     session = _session()
-    session.scalar.side_effect = [True, False, False]
-    session.execute.return_value.mappings.return_value.all.side_effect = [rows, [_sequence(owner)]]
-    lock = AsyncMock()
+    lock, verify = AsyncMock(), AsyncMock(return_value=owner)
     monkeypatch.setattr(preparation.destination.restore, "_lock_owned_restore_relations", lock)
-    monkeypatch.setattr(preparation.destination, "verify_entity_address_archive_stage_ownership", AsyncMock())
-    shape_by_field = {"shapes": [[name, oid, {"columns": ["synthetic"]}] for name, oid in owner.relation_oids]}
-    monkeypatch.setattr(preparation, "_candidate_schema_identity", AsyncMock(return_value=shape_by_field))
-    seal = await preparation._protected_catalog(session, proof, owner, read_only=read_only)
-    assert seal == preparation._digest(
-        {"relations": rows, "sequence": proof["inventory"]["sequences"][0], "schema": shape_by_field}
-    )
+    monkeypatch.setattr(preparation.destination, "verify_entity_address_archive_stage_ownership", verify)
+    observed = await preparation._protected_catalog(session, proof, owner, read_only=read_only)
+    assert observed == preparation._logical_inventory(proof["inventory"], owner)
+    assert not any("oid" in str(key) for key in observed)
+    assert preparation._digest(proof) == original
     lock.assert_awaited_once_with(session, owner, read_only=read_only)
-    assert session.scalar.await_args_list[-1].args[1]["relation_oids"] == [201]
+    verify.assert_awaited_once_with(session, owner=owner)
+    session.scalar.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -95,22 +93,19 @@ async def test_catalog_seal_binds_all_heaps_sequence_and_schema(monkeypatch, rea
     ],
 )
 async def test_candidate_catalog_drift_refuses_sequence_read(monkeypatch, field, value):
+    """Propagate native named-layout refusal before any publication or metadata mutation."""
     owner, proof = _inventory()
-    rows = [_heap(oid) for _name, oid in owner.relation_oids]
-    if field == "missing":
-        rows.pop()
-    else:
-        rows[0][field] = value
     session = _session()
-    session.scalar.return_value = True
-    session.execute.return_value.mappings.return_value.all.return_value = rows
-    monkeypatch.setattr(preparation.destination.restore, "_lock_owned_restore_relations", AsyncMock())
-    monkeypatch.setattr(preparation.destination, "verify_entity_address_archive_stage_ownership", AsyncMock())
-    sequence = AsyncMock()
-    monkeypatch.setattr(preparation, "_protected_sequence", sequence)
-    with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="candidate catalog differs"):
+    lock = AsyncMock()
+    refusal = preparation.destination.EntityAddressArchiveOwnershipError("candidate layout differs")
+    verify = AsyncMock(side_effect=refusal)
+    monkeypatch.setattr(preparation.destination.restore, "_lock_owned_restore_relations", lock)
+    monkeypatch.setattr(preparation.destination, "verify_entity_address_archive_stage_ownership", verify)
+    with pytest.raises(type(refusal), match="layout differs"):
         await preparation._protected_catalog(session, proof, owner)
-    sequence.assert_not_awaited()
+    lock.assert_awaited_once_with(session, owner, read_only=False)
+    verify.assert_awaited_once_with(session, owner=owner)
+    session.scalar.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -126,79 +121,79 @@ async def test_candidate_catalog_drift_refuses_sequence_read(monkeypatch, field,
     ],
 )
 async def test_sequence_requires_exact_ownership_and_inventory(field, value):
+    """Check the declared sequence purpose; old sequence tokens remain raw compatibility data."""
     owner, proof = _inventory()
-    row = _sequence(owner)
-    row[field] = value
-    session = _session()
-    session.execute.return_value.mappings.return_value.all.return_value = [] if field == "missing" else [row]
-    with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="sequence differs"):
-        await preparation._protected_sequence(session, proof, owner)
-    session.scalar.assert_not_awaited()
+    sequence_by_field = proof["inventory"]["sequences"][0]
+    original = preparation._digest(proof)
+    if field in {"relname", "attname", "missing"}:
+        if field == "missing":
+            proof["inventory"]["sequences"] = []
+        else:
+            sequence_by_field["sequence_name" if field == "relname" else "owner_column"] = value
+        with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="sequence differs"):
+            preparation._logical_inventory(proof["inventory"], owner)
+    else:
+        sequence_by_field[field] = value
+        logical = preparation._logical_inventory(proof["inventory"], owner)
+        assert logical["sequences"] == [
+            {
+                "sequence_name": preparation._EVIDENCE_SEQUENCE,
+                "owner_table": "entity_address_evidence",
+                "owner_column": "evidence_id",
+            }
+        ]
+        assert sequence_by_field[field] == value
+    assert original
 
 
 async def test_schema_seal_preserves_settings_and_index_identities(monkeypatch):
-    owner, _proof = _inventory()
-    session = _session()
-    indexes = [{"oid": 301, "indrelid": 100, "relname": "synthetic_idx", "filenode": 302}]
-    session.execute.return_value.mappings.return_value.all.return_value = indexes
-    receipt = preparation.destination.restore.importlib.import_module("process.entity_address_snapshot_receipt")
-    normalize, schema = AsyncMock(), AsyncMock(return_value={"columns": ["synthetic"]})
-    monkeypatch.setattr(receipt, "_normalize_receipt_session", normalize)
-    monkeypatch.setattr(receipt, "_schema_identity", schema)
-    monkeypatch.setattr(preparation.destination.db, "bind_existing_session", _bound)
-    monkeypatch.setattr(preparation.destination, "_preserve_receipt_settings", lambda: _bound(session))
-    identity = await preparation._candidate_schema_identity(session, owner)
-    normalize.assert_awaited_once_with(session, owner.schema_name)
-    assert identity["indexes"] == indexes
-    assert [(name, oid) for name, oid, _shape in identity["shapes"]] == list(owner.relation_oids)
-    assert [call.args for call in schema.await_args_list] == [
-        (session, oid, owner.schema_name, name) for name, oid in owner.relation_oids
-    ]
+    """Preserve legacy bytes while equal named inventory survives opaque token drift."""
+    from copy import deepcopy
+
+    owner, proof = _inventory()
+    saved = deepcopy(proof)
+    expected = preparation._logical_inventory(proof["inventory"], owner)
+    proof["inventory"]["schema_oid"] = None
+    for relation in proof["inventory"]["relations"]:
+        relation["relation_oid"] = True
+    proof["inventory"]["sequences"][0]["sequence_oid"] = "opaque"
+    proof["inventory_sha256"] = preparation._digest(proof["inventory"])
+    assert preparation._require_proof_inventory(proof, owner) == expected
+    assert saved["inventory"]["schema_oid"] == owner.schema_oid
+    assert proof["inventory"]["schema_oid"] is None
 
 
 @pytest.mark.parametrize("damage", [None, "missing", "unsafe", "partition", "temporary", "view"])
 async def test_publication_state_drains_writers_and_refuses_hooks(damage):
-    rows = [_heap(401), _heap(402)]
+    """Drain writers and require the complete finite state family with native heap layout."""
+    names = ("entity_address_geo_assurance_state", "entity_address_result_generation")
+    records = [{"name": name, "supported": True} for name in names]
     if damage == "missing":
-        rows.pop()
+        records.pop()
     elif damage is not None:
-        field, value = {
-            "unsafe": ("unsafe", True),
-            "partition": ("relispartition", True),
-            "temporary": ("relpersistence", "t"),
-            "view": ("relkind", "v"),
-        }[damage]
-        rows[0][field] = value
+        records[0]["supported"] = False
     session = _session()
-    session.scalar.return_value = None
-    session.execute.return_value.mappings.return_value.all.return_value = rows
+    session.scalar.return_value = False
+    session.execute.return_value.mappings.return_value.all.return_value = records
     if damage is None:
-        await preparation._lock_publication_state(session, "example", 31)
+        await preparation._lock_publication_state(session, "example")
     else:
-        with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="publication state catalog"):
-            await preparation._lock_publication_state(session, "example", 31)
+        with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="state layout"):
+            await preparation._lock_publication_state(session, "example")
     assert str(session.execute.await_args_list[0].args[0]).endswith("IN SHARE ROW EXCLUSIVE MODE NOWAIT")
+    assert not any(
+        "relowner" in str(call.args[0]) or "pg_has_role" in str(call.args[0])
+        for call in session.execute.await_args_list
+    )
 
 
 @pytest.mark.parametrize("builder", [None, {"name": '"builder"', "safe": False}, {"name": '"builder"', "safe": True}])
 async def test_builder_handback_requires_safe_role_before_any_ddl(monkeypatch, builder):
+    """Drop only the emptied owned namespace, without reassigning roles from old metadata."""
     owner, proof = _inventory()
-    names_by_table = {name: name + "_candidate" for name, _oid in owner.relation_oids}
     session = _session(builder)
     drop = AsyncMock()
     monkeypatch.setattr(preparation.destination.restore, "_drop_empty_owned_schema", drop)
-    if builder is None or not builder["safe"]:
-        with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="builder authority changed"):
-            await preparation._restore_builder_owner(session, proof, owner, "example", names_by_table)
-        assert session.execute.await_count == 1
-        drop.assert_not_awaited()
-    else:
-        await preparation._restore_builder_owner(session, proof, owner, "example", names_by_table)
-        statements = [str(call.args[0]) for call in session.execute.await_args_list[1:]]
-        assert sum("ALTER TABLE" in statement for statement in statements) == 7
-        assert sum("ALTER SEQUENCE" in statement for statement in statements) == 1
-        assert statements == [
-            *(f'ALTER TABLE "example"."{name}_candidate" OWNER TO "builder"' for name, _oid in owner.relation_oids),
-            'ALTER SEQUENCE "example"."entity_address_evidence_candidate_evidence_id_seq" OWNER TO "builder"',
-        ]
-        drop.assert_awaited_once_with(session, owner)
+    await preparation._restore_builder_owner(session, proof, owner, "example", {})
+    drop.assert_awaited_once_with(session, owner)
+    session.execute.assert_not_awaited()

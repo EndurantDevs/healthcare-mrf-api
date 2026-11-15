@@ -68,6 +68,9 @@ async def _install_archive_schema(database, schema):
         await connection.run_sync(lambda sync: foundation._exec_sql_batch(sync, foundation._create_archive_sql(schema)))
         await connection.run_sync(lambda sync: _apply(sync, "20260930120000"))
         await connection.run_sync(lambda sync: _apply(sync, "20260930130000"))
+        from tests.cms_named_revision_postgres_support import upgrade_named_native_counter
+
+        await upgrade_named_native_counter(connection, schema)
     formatter = _load_migration()
     await database.status(formatter._humanize_component_function_sql(schema))
     await database.status(formatter._formatted_address_function_sql(schema))
@@ -122,9 +125,7 @@ async def _seed_archive(database, schema):
         )
     async with database.transaction() as session:
         for name in ("address_archive_v2", "address_alias_v1", "openaddresses_geocode"):
-            await native_inputs._register_relation(
-                session, schema, schema, name, await archive._oid(fhir.db, schema, name)
-            )
+            await native_inputs._register_relation(session, schema, schema, name)
 
 
 async def _typed_sources(database, schema):
@@ -156,24 +157,14 @@ async def _fixture(monkeypatch):
         await _seed_archive(database, schema)
         fence = await _typed_sources(database, schema)
         async with source_input_custody(database, schema, monkeypatch) as component:
-            archive_oid = await archive._oid(database, schema, "address_archive_v2")
             await database.status(f'ALTER TABLE {schema}.address_archive_v2 OWNER TO "{component.owner}"')
-            assert (
-                await database.scalar(
-                    "SELECT oid=:oid AND relowner=CAST(:owner AS regrole) FROM pg_class WHERE oid=to_regclass(:name)",
-                    oid=archive_oid,
-                    owner=component.owner,
-                    name=f"{schema}.address_archive_v2",
-                )
-                is True
-            )
             monkeypatch.setattr(fhir, "db", component.database)
             monkeypatch.setattr(address_canon, "db", component.database)
             admission = _admission()
             admission.plan = replace(
                 admission.plan,
                 reservation_bytes=(("data", 10_000_000), ("temp", 10_000_000), ("wal", 10_000_000)),
-                temp_file_limit_bytes_per_backend=10_000_000 // 1024 * 1024,
+                temp_file_limit_bytes_per_backend=10_000_000 // admission.plan.worker_count // 1024 * 1024,
             )
             admission.lease = _signed_lease(admission.plan)
             admission._started = True
@@ -212,30 +203,12 @@ async def _baseline(database, schema, fence):
     """Run unchanged resolver and OA behavior against a complete incumbent copy."""
     component = database._input_component
     async with source_policy.source_transaction(database):
-        assert (
-            await database.scalar(
-                "SELECT current_user=:owner AND session_user=:publisher",
-                owner=component.owner,
-                publisher=component.publisher,
-            )
-            is True
-        )
         await database.status(f"CREATE TABLE {schema}.baseline (LIKE {schema}.address_archive_v2 INCLUDING DEFAULTS)")
         await database.status(f"INSERT INTO {schema}.baseline SELECT * FROM {schema}.address_archive_v2")
         await database.status(f"ALTER TABLE {schema}.baseline ADD PRIMARY KEY (address_key)")
         await database.status(
             fhir.provider_directory_location_archive_stage_sql(schema, "baseline_input", source_ids=fence.source_ids),
             source_ids=list(fence.source_ids),
-        )
-        assert (
-            await database.scalar(
-                "SELECT count(*)=2 AND bool_and(c.relowner=(SELECT oid FROM pg_roles WHERE rolname=:owner)) "
-                "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-                "WHERE n.nspname=:schema AND c.relname IN ('baseline','baseline_input')",
-                owner=component.owner,
-                schema=schema,
-            )
-            is True
         )
         stats = await _resolve(
             database,
@@ -260,7 +233,7 @@ async def test_seeded_delta_matches_full_archive_and_physical_overlay(monkeypatc
         prepared, metrics = await _prepare(schema, fence)
         try:
             assert await _rows(database, schema, "address_archive_v2") == before
-            assert await archive._revision(fhir.db, schema, prepared.target_oid) == prepared.from_revision
+            assert await archive._revision(fhir.db, schema) == prepared.from_revision
             assert await _rows(database, schema, prepared.effective_relation) == await _rows(
                 database, schema, "baseline"
             )
@@ -300,7 +273,7 @@ async def test_seeded_delta_matches_full_archive_and_physical_overlay(monkeypatc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("empty", [False, True])
-async def test_common_merge_preserves_oid_and_rolls_back_as_one_transaction(monkeypatch, empty):
+async def test_common_named_merge_rolls_back_as_one_transaction(monkeypatch, empty):
     async with _fixture(monkeypatch) as (database, schema, fence, admission, _checks):
         if empty:
             await database.status(f"DELETE FROM {schema}.provider_directory_location")
@@ -308,9 +281,18 @@ async def test_common_merge_preserves_oid_and_rolls_back_as_one_transaction(monk
         prepared, _metrics = await _prepare(schema, fence)
         before = await _rows(database, schema, "address_archive_v2")
         try:
-            with pytest.raises(RuntimeError, match="write_lock_required"):
+            with pytest.raises(RuntimeError, match="synthetic rollback"):
                 async with database.transaction() as session:
                     await prepared.apply(fhir, session)
+                    # Apply takes its own archive write intent before reading the prepared rows.
+                    assert await session.scalar(
+                        text(
+                            "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() AND granted "
+                            "AND relation=to_regclass(:name) AND mode='ShareRowExclusiveLock')"
+                        ),
+                        {"name": f"{schema}.address_archive_v2"},
+                    )
+                    raise RuntimeError("synthetic rollback")
             with pytest.raises(RuntimeError, match="synthetic rollback"):
                 async with database.transaction() as session:
                     await prepared.before_lock(fhir, session)
@@ -318,11 +300,11 @@ async def test_common_merge_preserves_oid_and_rolls_back_as_one_transaction(monk
                     assert publication_by_field["to_revision"] == publication_by_field["from_revision"] + 2
                     raise RuntimeError("synthetic rollback")
             assert await _rows(database, schema, "address_archive_v2") == before
-            assert await archive._revision(fhir.db, schema, prepared.target_oid) == prepared.from_revision
+            assert await archive._revision(fhir.db, schema) == prepared.from_revision
             async with database.transaction() as session:
                 await prepared.before_lock(fhir, session)
                 publication_by_field = await prepared.apply(fhir, session)
-            assert await archive._oid(fhir.db, schema, "address_archive_v2") == prepared.target_oid
+            assert await archive._relation_exists(fhir.db, schema, "address_archive_v2")
             assert await _rows(database, schema, "address_archive_v2") == await _rows(
                 database, schema, prepared.effective_relation
             )
@@ -347,14 +329,11 @@ async def test_invalid_inputs_reject_without_live_mutation_or_leaked_scratch(mon
         }
         await database.status(statements_by_corruption[corruption])
         before = await _rows(database, schema, "address_archive_v2")
-        revision = await archive._revision(fhir.db, schema, await archive._oid(fhir.db, schema, "address_archive_v2"))
+        revision = await archive._revision(fhir.db, schema)
         with pytest.raises(RuntimeError, match="(alias integrity|Stamped canonical)"):
             await _prepare(schema, fence)
         assert await _rows(database, schema, "address_archive_v2") == before
-        assert (
-            await archive._revision(fhir.db, schema, await archive._oid(fhir.db, schema, "address_archive_v2"))
-            == revision
-        )
+        assert await archive._revision(fhir.db, schema) == revision
         assert not admission._relations
         assert (
             await database.scalar(
@@ -367,7 +346,24 @@ async def test_invalid_inputs_reject_without_live_mutation_or_leaked_scratch(mon
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("corruption", ["live_write", "view", "seal", "delta_swap"])
+async def test_interrupted_preparation_drops_frozen_delta_as_restricted_owner(monkeypatch):
+    async with _fixture(monkeypatch) as (database, schema, fence, admission, _checks):
+        monkeypatch.setattr(admission, "assert_ready", AsyncMock(side_effect=RuntimeError("synthetic interruption")))
+        with pytest.raises(RuntimeError, match="synthetic interruption"):
+            await _prepare(schema, fence)
+        assert not admission._relations
+        assert (
+            await database.scalar(
+                "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname=:schema AND c.relname LIKE 'cms_archive_%'",
+                schema=schema,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", ["live_write", "view", "delta_swap"])
 async def test_prepared_identity_drift_fails_closed_and_cleanup_preserves_replacements(monkeypatch, corruption):
     async with _fixture(monkeypatch) as (database, schema, fence, admission, _checks):
         prepared, _metrics = await _prepare(schema, fence)
@@ -378,7 +374,6 @@ async def test_prepared_identity_drift_fails_closed_and_cleanup_preserves_replac
             statements_by_corruption = {
                 "live_write": f"UPDATE {schema}.address_archive_v2 SET first_line=first_line WHERE false",
                 "view": f"CREATE OR REPLACE VIEW {schema}.{prepared.effective_relation} AS SELECT * FROM {schema}.address_archive_v2",
-                "seal": f'GRANT UPDATE ON {schema}.{prepared.delta_table} TO "{database._input_component.reader}"',
                 "delta_swap": f"ALTER TABLE {schema}.{prepared.delta_table} RENAME TO retired_delta",
             }
             await database.status(statements_by_corruption[corruption])
@@ -391,11 +386,9 @@ async def test_prepared_identity_drift_fails_closed_and_cleanup_preserves_replac
                 await prepared.assert_ready(fhir)
         finally:
             await prepared.cleanup(fhir)
-        if corruption == "delta_swap":
-            assert await archive._oid(fhir.db, schema, prepared.delta_table) is not None
-            assert (schema, prepared.delta_table) in admission.cleanup_preserved
-        else:
-            assert not admission._relations
+        # Cleanup owns its scratch names, so a relation placed under one is removed with it.
+        assert not await archive._relation_exists(fhir.db, schema, prepared.delta_table)
+        assert not admission._relations
 
 
 @pytest.mark.asyncio
@@ -458,8 +451,7 @@ async def test_unadmitted_cms_bundle_fails_before_any_live_archive_statement(mon
             AsyncMock(return_value={"Practitioner": 0, "Organization": 0}),
         )
         before = await _rows(database, schema, "address_archive_v2")
-        oid = await archive._oid(database, schema, "address_archive_v2")
-        revision = await archive._revision(database, schema, oid)
+        revision = await archive._revision(database, schema)
         token = preparation._ACTIVE.set(None)
         try:
             async with fhir._provider_directory_artifact_bundle_scope():
@@ -476,7 +468,7 @@ async def test_unadmitted_cms_bundle_fails_before_any_live_archive_statement(mon
         finally:
             preparation._ACTIVE.reset(token)
         assert await _rows(database, schema, "address_archive_v2") == before
-        assert await archive._revision(database, schema, oid) == revision
+        assert await archive._revision(database, schema) == revision
 
 
 @pytest.mark.asyncio
@@ -491,7 +483,15 @@ async def test_optional_coordinate_heap_presence_and_mutation_are_native_inputs(
         with pytest.raises(RuntimeError, match="revision_guard_unavailable"):
             await input_proof._capture(database, schema)
         async with native_input_actor(database) as connection:
-            await native_inputs.register_native_address_inputs(connection, schema)
+            with pytest.raises(RuntimeError, match="revision_guard_unavailable"):
+                await native_inputs.register_native_address_inputs(connection, schema)
+        async with native_input_actor(database) as session:
+            await session.execute(text(f"ALTER TABLE {schema}.openaddresses_geocode RENAME TO incoming_geocode"))
+            prepared = await native_inputs.prepare_local_native_input_publication(
+                session, ledger_schema=schema, relations=(("openaddresses_geocode", "incoming_geocode"),)
+            )
+            await session.execute(text(f"ALTER TABLE {schema}.incoming_geocode RENAME TO openaddresses_geocode"))
+            await native_inputs.finish_local_native_input_publication(session, prepared=prepared)
         present = await input_proof._capture(database, schema)
         with pytest.raises(RuntimeError, match="native_inputs_changed"):
             await input_proof._assert(database, schema, absent)
@@ -524,16 +524,8 @@ async def _assert_archive_owner_transactions(database, schema, prepared, savepoi
         async with session.begin_nested() if savepoint else nullcontext():
             await prepared.before_lock(fhir, session)
             await prepared.apply(fhir, session)
-            revision_identity = await database.first(
-                f'SELECT xmin::text,pg_current_xact_id()::text FROM "{schema}".cms_native_input_revision '
-                "WHERE relation_oid=:oid",
-                oid=prepared.target_oid,
-            )
-            assert revision_identity[0] != revision_identity[1]
+            assert await archive._revision(database, schema) == prepared.from_revision + 2
         await prepared.assert_applied_backend(database)
-    with pytest.raises(RuntimeError, match="applied_owner_changed"):
-        async with database.transaction():
-            await prepared.assert_applied_backend(database)
 
 
 @pytest.mark.asyncio
@@ -554,30 +546,24 @@ async def test_native_acquired_backend_guard_and_applied_owner_are_exact(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("values", [(None,), (True,), (42, False)])
-async def test_native_archive_custody_refuses_missing_owner_or_open_acl(values):
-    """Malformed physical ownership and an opened ordinary ACL cannot authorize reads."""
+@pytest.mark.parametrize("is_supported", [True, False, None])
+async def test_native_archive_shape_is_checked_by_declared_name(is_supported):
+    """A partitioned, inherited, row-filtered, triggered or rewritten table cannot serve as the archive."""
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
-    database = SimpleNamespace(scalar=AsyncMock(side_effect=values))
-    with pytest.raises(RuntimeError, match="cms_archive_write_seal_changed"):
-        await archive._assert_backend_seal(database, "synthetic_schema", 123)
-    assert database.scalar.await_count == len(values)
-
-
-@pytest.mark.asyncio
-async def test_native_archive_custody_checks_exact_owner_and_oid():
-    """Backend proof binds the requested native identity and checks all ordinary writers."""
-    from types import SimpleNamespace
-    from unittest.mock import AsyncMock
-
-    database = SimpleNamespace(scalar=AsyncMock(side_effect=(42, True)))
-    await archive._assert_backend_seal(database, "synthetic_schema", 123)
+    database = SimpleNamespace(scalar=AsyncMock(return_value=is_supported))
+    if is_supported:
+        await archive._assert_backend_seal(database, "synthetic_schema", "cms_archive_example")
+    else:
+        with pytest.raises(RuntimeError, match="^cms_archive_storage_shape_unsupported$"):
+            await archive._assert_backend_seal(database, "synthetic_schema", "cms_archive_example")
     query = database.scalar.await_args
-    assert query.kwargs == {"oid": 123, "schema": "synthetic_schema", "owner_oid": 42}
-    assert "pg_trigger" in query.args[0] and "pg_rewrite" in query.args[0]
-    assert "has_any_column_privilege" in query.args[0]
+    assert database.scalar.await_count == 1
+    assert query.kwargs == {"relation": archive._qtable("synthetic_schema", "cms_archive_example")}
+    for shape in ("relispartition", "relrowsecurity", "relforcerowsecurity", "pg_inherits", "pg_trigger", "pg_rewrite"):
+        assert shape in query.args[0]
+    assert "relowner" not in query.args[0] and "privilege" not in query.args[0]
 
 
 def test_source_header_metadata_preserves_complete_fk_dependency_order():
@@ -647,6 +633,6 @@ async def test_archive_baseline_owns_creation_resolution_and_backfill(monkeypatc
     metrics = await _baseline(database, "synthetic_schema", SimpleNamespace(source_ids=("synthetic",)))
     assert metrics == {"inserted": 1, "openaddresses_coordinate_backfill_rows": 2}
     assert events[0] == "source_enter" and events[-3:] == ["resolve", "backfill", "source_exit"]
-    assert "CREATE TABLE synthetic_schema.baseline" in events[2]
-    assert 'CREATE UNLOGGED TABLE "synthetic_schema"."baseline_input"' in events[5]
+    assert "CREATE TABLE synthetic_schema.baseline" in events[1]
+    assert 'CREATE UNLOGGED TABLE "synthetic_schema"."baseline_input"' in events[4]
     assert not state_by_field["is_source"]

@@ -24,7 +24,6 @@ from tests.test_provider_directory_profile_control_capacity import (
     _control_wal_plan_input,
 )
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 from tests.provider_directory_profile_delta_schema_fixtures import (
     _create_delta_contract_tables,
@@ -73,9 +72,7 @@ async def _seed_delta_rows(database: Database, scenario) -> None:
             dataset_id=dataset_id,
             value_json=value_json,
         )
-    await database.status(
-        f"INSERT INTO {scenario.affected_ref} (npi) VALUES (1000000004);"
-    )
+    await database.status(f"INSERT INTO {scenario.affected_ref} (npi) VALUES (1000000004);")
     await database.status(
         f"""
         INSERT INTO {scenario.profile_target_ref} (
@@ -100,9 +97,10 @@ async def _delta_relation_scenario(
     schema: str,
 ):
     """Create, seed, and identify every target and scratch relation."""
-    evidence_stage = "provider_directory_profile_evidence_stage_delta"
-    profile_stage = "provider_directory_profile_stage_delta"
-    affected_stage = "provider_directory_profile_affected_delta"
+    build_id = "pdpb_" + "5" * 32
+    evidence_stage = profile.profile_evidence_stage_table_name(build_id)
+    profile_stage = profile.profile_stage_table_name(build_id)
+    affected_stage = importer._bounded_identifier(f"provider_directory_profile_affected_{build_id}")
     await _create_delta_contract_tables(
         database,
         schema,
@@ -115,21 +113,13 @@ async def _delta_relation_scenario(
         evidence_stage=evidence_stage,
         profile_stage=profile_stage,
         affected_stage=affected_stage,
-        evidence_target_ref=profile.qualified_table(
-            schema, profile.PROFILE_EVIDENCE_TABLE
-        ),
-        profile_target_ref=profile.qualified_table(
-            schema, profile.PROFILE_TABLE
-        ),
+        evidence_target_ref=profile.qualified_table(schema, profile.PROFILE_EVIDENCE_TABLE),
+        profile_target_ref=profile.qualified_table(schema, profile.PROFILE_TABLE),
         evidence_stage_ref=profile.qualified_table(schema, evidence_stage),
         profile_stage_ref=profile.qualified_table(schema, profile_stage),
         affected_ref=profile.qualified_table(schema, affected_stage),
-        checkpoint_ref=profile.qualified_table(
-            schema, "provider_directory_profile_build_checkpoint"
-        ),
-        serving_ref=profile.qualified_table(
-            schema, "provider_directory_profile_serving_generation"
-        ),
+        checkpoint_ref=profile.qualified_table(schema, "provider_directory_profile_build_checkpoint"),
+        serving_ref=profile.qualified_table(schema, "provider_directory_profile_serving_generation"),
         old_generation="pdprofile_" + "1" * 32,
         new_generation="pdprofile_" + "2" * 32,
     )
@@ -189,30 +179,37 @@ def _delta_lineage():
         ("source-a", "c" * 64),
         ("source-b", "b" * 64),
     )
+    batch_plan = importer._provider_directory_profile_batch_plan(
+        ["source-a"],
+        ["source-a", "source-b"],
+        ["dataset-a-new"],
+        has_existing_artifacts=True,
+        materialization_mode="source_delta",
+        evidence_window_size=1,
+        compact_window_size=1,
+        compact_ranges=importer._provider_directory_profile_npi_ranges(profile.PROFILE_NPI_BATCH_SIZE)[:1],
+        current_source_vector_hash=importer._provider_directory_profile_source_vector_hash(from_vector),
+        desired_source_vector_hash=importer._provider_directory_profile_source_vector_hash(to_vector),
+        current_source_context_vector_hash=importer._provider_directory_profile_source_context_vector_hash(
+            from_context_vector
+        ),
+        desired_source_context_vector_hash=importer._provider_directory_profile_source_context_vector_hash(
+            to_context_vector
+        ),
+    )
     return SimpleNamespace(
         from_vector=from_vector,
         to_vector=to_vector,
-        from_vector_hash=(
-            importer._provider_directory_profile_source_vector_hash(from_vector)
-        ),
-        to_vector_hash=(
-            importer._provider_directory_profile_source_vector_hash(to_vector)
-        ),
+        from_vector_hash=(importer._provider_directory_profile_source_vector_hash(from_vector)),
+        to_vector_hash=(importer._provider_directory_profile_source_vector_hash(to_vector)),
         from_context_vector=from_context_vector,
         to_context_vector=to_context_vector,
-        from_context_vector_hash=(
-            importer._provider_directory_profile_source_context_vector_hash(
-                from_context_vector
-            )
-        ),
-        to_context_vector_hash=(
-            importer._provider_directory_profile_source_context_vector_hash(
-                to_context_vector
-            )
-        ),
+        from_context_vector_hash=(importer._provider_directory_profile_source_context_vector_hash(from_context_vector)),
+        to_context_vector_hash=(importer._provider_directory_profile_source_context_vector_hash(to_context_vector)),
         build_id="pdpb_" + "5" * 32,
         resume_hash="5" * 64,
-        plan_hash="4" * 64,
+        batch_plan=batch_plan,
+        plan_hash=batch_plan.fingerprint,
         proof_id="3" * 64,
     )
 
@@ -232,9 +229,7 @@ async def _insert_delta_checkpoint(
             owner_run_id, state, materialization_mode,
             refresh_source_ids, removed_source_ids,
             evidence_stage, profile_stage, affected_npi_stage,
-            evidence_stage_oid, profile_stage_oid,
-            affected_npi_stage_oid, evidence_target_oid,
-            profile_target_oid, current_source_vector_hash,
+            targets_json, current_source_vector_hash,
             desired_source_vector_hash,
             current_source_context_vector_hash,
             desired_source_context_vector_hash,
@@ -246,13 +241,11 @@ async def _insert_delta_checkpoint(
             :build_id, :resume_hash, :plan_hash, 'run-delta',
             'ready', 'source_delta', '["source-a"]', '[]',
             :evidence_stage, :profile_stage, :affected_stage,
-            :evidence_stage_oid, :profile_stage_oid,
-            :affected_stage_oid, :evidence_target_oid,
-            :profile_target_oid, :from_vector_hash,
+            CAST(:targets_json AS jsonb), :from_vector_hash,
             :to_vector_hash, :from_context_vector_hash,
             :to_context_vector_hash, 'verified', :geometry_hash,
             CAST(:geometry_json AS jsonb), '2026-07-30',
-            1, 1, 1, 1
+            :evidence_batches, :evidence_batches, :profile_batches, :profile_batches
         );
         """,
         build_id=lineage.build_id,
@@ -261,17 +254,15 @@ async def _insert_delta_checkpoint(
         evidence_stage=scenario.evidence_stage,
         profile_stage=scenario.profile_stage,
         affected_stage=scenario.affected_stage,
-        evidence_stage_oid=oid_by_name["evidence_stage"],
-        profile_stage_oid=oid_by_name["profile_stage"],
-        affected_stage_oid=oid_by_name["affected_stage"],
-        evidence_target_oid=oid_by_name["evidence_target"],
-        profile_target_oid=oid_by_name["profile_target"],
+        targets_json=json.dumps(importer._provider_directory_profile_target_coordinates(scenario.schema)),
         from_vector_hash=lineage.from_vector_hash,
         to_vector_hash=lineage.to_vector_hash,
         from_context_vector_hash=lineage.from_context_vector_hash,
         to_context_vector_hash=lineage.to_context_vector_hash,
         geometry_hash=capacity.capacity_geometry_hash(geometry),
         geometry_json=capacity.canonical_capacity_geometry_json(geometry),
+        evidence_batches=len(lineage.batch_plan.evidence_batches),
+        profile_batches=len(lineage.batch_plan.compact_batches),
     )
 
 
@@ -292,7 +283,7 @@ async def _insert_delta_serving_generation(
             source_context_vector_hash, source_context_vector_json,
             executable_plan_hash, capacity_geometry_status,
             capacity_geometry_hash, capacity_geometry_json,
-            evidence_target_oid, profile_target_oid,
+            targets_json,
             evidence_rows, profile_rows, profile_as_of,
             published_at, created_at, updated_at
         ) VALUES (
@@ -303,27 +294,20 @@ async def _insert_delta_serving_generation(
             :source_context_vector_hash,
             CAST(:source_context_vector_json AS jsonb),
             :plan_hash, 'legacy_unavailable', NULL, NULL,
-            :evidence_target_oid, :profile_target_oid,
+            CAST(:targets_json AS jsonb),
             2, 1, '2026-07-30', now(), now(), now()
         );
         """,
         generation_id=scenario.old_generation,
         proof_id="6" * 64,
         source_vector_hash=lineage.from_vector_hash,
-        source_vector_json=json.dumps(
-            importer._provider_directory_profile_source_vector_json(
-                lineage.from_vector
-            )
-        ),
+        source_vector_json=json.dumps(importer._provider_directory_profile_source_vector_json(lineage.from_vector)),
         source_context_vector_hash=lineage.from_context_vector_hash,
         source_context_vector_json=json.dumps(
-            importer._provider_directory_profile_source_context_vector_json(
-                lineage.from_context_vector
-            )
+            importer._provider_directory_profile_source_context_vector_json(lineage.from_context_vector)
         ),
         plan_hash="7" * 64,
-        evidence_target_oid=oid_by_name["evidence_target"],
-        profile_target_oid=oid_by_name["profile_target"],
+        targets_json=json.dumps(importer._provider_directory_profile_target_coordinates(scenario.schema)),
     )
 
 
@@ -345,16 +329,12 @@ async def _delta_capacity_context(
     lineage,
     oid_by_name: dict[str, int],
 ):
-    """Bind live database identity into the exact admitted delta geometry."""
-    serving_state = await importer._provider_directory_profile_serving_state(
-        scenario.schema
-    )
+    """Bind logical relations and measured numeric capacity into the admitted delta geometry."""
+    serving_state = await importer._provider_directory_profile_serving_state(scenario.schema)
     assert serving_state is not None
-    database_identity = (
-        await importer._provider_directory_profile_capacity_database_identity(
-            scenario.schema,
-            serving_state,
-        )
+    database_identity = await importer._provider_directory_profile_capacity_database_identity(
+        scenario.schema,
+        serving_state,
     )
     geometry_by_field = _geometry_payload(
         selection_proof_id=lineage.proof_id,
@@ -365,8 +345,6 @@ async def _delta_capacity_context(
         desired_source_vector_hash=lineage.to_vector_hash,
         current_context_vector_hash=lineage.from_context_vector_hash,
         desired_context_vector_hash=lineage.to_context_vector_hash,
-        evidence_target_oid=oid_by_name["evidence_target"],
-        profile_target_oid=oid_by_name["profile_target"],
     )
     geometry_by_field.update(
         {
@@ -381,4 +359,5 @@ async def _delta_capacity_context(
         geometry=geometry,
         control_projection=control_projection,
         database_identity=database_identity,
+        serving_state=serving_state,
     )

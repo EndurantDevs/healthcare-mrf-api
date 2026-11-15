@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import fields, replace
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -11,17 +14,17 @@ from process import provider_directory_rooted_graph_twin_store as twin_store
 from process.provider_directory_fhir_root_policy import (
     REVIEWED_ROOT_POLICY_METADATA_KEY,
 )
-from process.provider_directory_rooted_graph_single_root_contract import (
-    derive_single_root_identity,
-)
 from process.provider_directory_rooted_graph_publication import (
     build_provider_directory_rooted_graph_dataset_identity,
     provider_directory_rooted_graph_publication_metadata,
 )
+from process.provider_directory_rooted_graph_single_root_contract import (
+    derive_single_root_identity,
+)
 from process.provider_directory_rooted_graph_twin_contract import (
+    ProviderDirectoryRootedGraphTwinError,
     build_provider_directory_rooted_graph_twin_admission,
     build_provider_directory_rooted_graph_twin_attempt,
-    ProviderDirectoryRootedGraphTwinError,
 )
 from tests.provider_directory_rooted_graph_publication_test_support import (
     exact_current,
@@ -44,14 +47,18 @@ class _ScriptedDatabase:
         self.first_rows = list(first_rows)
         self.scalars = list(scalars)
         self.status_calls: list[tuple[str, dict[str, object]]] = []
+        self.read_calls = []
+        self.transaction_count = 0
 
     def transaction(self) -> _Transaction:
+        self.transaction_count += 1
         return _Transaction()
 
     async def all(self, _statement: str, **_parameters: object):
         return self.rows.pop(0)
 
     async def first(self, _statement: str, **_parameters: object):
+        self.read_calls.append((_statement, _parameters))
         return self.first_rows.pop(0)
 
     async def scalar(self, _statement: str, **_parameters: object):
@@ -137,17 +144,21 @@ def test_row_decoders_reject_drift_and_preserve_exact_records() -> None:
 @pytest.mark.asyncio
 async def test_root_locking_is_ordered_complete_and_distinct() -> None:
     baseline, candidate = sealed_roots()
-    database = _ScriptedDatabase(rows=((_root_row(baseline), _root_row(candidate)),))
+    database = _ScriptedDatabase(first_rows=(_root_row(baseline), _root_row(candidate)))
     assert await twin_store._lock_roots(
         database,
         (candidate.acquisition_id, baseline.acquisition_id),
     ) == (baseline, candidate)
+    assert [parameters["acquisition_id"] for _, parameters in database.read_calls] == sorted(
+        (baseline.acquisition_id, candidate.acquisition_id)
+    )
+    assert all(statement.endswith("FOR SHARE") for statement, _ in database.read_calls)
     with pytest.raises(ProviderDirectoryRootedGraphTwinError, match="identity"):
         await twin_store._lock_roots(
             database,
             (baseline.acquisition_id, baseline.acquisition_id),
         )
-    missing_database = _ScriptedDatabase(rows=((_root_row(baseline),),))
+    missing_database = _ScriptedDatabase(first_rows=(_root_row(baseline), None))
     with pytest.raises(ProviderDirectoryRootedGraphTwinError, match="state"):
         await twin_store._lock_roots(
             missing_database,
@@ -158,9 +169,7 @@ async def test_root_locking_is_ordered_complete_and_distinct() -> None:
 @pytest.mark.asyncio
 async def test_insert_and_read_helpers_bound_exact_persisted_records() -> None:
     _baseline, _candidate, attempt, admission = _attempt_and_admission()
-    database = _ScriptedDatabase(
-        first_rows=(_record(attempt), _record(admission), None)
-    )
+    database = _ScriptedDatabase(first_rows=(_record(attempt), _record(admission), None))
     await twin_store._insert_attempt(database, attempt)
     await twin_store._insert_authority(database, admission)
     assert len(database.status_calls) == 2
@@ -332,9 +341,7 @@ def _single_root_candidate(current, operation_key):
     )
 
 
-def test_partial_single_root_intent_is_bound_without_changing_complete_identity() -> (
-    None
-):
+def test_partial_single_root_intent_is_bound_without_changing_complete_identity() -> None:
     operation_key = "f" * 64
     complete = exact_current()
     partial = replace(
@@ -356,22 +363,13 @@ def test_partial_single_root_intent_is_bound_without_changing_complete_identity(
         operation_key=operation_key,
     )
 
-    assert complete_identity.dataset_intent_id == (
-        "pdrgi_051f89ecd1ea11a695cc6ab36122a388ecf554bd7c13a45e"
-    )
+    assert complete_identity.dataset_intent_id == ("pdrgi_051f89ecd1ea11a695cc6ab36122a388ecf554bd7c13a45e")
     assert partial_identity.dataset_intent_id != complete_identity.dataset_intent_id
     assert different_partial.dataset_intent_id != partial_identity.dataset_intent_id
 
 
-@pytest.mark.asyncio
-async def test_single_root_admission_rederives_identity_and_publishes_metadata(
-    monkeypatch,
-) -> None:
-    """Bind admission, metadata, and stale-seal rejection to one identity."""
-
-    operation_key = "f" * 64
-    current = exact_current()
-    candidate = _single_root_candidate(current, operation_key)
+def _single_root_admission_protocol(monkeypatch, current, candidate):
+    """Keep the root and admission ledger mutable across the same replay protocol."""
     locked_roots = [candidate]
     stored_by_kind: dict[str, object] = {}
 
@@ -393,11 +391,34 @@ async def test_single_root_admission_rederives_identity_and_publishes_metadata(
     monkeypatch.setattr(twin_store, "_lock_single_root", lock_root)
     monkeypatch.setattr(twin_store, "_insert_authority", insert_admission)
     monkeypatch.setattr(twin_store, "_read_admission", read_admission)
+    return locked_roots
+
+
+@pytest.mark.asyncio
+async def test_single_root_admission_rederives_identity_and_publishes_metadata(
+    monkeypatch,
+) -> None:
+    """Bind admission, metadata, and stale-seal rejection to one identity."""
+
+    operation_key = "f" * 64
+    current = exact_current()
+    candidate = _single_root_candidate(current, operation_key)
+    locked_roots = _single_root_admission_protocol(monkeypatch, current, candidate)
     recorded_at = datetime(2026, 8, 10, 12, tzinfo=UTC)
     admission = await twin_store.admit_rooted_graph_single_root(
         candidate.acquisition_id,
         acquisition_operation_key=operation_key,
-        database=_ScriptedDatabase(scalars=(recorded_at, None)),
+        database=_ScriptedDatabase(
+            first_rows=(
+                {
+                    "npi_count": 1,
+                    "cohort_complete": True,
+                    "metadata": {"retry_exhausted_count": 0, "cohort_complete": True},
+                },
+                {"total": 1, "failed": 0, "incomplete": 0, "invalid_errors": 0},
+            ),
+            scalars=(recorded_at, None),
+        ),
     )
 
     assert admission.attempt_id is None
@@ -423,3 +444,48 @@ async def test_single_root_admission_rederives_identity_and_publishes_metadata(
             acquisition_operation_key=operation_key,
             database=_ScriptedDatabase(scalars=(recorded_at,)),
         )
+
+
+@pytest.fixture(autouse=True)
+def _configured_rooted_preflight(monkeypatch):
+    from process import provider_directory_rooted_graph_current_preflight as preflight
+    from process import provider_directory_rooted_graph_source_runtime as source_runtime
+
+    @asynccontextmanager
+    async def transaction(database, **options):
+        async with database.transaction():
+            yield SimpleNamespace(session=database)
+
+    runtime = SimpleNamespace(
+        transaction=transaction,
+        catalog_schema="mrf",
+        candidate_schema="mrf",
+        relation_coordinates=lambda schema, root, scoped_name: (schema, scoped_name),
+    )
+    monkeypatch.setattr(source_runtime, "current_rooted_graph_runtime", lambda database=None: runtime)
+    monkeypatch.setattr(
+        source_runtime,
+        "rooted_input_relations",
+        AsyncMock(
+            return_value={
+                twin_store.ACQUISITION_TABLE: {"schema": "named_generation", "name": twin_store.ACQUISITION_TABLE}
+            }
+        ),
+    )
+    monkeypatch.setattr(preflight, "prepare_current_root", AsyncMock())
+
+
+@pytest.mark.asyncio
+async def test_rooted_preflight_refusal_precedes_admission_transaction(monkeypatch):
+    from process import provider_directory_rooted_graph_current_preflight as preflight
+
+    refusal = RuntimeError("synthetic rooted preflight refusal")
+    monkeypatch.setattr(preflight, "prepare_current_root", AsyncMock(side_effect=refusal))
+    baseline, candidate = sealed_roots()
+    database = _ScriptedDatabase()
+    with pytest.raises(RuntimeError) as caught:
+        await twin_store.admit_provider_directory_rooted_graph_twins(
+            baseline.acquisition_id, candidate.acquisition_id, database=database
+        )
+    assert caught.value is refusal
+    assert database.transaction_count == 0 and database.read_calls == [] and database.status_calls == []

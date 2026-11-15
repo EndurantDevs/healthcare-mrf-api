@@ -115,16 +115,16 @@ async def require_reference_revision_tracking(database, *, importer_id, schema_n
         raise RuntimeError("reference source revision guards are unavailable")
 
 
+# expected_relation_oids is accepted and ignored so peer callers keep their current signature.
 async def _lock_source(session, *, importer_id, schema_name, expected_relation_oids, bootstrap=False):
     if not callable(getattr(session, "in_transaction", None)) or not session.in_transaction():
         raise ValueError("reference source observation requires a caller transaction")
     if await session.scalar(text("SHOW transaction_isolation")) != "read committed":
         raise ValueError("reference source observation requires read committed")
     importer, schema, authority_schema = _family(importer_id, schema_name)
-    expected = generation._relation_oids(importer, expected_relation_oids)
     names = generation.RELATION_NAMES_BY_IMPORTER[importer]
     relations = ", ".join(f"{generation._quoted(schema)}.{generation._quoted(name)}" for name in names)
-    await session.execute(text(f"LOCK TABLE {relations} IN SHARE MODE NOWAIT"))
+    await session.execute(text(f"LOCK TABLE {relations} IN ACCESS SHARE MODE NOWAIT"))
     # Keep relation-DDL admission fail-fast without blocking unrelated families.
     ledger = f'{generation._quoted(authority_schema)}."{generation.TABLE_NAME}"'
     await session.execute(text(f"LOCK TABLE {ledger} IN ROW SHARE MODE NOWAIT"))
@@ -135,9 +135,7 @@ async def _lock_source(session, *, importer_id, schema_name, expected_relation_o
     )
     if locked_importer is None:
         raise RuntimeError("reference family generation authority is unavailable")
-    current = await generation.current_reference_family_relation_oids(session, importer_id=importer, schema_name=schema)
-    if current != expected:
-        raise RuntimeError("reference source relation identity changed")
+    await generation.current_reference_family_relation_oids(session, importer_id=importer, schema_name=schema)
     return importer, schema
 
 
@@ -159,7 +157,9 @@ async def require_reference_source_generation(session, *, importer_id, schema_na
     authority = await generation.read_reference_family_result_generation_authority(
         session, importer_id=importer, schema_name=schema
     )
-    if authority.serving_generation is None or authority.relation_oids != tuple(expected_relation_oids):
+    if authority.serving_generation is None or authority.relations != generation.declared_reference_family_relations(
+        importer, schema
+    ):
         raise RuntimeError("reference source serving generation is unavailable or drifted")
     return authority
 

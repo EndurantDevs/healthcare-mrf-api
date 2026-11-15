@@ -54,14 +54,14 @@ async def test_owned_interactive_reader_disables_jit_before_resolution(monkeypat
     )
     monkeypatch.setattr(pricing, "is_owned_reader", lambda session: session is request.ctx.sa_session)
     tuner = AsyncMock()
-    monkeypatch.setattr(pricing, "execute_network_read", tuner)
+    monkeypatch.setattr(request.ctx.sa_session, "execute", tuner)
     resolver, search = _install_search(monkeypatch)
     original_specialty = pricing._resolve_ptg_specialty_or_raise
 
     async def specialty(session, args):
         tuner.assert_awaited_once()
-        assert tuner.await_args.args[0] is session
-        assert str(tuner.await_args.args[1]) == (
+        assert session is request.ctx.sa_session
+        assert str(tuner.await_args.args[0]) == (
             "SELECT set_config('jit', 'off', true), set_config('plan_cache_mode', 'force_custom_plan', true)"
         )
         return await original_specialty(session, args)
@@ -91,7 +91,7 @@ async def test_other_callers_receive_no_early_setting(monkeypatch, excluded):
         request.ctx._sa_reader_scope = None
     monkeypatch.setattr(pricing, "is_owned_reader", lambda _session: excluded != "unverified")
     tuner = AsyncMock(side_effect=AssertionError("caller settings must be preserved"))
-    monkeypatch.setattr(pricing, "execute_network_read", tuner)
+    monkeypatch.setattr(request.ctx.sa_session, "execute", tuner)
     _install_search(monkeypatch)
     assert (await pricing.list_providers_by_procedure(request)).status == 200
     tuner.assert_not_awaited()
@@ -102,7 +102,7 @@ async def test_valid_managed_native_request_retains_caller_settings(monkeypatch)
     native_args, request.args = request.args, {}
     monkeypatch.setattr(pricing, "is_owned_reader", lambda _session: True)
     tuner = AsyncMock(side_effect=AssertionError("native caller settings must be preserved"))
-    monkeypatch.setattr(pricing, "execute_network_read", tuner)
+    monkeypatch.setattr(request.ctx.sa_session, "execute", tuner)
     resolver, search = _install_search(monkeypatch)
     with network_address_scope.network_address_read_scope(
         MANIFEST, None, access_scope_sha256="b" * 64, excluded_network_ids=()
@@ -118,7 +118,7 @@ async def test_state_scan_receives_no_early_setting(monkeypatch):
     monkeypatch.setattr(pricing, "is_plan_pricing_state_scan", lambda _args: True)
     monkeypatch.setattr(pricing, "is_owned_reader", lambda _session: True)
     tuner = AsyncMock(side_effect=AssertionError("bulk planning is unchanged"))
-    monkeypatch.setattr(pricing, "execute_network_read", tuner)
+    monkeypatch.setattr(request.ctx.sa_session, "execute", tuner)
     resolver, _ = _install_search(monkeypatch)
     assert (await pricing.list_providers_by_procedure(request)).status == 503
     resolver.assert_awaited_once()

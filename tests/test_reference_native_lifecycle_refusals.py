@@ -96,9 +96,17 @@ def _handoff_scalar(observed, statement, parameters=None):
     raise AssertionError("unexpected scalar: " + sql)
 
 
-def _handoff_session(observed):
+def _handoff_session(observed, monkeypatch):
+    """Mock the separately tested native catalogue leaf for run/receipt branch checks."""
+
+    async def stage(_session, _schema, _table):
+        return observed.stage
+
+    monkeypatch.setattr(archive, "_nucc_native_stage", stage)
+    transaction = object()
     return SimpleNamespace(
         in_transaction=lambda: True,
+        get_transaction=lambda: transaction,
         execute=AsyncMock(side_effect=lambda *args: _handoff_execute(observed, *args)),
         scalar=AsyncMock(side_effect=lambda *args: _handoff_scalar(observed, *args)),
     )
@@ -107,48 +115,49 @@ def _handoff_session(observed):
 def _publication(handoff):
     incumbent = handoff["incumbent"]
     validation_by_field = {"contract": "nucc-indexed-set.v1", "row_count": 1, "csv_upper_bound": 128}
-    return archive.validate_nucc_native_publication(
-        {
-            "contract": archive.NUCC_IMMUTABLE_PUBLICATION_CONTRACT,
-            "handoff": handoff,
-            "sealed_owner_oid": 50,
-            "validation": validation_by_field,
-            "validation_sha256": archive.nucc_native_digest(validation_by_field),
-            "result_generation": {
-                **incumbent,
-                "local_generation": incumbent["local_generation"] + 1,
-                "relation_oids": [handoff["stage"]["relation_oid"]],
-                "serving_generation": {
-                    "origin_lineage_id": incumbent["local_lineage_id"],
-                    "origin_generation": 1,
-                    "published_at": "2026-10-01T00:01:00Z",
-                },
+    value_by_field = {
+        "contract": archive.NUCC_IMMUTABLE_PUBLICATION_CONTRACT,
+        "handoff": handoff,
+        "validation": validation_by_field,
+        "validation_sha256": archive.nucc_native_digest(validation_by_field),
+        "result_generation": {
+            **incumbent,
+            "local_generation": incumbent["local_generation"] + 1,
+            "relations": [{"schema_name": "mrf", "relation_name": "nucc_taxonomy"}],
+            "serving_generation": {
+                "origin_lineage_id": incumbent["local_lineage_id"],
+                "origin_generation": 1,
+                "published_at": "2026-10-01T00:01:00Z",
             },
-        }
-    )
+        },
+    }
+    value_by_field["result_generation"].pop("relation_oids", None)
+    if "database_oid" in handoff:
+        value_by_field["sealed_owner_oid"] = "opaque original owner"
+    return archive.validate_nucc_native_publication(value_by_field)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", (None, "finished", "phase", "missing", "stage", "marker"))
-async def test_handoff_authenticates_persisted_control_and_exact_heap_before_returning(fault):
+@pytest.mark.parametrize("fault", (None, "finished", "phase", "missing", "stage", "index-definition"))
+async def test_handoff_authenticates_persisted_control_and_exact_heap_before_returning(monkeypatch, fault):
     observed = _handoff_observations()
-    session = _handoff_session(observed)
+    session = _handoff_session(observed, monkeypatch)
     changes_by_fault = {
         "finished": (observed.run, "finished_at", "2026-10-01T00:02:00Z"),
         "phase": (observed.run, "phase_detail", "other"),
         "missing": (observed.run["metrics"], "nucc_handoff", None),
     }
     if fault in changes_by_fault:
-        record, field, field_value = changes_by_fault[fault]
-        record[field] = field_value
+        saved_record, field, field_value = changes_by_fault[fault]
+        saved_record[field] = field_value
     elif fault == "stage":
-        observed.stage["relfilenode"] += 1
-    elif fault == "marker":
-        observed.marker = None
+        observed.stage["table_name"] = "other"
+    elif fault == "index-definition":
+        observed.stage["indexes"][0]["definition"] = "changed definition"
     if fault:
         with pytest.raises(
             archive.ReferenceFamilyArchiveError,
-            match="source or location differs|stage identity differs|stage marker differs",
+            match="source or location differs|stage layout differs",
         ):
             await archive.require_nucc_native_handoff(session, observed.handoff)
     else:
@@ -157,7 +166,9 @@ async def test_handoff_authenticates_persisted_control_and_exact_heap_before_ret
     locks = [sql for sql in queries if sql.startswith("LOCK TABLE")]
     assert len(locks) == int(fault not in {"finished", "phase", "missing"})
     if locks:
-        assert locks == [f'LOCK TABLE ONLY "mrf"."{observed.stage["table_name"]}" IN ACCESS EXCLUSIVE MODE NOWAIT']
+        assert locks == [
+            f'LOCK TABLE ONLY "mrf"."{observed.handoff["stage"]["table_name"]}" IN ACCESS SHARE MODE NOWAIT'
+        ]
     assert not any(sql.startswith(("INSERT", "UPDATE", "DELETE", "DROP")) for sql in queries)
 
 
@@ -174,10 +185,10 @@ async def test_handoff_authenticates_persisted_control_and_exact_heap_before_ret
         ("metrics", []),
     ),
 )
-async def test_handoff_rejects_foreign_or_malformed_locked_attempt_before_catalog_reads(field, value):
+async def test_handoff_rejects_foreign_or_malformed_locked_attempt_before_catalog_reads(monkeypatch, field, value):
     observed = _handoff_observations()
     observed.run[field] = value
-    session = _handoff_session(observed)
+    session = _handoff_session(observed, monkeypatch)
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="native attempt differs"):
         await archive.require_nucc_native_handoff(session, observed.handoff)
     assert session.execute.await_count == 1
@@ -188,10 +199,8 @@ async def test_handoff_rejects_foreign_or_malformed_locked_attempt_before_catalo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "fault", ("missing", "attempt", "started", "test", "test_mode", "node", "source", "database", "history")
-)
-async def test_handoff_readback_cannot_rebind_attempt_source_or_database(fault):
+@pytest.mark.parametrize("fault", ("missing", "attempt", "started", "test", "test_mode", "node", "source"))
+async def test_handoff_readback_cannot_rebind_attempt_source_or_database(monkeypatch, fault):
     observed = _handoff_observations()
     changes_by_fault = {
         "attempt": (observed.run["progress"], "attempt_id", "other"),
@@ -209,7 +218,7 @@ async def test_handoff_readback_cannot_rebind_attempt_source_or_database(fault):
     else:
         field = "database_oid" if fault == "database" else "history_oid"
         setattr(observed, field, getattr(observed, field) + 1)
-    session = _handoff_session(observed)
+    session = _handoff_session(observed, monkeypatch)
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="attempt differs|source or location differs"):
         await archive.read_nucc_native_handoff(session, observed.handoff)
     assert session.execute.await_count == 1
@@ -219,12 +228,14 @@ async def test_handoff_readback_cannot_rebind_attempt_source_or_database(fault):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ("running", "finalizing", "succeeded", "canceling", "canceled", "cancelled"))
 @pytest.mark.parametrize("is_persisted", (False, True))
-async def test_commit_readback_distinguishes_absent_handoff_from_committed_terminal_history(status, is_persisted):
+async def test_commit_readback_distinguishes_absent_handoff_from_committed_terminal_history(
+    monkeypatch, status, is_persisted
+):
     observed = _handoff_observations()
     observed.run["status"] = status
     if not is_persisted:
         observed.run["metrics"] = None
-    session = _handoff_session(observed)
+    session = _handoff_session(observed, monkeypatch)
     if status == "running" and is_persisted:
         with pytest.raises(archive.ReferenceFamilyArchiveError, match="committed handoff differs"):
             await archive.read_nucc_native_handoff(session, observed.handoff)
@@ -237,7 +248,7 @@ async def test_commit_readback_distinguishes_absent_handoff_from_committed_termi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", (None, "absent", "status", "unfinished", "different-handoff"))
-async def test_publication_readback_requires_exact_committed_success_not_current_payload(fault):
+async def test_publication_readback_requires_exact_committed_success_not_current_payload(monkeypatch, fault):
     observed = _handoff_observations()
     observed.run.update(status="succeeded", finished_at="2026-10-01T00:02:00Z")
     receipt = _publication(observed.handoff)
@@ -250,12 +261,12 @@ async def test_publication_readback_requires_exact_committed_success_not_current
         observed.run["finished_at"] = None
     elif fault == "different-handoff":
         different = deepcopy(observed.handoff)
-        different["stage"]["indexes"][0]["relfilenode"] += 1
+        different["stage"]["indexes"][0]["definition"] += " changed"
         different["handoff_sha256"] = archive.nucc_native_digest(
             {key: value for key, value in different.items() if key != "handoff_sha256"}
         )
         observed.run["metrics"]["nucc_native_publication"] = _publication(different)
-    session = _handoff_session(observed)
+    session = _handoff_session(observed, monkeypatch)
     if fault in {"status", "unfinished", "different-handoff"}:
         with pytest.raises(archive.ReferenceFamilyArchiveError, match="committed receipt differs"):
             await archive.read_nucc_native_publication(session, observed.handoff)
@@ -269,9 +280,9 @@ async def test_publication_readback_requires_exact_committed_success_not_current
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ("outer-cancel", "inner-cancel", "query-failure"))
-async def test_commit_reconciliation_finishes_its_owned_readback_before_classifying_cancellation(fault):
+async def test_commit_reconciliation_finishes_its_owned_readback_before_classifying_cancellation(monkeypatch, fault):
     observed = _handoff_observations()
-    session = _handoff_session(observed)
+    session = _handoff_session(observed, monkeypatch)
     entered, release = asyncio.Event(), asyncio.Event()
     exits = []
     failure = asyncio.CancelledError() if fault == "inner-cancel" else RuntimeError("catalog unavailable")
@@ -364,33 +375,35 @@ async def test_native_completion_uses_one_exact_attempt_cas_and_preserves_unrela
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", (None, "identity", "empty", "oversized"))
-async def test_published_indexes_are_renamed_only_for_exact_heap_without_rebuilding(fault):
-    indexes = [(17, "nucc_stage_primary"), (18, "nucc_stage_lookup")]
+@pytest.mark.parametrize("fault", (None, "empty", "oversized"))
+async def test_published_indexes_are_renamed_by_name_without_rebuilding(monkeypatch, fault):
+    names = [("nucc_stage_lookup",), ("nucc_stage_primary",)]
     if fault == "empty":
-        indexes = []
-    elif fault == "oversized":
-        indexes = [(oid, "nucc_index_" + str(oid)) for oid in range(1, 18)]
+        names = []
+    if fault == "oversized":
+        names = [(f"index_{number}",) for number in range(17)]
     session = SimpleNamespace(
-        in_transaction=lambda: True,
-        scalar=AsyncMock(return_value=44 if fault == "identity" else 43),
-        execute=AsyncMock(return_value=_Rows(indexes)),
+        in_transaction=lambda: True, execute=AsyncMock(return_value=_Rows(names)), scalar=AsyncMock()
     )
+    monkeypatch.setattr(archive, "uuid4", lambda: SimpleNamespace(hex="a" * 32))
     if fault:
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="identity differs|index inventory differs"):
-            await archive.rename_nucc_published_indexes(session, schema_name="mrf", expected_relation_oid=43)
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="index inventory differs"):
+            await archive.rename_nucc_published_indexes(session, schema_name="mrf")
     else:
-        await archive.rename_nucc_published_indexes(session, schema_name="mrf", expected_relation_oid=43)
-    statements = [str(call.args[0]) for call in session.execute.await_args_list]
-    assert statements[1:] == (
+        await archive.rename_nucc_published_indexes(session, schema_name="mrf")
+    sql_entries = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert sql_entries[1:] == (
         []
         if fault
         else [
-            'ALTER INDEX "mrf"."nucc_stage_primary" RENAME TO "nucc_published_idx_11"',
-            'ALTER INDEX "mrf"."nucc_stage_lookup" RENAME TO "nucc_published_idx_12"',
+            f'ALTER INDEX "mrf"."{name}" RENAME TO "nucc_idx_' + "a" * 32 + f'_{position}"'
+            for position, (name,) in enumerate(names)
         ]
     )
-    assert not any(sql.startswith(("DROP", "CREATE")) for sql in statements)
+    assert "to_regclass(:relation)" in sql_entries[0]
+    assert session.execute.await_args_list[0].args[1] == {"relation": '"mrf"."nucc_taxonomy"'}
+    session.scalar.assert_not_awaited()
+    assert not any(item.startswith(("DROP", "CREATE")) for item in sql_entries)
 
 
 @pytest.mark.asyncio
@@ -473,9 +486,12 @@ async def test_source_clone_requires_indexed_set_and_reverse_key_equality(monkey
     elif fault == "equality":
         session.scalar.side_effect = [False]
     elif fault == "inventory":
-        monkeypatch.setattr(archive, "_schema_oid", AsyncMock(return_value=owner.schema_oid + 1))
+        monkeypatch.setattr(archive, "_relation_oid", AsyncMock(return_value=None))
     if fault:
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="set is invalid|clone differs|ownership differs"):
+        with pytest.raises(
+            archive.ReferenceFamilyArchiveError,
+            match="set is invalid|clone differs|ownership differs|owned relation is missing",
+        ):
             await archive._validate_nucc_source_clone(
                 session, SimpleNamespace(schema_name="mrf", manifest=manifest), owner
             )
@@ -497,18 +513,21 @@ def _native_driver_session(driver):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", (None, "builder", "model", "count"))
-async def test_native_batch_rejoins_precreated_custody_before_one_model_ordered_copy(fault):
+@pytest.mark.parametrize("fault", (None, "permission", "model", "count"))
+async def test_native_batch_rejoins_precreated_custody_before_one_model_ordered_copy(monkeypatch, fault):
     observed = _handoff_observations()
     stage = observed.handoff["precreated_stage"]
     observed.run.update(status="running", metrics={"nucc_native_stage": stage})
     observed.stage = deepcopy(stage["stage"])
     observed.marker = archive._canonical_json(stage).decode("ascii")
-    observed.is_builder_safe = fault != "builder"
-    session = _handoff_session(observed)
+    observed.is_builder_safe = True
+    session = _handoff_session(observed, monkeypatch)
     driver = SimpleNamespace(
         is_in_transaction=lambda: True,
-        copy_records_to_table=AsyncMock(return_value="COPY 0" if fault == "count" else "COPY 1"),
+        copy_records_to_table=AsyncMock(
+            side_effect=PermissionError("native INSERT denied") if fault == "permission" else None,
+            return_value="COPY 0" if fault == "count" else "COPY 1",
+        ),
         terminate=Mock(),
     )
     session.connection = _native_driver_session(driver).connection
@@ -516,12 +535,13 @@ async def test_native_batch_rejoins_precreated_custody_before_one_model_ordered_
     nucc_records = [{"code": "101Y00000X", "int_code": 12345}]
     if fault:
         with pytest.raises(
-            archive.ReferenceFamilyArchiveError, match="Builder authority differs|COPY model differs|COPY count differs"
+            (archive.ReferenceFamilyArchiveError, PermissionError),
+            match="native INSERT denied|COPY model differs|COPY count differs",
         ):
             await archive.copy_nucc_native_batch(session, stage, model, nucc_records)
     else:
         assert await archive.copy_nucc_native_batch(session, stage, model, nucc_records) == 1
-    assert driver.copy_records_to_table.await_count == int(fault in {None, "count"})
+    assert driver.copy_records_to_table.await_count == int(fault in {None, "permission", "count"})
     if fault in {None, "count"}:
         arguments = driver.copy_records_to_table.await_args
         columns = tuple(archive.models.NUCCTaxonomy.__table__.columns.keys())
@@ -712,56 +732,43 @@ def _publisher_session(proof):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", (None, "missing", "owner", "caller", "transaction"))
-@pytest.mark.parametrize("nucc", (False, True))
-async def test_publisher_owner_uses_actual_protected_namespace_and_preserves_refusal_cause(fault, nucc):
+@pytest.mark.parametrize("nucc", (False,))
+async def test_publisher_preparation_uses_transaction_without_legacy_actor_tokens(fault, nucc):
+    """Only the active transaction governs this prerequisite; native SQL enforces access later."""
     proof_by_field = {"owner_oid": 45, "owner_safe": fault != "owner", "caller_safe": fault != "caller"}
     session = _publisher_session(None if fault == "missing" else proof_by_field)
     session.in_transaction = lambda: fault != "transaction"
     operation = archive._nucc_native_publisher_owner if nucc else archive.protected_publisher_owner
-    if fault:
-        with pytest.raises(
-            archive.ReferenceFamilyArchiveError, match="publisher is unavailable|caller transaction"
-        ) as caught:
+    if fault == "transaction":
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="caller transaction"):
             await operation(session)
-        if fault != "transaction":
-            assert caught.value.__cause__ is not None
-        if nucc:
-            assert isinstance(caught.value.__cause__, archive.ReferenceFamilyArchiveError)
     else:
-        assert await operation(session) == 45
-    assert session.execute.await_count == int(fault != "transaction")
-    if fault != "transaction":
-        query = str(session.execute.await_args.args[0])
-        assert "namespace.nspname='hp_snapshot_retention'" in query and "session_user=current_user" in query
-        assert "pg_catalog.pg_has_role(caller.oid,owner.oid,'USAGE')" in query
-        assert "session_replication_role" in query
+        assert await operation(session) is None
+    session.execute.assert_not_awaited()
     session.scalar.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("owner", (45, 46))
-async def test_isolated_model_creation_authenticates_owner_before_any_native_ddl(owner):
-    session = _publisher_session({"owner_oid": 45, "owner_safe": True, "caller_safe": True})
-    arguments_by_field = {
-        "create_indexes": False,
-        "ordinary_heaps": True,
-        "protected_owner_oid": owner,
-    }
+@pytest.mark.parametrize("configured_owner", ["native_owner", "bad-role"])
+async def test_isolated_model_creation_uses_configured_role_before_native_ddl(monkeypatch, configured_owner):
+    from process import source_profile_result_pins as pins
+
+    session = _publisher_session({"old_owner_token": "opaque"})
+    monkeypatch.setattr(pins, "load_role_policy", lambda: (configured_owner, ("reader",)))
+    arguments_by_field = dict(create_indexes=False, ordinary_heaps=True, protected_owner_oid="opaque retired edition")
     spec = archive.reference_family_spec("nucc")
-    if owner != 45:
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="publisher owner differs"):
+    if configured_owner == "bad-role":
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="owner role declaration"):
             await archive._create_model_family(session, spec, "candidate", **arguments_by_field)
-        session.scalar.assert_not_awaited()
-        assert session.execute.await_count == 1
-        return
-    await archive._create_model_family(session, spec, "candidate", **arguments_by_field)
-    statements = [str(call.args[0]) for call in session.execute.await_args_list]
-    assert statements[1] == 'CREATE SCHEMA "candidate" AUTHORIZATION "native_owner"'
-    assert "CREATE TABLE candidate.nucc_taxonomy" in statements[2]
-    assert "code VARCHAR NOT NULL" in statements[2]
-    assert not any(phrase in statements[2] for phrase in ("PRIMARY KEY", "FOREIGN KEY", "CREATE TRIGGER"))
-    assert len(statements) == 3
-    assert session.scalar.await_args.args[1] == {"owner": 45}
+        session.execute.assert_not_awaited()
+    else:
+        await archive._create_model_family(session, spec, "candidate", **arguments_by_field)
+        statements = [str(call.args[0]) for call in session.execute.await_args_list]
+        assert statements[0] == 'CREATE SCHEMA "candidate" AUTHORIZATION "native_owner"'
+        assert "CREATE TABLE candidate.nucc_taxonomy" in statements[1] and "code VARCHAR NOT NULL" in statements[1]
+        assert not any(part in statements[1] for part in ("PRIMARY KEY", "FOREIGN KEY", "CREATE TRIGGER"))
+        assert len(statements) == 2
+    session.scalar.assert_not_awaited()
 
 
 def _nucc_columns():
@@ -843,7 +850,7 @@ def _resign_handoff(handoff):
     (
         ("import_date", "other"),
         ("node_id", ""),
-        ("database_oid", True),
+        ("schema_name", "other"),
         ("row_count", 0),
         ("source_contract_sha256", "g" * 64),
     ),
@@ -851,12 +858,15 @@ def _resign_handoff(handoff):
 def test_resigned_handoff_cannot_bypass_closed_attempt_identity(field, value):
     handoff = _handoff_observations().handoff
     handoff[field] = value
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="handoff identity differs"):
+    with pytest.raises(
+        archive.ReferenceFamilyArchiveError,
+        match="handoff scope differs|original attempt differs|handoff digest differs|handoff differs",
+    ):
         archive.validate_nucc_native_handoff(_resign_handoff(handoff))
 
 
 @pytest.mark.parametrize(
-    "fault", ("table", "owner", "empty", "oversized", "shape", "identity", "definition", "duplicate", "order")
+    "fault", ("table", "empty", "oversized", "shape", "identity", "definition", "duplicate", "order")
 )
 def test_resigned_handoff_preserves_exact_physical_heap_and_bounded_sorted_indexes(fault):
     handoff = _handoff_observations().handoff
@@ -867,16 +877,17 @@ def test_resigned_handoff_preserves_exact_physical_heap_and_bounded_sorted_index
         "owner": (stage, "owner_oid", True),
         "empty": (stage, "indexes", []),
         "oversized": (stage, "indexes", [first] * 17),
-        "identity": (first, "index_oid", True),
+        "identity": (first, "index_name", "bad;index"),
         "definition": (first, "definition", "x" * 8193),
         "duplicate": (stage, "indexes", [first, first]),
-        "order": (stage, "indexes", [{**first, "index_oid": 49}, first]),
+        "order": (stage, "indexes", [{"index_name": "z_index", "definition": "other definition"}, first]),
         "shape": (first, "unexpected", "field"),
     }
     record, field, field_value = changes_by_fault[fault]
     record[field] = field_value
     with pytest.raises(
-        archive.ReferenceFamilyArchiveError, match="native relation differs|native indexes differ|native indexes repeat"
+        archive.ReferenceFamilyArchiveError,
+        match="native relation differs|native indexes differ|native indexes repeat|native indexes are unordered|schema name is invalid|reference family schema is invalid",
     ):
         archive.validate_nucc_native_handoff(_resign_handoff(handoff))
 
@@ -885,11 +896,14 @@ def test_resigned_handoff_preserves_exact_physical_heap_and_bounded_sorted_index
     "path,value,reason",
     (
         (("contract",), archive.NUCC_PUBLICATION_CONTRACT, "contract differs"),
-        (("sealed_owner_oid",), True, "validation differs"),
         (("validation", "row_count"), 2, "validation differs"),
         (("validation", "csv_upper_bound"), 0, "validation differs"),
         (("validation_sha256",), "b" * 64, "validation differs"),
-        (("result_generation", "relation_oids"), [99], "generation differs"),
+        (
+            ("result_generation", "relations"),
+            [{"schema_name": "other", "relation_name": "nucc_taxonomy"}],
+            "generation differs",
+        ),
         (("result_generation", "local_generation"), 2, "generation differs"),
         (("result_generation", "serving_generation", "origin_generation"), 2, "generation differs"),
         (
@@ -1095,7 +1109,7 @@ def test_terminal_source_history_cannot_claim_a_tracked_producer_generation(impo
 @pytest.mark.parametrize("fault", ("automatic", "generation", "authority"))
 def test_terminal_cutover_never_promotes_history_into_automatic_authority(fault):
     manifest = _declared_manifest("claims-pricing")
-    cutover = archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, 12, 12, "manual")
+    cutover = archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, "manual")
     if fault == "automatic":
         cutover = replace(cutover, authority="automatic")
     elif fault == "generation":
@@ -1129,20 +1143,22 @@ async def test_captured_epoch_cannot_be_reused_for_another_family_or_schema(impo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("observed", (True, False, None, 1))
-async def test_native_handoff_decision_requires_actual_catalog_boolean(observed):
-    session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value=observed))
-    assert await archive.is_nucc_native_handoff_required(session, schema_name="mrf") is (observed is True)
-    query, parameters = session.scalar.await_args.args
-    assert "hp_snapshot_retention" in str(query) and "pg_catalog.pg_has_role(current_user,relowner,'USAGE')" in str(
-        query
-    )
-    assert parameters == {"relation": '"mrf"."nucc_taxonomy"'}
+@pytest.mark.parametrize("kind", ("p", "r", None, "v"))
+async def test_native_handoff_route_uses_only_declared_permanent_parent_kind(kind):
+    session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value=kind))
+    if kind == "v":
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="kind differs"):
+            await archive.is_nucc_native_handoff_required(session, schema_name="mrf")
+    else:
+        assert await archive.is_nucc_native_handoff_required(session, schema_name="mrf") is (kind == "p")
+    query, params = session.scalar.await_args.args
+    assert "relkind" in str(query) and "relowner" not in str(query)
+    assert params == {"relation": '"mrf"."nucc_taxonomy"'}
 
 
 @pytest.mark.asyncio
 async def test_unprotected_predecessor_does_not_reserve_a_native_attempt():
-    session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value=False), execute=AsyncMock())
+    session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value="r"), execute=AsyncMock())
     context_by_field = {}
     assert await archive.bind_nucc_native_attempt(session, context_by_field, schema_name="mrf") is None
     assert context_by_field == {}
@@ -1152,25 +1168,20 @@ async def test_unprotected_predecessor_does_not_reserve_a_native_attempt():
 
 @pytest.mark.asyncio
 async def test_missing_native_heap_refuses_before_index_catalog_or_mutation():
-    session = SimpleNamespace(execute=AsyncMock(return_value=_Rows()))
+    session = SimpleNamespace(scalar=AsyncMock(return_value=None), execute=AsyncMock())
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="native candidate is missing"):
         await archive._observe_nucc_native_stage(session, "mrf", "nucc_taxonomy_candidate")
-    session.execute.assert_awaited_once()
-    query, parameters = session.execute.await_args.args
+    session.execute.assert_not_awaited()
+    query, params = session.scalar.await_args.args
     assert "NOT relrowsecurity" in str(query) and "NOT indisvalid OR NOT indisready OR NOT indislive" in str(query)
-    assert parameters == {"relation": '"mrf"."nucc_taxonomy_candidate"'}
+    assert "relfilenode" not in str(query) and "relowner" not in str(query)
+    assert params == {"relation": '"mrf"."nucc_taxonomy_candidate"', "hook": None}
 
 
-def test_resigned_native_handoff_cannot_reuse_its_predecessor_heap():
+def test_resigned_native_handoff_cannot_select_the_canonical_serving_name_as_candidate():
     handoff = _handoff_observations().handoff
-    handoff.pop("precreated_stage")
-    handoff["contract"] = archive.NUCC_HANDOFF_CONTRACT
-    handoff["incumbent"].update(
-        local_generation=1,
-        relation_oids=[handoff["stage"]["relation_oid"]],
-        serving_generation=_serving_generation().as_dict(),
-    )
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="stage reuses its predecessor"):
+    handoff["stage"]["table_name"] = "nucc_taxonomy"
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="native relation differs"):
         archive.validate_nucc_native_handoff(_resign_handoff(handoff))
 
 
@@ -1178,7 +1189,7 @@ def test_resigned_native_handoff_cannot_reuse_its_predecessor_heap():
 def test_abandonment_decoder_binds_exact_stage_and_canonical_identity_before_cleanup(fault):
     _run, handoff, abandonment = _cleanup_inputs()
     if fault == "custody":
-        abandonment["candidate_custody"]["stage"] = {**handoff["stage"], "relfilenode": 999}
+        abandonment["candidate_custody"]["stage"] = {**handoff["stage"], "table_name": "other"}
     else:
         field, value = {
             "reason": ("reason", "expired"),
@@ -1219,7 +1230,9 @@ async def test_cleanup_rechecks_exact_terminal_ledger_before_any_physical_lookup
         return handoff["import_run_oid"]
 
     session = SimpleNamespace(
-        execute=AsyncMock(return_value=_Rows([] if run is None else [run])), scalar=AsyncMock(side_effect=scalar)
+        in_transaction=lambda: True,
+        execute=AsyncMock(return_value=_Rows([] if run is None else [run])),
+        scalar=AsyncMock(side_effect=scalar),
     )
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="cleanup run differs|cleanup receipt differs"):
         await archive._require_nucc_cleanup_run(session, handoff, abandonment)
@@ -1268,7 +1281,9 @@ async def test_cleanup_cancellation_cannot_change_original_observation(reason, s
         assert "relation.oid FROM pg_catalog.pg_class" in sql
         return handoff["import_run_oid"]
 
-    session = SimpleNamespace(execute=AsyncMock(return_value=_Rows([run])), scalar=AsyncMock(side_effect=scalar))
+    session = SimpleNamespace(
+        in_transaction=lambda: True, execute=AsyncMock(return_value=_Rows([run])), scalar=AsyncMock(side_effect=scalar)
+    )
     with pytest.raises(archive.ReferenceFamilyArchiveError):
         await archive._require_nucc_cleanup_run(session, handoff, abandonment)
     session.execute.assert_awaited_once()
@@ -1284,8 +1299,8 @@ def test_completed_cleanup_requires_canceled_marker(status, message):
         archive._require_nucc_cleanup_terminal(run, handoff, run["metrics"]["nucc_handoff"], abandonment["reason"])
 
 
-@pytest.mark.parametrize("fault", ("shape", "empty", "extra", "live", "relation", "oid", "database"))
-def test_retained_inventory_refuses_live_or_substituted_storage_before_cleanup(fault):
+@pytest.mark.parametrize("fault", ("shape", "empty", "extra", "live", "relation"))
+def test_retained_inventory_refuses_nonisolated_or_ambiguous_names(fault):
     inventory = _retained_inventory()
     if fault == "shape":
         inventory["unexpected"] = True
@@ -1293,15 +1308,10 @@ def test_retained_inventory_refuses_live_or_substituted_storage_before_cleanup(f
         inventory["relations"] = []
     elif fault == "extra":
         inventory["relations"].append(dict(inventory["relations"][0]))
-    elif fault == "database":
-        inventory["database_oid"] = True
+    elif fault == "live":
+        inventory["relations"][0]["schema_name"] = "mrf"
     else:
-        field, value = {
-            "live": ("schema_name", "mrf"),
-            "relation": ("relation_name", "other"),
-            "oid": ("relation_oid", 2**32),
-        }[fault]
-        inventory["relations"][0][field] = value
+        inventory["relations"][0]["relation_name"] = "other"
     with pytest.raises(
         archive.ReferenceFamilyArchiveError, match="retained inventory|retained family|retained location"
     ):
@@ -1309,7 +1319,7 @@ def test_retained_inventory_refuses_live_or_substituted_storage_before_cleanup(f
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ("cleanup-owner", "cleanup-callback", "retire", "publish"))
+@pytest.mark.parametrize("operation", ("cleanup-callback", "retire", "publish"))
 async def test_native_retirement_and_publication_require_trusted_callbacks_before_sql(operation):
     _run, handoff, abandonment = _cleanup_inputs()
     session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(), scalar=AsyncMock())
@@ -1321,7 +1331,6 @@ async def test_native_retirement_and_publication_require_trusted_callbacks_befor
                 session,
                 handoff,
                 abandonment=abandonment,
-                runtime_owner_oids=() if operation == "cleanup-owner" else (handoff["stage"]["owner_oid"],),
                 assert_unreferenced=None if operation == "cleanup-callback" else AsyncMock(),
             )
         elif operation == "retire":
@@ -1349,7 +1358,7 @@ def test_publication_decoder_refuses_additional_unbound_authority():
 
 @pytest.mark.asyncio
 async def test_manual_activation_cannot_rotate_an_owner_sealed_nucc_predecessor():
-    session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value=True), execute=AsyncMock())
+    session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value="p"), execute=AsyncMock())
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="requires validated publisher activation"):
         await archive.activate_reference_family_stage(
             session,
@@ -1486,35 +1495,44 @@ async def test_restored_canonical_auxiliary_keeps_native_set_and_historical_hash
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ("oid", "protected-owner"))
-async def test_native_attempt_authenticates_predecessor_before_recording_context_or_precreating(fault):
+@pytest.mark.parametrize("fault", ("location", "storage"))
+async def test_native_attempt_checks_declared_predecessor_and_storage_before_context_or_precreation(monkeypatch, fault):
+    from dataclasses import replace
+
+    from process import reference_family_result_generation as generation
+
     stage = _nucc_stage_receipt()
-    context_by_field = {
+    ctx_by_field = {
         "control_run_id": stage["run_id"],
         "context": {
             "_control_attempt_id": stage["attempt_id"],
             "_control_attempt_started_at": stage["attempt_started_at"],
         },
     }
-    original_context = deepcopy(context_by_field)
-    authority_by_field = {
-        **stage["incumbent"],
-        **_serving_generation().as_dict(),
-        "local_generation": 1,
-        "relation_oids": [46],
-    }
-    session = SimpleNamespace(
-        in_transaction=lambda: True,
-        execute=AsyncMock(return_value=_Rows([authority_by_field])),
-        scalar=AsyncMock(side_effect=[True, 47] if fault == "oid" else [True, 46, None]),
+    before = deepcopy(ctx_by_field)
+    authority = archive._nucc_result_authority(
+        {
+            **stage["incumbent"],
+            "local_generation": 1,
+            "serving_generation": _serving_generation().as_dict(),
+            "relations": [{"schema_name": "mrf", "relation_name": "nucc_taxonomy"}],
+        }
     )
-    with pytest.raises(RuntimeError, match="native predecessor differs|protected owner is unavailable"):
-        await archive.bind_nucc_native_attempt(session, context_by_field, schema_name="mrf")
-    assert context_by_field == original_context
-    session.execute.assert_awaited_once()
-    assert str(session.execute.await_args.args[0]).startswith("SELECT importer_id, local_lineage_id")
-    assert session.execute.await_args.args[1] == {"importer_id": "nucc"}
-    assert session.scalar.await_count == (2 if fault == "oid" else 3)
+    if fault == "location":
+        authority = replace(authority, relations=(("other", "nucc_taxonomy"),))
+    session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value="p"), execute=AsyncMock())
+    read = AsyncMock(return_value=authority)
+    storage = AsyncMock(side_effect=RuntimeError("native model unavailable"))
+    create = AsyncMock()
+    monkeypatch.setattr(archive, "read_reference_family_result_generation_authority", read)
+    monkeypatch.setattr(generation, "require_nucc_native_predecessor_storage", storage)
+    monkeypatch.setattr(archive, "_precreate_nucc_attempt", create)
+    with pytest.raises(RuntimeError, match="predecessor is untracked|native model unavailable"):
+        await archive.bind_nucc_native_attempt(session, ctx_by_field, schema_name="mrf")
+    assert ctx_by_field == before
+    assert storage.await_count == 1
+    create.assert_not_awaited()
+    assert "relkind" in str(session.scalar.await_args.args[0])
 
 
 @pytest.mark.asyncio
@@ -1585,8 +1603,18 @@ async def test_activation_cannot_rotate_before_complete_dictionary_and_shared_cu
         await archive._complete_validated_stage_activation(
             session, spec, owner, _incumbent(importer, pairs), _declared_manifest(importer)
         )
-    session.execute.assert_not_awaited()
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    if present == "partial":
+        assert not statements
+    else:
+        assert (
+            len(statements) == 1
+            and '"mrf"."code_catalog"' in statements[0]
+            and '"mrf"."code_crosswalk"' in statements[0]
+        )
+        assert statements[0].endswith("IN SHARE ROW EXCLUSIVE MODE NOWAIT")
     assert session.scalar.await_count == (0 if present == "partial" else 2)
+    assert not any(sql.startswith(("ALTER", "UPDATE", "INSERT", "DELETE")) for sql in statements)
 
 
 @pytest.mark.asyncio
@@ -1622,7 +1650,10 @@ def test_drug_validation_receipt_requires_destination_effects_not_only_portable_
     receipt = _validation_receipt()
     receipt.update(
         importer_id="drug-claims",
-        relation_oids=sorted([[model.__tablename__, 40 + index] for index, model in enumerate(spec.model_types)]),
+        relations=[
+            {"schema_name": receipt["stage_schema"], "relation_name": name}
+            for name in sorted(model.__tablename__ for model in spec.model_types)
+        ],
         tables=[table.as_dict() for table in _declared_manifest("drug-claims").tables],
     )
     receipt["validation_sha256"] = archive._validation_digest(

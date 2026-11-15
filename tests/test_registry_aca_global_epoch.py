@@ -15,7 +15,10 @@ from process import reference_family_archive as archive
 from process import registry_aca_global_epoch as global_epoch
 from process.mrf_address_publication import REFERENCES
 from process.mrf_publication_receipt import SUMMARY_INPUTS
-from process.reference_family_result_generation import ReferenceFamilyResultGenerationAuthority
+from process.reference_family_result_generation import (
+    ReferenceFamilyResultGenerationAuthority,
+    declared_reference_family_relations,
+)
 from tests.test_registry_aca_source_recipe import (
     _DATASET,
     _ROLES,
@@ -32,7 +35,7 @@ def _global_completion():
 
     generation = validate_reference_family_serving_generation(completed["generation"]["serving_generation"])
     completed["generation"] = ReferenceFamilyResultGenerationAuthority(
-        "mrf", str(_DATASET), 2, generation, tuple(range(100, 112))
+        "mrf", str(_DATASET), 2, generation, declared_reference_family_relations("mrf", "mrf")
     ).as_dict()
     completed["summary_inputs"] = {name: index + 200 for index, name in enumerate(SUMMARY_INPUTS)}
     completed["native_address_coverage"] = {
@@ -270,3 +273,67 @@ async def test_global_comment_preserves_json_and_original_physical_transaction(m
     assert session.in_transaction()
     connection.transaction.assert_not_called()
     connection.close.assert_not_awaited()
+
+
+@pytest.mark.parametrize("edition", ["named", "legacy"])
+def test_global_generation_accepts_closed_editions_without_rewriting_raw_tokens(edition):
+    document = _global_completion()["generation"]
+    if edition == "legacy":
+        names = document.pop("relations")
+        document["relation_oids"] = list(range(1000, 1000 + len(names)))
+    saved = deepcopy(document)
+    encoded = json.dumps(document, sort_keys=True)
+    global_epoch._generation(document, _publication())
+    assert document == saved
+    assert json.dumps(document, sort_keys=True) == encoded
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "extra",
+        "mixed",
+        "missing_relation",
+        "reordered_relation",
+        "foreign_name",
+        "foreign_schema",
+        "local_bool",
+        "local_negative",
+        "lineage",
+        "origin",
+        "origin_extra",
+        "legacy_short",
+        "legacy_tuple",
+    ],
+)
+def test_global_generation_refuses_noncanonical_or_incomplete_logical_editions(damage):
+    document = _global_completion()["generation"]
+    match damage:
+        case "legacy_short" | "legacy_tuple":
+            names = document.pop("relations")
+            tokens = list(range(len(names)))
+            document["relation_oids"] = tokens[:-1] if damage == "legacy_short" else tuple(tokens)
+        case "extra":
+            document["unknown"] = True
+        case "mixed":
+            document["relation_oids"] = []
+        case "missing_relation":
+            document["relations"].pop()
+        case "reordered_relation":
+            document["relations"].reverse()
+        case "foreign_name":
+            document["relations"][0]["relation_name"] = "foreign_table"
+        case "foreign_schema":
+            document["relations"][0]["schema_name"] = "foreign_schema"
+        case "local_bool":
+            document["local_generation"] = True
+        case "local_negative":
+            document["local_generation"] = -1
+        case "lineage":
+            document["local_lineage_id"] = "foreign"
+        case "origin":
+            document["serving_generation"]["origin_generation"] += 1
+        case "origin_extra":
+            document["serving_generation"]["unknown"] = True
+    with pytest.raises(ValueError, match="registry_aca_global_epoch_invalid"):
+        global_epoch._generation(document, _publication())

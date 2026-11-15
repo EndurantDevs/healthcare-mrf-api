@@ -89,6 +89,7 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
     create_indexes = AsyncMock()
     complete_generation = AsyncMock()
     native_enrollment = AsyncMock()
+    finish_enrollment = AsyncMock()
 
     async def fake_ensure_database(_test_mode):
         return None
@@ -116,6 +117,7 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
     monkeypatch.setattr(openaddresses, "restore_openaddresses_zips", restore_zip_codes)
     monkeypatch.setattr(openaddresses, "_complete_published_generation", complete_generation)
     monkeypatch.setattr(openaddresses, "prepare_local_native_input_publication", native_enrollment)
+    monkeypatch.setattr(openaddresses, "finish_local_native_input_publication", finish_enrollment)
     monkeypatch.setattr(openaddresses, "db", _PublicationDatabase())
     monkeypatch.setattr(openaddresses, "print_time_info", lambda _started_at: None)
     await openaddresses.shutdown(
@@ -135,6 +137,7 @@ async def test_openaddresses_shutdown_uses_job_import_id_from_shared_context(mon
         ledger_schema="mrf",
         relations=(("openaddresses_geocode", "openaddresses_geocode_oadev20260619"),),
     )
+    finish_enrollment.assert_awaited_once_with(None, prepared=native_enrollment.return_value)
     assert complete_generation.await_args.kwargs["import_id"] == "oadev20260619"
 
 

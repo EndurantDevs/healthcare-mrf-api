@@ -40,19 +40,16 @@ def _assert_publish_contract(publish_database):
     sql_statements = "\n".join(publish_database.statements)
     assert publish_database.transaction_entries == 1
     assert "DROP TABLE IF EXISTS mrf.pricing_prescription" in sql_statements
-    assert (
-        "ALTER TABLE mrf.prescription_stage "
-        "RENAME TO pricing_prescription"
-    ) in sql_statements
+    assert ("ALTER TABLE mrf.prescription_stage RENAME TO pricing_prescription") in sql_statements
     assert "ALTER TABLE IF EXISTS mrf.prescription_stage" not in sql_statements
     assert "prescription_stage_pricing_prescription_rx_code_idx" in sql_statements
     assert "prescription_stage_year_idx RENAME TO year_idx" in sql_statements
     assert "provider_stage RENAME TO pricing_provider_prescription" in sql_statements
-    assert (
-        "provider_stage_rx_ac_gin "
-        "RENAME TO pricing_provider_rx_autocomplete_trgm_idx"
-    ) in sql_statements
+    assert ("provider_stage_rx_ac_gin RENAME TO pricing_provider_rx_autocomplete_trgm_idx") in sql_statements
     assert "autocomplete_stage RENAME TO pricing_provider_rx_rollup" in sql_statements
+    assert publish_database.statements[-1] == (
+        "UPDATE mrf.pricing_provider_rx_rollup SET source_relation_fingerprint='mrf.pricing_provider_prescription';"
+    )
 
 
 @pytest.mark.asyncio
@@ -66,9 +63,7 @@ async def test_publish_renames_tables_and_declared_indexes(monkeypatch):
                 {"index_elements": ("rx_code",)},
                 {},
             ),
-            "__my_additional_indexes__": (
-                {"name": "year_idx", "index_elements": ("source_year",)},
-            ),
+            "__my_additional_indexes__": ({"name": "year_idx", "index_elements": ("source_year",)},),
         },
     )
     provider_model = type(
@@ -119,11 +114,7 @@ async def test_staging_build_declares_autocomplete_trigram_index(monkeypatch):
     await drug_claims._ensure_indexes(staging_model, "mrf")
 
     assert len(f"{staging_model.__tablename__}_rx_ac_gin") < 64
-    autocomplete_statements = [
-        statement
-        for statement in publish_database.statements
-        if "rx_ac_gin" in statement
-    ]
+    autocomplete_statements = [statement for statement in publish_database.statements if "rx_ac_gin" in statement]
     assert autocomplete_statements == [
         "CREATE INDEX IF NOT EXISTS "
         "pricing_provider_prescription_autocomplete_contract_rx_ac_gin "
@@ -237,16 +228,12 @@ def test_cleanup_requires_explicit_owned_work_directory(
     )
     remove_tree = Mock(wraps=drug_claims.shutil.rmtree)
     monkeypatch.setattr(drug_claims.shutil, "rmtree", remove_tree)
-    drug_claims._cleanup_drug_claims_workdir(
-        _drug_cleanup_request({"status": "ready"})
-    )
+    drug_claims._cleanup_drug_claims_workdir(_drug_cleanup_request({"status": "ready"}))
     remove_tree.assert_not_called()
 
     outside_directory = tmp_path / "outside"
     outside_directory.mkdir()
-    drug_claims._cleanup_drug_claims_workdir(
-        _drug_cleanup_request({"work_dir": str(outside_directory)})
-    )
+    drug_claims._cleanup_drug_claims_workdir(_drug_cleanup_request({"work_dir": str(outside_directory)}))
     assert outside_directory.is_dir()
     remove_tree.assert_not_called()
 
@@ -264,9 +251,7 @@ def test_cleanup_removes_completed_owned_work_directory(
         str(work_dir_root),
     )
     monkeypatch.setattr(drug_claims, "DRUG_CLAIMS_KEEP_WORKDIR", False)
-    drug_claims._cleanup_drug_claims_workdir(
-        _drug_cleanup_request({"work_dir": str(completed_directory)})
-    )
+    drug_claims._cleanup_drug_claims_workdir(_drug_cleanup_request({"work_dir": str(completed_directory)}))
     assert not completed_directory.exists()
 
 
@@ -283,9 +268,7 @@ def test_cleanup_preserves_owned_work_directory_when_retained(
         str(work_dir_root),
     )
     monkeypatch.setattr(drug_claims, "DRUG_CLAIMS_KEEP_WORKDIR", True)
-    drug_claims._cleanup_drug_claims_workdir(
-        _drug_cleanup_request({"work_dir": str(run_directory)})
-    )
+    drug_claims._cleanup_drug_claims_workdir(_drug_cleanup_request({"work_dir": str(run_directory)}))
     assert run_directory.is_dir()
 
 

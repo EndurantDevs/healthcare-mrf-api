@@ -88,11 +88,11 @@ async def stage_prepared_identities(workspace, handoff):
     document = handoff.document
     declared = document["tables"][storage.WITNESS]
     witness = storage_relation(workspace.policy.schema, declared["name"])
-    frozen_names_by_oid = {
-        native_record["relation_oid"]: native_record["relation_name"]
+    frozen_names = {
+        (native_record["schema_name"], native_record["relation_name"])
         for native_record in workspace._inputs["frozen_inventory"]["relations"]
     }
-    _require(frozen_names_by_oid.get(declared["oid"]) == declared["name"], "witness_changed")
+    _require((workspace.policy.schema, declared["name"]) in frozen_names, "witness_changed")
     release = workspace.identity["metadata"]["source_release"]
     family_counts_by_type = {}
     async with _savepoint(workspace.connection):

@@ -184,8 +184,8 @@ async def test_same_session_composer_refuses_missing_or_different_scope(detail_b
 @pytest.mark.asyncio
 async def test_padded_native_eligibility_uses_exact_ten_character_import_value():
     class Session:
-        async def execute(self, statement, parameters):
-            assert parameters == {}
+        async def execute(self, statement, parameters=None):
+            assert parameters in (None, {})
             self.statement = statement
 
             class Result:

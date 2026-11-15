@@ -2,6 +2,7 @@
 """Closed retained-output protocol inside existing resource checkpoint evidence."""
 
 from copy import deepcopy
+from dataclasses import replace
 
 from process.provider_directory_dataset_rehydrate_pages import _key_columns
 from process.provider_directory_dataset_rehydrate_types import DatasetRehydrationError
@@ -59,7 +60,7 @@ def _stage(entry, digest, target):
         _require(
             receipt.operation_digest == digest
             and receipt.incumbent == stage.incumbent
-            and receipt.successor.oid == stage.oid
+            and receipt.successor.schema == stage.schema
             and receipt.successor.relation == stage.relation
             and receipt.successor.target == target,
             "stage_receipt_changed",
@@ -98,8 +99,13 @@ def _generation(generation_by_field, digest):
         if prepared:
             _require(
                 all(
-                    before["incumbent"]["oid"] == after.old_oid and before["successor"]["oid"] == after.new_oid
-                    for before, after in zip(prepared, receipts, strict=True)
+                    _is_relocated_output_equal(before.incumbent, after.incumbent)
+                    and _is_relocated_output_equal(before.successor, after.successor)
+                    for before, after in zip(
+                        (PreparedOutputReceipt.from_payload(receipt_payload) for receipt_payload in prepared),
+                        receipts,
+                        strict=True,
+                    )
                 ),
                 "generation_invalid",
             )
@@ -107,8 +113,13 @@ def _generation(generation_by_field, digest):
         _require(generation_by_field["proofs"] is None, "generation_invalid")
 
 
+def _is_relocated_output_equal(before, after):
+    """Compare unchanged logical output metadata across the declared atomic rename."""
+    return replace(before, relation=after.relation) == after
+
+
 def output_journal(evidence):
-    """Validate stored structure; native custody remains a separate mandatory check."""
+    """Validate stored structure while native grants enforce the live named operations."""
     value = deepcopy(evidence.get("output_snapshots", {"protocol": 1, "active": None, "generations": {}}))
     _require(
         type(value) is dict
@@ -166,24 +177,41 @@ def begin_preparation(journal, operation, targets, members):
     return result
 
 
+def _require_stage_progress(old, stage, entry_by_field, receipt):
+    """Reject name substitution, sealed changes or cursor rewind before updating progress."""
+    _require(OutputStage.from_payload(old["stage"]) == stage and entry_by_field["rows"] >= old["rows"], "stage_changed")
+    _require(
+        old["receipt"] is None
+        or (
+            receipt is not None
+            and old["rows"] == entry_by_field["rows"]
+            and old["cursor"] == entry_by_field["cursor"]
+            and PreparedOutputReceipt.from_payload(old["receipt"]) == receipt
+        ),
+        "sealed_stage_changed",
+    )
+    _require(entry_by_field["rows"] > old["rows"] or old["cursor"] == entry_by_field["cursor"], "cursor_changed")
+
+
 def record_stage(journal, stage, *, cursor, rows, receipt=None):
-    """COPY and its exact stage/cursor/count witness commit together."""
+    """COPY and its named stage/cursor/count evidence commit together."""
     result = output_journal({"output_snapshots": journal})
     active = result["active"]
     _require(active is not None and stage.operation_digest == active["operation_digest"], "active_conflict")
     _require(stage.target in active["targets"], "stage_changed")
     entry_by_field = dict(
-        stage=stage.to_payload(),
+        stage=stage.named_payload(),
         cursor=list(cursor) if cursor is not None else None,
         rows=rows,
-        receipt=receipt.to_payload() if receipt is not None else None,
+        receipt=receipt.named_payload() if receipt is not None else None,
     )
     _stage(entry_by_field, stage.operation_digest, stage.target)
     old = active["stages"].get(stage.target)
     if old is not None:
-        _require(old["stage"] == entry_by_field["stage"] and rows >= old["rows"], "stage_changed")
-        _require(old["receipt"] is None or old == entry_by_field, "sealed_stage_changed")
-        _require(rows > old["rows"] or old["cursor"] == entry_by_field["cursor"], "cursor_changed")
+        _require_stage_progress(old, stage, entry_by_field, receipt)
+        if old["receipt"] is not None:
+            return result
+        entry_by_field["stage"] = old["stage"]
     active["stages"][stage.target] = entry_by_field
     return result
 
@@ -205,7 +233,7 @@ def seal_preparation(journal):
 
 
 def publish_generation(journal, digest, retained, proofs):
-    """The same physical cut transaction appends receipts and clears its active intent."""
+    """The same atomic cut transaction appends receipts and clears its active intent."""
     result = output_journal({"output_snapshots": journal})
     active = result["active"]
     _require(active is not None and active["operation_digest"] == digest, "active_conflict")
@@ -213,7 +241,7 @@ def publish_generation(journal, digest, retained, proofs):
     _require(generation is not None, "preparation_incomplete")
     published_by_field = {
         **generation,
-        "published": [receipt.to_payload() for receipt in retained],
+        "published": [receipt.named_payload() for receipt in retained],
         "proofs": deepcopy(proofs),
     }
     _generation(published_by_field, digest)
@@ -221,6 +249,24 @@ def publish_generation(journal, digest, retained, proofs):
     result["generations"][digest] = published_by_field
     result["active"] = None
     return result
+
+
+def _require_rollback_outputs(prior, generation_by_field, retained):
+    """Require the exact inverse logical output set without reinterpreting old tokens."""
+    _require(
+        prior["targets"] == generation_by_field["targets"]
+        and prior["members"] == generation_by_field["members"]
+        and all(
+            _is_relocated_output_equal(old.incumbent, new.successor)
+            and _is_relocated_output_equal(old.successor, new.incumbent)
+            for old, new in zip(
+                (RetainedOutputReceipt.from_payload(receipt_payload) for receipt_payload in prior["published"]),
+                retained,
+                strict=True,
+            )
+        ),
+        "rollback_changed",
+    )
 
 
 def record_rollback(journal, operation, targets, members, retained, proofs):
@@ -234,20 +280,12 @@ def record_rollback(journal, operation, targets, members, retained, proofs):
         targets=list(targets),
         members=_members(members),
         prepared=[],
-        published=[receipt.to_payload() for receipt in retained],
+        published=[receipt.named_payload() for receipt in retained],
         proofs=deepcopy(proofs),
     )
     digest = _intent(generation_by_field)
     _generation(generation_by_field, digest)
-    _require(
-        prior["targets"] == generation_by_field["targets"]
-        and prior["members"] == generation_by_field["members"]
-        and all(
-            old["incumbent"]["oid"] == new.new_oid and old["successor"]["oid"] == new.old_oid
-            for old, new in zip(prior["published"], retained, strict=True)
-        ),
-        "rollback_changed",
-    )
+    _require_rollback_outputs(prior, generation_by_field, retained)
     _require(result["generations"].get(digest, generation_by_field) == generation_by_field, "generation_changed")
     result["generations"][digest] = generation_by_field
     return result

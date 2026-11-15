@@ -4,10 +4,11 @@ import json
 from copy import deepcopy
 from uuid import UUID
 
+import asyncpg
 import pytest
 
 from process import registry_ptg_source_notifications as notices
-from process.registry_ptg_office_capture import _canonical, _digest
+from process.registry_ptg_office_capture import _canonical, _digest, office_storage
 from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
 from tests.test_registry_ptg_office_selection import _pair
 
@@ -29,28 +30,36 @@ IDENTITY = {
 
 
 def event(capture=1):
-    _, row, _ = _pair()
-    document = json.loads(row["approval_json"])
+    _, receipt_by_field, _ = _pair()
+    document = json.loads(receipt_by_field["approval_json"])
     capture_id = str(UUID(int=capture))
     document["capture_id"] = document["command"]["capture_id"] = capture_id
     document["actor"] = {"kind": "platform_admin", "client_id": "system", "user_id": str(UUID(int=99))}
-    document["witness"]["contract"] = "registry_ptg_office_witness.v1"
-    row.update(
+    schema = "registry_ptg_office_" + UUID(capture_id).hex
+    document["witness"].update(
+        contract="registry_ptg_office_witness.v1",
+        capture_id=capture_id,
+        schema_name=schema,
+        command_sha256=_digest(document["command"]),
+        storage=office_storage(schema, document["manifest_sha256"]),
+    )
+    receipt_by_field.update(
         capture_id=capture_id,
         actor_key=_digest(document["actor"]),
         idempotency_key=document["command"]["idempotency_key"],
     )
-    hold = json.loads(row["hold_json"])
-    row["approval_sha256"] = hold["approval_sha256"] = _digest(document)
+    hold = json.loads(receipt_by_field["hold_json"])
+    receipt_by_field["approval_sha256"] = hold["approval_sha256"] = _digest(document)
     hold.update(
         capture_id=capture_id,
-        schema_name="registry_ptg_office_" + UUID(capture_id).hex,
+        schema_name=schema,
+        storage=document["witness"]["storage"],
         witness_sha256=_digest(document["witness"]),
     )
-    row.update(
+    receipt_by_field.update(
         approval_json=_canonical(document).decode(), hold_json=_canonical(hold).decode(), hold_sha256=_digest(hold)
     )
-    return row
+    return receipt_by_field
 
 
 class Reader:
@@ -102,8 +111,15 @@ class Reader:
             key=lambda row: row["capture_id"],
         )[:limit]
 
-    def execute(self, *_args):
-        pytest.fail("discovery attempted a mutation/authority change")
+    async def execute(self, statement):
+        assert statement in {
+            'SELECT capture_id FROM "office_control".registry_ptg_office_approval LIMIT 0',
+            'SELECT capture_id FROM "office_control".registry_ptg_office_hold LIMIT 0',
+        }
+        if not self.protected:
+            raise asyncpg.InsufficientPrivilegeError("synthetic named table SELECT denied")
+        self.calls.append((statement, ()))
+        return "SELECT 0"
 
 
 async def page(reader, **kw):
@@ -163,7 +179,7 @@ async def test_empty_cycle_and_no_mutation_of_caller_cursor():
 async def test_wrong_native_authority_refuses_before_header_read(field, value):
     reader = Reader([event()])
     setattr(reader, field, value)
-    with pytest.raises(ValueError):
+    with pytest.raises((ValueError, asyncpg.InsufficientPrivilegeError)):
         await page(reader)
     assert not any("LEFT JOIN" in sql for sql, _ in reader.calls)
 

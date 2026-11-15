@@ -461,7 +461,7 @@ async def test_direct_v4_replay_survives_terminal_window_round_trip(
 ):
     """Keep one sealed direct-v4 root valid across v5 upgrade and downgrade."""
 
-    scenario = await create_committed_subset_schema(monkeypatch)
+    scenario = await create_committed_subset_schema(monkeypatch, owned_database=True)
     direct = _load_migration(
         DIRECT_DISPOSITION_MIGRATION_PATH,
         "provider_directory_terminal_window_direct_predecessor",

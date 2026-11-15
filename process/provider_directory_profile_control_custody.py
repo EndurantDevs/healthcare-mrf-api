@@ -16,10 +16,6 @@ from process.provider_directory_profile_source_wal import source_owned_wal_trans
 def _retain_origin(group_by_field, outcome):
     if outcome is not None and group_by_field["original_outcome"] is None:
         group_by_field["original_outcome"] = outcome
-        group_by_field["session"] = outcome.session
-        group_by_field["connection"] = outcome.connection
-        group_by_field["driver"] = outcome.retained_driver
-        group_by_field["pid"] = outcome.retained_pid
 
 
 def consume_owned_groups(fhir, outcome, failure, *, groups=None):
@@ -44,19 +40,11 @@ def consume_owned_groups(fhir, outcome, failure, *, groups=None):
         and outcome.cleanup_complete
         and outcome.status == "committed_measured"
         and isinstance(outcome.measurement, BackendWalDiagnosticResult)
-        and outcome.measurement.baseline.identity == outcome.measurement.final.identity
-        and outcome.retained_pid == outcome.measurement.final.identity.pid
     )
     for group_by_field in matching_groups:
         if not (
             measured
             and group_by_field["task"] is asyncio.current_task()
-            and group_by_field["session"] is outcome.session
-            and group_by_field["connection"] is outcome.connection
-            and group_by_field["driver"] is outcome.retained_driver
-            and group_by_field["driver"] is not None
-            and type(group_by_field["pid"]) is int
-            and group_by_field["pid"] == outcome.retained_pid
             and group_by_field["outcome"] is outcome
             and group_by_field["body_complete"] is True
             and group_by_field["original_outcome"] is outcome
@@ -106,10 +94,6 @@ async def transaction(fhir, original, *, identity, enabled, groups=None, stateme
         "original_statement_custody": statement_custody,
         "original_outcome": None,
         "outcome": None,
-        "session": None,
-        "connection": None,
-        "driver": None,
-        "pid": None,
         "body_complete": False,
         "failure": None,
         "consumed": False,

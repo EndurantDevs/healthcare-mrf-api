@@ -16,6 +16,7 @@ from .test_provider_directory_profile_control_capacity import (
 importer = importlib.import_module("process.provider_directory_fhir")
 capacity = importlib.import_module("process.provider_directory_profile_capacity")
 
+
 def _published_dataset_state() -> dict[str, object]:
     return {
         "dataset_id": "dataset-1",
@@ -49,24 +50,15 @@ def _profile_serving_state(
         selection_proof_id="2" * 64,
         authority_revision=6,
         profile_schema_version=1,
-        profile_strategy_version=(
-            importer.profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
-        ),
+        profile_strategy_version=(importer.profile_artifact.PROFILE_BUILD_STRATEGY_VERSION),
         source_vector=source_vector,
-        source_vector_hash=(
-            importer._provider_directory_profile_source_vector_hash(
-                source_vector
-            )
-        ),
+        source_vector_hash=(importer._provider_directory_profile_source_vector_hash(source_vector)),
         source_context_vector=source_context_vector,
         source_context_vector_hash=(
-            importer._provider_directory_profile_source_context_vector_hash(
-                source_context_vector
-            )
+            importer._provider_directory_profile_source_context_vector_hash(source_context_vector)
         ),
         executable_plan_hash="3" * 64,
-        evidence_target_oid=101,
-        profile_target_oid=102,
+        targets=importer._provider_directory_profile_target_coordinates("mrf"),
         evidence_rows=5,
         profile_rows=2,
         profile_as_of="2026-07-30",
@@ -80,10 +72,7 @@ def _wal_tracker_admission():
         geometry=geometry,
         control_wal_projection=control_projection,
         lease=SimpleNamespace(
-            max_build_deadline=(
-                datetime.datetime.now(datetime.UTC)
-                + datetime.timedelta(minutes=10)
-            )
+            max_build_deadline=(datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=10))
         ),
         database_identity=SimpleNamespace(),
         build_id="pdpb_" + "a" * 32,
@@ -102,17 +91,11 @@ def _capacity_consumption_row(admission):
     return {
         "attestation_id": admission.lease.attestation_id,
         "lease_digest": admission.lease.lease_digest,
-        "capacity_geometry_hash": capacity.capacity_geometry_hash(
-            admission.geometry
-        ),
+        "capacity_geometry_hash": capacity.capacity_geometry_hash(admission.geometry),
         "executable_plan_hash": admission.geometry.executable_plan_hash,
         "selection_proof_id": admission.geometry.selection_proof_id,
-        "source_vector_hash": (
-            admission.geometry.desired_source_vector_hash
-        ),
-        "source_context_vector_hash": (
-            admission.geometry.desired_context_vector_hash
-        ),
+        "source_vector_hash": (admission.geometry.desired_source_vector_hash),
+        "source_context_vector_hash": (admission.geometry.desired_context_vector_hash),
         "run_id": admission.run_id,
         "build_id": admission.build_id,
         "profile_as_of": admission.geometry.profile_as_of,

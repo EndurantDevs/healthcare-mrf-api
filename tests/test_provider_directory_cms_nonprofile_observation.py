@@ -77,14 +77,14 @@ async def test_catalog_facade_forwards_only_existing_constructors():
         _profile_capacity_relation_row=AsyncMock(),
         _profile_capacity_relation_catalog=AsyncMock(),
         _profile_bucket_index_row=AsyncMock(),
-        _provider_directory_profile_relation_storage_fingerprint=AsyncMock(),
+        _provider_directory_profile_capacity_relation_layout=AsyncMock(),
     )
     database = object()
     reader = observation.catalog_observation(directory, database)
     await reader._profile_capacity_relation_row(1, "p", 0)
     await reader._profile_capacity_relation_catalog([1])
     await reader._profile_bucket_index_row("s", "t", "i", "r")
-    await reader._provider_directory_profile_relation_storage_fingerprint(1, expected_persistence="p")
+    await reader._provider_directory_profile_capacity_relation_layout(1, expected_persistence="p")
     assert reader.db is database
     for constructor in vars(directory).values():
         assert constructor.await_args.kwargs["database"] is database
@@ -98,28 +98,28 @@ def test_observer_routing_keeps_source_reader_controls_and_ret_separate():
         source_relations={("source", "address"): 1, ("source", "private"): 2, ("source", "address_other"): 3},
         address_relations={("source", "address"): 1, ("source", "address_other"): 3},
         retained_tables={"retained": ("copy",)},
-        retained_relations={},
+        retained_relations=set(),
     )
     readers = observation._Observers(scope, controls)
-    pinned = readers.database_for(OwnedRelation("source", "address", 1, 4, "p"))
+    pinned = readers.database_for(OwnedRelation("source", "address", 4, "p"))
     assert isinstance(pinned, observation._ReaderCatalog) and pinned.source_input is source_input
-    assert readers.database_for(OwnedRelation("source", "address_other", 3, 4, "p")) is pinned
-    assert readers.database_for(OwnedRelation("source", "private", 2, 8, "p")) is controls
-    assert readers.database_for(OwnedRelation("retained", "copy", 3, 16, "p")) is None
-    for relation in (OwnedRelation("source", "address", 99, 0, "p"), OwnedRelation("retained", "foreign", 4, 0, "p")):
+    assert readers.database_for(OwnedRelation("source", "address_other", 4, "p")) is pinned
+    assert readers.database_for(OwnedRelation("source", "private", 8, "p")) is controls
+    assert readers.database_for(OwnedRelation("retained", "copy", 16, "p")) is None
+    for relation in (OwnedRelation("source", "foreign", 0, "p"), OwnedRelation("retained", "foreign", 0, "p")):
         with pytest.raises(RuntimeError, match="observation_changed"):
             readers.database_for(relation)
 
 
 @pytest.mark.asyncio
-async def test_measure_keeps_complete_aggregate_and_rejects_oid_substitution():
+async def test_measure_keeps_complete_named_aggregate_and_refuses_missing_names():
     admission = _admission()
     admission._started = True
     admission._relations = {
-        ("source", "closed"): 11,
-        ("source", "closed_other"): 12,
-        ("retained", "copy"): 22,
-        ("retained", "copy_other"): 23,
+        ("source", "closed"),
+        ("source", "closed_other"),
+        ("retained", "copy"),
+        ("retained", "copy_other"),
     }
     source_database = SimpleNamespace(
         all=AsyncMock(
@@ -146,18 +146,15 @@ async def test_measure_keeps_complete_aggregate_and_rejects_oid_substitution():
         _pagination_checkpoint_row_mapping=lambda catalog_record: catalog_record,
     )
     measured_relations = await admission._measure(directory, "retained", (), observers=readers)
-    assert [(relation.schema, relation.relation, relation.oid) for relation in measured_relations] == [
-        ("retained", "copy", 22),
-        ("retained", "copy_other", 23),
-        ("source", "closed", 11),
-        ("source", "closed_other", 12),
-    ]
+    assert [(relation.schema, relation.relation) for relation in measured_relations] == sorted(admission._relations)
     assert sum(relation.total_bytes for relation in measured_relations) == 480
     assert source_database.all.await_count == target_database.all.await_count == 1
     assert source_database.all.await_args.kwargs == {"relation_refs": ["source.closed", "source.closed_other"]}
     assert target_database.all.await_args.kwargs == {"relation_refs": ["retained.copy", "retained.copy_other"]}
     assert readers.record.call_count == 4
     source_database.all.return_value[0]["oid"] = 99
+    assert await admission._measure(directory, "retained", (), observers=readers) == measured_relations
+    source_database.all.return_value.pop()
     with pytest.raises(RuntimeError, match="relation_changed"):
         await admission._measure(directory, "retained", (), observers=readers)
 
@@ -176,7 +173,7 @@ async def test_raw_columns_use_issued_input_branch_without_parent_lookup(monkeyp
     captured = AsyncMock(return_value=(1, [source_attribute_by_field]))
     monkeypatch.setattr(observation, "pinned_raw_attributes", captured)
     directory = SimpleNamespace(db=SimpleNamespace(scalar=AsyncMock(side_effect=AssertionError("parent lookup"))))
-    relation = OwnedRelation("retained", "provider_directory_resource_raw", 2, 0, "p")
+    relation = SimpleNamespace(schema="retained", relation="provider_directory_resource_raw", oid=2, persistence="p")
     source_input = object()
     await raw_layout._require_source_columns(directory, relation, {}, [target_attribute_by_field], source_input)
     captured.assert_awaited_once_with(directory, source_input, {}, relation.relation)
@@ -216,7 +213,9 @@ def test_unissued_observation_constructor_cannot_authorize_io():
 def test_same_origin_still_requires_both_exact_signed_seals(field):
     from process.network_fhir_source_epoch import _ORIGIN_FIELDS
 
-    pin_by_field = dict.fromkeys(_ORIGIN_FIELDS, "synthetic")
+    pin_by_field = dict.fromkeys(
+        tuple(name for name in _ORIGIN_FIELDS if name != "resource_table_oid") + ("resource_relation",), "synthetic"
+    )
     source_input = SimpleNamespace(
         source_pin=SimpleNamespace(**pin_by_field), admission_sha256="aa" * 32, metadata_sha256="bb" * 32
     )
@@ -231,25 +230,14 @@ def test_same_origin_still_requires_both_exact_signed_seals(field):
         observation._require_epoch_policy(source_input, policy_by_field)
 
 
-@pytest.mark.parametrize(
-    "coordinate,changed",
-    [
-        (("source", "closed"), None),
-        (("source", "closed"), 99),
-        (("retained", "copy"), None),
-        (("retained", "copy"), 99),
-    ],
-)
-def test_budget_inventory_cannot_drop_or_replace_an_observed_member(coordinate, changed):
+@pytest.mark.parametrize("coordinate", [("source", "closed"), ("retained", "copy")])
+def test_budget_inventory_cannot_drop_an_observed_named_member(coordinate):
     scope = object.__new__(observation._RetainedObservations)
-    scope.source_relations = {("source", "closed"): 1}
-    scope.retained_relations = {("retained", "copy"): 2}
-    scope.admission = SimpleNamespace(_relations={**scope.source_relations, **scope.retained_relations})
+    scope.source_relations = {("source", "closed")}
+    scope.retained_relations = {("retained", "copy")}
+    scope.admission = SimpleNamespace(_relations=scope.source_relations | scope.retained_relations)
     scope.require_inventory()
-    if changed is None:
-        del scope.admission._relations[coordinate]
-    else:
-        scope.admission._relations[coordinate] = changed
+    scope.admission._relations.remove(coordinate)
     with pytest.raises(RuntimeError, match="observation_changed"):
         scope.require_inventory()
 
@@ -314,13 +302,40 @@ async def test_source_observer_opens_after_continuation_response(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_configured_observer_does_not_read_physical_database_identity(monkeypatch):
+    scope = object.__new__(observation._RetainedObservations)
+    scope.verify_transaction = AsyncMock()
+    scope.source_input = SimpleNamespace()
+    session, connection, events = object(), object(), []
+
+    @asynccontextmanager
+    async def read_only_observation(*, isolation):
+        assert isolation == "read committed"
+        events.append("opened")
+        try:
+            yield session
+        finally:
+            events.append("closed")
+
+    scope.factory = SimpleNamespace(observation_transaction=read_only_observation)
+    driver = AsyncMock(return_value=connection)
+    monkeypatch.setattr(observation, "native_driver", driver)
+    async with scope.observers() as readers:
+        assert isinstance(readers, observation._Observers)
+        assert events == ["opened"]
+    assert events == ["opened", "closed"]
+    driver.assert_awaited_once_with(session)
+    assert scope.verify_transaction.await_count == 3
+
+
+@pytest.mark.asyncio
 async def test_aggregate_budget_denial_is_not_skipped_for_routed_observations():
     from process.provider_directory_cms_preparation import NonprofileAdmissionCheck
 
     producer = _producer()
     producer.plan = replace(producer.plan, reservation_bytes=(("data", 1), ("temp", 1), ("wal", 1)))
     request = NonprofileAdmissionCheck(
-        "readiness", producer.lease, producer.plan, (OwnedRelation("source", "closed", 1, 2, "p"),)
+        "readiness", producer.lease, producer.plan, (OwnedRelation("source", "closed", 2, "p"),)
     )
     with pytest.raises(RuntimeError, match="data_budget_exceeded"):
         await producer._assert_physical(request, {}, observers=object())
@@ -349,8 +364,14 @@ async def test_retention_cannot_restart_admission_or_enter_resumed_profile(monke
 @asynccontextmanager
 async def _raw_attribute_input(monkeypatch, *, attribute_rows=None, change=None, oid=17):
     """Model an issued input's catalog transport; this is not native custody acceptance."""
-    pin_by_field = dict.fromkeys(epoch_pin.epoch._ORIGIN_FIELDS, "synthetic")
-    driver = SimpleNamespace(is_in_transaction=lambda: True, fetchval=AsyncMock(return_value="1/1"))
+    pin_by_field = dict.fromkeys(
+        tuple(name for name in epoch_pin.epoch._ORIGIN_FIELDS if name != "resource_table_oid") + ("resource_relation",),
+        "synthetic",
+    )
+    driver = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        fetchrow=AsyncMock(return_value={"isolation": "repeatable read", "readonly": "on"}),
+    )
     source_input = PinnedCMSFHIRSourceEpochInput(SimpleNamespace(**pin_by_field), "aa" * 32, "bb" * 32, driver)
     statements, parameters = [], []
     attributes = (
@@ -378,10 +399,7 @@ async def _raw_attribute_input(monkeypatch, *, attribute_rows=None, change=None,
 
     driver.prepare = AsyncMock(side_effect=prepare)
     epoch_pin._INPUTS[source_input] = dict(
-        task=asyncio.current_task(),
-        connection=driver,
         identity=(source_input.source_pin, source_input.admission_sha256, source_input.metadata_sha256),
-        virtual_xid="1/1",
         relations={_TABLES[1]: '"synthetic"."closed_raw"'},
     )
     policy_by_field = dict(
@@ -419,22 +437,23 @@ async def test_pinned_raw_attributes_read_only_exact_attribute_catalog(monkeypat
         )
         assert case.statements[1] == str(expected)
         assert case.parameters == [('"synthetic"."closed_raw"',), ([17],)]
-        assert case.driver.fetchval.await_count == 4
+        assert case.driver.fetchrow.await_count == 4
         case.ambient.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", ["virtual_xid", "transaction", "connection"])
-async def test_pinned_raw_attributes_refuse_custody_change_after_read(monkeypatch, field):
+@pytest.mark.parametrize("field", ["isolation", "readonly", "transaction"])
+async def test_pinned_raw_attributes_refuse_unstable_transaction_after_read(monkeypatch, field):
     def change(driver, statement):
         if "FROM pg_attribute AS attribute" not in statement:
             return
-        if field == "virtual_xid":
-            driver.fetchval.return_value = "1/2"
-        elif field == "transaction":
+        if field == "transaction":
             driver.is_in_transaction = lambda: False
         else:
-            epoch_pin._INPUTS[case.source_input]["connection"] = object()
+            driver.fetchrow.return_value = {
+                "isolation": "read committed" if field == "isolation" else "repeatable read",
+                "readonly": "off" if field == "readonly" else "on",
+            }
 
     async with _raw_attribute_input(monkeypatch, change=change) as case:
         with pytest.raises(epoch_pin.epoch.FHIRSourceEpochError):
@@ -454,13 +473,13 @@ async def test_pinned_raw_attributes_refuse_changed_policy_before_catalog_read(m
 
 
 @pytest.mark.asyncio
-async def test_pinned_raw_attributes_refuse_child_task_before_catalog_read(monkeypatch):
+async def test_pinned_raw_attributes_preserve_read_contract_in_sequential_task(monkeypatch):
     async with _raw_attribute_input(monkeypatch) as case:
-        with pytest.raises(epoch_pin.epoch.FHIRSourceEpochError):
-            await asyncio.create_task(
-                observation.pinned_raw_attributes(fhir, case.source_input, case.policy, _TABLES[1])
-            )
-        assert case.statements == []
+        oid, attributes = await asyncio.create_task(
+            observation.pinned_raw_attributes(fhir, case.source_input, case.policy, _TABLES[1])
+        )
+        assert oid == 17 and attributes == case.attributes
+        assert len(case.statements) == 2 and case.driver.fetchrow.await_count == 4
         case.ambient.assert_not_awaited()
 
 

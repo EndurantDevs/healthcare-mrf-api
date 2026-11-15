@@ -4,7 +4,7 @@
 import asyncio
 import copy
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import fields, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -22,11 +22,8 @@ from tests.test_provider_directory_profile_bounded_capacity import (
     capacity,
     fhir,
 )
+from tests.test_provider_directory_profile_capacity import _geometry_payload
 from tests.test_provider_directory_profile_capacity_preflight import _transaction
-from tests.test_provider_directory_profile_capacity_runtime import (
-    _geometry_database_by_field,
-    _geometry_relation_by_field,
-)
 from tests.test_provider_directory_profile_control_capacity import _control_wal_plan_input
 from tests.test_provider_directory_profile_initial import _geometry, _target
 from tests.test_provider_directory_profile_resume_lineage import _build, _dataset, _source_context
@@ -320,14 +317,14 @@ async def test_target_window_cannot_record_changed_rows(admitted_window, monkeyp
         relation_name="evidence_target",
         target_ref="target",
         stage_ref="stage",
-        target_oid=1,
-        stage_oid=2,
+        stage_schema="fixture",
+        stage_table="stage",
         column_sql="npi",
         key_sql="target.npi",
         totals_by_metric={},
     )
     layout = SimpleNamespace(
-        relation_oid=1, toast_oid=0, toastable_columns=(), main_index_pages=(1,), toast_index_pages=()
+        relation_oid=None, toast_oid=None, toastable_columns=(), main_index_pages=(1,), toast_index_pages=()
     )
     monkeypatch.setattr(fhir, "_profile_cutover_layout_pair", AsyncMock(return_value=(layout, layout)))
     monkeypatch.setattr(fhir, "_profile_delta_deletion_projection", AsyncMock(return_value=(1, 8)))
@@ -417,23 +414,38 @@ async def test_unbounded_target_global_interval_retains_local_forecast_guard(adm
         await cutover._observe_cutover_wal(fhir, forecast, "0/1")
 
 
+def _initial_receipt_layout(geometry):
+    receipt = geometry.relations["initial_receipt"]
+    return SimpleNamespace(
+        schema_name=receipt["schema"],
+        relation_name=receipt["name"],
+        main_index_pages=tuple(receipt["main_index_pages"]),
+        toast_index_pages=tuple(receipt["toast_index_pages"]),
+        toastable_columns=tuple("payload_" + str(index) for index in range(receipt["toastable_column_count"])),
+    )
+
+
+def _initial_database_geometry():
+    payload = {**_geometry_payload(), "wal_lsn": "0/1"}
+    identity = fhir._ProviderDirectoryProfileDatabaseCapacityIdentity
+    return identity(**{field.name: payload[field.name] for field in fields(identity)})
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", [None, "targets", "receipt_oid", "receipt_layout"])
+@pytest.mark.parametrize("drift", [None, "targets", "receipt_name", "receipt_layout"])
 async def test_initial_admission_rechecks_targets_before_consuming_lease(monkeypatch, drift):
     """An issued preflight cannot authorize targets that changed while waiting."""
     geometry = _geometry()
     target_state_by_field = _target()
-    initial_targets = initial_contract.InitialTargets(
-        target_state_by_field["evidence_target_oid"], target_state_by_field["profile_target_oid"], target_state_by_field
-    )
-    layout = SimpleNamespace(
-        relation_oid=geometry.initial_receipt_oid, exact_fingerprint=geometry.initial_receipt_storage_fingerprint
-    )
-    observed_targets = initial_targets if drift != "targets" else replace(initial_targets, profile_target_oid=999)
-    if drift == "receipt_oid":
-        layout.relation_oid += 1
+    initial_targets = initial_contract.InitialTargets(target_state_by_field["targets"], target_state_by_field)
+    layout = _initial_receipt_layout(geometry)
+    changed_by_role = {role: dict(entry) for role, entry in initial_targets.targets.items()}
+    changed_by_role["profile"]["name"] = "other_profile"
+    observed_targets = initial_targets if drift != "targets" else replace(initial_targets, targets=changed_by_role)
+    if drift == "receipt_name":
+        layout.relation_name = "other_receipt"
     if drift == "receipt_layout":
-        layout.exact_fingerprint = "ff" * 32
+        layout.main_index_pages = (100,)
     events = []
 
     monkeypatch.setattr(fhir.db, "transaction", lambda: _recorded_transaction(events))
@@ -466,7 +478,10 @@ async def test_initial_admission_rechecks_targets_before_consuming_lease(monkeyp
         geometry,
     )
     if drift:
-        with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match="initial_target_changed"):
+        with pytest.raises(
+            fhir.ProviderDirectoryArtifactBuildStale,
+            match="initial_target_changed|capacity_(layout_scope|index_bound)_changed",
+        ):
             await fhir._consume_admission_transaction(*args)
         runtime.assert_not_awaited()
         fhir._consume_profile_capacity_preflight_receipt.assert_not_awaited()
@@ -482,7 +497,7 @@ async def test_initial_admission_rechecks_targets_before_consuming_lease(monkeyp
 @pytest.mark.asyncio
 async def test_initial_preflight_captures_target_identity_and_locks_receipt_ledger(monkeypatch):
     payload = _target()
-    targets = initial_contract.InitialTargets(payload["evidence_target_oid"], payload["profile_target_oid"], payload)
+    targets = initial_contract.InitialTargets(payload["targets"], payload)
     token = initial.REQUESTED.set(True)
     serving = AsyncMock(side_effect=AssertionError("legacy adoption must not run"))
     monkeypatch.setattr(initial, "capture_targets", AsyncMock(return_value=targets))
@@ -500,7 +515,7 @@ async def test_initial_preflight_captures_target_identity_and_locks_receipt_ledg
         }
         fhir._assert_profile_capacity_receipt_serving(receipt_map, identity)
         changed = copy.deepcopy(receipt_map)
-        changed["serving_generation_preflight"]["profile_target_oid"] += 1
+        changed["serving_generation_preflight"]["targets"]["profile"]["name"] = "other_profile"
         with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match="initial_target_changed"):
             fhir._assert_profile_capacity_receipt_serving(changed, identity)
         await fhir._lock_profile_capacity_preflight_state("mrf")
@@ -596,11 +611,7 @@ async def test_initial_build_uses_full_scope_and_admitted_target_lineage(monkeyp
     try:
         ordinary = await fhir._profile_build_identity_inputs("mrf", fence, has_existing_artifacts=True)
         target_state_by_field = _target()
-        initial_targets = initial_contract.InitialTargets(
-            target_state_by_field["evidence_target_oid"],
-            target_state_by_field["profile_target_oid"],
-            target_state_by_field,
-        )
+        initial_targets = initial_contract.InitialTargets(target_state_by_field["targets"], target_state_by_field)
         fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
             replace(_wal_tracker_admission(), admitted_identity=replace(ordinary, initial_targets=initial_targets))
         )
@@ -611,10 +622,8 @@ async def test_initial_build_uses_full_scope_and_admitted_target_lineage(monkeyp
         assert bound.desired_source_vector_hash is not None
         assert bound.resume_lineage_hash != ordinary.resume_lineage_hash
         assert await fhir._provider_directory_profile_resource_scope_fence(fence, {"profile"}) is fence
-        database = SimpleNamespace(**_geometry_database_by_field(), **_geometry_relation_by_field())
-        layout = SimpleNamespace(
-            relation_oid=29000, exact_fingerprint="cd" * 32, effective_tablespace_oids=(database.tablespace_oid,)
-        )
+        database = _initial_database_geometry()
+        layout = _initial_receipt_layout(_geometry())
         workload = SimpleNamespace(
             database_identity=database,
             batch_plan=bound.batch_plan,
@@ -625,11 +634,18 @@ async def test_initial_build_uses_full_scope_and_admitted_target_lineage(monkeyp
             artifact_projection=SimpleNamespace(projected_rows=1, projected_logical_bytes=8, projection_hash="ab" * 32),
         )
         inputs = fhir._profile_admission_inputs(synthetic_profile_execution(), bound, workload)
-        assert inputs.initial_receipt_oid == layout.relation_oid
+        assert inputs.relations["initial_receipt"] == {
+            "schema": "fixture",
+            "name": initial_contract.RECEIPT_TABLE,
+            "main_index_pages": [2, 2],
+            "toast_index_pages": [2],
+            "toastable_column_count": 2,
+        }
         assert inputs.initial_target_state_sha256 == initial_contract.target_state_sha256(target_state_by_field)
-        layout.effective_tablespace_oids = (999,)
-        with pytest.raises(RuntimeError, match="initial_receipt_tablespace_unsupported"):
-            fhir._profile_admission_inputs(synthetic_profile_execution(), bound, workload)
+        layout.main_index_pages = (8, 2)
+        observed = fhir._profile_admission_inputs(synthetic_profile_execution(), bound, workload)
+        assert observed.relations["initial_receipt"]["main_index_pages"] == [8, 2]
+        assert observed.relations["initial_receipt"]["name"] == inputs.relations["initial_receipt"]["name"]
         serving.assert_not_awaited()
     finally:
         fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(admission_token)

@@ -18,20 +18,19 @@ from sqlalchemy import text
 from process import provider_directory_profile_capacity_attestation as lease_contract
 from process import provider_directory_profile_initial_contract as initial_contract
 from process.provider_directory_cms_capacity_contract import CMS_ADMISSION_FIELD, CMS_PREFLIGHT_CONTRACT
-from process.provider_directory_profile_capacity_attestation_contract import _SIGNED_BODY_FIELDS
 from process.provider_directory_profile_capacity_preflight_contract import (
     CAPACITY_PREFLIGHT_CONTRACT_ID,
     preflight_domain_sha256,
 )
 from process.provider_directory_profile_selection_contract import CMS_CAPACITY_EXECUTION_PARAM
 
-CONTRACT_ID = "provider-directory-healthcare-capacity-reservation-snapshot.v2"
+CONTRACT_ID = "provider-directory-healthcare-capacity-reservation-snapshot.v3"
 PROFILE_CAPACITY_PARAM = "provider_directory_profile_capacity_attestation"
 ACTIVE_RUN_STATUSES = ("queued", "starting", "running", "finalizing", "canceling")
-_DATABASE_FIELDS = ("database_system_identifier", "database_oid", "database_name")
 _LEGACY_CONTRACTS = {
     "provider-directory-database-capacity-lease-v1",
     lease_contract.LEGACY_CAPACITY_LEASE_V2_CONTRACT_ID,
+    "provider-directory-database-capacity-lease-v3",
 }
 
 
@@ -65,59 +64,51 @@ def _json_values(raw: Any) -> Any:
 
 
 def _envelope_identity(raw: Any) -> dict:
-    """Check current envelope structure and hashes without claiming trust verification."""
+    """Preserve original signed bytes; the authority verifies signatures before accounting."""
     envelope = _json_object(raw)
     if set(envelope) != {"lease", "signature"}:
         _fail("envelope_invalid")
     body = _json_object(envelope["lease"])
-    if set(body) != _SIGNED_BODY_FIELDS:
+    contract = body.get("contract_id")
+    version_by_contract = {
+        "provider-directory-database-capacity-lease-v2": 2,
+        "provider-directory-database-capacity-lease-v3": 3,
+        "provider-directory-database-capacity-lease-v4": 4,
+    }
+    version = version_by_contract.get(contract)
+    if version is None:
         _fail("envelope_contract_unsupported")
-    parsed = lease_contract._parse_capacity_lease_fields(body)
     lease_contract._decode_signature(envelope["signature"])
-    lease_contract._assert_attestation_id(body)
-    lease_contract._assert_tablespace_volume_binding(parsed["tablespaces"], parsed["volumes"])
-    lease_contract._assert_colocated_volume_accounting(parsed["volumes"])
-    lease_contract._parse_capacity_signing_guard_fields(body, parsed)
-    envelope = json.loads(lease_contract.canonical_capacity_lease_json(envelope))
-    purpose = (
-        "cms_nonprofile" if CMS_ADMISSION_FIELD in body["signing_preflight_guard"]["healthcare_request"] else "profile"
+    expected = lease_contract._domain_hash(
+        f"healthporta.provider-directory.database-capacity-attestation-id.v{version}",
+        {name: body_value for name, body_value in body.items() if name != "attestation_id"},
     )
+    if body.get("attestation_id") != expected:
+        _fail("envelope_digest_changed")
+    envelope = json.loads(lease_contract.canonical_capacity_lease_json(envelope))
+    guard = body.get("signing_preflight_guard")
+    request = guard.get("healthcare_request", {}) if isinstance(guard, Mapping) else {}
     return {
         "reservation_id": body["reservation_id"],
         "attestation_id": body["attestation_id"],
-        "lease_digest": lease_contract._domain_hash(lease_contract.CAPACITY_LEASE_DIGEST_DOMAIN, envelope),
-        "preflight_receipt_sha256": body["nonce"],
-        "admission_purpose": purpose,
+        "lease_digest": lease_contract._domain_hash(
+            f"healthporta.provider-directory.database-capacity-lease-digest.v{version}", envelope
+        ),
+        "preflight_receipt_sha256": body["nonce"] if isinstance(guard, Mapping) else None,
+        "admission_purpose": "cms_nonprofile" if CMS_ADMISSION_FIELD in request else "profile",
         "envelope": envelope,
-        "database_binding": {name: body[name] for name in _DATABASE_FIELDS},
-        "tablespace_identity_hash": lease_contract._identity_hash(
-            lease_contract.CAPACITY_TABLESPACE_IDENTITY_DOMAIN, body["tablespaces"]
-        ),
-        "volume_identity_hash": lease_contract._identity_hash(
-            lease_contract.CAPACITY_VOLUME_IDENTITY_DOMAIN, body["volumes"]
-        ),
         "signature_verification": "required_by_authority",
-        "opaque_legacy": False,
+        "opaque_legacy": version != 4,
     }
 
 
 def _legacy_consumption_identity(row: dict, envelope: dict) -> dict:
-    """Retain historical ledger assertions without applying v3 schemas or hash domains."""
+    """Expose legacy authentication material without inventing semantic replay proof."""
+    if envelope["lease"].get("contract_id") != "provider-directory-database-capacity-lease-v1":
+        return _envelope_identity(envelope)
     return {
-        **{
-            name: row[name]
-            for name in (
-                "reservation_id",
-                "attestation_id",
-                "lease_digest",
-                "admission_purpose",
-                "tablespace_identity_hash",
-                "volume_identity_hash",
-            )
-        },
+        **{name: row[name] for name in ("reservation_id", "attestation_id", "lease_digest", "admission_purpose")},
         "envelope": envelope,
-        "database_binding": {name: row[name] for name in _DATABASE_FIELDS},
-        # A legacy nonce is not evidence of a current signing-preflight receipt.
         "preflight_receipt_sha256": None,
         "signature_verification": "unresolved_legacy_contract",
         "opaque_legacy": True,
@@ -161,14 +152,11 @@ def _assert_current_consumption(consumption_by_field: dict, reservation: dict) -
                 "attestation_id",
                 "lease_digest",
                 "admission_purpose",
-                "tablespace_identity_hash",
-                "volume_identity_hash",
             )
         },
         **{
             name: body[name]
             for name in (
-                *_DATABASE_FIELDS,
                 "contract_id",
                 "capacity_geometry_hash",
                 "key_id",
@@ -272,6 +260,46 @@ def _run_observations(rows: list[dict], reservations: dict) -> list[dict]:
     return owners
 
 
+def _validated_preflight_record(preflight_by_field):
+    receipt = _json_object(preflight_by_field["receipt_json"])
+    contract = receipt.get("contract_id")
+    if contract not in {
+        CAPACITY_PREFLIGHT_CONTRACT_ID,
+        CMS_PREFLIGHT_CONTRACT,
+        initial_contract.RECEIPT_CONTRACT,
+        "healthporta.provider-directory-profile-capacity-preflight.v3",
+        "healthporta.provider-directory-profile-capacity-preflight.v4",
+        "healthporta.provider-directory-profile-capacity-preflight.v5",
+    }:
+        _fail("preflight_contract_unsupported")
+    digest = preflight_domain_sha256(
+        contract, {name: receipt_value for name, receipt_value in receipt.items() if name != "receipt_sha256"}
+    )
+    if digest != preflight_by_field["receipt_sha256"] or receipt.get("receipt_sha256") != digest:
+        _fail("preflight_digest_changed")
+    if contract == initial_contract.RECEIPT_CONTRACT and (
+        receipt.get("request_contract_id") != initial_contract.REQUEST_CONTRACT
+        or receipt.get("profile_materialization") != initial_contract.MATERIALIZATION
+        or _json_object(receipt.get("profile_execution_identity")).get("materialization_mode") != "full_swap"
+        or preflight_by_field.get("materialization_mode") != "full_swap"
+    ):
+        _fail("preflight_initial_contract_changed")
+    for field in (
+        "contract_id",
+        "request_contract_id",
+        "request_sha256",
+        "request_nonce",
+        "control_plane_receipt_sha256",
+        "capacity_geometry_hash",
+    ):
+        if preflight_by_field.get(field) != receipt.get(field):
+            _fail("preflight_metadata_changed")
+    for field in ("issued_at", "expires_at"):
+        if _timestamp(preflight_by_field[field]) != lease_contract._timestamp(receipt[field], field=field):
+            _fail("preflight_metadata_changed")
+    return receipt, digest
+
+
 def _preflight_observations(
     preflight_rows: list[dict], reservations: dict, observed_at: datetime.datetime
 ) -> list[dict]:
@@ -282,37 +310,7 @@ def _preflight_observations(
     }
     receipts = []
     for preflight_by_field in preflight_rows:
-        receipt = _json_object(preflight_by_field["receipt_json"])
-        contract = receipt.get("contract_id")
-        if contract not in {
-            CAPACITY_PREFLIGHT_CONTRACT_ID, CMS_PREFLIGHT_CONTRACT, initial_contract.RECEIPT_CONTRACT
-        }:
-            _fail("preflight_contract_unsupported")
-        digest = preflight_domain_sha256(
-            contract, {name: receipt_value for name, receipt_value in receipt.items() if name != "receipt_sha256"}
-        )
-        if digest != preflight_by_field["receipt_sha256"] or receipt.get("receipt_sha256") != digest:
-            _fail("preflight_digest_changed")
-        if contract == initial_contract.RECEIPT_CONTRACT and (
-            receipt.get("request_contract_id") != initial_contract.REQUEST_CONTRACT
-            or receipt.get("profile_materialization") != initial_contract.MATERIALIZATION
-            or _json_object(receipt.get("profile_execution_identity")).get("materialization_mode") != "full_swap"
-            or preflight_by_field.get("materialization_mode") != "full_swap"
-        ):
-            _fail("preflight_initial_contract_changed")
-        for field in (
-            "contract_id",
-            "request_contract_id",
-            "request_sha256",
-            "request_nonce",
-            "control_plane_receipt_sha256",
-            "capacity_geometry_hash",
-        ):
-            if preflight_by_field.get(field) != receipt.get(field):
-                _fail("preflight_metadata_changed")
-        for field in ("issued_at", "expires_at"):
-            if _timestamp(preflight_by_field[field]) != lease_contract._timestamp(receipt[field], field=field):
-                _fail("preflight_metadata_changed")
+        receipt, digest = _validated_preflight_record(preflight_by_field)
         reservation = by_receipt.get(digest)
         if (
             reservation is not None
@@ -332,17 +330,21 @@ def _preflight_observations(
 
 
 _RESERVATION_LIMITATIONS = [
-            "original_signed_bytes_are_not_remaining_reservations",
-            "pending_preflight_rows_do_not_store_original_requests_or_envelopes",
-            "expiry_and_terminal_run_status_do_not_prove_physical_release",
-            "profile_stage_catalog_presence_is_not_a_complete_cleanup_receipt",
-            "cms_scratch_ownership_is_not_durable_in_the_capacity_ledger",
-            "legacy_consumptions_are_opaque_unverified_ledger_observations",
-        ]
+    "original_signed_bytes_are_not_remaining_reservations",
+    "pending_preflight_rows_do_not_store_original_requests_or_envelopes",
+    "expiry_and_terminal_run_status_require_verified_settlement",
+    "profile_stage_catalog_presence_is_not_a_complete_cleanup_receipt",
+    "cms_scratch_ownership_is_not_durable_in_the_capacity_ledger",
+    "legacy_semantic_geometry_requires_retained_evidence",
+]
 
 
 def reservation_projection(
-    metadata: dict, consumptions: list[dict], runs: list[dict], preflights: list[dict], stages: list[dict],
+    metadata: dict,
+    consumptions: list[dict],
+    runs: list[dict],
+    preflights: list[dict],
+    stages: list[dict],
     cleanup_claims: list[dict] = (),
 ) -> dict:
     """Deduplicate original leases; observed lifecycle states never release bytes."""
@@ -387,8 +389,7 @@ def reservation_projection(
         "signature_verification_required": True,
         "release_proof_available": False,
         "observed_at": observed_at.isoformat(),
-        "database_snapshot": metadata["database_snapshot"],
-        "database_binding": {name: metadata[name] for name in _DATABASE_FIELDS},
+        "schema": metadata["schema"],
         "reservations": [reservations_by_id[identity] for identity in sorted(reservations_by_id)],
         "owners": owners,
         "preflight_receipts": receipts,
@@ -424,34 +425,22 @@ async def _snapshot_run_rows(session: Any, run_table: str, consumed: str) -> lis
 
 
 async def _snapshot_stage_rows(session: Any, checkpoint: str, schema: str) -> list[dict]:
-    """Observe the same named and physical stages without acquiring another snapshot."""
-    return [
-        dict(stage_by_field)
-        for stage_by_field in (
-            await session.execute(
-                text(f"""
-            SELECT checkpoint.build_id, checkpoint.owner_run_id, checkpoint.state,
-                   stage.kind, stage.name AS stage_name, stage.oid AS expected_oid,
-                   named.oid::bigint AS current_name_oid,
-                   owned.relname AS expected_oid_current_name, namespace.nspname AS expected_oid_current_schema,
-                   owned.relkind::text AS relation_kind, owned.relpersistence::text AS persistence
-              FROM {checkpoint} checkpoint
-             CROSS JOIN LATERAL (VALUES
-                 ('evidence', checkpoint.evidence_stage, checkpoint.evidence_stage_oid),
-                 ('profile', checkpoint.profile_stage, checkpoint.profile_stage_oid),
-                 ('affected_npi', checkpoint.affected_npi_stage, checkpoint.affected_npi_stage_oid)
-             ) stage(kind,name,oid)
-              LEFT JOIN pg_class owned ON owned.oid=stage.oid
-              LEFT JOIN pg_namespace namespace ON namespace.oid=owned.relnamespace
-              LEFT JOIN pg_namespace stage_namespace ON stage_namespace.nspname=:schema
-              LEFT JOIN pg_class named ON named.relnamespace=stage_namespace.oid AND named.relname=stage.name
-             WHERE stage.name IS NOT NULL
-             ORDER BY checkpoint.build_id,stage.kind
-        """),
-                {"schema": schema},
-            )
-        ).mappings()
-    ]
+    """Observe named stages inside the caller's read-only MVCC snapshot."""
+    result = await session.execute(
+        text(f"""
+        SELECT checkpoint.build_id, checkpoint.owner_run_id, checkpoint.state,
+               stage.kind, CAST(:schema AS text) AS schema, stage.name AS stage_name,
+               named.relkind::text AS relation_kind, named.relpersistence::text AS persistence
+          FROM {checkpoint} AS checkpoint
+         CROSS JOIN LATERAL (VALUES ('evidence', checkpoint.evidence_stage),
+            ('profile', checkpoint.profile_stage), ('affected_npi', checkpoint.affected_npi_stage)) stage(kind,name)
+          LEFT JOIN pg_namespace AS namespace ON namespace.nspname=:schema
+          LEFT JOIN pg_class AS named ON named.relnamespace=namespace.oid AND named.relname=stage.name
+         WHERE stage.name IS NOT NULL ORDER BY checkpoint.build_id,stage.kind
+    """),
+        {"schema": schema},
+    )
+    return [dict(row) for row in result.mappings()]
 
 
 async def capacity_reservation_snapshot(fhir: Any) -> dict:
@@ -476,16 +465,14 @@ async def capacity_reservation_snapshot(fhir: Any) -> dict:
             (
                 await session.execute(
                     text("""
-            SELECT transaction_timestamp() AS observed_at, pg_current_snapshot()::text AS database_snapshot,
-                   (SELECT system_identifier::text FROM pg_control_system()) AS database_system_identifier,
-                   oid::bigint AS database_oid, datname AS database_name
-              FROM pg_database WHERE datname=current_database()
+            SELECT transaction_timestamp() AS observed_at
         """)
                 )
             )
             .mappings()
             .one()
         )
+        metadata["schema"] = schema
         consumptions = [
             dict(consumption_by_field)
             for consumption_by_field in (
@@ -500,9 +487,16 @@ async def capacity_reservation_snapshot(fhir: Any) -> dict:
             ).mappings()
         ]
         stages = await _snapshot_stage_rows(session, checkpoint, schema)
-        cleanup_claims = [dict(database_record) for database_record in (await session.execute(text(
-            f"SELECT * FROM {fhir._unscoped_qt(schema, 'provider_directory_profile_failed_cleanup_claim')} ORDER BY operation_id"
-        ))).mappings()]
+        cleanup_claims = [
+            dict(database_record)
+            for database_record in (
+                await session.execute(
+                    text(
+                        f"SELECT * FROM {fhir._unscoped_qt(schema, 'provider_directory_profile_failed_cleanup_claim')} ORDER BY operation_id"
+                    )
+                )
+            ).mappings()
+        ]
         return reservation_projection(metadata, consumptions, runs, preflights, stages, cleanup_claims)
 
 
@@ -514,6 +508,11 @@ def _cleanup_claim_projection(claims, observed_at):
     for claim in claims:
         envelope = _claim_envelope(claim)
         if claim["expires_at"] > observed_at:
-            unexpired_claims.append({"record": _json_values(claim), "envelope": envelope,
-                           "signature_verification": "required_by_independent_cleanup_authority"})
+            unexpired_claims.append(
+                {
+                    "record": _json_values(claim),
+                    "envelope": envelope,
+                    "signature_verification": "required_by_independent_cleanup_authority",
+                }
+            )
     return unexpired_claims

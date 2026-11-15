@@ -223,23 +223,48 @@ def nucc_publication_driver(monkeypatch, nucc_module):
 
     monkeypatch.setattr(nucc_module.db, "transaction", transaction)
     monkeypatch.setattr(nucc_module.db, "acquire_driver", separate_connection)
-    stage_by_field = {
-        "schema": "mrf",
-        "name": "nucc_taxonomy_s_synthetic",
-        "oid": 100,
-        "owner_oid": 7,
-        "previous_oid": 99,
-    }
+    from tests.test_nucc_protected_control import source_generation
+
+    predecessor_by_field = {"native_input": None, "family_generation": source_generation(1, schema="mrf")}
+    publication_by_field = {"native_input": None, "family_generation": source_generation(2, schema="mrf")}
+    authority = nucc_module.generation._nucc_result_authority(publication_by_field["family_generation"])
+    publish = AsyncMock(return_value=authority)
+    monkeypatch.setattr(nucc_module.generation, "publish_immutable_nucc_generation", publish)
+    monkeypatch.setattr(
+        nucc_module,
+        "_plain_predecessor",
+        AsyncMock(
+            side_effect=lambda *_args, **_kwargs: publication_by_field if publish.await_count else predecessor_by_field
+        ),
+    )
+    monkeypatch.setattr(nucc_module, "_freeze_plain_publication", AsyncMock())
+    plain_result = nucc_module._plain_result
+    monkeypatch.setattr(
+        nucc_module, "_plain_result", lambda rows: {**plain_result(rows), "publication": publication_by_field}
+    )
+    stage_by_field = {"schema": "mrf", "name": "nucc_taxonomy_s_synthetic", "predecessor": predecessor_by_field}
     events = []
 
     async def validate(actual_session, schema, name):
-        assert actual_session is session and (schema, name) == ("mrf", stage_by_field["name"])
+        assert actual_session is session and schema == "mrf" and name in (stage_by_field["name"], "nucc_taxonomy")
         events.append("validate")
         return {"row_count": 7}
 
     return SimpleNamespace(
-        driver=driver, session=session, stage_by_field=stage_by_field, events=events, validate=validate
+        driver=driver,
+        session=session,
+        stage_by_field=stage_by_field,
+        events=events,
+        validate=validate,
+        publication=publication_by_field,
     )
+
+
+async def _assert_shutdown_replay(nucc_module, context_by_field, events):
+    """An already committed context cannot perform publication work twice."""
+    event_count = len(events)
+    await nucc_module.shutdown(context_by_field)
+    assert len(events) == event_count
 
 
 @pytest.mark.asyncio
@@ -272,6 +297,7 @@ async def test_shutdown_finishes_indexes_then_rotates_on_the_original_transactio
     commit_run = AsyncMock(return_value={"heartbeat_at": "actual-heartbeat", "finished_at": "actual-finished"})
     original_session.execute = AsyncMock(side_effect=execute)
     monkeypatch.setattr(nucc_module, "prepare_local_native_input_publication", preserved_reads)
+    monkeypatch.setattr(nucc_module, "finish_local_native_input_publication", AsyncMock())
     monkeypatch.setattr(nucc_module, "_plain_run", AsyncMock())
     monkeypatch.setattr(nucc_module, "_require_plain_stage", AsyncMock())
     monkeypatch.setattr(nucc_module.native, "_relation_oid", AsyncMock(return_value=99))
@@ -300,9 +326,7 @@ async def test_shutdown_finishes_indexes_then_rotates_on_the_original_transactio
     assert commit_run.await_args.args == (original_session, context_by_field, result_by_field)
     assert context_by_field["context"]["control_run_terminal_committed"] is True
     assert context_by_field["context"]["_control_committed_finished_at"] == "actual-finished"
-    event_count = len(events)
-    await nucc_module.shutdown(context_by_field)
-    assert len(events) == event_count
+    await _assert_shutdown_replay(nucc_module, context_by_field, events)
 
 
 @pytest.mark.asyncio
@@ -493,7 +517,7 @@ def _plain_timestamp_readback(plain_committed_times, nucc_module):
             "attempt_started_at": context["_control_attempt_started_at"],
             "phase": "nucc published",
         },
-        "metrics": {"rows": 7},
+        "metrics": {"rows": 7, "nucc_named_publication": nucc_module._plain_result(7).get("publication")},
         **plain_committed_times.times_by_field,
     }
 
@@ -536,9 +560,12 @@ async def test_plain_native_timestamps_project_exact_canonical_utc(
         session.execute = AsyncMock(
             return_value=_plain_timestamp_result(_plain_timestamp_readback(plain_committed_times, nucc_module))
         )
-        monkeypatch.setattr(nucc_module.native, "_relation_oid", AsyncMock(return_value=100))
+        monkeypatch.setattr(nucc_module.native, "_relation_oid", AsyncMock(return_value=None))
         monkeypatch.setattr(nucc_module, "_require_plain_stage", AsyncMock())
         monkeypatch.setattr(nucc_module.native, "_validate_nucc_table_set", AsyncMock(return_value={"row_count": 7}))
+        monkeypatch.setattr(
+            nucc_module, "_plain_predecessor", AsyncMock(return_value=nucc_publication_driver.publication)
+        )
         actual = await nucc_module._read_plain_commit(
             plain_committed_times.context_by_field, nucc_publication_driver.stage_by_field, nucc_module._plain_result(7)
         )
@@ -561,7 +588,7 @@ async def test_plain_commit_refuses_missing_or_non_native_database_time(
     )
     session = nucc_publication_driver.session
     session.execute = AsyncMock(return_value=_plain_timestamp_result(row))
-    monkeypatch.setattr(nucc_module.native, "_relation_oid", AsyncMock(return_value=100))
+    monkeypatch.setattr(nucc_module.native, "_relation_oid", AsyncMock(return_value=None))
     monkeypatch.setattr(nucc_module, "_require_plain_stage", AsyncMock())
     monkeypatch.setattr(nucc_module.native, "_validate_nucc_table_set", AsyncMock(return_value={"row_count": 7}))
     with pytest.raises(nucc_module.native.ReferenceFamilyArchiveError):
@@ -611,9 +638,10 @@ async def test_plain_publication_keeps_exact_utc_times_after_commit_or_readback(
     session.execute = AsyncMock(side_effect=execute)
     monkeypatch.setattr(nucc_module.db, "transaction", transaction)
     monkeypatch.setattr(nucc_module, "prepare_local_native_input_publication", AsyncMock())
+    monkeypatch.setattr(nucc_module, "finish_local_native_input_publication", AsyncMock())
     monkeypatch.setattr(nucc_module, "_plain_run", AsyncMock())
     monkeypatch.setattr(nucc_module, "_finish_plain_stage", AsyncMock(return_value=7))
-    monkeypatch.setattr(nucc_module.native, "_relation_oid", AsyncMock(return_value=100))
+    monkeypatch.setattr(nucc_module.native, "_relation_oid", AsyncMock(return_value=None))
     monkeypatch.setattr(nucc_module, "_require_plain_stage", AsyncMock())
     monkeypatch.setattr(nucc_module.native, "_validate_nucc_table_set", AsyncMock(return_value={"row_count": 7}))
     monkeypatch.setattr(nucc_module, "print_time_info", lambda _start: None)
@@ -681,3 +709,165 @@ async def test_plain_preparation_failure_never_locks_the_incumbent(
     retention.assert_not_awaited()
     statements = [str(call.args[0]) for call in nucc_publication_driver.session.execute.await_args_list]
     assert len(statements) == 1 and '"nucc_taxonomy_s_synthetic"' in statements[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "registered,tracked,expected", [(False, False, False), (False, True, True), (True, False, True), (True, True, True)]
+)
+async def test_plain_predecessor_uses_existing_named_authorities_or_requires_prephase(
+    monkeypatch, nucc_module, registered, tracked, expected
+):
+    from process import provider_directory_cms_native_registration as registration
+    from tests.test_nucc_protected_control import source_generation
+
+    schema, driver = "mrf", object()
+    authority = nucc_module.generation._nucc_result_authority(
+        source_generation(1 if tracked else 0, schema=schema), allow_untracked=True
+    )
+    evidence = (
+        {
+            "schema_name": schema,
+            "table_name": "nucc_taxonomy",
+            "revision": 7,
+            "mutation_xid": None,
+            "function_sha256": "semantic existing counter",
+        }
+        if registered
+        else None
+    )
+    capture = AsyncMock(return_value=evidence)
+    monkeypatch.setattr(registration, "capture_native_input_adoption", capture)
+    monkeypatch.setattr(nucc_module.native, "_native_model_copy_driver", AsyncMock(return_value=driver))
+    monkeypatch.setattr(
+        nucc_module.native, "read_reference_family_result_generation_authority", AsyncMock(return_value=authority)
+    )
+    session = SimpleNamespace(scalar=AsyncMock(return_value=True))
+    if expected:
+        assert await nucc_module._plain_predecessor(session, schema, lock=True) == {
+            "native_input": evidence,
+            "family_generation": authority.as_dict(),
+        }
+    else:
+        with pytest.raises(nucc_module.native.ReferenceFamilyArchiveError, match="prepare-nucc-source-generation"):
+            await nucc_module._plain_predecessor(session, schema)
+    capture.assert_awaited_once_with(
+        driver,
+        ledger_schema=schema,
+        candidate=registration.NativeInputCandidate(schema, "nucc_taxonomy", schema, "nucc_taxonomy"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_plain_cleanup_refuses_published_name_before_database_io(nucc_module):
+    with pytest.raises(nucc_module.native.ReferenceFamilyArchiveError, match="unpublished candidate name"):
+        await nucc_module._cleanup_plain_stage(
+            {"context": {"nucc_plain_stage": {"schema": "mrf", "name": "nucc_taxonomy"}}}
+        )
+
+
+@pytest.mark.asyncio
+async def test_legacy_unfinished_plain_stage_refuses_without_recorded_names(nucc_module):
+    session = SimpleNamespace(execute=AsyncMock())
+    with pytest.raises(nucc_module.native.ReferenceFamilyArchiveError, match="transition-legacy-nucc-stage"):
+        await nucc_module._finish_plain_stage(
+            session, {"schema": "mrf", "name": "nucc_taxonomy_s_abc", "oid": "old opaque token"}, 7
+        )
+    session.execute.assert_not_awaited()
+
+
+def _plain_publication_callbacks(session, events, authority, failure):
+    """Record native phase ordering and inject the exact requested late failure."""
+
+    @asynccontextmanager
+    async def transaction():
+        try:
+            yield session
+        except BaseException:
+            events.append("rollback")
+            raise
+        else:
+            events.append("commit")
+
+    async def execute(statement):
+        if "RENAME TO nucc_taxonomy" in str(statement):
+            events.append("rename")
+
+    async def finish(*_args, **_kwargs):
+        events.append("counter")
+
+    async def freeze(*_args, **_kwargs):
+        events.append("freeze")
+        if failure == "freeze":
+            raise RuntimeError("freeze failed")
+
+    async def validate(*_args):
+        events.append("validate")
+        if failure == "cancel":
+            raise asyncio.CancelledError()
+        if failure == "validation":
+            return {"row_count": 6}
+        return {"row_count": 7}
+
+    async def publish(*_args, **_kwargs):
+        events.append("generation")
+        if failure == "generation":
+            raise RuntimeError("generation CAS changed")
+        return authority
+
+    async def terminal(*_args):
+        events.append("terminal")
+
+    return SimpleNamespace(
+        transaction=transaction,
+        execute=execute,
+        finish=finish,
+        freeze=freeze,
+        validate=validate,
+        publish=publish,
+        terminal=terminal,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "freeze", "validation", "cancel", "generation"])
+async def test_plain_publication_validates_after_counter_and_freeze_before_terminal(
+    monkeypatch, nucc_module, nucc_publication_driver, failure
+):
+    """Preserve phase order and rollback through each caught late failure or cancellation."""
+    session, events = nucc_publication_driver.session, []
+    authority = nucc_module.generation._nucc_result_authority(nucc_publication_driver.publication["family_generation"])
+    callbacks = _plain_publication_callbacks(session, events, authority, failure)
+    monkeypatch.setattr(nucc_module.db, "transaction", callbacks.transaction)
+    session.execute = AsyncMock(side_effect=callbacks.execute)
+    monkeypatch.setattr(nucc_module, "_plain_run", AsyncMock())
+    monkeypatch.setattr(nucc_module, "_finish_plain_stage", AsyncMock(return_value=7))
+    monkeypatch.setattr(nucc_module, "prepare_local_native_input_publication", AsyncMock(return_value="prepared"))
+    monkeypatch.setattr(nucc_module, "finish_local_native_input_publication", callbacks.finish)
+    monkeypatch.setattr(nucc_module, "_freeze_plain_publication", callbacks.freeze)
+    monkeypatch.setattr(nucc_module, "_require_plain_stage", AsyncMock())
+    monkeypatch.setattr(nucc_module.native, "_validate_nucc_table_set", callbacks.validate)
+    monkeypatch.setattr(nucc_module.generation, "publish_immutable_nucc_generation", callbacks.publish)
+    monkeypatch.setattr(nucc_module, "_plain_predecessor", AsyncMock(return_value=nucc_publication_driver.publication))
+    monkeypatch.setattr(nucc_module, "_commit_plain_run", callbacks.terminal)
+    cleanup = AsyncMock()
+    monkeypatch.setattr(nucc_module, "_cleanup_plain_stage", cleanup)
+    monkeypatch.setattr(nucc_module, "print_time_info", lambda *_: None)
+    context_by_field = {
+        "context": {
+            "run": 1,
+            "rows": 7,
+            "start": datetime.datetime.now(),
+            "nucc_plain_stage": nucc_publication_driver.stage_by_field,
+        }
+    }
+    if failure:
+        with pytest.raises(asyncio.CancelledError if failure == "cancel" else RuntimeError):
+            await nucc_module._publish_plain_generation(context_by_field)
+        assert events[-1] == "rollback" and "terminal" not in events and "commit" not in events
+        cleanup.assert_awaited_once_with(context_by_field)
+    else:
+        publication_result = await nucc_module._publish_plain_generation(context_by_field)
+        assert publication_result["publication"] == nucc_publication_driver.publication
+        assert events == ["rename", "rename", "counter", "freeze", "validate", "generation", "terminal", "commit"]
+        cleanup.assert_not_awaited()

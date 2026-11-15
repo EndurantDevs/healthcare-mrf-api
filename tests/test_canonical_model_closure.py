@@ -141,28 +141,32 @@ async def test_publication_attribution_is_direct_only_and_noop_rows_are_not_upda
 @pytest.mark.parametrize("safe", [None, False])
 async def test_source_topology_refusal_precedes_executable_or_payload_use(monkeypatch, safe):
     checker = AsyncMock()
-    monkeypatch.setattr(native, "_require_stage_execution_catalog", checker)
-    session = SimpleNamespace(scalar=AsyncMock(return_value=safe))
+    monkeypatch.setattr(native, "_require_named_execution_catalog", checker)
+    rows = [{"schema_name": "mrf", "relation_name": name, "supported": safe} for name in ("first", "second")]
+    result = SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: rows))
+    session = SimpleNamespace(execute=AsyncMock(return_value=result), scalar=AsyncMock())
     with pytest.raises(RuntimeError, match="heap topology"):
         await canonical.require_native_read_catalog(session, (10, 11))
     checker.assert_not_awaited()
-    statement = str(session.scalar.await_args.args[0])
+    statement = str(session.execute.await_args.args[0])
     assert "relrowsecurity" in statement and "pg_inherits" in statement and "relkind='r'" in statement
 
 
 @pytest.mark.asyncio
-async def test_source_catalog_accepts_only_fixed_native_extensions_and_checks_code_owners(monkeypatch):
+async def test_source_catalog_accepts_only_fixed_native_extensions_without_role_identity_checks(monkeypatch):
     checker = AsyncMock()
-    monkeypatch.setattr(native, "_require_stage_execution_catalog", checker)
-    session = SimpleNamespace(scalar=AsyncMock(side_effect=[True, False, False]))
+    monkeypatch.setattr(native, "_require_named_execution_catalog", checker)
+    rows = [{"schema_name": "mrf", "relation_name": name, "supported": True} for name in ("first", "second")]
+    result = SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: rows))
+    session = SimpleNamespace(execute=AsyncMock(return_value=result), scalar=AsyncMock())
     await canonical.require_native_read_catalog(session, (10, 11))
     checker.assert_awaited_once_with(
         session,
-        {"stage_relations": [{"relation_oid": 10}, {"relation_oid": 11}]},
+        (("mrf", "first"), ("mrf", "second")),
         allowed_type_oids=(),
         allowed_extensions=("postgis", "intarray", "btree_gin", "btree_gist", "pg_trgm"),
     )
-    assert [call.args[1] for call in session.scalar.await_args_list[1:]] == [{"oid": 10}, {"oid": 11}]
+    session.scalar.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

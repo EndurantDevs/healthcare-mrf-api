@@ -7,7 +7,6 @@ import asyncpg
 import pytest
 
 from process.network_membership_publication import _lock_publication_controls
-from process.registry_fhir_catalog_permissions import _verify_revision_lock
 from tests.test_registry_fhir_catalog_custody_postgres import metadata_custody as metadata_custody
 
 
@@ -38,7 +37,6 @@ async def revision_lock(metadata_custody):
 async def test_lock_capability_cannot_change_singleton_or_revisions(revision_lock):
     fixture = revision_lock
     async with fixture.reader.transaction():
-        await _verify_revision_lock(fixture.reader, fixture.control_schema)
         assert await _lock_publication_controls(fixture.reader, fixture.namespace) == (4, 9)
         await fixture.reader.execute(f"UPDATE {fixture.namespace}.registry_revision_control SET id=1")
     for expression, error in (
@@ -55,29 +53,6 @@ async def test_lock_capability_cannot_change_singleton_or_revisions(revision_loc
         6,
         4,
     )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["rename", "missing", "weakened", "unvalidated", "rule"])
-async def test_lock_capability_requires_enforced_native_singleton(revision_lock, damage):
-    fixture = revision_lock
-    relation = fixture.namespace + ".registry_revision_control"
-    if damage == "rule":
-        await fixture.connection.execute(f"CREATE RULE ignore_update AS ON UPDATE TO {relation} DO INSTEAD NOTHING")
-    elif damage == "rename":
-        await fixture.connection.execute(
-            f"ALTER TABLE {relation} RENAME CONSTRAINT registry_revision_control_id_check TO renamed_singleton"
-        )
-    else:
-        await fixture.connection.execute(f"ALTER TABLE {relation} DROP CONSTRAINT registry_revision_control_id_check")
-        if damage in {"weakened", "unvalidated"}:
-            predicate = "id>=1" if damage == "weakened" else "id=1"
-            await fixture.connection.execute(f"ALTER TABLE {relation} ADD CHECK ({predicate}) NOT VALID")
-    if damage == "rename":
-        await _verify_revision_lock(fixture.reader, fixture.control_schema)
-    else:
-        with pytest.raises(ValueError, match="revision_lock_invalid"):
-            await _verify_revision_lock(fixture.reader, fixture.control_schema)
 
 
 @pytest.mark.asyncio

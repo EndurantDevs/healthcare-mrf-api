@@ -115,26 +115,31 @@ async def catalog_db(custom_db, request):
     try:
         provider_id, source_table = await _source_addresses(custom_db, count, system)
         other_id = await _other_provider(custom_db, source_table, system)
-        target = await _raw_candidate(custom_db, source_table, copy_targets)
+        candidate = await _raw_candidate(custom_db, source_table, copy_targets)
         await prepare_and_publish_network_candidate(
-            custom_db.connection, target, custom_db.base, **_roles(custom_db), control_schema=custom_db.control_schema
+            custom_db.connection,
+            candidate,
+            custom_db.base,
+            **_roles(custom_db),
+            control_schema=custom_db.control_schema,
+            seal_candidate=custom_db.seal_candidate,
         )
         async with custom_db.connection.transaction(readonly=True):
-            source = await resolve_network_serving_manifest(
+            manifest = await resolve_network_serving_manifest(
                 custom_db.connection, control_schema=custom_db.control_schema
             )
         yield SimpleNamespace(
             **vars(custom_db),
-            source=source,
+            source=manifest,
             provider_id=provider_id,
             provider_system=system,
             other_id=other_id,
             copy_targets=copy_targets,
         )
     finally:
-        for target in copy_targets:
-            await custom_db.connection.execute(f'DROP SCHEMA IF EXISTS "{target.schema_name}" CASCADE')
-            assert await custom_db.connection.fetchval("SELECT to_regnamespace($1)", target.schema_name) is None
+        for copy_target in copy_targets:
+            await custom_db.connection.execute(f'DROP SCHEMA IF EXISTS "{copy_target.schema_name}" CASCADE')
+            assert await custom_db.connection.fetchval("SELECT to_regnamespace($1)", copy_target.schema_name) is None
 
 
 def _arguments(fixture, **changes):
@@ -235,7 +240,7 @@ async def test_invalid_selector_has_no_database_calls(changes):
         )
 
 
-async def test_transaction_contract_and_five_reads(catalog_db):
+async def test_transaction_contract_and_three_reads(catalog_db):
     fixture = catalog_db
     with pytest.raises(RegistrySourceSiteCatalogError):
         await read_registry_source_sites(fixture.connection, **_arguments(fixture))
@@ -249,14 +254,14 @@ async def test_transaction_contract_and_five_reads(catalog_db):
             queries.clear()
             await read_registry_source_sites(fixture.connection, **_arguments(fixture, limit=1))
             await asyncio.sleep(0)
-            assert len(queries) == 5 and all(query.query.lstrip().split()[0] in ("SELECT", "WITH") for query in queries)
-            assert sum("network_candidate_custody" in query.query for query in queries) == 1
+            assert len(queries) == 3 and all(query.query.lstrip().split()[0] in ("SELECT", "WITH") for query in queries)
+            assert not any("network_candidate_custody" in query.query for query in queries)
     finally:
         fixture.connection.remove_query_logger(queries.append)
 
 
 @pytest.mark.parametrize("catalog_db", [(100, "npi")], indirect=True)
-async def test_maximum_page_uses_the_same_five_reads(catalog_db):
+async def test_maximum_page_uses_the_same_three_reads(catalog_db):
     fixture = catalog_db
     queries = []
     fixture.connection.add_query_logger(queries.append)
@@ -266,8 +271,8 @@ async def test_maximum_page_uses_the_same_five_reads(catalog_db):
             queries.clear()
             result = await read_registry_source_sites(fixture.connection, **_arguments(fixture, limit=100))
             await asyncio.sleep(0)
-            assert len(result["sites"]) == 100 and not result["has_more"] and len(queries) == 5
-            assert sum("network_candidate_custody" in query.query for query in queries) == 1
+            assert len(result["sites"]) == 100 and not result["has_more"] and len(queries) == 3
+            assert not any("network_candidate_custody" in query.query for query in queries)
     finally:
         fixture.connection.remove_query_logger(queries.append)
 
@@ -275,7 +280,6 @@ async def test_maximum_page_uses_the_same_five_reads(catalog_db):
 @pytest.mark.parametrize(
     "damage",
     [
-        "acl",
         "ineligible",
         "address_oid",
         "binding_oid",
@@ -293,7 +297,6 @@ async def test_native_changes_fail_closed_before_pagination_and_rollback(catalog
     baseline = await _read(fixture)
     namespace = '"' + fixture.source.schema_name + '"'
     statements_by_damage = {
-        "acl": f'GRANT UPDATE ON {namespace}.provider_location_binding TO "{fixture.roles["reader"]}"',
         "ineligible": f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false',
         "address_oid": f"ALTER TABLE {namespace}.entity_address_unified RENAME TO changed_address",
         "binding_oid": f"ALTER TABLE {namespace}.provider_location_binding RENAME TO changed_binding",
@@ -370,7 +373,12 @@ async def test_explicit_old_generation_does_not_follow_the_new_head(catalog_db):
         fixture, source_table, fixture.copy_targets, expected_head=fixture.source.generation_id
     )
     await prepare_and_publish_network_candidate(
-        fixture.connection, target, fixture.base, **_roles(fixture), control_schema=fixture.control_schema
+        fixture.connection,
+        target,
+        fixture.base,
+        **_roles(fixture),
+        control_schema=fixture.control_schema,
+        seal_candidate=fixture.seal_candidate,
     )
     current = await fixture.connection.fetchval(
         f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control WHERE id=1'

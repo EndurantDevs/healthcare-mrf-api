@@ -289,11 +289,7 @@ def test_cutover_contract_rejects_layout_identity_drift():
             includes_inserted_toast_chunks=False,
         ),
         lambda: cutover_contract._validated_index_pages(
-            {
-                "main_index_oids": [],
-                "main_index_pages": [],
-            },
-            oid_field="main_index_oids",
+            {"main_index_pages": []},
             page_field="main_index_pages",
             required=True,
         ),

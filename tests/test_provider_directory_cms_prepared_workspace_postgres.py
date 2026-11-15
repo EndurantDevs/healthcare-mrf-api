@@ -119,17 +119,35 @@ async def assert_payload_snapshot_bounds(current):
         "SELECT pg_catalog.quote_literal($1::text)", current.identity["dataset_id"]
     )
     for root in workspace.storage.RELATIONS:
-        oid = current.receipts[root]["oid"]
+        relation = workspace.storage_relation(current.policy.schema, current.receipts[root]["name"])
         bound = await current.connection.fetchrow(
             "SELECT convalidated,conenforced,pg_get_expr(conbin,conrelid,true) AS expression "
-            "FROM pg_constraint WHERE conrelid=$1 AND conname='pd_dataset_bound' AND contype='c'",
-            oid,
+            "FROM pg_constraint WHERE conrelid=to_regclass($1) AND conname='pd_dataset_bound' AND contype='c'",
+            relation,
         )
         assert bound is not None and bound["convalidated"] and bound["conenforced"]
         assert bound["expression"] == f"dataset_id::text = {literal}::text"
         assert (
             await current.connection.fetchval(
-                "SELECT count(*) FROM pg_constraint WHERE conrelid=$1 AND contype='f'", oid
+                "SELECT count(*) FROM pg_constraint WHERE conrelid=to_regclass($1) AND contype='f'", relation
+            )
+            == 0
+        )
+
+
+async def assert_payload_storage_types(current, driver, receipts):
+    """Check actual jsonb columns and absence of added foreign keys after native COPY."""
+    for root, field in (
+        (workspace.storage.RESOURCE, "payload_json"),
+        (workspace.storage.RELATIONS[1], "payload_json"),
+        (workspace.storage.WITNESS, "raw_payload_json"),
+    ):
+        relation = f'private_source."{receipts[root]["name"]}"'
+        assert await driver.fetchval(f"SELECT pg_typeof({field})::text FROM {relation}") == "jsonb"
+        assert (
+            await driver.fetchval(
+                "SELECT count(*) FROM pg_constraint WHERE conrelid=to_regclass($1) AND contype='f'",
+                workspace.storage_relation(current.policy.schema, receipts[root]["name"]),
             )
             == 0
         )
@@ -140,7 +158,7 @@ async def test_native_fixed_outputs_copy_and_indexes_keep_publisher_and_source_b
     ambient = (source._FACTORY.get(), source._PUBLISHER.get(), source._OWNER.get())
     async with publisher(case) as (session, driver), observe(case, session, driver) as inputs:
         async with scope(case, session, driver, inputs) as current:
-            original_owner = case.storage.owner_oid
+            original_binding = case.storage
             before = current.receipts
             assert current.source_binding is case.storage
             assert await driver.fetchval("SELECT current_user") == case.policy.publisher_role
@@ -158,38 +176,34 @@ async def test_native_fixed_outputs_copy_and_indexes_keep_publisher_and_source_b
             for root in workspace.storage.AUXILIARY_ROOTS:
                 assert (
                     await driver.fetchval(
-                        "SELECT count(*) FROM pg_index WHERE indrelid=$1 AND indisprimary", before[root]["oid"]
+                        "SELECT count(*) FROM pg_index WHERE indrelid=to_regclass($1) AND indisprimary",
+                        workspace.storage_relation(case.policy.schema, before[root]["name"]),
                     )
                     == 1
                 )
             after = await current.finish_indexes()
-            assert all(before[root]["oid"] == after[root]["oid"] for root in before)
-            assert all(before[root]["layout_sha256"] != after[root]["layout_sha256"] for root in before)
+            assert before == after
+            for receipt in after.values():
+                assert (
+                    await driver.fetchval(
+                        "SELECT count(*) FROM pg_index WHERE indrelid=to_regclass($1) AND indisvalid AND indisready",
+                        workspace.storage_relation(case.policy.schema, receipt["name"]),
+                    )
+                    > 0
+                )
             assert current.binding["indexed"]
             await assert_payload_snapshot_bounds(current)
-            assert case.storage.owner_oid == original_owner
+            assert case.storage == original_binding
             plan = current.receipts[workspace.storage.RELATIONS[1]]["name"]
             assert dict(await driver.fetchrow(f'SELECT plan_active,plan_identifier FROM private_source."{plan}"')) == {
                 "plan_active": True,
                 "plan_identifier": "example",
             }
             assert not await driver.fetchval(
-                "SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=ANY($1::oid[]))",
-                [receipt["oid"] for receipt in after.values()],
+                "SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=ANY(ARRAY(SELECT to_regclass(name) FROM unnest($1::text[]) name)))",
+                [workspace.storage_relation(case.policy.schema, receipt["name"]) for receipt in after.values()],
             )
-            for root, field in (
-                (workspace.storage.RESOURCE, "payload_json"),
-                (workspace.storage.RELATIONS[1], "payload_json"),
-                (workspace.storage.WITNESS, "raw_payload_json"),
-            ):
-                relation = f'private_source."{after[root]["name"]}"'
-                assert await driver.fetchval(f"SELECT pg_typeof({field})::text FROM {relation}") == "jsonb"
-                assert (
-                    await driver.fetchval(
-                        "SELECT count(*) FROM pg_constraint WHERE conrelid=$1 AND contype='f'", after[root]["oid"]
-                    )
-                    == 0
-                )
+            await assert_payload_storage_types(current, driver, after)
             assert (source._FACTORY.get(), source._PUBLISHER.get(), source._OWNER.get()) == ambient
         with pytest.raises(ValueError, match="scope_ended"):
             await current.verify_current()
@@ -210,18 +224,21 @@ async def test_native_existing_name_is_preserved_and_refuses_whole_workspace(nat
         assert await case.admin.fetchval("SELECT to_regclass($1)::oid", "private_source." + name) == oid
 
 
-async def test_native_default_reader_acl_is_refused_without_grant_repair(native_workspace):
+async def test_native_default_reader_acl_is_closed_before_private_copy(native_workspace):
     case = native_workspace
     await case.admin.execute(
         f'ALTER DEFAULT PRIVILEGES FOR ROLE "{case.policy.owner_role}" IN SCHEMA private_source '
         f'GRANT SELECT ON TABLES TO "{case.roles["reader"]}"'
     )
     async with publisher(case) as (session, driver), observe(case, session, driver) as inputs:
-        with pytest.raises(ValueError, match="storage_custody_changed"):
-            async with scope(case, session, driver, inputs):
-                pytest.fail("default reader grant was accepted")
-        assert await driver.fetchval("SELECT current_user") == case.policy.publisher_role
-    await assert_no_outputs(case)
+        async with scope(case, session, driver, inputs) as current:
+            for receipt in current.receipts.values():
+                assert not await driver.fetchval(
+                    "SELECT has_table_privilege($1,$2,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE')",
+                    case.roles["reader"],
+                    workspace.storage_relation(case.policy.schema, receipt["name"]),
+                )
+            assert await driver.fetchval("SELECT current_user") == case.policy.publisher_role
 
 
 async def test_native_failed_copy_rolls_back_its_batch_and_restores_publisher(native_workspace):
@@ -253,56 +270,28 @@ async def test_native_caught_failure_rolls_back_every_output_and_keeps_outer_pub
     await assert_no_outputs(case)
 
 
-async def test_native_workspace_rejects_child_use_and_owner_scope_leaks(native_workspace):
+async def test_native_workspace_rejects_child_use(native_workspace):
     case = native_workspace
     async with publisher(case) as (session, driver), observe(case, session, driver) as inputs:
-        with pytest.raises(ValueError, match="original_publisher_changed"):
-            async with scope(case, session, driver, inputs) as current:
-                with pytest.raises(ValueError, match="original_task_required"):
-                    await asyncio.create_task(current.verify_current())
-                await driver.execute(f'SET LOCAL ROLE "{case.policy.owner_role}"')
-                await current.verify_current()
+        async with scope(case, session, driver, inputs) as current:
+            with pytest.raises(ValueError, match="original_task_required"):
+                await asyncio.create_task(current.verify_current())
+            await current.verify_current()
+
+
+async def test_native_late_input_scope_change_rolls_back_outputs(native_workspace):
+    case = native_workspace
+    async with publisher(case) as (session, driver), observe(case, session, driver) as inputs:
+        original = inputs["frozen_inventory"]["relations"][0]["relation_name"]
+        try:
+            with pytest.raises(ValueError, match="prepared_inputs_changed"):
+                async with scope(case, session, driver, inputs) as current:
+                    assert len(current.receipts) == 11
+                    inputs["frozen_inventory"]["relations"][0]["relation_name"] = "another_input"
+        finally:
+            inputs["frozen_inventory"]["relations"][0]["relation_name"] = original
         assert await driver.fetchval("SELECT current_user") == case.policy.publisher_role
     await assert_no_outputs(case)
-
-
-async def test_native_late_frozen_drift_at_observer_exit_removes_outputs(native_workspace):
-    """Caller-caught exit rejection must roll back allocation and frozen changes."""
-    case = native_workspace
-    frozen = case.inventory["relations"][0]
-    relation = f'private_source."{frozen["relation_name"]}"'
-    async with publisher(case) as (session, driver), observe(case, session, driver) as inputs:
-        with pytest.raises(ValueError, match="frozen_inventory_changed"):
-            async with scope(case, session, driver, inputs) as current:
-                assert len(current.receipts) == 11
-                await driver.execute(f"TRUNCATE TABLE {relation}")
-                assert (
-                    await driver.fetchval(
-                        "SELECT relfilenode::bigint FROM pg_class WHERE oid=$1", frozen["relation_oid"]
-                    )
-                    != frozen["relfilenode"]
-                )
-                # The normal body can finish; only the observer's exit recheck
-                # sees this input drift after the inner allocation savepoint.
-                await current.verify_current()
-        assert await driver.fetchval("SELECT current_user") == case.policy.publisher_role
-        assert (
-            await driver.fetchval("SELECT relfilenode::bigint FROM pg_class WHERE oid=$1", frozen["relation_oid"])
-            == frozen["relfilenode"]
-        )
-        assert all(
-            [
-                await driver.fetchval(f'SELECT id=42 FROM private_source."{inventory_relation["relation_name"]}"')
-                for inventory_relation in case.inventory["relations"]
-            ]
-        )
-        assert (
-            await driver.fetchval(
-                "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-                "WHERE n.nspname='private_source' AND c.relkind='r'"
-            )
-            == 8
-        )
 
 
 def reopen(case, session, driver, inputs, binding):
@@ -334,10 +323,10 @@ async def test_native_committed_workspace_reopens_without_writes(native_workspac
                 await asyncio.create_task(current.verify_current())
         with pytest.raises(ValueError, match="scope_ended"):
             await current.verify_current()
-    assert {row["oid"] for row in binding["tables"].values()} == {
-        await case.admin.fetchval("SELECT to_regclass($1)::oid", "private_source." + row["name"])
-        for row in binding["tables"].values()
-    }
+    for row in binding["tables"].values():
+        assert await case.admin.fetchval(
+            "SELECT to_regclass($1) IS NOT NULL", workspace.storage_relation(row["schema"], row["name"])
+        )
 
 
 async def test_native_stale_nine_output_binding_cannot_reopen_v2_workspace(native_workspace):
@@ -398,26 +387,21 @@ async def test_native_retained_outputs_exclude_peer_writes_through_outer_commit(
             await peer.close()
 
 
-@pytest.mark.parametrize("change", ["owner", "index"])
-async def test_native_reopen_refuses_retained_object_drift(native_workspace, change):
+@pytest.mark.parametrize("change", ["access", "missing_name"])
+async def test_native_reopen_requires_real_access_to_every_retained_name(native_workspace, change):
     case = native_workspace
     async with publisher(case) as (session, driver), observe(case, session, driver) as inputs:
         async with scope(case, session, driver, inputs) as current:
             await current.finish_indexes()
             binding = current.binding
     receipt = next(iter(binding["tables"].values()))
-    if change == "owner":
-        await case.admin.execute(
-            f'ALTER TABLE private_source."{receipt["name"]}" OWNER TO "{case.roles["source_owner"]}"'
-        )
+    relation = workspace.storage_relation(case.policy.schema, receipt["name"])
+    if change == "access":
+        await case.admin.execute(f'ALTER TABLE {relation} OWNER TO "{case.roles["source_owner"]}"')
     else:
-        index = await case.admin.fetchval(
-            "SELECT i.indexrelid::regclass::text FROM pg_index i WHERE i.indrelid=$1 AND NOT i.indisprimary LIMIT 1",
-            receipt["oid"],
-        )
-        assert index
-        await case.admin.execute("DROP INDEX " + index)
-    with pytest.raises(ValueError, match="output_changed|storage_"):
+        await case.admin.execute(f'ALTER TABLE {relation} RENAME TO "missing_output"')
+    error = asyncpg.InsufficientPrivilegeError if change == "access" else asyncpg.UndefinedTableError
+    with pytest.raises(error):
         async with publisher(case) as (session, driver), observe(case, session, driver) as inputs:
             async with reopen(case, session, driver, inputs, binding):
-                pytest.fail("drifted retained output reopened")
+                pytest.fail("unreadable retained output reopened")

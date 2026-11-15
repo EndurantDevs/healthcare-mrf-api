@@ -59,7 +59,6 @@ def test_lifecycle_transaction_normalizes_retryable_database_error():
 
 def test_promote_ptg2_source_snapshot_repoints_source_and_plan_pointers(monkeypatch):
     publish_calls = []
-    clear_calls = []
 
     async def fake_publish(**kwargs):
         publish_calls.append(kwargs)
@@ -76,11 +75,6 @@ def test_promote_ptg2_source_snapshot_repoints_source_and_plan_pointers(monkeypa
         source_snapshot_control,
         "activate_ptg2_source_candidate",
         fake_publish,
-    )
-    monkeypatch.setattr(
-        source_snapshot_control,
-        "_clear_ptg2_snapshot_cache",
-        lambda: clear_calls.append(True),
     )
 
     promotion_result = asyncio.run(
@@ -104,7 +98,6 @@ def test_promote_ptg2_source_snapshot_repoints_source_and_plan_pointers(monkeypa
     assert publish["source_key"] == "source_a"
     assert publish["expected_current_snapshot_id"] == "snap_old"
     assert publish["expected_audit_only_attestation_digest"] is None
-    assert clear_calls == [True]
 
 
 def test_promote_ptg2_source_snapshot_rejects_candidate_predecessor_mismatch(monkeypatch):
@@ -157,9 +150,7 @@ def test_source_plan_rows_use_only_public_snapshot_scope(monkeypatch):
 
 
 def test_promote_ptg2_source_snapshot_refuses_stale_expected_pointer(monkeypatch):
-    publish = AsyncMock(
-        side_effect=source_pointers.PTG2SourcePointerConflict("stale pointer")
-    )
+    publish = AsyncMock(side_effect=source_pointers.PTG2SourcePointerConflict("stale pointer"))
     monkeypatch.setattr(
         source_snapshot_control,
         "activate_ptg2_source_candidate",
@@ -172,8 +163,8 @@ def test_promote_ptg2_source_snapshot_refuses_stale_expected_pointer(monkeypatch
                 source_key="source_a",
                 snapshot_id="snap_new",
                 expected_current_snapshot_id="snap_other",
-                )
             )
+        )
     publish.assert_awaited_once()
 
 
@@ -186,12 +177,14 @@ def test_source_snapshot_remove_plan_refuses_current_references(monkeypatch):
                 "snapshot_id": "snap_live",
                 "status": "published",
                 "import_month": "2026-06-01",
-                "manifest": {"serving_index": {
-                    "source_key": "source_a",
-                    "arch_version": "postgres_binary_v3",
-                    "storage_generation": "shared_blocks_v3",
-                    "shared_snapshot_key": 17,
-                }},
+                "manifest": {
+                    "serving_index": {
+                        "source_key": "source_a",
+                        "arch_version": "postgres_binary_v3",
+                        "storage_generation": "shared_blocks_v3",
+                        "shared_snapshot_key": 17,
+                    }
+                },
             }
         ),
     )
@@ -250,8 +243,7 @@ def test_source_snapshot_remove_plan_rejects_legacy_manifest(monkeypatch):
 
     assert plan["removable"] is False
     assert plan["reason"] == (
-        "only postgres_binary_v3/shared_blocks_v3 or "
-        "postgres_binary_v3/shared_blocks_v4 snapshots can be removed"
+        "only postgres_binary_v3/shared_blocks_v3 or postgres_binary_v3/shared_blocks_v4 snapshots can be removed"
     )
     assert plan["tables"] == []
 
@@ -359,14 +351,11 @@ def _assert_source_snapshot_retirement_results(
     retire_summary,
     transaction_statements,
     status_calls,
-    clear_calls,
 ) -> None:
     assert retire_summary["retired"] is True
     assert retire_summary["deleted_plan_pointers"] == 1
     assert retire_summary["deleted_source_pointers"] == 1
-    assert retire_summary["previous_current_references"]["source_keys"] == [
-        "source_a"
-    ]
+    assert retire_summary["previous_current_references"]["source_keys"] == ["source_a"]
     assert retire_summary["current_references"]["source_keys"] == []
     assert transaction_statements == [
         (
@@ -374,28 +363,18 @@ def _assert_source_snapshot_retirement_results(
             "set_config('statement_timeout', :statement_timeout, true)",
             {
                 "lock_timeout": ptg2_lifecycle_lock.PTG2_LIFECYCLE_LOCK_TIMEOUT,
-                "statement_timeout": (
-                    ptg2_lifecycle_lock.PTG2_LIFECYCLE_STATEMENT_TIMEOUT
-                ),
+                "statement_timeout": (ptg2_lifecycle_lock.PTG2_LIFECYCLE_STATEMENT_TIMEOUT),
             },
         ),
         (
             "SELECT pg_advisory_xact_lock(hashtext(:gc_lock_key))",
-            {
-                "gc_lock_key": (
-                    ptg2_lifecycle_lock.PTG2_SOURCE_POINTER_GC_LOCK_KEY
-                )
-            },
+            {"gc_lock_key": (ptg2_lifecycle_lock.PTG2_SOURCE_POINTER_GC_LOCK_KEY)},
         ),
     ]
     assert len(status_calls) == 2
-    assert all(
-        call[1] == {"snapshot_id": "snap_live", "source_key": "source_a"}
-        for call in status_calls
-    )
+    assert all(call[1] == {"snapshot_id": "snap_live", "source_key": "source_a"} for call in status_calls)
     assert any("ptg2_current_plan_source" in call[0] for call in status_calls)
     assert any("ptg2_current_source_snapshot" in call[0] for call in status_calls)
-    assert clear_calls == [True]
 
 
 def _retirement_snapshot(storage_generation):
@@ -439,7 +418,6 @@ def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(
             return {"global_slots": [], "source_keys": ["source_a"], "plan_source_keys": ["ps_1"]}
         return {"global_slots": [], "source_keys": [], "plan_source_keys": []}
 
-    clear_calls = []
     validate_layout = AsyncMock(return_value=None)
     monkeypatch.setattr(
         source_snapshot_control,
@@ -454,7 +432,6 @@ def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(
     )
     monkeypatch.setattr(source_snapshot_control.db, "status", fake_status)
     monkeypatch.setattr(source_snapshot_control.db, "transaction", lambda: transaction)
-    monkeypatch.setattr(source_snapshot_control, "_clear_ptg2_snapshot_cache", lambda: clear_calls.append(True))
 
     retire_summary = asyncio.run(
         source_snapshot_control.retire_ptg2_source_snapshot(
@@ -467,6 +444,5 @@ def test_retire_ptg2_source_snapshot_deletes_current_source_and_plan_pointers(
         retire_summary,
         transaction_statements,
         status_calls,
-        clear_calls,
     )
     validate_layout.assert_awaited_once()

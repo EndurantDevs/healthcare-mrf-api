@@ -247,7 +247,7 @@ async def prove_reviewed_subset_abandonment_guard_handoff(monkeypatch) -> None:
     """Commit the seal before a queued fresh worker can acquire its guard."""
 
     importer = importlib.import_module("process.provider_directory_fhir")
-    scenario = await create_committed_subset_schema(monkeypatch)
+    scenario = await create_committed_subset_schema(monkeypatch, owned_database=True)
     writer_scope = AsyncExitStack()
     waiter = await open_test_connection()
     fresh_task = None
@@ -469,7 +469,7 @@ async def _prove_downgrade_is_blocked(scenario, migration) -> None:
 async def prove_reviewed_subset_abandonment_lifecycle(monkeypatch) -> None:
     """Prove adoption, serialization, sealing, replay, and immutability."""
 
-    scenario = await create_committed_subset_schema(monkeypatch)
+    scenario = await create_committed_subset_schema(monkeypatch, owned_database=True)
     migration = load_abandonment_migration()
     writer_scope = AsyncExitStack()
     writer = await open_test_connection()

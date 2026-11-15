@@ -13,8 +13,6 @@ from uuid import UUID
 
 from process.network_address_projection import _identifier
 from process.network_cms_registry_address_capture import native_driver
-from process.network_custom_address_source import _closed
-from process.network_membership_writer_closure import _check_roles
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_ptg_producer_scope import read_registry_ptg_producer_scope
 from process.registry_ptg_published_office_scope import (
@@ -95,6 +93,7 @@ class RegistryPTGOfficeCaptureContext:
     owner_role: str
     reader_roles: tuple[str, ...]
     office_custody: object = None
+    preparation_request_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,7 +104,7 @@ class RegistryPTGOfficeCaptureDescriptor:
     schema_name: str
     manifest_sha256: str
     manifest_json: bytes
-    custody_json: bytes
+    storage_json: bytes
 
     def as_dict(self):
         """Return fresh decoded facts without mutating this prepared descriptor."""
@@ -114,8 +113,85 @@ class RegistryPTGOfficeCaptureDescriptor:
             "schema_name": self.schema_name,
             "manifest_sha256": self.manifest_sha256,
             "manifest": json.loads(self.manifest_json),
-            "custody": json.loads(self.custody_json),
+            "storage": descriptor_storage(self),
         }
+
+
+_OFFICE_TABLES = ("capture_manifest", "office_assertion")
+_LEGACY_CUSTODY_FIELDS = frozenset(
+    {
+        "schema_oid",
+        "owner_oid",
+        "table_oid",
+        "manifest_table_oid",
+        "valid",
+        "heaps",
+        "routines",
+        "triggers",
+        "columns_sha256",
+        "manifest_columns_sha256",
+        "owner_role",
+        "reader_roles",
+    }
+)
+
+
+def office_storage(schema_name, manifest_sha256=None):
+    """Return positive names and the stored logical manifest edition."""
+    if type(schema_name) is not str or re.fullmatch(r"registry_ptg_office_[0-9a-f]{32}", schema_name) is None:
+        raise RegistryPTGOfficeCaptureError("registry_ptg_office_descriptor_invalid")
+    storage_by_field = {
+        "schema_name": schema_name,
+        "tables": [{"schema": schema_name, "name": name} for name in _OFFICE_TABLES],
+    }
+    if manifest_sha256 is not None:
+        if type(manifest_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None:
+            raise RegistryPTGOfficeCaptureError("registry_ptg_office_descriptor_invalid")
+        storage_by_field["manifest_sha256"] = manifest_sha256
+    return storage_by_field
+
+
+def descriptor_storage(descriptor):
+    """Decode the exact old record as a named view without changing its stored edition."""
+    if type(descriptor.storage_json) is not bytes or not 1 <= len(descriptor.storage_json) <= 16384:
+        raise RegistryPTGOfficeCaptureError("registry_ptg_office_descriptor_invalid")
+    stored = json.loads(descriptor.storage_json)
+    expected = office_storage(descriptor.schema_name, descriptor.manifest_sha256)
+    if stored != expected and (type(stored) is not dict or set(stored) != _LEGACY_CUSTODY_FIELDS):
+        raise RegistryPTGOfficeCaptureError("registry_ptg_office_descriptor_invalid")
+    return expected
+
+
+def named_office_evidence(evidence, command):
+    """Project exact historical storage and serving fields without changing stored editions."""
+    from process.registry_ptg_office_review_contract import (
+        _retained_serving,
+        is_legacy_office_review_command,
+        named_office_review_command,
+    )
+
+    if type(evidence) is not dict:
+        raise RegistryPTGOfficeCaptureError("registry_ptg_office_descriptor_invalid")
+    expected = office_storage(evidence["schema_name"], evidence["manifest_sha256"])
+    if "custody" in evidence:
+        if (
+            "storage" in evidence
+            or type(evidence["custody"]) is not dict
+            or set(evidence["custody"]) != _LEGACY_CUSTODY_FIELDS
+        ):
+            raise RegistryPTGOfficeCaptureError("registry_ptg_office_descriptor_invalid")
+        evidence_by_field = {name: field_value for name, field_value in evidence.items() if name != "custody"} | {
+            "storage": expected
+        }
+    else:
+        if evidence.get("storage") != expected:
+            raise RegistryPTGOfficeCaptureError("registry_ptg_office_descriptor_invalid")
+        evidence_by_field = dict(evidence)
+    evidence_by_field["retained_serving"] = _retained_serving(
+        {**named_office_review_command(command), "retained_serving": evidence["retained_serving"]},
+        is_legacy_office_review_command(command),
+    )
+    return evidence_by_field
 
 
 def _canonical(value):
@@ -358,127 +434,26 @@ async def _validate_rows(driver, schema_name, scope, count):
         raise RegistryPTGOfficeCaptureError("registry_ptg_office_accounting_invalid")
 
 
-async def _close(driver, schema_name, context):
-    """Transfer this isolated family; revoke table AND column grants before closure."""
-    roles_by_name = {"owner_role": context.owner_role, "loader_roles": [], "reader_roles": list(context.reader_roles)}
-    await _check_roles(driver, roles_by_name)
-    namespace, owner = _identifier(schema_name), _identifier(context.owner_role)
-    grantees = await driver.fetch(
-        """SELECT DISTINCT CASE WHEN a.grantee=0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END AS name
-      FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid
-      LEFT JOIN pg_attribute att ON att.attrelid=c.oid AND att.attnum>0 AND NOT att.attisdropped
-      CROSS JOIN LATERAL aclexplode(coalesce(n.nspacl,acldefault('n',n.nspowner))||coalesce(c.relacl,acldefault('r',c.relowner))||coalesce(att.attacl,'{}'::aclitem[])) a
-      LEFT JOIN pg_roles r ON r.oid=a.grantee WHERE n.nspname=$1 AND a.grantee<>n.nspowner""",
-        schema_name,
-    )
-    publisher = await driver.fetchval("SELECT quote_ident(current_user)")
-    await driver.execute(f"ALTER SCHEMA {namespace} OWNER TO {owner}")
-    await driver.execute(f"SET LOCAL ROLE {owner}")
-    await driver.execute(f"GRANT USAGE ON SCHEMA {namespace} TO {publisher}")
-    await driver.execute(f"SET LOCAL ROLE {publisher}")
-    for table, columns in (
-        ("office_assertion", COPY_COLUMNS),
-        ("capture_manifest", ("id", "manifest_sha256", "manifest_json")),
+async def _require_office_layout(driver, schema_name, *, is_published):
+    """Validate essential columns by qualified name; PostgreSQL enforces access."""
+    for table, names, kinds, nullable in (
+        ("office_assertion", COPY_COLUMNS, _COLUMN_TYPES, ("company_key", "cohort_id") if is_published else ()),
+        ("capture_manifest", ("id", "manifest_sha256", "manifest_json"), ("integer", "text", "jsonb"), ()),
     ):
-        await driver.execute(f"ALTER TABLE {namespace}.{table} OWNER TO {owner}")
-    await driver.execute(f"SET LOCAL ROLE {owner}")
-    grantees = [{"name": publisher}, *grantees]
-    for table, columns in (
-        ("office_assertion", COPY_COLUMNS),
-        ("capture_manifest", ("id", "manifest_sha256", "manifest_json")),
-    ):
-        for grantee in grantees:
-            await driver.execute(f"REVOKE ALL ON {namespace}.{table} FROM {grantee['name']} CASCADE")
-            await driver.execute(
-                f"REVOKE ALL ({','.join(columns)}) ON {namespace}.{table} FROM {grantee['name']} CASCADE"
-            )
-    for grantee in grantees:
-        await driver.execute(f"REVOKE ALL ON SCHEMA {namespace} FROM {grantee['name']} CASCADE")
-    for role in context.reader_roles:
-        await driver.execute(f"GRANT USAGE ON SCHEMA {namespace} TO {_identifier(role)}")
-        await driver.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA {namespace} TO {_identifier(role)}")
-    await driver.execute(f"SET LOCAL ROLE {publisher}")
-    return await _custody(driver, schema_name, context)
-
-
-async def _custody(driver, schema_name, context):
-    catalog = await driver.fetchrow(
-        """SELECT n.oid::bigint AS schema_oid,n.nspowner::bigint AS owner_oid,r.oid::bigint AS table_oid,m.oid::bigint AS manifest_table_oid,
-      n.nspowner=owner.oid AND r.relowner=owner.oid AND r.relkind='r' AND r.relpersistence='p'
-      AND NOT r.relrowsecurity AND NOT r.relforcerowsecurity
-      AND m.relowner=owner.oid AND m.relkind='r' AND m.relpersistence='p'
-      AND NOT m.relrowsecurity AND NOT m.relforcerowsecurity
-      AND NOT EXISTS(SELECT FROM pg_class c WHERE c.relnamespace=n.oid
-        AND (c.relkind NOT IN ('r','i') OR c.relpersistence<>'p' OR c.relowner<>owner.oid
-          OR c.relkind='r' AND c.relname NOT IN ('office_assertion','capture_manifest'))) AS valid,
-      (SELECT count(*) FROM pg_class c WHERE c.relnamespace=n.oid AND c.relkind='r') AS heaps,
-      EXISTS(SELECT FROM pg_proc WHERE pronamespace=n.oid) AS routines,
-      EXISTS(SELECT FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid WHERE c.relnamespace=n.oid AND NOT t.tgisinternal) AS triggers
-      FROM pg_namespace n JOIN pg_class r ON r.relnamespace=n.oid AND r.relname='office_assertion'
-      JOIN pg_class m ON m.relnamespace=n.oid AND m.relname='capture_manifest'
-      JOIN pg_roles owner ON owner.rolname=$2 WHERE n.nspname=$1""",
-        schema_name,
-        context.owner_role,
-    )
-    if (
-        catalog is None
-        or catalog["valid"] is not True
-        or catalog["heaps"] != 2
-        or catalog["routines"]
-        or catalog["triggers"]
-    ):
-        raise RegistryPTGOfficeCaptureError("registry_ptg_office_custody_invalid")
-    await _closed(
-        driver,
-        catalog["schema_oid"],
-        catalog["owner_oid"],
-        context.reader_roles,
-        ["office_assertion", "capture_manifest"],
-    )
-    columns_sha256 = await _column_identity(
-        driver,
-        catalog["table_oid"],
-        COPY_COLUMNS,
-        _COLUMN_TYPES,
-        nullable_names=("company_key", "cohort_id") if is_published_office_context(context) else (),
-    )
-    manifest_columns_sha256 = await _column_identity(
-        driver,
-        catalog["manifest_table_oid"],
-        ("id", "manifest_sha256", "manifest_json"),
-        ("integer", "text", "jsonb"),
-    )
-    return {
-        **dict(catalog),
-        "columns_sha256": columns_sha256,
-        "manifest_columns_sha256": manifest_columns_sha256,
-        "owner_role": context.owner_role,
-        "reader_roles": list(context.reader_roles),
-    }
-
-
-async def _column_identity(driver, table_oid, names, kinds, *, nullable_names=()):
-    columns = await driver.fetch(
-        "SELECT attname,atttypid::regtype::text AS type,attnotnull,atthasdef FROM pg_attribute WHERE attrelid=$1::oid AND attnum>0 AND NOT attisdropped ORDER BY attnum",
-        table_oid,
-    )
-    expected_columns = tuple(
-        (name, kind, name not in nullable_names, False) for name, kind in zip(names, kinds, strict=True)
-    )
-    if (
-        tuple(
-            (
-                column["attname"],
-                column["type"],
-                column["attnotnull"],
-                column["atthasdef"],
-            )
-            for column in columns
+        relation = _identifier(schema_name) + "." + _identifier(table)
+        columns = await driver.fetch(
+            "SELECT attname,atttypid::regtype::text AS type,attnotnull,atthasdef FROM pg_attribute "
+            "WHERE attrelid=to_regclass($1) AND attnum>0 AND NOT attisdropped ORDER BY attnum",
+            relation,
         )
-        != expected_columns
-    ):
-        raise RegistryPTGOfficeCaptureError("registry_ptg_office_custody_invalid")
-    return _digest([dict(column) for column in columns])
+        expected_columns = tuple(
+            (name, kind, name not in nullable, False) for name, kind in zip(names, kinds, strict=True)
+        )
+        if (
+            tuple((row["attname"], row["type"], row["attnotnull"], row["atthasdef"]) for row in columns)
+            != expected_columns
+        ):
+            raise RegistryPTGOfficeCaptureError("registry_ptg_office_layout_invalid")
 
 
 def _office_review_source(scope):
@@ -527,7 +502,7 @@ def office_review_command(request, scope, serving, accounting):
     }
 
 
-def _prepared_capture_manifest(request, scope, serving, accounting):
+def _prepared_capture_manifest(request, scope, serving, accounting, preparation_request_sha256=None):
     command = office_review_command(request, scope, serving, accounting)
     return {
         "contract": "registry_ptg_office_capture.v1",
@@ -535,6 +510,8 @@ def _prepared_capture_manifest(request, scope, serving, accounting):
         "command": command,
         "command_sha256": _digest(command),
         "accounting": accounting,
+        "storage": office_storage("registry_ptg_office_" + request.capture_id.hex),
+        "preparation_request_sha256": preparation_request_sha256 or _digest(command),
     }
 
 
@@ -579,30 +556,40 @@ async def prepare_registry_ptg_office_capture(session, context, request, batches
             != serving
         ):
             raise RegistryPTGOfficeCaptureError("registry_ptg_office_source_changed")
-        manifest_by_field = _prepared_capture_manifest(request, scope, serving, accounting)
-        await driver.execute(
-            f"INSERT INTO {_identifier(schema_name)}.capture_manifest VALUES(1,$1,$2::jsonb)",
-            _digest(manifest_by_field),
-            _canonical(manifest_by_field).decode(),
+        manifest_by_field = _prepared_capture_manifest(
+            request, scope, serving, accounting, context.preparation_request_sha256
         )
-        custody = await _close(driver, schema_name, context)
-        if not session.in_transaction() or session.get_transaction() is not transaction:
-            raise RegistryPTGOfficeCaptureError("registry_ptg_office_transaction_changed")
-        return RegistryPTGOfficeCaptureDescriptor(
-            request.capture_id,
-            schema_name,
-            _digest(manifest_by_field),
-            _canonical(manifest_by_field),
-            _canonical(custody),
-        )
+        pending = await _handoff_office_capture(driver, schema_name, context, request, manifest_by_field)
+        _same_transaction(session, driver, transaction)
+        return pending
+
+
+async def _handoff_office_capture(driver, schema_name, context, request, manifest_by_field):
+    from process.registry_ptg_office_preparation import admit_office_preparation
+
+    await driver.execute(
+        f"INSERT INTO {_identifier(schema_name)}.capture_manifest VALUES(1,$1,$2::jsonb)",
+        _digest(manifest_by_field),
+        _canonical(manifest_by_field).decode(),
+    )
+    _, preparation, _ = await admit_office_preparation(driver, request.capture_id, context=context)
+    if preparation["state"] != "handed_off":
+        raise RegistryPTGOfficeCaptureError("registry_ptg_office_preparation_changed")
+    return {
+        "capture_id": str(request.capture_id),
+        "state": "handed_off",
+        "command": manifest_by_field["command"],
+        "command_sha256": manifest_by_field["command_sha256"],
+        "manifest_sha256": _digest(manifest_by_field),
+    }
 
 
 async def _office_driver(session, context, *, publisher=False):
     if is_published_office_context(context):
         await require_published_office_path(session)
     driver = await _driver(session)
-    if publisher and is_published_office_context(context):
-        from process.registry_ptg_office_custody import verify_registry_ptg_office_custody
+    from process.registry_ptg_office_custody import office_preparation_roles
 
-        await verify_registry_ptg_office_custody(driver, context, publisher=True)
+    if publisher:
+        office_preparation_roles(context)
     return driver

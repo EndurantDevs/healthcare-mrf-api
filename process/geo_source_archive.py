@@ -52,30 +52,21 @@ async def create_geo_export_clone(session, spec, schema, protected_owner=None):
         schema,
         create_indexes=False,
         ordinary_heaps=True,
-        protected_owner_oid=protected_owner,
     )
     ownership = await archive._capture_model_family_ownership(
         session,
         spec,
         UUID(schema.removeprefix(archive._STAGE_PREFIX)),
     )
-    owner = protected_owner if protected_owner is not None else await _writer(session)
-    await archive.seal_model_family_storage(session, ownership, owner, require_empty=True)
     return ownership
 
 
 async def seal_geo_model_relation(session, ownership, oid, owner):
-    """Close actual private stage writes without pretending its indexes are finished."""
-    from process.entity_address_snapshot_preparation import _require_no_untrusted_mutation
-    from process.mrf_address_publication import require_native_read_catalog
-    from process.provider_directory_generic_source_storage import _close_grants
+    """Freeze declared Geo snapshot relations using the configured role policy."""
+    from process.cms_doctors_immutable import seal_model_family_relation
 
-    require(await _writer(session) == owner and not ownership.sequence_oids, "owner_changed")
-    require(ownership.importer_id == "geo" and ownership.relation_oids == ((ROOT, oid),), "family_changed")
-    policy = replace(bound_publisher().policy, schema=ownership.schema_name)
-    await _close_grants(bound_publisher().connection, policy, ROOT)
-    await _require_no_untrusted_mutation(session, [oid], owner)
-    await require_native_read_catalog(session, (oid,))
+    require(ownership.importer_id == "geo", "family_changed")
+    await seal_model_family_relation(session, ownership)
 
 
 async def create_geo_predecessor_schema(session, schema):
@@ -101,21 +92,25 @@ async def preserve_geo_cut_reads(session, ownership, incumbent):
     """Replay only actual incumbent SELECT on the exact locked private successor."""
     from process.geo_source_storage import require_geo_storage
 
-    owner = await _archive_writer(session, "geo", incumbent.schema_name)
+    await _archive_writer(session, "geo", incumbent.schema_name)
     require(ownership.importer_id == incumbent.importer_id == "geo", "family_changed")
-    old_oid, new_oid = dict(incumbent.relation_oids)[ROOT], dict(ownership.relation_oids)[ROOT]
-    require(type(old_oid) is int and old_oid != new_oid, "incumbent_changed")
-    await require_geo_storage(session, schema_name=incumbent.schema_name, expected_oid=old_oid, is_incumbent=True)
-    await _heap_custody(session, GeoZipLookup, ownership.schema_name, ROOT, new_oid, owner)
-    locked = await session.scalar(
-        text(
-            "SELECT count(DISTINCT relation)=2 FROM pg_locks WHERE pid=pg_backend_pid() "
-            "AND locktype='relation' AND mode='AccessExclusiveLock' AND granted AND relation=ANY(:oids)"
-        ),
-        {"oids": [old_oid, new_oid]},
+    require(
+        tuple(name for name, _old in incumbent.relation_oids) == (ROOT,)
+        and tuple(name for name, _old in ownership.relation_oids) == (ROOT,),
+        "family_changed",
     )
-    require(locked is True, "cut_locks_required")
-    await replay_geo_reads(session, old_oid, storage_relation(ownership.schema_name, ROOT))
+    await require_geo_storage(session, schema_name=incumbent.schema_name, is_incumbent=True)
+    await _heap_custody(session, GeoZipLookup, ownership.schema_name, ROOT)
+    from process.native_publication_read_access import preserve_publication_reads
+    from process.provider_directory_projection_stage import _copy_driver
+
+    await preserve_publication_reads(
+        await _copy_driver(session),
+        schema=incumbent.schema_name,
+        live_table=ROOT,
+        stage_schema=ownership.schema_name,
+        stage_table=ROOT,
+    )
 
 
 def has_compatible_geo_indexes(manifest, tables):
@@ -250,10 +245,7 @@ async def create_model_family_archive_schema(session, importer, schema, protecte
 async def create_model_family_export_clone(session, spec, schema):
     """Dispatch only physical Geo while retained and other families keep their API."""
     if spec.importer_id == "geo":
-        from process.reference_family_archive import protected_publisher_owner
-
-        owner = None if is_source_geo_active("geo") else await protected_publisher_owner(session)
-        return await create_geo_export_clone(session, spec, schema, owner)
+        return await create_geo_export_clone(session, spec, schema)
     from process.cms_doctors_immutable import create_model_family_export_clone as original
 
     return await original(session, spec, schema)

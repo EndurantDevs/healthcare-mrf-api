@@ -15,11 +15,34 @@ import pytest
 from db.registry_fhir_catalog import PROJECTOR_VERSION, SNAPSHOT_COLUMNS
 from process import registry_fhir_catalog_grant as grants
 from process import registry_fhir_catalog_publication as publication
-from process.registry_fhir_catalog_permissions import _validate_column
 from process.registry_fhir_catalog_validation import canonical_json, metadata_generation
-from tests.test_registry_fhir_catalog_sources import descriptor, read_profile
+from tests.test_registry_fhir_catalog_sources import descriptor as observed_descriptor
+from tests.test_registry_fhir_catalog_sources import read_profile
 
 COMPANY = "11111111-1111-4111-8111-111111111111"
+
+
+def descriptor():
+    from process.registry_fhir_catalog_sources import RESOURCE_TYPES
+
+    selected = observed_descriptor()
+    kinds = sorted(RESOURCE_TYPES)
+    counts = dict.fromkeys(kinds, 0)
+    counts["Organization"] = 1
+    selected["admission"] = {
+        "version": 1,
+        "kind": "generic",
+        "proof_sha256": "a" * 64,
+        "metadata_sha256": selected["accepted_receipt_sha256"],
+        "resource_count": 1,
+        "resource_counts": counts,
+        "resource_types": kinds,
+        "selected_resources": kinds,
+        "completion_required_version": None,
+        "completion_sha256": None,
+        "proof_resource_scope": None,
+    }
+    return selected
 
 
 def standing_grant(**changes):
@@ -128,12 +151,12 @@ class CatalogConnection:
 @pytest.fixture
 def custody(monkeypatch):
     proof = AsyncMock()
-    monkeypatch.setattr(grants, "verify_fhir_catalog_snapshot", proof)
+    monkeypatch.setattr(grants, "validate_fhir_catalog_snapshot_record", proof)
     return proof
 
 
 def test_grant_roundtrip_is_canonical_and_metadata_only():
-    profile = grants.FHIRCatalogSourceReadProfile("second_source", "second_owner", ("second_reader",))
+    profile = grants.FHIRCatalogSourceReadProfile("second_source", "second_catalog")
     first = standing_grant(source_profiles=(read_profile(), profile))
     second = standing_grant(source_profiles=(profile, read_profile()))
     assert first.sha256 == second.sha256
@@ -142,33 +165,6 @@ def test_grant_roundtrip_is_canonical_and_metadata_only():
     assert first.crosswalk_for("alias-b") == ()
     assert first.sha256 != standing_grant(version=2, source_profiles=(profile, read_profile())).sha256
     assert first.document()["operation"] == "publish_fhir_catalog"
-
-
-@pytest.mark.parametrize("direct_role", [True, False])
-@pytest.mark.parametrize(
-    "role,table,column",
-    [
-        ("catalog_execution", "network_serving_control", "metadata_generation"),
-        ("catalog_lifecycle", "registry_publication_request", "state"),
-    ],
-)
-def test_publication_update_rights_cannot_be_granted_onward(direct_role, role, table, column):
-    config = SimpleNamespace(execution_role="catalog_execution")
-    rights_by_field = {
-        "rolname": role,
-        "direct_role": direct_role,
-        "relname": table,
-        "attname": column,
-        "can_read": True,
-        "can_insert": False,
-        "can_update": True,
-        "can_reference": False,
-        "can_grant": False,
-        "broad_write": False,
-    }
-    _validate_column(rights_by_field, config)
-    with pytest.raises(ValueError, match="registry_fhir_catalog_permissions_invalid"):
-        _validate_column({**rights_by_field, "can_grant": True}, config)
 
 
 @pytest.mark.parametrize(
@@ -416,54 +412,6 @@ async def test_canceling_an_active_source_read_waits_for_snapshot_rollback():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure",
-    ["database", "descriptor_database", "replica", "login", "elevated", "permissions", "owner_path", "create"],
-)
-async def test_source_reader_census_refuses_wrong_database_or_authority(failure):
-    identity_by_field = {
-        "database_name": "isolated_catalog",
-        "database_oid": 104,
-        "system_identifier": "123456789",
-        "postmaster_started": "2026-01-01T00:00:00Z",
-        "recovering": False,
-    }
-    role_by_field = {
-        "rolcanlogin": True,
-        **dict.fromkeys(
-            ("rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls", "elevated_membership"),
-            False,
-        ),
-    }
-    permissions = [{"admitted_role": True, "no_owner_path": True, "no_schema_create": True}]
-    source_descriptor = descriptor()
-    observed_identity_by_field = dict(identity_by_field)
-    match failure:
-        case "database":
-            observed_identity_by_field["system_identifier"] = "other-system"
-        case "descriptor_database":
-            source_descriptor["database_oid"] += 1
-        case "replica":
-            observed_identity_by_field["recovering"] = True
-        case "login":
-            role_by_field["rolcanlogin"] = False
-        case "elevated":
-            role_by_field["elevated_membership"] = True
-        case "permissions":
-            permissions = []
-        case _:
-            permissions[0]["no_owner_path" if failure == "owner_path" else "no_schema_create"] = False
-    reader = Mock(
-        fetchrow=AsyncMock(side_effect=[observed_identity_by_field, role_by_field]),
-        fetch=AsyncMock(return_value=permissions),
-    )
-    writer = Mock(fetchrow=AsyncMock(return_value=identity_by_field))
-    reason = "database_changed" if failure in {"database", "descriptor_database", "replica"} else "reader_role_unsafe"
-    with pytest.raises(grants.FHIRCatalogGrantError, match=reason):
-        await grants._reader_identity(reader, writer, (source_descriptor,))
-
-
-@pytest.mark.asyncio
 async def test_changed_proposed_storage_refuses_before_descriptor_discovery(custody):
     grant = standing_grant()
     selected = snapshot(grant, (descriptor(),))
@@ -531,39 +479,14 @@ def test_standing_policy_text_bounds_refuse_before_configuration_can_be_used(doc
         grants.parse_fhir_catalog_standing_grant(document)
 
 
-def _fixture_reader_identity(writer, monkeypatch):
-    identity_by_field = {
-        "database_name": "isolated_catalog",
-        "database_oid": 104,
-        "system_identifier": "123456789",
-        "postmaster_started": "2026-01-01T00:00:00Z",
-        "recovering": False,
-    }
-    role_by_field = {
-        "rolcanlogin": True,
-        **dict.fromkeys(
-            ("rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls", "elevated_membership"),
-            False,
-        ),
-    }
-    original = writer.fetchrow
-
-    async def fetchrow(query, *arguments):
-        return identity_by_field if query == grants._IDENTITY_SQL else await original(query, *arguments)
-
-    monkeypatch.setattr(writer, "fetchrow", fetchrow)
-    return identity_by_field, role_by_field
-
-
 @pytest.mark.asyncio
 async def test_current_source_fence_keeps_original_reader_until_verified_writer_exit(custody, monkeypatch):
     grant, source_descriptor = standing_grant(), descriptor()
     selected = snapshot(grant, (source_descriptor,))
     writer = CatalogConnection((selected,), (source_descriptor,))
-    identity, role = _fixture_reader_identity(writer, monkeypatch)
     transaction = Mock(start=AsyncMock(), rollback=AsyncMock())
     reader = Mock(
-        fetchrow=AsyncMock(side_effect=[identity, role]),
+        fetchrow=AsyncMock(),
         fetch=AsyncMock(return_value=[{"admitted_role": True, "no_owner_path": True, "no_schema_create": True}]),
         execute=AsyncMock(),
         transaction=Mock(return_value=transaction),
@@ -694,21 +617,7 @@ async def test_carried_observation_requires_its_protected_accounting_row_before_
 
 
 @pytest.mark.asyncio
-async def test_scoped_source_requires_native_reader_instead_of_source_export(monkeypatch):
-    from tests.test_registry_fhir_catalog_source_producer_grant import scoped_observed_descriptor, verifier_case, verify
-
-    selected, profile = scoped_observed_descriptor()
-    case = verifier_case(monkeypatch, (selected,), (profile,))
-    case.pool = None
-    with pytest.raises(grants.FHIRCatalogGrantError, match="reader_required"):
-        await verify(case)
-    case.factory.assert_not_called()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "boundary,reason", [("missing_export", "source_companies_unavailable"), ("database", "database_changed")]
-)
+@pytest.mark.parametrize("boundary,reason", [("missing_export", "source_companies_unavailable")])
 async def test_cached_label_seal_requires_export_and_the_committed_database(monkeypatch, boundary, reason):
     from process import registry_fhir_catalog_validation as validation
     from tests.test_registry_fhir_catalog_source_companies import source_company
@@ -720,9 +629,6 @@ async def test_cached_label_seal_requires_export_and_the_committed_database(monk
     case.snapshot["source_vector_json"][0]["source_companies"] = [source_company()]
     case.snapshot["metadata_generation"] = metadata_generation(case.snapshot)
     case.export["source_companies"] = AsyncMock(return_value=(source_company(),))
-    if boundary == "database":
-        case.export["database_identity"]["database_oid"] += 1
-        case.connection.fetchrow.return_value = dict(case.export["database_identity"])
     callback = grants.build_fhir_catalog_observation_verifier(
         case.grant, case.pool, source_export=None if boundary == "missing_export" else case.factory
     )
@@ -735,8 +641,6 @@ async def test_cached_label_seal_requires_export_and_the_committed_database(monk
     case.export["replay"].assert_not_awaited()
     case.pool.acquire.assert_not_called()
     validation.validate_fhir_catalog_observed_projection.assert_not_awaited()
-    if boundary == "database":
-        assert case.events[-1] == ("exit",)
 
 
 @pytest.mark.asyncio
@@ -853,25 +757,6 @@ async def test_fresh_native_observation_descriptor_drift_refuses_before_fact_rep
 
 
 @pytest.mark.asyncio
-async def test_registered_native_replay_cannot_borrow_the_candidate_writer_as_reader(monkeypatch):
-    from tests.test_registry_fhir_catalog_source_producer_grant import scoped_observed_descriptor, verifier_case, verify
-
-    selected, profile = scoped_observed_descriptor()
-    case = verifier_case(monkeypatch, (selected,), (profile,))
-
-    @asynccontextmanager
-    async def acquire():
-        yield case.connection
-
-    case.pool = SimpleNamespace(acquire=acquire)
-    with pytest.raises(grants.FHIRCatalogGrantError, match="reader_required"):
-        await verify(case)
-    case.factory.assert_not_called()
-    case.export["replay"].assert_not_awaited()
-    grants._verify_retained_product_observations.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("missing", ["reader", "workspace"])
 async def test_retained_product_replay_requires_both_pinned_reader_and_workspace(monkeypatch, missing):
     from process import registry_fhir_catalog_products as products
@@ -899,58 +784,3 @@ async def test_retained_product_replay_requires_both_pinned_reader_and_workspace
             {generation: retained.descriptor},
         )
     grants.require_retained_fhir_catalog_sources.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("same_reader", [False, True])
-async def test_retained_source_fence_pins_capture_until_authorized_verification(custody, monkeypatch, same_reader):
-    from tests.test_registry_fhir_catalog_retained import catalog_connection, descriptor_fixture
-
-    retained, _, _ = await descriptor_fixture(monkeypatch)
-    grant = standing_grant(retained_source_recipes=True)
-    generation = grants.fhir_catalog_source_generation(retained.descriptor)
-    selected = snapshot(
-        grant,
-        source_vector_json=[
-            {
-                "source_generation": generation,
-                "source_id": retained.descriptor["coordinates"]["source_id"],
-                "status": "last_good",
-            }
-        ],
-    )
-    writer = catalog_connection(selected, retained.descriptor)
-    transaction = Mock(start=AsyncMock(), rollback=AsyncMock())
-    reader = (
-        writer
-        if same_reader
-        else Mock(
-            transaction=Mock(return_value=transaction),
-            execute=AsyncMock(),
-            is_in_transaction=Mock(return_value=True),
-        )
-    )
-
-    @asynccontextmanager
-    async def acquire():
-        yield reader
-
-    pinned = SimpleNamespace(capture=object(), verify=AsyncMock())
-    monkeypatch.setattr(grants, "pin_retained_fhir_catalog_source", AsyncMock(return_value=pinned))
-    monkeypatch.setattr(grants, "_reader_identity", AsyncMock())
-    monkeypatch.setattr(grants, "require_retained_fhir_catalog_sources", AsyncMock())
-    runtime = grants.build_fhir_catalog_publication_runtime(grant, SimpleNamespace(acquire=acquire))
-    if same_reader:
-        with pytest.raises(grants.FHIRCatalogGrantError, match="reader_required"):
-            async with runtime.source_fence(snapshot=selected, connection=writer):
-                pytest.fail("writer reused as independent retained reader")
-        grants.pin_retained_fhir_catalog_source.assert_not_awaited()
-    else:
-        async with runtime.source_fence(snapshot=selected, connection=writer):
-            await runtime.authorize_metadata(command=command(grant, selected), snapshot=selected, connection=writer)
-            assert await runtime.verify_sources(snapshot=selected, connection=writer) is True
-            pinned.verify.assert_awaited_once_with(reader, pinned.capture)
-            transaction.rollback.assert_not_awaited()
-        grants.pin_retained_fhir_catalog_source.assert_awaited_once_with(reader, retained.descriptor)
-        transaction.rollback.assert_awaited_once()
-    assert grants._CONTEXT.get() is None

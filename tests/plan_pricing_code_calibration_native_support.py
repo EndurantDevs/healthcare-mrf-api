@@ -99,9 +99,10 @@ def _fault_verifier(fault, checked_cases):
     async def verify(oracle, audit, ownership):
         checked_cases.append(True)
         if fault == "membership":
-            await oracle.session.execute(
+            removed = await oracle.session.execute(
                 text(f'DELETE FROM "{ownership.schema_name}".plan_pricing_code_membership WHERE npi=1000000001')
             )
+            assert removed.rowcount > 0
         if fault == "work":
             oracle.work["factor"] += 1
         if fault == "cancelled":

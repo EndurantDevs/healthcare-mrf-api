@@ -12,7 +12,7 @@ from importlib import import_module
 
 from sqlalchemy import text
 
-from api.ptg2_geo_projection import validate_projection_dependency_bindings
+from api.ptg2_geo_projection import validate_projection_dependency_qnames
 from process import npi_result_generation as npi
 from process import reference_family_result_generation as reference
 from process.provider_directory_cms_native_registration import (
@@ -23,6 +23,9 @@ from process.provider_directory_cms_native_registration import (
 )
 from process.provider_directory_cms_native_registration import (
     capture_native_input_candidate as capture_native_input_candidate,
+)
+from process.provider_directory_cms_native_registration import (
+    finish_local_native_input_publication as finish_local_native_input_publication,
 )
 from process.provider_directory_cms_native_registration import (
     native_input_registration_roots as native_input_registration_roots,
@@ -83,6 +86,11 @@ def _relations(schema):
     return tuple(sorted(names))
 
 
+def _input_present(relation):
+    """Project old named catalog rows without interpreting their retired physical tokens."""
+    return relation["present"] if "present" in relation else relation.get("relkind") is not None
+
+
 async def _physical_relations(session, schema, *, captured_tiger=None):
     """Resolve a fixed catalog set, including absent optional inputs, without row scans."""
     if captured_tiger is not None:
@@ -90,14 +98,15 @@ async def _physical_relations(session, schema, *, captured_tiger=None):
     rows = (
         await session.execute(
             text("""
-        SELECT requested.name, relation.oid::bigint AS relation_oid,
-               pg_relation_filenode(relation.oid)::bigint AS relfilenode,
+        SELECT requested.name, namespace.nspname AS schema_name,relation.relname AS table_name,
+               relation.oid IS NOT NULL AS present,
                relation.relkind::text AS relkind, relation.relpersistence::text AS relpersistence,
                relation.relispartition OR EXISTS (
                    SELECT 1 FROM pg_inherits WHERE inhrelid=relation.oid OR inhparent=relation.oid
                ) AS inherited
           FROM unnest(CAST(:names AS text[])) AS requested(name)
           LEFT JOIN pg_class relation ON relation.oid=to_regclass(requested.name)
+          LEFT JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
          ORDER BY requested.name
     """),
             {"names": [f'"{namespace}"."{name}"' for namespace, name in _relations(schema)]},
@@ -130,11 +139,10 @@ async def _lock_inputs(
             schema != "mrf"
             or register
             or nucc_relation is None
-            or nucc_relation["relation_oid"] != protected_nucc["physical"]["parent_oid"]
+            or not _input_present(nucc_relation)
             or nucc_relation.get("relkind") != "p"
             or nucc_relation.get("relpersistence") != "p"
             or nucc_relation.get("inherited") is not True
-            or nucc_relation.get("relfilenode") is not None
         ):
             raise RuntimeError("cms_address_native_nucc_proof_changed")
     elif nucc_relation is not None and nucc_relation.get("relkind") == "p":
@@ -145,7 +153,7 @@ async def _lock_inputs(
     names = [
         name
         for name, physical in relations.items()
-        if physical["relation_oid"] is not None
+        if _input_present(physical)
         and name not in tiger_names
         and not (protected_nucc is not None and name == nucc_name)
     ]
@@ -172,18 +180,28 @@ async def _lock_inputs(
 
 
 def _npi_body(schema):
-    """The existing migration's statement revision function, with whitespace normalized only."""
-    return f'''
-        BEGIN
+    """The existing named NPI statement revision body, normalized only for whitespace."""
+    return f'''        BEGIN
             UPDATE "{schema}"."npi_result_generation"
                SET local_generation = local_generation + 1,
-                   origin_lineage_id = CASE WHEN origin_lineage_id IS NULL THEN NULL ELSE local_lineage_id END,
-                   origin_generation = CASE WHEN origin_lineage_id IS NULL THEN NULL ELSE local_generation + 1 END,
-                   published_at = CASE WHEN origin_lineage_id IS NULL THEN NULL ELSE transaction_timestamp() END
-             WHERE singleton IS TRUE AND relation_oids IS NOT NULL AND TG_RELID::bigint = ANY(relation_oids);
+                   origin_lineage_id = CASE
+                       WHEN origin_lineage_id IS NULL THEN NULL
+                       ELSE local_lineage_id
+                   END,
+                   origin_generation = CASE
+                       WHEN origin_lineage_id IS NULL THEN NULL
+                       ELSE local_generation + 1
+                   END,
+                   published_at = CASE
+                       WHEN origin_lineage_id IS NULL THEN NULL
+                       ELSE transaction_timestamp()
+                   END
+             WHERE singleton IS TRUE
+               AND serving_schema IS NOT NULL
+               AND TG_TABLE_SCHEMA = serving_schema
+               AND TG_TABLE_NAME = ANY(serving_relation_names);
             RETURN NULL;
-        END;
-    '''
+        END; '''
 
 
 async def _npi_revision(session, schema):
@@ -193,18 +211,21 @@ async def _npi_revision(session, schema):
         (
             await session.execute(
                 text("""
-        SELECT trigger.tgrelid::bigint AS relation_oid, trigger.tgtype, trigger.tgenabled::text AS tgenabled,
+        SELECT namespace.nspname AS schema_name,relation.relname AS table_name, trigger.tgtype, trigger.tgenabled::text AS tgenabled,
                trigger.tgnargs, trigger.tgqual IS NULL AS unconditional,
-               trigger.tgfoid::bigint AS function_oid, function.prosrc, function.prosecdef,
+               function.prosrc, function.prosecdef,
                function.proconfig, language.lanname
-          FROM pg_trigger trigger JOIN pg_proc function ON function.oid=trigger.tgfoid
+          FROM pg_trigger trigger JOIN pg_class relation ON relation.oid=trigger.tgrelid
+          JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+          JOIN pg_proc function ON function.oid=trigger.tgfoid
           JOIN pg_language language ON language.oid=function.prolang
-         WHERE trigger.tgrelid=ANY(CAST(:oids AS oid[])) AND trigger.tgname=:trigger
+         WHERE (namespace.nspname,relation.relname) IN (SELECT * FROM unnest(CAST(:schemas AS text[]),CAST(:names AS text[]))) AND trigger.tgname=:trigger
            AND trigger.tgfoid=to_regprocedure(:function)
-         ORDER BY trigger.tgrelid
+         ORDER BY namespace.nspname,relation.relname
     """),
                 {
-                    "oids": list(authority.relation_oids),
+                    "schemas": [namespace for namespace, _name in authority.relations],
+                    "names": [name for _namespace, name in authority.relations],
                     "trigger": npi.REVISION_TRIGGER,
                     "function": f'"{schema}"."{npi.REVISION_FUNCTION}"()',
                 },
@@ -242,18 +263,9 @@ async def _reference_authorities(session, schema, *, protected_tiger=None):
         authority = reference.validate_reference_family_result_generation_authority(authority_row)
         namespace = "tiger" if authority.importer_id == "tiger" else schema
         names = reference.RELATION_NAMES_BY_IMPORTER[authority.importer_id]
-        actual_oids = tuple(
-            (
-                await session.execute(
-                    text(
-                        "SELECT to_regclass(name)::oid::bigint FROM unnest(CAST(:names AS text[])) WITH ORDINALITY "
-                        "AS requested(name,ordinal) ORDER BY ordinal"
-                    ),
-                    {"names": [f'"{namespace}"."{table}"' for table in names]},
-                )
-            ).scalars()
-        )
-        if authority.serving_generation is not None and authority.relation_oids == actual_oids:
+        if authority.serving_generation is not None and authority.relations == tuple(
+            (namespace, name) for name in names
+        ):
             if authority.importer_id == "geo":
                 from process.geo_source_storage import capture_geo_generation
 
@@ -267,21 +279,19 @@ async def _reference_authorities(session, schema, *, protected_tiger=None):
 
 
 def _geo_bindings(schema, relations, *, captured_tiger=None):
-    """Reuse the exact geo physical binding contract; missing inputs remain unsupported."""
+    """Select the complete declared geo family; missing inputs remain unsupported."""
     names = [(schema, name) for name in _GEO] + [("tiger", "zip_state"), ("tiger", "zcta5")]
     captured_by_name = {} if captured_tiger is None else captured_tiger_bindings(captured_tiger)
     bindings_by_name = {}
     for namespace, name in names:
         physical = relations[f'"{namespace}"."{name}"']
-        if physical["relation_oid"] is None:
+        if not _input_present(physical):
             return None
         bindings_by_name[f"{namespace}.{name}"] = {
             "schema_name": captured_by_name.get(f"{namespace}.{name}", {}).get("schema_name", namespace),
             "table_name": name,
-            "relation_oid": physical["relation_oid"],
-            "relfilenode": physical["relfilenode"],
         }
-    return validate_projection_dependency_bindings(schema, bindings_by_name)
+    return validate_projection_dependency_qnames(schema, bindings_by_name)
 
 
 def _require_heaps(relations, *, protected_nucc=None, protected_tiger=None, captured_tiger=None, protected_fhir=None):
@@ -291,24 +301,18 @@ def _require_heaps(relations, *, protected_nucc=None, protected_tiger=None, capt
     for name, value in relations.items():
         if name in tiger_names or name in fhir_names:
             continue
-        if (
-            protected_nucc is not None
-            and name == '"mrf"."nucc_taxonomy"'
-            and value["relation_oid"] == protected_nucc["physical"]["parent_oid"]
-        ):
+        if protected_nucc is not None and name == '"mrf"."nucc_taxonomy"' and _input_present(value):
             if value["relkind"] != "p" or value["relpersistence"] != "p" or value["inherited"] is not True:
                 raise RuntimeError("cms_address_native_input_requires_persistent_heap")
             continue
-        if value["relation_oid"] is not None and (
-            value["relkind"] != "r" or value["relpersistence"] != "p" or value["inherited"]
-        ):
+        if _input_present(value) and (value["relkind"] != "r" or value["relpersistence"] != "p" or value["inherited"]):
             raise RuntimeError("cms_address_native_input_requires_persistent_heap")
 
 
 def _advance_body(schema):
     return f'''
 BEGIN
-    UPDATE "{schema}"."{_TABLE}" SET revision=revision+1,mutation_xid=pg_current_xact_id() WHERE relation_oid=TG_RELID::bigint;
+    UPDATE "{schema}"."{_TABLE}" SET revision=revision+1,mutation_xid=pg_current_xact_id() WHERE schema_name=TG_TABLE_SCHEMA AND table_name=TG_TABLE_NAME;
     IF NOT FOUND THEN RAISE EXCEPTION 'cms_native_input_not_registered'; END IF;
     RETURN NULL;
 END;
@@ -342,11 +346,11 @@ async def _require_ledger_guards(session, schema):
     _validate_ledger_guards(guard_rows)
 
 
-def _validate_ledger_guards(guard_rows):
-    expected_body = """
+def _ledger_guard_body():
+    return """
 BEGIN
     IF TG_OP='UPDATE' AND pg_trigger_depth()=2
-       AND NEW.relation_oid=OLD.relation_oid AND NEW.schema_name=OLD.schema_name
+       AND NEW.schema_name=OLD.schema_name
        AND NEW.table_name=OLD.table_name AND NEW.revision=OLD.revision+1
        AND NEW.mutation_xid=pg_current_xact_id() THEN
         RETURN NEW;
@@ -354,6 +358,10 @@ BEGIN
     RAISE EXCEPTION 'cms_native_input_revision_immutable';
 END;
 """
+
+
+def _validate_ledger_guards(guard_rows):
+    expected_body = _ledger_guard_body()
     expected_type_by_trigger = {"cms_native_input_revision_immutable": 27, "cms_native_input_revision_no_truncate": 34}
     if len(guard_rows) != 2 or any(
         guard["tgtype"] != expected_type_by_trigger[guard["tgname"]]
@@ -369,9 +377,9 @@ END;
         raise RuntimeError("cms_address_native_revision_ledger_unavailable")
 
 
-def _require_native_revision_triggers(guard_rows, oids, schema):
+def _require_native_revision_triggers(guard_rows, names, schema):
     """Verify every exact native revision guard before reading its revision."""
-    if len(guard_rows) != len(oids) or any(
+    if [(row["schema_name"], row["table_name"]) for row in guard_rows] != sorted(names) or any(
         guard["tgtype"] != 60
         or guard["tgenabled"] != "A"
         or guard["tgnargs"] != 0
@@ -386,22 +394,18 @@ def _require_native_revision_triggers(guard_rows, oids, schema):
         raise RuntimeError("cms_address_native_revision_guard_unavailable")
 
 
-def _revision_input_oids(schema, relations, protected_nucc, protected_tiger, captured_tiger, protected_fhir):
+def _revision_input_names(schema, relations, protected_nucc, protected_tiger, captured_tiger, protected_fhir):
     tiger_names = _tiger_read_names(protected_tiger, captured_tiger, relations)
     npi_names = {f'"{schema}"."{name}"' for name in npi.RELATION_NAMES}
     fhir_names = _fhir_input_names(protected_fhir, relations, schema)
     return [
-        physical["relation_oid"]
+        (physical["schema_name"], physical["table_name"])
         for name, physical in relations.items()
-        if physical["relation_oid"] is not None
+        if _input_present(physical)
         and name not in tiger_names
         and name not in npi_names
         and name not in fhir_names
-        and not (
-            protected_nucc is not None
-            and name == '"mrf"."nucc_taxonomy"'
-            and physical["relation_oid"] == protected_nucc["physical"]["parent_oid"]
-        )
+        and not (protected_nucc is not None and name == '"mrf"."nucc_taxonomy"' and _input_present(physical))
         and name not in {f'"{schema}"."doctor_clinician_address"', f'"{schema}"."geo_zip_lookup"'}
     ]
 
@@ -410,45 +414,52 @@ async def _revision_guards(
     session, schema, relations, *, protected_nucc=None, protected_tiger=None, captured_tiger=None, protected_fhir=None
 ):
     """Require exact all-event, unconditional ALWAYS guards and the migration function."""
-    await session.execute(text(f'SELECT relation_oid FROM "{schema}"."{_TABLE}" WHERE FALSE'))
+    await session.execute(text(f'SELECT schema_name,table_name FROM "{schema}"."{_TABLE}" WHERE FALSE'))
     await _require_ledger_guards(session, schema)
-    oids = _revision_input_oids(schema, relations, protected_nucc, protected_tiger, captured_tiger, protected_fhir)
+    names = _revision_input_names(schema, relations, protected_nucc, protected_tiger, captured_tiger, protected_fhir)
     guard_rows = (
         (
             await session.execute(
                 text("""
-        SELECT trigger.tgrelid::bigint AS relation_oid, trigger.tgtype, trigger.tgenabled::text AS tgenabled,
+        SELECT namespace.nspname AS schema_name,relation.relname AS table_name, trigger.tgtype, trigger.tgenabled::text AS tgenabled,
                trigger.tgnargs, trigger.tgqual IS NULL AS unconditional,
                function.prosrc, function.prosecdef, function.proconfig,
                function.prorettype='trigger'::regtype AS returns_trigger,
                language.lanname
-          FROM pg_trigger trigger JOIN pg_proc function ON function.oid=trigger.tgfoid
+          FROM pg_trigger trigger JOIN pg_class relation ON relation.oid=trigger.tgrelid
+          JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+          JOIN pg_proc function ON function.oid=trigger.tgfoid
           JOIN pg_language language ON language.oid=function.prolang
-         WHERE trigger.tgrelid=ANY(CAST(:oids AS oid[])) AND trigger.tgname=:trigger
+         WHERE (namespace.nspname,relation.relname) IN (SELECT * FROM unnest(CAST(:schemas AS text[]),CAST(:names AS text[]))) AND trigger.tgname=:trigger
            AND trigger.tgfoid=to_regprocedure(:function)
-         ORDER BY trigger.tgrelid
+         ORDER BY namespace.nspname,relation.relname
     """),
-                {"oids": oids, "trigger": _TRIGGER, "function": f'"{schema}".cms_native_input_advance()'},
+                {
+                    "schemas": [namespace for namespace, _ in names],
+                    "names": [name for _, name in names],
+                    "trigger": _TRIGGER,
+                    "function": f'"{schema}".cms_native_input_advance()',
+                },
             )
         )
         .mappings()
         .all()
     )
-    _require_native_revision_triggers(guard_rows, oids, schema)
+    _require_native_revision_triggers(guard_rows, names, schema)
     revisions = (
         (
             await session.execute(
                 text(
-                    f'SELECT relation_oid, schema_name, table_name, revision FROM "{schema}"."{_TABLE}" '
-                    "WHERE relation_oid=ANY(CAST(:oids AS bigint[])) ORDER BY relation_oid"
+                    f'SELECT schema_name, table_name, revision FROM "{schema}"."{_TABLE}" '
+                    "WHERE (schema_name,table_name) IN (SELECT * FROM unnest(CAST(:schemas AS text[]),CAST(:names AS text[]))) ORDER BY schema_name,table_name"
                 ),
-                {"oids": oids},
+                {"schemas": [namespace for namespace, _ in names], "names": [name for _, name in names]},
             )
         )
         .mappings()
         .all()
     )
-    if len(revisions) != len(oids):
+    if [(guard_record["schema_name"], guard_record["table_name"]) for guard_record in revisions] != sorted(names):
         raise RuntimeError("cms_address_native_input_not_registered")
     return [dict(guard) for guard in revisions]
 
@@ -469,29 +480,29 @@ async def register_native_address_inputs(session, schema: str) -> None:
     await capture_geo_generation(session, schema)
     for namespace, name in _relations(schema):
         relation = f'"{namespace}"."{name}"'
-        oid = relations[relation]["relation_oid"]
-        if oid is not None and not (
+        present = relations[relation]["present"]
+        if present and not (
             namespace == schema and name in (*npi.RELATION_NAMES, "doctor_clinician_address", "geo_zip_lookup")
         ):
-            await _register_relation(session, schema, namespace, name, oid)
+            await _register_relation(session, schema, namespace, name)
     await _revision_guards(session, schema, relations)
 
 
-async def _register_relation(session, schema, namespace, name, oid):
+async def _register_relation(session, schema, namespace, name, _old_address=None):
     relation = f'"{namespace}"."{name}"'
     registered = (
         await session.execute(
             text(
-                f'INSERT INTO "{schema}"."{_TABLE}" (relation_oid,schema_name,table_name) '
-                "VALUES (:oid,:namespace,:name) ON CONFLICT (relation_oid) DO NOTHING RETURNING relation_oid"
+                f'INSERT INTO "{schema}"."{_TABLE}" (schema_name,table_name) '
+                "VALUES (:namespace,:name) ON CONFLICT (schema_name,table_name) DO NOTHING RETURNING table_name"
             ),
-            {"oid": oid, "namespace": namespace, "name": name},
+            {"namespace": namespace, "name": name},
         )
     ).scalar_one_or_none()
     exists = (
         await session.execute(
-            text("SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=:oid AND tgname=:trigger)"),
-            {"oid": oid, "trigger": _TRIGGER},
+            text("SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass(:relation) AND tgname=:trigger)"),
+            {"relation": relation, "trigger": _TRIGGER},
         )
     ).scalar_one()
     if not exists:
@@ -533,22 +544,6 @@ async def _capture_selected_input_relations(session, schema):
     return relations, protected_by_kind
 
 
-async def _input_database_identity(session):
-    return (
-        (
-            await session.execute(
-                text("""
-        SELECT current_database() AS database_name, oid::bigint AS database_oid,
-               (SELECT system_identifier::text FROM pg_control_system()) AS system_identifier
-          FROM pg_database WHERE datname=current_database()
-    """)
-            )
-        )
-        .mappings()
-        .one()
-    )
-
-
 async def capture_native_address_input_fence(session, schema: str, *, cutover=False) -> dict:
     """Read registered proofs in a repeatable snapshot; never register during signing."""
     schema = npi._schema_name(schema)
@@ -581,11 +576,9 @@ async def capture_native_address_input_fence(session, schema: str, *, cutover=Fa
             raise RuntimeError("cms_address_native_fhir_cutover_isolation_changed")
     if protected_fhir is not None and await _capture_bound_fhir(session, schema) != protected_fhir:
         raise RuntimeError("cms_address_native_inputs_changed")
-    database = await _input_database_identity(session)
     fence_by_field = {
         "version": 1,
         "schema": schema,
-        "database": dict(database),
         "relations": before,
         "npi": await _npi_revision(session, schema),
         "reference_authorities": await _reference_authorities(
@@ -615,17 +608,14 @@ async def _cms_office_read_relations(session, schema, *, cutover=False, protecte
     """Pin existing sealed CMS read catalogs; never install mutation hooks."""
     from process.provider_directory_cms_typed_offices import CMS_OFFICE_READ_TABLES
 
-    statement = text("""SELECT requested.name,relation.oid::bigint AS relation_oid,
-      namespace.oid::bigint AS schema_oid,namespace.nspowner::bigint AS schema_owner_oid,
-      relation.relowner::bigint AS owner_oid,relation.relkind::text AS relkind,
-      relation.relpersistence::text AS relpersistence,relation.relacl::text AS raw_acl,
-      namespace.nspacl::text AS raw_schema_acl,relation.relrowsecurity,relation.relforcerowsecurity,
-      relation.relispartition,
+    statement = text("""SELECT requested.name,relation.oid IS NOT NULL AS present,
+      relation.relkind::text AS relkind,relation.relpersistence::text AS relpersistence,
+      relation.relrowsecurity,relation.relforcerowsecurity,relation.relispartition,
       relation.relispartition OR EXISTS(SELECT 1 FROM pg_inherits
         WHERE inhrelid=relation.oid OR inhparent=relation.oid) AS inherited
       FROM unnest(CAST(:names AS text[])) requested(name)
       LEFT JOIN pg_class relation ON relation.oid=to_regclass(:schema||'.'||requested.name)
-      LEFT JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace ORDER BY requested.name""")
+      ORDER BY requested.name""")
     parameters_by_name = {"names": list(CMS_OFFICE_READ_TABLES), "schema": '"' + schema + '"'}
     before_catalog_by_name = {
         catalog_row["name"]: dict(catalog_row)
@@ -645,12 +635,9 @@ async def _cms_office_read_relations(session, schema, *, cutover=False, protecte
         if protected_fhir["schema"] != schema or await _capture_bound_fhir(session, schema) != protected_fhir:
             raise RuntimeError("cms_address_native_fhir_proof_changed")
     for name, catalog_row in before_catalog_by_name.items():
-        if catalog_row["relation_oid"] is not None:
+        if catalog_row["present"]:
             if (
-                (
-                    name in partitioned_names
-                    and (catalog_row["relispartition"] or catalog_row["owner_oid"] != protected_fhir["owner_oid"])
-                )
+                (name in partitioned_names and catalog_row["relispartition"])
                 or (name not in partitioned_names and (catalog_row["relkind"] != "r" or catalog_row["inherited"]))
                 or catalog_row["relpersistence"] != "p"
                 or catalog_row["relrowsecurity"]
@@ -679,8 +666,6 @@ def _require_fhir_fence(fence, schema):
         ):
             raise RuntimeError("cms_address_native_fhir_proof_changed")
         _fhir_input_names(protected_fhir, fence["relations"], schema)
-        if protected_fhir["database_oid"] != fence["database"]["database_oid"]:
-            raise RuntimeError("cms_address_native_fhir_proof_changed")
     elif protected_fhir is not None or _has_partitioned_fhir(fence["relations"], schema):
         raise RuntimeError("cms_address_native_fhir_proof_changed")
 
@@ -703,7 +688,7 @@ def require_supported_native_address_inputs(fence: dict) -> None:
         observed_nucc = fence["relations"].get('"mrf"."nucc_taxonomy"', {})
         if (
             schema != "mrf"
-            or observed_nucc.get("relation_oid") != protected_nucc["physical"]["parent_oid"]
+            or not _input_present(observed_nucc)
             or observed_nucc.get("relkind") != "p"
             or observed_nucc.get("inherited") is not True
         ):
@@ -715,8 +700,6 @@ def require_supported_native_address_inputs(fence: dict) -> None:
         if protected_tiger is None:
             raise RuntimeError("cms_address_native_tiger_proof_changed")
         protected_tiger_relations(protected_tiger, fence["relations"])
-        if protected_tiger["database_oid"] != fence["database"]["database_oid"]:
-            raise RuntimeError("cms_address_native_tiger_proof_changed")
     elif protected_tiger is not None:
         raise RuntimeError("cms_address_native_tiger_proof_changed")
     if fence.get("geo_bindings") is None:
@@ -726,8 +709,6 @@ def require_supported_native_address_inputs(fence: dict) -> None:
         if captured_tiger is None:
             raise RuntimeError("cms_address_native_tiger_proof_changed")
         captured_tiger_relations(captured_tiger, fence["relations"])
-        if captured_tiger["database_oid"] != fence["database"]["database_oid"]:
-            raise RuntimeError("cms_address_native_tiger_proof_changed")
         expected_tiger = captured_tiger_bindings(captured_tiger)
         if any(fence["geo_bindings"].get(name) != binding for name, binding in expected_tiger.items()):
             raise RuntimeError("cms_address_native_tiger_proof_changed")
@@ -738,7 +719,7 @@ def require_supported_native_address_inputs(fence: dict) -> None:
     required_families = {"cms-doctors", "geo"} | (
         {"tiger"} if protected_tiger is None and captured_tiger is None else set()
     )
-    if fence["relations"][f'"{schema}"."facility_anchor"']["relation_oid"] is not None:
+    if _input_present(fence["relations"][f'"{schema}"."facility_anchor"']):
         required_families.add("facility-anchors")
     if not required_families <= authorities.keys() or not {"mrf", "mrf-address"} & authorities.keys():
         raise RuntimeError("cms_address_native_publication_unavailable")
@@ -762,29 +743,25 @@ def _require_protected_nucc_proof(proof):
     ):
         raise RuntimeError("cms_address_native_nucc_proof_changed")
     physical = proof["physical"]
-    fields = {
-        "contract",
-        "owner_oid",
-        "parent_oid",
-        "parent_index_oid",
-        "child_oid",
-        "child_schema",
-        "child_schema_oid",
-        "child_table",
-        "child_filenode",
-    }
+    fields = {"contract", "parent", "parent_index", "child"}
     if type(physical) is not dict or set(physical) != fields or physical["contract"] != partition.CONTRACT:
         raise RuntimeError("cms_address_native_nucc_proof_changed")
-    for key in fields - {"contract", "child_schema", "child_table"}:
-        partition._oid(physical[key])
+    for field in ("parent", "parent_index", "child"):
+        pair = physical[field]
+        if (
+            type(pair) not in (list, tuple)
+            or len(pair) != 2
+            or any(type(name) is not str or npi._schema_name(name) != name for name in pair)
+        ):
+            raise RuntimeError("cms_address_native_nucc_proof_changed")
     if (
-        type(physical["child_schema"]) is not str
-        or partition._CHILD_SCHEMA.fullmatch(physical["child_schema"]) is None
-        or physical["child_table"] != "nucc_taxonomy"
+        tuple(physical["parent"]) != ("mrf", "nucc_taxonomy")
+        or physical["child"][1] != "nucc_taxonomy"
+        or partition._CHILD_SCHEMA.fullmatch(physical["child"][0]) is None
     ):
         raise RuntimeError("cms_address_native_nucc_proof_changed")
     authority = reference._nucc_result_authority(proof["generation"])
-    if authority.relation_oids != (physical["child_oid"],):
+    if authority.relations != (tuple(physical["child"]),):
         raise RuntimeError("cms_address_native_nucc_generation_changed")
 
 
@@ -816,12 +793,13 @@ async def _captured_physical_relations(session, schema, proof):
     rows = (
         (
             await session.execute(
-                text("""SELECT requested.name,relation.oid::bigint AS relation_oid,
-        pg_relation_filenode(relation.oid)::bigint AS relfilenode,relation.relkind::text AS relkind,
+                text("""SELECT requested.name,namespace.nspname AS schema_name,relation.relname AS table_name,
+        relation.oid IS NOT NULL AS present,relation.relkind::text AS relkind,
         relation.relpersistence::text AS relpersistence,relation.relispartition OR EXISTS(
           SELECT 1 FROM pg_inherits WHERE inhrelid=relation.oid OR inhparent=relation.oid) AS inherited
         FROM unnest(CAST(:names AS text[]),CAST(:physical_names AS text[])) requested(name,physical_name)
-        LEFT JOIN pg_class relation ON relation.oid=to_regclass(requested.physical_name) ORDER BY requested.name"""),
+        LEFT JOIN pg_class relation ON relation.oid=to_regclass(requested.physical_name)
+        LEFT JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace ORDER BY requested.name"""),
                 dict(names=names, physical_names=physical_names),
             )
         )
@@ -855,15 +833,15 @@ def _fhir_input_names(proof, relations, schema=None):
     if schema is not None and proof["schema"] != schema:
         raise RuntimeError("cms_address_native_fhir_proof_changed")
     names = set()
-    for name, oid in proof["parent_oids"]:
-        quoted = f'"{proof["schema"]}"."{name}"'
+    for namespace, name in proof["parents"]:
+        quoted = f'"{namespace}"."{name}"'
         observed = relations.get(quoted, {})
-        inherited = any(row["parents"] == [oid] for row in proof["inventory"])
+        inherited = any([namespace, name] in row["parents"] for row in proof["inventory"])
         if (
-            observed.get("relation_oid") != oid
+            namespace != proof["schema"]
+            or not observed.get("present")
             or observed.get("relkind") != "p"
             or observed.get("relpersistence") != "p"
-            or observed.get("relfilenode") is not None
             or observed.get("inherited") is not inherited
         ):
             raise RuntimeError("cms_address_native_fhir_proof_changed")
@@ -873,7 +851,7 @@ def _fhir_input_names(proof, relations, schema=None):
 
 async def _capture_bound_fhir(session, schema):
     from process import provider_directory_source_observation as observation
-    from process.provider_directory_generic_source_policy import bound_publisher, source_callable_capability
+    from process.provider_directory_generic_source_policy import bound_publisher
     from process.provider_directory_projection_stage import _copy_driver
 
     directory = import_module("process.provider_directory_fhir")
@@ -881,10 +859,9 @@ async def _capture_bound_fhir(session, schema):
         return await observation.capture_fhir_input(directory, session, schema)
     publisher = bound_publisher()
     connection = await _copy_driver(session)
-    if publisher.connection is not connection or publisher.policy.schema != schema:
+    if publisher.policy.schema != schema:
         raise RuntimeError("cms_address_native_fhir_source_binding_changed")
-    await source_callable_capability(connection, publisher.policy)
     proof = await capture_protected_fhir_input(connection, source_policy=publisher.policy)
-    if bound_publisher() is not publisher or proof is None:
+    if proof is None:
         raise RuntimeError("cms_address_native_fhir_source_binding_changed")
     return proof

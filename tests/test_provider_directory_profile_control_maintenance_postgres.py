@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError, PendingRollbackError
+from sqlalchemy.exc import DBAPIError
 
 from process import provider_directory_profile as profile
 from process import provider_directory_profile_control_maintenance as maintenance
@@ -107,8 +107,7 @@ async def _held(fixture):
                 await connection.commit()
 
 
-def _liveness_lease(connection, fixture):
-    # Only the production native liveness query consumes these coordinates.
+def _liveness_lease(connection):
     # No signed admission, scope authorization or capacity receipt is synthesized.
     deadline = asyncio.get_running_loop().time() + 5
 
@@ -116,14 +115,13 @@ def _liveness_lease(connection, fixture):
         return max(1, int((deadline - asyncio.get_running_loop().time()) * 1000))
 
     fhir = SimpleNamespace(_profile_capacity_remaining_ms=remaining)
-    admission = SimpleNamespace(geometry=SimpleNamespace(database_oid=fixture.database_oid))
+    admission = SimpleNamespace()
     lease = maintenance._Lease(
         fhir,
         connection,
         admission,
         asyncio.current_task(),
         has_acquired=True,
-        coordinates=tuple(zip(fixture.oids, fixture.refs, strict=True)),
     )
     return lease
 
@@ -193,21 +191,14 @@ async def test_commit_releases_fence_before_stronger_cutover_keeps_advisory(nati
             await contender.rollback()
 
 
-@pytest.mark.parametrize("changed", ["oid", "transaction", "connection"])
-async def test_production_liveness_refuses_misbound_or_lost_native_lease(native_fence, changed):
+async def test_production_liveness_refuses_lost_native_transaction(native_fence):
     async with _held(native_fence) as (connection, _):
-        lease = _liveness_lease(connection, native_fence)
+        lease = _liveness_lease(connection)
         token = maintenance._ACTIVE.set(lease)
         try:
             await maintenance.assert_held(lease.fhir)
-            if changed == "oid":
-                lease.coordinates = (*lease.coordinates[:4], (native_fence.outside_oid, native_fence.outside_ref))
-            elif changed == "transaction":
-                await connection.commit()
-            else:
-                await connection.invalidate()
-            expected = PendingRollbackError if changed == "connection" else RuntimeError
-            with pytest.raises(expected):
+            await connection.commit()
+            with pytest.raises(RuntimeError, match="provider_directory_profile_maintenance_lease_lost"):
                 await maintenance.assert_held(lease.fhir)
         finally:
             maintenance._ACTIVE.reset(token)
@@ -227,7 +218,7 @@ async def test_cancel_drains_production_rollback_before_advisory_unlock(native_f
 
     async def worker():
         async with _held(native_fence) as (connection, _):
-            lease = _liveness_lease(connection, native_fence)
+            lease = _liveness_lease(connection)
             ready.set()
             try:
                 await asyncio.Event().wait()

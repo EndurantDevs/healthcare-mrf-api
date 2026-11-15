@@ -58,7 +58,7 @@ async def _case(monkeypatch):
     dsn = os.getenv("HLTHPRT_PHARMACY_ECON_POSTGRES_DSN")
     if not dsn:
         pytest.skip("requires disposable PostgreSQL")
-    connection = await asyncpg.connect(dsn)
+    connection = await asyncpg.connect(make_url(dsn).set(drivername="postgresql").render_as_string(hide_password=False))
     schema = "pharmacy_econ_snapshot_" + uuid4().hex
     stage = SimpleNamespace(
         __tablename__=_STAGE,
@@ -121,7 +121,7 @@ async def test_normal_publish_binds_exact_oid_and_rollback_is_atomic(monkeypatch
         authority = await generation.read_reference_family_result_generation_authority(
             economics.db, importer_id="pharmacy-economics", schema_name=schema
         )
-        assert authority.local_generation == 1 and authority.relation_oids == (stage_oid,)
+        assert authority.local_generation == 1 and authority.relations == ((schema, _LIVE),)
         assert await _oid(connection, schema, _LIVE) == stage_oid
         assert await _oid(connection, schema, _LIVE + "_old") == old_oid
         assert await connection.fetchval(f'SELECT marker FROM "{schema}"."{_LIVE}"') == "new"
@@ -143,7 +143,7 @@ async def test_normal_publish_binds_exact_oid_and_rollback_is_atomic(monkeypatch
         authority = await generation.read_reference_family_result_generation_authority(
             economics.db, importer_id="pharmacy-economics", schema_name=schema
         )
-        assert authority.local_generation == 0 and authority.relation_oids is None
+        assert authority.local_generation == 0 and authority.relations is None
 
 
 @pytest.mark.asyncio

@@ -208,7 +208,7 @@ async def test_vsp_retry_reopens_verified_detached_inputs_without_reset(
     header_by_field["publication_metadata_json"] = directory._endpoint_dataset_candidate_metadata(candidate)
     if rearmed:
         header_by_field["publication_metadata_json"]["error"] = rearmed
-    connection = SimpleNamespace(first=AsyncMock(return_value=header_by_field))
+    connection = SimpleNamespace(first=AsyncMock(return_value=header_by_field), scalar=AsyncMock(return_value=True))
     monkeypatch.setattr(source_policy, "source_transaction", lambda _db: nullcontext())
     monkeypatch.setattr(source_adapters, "require_source_transaction", Mock())
     monkeypatch.setattr(source_adapters, "require_generic_source_layout", AsyncMock())

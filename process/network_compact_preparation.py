@@ -8,7 +8,7 @@ from uuid import UUID
 from process.network_address_projection import _identifier
 from process.network_compact_custom_preparation import prepare_compact_custom_contribution
 from process.network_compact_dependencies import capture_compact_edge_artifacts, compact_slice_ref_digest
-from process.network_compact_readiness import COMPONENT, compact_index_digest
+from process.network_compact_readiness import COMPONENT, _require, compact_index_digest, has_named_compact_index_proof
 from process.network_membership_candidate_lifecycle import _locked_candidate
 from process.network_membership_slices import PinnedMembershipSlices, _prepare_slices
 from process.network_membership_validation import _scope_report, _validated_candidate
@@ -22,7 +22,7 @@ async def _previous_slices(connection, candidate, control_schema):
             connection, generation_id=candidate["expected_head"], control_schema=control_schema
         )
         if head.compact_layout is not None:
-            return PinnedMembershipSlices(head.candidate_id, head.schema_name, head.compact_layout.ref_map.table_oid)
+            return PinnedMembershipSlices(head.candidate_id, head.schema_name)
     return None
 
 
@@ -36,8 +36,8 @@ def _slice_readiness(scope, report, slices):
             field: report[field]
             for field in ("membership_rows", "distinct_memberships", "projected_locations", "orphan_bindings")
         },
-        "ref_map_oid": slices.ref_map_oid,
-        "edge_heap_oid": slices.edge_heap_oid,
+        "ref_map": asdict(slices.ref_map),
+        "edge_heap": asdict(slices.edge_heap),
         "slices": asdict(slices),
     }
 
@@ -83,12 +83,9 @@ async def _prepare_address_search(connection, copy_target, offices, slices, cont
 
     edge_artifacts = await capture_compact_edge_artifacts(connection, copy_target, control_schema=control_schema)
     layout = CompactNetworkLayout(
-        CompactAddressRelation(copy_target.schema_name, "network_slice_ref", slices.ref_map_oid),
+        CompactAddressRelation(copy_target.schema_name, "network_slice_ref"),
         offices.physical_base,
-        tuple(
-            CompactEdgeArtifact(entry["candidate_id"], entry["schema_name"], entry["table_oid"])
-            for entry in edge_artifacts
-        ),
+        tuple(CompactEdgeArtifact(entry["candidate_id"], entry["schema_name"]) for entry in edge_artifacts),
         offices.custom,
     )
     geo_search = await prepare_network_geo_search(connection, copy_target, layout)
@@ -128,6 +125,7 @@ async def prepare_compact_network_readiness(
         "ready": True,
         "scope": scope,
         "index_profile": "compact_membership",
+        "index_definition_revision": 2,
         "index_definition_sha256": await compact_index_digest(connection, copy_target.schema_name, candidate=candidate),
         "address_artifact": artifact,
         "edge_artifacts": edge_artifacts,
@@ -148,3 +146,37 @@ async def prepare_compact_network_readiness(
         ),
     )
     return serving_readiness_by_field
+
+
+async def rebuild_legacy_compact_readiness(connection, copy_target, candidate, *, control_schema, **source_options):
+    """Rebuild the named index proof only after complete native validation in the locked ready phase."""
+    from process.network_compact_dependencies import capture_compact_dependencies
+    from process.network_compact_validation import verify_compact_final_proof
+    from process.network_membership_serving_indexes import verify_network_search_indexes
+    from process.network_membership_validation import _json_object
+
+    report = _json_object(candidate["validation_json"])
+    serving = report["serving_readiness"]
+    if has_named_compact_index_proof(serving):
+        return
+    _require(candidate["state"] == "ready" and "legacy_serving_readiness" not in report)
+    rebuilt_by_field = {
+        **serving,
+        "index_definition_revision": 2,
+        "index_definition_sha256": await compact_index_digest(connection, copy_target.schema_name, candidate=candidate),
+    }
+    prospective_by_field = {**candidate, "validation_json": {**report, "serving_readiness": rebuilt_by_field}}
+    await verify_compact_final_proof(
+        connection, copy_target, prospective_by_field, control_schema=control_schema, **source_options
+    )
+    layout = await capture_compact_dependencies(connection, prospective_by_field, control_schema=control_schema)
+    await verify_network_search_indexes(connection, prospective_by_field, compact_layout=layout)
+    status = await connection.execute(
+        f"UPDATE {_identifier(control_schema)}.network_membership_candidate "
+        "SET validation_json=$2::jsonb WHERE candidate_id=$1 AND state='ready'",
+        UUID(copy_target.candidate_id),
+        json.dumps(
+            {**report, "legacy_serving_readiness": serving, "serving_readiness": rebuilt_by_field}, sort_keys=True
+        ),
+    )
+    _require(status == "UPDATE 1")

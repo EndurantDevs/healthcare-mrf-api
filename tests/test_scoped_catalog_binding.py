@@ -252,26 +252,22 @@ async def test_source_pin_uses_read_only_native_names_without_owner_metadata(mon
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "owner", "custody"])
-async def test_read_only_binding_authenticates_storage_without_granting_publication(monkeypatch, failure):
-    from process.ptg_parts import ptg2_physical_binding as custody
-
+@pytest.mark.parametrize("failure", [None, "missing", "catalog", "permission"])
+async def test_read_only_binding_validates_names_and_native_shape_without_granting_writes(monkeypatch, failure):
     session = _session()
-    session.scalar.return_value = None if failure == "owner" else 90
-    monkeypatch.setattr(native, "_schema_oid", AsyncMock(return_value=7))
-    publisher = AsyncMock()
-    monkeypatch.setattr(native, "protected_publisher_owner", publisher)
-    closed = AsyncMock(side_effect=RuntimeError("custody differs") if failure == "custody" else None)
-    monkeypatch.setattr(custody, "_require_closed_local_custody", closed)
-    pairs = (("code_catalog", 10), (codes.TABLE, 11))
+    address = AsyncMock(return_value=None if failure == "missing" else 10)
+    monkeypatch.setattr(native, "_relation_oid", address)
+    error = PermissionError("native read denied") if failure == "permission" else RuntimeError("catalog differs")
+    read = AsyncMock(side_effect=error if failure in {"catalog", "permission"} else None)
+    monkeypatch.setattr(native, "require_native_read_catalog", read)
+    pairs = (("code_catalog", 900), (codes.TABLE, 901))
     if failure:
-        with pytest.raises(RuntimeError, match="owner|custody"):
+        with pytest.raises((RuntimeError, PermissionError)):
             await binding.require_closed_catalog_read_binding(session, "serving", pairs)
     else:
-        assert await binding.require_closed_catalog_read_binding(session, "serving", pairs) == 90
-        assert closed.await_args.args[1].relation_oids == pairs
-        assert closed.await_args.args[1].schema_oid == 7
-    publisher.assert_not_awaited()
+        assert await binding.require_closed_catalog_read_binding(session, "serving", pairs) is None
+        assert [call.args[2] for call in address.await_args_list] == ["code_catalog", codes.TABLE]
+        read.assert_awaited_once_with(session, (10, 10))
     session.execute.assert_not_awaited()
 
 
@@ -470,23 +466,26 @@ async def test_effect_rebinding_requires_current_native_source_authority(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("table", [0, 1])
-@pytest.mark.parametrize("fault", [None, "changed", "schema"])
-async def test_effect_destination_resolves_native_names_without_saved_ids(monkeypatch, table, fault):
-    family = AsyncMock(return_value=(("code_catalog", 20), ("code_crosswalk", 21)))
-    if fault == "schema":
-        family.side_effect = RuntimeError("shared catalog model columns differ")
-    monkeypatch.setattr(storage, "require_tables", family)
+@pytest.mark.parametrize("mismatch", (False, True, None))
+@pytest.mark.parametrize("table", (0, 1))
+async def test_effect_destination_requires_exact_declared_names(monkeypatch, mismatch, table):
+    proof = AsyncMock()
+    monkeypatch.setattr(binding, "require_current_catalog_rebinding", proof)
+    monkeypatch.setattr(dictionary, "_effect_edition", AsyncMock(return_value="named"))
     session = _session()
-    mirror = dictionary._DRUG_SCOPED_MODELS[table]
-    oid = 999 if fault == "changed" else 20 + table
-    if fault:
-        with pytest.raises(RuntimeError, match="destination changed|columns differ"):
-            await dictionary._require_effect_destination(session, mirror, '"candidate"."effects"', "serving", oid)
+    session.scalar.return_value = mismatch
+    mirror, effect = dictionary._DRUG_SCOPED_MODELS[table], dictionary._DRUG_EFFECT_MODELS[table]
+    if mismatch is False:
+        await dictionary._require_effect_destination(session, mirror, effect, "candidate", "serving")
     else:
-        await dictionary._require_effect_destination(session, mirror, '"candidate"."effects"', "serving", oid)
-    family.assert_awaited_once_with(session, "serving", (CodeCatalog, CodeCrosswalk), lock="SHARE")
-    session.scalar.assert_not_awaited()
+        with pytest.raises(native.ReferenceFamilyArchiveError, match="destination changed"):
+            await dictionary._require_effect_destination(session, mirror, effect, "candidate", "serving")
+    proof.assert_not_awaited()
+    assert "destination_schema IS DISTINCT FROM :destination_schema" in str(session.scalar.await_args.args[0])
+    assert session.scalar.await_args.args[1] == {
+        "destination_schema": "serving",
+        "destination_name": mirror.__source_table__,
+    }
     session.execute.assert_not_awaited()
 
 
@@ -542,23 +541,20 @@ async def test_effect_current_binding_never_replaces_exact_image_checks(monkeypa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("closed", [True, False, None])
-async def test_current_binding_requires_real_closed_native_custody(monkeypatch, closed):
-    monkeypatch.setattr(native, "protected_publisher_owner", AsyncMock(return_value=90))
-    monkeypatch.setattr(native, "_schema_oid", AsyncMock(return_value=80))
+@pytest.mark.parametrize("readable", [True, False])
+async def test_current_binding_uses_configured_owner_name_and_native_read_boundary(monkeypatch, readable):
+    monkeypatch.setattr(native, "model_family_roles", lambda: ("frozen_owner", ("publisher", "reader")))
+    reader = AsyncMock(side_effect=None if readable else PermissionError("native SELECT denied"))
+    monkeypatch.setattr(binding, "require_closed_catalog_read_binding", reader)
     session = _session()
-    session.execute.return_value = SimpleNamespace(
-        mappings=lambda: SimpleNamespace(one=lambda: {"object_count": 2, "closed": closed})
-    )
     pairs = (("code_catalog", 20), ("code_sets_result_generation", 21))
-    if closed is True:
-        assert await binding.require_closed_catalog_binding(session, "serving", pairs) == 90
+    if readable:
+        assert await binding.require_closed_catalog_binding(session, "serving", pairs) == "frozen_owner"
     else:
-        with pytest.raises(RuntimeError, match="custody is not closed"):
+        with pytest.raises(PermissionError, match="native SELECT"):
             await binding.require_closed_catalog_binding(session, "serving", pairs)
-    query, parameters = session.execute.await_args.args
-    assert parameters["heaps"] == [20, 21] and parameters["schema_oid"] == 80
-    assert "a.privilege_type<>'SELECT'" in str(query) and "pg_trigger" in str(query)
+    reader.assert_awaited_once_with(session, "serving", pairs)
+    session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

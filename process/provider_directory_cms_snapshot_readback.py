@@ -6,16 +6,14 @@ Self-captured metadata cannot supply that provenance. Content, complete writer
 custody, deadlines and the outer transaction remain the caller's responsibility.
 """
 
-import re
 from contextlib import asynccontextmanager
 from copy import deepcopy
 
 from db.plan_release_storage import storage_identifier, storage_relation
-from process import provider_directory_cms_attachment_objects as attachment_objects
+from process import provider_directory_cms_canonical_layout as layout
 from process import provider_directory_cms_prepared_workspace as workspace
 from process import provider_directory_cms_snapshot_attach as attach
 from process import provider_directory_cms_snapshot_custody as custody
-from process.plan_release_storage_catalog import CATALOG_SQL
 
 
 def _require(condition, code):
@@ -23,64 +21,26 @@ def _require(condition, code):
         raise ValueError("cms_snapshot_readback_" + code)
 
 
-async def _reader_actor(connection, request, retained):
-    return await attach.seal._reader_admin(
-        connection,
-        request["source_binding"],
-        request["prepared_inputs"],
-        retained,
-        request["owner_role"],
-        request["migration_role"],
-    )
-
-
 def _expected(request, retained, expected_attachment):
-    """Bind a complete two-table postimage to the original private identities and owner."""
+    """Bind the complete attachment to the configured qualified parent and child names."""
     expected = workspace._copy(expected_attachment)
     roots = set(attach.ROOTS)
+    source = request["source_binding"]
     _require(
         type(expected) is dict
         and set(expected) == {"contract", "parents", "tables"}
         and expected["contract"] == attach.CONTRACT
-        and type(expected["parents"]) is dict
-        and set(expected["parents"]) == roots
-        and type(expected["tables"]) is dict
-        and set(expected["tables"]) == roots,
+        and expected["parents"] == {root: {"schema": source.catalog_schema, "name": root} for root in roots}
+        and expected["tables"] == {root: retained["tables"][root] for root in roots},
         "attachment_required",
     )
-    parents = expected["parents"]
-    _require(
-        all(type(oid) is int and 0 < oid < 2**32 for oid in parents.values()) and len(set(parents.values())) == 2,
-        "parents_changed",
-    )
-    for root, proof in expected["tables"].items():
-        original = retained["tables"][root]
-        _require(
-            type(proof) is dict
-            and set(proof) == {"name", "oid", "owner", "layout_sha256"}
-            and proof["name"] == original["name"]
-            and type(proof["oid"]) is int
-            and proof["oid"] == original["oid"]
-            and type(proof["owner"]) is int
-            and proof["owner"] == request["owner_oid"]
-            and type(proof["layout_sha256"]) is str
-            and re.fullmatch(r"[0-9a-f]{64}", proof["layout_sha256"]),
-            "tables_changed",
-        )
-    _require(not set(parents.values()) & {proof["oid"] for proof in expected["tables"].values()}, "parents_changed")
     return expected
 
 
 async def _observe(connection, request, retained, expected):
-    """Compare native parent/layout/bound semantics and complete attached postimage proofs."""
     source = request["source_binding"]
-    principals = await custody._principals(
-        connection, source, retained, request["owner_role"], request["owner_oid"], request["migration_role"]
-    )
-    await attach._compatible(connection, source, retained, expected["parents"], request["owner_oid"])
-    tables, _indexes_by_oid = await attach._capture_attached(
-        connection, source, retained, expected["parents"], request["owner_oid"], principals["publisher_oid"]
-    )
+    await attach._compatible(connection, source, retained, expected["parents"], request["owner_role"])
+    tables = await attach._capture_attached(connection, source, retained, expected["parents"])
     _require(tables == expected["tables"], "postimage_changed")
 
 
@@ -96,7 +56,6 @@ async def read_attached_cms_payload_snapshots(connection, request_by_name, *, ex
     _require(await connection.fetchval("SHOW search_path") in {"pg_catalog", "pg_catalog, pg_temp"}, "search_path")
     request, retained = attach._request(request_by_name)
     expected = _expected(request, retained, expected_attachment)
-    actor = await _reader_actor(connection, request, retained)
     source_binding = request["source_binding"]
     relations = sorted(
         [storage_relation(source_binding.catalog_schema, root) for root in attach.ROOTS]
@@ -109,7 +68,6 @@ async def read_attached_cms_payload_snapshots(connection, request_by_name, *, ex
         )
         await _observe(connection, request, retained, expected)
         await _observe(connection, request, retained, expected)
-        _require(await _reader_actor(connection, request, retained) == actor, "transaction_changed")
         current, current_retained = attach._request(request_by_name)
         _require(
             current == request and current_retained == retained and expected_attachment == expected,
@@ -120,71 +78,52 @@ async def read_attached_cms_payload_snapshots(connection, request_by_name, *, ex
 
 
 def _sealed_expected(request, retained, expected_seal):
-    """Keep the six-table seal separate from the immutable preparation preimage."""
+    """Keep the complete six-table named payload group separate from its preparation."""
     expected = workspace._copy(expected_seal)
-    source = request["source_binding"]
     _require(
-        type(expected) is dict
-        and set(expected) == {"contract", "owner_oid", "schema_oid", "namespace_owner_oid", "tables"}
-        and expected["contract"] == custody.CONTRACT
-        and expected["owner_oid"] == request["owner_oid"]
-        and expected["schema_oid"] == source.storage_schema_oid
-        and expected["namespace_owner_oid"] == source.namespace_owner_oid
-        and type(expected["tables"]) is dict
-        and set(expected["tables"]) == set(workspace.storage.RELATIONS),
+        expected
+        == {
+            "contract": custody.CONTRACT,
+            "tables": {root: retained["tables"][root] for root in workspace.storage.RELATIONS},
+        },
         "seal_required",
     )
-    for root, proof in expected["tables"].items():
-        _require(proof == {**retained["tables"][root], "owner": request["owner_oid"]}, "seal_changed")
     return expected
 
 
-async def _closed_payloads(connection, request, retained, sealed, principals):
-    """The four copied inputs remain closed, unattached heaps at their original OIDs."""
-    roots = workspace.storage.RELATIONS[:4]
-    names = [retained["tables"][root]["name"] for root in roots]
-    rows = await connection.fetch(
-        CATALOG_SQL,
-        [storage_relation(request["source_binding"].storage_schema, name) for name in names],
-        request["owner_oid"],
-        [principals["publisher_oid"]],
-    )
-    _require(len(rows) == len(names) and {row["relname"] for row in rows} == set(names), "inventory_changed")
-    proofs_by_name = {}
-    for row in rows:
-        _require(
-            row["nspname"] == request["source_binding"].storage_schema
-            and row["relowner"] == request["owner_oid"]
-            and row["readers_closed"] is True,
-            "postimage_changed",
-        )
-        proofs_by_name[row["relname"]] = workspace.storage._table_proof(row, private=True)
+async def _closed_payloads(connection, request, retained, sealed):
+    names = [retained["tables"][root]["name"] for root in workspace.storage.RELATIONS[:4]]
+    observed = await workspace.storage._capture(connection, workspace._policy(retained["prepared_policy"]), names)
     _require(
-        all(proofs_by_name[retained["tables"][root]["name"]] == sealed["tables"][root] for root in roots),
+        all(
+            observed[retained["tables"][root]["name"]] == sealed["tables"][root]
+            for root in workspace.storage.RELATIONS[:4]
+        ),
         "postimage_changed",
     )
+    for root in workspace.storage.RELATIONS[:4]:
+        receipt = retained["tables"][root]
+        relation = storage_relation(receipt["schema"], receipt["name"])
+        oid = await connection.fetchval("SELECT to_regclass($1)::oid", relation)
+        columns = await connection.fetch(layout._COLUMNS_SQL, [oid], sorted(layout._TYPES))
+        layout._require_columns(columns, layout._LAYOUTS[root]["columns"], root, storage_identifier(receipt["schema"]))
 
 
-async def _payload_writers(connection, request, retained, principals):
-    """Preserve the existing six-leaf closure check; parent/all-writer custody is external."""
-    oids = sorted(retained["tables"][root]["oid"] for root in workspace.storage.RELATIONS)
+async def _payload_writers(connection, request, retained):
+    """Payloads remain leaves; writes are prevented by the administrator's native grants."""
+    names = [
+        storage_relation(receipt["schema"], receipt["name"])
+        for root, receipt in retained["tables"].items()
+        if root in workspace.storage.RELATIONS
+    ]
     _require(
         await connection.fetchval(
-            "SELECT NOT EXISTS(SELECT FROM pg_catalog.pg_inherits WHERE inhparent=ANY($1::oid[]))", oids
+            "SELECT NOT EXISTS(SELECT FROM pg_catalog.pg_inherits "
+            "WHERE inhparent=ANY(ARRAY(SELECT to_regclass(name) FROM unnest($1::text[]) name)))",
+            names,
         )
         is True,
         "unexpected_descendant",
-    )
-    _require(
-        await connection.fetchval(
-            custody._WRITERS_SQL,
-            oids,
-            request["owner_oid"],
-            principals["namespace_owner_oid"],
-            principals["migration_oid"],
-        )
-        is True,
-        "writer_reachable",
     )
 
 
@@ -200,15 +139,6 @@ async def verify_sealed_cms_workspace(current, *, request, expected_seal, expect
     )
     sealed = _sealed_expected(request, retained, expected_seal)
     attached = _expected(request, retained, expected_attachment) if expected_attachment is not None else None
-    await _reader_actor(current.connection, request, retained)
-    principals = await custody._principals(
-        current.connection,
-        current.source_binding,
-        retained,
-        request["owner_role"],
-        request["owner_oid"],
-        request["migration_role"],
-    )
     identities_by_root = {
         root: receipt for root, receipt in current.receipts.items() if root not in workspace.storage.RELATIONS
     }
@@ -222,15 +152,14 @@ async def verify_sealed_cms_workspace(current, *, request, expected_seal, expect
             current.source_binding,
             retained,
             request["owner_role"],
-            request["owner_oid"],
             request["migration_role"],
         )
         _require(actual == sealed, "postimage_changed")
     else:
-        await _closed_payloads(current.connection, request, retained, sealed, principals)
+        await _closed_payloads(current.connection, request, retained, sealed)
         actual = await read_attached_cms_payload_snapshots(current.connection, request, expected_attachment=attached)
         _require(actual == attached, "postimage_changed")
-    await _payload_writers(current.connection, request, retained, principals)
+    await _payload_writers(current.connection, request, retained)
 
 
 async def _sealed_read_workspace(database, session, connection, request, expected_seal, expected_attachment):
@@ -246,7 +175,7 @@ async def _sealed_read_workspace(database, session, connection, request, expecte
     )
     storage_binding = request["source_binding"]
     fields = ("source_storage", "source_policy", "prepared_policy", "frozen_inventory")
-    expected, _source_policy, policy = admin._inputs(
+    expected, _source_policy, _policy = admin._inputs(
         storage_binding, {key: request["prepared_inputs"][key] for key in fields}
     )
     task, transaction = workspace.asyncio.current_task(), session.get_transaction()
@@ -257,7 +186,6 @@ async def _sealed_read_workspace(database, session, connection, request, expecte
     )
     _require(original_retained == retained, "workspace_changed")
     _require(original["native_coordinates"] == request["prepared_inputs"]["native_coordinates"], "inputs_changed")
-    await admin._pin_relations(connection, policy, expected, receipts)
     current = workspace.CMSPreparedWorkspace(
         database, session, connection, storage_binding, original, binding, receipts
     )
@@ -393,63 +321,3 @@ async def read_sealed_cms_candidate(
         )
         report_by_section = {"workspace": current.binding, "private": private, "canonical": canonical}
     return deepcopy(report_by_section)
-
-
-def retained_cms_payload_postimages(request, evidence, *, allocation):
-    """Extract linked payload postimages from already authenticated terminal data.
-
-    This performs no SQL and authenticates no receipt, profile or allocation.
-    The original-Admin recovery caller must load/verify those protected records,
-    acquire qualified read custody, and separately recheck retained history.
-    Never replace a missing field by capturing current catalog observations.
-    """
-    from process import provider_directory_cms_history_record as history_records
-
-    request, retained = attach._request(request)
-    evidence, allocation = workspace._copy(evidence), workspace._copy(allocation)
-    _require(
-        type(evidence) is dict
-        and set(evidence) == {"contract", "workspace", "private", "canonical"}
-        and evidence.get("contract") == "cms-npd-finalization-evidence-v1"
-        and evidence.get("workspace") == retained
-        and type(evidence.get("canonical")) is dict
-        and type(evidence["canonical"].get("payloads")) is dict,
-        "terminal_evidence_required",
-    )
-    postimages = evidence["canonical"]["payloads"].get("snapshot_postimages")
-    _require(
-        type(postimages) is dict and set(postimages) == {"sealed", "attached", "attachment_objects", "history_storage"},
-        "terminal_postimages_required",
-    )
-    _require(
-        type(allocation) is dict and allocation.get("contract") == history_records.ALLOCATION_CONTRACT,
-        "history_allocation_required",
-    )
-    binding = request["source_binding"]
-    plan = history_records.require_cms_history_record(
-        allocation["history"],
-        storage={
-            key: getattr(binding, key)
-            for key in ("database_oid", "catalog_schema", "catalog_schema_oid", "namespace_owner_oid")
-        },
-        parents=allocation["parents"],
-    )
-    sealed = _sealed_expected(request, retained, postimages["sealed"])
-    attached = _expected(request, retained, postimages["attached"])
-    _require(
-        attached["parents"] == {root: entry["oid"] for root, entry in allocation["parents"].items()},
-        "terminal_parents_changed",
-    )
-    history_oids = {
-        str(entry[kind]["oid"]) for entry in plan["request"]["heaps"].values() for kind in ("old", "parent")
-    }
-    _require(
-        type(postimages["history_storage"]) is dict and set(postimages["history_storage"]) == history_oids,
-        "terminal_history_storage_changed",
-    )
-    attachment_objects._retained_oids(attached["tables"], postimages["attachment_objects"])
-    return {
-        "sealed": sealed,
-        "attached": attached,
-        "attachment_objects": workspace._copy(postimages["attachment_objects"]),
-    }

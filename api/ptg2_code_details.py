@@ -8,7 +8,7 @@ from typing import Any
 
 from sqlalchemy import text
 
-from api.network_read_execution import direct_heap_relation_sql, execute_network_read, has_network_read_inventory
+from api.network_read_execution import qualified_relation_sql
 from api.ptg2_response import (
     _catalog_detail,
     _catalog_key,
@@ -111,10 +111,9 @@ async def _enrich_ptg2_code_details(
         query_params_by_name[f"code_system_{idx}"] = code_system
         query_params_by_name[f"code_{idx}"] = code
     relation = f"{PTG2_SCHEMA}.code_catalog"
-    if has_network_read_inventory(session):
-        relation = direct_heap_relation_sql(session, PTG2_SCHEMA, "code_catalog")
-    query_result = await execute_network_read(
-        session,
+    if getattr(session, "info", {}).get("api_reader_verified") is True:
+        relation = qualified_relation_sql(PTG2_SCHEMA, "code_catalog")
+    query_result = await session.execute(
         text(
             f"""
             SELECT code_system, code, display_name, short_description

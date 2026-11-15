@@ -127,26 +127,33 @@ def test_profile_reader_grants_cover_receipt_function_dependencies(monkeypatch):
 
 
 class ReaderSession(_FakeSession):
-    """Supply the genuine-login query result without a PostgreSQL connection."""
+    """Model configured transaction modes without a PostgreSQL connection."""
 
-    def __init__(self, identity=("reader_test", "reader_test")):
+    def __init__(self):
         super().__init__()
-        self.identity = identity
         self.info = {}
         self.modes = ("repeatable read", "on")
+        self.transaction_starts = []
 
     async def execute(self, statement, params=None):
         self._in_tx = True
+        if str(statement) == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY":
+            self.transaction_starts.append(str(statement))
+            return _FakeResult(1)
+        if str(statement) == "SELECT 1":
+            # The verified Reader's transaction-start probe is not application work.
+            return _FakeResult(1)
         if (
             str(statement)
             == "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')"
         ):
             self.executed.append((statement, params))
             return _FakeResult(self.modes)
-        if str(statement).startswith("SELECT session_user, current_user"):
-            self.executed.append((statement, params))
-            return _FakeResult((*self.identity, 12345, 23456, "192.0.2.1", 5432, 34567))
         return await super().execute(statement, params)
+
+    async def connection(self):
+        self._in_tx = True
+        return self
 
     async def commit(self):
         await super().commit()
@@ -356,7 +363,7 @@ async def test_npi_count_caller_keeps_both_queries_on_reader_owner(monkeypatch):
     monkeypatch.setattr(npi, "db", database)
     async with database.reader_session():
         assert await npi._compute_npi_counts() == [42, 42]
-    assert len(session.executed) == 3
+    assert len(session.executed) == 2
 
 
 async def test_ptg_network_caller_opens_independent_genuine_reader(monkeypatch):
@@ -413,13 +420,29 @@ async def test_reader_failure_and_cancellation_close_without_writer(monkeypatch,
     assert not database.has_reader_session()
 
 
-async def test_wrong_login_refuses_before_payload_and_closes(monkeypatch):
-    session = ReaderSession(("reader_test", "writer_test"))
+async def test_reader_starts_configured_transaction_without_setup_queries(monkeypatch):
+    session = ReaderSession()
     database = reader_database(monkeypatch, [session])
-    with pytest.raises(RuntimeError, match="login identity"):
+    async with database.reader_session() as acquired:
+        assert acquired is session and session.in_transaction()
+        assert session.info == {"api_reader_verified": True}
+        assert not session.executed
+        assert session.transaction_starts == ["SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"]
+    assert session.closed and session.committed and not session.info
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("connection failed"), asyncio.CancelledError()])
+async def test_reader_connection_failure_closes_and_clears_binding(monkeypatch, failure):
+    session = ReaderSession()
+    # The transaction-start probe is the Reader's first database contact.
+    session.execute = AsyncMock(side_effect=failure)
+    database = reader_database(monkeypatch, [session])
+    with pytest.raises(type(failure)) as caught:
         async with database.reader_session():
-            pytest.fail("unverified Reader reached payload")
-    assert len(session.executed) == 1 and session.closed and session.rolled_back
+            pytest.fail("failed connection yielded a Reader")
+    assert caught.value is failure
+    assert not session.executed and session.closed and not session.info
+    assert not database.has_reader_session()
 
 
 async def test_explicit_background_writer_preserves_parent_reader(monkeypatch):
@@ -499,7 +522,7 @@ async def test_pricing_statistics_queries_stay_on_reader_owner(monkeypatch):
         request = SimpleNamespace(ctx=SimpleNamespace(sa_session=session))
         response = await pricing.pricing_statistics(request)
         assert response.status == 200
-        assert len(session.executed) == 5
+        assert len(session.executed) == 4
 
 
 def _optional_count_read(session, events, failure):
@@ -542,7 +565,9 @@ def _bind_optional_count_queries(monkeypatch, session, connection):
     execute = session.execute
 
     async def execute_query(statement, parameters=None):
-        if str(statement).startswith(("SELECT session_user, current_user", "SELECT current_setting(")):
+        if str(statement) in {"SELECT 1", "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"} or str(
+            statement
+        ).startswith(("SELECT session_user, current_user", "SELECT current_setting(")):
             return await execute(statement, parameters)
         query_rows = await connection.all(statement, **(parameters or {}))
         return SimpleNamespace(all=lambda: query_rows)
@@ -824,80 +849,41 @@ async def test_npi_count_metadata_statements_consume_one_phase_budget(monkeypatc
     assert npi._NPI_COUNT_READ_SCOPE.get() is None
 
 
-def _native_cache_timeout_fixture(session):
-    """Emulate native cancellation and restoration on the original request session."""
-    from sqlalchemy.exc import DBAPIError
-
-    state = SimpleNamespace(aborted=False, native_reads=0, rollbacks=0, depth=0, failed_restores=0)
-    settings = SimpleNamespace(timeout_text="7", timeout_milliseconds="7")
-    execute = session.execute
-
-    @asynccontextmanager
-    async def nested():
-        state.depth += 1
-        try:
-            yield session
-        except BaseException:
-            state.aborted = False
-            state.rollbacks += 1
-            raise
-        finally:
-            state.depth -= 1
-
-    async def execute_cache(statement, parameters=None):
-        sql = str(statement)
-        if state.aborted:
-            assert "set_config(" in sql
-            state.failed_restores += 1
-            error = RuntimeError("synthetic aborted transaction")
-            error.sqlstate = "25P02"
-            raise DBAPIError(None, None, error)
-        if "AS timeout_text" in sql:
-            return SimpleNamespace(one_or_none=lambda: settings)
-        if "set_config(" in sql:
-            setting, timeout_value, local = statement.compile().params.values()
-            assert setting == "statement_timeout" and local is True and 0 < int(timeout_value) <= 7
-            settings.timeout_text = settings.timeout_milliseconds = timeout_value
-            return None
-        if "npi_canonical_publication_receipt" in sql:
-            assert state.depth == 1
-            return SimpleNamespace(all=lambda: [])
-        if "npi_result_generation" in sql:
-            assert state.depth == 2
-            state.native_reads += 1
-            state.aborted = True
-            error = RuntimeError("synthetic native identity statement timeout")
-            error.sqlstate = "57014"
-            raise DBAPIError(None, None, error)
-        return await execute(statement, parameters)
-
-    return state, settings, nested, execute_cache
-
-
-async def test_npi_count_native_cache_timeout_recovers_original_request_session(monkeypatch):
-    """Recover both nested scopes after native identity timeout without replacing the Reader."""
+async def test_npi_count_native_cache_bypass_retains_original_request_session(monkeypatch):
+    """Unkeyed native counts stay uncached and reuse the original bounded Reader."""
     import json
 
-    from api import provider_list_sql
     from api.endpoint import npi
-    from process.custom_import.read_core import _local_statement_timeout
 
     cache_identity = npi._npi_count_cache_identity
-    database, session, _events = _optional_count_reader(monkeypatch, None, unfiltered=True)
+    database, session, events = _optional_count_reader(monkeypatch, None, unfiltered=True)
     monkeypatch.setattr(npi, "_npi_count_cache_identity", cache_identity)
-    monkeypatch.setattr(provider_list_sql, "_local_statement_timeout", _local_statement_timeout)
-    state, settings, nested, execute_cache = _native_cache_timeout_fixture(session)
+    statements = []
+    execute = session.execute
 
-    monkeypatch.setattr(session, "begin_nested", nested)
+    async def execute_without_cache_metadata(statement, parameters=None):
+        assert current_session() is session
+        statements.append(str(statement))
+        return await execute(statement, parameters)
+
     request = SimpleNamespace(args={"count_only": "1"}, ctx=SimpleNamespace(sa_session=session))
     async with database.reader_session():
-        monkeypatch.setattr(session, "execute", execute_cache)
-        response = await npi.get_all(request)
-        assert response.status == 503 and json.loads(response.body)["error"] == "count_timeout"
-        assert not state.aborted and not session.rolled_back
-        assert state.native_reads == 1 and state.rollbacks == 2 and state.failed_restores == 1
-        assert settings.timeout_text == "7"
-    assert session.count_reads == 0 and npi._NPI_COUNT_READ_SCOPE.get() is None
+        monkeypatch.setattr(session, "execute", execute_without_cache_metadata)
+        assert await npi._npi_canonical_publication_identity(session=session) is None
+        for _ in range(2):
+            events.clear()
+            response = await npi.get_all(request)
+            assert response.status == 200 and json.loads(response.body) == {"rows": 12}
+            assert current_session() is session and not session.rolled_back
+            assert events == ["savepoint"] and npi._NPI_COUNT_READ_SCOPE.get() is None
+            assert npi._NPI_PRIMARY_TOTAL_CACHE_STATE["entry"] is None
+    assert session.count_reads == 2
+    assert sum("count(" in statement.lower() for statement in statements) == 2
+    assert not any(
+        "npi_canonical_publication_receipt" in statement or "npi_result_generation" in statement
+        for statement in statements
+    )
+    database.scalar.assert_not_awaited()
 
 
 @pytest.mark.parametrize("count_format", ["all", "full_taxonomy", "classification"])
@@ -1041,26 +1027,35 @@ async def test_optional_count_expired_cumulative_budget_never_returns_total(monk
     assert session.execute.await_count == (3 if has_started else 0)
 
 
-async def test_reader_temporary_setup_precedes_identity_and_read_only_verification(monkeypatch):
+def _provider_reader_pin_statements(session):
+    """Check the real named pin precedes temporary work without freezing a SELECT snapshot."""
+    statements = [str(statement) for statement, _ in session.executed]
+    assert statements[:3] == [
+        "SET TRANSACTION READ WRITE",
+        "SET LOCAL lock_timeout = '250ms'",
+        "SET LOCAL statement_timeout = '5s'",
+    ]
+    assert statements[3].startswith("LOCK TABLE ") and statements[3].endswith(" IN ACCESS SHARE MODE")
+    assert '"mrf"."provider_directory_profile_serving_generation"' in statements[3]
+    return statements[4:]
+
+
+async def test_reader_temporary_setup_precedes_read_only_verification(monkeypatch):
     session = ReaderSession()
     database = reader_database(monkeypatch, [session])
 
     async def setup(fresh):
-        assert fresh is session and not session.info and not database.has_reader_session()
-        assert [str(statement) for statement, _ in session.executed] == ["SET TRANSACTION READ WRITE"]
+        assert fresh is session and not database.has_reader_session()
+        assert set(session.info) == {"provider_profile_relations"}
+        assert _provider_reader_pin_statements(session) == []
         await fresh.execute("CREATE TEMP TABLE prepared(value int) ON COMMIT DROP")
 
     async with database.reader_session(temporary_setup=setup) as acquired:
         assert acquired is session and session.info["api_reader_verified"]
         assert current_session() is session
-        assert [str(statement) for statement, _ in session.executed] == [
-            "SET TRANSACTION READ WRITE",
+        assert _provider_reader_pin_statements(session) == [
             "CREATE TEMP TABLE prepared(value int) ON COMMIT DROP",
             "SET TRANSACTION READ ONLY",
-            "SELECT session_user, current_user, "
-            "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname=current_user), "
-            "(SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database()), "
-            "host(inet_server_addr()), inet_server_port(), pg_backend_pid()",
             "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')",
         ]
     assert session.committed and session.closed and not session.info and not database.has_reader_session()
@@ -1075,7 +1070,7 @@ async def test_reader_temporary_setup_refuses_reuse_and_allows_explicit_independ
             async with database.reader_session(temporary_setup=setup):
                 pytest.fail("reused Reader accepted setup")
         setup.assert_not_awaited()
-        assert len(parent.executed) == 1
+        assert not parent.executed
         async with database.reader_session(independent=True, temporary_setup=setup) as acquired:
             assert acquired is child and current_session() is child
             setup.assert_awaited_once_with(child)
@@ -1091,7 +1086,7 @@ async def test_reader_temporary_setup_failure_rolls_back_before_verification(mon
         async with database.reader_session(temporary_setup=AsyncMock(side_effect=failure)):
             pytest.fail("failed setup yielded a Reader")
     assert caught.value is failure
-    assert [str(statement) for statement, _ in session.executed] == ["SET TRANSACTION READ WRITE"]
+    assert _provider_reader_pin_statements(session) == []
     assert session.rolled_back and session.closed and not session.committed and not session.info
     assert not database.has_reader_session()
 
@@ -1116,12 +1111,17 @@ async def test_prepared_reader_preserves_primary_error_when_rollback_and_close_f
     if stage == "commit":
         session.commit = AsyncMock(side_effect=failure)
     database = reader_database(monkeypatch, [session])
+
+    async def setup(actual):
+        assert actual is session
+        session.info["snapshot_claims_dictionary_tables"] = ("synthetic_dictionary",)
+        if stage == "setup":
+            raise failure
+
     with pytest.raises(RuntimeError, match="No SQLAlchemy session bound"):
         current_session()
     with pytest.raises(RuntimeError) as caught:
-        async with database.reader_session(
-            temporary_setup=AsyncMock(side_effect=failure if stage == "setup" else None)
-        ):
+        async with database.reader_session(temporary_setup=setup):
             assert stage == "commit"
     assert caught.value is failure and str(failure) == "original failure"
     assert not session.info and not database.has_reader_session()

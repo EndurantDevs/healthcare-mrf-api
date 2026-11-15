@@ -28,8 +28,6 @@ def _connection(state):
             state.events.append("rollback")
 
     async def fetchrow(sql, *_arguments):
-        if sql == seal.custody._ACTOR_SQL:
-            return deepcopy(state.actor)
         if sql.startswith("UPDATE "):
             state.events.append("bulk_published")
             if state.failure == "published":
@@ -56,11 +54,13 @@ def _connection(state):
 
 
 def _configure_semantics(state, monkeypatch):
-    async def is_original_admin(_statement):
+    async def origin(_connection, _source_binding, _policy):
         state.checks += 1
-        return state.failure != ("admin_entry" if state.checks == 1 else "admin_exit")
+        if state.failure == ("mode_entry" if state.checks == 1 else "mode_exit"):
+            raise ValueError("transaction_mode_changed")
+        return {"readonly": "off", "isolation": "read committed", "replication_role": "origin"}
 
-    monkeypatch.setattr(seal, "NativeReceiptSession", lambda _connection: SimpleNamespace(scalar=is_original_admin))
+    monkeypatch.setattr(seal.context, "_origin", origin)
     _configure_data(state, monkeypatch)
     _configure_coverage(state, monkeypatch)
 
@@ -122,12 +122,8 @@ def seal_case(monkeypatch):
     roots = candidate.storage.RELATIONS[:4]
     state.counts = dict.fromkeys(roots, 2)
     state.counts[candidate.storage.RESOURCE] = expected["resource_count"]
-    state.tables = {
-        root: dict(name="leaf_" + str(index), oid=100 + index, owner=41, layout_sha256="a" * 64)
-        for index, root in enumerate(roots)
-    }
+    state.tables = {root: dict(schema="catalog", name="leaf_" + str(index)) for index, root in enumerate(roots)}
     state.private = {"relationship_parity": {"dataset_id": expected["dataset_id"], "relationship_count": 3}}
-    state.actor = {"session": "original", "current": "original", "transaction": "1/1"}
     state.stamp = datetime(2026, 1, 2, 0, 0)
     state.handoff = SimpleNamespace(
         document={"identity": {}, "admission": {"resource_count": expected["resource_count"]}}, document_sha256="a" * 64
@@ -138,6 +134,8 @@ def seal_case(monkeypatch):
         connection=state.connection,
         catalog_schema="catalog",
         session=object(),
+        source_binding=object(),
+        policy=object(),
         identity={
             "dataset_id": expected["dataset_id"],
             "endpoint_id": expected["endpoint_id"],
@@ -172,7 +170,7 @@ async def test_complete_semantics_receipts_and_both_bulk_checks_precede_noncurre
     assert all("is_current=" not in str(call.args[0]) for call in state.connection.execute.await_args_list)
 
 
-@pytest.mark.parametrize("failure", ["private", "copy", "coverage", "published", "admin_exit"])
+@pytest.mark.parametrize("failure", ["private", "copy", "coverage", "published", "mode_exit"])
 async def test_late_failure_or_cancel_rolls_back_the_complete_preseal(seal_case, failure):
     state = seal_case
     state.failure = failure
@@ -182,10 +180,10 @@ async def test_late_failure_or_cancel_rolls_back_the_complete_preseal(seal_case,
     assert state.header == before and state.events[-1] == "rollback"
 
 
-async def test_ordinary_or_assumed_actor_refuses_before_any_prework_or_write(seal_case):
+async def test_invalid_transaction_mode_refuses_before_any_prework_or_write(seal_case):
     state = seal_case
-    state.failure = "admin_entry"
-    with pytest.raises(ValueError, match="original_admin_required"):
+    state.failure = "mode_entry"
+    with pytest.raises(ValueError, match="transaction_mode_changed"):
         await seal.seal_allocated_cms_generic_candidate(state.workspace, state.handoff, allocation={})
     assert state.events == []
     state.connection.execute.assert_not_awaited()
@@ -242,8 +240,30 @@ async def test_native_four_drift_refuses(seal_case, fault):
         case "handoff":
             native["source_handoff_sha256"] = "f" * 64
         case "table":
-            next(iter(native["tables"].values()))["layout_sha256"] = "f" * 64
+            next(iter(native["tables"].values()))["name"] = "another_leaf"
     with pytest.raises(ValueError, match="native_publication"):
         await candidate._native_component(
             state.workspace, state.handoff, header_by_field, {"row_counts": state.counts}, native
         )
+
+
+@pytest.mark.parametrize("fault", [None, "table", "count", "handoff"])
+async def test_current_named_source_publication_keeps_scope_and_complete_counts(seal_case, fault):
+    state = seal_case
+    native = native_data(state)
+    native["contract"] = "generic-source-named-publication-v1"
+    native.pop("frozen_sha256")
+    native.pop("validation_sha256")
+    state.handoff.document["tables"] = deepcopy(state.tables)
+    if fault == "table":
+        next(iter(native["tables"].values()))["name"] = "another_snapshot"
+    elif fault == "count":
+        native["counts"][candidate.storage.RESOURCE] += 1
+    elif fault == "handoff":
+        native["source_handoff_sha256"] = "b" * 64
+    arguments = (state.workspace, state.handoff, {"published_at": state.stamp}, {"row_counts": state.counts}, native)
+    if fault:
+        with pytest.raises(ValueError, match="native_publication_changed"):
+            await candidate._native_component(*arguments)
+    else:
+        assert await candidate._native_component(*arguments) == native

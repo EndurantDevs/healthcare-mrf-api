@@ -4,10 +4,8 @@
 import asyncio
 import json
 from copy import deepcopy
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
-from weakref import ref
 
 import pytest
 
@@ -45,50 +43,38 @@ async def test_unstable_or_unknown_reader_refuses_before_locks(readonly, isolati
 
 
 @pytest.mark.asyncio
-async def test_unissued_input_cannot_open_source_scope_or_target():
+async def test_unissued_input_cannot_open_source_scope_or_copy():
     with pytest.raises(ValueError, match="pin_invalid"):
         async with pins.pinned_prepared_registry_address(object(), object()):
             pytest.fail("unissued source reached a context")
     input_pin = pins.PinnedRegistryCMSAddressInput(object(), object(), object(), (), (), "", "{}", "{}")
-    target = SimpleNamespace(fetchval=AsyncMock())
     with pytest.raises(ValueError, match="pin_invalid"):
-        await input_pin.require_target(target, "retained_owner")
-    target.fetchval.assert_not_awaited()
+        input_pin.require_active()
 
 
-def _issued(monkeypatch):
+def _issued(monkeypatch, *, source_layouts=()):
     source = SimpleNamespace(require_active=Mock(), verify_transaction=AsyncMock())
     admission = SimpleNamespace(_assert_lease=Mock())
-    stage = ("entity_address_unified", "stage", 11)
+    stage = ("entity_address_unified", "stage")
     prepared = SimpleNamespace(
-        address=SimpleNamespace(committed=False, stage_oids=(stage,)), nonprofile_admission=admission
+        address=SimpleNamespace(committed=False, stage_relations=(stage,)), nonprofile_admission=admission
     )
-    pin = pins.PinnedRegistryCMSAddressInput(prepared, source, object(), (stage,), (), "{}", "{}", "{}")
-    state_by_field = dict(
-        task=ref(asyncio.current_task()),
-        prepared=lambda: prepared,
-        source_input=source,
-        admission=lambda: admission,
-        active=True,
-        complete=False,
-        target=None,
-        relations={},
-    )
+    pin = pins.PinnedRegistryCMSAddressInput(prepared, source, object(), (stage,), source_layouts, "{}", "{}", "{}")
+    state_by_field = dict(active=True, complete=False, relations={})
     monkeypatch.setitem(pins._INPUTS, pin, state_by_field)
     return pin, state_by_field
 
 
 @pytest.mark.asyncio
-async def test_expired_cross_task_and_changed_prepared_source_refuse(monkeypatch):
+async def test_lease_lifetime_and_changed_named_selection_refuse(monkeypatch):
     pin, state_by_field = _issued(monkeypatch)
     pin.require_active()
 
     async def other_task():
-        with pytest.raises(ValueError, match="pin_invalid"):
-            pin.require_active()
+        pin.require_active()
 
     await asyncio.create_task(other_task())
-    pin.prepared.address.stage_oids = (("entity_address_unified", "replacement", 12),)
+    pin.prepared.address.stage_relations = (("entity_address_unified", "replacement"),)
     with pytest.raises(ValueError, match="pin_invalid"):
         pin.require_active()
     state_by_field["active"] = False
@@ -97,15 +83,22 @@ async def test_expired_cross_task_and_changed_prepared_source_refuse(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_equal_constructed_annotation_cannot_replace_registered_proof(monkeypatch):
+async def test_equal_logical_annotations_preserve_registered_phase(monkeypatch):
     pin, state_by_field = _issued(monkeypatch)
-    annotation = RetainedNativeRelation(
-        "retained", "entity_address_unified", 21, "{}", object(), phase="loading", source_input=pin
+    annotation = SimpleNamespace(
+        schema="retained",
+        relation="entity_address_unified",
+        policy_json="{}",
+        source_layout="logical layout",
+        phase="loading",
+        source_input=pin,
     )
-    state_by_field["relations"][(annotation.schema, annotation.relation)] = ref(annotation)
+    state_by_field["relations"][(annotation.schema, annotation.relation)] = annotation
     pin.require_annotation(annotation)
+    pin.require_annotation(SimpleNamespace(**vars(annotation)))
+    changed = SimpleNamespace(**{**vars(annotation), "source_layout": "changed layout"})
     with pytest.raises(ValueError, match="pin_invalid"):
-        pin.require_annotation(replace(annotation))
+        pin.require_annotation(changed)
     with pytest.raises(ValueError, match="pin_invalid"):
         pin.require_annotation(annotation, final=True)
     state_by_field["active"] = False
@@ -115,7 +108,7 @@ async def test_equal_constructed_annotation_cannot_replace_registered_proof(monk
 
 @pytest.mark.parametrize("phase", ["loading", "indexing"])
 def test_caught_partial_index_work_cannot_pass_final_admission(phase):
-    annotation = RetainedNativeRelation("retained", "entity_address_unified", 21, "{}", object(), phase=phase)
+    annotation = SimpleNamespace(schema="retained", relation="entity_address_unified", phase=phase)
     admission = SimpleNamespace(_native_relations={(annotation.schema, annotation.relation): annotation})
     with pytest.raises(RuntimeError, match="native_incomplete"):
         NonprofileAdmission._require_finished_native_relations(admission)
@@ -177,9 +170,8 @@ def test_source_heap_has_native_columns_but_no_source_nextval_or_indexes():
 def test_native_column_recipe_preserves_storage_and_compression():
     native = (None, json.dumps({"logical_catalog": {"target": {"columns": [{"attname": "value"}]}}}))
     layout = SimpleNamespace(
-        oid=7,
         catalog_json=json.dumps(
-            {"attributes": [{"relation_oid": 7, "attname": "value", "attstorage": "m", "attcompression": "p"}]}
+            {"attributes": [{"relation_kind": "main", "attname": "value", "attstorage": "m", "attcompression": "p"}]}
         ),
     )
     columns = pins._column_recipes(native, {"target": layout})["target"]
@@ -207,8 +199,59 @@ async def test_source_bounds_and_export_never_use_retained_driver(monkeypatch):
 
     monkeypatch.setattr(address, "_copy_native_batch", copy)
     await address._copy_prepared_rows(
-        target, _prepared(), "retained", ("entity_address_unified", "stage", 42), 2, (4, 1024), input_pin
+        target, _prepared(), "retained", ("entity_address_unified", "stage"), 2, (4, 1024), input_pin
     )
     target.fetchrow.assert_not_awaited()
     target.fetchval.assert_not_awaited()
     assert len(reader.bounds) == 1 and input_pin.verify_transaction.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transaction", ["active", "closed", "missing"])
+async def test_first_annotation_uses_native_transaction_without_owner_ceremony(monkeypatch, transaction):
+    source_layout = layouts.RetainedNativeSourceLayout("EntityAddressUnified", "sample", "stage", "{}")
+    pin, progress = _issued(monkeypatch, source_layouts=(("entity_address_unified", source_layout),))
+    connection = SimpleNamespace(
+        is_in_transaction=lambda: transaction == "active",
+        fetch=AsyncMock(side_effect=AssertionError("unexpected actor catalog")),
+        fetchrow=AsyncMock(side_effect=AssertionError("unexpected role catalog")),
+    )
+    binding = None if transaction == "missing" else SimpleNamespace(session=object())
+    pin.prepared.fhir = SimpleNamespace(db=SimpleNamespace(_transaction_binding=lambda: binding))
+    monkeypatch.setattr(pins, "native_driver", AsyncMock(return_value=connection))
+    annotation = RetainedNativeRelation("retained", "entity_address_unified", "{}", source_layout, "loading", pin)
+    if transaction == "active":
+        await pin.register_relation(annotation, pin.prepared.nonprofile_admission)
+        assert progress["relations"] == {("retained", "entity_address_unified"): annotation}
+    else:
+        with pytest.raises(ValueError, match="pin_invalid"):
+            await pin.register_relation(annotation, pin.prepared.nonprofile_admission)
+        assert progress["relations"] == {}
+    assert "target" not in progress
+    connection.fetch.assert_not_awaited()
+    connection.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["missing_name", "crossed_schema"])
+async def test_copy_completion_requires_one_complete_named_target(monkeypatch, damage):
+    names = sorted(model.__tablename__ for model in receipts._models())
+    stages = tuple((name, name + "_prepared") for name in names)
+    prepared = SimpleNamespace(
+        address=SimpleNamespace(committed=False, stage_relations=stages),
+        nonprofile_admission=SimpleNamespace(_assert_lease=Mock()),
+    )
+    source = SimpleNamespace(require_active=Mock(), verify_transaction=AsyncMock())
+    pin = pins.PinnedRegistryCMSAddressInput(prepared, source, object(), stages, (), "{}", "{}", "{}")
+    annotation_by_name = {name: SimpleNamespace(schema="retained", relation=name, phase="finished") for name in names}
+    if damage == "missing_name":
+        annotation_by_name.pop(names[0])
+    else:
+        annotation_by_name[names[0]].schema = "other_retained_schema"
+    monkeypatch.setitem(pins._INPUTS, pin, {"active": True, "complete": False, "relations": annotation_by_name})
+    monkeypatch.setattr(pins.PinnedRegistryCMSAddressInput, "_require_target_transaction", AsyncMock())
+    capture = AsyncMock()
+    monkeypatch.setattr(pins, "validate_registry_cms_address_copy", capture)
+    with pytest.raises(ValueError, match="pin_invalid"):
+        await pin.finish_copy(object(), SimpleNamespace(schema_name="retained", relation_names=tuple(names)), object())
+    capture.assert_not_awaited()

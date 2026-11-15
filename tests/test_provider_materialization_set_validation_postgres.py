@@ -6,7 +6,7 @@ import datetime
 import hashlib
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -79,7 +79,9 @@ def _tampered_copy(copier, field_name, value, candidate_names, target_table):
     return copy_rows
 
 
-async def _assert_invalid_candidate(database, admission, monkeypatch, field_name, value, target_table):
+async def _assert_invalid_candidate(
+    database, admission, monkeypatch, field_name, value, target_table, *, legacy_content=False
+):
     copier = materialization.copy_dataset_candidate_rows
     candidate_names = set()
     with monkeypatch.context() as patch:
@@ -88,9 +90,11 @@ async def _assert_invalid_candidate(database, admission, monkeypatch, field_name
             "copy_dataset_candidate_rows",
             _tampered_copy(copier, field_name, value, candidate_names, target_table),
         )
-        with pytest.raises(
-            GenericCandidateError, match="^provider_directory_generic_source_candidate_content_changed$"
-        ):
+        error_type = publication.UHCFlexPractitionerPublicationError if legacy_content else GenericCandidateError
+        reason = (
+            "content is invalid" if legacy_content else "^provider_directory_generic_source_candidate_content_changed$"
+        )
+        with pytest.raises(error_type, match=reason):
             await publication.publish_uhc_flex_practitioner_dataset(
                 admission.candidate_acquisition_id,
                 database=database,
@@ -117,11 +121,17 @@ async def test_candidate_shape_identity_and_npi_are_checked_as_a_set(monkeypatch
             ("acquired_resource_sha256", "a" * 64),
             ("requested_npi", 1000000001),
         )
-        for field_name, value in invalid_fields:
+        for field_name, invalid_value in invalid_fields:
             target_table = publication._PROVENANCE if field_name == "requested_npi" else publication._DATASET_RESOURCE
-            await _assert_invalid_candidate(database, admission, monkeypatch, field_name, value, target_table)
+            await _assert_invalid_candidate(database, admission, monkeypatch, field_name, invalid_value, target_table)
         await _assert_invalid_candidate(
-            database, admission, monkeypatch, "acquired_resource_sha256", "bad", publication._PROVENANCE
+            database,
+            admission,
+            monkeypatch,
+            "acquired_resource_sha256",
+            "bad",
+            publication._PROVENANCE,
+            legacy_content=True,
         )
         published = await publication.publish_uhc_flex_practitioner_dataset(
             admission.candidate_acquisition_id,
@@ -185,61 +195,41 @@ async def _candidate_relations(context):
 
 
 @pytest.mark.asyncio
-async def test_rooted_provenance_checks_are_retained_before_publication(monkeypatch):
+async def test_rooted_direct_publication_refuses_before_provenance_copy(monkeypatch):
     async with _lifecycle_scope(monkeypatch) as context:
         current = await _publish_legacy_root(context.database)
         admission = await _admitted_rooted_candidate(context.database, current)
         original_relations = await _candidate_relations(context)
         assert original_relations
-        copier = candidate_storage.copy_dataset_candidate_rows
-        for field_name, value in (("origin_kind", "invalid"), ("attempt", 0)):
-            with monkeypatch.context() as patch:
-                patch.setattr(
-                    candidate_storage,
-                    "copy_dataset_candidate_rows",
-                    _tampered_copy(
-                        copier, field_name, value, set(), "provider_directory_rooted_graph_dataset_resource"
-                    ),
-                )
-                with pytest.raises(
-                    GenericCandidateError, match="^provider_directory_generic_source_candidate_content_changed$"
-                ):
-                    await publish_provider_directory_rooted_graph_dataset(
-                        admission.publication_acquisition_id, database=context.database, batch_size=4
-                    )
-            assert await _candidate_relations(context) == original_relations
-            assert await _locked_exact_current(context.database) == current
-        published = await publish_provider_directory_rooted_graph_dataset(
-            admission.publication_acquisition_id, database=context.database, batch_size=4
-        )
-        assert published.readiness.previous_dataset_id == current.dataset_id
+        copier = AsyncMock(side_effect=AssertionError("closed route must not copy publication rows"))
+        monkeypatch.setattr(candidate_storage, "copy_dataset_candidate_rows", copier)
+        with pytest.raises(
+            RuntimeError, match="Rooted publication requires a prepared named generation through the Source operator"
+        ):
+            await publish_provider_directory_rooted_graph_dataset(
+                admission.publication_acquisition_id, database=context.database, batch_size=4
+            )
+        copier.assert_not_awaited()
+        assert await _candidate_relations(context) == original_relations
+        assert await _locked_exact_current(context.database) == current
 
 
 @pytest.mark.asyncio
-async def test_rooted_normalizer_identity_drift_fails_set_proof_and_rolls_back(monkeypatch):
+async def test_rooted_direct_publication_refuses_before_normalizer_execution(monkeypatch):
     async with _lifecycle_scope(monkeypatch) as context:
         current = await _publish_legacy_root(context.database)
         admission = await _admitted_rooted_candidate(context.database, current)
         original_relations = await _candidate_relations(context)
         assert original_relations
-        normalize = rooted_materialization.materialize_provider_directory_dataset_fhir_resource
-
-        def drift_identity(**keywords):
-            resource = normalize(**keywords)
-            if resource["resource_type"] == "Organization":
-                return {**resource, "resource_type": "Location"}
-            return resource
-
-        with monkeypatch.context() as patch:
-            patch.setattr(
-                rooted_materialization, "materialize_provider_directory_dataset_fhir_resource", drift_identity
+        normalize = Mock(side_effect=AssertionError("closed route must not normalize publication rows"))
+        monkeypatch.setattr(rooted_materialization, "materialize_provider_directory_dataset_fhir_resource", normalize)
+        with pytest.raises(
+            RuntimeError, match="Rooted publication requires a prepared named generation through the Source operator"
+        ):
+            await publish_provider_directory_rooted_graph_dataset(
+                admission.publication_acquisition_id, database=context.database, batch_size=4
             )
-            with pytest.raises(
-                GenericCandidateError, match="^provider_directory_generic_source_candidate_content_changed$"
-            ):
-                await publish_provider_directory_rooted_graph_dataset(
-                    admission.publication_acquisition_id, database=context.database, batch_size=4
-                )
+        normalize.assert_not_called()
         assert await _candidate_relations(context) == original_relations
         assert await _locked_exact_current(context.database) == current
         assert (
@@ -248,8 +238,3 @@ async def test_rooted_normalizer_identity_drift_fails_set_proof_and_rolls_back(m
             )
             == 0
         )
-        published = await publish_provider_directory_rooted_graph_dataset(
-            admission.publication_acquisition_id, database=context.database, batch_size=4
-        )
-        assert published.readiness.previous_dataset_id == current.dataset_id
-        assert published.readiness.resource_counts["Organization"] == 1

@@ -15,30 +15,27 @@ import re
 from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 from process.entity_address_result_generation import ENTITY_ADDRESS_RESULT_MODELS
 
 
 @dataclass(frozen=True)
 class NativeRelationLayout:
-    """Exact observed physical identity; never a Profile capacity projection."""
+    """Validated native layout named independently of a database's physical allocation."""
 
-    relation_oid: int
-    effective_tablespace_oids: tuple[int, ...]
-    exact_fingerprint: str
+    schema_name: str
+    relation_name: str
 
 
 @dataclass(frozen=True)
 class RetainedNativeSourceLayout:
-    """Immutable catalog evidence from one already admitted, finalized native heap."""
+    """Portable semantic layout from an admitted, finalized native named snapshot."""
 
     model_name: str
     schema: str
     relation: str
-    oid: int
-    database_oid: int
     catalog_json: str
-    exact_fingerprint: str
 
 
 def _native_model(name, targets):
@@ -160,7 +157,6 @@ def _assert_index_physical(index, relation):
         not all(index[field] is True for field in ("indisvalid", "indisready", "indislive", "indimmediate"))
         or index["indisexclusion"]
         or index["indisreplident"]
-        or not index["relfilenode"]
         or index["index_persistence"] != relation.persistence
         or index["index_schema"] not in (relation.schema, "pg_toast")
     ):
@@ -213,20 +209,28 @@ async def _index_physical_details(fhir, indexes):
     """Add exact namespaces, persistence and operator-class identities to shared catalog rows."""
     if not indexes:
         return
-    rows = await fhir.db.all(
+    catalog_records = await fhir.db.all(
         """
         SELECT relation.oid::bigint AS index_oid, namespace.nspname AS index_schema,
                relation.relpersistence::text AS index_persistence,
                ARRAY(SELECT operator.opcname::text FROM unnest(index.indclass::oid[]) WITH ORDINALITY AS item(oid,n)
-                     JOIN pg_opclass operator ON operator.oid=item.oid ORDER BY item.n) AS opclass_names
+                     JOIN pg_opclass operator ON operator.oid=item.oid ORDER BY item.n) AS opclass_names,
+               ARRAY(SELECT jsonb_build_object('schema', ns.nspname, 'name', op.opcname)
+                       FROM unnest(index.indclass::oid[]) WITH ORDINALITY AS item(oid,n)
+                       JOIN pg_opclass op ON op.oid=item.oid JOIN pg_namespace ns ON ns.oid=op.opcnamespace
+                      ORDER BY item.n) AS opclasses,
+               ARRAY(SELECT CASE WHEN item.oid=0 THEN NULL ELSE jsonb_build_object('schema', ns.nspname, 'name', co.collname) END
+                       FROM unnest(index.indcollation::oid[]) WITH ORDINALITY AS item(oid,n)
+                       LEFT JOIN pg_collation co ON co.oid=item.oid LEFT JOIN pg_namespace ns ON ns.oid=co.collnamespace
+                      ORDER BY item.n) AS collations
           FROM pg_class relation JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
           JOIN pg_index index ON index.indexrelid=relation.oid
          WHERE relation.oid=ANY(CAST(:oids AS oid[]))
     """,
         oids=[index["index_oid"] for index in indexes],
     )
-    details = [dict(fhir._pagination_checkpoint_row_mapping(row)) for row in rows]
-    details_by_oid = {row["index_oid"]: row for row in details}
+    details = [dict(fhir._pagination_checkpoint_row_mapping(catalog_row)) for catalog_row in catalog_records]
+    details_by_oid = {catalog_row["index_oid"]: catalog_row for catalog_row in details}
     for index in indexes:
         if index["index_oid"] not in details_by_oid:
             _reject()
@@ -284,6 +288,7 @@ async def _capture_model_layout(fhir, relation, model, declarations_by_name=None
 async def _capture_model_catalog(fhir, relation, model, declarations_by_name=None, bucket_name=None):
     """Keep the original native catalog validation shared with retained captures."""
     catalog_by_field, toast_oid = await _observe_catalog(fhir, relation)
+    relation = SimpleNamespace(**vars(relation), oid=catalog_by_field["relation"]["relation_oid"])
     attributes, indexes = catalog_by_field["attributes"], catalog_by_field["indexes"]
     checked_indexes = [index for index in indexes if index["index_name"] != bucket_name]
     if declarations_by_name is not None:
@@ -320,8 +325,16 @@ def _native_index_catalog_sql():
                ARRAY(SELECT operator.opcname::text
                        FROM unnest(index_row.indclass::oid[]) WITH ORDINALITY AS item(oid,n)
                        JOIN pg_opclass operator ON operator.oid=item.oid ORDER BY item.n) AS opclass_names,
+               ARRAY(SELECT jsonb_build_object('schema', ns.nspname, 'name', op.opcname)
+                       FROM unnest(index_row.indclass::oid[]) WITH ORDINALITY AS item(oid,n)
+                       JOIN pg_opclass op ON op.oid=item.oid JOIN pg_namespace ns ON ns.oid=op.opcnamespace
+                      ORDER BY item.n) AS opclasses,
+               ARRAY(SELECT CASE WHEN item.oid=0 THEN NULL ELSE jsonb_build_object('schema', ns.nspname, 'name', co.collname) END
+                       FROM unnest(index_row.indcollation::oid[]) WITH ORDINALITY AS item(oid,n)
+                       LEFT JOIN pg_collation co ON co.oid=item.oid LEFT JOIN pg_namespace ns ON ns.oid=co.collnamespace
+                      ORDER BY item.n) AS collations,
                (relation.oid IS NOT NULL AND namespace.oid IS NOT NULL
-                AND index_row.indexrelid IS NOT NULL) AS physical_present
+                AND index_row.indexrelid IS NOT NULL) AS catalog_present
           FROM native_indexes catalog_index
           LEFT JOIN pg_class relation ON relation.oid=catalog_index.index_oid
           LEFT JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
@@ -352,10 +365,25 @@ def _fixed_catalog_path_statement(catalog_ctes):
     )
 
 
+def _native_attribute_catalog_sql(directory):
+    """Resolve portable type and collation names in the same fresh catalog pass."""
+    return (
+        """SELECT attribute.*, jsonb_build_object('schema',tn.nspname,'name',t.typname) AS type,
+               CASE WHEN attribute.attcollation=0 THEN NULL
+                    ELSE jsonb_build_object('schema',cn.nspname,'name',c.collname) END AS collation
+              FROM ("""
+        + directory._PROFILE_CAPACITY_ATTRIBUTE_SQL.strip().removesuffix(";")
+        + """) attribute
+              JOIN pg_type t ON t.oid=attribute.atttypid JOIN pg_namespace tn ON tn.oid=t.typnamespace
+              LEFT JOIN pg_collation c ON c.oid=attribute.attcollation
+              LEFT JOIN pg_namespace cn ON cn.oid=c.collnamespace"""
+    )
+
+
 def _native_catalog_statement(directory):
     """Materialize exact deparsing before restoring the original backend's transaction-local path."""
     sections = (
-        ("attributes", directory._PROFILE_CAPACITY_ATTRIBUTE_SQL, "relation_oid,attnum"),
+        ("attributes", _native_attribute_catalog_sql(directory), "relation_oid,attnum"),
         ("indexes", _native_index_catalog_sql(), "relation_oid,index_oid"),
         (
             "constraints",
@@ -381,9 +409,7 @@ def _native_catalog_statement(directory):
         + _path_bound_catalog_sql(directory._PROFILE_CAPACITY_INDEX_SQL)
         + ") catalog_index),native_catalog AS MATERIALIZED (SELECT "
         + ",".join(projections)
-        + ",(SELECT oid::bigint FROM pg_database WHERE datname=current_database() "
-        "AND native_path.configured_path='pg_catalog' OFFSET 0) AS database_oid "
-        "FROM native_catalog_path native_path)"
+        + " FROM native_catalog_path native_path)"
     )
 
 
@@ -394,42 +420,37 @@ async def _native_catalog_rows(fhir, relation_oids):
     if catalog_row is None:
         _reject()
     catalog_by_name = dict(fhir._pagination_checkpoint_row_mapping(catalog_row))
-    database_oid = catalog_by_name.pop("database_oid", None)
-    if type(database_oid) is not int or not 0 < database_oid < 2**32:
-        _reject()
     names = ("attributes", "indexes", "constraints", "triggers")
     if set(catalog_by_name) != set(names) or any(
         type(catalog_rows) is not list or any(type(entry) is not dict for entry in catalog_rows)
         for catalog_rows in catalog_by_name.values()
     ):
         _reject()
-    if any(index.get("physical_present") is not True for index in catalog_by_name["indexes"]):
+    if any(index.get("catalog_present") is not True for index in catalog_by_name["indexes"]):
         _reject()
     catalog_by_name["indexes"] = [
-        {key: field_value for key, field_value in index.items() if key != "physical_present"}
+        {key: field_value for key, field_value in index.items() if key != "catalog_present"}
         for index in catalog_by_name["indexes"]
     ]
-    return (*tuple(catalog_by_name[name] for name in names), database_oid)
+    return tuple(catalog_by_name[name] for name in names)
 
 
 def _observed_catalog(relation, relation_map, toast_oid, catalog_rows):
     """Apply the same exact heap and native catalog checks to either fresh read path."""
-    attributes, indexes, constraints, triggers, database_oid = catalog_rows
+    attributes, indexes, constraints, triggers = catalog_rows
     if (
         type(relation_map) is not dict
         or type(relation_map.get("relation_oid")) is not int
-        or relation_map.get("relation_oid") != relation.oid
+        or not 0 < relation_map.get("relation_oid", 0) < 2**32
         or relation_map.get("schema_name") != relation.schema
         or relation_map.get("relation_name") != relation.relation
         or relation_map.get("relpersistence") != relation.persistence
         or type(relation_map.get("toast_oid", 0)) not in (int, type(None))
         or (relation_map.get("toast_oid") or None) != toast_oid
         or (toast_oid is not None and (type(toast_oid) is not int or not 0 < toast_oid < 2**32))
-        or type(database_oid) is not int
-        or not 0 < database_oid < 2**32
     ):
         _reject()
-    _validate_native_catalog_members((relation.oid, toast_oid), catalog_rows[:4])
+    _validate_native_catalog_members((relation_map["relation_oid"], toast_oid), catalog_rows)
     if triggers or any(
         constraint["constraint_type"] not in ("p", "n")
         or constraint["condeferrable"]
@@ -439,8 +460,7 @@ def _observed_catalog(relation, relation_map, toast_oid, catalog_rows):
     ):
         _reject()
     catalog_by_field = {
-        "contract": "cms-native-observed-layout.v1",
-        "database_oid": database_oid,
+        "contract": "cms-native-observed-layout.v2",
         "relation": relation_map,
         "attributes": attributes,
         "constraints": constraints,
@@ -481,46 +501,48 @@ def _validate_native_catalog_members(relation_oids, catalog_sections):
 
 
 def _native_batch_inventory(relations):
-    """Require complete, unambiguous heap coordinates for one executor's current pass."""
-    relation_by_oid, coordinates = {}, set()
-    for relation in relations:
-        coordinate = (relation.schema, relation.relation)
-        if (
-            type(relation.oid) is not int
-            or not 0 < relation.oid < 2**32
-            or any(type(value) is not str or not value for value in coordinate)
-            or relation.oid in relation_by_oid
-            or coordinate in coordinates
-        ):
-            _reject()
-        relation_by_oid[relation.oid] = relation
-        coordinates.add(coordinate)
-    return relation_by_oid
+    """Require an unambiguous named inventory before reading any catalog rows."""
+    by_coordinate = {(entry.schema, entry.relation): entry for entry in relations}
+    if len(by_coordinate) != len(relations) or any(
+        any(type(part) is not str or not part for part in coordinate) for coordinate in by_coordinate
+    ):
+        _reject()
+    return by_coordinate
 
 
-async def _native_batch_relation_rows(fhir, relation_by_oid):
-    """Reuse the unchanged physical relation SQL and validator for every requested heap."""
+async def _native_batch_relation_rows(fhir, relation_by_coordinate):
+    """Resolve names and validate all fresh heap rows in the existing single query."""
     directory = importlib.import_module("process.provider_directory_fhir")
     predicate = "relation.oid = CAST(:relation_oid AS oid)"
     if directory._PROFILE_CAPACITY_RELATION_SQL.count(predicate) != 1:
         _reject()
     statement = directory._PROFILE_CAPACITY_RELATION_SQL.replace(
-        predicate, "relation.oid = ANY(CAST(:relation_oids AS oid[]))"
+        predicate,
+        "relation.oid = ANY(SELECT to_regclass(name) FROM unnest(CAST(:relation_refs AS text[])) requested(name))",
     )
-    catalog_records = await fhir.db.all(statement, relation_oids=sorted(relation_by_oid))
-    observed_by_oid = {}
+    catalog_records = await fhir.db.all(
+        statement, relation_refs=[fhir._unscoped_qt(*coordinate) for coordinate in sorted(relation_by_coordinate)]
+    )
+    relation_by_oid, observed_by_oid = {}, {}
     for catalog_record in catalog_records:
         relation_map = dict(fhir._pagination_checkpoint_row_mapping(catalog_record))
+        coordinate = (relation_map.get("schema_name"), relation_map.get("relation_name"))
         relation_oid = relation_map.get("relation_oid")
-        if type(relation_oid) is not int or relation_oid not in relation_by_oid or relation_oid in observed_by_oid:
+        if (
+            coordinate not in relation_by_coordinate
+            or type(relation_oid) is not int
+            or not 0 < relation_oid < 2**32
+            or relation_oid in relation_by_oid
+        ):
             _reject()
-        relation = relation_by_oid[relation_oid]
+        relation = relation_by_coordinate[coordinate]
+        relation_by_oid[relation_oid] = SimpleNamespace(**vars(relation), oid=relation_oid)
         observed_by_oid[relation_oid] = await fhir._validate_profile_capacity_relation_row(
             catalog_record, relation.persistence, 0, database=fhir.db
         )
-    if set(observed_by_oid) != set(relation_by_oid):
+    if len(observed_by_oid) != len(relation_by_coordinate):
         _reject()
-    return observed_by_oid
+    return relation_by_oid, observed_by_oid
 
 
 async def observe_native_catalog_batch(fhir, relations, *, database=None):
@@ -528,10 +550,10 @@ async def observe_native_catalog_batch(fhir, relations, *, database=None):
     from process.provider_directory_cms_nonprofile_observation import catalog_observation
 
     fhir = catalog_observation(fhir, database)
-    relation_by_oid = _native_batch_inventory(relations)
-    if not relation_by_oid:
+    relation_by_coordinate = _native_batch_inventory(relations)
+    if not relation_by_coordinate:
         return {}
-    observed_by_oid = await _native_batch_relation_rows(fhir, relation_by_oid)
+    relation_by_oid, observed_by_oid = await _native_batch_relation_rows(fhir, relation_by_coordinate)
     owner_by_oid = dict.fromkeys(relation_by_oid)
     for relation_oid, (_relation_map, toast_oid) in observed_by_oid.items():
         owner_by_oid[relation_oid] = relation_oid
@@ -546,8 +568,8 @@ async def observe_native_catalog_batch(fhir, relations, *, database=None):
         for catalog_record in catalog_records:
             sections_by_oid[owner_by_oid[catalog_record["relation_oid"]]][section_number].append(catalog_record)
     return {
-        (relation.schema, relation.relation, relation.oid): _observed_catalog(
-            relation, *observed_by_oid[relation_oid], (*sections_by_oid[relation_oid], catalog_rows[4])
+        (relation.schema, relation.relation): _observed_catalog(
+            relation, *observed_by_oid[relation_oid], sections_by_oid[relation_oid]
         )
         for relation_oid, relation in relation_by_oid.items()
     }
@@ -559,25 +581,28 @@ async def _observe_catalog(fhir, relation, *, observed_catalog=None):
         if type(observed_catalog) is not tuple or len(observed_catalog) != 2:
             _reject()
         catalog, toast_oid = observed_catalog
-        names = ("attributes", "indexes", "constraints", "triggers", "database_oid")
+        names = ("attributes", "indexes", "constraints", "triggers")
         if (
             type(catalog) is not dict
             or set(catalog) != {"contract", "relation", *names}
-            or catalog["contract"] != "cms-native-observed-layout.v1"
+            or catalog["contract"] != "cms-native-observed-layout.v2"
         ):
             _reject()
         return _observed_catalog(relation, catalog["relation"], toast_oid, tuple(catalog[name] for name in names))
-    relation_map, toast_oid = await fhir._profile_capacity_relation_row(relation.oid, relation.persistence, 0)
-    catalog_rows = await _native_catalog_rows(fhir, [relation.oid] + ([toast_oid] if toast_oid else []))
+    relation_oid = await fhir.db.scalar(
+        "SELECT to_regclass(:name)::oid::bigint", name=fhir._unscoped_qt(relation.schema, relation.relation)
+    )
+    if type(relation_oid) is not int or not 0 < relation_oid < 2**32:
+        _reject()
+    relation_map, toast_oid = await fhir._profile_capacity_relation_row(relation_oid, relation.persistence, 0)
+    if relation_map.get("relation_oid") != relation_oid:
+        _reject()
+    catalog_rows = await _native_catalog_rows(fhir, [relation_oid] + ([toast_oid] if toast_oid else []))
     return _observed_catalog(relation, relation_map, toast_oid, catalog_rows)
 
 
 def _observed_layout(fhir, relation, catalog_by_field, toast_oid):
-    return NativeRelationLayout(
-        relation.oid,
-        fhir._profile_capacity_tablespaces(catalog_by_field["relation"], catalog_by_field["indexes"], toast_oid),
-        fhir._identity_hash(catalog_by_field),
-    )
+    return NativeRelationLayout(relation.schema, relation.relation)
 
 
 def _canonical_catalog(catalog):
@@ -586,8 +611,7 @@ def _canonical_catalog(catalog):
 
 def _retained_source_model(source, native_targets):
     if type(source) is not RetainedNativeSourceLayout or any(
-        type(value) is not str
-        for value in (source.model_name, source.schema, source.relation, source.catalog_json, source.exact_fingerprint)
+        type(value) is not str for value in (source.model_name, source.schema, source.relation, source.catalog_json)
     ):
         _reject()
     model = _native_model(source.relation, native_targets)
@@ -595,10 +619,6 @@ def _retained_source_model(source, native_targets):
         model is None
         or source.model_name != model.__tablename__
         or re.fullmatch(re.escape(model.__tablename__) + r"_cms[0-9a-f]{20}", source.relation) is None
-        or type(source.oid) is not int
-        or not 0 < source.oid < 2**32
-        or type(source.database_oid) is not int
-        or not 0 < source.database_oid < 2**32
         or type(source.schema) is not str
         or re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,62}", source.schema) is None
     ):
@@ -690,17 +710,12 @@ async def capture_retained_native_source(fhir, relation, native_targets, *, data
     ):
         _reject()
     catalog, _toast_oid = await _capture_model_catalog(fhir, relation, model)
-    _require_final_indexes(catalog, relation, model)
+    observed_relation = SimpleNamespace(**vars(relation), oid=catalog["relation"]["relation_oid"])
+    _require_final_indexes(catalog, observed_relation, model)
     if model.__tablename__ == "entity_address_evidence":
-        await _capture_evidence_sequence(fhir, relation, catalog)
+        await _capture_evidence_sequence(fhir, observed_relation, catalog)
     return RetainedNativeSourceLayout(
-        model.__tablename__,
-        relation.schema,
-        relation.relation,
-        relation.oid,
-        catalog["database_oid"],
-        _canonical_catalog(catalog),
-        fhir._identity_hash(catalog),
+        model.__tablename__, relation.schema, relation.relation, _canonical_catalog(_structural_catalog(catalog))
     )
 
 
@@ -708,21 +723,11 @@ def _structural_catalog(catalog):
     """Exclude only clone-generated physical identities; SQL and operator identities stay exact."""
     relation_oid = catalog["relation"]["relation_oid"]
     attribute_positions = _live_attribute_positions(catalog["attributes"])
-    excluded_fields = {
-        "relation_oid",
-        "index_oid",
-        "index_name",
-        "index_schema",
-        "schema_name",
-        "relation_name",
-        "relfilenode",
-        "toast_relfilenode",
-        "toast_oid",
-        "main_bytes",
-    }
+    excluded_fields = frozenset(
+        "relation_oid index_oid index_name index_schema schema_name relation_name relfilenode toast_relfilenode toast_oid main_bytes tablespace_oid effective_tablespace_oid toast_tablespace_oid toast_effective_tablespace_oid atttypid attcollation indclass indcollation".split()
+    )
     structure_by_field = {
         "contract": catalog["contract"],
-        "database_oid": catalog["database_oid"],
         "relation": {
             key: field_value for key, field_value in catalog["relation"].items() if key not in excluded_fields
         },
@@ -752,7 +757,15 @@ def _structural_catalog(catalog):
         structure_by_field["evidence_sequence"] = {
             key: field_value
             for key, field_value in catalog["evidence_sequence"].items()
-            if key not in {"sequence_oid", "schema_name", "sequence_name", "default_expression", "expected_default"}
+            if key
+            not in {
+                "sequence_oid",
+                "schema_name",
+                "sequence_name",
+                "default_expression",
+                "expected_default",
+                "type_oid",
+            }
         }
     return structure_by_field
 
@@ -785,51 +798,24 @@ async def capture_retained_native_layout(
         original = json.loads(source_layout.catalog_json)
         if (
             _canonical_catalog(original) != source_layout.catalog_json
-            or fhir._identity_hash(original) != source_layout.exact_fingerprint
-            or original["contract"] != "cms-native-observed-layout.v1"
-            or original["database_oid"] != source_layout.database_oid
-            or original["relation"]["relation_oid"] != source_layout.oid
-            or original["relation"]["schema_name"] != source_layout.schema
-            or original["relation"]["relation_name"] != source_layout.relation
-            or original["relation"]["relpersistence"] != "p"
+            or original["contract"] != "cms-native-observed-layout.v2"
         ):
             _reject()
-        _require_final_indexes(original, source_layout, model)
         catalog, toast_oid = await _observe_catalog(fhir, relation, observed_catalog=observed_catalog)
         if model.__tablename__ == "entity_address_evidence":
-            await _capture_evidence_sequence(fhir, relation, catalog)
-        if _structural_catalog(catalog) != _structural_catalog(original):
+            observed_relation = SimpleNamespace(**vars(relation), oid=catalog["relation"]["relation_oid"])
+            await _capture_evidence_sequence(fhir, observed_relation, catalog)
+        if _structural_catalog(catalog) != original:
             _reject()
-        original_indexes = iter(
-            sorted(
-                original["indexes"],
-                key=lambda index: _canonical_catalog(
-                    _structural_catalog({**original, "indexes": [index]})["indexes"][0]
-                ),
-            )
-        )
-        renamed_indexes = []
-        for index in sorted(
-            catalog["indexes"],
-            key=lambda index: _canonical_catalog(_structural_catalog({**catalog, "indexes": [index]})["indexes"][0]),
-        ):
-            renamed_indexes.append({**index, "index_name": next(original_indexes)["index_name"]})
-        _assert_indexes(
-            renamed_indexes,
-            catalog["attributes"],
-            relation,
-            model,
-            toast_oid,
-            _declarations(source_layout.relation, model),
-        )
-    except KeyError, TypeError, ValueError, StopIteration:
+    except KeyError, TypeError, ValueError:
         _reject()
+
     return _observed_layout(fhir, relation, catalog, toast_oid)
 
 
 def _retained_phase_structure(original, actual, phase):
     """Require the unchanged native heap and bounded recipe multisets during indexing."""
-    expected, observed = _structural_catalog(original), _structural_catalog(actual)
+    expected, observed = json.loads(_canonical_catalog(original)), _structural_catalog(actual)
     expected_indexes = [entry for entry in expected["indexes"] if entry["relation_kind"] == "main"]
     actual_indexes = [entry for entry in observed["indexes"] if entry["relation_kind"] == "main"]
     expected_constraints = [entry for entry in expected["constraints"] if entry["constraint_type"] in {"p", "u"}]
@@ -869,11 +855,8 @@ async def capture_retained_native_phase(
     if type(annotation.source_input) is not PinnedRegistryCMSAddressInput:
         _reject()
     annotation.source_input.require_annotation(annotation)
-    if (relation.schema, relation.relation, relation.oid) != (annotation.schema, annotation.relation, annotation.oid):
+    if (relation.schema, relation.relation) != (annotation.schema, annotation.relation):
         _reject()
-    annotation.source_input.require_target_owner(
-        await fhir.db.scalar("SELECT relowner::bigint FROM pg_class WHERE oid=CAST(:oid AS oid)", oid=relation.oid)
-    )
     if annotation.phase == "finished":
         return await capture_retained_native_layout(
             fhir, relation, annotation.source_layout, native_targets, observed_catalog=observed_catalog
@@ -888,13 +871,13 @@ async def capture_retained_native_phase(
     original = json.loads(source_layout.catalog_json)
     if (
         _canonical_catalog(original) != source_layout.catalog_json
-        or fhir._identity_hash(original) != source_layout.exact_fingerprint
+        or original.get("contract") != "cms-native-observed-layout.v2"
     ):
         _reject()
-    _require_final_indexes(original, source_layout, model)
     catalog, toast_oid = await _observe_catalog(fhir, relation, observed_catalog=observed_catalog)
     if model.__tablename__ == "entity_address_evidence":
-        await _capture_evidence_sequence(fhir, relation, catalog)
+        observed_relation = SimpleNamespace(**vars(relation), oid=catalog["relation"]["relation_oid"])
+        await _capture_evidence_sequence(fhir, observed_relation, catalog)
     _retained_phase_structure(original, catalog, annotation.phase)
     return _observed_layout(fhir, relation, catalog, toast_oid)
 
@@ -919,12 +902,13 @@ async def _capture_scratch_proof_layout(fhir, relation, proof, *, database=None,
 
     reader = catalog_observation(fhir, database)
     catalog, toast_oid = await _observe_catalog(reader, relation, observed_catalog=observed_catalog)
+    observed_relation = SimpleNamespace(**vars(relation), oid=catalog["relation"]["relation_oid"])
     for index in catalog["indexes"]:
-        _assert_index_physical(index, relation)
+        _assert_index_physical(index, observed_relation)
     _assert_indexes(
         [index for index in catalog["indexes"] if index["relation_oid"] == toast_oid],
         catalog["attributes"],
-        relation,
+        observed_relation,
         output_models()[proof.target],
         toast_oid,
     )
@@ -966,7 +950,7 @@ async def scratch_layout_batch(fhir, relations, *, database_for=None):
                         relation,
                         proof,
                         database=database,
-                        observed_catalog=observed_by_coordinate[(relation.schema, relation.relation, relation.oid)],
+                        observed_catalog=observed_by_coordinate[(relation.schema, relation.relation)],
                     )
             yield layout_by_coordinate
         finally:

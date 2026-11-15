@@ -64,6 +64,33 @@ READY_FIELDS = frozenset(
         "ready_sha256",
     }
 )
+_LEGACY_MARKER_FIELDS = MARKER_FIELDS
+_LEGACY_READY_FIELDS = READY_FIELDS
+_OLD_LOCATIONS = {
+    "database_oid",
+    "history_oid",
+    "owner_oid",
+    "publisher_oid",
+    "builder_oid",
+    "parent_oid",
+    "parent_index_oid",
+    "previous_child_oid",
+}
+MARKER_FIELDS = frozenset((MARKER_FIELDS - _OLD_LOCATIONS) | control._NAMED_FIELDS | {"publisher_role", "builder_role"})
+READY_FIELDS = frozenset((READY_FIELDS - {"stage_oid"}) | {"stage"})
+
+
+def _marker_locations(marker):
+    if "parent" in marker:
+        return control.named_locations(marker)
+    ownership = _stage_ownership(marker["ownership"])
+    return {
+        "parent": ("mrf", "nucc_taxonomy"),
+        "history": ("mrf", "import_run"),
+        "child": (ownership.schema_name, partition.CHILD_TABLE),
+    }
+
+
 WAIT_SECONDS = 300
 POLL_SECONDS = 0.25
 
@@ -86,44 +113,48 @@ def ready_digest(ready):
 
 
 def _stage_ownership(ownership_by_field):
+    named_fields = {"importer_id", "dataset_id", "schema_name", "relations", "sequences"}
+    legacy_fields = {
+        "importer_id",
+        "dataset_id",
+        "schema_name",
+        "schema_oid",
+        "relation_oids",
+        "sequence_oids",
+        "auxiliary_oid",
+    }
     _require(
-        type(ownership_by_field) is dict
-        and set(ownership_by_field)
-        == {
-            "importer_id",
-            "dataset_id",
-            "schema_name",
-            "schema_oid",
-            "relation_oids",
-            "sequence_oids",
-            "auxiliary_oid",
-        },
+        type(ownership_by_field) is dict and set(ownership_by_field) in (named_fields, legacy_fields),
         "ownership fields differ",
     )
     control._uuid(ownership_by_field["dataset_id"])
-    dataset_id = UUID(ownership_by_field["dataset_id"])
+    dataset = UUID(ownership_by_field["dataset_id"])
+    is_current = set(ownership_by_field) == named_fields
     _require(
         ownership_by_field["importer_id"] == "nucc"
-        and ownership_by_field["schema_name"] == native.reference_family_stage_schema(dataset_id)
-        and type(ownership_by_field["schema_oid"]) is int
-        and 0 < ownership_by_field["schema_oid"] < 2**32
-        and type(ownership_by_field["relation_oids"]) is list
-        and len(ownership_by_field["relation_oids"]) == 1
-        and type(ownership_by_field["relation_oids"][0]) is list
-        and len(ownership_by_field["relation_oids"][0]) == 2
-        and ownership_by_field["relation_oids"][0][0] == "nucc_taxonomy"
-        and type(ownership_by_field["relation_oids"][0][1]) is int
-        and 0 < ownership_by_field["relation_oids"][0][1] < 2**32
-        and ownership_by_field["sequence_oids"] == []
-        and ownership_by_field["auxiliary_oid"] is None,
+        and ownership_by_field["schema_name"] == native.reference_family_stage_schema(dataset),
         "ownership differs",
     )
+    if is_current:
+        _require(
+            ownership_by_field["relations"] == [{"table_name": "nucc_taxonomy"}]
+            and ownership_by_field["sequences"] == [],
+            "ownership differs",
+        )
+    else:
+        entries = ownership_by_field["relation_oids"]
+        _require(
+            type(entries) is list
+            and len(entries) == 1
+            and type(entries[0]) is list
+            and len(entries[0]) == 2
+            and entries[0][0] == "nucc_taxonomy"
+            and ownership_by_field["sequence_oids"] == []
+            and ownership_by_field["auxiliary_oid"] is None,
+            "ownership differs",
+        )
     return native.ReferenceFamilyStageOwnership(
-        "nucc",
-        dataset_id,
-        ownership_by_field["schema_name"],
-        ownership_by_field["schema_oid"],
-        (tuple(ownership_by_field["relation_oids"][0]),),
+        "nucc", dataset, ownership_by_field["schema_name"], None, (("nucc_taxonomy", None),)
     )
 
 
@@ -142,38 +173,36 @@ def _marker_identity(marker):
     except ValueError:
         raise native.ReferenceFamilyArchiveError("NUCC Source attempt time differs") from None
     _require(started.tzinfo is not None, "attempt time differs")
-    for field in (
-        "database_oid",
-        "history_oid",
-        "owner_oid",
-        "publisher_oid",
-        "builder_oid",
-        "parent_oid",
-        "parent_index_oid",
-        "previous_child_oid",
-    ):
-        _require(type(marker[field]) is int and 0 < marker[field] < 2**32, "native identity differs")
     control._digests(marker, ("admission_sha256", "source_contract_sha256", "marker_sha256"))
-    control._source_generation(marker["source_predecessor"], predecessor=True)
+    control._source_generation(marker["source_predecessor"], predecessor=True, legacy_read="parent" not in marker)
+    if "parent" in marker:
+        control._native_identities(marker)
+        for field in ("publisher_role", "builder_role"):
+            _require(
+                type(marker[field]) is str and native._schema_name(marker[field]) == marker[field],
+                "role declaration differs",
+            )
 
 
 def validate_source_stage_marker(marker):
-    """Decode the closed local wire shape; native Owner, actor and run proof remains mandatory."""
-    _require(type(marker) is dict and set(marker) == MARKER_FIELDS, "marker fields differ")
+    """Decode logical Source evidence while retaining old raw physical editions unchanged."""
+    _require(type(marker) is dict and set(marker) in (MARKER_FIELDS, _LEGACY_MARKER_FIELDS), "marker fields differ")
     _require(marker["contract"] == STAGE_CONTRACT and marker["phase"] in {"copying", "closed"}, "marker phase differs")
     _marker_identity(marker)
     ownership = _stage_ownership(marker["ownership"])
-    _require(marker_digest(marker) == marker["marker_sha256"], "marker digest differs")
+    if "parent" in marker:
+        _require(marker_digest(marker) == marker["marker_sha256"], "marker digest differs")
+        _require(_marker_locations(marker)["child"] == (ownership.schema_name, "nucc_taxonomy"), "stage name differs")
     if marker["phase"] == "copying":
         _require(marker["handoff"] is None, "copying marker invents a handoff")
     else:
         handoff = control.validate_handoff(marker["handoff"])
-        shared = set(handoff) & set(marker) - {"contract", "ownership", "marker_sha256", "phase", "handoff"}
+        shared = (
+            set(handoff) & set(marker) - {"contract", "ownership", "marker_sha256", "phase", "handoff"} - _OLD_LOCATIONS
+        )
         _require(all(handoff[key] == marker[key] for key in shared), "closed handoff differs")
         _require(
-            handoff["child_oid"] == ownership.relation_oids[0][1]
-            and handoff["child_schema"] == ownership.schema_name
-            and handoff["child_schema_oid"] == ownership.schema_oid,
+            control.named_locations(handoff)["child"] == (ownership.schema_name, "nucc_taxonomy"),
             "closed child differs",
         )
     return json.loads(json.dumps(marker))
@@ -195,25 +224,22 @@ class NuccSourceStage:
 
 
 def _is_same_stage_identity(expected, observed):
-    changing_fields = {"phase", "handoff", "marker_sha256"}
-    return {key: value for key, value in expected.items() if key not in changing_fields} == {
-        key: value for key, value in observed.items() if key not in changing_fields
-    }
+    changing = {"phase", "handoff", "marker_sha256"} | _OLD_LOCATIONS | {"ownership"}
+    return {key: value for key, value in expected.items() if key not in changing} == {
+        key: value for key, value in observed.items() if key not in changing
+    } and _stage_ownership(expected["ownership"]) == _stage_ownership(observed["ownership"])
 
 
 async def _native_stage_marker(session, ownership):
     await native.verify_reference_family_stage_ownership(session, ownership)
-    oid = ownership.relation_oids[0][1]
     observed = (
         (
             await session.execute(
-                text("""SELECT c.relowner::bigint AS owner_oid,n.nspowner::bigint AS schema_owner_oid,
- CASE WHEN octet_length(obj_description(c.oid,'pg_class'))<=131072
- THEN obj_description(c.oid,'pg_class') ELSE NULL END AS marker,
- c.relispartition AS attached,c.relkind='r' AND c.relpersistence='p'
- AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity AS ordinary
- FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=:oid"""),
-                {"oid": oid},
+                text("""SELECT
+ CASE WHEN octet_length(obj_description(c.oid,'pg_class'))<=131072 THEN obj_description(c.oid,'pg_class') ELSE NULL END AS marker,
+ c.relispartition AS attached,c.relkind='r' AND c.relpersistence='p' AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity AS ordinary
+ FROM pg_class c WHERE c.oid=to_regclass(:relation)"""),
+                {"relation": partition.relation_sql((ownership.schema_name, "nucc_taxonomy"))},
             )
         )
         .mappings()
@@ -231,45 +257,22 @@ async def _native_stage_marker(session, ownership):
         json.dumps(marker, sort_keys=True, separators=(",", ":")) == observed["marker"],
         "native marker is not canonical",
     )
-    _require(observed["owner_oid"] == observed["schema_owner_oid"] == marker["owner_oid"], "native Owner differs")
     _require(observed["attached"] is False or marker["phase"] == "closed", "writable stage is attached")
     return marker, observed["attached"]
 
 
 async def _copying_grants(session, stage):
     ownership = stage.ownership
-    oid = ownership.relation_oids[0][1]
-    entries = (
-        await session.execute(
-            text("""SELECT a.grantee::bigint,a.grantor::bigint,a.privilege_type,a.is_grantable
- FROM pg_class c,LATERAL aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) a WHERE c.oid=:oid"""),
-            {"oid": oid},
-        )
-    ).all()
-    owner = stage.marker["owner_oid"]
-    expected_edges = {(owner, owner, right, False) for right in partition._OWNER_RIGHTS}
-    expected_edges.add((stage.marker["publisher_oid"], owner, "SELECT", False))
-    expected_edges.add((stage.marker["builder_oid"], owner, "INSERT", False))
-    _require(set(entries) == expected_edges and len(entries) == len(expected_edges), "COPY privileges differ")
-    publisher = await session.scalar(
-        text("""SELECT rolcanlogin AND NOT (rolsuper OR rolcreaterole OR rolcreatedb
- OR rolreplication OR rolbypassrls) AND pg_has_role(oid,CAST(:owner AS oid),'USAGE')
- FROM pg_roles WHERE oid=:publisher"""),
-        {"owner": owner, "publisher": stage.marker["publisher_oid"]},
+    relation = partition.relation_sql((ownership.schema_name, "nucc_taxonomy"))
+    granted = await session.scalar(
+        text("""SELECT has_table_privilege(current_user,:relation,'INSERT')
+ AND has_schema_privilege(current_user,:schema,'USAGE') AND NOT has_schema_privilege(current_user,:schema,'CREATE')
+ AND NOT EXISTS(SELECT FROM pg_index WHERE indrelid=to_regclass(:relation))"""),
+        {"relation": relation, "schema": ownership.schema_name},
     )
-    _require(
-        publisher is True and len({owner, stage.marker["publisher_oid"], stage.marker["builder_oid"]}) == 3,
-        "Publisher role differs",
-    )
-    safe = await session.scalar(
-        text("""SELECT NOT EXISTS(SELECT FROM pg_index WHERE indrelid=:oid)
- AND NOT EXISTS(SELECT FROM pg_attribute WHERE attrelid=:oid AND attacl IS NOT NULL)
- AND NOT has_schema_privilege(current_user,CAST(:schema AS oid),'CREATE')
- AND has_schema_privilege(current_user,CAST(:schema AS oid),'USAGE')"""),
-        {"oid": oid, "schema": ownership.schema_oid},
-    )
-    _require(safe is True, "COPY heap is not isolated")
-    await native.require_native_read_catalog(session, (oid,))
+    _require(granted is True, "COPY grant unavailable or heap is not isolated")
+    address = await native._relation_oid(session, ownership.schema_name, "nucc_taxonomy")
+    await native.require_native_read_catalog(session, (address,))
 
 
 async def _source_stage_state(session, stage, *, copying, allow_pending_retry=False):
@@ -282,8 +285,8 @@ async def _source_stage_state(session, stage, *, copying, allow_pending_retry=Fa
         not attached or receipt is not None and run["status"] == "succeeded", "attached stage lacks its Owner outcome"
     )
     _require(
-        all(marker[field] == actor[field] for field in ("database_oid", "owner_oid", "node_id"))
-        and marker["builder_oid"] == actor["actor_oid"],
+        marker["node_id"] == actor["node_id"]
+        and ("builder_role" not in marker or marker["builder_role"] == actor["role"]),
         "Source actor differs",
     )
     _require(
@@ -298,10 +301,6 @@ async def _source_stage_state(session, stage, *, copying, allow_pending_retry=Fa
             all((run["progress"] or {}).get(field) == marker[field] for field in ("attempt_id", "attempt_started_at")),
             "original Source attempt changed",
         )
-    _require(
-        await session.scalar(text("SELECT to_regclass('mrf.import_run')::oid::bigint")) == marker["history_oid"],
-        "Source history changed",
-    )
     if copying:
         _require(
             receipt is None
@@ -312,14 +311,18 @@ async def _source_stage_state(session, stage, *, copying, allow_pending_retry=Fa
         )
         parent = await partition.capture_nucc_parent(session)
         _require(
-            all(parent[field] == marker[field] for field in ("owner_oid", "parent_oid", "parent_index_oid"))
-            and parent["child_oid"] == marker["previous_child_oid"],
+            parent["parent"] == _marker_locations(marker)["parent"]
+            and ("previous_child" not in marker or parent["child"] == partition.qualified(marker["previous_child"])),
             "Source parent changed",
         )
         from process.reference_family_result_generation import read_reference_family_result_generation_authority
 
         prior = await read_reference_family_result_generation_authority(session, importer_id="nucc", schema_name="mrf")
-        _require(prior.as_dict() == marker["source_predecessor"], "Source predecessor changed")
+        _require(
+            prior == control._source_generation(marker["source_predecessor"], predecessor=True)
+            and (prior.relations is None or prior.relations == (parent["child"],)),
+            "Source predecessor changed",
+        )
         await _copying_grants(session, stage)
     await control._recheck_source_transaction(session, actor)
     return run, marker
@@ -408,8 +411,8 @@ async def _source_copy_state(session, stage):
         "COPY Owner target changed",
     )
     _require(
-        all(marker[field] == actor[field] for field in ("database_oid", "owner_oid", "node_id"))
-        and marker["builder_oid"] == actor["actor_oid"],
+        marker["node_id"] == actor["node_id"]
+        and ("builder_role" not in marker or marker["builder_role"] == actor["role"]),
         "COPY Source actor differs",
     )
     _require(
@@ -423,10 +426,6 @@ async def _source_copy_state(session, stage):
         and (run["metrics"] or {}).get("nucc_handoff") is None
         and (run["metrics"] or {}).get("nucc_source_ready") is None,
         "COPY Source attempt is closed",
-    )
-    _require(
-        await session.scalar(text("SELECT to_regclass('mrf.import_run')::oid::bigint")) == marker["history_oid"],
-        "COPY Source history changed",
     )
     await _copying_grants(session, stage)
     return actor
@@ -452,27 +451,32 @@ def _source_files(source_files):
 
 
 def validate_source_ready(ready, marker):
-    """Decode input evidence only; the Owner must still validate its real frozen candidate."""
+    """Validate the exact ready-input edition without rewriting historical bytes or tokens."""
     marker = validate_source_stage_marker(marker)
     _require(
-        type(ready) is dict and set(ready) == READY_FIELDS and ready["contract"] == READY_CONTRACT,
+        type(ready) is dict
+        and set(ready) in (READY_FIELDS, _LEGACY_READY_FIELDS)
+        and ready["contract"] == READY_CONTRACT,
         "ready fields differ",
     )
     _require(
         all(
             ready[key] == marker[key]
             for key in ("preparation_id", "admission_sha256", "attempt_id", "attempt_started_at")
-        )
-        and type(ready["stage_oid"]) is int
-        and ready["stage_oid"] == _stage_ownership(marker["ownership"]).relation_oids[0][1],
+        ),
         "ready identity differs",
     )
+    if "stage" in ready:
+        ownership = _stage_ownership(marker["ownership"])
+        _require(partition.qualified(ready["stage"]) == (ownership.schema_name, "nucc_taxonomy"), "ready stage differs")
     files = _source_files(ready["source_files"])
     _require(
         type(ready["total_rows"]) is int and ready["total_rows"] == sum(item["row_count"] for item in files),
         "ready census differs",
     )
-    _require(ready_digest(ready) == ready["ready_sha256"], "ready digest differs")
+    control._digests(ready, ("ready_sha256",))
+    if "stage" in ready:
+        _require(ready_digest(ready) == ready["ready_sha256"], "ready digest differs")
     return json.loads(json.dumps(ready))
 
 
@@ -484,7 +488,7 @@ async def record_nucc_source_ready(session, stage, source_files):
         "contract": READY_CONTRACT,
         "preparation_id": marker["preparation_id"],
         "admission_sha256": marker["admission_sha256"],
-        "stage_oid": stage.ownership.relation_oids[0][1],
+        "stage": [stage.ownership.schema_name, "nucc_taxonomy"],
         "attempt_id": marker["attempt_id"],
         "attempt_started_at": marker["attempt_started_at"],
         "source_files": source_files,
@@ -494,8 +498,22 @@ async def record_nucc_source_ready(session, stage, source_files):
     ready_by_field = validate_source_ready(ready_by_field, marker)
     previous = (run["metrics"] or {}).get("nucc_source_ready")
     if previous is not None:
-        _require(previous == ready_by_field, "ready input changed")
-        return ready_by_field
+        previous = validate_source_ready(previous, marker)
+        _require(
+            all(
+                previous[key] == ready_by_field[key]
+                for key in (
+                    "preparation_id",
+                    "admission_sha256",
+                    "attempt_id",
+                    "attempt_started_at",
+                    "source_files",
+                    "total_rows",
+                )
+            ),
+            "ready input changed",
+        )
+        return previous
     changed = await session.scalar(
         text("""UPDATE mrf.import_run SET
  metrics=(metrics::jsonb||jsonb_build_object('nucc_source_ready',CAST(:ready AS jsonb)))::json,
@@ -652,11 +670,18 @@ async def consume_nucc_source_cancel(session, stage):
     if receipt is not None:
         await control._recheck_source_transaction(session, actor)
         return run
-    _require(NuccSourceStage.from_wire(stage.marker).ownership == stage.ownership, "cancellation ownership differs")
+    expected = NuccSourceStage.from_wire(stage.marker).ownership
+    _require(
+        all(
+            getattr(expected, name) == getattr(stage.ownership, name)
+            for name in ("importer_id", "dataset_id", "schema_name", "relation_names", "sequence_names")
+        ),
+        "cancellation ownership differs",
+    )
     _require(run["status"] in {"canceling", "canceled", "cancelled"}, "cancellation attempt differs")
     _require(
-        all(stage.marker[field] == actor[field] for field in ("database_oid", "owner_oid", "node_id"))
-        and stage.marker["builder_oid"] == actor["actor_oid"],
+        stage.marker["node_id"] == actor["node_id"]
+        and ("builder_role" not in stage.marker or stage.marker["builder_role"] == actor["role"]),
         "cancellation actor differs",
     )
     _require(
@@ -667,12 +692,8 @@ async def consume_nucc_source_cancel(session, stage):
     _require_cancel_inputs(stage, run)
     attempt = _source_pending_attempt(stage, run)
     removed = await session.scalar(
-        text("""SELECT to_regclass('mrf.import_run')::oid::bigint=:history_oid
- AND NOT EXISTS(SELECT FROM pg_class WHERE oid=:oid)
- AND to_regclass(:relation) IS NULL"""),
+        text("SELECT to_regclass(:relation) IS NULL"),
         {
-            "oid": stage.ownership.relation_oids[0][1],
-            "history_oid": stage.marker["history_oid"],
             "relation": f'"{stage.ownership.schema_name}"."nucc_taxonomy"',
         },
     )

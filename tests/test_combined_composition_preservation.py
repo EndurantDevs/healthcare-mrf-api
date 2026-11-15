@@ -13,7 +13,7 @@ from process import registry_composition_resume as resume
 from process import registry_initial_source_composition as offices
 from process import registry_publication_queue as queue
 from process.registry_source_recipe_composition import OFFICE_MAPPING_KEY
-from tests.test_registry_source_recipe_store_postgres import _example
+from tests.registry_source_recipe_support import _example
 from tests.test_verified_inventory_v2 import rows as witness_rows
 
 
@@ -110,7 +110,7 @@ async def test_only_flat_carry_prepares_final_artifact_before_current_office_pru
     async def current(*_args, **options):
         assert events == ([] if compact else ["artifact"])
         assert options["read_context"] == composition.SourceRecipeReadContext(
-            verified_office_inputs=native_offices if compact else (artifact.address_source, artifact.runtime_roles)
+            verified_office_inputs=native_offices if compact else (artifact.address_source, ())
         )
         events.append("current")
         return stage
@@ -131,7 +131,7 @@ async def test_verified_current_offices_precede_carry_alias_binding_union(monkey
     )
     connection = SimpleNamespace(execute=AsyncMock())
     inputs = composition._CompositionInputs(connection, None, object(), None, None)
-    target = composition._target(UUID(int=8), 7, 0, {})
+    copy_target = composition._target(UUID(int=8), 7, 0, {})
     events = []
 
     async def current(*_args):
@@ -143,13 +143,22 @@ async def test_verified_current_offices_precede_carry_alias_binding_union(monkey
         assert options == {"retain_source_bindings": False, "source_stage": stage}
         events.append("carry")
 
+    async def record_address(*arguments):
+        assert arguments[1] is copy_target and arguments[2] is prepared_artifact.address_source
+        events.clear()
+
+    prepared_artifact = SimpleNamespace(address_source=object())
+    monkeypatch.setattr(composition, "_record_composition_address", record_address)
     monkeypatch.setattr(composition, "_record_source_receipts", current)
     monkeypatch.setattr(composition, "_bindings", carry)
-    await composition._record_prepared_composition(inputs, target, ((), stage, object(), None, None, ()), "registry")
+    await composition._record_prepared_composition(
+        inputs, copy_target, ((), stage, prepared_artifact, None, None, ()), "registry"
+    )
+    # The address binding is recorded with admission, before the receipts and carried bindings.
     assert events == ["current", "carry"]
     connection.execute.assert_awaited_once_with(
         "CREATE INDEX IF NOT EXISTS provider_location_binding_location_idx "
-        f'ON "{target.schema_name}".provider_location_binding USING hash(location_key)'
+        f'ON "{copy_target.schema_name}".provider_location_binding USING hash(location_key)'
     )
 
 

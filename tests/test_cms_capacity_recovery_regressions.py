@@ -27,6 +27,7 @@ from process.provider_directory_cms_preparation import NonprofileAdmissionCheck
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import source_transaction
 from process.provider_directory_generic_source_storage import CONTRACT as SOURCE_STORAGE_CONTRACT
+from process.provider_directory_profile_capacity_signing_guard_contract import ProfileCapacitySigningGuardError
 from process.provider_directory_registry_network_metadata import fhir_network_binding_metadata
 from tests.provider_directory_cms_capacity_test_support import (
     cms_guard,
@@ -51,7 +52,7 @@ def _capacity_producer():
     runtime_dict = {
         "contract_id": runtime.PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID,
         **{
-            name: getattr(producer.lease.runtime_witness, name)
+            name: getattr(producer.lease.runtime, name)
             for name in runtime.CAPACITY_LEASE_LOCALLY_VERIFIED_RUNTIME_FIELDS
         },
     }
@@ -59,7 +60,9 @@ def _capacity_producer():
     profile_guard["healthcare_receipt"]["runtime_observation"] = deepcopy(runtime_dict)
     rehash_guard(profile_guard)
     profile_envelope = sign_guard(profile_guard)
-    producer.profile_lease = _verify(profile_envelope)
+    producer.profile_lease = _verify(
+        profile_envelope, expected_capacity_geometry_hash=profile_envelope["lease"]["capacity_geometry_hash"]
+    )
     producer.plan = replace(producer.plan, paired_profile_lease_digest=producer.profile_lease.lease_digest)
     assigned_guard = cms_guard(producer.plan, execution=producer.execution, paired_envelope=profile_envelope)
     assigned_guard["healthcare_receipt"]["runtime_observation"] = deepcopy(runtime_dict)
@@ -120,6 +123,7 @@ def _bind_capacity_importer(producer, database, events, insert):
     producer.fhir._profile_capacity_preflight_stored_receipt = fhir._profile_capacity_preflight_stored_receipt
     producer.fhir._assert_profile_capacity_receipt_open = fhir._assert_profile_capacity_receipt_open
     producer.fhir._profile_capacity_quiescence_sql = fhir._profile_capacity_quiescence_sql
+    producer.fhir._profile_capacity_quiescence = fhir._profile_capacity_quiescence
     producer.fhir._provider_directory_profile_capacity_consumption_identity = (
         fhir._provider_directory_profile_capacity_consumption_identity
     )
@@ -142,22 +146,10 @@ def _bind_capacity_importer(producer, database, events, insert):
 
 def _capacity_observation(producer):
     observation_dict = {
-        **{
-            name: getattr(producer.lease, name)
-            for name in ("database_system_identifier", "database_oid", "database_name")
-        },
         "temp_limit_bytes": producer.plan.temp_file_limit_bytes_per_backend,
         "query_parallel_workers": 0,
         "maintenance_parallel_workers": 0,
         "wal_lsn": "0/10",
-        **{
-            usage + "_tablespace_" + field: getattr(
-                next(tablespace for tablespace in producer.lease.tablespaces if tablespace.usage == usage),
-                "tablespace_" + field,
-            )
-            for usage in ("data", "temp")
-            for field in ("oid", "name")
-        },
     }
     return observation_dict
 
@@ -170,6 +162,7 @@ def capacity_case(monkeypatch):
     events, ledger = [], []
     database = _Database(events)
     rows_by_nonce, counters_dict, profile_row_dict = _capacity_receipts(producer, database, events, ledger)
+    monkeypatch.setattr(fhir, "db", database)
     observation_dict = _capacity_observation(producer)
     database_observation = AsyncMock(return_value=observation_dict)
     database_reader = capacity._database_observation
@@ -264,7 +257,7 @@ async def test_signed_admission_consumes_original_bytes_once_and_rechecks_readin
         ("nonprofile_changed", "profile_capacity_preflight_receipt_invalid"),
         ("paired_changed", "profile_capacity_preflight_receipt_invalid"),
         ("paired_consumed", "profile_capacity_preflight_receipt_expired"),
-        ("competing", "nonprofile_capacity_competing_admission"),
+        ("competing", "provider_directory_profile_capacity_preflight_not_quiescent"),
         ("runtime_changed", "runtime_observation_capacity_lease_runtime_mismatch"),
     ],
 )
@@ -900,11 +893,11 @@ async def test_admission_reads_effective_bounded_backend_before_signatures(capac
     [
         ("temp_limit_bytes", 0, "nonprofile_capacity_execution_limits_changed"),
         ("query_parallel_workers", 1, "nonprofile_capacity_execution_limits_changed"),
-        ("data_tablespace_oid", 1664, "nonprofile_capacity_tablespaces_changed"),
-        ("database_oid", 16402, "nonprofile_capacity_database_changed"),
+        ("maintenance_parallel_workers", 1, "nonprofile_capacity_execution_limits_changed"),
+        ("temp_limit_bytes", 1025, "nonprofile_capacity_execution_limits_changed"),
     ],
 )
-async def test_phase_rechecks_backend_identity_before_consumption(capacity_case, field, value, reason):
+async def test_phase_rechecks_execution_limits_before_consumption(capacity_case, field, value, reason):
     case = capacity_case
     admission = await _admission(case)
     case.observation[field] = value
@@ -915,7 +908,7 @@ async def test_phase_rechecks_backend_identity_before_consumption(capacity_case,
     case.producer.fhir._consume_provider_directory_profile_capacity_lease.assert_not_awaited()
 
 
-async def test_logging_rejects_changed_physical_tablespace_after_original_consumption(capacity_case):
+async def test_logging_rejects_changed_named_layout_after_original_consumption(capacity_case):
     case = capacity_case
     admission = await _admission(case)
     await _start(admission, case)
@@ -930,15 +923,15 @@ async def test_logging_rejects_changed_physical_tablespace_after_original_consum
         return original_all(query, **params)
 
     case.producer.fhir.db.all.side_effect = all_rows
-    case.producer.fhir._provider_directory_profile_relation_storage_fingerprint = AsyncMock(
-        return_value=SimpleNamespace(relation_oid=42, effective_tablespace_oids=(1664,))
+    case.producer.fhir._provider_directory_profile_capacity_relation_layout = AsyncMock(
+        return_value=SimpleNamespace(schema_name="synthetic", relation_name="changed")
     )
     before = deepcopy(case.ledger)
-    with pytest.raises(RuntimeError, match="nonprofile_capacity_physical_tablespace_changed"):
+    with pytest.raises(RuntimeError, match="nonprofile_capacity_relation_changed"):
         await admission.before_logging(case.producer.fhir, "synthetic", "staged_serving")
     assert case.ledger == before and admission._logged_relations == set()
-    case.producer.fhir._provider_directory_profile_relation_storage_fingerprint.assert_awaited_once_with(
-        42, expected_persistence="u"
+    case.producer.fhir._provider_directory_profile_capacity_relation_layout.assert_awaited_once_with(
+        0, expected_persistence="u"
     )
     case.producer.fhir._consume_provider_directory_profile_capacity_lease.assert_awaited_once()
 
@@ -963,15 +956,15 @@ async def test_changed_phase_plan_never_requests_authority(capacity_case):
 
 
 @pytest.mark.parametrize(
-    "fault,reason",
+    "fault,error_type,reason",
     [
-        ("colocated", "storage_continuation_colocated_observation_changed"),
-        ("timestamp_type", "storage_continuation_time_invalid"),
-        ("timestamp_text", "storage_continuation_time_invalid"),
-        ("timestamp_canonical", "storage_continuation_time_invalid"),
+        ("storage_class", ProfileCapacitySigningGuardError, "volume_order_invalid"),
+        ("timestamp_type", RuntimeError, "storage_continuation_time_invalid"),
+        ("timestamp_text", RuntimeError, "storage_continuation_time_invalid"),
+        ("timestamp_canonical", RuntimeError, "storage_continuation_time_invalid"),
     ],
 )
-async def test_signed_phase_observation_rejects_inconsistent_storage_and_time(capacity_case, fault, reason):
+async def test_signed_phase_observation_rejects_inconsistent_storage_and_time(capacity_case, fault, error_type, reason):
     case = capacity_case
     admission = await _admission(case)
     authority = case.producer.fresh_storage_envelope.side_effect
@@ -979,8 +972,8 @@ async def test_signed_phase_observation_rejects_inconsistent_storage_and_time(ca
     async def changed(request):
         envelope = await authority(request)
         witness = deepcopy(envelope["observation"])
-        if fault == "colocated":
-            witness["storage_observation"]["volumes"][1]["available_bytes"] -= 1
+        if fault == "storage_class":
+            witness["storage_observation"]["storage_classes"][1]["storage_class"] = "data"
         else:
             witness["issued_at"] = {
                 "timestamp_type": 2,
@@ -990,7 +983,7 @@ async def test_signed_phase_observation_rejects_inconsistent_storage_and_time(ca
         return _envelope(witness)
 
     case.producer.fresh_storage_envelope.side_effect = changed
-    with pytest.raises(RuntimeError, match=reason):
+    with pytest.raises(error_type, match=reason):
         await _start(admission, case)
     assert case.ledger == [] and not admission._started
     case.producer.fhir._consume_provider_directory_profile_capacity_lease.assert_not_awaited()
@@ -1083,21 +1076,9 @@ async def test_signed_preflight_runtime_must_match_actual_admission(capacity_cas
     guard["healthcare_receipt"]["runtime_observation"]["healthcare_source_commit"] = "f" * 40
     rehash_guard(guard)
     case.assigned_envelope = sign_guard(guard, cms=True)
-    old_nonce = case.producer.lease.nonce
-    case.producer.lease = _verify(
-        case.assigned_envelope, expected_capacity_geometry_hash=case.producer.plan.capacity_geometry_hash
-    )
-    del case.rows[old_nonce]
-    request = preflight.validated_capacity_preflight_request(guard["healthcare_request"])
-    case.rows[case.producer.lease.nonce] = capacity_contract.capacity_preflight_receipt_row_values(
-        request,
-        guard["healthcare_receipt"],
-        issued_at=preflight._utc_timestamp(guard["healthcare_receipt"]["issued_at"]),
-    )
-    admission = await _admission(case)
     before = deepcopy(case.rows)
-    with pytest.raises(RuntimeError, match="nonprofile_capacity_preflight_runtime_changed"):
-        await _start(admission, case)
+    with pytest.raises(ValueError, match="binding_mismatch: signing_preflight_guard"):
+        _verify(case.assigned_envelope, expected_capacity_geometry_hash=case.producer.plan.capacity_geometry_hash)
     assert case.rows == before and case.ledger == []
     case.producer.fhir._mark_profile_capacity_receipt_consumed.assert_not_awaited()
     case.producer.fhir._consume_provider_directory_profile_capacity_lease.assert_not_awaited()
@@ -1668,8 +1649,8 @@ async def test_publication_rechecks_one_local_owner_after_honest_cutover(capacit
         return original_all(query, **params)
 
     case.producer.fhir.db.all.side_effect = all_rows
-    case.producer.fhir._provider_directory_profile_relation_storage_fingerprint = AsyncMock(
-        return_value=SimpleNamespace(relation_oid=42, effective_tablespace_oids=(1663,))
+    case.producer.fhir._provider_directory_profile_capacity_relation_layout = AsyncMock(
+        return_value=SimpleNamespace(schema_name="synthetic", relation_name="staged_serving")
     )
     case.producer.fhir.db.scalar.side_effect = lambda query, **_params: (
         VALIDATION_TIME if "clock_timestamp" in query else 0
@@ -1681,14 +1662,14 @@ async def test_publication_rechecks_one_local_owner_after_honest_cutover(capacit
         async with admission.publication(case.producer.fhir, "synthetic"):
             async with case.producer.fhir.db.transaction():
                 await admission.assert_cutover_complete()
-                assert owner._cutover_binding is case.producer.fhir.db.binding
+                assert case.producer.fhir.db._transaction_binding() is not None
                 with pytest.raises(RuntimeError, match=reason):
                     await _exercise_cutover_fault(admission, owner, case, fault)
     finally:
         owner.fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(token)
     assert case.ledger == before and len(case.ledger) == 1
     assert not admission._cutover_active and not owner._cutover_active
-    assert owner._cutover_witness is None and owner._cutover_binding is None
+    assert owner._cutover_witness is None
     assert case.producer.fhir.db.binding is None
     assert case.producer.fresh_storage_envelope.await_count == 2
     case.producer.fhir._consume_provider_directory_profile_capacity_lease.assert_awaited_once()

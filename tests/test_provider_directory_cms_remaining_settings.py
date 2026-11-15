@@ -7,15 +7,12 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from process import entity_address_snapshot_preparation as address
-from process import network_fhir_retained_capture as capture
 from process import provider_directory_cms_receipt_guard as receipt
 from process import provider_directory_output_snapshot_journal as journal
 from process import provider_directory_profile_initial_guards as initial
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
-from tests.test_entity_address_preparation_cms import _migration
-from tests.test_network_fhir_retained_capture import retained
-from tests.test_provider_directory_cms_allocation_guard_contracts import _guard_specs
+from tests.test_cms_archive_transaction_migration import _load as _load_historical_migration
+from tests.test_cms_native_input_named_revision_migration import _migration as _named_revision_migration
 from tests.test_provider_directory_cms_callee_custody import _parse_statements
 from tests.test_provider_directory_output_snapshot_journal import _capability, _plan
 
@@ -58,8 +55,17 @@ def _guard_mapping(name, event, deferred, body, settings):
     )
 
 
+def _installed_body(name, body):
+    """Apply the named-revision migration to a guard body the original migration created."""
+    if name == "cms_serving_profile_transition":
+        return receipt.named_profile_transition_body('"example"')
+    for old, new, *_count in _named_revision_migration()._replacements("example").get(name, ()):
+        body = body.replace(old, new)
+    return body
+
+
 def _receipt_case(monkeypatch, group, settings):
-    migration, recorder = _migration(), Mock()
+    migration, recorder = _load_historical_migration("20260930100000"), Mock()
     monkeypatch.setattr(migration, "op", recorder)
     for name in (
         "_create_native_transition_guards",
@@ -75,7 +81,9 @@ def _receipt_case(monkeypatch, group, settings):
         if group == "profile"
         else ("cms_serving_receipt_immutable", "cms_serving_receipt_insert")
     )
-    guard_rows = [_guard_mapping(name, *_EVENTS[name], functions[name][-1], settings) for name in names]
+    guard_rows = [
+        _guard_mapping(name, *_EVENTS[name], _installed_body(name, functions[name][-1]), settings) for name in names
+    ]
     database = SimpleNamespace(
         all=AsyncMock(return_value=[SimpleNamespace(_mapping=guard) for guard in guard_rows]),
         scalar=AsyncMock(return_value=False),
@@ -144,38 +152,6 @@ async def test_initial_match_outside_transition_remains_old_only():
         await initial._assert_match_function(database, "example")
 
 
-def _retained_guard(monkeypatch, settings):
-    origin = retained().origin
-    body = _guard_specs(monkeypatch, origin.schema_name)["guard_tin_npi_connector_dataset_resource"][-1]
-    guard_by_field = dict(
-        guards=4, prosecdef=True, proconfig=deepcopy(settings), lanname="plpgsql", provolatile="v", prosrc=body
-    )
-    reader = SimpleNamespace(fetchrow=AsyncMock(return_value=guard_by_field))
-    candidate_check = AsyncMock()
-    monkeypatch.setattr(capture, "_origin_candidate_guards", candidate_check)
-    return reader, origin, guard_by_field, candidate_check
-
-
-@pytest.mark.parametrize("settings", [_OLD, _NEW])
-async def test_retained_source_guard_preserves_actual_source_body(monkeypatch, settings):
-    reader, origin, guard, candidate_check = _retained_guard(monkeypatch, settings)
-    await capture._origin_guard(reader, origin)
-    candidate_check.assert_awaited_once_with(reader, origin)
-    candidate_check.reset_mock()
-    guard["prosrc"] += " RETURN NULL;"
-    with pytest.raises(capture.RetainedFHIRCaptureError):
-        await capture._origin_guard(reader, origin)
-    candidate_check.assert_not_awaited()
-
-
-@pytest.mark.parametrize("settings", _BAD)
-async def test_retained_source_settings_near_misses_refuse(monkeypatch, settings):
-    reader, origin, _guard, candidate_check = _retained_guard(monkeypatch, settings)
-    with pytest.raises(capture.RetainedFHIRCaptureError):
-        await capture._origin_guard(reader, origin)
-    candidate_check.assert_not_awaited()
-
-
 def _plan_catalog():
     return dict(
         oid=41,
@@ -235,67 +211,49 @@ def _plan_catalog():
     )
 
 
-def _plan_case(monkeypatch, settings):
+def _plan_case(monkeypatch):
     capability = _capability()
     capability.policy = GenericSourcePolicy("source_schema", "plan_owner", "plan_publisher", ("reader",))
-    hook_by_field = dict(
-        tgname="pd_dataset_plan_owner",
-        tgtype=62,
-        tgenabled="A",
-        tgisinternal=False,
-        tgconstraint=0,
-        tgargs=b"",
-        tgqual=None,
-        tgoldtable=None,
-        tgnewtable=None,
-        proname="guard_pd_dataset_migration_owner",
-        nspname="source_schema",
-        prosrc=journal.candidate_functions("source_schema").split("$fn$", 2)[1],
-        prosecdef=False,
-        proconfig=deepcopy(settings),
-        pronargs=0,
-        trigger_result=True,
-        lanname="plpgsql",
-        table_method="heap",
-        function_owner="plan_owner",
-    )
+    native = _plan_catalog()
+    native["topology"]["hooks"] = 0
     capability.connection = SimpleNamespace(
-        fetch=AsyncMock(
-            side_effect=lambda *args: [_plan_catalog()] if args[0] == journal.OUTPUT_CATALOG_SQL else [hook_by_field]
-        ),
-        fetchval=AsyncMock(return_value=_plan()),
+        fetch=AsyncMock(return_value=[native]), fetchval=AsyncMock(return_value=_plan())
     )
     monkeypatch.setattr(journal.custody, "_require_capability", AsyncMock())
-    monkeypatch.setattr(journal, "storage_roles", AsyncMock(return_value=(17, [18])))
-    return capability, hook_by_field
+    return capability, native
 
 
-@pytest.mark.parametrize("settings", [_OLD, _NEW])
-async def test_output_journal_keeps_real_plan_hook_body(monkeypatch, settings):
-    capability, hook = _plan_case(monkeypatch, settings)
-    assert await journal._plan(capability) == _plan()
-    hook["prosrc"] += " RETURN NULL;"
-    with pytest.raises(RuntimeError, match="owner_hook_changed"):
+async def test_output_journal_reads_native_plan_without_retired_owner_hook(monkeypatch):
+    capability, _native = _plan_case(monkeypatch)
+    old_plan = _plan()
+    old_plan["legacy_extension"] = {"owner_token": {"copied": "opaque"}, "settings": None}
+    capability.connection.fetchval.return_value = old_plan
+    assert await journal._plan(capability) == old_plan
+    capability.connection.fetch.assert_awaited_once_with(
+        journal.OUTPUT_CATALOG_SQL, "source_schema", [journal.PLAN_ROOT]
+    )
+
+
+@pytest.mark.parametrize("damage", ["missing", "substituted"])
+async def test_output_journal_still_requires_complete_logical_plan(monkeypatch, damage):
+    capability, _native = _plan_case(monkeypatch)
+    plan = capability.connection.fetchval.return_value
+    key = next(iter(plan["tables"]))
+    plan["tables"].pop(key)
+    if damage == "substituted":
+        plan["tables"]["unrelated_table"] = {}
+    with pytest.raises(RuntimeError, match="plan_changed"):
         await journal._plan(capability)
 
 
-@pytest.mark.parametrize("field,value", [("function_owner", "unknown"), ("prosecdef", True), ("tgenabled", "D")])
-async def test_output_journal_other_hook_properties_stay_exact(monkeypatch, field, value):
-    capability, hook = _plan_case(monkeypatch, _NEW)
-    hook[field] = value
-    with pytest.raises(RuntimeError, match="owner_hook_changed"):
+@pytest.mark.parametrize("damage", ["column", "primary_key", "check"])
+async def test_output_journal_keeps_native_plan_layout_validation(monkeypatch, damage):
+    capability, native = _plan_case(monkeypatch)
+    if damage == "column":
+        native["columns"][0]["type"] = "text"
+    elif damage == "primary_key":
+        native["indexes"][0]["primary"] = False
+    else:
+        native["constraints"][1]["definition"] = "CHECK (true)"
+    with pytest.raises(RuntimeError, match="layout_changed"):
         await journal._plan(capability)
-
-
-@pytest.mark.parametrize("settings", _BAD)
-async def test_output_journal_settings_near_misses_refuse(monkeypatch, settings):
-    capability, _hook = _plan_case(monkeypatch, settings)
-    with pytest.raises(RuntimeError, match="owner_hook_changed"):
-        await journal._plan(capability)
-
-
-def test_address_sql_keeps_exact_settings_pair_and_original_authority():
-    assert "AND (p.proconfig=ARRAY['search_path=pg_catalog']::text[]" in address._CMS_GUARDS_SQL
-    assert "OR p.proconfig=ARRAY['search_path=pg_catalog, pg_temp']::text[])" in address._CMS_GUARDS_SQL
-    assert "p.pronamespace=c.relnamespace AND p.proname=t.tgname" in address._CMS_GUARDS_SQL
-    assert "AND NOT p.prosecdef" in address._CMS_GUARDS_SQL

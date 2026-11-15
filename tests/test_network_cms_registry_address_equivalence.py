@@ -112,7 +112,7 @@ def test_other_semantic_changes_remain_distinct(mutation):
 
 @pytest.mark.asyncio
 async def test_json_is_never_native_source_authority():
-    with pytest.raises(equivalence.RegistryCMSAddressEquivalenceError, match="natively captured"):
+    with pytest.raises(equivalence.RegistryCMSAddressEquivalenceError, match="content record"):
         await equivalence.validate_registry_cms_address_copy(None, source_capture={}, clone_ownership={})
 
 

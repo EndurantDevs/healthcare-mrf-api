@@ -17,7 +17,7 @@ _AUTHORITY_FIELDS = {
     "origin_lineage_id",
     "origin_generation",
     "published_at",
-    "relation_oids",
+    "relations",
 }
 _PROFILE_FIELDS = {
     "status",
@@ -32,8 +32,8 @@ _PROFILE_FIELDS = {
     "source_context_vector_hash",
     "executable_plan_hash",
     "profile_as_of",
-    "evidence_target_oid",
-    "profile_target_oid",
+    "evidence_target",
+    "profile_target",
     "evidence_rows",
     "profile_rows",
 }
@@ -48,9 +48,24 @@ _PAYLOAD_FIELDS = {
     "address",
     "doctors",
     "alias_generation",
-    "overlay_oid",
+    "overlay",
 }
-_ARCHIVE_FIELDS = {"target_oid", "from_revision", "to_revision", "native_input_hash", "delta_rows", "delta_sha256"}
+_LEGACY_AUTHORITY_FIELDS = (_AUTHORITY_FIELDS - {"relations"}) | {"relation_oids"}
+_LEGACY_PROFILE_FIELDS = (_PROFILE_FIELDS - {"evidence_target", "profile_target"}) | {
+    "evidence_target_oid",
+    "profile_target_oid",
+}
+_LEGACY_PAYLOAD_FIELDS = (_PAYLOAD_FIELDS - {"overlay"}) | {"overlay_oid"}
+_ARCHIVE_FIELDS = {
+    "target_schema",
+    "target_table",
+    "from_revision",
+    "to_revision",
+    "native_input_hash",
+    "delta_rows",
+    "delta_sha256",
+}
+_LEGACY_ARCHIVE_FIELDS = (_ARCHIVE_FIELDS - {"target_schema", "target_table"}) | {"target_oid"}
 _NATIVE_RELATIONS = (
     "doctor_clinician_address",
     "cms_doctor_education",
@@ -81,16 +96,19 @@ def _fields(value, expected):
 
 def validate_receipt_payload(payload):
     """Require fixed fields and a unique ordered vector; database guards verify their authority."""
-    _fields(payload, _PAYLOAD_FIELDS | ({"archive"} if isinstance(payload, dict) and "archive" in payload else set()))
+    optional = {"archive"} if isinstance(payload, dict) and "archive" in payload else set()
+    if not isinstance(payload, dict) or set(payload) not in (
+        _PAYLOAD_FIELDS | optional,
+        _LEGACY_PAYLOAD_FIELDS | optional,
+    ):
+        raise ValueError("cms_serving_receipt_fields_invalid")
     if "archive" in payload:
         _validate_archive(payload["archive"])
     if type(payload["contract_version"]) is not int or payload["contract_version"] != 1:
         raise ValueError("cms_serving_receipt_contract_invalid")
     _fields(payload["cms"], _PIN_FIELDS | {"release_id", "proof_version"})
     _fields(payload["selection"], {"proof_id", "fingerprint", "catalog_digest"})
-    _fields(payload["profile"], _PROFILE_FIELDS)
-    _fields(payload["address"], _AUTHORITY_FIELDS)
-    _fields(payload["doctors"], _AUTHORITY_FIELDS | {"importer_id"})
+    _validate_native_receipt_shapes(payload)
     if payload["expected_incumbent"] is not None:
         _fields(payload["expected_incumbent"], _PIN_FIELDS)
     pins = payload["desired_datasets"]
@@ -106,16 +124,31 @@ def validate_receipt_payload(payload):
     return payload
 
 
+def _validate_native_receipt_shapes(payload):
+    for document, shapes in (
+        (payload["profile"], (_PROFILE_FIELDS, _LEGACY_PROFILE_FIELDS)),
+        (payload["address"], (_AUTHORITY_FIELDS, _LEGACY_AUTHORITY_FIELDS)),
+        (payload["doctors"], (_AUTHORITY_FIELDS | {"importer_id"}, _LEGACY_AUTHORITY_FIELDS | {"importer_id"})),
+    ):
+        if not isinstance(document, dict) or set(document) not in shapes:
+            raise ValueError("cms_serving_receipt_fields_invalid")
+
+
 def _validate_archive(archive):
     """Keep the optional immutable merge result closed and bounded."""
-    _fields(archive, _ARCHIVE_FIELDS)
+    if type(archive) is not dict or set(archive) not in (_ARCHIVE_FIELDS, _LEGACY_ARCHIVE_FIELDS):
+        raise ValueError("cms_serving_archive_result_invalid")
+    if set(archive) == _ARCHIVE_FIELDS:
+        from db.plan_release_storage import storage_identifier
+
+        storage_identifier(archive["target_schema"])
+        if archive["target_table"] != "address_archive_v2":
+            raise ValueError("cms_serving_archive_result_invalid")
     if (
         any(
             type(archive[name]) is not int or not 0 <= archive[name] < 2**63
             for name in ("from_revision", "to_revision", "delta_rows")
         )
-        or type(archive["target_oid"]) is not int
-        or not 0 < archive["target_oid"] < 2**32
         or archive["to_revision"] != archive["from_revision"] + 2
         or any(
             not isinstance(archive[name], str) or re.fullmatch(r"[0-9a-f]{64}", archive[name]) is None
@@ -234,23 +267,15 @@ def decode_registry_source_pair_document(document):
 
 
 async def require_registry_receipt_owner(session, schema):
-    """Require the actual original same-task Source owner, not a retained publisher."""
+    """Require the bound Source publisher and its active configured schema."""
     from process.network_cms_registry_address_capture import native_driver
-    from process.provider_directory_generic_source_policy import bound_publisher, source_copy_session
+    from process.provider_directory_generic_source_policy import _require_active_source_session, bound_publisher
 
     publisher = bound_publisher()
-    if source_copy_session() is not session or schema != publisher.policy.schema:
+    _require_active_source_session(session)
+    if schema != publisher.policy.schema:
         raise ValueError("cms_serving_registry_original_session_required")
-    connection = await native_driver(session)
-    if connection is not publisher.connection or not connection.is_in_transaction():
-        raise ValueError("cms_serving_registry_original_session_required")
-    actor = await connection.fetchrow("SELECT session_user::text AS session,current_user::text AS current")
-    if actor is None or dict(actor) != {
-        "session": publisher.policy.publisher_role,
-        "current": publisher.policy.owner_role,
-    }:
-        raise ValueError("cms_serving_registry_original_session_required")
-    return connection
+    return await native_driver(session)
 
 
 async def append_serving_receipt(session, schema, payload, *, registry_source_pair=None):
@@ -258,6 +283,13 @@ async def append_serving_receipt(session, schema, payload, *, registry_source_pa
     if not session.in_transaction():
         raise ValueError("cms_serving_receipt_requires_transaction")
     payload = validate_receipt_payload(payload)
+    if (
+        "overlay" not in payload
+        or set(payload["profile"]) != _PROFILE_FIELDS
+        or set(payload["address"]) != _AUTHORITY_FIELDS
+        or set(payload["doctors"]) != _AUTHORITY_FIELDS | {"importer_id"}
+    ):
+        raise ValueError("cms_serving_receipt_named_fields_required")
     document = None
     if registry_source_pair is not None:
         document = registry_source_pair_document(registry_source_pair)

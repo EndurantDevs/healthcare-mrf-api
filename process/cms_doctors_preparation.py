@@ -39,28 +39,31 @@ class PreparedCMSDoctorsGeneration:
 
     schema: str
     import_date: str
-    stage_oids: tuple[tuple[str, str, int], ...]
+    stage_relations: tuple[tuple[str, str], ...]
     incumbent: archive.ReferenceFamilyIncumbent
     incumbent_authority: generation.ReferenceFamilyResultGenerationAuthority
     metrics: dict
     context: dict
     native_receipt: generation.ReferenceFamilyResultGenerationAuthority | None = None
     committed: bool = False
-    sealed_filenodes: tuple[tuple[int, int], ...] = ()
     source_provenance_json: str | None = None
 
     @property
     def relation_overrides(self) -> dict[str, str]:
         """Expose staged inputs for dependent preparation without changing public selectors."""
-        return {target: stage for target, stage, _oid in self.stage_oids}
+        return dict(prepared_stage_relations(self))
 
     async def mark_committed(self, receipt_id: str, payload: dict) -> None:
         """Consume ownership only from this family's exact committed common receipt."""
         native = _native()
         if native.db._transaction_binding() is not None or self.native_receipt is None:
             raise RuntimeError("cms_doctors_preparation_commit_pending")
-        authority = generation.validate_reference_family_result_generation_authority(payload.get("doctors"))
-        if authority != self.native_receipt or authority.relation_oids != tuple(oid for _, _, oid in self.stage_oids):
+        authority = generation.validate_reference_family_result_generation_authority(
+            payload.get("doctors"), declared_schema=self.schema
+        )
+        if authority != self.native_receipt or authority.relations != tuple(
+            (self.schema, target) for target, _stage in prepared_stage_relations(self)
+        ):
             raise RuntimeError("cms_doctors_preparation_receipt_changed")
         async with native.db.session() as session:
             if not await common_receipts.verify_historical_receipt(session, self.schema, receipt_id, payload):
@@ -70,33 +73,51 @@ class PreparedCMSDoctorsGeneration:
         self.metrics.update(published=True, publication_state="published")
 
 
+def prepared_stage_relations(prepared):
+    """Decode declared names without interpreting or rewriting saved physical tokens."""
+    recorded = getattr(prepared, "stage_relations", None)
+    has_legacy_names = recorded is None
+    if has_legacy_names:
+        recorded = getattr(prepared, "stage_oids", None)
+    width = 3 if has_legacy_names else 2
+    if not isinstance(recorded, tuple) or any(
+        not isinstance(entry, tuple) or len(entry) != width for entry in recorded
+    ):
+        raise RuntimeError("cms_doctors_preparation_family_incomplete")
+    names = tuple((entry[0], entry[1]) for entry in recorded)
+    expected_relations = tuple(
+        (model.__tablename__, _native().make_class(model, prepared.import_date).__tablename__) for model in _models()
+    )
+    if names != expected_relations:
+        raise RuntimeError("cms_doctors_preparation_family_incomplete")
+    return names
+
+
 async def _stage_inventory(session, schema, import_date):
-    """Capture only existing relations under this completed import's closed family names."""
-    owned_stages = []
+    """Capture existing stage names from the closed native model family."""
+    stages = []
     for model in _models():
         stage = _native().make_class(model, import_date).__tablename__
-        oid = await session.scalar(
-            text("SELECT to_regclass(:relation)::oid::bigint"), {"relation": f"{schema}.{stage}"}
-        )
-        if oid is not None:
-            owned_stages.append((model.__tablename__, stage, int(oid)))
-    return tuple(owned_stages)
+        if await session.scalar(text("SELECT to_regclass(:relation) IS NOT NULL"), {"relation": f"{schema}.{stage}"}):
+            stages.append((model.__tablename__, stage))
+    return tuple(stages)
 
 
-async def _assert_stage(session, schema, stage, expected_oid, *, logged):
-    """Reject a missing or replaced physical table before touching its name."""
-    observed = (
-        await session.execute(
-            text(
-                "SELECT oid::bigint,relpersistence::text,pg_relation_filenode(oid)::bigint "
-                "FROM pg_class WHERE oid=to_regclass(:relation) AND relkind='r'"
-            ),
-            {"relation": f"{schema}.{stage}"},
-        )
-    ).one_or_none()
-    if observed is None or observed[0] != expected_oid or (logged and observed[1] != "p"):
+async def _assert_stage(session, schema, stage, *, logged):
+    """Require the declared ordinary heap and actual native read access."""
+    relation = f"{archive._quoted(schema)}.{archive._quoted(stage)}"
+    observed = await session.scalar(
+        text(
+            "SELECT relkind='r' AND relpersistence IN ('p','u') AND NOT relispartition "
+            "AND NOT relrowsecurity AND NOT relforcerowsecurity "
+            "AND NOT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) "
+            "AND (:logged IS FALSE OR relpersistence='p') FROM pg_class c WHERE oid=to_regclass(:relation)"
+        ),
+        {"relation": relation, "logged": logged},
+    )
+    if observed is not True:
         raise RuntimeError("cms_doctors_prepared_stage_changed")
-    return int(observed[2])
+    await session.execute(text(f"SELECT 1 FROM {relation} LIMIT 0"))
 
 
 async def _assert_stage_indexes(session, schema, stage_cls):
@@ -123,10 +144,10 @@ async def _assert_stage_indexes(session, schema, stage_cls):
 async def _finalize_stages(prepared):
     """Finish persistence, indexes, and statistics outside the serving transaction."""
     native = _native()
-    for model, (_target, stage, oid) in zip(_models(), prepared.stage_oids, strict=True):
+    for model, (_target, stage) in zip(_models(), prepared_stage_relations(prepared), strict=True):
         async with source_transaction(native.db) as session:
             await archive._lock_family(session, prepared.schema, (stage,), "ACCESS EXCLUSIVE", nowait=True)
-            await _assert_stage(session, prepared.schema, stage, oid, logged=False)
+            await _assert_stage(session, prepared.schema, stage, logged=False)
             stage_cls = native.make_class(model, prepared.import_date)
             await native._create_stage_indexes(stage_cls, prepared.schema)
             await session.execute(text(f'ALTER TABLE "{prepared.schema}"."{stage}" SET LOGGED'))
@@ -135,55 +156,45 @@ async def _finalize_stages(prepared):
 
 
 async def assert_prepared_cms_doctors_seal(session, prepared, *, applied=False):
-    """Re-attest native custody and exact physical storage under the caller's locks."""
+    """Require complete native model layout and access for the declared prepared or applied family."""
     from process.cms_doctors_immutable import require_doctors_storage
 
-    if tuple(oid for oid, _filenode in prepared.sealed_filenodes) != tuple(
-        oid for _target, _stage, oid in prepared.stage_oids
-    ):
-        raise RuntimeError("cms_doctors_prepared_physical_seal_changed")
-    pairs = tuple((target if applied else stage, oid) for target, stage, oid in prepared.stage_oids)
-    await require_doctors_storage(session, schema_name=prepared.schema, relation_pairs=pairs)
-    for name, oid in pairs:
-        if (
-            await _assert_stage(session, prepared.schema, name, oid, logged=True)
-            != dict(prepared.sealed_filenodes)[oid]
-        ):
-            raise RuntimeError("cms_doctors_prepared_physical_seal_changed")
+    names = tuple(target if applied else stage for target, stage in prepared_stage_relations(prepared))
+    await require_doctors_storage(session, schema_name=prepared.schema, relation_names=names)
 
 
 async def _seal_finalized_stages(prepared):
-    """Close grants only after all source payload, indexes and set checks finish."""
+    """Close actual native writes only after source data, indexes and set checks finish."""
     from process.cms_doctors_immutable import seal_doctors_stages
 
     async with source_transaction(_native().db) as session, archive._bounded_capture(session):
-        stages = tuple(stage for _target, stage, _oid in prepared.stage_oids)
+        stages = tuple(stage for _target, stage in prepared_stage_relations(prepared))
         await archive._lock_family(session, prepared.schema, stages, "ACCESS EXCLUSIVE", nowait=True)
         await seal_doctors_stages(_native().db, prepared.schema, prepared.import_date)
-        prepared.sealed_filenodes = tuple(
-            [
-                (oid, await _assert_stage(session, prepared.schema, stage, oid, logged=True))
-                for _target, stage, oid in prepared.stage_oids
-            ]
-        )
         await assert_prepared_cms_doctors_seal(session, prepared)
 
 
-async def _drop_owned_stages(schema, stage_oids):
-    """Recheck OIDs under native locks and preserve any replacement bearing a reused name."""
+async def _drop_owned_stages(schema, stage_relations):
+    """Drop declared private stages under bounded native DDL, without searching former IDs."""
     native = _native()
+    from process.cms_doctors_immutable import _shape
+
+    models_by_target = {model.__tablename__: model for model in _models()}
     async with source_transaction(native.db) as session:
         await session.execute(text("SET LOCAL lock_timeout='500ms'"))
         await session.execute(text("SET LOCAL statement_timeout='5s'"))
-        for _target, stage, expected_oid in reversed(stage_oids):
-            actual_oid = await session.scalar(
+        for target, stage in reversed(stage_relations):
+            if not await session.scalar(
+                text("SELECT to_regclass(:relation) IS NOT NULL"), {"relation": f"{schema}.{stage}"}
+            ):
+                continue
+            await archive._lock_family(session, schema, (stage,), "ACCESS SHARE", nowait=True)
+            await _assert_stage(session, schema, stage, logged=False)
+            address = await session.scalar(
                 text("SELECT to_regclass(:relation)::oid::bigint"), {"relation": f"{schema}.{stage}"}
             )
-            if actual_oid != expected_oid:
-                continue
-            await archive._lock_family(session, schema, (stage,), "ACCESS EXCLUSIVE", nowait=True)
-            await _assert_stage(session, schema, stage, expected_oid, logged=False)
-            await session.execute(text(f'DROP TABLE "{schema}"."{stage}" RESTRICT'))
+            await _shape(session, models_by_target[target], address, indexed=False)
+            await session.execute(text(f"DROP TABLE {archive._quoted(schema)}.{archive._quoted(stage)} RESTRICT"))
 
 
 async def cleanup_prepared_cms_doctors(prepared):
@@ -192,16 +203,16 @@ async def cleanup_prepared_cms_doctors(prepared):
         raise RuntimeError("cms_doctors_preparation_cleanup_transaction_active")
     try:
         if not prepared.committed:
-            await _shielded_cleanup(prepared.schema, prepared.stage_oids)
+            await _shielded_cleanup(prepared.schema, prepared_stage_relations(prepared))
     finally:
         await discard_doctors_identities(
             _native().db, {"import_date": prepared.import_date, "context": prepared.context}
         )
 
 
-async def _shielded_cleanup(schema, stage_oids):
+async def _shielded_cleanup(schema, stage_relations):
     """Finish bounded owned cleanup even when the preparation task is cancelled."""
-    task = asyncio.create_task(_drop_owned_stages(schema, stage_oids))
+    task = asyncio.create_task(_drop_owned_stages(schema, stage_relations))
     is_cancelled = False
     while not task.done():
         try:
@@ -221,8 +232,8 @@ async def _capture_incumbent(session, schema):
         importer_id=_IMPORTER,
         schema_name=schema,
     )
-    if authority.relation_oids is not None and authority.relation_oids != tuple(
-        oid for _, oid in incumbent.relation_oids
+    if authority.relations is not None and authority.relations != tuple(
+        (schema, name) for name, address in incumbent.relation_oids if address is not None
     ):
         raise RuntimeError("cms_doctors_incumbent_authority_changed")
     return incumbent, authority
@@ -246,10 +257,10 @@ async def prepare_cms_doctors_generation(ctx):
     schema = archive._schema_name(os.getenv("HLTHPRT_DB_SCHEMA") or "mrf")
     await native.ensure_database(False)
     async with source_transaction(native.db) as session:
-        stage_oids = await _stage_inventory(session, schema, import_date)
+        stage_relations = await _stage_inventory(session, schema, import_date)
     prepared = None
     try:
-        if len(stage_oids) != len(_models()):
+        if len(stage_relations) != len(_models()):
             raise RuntimeError("cms_doctors_preparation_family_incomplete")
         async with source_transaction(native.db) as session:
             incumbent, authority = await _capture_incumbent(session, schema)
@@ -257,7 +268,9 @@ async def prepare_cms_doctors_generation(ctx):
         async with source_transaction(native.db):
             stage_rows = int(await native.db.scalar(f'SELECT count(*) FROM "{schema}"."{stage_cls.__tablename__}"'))
         metrics = await native._prepare_cms_doctors_sources(ctx, stage_cls, schema, stage_rows)
-        prepared = PreparedCMSDoctorsGeneration(schema, import_date, stage_oids, incumbent, authority, metrics, context)
+        prepared = PreparedCMSDoctorsGeneration(
+            schema, import_date, stage_relations, incumbent, authority, metrics, context
+        )
         if "artifact" in metrics:
             prepared.source_provenance_json = mint_doctors_source_provenance(metrics)
         await _finalize_stages(prepared)
@@ -272,7 +285,7 @@ async def prepare_cms_doctors_generation(ctx):
             if prepared is None or not prepared.committed:
                 if native.db._transaction_binding() is not None:
                     raise RuntimeError("cms_doctors_preparation_cleanup_transaction_active")
-                await _shielded_cleanup(schema, stage_oids)
+                await _shielded_cleanup(schema, stage_relations)
         finally:
             if native.db._transaction_binding() is None:
                 await discard_doctors_identities(native.db, ctx)
@@ -301,7 +314,9 @@ async def apply_prepared_cms_doctors_generation(prepared):
 async def _apply_prepared_family(prepared, native, session):
     """Keep all native postconditions inside the same rollback boundary as the cut."""
     stage_cls = native.make_class(native.DoctorClinicianAddress, prepared.import_date)
-    await native._lock_cms_doctors_publication(session, stage_cls, prepared.schema, prepared.import_date)
+    await native._lock_cms_doctors_publication(
+        session, stage_cls, prepared.schema, prepared.import_date, stage_read_only=True
+    )
     await archive._verify_incumbent(session, prepared.incumbent)
     authority = await generation.read_reference_family_result_generation_authority(
         session,
@@ -311,8 +326,8 @@ async def _apply_prepared_family(prepared, native, session):
     )
     if authority != prepared.incumbent_authority:
         raise RuntimeError("cms_doctors_incumbent_authority_changed")
-    for model, (_target, stage, oid) in zip(_models(), prepared.stage_oids, strict=True):
-        await _assert_stage(session, prepared.schema, stage, oid, logged=True)
+    for model, (_target, stage) in zip(_models(), prepared_stage_relations(prepared), strict=True):
+        await _assert_stage(session, prepared.schema, stage, logged=True)
         await _assert_stage_indexes(session, prepared.schema, native.make_class(model, prepared.import_date))
     await assert_prepared_cms_doctors_seal(session, prepared)
     receipt = await native._apply_locked_cms_doctors_stage(
@@ -321,6 +336,6 @@ async def _apply_prepared_family(prepared, native, session):
         prepared.import_date,
         identity_ctx={"import_date": prepared.import_date, "context": prepared.context},
     )
-    if receipt.relation_oids != tuple(oid for _, _, oid in prepared.stage_oids):
+    if receipt.relations != tuple((prepared.schema, target) for target, _stage in prepared_stage_relations(prepared)):
         raise RuntimeError("cms_doctors_preparation_result_changed")
     return receipt

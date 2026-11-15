@@ -25,14 +25,14 @@ async def registered_scratch(schema, name):
 async def test_capability_rejects_unissued_foreign_empty_or_retired_identity(monkeypatch, damage):
     async with parallel_preparation(monkeypatch) as (_sql, _database, _schema, _authority, _scope):
         capability = admitted.issue_row_scratch()
-        supplied = admitted._RowScratchCapability() if damage == "forged" else capability
+        supplied = object() if damage == "forged" else capability
         token = None
         if damage == "foreign_scope":
             token = admitted._ADMISSION.set(None)
         elif damage == "retired":
             admitted.finish_row_scratch(capability)
         try:
-            with pytest.raises(RuntimeError, match="scratch capability"):
+            with pytest.raises(RuntimeError, match="scratch scope|scratch capability|unregistered"):
                 async with admitted.native_transaction(row_scratch=supplied):
                     pytest.fail("invalid capability reached payload work")
         finally:
@@ -43,7 +43,7 @@ async def test_capability_rejects_unissued_foreign_empty_or_retired_identity(mon
 
 
 @pytest.mark.asyncio
-async def test_capability_cannot_be_swapped_inherited_or_enter_existing_broad_transaction(monkeypatch):
+async def test_nested_scratch_entry_preserves_active_transaction_locks(monkeypatch):
     async with (
         parallel_preparation(monkeypatch) as (_sql, _database, schema, _authority, _scope),
         registered_scratch(schema, "first_private") as first,
@@ -57,11 +57,11 @@ async def test_capability_cannot_be_swapped_inherited_or_enter_existing_broad_tr
             with pytest.raises(RuntimeError, match="replace transaction locks"):
                 async with admitted.native_transaction(row_scratch=second):
                     pytest.fail("another runner replaced the selected capability")
-            with pytest.raises(RuntimeError, match="scratch capability"):
+            with pytest.raises(RuntimeError, match="cannot run in a child asyncio task"):
                 await asyncio.create_task(admitted.tuned_status("SELECT 1"))
-            with pytest.raises(RuntimeError, match="scratch capability"):
+            with pytest.raises(RuntimeError, match="cannot run in a child asyncio task"):
                 await asyncio.create_task(admitted.drop_stage(schema, "second_private"))
-            with pytest.raises(RuntimeError, match="scratch capability"):
+            with pytest.raises(RuntimeError, match="cannot run in a child asyncio task"):
                 await asyncio.create_task(
                     admitted.create_stage_sql(
                         schema,
@@ -73,23 +73,20 @@ async def test_capability_cannot_be_swapped_inherited_or_enter_existing_broad_tr
 
 
 @pytest.mark.asyncio
-async def test_replaced_physical_oid_is_rejected_and_preserved_before_payload(monkeypatch):
+async def test_named_scratch_reads_equivalent_copied_relation(monkeypatch):
     async with (
         parallel_preparation(monkeypatch) as (_sql, database, schema, _authority, scope),
-        registered_scratch(schema, "replaced_private") as capability,
+        registered_scratch(schema, "replaced_private") as state,
     ):
-        original_oid = scope.owned_oids["replaced_private"]
+        await database.status(f"INSERT INTO {schema}.replaced_private VALUES ('kept')")
         await database.status(f"ALTER TABLE {schema}.replaced_private RENAME TO preserved_private")
-        await database.status(f"CREATE TABLE {schema}.replaced_private(marker text)")
-        replacement_oid = await database.scalar(f"SELECT '{schema}.replaced_private'::regclass::oid::bigint")
+        await database.status(f"CREATE TABLE {schema}.replaced_private (LIKE {schema}.preserved_private INCLUDING ALL)")
+        await database.status(f"INSERT INTO {schema}.replaced_private SELECT * FROM {schema}.preserved_private")
         try:
-            with pytest.raises(RuntimeError, match="relation_changed"):
-                async with admitted.native_transaction(row_scratch=capability):
-                    pytest.fail("replacement reached payload work")
-            assert (
-                await database.scalar(f"SELECT '{schema}.replaced_private'::regclass::oid::bigint") == replacement_oid
-            )
-            assert scope.row_scratch_owners["replaced_private"][0] == original_oid
+            async with admitted.native_transaction(row_scratch=state):
+                assert await database.scalar(f"SELECT marker FROM {schema}.replaced_private") == "kept"
+            assert "replaced_private" in scope.owned_relations
+            assert scope.row_scratch_owners["replaced_private"] is state
         finally:
             await database.status(f"DROP TABLE {schema}.replaced_private")
             await database.status(f"ALTER TABLE {schema}.preserved_private RENAME TO replaced_private")

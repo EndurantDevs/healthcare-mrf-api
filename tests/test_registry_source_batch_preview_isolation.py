@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Source resolution and retained-impact preview each own their isolation level."""
+"""Source resolution and retained-impact preview read one registry through one session."""
 
 from types import SimpleNamespace
 
@@ -52,10 +52,12 @@ def _preview_inputs(session, configured):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("configured", [False, True])
-async def test_source_batch_preview_isolation_is_owned_by_each_transaction(monkeypatch, configured):
-    """Both preview paths retain their own source snapshot and exact selected identity."""
+async def test_source_batch_selection_and_preview_share_one_registry_session(monkeypatch, configured):
+    """The selection is resolved on the same session that previews it, never on another registry."""
     session = PreviewSession()
     request, service, compact_by_field = _preview_inputs(session, configured)
+    reader = SimpleNamespace(name="configured reader")
+    preview_driver = reader if configured else session
     document, actor, command = object(), object(), object()
     preview_calls = []
 
@@ -64,27 +66,32 @@ async def test_source_batch_preview_isolation_is_owned_by_each_transaction(monke
         return session
 
     async def resolve(actual_driver, actual_document, actual_actor, *, allow_unbound):
-        assert (actual_driver, actual_document, actual_actor) == (session, document, actor)
+        # A configured preview never resolves its selection on the request database.
+        assert (actual_driver, actual_document, actual_actor) == (preview_driver, document, actor)
         assert allow_unbound is True
-        assert session.transaction_number == 1 and session.isolation == "repeatable read"
+        if not configured:
+            assert session.transaction_number == 1 and session.isolation == "repeatable read"
         return compact_by_field, command
 
     async def checked(actual_driver, actual_command, actual_actor, head, *, summary_only):
         assert (actual_driver, actual_command, actual_actor, head) == (session, command, actor, 1)
         assert summary_only is True
-        assert session.transaction_number == 2 and session.isolation == "repeatable read"
+        assert session.transaction_number == 1 and session.isolation == "repeatable read"
         preview_calls.append("fallback")
         return {"selected_count": 178, "unresolved_count": 0}
 
-    async def configured_preview(actual_request, actual_service, actual_command, actual_actor, head, *, summary_only):
+    async def configured_preview(
+        actual_request, actual_service, actual_command, actual_actor, head, *, summary_only, resolve
+    ):
         assert (actual_request, actual_service, actual_command, actual_actor, head) == (
             request,
             service,
-            command,
+            None,
             actor,
-            1,
+            None,
         )
         assert summary_only is True and session.isolation is None
+        assert await resolve(reader) == (command, 1)
         preview_calls.append("configured")
         return {"selected_count": 178, "unresolved_count": 0}
 
@@ -102,8 +109,6 @@ async def test_source_batch_preview_isolation_is_owned_by_each_transaction(monke
         "selection_count": 178,
         "selection_sha256": compact_by_field["selection_sha256"],
     }
-    expected_statements = [(1, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")]
-    if not configured:
-        expected_statements.append((2, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+    expected_statements = [] if configured else [(1, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")]
     assert session.statements == expected_statements
     assert preview_calls == ["configured" if configured else "fallback"]

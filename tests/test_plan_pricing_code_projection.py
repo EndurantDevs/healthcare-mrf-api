@@ -20,6 +20,7 @@ from api.plan_pricing_code_read import CodePricingCapability
 from api.plan_pricing_code_storage import _membership_views, attachment_name
 from api.plan_pricing_projection_contract import code_projection_scope, current_code_projection, table
 from api.plan_release_serving import PlanReleaseServingSelection, PlanReleaseSnapshotBinding
+from api.ptg_membership_contract import SPEC as MEMBERSHIP_SPEC
 
 
 def _selection():
@@ -46,7 +47,14 @@ def _source():
         "read_identity_digest": "e" * 64,
         "source_identity": {"snapshot_id": "synthetic-snapshot", "code_system": "CPT", "code": "27447"},
         "code_rows": [{"code_key": 1, "occurrence_count": 3}],
-        "membership": {"active_attachment": {"name": "pm_" + "a" * 52, "relation_oid": 1001}},
+        "membership": {
+            "active_attachment": {"schema_name": "hp_snapshot_retention", "name": "pm_" + "a" * 52},
+            "storage": {
+                "dataset_id": "00000000-0000-0000-0000-000000000001",
+                "schema_name": "reference_family_archive_00000000000000000000000000000001",
+                "relation_names": list(MEMBERSHIP_SPEC.table_names),
+            },
+        },
     }
 
 
@@ -101,8 +109,7 @@ def test_complete_alias_coverage_is_part_of_the_identity():
     membership_by_key = {
         "projection_id": "a" * 64,
         "content_digest": "b" * 64,
-        "active_attachment": {"name": "pm_" + "a" * 52, "relation_oid": 1},
-        "storage": {"schema_oid": 2},
+        **_source()["membership"],
         "code_coverage": [{"code_key": 1, "occurrence_count": 2}, {"code_key": 2, "occurrence_count": 3}],
     }
     source = source_coverage(
@@ -136,8 +143,8 @@ def test_normal_worker_params_are_closed(changes):
         validate_params(params_by_name | changes)
 
 
-def test_native_membership_dependencies_cannot_be_forged_by_names():
-    assert _membership_views(_identity()) == {"pm_" + "a" * 52: 1001}
+def test_membership_dependencies_require_safe_declared_names():
+    assert _membership_views(_identity()) == ("pm_" + "a" * 52,)
     source = _source()
     source["membership"]["active_attachment"]["name"] = 'unsafe".table'
     with pytest.raises(Exception, match="dependency identity"):
@@ -344,8 +351,7 @@ async def test_authoritative_physical_aliases_are_validated_but_materialized_onc
         "code_coverage": [{"code_key": 1, "occurrence_count": 3}],
         "projection_id": "a" * 64,
         "content_digest": "b" * 64,
-        "active_attachment": {"name": "pm_" + "a" * 52, "relation_oid": 1},
-        "storage": {"schema_oid": 2},
+        **_source()["membership"],
     }
     monkeypatch.setattr(build, "membership_receipt", lambda _found: member_by_key)
     monkeypatch.setattr(build, "load_sealed_code_rows", AsyncMock(return_value=[{"code_key": 1, "rate_count": 3}]))
@@ -531,3 +537,27 @@ def test_code_native_fixture_requires_an_explicit_database(monkeypatch):
     monkeypatch.delenv("HLTHPRT_PLAN_PRICING_CODE_TEST_DSN", raising=False)
     with pytest.raises(pytest.skip.Exception, match="HLTHPRT_PLAN_PRICING_CODE_TEST_DSN is not set"):
         _url()
+
+
+def test_retained_source_coordinates_are_opaque_but_logical_source_commitments_remain():
+    from api.plan_pricing_code_contract import logical_identity
+    from api.ptg2_serving import PTG2_SCHEMA
+
+    old = copy.deepcopy(_identity())
+    old["sources"][0]["source_identity"]["source_storage"] = {
+        "database_oid": None,
+        "schema_oid": True,
+        "relation_oids": [["ptg2_v4_snapshot_map_root", False]],
+        "attestation_digest": "a" * 64,
+    }
+    retained = copy.deepcopy(old)
+    current = copy.deepcopy(old)
+    current["sources"][0]["source_identity"]["source_storage"] = {
+        "schema_name": PTG2_SCHEMA,
+        "relation_names": ["ptg2_v4_snapshot_map_root"],
+    }
+    assert logical_identity(old) == logical_identity(current)
+    assert old == retained
+    changed = copy.deepcopy(current)
+    changed["sources"][0]["source_identity"]["snapshot_id"] = "another-snapshot"
+    assert logical_identity(old) != logical_identity(changed)

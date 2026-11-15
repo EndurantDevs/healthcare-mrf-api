@@ -212,7 +212,7 @@ async def test_quality_publish_generation_rolls_back_with_all_table_swaps(monkey
                 importer_id="provider-quality",
                 schema_name=schema,
             )
-            assert authority.local_generation == 0 and authority.relation_oids is None
+            assert authority.local_generation == 0 and authority.relations is None
 
         monkeypatch.setattr(publish_helpers, "publish_local_reference_family_generation", real_publish)
         await publish_helpers._publish_by_table_rename(classes, schema)
@@ -223,12 +223,9 @@ async def test_quality_publish_generation_rolls_back_with_all_table_swaps(monkey
                 schema_name=schema,
             )
             assert authority.local_generation == 1
-            assert authority.relation_oids == await generation.current_reference_family_relation_oids(
-                session,
-                importer_id="provider-quality",
-                schema_name=schema,
-            )
-            assert len(authority.relation_oids) == 8
+            assert authority.relations == generation.declared_reference_family_relations("provider-quality", schema)
+            # The staged heaps now serve under the declared names.
+            assert await _relation_oids(session, schema, relation_names) == stage_oids
             assert await session.scalar(text(f"SELECT to_regclass('{schema}.procedure_taxonomy_signal')")) is not None
             assert await session.scalar(text(f"SELECT to_regclass('{schema}.pricing_quality_run')")) is None
             with pytest.raises(RuntimeError, match="evidence prevents downgrade"):
@@ -405,8 +402,6 @@ async def _activate_quality(session, restored, manifest, incumbent, owner_oid, r
         cutover=archive.ReferenceFamilyCutoverAuthority(
             "b" * 64,
             archive.CONTRACT,
-            owner_oid,
-            owner_oid,
             "manual",
             serving_generation,
         ),

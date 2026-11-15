@@ -51,7 +51,10 @@ from process.ext.utils import (
     return_checksum,
 )
 from process.live_progress import enqueue_live_progress
-from process.provider_directory_cms_native_inputs import prepare_local_native_input_publication
+from process.provider_directory_cms_native_inputs import (
+    finish_local_native_input_publication,
+    prepare_local_native_input_publication,
+)
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -2109,7 +2112,7 @@ async def _publish_provider_enrichment_tables(
     db_schema: str,
 ) -> None:
     async with db.transaction() as session:
-        await prepare_local_native_input_publication(
+        native_input_publication = await prepare_local_native_input_publication(
             session,
             ledger_schema=db_schema,
             relations=tuple(
@@ -2143,6 +2146,8 @@ async def _publish_provider_enrichment_tables(
                     f"{db_schema}.{stage_model.__tablename__}_idx_{index_name} "
                     f"RENAME TO {table_name}_idx_{index_name};"
                 )
+
+        await finish_local_native_input_publication(session, prepared=native_input_publication)
 
 
 async def _complete_provider_enrichment_run(

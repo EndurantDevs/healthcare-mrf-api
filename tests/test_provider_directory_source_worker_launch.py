@@ -22,15 +22,15 @@ PROFILE_IMAGE = "example/profile-worker@sha256:" + "e" * 64
 SPEC = workers._BY_WORKER_CLASS["process.ProviderDirectoryFHIR"]
 
 
-def _signed_profile_run(monkeypatch, database_identity=None):
+def _signed_profile_run(monkeypatch):
     """Reuse the genuine signed lease and configured public trust fixtures."""
     from process.provider_directory_profile_capacity_preflight_contract import validated_capacity_preflight_request
     from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME, _signed_envelope
     from tests.test_provider_directory_profile_capacity_trust import _trust_payload
 
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
-    envelope = _signed_envelope(body_mutator=lambda body: body.update(database_identity or {}))
-    trust = _trust_payload(**(database_identity or {}))
+    envelope = _signed_envelope()
+    trust = _trust_payload()
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CAPACITY_TRUST_JSON", json.dumps(trust))
     monkeypatch.setattr(source, "datetime", SimpleNamespace(now=lambda _zone: VALIDATION_TIME))
     monkeypatch.setenv(source.IMAGE_ENV, IMAGE)
@@ -176,7 +176,7 @@ def test_profile_reuse_refuses_runtime_drift(
         "signature",
         "missing_trust",
         "key",
-        "database",
+        "environment",
         "expired",
         "future",
         "generation",
@@ -195,12 +195,12 @@ async def test_profile_admission_authenticates_signed_request(monkeypatch, mutat
         params["provider_directory_profile_capacity_attestation"]["signature"] = "A" * 86
     if mutation == "missing_trust":
         monkeypatch.delenv("HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CAPACITY_TRUST_JSON")
-    if mutation in {"key", "database"}:
+    if mutation in {"key", "environment"}:
         trust = json.loads(workers.os.environ["HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CAPACITY_TRUST_JSON"])
         if mutation == "key":
             trust["keys"][0]["public_key_hex"] = "00" * 32
         else:
-            trust["database_oid"] += 1
+            trust["environment_id"] = "another-environment"
         monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CAPACITY_TRUST_JSON", json.dumps(trust))
     if mutation in {"expired", "future"}:
         clock = VALIDATION_TIME.replace(year=2027 if mutation == "expired" else 2025)

@@ -52,19 +52,29 @@ def emulate_only_in_memory_sql_backend(monkeypatch):
 
 def _inputs():
     """Return a replacement CMS selection retaining an unrelated current source."""
-    datasets = tuple(
-        SimpleNamespace(source_id=source, dataset_id=dataset, artifact_resources=("Practitioner",))
-        for source, dataset in (("cms-npd", "cms-new"), ("retained", "retained-current"))
-    )
-    fence = SimpleNamespace(datasets=datasets, source_ids=("cms-npd", "retained"))
+    from tests.provider_directory_cms_capacity_test_support import cms_execution
+
+    actual = cms_execution().attestation
     execution = SimpleNamespace(
         attestation=SimpleNamespace(
-            proof_id="proof-a",
-            desired_profile_as_of="2026-09-29",
-            desired_cms_dataset={"dataset_id": "cms-new"},
-            operation="publish",
+            **vars(actual),
+            desired_profile_as_of=actual.desired_profile_as_of,
+            desired_cms_dataset=actual.desired_cms_dataset,
+            expected_cms_incumbent=actual.expected_cms_incumbent,
         )
     )
+    datasets = tuple(
+        SimpleNamespace(
+            **pair,
+            evidence_run_id=pair["acquisition_root_run_id"],
+            semantic_projection_as_of=execution.attestation.desired_profile_as_of
+            if pair["source_id"] == "cms-npd"
+            else None,
+            artifact_resources=("Practitioner",),
+        )
+        for pair in execution.attestation.pairs
+    )
+    fence = SimpleNamespace(datasets=datasets, source_ids=tuple(entry.source_id for entry in datasets))
     projection = SimpleNamespace(projection_hash="ab" * 32)
     return execution, fence, projection
 
@@ -72,23 +82,15 @@ def _inputs():
 def _signed_lease(plan):
     """Verify a synthetic signature over the exact nonprofile plan identity."""
 
-    def mutate(body):
-        body["capacity_geometry_hash"] = plan.capacity_geometry_hash
-        timestamp_by_field = {
-            field: datetime.datetime.fromisoformat(body[field].replace("Z", "+00:00"))
-            for field in ("observed_at", "issued_at", "expires_at", "max_build_deadline")
-        }
-        guard, guard_hash, receipt_hash = capacity_signing_guard(
-            capacity_geometry_hash=plan.capacity_geometry_hash,
-            **timestamp_by_field,
-        )
-        body.update(signing_preflight_guard=guard, signing_preflight_guard_sha256=guard_hash, nonce=receipt_hash)
+    from tests.provider_directory_cms_capacity_test_support import signed_cms_plan
 
-    return _verify(_signed_envelope(body_mutator=mutate), expected_capacity_geometry_hash=plan.capacity_geometry_hash)
+    return signed_cms_plan(plan)
 
 
 def _admission(*, artifact_targets=None, types=None, check=None):
     """Build a separately verified reservation with an explicit phase authority."""
+    from tests.provider_directory_cms_capacity_test_support import cms_plan
+
     execution, fence, projection = _inputs()
     artifact_targets = artifact_targets or {"address_overlay", "network_catalog"}
     types = types or frozenset({"Practitioner"})
@@ -109,7 +111,7 @@ def _admission(*, artifact_targets=None, types=None, check=None):
         1024,
         50_000,
         1000,
-        "ab" * 32,
+        cms_plan()[2].lease_digest,
     )
 
     async def approve(request):
@@ -144,7 +146,7 @@ def _database():
 
     async def status(query):
         if query.startswith("DROP TABLE "):
-            relation_by_ref.pop(query.removeprefix("DROP TABLE ").removesuffix(";"))
+            relation_by_ref.pop(query.removeprefix("DROP TABLE ").removesuffix(";").removesuffix(" RESTRICT"))
 
     @asynccontextmanager
     async def transaction():
@@ -167,8 +169,8 @@ async def test_measure_uses_one_fresh_query_for_complete_sorted_inventory():
     admission = _admission()
     admission._started = True
     fake, *_ = _fake_fhir([])
-    admission._relations = {("test_schema", f"stage_{index:03d}"): index + 1 for index in reversed(range(128))}
-    for (schema, name), oid in admission._relations.items():
+    admission._relations = {("test_schema", f"stage_{index:03d}") for index in reversed(range(128))}
+    for oid, (schema, name) in enumerate(sorted(admission._relations), 1):
         fake.db.relations[f"{schema}.{name}"] = {"oid": oid, "total_bytes": oid * 10, "persistence": "p"}
     fake.db.relations["other_schema.new_stage"] = {"oid": 200, "total_bytes": 50, "persistence": "u"}
     all_rows = fake.db.all
@@ -180,7 +182,7 @@ async def test_measure_uses_one_fresh_query_for_complete_sorted_inventory():
     fake.db.first = AsyncMock(side_effect=AssertionError("per-relation query"))
     measured = await admission.measure(fake, "other_schema", ("new_stage",))
     assert [(row.schema, row.relation) for row in measured] == sorted(admission._relations)
-    assert len(measured) == 129 and measured[0].oid == 200 and measured[0].persistence == "u"
+    assert len(measured) == 129 and measured[0].persistence == "u"
     assert sum(row.total_bytes for row in measured) == sum(range(1, 129)) * 10 + 50
     assert fake.db.all.await_count == 1
     assert len(fake.db.all.await_args.kwargs["relation_refs"]) == 129
@@ -204,7 +206,7 @@ async def test_measure_rejects_incomplete_or_ambiguous_bulk_catalog(fault):
     fake.db.all = AsyncMock(return_value=catalog_records)
     with pytest.raises(RuntimeError, match="nonprofile_relation_changed"):
         await admission.measure(fake, "test_schema", ("stage",))
-    assert admission._relations == {("test_schema", "stage"): 0}
+    assert admission._relations == {("test_schema", "stage")}
 
 
 @pytest.mark.parametrize("persistence", ["u", "p"])
@@ -232,7 +234,7 @@ async def test_address_registration_reserves_only_pending_logging(persistence):
     await admission.register_address_stages(
         fhir,
         "test_schema",
-        (("entity_address_unified", "address_stage", 42),),
+        (("entity_address_unified", "address_stage"),),
         input_hash=admission.plan.native_address_input_hash,
     )
     request = requests[-1]
@@ -329,7 +331,7 @@ class PreparationFakeFHIR:
         self.materialized = True
 
     @contextmanager
-    def _artifact_scope_tokens(self, full_fence, resource_fence, overrides, oids):
+    def _artifact_scope_tokens(self, full_fence, resource_fence, overrides):
         assert set(overrides.values()) <= self.indexed_names
         token = self.scope_relations.set(overrides)
         self.events.append("full-enter")
@@ -493,8 +495,8 @@ async def test_two_scopes_preserve_full_inputs_and_exact_profile_delta(abort):
                 raise RuntimeError("abort")
             await prepared.mark_committed(
                 profile_result={
-                    "selection_proof_id": "proof-a",
-                    "profile_as_of": "2026-09-29",
+                    "selection_proof_id": _inputs()[0].attestation.proof_id,
+                    "profile_as_of": _inputs()[0].attestation.desired_profile_as_of,
                     "operation": "publish",
                     "status": "published",
                     "generation_id": "generation-a",
@@ -555,19 +557,35 @@ async def test_unbound_geometry_and_invalid_phase_receipt_fail_closed():
 
 @pytest.mark.asyncio
 async def test_logging_gate_blocks_alter_and_default_is_inactive(monkeypatch):
+    """Admission refusal precedes logging and delegated candidate write closure."""
+    from process import provider_directory_artifact_bundle_preparation as artifacts
+
     database = _database()
-    database.status = AsyncMock()
+    steps = []
+    database.status = AsyncMock(side_effect=lambda *_args: steps.append("logged"))
+    check_logged = AsyncMock(side_effect=lambda *_args: steps.append("checked"))
+    freeze = AsyncMock(side_effect=lambda *_args: steps.append("frozen"))
     monkeypatch.setattr(importer, "db", database)
-    monkeypatch.setattr(importer, "_assert_provider_directory_logged_relation", AsyncMock())
+    monkeypatch.setattr(importer, "_assert_provider_directory_logged_relation", check_logged)
+    monkeypatch.setattr(artifacts, "freeze_artifact_stage", freeze)
     await importer._prepare_provider_directory_artifact_stage("test_schema", "stage_a")
-    database.status.assert_awaited_once()
+    database.status.assert_awaited_once_with('ALTER TABLE "test_schema"."stage_a" SET LOGGED;')
+    check_logged.assert_awaited_once_with("test_schema", "stage_a")
+    freeze.assert_awaited_once_with(importer, "test_schema", "stage_a")
+    assert steps == ["logged", "checked", "frozen"]
     database.status.reset_mock()
+    check_logged.reset_mock()
+    freeze.reset_mock()
+    steps.clear()
     admission = _admission()
     token = preparation._ACTIVE.set(admission)
     try:
         with pytest.raises(RuntimeError, match="admission_not_started"):
             await importer._prepare_provider_directory_artifact_stage("test_schema", "stage_b")
         database.status.assert_not_awaited()
+        check_logged.assert_not_awaited()
+        freeze.assert_not_awaited()
+        assert steps == []
     finally:
         preparation._ACTIVE.reset(token)
 
@@ -585,7 +603,7 @@ def _mutate_relation(relation_by_ref, name, change):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["oid", "missing", "data", "unlogged"])
+@pytest.mark.parametrize("change", ["missing", "data", "unlogged"])
 async def test_relation_drift_and_aggregate_budget_reject_readiness(change):
     fake, execution, fence, _ = _fake_fhir([])
     admission = _admission()
@@ -596,11 +614,7 @@ async def test_relation_drift_and_aggregate_budget_reject_readiness(change):
             name = "test_schema." + prepared.overlay_identity.relation
             _mutate_relation(fake.db.relations, name, change)
             await prepared.assert_ready()
-    if change == "oid":
-        assert list(fake.db.relations) == [name]
-        assert admission.cleanup_preserved == [("test_schema", prepared.overlay_identity.relation)]
-    else:
-        assert not fake.db.relations
+    assert not fake.db.relations
 
 
 @pytest.mark.asyncio
@@ -618,11 +632,11 @@ async def test_purge_reuses_admitted_empty_profile_scope_without_nonprofile_work
         await prepared.assert_ready(cutover=True)
         await prepared.mark_committed(
             profile_result={
-                "selection_proof_id": "proof-a",
+                "selection_proof_id": _inputs()[0].attestation.proof_id,
                 "operation": "purge",
                 "status": "purged",
                 "generation_id": "generation-a",
-                "profile_as_of": "2026-09-29",
+                "profile_as_of": _inputs()[0].attestation.desired_profile_as_of,
                 "evidence_rows": 0,
                 "profile_rows": 0,
             }
@@ -648,8 +662,8 @@ async def test_historical_profile_result_consumes_without_reading_current_pointe
         fake._refresh_bundle_profile_delta_metrics.side_effect = AssertionError("must not read current pointer")
         await prepared.mark_committed(
             profile_result={
-                "selection_proof_id": "proof-a",
-                "profile_as_of": "2026-09-29",
+                "selection_proof_id": _inputs()[0].attestation.proof_id,
+                "profile_as_of": _inputs()[0].attestation.desired_profile_as_of,
                 "operation": "publish",
                 "status": "published",
                 "generation_id": "generation-a",
@@ -798,18 +812,16 @@ async def _assert_native_scope_layouts(database, schema, overrides):
 
 
 @pytest.mark.asyncio
-async def test_replaced_typed_scope_is_preserved_during_cleanup():
+async def test_named_typed_scope_re_resolves_after_copy_and_cleans_admitted_names():
     fake, execution, fence, _ = _fake_fhir([])
     admission = _admission()
-    with pytest.raises(RuntimeError, match="nonprofile_relation_changed"):
-        async with _prepare(
-            fake, execution, fence, run_id="run-a", control_run_id=None, metrics={}, nonprofile_admission=admission
-        ) as prepared:
-            name = "test_schema." + prepared.relation_overrides["provider_directory_practitioner"]
-            fake.db.relations[name]["oid"] += 1
-            await prepared.assert_ready()
-    assert list(fake.db.relations) == [name]
-    assert admission.cleanup_preserved == [("test_schema", name.removeprefix("test_schema."))]
+    async with _prepare(
+        fake, execution, fence, run_id="run-a", control_run_id=None, metrics={}, nonprofile_admission=admission
+    ) as prepared:
+        name = "test_schema." + prepared.relation_overrides["provider_directory_practitioner"]
+        fake.db.relations[name]["oid"] += 1
+        await prepared.assert_ready()
+    assert not fake.db.relations and not admission.cleanup_preserved
 
 
 @pytest.mark.asyncio
@@ -844,37 +856,30 @@ async def test_capacity_preflight_routes_only_explicit_desired_selection(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_native_cleanup_preserves_replacement_oid(monkeypatch):
+async def test_native_cleanup_uses_named_admission_after_snapshot_copy(monkeypatch):
     from tests.test_provider_directory_dataset_artifact_db import _dataset_database
 
     async with _dataset_database(monkeypatch) as (database, schema):
-        await database.status(f"CREATE UNLOGGED TABLE {schema}.owned_stage (value integer);")
+        await database.status(f"CREATE UNLOGGED TABLE {schema}.owned_stage (value integer)")
         admission = _admission()
         execution, fence, projection = _inputs()
         await admission.before_scratch(
             execution, fence, projection, {"address_overlay", "network_catalog"}, frozenset({"Practitioner"})
         )
         await admission.measure(importer, schema, ("owned_stage",))
-        original_oid = admission._relations[(schema, "owned_stage")]
-        await database.status(f"DROP TABLE {schema}.owned_stage;")
-        await database.status(f"CREATE UNLOGGED TABLE {schema}.owned_stage (value integer);")
-        replacement_oid = await database.scalar(
-            "SELECT to_regclass(:relation)::oid::bigint;", relation=schema + ".owned_stage"
-        )
-        assert replacement_oid != original_oid
+        await database.status(f"DROP TABLE {schema}.owned_stage RESTRICT")
+        await database.status(f"CREATE UNLOGGED TABLE {schema}.owned_stage (value integer)")
+        await database.status(f"INSERT INTO {schema}.owned_stage VALUES (2)")
         token = preparation._ACTIVE.set(admission)
         try:
-            with pytest.raises(RuntimeError, match="nonprofile_relation_changed"):
-                await admission.assert_ready(importer, schema)
+            await admission.assert_ready(importer, schema)
+            assert await database.scalar(f"SELECT value FROM {schema}.owned_stage") == 2
             await importer._remove_provider_directory_artifact_stage(
                 SimpleNamespace(schema=schema, stage_table="owned_stage")
             )
         finally:
             preparation._ACTIVE.reset(token)
-        assert (
-            await database.scalar("SELECT to_regclass(:relation)::oid::bigint;", relation=schema + ".owned_stage")
-            == replacement_oid
-        )
+        assert await database.scalar("SELECT to_regclass(:relation)", relation=schema + ".owned_stage") is None
 
 
 def test_scratch_names_are_unique_bounded_and_outside_profile_recovery():
@@ -941,32 +946,31 @@ async def test_native_intermediate_registry_tracks_exact_rename_and_drop():
     )
     original_by_field = {"oid": 321, "total_bytes": 100, "persistence": "u"}
     fake.db.relations["test_schema.raw_stage"] = original_by_field
-    await admission.register_external_relation(fake, "test_schema", "raw_stage", 321)
+    await admission.register_external_relation(fake, "test_schema", "raw_stage")
     assert preparation._owned_cleanup_names(admission, "test_schema", []) == []
-    await admission.assert_external_relation(fake, "test_schema", "raw_stage", 321)
+    await admission.assert_external_relation(fake, "test_schema", "raw_stage")
     fake.db.relations["test_schema.compact_stage"] = fake.db.relations.pop("test_schema.raw_stage")
-    await admission.rename_external_relation(fake, "test_schema", "raw_stage", "compact_stage", 321)
-    assert admission._relations == {("test_schema", "compact_stage"): 321}
+    await admission.rename_external_relation(fake, "test_schema", "raw_stage", "compact_stage")
+    assert admission._relations == {("test_schema", "compact_stage")}
     fake.db.relations.pop("test_schema.compact_stage")
-    await admission.retire_external_relation(fake, "test_schema", "compact_stage", 321)
+    await admission.retire_external_relation(fake, "test_schema", "compact_stage")
     assert not admission._relations and not admission._external_relations
 
 
 @pytest.mark.asyncio
-async def test_native_registry_rejects_replacement_and_preserves_native_ownership():
+async def test_native_registry_re_resolves_names_and_keeps_external_cleanup_separate():
     fake, execution, fence, projection = _fake_fhir([])
     admission = _admission()
     await admission.before_scratch(
         execution, fence, projection, {"address_overlay", "network_catalog"}, frozenset({"Practitioner"})
     )
     fake.db.relations["test_schema.native_stage"] = {"oid": 321, "total_bytes": 100, "persistence": "u"}
-    await admission.register_external_relation(fake, "test_schema", "native_stage", 321)
+    await admission.register_external_relation(fake, "test_schema", "native_stage")
     fake.db.relations["test_schema.native_stage"]["oid"] = 654
+    await admission.assert_external_relation(fake, "test_schema", "native_stage")
     with pytest.raises(RuntimeError, match="relation_changed"):
-        await admission.assert_external_relation(fake, "test_schema", "native_stage", 321)
-    with pytest.raises(RuntimeError, match="relation_changed"):
-        await admission.retire_external_relation(fake, "test_schema", "native_stage", 321)
-    assert admission._relations == {("test_schema", "native_stage"): 321}
+        await admission.retire_external_relation(fake, "test_schema", "native_stage")
+    assert admission._relations == {("test_schema", "native_stage")}
     assert preparation._owned_cleanup_names(admission, "test_schema", []) == []
 
 
@@ -986,6 +990,9 @@ def _manifest_add_heap(fixture, name, required_indexes, *, persistence="p", prim
                 "indisready": True,
                 "indislive": True,
                 "indisprimary": index_name == name + "_pkey",
+                "indisunique": index_name == name + "_pkey",
+                "indnkeyatts": 1,
+                "indnatts": 1,
                 "index_am": "btree",
                 "indkey": "1",
                 "index_expressions": "",
@@ -1005,7 +1012,7 @@ def _manifest_scope_heaps(fixture):
             required_indexes.append(fhir._provider_directory_profile_bucket_index_sql("test_schema", name)[0])
         oid = _manifest_add_heap(fixture, name, required_indexes, persistence="u")
         fixture.prepared.relation_overrides[model.__tablename__] = name
-        fixture.admission._relations[("test_schema", name)] = oid
+        fixture.admission._relations.add(("test_schema", name))
     for target, suffixes, naming in (
         (
             fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
@@ -1020,7 +1027,7 @@ def _manifest_scope_heaps(fixture):
     ):
         name = target + "_stage"
         oid = _manifest_add_heap(fixture, name, [naming(name, suffix) for suffix in suffixes])
-        fixture.admission._relations[("test_schema", name)] = oid
+        fixture.admission._relations.add(("test_schema", name))
         fixture.prepared.nonprofile_bundle.stages.append(
             SimpleNamespace(schema="test_schema", stage_table=name, target_relation=target)
         )
@@ -1031,10 +1038,10 @@ def _manifest_native_heaps(fixture):
     native = importlib.import_module("process.entity_address_unified")
     models = importlib.import_module("process.entity_address_result_generation").ENTITY_ADDRESS_RESULT_MODELS
     fixture.admission.plan = replace(
-        fixture.admission.plan, native_address_targets=tuple(model.__tablename__ for model in models)
+        fixture.admission.plan, native_address_targets=tuple(sorted(model.__tablename__ for model in models))
     )
     fixture.admission.lease = _signed_lease(fixture.admission.plan)
-    fixture.address = SimpleNamespace(db_schema="test_schema", stage_oids=[], swaps=[])
+    fixture.address = SimpleNamespace(db_schema="test_schema", stage_relations=[], swaps=[])
     for model in models:
         name = model.__tablename__ + "_cms" + "a" * 20
         required_indexes = [
@@ -1042,8 +1049,8 @@ def _manifest_native_heaps(fixture):
             for index in model.__my_additional_indexes__
         ]
         oid = _manifest_add_heap(fixture, name, required_indexes)
-        fixture.admission._relations[("test_schema", name)] = oid
-        fixture.address.stage_oids.append((model.__tablename__, name, oid))
+        fixture.admission._relations.add(("test_schema", name))
+        fixture.address.stage_relations.append((model.__tablename__, name))
         fixture.address.swaps.append(
             SimpleNamespace(
                 stage_cls=SimpleNamespace(__tablename__=name, __my_additional_indexes__=model.__my_additional_indexes__)
@@ -1059,7 +1066,7 @@ def _manifest_profile_heaps(fixture, mode):
         evidence_stage="profile_evidence_stage",
         profile_stage="profile_stage",
         owner_run_id="run-a",
-        selection_proof_id="proof-a",
+        selection_proof_id=_inputs()[0].attestation.proof_id,
         materialization_mode="full_swap",
     )
     bundle = SimpleNamespace(stages=[], profile_delta=None)
@@ -1142,11 +1149,7 @@ def _manifest_install_seams(monkeypatch, fixture):
     fixture.fhir.db.relations.update({"test_schema." + name: heap for name, heap in fixture.heaps.items()})
 
     async def identities(_schema, names):
-        return {
-            name: (fixture.heaps[name]["oid"], "r", fixture.heaps[name]["persistence"])
-            for name in names
-            if name in fixture.heaps
-        }
+        return {name: (name, "r", fixture.heaps[name]["persistence"]) for name in names if name in fixture.heaps}
 
     async def catalog(oids):
         assert set(oids) == {heap["oid"] for heap in fixture.heaps.values()}
@@ -1192,6 +1195,8 @@ def _manifest_sql_backend(fixture):
     fixture.limits_observed = []
 
     async def scalar(_query, **params):
+        if "relation_ref" in params:
+            return fixture.fhir.db.relations.get(params["relation_ref"], {}).get("oid")
         if "has_parameter_privilege" in _query:
             return True
         if "pg_size_bytes" in _query and not params:
@@ -1247,27 +1252,30 @@ async def _manifest_boundary(fixture):
 async def test_prepared_manifest_is_complete_before_publication(monkeypatch, capsys, mode):
     fixture = _manifest_fixture(monkeypatch, mode)
     async with _manifest_boundary(fixture):
-        records = capsys.readouterr().out.splitlines()
-        assert len(records) == 1
-        prefix, encoded_record = records[0].split("\t", 1)
+        log_lines = capsys.readouterr().out.splitlines()
+        assert len(log_lines) == 1
+        prefix, encoded_record = log_lines[0].split("\t", 1)
         assert prefix == "PROVIDER_DIRECTORY_CMS_PREPARED_LAYOUT"
-        record = json.loads(encoded_record)
-        manifest = record["prepared_manifest"]
+        emitted_by_field = json.loads(encoded_record)
+        manifest = emitted_by_field["prepared_manifest"]
         encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
-        assert record["manifest_sha256"] == hashlib.sha256(encoded.encode("ascii")).hexdigest()
+        assert emitted_by_field["manifest_sha256"] == hashlib.sha256(encoded.encode("ascii")).hexdigest()
         assert manifest["run_id"] == manifest["control_run_id"] == "run-a"
-        assert manifest["selection_proof_id"] == "proof-a"
-        assert manifest["source_vector"] == [["cms-npd", "cms-new"], ["retained", "retained-current"]]
+        assert manifest["selection_proof_id"] == fixture.prepared.execution.attestation.proof_id
+        assert manifest["source_vector"] == sorted(
+            [[entry.source_id, entry.dataset_id] for entry in fixture.prepared.fence.datasets]
+        )
         assert manifest["desired_fence_hash"] == preparation.desired_fence_hash(fixture.prepared.fence)
         relations = manifest["relations"]
-        assert {row["relation"] for row in relations} == set(fixture.heaps)
+        assert {relation_entry["relation"] for relation_entry in relations} == set(fixture.heaps)
         assert len(relations) == (20 if mode == "initial" else 21)
-        assert {row["target"] for row in relations if row["role"] == "resource_scope"} == {
-            model.__tablename__ for model in (importer.ProviderDirectorySource, *importer.RESOURCE_MODELS)
-        }
-        assert all(row["columns"] and row["indexes"] for row in relations)
+        assert {
+            relation_entry["target"] for relation_entry in relations if relation_entry["role"] == "resource_scope"
+        } == {model.__tablename__ for model in (importer.ProviderDirectorySource, *importer.RESOURCE_MODELS)}
+        assert all(relation_entry["columns"] and relation_entry["indexes"] for relation_entry in relations)
         assert all(
-            set(row["required_indexes"]) <= {index["index_name"] for index in row["indexes"]} for row in relations
+            set(relation_entry["required_indexes"]) <= {index["index_name"] for index in relation_entry["indexes"]}
+            for relation_entry in relations
         )
     fixture.fhir._assert_provider_directory_profile_checkpoint_ready.assert_not_awaited()
     assert fixture.limits_observed == [{"limit": 1024, "timeout_ms": 14000}]
@@ -1280,7 +1288,7 @@ async def test_prepared_manifest_is_complete_before_publication(monkeypatch, cap
     [
         ("missing-index", "prepared_manifest_indexes_incomplete"),
         ("invalid-index", "prepared_manifest_indexes_incomplete"),
-        ("wrong-oid", "nonprofile_relation_changed"),
+        ("missing-name", "nonprofile_relation_changed"),
         ("missing-scope", "prepared_manifest_ownership_changed"),
         ("wrong-profile-owner", "prepared_manifest_profile_changed"),
         ("unlogged-serving", "prepared_manifest_stage_not_logged"),
@@ -1295,8 +1303,8 @@ async def test_prepared_manifest_refuses_incomplete_or_foreign_layout(monkeypatc
             fixture.indexes.pop(0)
         case "invalid-index":
             fixture.indexes[0]["indisready"] = False
-        case "wrong-oid":
-            fixture.heaps[first_name]["oid"] += 500
+        case "missing-name":
+            fixture.fhir.db.relations.pop("test_schema." + first_name)
         case "missing-scope":
             fixture.prepared.relation_overrides.pop(importer.ProviderDirectorySource.__tablename__)
         case "wrong-profile-owner":

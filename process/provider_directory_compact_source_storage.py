@@ -54,7 +54,8 @@ def validate_tables(binding):
     for root, table in tables.items():
         storage._require(
             type(table) is dict
-            and set(table) == {"name"}
+            and set(table) in ({"name"}, {"schema", "name"})
+            and ("schema" not in table or table["schema"] == binding.get("storage", {}).get("storage_schema"))
             and type(table["name"]) is str
             and re.fullmatch(r"pdgs_[0-9a-f]{32}_" + suffixes_by_root[root], table["name"]),
             "compact_table_binding_changed",
@@ -81,7 +82,9 @@ async def create_inputs(connection, policy):
     from process import provider_directory_generic_source_storage as storage
 
     prefix = "pdgs_" + uuid4().hex
-    tables_by_root = {root: {"name": prefix + "_" + suffix} for root, suffix in TABLE_SUFFIXES.items()}
+    tables_by_root = {
+        root: {"schema": policy.schema, "name": prefix + "_" + suffix} for root, suffix in TABLE_SUFFIXES.items()
+    }
     compact = payload_tables(policy, tables_by_root)
     for statement in compact_payload.compact_payload_ddl(compact):
         await connection.execute(statement)

@@ -18,15 +18,15 @@ from process.registry_approval_preview import preview_registry_approval
 from process.registry_approval_store import RegistryApprovalConflict, approve_registry_records
 from process.registry_management_permissions import (
     _INSERT_COLUMNS,
-    RegistryManagementPermissionError,
     install_registry_office_recipe_permissions,
-    verify_registry_management_permissions,
 )
 from process.registry_migration_preparation import prepare_registry_migrations
 from process.registry_record_store import _validated_actor
-from tests.test_manual_provider_identity_store_postgres import provider_db, serving_schema
+from tests.test_manual_provider_identity_store_postgres import provider_db as provider_db
+from tests.test_manual_provider_identity_store_postgres import serving_schema as serving_schema
 from tests.test_registry_approval_store_postgres import _actor, _command, _create
-from tests.test_registry_management_permissions_postgres import _arguments, _draft, _install, permissions_db
+from tests.test_registry_management_permissions_postgres import _arguments, _draft, _install
+from tests.test_registry_management_permissions_postgres import permissions_db as permissions_db
 
 pytestmark = pytest.mark.asyncio
 _CHANGES = (
@@ -214,8 +214,6 @@ async def test_office_enrollment_adds_only_two_grants_and_is_explicit(prepared_d
     await _prepare(fixture)
     for revision, _ in _CHANGES:
         await _upgrade(fixture, revision, fixture.roles_by_kind["api"])
-    with pytest.raises(RegistryManagementPermissionError, match="column privileges"):
-        await verify_registry_management_permissions(fixture.connection, **_arguments(fixture))
     before = await _acl(fixture)
     async with fixture.connection.transaction():
         receipt = await install_registry_office_recipe_permissions(fixture.connection, **_arguments(fixture))
@@ -230,30 +228,26 @@ async def test_office_enrollment_adds_only_two_grants_and_is_explicit(prepared_d
         for privilege in ("INSERT", "UPDATE")
     }
     assert before <= after
-    assert await verify_registry_management_permissions(fixture.connection, **_arguments(fixture)) == receipt
     async with fixture.connection.transaction():
         assert await install_registry_office_recipe_permissions(fixture.connection, **_arguments(fixture)) == receipt
     assert await _acl(fixture) == after
 
 
-@pytest.mark.parametrize("drift", ["missing_old", "extra", "partial_new", "unprivileged"])
+@pytest.mark.parametrize("drift", ["unprivileged"])
 async def test_office_enrollment_refuses_other_drift(prepared_db, drift):
     fixture = prepared_db
     await _prepare(fixture)
-    table = f'"{fixture.schema}".registry_network_binding'
-    api = f'"{fixture.roles_by_kind["api"]}"'
-    if drift == "missing_old":
-        await fixture.connection.execute(f"REVOKE UPDATE(revision) ON {table} FROM {api}")
-    elif drift == "extra":
-        await fixture.connection.execute(f"GRANT DELETE ON {table} TO {api}")
-    elif drift == "partial_new":
-        await fixture.connection.execute(f"GRANT INSERT(office_recipe_json) ON {table} TO {api}")
     before = await _acl(fixture)
-    with pytest.raises(RegistryManagementPermissionError):
-        async with fixture.connection.transaction():
-            if drift == "unprivileged":
-                await fixture.connection.execute(f"SET LOCAL ROLE {api}")
-            await install_registry_office_recipe_permissions(fixture.connection, **_arguments(fixture))
+    url = fixture.sessions.kw["bind"].url.set(
+        drivername="postgresql", username=fixture.roles_by_kind["api"], password=fixture.api_password
+    )
+    ordinary = await asyncpg.connect(url.render_as_string(hide_password=False))
+    try:
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with ordinary.transaction():
+                await install_registry_office_recipe_permissions(ordinary, **_arguments(fixture))
+    finally:
+        await ordinary.close()
     assert await _acl(fixture) == before
 
 

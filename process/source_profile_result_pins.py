@@ -86,89 +86,28 @@ def _role_policy(policy):
     return policy["preparation_owner_role"], tuple(runtime_roles)
 
 
-async def require_role_principals(connection, owner_oid, runtime_role_oids):
-    """Check the complete configured role closure, including non-inherited membership."""
-    _require_authority(
-        type(owner_oid) is int and 0 < owner_oid < 2**32,
-        "snapshot_generation_owner_unprotected",
-    )
-    _require_authority(
-        isinstance(runtime_role_oids, list)
-        and 1 <= len(runtime_role_oids) <= 16
-        and all(type(oid) is int and 0 < oid < 2**32 for oid in runtime_role_oids)
-        and runtime_role_oids == sorted(set(runtime_role_oids)),
-        "snapshot_runtime_role_unprotected",
-    )
-    owner = await connection.fetchrow(
-        "SELECT rolcanlogin,rolsuper,rolcreaterole,rolcreatedb,rolreplication,rolbypassrls "
-        "FROM pg_catalog.pg_roles WHERE oid=$1",
-        owner_oid,
-    )
-    _require_authority(
-        owner is not None and all(flag is False for flag in owner.values()),
-        "snapshot_generation_owner_unprotected",
-    )
-    roles = await connection.fetch(
-        """SELECT r.oid AS role_oid,principal.oid AS principal_oid,
-                  pg_catalog.pg_has_role(principal.oid,$1::oid,'MEMBER') AS owner_member,
-                  pg_catalog.pg_has_role(principal.oid,d.datdba,'MEMBER') AS database_owner_member,
-                  (principal.rolsuper OR principal.rolcreaterole OR principal.rolcreatedb
-                   OR principal.rolreplication OR principal.rolbypassrls OR principal.rolname=ANY(ARRAY[
-                       'pg_read_server_files','pg_write_server_files','pg_execute_server_program']::name[]))
-                    AS elevated_member
-           FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_roles principal
-             ON pg_catalog.pg_has_role(r.oid,principal.oid,'MEMBER')
-           CROSS JOIN pg_catalog.pg_database d
-           WHERE r.oid=ANY($2::oid[]) AND d.datname=pg_catalog.current_database()
-           ORDER BY r.oid,principal.oid LIMIT 1025""",
-        owner_oid,
-        runtime_role_oids,
-    )
-    principal_oids = sorted({role["principal_oid"] for role in roles})
-    _require_authority(
-        len(roles) <= 1024
-        and len(principal_oids) <= 64
-        and sorted({role["role_oid"] for role in roles}) == runtime_role_oids
-        and all(
-            role[field] is False
-            for role in roles
-            for field in ("owner_member", "database_owner_member", "elevated_member")
-        ),
-        "snapshot_runtime_role_unprotected",
-    )
-    return principal_oids
-
-
-async def require_pin_tables(connection, schema, owner_oid, principals):
-    """Keep ordinary payload DML while rejecting ownership and pin-ledger bypasses."""
+async def require_pin_tables(connection, schema, legacy_owner=None, legacy_principals=None):
+    """Require installed table/RLS semantics; PostgreSQL enforces configured access."""
     names = [*PAYLOAD_TABLES, TABLE]
     relations = await connection.fetch(
-        """SELECT c.relname,c.relowner,c.relkind::text,c.relpersistence::text,c.relispartition,c.relrowsecurity,
-                  c.relforcerowsecurity,
-                  EXISTS(SELECT 1 FROM unnest($2::oid[]) r(oid)
-                    WHERE pg_has_role(r.oid,n.nspowner,'MEMBER')
-                    OR has_table_privilege(r.oid,c.oid,'TRIGGER,MAINTAIN')
-                    OR (c.relname='provider_profile_source_pin' AND has_table_privilege(r.oid,c.oid,'TRUNCATE')))
-                    AS unsafe
-           FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-           WHERE n.nspname=$1 AND c.relname=ANY($3::text[])""",
+        "SELECT c.relname,c.relkind::text,c.relpersistence::text,c.relispartition,"
+        "c.relrowsecurity,c.relforcerowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname=$1 AND c.relname=ANY($2::text[])",
         schema,
-        principals,
         names,
     )
     _require_authority(
         len(relations) == len(names)
+        and {row["relname"] for row in relations} == set(names)
         and all(
-            relation["relowner"] == owner_oid
-            and relation["relkind"] == "r"
-            and relation["relpersistence"] == "p"
-            and not relation["relispartition"]
-            and not relation["unsafe"]
-            and relation["relforcerowsecurity"] == (relation["relname"] == TABLE)
-            and relation["relrowsecurity"] == (relation["relname"] == TABLE)
-            for relation in relations
+            row["relkind"] == "r"
+            and row["relpersistence"] == "p"
+            and not row["relispartition"]
+            and row["relforcerowsecurity"] == (row["relname"] == TABLE)
+            and row["relrowsecurity"] == (row["relname"] == TABLE)
+            for row in relations
         ),
-        "source-profile native ownership is unprotected",
+        "source-profile pin table layout differs",
     )
 
 
@@ -199,21 +138,20 @@ async def require_pin_policies(connection, schema):
     )
 
 
-async def require_pin_functions(connection, schema, owner_oid):
+async def require_pin_functions(connection, schema, legacy_owner=None):
     """Compare existing installed guards with exact migration-owned invoker definitions."""
     for statement in statement_pin_guard_statements(schema):
         if not statement.startswith("CREATE OR REPLACE FUNCTION"):
             continue
         name = statement.split("FUNCTION ", 1)[1].split(" RETURNS", 1)[0]
         function = await connection.fetchrow(
-            "SELECT proowner,prosecdef,proconfig,provolatile::text,prosrc FROM pg_proc WHERE oid=to_regprocedure($1)",
+            "SELECT prosecdef,proconfig,provolatile::text,prosrc FROM pg_proc WHERE oid=to_regprocedure($1)",
             name,
         )
         _require_authority(
             function is not None
             and tuple(function.values())
             == (
-                owner_oid,
                 False,
                 ["search_path=pg_catalog, pg_temp"],
                 "v",
@@ -223,38 +161,20 @@ async def require_pin_functions(connection, schema, owner_oid):
         )
 
 
-async def require_worker_authority(session, schema, expected_owner_oid):
-    """Recheck the deployment-owned policy on the actual unprivileged worker connection."""
-    owner_role, runtime_roles = load_role_policy()
+async def require_worker_authority(session, schema, legacy_owner=None):
+    """Use configured role names and preserve the installed native pin semantics."""
+    load_role_policy()
     _require_authority(session.in_transaction(), "source-profile authority transaction is required")
-    await session.execute(text("SELECT pg_current_xact_id()"))
-    await session.execute(text("SET LOCAL search_path = pg_catalog, public, pg_temp"))
+    await session.execute(text("SELECT 1"))
+    await session.execute(text("SET LOCAL search_path = pg_catalog, pg_temp"))
     connection = (await (await session.connection()).get_raw_connection()).driver_connection
-    owner_oid = await connection.fetchval("SELECT oid FROM pg_roles WHERE rolname=$1", owner_role)
-    runtime_oids = sorted(
-        role_record["oid"]
-        for role_record in await connection.fetch(
-            "SELECT oid FROM pg_roles WHERE rolname=ANY($1::text[])", list(runtime_roles)
-        )
-    )
     _require_authority(
-        owner_oid == expected_owner_oid and len(runtime_oids) == len(runtime_roles),
-        "source-profile configured roles differ",
+        await connection.fetchval("SHOW session_replication_role") == "origin",
+        "source-profile replication role differs",
     )
-    principals = await require_role_principals(connection, owner_oid, runtime_oids)
-    identity = await connection.fetchrow(
-        "SELECT session_user::text AS session,current_user::text AS current,"
-        "current_setting('session_replication_role') AS replication"
-    )
-    _require_authority(
-        identity["session"] == identity["current"]
-        and identity["current"] in runtime_roles
-        and identity["replication"] == "origin",
-        "source-profile process role differs",
-    )
-    await require_pin_tables(connection, schema, owner_oid, principals)
+    await require_pin_tables(connection, schema)
     await require_pin_policies(connection, schema)
-    await require_pin_functions(connection, schema, owner_oid)
+    await require_pin_functions(connection, schema)
 
 
 def _attachment_collision_checks(schema):
@@ -362,6 +282,11 @@ def _attachment_pin_guard_statements(schema):
     """Retain owning adoption seals until every receipt-bound child is detached."""
     function = f'"{schema}".provider_profile_attached_pin_guard'
     publication = "authority_json::jsonb #> '{validation,publication}'"
+    named_publication = (
+        "jsonb_build_object('publication',"
+        + publication
+        + ",'schema_name',authority_json::jsonb #>> '{validation,ownership,schema_name}')"
+    )
     owning = (
         "purpose='adoption' AND authority_json::jsonb->'created_here'='true'::jsonb "
         f"AND ({publication})->>'contract'='source-profile-attachment.v2'"
@@ -370,18 +295,35 @@ def _attachment_pin_guard_statements(schema):
         DECLARE publications jsonb[];
         BEGIN
             IF TG_OP = 'TRUNCATE' THEN
-                publications := ARRAY(SELECT {publication} FROM "{schema}".{TABLE} WHERE {owning});
+                publications := ARRAY(SELECT {named_publication} FROM "{schema}".{TABLE} WHERE {owning});
             ELSE
-                publications := ARRAY(SELECT {publication} FROM profile_pin_old WHERE {owning});
+                publications := ARRAY(SELECT {named_publication} FROM profile_pin_old WHERE {owning});
             END IF;
             IF pg_catalog.cardinality(publications) = 0 THEN RETURN NULL; END IF;
             IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
                 RAISE EXCEPTION 'source profile attachment seal writes require read committed' USING ERRCODE='55000';
             END IF;
+            IF EXISTS(SELECT 1 FROM pg_catalog.unnest(publications) AS publication(value)
+                WHERE publication.value->>'schema_name' IS NULL
+                OR publication.value->>'schema_name' !~ '^source_profile_result_[0-9a-f]{{32}}$'
+                OR pg_catalog.jsonb_typeof(publication.value#>'{{publication,children}}') IS DISTINCT FROM 'array') THEN
+                RAISE EXCEPTION 'source profile attachment names are unavailable' USING ERRCODE='55000';
+            END IF;
+            IF EXISTS(SELECT FROM pg_catalog.unnest(publications) AS publication(value)
+                WHERE pg_catalog.jsonb_array_length(publication.value#>'{{publication,children}}') NOT BETWEEN 1 AND 4
+                OR (SELECT count(DISTINCT child.value->>1)
+                    FROM pg_catalog.jsonb_array_elements(publication.value#>'{{publication,children}}') AS child(value)
+                    WHERE pg_catalog.jsonb_typeof(child.value)='array' AND pg_catalog.jsonb_array_length(child.value)=3
+                    AND child.value->>0 IN ('provider_profile_import_run','provider_profile_artifact','provider_profile_source_record','provider_profile_fact')
+                    AND child.value->>1 ~ '^[A-Za-z_][A-Za-z0-9_]{{0,62}}$') <> pg_catalog.jsonb_array_length(publication.value#>'{{publication,children}}')) THEN
+                RAISE EXCEPTION 'source profile attachment names are unavailable' USING ERRCODE='55000';
+            END IF;
             IF EXISTS(
                 SELECT 1 FROM pg_catalog.unnest(publications) AS publication(value)
-                CROSS JOIN LATERAL pg_catalog.jsonb_array_elements(publication.value->'children') AS child(value)
-                JOIN pg_catalog.pg_inherits inherited ON inherited.inhrelid::text=child.value->>2
+                CROSS JOIN LATERAL pg_catalog.jsonb_array_elements(publication.value#>'{{publication,children}}') AS child(value)
+                JOIN pg_catalog.pg_namespace namespace ON namespace.nspname=publication.value->>'schema_name'
+                JOIN pg_catalog.pg_class relation ON relation.relnamespace=namespace.oid AND relation.relname=child.value->>1
+                JOIN pg_catalog.pg_inherits inherited ON inherited.inhrelid=relation.oid
             ) THEN
                 RAISE EXCEPTION 'source profile attached adoption seal is retained' USING ERRCODE='55000';
             END IF;

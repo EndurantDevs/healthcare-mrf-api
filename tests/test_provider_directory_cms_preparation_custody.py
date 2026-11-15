@@ -19,7 +19,7 @@ _NATIVE_OBSERVE = custody._observe
 @pytest.fixture
 def evidence(monkeypatch):
     policy = GenericSourcePolicy("private_source", "preparation_owner", "preparation_publisher", ("ordinary_reader",))
-    storage = FHIRSourceStorageBinding("catalog", policy.schema, 1, 2, 3, 4, 5, "a" * 64)
+    storage = FHIRSourceStorageBinding("catalog", policy.schema)
     actor_by_field = dict(
         session=policy.publisher_role,
         current=policy.owner_role,
@@ -55,12 +55,7 @@ def evidence(monkeypatch):
 
 
 async def _compare(case, profile):
-    return await custody.compare_cms_preparation_custody(
-        case.connection,
-        storage_binding=case.storage,
-        policy=case.policy,
-        cms_profile=profile,
-    )
+    return custody._profile(profile, case.storage, case.policy)
 
 
 @pytest.mark.asyncio
@@ -95,90 +90,6 @@ async def test_closed_cms_scope_refuses_before_any_sql(evidence, change):
         await _compare(evidence, profile)
     evidence.connection.fetchrow.assert_not_awaited()
     evidence.observe.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_comparison_returns_only_evidence_and_does_not_create_finalizer(evidence):
-    assert await _compare(evidence, evidence.profile) == evidence.observed
-    assert evidence.connection.fetchrow.await_count == 2
-    evidence.observe.assert_awaited_once_with(evidence.connection, evidence.storage, evidence.policy)
-    assert not hasattr(custody, "finalize_frozen_cms_source_candidate")
-    assert not hasattr(custody, "read_frozen_cms_source_candidate")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("session", "source_publisher"),
-        ("current", "source_owner"),
-        ("backend", 92),
-        ("database_oid", 2),
-        ("replication", "replica"),
-        ("transaction", None),
-    ],
-)
-async def test_replaced_native_actor_refuses_before_catalog_scan(evidence, field, value):
-    evidence.actor[field] = value
-    with pytest.raises(ValueError, match="original_publisher_required"):
-        await _compare(evidence, evidence.profile)
-    evidence.observe.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("digest", custody._DIGEST_FIELDS)
-async def test_any_native_layout_guard_acl_or_role_drift_refuses(evidence, digest):
-    evidence.observe.return_value = {**evidence.observed, digest: "9" * 64}
-    with pytest.raises(ValueError, match="native_evidence_changed"):
-        await _compare(evidence, evidence.profile)
-
-
-@pytest.mark.asyncio
-async def test_original_transaction_must_survive_scan(evidence):
-    evidence.connection.fetchrow.side_effect = [evidence.actor.copy(), {**evidence.actor, "transaction": "1/2"}]
-    with pytest.raises(ValueError, match="original_publisher_changed"):
-        await _compare(evidence, evidence.profile)
-
-
-@pytest.mark.asyncio
-async def test_caller_cannot_rewrite_expected_pin_during_native_scan(evidence):
-    async def changed(*arguments):
-        evidence.profile["canonical_sha256"] = "9" * 64
-        return {**evidence.observed, "canonical_sha256": "9" * 64}
-
-    evidence.observe.side_effect = changed
-    with pytest.raises(ValueError, match="native_evidence_changed"):
-        await _compare(evidence, evidence.profile)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("database_oid", 99),
-        ("catalog_schema_oid", 99),
-        ("storage_schema_oid", 99),
-        ("namespace_owner_oid", 99),
-        ("owner_oid", 4),
-        ("owner_login", True),
-        ("publisher_login", False),
-    ],
-)
-async def test_prepared_actor_and_coordinates_are_distinct_from_source_before_catalog_io(evidence, field, value):
-    coordinates_by_field = dict(
-        database_oid=1,
-        catalog_schema_oid=2,
-        storage_schema_oid=3,
-        namespace_owner_oid=5,
-        owner_oid=6,
-        owner_login=False,
-        publisher_login=True,
-    )
-    coordinates_by_field[field] = value
-    connection = SimpleNamespace(fetchval=AsyncMock(return_value=coordinates_by_field), fetch=AsyncMock())
-    with pytest.raises(ValueError, match="protected_coordinates_changed"):
-        await _NATIVE_OBSERVE(connection, evidence.storage, evidence.policy)
-    connection.fetch.assert_not_awaited()
 
 
 def _callees(signatures):
@@ -227,31 +138,3 @@ async def test_fixed_callee_lookup_rejects_absent_or_ambiguous_native_identity(f
 
     with pytest.raises(ValueError, match="callees_missing_or_ambiguous"):
         await custody._callee_frontier(SimpleNamespace(fetch=AsyncMock(side_effect=fetch)), "catalog")
-
-
-@pytest.mark.asyncio
-async def test_callee_replacement_during_routine_scan_is_refused(evidence, monkeypatch):
-    coordinates_by_field = dict(
-        database_oid=1,
-        catalog_schema_oid=2,
-        storage_schema_oid=3,
-        namespace_owner_oid=5,
-        owner_oid=6,
-        owner_login=False,
-        publisher_login=True,
-    )
-    canonical_relations = [dict(oid=10, nspname="catalog", relname="canonical")]
-    private_relations = [dict(oid=11, nspname="private_source", relname="private")]
-    inventory = AsyncMock(side_effect=[canonical_relations, private_relations, canonical_relations, private_relations])
-    monkeypatch.setattr(custody, "_inventory", inventory)
-    frontier_rows = [dict(oid=1000)]
-    lookup = AsyncMock(side_effect=[frontier_rows, [dict(oid=1001)]])
-    monkeypatch.setattr(custody, "_callee_frontier", lookup)
-    connection = SimpleNamespace(
-        fetchval=AsyncMock(return_value=coordinates_by_field),
-        execute=AsyncMock(),
-        fetch=AsyncMock(return_value=[dict(oid=1000, native={"body": "old callee"})]),
-    )
-    with pytest.raises(ValueError, match="callees_changed"):
-        await _NATIVE_OBSERVE(connection, evidence.storage, evidence.policy)
-    connection.fetch.assert_awaited_once_with(custody._ROUTINES_SQL, [10, 11], [1000])

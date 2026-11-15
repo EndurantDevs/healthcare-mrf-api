@@ -126,16 +126,13 @@ def claims_dictionary_tables(session):
 
 async def _query_catalog_neighbors(session, pairs: set[tuple[str, str]]) -> set[tuple[str, str]]:
     """Return same-name neighbors from the request's pinned code catalog."""
-    from api.network_read_execution import execute_network_read
-
     code_catalog_table = claims_dictionary_tables(session)[0]
     if not pairs:
         return set()
 
     named_pairs = set()
     for system, code in pairs:
-        name_result = await execute_network_read(
-            session,
+        name_result = await session.execute(
             select(code_catalog_table.c.display_name)
             .where(
                 and_(
@@ -149,8 +146,7 @@ async def _query_catalog_neighbors(session, pairs: set[tuple[str, str]]) -> set[
         if not display_name:
             continue
         named_pairs.add((system, code))
-        neighbors = await execute_network_read(
-            session,
+        neighbors = await session.execute(
             select(code_catalog_table.c.code_system, code_catalog_table.c.code).where(
                 func.lower(code_catalog_table.c.display_name) == str(display_name).strip().lower()
             ),

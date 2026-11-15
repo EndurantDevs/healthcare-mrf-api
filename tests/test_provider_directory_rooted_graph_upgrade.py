@@ -1,178 +1,215 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Feature preparation preserves existing callable identities and native index custody."""
+"""Normal Rooted reconciliation closes named writers before retiring private-input FKs."""
 
-import copy
-from functools import lru_cache
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from db import migration_rooted_publication_freeze as freeze
-from tests.test_acquisition_validator_argument_types_migration import _current_functions, _migration
-from tests.test_provider_directory_rooted_graph_publication_freeze import _current_bodies
-from tests.test_provider_directory_source_callable_custody import _entry
+from process.provider_directory_rooted_graph_bulk import _data_module
+
+SCHEMA = "snapshot_schema"
+OWNER = "protected_namespace_owner"
+APPLICATIONS = ("old_builder", "source_worker", "catalog_publisher", "api_reader")
 
 
-@lru_cache
-def _bodies():
-    bodies = _current_bodies()
-    for (name, _), attributes in _current_functions().items():
-        if name not in {
-            "provider_directory_rooted_graph_dataset_valid",
-            "provider_directory_rooted_graph_dataset_ready",
-        }:
-            continue
-        body = attributes[-1]
-        for caller, old, new, count in _migration()._calls("snapshot_schema"):
-            if caller == name:
-                assert body.count(old) == count
-                body = body.replace(old, new)
-        bodies[name] = body
-    return bodies
+class _Rows(list):
+    def mappings(self):
+        return self
+
+    def one(self):
+        assert len(self) == 1
+        return self[0]
 
 
-def _functions():
-    functions_by_name = {}
-    for name, body in _bodies().items():
-        signature = name + ("()" if name in (freeze.GUARD, freeze.WORK_GUARD, freeze.SINGLE_ROOT_GUARD) else "(text)")
-        entry = _entry(signature)
-        identity_by_field = {key: value for key, value in entry["definition"].items() if key != "prosrc"}
-        functions_by_name[name] = {
-            "body": body,
-            "definition": "CREATE OR REPLACE FUNCTION " + name + " AS $body$" + body + "$body$",
-            "identity": identity_by_field,
-            "description": "existing callable",
-            "language": entry["language"],
-        }
-    return functions_by_name
-
-
-def _installer(monkeypatch, records, *, prepared=True):
-    connection = Mock()
-    connection.in_transaction.return_value = True
-    connection.execute.side_effect = [
-        Mock(scalar_one_or_none=lambda: True),
-        Mock(scalar_one_or_none=lambda: "preparation" if prepared else None),
+def _relations():
+    rooted = _data_module("20260811020000_provider_directory_rooted_graph_acquisition.py")
+    roots = (
+        rooted._ACQUISITION,
+        rooted._WORK,
+        rooted._RESOURCE,
+        rooted._EDGE,
+        rooted._TWIN_ATTEMPT,
+        rooted._TWIN_ADMISSION,
+        rooted._ROOTED_PROVENANCE,
+        rooted._ROOTED_DATASET,
+    )
+    return [
+        {"schema_name": SCHEMA, "relation_name": name, "columns": ["dataset_id", "status"]}
+        for name in (
+            *roots,
+            *(root + "_legacy" for root in (rooted._WORK, rooted._RESOURCE, rooted._EDGE)),
+            "work_partition_example",
+        )
     ]
 
-    def snapshot(_connection, signature):
-        name = signature.split(".", 1)[1].split("(", 1)[0].strip('"')
-        return copy.deepcopy(records[name])
 
-    def replace(statement):
-        name = statement.split("CREATE OR REPLACE FUNCTION ", 1)[1].split(" AS ", 1)[0]
-        record = records[name]
-        body = freeze.wrapped_body(name, "snapshot_schema", record["body"])
-        assert statement == record["definition"].replace(record["body"], body, 1)
-        record.update(body=body, definition=statement)
+def _connection(*, failure=None, missing_root=False, logical_guard=True):
+    statements = []
+    relations = _relations()[1:] if missing_root else _relations()
 
-    connection.exec_driver_sql.side_effect = replace
-    monkeypatch.setattr(freeze, "_function_snapshot", snapshot)
-    auxiliary = Mock(return_value={"existing": "dependencies"})
-    index = Mock()
-    monkeypatch.setattr(freeze, "_function_auxiliary", auxiliary)
-    monkeypatch.setattr(freeze, "_ensure_preparation_handoff_index", index)
-    return connection, auxiliary, index
+    def execute(statement, parameters):
+        query = str(statement)
+        if query == freeze._ROOTED_WRITE_FAMILY_SQL:
+            assert set(parameters) == {"roots"} and len(parameters["roots"]) == 11
+            assert {
+                f'"{SCHEMA}"."provider_directory_rooted_graph_{kind}_legacy"' for kind in ("work", "resource", "edge")
+            } <= set(parameters["roots"])
+            return _Rows(relations)
+        if "pg_get_functiondef" in query:
+            assert set(parameters) == {"signature"}
+            return _Rows([{"body": "SELECT true;", "definition": "existing static validator"}])
+        if "pg_get_function_identity_arguments" in query:
+            assert parameters["schema"] == SCHEMA
+            return _Rows([{"signature": f'"{SCHEMA}"."prepare_provider_directory_rooted_graph_storage"(text)'}])
+        assert query == "SELECT to_regprocedure(:signature) IS NOT NULL"
+        return SimpleNamespace(scalar_one=lambda: logical_guard)
+
+    def apply(statement):
+        statements.append(statement)
+        if failure is not None and failure in statement:
+            raise RuntimeError("synthetic DDL failure")
+
+    return SimpleNamespace(
+        in_transaction=lambda: True, execute=Mock(side_effect=execute), exec_driver_sql=Mock(side_effect=apply)
+    ), statements
 
 
-@pytest.mark.parametrize("prepared", [False, True])
-def test_upgrade_is_idempotent_and_preserves_callable_identity_and_dependencies(monkeypatch, prepared):
-    records = _functions()
-    originals = copy.deepcopy(records)
-    connection, auxiliary, index = _installer(monkeypatch, records, prepared=prepared)
-    freeze.upgrade_rooted_publication_freeze(connection, "snapshot_schema")
-    assert connection.exec_driver_sql.call_count == (6 if prepared else 2)
-    assert auxiliary.call_count == 2
-    if prepared:
-        index.assert_called_once_with(connection)
+def _upgrade(connection):
+    freeze.upgrade_rooted_publication_freeze(
+        connection, SCHEMA, application_roles=APPLICATIONS, protected_owner_role=OWNER
+    )
+
+
+def test_upgrade_closes_header_parent_and_leaf_writes_before_fk_retirement():
+    connection, statements = _connection()
+    _upgrade(connection)
+    locks = [statement for statement in statements if statement.startswith("LOCK TABLE")]
+    lock = locks[-1]
+    assert "ACCESS EXCLUSIVE MODE NOWAIT" in lock and "ONLY " in lock
+    for relation in _relations():
+        name = f'"{SCHEMA}"."{relation["relation_name"]}"'
+        assert name in lock
+        assert f'ALTER TABLE {name} OWNER TO "{OWNER}"' in statements
+        table_revoke = next(
+            statement for statement in statements if statement.startswith("REVOKE INSERT,UPDATE,") and name in statement
+        )
+        column_revoke = next(
+            statement
+            for statement in statements
+            if statement.startswith('REVOKE INSERT("dataset_id","status")') and name in statement
+        )
+        for statement in (table_revoke, column_revoke):
+            assert "FROM PUBLIC," in statement
+            assert all(f'"{role}"' in statement for role in APPLICATIONS)
+        read_grant = next(
+            statement for statement in statements if statement.startswith(f"GRANT SELECT ON TABLE {name} ")
+        )
+        assert "PUBLIC" not in read_grant and all(f'"{role}"' in read_grant for role in APPLICATIONS)
+    drops = [statement for statement in statements if "DROP CONSTRAINT" in statement]
+    header = f'"{SCHEMA}"."provider_directory_rooted_graph_dataset"'
+    assert drops == [
+        f'ALTER TABLE {header} DROP CONSTRAINT IF EXISTS "pd_rooted_graph_dataset_{kind}_fkey"'
+        for kind in ("admission", "attempt", "publication")
+    ]
+    first_drop = statements.index(drops[0])
+    assert all(
+        statements.index(statement) < first_drop
+        for statement in statements
+        if statement.startswith(("REVOKE ", "ALTER TABLE")) and "DROP CONSTRAINT" not in statement
+    )
+    assert any(
+        statement.startswith("REVOKE EXECUTE ON FUNCTION") and "FROM PUBLIC," in statement for statement in statements
+    )
+    assert all(
+        statement.startswith("GRANT SELECT ON TABLE") for statement in statements if statement.startswith("GRANT ")
+    )
+    assert "SET LOCAL statement_timeout='3s'" in statements
+
+
+def test_reconciliation_repeats_the_same_bounded_idempotent_ddl():
+    connection, statements = _connection()
+    _upgrade(connection)
+    first_statements = list(statements)
+    _upgrade(connection)
+    assert statements == first_statements * 2
+    assert len([statement for statement in first_statements if "DROP CONSTRAINT IF EXISTS" in statement]) == 3
+
+
+def test_retirement_preserves_legacy_child_and_lifecycle_guards():
+    connection, statements = _connection()
+    _upgrade(connection)
+    legacy_drops = [
+        statement for statement in statements if "DROP TRIGGER" in statement and "pd_uhc_flex_" in statement
+    ]
+    assert legacy_drops == [
+        f'DROP TRIGGER IF EXISTS "pd_uhc_flex_dataset_parent_guard" ON "{SCHEMA}"."provider_directory_endpoint_dataset"',
+        f'DROP TRIGGER IF EXISTS "pd_uhc_flex_dataset_valid_guard" ON "{SCHEMA}"."provider_directory_uhc_flex_practitioner_dataset"',
+    ]
+    retained_guards = (
+        "pd_uhc_flex_dataset_row_guard",
+        "pd_uhc_flex_dataset_truncate_guard",
+        "pd_uhc_flex_dataset_resource_row_guard",
+        "pd_uhc_flex_dataset_resource_truncate_guard",
+        "pd_uhc_flex_dataset_source_guard",
+        "pd_uhc_flex_dataset_source_truncate_guard",
+        "pd_uhc_flex_dataset_endpoint_guard",
+        "pd_uhc_flex_dataset_endpoint_truncate_guard",
+    )
+    assert all(guard not in statement for guard in retained_guards for statement in statements)
+    assert not any("DROP FUNCTION" in statement for statement in statements)
+
+
+@pytest.mark.parametrize("kind", ["inactive", "no-applications", "no-owner", "owner-is-application"])
+def test_missing_configured_write_closure_refuses_before_any_ddl(kind):
+    connection, statements = _connection()
+    applications, owner = APPLICATIONS, OWNER
+    if kind == "inactive":
+        connection.in_transaction = lambda: False
+    elif kind == "no-applications":
+        applications = ()
+    elif kind == "no-owner":
+        owner = None
     else:
-        index.assert_not_called()
-    for name, record in records.items():
-        assert record["identity"] == originals[name]["identity"]
-        assert record["description"] == originals[name]["description"]
-        if name in freeze.ORIGINAL_DIGESTS and (prepared or name in (freeze.WORK_GUARD, freeze.SINGLE_ROOT_GUARD)):
-            assert freeze.is_approved_successor(name, "snapshot_schema", record["body"], freeze.ORIGINAL_DIGESTS[name])
-        else:
-            assert record["body"] == originals[name]["body"]
-    connection, _, _ = _installer(monkeypatch, records, prepared=prepared)
-    freeze.upgrade_rooted_publication_freeze(connection, "snapshot_schema")
-    connection.exec_driver_sql.assert_not_called()
+        owner = APPLICATIONS[0]
+    with pytest.raises(RuntimeError, match="rooted_publication_"):
+        freeze.upgrade_rooted_publication_freeze(
+            connection, SCHEMA, application_roles=applications, protected_owner_role=owner
+        )
+    assert statements == []
+    connection.execute.assert_not_called()
 
 
-@pytest.mark.parametrize("name", [freeze.ROOTED, freeze.WORK_GUARD, freeze.SINGLE_ROOT_GUARD])
-@pytest.mark.parametrize("mutation", ["missing", "body", "owner", "security", "settings", "definition"])
-def test_upgrade_refuses_unrecognized_callables_before_replacing_them(monkeypatch, mutation, name):
-    records = _functions()
-    record = records[name]
-    mutations_by_name = {
-        "body": lambda: record.update(body=record["body"] + "\n-- changed body\n"),
-        "owner": lambda: record["identity"].update(proowner="999"),
-        "security": lambda: record["identity"].update(prosecdef=False),
-        "settings": lambda: record["identity"].update(proconfig=["search_path=public"]),
-        "definition": lambda: record.update(definition=record["definition"] + record["body"]),
-    }
-    if mutation in mutations_by_name:
-        mutations_by_name[mutation]()
-    connection, _, index = _installer(monkeypatch, records)
-    if mutation == "missing":
-        monkeypatch.setattr(freeze, "_function_snapshot", lambda *_args: None)
-    with pytest.raises(RuntimeError, match="rooted_publication_(function|definition)"):
-        freeze.upgrade_rooted_publication_freeze(connection, "snapshot_schema")
-    connection.exec_driver_sql.assert_not_called()
-    index.assert_not_called()
+def test_missing_named_root_refuses_before_constraint_retirement():
+    connection, statements = _connection(missing_root=True)
+    with pytest.raises(RuntimeError, match="rooted_publication_roots_missing"):
+        _upgrade(connection)
+    assert not any("DROP CONSTRAINT" in statement for statement in statements)
 
 
-@pytest.mark.parametrize("drift", ["identity", "description", "dependencies"])
-def test_upgrade_checks_post_replacement_custody(monkeypatch, drift):
-    records = _functions()
-    connection, auxiliary, index = _installer(monkeypatch, records)
-    replace = connection.exec_driver_sql.side_effect
-
-    def changed(statement):
-        replace(statement)
-        record = records[next(iter(records))]
-        if drift == "identity":
-            record["identity"]["proacl"] = ["changed"]
-        elif drift == "description":
-            record["description"] = "changed"
-
-    connection.exec_driver_sql.side_effect = changed
-    if drift == "dependencies":
-        auxiliary.side_effect = [{"existing": "dependencies"}, {"unexpected": "dependency"}]
-    with pytest.raises(RuntimeError, match="rooted_publication_function_(replacement|custody)_changed"):
-        freeze.upgrade_rooted_publication_freeze(connection, "snapshot_schema")
-    index.assert_not_called()
+@pytest.mark.parametrize("failure", ["OWNER TO", "REVOKE INSERT(", "REVOKE EXECUTE", "DROP TRIGGER", "DROP CONSTRAINT"])
+def test_ddl_failure_propagates_without_running_later_steps(failure):
+    connection, statements = _connection(failure=failure)
+    with pytest.raises(RuntimeError, match="synthetic DDL failure"):
+        _upgrade(connection)
+    assert failure in statements[-1]
+    if failure != "DROP CONSTRAINT":
+        assert not any("DROP CONSTRAINT" in statement for statement in statements)
 
 
-@pytest.mark.parametrize("prior_role", ["none", "installer_role"])
-def test_handoff_hash_index_preserves_original_role_and_uses_native_jsonb_equality(prior_role):
-    connection = Mock()
-    before = ("administrator", prior_role)
-    connection.execute.side_effect = [
-        Mock(one=lambda: before),
-        Mock(scalar_one=lambda: "protected_owner"),
-        Mock(scalar_one_or_none=lambda: None),
-        Mock(one=lambda: before),
-        Mock(scalar_one_or_none=lambda: True),
-    ]
-    freeze._ensure_preparation_handoff_index(connection)
-    statements = [call.args[0] for call in connection.exec_driver_sql.call_args_list]
-    assert statements[0] == 'SET LOCAL ROLE "protected_owner"'
-    assert "USING hash(handoff)" in statements[1] and "CREATE INDEX" in statements[1]
-    assert statements[-1] == ("RESET ROLE" if prior_role == "none" else 'SET LOCAL ROLE "installer_role"')
+def test_missing_logical_current_guard_preserves_constraint_protection():
+    connection, statements = _connection(logical_guard=False)
+    with pytest.raises(RuntimeError, match="rooted_logical_current_guard_missing"):
+        _upgrade(connection)
+    assert not any("DROP CONSTRAINT" in statement for statement in statements)
 
 
-@pytest.mark.parametrize("drift", ["role", "index"])
-def test_existing_handoff_index_refuses_invalid_custody_without_rebuilding_it(drift):
-    connection = Mock()
-    before = ("administrator", "none")
-    connection.execute.side_effect = [
-        Mock(one=lambda: before),
-        Mock(scalar_one=lambda: "protected_owner"),
-        Mock(scalar_one_or_none=lambda: "existing_index"),
-        Mock(one=lambda: ("other", "none") if drift == "role" else before),
-        Mock(scalar_one_or_none=lambda: drift != "index"),
-    ]
-    with pytest.raises(RuntimeError, match="rooted_publication_(migration_role|handoff_index)_changed"):
-        freeze._ensure_preparation_handoff_index(connection)
-    connection.exec_driver_sql.assert_not_called()
+def test_partition_enumeration_is_names_only_and_scoped_to_the_fixed_roots():
+    query = freeze._ROOTED_WRITE_FAMILY_SQL
+    assert "unnest(CAST(:roots AS text[]))" in query
+    assert "pg_inherits" in query and "JOIN family" in query
+    projection = query.split(" SELECT n.nspname", 1)[1].split(" FROM family", 1)[0]
+    assert "schema_name" in projection and "relation_name" in projection and "AS columns" in projection
+    for forbidden in ("relowner", "relacl", "pg_roles", "pg_auth_members", "relfilenode", "prosrc"):
+        assert forbidden not in query

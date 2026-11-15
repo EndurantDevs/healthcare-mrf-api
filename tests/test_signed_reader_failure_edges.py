@@ -10,6 +10,7 @@ from uuid import UUID
 import pytest
 
 from api import custom_import_read_http as transport
+from api import provider_profile_snapshot as snapshot
 from api import reference_family_reads
 from api import signed_request_reader as boundary
 from tests.signed_request_reader_support import cold_caller, install_reader_factory
@@ -20,19 +21,36 @@ from tests.test_reader_failure_diagnostics import CORE_ID, REQUEST_ID, _database
 @pytest.mark.parametrize("resource", ["providers", "search"])
 async def test_signed_provider_entry_uses_guarded_claims_reader(monkeypatch, resource):
     session = ReaderSession()
-    install_reader_factory(monkeypatch, session)
+    database = install_reader_factory(monkeypatch, session)
+    events = []
+
+    async def claims_reader(actual):
+        assert actual is session and "provider_profile_relations" in session.info
+        assert any(str(statement).startswith("LOCK TABLE ") for statement, _ in session.executed)
+        events.append("claims")
+
+    @asynccontextmanager
+    async def snapshot_scope(actual, _schema, **_options):
+        assert actual is session and events == ["claims"]
+        events.append("snapshot")
+        yield
+
+    monkeypatch.setattr(reference_family_reads, "pin_claims_reader", AsyncMock(side_effect=claims_reader))
+    monkeypatch.setattr(snapshot, "_read_snapshot_scope", snapshot_scope)
     request = SimpleNamespace(path="/api/v1/extensions/custom-import/" + resource, headers={})
     async with boundary.signed_request_reader(request, cold_caller()) as reader:
         assert reader is session
         if resource == "providers":
             reference_family_reads.pin_claims_reader.assert_awaited_once_with(session)
+            async with snapshot.provider_profile_read_snapshot(database, "mrf", include_detail=True) as actual:
+                assert actual is session and events == ["claims", "snapshot"]
         else:
             reference_family_reads.pin_claims_reader.assert_not_awaited()
     assert session.closed and session.committed
 
 
 @pytest.mark.parametrize("address,port", [(None, None), ("not-an-ip-address", 5432)])
-async def test_reader_failure_logs_only_valid_native_identity(monkeypatch, caplog, address, port):
+async def test_reader_failure_discards_legacy_native_identity(monkeypatch, caplog, address, port):
     session = ReaderSession()
     database = install_reader_factory(monkeypatch, session)
     ordinary = cold_caller()
@@ -40,17 +58,13 @@ async def test_reader_failure_logs_only_valid_native_identity(monkeypatch, caplo
     failure = RuntimeError("credential-sentinel")
     with pytest.raises(RuntimeError) as caught:
         async with boundary.signed_request_reader(request, ordinary, verified_request_id=REQUEST_ID):
-            session.info["api_reader_identity"].update(server_address=address, server_port=port)
+            session.info["api_reader_identity"] = {"server_address": address, "server_port": port}
             raise failure
     assert caught.value is failure and not hasattr(request, "ctx")
     assert session.closed and session.rolled_back and not database.has_reader_session()
     fields, _ = _logged(failure, caplog)
     assert fields["request_id"] == REQUEST_ID and fields["request_id_source"] == "verified_transport"
-    assert fields["reader"] == (
-        {"role_oid": 12345, "database_oid": 23456, "backend_pid": 34567, "server_address": None, "server_port": None}
-        if address is None
-        else None
-    )
+    assert "reader" not in fields
 
 
 @pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError])
@@ -102,7 +116,7 @@ def test_invalid_correlation_ids_cannot_displace_valid_ids(caplog, verified, for
     )
     fields, _ = _logged(failure, caplog)
     assert fields["request_id"] == expected and fields["request_id_source"] == source
-    assert fields["core_request_id"] == CORE_ID and fields["reader"] is None
+    assert fields["core_request_id"] == CORE_ID and "reader" not in fields
     assert fields["forwarded_request_id"] == (REQUEST_ID if forwarded == REQUEST_ID else None)
 
 
@@ -143,7 +157,7 @@ async def test_reader_marker_without_factory_ownership_is_rejected_and_closed(mo
     assert closed_readers == [reader] and request.ctx is context
     assert context.sa_session is ordinary and context.session is ordinary
     fields, _ = _logged(caught.value, caplog)
-    assert fields["reader"] is None and fields["request_id"] == REQUEST_ID
+    assert "reader" not in fields and fields["request_id"] == REQUEST_ID
     assert fields["request_id_source"] == "verified_transport"
 
 

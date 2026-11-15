@@ -152,12 +152,10 @@ async def test_mismatched_identity_cas_or_cancellation_rolls_back_before_any_par
 async def test_prepared_count_uses_verified_completed_output_without_raw_duplicates(case):
     binding = case.header["candidate_storage_json"]
     binding["phase"] = "prepared"
-    for index, root in enumerate(failure.storage.RELATIONS):
+    for root in failure.storage.RELATIONS:
         binding["tables"][root] = dict(
+            schema="source_schema",
             name="pdgs_" + "b" * 32 + "_" + failure.storage._SUFFIXES[root],
-            oid=20 + index,
-            owner=100,
-            layout_sha256="c" * 64,
         )
     await failure.mark_source_candidate(case.directory, case.candidate, "incomplete", {})
     query, dataset_id = case.native.fetchval.await_args.args

@@ -9,7 +9,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from api.network_direct_heap_reads import direct_heap_read_statement
 from process.network_compact_layout import CompactAddressRelation
 
-PIN = CompactAddressRelation("held", "provider", 23)
+PIN = CompactAddressRelation("held", "provider")
 TABLE = Table("provider", MetaData(), Column("id", Integer), Column("private", Integer), schema="held")
 
 
@@ -81,45 +81,3 @@ def test_orm_entities_are_retained_without_replacing_their_columns():
     assert adapted.column_descriptions == statement.column_descriptions
     assert adapted.compile().params == statement.compile().params
     assert "FROM ONLY held.provider" in _sql(adapted)
-
-
-def test_address_scope_markers_survive_composition_with_direct_heap_hints():
-    from api.network_address_scope import network_address_read_scope, scoped_address_statement
-    from api.network_read_execution import network_read_relations
-    from db.models import EntityAddressUnified
-    from tests.test_network_read_execution import _manifest
-
-    addresses = EntityAddressUnified.__table__
-    statement = select(TABLE.c.id).where(exists(select(addresses.c.location_key)))
-    with network_address_read_scope(_manifest(), (42,)):
-        scoped = scoped_address_statement(statement)
-        pins = network_read_relations(scoped)
-        adapted = direct_heap_read_statement(scoped, (PIN,))
-        assert network_read_relations(adapted) == pins
-        assert "FROM ONLY held.provider" in _sql(adapted)
-
-
-@pytest.mark.parametrize("refuse", [False, True])
-async def test_buffered_execution_uses_only_hints_before_existing_identity_guard(refuse):
-    from sanic.exceptions import ServiceUnavailable
-
-    from api import network_read_execution as execution
-    from tests.test_network_bound_names import _PIN, _installable_session
-
-    session, driver, buffered = _installable_session()
-    await execution.install_network_read_inventory(session, (_PIN,), only_relations=(_PIN,))
-    physical = Table(_PIN.table_name, MetaData(), Column("id", Integer), schema=_PIN.schema_name)
-
-    async def execute(statement, _parameters):
-        assert f"FROM ONLY {_PIN.schema_name}.{_PIN.table_name}" in _sql(statement)
-        driver.fetchrow.return_value["valid"] = not refuse
-        return buffered
-
-    session.execute.side_effect = execute
-    operation = execution.execute_network_read(session, select(physical.c.id))
-    if refuse:
-        with pytest.raises(ServiceUnavailable):
-            await operation
-        buffered.close.assert_called_once()
-    else:
-        assert await operation is buffered

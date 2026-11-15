@@ -84,12 +84,12 @@ def scope(monkeypatch):
         },
     }
     receipts_by_root = {
-        root: {"name": f"pdgs_{'1' * 32}_{suffix}", "oid": 10 + i, "owner": 5, "layout_sha256": "b" * 64}
+        root: {"schema": "mrf", "name": f"pdgs_{'1' * 32}_{suffix}"}
         for i, (root, suffix) in enumerate(zip(candidate.CMS_IDENTITY_TABLES, ("eb", "ee", "nb", "ne"), strict=True))
     }
 
     def receipt(suffix, oid):
-        return {"name": f"pdgs_{'1' * 32}_{suffix}", "oid": oid, "owner": 5, "layout_sha256": "b" * 64}
+        return {"schema": "mrf", "name": f"pdgs_{'1' * 32}_{suffix}"}
 
     binding_by_field = {
         "contract": storage.CONTRACT,
@@ -181,13 +181,10 @@ async def test_changed_release_replay_refuses_before_any_new_copy(scope):
 
 
 @pytest.mark.asyncio
-async def test_inherited_child_task_and_wrong_physical_session_refuse_before_io(scope):
-    publisher, session, identity, receipts = scope
-    async with candidate.bind_cms_identity_candidate(publisher, identity, receipts):
-        with pytest.raises(candidate.GenericCandidateError, match="physical_session_required"):
-            await asyncio.create_task(candidate.identity_candidate(session))
-        with pytest.raises(candidate.GenericCandidateError, match="physical_session_required"):
-            await candidate.identity_candidate(object())
+async def test_logical_candidate_scope_is_required_before_io(scope):
+    publisher, session, _, _ = scope
+    with pytest.raises(candidate.GenericCandidateError, match="candidate_scope_required"):
+        await candidate.identity_candidate(session)
     assert publisher.connection.reads == []
 
 
@@ -226,6 +223,23 @@ async def test_wrong_producer_or_global_target_receipt_refuses(scope):
     with pytest.raises(candidate.GenericCandidateError, match="global_target_forbidden"):
         async with candidate.bind_cms_identity_candidate(publisher, identity, receipts):
             pytest.fail("invalid binding entered")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["schema", "alias", "extra"])
+async def test_candidate_stage_names_cannot_escape_or_alias(scope, change):
+    publisher, _, identity, receipts = scope
+    first, second = candidate.CMS_IDENTITY_TABLES[:2]
+    if change == "schema":
+        receipts[first]["schema"] = "accepted_catalog"
+    elif change == "alias":
+        receipts[first]["name"] = receipts[second]["name"]
+    else:
+        receipts[first]["unexpected"] = True
+    with pytest.raises(candidate.GenericCandidateError, match="stage_receipt_changed|stages_aliased"):
+        async with candidate.bind_cms_identity_candidate(publisher, identity, receipts):
+            pytest.fail("invalid candidate names entered")
+    assert publisher.connection.reads == publisher.connection.copies == []
 
 
 @pytest.mark.asyncio
@@ -511,7 +525,10 @@ async def test_complete_five_stage_binding_is_required_before_any_identity_copy(
     elif change == "untracked_extra":
         tables["untracked"] = dict(tables[storage.CMS_RESOURCE_IDENTITY_ROOT])
     else:
-        tables[candidate.CMS_IDENTITY_TABLES[-1]] = {**tables[candidate.CMS_IDENTITY_TABLES[-1]], "oid": 99}
+        tables[candidate.CMS_IDENTITY_TABLES[-1]] = {
+            **tables[candidate.CMS_IDENTITY_TABLES[-1]],
+            "name": "different_candidate_stage",
+        }
     async with candidate.bind_cms_identity_candidate(publisher, identity, receipts):
         with pytest.raises(Exception, match="auxiliary_binding_changed|protected_binding_changed"):
             await bind_entity_batch(session, source_id="cms-npd", release_id="a" * 64, resources=organizations(1))

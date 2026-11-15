@@ -27,13 +27,14 @@ def _payload():
         "address": dict.fromkeys(receipts._AUTHORITY_FIELDS),
         "doctors": dict.fromkeys(receipts._AUTHORITY_FIELDS | {"importer_id"}),
         "alias_generation": 0,
-        "overlay_oid": 1,
+        "overlay": {"schema_name": "mrf", "relation_name": "provider_directory_address_overlay"},
     }
 
 
 def _archive_result():
     return {
-        "target_oid": 42,
+        "target_schema": "mrf",
+        "target_table": "address_archive_v2",
         "from_revision": 0,
         "to_revision": 2,
         "native_input_hash": "a" * 64,
@@ -50,7 +51,7 @@ def _archive_result():
         ("to_revision", 3),
         ("native_input_hash", "unbound"),
         ("delta_rows", True),
-        ("target_oid", 2**32),
+        ("target_table", "other"),
     ],
 )
 def test_archive_result_is_closed_and_bounded(field_name, replacement):
@@ -76,9 +77,7 @@ def test_archive_history_carries_only_for_the_same_retained_cms_pin():
             catalog_digest="f" * 64,
         )
     )
-    snapshot_by_field = {
-        key: previous[key] for key in ("profile", "address", "doctors", "alias_generation", "overlay_oid")
-    }
+    snapshot_by_field = {key: previous[key] for key in ("profile", "address", "doctors", "alias_generation", "overlay")}
     result = publication._receipt_payload(execution, previous["cms"], predecessor_by_field, snapshot_by_field)
     assert result["archive"] == previous["archive"]
     with pytest.raises(RuntimeError, match="archive_result_required"):
@@ -111,4 +110,36 @@ async def test_receipt_append_requires_caller_transaction():
     session = SimpleNamespace(in_transaction=lambda: False, scalar=AsyncMock())
     with pytest.raises(ValueError, match="requires_transaction"):
         await receipts.append_serving_receipt(session, "mrf", _payload())
+    session.scalar.assert_not_awaited()
+
+
+def test_retained_legacy_archive_result_keeps_opaque_coordinates_unchanged():
+    payload = _payload()
+    legacy = _archive_result()
+    del legacy["target_schema"], legacy["target_table"]
+    legacy["target_oid"] = "opaque retired edition"
+    payload["archive"] = legacy
+    assert receipts.validate_receipt_payload(payload) is payload
+    assert payload["archive"] is legacy
+
+
+def test_legacy_receipt_is_decoded_without_rewriting_retired_coordinates_or_content():
+    payload = _payload()
+    payload["overlay_oid"] = payload.pop("overlay")
+    for kind in ("address", "doctors"):
+        payload[kind]["relation_oids"] = {"opaque": "old edition"}
+        del payload[kind]["relations"]
+    for field in ("evidence_target", "profile_target"):
+        payload["profile"][field + "_oid"] = "opaque old edition"
+        del payload["profile"][field]
+    assert receipts.validate_receipt_payload(payload) is payload
+
+
+@pytest.mark.asyncio
+async def test_fresh_receipt_refuses_legacy_native_coordinates_before_inserting():
+    payload = _payload()
+    payload["overlay_oid"] = payload.pop("overlay")
+    session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock())
+    with pytest.raises(ValueError, match="named_fields_required"):
+        await receipts.append_serving_receipt(session, "mrf", payload)
     session.scalar.assert_not_awaited()

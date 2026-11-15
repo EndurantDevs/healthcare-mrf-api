@@ -2,6 +2,7 @@
 """Only the active verified connection may reuse a catalog manifest."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
@@ -17,7 +18,6 @@ from tests.test_registry_network_catalog_read import batch_boundary, legacy_sele
 @pytest.mark.asyncio
 async def test_sealed_catalog_pin_resolves_the_published_metadata(batch_boundary, monkeypatch):
     connection, manifest, _ = batch_boundary
-    object.__setattr__(manifest, "_custody_seal_sha256", "c" * 64)
     resolve = AsyncMock(return_value=manifest)
     monkeypatch.setattr(catalog, "resolve_network_serving_manifest", resolve)
     assert await catalog.catalog_pin(connection, 9, "sample_control") is manifest
@@ -60,8 +60,8 @@ async def test_legacy_reuses_active_verified_manifest_once(batch_boundary, monke
 async def test_manifest_reuse_refuses_unverified_context(batch_boundary, damage):
     connection, manifest, _ = batch_boundary
     async with catalog.registry_catalog_read_snapshot(connection, None, "sample_control"):
-        supplied = replace(manifest) if damage == "copy" else manifest
-        driver = object() if damage == "connection" else connection
+        supplied = replace(manifest, manifest_sha256="c" * 64) if damage == "copy" else manifest
+        driver = SimpleNamespace(is_in_transaction=lambda: False) if damage == "connection" else connection
         schema = "other_control" if damage == "schema" else "sample_control"
         generation = 10 if damage == "generation" else 9
         connection.in_transaction = damage != "closed"
@@ -127,8 +127,8 @@ async def test_catalog_family_reuse_refuses_without_query_or_repin(batch_boundar
         prior = len(connection.calls)
         pin = AsyncMock(side_effect=AssertionError("unexpected metadata verification"))
         monkeypatch.setattr(catalog, "_pin", pin)
-        supplied = replace(manifest) if damage == "copy" else manifest
-        driver = object() if damage == "connection" else connection
+        supplied = replace(manifest, manifest_sha256="c" * 64) if damage == "copy" else manifest
+        driver = SimpleNamespace(is_in_transaction=lambda: False) if damage == "connection" else connection
         schema = "other_control" if damage == "schema" else "sample_control"
         generation = 10 if damage == "generation" else 9
         connection.in_transaction = damage != "closed"

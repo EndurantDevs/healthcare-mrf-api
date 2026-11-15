@@ -111,12 +111,12 @@ async def test_preflight_fences_cover_publish_and_nonpublish(monkeypatch):
     )
 
     for operation in ("publish", "rebuild"):
-        execution = types.SimpleNamespace(
-            attestation=types.SimpleNamespace(operation=operation)
+        execution = types.SimpleNamespace(attestation=types.SimpleNamespace(operation=operation))
+        assert await importer._profile_capacity_preflight_fences(execution, ["source-a"]) == (
+            fence,
+            resource_fence,
+            resource_types,
         )
-        assert await importer._profile_capacity_preflight_fences(
-            execution, ["source-a"]
-        ) == (fence, resource_fence, resource_types)
     backfill.assert_awaited_once_with(importer._schema(), ["source-a"])
 
 
@@ -229,7 +229,7 @@ async def test_receipt_context_orchestration(monkeypatch):
 @pytest.mark.asyncio
 async def test_receipt_snapshot_orchestration(monkeypatch):
     """Persist one exact preflight snapshot after all bounded inputs agree."""
-    existing_row_by_field = {"existing": True}
+    existing_row_by_field = None
     snapshot_request = types.SimpleNamespace(request_sha256="a" * 64)
     snapshot_workload = object()
     snapshot_geometry = object()
@@ -281,12 +281,7 @@ async def test_receipt_snapshot_orchestration(monkeypatch):
     )
     persisted = AsyncMock(return_value=receipt_by_field)
     monkeypatch.setattr(importer, "_persist_or_replay_capacity_receipt", persisted)
-    assert (
-        await importer._profile_capacity_preflight_snapshot(
-            snapshot_request, ["source-a"]
-        )
-        == receipt_by_field
-    )
+    assert await importer._profile_capacity_preflight_snapshot(snapshot_request, ["source-a"]) == receipt_by_field
 
 
 @pytest.mark.asyncio
@@ -353,9 +348,7 @@ async def test_delta_materialization_loads_missing_serving_override(monkeypatch)
         "_provider_directory_profile_delta_sources",
         lambda *_args: (("source-a",), ()),
     )
-    execution_token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
-        object()
-    )
+    execution_token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(object())
     try:
         identity = await importer._profile_materialization_identity(
             "mrf",
@@ -369,9 +362,7 @@ async def test_delta_materialization_loads_missing_serving_override(monkeypatch)
     assert identity.serving_state == serving_state
     load_serving.assert_awaited_once_with("mrf", allow_adoption=True)
 
-    execution_token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(
-        object()
-    )
+    execution_token = importer._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(object())
     try:
         overridden = await importer._profile_materialization_identity(
             "mrf",

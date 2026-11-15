@@ -16,6 +16,7 @@ import pytest
 from db.connection import Database
 from process import provider_directory_profile_capacity as capacity
 from process import provider_directory_profile_capacity_runtime as runtime
+from tests.test_provider_directory_profile_capacity import _relation_geometry_by_field
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -72,11 +73,6 @@ def _limits_payload(**overrides: object) -> dict[str, object]:
 def _geometry_database_by_field() -> dict[str, object]:
     """Return the PostgreSQL ABI identity bound into a capacity geometry."""
     return {
-        "database_system_identifier": "7527713908662902214",
-        "database_oid": 16401,
-        "database_name": "healthporta",
-        "tablespace_oid": 1663,
-        "tablespace_name": "pg_default",
         "postgres_server_version_num": 180002,
         "postgres_block_size_bytes": 8192,
         "postgres_wal_block_size_bytes": 8192,
@@ -93,23 +89,8 @@ def _geometry_database_by_field() -> dict[str, object]:
 
 
 def _geometry_relation_by_field() -> dict[str, object]:
-    """Return serving and control relation identities for geometry tests."""
-    return {
-        "evidence_target_oid": 20001,
-        "profile_target_oid": 20002,
-        "evidence_target_storage_fingerprint": "9" * 64,
-        "profile_target_storage_fingerprint": "a" * 64,
-        "build_checkpoint_oid": 20003,
-        "serving_generation_oid": 20004,
-        "delta_receipt_oid": 20005,
-        "import_run_oid": 20006,
-        "capacity_consumption_oid": 20007,
-        "build_checkpoint_storage_fingerprint": "d" * 64,
-        "serving_generation_storage_fingerprint": "b" * 64,
-        "delta_receipt_storage_fingerprint": "c" * 64,
-        "import_run_storage_fingerprint": "f" * 64,
-        "capacity_consumption_storage_fingerprint": "0" * 64,
-    }
+    """Return declared QNames and complete numeric relation bounds."""
+    return {"relations": _relation_geometry_by_field()["relations"]}
 
 
 def _geometry_inputs(
@@ -184,10 +165,10 @@ def _assert_capacity_reservation_totals(geometry) -> None:
     assert geometry.minimum_remaining_bytes == 1_000_000
     assert geometry.artifact_scope_batch_size == 100_000
     assert geometry.maximum_worker_count == 2
-    assert geometry.import_run_oid == 20006
-    assert geometry.capacity_consumption_oid == 20007
-    assert geometry.import_run_storage_fingerprint == "f" * 64
-    assert geometry.capacity_consumption_storage_fingerprint == "0" * 64
+    assert geometry.relations["import_run"] == _relation_geometry_by_field()["relations"]["import_run"]
+    assert (
+        geometry.relations["capacity_consumption"] == _relation_geometry_by_field()["relations"]["capacity_consumption"]
+    )
     assert geometry.control_wal_plan_input_hash == "1" * 64
     assert geometry.control_wal_upper_bound_bytes == 50_000
     assert geometry.control_metadata_data_upper_bound_bytes == 60_000

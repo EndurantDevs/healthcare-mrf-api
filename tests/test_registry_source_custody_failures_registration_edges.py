@@ -29,7 +29,9 @@ async def test_native_observers_refuse_closed_original_transactions_before_catal
                     native, ledger_schema="sample", candidates=(candidate,), registrations=[]
                 )
             case "guard":
-                await registration.resolve_installed_native_input_guard(native, ledger_schema="sample", relation_oid=41)
+                await registration.resolve_installed_native_input_guard(
+                    native, ledger_schema="sample", schema_name="sample", table_name="mrf_address"
+                )
             case "adopt":
                 await registration.capture_native_input_adoption(native, ledger_schema="sample", candidate=candidate)
             case "retired":
@@ -39,15 +41,14 @@ async def test_native_observers_refuse_closed_original_transactions_before_catal
 
 
 @pytest.mark.asyncio
-async def test_actor_mismatch_refuses_registration_before_opening_mutation_scope():
+async def test_old_actor_metadata_cannot_grant_missing_native_insert_privilege():
     native = NativeProtocol()
-    with pytest.raises(RuntimeError, match="cms_native_input_operator_actor_changed"):
+    native.can_insert = False
+    with pytest.raises(PermissionError, match="INSERT denied"):
         await registration.register_native_input_candidates(
-            native, ledger_schema="sample", candidates=(native.candidate(),), expected_actor_oid=18
+            native, ledger_schema="sample", candidates=(native.candidate(),), expected_actor_oid="opaque retired actor"
         )
     assert native.rows == native.guards == {}
-    assert not _writes(native)
-    assert len(native.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -130,7 +131,7 @@ async def test_native_registration_rejects_structurally_similar_unissued_candida
     class ForeignCandidate(registration.NativeInputCandidate):
         """A structurally equal candidate from an unrecognized contract type."""
 
-    candidate = ForeignCandidate(**vars(replace(native.candidate(), relation_oid=42)))
+    candidate = ForeignCandidate(**vars(replace(native.candidate(), stage_table="other")))
     with pytest.raises(RuntimeError, match="cms_native_input_candidate_invalid"):
         await registration.verify_native_input_candidates(native, ledger_schema="sample", candidates=(candidate,))
     assert not native.calls

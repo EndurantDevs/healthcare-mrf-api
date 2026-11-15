@@ -21,7 +21,7 @@ def _compact_binding(binding):
     binding.update(contract=storage.NAMED_COMPACT_CONTRACT, payload_format=compact.FORMAT)
     prefix = binding["tables"]["resource_input"]["name"].removesuffix("_ri")
     for root, suffix in {**layout.TABLE_SUFFIXES, "resource_output_aliases": "oa"}.items():
-        binding["tables"][root] = {"name": prefix + "_" + suffix}
+        binding["tables"][root] = {"schema": binding["storage"]["storage_schema"], "name": prefix + "_" + suffix}
     return binding
 
 
@@ -35,7 +35,10 @@ async def test_compact_handoff_retains_inputs_and_skips_heap_operations_on_views
         assert document["payload_format"] == compact.FORMAT
         assert document["tables"].items() >= original_tables_by_root.items()
         assert set(document["tables"]) == set(original_tables_by_root) | set(storage.HANDOFF_CONTROL_ROOTS)
-        assert all(set(table) == {"name"} for table in document["tables"].values())
+        assert all(
+            set(table) == {"schema", "name"} and table["schema"] == document["storage"]["storage_schema"]
+            for table in document["tables"].values()
+        )
         assert not any(statement.startswith("DROP ") for statement in harness.sql)
         for root in ("resource_input", storage.RESOURCE):
             name = document["tables"][root]["name"]
@@ -48,7 +51,10 @@ async def test_compact_handoff_retains_inputs_and_skips_heap_operations_on_views
         previous_statements = list(harness.sql)
         replay = await completion.prepare_generic_source_handoff(publisher, document)
         assert replay.document == document and replay.document_sha256 == handoff.document_sha256
-        assert harness.sql == previous_statements
+        assert harness.sql[: len(previous_statements)] == previous_statements
+        assert harness.sql[len(previous_statements) :] == [
+            f'SELECT 1 FROM "{table["schema"]}"."{table["name"]}" LIMIT 0' for table in document["tables"].values()
+        ]
         storage._capture.assert_not_awaited()
 
 
@@ -59,8 +65,6 @@ async def test_compact_frozen_handoff_checks_data_without_physical_identity(harn
     driver = SimpleNamespace(
         is_in_transaction=lambda: True, execute=AsyncMock(), fetchval=AsyncMock(return_value=False)
     )
-    inventory = AsyncMock(side_effect=AssertionError("named data does not have a physical inventory guard"))
-    monkeypatch.setattr(completion, "_frozen_source_inventory", inventory)
     monkeypatch.setattr(completion, "_frozen_handoff_header", AsyncMock(return_value=harness.header))
     stored = SimpleNamespace(
         dataset_hash="a" * 64,
@@ -84,7 +88,14 @@ async def test_compact_frozen_handoff_checks_data_without_physical_identity(harn
     assert structural.await_args.args == selected.await_args.args
     assert structural.await_args.args[2] == handoff.document
     proof.assert_awaited_once()
-    inventory.assert_not_awaited()
+    assert driver.fetchval.await_count == len(handoff.document["tables"])
+    assert all(call.args[1:] == ("dataset",) for call in driver.fetchval.await_args_list)
+    driver.fetchval.return_value = True
+    proof.reset_mock()
+    with pytest.raises(ValueError, match="dataset_changed"):
+        await completion.validate_frozen_source_handoff(driver, harness.directory, handoff, protected_owner_role=None)
+    proof.assert_not_awaited()
+    driver.fetchval.return_value = False
     selected.side_effect = ValueError("invalid selected observation")
     proof.reset_mock()
     with pytest.raises(ValueError, match="invalid selected observation"):

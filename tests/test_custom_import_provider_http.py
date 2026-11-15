@@ -316,6 +316,17 @@ async def test_signed_provider_page_uses_one_snapshot_and_checks_empty_result_fi
         "end",
     ]
 
+    setup_statements = [str(statement) for statement, _ in session.reader_setup.executed]
+    assert setup_statements[:2] == ["SET LOCAL lock_timeout = '250ms'", "SET LOCAL statement_timeout = '5s'"]
+    assert len(setup_statements) == 3 and setup_statements[-1].endswith(" IN ACCESS SHARE MODE")
+    assert all(
+        name in setup_statements[-1]
+        for name in ("cms_doctor_education", "provider_directory_profile", "npi_result_generation")
+    )
+    assert session.reader_setup.nested_transactions == 1
+    with pytest.raises(AssertionError):
+        await session.execute("SELECT unexpected_payload_query")
+
 
 @pytest.mark.asyncio
 async def test_provider_scope_retains_exact_prepared_for_hydration(monkeypatch):

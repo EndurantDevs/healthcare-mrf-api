@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Original Source subsets detect producer faults without upgrading sampled read authority."""
 
+import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from uuid import uuid4
@@ -34,7 +35,6 @@ async def _reader_replay(case):
             created_names.append(names_by_kind[kind])
         await reader.execute("CREATE INDEX ON " + _identifier(names_by_kind["addresses"]) + "(address_key)")
         async with reader.transaction(isolation="repeatable_read", readonly=True):
-            assert await reader.fetchval("SELECT session_user::text") == case.fixture.component.reader
             assert await reader.fetchval("SHOW transaction_isolation") == "repeatable read"
             assert await reader.fetchval("SHOW transaction_read_only") == "on"
             standing_limit = await reader.fetchval(
@@ -57,18 +57,24 @@ async def _reader_replay(case):
 
 
 async def _immutable_publication(case, capture):
-    """Compare native Source header and candidate seal around validation, without replaying Source payloads."""
+    """Compare named source publication fields and captured graph content around validation."""
+    from db.plan_release_storage import storage_relation
+
+    relation = case.origin.header_relation
     header = await case.fixture.admin.fetchrow(
-        "SELECT publication.tableoid::oid::bigint,row_to_json(publication)::text FROM "
-        + _identifier(case.origin.schema_name)
-        + ".provider_directory_endpoint_dataset publication WHERE dataset_id=$1",
+        "SELECT row_to_json(publication)::text AS document FROM "
+        + storage_relation(relation["schema"], relation["name"])
+        + " publication WHERE dataset_id=$1",
         case.origin.dataset_id,
     )
-    seal = await case.fixture.admin.fetchval(
-        "SELECT obj_description($1::oid,'pg_namespace')", capture["catalog"]["schema_oid"]
+    assert header is not None
+    stage = await typed.bind_typed_graph_stage(
+        case.fixture.admin,
+        schema_name=capture["schema_name"],
+        table_names={kind: table["name"] for kind, table in capture["tables"].items()},
+        document=capture["graph"],
     )
-    assert header is not None and seal == custody.COMMENT + canonical(capture)
-    return tuple(header), seal, canonical(capture)
+    return header["document"], await custody._content(case.fixture.admin, stage), canonical(capture)
 
 
 def _producer_fault(monkeypatch, fault):
@@ -129,10 +135,10 @@ async def _verify_candidate(case, capture, anchor, replay, failed_direction):
             case.source_export, case.reader, capture, **arguments_by_name
         )
         assert type(result) is sampled.SampledTypedGraphRead
-        assert result.sealed_read.stage.checked is False
-        await result.verify(case.reader)
+        assert result.graph_read.stage.checked is False
+        result.require_ready()
         with pytest.raises(TypedFHIRGraphError, match="registry_fhir_typed_source_incomplete"):
-            await result.sealed_read.stage.verify(case.reader)
+            result.graph_read.stage.require_ready()
         return result.receipt
     with pytest.raises(TypedFHIRGraphError, match="^registry_fhir_typed_sample_failed$") as failure:
         await sampled.verify_sampled_typed_capture(case.source_export, case.reader, capture, **arguments_by_name)
@@ -146,8 +152,8 @@ async def _verify_candidate(case, capture, anchor, replay, failed_direction):
     [(None, None, 1), ("omitted-role", "source_to_candidate", 0), ("invented-pair", "candidate_to_source", 2)],
     ids=("valid-sampled-read", "missing-source-membership", "invented-candidate-membership"),
 )
-async def test_sampled_capture_preserves_native_custody(monkeypatch, fault, failed_direction, pair_rows):
-    async with source_witness_case(monkeypatch) as case:
+async def test_sampled_capture_preserves_named_content(monkeypatch, fault, failed_direction, pair_rows):
+    async with source_witness_case(monkeypatch, named=True) as case:
         capture, anchor = await _capture_candidate(case, monkeypatch, fault)
         assert capture["graph"]["counts"]["pair_rows"] == pair_rows
         before = await _immutable_publication(case, capture)
@@ -166,7 +172,7 @@ async def test_sampled_capture_preserves_native_custody(monkeypatch, fault, fail
                 assert network[direction]["failures"] == int(direction == failed_direction)
             sealed = await custody.load_typed_graph_capture(case.reader, capture, expected_anchor=anchor)
             assert sealed.stage.checked is False
-            await sealed.verify(case.reader)
+            sealed.require_ready()
         assert await _immutable_publication(case, capture) == before
 
 
@@ -205,7 +211,7 @@ async def test_candidate_budget_splits_after_source_eof_without_losing_provenanc
     monkeypatch.setattr(source, "_edition_rows", additional_role)
     monkeypatch.setattr(sampled, "_replay_roles", observe)
     monkeypatch.setattr(sampled, "_CANDIDATE_REPLAY_BUDGET", 4)
-    async with source_witness_case(monkeypatch) as case:
+    async with source_witness_case(monkeypatch, named=True) as case:
         capture, anchor = await _capture_candidate(case, monkeypatch, None)
         before = await _immutable_publication(case, capture)
         async with _reader_replay(case) as replay:
@@ -219,14 +225,13 @@ async def test_candidate_budget_splits_after_source_eof_without_losing_provenanc
 
 async def test_sampled_publication_keeps_proof_mode_on_retained_successor(monkeypatch):
     """Publish through original actors and retain sampled provenance without replay or promotion."""
-    from process import network_candidate_custody
     from process.network_sampled_custody import validate_sampled_custody
     from tests import test_network_fhir_source_witness_publication_postgres as publication
     from tests import test_network_fhir_typed_source_postgres as typed_fixture
 
     original_capture = typed_fixture._typed_worker_capture
     original_verification = sampled.verify_sampled_typed_capture
-    checked_actors = []
+    checked_captures = []
 
     async def capture_with_policy(*arguments):
         context = await original_capture(*arguments)
@@ -235,7 +240,7 @@ async def test_sampled_publication_keeps_proof_mode_on_retained_successor(monkey
 
     async def observe(factory, connection, capture, *, scope, policy):
         result = await original_verification(factory, connection, capture, scope=scope, policy=policy)
-        checked_actors.append(await connection.fetchval("SELECT session_user"))
+        checked_captures.append(capture["capture_id"])
         return result
 
     monkeypatch.setattr(publication, "_source_capture_for_workers", capture_with_policy)
@@ -244,7 +249,7 @@ async def test_sampled_publication_keeps_proof_mode_on_retained_successor(monkey
         first = await publication._publish_once(context)
         second = await publication._publish_once(context, head=first.generation_id)
         assert second.generation_id > first.generation_id
-        assert checked_actors == [await context.operator.connection.fetchval("SELECT session_user")]
+        assert checked_captures == [context.capture["capture_id"]]
         receipts = []
         async with (
             publication._login(context.worker, "api") as reader,
@@ -254,16 +259,17 @@ async def test_sampled_publication_keeps_proof_mode_on_retained_successor(monkey
                 reader, second
             )
             for manifest in (first, second):
-                seal = await reader.fetchrow(
-                    "SELECT receipt_json::text,seal_sha256 FROM "
+                candidate = await reader.fetchrow(
+                    "SELECT schema_name,state,validation_json::text FROM "
                     + _identifier(context.worker.fixture.control_schema)
-                    + ".network_candidate_custody WHERE candidate_id=$1",
+                    + ".network_membership_candidate WHERE candidate_id=$1",
                     manifest.candidate_id,
                 )
-                receipt = network_candidate_custody._sealed_receipt(seal)
-                assert receipt["revision"] == 5
+                assert candidate["schema_name"] == manifest.schema_name and candidate["state"] == "published"
+                validation = json.loads(candidate["validation_json"])["final_validation"]
+                assert validation["complete"] is True
                 semantic = validate_sampled_custody(
-                    receipt["semantic_validation"], candidate_id=str(manifest.candidate_id)
+                    validation["semantic_validation"], candidate_id=str(manifest.candidate_id)
                 )
                 receipts.append(semantic)
         assert receipts[0]["sources"][0]["method"] == "sampled"

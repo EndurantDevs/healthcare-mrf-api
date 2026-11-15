@@ -54,7 +54,14 @@ async def _owned(database, schema, name):
         "FROM pg_class WHERE oid=to_regclass(:name)",
         name=f"{schema}.{name}",
     )
-    return OwnedRelation(schema, name, row._mapping["oid"], row._mapping["bytes"], row._mapping["persistence"])
+    return OwnedRelation(schema, name, row._mapping["bytes"], row._mapping["persistence"])
+
+
+async def _catalog_oid(relation):
+    """Resolve a transient numeric catalog operand from the named snapshot."""
+    return await fhir.db.scalar(
+        "SELECT to_regclass(:name)::oid::bigint", name=fhir._unscoped_qt(relation.schema, relation.relation)
+    )
 
 
 async def _create_model(database, schema, model, *, dropped_slot=False):
@@ -106,13 +113,10 @@ async def test_retained_like_accepts_dropped_column_slots(monkeypatch):
         clone = await _owned(database, schema, model.__tablename__)
         original = json.loads(captured_source.catalog_json)
         observed, _toast_oid = await layout._observe_catalog(fhir, clone)
-        assert {
-            entry["attnum"] for entry in original["attributes"] if entry["relation_oid"] == source_relation.oid
-        } != {entry["attnum"] for entry in observed["attributes"] if entry["relation_oid"] == clone.oid}
         accepted = await layout.capture_retained_native_layout(fhir, clone, captured_source, (model.__tablename__,))
-        assert accepted.relation_oid == clone.oid
-        assert accepted.exact_fingerprint == fhir._identity_hash(observed)
-        assert layout._structural_catalog(original) == layout._structural_catalog(observed)
+        assert accepted == layout.NativeRelationLayout(clone.schema, clone.relation)
+        assert original == layout._structural_catalog(observed)
+        assert all("relation_oid" not in entry for entry in original["attributes"])
 
 
 @pytest.mark.asyncio
@@ -132,16 +136,9 @@ async def test_real_native_family_accepts_declared_gin_gist_and_logging(monkeypa
             initial = await layout.capture_native_layout(fhir, relation, targets)
             await _create_indexes(database, schema, stage, model)
             indexed = await layout.capture_native_layout(fhir, relation, targets)
-            assert indexed.exact_fingerprint != initial.exact_fingerprint
-            if model.__tablename__ == "entity_address_unified":
-                with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match="index_shape_unsupported"):
-                    await fhir._provider_directory_profile_relation_storage_fingerprint(
-                        relation.oid, expected_persistence="u"
-                    )
             await database.status(f'ALTER TABLE "{schema}"."{relation.relation}" SET LOGGED')
             logged = await layout.capture_native_layout(fhir, replace(relation, persistence="p"), targets)
-            assert logged.exact_fingerprint != indexed.exact_fingerprint
-            assert logged.relation_oid == indexed.relation_oid == relation.oid
+            assert initial == indexed == logged == layout.NativeRelationLayout(schema, relation.relation)
 
 
 @pytest.mark.asyncio
@@ -205,7 +202,8 @@ async def test_raw_index_names_remain_distinct_across_native_phases(monkeypatch)
         index_names = {
             index_row[0]
             for index_row in await database.all(
-                "SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid=:oid", oid=relation.oid
+                "SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid=:oid",
+                oid=(await _catalog_oid(relation)),
             )
         }
         expected_index_names = {f"{schema}.{index_name}" for index_name in layout._declarations(name, None)}
@@ -234,7 +232,7 @@ async def test_inference_indexes_remain_distinct_on_long_native_stage(monkeypatc
             index_row[0]
             for index_row in await database.all(
                 "SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid=:oid AND NOT indisprimary",
-                oid=relation.oid,
+                oid=(await _catalog_oid(relation)),
             )
         }
         expected_index_names = {
@@ -242,9 +240,8 @@ async def test_inference_indexes_remain_distinct_on_long_native_stage(monkeypatc
             for suffix in ("identity", "address")
         }
         assert len(index_names) == 2 and index_names == expected_index_names
-        assert (
-            await database.scalar("SELECT to_regclass(:name)::oid", name=f"{schema}.{stage.__tablename__}")
-            == relation.oid
+        assert await database.scalar("SELECT to_regclass(:name)::oid", name=f"{schema}.{stage.__tablename__}") == (
+            await _catalog_oid(relation)
         )
 
 
@@ -294,7 +291,7 @@ async def _signed_retention_policy(database, schema, capture_id, plan):
         "dataset-one",
         "a" * 64,
         "release-one",
-        source_resource.oid,
+        {"schema": source_resource.schema, "name": source_resource.relation},
         "medical/example",
         plan.desired_profile_as_of,
     )
@@ -360,7 +357,6 @@ async def _retained_raw_check(fixture, name, prefix):
     annotation = RetainedRawRelation(
         relation.schema,
         name,
-        relation.oid,
         json.dumps(fixture.policy, sort_keys=True, separators=(",", ":")),
         names,
     )
@@ -373,7 +369,7 @@ async def _retained_raw_check(fixture, name, prefix):
 async def _assert_retained_raw_physical(fixture, check):
     """Exercise the real aggregate checker, including its native raw dispatch."""
     relation = check.relations[0]
-    relation_map, _ = await fhir._profile_capacity_relation_row(relation.oid, "p", 0)
+    relation_map, _ = await fhir._profile_capacity_relation_row((await _catalog_oid(relation)), "p", 0)
     await fixture.producer._assert_physical(check, {"data_tablespace_oid": relation_map["effective_tablespace_oid"]})
 
 
@@ -386,13 +382,14 @@ async def _assert_provisioned_payload_columns(database, policy, raw_schema, root
     )
     assert tuple(catalog)[1:] == ("p", "p")
     if root == raw_layout.RESOURCE:
-        assert catalog._mapping["oid"] == policy["source_pin"]["resource_table_oid"]
+        assert policy["source_pin"]["resource_relation"] == {"schema": "mrf", "name": root}
     await database.status(f'CREATE TABLE "{raw_schema}"."{root}" (LIKE {source_ref} INCLUDING STORAGE)')
     relation = await _owned(database, raw_schema, root)
     observed = await raw_layout.capture_retained_raw_layout(fhir, relation, policy, (), database=database)
-    assert observed.relation_oid == relation.oid
+    assert (observed.schema_name, observed.relation_name) == (relation.schema, relation.relation)
     if root == raw_layout.RESOURCE:
-        wrong_policy_by_field = {**policy, "source_pin": {**policy["source_pin"], "resource_table_oid": catalog[0] + 1}}
+        wrong_pin_by_field = {**policy["source_pin"], "resource_relation": {"schema": "mrf", "name": root + "_absent"}}
+        wrong_policy_by_field = {**policy, "source_pin": wrong_pin_by_field}
         with pytest.raises(RuntimeError, match="raw_storage_shape_unsupported"):
             await raw_layout.capture_retained_raw_layout(fhir, relation, wrong_policy_by_field, (), database=database)
     await database.status(f'ALTER TABLE "{raw_schema}"."{root}" ADD COLUMN unexpected integer')
@@ -442,25 +439,23 @@ async def test_retained_entity_heap_accepts_only_annotated_native_index_prefix(m
                 await _create_retained_raw_index(fixture, _RAW_ENTITY, prefix - 1)
             check = await _retained_raw_check(fixture, _RAW_ENTITY, prefix)
             relation = check.relations[0]
-            _, toast_oid = await fhir._profile_capacity_relation_row(relation.oid, "p", 0)
-            _, indexes, constraints, _ = await fhir._profile_capacity_relation_catalog([relation.oid])
-            main_indexes, toast_indexes = fhir._profile_capacity_index_groups(indexes, relation.oid, toast_oid)
+            _, toast_oid = await fhir._profile_capacity_relation_row((await _catalog_oid(relation)), "p", 0)
+            _, indexes, constraints, _ = await fhir._profile_capacity_relation_catalog([(await _catalog_oid(relation))])
+            main_indexes, toast_indexes = fhir._profile_capacity_index_groups(
+                indexes, (await _catalog_oid(relation)), toast_oid
+            )
             assert toast_oid is None and toast_indexes == []
             assert len(main_indexes) == prefix
-            assert all(constraint["relation_oid"] == relation.oid for constraint in constraints)
+            assert {constraint["relation_oid"] for constraint in constraints} <= {await _catalog_oid(relation)}
             if not prefix:
                 assert main_indexes == []
-                with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match="index_shape_unsupported"):
-                    await fhir._provider_directory_profile_relation_storage_fingerprint(
-                        relation.oid, expected_persistence="p"
-                    )
             await _assert_retained_raw_physical(fixture, check)
             observed = await raw_layout.capture_retained_raw_layout(
                 fhir, relation, fixture.policy, check.raw_relations[0].index_names
             )
-            assert observed.relation_oid == relation.oid
-            fingerprints.append(observed.exact_fingerprint)
-        assert len(set(fingerprints)) == 4
+            assert (observed.schema_name, observed.relation_name) == (relation.schema, relation.relation)
+            fingerprints.append((observed.schema_name, observed.relation_name))
+        assert len(fingerprints) == 4 and len(set(fingerprints)) == 1
 
 
 @pytest.mark.asyncio
@@ -474,12 +469,14 @@ async def test_retained_toast_heaps_accept_native_catalog_and_primary_key(monkey
                 await _create_retained_raw_index(fixture, name, 0)
             check = await _retained_raw_check(fixture, name, prefix)
             relation = check.relations[0]
-            _, toast_oid = await fhir._profile_capacity_relation_row(relation.oid, "p", 0)
+            _, toast_oid = await fhir._profile_capacity_relation_row((await _catalog_oid(relation)), "p", 0)
             assert type(toast_oid) is int and toast_oid > 0
             attributes, indexes, constraints, _ = await fhir._profile_capacity_relation_catalog(
-                [relation.oid, toast_oid]
+                [(await _catalog_oid(relation)), toast_oid]
             )
-            main_indexes, toast_indexes = fhir._profile_capacity_index_groups(indexes, relation.oid, toast_oid)
+            main_indexes, toast_indexes = fhir._profile_capacity_index_groups(
+                indexes, (await _catalog_oid(relation)), toast_oid
+            )
             assert len(main_indexes) == prefix and len(toast_indexes) == 1
             assert [attribute["attname"] for attribute in attributes if attribute["relation_oid"] == toast_oid] == [
                 "chunk_id",
@@ -491,8 +488,8 @@ async def test_retained_toast_heaps_accept_native_catalog_and_primary_key(monkey
             observed = await raw_layout.capture_retained_raw_layout(
                 fhir, relation, fixture.policy, check.raw_relations[0].index_names
             )
-            fingerprints.append(observed.exact_fingerprint)
-        assert len(set(fingerprints)) == 2
+            fingerprints.append((observed.schema_name, observed.relation_name))
+        assert len(fingerprints) == 2 and len(set(fingerprints)) == 1
 
 
 async def _mutate_retained_raw_check(fixture, mutation):
@@ -503,7 +500,7 @@ async def _mutate_retained_raw_check(fixture, mutation):
     relation_ref = f'"{fixture.raw_schema}"."{_RAW_ENTITY}"'
     if mutation == "schema":
         relation = await _owned(fixture.database, fixture.source_schema, _RAW_ENTITY)
-        annotation = replace(annotation, schema=relation.schema, oid=relation.oid)
+        annotation = replace(annotation, schema=relation.schema)
     if mutation == "policy":
         changed_policy_dict = {**fixture.policy, "expected_metadata_sha256": "d" * 64}
         annotation = replace(
@@ -511,13 +508,13 @@ async def _mutate_retained_raw_check(fixture, mutation):
         )
     if mutation == "no_annotation":
         return replace(check, raw_relations=())
-    if mutation == "replaced_oid":
+    if mutation == "replaced_name":
         await fixture.database.status(f"DROP TABLE {relation_ref}")
         await fixture.database.status(
             f'CREATE TABLE {relation_ref} (LIKE "{fixture.source_schema}"."{_RAW_ENTITY}" INCLUDING STORAGE)'
         )
         relation = await _owned(fixture.database, fixture.raw_schema, _RAW_ENTITY)
-        assert relation.oid != annotation.oid
+        await fixture.database.status(f"ALTER TABLE {relation_ref} RENAME TO moved")
     if mutation == "wrong_key":
         await _create_retained_raw_index(fixture, _RAW_ENTITY, 0)
         await fixture.database.status(f"CREATE INDEX cms_epoch_entity_site ON {relation_ref} (organization_id)")
@@ -545,7 +542,7 @@ async def _mutate_retained_raw_check(fixture, mutation):
         "schema",
         "policy",
         "no_annotation",
-        "replaced_oid",
+        "replaced_name",
         "wrong_key",
         "premature_index",
         "missing_index",
@@ -558,7 +555,7 @@ async def test_retained_raw_annotation_and_physical_tampering_are_rejected(monke
         check = await _mutate_retained_raw_check(fixture, mutation)
         expected_error = {
             "policy": "raw_identity_changed",
-            "replaced_oid": "raw_identity_changed",
+            "replaced_name": "storage_shape_missing",
             "no_annotation": "index_shape_unsupported",
         }.get(mutation, "raw_storage_shape_unsupported")
         with pytest.raises(RuntimeError, match=expected_error):
@@ -575,15 +572,17 @@ def _catalog_value_types(value):
 
 async def _original_observed_catalog(fhir, relation):
     """Keep the previous complete catalog read as the native parity reference."""
-    relation_map, toast_oid = await fhir._profile_capacity_relation_row(relation.oid, relation.persistence, 0)
+    relation_map, toast_oid = await fhir._profile_capacity_relation_row(
+        (await _catalog_oid(relation)), relation.persistence, 0
+    )
     if (
-        relation_map["relation_oid"] != relation.oid
+        relation_map["relation_oid"] != (await _catalog_oid(relation))
         or relation_map["schema_name"] != relation.schema
         or relation_map["relation_name"] != relation.relation
     ):
         layout._reject()
     attributes, indexes, constraints, triggers = await fhir._profile_capacity_relation_catalog(
-        [relation.oid] + ([toast_oid] if toast_oid else [])
+        [(await _catalog_oid(relation))] + ([toast_oid] if toast_oid else [])
     )
     if triggers or any(
         constraint["constraint_type"] not in ("p", "n")
@@ -593,10 +592,16 @@ async def _original_observed_catalog(fhir, relation):
         for constraint in constraints
     ):
         layout._reject()
+    attributes = [
+        dict(fhir._pagination_checkpoint_row_mapping(catalog_row))
+        for catalog_row in await fhir.db.all(
+            layout._native_attribute_catalog_sql(fhir) + " ORDER BY relation_oid,attnum",
+            relation_oids=[(await _catalog_oid(relation))] + ([toast_oid] if toast_oid else []),
+        )
+    ]
     await layout._index_physical_details(fhir, indexes)
     catalog_by_field = {
-        "contract": "cms-native-observed-layout.v1",
-        "database_oid": await fhir.db.scalar("SELECT oid::bigint FROM pg_database WHERE datname=current_database()"),
+        "contract": "cms-native-observed-layout.v2",
         "relation": relation_map,
         "attributes": attributes,
         "constraints": constraints,
@@ -631,20 +636,22 @@ async def test_native_catalog_bundle_matches_original_heap_and_toast(monkeypatch
             assert observed_toast == original_toast and observed_catalog == original_catalog
             assert _catalog_value_types(observed_catalog) == _catalog_value_types(original_catalog)
             assert layout._canonical_catalog(observed_catalog) == layout._canonical_catalog(original_catalog)
-            assert fhir._identity_hash(observed_catalog) == fhir._identity_hash(original_catalog)
-            assert fhir._profile_capacity_tablespaces(
-                observed_catalog["relation"], observed_catalog["indexes"], observed_toast
-            ) == fhir._profile_capacity_tablespaces(
-                original_catalog["relation"], original_catalog["indexes"], original_toast
-            )
-            _row, toast_oid = await fhir._profile_capacity_relation_row(relation.oid, "p", 0)
-            relation_oids = [relation.oid] + ([toast_oid] if toast_oid else [])
+            _row, toast_oid = await fhir._profile_capacity_relation_row((await _catalog_oid(relation)), "p", 0)
+            relation_oids = [(await _catalog_oid(relation))] + ([toast_oid] if toast_oid else [])
             for selected in ([], list(reversed(relation_oids))):
                 original = await fhir._profile_capacity_relation_catalog(selected)
                 await layout._index_physical_details(fhir, original[1])
-                observed_with_database = await layout._native_catalog_rows(fhir, selected)
-                observed = observed_with_database[:4]
-                assert observed_with_database[4] == original_catalog["database_oid"]
+                original = (
+                    [
+                        dict(fhir._pagination_checkpoint_row_mapping(catalog_row))
+                        for catalog_row in await fhir.db.all(
+                            layout._native_attribute_catalog_sql(fhir) + " ORDER BY relation_oid,attnum",
+                            relation_oids=selected,
+                        )
+                    ],
+                    *original[1:],
+                )
+                observed = await layout._native_catalog_rows(fhir, selected)
                 assert observed == original
                 assert _catalog_value_types(observed) == _catalog_value_types(original)
                 assert layout._canonical_catalog(observed) == layout._canonical_catalog(original)
@@ -678,20 +685,22 @@ async def _retained_recipe_source(database, schema, model, hot_history):
 
 
 async def _retained_recipe_heap(session, database, schema, model, relation, original):
-    columns = await address_receipt._catalog_columns(session, relation.oid)
-    attributes_by_name = {row["attname"]: row for row in original["attributes"] if row["relation_oid"] == relation.oid}
+    columns = await address_receipt._catalog_columns(session, (await _catalog_oid(relation)))
+    attributes_by_name = {row["attname"]: row for row in original["attributes"] if row["relation_kind"] == "main"}
     for column in columns:
         column["storage"] = attributes_by_name[column["attname"]]["attstorage"]
         column["compression"] = attributes_by_name[column["attname"]]["attcompression"]
     await session.execute(text(address_writer._source_heap_sql(schema, model.__tablename__, columns)))
     for statement in address_writer._source_column_options(schema, model.__tablename__, columns):
         await session.execute(text(statement))
-    await address_writer._preserve_prepared_storage_options(session, schema, model.__tablename__, relation.oid)
+    await address_writer._preserve_prepared_storage_options(
+        session, schema, model.__tablename__, fhir._unscoped_qt(relation.schema, relation.relation)
+    )
     return await _owned(database, schema, model.__tablename__)
 
 
 async def _retain_every_index_statement(session, database, schema, source_stage, relation, clone, original):
-    recipes = await address_source._legacy_source_indexes(session, {"relation_oid": relation.oid})
+    recipes = await address_source._legacy_source_indexes(session, {"relation_oid": (await _catalog_oid(relation))})
     statement_count = 0
     for recipe in recipes:
         for statement in address_writer._source_index_statements(
@@ -706,21 +715,20 @@ async def _retain_every_index_statement(session, database, schema, source_stage,
             statement_count += 1
     assert statement_count == len(recipes) + 1  # The primary key attaches the same created index.
     assert len(recipes) == 1 + len(native.EntityAddressUnified.__my_additional_indexes__)
-    assert layout._structural_catalog(original) == layout._structural_catalog(actual)
-    assert await address_receipt._catalog_indexes(session, relation.oid) == await address_receipt._catalog_indexes(
-        session, clone.oid
-    )
-    assert await address_receipt._schema_identity(
-        session, relation.oid, relation.schema, "entity_address_unified"
-    ) == await address_receipt._schema_identity(session, clone.oid, clone.schema, "entity_address_unified")
+    assert original == layout._structural_catalog(actual)
+    assert await address_receipt._catalog_indexes(
+        session, (await _catalog_oid(relation))
+    ) == await address_receipt._catalog_indexes(session, (await _catalog_oid(clone)))
     return actual
 
 
 def _refuse_retained_index_mutations(original, actual, clone):
-    for field, altered in (("indisunique", True), ("indclass", "0"), ("indkey", "0"), ("predicate", "false")):
+    for field, altered in (("indisunique", True), ("opclasses", []), ("indkey", "0"), ("index_predicate", "false")):
         changed = json.loads(json.dumps(actual))
         index = next(
-            entry for entry in changed["indexes"] if entry["relation_oid"] == clone.oid and not entry["indisprimary"]
+            entry
+            for entry in changed["indexes"]
+            if entry["relation_oid"] == actual["relation"]["relation_oid"] and not entry["indisprimary"]
         )
         index[field] = altered
         with pytest.raises(RuntimeError, match="native_storage_shape_unsupported"):
@@ -753,7 +761,7 @@ async def test_retained_unified_native_recipes_preserve_every_index_predicate(
                 )
                 await session.execute(text("SELECT set_config('search_path',:path,true)"), {"path": caller_search_path})
                 same_heap, _ = await layout._observe_catalog(fhir, relation)
-                assert same_heap == original
+                assert layout._structural_catalog(same_heap) == original
                 await layout.capture_retained_native_layout(fhir, clone, captured, (model.__tablename__,))
                 assert await database.scalar("SHOW search_path") == caller_search_path
                 _refuse_retained_index_mutations(original, actual, clone)
@@ -764,11 +772,11 @@ async def test_retained_unified_native_recipes_preserve_every_index_predicate(
 
 
 async def _reject_changed_retained_expression(session, clone, captured, catalog):
-    """Physical GIST identity cannot conceal a genuinely changed stored expression."""
+    """Stored GIST expressions remain exact after native index recreation."""
     index = next(
         entry
         for entry in catalog["indexes"]
-        if entry["relation_oid"] == clone.oid
+        if entry["relation_oid"] == catalog["relation"]["relation_oid"]
         and entry["indnkeyatts"] == 1
         and entry["index_expressions"].startswith("public.geography(")
     )
@@ -796,13 +804,13 @@ async def test_catalog_path_failure_restores_original_readonly_transaction(monke
             backend = driver.get_server_pid()
             if failure == "sql_error":
                 injected = (
-                    "SELECT 0::bigint AS relation_oid,1 AS attnum,"
+                    "SELECT 0::bigint AS relation_oid,1 AS attnum,20::oid AS atttypid,0::oid AS attcollation,"
                     "1/(length(pg_catalog.current_setting('search_path'))-10) AS forced_failure"
                 )
                 expected = asyncpg.DivisionByZeroError
             else:
                 injected = (
-                    "SELECT 0::bigint AS relation_oid,1 AS attnum,"
+                    "SELECT 0::bigint AS relation_oid,1 AS attnum,20::oid AS atttypid,0::oid AS attcollation,"
                     "CASE WHEN pg_catalog.current_setting('search_path')='pg_catalog' "
                     "THEN pg_catalog.pg_sleep(10) ELSE pg_catalog.pg_sleep(0) END AS delayed"
                 )
@@ -850,9 +858,15 @@ async def test_retained_evidence_sequence_keeps_exact_binding_across_paths(monke
                     "SELECT pg_get_expr(adbin,adrelid,true) FROM pg_attrdef "
                     "JOIN pg_attribute ON attrelid=adrelid AND attnum=adnum "
                     "WHERE adrelid=CAST(:oid AS oid) AND attname='evidence_id'",
-                    oid=source_relation.oid,
+                    oid=(await _catalog_oid(source_relation)),
                 )
-                assert raw_default != json.loads(captured.catalog_json)["evidence_sequence"]["default_expression"]
+                sequence_row = await database.first(
+                    layout._evidence_sequence_statement(), relation_oid=(await _catalog_oid(source_relation))
+                )
+                canonical_sequences = fhir._pagination_checkpoint_row_mapping(sequence_row)["evidence_sequences"]
+                assert len(canonical_sequences) == 1
+                assert raw_default != canonical_sequences[0]["default_expression"]
+                assert "default_expression" not in json.loads(captured.catalog_json)["evidence_sequence"]
             same_source = await layout.capture_retained_native_source(fhir, source_relation, (model.__tablename__,))
             assert same_source.catalog_json == captured.catalog_json
             await layout.capture_retained_native_layout(fhir, clone, captured, (model.__tablename__,))
@@ -885,7 +899,7 @@ async def test_native_catalog_batch_matches_each_heap_and_toast_then_refuses_ren
             members.append(relation)
         async with database.transaction():
             individual_by_identity = {
-                (relation.schema, relation.relation, relation.oid): await layout._observe_catalog(fhir, relation)
+                (relation.schema, relation.relation): await layout._observe_catalog(fhir, relation)
                 for relation in members
             }
             calls = []
@@ -907,7 +921,7 @@ async def test_native_catalog_batch_matches_each_heap_and_toast_then_refuses_ren
             assert captured == individual_by_identity
             assert any(toast_oid is not None for _catalog, toast_oid in captured.values())
             for relation in members:
-                identity = (relation.schema, relation.relation, relation.oid)
+                identity = (relation.schema, relation.relation)
                 assert layout._observed_layout(fhir, relation, *captured[identity]) == layout._observed_layout(
                     fhir, relation, *individual_by_identity[identity]
                 )

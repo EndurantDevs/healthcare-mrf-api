@@ -1,27 +1,13 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Published resource scopes preserve bounded SQL rollups and temporary workspace custody."""
+"""Published resource scopes preserve bounded SQL rollups and temporary workspace cleanup."""
 
+import asyncio
 import json
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from process import registry_fhir_catalog_reference_rollup as rollup
-
-
-@pytest.fixture
-def published_scope(monkeypatch):
-    from process.registry_fhir_catalog_published_read import FHIRCatalogPublishedRead
-
-    verify = AsyncMock()
-    select = Mock(
-        return_value='SELECT * FROM ONLY "source_schema"."leaf_one" '
-        'UNION ALL SELECT * FROM ONLY "source_schema"."leaf_two"'
-    )
-    monkeypatch.setattr(FHIRCatalogPublishedRead, "verify", verify)
-    monkeypatch.setattr(FHIRCatalogPublishedRead, "resource_sql", select)
-    return SimpleNamespace(read=object.__new__(FHIRCatalogPublishedRead), verify=verify, select=select)
 
 
 def report(rows=0, *, last_id=None):
@@ -58,7 +44,7 @@ async def test_legacy_reference_rollup_preserves_its_resource_relation_and_clean
         assert stage.accounting.source_rows == 0
         assert [batch async for batch in stage.iter_batches()] == []
     query = connection.fetchrow.await_args_list[1].args[0]
-    assert 'FROM "source_schema".provider_directory_dataset_resource' in query
+    assert 'FROM "source_schema"."provider_directory_dataset_resource"' in query
     assert "catalog_resources" not in query
     assert connection.execute.await_args_list[0].args[0].startswith("CREATE TEMP TABLE ")
     assert connection.execute.await_args_list[-1].args[0].startswith("DROP TABLE IF EXISTS pg_temp.")
@@ -66,12 +52,22 @@ async def test_legacy_reference_rollup_preserves_its_resource_relation_and_clean
 
 
 @pytest.mark.asyncio
-async def test_published_rollup_uses_global_sql_pages_and_precreated_workspace(published_scope):
+@pytest.mark.parametrize("plan_tiers", [False, True])
+async def test_selected_plan_tier_policy_reaches_native_reference_pages(plan_tiers):
+    connection = connection_mock(reports=[report()])
+    stage = rollup.staged_plan_tier_references if plan_tiers else rollup.staged_fhir_catalog_references
+    async with stage(connection, schema_name="source_schema", dataset_id="dataset") as prepared:
+        assert prepared.active
+    assert connection.fetchrow.await_args_list[1].args[-1] is plan_tiers
+
+
+@pytest.mark.asyncio
+async def test_published_rollup_uses_global_sql_pages_and_precreated_workspace():
     connection = connection_mock(
         read_only="on", reports=[report(2, last_id="role-002"), report(1, last_id="role-003"), report()]
     )
     connection.is_in_transaction.return_value = False
-    connection.fetchval.side_effect = [123, 123, 1]
+    connection.fetchval.return_value = 1
     connection.fetch.side_effect = [
         [
             {
@@ -92,7 +88,7 @@ async def test_published_rollup_uses_global_sql_pages_and_precreated_workspace(p
             connection,
             schema_name="source_schema",
             dataset_id="dataset",
-            source_read=published_scope.read,
+            resource_relation={"schema": "source_schema", "name": "dataset_resources"},
             workspace=workspace,
             page_rows=2,
             page_bytes=1024,
@@ -108,15 +104,10 @@ async def test_published_rollup_uses_global_sql_pages_and_precreated_workspace(p
         connection.is_in_transaction.return_value = False
     assert not workspace.active
     assert connection.execute.await_args.args[0].startswith("DROP TABLE IF EXISTS pg_temp.")
-    assert published_scope.verify.await_count == 6
-    assert published_scope.verify.await_args_list[0].kwargs == {
-        "schema_name": "source_schema",
-        "dataset_id": "dataset",
-    }
     queries = connection.fetchrow.await_args_list[1:]
     for query in queries:
         sql = query.args[0]
-        assert "FROM (" + published_scope.select.return_value + ") AS catalog_resources" in sql
+        assert 'FROM "source_schema"."dataset_resources"' in sql
         assert "provider_directory_dataset_resource" not in sql
         assert sql.count("LIMIT $5") == 1 and sql.count("sum(source_bytes) OVER") == 1
         assert "jsonb_array_elements" in sql and "GROUP BY resource_type,reference_json::text" in sql
@@ -125,6 +116,33 @@ async def test_published_rollup_uses_global_sql_pages_and_precreated_workspace(p
     assert queries[1].args[3:5] == ("PractitionerRole", "role-002")
     assert queries[2].args[3:5] == ("PractitionerRole", "role-003")
     assert all("payload_json" not in call.args[0] for call in connection.fetch.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_reference_callbacks_follow_workspace_lifetime():
+    connection = connection_mock(read_only="on", reports=[report()])
+    connection.is_in_transaction.return_value = False
+    async with rollup.fhir_catalog_reference_workspace(connection) as workspace:
+        connection.is_in_transaction.return_value = True
+
+        async def read_references():
+            async with rollup.staged_fhir_catalog_references(
+                connection, schema_name="source_schema", dataset_id="dataset", workspace=workspace
+            ) as stage:
+                assert [batch async for batch in stage.iter_batches()] == []
+                return stage
+
+        closed_stage = await asyncio.create_task(read_references())
+        with pytest.raises(rollup.FHIRCatalogReferenceRollupError, match="stage_closed"):
+            await anext(closed_stage.iter_batches())
+        connection.is_in_transaction.return_value = False
+        with pytest.raises(rollup.FHIRCatalogReferenceRollupError, match="transaction_required"):
+            await rollup._verify_reference_workspace(connection, workspace)
+    connection.is_in_transaction.return_value = True
+    connection.fetchrow.side_effect = None
+    connection.fetchrow.return_value = {"isolation": "repeatable read", "read_only": "on"}
+    with pytest.raises(rollup.FHIRCatalogReferenceRollupError, match="workspace_closed"):
+        await rollup._verify_reference_workspace(connection, workspace)
 
 
 @pytest.mark.asyncio
@@ -156,54 +174,6 @@ async def test_invalid_reference_page_refuses_output_and_drops_its_owned_stage(c
         ):
             pytest.fail("invalid source page reached output")
     connection.fetch.assert_not_awaited()
-    assert connection.execute.await_args.args[0].startswith("DROP TABLE IF EXISTS pg_temp.")
-
-
-@pytest.mark.asyncio
-async def test_reference_workspace_cannot_be_borrowed_by_another_task():
-    import asyncio
-
-    connection = connection_mock()
-    connection.is_in_transaction.return_value = False
-    connection.fetchval.return_value = 123
-    async with rollup.fhir_catalog_reference_workspace(connection) as workspace:
-        await workspace.verify(connection)
-        with pytest.raises(ValueError, match="workspace_closed"):
-            await asyncio.create_task(workspace.verify(connection))
-    assert not workspace.active
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["duck", "coordinates", "workspace"])
-async def test_published_reference_scope_refuses_before_temporary_writes(published_scope, mode):
-    connection = connection_mock(read_only="on")
-    source_read = published_scope.read
-    if mode == "duck":
-        source_read = SimpleNamespace(verify=AsyncMock(), resource_sql=Mock())
-        connection.fetchrow.side_effect = [{"isolation": "repeatable read", "read_only": "off"}]
-    elif mode == "coordinates":
-        connection.fetchrow.side_effect = [{"isolation": "repeatable read", "read_only": "off"}]
-        published_scope.verify.side_effect = ValueError("dataset changed")
-    with pytest.raises(ValueError):
-        async with rollup.staged_fhir_catalog_references(
-            connection, schema_name="source_schema", dataset_id="dataset", source_read=source_read
-        ):
-            pytest.fail("invalid scope yielded a stage")
-    connection.execute.assert_not_awaited()
-    published_scope.select.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_published_reference_stage_reverifies_before_output(published_scope):
-    connection = connection_mock(reports=[report()])
-    async with rollup.staged_fhir_catalog_references(
-        connection, schema_name="source_schema", dataset_id="dataset", source_read=published_scope.read
-    ) as stage:
-        published_scope.verify.side_effect = ValueError("published read changed")
-        with pytest.raises(ValueError, match="published read changed"):
-            await anext(stage.iter_batches())
-    connection.fetch.assert_not_awaited()
-    assert not stage.active
     assert connection.execute.await_args.args[0].startswith("DROP TABLE IF EXISTS pg_temp.")
 
 
@@ -289,23 +259,6 @@ async def test_reference_rollup_requires_pinned_snapshot_and_original_workspace(
             pytest.fail("unqualified snapshot or workspace reached source reads")
     connection.execute.assert_not_awaited()
     connection.fetch.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_workspace_cannot_move_to_a_different_connection_or_survive_its_context():
-    connection = connection_mock()
-    connection.is_in_transaction.return_value = False
-    connection.fetchval.return_value = 123
-    other = connection_mock(read_only="on")
-    async with rollup.fhir_catalog_reference_workspace(connection) as workspace:
-        with pytest.raises(rollup.FHIRCatalogReferenceRollupError, match="workspace_closed"):
-            async with rollup.staged_fhir_catalog_references(
-                other, schema_name="source_schema", dataset_id="dataset", workspace=workspace
-            ):
-                pytest.fail("workspace borrowed another session")
-        other.execute.assert_not_awaited()
-    with pytest.raises(rollup.FHIRCatalogReferenceRollupError, match="workspace_closed"):
-        await workspace.verify(connection)
 
 
 @pytest.mark.asyncio

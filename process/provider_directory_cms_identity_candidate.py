@@ -1,9 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Private CMS identity observations and atomic, UUID-preserving publication.
-
-The common SOURCE owner creates, attests and enrolls these exact heaps. Global
-key allocation remains private until the entire source candidate is admitted.
-"""
+"""Candidate CMS identity observations and atomic, UUID-preserving publication."""
 
 import asyncio
 import json
@@ -96,18 +92,12 @@ def _identity(identity):
     return source["vector_sha256"]
 
 
-def _names(receipts):
+def _names(receipts, schema):
     _require(type(receipts) is dict and set(receipts) == set(CMS_IDENTITY_TABLES), "stages_changed")
     names_by_root = {}
     for root, receipt in receipts.items():
         _require(
-            type(receipt) is dict and set(receipt) == {"name", "oid", "owner", "layout_sha256"}, "stage_receipt_changed"
-        )
-        _require(
-            type(receipt["oid"]) is int
-            and receipt["oid"] > 0
-            and type(receipt["owner"]) is int
-            and receipt["owner"] > 0,
+            type(receipt) is dict and set(receipt) == {"schema", "name"} and receipt["schema"] == schema,
             "stage_receipt_changed",
         )
         storage_identifier(receipt["name"])
@@ -119,20 +109,18 @@ def _names(receipts):
 
 @dataclass(frozen=True)
 class _IdentityScope:
-    publisher: object
     identity: dict
     receipts: dict
-    task: object
 
 
 @asynccontextmanager
 async def bind_cms_identity_candidate(publisher, identity, receipts):
-    """Bind only common-owner-attested stages on the original physical session."""
+    """Bind the complete logical candidate and its qualified staging names."""
     _require(bound_publisher() is publisher and _ACTIVE.get() is None, "publisher_changed")
     source_copy_session()
     _identity(identity)
-    _names(receipts)
-    token = _ACTIVE.set(_IdentityScope(publisher, identity, receipts, asyncio.current_task()))
+    _names(receipts, publisher.policy.schema)
+    token = _ACTIVE.set(_IdentityScope(identity, receipts))
     try:
         yield
     finally:
@@ -142,17 +130,12 @@ async def bind_cms_identity_candidate(publisher, identity, receipts):
 async def identity_candidate(session, *, phases=("loading",)):
     """Recheck the protected native header before any batch statement or COPY."""
     scope = _ACTIVE.get()
-    _require(
-        scope is not None
-        and scope.task is asyncio.current_task()
-        and scope.publisher is bound_publisher()
-        and session is source_copy_session(),
-        "physical_session_required",
-    )
-    connection, policy = scope.publisher.connection, scope.publisher.policy
+    _require(scope is not None, "candidate_scope_required")
+    publisher = bound_publisher()
+    connection, policy = publisher.connection, publisher.policy
     _require(connection.is_in_transaction() is True, "transaction_required")
     await _protected_auxiliary(connection, policy, scope.identity, scope.receipts, phases)
-    return scope.publisher, scope.identity, scope.receipts
+    return publisher, scope.identity, scope.receipts
 
 
 async def _protected_auxiliary(connection, policy, identity, receipts, phases):
@@ -378,7 +361,7 @@ async def prepare_identity_stages(publisher, identity, names):
 
 
 def _relations(policy, receipts):
-    return {root: storage_relation(policy.schema, name) for root, name in _names(receipts).items()}
+    return {root: storage_relation(policy.schema, name) for root, name in _names(receipts, policy.schema).items()}
 
 
 def _canonical_schema(policy):
@@ -574,7 +557,7 @@ async def finish_identity_stages(publisher, identity, receipts):
     _require(publisher is bound_publisher() and connection.is_in_transaction() is True, "publisher_changed")
     source_copy_session()
     await _protected_auxiliary(connection, policy, identity, receipts, ("loading",))
-    for root, name in _names(receipts).items():
+    for root, name in _names(receipts, policy.schema).items():
         for index, columns in enumerate(_SECONDARY[root]):
             fields = ",".join(storage_identifier(column) for column in columns)
             await connection.execute(

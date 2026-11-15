@@ -69,17 +69,6 @@ _SEQUENCE_REACH = """SELECT EXISTS(SELECT FROM pg_depend d JOIN pg_class s
 
 # Generated from the fixed candidate API SQL; focused tests bind every body.
 _LEGACY_FUNCTIONS = {
-    "guard_pd_dataset_migration_owner()": (
-        (),
-        "trigger",
-        (),
-        "plpgsql",
-        "v",
-        False,
-        "u",
-        False,
-        "1961869026eea7109133e616c27af2d5017db3288646dfc331d9d948d640c2d8",
-    ),
     "deny_pd_dataset_candidate_write()": (
         (),
         "trigger",

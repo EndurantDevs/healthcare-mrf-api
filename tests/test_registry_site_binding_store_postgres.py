@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+from dataclasses import asdict
 from uuid import UUID, uuid4
 
 import pytest
@@ -62,8 +63,8 @@ async def test_fields_resolve_one_exact_office_with_complete_fresh_source_proof(
     assert proof["candidate_id"] == fixture.source.candidate_id
     assert proof["manifest_sha256"] == fixture.source.manifest_sha256
     assert proof["source_generations"] == fixture.source.source_generations
-    assert proof["address_table_oid"] == fixture.source.address_table_oid
-    assert all(proof[field] > 0 for field in ("schema_oid", "binding_table_oid", "owner_role_oid"))
+    assert proof["address_relation"] == asdict(fixture.source.address_relation)
+    assert proof["schema_name"] == fixture.source.schema_name
     assert proof["records"] == [
         {**fixture.rows[0], "entity_type": original["provider_system"], "entity_id": original["provider_id"]}
     ]
@@ -146,7 +147,7 @@ async def test_pure_validation_preserves_exact_opaque_directory_identity():
     assert original_by_field["provider_id"] == "source:Organization/provider-1"
 
 
-@pytest.mark.parametrize("damage", ["generation", "namespace", "site", "fingerprint", "ineligible", "acl", "oid"])
+@pytest.mark.parametrize("damage", ["generation", "namespace", "site", "fingerprint", "ineligible", "oid"])
 async def test_actual_retained_identity_or_catalog_drift_fails_closed(binding_db, damage):
     fixture, table = binding_db
     fields_by_name = _wire_fields(fixture)
@@ -162,7 +163,6 @@ async def test_actual_retained_identity_or_catalog_drift_fails_closed(binding_db
     try:
         statement_by_damage = {
             "ineligible": f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false',
-            "acl": f'GRANT UPDATE ON "{fixture.source.schema_name}".entity_address_unified TO "{fixture.roles["reader"]}"',
             "oid": f'ALTER TABLE "{fixture.source.schema_name}".provider_location_binding RENAME TO old_binding',
         }
         if damage in statement_by_damage:
@@ -244,8 +244,8 @@ async def test_repeatable_snapshot_contract_and_fixed_read_count(binding_db):
                 fixture.connection, _wire_fields(fixture), control_schema=fixture.control_schema
             )
             await asyncio.sleep(0)
-            assert len(queries) == 8
-            assert sum("network_candidate_custody" in query.query for query in queries) == 2
+            assert len(queries) == 4
+            assert not any("network_candidate_custody" in query.query for query in queries)
             assert all(query.query.lstrip().split()[0] in ("SELECT", "WITH") for query in queries)
     finally:
         fixture.connection.remove_query_logger(queries.append)

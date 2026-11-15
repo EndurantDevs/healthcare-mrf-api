@@ -11,7 +11,6 @@ import pytest
 
 from process import provider_directory_profile_capacity_attestation as lease
 from tests.test_provider_directory_profile_capacity_attestation import (
-    GOLDEN_ATTESTATION_ID,
     GOLDEN_SIGNATURE,
     VALIDATION_TIME,
     _golden_body,
@@ -41,25 +40,17 @@ def test_consumption_values_bind_full_build_and_source_identity():
         accepted_at=VALIDATION_TIME,
     )
 
-    assert consumption_by_field["attestation_id"] == GOLDEN_ATTESTATION_ID
-    assert (
-        consumption_by_field["reservation_id"]
-        == "pd-capacity-reservation-7"
-    )
-    assert consumption_by_field["capacity_geometry_hash"] == "55" * 32
+    assert consumption_by_field["attestation_id"] == verified.attestation_id
+    assert consumption_by_field["reservation_id"] == "pd-capacity-reservation-7"
+    assert consumption_by_field["capacity_geometry_hash"] == verified.capacity_geometry_hash
     assert consumption_by_field["executable_plan_hash"] == "88" * 32
     assert consumption_by_field["selection_proof_id"] == "99" * 32
     assert consumption_by_field["source_vector_hash"] == "aa" * 32
     assert consumption_by_field["source_context_vector_hash"] == "bb" * 32
     assert consumption_by_field["profile_as_of"] == "2026-07-30"
     assert consumption_by_field["accepted_at"] == VALIDATION_TIME
-    assert (
-        consumption_by_field["expires_at"]
-        > consumption_by_field["accepted_at"]
-    )
-    canonical_digest = hashlib.sha256(
-        consumption_by_field["canonical_lease_json"].encode("ascii")
-    ).hexdigest()
+    assert consumption_by_field["expires_at"] > consumption_by_field["accepted_at"]
+    canonical_digest = hashlib.sha256(consumption_by_field["canonical_lease_json"].encode("ascii")).hexdigest()
     assert canonical_digest != consumption_by_field["lease_digest"]
 
 
@@ -140,7 +131,7 @@ def test_wire_text_fields_reject_host_or_path_shaped_content(
 
     with pytest.raises(
         lease.ProviderDirectoryCapacityLeaseError,
-        match="invalid_value",
+        match="invalid_value|invalid_fields",
     ):
         _verify(_signed_envelope(body_mutator=insert_path))
 
@@ -148,13 +139,11 @@ def test_wire_text_fields_reject_host_or_path_shaped_content(
 @pytest.mark.parametrize(
     "body_mutator",
     [
-        lambda body: body.update(
-            {"database_system_identifier": "18446744073709551616"}
-        ),
-        lambda body: body.update({"database_oid": True}),
+        lambda body: body["storage_classes"][0].update({"available_bytes": 2**64}),
+        lambda body: body["storage_classes"][0].update({"reserved_bytes": True}),
         lambda body: body.update({"nonce": "A" * 64}),
-        lambda body: body["volumes"][0].update({"reserved_bytes": 0}),
-        lambda body: body["volumes"][0].update({"available_bytes": -1}),
+        lambda body: body["storage_classes"][0].update({"reserved_bytes": 0}),
+        lambda body: body["storage_classes"][0].update({"available_bytes": -1}),
     ],
 )
 def test_wire_numeric_and_digest_bounds_reject_signed_invalid_content(

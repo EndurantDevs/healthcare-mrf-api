@@ -4,28 +4,13 @@
 
 from __future__ import annotations
 
-import asyncio
-import dataclasses
-import datetime
 import importlib
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 
-from .test_provider_directory_profile_selection_attestation import _execution
-from .test_provider_directory_profile_capacity import _geometry_payload
-from .test_provider_directory_profile_control_capacity import (
-    _bound_control_wal_projection,
-)
-from .provider_directory_profile_execution_test_support import (
-    _capacity_consumption_row,
-    _capacity_geometry_identity,
-    _profile_serving_state,
-    _published_dataset_state,
-    _wal_tracker_admission,
-)
 from .test_provider_directory_profile_artifact_preflight_boundaries import (
     _evidence_batch_fixture,
 )
@@ -139,16 +124,14 @@ async def test_projection_driven_artifact_batch_consumes_hashed_terminal(
     exact_probe = _exact_resource_projection_probe()
     monkeypatch.setattr(importer.db, "first", exact_probe)
 
-    inserted = (
-        await importer._materialize_provider_directory_artifact_resource_dataset(
-            "mrf",
-            "provider_directory_practitioner_artifact_scope_test",
-            importer.ProviderDirectoryPractitioner,
-            dataset,
-            "Practitioner",
-            batch_size=100,
-            projection_batches=projection_batches,
-        )
+    inserted = await importer._materialize_provider_directory_artifact_resource_dataset(
+        "mrf",
+        "provider_directory_practitioner_artifact_scope_test",
+        importer.ProviderDirectoryPractitioner,
+        dataset,
+        "Practitioner",
+        batch_size=100,
+        projection_batches=projection_batches,
     )
 
     assert inserted == 1
@@ -264,11 +247,7 @@ async def test_artifact_resource_projection_requires_ordered_terminal_before_dml
     projection_batches = (
         (positive,)
         if terminal_batch_number is None
-        else (
-            (terminal, positive)
-            if terminal_batch_number == 1
-            else (positive, terminal)
-        )
+        else ((terminal, positive) if terminal_batch_number == 1 else (positive, terminal))
     )
     monkeypatch.setattr(importer.db, "first", AsyncMock())
     monkeypatch.setattr(importer.db, "status", AsyncMock())
@@ -292,32 +271,25 @@ async def test_artifact_resource_projection_requires_ordered_terminal_before_dml
 
 
 def test_profile_empty_layout_index_ddl_has_no_collision_skip_path():
-    evidence_statements = (
-        importer.profile_artifact.profile_index_statements(
-            "mrf",
-            "evidence_stage",
-            evidence=True,
-        )
+    evidence_statements = importer.profile_artifact.profile_index_statements(
+        "mrf",
+        "evidence_stage",
+        evidence=True,
     )
-    profile_statements = (
-        importer.profile_artifact.profile_index_statements(
-            "mrf",
-            "profile_stage",
-            evidence=False,
-        )
+    profile_statements = importer.profile_artifact.profile_index_statements(
+        "mrf",
+        "profile_stage",
+        evidence=False,
     )
-    _index_name, bucket_statement = (
-        importer._provider_directory_profile_bucket_index_sql(
-            "mrf",
-            "role_scope",
-        )
+    _index_name, bucket_statement = importer._provider_directory_profile_bucket_index_sql(
+        "mrf",
+        "role_scope",
     )
 
     assert len(evidence_statements) == 4
     assert len(profile_statements) == 1
     assert all(
-        statement.startswith("CREATE INDEX ")
-        and "IF NOT EXISTS" not in statement
+        statement.startswith("CREATE INDEX ") and "IF NOT EXISTS" not in statement
         for statement in (
             *evidence_statements,
             *profile_statements,
@@ -353,11 +325,7 @@ async def test_stage_layout_drift_refuses_capacity_write_before_dml(
         verify_layout,
     )
     monkeypatch.setattr(importer.db, "status", AsyncMock())
-    capacity_token = (
-        importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
-            object()
-        )
-    )
+    capacity_token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(object())
     try:
         with pytest.raises(
             importer.ProviderDirectoryArtifactBuildStale,
@@ -370,45 +338,33 @@ async def test_stage_layout_drift_refuses_capacity_write_before_dml(
                 {},
             )
     finally:
-        importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(
-            capacity_token
-        )
+        importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(capacity_token)
 
     verify_layout.assert_awaited_once()
     importer.db.status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_resumed_stage_fingerprint_drift_is_not_reusable(
-    monkeypatch,
-):
+async def test_resumed_stage_uses_names_and_refuses_native_shape_drift(monkeypatch):
     checkpoint_by_field = {
+        "evidence_stage": "evidence_stage",
+        "profile_stage": "profile_stage",
         "evidence_stage_oid": 21,
         "evidence_stage_storage_fingerprint": "a" * 64,
         "profile_stage_oid": 22,
         "profile_stage_storage_fingerprint": "b" * 64,
     }
-    observed_fingerprint = AsyncMock(return_value="c" * 64)
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_stage_storage_fingerprint",
-        observed_fingerprint,
-    )
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_stage_relation_identity",
-        AsyncMock(return_value=(21, "r", "p")),
-    )
-
+    original_by_field = dict(checkpoint_by_field)
+    native_shape = AsyncMock(return_value=(999, "r", "p"))
+    layout_read = AsyncMock(return_value=None)
+    monkeypatch.setattr(importer, "_provider_directory_profile_stage_relation_identity", native_shape)
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_relation_layout", layout_read)
+    assert await importer._is_profile_stage_pair_matching("mrf", checkpoint_by_field, "evidence_stage", "profile_stage")
+    assert checkpoint_by_field == original_by_field and layout_read.await_count == 2
+    layout_read.assert_awaited_with(999, expected_persistence="p")
+    native_shape.return_value = (999, "r", "u")
+    layout_read.reset_mock()
     assert not await importer._is_profile_stage_pair_matching(
-        "mrf",
-        checkpoint_by_field,
-        "evidence_stage",
-        "profile_stage",
+        "mrf", checkpoint_by_field, "evidence_stage", "profile_stage"
     )
-    observed_fingerprint.assert_awaited_once_with(
-        "mrf",
-        "evidence_stage",
-        expected_oid=21,
-        lock_relation=False,
-    )
+    layout_read.assert_not_awaited()

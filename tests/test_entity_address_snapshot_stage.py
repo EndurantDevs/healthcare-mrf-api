@@ -82,7 +82,11 @@ async def test_stage_export_clones_pinned_family(monkeypatch):
         AsyncMock(return_value=[{"model": model, "source_ref": f'"mrf"."{model.__tablename__}"'} for model in models]),
     )
     monkeypatch.setattr(source, "_legacy_source_indexes", AsyncMock(return_value=[]))
-    monkeypatch.setattr(source, "_require_legacy_target_custody", AsyncMock())
+    layout = AsyncMock()
+    close_grants = AsyncMock()
+    monkeypatch.setattr(source, "_require_legacy_target_layout", layout)
+    monkeypatch.setattr(source.family_archive, "_native_model_copy_driver", AsyncMock(return_value=object()))
+    monkeypatch.setattr(source, "_close_clone_grants", close_grants)
     monkeypatch.setattr(source.family_archive, "_is_model_table_equal", AsyncMock(return_value=True))
 
     manifest = await source.export_entity_address_archive_stage(
@@ -110,6 +114,11 @@ async def test_stage_export_clones_pinned_family(monkeypatch):
     assert len([statement for statement in clone_statements if "EXCLUDING INDEXES" in statement]) == 7
     assert native_copy.await_count == 7
     created.assert_awaited_once_with(clone)
+    layout.assert_awaited_once()
+    assert layout.await_args.args[0] is clone and layout.await_args.args[2] == stage_schema
+    close_grants.assert_awaited_once()
+    assert close_grants.await_args.args[1] == stage_schema
+    assert tuple(close_grants.await_args.args[2]) == tuple(model.__tablename__ for model in models)
     stage_statements = [str(call.args[0]) for call in stage.execute.await_args_list]
     assert all(f'LOCK TABLE "{stage_schema}".' in statement for statement in stage_statements[1:-1])
 
@@ -248,7 +257,7 @@ def test_stage_ownership_token_is_closed_to_the_uuid_model_family():
 
     assert ownership.validate_entity_address_archive_stage_ownership(owner.as_dict()) == owner
     tampered = owner.as_dict()
-    tampered["relation_oids"][0]["oid"] = 0
+    tampered["relation_oids"][0]["table_name"] = "foreign"
     with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="token is invalid"):
         ownership.validate_entity_address_archive_stage_ownership(tampered)
 

@@ -1,9 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Scan fixed history data after the original-Admin producer authenticates its common fence.
+"""Scan complete fixed history by qualified name; execute no DDL or commit.
 
-This module supplies mechanics, never an authority handle. Its only issuer caller
-must retain authenticated native inventories and continuous common custody through
-the eventual outer commit. No DDL, record write or commit occurs here.
+The caller owns authorization and the atomic publication transaction.
 """
 
 from copy import deepcopy
@@ -20,76 +18,50 @@ def _require(condition, code):
         raise ValueError("cms_history_capture_" + code)
 
 
-def _oid(value):
-    if type(value) is str and value.isascii() and value.isdecimal() and not value.startswith("0"):
-        value = int(value)
-    _require(type(value) is int and 0 < value < 2**32, "native_oid_required")
-    return value
+def _schema(storage):
+    return storage["catalog_schema"] if type(storage) is dict else storage.catalog_schema
 
 
 def _old_roots(family):
-    roots_by_name = {entry["relname"]: entry for entry in family if entry["relname"] in scans.ROOTS}
-    _require(set(roots_by_name) == set(scans.ROOTS), "roots_required")
-    _require(all(not entry["native"]["parents"] for entry in roots_by_name.values()), "roots_changed")
-    return roots_by_name
+    """Accept declared names, including stored relname mappings; ignore physical metadata."""
+    names = [entry.get("name", entry.get("relname")) for entry in family]
+    _require(all(names.count(root) == 1 for root in scans.ROOTS), "roots_required")
+    return {root: root for root in scans.ROOTS}
 
 
-def _identity(entry, index_names, schema, root):
-    native = entry["native"]
-    dependencies = history.cms_history_dependencies(schema, root)
-    hooks_by_name = {}
-    for hook in native["triggers"]:
-        if not hook["tgisinternal"]:
-            name = hook["tgname"]
-            _require(name in dependencies["hooks"], "hook_changed")
-            hooks_by_name[name] = dict(
-                oid=_oid(hook["oid"]),
-                function_oid=_oid(hook["tgfoid"]),
-                function=dependencies["hooks"][name]["function"],
-                tgtype=hook["tgtype"],
-                enabled=hook["tgenabled"],
-                old_table=hook["tgoldtable"],
-                new_table=hook["tgnewtable"],
-            )
-    return dict(
-        oid=entry["oid"],
-        name=entry["relname"],
-        schema_oid=native["namespace"][0],
-        owner_oid=entry["relowner"],
-        kind=entry["relkind"],
-        indexes={index_names[index["class"][0]]: index["class"][0] for index in native["indexes"]},
-        foreign_keys={
-            constraint["conname"]: {"oid": _oid(constraint["oid"]), "definition": definition}
-            for constraint, definition in native["constraints"]
-            if constraint["contype"] == "f" and str(constraint["conparentid"]) == "0"
-        },
-        hooks=hooks_by_name,
-    )
+_IDENTITY_SQL = """SELECT n.nspname AS schema,c.relname AS name,c.relkind::text AS kind,
+ ARRAY(SELECT i.relname FROM pg_index x JOIN pg_class i ON i.oid=x.indexrelid
+  WHERE x.indrelid=c.oid ORDER BY i.relname) AS indexes,
+ COALESCE((SELECT jsonb_object_agg(k.conname,pg_get_constraintdef(k.oid,true)) FROM pg_constraint k
+  WHERE k.conrelid=c.oid AND k.contype='f' AND k.conparentid=0),'{}'::jsonb) AS foreign_keys,
+ COALESCE((SELECT jsonb_object_agg(t.tgname,jsonb_build_object('function',p.proname,'tgtype',t.tgtype,
+  'enabled',t.tgenabled::text,'old_table',t.tgoldtable,'new_table',t.tgnewtable))
+  FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid WHERE t.tgrelid=c.oid AND NOT t.tgisinternal),'{}'::jsonb) AS hooks
+ FROM pg_namespace n JOIN pg_class c ON c.relnamespace=n.oid WHERE n.nspname=$1 AND c.relname=$2
+ AND NOT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid)"""
 
 
-async def _index_names(connection, entries):
-    oids = sorted({index["class"][0] for entry in entries for index in entry["native"]["indexes"]})
-    rows = await connection.fetch(
-        "SELECT oid::bigint,relname::text AS name FROM pg_catalog.pg_class WHERE oid=ANY($1::oid[])", oids
-    )
-    names_by_oid = {row["oid"]: row["name"] for row in rows}
-    _require(set(names_by_oid) == set(oids), "indexes_changed")
-    return names_by_oid
+async def _identity(connection, relation):
+    row = await connection.fetchrow(_IDENTITY_SQL, relation["schema"], relation["name"])
+    _require(row is not None, "relation_changed")
+    import json
+
+    identity_by_field = dict(row)
+    for key in ("foreign_keys", "hooks"):
+        if type(identity_by_field[key]) is str:
+            identity_by_field[key] = json.loads(identity_by_field[key])
+    return identity_by_field
 
 
 async def scan_cms_history_prework_data(connection, session, *, storage, family, expected_history_bounds=None):
     """Read complete fixed history without inventing an allocation or conversion authority.
 
-    The caller authenticates the family and holds the original-Admin history
-    fence throughout the scan. Finalization must capture its own fresh history.
+    The caller declares the family and owns its repeatable-read transaction.
+    Finalization must capture fresh history within its publication boundary.
     """
     roots_by_name = _old_roots(family)
-    catalog_by_field = dict(
-        database_oid=storage["database_oid"],
-        schema_oid=storage["catalog_schema_oid"],
-        roots={root: {"oid": entry["oid"], "owner": entry["relowner"]} for root, entry in roots_by_name.items()},
-    )
-    schema = storage["catalog_schema"]
+    schema = _schema(storage)
+    catalog_by_field = {"schema": schema, "roots": {root: {"schema": schema, "name": root} for root in roots_by_name}}
     checked = (
         None if expected_history_bounds is None else bounds.require_cms_history_expectations(expected_history_bounds)
     )
@@ -115,55 +87,47 @@ async def scan_cms_history_prework_data(connection, session, *, storage, family,
     }
 
 
-async def capture_cms_history_data(connection, session, *, storage, family, parents, expected_history_bounds=None):
-    """Capture fresh complete history and its genuine allocated conversion plan."""
-    roots_by_name = _old_roots(family)
+async def capture_cms_history_data(
+    connection, session, *, storage, family, parents, history_names, expected_history_bounds=None
+):
+    """Capture complete history and a plan using explicit retained relation names.
+
+    No ID-derived history name is invented. The caller declares collision-free
+    names and applies the returned plan within its atomic publication boundary.
+    """
+    _old_roots(family)
     scanned = await scan_cms_history_prework_data(
-        connection,
-        session,
-        storage=storage,
-        family=family,
-        expected_history_bounds=expected_history_bounds,
+        connection, session, storage=storage, family=family, expected_history_bounds=expected_history_bounds
     )
-    schema = storage["catalog_schema"]
-    index_names = await _index_names(connection, [*(roots_by_name[root] for root in history.ROOTS), *parents.values()])
-    request_by_field = dict(
-        database_oid=storage["database_oid"],
-        catalog_schema=schema,
-        catalog_schema_oid=storage["catalog_schema_oid"],
-        future_schema=schema,
-        future_schema_oid=storage["catalog_schema_oid"],
-        owner_oid=storage["namespace_owner_oid"],
-        heaps={
-            root: dict(
-                old=_identity(roots_by_name[root], index_names, schema, root),
-                parent=_identity(parents[root], index_names, schema, root),
-                dataset_ids=scanned["history_dataset_ids"][root],
-            )
-            for root in history.ROOTS
-        },
-    )
-    history_by_field = dict(
-        transaction=await connection.fetchval("SELECT pg_catalog.pg_current_xact_id()::text"),
-        request=request_by_field,
-        dataset_rows=scanned["dataset_rows"],
-        content=scanned["content"],
-    )
-    records.require_cms_history_record(history_by_field, storage=storage, parents=parents)
-    return deepcopy(history_by_field)
+    schema = _schema(storage)
+    _require(type(history_names) is dict and set(history_names) == set(history.ROOTS), "history_names_required")
+    heaps_by_root = {}
+    for root in history.ROOTS:
+        heaps_by_root[root] = {
+            "old": await _identity(connection, {"schema": schema, "name": root}),
+            "parent": await _identity(connection, parents[root]),
+            "history_name": history_names[root],
+            "dataset_ids": scanned["history_dataset_ids"][root],
+        }
+    record_by_field = {
+        "request": {"catalog_schema": schema, "future_schema": schema, "heaps": heaps_by_root},
+        "dataset_rows": scanned["dataset_rows"],
+        "content": scanned["content"],
+    }
+    records.require_cms_history_record(record_by_field, storage=storage, parents=parents)
+    return deepcopy(record_by_field)
 
 
 async def read_converted_cms_history_data(connection, session, *, record, plan):
-    """Compare both complete retained heaps to the already authenticated history commitment.
+    """Compare complete retained heaps to the accepted content and dataset bounds.
 
-    The caller authenticates protected record provenance, exact converted storage
-    and bounds, and the original-Admin snapshot before and after these scans.
-    Current rows never supply expected bounds, identities or content hashes.
+    The plan supplies declared names and expected bounds. Native COPY scans all
+    stored values in primary-key order within the caller's read snapshot.
     """
     _require(type(record) is dict and plan == history.plan_cms_history_conversion(record["request"]), "plan_changed")
-    schema = plan["request"]["future_schema"]
+    schema = plan["request"]["catalog_schema"]
     receipts_by_root = {
-        root: {key: plan["expected"][root]["old"][key] for key in ("name", "oid")} for root in history.ROOTS
+        root: {key: plan["expected"][root]["old"][key] for key in ("schema", "name")} for root in history.ROOTS
     }
     relations_by_root = {
         scans.RESOURCE: storage_relation(schema, scans.RESOURCE),

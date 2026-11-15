@@ -120,18 +120,17 @@ def original_profile_input_scope(fhir: Any):
 
 
 async def _assert_resumed_profile_state(fhir: Any, identity: Any, geometry: Any) -> None:
-    """Recheck the original predecessor or initial physical snapshot under its locks."""
+    """Recheck the original predecessor or initial named snapshot under its locks."""
     if identity.initial_targets is None:
         observed_serving = await fhir._provider_directory_profile_serving_state(fhir._schema(), for_update=True)
         fhir._assert_provider_directory_profile_capacity_serving_state(identity.serving_state, observed_serving)
         return
     observed_targets = await profile_initial.capture_targets(fhir, fhir._schema())
     receipt_layout = await profile_initial.receipt_layout(fhir, fhir._schema())
-    if (
-        observed_targets != identity.initial_targets
-        or receipt_layout.relation_oid != geometry.initial_receipt_oid
-        or receipt_layout.exact_fingerprint != geometry.initial_receipt_storage_fingerprint
-    ):
+    if observed_targets != identity.initial_targets or {
+        "schema": receipt_layout.schema_name,
+        "name": receipt_layout.relation_name,
+    } != {name: geometry.relations["initial_receipt"][name] for name in ("schema", "name")}:
         raise _error("profile_initial_target_changed")
 
 
@@ -219,20 +218,12 @@ async def _database_observation(fhir: Any, plan: NonprofileAdmissionPlan) -> dic
 
 
 async def _read_database_observation(fhir: Any) -> dict[str, Any]:
-    """Read native database, effective tablespaces and actual session temp limits."""
+    """Read actual session limits and the numeric WAL position."""
     row = await fhir.db.first("""
-        SELECT control.system_identifier::text AS database_system_identifier,
-               d.oid::bigint AS database_oid, d.datname AS database_name,
-               d.dattablespace::bigint AS data_tablespace_oid, data.spcname AS data_tablespace_name,
-               temp.oid::bigint AS temp_tablespace_oid, temp.spcname AS temp_tablespace_name,
-               pg_current_wal_insert_lsn()::text AS wal_lsn,
+        SELECT pg_current_wal_insert_lsn()::text AS wal_lsn,
                current_setting('temp_file_limit') AS temp_limit,
                current_setting('max_parallel_workers_per_gather')::integer AS query_parallel_workers,
-               current_setting('max_parallel_maintenance_workers')::integer AS maintenance_parallel_workers
-          FROM pg_database d CROSS JOIN pg_control_system() control
-          JOIN pg_tablespace data ON data.oid=d.dattablespace
-          JOIN pg_tablespace temp ON temp.spcname=COALESCE(NULLIF(current_setting('temp_tablespaces'),''),data.spcname)
-         WHERE d.datname=current_database();
+               current_setting('max_parallel_maintenance_workers')::integer AS maintenance_parallel_workers;
     """)
     if row is None:
         raise _error("database_observation_missing")
@@ -255,9 +246,6 @@ def _verify_envelope(
         trust=capacity_runtime.configured_capacity_lease_trust(),
         now=now,
         expected_capacity_geometry_hash=geometry_hash,
-        expected_database_system_identifier=observation["database_system_identifier"],
-        expected_database_oid=observation["database_oid"],
-        expected_database_name=observation["database_name"],
     )
 
 
@@ -287,21 +275,6 @@ def _assert_runtime_storage(
         )
     ):
         raise _error("execution_limits_changed")
-    expected_by_usage = {
-        usage: (observation[usage + "_tablespace_oid"], observation[usage + "_tablespace_name"])
-        for usage in ("data", "temp")
-    }
-    if {entry.usage: (entry.tablespace_oid, entry.tablespace_name) for entry in lease.tablespaces} != expected_by_usage:
-        raise _error("tablespaces_changed")
-    if any(
-        observation[name] != getattr(lease, name)
-        for name in (
-            "database_system_identifier",
-            "database_oid",
-            "database_name",
-        )
-    ):
-        raise _error("database_changed")
 
 
 def _assert_paired_reservation(
@@ -311,38 +284,31 @@ def _assert_paired_reservation(
     *,
     storage: VerifiedStorageContinuation | None = None,
 ) -> None:
-    """Account both independent reservations on each possibly colocated volume."""
+    """Charge the authenticated pair once within the shared environment pool."""
     if nonprofile.reservation_id == profile.reservation_id or nonprofile.attestation_id == profile.attestation_id:
         raise _error("profile_reservation_reused")
-    nonprofile_volumes_by_class = {volume.volume_class: volume.volume_digest for volume in nonprofile.volumes}
-    profile_volumes_by_class = {volume.volume_class: volume.volume_digest for volume in profile.volumes}
-    if (
-        nonprofile.tablespace_identity_hash != profile.tablespace_identity_hash
-        or nonprofile_volumes_by_class != profile_volumes_by_class
-    ):
-        raise _error("paired_storage_changed")
-    reserved_by_volume: dict[str, int] = {}
-    for lease in (nonprofile, profile):
-        for volume in lease.volumes:
-            reserved_by_volume[volume.volume_digest] = (
-                reserved_by_volume.get(volume.volume_digest, 0) + volume.reserved_bytes
-            )
+    reserved = nonprofile.reservation_bytes_by_storage_class
+    paired = profile.reservation_bytes_by_storage_class
     observations = (
-        storage.volume_observations
+        storage.storage_observations
         if storage is not None
         else tuple(
             (
-                volume.volume_class,
-                volume.volume_digest,
-                volume.available_bytes,
-                volume.available_after_all_reservations_bytes,
+                entry.storage_class,
+                entry.available_bytes,
+                entry.available_after_all_reservations_bytes,
             )
-            for volume in nonprofile.volumes
+            for entry in nonprofile.storage_classes
         )
     )
-    for _class, digest, available, remaining in observations:
-        if available < reserved_by_volume[digest] + minimum or remaining < minimum:
-            raise _error("aggregate_remaining_capacity_too_small")
+    free = min(available for _class, available, _remaining in observations)
+    outstanding_by_class = {role: available - reserved[role] - remaining for role, available, remaining in observations}
+    if (
+        free < sum(reserved.values()) + sum(paired.values()) + minimum
+        or any(outstanding_by_class[role] < paired[role] for role in paired)
+        or free - sum(reserved.values()) - sum(outstanding_by_class.values()) < minimum
+    ):
+        raise _error("aggregate_remaining_capacity_too_small")
 
 
 @dataclass
@@ -369,7 +335,6 @@ class _CapacityProducer:
     _cutover_request: NonprofileAdmissionCheck | None = field(default=None, init=False)
     _cutover_witness: VerifiedStorageContinuation | None = field(default=None, init=False)
     _cutover_observation: Mapping[str, Any] | None = field(default=None, init=False)
-    _cutover_binding: Any = field(default=None, init=False)
 
     @asynccontextmanager
     async def cutover_operation(self):
@@ -381,7 +346,7 @@ class _CapacityProducer:
             yield
         finally:
             self._cutover_active = False
-            self._cutover_request = self._cutover_witness = self._cutover_observation = self._cutover_binding = None
+            self._cutover_request = self._cutover_witness = self._cutover_observation = None
 
     async def assert_cutover(self, relations: tuple[OwnedRelation, ...] | None) -> None:
         """Recheck the same transaction locally without another authority request."""
@@ -398,16 +363,12 @@ class _CapacityProducer:
             or self.profile_lease.lease_digest != self.plan.paired_profile_lease_digest
         ):
             raise _error("cutover_operation_changed")
-        if self._cutover_binding is None:
-            self._cutover_binding = binding
-        if self._cutover_binding is not binding:
-            raise _error("cutover_operation_changed")
         await self._assert_consumption()
         if relations is None:
             await self._assert_wal_budget(request)
         else:
-            if tuple((relation.schema, relation.relation, relation.oid) for relation in relations) != tuple(
-                (relation.schema, relation.relation, relation.oid) for relation in request.relations
+            if tuple((relation.schema, relation.relation) for relation in relations) != tuple(
+                (relation.schema, relation.relation) for relation in request.relations
             ):
                 raise _error("cutover_relations_changed")
             await self._assert_physical(replace(request, relations=relations), self._cutover_observation)
@@ -578,20 +539,19 @@ class _CapacityProducer:
         now = await fhir._profile_capacity_preflight_clock()
         fhir._assert_profile_capacity_receipt_open(receipt_row, self.lease, now)
         await fhir._assert_profile_capacity_receipt_storage(schema, receipt)
-        await self._assert_paired_preflight()
-        query = fhir._profile_capacity_quiescence_sql(schema).replace(
-            "AND request_sha256 <> :request_sha256",
-            "AND request_sha256 <> :request_sha256 AND request_sha256 <> :paired_request_sha256",
+        pair = await self._assert_paired_preflight()
+        await fhir._profile_capacity_quiescence(
+            schema,
+            observed_at=now,
+            request_sha256=receipt["request_sha256"],
+            current_run_id=self.run_id,
+            verified_receipts=(receipt, pair),
         )
-        params_by_name = _quiescence_parameters(fhir, self, receipt, now)
-        counters = await fhir.db.first(query, **params_by_name)
-        if counters is None or any(value != 0 for value in fhir._pagination_checkpoint_row_mapping(counters).values()):
-            raise _error("competing_admission")
         if receipt["runtime_observation"] != dict(runtime):
             raise _error("preflight_runtime_changed")
         await fhir._mark_profile_capacity_receipt_consumed(schema, self.run_id, self.lease, now)
 
-    async def _assert_paired_preflight(self) -> None:
+    async def _assert_paired_preflight(self) -> dict:
         """Permit exactly one open, durable, signed Profile receipt for this selection."""
         receipt = self.profile_lease.signing_preflight_guard["healthcare_receipt"]
         row = await self.fhir.db.first(
@@ -610,6 +570,7 @@ class _CapacityProducer:
         self.fhir._assert_profile_capacity_receipt_open(
             values_by_field, self.profile_lease, await self.fhir._profile_capacity_preflight_clock()
         )
+        return stored
 
     async def _assert_consumption(self, *, database=None) -> None:
         """Require the same immutable full original lease bytes for every later phase."""
@@ -634,7 +595,7 @@ class _CapacityProducer:
             raise _error("consumption_changed")
 
     def _raw_relation_policies(self, request: NonprofileAdmissionCheck) -> dict:
-        """Reject annotations outside this verified policy and measured original OIDs."""
+        """Reject annotations outside the signed policy and selected logical tables."""
         if not request.raw_relations:
             return {}
         policy = retained_raw_policy(self.lease)
@@ -646,9 +607,7 @@ class _CapacityProducer:
         ):
             raise _error("raw_identity_changed")
         policy_json = json.dumps(policy, sort_keys=True, separators=(",", ":"))
-        measured_oid_by_coordinate = {
-            (relation.schema, relation.relation): relation.oid for relation in request.relations
-        }
+        measured_coordinates = {(relation.schema, relation.relation) for relation in request.relations}
         raw_by_coordinate = {}
         for raw_relation in request.raw_relations:
             if type(raw_relation) is not RetainedRawRelation:
@@ -656,9 +615,7 @@ class _CapacityProducer:
             coordinate = (raw_relation.schema, raw_relation.relation)
             if (
                 coordinate in raw_by_coordinate
-                or type(raw_relation.oid) is not int
-                or not 0 < raw_relation.oid < 2**32
-                or measured_oid_by_coordinate.get(coordinate) != raw_relation.oid
+                or coordinate not in measured_coordinates
                 or raw_relation.policy_json != policy_json
                 or type(raw_relation.index_names) is not tuple
                 or any(type(name) is not str for name in raw_relation.index_names)
@@ -685,13 +642,11 @@ class _CapacityProducer:
             raise _error("native_identity_changed")
         policy_json = json.dumps(policy, sort_keys=True, separators=(",", ":"))
         schema = "entity_address_archive_" + UUID(policy["capture_id"]).hex
-        measured_oid_by_coordinate = {
-            (relation.schema, relation.relation): relation.oid for relation in request.relations
-        }
-        if len(measured_oid_by_coordinate) != len(request.relations):
+        measured_coordinates = {(relation.schema, relation.relation) for relation in request.relations}
+        if len(measured_coordinates) != len(request.relations):
             raise _error("native_identity_changed")
         raw_coordinates = {(relation.schema, relation.relation) for relation in request.raw_relations}
-        native_by_coordinate, source_oids, clone_oids = {}, set(), set()
+        native_by_coordinate, source_coordinates = {}, set()
         for annotation in request.native_relations:
             if type(annotation) is not RetainedNativeRelation or (
                 type(annotation.schema) is not str or type(annotation.relation) is not str
@@ -700,24 +655,20 @@ class _CapacityProducer:
             source_layout = annotation.source_layout
             model = _retained_source_model(source_layout, self.plan.native_address_targets)
             coordinate = (annotation.schema, annotation.relation)
+            source_coordinate = (source_layout.schema, source_layout.relation)
             if (
                 coordinate in native_by_coordinate
                 or coordinate in raw_coordinates
                 or annotation.schema != schema
                 or annotation.relation != model.__tablename__
                 or annotation.relation not in policy["address_tables"]
-                or type(annotation.oid) is not int
-                or not 0 < annotation.oid < 2**32
-                or measured_oid_by_coordinate.get(coordinate) != annotation.oid
+                or coordinate not in measured_coordinates
                 or annotation.policy_json != policy_json
-                or source_layout.database_oid != self.lease.database_oid
-                or source_layout.oid in source_oids
-                or annotation.oid in clone_oids
-                or annotation.oid == source_layout.oid
+                or source_coordinate in source_coordinates
+                or coordinate == source_coordinate
             ):
                 raise _error("native_identity_changed")
-            source_oids.add(source_layout.oid)
-            clone_oids.add(annotation.oid)
+            source_coordinates.add(source_coordinate)
             native_by_coordinate[coordinate] = self._native_source_policy(annotation, request)
         return native_by_coordinate
 
@@ -748,7 +699,7 @@ class _CapacityProducer:
         catalog_by_identity = {}
         for database, group in groups_by_executor.values():
             captured = await native_layout.observe_native_catalog_batch(self.fhir, group, database=database)
-            expected_identities = {(relation.schema, relation.relation, relation.oid) for relation in group}
+            expected_identities = {(relation.schema, relation.relation) for relation in group}
             if set(captured) != expected_identities or catalog_by_identity.keys() & captured.keys():
                 raise _error("native_identity_changed")
             catalog_by_identity.update(captured)
@@ -798,16 +749,14 @@ class _CapacityProducer:
                         "source_input": observers.scope.source_input,
                     }
                 )
-                identity = (relation.schema, relation.relation, relation.oid)
+                identity = (relation.schema, relation.relation)
                 if identity in native_catalogs:
                     arguments["observed_catalog"] = native_catalogs[identity]
                 layout = scratch_layouts.get((relation.schema, relation.relation))
                 if layout is None:
                     layout = await self._capture_relation_layout(relation, raw_state, native_source, **arguments)
-                if layout.relation_oid != relation.oid or layout.effective_tablespace_oids != (
-                    observation["data_tablespace_oid"],
-                ):
-                    raise _error("physical_tablespace_changed")
+                if (layout.schema_name, layout.relation_name) != (relation.schema, relation.relation):
+                    raise _error("relation_changed")
 
     async def _capture_relation_layout(
         self,
@@ -850,8 +799,16 @@ class _CapacityProducer:
             )
         if native_layout.is_scope_relation(self.fhir, relation.relation):
             return await native_layout.capture_scope_layout(self.fhir, relation, **arguments)
-        return await self.fhir._provider_directory_profile_relation_storage_fingerprint(
-            relation.oid, expected_persistence=relation.persistence, **arguments
+        selected_database = self.fhir.db if database is None else database
+        from db.plan_release_storage import storage_relation
+
+        oid = await selected_database.scalar(
+            "SELECT to_regclass(:relation)::oid::bigint", relation=storage_relation(relation.schema, relation.relation)
+        )
+        if oid is None:
+            raise _error("relation_changed")
+        return await self.fhir._provider_directory_profile_capacity_relation_layout(
+            oid, expected_persistence=relation.persistence, **arguments
         )
 
     async def _assert_wal_budget(self, request: NonprofileAdmissionCheck, *, controls=None) -> None:
@@ -952,29 +909,6 @@ class _CapacityProducer:
             "selection_proof_id": self.plan.selection_proof_id,
         }:
             raise _error("active_profile_consumption_changed")
-
-
-def _quiescence_parameters(
-    fhir: Any, producer: _CapacityProducer, receipt: Mapping[str, Any], now: datetime.datetime
-) -> dict[str, Any]:
-    """Reuse closed existing competing-owner boundaries with one exact paired hash."""
-    quiescence = receipt["quiescence"]
-    return {
-        "active_statuses": quiescence["active_profile_run_statuses"],
-        "profile_params": json.dumps(
-            {
-                "provider_directory_profile_contract_id": fhir.PROFILE_EXECUTION_CONTRACT_ID,
-                "publish_artifacts_only": True,
-                "publish_artifacts_targets": ["profile"],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-        "current_run_id": producer.run_id,
-        "observed_at": now,
-        "request_sha256": receipt["request_sha256"],
-        "paired_request_sha256": producer.profile_lease.signing_preflight_guard["healthcare_receipt"]["request_sha256"],
-    }
 
 
 async def produce_nonprofile_admission(

@@ -144,7 +144,7 @@ async def test_direct_v4_lifecycle_replay_acl_identity_and_downgrade_fence(
 ):
     """Seal once, replay once, and preserve every pre-existing object identity."""
 
-    scenario = await create_committed_subset_schema(monkeypatch)
+    scenario = await create_committed_subset_schema(monkeypatch, owned_database=True)
     migration = _load_migration()
     migration._MARKER_SHA256 = SYNTHETIC_MARKER_SHA256
     monkeypatch.setattr(
@@ -197,7 +197,7 @@ async def test_v1_evidence_survives_v2_upgrade_and_clean_downgrade(
 ):
     """Keep a historical v1 marker valid across the thin v2 migration."""
 
-    scenario = await create_committed_subset_schema(monkeypatch)
+    scenario = await create_committed_subset_schema(monkeypatch, owned_database=True)
     migration = _load_migration()
     writer_scope = AsyncExitStack()
     try:

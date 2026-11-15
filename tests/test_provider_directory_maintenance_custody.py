@@ -24,8 +24,8 @@ async def test_original_maintenance_custody_spans_parents_without_early_authorit
             identity_owner = identity_group["original_outcome"]
             assert identity_group is held["original_identity_check_group"]
             assert identity_group["consumed"] and identity_owner.is_committed
-            assert identity_owner is not original and identity_owner.connection is not connection
-            assert held["task"] is asyncio.current_task() and held["connection"] is connection
+            assert identity_owner is not original
+            assert held["task"] is asyncio.current_task()
             assert held["admission"] is admission and held["lease"].owned_outcome is original
             assert held["status"] == "incomplete" and not held["consumed"]
             assert original.measurement is None and not original.is_committed
@@ -50,17 +50,33 @@ async def test_original_maintenance_custody_spans_parents_without_early_authorit
         await close_healthy(connection)
 
 
+async def test_terminal_accounting_ignores_legacy_connection_tokens():
+    """Opaque old connection fields cannot override real terminal outcomes or measured accounting."""
+    fhir, connection, _, admission, _ = await coupled_fixture()
+    try:
+        async with maintenance.control_maintenance_fence(fhir, connection):
+            held = admission.wal_tracker.owned_control_maintenance_custody
+            held.update(connection=object(), retained_driver=object(), retained_pid=-1)
+            held["identity_check_group"].update(driver=object(), pid=-1)
+            await maintenance.release_before_cutover(fhir)
+            outcome = held["original_outcome"]
+            assert outcome.is_committed and outcome.cleanup_complete and outcome.status == "committed_measured"
+            assert held["consumed"] and held["status"] == "complete_long_lived_mixed_unclassified"
+            assert held["ordinary_body_physical_wal_upper_bytes"] == 618
+            assert not held["accounting_authority"] and not held["reservation_refund"]
+        assert connection.events.count("begin") == connection.events.count("commit") == 1
+    finally:
+        await close_healthy(connection)
+
+
 @pytest.mark.parametrize(
     "field",
     [
         "lease",
         "task",
-        "connection",
         "admission",
         "acquisition_window",
         "original_outcome",
-        "retained_driver",
-        "retained_pid",
         "terminal_window",
         "consumed",
     ],
@@ -138,7 +154,7 @@ def _replace_identity_group(held, group, change):
 
 @pytest.mark.parametrize(
     "change",
-    ["group", "outcome", "one_owner", "identity", "driver", "pid", "window", "consumed", "commit", "measurement"],
+    ["group", "outcome", "one_owner", "identity", "window", "consumed", "commit", "measurement"],
 )
 async def test_identity_callback_replacement_never_completes_family(change):
     fhir, connection, _, admission, _ = await coupled_fixture()

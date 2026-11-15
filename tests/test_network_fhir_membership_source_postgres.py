@@ -556,7 +556,6 @@ async def test_retained_generation_reread_cursor_and_native_fixed_queries(fhir_s
         {"dataset_id": "missing"},
         {"source_id": "another-source"},
         {"endpoint_id": "other-endpoint"},
-        {"resource_table_oid": 1},
     ],
 )
 async def test_pinned_scope_and_physical_identity_reject_drift(fhir_source, change):
@@ -622,10 +621,11 @@ async def test_relation_pin_holds_native_ddl_lock_and_copy_needs_caller(fhir_sou
     await _resource(connection, schema, "PractitionerRole", "role-one", _role())
     async with connection.transaction():
         await read_fhir_membership_batch(connection, source_pin, registry_schema=schema)
+        relation = source_pin.read_resource_relation
         assert await connection.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND relation=$1::oid "
+            "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND relation=to_regclass($1) "
             "AND mode='AccessShareLock' AND granted)",
-            source_pin.resource_table_oid,
+            f'"{relation["schema"]}"."{relation["name"]}"',
         )
     batch = await _read(fhir_source)
     with pytest.raises(FHIRMembershipSourceError, match="caller transaction"):

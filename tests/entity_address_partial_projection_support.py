@@ -137,10 +137,9 @@ async def projection_database(monkeypatch, *, desired=False):
                 "other", "endpoint-b", "dataset-b", "hash-b", "run-b"
             )
             inputs = preparation.ProviderDirectoryAddressPreparationInput(
-                (selected, sibling, other),
-                "desired_overlay",
-                1,
-                0,
+                dataset_pins=(selected, sibling, other),
+                overlay_table="desired_overlay",
+                address_alias_generation=0,
                 semantic_as_of="2026-01-03",
                 ordinary_serving_peer_pins=(other,),
             )

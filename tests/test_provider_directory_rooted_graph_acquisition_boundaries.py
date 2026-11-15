@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import math
+from contextlib import asynccontextmanager
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,6 +43,7 @@ from tests.provider_directory_rooted_graph_runtime_test_support import (
     RuntimeHarness,
     enabled_config,
 )
+from tests.test_rooted_predecessor_preflight import preflight_case as preflight_case
 
 
 @pytest.mark.parametrize("invalid_seconds", (True, "1", -1, math.inf))
@@ -201,50 +204,92 @@ class _Transaction:
 
 
 class _Database:
-    def __init__(self, row: object) -> None:
+    def __init__(self, row: object, *, source=None) -> None:
         self.row = row
+        self.source = source
+        self.session = self
+        self.reads = []
+        self.ordinary_transactions = 0
 
     def transaction(self) -> _Transaction:
+        self.ordinary_transactions += 1
         return _Transaction()
 
-    async def scalar(self, *_args, **_kwargs):
-        return None
+    @asynccontextmanager
+    async def configured(self, runtime):
+        """Reuse the configured named runtime while keeping scripted row transport local."""
+        from process.provider_directory_generic_source_policy import bind_generic_source_transaction_factory
 
-    async def first(self, *_args, **_kwargs):
+        runtime.relation_coordinates = lambda schema, root, name: (
+            ("candidate_generation", name) if root.startswith("provider_directory_rooted_graph_") else (schema, name)
+        )
+        factory = SimpleNamespace(transaction=self.transaction, rooted_graph_runtime=runtime)
+        async with bind_generic_source_transaction_factory(factory):
+            yield self
+
+    async def scalar(self, *args, **kwargs):
+        return None if self.source is None else await self.source.scalar(*args, **kwargs)
+
+    async def status(self, *args, **kwargs):
+        return None if self.source is None else await self.source.status(*args, **kwargs)
+
+    async def first(self, query, **parameters):
+        self.reads.append((query, parameters))
         return self.row
 
 
 @pytest.mark.asyncio
-async def test_locked_status_returns_absent_after_current_root_fence() -> None:
-    async def select_current(_database, *, pair):
-        return object()
+async def test_locked_status_returns_absent_after_current_root_fence(preflight_case) -> None:
+    case = preflight_case
+    root = identity()
+    database = _Database(None, source=case.database)
 
-    status = await _locked_acquisition_status(
-        identity(),
-        _Database(None),
-        "synthetic-lock",
-        lambda: object(),
-        select_current,
-        lambda _current, _identity: True,
-    )
+    async def select_current(_database, *, pair):
+        pytest.fail("Configured status must use the validated current-root fence")
+
+    def has_current_root(current, expected):
+        assert current == case.current and expected == root
+        return True
+
+    async with database.configured(case.runtime):
+        status = await _locked_acquisition_status(
+            root, database, "synthetic-lock", lambda: object(), select_current, has_current_root
+        )
     assert status == "absent"
+    assert case.runtime.transactions == [{"isolation": "repeatable read", "readonly": True}, {}]
+    assert database.ordinary_transactions == 0
+    assert database.reads == [
+        (
+            'SELECT * FROM "candidate_generation"."provider_directory_rooted_graph_acquisition" WHERE acquisition_id = :acquisition_id FOR SHARE;',
+            {"acquisition_id": root.acquisition_id},
+        )
+    ]
+    case.database.status.assert_awaited_once_with("SET LOCAL lock_timeout='1500ms'")
 
 
 @pytest.mark.asyncio
-async def test_locked_status_revalidates_existing_acquisition_row() -> None:
-    async def select_current(_database, *, pair):
-        return object()
-
+async def test_locked_status_revalidates_existing_acquisition_row(preflight_case) -> None:
+    case = preflight_case
     root = identity()
-    status = await _locked_acquisition_status(
-        root,
-        _Database({**identity_fields(root), "status": "building"}),
-        "synthetic-lock",
-        lambda: object(),
-        select_current,
-        lambda _current, _identity: True,
-    )
+    acquisition_by_field = {**identity_fields(root), "status": "building"}
+    database = _Database(acquisition_by_field, source=case.database)
+
+    async def select_current(_database, *, pair):
+        pytest.fail("Configured status must use the validated current-root fence")
+
+    def has_current_root(current, expected):
+        assert current == case.current and expected == root
+        return True
+
+    async with database.configured(case.runtime):
+        status = await _locked_acquisition_status(
+            root, database, "synthetic-lock", lambda: object(), select_current, has_current_root
+        )
     assert status == "building"
+    assert database.row == {**identity_fields(root), "status": "building"}
+    assert case.runtime.transactions == [{"isolation": "repeatable read", "readonly": True}, {}]
+    assert database.ordinary_transactions == 0
+    assert database.reads[0][1] == {"acquisition_id": root.acquisition_id}
 
 
 @pytest.mark.asyncio
@@ -264,24 +309,32 @@ async def test_public_revalidation_rejects_nonidentity_input() -> None:
 async def test_census_state_accepts_exact_absent_or_singleton(
     row: dict[str, object],
     expected: str,
+    preflight_case,
 ) -> None:
-    assert (
-        await provider_directory_rooted_graph_census_state(
-            identity().acquisition_id,
-            database=_Database(row),
+    database = _Database(row)
+    async with database.configured(preflight_case.runtime):
+        assert (
+            await provider_directory_rooted_graph_census_state(
+                identity().acquisition_id,
+                database=database,
+            )
+            == expected
         )
-        == expected
-    )
+    assert database.row == row and database.ordinary_transactions == 0
 
 
 @pytest.mark.asyncio
-async def test_census_state_rejects_duplicate_or_unknown_rows() -> None:
-    with pytest.raises(ProviderDirectoryRootedGraphAcquisitionError) as error_info:
-        await provider_directory_rooted_graph_census_state(
-            identity().acquisition_id,
-            database=_Database({"census_count": 2, "census_status": "pending"}),
-        )
+async def test_census_state_rejects_duplicate_or_unknown_rows(preflight_case) -> None:
+    census_by_field = {"census_count": 2, "census_status": "pending"}
+    database = _Database(census_by_field)
+    async with database.configured(preflight_case.runtime):
+        with pytest.raises(ProviderDirectoryRootedGraphAcquisitionError) as error_info:
+            await provider_directory_rooted_graph_census_state(
+                identity().acquisition_id,
+                database=database,
+            )
     assert error_info.value.code == "state"
+    assert database.row == census_by_field and database.ordinary_transactions == 0
 
 
 def test_default_dependency_surface_is_fully_callable() -> None:
@@ -291,9 +344,11 @@ def test_default_dependency_surface_is_fully_callable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_default_session_is_isolated_and_identity_encoded() -> None:
-    async with default_session_scope(2) as session:
-        assert session.connector.limit == 2
+@pytest.mark.parametrize("connection_limit", [2, 8])
+async def test_default_session_is_isolated_and_identity_encoded(connection_limit) -> None:
+    async with default_session_scope(connection_limit) as session:
+        assert session.connector.limit == connection_limit
+        assert session.connector.limit_per_host == connection_limit
         assert session.auto_decompress is False
         assert session.trust_env is False
         assert session.headers["Accept-Encoding"] == "identity"

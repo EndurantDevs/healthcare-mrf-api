@@ -24,7 +24,6 @@ from tests.test_pricing_api import (
     pricing_module,
 )
 
-
 ROLLUP_TABLE = "pricing_provider_rx_rollup"
 
 
@@ -171,9 +170,7 @@ async def _create_rollup_fixture(connection, relation, rollup_relation):
 async def _query_rows(engine, query):
     async with engine.connect() as query_connection:
         query_result = await query_connection.execute(query)
-        return [
-            dict(query_row) for query_row in query_result.mappings().all()
-        ]
+        return [dict(query_row) for query_row in query_result.mappings().all()]
 
 
 async def _load_autocomplete_page(
@@ -187,15 +184,11 @@ async def _load_autocomplete_page(
         offset=query_arguments.pop("offset", 0),
     )
     async with engine.connect() as query_connection:
-        query_connection = await query_connection.execution_options(
-            schema_translate_map={"mrf": schema}
-        )
+        query_connection = await query_connection.execution_options(schema_translate_map={"mrf": schema})
         return await pricing_module._load_prescription_autocomplete_page(
             query_connection,
             source_table,
-            terminology_internal_codes=query_arguments.pop(
-                "terminology_internal_codes", []
-            ),
+            terminology_internal_codes=query_arguments.pop("terminology_internal_codes", []),
             order_by=query_arguments.pop("order_by", "total_claims"),
             order=query_arguments.pop("order", "desc"),
             pagination=pagination,
@@ -266,15 +259,11 @@ async def _assert_stable_tie_pagination(engine, schema):
 
 def _assert_benchmark_plans(rollup_plan, provider_plan):
     provider_nodes = list(_plan_nodes(provider_plan["Plan"]))
-    assert sum(
-        node.get("Index Name") == "pricing_provider_rx_autocomplete_trgm_idx"
-        for node in provider_nodes
-    ) == 4
+    assert sum(node.get("Index Name") == "pricing_provider_rx_autocomplete_trgm_idx" for node in provider_nodes) == 4
     assert provider_plan["Execution Time"] > rollup_plan["Execution Time"] * 5
     assert rollup_plan["Execution Time"] <= 5.0
     assert not any(
-        node.get("Relation Name") == "pricing_provider_prescription"
-        for node in _plan_nodes(rollup_plan["Plan"])
+        node.get("Relation Name") == "pricing_provider_prescription" for node in _plan_nodes(rollup_plan["Plan"])
     )
 
 
@@ -303,19 +292,13 @@ async def test_production_autocomplete_uses_exact_bounded_rollup(monkeypatch):
         monkeypatch.setattr(
             pricing_module,
             "_PRESCRIPTION_AUTOCOMPLETE_FINGERPRINT_SQL",
-            (
-                "COALESCE(to_regclass('"
-                f'"{schema}"."pricing_provider_prescription"'
-                "')::oid::text, '0')"
-            ),
+            f"'{schema}.pricing_provider_prescription'",
         )
 
-        fast_query = (await _rollup_query()).execution_options(
+        fast_query = (await _rollup_query()).execution_options(schema_translate_map={"mrf": schema})
+        fallback_query = (await _rollup_query(rollup_available=False)).execution_options(
             schema_translate_map={"mrf": schema}
         )
-        fallback_query = (
-            await _rollup_query(rollup_available=False)
-        ).execution_options(schema_translate_map={"mrf": schema})
         rollup_plan = (await _prepared_plans(engine, fast_query))[0][-1][0]
         provider_plan = (await _prepared_plans(engine, fallback_query))[0][-1][0]
 

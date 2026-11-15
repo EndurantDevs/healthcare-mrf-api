@@ -7,13 +7,10 @@ from pathlib import Path
 import pytest
 
 from db.models import PricingProviderPrescriptionAutocomplete
-
+from db.prescription_autocomplete_rollup_sql import prescription_autocomplete_source_fingerprint_sql
 
 MIGRATION_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "alembic"
-    / "versions"
-    / "20260820140000_prescription_autocomplete_rollup.py"
+    Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20260820140000_prescription_autocomplete_rollup.py"
 )
 MIGRATION_SPEC = spec_from_file_location(
     "prescription_autocomplete_rollup_migration",
@@ -25,24 +22,26 @@ MIGRATION_SPEC.loader.exec_module(migration)
 drug_claims = importlib.import_module("process.drug_claims")
 
 
+@pytest.mark.parametrize("schema", ["reference", "quote's"])
+def test_rollup_binding_is_a_portable_name_literal(schema):
+    statement = prescription_autocomplete_source_fingerprint_sql(
+        schema=schema, provider_table="pricing_provider_prescription"
+    )
+    assert statement == "'" + schema.replace("'", "''") + ".pricing_provider_prescription'"
+
+
 def test_rollup_model_matches_migration_contract():
     model = PricingProviderPrescriptionAutocomplete
 
-    assert migration.down_revision == (
-        "20260820130000_site_intelligence_fast_paths"
-    )
-    assert migration.TABLE_COLUMNS == {
-        column.name for column in model.__table__.columns
-    }
+    assert migration.down_revision == ("20260820130000_site_intelligence_fast_paths")
+    assert migration.TABLE_COLUMNS == {column.name for column in model.__table__.columns}
     assert model.__my_index_elements__ == [
         "year",
         "rx_code_system",
         "rx_code",
         "variant_id",
     ]
-    assert list(model.__table__.primary_key.columns.keys()) == (
-        model.__my_index_elements__
-    )
+    assert list(model.__table__.primary_key.columns.keys()) == (model.__my_index_elements__)
 
 
 def test_drug_claims_stages_rollup_model():
@@ -75,8 +74,5 @@ async def test_drug_claims_materializes_exact_name_variants(monkeypatch):
     assert '"mrf"."autocomplete_stage"' in statements[1]
     assert '"mrf"."provider_stage"' in statements[1]
     materialization_sql = " ".join(statements[1].split())
-    assert (
-        "GROUP BY year, rx_code_system, rx_code, rx_name, generic_name, "
-        "brand_name"
-    ) in materialization_sql
+    assert ("GROUP BY year, rx_code_system, rx_code, rx_name, generic_name, brand_name") in materialization_sql
     assert "source_relation_fingerprint" in statements[1]

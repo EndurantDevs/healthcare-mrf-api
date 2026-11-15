@@ -144,7 +144,7 @@ async def _product_recipe(fixture, serving, capture, plans=("plan-one", "plan-on
         fixture.origin.dataset_id,
         fixture.origin.dataset_sha256,
         capture.release_id,
-        fixture.origin.resource_parent_oid,
+        fixture.origin.resource_relation,
         "medical",
         "2026-10-01",
         retained_capture=capture,
@@ -272,7 +272,7 @@ async def _fixture(connection):
         relation=lambda _: "pg_temp.pair_plan_input",
         document={"counts": {"pair_rows": 5001, "reference_rows": 10002}},
     )
-    selected = mapping.TypedGraphMapping(stage, names, {}, {})
+    selected = mapping.TypedGraphMapping(stage, names, {})
     await connection.execute(
         "INSERT INTO "
         + selected.relation("offices")

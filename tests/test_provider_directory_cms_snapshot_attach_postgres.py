@@ -32,7 +32,7 @@ async def _parents(case):
         relation = _root(case, root)
         await case.admin.execute(f"ALTER TABLE {relation} OWNER TO {storage_identifier(case.roles['namespace'])}")
         await case.admin.execute(f"GRANT SELECT ON {relation} TO {storage_identifier(case.policy.publisher_role)}")
-        oids_by_root[root] = await case.admin.fetchval("SELECT $1::regclass::oid::bigint", relation)
+        oids_by_root[root] = {"schema": case.storage.catalog_schema, "name": root}
     return {root: oids_by_root[root] for root in attach.ROOTS}
 
 
@@ -91,23 +91,22 @@ async def _private(case, driver):
 
 async def test_two_attach_preserves_indexes_and_reader(attachment_case):
     case = attachment_case
-    before_by_root = {
-        root: await _index_oids(case.admin, entry["oid"]) for root, entry in case.sealed["tables"].items()
-    }
+    before_by_root = {root: await _index_oids(case.admin, entry) for root, entry in case.sealed["tables"].items()}
     async with _admin(case):
         result = await _attach(case)
         assert result["contract"] == attach.CONTRACT
         assert result["parents"] == case.parent_oids
         assert set(result["tables"]) == set(attach.ROOTS)
         for root, proof in result["tables"].items():
-            assert proof["oid"] == case.sealed["tables"][root]["oid"]
-            assert await _index_oids(case.admin, proof["oid"]) == before_by_root[root]
+            assert proof == case.sealed["tables"][root]
+            assert await _index_oids(case.admin, proof) == before_by_root[root]
         for root, proof in case.sealed["tables"].items():
             if root not in attach.ROOTS:
                 assert not await case.admin.fetchval(
-                    "SELECT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=$1)", proof["oid"]
+                    "SELECT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=to_regclass($1))",
+                    storage_relation(proof["schema"], proof["name"]),
                 )
-                assert await _index_oids(case.admin, proof["oid"]) == before_by_root[root]
+                assert await _index_oids(case.admin, proof) == before_by_root[root]
     async with publisher(case) as (_session, driver):
         for root in workspace.storage.RELATIONS:
             assert await driver.fetchval("SELECT count(*) FROM " + _root(case, root)) == (
@@ -172,8 +171,11 @@ async def test_busy_parent_refuses_nowait_and_releases_own_pins(attachment_case)
                 await _attach(case)
             await _private(case, case.admin)
             assert not await case.admin.fetchval(
-                "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() AND relation=ANY($1::oid[]))",
-                list(case.parent_oids.values()) + [entry["oid"] for entry in case.sealed["tables"].values()],
+                "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() AND relation=ANY(ARRAY(SELECT to_regclass(name) FROM unnest($1::text[]) name)))",
+                [
+                    storage_relation(entry["schema"], entry["name"])
+                    for entry in [*case.parent_oids.values(), *case.sealed["tables"].values()]
+                ],
             )
 
 
@@ -186,7 +188,7 @@ async def test_late_bound_rolls_back_both(attachment_case):
         await _private(case, case.admin)
 
 
-@pytest.mark.parametrize("drift", ["default", "index", "parent_oid", "row_hook"])
+@pytest.mark.parametrize("drift", ["default", "index", "parent_name", "row_hook"])
 async def test_parent_drift_refuses_before_attachment(attachment_case, drift):
     case = attachment_case
     root = attach.ROOTS[0]
@@ -195,8 +197,8 @@ async def test_parent_drift_refuses_before_attachment(attachment_case, drift):
         await _old_child(case, root, "", default=True)
     elif drift == "index":
         await case.admin.execute("CREATE INDEX unmatched_payload_idx ON " + parent + "(dataset_id)")
-    elif drift == "parent_oid":
-        case.parent_oids[root] += 1
+    elif drift == "parent_name":
+        case.parent_oids[root] = {**case.parent_oids[root], "name": "different_parent"}
     else:
         await case.admin.execute(
             "CREATE TRIGGER row_hook BEFORE UPDATE ON "
@@ -251,7 +253,7 @@ async def test_unsealed_payloads_refuse(private_payload_case):
     case.parent_oids = await _parents(case)
     case.sealed = {}
     async with _admin(case):
-        with pytest.raises(ValueError, match="rights_changed"):
+        with pytest.raises(ValueError, match="cms_snapshot_attach_seal_changed"):
             await _attach(case)
 
 
@@ -259,7 +261,7 @@ async def test_ordinary_publisher_cannot_invoke_admin_attachment(attachment_case
     case = attachment_case
     async with publisher(case) as (_session, driver):
         await driver.execute("SET LOCAL search_path=pg_catalog,pg_temp")
-        with pytest.raises(ValueError, match="independent_original_admin_required"):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
             await _attach(case, driver)
         assert await _check(case, driver) == case.sealed
 
@@ -267,13 +269,13 @@ async def test_ordinary_publisher_cannot_invoke_admin_attachment(attachment_case
 @pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
 async def test_late_failure_or_cancellation_rolls_back_attached_group(attachment_case, monkeypatch, failure):
     case = attachment_case
-    original = attach._attached
+    original = attach._capture_attached
 
     async def fail_after_attach(*args):
         await original(*args)
         raise failure("injected after two native attachments")
 
-    monkeypatch.setattr(attach, "_attached", fail_after_attach)
+    monkeypatch.setattr(attach, "_capture_attached", fail_after_attach)
     async with _admin(case):
         with pytest.raises(failure):
             await _attach(case)

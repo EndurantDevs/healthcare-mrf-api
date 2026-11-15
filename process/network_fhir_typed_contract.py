@@ -1,14 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Versioned strict graph inputs; declarations and temporary workspaces grant no custody."""
+"""Versioned graph accounting and named temporary workspaces."""
 
-import asyncio
 import json
 from dataclasses import asdict, dataclass
 from datetime import date
 
 from process.network_address_projection import _identifier
-from process.network_fhir_source_epoch_pin import _virtual_xid
-from process.network_fhir_source_witness_contract import database_identity, source_origin
+from process.network_fhir_source_witness_contract import source_origin
 
 POLICY = "fhir-direct-network-office-v3"
 DERIVATION_VERSION = 3
@@ -43,7 +41,6 @@ PAIR_COLUMNS = (
     "evidence_basis",
     "reference_rows",
 )
-_BRAND = object()
 
 
 class TypedFHIRGraphError(ValueError):
@@ -67,8 +64,8 @@ def policy_date(value):
     return parsed
 
 
-def graph_document(origin, identity, membership_as_of, counts):
-    """Bind exact original Source commitments and new derivation semantics without an old capture receipt."""
+def graph_document(origin, membership_as_of, counts):
+    """Describe the logical Source edition and the complete graph accounting."""
     policy_date(membership_as_of)
     require(
         type(counts) is dict
@@ -82,32 +79,25 @@ def graph_document(origin, identity, membership_as_of, counts):
         "canonicalizer_version": 2,
         "membership_as_of": membership_as_of,
         "origin": json.loads(json.dumps(asdict(source_origin(origin)))),
-        "database_identity": asdict(database_identity(identity)),
         "counts": dict(counts),
     }
 
 
 def validate_graph_document(document):
-    """Closed metadata is a description; only the live original Source factory can authenticate an input."""
+    """Validate graph data and project historical documents to named Source scope."""
+    fields = {
+        "contract",
+        "derivation_version",
+        "office_policy",
+        "canonicalizer_version",
+        "membership_as_of",
+        "origin",
+        "counts",
+    }
+    require(type(document) is dict and set(document) in (fields, fields | {"database_identity"}))
+    rebuilt = graph_document(document["origin"], document["membership_as_of"], document["counts"])
     require(
-        type(document) is dict
-        and set(document)
-        == {
-            "contract",
-            "derivation_version",
-            "office_policy",
-            "canonicalizer_version",
-            "membership_as_of",
-            "origin",
-            "database_identity",
-            "counts",
-        }
-    )
-    rebuilt = graph_document(
-        document["origin"], document["database_identity"], document["membership_as_of"], document["counts"]
-    )
-    require(
-        document == rebuilt
+        all(document[field] == rebuilt[field] for field in fields - {"origin"})
         and type(document["derivation_version"]) is int
         and type(document["canonicalizer_version"]) is int
     )
@@ -116,37 +106,22 @@ def validate_graph_document(document):
 
 @dataclass
 class TypedFHIRGraphStage:
-    """Task/transaction-bound temporary output; durable custody is the candidate owner's responsibility."""
+    """Named graph tables and their data-validation progress."""
 
-    connection: object
-    task: object
-    virtual_xid: str
     names: dict
-    oids: dict
     schema_name: str = "pg_temp"
     document: dict | None = None
     active: bool = True
     checked: bool = False
-    brand: object = None
 
     def relation(self, kind):
-        """Resolve only a declared relation in the bound workspace."""
+        """Render one declared graph table using validated SQL identifiers."""
         require(kind in self.names)
         return _identifier(self.schema_name) + "." + _identifier(self.names[kind])
 
-    async def verify(self, connection, *, complete=True):
-        """Require the original task, transaction and relation identities before reading rows."""
-        require(self.brand is _BRAND and self.active and self.connection is connection, "workspace_closed")
-        require(self.task is asyncio.current_task() and connection.is_in_transaction(), "workspace_scope")
-        require(await _virtual_xid(connection) == self.virtual_xid, "workspace_scope")
-        for kind, oid in self.oids.items():
-            require(
-                await connection.fetchval(
-                    "SELECT to_regclass($1)::oid::bigint", self.schema_name + "." + self.names[kind]
-                )
-                == oid,
-                "workspace_changed",
-            )
+    def require_ready(self, *, complete=True):
+        """Require an active stage and, when requested, complete graph validation."""
+        require(self.active, "workspace_closed")
         if complete:
             require(self.checked and self.document is not None, "source_incomplete")
             validate_graph_document(self.document)

@@ -26,6 +26,7 @@ from process.registry_ptg_office_preparation import RegistryPTGOfficePreparation
 from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
 from process.registry_record_store import RegistryActor
 from tests import test_registry_ptg_office_capture_postgres as office_fixtures
+from tests.registry_named_preparation_postgres_support import freeze_named_preparation
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_ptg2_candidate_attestation import _audit_sample, _source_witness
 from tests.test_registry_approval_store_postgres import _approve, _command
@@ -321,17 +322,24 @@ async def _source_review(fixture, custom, roles, password, tmp_path):
 
 
 async def _publisher_rights(fixture, custom, roles):
-    connection, source = custom.connection, fixture.source.source.name
+    from process.registry_ptg_published_provisioning import install_registry_ptg_office_preparation_permissions
+
+    connection, source_schema = custom.connection, fixture.source.source.name
     await connection.execute(f'REVOKE "{fixture.roles[0]}" FROM "{fixture.source.roles[2]}"')
     database = await connection.fetchval("SELECT quote_ident(current_database())")
     await connection.execute(f'REVOKE CREATE ON DATABASE {database} FROM "{fixture.source.roles[2]}"')
-    await connection.execute(f'GRANT CREATE ON DATABASE {database} TO "{roles["publisher"]}","{fixture.roles[0]}"')
-    await connection.execute(f'GRANT "{fixture.roles[0]}" TO "{roles["publisher"]}" WITH INHERIT FALSE, SET TRUE')
+    async with connection.transaction():
+        await install_registry_ptg_office_preparation_permissions(
+            connection,
+            profile=RegistryPTGOfficeCustodyProfile(fixture.roles[0], roles["publisher"]),
+            store=fixture.source.service.store,
+            reader_roles=(fixture.source.roles[2], fixture.roles[1]),
+        )
     tables = await connection.fetch(
         "SELECT relname FROM pg_catalog.pg_class WHERE relnamespace=pg_catalog.to_regnamespace($1) AND relkind='r'",
-        source,
+        source_schema,
     )
-    await _grant_reads(connection, source, (roles["publisher"],), [item["relname"] for item in tables])
+    await _grant_reads(connection, source_schema, (roles["publisher"],), [relation["relname"] for relation in tables])
     for table in (
         "ptg2_snapshot",
         "ptg2_import_run",
@@ -341,9 +349,15 @@ async def _publisher_rights(fixture, custom, roles):
         "ptg2_snapshot_pin",
     ):
         await connection.execute(
-            f'GRANT UPDATE(registry_ptg_read_lock) ON "{source}"."{table}" TO "{roles["publisher"]}"'
+            f'GRANT UPDATE(registry_ptg_read_lock) ON "{source_schema}"."{table}" TO "{roles["publisher"]}"'
         )
     await _grant_reads(connection, custom.source_schema, (roles["publisher"],), ("entity_address_unified", "npi"))
+    await _grant_reads(
+        connection,
+        fixture.serving.schema_name,
+        (roles["publisher"],),
+        ("entity_address_unified", "provider_location_binding", "network_membership"),
+    )
 
 
 async def _open_coordinator(fixture, custom, roles, password, scope, resources):
@@ -397,6 +411,9 @@ def _observe_handoffs(fixture, custom, roles, journal, monkeypatch):
         assert record["state"] == "running"
         calls.append("genuine_prepare")
         reply = await actual_prepare(installed, envelope, deadline=deadline)
+        if reply["state"] == "handed_off":
+            await _freeze_handed_off_office(installed, custom, envelope["selector"]["capture_id"])
+            reply = await actual_prepare(installed, envelope, deadline=deadline)
         if acknowledgments.lose_next:
             acknowledgments.lose_next = False
             raise TimeoutError
@@ -409,6 +426,26 @@ def _observe_handoffs(fixture, custom, roles, journal, monkeypatch):
     monkeypatch.setattr(RegistryPTGOfficePreparationService, "prepare", registered_prepare)
     monkeypatch.setattr(RegistryPTGOfficePreparationService, "read", observed_read)
     return calls, acknowledgments
+
+
+async def _freeze_handed_off_office(installed, custom, candidate_id):
+    """Resume the original real service only after the separate administrator phase commits."""
+    from process.registry_ptg_office_approval import _reader_roles
+    from process.registry_ptg_office_custody import office_preparation_roles
+    from process.registry_ptg_office_preparation import load_named_office_preparation
+
+    scope = installed.scope_service
+    handoff = await load_named_office_preparation(custom.connection, candidate_id, control_schema=custom.control_schema)
+    assert handoff is not None and handoff["kind"] == "office"
+    roles = office_preparation_roles(
+        SimpleNamespace(
+            office_custody=scope.office_custody,
+            owner_role=scope.office_custody.owner_role,
+            reader_roles=_reader_roles(scope),
+        )
+    )
+    frozen = await freeze_named_preparation(custom.engine, handoff, roles)
+    assert frozen == {"preparation_id": candidate_id, "state": "frozen"}
 
 
 async def _cleanup_coordinator(fixture, custom, roles, created, resources, journal):
@@ -484,11 +521,6 @@ async def coordinator_db(office_db, custom_db, tmp_path, monkeypatch, office_pub
 async def test_native_coordinator_commits_then_prepares_and_replays_original_audit(coordinator_db):
     native = coordinator_db
     async with native.service.queue_pool.acquire() as connection:
-        assert await connection.fetchval(
-            "SELECT current_user=session_user AND current_user=$1", native.roles_by_kind["queue"]
-        )
-        identity = await coordinator._native_identity(connection)
-        assert identity == await coordinator._native_identity(native.custom.connection)
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             async with connection.transaction():
                 await connection.execute(
@@ -497,6 +529,11 @@ async def test_native_coordinator_commits_then_prepares_and_replays_original_aud
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             async with connection.transaction():
                 await connection.execute(f'SET LOCAL ROLE "{native.custom.roles["owner"]}"')
+    async with native.service.preparation.scope_service.reader_sessions() as reader, reader.begin():
+        driver = (await (await reader.connection()).get_raw_connection()).driver_connection
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with reader.begin_nested():
+                await driver.execute("UPDATE hp_snapshot_retention.preparation SET state=state")
     reply = await native.service.prepare(native.request)
     assert reply["intent"]["state"] == "completed" and reply["preparation"]["state"] == "prepared"
     namespace = '"' + native.custom.control_schema + '"'
@@ -532,8 +569,8 @@ async def test_native_competing_exact_claim_and_expired_lease_keep_one_capture(c
     identity = await coordinator._approved_source(native.service, request, deadline)
     receipt = await coordinator._reserve(native.service, request, actor, identity, deadline, {"commit_started": False})
     claims = await asyncio.gather(
-        coordinator._claim(native.service, receipt, semantic, identity),
-        coordinator._claim(native.service, receipt, semantic, identity),
+        coordinator._claim(native.service, receipt, semantic),
+        coordinator._claim(native.service, receipt, semantic),
     )
     assert sum(lease is not None for _, lease, _ in claims) == 1
     assert not native.calls
@@ -577,32 +614,25 @@ async def test_native_competing_exact_claim_and_expired_lease_keep_one_capture(c
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("unsafe", ["owner_set", "immutable_update"])
-async def test_native_queue_profile_refuses_before_intent_insert(coordinator_db, unsafe):
+async def test_native_queue_role_cannot_change_owner_or_immutable_intent(coordinator_db, unsafe):
     native = coordinator_db
     queue, owner = native.roles_by_kind["queue"], native.custom.roles["owner"]
-    if unsafe == "owner_set":
-        await native.custom.connection.execute(f'GRANT "{owner}" TO "{queue}" WITH INHERIT FALSE, SET TRUE')
-    else:
-        await native.custom.connection.execute(
-            f'GRANT UPDATE(command_json) ON "{native.custom.control_schema}".registry_publication_request TO "{queue}"'
+    statement = (
+        f'SET LOCAL ROLE "{owner}"'
+        if unsafe == "owner_set"
+        else f'UPDATE "{native.custom.control_schema}".registry_publication_request SET command_json=command_json'
+    )
+    async with native.service.queue_pool.acquire() as connection:
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with connection.transaction():
+                await connection.execute(statement)
+    assert not native.calls
+    assert (
+        await native.custom.connection.fetchval(
+            f'SELECT count(*) FROM "{native.custom.control_schema}".registry_publication_request'
         )
-    try:
-        with pytest.raises(ValueError, match="queue_permissions"):
-            await native.service.prepare(native.request)
-        assert not native.calls
-        assert (
-            await native.custom.connection.fetchval(
-                f'SELECT count(*) FROM "{native.custom.control_schema}".registry_publication_request'
-            )
-            == 0
-        )
-    finally:
-        if unsafe == "owner_set":
-            await native.custom.connection.execute(f'REVOKE "{owner}" FROM "{queue}"')
-        else:
-            await native.custom.connection.execute(
-                f'REVOKE UPDATE(command_json) ON "{native.custom.control_schema}".registry_publication_request FROM "{queue}"'
-            )
+        == 0
+    )
 
 
 @pytest.mark.asyncio

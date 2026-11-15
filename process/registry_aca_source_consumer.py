@@ -13,10 +13,10 @@ from sqlalchemy import text
 
 from db.connection import db
 from process import provider_directory_generic_source_policy as source_policy
-from process.network_address_projection import PinnedAddressSource, _identifier
+from process.network_address_projection import _identifier
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_approved_source_bindings import require_approved_network_source_bindings
-from process.network_candidate_custody import SOURCE_EVENT_ASSERTION, verify_network_candidate_custody
+from process.network_candidate_custody import SOURCE_EVENT_ASSERTION
 from process.network_cms_registry_address_capture import NativeReceiptSession
 from process.network_legacy_membership_source import (
     PinnedACAMembershipSource,
@@ -85,6 +85,7 @@ class RegistryACASourceConsumerConfig:
     initial_address_sources: RegistryCompositionAddressSources | None = None
     composition_runtime: RegistryPublicationPTGRuntime | None = field(default=None, repr=False)
     seal_candidate: object = field(default=None, repr=False)
+    preparation_roles: dict | None = field(default=None, repr=False)
     source_authority_roles: tuple[str, ...] = field(default=(), repr=False)
     global_epoch: bool = False
     initial_batch: bool = False
@@ -513,20 +514,17 @@ def _candidate_target(candidate_by_name):
 
 
 async def _replay_inventory(connection, candidate_by_name, target, config):
-    from db.registry_source_inventory_schema import INVENTORY_TABLE
     from process.registry_source_inventory_reference import verify_source_recipe_metadata
-    from process.registry_source_inventory_store import _load_locked_source_inventory
+    from process.registry_source_inventory_store import load_source_inventory
     from process.registry_source_recipe_store import _decode_document, _decode_source_inventory_recipes
 
     if type(_decode_document(candidate_by_name["source_recipes_json"])) is not dict:
         return None
     metadata = verify_source_recipe_metadata(candidate_by_name)
-    sealed = await _verify_source_custody(connection, target, config)
-    reference, entries = await _load_locked_source_inventory(
+    reference, entries = await load_source_inventory(
         connection,
         target,
         candidate_by_name,
-        expected_table_oid=sealed["receipt"]["closure"]["relation_oids"][INVENTORY_TABLE],
         control_schema=config.control_schema,
     )
     recipes = _decode_source_inventory_recipes(entries)
@@ -605,11 +603,11 @@ async def _replay(connection, event, recipe, config):
         _require_replay_target(
             candidate_by_name, event, attempt, generations, recipes, None if inventory is None else inventory[0]
         )
-        if inventory is None:
-            await _verify_source_custody(connection, copy_target, config)
-        # Keep Source custody until the control transaction commits or rolls back.
+        # Keep the Source fence until the control transaction commits or rolls back.
         await fences.enter_async_context(current_aca_source_fence(recipe, config))
-        await publish_network_candidate(connection, copy_target, control_schema=config.control_schema)
+        await publish_network_candidate(
+            connection, copy_target, control_schema=config.control_schema, preparation_roles=config.preparation_roles
+        )
     return {"state": "replayed"}
 
 
@@ -634,18 +632,8 @@ def _require_replay_target(candidate_by_name, event, attempt, generations, recip
         _invalid()
 
 
-async def _verify_source_custody(connection, target, config):
-    """A sealed candidate must include the genuine Source authorities in its forbidden census."""
-    sealed = await verify_network_candidate_custody(
-        connection, target, control_schema=config.control_schema, required=True
-    )
-    if not set(config.source_authority_roles) <= set(sealed["receipt"]["runtime_roles"]):
-        _invalid()
-    return sealed
-
-
 async def _checkpoint(connection, target, event, attempt, config):
-    """Commit the exact provisional source assertion before independent final custody."""
+    """Commit the exact provisional source assertion before named candidate validation."""
     namespace = _identifier(config.control_schema)
     checkpoint_by_name = {**event, "attempt_id": str(attempt)}
     assertion_by_name = {"revision": 1, "kind": "aca", "checkpoint": checkpoint_by_name}
@@ -668,8 +656,6 @@ async def _checkpoint(connection, target, event, attempt, config):
         elif saved != assertion_by_name:
             _invalid()
     await config.seal_candidate(target)
-    async with connection.transaction(isolation="repeatable_read", readonly=True):
-        await _verify_source_custody(connection, target, config)
     return checkpoint_by_name, assertion_by_name
 
 
@@ -721,7 +707,9 @@ async def _attempt(connection, pool, store, identity, event, recipe, config):
         )
         if changed != "UPDATE 1":
             _invalid()
-        await publish_network_candidate(connection, copy_target, control_schema=config.control_schema)
+        await publish_network_candidate(
+            connection, copy_target, control_schema=config.control_schema, preparation_roles=config.preparation_roles
+        )
     return {"state": "completed"}
 
 

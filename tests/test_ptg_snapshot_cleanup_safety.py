@@ -7,8 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process.ptg_parts import ptg2_source_snapshot_gc as snapshot_gc
-from process.ptg_parts import snapshot_cleanup
-from process.ptg_parts import source_snapshot_control
+from process.ptg_parts import snapshot_cleanup, source_snapshot_control
 
 
 def _snapshot_row(snapshot_id, status, table_name, previous_snapshot_id=None):
@@ -41,10 +40,7 @@ class _StaticCleanupConnection:
         if "current_refs" in statement:
             self.pointer_sql = statement
             assert params == {"source_key": "source_a"}
-            return [
-                {"snapshot_id": snapshot_id}
-                for snapshot_id in self.current_snapshot_ids
-            ]
+            return [{"snapshot_id": snapshot_id} for snapshot_id in self.current_snapshot_ids]
         if "ptg2_snapshot" in statement:
             assert "pg_advisory_xact_lock" in self.status_calls[0][0]
             self.manifest_sql = statement
@@ -181,11 +177,6 @@ async def test_exact_retirement_keeps_source_key_boundary(monkeypatch) -> None:
         source_snapshot_control,
         "_delete_retired_source_pointers",
         pointer_deletes,
-    )
-    monkeypatch.setattr(
-        source_snapshot_control,
-        "_clear_ptg2_snapshot_cache",
-        lambda: None,
     )
 
     retirement_result = await source_snapshot_control.retire_ptg2_source_snapshot(

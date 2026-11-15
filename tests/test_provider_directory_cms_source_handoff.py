@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """CMS intake remains complete and private while protected finalization is pending."""
 
+import json
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -12,6 +13,7 @@ from process import provider_directory_cms_source_handoff as cms_handoff
 from process import provider_directory_generic_source_completion as completion
 from process import provider_directory_generic_source_storage as storage
 from process.provider_directory_generic_candidate import GenericCandidateError
+from process.provider_directory_source_storage_binding import FHIRSourceCandidateHandoff
 from tests.test_provider_directory_generic_source_completion import _prepared_detached
 from tests.test_provider_directory_generic_source_storage import _isolated_harness, harness
 
@@ -154,9 +156,13 @@ async def test_cms_prepare_and_reduce_never_allocate_canonical_auxiliary_stages(
         harness.header["candidate_storage_json"]["identity"]["metadata"].update(_identity()["metadata"])
         harness.header["candidate_storage_json"] = None
         harness.connection.fetch = AsyncMock(return_value=[])
-        harness.connection.fetchval = AsyncMock(
-            side_effect=lambda query, *args: "private_ordinal_sequence" if "pg_get_serial_sequence" in query else False
-        )
+
+        async def scalar(query, *args):
+            if query.startswith("SELECT candidate_storage_json"):
+                return deepcopy(harness.header["candidate_storage_json"])
+            return "private_ordinal_sequence" if "pg_get_serial_sequence" in query else False
+
+        harness.connection.fetchval = AsyncMock(side_effect=scalar)
         proof_by_name = {}
 
         async def capture(connection, policy, names, **options):
@@ -316,3 +322,18 @@ async def test_isolated_cms_result_carries_handoff_and_never_calls_legacy_public
     assert staged_result["resource_count"] == 16
     for method in forbidden_by_name.values():
         method.assert_not_awaited()
+
+
+@pytest.mark.parametrize("contract", [storage.NAMED_ISOLATED_CONTRACT, storage.CMS_ISOLATED_CONTRACT])
+def test_named_candidate_preserves_data_admission_proof_and_original_document(contract):
+    document_by_field = {
+        "contract": contract,
+        "storage": {"catalog_schema": "catalog", "storage_schema": "candidate", "owner_oid": 41},
+        "admission": {"dataset_hash": "a" * 64, "content_proof_admission_sha256": "b" * 64},
+        "tables": {"resource": {"schema": "candidate", "name": "resources", "oid": 42}},
+    }
+    raw = json.dumps(document_by_field)
+    handoff = FHIRSourceCandidateHandoff(raw)
+    assert handoff.document["admission"] == document_by_field["admission"]
+    assert handoff.document["storage"] == {"catalog_schema": "catalog", "storage_schema": "candidate"}
+    assert handoff.document_json == raw

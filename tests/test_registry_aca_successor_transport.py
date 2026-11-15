@@ -290,7 +290,7 @@ async def test_final_fence_uses_flat_notice_while_rechecking_original_anchor(mon
     notice.assert_awaited_once_with(None, None, {}, event_by_name["header"])
     assert bindings.await_args.args[2] == old.binding_coordinates
     assert native.await_args.args[1] == combined.source_pin
-    publish.assert_awaited_once_with(connection, copy_target, control_schema="registry_control")
+    publish.assert_awaited_once_with(connection, copy_target, control_schema="registry_control", preparation_roles=None)
 
 
 @pytest.mark.asyncio

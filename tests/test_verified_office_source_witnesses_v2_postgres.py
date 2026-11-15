@@ -418,7 +418,7 @@ def _successor_recipe(recipe, physical):
         origin.dataset_id,
         origin.dataset_sha256,
         physical.release_id,
-        origin.resource_parent_oid,
+        origin.resource_relation,
         recipe.source_pin.alias_scope,
         origin.semantic_projection_as_of,
         retained_capture=physical,

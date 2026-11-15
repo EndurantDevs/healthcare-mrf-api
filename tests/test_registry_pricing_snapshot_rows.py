@@ -31,7 +31,7 @@ class SnapshotDriver(Driver):
         self.read_only = "on"
 
     async def fetch(self, sql, *parameters):
-        if "requested.table_name" in sql:
+        if "requested.table_name" in sql or "ptg2_installed_physical_binding" in sql:
             self.calls.append((sql, parameters))
             self.tasks.append(asyncio.current_task())
             return []

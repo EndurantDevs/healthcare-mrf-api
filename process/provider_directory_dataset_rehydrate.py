@@ -527,7 +527,7 @@ async def _is_rehydration_output_replay_valid(directory, journal, pinned, operat
             )
             if tuple(receipt.target for receipt in receipts) != output_targets:
                 raise RuntimeError("provider_directory_dataset_rehydrate_output_set_changed")
-            if any(installed[receipt.target].oid != receipt.new_oid for receipt in receipts):
+            if any(installed[receipt.target] != receipt.successor for receipt in receipts):
                 continue
             target_by_relation = {
                 proof.relation: proof.target for receipt in receipts for proof in (receipt.incumbent, receipt.successor)

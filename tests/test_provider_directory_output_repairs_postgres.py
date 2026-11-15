@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import text
 
 from db import models
+from db.plan_release_storage import storage_relation
 from process import provider_directory_output_canonical_backfill as canonical
 from process import provider_directory_output_contact_backfill as contacts
 from process import provider_directory_output_coordinate_backfill as coordinates
@@ -162,16 +163,16 @@ async def test_native_npi_and_location_repairs_publish_complete_preserved_tuples
 async def test_native_late_location_parity_refusal_preserves_all_incumbent_tuples(monkeypatch):
     async with _repair_scope(monkeypatch) as component:
         before = await _read_outputs(component)
-        verify = locations._verify_contact_parity
+        finish_indexes = locations.stages.finish_output_indexes
 
-        async def corrupt_candidate_then_verify(capability, stage, projection, params_by_name):
-            # Inject a real candidate data fault; retain the original native parity validator.
+        async def corrupt_before_freeze(directory, capability, stage):
+            # Fault the writable candidate, then retain normal freeze and complete parity validation.
             await capability.session.execute(
                 text(f'UPDATE "{stage.schema}"."{stage.relation}" SET name=\'Changed candidate\'')
             )
-            await verify(capability, stage, projection, params_by_name)
+            await finish_indexes(directory, capability, stage)
 
-        monkeypatch.setattr(locations, "_verify_contact_parity", corrupt_candidate_then_verify)
+        monkeypatch.setattr(locations.stages, "finish_output_indexes", corrupt_before_freeze)
         with pytest.raises(RuntimeError, match="contact_parity_failed"):
             await contacts.backfill_location_contacts(directory)
         assert await _read_outputs(component) == before
@@ -181,7 +182,6 @@ async def _canonical_snapshot(component):
     async with source_transaction(component.database):
         return {
             target: {
-                "oid": await component.database.scalar("SELECT to_regclass(:name)::oid::bigint", name="mrf." + target),
                 "rows": [
                     dict(row._mapping)
                     for row in await component.database.all(
@@ -191,6 +191,29 @@ async def _canonical_snapshot(component):
             }
             for target in canonical.TARGETS
         }
+
+
+async def _retained_rows(component, kind, target):
+    """Read complete rollback contents by the exact QName recorded in the publication journal."""
+    from process.provider_directory_output_snapshot_catalog import decoded
+    from process.provider_directory_output_snapshot_retention import RetainedOutputReceipt
+
+    async with source_transaction(component.database):
+        plan = decoded(
+            await component.database.scalar('SELECT plan FROM "mrf"."pd_dataset_migration_plan" WHERE singleton')
+        )
+        entries = [
+            entry for entry in plan["output_maintenance"]["operations"].values() if entry["operation"]["kind"] == kind
+        ]
+        assert len(entries) == 1
+        receipts = [RetainedOutputReceipt.from_payload(item) for item in entries[0]["history"][-1]["receipts"]]
+        retained = next(receipt for receipt in receipts if receipt.target == target)
+        return [
+            dict(row._mapping)
+            for row in await component.database.all(
+                f"SELECT * FROM {storage_relation(retained.schema, retained.retained_name)} ORDER BY resource_id"
+            )
+        ]
 
 
 @pytest.mark.asyncio
@@ -205,20 +228,12 @@ async def test_native_canonical_two_root_publication_preserves_history_and_unsel
         after = await _canonical_snapshot(component)
         assert await _read_outputs(component) == typed
         for relation_name in canonical.TARGETS:
-            assert after[relation_name]["oid"] != before[relation_name]["oid"]
             previous = [resource for resource in before[relation_name]["rows"] if resource["resource_id"] == "kept"]
             assert [
                 resource for resource in after[relation_name]["rows"] if resource["resource_id"] == "kept"
             ] == previous
             assert len(after[relation_name]["rows"]) == 4
-            async with component.admin_engine.begin() as connection:
-                assert (
-                    await connection.scalar(
-                        text("SELECT EXISTS(SELECT FROM pg_class WHERE oid=:oid)"),
-                        {"oid": before[relation_name]["oid"]},
-                    )
-                    is True
-                )
+            assert await _retained_rows(component, "canonical_backfill", relation_name) == before[relation_name]["rows"]
         canonical_by_type = {
             resource["resource_type"]: resource
             for resource in after[canonical.TARGETS[0]]["rows"]
@@ -256,3 +271,92 @@ async def test_native_canonical_fresh_control_refusal_rolls_back_both_output_can
             await canonical.backfill_canonical_resources(directory, resources="Location,Organization,Practitioner")
         assert await _canonical_snapshot(component) == before
         assert await _read_outputs(component) == typed
+
+
+@pytest.mark.asyncio
+async def test_native_named_output_rollback_preserves_both_complete_generations(monkeypatch):
+    from process import provider_directory_output_snapshot_custody as custody
+    from process import provider_directory_output_snapshot_journal as journal
+    from process import provider_directory_output_snapshot_retention as retention
+    from process.provider_directory_output_snapshot_catalog import decoded
+
+    async with _repair_scope(monkeypatch) as component:
+        previous = await _read_outputs(component)
+        await npis.backfill_resource_id_npis(directory, run_id="repair-run", source_ids=[SOURCE])
+        published = await _read_outputs(component)
+        async with source_transaction(component.database):
+            plan = decoded(
+                await component.database.scalar('SELECT plan FROM "mrf"."pd_dataset_migration_plan" WHERE singleton')
+            )
+        forward_digest, entry = next(iter(plan["output_maintenance"]["operations"].items()))
+        forward_receipts = tuple(
+            retention.RetainedOutputReceipt.from_payload(receipt_payload)
+            for receipt_payload in entry["history"][-1]["receipts"]
+        )
+        rollback_by_field = {**entry["operation"], "kind": "rollback", "rollback_of": forward_digest}
+        async with custody.output_snapshot_transaction(
+            directory, operation=rollback_by_field, targets=npis.TARGETS
+        ) as capability:
+            restored = await retention.restore_retained_outputs(capability, forward_receipts)
+            preparations = tuple(
+                custody.PreparedOutputReceipt(2, receipt.operation_digest, receipt.incumbent, receipt.successor)
+                for receipt in forward_receipts
+            )
+            await journal.append_output_history(capability, preparations, restored)
+        assert await _read_outputs(component) == previous
+        async with source_transaction(component.database):
+            for receipt in restored:
+                retained_rows = [
+                    dict(retained_row._mapping)
+                    for retained_row in await component.database.all(
+                        f"SELECT * FROM {storage_relation(receipt.schema, receipt.retained_name)} ORDER BY resource_id"
+                    )
+                ]
+                assert retained_rows == published[receipt.target.removeprefix("provider_directory_")]
+                assert receipt.to_payload()["protocol"] == 2
+
+
+@pytest.mark.asyncio
+async def test_native_late_reader_pin_rolls_back_and_reuses_prepared_pair(monkeypatch):
+    from process import provider_directory_artifact_bundle_preparation as bundles
+    from process import provider_directory_output_snapshot_custody as custody
+
+    async with _repair_scope(monkeypatch) as component:
+        previous = await _read_outputs(component)
+        selector_by_name = {"run_id": "repair-run", "source_ids": [SOURCE]}
+        operation, incumbents_by_target, counts_by_target, decision_at = await npis._capture_operation(
+            directory, selector_by_name
+        )
+        prepared_stages = []
+        prepared = await npis._prepare(
+            directory, operation, selector_by_name, incumbents_by_target, counts_by_target, decision_at, prepared_stages
+        )
+
+        async def journal(capability, retained):
+            await npis.journal.append_output_history(capability, prepared, retained)
+
+        readers = await component.database._connect_reader()
+        async with readers.session_factory() as reader, reader.begin():
+            await reader.execute(text("SET TRANSACTION READ ONLY"))
+            pinned = (
+                (await reader.execute(text('SELECT * FROM "mrf"."provider_directory_practitioner"'))).mappings().all()
+            )
+            with pytest.raises(TimeoutError, match="serving_relation_lock_timeout"):
+                async with custody.output_snapshot_transaction(
+                    directory, operation=operation, targets=npis.TARGETS
+                ) as capability:
+                    await bundles.apply_prepared_output_bundle(
+                        directory, capability, prepared, after_output_publish=journal
+                    )
+            assert await _read_outputs(component) == previous
+            assert [dict(pinned_row) for pinned_row in pinned] == previous["practitioner"]
+        async with custody.output_snapshot_transaction(
+            directory, operation=operation, targets=npis.TARGETS
+        ) as capability:
+            _, retained = await bundles.apply_prepared_output_bundle(
+                directory, capability, prepared, after_output_publish=journal
+            )
+        assert len(retained) == 2
+        assert all(
+            published_row["npi"] == 1234567890 for published_row in (await _read_outputs(component))["practitioner"]
+        )

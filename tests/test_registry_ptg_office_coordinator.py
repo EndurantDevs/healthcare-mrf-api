@@ -6,7 +6,6 @@ import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from uuid import UUID
 
 import pytest
 
@@ -58,6 +57,10 @@ class QueueConnection:
     def is_in_transaction(self):
         return True
 
+    async def execute(self, sql):
+        assert sql == "SET LOCAL search_path TO pg_catalog,pg_temp"
+        self.events.append("canonical_path")
+
     async def fetchrow(self, sql, request_id):
         record = next(
             (item for item in self.storage.requests_by_key.values() if item["request_id"] == request_id),
@@ -71,6 +74,12 @@ class QueueConnection:
             for stored_request in self.storage.requests_by_key.values()
             if stored_request["request_id"] == args[0]
         )
+        if "SET lease_expires_at=clock_timestamp()" in sql:
+            assert request_record["state"] == "running" and request_record["lease_id"] == args[1]
+            assert "WHERE request_id=$1 AND lease_id=$2 AND state='running'" in sql
+            self.expired = True
+            self.events.append("pending_lease_yield")
+            return args[1]
         if "SET state='running'" in sql:
             self.claim_sql = sql
             self.events.append("exact_claim")
@@ -211,22 +220,8 @@ def boundaries(monkeypatch):
         events.append("fresh_source_authority")
         return IDENTITY
 
-    async def management(*args, **kwargs):
-        events.append("verified_management")
-
-    async def permissions(*args):
-        events.append("verified_queue")
-
     monkeypatch.setattr(coordinator, "_approved_source", AsyncMock(side_effect=source))
-    monkeypatch.setattr(coordinator, "_queue_permissions", AsyncMock(side_effect=permissions))
-    monkeypatch.setattr(coordinator, "_role", AsyncMock())
-    monkeypatch.setattr(coordinator, "_native_identity", AsyncMock(return_value=IDENTITY))
     monkeypatch.setattr(coordinator, "native_driver", AsyncMock(return_value=storage))
-    monkeypatch.setattr(
-        coordinator,
-        "verify_registry_management_permissions",
-        AsyncMock(side_effect=management),
-    )
     return SimpleNamespace(
         service=service,
         events=events,
@@ -245,7 +240,7 @@ async def test_reserve_commit_and_exact_lease_commit_precede_physical_prepare(
     fixture = boundaries(monkeypatch)
     reply = await fixture.service.prepare(envelope())
     assert reply["intent"]["state"] == "completed" and reply["preparation"]["state"] == "prepared"
-    assert fixture.events.index("verified_management") < fixture.events.index("management_commit")
+    assert fixture.events.index("fresh_source_authority") < fixture.events.index("management_commit")
     assert (
         fixture.events.index("management_commit")
         < fixture.events.index("exact_claim")
@@ -256,16 +251,6 @@ async def test_reserve_commit_and_exact_lease_commit_precede_physical_prepare(
     assert "WHERE request_id=$1 AND request_sha256=$3 AND command_json=$4::jsonb" in fixture.queue.claim_sql
     assert "semantic_sha256" in fixture.queue.claim_sql and "version" in fixture.queue.claim_sql
     assert "SKIP LOCKED" not in fixture.queue.claim_sql
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("boundary", ["_queue_permissions", "verify_registry_management_permissions"])
-async def test_unverified_writer_or_queue_never_inserts_or_hands_off(monkeypatch, boundary):
-    fixture = boundaries(monkeypatch)
-    monkeypatch.setattr(coordinator, boundary, AsyncMock(side_effect=ValueError("denied")))
-    with pytest.raises(ValueError):
-        await fixture.service.prepare(envelope())
-    assert not fixture.storage.requests_by_key and not fixture.preparation.prepare.await_count
 
 
 @pytest.mark.asyncio
@@ -382,94 +367,6 @@ async def test_lost_finish_ack_never_rejects_or_allocates_replacement(monkeypatc
     assert all("rejected" not in str(call) for call in fixture.storage.calls)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "updates",
-    [
-        coordinator._MUTABLE,
-        coordinator._MUTABLE | {"command_json"},
-        coordinator._MUTABLE - {"lease_id"},
-    ],
-)
-async def test_queue_role_requires_exact_lifecycle_columns_and_denies_audit_updates(monkeypatch, updates):
-    service = SimpleNamespace(
-        queue_role="synthetic_queue",
-        schema="synthetic_control",
-        owner_role="synthetic_owner",
-    )
-    connection = SimpleNamespace(
-        is_in_transaction=lambda: True,
-        execute=AsyncMock(),
-        fetchrow=AsyncMock(
-            return_value={
-                "closed": True,
-                "table_oid": 10,
-                "schema_oid": 11,
-                "owner_oid": 12,
-                "runtime_oid": 13,
-                "owner_role": "synthetic_owner",
-            }
-        ),
-        fetchval=AsyncMock(return_value=True),
-        fetch=AsyncMock(
-            return_value=[
-                {"attname": name, "allowed": name in updates}
-                for name in coordinator.LIFECYCLE_COLUMNS
-                | {
-                    "request_id",
-                    "actor_key",
-                    "session_token_sha256",
-                    "actor_json",
-                    "command_json",
-                    "idempotency_key",
-                    "request_sha256",
-                    "created_at",
-                }
-            ]
-        ),
-    )
-    monkeypatch.setattr(coordinator, "_role", AsyncMock())
-    monkeypatch.setattr(coordinator, "_native_identity", AsyncMock(return_value=IDENTITY))
-    if updates == coordinator._MUTABLE:
-        await coordinator._queue_permissions(connection, service, IDENTITY)
-    else:
-        with pytest.raises(ValueError, match="queue_permissions"):
-            await coordinator._queue_permissions(connection, service, IDENTITY)
-
-
-@pytest.mark.asyncio
-async def test_queue_native_custody_or_reachable_unsafe_role_refusal_precedes_mutation(
-    monkeypatch,
-):
-    service = SimpleNamespace(
-        queue_role="synthetic_queue",
-        schema="synthetic_control",
-        owner_role="synthetic_owner",
-    )
-    connection = SimpleNamespace(
-        is_in_transaction=lambda: True,
-        execute=AsyncMock(),
-        fetchrow=AsyncMock(
-            return_value={
-                "closed": True,
-                "table_oid": 10,
-                "schema_oid": 11,
-                "owner_oid": 12,
-                "runtime_oid": 13,
-                "owner_role": "synthetic_owner",
-            }
-        ),
-        fetchval=AsyncMock(return_value=False),
-        fetch=AsyncMock(return_value=[{"attname": name, "allowed": True} for name in coordinator._MUTABLE]),
-    )
-    monkeypatch.setattr(coordinator, "_role", AsyncMock())
-    monkeypatch.setattr(coordinator, "_native_identity", AsyncMock(return_value=IDENTITY))
-    with pytest.raises(ValueError, match="queue_permissions"):
-        await coordinator._queue_permissions(connection, service, IDENTITY)
-    assert connection.fetchval.await_args.args[5] == sorted(coordinator._MUTABLE)
-    assert connection.execute.await_args.args == ("SET LOCAL search_path TO pg_catalog,pg_temp",)
-
-
 @pytest.mark.parametrize(
     "change",
     [
@@ -490,7 +387,7 @@ async def test_lost_claim_commit_ack_keeps_one_pending_intent_without_physical_h
     monkeypatch,
 ):
     fixture = boundaries(monkeypatch)
-    fixture.queue.lose_commit_on = 2
+    fixture.queue.lose_commit_on = 1
     with pytest.raises(RegistryPTGScopeDeadlineExpired) as error:
         await fixture.service.prepare(envelope())
     assert error.value.outcome_unknown and not fixture.preparation.prepare.await_count
@@ -499,39 +396,6 @@ async def test_lost_claim_commit_ack_keeps_one_pending_intent_without_physical_h
     reply = await fixture.service.prepare(envelope())
     assert reply["intent"]["request_id"] == str(original_request) and reply["preparation"] is None
     assert len(fixture.storage.requests_by_key) == 1 and not fixture.preparation.prepare.await_count
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "change",
-    [
-        {"role": "other"},
-        {"login": "other"},
-        {"rolsuper": True},
-        {"rolbypassrls": True},
-        {"rolcanlogin": False},
-    ],
-)
-async def test_actual_native_role_refuses_impersonation_or_elevation(change):
-    role_by_field = {
-        "role": "synthetic_queue",
-        "login": "synthetic_queue",
-        "rolcanlogin": True,
-        **dict.fromkeys(
-            (
-                "rolsuper",
-                "rolcreatedb",
-                "rolcreaterole",
-                "rolreplication",
-                "rolbypassrls",
-            ),
-            False,
-        ),
-        **change,
-    }
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=role_by_field))
-    with pytest.raises(ValueError, match="writer_unavailable"):
-        await coordinator._role(connection, "synthetic_queue")
 
 
 @pytest.mark.asyncio
@@ -557,13 +421,12 @@ async def test_reader_reconstructs_actual_approval_and_exact_source_before_autho
     monkeypatch.setattr(coordinator, "registry_company_approval_transaction", reader)
     monkeypatch.setattr(coordinator, "read_registry_ptg_published_plan_scope", read)
     monkeypatch.setattr(coordinator, "native_driver", AsyncMock(return_value=object()))
-    monkeypatch.setattr(coordinator, "_native_identity", AsyncMock(return_value=IDENTITY))
     if change:
         with pytest.raises(ValueError, match="source_changed"):
             await coordinator._approved_source(service, document, coordinator._deadline(None))
         assert not authority.authorize.await_count
     else:
-        assert await coordinator._approved_source(service, document, coordinator._deadline(None)) == IDENTITY
+        assert await coordinator._approved_source(service, document, coordinator._deadline(None)) == stored_by_field
         assert authority.authorize.await_args.args[0] == {
             "actor": document["actor"],
             "session_token_sha256": document["session_token_sha256"],
@@ -597,3 +460,48 @@ async def test_unicode_reason_uses_physical_command_digest_on_prepare_and_replay
     assert first["preparation"]["command_sha256"] != _digest(first["preparation"]["command"])
     replay = await fixture.service.prepare(request)
     assert replay == first
+
+
+@pytest.mark.asyncio
+async def test_legacy_completion_replay_preserves_opaque_versions_and_original_lease(monkeypatch):
+    fixture = boundaries(monkeypatch)
+    original_prepare = fixture.preparation.prepare.side_effect
+
+    async def prepare_legacy(document, **arguments):
+        prepared = await original_prepare(document, **arguments)
+        prepared["command"]["retained_serving"].pop("address_relation")
+        prepared["command"]["retained_serving"]["address_table_oid"] = 17
+        prepared["command_sha256"] = "9" * 64
+        return prepared
+
+    fixture.preparation.prepare.side_effect = prepare_legacy
+    first = await fixture.service.prepare(envelope())
+    replay = await fixture.service.prepare(envelope())
+    assert first["intent"]["request_id"] == replay["intent"]["request_id"]
+    assert first["preparation"]["command_sha256"] == replay["preparation"]["command_sha256"] == "9" * 64
+    assert fixture.preparation.prepare.await_count == fixture.preparation.read.await_count == 1
+    assert len(fixture.storage.requests_by_key) == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_admin_freeze_yields_same_request_lease_without_completion(monkeypatch):
+    fixture = boundaries(monkeypatch)
+    prepare = fixture.preparation.prepare.side_effect
+
+    async def pending(document, **kwargs):
+        reply = await prepare(document, **kwargs)
+        reply["state"] = "handed_off"
+        return reply
+
+    fixture.preparation.prepare.side_effect = pending
+    first = await fixture.service.prepare(envelope())
+    assert first["intent"]["state"] == "running" and first["preparation"]["state"] == "handed_off"
+    assert fixture.queue.expired and "finish" not in fixture.events
+    assert fixture.events.index("physical_prepare") < fixture.events.index("pending_lease_yield")
+    request_id = first["intent"]["request_id"]
+    fixture.preparation.prepare.side_effect = prepare
+    completed = await fixture.service.prepare(envelope())
+    assert completed["intent"]["state"] == "completed"
+    assert completed["intent"]["request_id"] == request_id
+    assert completed["preparation"]["capture_id"] == first["preparation"]["capture_id"]
+    assert len(fixture.storage.requests_by_key) == 1

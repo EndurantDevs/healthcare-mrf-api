@@ -4,7 +4,7 @@
 from contextlib import contextmanager
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import Mock
 
 import pytest
 
@@ -224,23 +224,3 @@ def test_interrupted_installer_rolls_back_and_preserves_outer_transaction(upgrad
     with pytest.raises(RuntimeError, match="after body replacement"):
         _upgrade(upgrade_case)
     assert upgrade_case.body == before and upgrade_case.connection.in_transaction()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("version", [0, 1, 2])
-async def test_protected_cms_execution_requires_the_bound_target(monkeypatch, version):
-    from process import network_cms_registry_address_capture as native
-
-    observed_by_field = dict(body=_bodies("sample")[version], identity={"oid": 100, "proowner": 200})
-    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(one_or_none=lambda: observed_by_field)))
-    monkeypatch.setattr(native, "NativeReceiptSession", lambda connection: session)
-    driver = SimpleNamespace(
-        is_in_transaction=lambda: True, is_closed=lambda: False, fetchval=AsyncMock(return_value="pg_catalog")
-    )
-    if version == 2:
-        assert await migration.require_cms_snapshot_allocator(
-            driver, "sample", expected=dict(oid=100, owner_oid=200)
-        ) == dict(oid=100, owner_oid=200)
-    else:
-        with pytest.raises(RuntimeError, match="function_changed"):
-            await migration.require_cms_snapshot_allocator(driver, "sample", expected=dict(oid=100, owner_oid=200))

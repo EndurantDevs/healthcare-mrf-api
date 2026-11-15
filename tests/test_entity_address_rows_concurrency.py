@@ -30,7 +30,9 @@ async def test_two_workers_retire_private_scratch_while_other_consumer_stays_hel
 
             async def consume(select_sql, *, native_prepared):
                 """Record exact OIDs before this runner commits and cleans its private heaps."""
-                finished_by_field.update(admitted._row_scratch_state(admitted._ROW_SCRATCH.get()).owned_oids)
+                finished_by_field.update(
+                    {name: name for name in admitted._row_scratch_state(admitted._ROW_SCRATCH.get()).owned_relations}
+                )
                 await sql._run_sql_phase(
                     sql._insert_raw_from_source_sql(schema, "raw_actual", select_sql, native_prepared=native_prepared),
                     context={},
@@ -49,13 +51,14 @@ async def test_two_workers_retire_private_scratch_while_other_consumer_stays_hel
             assert not tasks[0].done() and not release.is_set()
             assert (
                 await database.scalar(
-                    "SELECT count(*) FROM pg_locks WHERE pid=:pid AND relation=ANY(CAST(:oids AS oid[]))",
-                    pid=held_by_field["pid"],
-                    oids=list(finished_by_field.values()),
+                    "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "WHERE n.nspname=:schema AND c.relname=ANY(CAST(:names AS text[]))",
+                    schema=schema,
+                    names=list(finished_by_field),
                 )
                 == 0
             )
-            assert all(name not in scope.owned_oids for name in finished_by_field)
+            assert all(name not in scope.owned_relations for name in finished_by_field)
             assert scope.workers._value == 1
         finally:
             await drain_tasks(tasks, release)
@@ -153,7 +156,7 @@ async def test_cancelled_runner_cleans_exact_scratch_while_other_consumer_is_saf
             gate_release.set()
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(tasks[1], 10)
-            assert captured_by_name and all(name not in scope.owned_oids for name in captured_by_name)
+            assert captured_by_name and all(name not in scope.owned_relations for name in captured_by_name)
             assert not tasks[0].done() and scope.workers._value == 1 and scope.worker_tasks == {tasks[0]}
             assert set(scope.row_scratch_owners) == set(held_by_field["scratch"])
             assert await database.scalar(

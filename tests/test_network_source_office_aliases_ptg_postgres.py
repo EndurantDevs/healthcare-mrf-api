@@ -15,6 +15,7 @@ from process import registry_source_recipe_composition as composition
 from process.network_address_projection import PinnedAddressSource
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.registry_candidate_composition import RegistryCompositionAddressSources
+from process.registry_publication_execution import prepare_registry_candidate_for_context
 from process.registry_record_store import RegistryRecordCommand, apply_registry_record_command
 from tests.test_network_custom_address_source_postgres import custom_db as base_custom_db
 from tests.test_registry_approval_store_postgres import _actor, _approve, _command
@@ -179,7 +180,7 @@ def _composition(native, recipes, revision, retained, owner):
 async def _assert_digest_replay(native, runtime, connection, parameters, receipt):
     namespace = receipt.address_source.schema_name
     original = await native.custom.connection.fetchval(
-        "SELECT obj_description($1::oid,'pg_namespace')", receipt.schema_oid
+        "SELECT obj_description(to_regnamespace($1),'pg_namespace')", namespace
     )
     forged = replace(receipt, ptg_carry_sha256="0" * 64)
     digest = custom._generation(forged)
@@ -240,14 +241,14 @@ async def test_ptg_only_alias_artifact_prepare_replay_and_authentication(alias_m
     owner = "ptg_alias_owner_" + uuid4().hex
     executor = "ptg_alias_executor_" + uuid4().hex
     password = uuid4().hex
-    created, engine, connection = [], None, None
+    created, engine, connection, worker = [], None, None, None
     try:
         for role in (owner, executor):
             created.append(role)
             await native.custom.connection.execute(
                 f'CREATE ROLE "{role}" ' + (f"LOGIN PASSWORD '{password}'" if role == executor else "NOLOGIN")
             )
-        engine, runtime, connection = await _worker(native, executor, owner, password)
+        engine, runtime, connection, worker = await _worker(native, executor, owner, password)
         retained = await _retained_pin(native)
         parameters = _composition(native, recipes, revision, retained, owner)
         copy_target, addresses = await runtime.compose(connection, **parameters)
@@ -256,7 +257,7 @@ async def test_ptg_only_alias_artifact_prepare_replay_and_authentication(alias_m
             "SELECT obj_description(to_regnamespace($1),'pg_namespace')", addresses.schema_name
         )
         receipt = custom._from_document(stored)
-        assert receipt.source_aliases and receipt.as_dict()["revision"] == 5 and receipt.ptg_carry_sha256 is not None
+        assert receipt.source_aliases and receipt.as_dict()["revision"] == 7 and receipt.ptg_carry_sha256 is not None
         async with connection.transaction(isolation="repeatable_read", readonly=True):
             assert await custom.verify_custom_address_source(connection, receipt) == receipt
             assert (
@@ -274,13 +275,17 @@ async def test_ptg_only_alias_artifact_prepare_replay_and_authentication(alias_m
         invalid = replace(recipes[0], source_pin=replace(recipes[0].source_pin, hold_sha256="0" * 64))
         with pytest.raises(ValueError):
             await runtime.compose(connection, **_composition(native, (invalid,), revision, retained, owner))
+        await prepare_registry_candidate_for_context(connection, copy_target, addresses, worker.consumer)
         await prepare_and_publish_network_candidate(
             connection,
             copy_target,
             addresses,
             **parameters["writer_roles"],
             control_schema=native.custom.control_schema,
+            seal_candidate=worker.consumer.seal_candidate,
         )
         await _assert_published_aliases(native, connection, recipes, retained)
     finally:
+        if worker is not None:
+            await worker.cleanup.aclose()
         await _cleanup_worker(native, connection, engine, created)

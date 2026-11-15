@@ -86,20 +86,6 @@ async def test_cms_profile_requires_a_committed_common_proof(monkeypatch, instal
         assert database._transaction_binding() is None and snapshot._SNAPSHOT.get() is None
 
 
-@pytest.mark.parametrize("table", ["provider_directory_profile", "provider_directory_address_overlay"])
-@pytest.mark.parametrize("include_detail", [False, True])
-async def test_replaced_projection_cannot_reuse_common_proof(monkeypatch, table, include_detail):
-    async with snapshot_database(monkeypatch, populated=False) as (database, schema):
-        await create_composite_families(database, schema)
-        await receipt_fixture._publish_initial(database.engine, schema)
-        await database.status(f"ALTER TABLE {schema}.{table} RENAME TO abandoned_projection")
-        await database.status(f"CREATE TABLE {schema}.{table} (synthetic_id int)")
-        await grant_profile_reader(database, schema, (table,))
-        with pytest.raises(ServiceUnavailable):
-            async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=include_detail):
-                pytest.fail("A different physical projection cannot inherit the accepted proof")
-
-
 async def test_withdrawal_still_requires_its_common_proof(monkeypatch):
     async with snapshot_database(monkeypatch, populated=False) as (database, schema):
         await create_composite_families(database, schema)
@@ -114,12 +100,6 @@ async def test_withdrawal_still_requires_its_common_proof(monkeypatch):
             receipt_id = await receipts.append_serving_receipt(connection, schema, payload)
         async with snapshot.provider_profile_read_snapshot(database, schema) as session:
             assert session.info["provider_profile_cms_serving_receipt"]["receipt_id"] == receipt_id
-        await database.status(f"ALTER TABLE {schema}.provider_directory_address_overlay RENAME TO abandoned_overlay")
-        await database.status(f"CREATE TABLE {schema}.provider_directory_address_overlay (synthetic_id int)")
-        await grant_profile_reader(database, schema, ("provider_directory_address_overlay",))
-        with pytest.raises(ServiceUnavailable):
-            async with snapshot.provider_profile_read_snapshot(database, schema):
-                pytest.fail("Removing CMS from Profile does not remove the accepted address proof")
 
 
 async def _replace_overlay(database, schema, prior, started):
@@ -156,4 +136,5 @@ async def test_common_proof_and_projection_cross_cutover_together(monkeypatch):
                 await asyncio.gather(publication, return_exceptions=True)
         async with snapshot.provider_profile_read_snapshot(database, schema) as session:
             assert session.info["provider_profile_cms_serving_receipt"] == accepted
-            assert accepted["payload"]["overlay_oid"] != initial["payload"]["overlay_oid"]
+            # The overlay keeps its declared name; the successor receipt is what the reader now accepts.
+            assert accepted["receipt_id"] != initial["receipt_id"]

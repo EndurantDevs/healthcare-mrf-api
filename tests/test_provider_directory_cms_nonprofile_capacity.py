@@ -102,13 +102,6 @@ def _cutover_producer(monkeypatch):
         "temp_limit_bytes": 1024,
         "query_parallel_workers": 0,
         "maintenance_parallel_workers": 0,
-        "database_system_identifier": producer.lease.database_system_identifier,
-        "database_oid": producer.lease.database_oid,
-        "database_name": producer.lease.database_name,
-        "data_tablespace_oid": 1663,
-        "data_tablespace_name": "pg_default",
-        "temp_tablespace_oid": 1663,
-        "temp_tablespace_name": "pg_default",
     }
     monkeypatch.setattr(capacity, "_database_observation", AsyncMock(return_value=observation_by_field))
     monkeypatch.setattr(capacity.capacity_runtime, "configured_capacity_lease_trust", _trust)
@@ -133,7 +126,7 @@ def _cutover_producer(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cutover_witness_is_local_and_cannot_cross_sessions_or_retries(monkeypatch):
+async def test_cutover_permit_is_local_to_one_operation_and_cannot_cross_retries(monkeypatch):
     """Only a fresh nonce authorizes each operation; local checks retain original bytes."""
     producer = _cutover_producer(monkeypatch)
     request = NonprofileAdmissionCheck("cutover", producer.lease, producer.plan, ())
@@ -146,9 +139,8 @@ async def test_cutover_witness_is_local_and_cannot_cross_sessions_or_retries(mon
         await producer.assert_cutover(None)
         with pytest.raises(RuntimeError, match="cutover_operation_changed"):
             await producer.check_phase(request)
-        producer.fhir.db.binding = SimpleNamespace(session=producer.fhir.db.binding.session)
-        with pytest.raises(RuntimeError, match="cutover_operation_changed"):
-            await producer.assert_cutover(None)
+        producer.fhir.db.binding = SimpleNamespace(session=object())
+        await producer.assert_cutover(None)
     assert producer._cutover_witness is None and producer._cutover_request is None
     with pytest.raises(RuntimeError, match="cutover_operation_changed"):
         await producer.assert_cutover(None)
@@ -176,14 +168,14 @@ def _set_cutover_failure(producer, failure):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["expiry", "deadline", "wal", "consumption", "relations", "profile"])
 async def test_local_cutover_rejects_expiry_overrun_and_identity_drift(monkeypatch, failure):
-    """The final check retains paired deadlines, immutable use, owned OIDs and WAL caps."""
+    """The final check retains paired deadlines, immutable use, named targets and WAL caps."""
     producer = _cutover_producer(monkeypatch)
     request = NonprofileAdmissionCheck("cutover", producer.lease, producer.plan, ())
     async with producer.cutover_operation():
         await producer.check_phase(request)
         producer.fhir.db.binding = SimpleNamespace(session=object())
         _set_cutover_failure(producer, failure)
-        relations = (OwnedRelation("synthetic", "replaced", 7, 0, "p"),) if failure == "relations" else None
+        relations = (OwnedRelation("synthetic", "replaced", 0, "p"),) if failure == "relations" else None
         with pytest.raises(RuntimeError):
             await producer.assert_cutover(relations)
     assert producer._cutover_witness is None and producer.fresh_storage_envelope.await_count == 1
@@ -193,20 +185,20 @@ async def test_local_cutover_rejects_expiry_overrun_and_identity_drift(monkeypat
 @pytest.mark.parametrize("data_bytes", [16_666, 16_667])
 async def test_logging_reserve_uses_measured_owned_storage_before_rewrite(data_bytes):
     producer = _producer()
-    producer.fhir._provider_directory_profile_relation_storage_fingerprint = AsyncMock(
-        return_value=SimpleNamespace(relation_oid=1, effective_tablespace_oids=(2,))
+    producer.fhir._provider_directory_profile_capacity_relation_layout = AsyncMock(
+        return_value=SimpleNamespace(schema_name="synthetic", relation_name="profile_scope")
     )
-    relation = OwnedRelation("synthetic", "profile_scope", 1, data_bytes, "u")
+    relation = OwnedRelation("synthetic", "profile_scope", data_bytes, "u")
     request = NonprofileAdmissionCheck(
         "pre_logging", producer.lease, producer.plan, (relation,), ((relation.schema, relation.relation),)
     )
     if 3 * data_bytes > producer.plan.logging_wal_upper_bound_bytes:
         with pytest.raises(RuntimeError, match="measured_logging_reserve_exceeded"):
-            await producer._assert_physical(request, {"data_tablespace_oid": 2})
-        producer.fhir._provider_directory_profile_relation_storage_fingerprint.assert_not_awaited()
+            await producer._assert_physical(request, {})
+        producer.fhir._provider_directory_profile_capacity_relation_layout.assert_not_awaited()
     else:
-        await producer._assert_physical(request, {"data_tablespace_oid": 2})
-        producer.fhir._provider_directory_profile_relation_storage_fingerprint.assert_awaited_once()
+        await producer._assert_physical(request, {})
+        producer.fhir._provider_directory_profile_capacity_relation_layout.assert_awaited_once()
 
 
 @pytest.mark.parametrize("existing", [False, True])
@@ -232,26 +224,24 @@ async def test_physical_pass_reuses_original_binding_and_checks_every_relation(e
         assert database.binding is original
         events.append(relation.relation)
         return SimpleNamespace(
-            relation_oid=relation.oid + int(replaced and relation.relation == "second"),
-            effective_tablespace_oids=(2,),
+            schema_name=relation.schema,
+            relation_name="other" if replaced and relation.relation == "second" else relation.relation,
         )
 
     database.transaction = transaction
     producer._capture_relation_layout = AsyncMock(side_effect=capture)
-    relations = tuple(
-        OwnedRelation("synthetic", name, oid, 100, "p") for oid, name in enumerate(("first", "second"), 1)
-    )
+    relations = tuple(OwnedRelation("synthetic", name, 100, "p") for name in ("first", "second"))
     request = NonprofileAdmissionCheck("readiness", producer.lease, producer.plan, relations)
     if replaced:
-        with pytest.raises(RuntimeError, match="physical_tablespace_changed"):
-            await producer._assert_physical(request, {"data_tablespace_oid": 2})
+        with pytest.raises(RuntimeError, match="relation_changed"):
+            await producer._assert_physical(request, {})
     else:
-        await producer._assert_physical(request, {"data_tablespace_oid": 2})
+        await producer._assert_physical(request, {})
     assert events == (["first", "second"] if existing else ["opened", "first", "second", "closed"])
     assert database.binding is (original if existing else None)
 
 
-@pytest.mark.parametrize("changed", [None, "oid", "tablespace"])
+@pytest.mark.parametrize("changed", [None, "name", "schema"])
 async def test_physical_pass_batches_only_scratch_and_keeps_original_backend(monkeypatch, changed):
     from process import provider_directory_cms_native_layout as layout
 
@@ -259,9 +249,7 @@ async def test_physical_pass_batches_only_scratch_and_keeps_original_backend(mon
     database, events = producer.fhir.db, []
     original = object()
     database._transaction_binding = lambda: original
-    relations = tuple(
-        OwnedRelation("synthetic", name, oid, 100, "p") for oid, name in enumerate(("scratch", "ordinary"), 1)
-    )
+    relations = tuple(OwnedRelation("synthetic", name, 100, "p") for name in ("scratch", "ordinary"))
 
     @asynccontextmanager
     async def batch(actual, members, *, database_for):
@@ -270,7 +258,8 @@ async def test_physical_pass_batches_only_scratch_and_keeps_original_backend(mon
         events.append("before")
         yield {
             ("synthetic", "scratch"): SimpleNamespace(
-                relation_oid=1 + int(changed == "oid"), effective_tablespace_oids=(3 if changed == "tablespace" else 2,)
+                schema_name="other" if changed == "schema" else "synthetic",
+                relation_name="other" if changed == "name" else "scratch",
             )
         }
         events.append("after")
@@ -278,17 +267,17 @@ async def test_physical_pass_batches_only_scratch_and_keeps_original_backend(mon
     async def ordinary(relation, *_args):
         assert database._transaction_binding() is original
         events.append(relation.relation)
-        return SimpleNamespace(relation_oid=relation.oid, effective_tablespace_oids=(2,))
+        return SimpleNamespace(schema_name=relation.schema, relation_name=relation.relation)
 
     monkeypatch.setattr(layout, "scratch_layout_batch", batch)
     producer._capture_relation_layout = AsyncMock(side_effect=ordinary)
     request = NonprofileAdmissionCheck("readiness", producer.lease, producer.plan, relations)
     if changed:
-        with pytest.raises(RuntimeError, match="physical_tablespace_changed"):
-            await producer._assert_physical(request, {"data_tablespace_oid": 2})
+        with pytest.raises(RuntimeError, match="relation_changed"):
+            await producer._assert_physical(request, {})
         producer._capture_relation_layout.assert_not_awaited()
     else:
-        await producer._assert_physical(request, {"data_tablespace_oid": 2})
+        await producer._assert_physical(request, {})
         assert events == ["before", "ordinary", "after"]
         producer._capture_relation_layout.assert_awaited_once()
 
@@ -298,7 +287,7 @@ async def test_scratch_batch_cannot_replace_stronger_retained_policy(monkeypatch
     from process import provider_directory_cms_native_layout as layout
 
     producer, policy = _producer(), object()
-    relation = OwnedRelation("synthetic", "scratch", 11, 100, "p")
+    relation = OwnedRelation("synthetic", "scratch", 100, "p")
     coordinate = (relation.schema, relation.relation)
     producer._raw_relation_policies = lambda _request: {coordinate: policy} if kind == "raw" else {}
     producer._native_relation_policies = lambda _request: {coordinate: policy} if kind == "native" else {}
@@ -309,14 +298,14 @@ async def test_scratch_batch_cannot_replace_stronger_retained_policy(monkeypatch
         yield {}
 
     monkeypatch.setattr(layout, "scratch_layout_batch", batch)
-    observed_catalog = ({"relation": {"relation_oid": relation.oid}}, None)
-    native_capture = AsyncMock(return_value={(relation.schema, relation.relation, relation.oid): observed_catalog})
+    observed_catalog = ({"relation": {"schema_name": relation.schema, "relation_name": relation.relation}}, None)
+    native_capture = AsyncMock(return_value={(relation.schema, relation.relation): observed_catalog})
     monkeypatch.setattr(layout, "observe_native_catalog_batch", native_capture)
     producer._capture_relation_layout = AsyncMock(
-        return_value=SimpleNamespace(relation_oid=11, effective_tablespace_oids=(2,))
+        return_value=SimpleNamespace(schema_name=relation.schema, relation_name=relation.relation)
     )
     request = NonprofileAdmissionCheck("readiness", producer.lease, producer.plan, (relation,))
-    await producer._assert_physical(request, {"data_tablespace_oid": 2})
+    await producer._assert_physical(request, {})
     assert producer._capture_relation_layout.await_args.args == (
         relation,
         policy if kind == "raw" else None,
@@ -367,18 +356,29 @@ def test_scope_and_paired_lease_are_in_signed_geometry():
         )
 
 
-def test_quiescence_reuses_exact_existing_profile_contract_predicate():
+@pytest.mark.asyncio
+async def test_quiescence_reuses_shared_gate_with_complete_authenticated_receipts(monkeypatch):
     producer = _producer()
+    fhir = producer.fhir
+    fhir._schema = lambda: "synthetic"
     receipt = producer.lease.signing_preflight_guard["healthcare_receipt"]
-    params_by_field = capacity._quiescence_parameters(producer.fhir, producer, receipt, VALIDATION_TIME)
-    assert json.loads(params_by_field["profile_params"]) == {
-        "provider_directory_profile_contract_id": "execution-contract",
-        "publish_artifacts_only": True,
-        "publish_artifacts_targets": ["profile"],
-    }
-    assert (
-        params_by_field["paired_request_sha256"]
-        == producer.profile_lease.signing_preflight_guard["healthcare_receipt"]["request_sha256"]
+    pair = producer.profile_lease.signing_preflight_guard["healthcare_receipt"]
+    fhir._profile_capacity_preflight_stored_receipt = lambda row, lease: receipt
+    fhir._pagination_checkpoint_row_mapping = lambda row: row
+    fhir._profile_capacity_preflight_receipt_ref = lambda schema: schema + ".receipt"
+    fhir._assert_profile_capacity_receipt_open = lambda *args: None
+    fhir._assert_profile_capacity_receipt_storage = AsyncMock()
+    fhir._profile_capacity_quiescence = AsyncMock()
+    fhir._mark_profile_capacity_receipt_consumed = AsyncMock()
+    fhir.db.first = AsyncMock(return_value=receipt)
+    producer._assert_paired_preflight = AsyncMock(return_value=pair)
+    await producer._consume_preflight(receipt["runtime_observation"])
+    fhir._profile_capacity_quiescence.assert_awaited_once_with(
+        "synthetic",
+        observed_at=VALIDATION_TIME,
+        request_sha256=receipt["request_sha256"],
+        current_run_id=producer.run_id,
+        verified_receipts=(receipt, pair),
     )
 
 
@@ -400,10 +400,12 @@ def test_pair_reuse_and_aggregate_colocated_free_space_fail_closed():
         capacity._assert_paired_reservation(producer.lease, producer.lease, 1000)
     volumes = tuple(
         replace(volume, available_bytes=1, available_after_all_reservations_bytes=1)
-        for volume in producer.lease.volumes
+        for volume in producer.lease.storage_classes
     )
     with pytest.raises(RuntimeError, match="aggregate_remaining_capacity_too_small"):
-        capacity._assert_paired_reservation(replace(producer.lease, volumes=volumes), producer.profile_lease, 1000)
+        capacity._assert_paired_reservation(
+            replace(producer.lease, storage_classes=volumes), producer.profile_lease, 1000
+        )
 
 
 def test_paired_capacity_keeps_independent_reservations_on_same_storage():
@@ -413,9 +415,14 @@ def test_paired_capacity_keeps_independent_reservations_on_same_storage():
         producer.lease.reservation_bytes_by_storage_class != producer.profile_lease.reservation_bytes_by_storage_class
     )
     capacity._assert_paired_reservation(producer.lease, producer.profile_lease, 1000)
-    volumes = tuple(replace(volume, volume_digest="99" * 32) for volume in producer.lease.volumes)
-    with pytest.raises(RuntimeError, match="paired_storage_changed"):
-        capacity._assert_paired_reservation(replace(producer.lease, volumes=volumes), producer.profile_lease, 1000)
+    entries = tuple(
+        replace(entry, available_after_all_reservations_bytes=entry.available_bytes - entry.reserved_bytes)
+        for entry in producer.lease.storage_classes
+    )
+    with pytest.raises(RuntimeError, match="aggregate_remaining_capacity_too_small"):
+        capacity._assert_paired_reservation(
+            replace(producer.lease, storage_classes=entries), producer.profile_lease, 1000
+        )
 
 
 @pytest.mark.asyncio
@@ -430,13 +437,6 @@ async def test_phase_rejects_unsigned_transport_and_retains_original_bytes(monke
         "temp_limit_bytes": 1024,
         "query_parallel_workers": 0,
         "maintenance_parallel_workers": 0,
-        "database_system_identifier": "7527713908662902214",
-        "database_oid": 16401,
-        "database_name": "healthporta_test",
-        "data_tablespace_oid": 1663,
-        "data_tablespace_name": "pg_default",
-        "temp_tablespace_oid": 1663,
-        "temp_tablespace_name": "pg_default",
     }
     monkeypatch.setattr(capacity, "_database_observation", AsyncMock(return_value=observation_by_field))
     monkeypatch.setattr(capacity.capacity_runtime, "configured_capacity_lease_trust", _trust)

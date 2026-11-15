@@ -3,7 +3,7 @@
 
 import asyncio
 import json
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -350,7 +350,6 @@ async def test_reporting_overflow_stops_real_preparation_before_registry_or_cand
     head, build = AsyncMock(), AsyncMock()
     monkeypatch.setattr(sync, "iter_fhir_catalog_sources", pages)
     monkeypatch.setattr(sync, "fhir_catalog_reference_workspace", lambda _connection: scoped(object()))
-    monkeypatch.setattr(sync, "fhir_catalog_published_reads", lambda _connection: nullcontext())
     monkeypatch.setattr(sync, "_catalog_registry_head", head)
     monkeypatch.setattr(sync, "_build_catalog_candidate", build)
     staged_by_kind = {}

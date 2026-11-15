@@ -26,7 +26,6 @@ from process.provider_directory_rooted_graph_store_support import (
     ACQUISITION_TABLE,
     ENDPOINT_TABLE,
     row_fields,
-    set_store_action,
     table_ref,
 )
 
@@ -58,8 +57,7 @@ def _derived_work_specs(claim, query_result, api_base):
     for edge in query_result.edges:
         if (
             edge.closure_scope not in {"root", "plan"}
-            or edge.target_resource_type
-            not in PROVIDER_DIRECTORY_ROOTED_GRAPH_DIRECT_READ_TYPES
+            or edge.target_resource_type not in PROVIDER_DIRECTORY_ROOTED_GRAPH_DIRECT_READ_TYPES
         ):
             continue
         spec = build_provider_directory_rooted_graph_work_spec(
@@ -100,13 +98,11 @@ def _derived_work_specs(claim, query_result, api_base):
 def _has_derived_frontier(query_result) -> bool:
     has_direct_frontier = any(
         edge.closure_scope in {"root", "plan"}
-        and edge.target_resource_type
-        in PROVIDER_DIRECTORY_ROOTED_GRAPH_DIRECT_READ_TYPES
+        and edge.target_resource_type in PROVIDER_DIRECTORY_ROOTED_GRAPH_DIRECT_READ_TYPES
         for edge in query_result.edges
     )
     has_affiliation_frontier = any(
-        resource.resource_type == "Organization"
-        and resource.closure_scope in {"root", "plan"}
+        resource.resource_type == "Organization" and resource.closure_scope in {"root", "plan"}
         for resource in query_result.resources
     )
     return has_direct_frontier or has_affiliation_frontier
@@ -128,7 +124,6 @@ async def register_rooted_graph_frontier(
     )
     if not specs:
         return
-    await set_store_action(database, "derive", claim.acquisition_id, claim.lease_token)
     await admit_work_specs(database, claim.acquisition_id, specs, action="derive")
 
 

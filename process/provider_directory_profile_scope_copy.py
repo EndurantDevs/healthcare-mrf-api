@@ -224,13 +224,6 @@ def _table_projection(fhir, model, batch):
     return matching_tables[0]
 
 
-async def _target_oid(fhir, relation):
-    qualified = fhir._unscoped_qt(fhir._schema(), relation)
-    oid = await fhir.db.scalar("SELECT to_regclass(:relation)::oid::bigint", relation=qualified)
-    _require(type(oid) is int and oid > 0)
-    return oid
-
-
 async def copy_batch(fhir, model, batch, statement, params_by_name):
     """COPY bounded pages from the same selected physical input used by preflight."""
     _require(is_enabled(fhir) and _SCOPE.get() is not None and _SCOPE.get()["closed"] is False)
@@ -241,7 +234,6 @@ async def copy_batch(fhir, model, batch, statement, params_by_name):
     request = native_copy.NativeCopyRequest(
         model=model,
         relation=relation,
-        target_oid=await _target_oid(fhir, relation),
         batch=batch,
         table_projection=table_projection,
         source_binding=source_binding,
@@ -330,8 +322,7 @@ async def validate_snapshot(fhir, schema, plan, fence, resource_fence, resource_
         for table in projection.tables:
             model = plan.model_by_table_name[table.table_name]
             relation = plan.relation_by_table[table.table_name]
-            oid = await _target_oid(fhir, relation)
-            before = await native_copy.completed_target_catalog(fhir, model, relation, oid, outcome=outcome)
+            before = await native_copy.completed_target_catalog(fhir, model, relation, outcome=outcome)
             if model is fhir.ProviderDirectorySource:
                 statement = fhir._provider_directory_artifact_source_select_sql(model, schema)
                 params_by_name = {"source_ids": sorted(set(fence.source_ids))}
@@ -342,5 +333,5 @@ async def validate_snapshot(fhir, schema, plan, fence, resource_fence, resource_
                 _parity_sql(fhir, model, qualified, statement), **params_by_name, expected_rows=table.projected_rows
             )
             _require(valid is True)
-            after = await native_copy.completed_target_catalog(fhir, model, relation, oid, outcome=outcome)
+            after = await native_copy.completed_target_catalog(fhir, model, relation, outcome=outcome)
             _require(after == before)

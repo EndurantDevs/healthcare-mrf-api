@@ -5,11 +5,14 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 import asyncpg
 import pytest
 from sqlalchemy import MetaData, text
+from sqlalchemy.exc import DBAPIError
 
 from db import models
 from db.connection import db
@@ -25,47 +28,42 @@ from process import entity_address_snapshot_source as source
 from process import reference_family_archive as family_archive
 from tests.test_address_numeric_grid_alias_db import _insert_archive_address
 from tests.test_address_numeric_grid_alias_lifecycle_db import _apply_reviewed_alias
-from tests.test_entity_address_alias_guard_postgres import _admin_url, _owned_guard_database, _provision_test_schema
-from tests.test_entity_address_snapshot_destination import _create_geo_dependencies, _seed_support_rows
+from tests.test_address_numeric_grid_alias_runtime_db import _create_alias_probe_schema
+from tests.test_entity_address_alias_guard_postgres import _owned_guard_database
+from tests.test_entity_address_snapshot_destination import (
+    _create_geo_dependencies,
+    _publish_npi_fixture_generation,
+    _seed_support_rows,
+)
 
 SCHEMA = "mrf"
 
 
 @asynccontextmanager
 async def _publication_database(monkeypatch):
-    """Reuse cleanup registered before creation and the actual protected alias authority."""
-    census = await _cluster_census()
-    try:
+    """Use registered exact cleanup and real native roles from a bounded policy file."""
+    with TemporaryDirectory(prefix="address_native_policy_") as folder:
         async with _owned_guard_database(monkeypatch) as resources:
+            policy = Path(folder) / "roles.json"
+            policy.write_text(
+                json.dumps(
+                    {
+                        "owner_role": resources.admin_role,
+                        "migration_role": resources.roles["publisher"],
+                        "preparation_owner_role": resources.roles["owner"],
+                        "runtime_roles": [resources.roles["writer"]],
+                    }
+                )
+            )
+            monkeypatch.setenv("HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE", str(policy))
             await _provision_publication_database(monkeypatch, resources)
             yield resources
-    finally:
-        assert await _cluster_census() == census
-
-
-async def _cluster_census():
-    connection = await asyncpg.connect(_admin_url().render_as_string(hide_password=False), timeout=10)
-    try:
-        return tuple(
-            [
-                tuple(tuple(row) for row in await connection.fetch(query))
-                for query in (
-                    "SELECT oid,datname,datdba FROM pg_database ORDER BY oid",
-                    "SELECT oid,rolname,rolsuper,rolinherit,rolcreaterole,rolcreatedb,rolcanlogin,rolreplication,rolbypassrls "
-                    "FROM pg_roles ORDER BY oid",
-                    "SELECT roleid,member,grantor,admin_option,inherit_option,set_option FROM pg_auth_members "
-                    "ORDER BY roleid,member,grantor",
-                )
-            ]
-        )
-    finally:
-        await connection.close(timeout=10)
 
 
 async def _provision_publication_database(monkeypatch, resources):
     """Provision only resources inside the exact database created by the lifecycle."""
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_PROTECTED_PUBLICATION", "true")
-    await _provision_test_schema(resources, SCHEMA, initial_generation=0)
+    await _provision_named_alias_schema(resources, SCHEMA, initial_generation=0)
     await resources.admin.execute("DROP TABLE mrf.entity_address_unified")
     await resources.admin.execute("CREATE EXTENSION intarray")
     await resources.admin.execute("CREATE EXTENSION btree_gin")
@@ -78,8 +76,40 @@ async def _provision_publication_database(monkeypatch, resources):
     await _create_canonical_models()
     await _create_geo_dependencies(db, SCHEMA)
     await _seed_canonical_payload()
+    await _publish_npi_fixture_generation(db, SCHEMA)
     await _seed_active_alias()
     await _protect_control_state(resources)
+
+
+async def _provision_named_alias_schema(resources, schema, *, initial_generation):
+    """Keep genuine alias data/privileges without the retired metadata attestation."""
+    from process import entity_address_alias_guard as guard
+
+    admin, roles = resources.admin, resources.roles
+    await _create_alias_probe_schema(admin, schema, "generation_guard")
+    await admin.execute(f'GRANT USAGE,CREATE ON SCHEMA "{schema}" TO "{roles["writer"]}","{roles["owner"]}"')
+    tables = await admin.fetch(
+        "SELECT relname FROM pg_class JOIN pg_namespace n ON n.oid=relnamespace WHERE n.nspname=$1 AND relkind='r'",
+        schema,
+    )
+    for row in tables:
+        owner = (
+            roles["owner"]
+            if row["relname"] in {guard.alias._STATE_TABLE, guard.alias._ALIAS_TABLE}
+            else roles["writer"]
+        )
+        await admin.execute(f'ALTER TABLE "{schema}"."{row["relname"]}" OWNER TO "{owner}"')
+    for statement in guard.generation_guard_statements(schema):
+        await admin.execute(statement)
+    for function in guard.GUARDS:
+        await admin.execute(f'ALTER FUNCTION "{schema}"."{function}"() OWNER TO "{roles["owner"]}"')
+    await admin.execute(f'GRANT SELECT ON "{schema}".address_alias_state_v1 TO "{roles["writer"]}"')
+    await admin.execute(
+        f'GRANT SELECT,INSERT,UPDATE ({",".join(guard.REVOCATION_COLUMNS)}) ON "{schema}".address_alias_v1 TO "{roles["writer"]}"'
+    )
+    await admin.execute(f'UPDATE "{schema}".address_alias_state_v1 SET generation=$1', initial_generation)
+    async with resources.publisher.transaction() as session:
+        await preparation.require_entity_address_archive_publisher(session, db_schema=schema)
 
 
 async def _create_canonical_models():
@@ -202,11 +232,23 @@ async def _seed_stage_payload(suffix, *, invalid_payload):
             )
 
 
+def _assert_named_metadata(value):
+    """Fresh receipts identify stored objects by name while retaining semantic entity IDs."""
+    if isinstance(value, dict):
+        assert all(not key.endswith(("_oid", "_oids", "_filenode")) and key != "relfilenode" for key in value)
+        for child in value.values():
+            _assert_named_metadata(child)
+    elif isinstance(value, list):
+        for child in value:
+            _assert_named_metadata(child)
+
+
 async def _handoff(context):
     result = await publication.handoff_entity_address_generation(
         context, schema_name=SCHEMA, import_date=context["import_date"], dependency_bindings=None, row_count=1
     )
     handoff = result["address_handoff"]
+    _assert_named_metadata(handoff)
     assert context["context"]["control_run_handoff_committed"] is True
     assert (
         await db.scalar("SELECT status FROM mrf.import_run WHERE run_id=:run", run=context["control_run_id"])
@@ -217,8 +259,9 @@ async def _handoff(context):
 
 async def _publish(resources, handoff, *, rollback):
     async def continuation(session, _receipt, cutover):
-        assert await session.scalar(text("SELECT current_user=session_user")) is True
+        assert session.in_transaction()
         receipt = await cutover()
+        _assert_named_metadata(receipt)
         assert receipt["result_generation"]["serving_generation"]["origin_generation"] == 1
         if rollback:
             raise RuntimeError("publication rollback probe")
@@ -230,20 +273,29 @@ async def _publish(resources, handoff, *, rollback):
         )
 
 
-async def _canonical_oids(resources):
-    return tuple(
-        [
-            await resources.admin.fetchval("SELECT to_regclass($1)::oid::bigint", f"mrf.{name}")
-            for name in generation.RELATION_NAMES
-        ]
-    )
+async def _relation_rows(resources, schema, names):
+    """Read complete fixture payloads from declared names, independent of native storage tokens."""
+    return {
+        name: tuple(
+            row["row"]
+            for row in await resources.admin.fetch(
+                f'SELECT to_jsonb(value)::text AS row FROM "{schema}"."{name}" value ORDER BY to_jsonb(value)::text'
+            )
+        )
+        for name in names
+    }
+
+
+async def _canonical_rows(resources):
+    """Read complete serving payloads to prove atomic publication rollback."""
+    return await _relation_rows(resources, SCHEMA, generation.RELATION_NAMES)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["published", "rollback", "invalid_payload"])
 async def test_native_ordinary_address_publication_preserves_transaction_and_payload_guards(monkeypatch, outcome):
     async with _publication_database(monkeypatch) as resources:
-        incumbent_oids = await _canonical_oids(resources)
+        incumbent_rows = await _canonical_rows(resources)
         context = _attempt_context()
         await _create_attempt_stage(context, invalid_payload=outcome == "invalid_payload")
         handoff = await _handoff(context)
@@ -251,7 +303,7 @@ async def test_native_ordinary_address_publication_preserves_transaction_and_pay
             expected = "publication rollback probe" if outcome == "rollback" else "stale address alias generation"
             with pytest.raises(RuntimeError, match=expected):
                 await _publish(resources, handoff, rollback=outcome == "rollback")
-            assert await _canonical_oids(resources) == incumbent_oids
+            assert await _canonical_rows(resources) == incumbent_rows
             assert await db.scalar("SELECT local_generation FROM mrf.entity_address_result_generation") == 0
             assert (
                 await db.scalar("SELECT status FROM mrf.import_run WHERE run_id=:run", run=context["control_run_id"])
@@ -259,7 +311,7 @@ async def test_native_ordinary_address_publication_preserves_transaction_and_pay
             )
             return
         receipt = await _publish(resources, handoff, rollback=False)
-        assert await _canonical_oids(resources) == tuple(entry["relation_oid"] for entry in handoff["stage_relations"])
+        assert set(await _canonical_rows(resources)) == set(generation.RELATION_NAMES)
         assert await db.scalar("SELECT local_generation FROM mrf.entity_address_result_generation") == 1
         async with resources.publisher.transaction() as session:
             assert await publication.read_entity_address_native_publication(session, handoff) == receipt
@@ -310,14 +362,15 @@ async def _clone_published_family(resources, handoff, *, byte_limit=1024 * 1024)
 
     async def on_precreated(session):
         owner = await ownership.capture_created_entity_address_archive_stage(session, dataset_id=dataset_id)
-        assert len(owner.relation_oids) == 8
-        for name, _oid in owner.relation_oids:
+        assert len(owner.relation_names) == 8
+        for name in owner.relation_names:
             assert await session.scalar(text(f'SELECT count(*) FROM "{owner.schema_name}"."{name}"')) == 0
         captured_owners.append(owner)
 
     async with resources.publisher.session_factory() as pinned, pinned.begin():
+        queued = await serving.capture_entity_address_receive_admission(pinned, schema_name=SCHEMA)
         source_capture = await source.capture_entity_address_archive_source(
-            pinned, schema_name=SCHEMA, contract=source.CONTRACT
+            pinned, schema_name=SCHEMA, queued_serving_capture=queued, contract=source.CONTRACT
         )
         alias_receipt = await alias.capture_entity_address_alias_authority_receipt(pinned, schema_name=SCHEMA)
         source_connection = await pinned.connection()
@@ -388,8 +441,10 @@ async def _load_received_heaps(captured):
             )
             assert (
                 await receiver.scalar(
-                    text("SELECT count(*) FROM pg_index WHERE indrelid=ANY(:oids)"),
-                    {"oids": [oid for _name, oid in owner.relation_oids]},
+                    text(
+                        "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=:schema AND c.relname=ANY(:names)"
+                    ),
+                    {"schema": owner.schema_name, "names": list(owner.relation_names)},
                 )
                 == 0
             )
@@ -418,63 +473,43 @@ async def _load_received_heaps(captured):
                     right_name=model.__tablename__,
                 )
     assert len(copy_sizes) == 8
-    return {**captured, "owner": owner, "destination": destination_by_field}
+    return {**captured, "raw_source_owner": captured["owner"], "owner": owner, "destination": destination_by_field}
 
 
 async def _freeze_received_family(resources, owner):
+    from process.cms_doctors_immutable import _freeze_named_model_relations
+
     async with resources.publisher.session_factory() as session, session.begin():
-        owner_oid = await preparation.require_entity_address_archive_publisher(session, db_schema=SCHEMA)
+        await preparation.require_entity_address_archive_publisher(session, db_schema=SCHEMA)
         await session.execute(text(f'ALTER SCHEMA "{owner.schema_name}" OWNER TO "{resources.roles["owner"]}"'))
-        for _name, oid in owner.relation_oids:
-            await preparation._seal_published_relation(session, oid, owner_oid)
+        await _freeze_named_model_relations(session, owner.schema_name, owner.relation_names)
         await session.execute(
             text(f'REVOKE CREATE ON SCHEMA "{owner.schema_name}" FROM PUBLIC,"{resources.roles["writer"]}"')
         )
-        return await _observed_preparation(session, resources, owner)
+        await session.execute(text(f'GRANT USAGE ON SCHEMA "{owner.schema_name}" TO "{resources.roles["writer"]}"'))
+        return {"state": "frozen", **await _observed_preparation(session, resources, owner)}
 
 
 async def _observed_preparation(session, resources, owner):
     assert await ownership.verify_entity_address_archive_stage_ownership(session, owner=owner) == owner
-    owner_oid = await session.scalar(
-        text("SELECT oid FROM pg_roles WHERE rolname=:name"), {"name": resources.roles["owner"]}
-    )
-    builder_oid = await session.scalar(
-        text("SELECT oid FROM pg_roles WHERE rolname=:name"), {"name": resources.roles["writer"]}
-    )
-    assert (
-        await session.scalar(text("SELECT nspowner FROM pg_namespace WHERE oid=:oid"), {"oid": owner.schema_oid})
-        == owner_oid
-    )
-    sequence_oid = await session.scalar(
-        text("SELECT to_regclass(:name)::oid"), {"name": f'"{owner.schema_name}"."{preparation._EVIDENCE_SEQUENCE}"'}
-    )
     inventory_by_field = {
         "schema_name": owner.schema_name,
-        "schema_oid": owner.schema_oid,
-        "relations": [{"table_name": name, "relation_oid": oid} for name, oid in owner.relation_oids],
+        "relations": [{"schema_name": owner.schema_name, "relation_name": name} for name in owner.relation_names],
         "sequences": [
             {
                 "sequence_name": preparation._EVIDENCE_SEQUENCE,
-                "sequence_oid": sequence_oid,
                 "owner_table": "entity_address_evidence",
                 "owner_column": "evidence_id",
             }
         ],
     }
-    return {
-        "state": "frozen",
-        "frozen_owner_oid": owner_oid,
-        "builder_oid": builder_oid,
-        "inventory": inventory_by_field,
-        "inventory_sha256": preparation._digest(inventory_by_field),
-    }
+    return {"inventory": inventory_by_field, "inventory_sha256": preparation._digest(inventory_by_field)}
 
 
-async def _prepare_received_family(resources, captured, frozen):
+async def _prepare_received_family(resources, captured):
     async def authenticate(session):
         observed = await _observed_preparation(session, resources, captured["owner"])
-        assert observed == frozen
-        return observed
+        return {"state": "handed_off", **observed}
 
     async with resources.publisher.session_factory() as session, session.begin():
         return await preparation.prepare_loaded_entity_address_archive_destination(
@@ -492,11 +527,11 @@ async def _activate_received_family(resources, captured, frozen, validation, inc
         assert supplied_preparation == frozen
         assert supplied_validation == validation
         observed = await _observed_preparation(session, resources, captured["owner"])
-        assert observed == frozen
+        assert {"state": "frozen", **observed} == frozen
         return {**observed, "state": "validated", "validation": {"evidence": validation}}
 
     async def before():
-        assert await db.scalar("SELECT current_user=session_user") is True
+        assert db._transaction_binding().session.in_transaction()
 
     async def after():
         assert await db.scalar("SELECT local_generation FROM mrf.entity_address_result_generation") == 1
@@ -521,6 +556,35 @@ async def _activate_received_family(resources, captured, frozen, validation, inc
         )
 
 
+async def _assert_frozen_family_access(owner):
+    """Real runtime SELECT remains usable while native DML and DDL are denied."""
+    for name in owner.relation_names:
+        table = f'"{owner.schema_name}"."{name}"'
+        assert await db.scalar(f"SELECT count(*) FROM {table}") >= 0
+        for statement in (
+            f"DELETE FROM {table} WHERE FALSE",
+            f"ALTER TABLE {table} ADD COLUMN forbidden_write integer",
+        ):
+            with pytest.raises(DBAPIError) as caught:
+                async with db.transaction() as session:
+                    await session.execute(text(statement))
+            assert caught.value.orig.sqlstate == "42501"
+
+
+async def _refuse_changed_frozen_content(resources, captured, frozen, validation, incumbent):
+    """Same-count data drift is refused before atomic publication, even under elevated fixture access."""
+    table = f'"{captured["owner"].schema_name}"."entity_address_unified"'
+    original = await resources.admin.fetchval(f"SELECT city_name FROM {table}")
+    count = await resources.admin.fetchval(f"SELECT count(*) FROM {table}")
+    await resources.admin.execute(f"UPDATE {table} SET city_name=$1", "Changed City")
+    try:
+        with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="content"):
+            await _activate_received_family(resources, captured, frozen, validation, incumbent, rollback=False)
+        assert await resources.admin.fetchval(f"SELECT count(*) FROM {table}") == count
+    finally:
+        await resources.admin.execute(f"UPDATE {table} SET city_name=$1", original)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("rollback", [False, True])
 async def test_native_received_address_copy_seal_and_activation_preserve_origin_and_rollback(monkeypatch, rollback):
@@ -529,56 +593,75 @@ async def test_native_received_address_copy_seal_and_activation_preserve_origin_
         await _create_attempt_stage(context)
         handoff = await _handoff(context)
         ordinary_receipt = await _publish(resources, handoff, rollback=False)
-        incumbent_oids = await _canonical_oids(resources)
+        incumbent_rows = await _canonical_rows(resources)
         async with resources.publisher.session_factory() as session, session.begin():
             incumbent = await serving.capture_entity_address_receive_admission(session, schema_name=SCHEMA)
         captured = await _load_received_heaps(await _clone_published_family(resources, handoff))
+        raw_rows = await _relation_rows(
+            resources, captured["raw_source_owner"].schema_name, captured["raw_source_owner"].relation_names
+        )
+        validation = await _prepare_received_family(resources, captured)
+        _assert_named_metadata(validation)
         frozen = await _freeze_received_family(resources, captured["owner"])
-        validation = await _prepare_received_family(resources, captured, frozen)
+        await _assert_frozen_family_access(captured["owner"])
+        await _refuse_changed_frozen_content(resources, captured, frozen, validation, incumbent)
+        assert (
+            await _relation_rows(
+                resources, captured["raw_source_owner"].schema_name, captured["raw_source_owner"].relation_names
+            )
+            == raw_rows
+        )
+        assert await _canonical_rows(resources) == incumbent_rows
         if rollback:
             with pytest.raises(RuntimeError, match="received publication rollback probe"):
                 await _activate_received_family(resources, captured, frozen, validation, incumbent, rollback=True)
-            assert await _canonical_oids(resources) == incumbent_oids
+            assert await _canonical_rows(resources) == incumbent_rows
             assert await db.scalar("SELECT local_generation FROM mrf.entity_address_result_generation") == 1
             return
-        result = await _activate_received_family(resources, captured, frozen, validation, incumbent, rollback=False)
-        published = result["publication"]
-        assert len(published["relations"]) == 7
-        expected_oid_by_name = dict(captured["owner"].relation_oids)
-        assert await _canonical_oids(resources) == tuple(
-            expected_oid_by_name[name] for name in generation.RELATION_NAMES
+        publication_result = await _activate_received_family(
+            resources, captured, frozen, validation, incumbent, rollback=False
         )
+        published = publication_result["publication"]
+        assert len(published["relations"]) == 7
+        assert published["relations"] == [
+            {"schema_name": SCHEMA, "relation_name": name} for name in generation.RELATION_NAMES
+        ]
         assert await _serving_generation(resources) == ordinary_receipt["result_generation"]["serving_generation"]
         assert await db.scalar("SELECT local_generation FROM mrf.entity_address_result_generation") == 1
-        assert published["alias_authority"]["relation_oid"] == expected_oid_by_name[alias.AUTHORITY_TABLE]
+        assert published["alias_authority"] == {
+            "schema_name": captured["owner"].schema_name,
+            "relation_name": alias.AUTHORITY_TABLE,
+        }
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["index", "marker"])
-async def test_native_handoff_refuses_changed_custody(monkeypatch, change):
+@pytest.mark.parametrize("change", ["index", "content"])
+async def test_native_handoff_refuses_changed_layout_or_content(monkeypatch, change):
     async with _publication_database(monkeypatch) as resources:
-        incumbent_oids = await _canonical_oids(resources)
+        incumbent_rows = await _canonical_rows(resources)
         context = _attempt_context()
         await _create_attempt_stage(context)
         handoff = await _handoff(context)
         if change == "index":
             index_name = await resources.admin.fetchval(
-                "SELECT quote_ident(n.nspname)||'.'||quote_ident(c.relname) FROM pg_class c "
-                "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=ANY($1::oid[]) "
-                "AND NOT EXISTS(SELECT 1 FROM pg_constraint k WHERE k.conindid=c.oid) ORDER BY c.oid LIMIT 1",
-                [entry["index_oid"] for entry in handoff["indexes"]],
+                "SELECT quote_ident(n.nspname)||'.'||quote_ident(idx.relname) FROM pg_index i "
+                "JOIN pg_class idx ON idx.oid=i.indexrelid JOIN pg_class c ON c.oid=i.indrelid "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) "
+                "AND NOT EXISTS(SELECT 1 FROM pg_constraint k WHERE k.conindid=idx.oid) ORDER BY idx.relname LIMIT 1",
+                SCHEMA,
+                [entry["stage_name"] for entry in handoff["stage_relations"]],
             )
             assert index_name is not None
             await resources.admin.execute("DROP INDEX " + index_name)
             expected_error = "indexes changed"
         else:
             await resources.admin.execute(
-                f'COMMENT ON TABLE mrf."{handoff["stage_relations"][0]["stage_name"]}" IS NULL'
+                f'UPDATE mrf."{handoff["stage_relations"][0]["stage_name"]}" SET city_name=$1', "Changed City"
             )
-            expected_error = "stage marker changed"
+            expected_error = "stage content changed"
         with pytest.raises(RuntimeError, match=expected_error):
             await _publish(resources, handoff, rollback=False)
-        assert await _canonical_oids(resources) == incumbent_oids
+        assert await _canonical_rows(resources) == incumbent_rows
         assert await db.scalar("SELECT local_generation FROM mrf.entity_address_result_generation") == 0
 
 
@@ -589,8 +672,106 @@ async def test_native_source_copy_budget_rolls_back_precreated_family(monkeypatc
         await _create_attempt_stage(context)
         handoff = await _handoff(context)
         await _publish(resources, handoff, rollback=False)
-        before_schemas = tuple(await resources.admin.fetch("SELECT oid,nspname FROM pg_namespace ORDER BY oid"))
+        before_schemas = tuple(await resources.admin.fetch("SELECT nspname FROM pg_namespace ORDER BY nspname"))
         with pytest.raises(RuntimeError, match="native COPY exceeded admitted bytes"):
             await _clone_published_family(resources, handoff, byte_limit=1)
-        assert tuple(await resources.admin.fetch("SELECT oid,nspname FROM pg_namespace ORDER BY oid")) == before_schemas
-        assert await _canonical_oids(resources) == tuple(entry["relation_oid"] for entry in handoff["stage_relations"])
+        assert tuple(await resources.admin.fetch("SELECT nspname FROM pg_namespace ORDER BY nspname")) == before_schemas
+        assert set(await _canonical_rows(resources)) == set(generation.RELATION_NAMES)
+
+
+async def _record_cancelled_candidate(resources, handoff):
+    preparation_id = str(uuid4())
+    candidate_by_field = {
+        key: handoff[key]
+        for key in (
+            "schema_name",
+            "attempt_id",
+            "attempt_started_at",
+            "handoff_sha256",
+            "source_contract_sha256",
+            "stage_relations",
+            "indexes",
+        )
+    }
+    abandonment_by_field = {
+        "contract": "entity-address-unpublished-abandonment.v2",
+        "preparation_id": preparation_id,
+        "admission_sha256": "a" * 64,
+        "generation_id": str(uuid4()),
+        "publication_fence": str(uuid4()),
+        "reason": "terminal-cancellation",
+        "stage_disposition": "retained-unpublished",
+        "physical_cleanup_completed": False,
+        "same_run_readmission": "requires-exact-candidate-cleanup-and-ledger-retirement",
+        "observed_run": {
+            "run_id": handoff["run_id"],
+            "node_id": "synthetic-node",
+            "status": "cancelled",
+            "progress": {key: handoff[key] for key in ("attempt_id", "attempt_started_at")},
+            "handoff_sha256": handoff["handoff_sha256"],
+            "phase_detail": publication.HANDOFF_PHASE,
+            "finished_at": "2026-01-02T03:05:00Z",
+        },
+        "candidate": candidate_by_field,
+        "released_pins": [],
+    }
+    await resources.admin.execute(
+        "UPDATE mrf.import_run SET engine='healthcare-mrf-api',status='cancelled',finished_at=clock_timestamp(),"
+        "metrics=(metrics::jsonb||jsonb_build_object('address_native_abandonments',$1::jsonb))::json WHERE run_id=$2",
+        json.dumps({preparation_id: abandonment_by_field}),
+        handoff["run_id"],
+    )
+    return abandonment_by_field
+
+
+async def _native_candidate_cleanup(resources, handoff, abandonment):
+    async def unreferenced(session, supplied_handoff, supplied_abandonment):
+        assert supplied_handoff == handoff and supplied_abandonment == abandonment
+        return await session.scalar(
+            text("SELECT NOT EXISTS(SELECT 1 FROM mrf.native_cleanup_reference WHERE relation_name=ANY(:names))"),
+            {"names": [entry["stage_name"] for entry in handoff["stage_relations"]]},
+        )
+
+    async with resources.publisher.session_factory() as session, session.begin():
+        return await publication.cleanup_entity_address_native_handoff(
+            session,
+            handoff,
+            abandonment=abandonment,
+            assert_unreferenced=unreferenced,
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_cancelled_candidate_cleanup_preserves_serving_data(monkeypatch):
+    async with _publication_database(monkeypatch) as resources:
+        before = await _canonical_rows(resources)
+        context = _attempt_context()
+        await _create_attempt_stage(context)
+        handoff = await _handoff(context)
+        abandonment = await _record_cancelled_candidate(resources, handoff)
+        candidate = handoff["stage_relations"][0]["stage_name"]
+        await resources.admin.execute("CREATE TABLE mrf.native_cleanup_reference (relation_name text PRIMARY KEY)")
+        await resources.admin.execute(
+            f'GRANT SELECT ON mrf.native_cleanup_reference TO "{resources.roles["publisher"]}"'
+        )
+        await resources.admin.execute("INSERT INTO mrf.native_cleanup_reference VALUES ($1)", candidate)
+        with pytest.raises(RuntimeError, match="remains referenced"):
+            await _native_candidate_cleanup(resources, handoff, abandonment)
+        await resources.admin.execute("DELETE FROM mrf.native_cleanup_reference WHERE relation_name=$1", candidate)
+        await resources.admin.execute(f'CREATE VIEW mrf.native_cleanup_dependency AS SELECT * FROM mrf."{candidate}"')
+        with pytest.raises(DBAPIError) as caught:
+            await _native_candidate_cleanup(resources, handoff, abandonment)
+        assert caught.value.orig.sqlstate == "2BP01"
+        for entry in handoff["stage_relations"]:
+            assert await resources.admin.fetchval("SELECT to_regclass($1) IS NOT NULL", f'mrf."{entry["stage_name"]}"')
+        assert await _canonical_rows(resources) == before
+        await resources.admin.execute("DROP VIEW mrf.native_cleanup_dependency")
+        cleanup_receipt = await _native_candidate_cleanup(resources, handoff, abandonment)
+        assert (
+            cleanup_receipt["physical_cleanup_completed"] is True
+            and cleanup_receipt["contract"] == publication.CLEANUP_CONTRACT
+        )
+        for entry in handoff["stage_relations"]:
+            assert await resources.admin.fetchval("SELECT to_regclass($1)", f'mrf."{entry["stage_name"]}"') is None
+        assert await _canonical_rows(resources) == before
+        assert await resources.admin.fetchval("SELECT local_generation FROM mrf.entity_address_result_generation") == 0

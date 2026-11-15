@@ -104,11 +104,28 @@ async def _providers(db, monkeypatch):
         await session.execute(
             text("UPDATE mrf.entity_address_unified SET geo_evidence_source_id=CASE WHEN assured THEN 1 ELSE 0 END")
         )
+        await _seed_address_source_evidence(session)
         await session.execute(
             text(
                 f'GRANT SELECT ON mrf.entity_address_unified,mrf.npi,mrf.npi_taxonomy,mrf.geo_zip_lookup TO "{db.reader}"'
             )
         )
+
+
+async def _seed_address_source_evidence(session):
+    """Support every positive fixture row with genuine dated NPPES evidence."""
+    await session.execute(
+        text("""UPDATE mrf.entity_address_unified
+        SET address_key=md5(npi::text||':'||coalesce(zip5,postal_code))::uuid,address_source_mask=1
+        WHERE assured""")
+    )
+    await session.execute(
+        text("""INSERT INTO mrf.npi_address(npi,address_key,date_added)
+        SELECT DISTINCT addr.npi,addr.address_key,DATE '2026-01-01'
+        FROM mrf.entity_address_unified addr WHERE addr.assured
+        AND NOT EXISTS(SELECT 1 FROM mrf.npi_address source
+          WHERE source.npi=addr.npi AND source.address_key=addr.address_key)""")
+    )
 
 
 def _scoped_inputs(monkeypatch, identity, *, drift=False):
@@ -443,8 +460,9 @@ async def _dense_raw_address_oracle(session):
     )
     await session.execute(
         text("""INSERT INTO mrf.npi_address
-        VALUES(1000000002,md5('stored-zero')::uuid,'2026-01-01')""")
+        VALUES(1000000002,md5('stored-zero')::uuid,NULL)""")
     )
+    await _seed_address_source_evidence(session)
     return await _assured_membership_rows(session)
 
 

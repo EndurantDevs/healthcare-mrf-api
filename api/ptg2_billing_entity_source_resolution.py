@@ -10,7 +10,6 @@ from typing import Any
 
 from sqlalchemy import text
 
-from api.network_read_execution import execute_network_read
 from api.ptg2_billing_associations import _normalized_provider_group_refs
 from api.ptg2_billing_entity_group_resolution import (
     _resolve_billing_entity_ref_tin_key,
@@ -380,8 +379,7 @@ async def resolve_billing_entity_ref_source_scope(
         snapshot_key=snapshot_key,
         billing_entity_ref=billing_entity_ref,
     )
-    geometry_result = await execute_network_read(
-        session,
+    geometry_result = await session.execute(
         _source_geometry_query(schema_name),
         {
             "snapshot_key": snapshot_key,
@@ -395,8 +393,7 @@ async def resolve_billing_entity_ref_source_scope(
     )
     if tin_key is None:
         return None
-    witness_result = await execute_network_read(
-        session,
+    witness_result = await session.execute(
         _source_witness_query(schema_name),
         {
             "snapshot_key": snapshot_key,

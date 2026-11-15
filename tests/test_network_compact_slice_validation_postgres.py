@@ -17,10 +17,10 @@ from tests.test_network_membership_slices_postgres import _candidate, _pin, _pre
 
 async def _layout(db, target, receipt, artifacts=None):
     oid = await db.connection.fetchval("SELECT to_regclass($1)::oid", db.source_schema + ".retained_addresses")
-    own = CompactEdgeArtifact(target.candidate_id, target.schema_name, receipt.edge_heap_oid)
+    own = CompactEdgeArtifact(target.candidate_id, target.schema_name)
     return CompactNetworkLayout(
-        CompactAddressRelation(target.schema_name, "network_slice_ref", receipt.ref_map_oid),
-        CompactAddressRelation(db.source_schema, "retained_addresses", oid),
+        CompactAddressRelation(target.schema_name, "network_slice_ref"),
+        CompactAddressRelation(db.source_schema, "retained_addresses"),
         (own,) if artifacts is None else tuple(sorted(artifacts, key=lambda artifact: artifact.candidate_id)),
     )
 
@@ -67,8 +67,8 @@ async def test_reused_slice_metadata_must_match_its_sealed_origin(slice_db):
             second,
             receipt,
             (
-                CompactEdgeArtifact(first.candidate_id, first.schema_name, first_receipt.edge_heap_oid),
-                CompactEdgeArtifact(second.candidate_id, second.schema_name, receipt.edge_heap_oid),
+                CompactEdgeArtifact(first.candidate_id, first.schema_name),
+                CompactEdgeArtifact(second.candidate_id, second.schema_name),
             ),
         )
         await verify_compact_slice_contents(db.connection, second, layout)
@@ -131,11 +131,11 @@ async def test_indexed_compact_set_parity_keeps_aliases_evidence_and_selected_re
         async with db.connection.transaction():
             first_receipt = await _prepare(db, first)
         prior = _pin(first, first_receipt)
-        artifacts.append(CompactEdgeArtifact(first.candidate_id, first.schema_name, first_receipt.edge_heap_oid))
+        artifacts.append(CompactEdgeArtifact(first.candidate_id, first.schema_name))
     copy_target = await _set_candidate(db, pairs + ([(21, 3)] if reuse else []))
     async with db.connection.transaction():
         receipt = await _prepare(db, copy_target, previous=prior)
-        artifacts.append(CompactEdgeArtifact(copy_target.candidate_id, copy_target.schema_name, receipt.edge_heap_oid))
+        artifacts.append(CompactEdgeArtifact(copy_target.candidate_id, copy_target.schema_name))
         layout = await _layout(db, copy_target, receipt, artifacts)
         await verify_compact_slice_contents(db.connection, copy_target, layout)
     namespace = '"' + copy_target.schema_name + '"'
@@ -229,11 +229,11 @@ async def test_independent_work_requires_exact_reference_tails(slice_db, reuse):
         async with db.connection.transaction():
             first_receipt = await _prepare(db, first)
         prior = _pin(first, first_receipt)
-        artifacts.append(CompactEdgeArtifact(first.candidate_id, first.schema_name, first_receipt.edge_heap_oid))
+        artifacts.append(CompactEdgeArtifact(first.candidate_id, first.schema_name))
     copy_target = await _set_candidate(db, [(network, 0) for network in range(1, 302)] + [(42, 0), (42, 1)])
     async with db.connection.transaction():
         receipt = await _prepare(db, copy_target, previous=prior)
-        artifacts.append(CompactEdgeArtifact(copy_target.candidate_id, copy_target.schema_name, receipt.edge_heap_oid))
+        artifacts.append(CompactEdgeArtifact(copy_target.candidate_id, copy_target.schema_name))
         layout = await _layout(db, copy_target, receipt, artifacts)
         await verify_compact_slice_contents(db.connection, copy_target, layout)
         await verify_digests(db.connection, copy_target)

@@ -68,15 +68,14 @@ async def test_delta_receipt_replay_edges(monkeypatch):
     )
     assert await importer._is_profile_delta_receipt_replay(delta, "receipt")
 
+
 @pytest.mark.asyncio
 async def test_profile_adoption_input_edges(monkeypatch):
     with pytest.raises(RuntimeError, match="adoption_as_of_ambiguous"):
         importer._profile_adoption_as_of({})
     with pytest.raises(RuntimeError, match="adoption_as_of_ambiguous"):
         importer._profile_adoption_as_of({"profile_as_of": "2026-7-3"})
-    assert importer._profile_adoption_as_of(
-        {"profile_as_of": "2026-07-30"}
-    ) == "2026-07-30"
+    assert importer._profile_adoption_as_of({"profile_as_of": "2026-07-30"}) == "2026-07-30"
 
     monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
     with pytest.raises(RuntimeError, match="adoption_missing"):
@@ -105,6 +104,7 @@ async def test_profile_adoption_input_edges(monkeypatch):
             {},
             generation_id="pdprofile_" + "1" * 32,
         )
+
 
 @pytest.mark.asyncio
 async def test_profile_adoption_vector_edges(monkeypatch):
@@ -150,15 +150,13 @@ async def test_profile_adoption_vector_edges(monkeypatch):
             )
         ),
     )
-    source_vector, context_vector = (
-        await importer._profile_adoption_vectors(
-            "mrf",
-            invalid_digest_by_field
-            | {"source_context_digest": "a" * 64},
-        )
+    source_vector, context_vector = await importer._profile_adoption_vectors(
+        "mrf",
+        invalid_digest_by_field | {"source_context_digest": "a" * 64},
     )
     assert source_vector == (("source-a", "dataset-a"),)
     assert context_vector[0][0] == "source-a"
+
 
 def test_profile_adoption_row_count_edges():
     with pytest.raises(RuntimeError, match="adoption_invalid"):
@@ -190,8 +188,7 @@ def _adoption_candidate():
         source_vector=(("source-a", "dataset-a"),),
         source_context_vector=(("source-a", "a" * 64),),
         profile_as_of="2026-07-30",
-        profile_target_oid=12,
-        evidence_target_oid=11,
+        targets=importer._provider_directory_profile_target_coordinates("mrf"),
         profile_rows=1,
         evidence_rows=1,
         published_at="2026-07-30T00:00:00Z",
@@ -216,20 +213,13 @@ def _adoption_serving(candidate):
         profile_schema_version=1,
         profile_strategy_version=profile.PROFILE_BUILD_STRATEGY_VERSION,
         source_vector=candidate.source_vector,
-        source_vector_hash=(
-            importer._provider_directory_profile_source_vector_hash(
-                candidate.source_vector
-            )
-        ),
+        source_vector_hash=(importer._provider_directory_profile_source_vector_hash(candidate.source_vector)),
         source_context_vector=candidate.source_context_vector,
         source_context_vector_hash=(
-            importer._provider_directory_profile_source_context_vector_hash(
-                candidate.source_context_vector
-            )
+            importer._provider_directory_profile_source_context_vector_hash(candidate.source_context_vector)
         ),
         executable_plan_hash=candidate.executable_plan_hash,
-        evidence_target_oid=candidate.evidence_target_oid,
-        profile_target_oid=candidate.profile_target_oid,
+        targets=candidate.targets,
         evidence_rows=1,
         profile_rows=1,
         profile_as_of=candidate.profile_as_of,
@@ -240,20 +230,27 @@ def _adoption_serving(candidate):
 def test_profile_adoption_matching_serving_edge():
     candidate = _adoption_candidate()
     serving = _adoption_serving(candidate)
-    assert importer._validate_profile_adoption_serving(
-        serving,
-        candidate,
-    ) == serving
+    assert (
+        importer._validate_profile_adoption_serving(
+            serving,
+            candidate,
+        )
+        == serving
+    )
+
 
 @pytest.mark.asyncio
 async def test_toast_projection_identity_edges(monkeypatch):
-    assert await importer._provider_directory_profile_toast_chunk_count(
-        source_sql="SELECT 1",
-        relation_oid=1,
-        toast_oid=None,
-        toastable_columns=(),
-        expected_compression="pglz",
-    ) == 0
+    assert (
+        await importer._provider_directory_profile_toast_chunk_count(
+            source_sql="SELECT 1",
+            relation_oid=1,
+            toast_oid=None,
+            toastable_columns=(),
+            expected_compression="pglz",
+        )
+        == 0
+    )
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
         match="toast_identity_invalid",
@@ -411,6 +408,7 @@ async def test_cutover_forecast_status_and_cas_edges(monkeypatch):
             delta,
             forecast,
         )
+
 
 @pytest.mark.asyncio
 async def test_resource_npi_candidate_edges(monkeypatch):

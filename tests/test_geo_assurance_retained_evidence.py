@@ -54,8 +54,11 @@ def test_retained_dependencies_do_not_require_moving_the_unified_anchor():
 @pytest.mark.parametrize(
     "defect", ["missing", "extra", "duplicate_oid", "duplicate_relation", "identifier", "bool_oid"]
 )
-def test_retained_evidence_refuses_incomplete_or_unsafe_dependencies(defect):
+def test_retained_evidence_checks_names_and_preserves_opaque_legacy_tokens(defect):
     bindings = _bindings()
+    expected_sql = projection.legacy_evidence_source_id_sql(
+        "office", schema_name="mrf", dependency_bindings=bindings, unified_schema_name="held_offices"
+    )
     if defect == "missing":
         del bindings["tiger.zip_state"]
     if defect == "extra":
@@ -68,10 +71,20 @@ def test_retained_evidence_refuses_incomplete_or_unsafe_dependencies(defect):
         bindings["mrf.npi_address"]["schema_name"] = 'held"; SELECT 1; --'
     if defect == "bool_oid":
         bindings["mrf.npi_address"]["relation_oid"] = True
-    with pytest.raises(ValueError):
-        projection.legacy_evidence_source_id_sql(
-            "office", schema_name="mrf", dependency_bindings=bindings, unified_schema_name="held_offices"
+    original = copy.deepcopy(bindings)
+    if defect in {"duplicate_oid", "bool_oid"}:
+        assert (
+            projection.legacy_evidence_source_id_sql(
+                "office", schema_name="mrf", dependency_bindings=bindings, unified_schema_name="held_offices"
+            )
+            == expected_sql
         )
+        assert bindings == original
+    else:
+        with pytest.raises(ValueError):
+            projection.legacy_evidence_source_id_sql(
+                "office", schema_name="mrf", dependency_bindings=bindings, unified_schema_name="held_offices"
+            )
 
 
 @pytest.mark.parametrize("field", ["unified_schema_name", "unified_table_name"])

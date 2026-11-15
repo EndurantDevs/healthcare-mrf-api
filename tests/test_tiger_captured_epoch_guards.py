@@ -17,20 +17,16 @@ from process import tiger_captured_epoch as captured
 def _graph_rows():
     return [
         {
-            "relation_oid": oid,
             "schema_name": "tiger" if parent is None else "tiger_data",
             "table_name": name,
-            "owner_oid": 20,
-            "relfilenode": oid + 1000,
             "relkind": "r",
             "relpersistence": "p",
             "relispartition": False,
             "relrowsecurity": False,
             "relforcerowsecurity": False,
-            "writer_fenced": True,
             "attributes": [[1, "value", 25, -1, False, 100, False, "", ""]],
-            "parents": [] if parent is None else [parent],
-            "extensions": ["postgis_tiger_geocoder:3.6.1"] if parent is None else [],
+            "parents": [] if parent is None else [["tiger", "zip_state" if parent == 101 else "zcta5"]],
+            "extensions": ["postgis_tiger_geocoder"] if parent is None else [],
         }
         for oid, name, parent in (
             (101, "zip_state", None),
@@ -103,8 +99,7 @@ def test_captured_origin_normalizes_uuid_without_inventing_generation():
         ("relispartition", True),
         ("relrowsecurity", True),
         ("relforcerowsecurity", True),
-        ("writer_fenced", False),
-        ("parents", [999]),
+        ("parents", [["elsewhere", "missing"]]),
     ),
 )
 async def test_graph_refuses_unfenced_or_external_child(field, value):
@@ -113,7 +108,7 @@ async def test_graph_refuses_unfenced_or_external_child(field, value):
     session = _session(rows)
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="closed persistent heap family"):
         await captured.read_locked_tiger_graph(session)
-    session.scalar.assert_not_awaited()
+    assert all(str(call.args[0]).startswith("SHOW ") for call in session.scalar.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -131,47 +126,35 @@ async def test_graph_requires_both_genuine_roots(change):
 
 
 @pytest.mark.asyncio
-async def test_graph_retains_nested_edges_and_actual_physical_identity():
+async def test_graph_retains_nested_qualified_edges():
     rows = _graph_rows()
     descendant = deepcopy(rows[-1])
-    descendant.update(relation_oid=105, parents=[104], relfilenode=1105, table_name="nested_synthetic")
+    descendant.update(parents=[["tiger_data", "zcta5_synthetic"]], table_name="nested_synthetic")
     rows.append(descendant)
     graph = await captured.read_locked_tiger_graph(_session(rows))
-    assert graph == {"contract": captured.GRAPH_CONTRACT, "database_oid": 77, "relations": rows}
+    assert graph == {"contract": captured.GRAPH_CONTRACT, "relations": rows}
     assert graph["relations"][-1] is not descendant
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("protected_index", (None, 0, 2))
-async def test_empty_or_mixed_protected_graph_uses_strict_target_admission(protected_index):
-    rows = _graph_rows()
-    if protected_index is None:
-        rows = rows[:2]
-    else:
-        rows[protected_index]["owner_oid"] = 90
+@pytest.mark.parametrize("empty", (False, True))
+async def test_source_admission_uses_native_recursive_lock_and_complete_graph(empty):
+    rows = _graph_rows()[:2] if empty else _graph_rows()
     session = _session(rows)
-    assert await captured.has_attested_inherited_tiger_source_capture(session, owner_oid=90) is False
-    assert not any("has_table_privilege" in str(call.args[0]) for call in session.scalar.await_args_list)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("capable", (True, False, None))
-async def test_source_admission_requires_effective_read_and_maintain_without_row_writes(capable):
-    session = _session(_graph_rows(), capable=capable)
-    if capable is True:
-        assert await captured.has_attested_inherited_tiger_source_capture(session, owner_oid=90) is True
-    else:
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="fence privilege"):
-            await captured.has_attested_inherited_tiger_source_capture(session, owner_oid=90)
+    assert await captured.has_attested_inherited_tiger_source_capture(session, owner_oid=90) is not empty
     statements = [str(call.args[0]) for call in session.execute.await_args_list]
     assert statements.index('LOCK TABLE "tiger"."zip_state", "tiger"."zcta5" IN SHARE MODE') < statements.index(
         captured._GRAPH_SQL
     )
-    privilege = session.scalar.await_args_list[-1]
-    assert privilege.args[1] == {"oids": [101, 102]}
-    assert "'MAINTAIN'" in str(privilege.args[0])
-    assert "NOT has_table_privilege(current_user,oid,'INSERT,UPDATE,DELETE,TRUNCATE')" in str(privilege.args[0])
-    assert "NOT has_any_column_privilege(current_user,oid,'INSERT,UPDATE')" in str(privilege.args[0])
+    assert not any("pg_has_role" in statement or "aclexplode" in statement for statement in statements)
+
+
+@pytest.mark.asyncio
+async def test_native_source_lock_denial_propagates_before_capture():
+    session = _session(_graph_rows())
+    session.execute.side_effect = PermissionError("native LOCK denied")
+    with pytest.raises(PermissionError, match="native LOCK"):
+        await captured.has_attested_inherited_tiger_source_capture(session)
 
 
 @pytest.mark.asyncio
@@ -180,7 +163,7 @@ async def test_source_admission_requires_caller_transaction_before_catalog_reads
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="caller transaction"):
         await captured.has_attested_inherited_tiger_source_capture(session, owner_oid=90)
     session.execute.assert_not_awaited()
-    session.scalar.assert_not_awaited()
+    assert all(str(call.args[0]).startswith("SHOW ") for call in session.scalar.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -240,40 +223,29 @@ async def test_preparation_holds_recursive_share_until_publisher_clone_returns(m
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field,value", (("host", "other"), ("port", 5433), ("database", "other")))
-async def test_clone_refuses_cross_database_identity_before_creating_objects(monkeypatch, field, value):
-    source_url = make_url("postgresql+asyncpg://reader@localhost:5432/synthetic")
+async def test_clone_preserves_native_snapshot_or_read_denial_without_url_identity_checks(monkeypatch):
     session = _session([])
-    session.get_bind = lambda: SimpleNamespace(url=source_url.set(**{field: value}))
 
     @asynccontextmanager
     async def transaction():
         yield session
 
     session.begin = transaction
-    create = AsyncMock()
+    create = AsyncMock(side_effect=PermissionError("native source SELECT denied"))
     monkeypatch.setattr(archive, "_clone_source", create)
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="databases differ"):
-        await captured._clone_captured_model(
-            transaction, object(), UUID("550e8400-e29b-41d4-a716-446655440000"), {}, AsyncMock(), source_url=source_url
-        )
-    create.assert_not_awaited()
+    with pytest.raises(PermissionError, match="native source SELECT"):
+        await captured._clone_captured_model(transaction, object(), UUID(int=1), {}, AsyncMock(), source_url=object())
+    create.assert_awaited_once()
 
 
 def _snapshot_rows(*, pinned=True):
-    rows = deepcopy(_graph_rows())
-    for row in rows:
-        row["read_pinned"] = pinned
-        del row["writer_fenced"]
-    return rows
+    return deepcopy(_graph_rows())
 
 
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("read_pinned", False),
-        ("parents", [999]),
-        ("relfilenode", 0),
+        ("parents", [["elsewhere", "missing"]]),
         ("relkind", "p"),
         ("relpersistence", "u"),
         ("relispartition", True),
@@ -283,47 +255,55 @@ def _snapshot_rows(*, pinned=True):
 def test_readonly_snapshot_graph_refuses_missing_pins_or_identity(field, value):
     rows = _snapshot_rows()
     rows[-1][field] = value
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="snapshot"):
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="TIGER"):
         captured._snapshot_graph(rows, pinned=True)
 
 
 def test_snapshot_projection_freezes_each_physical_heap_once():
     rows = _snapshot_rows()
-    by_oid, projection = captured._snapshot_graph(rows, pinned=True)
-    assert set(by_oid) == {101, 102, 103, 104}
+    by_name, projection = captured._snapshot_graph(rows, pinned=True)
+    assert set(by_name) == {
+        ("tiger", "zip_state"),
+        ("tiger", "zcta5"),
+        ("tiger_data", "zip_state_synthetic"),
+        ("tiger_data", "zcta5_synthetic"),
+    }
     assert projection == (
-        ("zip_state", (("tiger", "zip_state", 101, 1101), ("tiger_data", "zip_state_synthetic", 103, 1103))),
-        ("zcta5", (("tiger", "zcta5", 102, 1102), ("tiger_data", "zcta5_synthetic", 104, 1104))),
+        ("zip_state", (("tiger", "zip_state"), ("tiger_data", "zip_state_synthetic"))),
+        ("zcta5", (("tiger", "zcta5"), ("tiger_data", "zcta5_synthetic"))),
     )
-    rows[-1]["parents"] = [101, 102]
+    rows[-1]["parents"] = [["tiger", "zip_state"], ["tiger", "zcta5"]]
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="ambiguous"):
         captured._snapshot_graph(rows, pinned=True)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", [None, "file", "name", "owner", "extra", "privilege"])
+@pytest.mark.parametrize("fault", [None, "columns", "name", "extra", "permission"])
 async def test_snapshot_locks_every_heap_before_first_snapshot_query(fault):
     discovered = _snapshot_rows(pinned=False)
     observed = _snapshot_rows()
-    if fault == "file":
-        observed[-1]["relfilenode"] += 1
+    if fault == "columns":
+        observed[-1]["attributes"] = [["changed"]]
     elif fault == "name":
         observed[-1]["table_name"] += "_changed"
-    elif fault == "owner":
-        observed[-1]["owner_oid"] += 1
     elif fault == "extra":
         extra = deepcopy(observed[-1])
-        extra.update(relation_oid=105, relfilenode=1105, table_name="extra")
+        extra.update(table_name="extra")
         observed.append(extra)
-    session = _session(observed, capable=fault != "privilege")
+    session = _session(observed)
+    if fault == "permission":
+        session.execute.side_effect = PermissionError("native ACCESS SHARE denied")
     if fault is None:
         graph, projection = await captured._pin_snapshot_graph(session, discovered)
         assert graph["contract"] == captured.SNAPSHOT_GRAPH_CONTRACT
-        assert graph["database_oid"] == 77
-        assert graph["projection_oids"] == {"zip_state": [101, 103], "zcta5": [102, 104]}
+        assert graph["projection"]["zip_state"] == [["tiger", "zip_state"], ["tiger_data", "zip_state_synthetic"]]
         assert len(projection) == 2
+    elif fault == "permission":
+        with pytest.raises(PermissionError, match="ACCESS SHARE"):
+            await captured._pin_snapshot_graph(session, discovered)
+        return
     else:
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="snapshot"):
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="TIGER"):
             await captured._pin_snapshot_graph(session, discovered)
     statements = [str(call.args[0]) for call in session.execute.await_args_list]
     assert statements[:4] == [
@@ -411,24 +391,10 @@ async def test_snapshot_capture_keeps_both_transactions_and_forwards_trusted_cre
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state", ["eligible", "empty", "protected", "missing_privilege"])
-async def test_snapshot_capability_is_only_preflight_and_preserves_target_admission(state):
-    rows = _snapshot_rows(pinned=False)
-    if state == "empty":
-        rows = rows[:2]
-    elif state == "protected":
-        rows[-1]["owner_oid"] = 90
-    session = _session(rows, capable=state != "missing_privilege")
-    if state == "missing_privilege":
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="capability"):
-            await captured.can_prepare_snapshot_tiger_epoch(session, owner_oid=90)
-    else:
-        assert await captured.can_prepare_snapshot_tiger_epoch(session, owner_oid=90) is (state == "eligible")
+@pytest.mark.parametrize("empty", [True, False])
+async def test_snapshot_preflight_only_checks_bounded_graph_shape(empty):
+    rows = _snapshot_rows()[:2] if empty else _snapshot_rows()
+    session = _session(rows)
+    assert await captured.can_prepare_snapshot_tiger_epoch(session) is not empty
     assert not any("LOCK TABLE" in str(call.args[0]) for call in session.execute.await_args_list)
-    for call in session.scalar.await_args_list:
-        assert "MAINTAIN" not in str(call.args[0])
-    if state == "eligible":
-        query = str(session.scalar.await_args_list[-1].args[0])
-        assert "has_schema_privilege" in query and "NOT pg_has_role" in query
-        assert "NOT has_any_column_privilege" in query
-        assert session.scalar.await_args_list[-1].args[1] == {"oids": [101, 102, 103, 104]}
+    assert all(str(call.args[0]).startswith("SHOW ") for call in session.scalar.await_args_list)

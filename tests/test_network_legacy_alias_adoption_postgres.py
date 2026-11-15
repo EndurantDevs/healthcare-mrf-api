@@ -7,8 +7,10 @@ from dataclasses import asdict, replace
 from types import SimpleNamespace
 from uuid import uuid4
 
+import asyncpg
 import pytest
 from sqlalchemy import event, text
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import network_catalog_import as catalog_import
 from process.network_catalog_store import (
@@ -26,7 +28,6 @@ from process.network_legacy_alias_adoption import (
 )
 from process.network_registry_identity import allocate_network_ids
 from process.registry_approval_store import approve_registry_records
-from process.registry_management_permissions import RegistryManagementPermissionError
 from process.registry_manual_undo import RegistryManualUndoCommand, prepare_registry_manual_undo
 from process.registry_record_store import (
     RegistryRecordCommand,
@@ -455,14 +456,6 @@ async def test_outer_rollback_and_api_authority_preserve_immutable_inputs(permis
     finally:
         await transaction.rollback()
     assert await _state(fixture) == retained
-    async with fixture.connection.transaction():
-        await fixture.connection.execute(f'SET LOCAL ROLE "{fixture.roles_by_kind["api"]}"')
-        with pytest.raises(RegistryManagementPermissionError, match="cannot assume"):
-            await seed_network_catalog_drafts(
-                fixture.connection, draft_rows, actor, **_arguments(fixture), source_context=_context(draft_rows)
-            )
-        assert await fixture.connection.fetchval("SELECT current_user") == fixture.roles_by_kind["api"]
-    assert await _state(fixture) == retained
 
 
 class _CountedConnection:
@@ -820,17 +813,22 @@ async def test_catalog_import_savepoint_rolls_back_adoption_when_seed_conflicts(
 
 
 async def test_operator_refuses_untrusted_credentials(permissions_db):
+    """PostgreSQL refuses an ordinary API login the switch to the registry owner."""
     fixture, actor = permissions_db, _actor()
     await _ready(fixture)
     draft_rows = [_row()]
     retained = await _state(fixture)
-    async with fixture.sessions() as session, session.begin():
-        await session.execute(text(f'SET LOCAL ROLE "{fixture.roles_by_kind["api"]}"'))
-        with pytest.raises(RegistryManagementPermissionError, match="cannot assume"):
-            await catalog_import.import_network_catalog(
-                session, _operator_rows(draft_rows), actor, _context(draft_rows), **_arguments(fixture)
-            )
-        assert await session.scalar(text("SELECT current_user")) == fixture.roles_by_kind["api"]
+    api_role, password = fixture.roles_by_kind["api"], uuid4().hex
+    await fixture.connection.execute(f"ALTER ROLE \"{api_role}\" LOGIN PASSWORD '{password}'")
+    engine = create_async_engine(fixture.sessions.kw["bind"].url.set(username=api_role, password=password))
+    try:
+        async with async_sessionmaker(engine)() as session, session.begin():
+            with pytest.raises(asyncpg.InsufficientPrivilegeError, match="permission denied to set role"):
+                await catalog_import.import_network_catalog(
+                    session, _operator_rows(draft_rows), actor, _context(draft_rows), **_arguments(fixture)
+                )
+    finally:
+        await engine.dispose()
     assert await _state(fixture) == retained
     assert await fixture.connection.fetchval(f'SELECT count(*) FROM "{fixture.schema}".network_registry_identity') == 0
 

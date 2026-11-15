@@ -138,7 +138,7 @@ async def test_registered_snapshot_uses_real_reader_and_closes_transaction(monke
         assert transaction_state.is_active
         sql = str(statement)
         statements.append(sql)
-        if "pg_current_snapshot()" in sql:
+        if "transaction_timestamp() AS observed_at" in sql:
             if outcome == "backend_failure":
                 raise RuntimeError("synthetic catalog detail")
             if outcome == "timeout":
@@ -155,6 +155,7 @@ async def test_registered_snapshot_uses_real_reader_and_closes_transaction(monke
         finally:
             transaction_state.is_active = False
 
+    monkeypatch.setattr(directory_importer, "_schema", lambda: "fixture")
     monkeypatch.setattr(directory_importer.db, "_transaction_binding", lambda: None)
     monkeypatch.setattr(directory_importer.db, "transaction", transaction)
     app = _app(monkeypatch)

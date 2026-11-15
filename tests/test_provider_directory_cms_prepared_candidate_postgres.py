@@ -15,7 +15,6 @@ from sqlalchemy.schema import CreateColumn
 from db import models
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_cms_prepared_candidate as candidate
-from process import provider_directory_cms_prepared_context as context
 from process import provider_directory_generic_source_policy as source
 from process import provider_directory_generic_source_storage as storage
 from process.provider_directory_admission_seal import admission_seal_from_validated_metadata
@@ -104,13 +103,6 @@ async def _complete_frozen_header(case):
                 f"ALTER TABLE {relation} ALTER COLUMN {storage_identifier(column.name)} SET NOT NULL"
             )
     case.handoff = FHIRSourceCandidateHandoff(storage._encoded(document))
-    native_rows = await case.admin.fetch(
-        context._INVENTORY_SQL, [native_row["relation_oid"] for native_row in case.inventory["relations"]]
-    )
-    case.inventory["relations"] = [
-        {key: column_value for key, column_value in dict(native_row).items() if key != "supported"}
-        for native_row in native_rows
-    ]
     return relation
 
 
@@ -373,37 +365,29 @@ async def test_native_retained_candidate_preserves_rich_evidence_and_detects_min
             assert changed["descriptor"] == descriptor and changed["identities"] != rich["identities"]
 
 
-async def test_native_same_transaction_allocation_refuses_then_committed_record_adopts(unallocated_candidate_case):
+async def test_native_same_transaction_allocation_finishes_atomically(unallocated_candidate_case):
     case = unallocated_candidate_case
     async with publisher(case) as (session, driver), observe(case, session, driver) as inputs:
         async with prepare_outputs(case, session, driver, inputs) as (workspace, _):
             case.workspace_binding = workspace.binding
             case.allocation = await allocate_prepared_cms_candidate(workspace, case.handoff)
-            before = await canonical_snapshot(case, driver)
-            with pytest.raises(ValueError, match="allocation_not_committed"):
-                await candidate.finish_prepared_cms_candidate(workspace, case.handoff, allocation=case.allocation)
-            assert await canonical_snapshot(case, driver) == before
-            assert not any((await target_counts(driver, case)).values())
-    async with publisher(case) as (session, driver), observe(case, session, driver) as inputs:
-        async with prepare(case, session, driver, inputs) as (workspace, _):
-            assert (await candidate.finish_prepared_cms_candidate(workspace, case.handoff, allocation=case.allocation))[
-                "status"
-            ] == "ready"
+            descriptor = await candidate.finish_prepared_cms_candidate(
+                workspace, case.handoff, allocation=case.allocation
+            )
+            assert descriptor["status"] == "ready"
+            assert await candidate.read_prepared_cms_candidate(workspace, case.handoff)
+            assert any((await target_counts(driver, case)).values())
 
 
-@pytest.mark.parametrize("drift", ["header", "same_values", "acl", "record"])
+@pytest.mark.parametrize("drift", ["header", "name", "record"])
 async def test_native_allocation_drift_refuses_before_copy(candidate_case, drift):
     case = candidate_case
     allocation = deepcopy(case.allocation)
     if drift == "header":
         header = storage_relation(case.storage.catalog_schema, storage.HEADER)
         await case.admin.execute(f"UPDATE {header} SET created_at=created_at+interval '1 second' WHERE NOT is_current")
-    elif drift == "same_values":
-        header = storage_relation(case.storage.catalog_schema, storage.HEADER)
-        await case.admin.execute(f"UPDATE {header} SET created_at=created_at WHERE NOT is_current")
-    elif drift == "acl":
-        target = storage_relation(case.storage.catalog_schema, storage.RESOURCE)
-        await case.admin.execute(f"GRANT SELECT ON {target} TO PUBLIC")
+    elif drift == "name":
+        allocation["inventory"][0]["name"] = "another_target"
     else:
         allocation["workspace"]["admission_sha256"] = "0" * 64
     before = await canonical_snapshot(case, case.admin)

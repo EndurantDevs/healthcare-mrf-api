@@ -33,9 +33,7 @@ async def _new_address_context(directory, run_id):
     context_by_field["import_date"] = "pdr" + uuid4().hex[:20]
     for stage in ordinary_preparation.declared_names(native, context_by_field["import_date"]):
         require_output(
-            await directory.db.scalar(
-                "SELECT to_regclass(:relation)::oid::bigint", relation=f"{directory._schema()}.{stage}"
-            )
+            await directory.db.scalar("SELECT to_regclass(:relation)", relation=f"{directory._schema()}.{stage}")
             is None,
             "rest_artifact_replacement_stage_occupied",
         )
@@ -50,14 +48,10 @@ async def _prepare_address(directory, fence, bundle, run_id):
         "rest_artifact_replacement_preparation_required",
     )
     stage, dataset = bundle.stages[0], fence.datasets[0]
-    stage_oid = await directory.db.scalar(
-        "SELECT to_regclass(:relation)::oid::bigint", relation=f"{stage.schema}.{stage.stage_table}"
-    )
     overrides = directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()
     inputs = address_preparation.ProviderDirectoryAddressPreparationInput(
         serving_inputs.desired_pins(admission.recovery["serving_inputs"]),
         stage.stage_table,
-        stage_oid,
         await native._address_alias_generation(directory._schema()),
         tuple((name, overrides[name]) for name in sorted(address_preparation._RELATION_OVERRIDES) if name in overrides),
         ordinary_serving_peer_pins=serving_inputs.peer_pins(admission.recovery["serving_inputs"]),
@@ -80,7 +74,7 @@ async def _prepare_address(directory, fence, bundle, run_id):
             ),
             preparation_input=inputs,
         )
-        owned.keep(prepared.stage_oids)
+        owned.keep(prepared.stage_relations)
         return prepared
 
 

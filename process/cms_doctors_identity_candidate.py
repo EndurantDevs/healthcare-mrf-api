@@ -62,17 +62,12 @@ class DoctorsIdentityCandidate:
     kind: str
     import_date: str
     source_name: str
-    source_oid: int
+    source_schema: str
     generation_id: str
     source_rows: int
     artifact_sha256: str
-    policy_identity: tuple
     table: dict
     count: int
-
-
-def _policy_identity(policy):
-    return (policy.schema, policy.owner_role, policy.publisher_role, policy.runtime_roles, policy.control_runtime_roles)
 
 
 def _source_coordinates(ctx, import_date, schema, receipt):
@@ -90,28 +85,19 @@ def _source_coordinates(ctx, import_date, schema, receipt):
     return stage, artifact
 
 
-async def _source_identity(database, stage, receipt, *, expected_oid=None, require_logged=False):
+async def _source_identity(database, stage, receipt, *, require_logged=False):
     from process.cms_doctors_groups import validate_group_site_stage
     from process.cms_doctors_organizations import _lock_group_stage
-    from process.cms_doctors_preparation import _assert_stage_indexes
+    from process.cms_doctors_preparation import _assert_stage, _assert_stage_indexes
 
-    publisher = bound_publisher()
     session = source_copy_session()
-    oid = await _lock_group_stage(session, stage, expected_oid)
-    await _lock_group_stage(session, stage, oid, identifier_column="adrs_id")
-    owner = await publisher.connection.fetchval(
-        "SELECT c.relowner=(SELECT oid FROM pg_roles WHERE rolname=$2) AND c.relkind='r' "
-        "AND c.relpersistence IN ('p','u') AND (NOT $3 OR c.relpersistence='p') "
-        "AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity FROM pg_class c WHERE c.oid=$1::oid",
-        oid,
-        publisher.policy.owner_role,
-        require_logged,
-    )
-    _require(owner is True, "source_owner_changed")
+    await _lock_group_stage(session, stage)
+    await _lock_group_stage(session, stage, identifier_column="adrs_id")
+    await _assert_stage(session, str(stage.schema), str(stage.name), logged=require_logged)
     import_date = stage.name.removeprefix(CMSDoctorGroupSite.__tablename__ + "_")
     await validate_group_site_stage(import_date, stage.schema, receipt)
     await _assert_stage_indexes(session, stage.schema, make_class(CMSDoctorGroupSite, import_date))
-    return oid
+    return str(stage.schema), str(stage.name)
 
 
 async def require_doctors_identity_roots(database):
@@ -200,7 +186,7 @@ async def prepare_doctors_identity_kind(database, ctx, import_date, schema, rece
     async with source_transaction(database):
         publisher = bound_publisher()
         _require(publisher.policy.schema == schema, "schema_changed")
-        oid = await _source_identity(database, stage, receipt)
+        await _source_identity(database, stage, receipt)
         name = "cmsdi_" + uuid4().hex + "_" + kind
         relation = storage_relation(schema, name)
         await publisher.connection.execute(
@@ -218,15 +204,13 @@ async def prepare_doctors_identity_kind(database, ctx, import_date, schema, rece
             kind,
             import_date,
             str(stage.name),
-            oid,
+            str(stage.schema),
             receipt["generation_id"],
             receipt["source_rows"],
             artifact,
-            _policy_identity(publisher.policy),
             proof,
             count,
         )
-        # Register exact OID custody before the outer transaction can commit.
         context.setdefault(_CONTEXT_KEY, {})[kind] = candidate
         await cancel_check()
     return count
@@ -244,11 +228,11 @@ def _candidates(ctx):
 
 async def _verify_candidate(database, candidate, ctx):
     publisher = bound_publisher()
-    _require(candidate.policy_identity == _policy_identity(publisher.policy), "policy_changed")
+    _require(candidate.source_schema == publisher.policy.schema, "source_schema_changed")
     receipt_by_field = {"source_rows": candidate.source_rows, "generation_id": candidate.generation_id}
     stage, artifact = _source_coordinates(ctx, candidate.import_date, publisher.policy.schema, receipt_by_field)
     _require(stage.name == candidate.source_name and artifact == candidate.artifact_sha256, "source_changed")
-    await _source_identity(database, stage, receipt_by_field, expected_oid=candidate.source_oid, require_logged=True)
+    await _source_identity(database, stage, receipt_by_field, require_logged=True)
     actual = await storage._capture(publisher.connection, publisher.policy, [candidate.table["name"]])
     _require(actual[candidate.table["name"]] == candidate.table, "storage_changed")
     count = await _complete(
@@ -322,7 +306,7 @@ async def discard_doctors_identities(database, ctx):
 
 
 async def _discard_identities(database, ctx):
-    """Drop only exact task-created map OIDs, preserving any replacement."""
+    """Drop private named maps after checking their declared structure."""
     context = ctx.get("context") or {}
     candidates = context.get(_CONTEXT_KEY, {})
     if not candidates:
@@ -333,14 +317,14 @@ async def _discard_identities(database, ctx):
         await publisher.connection.execute("SET LOCAL statement_timeout='5s'")
         for kind, candidate in candidates.items():
             _require(type(candidate) is DoctorsIdentityCandidate and kind == candidate.kind, "candidate_changed")
-            _require(candidate.policy_identity == _policy_identity(publisher.policy), "policy_changed")
+            _require(candidate.source_schema == publisher.policy.schema, "source_schema_changed")
             name = candidate.table["name"]
-            oid = await publisher.connection.fetchval(
-                "SELECT to_regclass($1)::oid::bigint", storage_relation(publisher.policy.schema, name)
+            present = await publisher.connection.fetchval(
+                "SELECT to_regclass($1) IS NOT NULL", storage_relation(publisher.policy.schema, name)
             )
-            if oid is not None:
+            if present is True:
                 await publisher.connection.execute(
-                    f"LOCK TABLE {storage_relation(publisher.policy.schema, name)} IN ACCESS EXCLUSIVE MODE NOWAIT"
+                    f"LOCK TABLE {storage_relation(publisher.policy.schema, name)} IN ACCESS SHARE MODE NOWAIT"
                 )
                 actual = await storage._capture(publisher.connection, publisher.policy, [name])
                 _require(actual[name] == candidate.table, "cleanup_storage_changed")

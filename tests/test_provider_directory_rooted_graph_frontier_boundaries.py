@@ -117,7 +117,7 @@ async def test_empty_defensive_derivation_skips_store_action(monkeypatch) -> Non
         actions.append((args, kwargs))
 
     monkeypatch.setattr(frontier, "_derived_work_specs", lambda *_args: ())
-    monkeypatch.setattr(frontier, "set_store_action", fail_if_called)
+    monkeypatch.setattr(frontier, "admit_work_specs", fail_if_called)
     await frontier.register_rooted_graph_frontier(
         _Database({"canonical_api_base": API_BASE}),
         claim,
@@ -131,19 +131,16 @@ async def test_registration_sets_action_before_sorted_specs(monkeypatch) -> None
     claim, result = _organization_result()
     events: list[tuple[str, object]] = []
 
-    async def record_action(_database, action, *_args):
-        events.append(("action", action))
-
     async def record_specs(_database, _acquisition_id, specs, *, action):
         events.append(("specs", tuple(spec.query_id for spec in specs)))
         assert action == "derive"
 
-    monkeypatch.setattr(frontier, "set_store_action", record_action)
     monkeypatch.setattr(frontier, "admit_work_specs", record_specs)
     await frontier.register_rooted_graph_frontier(
         _Database({"canonical_api_base": API_BASE}),
         claim,
         result,
     )
-    assert events[0] == ("action", "derive")
-    assert events[1][0] == "specs"
+    assert events == [
+        ("specs", tuple(sorted(spec.query_id for spec in frontier._derived_work_specs(claim, result, API_BASE))))
+    ]

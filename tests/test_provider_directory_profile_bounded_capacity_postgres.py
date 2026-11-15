@@ -105,12 +105,7 @@ async def _wide_delta(database, schema):
 async def _prepare(database, scenario):
     lineage = _delta_lineage()
     oids = await _delta_relation_oid_by_name(database, scenario)
-    seed = capacity.validated_capacity_geometry(
-        _geometry_payload(
-            evidence_target_oid=oids["evidence_target"],
-            profile_target_oid=oids["profile_target"],
-        )
-    )
+    seed = capacity.validated_capacity_geometry(_geometry_payload())
     await _insert_delta_checkpoint(database, scenario, lineage, oids, seed)
     await _insert_delta_serving_generation(database, scenario, lineage, oids)
     await database.status(f"UPDATE {scenario.serving_ref} SET evidence_rows = 3;")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import importlib
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -34,12 +35,10 @@ def _geo_signature(schema_name: str) -> tuple[tuple[str, int, int], ...]:
 
 
 def _install_observation_results(monkeypatch: pytest.MonkeyPatch, schema_name: str) -> None:
-    relation_oids = iter(range(10, 17))
-
-    async def relation_oid(_session, _schema_name, _table_name):
-        return next(relation_oids)
-
-    monkeypatch.setattr(serving, "_relation_oid", relation_oid)
+    monkeypatch.setattr(
+        serving, "_relation_oid", AsyncMock(side_effect=AssertionError("live capture resolved a physical token"))
+    )
+    monkeypatch.setattr(serving, "_require_declared_family", AsyncMock())
     monkeypatch.setattr(serving, "_alias_state", AsyncMock(return_value=(2, 1, 4)))
     monkeypatch.setattr(
         serving,
@@ -68,9 +67,12 @@ async def test_queue_capture_uses_fixed_bounds_and_writer_lock_order(monkeypatch
         "SET LOCAL statement_timeout TO '3s'",
         serving.address_alias_sql.alias_advisory_xact_lock_sql(),
     ]
-    assert len([statement for statement in statements[4:11] if " IN SHARE MODE" in statement]) == 7
+    assert len([statement for statement in statements[4:11] if " IN ACCESS SHARE MODE" in statement]) == 7
     assert statements[11] == serving.geo_projection.projection_dependency_lock_sql("mrf")
-    assert captured.relation_oids == tuple(range(10, 17))
+    assert captured.contract == serving.NAMED_CONTRACT
+    assert captured.relation_oids == ()
+    assert all(set(entry) == {"model_name", "schema_name", "table_name"} for entry in captured.as_dict()["relations"])
+    assert "active_table_oid" not in captured.as_dict()["geo_assurance"]
     assert captured.result_generation is None
     assert serving.validate_entity_address_observed_serving_capture(captured.as_dict()) == captured
 
@@ -118,7 +120,30 @@ def test_legacy_capture_without_generation_is_explicitly_generationless():
     assert validated.result_generation is None
 
 
-def test_capture_rejects_duplicate_relation_oids():
+@pytest.mark.parametrize("named", [False, True])
+def test_geo_signature_editions_preserve_full_saved_capture(named):
+    """Signature decoding leaves the complete original capture metadata unchanged."""
+    signature_entries = _geo_signature("mrf")
+    if named:
+        signature_entries = tuple((name, "held_geo", name.split(".", 1)[1]) for name, _, _ in signature_entries)
+    stored = serving.EntityAddressObservedServingCapture(
+        contract=serving.CONTRACT,
+        source_schema="mrf",
+        relation_oids=tuple(range(10, 17)),
+        alias_schema_version=2,
+        alias_ruleset_version=1,
+        alias_generation=4,
+        geo_assurance_version=1,
+        geo_active_table_oid=10,
+        geo_active_relation_signature=signature_entries,
+    ).as_dict()
+    original = json.dumps(stored, sort_keys=True, separators=(",", ":"))
+    decoded = serving.validate_entity_address_observed_serving_capture(stored)
+    assert decoded.as_dict() == stored
+    assert json.dumps(stored, sort_keys=True, separators=(",", ":")) == original
+
+
+def test_legacy_capture_preserves_duplicate_opaque_tokens():
     capture = serving.EntityAddressObservedServingCapture(
         contract=serving.CONTRACT,
         source_schema="mrf",
@@ -131,12 +156,11 @@ def test_capture_rejects_duplicate_relation_oids():
         geo_active_relation_signature=_geo_signature("mrf"),
     ).as_dict()
 
-    with pytest.raises(ValueError, match="relation identity"):
-        serving.validate_entity_address_observed_serving_capture(capture)
+    assert serving.validate_entity_address_observed_serving_capture(capture).as_dict() == capture
 
 
 @pytest.mark.asyncio
-async def test_generation_state_rejects_stale_relation_identity(monkeypatch):
+async def test_generation_state_preserves_logical_origin_without_physical_comparison(monkeypatch):
     authority = generation.EntityAddressResultGenerationAuthority(
         local_lineage_id="c8f27af1-56ba-4cda-82d8-0fc67650918f",
         local_generation=12,
@@ -147,18 +171,42 @@ async def test_generation_state_rejects_stale_relation_identity(monkeypatch):
         ),
         relation_oids=tuple(range(20, 27)),
     )
-    monkeypatch.setattr(
-        generation,
-        "read_entity_address_result_generation_authority",
-        AsyncMock(return_value=authority),
+    monkeypatch.setattr(serving, "_logical_result_state", AsyncMock(return_value=(12, authority.serving_generation)))
+
+    assert (
+        await serving._result_generation_state(object(), schema_name="mrf", relation_oids=tuple(range(10, 17)))
+        == authority.serving_generation
     )
 
-    with pytest.raises(RuntimeError, match="does not identify the serving relations"):
-        await serving._result_generation_state(
-            object(),
-            schema_name="mrf",
-            relation_oids=tuple(range(10, 17)),
-        )
+
+def test_logical_capture_ignores_old_tokens_and_preserves_raw_metadata():
+    """Copied old captures compare by logical state while their original bytes remain unchanged."""
+    legacy = serving.EntityAddressObservedServingCapture(
+        contract=serving.CONTRACT,
+        source_schema="mrf",
+        relation_oids=tuple(range(10, 17)),
+        alias_schema_version=2,
+        alias_ruleset_version=1,
+        alias_generation=4,
+        geo_assurance_version=1,
+        geo_active_table_oid=10,
+        geo_active_relation_signature=_geo_signature("mrf"),
+    ).as_dict()
+    original = json.dumps(legacy, sort_keys=True)
+    copied = json.loads(original)
+    for relation in copied["relations"]:
+        relation["relation_oid"] = None
+    copied["geo_assurance"]["active_table_oid"] = True
+    copied["geo_assurance"]["active_relation_signature"] = {
+        name: [None, False] for name in copied["geo_assurance"]["active_relation_signature"]
+    }
+    assert serving.validate_entity_address_observed_serving_capture(copied).as_dict() == copied
+    logical = serving.logical_entity_address_serving_capture(legacy)
+    assert serving.logical_entity_address_serving_capture(copied) == logical
+    assert logical["contract"] == serving.NAMED_CONTRACT
+    assert all(set(relation) == {"model_name", "schema_name", "table_name"} for relation in logical["relations"])
+    assert "active_table_oid" not in logical["geo_assurance"]
+    assert json.dumps(legacy, sort_keys=True) == original
 
 
 @pytest.mark.asyncio
@@ -225,7 +273,7 @@ async def test_receive_final_comparison_uses_writer_order_and_rejects_changed_to
         "SET LOCAL statement_timeout TO '3s'",
         serving.address_alias_sql.alias_advisory_xact_lock_sql(),
     ]
-    assert len([statement for statement in statements[3:10] if " IN SHARE MODE" in statement]) == 7
+    assert len([statement for statement in statements[3:10] if " IN ACCESS SHARE MODE" in statement]) == 7
     _install_observation_results(monkeypatch, "mrf")
     expected["alias_state"]["generation"] += 1
     with pytest.raises(RuntimeError, match="receive incumbent changed"):
@@ -236,9 +284,11 @@ def _install_empty_receive_results(monkeypatch):
     _install_observation_results(monkeypatch, "mrf")
     monkeypatch.setattr(serving, "_geo_assurance_state", AsyncMock(return_value=(None, None, None)))
     authority = SimpleNamespace(local_generation=0, serving_generation=None, relation_oids=None)
-    monkeypatch.setattr(
-        generation, "read_entity_address_result_generation_authority", AsyncMock(return_value=authority)
-    )
+
+    async def logical_state(_session, _schema):
+        return authority.local_generation, authority.serving_generation
+
+    monkeypatch.setattr(serving, "_logical_result_state", logical_state)
     return authority
 
 
@@ -248,9 +298,7 @@ async def test_empty_receive_roundtrips_null_geo_and_rechecks_before_publication
     session.scalar.side_effect = lambda sql: "read committed" if str(sql) == "SHOW transaction_isolation" else False
     _install_empty_receive_results(monkeypatch)
     captured = await serving.capture_entity_address_receive_admission(session, schema_name="mrf")
-    assert captured.as_dict()["geo_assurance"] == dict.fromkeys(
-        ("version", "active_table_oid", "active_relation_signature")
-    )
+    assert captured.as_dict()["geo_assurance"] == dict.fromkeys(("version", "active_relation_signature"))
     assert serving.validate_entity_address_observed_serving_capture(captured, allow_unpublished_geo=True) == captured
     with pytest.raises(ValueError):
         serving.validate_entity_address_observed_serving_capture(captured)
@@ -277,7 +325,9 @@ async def test_empty_receive_final_recheck_rejects_changed_state(monkeypatch, in
     elif invalid == "alias":
         monkeypatch.setattr(serving, "_alias_state", AsyncMock(return_value=(2, 1, 5)))
     else:
-        monkeypatch.setattr(serving, "_relation_oid", AsyncMock(side_effect=range(20, 27)))
+        monkeypatch.setattr(
+            serving, "_require_declared_family", AsyncMock(side_effect=RuntimeError("declared family is unavailable"))
+        )
     with pytest.raises(RuntimeError):
         await serving.require_entity_address_receive_incumbent(session, schema_name="mrf", expected=expected)
 

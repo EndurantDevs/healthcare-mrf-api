@@ -42,6 +42,7 @@ from process import entity_address_batch as address_batches
 from process import entity_address_candidate_preparation as candidate_preparation
 from process import entity_address_partial_projection as partial_projection
 from process import entity_address_preparation_admission as preparation_admission
+from process import entity_address_prepared_doctors as prepared_doctors
 from process import entity_address_result_generation as result_generation
 from process import entity_address_rows_native as row_preparation
 from process import entity_address_rows_preparation as prepared_rows
@@ -67,6 +68,15 @@ from process.entity_address_cutover_contract import (
     require_caller_owned_cutover_transaction,
     run_publish_validation_operations,
 )
+from process.entity_address_cutover_contract import (
+    activate_named_geo_candidate as _activate_named_geo_candidate,
+)
+from process.entity_address_cutover_contract import (
+    apply_cutover_support_patches as _apply_cutover_support_patches,
+)
+from process.entity_address_cutover_contract import (
+    require_geo_candidate_stage as _require_geo_candidate_stage,
+)
 from process.entity_address_dependency_bindings import (
     activate_geo_assurance_candidate_sql as _activate_geo_assurance_candidate_sql,
 )
@@ -81,6 +91,7 @@ from process.entity_address_dependency_bindings import (
 from process.entity_address_dependency_bindings import (
     validate_schema_name as _validate_schema_name,
 )
+from process.entity_address_search_index_sql import partial_scope_index_sql
 from process.entity_address_serving_receipt import ordinary_address_receipt_callbacks
 from process.ext import address_alias_sql
 from process.ext.address_format import (
@@ -2118,7 +2129,10 @@ async def _acquire_cutover_locks(
     db_schema: str,
     relation_names: list[str],
     required_names: list[str],
+    *,
+    read_only: bool = False,
 ) -> None:
+    """Pin the complete family; immutable adoption obtains exclusive locks through its bounded native DDL."""
     publisher_lock = await preparation_admission.read_scalar(
         db,
         "SELECT pg_try_advisory_xact_lock(hashtextextended(:lock_name, 0));",
@@ -2136,7 +2150,8 @@ async def _acquire_cutover_locks(
 
     schema = _validate_schema_name(db_schema)
     qualified_names = [f"{schema}.{_validate_schema_name(name)}" for name in existing_names]
-    await db.status(f"LOCK TABLE {', '.join(qualified_names)} IN ACCESS EXCLUSIVE MODE NOWAIT;")
+    mode = "ACCESS SHARE" if read_only else "ACCESS EXCLUSIVE"
+    await db.status(f"LOCK TABLE {', '.join(qualified_names)} IN {mode} MODE NOWAIT;")
 
 
 def _is_retryable_cutover_lock_error(error: BaseException) -> bool:
@@ -2156,6 +2171,7 @@ async def _run_entity_address_cutover(
 ) -> None:
     """Atomically publish an address stage with local semantic fences."""
 
+    _require_geo_candidate_stage(importlib.import_module(__name__), db_schema, swaps, context)
     lock_timeout = (
         _env_sql_setting("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_LOCK_TIMEOUT", DEFAULT_CUTOVER_LOCK_TIMEOUT)
         or DEFAULT_CUTOVER_LOCK_TIMEOUT
@@ -2173,28 +2189,25 @@ async def _run_entity_address_cutover(
             raise RuntimeError("address alias generation changed during entity-address-unified build")
         await _assert_provider_directory_overlay_alias_fence(db_schema, context)
         await serving_recovery.prepare_address(db, db_schema, swaps, context)
-        await _acquire_cutover_locks(db_schema, relation_names, required_names)
+        await _acquire_cutover_locks(
+            db_schema,
+            relation_names,
+            required_names,
+            **({"read_only": True} if require_caller_owned_transaction else {}),
+        )
         from process import entity_address_snapshot_adoption as adoption
 
+        serving_generation = await adoption._prepare_protected_ordinary_rotation(
+            db_schema, swaps, bool(patch_statements), context
+        )
         await adoption._require_protected_cutover(db_schema, swaps, context)
         await _assert_cutover_has_no_dependent_views(db_schema, [swap.live_cls.__main_table__ for swap in swaps])
         if callbacks is not None and callbacks.before_cutover is not None:
             await callbacks.before_cutover()
         await serving_recovery.before_address(db, db_schema, swaps, context)
-        await adoption._publish_result_swaps(db_schema, swaps, context)
-        for label, statement in patch_statements:
-            started = time.monotonic()
-            rowcount = await db.status(statement)
-            _record_phase_timing(
-                context,
-                f"entity-address-unified patching support {label}",
-                time.monotonic() - started,
-                _coerce_rowcount(rowcount),
-            )
-        active_table_oid = await preparation_admission.read_scalar(db, _activate_geo_assurance_candidate_sql(db_schema))
-        if active_table_oid is None:
-            raise RuntimeError("geo assurance candidate does not match the published table and sources")
-        context["geo_assurance_active_table_oid"] = int(active_table_oid)
+        await adoption._publish_result_swaps(db_schema, swaps, context, serving_generation=serving_generation)
+        await _apply_cutover_support_patches(importlib.import_module(__name__), patch_statements, context)
+        await _activate_named_geo_candidate(importlib.import_module(__name__), db_schema, context)
         generation_authority = await result_generation.publish_cutover_entity_address_generation(
             db, schema_name=db_schema, context=context
         )
@@ -2245,9 +2258,6 @@ async def _publish_staged_entity_address_tables(
         phase="entity-address-unified analyzing staged main table",
     )
     context.update(stage_persistence="p", result_generation_mode="ordinary")
-    from process.entity_address_snapshot_adoption import _prepare_protected_ordinary_rotation
-
-    await _prepare_protected_ordinary_rotation(db_schema, stage_cls, partial_support_patch, context)
     callbacks = ordinary_address_receipt_callbacks(db, db_schema, _sql_literal)
     max_attempts, base_backoff_ms, max_backoff_ms = _cutover_retry_settings()
     for attempt in range(1, max_attempts + 1):
@@ -4284,33 +4294,7 @@ def _index_partial_affected_groups_sql(db_schema: str, group_table: str) -> str:
 
 
 def _partial_scope_index_preflight_sql(db_schema: str) -> str:
-    return f"""
-    SELECT EXISTS (
-        SELECT 1
-          FROM pg_catalog.pg_index AS index_meta
-          JOIN pg_catalog.pg_class AS table_meta
-            ON table_meta.oid = index_meta.indrelid
-          JOIN pg_catalog.pg_namespace AS namespace_meta
-            ON namespace_meta.oid = table_meta.relnamespace
-          JOIN pg_catalog.pg_class AS index_relation
-            ON index_relation.oid = index_meta.indexrelid
-         WHERE namespace_meta.nspname = {_sql_literal(db_schema)}
-           AND table_meta.relname = 'provider_directory_address_overlay'
-           AND index_relation.relname = {_sql_literal(PROVIDER_DIRECTORY_PARTIAL_SCOPE_INDEX)}
-           AND index_meta.indisvalid IS TRUE
-           AND index_meta.indisready IS TRUE
-           AND index_meta.indislive IS TRUE
-           AND index_meta.indpred IS NULL
-           AND index_meta.indexprs IS NULL
-           AND (
-                SELECT array_agg(attribute_meta.attname::text ORDER BY index_column.ordinality)
-                  FROM unnest(index_meta.indkey) WITH ORDINALITY AS index_column(attnum, ordinality)
-                  JOIN pg_catalog.pg_attribute AS attribute_meta
-                    ON attribute_meta.attrelid = table_meta.oid
-                   AND attribute_meta.attnum = index_column.attnum
-               ) = ARRAY['source_id', 'last_seen_run_id', 'resource_type', 'resource_id']::text[]
-    );
-    """
+    return partial_scope_index_sql(_sql_literal(db_schema), _sql_literal(PROVIDER_DIRECTORY_PARTIAL_SCOPE_INDEX))
 
 
 async def _preflight_provider_directory_partial_scope_index(db_schema: str) -> None:
@@ -4847,16 +4831,13 @@ def _uses_provider_directory_overlay(
     return any(overlay_from in source_select for source_select in source_selects)
 
 
-async def _provider_directory_overlay_alias_fence(
-    db_schema: str,
-) -> tuple[int, int]:
-    """Return the materialized alias generation and live overlay relation OID."""
+async def _provider_directory_overlay_alias_fence(db_schema: str) -> tuple[int, tuple[str, str], str]:
+    """Return the named overlay's alias generation and logical publication revision."""
     row = await preparation_admission.read_first(
         db,
         f"""
-        SELECT
-            receipt.generation,
-            to_regclass(:overlay_relation)::oid::bigint AS relation_oid
+        SELECT receipt.generation, receipt.updated_at,
+               to_regclass(:overlay_relation) IS NOT NULL AS relation_exists
         FROM {db_schema}.{address_alias_sql.ADDRESS_ALIAS_ARTIFACT_STATE_TABLE} AS receipt
         WHERE receipt.artifact_name = :artifact_name;
         """,
@@ -4865,46 +4846,21 @@ async def _provider_directory_overlay_alias_fence(
     )
     if row is None:
         raise RuntimeError("Provider Directory address overlay alias-generation receipt is missing")
-    if row.relation_oid is None:
+    if not row.relation_exists:
         raise RuntimeError("Provider Directory address overlay relation is missing")
-    return int(row.generation), int(row.relation_oid)
+    return int(row.generation), (db_schema, "provider_directory_address_overlay"), row.updated_at.isoformat()
 
 
 async def _capture_provider_directory_overlay_alias_fence(
-    db_schema: str,
-    source_selects: list[str],
-    context: dict,
+    db_schema: str, source_selects: list[str], context: dict
 ) -> None:
-    """Fence a selected overlay before a long unified-address build."""
-    if candidate_preparation.current() is not None:
-        return await candidate_preparation.capture_overlay_fence(db_schema, context)
-    if not _uses_provider_directory_overlay(db_schema, source_selects):
-        context.pop("provider_directory_overlay_alias_generation", None)
-        context.pop("provider_directory_overlay_relation_oid", None)
-        return
-    generation, relation_oid = await _provider_directory_overlay_alias_fence(db_schema)
-    expected_generation = int(context.get("address_alias_generation") or 0)
-    if generation != expected_generation:
-        raise RuntimeError(
-            "Provider Directory address overlay uses a stale address alias generation; "
-            "run a full address overlay rebuild before entity-address-unified"
-        )
-    context["provider_directory_overlay_alias_generation"] = generation
-    context["provider_directory_overlay_relation_oid"] = relation_oid
+    """Capture the selected overlay publication before the address build."""
+    await candidate_preparation.capture_selected_overlay_fence(db_schema, source_selects, context)
 
 
-async def _assert_provider_directory_overlay_alias_fence(
-    db_schema: str,
-    context: dict,
-) -> None:
-    """Recheck the selected overlay under the alias cutover lock."""
-    expected_oid = context.get("provider_directory_overlay_relation_oid")
-    if expected_oid is None:
-        return
-    expected_generation = int(context.get("provider_directory_overlay_alias_generation") or 0)
-    generation, relation_oid = await _provider_directory_overlay_alias_fence(db_schema)
-    if generation != expected_generation or relation_oid != int(expected_oid):
-        raise RuntimeError("Provider Directory address overlay changed during entity-address-unified build")
+async def _assert_provider_directory_overlay_alias_fence(db_schema: str, context: dict) -> None:
+    """Recheck the selected overlay publication at cutover."""
+    await candidate_preparation.assert_selected_overlay_fence(db_schema, context)
 
 
 _RAW_ALIAS_INTEGRITY_SQL = address_batches.ALIAS_INTEGRITY_SQL
@@ -5689,13 +5645,20 @@ async def _materialize_geo_assurance(
 ) -> int:
     await _emit_geo_assurance_progress(run_id, stage_rows)
     started = time.monotonic()
-    projected_rows, invalid_rows, candidate_table_oid, effective_force = await _project_geo_assurance_transaction(
+    (
+        projected_rows,
+        invalid_rows,
+        candidate_geo_version,
+        should_force_projection,
+    ) = await _project_geo_assurance_transaction(
         db_schema,
         stage_table,
         force=force,
         **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings}),
         **({} if record_candidate else {"record_candidate": False}),
     )
+    if candidate_preparation.geo_dependency_options() and projected_rows != stage_rows:
+        raise RuntimeError("entity_address_named_geo_projected_rows_changed")
     elapsed = time.monotonic() - started
     _record_phase_timing(
         context,
@@ -5703,8 +5666,8 @@ async def _materialize_geo_assurance(
         elapsed,
         projected_rows,
     )
-    context["geo_assurance_candidate_table_oid"] = candidate_table_oid
-    context["geo_assurance_forced_full_projection"] = effective_force
+    context["geo_assurance_candidate_relation"] = {"schema_name": db_schema, "relation_name": stage_table}
+    context["geo_assurance_forced_full_projection"] = should_force_projection
     context["invalid_geo_assurance_rows"] = invalid_rows
     await _emit_geo_assurance_progress(
         run_id,
@@ -5725,29 +5688,26 @@ async def _project_geo_assurance_transaction(
 ) -> tuple[int, int, int, bool]:
     """Project and validate one source-stable stage; only its publisher records authority."""
 
-    if dependency_bindings is not None:
+    named_bindings = prepared_doctors._named_prepared_geo_bindings(db_schema, dependency_bindings)
+    if named_bindings is not None and record_candidate and candidate_preparation.current() is not None:
+        raise RuntimeError("entity_address_named_geo_global_state_unsupported")
+    if named_bindings is not None:
+        dependency_bindings = named_bindings
+    elif dependency_bindings is not None:
         dependency_bindings = geo_projection.validate_projection_dependency_bindings(db_schema, dependency_bindings)
     binding_options = {} if dependency_bindings is None else {"dependency_bindings": dependency_bindings}
     async with preparation_admission.native_transaction():
         await _apply_entity_address_transaction_settings()
-        await db.status(geo_projection.projection_dependency_lock_sql(db_schema, **binding_options))
-        if dependency_bindings is not None and not await preparation_admission.read_scalar(
-            db, f"SELECT {geo_projection.projection_dependency_bindings_match_sql(db_schema, dependency_bindings)}"
-        ):
-            raise RuntimeError("geo assurance dependency binding changed")
-        current_projection_available = dependency_bindings is None and bool(
-            await preparation_admission.read_scalar(
-                db, f"SELECT {geo_projection.projection_state_available_sql(db_schema)};"
-            )
-        )
-        effective_force = force or not current_projection_available
+        await prepared_doctors._lock_geo_projection_inputs(db_schema, dependency_bindings, named_bindings)
+        # Named input metadata does not establish current semantic freshness.
+        should_force_projection = True
         projected_rows = int(
             _coerce_rowcount(
                 await db.status(
                     _materialize_geo_assurance_sql(
                         db_schema,
                         stage_table,
-                        force=effective_force,
+                        force=should_force_projection,
                         **binding_options,
                     )
                 )
@@ -5755,32 +5715,18 @@ async def _project_geo_assurance_transaction(
             or 0
         )
         invalid_rows = await _validate_geo_assurance_projection(db_schema, stage_table)
-        candidate_sql = _geo_assurance_candidate_receipt_sql(
+        candidate_sql = prepared_doctors._geo_assurance_candidate_receipt_sql(
             db_schema, stage_table, projected_rows, binding_options, record_candidate=record_candidate
         )
-        candidate_table_oid = await preparation_admission.read_scalar(db, candidate_sql)
-        if candidate_table_oid is None:
+        candidate_geo_version = await preparation_admission.read_scalar(db, candidate_sql)
+        if candidate_geo_version is None:
             raise RuntimeError("geo assurance stage disappeared before receipt")
     return (
         projected_rows,
         invalid_rows,
-        int(candidate_table_oid),
-        effective_force,
+        int(candidate_geo_version),
+        should_force_projection,
     )
-
-
-def _geo_assurance_candidate_receipt_sql(db_schema, stage_table, projected_rows, binding_options, *, record_candidate):
-    """Leave authority recording to the Publisher when preparing a protected handoff."""
-    if record_candidate:
-        return _record_geo_assurance_candidate_sql(
-            db_schema,
-            stage_table,
-            projected_rows,
-            require_canonical_publication=candidate_preparation.has_prepared_doctors(),
-            **binding_options,
-        )
-    relation = f"{_validate_schema_name(db_schema)}.{_validate_schema_name(stage_table)}"
-    return "SELECT to_regclass(" + _sql_literal(relation) + ")::oid::bigint;"
 
 
 async def _apply_entity_address_transaction_settings() -> None:
@@ -12996,7 +12942,9 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
     db_schema = os.getenv("HLTHPRT_DB_SCHEMA") if os.getenv("HLTHPRT_DB_SCHEMA") else "mrf"
     geo_dependency_options_dict = candidate_preparation.geo_dependency_options()
     if dependency_bindings is not None:
-        selected = geo_projection.validate_projection_dependency_bindings(db_schema, dependency_bindings)
+        selected = prepared_doctors._named_prepared_geo_bindings(db_schema, dependency_bindings)
+        if selected is None:
+            selected = geo_projection.validate_projection_dependency_bindings(db_schema, dependency_bindings)
         if geo_dependency_options_dict and geo_dependency_options_dict["dependency_bindings"] != selected:
             raise RuntimeError("entity-address desired dependency bindings differ")
         geo_dependency_options_dict = {"dependency_bindings": selected}
@@ -13008,6 +12956,12 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
                 return await publish_entity_address_unified_generation(
                     ctx, prepare_only=prepare_only, dependency_bindings=selected
                 )
+    named_prepared_bindings = prepared_doctors._named_prepared_geo_bindings(
+        db_schema, geo_dependency_options_dict.get("dependency_bindings")
+    )
+    has_named_preparation = named_prepared_bindings is not None and candidate_preparation.current() is not None
+    if has_named_preparation and not prepare_only:
+        raise RuntimeError("entity_address_named_geo_requires_prepare_only")
     stage_cls = make_class(EntityAddressUnified, import_date)
     serving_only_refresh = bool(context.get("serving_only_refresh"))
     support_stage_class_map = {} if serving_only_refresh else _support_stage_classes(import_date)
@@ -13233,7 +13187,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
         run_id=run_id,
         stage_rows=stage_rows,
         **geo_dependency_options_dict,
-        **({"record_candidate": False} if protected_publication else {}),
+        **({"record_candidate": False} if protected_publication or has_named_preparation else {}),
     )
     await _emit_phase_progress(
         run_id,
@@ -13285,6 +13239,8 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             "status": "pending",
         }
     else:
+        if prepare_only:
+            await candidate_preparation.freeze_ordinary_prepared_stages(db_schema, stage_cls, support_stage_class_map)
         context["publish_validation"] = await _run_publish_validation(
             db_schema,
             stage_cls.__tablename__,

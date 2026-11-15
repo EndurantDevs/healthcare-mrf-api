@@ -152,36 +152,15 @@ def _execution_by_field(
 
 
 def _storage_observation(timing: _GuardTiming) -> dict[str, object]:
-    common_volume_by_field = {
-        "available_bytes": 1_000_000_000_000,
-        "available_after_all_reservations_bytes": 650_000_000_000,
-    }
+    from tests.provider_directory_profile_capacity_runtime_test_support import golden_storage_classes
+
     return {
         "observed_at": _utc(timing.observed_at),
         "issued_at": _utc(timing.issued_at),
         "expires_at": _utc(timing.expires_at),
         "max_build_deadline": _utc(timing.max_build_deadline),
-        "temp_tablespace": {
-            "tablespace_name": "pg_default",
-            "tablespace_oid": 1663,
-            "volume_digest": "33" * 32,
-        },
-        "volumes": [
-            {
-                "volume_class": "data",
-                "volume_digest": "33" * 32,
-                **common_volume_by_field,
-            },
-            {
-                "volume_class": "temp",
-                "volume_digest": "33" * 32,
-                **common_volume_by_field,
-            },
-            {
-                "volume_class": "wal",
-                "volume_digest": "44" * 32,
-                **common_volume_by_field,
-            },
+        "storage_classes": [
+            {name: value for name, value in row.items() if name != "reserved_bytes"} for row in golden_storage_classes()
         ],
     }
 
@@ -332,60 +311,23 @@ def _healthcare_quiescence() -> dict[str, object]:
 
 def _healthcare_receipt(
     validated_request,
-    import_receipt_by_field: dict[str, object],
-    execution_identity_by_field: dict[str, object],
-    limits_by_field: dict[str, object],
-    capacity_geometry_hash: str,
-    timing: _GuardTiming,
+    import_receipt_by_field,
+    execution_identity_by_field,
+    limits_by_field,
+    capacity_geometry_hash,
+    timing,
 ) -> dict[str, object]:
-    serving_by_field = {
-        "contract_id": preflight.CAPACITY_SERVING_PREFLIGHT_CONTRACT_ID,
-        "resolution": "existing",
-    }
-    quiescence_by_field = _healthcare_quiescence()
-    receipt_by_field = {
-        "contract_id": preflight.CAPACITY_PREFLIGHT_CONTRACT_ID,
-        "request_contract_id": preflight.CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID,
-        "request_sha256": validated_request.request_sha256,
-        "request_nonce": timing.request_nonce,
-        "control_plane_receipt_sha256": import_receipt_by_field["receipt_sha256"],
-        "issued_at": _utc(timing.issued_at + datetime.timedelta(seconds=1)),
-        "expires_at": _utc(timing.expires_at),
-        "profile_execution_identity": execution_identity_by_field,
-        "capacity_limits": limits_by_field,
-        "capacity_limits_sha256": validated_request.limits_sha256,
-        "capacity_geometry_hash": capacity_geometry_hash,
-        "capacity_geometry": {"contract_id": "synthetic-geometry.v1"},
-        "required_reservation_bytes_by_storage_class": {
-            "data": 180_000_000_000,
-            "temp": 20_000_000_000,
-            "wal": 150_000_000_000,
-        },
-        "artifact_scope_projection": {
-            "projected_rows": 1,
-            "projected_logical_bytes": 1,
-            "projection_hash": "88" * 32,
-        },
-        "runtime_observation": {"contract_id": "healthporta.provider-directory-profile-runtime-observation.v1"},
-        "serving_generation_preflight": serving_by_field,
-        "serving_generation_preflight_sha256": preflight.preflight_domain_sha256(
-            preflight.CAPACITY_SERVING_PREFLIGHT_DIGEST_DOMAIN,
-            serving_by_field,
-        ),
-        "quiescence": quiescence_by_field,
-        "quiescence_sha256": preflight.preflight_domain_sha256(
-            preflight.CAPACITY_QUIESCENCE_DIGEST_DOMAIN,
-            quiescence_by_field,
-        ),
-        "preflight_receipt_storage": {
-            "contract_id": "healthporta.provider-directory-profile-capacity-preflight-storage.v1"
-        },
-    }
-    receipt_by_field["receipt_sha256"] = preflight.preflight_domain_sha256(
-        preflight.CAPACITY_PREFLIGHT_CONTRACT_ID,
-        receipt_by_field,
+    """Assemble the same logical receipt through the shared current builder."""
+    from tests.provider_directory_profile_capacity_signing_guard_builder import build_healthcare_receipt
+
+    return build_healthcare_receipt(
+        validated_request,
+        import_receipt_by_field,
+        execution_identity_by_field,
+        limits_by_field,
+        capacity_geometry_hash,
+        timing,
     )
-    return receipt_by_field
 
 
 def _guard_payload(
@@ -417,7 +359,7 @@ def _guard_payload(
 
 def capacity_signing_guard(
     *,
-    capacity_geometry_hash: str,
+    capacity_geometry_hash: str | None,
     observed_at: datetime.datetime,
     issued_at: datetime.datetime,
     expires_at: datetime.datetime,

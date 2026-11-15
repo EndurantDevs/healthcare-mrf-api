@@ -14,7 +14,7 @@ def _canonical_index_catalog(statement, geo_present):
         "SELECT pg_catalog.set_config('search_path','pg_catalog',true) AS configured_path "
         "FROM native_previous_path),native_catalog AS MATERIALIZED ("
         "SELECT (SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(index_row) "
-        "ORDER BY index_row.index_oid),'[]'::pg_catalog.jsonb) FROM ("
+        "ORDER BY pg_catalog.to_jsonb(index_row)),'[]'::pg_catalog.jsonb) FROM ("
         + _path_bound_catalog_sql(statement)
         + ") index_row) AS rows FROM native_catalog_path native_path),"
         "native_restored_path AS MATERIALIZED ("
@@ -28,7 +28,7 @@ def index_catalog_statement(statement, *, geo_present=None):
     """Materialize bounded index rows before restoring the exact caller path in one statement."""
     aggregate = (
         "SELECT COALESCE(pg_catalog.jsonb_agg(pg_catalog.to_jsonb(index_row) "
-        "ORDER BY index_row.index_oid),'[]'::pg_catalog.jsonb) FROM ("
+        "ORDER BY pg_catalog.to_jsonb(index_row)),'[]'::pg_catalog.jsonb) FROM ("
     )
     canonical = _canonical_index_catalog(statement, geo_present)
     if geo_present is None:

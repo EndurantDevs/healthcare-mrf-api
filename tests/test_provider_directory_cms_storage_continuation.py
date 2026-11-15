@@ -76,19 +76,20 @@ def test_fresh_signature_does_not_replace_original_lease_or_consumption():
         "capacity_geometry_hash",
         "reservation_id",
         "attestation_id",
-        "database_oid",
+        "environment_id",
         "key_id",
     ],
 )
 def test_signed_substitution_cannot_change_request_binding(field):
     lease, request, witness = _fixture()
-    witness[field] = 234 if field == "database_oid" else "changed"
+    witness[field] = "changed"
     with pytest.raises(RuntimeError, match="request_binding_changed"):
         _verify_continuation(lease, request, witness)
 
 
 @pytest.mark.parametrize(
-    "change", ["stale", "future", "expiry", "deadline", "volume", "temp", "extra", "bad_signature"]
+    "change",
+    ["stale", "future", "expiry", "deadline", "class_order", "physical_field", "accounting", "extra", "bad_signature"],
 )
 def test_observation_rejects_stale_or_changed_authority_material(change):
     lease, request, witness = _fixture()
@@ -103,7 +104,7 @@ def test_observation_rejects_stale_or_changed_authority_material(change):
 
 
 def _mutate(witness, change):
-    """Alter a single signed synthetic field without introducing a new contract."""
+    """Alter one signed field while retaining the real authority signature path."""
     storage = witness["storage_observation"]
     if change == "stale":
         storage["observed_at"] = continuation._utc(VALIDATION_TIME - datetime.timedelta(seconds=6))
@@ -117,11 +118,16 @@ def _mutate(witness, change):
     if change == "deadline":
         storage["max_build_deadline"] = continuation._utc(VALIDATION_TIME + datetime.timedelta(minutes=10))
         return
-    if change == "volume":
-        storage["volumes"][0]["volume_digest"] = "ef" * 32
+    if change == "class_order":
+        storage["storage_classes"].reverse()
         return
-    if change == "temp":
-        storage["temp_tablespace"]["tablespace_oid"] += 1
+    if change == "physical_field":
+        storage["storage_classes"][0]["volume_digest"] = "ef" * 32
+        return
+    if change == "accounting":
+        storage["storage_classes"][0]["available_after_all_reservations_bytes"] = (
+            storage["storage_classes"][0]["available_bytes"] + 1
+        )
         return
     if change == "extra":
         witness["extra"] = True
@@ -148,7 +154,7 @@ def test_expired_phase_and_replaced_trust_pin_fail_closed():
             _envelope(witness),
             request=request,
             lease=lease,
-            trust=replace(_trust(), database_oid=16402),
+            trust=replace(_trust(), environment_id="other-environment"),
             now=VALIDATION_TIME,
         )
 
@@ -232,3 +238,46 @@ async def test_transport_never_redirects_or_accepts_unbounded_responses(monkeypa
         headers={"Authorization": "Bearer synthetic-token"},
         allow_redirects=False,
     )
+
+
+def test_request_and_result_keep_only_logical_identity_and_numeric_storage():
+    lease, request, witness = _fixture()
+    assert request.payload["contract_id"] == "provider-directory-capacity-storage-continuation-v2"
+    assert not {
+        "database_system_identifier",
+        "database_oid",
+        "database_name",
+        "tablespace_identity_hash",
+        "volume_identity_hash",
+    } & set(request.payload)
+    assert request.payload["original_lease_digest"] == lease.lease_digest
+    assert request.payload["requested_at"] == continuation._utc(VALIDATION_TIME)
+    result = _verify_continuation(lease, request, witness)
+    assert result.storage_observations == tuple(
+        (row["storage_class"], row["available_bytes"], row["available_after_all_reservations_bytes"])
+        for row in witness["storage_observation"]["storage_classes"]
+    )
+    with pytest.raises(TypeError):
+        request.binding_by_field["phase"] = "cutover"
+
+
+def test_delayed_response_cannot_reuse_a_six_second_old_observation():
+    lease, request, witness = _fixture()
+    now = VALIDATION_TIME + datetime.timedelta(seconds=6)
+    witness["issued_at"] = witness["storage_observation"]["issued_at"] = continuation._utc(now)
+    with pytest.raises(RuntimeError, match="fresh_observation_required"):
+        _verify_continuation(lease, request, witness, now=now)
+
+
+def test_original_continuation_signature_domain_is_not_current_authority():
+    lease, request, witness = _fixture()
+    canonical = json.dumps(witness, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    signature = PRIVATE_KEY.sign(b"provider-directory-capacity-storage-continuation-v1\x00" + canonical)
+    with pytest.raises(RuntimeError, match="signature_invalid"):
+        continuation.verify_storage_continuation(
+            {"observation": witness, "signature": base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")},
+            request=request,
+            lease=lease,
+            trust=_trust(),
+            now=VALIDATION_TIME,
+        )

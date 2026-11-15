@@ -15,7 +15,7 @@ from process import provider_directory_cms_serving_coverage as coverage
 from process import provider_directory_generic_source_policy as policy
 from process import provider_directory_source_local_publication as local
 from process.provider_directory_generic_candidate import GenericCandidateError
-from tests.test_provider_directory_generic_source_policy import _connection, _policy
+from tests.test_provider_directory_generic_source_policy import _connection, _identity_factory, _policy
 
 fhir = importlib.import_module("process.provider_directory_fhir")
 
@@ -24,22 +24,15 @@ fhir = importlib.import_module("process.provider_directory_fhir")
 def owner_body(monkeypatch):
     """Use the actual publisher/Owner binding with an explicit native boundary double."""
     connection, transitions = _connection()
-    native = SimpleNamespace(isolation="read committed", actor="source_publisher", pid=1234, xid="42", active=True)
-    session = object()
+    native = SimpleNamespace(isolation="read committed", actor="source_publisher", active=True)
+    session = SimpleNamespace(in_transaction=lambda: native.active)
     database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=session))
 
     async def execute(statement):
         native.actor = "source_owner" if statement.startswith("SET LOCAL ROLE") else "source_publisher"
 
     connection.execute.side_effect = execute
-    connection.fetchrow.side_effect = lambda _: {"session": "source_publisher", "current": native.actor}
-    connection.fetchval.side_effect = lambda sql: (
-        native.isolation if sql == "SHOW transaction_isolation" else native.xid
-    )
-    connection.get_server_pid = lambda: native.pid
     connection.is_in_transaction = lambda: native.active
-    monkeypatch.setattr(policy, "storage_roles", AsyncMock())
-    monkeypatch.setattr(policy, "_copy_driver", AsyncMock(return_value=connection))
 
     @asynccontextmanager
     async def bind(isolation="read committed", *, final=True):
@@ -86,34 +79,12 @@ async def test_minimum_rc_borrow_cannot_authorize_a_stale_final_cut(owner_body, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "changed", ["isolation", "actor", "session", "driver", "task", "backend", "xid", "transaction"]
-)
-async def test_original_publication_binding_rejects_substitution(owner_body, changed, monkeypatch):
+async def test_publication_requires_its_transaction_to_stay_active(owner_body):
     async with owner_body() as body:
-        database = body.database
-        if changed == "isolation":
-            body.native.isolation = "repeatable read"
-        if changed == "actor":
-            body.native.actor = "source_publisher"
-        if changed == "session":
-            database = SimpleNamespace(_transaction_binding=lambda: SimpleNamespace(session=object()))
-        if changed == "driver":
-            monkeypatch.setattr(policy, "_copy_driver", AsyncMock(return_value=object()))
-        if changed == "backend":
-            body.native.pid = 4321
-        if changed == "xid":
-            body.native.xid = "43"
-        if changed == "transaction":
-            body.native.active = False
-        with pytest.raises(GenericCandidateError):
-            if changed == "task":
-                await asyncio.create_task(policy.require_source_publication_transaction(database))
-            else:
-                await policy.require_source_publication_transaction(database)
-        body.native.actor = "source_owner"
-        body.native.isolation, body.native.pid, body.native.xid, body.native.active = "read committed", 1234, "42", True
-        monkeypatch.setattr(policy, "_copy_driver", AsyncMock(return_value=body.connection))
+        body.native.active = False
+        with pytest.raises(GenericCandidateError, match="transaction_required"):
+            await policy.require_source_publication_transaction(body.database)
+        body.native.active = True
 
 
 @pytest.mark.asyncio
@@ -173,8 +144,8 @@ async def test_fixed_control_fence_authenticates_before_ordered_nowait_locks(mon
     monkeypatch.setattr(fhir, "_schema", lambda: "source_schema")
     if failure is None:
         await fhir._lock_source_publication_controls()
-        assert 'provider_directory_api_endpoint" IN SHARE MODE NOWAIT' in events[1]
-        assert 'provider_directory_source" IN SHARE ROW EXCLUSIVE MODE NOWAIT' in events[2]
+        assert 'provider_directory_api_endpoint" IN ACCESS SHARE MODE NOWAIT' in events[1]
+        assert 'provider_directory_source" IN ACCESS SHARE MODE NOWAIT' in events[2]
     else:
         with pytest.raises(type(failure)):
             await fhir._lock_source_publication_controls()
@@ -255,51 +226,24 @@ async def test_source_local_callback_finishes_before_short_control_fence(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_plain_rc_intake_owner_has_no_issued_final_origin(owner_body):
-    async with owner_body(final=False) as body:
-        with pytest.raises(GenericCandidateError, match="publication_transaction_changed"):
-            await policy.require_source_publication_transaction(body.database)
-
-
-@pytest.mark.asyncio
 async def test_nested_owner_and_publisher_bodies_preserve_the_issued_origin(owner_body):
     async with owner_body() as body:
         original = policy._OWNER.get()
         async with policy.source_publication_body(body.database):
             async with policy.source_transaction(body.database):
-                assert policy._OWNER.get() is original
+                assert policy._OWNER.get() == original
             async with policy.source_publisher_body(body.session):
                 assert policy._OWNER.get() is None and body.native.actor == "source_publisher"
-            assert policy._OWNER.get() is original
+            assert policy._OWNER.get() == original
         assert policy._OWNER.get() is original
         assert await policy.require_source_publication_transaction(body.database) is body.publisher
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["pid", "xid"])
-async def test_clean_exit_rejects_a_replaced_native_transaction(owner_body, changed):
-    with pytest.raises(GenericCandidateError, match="publication_transaction_changed"):
-        async with owner_body() as body:
-            setattr(body.native, changed, 4321 if changed == "pid" else "43")
-    assert policy._OWNER.get() is None
-
-
-@pytest.mark.asyncio
-async def test_nested_final_body_cannot_reissue_a_changed_origin(owner_body):
-    async with owner_body() as body:
-        body.native.xid = "43"
-        with pytest.raises(GenericCandidateError, match="publication_transaction_changed"):
-            async with policy.source_publication_body(body.database):
-                pytest.fail("a replacement top XID was accepted")
-        body.native.xid = "42"
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [RuntimeError("synthetic final error"), asyncio.CancelledError()])
-async def test_original_failure_is_not_masked_by_exit_identity_queries(owner_body, failure):
+async def test_original_failure_leaves_the_publication_body_unchanged(owner_body, failure):
     with pytest.raises(type(failure)) as caught:
-        async with owner_body() as body:
-            body.native.xid = "43"
+        async with owner_body():
             raise failure
     assert caught.value is failure and policy._OWNER.get() is None
 
@@ -323,18 +267,10 @@ def _cutover_directory(database, observed_events, fence, prove_frozen_cutover):
     )
 
 
-def _cutover_session(sessions, isolation):
-    """Expose the original actor, backend and transaction observations for one owner."""
+def _cutover_session():
+    """Give one owner its own driver and an active session."""
     driver, _ = _connection()
-    actor = SimpleNamespace(current="source_publisher")
-    driver.get_server_pid = lambda: 1234 + len(sessions)
-    driver.fetchval.side_effect = lambda sql: isolation if sql == "SHOW transaction_isolation" else str(len(sessions))
-    driver.fetchrow.side_effect = lambda _: {"session": "source_publisher", "current": actor.current}
-    driver.execute.side_effect = lambda sql: setattr(
-        actor, "current", "source_owner" if sql.startswith("SET LOCAL ROLE") else "source_publisher"
-    )
-    session = SimpleNamespace(driver=driver)
-    return session
+    return SimpleNamespace(driver=driver, in_transaction=lambda: True)
 
 
 @asynccontextmanager
@@ -345,14 +281,13 @@ async def _cutover_factory(monkeypatch, *, committed, proof_error=None):
     observed_events = []
     sessions = []
     original_error = RuntimeError("synthetic final commit acknowledgement")
-    publisher_policy = _policy()
-    monkeypatch.setattr(policy, "storage_roles", AsyncMock())
-    monkeypatch.setattr(policy, "_copy_driver", AsyncMock(side_effect=lambda session: session.driver))
+    factory = _identity_factory()
+    publisher_policy = factory.policy
 
     @asynccontextmanager
     async def transaction(requested_database, *, isolation):
         assert requested_database is database and isolation == "read committed"
-        session = _cutover_session(sessions, isolation)
+        session = _cutover_session()
         driver = session.driver
         sessions.append(session)
         token = binding.set(SimpleNamespace(session=session))
@@ -390,7 +325,8 @@ async def _cutover_factory(monkeypatch, *, committed, proof_error=None):
         return committed
 
     directory = _cutover_directory(database, observed_events, fence, prove_frozen_cutover)
-    async with policy.bind_generic_source_transaction_factory(SimpleNamespace(transaction=transaction)):
+    factory.transaction = transaction
+    async with policy.bind_generic_source_transaction_factory(factory):
         yield directory, candidate, original_error, observed_events
 
 

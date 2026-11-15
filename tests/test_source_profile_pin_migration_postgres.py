@@ -820,7 +820,7 @@ async def test_parent_copy_upsert_and_update_cannot_duplicate_attached_keys(oper
         ).rowcount > 0
 
 
-async def _record_attachment_seal(session, case, parent, child, child_name):
+async def _record_attachment_seal(session, case, parent, child, child_name, *, edition):
     parent_oid = await session.scalar(text("SELECT CAST(:relation AS regclass)::oid"), {"relation": parent})
     child_oid = await session.scalar(text("SELECT CAST(:relation AS regclass)::oid"), {"relation": child})
     pin_id = uuid4()
@@ -828,8 +828,23 @@ async def _record_attachment_seal(session, case, parent, child, child_name):
         "contract": "source-profile-attachment.v2",
         "created_run_ids": [case.incoming],
         "reused_run_ids": [],
-        "parents": [["provider_profile_artifact", parent_oid]],
-        "children": [["provider_profile_artifact", child_name, child_oid]],
+        "parents": [
+            [
+                "provider_profile_artifact",
+                parent_oid
+                if edition == "saved_names"
+                else {"schema": case.destination_schema, "name": "provider_profile_artifact"},
+            ]
+        ],
+        "children": [
+            [
+                "provider_profile_artifact",
+                child_name,
+                -child_oid
+                if edition == "saved_names"
+                else {"schema": case.prepared.ownership.schema_name, "name": child_name},
+            ]
+        ],
         "ancestor_relations": [],
     }
     await archive.pins.record_pin(
@@ -839,16 +854,23 @@ async def _record_attachment_seal(session, case, parent, child, child_name):
         run_id=case.incoming,
         pin_id=pin_id,
         purpose="adoption",
-        authority={"created_here": True, "validation": {"publication": publication_by_field}},
+        authority={
+            "created_here": True,
+            "validation": {
+                "ownership": {"schema_name": case.prepared.ownership.schema_name},
+                "publication": publication_by_field,
+            },
+        },
     )
     return pin_id
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ("delete", "purpose", "authority", "truncate"))
-async def test_attachment_owner_seal_requires_detachment_before_mutation(operation):
+@pytest.mark.parametrize("edition", ("named", "saved_names"))
+async def test_attachment_owner_seal_requires_detachment_before_mutation(operation, edition):
     async with _attached_child("provider_profile_artifact") as (case, session, parent, child, child_name):
-        pin_id = await _record_attachment_seal(session, case, parent, child, child_name)
+        pin_id = await _record_attachment_seal(session, case, parent, child, child_name, edition=edition)
         pin_table = f'"{case.destination_schema}".provider_profile_source_pin'
         statement_by_operation = {
             "delete": f"DELETE FROM {pin_table} WHERE pin_id=:pin",
@@ -870,3 +892,52 @@ async def test_attachment_owner_seal_requires_detachment_before_mutation(operati
         assert (
             await session.execute(text(f"DELETE FROM {pin_table} WHERE pin_id=:pin"), {"pin": str(pin_id)})
         ).rowcount == 1
+
+
+async def _attachment_guard_metadata(session, schema):
+    function = (
+        await session.execute(
+            text(
+                "SELECT oid,proowner,proacl,prosecdef,provolatile,proconfig FROM pg_proc WHERE oid=to_regprocedure(:name)"
+            ),
+            {"name": f'"{schema}".provider_profile_attached_pin_guard()'},
+        )
+    ).one()
+    triggers = (
+        await session.execute(
+            text(
+                "SELECT oid,tgname,tgfoid,tgtype,tgenabled,tgoldtable,tgnewtable FROM pg_trigger "
+                "WHERE tgrelid=to_regclass(:name) AND NOT tgisinternal ORDER BY tgname"
+            ),
+            {"name": f'"{schema}".provider_profile_source_pin'},
+        )
+    ).all()
+    return tuple(function), [tuple(trigger) for trigger in triggers]
+
+
+@pytest.mark.asyncio
+async def test_named_attachment_migration_preserves_function_and_statement_trigger_metadata(monkeypatch):
+    """Replace only the existing guard body, including a nondefault ACL."""
+    async with _prepared_case("massachusetts-borim-profile") as case:
+        monkeypatch.setenv("HLTHPRT_DB_SCHEMA", case.destination_schema)
+        monkeypatch.delenv("DB_SCHEMA", raising=False)
+        async with case.sessions() as session, session.begin():
+            name = f'"{case.destination_schema}".provider_profile_attached_pin_guard()'
+            await session.execute(text(f"REVOKE EXECUTE ON FUNCTION {name} FROM PUBLIC"))
+            before = await _attachment_guard_metadata(session, case.destination_schema)
+            path = Path(__file__).parents[1] / "alembic/versions/20261114170000_source_profile_named_attachment.py"
+            spec = importlib.util.spec_from_file_location("named_attachment_migration", path)
+            migration = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(migration)
+
+            def apply(connection):
+                with Operations.context(MigrationContext.configure(connection)):
+                    migration.upgrade()
+
+            await (await session.connection()).run_sync(apply)
+            assert await _attachment_guard_metadata(session, case.destination_schema) == before
+            body = await session.scalar(text("SELECT pg_get_functiondef(to_regprocedure(:name))"), {"name": name})
+            assert "schema_name" in body and "relation.relname" in body
+            assert "child.value->>2" not in body
+            assert "read committed" in body and len(before[1]) == 3
+            await archive.require_pin_guards(session, case.destination_schema)

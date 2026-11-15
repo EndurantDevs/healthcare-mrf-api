@@ -37,16 +37,15 @@ async def test_source_bootstrap_cannot_replace_the_label_publication_ledger():
     session.execute.assert_not_awaited()
 
 
-async def test_source_observation_rejects_an_oid_changed_before_the_fence(monkeypatch):
+async def test_source_observation_keeps_logical_name_locks_when_old_ids_differ(monkeypatch):
     session = _session()
     current = AsyncMock(return_value=(18,))
     monkeypatch.setattr(source_generation.generation, "current_reference_family_relation_oids", current)
-    with pytest.raises(RuntimeError, match="relation identity changed"):
-        await source_generation.require_reference_source_generation(
-            session, importer_id="geo", schema_name="mrf", expected_relation_oids=(17,)
-        )
+    assert await source_generation._lock_source(
+        session, importer_id="geo", schema_name="mrf", expected_relation_oids=(17,)
+    ) == ("geo", "mrf")
     assert [str(call.args[0]) for call in session.execute.await_args_list] == [
-        'LOCK TABLE "mrf"."geo_zip_lookup" IN SHARE MODE NOWAIT',
+        'LOCK TABLE "mrf"."geo_zip_lookup" IN ACCESS SHARE MODE NOWAIT',
         'LOCK TABLE "mrf"."reference_family_result_generation" IN ROW SHARE MODE NOWAIT',
     ]
     statement, bindings = session.scalar.await_args.args
@@ -63,7 +62,7 @@ async def test_source_observation_rejects_a_drifted_serving_ledger(monkeypatch):
     from process import geo_source_storage
 
     monkeypatch.setattr(geo_source_storage, "require_geo_storage", AsyncMock(return_value=17))
-    authority = SimpleNamespace(serving_generation=object(), relation_oids=(18,))
+    authority = SimpleNamespace(serving_generation=object(), relations=(("mrf", "other"),))
     reader = AsyncMock(return_value=authority)
     monkeypatch.setattr(source_generation.generation, "read_reference_family_result_generation_authority", reader)
     with pytest.raises(RuntimeError, match="geo_source_generation_unavailable"):

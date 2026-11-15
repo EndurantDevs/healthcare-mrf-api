@@ -913,7 +913,7 @@ async def test_compact_metadata_reconstructs_only_the_complete_original_contract
         "nested",
         "missing_scope",
         "foreign_coordinates",
-        "foreign_owner",
+        "foreign_namespace",
         "foreign_validation",
         "empty",
         "too_many",
@@ -941,8 +941,8 @@ async def test_batch_wire_rejects_malformed_or_substituted_shared_capture(monkey
             child["source_pin"].pop("source_url")
         case "foreign_coordinates":
             child["binding_coordinates"]["producer_id"] = "foreign"
-        case "foreign_owner":
-            batch["prepared"]["ownership"]["schema_oid"] += 1
+        case "foreign_namespace":
+            batch["prepared"]["ownership"]["schema_name"] = "foreign_stage"
         case "foreign_validation":
             batch["validation"]["manifest_sha256"] = "f" * 64
         case "empty":
@@ -961,7 +961,7 @@ async def test_batch_wire_rejects_malformed_or_substituted_shared_capture(monkey
 @pytest.mark.asyncio
 async def test_singleton_wire_stays_exact_and_mixed_batches_remain_complete(monkeypatch):
     from process import registry_source_recipe_store as codec
-    from tests.test_registry_source_recipe_store_postgres import _example
+    from tests.registry_source_recipe_support import _example
 
     prepared, validation = await _prepared(monkeypatch)
     singleton = producer._recipe(prepared, validation, _ROLES)
@@ -1086,3 +1086,23 @@ async def test_verified_batch_refuses_preflight_transaction_change(monkeypatch):
         await producer.prepare_registry_aca_batch_read(connection, recipes[0].source_pin)
     assert decode.await_count == 1
     native.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_batch_wire_preserves_opaque_legacy_tokens_without_treating_them_as_scope(monkeypatch):
+    from process import registry_source_recipe_store as codec
+
+    prepared, validation = await _batch_prepared(monkeypatch)
+    documents = json.loads(
+        codec.canonical_registry_source_recipes(producer._batch_recipes(prepared, validation, _ROLES))
+    )
+    batch = documents[0]
+    ownership = batch["prepared"]["ownership"]
+    ownership["schema_oid"] += 1000
+    for entry in ownership["relation_oids"]:
+        entry[1] += 1000
+    saved = deepcopy(documents)
+    decoded = codec.decode_registry_source_recipes(documents)
+    assert json.loads(codec.canonical_registry_source_recipes(decoded)) == saved
+    assert decoded[0].source_pin.validation.as_dict() == batch["validation"]
+    assert decoded[0].source_pin.prepared.manifest == prepared.manifest

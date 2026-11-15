@@ -3,14 +3,31 @@
 
 import importlib
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
+from sqlalchemy import Column, MetaData, String, Table
 
 from process import cms_doctors_organizations as organizations
 from process.control_cancel import ImportCancelledError
 
 cms_doctors = importlib.import_module("process.cms_doctors")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deterministic", [True, False])
+async def test_group_stage_uses_named_read_lock_and_preserves_collation_refusal(deterministic):
+    stage = Table("private_groups", MetaData(schema="synthetic"), Column("org_pac_id", String))
+    result = SimpleNamespace(one=lambda: ("org_pac_id", deterministic))
+    session = SimpleNamespace(execute=AsyncMock(side_effect=[None, result]))
+    if deterministic:
+        assert await organizations._lock_group_stage(session, stage) == ("synthetic", "private_groups")
+    else:
+        with pytest.raises(RuntimeError, match="cms_group_site_binding_stage_changed"):
+            await organizations._lock_group_stage(session, stage)
+    assert "IN ACCESS SHARE MODE" in str(session.execute.await_args_list[0].args[0])
+    assert "attribute.attname" in str(session.execute.await_args_list[1].args[0])
 
 
 def _publication_context():

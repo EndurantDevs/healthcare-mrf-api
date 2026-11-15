@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import insert, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -18,7 +18,14 @@ from api import provider_profile_states as serving
 from db import models
 from db.connection import Database
 from process import source_profile_result_archive as archive
-from tests.source_profile_archive_support import _create_family, _database_url, _drop_family, _seed, native_source_copy
+from tests.source_profile_archive_support import (
+    _create_family,
+    _database_url,
+    _drop_family,
+    _seed,
+    _seed_rows,
+    native_source_copy,
+)
 
 
 @asynccontextmanager
@@ -39,6 +46,7 @@ async def _prepared_case(importer, *, with_ancestry=False, contract=archive.LEGA
                 session, source_schema, destination_schema, importer, with_ancestry
             )
             await _assert_reference_free_tables(session, created_schemas)
+            owner_name = await session.scalar(text("SELECT current_user::text"))
         async with sessions() as session, session.begin():
             prepared = await archive.prepare_source(
                 session,
@@ -54,7 +62,6 @@ async def _prepared_case(importer, *, with_ancestry=False, contract=archive.LEGA
             destination_schema=destination_schema,
             expected_current_run_id=incumbent,
             package_id="a" * 64,
-            sealed_owner_oid=owner,
             pin_id=uuid4(),
         )
         yield SimpleNamespace(
@@ -72,6 +79,7 @@ async def _prepared_case(importer, *, with_ancestry=False, contract=archive.LEGA
             activation_by_field=activation_by_field,
             preparation_by_field={
                 **activation_by_field,
+                "roles": SimpleNamespace(owner_role=owner_name, publisher_role=owner_name, runtime_roles=(owner_name,)),
                 "publication_request": {"source_copy": native_source_copy()} if contract == archive.CONTRACT else None,
             },
         )
@@ -100,19 +108,24 @@ async def _drop_prepared_stage(session, prepared, destination_schema):
     if prepared.manifest["contract"] == archive.LEGACY_CONTRACT:
         await archive.cleanup_stage(session, prepared.ownership)
         return
-    oid_by_name = dict(prepared.ownership.relation_oids)
+    references_by_name = {
+        name: archive._reference(prepared.ownership.schema_name, name) for name in prepared.ownership.relation_names
+    }
     publication_by_field = {
-        "parents": [
-            [name, await archive.native._relation_oid(session, destination_schema, name)] for name in archive.TABLES
-        ],
+        "parents": [[name, archive._reference(destination_schema, name)] for name in archive.TABLES],
         "children": [
-            [name, child, oid_by_name[child]]
+            [name, child, references_by_name[child]]
             for name, child in zip(archive.TABLES, archive.PUBLICATION_TABLES, strict=True)
         ],
     }
     if await session.scalar(
         text("SELECT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=ANY(CAST(:oids AS oid[])))"),
-        {"oids": [child[2] for child in publication_by_field["children"]]},
+        {
+            "oids": [
+                await archive.native._relation_oid(session, reference["schema"], reference["name"])
+                for _name, _child, reference in publication_by_field["children"]
+            ]
+        },
     ):
         await archive._detach_publication(
             session,
@@ -207,7 +220,8 @@ async def test_set_validated_publication_has_no_row_hashes_or_early_adoption(imp
 
 async def _assert_indexed_stage_without_row_guards(session, ownership):
     """Every prepared heap has finished indexes, no FK and no payload-row trigger."""
-    for _name, oid in ownership.relation_oids:
+    for name in ownership.relation_names:
+        oid = await archive.native._relation_oid(session, ownership.schema_name, name)
         assert not await session.scalar(
             text("SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=:oid AND contype='f')"), {"oid": oid}
         )
@@ -223,7 +237,8 @@ async def _assert_indexed_stage_without_row_guards(session, ownership):
 async def _assert_physical_publication(session, case, publication):
     """Serving queries use the exact indexed alias OIDs, with only recorded leaf attachments."""
     await archive._require_stage_topology(session, case.prepared.ownership, publication)
-    for name, _child, oid in publication["children"]:
+    for name, _child, reference in publication["children"]:
+        oid = await archive.native._relation_oid(session, reference["schema"], reference["name"])
         assert (
             await session.scalar(
                 text(f"SELECT tableoid::oid FROM {archive._table(case.destination_schema, name)} WHERE run_id=:run"),
@@ -357,8 +372,14 @@ async def _assert_api_relation_locks(case, reader_pid, expected_run):
         names = ("provider_profile_source_publication", "provider_profile_import_run", "provider_profile_fact")
         oids = [await archive.native._relation_oid(session, case.destination_schema, name) for name in names]
         if expected_run == case.incoming:
-            owned_by_name = dict(case.prepared.ownership.relation_oids)
-            oids.extend(owned_by_name[name + "_published"] for name in names[1:])
+            oids.extend(
+                [
+                    await archive.native._relation_oid(
+                        session, case.prepared.ownership.schema_name, name + "_published"
+                    )
+                    for name in names[1:]
+                ]
+            )
         assert await session.scalar(
             text(
                 "SELECT count(DISTINCT relation)=:count FROM pg_locks WHERE pid=:pid AND granted "
@@ -443,7 +464,8 @@ async def test_attached_publication_detaches_only_after_last_reference_and_binds
             assert await archive.cleanup_adoption(session, **cleanup_by_field) == "released"
             assert await archive._run(session, case.destination_schema, case.incoming) is None
             await archive._require_stage_topology(session, case.prepared.ownership)
-            with pytest.raises(archive.SourceProfileArchiveError, match="parent catalog changed"):
+            # A different destination is refused by its qualified parent names.
+            with pytest.raises(archive.SourceProfileArchiveError, match="attachment parent names differ"):
                 async with session.begin_nested():
                     await archive.cleanup_stage(
                         session,
@@ -526,7 +548,11 @@ async def _assert_stage_refusals(case):
     with pytest.raises(archive.SourceProfileArchiveError, match="stage ownership changed"):
         async with case.sessions() as session, session.begin():
             await archive.verify_ownership(
-                session, replace(case.prepared.ownership, schema_oid=case.prepared.ownership.schema_oid + 1)
+                session,
+                replace(
+                    case.prepared.ownership,
+                    relation_names=("another_snapshot", *case.prepared.ownership.relation_names[1:]),
+                ),
             )
 
 
@@ -740,7 +766,7 @@ async def _assign_adoption_roles(case, ordinary_role, publisher_role):
             (
                 case.prepared.ownership.schema_name,
                 publisher_role,
-                tuple(name for name, _ in case.prepared.ownership.relation_oids),
+                case.prepared.ownership.relation_names,
             ),
         ):
             await session.execute(text(f'ALTER SCHEMA "{schema}" OWNER TO "{owner}"'))
@@ -764,7 +790,9 @@ async def _assign_adoption_roles(case, ordinary_role, publisher_role):
         case.activation_by_field["sealed_owner_oid"] = await session.scalar(
             text("SELECT oid FROM pg_roles WHERE rolname=:role"), {"role": publisher_role}
         )
-        case.preparation_by_field["sealed_owner_oid"] = case.activation_by_field["sealed_owner_oid"]
+        case.preparation_by_field["roles"] = SimpleNamespace(
+            owner_role=publisher_role, publisher_role=publisher_role, runtime_roles=(ordinary_role,)
+        )
 
 
 async def _exercise_inherited_adoption(case, ordinary_role, publisher_role):
@@ -923,3 +951,91 @@ async def test_unpublished_cleanup_and_active_conflict():
                 )
                 == "already_released"
             )
+
+
+async def _cleanup_stage_contents(session, ownership):
+    """Compare every original stored row after a native restrictive cleanup refusal."""
+    return [
+        (
+            await session.execute(
+                text(
+                    f"SELECT to_jsonb(candidate) FROM {archive._table(ownership.schema_name, name)} candidate "
+                    "ORDER BY to_jsonb(candidate)::text"
+                )
+            )
+        )
+        .scalars()
+        .all()
+        for name in ownership.relation_names
+    ]
+
+
+@asynccontextmanager
+async def _frozen_cleanup_stage():
+    """Register exact namespace and role cleanup before creating one real frozen family."""
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    stage_id = uuid4()
+    stage_schema = archive.stage_schema(stage_id)
+    role = "profile_cleanup_" + uuid4().hex
+    try:
+        async with sessions() as session, session.begin():
+            await session.execute(text(f'CREATE ROLE "{role}" NOLOGIN NOSUPERUSER'))
+            ownership = await archive.precreate_restore(session, "massachusetts-borim-profile", stage_id)
+            for model, stored in zip(archive.MODELS, _seed_rows(ownership.importer_id)[:4], strict=True):
+                table = model.__table__.to_metadata(archive.native.MetaData(), schema=stage_schema)
+                await session.execute(insert(table).values(stored))
+            await archive.complete_restore(session, ownership)
+            await archive.native.seal_model_family_storage(
+                session,
+                ownership,
+                roles=SimpleNamespace(owner_role=role, publisher_role=role, runtime_roles=(role,)),
+            )
+        yield sessions, ownership, role
+    finally:
+        try:
+            async with sessions() as session, session.begin():
+                await session.execute(
+                    text(
+                        "DROP TABLE IF EXISTS "
+                        + ", ".join(archive._table(stage_schema, name) for name in archive.TABLES)
+                        + " RESTRICT"
+                    )
+                )
+                await session.execute(text(f'DROP SCHEMA IF EXISTS "{stage_schema}" RESTRICT'))
+        finally:
+            async with sessions() as session, session.begin():
+                await session.execute(text(f'DROP ROLE IF EXISTS "{role}"'))
+            await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_frozen_cleanup_retains_rows_under_pinned_reader():
+    """A frozen owner cannot write data; its bounded DROP waits for real readers and preserves all rows."""
+    async with _frozen_cleanup_stage() as (sessions, ownership, role):
+        async with sessions() as reader, reader.begin():
+            await reader.execute(text(f"SELECT * FROM {archive._table(ownership.schema_name, archive.TABLES[0])}"))
+            async with sessions() as session, session.begin():
+                await session.execute(text(f'SET LOCAL ROLE "{role}"'))
+                await session.execute(text("SET LOCAL lock_timeout='1700ms'"))
+                before = await _cleanup_stage_contents(session, ownership)
+                assert all(len(rows) == 1 for rows in before)
+                await _assert_cleanup_stage_cannot_write(session, ownership)
+                with pytest.raises(DBAPIError, match="lock timeout"):
+                    await archive.cleanup_stage(session, ownership)
+                assert session.in_transaction()
+                assert await session.scalar(text("SHOW lock_timeout")) == "1700ms"
+                assert await _cleanup_stage_contents(session, ownership) == before
+        async with sessions() as session, session.begin():
+            await session.execute(text(f'SET LOCAL ROLE "{role}"'))
+            await archive.cleanup_stage(session, ownership)
+            assert (
+                await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": ownership.schema_name}) is None
+            )
+
+
+async def _assert_cleanup_stage_cannot_write(session, ownership):
+    """Native owner DDL remains available while published row mutation is denied."""
+    with pytest.raises(DBAPIError, match="permission denied"):
+        async with session.begin_nested():
+            await session.execute(text(f"DELETE FROM {archive._table(ownership.schema_name, archive.TABLES[0])}"))

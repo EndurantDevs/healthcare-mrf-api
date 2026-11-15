@@ -137,14 +137,11 @@ def test_persisted_receipt_json_has_the_same_closed_content_as_object_form():
     [
         "untyped_source",
         "other_table",
-        "roles_type",
-        "roles_order",
-        "role_duplicate",
         "parameter_type",
         "parameter_limit",
     ],
 )
-async def test_office_origin_requires_exact_source_roles_and_parameter_scope_before_sql(fault):
+async def test_office_origin_requires_named_source_and_parameter_scope_before_sql(fault):
     source = PinnedAddressSource("source", "entity_address_unified", "a" * 64)
     if fault == "other_table":
         source = replace(source, table_name="other_addresses")
@@ -167,22 +164,21 @@ async def test_office_origin_requires_exact_source_roles_and_parameter_scope_bef
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["missing", "noncompact", "source", "generation", "roles"])
-async def test_retained_locator_cannot_relax_the_complete_office_origin_contract(monkeypatch, fault):
+@pytest.mark.parametrize("fault", ["missing", "source", "generation", "manifest"])
+async def test_retained_locator_preserves_complete_logical_office_scope(monkeypatch, fault):
     from process import registry_source_office_origin as origins
-    from tests.test_network_raw_provider_api_identity import _manifest
+    from process.network_compact_layout import CompactAddressRelation
 
-    address_source = PinnedAddressSource("synthetic_addresses", "entity_address_unified", "a" * 64)
-    manifest = _manifest(compact=fault != "noncompact")
-    manifest.source_generations["unified_address"] = "b" * 64 if fault == "generation" else address_source.generation_id
+    address = PinnedAddressSource("synthetic_addresses", "entity_address_unified", "a" * 64)
+    manifest = SimpleNamespace(
+        manifest_sha256="b" * 64 if fault == "manifest" else "c" * 64,
+        compact_layout=None,
+        address_relation=CompactAddressRelation("retained_addresses", "entity_address_unified"),
+        source_generations={"unified_address": "b" * 64 if fault == "generation" else address.generation_id},
+    )
     candidate_by_field = {
         "validation_json": {
-            "address_source": asdict(
-                replace(address_source, generation_id="b" * 64) if fault == "source" else address_source
-            ),
-            "serving_readiness": {
-                "address_artifact": {"runtime_roles": ["other_reader"] if fault == "roles" else ["reader"]}
-            },
+            "address_source": asdict(replace(address, generation_id="b" * 64) if fault == "source" else address)
         }
     }
     resolve = AsyncMock(return_value=None if fault == "missing" else (manifest, candidate_by_field))
@@ -192,14 +188,42 @@ async def test_retained_locator_cannot_relax_the_complete_office_origin_contract
     )
     with pytest.raises(ValueError, match="origin_unavailable|origin_differs"):
         await resolve_source_office_origin(
-            connection,
-            address_source,
-            runtime_roles=("reader",),
-            control_schema="registry",
-            origin_manifest_sha256="a" * 64,
+            connection, address, runtime_roles=(), control_schema="registry", origin_manifest_sha256="c" * 64
         )
-    assert resolve.await_args.args[1] == {"source_generations": {"retained_network_source": "a" * 64}}
     connection.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("database_label", ["first_copy", "second_copy"])
+async def test_copied_named_office_origin_needs_no_physical_metadata(monkeypatch, database_label):
+    from process import registry_source_office_origin as origins
+    from process.network_compact_layout import CompactAddressRelation
+
+    address = PinnedAddressSource("synthetic_addresses", "entity_address_unified", "a" * 64)
+    manifest = SimpleNamespace(
+        manifest_sha256="c" * 64,
+        compact_layout=None,
+        address_relation=CompactAddressRelation("retained_addresses", "entity_address_unified"),
+        source_generations={"unified_address": address.generation_id},
+    )
+    monkeypatch.setattr(
+        origins,
+        "resolve_registry_retained_generation",
+        AsyncMock(return_value=(manifest, {"validation_json": {"address_source": asdict(address)}})),
+    )
+    connection = SimpleNamespace(
+        database_label=database_label,
+        is_in_transaction=lambda: True,
+        fetchval=AsyncMock(return_value="repeatable read"),
+        fetchrow=AsyncMock(),
+    )
+    resolved = await resolve_source_office_origin(
+        connection, address, runtime_roles=(), control_schema="registry", origin_manifest_sha256="c" * 64
+    )
+    assert resolved.address_scope == (address.schema_name, address.table_name, address.generation_id, "c" * 64)
+    assert resolved.relation_sql == '"retained_addresses"."entity_address_unified"' and resolved.arguments == ()
+    connection.fetchrow.assert_not_awaited()
+    assert connection.fetchval.await_args.args == ("SHOW transaction_isolation",)
 
 
 def _office_candidate():

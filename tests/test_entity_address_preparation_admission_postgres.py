@@ -112,7 +112,7 @@ async def test_all_native_stages_registered_before_geo_compaction_logs(monkeypat
         assert observed_states[0] == {"entity_address_evidence_stage": "u", "entity_address_unified_stage": "u"}
         assert observed_states[1] == observed_states[0]
         assert observed_states[-1] == {"entity_address_evidence_stage": "u", "entity_address_unified_stage": "p"}
-        assert {(schema, stage) for _target, stage, _oid in prepared.stage_oids} <= admission._external_relations
+        assert {(schema, stage) for _target, stage in prepared.stage_relations} <= admission._external_relations
         assert admitted._ADMISSION.get() is None
         await preparation.cleanup_prepared_entity_address_generation(prepared)
         assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified") == "old"
@@ -222,47 +222,33 @@ async def _run_worker(database, schema, worker):
             await database.status(_settings_probe(schema, "denied"))
 
 
-async def test_replacement_after_logging_check_is_never_logged_or_deleted(monkeypatch):
+async def test_missing_stage_after_logging_check_preserves_serving_generation(monkeypatch):
     async with _temporary_schema() as (database, schema):
         ctx, inputs, admission, observed_states = await _admitted_fixture(database, schema, monkeypatch)
         check = admission.check_phase
 
-        async def replace_after_admission_check(request):
+        async def remove_after_admission_check(request):
             receipt = await check(request)
             if request.phase == "pre_logging" and len(observed_states) == 2:
-                await database.status(f"ALTER TABLE {schema}.entity_address_unified_stage RENAME TO original_stage")
-                await database.status(f"CREATE UNLOGGED TABLE {schema}.entity_address_unified_stage (marker text)")
+                await database.status(f"DROP TABLE {schema}.entity_address_unified_stage")
             return receipt
 
-        admission.check_phase = replace_after_admission_check
-        with pytest.raises(RuntimeError, match="relation_changed|stage changed"):
+        admission.check_phase = remove_after_admission_check
+        with pytest.raises((DBAPIError, RuntimeError), match="does not exist|nonprofile_relation_changed"):
             await _prepare(ctx, inputs, admission)
-        assert await native._stage_table_persistence(schema, "entity_address_unified_stage") == "u"
-        assert await native._stage_table_persistence(schema, "original_stage") == "u"
+        assert await native._stage_table_persistence(schema, "entity_address_unified_stage") is None
         assert await native._stage_table_persistence(schema, "entity_address_evidence_stage") is None
         assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified") == "old"
 
 
-async def test_cleanup_rechecks_oid_after_concurrent_name_replacement(monkeypatch):
+async def test_cleanup_preserves_unlisted_relations_and_previous_snapshot(monkeypatch):
     async with _temporary_schema() as (database, schema):
         prepared = await _prepared_fixture(database, schema, monkeypatch)
-        acquire_locks = native._acquire_cutover_locks
-
-        async def replace_then_lock(*args):
-            async with database.engine.begin() as connection:
-                await connection.execute(
-                    text(f"ALTER TABLE {schema}.entity_address_unified_stage RENAME TO original_stage")
-                )
-                await connection.execute(text(f"CREATE TABLE {schema}.entity_address_unified_stage (marker text)"))
-                await connection.execute(
-                    text(f"INSERT INTO {schema}.entity_address_unified_stage VALUES ('replacement')")
-                )
-            await acquire_locks(*args)
-
-        monkeypatch.setattr(native, "_acquire_cutover_locks", replace_then_lock)
+        await database.status(f"CREATE TABLE {schema}.unlisted_stage (marker text)")
+        await database.status(f"INSERT INTO {schema}.unlisted_stage VALUES ('preserved')")
         await preparation.cleanup_prepared_entity_address_generation(prepared)
-        assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified_stage") == "replacement"
-        assert await database.scalar(f"SELECT marker FROM {schema}.original_stage") == "new"
+        assert await database.scalar(f"SELECT marker FROM {schema}.unlisted_stage") == "preserved"
+        assert await database.scalar(f"SELECT to_regclass('{schema}.entity_address_unified_stage')") is None
         assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified") == "old"
 
 
@@ -271,8 +257,8 @@ async def test_cleanup_holds_native_lock_until_drop(monkeypatch):
         prepared = await _prepared_fixture(database, schema, monkeypatch)
         acquire_locks = native._acquire_cutover_locks
 
-        async def lock_then_attempt_replacement(*args):
-            await acquire_locks(*args)
+        async def lock_then_attempt_replacement(*args, **kwargs):
+            await acquire_locks(*args, **kwargs)
             assert await database.scalar("SHOW lock_timeout") == "500ms"
             assert await database.scalar("SHOW statement_timeout") == "5s"
             with pytest.raises(DBAPIError, match="could not obtain lock"):
@@ -292,8 +278,8 @@ async def test_cleanup_finishes_after_owner_cancellation(monkeypatch):
         acquire_locks = native._acquire_cutover_locks
         is_locked, release_cleanup = asyncio.Event(), asyncio.Event()
 
-        async def lock_then_wait(*args):
-            await acquire_locks(*args)
+        async def lock_then_wait(*args, **kwargs):
+            await acquire_locks(*args, **kwargs)
             is_locked.set()
             await release_cleanup.wait()
 

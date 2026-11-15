@@ -8,8 +8,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from sqlalchemy.exc import DBAPIError
 import pytest
+from sqlalchemy.exc import DBAPIError
 
 import process.uhc_flex_practitioner_publication as publication
 from process.uhc_flex_practitioner_acquisition_contract import (
@@ -68,9 +68,9 @@ async def _terminalize_retry_exhaustion(database, identity, exhausted_npi) -> No
     )
 
 
-async def _partial_single_root(database):
+def _partial_identity(cohort):
+    """Derive the same candidate and operation for either genuine cohort source."""
     operation_key = "c" * 64
-    cohort = cohort_support.cohort_fixture()
     intent_id = single_root_dataset_intent_id(
         cohort.cohort_id,
         PROJECTION_DATE,
@@ -82,10 +82,20 @@ async def _partial_single_root(database):
         run_id=single_root_run_id(intent_id),
         dataset_intent_id=intent_id,
     )
-    assert await initialize_uhc_flex_practitioner_acquisition(
-        identity,
-        database=database,
-    ) == 1
+    return identity, operation_key
+
+
+async def _partial_single_root(database, *, cohort=None):
+    """Admit one actually exhausted candidate using its complete official cohort."""
+    cohort = cohort_support.cohort_fixture() if cohort is None else cohort
+    identity, operation_key = _partial_identity(cohort)
+    assert (
+        await initialize_uhc_flex_practitioner_acquisition(
+            identity,
+            database=database,
+        )
+        == 1
+    )
     matched_npi, exhausted_npi = MEMBER_NPIS
     unmatched_npis = tuple(npi for npi in cohort_support.MEMBER_NPIS if npi not in MEMBER_NPIS)
     await _terminalize_retry_exhaustion(database, identity, exhausted_npi)
@@ -102,11 +112,15 @@ async def _partial_single_root(database):
     )
     for npi in unmatched_npis:
         unmatched = await claim_uhc_flex_practitioner_work(
-            identity.acquisition_id, requested_npi=npi, database=database,
+            identity.acquisition_id,
+            requested_npi=npi,
+            database=database,
         )
         assert unmatched is not None
         await complete_uhc_flex_practitioner_result(
-            unmatched, _query_result(npi, False), database=database,
+            unmatched,
+            _query_result(npi, False),
+            database=database,
         )
     summary = await seal_uhc_flex_practitioner_acquisition(
         identity,

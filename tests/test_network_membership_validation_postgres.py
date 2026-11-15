@@ -669,7 +669,6 @@ async def test_typed_accounting_preserves_duplicate_office_arms(validation_db):
     duplicate = CompactAddressRelation(
         fixture.address_source.schema_name,
         fixture.address_source.table_name,
-        await fixture.connection.fetchval("SELECT to_regclass($1)::oid", addresses),
     )
     async with fixture.connection.transaction():
         expected_counts_by_field = dict(

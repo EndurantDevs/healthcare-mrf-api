@@ -5,12 +5,19 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
 import math
 import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
+from process.provider_directory_rooted_graph_contract import (
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_EDGE_ROWS,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_PAYLOAD_BYTES,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_RESOURCE_ROWS,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_WORK_ITEMS,
+    has_matching_rooted_graph_root_publication,
+)
 from process.provider_directory_rooted_graph_http import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_PAGE_BYTES,
     PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_PAGES,
@@ -21,25 +28,18 @@ from process.provider_directory_rooted_graph_http import (
     PROVIDER_DIRECTORY_ROOTED_GRAPH_TIMEOUT_SECONDS,
     ProviderDirectoryRootedGraphHTTPBounds,
 )
-from process.provider_directory_rooted_graph_contract import (
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_EDGE_ROWS,
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_PAYLOAD_BYTES,
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_RESOURCE_ROWS,
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_WORK_ITEMS,
-    has_matching_rooted_graph_root_publication,
-)
-from process.provider_directory_rooted_graph_source_contract import (
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_AUTHORITY_ID,
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256,
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
-)
 from process.provider_directory_rooted_graph_identity import (
     ROOTED_GRAPH_SCOPE_PATTERN,
     SHA256_PATTERN,
 )
 from process.provider_directory_rooted_graph_query import (
     canonical_provider_directory_api_base,
+)
+from process.provider_directory_rooted_graph_source_contract import (
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_AUTHORITY_ID,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256,
+    PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID,
 )
 from process.provider_directory_rooted_graph_store_contract import (
     ACQUISITION_PATTERN,
@@ -48,25 +48,18 @@ from process.provider_directory_rooted_graph_store_contract import (
     ProviderDirectoryRootedGraphAcquisitionIdentity,
 )
 
-
-PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_CONCURRENCY = 4
+PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_CONCURRENCY = 8
 PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_CONCURRENCY = 16
 PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_ATTEMPTS = 3
 PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_ATTEMPTS = 8
 PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_RETRY_SECONDS = 1.0
-PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_RETRY_SECONDS = (
-    PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_RETRY_AFTER_SECONDS
-)
+PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_RETRY_SECONDS = PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_RETRY_AFTER_SECONDS
 PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_HEARTBEAT_SECONDS = 30.0
-PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_ROOT_TIMEOUT_SECONDS = (
-    7 * 24 * 60 * 60
-)
+PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_ROOT_TIMEOUT_SECONDS = 7 * 24 * 60 * 60
 PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_ROOT_TIMEOUT_SECONDS = 30 * 24 * 60 * 60
 ROOT_ROLES = ("baseline", "candidate")
 ACQUISITION_STATES = frozenset({"absent", "building", "sealed"})
-CENSUS_STATES = frozenset(
-    {"absent", "pending", "leased", "completed", "error", "timeout_skipped"}
-)
+CENSUS_STATES = frozenset({"absent", "pending", "leased", "completed", "error", "timeout_skipped"})
 
 
 class ProviderDirectoryRootedGraphAcquisitionError(RuntimeError):
@@ -106,10 +99,7 @@ def _is_snapshot_lineage_valid(snapshot: Any) -> bool:
             and snapshot.root_source_id != snapshot.acquisition_source_id
             and snapshot.root_endpoint_id != snapshot.acquisition_endpoint_id
         )
-        or (
-            snapshot.root_dataset_variant == "rooted_combined"
-            and root_pair == acquisition_pair
-        )
+        or (snapshot.root_dataset_variant == "rooted_combined" and root_pair == acquisition_pair)
     )
 
 
@@ -125,11 +115,9 @@ def _is_snapshot_registry_valid(snapshot: Any) -> bool:
         and type(snapshot.root_endpoint_id) is str
         and SHA256_PATTERN.fullmatch(snapshot.root_endpoint_id) is not None
         and snapshot.acquisition_source_id == PROVIDER_DIRECTORY_ROOTED_GRAPH_SOURCE_ID
-        and snapshot.acquisition_endpoint_id
-        == PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID
+        and snapshot.acquisition_endpoint_id == PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_ID
         and snapshot.source_authority_id == PROVIDER_DIRECTORY_ROOTED_GRAPH_AUTHORITY_ID
-        and snapshot.endpoint_signature_sha256
-        == PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256
+        and snapshot.endpoint_signature_sha256 == PROVIDER_DIRECTORY_ROOTED_GRAPH_ENDPOINT_SIGNATURE_SHA256
     )
 
 
@@ -162,10 +150,7 @@ def _is_snapshot_budget_valid(snapshot: Any) -> bool:
         ),
     )
     return bool(
-        all(
-            type(budget) is int and 0 < budget <= maximum
-            for budget, maximum in budget_limits
-        )
+        all(type(budget) is int and 0 < budget <= maximum for budget, maximum in budget_limits)
         and snapshot.max_work_items > snapshot.root_resource_count
     )
 
@@ -178,24 +163,16 @@ class ProviderDirectoryRootedGraphAcquisitionConfig:
     concurrency: int = PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_CONCURRENCY
     max_attempts: int = PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_ATTEMPTS
     lease_seconds: int = 300
-    heartbeat_seconds: float = (
-        PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_HEARTBEAT_SECONDS
-    )
-    retry_base_seconds: float = (
-        PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_RETRY_SECONDS
-    )
-    max_retry_seconds: float = (
-        PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_RETRY_SECONDS
-    )
+    heartbeat_seconds: float = PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_HEARTBEAT_SECONDS
+    retry_base_seconds: float = PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_RETRY_SECONDS
+    max_retry_seconds: float = PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_RETRY_SECONDS
     max_page_bytes: int = PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_PAGE_BYTES
     max_query_bytes: int = PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_QUERY_BYTES
     max_pages: int = PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_PAGES
     max_resources: int = PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_RESOURCES
     max_url_bytes: int = PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_URL_BYTES
     timeout_seconds: float = PROVIDER_DIRECTORY_ROOTED_GRAPH_TIMEOUT_SECONDS
-    root_timeout_seconds: float = (
-        PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_ROOT_TIMEOUT_SECONDS
-    )
+    root_timeout_seconds: float = PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_DEFAULT_ROOT_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         heartbeat_seconds = strict_nonnegative_seconds(
@@ -217,33 +194,22 @@ class ProviderDirectoryRootedGraphAcquisitionConfig:
         try:
             self.http_bounds()
         except ValueError:
-            raise ValueError(
-                "provider_directory_rooted_graph_acquisition_config_invalid"
-            ) from None
+            raise ValueError("provider_directory_rooted_graph_acquisition_config_invalid") from None
         if (
             type(self.enabled) is not bool
             or type(self.concurrency) is not int
-            or not 1
-            <= self.concurrency
-            <= PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_CONCURRENCY
+            or not 1 <= self.concurrency <= PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_CONCURRENCY
             or type(self.max_attempts) is not int
-            or not 1
-            <= self.max_attempts
-            <= PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_ATTEMPTS
+            or not 1 <= self.max_attempts <= PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_ATTEMPTS
             or type(self.lease_seconds) is not int
             or not 30 <= self.lease_seconds <= 3600
             or not 0 < heartbeat_seconds <= self.lease_seconds / 2
             or retry_base_seconds <= 0
             or retry_base_seconds > max_retry_seconds
-            or max_retry_seconds
-            > PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_RETRY_SECONDS
-            or not 0
-            < root_timeout_seconds
-            <= PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_ROOT_TIMEOUT_SECONDS
+            or max_retry_seconds > PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_RETRY_SECONDS
+            or not 0 < root_timeout_seconds <= PROVIDER_DIRECTORY_ROOTED_GRAPH_ACQUISITION_MAX_ROOT_TIMEOUT_SECONDS
         ):
-            raise ValueError(
-                "provider_directory_rooted_graph_acquisition_config_invalid"
-            )
+            raise ValueError("provider_directory_rooted_graph_acquisition_config_invalid")
 
     def http_bounds(self) -> ProviderDirectoryRootedGraphHTTPBounds:
         """Project transport caps without widening any hard maximum."""
@@ -286,13 +252,10 @@ class ProviderDirectoryRootedGraphInputSnapshot:
         try:
             canonical_api_base = canonical_provider_directory_api_base(self.api_base)
         except ValueError:
-            raise ValueError(
-                "provider_directory_rooted_graph_input_snapshot_invalid"
-            ) from None
+            raise ValueError("provider_directory_rooted_graph_input_snapshot_invalid") from None
         if (
             canonical_api_base != self.api_base
-            or self.root_dataset_variant
-            not in {"uhc_flex_practitioner", "rooted_combined"}
+            or self.root_dataset_variant not in {"uhc_flex_practitioner", "rooted_combined"}
             or not _is_snapshot_lineage_valid(self)
             or not _is_snapshot_registry_valid(self)
             or not _is_snapshot_root_valid(self)
@@ -334,8 +297,7 @@ class ProviderDirectoryRootedGraphInputSnapshot:
         return bool(
             type(identity) is ProviderDirectoryRootedGraphAcquisitionIdentity
             and self.root_dataset_variant == identity.root_dataset_variant
-            and self.root_publication_contract_id
-            == identity.root_publication_contract_id
+            and self.root_publication_contract_id == identity.root_publication_contract_id
             and self.root_source_id == identity.root_source_id
             and self.root_endpoint_id == identity.root_endpoint_id
             and self.acquisition_source_id == identity.acquisition_source_id
@@ -407,8 +369,7 @@ class ProviderDirectoryRootedGraphAcquisitionReceipt:
             or self.baseline.acquisition_id == self.candidate.acquisition_id
             or self.baseline.run_id == self.candidate.run_id
             or type(self.rooted_graphs_match) is not bool
-            or self.rooted_graphs_match
-            != (self.baseline.rooted_graph_sha256 == self.candidate.rooted_graph_sha256)
+            or self.rooted_graphs_match != (self.baseline.rooted_graph_sha256 == self.candidate.rooted_graph_sha256)
         ):
             raise ValueError("provider_directory_rooted_graph_receipt_invalid")
         strict_nonnegative_seconds(self.elapsed_seconds, "elapsed_seconds")

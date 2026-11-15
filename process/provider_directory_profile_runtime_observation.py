@@ -5,9 +5,8 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import re
-import stat
+from pathlib import Path
 from typing import Any, Mapping
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -25,18 +24,10 @@ from process.provider_directory_profile_capacity_types import (
     PROFILE_STRATEGY_VERSION,
 )
 
-
-PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-runtime-observation.v1"
-)
-PROFILE_RUNTIME_SOURCE_COMMIT_FILE = Path(
-    "/opt/healthporta/build-identity/healthcare-source-commit"
-)
+PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID = "healthporta.provider-directory-profile-runtime-observation.v1"
+PROFILE_RUNTIME_SOURCE_COMMIT_FILE = Path("/opt/healthporta/build-identity/healthcare-source-commit")
 _SOURCE_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _MIGRATION_REVISION_PATTERN = re.compile(r"^[0-9a-z_]{1,128}$")
-_BUILD_IDENTITY_UID = 0
-_BUILD_IDENTITY_GID = 0
-_BUILD_IDENTITY_MODE = 0o444
 _BUILD_IDENTITY_SIZE = 41
 _RUNTIME_OBSERVATION_FIELDS = frozenset(
     {
@@ -60,14 +51,6 @@ CAPACITY_LEASE_AUDIT_ONLY_RUNTIME_FIELDS = (
     CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD,
     CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD,
 )
-CAPACITY_LEASE_AUDIT_ONLY_DEPLOYMENT_FIELDS = (
-    "flux_revision",
-    "bootstrap_config_sha256",
-    "kubernetes_snapshot_sha256",
-    "preflight_pod_name",
-    "preflight_pod_uid",
-    "preflight_transport",
-)
 
 
 class ProviderDirectoryProfileRuntimeObservationError(RuntimeError):
@@ -77,9 +60,7 @@ class ProviderDirectoryProfileRuntimeObservationError(RuntimeError):
 def _runtime_observation_error(
     reason: str,
 ) -> ProviderDirectoryProfileRuntimeObservationError:
-    return ProviderDirectoryProfileRuntimeObservationError(
-        f"provider_directory_profile_runtime_observation_{reason}"
-    )
+    return ProviderDirectoryProfileRuntimeObservationError(f"provider_directory_profile_runtime_observation_{reason}")
 
 
 def _database_schema() -> str:
@@ -112,17 +93,8 @@ def build_baked_healthcare_source_commit() -> str:
 
     descriptor: int | None = None
     try:
-        path_stat = PROFILE_RUNTIME_SOURCE_COMMIT_FILE.lstat()
-        _validate_build_identity_file_stat(path_stat)
         descriptor = _open_build_identity_file(PROFILE_RUNTIME_SOURCE_COMMIT_FILE)
-        opened_stat = os.fstat(descriptor)
-        _validate_build_identity_file_stat(opened_stat)
-        _require_same_build_identity_file(path_stat, opened_stat)
         raw_source_commit = _read_build_identity_file(descriptor)
-        final_path_stat = PROFILE_RUNTIME_SOURCE_COMMIT_FILE.lstat()
-        final_opened_stat = os.fstat(descriptor)
-        _require_same_build_identity_file(path_stat, final_path_stat)
-        _require_same_build_identity_file(path_stat, final_opened_stat)
         source_commit = raw_source_commit.decode("ascii").removesuffix("\n")
     except (OSError, UnicodeDecodeError) as exc:
         raise _runtime_observation_error("healthcare_source_commit_invalid") from exc
@@ -139,20 +111,8 @@ def build_baked_healthcare_source_commit() -> str:
     return source_commit
 
 
-def _validate_build_identity_file_stat(file_stat: os.stat_result) -> None:
-    if (
-        not stat.S_ISREG(file_stat.st_mode)
-        or stat.S_IMODE(file_stat.st_mode) != _BUILD_IDENTITY_MODE
-        or file_stat.st_uid != _BUILD_IDENTITY_UID
-        or file_stat.st_gid != _BUILD_IDENTITY_GID
-        or file_stat.st_nlink != 1
-        or file_stat.st_size != _BUILD_IDENTITY_SIZE
-    ):
-        raise _runtime_observation_error("healthcare_source_commit_invalid")
-
-
 def _open_build_identity_file(path: Path) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     return os.open(path, flags)
 
 
@@ -166,28 +126,6 @@ def _read_build_identity_file(descriptor: int) -> bytes:
     if os.read(descriptor, 1):
         raise _runtime_observation_error("healthcare_source_commit_invalid")
     return bytes(chunks)
-
-
-def _require_same_build_identity_file(
-    expected: os.stat_result,
-    observed: os.stat_result,
-) -> None:
-    stable_fields = (
-        "st_dev",
-        "st_ino",
-        "st_mode",
-        "st_nlink",
-        "st_uid",
-        "st_gid",
-        "st_size",
-        "st_mtime_ns",
-        "st_ctime_ns",
-    )
-    if any(
-        getattr(expected, field_name) != getattr(observed, field_name)
-        for field_name in stable_fields
-    ):
-        raise _runtime_observation_error("healthcare_source_commit_invalid")
 
 
 def _runtime_observation_row_mapping(row: Any) -> Mapping[str, Any]:
@@ -218,11 +156,7 @@ def _validated_postgres_server_version_num(value: Any) -> int:
 def _source_profile_identity() -> tuple[int, str]:
     schema_version = profile_artifact.PROFILE_SCHEMA_VERSION
     strategy_version = profile_artifact.PROFILE_BUILD_STRATEGY_VERSION
-    if (
-        not isinstance(schema_version, int)
-        or isinstance(schema_version, bool)
-        or schema_version <= 0
-    ):
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version <= 0:
         raise _runtime_observation_error("profile_schema_version_invalid")
     if strategy_version != PROFILE_STRATEGY_VERSION:
         raise _runtime_observation_error("profile_strategy_version_invalid")
@@ -236,27 +170,19 @@ async def observe_profile_runtime(database: Any = db) -> dict[str, Any]:
     try:
         migration_rows = await database.all(profile_runtime_observation_sql())
     except SQLAlchemyError as exc:
-        raise _runtime_observation_error(
-            "profile_migration_revision_unavailable"
-        ) from exc
+        raise _runtime_observation_error("profile_migration_revision_unavailable") from exc
     if not isinstance(migration_rows, (list, tuple)) or len(migration_rows) != 1:
-        raise _runtime_observation_error(
-            "profile_migration_revision_cardinality_invalid"
-        )
+        raise _runtime_observation_error("profile_migration_revision_cardinality_invalid")
     migration_row = _runtime_observation_row_mapping(migration_rows[0])
     schema_version, strategy_version = _source_profile_identity()
     return {
         "contract_id": PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID,
         "healthcare_source_commit": source_commit,
-        "profile_migration_revision": _validated_migration_revision(
-            migration_row["profile_migration_revision"]
-        ),
+        "profile_migration_revision": _validated_migration_revision(migration_row["profile_migration_revision"]),
         "profile_schema_version": schema_version,
         "profile_strategy_version": strategy_version,
         "postgres_server_version_num": (
-            _validated_postgres_server_version_num(
-                migration_row["postgres_server_version_num"]
-            )
+            _validated_postgres_server_version_num(migration_row["postgres_server_version_num"])
         ),
     }
 
@@ -309,14 +235,12 @@ def assert_capacity_lease_matches_runtime_observation(
         or observation.get("contract_id") != PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID
     ):
         raise _runtime_observation_error("fields_invalid")
-    witness = lease.runtime_witness
+    witness = lease.runtime
     expected_by_field = {
-        field_name: getattr(witness, field_name)
-        for field_name in CAPACITY_LEASE_LOCALLY_VERIFIED_RUNTIME_FIELDS
+        field_name: getattr(witness, field_name) for field_name in CAPACITY_LEASE_LOCALLY_VERIFIED_RUNTIME_FIELDS
     }
     observed_by_field = {
-        field_name: observation.get(field_name)
-        for field_name in CAPACITY_LEASE_LOCALLY_VERIFIED_RUNTIME_FIELDS
+        field_name: observation.get(field_name) for field_name in CAPACITY_LEASE_LOCALLY_VERIFIED_RUNTIME_FIELDS
     }
     if expected_by_field != observed_by_field:
         raise _runtime_observation_error("capacity_lease_runtime_mismatch")

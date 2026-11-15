@@ -2,7 +2,6 @@
 """Real signed Profile pairs and closed CMS receipts using the existing synthetic key."""
 
 from copy import deepcopy
-from dataclasses import replace
 from types import SimpleNamespace
 
 from process import provider_directory_cms_capacity_contract as contract
@@ -77,9 +76,17 @@ def _profile_guard(execution):
         control_receipt,
         identity_by_field,
         limits_by_field,
-        "55" * 32,
+        None,
         timing,
     )
+    from process import provider_directory_profile_capacity as capacity
+
+    geometry = healthcare_receipt["capacity_geometry"]
+    geometry["profile_as_of"] = execution.attestation.desired_profile_as_of
+    healthcare_receipt["capacity_geometry_hash"] = capacity.capacity_geometry_hash(
+        capacity.validated_capacity_geometry(geometry)
+    )
+    _receipt_digest(healthcare_receipt)
     return support._guard_payload(
         control_request,
         control_receipt,
@@ -113,6 +120,7 @@ def rehash_guard(guard):
     healthcare["control_plane_receipt_sha256"] = control["receipt_sha256"]
     _receipt_digest(healthcare)
     guard.update(
+        storage_observation_sha256=control["storage_observation_sha256"],
         control_plane_request_sha256=control["request_sha256"],
         control_plane_receipt_sha256=control["receipt_sha256"],
         healthcare_request_sha256=healthcare["request_sha256"],
@@ -120,8 +128,8 @@ def rehash_guard(guard):
     )
 
 
-def sign_guard(guard, *, cms=False, database_identity=None):
-    """Sign all changed content with the golden Ed25519 key, preserving runtime witness fields."""
+def sign_guard(guard, *, cms=False):
+    """Sign all changed logical content with the existing golden Ed25519 key."""
 
     def mutate(body):
         receipt = guard["healthcare_receipt"]
@@ -134,28 +142,29 @@ def sign_guard(guard, *, cms=False, database_identity=None):
                 guard,
             ),
         )
-        if database_identity is not None:
-            assert set(database_identity) == {"database_oid", "database_name", "database_system_identifier"}
-            body.update(database_identity)
         if cms:
             body["reservation_id"] = "synthetic-nonprofile"
-            for volume in body["volumes"]:
-                volume["reserved_bytes"] = receipt["required_reservation_bytes_by_storage_class"][
-                    volume["volume_class"]
-                ]
+            body["storage_classes"] = [
+                {
+                    **entry,
+                    "reserved_bytes": receipt["required_reservation_bytes_by_storage_class"][entry["storage_class"]],
+                }
+                for entry in guard["control_plane_request"]["storage_observation"]["storage_classes"]
+            ]
 
     return _signed_envelope(body_mutator=mutate)
 
 
-def paired_profile_envelope(execution=None, *, database_identity=None):
+def paired_profile_envelope(execution=None):
     """Return a current signed Profile-purpose lease for the exact desired CMS execution."""
-    return sign_guard(_profile_guard(execution or cms_execution()), database_identity=database_identity)
+    return sign_guard(_profile_guard(execution or cms_execution()))
 
 
 def cms_plan():
     """Bind every nonprofile plan field to the real paired proof, date, and lease digest."""
     execution = cms_execution()
-    profile = _verify(paired_profile_envelope(execution))
+    envelope = paired_profile_envelope(execution)
+    profile = _verify(envelope, expected_capacity_geometry_hash=envelope["lease"]["capacity_geometry_hash"])
     fence = SimpleNamespace(
         datasets=tuple(
             SimpleNamespace(
@@ -207,11 +216,11 @@ def cms_limits(plan):
     }
 
 
-def cms_guard(plan=None, *, execution=None, paired_envelope=None, retention_policy=None, database_identity=None):
-    """Build explicit CMS v4/Control v2 receipts over a complete nonprofile plan."""
+def cms_guard(plan=None, *, execution=None, paired_envelope=None, retention_policy=None):
+    """Build current CMS/Control receipts over the complete plan and authenticated pair."""
     execution = execution or cms_execution()
     plan = plan or cms_plan()[0]
-    pair = paired_envelope or paired_profile_envelope(execution, database_identity=database_identity)
+    pair = paired_envelope or paired_profile_envelope(execution)
     guard = _profile_guard(execution)
     admission_by_field = {
         "contract_id": contract.CMS_ADMISSION_REQUEST_CONTRACT,
@@ -236,7 +245,18 @@ def cms_guard(plan=None, *, execution=None, paired_envelope=None, retention_poli
         **{contract.CMS_ADMISSION_FIELD: deepcopy(admission_by_field)},
     )
     body = pair["lease"]
-    data_tablespace = next(entry for entry in body["tablespaces"] if entry["usage"] == "data")
+    storage = guard["control_plane_request"]["storage_observation"]
+    storage["storage_classes"] = [
+        {name: entry_value for name, entry_value in entry.items() if name != "reserved_bytes"}
+        | {
+            "available_after_all_reservations_bytes": entry["available_after_all_reservations_bytes"]
+            - dict(plan.reservation_bytes)[entry["storage_class"]]
+        }
+        for entry in body["storage_classes"]
+    ]
+    guard["control_plane_receipt"]["storage_observation_sha256"] = preflight.preflight_domain_sha256(
+        support.guard_contract.CONTROL_PLANE_STORAGE_OBSERVATION_DIGEST_DOMAIN, storage
+    )
     guard["healthcare_receipt"].update(
         contract_id=contract.CMS_PREFLIGHT_CONTRACT,
         request_contract_id=contract.CMS_PREFLIGHT_REQUEST_CONTRACT,
@@ -244,35 +264,19 @@ def cms_guard(plan=None, *, execution=None, paired_envelope=None, retention_poli
         capacity_geometry=plan.payload,
         required_reservation_bytes_by_storage_class=dict(plan.reservation_bytes),
         artifact_scope_projection={"projection_hash": plan.artifact_scope_projection_hash},
-        database_binding={
-            **{
-                name: body[name]
-                for name in (
-                    "database_system_identifier",
-                    "database_oid",
-                    "database_name",
-                )
-            },
-            **{name: data_tablespace[name] for name in ("tablespace_oid", "tablespace_name")},
-        },
     )
     rehash_guard(guard)
     return guard
 
 
-def signed_cms_plan(plan, *, retention_policy=None, execution=None, database_identity=None):
+def signed_cms_plan(plan, *, retention_policy=None, execution=None):
     """Return actual CMS signature verification, never a Profile-only guard stand-in."""
     return _verify(
         sign_guard(
-            cms_guard(
-                plan, retention_policy=retention_policy, execution=execution, database_identity=database_identity
-            ),
+            cms_guard(plan, retention_policy=retention_policy, execution=execution),
             cms=True,
-            database_identity=database_identity,
         ),
         expected_capacity_geometry_hash=plan.capacity_geometry_hash,
-        **({"trust": replace(_trust(), **database_identity)} if database_identity else {}),
-        **({"expected_" + field: value for field, value in database_identity.items()} if database_identity else {}),
     )
 
 

@@ -31,22 +31,8 @@ def sign(body, key):
 
 
 def authorization_fixture(now=NOW):
-    """Return the original signed synthetic authority and its verification trust."""
+    """Return one logical signed permit and independent source/key trust."""
     key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
-    tablespaces = [
-        {"usage": role, "tablespace_oid": 1663, "tablespace_name": "pg_default", "volume_digest": "a" * 64}
-        for role in ("data", "temp")
-    ]
-    volumes = [
-        {
-            "volume_class": role,
-            "volume_digest": "a" * 64,
-            "reserved_bytes": field_value,
-            "available_bytes": 10**10,
-            "available_after_all_reservations_bytes": 10**10 - 10**9,
-        }
-        for role, field_value in (("data", 10**6), ("temp", 0), ("wal", 10**8))
-    ]
     trust_key = SimpleNamespace(
         key_id="key-a",
         public_key=key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw),
@@ -56,18 +42,18 @@ def authorization_fixture(now=NOW):
         verify_until=None,
     )
     trust = SimpleNamespace(
-        attestor_id="authority-a",
-        environment_id="environment-a",
-        active_key_id="key-a",
-        keys=(trust_key,),
-        database_system_identifier="123456789",
-        database_oid=16384,
-        database_name="synthetic_test",
-        tablespaces=tuple(tablespaces),
-        volumes=tuple({field: volume[field] for field in ("volume_class", "volume_digest")} for volume in volumes),
+        attestor_id="authority-a", environment_id="environment-a", active_key_id="key-a", keys=(trust_key,)
     )
-    body_by_field = _authorization_body(now, trust, tablespaces, volumes)
-    return sign(body_by_field, key), trust, key
+    storage_classes = [
+        {
+            "storage_class": role,
+            "reserved_bytes": reserved,
+            "available_bytes": 10**10,
+            "available_after_all_reservations_bytes": 10**10 - reserved,
+        }
+        for role, reserved in (("data", 10**6), ("temp", 0), ("wal", 10**8))
+    ]
+    return sign(_authorization_body(now, trust, storage_classes), key), trust, key
 
 
 def test_independent_signature_and_retained_claim_replay():
@@ -78,6 +64,39 @@ def test_independent_signature_and_retained_claim_replay():
     assert cleanup.validate_authorization(envelope, trust=trust, now=NOW + timedelta(hours=1), claimed_at=NOW)
     with pytest.raises(RuntimeError, match="independent_trust_missing"):
         cleanup.validate_authorization(envelope, trust=None, now=NOW)
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
+def test_historical_authentication_preserves_raw_history_and_full_ceilings(version):
+    """Original signed history accounts ceilings without granting fresh disposal authority."""
+    envelope, trust, key = authorization_fixture()
+    body = envelope["authorization"]
+    body["contract_id"] = f"healthporta.provider-directory.failed-profile-cleanup-authorization.v{version}"
+    body["volumes"] = body.pop("storage_classes")
+    if version != 1:
+        body.update(variant="legacy_full_swap" if version == 2 else "initial_full_swap", physical={})
+        body["publication" if version == 2 else "initial"] = {"retained": "opaque signed history"}
+    signed = sign(body, key)
+    original_bytes = cleanup.canonical(signed)
+    original_digest = cleanup.digest(signed)
+    trust.keys[0].status = "retired"
+    trust.keys[0].retired_at = NOW + timedelta(minutes=1)
+    trust.keys[0].verify_until = NOW + timedelta(minutes=20)
+    authenticated = cleanup.authenticate_historical_authorization(
+        signed, trust=trust, now=NOW + timedelta(days=1), claimed_at=NOW
+    )
+    assert authenticated == body
+    assert authenticated["limits"] == body["limits"]
+    assert cleanup.canonical(signed) == original_bytes
+    assert cleanup.digest(signed) == original_digest
+    with pytest.raises(RuntimeError, match="legacy_semantic_evidence_required$"):
+        cleanup.validate_authorization(signed, trust=trust, now=NOW, claimed_at=NOW)
+    tampered = deepcopy(signed)
+    tampered["authorization"]["limits"]["wal_bytes"] += 1
+    with pytest.raises(RuntimeError, match="signature_invalid$"):
+        cleanup.authenticate_historical_authorization(
+            tampered, trust=trust, now=NOW + timedelta(days=1), claimed_at=NOW
+        )
 
 
 @pytest.mark.parametrize(
@@ -93,9 +112,9 @@ def test_closed_authority_rejects_changed_or_unfunded_operation(change):
     if change == "stage":
         body["stages"][0]["table_name"] = "arbitrary"
     if change == "oid":
-        body["stages"][0]["oid"] = body["stages"][1]["oid"]
+        body["stages"][0]["name"] = body["stages"][1]["name"]
     if change == "volume":
-        body["volumes"][0]["available_after_all_reservations_bytes"] = 10**10
+        body["storage_classes"][0]["available_after_all_reservations_bytes"] = 10**10
     if change == "freshness":
         body["observations"]["host_observed_at"] = (NOW - timedelta(seconds=6)).isoformat()
     if change == "deadline":
@@ -191,7 +210,7 @@ async def test_completion_marker_refuses_non_object_before_claim_lookup(receipt)
 
 def test_canonical_cross_repository_golden():
     envelope, _trust, _key = authorization_fixture()
-    assert cleanup.digest(envelope) == "8d4c06968e8031b24b166583e95e8ebd77e2a098d487128989fc05256723f049"
+    assert cleanup.digest(envelope) == "67075e66d177fb7a75bd2857477c655643c70cc79fb2aa6e0f903968b847ebfd"
 
 
 @pytest.mark.parametrize("mode", ["execute", "reconcile"])
@@ -219,7 +238,7 @@ def test_cli_dispatch_validates_legacy_authority_in_its_own_namespace(monkeypatc
 
 
 def legacy_authorization_fixture(now=NOW):
-    """Extend the ordinary synthetic authority with the exact legacy witnesses."""
+    """Bind the two-stage full-swap variant to named history and numeric costs."""
     envelope, trust, key = authorization_fixture(now)
     body = envelope["authorization"]
     body.update(contract_id=cleanup.LEGACY_CONTRACT, variant="legacy_full_swap")
@@ -234,33 +253,49 @@ def legacy_authorization_fixture(now=NOW):
     )
     body["stages"] = body["stages"][:2]
     body["limits"]["statement_count"] = 4
-    postgres_by_field = _legacy_postgres_fields(trust)
-    body["physical"] = {
+    body["capacity"] = {
         "observed_at": now.isoformat(),
-        "postgres": postgres_by_field,
+        "postgres": _legacy_postgres_fields(trust),
         "checkpoint_layout": {
-            "oid": 17030,
-            "storage_fingerprint": "f" * 64,
+            "schema": "mrf",
+            "name": "provider_directory_profile_build_checkpoint",
+            "main_index_pages": [1, 1, 1],
+            "toast_index_pages": [1],
+            "toastable_column_count": 1,
             "old_toast_chunks": 35,
             "row_payload_upper_bytes": 32000,
         },
-        "claim_layout": {"oid": 17031, "storage_fingerprint": "a" * 64},
+        "claim_layout": {
+            "schema": "mrf",
+            "name": "provider_directory_profile_failed_cleanup_claim",
+            "main_index_pages": [1, 1, 1],
+            "toast_index_pages": [1],
+            "toastable_column_count": 1,
+        },
         "stage_dependencies": [
-            {"role": role, "object_count": 5, "relation_count": 3, "catalog_tuple_count": 25, "fingerprint": "b" * 64}
+            {"role": role, "object_count": 5, "relation_count": 3, "catalog_tuple_count": 25}
             for role in ("evidence", "profile")
         ],
         "commit_wal_upper_bytes": 10000000,
     }
     _bind_legacy_catalogs(body)
-    body["publication"] = {
+    body["publication"] = _legacy_publication_fixture()
+    return sign(body, key), trust, key
+
+
+def _legacy_publication_fixture():
+    """Return the exact named publication history used by current full-swap fixtures."""
+    return {
         "serving_state": "empty",
-        "serving_table_oid": 17040,
-        "delta_receipt_table_oid": 17041,
-        "cms_receipt_table_oid": 17042,
-        "targets": [
-            {"role": role, "oid": oid, "storage_fingerprint": "c" * 64}
-            for role, oid in (("evidence", 17050), ("profile", 17051))
-        ],
+        "relations": {
+            role: {"schema": "mrf", "name": name}
+            for role, name in (
+                ("serving_generation", "provider_directory_profile_serving_generation"),
+                ("delta_receipt", "provider_directory_profile_delta_receipt"),
+                ("cms_receipt", "provider_directory_cms_serving_receipt"),
+            )
+        },
+        "targets": [{"role": role, "schema": "mrf", "name": "published_" + role} for role in ("evidence", "profile")],
         "published_run_id": "run-published",
         "published_run_preimage_sha256": "d" * 64,
         "published_result_sha256": "e" * 64,
@@ -268,7 +303,6 @@ def legacy_authorization_fixture(now=NOW):
         "published_proof_id": "f" * 64,
         "published_control_generation": 6,
     }
-    return sign(body, key), trust, key
 
 
 def test_closed_legacy_has_separate_domain_and_preserves_explicit_absence():
@@ -278,7 +312,7 @@ def test_closed_legacy_has_separate_domain_and_preserves_explicit_absence():
     assert body["checkpoint"]["selection_proof_id"] is None
     assert cleanup.stage_roles(body) == ("evidence", "profile")
     assert cleanup.signature_domain(body) != cleanup.SIGNATURE_DOMAIN
-    assert cleanup.digest(envelope) == "0b276dd274c8f8b3586fee01ab52eaca8d6d64a7998257baa0b885a0113cdc6a"
+    assert cleanup.digest(envelope) == "55e4e245b5d8545fd6a24e3770f5fef3e0b0f79bb80fc1db2d8f20027991e5ac"
 
 
 @pytest.mark.parametrize(
@@ -290,7 +324,7 @@ def test_closed_legacy_has_separate_domain_and_preserves_explicit_absence():
         "affected",
         "target_alias",
         "publication_missing",
-        "physical_stale",
+        "capacity_stale",
         "unknown_variant",
         "old_toast",
         "row_payload",
@@ -311,20 +345,20 @@ def test_legacy_closed_authority_refuses_unknown_identity_or_physical_inputs(cha
     if change == "partial":
         body["checkpoint"]["control_generation"] = 7
     if change == "affected":
-        body["stages"].append({"role": "affected_npi", "oid": 17002, "storage_fingerprint": "e" * 64})
+        body["stages"].append({"role": "affected_npi", "schema": "mrf", "name": "affected_failed"})
     if change == "target_alias":
-        body["stages"][0]["oid"] = body["publication"]["targets"][0]["oid"]
+        body["stages"][0].update({name: body["publication"]["targets"][0][name] for name in ("schema", "name")})
     if change == "publication_missing":
         body["publication"]["published_run_id"] = None
-    if change == "physical_stale":
-        body["physical"]["observed_at"] = (NOW - timedelta(seconds=6)).isoformat()
+    if change == "capacity_stale":
+        body["capacity"]["observed_at"] = (NOW - timedelta(seconds=6)).isoformat()
     if change == "unknown_variant":
         body["variant"] = "full_swap"
     if change == "old_toast":
-        body["physical"]["checkpoint_layout"]["old_toast_chunks"] = -1
+        body["capacity"]["checkpoint_layout"]["old_toast_chunks"] = -1
     if change == "row_payload":
-        body["physical"]["checkpoint_layout"]["row_payload_upper_bytes"] = 65537
-    dependency = body["physical"]["stage_dependencies"][0]
+        body["capacity"]["checkpoint_layout"]["row_payload_upper_bytes"] = 65537
+    dependency = body["capacity"]["stage_dependencies"][0]
     if change == "catalog_missing":
         dependency["catalog_deletions"].pop()
     if change == "catalog_unknown":
@@ -339,8 +373,8 @@ def test_legacy_closed_authority_refuses_unknown_identity_or_physical_inputs(cha
         cleanup.validate_authorization(sign(body, key), trust=trust, now=NOW)
 
 
-def _authorization_body(now, trust, tablespaces, volumes):
-    """Build the unchanged closed synthetic cleanup authorization body."""
+def _authorization_body(now, trust, storage_classes):
+    """Build the closed named-stage cleanup authorization body."""
     return {
         "contract_id": cleanup.CONTRACT,
         "purpose": "failed_profile_cleanup",
@@ -356,13 +390,7 @@ def _authorization_body(now, trust, tablespaces, volumes):
         "environment_id": trust.environment_id,
         "attestor_release_digest": "b" * 64,
         "executor_identity": {"runtime_sha256": "c" * 64, "release_digest": "d" * 64},
-        "database": {
-            "database_system_identifier": trust.database_system_identifier,
-            "database_oid": trust.database_oid,
-            "database_name": trust.database_name,
-            "schema": "mrf",
-            "tablespaces": tablespaces,
-        },
+        "database": {"schema": "mrf"},
         "checkpoint": {
             "build_id": "pdpb_" + "e" * 32,
             "owner_run_id": "run-a",
@@ -376,15 +404,15 @@ def _authorization_body(now, trust, tablespaces, volumes):
             "control_generation": 2,
         },
         "stages": [
-            {"role": role, "oid": oid, "storage_fingerprint": "e" * 64}
-            for role, oid in (("evidence", 17000), ("profile", 17001), ("affected_npi", 17002))
+            {"role": role, "schema": "mrf", "name": role + "_failed"}
+            for role in ("evidence", "profile", "affected_npi")
         ],
         "observations": {
             **{kind + "_observed_at": now.isoformat() for kind in ("host", "control", "healthcare")},
             **{kind + "_sha256": "f" * 64 for kind in ("host", "control", "healthcare")},
             "accounted_reservation_ids": ["reservation-a"],
         },
-        "volumes": volumes,
+        "storage_classes": storage_classes,
         "limits": {
             "data_bytes": 10**6,
             "temp_bytes": 0,
@@ -400,13 +428,6 @@ def _authorization_body(now, trust, tablespaces, volumes):
 def _legacy_postgres_fields(trust):
     """Return the fixed PostgreSQL settings used by the legacy authority fixture."""
     return {
-        "database_system_identifier": trust.database_system_identifier,
-        "database_oid": trust.database_oid,
-        "database_name": trust.database_name,
-        "tablespace_oid": 1663,
-        "tablespace_name": "pg_default",
-        "temp_tablespace_oid": 1663,
-        "temp_tablespace_name": "pg_default",
         "postgres_server_version_num": 180000,
         "postgres_block_size_bytes": 8192,
         "postgres_wal_block_size_bytes": 8192,
@@ -441,12 +462,12 @@ def _bind_legacy_catalogs(body):
         "pg_init_privs",
         "pg_statistic",
     )
-    for dependency in body["physical"]["stage_dependencies"]:
+    for dependency in body["capacity"]["stage_dependencies"]:
         dependency["catalog_deletions"] = [
             {
                 "catalog": name,
-                "oid": 20000 + position,
-                "storage_fingerprint": "a" * 64,
+                "schema": "pg_catalog",
+                "name": name,
                 "deleted_rows": 2,
                 "deleted_toast_chunks": 3 if name == "pg_description" else 0,
                 "wal_upper_bytes": 100000,
@@ -459,7 +480,7 @@ def _bind_legacy_catalogs(body):
 
 @pytest.mark.parametrize(
     "legacy,kind",
-    [(legacy, kind) for legacy in (False, True) for kind in ("host", "control", "healthcare")] + [(True, "physical")],
+    [(legacy, kind) for legacy in (False, True) for kind in ("host", "control", "healthcare")] + [(True, "capacity")],
 )
 @pytest.mark.parametrize("is_stored", [False, True])
 def test_observations_cannot_postdate_signed_issuance(legacy, kind, is_stored):
@@ -467,12 +488,12 @@ def test_observations_cannot_postdate_signed_issuance(legacy, kind, is_stored):
     factory = legacy_authorization_fixture if legacy else authorization_fixture
     envelope, trust, key = factory()
     body = envelope["authorization"]
-    target = body["physical"] if kind == "physical" else body["observations"]
-    field = "observed_at" if kind == "physical" else kind + "_observed_at"
+    target = body["capacity"] if kind == "capacity" else body["observations"]
+    field = "observed_at" if kind == "capacity" else kind + "_observed_at"
     target[field] = (NOW + timedelta(seconds=1)).isoformat()
     envelope = sign(body, key)
     admission_at = NOW + timedelta(seconds=2)
-    reason = "physical_observation_stale" if kind == "physical" else "observation_stale"
+    reason = "capacity_observation_stale" if kind == "capacity" else "observation_stale"
     with pytest.raises(RuntimeError, match="failed_profile_cleanup_" + reason):
         cleanup.validate_authorization(
             envelope,
@@ -496,7 +517,7 @@ def test_observation_windows_keep_inclusive_microsecond_bounds(legacy, observed_
     for kind in ("host", "control", "healthcare"):
         body["observations"][kind + "_observed_at"] = observed_at
     if legacy:
-        body["physical"]["observed_at"] = observed_at
+        body["capacity"]["observed_at"] = observed_at
     envelope = sign(body, key)
     admission_at = NOW + timedelta(seconds=admission_offset)
     if accepted:
@@ -526,7 +547,7 @@ def test_legacy_contract_refuses_signed_source_delta_coordinates(variant, is_sto
     body.update(
         contract_id=cleanup.LEGACY_CONTRACT,
         variant=variant,
-        physical=legacy["authorization"]["physical"],
+        capacity=legacy["authorization"]["capacity"],
         publication=legacy["authorization"]["publication"],
     )
     with pytest.raises(RuntimeError, match="failed_profile_cleanup_variant_invalid"):
@@ -534,19 +555,33 @@ def test_legacy_contract_refuses_signed_source_delta_coordinates(variant, is_sto
 
 
 def initial_authorization_fixture(now=NOW, *, with_geometry=False):
-    """Bind real initial geometry validation to a separately funded two-stage permit."""
+    """Bind current initial geometry to independently funded named cleanup."""
     from process import provider_directory_profile_capacity as capacity
     from process import provider_directory_profile_initial_contract as initial
-    from tests.test_provider_directory_profile_initial import _geometry, _target
+    from tests.test_provider_directory_profile_capacity import _geometry_payload
 
     envelope, trust, key = authorization_fixture(now)
-    physical = legacy_authorization_fixture(now)[0]["authorization"]["physical"]
-    target = _target()
-    geometry = capacity.capacity_geometry_payload(_geometry())
-    geometry.update({name: value for name, value in physical["postgres"].items() if name in geometry})
-    geometry.update({name: value for name, value in target.items() if "_target_" in name and name in geometry})
-    geometry.update(initial_target_state_sha256=initial.target_state_sha256(target))
-    body = _initial_authorization_body(envelope["authorization"], geometry, target, physical)
+    capacity_snapshot = legacy_authorization_fixture(now)[0]["authorization"]["capacity"]
+    target_by_field = _initial_target()
+    geometry = _geometry_payload(
+        contract_id=initial.GEOMETRY_CONTRACT,
+        materialization_mode="full_swap",
+        physical_projection_contract_id=capacity.BOUNDED_ADMISSION_CONTRACT_ID,
+        current_source_vector_hash=None,
+        current_context_vector_hash=None,
+        initial_target_state_sha256=initial.target_state_sha256(target_by_field),
+    )
+    geometry.update(capacity_snapshot["postgres"])
+    for role in ("evidence", "profile"):
+        geometry["relations"][role + "_target"].update(target_by_field["targets"][role])
+    geometry["relations"]["initial_receipt"] = {
+        "schema": "mrf",
+        "name": initial.RECEIPT_TABLE,
+        "main_index_pages": [1],
+        "toast_index_pages": [1],
+        "toastable_column_count": 1,
+    }
+    body = _initial_authorization_body(envelope["authorization"], geometry, target_by_field, capacity_snapshot)
     body["checkpoint"]["capacity_geometry_hash"] = capacity.capacity_geometry_hash(
         capacity.validated_capacity_geometry(geometry)
     )
@@ -555,22 +590,38 @@ def initial_authorization_fixture(now=NOW, *, with_geometry=False):
     return (signed, trust, key, geometry) if with_geometry else (signed, trust, key)
 
 
-def _initial_authorization_body(body, geometry, target, physical):
-    """Keep the original checkpoint proof and target geometry internally consistent."""
+def _initial_target():
+    from process import provider_directory_profile_initial_contract as initial
+
+    return {
+        "contract_id": initial.TARGET_CONTRACT,
+        "resolution": "empty",
+        "serving_singleton_absent": True,
+        "initial_commit_receipt_absent": True,
+        "targets": {
+            "evidence": {"schema": "mrf", "name": "provider_directory_profile_evidence"},
+            "profile": {"schema": "mrf", "name": "provider_directory_profile"},
+        },
+        "evidence_target_bytes": 0,
+        "profile_target_bytes": 0,
+        "evidence_rows": 0,
+        "profile_rows": 0,
+        "historical_publication": None,
+    }
+
+
+def _initial_authorization_body(body, geometry, target, capacity_snapshot):
+    """Keep source/plan/target names bound to the original logical geometry."""
+    from process import provider_directory_profile_initial_contract as initial
+
     body.update(
         contract_id=cleanup.INITIAL_CONTRACT,
         variant="initial_full_swap",
-        physical=physical,
+        capacity=capacity_snapshot,
         initial={
             "target_state": target,
-            **{
-                name: geometry[name]
-                for name in (
-                    "initial_target_state_sha256",
-                    "initial_receipt_oid",
-                    "initial_receipt_storage_fingerprint",
-                )
-            },
+            "initial_target_state_sha256": geometry["initial_target_state_sha256"],
+            "receipt": {"schema": "mrf", "name": initial.RECEIPT_TABLE},
         },
     )
     body["stages"] = body["stages"][:2]
@@ -578,8 +629,8 @@ def _initial_authorization_body(body, geometry, target, physical):
     body["checkpoint"].update(
         selection_proof_id=geometry["selection_proof_id"], executable_plan_hash=geometry["executable_plan_hash"]
     )
-    physical["checkpoint_layout"].update(
-        oid=geometry["build_checkpoint_oid"], storage_fingerprint=geometry["build_checkpoint_storage_fingerprint"]
+    capacity_snapshot["checkpoint_layout"].update(
+        {name: geometry["relations"]["build_checkpoint"][name] for name in ("schema", "name")}
     )
     return body
 
@@ -605,15 +656,15 @@ def test_initial_cleanup_refuses_mixed_or_changed_original_authority(change):
         case "old_version":
             body["contract_id"] = cleanup.LEGACY_CONTRACT
         case "target":
-            body["initial"]["target_state"]["profile_target_oid"] += 1
+            body["initial"]["target_state"]["targets"]["profile"]["name"] = "other_profile"
         case "alias":
-            body["stages"][0]["oid"] = body["initial"]["target_state"]["evidence_target_oid"]
+            body["stages"][0].update(body["initial"]["target_state"]["targets"]["evidence"])
         case "stale":
-            body["physical"]["observed_at"] = (NOW - timedelta(seconds=6)).isoformat()
+            body["capacity"]["observed_at"] = (NOW - timedelta(seconds=6)).isoformat()
         case "future":
-            body["physical"]["observed_at"] = (NOW + timedelta(seconds=1)).isoformat()
+            body["capacity"]["observed_at"] = (NOW + timedelta(seconds=1)).isoformat()
         case "third_stage":
-            body["stages"].append({"role": "affected_npi", "oid": 17002, "storage_fingerprint": "e" * 64})
+            body["stages"].append({"role": "affected_npi", "schema": "mrf", "name": "affected_failed"})
     with pytest.raises((RuntimeError, ValueError)):
         cleanup.validate_authorization(sign(body, key), trust=trust, now=NOW)
 
@@ -621,7 +672,7 @@ def test_initial_cleanup_refuses_mixed_or_changed_original_authority(change):
 def historical_trust_document(trust):
     """Serialize the original public-only trust set for independently pinned retention."""
     return {
-        "contract_id": "provider-directory-database-capacity-trust-v2",
+        "contract_id": "provider-directory-database-capacity-trust-v3",
         "signature_algorithm": "Ed25519",
         **{
             name: getattr(trust, name)
@@ -629,13 +680,8 @@ def historical_trust_document(trust):
                 "attestor_id",
                 "environment_id",
                 "active_key_id",
-                "database_system_identifier",
-                "database_oid",
-                "database_name",
             )
         },
-        "tablespaces": cleanup._storage_values(trust.tablespaces),
-        "volumes": cleanup._storage_values(trust.volumes),
         "keys": [
             {
                 "key_id": key.key_id,
@@ -723,22 +769,13 @@ def _completed_history_fixture():
 
 
 def _completed_history_database(body, *, stage_present=False, database_changed=False):
-    from unittest.mock import AsyncMock
-
-    binding_by_field = {
-        name: value for name, value in body["database"].items() if name not in {"tablespaces", "schema"}
-    }
-    if database_changed:
-        binding_by_field["database_oid"] += 1
     return SimpleNamespace(
-        db=SimpleNamespace(first=AsyncMock(return_value=SimpleNamespace(_mapping=binding_by_field))),
+        db=SimpleNamespace(scalar=AsyncMock(return_value=stage_present)),
+        _unscoped_qt=lambda schema, name: f'"{schema}"."{name}"',
         _validated_profile_checkpoint_stage_names=lambda _checkpoint: (
             "evidence_stage",
             "profile_stage",
             "affected_stage",
-        ),
-        _provider_directory_profile_stage_relation_identity=AsyncMock(
-            return_value=(1, "r", "p") if stage_present else None
         ),
     )
 
@@ -759,7 +796,7 @@ async def test_completed_history_uses_pinned_original_trust_without_live_authori
             trust.keys[0].retired_at = NOW + timedelta(minutes=1)
             trust.keys[0].verify_until = NOW + timedelta(minutes=16)
         case "volumes":
-            trust.volumes = tuple(dict(value, volume_digest="0" * 64) for value in trust.volumes)
+            trust.environment_id = "other-environment"
     monkeypatch.setattr(cleanup, "_now_utc", lambda: NOW + timedelta(hours=1))
     with pytest.raises(RuntimeError):
         cleanup.validate_authorization(envelope, trust=trust, now=cleanup._now_utc(), claimed_at=claim["claimed_at"])
@@ -820,7 +857,9 @@ async def test_historical_archive_never_replaces_exact_completion_or_authentic_e
         envelope["authorization"], stage_present=change == "stage", database_changed=change == "database"
     )
     with pytest.raises(RuntimeError, match="failed_profile_cleanup_" + reason):
-        await cleanup._completed_claim_receipt(database, "mrf", checkpoint, claim, None)
+        await cleanup._completed_claim_receipt(
+            database, "other" if change == "database" else "mrf", checkpoint, claim, None
+        )
 
 
 @pytest.mark.parametrize("change", ["geometry_hash", "geometry", "target", "receipt", "proof", "physical"])
@@ -831,15 +870,15 @@ def test_initial_request_revalidates_full_original_geometry_before_signing(chang
         case "geometry_hash":
             body["checkpoint"]["capacity_geometry_hash"] = "0" * 64
         case "geometry":
-            geometry["initial_receipt_oid"] += 1
+            geometry["relations"]["initial_receipt"]["name"] = "other_receipt"
         case "target":
             body["initial"]["initial_target_state_sha256"] = "0" * 64
         case "receipt":
-            body["initial"]["initial_receipt_storage_fingerprint"] = "0" * 64
+            body["initial"]["receipt"]["name"] = "other_receipt"
         case "proof":
             body["checkpoint"]["selection_proof_id"] = "different-proof"
         case "physical":
-            body["physical"]["postgres"]["postgres_wal_level"] = "minimal"
+            body["capacity"]["postgres"]["postgres_wal_level"] = "minimal"
     with pytest.raises((RuntimeError, ValueError)):
         cleanup._validate_initial_request(dict(body, capacity_geometry=geometry))
 

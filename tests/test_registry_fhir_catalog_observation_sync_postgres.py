@@ -1,12 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Imported observations cross genuine Reader, Loader, Sealer and publication gates."""
 
-import asyncio
 import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import asyncpg
 import pytest
@@ -15,8 +14,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
 
 from db.models.registry_publication_request import RegistryPublicationRequest
-from process.network_membership_writer_closure import writer_role_names
-from process.registry_fhir_catalog_custody import freeze_fhir_catalog_snapshot
+from process.registry_fhir_catalog_custody import FHIRCatalogTarget
 from process.registry_fhir_catalog_grant import (
     FHIRCatalogStandingGrant,
     build_fhir_catalog_observation_verifier,
@@ -31,11 +29,15 @@ from process.registry_fhir_catalog_publication import (
 from process.registry_fhir_catalog_read import FHIRCatalogQuery, read_fhir_catalog
 from process.registry_fhir_catalog_reference_rollup import fhir_catalog_reference_workspace
 from process.registry_fhir_catalog_registry_reader import (
+    fhir_catalog_registry_connection,
     fhir_catalog_registry_reads,
-    verify_fhir_catalog_registry_reads,
 )
 from process.registry_fhir_catalog_sources import fhir_catalog_source_generation, iter_fhir_catalog_sources
-from process.registry_fhir_catalog_store import copy_fhir_catalog_snapshot, create_fhir_catalog_indexes
+from process.registry_fhir_catalog_store import (
+    catalog_snapshot_preparation,
+    copy_fhir_catalog_snapshot,
+    create_fhir_catalog_indexes,
+)
 from process.registry_fhir_catalog_sync import (
     prepare_fhir_catalog_snapshot,
     project_fhir_catalog_source,
@@ -44,11 +46,11 @@ from process.registry_fhir_catalog_sync import (
 )
 from process.registry_fhir_catalog_validation import fhir_catalog_observation_digest, metadata_generation
 from process.registry_publication_queue import claim_registry_publication_request
+from tests.test_registry_fhir_catalog_custody_postgres import freeze_metadata, metadata_preparation_roles
 from tests.test_registry_fhir_catalog_custody_postgres import metadata_custody as metadata_custody
 from tests.test_registry_fhir_catalog_enrichment import COMPANY, GROUP
 from tests.test_registry_fhir_catalog_observed_source_postgres import (
     _add_second_scope_entry,
-    published_metadata_counts,
     refresh_published_profile,
 )
 from tests.test_registry_fhir_catalog_observed_source_postgres import observed_source_db as observed_source_db
@@ -124,7 +126,7 @@ async def observation_case(metadata_custody, observed_source_db):
     fixture, source_fixture = metadata_custody, observed_source_db
     await _registry(fixture)
     await _control_tables(fixture)
-    await source_fixture.admin.execute(f'''ALTER TABLE "{source_fixture.schema}".provider_directory_endpoint_dataset
+    await source_fixture.admin.execute(f'''ALTER TABLE "{source_fixture.header_schema}".provider_directory_endpoint_dataset
       ADD COLUMN content_proof_resource_types text[],ADD COLUMN publication_metadata_summary_json jsonb,
       ADD COLUMN completion_proof_required_version integer,ADD COLUMN completion_proof_json jsonb,
       ADD COLUMN completion_proof_sha256 text''')
@@ -135,8 +137,6 @@ async def observation_case(metadata_custody, observed_source_db):
             f'GRANT SELECT ON "{source_fixture.schema}".provider_directory_insurance_network_source_binding '
             f'TO "{source_fixture.roles_by_kind["reader"]}"'
         )
-    for role in (source_fixture.roles_by_kind["reader"], fixture.roles["publisher"]):
-        await fixture.connection.execute(f'GRANT EXECUTE ON FUNCTION pg_control_system() TO "{role}"')
     await _source_facts(source_fixture)
     if source_fixture.layout == "SCOPED":
         await source_fixture.admin.execute(
@@ -166,6 +166,7 @@ async def observation_case(metadata_custody, observed_source_db):
         loader_role=fixture.roles["loader"],
         reader_roles=tuple(sorted((fixture.roles["reader"], fixture.roles["loader"]))),
         consumer=SimpleNamespace(physical_owner_role=fixture.roles["owner"]),
+        preparation_roles=metadata_preparation_roles(fixture),
     )
     return SimpleNamespace(
         fixture=fixture,
@@ -182,12 +183,18 @@ async def _prepare(case):
     snapshot, previous, accounting = prepared
     if snapshot is not None and snapshot["schema_name"] not in case.fixture.schemas:
         case.fixture.schemas.append(snapshot["schema_name"])
+    if snapshot is not None and accounting.get("preparation_state") == "handed_off":
+        target = FHIRCatalogTarget(**catalog_snapshot_preparation(snapshot)["target"])
+        await _freeze(case, target, snapshot)
+        accounting["preparation_state"] = "validated"
     return prepared
 
 
 async def _publish(case, snapshot, previous=None):
     connection, control = case.fixture.connection, case.fixture.control_schema
-    runtime = build_fhir_catalog_publication_runtime(case.grant, None)
+    runtime = replace(
+        build_fhir_catalog_publication_runtime(case.grant, None), preparation_roles=case.config.preparation_roles
+    )
     command_by_field = {
         "operation": OPERATION,
         "metadata_generation": snapshot["metadata_generation"],
@@ -203,7 +210,7 @@ async def _publish(case, snapshot, previous=None):
         claimed = await claim_registry_publication_request(
             connection, operation_family="publication", allow_metadata=True, control_schema=control
         )
-        await verify_fhir_catalog_registry_reads()
+        await fhir_catalog_registry_connection(connection)
     assert str(claimed["request_id"]) == request["request_id"]
     publication_result = await complete_queued_fhir_catalog_publication(
         connection,
@@ -213,6 +220,7 @@ async def _publish(case, snapshot, previous=None):
         verify_sources=runtime.verify_sources,
         source_fence=runtime.source_fence,
         control_schema=control,
+        preparation_roles=case.config.preparation_roles,
     )
     assert publication_result["canonical_entities_deleted"] == publication_result["canonical_entities_archived"] == 0
     return publication_result
@@ -312,8 +320,8 @@ async def test_relationship_pages_keep_all_surviving_bindings_and_skip_unresolve
 
 
 @pytest.mark.parametrize("observed_source_db", [("SCOPED", 2)], indirect=True)
-async def test_leaf_only_source_pipeline_seals_publishes_and_replays_without_directory_change(observation_case):
-    """Use the real scoped login through Loader, Sealer and exact metadata publication."""
+async def test_named_source_pipeline_freezes_publishes_and_replays_without_directory_change(observation_case):
+    """Use the real named login through loading, validation and exact metadata publication."""
     case = observation_case
     connection, control = case.fixture.connection, '"' + case.fixture.control_schema + '"'
     original_identity = await case.source.admin.fetchval(
@@ -349,51 +357,34 @@ async def test_leaf_only_source_pipeline_seals_publishes_and_replays_without_dir
     assert replay is None and retained["metadata_generation"] == snapshot["metadata_generation"]
     assert replay_accounting["accepted_sources"] == 1
     reader = await case.source.connect()
-    assert not await reader.fetchval(
-        "SELECT has_table_privilege(current_user,$1,'SELECT')",
-        f'"{case.source.schema}".provider_directory_dataset_resource',
-    )
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        await reader.fetch(f'SELECT * FROM "{case.source.schema}".resources_detached')
 
 
 @pytest.mark.parametrize("observed_source_db", [("SCOPED", 2)], indirect=True)
-async def test_published_scope_pipeline_and_sealer_replay_share_linear_metadata_proofs(observation_case):
-    """Count genuine native preparation and independent sealer replay per reader snapshot."""
-    case, query_counts = observation_case, []
+async def test_named_pipeline_validates_each_observed_endpoint_against_real_data(observation_case):
+    """Prepare and replay both actual dataset relations without metadata proof caches."""
+    case = observation_case
     await _add_second_scope_entry(case.source, published=True)
-    case.grant = replace(case.grant, source_profiles=(case.source.profile,))
-    case.config.grant = case.grant
-
-    @asynccontextmanager
-    async def source_reader():
-        """Observe existing native LOGINs without wrapping their connection type."""
-        reader = await case.source.connect()
-        try:
-            with published_metadata_counts(reader) as counts:
-                query_counts.append(counts)
-                yield reader
-        finally:
-            await reader.close()
-
-    case.source_pool = SimpleNamespace(acquire=source_reader)
     snapshot, previous, accounting = await _prepare(case)
-    await asyncio.sleep(0)
     assert snapshot is not None and previous is None and accounting["accepted_sources"] == 2
-    assert len(query_counts) == 2
-    assert all(counts == {"headers": 2, "sources": 2, "endpoints": 2, "bindings": 1} for counts in query_counts)
+    assert len(snapshot["source_vector_json"]) == 2
+    assert accounting["preparation_state"] == "validated"
 
 
 async def _replace_source(case):
     source = case.source
     await source.admin.execute(
-        f"UPDATE \"{source.schema}\".provider_directory_endpoint_dataset SET status='superseded',is_current=false"
+        f"UPDATE \"{source.header_schema}\".provider_directory_endpoint_dataset SET status='superseded',is_current=false"
     )
-    await source.admin.execute(f'''INSERT INTO "{source.schema}".provider_directory_endpoint_dataset
+    await source.admin.execute(f'''INSERT INTO "{source.header_schema}".provider_directory_endpoint_dataset
       (dataset_id,endpoint_id,acquisition_root_run_id,dataset_hash,status,is_current,published_at,resource_count,
        previous_dataset_id,publication_metadata_json,publication_metadata_sha256,content_proof_admission_version,
-       content_proof_admission_kind,content_proof_admission_sha256)
+       content_proof_admission_kind,content_proof_admission_sha256,candidate_storage_json)
       SELECT 'dataset-two',endpoint_id,'second-publication',repeat('e',64),'published',true,published_at,resource_count,
        'dataset-one',publication_metadata_json,publication_metadata_sha256,content_proof_admission_version,
-       content_proof_admission_kind,content_proof_admission_sha256 FROM "{source.schema}".provider_directory_endpoint_dataset''')
+       content_proof_admission_kind,content_proof_admission_sha256,
+       jsonb_set(candidate_storage_json,'{{identity,dataset_id}}','"dataset-two"') FROM "{source.header_schema}".provider_directory_endpoint_dataset''')
     await _source_facts(source, edition="dataset-two", retain_old=False)
 
 
@@ -484,22 +475,17 @@ async def _forge_organization(case, target):
 
 
 async def _freeze(case, target, snapshot, *, with_verifier=True):
-    async with fhir_catalog_registry_reads(case.fixture.publisher), case.fixture.publisher.transaction():
-        receipt = await freeze_fhir_catalog_snapshot(
-            case.fixture.publisher,
-            target,
-            writer_roles=writer_role_names(
-                case.fixture.roles["owner"], (case.fixture.roles["loader"],), case.config.reader_roles
-            ),
-            expected_snapshot=snapshot,
-            control_schema=case.fixture.control_schema,
-            standing_grant=case.grant,
-            observation_verifier=build_fhir_catalog_observation_verifier(case.grant, case.source_pool)
-            if with_verifier
-            else None,
-        )
-        await verify_fhir_catalog_registry_reads()
-        return receipt
+    """Use the existing administrator freeze and complete logical source replay."""
+    await freeze_metadata(
+        case.fixture,
+        target,
+        snapshot,
+        standing_grant=case.grant,
+        observation_verifier=build_fhir_catalog_observation_verifier(case.grant, case.source_pool)
+        if with_verifier
+        else None,
+    )
+    return snapshot["custody_json"]
 
 
 @pytest.mark.parametrize("forged", [True, False])
@@ -633,37 +619,30 @@ async def test_derived_output_mutation_cannot_be_attested_with_unchanged_source_
         await _freeze(case, target, snapshot)
 
 
-async def test_projection_replay_does_not_execute_loader_check_as_sealer(observation_case):
+async def test_projection_replay_preserves_frozen_loader_rows(observation_case):
     case = observation_case
     copy_target, disposition, snapshot = await _unsealed(case)
-    trap_schema = "fhir_catalog_check_" + uuid4().hex
-    case.fixture.schemas.append(trap_schema)
-    trap_function = '"' + trap_schema + '".accept_loader'
+    relation = '"' + copy_target.schema_name + '".registry_fhir_catalog_network'
+    contents = f"SELECT jsonb_agg(to_jsonb(network) ORDER BY network_id)::text FROM {relation} network"
     async with case.fixture.loader.transaction():
         await _project(case, copy_target, disposition, snapshot)
-        await case.fixture.loader.execute(f'CREATE SCHEMA "{trap_schema}"')
-        await case.fixture.loader.execute(f"""CREATE FUNCTION {trap_function}(network_id integer)
-          RETURNS boolean LANGUAGE plpgsql AS $check_trap$
-          BEGIN
-            IF current_user::text='{case.fixture.roles["publisher"]}' THEN
-              RAISE EXCEPTION 'loader_check_executed_as_sealer';
-            END IF;
-            RETURN true;
-          END $check_trap$""")
-        assert await case.fixture.loader.fetchval(f"SELECT {trap_function}(1)") is True
-        await case.fixture.loader.execute(
-            f'ALTER TABLE "{copy_target.schema_name}".registry_fhir_catalog_network '
-            f"ADD CONSTRAINT loader_external_check CHECK ({trap_function}(network_id))"
-        )
         await create_fhir_catalog_indexes(
             case.fixture.loader,
             copy_target,
             loader_role=case.fixture.roles["loader"],
             control_schema=case.fixture.control_schema,
         )
-    with pytest.raises(asyncpg.RaiseError, match="loader_check_executed_as_sealer"):
-        async with case.fixture.publisher.transaction():
-            await case.fixture.publisher.fetchval(f"SELECT {trap_function}(1)")
-    sealed = await _freeze(case, copy_target, snapshot)
-    assert sealed["component"] == "registry_fhir_catalog_writer_closure"
-    assert sealed["validation"]["tables"]["registry_fhir_catalog_network"]["rows"] == 2
+        original = await case.fixture.loader.fetchval(contents)
+    validated = await _freeze(case, copy_target, snapshot)
+    assert validated["metadata_generation"] == snapshot["metadata_generation"]
+    assert validated["tables"]["registry_fhir_catalog_network"]["rows"] == 2
+    assert await case.fixture.loader.fetchval(contents) == original
+    for statement in (
+        f"INSERT INTO {relation} SELECT * FROM {relation}",
+        f"UPDATE {relation} SET display_name=display_name",
+        f"DELETE FROM {relation}",
+        f"TRUNCATE {relation}",
+    ):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await case.fixture.publisher.execute(statement)
+    assert await case.fixture.loader.fetchval(contents) == original

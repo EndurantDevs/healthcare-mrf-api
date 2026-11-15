@@ -12,7 +12,7 @@ from process import provider_directory_cms_preflight as producer
 from process import provider_directory_profile_capacity_preflight_contract as preflight
 from tests.cms_npd_admission_postgres_support import _database_url, _run_migrations
 from tests.provider_directory_cms_capacity_test_support import cms_request
-from tests.test_cms_capacity_preflight_receipt_migration import _ledger, _migrate
+from tests.test_cms_capacity_preflight_receipt_migration import _ledger
 from tests.test_provider_directory_cms_preflight import _inputs, _request, fhir
 from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME, _trust
 from tests.test_provider_directory_profile_capacity_preflight_postgres import _receipt_values
@@ -32,8 +32,7 @@ async def _fixture(monkeypatch):
     }.items():
         monkeypatch.setenv("HLTHPRT_DB_" + key, setting_value)
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
-    async with _ledger(monkeypatch) as (engine, schema):
-        await _migrate(engine, schema, "upgrade")
+    async with _ledger(monkeypatch, current=True) as (engine, schema):
         async with engine.begin() as connection:
             await connection.run_sync(_run_migrations, ("20261001100000",))
         database = Database()

@@ -467,12 +467,13 @@ def cms_publication_session(monkeypatch):
 
     def execute_statement(_statement, params=None):
         _assert_cms_publication_transaction()
-        if params is not None:
+        if params is not None and "names" in params:
             inventory.scalars.return_value.all.return_value = params["names"]
         return inventory
 
     execute = AsyncMock(side_effect=execute_statement)
     monkeypatch.setattr(session, "execute", execute)
+    monkeypatch.setattr(session, "scalar", AsyncMock(return_value="0"))
     monkeypatch.setattr(cms_doctors.db, "session_factory", lambda: session)
 
     @asynccontextmanager
@@ -550,7 +551,7 @@ async def test_cms_publish_swaps_indexes_and_records_address_resolution(monkeypa
     sql_statement_list = [call.args[0] for call in status.await_args_list]
     assert any("doctor_clinician_address_old" in statement for statement in sql_statement_list)
     assert any("doctor_stage_idx_site" in statement for statement in sql_statement_list)
-    assert "ACCESS EXCLUSIVE MODE NOWAIT" in str(cms_publication_session.await_args.args[0])
+    assert any("ACCESS EXCLUSIVE MODE NOWAIT" in str(call.args[0]) for call in cms_publication_session.await_args_list)
     verify_artifact.assert_called_once_with(_ARTIFACT_RECEIPT)
     _assert_cms_publish_metrics(marked, terminal_result, address_stats)
 
@@ -594,7 +595,7 @@ async def test_cms_publish_production_stage_without_address_feature_still_swaps(
         }
     )
     assert cms_doctors.db._transaction_binding() is None
-    assert "ACCESS EXCLUSIVE MODE NOWAIT" in str(cms_publication_session.await_args.args[0])
+    assert any("ACCESS EXCLUSIVE MODE NOWAIT" in str(call.args[0]) for call in cms_publication_session.await_args_list)
     verify_artifact.assert_called_once_with(_ARTIFACT_RECEIPT)
     assert marked.await_args.kwargs["metrics"] == {
         "rows": cms_doctors.DEFAULT_MIN_ROWS,

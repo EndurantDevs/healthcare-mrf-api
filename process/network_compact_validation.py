@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Independent final proof before compact candidate custody is transferred."""
+"""Independent final proof before compact candidate publication."""
 
 from uuid import UUID
 
@@ -11,7 +11,12 @@ from process.network_address_projection import (
 )
 from process.network_compact_dependencies import capture_compact_dependencies, compact_slice_ref_digest
 from process.network_compact_offices import CompactOfficeSources, pin_compact_office_sources
-from process.network_compact_readiness import _require, compact_index_digest, compact_readiness
+from process.network_compact_readiness import (
+    _require,
+    compact_index_digest,
+    compact_readiness,
+    require_compact_native_layout,
+)
 from process.network_compact_slice_validation import verify_compact_slice_contents
 from process.network_membership_validation import _json_object, _native_accounting, _scope_report, _validation_report
 
@@ -76,11 +81,12 @@ async def _membership_sets_differ(connection, namespace, layout):
 async def verify_compact_final_proof(
     connection, copy_target, candidate, *, control_schema, office_authority=None, source_witness_runtime=None
 ):
-    """Recheck original address authority and full membership parity before sealing."""
+    """Recheck named address inputs and full membership parity before publication."""
     report = _json_object(candidate["validation_json"])
     address_source = PinnedAddressSource(**report["address_source"])
     scope = _scope_report(candidate, address_source)
     _, serving = compact_readiness(candidate, report, scope)
+    await require_compact_native_layout(connection, copy_target.schema_name)
     layout = await capture_compact_dependencies(connection, candidate, control_schema=control_schema)
     from process import network_indexed_address_artifact as indexed
 
@@ -107,7 +113,7 @@ async def verify_compact_final_proof(
         connection, namespace + ".network_membership", control_schema, copy_target.candidate_id
     )
     validation = _validation_report(scope, counts, native)
-    _require(all(report.get(field) == expected_value for field, expected_value in validation.items()))
+    _require_validation_report(report, validation)
     _require(
         await compact_index_digest(connection, copy_target.schema_name, candidate=candidate)
         == serving["index_definition_sha256"]
@@ -128,6 +134,16 @@ async def verify_compact_final_proof(
         await connection.execute(f"DROP TABLE {work}")
     else:
         _require(await _membership_sets_differ(connection, namespace, layout) is False)
+    return validation
+
+
+def _require_validation_report(report, validation):
+    from process.network_compact_custom_offices import logical_compact_custom_scope
+
+    comparison = logical_compact_custom_scope(report)
+    _require(
+        all(comparison.get(field) == expected for field, expected in logical_compact_custom_scope(validation).items())
+    )
 
 
 async def _compact_accounting(connection, candidate, namespace, address, offices):
@@ -160,7 +176,7 @@ async def _verify_custom_contribution(
         custom = await verify_compact_custom_contribution(
             connection,
             candidate,
-            runtime_roles=receipt.runtime_roles,
+            runtime_roles=(),
             control_schema=control_schema,
             office_authority=office_authority,
             **({"source_witness_runtime": source_witness_runtime} if source_witness_runtime is not None else {}),

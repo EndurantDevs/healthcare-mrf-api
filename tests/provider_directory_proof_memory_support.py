@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Memory-only proof semantic tests keep native authority in its own real tests."""
+"""Memory-only proof semantics with the normal native batch statement interface."""
 
 from types import SimpleNamespace
 
@@ -11,10 +11,38 @@ from process import provider_directory_source_proof_control as control
 
 @pytest.fixture(autouse=True)
 def proof_memory_authority(monkeypatch):
-    """Substitute only the new native boundary around existing in-memory proofs."""
+    """Map native batch statements onto the existing in-memory proof storage."""
 
     async def memory_executor(executor, schema):
-        return SimpleNamespace(connection=executor, schema=schema)
+        async def execute(query, *arguments):
+            if "INSERT INTO" in query:
+                fields = (
+                    "dataset_id",
+                    "shard_id",
+                    "endpoint_id",
+                    "acquisition_root_run_id",
+                    "source_ids_json",
+                    "resource_count",
+                    "resource_counts_json",
+                    "first_identity_json",
+                    "last_identity_json",
+                    "input_sha256",
+                    "artifact_sha256",
+                    "artifact_byte_count",
+                    "payload_bytes",
+                )
+            else:
+                fields = ("dataset_id", "resource_type") if "resource_counts_json ?" in query else ("dataset_id",)
+            return await executor.status(query, **dict(zip(fields, arguments, strict=True)))
+
+        async def fetchrow(query, dataset_id, shard_id):
+            return await executor.first(query, dataset_id=dataset_id, shard_id=shard_id)
+
+        async def first(query, **parameters):
+            return await executor.first(query, **parameters)
+
+        connection = SimpleNamespace(execute=execute, fetchrow=fetchrow, first=first, is_in_transaction=lambda: True)
+        return SimpleNamespace(connection=connection, schema=schema)
 
     async def memory_parent(publisher, dataset_id, *, acquiring):
         return await publisher.connection.first(

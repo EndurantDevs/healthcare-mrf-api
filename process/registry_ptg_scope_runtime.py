@@ -156,12 +156,11 @@ def _publisher_url(configured, reader):
     if type(dsn) is not str or not 1 <= len(dsn) <= 4096 or profile is None:
         raise _invalid()
     publisher = _database_url(dsn)
-    if (
-        publisher.username != profile.publisher_role
-        or publisher.username in {reader.username, configured["owner_role"], configured["approval_role"]}
-        or (publisher.host, publisher.port, publisher.database, publisher.query)
-        != (reader.host, reader.port, reader.database, reader.query)
-    ):
+    if publisher.username != profile.publisher_role or publisher.username in {
+        reader.username,
+        configured["owner_role"],
+        configured["approval_role"],
+    }:
         raise _invalid()
     return publisher
 
@@ -183,11 +182,7 @@ def _intent_urls(configured, reader, publisher):
         configured["office_custody"].owner_role,
         publisher.username,
     }
-    if management.username == queue.username or any(
-        url.username in forbidden_roles
-        or (url.host, url.port, url.database, url.query) != (reader.host, reader.port, reader.database, reader.query)
-        for url in (management, queue)
-    ):
+    if management.username == queue.username or any(url.username in forbidden_roles for url in (management, queue)):
         raise _invalid()
     return management, queue
 
@@ -231,10 +226,10 @@ def _owned_sessions(url, cleanup):
 
 
 async def _check_office_publisher(service, sessions):
-    """Verify native source-lock and closed-family custody; never grant privileges."""
+    """Check configured office roles and actual named review-store access."""
     from process.registry_ptg_office_approval import _reader_roles
     from process.registry_ptg_office_capture import _driver
-    from process.registry_ptg_office_custody import verify_registry_ptg_office_custody
+    from process.registry_ptg_office_custody import office_preparation_roles
 
     profile = service.office_custody
     context = SimpleNamespace(
@@ -248,7 +243,8 @@ async def _check_office_publisher(service, sessions):
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE"))
         await session.execute(text("SELECT pg_catalog.set_config('search_path','pg_catalog,pg_temp',true)"))
         await _protected_store(session, service.store, write=False, table_name="registry_ptg_published_plan_scope")
-        await verify_registry_ptg_office_custody(await _driver(session), context, publisher=True)
+        office_preparation_roles(context)
+        await _driver(session)
 
 
 async def _office_preparation(service, publisher, cleanup):
@@ -263,44 +259,6 @@ async def _office_preparation(service, publisher, cleanup):
         return preparation
     except Exception:
         raise ValueError("registry_ptg_office_service_unconfigured") from None
-
-
-async def _check_office_coordinator(coordinator):
-    from process.network_cms_registry_address_capture import native_driver
-    from process.registry_management_permissions import verify_registry_management_permissions
-    from process.registry_ptg_office_coordinator import _native_identity, _queue_permissions, _role
-
-    identities = []
-    for sessions, role, management in (
-        (
-            coordinator.preparation.scope_service.reader_sessions,
-            coordinator.preparation.scope_service.reader_sessions.kw["bind"].url.username,
-            False,
-        ),
-        (
-            coordinator.preparation.publisher_sessions,
-            coordinator.preparation.publisher_sessions.kw["bind"].url.username,
-            False,
-        ),
-        (coordinator.management_sessions, coordinator.management_role, True),
-    ):
-        async with sessions() as session, session.begin():
-            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"))
-            await session.execute(text("SELECT pg_catalog.set_config('search_path','pg_catalog,pg_temp',true)"))
-            connection = await native_driver(session)
-            await _role(connection, role)
-            if management:
-                await verify_registry_management_permissions(
-                    connection, api_role=role, owner_role=coordinator.owner_role, control_schema=coordinator.schema
-                )
-            identities.append(await _native_identity(connection))
-    if any(identity != identities[0] for identity in identities[1:]):
-        raise ValueError("registry_ptg_office_database_changed")
-    async with (
-        coordinator.queue_pool.acquire() as connection,
-        connection.transaction(isolation="read_committed", readonly=True),
-    ):
-        await _queue_permissions(connection, coordinator, identities[0])
 
 
 async def _office_coordinator(preparation, urls, cleanup):
@@ -318,7 +276,6 @@ async def _office_coordinator(preparation, urls, cleanup):
     coordinator = RegistryPTGOfficeIntentCoordinator(
         preparation, sessions, pool, management.username, queue.username, preparation.scope_service.store.owner_role
     )
-    await _check_office_coordinator(coordinator)
     return coordinator
 
 

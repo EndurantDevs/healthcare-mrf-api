@@ -13,6 +13,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import text
 
+from db.plan_release_storage import storage_relation
 from process import network_fhir_source_witness_capture as witness
 from process import network_fhir_typed_source as typed
 from process.network_fhir_retained_capture_contract import RetainedFHIRCaptureError
@@ -147,6 +148,37 @@ async def _consume(case):
         return [row for page in [page async for page in export["resources"]()] for row in page]
 
 
+async def _assert_named_legacy_partition(case):
+    """Verify the declared parent and actual dataset leaf through native named layout."""
+    relation = case.origin.resource_relation
+    assert relation == {"schema": case.source_profile.schema_name, "name": "provider_directory_dataset_resource"}
+    partitions = await case.fixture.admin.fetch(
+        "SELECT child_ns.nspname AS schema,child.relname AS name,"
+        "parent_ns.nspname AS parent_schema,parent.relname AS parent_name,count(*)::bigint AS rows "
+        f"FROM {storage_relation(relation['schema'], relation['name'])} resource "
+        "JOIN pg_catalog.pg_class child ON child.oid=resource.tableoid "
+        "JOIN pg_catalog.pg_namespace child_ns ON child_ns.oid=child.relnamespace "
+        "JOIN pg_catalog.pg_inherits inheritance ON inheritance.inhrelid=child.oid "
+        "JOIN pg_catalog.pg_class parent ON parent.oid=inheritance.inhparent "
+        "JOIN pg_catalog.pg_namespace parent_ns ON parent_ns.oid=parent.relnamespace "
+        "WHERE resource.dataset_id=$1 GROUP BY child_ns.nspname,child.relname,parent_ns.nspname,parent.relname",
+        case.origin.dataset_id,
+    )
+    assert len(partitions) == 1
+    partition = partitions[0]
+    assert {"schema": partition["parent_schema"], "name": partition["parent_name"]} == relation
+    assert {"schema": partition["schema"], "name": partition["name"]} != relation
+    assert partition["rows"] == sum(dict(case.origin.resource_counts).values())
+
+
+def _assert_closed_root_scopes(scopes):
+    """Each completed export must reject escaped callbacks before any further SQL."""
+    for scope in scopes:
+        assert scope.is_active is False
+        with pytest.raises(ValueError, match="catalog_source_export_inactive"):
+            scope.require_active()
+
+
 async def test_historical_source_closes_typed_capture_and_replays_without_old_witness_waiver(monkeypatch):
     recorded = _install_historical_seed(monkeypatch)
     catalog, roots = _root_proof_modules()
@@ -155,18 +187,27 @@ async def test_historical_source_closes_typed_capture_and_replays_without_old_wi
     monkeypatch.setattr(roots, "_PAGE_ROWS", 2)
 
     async def observe(scope, origin):
+        scope.require_active()
+        assert dict(
+            await scope.connection.fetchrow(
+                "SELECT current_setting('transaction_read_only') AS readonly,"
+                "current_setting('transaction_isolation') AS isolation"
+            )
+        ) == {"readonly": "on", "isolation": "repeatable read"}
         await original(scope, origin)
-        passes.append(dict(scope.native_identity_by_field))
+        passes.append(scope)
 
     monkeypatch.setattr(roots, "_historical_roots", observe)
     async with source_witness_case(monkeypatch, legacy=True) as case:
         before = await _header(case)
         assert case.origin.dataset_sha256 == recorded["root"] != recorded["canonical_root"]
-        assert case.origin.resource_parent_oid != case.origin.resource_leaf_oid
+        await _assert_named_legacy_partition(case)
         descriptor, _ = await _observed_source_descriptor(
             case.source_runtime, case.source_profile, case.origin, catalog
         )
         document, anchor = await _produce_recipe_capture(case, descriptor, (case.fixture.component.reader,))
+        assert len(passes) == 2
+        _assert_closed_root_scopes(passes)
         assert document["graph"]["origin"]["dataset_sha256"] == recorded["root"]
         assert dict(document["graph"]["origin"]["resource_hashes"]) == recorded["hashes"]
         names_by_kind = {kind: "historical_replay_" + kind + "_" + uuid4().hex for kind in typed._DDL}
@@ -179,12 +220,14 @@ async def test_historical_source_closes_typed_capture_and_replays_without_old_wi
         finally:
             for name in names_by_kind.values():
                 await case.reader.execute('DROP TABLE "' + name + '"')
-        assert len(passes) == 2 and passes[0]["virtual_transaction"] != passes[1]["virtual_transaction"]
+        assert len(passes) == 3
+        _assert_closed_root_scopes(passes)
         arguments = capture_arguments(case)
         with pytest.raises(RetainedFHIRCaptureError):
             await _capture(case, witness, arguments)
         await _assert_rolled_back(case, arguments)
-        assert len(passes) == 3 and await _header(case) == before
+        assert len(passes) == 4 and await _header(case) == before
+        _assert_closed_root_scopes(passes)
 
 
 @pytest.mark.parametrize("damage", ["payload", "missing", "dataset_root", "family_root"])
@@ -210,16 +253,16 @@ async def test_historical_proof_cancellation_and_partial_export_close_source_sna
                 iterator = export["resources"]()
                 assert await anext(iterator)
                 await iterator.aclose()
-        started, original = asyncio.Event(), roots._collation_snapshot
+        started, original = asyncio.Event(), roots.stored_resource_roots
 
-        async def pause_after_collation(connection, origin):
-            snapshot = await original(connection, origin)
+        async def pause_after_root_rows(scope, origin):
+            replay = await original(scope, origin)
             started.set()
             await asyncio.Future()
-            return snapshot
+            return replay
 
         with monkeypatch.context() as patch:
-            patch.setattr(roots, "_collation_snapshot", pause_after_collation)
+            patch.setattr(roots, "stored_resource_roots", pause_after_root_rows)
             pending = asyncio.create_task(_consume(case))
             try:
                 await asyncio.wait_for(started.wait(), 10)

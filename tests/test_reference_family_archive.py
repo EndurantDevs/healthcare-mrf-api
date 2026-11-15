@@ -153,35 +153,19 @@ async def test_successful_export_cleans_stage_before_returning_manifest(monkeypa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("auxiliary_owner", (7, 8))
-async def test_mrf_stage_owner_includes_canonical_auxiliary(auxiliary_owner):
-    ownership = archive.ReferenceFamilyStageOwnership(
-        "mrf",
-        UUID(int=1),
-        "reference_family_archive_" + UUID(int=1).hex,
-        10,
-        (("issuer", 11),),
-        auxiliary_oid=12,
+@pytest.mark.parametrize("changed_name", [False, True])
+async def test_stage_verification_uses_declared_names_and_ignores_physical_editions(monkeypatch, changed_name):
+    ownership = _ownership()
+    observed = replace(
+        ownership, schema_oid=99, relation_oids=(("other_table" if changed_name else "pricing_places_zcta", 101),)
     )
-    session = SimpleNamespace(
-        scalar=AsyncMock(return_value=7),
-        execute=AsyncMock(
-            return_value=SimpleNamespace(
-                mappings=Mock(
-                    return_value=[
-                        {"relname": "issuer", "oid": 11, "relowner": 7},
-                        {"relname": "mrf_canonical_address", "oid": 12, "relowner": auxiliary_owner},
-                    ]
-                )
-            )
-        ),
-    )
-    if auxiliary_owner == 7:
-        await archive._verify_stage_owner(session, ownership, 7)
+    monkeypatch.setattr(archive, "capture_model_family_stage_ownership", AsyncMock(return_value=observed))
+    session = SimpleNamespace(in_transaction=lambda: True)
+    if changed_name:
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="declaration differs"):
+            await archive.verify_reference_family_stage_ownership(session, ownership)
     else:
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="stage owner differs"):
-            await archive._verify_stage_owner(session, ownership, 7)
-    assert session.execute.await_args.args[1] == {"relation_oids": [11, 12]}
+        assert await archive.verify_reference_family_stage_ownership(session, ownership) == observed
 
 
 def test_registry_is_closed_to_exact_ordered_replacement_families():
@@ -271,9 +255,12 @@ def _validation_receipt():
         "package_id": "a" * 64,
         "profile_contract": archive.CONTRACT,
         "stage_schema": "reference_family_archive_550e8400e29b41d4a716446655440000",
-        "stage_schema_oid": 10,
-        "relation_oids": [["pricing_places_zcta", 11]],
-        "sealed_owner_oid": 12,
+        "relations": [
+            {
+                "schema_name": "reference_family_archive_550e8400e29b41d4a716446655440000",
+                "relation_name": "pricing_places_zcta",
+            }
+        ],
         "manifest_sha256": "b" * 64,
         "tables": [table.as_dict() for table in manifest.tables],
     }
@@ -360,9 +347,7 @@ def test_guarded_capture_is_distinct_digest_bound_manifest_evidence():
         {key: value for key, value in receipt_fields.items() if key != "validation_sha256"}
     )
     receipt = archive.validate_reference_family_validation_receipt(receipt_fields)
-    cutover = archive.ReferenceFamilyCutoverAuthority(
-        "a" * 64, archive.CONTRACT, 12, 12, "automatic", _serving_generation()
-    )
+    cutover = archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, "automatic", _serving_generation())
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="validation authority differs"):
         archive._require_validated_cutover_binding(_ownership(), _incumbent(), guarded, receipt, cutover)
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="differs from captured manifest"):
@@ -402,7 +387,7 @@ async def test_legacy_tracked_manifest_cannot_enter_automatic_cutover(absent):
             expected_incumbent=incumbent,
             validation_receipt=_validation_receipt(),
             cutover=archive.ReferenceFamilyCutoverAuthority(
-                "a" * 64, archive.CONTRACT, 12, 12, "automatic", manifest.source_serving_generation
+                "a" * 64, archive.CONTRACT, "automatic", manifest.source_serving_generation
             ),
         )
     session.execute.assert_not_awaited()
@@ -658,26 +643,29 @@ def test_manifest_rejects_invalid_table_receipts(field, value):
         ("profile_contract", "wrong"),
         ("package_id", "bad"),
         ("manifest_sha256", "bad"),
-        ("stage_schema_oid", True),
-        ("stage_schema_oid", 0),
-        ("sealed_owner_oid", True),
-        ("sealed_owner_oid", 0),
+        ("validation_sha256", "bad"),
+        ("stage_schema", "bad-name"),
     ],
 )
 def test_validation_receipt_rejects_invalid_identifiers(field, value):
     receipt = _validation_receipt()
     receipt[field] = value
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="receipt is invalid"):
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="receipt is invalid|schema is invalid"):
         archive.validate_reference_family_validation_receipt(receipt)
 
 
 @pytest.mark.parametrize(
-    "relation_oids",
-    [[], [["wrong", 11]], [["pricing_places_zcta"]], [["pricing_places_zcta", True]]],
+    "relations",
+    [
+        [],
+        [{"schema_name": "other", "relation_name": "pricing_places_zcta"}],
+        [{"relation_name": "pricing_places_zcta"}],
+        [{"schema_name": "reference_family_archive_550e8400e29b41d4a716446655440000", "relation_name": "other"}],
+    ],
 )
-def test_validation_receipt_rejects_invalid_relation_inventory(relation_oids):
+def test_validation_receipt_rejects_invalid_relation_inventory(relations):
     receipt = _validation_receipt()
-    receipt["relation_oids"] = relation_oids
+    receipt["relations"] = relations
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="inventory is invalid"):
         archive.validate_reference_family_validation_receipt(receipt)
 
@@ -911,20 +899,6 @@ async def test_export_rejects_invalid_snapshot(monkeypatch):
 async def test_stage_owner_and_activation_guards(monkeypatch):
     ownership = _ownership()
     session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value=77), execute=AsyncMock())
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="stage owner is invalid"):
-        await archive._verify_stage_owner(session, ownership, 0)
-
-    empty_rows = SimpleNamespace(mappings=lambda: [])
-    session.execute = AsyncMock(return_value=empty_rows)
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="stage owner differs"):
-        await archive._verify_stage_owner(session, ownership, 77)
-
-    sequence_ownership = _ownership(sequence_oids=(("seq", 21, "pricing_places_zcta", "id"),))
-    relation_rows = SimpleNamespace(mappings=lambda: [{"relname": "pricing_places_zcta", "oid": 11, "relowner": 77}])
-    session.execute = AsyncMock(side_effect=[relation_rows, empty_rows])
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="sequence owner differs"):
-        await archive._verify_stage_owner(session, sequence_ownership, 77)
-
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="validation scope differs"):
         await archive.prepare_reference_family_activation(
             session,
@@ -948,7 +922,7 @@ async def test_stage_owner_and_activation_guards(monkeypatch):
         await archive.capture_reference_family_incumbent(session, importer_id="medicare-enrollment", schema_name="mrf")
 
     complete = ((medicare_spec.table_names[0], 1), (medicare_spec.table_names[1], 2))
-    changed = ((medicare_spec.table_names[0], 1), (medicare_spec.table_names[1], 3))
+    changed = ((medicare_spec.table_names[0], 1), (medicare_spec.table_names[1], None))
     monkeypatch.setattr(archive, "_incumbent_pairs", AsyncMock(side_effect=[complete, changed]))
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="changed during capture"):
         await archive.capture_reference_family_incumbent(session, importer_id="medicare-enrollment", schema_name="mrf")
@@ -974,8 +948,8 @@ async def test_activation_receipt_and_authority_guards(monkeypatch):
             object(), archive.reference_family_spec("places-zcta"), ownership, incumbent, manifest, tables, None
         )
 
-    monkeypatch.setattr(archive, "_incumbent_pairs", AsyncMock(return_value=(("pricing_places_zcta", 99),)))
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="OID differs"):
+    monkeypatch.setattr(archive, "_incumbent_pairs", AsyncMock(return_value=(("other_table", 99),)))
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="declaration differs"):
         await archive._activation_receipt(
             object(), archive.reference_family_spec("places-zcta"), ownership, incumbent, manifest, tables, None
         )
@@ -1030,7 +1004,7 @@ async def test_activation_authority_guards():
             validation_receipt=_validation_receipt(),
             cutover=object(),
         )
-    invalid_cutover = archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, 12, 77, "invalid")
+    invalid_cutover = archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, "invalid")
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="activation authority is unsupported"):
         await archive.activate_validated_reference_family_stage(
             session,
@@ -1040,7 +1014,7 @@ async def test_activation_authority_guards():
             validation_receipt=_validation_receipt(),
             cutover=invalid_cutover,
         )
-    valid_cutover = archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, 12, 77, "manual")
+    valid_cutover = archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, "manual")
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="activation ownership is invalid"):
         await archive.activate_validated_reference_family_stage(
             session,
@@ -1062,7 +1036,7 @@ async def test_automatic_and_published_generation_guards(monkeypatch):
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="source generation is unavailable"):
         await archive._require_automatic_cutover_generation(object(), spec, incumbent, None)
 
-    current = SimpleNamespace(serving_generation=None, relation_oids=None)
+    current = SimpleNamespace(serving_generation=None, relations=None)
     monkeypatch.setattr(
         archive,
         "read_reference_family_result_generation_authority",
@@ -1071,7 +1045,7 @@ async def test_automatic_and_published_generation_guards(monkeypatch):
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="incumbent is incomplete"):
         await archive._require_automatic_cutover_generation(object(), spec, incumbent, _serving_generation())
 
-    current = SimpleNamespace(serving_generation=_serving_generation(), relation_oids=(99, 100))
+    current = SimpleNamespace(serving_generation=_serving_generation(), relations=(("mrf", "other"),))
     monkeypatch.setattr(
         archive,
         "read_reference_family_result_generation_authority",
@@ -1086,22 +1060,22 @@ async def test_automatic_and_published_generation_guards(monkeypatch):
 
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="source generation is invalid"):
         archive._cutover_source_generation(
-            archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, 12, 77, "automatic", {"bad": True})
+            archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, "automatic", {"bad": True})
         )
 
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="generation OIDs differ"):
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="generation names differ"):
         archive._require_published_generation_binding(
             archive.reference_family_spec("places-zcta"),
             (("pricing_places_zcta", 11),),
             _serving_generation(),
-            SimpleNamespace(relation_oids=(99,), serving_generation=_serving_generation()),
+            SimpleNamespace(relations=(("mrf", "other"),), serving_generation=_serving_generation()),
         )
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="generation-less adoption differs"):
         archive._require_published_generation_binding(
             archive.reference_family_spec("places-zcta"),
             (("pricing_places_zcta", 11),),
             None,
-            SimpleNamespace(relation_oids=(11,), serving_generation=None),
+            SimpleNamespace(relations=(("mrf", "pricing_places_zcta"),), serving_generation=None),
         )
 
 
@@ -1437,8 +1411,34 @@ async def test_index_completion_rejects_changed_ownership_before_ddl(monkeypatch
     session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
     ownership = _ownership()
     monkeypatch.setattr(
-        archive, "_capture_model_family_ownership", AsyncMock(return_value=replace(ownership, schema_oid=99))
+        archive,
+        "_capture_model_family_ownership",
+        AsyncMock(return_value=replace(ownership, relation_oids=(("other_table", 99),))),
     )
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="ownership differs"):
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="declaration differs"):
         await archive.complete_reference_family_restore(session, ownership)
     session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owned", "declared", "is_accepted"),
+    [
+        ((("codes_id_seq", 5, "codes", "id"),), (), True),
+        ((("codes_id_seq", 5, "codes", "id"),), (("codes_id_seq", "codes", "id"),), True),
+        ((("other_id_seq", 6, "other", "id"),), (), False),
+        ((), (("codes_id_seq", "codes", "id"),), False),
+    ],
+)
+async def test_model_namespace_admits_only_sequences_owned_by_family_columns(monkeypatch, owned, declared, is_accepted):
+    monkeypatch.setattr(archive, "_schema_oid", AsyncMock(return_value=10))
+    monkeypatch.setattr(archive, "_owned_sequences", AsyncMock(return_value=owned))
+    monkeypatch.setattr(archive, "_namespace_relations", AsyncMock(return_value=[]))
+    check = archive._require_model_family_namespace(
+        object(), SimpleNamespace(sequence_names=declared), "stage", (("codes", 4),)
+    )
+    if is_accepted:
+        await check
+        return
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="sequence declaration differs"):
+        await check

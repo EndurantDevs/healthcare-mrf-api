@@ -5,7 +5,7 @@ import asyncio
 import hashlib
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -41,14 +41,13 @@ async def test_office_read_dispatch_keeps_original_and_physical_capabilities(mon
     original, physical = _semantic_pin("original"), _semantic_pin("physical")
     source = fhir.with_fhir_successor(original, physical) if successor else original
     connection, events = object(), []
-    original_read = RetainedFHIRRead(connection, original.retained_capture, asyncio.current_task(), "unit", object())
-    physical_read = RetainedFHIRRead(connection, physical.retained_capture, asyncio.current_task(), "unit", object())
+    original_read = RetainedFHIRRead(original.retained_capture)
+    physical_read = RetainedFHIRRead(physical.retained_capture)
 
-    async def observe(read, actual_connection, capture):
-        assert actual_connection is connection
+    def observe(read, capture):
         events.append((read, capture))
 
-    monkeypatch.setattr(RetainedFHIRRead, "verify", observe)
+    monkeypatch.setattr(RetainedFHIRRead, "require_ready", observe)
     reads = fhir.RetainedFHIRSuccessorReads(original_read, physical_read) if successor else original_read
     await offices._verify_retained_office_read(connection, source, reads)
     assert events == [(original_read, original.retained_capture)] + (
@@ -60,7 +59,7 @@ async def test_office_read_dispatch_keeps_original_and_physical_capabilities(mon
 async def test_office_successor_rejects_foreign_capability_before_any_verify(monkeypatch, foreign):
     original, physical = _semantic_pin("original"), _semantic_pin("physical")
     source = fhir.with_fhir_successor(original, physical)
-    native = RetainedFHIRRead(object(), original.retained_capture, asyncio.current_task(), "unit", object())
+    native = RetainedFHIRRead(original.retained_capture)
     reads = (
         SimpleNamespace(verify=AsyncMock())
         if foreign == "outer"
@@ -68,11 +67,11 @@ async def test_office_successor_rejects_foreign_capability_before_any_verify(mon
             object() if foreign == "original" else native, object() if foreign == "physical" else native
         )
     )
-    verify = AsyncMock()
-    monkeypatch.setattr(RetainedFHIRRead, "verify", verify)
+    verify = Mock()
+    monkeypatch.setattr(RetainedFHIRRead, "require_ready", verify)
     with pytest.raises(offices.InitialCMSOfficeBindingError):
         await offices._verify_retained_office_read(object(), source, reads)
-    verify.assert_not_awaited()
+    verify.assert_not_called()
 
 
 async def test_verified_location_page_uses_physical_dataset_and_schema(monkeypatch):

@@ -260,6 +260,9 @@ async def test_lifecycle_v2_admits_and_seals_observed_as_of_shapes(
 
 # Collect isolated native proof in the existing database lane with its required DSN.
 from tests.nppes_isolated_catalog_postgres_support import (
+    publisher,
+)
+from tests.nppes_isolated_catalog_postgres_support import (
     runtime as runtime,
 )
 from tests.nppes_isolated_catalog_postgres_support import (
@@ -284,11 +287,29 @@ from tests.nppes_isolated_catalog_postgres_support import (
     test_missing_or_dishonest_controller_cannot_publish as test_missing_or_dishonest_controller_cannot_publish,
 )
 from tests.nppes_isolated_catalog_postgres_support import (
-    test_original_native_receipt_rejects_control_authority_drift as test_original_native_receipt_rejects_control_authority_drift,
-)
-from tests.nppes_isolated_catalog_postgres_support import (
     test_prepared_source_resumes_only_through_independent_freeze as test_prepared_source_resumes_only_through_independent_freeze,
 )
 from tests.nppes_isolated_catalog_postgres_support import (
     test_private_catalog_has_only_native_inert_relations as test_private_catalog_has_only_native_inert_relations,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "UPDATE {table} SET admission_ref=admission_ref",
+        "DELETE FROM {table}",
+        "TRUNCATE {table}",
+    ),
+    ids=("update", "delete", "truncate"),
+)
+async def test_source_control_write_permissions_are_enforced_by_postgresql(runtime, statement):
+    """Keep named control reads available while PostgreSQL refuses Source writes."""
+    table = f'"{runtime.policy.schema}"."{ADMISSION_TABLE}"'
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        async with publisher(runtime) as connection:
+            assert await connection.fetchval(f"SELECT count(*) FROM {table}") == 0
+            await connection.execute(statement.format(table=table))
+    async with publisher(runtime) as connection:
+        assert await connection.fetchval(f"SELECT count(*) FROM {table}") == 0

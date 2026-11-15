@@ -25,17 +25,15 @@ async def test_preserved_reads_never_replay_delegation_or_missing_roles(grantabl
     session = SimpleNamespace(
         scalar=AsyncMock(return_value='"legacy_reader"' if role_exists else None), execute=AsyncMock()
     )
-    if grantable or not role_exists:
-        with pytest.raises(bootstrap.native.ReferenceFamilyArchiveError):
-            await bootstrap._preserve_reads(session, child_by_field, {"oid": 101}, '"archive"."nucc_taxonomy"')
-        session.execute.assert_not_awaited()
-        return
-    await bootstrap._preserve_reads(session, child_by_field, {"oid": 101}, '"archive"."nucc_taxonomy"')
-    assert session.scalar.await_count == 1
+    # Reads come from the configured reader policy; the retired heap's ACL is never replayed.
+    owner_by_field = {"readers": ("legacy_reader", "api_reader")}
+    await bootstrap._preserve_reads(session, child_by_field, owner_by_field, '"archive"."nucc_taxonomy"')
+    session.scalar.assert_not_awaited()
     statements = [str(call.args[0]) for call in session.execute.await_args_list]
     assert statements == [
         'GRANT USAGE ON SCHEMA "archive" TO "legacy_reader"',
         'GRANT SELECT ON "mrf"."nucc_taxonomy","archive"."nucc_taxonomy" TO "legacy_reader"',
-        'GRANT USAGE ON SCHEMA "archive" TO PUBLIC',
-        'GRANT SELECT ON "mrf"."nucc_taxonomy","archive"."nucc_taxonomy" TO PUBLIC',
+        'GRANT USAGE ON SCHEMA "archive" TO "api_reader"',
+        'GRANT SELECT ON "mrf"."nucc_taxonomy","archive"."nucc_taxonomy" TO "api_reader"',
     ]
+    assert not any("GRANT OPTION" in statement or "PUBLIC" in statement for statement in statements)

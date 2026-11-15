@@ -44,7 +44,7 @@ async def held_consumer(sql, database, schema, held, release, observed):
         """Hold one actual consumer transaction while another runner retires its scratch."""
         capability = admitted._ROW_SCRATCH.get()
         observed["capability"] = capability
-        observed["scratch"] = dict(admitted._row_scratch_state(capability).owned_oids)
+        observed["scratch"] = {name: name for name in admitted._row_scratch_state(capability).owned_relations}
         driver = await _copy_driver(database._transaction_binding().session)
         observed["pid"] = await driver.fetchval("SELECT pg_backend_pid()")
         held.set()
@@ -84,12 +84,22 @@ def staged_runner_barrier(monkeypatch, held, task_by_name):
 def creation_cancel_gate(monkeypatch, task_by_name, captured_by_name):
     entered, release = asyncio.Event(), asyncio.Event()
     original = admitted._create_owned_relation
+    issue = admitted.issue_row_scratch
+    creator_by_state = {}
+
+    def capture_creator():
+        state = issue()
+        if state is not None:
+            creator_by_state[state] = asyncio.current_task()
+        return state
+
+    monkeypatch.setattr(admitted, "issue_row_scratch", capture_creator)
 
     async def create(schema, name, operation, row_scratch=None, row_state=None):
         """Hold a successfully registered creation until its original waiter is cancelled."""
         await original(schema, name, operation, row_scratch, row_state)
-        if row_state is not None and row_state.task is task_by_name.get("cancelled"):
-            captured_by_name.update(row_state.owned_oids)
+        if row_state is not None and creator_by_state.get(row_state) is task_by_name.get("cancelled"):
+            captured_by_name.update({name: name for name in row_state.owned_relations})
             entered.set()
             await release.wait()
 
@@ -105,7 +115,9 @@ def copy_cancel_gate(monkeypatch, task_by_name, captured_by_name):
         """Pause a real PostgreSQL COPY after its first partial frame was sent."""
         if asyncio.current_task() is task_by_name.get("cancelled"):
             source = kwargs["source"]
-            captured_by_name.update(admitted._row_scratch_state(admitted._ROW_SCRATCH.get()).owned_oids)
+            captured_by_name.update(
+                {name: name for name in admitted._row_scratch_state(admitted._ROW_SCRATCH.get()).owned_relations}
+            )
 
             async def chunks():
                 """Leave the server waiting for the remainder of this bounded native frame."""

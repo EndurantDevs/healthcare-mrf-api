@@ -199,8 +199,9 @@ async def _has_dropped_unpublished_stage(database, ctx, schema, table, stage_oid
             return False
         if await database.scalar(
             f'SELECT EXISTS (SELECT 1 FROM "{schema}".reference_family_result_generation '
-            "WHERE :stage_oid = ANY(relation_oids))",
-            stage_oid=stage_oid,
+            "WHERE serving_schema=:schema AND :table = ANY(serving_relation_names))",
+            schema=schema,
+            table=table,
         ):
             return False
         await database.status(f'DROP TABLE "{schema}"."{table}"')

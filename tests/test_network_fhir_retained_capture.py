@@ -52,10 +52,8 @@ def retained():
         "dataset-one",
         "a" * 64,
         "run-one",
-        10,
-        11,
-        12,
-        "reader_example",
+        {"schema": "source_example", "name": TABLES[0]},
+        {"schema": "source_example", "name": TABLES[1]},
         100,
         "b" * 64,
         "c" * 64,
@@ -70,11 +68,7 @@ def retained():
         origin,
         identity,
         "registry_fhir_capture_" + UUID(identity).hex,
-        20,
-        tuple((name, index + 30) for index, name in enumerate(sorted(TABLES))),
-        "owner_example",
-        ("reader_example",),
-        "1" * 64,
+        {name: {"schema": "registry_fhir_capture_" + UUID(identity).hex, "name": name} for name in TABLES},
         "2" * 64,
         "0" * 64,
     )
@@ -83,7 +77,7 @@ def retained():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("profile", ["legacy", "historical_semantic", "native"])
-async def test_capture_guard_route_never_falls_back_from_failed_native_proof(monkeypatch, profile):
+async def test_capture_data_refusal_precedes_candidate_writes(monkeypatch, profile):
     origin = retained().origin
     if profile != "legacy":
         origin = replace(
@@ -94,40 +88,26 @@ async def test_capture_guard_route_never_falls_back_from_failed_native_proof(mon
             semantic_projection_as_of="2026-01-01",
             descriptor_counts=origin.resource_counts,
         )
-    for name in ("_reader_identity", "_require_transaction", "_check_roles", "_same_database"):
-        monkeypatch.setattr(capture, name, AsyncMock())
-    monkeypatch.setattr(capture, "_origin_header", AsyncMock(return_value={} if profile == "native" else None))
-    legacy_guard = AsyncMock(side_effect=RetainedFHIRCaptureError("historical-guard"))
-    native_proof = AsyncMock(side_effect=RetainedFHIRCaptureError("native-proof"))
-    monkeypatch.setattr(capture, "_origin_guard", legacy_guard)
-    monkeypatch.setattr(capture, "require_native_generic_snapshot", native_proof)
+    reader = SimpleNamespace(is_in_transaction=lambda: True, fetchval=AsyncMock(return_value="repeatable read"))
     writer = SimpleNamespace(
-        fetchrow=AsyncMock(
-            return_value=dict(
-                login="capture_writer",
-                actor="capture_writer",
-                rolcanlogin=True,
-                rolsuper=False,
-                rolcreatedb=False,
-                rolcreaterole=False,
-                rolreplication=False,
-                rolbypassrls=False,
-            )
-        ),
-        execute=AsyncMock(),
+        is_in_transaction=lambda: True, fetchval=AsyncMock(return_value="repeatable read"), execute=AsyncMock()
     )
-    expected = "native-proof" if profile == "native" else "historical-guard"
-    with pytest.raises(RetainedFHIRCaptureError, match=expected):
+    header = AsyncMock(return_value={} if profile == "native" else None)
+    if profile != "native":
+        header.side_effect = RetainedFHIRCaptureError("source-data-refused")
+    monkeypatch.setattr(capture, "_origin_header", header)
+    source_data = AsyncMock(side_effect=RetainedFHIRCaptureError("source-data-refused"))
+    monkeypatch.setattr(capture, "require_native_generic_snapshot", source_data)
+    with pytest.raises(RetainedFHIRCaptureError, match="source-data-refused"):
         await capture.capture_retained_fhir_source(
-            object(),
+            reader,
             writer,
             origin,
             capture_id=uuid4(),
             owner_role="capture_owner",
-            runtime_roles=(origin.reader_role,),
+            runtime_roles=("capture_reader",),
         )
-    assert native_proof.await_count == (1 if profile == "native" else 0)
-    assert legacy_guard.await_count == (0 if profile == "native" else 1)
+    assert source_data.await_count == int(profile == "native")
     writer.execute.assert_not_awaited()
 
 
@@ -140,7 +120,7 @@ def pin(value):
         origin.dataset_id,
         origin.dataset_sha256,
         value.release_id,
-        origin.resource_parent_oid,
+        origin.resource_relation,
         "registry-source-one",
         "2026-01-01",
         retained_capture=value,
@@ -168,7 +148,7 @@ def test_capture_wire_preserves_original_refusal_and_direct_organization_scope()
     assert decode_registry_source_recipes(wire) == (recipe,)
     assert validate_initial_source_recipes((recipe,)) == (recipe,)
     assert source.read_schema_name == value.schema_name
-    assert source.read_resource_table_oid == dict(value.relation_oids)[TABLES[1]]
+    assert source.read_resource_relation == value.tables[TABLES[1]]
     assert value.origin.original_admission_refusal == REFUSAL
     sql = _extraction_sql(source, '"registry_example"', True, True)
     assert "'capture_sha256',$17::text" in sql and "legacy_uuid" not in sql
@@ -181,7 +161,7 @@ def test_capture_wire_preserves_original_refusal_and_direct_organization_scope()
     [
         ("source_id", "other-source"),
         ("dataset_sha256", "f" * 64),
-        ("resource_table_oid", 99),
+        ("resource_relation", {"schema": "other_source", "name": TABLES[1]}),
         ("release_id", "invented-original-release"),
     ],
 )
@@ -231,44 +211,6 @@ def test_normalized_payload_validation_rejects_changed_body_and_wrong_source():
             capture._fold_rows([altered_by_field], origin, roots, counts, root, 0)
     with pytest.raises(RetainedFHIRCaptureError):
         capture._require_roots(origin, roots, counts, root)
-
-
-@pytest.mark.asyncio
-async def test_verified_read_is_local_to_original_transaction_and_rechecks_custody(monkeypatch):
-    value = retained()
-    connection = SimpleNamespace(is_in_transaction=lambda: True)
-    custody = AsyncMock(return_value=value)
-    xid = AsyncMock(return_value="1/2")
-    monkeypatch.setattr(capture, "require_retained_fhir_capture", custody)
-    monkeypatch.setattr(capture, "_virtual_xid", xid)
-    read = await capture.pin_retained_fhir_read(connection, value)
-    await read.verify(connection, value)
-    assert custody.await_args_list[0].kwargs == {}
-    assert custody.await_args_list[1].kwargs == {"verify_content": False}
-    with pytest.raises(RetainedFHIRCaptureError):
-        await read.verify(SimpleNamespace(is_in_transaction=lambda: True), value)
-    xid.return_value = "1/3"
-    with pytest.raises(RetainedFHIRCaptureError):
-        await read.verify(connection, value)
-    xid.return_value = "1/2"
-    with pytest.raises(RetainedFHIRCaptureError):
-        await asyncio.create_task(read.verify(connection, value))
-    forged = replace(read, brand=object())
-    with pytest.raises(RetainedFHIRCaptureError):
-        await forged.verify(connection, value)
-
-
-@pytest.mark.asyncio
-async def test_closed_native_receipt_and_content_are_not_caller_claims(monkeypatch):
-    value = retained()
-    connection = SimpleNamespace(
-        is_in_transaction=lambda: True, fetchval=AsyncMock(side_effect=["repeatable read", "changed-native-comment"])
-    )
-    monkeypatch.setattr(
-        capture, "_catalog", AsyncMock(return_value=(value.schema_oid, value.relation_oids, value.catalog_sha256))
-    )
-    with pytest.raises(RetainedFHIRCaptureError):
-        await capture.require_retained_fhir_capture(connection, value, verify_content=False)
 
 
 def test_admitted_profile_is_explicit_and_does_not_replace_legacy_refusal():
@@ -785,57 +727,6 @@ async def test_large_semantic_metadata_stream_preserves_raw_identity(monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("version", [1, 2])
-async def test_parent_reader_refusal_stops_leaf_checks(version):
-    from db import migration_generic_source_candidates as guards
-
-    origin = retained().origin
-    snapshot_by_field = {
-        "body": guards._canonical_copy_guard_bodies(origin.schema_name, origin.preparation_schema)[1]
-        if version == 1
-        else guards._cms_canonical_copy_guard_body(origin.schema_name, origin.preparation_schema),
-        "identity": {"oid": 44, "proowner": 55},
-    }
-    statements = [
-        SimpleNamespace(get_attributes=lambda: (), fetch=AsyncMock(return_value=rows))
-        for rows in ([snapshot_by_field], [{"reader_valid": False}], [])
-    ]
-    reader = SimpleNamespace(
-        prepare=AsyncMock(side_effect=statements),
-        fetchval=AsyncMock(return_value=99),
-        fetch=AsyncMock(),
-        execute=AsyncMock(),
-    )
-    with pytest.raises(RetainedFHIRCaptureError, match="retained_fhir_capture_unavailable") as refused:
-        await capture._origin_candidate_guards(reader, origin)
-    assert str(refused.value.__context__) == "provider_directory_canonical_copy_preparation_reader_required"
-    assert refused.value.__cause__ is None and refused.value.__suppress_context__
-    assert reader.prepare.await_count == 3
-    reader.fetch.assert_not_awaited()
-    reader.execute.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("version", [0, 1, 2])
-async def test_unapproved_guard_body_refuses_before_reader_authority(version):
-    from db import migration_generic_source_candidates as guards
-
-    origin = retained().origin
-    body = (
-        *guards._canonical_copy_guard_bodies(origin.schema_name, origin.preparation_schema),
-        guards._cms_canonical_copy_guard_body(origin.schema_name, origin.preparation_schema),
-    )[version]
-    if version:
-        body += "\n-- changed\n"
-    statement = SimpleNamespace(get_attributes=lambda: (), fetch=AsyncMock(return_value=[{"body": body}]))
-    reader = SimpleNamespace(prepare=AsyncMock(return_value=statement), fetchval=AsyncMock())
-    with pytest.raises(RetainedFHIRCaptureError, match="retained_fhir_capture_unavailable"):
-        await capture._candidate_parent_proof(reader, origin)
-    reader.prepare.assert_awaited_once()
-    reader.fetchval.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["verify", "copy"])
 async def test_oversized_resource_refuses_before_fetch(operation):
     origin, limits = retained().origin, []
@@ -859,7 +750,6 @@ async def test_oversized_resource_refuses_before_fetch(operation):
         is_in_transaction=lambda: True,
     )
     pair = capture._ReaderCopy(reader, writer)
-    pair.virtual_xid = "1/2"
     with pytest.raises(RetainedFHIRCaptureError):
         if operation == "verify":
             await capture._verify_resources(reader, "capture_example", origin)
@@ -914,3 +804,117 @@ async def test_resource_verify_reduces_page_without_skipping():
 def test_resource_hash_selection_never_downgrades_unknown_profile():
     with pytest.raises(RetainedFHIRCaptureError):
         capture._resource_hash_contract(SimpleNamespace(admission_profile="unknown"))
+
+
+def test_legacy_capture_projects_names_and_preserves_existing_capture_identifier():
+    value = retained()
+    origin_by_field = value.as_dict()["origin"]
+    origin_by_field = {
+        key: field for key, field in origin_by_field.items() if key not in {"header_relation", "resource_relation"}
+    }
+    origin_by_field.update(
+        header_oid=100, resource_parent_oid=101, resource_leaf_oid=102, reader_role="previous_reader"
+    )
+    capture_by_field = {
+        "origin": origin_by_field,
+        "capture_id": value.capture_id,
+        "schema_name": value.schema_name,
+        "schema_oid": 200,
+        "relation_oids": [[name, index] for index, name in enumerate(TABLES, 201)],
+        "owner_role": "previous_owner",
+        "runtime_roles": ["previous_reader"],
+        "catalog_sha256": "obsolete",
+        "content_sha256": value.content_sha256,
+        "capture_sha256": "f" * 64,
+    }
+    decoded = validate_capture(capture_by_field)
+    assert decoded.capture_sha256 == "f" * 64
+    assert decoded.tables[TABLES[1]] == {"schema": value.schema_name, "name": TABLES[1]}
+    assert decoded.origin.resource_relation == {"schema": value.origin.schema_name, "name": TABLES[1]}
+    assert validate_capture(decoded.as_dict()) == decoded
+    capture_by_field["unknown"] = True
+    with pytest.raises(RetainedFHIRCaptureError):
+        validate_capture(capture_by_field)
+
+
+def test_new_capture_content_digest_and_relation_names_remain_bound():
+    value = retained()
+    assert validate_capture(value.as_dict()) == value
+    for change in ({"content_sha256": "f" * 64}, {"tables": {}}):
+        with pytest.raises(RetainedFHIRCaptureError):
+            validate_capture({**value.as_dict(), **change})
+
+
+@pytest.mark.parametrize("changed_content", [False, True])
+async def test_pinned_retained_read_validates_content_and_keeps_the_logical_edition(monkeypatch, changed_content):
+    value = retained()
+    connection = SimpleNamespace(is_in_transaction=lambda: True, fetchval=AsyncMock(return_value="repeatable read"))
+    header = AsyncMock()
+    content = AsyncMock(return_value="f" * 64 if changed_content else value.content_sha256)
+    monkeypatch.setattr(capture, "_copied_header_bytes", header)
+    monkeypatch.setattr(capture, "_content_tables", content)
+    if changed_content:
+        with pytest.raises(RetainedFHIRCaptureError):
+            await capture.pin_retained_fhir_read(connection, value)
+    else:
+        read = await capture.pin_retained_fhir_read(connection, value)
+        read.require_ready(value)
+        assert read.capture == value
+        with pytest.raises(RetainedFHIRCaptureError):
+            read.require_ready(retained())
+    header.assert_awaited_once_with(connection, value.schema_name, value.origin)
+    content.assert_awaited_once_with(connection, value.schema_name)
+
+
+async def test_retained_read_requires_pinned_repeatable_read_before_data_queries(monkeypatch):
+    connection = SimpleNamespace(is_in_transaction=lambda: True, fetchval=AsyncMock(return_value="read committed"))
+    header = AsyncMock()
+    monkeypatch.setattr(capture, "_copied_header_bytes", header)
+    with pytest.raises(ValueError, match="repeatable-read"):
+        await capture.require_retained_fhir_capture(connection, retained())
+    header.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "freeze", "resources", "metadata", "content"])
+async def test_capture_freezes_then_checks_complete_data_before_saving_metadata(monkeypatch, failure):
+    origin = retained().origin
+    capture_id = UUID(int=24)
+    schema = "registry_fhir_capture_" + capture_id.hex
+    phases = []
+
+    def phase(name, result=None):
+        async def run(*arguments, **options):
+            phases.append(name)
+            if name == failure:
+                raise RuntimeError("synthetic capture failure")
+            return result
+
+        return AsyncMock(side_effect=run)
+
+    freeze = phase("freeze")
+    monkeypatch.setattr(capture, "freeze_fhir_source_snapshot", freeze)
+    monkeypatch.setattr(capture, "_verify_resources", phase("resources"))
+    monkeypatch.setattr(capture, "_copied_header_bytes", phase("metadata"))
+    monkeypatch.setattr(capture, "_content_tables", phase("content", "e" * 64))
+    writer = SimpleNamespace(execute=AsyncMock())
+    if failure is not None:
+        with pytest.raises(RuntimeError, match="synthetic capture failure"):
+            await capture._seal_capture(writer, origin, schema, capture_id, "capture_owner", ("capture_reader",))
+        writer.execute.assert_not_awaited()
+    else:
+        retained_copy = await capture._seal_capture(
+            writer, origin, schema, capture_id, "capture_owner", ("capture_reader",)
+        )
+        assert phases == ["freeze", "resources", "metadata", "content"]
+        assert validate_capture(retained_copy) == retained_copy
+        assert retained_copy.tables == {name: {"schema": schema, "name": name} for name in TABLES}
+        assert retained_copy.contract == "retained-normalized-fhir-v2"
+        assert writer.execute.await_args.args[0].startswith('COMMENT ON SCHEMA "' + schema + '"')
+    freeze.assert_awaited_once_with(
+        writer,
+        schema,
+        namespace_owner="capture_owner",
+        reader_roles=("capture_reader",),
+        application_roles=("capture_reader",),
+    )

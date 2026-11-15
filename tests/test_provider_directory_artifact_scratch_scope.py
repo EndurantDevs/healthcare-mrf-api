@@ -21,7 +21,6 @@ def _new_case():
     name_by_root = {
         root: f"scratch_{index}" for index, root in enumerate((scratch.inputs.SOURCE, *scratch.inputs.TYPED_ROOTS))
     }
-    oid_by_root = {root: index + 101 for index, root in enumerate(name_by_root)}
     fence = SimpleNamespace(
         datasets=(SimpleNamespace(source_id="source", dataset_id="dataset", artifact_resources=()),)
     )
@@ -35,7 +34,6 @@ def _new_case():
     admission._started = True
     directory = SimpleNamespace(
         _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES=ContextVar("host_names", default={}),
-        _PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS=ContextVar("host_oids", default={}),
     )
     return SimpleNamespace(
         directory=directory,
@@ -45,7 +43,6 @@ def _new_case():
         projection=projection,
         types=frozenset({"Practitioner"}),
         names=name_by_root,
-        oids=oid_by_root,
         events=[],
         metadata=None,
         metadata_error=None,
@@ -73,7 +70,7 @@ async def _metadata(case, directory, scope):
     if case.metadata_error is not None:
         raise case.metadata_error
     case.metadata_seen = True
-    return deepcopy(case.metadata or {"relation_by_table": case.names, "relation_oids": case.oids})
+    return deepcopy(case.metadata or {"relation_by_table": case.names})
 
 
 @contextmanager
@@ -89,15 +86,13 @@ def _input_scope(case, scope):
 
 
 @contextmanager
-def _artifact_tokens(case, full_fence, resource_fence, names, oids):
+def _artifact_tokens(case, full_fence, resource_fence, names):
     assert full_fence is resource_fence is case.fence and case.metadata_seen
     case.events.append("tokens enter")
     names_token = case.directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(names)
-    oids_token = case.directory._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.set(oids)
     try:
         yield
     finally:
-        case.directory._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.reset(oids_token)
         case.directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(names_token)
         case.events.append("tokens exit")
 
@@ -186,22 +181,21 @@ async def test_cleanup_failure_after_success_propagates(case):
     assert caught.value is error
 
 
-@pytest.mark.parametrize("fault", ["missing", "foreign", "duplicate_name", "duplicate_oid", "boolean_oid"])
+@pytest.mark.parametrize("fault", ["missing", "foreign", "duplicate_name", "invalid_name", "extra_field"])
 async def test_invalid_metadata_never_exposes_names(case, fault):
-    names, oids = dict(case.names), dict(case.oids)
-    first, second = list(names)[:2]
+    name_by_root = dict(case.names)
+    first, second = list(name_by_root)[:2]
     if fault == "missing":
-        oids.pop(first)
+        name_by_root.pop(first)
     elif fault == "foreign":
-        names["foreign"] = names.pop(first)
-        oids["foreign"] = oids.pop(first)
+        name_by_root["foreign"] = name_by_root.pop(first)
     elif fault == "duplicate_name":
-        names[first] = names[second]
-    elif fault == "duplicate_oid":
-        oids[first] = oids[second]
-    else:
-        oids[first] = True
-    case.metadata = {"relation_by_table": names, "relation_oids": oids}
+        name_by_root[first] = name_by_root[second]
+    elif fault == "invalid_name":
+        name_by_root[first] = None
+    case.metadata = {"relation_by_table": name_by_root}
+    if fault == "extra_field":
+        case.metadata["unsupported"] = True
     with pytest.raises(RuntimeError, match="scratch_metadata_changed"):
         async with prepared(case):
             pytest.fail("invalid metadata was exposed")
@@ -249,8 +243,6 @@ def _reuse_fault(case, fault, monkeypatch):
             case.projection.projection_hash = "b" * 64
         case "names":
             case.directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set({})
-        case "oids":
-            case.directory._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.set({})
         case "scope":
             monkeypatch.setattr(
                 scratch.inputs, "active_scratch_inputs", lambda directory: SimpleNamespace(admission=case.admission)
@@ -259,7 +251,7 @@ def _reuse_fault(case, fault, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "fault", ["missing", "profile", "foreign", "unstarted", "fence", "types", "projection", "names", "oids", "scope"]
+    "fault", ["missing", "profile", "foreign", "unstarted", "fence", "types", "projection", "names", "scope"]
 )
 async def test_reuse_refuses_changed_authority_and_plan(case, fault, monkeypatch):
     token = preparation._ACTIVE.set(case.admission)
@@ -345,7 +337,9 @@ def _native_manifest_fixture(monkeypatch):
     for number, (root, relation) in enumerate(fixture.prepared.relation_overrides.items()):
         oid = fixture.heaps[relation]["oid"]
         selected.append(oid)
+        template = next(entry for entry in fixture.indexes if entry["relation_oid"] == oid)
         native_index = dict(
+            template,
             relation_oid=oid,
             index_oid=9000 + number,
             index_name=f"prepared_native_{number}",
@@ -361,8 +355,7 @@ def _native_manifest_fixture(monkeypatch):
         inventory[root] = dict(
             schema="test_schema",
             relation=relation,
-            oid=oid,
-            indexes=((native_index["index_name"], native_index["index_oid"]),),
+            indexes=(native_index["index_name"],),
         )
 
     async def metadata(directory, _scope):
@@ -377,8 +370,8 @@ def _native_manifest_fixture(monkeypatch):
     return support, fixture
 
 
-@pytest.mark.parametrize("fault", [None, "missing", "extra", "replaced", "invalid", "primary"])
-async def test_manifest_compares_exact_prepared_index_names_and_oids(monkeypatch, capsys, fault):
+@pytest.mark.parametrize("fault", [None, "missing", "extra", "allocation", "renamed", "invalid", "primary"])
+async def test_manifest_compares_complete_prepared_index_names_and_state(monkeypatch, capsys, fault):
     support, fixture = _native_manifest_fixture(monkeypatch)
     row = fixture.native_rows[0]
     match fault:
@@ -386,13 +379,15 @@ async def test_manifest_compares_exact_prepared_index_names_and_oids(monkeypatch
             fixture.indexes.remove(row)
         case "extra":
             fixture.indexes.append({**row, "index_name": "extra_native", "index_oid": 99000})
-        case "replaced":
+        case "allocation":
             row["index_oid"] += 50000
+        case "renamed":
+            row["index_name"] = "unexpected_replacement"
         case "invalid":
             row["indisvalid"] = False
         case "primary":
             row["indisprimary"] = False
-    if fault is not None:
+    if fault not in (None, "allocation"):
         reason = "indexes_incomplete" if fault in {"invalid", "primary"} else "index_identity_changed"
         await _assert_manifest_index_refusal(support, fixture, reason)
         return

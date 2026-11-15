@@ -54,6 +54,7 @@ from process import provider_directory_generic_source_adapters as source_adapter
 from process.provider_directory_proof_store import build_dataset_proof_shard
 from process.provider_directory_resource_hash import LEGACY_RESOURCE_HASH_CONTRACT
 from scripts.research import provider_directory_fhir_harness as harness
+from tests.provider_directory_fhir_coverage_low_support import stub_artifact_build_guard as _stub_artifact_build_guard
 from tests.provider_directory_fhir_subset_completion_support import (
     build_completed_execution_proof,
     build_subset_contract,
@@ -5819,26 +5820,21 @@ async def test_location_scope_identity_guards(monkeypatch):
     relation_token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
         {"provider_directory_location": "location_scope"}
     )
-    oid_token = importer._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.set({"provider_directory_location": 41})
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_capacity_admission",
         lambda: None,
     )
     try:
-        identities.return_value = {"location_scope": (41, "r", "u")}
-        assert await importer._owned_unlogged_location_artifact_scope("mrf") == (
-            "location_scope",
-            41,
-        )
-        identities.return_value = {"location_scope": (42, "r", "u")}
+        identities.return_value = {"location_scope": ("location_scope", "r", "u")}
+        assert await importer._owned_unlogged_location_artifact_scope("mrf") == "location_scope"
+        identities.return_value = {"location_scope": ("location_scope", "r", "p")}
         with pytest.raises(
             importer.ProviderDirectoryArtifactBuildStale,
             match="location_address_scope_invalid",
         ):
             await importer._owned_unlogged_location_artifact_scope("mrf")
     finally:
-        importer._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.reset(oid_token)
         importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(relation_token)
 
 
@@ -5903,14 +5899,13 @@ async def test_location_key_replacement_guards(monkeypatch):
     build = SimpleNamespace(
         schema="mrf",
         old_table="location_scope",
-        old_oid=41,
         stage_table="location_sidecar",
         replacement_table="location_replacement",
     )
     monkeypatch.setattr(
         importer,
         "_artifact_scope_relation_identities",
-        AsyncMock(return_value={"location_scope": (42, "r", "u")}),
+        AsyncMock(return_value={"location_scope": ("location_scope", "r", "p")}),
     )
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
@@ -6013,13 +6008,21 @@ def _install_native_location_test(monkeypatch, worker_connection, status, scalar
     monkeypatch.setattr(
         importer,
         "_owned_unlogged_location_artifact_scope",
-        AsyncMock(return_value=("provider_directory_location_artifact_scope_test", 41)),
+        AsyncMock(return_value="provider_directory_location_artifact_scope_test"),
     )
     monkeypatch.setattr(importer, "_provider_directory_profile_capacity_transaction", transaction)
     monkeypatch.setattr(
         importer,
         "_artifact_scope_relation_identities",
-        AsyncMock(return_value={"provider_directory_location_artifact_scope_test": (41, "r", "u")}),
+        AsyncMock(
+            return_value={
+                "provider_directory_location_artifact_scope_test": (
+                    "provider_directory_location_artifact_scope_test",
+                    "r",
+                    "u",
+                )
+            }
+        ),
     )
     monkeypatch.setattr(importer.db, "acquire", acquire)
     monkeypatch.setattr(importer.db, "status", status)
@@ -10823,26 +10826,6 @@ def _artifact_publish_scalar(row_count: int, statements: list[str] | None = None
     return fake_scalar
 
 
-def _stub_artifact_build_guard(monkeypatch):
-    @contextlib.asynccontextmanager
-    async def unlocked_guard(_schema, target_relation, **_kwargs):
-        target_oid = 101 if "address_overlay" in target_relation else None
-        yield importer.ProviderDirectoryArtifactBuildFence(target_oid=target_oid)
-
-    monkeypatch.setattr(importer, "_provider_directory_artifact_build_guard", unlocked_guard)
-    monkeypatch.setattr(importer, "_address_alias_generation", AsyncMock(return_value=0))
-    monkeypatch.setattr(
-        importer,
-        "_address_alias_artifact_generation",
-        AsyncMock(return_value=0),
-    )
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_relation_oid",
-        AsyncMock(side_effect=lambda _schema, relation: 101 if "address_overlay" in relation else None),
-    )
-
-
 def _artifact_stage_table(status_calls: list[tuple[str, dict[str, Any]]], prefix: str) -> str:
     """Return the unique stage identifier recorded by a publisher test."""
 
@@ -13617,6 +13600,7 @@ async def test_failed_endpoint_dataset_candidate_does_not_change_current_pointer
 
 class _EndpointDatasetPromotionHarness:
     def __init__(self):
+        self.scalar = AsyncMock(return_value=True)  # the candidate admission lock is granted
         self.datasets = {
             "dataset_old": {"dataset_id": "dataset_old", "is_current": True, "status": "published"},
             "dataset_new": {
@@ -13965,8 +13949,12 @@ class _AtomicCandidateInitializationHarness:
         ]
 
     async def has_resource_family_lock(self, sql, **_params):
-        assert "pg_advisory_xact_lock" in str(sql)
-        self.events.append("resource_family_lock")
+        if "pg_try_advisory_xact_lock" in str(sql):
+            assert set(_params) == {"admission_scope"}
+            self.events.append("lock")
+        else:
+            assert "pg_advisory_xact_lock" in str(sql)
+            self.events.append("resource_family_lock")
         return True
 
     scalar = has_resource_family_lock
@@ -27835,10 +27823,14 @@ async def test_import_resources_owner_cancel_stops_sibling_promptly(monkeypatch)
     sibling_started = asyncio.Event()
     sibling_cancelled = asyncio.Event()
     wait_forever = asyncio.Event()
+    owner_ready = asyncio.Event()
+    request_cancel = asyncio.Event()
 
     async def fake_fetch_resource_rows(source, _resource_type, **_kwargs):
         if source["source_id"] == "source_cancelled":
             await sibling_started.wait()
+            owner_ready.set()
+            await request_cancel.wait()
             raise importer.ImportCancelledError("owner cancelled run_1")
         sibling_started.set()
         try:
@@ -27850,11 +27842,16 @@ async def test_import_resources_owner_cancel_stops_sibling_promptly(monkeypatch)
     monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
     monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=0))
 
-    with pytest.raises(importer.ImportCancelledError, match="owner cancelled run_1"):
-        await asyncio.wait_for(
-            _import_location_source_groups(["source_cancelled", "source_sibling"]),
-            timeout=1,
-        )
+    import_task = asyncio.create_task(_import_location_source_groups(["source_cancelled", "source_sibling"]))
+    try:
+        # Bound cancellation after both workers are ready, separately from startup.
+        await asyncio.wait_for(owner_ready.wait(), timeout=10)
+        request_cancel.set()
+        with pytest.raises(importer.ImportCancelledError, match="owner cancelled run_1"):
+            await asyncio.wait_for(import_task, timeout=1)
+    finally:
+        import_task.cancel()
+        await asyncio.gather(import_task, return_exceptions=True)
 
     assert sibling_cancelled.is_set()
 

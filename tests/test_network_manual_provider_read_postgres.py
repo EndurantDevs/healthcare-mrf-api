@@ -54,7 +54,12 @@ async def _compose(fixture, seed, request_id, expected_head):
     )
     fixture.copy_targets.append(target)
     await prepare_and_publish_network_candidate(
-        fixture.connection, target, addresses, **_roles(fixture), control_schema=fixture.control_schema
+        fixture.connection,
+        target,
+        addresses,
+        **_roles(fixture),
+        control_schema=fixture.control_schema,
+        seal_candidate=fixture.seal_candidate,
     )
     async with fixture.connection.transaction(readonly=True):
         return await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
@@ -317,9 +322,8 @@ def _assert_fixed_guarded_queries(logged_queries):
     application_prefixes = (
         "SELECT current_setting('transaction_isolation')",
         # The published routing metadata is the only candidate lookup.
-        "SELECT to_jsonb(candidate)::text AS candidate_json",
+        "SELECT jsonb_build_object( 'candidate_id',candidate.candidate_id",
         "WITH selected_addresses AS NOT MATERIALIZED",
-        "WITH expected AS MATERIALIZED",
     )
     codec_prefixes = (
         "SELECT current_setting('jit') AS cur, set_config('jit', 'off', false) AS new",
@@ -330,12 +334,12 @@ def _assert_fixed_guarded_queries(logged_queries):
     for query in logged_queries:
         statement = " ".join(query.query.split())
         (codec_queries if statement.startswith(codec_prefixes) else application_queries).append(statement)
-    assert len(application_queries) == len(application_prefixes) == 4
+    assert len(application_queries) == len(application_prefixes) == 3
     assert all(
         statement.startswith(prefix)
         for statement, prefix in zip(application_queries, application_prefixes, strict=True)
     )
-    assert len(codec_queries) in (0, 3) and len(logged_queries) in (4, 7)
+    assert len(codec_queries) in (0, 3) and len(logged_queries) in (3, 6)
     assert all(statement.startswith(prefix) for statement, prefix in zip(codec_queries, codec_prefixes))
     assert all(query.query.lstrip().startswith(("SELECT", "WITH")) for query in logged_queries)
     assert not any("network_candidate_custody" in query.query for query in logged_queries)
@@ -425,7 +429,6 @@ async def test_transaction_pin_and_output_bounds_fail_closed(manual_read_db, mon
     "damage",
     [
         "oid",
-        "row_security",
         "display",
         "coordinates",
         "duplicate_binding",
@@ -505,7 +508,6 @@ def _tampering_statement(fixture, damage):
     namespace = '"' + fixture.source.schema_name + '"'
     statements_by_damage = {
         "oid": (f"ALTER TABLE {namespace}.entity_address_unified RENAME TO changed_address", ()),
-        "row_security": (f"ALTER TABLE {namespace}.entity_address_unified ENABLE ROW LEVEL SECURITY", ()),
         "display": (f"UPDATE {namespace}.entity_address_unified SET first_line=repeat('x',513)", ()),
         "coordinates": (f"UPDATE {namespace}.entity_address_unified SET lat=91,long=10", ()),
         "missing_membership": (

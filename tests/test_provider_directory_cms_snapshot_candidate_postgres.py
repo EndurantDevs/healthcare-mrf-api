@@ -231,7 +231,7 @@ async def test_original_publisher_cannot_allocate_snapshot_header(snapshot_case)
     case = snapshot_case
     async with publisher(case) as (_session, driver):
         await driver.execute("SET LOCAL search_path=pg_catalog,pg_temp")
-        with pytest.raises(ValueError, match="independent_original_admin_required"):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
             await _attach(case, driver)
         assert await _check(case, driver) == case.sealed
     assert await _new_header(case) is None
@@ -292,7 +292,6 @@ async def _copy_four_allocated_targets(case, session, driver):
                 case.storage,
                 retained,
                 request["owner_role"],
-                request["owner_oid"],
                 request["migration_role"],
             )
             == case.sealed
@@ -467,11 +466,12 @@ async def allocated_generic_copy_case(publication_case, monkeypatch):
 
 
 async def _assert_copy_candidate_pins(case, driver):
-    child_tables = [row for row in case.generic_allocation["inventory"] if row["relkind"] == "r"]
+    child_tables = [row for row in case.generic_allocation["inventory"] if row["kind"] == "r"]
     assert await driver.fetchval(
         "SELECT count(DISTINCT relation)=4 FROM pg_locks WHERE pid=pg_backend_pid() "
-        "AND granted AND mode='ShareUpdateExclusiveLock' AND relation=ANY($1::oid[])",
-        [row["oid"] for row in child_tables],
+        "AND granted AND mode='ShareUpdateExclusiveLock' AND relation=ANY(ARRAY(SELECT to_regclass(format('%I.%I',$1::text,name))::oid FROM unnest($2::text[]) name))",
+        case.storage.catalog_schema,
+        [row["name"] for row in child_tables],
     )
     assert not await driver.fetchval(
         "SELECT EXISTS(SELECT FROM pg_locks l JOIN pg_class c ON c.oid=l.relation "

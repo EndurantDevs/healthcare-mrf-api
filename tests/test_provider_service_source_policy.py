@@ -14,6 +14,7 @@ from api import provider_service_source_policy as policy
 from api.network_address_scope import NetworkAddressReadScope
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
 from api.plan_release_serving import PlanReleaseSnapshotBinding
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.ptg_parts.result_archive_source_authority import result_archive_manifest_sha256
 from process.registry_catalog_policy import RegistryOrganizationVisibility
@@ -43,15 +44,16 @@ def _reviewed_source():
 
 
 def _fixture(monkeypatch, *, excluded=(), org=None):
+    """Bind the reviewed source and queued metadata replies to one logical read scope."""
     mapping, review, manifest = _reviewed_source()
     command = review["document"]["command"]
     binding = PlanReleaseSnapshotBinding(
         9, "snapshot_example", "source_example", command["plan_id"], command["plan_market_type"], "in_network", True
     )
     selection = SimpleNamespace(in_network_bindings=(binding,), bindings=(binding,))
-    pin = PinnedNetworkServingManifest(
-        17, str(UUID(int=10)), "network_candidate_" + UUID(int=10).hex, 1, {}, 23, "b" * 64, 99
-    )
+    schema_name = "network_candidate_" + UUID(int=10).hex
+    address_relation = CompactAddressRelation(schema_name, "entity_address_unified")
+    pin = PinnedNetworkServingManifest(17, str(UUID(int=10)), schema_name, 1, {}, 23, "b" * 64, address_relation)
     scope = NetworkAddressReadScope(pin, None, None, "a" * 64, excluded, None, org or RegistryOrganizationVisibility())
     monkeypatch.setattr(policy, "current_network_address_scope", lambda: scope)
     monkeypatch.setattr(policy, "PTG2_SCHEMA", "synthetic_ptg")

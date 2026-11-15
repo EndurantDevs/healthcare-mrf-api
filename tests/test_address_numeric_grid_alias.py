@@ -29,20 +29,15 @@ from process.ext import (
     address_strict_source_backfill_sql,
 )
 
-
 provider_directory = importlib.import_module("process.provider_directory_fhir")
 entity_address = importlib.import_module("process.entity_address_unified")
 
 
 MIGRATION_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "alembic/versions"
-    / "20260811100000_address_numeric_grid_alias.py"
+    Path(__file__).resolve().parents[1] / "alembic/versions" / "20260811100000_address_numeric_grid_alias.py"
 )
 EVIDENCE_MIGRATION_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "alembic/versions"
-    / "20260816020000_address_evidence_alias.py"
+    Path(__file__).resolve().parents[1] / "alembic/versions" / "20260816020000_address_evidence_alias.py"
 )
 
 
@@ -112,14 +107,9 @@ def test_candidate_sql_requires_exact_unit_and_geography_and_counts_ambiguity_fi
     assert "levenshtein" not in sql.lower()
 
 
-
 def test_alias_kind_policy_is_closed_and_persisted_materialization_is_generic():
-    assert address_alias_sql.alias_ruleset(
-        address_alias_sql.NUMERIC_GRID_ALIAS_KIND
-    ) == 1
-    assert address_alias_sql.alias_ruleset(
-        address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND
-    ) == 1
+    assert address_alias_sql.alias_ruleset(address_alias_sql.NUMERIC_GRID_ALIAS_KIND) == 1
+    assert address_alias_sql.alias_ruleset(address_alias_sql.EVIDENCE_ADDRESS_MATCH_ALIAS_KIND) == 1
     with pytest.raises(ValueError, match="alias_kind"):
         address_alias_sql.alias_ruleset("fuzzy_address_v1")
 
@@ -155,9 +145,7 @@ def test_alias_scope_and_apply_inputs_fail_closed():
         _target_limit(0)
     with pytest.raises(ValueError, match="max_targets"):
         _target_limit(10_001)
-    assert _uuid("00000000-0000-0000-0000-000000000001", name="source") == (
-        "00000000-0000-0000-0000-000000000001"
-    )
+    assert _uuid("00000000-0000-0000-0000-000000000001", name="source") == ("00000000-0000-0000-0000-000000000001")
     assert _reason(" reviewed rollback ") == "reviewed rollback"
     with pytest.raises(ValueError, match="valid UUID"):
         _uuid("not-a-key", name="source")
@@ -184,9 +172,7 @@ def test_strict_source_registry_uses_exact_source_rows_only():
     }
     assert "partd_pharmacy_activity_v2" not in tables
     assert 128 == next(
-        projection.source_bit
-        for projection in projections
-        if projection.table == "provider_directory_address_overlay"
+        projection.source_bit for projection in projections if projection.table == "provider_directory_address_overlay"
     )
 
 
@@ -219,21 +205,17 @@ def test_migration_creates_durable_review_and_generation_contract(monkeypatch):
 
     migration.upgrade()
     normalized = " ".join(" ".join(sql.split()) for sql in recorder.statements)
-    alias_statements = migration._split_sql_statements(
-        migration._alias_schema_sql("alias_contract")
-    )
+    alias_statements = migration._split_sql_statements(migration._alias_schema_sql("alias_contract"))
 
     assert migration.revision == "20260811100000_address_numeric_grid_alias"
-    assert migration.down_revision == (
-        "20260811030000_fhir_formulary_source_acquisition_lease"
-    )
+    assert migration.down_revision == ("20260811030000_fhir_formulary_source_acquisition_lease")
     assert "addr_numeric_grid_parts_v1" in normalized
     assert "ADD COLUMN strict_source_bits integer NOT NULL DEFAULT 0" in normalized
-    assert "CREATE TABLE \"alias_contract\".\"address_alias_state_v1\"" in normalized
-    assert "CREATE TABLE \"alias_contract\".\"address_alias_artifact_state_v1\"" in normalized
-    assert "CREATE TABLE \"alias_contract\".\"address_alias_run_v1\"" in normalized
-    assert "CREATE TABLE \"alias_contract\".\"address_alias_candidate_v1\"" in normalized
-    assert "CREATE TABLE \"alias_contract\".\"address_alias_v1\"" in normalized
+    assert 'CREATE TABLE "alias_contract"."address_alias_state_v1"' in normalized
+    assert 'CREATE TABLE "alias_contract"."address_alias_artifact_state_v1"' in normalized
+    assert 'CREATE TABLE "alias_contract"."address_alias_run_v1"' in normalized
+    assert 'CREATE TABLE "alias_contract"."address_alias_candidate_v1"' in normalized
+    assert 'CREATE TABLE "alias_contract"."address_alias_v1"' in normalized
     assert "mode IN ('shadow', 'backfill', 'apply', 'revoke')" in normalized
     assert "'backfilled'" in normalized
     assert "'revoked'" in normalized
@@ -258,12 +240,8 @@ def test_migration_creates_durable_review_and_generation_contract(monkeypatch):
     assert all(statement.rstrip().endswith(";") for statement in alias_statements)
 
 
-
-
 def test_request_path_never_joins_the_offline_alias_table():
-    request_module = (
-        Path(__file__).resolve().parents[1] / "api" / "endpoint" / "npi.py"
-    ).read_text(encoding="utf-8")
+    request_module = (Path(__file__).resolve().parents[1] / "api" / "endpoint" / "npi.py").read_text(encoding="utf-8")
 
     assert "address_alias_v1" not in request_module
 
@@ -288,13 +266,11 @@ async def test_failure_marker_preserves_a_terminal_run(monkeypatch):
 
 
 def test_alias_generation_lock_precedes_every_materialization_fence():
-    single_cutover = inspect.getsource(
-        provider_directory._promote_provider_directory_artifact_stage_transaction
-    )
+    single_cutover = inspect.getsource(provider_directory._promote_provider_directory_artifact_stage_transaction)
     bundled_cutover = inspect.getsource(
         importlib.import_module(
             "process.provider_directory_artifact_bundle_preparation"
-        ).apply_prepared_artifact_bundle
+        ).ArtifactBundlePublication.apply
     )
     resolver = inspect.getsource(address_canon._validated_active_alias_state)
     entity_cutover = inspect.getsource(entity_address._run_entity_address_cutover)
@@ -302,39 +278,35 @@ def test_alias_generation_lock_precedes_every_materialization_fence():
     assert single_cutover.index("alias_advisory_xact_lock_sql") < single_cutover.index(
         "_assert_provider_directory_artifact_build_fence"
     )
-    assert bundled_cutover.index("alias_advisory_xact_lock_sql") < bundled_cutover.index(
-        "_lock_provider_directory_artifact_bundle_targets"
-    ) < bundled_cutover.index("_apply_locked_provider_directory_artifact_bundle")
-    assert resolver.index("alias_advisory_xact_lock_sql") < resolver.index(
-        "active_alias_generation_sql"
+    assert (
+        bundled_cutover.index("alias_advisory_xact_lock_sql")
+        < bundled_cutover.index("_lock_provider_directory_artifact_bundle_targets")
+        < bundled_cutover.index("_apply_locked_provider_directory_artifact_bundle")
     )
-    assert entity_cutover.index("alias_advisory_xact_lock_sql") < entity_cutover.index(
-        "_assert_provider_directory_overlay_alias_fence"
-    ) < entity_cutover.index("_acquire_cutover_locks")
+    assert resolver.index("alias_advisory_xact_lock_sql") < resolver.index("active_alias_generation_sql")
+    assert (
+        entity_cutover.index("alias_advisory_xact_lock_sql")
+        < entity_cutover.index("_assert_provider_directory_overlay_alias_fence")
+        < entity_cutover.index("_acquire_cutover_locks")
+    )
 
 
 def test_apply_waits_for_archive_writers_before_reading_reviewed_evidence():
     alias_module = importlib.import_module("process.address_numeric_grid_alias")
-    locking_source = inspect.getsource(
-        alias_module._NumericGridAliasRunner._configure_and_lock
-    )
-    review_source = inspect.getsource(
-        alias_module._NumericGridAliasRunner._validate_reviewed_shadow
-    )
+    locking_source = inspect.getsource(alias_module._NumericGridAliasRunner._configure_and_lock)
+    review_source = inspect.getsource(alias_module._NumericGridAliasRunner._validate_reviewed_shadow)
 
     assert '"READ COMMITTED" if execution.operation == "apply"' in locking_source
-    assert locking_source.index("_archive_lock_key") < locking_source.index(
-        "alias_advisory_xact_lock_sql"
-    ) < locking_source.index("LOCK TABLE")
+    assert (
+        locking_source.index("_archive_lock_key")
+        < locking_source.index("alias_advisory_xact_lock_sql")
+        < locking_source.index("LOCK TABLE")
+    )
     assert "reviewed shadow changed before apply" in review_source
 
 
 def test_shadow_review_attribution_is_written_only_on_new_approvals():
-    source = inspect.getsource(
-        importlib.import_module(
-            "process.address_numeric_grid_alias"
-        )._approve_shadow_candidates
-    )
+    source = inspect.getsource(importlib.import_module("process.address_numeric_grid_alias")._approve_shadow_candidates)
 
     assert "WITH approved AS" in source
     assert "reviewed_by IS NULL" in source
@@ -343,10 +315,8 @@ def test_shadow_review_attribution_is_written_only_on_new_approvals():
 
 @pytest.mark.asyncio
 async def test_unified_overlay_generation_and_relation_fence_fail_closed(monkeypatch):
-    selected_overlay_queries = [
-        "SELECT * FROM mrf.provider_directory_address_overlay AS overlay"
-    ]
-    read_fence = AsyncMock(return_value=(1, 11))
+    selected_overlay_queries = ["SELECT * FROM mrf.provider_directory_address_overlay AS overlay"]
+    read_fence = AsyncMock(return_value=(1, ("mrf", "provider_directory_address_overlay"), "revision"))
     monkeypatch.setattr(
         entity_address,
         "_provider_directory_overlay_alias_fence",
@@ -361,20 +331,27 @@ async def test_unified_overlay_generation_and_relation_fence_fail_closed(monkeyp
             fence_context_by_field,
         )
 
-    read_fence.return_value = (2, 11)
+    read_fence.return_value = (2, ("mrf", "provider_directory_address_overlay"), "revision")
     await entity_address._capture_provider_directory_overlay_alias_fence(
         "mrf",
         selected_overlay_queries,
         fence_context_by_field,
     )
-    assert fence_context_by_field["provider_directory_overlay_relation_oid"] == 11
+    assert fence_context_by_field["provider_directory_overlay_relation"] == (
+        "mrf",
+        "provider_directory_address_overlay",
+    )
 
-    read_fence.return_value = (2, 12)
+    read_fence.return_value = (2, ("mrf", "different_overlay"), "revision")
     with pytest.raises(RuntimeError, match="overlay changed"):
         await entity_address._assert_provider_directory_overlay_alias_fence(
             "mrf",
             fence_context_by_field,
         )
+
+    read_fence.return_value = (2, ("mrf", "provider_directory_address_overlay"), "later-revision")
+    with pytest.raises(RuntimeError, match="overlay changed"):
+        await entity_address._assert_provider_directory_overlay_alias_fence("mrf", fence_context_by_field)
 
 
 @pytest.mark.asyncio
@@ -394,14 +371,16 @@ async def test_unified_without_selected_overlay_does_not_require_receipt(monkeyp
     )
 
     read_fence.assert_not_awaited()
-    assert "provider_directory_overlay_relation_oid" not in fence_context_by_field
+    assert "provider_directory_overlay_relation" not in fence_context_by_field
 
 
 @pytest.mark.asyncio
 async def test_overlay_requires_full_rebuild_after_alias_generation_change(monkeypatch):
     @contextlib.asynccontextmanager
     async def build_guard(*_args, **_kwargs):
-        yield provider_directory.ProviderDirectoryArtifactBuildFence(target_oid=11)
+        yield provider_directory.ProviderDirectoryArtifactBuildFence(
+            target_publication=(True, ("synthetic-11", "revision-11"))
+        )
 
     build = AsyncMock()
     monkeypatch.setattr(
@@ -453,7 +432,9 @@ async def test_overlay_requires_full_rebuild_after_alias_generation_change(monke
 async def test_overlay_full_rebuild_can_advance_alias_generation_receipt(monkeypatch):
     @contextlib.asynccontextmanager
     async def build_guard(*_args, **_kwargs):
-        yield provider_directory.ProviderDirectoryArtifactBuildFence(target_oid=11)
+        yield provider_directory.ProviderDirectoryArtifactBuildFence(
+            target_publication=(True, ("synthetic-11", "revision-11"))
+        )
 
     build = AsyncMock(return_value={"published": True})
     monkeypatch.setattr(
@@ -492,9 +473,7 @@ async def test_overlay_full_rebuild_can_advance_alias_generation_receipt(monkeyp
         build,
     )
 
-    publish_result = await provider_directory.publish_provider_directory_address_overlay(
-        "mrf"
-    )
+    publish_result = await provider_directory.publish_provider_directory_address_overlay("mrf")
 
     assert publish_result == {"published": True}
     assert build.await_args.args[5].alias_generation == 2

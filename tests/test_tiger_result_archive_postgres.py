@@ -77,18 +77,18 @@ async def _install_authority_as_app(session, schema, role):
     assert (
         await session.execute(text(f"SELECT * FROM {ledger} WHERE importer_id <> 'tiger' ORDER BY importer_id"))
     ).all() == before
+    assert await session.scalar(text("SELECT to_regclass('tiger.reference_family_result_generation')")) is None
+    await _migration(session, "20260920110000_tiger_result_generation", "downgrade")
+    await _migration(session, "20260920110000_tiger_result_generation", "upgrade")
+    await install_source_generation_guards(await session.connection(), schema)
     authority = await generation.read_reference_family_result_generation_authority(
         session,
         importer_id="tiger",
         schema_name="tiger",
     )
     assert authority.local_generation == 0 and authority.serving_generation is None
-    assert await session.scalar(text("SELECT to_regclass('tiger.reference_family_result_generation')")) is None
     with pytest.raises(RuntimeError, match="unavailable or drifted"):
         await generation.capture_reference_family_serving_generation(session, importer_id="tiger", schema_name="tiger")
-    await _migration(session, "20260920110000_tiger_result_generation", "downgrade")
-    await _migration(session, "20260920110000_tiger_result_generation", "upgrade")
-    await install_source_generation_guards(await session.connection(), schema)
     assert not await session.scalar(text(f"SELECT source_revision_tracked FROM {ledger} WHERE importer_id='tiger'"))
     assert not await session.scalar(
         text(
@@ -172,16 +172,14 @@ async def _assert_restored_source(sessions, prepared):
 
 async def _activation_bindings(session, prepared):
     incumbent = await archive.capture_reference_family_incumbent(session, importer_id="tiger", schema_name="tiger")
-    owner = await session.scalar(text("SELECT oid FROM pg_roles WHERE rolname=current_user"))
     validation = await archive.prepare_reference_family_activation(
         session,
         ownership=prepared.ownership,
         manifest=prepared.manifest,
         package_id="a" * 64,
         profile_contract=archive.CONTRACT,
-        sealed_owner_oid=owner,
     )
-    cutover = archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, owner, owner, "manual")
+    cutover = archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, "manual")
     return dict(
         ownership=prepared.ownership,
         manifest=prepared.manifest,
@@ -255,9 +253,11 @@ async def _assert_rollback_and_publish(sessions, prepared, role):
             session, importer_id="tiger", schema_name="tiger"
         )
         assert authority.local_generation == 1
-        assert authority.relation_oids == tuple(
-            dict(prepared.ownership.relation_oids)[name] for name in ("zip_state", "zcta5")
-        )
+        assert authority.relations == generation.declared_reference_family_relations("tiger", "tiger")
+        # The restored heaps now serve under the declared names.
+        for name, restored_oid in prepared.ownership.relation_oids:
+            live = await session.scalar(text("SELECT to_regclass(:name)::oid::bigint"), {"name": f"tiger.{name}"})
+            assert live == restored_oid
         assert (
             await generation.capture_reference_family_serving_generation(
                 session, importer_id="tiger", schema_name="tiger"

@@ -4,7 +4,6 @@
 from contextlib import asynccontextmanager
 from io import StringIO
 from pathlib import Path
-from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -18,6 +17,7 @@ from process import mrf_address_source_generation as address_source
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
 from process import reference_source_generation as source_generation
+from tests.reference_family_generation_fixture import install_named_generation, install_source_generation_guards
 from tests.test_reference_family_result_generation_postgres import (
     _CENSUS_MIGRATION_PATH,
     _GEO_MIGRATION_PATH,
@@ -32,10 +32,11 @@ from tests.test_reference_family_result_generation_postgres import (
 _MIGRATION = (
     Path(__file__).resolve().parents[1] / "alembic/versions/20260929040000_reference_source_generation_guard.py"
 )
+_NAMED_MIGRATION = _MIGRATION.with_name("20261114180000_reference_family_named_generation.py")
 
 
 @asynccontextmanager
-async def _source_family(monkeypatch, *, migrate=True):
+async def _source_family(monkeypatch, *, migrate=True, named=True):
     schema = "reference_source_" + uuid4().hex
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     monkeypatch.delenv("DB_SCHEMA", raising=False)
@@ -55,7 +56,7 @@ async def _source_family(monkeypatch, *, migrate=True):
             ):
                 await _run_migration(connection, path, "upgrade")
             if migrate:
-                await _run_migration(connection, _MIGRATION, "upgrade")
+                await install_source_generation_guards(connection, schema, named=named)
         yield engine, schema, async_sessionmaker(engine, expire_on_commit=False)
     finally:
         async with engine.begin() as connection:
@@ -96,21 +97,68 @@ async def test_legacy_bootstrap_preserves_migration_evidence(monkeypatch):
                     f"relation_oids=ARRAY['\"{schema}\".geo_zip_census_profile'::regclass::oid::bigint] WHERE importer_id='geo-census'"
                 )
             )
-            before = await _read_authority(connection, schema)
+            historical_query = text(
+                "SELECT importer_id, local_lineage_id, local_generation, origin_lineage_id, "
+                f'origin_generation, published_at, relation_oids FROM "{schema}".reference_family_result_generation '
+                "WHERE importer_id='geo-census'"
+            )
+            historical = (await connection.execute(historical_query)).one()
             await _run_migration(connection, _MIGRATION, "upgrade")
-            assert await _read_authority(connection, schema) == before
+            assert (await connection.execute(historical_query)).one() == historical
+            await install_named_generation(connection, schema)
+            before = await _read_authority(connection, schema)
+            assert before.local_generation == historical.local_generation == 4
+            assert before.local_lineage_id == str(historical.local_lineage_id)
+            assert before.serving_generation.origin_lineage_id == str(historical.origin_lineage_id)
+            assert before.serving_generation.origin_generation == historical.origin_generation
+            assert before.serving_generation.published_at == historical.published_at
         with pytest.raises(RuntimeError, match="tracking is unavailable"):
             async with sessions.begin() as session:
                 await _observe(session, schema)
         async with sessions.begin() as session:
             boundary = await _observe(session, schema, bootstrap=True)
             assert boundary.local_generation == 5
-            assert boundary.relation_oids == before.relation_oids
+            assert boundary.relations == before.relations == ((schema, "geo_zip_census_profile"),)
             assert await _observe(session, schema, bootstrap=True) == boundary
         async with sessions.begin() as session:
             assert await _observe(session, schema) == boundary
-            with pytest.raises(RuntimeError, match="evidence prevents downgrade"):
-                await _run_migration(await session.connection(), _MIGRATION, "downgrade")
+            with pytest.raises(RuntimeError, match="explicit retirement"):
+                await _run_migration(await session.connection(), _NAMED_MIGRATION, "downgrade")
+
+
+async def test_named_upgrade_keeps_a_populated_serving_generation_capturable(monkeypatch):
+    async with _source_family(monkeypatch, named=False) as (engine, schema, sessions):
+        names = generation.RELATION_NAMES_BY_IMPORTER["mrf"]
+        async with engine.begin() as connection:
+            # The pre-upgrade ledger records the populated serving generation by its relation identities.
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema}".reference_family_result_generation SET local_generation=4, '
+                    "origin_lineage_id=local_lineage_id, origin_generation=4, published_at=transaction_timestamp(), "
+                    "source_revision_tracked=TRUE, relation_oids=ARRAY(SELECT to_regclass(format('%I.%I', "
+                    "CAST(:schema AS text), name))::oid::bigint FROM unnest(CAST(:names AS text[])) "
+                    "WITH ORDINALITY AS family(name, ordinal) ORDER BY ordinal) WHERE importer_id='mrf'"
+                ),
+                {"schema": schema, "names": list(names)},
+            )
+            recorded = (
+                await connection.execute(
+                    text(
+                        "SELECT local_lineage_id, origin_lineage_id, origin_generation, published_at "
+                        f"FROM \"{schema}\".reference_family_result_generation WHERE importer_id='mrf'"
+                    )
+                )
+            ).one()
+            await _run_migration(connection, _NAMED_MIGRATION, "upgrade")
+        async with sessions.begin() as session:
+            authority = await _observe(session, schema, importer="mrf")
+            serving = await generation.capture_reference_family_serving_generation(
+                session, importer_id="mrf", schema_name=schema
+            )
+        assert authority.relations == tuple((schema, name) for name in names)
+        assert serving == authority.serving_generation
+        assert (serving.origin_lineage_id, serving.origin_generation) == (str(recorded.origin_lineage_id), 4)
+        assert authority.local_lineage_id == str(recorded.local_lineage_id) and authority.local_generation == 4
 
 
 @pytest.mark.parametrize(
@@ -134,7 +182,11 @@ async def test_shared_address_writes_advance_both_families(monkeypatch, statemen
         async with sessions.begin() as session:
             for importer, before in before_by_importer.items():
                 after = await _observe(session, schema, importer)
-                assert after.relation_oids == before.relation_oids
+                assert (
+                    after.relations
+                    == before.relations
+                    == tuple((schema, name) for name in generation.RELATION_NAMES_BY_IMPORTER[importer])
+                )
                 assert after.local_generation == before.local_generation + (importer != "geo-census")
         with pytest.raises(RuntimeError, match="rollback"):
             async with engine.begin() as connection:
@@ -156,11 +208,16 @@ async def test_publish_and_adopt_install_new_oid_guards(monkeypatch):
             published = await generation.publish_local_reference_family_generation(
                 session, importer_id="geo-census", schema_name=schema
             )
-            assert published.relation_oids != first.relation_oids
+            assert published.relations == first.relations == ((schema, "geo_zip_census_profile"),)
+            assert published.local_generation == first.local_generation + 1
+            assert await session.scalar(text(f'SELECT count(*) FROM "{schema}".geo_zip_census_profile')) == 0
+            assert (await session.execute(text(f'SELECT * FROM "{schema}".retained_geo'))).all() == [(1, "initial")]
             assert await _observe(session, schema) == published
         async with engine.begin() as connection:
             await connection.execute(text(f"UPDATE \"{schema}\".retained_geo SET marker='old'"))
             assert await _read_authority(connection, schema) == published
+            assert await connection.scalar(text(f'SELECT count(*) FROM "{schema}".geo_zip_census_profile')) == 0
+            assert (await connection.execute(text(f'SELECT * FROM "{schema}".retained_geo'))).all() == [(1, "old")]
         incoming_by_field = {
             "origin_lineage_id": str(uuid4()),
             "origin_generation": 17,
@@ -177,12 +234,22 @@ async def test_publish_and_adopt_install_new_oid_guards(monkeypatch):
                 source_revision_tracked=True,
             )
             assert (await _observe(session, schema)).serving_generation == adopted.serving_generation
+            assert adopted.relations == published.relations
+            assert adopted.local_generation == published.local_generation
+            assert adopted.local_lineage_id == published.local_lineage_id
+            assert adopted.serving_generation.origin_lineage_id == incoming_by_field["origin_lineage_id"]
+            assert adopted.serving_generation.origin_generation == incoming_by_field["origin_generation"]
         async with engine.begin() as connection:
             await connection.execute(text(f"INSERT INTO \"{schema}\".geo_zip_census_profile VALUES (1, 'local')"))
         async with sessions.begin() as session:
             changed = await _observe(session, schema)
             assert changed.serving_generation.origin_lineage_id == adopted.local_lineage_id
             assert changed.local_generation == adopted.local_generation + 1
+            assert (await session.execute(text(f'SELECT * FROM "{schema}".geo_zip_census_profile'))).all() == [
+                (1, "local")
+            ]
+            assert await session.scalar(text(f'SELECT count(*) FROM "{schema}".retained_second_geo')) == 0
+            assert (await session.execute(text(f'SELECT * FROM "{schema}".retained_geo'))).all() == [(1, "old")]
             await generation.publish_adopted_reference_family_generation(
                 session, importer_id="geo-census", schema_name=schema, source_generation=None
             )
@@ -209,7 +276,7 @@ async def test_observation_holds_writer_fences(monkeypatch):
                 await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
                 await _observe(session, schema)
         async with engine.begin() as writer:
-            await writer.execute(text(f'LOCK TABLE "{schema}".geo_zip_census_profile IN ROW EXCLUSIVE MODE'))
+            await writer.execute(text(f"UPDATE \"{schema}\".geo_zip_census_profile SET marker='pending-revision'"))
             with pytest.raises(DBAPIError) as blocked:
                 async with sessions.begin() as session:
                     await _observe(session, schema)
@@ -285,6 +352,7 @@ async def test_offline_source_guard_upgrade_handles_absent_optional_tables(monke
             )
             raw = await connection.get_raw_connection()
             await raw.driver_connection.execute(output.getvalue())
+            await install_named_generation(connection, schema)
         async with sessions.begin() as session:
             initial = await _observe(session, schema, bootstrap=True)
         async with engine.begin() as writer:
@@ -390,6 +458,7 @@ async def _migrate_tiger_as_app(engine, schema, role):
                 "SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid IN ('tiger.zip_state'::regclass,'tiger.zcta5'::regclass))"
             )
         )
+        await install_named_generation(connection, schema)
 
 
 async def _assert_function_grantees(session, schema, roles):
@@ -459,7 +528,7 @@ async def test_tiger_upgrade_and_explicit_owner_bootstrap(monkeypatch):
             async with sessions.begin() as session:
                 await session.execute(text(f'SET LOCAL ROLE "{role}"'))
                 changed = await _observe(session, "tiger", "tiger")
-                assert changed.relation_oids == initial.relation_oids
+                assert changed.relations == initial.relations == (("tiger", "zip_state"), ("tiger", "zcta5"))
                 assert changed.local_generation == initial.local_generation + 4
 
 
@@ -494,6 +563,7 @@ async def test_tiger_preserves_protected_owner_boundary(monkeypatch):
             await _migrate_tiger_as_app(engine, schema, role)
             async with sessions.begin() as session:
                 await session.execute(text(f'SET LOCAL ROLE "{owner}"'))
+                await session.execute(text("INSERT INTO tiger.zip_state VALUES (1)"))
                 initial = await _observe(session, "tiger", "tiger", bootstrap=True)
                 assert await _observe(session, "tiger", "tiger") == initial
             async with engine.begin() as connection:
@@ -513,7 +583,10 @@ async def test_tiger_preserves_protected_owner_boundary(monkeypatch):
                 replacement = await generation.publish_local_reference_family_generation(
                     session, importer_id="tiger", schema_name="tiger"
                 )
-                assert replacement.relation_oids != initial.relation_oids
+                assert replacement.relations == initial.relations == (("tiger", "zip_state"), ("tiger", "zcta5"))
+                assert replacement.local_generation == initial.local_generation + 1
+                assert (await session.execute(text("SELECT * FROM tiger.retained_zip_state"))).all() == [(1,)]
+                assert await session.scalar(text("SELECT count(*) FROM tiger.zip_state")) == 0
             async with sessions.begin() as session:
                 await session.execute(text(f'SET LOCAL ROLE "{role}"'))
                 assert await _observe(session, "tiger", "tiger") == replacement
@@ -594,8 +667,8 @@ async def test_untracked_incumbent_blocks_automatic_cutover(monkeypatch):
         async with sessions.begin() as session:
             authority = await _observe(session, schema, bootstrap=True)
             incoming_by_field = {**authority.serving_generation.as_dict(), "origin_generation": 100}
-            expected = SimpleNamespace(
-                schema_name=schema, relation_oids=(("geo_zip_census_profile", authority.relation_oids[0]),)
+            expected = await archive.capture_reference_family_incumbent(
+                session, importer_id="geo-census", schema_name=schema
             )
             spec = archive.reference_family_spec("geo-census")
             await archive._require_automatic_cutover_generation(session, spec, expected, incoming_by_field)

@@ -46,7 +46,29 @@ async def _seed_authorities(database, schema):
     await database.status(f'''CREATE TABLE "{schema}".reference_family_result_generation (
         importer_id text PRIMARY KEY,local_lineage_id uuid,local_generation bigint,
         origin_lineage_id uuid,origin_generation bigint,published_at timestamptz,relation_oids bigint[],
-        source_revision_tracked boolean NOT NULL DEFAULT false)''')
+        source_revision_tracked boolean NOT NULL DEFAULT false,
+        CONSTRAINT reference_family_result_generation_shape_check CHECK (local_generation>=0))''')
+
+    async with database.engine.begin() as connection:
+
+        def named(sync):
+            from alembic.migration import MigrationContext
+            from alembic.operations import Operations
+
+            with Operations.context(MigrationContext.configure(sync)):
+                for prefix in ("20261114160000", "20261114180000"):
+                    migration = _migration(prefix)
+                    migration._schema = lambda: schema
+                    migration.upgrade()
+
+        await connection.run_sync(named)
+        counter = _migration("20261114190000")
+        check, key = counter._key_sql(schema)
+        await connection.execute(text(check))
+        await connection.execute(
+            text(counter._function_sql(schema, names=("cms_native_input_advance", "cms_native_input_revision_guard")))
+        )
+        await connection.execute(text(key))
     for family in inputs._FAMILIES:
         if family == "mrf":
             continue
@@ -54,24 +76,20 @@ async def _seed_authorities(database, schema):
         names = inputs.reference.RELATION_NAMES_BY_IMPORTER[family]
         for name in names:
             await database.status(f'CREATE TABLE IF NOT EXISTS "{namespace}"."{name}" (value int)')
-        oids = [
-            int(await database.scalar("SELECT to_regclass(:name)::oid::bigint", name=f'"{namespace}"."{name}"'))
-            for name in names
-        ]
         await database.status(
             f'''INSERT INTO "{schema}".reference_family_result_generation
-            (importer_id,local_lineage_id,local_generation,origin_lineage_id,origin_generation,published_at,relation_oids)
-            VALUES (:family,:lineage,1,:lineage,1,now(),:oids)''',
+            (importer_id,local_lineage_id,local_generation,origin_lineage_id,origin_generation,published_at,serving_schema,serving_relation_names)
+            VALUES (:family,:lineage,1,:lineage,1,now(),:namespace,:names)''',
             family=family,
             lineage=uuid4(),
-            oids=oids,
+            namespace=namespace,
+            names=list(names),
         )
-    async with database.session() as session:
-        oids = list(await inputs.npi.current_npi_relation_oids(session, schema_name=schema))
     await database.status(
         f'''UPDATE "{schema}".npi_result_generation SET local_generation=1,
-        origin_lineage_id=local_lineage_id,origin_generation=1,published_at=now(),relation_oids=:oids''',
-        oids=oids,
+        origin_lineage_id=local_lineage_id,origin_generation=1,published_at=now(),serving_schema=:schema,serving_relation_names=:names''',
+        schema=schema,
+        names=list(inputs.npi.RELATION_NAMES),
     )
 
 
@@ -128,33 +146,33 @@ async def test_same_oid_mutations_invalidate_native_fence(monkeypatch, statement
         await _assert(database, schema, fence)
         await database.status(statement.format(relation=relation))
         changed = await _capture(database, schema)
-        assert [row["relation_oid"] for row in changed["relations"].values()] == [
-            row["relation_oid"] for row in fence["relations"].values()
-        ]
+        assert changed["relations"] == fence["relations"]
         assert changed["revisions"] != fence["revisions"]
         with pytest.raises(RuntimeError, match="native_inputs_changed"):
             await _assert(database, schema, fence)
 
 
 @pytest.mark.asyncio
-async def test_swapped_in_input_requires_additive_registration(monkeypatch):
-    """Renamed old OIDs retain their revision, while an untracked replacement cannot sign."""
+async def test_named_input_replacement_advances_counter_in_the_atomic_swap(monkeypatch):
     async with _fixture(monkeypatch) as (database, schema):
         fence = await _capture(database, schema)
-        await database.status(f'ALTER TABLE "{schema}".nucc_taxonomy RENAME TO old_nucc')
-        await database.status(f'CREATE TABLE "{schema}".nucc_taxonomy (value int)')
-        await enroll_native_input_custody(
-            database, schema, database._native_input_component, replacement_name="nucc_taxonomy"
-        )
-        with pytest.raises(RuntimeError, match="revision_guard_unavailable"):
-            await _capture(database, schema)
-        async with native_input_actor(database) as connection:
-            await inputs.register_native_address_inputs(connection, schema)
+        async with native_input_actor(database) as session:
+            await session.execute(text(f'CREATE TABLE "{schema}".incoming_nucc(value int)'))
+            await session.execute(text(f'INSERT INTO "{schema}".incoming_nucc VALUES (7)'))
+            prepared = await inputs.prepare_local_native_input_publication(
+                session, ledger_schema=schema, relations=(("nucc_taxonomy", "incoming_nucc"),)
+            )
+            await session.execute(text(f'ALTER TABLE "{schema}".nucc_taxonomy RENAME TO old_nucc'))
+            await session.execute(text(f'ALTER TABLE "{schema}".incoming_nucc RENAME TO nucc_taxonomy'))
+            await inputs.finish_local_native_input_publication(session, prepared=prepared)
         changed = await _capture(database, schema)
-        assert changed["relations"] != fence["relations"]
+        assert changed["relations"] == fence["relations"]
+        before = next(row for row in fence["revisions"] if row["table_name"] == "nucc_taxonomy")
+        after = next(row for row in changed["revisions"] if row["table_name"] == "nucc_taxonomy")
+        assert after["revision"] == before["revision"] + 1
         with pytest.raises(RuntimeError, match="native_inputs_changed"):
             await _assert(database, schema, fence)
-        assert await database.scalar(f'SELECT count(*) FROM "{schema}".{inputs._TABLE}') == len(fence["revisions"]) + 1
+        assert await database.scalar(f'SELECT count(*) FROM "{schema}".{inputs._TABLE}') == len(fence["revisions"])
 
 
 @pytest.mark.asyncio
@@ -227,7 +245,7 @@ async def test_content_registration_does_not_fabricate_native_acceptance(monkeyp
     """A generationless native family remains unacceptable despite valid content tracking."""
     async with _fixture(monkeypatch) as (database, schema):
         await database.status(f'''UPDATE "{schema}".reference_family_result_generation
-            SET origin_lineage_id=NULL,origin_generation=NULL,published_at=NULL,relation_oids=NULL
+            SET origin_lineage_id=NULL,origin_generation=NULL,published_at=NULL,serving_schema=NULL,serving_relation_names=NULL
             WHERE importer_id='geo' ''')
         with pytest.raises(RuntimeError, match="native_publication_unavailable"):
             await _capture(database, schema)
@@ -259,19 +277,20 @@ async def test_changed_function_event_shape_or_ledger_guard_rejects(monkeypatch,
 
 @pytest.mark.asyncio
 async def test_registration_rollback_and_history_retention(monkeypatch):
-    """Failed registration leaves no partial new-OID tracking; downgrade keeps committed history."""
     async with _fixture(monkeypatch) as (database, schema):
-        await database.status(f'ALTER TABLE "{schema}".nucc_taxonomy RENAME TO prior_nucc')
-        await database.status(f'CREATE TABLE "{schema}".nucc_taxonomy (value int)')
+        fence = await _capture(database, schema)
         with pytest.raises(asyncio.CancelledError):
-            await enroll_native_input_custody(
-                database, schema, database._native_input_component, replacement_name="nucc_taxonomy"
-            )
-            async with native_input_actor(database) as connection:
-                await inputs.register_native_address_inputs(connection, schema)
+            async with native_input_actor(database) as session:
+                await session.execute(text(f'CREATE TABLE "{schema}".incoming_nucc(value int)'))
+                prepared = await inputs.prepare_local_native_input_publication(
+                    session, ledger_schema=schema, relations=(("nucc_taxonomy", "incoming_nucc"),)
+                )
+                await session.execute(text(f'ALTER TABLE "{schema}".nucc_taxonomy RENAME TO prior_nucc'))
+                await session.execute(text(f'ALTER TABLE "{schema}".incoming_nucc RENAME TO nucc_taxonomy'))
+                await inputs.finish_local_native_input_publication(session, prepared=prepared)
                 raise asyncio.CancelledError
-        with pytest.raises(RuntimeError, match="revision_guard_unavailable"):
-            await _capture(database, schema)
+        await _assert(database, schema, fence)
+        assert await database.scalar("SELECT to_regclass(:name)", name=f'"{schema}".incoming_nucc') is None
         with pytest.raises(DBAPIError, match="history_requires_retention"):
             async with database.engine.begin() as connection:
                 await connection.run_sync(lambda sync: _apply(sync, "20260930120000", "downgrade"))
@@ -361,28 +380,31 @@ async def test_same_count_dataset_edge_key_and_payload_changes_invalidate_fence(
 @pytest.mark.parametrize("table", _DATASET_INPUTS)
 @pytest.mark.parametrize("mutation", ["drop", "replace"])
 async def test_dataset_input_drop_or_replacement_cannot_reuse_captured_fence(monkeypatch, table, mutation):
-    """New physical OIDs need additive registration and never revive a prior input identity."""
     async with _fixture(monkeypatch) as (database, schema):
         fence = await _capture(database, schema)
         relation = f'"{schema}"."{table}"'
         if mutation == "drop":
             await database.status(f"DROP TABLE {relation}")
         else:
-            await database.status(f'ALTER TABLE {relation} RENAME TO "{table}_prior"')
-            await database.status(f"CREATE TABLE {relation} ({_DATASET_INPUTS[table][0]})")
-            await enroll_native_input_custody(
-                database, schema, database._native_input_component, replacement_name=table
-            )
-            with pytest.raises(RuntimeError, match="revision_guard_unavailable"):
-                await _assert(database, schema, fence)
-            async with native_input_actor(database) as connection:
-                await inputs.register_native_address_inputs(connection, schema)
+            stage = table + "_next"
+            async with native_input_actor(database) as session:
+                await session.execute(text(f'CREATE TABLE "{schema}"."{stage}" ({_DATASET_INPUTS[table][0]})'))
+                await session.execute(
+                    text(
+                        f'INSERT INTO "{schema}"."{stage}" VALUES '
+                        + _DATASET_INPUTS[table][1].replace("dataset-a", "dataset-b")
+                    )
+                )
+                prepared = await inputs.prepare_local_native_input_publication(
+                    session, ledger_schema=schema, relations=((table, stage),)
+                )
+                await session.execute(text(f'ALTER TABLE {relation} RENAME TO "{table}_prior"'))
+                await session.execute(text(f'ALTER TABLE "{schema}"."{stage}" RENAME TO "{table}"'))
+                await inputs.finish_local_native_input_publication(session, prepared=prepared)
             changed = await _capture(database, schema)
-            assert changed["relations"][relation]["relation_oid"] != fence["relations"][relation]["relation_oid"]
+            assert changed["relations"] == fence["relations"]
             assert len(changed["revisions"]) == len(fence["revisions"])
-            assert (
-                await database.scalar(f'SELECT count(*) FROM "{schema}".{inputs._TABLE}') == len(fence["revisions"]) + 1
-            )
+            assert await database.scalar(f'SELECT count(*) FROM "{schema}".{inputs._TABLE}') == len(fence["revisions"])
         with pytest.raises(RuntimeError, match="native_inputs_changed"):
             await _assert(database, schema, fence)
 
@@ -492,3 +514,47 @@ async def test_native_input_replacement_enrollment_changes_only_the_exact_oid():
     assert statements[1] == ('ALTER TABLE "synthetic_schema"."nucc_taxonomy" OWNER TO "synthetic_owner"', None)
     assert statements[2][1] == {"oid": 42, "owner": "synthetic_owner", "name": '"synthetic_schema"."nucc_taxonomy"'}
     assert database._native_input_component is component
+
+
+@pytest.mark.asyncio
+async def test_fhir_input_layout_uses_named_partition_edges(monkeypatch):
+    """A copied same-name partition keeps its layout proof without physical coordinates."""
+    from process import provider_directory_generic_source_provision as provision
+    from process.provider_directory_generic_source_policy import GenericSourcePolicy
+    from process.provider_directory_projection_stage import _copy_driver
+
+    async with _delta_database(monkeypatch) as (database, schema):
+        roots = provision.FHIR_INPUT_ROOTS
+        for root in roots:
+            await database.status(
+                f'CREATE TABLE "{schema}"."{root}" '
+                "(dataset_id varchar NOT NULL, id integer NOT NULL, PRIMARY KEY(dataset_id,id)) "
+                "PARTITION BY LIST(dataset_id)"
+            )
+        parent = f'"{schema}"."{roots[0]}"'
+        leaf = f'"{schema}".fhir_input_leaf'
+        await database.status(f"CREATE TABLE {leaf} PARTITION OF {parent} FOR VALUES IN ('dataset-a')")
+        await database.status(f"INSERT INTO {leaf} VALUES ('dataset-a',1)")
+        policy = GenericSourcePolicy(schema, "input_owner", "input_publisher", ("input_reader",))
+        async with database.session() as session, session.begin():
+            await session.execute(text("SELECT 1"))
+            driver = await _copy_driver(session)
+            before = await provision.capture_protected_fhir_input(driver, source_policy=policy)
+            assert before["parents"] == [[schema, name] for name in roots]
+            observed_leaf = next(
+                catalog_record
+                for catalog_record in before["inventory"]
+                if catalog_record["relname"] == "fhir_input_leaf"
+            )
+            assert observed_leaf["parents"] == [[schema, roots[0]]]
+            assert not {"database_oid", "owner_oid", "parent_oids", "family_sha256"} & before.keys()
+            await driver.execute(f"CREATE TEMP TABLE saved_fhir_leaf AS TABLE {leaf}")
+            await driver.execute(f"ALTER TABLE {parent} DETACH PARTITION {leaf}")
+            await driver.execute(f"DROP TABLE {leaf}")
+            await driver.execute(f"CREATE TABLE {leaf} PARTITION OF {parent} FOR VALUES IN ('dataset-a')")
+            await driver.execute(f"INSERT INTO {leaf} SELECT * FROM saved_fhir_leaf")
+            await driver.execute("DROP TABLE saved_fhir_leaf")
+            assert await driver.fetchval(f"SELECT count(*) FROM {leaf}") == 1
+            assert await provision.capture_protected_fhir_input(driver, source_policy=policy) == before
+            await driver.execute(f"ALTER TABLE {parent} ADD COLUMN extra integer")
+            assert await provision.capture_protected_fhir_input(driver, source_policy=policy) != before

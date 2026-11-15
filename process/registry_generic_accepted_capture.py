@@ -77,9 +77,10 @@ def require_generic_capture_head(capture, head):
 async def _current_header(driver, schema_name, source_id, endpoint_id):
     require(driver.is_in_transaction())
     namespace = _identifier(schema_name)
-    rows = await driver.fetch(
+    header_rows = await driver.fetch(
         f"""SELECT d.dataset_id,d.endpoint_id,d.acquisition_root_run_id,d.dataset_hash,d.resource_count,
-        d.tableoid::oid::bigint AS header_oid,d.candidate_storage_json,d.completion_proof_required_version,
+        d.candidate_storage_json,d.completion_proof_required_version,d.completion_proof_sha256,
+        d.previous_dataset_id,d.status,d.published_at,d.is_current,
         d.publication_metadata_sha256,d.content_proof_admission_version,d.content_proof_admission_kind,
         d.content_proof_admission_sha256,d.content_proof_resource_types,
         CASE WHEN octet_length(d.publication_metadata_summary_json::text)<=$3
@@ -92,14 +93,15 @@ async def _current_header(driver, schema_name, source_id, endpoint_id):
         endpoint_id,
         ADMISSION_METADATA_SUMMARY_MAX_BYTES,
     )
-    require(len(rows) == 1)
-    header_by_field = dict(rows[0])
+    require(len(header_rows) == 1)
+    header_by_field = dict(header_rows[0])
     published_generic_binding(
         header_by_field,
         dataset_id=header_by_field["dataset_id"],
         endpoint_id=endpoint_id,
         root_run_id=header_by_field["acquisition_root_run_id"],
         source_id=source_id,
+        schema_name=schema_name,
     )
     return header_by_field
 
@@ -149,8 +151,9 @@ def _admitted_summary(header, schema_name, source_id):
     )
     projection_date = summary["semantic_projection_as_of"]
     require(type(projection_date) is str and date.fromisoformat(projection_date).isoformat() == projection_date)
+    payload_schema = _admitted_payload_schema(header, schema_name, source_id)
     head = AcceptedGenericFHIRHead(
-        schema_name,
+        payload_schema,
         source_id,
         header["endpoint_id"],
         header["dataset_id"],
@@ -161,6 +164,19 @@ def _admitted_summary(header, schema_name, source_id):
         projection_date,
     )
     return head, summary, source_summary
+
+
+def _admitted_payload_schema(header, schema_name, source_id):
+    """Keep payload generation identity independent of the catalog header location."""
+    binding = published_generic_binding(
+        header,
+        dataset_id=header["dataset_id"],
+        endpoint_id=header["endpoint_id"],
+        root_run_id=header["acquisition_root_run_id"],
+        source_id=source_id,
+        schema_name=schema_name,
+    )
+    return binding["tables"]["provider_directory_dataset_resource"]["schema"] if binding else schema_name
 
 
 def _require_admitted_plan(summary, header):
@@ -184,10 +200,11 @@ async def read_current_generic_fhir_head(driver, *, schema_name, source_id, endp
 async def is_original_generic_capture_current(driver, capture):
     """Allow an exact original capture without inventing a legacy successor admission."""
     origin = capture.origin
-    namespace = _identifier(origin.schema_name)
+    namespace = _identifier(origin.header_relation["schema"])
     current_headers = await driver.fetch(
         f"""SELECT d.dataset_id,d.endpoint_id,d.dataset_hash,d.acquisition_root_run_id,d.publication_metadata_sha256,
-        d.content_proof_admission_sha256,d.candidate_storage_json,d.completion_proof_required_version
+        d.content_proof_admission_sha256,d.candidate_storage_json,d.completion_proof_required_version,
+        d.completion_proof_sha256,d.previous_dataset_id,d.status,d.published_at,d.is_current,d.resource_count
         FROM {namespace}.provider_directory_endpoint_dataset d
         JOIN {namespace}.provider_directory_source s ON s.endpoint_id=d.endpoint_id
         WHERE s.source_id=$1 AND s.endpoint_id=$2 AND d.is_current AND d.status='published'
@@ -203,7 +220,11 @@ async def is_original_generic_capture_current(driver, capture):
         endpoint_id=origin.endpoint_id,
         root_run_id=current_header["acquisition_root_run_id"],
         source_id=origin.source_id,
+        schema_name=origin.header_relation["schema"],
     )
+    if binding is not None and binding["contract"] == "generic-source-detached-by-name-v1":
+        if current_header["dataset_id"] == origin.dataset_id:
+            require(binding["tables"]["provider_directory_dataset_resource"] == origin.resource_relation)
     if binding is not None and origin.admission_profile != SEMANTIC_PROFILE:
         return False
     return (
@@ -244,16 +265,19 @@ async def read_current_generic_fhir_input(
     header = await _current_header(driver, schema_name, source_id, endpoint_id)
     head, summary, source_summary = _admitted_summary(header, schema_name, source_id)
     namespace = _identifier(schema_name)
-    physical = await driver.fetchrow(
-        f"""SELECT session_user::text AS reader_role,
-        octet_length(publication_metadata_json::text)::bigint AS metadata_bytes,
-        encode(sha256(convert_to(publication_metadata_json::text,'UTF8')),'hex') AS metadata_sha256,
-        to_regclass($2)::oid::bigint AS parent_oid,
-        (SELECT tableoid::oid::bigint FROM {namespace}.provider_directory_dataset_resource
-          WHERE dataset_id=$1 ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT 1) AS leaf_oid
-        FROM {namespace}.provider_directory_endpoint_dataset WHERE dataset_id=$1""",
+    metadata = await driver.fetchrow(
+        f"SELECT octet_length(publication_metadata_json::text)::bigint AS metadata_bytes,"
+        "encode(sha256(convert_to(publication_metadata_json::text,'UTF8')),'hex') AS metadata_sha256 "
+        f"FROM {namespace}.provider_directory_endpoint_dataset WHERE dataset_id=$1",
         head.dataset_id,
-        f"{namespace}.provider_directory_dataset_resource",
+    )
+    binding = published_generic_binding(
+        header,
+        dataset_id=head.dataset_id,
+        endpoint_id=head.endpoint_id,
+        root_run_id=head.root_run_id,
+        source_id=head.source_id,
+        schema_name=schema_name,
     )
     counts = tuple(sorted(source_summary["resource_counts"].items()))
     return RetainedFHIRInput(
@@ -263,12 +287,12 @@ async def read_current_generic_fhir_input(
         head.dataset_id,
         head.dataset_sha256,
         head.root_run_id,
-        header["header_oid"],
-        physical["parent_oid"],
-        physical["leaf_oid"],
-        physical["reader_role"],
-        physical["metadata_bytes"],
-        physical["metadata_sha256"],
+        {"schema": schema_name, "name": "provider_directory_endpoint_dataset"},
+        binding["tables"]["provider_directory_dataset_resource"]
+        if binding is not None
+        else {"schema": schema_name, "name": "provider_directory_dataset_resource"},
+        metadata["metadata_bytes"],
+        metadata["metadata_sha256"],
         source_summary["summary_sha256"],
         head.proof_sha256,
         counts,

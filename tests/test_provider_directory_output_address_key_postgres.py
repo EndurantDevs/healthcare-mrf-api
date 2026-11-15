@@ -21,6 +21,7 @@ from tests.cms_output_snapshot_postgres_support import provision_native_outputs
 from tests.geo_source_postgres_support import geo_source_component_database
 from tests.provider_directory_dataset_rehydrate_postgres_support import _migrations
 from tests.test_geo_reference_family_postgres import _load_snapshot
+from tests.test_provider_directory_output_repairs_postgres import _retained_rows
 
 directory = importlib.import_module("process.provider_directory_fhir")
 SOURCE = "address-example"
@@ -66,28 +67,26 @@ async def _address_scope(monkeypatch, tmp_path):
 
 async def _locations(component):
     async with source_transaction(component.database):
-        oid = await component.database.scalar("SELECT 'mrf.provider_directory_location'::regclass::oid::bigint")
         rows = [
             dict(row._mapping)
             for row in await component.database.all(
                 "SELECT * FROM mrf.provider_directory_location ORDER BY source_id,resource_id"
             )
         ]
-        return oid, rows
+        return rows
 
 
 @pytest.mark.asyncio
 async def test_native_address_keys_publish_distinct_offices_and_preserve_complete_tuples(monkeypatch, tmp_path):
     async with _address_scope(monkeypatch, tmp_path) as (component, _authority):
-        before_oid, before = await _locations(component)
+        before = await _locations(component)
         expected_keys = address_fast._fast_module().canonicalize_location_batch(
             [("123 Main Street", suite, "New York", "NY", "10001-1234", "US") for suite in ("Suite 101", "Suite 202")]
         )
         assert (
             await addresses.publish_location_address_keys(directory, run_id=RUN, source_ids=[SOURCE], batch_size=1) == 2
         )
-        after_oid, after = await _locations(component)
-        assert after_oid != before_oid
+        after = await _locations(component)
         assert len({location["address_key"] for location in after}) == 2
         for previous, current, canonical in zip(before, after, expected_keys, strict=True):
             assert current == dict(
@@ -101,14 +100,11 @@ async def test_native_address_keys_publish_distinct_offices_and_preserve_complet
                 country_code="US",
                 updated_at=current["updated_at"],
             )
-        async with component.admin_engine.begin() as connection:
-            assert await connection.scalar(
-                text("SELECT EXISTS(SELECT FROM pg_class WHERE oid=:oid)"), {"oid": before_oid}
-            )
+        assert await _retained_rows(component, "address_key_backfill", addresses.TARGET) == before
         assert (
             await addresses.publish_location_address_keys(directory, run_id=RUN, source_ids=[SOURCE], batch_size=1) == 0
         )
-        assert await _locations(component) == (after_oid, after)
+        assert await _locations(component) == after
 
 
 @pytest.mark.asyncio
@@ -136,7 +132,7 @@ async def test_native_late_geo_publication_refuses_address_candidate_and_preserv
         assert "FOR SHARE NOWAIT" in refused.value.statement
         assert len(successor_authorities) == 1
         assert successor_authorities[0].local_generation > authority.local_generation
-        assert successor_authorities[0].relation_oids != authority.relation_oids
+        assert successor_authorities[0].relations == authority.relations
         assert await _locations(component) == before
         async with source_transaction(component.database):
             assert (

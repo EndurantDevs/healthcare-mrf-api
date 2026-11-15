@@ -15,7 +15,6 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process.network_approved_membership_source import pin_approved_membership_source
-from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_composition import RegistryCompositionAddressSources
 from process.registry_cms_source_consumer import (
@@ -31,8 +30,9 @@ from tests import test_registry_cms_source_consumer_initial_postgres as initial
 from tests import test_registry_cms_source_consumer_postgres as cms
 from tests import test_registry_ptg_office_coordinator_postgres as coordinator
 from tests import test_registry_publication_ptg_runtime_postgres as ptg
+from tests.source_contribution_custody_postgres_support import publish_source_contribution_candidate
+from tests.test_network_compact_publication_postgres import _named_compact_runtime
 from tests.test_provider_directory_cms_resource_batch_postgres import cms_source_template as cms_source_template
-from tests.test_registry_candidate_composition_postgres import _seal_composition_target
 
 pytestmark = pytest.mark.usefixtures(cms_source_template.__name__)
 
@@ -44,7 +44,12 @@ async def _enter_fixture(stack, fixture):
 
 
 async def _mixed_fixture(database, monkeypatch, stack, tmp_path, state_by_name, original):
-    fixture = await original(database, monkeypatch, stack)
+    async def install_preparation(fixture, resources):
+        await _named_compact_runtime(fixture, resources, monkeypatch)
+
+    with monkeypatch.context() as setup_patch:
+        setup_patch.setattr(cms.custody, "install_candidate_custody", install_preparation)
+        fixture = await original(database, monkeypatch, stack)
     dsn = database.engine.url.set(drivername="postgresql").render_as_string(hide_password=False)
     monkeypatch.setenv("HLTHPRT_PTG2_V4_MIGRATION_POSTGRES_DSN", dsn)
     assert os.environ.get("HLTHPRT_PTG2_V4_MAP_POSTGRES_TEST") == "1"
@@ -52,25 +57,8 @@ async def _mixed_fixture(database, monkeypatch, stack, tmp_path, state_by_name, 
     extensions = await fixture.connection.fetch("SELECT extname FROM pg_extension")
     assert {"intarray", "btree_gin", "postgis"} <= {extension["extname"] for extension in extensions}
     publisher = await _enter_fixture(stack, coordinator.office_publisher.__wrapped__(fixture, tmp_path))
-    publish = coordinator.office_fixtures.prepare_and_publish_network_candidate
 
-    async def publish_sealed(connection, target, address, **options):
-        assert connection is fixture.connection
-        runtime_roles = tuple(
-            sorted({*options["reader_roles"], fixture.executor_role, fixture.writer_roles["owner_role"]})
-        )
-
-        async def seal_candidate(actual):
-            assert actual == target
-            return await _seal_composition_target(fixture, actual, runtime_roles)
-
-        return await publish(connection, target, address, **options, seal_candidate=seal_candidate)
-
-    with monkeypatch.context() as native_patch:
-        native_patch.setattr(coordinator.office_fixtures, "prepare_and_publish_network_candidate", publish_sealed)
-        offices = await _enter_fixture(
-            stack, coordinator.office_db.__wrapped__(fixture, tmp_path, monkeypatch, publisher)
-        )
+    offices = await _enter_fixture(stack, coordinator.office_db.__wrapped__(fixture, tmp_path, monkeypatch, publisher))
     native = await _enter_fixture(
         stack, coordinator.coordinator_db.__wrapped__(offices, fixture, tmp_path, monkeypatch, publisher)
     )
@@ -114,13 +102,7 @@ async def _publish(fixture, runtime, pair, source_manifest, recipes, revision, r
             fixture.connection, approved_revision=revision, control_schema=fixture.control_schema
         )
     fixture.composition_ids.append(uuid5(request, "address:" + approved.generation_id))
-    address_sources = await fixture.prepare_address_sources(
-        request_id=request,
-        approved_revision=revision,
-        expected_head=source_manifest.generation_id,
-        source_manifest=source_manifest,
-        address_sources=RegistryCompositionAddressSources(pair.address_source, replacement_source_recipes=recipes),
-    )
+    address_sources = RegistryCompositionAddressSources(pair.address_source, replacement_source_recipes=recipes)
     copy_target, address = await runtime.compose(
         fixture.execution_connection,
         request_id=request,
@@ -131,13 +113,12 @@ async def _publish(fixture, runtime, pair, source_manifest, recipes, revision, r
         writer_roles={**fixture.writer_roles, "reader_roles": readers},
         control_schema=fixture.control_schema,
     )
-    await prepare_and_publish_network_candidate(
+    await publish_source_contribution_candidate(
+        fixture,
         fixture.execution_connection,
         copy_target,
         address,
-        **{**fixture.writer_roles, "reader_roles": readers},
-        control_schema=fixture.control_schema,
-        seal_candidate=fixture.seal_candidate,
+        writer_roles={**fixture.writer_roles, "reader_roles": readers},
     )
     return await _pin(fixture)
 
@@ -261,7 +242,7 @@ async def _assert_carried_hash(fixture, current, site):
             address_schema,
         )
     )
-    assert receipt["revision"] == 5 and "source_aliases" not in receipt
+    assert receipt["revision"] == 7 and receipt["source_aliases"] is False
     assert all(len(receipt[name]) == 64 for name in ("ptg_carry_sha256", "fhir_carry_sha256"))
 
 
@@ -269,6 +250,7 @@ async def _flow(database, pair, notice, old, fixture, store, sessions, state_by_
     native = state_by_name["native"]
     runtime = state_by_name["runtime"]
     config = await cms.custody.candidate_custody_consumer(fixture, pair, old, store, runtime)
+    fixture.preparation_roles = config.preparation_roles
     ptg_recipes = state_by_name["recipes"]
     site, source_row = await _site(fixture, native, pair)
     await cms.recipes._reviewed_cms_binding(

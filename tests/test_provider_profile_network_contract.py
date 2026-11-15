@@ -8,6 +8,7 @@ import pytest
 
 from api.provider_profile_network_contract import bind_managed_profile_generation, parse_managed_profile_query
 from process.florida_mqa_profile import STANDARD_CATEGORIES
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 
 
@@ -20,7 +21,7 @@ def manifest():
         {"fhir": "a" * 64},
         4,
         "b" * 64,
-        7,
+        CompactAddressRelation("network_candidate_" + "1" * 32, "entity_address_unified"),
     )
 
 

@@ -6,7 +6,7 @@ COPY, admission, retention and publication remain in the shared family pipeline.
 
 from dataclasses import dataclass, replace
 
-from sqlalchemy import Column, MetaData, Table, text
+from sqlalchemy import Column, MetaData, String, Table, text
 from sqlalchemy.dialects import postgresql
 
 from db import models
@@ -180,7 +180,7 @@ class DrugClaimsCodeCrosswalk:
     __my_additional_indexes__ = models.CodeCrosswalk.__my_additional_indexes__
 
 
-def _dictionary_effect_model(name, model):
+def _dictionary_effect_model(name, model, *, legacy=False):
     """Compile native key/preimage heaps; no executable expressions or row hooks."""
     table = Table(
         name,
@@ -189,7 +189,14 @@ def _dictionary_effect_model(name, model):
         Column("baseline_image", postgresql.JSONB),
         Column("before_image", postgresql.JSONB),
         Column("after_image", postgresql.JSONB),
-        Column("destination_oid", postgresql.OID, nullable=False),
+        *(
+            (Column("destination_oid", postgresql.OID, nullable=False),)
+            if legacy
+            else (
+                Column("destination_schema", String(63), nullable=False),
+                Column("destination_name", String(63), nullable=False),
+            )
+        ),
     )
     return type(name.title().replace("_", ""), (), {"__tablename__": name, "__table__": table})
 
@@ -201,6 +208,77 @@ _DRUG_EFFECT_MODELS = tuple(
         ("drug_claims_catalog_effect", "drug_claims_crosswalk_effect"), _DRUG_SCOPED_MODELS, strict=True
     )
 )
+
+
+_LEGACY_DRUG_EFFECT_MODELS = tuple(
+    _dictionary_effect_model(effect.__tablename__, mirror, legacy=True)
+    for mirror, effect in zip(_DRUG_SCOPED_MODELS, _DRUG_EFFECT_MODELS, strict=True)
+)
+
+
+class LegacyDictionaryEffectWriteRequired(RuntimeError):
+    """Keep an unfinished old operation intact until its named-table transition is approved."""
+
+    action = "transition-legacy-dictionary-effect-tables"
+
+    def __init__(self, relations):
+        self.relations = tuple(relations)
+        super().__init__("reference_dictionary_legacy_writer_requires_named_preparation")
+
+
+async def _effect_edition(session, mirror, effect, schema_name):
+    """Admit complete named or original column editions without interpreting stored IDs."""
+    from process import reference_family_archive as native
+
+    relation = f"{native._quoted(native._schema_name(schema_name))}.{native._quoted(effect.__tablename__)}"
+    column_rows = (
+        await session.execute(
+            text("""SELECT a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,
+        a.attgenerated::text,a.attidentity::text,d.oid IS NOT NULL,
+        EXISTS(SELECT 1 FROM pg_constraint c WHERE c.conrelid=a.attrelid AND c.contype='p'
+          AND a.attnum=ANY(c.conkey))
+        FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+        WHERE a.attrelid=to_regclass(:relation) AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum"""),
+            {"relation": relation},
+        )
+    ).all()
+
+    def normalized(type_name):
+        """Normalize native and model column type spelling for edition comparison."""
+        return type_name.upper().replace("CHARACTER VARYING", "VARCHAR").replace(" ", "")
+
+    observed_columns_by_name = {
+        column_record[0]: (normalized(column_record[1]), *column_record[2:]) for column_record in column_rows
+    }
+    if len(observed_columns_by_name) != len(column_rows):
+        raise native.ReferenceFamilyArchiveError("reference dictionary effect column edition differs")
+    for edition, model in (
+        ("named", effect),
+        ("legacy", _LEGACY_DRUG_EFFECT_MODELS[_DRUG_SCOPED_MODELS.index(mirror)]),
+    ):
+        expected_columns_by_name = {
+            column.name: (
+                normalized(str(column.type.compile(dialect=postgresql.dialect()))),
+                not column.nullable,
+                "",
+                "",
+                False,
+                column.primary_key,
+            )
+            for column in model.__table__.columns
+        }
+        if observed_columns_by_name == expected_columns_by_name:
+            return edition
+    raise native.ReferenceFamilyArchiveError("reference dictionary effect column edition differs")
+
+
+async def _require_named_effect_writer(session, stage_schema):
+    legacy_relations = []
+    for mirror, effect in zip(_DRUG_SCOPED_MODELS, _DRUG_EFFECT_MODELS, strict=True):
+        if await _effect_edition(session, mirror, effect, stage_schema) == "legacy":
+            legacy_relations.append((stage_schema, effect.__tablename__))
+    if legacy_relations:
+        raise LegacyDictionaryEffectWriteRequired(legacy_relations)
 
 
 @dataclass(frozen=True)
@@ -397,8 +475,8 @@ async def _validate_prescription_edges(session, prescription_ref, catalog, cross
         raise native.ReferenceFamilyArchiveError("prescription crosswalk domain is invalid")
 
 
-async def validate_prescription_rollup(session, schema_name, *, require_binding=False):
-    """Compare the actual producer aggregate, excluding only the portable OID binding."""
+async def validate_prescription_rollup(session, schema_name, *, require_binding=False, provider_schema="mrf"):
+    """Compare the full aggregate and declared provider name, preserving old numeric editions."""
     from db.prescription_autocomplete_rollup_sql import prescription_autocomplete_rollup_insert_sql
     from process import reference_family_archive as native
 
@@ -428,10 +506,10 @@ async def validate_prescription_rollup(session, schema_name, *, require_binding=
     if require_binding and await session.scalar(
         text(f"""
         SELECT EXISTS(SELECT 1 FROM {native._quoted(schema)}.{native._quoted(model.__tablename__)}
-          WHERE source_relation_fingerprint IS DISTINCT FROM
-          to_regclass(:provider)::oid::text)
+          WHERE source_relation_fingerprint IS NULL OR (source_relation_fingerprint !~ '^[0-9]+$'
+            AND source_relation_fingerprint IS DISTINCT FROM :provider))
     """),
-        {"provider": f'{native._quoted(schema)}."pricing_provider_prescription"'},
+        {"provider": native._schema_name(provider_schema) + ".pricing_provider_prescription"},
     ):
         raise native.ReferenceFamilyArchiveError("prescription autocomplete binding differs")
 
@@ -446,18 +524,18 @@ def _dictionary_key_join(model, left, right):
 
 
 async def _lock_reference_dictionary(session, schema_name):
-    """Authenticate both native global heaps before any scoped reads or writes."""
+    """Lock the two declared global heaps before observing their native catalog shape."""
     from process import reference_family_archive as native
 
+    native._require_transaction(session)
+    schema_name = native._schema_name(schema_name)
     names = ("code_catalog", "code_crosswalk")
-    oids = tuple([await native._relation_oid(session, schema_name, name) for name in names])
-    if any(oid is None for oid in oids):
-        raise native.ReferenceFamilyArchiveError("claims shared dictionary is unavailable")
     await native._lock_family(session, schema_name, names, "SHARE ROW EXCLUSIVE", nowait=True)
-    if tuple([await native._relation_oid(session, schema_name, name) for name in names]) != oids:
-        raise native.ReferenceFamilyArchiveError("claims shared dictionary identity changed")
-    await native.require_native_read_catalog(session, oids)
-    return oids
+    addresses = tuple([await native._relation_oid(session, schema_name, name) for name in names])
+    if any(address is None for address in addresses):
+        raise native.ReferenceFamilyArchiveError("claims shared dictionary is unavailable")
+    await native.require_native_read_catalog(session, addresses)
+    return tuple((schema_name, name) for name in names)
 
 
 async def prepare_reference_dictionary_effects(session, ownership, *, destination_schema="mrf", max_bytes):
@@ -469,12 +547,14 @@ async def prepare_reference_dictionary_effects(session, ownership, *, destinatio
         raise native.ReferenceFamilyArchiveError("reference dictionary effect scope is invalid")
     await native.verify_reference_family_stage_ownership(session, ownership)
     await validate_prescription_dictionary_closure(session, ownership.schema_name)
+    await _require_named_effect_writer(session, ownership.schema_name)
+    destination_schema = native._schema_name(destination_schema)
     await session.execute(
         text(f"""
         UPDATE {native._quoted(ownership.schema_name)}.pricing_provider_rx_rollup
-        SET source_relation_fingerprint=to_regclass(:provider)::oid::text
+        SET source_relation_fingerprint=:provider
     """),
-        {"provider": f'{native._quoted(ownership.schema_name)}."pricing_provider_prescription"'},
+        {"provider": destination_schema + ".pricing_provider_prescription"},
     )
     current = await native.capture_reference_family_incumbent(
         session, importer_id="drug-claims", schema_name=destination_schema
@@ -485,10 +565,10 @@ async def prepare_reference_dictionary_effects(session, ownership, *, destinatio
         await _require_terminal_current_binding(session, current)
     else:
         await require_terminal_empty_incumbent(session, current)
-    oids = await _lock_reference_dictionary(session, destination_schema)
-    for mirror, effect, oid in zip(_DRUG_SCOPED_MODELS, _DRUG_EFFECT_MODELS, oids, strict=True):
+    await _lock_reference_dictionary(session, destination_schema)
+    for mirror, effect in zip(_DRUG_SCOPED_MODELS, _DRUG_EFFECT_MODELS, strict=True):
         await _capture_dictionary_effect_table(
-            session, ownership.schema_name, destination_schema, mirror, effect, oid, current_present
+            session, ownership.schema_name, destination_schema, mirror, effect, current_present
         )
     size = await session.scalar(
         text(
@@ -517,23 +597,21 @@ async def _require_terminal_current_binding(session, incumbent):
     rows = (
         await session.execute(
             text("""
-        SELECT c.generation_id::text,heap.relname::text AS relation_name,r.relation_oid::bigint
+        SELECT c.generation_id::text,r.schema_name,r.relation_name
         FROM hp_snapshot_retention.current_generation c JOIN hp_snapshot_retention.relation r USING(generation_id)
-        JOIN pg_catalog.pg_class heap ON heap.oid::bigint=r.relation_oid
-        WHERE c.importer_id=:importer AND c.dataset_key=:importer ORDER BY heap.relname
+        WHERE c.importer_id=:importer AND c.dataset_key=:importer ORDER BY r.schema_name,r.relation_name
     """),
             {"importer": incumbent.importer_id},
         )
     ).all()
-    if len({row[0] for row in rows}) != 1 or tuple((row[1], row[2]) for row in rows) != tuple(
-        sorted(incumbent.relation_oids)
-    ):
+    expected_relations = tuple(
+        sorted((incumbent.schema_name, name) for name, present in incumbent.relation_oids if present is not None)
+    )
+    if len({row[0] for row in rows}) != 1 or tuple((row[1], row[2]) for row in rows) != expected_relations:
         raise native.ReferenceFamilyArchiveError("reference dictionary predecessor is unregistered")
 
 
-async def _capture_dictionary_effect_table(
-    session, stage_schema, destination_schema, mirror, effect, oid, current_present
-):
+async def _capture_dictionary_effect_table(session, stage_schema, destination_schema, mirror, effect, current_present):
     from process import reference_family_archive as native
 
     stage, destination = native._quoted(stage_schema), native._quoted(destination_schema)
@@ -547,52 +625,62 @@ async def _capture_dictionary_effect_table(
     keys = ",".join(native._quoted(column.name) for column in mirror.__table__.primary_key.columns)
     current_ref = f"{destination}.{native._quoted(effect.__tablename__)}"
     if current_present:
-        await _require_effect_destination(session, mirror, current_ref, destination_schema, oid)
+        await _require_effect_destination(session, mirror, effect, destination_schema, destination_schema)
         key_query = f"SELECT {keys} FROM {incoming} UNION SELECT {keys} FROM {current_ref}"
-        baseline = (
-            "CASE WHEN current_row.destination_oid IS NULL THEN to_jsonb(live) ELSE current_row.baseline_image END"
-        )
+        marker = "current_row." + native._quoted(next(iter(mirror.__table__.primary_key.columns)).name)
+        baseline = f"CASE WHEN {marker} IS NULL THEN to_jsonb(live) ELSE current_row.baseline_image END"
         current_join = f"LEFT JOIN {current_ref} current_row ON {_dictionary_key_join(mirror, 'keys', 'current_row')}"
     else:
         key_query, baseline, current_join = f"SELECT {keys} FROM {incoming}", "to_jsonb(live)", ""
     collision = (
         (
-            "current_row.destination_oid IS NOT NULL AND current_row.after_image IS DISTINCT FROM to_jsonb(live) OR "
-            "current_row.destination_oid IS NULL AND "
+            f"{marker} IS NOT NULL AND current_row.after_image IS DISTINCT FROM to_jsonb(live) OR {marker} IS NULL AND "
             if current_present
             else ""
         )
         + "to_jsonb(live) IS NOT NULL AND to_jsonb(incoming) IS NOT NULL AND to_jsonb(live) IS DISTINCT FROM to_jsonb(incoming)"
     )
     joins = f"FROM ({key_query}) keys LEFT JOIN {live} live ON {_dictionary_key_join(mirror, 'keys', 'live')} LEFT JOIN {incoming} incoming ON {_dictionary_key_join(mirror, 'keys', 'incoming')} {current_join}"
-    if await session.scalar(text(f"SELECT EXISTS(SELECT 1 {joins} WHERE {collision})"), {"oid": oid}):
+    if await session.scalar(text(f"SELECT EXISTS(SELECT 1 {joins} WHERE {collision})")):
         raise native.ReferenceFamilyArchiveError("reference dictionary predecessor or foreign key changed")
     await session.execute(
         text(f"""
-        INSERT INTO {effect_ref}({keys},baseline_image,before_image,after_image,destination_oid)
+        INSERT INTO {effect_ref}({keys},baseline_image,before_image,after_image,destination_schema,destination_name)
         SELECT {",".join("keys." + native._quoted(column.name) for column in mirror.__table__.primary_key.columns)},
-          {baseline},to_jsonb(live),CASE WHEN to_jsonb(incoming) IS NULL THEN {baseline} ELSE to_jsonb(incoming) END,:oid
+          {baseline},to_jsonb(live),CASE WHEN to_jsonb(incoming) IS NULL THEN {baseline} ELSE to_jsonb(incoming) END,:destination_schema,:destination_name
         {joins}
     """),
-        {"oid": oid},
+        {"destination_schema": destination_schema, "destination_name": mirror.__source_table__},
     )
     if await session.scalar(text(f"SELECT count(*)>100000 FROM {effect_ref}")):
         raise native.ReferenceFamilyArchiveError("claims dictionary publication bound is exceeded")
 
 
-async def validate_reference_dictionary_effects(session, ownership):
-    """Authenticate the closed local effect domain, including absent and removed keys."""
+async def validate_reference_dictionary_effects(session, ownership, *, destination_schema="mrf"):
+    """Validate the closed local effect domain, including absent and removed keys."""
     from process import reference_family_archive as native
 
     if native._ownership_spec(ownership) != native.reference_family_receive_spec("drug-claims"):
         raise native.ReferenceFamilyArchiveError("reference dictionary effect inventory is incomplete")
-    await validate_prescription_rollup(session, ownership.schema_name, require_binding=True)
+    destination_schema = native._schema_name(destination_schema)
+    await validate_prescription_rollup(
+        session, ownership.schema_name, require_binding=True, provider_schema=destination_schema
+    )
     schema = native._quoted(ownership.schema_name)
     for mirror, effect in zip(_DRUG_SCOPED_MODELS, _DRUG_EFFECT_MODELS, strict=True):
         incoming, effects = (
             f"{schema}.{native._quoted(mirror.__tablename__)}",
             f"{schema}.{native._quoted(effect.__tablename__)}",
         )
+        edition = await _effect_edition(session, mirror, effect, ownership.schema_name)
+        marker = "effect." + native._quoted(next(iter(mirror.__table__.primary_key.columns)).name)
+        destination = (
+            "effect.destination_schema IS DISTINCT FROM :destination_schema "
+            "OR effect.destination_name IS DISTINCT FROM :destination_name OR "
+            if edition == "named"
+            else ""
+        )
+        vector = " OR count(DISTINCT (destination_schema,destination_name))>1" if edition == "named" else ""
         join = _dictionary_key_join(mirror, "incoming", "effect")
         images = " OR ".join(
             f"(effect.{image} IS NOT NULL AND (jsonb_typeof(effect.{image})<>'object' OR "
@@ -606,12 +694,15 @@ async def validate_reference_dictionary_effects(session, ownership):
         if await session.scalar(
             text(f"""
             SELECT EXISTS(SELECT 1 FROM {incoming} incoming LEFT JOIN {effects} effect ON {join}
-              WHERE effect.destination_oid IS NULL OR effect.after_image IS DISTINCT FROM to_jsonb(incoming))
+              WHERE {marker} IS NULL OR effect.after_image IS DISTINCT FROM to_jsonb(incoming))
               OR EXISTS(SELECT 1 FROM {effects} effect LEFT JOIN {incoming} incoming ON {join}
-              WHERE effect.destination_oid IS NULL OR effect.destination_oid=0 OR {images}
+              WHERE {marker} IS NULL OR {destination}{images}
               OR (to_jsonb(incoming) IS NULL AND effect.after_image IS DISTINCT FROM effect.baseline_image))
-              OR (SELECT count(*)>100000 OR count(DISTINCT destination_oid)>1 FROM {effects})
-        """)
+              OR (SELECT count(*)>100000{vector} FROM {effects})
+        """),
+            {"destination_schema": destination_schema, "destination_name": mirror.__source_table__}
+            if edition == "named"
+            else {},
         ):
             raise native.ReferenceFamilyArchiveError("reference dictionary effect closure differs")
 
@@ -623,27 +714,32 @@ async def apply_reference_dictionary_effects(
     from process import reference_family_archive as native
 
     native._require_transaction(session)
-    oids = await _lock_reference_dictionary(session, destination_schema)
-    for mirror, effect, oid in zip(_DRUG_SCOPED_MODELS, _DRUG_EFFECT_MODELS, oids, strict=True):
+    incoming_schema = native._schema_name(incoming_schema)
+    destination_schema = native._schema_name(destination_schema)
+    current_schema = None if current_schema is None else native._schema_name(current_schema)
+    if rollback and current_schema is None:
+        raise native.ReferenceFamilyArchiveError("reference dictionary rollback scope is invalid")
+    await _lock_reference_dictionary(session, destination_schema)
+    for mirror, effect in zip(_DRUG_SCOPED_MODELS, _DRUG_EFFECT_MODELS, strict=True):
         effects = f"{native._quoted(incoming_schema)}.{native._quoted(effect.__tablename__)}"
         live = f"{native._quoted(destination_schema)}.{native._quoted(mirror.__source_table__)}"
         fence = f"{native._quoted(current_schema)}.{native._quoted(effect.__tablename__)}" if rollback else effects
         image = "after_image" if rollback else "before_image"
-        await _require_effect_destination(session, mirror, fence, destination_schema, oid)
+        await _require_effect_destination(
+            session, mirror, effect, current_schema if rollback else incoming_schema, destination_schema
+        )
         if await session.scalar(
             text(
                 f"SELECT EXISTS(SELECT 1 FROM {fence} effect LEFT JOIN {live} live ON {_dictionary_key_join(mirror, 'effect', 'live')} WHERE effect.{image} IS DISTINCT FROM to_jsonb(live))"
             ),
-            {"oid": oid},
         ):
             raise native.ReferenceFamilyArchiveError("reference dictionary destination changed")
         if rollback:
-            await _require_effect_destination(session, mirror, effects, destination_schema, oid)
+            await _require_effect_destination(session, mirror, effect, incoming_schema, destination_schema)
         if rollback and await session.scalar(
             text(
                 f"SELECT EXISTS(SELECT 1 FROM {effects} effect LEFT JOIN {live} live ON {_dictionary_key_join(mirror, 'effect', 'live')} WHERE NOT EXISTS(SELECT 1 FROM {fence} current_row WHERE {_dictionary_key_join(mirror, 'effect', 'current_row')}) AND effect.baseline_image IS DISTINCT FROM to_jsonb(live))"
             ),
-            {"oid": oid},
         ):
             raise native.ReferenceFamilyArchiveError("reference dictionary rollback key changed")
     for mirror, effect in zip(_DRUG_SCOPED_MODELS, _DRUG_EFFECT_MODELS, strict=True):
@@ -652,17 +748,23 @@ async def apply_reference_dictionary_effects(
         )
 
 
-async def _require_effect_destination(session, mirror, effects, destination_schema, oid):
-    """Resolve the locked native family by name; saved effect IDs are historical metadata."""
+async def _require_effect_destination(session, mirror, effect, effect_schema, destination_schema):
+    """Bind named rows exactly; original editions use only the declared compiled target."""
     from process import reference_family_archive as native
-    from process import scoped_catalog_named_storage as storage
 
-    pairs_by_name = dict(
-        await storage.require_tables(
-            session, destination_schema, (models.CodeCatalog, models.CodeCrosswalk), lock="SHARE"
-        )
+    destination_schema = native._schema_name(destination_schema)
+    edition = await _effect_edition(session, mirror, effect, effect_schema)
+    if edition == "legacy":
+        return
+    effects = f"{native._quoted(effect_schema)}.{native._quoted(effect.__tablename__)}"
+    changed = await session.scalar(
+        text(
+            f"SELECT EXISTS(SELECT 1 FROM {effects} WHERE "
+            "destination_schema IS DISTINCT FROM :destination_schema OR destination_name IS DISTINCT FROM :destination_name)"
+        ),
+        {"destination_schema": destination_schema, "destination_name": mirror.__source_table__},
     )
-    if pairs_by_name.get(mirror.__source_table__) != oid:
+    if changed is not False:
         raise native.ReferenceFamilyArchiveError("reference dictionary destination changed")
 
 

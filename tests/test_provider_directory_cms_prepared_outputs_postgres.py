@@ -78,7 +78,7 @@ async def assert_private_payload_twins(workspace, handoff):
     ):
         frozen = handoff.document["tables"][root]
         copied = workspace.receipts[root]
-        assert frozen["oid"] != copied["oid"]
+        assert (frozen["schema"], frozen["name"]) != (copied["schema"], copied["name"])
         source_relation = storage_relation(workspace.policy.schema, frozen["name"])
         target_relation = storage_relation(workspace.policy.schema, copied["name"])
         projection = ",".join(
@@ -98,15 +98,15 @@ async def assert_private_payload_twins(workspace, handoff):
         assert row_counts_by_root[root] > 0
         assert (
             await workspace.connection.fetchval(
-                "SELECT atttypid='jsonb'::regtype FROM pg_attribute WHERE attrelid=$1 AND attname=$2",
-                copied["oid"],
+                "SELECT atttypid='jsonb'::regtype FROM pg_attribute WHERE attrelid=to_regclass($1) AND attname=$2",
+                target_relation,
                 json_field,
             )
             is True
         )
         assert (
             await workspace.connection.fetchval(
-                "SELECT count(*) FROM pg_constraint WHERE conrelid=$1 AND contype='f'", copied["oid"]
+                "SELECT count(*) FROM pg_constraint WHERE conrelid=to_regclass($1) AND contype='f'", target_relation
             )
             == 0
         )
@@ -176,9 +176,9 @@ async def test_native_generic_middle_payload_page_uses_existing_collated_primary
     relation = storage_relation(case.storage.storage_schema, frozen["name"])
     primary_key_sql = (
         "SELECT i.indexrelid::bigint AS oid,i.indkey::text,pg_get_indexdef(i.indexrelid) AS definition "
-        "FROM pg_index i WHERE i.indrelid=$1 AND i.indisprimary"
+        "FROM pg_index i WHERE i.indrelid=to_regclass($1) AND i.indisprimary"
     )
-    primary_key = await case.admin.fetchrow(primary_key_sql, frozen["oid"])
+    primary_key = await case.admin.fetchrow(primary_key_sql, relation)
     assert primary_key is not None
     transaction, has_prepared_statement = case.admin.transaction(), False
     await transaction.start()
@@ -217,12 +217,12 @@ async def test_native_generic_middle_payload_page_uses_existing_collated_primary
         assert "ROW(" in scan["Index Cond"] and "COLLATE" not in scan["Index Cond"]
         index = storage_relation(case.storage.storage_schema, scan["Index Name"])
         assert await case.admin.fetchval("SELECT $1::regclass::oid", index) == primary_key["oid"]
-        assert await case.admin.fetchrow(primary_key_sql, frozen["oid"]) == primary_key
+        assert await case.admin.fetchrow(primary_key_sql, relation) == primary_key
     finally:
         await transaction.rollback()
         if has_prepared_statement:
             await case.admin.execute("DEALLOCATE cms_payload_seek")
-    assert await case.admin.fetchrow(primary_key_sql, frozen["oid"]) == primary_key
+    assert await case.admin.fetchrow(primary_key_sql, relation) == primary_key
     assert await frozen_and_canonical(case) == before
 
 
@@ -397,8 +397,12 @@ async def test_native_interrupted_frozen_copy_closes_original_transport_and_retr
 async def test_native_inherited_child_cannot_escape_only_input_commitment(full_private_case, root):
     case = full_private_case
     before = await frozen_and_canonical(case)
+    expected_code = {
+        storage.RESOURCE: "cms_prepared_derived_projection_changed",
+        storage.HEADER: "provider_directory_generic_source_plan_projection_changed",
+    }[root]
     async with publisher(case) as (session, driver), observe(case, session, driver) as inputs:
-        with pytest.raises(ValueError, match="provider_directory_generic_source_storage_missing"):
+        with pytest.raises(ValueError, match=f"^{expected_code}$"):
             async with prepare(case, session, driver, inputs) as (workspace, evidence):
                 relation = storage_relation(workspace.policy.schema, case.handoff.document["tables"][root]["name"])
                 await driver.execute(f"CREATE TABLE private_source.extra_child () INHERITS ({relation})")

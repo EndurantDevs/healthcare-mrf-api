@@ -6,6 +6,7 @@ publication identity, capture cleanup and the outer commit path remain real code
 """
 
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -58,28 +59,32 @@ def _publication_transport(driver, events, monkeypatch):
 
 def _trusted_factory(monkeypatch, change):
     """Bind genuine policy contexts, then optionally replace their factory at exit."""
-    monkeypatch.setattr(policy, "storage_roles", AsyncMock())
+    configured_policy = _policy()
+    changed_factory = SimpleNamespace(
+        policy=replace(configured_policy, schema="changed_source"), _require_current_policy=lambda: None
+    )
 
     @asynccontextmanager
     async def bind(database, session, *, isolation):
         assert isolation == "read committed" and database._transaction_binding().session is session
-        monkeypatch.setattr(session, "raw_connection", await session.bind.get_raw_connection(), raising=False)
-        driver = await policy._copy_driver(session)
+        driver = (await session.bind.get_raw_connection()).driver_connection
         _publication_transport(driver, session.bind.events, monkeypatch)
         async with (
-            policy.bind_generic_source_publisher(
-                driver, _policy(), verify_role_profile=AsyncMock(), transaction_isolation=isolation
-            ),
+            policy.bind_generic_source_publisher(driver, configured_policy, transaction_isolation=isolation),
             policy.source_owner_transaction(database),
         ):
             if change == "entry":
-                policy._FACTORY.set(object())
+                policy._FACTORY.set(changed_factory)
             yield session
         if change == "exit":
-            policy._FACTORY.set(object())
+            policy._FACTORY.set(changed_factory)
 
     return SimpleNamespace(
-        transaction=lambda: None, publication_session_factory=AsyncMock(), bind_existing_transaction=bind
+        transaction=lambda: None,
+        publication_session_factory=AsyncMock(),
+        bind_existing_transaction=bind,
+        policy=configured_policy,
+        _require_current_policy=lambda: None,
     )
 
 

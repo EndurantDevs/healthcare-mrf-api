@@ -45,7 +45,9 @@ _DESCRIPTOR_FIELDS = {
     *_HASH_FIELDS,
     "transform_version",
 }
-FACT_ANCHOR_FIELDS = frozenset(("fact_candidate_id", "fact_table_oid", "fact_seal_sha256"))
+FACT_ANCHOR_FIELDS = frozenset(("fact_candidate_id", "fact_schema_name", "fact_table_name", "fact_generation_id"))
+LEGACY_FACT_ANCHOR_FIELDS = frozenset(("fact_candidate_id", "fact_table_oid", "fact_seal_sha256"))
+ALL_FACT_ANCHOR_FIELDS = FACT_ANCHOR_FIELDS | LEGACY_FACT_ANCHOR_FIELDS
 _FACT_FIELDS = {
     "resource_type",
     "resource_id",
@@ -120,27 +122,33 @@ async def source_mapping_sha256(connection, recipe, approved, control_schema):
 
 
 def _validate_fact_anchor(descriptor):
-    anchor_values = [descriptor[field] for field in FACT_ANCHOR_FIELDS]
-    if all(value is None for value in anchor_values):
+    fields = set(descriptor) & ALL_FACT_ANCHOR_FIELDS
+    if fields not in (FACT_ANCHOR_FIELDS, LEGACY_FACT_ANCHOR_FIELDS):
+        raise ValueError
+    values = [descriptor[field] for field in fields]
+    if all(value is None for value in values):
         return
-    if any(value is None for value in anchor_values):
+    if any(value is None for value in values):
         raise ValueError
     identity = UUID(descriptor["fact_candidate_id"]) if type(descriptor["fact_candidate_id"]) is str else None
-    if (
-        identity is None
-        or not identity.int
-        or str(identity) != descriptor["fact_candidate_id"]
-        or type(descriptor["fact_table_oid"]) is not int
-        or not 0 < descriptor["fact_table_oid"] < 2**32
-        or type(descriptor["fact_seal_sha256"]) is not str
-        or re.fullmatch(r"[0-9a-f]{64}", descriptor["fact_seal_sha256"]) is None
-    ):
+    if identity is None or not identity.int or str(identity) != descriptor["fact_candidate_id"]:
         raise ValueError
+    if fields == FACT_ANCHOR_FIELDS:
+        _identifier(descriptor["fact_schema_name"])
+        if (
+            descriptor["fact_table_name"] != CONTRIBUTION_TABLE
+            or type(descriptor["fact_generation_id"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", descriptor["fact_generation_id"]) is None
+        ):
+            raise ValueError
 
 
 def locally_owned_source_descriptor(descriptor):
-    """Represent newly extracted source facts without a circular self-seal reference."""
-    return {**descriptor, **dict.fromkeys(FACT_ANCHOR_FIELDS)}
+    """Represent newly extracted local source facts without a published-generation reference."""
+    return {
+        **{key: value for key, value in descriptor.items() if key not in ALL_FACT_ANCHOR_FIELDS},
+        **dict.fromkeys(FACT_ANCHOR_FIELDS),
+    }
 
 
 def _validate_inventory_contribution(receipt, inventory_root):
@@ -190,7 +198,9 @@ def validate_registry_source_contribution_receipt(receipt, *, inventory_root=Non
         for descriptor in receipt["sources"]:
             if (
                 type(descriptor) is not dict
-                or set(descriptor) != _DESCRIPTOR_FIELDS | (FACT_ANCHOR_FIELDS if receipt["revision"] == 2 else set())
+                or set(descriptor) - _DESCRIPTOR_FIELDS
+                not in ((FACT_ANCHOR_FIELDS, LEGACY_FACT_ANCHOR_FIELDS) if receipt["revision"] == 2 else (set(),))
+                or not _DESCRIPTOR_FIELDS <= descriptor.keys()
                 or descriptor["transform_version"]
                 not in {TRANSFORM_VERSION, GENERIC_TRANSFORM_VERSION, SOURCE_PLAN_TIER_TRANSFORM_VERSION}
                 or any(type(descriptor[field]) is not int or not 0 <= descriptor[field] < 2**63 for field in _COUNTERS)
@@ -236,7 +246,7 @@ def registry_source_contribution_receipt(stage, *, inventory_root=None):
             validate_source_witness_descriptor_v2(descriptor)
             if "descriptor_version" in descriptor
             else locally_owned_source_descriptor(descriptor)
-            if not FACT_ANCHOR_FIELDS <= descriptor.keys()
+            if not ALL_FACT_ANCHOR_FIELDS.intersection(descriptor)
             else descriptor
             for descriptor in descriptors
         ]
@@ -856,7 +866,7 @@ def validate_source_witness_descriptor_v2(descriptor):
         }
         if (
             type(descriptor) is not dict
-            or set(descriptor) != fields
+            or set(descriptor) not in (fields, fields - FACT_ANCHOR_FIELDS | LEGACY_FACT_ANCHOR_FIELDS)
             or type(descriptor["descriptor_version"]) is not int
             or descriptor["descriptor_version"] != SOURCE_WITNESS_DESCRIPTOR_VERSION_V2
             or descriptor["transform_version"]
@@ -1000,7 +1010,7 @@ def validate_source_mapping_descriptor_v3(descriptor):
         }
         if (
             type(descriptor) is not dict
-            or set(descriptor) != fields
+            or set(descriptor) not in (fields, fields - FACT_ANCHOR_FIELDS | LEGACY_FACT_ANCHOR_FIELDS)
             or len(_canonical(descriptor).encode()) > MAX_RECEIPT_BYTES
             or type(descriptor["descriptor_version"]) is not int
             or descriptor["descriptor_version"] != SOURCE_MAPPING_DESCRIPTOR_VERSION_V3
@@ -1059,7 +1069,7 @@ def validate_source_contribution_descriptor(descriptor):
         return validate_registry_source_contribution_receipt(
             {
                 "component": SUMMARY_KEY,
-                "revision": 2 if FACT_ANCHOR_FIELDS.intersection(descriptor) else 1,
+                "revision": 2 if ALL_FACT_ANCHOR_FIELDS.intersection(descriptor) else 1,
                 "table_name": CONTRIBUTION_TABLE,
                 "sources": [descriptor],
             }

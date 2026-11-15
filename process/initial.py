@@ -74,7 +74,10 @@ from process.mrf_publication_receipt import begin_publication
 from process.mrf_workbook import read_mrf_workbook
 from process.openaddresses import refresh_archive_geocodes_from_openaddresses
 from process.plan_summary import rebuild_plan_search_summary
-from process.provider_directory_cms_native_inputs import prepare_local_native_input_publication
+from process.provider_directory_cms_native_inputs import (
+    finish_local_native_input_publication,
+    prepare_local_native_input_publication,
+)
 from process.ptg_parts.copy_load import _copy_ignore_objects
 from process.redis_config import build_redis_settings
 from process.reference_family_result_generation import publish_local_reference_family_generation
@@ -3320,7 +3323,7 @@ async def _publish_mrf_table_generation(import_date: str, db_schema: str):
         cls.__main_table__: make_class(cls, import_date, schema_override=db_schema) for cls in _MRF_PUBLICATION_MODELS
     }
     async with db.transaction() as session:
-        await prepare_local_native_input_publication(
+        native_input_publication = await prepare_local_native_input_publication(
             session,
             ledger_schema=db_schema,
             relations=tuple((name, stage.__tablename__) for name, stage in staging_tables_by_main_name.items()),
@@ -3357,6 +3360,7 @@ async def _publish_mrf_table_generation(import_date: str, db_schema: str):
                         f"{db_schema}.{staging_cls.__tablename__}_idx_{index_name} RENAME TO "
                         f"{table}_idx_{index_name};"
                     )
+        await finish_local_native_input_publication(session, prepared=native_input_publication)
         publication_generation = await publish_local_reference_family_generation(
             db,
             importer_id="mrf",

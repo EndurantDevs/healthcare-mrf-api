@@ -79,7 +79,6 @@ def _child_context(directory):
         (_READ, None),
         (_SLOT, None),
         (directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES, {}),
-        (directory._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS, {}),
         (directory._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE, None),
         (directory._PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS, ()),
     ):
@@ -239,12 +238,9 @@ async def _run_native_ticket(ticket):
         scope = ticket.scope
         source_copy = decoded(scope.source_copy_json)
         name_by_root = {inputs.SOURCE: source_copy["name"], **{stage.target: stage.relation for stage in scope.stages}}
-        oid_by_root = {inputs.SOURCE: source_copy["copy"]["oid"], **{stage.target: stage.oid for stage in scope.stages}}
         token = _READ.set((ticket, capability))
         try:
-            with ticket.directory._artifact_scope_tokens(
-                ticket.fence, ticket.resource_fence, name_by_root, oid_by_root
-            ):
+            with ticket.directory._artifact_scope_tokens(ticket.fence, ticket.resource_fence, name_by_root):
                 return await ticket.operation
         finally:
             _READ.reset(token)
