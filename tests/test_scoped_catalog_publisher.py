@@ -14,6 +14,7 @@ import pytest
 
 from api import control_workers as workers
 from api import scoped_catalog_publisher_worker as launcher
+from process import scoped_catalog_publisher as publisher
 from process.scoped_catalog_publisher import PREFIX, PublisherSettings, parse_attempt
 from tests.test_scoped_catalog_handoff import _value
 
@@ -213,7 +214,22 @@ def test_publisher_state_uses_terminal_condition_without_pod_counts(monkeypatch,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "change", ["attempt", "node", "generation", "params", "error", "succeeded", "canceled", "none"]
+    "change",
+    [
+        "attempt",
+        "node",
+        "generation",
+        "params",
+        "error",
+        "succeeded",
+        "canceled",
+        "none",
+        "missing",
+        "bad-content",
+        "encoded",
+        "terminal-receipt",
+        "not-pending",
+    ],
 )
 async def test_launcher_admits_only_real_persisted_attempt(monkeypatch, change):
     request, candidate = _request(), _value()
@@ -243,13 +259,28 @@ async def test_launcher_admits_only_real_persisted_attempt(monkeypatch, change):
         run_by_field.update(status=change, finished_at="2026-01-01T00:01:00+00:00")
         metric = "scoped_catalog_publication" if change == "succeeded" else "scoped_catalog_cancellation"
         run_by_field["metrics"][metric] = {"handoff": candidate}
-    connection = SimpleNamespace(all=AsyncMock(return_value=[run_by_field]))
-    if change == "none":
+    if change == "bad-content":
+        run_by_field["progress"] = []
+    if change == "encoded":
+        for key in ("progress", "metrics", "params"):
+            run_by_field[key] = json.dumps(run_by_field[key])
+    if change == "terminal-receipt":
+        run_by_field.update(status="succeeded", finished_at="2026-01-01T00:01:00+00:00")
+    if change == "not-pending":
+        run_by_field["status"] = "running"
+    connection = SimpleNamespace(all=AsyncMock(return_value=[] if change == "missing" else [run_by_field]))
+    if change in {"none", "encoded"}:
         assert await launcher._admit(connection, request, "serving") is None
     elif change in {"succeeded", "canceled"}:
         assert await launcher._admit(connection, request, "serving") == change
     else:
-        with pytest.raises(ValueError, match="attempt changed"):
+        message = {
+            "missing": "run is unavailable",
+            "bad-content": "content is unavailable",
+            "terminal-receipt": "terminal result differs",
+            "not-pending": "run is not pending",
+        }.get(change, "attempt changed")
+        with pytest.raises(ValueError, match=message):
             await launcher._admit(connection, request, "serving")
 
 
@@ -377,3 +408,209 @@ def test_existing_publisher_cannot_gain_retries_or_privileges(change):
     if change == "restart":
         pod["restartPolicy"] = "OnFailure"
     assert not launcher._matches(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("run_id", ""),
+        ("run_id", "x" * 129),
+        ("node_id", "invalid\nselector"),
+        ("expected_lineage_id", "00000000-0000-0000-0000-000000000000"),
+        ("expected_lineage_id", "invalid-lineage"),
+        ("expected_generation", "-1"),
+        ("expected_generation", "01"),
+    ],
+)
+def test_publisher_argument_errors_do_not_echo_selectors(capsys, key, value):
+    request_by_field = dict(_request(), **{key: value})
+    arguments = [
+        part for name in launcher.SELECTORS for part in ("--" + name.replace("_", "-"), str(request_by_field[name]))
+    ]
+    with pytest.raises(SystemExit) as error:
+        publisher.parse_attempt(arguments)
+    assert error.value.code == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert json.loads(output.err) == {"status": "error", "code": "invalid_arguments"}
+
+
+@pytest.mark.parametrize(
+    "failure,code,exit_code",
+    [(None, None, 0), (ValueError, "configuration", 2), (TimeoutError, "timeout", 1), (RuntimeError, "publication", 1)],
+)
+def test_publisher_cli_reports_sanitized_terminal_outcome(monkeypatch, capsys, failure, code, exit_code):
+    request = _request()
+    arguments = [part for name in launcher.SELECTORS for part in ("--" + name.replace("_", "-"), str(request[name]))]
+    settings = PublisherSettings.from_environment(_environment())
+    monkeypatch.setattr(publisher.PublisherSettings, "from_environment", lambda: settings)
+    publish = AsyncMock(
+        return_value={"status": "published"}, side_effect=failure("synthetic detail") if failure else None
+    )
+    monkeypatch.setattr(publisher, "run_publisher", publish)
+    assert publisher.main(arguments) == exit_code
+    output = capsys.readouterr()
+    assert json.loads(output.out) == ({"status": "error", "code": code} if failure else {"status": "published"})
+    assert output.err == ""
+    publish.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        None,
+        "queue",
+        "worker_class",
+        "job_id",
+        "import_id",
+        "resource_class",
+        "attempt_id",
+        "expected_generation",
+        "extra",
+    ],
+)
+def test_repair_hints_cannot_replace_persisted_publisher_coordinates(changed):
+    request_by_field = dict(_request(), role="finish")
+    handoff = _value()
+    run_by_field = {"importer": "code-sets", "metrics": {}, "params": {}}
+    if changed:
+        request_by_field[changed] = "different"
+    original = deepcopy(request_by_field)
+    generation = handoff["expected_generations"]["code-sets"]
+    if changed:
+        with pytest.raises(ValueError, match="repair selector differs"):
+            launcher._bind_repair_request(request_by_field, run_by_field, handoff, generation)
+        assert request_by_field == original
+    else:
+        launcher._bind_repair_request(request_by_field, run_by_field, handoff, generation)
+        assert request_by_field == _request()
+
+
+@pytest.mark.parametrize("collision", [False, True])
+def test_publisher_creation_reconciles_a_collision_without_second_post(monkeypatch, collision):
+    request = _request()
+    request.scoped_catalog_admission = True
+    image = "registry.example/image@sha256:" + "a" * 64
+    job = launcher.manifest(_spec(request), request, image)
+    responses = [workers._KubernetesApiError(404, "absent")]
+    responses.extend([workers._KubernetesApiError(409, "exists"), job] if collision else [{}])
+    api = Mock(side_effect=responses)
+    monkeypatch.setattr(workers, "_kubernetes_request", api)
+    monkeypatch.setattr(workers, "_launcher_mode", lambda: "kubernetes")
+    monkeypatch.setattr(workers, "_configured_worker_job_image", lambda *_: image)
+    result = launcher.ensure(_spec(request), request)
+    assert result["status"] == ("already_running" if collision else "started")
+    assert [call.args[0] for call in api.call_args_list] == (["GET", "POST", "GET"] if collision else ["GET", "POST"])
+    assert api.call_args_list[1].args[2] == job
+
+
+@pytest.mark.parametrize("operation", ["read", "create"])
+def test_publisher_api_failure_does_not_retry_creation(monkeypatch, operation):
+    request = _request()
+    request.scoped_catalog_admission = True
+    responses = [workers._KubernetesApiError(503, "unavailable")]
+    if operation == "create":
+        responses.insert(0, workers._KubernetesApiError(404, "absent"))
+    api = Mock(side_effect=responses)
+    monkeypatch.setattr(workers, "_kubernetes_request", api)
+    monkeypatch.setattr(workers, "_launcher_mode", lambda: "kubernetes")
+    monkeypatch.setattr(workers, "_configured_worker_job_image", lambda *_: "registry.example/image@sha256:" + "a" * 64)
+    assert launcher.ensure(_spec(request), request)["status"] == "failed"
+    assert [call.args[0] for call in api.call_args_list] == (["GET", "POST"] if operation == "create" else ["GET"])
+
+
+@pytest.mark.parametrize("admitted", [False, True])
+def test_publisher_requires_admission_and_isolated_launcher_before_api(monkeypatch, admitted):
+    request = _request()
+    request.scoped_catalog_admission = admitted
+    api = Mock(side_effect=AssertionError("unadmitted requests must not contact the launcher"))
+    monkeypatch.setattr(workers, "_kubernetes_request", api)
+    monkeypatch.setattr(workers, "_launcher_mode", lambda: "local")
+    assert launcher.ensure(_spec(request), request)["status"] == ("blocked" if admitted else "failed")
+    api.assert_not_called()
+
+
+@pytest.mark.parametrize("resources", [[], {"other": {}}, {"limits": []}])
+def test_publisher_refuses_malformed_resource_sections(resources):
+    with pytest.raises(ValueError, match="invalid resource"):
+        launcher._normalized_resources(resources)
+
+
+def test_publisher_refuses_invalid_selectors_and_mutable_image():
+    request = _request()
+    spec = _spec(request)
+    with pytest.raises(ValueError, match="selector is invalid"):
+        launcher.selected_spec(spec, dict(request, expected_generation=True))
+    with pytest.raises(ValueError, match="immutable configured image"):
+        launcher.manifest(spec, request, "registry.example/image:latest")
+
+
+@pytest.mark.parametrize("outcome", ["not-pending", "changed", "terminal", "missing-id", "absent", "unavailable"])
+def test_cancel_does_not_delete_unavailable_or_unmatched_publisher(monkeypatch, outcome):
+    request, candidate = _request(), _value()
+    image = "registry.example/image@sha256:" + "a" * 64
+    job = launcher.manifest(_spec(request), request, image)
+    job["status"] = {"conditions": [{"type": "Complete", "status": "True"}]} if outcome == "terminal" else {}
+    error = workers._KubernetesApiError(404 if outcome == "absent" else 503, "unavailable")
+    api = Mock(side_effect=error if outcome in {"absent", "unavailable"} else None, return_value=job)
+    monkeypatch.setattr(workers, "_kubernetes_request", api)
+    monkeypatch.setattr(workers, "_launcher_mode", lambda: "kubernetes")
+    monkeypatch.setattr(workers, "_configured_worker_job_image", lambda *_: image)
+    run_by_field = {
+        "run_id": candidate["run_id"],
+        "importer": "code-sets",
+        "node_id": "node-1",
+        "status": "canceling" if outcome == "not-pending" else "finalizing",
+        "metrics": {"scoped_catalog_handoff": candidate},
+        "progress": {key: candidate[key] for key in ("attempt_id", "attempt_started_at")},
+    }
+    if outcome == "changed":
+        run_by_field["node_id"] = "different-node"
+    result = launcher.stop_publisher(run_by_field)
+    assert result["deleted"] == 0
+    assert ("error" in result) == (outcome in {"changed", "missing-id", "unavailable"})
+    assert [call.args[0] for call in api.call_args_list] == ([] if outcome in {"not-pending", "changed"} else ["GET"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["missing", "changed", "unavailable", "updated"])
+async def test_cancel_reconciles_persisted_attempt_before_reporting_progress(monkeypatch, outcome):
+    from api import control_imports as imports
+    from process import scoped_catalog_handoff as handoff
+
+    candidate = _value()
+    observed_by_field = {"metrics": {"scoped_catalog_handoff": candidate}}
+    current_by_field = {"status": "finalizing", "metrics": observed_by_field["metrics"] if outcome != "changed" else {}}
+    events = []
+
+    @asynccontextmanager
+    async def transaction():
+        events.append("row-lock")
+        yield SimpleNamespace()
+
+    persisted_record = None if outcome == "missing" else SimpleNamespace(_mapping=current_by_field)
+    monkeypatch.setattr(
+        imports, "db", SimpleNamespace(transaction=transaction, first=AsyncMock(return_value=persisted_record))
+    )
+    monkeypatch.setattr(launcher, "stop_publisher", lambda *_: events.append("stop"))
+    cancel = AsyncMock()
+    monkeypatch.setattr(handoff, "request_catalog_cancel", cancel)
+    refreshed = {"status": "canceling"} if outcome == "updated" else None
+    refresh = AsyncMock(return_value=refreshed)
+    monkeypatch.setattr(imports, "get_import_run", refresh)
+    progress, enqueue = Mock(), Mock()
+    monkeypatch.setattr(imports, "_write_run_live_progress", progress)
+    monkeypatch.setattr(imports, "enqueue_status_event", enqueue)
+    if outcome == "changed":
+        with pytest.raises(RuntimeError, match="attempt changed"):
+            await launcher.request_cancel(candidate["run_id"], observed_by_field)
+    else:
+        assert await launcher.request_cancel(candidate["run_id"], observed_by_field) == refreshed
+    assert events == ["stop", "row-lock"]
+    assert cancel.await_count == refresh.await_count == int(outcome in {"unavailable", "updated"})
+    if outcome == "updated":
+        progress.assert_called_once_with(refreshed, publish_event=False)
+        enqueue.assert_called_once_with(refreshed)
+    else:
+        progress.assert_not_called()
+        enqueue.assert_not_called()

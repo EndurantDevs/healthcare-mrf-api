@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 
 from db.plan_release_storage import storage_identifier, storage_relation
+from process import provider_directory_compact_source_migration as compact_migration
 from process import provider_directory_generic_source_storage as storage
 from process.provider_directory_generic_candidate import (
     COPY_FRAME_BYTES,
@@ -260,19 +261,31 @@ async def _reduced_rows(rows, *, dataset_id, prepare, merge):
         """Reduce the last rows of one key and validate a merged result like an observation."""
         return reduced([reduced(key_rows)]) if len(key_rows) > 1 else reduced(key_rows)
 
-    previous_key, pending_rows = None, []
+    previous_key, pending_rows, pending_bytes = None, [], COPY_FRAME_BYTES
     async for row in rows:
         key = (row["resource_type"], row["resource_id"])
+        row_bytes = _reduction_row_bytes(row)
         storage._require(previous_key is None or key >= previous_key, "resource_order_changed")
         if pending_rows and key != previous_key:
             yield complete(pending_rows)
-            pending_rows = []
-        elif len(pending_rows) == _KEY_CHUNK_ROWS:
+            pending_rows, pending_bytes = [], COPY_FRAME_BYTES
+        elif pending_rows and (len(pending_rows) == _KEY_CHUNK_ROWS or pending_bytes + row_bytes > COPY_MAX_BYTES):
             pending_rows = [reduced(pending_rows)]
+            pending_bytes = COPY_FRAME_BYTES + _reduction_row_bytes(pending_rows[0])
         pending_rows.append(row)
+        pending_bytes += row_bytes
         previous_key = key
     if pending_rows:
         yield complete(pending_rows)
+
+
+def _reduction_row_bytes(row):
+    return copy_record_bytes(
+        tuple(
+            storage._encoded(storage._json(row[name])) if name == "payload_json" else row.get(name)
+            for name in RESOURCE_COLUMNS
+        )
+    )
 
 
 async def _reduced_witnesses(rows, dataset_id, release_id):
@@ -405,6 +418,10 @@ async def complete_generic_source_candidate(database, directory, candidate):
         previous = await storage._locked(connection, policy, identity, phases=("loading", "prepared"))
         storage._require(previous is not None, "preparation_required")
         await storage._verify_tables(connection, policy, previous)
+        if previous["contract"] == storage.NAMED_COMPACT_CONTRACT:
+            from process.provider_directory_compact_source_completion import complete
+
+            return await complete(publisher, previous, candidate, directory)
         if previous["phase"] == "prepared":
             return previous
         tables_by_root = dict(previous["tables"])
@@ -518,6 +535,8 @@ async def _relationships(connection, policy, binding_by_field):
 
 async def _prepare_final_tables(connection, policy, binding_by_field):
     """Finish bounds and reader grants on private heaps before any publication."""
+    if binding_by_field.get("contract") == storage.NAMED_COMPACT_CONTRACT:
+        return await storage.compact_storage.prepare_final_tables(connection, policy, binding_by_field)
     dataset_id = binding_by_field["identity"]["dataset_id"]
     literal = "'" + dataset_id.replace("'", "''") + "'"
     for root in storage.RELATIONS:
@@ -575,7 +594,7 @@ async def _finish_derived_indexes(connection, policy, binding_by_field):
 async def _validated_header(publisher, binding_by_field):
     """Re-read the original protected row after complete content admission."""
     connection, policy = publisher.connection, publisher.policy
-    if binding_by_field["contract"] != storage.NAMED_ISOLATED_CONTRACT:
+    if binding_by_field["contract"] not in storage.NAMED_CONTRACTS:
         actor = await connection.fetchrow("SELECT session_user::text AS session,current_user::text AS current")
         storage._require(
             actor["session"] == policy.publisher_role and actor["current"] == policy.owner_role,
@@ -620,6 +639,7 @@ def _validate_handoff_acquisition(header, identity):
 
 async def prepare_generic_source_handoff(publisher, binding_by_field):
     """Prepare exact detached inputs; a separate publisher must close all writers."""
+    storage._require(publisher is not None, "original_storage_publisher_required")
     storage._require(
         bound_publisher() is publisher and publisher.storage_binding is not None, "original_storage_publisher_required"
     )
@@ -649,14 +669,11 @@ async def prepare_generic_source_handoff(publisher, binding_by_field):
 
         await validate_cms_handoff_rows(connection, policy, binding_by_field)
     await _prepare_final_tables(connection, policy, binding_by_field)
+    binding_by_field = await compact_migration.release_conversion_inputs(connection, policy, binding_by_field)
     names_by_root = await _prepare_handoff_controls(connection, policy, binding_by_field)
-    for key in ("resource_input", "witness_input"):
-        await connection.execute(
-            f"DROP TABLE {storage_relation(policy.schema, binding_by_field['tables'][key]['name'])}"
-        )
-    names_by_root.update({root: binding_by_field["tables"][root]["name"] for root in storage.RELATIONS})
+    names_by_root.update(await _handoff_payload_names(connection, policy, binding_by_field))
     tables_by_root = {root: {"name": name} for root, name in names_by_root.items()}
-    if binding_by_field["contract"] != storage.NAMED_ISOLATED_CONTRACT:
+    if binding_by_field["contract"] not in storage.NAMED_CONTRACTS:
         captured = await storage._capture(connection, policy, list(names_by_root.values()))
         tables_by_root = {root: captured[name] for root, name in names_by_root.items()}
     handoff_by_field = {
@@ -677,6 +694,15 @@ async def prepare_generic_source_handoff(publisher, binding_by_field):
     await storage._store(connection, policy, binding_by_field["identity"], binding_by_field, handoff_by_field)
     await _verify_handoff_controls(connection, policy, handoff_by_field)
     return FHIRSourceCandidateHandoff(storage._encoded(handoff_by_field))
+
+
+async def _handoff_payload_names(connection, policy, binding):
+    """Resolve frozen payload names and retain compact observations."""
+    if binding["contract"] == storage.NAMED_COMPACT_CONTRACT:
+        return {root: table["name"] for root, table in binding["tables"].items()}
+    for key in ("resource_input", "witness_input"):
+        await connection.execute(f"DROP TABLE {storage_relation(policy.schema, binding['tables'][key]['name'])}")
+    return {root: binding["tables"][root]["name"] for root in storage.RELATIONS}
 
 
 async def _prepare_handoff_controls(connection, policy, binding_by_field):
@@ -958,7 +984,7 @@ async def validate_frozen_source_handoff(connection, directory, handoff, *, prot
     """
     storage._require(type(handoff) is FHIRSourceCandidateHandoff, "handoff_required")
     storage._require(
-        handoff.document.get("contract") in {storage.ISOLATED_CONTRACT, storage.NAMED_ISOLATED_CONTRACT},
+        handoff.document.get("contract") in {storage.ISOLATED_CONTRACT, *storage.NAMED_CONTRACTS},
         "ordinary_handoff_required",
     )
     return await _validate_frozen_source_handoff(
@@ -993,13 +1019,18 @@ async def _validate_frozen_source_handoff(connection, directory, handoff, *, pro
     document = handoff.document
     storage.validate_handoff_document(document, document.get("storage"))
     policy = SimpleNamespace(schema=document["storage"]["storage_schema"], owner_role=protected_owner_role)
-    is_named_storage = document["contract"] == storage.NAMED_ISOLATED_CONTRACT
+    is_named_storage = document["contract"] in storage.NAMED_CONTRACTS
     transaction_id = None if is_named_storage else await connection.fetchval("SELECT pg_current_xact_id()::text")
     relations = sorted(storage_relation(policy.schema, table["name"]) for table in document["tables"].values())
     await connection.execute("LOCK TABLE " + ",".join(relations) + " IN ACCESS SHARE MODE NOWAIT")
     if not is_named_storage:
         await _frozen_source_inventory(connection, policy, document)
     header = await _frozen_handoff_header(connection, policy, document)
+    if document["contract"] == storage.NAMED_COMPACT_CONTRACT:
+        from process import provider_directory_compact_source_completion as compact_completion
+
+        await compact_completion.validate_storage(connection, policy, document)
+        await compact_completion.validate_output_structure(connection, policy, document)
     for table in document["tables"].values():
         invalid = await connection.fetchval(
             f"SELECT EXISTS(SELECT FROM {storage_relation(policy.schema, table['name'])} WHERE dataset_id<>$1)",

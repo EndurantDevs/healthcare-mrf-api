@@ -49,6 +49,111 @@ async def test_current_family_refuses_partial_synonym_relationship_inventory(mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["missing", False, None])
+async def test_named_tables_refuse_missing_or_unsafe_structure(monkeypatch, failure):
+    session = _session()
+    session.scalar.return_value = failure
+    monkeypatch.setattr(native, "_lock_family", AsyncMock())
+    monkeypatch.setattr(native, "_relation_oid", AsyncMock(return_value=None if failure == "missing" else 1))
+    read_structure = AsyncMock()
+    columns = AsyncMock()
+    monkeypatch.setattr(storage, "_require_native_read_structure", read_structure)
+    monkeypatch.setattr(storage.binding, "_require_model_columns", columns)
+    with pytest.raises(RuntimeError, match="relation is unavailable|executable structure differs"):
+        await storage.require_tables(session, "serving", (CodeCatalog,))
+    native._lock_family.assert_awaited_once_with(session, "serving", ("code_catalog",), "ACCESS SHARE", nowait=True)
+    read_structure.assert_not_awaited()
+    columns.assert_not_awaited()
+    if failure == "missing":
+        session.scalar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("names", "functions"),
+    [
+        (["code_catalog"], False),
+        ([], False),
+        (["code_catalog", "unexpected"], False),
+        (["code_catalog"], True),
+        (["code_catalog"], None),
+    ],
+)
+async def test_named_candidate_requires_exact_heap_and_function_inventory(names, functions):
+    session = _session()
+    session.execute.return_value = SimpleNamespace(scalars=lambda: names)
+    session.scalar.return_value = functions
+    if names == ["code_catalog"] and functions is False:
+        await storage.require_inventory(session, "candidate", ("code_catalog",))
+    else:
+        with pytest.raises(RuntimeError, match="candidate object inventory differs"):
+            await storage.require_inventory(session, "candidate", ("code_catalog",))
+    assert all(str(call.args[0]).startswith("SELECT ") for call in session.execute.await_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("namespace", [False, True])
+async def test_native_privilege_destination_enumeration_is_bounded(namespace):
+    session = _session()
+    session.execute.return_value = SimpleNamespace(scalars=lambda: [f"reader_{index}" for index in range(2049)])
+    with pytest.raises(RuntimeError, match="privilege destinations exceed the bound"):
+        await storage._acl_grantees(session, "candidate", ("code_catalog",), namespace=namespace)
+    assert str(session.execute.await_args.args[0]).endswith("ORDER BY 1 LIMIT 2049")
+    session.scalar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_candidate_protection_keeps_its_owner_while_revoking_public_access(monkeypatch):
+    session = _session()
+    session.execute.return_value = SimpleNamespace(scalars=lambda: ["code"])
+    monkeypatch.setattr(native, "_lock_family", AsyncMock())
+    monkeypatch.setattr(storage, "_acl_grantees", AsyncMock(side_effect=[["catalog_owner"], []]))
+    settings = SimpleNamespace(owner_role="catalog_owner", reader_roles=())
+    await storage.protect_tables(session, "candidate", (CodeCatalog,), settings, candidate=True, nowait=False)
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert 'ALTER SCHEMA "candidate" OWNER TO "catalog_owner"' in statements
+    assert 'REVOKE ALL ON SCHEMA "candidate" FROM PUBLIC' in statements
+    assert not any(statement.startswith("REVOKE") and statement.endswith('"catalog_owner"') for statement in statements)
+    native._lock_family.assert_awaited_once_with(
+        session, "candidate", ("code_catalog",), "ACCESS EXCLUSIVE", nowait=False
+    )
+
+
+@pytest.mark.asyncio
+async def test_composition_requires_bounded_native_copy_before_allocating_candidate(monkeypatch):
+    stage = AsyncMock()
+    monkeypatch.setattr(storage, "create_stage", stage)
+    with pytest.raises(RuntimeError, match="bounded native COPY is required"):
+        await cutover._compose(_session(), {}, storage.MODELS, object())
+    stage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer", ["code-sets", "ms-drg"])
+async def test_rollback_refuses_exhausted_revision_before_update(importer):
+    logical_by_field = {"live_schema": "serving", "previous_generations": {importer: _generation()}}
+    session = _session()
+    with pytest.raises(RuntimeError, match="rollback generation is exhausted"):
+        await cutover._restore_generation(
+            session, logical_by_field, {importer: {"local_generation": 2**63 - 1}}, importer
+        )
+    session.execute.assert_not_awaited()
+    session.scalar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rollback_refuses_different_destination_before_locking(monkeypatch):
+    monkeypatch.setattr(retention, "require_retained", AsyncMock(return_value={"live_schema": "other"}))
+    family = AsyncMock()
+    monkeypatch.setattr(storage, "require_tables", family)
+    with pytest.raises(RuntimeError, match="rollback destination differs"):
+        await cutover.rollback(
+            _session(), {"retained": {"contract": retention.CONTRACT}}, SimpleNamespace(schema="serving")
+        )
+    family.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_composition_refuses_different_producer_before_current_state(monkeypatch):
     """A complete input from the wrong producer cannot enter composition or acquire current authority."""
     current = AsyncMock()

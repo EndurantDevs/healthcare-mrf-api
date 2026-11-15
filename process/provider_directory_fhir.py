@@ -168,6 +168,7 @@ from process.provider_directory_artifact_scope_projection import (
 )
 from process.provider_directory_backend_wal_diagnostic import BackendWalDiagnosticResult
 from process.provider_directory_cms_npd_recovery import candidate_available_sql
+from process.provider_directory_compact_source_migration import initialize_source_candidate, prepare_retained_prefix
 from process.provider_directory_dataset_rehydrate import (
     DEFAULT_BATCH_SIZE as DEFAULT_DATASET_REHYDRATE_BATCH_SIZE,
 )
@@ -61165,14 +61166,7 @@ async def _initialize_endpoint_dataset_candidate(
     candidate: EndpointDatasetCandidate,
     partition_initializations: tuple[LastUpdatedPartitionInitialization, ...],
 ) -> EndpointDatasetCandidate:
-    if partition_initializations:
-        initialized_candidate = await _ensure_endpoint_dataset_candidate(
-            candidate,
-            partition_initializations,
-        )
-    else:
-        initialized_candidate = await _ensure_endpoint_dataset_candidate(candidate)
-    return initialized_candidate if isinstance(initialized_candidate, EndpointDatasetCandidate) else candidate
+    return await initialize_source_candidate(sys.modules[__name__], candidate, partition_initializations)
 
 
 def _candidate_resource_scope(
@@ -67987,10 +67981,8 @@ async def _import_resources(
             return await replay_finalized_candidate(candidate, prepared_source_records)
         diagnostics_by_resource: dict[str, dict[str, Any]] = {}
         try:
-            import_summary = await import_one_group(
-                prepared_source_records,
-                group_resume_required,
-            )
+            await prepare_retained_prefix(sys.modules[__name__], candidate, resource_import_cancellation)
+            import_summary = await import_one_group(prepared_source_records, group_resume_required)
             diagnostics_by_resource = import_summary[1]
             if group_resume_required:
                 await resource_import_cancellation.check()
