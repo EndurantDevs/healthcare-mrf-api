@@ -23,6 +23,8 @@ SPOOL_ROOT_ENV = "HLTHPRT_PROVIDER_DIRECTORY_BULK_SPOOL_ROOT"
 READ_BYTES = 4 << 20
 # Each frame is fsynced and recorded, so a broken download resumes from its last whole frame.
 FRAME_BYTES = 256 << 20
+# Copies hold no database session, so an export's outputs download at once up to this many.
+MAX_DOWNLOADS = 32
 _RANGE_RE = re.compile(r"bytes=(\d+)-")
 
 

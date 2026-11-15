@@ -162,7 +162,10 @@ async def _spool_export(context):
         if validator is None:
             return "bulk_export_spool_validator_missing"
         spooled_outputs.append((output, spool.spooled_output(checkpoint_id, output.output_index, validator)))
-    # The shared transfer budget bounds how many downloads run at once.
+    # Every incomplete output downloads at once (up to MAX_DOWNLOADS): the link window bounds the download, not
+    # the parse. Throttling still halves the shared budget, and parsing keeps the source's output concurrency.
+    slots = state(directory, context.source_record)["requests"]
+    slots.limit = max(slots.limit, min(len(spooled_outputs), spool.MAX_DOWNLOADS))
     tasks = [asyncio.create_task(_spool_output(context, pair)) for pair in spooled_outputs]
     if not tasks:
         return None
