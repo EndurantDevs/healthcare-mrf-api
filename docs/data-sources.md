@@ -52,7 +52,11 @@ Other states use discovery-driven machine-readable extraction via FDA BeSafeRx l
 
 ## Code-set Publication
 
-`code-sets` uses native catalog handoff by default. Setting `HLTHPRT_CODE_SETS_PUBLICATION_MODE=legacy-mutable` explicitly selects publication into an existing ordinary-owned mutable catalog and requires a complete managed import attempt. This mode preserves the existing catalog heap and rows omitted from the current source feeds, and commits the source updates, result generation, and managed completion together. Storage or attempt validation failures stop publication.
+`code-sets` and `ms-drg` prepare isolated candidates and remain `finalizing` until a protected one-shot publisher commits the complete catalog exchange and managed completion. Code sets preserve omitted source keys. Both accepted `HLTHPRT_CODE_SETS_PUBLICATION_MODE` values (`native` and `legacy-mutable`) use this path; the compatibility selector no longer grants direct writes to serving tables. Standalone runs prepare candidates without publishing.
+
+The authenticated worker launcher accepts the `scoped-catalog-publisher` role only for the actual persisted run, attempt, node and expected logical generation. It creates one deterministic Job and preserves a failed Job and candidate for review. Job success alone does not complete the import. Ordinary importer and API roles require native SELECT-only access to published data, and the publisher runs separately with its own PostgreSQL configuration.
+
+The launcher references only the fixed `scoped-catalog-publisher` Secret and service account. Secret keys `dsn`, `schema`, `owner-role`, `reader-roles`, `copy-max-bytes` and `timeout-seconds` provide the corresponding `HLTHPRT_SCOPED_CATALOG_PUBLISHER_*` settings. All six settings are mandatory; there is no application-credential fallback. Reader roles are a JSON string array, native COPY is bounded to at most 2 GiB and the transaction timeout to at most 600 seconds. The protected command accepts only `--run-id`, `--attempt-id`, `--attempt-started-at`, `--node-id`, `--expected-lineage-id` and `--expected-generation`; it derives the importer and complete source-generation vector from the real managed handoff.
 
 ## Notes
 

@@ -155,12 +155,13 @@ async def publish_local_generation(session, schema: str, *, include_relationship
 
 
 async def read_current_generation(session, schema: str) -> dict:
-    """Reject drift between the publication receipt and serving rows/OIDs."""
+    """Reject data or structure drift while resolving the published family by name."""
+    from process.ms_drg_result_archive import _content
     from process.scoped_catalog_binding import pin_catalog_source
 
     qualified = _quoted(schema)
     await pin_catalog_source(session, schema, _MODELS, TABLE)
-    row = (
+    generation_record = (
         (
             await session.execute(
                 text(
@@ -172,9 +173,15 @@ async def read_current_generation(session, schema: str) -> dict:
         .mappings()
         .one_or_none()
     )
-    if row is None or row["origin_generation"] is None:
+    if generation_record is None or generation_record["origin_generation"] is None:
         raise RuntimeError("MS-DRG serving generation is unavailable")
     current = await capture_result(session, schema)
-    if current != row["receipt"]:
+    receipt = generation_record["receipt"]
+    if (
+        type(receipt) is not dict
+        or receipt.get("contract") != current["contract"]
+        or receipt.get("content_sha256") != current["content_sha256"]
+        or _content(receipt) != _content(current)
+    ):
         raise RuntimeError("MS-DRG serving result changed")
-    return dict(row)
+    return dict(generation_record)

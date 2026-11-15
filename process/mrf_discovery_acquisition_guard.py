@@ -19,7 +19,9 @@ IMPORTER = "mrf-source-discovery"
 ENGINE = "healthcare-mrf-api"
 MARKER = "mrf_acquisition"
 REPLACEMENT = "mrf_acquisition_replacement"
-DATASET_KEYS = ("database_oid", "control_run_oid", "source_oid", "payer_oid", "file_oid")
+DATASET_KEYS = ("control_relation", "source_relation", "payer_relation", "file_relation")
+LEGACY_DATASET_KEYS = frozenset({"database_oid", "control_run_oid", "source_oid", "payer_oid", "file_oid"})
+RELATION_PATTERN = r"[A-Za-z_][A-Za-z0-9_]{0,62}\.[A-Za-z_][A-Za-z0-9_]{0,62}"
 RUNNABLE = frozenset({"queued", "starting", "running"})
 CONTROL_RELATION_ENV = "HLTHPRT_MRF_ACQUISITION_CONTROL_RELATION"
 
@@ -44,8 +46,13 @@ def _dataset(value):
     return (
         isinstance(value, dict)
         and set(value) == set(DATASET_KEYS)
-        and all(type(item) is int and item > 0 for item in value.values())
+        and all(isinstance(item, str) and re.fullmatch(RELATION_PATTERN, item) for item in value.values())
     )
+
+
+def _dataset_matches(stored, current):
+    # Legacy physical fields are archived metadata, never evidence of a separate dataset.
+    return (isinstance(stored, dict) and set(stored) == LEGACY_DATASET_KEYS) or (_dataset(stored) and stored == current)
 
 
 def _relation(model):
@@ -55,33 +62,62 @@ def _relation(model):
 
 def _control_relation():
     configured = os.getenv(CONTROL_RELATION_ENV, "")
-    _require(re.fullmatch(r"[a-z_][a-z0-9_]{0,62}\.[a-z_][a-z0-9_]{0,62}", configured) is not None)
+    _require(re.fullmatch(RELATION_PATTERN, configured) is not None)
     return '"' + configured.replace(".", '"."') + '"'
 
 
 async def native_dataset_identity(connection, *, control_relation=None):
-    """Resolve configured relations; no saved runtime identity is an authority."""
+    """Read configured names using the connection's native PostgreSQL permissions."""
     control_relation = _control_relation() if control_relation is None else control_relation
-    row = await connection.fetchrow(
-        "SELECT (SELECT oid::bigint FROM pg_catalog.pg_database WHERE datname=current_database()) AS database_oid, "
-        "to_regclass($1)::oid::bigint AS control_run_oid, to_regclass($2)::oid::bigint AS source_oid, "
-        "to_regclass($3)::oid::bigint AS payer_oid, to_regclass($4)::oid::bigint AS file_oid, "
-        "has_table_privilege(to_regclass($1),'SELECT') AS can_read_control",
-        control_relation,
-        _relation(MRFSource),
-        _relation(MRFPayer),
-        _relation(MRFFile),
+    relations = (control_relation, _relation(MRFSource), _relation(MRFPayer), _relation(MRFFile))
+    dataset_by_name = {key: relation.replace('"', "") for key, relation in zip(DATASET_KEYS, relations)}
+    _require(_dataset(dataset_by_name))
+    _require(
+        all(
+            relation in (name, '"' + name.replace(".", '"."') + '"')
+            for relation, name in zip(relations, dataset_by_name.values())
+        )
     )
-    _require(row is not None and row["can_read_control"] is True)
-    dataset_by_name = {key: row[key] for key in DATASET_KEYS}
-    _require(all(type(value) is int and value > 0 for value in dataset_by_name.values()))
+    try:
+        for relation in dataset_by_name.values():
+            quoted = '"' + relation.replace(".", '"."') + '"'
+            await connection.fetchval(f"SELECT 1 FROM {quoted} LIMIT 0")
+    except Exception as exc:
+        raise ValueError("mrf_acquisition_not_admitted") from exc
     return dataset_by_name
 
 
 async def acquisition_dataset():
-    """Read the current native dataset for a discovery reservation."""
+    """Expose named scope alongside the deprecated health wire format."""
     async with db.acquire_driver() as connection:
-        return await native_dataset_identity(connection)
+        dataset = await native_dataset_identity(connection)
+        # Older clients echo these fields; current admission never compares them.
+        legacy = await connection.fetchrow(
+            "SELECT (SELECT oid::bigint FROM pg_catalog.pg_database WHERE datname=current_database()) AS database_oid, "
+            "to_regclass($1)::oid::bigint AS control_run_oid, to_regclass($2)::oid::bigint AS source_oid, "
+            "to_regclass($3)::oid::bigint AS payer_oid, to_regclass($4)::oid::bigint AS file_oid",
+            *('"' + dataset[key].replace(".", '"."') + '"' for key in DATASET_KEYS),
+        )
+        return {
+            "mrf_acquisition_dataset": dict(legacy),
+            "mrf_acquisition_dataset_v2": dataset if is_named_discovery_worker() else None,
+        }
+
+
+def is_named_discovery_worker():
+    """Only advertise named reservations to workers running this implementation."""
+    launcher = os.getenv("HLTHPRT_WORKER_LAUNCHER", "process").strip().lower()
+    if launcher == "process":
+        return True
+    image = (
+        os.getenv("HLTHPRT_MRF_SOURCE_DISCOVERY_WORKER_IMAGE", "").strip()
+        or os.getenv("HLTHPRT_WORKER_JOB_IMAGE", "").strip()
+    )
+    return (
+        launcher == "kubernetes"
+        and re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image) is not None
+        and image == os.getenv("HLTHPRT_RUNTIME_IMAGE_IDENTITY", "").strip()
+    )
 
 
 async def database_health(database):
@@ -89,10 +125,10 @@ async def database_health(database):
     try:
         await database.execute(text("SELECT 1"))
         try:
-            dataset = await acquisition_dataset()
+            dataset_fields_by_name = await acquisition_dataset()
         except Exception:
-            dataset = None
-        return {"ok": True, "mrf_acquisition_dataset": dataset}
+            dataset_fields_by_name = {"mrf_acquisition_dataset": None, "mrf_acquisition_dataset_v2": None}
+        return {"ok": True, **dataset_fields_by_name}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -103,7 +139,7 @@ def _reservation(run, request, dataset):
     _require(isinstance(marker, dict) and marker.get("schema") == "mrf-acquisition-v1")
     for field, expected in (("run_id", request.get("run_id")), ("importer", IMPORTER), ("engine", ENGINE)):
         _require(run.get(field) == marker.get(field) == expected)
-    _require(_dataset(marker.get("dataset")) and marker["dataset"] == dataset)
+    _require(_dataset_matches(marker.get("dataset"), dataset))
     _require(marker.get("idempotency_key") == request.get("idempotency_key") and bool(marker.get("idempotency_key")))
     _require(
         marker.get("params_digest")
@@ -137,7 +173,7 @@ async def _replacement_owner(connection, marker, dataset, control_relation):
     hold = metrics.get(REPLACEMENT)
     _require(metrics.get("catalog_sync_status") == "failed" and metrics.get("catalog_sync_attempt") == link["attempt"])
     _require(isinstance(hold, dict) and hold.get("schema") == "mrf-replacement-v1")
-    _require(hold.get("run_id") == marker["run_id"] and _dataset(hold.get("dataset")) and hold["dataset"] == dataset)
+    _require(hold.get("run_id") == marker["run_id"] and _dataset_matches(hold.get("dataset"), dataset))
     _require(all(hold.get(key) == link[key] for key in ("attempt", "old_digest", "command_id")))
     return old["run_id"]
 
@@ -145,19 +181,17 @@ async def _replacement_owner(connection, marker, dataset, control_relation):
 def _foreign_dataset_sql():
     dataset = "(r.metrics->'mrf_acquisition'->'dataset')"
     valid = " AND ".join(
-        f"jsonb_typeof({dataset}->'{key}')='number' AND {dataset}->>'{key}' ~ '^[1-9][0-9]*$'" for key in DATASET_KEYS
+        f"jsonb_typeof({dataset}->'{key}')='string' AND {dataset}->>'{key}' ~ '^{RELATION_PATTERN}$'"
+        for key in DATASET_KEYS
     )
     keys = ",".join("'" + key + "'" for key in DATASET_KEYS)
     disjoint = " AND ".join(
-        f"{dataset}->'{known}' <> $2::jsonb->'{target}'"
-        for known in ("source_oid", "payer_oid", "file_oid")
-        for target in ("source_oid", "payer_oid", "file_oid")
+        f"{dataset}->'{known}' <> $2::jsonb->'{target}'" for known in DATASET_KEYS[1:] for target in DATASET_KEYS[1:]
     )
     return (
         f"r.metrics->'mrf_acquisition'->>'schema'='mrf-acquisition-v1' AND jsonb_typeof({dataset})='object' "
         f"AND {dataset} ?& ARRAY[{keys}] AND {dataset} - ARRAY[{keys}] = '{{}}'::jsonb AND {valid} "
-        f"AND {dataset}->'database_oid' = $2::jsonb->'database_oid' "
-        f"AND {dataset}->'control_run_oid' = $2::jsonb->'control_run_oid' AND {disjoint}"
+        f"AND {dataset}->'control_relation' = $2::jsonb->'control_relation' AND {disjoint}"
     )
 
 

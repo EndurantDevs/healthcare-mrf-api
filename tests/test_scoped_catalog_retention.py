@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Exact retained authority serialization, native readback and bounded cleanup contracts."""
+"""Logical retained records, native readback and bounded exact-name cleanup."""
 
-import hashlib
 from copy import deepcopy
 from datetime import datetime
 from types import SimpleNamespace
@@ -11,147 +10,42 @@ from uuid import UUID
 import pytest
 
 from process import reference_family_archive as native
-from process import scoped_catalog_binding as binding
+from process import scoped_catalog_named_retention as named
 from process import scoped_catalog_retention as retention
-
-
-def _signed(receipt):
-    receipt_by_field = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
-    receipt_by_field["receipt_sha256"] = hashlib.sha256(
-        retention.canonical_metadata(receipt_by_field).encode()
-    ).hexdigest()
-    return receipt_by_field
+from tests.test_scoped_catalog_handoff import _generation
 
 
 def _receipt():
-    return _signed(
-        {
-            "contract": retention.CONTRACT,
-            "importer": "code-sets",
-            "dataset_id": str(UUID(int=1)),
-            "schema_name": native.reference_family_predecessor_schema(UUID(int=1)),
-            "schema_oid": 10,
-            "owner_oid": 11,
-            "database_oid": 12,
-            "live_schema": "serving",
-            "generation_table": "code_sets_result_generation",
-            "generation_oid": 14,
-            "previous_generations": {"code-sets": {"local_generation": 0}},
-            "current_generation": {"local_generation": 1},
-            "tables": [
-                {
-                    "table": "code_catalog",
-                    "relation_oid": 13,
-                    "row_count": 2,
-                    "row_sha256": "a" * 64,
-                    "schema_sha256": "b" * 64,
-                }
-            ],
-            "published_oids": [["code_catalog", 23]],
-            "publication_handoff_sha256": None,
-        }
-    )
+    before = _generation()
+    after_by_field = {**before, "local_generation": 1}
+    return {
+        "contract": named.CONTRACT,
+        "importer": "code-sets",
+        "dataset_id": str(UUID(int=1)),
+        "schema_name": native.reference_family_predecessor_schema(UUID(int=1)),
+        "live_schema": "serving",
+        "generation_table": "code_sets_result_generation",
+        "previous_generations": {"code-sets": before},
+        "published_generations": {"code-sets": after_by_field},
+        "publication_handoff_sha256": "c" * 64,
+        "tables": [{"table": "code_catalog", "row_count": 2, "row_sha256": "a" * 64, "schema_sha256": "b" * 64}],
+    }
 
 
 @pytest.mark.parametrize("unsupported", [object(), datetime(2026, 1, 1)])
-def test_metadata_refuses_unsupported_or_timezone_free_authority(unsupported):
-    """Durable authority never silently stringifies unsupported values or ambiguous timestamps."""
+def test_metadata_refuses_unsupported_or_timezone_free_values(unsupported):
     with pytest.raises(TypeError, match="unsupported catalog metadata scalar"):
         retention.canonical_metadata({"published_at": unsupported})
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["namespace", "generation"])
-async def test_retention_refuses_wrong_namespace_or_changed_source_generation(monkeypatch, failure):
-    """Retained authority must use its owned predecessor and the exact captured source singleton."""
-    from tests.test_scoped_catalog_publication import _prepared
-
-    prepared = _prepared()
-    schema = native.reference_family_predecessor_schema(prepared.ownership.dataset_id)
-    copy = AsyncMock(return_value={"local_generation": 9})
-    monkeypatch.setattr(retention, "copy_generation_authority", copy)
-    monkeypatch.setattr(retention, "generation_value", lambda _generation: {"local_generation": 0})
-    session = SimpleNamespace(execute=AsyncMock())
-    with pytest.raises(native.ReferenceFamilyArchiveError, match="namespace differs|generation differs"):
-        await retention.retain_catalog_authority(session, prepared, "other" if failure == "namespace" else schema)
-    if failure == "namespace":
-        copy.assert_not_awaited()
-    else:
-        copy.assert_awaited_once_with(session, prepared.importer, "serving", schema)
-    session.execute.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["bound", "cas"])
-async def test_retained_finish_refuses_oversized_or_changed_authority_before_sealing(monkeypatch, failure):
-    """Final authority is bounded and compare-and-set fenced before immutable storage is sealed."""
-    from process import scoped_catalog_publication as publication
-
+def test_retained_json_roundtrip_preserves_input_and_checks_destination():
     receipt = _receipt()
-    session = SimpleNamespace(scalar=AsyncMock(return_value=None), execute=AsyncMock())
-    seal = AsyncMock()
-    monkeypatch.setattr(publication, "_seal_candidate", seal)
-    if failure == "bound":
-        receipt["extra"] = "x" * 65536
-    with pytest.raises(native.ReferenceFamilyArchiveError, match="exceeds its bound|authority changed"):
-        await retention.finish_catalog_authority(
-            session, SimpleNamespace(owner_oid=11), receipt, {"local_generation": 1}
-        )
-    if failure == "bound":
-        session.scalar.assert_not_awaited()
-    else:
-        assert "retained_family IS NULL RETURNING id" in str(session.scalar.await_args.args[0])
-    seal.assert_not_awaited()
-    session.execute.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_retained_finish_preserves_composite_importer_and_exact_custody_inventory(monkeypatch):
-    from process import scoped_catalog_publication as publication
-
-    receipt = _receipt()
-    prepared = SimpleNamespace(spec=publication.input_spec(receipt["importer"]), owner_oid=receipt["owner_oid"])
-    session = SimpleNamespace(scalar=AsyncMock(return_value=1), execute=AsyncMock())
-    seal, readback = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(publication, "_seal_candidate", seal)
-    monkeypatch.setattr(retention, "require_retained_catalog", readback)
-    await retention.finish_catalog_authority(session, prepared, receipt, {"local_generation": 1})
-    original, ownership, owner = seal.await_args.args
-    assert original is session and owner == receipt["owner_oid"]
-    assert ownership.importer_id == prepared.spec.importer_id == "scoped-catalog"
-    assert ownership.schema_name == receipt["schema_name"] and ownership.schema_oid == receipt["schema_oid"]
-    assert ownership.relation_oids == (("code_catalog", 13), ("code_sets_result_generation", 14))
-    assert ownership.sequence_oids == ()
-    readback.assert_awaited_once_with(session, receipt)
-
-
-@pytest.mark.parametrize("tables", [None, [None]])
-def test_retained_authority_refuses_non_table_receipts(tables):
-    """Re-signing cannot turn a malformed table inventory into native retained authority."""
-    receipt = _receipt()
-    receipt["tables"] = tables
-    with pytest.raises(native.ReferenceFamilyArchiveError, match="tables differ"):
-        retention.validate_retained_catalog(_signed(receipt))
-
-
-def _session(receipt):
-    async def scalar(statement, _parameters=None):
-        if "current_database()" in str(statement):
-            return receipt["database_oid"]
-        if "retained_family" in str(statement):
-            return receipt
-        raise AssertionError(str(statement))
-
-    return SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(side_effect=scalar), execute=AsyncMock())
-
-
-def test_retained_json_roundtrip_has_no_authority_side_effect():
-    receipt = _receipt()
+    before = deepcopy(receipt)
     assert retention.validate_retained_catalog(receipt, importer="code-sets", live_schema="serving") is receipt
-    with pytest.raises(native.ReferenceFamilyArchiveError, match="importer"):
-        retention.validate_retained_catalog(receipt, importer="ms-drg")
-    with pytest.raises(native.ReferenceFamilyArchiveError, match="destination"):
-        retention.validate_retained_catalog(receipt, live_schema="other")
+    assert receipt == before
+    for options in ({"importer": "ms-drg"}, {"live_schema": "other"}):
+        with pytest.raises(RuntimeError, match="destination"):
+            retention.validate_retained_catalog(receipt, **options)
 
 
 @pytest.mark.parametrize(
@@ -160,100 +54,105 @@ def test_retained_json_roundtrip_has_no_authority_side_effect():
         ("contract", "other"),
         ("importer", "other"),
         ("schema_name", "serving"),
-        ("schema_oid", True),
-        ("owner_oid", 0),
-        ("database_oid", 2**32),
-        ("generation_oid", 13),
         ("generation_table", "code_catalog"),
         ("previous_generations", {}),
-        ("current_generation", []),
+        ("published_generations", {}),
         ("tables", []),
-        ("published_oids", [["code_catalog", True]]),
-        ("published_oids", [["other", 23]]),
+        ("tables", None),
+        ("tables", [None]),
         ("publication_handoff_sha256", True),
         ("publication_handoff_sha256", "x" * 64),
     ],
 )
-def test_retained_parser_refuses_re_signed_bad_inventory(field, replacement):
+def test_retained_parser_refuses_wrong_logical_scope(field, replacement):
     receipt = _receipt()
     receipt[field] = replacement
-    with pytest.raises(native.ReferenceFamilyArchiveError):
-        retention.validate_retained_catalog(_signed(receipt))
+    with pytest.raises((RuntimeError, KeyError, TypeError, ValueError)):
+        retention.validate_retained_catalog(receipt)
 
 
-@pytest.mark.parametrize("field,replacement", [("row_count", True), ("row_sha256", "x" * 64), ("relation_oid", -1)])
-def test_retained_parser_refuses_invalid_table_receipt(field, replacement):
+@pytest.mark.parametrize(
+    "field,replacement", [("row_count", True), ("row_count", -1), ("row_sha256", "x" * 64), ("schema_sha256", "bad")]
+)
+def test_retained_parser_refuses_invalid_data_receipt(field, replacement):
     receipt = _receipt()
     receipt["tables"][0][field] = replacement
-    with pytest.raises(native.ReferenceFamilyArchiveError, match="table receipt"):
-        retention.validate_retained_catalog(_signed(receipt))
+    with pytest.raises(RuntimeError, match="receipt differs"):
+        retention.validate_retained_catalog(receipt)
 
 
-def _native_boundaries(monkeypatch, receipt):
-    pairs = (("code_catalog", 13), ("code_sets_result_generation", 14))
-    monkeypatch.setattr(native, "_lock_family", AsyncMock())
-    monkeypatch.setattr(native, "_schema_oid", AsyncMock(return_value=receipt["schema_oid"]))
-    monkeypatch.setattr(native, "_relation_oid", AsyncMock(side_effect=lambda _s, _schema, name: dict(pairs)[name]))
-    monkeypatch.setattr(
-        native, "_namespace_relations", AsyncMock(return_value=[{"oid": oid, "relkind": "r"} for _, oid in pairs])
-    )
-    monkeypatch.setattr(binding, "require_closed_catalog_binding", AsyncMock(return_value=receipt["owner_oid"]))
-    monkeypatch.setattr(native, "require_native_read_catalog", AsyncMock())
-    monkeypatch.setattr(
-        retention, "_read_retained_generation", AsyncMock(return_value=receipt["previous_generations"]["code-sets"])
-    )
-    monkeypatch.setattr(retention, "_family_receipts", AsyncMock(return_value=receipt["tables"]))
+def test_old_retained_record_uses_logical_fields_without_rewriting_copied_metadata():
+    receipt = _receipt()
+    receipt["contract"] = "scoped-catalog-retained.v1"
+    receipt["current_generation"] = receipt.pop("published_generations")["code-sets"]
+    receipt.update(database_oid=99, owner_oid=98, schema_oid=97, generation_oid=96, receipt_sha256="old")
+    receipt["tables"][0]["relation_oid"] = 95
+    original = deepcopy(receipt)
+    logical = named.logical_receipt(receipt)
+    assert logical["published_generations"]["code-sets"] == receipt["current_generation"]
+    assert logical["tables"][0] == _receipt()["tables"][0]
+    assert receipt == original
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "changed", [None, "namespace", "heap", "extra", "owner", "native", "singleton", "content", "persisted", "database"]
-)
-async def test_retained_authority_requires_native_readback(monkeypatch, changed):
+@pytest.mark.parametrize("failure", ["bound", "cas"])
+async def test_retained_record_refuses_oversize_or_existing_slot_before_grants(monkeypatch, failure):
     receipt = _receipt()
-    session = _session(receipt)
-    _native_boundaries(monkeypatch, receipt)
-    if changed == "namespace":
-        native._schema_oid.return_value = 99
-    if changed == "heap":
-        native._relation_oid.side_effect = None
-        native._relation_oid.return_value = 99
-    if changed == "extra":
-        native._namespace_relations.return_value.append({"oid": 99, "relkind": "r"})
-    if changed == "owner":
-        binding.require_closed_catalog_binding.return_value = 99
-    if changed == "native":
-        native.require_native_read_catalog.side_effect = native.ReferenceFamilyArchiveError("unsafe native catalog")
-    if changed == "singleton":
-        retention._read_retained_generation.return_value = {"local_generation": 1}
-    if changed == "content":
-        retention._family_receipts.return_value = []
-    if changed == "persisted":
-        session.scalar = AsyncMock(side_effect=[12, {}])
-    if changed == "database":
-        session.scalar = AsyncMock(return_value=99)
-    if changed:
-        with pytest.raises(native.ReferenceFamilyArchiveError):
+    if failure == "bound":
+        receipt["extra"] = "x" * 65536
+    session = SimpleNamespace(scalar=AsyncMock(return_value=None), execute=AsyncMock())
+    protect = AsyncMock()
+    monkeypatch.setattr(named.storage, "protect_tables", protect)
+    with pytest.raises(RuntimeError, match="bound|already exists"):
+        await named.record_retained(session, receipt, object())
+    protect.assert_not_awaited()
+    if failure == "bound":
+        session.execute.assert_not_awaited()
+    else:
+        assert "retained_family IS NULL RETURNING id" in str(session.scalar.await_args.args[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "generation", "content", "persisted", "receipt"])
+async def test_retained_readback_compares_actual_content_and_generations(monkeypatch, change):
+    receipt = _receipt()
+    persisted = deepcopy(receipt)
+    if change == "persisted":
+        persisted["tables"][0]["row_count"] = 3
+    session = SimpleNamespace(scalar=AsyncMock(return_value=persisted), execute=AsyncMock())
+    vector = deepcopy(receipt["previous_generations"])
+    if change == "generation":
+        vector["code-sets"]["local_generation"] = 1
+    monkeypatch.setattr(named.generations, "read_generations", AsyncMock(return_value=vector))
+    monkeypatch.setattr(
+        named.storage, "table_receipts", AsyncMock(return_value=[] if change == "content" else receipt["tables"])
+    )
+    validate = AsyncMock(side_effect=RuntimeError("source receipt differs") if change == "receipt" else None)
+    monkeypatch.setattr(named.generations, "validate_published_content", validate)
+    if change:
+        with pytest.raises(RuntimeError, match="differs"):
             await retention.require_retained_catalog(session, receipt)
     else:
         assert await retention.require_retained_catalog(session, receipt) is receipt
-        binding.require_closed_catalog_binding.assert_awaited_once_with(
-            session, receipt["schema_name"], (("code_catalog", 13), ("code_sets_result_generation", 14))
-        )
+    if change in (None, "receipt"):
+        validate.assert_awaited_once_with(session, receipt["schema_name"], receipt["previous_generations"])
+    else:
+        validate.assert_not_awaited()
     session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("refusal", [None, "authority", "serving", "pinned", "recheck"])
-async def test_retained_cleanup_has_no_unbound_drop(monkeypatch, refusal):
-    receipt, session = _receipt(), _session(_receipt())
-    require = AsyncMock(return_value=receipt)
-    if refusal == "authority":
-        require.side_effect = native.ReferenceFamilyArchiveError("authority refused")
+@pytest.mark.parametrize("refusal", [None, "record", "pinned", "recheck"])
+async def test_retained_cleanup_rechecks_after_lock_before_exact_restrict_drops(monkeypatch, refusal):
+    receipt = _receipt()
+    session = SimpleNamespace(execute=AsyncMock())
+    logical = named.logical_receipt(receipt)
+    require = AsyncMock(return_value=logical)
+    if refusal == "record":
+        require.side_effect = RuntimeError("record refused")
     elif refusal == "recheck":
-        require.side_effect = [receipt, native.ReferenceFamilyArchiveError("authority changed")]
-    monkeypatch.setattr(retention, "require_retained_catalog", require)
-    monkeypatch.setattr(native, "_relation_oid", AsyncMock(return_value=13 if refusal == "serving" else 23))
+        require.side_effect = [logical, RuntimeError("record changed")]
+    monkeypatch.setattr(named, "require_retained", require)
     monkeypatch.setattr(
         native, "_lock_family", AsyncMock(side_effect=RuntimeError("reader pinned") if refusal == "pinned" else None)
     )
@@ -269,10 +168,3 @@ async def test_retained_cleanup_has_no_unbound_drop(monkeypatch, refusal):
             f'DROP TABLE "{receipt["schema_name"]}"."code_sets_result_generation" RESTRICT',
             f'DROP SCHEMA "{receipt["schema_name"]}" RESTRICT',
         ]
-
-
-def test_retained_digest_detects_inventory_edit():
-    receipt = deepcopy(_receipt())
-    receipt["tables"][0]["row_count"] += 1
-    with pytest.raises(native.ReferenceFamilyArchiveError, match="digest"):
-        retention.validate_retained_catalog(receipt)

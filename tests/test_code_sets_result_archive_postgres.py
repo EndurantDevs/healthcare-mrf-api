@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 from contextlib import asynccontextmanager
@@ -22,7 +21,7 @@ from db.models import CodeCatalog, ImportRun
 from process import code_sets_result_archive as archive
 from process import reference_family_archive as native
 from process.scoped_catalog_retention import cleanup_retained_catalog
-from tests.scoped_catalog_native_fixture import catalog_actors, seal_catalog
+from tests.scoped_catalog_native_fixture import catalog_actors, configure_catalog_publisher, seal_catalog
 
 
 def _copy():
@@ -59,7 +58,7 @@ async def test_cleanup_rejects_stage_namespace_not_derived_from_dataset():
     )
     stage = archive.CodeSetsStage(uuid4(), "unrelated_schema", 1, 2, source, len(archive.SOURCES), "a" * 64)
     session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
-    with pytest.raises(archive.CodeSetsArchiveError, match="stage identity is invalid"):
+    with pytest.raises(archive.CodeSetsArchiveError, match="stage logical name differs"):
         await archive.cleanup_stage(session, stage)
     session.execute.assert_not_awaited()
 
@@ -73,7 +72,7 @@ def _dsn():
         url.drivername != "postgresql"
         or url.username != "postgres"
         or url.host not in {"127.0.0.1", "localhost"}
-        or url.port not in {5432, 5440}
+        or not 1024 <= (url.port or 0) <= 65535
     ):
         pytest.fail("code-set archive test requires a dedicated local PostgreSQL database")
     if not re.fullmatch(r"hc_scoped_reference_[0-9a-f]{32}", url.database or ""):
@@ -239,7 +238,7 @@ async def _assert_activation_and_rollback(sessions, destination, prepared):
 
 
 @pytest.mark.asyncio
-async def test_scoped_archive_merge_rollback_and_foreign_conflict():
+async def test_scoped_archive_merge_rollback_and_foreign_conflict(monkeypatch):
     """Merge only owned rows, retain unrelated rows, and roll back atomically."""
     engine = create_async_engine(_dsn())
     sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -249,6 +248,7 @@ async def test_scoped_archive_merge_rollback_and_foreign_conflict():
     owned_schemas = [source, destination, archive.stage_schema(dataset_id)]
     try:
         async with catalog_actors(engine, owned_schemas) as actors:
+            configure_catalog_publisher(monkeypatch, actors, destination)
             await _setup(engine, source)
             await _setup(engine, destination)
             await _seed_merge_catalogs(sessions, source, destination)
@@ -362,7 +362,7 @@ async def _assert_drift_rejected_and_restored(sessions, destination, stage, expe
 
 
 @pytest.mark.asyncio
-async def test_tracked_predecessor_and_drifted_source_fail_closed():
+async def test_tracked_predecessor_and_drifted_source_fail_closed(monkeypatch):
     """Reject foreign predecessors and drift before activation or rollback."""
     engine = create_async_engine(_dsn())
     sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -372,6 +372,7 @@ async def test_tracked_predecessor_and_drifted_source_fail_closed():
     owned_schemas = [source, destination, archive.stage_schema(dataset_id)]
     try:
         async with catalog_actors(engine, owned_schemas) as actors:
+            configure_catalog_publisher(monkeypatch, actors, destination)
             await _setup(engine, source)
             await _setup(engine, destination)
             await _seed_tracked_catalogs(sessions, source, destination)
@@ -418,7 +419,7 @@ async def _restored_preparation(sessions, destination, original, receive_id):
 
 
 @pytest.mark.asyncio
-async def test_precreated_two_relation_stage_validates_after_restore():
+async def test_precreated_two_relation_stage_validates_after_restore(monkeypatch):
     """Authenticate the registered frozen restore before a genuine publisher swaps it."""
     engine = create_async_engine(_dsn())
     sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -428,6 +429,7 @@ async def test_precreated_two_relation_stage_validates_after_restore():
     owned_schemas = [source_schema, destination, archive.stage_schema(source_id), archive.stage_schema(receive_id)]
     try:
         async with catalog_actors(engine, owned_schemas) as actors:
+            configure_catalog_publisher(monkeypatch, actors, destination)
             await _setup(engine, source_schema)
             await _setup(engine, destination)
             await _seed_code_generation(sessions, source_schema, "23")
@@ -453,7 +455,6 @@ async def test_precreated_two_relation_stage_validates_after_restore():
 
 @asynccontextmanager
 async def _code_sets_cancel_fixture(monkeypatch, *, legacy=True):
-    from api import control_imports
     from tests import test_code_sets_publication_postgres as publication
 
     engine = create_async_engine(_dsn())

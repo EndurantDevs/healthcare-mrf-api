@@ -358,6 +358,32 @@ async def test_direct_mutable_publisher_revalidates_attempt_before_transaction(m
     transaction.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_legacy_mode_uses_isolated_handoff_without_a_live_write(monkeypatch):
+    context_by_field = {
+        "context": {
+            "control_run_id": "synthetic-run",
+            "_control_attempt_id": "synthetic-attempt",
+            "_control_attempt_started_at": "2026-01-01",
+        }
+    }
+    expected_by_field = {"generations": {"code-sets": {"local_generation": 0}}, "tables": []}
+    context_by_field["context"][mutable.named._CONTEXT_EXPECTED] = expected_by_field
+    prepared = AsyncMock(return_value={"status": "finalizing"})
+    monkeypatch.setattr(mutable.named, "prepare", prepared)
+    payloads = [{"source": source, "code_system": system} for source, system in mutable.codes.SOURCES]
+    assert await mutable.publish_mutable_code_sets(
+        code_sets.db, context_by_field, schema="mrf", payloads=payloads, metrics={}, expected=expected_by_field
+    ) == {"status": "finalizing"}
+    assert prepared.await_args.kwargs["payloads"] == {"code_catalog": payloads}
+    prepared.reset_mock()
+    with pytest.raises(RuntimeError, match="generation changed"):
+        await mutable.publish_mutable_code_sets(
+            code_sets.db, context_by_field, schema="mrf", payloads=payloads, metrics={}, expected={}
+        )
+    prepared.assert_not_awaited()
+
+
 def test_mutable_committed_result_uses_the_existing_terminal_projection():
     from process.control_lifecycle import _committed_target_result
 
@@ -368,55 +394,6 @@ def test_mutable_committed_result_uses_the_existing_terminal_projection():
     assert _committed_target_result(context_by_field, target_module="process.code_sets") == result_by_field
     context_by_field["context"]["control_run_terminal_committed"] = False
     assert _committed_target_result(context_by_field, target_module="process.code_sets") is None
-
-
-@pytest.fixture
-def mutable_completion():
-    attempt_by_field = {
-        "run_id": "synthetic-run",
-        "attempt_id": "synthetic-attempt",
-        "attempt_started_at": "2026-01-01",
-    }
-    storage_by_field = {"database_oid": 11, "schema_oid": 12, "owner_oid": 13, "relation_oids": (14, 15, 16)}
-    receipt_by_field = mutable._publication_receipt(attempt_by_field, storage_by_field, {"local_generation": 1}, {}, 3)
-    row_by_field = {
-        "status": "succeeded",
-        "phase_detail": "code sets published",
-        "error": None,
-        "heartbeat_at": datetime(2026, 1, 1, tzinfo=UTC),
-        "finished_at": datetime(2026, 1, 1, tzinfo=UTC),
-        "metrics": {mutable.METRIC: receipt_by_field},
-    }
-    return attempt_by_field, storage_by_field, row_by_field
-
-
-@pytest.mark.parametrize(
-    "path,value",
-    [
-        (("status",), "running"),
-        (("phase_detail",), "different phase"),
-        (("error",), {"code": "synthetic-error"}),
-        (("heartbeat_at",), None),
-        (("finished_at",), "2026-01-01"),
-        (("metrics",), {}),
-        (("metrics", mutable.METRIC), []),
-        (("metrics", mutable.METRIC, "contract"), "different-contract"),
-        (("metrics", mutable.METRIC, "attempt"), {}),
-        (("metrics", mutable.METRIC, "storage"), {}),
-        (("metrics", mutable.METRIC, "status"), "running"),
-        (("metrics", mutable.METRIC, "publication_mode"), "different-mode"),
-        (("metrics", mutable.METRIC, "generation"), {"local_generation": 2}),
-    ],
-)
-def test_mutable_completion_refuses_changed_durable_postimages(mutable_completion, path, value):
-    attempt_by_field, storage_by_field, row_by_field = mutable_completion
-    expected = deepcopy(row_by_field["metrics"][mutable.METRIC])
-    target = row_by_field
-    for name in path[:-1]:
-        target = target[name]
-    target[path[-1]] = value
-    with pytest.raises(RuntimeError, match="committed attempt differs"):
-        mutable._confirmed(row_by_field, attempt_by_field, storage_by_field, expected)
 
 
 @pytest.mark.parametrize("bound", ["empty", "rows", "bytes", "source"])
@@ -433,118 +410,6 @@ def test_mutable_payload_bounds_refuse_invalid_batches(bound):
         payloads[0]["source"] = "different-source"
     with pytest.raises(RuntimeError, match="input scope or bound differs"):
         mutable._validate_payloads(payloads)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "status,has_receipt,changed_check,expected_error",
-    [
-        ("succeeded", True, 0, "reconciliation storage changed"),
-        ("succeeded", True, 1, "reconciliation storage changed"),
-        ("failed", False, None, "commit outcome differs"),
-        ("running", True, None, "commit outcome differs"),
-        ("running", False, None, None),
-        ("canceling", False, None, None),
-        ("canceled", False, None, None),
-        ("succeeded", True, None, None),
-    ],
-)
-async def test_mutable_reconciliation_requires_stable_storage_and_exact_outcome(
-    monkeypatch, mutable_completion, status, has_receipt, changed_check, expected_error
-):
-    attempt_by_field, storage_by_field, row_by_field = mutable_completion
-    expected = deepcopy(row_by_field["metrics"][mutable.METRIC])
-    row_by_field["status"] = status
-    if not has_receipt:
-        row_by_field["metrics"] = {}
-    storage_observations = [storage_by_field, storage_by_field]
-    if changed_check is not None:
-        storage_observations[changed_check] = {**storage_by_field, "database_oid": 99}
-    session = Mock(execute=AsyncMock(), scalar=AsyncMock(return_value="pg_catalog,pg_temp"))
-
-    @asynccontextmanager
-    async def transaction():
-        yield session
-
-    database = Mock(transaction=transaction)
-    storage_reader = AsyncMock(side_effect=storage_observations)
-    run_reader = AsyncMock(return_value=row_by_field)
-    monkeypatch.setattr(mutable, "_mutable_storage", storage_reader)
-    monkeypatch.setattr(mutable, "_run", run_reader)
-    if expected_error is not None:
-        with pytest.raises(RuntimeError, match=expected_error):
-            await mutable._reconcile(database, "mrf", attempt_by_field, storage_by_field, expected)
-    else:
-        assert await mutable._reconcile(database, "mrf", attempt_by_field, storage_by_field, expected) == row_by_field
-    assert run_reader.await_count == (0 if changed_check == 0 else 1)
-    if run_reader.await_count:
-        run_reader.assert_awaited_once_with(session, "mrf", attempt_by_field, lock="SHARE", allow_cancel=True)
-    statements = [str(execution.args[0]) for execution in session.execute.await_args_list]
-    assert "SET LOCAL lock_timeout='30s'" in statements
-    assert "SET LOCAL statement_timeout='30s'" in statements
-
-
-@pytest.mark.asyncio
-async def test_mutable_reconciliation_propagates_a_completed_cancellation(monkeypatch):
-    reconcile = AsyncMock(side_effect=asyncio.CancelledError())
-    monkeypatch.setattr(mutable, "_reconcile", reconcile)
-    with pytest.raises(asyncio.CancelledError):
-        await mutable._await_reconciliation(None, "mrf", {}, {}, {})
-    reconcile.assert_awaited_once_with(None, "mrf", {}, {}, {})
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["running", "succeeded", "failed", "finished", "wrong-receipt"])
-async def test_mutable_acquisition_captures_freshness_or_returns_exact_completion(
-    monkeypatch, mutable_completion, outcome
-):
-    attempt_by_field, storage_by_field, row_by_field = mutable_completion
-    if outcome != "succeeded":
-        row_by_field = {**row_by_field, "status": "running", "finished_at": None}
-    if outcome == "failed":
-        row_by_field["status"] = "failed"
-    if outcome == "finished":
-        row_by_field["finished_at"] = datetime(2026, 1, 1, tzinfo=UTC)
-    if outcome == "wrong-receipt":
-        row_by_field.update(status="succeeded", finished_at=datetime(2026, 1, 1, tzinfo=UTC))
-        row_by_field["metrics"][mutable.METRIC]["contract"] = "different-contract"
-    session = Mock(execute=AsyncMock(), scalar=AsyncMock(return_value="pg_catalog,pg_temp"))
-
-    @asynccontextmanager
-    async def transaction():
-        yield session
-
-    database = Mock(transaction=transaction)
-    database._transaction_binding.return_value = None
-    database._reader_binding.return_value = None
-    monkeypatch.setattr(mutable, "_lock_mutable_storage", AsyncMock(return_value=storage_by_field))
-    monkeypatch.setattr(mutable, "_run", AsyncMock(return_value=row_by_field))
-    generation = AsyncMock(return_value={"local_generation": 0})
-    monkeypatch.setattr(mutable.codes, "read_generation", generation)
-    context_by_field = {
-        "context": {
-            "control_run_id": attempt_by_field["run_id"],
-            "_control_attempt_id": attempt_by_field["attempt_id"],
-            "_control_attempt_started_at": attempt_by_field["attempt_started_at"],
-        }
-    }
-    if outcome in {"failed", "finished", "wrong-receipt"}:
-        with pytest.raises(RuntimeError, match="not running|committed attempt differs"):
-            await mutable.capture_mutable_code_sets(database, context_by_field, schema="mrf")
-        generation.assert_not_awaited()
-    else:
-        captured, completed = await mutable.capture_mutable_code_sets(database, context_by_field, schema="mrf")
-        if outcome == "running":
-            assert captured == {
-                "storage": mutable.generation_value(storage_by_field),
-                "generation": {"local_generation": 0},
-            }
-            assert completed is None
-            generation.assert_awaited_once_with(session, "mrf", lock=True)
-        else:
-            assert captured is None and completed == row_by_field["metrics"][mutable.METRIC]
-            assert context_by_field["context"]["control_run_terminal_committed"] is True
-            generation.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -566,170 +431,6 @@ async def test_mutable_import_returns_completion_before_downloading(monkeypatch)
     assert await code_sets.import_code_sets(_control_context=context_by_field) == completed_by_field
     download.assert_not_called()
     publish.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["type", "generated", "identity", "default", "singleton", "id-default"])
-async def test_mutable_generation_shape_requires_ordinary_columns_and_one_generation(change):
-    columns = [
-        ["id", "smallint", True, "", "", False],
-        ["local_lineage_id", "uuid", True, "", "", False],
-        ["local_generation", "bigint", True, "", "", False],
-        ["origin_lineage_id", "uuid", False, "", "", False],
-        ["origin_generation", "bigint", False, "", "", False],
-        ["published_at", "timestamp with time zone", False, "", "", False],
-        ["code_catalog_oid", "bigint", False, "", "", False],
-        ["row_count", "bigint", False, "", "", False],
-        ["row_sha256", "text", False, "", "", False],
-    ]
-    changes_by_kind = {"type": (1, "numeric"), "generated": (3, "s"), "identity": (4, "a"), "default": (5, True)}
-    if change in changes_by_kind:
-        position, value = changes_by_kind[change]
-        columns[7][position] = value
-    if change == "id-default":
-        columns[0][5] = True
-    result = Mock()
-    result.all.return_value = columns
-    session = Mock(execute=AsyncMock(return_value=result), scalar=AsyncMock(return_value=change != "singleton"))
-    if change == "id-default":
-        assert await mutable._generation_shape(session, "mrf", 15) is None
-    else:
-        with pytest.raises(RuntimeError, match="generation (model|singleton) differs"):
-            await mutable._generation_shape(session, "mrf", 15)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["storage", "closed", "none"])
-async def test_mutable_lock_rechecks_storage_before_accepting_mutable_binding(monkeypatch, mutable_completion, failure):
-    _, storage_by_field, _ = mutable_completion
-    session = Mock(execute=AsyncMock())
-    observed = {**storage_by_field, "database_oid": 99} if failure == "storage" else storage_by_field
-    monkeypatch.setattr(mutable, "_mutable_storage", AsyncMock(side_effect=[storage_by_field, observed]))
-    lock = AsyncMock()
-    pin = AsyncMock(return_value=failure == "closed")
-    shape = AsyncMock()
-    monkeypatch.setattr(mutable.native, "_lock_family", lock)
-    monkeypatch.setattr(mutable.binding, "pin_catalog_source", pin)
-    monkeypatch.setattr(mutable, "_generation_shape", shape)
-    if failure == "none":
-        assert await mutable._lock_mutable_storage(session, "mrf") == storage_by_field
-        shape.assert_awaited_once_with(session, "mrf", 15)
-    else:
-        with pytest.raises(RuntimeError, match="storage identity changed|cannot target closed"):
-            await mutable._lock_mutable_storage(session, "mrf")
-        shape.assert_not_awaited()
-    assert lock.await_args_list == [
-        call(session, "mrf", ("code_catalog", mutable.codes.TABLE), "SHARE ROW EXCLUSIVE", nowait=True),
-        call(session, "mrf", ("import_run",), "ACCESS SHARE", nowait=True),
-    ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["foreign", "generation", "storage", "none"])
-async def test_mutable_row_application_refuses_changed_ownership_and_generation(
-    monkeypatch, mutable_completion, failure
-):
-    _, storage_by_field, _ = mutable_completion
-    session = Mock(execute=AsyncMock(), scalar=AsyncMock(return_value=failure == "foreign"))
-    incoming = Mock(ownership=Mock(schema_name="candidate"))
-    prior, generation = {"local_generation": 0}, {"local_generation": 1}
-    observed = generation if failure == "generation" else prior
-    monkeypatch.setattr(mutable.codes, "read_generation", AsyncMock(side_effect=[prior, observed]))
-    publish = AsyncMock(return_value=generation)
-    cleanup = AsyncMock()
-    monkeypatch.setattr(mutable.codes, "publish_local_generation", publish)
-    monkeypatch.setattr(mutable.publication, "precreate_catalog_input", AsyncMock(return_value=incoming))
-    monkeypatch.setattr(mutable.publication, "copy_catalog_records", AsyncMock())
-    monkeypatch.setattr(mutable.publication, "validate_catalog_semantics", AsyncMock())
-    monkeypatch.setattr(mutable.native, "cleanup_model_family_stage", cleanup)
-    observed_storage = {**storage_by_field, "database_oid": 99} if failure == "storage" else storage_by_field
-    monkeypatch.setattr(mutable, "_mutable_storage", AsyncMock(return_value=observed_storage))
-    if failure == "none":
-        assert await mutable._apply_rows(session, "mrf", [], storage_by_field) == generation
-        cleanup.assert_awaited_once_with(session, incoming.spec, incoming.ownership)
-    else:
-        with pytest.raises(RuntimeError, match="ownership differs|generation changed|storage identity changed"):
-            await mutable._apply_rows(session, "mrf", [], storage_by_field)
-        cleanup.assert_not_awaited()
-    assert publish.await_count == (1 if failure in {"storage", "none"} else 0)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["not-running", "finished", "cas", "source", "storage", "none"])
-async def test_mutable_completion_requires_running_attempt_and_returned_cas(monkeypatch, mutable_completion, failure):
-    attempt_by_field, storage_by_field, completed = mutable_completion
-    running_row_by_field = {**completed, "status": "running", "finished_at": None}
-    if failure == "not-running":
-        running_row_by_field["status"] = "failed"
-    if failure == "finished":
-        running_row_by_field["finished_at"] = completed["finished_at"]
-    completion_result = Mock()
-    completion_result.mappings.return_value.one_or_none.return_value = None if failure == "cas" else completed
-    session = Mock(execute=AsyncMock(return_value=completion_result))
-    apply = AsyncMock(return_value={"local_generation": 1})
-    monkeypatch.setattr(mutable, "_run", AsyncMock(return_value=running_row_by_field))
-    monkeypatch.setattr(mutable, "_apply_rows", apply)
-    monkeypatch.setattr(mutable.codes, "read_generation", AsyncMock(return_value={"local_generation": 0}))
-    expected_by_field = {
-        "storage": mutable.generation_value(
-            {**storage_by_field, "database_oid": 99} if failure == "storage" else storage_by_field
-        ),
-        "generation": {"local_generation": 1 if failure == "source" else 0},
-    }
-    if failure == "none":
-        assert (
-            await mutable._publish_attempt(
-                session, "mrf", attempt_by_field, storage_by_field, [{}, {}, {}], {}, expected_by_field
-            )
-            == completed
-        )
-    else:
-        with pytest.raises(RuntimeError, match="not running|completion attempt changed|source changed"):
-            await mutable._publish_attempt(
-                session, "mrf", attempt_by_field, storage_by_field, [{}, {}, {}], {}, expected_by_field
-            )
-    assert apply.await_count == (1 if failure in {"cas", "none"} else 0)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["running", "canceling", "canceled", "succeeded"])
-async def test_mutable_lost_commit_response_obeys_reconciled_terminal_state(monkeypatch, mutable_completion, status):
-    attempt_by_field, storage_by_field, completed = mutable_completion
-    session = Mock(execute=AsyncMock(), scalar=AsyncMock(return_value="pg_catalog,pg_temp"))
-
-    @asynccontextmanager
-    async def transaction():
-        yield session
-        raise RuntimeError("synthetic lost commit response")
-
-    database = Mock(transaction=transaction)
-    database._transaction_binding.return_value = None
-    database._reader_binding.return_value = None
-    monkeypatch.setattr(mutable, "_lock_mutable_storage", AsyncMock(return_value=storage_by_field))
-    monkeypatch.setattr(mutable, "_publish_attempt", AsyncMock(return_value=completed))
-    monkeypatch.setattr(mutable, "_await_reconciliation", AsyncMock(return_value={**completed, "status": status}))
-    context_by_field = {
-        "context": {
-            "control_run_id": attempt_by_field["run_id"],
-            "_control_attempt_id": attempt_by_field["attempt_id"],
-            "_control_attempt_started_at": attempt_by_field["attempt_started_at"],
-        }
-    }
-    payloads = [{"source": source_name, "code_system": system} for source_name, system in mutable.codes.SOURCES]
-    if status == "succeeded":
-        assert await mutable.publish_mutable_code_sets(
-            database, context_by_field, schema="mrf", payloads=payloads, metrics={}
-        )
-        assert context_by_field["context"]["control_run_terminal_committed"] is True
-    else:
-        with pytest.raises((RuntimeError, mutable.ImportCancelledError)) as raised:
-            await mutable.publish_mutable_code_sets(
-                database, context_by_field, schema="mrf", payloads=payloads, metrics={}
-            )
-        expected = "synthetic lost commit response" if status == "running" else "code-set managed attempt was canceled"
-        assert str(raised.value) == expected
-        assert context_by_field["context"].get("control_run_terminal_committed") is not True
-    assert context_by_field["context"].get("scoped_catalog_commit_unknown") is not True
 
 
 def test_code_payloads_reject_foreign_source():

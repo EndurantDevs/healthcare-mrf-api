@@ -15,7 +15,7 @@ from typing import Any
 from db.connection import init_db
 from db.models import CodeCatalog, db
 from process.ext.utils import ensure_database
-from process.scoped_catalog_handoff import prepare_catalog_handoff
+from process.scoped_catalog_handoff import capture_catalog_expected, prepare_catalog_handoff
 
 DEFAULT_POS_URL = "https://www.cms.gov/medicare/coding-billing/place-of-service-codes/code-sets"
 DEFAULT_RC_URL = "https://bluebutton.cms.gov/fhir/CodeSystem/CLM-REV-CNTR-CD/"
@@ -301,6 +301,11 @@ async def import_code_sets(test_mode: bool = False, *, _control_context=None) ->
         expected, completed = await capture_mutable_code_sets(db, _control_context, schema=schema, test_mode=test_mode)
         if completed is not None:
             return completed
+    else:
+        await capture_catalog_expected(db, _control_context, importer="code-sets", schema=schema)
+        committed = (_control_context or {}).get("context", {}).get("_control_committed_result")
+        if committed is not None:
+            return committed
 
     pos_url = os.getenv("HLTHPRT_CODE_SETS_POS_URL", DEFAULT_POS_URL)
     rc_url = os.getenv("HLTHPRT_CODE_SETS_RC_URL", DEFAULT_RC_URL)
@@ -319,7 +324,7 @@ async def import_code_sets(test_mode: bool = False, *, _control_context=None) ->
         raise RuntimeError(f"CMS Blue Button revenue-code source produced no code rows: {rc_url}")
 
     modifier_rows = modifier_code_rows()
-    if mode == "native":
+    if mode == "native" and _control_context is None:
         await _ensure_code_catalog(schema)
     pos_payloads, rc_payloads, modifier_payloads = map(_code_payloads, (pos_rows, rc_rows, modifier_rows))
     pos_count, rc_count, modifier_count = map(len, (pos_payloads, rc_payloads, modifier_payloads))

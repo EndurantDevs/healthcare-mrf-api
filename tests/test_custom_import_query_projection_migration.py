@@ -107,6 +107,7 @@ def _assert_projection_upgrade_order(script, module):
         "20261108010000_custom_import_family_child_reference_aggregate",
         "20261111010000_code_sets_publication_idempotency",
         "20261113010000_address_canonical_space_normalization",
+        "20261115010000_ms_drg_companion_tables",
     ]
 
 
@@ -118,7 +119,7 @@ def test_projection_migration_extends_the_single_installed_head():
     script = ScriptDirectory.from_config(config)
     module = migration()
     assert module.down_revision == "20261013010000_registry_custom_history_events"
-    assert script.get_heads() == ["20261113010000_address_canonical_space_normalization"]
+    assert script.get_heads() == ["20261115010000_ms_drg_companion_tables"]
     assert script.get_revision("20261113010000_address_canonical_space_normalization").down_revision == (
         "20261111010000_code_sets_publication_idempotency"
     )

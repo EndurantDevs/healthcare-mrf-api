@@ -10,7 +10,13 @@ import pytest
 
 from process import mrf_discovery_acquisition_guard as guard
 
-DATASET = dict(zip(guard.DATASET_KEYS, range(11, 16)))
+DATASET = {
+    "control_relation": "discovery_control.reservations",
+    "source_relation": guard._relation(guard.MRFSource).replace('"', ""),
+    "payer_relation": guard._relation(guard.MRFPayer).replace('"', ""),
+    "file_relation": guard._relation(guard.MRFFile).replace('"', ""),
+}
+LEGACY_DATASET = dict(zip(sorted(guard.LEGACY_DATASET_KEYS), range(11, 16)))
 CONTROL_RELATION = '"discovery_control"."reservations"'
 
 
@@ -48,16 +54,16 @@ class Driver:
         self.local = deepcopy(self.source)
         self.old = None
         self.blocker = self.active = None
-        self.identity = {**DATASET, "can_read_control": True}
+        self.read_error = None
         self.locked = False
         self.sql = []
 
-    async def fetchrow(self, sql, *params):
-        self.sql.append((sql, params))
-        return dict(self.identity)
-
     async def fetchval(self, sql, *params):
         self.sql.append((sql, params))
+        if sql.startswith("SELECT 1 FROM"):
+            if self.read_error:
+                raise self.read_error
+            return None
         if "pg_try_advisory_lock" in sql:
             self.locked = True
             return True
@@ -98,12 +104,23 @@ async def test_invalid_control_configuration_refuses_before_sql(monkeypatch, con
     assert driver.sql == []
 
 
-@pytest.mark.parametrize("changed", ["control_run_oid", "can_read_control"])
-async def test_configured_control_requires_matching_native_identity_and_privilege(changed):
+@pytest.mark.parametrize("error", [PermissionError("read denied"), RuntimeError("relation missing")])
+async def test_configured_relations_require_native_read_access(error):
     driver = Driver()
-    driver.identity[changed] = DATASET[changed] + 1 if changed in DATASET else False
-    with pytest.raises(ValueError, match="mrf_acquisition_not_admitted"):
+    driver.read_error = error
+    with pytest.raises(ValueError, match="mrf_acquisition_not_admitted") as raised:
         await guard.require_reservation(driver, driver.local)
+    assert raised.value.__cause__ is error
+    assert len(driver.sql) == 1
+
+
+@pytest.mark.parametrize("relation", ['"invalid"."export""file"', '"missing_schema"', '"other"."file"; SELECT 1'])
+async def test_model_relation_names_are_not_silently_reinterpreted(monkeypatch, relation):
+    monkeypatch.setattr(guard, "_relation", lambda _model: relation)
+    driver = Driver()
+    with pytest.raises(ValueError, match="mrf_acquisition_not_admitted"):
+        await guard.native_dataset_identity(driver)
+    assert driver.sql == []
 
 
 @pytest.mark.parametrize("catalog_status", ["", "running", "failed"])
@@ -126,7 +143,7 @@ async def test_reservation_identity_is_not_a_caller_supplied_bypass(changed):
     if changed == "status":
         driver.source["status"] = "succeeded"
     if changed == "dataset":
-        marker["dataset"]["file_oid"] += 1
+        marker["dataset"]["file_relation"] = "changed.export_file"
     if changed == "digest":
         marker["params_digest"] = "0" * 64
     if changed == "key":
@@ -253,10 +270,11 @@ async def test_command_captures_control_relation_before_lock_recheck(monkeypatch
     monkeypatch.setattr(driver, "fetchval", mutate_configuration)
     async with guard.acquisition_command(command, {"crawl": True, "dry_run": False, "run_id": driver.local["run_id"]}):
         assert driver.locked
-    identity_relations = [params[0] for sql, params in driver.sql if "AS control_run_oid" in sql]
-    assert identity_relations == [CONTROL_RELATION, CONTROL_RELATION]
-    control_reads = [sql for sql, _ in driver.sql if CONTROL_RELATION in sql]
-    assert len(control_reads) == 3
+    probes = [sql for sql, _ in driver.sql if sql.startswith("SELECT 1 FROM") and CONTROL_RELATION in sql]
+    assert probes == [f"SELECT 1 FROM {CONTROL_RELATION} LIMIT 0"] * 2
+    control_reads = [sql for sql, _ in driver.sql if CONTROL_RELATION in sql and "to_jsonb(r)" in sql]
+    assert len(control_reads) == 2
+    assert not any("changed_control" in sql for sql, _ in driver.sql)
     assert not driver.locked
 
 
@@ -264,13 +282,18 @@ async def test_command_recheck_cannot_change_the_locked_native_dataset(monkeypat
     driver = Driver()
     bind_driver(monkeypatch, driver)
     original_fetch = driver.fetchval
+    original_relation = guard._relation
 
     async def replace_control_relation(sql, *params):
         result = await original_fetch(sql, *params)
         if "pg_try_advisory_lock" in sql:
-            driver.identity["control_run_oid"] += 1
+            monkeypatch.setattr(
+                guard,
+                "_relation",
+                lambda model: '"changed"."export_file"' if model is guard.MRFFile else original_relation(model),
+            )
             for run in (driver.source, driver.local):
-                run["metrics"][guard.MARKER]["dataset"]["control_run_oid"] = driver.identity["control_run_oid"]
+                run["metrics"][guard.MARKER]["dataset"]["file_relation"] = "changed.export_file"
         return result
 
     async def command(crawl=False, dry_run=False, run_id=None):
@@ -427,13 +450,19 @@ async def test_health_exposes_native_dataset_at_top_level_for_source_reservation
     from api import control_imports
 
     monkeypatch.setattr(
-        control_imports, "_database_check", AsyncMock(return_value={"ok": True, "mrf_acquisition_dataset": DATASET})
+        control_imports,
+        "_database_check",
+        AsyncMock(
+            return_value={"ok": True, "mrf_acquisition_dataset": LEGACY_DATASET, "mrf_acquisition_dataset_v2": DATASET}
+        ),
     )
     monkeypatch.setattr(control_imports, "_redis_check", lambda: {"ok": True})
     monkeypatch.setattr(control_imports, "_worker_and_queue_health", lambda: ({}, {}, {}))
     monkeypatch.setattr(control_imports, "_ram_status", lambda: {})
     monkeypatch.setattr(control_imports, "_disk_status_by_name", lambda _: {})
-    assert (await control_imports.node_health())["mrf_acquisition_dataset"] == DATASET
+    health = await control_imports.node_health()
+    assert health["mrf_acquisition_dataset"] == LEGACY_DATASET
+    assert health["mrf_acquisition_dataset_v2"] == DATASET
 
 
 @pytest.mark.parametrize("failure", [None, "database", "acquisition"])
@@ -441,7 +470,8 @@ async def test_database_health_keeps_connection_and_acquisition_failures_distinc
     from api import control_imports
 
     database = SimpleNamespace(execute=AsyncMock())
-    acquire = AsyncMock(return_value=DATASET)
+    fields_by_name = {"mrf_acquisition_dataset": LEGACY_DATASET, "mrf_acquisition_dataset_v2": DATASET}
+    acquire = AsyncMock(return_value=fields_by_name)
     if failure == "database":
         database.execute.side_effect = RuntimeError("synthetic database failure")
     if failure == "acquisition":
@@ -454,14 +484,14 @@ async def test_database_health_keeps_connection_and_acquisition_failures_distinc
         assert report == {"ok": False, "error": "synthetic database failure"}
         acquire.assert_not_awaited()
     else:
-        assert report == {"ok": True, "mrf_acquisition_dataset": None if failure else DATASET}
+        assert report == {"ok": True, **{key: None if failure else value for key, value in fields_by_name.items()}}
         acquire.assert_awaited_once()
 
 
 def test_foreign_dataset_requires_disjoint_exporters_across_all_relation_families():
     query = guard._foreign_dataset_sql()
-    for known in ("source_oid", "payer_oid", "file_oid"):
-        for target in ("source_oid", "payer_oid", "file_oid"):
+    for known in ("source_relation", "payer_relation", "file_relation"):
+        for target in ("source_relation", "payer_relation", "file_relation"):
             assert f"->'{known}' <> $2::jsonb->'{target}'" in query
     assert query.count(" <>") == 9
 
@@ -599,3 +629,25 @@ async def test_empty_reservation_params_match_worker_defaults(representation):
             command=discovery.run_mrf_source_discovery_command,
             command_params=command_params_by_name,
         )
+
+
+@pytest.mark.parametrize("replacement_link", [False, True])
+async def test_legacy_physical_fields_are_inert_for_exact_logical_owner(replacement_link):
+    driver = Driver()
+    if replacement_link:
+        replacement(driver)
+        driver.old["metrics"][guard.REPLACEMENT]["dataset"] = {key: "archived" for key in LEGACY_DATASET}
+    driver.source["metrics"][guard.MARKER]["dataset"] = dict(LEGACY_DATASET)
+    before = deepcopy(driver.source)
+    assert await guard.require_reservation(driver, driver.local, require_local=True) == DATASET
+    assert driver.source == before
+    assert not any("to_regclass" in sql or "pg_database" in sql for sql, _ in driver.sql)
+
+
+@pytest.mark.parametrize("status", ["canceling", "failed", "succeeded"])
+async def test_legacy_metadata_never_reopens_a_nonrunnable_reservation(status):
+    driver = Driver()
+    driver.source["metrics"][guard.MARKER]["dataset"] = dict(LEGACY_DATASET)
+    driver.source["status"] = status
+    with pytest.raises(ValueError, match="mrf_acquisition_not_admitted"):
+        await guard.require_reservation(driver, driver.local)

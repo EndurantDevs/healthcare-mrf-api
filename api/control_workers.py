@@ -28,6 +28,7 @@ from api import (
     provider_directory_source_worker,
     reference_source_worker,
     registry_aca_source_worker,
+    scoped_catalog_publisher_worker,
 )
 from db.models import db
 from process import mrf_discovery_acquisition_guard as mrf_acquisition
@@ -73,6 +74,7 @@ class _AdmittedWorkerRequest(dict[str, Any]):
     ordinary_fhir_profile_lease: object | None = None
     npi_source_launch: object | None = None
     pricing_control_admission: object | None = None
+    scoped_catalog_admission: bool = False
 
 
 _PROVIDER_DIRECTORY_WORKER_CLASS = "process.ProviderDirectoryFHIR"
@@ -215,6 +217,10 @@ def worker_registry() -> list[dict[str, Any]]:
 def ensure_worker(payload: dict[str, Any]) -> dict[str, Any]:
     """Start or locate workers selected by one launch payload."""
 
+    if payload.get("role") == scoped_catalog_publisher_worker.ROLE:
+        return _worker_ensure_response(
+            payload, status="failed", items=[], message="catalog publisher requires guarded admission"
+        )
     specs = _resolve_specs(payload)
     if not specs:
         importer = str(payload.get("importer") or "").strip()
@@ -314,6 +320,12 @@ async def _admit_worker_ensure(
 
 async def _admit_source_worker_launches(worker_payload, admitted_run):
     """Capture exact source-image capabilities only after native job admission."""
+    if (
+        admitted_run.get("importer") in {"code-sets", "ms-drg"}
+        and admitted_run.get("status") in {"finalizing", "canceling"}
+        and (admitted_run.get("metrics") or {}).get("scoped_catalog_handoff") is not None
+    ):
+        return _failed_worker_admission(worker_payload, "catalog handoff requires the protected continuation")
     if isinstance(worker_payload, _AdmittedWorkerRequest):
         from api.provider_directory_cms_registry_worker import admit_cms_registry_worker_launch
 
@@ -405,6 +417,8 @@ async def guarded_ensure_worker(
     """Persist run/selector admission before any worker launch."""
 
     worker_payload = _AdmittedWorkerRequest(worker_payload)
+    if scoped_catalog_publisher_worker.is_publisher_request(worker_payload):
+        return await scoped_catalog_publisher_worker.guarded_ensure(worker_payload)
     importer = str(worker_payload.get("importer") or "").strip()
     run_id = str(worker_payload.get("run_id") or "").strip()
     selected_specs = _resolve_specs(worker_payload)
@@ -454,10 +468,7 @@ async def guarded_ensure_worker(
         except ValueError:
             requested_source_id = "invalid"
         if requested_source_id is not None:
-            return _failed_worker_admission(
-                worker_payload,
-                "source-attempt worker launch requires run_id",
-            )
+            return _failed_worker_admission(worker_payload, "source-attempt worker launch requires run_id")
     return await asyncio.to_thread(ensure_worker, worker_payload)
 
 
@@ -563,6 +574,8 @@ def _worker_ensure_response(
 
 def worker_state(payload: dict[str, Any]) -> dict[str, Any]:
     """Return current process or Kubernetes worker state for a launch payload."""
+    if payload.get("role") == scoped_catalog_publisher_worker.ROLE:
+        return scoped_catalog_publisher_worker.state(payload)
     specs = _resolve_specs(payload)
     if not specs:
         importer = str(payload.get("importer") or "").strip()

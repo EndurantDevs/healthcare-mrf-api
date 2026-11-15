@@ -15,6 +15,11 @@ from db.registry_fhir_catalog import MAX_CORE_BYTES, table_sql
 from process import registry_fhir_catalog_read as catalog
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.registry_catalog_policy import RegistryOrganizationVisibility
+from tests.fhir_catalog_named_copy_support import assert_copied_fhir_view
+from tests.test_network_compact_address_origin_postgres import indexed_api_db as indexed_api_db
+from tests.test_network_compact_address_origin_postgres import indexed_db as indexed_db
+from tests.test_network_custom_address_source_postgres import bootstrap_db as bootstrap_db
+from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_fhir_catalog_read import (
     COMPANY,
     GROUP,
@@ -56,7 +61,7 @@ async def catalog_database(monkeypatch):
     )
     fixture.original_metadata_pin = catalog._metadata_pin
     fixture.manifest = manifest
-    monkeypatch.setattr(catalog, "catalog_pin", AsyncMock(return_value=manifest))
+    monkeypatch.setattr(catalog, "read_published_api_pin", AsyncMock(return_value=(manifest, None, None)))
     monkeypatch.setattr(catalog, "_metadata_pin", AsyncMock(return_value=snapshot_by_field))
     try:
         await connection.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
@@ -413,13 +418,14 @@ async def _copy_company_population(fixture, source_count, network_count):
 
 
 async def _all_company_pages(fixture, monkeypatch):
-    statements, original = [], catalog.catalog_directory_fetchrow
+    statements, original = [], asyncpg.Connection.fetchrow
 
-    async def counted_read(*args, **kwargs):
-        statements.append(args[1])
-        return await original(*args, **kwargs)
+    async def counted_read(connection, statement, *args, **kwargs):
+        if " AS rows_json" in statement:
+            statements.append(statement)
+        return await original(connection, statement, *args, **kwargs)
 
-    monkeypatch.setattr(catalog, "catalog_directory_fetchrow", counted_read)
+    monkeypatch.setattr(asyncpg.Connection, "fetchrow", counted_read)
     page = await _read(fixture, catalog.FHIRCatalogQuery(limit=100))
     network_documents = list(page["items"])
     while page["next_offset"] is not None:
@@ -587,7 +593,7 @@ async def test_unattached_catalog_has_no_directory_dependency_and_keeps_visibili
     fixture = catalog_database
     fixture.snapshot.update(network_generation=None, manifest_sha256=None)
     pinner = AsyncMock(side_effect=AssertionError("an unattached catalog has no directory parent"))
-    monkeypatch.setattr(catalog, "catalog_pin", pinner)
+    monkeypatch.setattr(catalog, "read_published_api_pin", pinner)
     await fixture.connection.execute(f'DROP SCHEMA "{fixture.memberships}" CASCADE')
     page = await _read(fixture)
     assert page["generation"] is None and page["approved_custom_revision"] is None
@@ -610,9 +616,11 @@ async def test_unattached_catalog_has_no_directory_dependency_and_keeps_visibili
     "transaction", [None, {"isolation": "read_committed", "readonly": True}, {"isolation": "repeatable_read"}]
 )
 @pytest.mark.asyncio
-async def test_unattached_read_refuses_unpinned_transactions(catalog_database, transaction):
+@pytest.mark.parametrize("attached", [False, True])
+async def test_read_refuses_unpinned_transactions(catalog_database, transaction, attached):
     fixture = catalog_database
-    fixture.snapshot.update(network_generation=None, manifest_sha256=None)
+    if not attached:
+        fixture.snapshot.update(network_generation=None, manifest_sha256=None)
     if transaction is None:
         with pytest.raises(catalog.RegistryNetworkCatalogError, match="transaction_required"):
             await catalog.read_fhir_catalog(fixture.connection, catalog.FHIRCatalogQuery(), excluded_network_ids=())
@@ -620,7 +628,7 @@ async def test_unattached_read_refuses_unpinned_transactions(catalog_database, t
         async with fixture.connection.transaction(**transaction):
             with pytest.raises(catalog.RegistryNetworkCatalogError, match="transaction_required"):
                 await catalog.read_fhir_catalog(fixture.connection, catalog.FHIRCatalogQuery(), excluded_network_ids=())
-    catalog.catalog_pin.assert_not_awaited()
+    catalog.read_published_api_pin.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -628,7 +636,7 @@ async def test_unattached_continuations_pin_metadata_scope_and_fresh_visibility(
     fixture = catalog_database
     fixture.snapshot.update(network_generation=None, manifest_sha256=None)
     pinner = AsyncMock(side_effect=AssertionError("directory pin is not part of metadata continuation"))
-    monkeypatch.setattr(catalog, "catalog_pin", pinner)
+    monkeypatch.setattr(catalog, "read_published_api_pin", pinner)
     first = await _read(fixture, catalog.FHIRCatalogQuery(limit=1))
     query = catalog.FHIRCatalogQuery(
         limit=1,
@@ -661,7 +669,7 @@ async def test_unattached_read_pins_published_metadata_instead_of_current_direct
         "SET network_generation=NULL,manifest_sha256=NULL,published_at=clock_timestamp()"
     )
     pinner = AsyncMock(side_effect=AssertionError("the current directory head is not a metadata attachment"))
-    monkeypatch.setattr(catalog, "catalog_pin", pinner)
+    monkeypatch.setattr(catalog, "read_published_api_pin", pinner)
     monkeypatch.setattr(catalog, "_metadata_pin", fixture.original_metadata_pin)
     page = await _read(fixture, control_schema=fixture.metadata)
     assert page["metadata_generation"] == GENERATION and page["metadata_approved_revision"] == "6"
@@ -863,8 +871,8 @@ async def test_unpublished_and_changed_pin_refuse(catalog_database, monkeypatch)
     assert pinned["metadata_generation"] == GENERATION
     verifier.assert_awaited_once()
     monkeypatch.setattr(catalog, "_metadata_pin", fixture.original_metadata_pin)
-    pinner = AsyncMock(return_value=fixture.manifest)
-    monkeypatch.setattr(catalog, "catalog_pin", pinner)
+    pinner = AsyncMock(return_value=(fixture.manifest, None, None))
+    monkeypatch.setattr(catalog, "read_published_api_pin", pinner)
 
     page = await _read(fixture, control_schema=fixture.metadata)
     assert page["generation"] == "9"
@@ -897,9 +905,14 @@ async def test_unpublished_and_changed_pin_refuse(catalog_database, monkeypatch)
     async def pin(_connection, generation, _schema):
         if generation != 10:
             raise ValueError("retained parent is ineligible")
-        return successor
+        return successor, None, None
 
     pinner.side_effect = pin
     assert (await _read(fixture, control_schema=fixture.metadata))["generation"] == "10"
     with pytest.raises(catalog.RegistryNetworkCatalogError, match="unavailable"):
         await _read(fixture, query, control_schema=fixture.metadata)
+
+
+@pytest.mark.asyncio
+async def test_copied_catalog_preserves_named_api_reader(indexed_api_db, monkeypatch):
+    await assert_copied_fhir_view(indexed_api_db, monkeypatch)

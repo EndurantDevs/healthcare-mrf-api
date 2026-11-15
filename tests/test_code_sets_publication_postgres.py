@@ -9,7 +9,6 @@ import json
 import os
 import re
 from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
-from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -33,10 +32,11 @@ from process import control_lifecycle
 from process import provider_directory_cms_npd_recovery as recovery
 from process import reference_family_archive as native
 from process import scoped_catalog_handoff as handoff
+from process import scoped_catalog_named_cutover as cutover
 from process.provider_directory_source_control_privileges import ADMISSION_GRANTS
-from process.provider_directory_source_storage_binding import _ADMISSION_RIGHTS, _ADMISSION_RIGHTS_SQL
+from process.scoped_catalog_publisher import ManagedAttempt, PublisherSettings, run_publisher
 from process.scoped_catalog_retention import cleanup_retained_catalog
-from tests.scoped_catalog_native_fixture import catalog_actors, seal_catalog
+from tests.scoped_catalog_native_fixture import catalog_actors, configure_catalog_publisher, seal_catalog
 
 code_sets = importlib.import_module("process.code_sets")
 
@@ -53,7 +53,7 @@ def _dsn() -> str:
         url.drivername != "postgresql"
         or url.username != "postgres"
         or url.host not in {"127.0.0.1", "localhost"}
-        or url.port not in {5432, 5440}
+        or not 1024 <= (url.port or 0) <= 65535
         or re.fullmatch(r"hc_scoped_reference_[0-9a-f]{32}", url.database or "") is None
     ):
         pytest.fail("code-set publication test requires its dedicated local database")
@@ -150,7 +150,9 @@ async def _cancel_preparation(actors, candidate):
         )
         await handoff.request_catalog_cancel(session, current)
     async with actors.publisher.begin() as session:
-        receipt = await handoff.cancel_catalog_handoff(session, candidate)
+        receipt = await handoff.cancel_catalog_handoff(
+            session, candidate, settings=PublisherSettings.from_environment()
+        )
         assert receipt == {"handoff": candidate, "status": "canceled"}
     async with actors.publisher.begin() as session:
         assert await handoff.read_catalog_handoff_outcome(session, candidate) == receipt
@@ -161,7 +163,9 @@ async def _assert_late_failure_rolls_back(actors):
     candidate = result[handoff.METRIC]
     with pytest.raises(RuntimeError, match="synthetic late failure"):
         async with actors.publisher.begin() as session:
-            await handoff.publish_catalog_handoff(session, candidate, source_copy=_copy())
+            await handoff.publish_catalog_handoff(
+                session, candidate, source_copy=_copy(), settings=PublisherSettings.from_environment()
+            )
             raise RuntimeError("synthetic late failure")
     async with actors.builder.begin() as session:
         catalog_sources = (
@@ -185,7 +189,9 @@ async def _assert_foreign_conflict_rolls_back(actors):
     candidate = (await _ordinary_preparation(actors))[handoff.METRIC]
     with pytest.raises(RuntimeError, match="foreign key ownership"):
         async with actors.publisher.begin() as session:
-            await handoff.publish_catalog_handoff(session, candidate, source_copy=_copy())
+            await handoff.publish_catalog_handoff(
+                session, candidate, source_copy=_copy(), settings=PublisherSettings.from_environment()
+            )
     async with actors.publisher.begin() as session:
         catalog_entries = (
             await session.execute(
@@ -211,11 +217,15 @@ async def _assert_partial_feed_retains_prior_code(actors):
         before_oid = await reader.scalar(text("SELECT 'mrf.code_catalog'::regclass::oid"))
         with pytest.raises(DBAPIError, match="lock"):
             async with actors.publisher.begin() as publisher:
-                await handoff.publish_catalog_handoff(publisher, candidate, source_copy=_copy())
+                await handoff.publish_catalog_handoff(
+                    publisher, candidate, source_copy=_copy(), settings=PublisherSettings.from_environment()
+                )
         assert await reader.scalar(text("SELECT 'mrf.code_catalog'::regclass::oid")) == before_oid
         assert await reader.scalar(text("SELECT count(*) FROM mrf.code_catalog")) == 2
     async with actors.publisher.begin() as session:
-        receipt = await handoff.publish_catalog_handoff(session, candidate, source_copy=_copy())
+        receipt = await handoff.publish_catalog_handoff(
+            session, candidate, source_copy=_copy(), settings=PublisherSettings.from_environment()
+        )
     async with actors.publisher.begin() as session:
         assert await handoff.read_catalog_handoff_outcome(session, candidate) == receipt
     async with actors.builder.begin() as session:
@@ -253,6 +263,7 @@ async def test_code_sets_rolls_back_late_failure_and_foreign_key_conflict(monkey
     engine = create_async_engine(dsn)
     try:
         async with catalog_actors(engine, ["mrf"]) as actors:
+            configure_catalog_publisher(monkeypatch, actors, "mrf")
             await _seed_catalog(engine)
             await seal_catalog(actors, "mrf", (CodeCatalog,), "code_sets_result_generation")
             async with engine.begin() as connection:
@@ -287,6 +298,7 @@ async def _mutable_catalog(engine):
                 await connection.execute(text(f'ALTER DATABASE "{engine.url.database}" OWNER TO "{namespace_owner}"'))
                 await connection.execute(text(f'ALTER SCHEMA mrf OWNER TO "{namespace_owner}"'))
                 await connection.execute(text(f'GRANT USAGE,CREATE ON SCHEMA mrf TO "{actors.roles["builder"]}"'))
+                await connection.execute(text(f'GRANT USAGE,CREATE ON SCHEMA mrf TO "{actors.roles["owner"]}"'))
                 await connection.execute(
                     text(
                         "ALTER TABLE mrf.code_catalog ALTER COLUMN display_name TYPE TEXT, ALTER COLUMN short_description TYPE TEXT"
@@ -421,33 +433,6 @@ async def _protected_control_lock(actors, *, protected_namespace=False):
 
 
 async def _require_native_source_lock(actors, lock_profile, run_id, status):
-    query = _ADMISSION_RIGHTS_SQL.replace("$3::oid", "CAST(:owner AS oid)").replace(
-        "$4::oid", "CAST(:publisher AS oid)"
-    )
-    query = query.replace("$2::name", "CAST(:schema AS name)").replace("$8::jsonb", "CAST(:rights AS jsonb)")
-    key, selected = _ADMISSION_RIGHTS["import_run"]
-    async with actors.engine.begin() as connection:
-        owner_oid = await connection.scalar(
-            text("SELECT oid FROM pg_roles WHERE rolname=:role"), {"role": lock_profile.owner}
-        )
-        publisher_oid = await connection.scalar(
-            text("SELECT oid FROM pg_roles WHERE rolname=:role"), {"role": lock_profile.publisher}
-        )
-        actual = (
-            await connection.execute(
-                text(
-                    "WITH catalog AS (SELECT 'admission' AS scope,c.oid,c.relowner,c.relname FROM pg_class c "
-                    "WHERE c.oid='mrf.import_run'::regclass) " + query
-                ),
-                {
-                    "owner": owner_oid,
-                    "publisher": publisher_oid,
-                    "schema": "mrf",
-                    "rights": json.dumps([{"root": "import_run", "key": key, "selected": selected}]),
-                },
-            )
-        ).one()
-        assert actual.closed is True
     async with lock_profile.engine.begin() as connection:
         assert await connection.scalar(text("SELECT session_user")) == lock_profile.publisher
         await connection.execute(text(f'SET LOCAL ROLE "{lock_profile.owner}"'))
@@ -488,94 +473,104 @@ async def test_mutable_code_sets_coexist_with_owner_issued_native_control_lock(m
                 )
             await _require_native_source_lock(actors, lock_profile, run_id, "failed")
             before = await _mutable_state(actors)
-            publication_by_field = await code_sets.import_code_sets(_control_context=run_context)
+            publication_by_field = await _publish_import(actors, run_context)
             after = await _mutable_state(actors)
-            assert after[2:] == before[2:]
+            assert after[2] != before[2]
+            assert after[4:] == before[4:]
             assert len(after[0]) == 5 and after[1][2] == 1
-            assert publication_by_field["contract"] == mutable.CONTRACT
-            assert publication_by_field["generation"]["row_count"] == 4
-            assert run_context["context"]["control_run_terminal_committed"] is True
+            assert publication_by_field["status"] == "succeeded"
+            assert after[1][-2] == 4
+            assert run_context["context"]["control_run_handoff_committed"] is True
             await _require_native_source_lock(actors, lock_profile, run_id, "failed")
     finally:
         await engine.dispose()
 
 
-async def _delegate_foreign_control_key(connection, lock_profile):
-    await connection.execute(text(f'GRANT USAGE ON SCHEMA mrf TO "{lock_profile.publisher}"'))
-    await connection.execute(
-        text(f'GRANT UPDATE(run_id) ON mrf.import_run TO "{lock_profile.publisher}" WITH GRANT OPTION')
-    )
-    await connection.execute(text(f'SET LOCAL ROLE "{lock_profile.publisher}"'))
-    await connection.execute(text(f'GRANT UPDATE(run_id) ON mrf.import_run TO "{lock_profile.owner}"'))
-    assert await connection.scalar(
-        text(
-            "SELECT EXISTS(SELECT FROM pg_attribute col,LATERAL aclexplode(col.attacl) acl "
-            "JOIN pg_roles grantor ON grantor.oid=acl.grantor JOIN pg_roles recipient ON recipient.oid=acl.grantee "
-            "WHERE col.attrelid='mrf.import_run'::regclass AND col.attname='run_id' "
-            "AND grantor.rolname=:grantor AND recipient.rolname=:recipient "
-            "AND acl.privilege_type='UPDATE' AND NOT acl.is_grantable)"
-        ),
-        {"grantor": lock_profile.publisher, "recipient": lock_profile.owner},
-    )
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "INSERT INTO mrf.code_catalog(code_system,code) VALUES ('OTHER','denied')",
+        "UPDATE mrf.code_catalog SET display_name='denied'",
+        "DELETE FROM mrf.code_catalog",
+        "TRUNCATE mrf.code_catalog",
+        "UPDATE mrf.code_sets_result_generation SET local_generation=99",
+    ],
+)
+async def test_published_catalog_rejects_native_worker_writes(monkeypatch, statement):
+    engine = create_async_engine(_dsn())
+    try:
+        async with _mutable_catalog(engine) as actors:
+            _mutable_dependencies(monkeypatch, actors)
+            await _publish_import(actors, await _mutable_context(actors))
+            before = await _mutable_state(actors)
+            with pytest.raises(DBAPIError, match="permission denied"):
+                async with actors.builder.begin() as session:
+                    await session.execute(text(statement))
+            assert await _mutable_state(actors) == before
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure",
-    [
-        "foreign-grantee",
-        "public-grantee",
-        "missing-read",
-        "foreign-grantor",
-        "column",
-        "grant-option",
-        "table",
-        "catalog",
-        "generation",
-        "extra-read",
-        "login",
-        "elevated",
-        "inherited-elevation",
-        "mutable-namespace-writer",
-        "owner-membership",
-        "writer-membership",
-        "read-grant-option",
-        "insert",
-    ],
-)
-async def test_mutable_control_lock_exception_refuses_foreign_authority(failure):
+async def test_publisher_requires_native_owner_membership(monkeypatch):
     engine = create_async_engine(_dsn())
     try:
-        async with _mutable_catalog(engine) as actors, _protected_control_lock(actors) as lock_profile:
-            statements_by_failure = {
-                "foreign-grantee": f'GRANT UPDATE(run_id) ON mrf.import_run TO "{actors.roles["owner"]}"',
-                "public-grantee": "GRANT UPDATE(run_id) ON mrf.import_run TO PUBLIC",
-                "missing-read": f'REVOKE SELECT(params) ON mrf.import_run FROM "{lock_profile.owner}"',
-                "column": f'GRANT UPDATE(status) ON mrf.import_run TO "{lock_profile.owner}"',
-                "grant-option": f'GRANT UPDATE(run_id) ON mrf.import_run TO "{lock_profile.owner}" WITH GRANT OPTION',
-                "table": f'GRANT UPDATE ON mrf.import_run TO "{lock_profile.owner}"',
-                "catalog": f'GRANT UPDATE(code) ON mrf.code_catalog TO "{lock_profile.owner}"',
-                "generation": f'GRANT UPDATE(local_generation) ON mrf.code_sets_result_generation TO "{lock_profile.owner}"',
-                "extra-read": f'GRANT SELECT(progress) ON mrf.import_run TO "{lock_profile.owner}"',
-                "login": f'ALTER ROLE "{lock_profile.owner}" LOGIN',
-                "elevated": f'ALTER ROLE "{lock_profile.owner}" CREATEDB',
-                "inherited-elevation": f'GRANT postgres TO "{lock_profile.owner}"',
-                "mutable-namespace-writer": f'GRANT CREATE ON SCHEMA mrf TO "{lock_profile.owner}"',
-                "owner-membership": f'GRANT "{actors.roles["builder"]}" TO "{lock_profile.owner}"',
-                "writer-membership": f'GRANT "{lock_profile.owner}" TO "{actors.roles["builder"]}"',
-                "read-grant-option": f'GRANT SELECT(run_id) ON mrf.import_run TO "{lock_profile.owner}" WITH GRANT OPTION',
-                "insert": f'GRANT INSERT(run_id) ON mrf.import_run TO "{lock_profile.owner}"',
-            }
-            prior_state = await _mutable_state(actors)
+        async with _mutable_catalog(engine) as actors:
+            _mutable_dependencies(monkeypatch, actors)
+            prepared = await code_sets.import_code_sets(_control_context=await _mutable_context(actors))
+            before = await _mutable_state(actors)
             async with engine.begin() as session:
-                if failure == "foreign-grantor":
-                    await _delegate_foreign_control_key(session, lock_profile)
-                else:
-                    await session.execute(text(statements_by_failure[failure]))
+                await session.execute(text(f'REVOKE "{actors.roles["owner"]}" FROM "{actors.roles["publisher"]}"'))
+            with pytest.raises(DBAPIError, match="permission denied|must be able to SET ROLE"):
+                await _publish_prepared(prepared)
+            assert await _mutable_state(actors) == before
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_preparation_requires_native_catalog_read_permission(monkeypatch):
+    engine = create_async_engine(_dsn())
+    try:
+        async with _mutable_catalog(engine) as actors:
+            _mutable_dependencies(monkeypatch, actors)
+            await _publish_import(actors, await _mutable_context(actors))
+            context = await _mutable_context(actors)
+            before = await _mutable_state(actors)
+            async with actors.publisher.begin() as session:
+                await session.execute(text(f'REVOKE SELECT ON mrf.code_catalog FROM "{actors.roles["builder"]}"'))
+            with pytest.raises(DBAPIError, match="permission denied"):
+                await code_sets.import_code_sets(_control_context=context)
+            async with actors.publisher.begin() as session:
+                await session.execute(text(f'GRANT SELECT ON mrf.code_catalog TO "{actors.roles["builder"]}"'))
+            assert await _mutable_state(actors) == before
+            assert context["context"].get("control_run_handoff_committed") is not True
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["phase", "error", "receipt", "unfinished"])
+async def test_publisher_replay_rejects_changed_terminal_outcome(monkeypatch, failure):
+    engine = create_async_engine(_dsn())
+    try:
+        async with _mutable_catalog(engine) as actors:
+            _mutable_dependencies(monkeypatch, actors)
+            prepared = await code_sets.import_code_sets(_control_context=await _mutable_context(actors))
+            await _publish_prepared(prepared)
+            before = await _mutable_state(actors)
+            statements_by_failure = {
+                "phase": "UPDATE mrf.import_run SET phase_detail='changed'",
+                "error": "UPDATE mrf.import_run SET error=json_build_object('code','changed')",
+                "receipt": "UPDATE mrf.import_run SET metrics=(metrics::jsonb-'scoped_catalog_publication')::json",
+                "unfinished": "UPDATE mrf.import_run SET finished_at=NULL",
+            }
             async with actors.builder.begin() as session:
-                with pytest.raises(RuntimeError, match="ownership, access or execution hooks differ"):
-                    await mutable._mutable_storage(session, "mrf")
-            assert await _mutable_state(actors) == prior_state
+                await session.execute(text(statements_by_failure[failure]))
+            with pytest.raises(RuntimeError):
+                await _publish_prepared(prepared)
+            assert await _mutable_state(actors) == before
     finally:
         await engine.dispose()
 
@@ -592,9 +587,10 @@ async def _mutable_state(actors):
                 text("SELECT indexrelid FROM pg_index WHERE indrelid='mrf.code_catalog'::regclass ORDER BY indexrelid")
             )
         ).all()
-        sequence = (
-            await session.execute(text("SELECT last_value,is_called FROM mrf.code_sets_result_generation_id_seq"))
-        ).one()
+        async with actors.publisher.begin() as inspector:
+            sequence = (
+                await inspector.execute(text("SELECT last_value,is_called FROM mrf.code_sets_result_generation_id_seq"))
+            ).one()
         default = await session.scalar(
             text(
                 "SELECT pg_get_expr(adbin,adrelid) FROM pg_attrdef WHERE adrelid='mrf.code_sets_result_generation'::regclass"
@@ -604,6 +600,7 @@ async def _mutable_state(actors):
 
 
 def _mutable_dependencies(monkeypatch, actors):
+    configure_catalog_publisher(monkeypatch, actors, "mrf")
     database = Database(engine=actors.builder.kw["bind"], session_factory=actors.builder)
     monkeypatch.setattr(code_sets, "db", database)
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
@@ -633,6 +630,33 @@ async def _claim_mutable_context(monkeypatch, actors, database, ctx=None):
     return ctx
 
 
+def _managed_attempt(prepared):
+    candidate = prepared[handoff.METRIC]
+    generation = candidate["expected_generations"]["code-sets"]
+    return ManagedAttempt(
+        *(candidate[name] for name in ("run_id", "attempt_id", "attempt_started_at", "node_id")),
+        generation["local_lineage_id"],
+        generation["local_generation"],
+    )
+
+
+async def _publish_prepared(prepared):
+    assert prepared["status"] == "finalizing"
+    return await run_publisher(PublisherSettings.from_environment(), _managed_attempt(prepared))
+
+
+async def _publish_import(actors, context):
+    before = await _mutable_state(actors)
+    prepared = await code_sets.import_code_sets(_control_context=context)
+    assert prepared["status"] == "finalizing"
+    assert await _mutable_state(actors) == before
+    result = await _publish_prepared(prepared)
+    assert result["status"] == "succeeded"
+    async with actors.publisher.begin() as session:
+        assert await handoff.read_catalog_handoff_outcome(session, prepared[handoff.METRIC])
+    return result
+
+
 async def _assert_mutable_export(actors, result_by_field, published_state):
     stage = None
     try:
@@ -640,8 +664,8 @@ async def _assert_mutable_export(actors, result_by_field, published_state):
             async with native._nucc_catalog_search_path(session):
                 stage = await archive.prepare_source(session, "mrf", uuid4(), source_copy=_copy())
                 assert (stage.row_count, stage.row_sha256) == (
-                    result_by_field["generation"]["row_count"],
-                    result_by_field["generation"]["row_sha256"],
+                    published_state[1][-2],
+                    published_state[1][-1],
                 )
                 assert stage.catalog_oid != published_state[2]
                 assert await archive.scope_receipt(session, stage.schema_name, stage=True) == (
@@ -665,26 +689,58 @@ async def _assert_mutable_export(actors, result_by_field, published_state):
     assert await _mutable_state(actors) == published_state
 
 
+async def _assert_publication_metrics_and_time(actors):
+    async with actors.builder.begin() as session:
+        index_keys = (
+            await session.execute(
+                text(
+                    "SELECT ARRAY(SELECT pg_get_indexdef(indexrelid,position,true) "
+                    "FROM generate_series(1,indnkeyatts) AS positions(position)),indisunique,indisprimary "
+                    "FROM pg_index WHERE indrelid='mrf.code_catalog'::regclass"
+                )
+            )
+        ).all()
+        assert {(tuple(keys), unique, primary) for keys, unique, primary in index_keys} == {
+            (("code_system", "code"), True, True),
+            *((tuple(entry["index_elements"]), False, False) for entry in CodeCatalog.__my_additional_indexes__),
+        }
+        assert await session.scalar(
+            text("SELECT bool_and(indisvalid AND indisready) FROM pg_index WHERE indrelid='mrf.code_catalog'::regclass")
+        )
+        completion = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT metrics,heartbeat_at,finished_at,timezone('UTC',clock_timestamp()) AS utc_now FROM mrf.import_run"
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert completion["metrics"]["unrelated"] == 17
+        assert tuple(completion["metrics"][key] for key in ("pos_rows", "rc_rows", "modifier_rows")) == (1, 1, 1)
+        for key in ("heartbeat_at", "finished_at"):
+            assert (
+                completion[key].tzinfo is None and 0 <= (completion["utc_now"] - completion[key]).total_seconds() < 30
+            )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("session_timezone", ["UTC", "Pacific/Honolulu"])
-async def test_mutable_code_sets_preserve_heap_indexes_partial_feed_and_generation_default(
-    monkeypatch, session_timezone
-):
+async def test_named_code_sets_preserve_partial_feed_indexes_and_generation_default(monkeypatch, session_timezone):
+    """Prepare privately, publish once, and retain schema, source rows and UTC completion."""
     engine = create_async_engine(_dsn())
     try:
         async with _mutable_catalog(engine) as actors:
             database = _mutable_dependencies(monkeypatch, actors)
-            transaction = database.transaction
-
-            @asynccontextmanager
-            async def publication_transaction():
-                async with transaction() as session:
-                    await session.execute(
-                        text("SELECT pg_catalog.set_config('TimeZone',:timezone,true)"), {"timezone": session_timezone}
-                    )
-                    yield session
-
-            monkeypatch.setattr(database, "transaction", publication_transaction)
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(f"ALTER ROLE \"{actors.roles['builder']}\" SET timezone TO '{session_timezone}'")
+                )
+                await connection.execute(
+                    text(f"ALTER ROLE \"{actors.roles['publisher']}\" SET timezone TO '{session_timezone}'")
+                )
             ctx = await _claim_mutable_context(monkeypatch, actors, database)
             async with actors.builder.begin() as session:
                 await session.execute(
@@ -693,210 +749,135 @@ async def test_mutable_code_sets_preserve_heap_indexes_partial_feed_and_generati
                 )
                 await session.execute(
                     text(
-                        "CREATE TRIGGER synthetic_control_guard BEFORE UPDATE ON mrf.import_run "
-                        "FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger()"
+                        "CREATE TRIGGER synthetic_control_guard BEFORE UPDATE ON mrf.import_run FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger()"
                     )
                 )
             before = await _mutable_state(actors)
-            result_by_field = await code_sets.import_code_sets(_control_context=ctx)
+            published = await _publish_import(actors, ctx)
             after = await _mutable_state(actors)
-            assert after[2:] == before[2:]
-            assert len(after[0]) == 5 and after[1][2] == 1
-            assert result_by_field["generation"]["row_count"] == 4
-            assert {catalog_row["source"] for catalog_row in after[0]} == {
+            assert after[2] != before[2] and after[4:] == before[4:]
+            assert len(after[0]) == 5 and after[1][2] == 1 and after[1][-2] == 4
+            assert {entry["source"] for entry in after[0]} == {
                 code_sets.SOURCE_POS,
                 code_sets.SOURCE_RC,
                 code_sets.SOURCE_MODIFIER,
                 "synthetic-unrelated",
             }
-            assert ctx["context"]["control_run_terminal_committed"] is True
-            assert ctx["context"].get("control_run_handoff_committed") is not True
-            async with actors.builder.begin() as session:
-                stored = await session.scalar(text("SELECT metrics FROM mrf.import_run"))
-                assert stored["unrelated"] == 17
-                assert (stored["pos_rows"], stored["rc_rows"], stored["modifier_rows"]) == (1, 1, 1)
-                await _assert_utc_completion(session, ctx)
+            assert ctx["context"]["control_run_handoff_committed"] is True
+            assert ctx["context"].get("control_run_terminal_committed") is not True
+            await _assert_publication_metrics_and_time(actors)
             download = Mock(side_effect=AssertionError("completed attempts must not reacquire feeds"))
             monkeypatch.setattr(code_sets, "_download_text", download)
-            assert await code_sets.import_code_sets(_control_context=ctx) == result_by_field
+            replay = await code_sets.import_code_sets(_control_context=ctx)
+            assert replay["status"] == "succeeded"
+            assert (await run_publisher(PublisherSettings.from_environment(), _managed_attempt(replay)))["replayed"]
             download.assert_not_called()
             assert await _mutable_state(actors) == after
-            await _assert_mutable_export(actors, result_by_field, after)
+            await _assert_mutable_export(actors, published, after)
     finally:
         await engine.dispose()
-
-
-async def _assert_utc_completion(session, ctx):
-    row = (
-        (
-            await session.execute(
-                text(
-                    "SELECT heartbeat_at,finished_at,pg_catalog.timezone('UTC',pg_catalog.clock_timestamp()) AS utc_now "
-                    "FROM mrf.import_run"
-                )
-            )
-        )
-        .mappings()
-        .one()
-    )
-    for field in ("heartbeat_at", "finished_at"):
-        assert row[field].tzinfo is None and 0 <= (row["utc_now"] - row[field]).total_seconds() < 30
-        assert ctx["context"]["_control_committed_" + field] == row[field].replace(tzinfo=UTC).isoformat(
-            timespec="microseconds"
-        )
-    result = ctx["context"]["_control_committed_result"]
-    published_at = datetime.fromisoformat(result["generation"]["published_at"])
-    assert published_at.tzinfo is not None
-    assert 0 <= (row["utc_now"].replace(tzinfo=UTC) - published_at).total_seconds() < 30
-
-
-def _patch_mutable_failure(monkeypatch, failure):
-    if failure == "rollback":
-        original = native.cleanup_model_family_stage
-
-        async def fail_cleanup(*args, **kwargs):
-            await original(*args, **kwargs)
-            raise RuntimeError("synthetic late failure")
-
-        monkeypatch.setattr(native, "cleanup_model_family_stage", fail_cleanup)
-    if failure == "postimage":
-        original_confirmation = mutable._confirmed
-
-        def fail_confirmation(row_by_field, attempt, storage, expected=None):
-            if expected is not None:
-                row_by_field = {**row_by_field, "phase_detail": "synthetic changed terminal postimage"}
-            return original_confirmation(row_by_field, attempt, storage, expected)
-
-        monkeypatch.setattr(mutable, "_confirmed", fail_confirmation)
-    if failure == "generation":
-        original_copy = mutable.publication.copy_catalog_records
-
-        async def change_generation(session, *args, **kwargs):
-            result = await original_copy(session, *args, **kwargs)
-            await session.execute(text("UPDATE mrf.code_sets_result_generation SET local_generation=4"))
-            return result
-
-        monkeypatch.setattr(mutable.publication, "copy_catalog_records", change_generation)
-    drift_at = {"storage-lock": 4, "storage-write": 5}.get(failure)
-    if drift_at is not None:
-        original_storage = mutable._mutable_storage
-        observations = []
-
-        async def changed_storage(*args):
-            storage = await original_storage(*args)
-            observations.append(storage)
-            if len(observations) == drift_at:
-                return {**storage, "database_oid": storage["database_oid"] + 1}
-            return storage
-
-        monkeypatch.setattr(mutable, "_mutable_storage", changed_storage)
-    if failure == "closed-binding":
-        monkeypatch.setattr(mutable.binding, "pin_catalog_source", AsyncMock(return_value=True))
-    if failure == "completion-cas":
-        original_apply = mutable._apply_rows
-
-        async def changed_attempt(session, *args):
-            generation = await original_apply(session, *args)
-            await session.execute(
-                text("UPDATE mrf.import_run SET progress=jsonb_set(progress::jsonb,'{attempt_id}','\"changed\"')::json")
-            )
-            return generation
-
-        monkeypatch.setattr(mutable, "_apply_rows", changed_attempt)
-
-
-async def _configure_mutable_refusal(monkeypatch, actors, ctx, failure):
-    if failure == "foreign":
-        async with actors.builder.begin() as session:
-            await session.execute(
-                text("INSERT INTO mrf.code_catalog (code_system,code,source) VALUES ('RC','0450','synthetic-foreign')")
-            )
-    if failure == "error":
-        async with actors.builder.begin() as session:
-            await session.execute(
-                text("UPDATE mrf.import_run SET error=CAST(:error AS json)"),
-                {"error": json.dumps({"code": "synthetic_failure"})},
-            )
-    if failure == "stale":
-        ctx["context"]["_control_attempt_id"] = uuid4().hex
-    if failure == "protected":
-        monkeypatch.setattr(
-            code_sets, "db", Database(engine=actors.publisher.kw["bind"], session_factory=actors.publisher)
-        )
-    if failure == "mixed":
-        async with actors.engine.begin() as connection:
-            await connection.execute(text(f'ALTER TABLE mrf.code_catalog OWNER TO "{actors.roles["owner"]}"'))
-            await connection.execute(text(f'GRANT SELECT ON mrf.code_catalog TO "{actors.roles["builder"]}"'))
-    if failure == "payload-hook":
-        async with actors.builder.begin() as session:
-            await session.execute(
-                text(
-                    "CREATE TRIGGER synthetic_payload_hook BEFORE UPDATE ON mrf.code_catalog "
-                    "FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger()"
-                )
-            )
-    if failure == "missing-retention":
-        async with actors.engine.begin() as connection:
-            await connection.execute(text("DROP SCHEMA hp_snapshot_retention"))
-    statements_by_failure = {
-        "generation-model": "ALTER TABLE mrf.code_sets_result_generation ALTER COLUMN row_count TYPE numeric",
-        "generation-singleton": "UPDATE mrf.code_sets_result_generation SET id=2",
-        "not-running": "UPDATE mrf.import_run SET status='failed'",
-        "already-finished": "UPDATE mrf.import_run SET finished_at=TIMESTAMP '2026-01-01'",
-    }
-    if failure in statements_by_failure:
-        async with actors.builder.begin() as session:
-            await session.execute(text(statements_by_failure[failure]))
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
     [
-        "foreign",
-        "rollback",
-        "postimage",
-        "generation",
         "stale",
         "cancel",
-        "protected",
         "missing",
-        "mixed",
-        "missing-retention",
         "payload-hook",
-        "error",
-        "generation-model",
         "generation-singleton",
+        "generation",
+        "error",
         "not-running",
         "already-finished",
-        "storage-lock",
-        "storage-write",
-        "closed-binding",
-        "completion-cas",
     ],
 )
-async def test_mutable_code_sets_refuse_conflicts_and_roll_back_the_whole_attempt(monkeypatch, failure):
+async def test_managed_preparation_refuses_invalid_source_or_attempt(monkeypatch, failure):
     engine = create_async_engine(_dsn())
     try:
         async with _mutable_catalog(engine) as actors:
             _mutable_dependencies(monkeypatch, actors)
             ctx = await _mutable_context(actors, status="canceling" if failure == "cancel" else "running")
-            _patch_mutable_failure(monkeypatch, failure)
-            await _configure_mutable_refusal(monkeypatch, actors, ctx, failure)
-            if failure == "missing":
-                async with actors.builder.begin() as session:
-                    await session.execute(text("DROP TABLE mrf.code_catalog"))
-                with pytest.raises(RuntimeError, match="relation inventory"):
-                    await code_sets.import_code_sets(_control_context=ctx)
-                async with actors.builder.begin() as session:
-                    assert await session.scalar(text("SELECT to_regclass('mrf.code_catalog')")) is None
-                assert ctx["context"].get("control_run_terminal_committed") is not True
-                return
-            before = await _mutable_state(actors)
-            with pytest.raises((RuntimeError, mutable.ImportCancelledError)):
+            if failure == "stale":
+                ctx["context"]["_control_attempt_id"] = uuid4().hex
+            statements_by_failure = {
+                "missing": "DROP TABLE mrf.code_catalog",
+                "payload-hook": "CREATE TRIGGER synthetic_payload_hook BEFORE UPDATE ON mrf.code_catalog FOR EACH ROW EXECUTE FUNCTION pg_catalog.suppress_redundant_updates_trigger()",
+                "generation-singleton": "UPDATE mrf.code_sets_result_generation SET id=2",
+                "generation": "UPDATE mrf.code_sets_result_generation SET local_generation=-1",
+                "error": "UPDATE mrf.import_run SET error=json_build_object('code','synthetic_failure')",
+                "not-running": "UPDATE mrf.import_run SET status='failed'",
+                "already-finished": "UPDATE mrf.import_run SET finished_at=TIMESTAMP '2026-01-01'",
+            }
+            if failure in statements_by_failure:
+                async with engine.begin() as session:
+                    await session.execute(text(statements_by_failure[failure]))
+            before = await _mutable_state(actors) if failure != "missing" else None
+            with pytest.raises((RuntimeError, DBAPIError)):
                 await code_sets.import_code_sets(_control_context=ctx)
+            if before is not None:
+                assert await _mutable_state(actors) == before
+            else:
+                async with engine.begin() as session:
+                    assert await session.scalar(text("SELECT to_regclass('mrf.code_catalog')")) is None
+            assert ctx["context"].get("control_run_handoff_committed") is not True
+    finally:
+        await engine.dispose()
+
+
+async def _change_pending(actors, prepared, failure):
+    statements_by_failure = {
+        "generation": "UPDATE mrf.code_sets_result_generation SET local_generation=4",
+        "source": "UPDATE mrf.code_catalog SET display_name='changed'",
+        "attempt": "UPDATE mrf.import_run SET progress=jsonb_set(progress::jsonb,'{attempt_id}','\"changed\"')::json",
+        "params": "UPDATE mrf.import_run SET params=json_build_object('changed',true)",
+        "finished": "UPDATE mrf.import_run SET finished_at=TIMESTAMP '2026-01-01'",
+    }
+    async with actors.engine.begin() as session:
+        if failure == "input":
+            schema = prepared[handoff.METRIC]["input"]["schema_name"]
+            await session.execute(text(f'UPDATE "{schema}".code_catalog SET display_name=:name'), {"name": "changed"})
+        elif failure in statements_by_failure:
+            await session.execute(text(statements_by_failure[failure]))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    ["foreign", "generation", "source", "attempt", "params", "input", "finished", "rollback", "completion-cas"],
+)
+async def test_publisher_refuses_conflicts_and_rolls_back_whole_attempt(monkeypatch, failure):
+    engine = create_async_engine(_dsn())
+    try:
+        async with _mutable_catalog(engine) as actors:
+            _mutable_dependencies(monkeypatch, actors)
+            if failure == "foreign":
+                async with actors.builder.begin() as session:
+                    await session.execute(
+                        text(
+                            "INSERT INTO mrf.code_catalog(code_system,code,source) VALUES ('RC','0450','synthetic-foreign')"
+                        )
+                    )
+            ctx = await _mutable_context(actors)
+            prepared = await code_sets.import_code_sets(_control_context=ctx)
+            await _change_pending(actors, prepared, failure)
+            original = cutover._finish
+
+            async def finish_then_fail(session, *args, **kwargs):
+                if failure == "completion-cas":
+                    await session.execute(text("UPDATE mrf.import_run SET progress='{}'"))
+                await original(session, *args, **kwargs)
+                if failure == "rollback":
+                    raise RuntimeError("synthetic late failure")
+
+            monkeypatch.setattr(cutover, "_finish", finish_then_fail)
+            before = await _mutable_state(actors)
+            with pytest.raises(RuntimeError):
+                await _publish_prepared(prepared)
             assert await _mutable_state(actors) == before
-            assert ctx["context"].get("control_run_terminal_committed") is not True
+            async with actors.builder.begin() as session:
+                assert await session.scalar(text("SELECT status FROM mrf.import_run")) == "finalizing"
     finally:
         await engine.dispose()
 
@@ -907,9 +888,9 @@ async def test_mutable_code_sets_concurrent_attempts_publish_once(monkeypatch):
     try:
         async with _mutable_catalog(engine) as actors:
             _mutable_dependencies(monkeypatch, actors)
-            ctx = await _mutable_context(actors)
+            prepared = await code_sets.import_code_sets(_control_context=await _mutable_context(actors))
             entered, resume = asyncio.Event(), asyncio.Event()
-            original = publication_copy = mutable.publication.copy_catalog_records
+            original = native.native_copy_projection
 
             async def pause_copy(*args, **kwargs):
                 result = await original(*args, **kwargs)
@@ -917,16 +898,16 @@ async def test_mutable_code_sets_concurrent_attempts_publish_once(monkeypatch):
                 await resume.wait()
                 return result
 
-            monkeypatch.setattr(mutable.publication, "copy_catalog_records", pause_copy)
-            first = asyncio.create_task(code_sets.import_code_sets(_control_context=ctx))
+            monkeypatch.setattr(native, "native_copy_projection", pause_copy)
+            first = asyncio.create_task(_publish_prepared(prepared))
             try:
                 await asyncio.wait_for(entered.wait(), 10)
                 with pytest.raises(DBAPIError, match="lock"):
-                    await code_sets.import_code_sets(_control_context={"context": dict(ctx["context"])})
+                    await _publish_prepared(prepared)
             finally:
                 resume.set()
                 await first
-            monkeypatch.setattr(mutable.publication, "copy_catalog_records", publication_copy)
+            assert (await _publish_prepared(prepared))["replayed"] is True
             assert (await _mutable_state(actors))[1][2] == 1
     finally:
         await engine.dispose()
@@ -955,22 +936,23 @@ async def test_mutable_code_sets_reconcile_a_lost_commit_response(monkeypatch, o
             transaction = database.transaction
             commit_seen = asyncio.Event()
             reconciling, resume = asyncio.Event(), asyncio.Event()
-            original_reconcile = mutable._reconcile
-
-            async def paused_reconcile(*args):
-                reconciling.set()
-                await resume.wait()
-                if outcome == "unknown":
-                    raise RuntimeError("synthetic unavailable commit reconciliation")
-                return await original_reconcile(*args)
-
-            monkeypatch.setattr(mutable, "_reconcile", paused_reconcile)
 
             @asynccontextmanager
             async def lost_commit():
                 async with transaction() as session:
+                    scalar = session.scalar
+
+                    async def pause_readback(statement, *args, **kwargs):
+                        if "FOR SHARE" in str(statement):
+                            reconciling.set()
+                            await resume.wait()
+                            if outcome == "unknown":
+                                raise RuntimeError("synthetic unavailable commit reconciliation")
+                        return await scalar(statement, *args, **kwargs)
+
+                    session.scalar = pause_readback
                     yield session
-                    is_published = await session.scalar(text("SELECT status='succeeded' FROM mrf.import_run"))
+                    is_published = await session.scalar(text("SELECT status='finalizing' FROM mrf.import_run"))
                 if is_published and not commit_seen.is_set():
                     commit_seen.set()
                     raise asyncio.CancelledError()
@@ -983,13 +965,13 @@ async def test_mutable_code_sets_reconcile_a_lost_commit_response(monkeypatch, o
                     await task
                 assert ctx["context"]["scoped_catalog_commit_unknown"] is True
                 assert ctx["context"].get("control_run_terminal_committed") is not True
-                assert (await _mutable_state(actors))[1][2] == 1
+                assert (await _mutable_state(actors))[1][2] == 0
                 return
             result_by_field = await task
-            assert result_by_field["status"] == "succeeded"
-            assert ctx["context"]["control_run_terminal_committed"] is True
+            assert result_by_field["status"] == "finalizing"
+            assert ctx["context"]["control_run_handoff_committed"] is True
             assert ctx["context"].get("scoped_catalog_commit_unknown") is not True
-            assert (await _mutable_state(actors))[1][2] == 1
+            assert (await _mutable_state(actors))[1][2] == 0
     finally:
         await engine.dispose()
 
@@ -1012,7 +994,7 @@ async def test_mutable_code_sets_reconcile_a_rejected_commit_without_claiming_su
                     async with transaction() as session:
                         yield session
                         if not commit_seen.is_set() and await session.scalar(
-                            text("SELECT status='succeeded' FROM mrf.import_run")
+                            text("SELECT status='finalizing' FROM mrf.import_run")
                         ):
                             commit_seen.set()
                             raise RuntimeError("synthetic rejected commit")
@@ -1022,18 +1004,11 @@ async def test_mutable_code_sets_reconcile_a_rejected_commit_without_claiming_su
                     raise
 
             monkeypatch.setattr(database, "transaction", reject_commit)
-            with pytest.raises((RuntimeError, mutable.ImportCancelledError)) as raised:
+            with pytest.raises(RuntimeError, match="synthetic rejected commit"):
                 await code_sets.import_code_sets(_control_context=ctx)
-            expected_by_status = {
-                "running": "synthetic rejected commit",
-                "canceling": "code-set managed attempt was canceled",
-                "canceled": "code-set managed attempt was canceled",
-                "failed": "mutable code-set commit outcome differs",
-            }
-            assert str(raised.value) == expected_by_status[status]
             assert await _mutable_state(actors) == before
             assert ctx["context"].get("control_run_terminal_committed") is not True
-            assert ctx["context"].get("scoped_catalog_commit_unknown", False) is (status == "failed")
+            assert ctx["context"].get("scoped_catalog_commit_unknown") is not True
     finally:
         await engine.dispose()
 
@@ -1066,23 +1041,22 @@ async def test_mutable_code_sets_reject_older_feed_after_another_publish(monkeyp
                         "Emergency", "Newest"
                     ),
                 )
-                result_by_field = await code_sets.import_code_sets(_control_context=newer)
+                result_by_field = await _publish_import(actors, newer)
                 winner = await _mutable_state(actors)
                 assert result_by_field["generation"]["local_generation"] == 1
                 assert any(code_row["display_name"] == "Newest" for code_row in winner[0])
                 resume.set()
-                with pytest.raises(RuntimeError, match="source changed during acquisition"):
-                    await task
+                older_prepared = await task
+                with pytest.raises(RuntimeError, match="generation vector changed"):
+                    await _publish_prepared(older_prepared)
                 assert await _mutable_state(actors) == winner
                 assert older["context"].get("control_run_terminal_committed") is not True
                 latest = await _mutable_context(actors)
-                assert (await code_sets.import_code_sets(_control_context=latest))["generation"][
-                    "local_generation"
-                ] == 2
+                assert (await _publish_import(actors, latest))["generation"]["local_generation"] == 2
                 advanced = await _mutable_state(actors)
                 download = Mock(side_effect=AssertionError("completed attempts must not reacquire feeds"))
                 monkeypatch.setattr(code_sets, "_download_text", download)
-                assert await code_sets.import_code_sets(_control_context=newer) == result_by_field
+                assert (await code_sets.import_code_sets(_control_context=newer))["status"] == "succeeded"
                 download.assert_not_called()
                 assert await _mutable_state(actors) == advanced
             finally:
@@ -1149,7 +1123,7 @@ async def test_mutable_normal_api_ack_cancel_status_and_idempotency_preserve_com
                     }
                 }
                 await _claim_mutable_context(monkeypatch, actors, database, context_by_field)
-                await code_sets.import_code_sets(_control_context=context_by_field)
+                await _publish_import(actors, context_by_field)
                 return control_imports._successful_enqueue_result(
                     params={}, adapter=control_imports._SINGLE_JOB_ADAPTERS["code-sets"], job_id="synthetic-job"
                 )
@@ -1159,7 +1133,8 @@ async def test_mutable_normal_api_ack_cancel_status_and_idempotency_preserve_com
             request_by_field = {"importer": "code-sets", "run_id": uuid4().hex, "idempotency_key": uuid4().hex}
             completed, created = await control_imports.create_import_run(request_by_field)
             assert created and completed["status"] == "succeeded"
-            assert completed["metrics"][mutable.METRIC]["generation"]["local_generation"] == 1
+            assert completed["metrics"][mutable.METRIC]["status"] == "succeeded"
+            assert (await _mutable_state(actors))[1][2] == 1
             before = await _mutable_state(actors)
             assert (await _late_queued_cancel(completed["run_id"], original_rows[0]))["status"] == "succeeded"
             for status in ("succeeded", "failed", "canceled"):
@@ -1193,7 +1168,7 @@ async def test_mutable_queued_cancel_cannot_replace_a_new_worker_claim(monkeypat
             current = await _late_queued_cancel(run_id, queued)
             assert current["status"] == "running"
             assert current["progress"]["attempt_id"] == ctx["context"]["_control_attempt_id"]
-            assert (await code_sets.import_code_sets(_control_context=ctx))["status"] == "succeeded"
+            assert (await _publish_import(actors, ctx))["status"] == "succeeded"
     finally:
         await engine.dispose()
 
@@ -1238,7 +1213,7 @@ async def test_mutable_code_sets_cancel_before_completion_rolls_back(monkeypatch
             ctx = await _mutable_context(actors)
             before = await _mutable_state(actors)
             copied = asyncio.Event()
-            original = mutable.publication.copy_catalog_records
+            original = native.native_copy_record_batch
 
             async def paused_copy(*args, **kwargs):
                 result = await original(*args, **kwargs)
@@ -1246,7 +1221,7 @@ async def test_mutable_code_sets_cancel_before_completion_rolls_back(monkeypatch
                 await asyncio.Event().wait()
                 return result
 
-            monkeypatch.setattr(mutable.publication, "copy_catalog_records", paused_copy)
+            monkeypatch.setattr(native, "native_copy_record_batch", paused_copy)
             task = asyncio.create_task(code_sets.import_code_sets(_control_context=ctx))
             try:
                 await asyncio.wait_for(copied.wait(), 10)
@@ -1431,7 +1406,7 @@ async def test_mutable_request_cancel_losing_to_claim_never_signals_worker(monke
             assert current["progress"]["attempt_id"] == context["context"]["_control_attempt_id"]
             for signal in signals:
                 signal.assert_not_awaited()
-            assert (await code_sets.import_code_sets(_control_context=context))["status"] == "succeeded"
+            assert (await _publish_import(actors, context))["status"] == "succeeded"
     finally:
         await engine.dispose()
 
@@ -1525,7 +1500,7 @@ async def test_mutable_api_key_owner_survives_completion_during_admission_or_con
                     owner_queries.append(statement)
                     if not completed_runs:
                         completed_runs.append(run_id)
-                        await code_sets.import_code_sets(_control_context=context)
+                        await _publish_import(actors, context)
                 return result
 
             monkeypatch.setattr(control_imports, "_idempotent_import_run", select_owner)

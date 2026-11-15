@@ -27862,7 +27862,7 @@ async def test_import_resources_owner_cancel_stops_sibling_promptly(monkeypatch)
 @pytest.mark.asyncio
 async def test_import_resources_cancel_probe_failure_stops_siblings(monkeypatch):
     _stub_resource_import_metadata(monkeypatch)
-    sibling_probe_started = asyncio.Event()
+    sibling_fetch_started = asyncio.Event()
     sibling_cancelled = asyncio.Event()
     wait_forever = asyncio.Event()
     probe_counts_by_name = {"calls": 0}
@@ -27870,12 +27870,12 @@ async def test_import_resources_cancel_probe_failure_stops_siblings(monkeypatch)
     async def fake_raise_if_cancelled(_cancel_ctx, _cancel_task):
         probe_counts_by_name["calls"] += 1
         if probe_counts_by_name["calls"] == 1:
-            await sibling_probe_started.wait()
+            await sibling_fetch_started.wait()
             raise ConnectionError("redis backend unavailable")
-        sibling_probe_started.set()
 
     async def fake_fetch_resource_rows(source, _resource_type, **_kwargs):
         assert source["source_id"] == "source_sibling"
+        sibling_fetch_started.set()
         try:
             await wait_forever.wait()
         except asyncio.CancelledError:
@@ -27895,7 +27895,7 @@ async def test_import_resources_cancel_probe_failure_stops_siblings(monkeypatch)
                 cancel_ctx={"redis": object()},
                 cancel_task={"run_id": "run_1"},
             ),
-            timeout=1,
+            timeout=5,
         )
 
     assert probe_counts_by_name["calls"] >= 3

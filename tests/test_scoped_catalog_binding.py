@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Current-binding and immutable effect checks; PostgreSQL qualification is separate."""
 
-import json
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -18,6 +17,7 @@ from process import ms_drg_result_generation as drg
 from process import reference_family_archive as native
 from process import reference_family_dictionary as dictionary
 from process import scoped_catalog_binding as binding
+from process import scoped_catalog_named_storage as storage
 
 
 def _code_generation(oid=10):
@@ -57,51 +57,36 @@ def _session():
 
 def _stub_binding(monkeypatch, pairs=(("code_catalog", 20),)):
     monkeypatch.setattr(binding, "lock_catalog_binding", AsyncMock(return_value=pairs))
+    monkeypatch.setattr(storage, "require_tables", AsyncMock(return_value=pairs))
+    monkeypatch.setattr(storage, "current_models", AsyncMock(return_value=storage.MODELS))
     monkeypatch.setattr(binding, "_lock_generation", AsyncMock(return_value=99))
     monkeypatch.setattr(binding, "require_closed_catalog_binding", AsyncMock(return_value=90))
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "generation", "unpublished", "rows", "digest", "late", "custody"])
-async def test_ms_drg_rebind_preserves_authority_and_changes_only_physical_receipt(monkeypatch, failure):
-    """Rebinding never advances origin or writes before generation, custody and content agree."""
+@pytest.mark.parametrize("failure", [None, "generation", "unpublished", "rows", "digest"])
+async def test_ms_drg_rebind_preserves_receipt_bytes_and_logical_cas(monkeypatch, failure):
+    """The compatibility reader validates content and never rewrites historical metadata."""
     _stub_binding(monkeypatch)
     expected, session = _drg_generation(), _session()
     if failure == "unpublished":
         expected["origin_lineage_id"] = None
-    locked = {**expected, "local_generation": 4} if failure == "generation" else expected
-    session.execute.return_value = SimpleNamespace(mappings=lambda: SimpleNamespace(one=lambda: locked))
-    current = deepcopy(_drg_generation(20)["receipt"])
-    if failure == "rows":
-        current["tables"][1]["row_sha256"] = "d" * 64
-    if failure == "digest":
-        current["content_sha256"] = "d" * 64
-    rebound_by_field = {**expected, "receipt": current}
-    capture = AsyncMock(return_value=current)
-    read = AsyncMock(
-        return_value={**rebound_by_field, "local_generation": 4} if failure == "late" else rebound_by_field
-    )
-    monkeypatch.setattr(drg, "capture_result", capture)
-    monkeypatch.setattr(drg, "read_current_generation", read)
-    if failure == "custody":
-        binding.require_closed_catalog_binding.side_effect = RuntimeError("open custody")
-    if failure in {"generation", "rows", "digest", "late", "custody"}:
-        with pytest.raises(RuntimeError, match="generation|source changed|custody"):
+    observed = deepcopy(expected)
+    if failure == "generation":
+        observed["local_generation"] += 1
+    session.execute.return_value = SimpleNamespace(mappings=lambda: SimpleNamespace(one=lambda: observed))
+    reader = AsyncMock(return_value=observed)
+    if failure in {"rows", "digest"}:
+        reader.side_effect = RuntimeError("MS-DRG serving result changed")
+    monkeypatch.setattr(drg, "read_current_generation", reader)
+    if failure in {"generation", "rows", "digest"}:
+        with pytest.raises(RuntimeError, match="generation changed|serving result changed"):
             await binding.rebind_ms_drg_generation(session, "serving", expected)
     else:
-        assert await binding.rebind_ms_drg_generation(session, "serving", expected) == (
-            expected if failure == "unpublished" else rebound_by_field
-        )
-    assert "FOR UPDATE" in str(session.execute.await_args_list[0].args[0])
-    assert session.execute.await_count == (2 if failure in {None, "late"} else 1)
-    if failure in {None, "late"}:
-        query, parameters = session.execute.await_args.args
-        assert str(query) == 'UPDATE "serving".ms_drg_result_generation SET receipt=CAST(:receipt AS jsonb) WHERE id=1'
-        assert json.loads(parameters["receipt"]) == current
-    if failure in {"generation", "unpublished", "custody"}:
-        capture.assert_not_awaited()
-    if failure != "late" and failure is not None:
-        read.assert_not_awaited()
+        assert await binding.rebind_ms_drg_generation(session, "serving", expected) == observed
+    assert "FOR UPDATE" in str(session.execute.await_args.args[0])
+    assert session.execute.await_count == 1
+    assert reader.await_count == int(failure not in {"generation", "unpublished"})
     session.commit.assert_not_awaited()
 
 
@@ -197,21 +182,20 @@ async def test_unchanged_native_binding_does_not_require_relocation_custody(monk
 @pytest.mark.parametrize("read_only", [False, True])
 async def test_generation_pin_uses_authenticated_lock_and_read_boundary(monkeypatch, read_only):
     """Successful native generation pins preserve mode, identity and read-only custody boundaries."""
+    from process import mrf_address_publication
+
     session = _session()
     monkeypatch.setattr(native, "_relation_oid", AsyncMock(return_value=10))
     lock, catalog, custody = AsyncMock(), AsyncMock(), AsyncMock()
     monkeypatch.setattr(native, "_lock_family", lock)
-    monkeypatch.setattr(native, "require_native_read_catalog", catalog)
+    monkeypatch.setattr(mrf_address_publication, "_require_native_read_structure", catalog)
     monkeypatch.setattr(binding, "require_closed_catalog_read_binding", custody)
     assert await binding._lock_generation(session, "serving", drg.TABLE, required=True, read_only=read_only) == 10
     lock.assert_awaited_once_with(
         session, "serving", (drg.TABLE,), "ACCESS SHARE" if read_only else "SHARE", nowait=True
     )
-    catalog.assert_awaited_once_with(session, (10,))
-    if read_only:
-        custody.assert_awaited_once_with(session, "serving", ((drg.TABLE, 10),))
-    else:
-        custody.assert_not_awaited()
+    catalog.assert_awaited_once_with(session, (10,), ())
+    custody.assert_not_awaited()
     session.execute.assert_not_awaited()
 
 
@@ -233,35 +217,38 @@ async def test_text_normalization_refuses_missing_native_source_before_alter(mon
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed", [False, True])
 async def test_effect_rebinding_authenticates_ms_drg_complete_current_family(monkeypatch, changed):
-    """MS-DRG authority requires its full family and the exact current catalog OID."""
+    """Named authority validates all source tables, including copied old receipts."""
     pairs = (("code_catalog", 20), ("code_crosswalk", 21))
-    drg_pairs = tuple((name, 20 + index) for index, (name, _) in enumerate(drg._SCOPES))
-    _stub_binding(monkeypatch)
-    binding.lock_catalog_binding.side_effect = [pairs, drg_pairs]
+    _stub_binding(monkeypatch, pairs)
     binding._lock_generation.side_effect = [None, 99]
-    monkeypatch.setattr(drg, "read_current_generation", AsyncMock(return_value=_drg_generation(22 if changed else 20)))
+    reader = AsyncMock(return_value=_drg_generation(999))
+    if changed:
+        reader.side_effect = RuntimeError("MS-DRG serving result changed")
+    monkeypatch.setattr(drg, "read_current_generation", reader)
     session = _session()
     if changed:
-        with pytest.raises(native.ReferenceFamilyArchiveError, match="content changed"):
+        with pytest.raises(RuntimeError, match="serving result changed"):
             await binding.require_current_catalog_rebinding(session, "serving", 20)
     else:
         await binding.require_current_catalog_rebinding(session, "serving", 20)
-    binding.require_closed_catalog_binding.assert_any_await(session, "serving", drg_pairs + ((drg.TABLE, 99),))
+    storage.require_tables.assert_any_await(session, "serving", storage.MODELS, lock="SHARE")
+    reader.assert_awaited_once_with(session, "serving")
+    binding.require_closed_catalog_binding.assert_not_awaited()
     session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("protected", [True, False, None])
-async def test_source_pin_uses_select_only_locks_exclusively_for_protected_storage(monkeypatch, protected):
+async def test_source_pin_uses_read_only_native_names_without_owner_metadata(monkeypatch):
+    from process import scoped_catalog_named_storage as storage
+
     session = _session()
-    session.scalar.return_value = protected
     family, generation = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(binding, "lock_catalog_binding", family)
+    monkeypatch.setattr(storage, "require_tables", family)
     monkeypatch.setattr(binding, "_lock_generation", generation)
-    is_read_only = protected is True
-    assert await binding.pin_catalog_source(session, "serving", (CodeCatalog,), codes.TABLE) is is_read_only
-    family.assert_awaited_once_with(session, "serving", (CodeCatalog,), read_only=is_read_only)
-    generation.assert_awaited_once_with(session, "serving", codes.TABLE, required=True, read_only=is_read_only)
+    assert await binding.pin_catalog_source(session, "serving", (CodeCatalog,), codes.TABLE) is None
+    family.assert_awaited_once_with(session, "serving", (CodeCatalog,))
+    generation.assert_awaited_once_with(session, "serving", codes.TABLE, required=True, read_only=True)
+    session.scalar.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -290,6 +277,8 @@ async def test_read_only_binding_authenticates_storage_without_granting_publicat
 
 @pytest.mark.asyncio
 async def test_read_only_family_and_generation_pins_reject_open_storage(monkeypatch):
+    from process import mrf_address_publication
+
     pairs = (("code_catalog", 10),)
     monkeypatch.setattr(native, "_incumbent_pairs", AsyncMock(return_value=pairs))
     monkeypatch.setattr(native, "_relation_oid", AsyncMock(return_value=11))
@@ -303,7 +292,12 @@ async def test_read_only_family_and_generation_pins_reject_open_storage(monkeypa
     session = _session()
     with pytest.raises(RuntimeError, match="open storage"):
         await binding.lock_catalog_binding(session, "serving", (CodeCatalog,), read_only=True)
-    with pytest.raises(RuntimeError, match="open storage"):
+    monkeypatch.setattr(
+        mrf_address_publication,
+        "_require_native_read_structure",
+        AsyncMock(side_effect=RuntimeError("unsafe generation structure")),
+    )
+    with pytest.raises(RuntimeError, match="unsafe generation structure"):
         await binding._lock_generation(session, "serving", codes.TABLE, required=True, read_only=True)
     assert [call.args[3] for call in locks.await_args_list] == ["ACCESS SHARE", "ACCESS SHARE"]
 
@@ -386,21 +380,17 @@ def test_ms_drg_logical_comparison_retains_every_semantic_receipt_field(changed)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "logical", "rows", "physical", "schema"])
-async def test_code_set_current_binding_resolves_only_exact_source_and_schema(monkeypatch, failure):
+@pytest.mark.parametrize("failure", [None, "logical", "rows", "schema"])
+@pytest.mark.parametrize("stored_oid", [None, 999])
+async def test_code_set_current_binding_resolves_only_exact_source_and_schema(monkeypatch, failure, stored_oid):
     _stub_binding(monkeypatch)
-    installed, observed = _code_generation(), _code_generation(20)
+    installed, observed = _code_generation(), _code_generation(stored_oid)
     if failure == "logical":
         observed = replace(observed, origin_generation=9)
-    if failure == "physical":
-        observed = replace(observed, code_catalog_oid=21)
     monkeypatch.setattr(codes, "read_generation", AsyncMock(return_value=observed))
-    monkeypatch.setattr(
-        codes,
-        "scope_receipt",
-        AsyncMock(return_value=(4 if failure == "rows" else 3, "a" * 64, observed.code_catalog_oid)),
-    )
-    monkeypatch.setattr(codes, "_column_signature", AsyncMock(return_value=("shape",)))
+    monkeypatch.setattr(codes, "scope_receipt", AsyncMock(return_value=(4 if failure == "rows" else 3, "a" * 64, 20)))
+    signature = AsyncMock(return_value=("shape",))
+    monkeypatch.setattr(codes, "_column_signature", signature)
     session = _session()
     options_by_field = dict(schema_sha256="bad" if failure == "schema" else codes._schema_digest(("shape",)))
     if failure:
@@ -408,73 +398,71 @@ async def test_code_set_current_binding_resolves_only_exact_source_and_schema(mo
             await binding.require_code_sets_binding(session, "serving", installed, **options_by_field)
     else:
         assert await binding.require_code_sets_binding(session, "serving", installed, **options_by_field) == observed
+        signature.assert_awaited_once_with(session, 20)
     session.execute.assert_not_awaited()
     session.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "logical", "physical"])
-async def test_ms_drg_binding_requires_complete_three_table_vector(monkeypatch, failure):
+@pytest.mark.parametrize("failure", [None, "logical", "partial"])
+@pytest.mark.parametrize("named", [False, True])
+async def test_ms_drg_binding_requires_complete_three_table_vector(monkeypatch, failure, named):
     pairs = tuple((name, 20 + index) for index, (name, _) in enumerate(drg._SCOPES))
     _stub_binding(monkeypatch, pairs)
-    installed, observed = _drg_generation(), _drg_generation(20)
+    installed, observed = _drg_generation(), _drg_generation(999)
+    if named:
+        for receipt in observed["receipt"]["tables"]:
+            del receipt["relation_oid"]
     if failure == "logical":
         observed["receipt"]["tables"][1]["row_sha256"] = "d" * 64
-    if failure == "physical":
-        observed["receipt"]["tables"][2]["relation_oid"] = 99
-    monkeypatch.setattr(drg, "read_current_generation", AsyncMock(return_value=observed))
+    if failure == "partial":
+        storage.require_tables.side_effect = RuntimeError("catalog relation is unavailable")
+    reader = AsyncMock(return_value=observed)
+    monkeypatch.setattr(drg, "read_current_generation", reader)
     if failure:
-        with pytest.raises(RuntimeError, match="current binding"):
+        with pytest.raises(RuntimeError, match="current binding|unavailable"):
             await binding.require_ms_drg_binding(_session(), "serving", installed)
     else:
         assert await binding.require_ms_drg_binding(_session(), "serving", installed) == observed
-    assert binding.lock_catalog_binding.await_args.args[2] == (CodeCatalog, CodeSynonym, CodeRelationship)
+    assert storage.require_tables.await_args.args[2] == storage.MODELS
+    if failure == "partial":
+        reader.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "generation", "rows", "late"])
-async def test_code_set_rebind_changes_only_physical_receipt(monkeypatch, failure):
+@pytest.mark.parametrize("failure", [None, "generation", "rows"])
+@pytest.mark.parametrize("stored_oid", [None, 999])
+async def test_code_set_rebind_preserves_stored_receipt_and_logical_cas(monkeypatch, failure, stored_oid):
     _stub_binding(monkeypatch)
     expected = _code_generation()
-    rebound = replace(expected, code_catalog_oid=20)
-    monkeypatch.setattr(
-        codes,
-        "read_generation",
-        AsyncMock(
-            side_effect=[
-                replace(expected, local_generation=4) if failure == "generation" else expected,
-                replace(rebound, row_count=9) if failure == "late" else rebound,
-            ]
-        ),
-    )
+    observed = replace(expected, code_catalog_oid=stored_oid, local_generation=4 if failure == "generation" else 3)
+    reader = AsyncMock(return_value=observed)
+    monkeypatch.setattr(codes, "read_generation", reader)
     monkeypatch.setattr(codes, "scope_receipt", AsyncMock(return_value=(4 if failure == "rows" else 3, "a" * 64, 20)))
     session = _session()
     if failure:
         with pytest.raises(codes.CodeSetsArchiveError, match="generation|source changed"):
             await binding.rebind_code_sets_generation(session, "serving", expected)
     else:
-        assert await binding.rebind_code_sets_generation(session, "serving", expected) == rebound
-    if failure in {"generation", "rows"}:
-        session.execute.assert_not_awaited()
-    else:
-        query, parameters = session.execute.await_args.args
-        assert str(query) == 'UPDATE "serving".code_sets_result_generation SET code_catalog_oid=:oid WHERE id=1'
-        assert parameters == {"oid": 20}
+        assert await binding.rebind_code_sets_generation(session, "serving", expected) == observed
+    reader.assert_awaited_once_with(session, "serving", lock=True)
+    session.execute.assert_not_awaited()
     session.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "missing", "inactive", "rows", "oid"])
-async def test_effect_rebinding_requires_current_native_source_authority(monkeypatch, failure):
+@pytest.mark.parametrize("failure", [None, "missing", "inactive", "rows", "unknown"])
+@pytest.mark.parametrize("stored_oid", [None, 999])
+async def test_effect_rebinding_requires_current_native_source_authority(monkeypatch, failure, stored_oid):
     _stub_binding(monkeypatch, (("code_catalog", 20), ("code_crosswalk", 21)))
     binding._lock_generation.side_effect = [None, None] if failure == "missing" else [99, None]
     session = _session()
-    session.scalar.return_value = failure != "inactive"
-    observed = _code_generation(22 if failure == "oid" else 20)
+    session.scalar.return_value = None if failure == "unknown" else failure != "inactive"
+    observed = _code_generation(stored_oid)
     monkeypatch.setattr(codes, "read_generation", AsyncMock(return_value=observed))
     monkeypatch.setattr(codes, "scope_receipt", AsyncMock(return_value=(4 if failure == "rows" else 3, "a" * 64, 20)))
     if failure:
-        with pytest.raises(native.ReferenceFamilyArchiveError, match="authority|content changed"):
+        with pytest.raises(native.ReferenceFamilyArchiveError, match="authority|content changed|unavailable"):
             await binding.require_current_catalog_rebinding(session, "serving", 20)
     else:
         await binding.require_current_catalog_rebinding(session, "serving", 20)
@@ -482,22 +470,23 @@ async def test_effect_rebinding_requires_current_native_source_authority(monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "mismatch,table,accepted", [(False, 0, True), (True, 0, True), (True, 1, False), (None, 0, False)]
-)
-async def test_effect_destination_preserves_oid_fence_or_authenticates_catalog(monkeypatch, mismatch, table, accepted):
-    proof = AsyncMock()
-    monkeypatch.setattr(binding, "require_current_catalog_rebinding", proof)
+@pytest.mark.parametrize("table", [0, 1])
+@pytest.mark.parametrize("fault", [None, "changed", "schema"])
+async def test_effect_destination_resolves_native_names_without_saved_ids(monkeypatch, table, fault):
+    family = AsyncMock(return_value=(("code_catalog", 20), ("code_crosswalk", 21)))
+    if fault == "schema":
+        family.side_effect = RuntimeError("shared catalog model columns differ")
+    monkeypatch.setattr(storage, "require_tables", family)
     session = _session()
-    session.scalar.return_value = mismatch
     mirror = dictionary._DRUG_SCOPED_MODELS[table]
-    if accepted:
-        await dictionary._require_effect_destination(session, mirror, '"candidate"."effects"', "serving", 20)
+    oid = 999 if fault == "changed" else 20 + table
+    if fault:
+        with pytest.raises(RuntimeError, match="destination changed|columns differ"):
+            await dictionary._require_effect_destination(session, mirror, '"candidate"."effects"', "serving", oid)
     else:
-        with pytest.raises(native.ReferenceFamilyArchiveError, match="destination changed"):
-            await dictionary._require_effect_destination(session, mirror, '"candidate"."effects"', "serving", 20)
-    assert proof.await_count == int(accepted and mismatch is True)
-    assert "destination_oid IS DISTINCT FROM :oid" in str(session.scalar.await_args.args[0])
+        await dictionary._require_effect_destination(session, mirror, '"candidate"."effects"', "serving", oid)
+    family.assert_awaited_once_with(session, "serving", (CodeCatalog, CodeCrosswalk), lock="SHARE")
+    session.scalar.assert_not_awaited()
     session.execute.assert_not_awaited()
 
 
@@ -574,27 +563,22 @@ async def test_current_binding_requires_real_closed_native_custody(monkeypatch, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("importer", ["code-sets", "ms-drg"])
-async def test_relocated_current_receipt_refuses_open_custody(monkeypatch, importer):
-    _stub_binding(
-        monkeypatch,
-        (("code_catalog", 20),)
-        if importer == "code-sets"
-        else tuple((name, 20 + index) for index, (name, _) in enumerate(drg._SCOPES)),
-    )
-    binding.require_closed_catalog_binding.side_effect = RuntimeError("synthetic open custody")
+async def test_current_receipt_refuses_invalid_named_storage_before_generation_read(monkeypatch, importer):
+    _stub_binding(monkeypatch)
+    storage.require_tables.side_effect = RuntimeError("synthetic invalid model")
+    reader = AsyncMock()
     if importer == "code-sets":
-        monkeypatch.setattr(codes, "read_generation", AsyncMock(return_value=_code_generation(20)))
-        monkeypatch.setattr(codes, "scope_receipt", AsyncMock(return_value=(3, "a" * 64, 20)))
-        monkeypatch.setattr(codes, "_column_signature", AsyncMock(return_value=("shape",)))
+        monkeypatch.setattr(codes, "read_generation", reader)
         operation = binding.require_code_sets_binding(
             _session(), "serving", _code_generation(), schema_sha256=codes._schema_digest(("shape",))
         )
     else:
-        monkeypatch.setattr(drg, "read_current_generation", AsyncMock(return_value=_drg_generation(20)))
+        monkeypatch.setattr(drg, "read_current_generation", reader)
         operation = binding.require_ms_drg_binding(_session(), "serving", _drg_generation())
-    with pytest.raises(RuntimeError, match="open custody"):
+    with pytest.raises(RuntimeError, match="invalid model"):
         await operation
-    assert binding.require_closed_catalog_binding.await_args.args[2][-1][1] == 99
+    reader.assert_not_awaited()
+    binding.require_closed_catalog_binding.assert_not_awaited()
 
 
 @pytest.mark.asyncio

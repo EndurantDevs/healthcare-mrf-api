@@ -2,7 +2,6 @@
 """Host call-flow checks for complete scoped composition and its caller-owned transaction."""
 
 from contextlib import asynccontextmanager
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -12,8 +11,12 @@ import pytest
 from db.models import CodeCatalog
 from process import code_sets_result_archive as codes
 from process import reference_family_archive as native
+from process import scoped_catalog_named_cutover as cutover
+from process import scoped_catalog_named_generation as generations
+from process import scoped_catalog_named_retention as retention
+from process import scoped_catalog_named_storage as storage
 from process import scoped_catalog_publication as publication
-from process import scoped_catalog_retention as retention
+from tests.test_scoped_catalog_handoff import _generation
 
 
 def _session():
@@ -30,23 +33,6 @@ def _input(importer="ms-drg"):
     return publication.CatalogInput(spec, ownership)
 
 
-def _prepared():
-    incoming = _input()
-    incumbent = native.ReferenceFamilyIncumbent(
-        incoming.spec.importer_id, "serving", tuple((name, oid + 20) for name, oid in incoming.ownership.relation_oids)
-    )
-    return publication.ComposedCatalog(
-        "ms-drg",
-        incoming.spec,
-        incoming.ownership,
-        incumbent,
-        {"code-sets": object(), "ms-drg": object()},
-        (),
-        50,
-        "77",
-    )
-
-
 def test_scoped_input_refuses_unknown_producer():
     """Only the two compiled catalog producers can obtain a native input model inventory."""
     with pytest.raises(native.ReferenceFamilyArchiveError, match="producer is unsupported"):
@@ -58,53 +44,26 @@ def test_scoped_input_refuses_unknown_producer():
 async def test_current_family_refuses_partial_synonym_relationship_inventory(monkeypatch, oids):
     """A partially installed MS-DRG family cannot be hidden by a code-only producer."""
     monkeypatch.setattr(native, "_relation_oid", AsyncMock(side_effect=oids))
-    lock = AsyncMock()
-    monkeypatch.setattr(publication.binding, "lock_catalog_binding", lock)
-    with pytest.raises(native.ReferenceFamilyArchiveError, match="family is incomplete"):
-        await publication._current_family(_session(), "serving", "code-sets")
-    lock.assert_not_awaited()
+    with pytest.raises(RuntimeError, match="family is incomplete"):
+        await storage.current_models(_session(), "serving")
 
 
 @pytest.mark.asyncio
 async def test_composition_refuses_different_producer_before_current_state(monkeypatch):
     """A complete input from the wrong producer cannot enter composition or acquire current authority."""
     current = AsyncMock()
-    monkeypatch.setattr(publication, "_current_family", current)
-    with pytest.raises(native.ReferenceFamilyArchiveError, match="input producer differs"):
+    monkeypatch.setattr(storage, "current_models", current)
+    monkeypatch.setattr(publication.PublisherSettings, "from_environment", lambda: SimpleNamespace(schema="serving"))
+    with pytest.raises(RuntimeError, match="input differs"):
         await publication.compose_catalog_family(_session(), "serving", "ms-drg", _input("code-sets"), (), object())
     current.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("transaction", [None, 77, "not-a-transaction", "0"])
-async def test_publication_requires_native_transaction_identity(transaction):
-    """Only a positive native transaction identifier can fence a composed candidate."""
-    session = _session()
-    session.scalar.return_value = transaction
-    with pytest.raises(native.ReferenceFamilyArchiveError, match="transaction is unavailable"):
-        await publication._transaction_id(session)
-    session.execute.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_current_generations_refuse_code_source_drift_before_other_family(monkeypatch):
-    """An installed code generation's exact rows must still agree before its authority is captured."""
-    generation = SimpleNamespace(origin_generation=1, row_count=3, row_sha256="a" * 64, code_catalog_oid=10)
-    monkeypatch.setattr(publication.binding, "_lock_generation", AsyncMock(return_value=9))
-    monkeypatch.setattr(codes, "read_generation", AsyncMock(return_value=generation))
-    monkeypatch.setattr(codes, "scope_receipt", AsyncMock(return_value=(4, "a" * 64, 10)))
-    session = _session()
-    with pytest.raises(codes.CodeSetsArchiveError, match="predecessor drifted"):
-        await publication._current_generations(session, "serving", "code-sets", read_only=True)
-    assert publication.binding._lock_generation.await_count == 1
-    session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_records_copy_before_complete_native_indexes(monkeypatch):
     incoming = _input("code-sets")
     session, events = _session(), []
-    monkeypatch.setattr(native, "verify_model_family_stage_ownership", AsyncMock())
+    monkeypatch.setattr(publication, "_input_handles", AsyncMock())
 
     async def copy_batch(observed, model, **options):
         assert observed is session and model is CodeCatalog
@@ -116,11 +75,11 @@ async def test_records_copy_before_complete_native_indexes(monkeypatch):
         return len(options["records"])
 
     async def complete(*arguments):
-        assert arguments == (session, incoming.spec, incoming.ownership)
+        assert arguments == (session, incoming.ownership.schema_name, incoming.spec.model_types)
         events.append("indexes")
 
     monkeypatch.setattr(native, "native_copy_record_batch", copy_batch)
-    monkeypatch.setattr(native, "complete_model_family_stage", complete)
+    monkeypatch.setattr(storage, "complete_stage", complete)
     counts = await publication.copy_catalog_records(session, incoming, {"code_catalog": [{"code": "001"}] * 5001})
     assert counts == {"code_catalog": 5001}
     assert events == [5000, 1, "indexes"]
@@ -130,156 +89,12 @@ async def test_records_copy_before_complete_native_indexes(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("payloads", [{}, {"code_catalog": [{"unexpected": 1}]}])
 async def test_record_copy_refuses_unbound_model_fields(monkeypatch, payloads):
-    monkeypatch.setattr(native, "verify_model_family_stage_ownership", AsyncMock())
+    monkeypatch.setattr(publication, "_input_handles", AsyncMock())
     copy = AsyncMock()
     monkeypatch.setattr(native, "native_copy_record_batch", copy)
-    with pytest.raises(native.ReferenceFamilyArchiveError, match="differ"):
+    with pytest.raises(RuntimeError, match="differ"):
         await publication.copy_catalog_records(_session(), _input("code-sets"), payloads)
     copy.assert_not_awaited()
-
-
-def _composition_steps(monkeypatch, prepared, events, failure=None):
-    outcomes_by_step = {
-        "_current_family": (prepared.spec, prepared.incumbent, prepared.owner_oid),
-        "_current_generations": prepared.generations,
-        "_capture_access": prepared.access,
-        "precreate_model_family_stage": prepared.ownership,
-    }
-    steps = (
-        (publication, "_current_family"),
-        (publication, "_current_generations"),
-        (publication, "_capture_access"),
-        (native, "precreate_model_family_stage"),
-        (publication.binding, "match_catalog_text_columns"),
-        (publication, "compose_model_family_stage"),
-        (publication, "validate_catalog_semantics"),
-        (publication, "_require_unchanged_schema"),
-        (publication, "_seal_candidate"),
-    )
-    for module, name in steps:
-
-        async def perform(*arguments, step=name, **keywords):
-            events.append(step)
-            if step == failure:
-                raise RuntimeError("refused " + step)
-            return outcomes_by_step.get(step)
-
-        monkeypatch.setattr(module, name, perform)
-    return [name for _, name in steps]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure",
-    [None, "_current_family", "compose_model_family_stage", "validate_catalog_semantics", "_require_unchanged_schema"],
-)
-async def test_composition_verifies_every_boundary_before_sealing(monkeypatch, failure):
-    prepared, events = _prepared(), []
-    steps = _composition_steps(monkeypatch, prepared, events, failure)
-    arguments = (_session(), "serving", "ms-drg", _input(), publication.contributions("ms-drg"), object())
-    if failure:
-        with pytest.raises(RuntimeError, match="refused"):
-            await publication.compose_catalog_family(*arguments)
-        assert events == steps[: steps.index(failure) + 1]
-    else:
-        assert await publication.compose_catalog_family(*arguments) == prepared
-        assert events == steps
-
-
-def _activation_steps(monkeypatch, prepared, events, failure=None):
-    retained_by_field = {"retained": True}
-    operations = (
-        (native, "_lock_family", None),
-        (native, "verify_model_family_stage_ownership", None),
-        (native, "_incumbent_pairs", prepared.incumbent.relation_oids),
-        (publication, "_current_generations", prepared.generations),
-        (native, "_rotate_family_relations", "predecessor"),
-        (retention, "retain_catalog_authority", retained_by_field),
-        (publication.binding, "rebind_code_sets_generation", None),
-        (publication, "_restore_access", None),
-        (publication, "_seal_generations", None),
-        (retention, "finish_catalog_authority", None),
-    )
-    for module, name, outcome in operations:
-
-        async def perform(*arguments, step=name, result=outcome, **keywords):
-            events.append(step)
-            if step == failure:
-                raise RuntimeError("refused " + step)
-            return result
-
-        monkeypatch.setattr(module, name, AsyncMock(side_effect=perform))
-
-    async def publish():
-        events.append("publish")
-        return "current"
-
-    return publish, retained_by_field
-
-
-@pytest.mark.asyncio
-async def test_atomic_swap_retains_authority_before_generation(monkeypatch):
-    prepared, session, events = _prepared(), _session(), []
-    publish, retained = _activation_steps(monkeypatch, prepared, events)
-    current = await publication.activate_catalog_family(session, prepared, publish)
-    assert current == ("current", retained)
-    assert events == [
-        "_lock_family",
-        "verify_model_family_stage_ownership",
-        "_incumbent_pairs",
-        "_current_generations",
-        "_rotate_family_relations",
-        "retain_catalog_authority",
-        "publish",
-        "rebind_code_sets_generation",
-        "_restore_access",
-        "_seal_generations",
-        "finish_catalog_authority",
-    ]
-    publication.binding.rebind_code_sets_generation.assert_awaited_once_with(
-        session, "serving", prepared.generations["code-sets"]
-    )
-    native._lock_family.assert_awaited_once_with(
-        session, "serving", tuple(sorted(prepared.spec.table_names)), "ACCESS EXCLUSIVE", nowait=True
-    )
-    assert str(session.execute.await_args.args[0]) == f'DROP SCHEMA "{prepared.ownership.schema_name}" RESTRICT'
-    assert not hasattr(session, "commit")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure",
-    [
-        "verify_model_family_stage_ownership",
-        "_rotate_family_relations",
-        "retain_catalog_authority",
-        "_restore_access",
-        "finish_catalog_authority",
-    ],
-)
-async def test_swap_errors_propagate_to_callers_transaction(monkeypatch, failure):
-    prepared, session, events = _prepared(), _session(), []
-    publish, _retained = _activation_steps(monkeypatch, prepared, events, failure)
-    with pytest.raises(RuntimeError, match="refused"):
-        await publication.activate_catalog_family(session, prepared, publish)
-    assert events[-1] == failure
-    session.execute.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["transaction", "oids", "generation"])
-async def test_swap_rechecks_complete_current_vector(monkeypatch, changed):
-    prepared, events = _prepared(), []
-    publish, _retained = _activation_steps(monkeypatch, prepared, events)
-    if changed == "transaction":
-        prepared = replace(prepared, transaction_id="78")
-    elif changed == "oids":
-        monkeypatch.setattr(native, "_incumbent_pairs", AsyncMock(return_value=(("code_catalog", 99),)))
-    else:
-        monkeypatch.setattr(publication, "_current_generations", AsyncMock(return_value={}))
-    with pytest.raises(native.ReferenceFamilyArchiveError, match="changed"):
-        await publication.activate_catalog_family(_session(), prepared, publish)
-    assert "_rotate_family_relations" not in events and "publish" not in events
 
 
 @pytest.mark.asyncio
@@ -341,23 +156,6 @@ async def test_native_schema_keeps_incumbent_constraints_and_indexes(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_ordinary_predecessor_capture_needs_no_live_row_update_privilege(monkeypatch):
-    from process import ms_drg_result_archive as drg
-
-    generation = SimpleNamespace(origin_generation=None)
-    monkeypatch.setattr(publication.binding, "_lock_generation", AsyncMock(return_value=9))
-    codes_read, drg_read = AsyncMock(return_value=generation), AsyncMock(return_value=({"local_generation": 0}, {}))
-    monkeypatch.setattr(codes, "read_generation", codes_read)
-    monkeypatch.setattr(drg, "_current", drg_read)
-    session = _session()
-    result = await publication._current_generations(session, "serving", "ms-drg", read_only=True)
-    assert set(result) == {"code-sets", "ms-drg"}
-    codes_read.assert_awaited_once_with(session, "serving", lock=False)
-    drg_read.assert_awaited_once_with(session, "serving", lock=False)
-    assert all(call.kwargs["read_only"] is True for call in publication.binding._lock_generation.await_args_list)
-
-
-@pytest.mark.asyncio
 async def test_native_fixture_refuses_preexisting_names_before_registering_cleanup():
     from tests import scoped_catalog_native_fixture as fixture
 
@@ -413,3 +211,85 @@ async def test_native_fixture_refuses_unknown_importer_before_custody_mutation()
 
     with pytest.raises(ValueError, match="unsupported scoped catalog generation table"):
         await fixture.seal_catalog(object(), "synthetic_live", (CodeCatalog,), "unknown_generation")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "companion", "data", "semantic"])
+async def test_cutover_checks_complete_generation_and_content(monkeypatch, change):
+    generations_by_importer = {name: _generation() for name in ("code-sets", "ms-drg")}
+    handoff_by_field = {
+        "schema_name": "serving",
+        "importer_id": "code-sets",
+        "expected_generations": generations_by_importer,
+        "expected_tables": ["unchanged"],
+    }
+    observed_by_importer = {name: dict(generation) for name, generation in generations_by_importer.items()}
+    if change == "companion":
+        observed_by_importer["ms-drg"]["local_generation"] += 1
+    lock = AsyncMock()
+    monkeypatch.setattr(storage, "require_tables", lock)
+    monkeypatch.setattr(generations, "read_generations", AsyncMock(return_value=observed_by_importer))
+    monkeypatch.setattr(
+        generations,
+        "validate_published_content",
+        AsyncMock(side_effect=RuntimeError("semantic drift") if change == "semantic" else None),
+    )
+    monkeypatch.setattr(
+        storage, "table_receipts", AsyncMock(return_value=["changed" if change == "data" else "unchanged"])
+    )
+    if change:
+        with pytest.raises(RuntimeError, match="changed|drift"):
+            await cutover._require_current(_session(), handoff_by_field, storage.MODELS, lock=True)
+    else:
+        assert await cutover._require_current(_session(), handoff_by_field, storage.MODELS, lock=True) == (
+            generations_by_importer,
+            ["unchanged"],
+        )
+    assert lock.await_args.kwargs == {"lock": "ACCESS EXCLUSIVE"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "current", "rotate", "copy", "publish", "record"])
+async def test_atomic_exchange_preserves_generation_order_and_propagates_failure(monkeypatch, failure):
+    events = []
+    identifier = uuid4()
+    generations_by_importer = {"code-sets": _generation()}
+    handoff_by_field = {
+        "schema_name": "serving",
+        "importer_id": "code-sets",
+        "expected_generations": generations_by_importer,
+        "expected_tables": [],
+    }
+    spec = publication.input_spec("code-sets")
+    session = _session()
+
+    def operation(name, result=None):
+        async def perform(*_args, **_kwargs):
+            events.append(name)
+            if failure == name:
+                raise RuntimeError("refused " + name)
+            return result
+
+        return AsyncMock(side_effect=perform)
+
+    monkeypatch.setattr(cutover, "_require_current", operation("current", (generations_by_importer, [])))
+    monkeypatch.setattr(storage, "require_tables", AsyncMock(return_value=(("code_catalog", 10),)))
+    monkeypatch.setattr(native, "_schema_oid", AsyncMock(return_value=9))
+    monkeypatch.setattr(native, "_rotate_family_relations", operation("rotate", "retained"))
+    monkeypatch.setattr(retention, "copy_generations", operation("copy"))
+    monkeypatch.setattr(generations, "read_generations", AsyncMock(return_value=generations_by_importer))
+    monkeypatch.setattr(retention, "record_retained", operation("record"))
+    monkeypatch.setattr(storage, "protect_tables", operation("grants"))
+    advance = operation("publish", "current")
+    arguments = (session, handoff_by_field, (identifier, "candidate", spec), SimpleNamespace(schema="serving"), advance)
+    if failure:
+        with pytest.raises(RuntimeError, match="refused"):
+            await cutover.activate_prepared(*arguments)
+        assert events[-1] == failure
+        session.execute.assert_not_awaited()
+    else:
+        current, receipt = await cutover.activate_prepared(*arguments)
+        assert current == "current" and receipt["previous_generations"] == generations_by_importer
+        assert events == ["current", "rotate", "copy", "publish", "record", "grants"]
+        assert str(session.execute.await_args.args[0]) == 'DROP SCHEMA "candidate" RESTRICT'
+    assert not hasattr(session, "commit")

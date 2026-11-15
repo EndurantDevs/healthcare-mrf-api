@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
-from sqlalchemy import text
+from sqlalchemy import Column, Integer, MetaData, text
 from sqlalchemy.dialects import postgresql
 
 from db.models import CodeCatalog, CodeCrosswalk, CodeRelationship, CodeSynonym
@@ -15,9 +16,32 @@ def model_ordered_columns(columns, model):
     """Keep complete native column records in the same order as named COPY projections."""
     columns_by_name = {column[0]: column for column in columns}
     names = tuple(model.__table__.columns.keys())
+    if model is CodeCatalog and "effective_year" in columns_by_name:
+        names += ("effective_year",)
     if len(columns_by_name) != len(columns) or set(columns_by_name) != set(names):
         raise ValueError("catalog model columns differ")
     return tuple(columns_by_name[name] for name in names)
+
+
+async def catalog_projection_model(session, schema, model, *, table_name=None):
+    """Include only the known legacy catalog field when copying an installed table."""
+    if model is not CodeCatalog:
+        return model
+    from process import reference_family_archive as native
+
+    relation = native._quoted(schema) + "." + native._quoted(table_name or model.__tablename__)
+    has_year = await session.scalar(
+        text(
+            "SELECT EXISTS(SELECT FROM pg_attribute WHERE attrelid=to_regclass(:relation) "
+            "AND attname='effective_year' AND attnum>0 AND NOT attisdropped)"
+        ),
+        {"relation": relation},
+    )
+    if has_year is not True:
+        return model
+    table = model.__table__.to_metadata(MetaData())
+    table.append_column(Column("effective_year", Integer(), nullable=True))
+    return SimpleNamespace(__table__=table, __tablename__=model.__tablename__)
 
 
 def named_catalog_schema(columns, constraints, indexes):
@@ -74,24 +98,16 @@ async def lock_catalog_binding(session, schema, models, *, read_only=False):
 
 
 async def pin_catalog_source(session, schema, models, generation_table):
-    """Use read pins only for closed storage; mutable legacy sources keep writer locks."""
-    from process import reference_family_archive as native
+    """Pin published names; actual PostgreSQL grants enforce read-only access."""
+    from process import scoped_catalog_named_storage as storage
 
-    native._require_transaction(session)
-    is_read_only = (
-        await session.scalar(
-            text(
-                "SELECT serving.nspowner=protected.nspowner FROM pg_catalog.pg_namespace serving "
-                "JOIN pg_catalog.pg_namespace protected ON protected.nspname='hp_snapshot_retention' "
-                "WHERE serving.nspname=:schema"
-            ),
-            {"schema": schema},
-        )
-        is True
-    )
-    await lock_catalog_binding(session, schema, models, read_only=is_read_only)
-    await _lock_generation(session, schema, generation_table, required=True, read_only=is_read_only)
-    return is_read_only
+    if models not in ((CodeCatalog,), storage.MODELS) or generation_table not in {
+        "code_sets_result_generation",
+        "ms_drg_result_generation",
+    }:
+        raise RuntimeError("published catalog source scope differs")
+    await storage.require_tables(session, schema, models)
+    await _lock_generation(session, schema, generation_table, required=True, read_only=True)
 
 
 async def require_closed_catalog_read_binding(session, schema, pairs):
@@ -139,7 +155,11 @@ async def _require_model_columns(session, oid, model):
         columns = model_ordered_columns(columns, model)
     except ValueError as error:
         raise native.ReferenceFamilyArchiveError("shared catalog model columns differ") from error
-    for observed, column in zip(columns, model.__table__.columns, strict=True):
+    declared_by_name = {column.name: column for column in model.__table__.columns}
+    if model is CodeCatalog:
+        declared_by_name["effective_year"] = Column("effective_year", Integer(), nullable=True)
+    for observed in columns:
+        column = declared_by_name[observed[0]]
         name, type_name, not_null, generated, identity, has_default = observed
         declared = str(column.type.compile(dialect=postgresql.dialect())).upper().replace(" ", "")
         actual = type_name.upper().replace("CHARACTER VARYING", "VARCHAR").replace(" ", "")
@@ -158,7 +178,7 @@ async def _require_model_columns(session, oid, model):
 
 
 async def match_catalog_text_columns(session, source_schema, target_schema, target_name):
-    """Preserve the ordinary importer's reviewed TEXT normalization in isolated heaps."""
+    """Preserve supported text and legacy year fields in isolated heaps."""
     from process import reference_family_archive as native
 
     native._require_transaction(session)
@@ -175,7 +195,9 @@ async def match_catalog_text_columns(session, source_schema, target_schema, targ
         (
             await session.execute(
                 text(
-                    "SELECT attname FROM pg_catalog.pg_attribute WHERE attrelid=:oid AND attname IN ('display_name','short_description') AND atttypid='pg_catalog.text'::regtype AND NOT attisdropped ORDER BY attname"
+                    "SELECT attname FROM pg_catalog.pg_attribute WHERE attrelid=:oid "
+                    "AND ((attname IN ('display_name','short_description') AND atttypid='pg_catalog.text'::regtype) "
+                    "OR attname='effective_year') AND NOT attisdropped ORDER BY attname"
                 ),
                 {"oid": oid},
             )
@@ -184,10 +206,13 @@ async def match_catalog_text_columns(session, source_schema, target_schema, targ
         .all()
     )
     for name in columns:
+        operation = (
+            'ADD COLUMN "effective_year" integer'
+            if name == "effective_year"
+            else f"ALTER COLUMN {native._quoted(name)} TYPE TEXT"
+        )
         await session.execute(
-            text(
-                f"ALTER TABLE {native._quoted(target_schema)}.{native._quoted(target_name)} ALTER COLUMN {native._quoted(name)} TYPE TEXT"
-            )
+            text(f"ALTER TABLE {native._quoted(target_schema)}.{native._quoted(target_name)} {operation}")
         )
 
 
@@ -221,39 +246,33 @@ def same_ms_drg_origin(observed, installed):
 
 
 async def require_code_sets_binding(session, schema, installed, *, schema_sha256):
-    """Resolve an immutable installation against the authenticated current physical receipt."""
+    """Verify named source content and shape while preserving the stored generation."""
     from process import code_sets_result_archive as codes
+    from process import scoped_catalog_named_storage as storage
 
-    pairs = await lock_catalog_binding(session, schema, (CodeCatalog,))
-    generation_oid = await _lock_generation(session, schema, codes.TABLE, required=True)
+    pairs_by_name = dict(await storage.require_tables(session, schema, await storage.current_models(session, schema)))
+    await _lock_generation(session, schema, codes.TABLE, required=True, read_only=True)
     observed = await codes.read_generation(session, schema)
+    count, digest, _oid = await codes.scope_receipt(session, schema)
     if (
         not same_code_sets_origin(observed, installed)
-        or await codes.scope_receipt(session, schema)
-        != (observed.row_count, observed.row_sha256, observed.code_catalog_oid)
-        or observed.code_catalog_oid != pairs[0][1]
-        or codes._schema_digest(await codes._column_signature(session, observed.code_catalog_oid)) != schema_sha256
+        or (count, digest) != (observed.row_count, observed.row_sha256)
+        or codes._schema_digest(await codes._column_signature(session, pairs_by_name["code_catalog"])) != schema_sha256
     ):
         raise codes.CodeSetsArchiveError("code-set current binding differs")
-    if observed.code_catalog_oid != installed.code_catalog_oid:
-        await require_closed_catalog_binding(session, schema, pairs + ((codes.TABLE, generation_oid),))
     return observed
 
 
 async def require_ms_drg_binding(session, schema, installed):
-    """Resolve all three immutable source receipts against one locked current family."""
+    """Verify all three named source tables without rewriting copied metadata."""
+    from process import scoped_catalog_named_storage as storage
     from process.ms_drg_result_generation import TABLE, read_current_generation
 
-    pairs = await lock_catalog_binding(session, schema, (CodeCatalog, CodeSynonym, CodeRelationship))
-    generation_oid = await _lock_generation(session, schema, TABLE, required=True)
+    await storage.require_tables(session, schema, storage.MODELS)
+    await _lock_generation(session, schema, TABLE, required=True, read_only=True)
     observed = await read_current_generation(session, schema)
-    if (
-        not same_ms_drg_origin(observed, installed)
-        or tuple((receipt["table"], receipt["relation_oid"]) for receipt in observed["receipt"]["tables"]) != pairs
-    ):
+    if not same_ms_drg_origin(observed, installed):
         raise RuntimeError("MS-DRG current binding differs")
-    if observed["receipt"] != installed["receipt"]:
-        await require_closed_catalog_binding(session, schema, pairs + ((TABLE, generation_oid),))
     return observed
 
 
@@ -284,91 +303,81 @@ async def _lock_generation(session, schema, table, *, required=False, read_only=
     await native._lock_family(session, schema, (table,), "ACCESS SHARE" if read_only else "SHARE", nowait=True)
     if await native._relation_oid(session, schema, table) != oid:
         raise native.ReferenceFamilyArchiveError("shared catalog generation identity changed")
-    await native.require_native_read_catalog(session, (oid,))
-    if read_only:
-        await require_closed_catalog_read_binding(session, schema, ((table, oid),))
+    from process.mrf_address_publication import _require_native_read_structure
+
+    await _require_native_read_structure(session, (oid,), ())
     return oid
 
 
 async def require_current_catalog_rebinding(session, schema, catalog_oid):
-    """Only a reverified native source publication can supersede an effect's catalog OID.
+    """Authenticate named source publications before continuing exact dictionary effects.
 
-    This does not admit crosswalk replacement or relax any key/image check. The
-    caller must already authenticate the frozen effect family and destination.
+    The catalog handle is transient and caller-held; saved receipt OIDs are inert.
+    Crosswalk identity and every effect key/image fence remain the caller's checks.
     """
     from process import code_sets_result_archive as codes
     from process import reference_family_archive as native
+    from process import scoped_catalog_named_storage as storage
     from process.ms_drg_result_generation import TABLE as drg_table
     from process.ms_drg_result_generation import read_current_generation
+    from process.scoped_catalog_named_generation import logical_generation
 
-    pairs = await lock_catalog_binding(session, schema, (CodeCatalog, CodeCrosswalk))
-    if pairs[0][1] != catalog_oid:
+    pairs_by_name = dict(await storage.require_tables(session, schema, (CodeCatalog, CodeCrosswalk), lock="SHARE"))
+    if pairs_by_name["code_catalog"] != catalog_oid:
         raise native.ReferenceFamilyArchiveError("shared catalog current identity changed")
-    await require_closed_catalog_binding(session, schema, pairs)
+    await storage.require_tables(session, schema, await storage.current_models(session, schema), lock="SHARE")
     has_current_authority = False
     for table in (codes.TABLE, drg_table):
-        oid = await _lock_generation(session, schema, table)
-        if oid is None:
+        if await _lock_generation(session, schema, table) is None:
             continue
         active = await session.scalar(
             text(
                 f"SELECT origin_generation IS NOT NULL FROM {native._quoted(schema)}.{native._quoted(table)} WHERE id=1"
             )
         )
-        if active is not True:
+        if active is False:
             continue
-        await require_closed_catalog_binding(session, schema, pairs + ((table, oid),))
+        if active is not True:
+            raise native.ReferenceFamilyArchiveError("shared catalog generation is unavailable")
         if table == codes.TABLE:
             observed = await codes.read_generation(session, schema)
-            current = await codes.scope_receipt(session, schema)
-            is_valid_binding = current == (observed.row_count, observed.row_sha256, observed.code_catalog_oid)
-            is_valid_binding = is_valid_binding and observed.code_catalog_oid == catalog_oid
+            count, digest, _oid = await codes.scope_receipt(session, schema)
+            if observed.origin_lineage_id is None or (count, digest) != (observed.row_count, observed.row_sha256):
+                raise native.ReferenceFamilyArchiveError("shared catalog generation content changed")
         else:
-            drg_pairs = await lock_catalog_binding(session, schema, (CodeCatalog, CodeSynonym, CodeRelationship))
-            await require_closed_catalog_binding(session, schema, drg_pairs + ((table, oid),))
-            observed = await read_current_generation(session, schema)
-            is_valid_binding = observed["receipt"]["tables"][0]["relation_oid"] == catalog_oid
-        if not is_valid_binding:
-            raise native.ReferenceFamilyArchiveError("shared catalog generation content changed")
+            await storage.require_tables(session, schema, storage.MODELS, lock="SHARE")
+            logical_generation(await read_current_generation(session, schema))
         has_current_authority = True
     if not has_current_authority:
         raise native.ReferenceFamilyArchiveError("shared catalog replacement has no current source authority")
 
 
 async def rebind_code_sets_generation(session, schema, expected):
-    """Rebind unchanged source rows after a verified caller-held swap, without advancing origin."""
+    """Validate exact logical CAS and named content; historical receipt bytes stay intact."""
     from process import code_sets_result_archive as codes
+    from process import scoped_catalog_named_storage as storage
 
-    pairs = await lock_catalog_binding(session, schema, (CodeCatalog,))
+    await storage.require_tables(session, schema, await storage.current_models(session, schema), lock="SHARE")
     await _lock_generation(session, schema, codes.TABLE, required=True)
     observed = await codes.read_generation(session, schema, lock=True)
-    if observed != expected:
+    if not codes._same_generation(observed, expected):
         raise codes.CodeSetsArchiveError("code-set generation changed before rebind")
     if expected.origin_lineage_id is None:
         return observed
-    await require_closed_catalog_binding(session, schema, pairs)
-    count, digest, oid = await codes.scope_receipt(session, schema)
-    if (count, digest, oid) != (expected.row_count, expected.row_sha256, pairs[0][1]):
+    count, digest, _oid = await codes.scope_receipt(session, schema)
+    if (count, digest) != (expected.row_count, expected.row_sha256):
         raise codes.CodeSetsArchiveError("code-set source changed during rebind")
-    await session.execute(
-        text(f"UPDATE {codes._schema(schema)}.{codes.TABLE} SET code_catalog_oid=:oid WHERE id=1"), {"oid": oid}
-    )
-    rebound = await codes.read_generation(session, schema)
-    if rebound != replace(expected, code_catalog_oid=oid):
-        raise codes.CodeSetsArchiveError("code-set rebound generation differs")
-    return rebound
+    return observed
 
 
 async def rebind_ms_drg_generation(session, schema, expected):
-    """Update only physical receipt fields for exactly unchanged MS-DRG source content."""
-    import json
+    """Validate exact logical CAS and all source tables without changing old receipts."""
+    from process import scoped_catalog_named_storage as storage
+    from process.ms_drg_result_generation import TABLE, _quoted, read_current_generation
 
-    from process import ms_drg_result_archive as drg
-    from process.ms_drg_result_generation import TABLE, _quoted, capture_result, read_current_generation
-
-    pairs = await lock_catalog_binding(session, schema, (CodeCatalog, CodeSynonym, CodeRelationship))
+    await storage.require_tables(session, schema, storage.MODELS, lock="SHARE")
     await _lock_generation(session, schema, TABLE, required=True)
-    generation_row = (
+    observed_by_field = dict(
         (
             await session.execute(
                 text(
@@ -379,22 +388,15 @@ async def rebind_ms_drg_generation(session, schema, expected):
         .mappings()
         .one()
     )
-    if dict(generation_row) != expected:
-        raise RuntimeError("MS-DRG generation changed before rebind")
     if expected["origin_lineage_id"] is None:
-        return dict(generation_row)
-    await require_closed_catalog_binding(session, schema, pairs)
-    current = await capture_result(session, schema)
-    if (
-        drg._content(current) != drg._content(expected["receipt"])
-        or current["content_sha256"] != expected["receipt"]["content_sha256"]
-    ):
-        raise RuntimeError("MS-DRG source changed during rebind")
-    await session.execute(
-        text(f"UPDATE {_quoted(schema)}.{TABLE} SET receipt=CAST(:receipt AS jsonb) WHERE id=1"),
-        {"receipt": json.dumps(current, sort_keys=True, separators=(",", ":"))},
-    )
-    rebound = await read_current_generation(session, schema)
-    if rebound != {**expected, "receipt": current}:
-        raise RuntimeError("MS-DRG rebound generation differs")
-    return rebound
+        is_matching_generation = observed_by_field == expected
+    else:
+        is_matching_generation = (
+            same_ms_drg_origin(observed_by_field, expected)
+            and observed_by_field["local_generation"] == expected["local_generation"]
+        )
+    if not is_matching_generation:
+        raise RuntimeError("MS-DRG generation changed before rebind")
+    if observed_by_field["origin_lineage_id"] is not None:
+        await read_current_generation(session, schema)
+    return observed_by_field

@@ -11,7 +11,9 @@ import process.clinical_reference_publication as clinical_publication
 import process.reference_stage as reference_stage
 from api import control_imports
 from process import scoped_catalog_handoff as catalog_handoff
+from process import scoped_catalog_named_publication as named_catalog
 from process.control_cancel import ImportCancelledError
+from tests.test_scoped_catalog_handoff import _sign, _value
 
 clinical = importlib.import_module("process.clinical_reference")
 ms_drg = importlib.import_module("process.ms_drg")
@@ -107,49 +109,72 @@ def _stage_drop_count(database):
 
 
 def _install_ms_drg_handoff_contract(monkeypatch, database, events, failure=None):
-    """Double candidate I/O only; exercise the real handoff transaction and importer boundary."""
-    incoming, receipt = object(), object()
+    """Double candidate I/O only; exercise the current managed handoff transaction."""
+    receipt_by_field = _value("ms-drg")
+    receipt_by_field.update(
+        schema_name="unit",
+        run_id="run-safe",
+        include_relationships=True,
+        metrics={"catalog_rows": 1, "synonym_rows": 1, "relationship_rows": 1},
+    )
+    receipt_by_field["source_contract_sha256"] = named_catalog.digest(
+        {
+            "importer": "ms-drg",
+            "params": {},
+            "options": {"include_relationships": True, "test_mode": False},
+            "metrics": receipt_by_field["metrics"],
+        }
+    )
+    receipt_by_field = _sign(receipt_by_field)
 
-    async def precreate(session, importer, schema):
+    async def read_run(session, schema, attempt, *, states):
+        assert session.database is database and database.is_transaction_active
+        assert schema == "unit" and states == ("running",)
+        assert attempt == {key: receipt_by_field[key] for key in ("run_id", "attempt_id", "attempt_started_at")}
+        return {"importer": "ms-drg", "finished_at": None, "metrics": {}, "params": {}, "node_id": "node-1"}
+
+    async def prepare_input(session, importer, schema, payloads):
         assert session.database is database and database.is_transaction_active
         assert (importer, schema) == ("ms-drg", "unit")
-        events.append("create")
-        return incoming
-
-    async def copy_rows(session, selected, payloads):
-        assert session.database is database and database.is_transaction_active
-        assert selected is incoming
         assert payloads == {
             "code_catalog": _ms_drg_payloads().catalog_payloads,
             "code_synonym": _ms_drg_payloads().synonym_payloads,
             "code_relationship": _ms_drg_payloads().relationship_payloads,
         }
-        events.extend(payloads)
+        events.extend(("create", *payloads))
         if failure is not None:
             raise failure
+        return receipt_by_field["input"], receipt_by_field["tables"]
 
-    async def record(session, context, **options):
+    async def record(session, schema, attempt, candidate):
         assert session.database is database and database.is_transaction_active
-        assert context["context"]["control_run_id"] == "run-safe"
-        assert options == {
-            "importer": "ms-drg",
-            "schema": "unit",
-            "incoming": incoming,
-            "options": {"include_relationships": True, "test_mode": False},
-            "metrics": {"catalog_rows": 1, "synonym_rows": 1, "relationship_rows": 1},
-        }
+        assert schema == "unit" and attempt["run_id"] == "run-safe"
+        assert candidate == receipt_by_field
         events.append("handoff")
-        return receipt
 
     monkeypatch.setattr(ms_drg, "db", database)
     monkeypatch.setattr(ms_drg, "_raise_if_cancelled", lambda _run_id: None)
-    monkeypatch.setattr(catalog_handoff.publication, "precreate_catalog_input", precreate)
-    monkeypatch.setattr(catalog_handoff.publication, "copy_catalog_records", copy_rows)
-    record_handoff = AsyncMock(side_effect=record)
-    activate = AsyncMock()
-    monkeypatch.setattr(catalog_handoff, "record_catalog_handoff", record_handoff)
+    monkeypatch.setattr(named_catalog, "_run", read_run)
+    monkeypatch.setattr(named_catalog, "_prepare_input", prepare_input)
+    record_handoff, activate = AsyncMock(side_effect=record), AsyncMock()
+    monkeypatch.setattr(named_catalog, "_record_handoff", record_handoff)
     monkeypatch.setattr(catalog_handoff.publication, "activate_catalog_family", activate)
-    return receipt, record_handoff, activate
+    return receipt_by_field, record_handoff, activate
+
+
+def _ms_drg_control_context(receipt):
+    """Supply the logical revision captured before acquisition, including the attempt fence."""
+    return {
+        "context": {
+            "control_run_id": receipt["run_id"],
+            "_control_attempt_id": receipt["attempt_id"],
+            "_control_attempt_started_at": receipt["attempt_started_at"],
+            named_catalog._CONTEXT_EXPECTED: {
+                "generations": receipt["expected_generations"],
+                "tables": receipt["expected_tables"],
+            },
+        }
+    }
 
 
 @pytest.mark.asyncio
@@ -157,7 +182,7 @@ async def test_ms_drg_candidate_and_handoff_share_one_transaction(monkeypatch):
     """All payload families commit one deferred handoff, never a worker-side live replacement."""
     database, events = _RecordingDb(), []
     receipt, recorded, activate = _install_ms_drg_handoff_contract(monkeypatch, database, events)
-    context_by_field = {"context": {"control_run_id": "run-safe"}}
+    context_by_field = _ms_drg_control_context(receipt)
     summary_map = {"catalog_rows": 1, "synonym_rows": 1, "relationship_rows": 1}
 
     outcome = await ms_drg._stage_and_publish(
@@ -181,8 +206,8 @@ async def test_ms_drg_candidate_and_handoff_share_one_transaction(monkeypatch):
 async def test_ms_drg_late_preparation_refusal_rolls_back_without_handoff(monkeypatch, failure):
     """A late failure or cancellation leaves neither a committed handoff nor live publication."""
     database, events = _RecordingDb(), []
-    _receipt, recorded, activate = _install_ms_drg_handoff_contract(monkeypatch, database, events, failure)
-    context_by_field = {"context": {"control_run_id": "run-safe"}}
+    receipt, recorded, activate = _install_ms_drg_handoff_contract(monkeypatch, database, events, failure)
+    context_by_field = _ms_drg_control_context(receipt)
     with pytest.raises(type(failure)) as caught:
         await ms_drg._stage_and_publish(
             "unit", replace(_ms_drg_request(), test_mode=False), _ms_drg_payloads(), {}, context_by_field

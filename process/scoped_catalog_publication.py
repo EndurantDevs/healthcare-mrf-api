@@ -1,18 +1,19 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Compose the two scoped catalog producers without mutating a serving slice."""
+"""Compose fixed catalog source slices through the shared named publisher path."""
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy import text
 
 from db.models import CodeCatalog, CodeRelationship, CodeSynonym
 from process import reference_family_archive as native
 from process import scoped_catalog_binding as binding
-from process.reference_family_composition import ReferenceModelContribution, compose_model_family_stage
+from process.reference_family_composition import ReferenceModelContribution
+from process.scoped_catalog_publisher import PublisherSettings
 
 MODELS = (CodeCatalog, CodeSynonym, CodeRelationship)
 
@@ -30,9 +31,8 @@ class ComposedCatalog:
     ownership: native.ReferenceFamilyStageOwnership
     incumbent: native.ReferenceFamilyIncumbent
     generations: dict
-    access: tuple
-    owner_oid: int
-    transaction_id: str
+    logical_handoff: dict
+    settings: PublisherSettings
 
 
 def input_spec(importer):
@@ -40,86 +40,6 @@ def input_spec(importer):
     if importer not in {"code-sets", "ms-drg"}:
         raise native.ReferenceFamilyArchiveError("scoped catalog producer is unsupported")
     return native.ReferenceFamilySpec("scoped-catalog", (CodeCatalog,) if importer == "code-sets" else MODELS)
-
-
-async def precreate_catalog_input(session, importer, destination):
-    """Create caller-owned heaps; an ordinary producer obtains no publication authority."""
-    spec = input_spec(importer)
-    ownership = await native.precreate_model_family_stage(session, spec, uuid4())
-    await binding.match_catalog_text_columns(session, destination, ownership.schema_name, "code_catalog")
-    return CatalogInput(spec, ownership)
-
-
-async def copy_catalog_records(session, incoming, payload_by_table):
-    """COPY fixed-size complete model records, with no live-table INSERT fallback."""
-    await native.verify_model_family_stage_ownership(session, incoming.spec, incoming.ownership)
-    if set(payload_by_table) != set(incoming.spec.table_names):
-        raise native.ReferenceFamilyArchiveError("catalog input model set differs")
-    counts_by_table = {}
-    for model in incoming.spec.model_types:
-        columns = tuple(model.__table__.columns.keys())
-        row_maps = payload_by_table[model.__tablename__]
-        if any(set(row_map) - set(columns) for row_map in row_maps):
-            raise native.ReferenceFamilyArchiveError("catalog input fields differ")
-        count = 0
-        for start in range(0, len(row_maps), 5000):
-            records = [tuple(row_map.get(name) for name in columns) for row_map in row_maps[start : start + 5000]]
-            count += await native.native_copy_record_batch(
-                session,
-                model,
-                schema_name=incoming.ownership.schema_name,
-                table_name=model.__tablename__,
-                columns=columns,
-                records=records,
-            )
-        counts_by_table[model.__tablename__] = count
-    await native.complete_model_family_stage(session, incoming.spec, incoming.ownership)
-    return counts_by_table
-
-
-async def copy_received_input(session, importer, destination, source_schema, source_tables, source_copy):
-    """Copy an already-authenticated frozen contribution into the same model input seam."""
-    spec = input_spec(importer)
-    native._schema_name(source_schema)
-    if source_tables not in (
-        spec.table_names,
-        tuple(name + "_predecessor" for name in spec.table_names),
-    ) or not isinstance(source_copy, native.ReferenceFamilySourceCopy):
-        raise native.ReferenceFamilyArchiveError("received catalog COPY scope differs")
-    incoming = await precreate_catalog_input(session, importer, destination)
-    await native._lock_family(session, source_schema, source_tables, "SHARE", nowait=True)
-    oids = tuple([await native._relation_oid(session, source_schema, name) for name in source_tables])
-    if any(type(oid) is not int or oid <= 0 for oid in oids) or len(set(oids)) != len(oids):
-        raise native.ReferenceFamilyArchiveError("received catalog source inventory differs")
-    await native.require_native_read_catalog(session, oids)
-    remaining = source_copy.max_bytes
-    async with asyncio.timeout(source_copy.timeout) as deadline:
-        for model, source_name in zip(spec.model_types, source_tables, strict=True):
-            columns = tuple(model.__table__.columns.keys())
-            projection = "SELECT " + ",".join(native._quoted(name) for name in columns)
-            projection += f" FROM {native._quoted(source_schema)}.{native._quoted(source_name)}"
-            remaining = await native._copy_source_projection(
-                session,
-                source_copy,
-                projection,
-                incoming.ownership.schema_name,
-                model.__tablename__,
-                columns,
-                remaining,
-                deadline.when(),
-            )
-        await native.complete_model_family_stage(session, spec, incoming.ownership)
-        for model, source_name in zip(spec.model_types, source_tables, strict=True):
-            if not await native._is_model_table_equal(
-                session,
-                model,
-                left_schema=source_schema,
-                left_name=source_name,
-                right_schema=incoming.ownership.schema_name,
-                right_name=model.__tablename__,
-            ):
-                raise native.ReferenceFamilyArchiveError("received catalog COPY rows differ")
-    return incoming
 
 
 def contributions(importer, *, include_relationships=True, upsert=False):
@@ -151,118 +71,6 @@ def contributions(importer, *, include_relationships=True, upsert=False):
     return tuple(contribution_rules)
 
 
-async def _current_family(session, schema, importer, *, read_only=False):
-    """A catalog replacement also fences an already-installed synonym/relationship family."""
-    spec = input_spec(importer)
-    optional_oids = []
-    for model in MODELS[1:]:
-        optional_oids.append(await native._relation_oid(session, schema, model.__tablename__))
-    if any(oid is not None for oid in optional_oids):
-        if any(oid is None for oid in optional_oids):
-            raise native.ReferenceFamilyArchiveError("shared catalog family is incomplete")
-        spec = native.ReferenceFamilySpec("scoped-catalog", MODELS)
-    pairs = await binding.lock_catalog_binding(session, schema, spec.model_types, read_only=read_only)
-    owner = await (
-        binding.require_closed_catalog_read_binding if read_only else binding.require_closed_catalog_binding
-    )(session, schema, pairs)
-    return spec, native.ReferenceFamilyIncumbent(spec.importer_id, schema, pairs), owner
-
-
-async def _current_generations(session, schema, importer, *, read_only=False):
-    from process import code_sets_result_archive as codes
-    from process import ms_drg_result_archive as drg
-
-    generations_by_importer = {}
-    for name, table in (("code-sets", codes.TABLE), ("ms-drg", drg.GENERATION_TABLE)):
-        oid = await binding._lock_generation(session, schema, table, required=name == importer, read_only=read_only)
-        if oid is None:
-            continue
-        if name == "code-sets":
-            generation = await codes.read_generation(session, schema, lock=not read_only)
-            if generation.origin_generation is not None:
-                if await codes.scope_receipt(session, schema) != (
-                    generation.row_count,
-                    generation.row_sha256,
-                    generation.code_catalog_oid,
-                ):
-                    raise codes.CodeSetsArchiveError("code-set publication predecessor drifted")
-        else:
-            active = await session.scalar(
-                text(f'SELECT origin_generation IS NOT NULL FROM "{schema}".{table} WHERE id=1')
-            )
-            if name != importer and active is False:
-                continue
-            generation, _receipt = await drg._current(session, schema, lock=not read_only)
-        generations_by_importer[name] = generation
-    return generations_by_importer
-
-
-async def _capture_access(session, incumbent):
-    from process import code_catalog_snapshot as catalog
-
-    access = []
-    for _name, oid in incumbent.relation_oids:
-        await catalog._require_supported_relation_state(session, oid)
-        await catalog._require_no_foreign_key_dependents(session, oid)
-        await catalog._require_no_dependent_views(session, oid)
-        access.append(await catalog._relation_access(session, oid))
-    return tuple(access)
-
-
-async def compose_catalog_family(session, schema, importer, incoming, rules, source_copy):
-    """An admitted publisher composes under one complete current-family CAS vector."""
-    native._require_transaction(session)
-    native._schema_name(schema)
-    if incoming.spec != input_spec(importer):
-        raise native.ReferenceFamilyArchiveError("catalog input producer differs")
-    spec, incumbent, owner = await _current_family(session, schema, importer)
-    generations_by_importer = await _current_generations(session, schema, importer)
-    access = await _capture_access(session, incumbent)
-    ownership = await native.precreate_model_family_stage(session, spec, uuid4())
-    await binding.match_catalog_text_columns(session, schema, ownership.schema_name, "code_catalog")
-    await compose_model_family_stage(
-        session,
-        spec,
-        ownership=ownership,
-        incumbent=incumbent,
-        incoming_spec=incoming.spec,
-        incoming=incoming.ownership,
-        contributions=rules,
-        source_copy=source_copy,
-    )
-    await validate_catalog_semantics(session, spec, ownership.schema_name)
-    await _require_unchanged_schema(session, spec, incumbent, ownership)
-    await _seal_candidate(session, ownership, owner)
-    transaction_id = await _transaction_id(session)
-    return ComposedCatalog(
-        importer,
-        spec,
-        ownership,
-        incumbent,
-        generations_by_importer,
-        access,
-        owner,
-        transaction_id,
-    )
-
-
-async def _transaction_id(session):
-    transaction_id = await session.scalar(text("SELECT pg_current_xact_id()::text"))
-    if not isinstance(transaction_id, str) or not transaction_id.isdecimal() or int(transaction_id) <= 0:
-        raise native.ReferenceFamilyArchiveError("catalog publication transaction is unavailable")
-    return transaction_id
-
-
-async def _require_unchanged_schema(session, spec, incumbent, ownership):
-    for model in spec.model_types:
-        name = model.__tablename__
-        await require_preserved_catalog_schema(
-            session,
-            (incumbent.schema_name, dict(incumbent.relation_oids)[name]),
-            (ownership.schema_name, dict(ownership.relation_oids)[name]),
-        )
-
-
 async def require_preserved_catalog_schema(session, incumbent, candidate):
     """Preserve native columns/constraints and every old index while completing model indexes."""
     from process import entity_address_snapshot_receipt as catalog
@@ -284,19 +92,6 @@ async def require_preserved_catalog_schema(session, incumbent, candidate):
         raise native.ReferenceFamilyArchiveError("catalog native columns or constraints differ")
     if any(index not in after["indexes"] for index in before["indexes"]):
         raise native.ReferenceFamilyArchiveError("catalog incumbent index is unavailable")
-
-
-async def _seal_candidate(session, ownership, owner_oid):
-    owner_name = await session.scalar(
-        text("SELECT quote_ident(rolname) FROM pg_roles WHERE oid=:oid"), {"oid": owner_oid}
-    )
-    if not owner_name:
-        raise native.ReferenceFamilyArchiveError("catalog protected owner is unavailable")
-    schema = native._quoted(ownership.schema_name)
-    await session.execute(text(f"ALTER SCHEMA {schema} OWNER TO {owner_name}"))
-    for name, _oid in ownership.relation_oids:
-        await session.execute(text(f"ALTER TABLE {schema}.{native._quoted(name)} OWNER TO {owner_name}"))
-    await native.seal_model_family_storage(session, ownership, owner_oid)
 
 
 async def validate_catalog_semantics(session, spec, schema):
@@ -340,66 +135,182 @@ async def validate_catalog_semantics(session, spec, schema):
         raise native.ReferenceFamilyArchiveError("catalog composite relationship semantics differ")
 
 
-async def activate_catalog_family(session, prepared, publish_generation, *, publication_handoff_sha256=None):
-    """Swap all heaps once, retain rollback authority, then advance only the changed source."""
-    from process.scoped_catalog_retention import finish_catalog_authority, retain_catalog_authority
+async def _input_handles(session, spec, dataset_id, schema):
+    from process import scoped_catalog_named_storage as storage
 
-    native._require_transaction(session)
-    if await _transaction_id(session) != prepared.transaction_id:
-        raise native.ReferenceFamilyArchiveError("catalog publication transaction changed")
-    schema = prepared.incumbent.schema_name
-    await native._lock_family(
-        session, schema, tuple(sorted(prepared.spec.table_names)), "ACCESS EXCLUSIVE", nowait=True
+    if schema != native.reference_family_stage_schema(UUID(str(dataset_id))):
+        raise RuntimeError("catalog candidate logical name differs")
+    await storage.require_inventory(session, schema, spec.table_names)
+    pairs = tuple([(name, await native._relation_oid(session, schema, name)) for name in sorted(spec.table_names)])
+    return native.ReferenceFamilyStageOwnership(
+        spec.importer_id, dataset_id, schema, await native._schema_oid(session, schema), pairs
     )
-    await native.verify_model_family_stage_ownership(session, prepared.spec, prepared.ownership)
-    if await native._incumbent_pairs(session, prepared.spec, schema) != prepared.incumbent.relation_oids:
-        raise native.ReferenceFamilyArchiveError("catalog publication incumbent changed")
-    if await _current_generations(session, schema, prepared.importer) != prepared.generations:
-        raise native.ReferenceFamilyArchiveError("catalog source authority changed")
-    predecessor = await native._rotate_family_relations(session, prepared.spec, prepared.ownership, prepared.incumbent)
-    receipt = await retain_catalog_authority(session, prepared, predecessor)
-    receipt["publication_handoff_sha256"] = publication_handoff_sha256
-    current = await publish_generation()
-    for importer, previous in prepared.generations.items():
-        if importer != prepared.importer:
-            rebind = (
-                binding.rebind_code_sets_generation if importer == "code-sets" else binding.rebind_ms_drg_generation
+
+
+async def precreate_catalog_input(session, importer, destination):
+    """Create an isolated native candidate without granting access to serving tables."""
+    from process import scoped_catalog_named_storage as storage
+
+    spec, identifier = input_spec(importer), uuid4()
+    schema = await storage.create_stage(session, destination, spec.model_types, identifier)
+    return CatalogInput(spec, await _input_handles(session, spec, identifier, schema))
+
+
+async def copy_catalog_records(session, incoming, payload_by_table):
+    """COPY bounded model batches and complete native keys in the isolated input."""
+    from process import scoped_catalog_named_storage as storage
+
+    await _input_handles(session, incoming.spec, incoming.ownership.dataset_id, incoming.ownership.schema_name)
+    if set(payload_by_table) != set(incoming.spec.table_names):
+        raise RuntimeError("catalog input model set differs")
+    counts_by_table = {}
+    for model in incoming.spec.model_types:
+        columns = tuple(model.__table__.columns.keys())
+        row_maps = payload_by_table[model.__tablename__]
+        if any(set(row_map) - set(columns) for row_map in row_maps):
+            raise RuntimeError("catalog input fields differ")
+        count = 0
+        for start in range(0, len(row_maps), 5000):
+            count += await native.native_copy_record_batch(
+                session,
+                model,
+                schema_name=incoming.ownership.schema_name,
+                table_name=model.__tablename__,
+                columns=columns,
+                records=[tuple(row_map.get(name) for name in columns) for row_map in row_maps[start : start + 5000]],
             )
-            await rebind(session, schema, previous)
-    await _restore_access(session, prepared)
-    await _seal_generations(session, prepared)
-    await finish_catalog_authority(session, prepared, receipt, current)
-    if await _transaction_id(session) != prepared.transaction_id:
-        raise native.ReferenceFamilyArchiveError("catalog publication transaction changed")
-    await session.execute(text(f"DROP SCHEMA {native._quoted(prepared.ownership.schema_name)} RESTRICT"))
-    return current, receipt
+        counts_by_table[model.__tablename__] = count
+    await storage.complete_stage(session, incoming.ownership.schema_name, incoming.spec.model_types)
+    return counts_by_table
 
 
-async def _seal_generations(session, prepared):
-    from process.entity_address_snapshot_preparation import _seal_published_relation
-    from process.scoped_catalog_retention import GENERATION_TABLES
+async def copy_received_input(session, importer, destination, source_schema, source_tables, source_copy):
+    """Copy fixed archived names with native executable/shape checks and exact row parity."""
+    from process import scoped_catalog_binding as binding
+    from process.mrf_address_publication import _require_native_read_structure
 
-    for importer in prepared.generations:
-        oid = await native._relation_oid(session, prepared.incumbent.schema_name, GENERATION_TABLES[importer])
-        await _seal_published_relation(session, oid, prepared.owner_oid)
-
-
-async def _restore_access(session, prepared):
-    from process import code_catalog_snapshot as catalog
-
-    schema = prepared.incumbent.schema_name
-    for model, prior in zip(prepared.spec.model_types, prepared.access, strict=True):
-        name = model.__tablename__
-        for grant in prior.grants:
-            if grant.grantee_name == prior.owner_name:
-                continue
-            if grant.privilege_type != "SELECT" or grant.is_grantable:
-                raise native.ReferenceFamilyArchiveError("catalog ordinary mutation remains available")
-            grantee = await catalog._quoted_role(session, grant.grantee_name)
-            column = "" if grant.column_name is None else f" ({native._quoted(grant.column_name)})"
-            await session.execute(
-                text(f"GRANT SELECT{column} ON TABLE {native._quoted(schema)}.{native._quoted(name)} TO {grantee}")
+    spec = input_spec(importer)
+    native._schema_name(source_schema)
+    if source_tables not in (
+        spec.table_names,
+        tuple(name + "_predecessor" for name in spec.table_names),
+    ) or not isinstance(source_copy, native.ReferenceFamilySourceCopy):
+        raise RuntimeError("received catalog COPY scope differs")
+    incoming = await precreate_catalog_input(session, importer, destination)
+    await native._lock_family(session, source_schema, source_tables, "SHARE", nowait=True)
+    oids = tuple([await native._relation_oid(session, source_schema, name) for name in source_tables])
+    await _require_native_read_structure(session, oids, ())
+    remaining = source_copy.max_bytes
+    projected_models = []
+    async with asyncio.timeout(source_copy.timeout) as deadline:
+        for model, name, oid in zip(spec.model_types, source_tables, oids, strict=True):
+            await binding._require_model_columns(session, oid, model)
+            projected = await binding.catalog_projection_model(session, source_schema, model, table_name=name)
+            projected_models.append(projected)
+            columns = tuple(projected.__table__.columns.keys())
+            projection = (
+                "SELECT "
+                + ",".join(native._quoted(column) for column in columns)
+                + f" FROM {native._quoted(source_schema)}.{native._quoted(name)}"
             )
-        if await catalog._relation_access(session, dict(prepared.ownership.relation_oids)[name]) != prior:
-            raise native.ReferenceFamilyArchiveError("catalog published access differs")
-    await binding.require_closed_catalog_binding(session, schema, prepared.ownership.relation_oids)
+            remaining = await native._copy_source_projection(
+                session,
+                source_copy,
+                projection,
+                incoming.ownership.schema_name,
+                model.__tablename__,
+                columns,
+                remaining,
+                deadline.when(),
+            )
+        from process import scoped_catalog_named_storage as storage
+
+        await storage.complete_stage(session, incoming.ownership.schema_name, spec.model_types)
+        for model, name in zip(projected_models, source_tables, strict=True):
+            if not await native._is_model_table_equal(
+                session,
+                model,
+                left_schema=source_schema,
+                left_name=name,
+                right_schema=incoming.ownership.schema_name,
+                right_name=model.__tablename__,
+            ):
+                raise RuntimeError("received catalog COPY rows differ")
+    return incoming
+
+
+async def compose_catalog_family(session, schema, importer, incoming, rules, source_copy):
+    """Use explicit protected settings and fence every installed logical source generation."""
+    from process import code_sets_result_archive as codes
+    from process import ms_drg_result_archive as drg
+    from process import scoped_catalog_named_cutover as cutover
+    from process import scoped_catalog_named_generation as generations
+    from process import scoped_catalog_named_storage as storage
+
+    settings = PublisherSettings.from_environment()
+    if settings.schema != schema or incoming.spec != input_spec(importer):
+        raise RuntimeError("catalog operator destination or input differs")
+    await _input_handles(session, incoming.spec, incoming.ownership.dataset_id, incoming.ownership.schema_name)
+    await storage.protect_tables(
+        session, incoming.ownership.schema_name, incoming.spec.model_types, settings, candidate=True
+    )
+    await storage.require_tables(session, incoming.ownership.schema_name, incoming.spec.model_types)
+    await validate_catalog_semantics(session, incoming.spec, incoming.ownership.schema_name)
+    models = await storage.current_models(session, schema)
+    vector_by_importer = await generations.read_generations(session, schema, lock=True, importer=importer)
+    await generations.validate_published_content(session, schema, vector_by_importer)
+    handoff_by_field = {
+        "schema_name": schema,
+        "importer_id": importer,
+        "input": {"schema_name": incoming.ownership.schema_name},
+        "expected_generations": vector_by_importer,
+        "expected_tables": await storage.table_receipts(session, schema, models),
+        "include_relationships": True,
+    }
+    await cutover._require_current(session, handoff_by_field, models)
+    identifier, stage, spec = await cutover._compose(session, handoff_by_field, models, source_copy, rules=rules)
+    await storage.protect_tables(session, stage, models, settings, candidate=True)
+    native_generations_by_importer = {}
+    for name in vector_by_importer:
+        native_generations_by_importer[name] = (
+            await codes.read_generation(session, schema)
+            if name == "code-sets"
+            else (await drg._current(session, schema))[0]
+        )
+    return ComposedCatalog(
+        importer,
+        spec,
+        await _input_handles(session, spec, identifier, stage),
+        native.ReferenceFamilyIncumbent(
+            spec.importer_id, schema, await storage.require_tables(session, schema, models)
+        ),
+        native_generations_by_importer,
+        handoff_by_field,
+        settings,
+    )
+
+
+async def activate_catalog_family(session, prepared, publish_generation, *, publication_handoff_sha256=None):
+    """Exchange the complete family and retain logical rollback data in one transaction."""
+    from process.scoped_catalog_named_cutover import activate_prepared
+
+    handoff_by_field = {**prepared.logical_handoff, "handoff_sha256": publication_handoff_sha256}
+    return await activate_prepared(
+        session,
+        handoff_by_field,
+        (prepared.ownership.dataset_id, prepared.ownership.schema_name, prepared.spec),
+        prepared.settings,
+        publish_generation,
+    )
+
+
+async def cleanup_catalog_input(session, incoming):
+    """Drop only the exact UUID-named fixed input family, using native RESTRICT semantics."""
+    from process import scoped_catalog_named_storage as storage
+
+    schema = incoming.ownership.schema_name
+    await _input_handles(session, incoming.spec, incoming.ownership.dataset_id, schema)
+    await storage.require_tables(session, schema, incoming.spec.model_types, lock="ACCESS EXCLUSIVE")
+    for name in incoming.spec.table_names:
+        await session.execute(text(f"DROP TABLE {storage.qualified(schema, name)} RESTRICT"))
+    await session.execute(text(f"DROP SCHEMA {native._quoted(schema)} RESTRICT"))

@@ -11,7 +11,7 @@ from db.models import CodeCatalog
 from process import code_sets_result_archive as archive
 from process import ms_drg_result_generation as drg
 from process.scoped_catalog_retention import cleanup_retained_catalog
-from tests.scoped_catalog_native_fixture import catalog_actors, seal_catalog
+from tests.scoped_catalog_native_fixture import catalog_actors, configure_catalog_publisher, seal_catalog
 from tests.test_code_sets_result_archive_postgres import (
     _copy,
     _dsn,
@@ -103,18 +103,21 @@ async def _assert_roundtrip(sessions, source_schema, destination, stage, expecte
     async with sessions.begin() as session:
         prior_rows = await _rows(session, destination)
         source_rows = await _rows(session, source_schema)
-        assert await _column_names(session, expected.code_catalog_oid) == legacy_names
+        prior_catalog_oid = await archive.native._relation_oid(session, destination, CodeCatalog.__tablename__)
+        assert await _column_names(session, prior_catalog_oid) == legacy_names
         assert await _column_names(session, stage.catalog_oid) == model_names
-        assert await archive._column_signature(session, expected.code_catalog_oid) == await archive._column_signature(
+        assert await archive._column_signature(session, prior_catalog_oid) == await archive._column_signature(
             session, stage.catalog_oid
         )
-        assert await drg._table_shape(session, expected.code_catalog_oid, CodeCatalog) == await drg._table_shape(
+        assert await drg._table_shape(session, prior_catalog_oid, CodeCatalog) == await drg._table_shape(
             session, stage.catalog_oid, CodeCatalog
         )
         activation = await archive.activate_stage(
             session, destination=destination, prepared=prepared, source_copy=_copy()
         )
-        assert activation.current.code_catalog_oid != expected.code_catalog_oid
+        assert activation.current.code_catalog_oid is None
+        current_catalog_oid = await archive.native._relation_oid(session, destination, CodeCatalog.__tablename__)
+        assert await _column_names(session, current_catalog_oid) == model_names
         assert activation.current.origin_lineage_id == stage.source_generation.origin_lineage_id
         assert activation.current.row_sha256 == stage.source_generation.row_sha256
         combined_rows = [catalog_row for catalog_row in source_rows if catalog_row["source"] != "unrelated"]
@@ -123,7 +126,7 @@ async def _assert_roundtrip(sessions, source_schema, destination, stage, expecte
             combined_rows, key=lambda catalog_row: (catalog_row["code_system"], catalog_row["code"])
         )
         assert await _rows(session, activation.retained_family["schema_name"]) == prior_rows
-        assert await _column_names(session, expected.code_catalog_oid) == legacy_names
+        assert await _column_names(session, prior_catalog_oid) == legacy_names
     async with sessions.begin() as session:
         restored = await archive.rollback_activation(
             session, destination=destination, activation=activation, source_copy=_copy()
@@ -138,7 +141,7 @@ async def _assert_roundtrip(sessions, source_schema, destination, stage, expecte
 
 
 @pytest.mark.asyncio
-async def test_appended_attribution_copy_publication_rollback_and_schema_drift():
+async def test_appended_attribution_copy_publication_rollback_and_schema_drift(monkeypatch):
     """Real COPY and protected-principal publication accept order only, never schema drift."""
     engine = create_async_engine(_dsn())
     sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -148,6 +151,7 @@ async def test_appended_attribution_copy_publication_rollback_and_schema_drift()
     owned_schemas = [source, destination, archive.stage_schema(dataset_id)]
     try:
         async with catalog_actors(engine, owned_schemas) as actors:
+            configure_catalog_publisher(monkeypatch, actors, destination)
             for schema in (source, destination):
                 await _setup(engine, schema, appended_attribution=True)
             await _seed_catalogs(sessions, source, destination)

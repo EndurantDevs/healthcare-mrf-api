@@ -39,7 +39,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Iterator, 
 
 import aiohttp
 import asyncpg
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet
 from sqlalchemy import and_, case, func, literal, or_
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects import postgresql
@@ -43141,16 +43141,9 @@ def _encrypt_bulk_capability(value: str) -> str:
 
 
 def _decrypt_bulk_capability(value: Any) -> str:
-    encrypted_value = _clean_text(value)
-    if not encrypted_value or not encrypted_value.startswith(BULK_EXPORT_CAPABILITY_CIPHER_PREFIX):
-        raise RuntimeError("bulk_export_checkpoint_ciphertext_invalid")
-    token = encrypted_value.removeprefix(BULK_EXPORT_CAPABILITY_CIPHER_PREFIX)
-    for decryption_secret in _bulk_checkpoint_decryption_secrets():
-        try:
-            return _bulk_checkpoint_fernet(decryption_secret).decrypt(token.encode("ascii")).decode("utf-8")
-        except InvalidToken, UnicodeError, ValueError:
-            continue
-    raise RuntimeError("bulk_export_checkpoint_decryption_failed")
+    from process.provider_directory_checkpoint_crypto import decrypt_bulk_capability
+
+    return decrypt_bulk_capability(sys.modules[__name__], value)
 
 
 def _bulk_manifest_audit_payload(payload: dict[str, Any]) -> dict[str, Any]:

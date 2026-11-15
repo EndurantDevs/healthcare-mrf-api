@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Exact disposable principals for the existing opt-in scoped catalog databases."""
 
+import json
 from contextlib import AsyncExitStack, asynccontextmanager
 from types import SimpleNamespace
 from uuid import uuid4
@@ -12,6 +13,21 @@ from sqlalchemy.pool import NullPool
 from process import code_sets_result_archive as codes
 from process import ms_drg_result_generation as drg
 from process import reference_family_archive as native
+from process.scoped_catalog_publisher import PREFIX
+
+
+def configure_catalog_publisher(monkeypatch, actors, schema):
+    """Use the fixture's explicit publisher principal and native destination roles."""
+    values_by_name = {
+        "DSN": actors.publisher.kw["bind"].url.render_as_string(hide_password=False),
+        "SCHEMA": schema,
+        "OWNER_ROLE": actors.roles["owner"],
+        "READER_ROLES": json.dumps([actors.roles["builder"]]),
+        "COPY_MAX_BYTES": str(1024**2),
+        "TIMEOUT_SECONDS": "30",
+    }
+    for name, value in values_by_name.items():
+        monkeypatch.setenv(PREFIX + name, value)
 
 
 async def _remove_catalog_actors(engine, roles, owned_schemas):

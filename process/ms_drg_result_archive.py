@@ -14,6 +14,7 @@ from uuid import UUID
 from sqlalchemy import text
 
 from db.models import CodeCatalog, CodeRelationship, CodeSynonym
+from process import ms_drg_result_generation as generation
 from process import reference_family_archive as native
 from process.entity_address_snapshot_receipt import _projected_row_identity
 from process.ms_drg_result_generation import (
@@ -24,14 +25,12 @@ from process.ms_drg_result_generation import (
     read_current_generation,
 )
 from process.ms_drg_result_generation import (
-    CONTRACT as GENERATION_CONTRACT,
-)
-from process.ms_drg_result_generation import (
     TABLE as GENERATION_TABLE,
 )
-from process.scoped_catalog_binding import match_catalog_text_columns
+from process.scoped_catalog_binding import catalog_projection_model, match_catalog_text_columns
 
 CONTRACT = "ms-drg-scoped.postgres.v1"
+GENERATION_CONTRACT = generation.CONTRACT
 MODELS = (CodeCatalog, CodeSynonym, CodeRelationship)
 TABLES = tuple(model.__tablename__ for model in MODELS)
 PREDECESSORS = tuple(name + "_predecessor" for name in TABLES)
@@ -148,36 +147,54 @@ async def _oids(session, schema: str, names: tuple[str, ...]) -> tuple[int, ...]
     return oids
 
 
-async def _verify_namespace(session, schema: str, schema_oid: int, relation_oids: tuple[int, ...]) -> None:
-    require(
-        await session.scalar(text("SELECT to_regnamespace(:name)::oid::bigint"), {"name": schema}) == schema_oid,
-        "MS-DRG stage schema changed",
+async def _named_stage(session, stage, *, receiving):
+    """Resolve actual local handles from logical names without updating copied records."""
+    schema = stage_schema(UUID(stage["dataset_id"]))
+    require(stage["schema_name"] == schema, "MS-DRG stage logical name differs")
+    names = TABLES + PREDECESSORS if receiving else TABLES
+    return {
+        **stage,
+        "schema_oid": await native._schema_oid(session, schema),
+        "relation_oids": await _oids(session, schema, names),
+    }
+
+
+def _has_same_generation(observed, expected):
+    from process.scoped_catalog_named_generation import logical_generation
+
+    return (
+        logical_generation(observed) == logical_generation(expected)
+        and observed["include_relationships"] == expected["include_relationships"]
+        and (None if observed["receipt"] is None else _content(observed["receipt"]))
+        == (None if expected["receipt"] is None else _content(expected["receipt"]))
     )
-    rows = (
-        await session.execute(
-            text(
-                "SELECT c.oid::bigint,c.relkind::text,i.indrelid::bigint FROM pg_class c "
-                "LEFT JOIN pg_index i ON i.indexrelid=c.oid WHERE c.relnamespace=:oid"
-            ),
-            {"oid": schema_oid},
-        )
-    ).all()
-    require(
-        all(
-            (kind == "r" and oid in relation_oids) or (kind == "i" and owner in relation_oids)
-            for oid, kind, owner in rows
+
+
+async def _verify_namespace(session, schema, schema_oid, relation_oids):
+    """Require exact named native heaps while ignoring legacy physical handles."""
+    from process import scoped_catalog_named_storage as storage
+    from process.mrf_address_publication import _require_native_read_structure
+
+    require(len(relation_oids) in {len(TABLES), len(TABLES + PREDECESSORS)}, "MS-DRG stage inventory differs")
+    names = TABLES + PREDECESSORS if len(relation_oids) == 6 else TABLES
+    await storage.require_inventory(session, schema, names)
+    oids = await _oids(session, schema, names)
+    await _require_native_read_structure(session, oids, ())
+    safe = await session.scalar(
+        text(
+            "SELECT NOT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=ANY(CAST(:oids AS oid[])) AND NOT tgisinternal) AND NOT EXISTS(SELECT FROM pg_rewrite WHERE ev_class=ANY(CAST(:oids AS oid[]))) AND NOT EXISTS(SELECT FROM pg_constraint WHERE conrelid=ANY(CAST(:oids AS oid[])) AND contype='f')"
         ),
-        "MS-DRG stage contains an unowned relation",
+        {"oids": list(oids)},
     )
+    require(safe is True, "MS-DRG stage executable structure differs")
 
 
 async def _strict_stage(session, stage: dict, manifest: dict, *, receiving: bool) -> None:
+    stage = await _named_stage(session, stage, receiving=receiving)
     validate_manifest(manifest)
     schema = stage_schema(UUID(stage["dataset_id"]))
-    expected_names = TABLES + PREDECESSORS if receiving else TABLES
     require(
-        stage["schema_name"] == schema
-        and tuple(stage["relation_oids"]) == await _oids(session, schema, expected_names),
+        stage["schema_name"] == schema,
         "MS-DRG stage identity changed",
     )
     await _verify_namespace(session, schema, stage["schema_oid"], tuple(stage["relation_oids"]))
@@ -220,7 +237,8 @@ async def _copy_slice(
         target_name in (source_name, source_name + "_predecessor"),
         "MS-DRG COPY source scope differs",
     )
-    columns = tuple(column.name for column in model.__table__.columns)
+    projected = await catalog_projection_model(session, source_schema, model)
+    columns = tuple(projected.__table__.columns.keys())
     literals = ",".join("'" + name + "'" for name in scope_sources)
     query = (
         "SELECT "
@@ -313,12 +331,12 @@ async def precreate_restore(session, destination: str, dataset_id: UUID, manifes
 
 async def complete_restore(session, stage: dict, manifest: dict) -> None:
     """Complete restored candidate indexes before its registered namespace is frozen."""
+    stage = await _named_stage(session, stage, receiving=True)
     require(session.in_transaction(), "MS-DRG restore transaction is required")
     validate_manifest(manifest)
     schema = stage_schema(UUID(stage["dataset_id"]))
     require(
-        stage["schema_name"] == schema
-        and tuple(stage["relation_oids"]) == await _oids(session, schema, TABLES + PREDECESSORS),
+        stage["schema_name"] == schema,
         "MS-DRG stage identity changed",
     )
     await session.execute(
@@ -340,6 +358,7 @@ async def complete_restore(session, stage: dict, manifest: dict) -> None:
 
 async def verify_stage(session, stage: dict, manifest: dict, *, receiving: bool) -> None:
     """Check stage ownership and content while holding its table locks."""
+    stage = await _named_stage(session, stage, receiving=receiving)
     require(session.in_transaction(), "MS-DRG stage transaction is required")
     await session.execute(
         text(
@@ -353,11 +372,12 @@ async def verify_stage(session, stage: dict, manifest: dict, *, receiving: bool)
 
 async def cleanup_stage(session, stage: dict, *, receiving: bool) -> None:
     """Drop only the still-owned relations and namespace in this transaction."""
+    stage = await _named_stage(session, stage, receiving=receiving)
     require(session.in_transaction(), "MS-DRG cleanup transaction is required")
     schema = stage_schema(UUID(stage["dataset_id"]))
     names = TABLES + PREDECESSORS if receiving else TABLES
     require(
-        stage["schema_name"] == schema and tuple(stage["relation_oids"]) == await _oids(session, schema, names),
+        stage["schema_name"] == schema,
         "MS-DRG cleanup ownership changed",
     )
     await _verify_namespace(session, schema, stage["schema_oid"], tuple(stage["relation_oids"]))
@@ -377,7 +397,7 @@ async def _lock_live(session, destination: str) -> None:
 
 
 async def _current(session, destination: str, *, lock=True) -> tuple[dict, dict]:
-    row = (
+    generation_record = (
         (
             await session.execute(
                 text(
@@ -391,21 +411,30 @@ async def _current(session, destination: str, *, lock=True) -> tuple[dict, dict]
         .one_or_none()
     )
     require(
-        row is not None and type(row["local_generation"]) is int and 0 <= row["local_generation"] < MAX_GENERATION,
+        generation_record is not None
+        and type(generation_record["local_generation"]) is int
+        and 0 <= generation_record["local_generation"] < MAX_GENERATION,
         "MS-DRG destination generation is unavailable",
     )
     actual = await capture_result(session, destination)
-    if row["origin_generation"] is None:
+    if generation_record["origin_generation"] is None:
         require(
-            row["receipt"] is None and all(table["row_count"] == 0 for table in actual["tables"]),
+            generation_record["receipt"] is None and all(table["row_count"] == 0 for table in actual["tables"]),
             "untracked MS-DRG rows prevent activation",
         )
     else:
-        require(row["receipt"] == actual, "MS-DRG destination rows changed")
-    return dict(row), actual
+        require(
+            type(generation_record["receipt"]) is dict
+            and generation_record["receipt"].get("contract") == actual["contract"]
+            and generation_record["receipt"].get("content_sha256") == actual["content_sha256"]
+            and _content(generation_record["receipt"]) == _content(actual),
+            "MS-DRG destination rows changed",
+        )
+    return dict(generation_record), actual
 
 
 async def _predecessor_content(session, stage: dict) -> list[dict]:
+    stage = await _named_stage(session, stage, receiving=True)
     schema = stage["schema_name"]
     table_receipts = []
     for model, (name, owned_sources), predecessor, oid in zip(
@@ -441,6 +470,7 @@ async def _predecessor_content(session, stage: dict) -> list[dict]:
 
 async def prepare_predecessor(session, destination: str, stage: dict, manifest: dict, *, source_copy=None) -> dict:
     """Copy the before-image inside the registered six-table stage before freeze."""
+    stage = await _named_stage(session, stage, receiving=True)
     require(session.in_transaction(), "MS-DRG predecessor transaction is required")
     _require_copy(source_copy)
     await _lock_live(session, destination)
@@ -471,6 +501,7 @@ async def prepare_predecessor(session, destination: str, stage: dict, manifest: 
 
 async def validate_prepared_stage(session, destination: str, stage: dict, manifest: dict) -> dict:
     """Recheck the frozen before-image and destination CAS value."""
+    stage = await _named_stage(session, stage, receiving=True)
     require(session.in_transaction(), "MS-DRG validation transaction is required")
     await session.execute(
         text("LOCK TABLE " + ",".join(f"{_quoted(destination)}.{_quoted(name)}" for name in TABLES) + " IN SHARE MODE")
@@ -508,7 +539,7 @@ async def _publish_source_slices(session, destination, stage, names, *, previous
     composed = await publication.compose_catalog_family(
         session, destination, "ms-drg", incoming, publication.contributions("ms-drg"), source_copy
     )
-    require(composed.generations["ms-drg"] == previous, "MS-DRG publication generation changed")
+    require(_has_same_generation(composed.generations["ms-drg"], previous), "MS-DRG publication generation changed")
 
     async def _publish_generation():
         current_receipt = await capture_result(session, destination)
@@ -527,7 +558,7 @@ async def _publish_source_slices(session, destination, stage, names, *, previous
         )
 
     current, retained = await publication.activate_catalog_family(session, composed, _publish_generation)
-    await native.cleanup_model_family_stage(session, incoming.spec, incoming.ownership)
+    await publication.cleanup_catalog_input(session, incoming)
     return current, retained
 
 
@@ -535,7 +566,8 @@ async def _write_generation(
     session, destination: str, previous: dict, *, manifest: dict | None, receipt: dict | None
 ) -> dict:
     origin = None if manifest is None else UUID(manifest["origin_lineage_id"])
-    row = (
+    receipt_by_field = None if receipt is None else {**receipt, "tables": _content(receipt)}
+    generation_record = (
         (
             await session.execute(
                 text(
@@ -552,26 +584,29 @@ async def _write_generation(
                     "origin_generation": None if manifest is None else manifest["origin_generation"],
                     "published_at": None if manifest is None else datetime.fromisoformat(manifest["published_at"]),
                     "include_relationships": None if manifest is None else manifest["include_relationships"],
-                    "receipt": None if receipt is None else json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+                    "receipt": None
+                    if receipt_by_field is None
+                    else json.dumps(receipt_by_field, sort_keys=True, separators=(",", ":")),
                 },
             )
         )
         .mappings()
         .one()
     )
-    return dict(row)
+    return dict(generation_record)
 
 
 async def activate_stage(
     session, destination: str, stage: dict, manifest: dict, prepared: dict, *, source_copy=None
 ) -> dict:
     """CAS all owned slices and source origin in one destination transaction."""
+    stage = await _named_stage(session, stage, receiving=True)
     require(session.in_transaction(), "MS-DRG activation transaction is required")
     _require_copy(source_copy)
     await _lock_live(session, destination)
     previous, before = await _current(session, destination)
     require(
-        previous == prepared["previous"] and _content(before) == prepared["before"],
+        _has_same_generation(previous, prepared["previous"]) and _content(before) == prepared["before"],
         "MS-DRG destination generation changed",
     )
     await verify_stage(session, stage, manifest, receiving=True)
@@ -603,10 +638,10 @@ async def rollback_activation(session, destination: str, activation: dict, *, so
     """Restore only this installation's frozen predecessor under an exact CAS."""
     require(session.in_transaction(), "MS-DRG rollback transaction is required")
     _require_copy(source_copy)
-    stage = activation["stage"]
+    stage = await _named_stage(session, activation["stage"], receiving=True)
     await _lock_live(session, destination)
     current, _receipt = await _current(session, destination)
-    require(current == activation["current"], "MS-DRG rollback generation changed")
+    require(_has_same_generation(current, activation["current"]), "MS-DRG rollback generation changed")
     await _strict_stage(session, stage, activation["manifest"], receiving=True)
     require(await _predecessor_content(session, stage) == activation["before"], "MS-DRG rollback predecessor changed")
     require(

@@ -16,7 +16,7 @@ from db.plan_release_storage import storage_identifier
 from db.registry_fhir_catalog import MAX_CORE_BYTES, NESTED_LIMIT, SNAPSHOT_COLUMNS, VIEW
 from db.registry_schema import registry_schema
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_read_identity import NetworkReadIdentityError
+from process.network_published_api_pin import read_published_api_pin
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 from process.registry_network_catalog_read import (
     MAX_OFFSET,
@@ -24,12 +24,10 @@ from process.registry_network_catalog_read import (
     RegistryNetworkCatalogQuery,
     catalog_binding_document,
     catalog_closed_json,
-    catalog_directory_fetchrow,
     catalog_directory_relation,
     catalog_exclusions,
     catalog_integer,
     catalog_network_document,
-    catalog_pin,
     catalog_text,
     catalog_uuid,
 )
@@ -371,20 +369,20 @@ async def _directory_manifest(connection, query, snapshot, control_schema):
         and query.generation_id != generation
     ):
         _invalid("source_changed")
+    if (
+        not connection.is_in_transaction()
+        or await connection.fetchval(
+            "SELECT current_setting('transaction_isolation') IN ('repeatable read','serializable') "
+            "AND current_setting('transaction_read_only')='on'"
+        )
+        is not True
+    ):
+        _invalid("transaction_required")
     if generation is None:
-        if (
-            not connection.is_in_transaction()
-            or await connection.fetchval(
-                "SELECT current_setting('transaction_isolation') IN ('repeatable read','serializable') "
-                "AND current_setting('transaction_read_only')='on'"
-            )
-            is not True
-        ):
-            _invalid("transaction_required")
         return None
     catalog_integer(generation, 9223372036854775807)
     _digest(digest)
-    manifest = await catalog_pin(connection, generation, control_schema)
+    manifest, _, _ = await read_published_api_pin(connection, generation, control_schema)
     if manifest.manifest_sha256 != digest:
         _invalid("source_changed")
     return manifest
@@ -699,14 +697,14 @@ async def read_fhir_catalog(
         continuation_scope_sha256 = _continuation_scope(
             query, manifest, snapshot, exclusions, policy, access_scope_sha256
         )
-        sql, address_parameters, relations = _catalog_page_statement(snapshot, manifest)
-        entry = await catalog_directory_fetchrow(
-            connection,
+        sql, address_parameters, _ = _catalog_page_statement(snapshot, manifest)
+        entry = await connection.fetchrow(
             sql,
-            _query_parameters(query, snapshot["metadata_generation"], exclusions, policy, network_id)
-            + (_source_company_parameters(snapshot, policy),)
-            + address_parameters,
-            relations,
+            *(
+                _query_parameters(query, snapshot["metadata_generation"], exclusions, policy, network_id)
+                + (_source_company_parameters(snapshot, policy),)
+                + address_parameters
+            ),
         )
         if entry is None:
             _invalid()
@@ -714,7 +712,7 @@ async def read_fhir_catalog(
         if network_id is not None and (page["total"] != 1 or len(page["items"]) != 1):
             _invalid("detail_denied")
         return page
-    except (NetworkReadIdentityError, asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
+    except (asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
         if isinstance(error, RegistryNetworkCatalogError):
             raise
         raise RegistryNetworkCatalogError("registry_network_catalog_unavailable") from error
