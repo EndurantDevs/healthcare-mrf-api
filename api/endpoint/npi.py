@@ -2402,6 +2402,8 @@ def _provider_directory_network_plan_ctes_sql(
     """
 
 
+# OFFSET 0 keeps one keyed lookup per endpoint/service reference: under the LIMIT the planner
+# otherwise merge-joins every resource of that type in the dataset to find a few references.
 _PROVIDER_DIRECTORY_REQUESTED_ROLE_CTES_TEMPLATE = """
     requested_roles AS (
         SELECT source_id, role_id
@@ -2465,10 +2467,9 @@ _PROVIDER_DIRECTORY_REQUESTED_ROLE_CTES_TEMPLATE = """
                            FROM jsonb_array_elements_text(
                                     COALESCE(role.endpoint_refs::jsonb, '[]'::jsonb)
                                 ) AS endpoint_ref(value)
-                           JOIN current_endpoints AS endpoint
-                             ON endpoint.dataset_id = role.dataset_id
-                            AND endpoint.source_id = role.source_id
-                            AND endpoint.resource_id = {endpoint_id}
+                          CROSS JOIN LATERAL (SELECT * FROM current_endpoints AS endpoint
+                               WHERE endpoint.dataset_id = role.dataset_id AND endpoint.source_id = role.source_id
+                                 AND endpoint.resource_id = {endpoint_id} OFFSET 0) AS endpoint
                           ORDER BY endpoint.resource_id
                           LIMIT {role_reference_limit}
                      ) AS resolved_endpoint
@@ -2505,10 +2506,9 @@ _PROVIDER_DIRECTORY_REQUESTED_ROLE_CTES_TEMPLATE = """
                            FROM jsonb_array_elements_text(
                                     COALESCE(role.healthcare_service_refs::jsonb, '[]'::jsonb)
                                 ) AS service_ref(value)
-                           JOIN current_healthcare_services AS service
-                             ON service.dataset_id = role.dataset_id
-                            AND service.source_id = role.source_id
-                            AND service.resource_id = {service_id}
+                          CROSS JOIN LATERAL (SELECT * FROM current_healthcare_services AS service
+                               WHERE service.dataset_id = role.dataset_id AND service.source_id = role.source_id
+                                 AND service.resource_id = {service_id} OFFSET 0) AS service
                           ORDER BY service.resource_id
                           LIMIT {role_reference_limit}
                      ) AS resolved_service
