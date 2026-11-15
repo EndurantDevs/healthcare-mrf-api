@@ -194,7 +194,7 @@ def page_boundary(monkeypatch):
         "custody_json": {},
         "source_vector_json": [],
     }
-    monkeypatch.setattr(catalog, "catalog_pin", AsyncMock(return_value=manifest))
+    monkeypatch.setattr(catalog, "read_published_api_pin", AsyncMock(return_value=(manifest, None, None)))
     monkeypatch.setattr(catalog, "_metadata_pin", AsyncMock(return_value=snapshot_by_field))
     connection.fetchrow.return_value = {"total": 1, "rows_json": json.dumps([network_document()])}
     return connection, manifest, snapshot_by_field
@@ -365,7 +365,7 @@ async def test_unattached_metadata_never_pins_or_reads_directory_tables(page_bou
     assert page["generation"] is None and page["approved_custom_revision"] is None
     assert page["metadata_generation"] == "a" * 64 and page["metadata_approved_revision"] == "6"
     assert page["items"][0]["directory_available"] is False
-    catalog.catalog_pin.assert_not_awaited()
+    catalog.read_published_api_pin.assert_not_awaited()
     assert "network_membership" not in connection.fetchrow.call_args.args[0]
 
 
@@ -377,7 +377,7 @@ async def test_unattached_read_keeps_the_readonly_repeatable_snapshot_guard(page
     with pytest.raises(catalog.RegistryNetworkCatalogError, match="transaction_required"):
         await catalog.read_fhir_catalog(connection, catalog.FHIRCatalogQuery(), excluded_network_ids=())
     connection.fetchrow.assert_not_awaited()
-    catalog.catalog_pin.assert_not_awaited()
+    catalog.read_published_api_pin.assert_not_awaited()
 
 
 @pytest.mark.parametrize("attachment", [(None, "f" * 64), (9, None), (None, None), (10, "f" * 64)])
@@ -392,7 +392,7 @@ async def test_nullable_attachment_and_explicit_generation_must_agree(page_bound
             excluded_network_ids=(),
             control_schema="sample_control",
         )
-    catalog.catalog_pin.assert_not_awaited()
+    catalog.read_published_api_pin.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -707,7 +707,11 @@ def test_relationship_dates_refuse_noncanonical_iso_week_spelling():
 @pytest.mark.asyncio
 async def test_changed_pinned_directory_manifest_refuses_before_reading_network_rows(page_boundary):
     connection, manifest, _snapshot = page_boundary
-    catalog.catalog_pin.return_value = SimpleNamespace(**{**vars(manifest), "manifest_sha256": "e" * 64})
+    catalog.read_published_api_pin.return_value = (
+        SimpleNamespace(**{**vars(manifest), "manifest_sha256": "e" * 64}),
+        None,
+        None,
+    )
     with pytest.raises(catalog.RegistryNetworkCatalogError, match="source_changed"):
         await catalog.read_fhir_catalog(connection, catalog.FHIRCatalogQuery(), excluded_network_ids=())
     connection.fetchrow.assert_not_awaited()
@@ -719,7 +723,7 @@ async def test_unattached_metadata_cannot_claim_provider_directory_availability(
     snapshot.update(network_generation=None, manifest_sha256=None)
     with pytest.raises(catalog.RegistryNetworkCatalogError):
         await catalog.read_fhir_catalog(connection, catalog.FHIRCatalogQuery(), excluded_network_ids=())
-    catalog.catalog_pin.assert_not_awaited()
+    catalog.read_published_api_pin.assert_not_awaited()
 
 
 def _near_limit_network_documents():

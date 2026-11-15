@@ -962,6 +962,17 @@ manifest output. Encryption derives a domain-separated Fernet key from
 comma-separated or JSON-array
 `HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_PREVIOUS_KEYS` key ring, allowing a
 dedicated key to rotate while an accepted export is active.
+`HLTHPRT_PROVIDER_DIRECTORY_CHECKPOINT_PREVIOUS_FERNET_KEYS` optionally accepts a
+strict JSON array of previously derived Fernet keys: canonical URL-safe base64
+strings encoding exactly 32 bytes. This avoids distributing previous master
+credentials just to read retained checkpoints. The importer uses this ring only
+for decryption; new ciphertext always uses the current primary key. A Fernet key
+is symmetric and still grants cryptographic encryption and decryption capability,
+so protect this ring as a secret. Its entries are already domain-derived keys;
+they are not raw master credentials and are not derived again. Invalid nonempty
+configuration fails closed without logging key contents. An empty array disables
+the ring. The existing raw previous-key ring and control-token fallback remain
+supported. No stored checkpoint rewrite is required for rotation.
 Missing/wrong key configuration fails closed but remains retryable and does not
 erase encrypted capabilities. Terminal completion or data-level failure clears
 capability ciphertext while retaining hashes and audit data. A retry can adopt

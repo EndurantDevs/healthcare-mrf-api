@@ -157,7 +157,7 @@ async def _lock_composition_inputs(session, spec, ownership, incumbent, incoming
             raise native.ReferenceFamilyArchiveError("model composition candidate is not empty")
 
 
-def _composition_projection(model_type, incumbent_schema, incoming_schema, contribution):
+def _composition_projection(model_type, incumbent_schema, incoming_schema, contribution, *, incoming_relation=None):
     from process import reference_family_archive as native
 
     columns = ", ".join(native._quoted(column.name) for column in model_type.__table__.columns)
@@ -165,7 +165,9 @@ def _composition_projection(model_type, incumbent_schema, incoming_schema, contr
     projection = f"SELECT {columns} FROM {live} live"
     parameters_by_field = {}
     if contribution is not None:
-        incoming = f"{native._quoted(incoming_schema)}.{native._quoted(contribution.incoming_model.__tablename__)}"
+        incoming = incoming_relation or (
+            f"{native._quoted(incoming_schema)}.{native._quoted(contribution.incoming_model.__tablename__)}"
+        )
         if contribution.update_columns:
             return _source_upsert_projection(model_type, live, incoming, contribution), parameters_by_field
         if contribution.effect_model is None:

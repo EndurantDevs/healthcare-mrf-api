@@ -37,6 +37,26 @@ Run directly for local smokes or one-off repairs:
 python main.py start mrf-source-discovery --test
 ```
 
+## Rolling acquisition compatibility
+
+Node health preserves the five-field `mrf_acquisition_dataset` wire format for
+older clients. These physical IDs are compatibility metadata only; current
+admission checks named relations and never compares the saved IDs.
+`mrf_acquisition_dataset_v2` supplies the four schema-qualified relation names
+for clients that support named reservations.
+
+For Kubernetes, named health is available only when the selected discovery
+worker is pinned by digest and equals `HLTHPRT_RUNTIME_IMAGE_IDENTITY`.
+`HLTHPRT_MRF_SOURCE_DISCOVERY_WORKER_IMAGE` takes precedence over
+`HLTHPRT_WORKER_JOB_IMAGE`; an older or unknown worker gets only legacy health.
+Process workers use the same installed implementation as the API.
+
+Update the client to understand both versions, then update the API and selected
+discovery worker together. Preserve running Jobs and existing reservation bytes.
+Before rollback to an older worker, finish named acquisitions and their catalog
+consumers; an older worker cannot resume a named reservation. Do not rewrite a
+reservation or restart retained acquisition work to make rollback succeed.
+
 ## Recommended Schedules
 
 Configure these in an external scheduler rather than hard-coded cron:

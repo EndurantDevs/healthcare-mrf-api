@@ -128,6 +128,7 @@ async def test_ms_drg_copies_entire_family_with_one_budget_and_deadline(monkeypa
     if predecessors:
         stage = await drg._create_stage(session, "source", uuid4(), predecessors=True)
         session.scalar.return_value = False
+        monkeypatch.setattr(drg, "_named_stage", AsyncMock(return_value=stage))
         await drg.prepare_predecessor(session, "source", stage, manifest, source_copy=capability)
         names = drg.PREDECESSORS
     else:
@@ -235,7 +236,7 @@ async def test_ms_drg_copy_refuses_targets_outside_its_closed_model_scope():
 
 
 @pytest.mark.asyncio
-async def test_restore_candidate_indexes_complete_without_replacing_registered_oids(monkeypatch):
+async def test_restore_candidate_indexes_use_named_local_handles(monkeypatch):
     events = []
     session = _session(events)
     monkeypatch.setattr(codes, "_verify_clone", AsyncMock())
@@ -248,8 +249,11 @@ async def test_restore_candidate_indexes_complete_without_replacing_registered_o
     assert not any("CREATE TABLE" in event or "DROP " in event for event in events)
     assert any("ADD PRIMARY KEY" in event for event in events)
     assert all(codes.PREDECESSOR_TABLE not in event for event in events)
-    signature.assert_awaited_once_with(session, stage.catalog_oid, pending_primary=True)
-    verify.assert_awaited_once_with(session, stage, predecessor_oid=13)
+    signature.assert_awaited_once_with(session, 11, pending_primary=True)
+    resolved = verify.await_args.args[1]
+    assert resolved.schema_name == stage.schema_name and resolved.catalog_oid == 11
+    assert stage.catalog_oid == 12
+    assert verify.await_args.kwargs == {"predecessor_oid": 11}
 
 
 @pytest.mark.asyncio
@@ -276,7 +280,7 @@ async def test_ms_drg_restore_precreates_only_heaps_and_finishes_candidate_famil
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("archive", [codes, drg])
-async def test_restore_rejects_changed_registered_oid_before_any_index_work(monkeypatch, archive):
+async def test_restore_rejects_invalid_named_inventory_before_any_index_work(monkeypatch, archive):
     events = []
     if archive is codes:
         monkeypatch.setattr(
@@ -289,7 +293,10 @@ async def test_restore_rejects_changed_registered_oid_before_any_index_work(monk
         stage_by_field = dict(
             dataset_id=str(dataset_id), schema_name=drg.stage_schema(dataset_id), schema_oid=11, relation_oids=(12,) * 6
         )
-        with pytest.raises(drg.MsDrgArchiveError, match="identity changed"):
+        monkeypatch.setattr(
+            drg, "_verify_namespace", AsyncMock(side_effect=drg.MsDrgArchiveError("named inventory differs"))
+        )
+        with pytest.raises(drg.MsDrgArchiveError, match="named inventory differs"):
             await drg.complete_restore(_session(events), stage_by_field, _manifest())
     assert not any("CREATE " in event or "ALTER " in event for event in events)
 

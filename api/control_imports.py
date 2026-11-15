@@ -53,6 +53,7 @@ from api.control_workers import (
     _request_nucc_cancel,
     exact_worker_presence,
 )
+from api.scoped_catalog_publisher_worker import request_cancel as request_catalog_stop
 from db.models import ImportRun, PTG2ImportRun, PTG2Snapshot, db
 from process import mrf_discovery_acquisition_guard as mrf_acquisition
 from process import npi_isolated_execution as npi_execution
@@ -157,7 +158,7 @@ from process.ptg_singleton_direct_control import (
     protected_singleton_direct_presence,
 )
 from process.redis_config import build_redis_settings
-from process.scoped_catalog_handoff import has_catalog_handoff, request_catalog_cancel
+from process.scoped_catalog_handoff import has_catalog_handoff
 from process.serialization import deserialize_job, serialize_job
 from process.uhc_provider_file_admission import (
     validate_uhc_official_file_admission,
@@ -1118,6 +1119,7 @@ async def node_health() -> dict[str, Any]:
         "status": "degraded" if failing_checks else "ok",
         "checks": health_checks_by_name,
         "mrf_acquisition_dataset": health_checks_by_name["database"].get("mrf_acquisition_dataset"),
+        "mrf_acquisition_dataset_v2": health_checks_by_name["database"].get("mrf_acquisition_dataset_v2"),
         "failing_checks": failing_checks,
         "time": dt.datetime.now(dt.UTC).isoformat(),
         "features": {
@@ -4266,7 +4268,9 @@ async def request_cancel(run_id: str) -> dict[str, Any] | None:
         and current["metrics"].get("places_handoff") is not None
     ):
         return await _request_protected_places_cancel(run_id)
-    if _has_source_profile_handoff(current) or has_catalog_handoff(current):
+    if has_catalog_handoff(current):
+        return await request_catalog_stop(run_id, current)
+    if _has_source_profile_handoff(current):
         return await _request_source_profile_cancel(run_id)
     return await _request_worker_cancel(current)
 
@@ -4294,10 +4298,7 @@ async def _request_source_profile_cancel(run_id):
         if archive.is_native_published_attempt(current_by_field):
             await archive.require_native_maintenance(session, current_by_field)
             return normalize_run(current_by_field)
-        if has_catalog_handoff(current_by_field):
-            await request_catalog_cancel(session, current_by_field)
-        else:
-            await _mark_source_profile_cancel(session, current_by_field)
+        await _mark_source_profile_cancel(session, current_by_field)
     updated = await get_import_run(run_id)
     if updated is not None:
         _write_run_live_progress(updated, publish_event=False)
@@ -4571,12 +4572,11 @@ async def _persist_cancel_request(
     update_result = await db.execute(cancel_update)
     updated = await get_import_run(run_id)
     if getattr(update_result, "rowcount", 1) == 0:
-        if (
-            updated is not None
-            and updated["status"] not in TERMINAL_STATUSES
-            and (_has_source_profile_handoff(updated) or has_catalog_handoff(updated))
-        ):
-            return await _request_source_profile_cancel(run_id)
+        if updated is not None and updated["status"] not in TERMINAL_STATUSES:
+            if has_catalog_handoff(updated):
+                return await request_catalog_stop(run_id, updated)
+            if _has_source_profile_handoff(updated):
+                return await _request_source_profile_cancel(run_id)
         return updated
     if updated and publish:
         _write_run_live_progress(

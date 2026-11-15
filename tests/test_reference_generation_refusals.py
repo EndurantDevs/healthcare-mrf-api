@@ -662,9 +662,11 @@ async def test_existing_dictionary_effects_require_registered_predecessor_before
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("current_present", (True, False))
-async def test_dictionary_effect_capture_refuses_aggregate_row_bound(current_present):
+async def test_dictionary_effect_capture_refuses_aggregate_row_bound(monkeypatch, current_present):
     session = _session()
-    session.scalar.side_effect = [False] * (3 if current_present else 2) + [True]
+    destination = AsyncMock()
+    monkeypatch.setattr(dictionary, "_require_effect_destination", destination)
+    session.scalar.side_effect = [False, False, True]
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="publication bound is exceeded"):
         await dictionary._capture_dictionary_effect_table(
             session,
@@ -675,6 +677,7 @@ async def test_dictionary_effect_capture_refuses_aggregate_row_bound(current_pre
             201,
             current_present,
         )
+    assert destination.await_count == int(current_present)
     session.execute.assert_awaited_once()
     assert str(session.execute.await_args.args[0]).lstrip().startswith('INSERT INTO "candidate".')
     assert "SELECT count(*)>100000" in str(session.scalar.await_args.args[0])
@@ -716,12 +719,15 @@ async def test_dictionary_effect_closure_refuses_either_set_without_mutation(mon
 async def test_dictionary_readback_failure_stops_publication_and_rollback(monkeypatch, rollback, failed_model):
     session = _session()
     monkeypatch.setattr(dictionary, "_lock_reference_dictionary", AsyncMock(return_value=(201, 202)))
-    fence_count = 8 if rollback else 4
+    destination = AsyncMock()
+    monkeypatch.setattr(dictionary, "_require_effect_destination", destination)
+    fence_count = 4 if rollback else 2
     session.scalar.side_effect = [False] * (fence_count + failed_model) + [True]
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="dictionary publication differs"):
         await dictionary.apply_reference_dictionary_effects(
             session, incoming_schema="candidate", current_schema="mrf", rollback=rollback
         )
+    assert destination.await_count == (4 if rollback else 2)
     assert session.execute.await_count == 2 * (failed_model + 1)
     query = str(session.scalar.await_args.args[0])
     assert "effect.image IS DISTINCT FROM to_jsonb(live)" in query

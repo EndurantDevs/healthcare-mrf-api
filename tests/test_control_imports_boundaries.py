@@ -308,7 +308,11 @@ def test_acquisition_scope_rejects_source_and_discovered_endpoint_edges():
 async def test_health_helpers_report_success_and_invalid_sysconf(monkeypatch):
     monkeypatch.setattr(control_imports.db, "execute", AsyncMock())
     monkeypatch.setattr(control_imports.mrf_acquisition, "acquisition_dataset", AsyncMock(side_effect=ValueError))
-    assert await control_imports._database_check() == {"ok": True, "mrf_acquisition_dataset": None}
+    assert await control_imports._database_check() == {
+        "ok": True,
+        "mrf_acquisition_dataset": None,
+        "mrf_acquisition_dataset_v2": None,
+    }
 
     redis_client = Mock()
     monkeypatch.setattr(control_imports, "_redis_client", lambda: redis_client)

@@ -24,7 +24,7 @@ from process import ms_drg_result_generation as authority
 from process import reference_family_archive as native
 from process.ms_drg_publication import SOURCE_ICD10PCS_INDEX, SOURCE_MS_DRG
 from process.scoped_catalog_retention import cleanup_retained_catalog
-from tests.scoped_catalog_native_fixture import catalog_actors, seal_catalog
+from tests.scoped_catalog_native_fixture import catalog_actors, configure_catalog_publisher, seal_catalog
 
 _MIGRATION_PATH = Path(__file__).resolve().parents[1] / "alembic/versions/20260923021000_ms_drg_result_generation.py"
 
@@ -53,7 +53,7 @@ def _dsn() -> str:
     url = make_url(raw)
     if (
         (url.drivername, url.username, url.host) != ("postgresql", "postgres", "127.0.0.1")
-        or url.port not in {5432, 5440}
+        or not 1024 <= (url.port or 0) <= 65535
         or re.fullmatch(r"hc_ms_drg_authority_[0-9a-f]{32}", url.database or "") is None
     ):
         pytest.fail("MS-DRG authority test requires its dedicated local database")
@@ -278,6 +278,7 @@ async def test_ms_drg_generation_variants_rollback_and_concurrent_publish(monkey
     monkeypatch.delenv("DB_SCHEMA", raising=False)
     try:
         async with catalog_actors(engine, [schema, destination]) as actors:
+            configure_catalog_publisher(monkeypatch, actors, destination)
             await _create_source(engine, schema)
             await _create_destination(engine, destination)
             for name in (schema, destination):

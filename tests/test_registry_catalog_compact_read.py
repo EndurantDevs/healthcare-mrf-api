@@ -7,6 +7,7 @@ from dataclasses import replace
 from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
+import asyncpg
 import pytest
 
 from api.network_compact_address import compact_address_native_sql, compact_address_read_relations
@@ -26,7 +27,7 @@ from tests.test_registry_network_catalog_read import (
     source_coordinates,
 )
 
-SURFACES = ("fhir-list", "fhir-detail", "list", "detail", "legacy", "legacy-batch")
+SURFACES = ("list", "detail", "legacy", "legacy-batch")
 _PID = 77
 
 
@@ -63,7 +64,7 @@ def _boundary(request, surface, *, empty=False):
                 9, str(UUID(int=1)), original.schema_name, 1, {}, 4, original.manifest_sha256, 123
             )
         )
-        fhir.catalog_pin.return_value = manifest
+        fhir.read_published_api_pin.return_value = (manifest, None, None)
         if empty:
             connection.fetchrow.return_value = {"total": 0, "rows_json": "[]"}
     else:
@@ -225,7 +226,6 @@ async def test_legacy_binds_and_filter_positions_survive_compact_projection(requ
 
 async def test_fhir_filters_and_exclusions_keep_their_original_positions(request, monkeypatch):
     connection, manifest = _boundary(request, "fhir-list", empty=True)
-    _guarded_page(monkeypatch, connection, manifest)
     policy = RegistryOrganizationVisibility((COMPANY,), (GROUP,))
     source = source_coordinates("fhir")
     await fhir.read_fhir_catalog(
@@ -350,3 +350,17 @@ async def test_public_flat_and_unattached_reads_add_no_pid_or_compact_check(requ
         assert result["items"][0]["network_id"] == 7
     guard.assert_not_awaited()
     connection.get_server_pid.assert_not_called()
+
+
+@pytest.mark.parametrize("surface", ["fhir-list", "fhir-detail"])
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_fhir_named_query_preserves_native_refusals_and_cancellation(request, monkeypatch, surface, cancelled):
+    connection, _ = _boundary(request, surface, empty=True)
+    failure = asyncio.CancelledError() if cancelled else asyncpg.InsufficientPrivilegeError("denied")
+    connection.fetchrow.side_effect = failure
+    guard = AsyncMock(side_effect=AssertionError("named publication compared historical object IDs"))
+    monkeypatch.setattr(catalog, "verify_consumed_network_relations", guard)
+    with pytest.raises(asyncio.CancelledError if cancelled else catalog.RegistryNetworkCatalogError) as error:
+        await _read(surface, connection)
+    assert error.value is failure if cancelled else error.value.__cause__ is failure
+    guard.assert_not_awaited()

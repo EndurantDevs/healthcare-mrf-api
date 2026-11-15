@@ -9,11 +9,11 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import Column, Integer, MetaData, Table
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db.connection import Database
 from process import mrf_discovery_acquisition_guard as guard
-from tests.test_mrf_discovery_acquisition_guard import replacement, reserved_run
+from tests.test_mrf_discovery_acquisition_guard import LEGACY_DATASET, replacement, reserved_run
 from tests.test_mrf_discovery_checkpoints_postgres import _connect, _database_url
 
 
@@ -30,15 +30,14 @@ async def _create_guard_relations(connection, control, relation_by_model):
 
 def _native_guard_database(database_url):
     """Use the same one-slot engine and native connection settings."""
-    return Database(
-        engine=create_async_engine(
-            database_url.set(drivername="postgresql+asyncpg"),
-            pool_size=1,
-            max_overflow=0,
-            pool_timeout=0.5,
-            connect_args={"server_settings": {"application_name": "synthetic-mrf-acquisition-single-slot"}},
-        )
+    engine = create_async_engine(
+        database_url.set(drivername="postgresql+asyncpg"),
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.5,
+        connect_args={"server_settings": {"application_name": "synthetic-mrf-acquisition-single-slot"}},
     )
+    return Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
 
 
 async def _seed_guard_run(first, control, relation_by_model):
@@ -67,14 +66,16 @@ async def _seed_guard_run(first, control, relation_by_model):
 
 
 @pytest.fixture
-async def native_guard(monkeypatch):
+async def native_guard(monkeypatch, request):
     """Create and always remove the exact native control/export relation set."""
     database_url = _database_url()
     first = await _connect(database_url)
     second = None
     database = None
     has_schema = False
-    schema = "mrf_acquisition_test_" + uuid.uuid4().hex
+    schema = (
+        "MRF_Acquisition_Test_" if getattr(request, "param", False) else "mrf_acquisition_test_"
+    ) + uuid.uuid4().hex
     quoted_schema = '"' + schema + '"'
     relation_by_model = {
         guard.ImportRun: f'{quoted_schema}."local_run"',
@@ -212,25 +213,26 @@ async def test_native_reciprocal_replacement_leaves_old_failed_and_other_importe
             pytest.fail("mismatched replacement entered mutable work")
 
 
-async def test_native_execution_rejects_replaced_exporter_relation(native_guard):
+async def test_native_execution_accepts_named_exporter_copy_without_metadata_rewrite(native_guard):
     case = native_guard
     source = case.models[guard.MRFSource]
     await case.first.execute(f"ALTER TABLE {source} RENAME TO export_source_original")
     await case.first.execute(f"CREATE TABLE {source} (id integer PRIMARY KEY, payload text)")
-    with pytest.raises(ValueError, match="mrf_acquisition_not_admitted"):
-        async with guard.acquisition_command(command, command_params(case)):
-            pytest.fail("replacement relation reused a saved reservation")
+    await case.first.execute(f'INSERT INTO {source} SELECT * FROM "{case.schema}".export_source_original')
+    async with guard.acquisition_command(command, command_params(case)):
+        assert await case.first.fetchval(f"SELECT payload FROM {source} WHERE id=1") == "original"
+    stored = await case.first.fetchval(f"SELECT metrics FROM {case.control} WHERE run_id=$1", case.run["run_id"])
+    assert json.loads(stored) == case.run["metrics"]
 
 
-async def test_native_execution_rejects_replaced_control_relation(native_guard):
+async def test_native_execution_accepts_named_control_copy_with_exact_logical_reservation(native_guard):
     case = native_guard
     original = case.control.rsplit(".", 1)[0] + '."control_run_original"'
     await case.first.execute(f"ALTER TABLE {case.control} RENAME TO control_run_original")
     await case.first.execute(f"CREATE TABLE {case.control} (LIKE {original} INCLUDING ALL)")
     await case.first.execute(f"INSERT INTO {case.control} SELECT * FROM {original}")
-    with pytest.raises(ValueError, match="mrf_acquisition_not_admitted"):
-        async with guard.acquisition_command(command, command_params(case)):
-            pytest.fail("replacement control relation reused a saved reservation")
+    async with guard.acquisition_command(command, command_params(case)):
+        assert await guard.native_dataset_identity(case.first) == case.dataset
     assert await case.first.fetchval(f"SELECT payload FROM {case.models[guard.MRFSource]} WHERE id=1") == "original"
 
 
@@ -242,7 +244,7 @@ async def test_native_verified_foreign_dataset_reservation_does_not_block(native
     for kind in ("source", "payer", "file"):
         relation = f'{schema}."foreign_{kind}"'
         await case.first.execute(f"CREATE TABLE {relation} (id integer PRIMARY KEY)")
-        foreign["dataset"][kind + "_oid"] = await case.first.fetchval("SELECT to_regclass($1)::oid::bigint", relation)
+        foreign["dataset"][kind + "_relation"] = relation.replace('"', "")
     await case.first.execute(
         f"INSERT INTO {case.control} (run_id,importer,status,metrics) VALUES ($1,$2,'running',$3::jsonb)",
         foreign["run_id"],
@@ -276,3 +278,79 @@ async def test_native_guard_keeps_a_one_connection_data_pool_available(native_gu
             await discovery._ensure_catalog_tables()
             assert case.database.engine.pool.checkedout() == 0
     assert await case.first.fetchval("SELECT to_regclass($1) IS NOT NULL", f"{case.schema}.single_pool_catalog")
+
+
+async def test_native_legacy_pending_consumer_is_never_treated_as_disjoint(native_guard):
+    case = native_guard
+    marker = deepcopy(case.run["metrics"][guard.MARKER])
+    marker.update(run_id="legacy-pending", dataset=dict(LEGACY_DATASET))
+    await case.first.execute(
+        f"INSERT INTO {case.control} (run_id,importer,status,metrics) VALUES ($1,$2,'running',$3::jsonb)",
+        marker["run_id"],
+        guard.IMPORTER,
+        json.dumps({guard.MARKER: marker}),
+    )
+    with pytest.raises(ValueError, match="mrf_acquisition_not_admitted"):
+        async with guard.acquisition_command(command, command_params(case)):
+            pytest.fail("legacy unknown overlap entered mutable work")
+    assert await case.first.fetchval(f"SELECT payload FROM {case.models[guard.MRFSource]} WHERE id=1") == "original"
+
+
+async def test_native_legacy_owner_continues_without_rewriting_archived_fields(native_guard):
+    case = native_guard
+    marker = deepcopy(case.run["metrics"][guard.MARKER])
+    marker["dataset"] = dict(LEGACY_DATASET)
+    metrics_map = {guard.MARKER: marker}
+    await case.first.execute(f"UPDATE {case.control} SET metrics=$1::jsonb", json.dumps(metrics_map))
+    async with guard.acquisition_command(command, command_params(case)):
+        stored = await case.first.fetchval(f"SELECT metrics FROM {case.control} WHERE run_id=$1", case.run["run_id"])
+        assert json.loads(stored) == metrics_map
+
+
+async def test_native_missing_named_relation_refuses_before_execution(native_guard):
+    case = native_guard
+    await case.first.execute(f"DROP TABLE {case.models[guard.MRFFile]}")
+    with pytest.raises(ValueError, match="mrf_acquisition_not_admitted"):
+        async with guard.acquisition_command(command, command_params(case)):
+            pytest.fail("missing named relation entered mutable work")
+
+
+async def test_native_permissions_refuse_unreadable_exporter(native_guard):
+    case = native_guard
+    role = "acquisition_reader_" + uuid.uuid4().hex
+    has_role = False
+    try:
+        await case.first.execute(f'CREATE ROLE "{role}"')
+        has_role = True
+        await case.first.execute(f'GRANT USAGE ON SCHEMA "{case.schema}" TO "{role}"')
+        for relation in (case.control, case.models[guard.MRFSource], case.models[guard.MRFPayer]):
+            await case.first.execute(f'GRANT SELECT ON {relation} TO "{role}"')
+        await case.second.execute(f'SET ROLE "{role}"')
+        with pytest.raises(ValueError, match="mrf_acquisition_not_admitted") as raised:
+            await guard.native_dataset_identity(case.second)
+        assert raised.value.__cause__.sqlstate == "42501"
+    finally:
+        await case.second.execute("RESET ROLE")
+        if has_role:
+            await case.first.execute(f'DROP OWNED BY "{role}"')
+            await case.first.execute(f'DROP ROLE "{role}"')
+
+
+@pytest.mark.parametrize("native_guard", [False, True], indirect=True)
+async def test_native_health_exposes_both_wire_versions_without_rewriting_reservation(native_guard, monkeypatch):
+    case = native_guard
+    monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "process")
+    before = await case.first.fetchval(f"SELECT metrics FROM {case.control} WHERE run_id=$1", case.run["run_id"])
+    health = await guard.database_health(case.database)
+    legacy = health["mrf_acquisition_dataset"]
+    assert health["ok"] is True
+    assert health["mrf_acquisition_dataset_v2"] == case.dataset
+    assert set(legacy) == guard.LEGACY_DATASET_KEYS
+    assert all(type(value) is int and value > 0 for value in legacy.values())
+    assert legacy["source_oid"] == await case.first.fetchval(
+        "SELECT to_regclass($1)::oid", case.models[guard.MRFSource]
+    )
+    assert await guard.require_reservation(case.first, case.run) == case.dataset
+    assert before == await case.first.fetchval(
+        f"SELECT metrics FROM {case.control} WHERE run_id=$1", case.run["run_id"]
+    )

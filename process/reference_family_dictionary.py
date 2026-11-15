@@ -653,18 +653,17 @@ async def apply_reference_dictionary_effects(
 
 
 async def _require_effect_destination(session, mirror, effects, destination_schema, oid):
-    """Keep the original fence unless a current source receipt authenticates a catalog rebind."""
+    """Resolve the locked native family by name; saved effect IDs are historical metadata."""
     from process import reference_family_archive as native
-    from process.scoped_catalog_binding import require_current_catalog_rebinding
+    from process import scoped_catalog_named_storage as storage
 
-    changed = await session.scalar(
-        text(f"SELECT EXISTS(SELECT 1 FROM {effects} WHERE destination_oid IS DISTINCT FROM :oid)"), {"oid": oid}
+    pairs_by_name = dict(
+        await storage.require_tables(
+            session, destination_schema, (models.CodeCatalog, models.CodeCrosswalk), lock="SHARE"
+        )
     )
-    if changed is False:
-        return
-    if changed is not True or mirror.__source_table__ != "code_catalog":
+    if pairs_by_name.get(mirror.__source_table__) != oid:
         raise native.ReferenceFamilyArchiveError("reference dictionary destination changed")
-    await require_current_catalog_rebinding(session, destination_schema, oid)
 
 
 async def _write_dictionary_effects(

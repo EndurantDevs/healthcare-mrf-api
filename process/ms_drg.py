@@ -56,7 +56,7 @@ from process.ms_drg_sources import (
     _TableParser,
 )
 from process.reference_stage import build_reference_stage_suffix
-from process.scoped_catalog_handoff import prepare_catalog_handoff
+from process.scoped_catalog_handoff import capture_catalog_expected, prepare_catalog_handoff
 
 DEFAULT_CONCURRENCY = 10
 TEST_INDEX_PAGE_LIMIT = 2
@@ -387,7 +387,12 @@ async def _import_request(request, control_context=None):
     """Normalize ordinary input and hand its complete candidate to the admitted publisher."""
     await ensure_database(request.test_mode)
     schema = _schema()
-    await _ensure_tables(schema)
+    if control_context is None:
+        await _ensure_tables(schema)
+    await capture_catalog_expected(db, control_context, importer="ms-drg", schema=schema)
+    committed = (control_context or {}).get("context", {}).get("_control_committed_result")
+    if committed is not None:
+        return committed
     manual_source = await _load_manual_source(request)
     relationship_rows = await _load_relationship_rows(manual_source, request)
     import_payloads = _build_payloads(manual_source, relationship_rows)

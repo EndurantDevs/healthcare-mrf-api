@@ -18,6 +18,17 @@ def catalog_shape_boundary(monkeypatch):
     monkeypatch.setattr(archive, "match_catalog_text_columns", AsyncMock())
 
 
+@pytest.fixture(autouse=True)
+def named_handle_boundary(monkeypatch):
+    async def resolve(_session, stage):
+        if not isinstance(stage, archive.CodeSetsStage) or stage.schema_name != archive.stage_schema(stage.dataset_id):
+            raise archive.CodeSetsArchiveError("code-set stage logical name differs")
+        return stage
+
+    monkeypatch.setattr(archive, "_named_stage", resolve)
+    monkeypatch.setattr(reference_family_archive, "_relation_oid", AsyncMock(return_value=13))
+
+
 def _copy():
     return reference_family_archive.ReferenceFamilySourceCopy(AsyncMock(return_value=1), 4096, 30)
 
@@ -185,21 +196,27 @@ async def test_publish_and_slice_reject_exhausted_or_missing_catalogs(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_clone_and_ownership_checks_reject_changed_relations(monkeypatch):
-    with pytest.raises(archive.CodeSetsArchiveError, match="clone is unavailable"):
-        await archive._clone_slice(_session(scalar_values=[None, 2]), "source", "target", source_copy=_copy())
-    with pytest.raises(archive.CodeSetsArchiveError, match="ownership changed"):
-        await archive._verify_clone(_session(scalar_values=[2, 3]), "target", 1, 3)
-    with pytest.raises(archive.CodeSetsArchiveError, match="predecessor ownership changed"):
-        await archive._verify_clone(_session(scalar_values=[1, 3, 5]), "target", 1, 3, 4)
+async def test_clone_checks_require_named_inventory_and_native_structure(monkeypatch):
+    from process import mrf_address_publication
+    from process import scoped_catalog_named_storage as storage
 
-    monkeypatch.setattr(
-        reference_family_archive,
-        "_namespace_relations",
-        AsyncMock(return_value=[{"relkind": "v", "oid": 3, "index_table_oid": None}]),
-    )
-    with pytest.raises(archive.CodeSetsArchiveError, match="unowned relation"):
-        await archive._verify_clone(_session(scalar_values=[1, 3]), "target", 1, 3)
+    with pytest.raises(archive.CodeSetsArchiveError, match="clone is unavailable"):
+        await archive._clone_slice(_session(scalar_values=[False, None, 2]), "source", "target", source_copy=_copy())
+    inventory = AsyncMock(side_effect=RuntimeError("named inventory differs"))
+    monkeypatch.setattr(storage, "require_inventory", inventory)
+    with pytest.raises(RuntimeError, match="named inventory"):
+        await archive._verify_clone(_session(), "target", 999, 998)
+    inventory.side_effect = None
+    monkeypatch.setattr(reference_family_archive, "_lock_family", AsyncMock())
+    structure = AsyncMock(side_effect=RuntimeError("native structure differs"))
+    monkeypatch.setattr(mrf_address_publication, "_require_native_read_structure", structure)
+    with pytest.raises(RuntimeError, match="native structure"):
+        await archive._verify_clone(_session(), "target", 999, 998)
+    structure.side_effect = None
+    with pytest.raises(archive.CodeSetsArchiveError, match="executable structure"):
+        await archive._verify_clone(_session(scalar_values=[False]), "target", 999, 998, 997)
+    await archive._verify_clone(_session(scalar_values=[True]), "target", 999, 998, 997)
+    assert inventory.await_args.args[1:] == ("target", ("code_catalog", archive.PREDECESSOR_TABLE))
 
 
 @pytest.mark.asyncio
@@ -209,7 +226,7 @@ async def test_prepare_source_rejects_drift_clone_difference_and_incomplete_auth
     generation = _generation(source=source, catalog_oid=9)
     session = _session()
     monkeypatch.setattr(archive, "read_generation", AsyncMock(return_value=generation))
-    monkeypatch.setattr(archive, "scope_receipt", AsyncMock(return_value=(source.row_count, source.row_sha256, 8)))
+    monkeypatch.setattr(archive, "scope_receipt", AsyncMock(return_value=(source.row_count + 1, source.row_sha256, 8)))
     with pytest.raises(archive.CodeSetsArchiveError, match="generation drifted"):
         await archive.prepare_source(session, "source", uuid4(), source_copy=_copy())
 
@@ -237,7 +254,7 @@ async def test_restore_stage_and_verification_reject_invalid_physical_state(monk
     with pytest.raises(archive.CodeSetsArchiveError, match="restore schema differs"):
         await archive.precreate_restore(session, destination="destination", dataset_id=uuid4(), manifest=manifest)
 
-    with pytest.raises(archive.CodeSetsArchiveError, match="stage identity"):
+    with pytest.raises(archive.CodeSetsArchiveError, match="stage logical name"):
         await archive.verify_stage(_session(), object())
 
     stage = _stage()
