@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import sqlite3
+from dataclasses import replace
 
 import pytest
 
@@ -22,14 +22,14 @@ from process.provider_directory_rooted_graph_persistence_sql import (
     root_closure_sql,
 )
 from tests.provider_directory_rooted_graph_acquisition_test_support import identity
-from tests.provider_directory_rooted_graph_runtime_test_support import RuntimeHarness
+from tests.provider_directory_rooted_graph_runtime_test_support import RuntimeHarness, configure_rooted_generation
 from tests.test_provider_directory_rooted_graph_acquisition_boundaries import _Database
-from tests.test_provider_directory_rooted_graph_worker_boundaries import _runner
 from tests.test_provider_directory_rooted_graph_http_adaptive_pages import (
     FakeSession,
     request_sizes,
     timeout_response,
 )
+from tests.test_provider_directory_rooted_graph_worker_boundaries import _runner
 
 
 @pytest.mark.asyncio
@@ -39,34 +39,24 @@ async def test_exhausted_page_ladder_terminalizes_without_outer_retry() -> None:
     runner = _runner(
         harness,
         max_attempts=8,
-        dependencies=replace(
-            harness.dependencies(), fetch=fetch_provider_directory_rooted_graph_query
-        ),
+        dependencies=replace(harness.dependencies(), fetch=fetch_provider_directory_rooted_graph_query),
     )
-    assert (
-        await runner.process_claim(session, harness._claims("baseline")["role"]) is None
-    )
+    assert await runner.process_claim(session, harness._claims("baseline")["role"]) is None
     assert request_sizes(session) == [100, 50, 25, 12, 6, 3, 1]
     assert harness.events == [("error", identity().acquisition_id, "transport_timeout")]
 
 
 @pytest.mark.asyncio
-async def test_timeout_retries_create_one_error_and_drain_remaining_known_work() -> (
-    None
-):
+async def test_timeout_retries_create_one_error_and_drain_remaining_known_work() -> None:
     harness = RuntimeHarness()
     root = identity()
     claims = harness._claims("baseline")
-    harness.generic_pending[root.acquisition_id].extend(
-        [claims["role"], claims["direct"]]
-    )
+    harness.generic_pending[root.acquisition_id].extend([claims["role"], claims["direct"]])
 
     async def timeout_role(session, api_base, claim, *, bounds):
         response = await harness.fetch(session, api_base, claim, bounds=bounds)
         if claim.query_id == claims["role"].query_id:
-            raise ProviderDirectoryRootedGraphHTTPError(
-                "transport_timeout", retryable=True
-            )
+            raise ProviderDirectoryRootedGraphHTTPError("transport_timeout", retryable=True)
         return response
 
     runner = _runner(
@@ -102,9 +92,7 @@ async def test_timeout_terminal_materializes_without_release_or_descendants(
         max_attempts=1,
         dependencies=replace(harness.dependencies(), fetch=timeout_fetch),
     )
-    outcome = await runner.process_claim(
-        {"session_id": 1}, harness._claims("baseline")[claim_name]
-    )
+    outcome = await runner.process_claim({"session_id": 1}, harness._claims("baseline")[claim_name])
     assert outcome is None
     assert harness.events == [("error", identity().acquisition_id, "transport_timeout")]
     assert not harness.generic_pending
@@ -119,9 +107,7 @@ async def test_timeout_terminal_materializes_without_release_or_descendants(
         ("resource_limit", False, "resource_limit"),
     ),
 )
-async def test_non_timeout_terminal_still_aborts(
-    error_code, retryable, terminal_code
-) -> None:
+async def test_non_timeout_terminal_still_aborts(error_code, retryable, terminal_code) -> None:
     harness = RuntimeHarness()
 
     async def fail_fetch(*_args, **_kwargs):
@@ -133,9 +119,7 @@ async def test_non_timeout_terminal_still_aborts(
         dependencies=replace(harness.dependencies(), fetch=fail_fetch),
     )
     with pytest.raises(ProviderDirectoryRootedGraphAcquisitionError):
-        await runner.process_claim(
-            {"session_id": 1}, harness._claims("baseline")["role"]
-        )
+        await runner.process_claim({"session_id": 1}, harness._claims("baseline")["role"])
     assert harness.events == [("error", identity().acquisition_id, terminal_code)]
 
 
@@ -156,9 +140,8 @@ async def test_census_resume_accepts_only_proven_timeout_skip_without_refetch() 
         (None, "error"),
     ),
 )
-async def test_census_state_preserves_timeout_provenance(
-    error_code, expected_state
-) -> None:
+async def test_census_state_preserves_timeout_provenance(monkeypatch, error_code, expected_state) -> None:
+    configure_rooted_generation(monkeypatch)
     state = await provider_directory_rooted_graph_census_state(
         identity().acquisition_id,
         database=_Database(
@@ -184,21 +167,16 @@ async def test_census_state_preserves_timeout_provenance(
         ("leased", "transport_timeout", 0),
     ),
 )
-def test_drained_predicate_accepts_only_complete_or_proven_timeout(
-    status, error_code, expected
-) -> None:
+def test_drained_predicate_accepts_only_complete_or_proven_timeout(status, error_code, expected) -> None:
     with sqlite3.connect(":memory:") as database:
         observed = database.execute(
-            f"SELECT {_terminal_work_sql('work')} FROM "
-            "(SELECT ? AS status, ? AS error_code) AS work",
+            f"SELECT {_terminal_work_sql('work')} FROM (SELECT ? AS status, ? AS error_code) AS work",
             (status, error_code),
         ).fetchone()[0]
     assert observed == expected
 
 
-def test_root_frontier_proof_covers_known_queries_without_claiming_completeness() -> (
-    None
-):
+def test_root_frontier_proof_covers_known_queries_without_claiming_completeness() -> None:
     sql = root_closure_sql()
     assert "AS root_frontier_drained" in sql
     assert "root_closure_complete" not in sql

@@ -13,6 +13,7 @@ from sqlalchemy import event, text
 from db.connection import Database
 from process import provider_directory_generic_source_artifacts as artifacts
 from process import provider_directory_published_source_replacement as replacement
+from process import provider_directory_serving_recovery_receipts as receipts
 from tests import provider_directory_generic_artifact_pages_support as page_copy
 from tests.provider_directory_dataset_artifact_pg_support import seal_validated_dataset
 from tests.provider_directory_serving_recovery_postgres_support import ordinary_serving_case
@@ -302,20 +303,18 @@ async def _swap_and_abort(database, schema, stage, fence, retain):
     from process import provider_directory_serving_recovery_receipts as receipts
 
     target_relation = stage.target_relation
-    old_oid = await database.scalar(f"SELECT '{schema}.{target_relation}'::regclass::oid::bigint")
     async with database.transaction():
         await importer._lock_and_verify_artifact_dataset_fence(fence, database)
-        await database.status(
-            f"LOCK TABLE {schema}.{target_relation},{schema}.prepared_overlay IN ACCESS EXCLUSIVE MODE"
-        )
+        await database.status(f"LOCK TABLE {schema}.{target_relation},{schema}.prepared_overlay IN ACCESS SHARE MODE")
         if retain:
             native = await receipts.relation(database, schema, target_relation, content=False)
-            await receipts.retain(database, schema, native)
+            retained = await receipts.retain(database, schema, native, generation="rollback-probe")
         await importer._install_provider_directory_prepared_stage(stage)
         await importer._finish_provider_directory_prepared_stage(stage)
         await importer._cutover_provider_directory_artifact_sources(fence)
         assert await database.scalar(f"SELECT marker FROM {schema}.{target_relation}") == "new"
-        assert await database.scalar(f"SELECT marker FROM {schema}.{receipts.retained_name(old_oid)}") == "old"
+        if retain:
+            assert await database.scalar(f'SELECT marker FROM "{retained["schema"]}"."{retained["relation"]}"') == "old"
         raise RuntimeError("rollback probe")
 
 
@@ -327,7 +326,8 @@ async def test_native_stage_cut_requires_retention_and_rolls_back_with_alias(mon
         target_relation = "provider_directory_address_overlay"
         await database.status(f"CREATE TABLE {schema}.prepared_overlay (LIKE {schema}.{target_relation} INCLUDING ALL)")
         await database.status(f"INSERT INTO {schema}.prepared_overlay VALUES ('new')")
-        old_oid = await database.scalar(f"SELECT '{schema}.{target_relation}'::regclass::oid::bigint")
+        async with database.transaction():
+            before = await receipts.relation(database, schema, target_relation)
 
         async def rename_indexes(_schema, _stage):
             await database.status(
@@ -345,7 +345,8 @@ async def test_native_stage_cut_requires_retention_and_rolls_back_with_alias(mon
                 await _swap_and_abort(database, schema, stage, fence, retain)
             assert await _alias(database, schema) == "endpoint_repoint"
             assert await database.scalar(f"SELECT marker FROM {schema}.{target_relation}") == "old"
-            assert await database.scalar(f"SELECT '{schema}.{target_relation}'::regclass::oid::bigint") == old_oid
+            async with database.transaction():
+                assert await receipts.relation(database, schema, target_relation) == before
             assert await database.scalar(f"SELECT marker FROM {schema}.prepared_overlay") == "new"
 
 

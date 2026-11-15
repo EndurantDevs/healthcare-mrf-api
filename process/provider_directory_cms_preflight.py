@@ -8,7 +8,6 @@ logging. The unchanged, separately signed Profile admission keeps its own geomet
 
 from __future__ import annotations
 
-import json
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -31,8 +30,6 @@ from process.provider_directory_cms_nonprofile_capacity import (
 )
 from process.provider_directory_cms_preparation import NonprofileAdmissionPlan, desired_fence_hash
 from process.provider_directory_profile_capacity_preflight_contract import (
-    CAPACITY_QUIESCENCE_CONTRACT_ID,
-    CAPACITY_QUIESCENCE_DIGEST_DOMAIN,
     assert_preflight_expiry,
     preflight_domain_sha256,
     profile_execution_identity_payload,
@@ -55,7 +52,6 @@ class _PreflightInputs:
     native_dependencies: dict
     native_input_fence: dict
     runtime: dict
-    database_binding: dict
     serving: Any
 
 
@@ -113,14 +109,6 @@ def _monitored_plan(request, profile_lease, fence, projection, address, artifact
     _validate_plan(plan)
     contract.assert_cms_geometry_matches_request(plan, request)
     return plan
-
-
-def _database_binding(observed):
-    return {
-        **{name: observed[name] for name in ("database_system_identifier", "database_oid", "database_name")},
-        "tablespace_oid": observed["data_tablespace_oid"],
-        "tablespace_name": observed["data_tablespace_name"],
-    }
 
 
 async def _paired_preflight(fhir, profile_lease, *, lock=False):
@@ -187,9 +175,7 @@ async def _read_inputs(fhir, request, profile_lease):
         runtime = await observe_profile_runtime(fhir.db)
         assert_capacity_lease_matches_runtime_observation(profile_lease, runtime)
         serving = await fhir._profile_capacity_preflight_serving(schema)
-        return _PreflightInputs(
-            plan, fence, projection, dependencies, native_input_fence, runtime, _database_binding(observed), serving
-        )
+        return _PreflightInputs(plan, fence, projection, dependencies, native_input_fence, runtime, serving)
 
 
 def _projection_fields(request, inputs):
@@ -211,52 +197,18 @@ def _projection_fields(request, inputs):
         "runtime_observation": inputs.runtime,
         "serving_generation_preflight": inputs.serving.payload,
         "serving_generation_preflight_sha256": inputs.serving.payload_sha256,
-        "database_binding": inputs.database_binding,
     }
 
 
-async def _quiescence(fhir, request, profile_lease, observed_at):
-    """Retain all existing owner boundaries while allowing the exact pending Profile pair."""
-    query = fhir._profile_capacity_quiescence_sql(fhir._schema()).replace(
-        "AND request_sha256 <> :request_sha256",
-        "AND request_sha256 <> :request_sha256 AND request_sha256 <> :paired_request_sha256",
-    )
-    quiescence_row = await fhir.db.first(
-        query,
-        active_statuses=list(fhir._PROFILE_ACTIVE_RUN_STATUSES),
-        profile_params=json.dumps(
-            {
-                "provider_directory_profile_contract_id": fhir.PROFILE_EXECUTION_CONTRACT_ID,
-                "publish_artifacts_only": True,
-                "publish_artifacts_targets": ["profile"],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-        current_run_id=None,
+async def _quiescence(fhir, request, profile_lease, observed_at, existing=None):
+    """Reuse the shared owner boundary, exempting only complete authenticated receipts."""
+    return await fhir._profile_capacity_quiescence(
+        fhir._schema(),
         observed_at=observed_at,
         request_sha256=request.request_sha256,
-        paired_request_sha256=profile_lease.signing_preflight_guard["healthcare_receipt"]["request_sha256"],
+        verified_receipts=fhir._profile_capacity_existing_receipt_exemption(existing, request)
+        + (profile_lease.signing_preflight_guard["healthcare_receipt"],),
     )
-    if quiescence_row is None:
-        raise _error("quiescence_missing")
-    counts_by_boundary = dict(fhir._pagination_checkpoint_row_mapping(quiescence_row))
-    if set(counts_by_boundary) != {
-        "active_profile_run_count",
-        "claimed_profile_checkpoint_count",
-        "unexpired_capacity_consumption_count",
-        "outstanding_preflight_receipt_count",
-    } or any(type(count) is not int or count != 0 for count in counts_by_boundary.values()):
-        raise _error("not_quiescent")
-    payload_by_field = {
-        "contract_id": CAPACITY_QUIESCENCE_CONTRACT_ID,
-        **counts_by_boundary,
-        "active_profile_run_statuses": list(fhir._PROFILE_ACTIVE_RUN_STATUSES),
-        "claimed_checkpoint_states": ["building_evidence", "evidence_complete", "building_profile", "ready"],
-        "capacity_consumption_boundary": "unexpired",
-        "preflight_receipt_boundary": "unconsumed_and_unexpired",
-    }
-    return payload_by_field, preflight_domain_sha256(CAPACITY_QUIESCENCE_DIGEST_DOMAIN, payload_by_field)
 
 
 async def _assert_current_inputs(fhir, request, inputs, profile_lease, session):
@@ -273,7 +225,6 @@ async def _assert_current_inputs(fhir, request, inputs, profile_lease, session):
     serving = await fhir._profile_capacity_preflight_serving(fhir._schema())
     if (
         runtime != inputs.runtime
-        or _database_binding(observed) != inputs.database_binding
         or serving.payload != inputs.serving.payload
         or serving.payload_sha256 != inputs.serving.payload_sha256
     ):
@@ -300,7 +251,7 @@ async def _issue_receipt(fhir, request, inputs, profile_lease):
         await _paired_preflight(fhir, profile_lease, lock=True)
         existing = await fhir._profile_capacity_preflight_existing_receipt(schema, request)
         observed_at = await fhir._profile_capacity_preflight_clock()
-        quiescence, quiescence_hash = await _quiescence(fhir, request, profile_lease, observed_at)
+        quiescence, quiescence_hash = await _quiescence(fhir, request, profile_lease, observed_at, existing)
         issued_at = fhir._profile_capacity_receipt_issued_at(existing, observed_at)
         assert_preflight_expiry(request, issued_at=issued_at)
         if request.expires_at > profile_lease.expires_at:

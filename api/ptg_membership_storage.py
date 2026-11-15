@@ -7,11 +7,9 @@ from uuid import UUID
 
 from sqlalchemy import text
 
-from api.ptg_membership_contract import CONTRACT, SPEC, digest
+from api.ptg_membership_contract import CONTRACT, SPEC, digest, logical_source_identity
 from process import reference_family_archive as native
-from process.entity_address_snapshot_preparation import _require_no_untrusted_mutation, _seal_published_relation
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
-from process.ptg_parts.ptg2_physical_binding import _require_closed_local_custody
 
 
 def attachment_name(identity):
@@ -24,20 +22,8 @@ def _attachment_for_digest(key):
 
 
 async def protected_owner(session):
-    """Resolve the retention namespace owner and reject unsafe role custody."""
-    row = (
-        await session.execute(
-            text(
-                "SELECT owner.oid, NOT owner.rolcanlogin AND NOT owner.rolsuper "
-                "AND NOT owner.rolcreatedb AND NOT owner.rolcreaterole AND NOT owner.rolreplication "
-                "AND NOT owner.rolbypassrls AS safe FROM pg_namespace n "
-                "JOIN pg_roles owner ON owner.oid=n.nspowner WHERE n.nspname='hp_snapshot_retention'"
-            )
-        )
-    ).first()
-    if row is not None and not row[1]:
-        raise PTG2ManifestArtifactError("membership protected namespace owner differs")
-    return None if row is None else int(row[0])
+    """Keep the legacy entrypoint without observing roles or catalog ownership."""
+    return None
 
 
 async def lock_identity(session, identity):
@@ -77,12 +63,12 @@ async def source_pin(session, identity, *, create=False):
     return params
 
 
-async def _active_view(session, identity, owner):
+async def _active_view(session, identity, owner=None):
     name = attachment_name(identity)
     row = (
         await session.execute(
             text(
-                "SELECT c.oid,c.relowner,c.relkind='v',c.relpersistence='p' FROM pg_class c "
+                "SELECT c.relkind='v',c.relpersistence='p' FROM pg_class c "
                 "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='hp_snapshot_retention' AND c.relname=:name"
             ),
             {"name": name},
@@ -90,29 +76,34 @@ async def _active_view(session, identity, owner):
     ).first()
     if row is None:
         return None
-    view_oid, view_owner, kind, persistence = row
-    if view_owner != owner or kind is not True or persistence is not True:
-        raise PTG2ManifestArtifactError("membership active attachment custody differs")
-    await _require_no_untrusted_mutation(session, [view_oid], owner)
-    return view_oid
+    if tuple(row) != (True, True):
+        raise PTG2ManifestArtifactError("membership active attachment layout differs")
+    return "hp_snapshot_retention." + name
 
 
-async def _attachment_storage(session, view_oid, owner):
+async def attachment_storage(session, view, spec, *, membership_names=()):
+    """Resolve the complete dependency family by its declared qualified names."""
     dependencies = (
         await session.execute(
             text(
-                "SELECT DISTINCT c.oid,n.oid,n.nspname,c.relname FROM pg_rewrite r "
+                "SELECT DISTINCT n.nspname,c.relname FROM pg_rewrite r "
                 "JOIN pg_depend d ON d.classid='pg_rewrite'::regclass AND d.objid=r.oid "
                 "AND d.refclassid='pg_class'::regclass JOIN pg_class c ON c.oid=d.refobjid "
-                "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE r.ev_class=:view AND c.oid<>:view"
+                "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE r.ev_class=to_regclass(:view) AND c.oid<>r.ev_class"
             ),
-            {"view": view_oid},
+            {"view": view},
         )
     ).all()
-    schemas = {(int(dependency[1]), dependency[2]) for dependency in dependencies}
-    if len(schemas) != 1 or {dependency[3] for dependency in dependencies} != set(SPEC.table_names):
+    actual_membership_names = {name for schema, name in dependencies if schema == "hp_snapshot_retention"}
+    stored_pairs = {(schema, name) for schema, name in dependencies if schema != "hp_snapshot_retention"}
+    schemas = {schema for schema, _name in stored_pairs}
+    if (
+        actual_membership_names != set(membership_names)
+        or len(schemas) != 1
+        or {name for _schema, name in stored_pairs} != set(spec.table_names)
+    ):
         raise PTG2ManifestArtifactError("membership active attachment dependencies differ")
-    schema_oid, schema = schemas.pop()
+    schema = schemas.pop()
     prefix = "reference_family_archive_"
     try:
         if not schema.startswith(prefix):
@@ -120,14 +111,37 @@ async def _attachment_storage(session, view_oid, owner):
         dataset = UUID(schema[len(prefix) :])
     except ValueError as error:
         raise PTG2ManifestArtifactError("membership index namespace differs") from error
-    await native._lock_family(session, schema, SPEC.table_names, "ACCESS SHARE", nowait=True)
-    ownership = await native.capture_model_family_stage_ownership(session, SPEC, dataset)
-    if ownership.schema_oid != schema_oid or set(ownership.relation_oids) != {
-        (dependency[3], int(dependency[0])) for dependency in dependencies
-    }:
-        raise PTG2ManifestArtifactError("membership index storage identity changed")
-    await _require_closed_local_custody(session, ownership, owner)
+    await native._lock_family(session, schema, spec.table_names, "ACCESS SHARE", nowait=True)
+    ownership = await native.capture_model_family_stage_ownership(session, spec, dataset)
+    if ownership.schema_name != schema or set(ownership.relation_names) != set(spec.table_names):
+        raise PTG2ManifestArtifactError("membership index storage names changed")
     return ownership
+
+
+async def _attachment_storage(session, view, owner=None):
+    return await attachment_storage(session, view, SPEC)
+
+
+async def freeze_attachment(session, view, reader_principals):
+    """Close the one named attachment through the existing administrative freeze."""
+    from process.provider_directory_generic_source_provision import _freeze_snapshot_relation
+
+    namespace, name = view.split(".", 1)
+    if namespace != "hp_snapshot_retention" or re.fullmatch(r"(?:pm|pc)_[a-z2-7]{52}", name) is None:
+        raise PTG2ManifestArtifactError("projection attachment name is invalid")
+    owner, readers = native.model_family_roles()
+    driver = await native._native_model_copy_driver(session, ("execute", "fetch", "fetchval"))
+    await _freeze_snapshot_relation(
+        driver,
+        namespace,
+        {"relname": name, "relkind": "v"},
+        native._quoted(owner),
+        tuple(native._quoted(role) for role in readers),
+    )
+    for principal in reader_principals:
+        await session.execute(
+            text(f"GRANT SELECT ON {native._quoted(namespace)}.{native._quoted(name)} TO {principal}")
+        )
 
 
 async def _sealed_header(session, schema, identity):
@@ -140,7 +154,10 @@ async def _sealed_header(session, schema, identity):
         .mappings()
         .one()
     )
-    if header["identity"] != identity or re.fullmatch("[0-9a-f]{64}", header["content_digest"] or "") is None:
+    if (
+        logical_source_identity(header["identity"]) != logical_source_identity(identity)
+        or re.fullmatch("[0-9a-f]{64}", header["content_digest"] or "") is None
+    ):
         raise PTG2ManifestArtifactError("membership index sealed identity differs")
     coverage_rows = [
         dict(coverage_row)
@@ -158,34 +175,23 @@ async def _sealed_header(session, schema, identity):
 
 
 async def locate(session, identity):
-    """Only a protected native view authorizes an active index; comments do not."""
-    owner = await protected_owner(session)
-    if owner is None:
+    """Resolve the named attachment, complete data family and retention pin."""
+    view = await _active_view(session, identity)
+    if view is None:
         return None
-    view_oid = await _active_view(session, identity, owner)
-    if view_oid is None:
-        return None
-    ownership = await _attachment_storage(session, view_oid, owner)
+    ownership = await _attachment_storage(session, view)
     header = await _sealed_header(session, ownership.schema_name, identity)
-    pin = await source_pin(session, identity)
-    return ownership, header, owner, view_oid, pin
+    pin = await source_pin(session, header["identity"])
+    return ownership, header, None, view, pin
 
 
 async def seal(session, ownership, identity, *, reader_principals):
-    """A native dependency view and source FK pin retain this exact immutable family."""
-    owner = await native.protected_publisher_owner(session)
-    owner_name = await session.scalar(
-        text("SELECT quote_ident(rolname) FROM pg_roles WHERE oid=:owner"), {"owner": owner}
-    )
+    """A native dependency view and source pin retain the immutable family."""
     schema = native._quoted(ownership.schema_name)
+    await native.seal_model_family_storage(session, ownership)
     for principal in reader_principals:
         await session.execute(text(f"GRANT USAGE ON SCHEMA {schema} TO {principal}"))
         await session.execute(text(f"GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {principal}"))
-    await session.execute(text(f"ALTER SCHEMA {schema} OWNER TO {owner_name}"))
-    # The creating heap owner remains observable to the native ACL closer.
-    for _name, oid in ownership.relation_oids:
-        await _seal_published_relation(session, oid, owner)
-    await native.seal_model_family_storage(session, ownership, owner)
     name = native._quoted(attachment_name(identity))
     dependencies = ",".join(
         f"(SELECT count(*) FROM {schema}.{native._quoted(table)} WHERE false) AS dependency_{index}"
@@ -198,32 +204,26 @@ async def seal(session, ownership, identity, *, reader_principals):
             f"FROM {schema}.ptg_membership_manifest WHERE singleton=1"
         )
     )
-    view_oid = await session.scalar(
-        text("SELECT to_regclass(:relation)::oid"), {"relation": "hp_snapshot_retention." + attachment_name(identity)}
-    )
-    await _seal_published_relation(session, view_oid, owner)
-    for principal in reader_principals:
-        await session.execute(text(f"GRANT SELECT ON hp_snapshot_retention.{name} TO {principal}"))
+    await freeze_attachment(session, "hp_snapshot_retention." + attachment_name(identity), reader_principals)
     await source_pin(session, identity, create=True)
 
 
 def receipt(found):
     """Expose the sealed identity, accounting and retained storage coordinates."""
-    ownership, header, owner, view_oid, pin = found
+    ownership, header, _legacy_owner, _view, pin = found
     return dict(
-        header["identity"],
+        logical_source_identity(header["identity"]),
         state="ready",
-        projection_id=digest(header["identity"]),
+        projection_id=digest(logical_source_identity(header["identity"])),
         content_digest=header["content_digest"],
         counts=header["counts"],
         code_coverage=header["counts"]["code_coverage"],
-        active_attachment={"relation_oid": int(view_oid), "name": attachment_name(header["identity"])},
+        active_attachment={"schema_name": "hp_snapshot_retention", "name": attachment_name(header["identity"])},
         source_pin=pin,
         storage={
             "dataset_id": str(ownership.dataset_id),
-            "schema_oid": ownership.schema_oid,
-            "relation_oids": [list(pair) for pair in ownership.relation_oids],
-            "owner_oid": owner,
+            "schema_name": ownership.schema_name,
+            "relation_names": sorted(ownership.relation_names),
         },
     )
 
@@ -309,9 +309,9 @@ async def retire_unreferenced(session, identity):
 
     expected = await _require_no_references(session, identity)
     ownership = found[0]
-    # A concurrent reader already holds ACCESS SHARE on the family; NOWAIT makes
-    # this retirement roll back without detaching its view or pin under that reader.
-    await native._lock_family(session, ownership.schema_name, SPEC.table_names, "ACCESS EXCLUSIVE", nowait=True)
+    # Native DROP waits only briefly for pinned readers, then rolls back the whole retirement.
+    await native._lock_family(session, ownership.schema_name, SPEC.table_names, "ACCESS SHARE", nowait=True)
+    await session.execute(text("SET LOCAL lock_timeout='1s'"))
     await session.execute(text(f"DROP VIEW hp_snapshot_retention.{native._quoted(attachment_name(identity))} RESTRICT"))
     await session.execute(
         text(

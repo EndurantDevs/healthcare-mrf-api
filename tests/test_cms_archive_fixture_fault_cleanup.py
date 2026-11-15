@@ -99,6 +99,14 @@ async def test_source_transaction_remains_the_acknowledgement_boundary(monkeypat
     engine = create_async_engine("postgresql+asyncpg://synthetic@127.0.0.1/synthetic")
     events = []
     actual_databases = []
+    grant_connection = SimpleNamespace(execute=AsyncMock())
+
+    @asynccontextmanager
+    async def native_grant_setup(actual_engine):
+        assert actual_engine is engine
+        yield grant_connection
+
+    monkeypatch.setattr(type(engine), "begin", native_grant_setup)
 
     @asynccontextmanager
     async def custody(administrator, schema, settings):
@@ -114,7 +122,7 @@ async def test_source_transaction_remains_the_acknowledgement_boundary(monkeypat
             events.append("source_commit")
 
         settings.setattr(actual_database, "transaction", source_transaction)
-        yield SimpleNamespace(database=actual_database)
+        yield SimpleNamespace(database=actual_database, owner="synthetic_source_writer")
 
     async def source_body(database):
         async with database.transaction():
@@ -127,6 +135,10 @@ async def test_source_transaction_remains_the_acknowledgement_boundary(monkeypat
     try:
         async with archive_case._publication_database(monkeypatch, engine, "synthetic") as database:
             assert database is actual_databases[0]
+            grant_connection.execute.assert_awaited_once()
+            assert str(grant_connection.execute.call_args.args[0]) == (
+                'GRANT EXECUTE ON FUNCTION "synthetic".cms_native_input_advance() TO "synthetic_source_writer"'
+            )
             database.acknowledgement_failure = (
                 OSError("synthetic acknowledgement") if failure_kind == "acknowledgement" else None
             )

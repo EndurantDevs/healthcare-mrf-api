@@ -99,9 +99,9 @@ async def test_paired_admission_window_cannot_be_replaced_or_include_an_older_of
 @pytest.mark.asyncio
 async def test_pending_rewrite_uses_remaining_allowance_and_only_its_measured_heap():
     producer = _fully_allocated_producer()
-    target = OwnedRelation("synthetic", "pending_stage", 1, 3000, "u")
-    scratch = OwnedRelation("synthetic", "scratch_scope", 2, 60_000, "u")
-    logged = OwnedRelation("synthetic", "previous_stage", 3, 30_000, "p")
+    target = OwnedRelation("synthetic", "pending_stage", 3000, "u")
+    scratch = OwnedRelation("synthetic", "scratch_scope", 60_000, "u")
+    logged = OwnedRelation("synthetic", "previous_stage", 30_000, "p")
     request = _check(producer, "pre_logging", (target, scratch, logged), ((target.schema, target.relation),))
     producer.fhir.db.scalar.return_value = 41_000
     await producer._assert_wal_budget(request)
@@ -118,8 +118,8 @@ async def test_pending_rewrite_uses_remaining_allowance_and_only_its_measured_he
 async def test_rewrite_requires_exact_unique_unlogged_owned_targets(targets):
     producer = _fully_allocated_producer()
     relations = (
-        OwnedRelation("synthetic", "pending", 1, 1000, "u"),
-        OwnedRelation("synthetic", "logged", 2, 1000, "p"),
+        OwnedRelation("synthetic", "pending", 1000, "u"),
+        OwnedRelation("synthetic", "logged", 1000, "p"),
     )
     with pytest.raises(RuntimeError, match="logging_targets_invalid"):
         await producer._assert_wal_budget(_check(producer, "pre_logging", relations, targets))

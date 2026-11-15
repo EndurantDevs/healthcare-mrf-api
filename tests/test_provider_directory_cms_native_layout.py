@@ -23,12 +23,13 @@ from tests.test_provider_directory_cms_nonprofile_capacity import _producer
 async def test_only_declared_native_stages_use_native_validator(monkeypatch):
     """The same aggregate check keeps FHIR relations on the unchanged Profile validator."""
     producer = _producer()
-    native = OwnedRelation("synthetic", "entity_address_unified_cms" + "a" * 20 + "_raw", 11, 100, "u")
-    artifact = OwnedRelation("synthetic", "artifact_stage", 12, 100, "u")
-    native_capture = AsyncMock(return_value=layout.NativeRelationLayout(11, (42,), "a" * 64))
+    native = OwnedRelation("synthetic", "entity_address_unified_cms" + "a" * 20 + "_raw", 100, "u")
+    artifact = OwnedRelation("synthetic", "artifact_stage", 100, "u")
+    native_capture = AsyncMock(return_value=layout.NativeRelationLayout(native.schema, native.relation))
     monkeypatch.setattr(layout, "capture_native_layout", native_capture)
-    profile_capture = AsyncMock(return_value=SimpleNamespace(relation_oid=12, effective_tablespace_oids=(42,)))
-    producer.fhir._provider_directory_profile_relation_storage_fingerprint = profile_capture
+    profile_capture = AsyncMock(return_value=layout.NativeRelationLayout(artifact.schema, artifact.relation))
+    producer.fhir._provider_directory_profile_capacity_relation_layout = profile_capture
+    producer.fhir.db.scalar.return_value = 12
     producer._current_wal_bytes = AsyncMock(return_value=0)
     request = NonprofileAdmissionCheck("readiness", producer.lease, producer.plan, (native, artifact))
     await producer._assert_physical(request, {"data_tablespace_oid": 42})
@@ -41,7 +42,7 @@ def test_nonready_native_index_is_rejected(field):
     """A declaration cannot authorize an unfinished or invalid physical index."""
     name = "entity_address_unified_cms" + "a" * 20
     index_by_field = {"indisvalid": True, "indisready": True, "indislive": True, "indimmediate": True, field: False}
-    relation = OwnedRelation("synthetic", name, 11, 100, "u")
+    relation = OwnedRelation("synthetic", name, 100, "u")
     with pytest.raises(RuntimeError, match="storage_shape_unsupported"):
         layout._assert_indexes([index_by_field], [], relation, layout.ENTITY_ADDRESS_RESULT_MODELS[0], None)
 
@@ -134,7 +135,7 @@ async def _completed_raw_phase(monkeypatch, phase):
     adapter.prepared = SimpleNamespace(fhir=fhir, nonprofile_admission=admission)
     coordinate = (adapter.schema_name, logical)
     database.relations[".".join(coordinate)] = {"oid": 42, "total_bytes": 100, "persistence": "p"}
-    await admission.register_external_relation(fhir, *coordinate, 42)
+    await admission.register_external_relation(fhir, *coordinate)
     admission._logged_relations.add(coordinate)
     if phase == "after_index":
         adapter._next_table, adapter._is_index_pending = len(_TABLES), True
@@ -153,32 +154,35 @@ async def _completed_raw_phase(monkeypatch, phase):
 @pytest.mark.parametrize("phase", ["after_copy_batch", "after_insert", "after_index"])
 async def test_completed_raw_phase_checks_fresh_readiness_once(monkeypatch, phase):
     adapter, admission, _database, coordinate, bounds = await _completed_raw_phase(monkeypatch, phase)
-    await epoch._admit_epoch_copy(adapter, phase, *coordinate, 42)
+    await epoch._admit_epoch_copy(adapter, phase, *coordinate)
     admission.measure.assert_awaited_once()
     admission.check_phase.assert_awaited_once()
     request = admission.check_phase.await_args.args[0]
-    assert request.phase == "readiness" and request.relations == (OwnedRelation(*coordinate, 42, 100, "p"),)
-    assert len(request.raw_relations) == 1 and request.raw_relations[0].oid == 42
+    assert request.phase == "readiness" and request.relations == (OwnedRelation(*coordinate, 100, "p"),)
+    assert (
+        len(request.raw_relations) == 1
+        and (request.raw_relations[0].schema, request.raw_relations[0].relation) == coordinate
+    )
     bounds.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["oid", "unlogged", "custody", "extra_budget", "cancel"])
+@pytest.mark.parametrize("failure", ["missing", "unlogged", "budget", "extra_budget", "cancel"])
 async def test_completed_raw_phase_preserves_failure_and_cancel_boundary(monkeypatch, failure):
     adapter, admission, database, coordinate, bounds = await _completed_raw_phase(monkeypatch, "after_copy_batch")
-    if failure == "oid":
-        database.relations[".".join(coordinate)]["oid"] = 43
+    if failure == "missing":
+        del database.relations[".".join(coordinate)]
     elif failure == "unlogged":
         database.relations[".".join(coordinate)]["persistence"] = "u"
     elif failure == "extra_budget":
         bounds.side_effect = RuntimeError("synthetic extra budget")
     else:
         admission.check_phase.side_effect = (
-            asyncio.CancelledError() if failure == "cancel" else RuntimeError("synthetic custody")
+            asyncio.CancelledError() if failure == "cancel" else RuntimeError("synthetic budget")
         )
     error = asyncio.CancelledError if failure == "cancel" else epoch.FHIRSourceEpochError
     with pytest.raises(error):
-        await epoch._admit_epoch_copy(adapter, "after_copy_batch", *coordinate, 42)
+        await epoch._admit_epoch_copy(adapter, "after_copy_batch", *coordinate)
     admission.measure.assert_awaited_once()
     if failure == "extra_budget":
         bounds.assert_awaited_once()
@@ -317,8 +321,8 @@ async def test_raw_annotation_requires_signed_retention_policy():
     """An annotation cannot turn an existing lease without a raw policy into authority."""
     producer = _producer()
     producer._current_wal_bytes = AsyncMock(return_value=0)
-    relation = OwnedRelation("registry_cms_epoch_" + "a" * 32, _TABLES[2], 11, 0, "p")
-    raw_relation = RetainedRawRelation(relation.schema, relation.relation, relation.oid, "{}", ())
+    relation = OwnedRelation("registry_cms_epoch_" + "a" * 32, _TABLES[2], 0, "p")
+    raw_relation = RetainedRawRelation(relation.schema, relation.relation, "{}", ())
     request = NonprofileAdmissionCheck("readiness", producer.lease, producer.plan, (relation,), (), (raw_relation,))
     with pytest.raises(RuntimeError, match="raw_policy_required"):
         await producer._assert_physical(request, {"data_tablespace_oid": 42})
@@ -328,14 +332,14 @@ async def test_raw_annotation_requires_signed_retention_policy():
 async def test_issued_scratch_native_capture_rechecks_proof_after_catalog(monkeypatch):
     from process import provider_directory_artifact_scratch_inputs as scratch
 
-    fhir, relation = object(), OwnedRelation("synthetic", "pdout_" + "a" * 32, 11, 100, "p")
+    fhir, relation = object(), OwnedRelation("synthetic", "pdout_" + "a" * 32, 100, "p")
     proof = SimpleNamespace(target="provider_directory_location")
     capture = AsyncMock(side_effect=[proof, proof])
     monkeypatch.setattr(scratch, "scratch_relation_proof", capture)
-    catalog_by_field = dict(indexes=[], attributes=[])
+    catalog_by_field = dict(indexes=[], attributes=[], relation={"relation_oid": 11})
     observe = AsyncMock(return_value=(catalog_by_field, None))
     monkeypatch.setattr(layout, "_observe_catalog", observe)
-    expected = layout.NativeRelationLayout(11, (42,), "a" * 64)
+    expected = layout.NativeRelationLayout(relation.schema, relation.relation)
     monkeypatch.setattr(layout, "_observed_layout", lambda *_args: expected)
     assert await layout.capture_scratch_layout(fhir, relation) == expected
     assert capture.await_count == 2
@@ -351,7 +355,7 @@ async def test_issued_scratch_native_capture_rechecks_proof_after_catalog(monkey
 async def test_issued_scratch_main_index_retains_native_physical_refusal(monkeypatch, batch):
     from process import provider_directory_artifact_scratch_inputs as scratch
 
-    relation = OwnedRelation("synthetic", "pdout_" + "a" * 32, 11, 100, "p")
+    relation = OwnedRelation("synthetic", "pdout_" + "a" * 32, 100, "p")
     index_by_field = dict(
         relation_oid=11,
         indisvalid=True,
@@ -368,7 +372,9 @@ async def test_issued_scratch_main_index_retains_native_physical_refusal(monkeyp
         scratch, "scratch_relation_proof", AsyncMock(return_value=SimpleNamespace(target="provider_directory_location"))
     )
     monkeypatch.setattr(
-        layout, "_observe_catalog", AsyncMock(return_value=(dict(indexes=[index_by_field], attributes=[]), None))
+        layout,
+        "_observe_catalog",
+        AsyncMock(return_value=(dict(indexes=[index_by_field], attributes=[], relation={"relation_oid": 11}), None)),
     )
 
     @asynccontextmanager
@@ -379,7 +385,7 @@ async def test_issued_scratch_main_index_retains_native_physical_refusal(monkeyp
     monkeypatch.setattr(
         layout,
         "observe_native_catalog_batch",
-        AsyncMock(return_value={(relation.schema, relation.relation, relation.oid): ({}, None)}),
+        AsyncMock(return_value={(relation.schema, relation.relation): ({}, None)}),
     )
     with pytest.raises(RuntimeError, match="storage_shape_unsupported"):
         if batch:
@@ -393,9 +399,7 @@ async def test_issued_scratch_main_index_retains_native_physical_refusal(monkeyp
 async def test_scratch_layout_batch_fences_native_and_ordinary_work_and_clears_map(monkeypatch):
     from process import provider_directory_artifact_scratch_inputs as scratch
 
-    relations = tuple(
-        OwnedRelation("synthetic", name, oid, 100, "p") for oid, name in enumerate(("first", "second"), 1)
-    )
+    relations = tuple(OwnedRelation("synthetic", name, 100, "p") for oid, name in enumerate(("first", "second"), 1))
     events, databases = [], (object(), object())
 
     @asynccontextmanager
@@ -409,17 +413,17 @@ async def test_scratch_layout_batch_fences_native_and_ordinary_work_and_clears_m
         events.append("after")
 
     async def capture(_fhir, relation, _proof, *, database, observed_catalog):
-        assert database is databases[relation.oid - 1]
-        assert observed_catalog == (dict(relation_oid=relation.oid), None)
+        assert database is databases[relations.index(relation)]
+        assert observed_catalog == (dict(relation_oid=relations.index(relation) + 1), None)
         events.append(relation.relation)
-        return layout.NativeRelationLayout(relation.oid, (42,), "a" * 64)
+        return layout.NativeRelationLayout(relation.schema, relation.relation)
 
     monkeypatch.setattr(scratch, "scratch_relation_batch", proofs)
     monkeypatch.setattr(layout, "_capture_scratch_proof_layout", capture)
 
     async def census(_fhir, members, *, database):
-        assert database is databases[members[0].oid - 1]
-        return {(item.schema, item.relation, item.oid): (dict(relation_oid=item.oid), None) for item in members}
+        assert database is databases[relations.index(members[0])]
+        return {(item.schema, item.relation): (dict(relation_oid=relations.index(item) + 1), None) for item in members}
 
     monkeypatch.setattr(layout, "observe_native_catalog_batch", census)
     async with layout.scratch_layout_batch(object(), relations) as layouts:
@@ -434,10 +438,12 @@ async def test_cms_catalog_capture_uses_one_complete_native_query(monkeypatch):
     from process.provider_directory_cms_nonprofile_observation import catalog_observation
 
     directory = importlib.import_module("process.provider_directory_fhir")
-    relation = OwnedRelation("synthetic", "native_heap", 11, 0, "p")
-    sections_by_name = dict(attributes=[], indexes=[], constraints=[], triggers=[], database_oid=7)
+    relation = OwnedRelation("synthetic", "native_heap", 0, "p")
+    sections_by_name = dict(attributes=[], indexes=[], constraints=[], triggers=[])
     database = SimpleNamespace(
-        first=AsyncMock(return_value=sections_by_name), all=AsyncMock(return_value=[]), scalar=AsyncMock(return_value=7)
+        first=AsyncMock(return_value=sections_by_name),
+        all=AsyncMock(return_value=[]),
+        scalar=AsyncMock(return_value=11),
     )
     monkeypatch.setattr(
         directory,
@@ -452,8 +458,8 @@ async def test_cms_catalog_capture_uses_one_complete_native_query(monkeypatch):
     observed, toast = await layout._observe_catalog(catalog_observation(directory, database), relation)
     assert toast is None and observed["attributes"] == observed["indexes"] == []
     database.all.assert_not_awaited()
-    database.scalar.assert_not_awaited()
-    assert observed["database_oid"] == 7
+    database.scalar.assert_awaited_once()
+    assert "database_oid" not in observed
     database.first.assert_awaited_once()
     assert database.first.await_args.kwargs == {"relation_oids": [11]}
     query = database.first.await_args.args[0]
@@ -469,12 +475,11 @@ async def test_catalog_bundle_keeps_empty_sections_and_native_values(relation_oi
         indexes=[],
         constraints=[],
         triggers=[],
-        database_oid=7,
     )
     database = SimpleNamespace(first=AsyncMock(return_value=rows_by_name))
     backend = SimpleNamespace(db=database, _pagination_checkpoint_row_mapping=lambda row: row)
     result = await layout._native_catalog_rows(backend, relation_oids)
-    assert result == (rows_by_name["attributes"], [], [], [], 7)
+    assert result == (rows_by_name["attributes"], [], [], [])
     assert type(result[0][0]["attnum"]) is int and type(result[0][0]["attnotnull"]) is bool
     database.first.assert_awaited_once()
     assert database.first.await_args.kwargs == {"relation_oids": relation_oids}
@@ -498,7 +503,7 @@ def test_catalog_statement_orders_fixed_deparsing_and_consumes_restoration():
     assert "pg_catalog.set_config('search_path','pg_catalog',true)" in statement
     assert "pg_catalog.set_config('search_path',previous_path,true)" in statement
     assert "FROM native_catalog CROSS JOIN native_previous_path" in statement
-    assert statement.count("native_path.configured_path='pg_catalog' OFFSET 0") == 6
+    assert statement.count("native_path.configured_path='pg_catalog' OFFSET 0") == 5
     assert statement.count("FROM LATERAL (") == 4
     assert "FROM native_catalog_path native_path CROSS JOIN LATERAL (" in statement
 
@@ -536,7 +541,7 @@ async def test_catalog_bundle_refuses_changed_native_transport_shape(changed):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("database_oid", [None, 0, True, -1, 2**32, "7"])
-async def test_catalog_bundle_refuses_malformed_database_identity(database_oid):
+async def test_catalog_bundle_refuses_unknown_extra_transport_fields(database_oid):
     database = SimpleNamespace(
         first=AsyncMock(
             return_value=dict(attributes=[], indexes=[], constraints=[], triggers=[], database_oid=database_oid)
@@ -548,14 +553,13 @@ async def test_catalog_bundle_refuses_malformed_database_identity(database_oid):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("physical_present", [None, False, 1, "true"])
-async def test_catalog_bundle_preserves_missing_physical_metadata_refusal(physical_present):
+@pytest.mark.parametrize("catalog_present", [None, False, 1, "true"])
+async def test_catalog_bundle_preserves_missing_physical_metadata_refusal(catalog_present):
     rows_by_name = dict(
         attributes=[],
-        indexes=[dict(index_oid=13, physical_present=physical_present)],
+        indexes=[dict(index_oid=13, catalog_present=catalog_present)],
         constraints=[],
         triggers=[],
-        database_oid=7,
     )
     backend = SimpleNamespace(
         db=SimpleNamespace(first=AsyncMock(return_value=rows_by_name)),
@@ -572,16 +576,15 @@ async def test_catalog_bundle_preserves_physical_fields_and_strips_transport_sen
     )
     rows_by_name = dict(
         attributes=[],
-        indexes=[dict(index_by_field, physical_present=True)],
+        indexes=[dict(index_by_field, catalog_present=True)],
         constraints=[],
         triggers=[],
-        database_oid=7,
     )
     database = SimpleNamespace(first=AsyncMock(return_value=rows_by_name))
     backend = SimpleNamespace(db=database, _pagination_checkpoint_row_mapping=lambda row: row)
     observed = await layout._native_catalog_rows(backend, [11])
-    assert observed[1] == [index_by_field] and observed[4] == 7
-    assert rows_by_name["indexes"][0]["physical_present"] is True
+    assert observed[1] == [index_by_field] and len(observed) == 4
+    assert rows_by_name["indexes"][0]["catalog_present"] is True
     query = database.first.await_args.args[0]
     assert "LEFT JOIN pg_class relation ON relation.oid=catalog_index.index_oid" in query
     assert "LEFT JOIN pg_index index_row ON index_row.indexrelid=relation.oid" in query
@@ -591,10 +594,50 @@ async def test_catalog_bundle_preserves_physical_fields_and_strips_transport_sen
 @pytest.mark.asyncio
 async def test_relation_safety_refusal_precedes_native_catalog_query():
     directory = importlib.import_module("process.provider_directory_fhir")
-    database = SimpleNamespace(first=AsyncMock(return_value=dict(relkind="v", toast_oid=0)))
+    database = SimpleNamespace(
+        first=AsyncMock(return_value=dict(relkind="v", toast_oid=0)), scalar=AsyncMock(return_value=11)
+    )
     from process.provider_directory_cms_nonprofile_observation import catalog_observation
 
-    relation = OwnedRelation("synthetic", "unsafe", 11, 0, "p")
+    relation = OwnedRelation("synthetic", "unsafe", 0, "p")
     with pytest.raises(directory.ProviderDirectoryArtifactBuildStale, match="storage_shape_unsupported"):
         await layout._observe_catalog(catalog_observation(directory, database), relation)
     database.first.assert_awaited_once_with(directory._PROFILE_CAPACITY_RELATION_SQL, relation_oid=11)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ready", [False, True])
+async def test_named_prepared_copy_rechecks_logging_and_budget_before_import(monkeypatch, ready):
+    """A named COPY retains its row bound and denies writes before import if the heap is unavailable."""
+    from process import network_registry_cms_prepared_address as writer
+
+    logical = next(iter(writer._COPY_KEYS))
+    stage = "prepared_stage"
+    connection = SimpleNamespace(fetchval=AsyncMock(return_value=ready))
+    budget = AsyncMock()
+    prepared = SimpleNamespace(
+        fhir=object(),
+        address=SimpleNamespace(db_schema="candidate"),
+        nonprofile_admission=SimpleNamespace(assert_ready=budget),
+    )
+    upper_keys = tuple("upper" for _key in writer._COPY_KEYS[logical])
+    bounds = AsyncMock(return_value=(2, 32, upper_keys))
+    imports = []
+
+    async def copy(driver, query, parameters, schema, name, count, *, byte_limit, import_admission):
+        assert driver is connection and schema == "retained" and name == logical and count == 2 and byte_limit == 4096
+        assert '"candidate"."prepared_stage"' in query
+        await import_admission("before_import")
+        imports.append(count)
+
+    monkeypatch.setattr(writer, "_prepared_copy_bounds", bounds)
+    monkeypatch.setattr(writer, "_copy_native_batch", copy)
+    if ready:
+        await writer._copy_prepared_rows(connection, prepared, "retained", (logical, stage), 2, (10, 4096))
+        assert imports == [2]
+        budget.assert_awaited_once_with(prepared.fhir, "retained")
+    else:
+        with pytest.raises(ValueError, match="prepared_address_changed"):
+            await writer._copy_prepared_rows(connection, prepared, "retained", (logical, stage), 2, (10, 4096))
+        assert imports == []
+        budget.assert_not_awaited()

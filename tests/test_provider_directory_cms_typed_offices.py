@@ -26,12 +26,13 @@ def _available():
 
 def _inputs():
     return preparation.ProviderDirectoryAddressPreparationInput(
-        (preparation.ProviderDirectoryAddressDatasetPin("cms-npd", "endpoint", "candidate", "a" * 64, "root"),),
-        "desired_overlay",
-        41,
-        0,
-        (("provider_directory_location", "desired_locations"),),
-        "2026-01-02",
+        dataset_pins=(
+            preparation.ProviderDirectoryAddressDatasetPin("cms-npd", "endpoint", "candidate", "a" * 64, "root"),
+        ),
+        overlay_table="desired_overlay",
+        address_alias_generation=0,
+        relation_overrides=(("provider_directory_location", "desired_locations"),),
+        semantic_as_of="2026-01-02",
     )
 
 

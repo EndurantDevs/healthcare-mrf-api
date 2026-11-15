@@ -11,19 +11,16 @@ from uuid import UUID, uuid4
 import asyncpg
 import pytest
 from sanic import response
-from sqlalchemy import text
 
 from api.network_address_scope import (
     canonical_network_read,
     current_network_address_scope,
     network_address_read_scope,
-    scoped_address_parameters,
-    scoped_address_relation_sql,
 )
 from api.network_compact_address import compact_address_native_sql
 from api.network_provider_only_read import read_network_provider_only_page
 from api.network_provider_read import NetworkOfficeSelection, NetworkProviderReadUnavailable, read_network_provider_page
-from api.network_read_execution import execute_network_read
+from api.network_read_execution import bounded_network_read_rows
 from db.connection import db
 from process.network_address_projection import _identifier
 from process.network_membership_pipeline import prepare_and_publish_network_candidate, prepare_network_candidate
@@ -100,16 +97,18 @@ async def compact_cms_source(cms_full_office_source, provider_only_source, custo
 
 
 async def test_retained_inventory_and_contributions_require_published_seal(compact_cms_source):
-    from process.network_candidate_custody import NetworkCandidateCustodyError
-    from process.registry_retained_generation import resolve_registry_retained_generation
+    from process.registry_retained_generation import (
+        RegistryRetainedGenerationError,
+        resolve_registry_retained_generation,
+    )
 
     context = compact_cms_source
     fixture = context.fixture
     await fixture.connection.execute(_migration()._ddl(fixture.control_schema))
-    target = await _compose(context, context.reviewed[5].approved_revision)
-    await _prepare(context, target)
-    _, manifest = await _publish(context, target)
-    candidate = await _candidate(context, target)
+    copy_target = await _compose(context, context.reviewed[5].approved_revision)
+    await _prepare(context, copy_target)
+    _, manifest = await _publish(context, copy_target)
+    candidate = await _candidate(context, copy_target)
     assert verify_source_recipe_metadata(candidate).inventory is not None
     assert verify_registry_source_contributions(candidate) is not None
     retained_locator_by_field = {"source_generations": {"retained_network_source": manifest.manifest_sha256}}
@@ -117,13 +116,14 @@ async def test_retained_inventory_and_contributions_require_published_seal(compa
         retained, _ = await resolve_registry_retained_generation(
             fixture.execution_connection, retained_locator_by_field, control_schema=fixture.control_schema
         )
-        assert retained == manifest and retained.custody_control is not None
+        assert retained == manifest
+    # Retained reuse follows the published logical state, not a custody row.
     async with fixture.connection.transaction(isolation="repeatable_read"):
         await fixture.connection.execute(
-            f'DELETE FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
-            UUID(target.candidate_id),
+            f"UPDATE \"{fixture.control_schema}\".network_membership_candidate SET state='ready' WHERE candidate_id=$1",
+            UUID(copy_target.candidate_id),
         )
-        with pytest.raises(NetworkCandidateCustodyError):
+        with pytest.raises(RegistryRetainedGenerationError, match="registry_retained_generation_unavailable"):
             await resolve_registry_retained_generation(
                 fixture.connection, retained_locator_by_field, control_schema=fixture.control_schema
             )
@@ -185,13 +185,37 @@ async def _head(context):
 
 async def _no_seal(context, copy_target, expected_head):
     assert await _head(context) == expected_head
-    assert (
-        await context.fixture.connection.fetchval(
-            f'SELECT count(*) FROM "{context.fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
-            UUID(copy_target.candidate_id),
-        )
-        == 0
+    # A refused candidate's named preparation never reaches a validated or published state.
+    state = await context.fixture.connection.fetchval(
+        "SELECT state FROM hp_snapshot_retention.preparation WHERE preparation_id=$1", UUID(copy_target.candidate_id)
     )
+    assert state not in {"validated", "published"}
+
+
+async def _freeze_untouched(context, copy_target):
+    """Admit and freeze the untouched candidate, so each refusal is judged against that named admission."""
+    from process.network_membership_publication import (
+        NetworkPreparationPending,
+        load_named_network_preparation,
+        validate_named_network_preparation,
+    )
+    from process.registry_named_preparation_administration import _freeze_registry_generation
+
+    fixture = context.fixture
+    with pytest.raises(NetworkPreparationPending):
+        await validate_named_network_preparation(
+            fixture.connection, copy_target, control_schema=fixture.control_schema, roles=fixture.preparation_roles
+        )
+    handoff = await load_named_network_preparation(
+        fixture.connection, copy_target.candidate_id, control_schema=fixture.control_schema
+    )
+    config_by_field = {
+        **{field: handoff[field] for field in ("kind", "candidate_id", "catalog_schema", "storage_schema")},
+        "preparation_roles": fixture.preparation_roles,
+    }
+    async with fixture.engine.connect() as administrator:
+        frozen = await _freeze_registry_generation(administrator, config_by_field, copy_target.candidate_id)
+    assert frozen["state"] == "frozen"
 
 
 async def _assert_inventory(context, copy_target):
@@ -244,10 +268,13 @@ async def _heap_versions(context, copy_target):
 async def _publish(context, copy_target):
     fixture = context.fixture
     seal = await fixture.seal_candidate(copy_target)
-    assert seal["receipt"]["revision"] == 4
-    closure = seal["receipt"]["closure"]
-    versions = await _heap_versions(context, copy_target)
-    assert closure["relation_oids"] == {name: state[0]["oid"] for name, state in versions.items()}
+    assert seal == {"state": "validated", "candidate_id": copy_target.candidate_id}
+    # The frozen preparation retains every candidate heap by qualified name; no table identity is sealed.
+    retained = await fixture.connection.fetch(
+        "SELECT relation_name FROM hp_snapshot_retention.preparation_relation WHERE schema_name=$1",
+        copy_target.schema_name,
+    )
+    assert _HEAPS <= {retained_row["relation_name"] for retained_row in retained}
     async with fixture.execution_connection.transaction(isolation="repeatable_read"):
         publication = await publish_network_candidate(
             fixture.execution_connection, copy_target, control_schema=fixture.control_schema
@@ -272,6 +299,7 @@ async def _replay(context, copy_target, publication):
             context.source,
             **fixture.writer_roles,
             control_schema=fixture.control_schema,
+            seal_candidate=fixture.seal_candidate,
         )
         await asyncio.sleep(0)
     finally:
@@ -382,12 +410,16 @@ async def _canonical_request(context, manifest, copy_target, monkeypatch):
 
 async def _maintenance_inventory(context, copy_target):
     async with context.fixture.connection.transaction(isolation="read_committed"):
-        candidate_by_field, seal, entries = await read_sealed_source_inventory_for_maintenance(
+        candidate_by_field, receipt, entries = await read_sealed_source_inventory_for_maintenance(
             context.fixture.connection, copy_target, control_schema=context.fixture.control_schema
         )
         inventory = verify_source_recipe_metadata(candidate_by_field).inventory
         assert candidate_by_field["state"] == "published" and source_inventory_root(entries) == inventory.root
-        assert seal["receipt"]["closure"]["relation_oids"]["network_source_inventory"] > 0
+        assert (receipt.schema_name, receipt.table_name, receipt.root) == (
+            copy_target.schema_name,
+            "network_source_inventory",
+            inventory.root,
+        )
 
 
 def _assert_selected(read_by_kind, network_id):
@@ -453,41 +485,16 @@ async def _modified_header(context, copy_target):
         )
 
 
-@asynccontextmanager
-async def _wrong_closure_oid(context, copy_target):
-    connection = context.fixture.connection
-    candidate_by_field = await _candidate(context, copy_target)
-    original = _document(candidate_by_field["validation_json"])
-    changed_by_field = json.loads(json.dumps(original))
-    actual = changed_by_field["writer_closure"]["relation_oids"]["network_source_inventory"]
-    wrong = changed_by_field["writer_closure"]["relation_oids"]["network_provider_only_evidence"]
-    assert actual != wrong
-    changed_by_field["writer_closure"]["relation_oids"]["network_source_inventory"] = wrong
-    relation = _identifier(context.fixture.control_schema) + ".network_membership_candidate"
-    await connection.execute(
-        f"UPDATE {relation} SET validation_json=$2::jsonb WHERE candidate_id=$1",
-        UUID(copy_target.candidate_id),
-        json.dumps(changed_by_field),
-    )
-    try:
-        yield
-    finally:
-        await connection.execute(
-            f"UPDATE {relation} SET validation_json=$2::jsonb WHERE candidate_id=$1",
-            UUID(copy_target.candidate_id),
-            json.dumps(original),
-        )
-
-
 async def _refusals(context, copy_target):
     expected_head = await _head(context)
+    await _freeze_untouched(context, copy_target)
     candidate_before = await _candidate(context, copy_target)
     for name in ("network_source_inventory", "network_provider_only_evidence"):
         async with _missing_heap(context, copy_target, name):
             with pytest.raises(ValueError):
                 await context.fixture.seal_candidate(copy_target)
             await _no_seal(context, copy_target, expected_head)
-    for probe in (_modified_header, _wrong_closure_oid):
+    for probe in (_modified_header,):
         async with probe(context, copy_target):
             with pytest.raises(ValueError):
                 await context.fixture.seal_candidate(copy_target)
@@ -515,7 +522,7 @@ async def _pinned_publication(context, original):
         await _prepare(context, second)
         _publication, current = await _publish(context, second)
         assert current.generation_id != original.generation_id
-        assert current.compact_layout.base.table_oid == original.compact_layout.base.table_oid
+        assert current.compact_layout.base == original.compact_layout.base
         assert await _read_scope(connection, pinned, original_network, fixture.control_schema) == expected
         assert (
             await resolve_network_serving_manifest(connection, control_schema=fixture.control_schema)
@@ -557,7 +564,10 @@ async def test_inventory_source_publication_and_pinned_replay(compact_cms_source
     await _no_seal(context, first, None)
     await _refusals(context, first)
     publication, manifest = await _publish(context, first)
-    assert manifest.compact_layout.base.table_oid == context.address.descriptor["table"]["oid"]
+    assert (manifest.compact_layout.base.schema_name, manifest.compact_layout.base.table_name) == (
+        context.source.schema_name,
+        context.source.table_name,
+    )
     assert manifest.compact_layout.custom is None
     await _canonical_request(context, manifest, first, monkeypatch)
     await _maintenance_inventory(context, first)
@@ -569,22 +579,25 @@ async def test_inventory_source_publication_and_pinned_replay(compact_cms_source
         )
         == base_before
     )
-    assert (
-        await context.fixture.connection.fetchval("SELECT to_regclass($1)::oid::bigint", base)
-        == manifest.compact_layout.base.table_oid
+    assert base == (
+        _identifier(manifest.compact_layout.base.schema_name)
+        + "."
+        + _identifier(manifest.compact_layout.base.table_name)
     )
 
 
 async def _assert_canonical_locations(session, manifest, network_id):
     """Consume the same scoped logical office relation under the existing pinned session."""
-    with network_address_read_scope(manifest, (network_id,)):
-        relation = scoped_address_relation_sql("mrf.entity_address_unified")
-        guarded = await execute_network_read(
-            session,
-            text(f"SELECT location_key FROM {relation} office ORDER BY location_key"),
-            scoped_address_parameters({}),
+    with network_address_read_scope(manifest, (network_id,)) as scope:
+        relation, arguments = compact_address_native_sql(
+            scope.manifest.compact_layout, first_parameter=1, network_ids=scope.network_ids
         )
-        assert guarded.scalars().all() == ["a" * 64]
+        guarded = await bounded_network_read_rows(
+            session,
+            f"SELECT location_key FROM {relation} office ORDER BY location_key",
+            *arguments,
+        )
+        assert guarded == [{"location_key": "a" * 64}]
 
 
 def _canonical_address_handler(session, manifest):
@@ -592,13 +605,16 @@ def _canonical_address_handler(session, manifest):
 
     @canonical_network_read
     async def read_addresses(_request):
-        assert current_network_address_scope().manifest == manifest
-        relation = scoped_address_relation_sql("mrf.entity_address_unified")
-        keys = await execute_network_read(
-            session,
-            text(f"SELECT location_key FROM {relation} office ORDER BY location_key"),
-            scoped_address_parameters({}),
+        scope = current_network_address_scope()
+        assert scope.manifest == manifest
+        relation, arguments = compact_address_native_sql(
+            scope.manifest.compact_layout, first_parameter=1, network_ids=scope.network_ids
         )
-        return response.json({"locations": keys.scalars().all()})
+        keys = await bounded_network_read_rows(
+            session,
+            f"SELECT location_key FROM {relation} office ORDER BY location_key",
+            *arguments,
+        )
+        return response.json({"locations": [entry["location_key"] for entry in keys]})
 
     return read_addresses

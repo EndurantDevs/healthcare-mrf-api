@@ -14,11 +14,11 @@ from process.provider_directory_rooted_graph_query import (
     build_insurance_plan_census_query,
     build_provider_directory_practitioner_role_query,
 )
-from process.provider_directory_rooted_graph_result_store import (
-    complete_provider_directory_rooted_graph_result,
-)
 from process.provider_directory_rooted_graph_result_contract import (
     build_provider_directory_rooted_graph_query_result,
+)
+from process.provider_directory_rooted_graph_result_store import (
+    complete_provider_directory_rooted_graph_result,
 )
 from process.provider_directory_rooted_graph_store import (
     claim_provider_directory_rooted_graph_census,
@@ -32,6 +32,7 @@ from process.provider_directory_rooted_graph_store_contract import (
     build_provider_directory_rooted_graph_work_spec,
 )
 from process.provider_directory_rooted_graph_store_support import identity_fields
+from tests.provider_directory_rooted_graph_runtime_test_support import configure_rooted_generation
 from tests.test_provider_directory_rooted_graph_store_contract import (
     API_BASE,
     DATASET_HASH,
@@ -44,14 +45,19 @@ from tests.test_provider_directory_rooted_graph_store_contract import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _configured_rooted_generation(monkeypatch):
+    configure_rooted_generation(monkeypatch)
+
+
 class _Database:
-    def __init__(self, *, first_rows=(), all_rows=(), status_counts=(), admit_counts=None) -> None:
+    def __init__(self, *, first_rows=(), all_rows=(), status_counts=(), scalar_results=()) -> None:
         self.first_rows = iter(first_rows)
         self.all_rows = list(all_rows)
         self.status_counts = iter(status_counts)
+        self.scalar_results = iter(scalar_results)
         self.statements: list[tuple[str, dict[str, object]]] = []
         self.transaction_count = 0
-        self.admit_counts = admit_counts
         self.copied_rows = {}
 
     @asynccontextmanager
@@ -61,15 +67,7 @@ class _Database:
 
     async def scalar(self, statement, **parameters):
         self.statements.append((statement, parameters))
-        if "initialize_provider_directory_rooted_graph_work" in statement:
-            return 1
-        if "admit_provider_directory_rooted_graph_witnesses" in statement:
-            return self.admit_counts or [len(self.copied_rows.get(name, ())) for name in (
-                "pdrg_resource_stage", "pdrg_edge_stage",
-            )]
-        if "admit_provider_directory_rooted_graph_work" in statement:
-            return len(self.copied_rows.get("pdrg_work_stage", ()))
-        return ""
+        return next(self.scalar_results, "")
 
     async def copy_records_to_table(self, name, *, schema_name, columns, records):
         assert schema_name == "pg_temp"
@@ -91,6 +89,10 @@ class _Database:
 
 def _header(identity, status="building"):
     return {**identity_fields(identity), "status": status}
+
+
+_CANONICAL_ROOT_DATASET = {"candidate_storage_json": None}
+_WORK_ADMISSION = 'SELECT * FROM pg_temp."pdrg_work_stage"'
 
 
 def _role_spec(identity):
@@ -145,8 +147,13 @@ async def test_initialize_builds_root_queries_set_wise_and_delays_plan_census() 
     database = _Database(
         first_rows=(
             _header(identity),
+            _header(identity),
+            _CANONICAL_ROOT_DATASET,
+            _header(identity),
+            _CANONICAL_ROOT_DATASET,
             {"work_count": 1, "role_count": 1, "plan_count": 0},
         ),
+        scalar_results=("", False, identity.root_resource_count, [], identity.root_resource_count),
     )
 
     assert (
@@ -159,7 +166,8 @@ async def test_initialize_builds_root_queries_set_wise_and_delays_plan_census() 
     sql = "\n".join(statement for statement, _parameters in database.statements)
     assert "WHERE NOT EXISTS" in sql
     assert "INSERT INTO" in sql and "SELECT" in sql
-    assert "initialize_provider_directory_rooted_graph_work" in sql
+    assert "WITH initial_work (" in sql
+    assert sum(_WORK_ADMISSION in statement for statement, _parameters in database.statements) == 1
     assert "database.all" not in sql
     assert "full_insurance_plan_census" in sql
 
@@ -197,7 +205,7 @@ async def test_large_root_initialization_requests_bounded_pages() -> None:
 
     class BoundedPageDatabase(_Database):
         async def all(self, statement, **parameters):
-            assert "read_provider_directory_rooted_graph_initial_work" in statement
+            assert statement.startswith("WITH initial_work (")
             assert 1 <= parameters["limit"] <= 1024
             if parameters["after_id"]:
                 return []
@@ -206,27 +214,29 @@ async def test_large_root_initialization_requests_bounded_pages() -> None:
     database = BoundedPageDatabase(
         first_rows=(
             _header(identity),
+            _header(identity),
+            _CANONICAL_ROOT_DATASET,
+            _header(identity),
+            _CANONICAL_ROOT_DATASET,
             {
                 "work_count": root_count,
                 "role_count": root_count,
                 "plan_count": 0,
             },
-        )
+        ),
+        scalar_results=("", False, root_count, [], root_count),
     )
     await initialize_provider_directory_rooted_graph_acquisition(
         identity,
         database=database,
     )
 
-    assert sum("initialize_provider_directory_rooted_graph_work" in statement
-               for statement, _parameters in database.statements) == 1
+    assert sum(_WORK_ADMISSION in statement for statement, _parameters in database.statements) == 1
     assert len(database.copied_rows["pdrg_work_stage"]) == 1
 
 
 @pytest.mark.asyncio
-async def test_claim_sql_reclaims_expired_generation_and_resume_increments_attempt() -> (
-    None
-):
+async def test_claim_sql_reclaims_expired_generation_and_resume_increments_attempt() -> None:
     identity = _identity()
     database = _Database(first_rows=(_claim_row(identity, attempt=3),))
 
@@ -260,9 +270,13 @@ async def test_dedicated_census_claim_returns_db_sorted_root_network_anchors() -
     database = _Database(
         first_rows=(
             _header(identity),
+            _CANONICAL_ROOT_DATASET,
             closure_by_field,
+            _header(identity),
+            _CANONICAL_ROOT_DATASET,
             _census_claim_row(identity),
-        )
+        ),
+        scalar_results=("", 1, [], 1),
     )
 
     census_claim = await claim_provider_directory_rooted_graph_census(
@@ -271,15 +285,13 @@ async def test_dedicated_census_claim_returns_db_sorted_root_network_anchors() -
     )
 
     assert census_claim is not None
-    assert (
-        census_claim.root_network_references
-        == closure_by_field["root_network_references"]
-    )
+    assert census_claim.root_network_references == closure_by_field["root_network_references"]
     sql = "\n".join(statement for statement, _ in database.statements)
     assert "FOR SHARE" in sql
     assert "root_frontier_drained" in sql
     assert "full_insurance_plan_census" in sql
-    assert "claim_census" in str(database.statements)
+    assert [parameters["action"] for _, parameters in database.statements if "action" in parameters] == ["census"]
+    assert len(database.copied_rows["pdrg_work_stage"]) == 1
 
 
 @pytest.mark.asyncio
@@ -311,7 +323,9 @@ async def test_release_and_terminalization_are_exact_token_fenced() -> None:
             }
         ],
     )
-    stale_database = _Database(status_counts=(0,))
+    stale_database = _Database(
+        first_rows=({"acquisition_id": claim.acquisition_id}, {"query_id": claim.query_id}),
+    )
     with pytest.raises(ProviderDirectoryRootedGraphStoreError) as error:
         await complete_provider_directory_rooted_graph_result(
             claim,
@@ -320,7 +334,8 @@ async def test_release_and_terminalization_are_exact_token_fenced() -> None:
         )
     assert error.value.code == "lease_lost"
     terminal_sql, terminal_parameters = stale_database.statements[-1]
-    assert "lease_expires_at > clock_timestamp()" in terminal_sql
+    assert "status='leased'" in terminal_sql
+    assert "lease_expires_at>clock_timestamp()" in terminal_sql
     assert terminal_parameters["attempt"] == claim.attempt
     assert terminal_parameters["lease_token"] == claim.lease_token
 

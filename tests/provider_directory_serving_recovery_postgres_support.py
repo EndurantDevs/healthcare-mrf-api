@@ -3,6 +3,8 @@
 
 import importlib
 import importlib.util
+import json
+import tempfile
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,7 +40,8 @@ async def _create_serving(database, schema):
     await database.status(f'''CREATE TABLE "{schema}".entity_address_result_generation (
         singleton boolean PRIMARY KEY, local_lineage_id uuid NOT NULL,
         local_generation bigint NOT NULL, origin_lineage_id uuid, origin_generation bigint,
-        published_at timestamptz, relation_oids bigint[])''')
+        published_at timestamptz, relation_oids bigint[],
+        CONSTRAINT entity_address_result_generation_shape_check CHECK (singleton))''')
     await database.status(
         f'INSERT INTO "{schema}".entity_address_result_generation VALUES (true,:lineage,0,NULL,NULL,NULL,NULL)',
         lineage=uuid4(),
@@ -56,6 +59,17 @@ async def _create_serving(database, schema):
 
     async with database.engine.begin() as connection:
         await connection.run_sync(apply)
+    named_path = Path(__file__).parents[1] / "alembic/versions/20261115120000_named_output_recovery_document.py"
+    spec = importlib.util.spec_from_file_location("named_serving_recovery_migration", named_path)
+    named = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(named)
+
+    def apply_named(connection):
+        named.op = Operations(MigrationContext.configure(connection))
+        named.upgrade()
+
+    async with database.engine.begin() as connection:
+        await connection.run_sync(apply_named)
 
 
 async def _remove_owned_catalog(administrator, ownership):
@@ -63,7 +77,8 @@ async def _remove_owned_catalog(administrator, ownership):
         return
     async with administrator.begin() as connection:
         await connection.execute(text(f'DROP SCHEMA IF EXISTS "{ownership.schema}" CASCADE'))
-        await connection.execute(text(f'DROP ROLE IF EXISTS "{ownership.role}"'))
+        for role in ownership.roles:
+            await connection.execute(text(f'DROP ROLE IF EXISTS "{role}"'))
         assert await connection.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": ownership.schema}) is None
         assert not await connection.scalar(
             text("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=:role)"), {"role": ownership.role}
@@ -83,6 +98,50 @@ async def _seed_source(database, schema):
     return await directory._resolve_provider_directory_artifact_datasets(["source_primary"])
 
 
+async def _create_catalog(administrator, ownership, password):
+    """Create only the pre-registered disposable roles and namespace."""
+    schema, role = ownership.schema, ownership.role
+    extra_roles = ownership.roles[1:]
+    async with administrator.begin() as connection:
+        for extension in ("postgis", "intarray", "pg_trgm"):
+            await connection.execute(text(f"CREATE EXTENSION IF NOT EXISTS {extension}"))
+        assert await connection.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": schema}) is None
+        assert not await connection.scalar(
+            text("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=:role)"), {"role": role}
+        )
+        ownership.is_registered = True
+        await connection.execute(
+            text(
+                f'CREATE ROLE "{role}" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS '
+                f"PASSWORD '{password}'"
+            )
+        )
+        for other_role in extra_roles:
+            await connection.execute(text(f'CREATE ROLE "{other_role}" NOLOGIN'))
+        await connection.execute(text(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{role}"'))
+        await connection.execute(text(f'GRANT USAGE ON SCHEMA "{schema}" TO "{extra_roles[2]}"'))
+
+
+async def _freeze_serving(database, schema, role, reader_role):
+    """Use the same native immutable transition as the ordinary publisher."""
+    from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
+    from process.provider_directory_projection_stage import _copy_driver
+
+    async with database.transaction():
+        session = database._transaction_binding().session
+        await session.execute(text("SELECT 1"))
+        driver = await _copy_driver(session)
+        await freeze_fhir_source_snapshot(
+            driver,
+            schema,
+            namespace_owner=role,
+            reader_roles=(role, reader_role),
+            application_roles=(),
+            relation_names=("provider_directory_address_overlay", "entity_address_unified"),
+            freeze_schema=False,
+        )
+
+
 @asynccontextmanager
 async def ordinary_serving_case(monkeypatch):
     """Register one role/schema before creation and close resources in dependency order."""
@@ -92,27 +151,29 @@ async def ordinary_serving_case(monkeypatch):
     administrator = create_async_engine(url)
     engine = create_async_engine(url.set(username=role, password=password))
     database = Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
-    ownership = SimpleNamespace(schema=schema, role=role, is_registered=False)
+    extra_roles = tuple("serving_" + kind + "_" + identity[:16] for kind in ("owner", "migration", "reader"))
+    ownership = SimpleNamespace(schema=schema, role=role, roles=(role, *extra_roles), is_registered=False)
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     monkeypatch.setenv("DB_SCHEMA", schema)
     monkeypatch.setattr(directory, "db", database)
     async with AsyncExitStack() as contexts:
+        tempdir = contexts.enter_context(tempfile.TemporaryDirectory(prefix="serving-policy-"))
+        policy_file = Path(tempdir) / "roles.json"
+        policy_file.write_text(
+            json.dumps(
+                {
+                    "owner_role": extra_roles[0],
+                    "migration_role": extra_roles[1],
+                    "preparation_owner_role": role,
+                    "runtime_roles": [extra_roles[2]],
+                }
+            )
+        )
+        monkeypatch.setenv("HLTHPRT_SOURCE_PROFILE_ROLE_POLICY_FILE", str(policy_file))
         contexts.push_async_callback(administrator.dispose)
         contexts.push_async_callback(_remove_owned_catalog, administrator, ownership)
         contexts.push_async_callback(database.disconnect)
-        async with administrator.begin() as connection:
-            assert await connection.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": schema}) is None
-            assert not await connection.scalar(
-                text("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=:role)"), {"role": role}
-            )
-            ownership.is_registered = True
-            await connection.execute(
-                text(
-                    f'CREATE ROLE "{role}" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS '
-                    f"PASSWORD '{password}'"
-                )
-            )
-            await connection.execute(text(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{role}"'))
+        await _create_catalog(administrator, ownership, password)
         async with database.transaction():
             actor = await database.first(
                 "SELECT session_user::text,current_user::text,rolsuper,rolcreatedb,"
@@ -120,6 +181,7 @@ async def ordinary_serving_case(monkeypatch):
             )
             assert tuple(actor[:2]) == (role, role) and not any(actor[2:])
         fence = await _seed_source(database, schema)
+        await _freeze_serving(database, schema, role, extra_roles[2])
         selected = fence.datasets[0]
         pin_by_field = dict(
             source_id=selected.source_id,
@@ -129,5 +191,12 @@ async def ordinary_serving_case(monkeypatch):
             parent_run_id=selected.evidence_run_id,
         )
         yield SimpleNamespace(
-            database=database, schema=schema, directory=directory, pin=pin_by_field, fence=fence, role=role
+            database=database,
+            schema=schema,
+            directory=directory,
+            pin=pin_by_field,
+            fence=fence,
+            role=role,
+            administrator=administrator,
+            reader_role=extra_roles[2],
         )

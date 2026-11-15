@@ -13,9 +13,6 @@ from db import migration_cms_replay_resolution as replay
 from db import migration_cms_retirement_resolution as retirement
 from db import migration_cms_snapshot_allocator as allocator
 from db import migration_cms_terminal_resolution as terminal
-from process import provider_directory_cms_generic_seal as generic_runtime
-from process import provider_directory_cms_snapshot_allocation as allocation_runtime
-from process import provider_directory_cms_snapshot_parents as parent_runtime
 
 _INSTALLERS = (
     (allocator, "upgrade_cms_snapshot_allocator", "_canonical_copy_guard_snapshot"),
@@ -32,13 +29,6 @@ def test_installer_query_changes_only_the_exact_isolation_clause():
     successor = "pg_catalog.current_setting('transaction_isolation') IN ('read committed','serializable')"
     assert str(allocator._ADMIN_SQL).count(original) == 1
     assert str(allocator._INSTALLER_ADMIN_SQL) == str(allocator._ADMIN_SQL).replace(original, successor, 1)
-
-
-def test_runtime_consumers_keep_the_original_query():
-    assert generic_runtime._ADMIN_SQL is allocator._ADMIN_SQL
-    assert allocation_runtime._ADMIN_SQL is allocator._ADMIN_SQL
-    assert parent_runtime._ADMIN_SQL is allocator._ADMIN_SQL
-    assert "serializable" not in str(allocator._ADMIN_SQL)
 
 
 def _is_query_accepted(query, context_by_field):

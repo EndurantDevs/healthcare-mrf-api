@@ -118,9 +118,9 @@ def _physical_read_identity(serving_tables, legacy_identity):
     return (
         *legacy_identity,
         physical.dataset_id,
-        physical.schema_oid,
+        physical.schema_name,
         physical.payload_snapshot_id,
-        physical.relation_oids,
+        physical.relations,
     )
 
 

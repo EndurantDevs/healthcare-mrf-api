@@ -163,6 +163,8 @@ async def test_publish_tables_moves_primary_and_declared_indexes(monkeypatch):
 
     prepared = AsyncMock()
     monkeypatch.setattr(enrichment, "prepare_local_native_input_publication", prepared)
+    finished = AsyncMock()
+    monkeypatch.setattr(enrichment, "finish_local_native_input_publication", finished)
     monkeypatch.setattr(enrichment, "PROCESSING_CLASSES", (PublishedModel,))
     monkeypatch.setattr(enrichment.db, "transaction", lambda: _AsyncTransaction())
     db_status = AsyncMock()
@@ -177,6 +179,7 @@ async def test_publish_tables_moves_primary_and_declared_indexes(monkeypatch):
     )
 
     prepared.assert_awaited_once()
+    finished.assert_awaited_once_with(prepared.await_args.args[0], prepared=prepared.return_value)
     assert isinstance(prepared.await_args.args[0], _AsyncTransaction)
     assert prepared.await_args.kwargs == dict(
         ledger_schema="provider_test", relations=(("published", "published_stage"),)

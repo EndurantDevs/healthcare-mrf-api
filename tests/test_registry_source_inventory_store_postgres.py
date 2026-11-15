@@ -12,9 +12,6 @@ import asyncpg
 import pytest
 
 from process import registry_source_inventory_store as store
-from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_fhir_membership_source import with_fhir_successor
-from process.network_fhir_retained_capture_contract import SEMANTIC_PROFILE, capture_digest
 from process.network_membership_candidate_lifecycle import (
     MembershipCandidateError,
     create_network_candidate,
@@ -32,35 +29,13 @@ from process.registry_source_inventory_reference import SourceInventoryReference
 from process.registry_source_inventory_summaries import contribution_summary_v3
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe, canonical_registry_source_recipes
 from tests.registry_compact_target_postgres_support import coverage_reader
+from tests.registry_source_recipe_support import _capture_recipe, _example
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
-from tests.test_network_fhir_retained_capture import pin, retained
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_ptg_office_membership_recipe import _recipe as _ptg_recipe
 from tests.test_registry_source_inventory_contract import _entries
 from tests.test_registry_source_inventory_schema_postgres import _migration
-from tests.test_registry_source_recipe_store_postgres import _cms_custody_recipe, _cms_epoch_recipe, _example
-
-
-def _capture_recipe():
-    captures = []
-    for dataset in ("dataset-one", "dataset-two"):
-        capture = retained()
-        origin = replace(
-            capture.origin,
-            dataset_id=dataset,
-            admission_profile=SEMANTIC_PROFILE,
-            original_admission_refusal=None,
-            admission_metadata_sha256="1" * 64,
-            semantic_projection_as_of="2026-01-01",
-            descriptor_counts=capture.origin.resource_counts,
-        )
-        capture = replace(capture, origin=origin)
-        captures.append(replace(capture, capture_sha256=capture_digest(capture)))
-    source = with_fhir_successor(pin(captures[0]), pin(captures[1]))
-    coordinates = RegistryNetworkSourceCoordinates(
-        "fhir", source.source_id, source.schema_name, source.dataset_id, "fixture-producer", captures[0].capture_id
-    )
-    return RegistrySourceMembershipRecipe(source, coordinates)
+from tests.test_registry_source_recipe_store_postgres import _cms_custody_recipe, _cms_epoch_recipe
 
 
 @pytest.mark.parametrize("recipe", [_example(), _cms_epoch_recipe(), _ptg_recipe(), _capture_recipe()])
@@ -203,12 +178,17 @@ async def _write(context, copy_target, entries, **options):
     return receipt
 
 
+async def _table_oid(context, copy_target):
+    """Observe the named inventory table's catalog entry for native constraint assertions."""
+    relation = '"' + copy_target.schema_name + '".' + store.INVENTORY_TABLE
+    return await context.fixture.connection.fetchval("SELECT to_regclass($1)::oid::bigint", relation)
+
+
 async def _verify(context, copy_target, receipt, **options):
     async with context.coverage_reader.transaction(isolation="repeatable_read", readonly=True):
         return await store.verify_source_inventory(
             context.coverage_reader,
             copy_target,
-            expected_table_oid=receipt.table_oid,
             expected_root=receipt.root,
             control_schema=context.fixture.control_schema,
             **options,
@@ -232,9 +212,7 @@ async def test_open_inventory_replay_preserves_rows_and_rejects_changed_stream(i
         )
         == before
     )
-    assert (
-        await context.fixture.connection.fetchval("SELECT to_regclass($1)::oid::bigint", relation) == receipt.table_oid
-    )
+    assert (receipt.schema_name, receipt.table_name) == (copy_target.schema_name, store.INVENTORY_TABLE)
     candidate_record = await context.fixture.connection.fetchrow(
         f'SELECT * FROM "{context.fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
         UUID(copy_target.candidate_id),
@@ -247,23 +225,13 @@ async def test_open_inventory_replay_preserves_rows_and_rejects_changed_stream(i
             )
             == entries
         )
-        loaded, stored_entries = await store._load_locked_source_inventory(
+        loaded, stored_entries = await store.load_source_inventory(
             context.fixture.connection,
             copy_target,
             candidate_by_field,
-            expected_table_oid=receipt.table_oid,
             control_schema=context.fixture.control_schema,
         )
         assert loaded.root == receipt.root and stored_entries == entries
-    async with context.fixture.connection.transaction(isolation="repeatable_read"):
-        with pytest.raises(RegistrySourceInventoryError, match="physical_identity_invalid"):
-            await store._load_locked_source_inventory(
-                context.fixture.connection,
-                copy_target,
-                candidate_by_field,
-                expected_table_oid=receipt.table_oid + 1,
-                control_schema=context.fixture.control_schema,
-            )
     if count:
         with pytest.raises(RegistrySourceInventoryError, match="root_changed"):
             async with context.fixture.connection.transaction():
@@ -292,7 +260,6 @@ async def test_native_inventory_copy_and_limited_reader_keysets_preserve_complet
             page = await store.read_source_inventory_page(
                 context.coverage_reader,
                 copy_target,
-                expected_table_oid=receipt.table_oid,
                 after_ordinal=after,
                 row_limit=17,
                 byte_limit=4096,
@@ -314,13 +281,15 @@ async def test_native_inventory_copy_and_limited_reader_keysets_preserve_complet
                 )
     assert (
         await context.fixture.connection.fetchval(
-            "SELECT count(*) FROM pg_constraint WHERE conrelid=$1::oid AND contype='f'", receipt.table_oid
+            "SELECT count(*) FROM pg_constraint WHERE conrelid=$1::oid AND contype='f'",
+            await _table_oid(context, copy_target),
         )
         == 0
     )
     assert (
         await context.fixture.connection.fetchval(
-            "SELECT count(*) FROM pg_trigger WHERE tgrelid=$1::oid AND NOT tgisinternal", receipt.table_oid
+            "SELECT count(*) FROM pg_trigger WHERE tgrelid=$1::oid AND NOT tgisinternal",
+            await _table_oid(context, copy_target),
         )
         == 0
     )
@@ -372,10 +341,10 @@ async def test_native_inventory_full_root_refuses_extra_zero_row_with_intact_pk(
     constraint = await context.fixture.connection.fetchrow(
         "SELECT conname,pg_get_constraintdef(oid) AS definition FROM pg_constraint "
         "WHERE conrelid=$1::oid AND contype='c' AND conkey=ARRAY[1]::smallint[]",
-        receipt.table_oid,
+        await _table_oid(context, copy_target),
     )
     primary_key = await context.fixture.connection.fetchval(
-        "SELECT oid FROM pg_constraint WHERE conrelid=$1::oid AND contype='p'", receipt.table_oid
+        "SELECT oid FROM pg_constraint WHERE conrelid=$1::oid AND contype='p'", await _table_oid(context, copy_target)
     )
     assert constraint is not None and primary_key is not None
     try:
@@ -390,7 +359,8 @@ async def test_native_inventory_full_root_refuses_extra_zero_row_with_intact_pk(
         assert await context.fixture.connection.fetchval(f"SELECT count(*) FROM {relation} WHERE ordinal>0") == 3
         assert (
             await context.fixture.connection.fetchval(
-                "SELECT oid FROM pg_constraint WHERE conrelid=$1::oid AND contype='p'", receipt.table_oid
+                "SELECT oid FROM pg_constraint WHERE conrelid=$1::oid AND contype='p'",
+                await _table_oid(context, copy_target),
             )
             == primary_key
         )
@@ -400,7 +370,7 @@ async def test_native_inventory_full_root_refuses_extra_zero_row_with_intact_pk(
         await context.fixture.connection.execute(f"DELETE FROM {relation} WHERE ordinal=0")
         if not await context.fixture.connection.fetchval(
             "SELECT EXISTS(SELECT FROM pg_constraint WHERE conrelid=$1::oid AND conname=$2)",
-            receipt.table_oid,
+            await _table_oid(context, copy_target),
             constraint["conname"],
         ):
             await context.fixture.connection.execute(
@@ -419,7 +389,7 @@ async def test_native_inventory_duplicate_scalar_boundary_refuses_before_payload
     primary_key = await context.fixture.connection.fetchrow(
         "SELECT conname,pg_get_constraintdef(oid) AS definition FROM pg_constraint "
         "WHERE conrelid=$1::oid AND contype='p'",
-        receipt.table_oid,
+        await _table_oid(context, copy_target),
     )
     extra = make_source_inventory_entry(2, _example(99))
     extra_record = store.source_inventory_record(extra)
@@ -438,7 +408,6 @@ async def test_native_inventory_duplicate_scalar_boundary_refuses_before_payload
                     await store.read_source_inventory_page(
                         context.coverage_reader,
                         copy_target,
-                        expected_table_oid=receipt.table_oid,
                         after_ordinal=1,
                         row_limit=1,
                         byte_limit=max(len(encode_source_inventory_entry(entry)) for entry in (entries[1], extra)) + 2,
@@ -450,7 +419,7 @@ async def test_native_inventory_duplicate_scalar_boundary_refuses_before_payload
         await context.fixture.connection.execute(f"DELETE FROM {relation} WHERE recipe_sha256=$1", extra_record[4])
         if not await context.fixture.connection.fetchval(
             "SELECT EXISTS(SELECT FROM pg_constraint WHERE conrelid=$1::oid AND conname=$2)",
-            receipt.table_oid,
+            await _table_oid(context, copy_target),
             primary_key["conname"],
         ):
             await context.fixture.connection.execute(
@@ -512,7 +481,6 @@ async def _assert_reader_boundaries(context, copy_target, receipt, entries):
         exact_page = await store.read_source_inventory_page(
             context.coverage_reader,
             copy_target,
-            expected_table_oid=receipt.table_oid,
             byte_limit=len(encode_source_inventory_entry(entries[0])) + 2,
             control_schema=context.fixture.control_schema,
         )
@@ -522,14 +490,6 @@ async def _assert_reader_boundaries(context, copy_target, receipt, entries):
             await store.read_source_inventory_page(
                 context.coverage_reader,
                 wrong_target,
-                expected_table_oid=receipt.table_oid,
-                control_schema=context.fixture.control_schema,
-            )
-        with pytest.raises(RegistrySourceInventoryError, match="physical_identity"):
-            await store.read_source_inventory_page(
-                context.coverage_reader,
-                copy_target,
-                expected_table_oid=receipt.table_oid + 1,
                 control_schema=context.fixture.control_schema,
             )
         queries = []
@@ -538,7 +498,6 @@ async def _assert_reader_boundaries(context, copy_target, receipt, entries):
                 await store.read_source_inventory_page(
                     context.coverage_reader,
                     copy_target,
-                    expected_table_oid=receipt.table_oid,
                     byte_limit=len(encode_source_inventory_entry(entries[0])) + 1,
                     control_schema=context.fixture.control_schema,
                 )
@@ -573,7 +532,6 @@ async def test_native_inventory_scope_state_oid_snapshot_and_first_row_bounds(in
             await store.read_source_inventory_page(
                 context.coverage_reader,
                 copy_target,
-                expected_table_oid=receipt.table_oid,
                 control_schema=context.fixture.control_schema,
             )
     closed = await _new_target(context)

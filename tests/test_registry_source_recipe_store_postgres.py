@@ -5,7 +5,7 @@ import hashlib
 import json
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
 
@@ -13,15 +13,7 @@ from process.network_approved_source_bindings import RegistryNetworkSourceCoordi
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource, _require_pinned_source
 from process.network_fhir_retained_capture import pin_retained_fhir_read
 from process.network_fhir_retained_capture_contract import PRODUCER
-from process.network_fhir_source_epoch import _TABLES, RetainedCMSFHIRSourceEpoch
-from process.network_membership_candidate_lifecycle import (
-    MembershipCandidateError,
-    admit_network_membership_batch,
-    create_network_candidate,
-    seal_network_candidate,
-)
-from process.network_membership_copy import MembershipCopyTarget
-from process.network_membership_pipeline import prepare_and_publish_network_candidate
+from process.network_fhir_source_epoch import RetainedCMSFHIRSourceEpoch
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_source_recipe_store import (
     MAX_SOURCE_RECIPE_BYTES,
@@ -36,39 +28,17 @@ from process.registry_source_recipe_store import (
     resolve_retained_registry_source_recipes,
     verify_registry_source_recipes,
 )
-from tests.test_network_custom_address_source_postgres import custom_db
-from tests.test_network_fhir_membership_source_postgres import fhir_source, reviewed_fhir_source
+from tests.registry_source_recipe_support import _example
+from tests.test_network_custom_address_source_postgres import custom_db as custom_db
+from tests.test_network_fhir_membership_source_postgres import fhir_source as fhir_source
+from tests.test_network_fhir_membership_source_postgres import reviewed_fhir_source as reviewed_fhir_source
 from tests.test_network_fhir_retained_capture_postgres import _capture
 from tests.test_network_fhir_retained_capture_postgres import legacy_capture_db as legacy_capture_db
-from tests.test_network_legacy_membership_source_postgres import reviewed_aca_source
-from tests.test_network_serving_schema_postgres import serving_schema
-from tests.test_registry_candidate_composition_postgres import _roles
-from tests.test_registry_retained_site_adoption_postgres import _source_addresses
+from tests.test_network_legacy_membership_source_postgres import reviewed_aca_source as reviewed_aca_source
+from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
+from tests.test_registry_provider_plan_read_postgres import provider_plans_db as provider_plans_db
 
 pytestmark = pytest.mark.asyncio
-
-
-def _example(index=0):
-    source = PinnedFHIRMembershipSource(
-        "source_example",
-        "source-example",
-        "endpoint-example",
-        f"dataset-{index}",
-        "a" * 64,
-        "release-one",
-        123,
-        "medical",
-        "2026-10-01",
-    )
-    coordinates = RegistryNetworkSourceCoordinates(
-        "fhir",
-        source.source_id,
-        source.schema_name,
-        source.dataset_id,
-        "producer-example",
-        "edition-one",
-    )
-    return RegistrySourceMembershipRecipe(source, coordinates)
 
 
 def _candidate(recipes):
@@ -103,10 +73,6 @@ def _cms_custody_recipe():
         legacy.source_pin,
         source_id="cms-npd",
         release_id="e" * 64,
-        custody_owner_role="cms_owner",
-        custody_runtime_roles=("cms_reader", "cms_writer"),
-        custody_proof_sha256="b" * 64,
-        custody_catalog_sha256="c" * 64,
     )
     return RegistrySourceMembershipRecipe(source, replace(legacy.binding_coordinates, source_id="cms-npd"))
 
@@ -124,8 +90,11 @@ async def test_cms_custody_wire_preserves_legacy_generation_and_binds_complete_r
     canonical = canonical_registry_source_recipes((recipe,))
     assert decode_registry_source_recipes(canonical) == (recipe,)
     pin = json.loads(canonical)[0]["source_pin"]
-    assert len(pin) == 13 and pin["custody_runtime_roles"] == ["cms_reader", "cms_writer"]
-    assert replace(recipe.source_pin, custody_catalog_sha256="d" * 64).generation_id != recipe.source_pin.generation_id
+    assert len(pin) == 9 and pin["resource_relation"] == {
+        "schema": recipe.source_pin.schema_name,
+        "name": "provider_directory_dataset_resource",
+    }
+    assert replace(recipe.source_pin, dataset_sha256="d" * 64).generation_id != recipe.source_pin.generation_id
 
 
 def _cms_epoch_recipe():
@@ -136,29 +105,27 @@ def _cms_epoch_recipe():
         tuple(source_pin.coordinates.values()),
         identity,
         "registry_cms_epoch_" + identity.hex,
-        1000,
-        tuple((name, 2000 + index) for index, name in enumerate(sorted(_TABLES))),
-        "cms_epoch_owner",
-        ("cms_reader",),
         "b" * 64,
         "c" * 64,
         "d" * 64,
-        "f" * 64,
     )
     return RegistrySourceMembershipRecipe(
         replace(source_pin, retained_epoch=epoch), replace(legacy.binding_coordinates, source_id="cms-npd")
     )
 
 
-async def test_cms_epoch_wire_preserves_origin_and_binds_physical_custody():
+async def test_cms_epoch_wire_preserves_origin_and_named_content():
     recipe = _cms_epoch_recipe()
     canonical = canonical_registry_source_recipes((recipe,))
     assert decode_registry_source_recipes(canonical) == (recipe,)
     document = json.loads(canonical)[0]["source_pin"]
     assert len(document) == 10 and document["schema_name"] == "source_example"
-    assert document["resource_table_oid"] == 123
+    assert document["resource_relation"] == {"schema": "source_example", "name": "provider_directory_dataset_resource"}
     assert recipe.source_pin.read_schema_name == recipe.source_pin.retained_epoch.schema_name
-    assert recipe.source_pin.read_resource_table_oid != recipe.source_pin.resource_table_oid
+    assert recipe.source_pin.read_resource_relation == {
+        "schema": recipe.source_pin.retained_epoch.schema_name,
+        "name": "provider_directory_dataset_resource",
+    }
     changed_epoch = replace(recipe.source_pin.retained_epoch, content_sha256="1" * 64)
     assert replace(recipe.source_pin, retained_epoch=changed_epoch).generation_id != recipe.source_pin.generation_id
 
@@ -173,7 +140,13 @@ async def test_cms_epoch_wire_rejects_malformed_or_mixed_receipt(damage):
     if damage == "origin_schema":
         epoch["origin_coordinates"][0] = "other_source"
     elif damage == "mixed":
-        pin.update(json.loads(canonical_registry_source_recipes((_cms_custody_recipe(),)))[0]["source_pin"])
+        # A retained epoch never carries the retired receipt fields of the historical flat wire.
+        pin.update(
+            custody_owner_role="cms_owner",
+            custody_runtime_roles=["cms_reader"],
+            custody_proof_sha256="b" * 64,
+            custody_catalog_sha256="c" * 64,
+        )
     elif damage == "nil":
         pin["retained_epoch"] = None
     else:
@@ -190,28 +163,12 @@ async def test_cms_epoch_wire_rejects_malformed_or_mixed_receipt(damage):
 
 
 @pytest.mark.parametrize(
-    "damage",
-    ["partial", "roles_text", "role_type", "duplicate", "unsorted", "owner", "digest", "empty", "other_source"],
+    "field", ["custody_owner_role", "custody_runtime_roles", "custody_proof_sha256", "custody_catalog_sha256"]
 )
-async def test_cms_custody_wire_rejects_partial_or_malformed_receipts(damage):
-    """Closed decoding rejects ambiguous receipt defaults and unsafe role coordinates."""
+async def test_named_wire_rejects_retired_receipt_fields(field):
+    """Closed decoding accepts retired fields only on the complete historical wire."""
     document = json.loads(canonical_registry_source_recipes((_cms_custody_recipe(),)))[0]
-    pin = document["source_pin"]
-    if damage == "partial":
-        pin.pop("custody_catalog_sha256")
-    elif damage == "other_source":
-        pin["source_id"] = document["binding_coordinates"]["source_id"] = "source-example"
-    else:
-        key, value = {
-            "roles_text": ("custody_runtime_roles", "cms_reader"),
-            "role_type": ("custody_runtime_roles", [1]),
-            "duplicate": ("custody_runtime_roles", ["cms_reader", "cms_reader"]),
-            "unsorted": ("custody_runtime_roles", ["cms_writer", "cms_reader"]),
-            "owner": ("custody_runtime_roles", ["cms_owner"]),
-            "digest": ("custody_proof_sha256", "B" * 64),
-            "empty": ("custody_owner_role", None),
-        }[damage]
-        pin[key] = value
+    document["source_pin"][field] = "cms_owner"
     with pytest.raises(RegistrySourceRecipeError, match="^registry_source_recipes_invalid$"):
         decode_registry_source_recipes([document])
 
@@ -413,89 +370,14 @@ async def test_real_aca_receipt_tamper_is_sanitized(reviewed_aca_source, damage)
         decode_registry_source_recipes([document])
 
 
-async def _seed_recipe_membership(fixture, copy_target, source_table, provider_id, network_id):
-    """Admit one exact retained office in the caller's native candidate transaction."""
-    await fixture.connection.execute(f'''CREATE TABLE "{copy_target.schema_name}".provider_location_binding(
-      provider_system text NOT NULL,provider_id text NOT NULL,location_id uuid NOT NULL,
-      location_key varchar(64) NOT NULL,entity_type text NOT NULL,entity_id text NOT NULL,
-      PRIMARY KEY(provider_system,provider_id,location_id))''')
-    await fixture.connection.execute(
-        f'''INSERT INTO "{copy_target.schema_name}".provider_location_binding
-      SELECT 'npi',$1,md5(location_key)::uuid,location_key,entity_type,entity_id FROM {source_table}''',
-        provider_id,
-    )
-    site_id = await fixture.connection.fetchval(
-        f'SELECT location_id FROM "{copy_target.schema_name}".provider_location_binding'
-    )
-    members = json.dumps(
-        [
-            {
-                "network_id": network_id,
-                "provider_system": "npi",
-                "provider_id": provider_id,
-                "location_id": str(site_id),
-                "evidence_id": "e" * 64,
-            },
-        ]
-    ).encode()
-    await admit_network_membership_batch(
-        fixture.connection,
-        copy_target,
-        batch_id=uuid4(),
-        input_bytes=members,
-        expected_input_sha256=hashlib.sha256(members).hexdigest(),
-        control_schema=fixture.control_schema,
-    )
-    await seal_network_candidate(fixture.connection, copy_target, control_schema=fixture.control_schema)
-
-
 @pytest.fixture
-async def recipe_serving(custom_db, reviewed_fhir_source, reviewed_aca_source):
-    """Publish actual source recipes and register exact candidate cleanup before creation."""
-    fixture = custom_db
-    fhir_fixture, _, networks, _, fhir_coordinates, _ = reviewed_fhir_source
-    aca_fixture, _, _, _, aca_coordinates, _ = reviewed_aca_source
-    recipes = (
-        RegistrySourceMembershipRecipe(fhir_fixture[2], fhir_coordinates),
-        RegistrySourceMembershipRecipe(aca_fixture[2], aca_coordinates),
-    )
-    candidate_id = uuid4()
-    copy_target = MembershipCopyTarget(
-        str(uuid4()), str(uuid4()), str(uuid4()), str(candidate_id), "network_candidate_" + candidate_id.hex
-    )
-    try:
-        provider_id, source_table = await _source_addresses(fixture, 1, "npi")
-        revision = await fixture.connection.fetchval(
-            f'SELECT approved_revision FROM "{fixture.control_schema}".registry_revision_control'
-        )
-        arguments_by_name = {
-            "source_generations": {"unified_address": fixture.base.generation_id},
-            "source_recipes": recipes,
-            "approved_custom_revision": revision,
-            "expected_head": 0,
-            "expected_rows": 1,
-            "control_schema": fixture.control_schema,
-        }
-        async with fixture.connection.transaction():
-            await create_network_candidate(fixture.connection, copy_target, **arguments_by_name)
-            await create_network_candidate(fixture.connection, copy_target, **arguments_by_name)
-            await create_network_candidate(
-                fixture.connection, copy_target, **{**arguments_by_name, "source_recipes": tuple(reversed(recipes))}
-            )
-            with pytest.raises(MembershipCandidateError):
-                await create_network_candidate(
-                    fixture.connection, copy_target, **{**arguments_by_name, "source_recipes": ()}
-                )
-            await _seed_recipe_membership(fixture, copy_target, source_table, provider_id, networks[0]["record_id"])
-        await prepare_and_publish_network_candidate(
-            fixture.connection, copy_target, fixture.base, **_roles(fixture), control_schema=fixture.control_schema
-        )
-        async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
-            manifest = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
-        yield SimpleNamespace(fixture=fixture, manifest=manifest, recipes=recipes, target=copy_target)
-    finally:
-        await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{copy_target.schema_name}" CASCADE')
-        assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", copy_target.schema_name) is None
+async def recipe_serving(provider_plans_db):
+    """Read the serving manifest of a reviewed recipe published through production composition."""
+    fixture, source_pin, _networks, copy_target = provider_plans_db
+    recipes = (RegistrySourceMembershipRecipe(source_pin, fixture.source_coordinates),)
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
+        manifest = await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
+    return SimpleNamespace(fixture=fixture, manifest=manifest, recipes=recipes, target=copy_target)
 
 
 async def test_native_retained_recipes_revalidate_manifest_and_do_not_mutate(recipe_serving):
@@ -516,10 +398,18 @@ async def test_native_retained_recipes_revalidate_manifest_and_do_not_mutate(rec
         )
         == before
     )
-    assert set(manifest.source_generations) == {"unified_address", RECIPE_DIGEST_KEY}
+    assert set(manifest.source_generations) == {
+        "unified_address",
+        "custom_membership",
+        "initial_source_recipe_0",
+        "registry_initial_source_offices",
+        "registry_source_membership",
+        "registry_source_retention",
+        RECIPE_DIGEST_KEY,
+    }
 
 
-@pytest.mark.parametrize("damage", ["isolation", "digest", "recipes", "manifest", "ineligible", "writable"])
+@pytest.mark.parametrize("damage", ["isolation", "digest", "recipes", "manifest", "ineligible"])
 async def test_native_retained_tamper_rejected(recipe_serving, damage):
     fixture, manifest = recipe_serving.fixture, recipe_serving.manifest
     isolation = "read_committed" if damage == "isolation" else "repeatable_read"
@@ -529,7 +419,6 @@ async def test_native_retained_tamper_rejected(recipe_serving, damage):
             f"source_generations=jsonb_set(source_generations,'{{{RECIPE_DIGEST_KEY}}}',to_jsonb('wrong'::text))",
             "recipes": f"UPDATE \"{fixture.control_schema}\".network_membership_candidate SET source_recipes_json='[]'",
             "ineligible": f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false',
-            "writable": f'GRANT UPDATE ON "{manifest.schema_name}".network_membership TO "{fixture.roles["reader"]}"',
         }
         if damage in sql_by_damage:
             await fixture.connection.execute(sql_by_damage[damage])
@@ -559,7 +448,7 @@ def _capture_recipe(capture):
         origin.dataset_id,
         origin.dataset_sha256,
         capture.release_id,
-        origin.resource_parent_oid,
+        origin.resource_relation,
         "registry-source-one",
         "2026-01-01",
         retained_capture=capture,
@@ -595,7 +484,10 @@ async def test_capture_reader_keeps_original_wire_after_owner_transition(legacy_
     await _guard_version(fixture, guard_version)
     capture = await _capture(fixture)
     wire = canonical_registry_source_recipes((_capture_recipe(capture),))
-    oids = [capture.origin.resource_parent_oid, capture.origin.resource_leaf_oid]
+    oids = [
+        await fixture.admin.fetchval("SELECT to_regclass($1)::oid", f'"{fixture.schema}"."{name}"')
+        for name in ("provider_directory_dataset_resource", "retained_input")
+    ]
     original = await fixture.admin.fetch(_ORIGIN_SQL, oids)
     resources_sql = (
         "SELECT jsonb_agg(to_jsonb(resource) ORDER BY resource_type,resource_id) "
@@ -625,8 +517,7 @@ async def test_capture_reader_keeps_original_wire_after_owner_transition(legacy_
     async with reader.transaction(isolation="repeatable_read", readonly=True):
         read = await pin_retained_fhir_read(reader, capture)
         await _require_pinned_source(reader, recipe.source_pin, retained_read=read)
-        await read.verify(reader, capture)
-        assert recipe.source_pin.read_resource_table_oid != capture.origin.resource_leaf_oid
+        assert recipe.source_pin.read_resource_relation != capture.origin.resource_relation
         assert recipe.source_pin.read_schema_name == capture.schema_name
         assert await reader.fetchval(
             f'SELECT count(*) FROM "{capture.schema_name}".provider_directory_dataset_resource'
@@ -641,4 +532,6 @@ async def test_capture_reader_keeps_original_wire_after_owner_transition(legacy_
         )
         is True
     )
-    assert json.loads(wire)[0]["source_pin"]["retained_capture"]["origin"]["resource_leaf_oid"] == oids[1]
+    assert json.loads(wire)[0]["source_pin"]["retained_capture"]["origin"]["resource_relation"] == dict(
+        capture.origin.resource_relation
+    )

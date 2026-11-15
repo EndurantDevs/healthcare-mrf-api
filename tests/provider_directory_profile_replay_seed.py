@@ -32,15 +32,14 @@ from process.provider_directory_profile_selection_contract import (
     ProviderDirectoryProfileExecution,
     ProviderDirectoryProfileSelectionAttestation,
 )
-from tests.test_provider_directory_profile_capacity import _geometry_payload
-from tests.test_provider_directory_profile_capacity_attestation import (
-    _signed_envelope,
-)
 from tests.provider_directory_profile_capacity_trust_fixtures import (
     capacity_trust_from_envelope,
 )
 from tests.provider_directory_profile_delta_test_support import _delta_database
-
+from tests.test_provider_directory_profile_capacity import _geometry_payload
+from tests.test_provider_directory_profile_capacity_attestation import (
+    _signed_envelope,
+)
 
 importer = importlib.import_module("process.provider_directory_fhir")
 UTC = datetime.timezone.utc
@@ -68,9 +67,7 @@ class _ReplaySeed:
 
     @property
     def generation_id(self) -> str:
-        digest = hashlib.sha256(
-            f"{self.build_id}:{self.geometry.profile_as_of}".encode("utf-8")
-        ).hexdigest()
+        digest = hashlib.sha256(f"{self.build_id}:{self.geometry.profile_as_of}".encode("utf-8")).hexdigest()
         return "pdprofile_" + digest[:32]
 
 
@@ -82,11 +79,6 @@ def _replay_capacity_consumption(seed: _ReplaySeed) -> dict[str, object]:
         trust=capacity_trust_from_envelope(seed.envelope),
         now=seed.accepted_at,
         expected_capacity_geometry_hash=seed.geometry_hash,
-        expected_database_system_identifier=(
-            geometry.database_system_identifier
-        ),
-        expected_database_oid=geometry.database_oid,
-        expected_database_name=geometry.database_name,
     )
     return lease.capacity_lease_consumption_values(
         verified_lease,
@@ -103,20 +95,13 @@ def _replay_capacity_consumption(seed: _ReplaySeed) -> dict[str, object]:
     )
 
 
-def _metadata_layout_by_field(
-    exact_fingerprint: str,
-    *,
-    main_index_oid: int,
-    toast_index_oid: int,
-) -> dict[str, object]:
-    """Return one deterministic metadata relation layout."""
+def _metadata_layout_by_field(geometry, role, *, target=False):
+    """Retain only named coordinates and numeric cutover layout costs."""
+    relation = geometry.relations[role]
     return {
-        "exact_fingerprint": exact_fingerprint,
-        "main_index_oids": [main_index_oid],
-        "main_index_pages": [1],
-        "toast_index_oids": [toast_index_oid],
-        "toast_index_pages": [1],
+        **{name: relation[name] for name in ("schema", "name", "main_index_pages", "toast_index_pages")},
         "deleted_toast_chunks": 0,
+        **({"inserted_toast_chunks": 0} if target else {}),
     }
 
 
@@ -130,46 +115,28 @@ def _replay_metadata_projection(seed: _ReplaySeed):
                 operation="update",
                 payload_upper_bytes=64 * 1024,
                 deleted_toast_chunks=0,
-                main_index_pages=(1,),
-                toast_index_pages=(1,),
+                main_index_pages=tuple(seed.geometry.relations["build_checkpoint"]["main_index_pages"]),
+                toast_index_pages=tuple(seed.geometry.relations["build_checkpoint"]["toast_index_pages"]),
             ),
             capacity.ProviderDirectoryProfileMetadataMutationInput(
                 relation_name="serving_generation",
                 operation="update",
                 payload_upper_bytes=4_096,
                 deleted_toast_chunks=0,
-                main_index_pages=(1,),
-                toast_index_pages=(1,),
+                main_index_pages=tuple(seed.geometry.relations["serving_generation"]["main_index_pages"]),
+                toast_index_pages=tuple(seed.geometry.relations["serving_generation"]["toast_index_pages"]),
             ),
             capacity.ProviderDirectoryProfileMetadataMutationInput(
                 relation_name="delta_receipt",
                 operation="insert",
                 payload_upper_bytes=64 * 1024,
                 deleted_toast_chunks=0,
-                main_index_pages=(1,),
-                toast_index_pages=(1,),
+                main_index_pages=tuple(seed.geometry.relations["delta_receipt"]["main_index_pages"]),
+                toast_index_pages=tuple(seed.geometry.relations["delta_receipt"]["toast_index_pages"]),
             ),
         ),
         pending_commit_items=0,
     )
-
-
-def _empty_target_layout(
-    exact_fingerprint: str,
-    *,
-    main_index_oid: int,
-    toast_index_oid: int,
-) -> dict[str, object]:
-    """Return an unchanged target relation layout."""
-    return {
-        "exact_fingerprint": exact_fingerprint,
-        "main_index_oids": [main_index_oid],
-        "main_index_pages": [1],
-        "toast_index_oids": [toast_index_oid],
-        "toast_index_pages": [1],
-        "inserted_toast_chunks": 0,
-        "deleted_toast_chunks": 0,
-    }
 
 
 def _empty_target_projection() -> dict[str, object]:
@@ -203,31 +170,11 @@ def _replay_forecast(seed: _ReplaySeed, metadata_projection):
         "wal_bytes_before": 0,
         "evidence_target_bytes_before": 0,
         "profile_target_bytes_before": 0,
-        "evidence_target_layout": _empty_target_layout(
-            geometry.evidence_target_storage_fingerprint,
-            main_index_oid=1,
-            toast_index_oid=2,
-        ),
-        "profile_target_layout": _empty_target_layout(
-            geometry.profile_target_storage_fingerprint,
-            main_index_oid=3,
-            toast_index_oid=4,
-        ),
-        "build_checkpoint_layout": _metadata_layout_by_field(
-            geometry.build_checkpoint_storage_fingerprint,
-            main_index_oid=5,
-            toast_index_oid=6,
-        ),
-        "serving_generation_layout": _metadata_layout_by_field(
-            geometry.serving_generation_storage_fingerprint,
-            main_index_oid=7,
-            toast_index_oid=8,
-        ),
-        "delta_receipt_layout": _metadata_layout_by_field(
-            geometry.delta_receipt_storage_fingerprint,
-            main_index_oid=9,
-            toast_index_oid=10,
-        ),
+        "evidence_target_layout": _metadata_layout_by_field(geometry, "evidence_target", target=True),
+        "profile_target_layout": _metadata_layout_by_field(geometry, "profile_target", target=True),
+        "build_checkpoint_layout": _metadata_layout_by_field(geometry, "build_checkpoint"),
+        "serving_generation_layout": _metadata_layout_by_field(geometry, "serving_generation"),
+        "delta_receipt_layout": _metadata_layout_by_field(geometry, "delta_receipt"),
         "build_checkpoint_payload_upper_bytes": 64 * 1024,
         "serving_payload_upper_bytes": 4_096,
         "receipt_payload_upper_bytes": 64 * 1024,
@@ -240,7 +187,7 @@ def _replay_forecast_hash(forecast_by_field: dict[str, object]) -> str:
     """Hash a replay forecast with its immutable contract identity."""
     return importer._identity_hash(
         {
-            "contract": "provider-directory-profile-cutover-forecast-hash-v1",
+            "contract": importer._profile_cutover_hash_domain(forecast_by_field, "forecast"),
             "forecast": forecast_by_field,
         }
     )
@@ -274,7 +221,7 @@ def _replay_actual_hash(actual_by_field: dict[str, object]) -> str:
     """Hash replay observations with their immutable contract identity."""
     return importer._identity_hash(
         {
-            "contract": "provider-directory-profile-cutover-actual-hash-v1",
+            "contract": importer._profile_cutover_hash_domain(actual_by_field, "actual"),
             "actual": actual_by_field,
         }
     )
@@ -298,12 +245,8 @@ def _replay_receipt_values(
         "capacity_geometry_json": capacity.capacity_geometry_payload(geometry),
         "from_source_vector_hash": geometry.current_source_vector_hash,
         "to_source_vector_hash": geometry.desired_source_vector_hash,
-        "from_source_context_vector_hash": (
-            geometry.current_context_vector_hash
-        ),
-        "to_source_context_vector_hash": (
-            geometry.desired_context_vector_hash
-        ),
+        "from_source_context_vector_hash": (geometry.current_context_vector_hash),
+        "to_source_context_vector_hash": (geometry.desired_context_vector_hash),
         "from_generation_id": "pdprofile_" + "1" * 32,
         "generation_id": seed.generation_id,
         "operation": "publish",
@@ -311,8 +254,10 @@ def _replay_receipt_values(
         "selection_proof_id": geometry.selection_proof_id,
         "control_generation": 7,
         "authority_revision": 7,
-        "evidence_target_oid": geometry.evidence_target_oid,
-        "profile_target_oid": geometry.profile_target_oid,
+        "targets_json": {
+            role: {name: geometry.relations[role + "_target"][name] for name in ("schema", "name")}
+            for role in ("evidence", "profile")
+        },
         "evidence_rows": 0,
         "profile_rows": 0,
         "evidence_inserted": 0,
@@ -353,24 +298,20 @@ def _replay_serving_values(
         "profile_schema_version": profile.PROFILE_SCHEMA_VERSION,
         "profile_strategy_version": profile.PROFILE_BUILD_STRATEGY_VERSION,
         "source_vector_hash": geometry.desired_source_vector_hash,
-        "source_vector_json": (
-            importer._provider_directory_profile_source_vector_json(
-                seed.source_vector
-            )
-        ),
+        "source_vector_json": (importer._provider_directory_profile_source_vector_json(seed.source_vector)),
         "source_context_vector_hash": geometry.desired_context_vector_hash,
         "source_context_vector_json": (
-            importer._provider_directory_profile_source_context_vector_json(
-                seed.source_context_vector
-            )
+            importer._provider_directory_profile_source_context_vector_json(seed.source_context_vector)
         ),
         "executable_plan_hash": geometry.executable_plan_hash,
         "capacity_geometry_status": "verified",
         "capacity_geometry_hash": seed.geometry_hash,
         "capacity_geometry_json": capacity.capacity_geometry_payload(geometry),
         "cutover_forecast_hash": _replay_forecast_hash(forecast_by_field),
-        "evidence_target_oid": geometry.evidence_target_oid,
-        "profile_target_oid": geometry.profile_target_oid,
+        "targets_json": {
+            role: {name: geometry.relations[role + "_target"][name] for name in ("schema", "name")}
+            for role in ("evidence", "profile")
+        },
         "evidence_rows": 0,
         "profile_rows": 0,
         "profile_as_of": geometry.profile_as_of,
@@ -389,12 +330,10 @@ async def _insert_replay_rows(seed: _ReplaySeed) -> None:
         _replay_forecast_hash(forecast_by_field),
         metadata_projection,
     )
-    await seed.database.insert(consumption_table).values(
-        **_replay_capacity_consumption(seed)
-    ).status()
-    await seed.database.insert(receipt_table).values(
-        **_replay_receipt_values(seed, forecast_by_field, actual_by_field)
-    ).status()
-    await seed.database.insert(serving_table).values(
-        **_replay_serving_values(seed, forecast_by_field)
-    ).status()
+    await seed.database.insert(consumption_table).values(**_replay_capacity_consumption(seed)).status()
+    await (
+        seed.database.insert(receipt_table)
+        .values(**_replay_receipt_values(seed, forecast_by_field, actual_by_field))
+        .status()
+    )
+    await seed.database.insert(serving_table).values(**_replay_serving_values(seed, forecast_by_field)).status()

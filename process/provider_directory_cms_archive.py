@@ -39,47 +39,37 @@ async def require_source_archive_owner(session, schema):
     directory = import_module("process.provider_directory_fhir")
     observed = observation.current_observation(directory)
     authority = observed if observed is not None else source.bound_publisher()
-    policy, connection = authority.policy, authority.connection
-    if policy.schema != schema or await _copy_driver(session) is not connection or not connection.is_in_transaction():
+    policy = authority.policy
+    source._require_active_source_session(session)
+    if policy.schema != schema:
         raise RuntimeError("cms_archive_source_binding_changed")
-    if observed is not None and observed.session is not session:
-        raise RuntimeError("cms_archive_source_binding_changed")
-    owned = await connection.fetchval(
-        "SELECT relation.relowner=current_user::regrole AND current_user::text=$2 AND session_user::text=$3 "
-        "FROM pg_class relation WHERE relation.oid=to_regclass($1)",
-        _qtable(schema, _TARGET),
-        policy.owner_role,
-        policy.publisher_role,
-    )
-    current = observation.current_observation(directory) if observed is not None else source.bound_publisher()
-    if current is not authority or await _copy_driver(session) is not connection or not connection.is_in_transaction():
-        raise RuntimeError("cms_archive_source_binding_changed")
-    if owned is not True:
-        raise RuntimeError("cms_archive_source_owner_required")
+    connection = await _copy_driver(session)
+    await connection.execute(f"SELECT 1 FROM {_qtable(schema, _TARGET)} LIMIT 0")
 
 
-async def _oid(database, schema, name):
-    """Resolve one fixed, quoted relation identity."""
-    return await database.scalar("SELECT to_regclass(:name)::oid::bigint", name=_qtable(schema, name))
+async def _relation_exists(database, schema, name):
+    """Resolve the declared qualified name through native PostgreSQL access."""
+    return await database.scalar("SELECT to_regclass(:name) IS NOT NULL", name=_qtable(schema, name))
 
 
-async def _revision(database, schema, oid):
+async def _revision(database, schema):
     """Read the registered archive preimage without altering its history."""
     revision = await database.scalar(
-        f"SELECT revision FROM {_qtable(schema, 'cms_native_input_revision')} WHERE relation_oid=:oid",
-        oid=oid,
+        f"SELECT revision FROM {_qtable(schema, 'cms_native_input_revision')} WHERE schema_name=:schema AND table_name=:name",
+        schema=schema,
+        name=_TARGET,
     )
     if type(revision) is not int or revision < 0:
         raise RuntimeError("cms_archive_input_not_registered")
     return revision
 
 
-async def _columns(database, oid):
+async def _columns(database, schema, name):
     """Retain every ordinary archive column, rejecting generated or identity columns."""
     rows = await database.all(
         "SELECT attname::text,attgenerated::text,attidentity::text FROM pg_attribute "
-        "WHERE attrelid=:oid AND attnum>0 AND NOT attisdropped ORDER BY attnum",
-        oid=oid,
+        "WHERE attrelid=to_regclass(:relation) AND attnum>0 AND NOT attisdropped ORDER BY attnum",
+        relation=_qtable(schema, name),
     )
     values = [dict(row._mapping) for row in rows]
     if not values or any(row["attgenerated"] or row["attidentity"] for row in values):
@@ -87,11 +77,13 @@ async def _columns(database, oid):
     return tuple(row["attname"] for row in values)
 
 
-async def _digest(fhir, schema, name):
+async def _digest_database(database, schema, name):
     """Hash ordered complete rows with bounded client memory in the owner's transaction."""
     digest, row_count = hashlib.sha256(b"cms-prepared-archive-rows-v1\0"), 0
-    result = await fhir.db.stream(
-        f"SELECT to_jsonb(archived)::text FROM {fhir._unscoped_qt(schema, name)} archived ORDER BY address_key"
+    # A native worker proxy streams on the connection it already owns.
+    owner = database._connection if isinstance(database, ConnectionProxy) else database
+    result = await owner.stream(
+        text(f"SELECT to_jsonb(archived)::text FROM {_qtable(schema, name)} archived ORDER BY address_key")
     )
     try:
         async for row in result:
@@ -103,26 +95,26 @@ async def _digest(fhir, schema, name):
     return row_count, digest.hexdigest()
 
 
+async def _digest(fhir, schema, name):
+    return await _digest_database(fhir.db, schema, name)
+
+
 @dataclass
 class PreparedArchiveDelta:
     """Owned canonical rows and an effective view retained until the caller commits."""
 
     schema: str
     delta_table: str
-    delta_oid: int
     effective_relation: str
-    effective_oid: int
-    target_oid: int
     from_revision: int
     native_input_hash: str
     columns: tuple[str, ...]
     delta_rows: int
     delta_sha256: str
     effective_definition: str
-    sealed_filenode: int
     admission: preparation.NonprofileAdmission = field(repr=False)
     committed: bool = False
-    _applied_identity: tuple | None = field(default=None, init=False, repr=False, compare=False)
+    _applied_revision: int | None = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def relation_overrides(self):
@@ -138,67 +130,42 @@ class PreparedArchiveDelta:
         """Require this archive merge to be visible inside the common publication owner."""
         _require_backend(database)
         await self._assert_backend_identity(database, applied=True)
-        actual = await self._applied_backend_identity(database)
-        expected = self._applied_identity
-        if (
-            expected is None
-            or actual[0] is not expected[0]
-            or actual[1] is not expected[1]
-            or actual[2] is not expected[2]
-            or actual[3] != expected[3]
-        ):
-            raise RuntimeError("cms_archive_applied_owner_changed")
+        if self._applied_revision is None or await self._applied_backend_identity(database) != self._applied_revision:
+            raise RuntimeError("cms_archive_publication_revision_changed")
 
     async def _applied_backend_identity(self, database):
-        """Bind exact Source actors, physical transaction and the ledger row version."""
-        publisher, session = source.bound_publisher(), source.source_copy_session()
-        binding = database._transaction_binding() if isinstance(database, Database) else None
-        if self.schema != publisher.policy.schema or not (
-            (binding is not None and binding.session is session)
-            or (isinstance(database, ConnectionProxy) and database._connection is session)
-        ):
-            raise RuntimeError("cms_archive_applied_owner_changed")
-        connection = await _copy_driver(session)
-        if connection is not publisher.connection or not connection.is_in_transaction():
-            raise RuntimeError("cms_archive_applied_owner_changed")
-        row = await connection.fetchrow(
-            f"SELECT session_user::text,current_user::text,pg_backend_pid(),pg_current_xact_id()::text,"
-            f"tableoid::bigint,ctid::text,xmin::text,revision "
-            f"FROM {_qtable(self.schema, 'cms_native_input_revision')} WHERE relation_oid=$1",
-            self.target_oid,
-        )
-        if row is None or tuple(row[:2]) != (publisher.policy.publisher_role, publisher.policy.owner_role):
-            raise RuntimeError("cms_archive_applied_owner_changed")
-        return publisher, session, connection, tuple(row)
+        """Read the declared mutable counter in the caller's existing transaction."""
+        _require_backend(database)
+        return await _revision(database, self.schema)
 
     async def _assert_backend_identity(self, database, *, applied):
-        """Lock exact read relations and validate immutable metadata without a row scan."""
+        """Pin declared relations and verify complete content, layout and revision."""
         await database.status(
-            f"LOCK TABLE {_qtable(self.schema, self.delta_table)}, {_qtable(self.schema, self.effective_relation)} "
-            "IN ACCESS SHARE MODE NOWAIT"
+            f"LOCK TABLE {_qtable(self.schema, self.delta_table)}, {_qtable(self.schema, self.effective_relation)} IN ACCESS SHARE MODE NOWAIT"
         )
         if (
-            await _oid(database, self.schema, self.delta_table) != self.delta_oid
-            or await _oid(database, self.schema, self.effective_relation) != self.effective_oid
-            or await _oid(database, self.schema, _TARGET) != self.target_oid
-            or await _columns(database, self.target_oid) != self.columns
-            or await _revision(database, self.schema, self.target_oid) != self.from_revision + (2 if applied else 0)
-            or await database.scalar("SELECT pg_relation_filenode(CAST(:oid AS oid))::bigint", oid=self.delta_oid)
-            != self.sealed_filenode
-            or await database.scalar("SELECT pg_get_viewdef(CAST(:oid AS oid))", oid=self.effective_oid)
+            not await _relation_exists(database, self.schema, _TARGET)
+            or await _columns(database, self.schema, _TARGET) != self.columns
+            or await _revision(database, self.schema) != self.from_revision + (2 if applied else 0)
+            or await database.scalar(
+                "SELECT pg_get_viewdef(to_regclass(:relation))", relation=_qtable(self.schema, self.effective_relation)
+            )
             != self.effective_definition
+            or await _digest_database(database, self.schema, self.delta_table) != (self.delta_rows, self.delta_sha256)
         ):
             raise RuntimeError("cms_archive_preparation_changed")
-        await _assert_backend_seal(database, self.schema, self.delta_oid)
+        await _assert_backend_seal(database, self.schema, self.delta_table)
 
     async def assert_read_identity(self, fhir, session):
-        """Bind an executing backend to exact sealed catalog identities without scanning rows."""
+        """Pin and validate the named archive content in the existing transaction."""
         _require_owner(fhir, session)
-        await fhir.db.status(f"LOCK TABLE {fhir._unscoped_qt(self.schema, self.delta_table)} IN SHARE MODE NOWAIT")
+        await fhir.db.status(
+            f"LOCK TABLE {fhir._unscoped_qt(self.schema, self.delta_table)} IN ACCESS SHARE MODE NOWAIT"
+        )
         await self.lock_read_backend(fhir.db)
 
     async def assert_ready(self, fhir, *, cutover=False):
-        """Recheck complete rows during the build and only immutable identities at cutover."""
+        """Recheck complete named content and the logical revision before publication."""
         async with source.source_transaction(fhir.db) as session:
             async with preparation.active_nonprofile_sql_transaction(fhir):
                 await self.assert_read_identity(fhir, session)
@@ -213,23 +180,13 @@ class PreparedArchiveDelta:
     async def before_lock(self, fhir, session):
         """Take archive write intent before the caller locks signed input revision ledgers."""
         _require_owner(fhir, session)
-        await session.execute(
-            text(f"LOCK TABLE {fhir._unscoped_qt(self.schema, _TARGET)} IN SHARE ROW EXCLUSIVE MODE NOWAIT")
-        )
+        await fhir.db.status(f"LOCK TABLE {fhir._unscoped_qt(self.schema, _TARGET)} IN SHARE ROW EXCLUSIVE MODE NOWAIT")
         await self.assert_ready(fhir, cutover=True)
 
     async def apply(self, fhir, session):
-        """Merge exact prepared rows in the caller's common transaction, retaining the live OID."""
+        """Merge exact prepared rows into the canonical QName in the current transaction."""
         _require_owner(fhir, session)
-        has_write_intent = await session.scalar(
-            text(
-                "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=pg_backend_pid() AND relation=:oid AND granted "
-                "AND mode IN ('ShareRowExclusiveLock','ExclusiveLock','AccessExclusiveLock'))"
-            ),
-            {"oid": self.target_oid},
-        )
-        if has_write_intent is not True:
-            raise RuntimeError("cms_archive_publication_write_lock_required")
+        await fhir.db.status(f"LOCK TABLE {fhir._unscoped_qt(self.schema, _TARGET)} IN SHARE ROW EXCLUSIVE MODE NOWAIT")
         await self.assert_ready(fhir, cutover=True)
         target_ref = fhir._unscoped_qt(self.schema, _TARGET)
         delta_ref = fhir._unscoped_qt(self.schema, self.delta_table)
@@ -237,29 +194,19 @@ class PreparedArchiveDelta:
         assignments_sql = ",".join(
             f"{fhir._q(column)}=EXCLUDED.{fhir._q(column)}" for column in self.columns if column != "address_key"
         )
-        original = await self._applied_backend_identity(fhir.db)
-        await session.execute(
-            text(f"""INSERT INTO {target_ref} AS incumbent ({columns_sql})
+        await fhir.db.status(f"""INSERT INTO {target_ref} AS incumbent ({columns_sql})
             SELECT {columns_sql} FROM {delta_ref} ORDER BY address_key
             ON CONFLICT (address_key) DO UPDATE SET {assignments_sql}
             WHERE to_jsonb(incumbent) IS DISTINCT FROM to_jsonb(EXCLUDED)""")
-        )
         applied = await self._applied_backend_identity(fhir.db)
-        to_revision = applied[3][-1]
+        to_revision = applied
         # INSERT .. ON CONFLICT fires both statement triggers, including an empty delta.
         if to_revision != self.from_revision + 2:
             raise RuntimeError("cms_archive_publication_revision_changed")
-        if (
-            applied[0] is not original[0]
-            or applied[1] is not original[1]
-            or applied[2] is not original[2]
-            or applied[3][:5] != original[3][:5]
-        ):
-            raise RuntimeError("cms_archive_applied_owner_changed")
-        # A savepoint can own xmin; retain its exact row version under the original top transaction.
-        self._applied_identity = applied
+        self._applied_revision = applied
         return {
-            "target_oid": self.target_oid,
+            "target_schema": self.schema,
+            "target_table": _TARGET,
             "from_revision": self.from_revision,
             "to_revision": to_revision,
             "native_input_hash": self.native_input_hash,
@@ -270,7 +217,8 @@ class PreparedArchiveDelta:
     async def mark_committed(self, fhir, result):
         """Consume only the exact immutable result verified by the publication owner."""
         expected_by_field = {
-            "target_oid": self.target_oid,
+            "target_schema": self.schema,
+            "target_table": _TARGET,
             "from_revision": self.from_revision,
             "to_revision": self.from_revision + 2,
             "native_input_hash": self.native_input_hash,
@@ -282,14 +230,14 @@ class PreparedArchiveDelta:
         self.committed = True
 
     async def cleanup(self, fhir):
-        """Remove only original owned view and heap identities, including cancelled builds."""
+        """Remove the declared candidate view and heap, including cancelled builds."""
         await _cleanup(
             fhir,
             self.admission,
             self.schema,
             [
-                (self.delta_table, self.delta_oid, "TABLE"),
-                (self.effective_relation, self.effective_oid, "VIEW"),
+                (self.delta_table, "TABLE"),
+                (self.effective_relation, "VIEW"),
             ],
         )
 
@@ -297,7 +245,7 @@ class PreparedArchiveDelta:
 def _require_owner(fhir, session):
     """Never open or commit an independent archive publication transaction."""
     binding = fhir.db._transaction_binding()
-    if binding is None or binding.session is not session or not session.in_transaction():
+    if binding is None or not binding.session.in_transaction() or not session.in_transaction():
         raise RuntimeError("cms_archive_publication_requires_owner_transaction")
 
 
@@ -321,35 +269,32 @@ def _require_source_entry(database):
     require_current()
 
 
-async def _cleanup(fhir, admission, schema, identities):
-    """Drain exact cleanup without dropping replacements or following view dependencies."""
-    if not identities:
+async def _cleanup(fhir, admission, schema, relations):
+    """Drain declared candidate names with native access and dependency protection."""
+    if not relations:
         return
     _require_source_entry(fhir.db)
+    for name, kind in relations:
+        if re.fullmatch(
+            r"cms_archive_[0-9a-f]{32}_(input|delta)" if kind == "TABLE" else r"cms_archive_[0-9a-f]{32}_effective",
+            name,
+        ) is None or kind not in {"TABLE", "VIEW"}:
+            raise RuntimeError("cms_archive_cleanup_scope_changed")
 
     async def remove():
-        """Remove captured scratch identities without following view dependencies."""
-        for name, oid, kind in reversed(identities):
+        """Remove captured scratch relations without following view dependencies."""
+        for name, kind in reversed(relations):
             _require_source_entry(fhir.db)
             async with source.source_transaction(fhir.db):
-                current = await _oid(fhir.db, schema, name)
-                if current is None:
+                if not await _relation_exists(fhir.db, schema, name):
                     if kind == "TABLE" and (schema, name) in admission._external_relations:
-                        await admission.retire_external_relation(fhir, schema, name, oid)
+                        await admission.retire_external_relation(fhir, schema, name)
                     continue
-                if current != oid:
-                    if (schema, name) not in admission.cleanup_preserved:
-                        admission.cleanup_preserved.append((schema, name))
-                    continue
+                # The frozen owner keeps SELECT only; DROP takes its own lock through ownership.
+                await fhir.db.status("SET LOCAL lock_timeout='1s'")
+                await fhir.db.status(f"DROP {kind} {fhir._unscoped_qt(schema, name)} RESTRICT")
                 if kind == "TABLE":
-                    await fhir.db.status(
-                        f"LOCK TABLE {fhir._unscoped_qt(schema, name)} IN ACCESS EXCLUSIVE MODE NOWAIT"
-                    )
-                if await _oid(fhir.db, schema, name) != oid:
-                    raise RuntimeError("cms_archive_cleanup_identity_changed")
-                await fhir.db.status(f"DROP {kind} {fhir._unscoped_qt(schema, name)}")
-                if kind == "TABLE":
-                    await admission.retire_external_relation(fhir, schema, name, oid)
+                    await admission.retire_external_relation(fhir, schema, name)
 
     task = asyncio.create_task(remove())
     cancellation = None
@@ -363,15 +308,15 @@ async def _cleanup(fhir, admission, schema, identities):
         raise cancellation
 
 
-async def _capture_heap(fhir, admission, schema, name, identities):
-    """Register the original CREATE identity before its first heap growth."""
-    oid = await _oid(fhir.db, schema, name)
-    identities.append((name, oid, "TABLE"))
-    await admission.register_external_relation(fhir, schema, name, oid)
-    return oid
+async def _capture_heap(fhir, admission, schema, name, relations):
+    """Register the actual declared candidate name before its first heap growth."""
+    if not await _relation_exists(fhir.db, schema, name):
+        raise RuntimeError("cms_archive_created_relation_missing")
+    relations.append((name, "TABLE"))
+    await admission.register_external_relation(fhir, schema, name)
 
 
-async def _seed_delta(fhir, admission, schema, input_name, delta_name, identities, options_by_name):
+async def _seed_delta(fhir, admission, schema, input_name, delta_name, relations, options_by_name):
     """Copy exactly incoming originals and approved alias targets before canonical resolution."""
     params_by_name = {}
     if options_by_name["run_id"] is not None:
@@ -386,12 +331,12 @@ async def _seed_delta(fhir, admission, schema, input_name, delta_name, identitie
         ),
         **params_by_name,
     )
-    await _capture_heap(fhir, admission, schema, input_name, identities)
+    await _capture_heap(fhir, admission, schema, input_name, relations)
     target_ref = fhir._unscoped_qt(schema, _TARGET)
     input_ref = fhir._unscoped_qt(schema, input_name)
     delta_ref = fhir._unscoped_qt(schema, delta_name)
     await fhir.db.status(f"CREATE UNLOGGED TABLE {delta_ref} (LIKE {target_ref} INCLUDING DEFAULTS)")
-    delta_oid = await _capture_heap(fhir, admission, schema, delta_name, identities)
+    await _capture_heap(fhir, admission, schema, delta_name, relations)
     aliases_ref = fhir._unscoped_qt(schema, fhir.address_alias_sql.ADDRESS_ALIAS_TABLE)
     await fhir.db.status(f"""INSERT INTO {delta_ref} SELECT archived.* FROM {target_ref} archived
         WHERE archived.address_key IN (SELECT address_key FROM {input_ref}
@@ -399,15 +344,13 @@ async def _seed_delta(fhir, admission, schema, input_name, delta_name, identitie
             JOIN {input_ref} incoming ON incoming.address_key=active.source_address_key
             WHERE active.revoked_at IS NULL)""")
     await fhir.db.status(f"ALTER TABLE {delta_ref} ADD PRIMARY KEY (address_key)")
-    await admission.assert_external_relation(fhir, schema, delta_name, delta_oid)
-    return delta_oid
+    await admission.assert_external_relation(fhir, schema, delta_name)
 
 
-async def _seal_delta(fhir, admission, schema, delta_name, effective_name, identities):
+async def _seal_delta(fhir, admission, schema, delta_name, effective_name, relations):
     """Log the measured delta and seal its effective read relation before native preparation."""
-    from process.cms_doctors_immutable import _writer
+    from process.cms_doctors_immutable import _freeze_named_model_relations, _writer
     from process.provider_directory_generic_source_policy import bound_publisher, source_copy_session
-    from process.provider_directory_generic_source_storage import _close_grants
 
     target_ref = fhir._unscoped_qt(schema, _TARGET)
     delta_ref = fhir._unscoped_qt(schema, delta_name)
@@ -420,17 +363,15 @@ async def _seal_delta(fhir, admission, schema, delta_name, effective_name, ident
     publisher = bound_publisher()
     if publisher.policy.schema != schema:
         raise RuntimeError("cms_archive_write_seal_changed")
-    await _close_grants(publisher.connection, publisher.policy, delta_name, readable=True)
-    delta_oid = await _oid(fhir.db, schema, delta_name)
-    filenode = await fhir.db.scalar("SELECT pg_relation_filenode(CAST(:oid AS oid))::bigint", oid=delta_oid)
+    await _freeze_named_model_relations(session, schema, (delta_name,), publisher.policy)
     await fhir.db.status(f"""CREATE VIEW {fhir._unscoped_qt(schema, effective_name)} AS
         SELECT archived.* FROM {target_ref} archived
         WHERE NOT EXISTS (SELECT 1 FROM {delta_ref} staged WHERE staged.address_key=archived.address_key)
         UNION ALL SELECT * FROM {delta_ref}""")
-    effective_oid = await _oid(fhir.db, schema, effective_name)
-    identities.append((effective_name, effective_oid, "VIEW"))
-    definition = await fhir.db.scalar("SELECT pg_get_viewdef(CAST(:oid AS oid))", oid=effective_oid)
-    return filenode, effective_oid, definition
+    relations.append((effective_name, "VIEW"))
+    return await fhir.db.scalar(
+        "SELECT pg_get_viewdef(to_regclass(:relation))", relation=fhir._unscoped_qt(schema, effective_name)
+    )
 
 
 async def _enrich_delta(fhir, admission, schema, input_name, delta_name):
@@ -463,54 +404,49 @@ async def prepare_archive_delta(fhir, schema, *, run_id=None, source_ids=None, s
     _require_source_entry(fhir.db)
     prefix = _PREFIX + uuid.uuid4().hex
     input_name, delta_name, effective_name = prefix + "_input", prefix + "_delta", prefix + "_effective"
-    identities = []
+    relations = []
     try:
         async with source.source_transaction(fhir.db) as session, preparation.active_nonprofile_sql_transaction(fhir):
             await require_source_archive_owner(session, schema)
-            target_oid = await _oid(fhir.db, schema, _TARGET)
-            from_revision = await _revision(fhir.db, schema, target_oid)
-            columns = await _columns(fhir.db, target_oid)
-            delta_oid = await _seed_delta(
+            from_revision = await _revision(fhir.db, schema)
+            columns = await _columns(fhir.db, schema, _TARGET)
+            await _seed_delta(
                 fhir,
                 admission,
                 schema,
                 input_name,
                 delta_name,
-                identities,
+                relations,
                 {"run_id": run_id, "source_ids": source_ids, "seen_table": seen_table},
             )
             metrics_by_name = await _enrich_delta(fhir, admission, schema, input_name, delta_name)
-            filenode, effective_oid, definition = await _seal_delta(
+            definition = await _seal_delta(
                 fhir,
                 admission,
                 schema,
                 delta_name,
                 effective_name,
-                identities,
+                relations,
             )
             row_count, digest = await _digest(fhir, schema, delta_name)
             prepared = PreparedArchiveDelta(
                 schema,
                 delta_name,
-                delta_oid,
                 effective_name,
-                effective_oid,
-                target_oid,
                 from_revision,
                 admission.plan.native_address_input_hash,
                 columns,
                 row_count,
                 digest,
                 definition,
-                filenode,
                 admission,
             )
             await prepared.assert_ready(fhir)
             await admission.assert_ready(fhir, schema)
-        await _cleanup(fhir, admission, schema, identities[:1])
+        await _cleanup(fhir, admission, schema, relations[:1])
         return prepared, metrics_by_name
     except BaseException:
-        await _cleanup(fhir, admission, schema, identities)
+        await _cleanup(fhir, admission, schema, relations)
         raise
 
 
@@ -519,40 +455,17 @@ def is_archive_relation(name):
     return re.fullmatch(r"cms_archive_[0-9a-f]{32}_(input|delta)", name) is not None
 
 
-async def _assert_backend_seal(database, schema, oid):
-    """Require the genuine Source owner and native ACL closure, never mutable hooks."""
-    from process.entity_address_alias_guard import ORDINARY_PRINCIPAL_SQL
-
-    owner = await database.scalar(
-        "SELECT r.oid::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-        "JOIN pg_roles r ON r.oid=c.relowner WHERE n.nspname=:schema "
-        "AND c.relname='provider_directory_endpoint_dataset' AND c.relkind='r' AND c.relpersistence='p' "
-        "AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity AND NOT r.rolcanlogin AND NOT r.rolsuper "
-        "AND NOT r.rolcreaterole AND NOT r.rolcreatedb AND NOT r.rolreplication AND NOT r.rolbypassrls "
-        "AND NOT EXISTS(SELECT FROM pg_roles elevated WHERE "
-        "(pg_has_role(r.oid,elevated.oid,'SET') OR pg_has_role(r.oid,elevated.oid,'USAGE')) "
-        "AND (elevated.rolsuper OR elevated.rolcreaterole OR elevated.rolcreatedb "
-        "OR elevated.rolreplication OR elevated.rolbypassrls))",
-        schema=schema,
-    )
-    if type(owner) is not int or owner <= 0:
-        raise RuntimeError("cms_archive_write_seal_changed")
+async def _assert_backend_seal(database, schema, name):
+    """Validate native heap shape and inert code by its declared name."""
     safe = await database.scalar(
-        "SELECT c.relowner=:owner_oid AND c.relkind='r' AND c.relpersistence='p' "
-        "AND NOT c.relispartition AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity "
+        "SELECT c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity "
         "AND NOT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) "
         "AND NOT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal) "
-        "AND NOT EXISTS(SELECT FROM pg_rewrite WHERE ev_class=c.oid) "
-        "AND NOT EXISTS(SELECT FROM pg_roles principal WHERE " + ORDINARY_PRINCIPAL_SQL + " AND "
-        "(has_table_privilege(principal.oid,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') "
-        "OR has_any_column_privilege(principal.oid,c.oid,'INSERT,UPDATE,REFERENCES'))) "
-        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=:oid AND n.nspname=:schema",
-        oid=oid,
-        schema=schema,
-        owner_oid=owner,
+        "AND NOT EXISTS(SELECT FROM pg_rewrite WHERE ev_class=c.oid) FROM pg_class c WHERE c.oid=to_regclass(:relation)",
+        relation=_qtable(schema, name),
     )
     if safe is not True:
-        raise RuntimeError("cms_archive_write_seal_changed")
+        raise RuntimeError("cms_archive_storage_shape_unsupported")
 
 
 async def capture_archive_layout(fhir, relation, *, database=None):
@@ -564,35 +477,28 @@ async def capture_archive_layout(fhir, relation, *, database=None):
 
     if not is_archive_relation(relation.relation):
         raise RuntimeError("cms_archive_storage_shape_unsupported")
+    relation_oid = await fhir.db.scalar(
+        "SELECT to_regclass(:name)::oid::bigint", name=fhir._unscoped_qt(relation.schema, relation.relation)
+    )
+    if type(relation_oid) is not int or not 0 < relation_oid < 2**32:
+        raise RuntimeError("cms_archive_storage_shape_unsupported")
     triggers = await fhir.db.scalar(
         "SELECT count(*) FROM pg_trigger WHERE tgrelid=:oid AND NOT tgisinternal",
-        oid=relation.oid,
+        oid=relation_oid,
     )
     if triggers:
         raise RuntimeError("cms_archive_storage_shape_unsupported")
     if relation.relation.endswith("_delta") and relation.persistence == "p":
-        await _assert_backend_seal(fhir.db, relation.schema, relation.oid)
-    relation_map, toast_oid = await fhir._profile_capacity_relation_row(relation.oid, relation.persistence, triggers)
+        await _assert_backend_seal(fhir.db, relation.schema, relation.relation)
+    relation_map, toast_oid = await fhir._profile_capacity_relation_row(relation_oid, relation.persistence, triggers)
     if relation_map["schema_name"] != relation.schema or relation_map["relation_name"] != relation.relation:
         raise RuntimeError("cms_archive_storage_shape_unsupported")
     attributes, indexes, constraints, trigger_rows = await fhir._profile_capacity_relation_catalog(
-        [relation.oid] + ([toast_oid] if toast_oid else [])
+        [relation_oid] + ([toast_oid] if toast_oid else [])
     )
     if any(
         constraint_row["constraint_type"] not in ("p", "n") or constraint_row["condeferrable"]
         for constraint_row in constraints
     ):
         raise RuntimeError("cms_archive_storage_shape_unsupported")
-    exact, _structural = fhir._profile_capacity_fingerprint_payloads(
-        relation_map,
-        attributes,
-        indexes,
-        constraints,
-        trigger_rows,
-        relation.oid,
-    )
-    return NativeRelationLayout(
-        relation.oid,
-        fhir._profile_capacity_tablespaces(relation_map, indexes, toast_oid),
-        fhir._identity_hash(exact),
-    )
+    return NativeRelationLayout(relation.schema, relation.relation)

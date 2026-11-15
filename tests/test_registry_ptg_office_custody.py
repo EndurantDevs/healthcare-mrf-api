@@ -69,56 +69,19 @@ async def test_approval_uses_installed_office_owner_and_consumes_native_guard(mo
     service = replace(service, office_custody=profile)
     session, _, document = _fixture()
     driver = object()
-    guard = AsyncMock(return_value="office_owner")
     monkeypatch.setattr(approval, "_approved_source_review", AsyncMock(return_value=document))
     monkeypatch.setattr(approval, "_reader_roles", lambda actual: ("office_reader", "scope_approver"))
     from process import registry_ptg_office_capture as capture
 
     monkeypatch.setattr(capture, "_driver", AsyncMock(return_value=driver))
-    monkeypatch.setattr(custody, "verify_registry_ptg_office_custody", guard)
     context = await approval._context(session, service, _envelope()["command"], "synthetic_control")
     assert context.owner_role == "office_owner" != service.store.owner_role
     assert context.office_custody is profile
-    guard.assert_awaited_once_with(driver, context, publisher=False)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure",
-    [None, "genuine", "flags", "set_closed", "readers_closed", "office_only", "publisher_writes_closed", "oversize"],
-)
-async def test_native_profile_refuses_foreign_owner_set_acl_and_catalog_scope(monkeypatch, failure):
-    profile = custody.RegistryPTGOfficeCustodyProfile("office_owner", "office_publisher")
-    context = SimpleNamespace(
-        office_custody=profile,
-        owner_role="office_owner",
-        reader_roles=("reader", "approver"),
-        scope_store=SimpleNamespace(owner_role="store_owner"),
-        source_specification=SimpleNamespace(ptg_schema_name="synthetic_ptg"),
-    )
-    record_by_field = {
-        field: True
-        for field in ("genuine", "flags", "set_closed", "readers_closed", "office_only", "publisher_writes_closed")
+    assert custody.office_preparation_roles(context) == {
+        "namespace_owner_role": "office_owner",
+        "publisher_role": "office_publisher",
+        "application_roles": ["office_publisher", "office_reader", "scope_approver"],
     }
-    record_by_field.update(schema_count=0, schemas=[], owner_oid=10, publisher_oid=11)
-    if failure == "oversize":
-        record_by_field["schema_count"] = 129
-    elif failure:
-        record_by_field[failure] = False
-    driver = SimpleNamespace(fetchrow=AsyncMock(return_value=record_by_field))
-    if failure:
-        with pytest.raises(ValueError, match="profile_unavailable"):
-            await custody.verify_registry_ptg_office_custody(driver, context, publisher=True)
-    else:
-        assert await custody.verify_registry_ptg_office_custody(driver, context, publisher=True) == "office_owner"
-    assert driver.fetchrow.await_args.args[1:] == (
-        "office_owner",
-        "office_publisher",
-        ["reader", "approver"],
-        True,
-        "store_owner",
-        "synthetic_ptg",
-    )
 
 
 def test_browser_owner_fields_refuse_at_original_closed_envelope():
@@ -136,6 +99,7 @@ async def test_published_capture_missing_profile_refuses_before_candidate_ddl(mo
 
     context = replace(
         _context(),
+        office_custody=None,
         source_specification=RegistryPTGPublishedPlanSourceSpecification(
             "22222222-2222-4222-8222-222222222222", "synthetic_ptg", "snapshot", "source"
         ),
@@ -165,95 +129,57 @@ async def test_runtime_carries_only_trusted_profile_into_original_service(monkey
     assert all(engine.dispose.await_count == 1 for engine in boundary.engines)
 
 
-@pytest.mark.asyncio
-async def test_release_consumes_profile_before_owner_fence_or_store_sql(monkeypatch):
-    from process import registry_ptg_office_retention as retention
-    from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
-    from process.registry_ptg_published_plan_contract import RegistryPTGPublishedPlanSourceSpecification
-    from tests.test_registry_ptg_office_capture import _context
-
-    context = replace(
-        _context(),
-        source_specification=RegistryPTGPublishedPlanSourceSpecification(
-            "22222222-2222-4222-8222-222222222222", "synthetic_ptg", "snapshot", "source"
-        ),
-    )
-    guard = AsyncMock(side_effect=ValueError("registry_ptg_office_profile_unavailable"))
-    fence = AsyncMock()
-    monkeypatch.setattr(custody, "verify_registry_ptg_office_custody", guard)
-    monkeypatch.setattr(retention, "require_registry_company_approval_fence", fence)
-    session = SimpleNamespace(execute=AsyncMock())
-    store = RegistryPTGProducerScopeStore("store_owner", "approver", context.control_schema)
-    driver = object()
-    with pytest.raises(ValueError, match="profile_unavailable"):
-        await retention._owner_tables(session, store, driver, context)
-    guard.assert_awaited_once_with(driver, context, publisher=True)
-    fence.assert_not_awaited()
-    session.execute.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_configured_publisher_write_refusal_is_consumed_on_approver_connection():
+@pytest.mark.parametrize("change", ["profile", "owner", "reader_owner", "empty"])
+def test_office_role_configuration_refuses_missing_or_conflicting_names(change):
     profile = custody.RegistryPTGOfficeCustodyProfile("office_owner", "office_publisher")
     context = SimpleNamespace(
-        office_custody=profile,
-        owner_role="office_owner",
-        reader_roles=("reader", "approver"),
-        scope_store=SimpleNamespace(owner_role="store_owner"),
-        source_specification=SimpleNamespace(ptg_schema_name="synthetic_ptg"),
+        office_custody=profile, owner_role="office_owner", reader_roles=("office_reader", "approver")
     )
-    record_by_field = {field: True for field in ("genuine", "flags", "set_closed", "readers_closed", "office_only")}
-    record_by_field.update(schema_count=0, schemas=[], publisher_writes_closed=False)
-    driver = SimpleNamespace(fetchrow=AsyncMock(return_value=record_by_field))
+    if change == "profile":
+        context.office_custody = None
+    elif change == "owner":
+        context.owner_role = "other_owner"
+    elif change == "reader_owner":
+        context.reader_roles = ("office_owner",)
+    else:
+        context.reader_roles = ()
     with pytest.raises(ValueError, match="profile_unavailable"):
-        await custody.verify_registry_ptg_office_custody(driver, context, publisher=False)
-    assert driver.fetchrow.await_args.args[2] == "office_publisher"
-    assert driver.fetchrow.await_args.args[4] is False
-
-
-def test_publisher_query_reuses_native_guard_without_pin_writer_or_role_switch():
-    from process.registry_ptg_published_provisioning import HEADER_TABLES, LOCK_COLUMN
-
-    assert "current_user" not in custody._PUBLISHER_LOCK_SQL
-    assert "$2::name" in custody._PUBLISHER_LOCK_SQL
-    assert ":" not in custody._PUBLISHER_LOCK_SQL.replace("::", "")
-    assert "SET ROLE" not in custody._PROFILE_SQL
-    assert "MAINTAIN" in custody._PUBLISHER_LOCK_SQL
-    assert "AND NOT(FALSE AND" in custody._PUBLISHER_LOCK_SQL
-    assert LOCK_COLUMN + "=0" in custody._PUBLISHER_LOCK_SQL
-    assert all("'" + table + "'" in custody._PUBLISHER_LOCK_SQL for table in HEADER_TABLES)
-
-
-def test_publisher_owner_membership_requires_set_without_inherited_usage():
-    """Keep initial empty-owner custody as strict as retained-family custody."""
-    assert "pg_catalog.pg_has_role(p.oid,o.oid,'SET')" in custody._PROFILE_SQL
-    assert "NOT pg_catalog.pg_has_role(p.oid,o.oid,'USAGE')" in custody._PROFILE_SQL
+        custody.office_preparation_roles(context)
 
 
 @pytest.mark.asyncio
-async def test_zero_family_inherited_owner_refuses_before_candidate_ddl(monkeypatch):
-    from process import registry_ptg_office_capture as capture
-    from process.registry_ptg_published_plan_contract import RegistryPTGPublishedPlanSourceSpecification
-    from tests.test_registry_ptg_office_capture import _context, _request
+async def test_administrator_installer_gives_only_publisher_and_approver_control_writes():
+    from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
+    from process.registry_ptg_published_provisioning import install_registry_ptg_office_preparation_permissions
 
-    profile = custody.RegistryPTGOfficeCustodyProfile("office_owner", "office_publisher")
-    context = replace(
-        _context(),
-        owner_role=profile.owner_role,
-        scope_store=SimpleNamespace(owner_role="store_owner"),
-        office_custody=profile,
-        source_specification=RegistryPTGPublishedPlanSourceSpecification(
-            "22222222-2222-4222-8222-222222222222", "synthetic_ptg", "snapshot", "source"
-        ),
+    connection = SimpleNamespace(
+        is_in_transaction=lambda: True, execute=AsyncMock(), fetchval=AsyncMock(return_value='"synthetic"')
     )
-    profile_by_field = {
-        name: True for name in ("genuine", "flags", "readers_closed", "office_only", "publisher_writes_closed")
-    }
-    profile_by_field.update(set_closed=False, schema_count=0, schemas=[])
-    driver = SimpleNamespace(fetchrow=AsyncMock(return_value=profile_by_field), execute=AsyncMock())
-    monkeypatch.setattr(capture, "require_published_office_path", AsyncMock())
-    monkeypatch.setattr(capture, "_driver", AsyncMock(return_value=driver))
-    monkeypatch.setattr(capture, "_encoder", lambda: object())
-    with pytest.raises(ValueError, match="profile_unavailable"):
-        await capture.prepare_registry_ptg_office_capture(SimpleNamespace(), context, _request(), object())
-    driver.execute.assert_not_awaited()
+    profile = custody.RegistryPTGOfficeCustodyProfile("office_owner", "office_publisher")
+    store = RegistryPTGProducerScopeStore("scope_owner", "office_approver", "synthetic_control")
+    await install_registry_ptg_office_preparation_permissions(
+        connection, profile=profile, store=store, reader_roles=("office_reader",)
+    )
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    writes = [
+        query
+        for query in statements
+        if query.startswith("GRANT SELECT,INSERT(") and "ON hp_snapshot_retention.preparation TO" in query
+    ]
+    assert len(writes) == 1 and writes[0].endswith('TO "office_approver","office_publisher"')
+    assert all("office_reader" not in query for query in writes)
+    assert "frozen_inventory" not in writes[0] and "frozen_sha256" not in writes[0]
+    assert any(
+        "preparation_claim" in query and "preparation_relation" in query
+        for query in statements
+        if query.startswith("REVOKE ") and query.endswith('FROM "office_reader"')
+    )
+    assert any(
+        "INSERT(" in query and "frozen_inventory" in query
+        for query in statements
+        if query.startswith("REVOKE ") and query.endswith('FROM "office_reader"')
+    )
+
+    assert any(query.startswith("GRANT SELECT ON ") and query.endswith('TO "office_reader"') for query in statements)
+    assert any(query.startswith('REVOKE "office_owner" FROM ') for query in statements)
+    assert not any(query.startswith('GRANT "office_owner"') or "SET ROLE" in query for query in statements)

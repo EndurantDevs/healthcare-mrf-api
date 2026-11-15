@@ -118,13 +118,18 @@ async def test_archive_schema_uses_original_publisher_then_physical_owner_on_sam
                     timeout=30,
                 )
             await archive.complete_reference_family_restore(session, ownership)
-            owner_oid = await immutable._writer(session)
-            await archive.seal_model_family_storage(session, ownership, owner_oid)
+            await archive.seal_model_family_storage(session, ownership, roles=component.policy)
             assert not await native.fetchval(
                 "SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=ANY($1::oid[]))",
                 [oid for _, oid in ownership.relation_oids],
             )
+            # The sealed stage is read-only even for its owner, yet a failed attempt still retires it.
+            with pytest.raises(DBAPIError) as refused:
+                async with session.begin_nested():
+                    await session.execute(text(f'DELETE FROM "{ownership.schema_name}".doctor_clinician_address'))
+            assert refused.value.orig.sqlstate == "42501"
             await archive.cleanup_reference_family_stage(session, ownership)
+            assert await native.fetchval("SELECT to_regnamespace($1)", ownership.schema_name) is None
 
 
 @pytest.mark.asyncio
@@ -249,28 +254,39 @@ async def test_protected_received_family_replacement_restore_and_export(monkeypa
             await engine.dispose()
 
 
+def _received_roles(component):
+    """Declare the retained Publisher's administrative roles; nothing is derived from the catalog."""
+    return SimpleNamespace(
+        owner_role=component.retained_publisher, publisher_role=component.retained_publisher, runtime_roles=()
+    )
+
+
 async def _received_family_roundtrip(component, sessions, importer):
     reads = await _prepare_received_reader_access(component, importer)
-    first = await _received_clone(sessions, importer, component.policy.schema)
+    roles = _received_roles(component)
+    first = await _received_clone(sessions, importer, component.policy.schema, roles)
     await _assert_received_clone_private(component, first)
-    await _refuse_received_custody(sessions, first, component.owner)
+    await _refuse_received_writes(sessions, first, component.owner)
     await _activate_received_clone(sessions, first, rollback=True)
     await _assert_received_clone_private(component, first)
     assert await _received_reader_queries(component, importer) == reads
     first_receipt = await _activate_received_clone(sessions, first)
     assert await _received_reader_queries(component, importer) == reads
-    second = await _received_clone(sessions, importer, component.policy.schema)
+    second = await _received_clone(sessions, importer, component.policy.schema, roles)
     await _assert_received_clone_private(component, second)
     assert second.manifest.source_serving_generation == first.manifest.source_serving_generation
     second_receipt = await _activate_received_clone(sessions, second)
     assert await _received_reader_queries(component, importer) == reads
     assert second_receipt.predecessor_schema_name is not None
-    await _restore_received_clone(sessions, first, second, second_receipt.predecessor_schema_name, rollback=True)
+    retained = second_receipt.predecessor_schema_name
+    await _restore_received_clone(sessions, first, second, retained, roles, rollback=True)
     assert await _received_reader_queries(component, importer) == reads
-    restored = await _restore_received_clone(sessions, first, second, second_receipt.predecessor_schema_name)
+    restored = await _restore_received_clone(sessions, first, second, retained, roles)
     assert await _received_reader_queries(component, importer) == reads
-    assert restored.relation_oids == tuple(oid for _name, oid in first_receipt.relation_oids)
-    exported = await _received_clone(sessions, importer, component.policy.schema)
+    assert restored.relations == generation.declared_reference_family_relations(importer, component.policy.schema)
+    # The first received heaps serve again under their declared names.
+    assert dict(await _live_relation_oids(component, first)) == dict(first_receipt.relation_oids)
+    exported = await _received_clone(sessions, importer, component.policy.schema, roles)
     await _assert_received_clone_private(component, exported)
     await _export_received_clone(sessions, exported)
 
@@ -291,18 +307,36 @@ async def _prepare_received_reader_access(component, importer):
 
 async def _assert_received_clone_private(component, prepared):
     async with component.admin_engine.connect() as admin:
-        for _name, oid in prepared.ownership.relation_oids:
+        for name in prepared.ownership.relation_names:
+            relation = f'"{prepared.ownership.schema_name}"."{name}"'
             for role in (component.reader, component.builder):
                 assert (
                     await admin.scalar(
                         text(
-                            "SELECT NOT has_table_privilege(:role,CAST(:oid AS oid),'SELECT') "
-                            "AND NOT has_any_column_privilege(:role,CAST(:oid AS oid),'SELECT')"
+                            "SELECT NOT has_table_privilege(:role,:relation,'SELECT') "
+                            "AND NOT has_any_column_privilege(:role,:relation,'SELECT')"
                         ),
-                        {"role": role, "oid": oid},
+                        {"role": role, "relation": relation},
                     )
                     is True
                 )
+
+
+async def _live_relation_oids(component, prepared):
+    """Observe the heaps now serving by name, as the test's own catalog reference."""
+    async with component.admin_engine.connect() as admin:
+        return tuple(
+            [
+                (
+                    name,
+                    await admin.scalar(
+                        text("SELECT to_regclass(:relation)::oid::bigint"),
+                        {"relation": f'"{prepared.schema}"."{name}"'},
+                    ),
+                )
+                for name, _ in prepared.ownership.relation_oids
+            ]
+        )
 
 
 async def _received_reader_queries(component, importer):
@@ -342,7 +376,7 @@ async def _received_column_read(reader, schema, model):
     return selected
 
 
-async def _received_clone(sessions, importer, schema):
+async def _received_clone(sessions, importer, schema, roles):
     """Use real native COPY and sealed clone validation on the separate Publisher connection."""
     async with sessions() as session, session.begin():
         capture = await archive.capture_reference_family_source(
@@ -350,7 +384,6 @@ async def _received_clone(sessions, importer, schema):
         )
     spec = archive.reference_family_spec(importer)
     async with sessions() as session, session.begin():
-        owner = await archive.protected_publisher_owner(session)
         ownership = await archive.create_model_family_export_clone(
             session, spec, archive.reference_family_stage_schema(uuid4())
         )
@@ -367,28 +400,27 @@ async def _received_clone(sessions, importer, schema):
                 timeout=30,
             )
         await archive.complete_reference_family_restore(session, ownership)
-        await archive.seal_model_family_storage(session, ownership, owner)
+        await archive.seal_model_family_storage(session, ownership, roles=roles)
         validation = await archive.prepare_reference_family_activation(
             session,
             ownership=ownership,
             manifest=capture.manifest,
             package_id="a" * 64,
             profile_contract=archive.reference_family_profile_contract(capture.manifest),
-            sealed_owner_oid=owner,
+            roles=roles,
         )
     return SimpleNamespace(
         ownership=ownership,
         manifest=capture.manifest,
         validation=validation,
-        owner=owner,
         schema=schema,
         cutover=archive.ReferenceFamilyCutoverAuthority(
             "a" * 64,
             archive.reference_family_profile_contract(capture.manifest),
-            owner,
-            owner,
             "manual",
             capture.manifest.source_serving_generation,
+            roles=roles,
+            stage_read_only=True,
         ),
     )
 
@@ -419,64 +451,30 @@ async def _activate_received_clone(sessions, prepared, *, rollback=False):
         return receipt
 
 
-async def _refuse_received_custody(sessions, prepared, physical_owner):
+async def _refuse_received_writes(sessions, prepared, physical_owner):
+    """The sealed clone is read-only: PostgreSQL refuses data writes and ownership changes."""
     async with sessions() as session, session.begin():
         assert not await session.scalar(
             text("SELECT pg_has_role(current_user,:owner,'SET')"), {"owner": physical_owner}
         )
-        incumbent = await archive.capture_reference_family_incumbent(
-            session, importer_id=prepared.manifest.importer_id, schema_name=prepared.schema
-        )
-        activation_by_field = dict(
-            ownership=prepared.ownership,
-            manifest=prepared.manifest,
-            expected_incumbent=incumbent,
-            validation_receipt=prepared.validation,
-            cutover=prepared.cutover,
-        )
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="reference family stage owner differs"):
-            await archive.activate_validated_reference_family_stage(
-                session,
-                **{
-                    **activation_by_field,
-                    "cutover": replace(prepared.cutover, expected_stage_owner_oid=prepared.owner + 1),
-                },
-            )
-        async with session.begin_nested() as changed:
-            await session.execute(
-                text(
-                    f'ALTER TABLE "{prepared.ownership.schema_name}"."{prepared.ownership.relation_oids[0][0]}" OWNER TO CURRENT_USER'
-                )
-            )
-            with pytest.raises(archive.ReferenceFamilyArchiveError, match="reference family stage owner differs"):
-                await archive.activate_validated_reference_family_stage(session, **activation_by_field)
-            await changed.rollback()
-        await _refuse_received_scope_transfer(sessions, session, prepared)
+        relation = f'"{prepared.ownership.schema_name}"."{prepared.ownership.relation_names[0]}"'
+        for statement in (f"DELETE FROM {relation}", f'ALTER TABLE {relation} OWNER TO "{physical_owner}"'):
+            with pytest.raises(DBAPIError) as refused:
+                async with session.begin_nested():
+                    await session.execute(text(statement))
+            assert refused.value.orig.sqlstate == "42501"
 
 
-async def _refuse_received_scope_transfer(sessions, session, prepared):
-    importer = prepared.manifest.importer_id
-    async with archive.protected_reference_family_publication(
-        session, importer_id=importer, schema_name=prepared.schema, expected_owner_oid=prepared.owner
-    ):
-        async with sessions() as other, other.begin():
-            with pytest.raises(RuntimeError, match="protected_scope_changed"):
-                await immutable._archive_writer(other, importer, prepared.schema)
-        with pytest.raises(RuntimeError, match="protected_scope_changed"):
-            await asyncio.create_task(immutable._archive_writer(session, importer, prepared.schema))
-        with pytest.raises(ValueError, match="publisher_connection_required"):
-            await immutable._writer(session)
-
-
-async def _restore_received_clone(sessions, first, second, retained_schema, *, rollback=False):
+async def _restore_received_clone(sessions, first, second, retained_schema, roles, *, rollback=False):
     """Exercise the same locked native predecessor/adoption pair used by retained restore."""
     importer, spec = first.manifest.importer_id, archive.reference_family_spec(first.manifest.importer_id)
     async with sessions() as session, session.begin():
         async with archive.protected_reference_family_publication(
-            session, importer_id=importer, schema_name=first.schema, expected_owner_oid=first.owner
+            session, importer_id=importer, schema_name=first.schema, roles=roles
         ):
-            await archive._lock_family(session, first.schema, spec.archive_names, "ACCESS EXCLUSIVE")
-            await archive._lock_family(session, retained_schema, spec.archive_names, "ACCESS EXCLUSIVE")
+            # Frozen families keep SELECT only, so they are read-locked as validated activation does.
+            await archive._lock_family(session, first.schema, spec.archive_names, "ACCESS SHARE")
+            await archive._lock_family(session, retained_schema, spec.archive_names, "ACCESS SHARE")
             incumbent = await archive.capture_reference_family_incumbent(
                 session, importer_id=importer, schema_name=first.schema
             )
@@ -493,7 +491,7 @@ async def _restore_received_clone(sessions, first, second, retained_schema, *, r
                     first.manifest,
                     incumbent,
                     first.manifest.source_serving_generation,
-                    tuple((name, dict(first.ownership.relation_oids)[name]) for name in spec.table_names),
+                    tuple((name, None) for name in spec.table_names),
                     predecessor,
                     **arguments,
                 )
@@ -516,17 +514,7 @@ async def _received_geo_cut(session, prepared, schema):
         return {}
     from process.geo_source_storage import capture_geo_retained_cut
 
-    oid = dict(prepared.ownership.relation_oids)["geo_zip_lookup"]
-    filenode = await session.scalar(text("SELECT pg_relation_filenode(CAST(:oid AS oid))::bigint"), {"oid": oid})
-    return {
-        "geo_retained_cut": await capture_geo_retained_cut(
-            session,
-            schema_name=schema,
-            expected_relation_oid=oid,
-            expected_relfilenode=filenode,
-            manifest=prepared.manifest,
-        )
-    }
+    return {"geo_retained_cut": await capture_geo_retained_cut(session, schema_name=schema, manifest=prepared.manifest)}
 
 
 async def _export_received_clone(sessions, prepared):

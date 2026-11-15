@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from process import provider_directory_generic_source_policy as policy_module
 from process import provider_directory_source_acquisition_custody as acquisition
 from process import provider_directory_source_cohort_custody as custody
 
@@ -270,23 +269,6 @@ def test_history_bound_rejects_extra_id_and_unconditional_expression():
     entry_by_field["catalog"]["constraints"][0]["constraint_definition"] = "CHECK (true)"
     with pytest.raises(ValueError, match="history_scope_changed"):
         custody._require_scope_check(entry_by_field, [first, second])
-
-
-@pytest.mark.asyncio
-async def test_factory_facade_requires_exact_original_connection_and_policy(monkeypatch):
-    connection, policy = object(), object()
-    capture = AsyncMock(return_value={"namespace_roles": ("migration", "namespace")})
-    monkeypatch.setattr(policy_module, "bound_publisher", lambda: SimpleNamespace(connection=connection, policy=policy))
-    token = policy_module._FACTORY.set(SimpleNamespace(cohort_snapshot_custody=capture))
-    try:
-        assert await policy_module.source_cohort_snapshot_custody(connection, policy, cohort_id="selected") == {
-            "namespace_roles": ("migration", "namespace")
-        }
-        capture.assert_awaited_once_with(connection, policy, cohort_id="selected")
-        with pytest.raises(ValueError, match="cohort_original_publisher_required"):
-            await policy_module.source_cohort_snapshot_custody(object(), policy)
-    finally:
-        policy_module._FACTORY.reset(token)
 
 
 @pytest.mark.asyncio

@@ -206,6 +206,7 @@ async def test_complete_profile_before_changes_and_after_retirement_rolls_back_o
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
         transaction=transaction,
+        fetchval=AsyncMock(return_value=False),
         fetchrow=AsyncMock(return_value={"session": "admin", "current": "admin"}),
         fetch=AsyncMock(return_value=family_rows),
         execute=AsyncMock(),
@@ -409,7 +410,7 @@ def test_source_release_fixed_contract_closes_complete_retiring_overload_set():
     from process import provider_directory_generic_source_release_checks as checks
 
     assert set(provision._RETIRED_FUNCTIONS) <= checks._LEGACY_FUNCTIONS.keys()
-    assert len(checks._LEGACY_FUNCTIONS) == 17
+    assert len(checks._LEGACY_FUNCTIONS) == 16
     assert all(len(spec[-1]) == 64 for spec in checks._LEGACY_FUNCTIONS.values())
     assert "MAINTAIN" in checks._WRITE_REACH
     assert "USAGE,UPDATE" in checks._SEQUENCE_REACH
@@ -617,6 +618,8 @@ def test_source_release_specs_match_real_templates(monkeypatch):
             "SECURITY DEFINER" in options,
             _body_digest(body, "snapshot_schema"),
         )
+    retired = actual.pop("guard_pd_dataset_migration_owner()")
+    assert retired[-1] == "1961869026eea7109133e616c27af2d5017db3288646dfc331d9d948d640c2d8"
     assert actual == checks._LEGACY_FUNCTIONS
     from process import provider_directory_source_callable_custody as custody
     from tests.test_provider_directory_source_callable_custody import _entry

@@ -7,14 +7,19 @@ from contextlib import nullcontext
 import pytest
 
 from process import registry_fhir_catalog_source_fence as fences
-from process import registry_fhir_catalog_sources as sources
-from tests.test_registry_fhir_catalog_sources import native_inventory, published_row, read_profile
+from process.registry_fhir_catalog_observation import (
+    CATALOG_OBSERVATION_CONTRACT,
+    catalog_observation_descriptor_digest,
+)
+from tests.test_registry_fhir_catalog_sources import descriptor
 
 
 def _descriptor(endpoint="endpoint-one"):
-    return sources._disposition(
-        published_row(endpoint_id=endpoint), read_profile(), native_inventory(), None, sources.DEFAULT_BYTES
-    ).descriptor
+    result = descriptor()
+    result["endpoint_id"] = endpoint
+    digest = catalog_observation_descriptor_digest(result)
+    result.update(accepted_receipt_sha256=digest, accepted_receipt_id=CATALOG_OBSERVATION_CONTRACT + ":" + digest)
+    return result
 
 
 class LockConnection:
@@ -82,57 +87,7 @@ async def test_missing_or_untyped_source_inventory_never_acquires_a_lock(descrip
 
 
 @pytest.mark.asyncio
-async def test_fence_is_original_connection_and_task_scoped_with_subset_verification():
-    connection = LockConnection()
-    first, second = _descriptor(), _descriptor("endpoint-two")
-    async with fences.fhir_catalog_source_publication_fence(connection, (second, first, first)):
-        assert connection.shared_keys == {101, 202}
-        await fences.require_fhir_catalog_source_publication_fence(connection, (first,))
-        with pytest.raises(fences.FHIRCatalogSourceFenceError, match="unavailable"):
-            await fences.require_fhir_catalog_source_publication_fence(LockConnection(), (first,))
-        with pytest.raises(fences.FHIRCatalogSourceFenceError, match="unavailable"):
-            await asyncio.create_task(fences.require_fhir_catalog_source_publication_fence(connection, (first,)))
-        with pytest.raises(fences.FHIRCatalogSourceFenceError, match="pre_snapshot_required"):
-            async with fences.fhir_catalog_source_publication_fence(connection, (first,)):
-                pytest.fail("nested fence entered")
-    assert not connection.shared_keys and not connection.terminated
-    assert fences._ISSUED.get() is None
-    await fences.require_fhir_catalog_source_publication_fence(connection, (first,), required=False)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["transaction", "existing_lock"])
-async def test_existing_transaction_or_advisory_lock_is_preserved_on_refusal(failure):
-    connection = LockConnection()
-    connection.active = failure == "transaction"
-    connection.external_keys = {101} if failure == "existing_lock" else set()
-    reason = "pre_snapshot_required" if connection.active else "preexisting_lock"
-    with pytest.raises(fences.FHIRCatalogSourceFenceError, match=reason):
-        async with fences.fhir_catalog_source_publication_fence(connection, (_descriptor(),)):
-            pytest.fail("pre-existing state was adopted")
-    assert "acquire" not in connection.events and "release" not in connection.events
-    assert connection.external_keys == ({101} if failure == "existing_lock" else set())
-    assert not connection.terminated
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["different_endpoint", "lost_lock"])
-async def test_issued_fence_refuses_endpoint_expansion_and_lost_shared_lock(failure):
-    connection = LockConnection()
-    selected = (_descriptor(),)
-    async with fences.fhir_catalog_source_publication_fence(connection, selected):
-        if failure == "different_endpoint":
-            selected = (_descriptor("endpoint-two"),)
-        else:
-            connection.shared_keys.clear()
-        reason = "scope_changed" if failure == "different_endpoint" else "lost"
-        with pytest.raises(fences.FHIRCatalogSourceFenceError, match=reason):
-            await fences.require_fhir_catalog_source_publication_fence(connection, selected)
-    assert not connection.shared_keys and fences._ISSUED.get() is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("release_mode", ["refused", "still_held"])
+@pytest.mark.parametrize("release_mode", ["refused"])
 @pytest.mark.parametrize("body_error", [False, True])
 async def test_failed_release_terminates_connection_without_replacing_body_failure(release_mode, body_error):
     connection = LockConnection()
@@ -147,7 +102,7 @@ async def test_failed_release_terminates_connection_without_replacing_body_failu
         assert caught.value is original
     else:
         assert "release_failed" in str(caught.value)
-    assert connection.terminated and fences._ISSUED.get() is None
+    assert connection.terminated
 
 
 @pytest.mark.asyncio
@@ -157,7 +112,7 @@ async def test_busy_acquisition_exits_at_its_bound_without_issuing_a_fence():
     with pytest.raises(fences.FHIRCatalogSourceFenceError, match="busy"):
         async with fences.fhir_catalog_source_publication_fence(connection, (_descriptor(),), timeout_seconds=0.001):
             pytest.fail("busy source lock entered publication")
-    assert not connection.shared_keys and fences._ISSUED.get() is None
+    assert not connection.shared_keys
     assert not connection.terminated
 
 

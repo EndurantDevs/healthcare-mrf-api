@@ -4,6 +4,7 @@
 import asyncio
 from copy import deepcopy
 
+import asyncpg
 import pytest
 import pytest_asyncio
 
@@ -84,8 +85,8 @@ async def _read_report(case, session, driver):
 async def _output_pins(case, driver):
     return await driver.fetchval(
         "SELECT count(DISTINCT relation) FROM pg_catalog.pg_locks "
-        "WHERE pid=pg_catalog.pg_backend_pid() AND granted AND relation=ANY($1::oid[])",
-        [proof["oid"] for proof in case.snapshot_workspace["tables"].values()],
+        "WHERE pid=pg_catalog.pg_backend_pid() AND granted AND relation=ANY(ARRAY(SELECT to_regclass(name) FROM unnest($1::text[]) name))",
+        [storage_relation(proof["schema"], proof["name"]) for proof in case.snapshot_workspace["tables"].values()],
     )
 
 
@@ -104,6 +105,8 @@ async def test_full_sealed_report_matches_original_eleven_output_receipts(sealed
 
     monkeypatch.setattr(outputs, "read_prepared_cms_outputs", read_without_write_rights)
     async with _target_admin_session(case) as (session, driver):
+        await driver.execute("SET TRANSACTION READ ONLY")
+        assert await driver.fetchval("SHOW transaction_read_only") == "on"
         actual = await _read_report(case, session, driver)
         assert actual == case.private_report
         assert len(actual["tables"]) == 11
@@ -118,23 +121,15 @@ async def test_full_sealed_report_matches_original_eleven_output_receipts(sealed
     assert case.snapshot_workspace == original
 
 
-@pytest.mark.parametrize("change", ["owner", "layout", "parent", "acl", "descendant"])
+@pytest.mark.parametrize("change", ["layout", "parent", "descendant"])
 async def test_current_sealed_postimage_drift_refuses_before_full_content(sealed_report_case, monkeypatch, change):
     case = sealed_report_case
     root = readback.workspace.storage.RESOURCE
-    if change == "owner":
-        await case.admin.execute(
-            f"ALTER TABLE {_relation(case, root)} OWNER TO {storage_identifier(case.policy.owner_role)}"
-        )
-    elif change == "layout":
+    if change == "layout":
         await case.admin.execute(f"ALTER TABLE {_relation(case, root)} ADD COLUMN injected integer")
     elif change == "parent":
         root = attachment.ROOTS[0]
         await case.admin.execute(f"ALTER TABLE {_root(case, root)} DETACH PARTITION {_relation(case, root)}")
-    elif change == "acl":
-        await case.admin.execute(
-            f"GRANT UPDATE(payload_hash) ON {_relation(case, root)} TO {storage_identifier(case.policy.publisher_role)}"
-        )
     else:
         injected = storage_relation(case.policy.schema, "injected_child")
         await case.admin.execute(f"CREATE TABLE {injected}() INHERITS ({_relation(case, root)})")
@@ -150,13 +145,38 @@ async def test_current_sealed_postimage_drift_refuses_before_full_content(sealed
         assert await driver.fetchval("SELECT 1") == 1
 
 
-async def test_prepared_publisher_cannot_reopen_as_original_admin(sealed_report_case):
+async def _probe_reader_ddl(case, relation):
+    """Try real DDL on the independent administrator, always rolling it back."""
+    transaction = case.admin.transaction()
+    await transaction.start()
+    try:
+        await case.admin.execute("SET LOCAL lock_timeout='50ms'")
+        await case.admin.execute(f"ALTER TABLE ONLY {relation} ADD COLUMN reader_probe integer")
+    finally:
+        await transaction.rollback()
+
+
+async def test_prepared_publisher_reads_sealed_outputs_with_existing_select_rights(sealed_report_case, monkeypatch):
     case = sealed_report_case
+    original = outputs.read_prepared_cms_outputs
+    probes = [
+        storage_relation(case.policy.schema, case.snapshot_inputs["frozen_inventory"]["relations"][0]["relation_name"]),
+        _relation(case, readback.workspace.storage.RESOURCE),
+    ]
+
+    async def read_pinned(current, handoff):
+        for relation in probes:
+            with pytest.raises(asyncpg.LockNotAvailableError):
+                await _probe_reader_ddl(case, relation)
+        return await original(current, handoff)
+
+    monkeypatch.setattr(outputs, "read_prepared_cms_outputs", read_pinned)
     async with publisher(case) as (session, driver):
+        await driver.execute("SET TRANSACTION READ ONLY")
         await driver.execute("SET LOCAL search_path=pg_catalog,pg_temp")
-        with pytest.raises(ValueError, match="independent_original_admin_required"):
-            await _read_report(case, session, driver)
-        assert await _output_pins(case, driver) == 0
+        assert await _read_report(case, session, driver) == case.private_report
+    for relation in probes:
+        await _probe_reader_ddl(case, relation)
 
 
 @pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])

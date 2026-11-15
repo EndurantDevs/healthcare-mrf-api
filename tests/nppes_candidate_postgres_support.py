@@ -8,35 +8,22 @@ from contextvars import ContextVar
 from graphlib import TopologicalSorter
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import uuid4
 
 import pytest
 from sqlalchemy import Index, MetaData, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from db.migration_nppes_evidence_candidates import upgrade_nppes_evidence_candidates
-from db.migration_rooted_publication_freeze import upgrade_rooted_publication_freeze
+from db.plan_release_storage import storage_identifier, storage_relation
 from process import nppes_public_evidence_storage as storage
 from process import provider_directory_generic_source_policy as source
+from process import provider_directory_source_acquisition_custody as acquisition
 from process import provider_directory_source_callable_custody as source_callables
-from process.nppes_public_evidence_control_custody import adopt_nppes_control_custody, attest_nppes_control_custody
-from process.provider_directory_cms_callable_custody import provision_cms_callable_custody
-from process.provider_directory_cms_control_custody import (
-    adopt_cms_control_custody,
-    capture_cms_control_custody,
-    require_cms_control_adoption_delta,
-)
-from process.provider_directory_cms_receipt_custody import (
-    provision_cms_origin_metadata_readers,
-    provision_cms_serving_receipt_custody,
-)
-from process.provider_directory_profile_initial_custody import provision_initial_callable_custody
-from process.provider_directory_source_acquisition_custody import lock_source_control_family
-from process.provider_directory_source_callable_custody import capture_source_callable_custody
-from process.provider_directory_source_namespace_custody import (
-    capture_source_namespace_custody,
-    provision_source_namespace_custody,
-)
+from process import provider_directory_source_cohort_custody as cohort
+from process.nppes_public_evidence_control_custody import adopt_nppes_control_custody
+from process.provider_directory_cms_control_custody import _RIGHTS as control_rights
+from process.provider_directory_cms_control_privileges import grant_cms_origin_metadata_read_privileges
+from process.provider_directory_cms_receipt_custody import provision_cms_serving_receipt_custody
 from tests.cms_npd_admission_postgres_support import (
     _owned_database,
     _provision_cms_epoch_controls,
@@ -44,6 +31,7 @@ from tests.cms_npd_admission_postgres_support import (
 )
 from tests.formulary_fhir_twin_admission_pg_support import load_migration, run_migration
 from tests.provider_directory_source_postgres_support import (
+    _named_component_generations,
     native_source_component,
     provision_source_component,
     source_component_migrations,
@@ -117,7 +105,7 @@ def nppes_source_component_migrations():
 
 
 def nppes_source_component_migration_stages():
-    """Install canonical primitives before typed-call repairs and genuine custody."""
+    """Install canonical primitives before typed-call repairs and native control DCL."""
     prefixes = nppes_source_component_migrations()
     boundary = prefixes.index("20261016040000")
     return prefixes[:boundary], prefixes[boundary:]
@@ -225,81 +213,6 @@ async def install_nppes_enumeration_storage(engine, policy):
     await run_migration(engine, migration, "install")
 
 
-async def capture_source_legacy_callable_custody(connection, policy, *, migration_role, namespace_owner_role):
-    """Keep the production proof intact and identify exact ACL refusals read-only."""
-    try:
-        return await capture_source_callable_custody(
-            connection,
-            policy,
-            legacy=True,
-            migration_role=migration_role,
-            namespace_owner_role=namespace_owner_role,
-        )
-    except ValueError as error:
-        if str(error) != "source_callable_acl_changed":
-            raise
-        roles_by_name = {
-            callable_row["rolname"]: callable_row["oid"]
-            for callable_row in await connection.fetch(
-                "SELECT rolname,oid::bigint AS oid FROM pg_roles WHERE rolname=ANY($1::text[])",
-                [policy.owner_role, policy.control_runtime_roles[0], namespace_owner_role],
-            )
-        }
-        roles_by_oid = dict(
-            owner=roles_by_name[policy.owner_role],
-            builder=roles_by_name[policy.control_runtime_roles[0]],
-            namespace_owner=roles_by_name[namespace_owner_role],
-        )
-        callable_rows = await connection.fetch(
-            source_callables._FUNCTION_SQL,
-            list(source_callables.source_callable_signatures(policy.schema)),
-            policy.schema,
-            list(source_callables.SOURCE_CALLABLE_NAMES),
-            list(policy.runtime_roles),
-        )
-        failures = []
-        for callable_row in callable_rows:
-            acl_by_field = dict(
-                definition=source_callables._decoded(callable_row["definition"]),
-                acl=source_callables._decoded(callable_row["acl"]),
-            )
-            try:
-                source_callables._require_acl(acl_by_field, roles_by_oid, legacy=True)
-            except ValueError as refusal:
-                failures.append(
-                    dict(signature=callable_row["signature"], acl=acl_by_field["acl"], refusal=str(refusal))
-                )
-        raise ValueError("native_source_legacy_acl_refused " + json.dumps(failures, sort_keys=True)) from error
-
-
-async def assert_source_callable_census(connection, policy):
-    """Explain absent or extra native overloads before the full exact-body proof."""
-    expected = await connection.fetch(
-        "SELECT signature,to_regprocedure(signature)::oid::bigint AS oid FROM unnest($1::text[]) f(signature)",
-        list(source_callables.source_callable_signatures(policy.schema)),
-    )
-    actual = await connection.fetch(
-        "SELECT p.oid::bigint AS oid,p.proname AS name,pg_get_function_identity_arguments(p.oid) AS arguments "
-        "FROM pg_proc p WHERE p.pronamespace=to_regnamespace($1) AND p.proname=ANY($2::text[]) ORDER BY p.oid",
-        policy.schema,
-        list(source_callables.SOURCE_CALLABLE_NAMES),
-    )
-    expected_oids = {record["oid"] for record in expected if record["oid"] is not None}
-    missing_entries = [record["signature"] for record in expected if record["oid"] is None]
-    unexpected_entries = [dict(record) for record in actual if record["oid"] not in expected_oids]
-    assert not missing_entries and not unexpected_entries and len(actual) == len(expected) == len(expected_oids), (
-        json.dumps(
-            dict(
-                missing_signatures=missing_entries,
-                unexpected_overloads=unexpected_entries,
-                expected_count=len(expected),
-                actual_count=len(actual),
-            ),
-            sort_keys=True,
-        )
-    )
-
-
 def candidate_component(schema):
     component = _COMPONENT.get()
     assert component is not None and component.policy.schema == schema
@@ -343,53 +256,80 @@ async def _provision_component_receipt(driver, policy, migrator, metadata_read_r
     )
 
 
-async def _enroll_native_custody(component, namespace, migrator, *, native_inputs=False, metadata_read_roles=()):
-    """Preserve Source custody before granting explicitly declared metadata access."""
+async def _adopt_acquisition_family(driver, policy):
+    """Stand in for the operator's one-time adoption: the Source owner owns the acquisition family
+    with full rights, and the builder keeps only its fixed writer rights."""
+    owner, builder = storage_identifier(policy.owner_role), storage_identifier(policy.control_runtime_roles[0])
+    members = [(root, root, False) for root in (*acquisition.ACQUISITION_ROOTS, *acquisition.METADATA_ROOTS)]
+    members += [(root + "_legacy", root, True) for root in acquisition.BULK_ROOTS]
+    for name, root, history in members:
+        table = storage_relation(policy.schema, name)
+        columns = await driver.fetch(
+            "SELECT attname FROM pg_attribute WHERE attrelid=to_regclass($1) AND attnum>0 AND NOT attisdropped "
+            "ORDER BY attnum",
+            table,
+        )
+        if not columns:
+            continue
+        await driver.execute(f"ALTER TABLE {table} OWNER TO {owner}")
+        await driver.execute(f"REVOKE ALL ON TABLE {table} FROM {builder}")
+        await driver.execute(f"GRANT {','.join(sorted(control_rights))} ON TABLE {table} TO {owner}")
+        table_rights, column_rights = acquisition._writer_rights(
+            root, [column["attname"] for column in columns], history=history
+        )
+        if table_rights:
+            await driver.execute(f"GRANT {','.join(sorted(table_rights))} ON TABLE {table} TO {builder}")
+        for right, names in column_rights.items():
+            selected = ",".join(storage_identifier(column) for column in names)
+            await driver.execute(f"GRANT {right}({selected}) ON TABLE {table} TO {builder}")
+    for signature in source_callables.source_callable_signatures(policy.schema):
+        # Source callables, including the definer guards, run as the Source owner; the builder may execute them.
+        if await driver.fetchval("SELECT to_regprocedure($1)", signature) is not None:
+            # The shared Reference counter keeps its migration actor and mutable-ledger rights.
+            if signature != storage_relation(policy.schema, "advance_reference_source_generation") + "()":
+                await driver.execute(f"ALTER FUNCTION {signature} OWNER TO {owner}")
+            await driver.execute(f"GRANT EXECUTE ON FUNCTION {signature} TO {builder}")
+    await _retire_cohort_intake_guards(driver, policy)
+
+
+async def _retire_cohort_intake_guards(driver, policy):
+    """The adoption retired the replaced bulk cohort checks; the header guard keeps refusing UPDATE and DELETE."""
+    history = storage_relation(policy.schema, cohort.HISTORY)
+    header = storage_relation(policy.schema, cohort.HEADER)
+    hooks = tuple(cohort._history_hooks(True))
+    legacy = await driver.fetchval(
+        "SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=to_regclass($1) AND tgname=$2)", history, hooks[-1]
+    )
+    if not legacy:
+        return
+    for name in hooks:
+        await driver.execute(f"DROP TRIGGER {storage_identifier(name)} ON {history}")
+    await driver.execute(f"ALTER TABLE {history} DROP CONSTRAINT pd_uhc_flex_npi_member_cohort_fkey")
+    await driver.execute(f"DROP TRIGGER pd_uhc_flex_npi_cohort_guard ON {header}")
+    await driver.execute(
+        f"CREATE TRIGGER pd_uhc_flex_npi_cohort_guard BEFORE UPDATE OR DELETE ON {header} FOR EACH ROW "
+        f"EXECUTE FUNCTION {storage_relation(policy.schema, cohort._HEADER_GUARD)}()"
+    )
+    await driver.execute(f"ALTER TABLE {header} ENABLE ALWAYS TRIGGER pd_uhc_flex_npi_cohort_guard")
+
+
+async def _provision_native_controls(component, *, native_inputs=False, metadata_read_roles=()):
+    """Use configured PostgreSQL roles and preserve native NPPES data validation."""
     policy = component.policy
-    async with component.admin_engine.begin() as connection:
-        await connection.execute(
-            text(f'CREATE ROLE "{namespace}" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS')
-        )
-        await connection.execute(
-            text(f'CREATE ROLE "{migrator}" LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS')
-        )
-        await connection.execute(
-            text(f'GRANT "{policy.owner_role}","{namespace}" TO "{migrator}" WITH INHERIT TRUE, SET TRUE, ADMIN FALSE')
-        )
-        await connection.execute(text(f'REVOKE "{policy.owner_role}" FROM "{component.retained_publisher}"'))
-        await connection.execute(text(f'ALTER SCHEMA "{policy.schema}" OWNER TO "{namespace}"'))
-        await connection.execute(text(f'GRANT USAGE ON SCHEMA "{policy.schema}" TO "{policy.owner_role}"'))
     await _provision_cms_epoch_controls(component)
     async with component.admin_engine.begin() as connection:
-        await connection.execute(text("SELECT current_user=session_user"))
+        await connection.execute(text("SELECT 1"))
         driver = (await connection.get_raw_connection()).driver_connection
-        await provision_cms_callable_custody(driver, policy, verify_role_profile=verify_native_source_profile)
-        await _provision_component_receipt(driver, policy, migrator, metadata_read_roles)
-        await provision_initial_callable_custody(driver, policy, verify_role_profile=verify_native_source_profile)
-        await provision_source_namespace_custody(
-            driver, policy, namespace_owner_role=namespace, verify_role_profile=verify_native_source_profile
+        await _adopt_acquisition_family(driver, policy)
+        await adopt_nppes_control_custody(
+            driver,
+            policy.schema,
+            policy,
+            migration_role=policy.control_runtime_roles[0],
+            namespace_owner_role=policy.owner_role,
         )
-        await capture_source_namespace_custody(driver, policy, namespace_owner_role=namespace)
-        arguments_by_key = dict(migration_role=migrator, namespace_owner_role=namespace)
-        await assert_source_callable_census(driver, policy)
-        await capture_source_legacy_callable_custody(driver, policy, **arguments_by_key)
-        await lock_source_control_family(driver, policy)
-        before = await capture_cms_control_custody(driver, policy, legacy=True, **arguments_by_key)
-        expected_checks = await adopt_cms_control_custody(driver, policy, before)
-        after = await capture_cms_control_custody(driver, policy, **arguments_by_key)
-        require_cms_control_adoption_delta(before, after, expected_checks)
-        await adopt_nppes_control_custody(driver, policy.schema, policy, **arguments_by_key)
-        await attest_nppes_control_custody(driver, policy.schema, policy, **arguments_by_key)
         if metadata_read_roles:
-            await provision_cms_origin_metadata_readers(
-                driver,
-                policy,
-                migration_role=migrator,
-                metadata_read_roles=metadata_read_roles,
-                verify_role_profile=verify_native_source_profile,
-            )
-    component.factory.migration_role = migrator
-    component.factory.namespace_owner_role = namespace
+            await grant_cms_origin_metadata_read_privileges(driver, policy, metadata_read_roles=metadata_read_roles)
     if native_inputs:
         assert component.factory._native_input_producer is not None
         component.factory._require_current_policy()
@@ -424,16 +364,6 @@ async def _install_nppes_historical_storage(engine, url, component, migrations):
             await connection.execute(text(f'REVOKE CREATE ON DATABASE "{url.database}" FROM "{component.builder}"'))
 
 
-async def _drop_nppes_component_roles(engine, roles):
-    async with engine.begin() as connection:
-        administrator = await connection.scalar(text("SELECT session_user"))
-        for role in roles:
-            if await connection.scalar(text("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=:role)"), {"role": role}):
-                await connection.execute(text(f'REASSIGN OWNED BY "{role}" TO "{administrator}"'))
-                await connection.execute(text(f'DROP OWNED BY "{role}"'))
-                await connection.execute(text(f'DROP ROLE "{role}"'))
-
-
 async def _install_nppes_publication(engine):
     from tests.npi_canonical_publication_postgres_support import CANONICAL_TABLES, load_publication_migration
 
@@ -451,24 +381,15 @@ async def _install_nppes_publication(engine):
 
 @asynccontextmanager
 async def existing_nppes_component(component):
-    """Borrow a caller-owned component only after its complete native NPPES attestation."""
+    """Borrow the caller's configured Source scope with its actual native data catalog."""
+    from process.nppes_public_evidence_catalog import assert_nppes_candidate_catalog
+
     factory = component.factory
-    namespace = getattr(factory, "namespace_owner_role", None)
-    migrator = getattr(factory, "migration_role", None)
-    if not isinstance(namespace, str) or not isinstance(migrator, str):
-        raise RuntimeError("caller_owned_nppes_enrollment_required")
-    assert _COMPONENT.get() is None
-    assert source._FACTORY.get() is factory and factory.policy is component.policy
-    assert factory.database is component.database
+    assert _COMPONENT.get() is None and source._FACTORY.get() is factory
+    factory._require_current_policy()
     async with source.source_transaction(component.database):
-        publisher = source.bound_publisher()
-        assert publisher.factory is factory and publisher.policy is component.policy
-        await attest_nppes_control_custody(
-            publisher.connection,
-            component.policy.schema,
-            component.policy,
-            migration_role=migrator,
-            namespace_owner_role=namespace,
+        await assert_nppes_candidate_catalog(
+            source.bound_publisher().connection, component.policy.schema, component.policy
         )
     token = _COMPONENT.set(component)
     try:
@@ -477,24 +398,25 @@ async def existing_nppes_component(component):
         _COMPONENT.reset(token)
 
 
-async def _prepare_nppes_component(component, url, namespace, migrator, publication):
-    """Keep the original bootstrap and custody sequence before exposing component authority."""
+async def _prepare_nppes_component(component, url, publication):
+    """Bootstrap real storage and configured DCL before exposing the native component."""
     engine = component.admin_engine
     before_canonical, after_canonical = nppes_source_component_migration_stages()
     await _bootstrap_nppes_parent_component(engine, component.policy, before_canonical)
     await _install_nppes_historical_storage(engine, url, component, after_canonical)
+    async with engine.begin() as connection:
+        await connection.run_sync(_named_component_generations, component.policy.schema)
     await provision_source_component(engine, component.policy)
     async with engine.begin() as connection:
         await connection.run_sync(lambda sync: upgrade_nppes_evidence_candidates(sync, "mrf"))
-        await connection.run_sync(lambda sync: upgrade_rooted_publication_freeze(sync, "mrf"))
-    await _enroll_native_custody(component, namespace, migrator)
+    await _provision_native_controls(component)
     return await _install_nppes_publication(engine) if publication else None
 
 
 @asynccontextmanager
-async def _ready_nppes_component(engine, url, settings, namespace, migrator, publication):
+async def _ready_nppes_component(engine, url, settings, publication):
     async with native_source_component(engine, "mrf", settings, legacy_builder=True) as component:
-        migration = await _prepare_nppes_component(component, url, namespace, migrator, publication)
+        migration = await _prepare_nppes_component(component, url, publication)
         token = _COMPONENT.set(component)
         try:
             yield migration
@@ -504,20 +426,15 @@ async def _ready_nppes_component(engine, url, settings, namespace, migrator, pub
 
 @asynccontextmanager
 async def composed_nppes_component(component, *, migration_prefixes=None):
-    """Enroll the caller's real model family before its first consumer custody capture."""
+    """Prepare the caller's real model family and configured native control permissions."""
     if migration_prefixes is not None:
         from tests.cms_registry_complete_publication_postgres_support import source_component_native_migrations
 
         if type(migration_prefixes) is not tuple or migration_prefixes != source_component_native_migrations():
             raise RuntimeError("caller_owned_nppes_migration_profile_required")
     engine, policy = component.admin_engine, component.policy
-    namespace, migrator = "nppes_namespace_" + uuid4().hex[:16], "nppes_migrator_" + uuid4().hex[:16]
     assert _COMPONENT.get() is None and source._FACTORY.get() is component.factory
-    assert not hasattr(component.factory, "migration_role")
-    assert not hasattr(component.factory, "namespace_owner_role")
     borrowed_attributes = (
-        "migration_role",
-        "namespace_owner_role",
         "producer_identity",
         "_native_input_producer",
         "native_tiger_input_fence",
@@ -537,11 +454,9 @@ async def composed_nppes_component(component, *, migration_prefixes=None):
             await _install_nppes_historical_storage(engine, engine.url, component, missing_prefixes)
         async with engine.begin() as connection:
             await connection.run_sync(lambda sync: upgrade_nppes_evidence_candidates(sync, policy.schema))
-            if migration_prefixes is None or "20260909120000" in migration_prefixes:
-                await connection.run_sync(lambda sync: upgrade_rooted_publication_freeze(sync, policy.schema))
         if migration_prefixes is None:
             await _install_existing_npi_publication(engine, policy.schema)
-        await _enroll_native_custody(component, namespace, migrator, native_inputs=True)
+        await _provision_native_controls(component, native_inputs=True)
         async with existing_nppes_component(component):
             yield component
     finally:
@@ -550,7 +465,6 @@ async def composed_nppes_component(component, *, migration_prefixes=None):
                 setattr(component.factory, name, prior_value_by_name[name])
             elif hasattr(component.factory, name):
                 delattr(component.factory, name)
-        await _drop_nppes_component_roles(engine, (migrator, namespace))
 
 
 async def _install_existing_npi_publication(engine, schema):
@@ -568,20 +482,18 @@ async def _install_existing_npi_publication(engine, schema):
 
 @asynccontextmanager
 async def nppes_candidate_schema(*, publication=False):
-    """Construct real migration/callable/namespace custody; no runtime-image claim."""
+    """Construct the native migration, data-validation and PostgreSQL permission fixture."""
     async with _owned_database(database_url()) as (url, _admin):
         engine = create_async_engine(url.set(drivername="postgresql+asyncpg"))
-        namespace, migrator = "nppes_namespace_" + uuid4().hex[:16], "nppes_migrator_" + uuid4().hex[:16]
         try:
             with pytest.MonkeyPatch.context() as settings:
                 settings.setenv("HLTHPRT_DB_SCHEMA", "mrf")
                 settings.setenv("DB_SCHEMA", "mrf")
                 async with engine.begin() as connection:
                     await connection.execute(text('CREATE SCHEMA "mrf"'))
-                async with _ready_nppes_component(engine, url, settings, namespace, migrator, publication) as migration:
+                async with _ready_nppes_component(engine, url, settings, publication) as migration:
                     yield engine, url, "mrf", migration
         finally:
-            await _drop_nppes_component_roles(engine, (migrator, namespace))
             await engine.dispose()
 
 

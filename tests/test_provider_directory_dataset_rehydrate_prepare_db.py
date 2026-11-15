@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Actual fixed-output custody/COPY mechanics with genuine native component roles."""
+"""Actual named output/COPY mechanics with genuine native component roles."""
 
 import asyncio
 import os
@@ -85,24 +85,32 @@ async def _case(monkeypatch, count=3, resources=("Location",)):
             yield case
 
 
+async def output_rows(case, schema, relation):
+    """Read complete deterministically ordered output content by its declared QName."""
+    return await case.admin.all(
+        f'SELECT to_jsonb(output) FROM "{schema}"."{relation}" AS output ORDER BY to_jsonb(output)::text'
+    )
+
+
 async def test_native_prepares_verified_outputs_and_replays_exact_private_stages(monkeypatch):
     async with _case(monkeypatch) as case:
+        incumbent_rows_by_target = {
+            target: await output_rows(case, case.schema, target)
+            for target in preparation._targets(fhir, case.operation["resource_types"])
+        }
         async with preparation.prepared_compatibility_outputs(
             fhir, case.pinned, case.operation, checkpoint_journal=case.journal
         ) as prepared:
             assert len(prepared.stages) == len(prepared.receipts) == 3
             names = [stage.relation for stage in prepared.stages]
             for stage, receipt in zip(prepared.stages, prepared.receipts, strict=True):
-                assert receipt.incumbent.oid == stage.incumbent.oid
-                assert receipt.successor.oid == stage.oid
-                assert (
-                    await case.admin.scalar("SELECT to_regclass(:r)::oid", r=f"{case.schema}.{stage.target}")
-                    == stage.incumbent.oid
-                )
+                assert receipt.incumbent == stage.incumbent
+                assert (receipt.successor.schema, receipt.successor.relation) == (stage.schema, stage.relation)
+                assert await output_rows(case, case.schema, stage.target) == incumbent_rows_by_target[stage.target]
                 assert await case.admin.scalar(f'SELECT count(*) FROM "{case.schema}"."{stage.relation}"') == 5
-            async with source_transaction(case.database, isolation="read committed"):
+            async with case.admin.transaction():
                 for target in prepared.targets:
-                    await case.database.status(f'LOCK TABLE "{case.schema}"."{target}" IN ACCESS EXCLUSIVE MODE NOWAIT')
+                    await case.admin.status(f'LOCK TABLE "{case.schema}"."{target}" IN ACCESS EXCLUSIVE MODE NOWAIT')
             assert await case.pinned.reader.scalar("SELECT 1") == 1
         for name in names:
             assert await case.admin.scalar("SELECT to_regclass(:r)", r=f"{case.schema}.{name}") is not None
@@ -117,6 +125,12 @@ async def test_native_prepared_outputs_join_actual_retained_cut_and_rollback(mon
         async with preparation.prepared_compatibility_outputs(
             fhir, case.pinned, case.operation, checkpoint_journal=case.journal
         ) as prepared:
+            prior_rows_by_target = {
+                stage.target: await output_rows(case, stage.schema, stage.target) for stage in prepared.stages
+            }
+            candidate_rows_by_target = {
+                stage.target: await output_rows(case, stage.schema, stage.relation) for stage in prepared.stages
+            }
             async with custody.output_snapshot_transaction(
                 fhir, operation=case.operation, targets=prepared.targets
             ) as capability:
@@ -126,18 +140,16 @@ async def test_native_prepared_outputs_join_actual_retained_cut_and_rollback(mon
                 await capability.connection.execute(
                     "LOCK TABLE "
                     + ",".join(storage_relation(case.schema, name) for name in relations)
-                    + " IN ACCESS EXCLUSIVE MODE NOWAIT"
+                    + " IN ACCESS SHARE MODE NOWAIT"
                 )
                 retained = await retention.retain_prepared_outputs(capability, prepared.receipts)
             for receipt in retained:
+                assert (receipt.incumbent.schema, receipt.incumbent.relation) == (case.schema, receipt.retained_name)
+                assert (receipt.successor.schema, receipt.successor.relation) == (case.schema, receipt.target)
                 assert (
-                    await case.admin.scalar("SELECT to_regclass(:r)::oid", r=f"{case.schema}.{receipt.retained_name}")
-                    == receipt.old_oid
+                    await output_rows(case, case.schema, receipt.retained_name) == prior_rows_by_target[receipt.target]
                 )
-                assert (
-                    await case.admin.scalar("SELECT to_regclass(:r)::oid", r=f"{case.schema}.{receipt.target}")
-                    == receipt.new_oid
-                )
+                assert await output_rows(case, case.schema, receipt.target) == candidate_rows_by_target[receipt.target]
             rollback_by_field = {**case.operation, "kind": "rollback", "rollback_of": retained[0].operation_digest}
             async with custody.output_snapshot_transaction(
                 fhir, operation=rollback_by_field, targets=prepared.targets
@@ -146,10 +158,15 @@ async def test_native_prepared_outputs_join_actual_retained_cut_and_rollback(mon
                 await capability.connection.execute(
                     "LOCK TABLE "
                     + ",".join(storage_relation(case.schema, name) for name in names)
-                    + " IN ACCESS EXCLUSIVE MODE NOWAIT"
+                    + " IN ACCESS SHARE MODE NOWAIT"
                 )
                 restored = await retention.restore_retained_outputs(capability, retained)
-            assert all(receipt.new_oid == forward.old_oid for receipt, forward in zip(restored, retained, strict=True))
+            for receipt in restored:
+                assert await output_rows(case, case.schema, receipt.target) == prior_rows_by_target[receipt.target]
+                assert (
+                    await output_rows(case, case.schema, receipt.retained_name)
+                    == candidate_rows_by_target[receipt.target]
+                )
 
 
 async def test_native_cancellation_after_preparation_retains_exact_resume_without_cut(monkeypatch):
@@ -209,8 +226,9 @@ async def test_native_committed_copy_and_journal_resume_without_remint_or_duplic
             entries_by_target = snapshot.journal["active"]["stages"]
             assert len(entries_by_target) == 3
             assert sorted(entry["rows"] for entry in entries_by_target.values()) == [0, 0, 512]
-            original_ids_by_target = {
-                target_name: entry["stage"]["oid"] for target_name, entry in entries_by_target.items()
+            original_names_by_target = {
+                target_name: (entry["stage"]["schema"], entry["stage"]["relation"])
+                for target_name, entry in entries_by_target.items()
             }
             for entry in entries_by_target.values():
                 stage = entry["stage"]
@@ -222,7 +240,9 @@ async def test_native_committed_copy_and_journal_resume_without_remint_or_duplic
         async with preparation.prepared_compatibility_outputs(
             fhir, case.pinned, case.operation, checkpoint_journal=case.journal
         ) as resumed:
-            assert {stage.target: stage.oid for stage in resumed.stages} == original_ids_by_target
+            assert {
+                stage.target: (stage.schema, stage.relation) for stage in resumed.stages
+            } == original_names_by_target
             for stage in resumed.stages:
                 assert await case.admin.scalar(f'SELECT count(*) FROM "{stage.schema}"."{stage.relation}"') == 515
 
@@ -256,8 +276,8 @@ async def test_native_copy_rolls_back_when_matching_journal_write_fails(monkeypa
         async with preparation.prepared_compatibility_outputs(
             fhir, case.pinned, case.operation, checkpoint_journal=case.journal
         ) as resumed:
-            assert {stage.oid for stage in resumed.stages} == {
-                entry["stage"]["oid"] for entry in entries_by_target.values()
+            assert {(stage.schema, stage.relation) for stage in resumed.stages} == {
+                (entry["stage"]["schema"], entry["stage"]["relation"]) for entry in entries_by_target.values()
             }
 
 
@@ -273,6 +293,9 @@ async def test_native_resource_group_prepares_shared_outputs_once_and_rejects_me
             assert len(set(prepared.targets)) == 4
             assert prepared.targets.count("provider_directory_canonical_resource") == 1
             assert prepared.targets.count("provider_directory_source_resource") == 1
+        prepared_rows_by_name = {
+            stage.relation: await output_rows(case, stage.schema, stage.relation) for stage in prepared.stages
+        }
         async with checkpoint_output_transaction(case.journal) as (_, snapshot):
             assert len(snapshot.rows) == 2
             generation = snapshot.journal["generations"][prepared.receipts[0].operation_digest]
@@ -291,7 +314,4 @@ async def test_native_resource_group_prepares_shared_outputs_once_and_rejects_me
             ):
                 pytest.fail("disagreeing group receipts were accepted")
         for stage in prepared.stages:
-            assert (
-                await case.admin.scalar("SELECT to_regclass(:name)::oid", name=f"{stage.schema}.{stage.relation}")
-                == stage.oid
-            )
+            assert await output_rows(case, stage.schema, stage.relation) == prepared_rows_by_name[stage.relation]

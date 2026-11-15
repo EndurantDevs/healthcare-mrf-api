@@ -5,21 +5,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from process import provider_directory_profile_capacity as capacity
 from process.provider_directory_profile_capacity_trust import (
     CAPACITY_TRUST_CONTRACT_ID,
 )
 
-CAPACITY_LIMITS_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-capacity-limits.v2"
-)
-CAPACITY_LIMITS_ENV = (
-    "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CAPACITY_LIMITS_JSON"
-)
-CAPACITY_TRUST_ENV = (
-    "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CAPACITY_TRUST_JSON"
-)
+CAPACITY_LIMITS_CONTRACT_ID = "healthporta.provider-directory-profile-capacity-limits.v2"
+CAPACITY_LIMITS_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CAPACITY_LIMITS_JSON"
+CAPACITY_TRUST_ENV = "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_CAPACITY_TRUST_JSON"
 
 _RELATION_NAMES = (
     "artifact_scope",
@@ -70,16 +65,9 @@ _TRUST_FIELDS = frozenset(
         "attestor_id",
         "active_key_id",
         "keys",
-        "database_system_identifier",
-        "database_oid",
-        "database_name",
-        "tablespaces",
-        "volumes",
     }
 )
-_TRUST_TABLESPACE_FIELDS = frozenset(
-    {"tablespace_name", "tablespace_oid", "usage", "volume_digest"}
-)
+_TRUST_TABLESPACE_FIELDS = frozenset({"tablespace_name", "tablespace_oid", "usage", "volume_digest"})
 _TRUST_VOLUME_FIELDS = frozenset({"volume_class", "volume_digest"})
 _TRUST_KEY_FIELDS = frozenset(
     {
@@ -136,13 +124,7 @@ class ProviderDirectoryProfileCapacityGeometryInputs:
     current_context_vector_hash: str
     desired_context_vector_hash: str
     sql_contract_digest: str
-    database_system_identifier: str
-    database_oid: int
-    database_name: str
-    tablespace_oid: int
-    tablespace_name: str
-    evidence_target_oid: int
-    profile_target_oid: int
+    relations: dict[str, dict[str, Any]]
     postgres_server_version_num: int
     postgres_block_size_bytes: int
     postgres_wal_block_size_bytes: int
@@ -155,18 +137,6 @@ class ProviderDirectoryProfileCapacityGeometryInputs:
     postgres_default_toast_compression: str
     postgres_checkpoint_timeout_seconds: int
     postgres_max_wal_size_bytes: int
-    evidence_target_storage_fingerprint: str
-    profile_target_storage_fingerprint: str
-    build_checkpoint_oid: int
-    serving_generation_oid: int
-    delta_receipt_oid: int
-    import_run_oid: int
-    capacity_consumption_oid: int
-    build_checkpoint_storage_fingerprint: str
-    serving_generation_storage_fingerprint: str
-    delta_receipt_storage_fingerprint: str
-    import_run_storage_fingerprint: str
-    capacity_consumption_storage_fingerprint: str
     control_wal_plan_input_hash: str
     control_wal_upper_bound_bytes: int
     control_metadata_data_upper_bound_bytes: int

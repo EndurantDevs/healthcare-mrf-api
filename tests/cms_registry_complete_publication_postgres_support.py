@@ -7,7 +7,6 @@ helpers do not establish production admission or an image deployment witness.
 
 import datetime
 import json
-import os
 import re
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -35,7 +34,6 @@ from process import provider_directory_cms_nonprofile_capacity as nonprofile
 from process import provider_directory_cms_serving_receipt as serving_receipt
 from process import provider_directory_generic_source_policy as source_policy
 from process import provider_directory_profile as profile
-from process import provider_directory_profile_capacity_attestation as leases
 from process import provider_directory_profile_capacity_control_projection as control_projection
 from process import provider_directory_profile_runtime_observation as runtime
 from process import provider_directory_profile_selection as selection
@@ -85,6 +83,11 @@ NATIVE_INPUT_MIGRATIONS = (
     "20261022120000",
     "20261023100000_provider_directory_retirement_parent_updates",
     "20261024050000",
+    "20261114160000",
+    "20261114180000",
+    "20261114190000",
+    "20261115120000",
+    "20261116090000",
 )
 
 
@@ -94,13 +97,13 @@ def source_component_native_migrations():
 
     baseline = source_component_migrations()
     assert len(baseline) == len(set(baseline)) == 99
-    assert len(NATIVE_INPUT_MIGRATIONS) == len(set(NATIVE_INPUT_MIGRATIONS)) == 31
+    assert len(NATIVE_INPUT_MIGRATIONS) == len(set(NATIVE_INPUT_MIGRATIONS)) == 36
     from tests.nppes_candidate_postgres_support import nppes_source_component_migrations
 
     callable_migrations = nppes_source_component_migrations()
     selected = set(baseline) | set(NATIVE_INPUT_MIGRATIONS) | set(callable_migrations)
     assert set(baseline) & set(NATIVE_INPUT_MIGRATIONS) == {"20260920100000", "20260929000000", "20260929040000"}
-    assert len(selected) == 135
+    assert len(selected) == 140
     root = Path(__file__).resolve().parents[1]
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "alembic"))
@@ -117,7 +120,7 @@ def source_component_native_migrations():
     prefix_by_revision = {found[0].revision: prefix for prefix, found in nodes_by_prefix.items()}
     assert len(prefix_by_revision) == len(selected)
     ordered_prefixes = tuple(prefix_by_revision[node.revision] for node in nodes if node.revision in prefix_by_revision)
-    assert set(ordered_prefixes) == selected and len(ordered_prefixes) == 135
+    assert set(ordered_prefixes) == selected and len(ordered_prefixes) == 140
     assert tuple(prefix for prefix in ordered_prefixes if prefix in set(baseline)) == baseline
     return ordered_prefixes
 
@@ -230,8 +233,6 @@ async def _initialize_native_inputs(database, monkeypatch, tmp_path, source_comm
     identity.write_text(source_commit + "\n")
     identity.chmod(0o444)
     monkeypatch.setattr(runtime, "PROFILE_RUNTIME_SOURCE_COMMIT_FILE", identity)
-    monkeypatch.setattr(runtime, "_BUILD_IDENTITY_UID", os.getuid())
-    monkeypatch.setattr(runtime, "_BUILD_IDENTITY_GID", os.getgid())
     observe = partial(runtime.observe_profile_runtime, database=database)
     monkeypatch.setattr(source.fhir, "observe_profile_runtime", runtime.observe_profile_runtime)
     return observe
@@ -370,6 +371,7 @@ async def _bootstrap_native_source(engine, policy, *, migration_prefixes):
 @asynccontextmanager
 async def source_native_publication_database(monkeypatch, tmp_path, source_commit, *, metadata_read_roles=()):
     """Compose the original protected acquisition fixture with the verified combined bootstrap."""
+    from process import provider_directory_cms_npd as cms
     from tests import provider_directory_source_postgres_support as native_source
 
     migrations = source_component_native_migrations()
@@ -387,109 +389,60 @@ async def source_native_publication_database(monkeypatch, tmp_path, source_commi
         ) as administrator:
             component = administrator._source_component
             await _register_native_heaps(administrator, component)
-            namespace, migrator = "native_namespace_" + uuid4().hex, "native_migrator_" + uuid4().hex
             from db.migration_nppes_evidence_candidates import upgrade_nppes_evidence_candidates
-            from tests import nppes_candidate_postgres_support as nppes_fixture
 
-            try:
-                async with component.admin_engine.begin() as connection:
-                    await connection.run_sync(lambda sync: upgrade_nppes_evidence_candidates(sync, "mrf"))
-                await nppes_fixture._enroll_native_custody(
-                    component, namespace, migrator, native_inputs=True, metadata_read_roles=metadata_read_roles
-                )
-                await _adopt_native_counter(component)
-                await _grant_profile_controls(administrator, component.policy)
-                for module in (selection, selection_snapshot, entity_address_unified, address_canon):
-                    settings.setattr(module, "db", component.database)
-                settings.setattr(source.fhir, "observe_profile_runtime", runtime.observe_profile_runtime)
-                yield administrator
-            finally:
-                await nppes_fixture._drop_nppes_component_roles(component.admin_engine, (migrator, namespace))
+            async with component.admin_engine.begin() as connection:
+                await connection.run_sync(lambda sync: upgrade_nppes_evidence_candidates(sync, "mrf"))
+            await _require_named_native_controls(component, metadata_read_roles)
+            await _grant_profile_controls(administrator, component.policy)
+            settings.setattr(
+                cms,
+                "_register_source",
+                partial(_register_source_catalog, administrator, settings, cms._register_source),
+            )
+            for module in (selection, selection_snapshot, entity_address_unified, address_canon):
+                settings.setattr(module, "db", component.database)
+            settings.setattr(source.fhir, "observe_profile_runtime", runtime.observe_profile_runtime)
+            yield administrator
 
 
-async def _counter_inventory(driver, policy, custody_by_role):
-    """Retain the complete native payload, roles and namespace across only custody DDL."""
-    from process import provider_directory_native_counter_catalog as counter
-    from process import provider_directory_source_callable_custody as callables
+async def _register_source_catalog(database, monkeypatch, register_source, fhir):
+    """Seed the real registration's two catalog rows through fixture administration."""
+    assert database.engine is database._source_component.admin_engine
+    assert fhir is source.fhir and source_policy.source_transaction_available() is None
 
-    graph, roles, namespace, reach = await callables._capture_roles(driver, policy, **custody_by_role)
-    census_by_field = dict(await driver.fetchrow(counter._CENSUS_SQL, namespace["oid"], list(counter.FUNCTIONS)))
-    catalog = await counter._capture_counter_catalog(driver, policy, roles, namespace, census_by_field)
-    defaults = callables._decoded(
-        await driver.fetchval(
-            "SELECT COALESCE(jsonb_agg(to_jsonb(d) ORDER BY d.oid),'[]'::jsonb) FROM pg_default_acl d"
-        )
-    )
-    return dict(
-        graph=graph,
-        roles=roles,
-        namespace=namespace,
-        reach=reach,
-        census_by_field=census_by_field,
-        catalog=catalog,
-        defaults=defaults,
-    )
+    async def seed_catalog(model, normalized_rows, columns, primary_keys, *, skip_unchanged):
+        assert model in (fhir.ProviderDirectoryAPIEndpoint, fhir.ProviderDirectorySource)
+        assert columns == [column.name for column in model.__table__.columns]
+        assert primary_keys == [column.name for column in model.__table__.primary_key.columns]
+        assert skip_unchanged is False
+        for fields in normalized_rows:
+            await _seed_selection_row(database, model, fields)
+        return len(normalized_rows)
+
+    with monkeypatch.context() as catalog_setup:
+        catalog_setup.setattr(fhir, "_upsert_normalized_rows", seed_catalog)
+        return await register_source(fhir)
 
 
-def _counter_immutable_inventory(snapshot):
-    """Project only the ownership/ACL fields independently checked by the native contract."""
-    inventory = deepcopy(snapshot)
-    payload = inventory["catalog"]
-    catalog = payload["ledger"]["catalog"]
-    for relation in catalog["classes"]:
-        relation["relowner"] = relation["relacl"] = None
-    for attribute in catalog["attributes"]:
-        attribute["attacl"] = None
-    for field in ("table_acl", "column_acl", "access"):
-        catalog[field] = None
-    payload["ledger"]["composite"]["typowner"] = None
-    for function in payload["functions"].values():
-        function["definition"]["proowner"] = function["definition"]["proacl"] = None
-        function["acl"] = None
-    return inventory
+async def _require_named_native_controls(component, metadata_read_roles):
+    """Use configured native roles and the current counter's semantic guard contract."""
+    from process import provider_directory_cms_native_registration as registration
+    from process.provider_directory_cms_control_privileges import grant_cms_origin_metadata_read_privileges
 
-
-async def _adopt_native_counter(component):
-    """Transfer the genuine fixed counter under complete before/after callable proof."""
-    from process.provider_directory_cms_callable_custody import _admin_identity
-    from process.provider_directory_native_counter_catalog import _CENSUS_SQL, FUNCTIONS, ROOT
-
-    policy = component.policy
-    table = f'"{policy.schema}"."{ROOT}"'
-    custody_by_role = dict(
-        migration_role=component.factory.migration_role, namespace_owner_role=component.factory.namespace_owner_role
-    )
-    from process.provider_directory_source_callable_custody import attest_source_callable_capability
-
+    component.factory._require_current_policy()
+    assert component.factory._native_input_producer is not None
     async with component.admin_engine.begin() as connection:
-        await connection.execute(text("SELECT current_user=session_user"))
+        # Begin the administrator transaction before the raw driver writes the registration and grants.
+        await connection.execute(text("SELECT 1"))
         driver = (await connection.get_raw_connection()).driver_connection
-        await driver.fetchval("SELECT pg_current_xact_id()::text")
-        actor = await _admin_identity(driver, policy)
-        await driver.execute(f"LOCK TABLE ONLY {table} IN ACCESS EXCLUSIVE MODE NOWAIT")
-        namespace = await driver.fetchval("SELECT to_regnamespace($1)::oid", policy.schema)
-        census_by_field = dict(await driver.fetchrow(_CENSUS_SQL, namespace, list(FUNCTIONS)))
-        before = await attest_source_callable_capability(driver, policy, **custody_by_role)
-        previous = await _counter_inventory(driver, policy, custody_by_role)
-        counter_rows = await driver.fetch(f"SELECT * FROM {table} ORDER BY relation_oid")
-        advance = await driver.fetchval(
-            "SELECT to_regprocedure($1)::oid::bigint", f'"{policy.schema}"."{FUNCTIONS[0]}"()'
-        )
-        assert type(advance) is int and advance not in before
-        owner, builder = f'"{policy.owner_role}"', f'"{policy.control_runtime_roles[0]}"'
-        await driver.execute(f"ALTER TABLE {table} OWNER TO {owner}")
-        await driver.execute(f"GRANT SELECT ON TABLE {table} TO {builder}")
-        await driver.execute(f"GRANT INSERT(relation_oid,schema_name,table_name) ON TABLE {table} TO {builder}")
-        for name in FUNCTIONS:
-            await driver.execute(f'ALTER FUNCTION "{policy.schema}"."{name}"() OWNER TO {owner}')
-        await driver.execute(f'GRANT EXECUTE ON FUNCTION "{policy.schema}"."{FUNCTIONS[0]}"() TO {builder}')
-        after = await attest_source_callable_capability(driver, policy, **custody_by_role)
-        assert after == tuple(sorted((*before, advance)))
-        current = await _counter_inventory(driver, policy, custody_by_role)
-        assert _counter_immutable_inventory(current) == _counter_immutable_inventory(previous)
-        assert dict(await driver.fetchrow(_CENSUS_SQL, namespace, list(FUNCTIONS))) == census_by_field
-        assert await driver.fetch(f"SELECT * FROM {table} ORDER BY relation_oid") == counter_rows
-        assert await _admin_identity(driver, policy) == actor
+        ledger = await registration._native_registration_ledger(driver, component.policy.schema)
+        await registration._native_registration_function(driver, component.policy.schema, ledger)
+        if metadata_read_roles:
+            await grant_cms_origin_metadata_read_privileges(
+                driver, component.policy, metadata_read_roles=metadata_read_roles
+            )
+    component.factory._require_current_policy()
 
 
 async def _grant_profile_controls(database, policy):
@@ -506,6 +459,8 @@ async def _grant_profile_controls(database, policy):
         "provider_directory_profile_failed_cleanup_claim": "SELECT",
         "provider_directory_profile_delta_receipt": "SELECT,INSERT",
         "npi_result_generation": "SELECT,MAINTAIN",
+        "cms_native_input_revision": 'SELECT("schema_name","table_name","revision","mutation_xid")',
+        "provider_directory_cms_serving_receipt": 'INSERT("receipt_id","payload","registry_source_pair_json")',
     }
     async with database.engine.begin() as connection:
         for name, rights in rights_by_table.items():
@@ -516,6 +471,7 @@ async def _grant_profile_controls(database, policy):
 
         raw = await connection.get_raw_connection()
         await grant_cms_control_privileges(raw.driver_connection, policy)
+        await _grant_profile_read_protocol(connection, raw.driver_connection, policy)
         assert (
             await connection.scalar(
                 text("SELECT NOT has_table_privilege(:owner,:table,'SELECT,UPDATE')"),
@@ -532,13 +488,40 @@ async def _grant_profile_controls(database, policy):
                 AND relation.relname=ANY(:names) AND namespace.nspname='pg_toast'
                 AND toast.relowner<>(SELECT oid FROM pg_catalog.pg_roles WHERE rolname=:owner)
                 ORDER BY relation.relname"""),
-            {"schema": policy.schema, "names": ["import_run"], "owner": policy.owner_role},
+            {
+                "schema": policy.schema,
+                "names": [
+                    "import_run",
+                    "provider_directory_profile_build_checkpoint",
+                    "provider_directory_profile_serving_generation",
+                ],
+                "owner": policy.owner_role,
+            },
         )
         for toast_relation in toast_query.all():
             assert re.fullmatch(r"pg_toast_[1-9][0-9]*", toast_relation.relname)
             await connection.execute(
                 text(f'GRANT SELECT(chunk_id) ON "pg_toast"."{toast_relation.relname}" TO "{policy.owner_role}"')
             )
+
+
+async def _grant_profile_read_protocol(connection, driver, policy):
+    """Grant only fixed mutable selection fences and existing readonly entry points."""
+    from db.plan_release_storage import storage_identifier
+    from process.provider_directory_cms_control_privileges import READ_COLUMN_GRANTS, grant_cms_control_read_privileges
+    from process.provider_directory_dataset_scoped_publication import LEGACY_READY_FUNCTION, ROOTED_READY_FUNCTION
+
+    for name in selection_snapshot.UHC_FLEX_PROFILE_SELECTION_LOCK_RELATIONS:
+        await connection.execute(text(f'GRANT SELECT,MAINTAIN ON "{policy.schema}"."{name}" TO "{policy.owner_role}"'))
+    for name in (LEGACY_READY_FUNCTION, ROOTED_READY_FUNCTION):
+        await connection.execute(
+            text(f'GRANT EXECUTE ON FUNCTION "{policy.schema}"."{name}"(text) TO "{policy.owner_role}"')
+        )
+    columns = ",".join(map(storage_identifier, READ_COLUMN_GRANTS[serving_receipt._TABLE]))
+    await connection.execute(
+        text(f'GRANT SELECT({columns}) ON "{policy.schema}"."{serving_receipt._TABLE}" TO "{policy.owner_role}"')
+    )
+    await grant_cms_control_read_privileges(driver, policy)
 
 
 async def _register_native_heaps(database, component):
@@ -565,10 +548,7 @@ async def _register_native_heaps(database, component):
             relation = f'"{candidate.stage_schema}"."{candidate.stage_table}"'
             await driver.execute(f'REVOKE ALL ON TABLE {relation} FROM "{component.policy.owner_role}"')
             await driver.execute(f'GRANT SELECT,MAINTAIN ON TABLE {relation} TO "{component.policy.owner_role}"')
-        actor_oid = await driver.fetchval("SELECT current_user::regrole::oid::bigint")
-        await registration.register_native_input_candidates(
-            driver, ledger_schema="mrf", candidates=tuple(candidates), expected_actor_oid=actor_oid
-        )
+        await registration.register_native_input_candidates(driver, ledger_schema="mrf", candidates=tuple(candidates))
 
 
 async def _seed_native_doctors(database):
@@ -716,7 +696,7 @@ async def committed_publication_proof(database, admitted):
 
 
 async def assert_native_offices(database, receipt_payload):
-    """Check actual office conservation and all native receipt relation identities."""
+    """Check actual office conservation and every ordered native receipt QName."""
     async with database.session_factory() as session:
         offices = (
             await session.execute(
@@ -757,10 +737,10 @@ async def assert_native_offices(database, receipt_payload):
             ("address", addresses.RELATION_NAMES),
             ("doctors", reference.RELATION_NAMES_BY_IMPORTER["cms-doctors"]),
         ):
-            for name, oid in zip(names, receipt_payload[family]["relation_oids"], strict=True):
-                assert (
-                    await session.scalar(text("SELECT to_regclass(:name)::oid::bigint"), {"name": "mrf." + name}) == oid
-                )
+            expected_relations = [{"schema_name": "mrf", "relation_name": name} for name in names]
+            assert receipt_payload[family]["relations"] == expected_relations
+            for name in names:
+                await session.execute(text(f'SELECT 1 FROM "mrf"."{name}" LIMIT 0'))
 
 
 def observe_geometry(monkeypatch, database, *, private_capture=None):
@@ -944,23 +924,20 @@ async def _reject_resume_source_change(database, original, arguments):
 
 
 async def _reject_resume_target_change(database, original, arguments):
+    """Replacing populated target data must refuse retained geometry and preserve the original rows."""
     async with database.transaction():
-        original_oid = await database.scalar("SELECT 'mrf.provider_directory_profile'::regclass::oid::bigint")
+        original_rows = await database.all("SELECT * FROM mrf.provider_directory_profile ORDER BY npi")
         await database.status("ALTER TABLE mrf.provider_directory_profile RENAME TO changed_profile_target")
         await database.status(profile.profile_table_sql("mrf", logged=True))
-        replacement_oid = await database.scalar("SELECT 'mrf.provider_directory_profile'::regclass::oid::bigint")
     try:
         async with _resume_probe_transaction(arguments[0]):
-            with pytest.raises(RuntimeError, match="provider_directory_profile_capacity_target_identity_changed"):
+            with pytest.raises(RuntimeError, match="provider_directory_nonprofile_capacity_profile_geometry_changed"):
                 await original(*arguments)
     finally:
         async with database.transaction():
-            assert (
-                await database.scalar("SELECT 'mrf.provider_directory_profile'::regclass::oid::bigint")
-                == replacement_oid
-            )
-            assert await database.scalar("SELECT 'mrf.changed_profile_target'::regclass::oid::bigint") == original_oid
-            await database.status("DROP TABLE mrf.provider_directory_profile")
+            assert await database.all("SELECT * FROM mrf.provider_directory_profile ORDER BY npi") == []
+            assert await database.all("SELECT * FROM mrf.changed_profile_target ORDER BY npi") == original_rows
+            await database.status("DROP TABLE mrf.provider_directory_profile RESTRICT")
             await database.status("ALTER TABLE mrf.changed_profile_target RENAME TO provider_directory_profile")
 
 
@@ -1042,12 +1019,10 @@ async def retained_pair(database, proof, *, expected_address_rows=2):
 
 def sign_native_receipt(guard, receipt, timing, *, reservation):
     """Enroll actual database, geometry and runtime values with the synthetic key."""
-    binding = receipt.get("database_binding", receipt["capacity_geometry"])
     required = receipt["required_reservation_bytes_by_storage_class"]
 
     def mutate(body):
         body.update(
-            **{field: binding[field] for field in ("database_system_identifier", "database_oid", "database_name")},
             capacity_geometry_hash=receipt["capacity_geometry_hash"],
             nonce=receipt["receipt_sha256"],
             observed_at=signing._utc(timing.observed_at),
@@ -1060,19 +1035,16 @@ def sign_native_receipt(guard, receipt, timing, *, reservation):
                 signing.guard_contract.CAPACITY_SIGNING_PREFLIGHT_GUARD_DIGEST_DOMAIN, guard
             ),
         )
-        body["runtime_witness"].update(
+        body["runtime"].update(
             **{
                 field: receipt["runtime_observation"][field]
                 for field in runtime.CAPACITY_LEASE_LOCALLY_VERIFIED_RUNTIME_FIELDS
             }
         )
-        body["runtime_witness_sha256"] = leases.capacity_runtime_witness_sha256(
-            body["runtime_witness"], body["deployment_witness"]
-        )
-        for tablespace in body["tablespaces"]:
-            tablespace.update(tablespace_oid=binding["tablespace_oid"], tablespace_name=binding["tablespace_name"])
-        for volume in body["volumes"]:
-            volume["reserved_bytes"] = required[volume["volume_class"]]
+        body["storage_classes"] = [
+            {**entry, "reserved_bytes": required[entry["storage_class"]]}
+            for entry in guard["control_plane_request"]["storage_observation"]["storage_classes"]
+        ]
 
     return _signed_envelope(body_mutator=mutate)
 

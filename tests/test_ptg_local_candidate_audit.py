@@ -259,8 +259,7 @@ async def test_cached_local_target_cannot_bypass_a_new_custody_check(monkeypatch
     if drift == "legacy":
         case.state = None
     elif drift == "heap":
-        relations = case.binding.relation_oids
-        case.state["physical_binding"] = replace(case.binding, relation_oids=((relations[0][0], 9999), *relations[1:]))
+        case.state["physical_binding"] = replace(case.binding, payload_snapshot_id="changed_payload")
     elif drift == "key":
         case.state["physical_binding"] = replace(case.binding, payload_snapshot_key=18)
     else:

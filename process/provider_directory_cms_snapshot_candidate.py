@@ -51,7 +51,7 @@ async def attach_cms_snapshot_candidate(connection, request_by_name, *, expected
     _require(await connection.fetchval("SHOW search_path") in {"pg_catalog", "pg_catalog, pg_temp"}, "search_path")
     request, retained = attachment._request(request_by_name)
     seal = workspace._copy(expected_seal)
-    parents = workspace._copy(expected_parent_oids)
+    parents = attachment._parent_references(expected_parent_oids)
     actor = await attachment._actor(connection, request, retained)
     async with workspace._savepoint(connection):
         snapshots = await attachment.attach_sealed_cms_payload_snapshots(
@@ -62,7 +62,7 @@ async def attach_cms_snapshot_candidate(connection, request_by_name, *, expected
         _require(
             attachment._request(request_by_name) == (request, retained)
             and expected_seal == seal
-            and expected_parent_oids == parents,
+            and attachment._parent_references(expected_parent_oids) == parents,
             "inputs_changed",
         )
     return {"contract": CONTRACT, "header": header, "snapshots": snapshots}

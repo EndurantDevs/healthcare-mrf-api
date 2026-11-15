@@ -132,7 +132,8 @@ def _validate_conversion_tables(binding, progress_by_field):
         table = legacy[root]
         storage._require(
             type(table) is dict
-            and set(table) == {"name"}
+            and set(table) in ({"name"}, {"schema", "name"})
+            and ("schema" not in table or table["schema"] == binding.get("storage", {}).get("storage_schema"))
             and type(table["name"]) is str
             and re.fullmatch(r"pdgs_[0-9a-f]{32}_" + suffix, table["name"]),
             "payload_conversion_tables",

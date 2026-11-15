@@ -17,6 +17,7 @@ from api.network_address_scope import (
     scoped_address_relation_sql,
 )
 from process.custom_import.read_contracts import CustomImportReadUnavailableError
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 from tests.test_custom_import_provider_network import _bound_document
 from tests.test_network_custom_address_source_postgres import _draft
@@ -135,7 +136,9 @@ async def test_native_same_canonical_identity_never_widens_original_office_or_pr
             "('office-a',1111111111,ARRAY[84],ARRAY[42]),('office-b',2222222222,ARRAY[84],ARRAY[-17])"
         )
         await connection.execute(f'INSERT INTO "{schema}".synthetic_prices VALUES(1111111111,10),(2222222222,9000)')
-        manifest = PinnedNetworkServingManifest(1, str(candidate), schema, 1, {}, 0, "a" * 64, 1)
+        manifest = PinnedNetworkServingManifest(
+            1, str(candidate), schema, 1, {}, 0, "a" * 64, CompactAddressRelation(schema, "entity_address_unified")
+        )
         for selected, expected in ((None, ["office-a", "office-b"]), ((42,), ["office-a"]), ((-17,), ["office-b"])):
             offices = await _subset_rows(connection, manifest, selected)
             assert [office["location_key"] for office in offices] == expected

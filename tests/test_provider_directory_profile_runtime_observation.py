@@ -15,21 +15,17 @@ from process import provider_directory_profile_runtime_observation as runtime
 from process.provider_directory_profile_capacity_attestation_contract import (
     capacity_runtime_witness_sha256,
 )
-from tests.test_provider_directory_profile_capacity_preflight import _geometry
 from tests.test_provider_directory_profile_capacity_attestation import (
     _signed_envelope,
     _verify,
 )
+from tests.test_provider_directory_profile_capacity_preflight import _geometry
 
 
 @pytest.fixture(autouse=True)
 def baked_source_commit_file(tmp_path, monkeypatch):
     source_file = tmp_path / "healthcare-source-commit"
-    monkeypatch.setattr(
-        runtime, "PROFILE_RUNTIME_SOURCE_COMMIT_FILE", source_file
-    )
-    monkeypatch.setattr(runtime, "_BUILD_IDENTITY_UID", os.getuid())
-    monkeypatch.setattr(runtime, "_BUILD_IDENTITY_GID", os.getgid())
+    monkeypatch.setattr(runtime, "PROFILE_RUNTIME_SOURCE_COMMIT_FILE", source_file)
 
     def write_source_file(raw_value: bytes | None = b"b" * 40 + b"\n") -> Path:
         if source_file.is_symlink() or source_file.exists():
@@ -79,28 +75,19 @@ def test_runtime_source_commit_ignores_conflicting_environment(monkeypatch):
     assert runtime.build_baked_healthcare_source_commit() == "b" * 40
 
 
-@pytest.mark.parametrize("unsafe_shape", ["mode", "hardlink", "symlink"])
-def test_runtime_source_commit_rejects_unsafe_file_shape(
-    tmp_path,
-    baked_source_commit_file,
-    unsafe_shape,
-):
+@pytest.mark.parametrize("file_shape", ["mode", "hardlink", "symlink"])
+def test_runtime_source_commit_uses_content_without_file_custody(tmp_path, baked_source_commit_file, file_shape):
     source_file = baked_source_commit_file()
-    if unsafe_shape == "mode":
+    if file_shape == "mode":
         source_file.chmod(0o644)
-    elif unsafe_shape == "hardlink":
-        os.link(source_file, tmp_path / "second-link")
+    elif file_shape == "hardlink":
+        os.link(source_file, tmp_path / "same-content")
     else:
-        target = tmp_path / "target"
+        target = tmp_path / "source-content"
         target.write_bytes(b"b" * 40 + b"\n")
         source_file.unlink()
         source_file.symlink_to(target)
-
-    with pytest.raises(
-        runtime.ProviderDirectoryProfileRuntimeObservationError,
-        match="healthcare_source_commit_invalid",
-    ):
-        runtime.build_baked_healthcare_source_commit()
+    assert runtime.build_baked_healthcare_source_commit() == "b" * 40
 
 
 @pytest.mark.asyncio
@@ -137,9 +124,7 @@ async def test_runtime_observation_requires_one_migration_row(
         ),
         (
             {
-                "profile_migration_revision": (
-                    "20260730110000_provider_directory_profile_delta"
-                ),
+                "profile_migration_revision": ("20260730110000_provider_directory_profile_delta"),
                 "postgres_server_version_num": True,
             },
             "postgres_server_version_num_invalid",
@@ -188,9 +173,7 @@ async def test_runtime_observation_uses_configured_database_schema(
     runtime_rows = AsyncMock(
         return_value=[
             {
-                "profile_migration_revision": (
-                    "20260801130000_provider_directory_capacity_lease_v2"
-                ),
+                "profile_migration_revision": ("20260801130000_provider_directory_capacity_lease_v2"),
                 "postgres_server_version_num": 180002,
             }
         ]
@@ -199,13 +182,9 @@ async def test_runtime_observation_uses_configured_database_schema(
 
     observation = await runtime.observe_profile_runtime()
 
-    assert observation["profile_migration_revision"] == (
-        "20260801130000_provider_directory_capacity_lease_v2"
-    )
+    assert observation["profile_migration_revision"] == ("20260801130000_provider_directory_capacity_lease_v2")
     runtime_rows.assert_awaited_once()
-    assert 'FROM "profile""runtime"."alembic_version"' in (
-        runtime_rows.await_args.args[0]
-    )
+    assert 'FROM "profile""runtime"."alembic_version"' in (runtime_rows.await_args.args[0])
 
 
 @pytest.mark.asyncio
@@ -271,14 +250,10 @@ def test_runtime_observation_rejects_geometry_disagreement(
     observation_by_field = {
         "contract_id": runtime.PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID,
         "healthcare_source_commit": "c" * 40,
-        "profile_migration_revision": (
-            "20260730110000_provider_directory_profile_delta"
-        ),
+        "profile_migration_revision": ("20260730110000_provider_directory_profile_delta"),
         "profile_schema_version": geometry.profile_schema_version,
         "profile_strategy_version": geometry.profile_strategy_version,
-        "postgres_server_version_num": (
-            geometry.postgres_server_version_num
-        ),
+        "postgres_server_version_num": (geometry.postgres_server_version_num),
     }
     observation_by_field[field_name] = replacement
 
@@ -308,7 +283,7 @@ def test_runtime_observation_requires_closed_fields(observation_by_field):
 
 
 def _lease_runtime_observation(verified_lease):
-    witness = verified_lease.runtime_witness
+    witness = verified_lease.runtime
     return {
         "contract_id": runtime.PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID,
         "healthcare_source_commit": witness.healthcare_source_commit,
@@ -348,38 +323,19 @@ def test_capacity_lease_rejects_cross_runtime_replay():
             )
 
 
-def test_capacity_lease_deployment_fields_are_explicitly_audit_only():
-    def mutate(body):
-        body["runtime_witness"]["healthcare_image_digest"] = (
-            "sha256:" + "ab" * 32
-        )
-        body["deployment_witness"]["flux_revision"] = (
-            "main@sha1:" + "cd" * 20
-        )
-        body["runtime_witness_sha256"] = (
-            capacity_runtime_witness_sha256(
-                body["runtime_witness"],
-                body["deployment_witness"],
-            )
-        )
-
-    verified_lease = _verify(_signed_envelope(body_mutator=mutate))
-    runtime.assert_capacity_lease_matches_runtime_observation(
-        verified_lease,
-        _lease_runtime_observation(verified_lease),
-    )
+def test_current_capacity_lease_refuses_deployment_custody_fields():
+    envelope = _signed_envelope()
+    envelope["lease"]["deployment_witness"] = {}
+    with pytest.raises(ValueError, match="invalid_fields"):
+        _verify(envelope)
 
 
 def test_runtime_source_commit_is_baked_into_the_image():
-    dockerfile = (
-        Path(__file__).resolve().parents[1] / "Dockerfile"
-    ).read_text(encoding="utf-8")
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text(encoding="utf-8")
     assert "ARG HLTHPRT_SOURCE_COMMIT" in dockerfile
     assert 'test "${#HLTHPRT_SOURCE_COMMIT}" -eq 40' in dockerfile
     assert "grep -Eq '^[0-9a-f]{40}$'" in dockerfile
-    assert (
-        'test "${HLTHPRT_SOURCE_COMMIT}" != "' + "0" * 40 + '"'
-    ) in dockerfile
+    assert ('test "${HLTHPRT_SOURCE_COMMIT}" != "' + "0" * 40 + '"') in dockerfile
     assert "/opt/healthporta/build-identity/healthcare-source-commit" in dockerfile
     assert "chown root:root" in dockerfile
     assert "chmod 0444" in dockerfile

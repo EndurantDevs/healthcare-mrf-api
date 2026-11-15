@@ -554,14 +554,10 @@ async def project_scratch_window(
     admission = fhir._provider_directory_profile_capacity_admission()
     if admission is None:
         raise RuntimeError("provider_directory_profile_capacity_admission_missing")
-    layout = await fhir._provider_directory_profile_relation_storage_fingerprint(
+    layout = await fhir._provider_directory_profile_capacity_relation_layout(
         relation_oid,
         expected_persistence=expected_persistence,
     )
-    if layout.relation_oid != relation_oid:
-        raise fhir.ProviderDirectoryArtifactBuildStale(
-            "provider_directory_profile_capacity_scratch_oid_changed",
-        )
     projection = fhir.profile_capacity.project_profile_scratch_capacity(
         admission.geometry,
         fhir.profile_capacity.ProviderDirectoryProfileScratchInput(

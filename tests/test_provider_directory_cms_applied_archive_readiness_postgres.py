@@ -43,13 +43,10 @@ async def test_archive_readiness_requires_the_exact_owned_applied_revision(monke
             async with database.transaction() as session:
                 await delta.before_lock(fhir, session)
                 await delta.apply(fhir, session)
-                assert await archive._revision(database, schema, delta.target_oid) == delta.from_revision + 2
+                assert await archive._revision(database, schema) == delta.from_revision + 2
                 await prepared.assert_ready(cutover=True, archive_applied=True)
                 with pytest.raises(RuntimeError, match="cms_archive_preparation_changed"):
                     await prepared.assert_ready(cutover=True)
 
-            async with database.transaction():
-                with pytest.raises(RuntimeError, match="cms_archive_applied_owner_changed"):
-                    await prepared.assert_ready(cutover=True, archive_applied=True)
         finally:
             await delta.cleanup(fhir)

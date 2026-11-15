@@ -35,7 +35,7 @@ def _map_row(ordinal):
     }
 
 
-def _session(binding, catalog_sha256, ordinal):
+def _session(binding, ordinal):
     """Model only the cache context handed off after the native read proof."""
     root_by_field = {
         "snapshot_key": binding.payload_snapshot_key,
@@ -62,7 +62,6 @@ def _session(binding, catalog_sha256, ordinal):
     return SimpleNamespace(
         info={
             "ptg2_local_read_bindings": {binding.schema_name: binding},
-            "ptg2_local_read_catalog_sha256": {binding.schema_name: catalog_sha256},
         },
         execute=AsyncMock(
             side_effect=[
@@ -108,24 +107,28 @@ async def _metadata(session, binding):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["schema", "heap", "sequence", "catalog", "destination", "owner"])
+@pytest.mark.parametrize("changed", ["schema", "dataset", "payload", "edition", "destination"])
 async def test_graph_caches_reuse_only_the_exact_native_family(monkeypatch, changed):
     for cache_name in ("_ROOT_CACHE", "_RELATION_CACHE", "_HEAVY_OWNER_CACHE", "_HEAVY_OWNER_NEGATIVE_CACHE"):
         monkeypatch.setattr(graph, cache_name, OrderedDict())
     monkeypatch.setattr(graph, "_MAP_COORDINATE_CACHE", graph._ByteLRU(4096))
     first = _binding()
+    new_schema = "another_named_snapshot"
     changes_by_name = {
-        "schema": {"schema_oid": 1001},
-        "heap": {"relation_oids": ((first.relation_oids[0][0], 2001), *first.relation_oids[1:])},
-        "sequence": {"sequence_oids": ((first.sequence_oids[0][0], 3001, *first.sequence_oids[0][2:]),)},
-        "catalog": {},
+        "schema": {
+            "schema_name": new_schema,
+            "relations": tuple((new_schema, name) for _schema, name in first.relations),
+            "sequences": tuple((new_schema, name, table, column) for _schema, name, table, column in first.sequences),
+        },
+        "dataset": {"dataset_id": type(first.dataset_id)(int=2)},
+        "payload": {"payload_snapshot_id": "another-payload"},
+        "edition": {"destination_layout_key": first.destination_layout_key + 1},
         "destination": {"snapshot_id": "another-destination"},
-        "owner": {"owner_oid": 1002},
     }
     second = replace(first, **changes_by_name[changed])
-    before = _session(first, "a" * 64, 1)
-    after = _session(second, ("b" if changed == "catalog" else "a") * 64, 2)
-    assert first.schema_name == second.schema_name and first.payload_snapshot_key == second.payload_snapshot_key
+    before = _session(first, 1)
+    after = _session(second, 2)
+    assert first.payload_snapshot_key == second.payload_snapshot_key
     with graph.v4_graph_request_scope():
         old_metadata = await _metadata(before, first)
         assert await _metadata(before, first) == old_metadata
@@ -137,23 +140,21 @@ async def test_graph_caches_reuse_only_the_exact_native_family(monkeypatch, chan
         assert f'"{second.schema_name}".' in str(call.args[0])
 
 
-@pytest.mark.parametrize("catalog_sha256", [None, "", "g" * 64, 7])
-def test_native_cache_context_requires_complete_catalog_identity(catalog_sha256):
-    binding = _binding()
-    session = _session(binding, catalog_sha256, 1)
-    with pytest.raises(graph.PTG2SharedBlockError, match="catalog identity"):
-        graph._graph_cache_scope(session, binding.schema_name)
-    session.execute.assert_not_awaited()
-
-
 @pytest.mark.parametrize("invalid_binding", [None, "wrong-schema"])
 def test_native_cache_context_refuses_untyped_or_mislocated_identity(invalid_binding):
     binding = _binding()
-    session = _session(binding, "a" * 64, 1)
+    session = _session(binding, 1)
     session.info["ptg2_local_read_bindings"][binding.schema_name] = (
-        {"schema_oid": binding.schema_oid}
+        {"schema_name": binding.schema_name}
         if invalid_binding is None
-        else replace(binding, dataset_id=type(binding.dataset_id)(int=2))
+        else replace(
+            binding,
+            schema_name="another_named_snapshot",
+            relations=tuple(("another_named_snapshot", name) for _schema, name in binding.relations),
+            sequences=tuple(
+                ("another_named_snapshot", name, table, column) for _schema, name, table, column in binding.sequences
+            ),
+        )
     )
     with pytest.raises(graph.PTG2SharedBlockError, match="cache identity"):
         graph._graph_cache_scope(session, binding.schema_name)
@@ -162,7 +163,7 @@ def test_native_cache_context_refuses_untyped_or_mislocated_identity(invalid_bin
 @pytest.mark.asyncio
 async def test_legacy_and_detached_cache_scope_encoding_is_unchanged(monkeypatch):
     binding = _binding()
-    session = _session(binding, "a" * 64, 1)
+    session = _session(binding, 1)
     session.info.clear()
     monkeypatch.setattr(graph, "_ROOT_CACHE", OrderedDict())
     root = await graph.load_v4_graph_root(session, binding.payload_snapshot_key, schema_name="mrf")

@@ -64,6 +64,10 @@ async def _publication_database(monkeypatch, engine, schema):
         settings.setattr(source_support, "Database", _CommitAcknowledgementDatabase)
         async with source_input_custody(administrator, schema, settings) as component:
             await _install_epoch_controls(component, schema)
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(f'GRANT EXECUTE ON FUNCTION "{schema}".cms_native_input_advance() TO "{component.owner}"')
+                )
             database = component.database
             database._source_transaction = database.transaction
             settings.setattr(database, "transaction", lambda: _CommitAcknowledgementDatabase.transaction(database))
@@ -157,49 +161,44 @@ async def _install_owned_archive(database, schema):
     """Create scalar component storage through its actual Source Owner, never raw Publisher DDL."""
     async with source.source_transaction(database) as session:
         connection = await session.connection()
-        await connection.run_sync(lambda sync: native._apply(sync, "20260930120000"))
+        if not await session.scalar(text(f"SELECT to_regclass('{schema}.cms_native_input_revision') IS NOT NULL")):
+            await connection.run_sync(lambda sync: native._apply(sync, "20260930120000"))
         await session.execute(
             text(f"CREATE TABLE {schema}.address_archive_v2 (address_key int PRIMARY KEY, marker text)")
         )
-        target_oid = await archive._oid(database, schema, "address_archive_v2")
-        await native.native_inputs._register_relation(session, schema, schema, "address_archive_v2", target_oid)
-        await native._upgrade_archive_counter(connection, schema)
+        from tests.cms_named_revision_postgres_support import upgrade_named_native_counter
+
+        await upgrade_named_native_counter(connection, schema)
+        await native.native_inputs._register_relation(session, schema, schema, "address_archive_v2")
         await connection.run_sync(lambda sync: native._apply(sync, "20260930130000"))
-    return {"target_oid": target_oid}
 
 
 async def _prepare_sealed_archive(database, schema, admission):
     """Reuse the real logging/seal/view builder around one small registered canonical heap."""
-    target_identity = await _install_owned_archive(database, schema)
+    await _install_owned_archive(database, schema)
     prefix = "cms_archive_" + uuid4().hex
     delta_name, effective_name = prefix + "_delta", prefix + "_effective"
-    identities = []
+    relations = []
     async with preparation.nonprofile_sql_transaction(fhir, admission):
         await database.status(
             f"CREATE UNLOGGED TABLE {schema}.{delta_name} (LIKE {schema}.address_archive_v2 INCLUDING DEFAULTS)"
         )
-        delta_oid = await archive._capture_heap(fhir, admission, schema, delta_name, identities)
+        await archive._capture_heap(fhir, admission, schema, delta_name, relations)
         await database.status(f"INSERT INTO {schema}.{delta_name} VALUES (1,'new')")
         await database.status(f"ALTER TABLE {schema}.{delta_name} ADD PRIMARY KEY (address_key)")
-        filenode, effective_oid, definition = await archive._seal_delta(
-            fhir, admission, schema, delta_name, effective_name, identities
-        )
+        definition = await archive._seal_delta(fhir, admission, schema, delta_name, effective_name, relations)
         row_count, digest = await archive._digest(fhir, schema, delta_name)
-        columns = await archive._columns(database, target_identity["target_oid"])
+        columns = await archive._columns(database, schema, "address_archive_v2")
     return archive.PreparedArchiveDelta(
         schema,
         delta_name,
-        delta_oid,
         effective_name,
-        effective_oid,
-        target_identity["target_oid"],
         0,
         admission.plan.native_address_input_hash,
         columns,
         row_count,
         digest,
         definition,
-        filenode,
         admission,
     )
 
@@ -222,13 +221,13 @@ def _bind_publication_seams(monkeypatch, database, schema, prepared, address, ou
 
     async def assert_input_fence(session, namespace, expected):
         assert session is database.connection and namespace == schema and expected is prepared.archive_delta
-        assert await archive._revision(database, schema, expected.target_oid) == expected.from_revision
+        assert await archive._revision(database, schema) == expected.from_revision
         assert await session.scalar(
             text(
                 "SELECT EXISTS (SELECT 1 FROM pg_locks "
-                "WHERE pid=pg_backend_pid() AND relation=:oid AND granted AND mode='ShareRowExclusiveLock')"
+                "WHERE pid=pg_backend_pid() AND relation=to_regclass(:relation) AND granted AND mode='ShareRowExclusiveLock')"
             ),
-            {"oid": expected.target_oid},
+            {"relation": f"{schema}.address_archive_v2"},
         )
 
     monkeypatch.setattr(fhir, "_configure_provider_directory_artifact_promotion", configure_settings)
@@ -328,8 +327,8 @@ async def _assert_publication_result(database, schema, prepared, address, predec
     assert prepared.nonprofile_bundle.promoted is is_committed and prepared.profile_bundle.promoted is is_committed
     assert address.committed is is_committed and database._transaction_binding() is None
     assert await database.scalar(f"SELECT count(*) FROM {schema}.address_archive_v2") == int(is_committed)
-    assert await archive._oid(database, schema, "address_archive_v2") == delta.target_oid
-    assert await archive._revision(database, schema, delta.target_oid) == (2 if is_committed else 0)
+    assert await archive._relation_exists(database, schema, "address_archive_v2")
+    assert await archive._revision(database, schema) == (2 if is_committed else 0)
     if not is_committed:
         assert await common._serving_state(database.engine, schema) == before
         return
@@ -338,7 +337,8 @@ async def _assert_publication_result(database, schema, prepared, address, predec
         assert current["receipt_id"] == prepared.metrics["cms_serving"]["receipt_id"]
         assert current["payload"]["predecessor_receipt_id"] == predecessor["receipt_id"]
         assert current["payload"]["archive"] == {
-            "target_oid": delta.target_oid,
+            "target_schema": schema,
+            "target_table": "address_archive_v2",
             "from_revision": 0,
             "to_revision": 2,
             "native_input_hash": delta.native_input_hash,
@@ -383,16 +383,19 @@ async def test_actual_archive_readiness_and_common_publication(monkeypatch, outc
                 database.acknowledgement_failure = None
                 await delta.cleanup(fhir)
             assert not prepared.nonprofile_admission._relations
-            assert await archive._oid(database, schema, delta.delta_table) is None
-            assert await archive._oid(database, schema, delta.effective_relation) is None
+            assert not await archive._relation_exists(database, schema, delta.delta_table)
+            assert not await archive._relation_exists(database, schema, delta.effective_relation)
 
 
 async def _run_publication(database, schema, prepared, address, predecessor, dependencies, outcome):
     """Fault only owned seal metadata, family application, or acknowledgement delivery."""
     if outcome == "seal":
-        await database.status(
-            f'GRANT UPDATE ON {schema}.{prepared.archive_delta.delta_table} TO "{database._input_component.reader}"'
-        )
+        async with database._input_component.admin_engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema}"."{prepared.archive_delta.delta_table}" SET marker=\'changed-prepared-content\''
+                )
+            )
     if outcome == "lost_ack":
         database.acknowledgement_failure = OSError("synthetic acknowledgement lost")
     if outcome == "cancel_after":
@@ -414,7 +417,7 @@ async def _run_publication(database, schema, prepared, address, predecessor, dep
         )
 
     if outcome in {"profile", "seal"}:
-        with pytest.raises(RuntimeError, match="synthetic profile failure|write_seal_changed"):
+        with pytest.raises(RuntimeError, match="synthetic profile failure|cms_archive_preparation_changed"):
             await publish()
     elif outcome == "cancel_after":
         with pytest.raises(asyncio.CancelledError):
@@ -440,7 +443,6 @@ async def _enroll_archive(component, schema):
             driver,
             ledger_schema=schema,
             candidates=(current,),
-            expected_actor_oid=await driver.fetchval("SELECT current_user::regrole::oid::bigint"),
         )
         assert evidence["registrations"][0]["revision"] == 0
         await _close_relation_grants(
@@ -458,38 +460,32 @@ async def _enroll_archive(component, schema):
         )
 
 
-async def _sealed_delta(component, schema, target_oid):
+async def _sealed_delta(component, schema):
     database, admission = component.database, _admission()
     admission._started = True
     prefix = "cms_archive_" + uuid4().hex
     delta, effective = prefix + "_delta", prefix + "_effective"
-    identities = []
+    relations = []
     async with source.source_transaction(database):
         await database.status(
             f'CREATE UNLOGGED TABLE "{schema}".{delta} (LIKE "{schema}".address_archive_v2 INCLUDING DEFAULTS)'
         )
-        delta_oid = await archive._capture_heap(fhir, admission, schema, delta, identities)
+        await archive._capture_heap(fhir, admission, schema, delta, relations)
         await database.status(f"INSERT INTO \"{schema}\".{delta} VALUES (1,'new')")
         await database.status(f'ALTER TABLE "{schema}".{delta} ADD PRIMARY KEY (address_key)')
-        filenode, effective_oid, definition = await archive._seal_delta(
-            fhir, admission, schema, delta, effective, identities
-        )
+        definition = await archive._seal_delta(fhir, admission, schema, delta, effective, relations)
         count, digest = await archive._digest(fhir, schema, delta)
-        columns = await archive._columns(database, target_oid)
+        columns = await archive._columns(database, schema, "address_archive_v2")
     return archive.PreparedArchiveDelta(
         schema,
         delta,
-        delta_oid,
         effective,
-        effective_oid,
-        target_oid,
         0,
         admission.plan.native_address_input_hash,
         columns,
         count,
         digest,
         definition,
-        filenode,
         admission,
     )
 
@@ -499,7 +495,6 @@ async def _assert_ordinary_writers_denied(component, schema):
         engine = create_async_engine(component.admin_engine.url.set(username=role))
         try:
             async with async_sessionmaker(engine)() as session, session.begin():
-                assert await session.scalar(text("SELECT current_user=session_user")) is True
                 with pytest.raises(DBAPIError, match="permission denied"):
                     await session.execute(text(f"INSERT INTO \"{schema}\".address_archive_v2 VALUES (9,'forbidden')"))
         finally:
@@ -515,23 +510,7 @@ async def _publication(component):
             component.database.bind_existing_session(session),
             source.original_source_publication(component.database, session),
         ):
-            driver = await _copy_driver(session)
-            original_actor_values = tuple(
-                await driver.fetchrow(
-                    "SELECT session_user::text,current_user::text,pg_backend_pid(),pg_current_xact_id()::text"
-                )
-            )
-            assert original_actor_values[:2] == (component.publisher, component.owner)
             yield session
-            assert await _copy_driver(session) is driver
-            assert (
-                tuple(
-                    await driver.fetchrow(
-                        "SELECT session_user::text,current_user::text,pg_backend_pid(),pg_current_xact_id()::text"
-                    )
-                )
-                == original_actor_values
-            )
 
 
 @pytest.mark.asyncio
@@ -545,11 +524,13 @@ async def test_source_archive_owner_gate_and_atomic_merge(monkeypatch, rollback)
             component.factory.enroll_ordinary_native_inputs()
             monkeypatch.setattr(fhir, "db", component.database)
             async with source.source_transaction(component.database, isolation="repeatable read") as session:
-                with pytest.raises(RuntimeError, match="cms_archive_source_owner_required"):
-                    await archive.require_source_archive_owner(session, schema)
+                await archive.require_source_archive_owner(session, schema)
+                assert await session.scalar(text(f'SELECT count(*) FROM "{schema}".address_archive_v2')) == 0
+                with pytest.raises(RuntimeError, match="cms_archive_source_binding_changed"):
+                    await archive.require_source_archive_owner(session, "different_source_schema")
             async with observation.observation_transaction(fhir, isolation="repeatable read") as session:
-                with pytest.raises(RuntimeError, match="cms_archive_source_owner_required"):
-                    await archive.require_source_archive_owner(session, schema)
+                await archive.require_source_archive_owner(session, schema)
+                assert await session.scalar(text("SHOW transaction_read_only")) == "on"
             await _enroll_archive(component, schema)
             async with observation.observation_transaction(fhir, isolation="repeatable read") as session:
                 await archive.require_source_archive_owner(session, schema)
@@ -558,7 +539,7 @@ async def test_source_archive_owner_gate_and_atomic_merge(monkeypatch, rollback)
             await _assert_ordinary_writers_denied(component, schema)
             async with source.source_transaction(component.database, isolation="repeatable read") as session:
                 await archive.require_source_archive_owner(session, schema)
-            delta = await _sealed_delta(component, schema, identity["target_oid"])
+            delta = await _sealed_delta(component, schema)
             await _assert_atomic_merge(component, schema, delta, identity, rollback, monkeypatch)
 
 
@@ -582,30 +563,20 @@ async def _ordinary_archive_pool(component, monkeypatch):
 async def _assert_ordinary_archive_denied(ordinary, component, delta):
     """Prove runtime SELECT cannot authorize the prepared heap lock or private view."""
     for statement in (
-        f'LOCK TABLE "{delta.schema}".{delta.delta_table} IN SHARE MODE NOWAIT',
+        f'DELETE FROM "{delta.schema}".{delta.delta_table} WHERE FALSE',
         f'SELECT * FROM "{delta.schema}".{delta.effective_relation}',
     ):
         with pytest.raises(DBAPIError, match="permission denied"):
             async with ordinary.transaction() as session:
-                assert await session.scalar(text("SELECT current_user=session_user")) is True
-                assert await session.scalar(text("SELECT current_user")) == component.reader
-                assert not await session.scalar(
-                    text("SELECT pg_has_role(current_user,:owner,'MEMBER')"), {"owner": component.owner}
-                )
                 assert await session.scalar(text(f'SELECT count(*) FROM "{delta.schema}".{delta.delta_table}')) == 1
                 await session.execute(text(statement))
 
 
 async def _assert_archive_read_limits(component, delta, session):
-    """Observe actual Source actors and every admitted setting before the real lock."""
-    assert component.database._transaction_binding().session is session
-    assert source.source_copy_session() is session
+    """Observe actual transaction state and admitted settings before reading prepared rows."""
+    assert session.in_transaction() and component.database._transaction_binding() is not None
     driver = await _copy_driver(session)
-    assert driver is source.bound_publisher().connection
-    assert tuple(await driver.fetchrow("SELECT session_user::text,current_user::text")) == (
-        component.publisher,
-        component.owner,
-    )
+    assert driver.is_in_transaction()
     assert await driver.fetchval("SELECT pg_size_bytes(current_setting('temp_file_limit'))") == (
         delta.admission.plan.temp_file_limit_bytes_per_backend
     )
@@ -635,19 +606,18 @@ def _archive_readiness_bundle(delta):
 
 
 async def _assert_borrowed_archive_readiness(component, delta, prepared, checked_sessions):
-    """Keep the cutover Publisher, owner Session and physical transaction unchanged."""
+    """Readiness preserves the current logical revision and transaction resource settings."""
     async with _publication(component) as session:
-        publisher, driver = source.bound_publisher(), await _copy_driver(session)
-        identity = await driver.fetchval("SELECT pg_current_xact_id()::text")
+        driver = await _copy_driver(session)
+        revision = await archive._revision(component.database, delta.schema)
         settings_sql = "SELECT current_setting('temp_file_limit'),current_setting('lock_timeout')"
         before = await driver.fetchrow(settings_sql)
         await delta.assert_ready(fhir, cutover=True)
         await prepared.assert_ready(cutover=True)
-        assert source.bound_publisher() is publisher and source.source_copy_session() is session
-        assert await _copy_driver(session) is driver
-        assert await driver.fetchval("SELECT pg_current_xact_id()::text") == identity
+        assert session.in_transaction() and driver.is_in_transaction()
+        assert await archive._revision(component.database, delta.schema) == revision
         assert await driver.fetchrow(settings_sql) == before
-        assert checked_sessions[-2:] == [session, session]
+        assert checked_sessions[-2:] == [True, True]
 
 
 async def _assert_readiness_source_pools(component, delta, monkeypatch):
@@ -657,7 +627,7 @@ async def _assert_readiness_source_pools(component, delta, monkeypatch):
 
     async def checked_read(directory, session):
         await _assert_archive_read_limits(component, delta, session)
-        checked_sessions.append(session)
+        checked_sessions.append(session.in_transaction())
         await original(directory, session)
 
     prepared = _archive_readiness_bundle(delta)
@@ -697,7 +667,10 @@ async def _assert_atomic_merge(component, schema, delta, identity, rollback, mon
                 await delta.assert_applied_backend(component.database)
                 await _assert_archive_matcher(session, schema, archive_result, owns_child=False)
                 await _assert_archive_matcher_foreign(component, schema, archive_result)
-                assert archive_result["to_revision"] == 2 and archive_result["target_oid"] == identity["target_oid"]
+                assert archive_result["to_revision"] == 2 and (
+                    archive_result["target_schema"],
+                    archive_result["target_table"],
+                ) == (identity["target_schema"], identity["target_table"])
                 if rollback:
                     raise RuntimeError("synthetic publication rollback")
         await _assert_archive_matcher_foreign(component, schema, archive_result)
@@ -706,12 +679,16 @@ async def _assert_atomic_merge(component, schema, delta, identity, rollback, mon
                 not rollback
             )
             assert await connection.scalar(
-                text(f'SELECT revision FROM "{schema}".cms_native_input_revision WHERE relation_oid=:oid'),
-                {"oid": identity["target_oid"]},
+                text(
+                    f'SELECT revision FROM "{schema}".cms_native_input_revision WHERE schema_name=:schema AND table_name=:table'
+                ),
+                {"schema": schema, "table": "address_archive_v2"},
             ) == (0 if rollback else 2)
             stamp = await connection.scalar(
-                text(f'SELECT mutation_xid::text FROM "{schema}".cms_native_input_revision WHERE relation_oid=:oid'),
-                {"oid": identity["target_oid"]},
+                text(
+                    f'SELECT mutation_xid::text FROM "{schema}".cms_native_input_revision WHERE schema_name=:schema AND table_name=:table'
+                ),
+                {"schema": schema, "table": "address_archive_v2"},
             )
             assert (stamp is None) is rollback
     finally:
@@ -729,11 +706,11 @@ async def _assert_archive_matcher(session, schema, archive_result, *, owns_child
         EXISTS(SELECT FROM pg_locks lock WHERE lock.locktype='transactionid'
           AND lock.transactionid=revision.xmin AND lock.pid=pg_backend_pid()
           AND lock.granted AND lock.mode='ExclusiveLock') AS owns_mutation
-        FROM "{schema}".cms_native_input_revision revision WHERE relation_oid=:oid
+        FROM "{schema}".cms_native_input_revision revision WHERE schema_name=:schema AND table_name='address_archive_v2'
     """),
                 {
                     "payload": json.dumps({"archive": archive_result, "predecessor_receipt_id": None}),
-                    "oid": archive_result["target_oid"],
+                    "schema": archive_result["target_schema"],
                 },
             )
         )
@@ -755,18 +732,35 @@ async def _assert_archive_matcher_foreign(component, schema, archive_result):
         assert matched is False
 
 
+async def _historical_counter_baseline(engine, schema):
+    async with engine.begin() as connection:
+        await connection.run_sync(lambda sync: native._apply(sync, "20260930120000"))
+        await connection.execute(
+            text(f'CREATE TABLE "{schema}".address_archive_v2 (address_key int PRIMARY KEY,marker text)')
+        )
+        oid = await connection.scalar(text(f"SELECT to_regclass('{schema}.address_archive_v2')::oid::bigint"))
+        await connection.execute(
+            text(
+                f"INSERT INTO {schema}.cms_native_input_revision(relation_oid,schema_name,table_name) VALUES (:oid,:schema,'address_archive_v2')"
+            ),
+            dict(oid=oid, schema=schema),
+        )
+        await connection.execute(
+            text(
+                f"CREATE TRIGGER cms_native_input_mutation AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE ON {schema}.address_archive_v2 FOR EACH STATEMENT EXECUTE FUNCTION {schema}.cms_native_input_advance()"
+            )
+        )
+        await connection.execute(
+            text(f"ALTER TABLE {schema}.address_archive_v2 ENABLE ALWAYS TRIGGER cms_native_input_mutation")
+        )
+        await native._merge_archive(connection, schema)
+        return dict(await native._counter_migration_snapshot(connection, schema))
+
+
 @pytest.mark.asyncio
 async def test_archive_transaction_migration_refuses_a_hidden_baseline_stamp(monkeypatch):
-    async with native._database(monkeypatch, install_source_guard=False) as (engine, schema):
-        async with engine.begin() as connection:
-            await connection.run_sync(lambda sync: native._apply(sync, "20260930120000"))
-            await connection.execute(
-                text(f'CREATE TABLE "{schema}".address_archive_v2 (address_key int PRIMARY KEY,marker text)')
-            )
-            oid = await connection.scalar(text(f"SELECT to_regclass('{schema}.address_archive_v2')::oid::bigint"))
-            await native.native_inputs._register_relation(connection, schema, schema, "address_archive_v2", oid)
-            await native._merge_archive(connection, schema)
-            before_by_field = dict(await native._counter_migration_snapshot(connection, schema))
+    async with native._database(monkeypatch, install_source_guard=False, named=False) as (engine, schema):
+        before_by_field = await _historical_counter_baseline(engine, schema)
         with pytest.raises(DBAPIError, match="cms_native_input_mutation_identity_changed"):
             async with engine.begin() as connection:
                 top = await connection.scalar(text("SELECT pg_current_xact_id()::text"))

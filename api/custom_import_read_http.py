@@ -23,7 +23,7 @@ import orjson
 from sanic import response
 from sqlalchemy import select, text
 
-from api.signed_request_reader import _request_uuid, _safe_reader_identity, signed_request_reader
+from api.signed_request_reader import _request_uuid, signed_request_reader
 from db.models.custom_import import CustomImportDataset
 from process.custom_import.failure_diagnostics import _failure_chain, _static_attribute, database_sqlstate
 from process.custom_import.read_contracts import (
@@ -945,7 +945,6 @@ def _log_failure(failure: BaseException) -> None:
             request_id_source = snapshot.get("request_id_source")
             fields_by_name.update(
                 boundary=snapshot["boundary"],
-                reader=_safe_reader_identity(snapshot.get("reader")),
                 request_id=_request_uuid(snapshot.get("request_id")),
                 request_id_source=request_id_source
                 if request_id_source in {"verified_transport", "forwarded", "core"}

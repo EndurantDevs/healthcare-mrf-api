@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -123,9 +122,7 @@ def test_validated_dataset_selection_rejects_current_metadata_and_proof_gaps():
 
 def _replay_metadata(candidate):
     return {
-        importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: (
-            candidate.resource_hash_contract
-        ),
+        importer.RESOURCE_HASH_CONTRACT_METADATA_KEY: (candidate.resource_hash_contract),
         "acquisition_root_run_id": candidate.acquisition_root_run_id,
         "selected_resources": list(candidate.selected_resources),
         "expected_resources": list(candidate.expected_resources),
@@ -146,9 +143,7 @@ def test_finalized_dataset_replay_rejects_metadata_identity_and_diagnostics():
     mismatched_metadata = _replay_metadata(candidate)
     mismatched_metadata["source_ids"] = ["source-other"]
     with pytest.raises(RuntimeError, match="published_identity_mismatch"):
-        importer._assert_finalized_endpoint_dataset_replay(
-            _candidate(published_metadata=mismatched_metadata)
-        )
+        importer._assert_finalized_endpoint_dataset_replay(_candidate(published_metadata=mismatched_metadata))
 
     metadata = _replay_metadata(candidate)
     metadata["resource_diagnostics"] = None
@@ -173,9 +168,7 @@ async def test_unexpected_empty_checkpoint_reset_is_guarded_and_exact(
     checkpoint_saver = AsyncMock()
     monkeypatch.setattr(importer, "_save_pagination_checkpoint", checkpoint_saver)
     unexpected_empty_result = SimpleNamespace(error=unexpected_empty_error)
-    await importer._reset_unexpected_empty_pagination_checkpoint(
-        {}, "Practitioner", 100, unexpected_empty_result
-    )
+    await importer._reset_unexpected_empty_pagination_checkpoint({}, "Practitioner", 100, unexpected_empty_result)
     checkpoint_saver.assert_not_awaited()
 
     checkpoint_context = _context()
@@ -209,9 +202,7 @@ async def test_unexpected_empty_checkpoint_reset_is_guarded_and_exact(
 
     checkpoint_saver.reset_mock()
     unrelated_result = SimpleNamespace(error="unrelated_fetch_error")
-    await importer._reset_unexpected_empty_pagination_checkpoint(
-        source_by_field, "Practitioner", 100, unrelated_result
-    )
+    await importer._reset_unexpected_empty_pagination_checkpoint(source_by_field, "Practitioner", 100, unrelated_result)
     checkpoint_saver.assert_not_awaited()
 
 
@@ -247,6 +238,7 @@ async def test_dataset_validation_lock_rejects_missing_stale_and_changed_rows():
     candidate = _candidate()
 
     connection = AsyncMock()
+    connection.scalar.return_value = True
     connection.first.return_value = None
     with pytest.raises(RuntimeError, match="api_endpoint_missing"):
         await importer._lock_endpoint_dataset_for_validation(connection, candidate)
@@ -279,6 +271,26 @@ async def test_dataset_validation_lock_rejects_missing_stale_and_changed_rows():
         await importer._lock_endpoint_dataset_for_validation(connection, candidate)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("isolated", [True, False])
+@pytest.mark.parametrize("source_exists", [True, False])
+async def test_candidate_source_validation_preserves_scope(monkeypatch, isolated, source_exists):
+    from process import provider_directory_generic_source_policy as policy
+
+    monkeypatch.setattr(policy, "current_source_storage_binding", lambda: object() if isolated else None)
+    candidate = _candidate(source_ids=("source-2", "source-1", "source-1"))
+    connection = SimpleNamespace(
+        all=AsyncMock(return_value=[{"source_id": "source-1"}, {"source_id": "source-2"}] if source_exists else [])
+    )
+    if source_exists:
+        await importer._lock_validated_candidate_sources(connection, candidate)
+    else:
+        with pytest.raises(RuntimeError, match="endpoint_dataset_source_changed"):
+            await importer._lock_validated_candidate_sources(connection, candidate)
+    assert connection.all.await_args.kwargs == {"source_ids": ["source-1", "source-2"]}
+    assert ("FOR NO KEY UPDATE" in connection.all.await_args.args[0]) is (not isolated)
+
+
 def test_linked_resource_urls_cover_reference_endpoint_and_api_fallbacks():
     assert importer._linked_resource_candidate_urls(
         {},
@@ -287,18 +299,17 @@ def test_linked_resource_urls_cover_reference_endpoint_and_api_fallbacks():
         reference="https://reference.test/Organization/org%201?old=1",
     ) == ["https://reference.test/Organization/org%201"]
 
-    assert importer._linked_resource_candidate_urls(
-        {"endpoint_organization": "Organization"},
-        "Organization",
-        "org-1",
-    ) == []
+    assert (
+        importer._linked_resource_candidate_urls(
+            {"endpoint_organization": "Organization"},
+            "Organization",
+            "org-1",
+        )
+        == []
+    )
 
     endpoint_urls = importer._linked_resource_candidate_urls(
-        {
-            "endpoint_organization": (
-                "https://example.test/fhir/Organization?_id=existing"
-            )
-        },
+        {"endpoint_organization": ("https://example.test/fhir/Organization?_id=existing")},
         "Organization",
         "org-1",
     )
@@ -316,15 +327,14 @@ def test_linked_resource_urls_cover_reference_endpoint_and_api_fallbacks():
 
 
 def test_address_overlay_components_clean_strings_duplicates_and_invalid_values():
-    assert importer._clean_address_overlay_components(
-        " practitioner_address,organization_address "
-    ) == ("practitioner_address", "organization_address")
-    assert importer._clean_address_overlay_components(
-        ["", "practitioner_role", "practitioner_role"]
-    ) == ("practitioner_role",)
-    assert importer._clean_address_overlay_components([]) == (
-        importer.ADDRESS_OVERLAY_COMPONENTS
+    assert importer._clean_address_overlay_components(" practitioner_address,organization_address ") == (
+        "practitioner_address",
+        "organization_address",
     )
+    assert importer._clean_address_overlay_components(["", "practitioner_role", "practitioner_role"]) == (
+        "practitioner_role",
+    )
+    assert importer._clean_address_overlay_components([]) == (importer.ADDRESS_OVERLAY_COMPONENTS)
     with pytest.raises(ValueError, match="unknown Provider Directory"):
         importer._clean_address_overlay_components(b"practitioner_role")
     with pytest.raises(ValueError, match="unknown Provider Directory"):

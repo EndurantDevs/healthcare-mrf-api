@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Native custody and ordinary generation CAS for the fixed Doctors family."""
+"""Named native models and ordinary generation CAS for the fixed Doctors family."""
 
-import asyncio
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -15,13 +14,10 @@ from process import reference_family_result_generation as generation
 
 @dataclass(frozen=True)
 class _ProtectedReferencePublication:
-    session: object
-    connection: object
-    task: object
     importer_id: str
     schema_name: str
-    owner_oid: int
-    transaction_identity: tuple
+    owner_role: str
+    role_policy: object = None
 
 
 _PROTECTED_PUBLICATION = ContextVar("protected_reference_publication", default=None)
@@ -38,49 +34,22 @@ def _require(condition, code):
         raise RuntimeError("cms_doctors_immutable_" + code)
 
 
-async def _protected_transaction_identity(session):
-    _require(session.in_transaction(), "protected_transaction_changed")
-    row = (
-        await session.execute(
-            text(
-                "SELECT pg_backend_pid(),pg_current_xact_id()::text,"
-                "(SELECT oid::bigint FROM pg_database WHERE datname=current_database()),"
-                "(SELECT oid::bigint FROM pg_roles WHERE rolname=session_user),"
-                "current_setting('transaction_read_only')='off'"
-            )
-        )
-    ).one()
-    _require(all(value is not None for value in row[:4]) and row[4] is True, "protected_transaction_changed")
-    return tuple(row[:4])
-
-
 @asynccontextmanager
-async def protected_reference_family_publication(session, *, importer_id, schema_name, expected_owner_oid):
-    """Bind genuine retained publication without borrowing physical SOURCE authority."""
-    from process.provider_directory_generic_source_policy import _PUBLISHER
-    from process.provider_directory_projection_stage import _copy_driver
-    from process.reference_family_archive import protected_publisher_owner
+async def protected_reference_family_publication(
+    session, *, importer_id, schema_name, expected_owner_oid=None, roles=None
+):
+    """Keep the existing atomic cutover scope, using configured names for administrative DCL."""
+    from process.provider_directory_generic_source_policy import _PUBLISHER, _require_active_source_session
+    from process.reference_family_archive import model_family_roles
 
+    _require_active_source_session(session)
     _require(
-        importer_id in {"geo", "cms-doctors"}
-        and type(expected_owner_oid) is int
-        and 0 < expected_owner_oid < 2**32
-        and _PROTECTED_PUBLICATION.get() is None
-        and _PUBLISHER.get() is None,
+        importer_id in {"geo", "cms-doctors"} and _PROTECTED_PUBLICATION.get() is None and _PUBLISHER.get() is None,
         "protected_scope_invalid",
     )
     schema = generation._schema_name(schema_name)
-    _require(await protected_publisher_owner(session) == expected_owner_oid, "protected_owner_changed")
-    publication = _ProtectedReferencePublication(
-        session,
-        await _copy_driver(session),
-        asyncio.current_task(),
-        importer_id,
-        schema,
-        expected_owner_oid,
-        await _protected_transaction_identity(session),
-    )
-    token = _PROTECTED_PUBLICATION.set(publication)
+    owner, _readers = model_family_roles(roles)
+    token = _PROTECTED_PUBLICATION.set(_ProtectedReferencePublication(importer_id, schema, owner, roles))
     try:
         async with session.begin_nested():
             yield
@@ -90,40 +59,31 @@ async def protected_reference_family_publication(session, *, importer_id, schema
 
 
 async def _protected_reference_writer(session, importer_id, schema_name=None):
-    """Recheck the original Publisher, native backend and top transaction at each cut boundary."""
-    from process.provider_directory_projection_stage import _copy_driver
-    from process.reference_family_archive import protected_publisher_owner
-
+    """Retain declared cutover scope while PostgreSQL authorizes the native statements."""
     publication = _PROTECTED_PUBLICATION.get()
     if publication is None:
         return None
+    from process.provider_directory_generic_source_policy import _require_active_source_session
+
+    _require_active_source_session(session)
     _require(
-        publication.session is session
-        and publication.task is asyncio.current_task()
-        and publication.importer_id == importer_id
-        and (schema_name is None or publication.schema_name == schema_name),
+        publication.importer_id == importer_id and (schema_name is None or publication.schema_name == schema_name),
         "protected_scope_changed",
-    )
-    _require(
-        await _copy_driver(session) is publication.connection
-        and await protected_publisher_owner(session) == publication.owner_oid
-        and await _protected_transaction_identity(session) == publication.transaction_identity,
-        "protected_authority_changed",
     )
     return publication
 
 
 async def _archive_writer(session, importer_id, schema_name=None):
     publication = await _protected_reference_writer(session, importer_id, schema_name)
-    return await _writer(session) if publication is None else publication.owner_oid
+    return await _writer(session) if publication is None else publication.owner_role
 
 
 async def _owner(session, schema, *, native_policy=None):
-    """Authenticate physical SOURCE custody separately from retained clone ownership."""
-    from process.plan_release_storage_custody import storage_roles
+    """Return declared administrative role names without deriving ownership from the catalog."""
     from process.provider_directory_generic_source_policy import _PUBLISHER, GenericSourcePolicy, bound_publisher
-    from process.provider_directory_projection_stage import _copy_driver
+    from process.reference_family_archive import model_family_roles
 
+    generation._schema_name(schema)
     policy = native_policy
     if _PUBLISHER.get() is not None:
         current = bound_publisher().policy
@@ -131,102 +91,45 @@ async def _owner(session, schema, *, native_policy=None):
         policy = current
     if policy is not None:
         _require(type(policy) is GenericSourcePolicy and policy.schema == schema, "native_policy_changed")
-        owner, _readers = await storage_roles(await _copy_driver(session), schema, **policy.role_arguments())
-        return owner
-    owner = await _physical_owner(session, schema)
-    _require(type(owner) is int and owner > 0, "owner_unavailable")
-    return owner
-
-
-async def _physical_owner(session, schema):
-    return await session.scalar(
-        text(
-            "SELECT r.oid::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-            "JOIN pg_roles r ON r.oid=c.relowner WHERE n.nspname=:schema "
-            "AND c.relname='provider_directory_endpoint_dataset' AND c.relkind='r' AND c.relpersistence='p' "
-            "AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity AND NOT r.rolcanlogin AND NOT r.rolsuper "
-            "AND NOT r.rolcreaterole AND NOT r.rolcreatedb AND NOT r.rolreplication AND NOT r.rolbypassrls "
-            "AND NOT EXISTS(SELECT FROM pg_roles elevated WHERE "
-            "(pg_has_role(r.oid,elevated.oid,'SET') OR pg_has_role(r.oid,elevated.oid,'USAGE')) "
-            "AND (elevated.rolsuper OR elevated.rolcreaterole OR elevated.rolcreatedb "
-            "OR elevated.rolreplication OR elevated.rolbypassrls))"
-        ),
-        {"schema": schema},
-    )
+        return model_family_roles(policy)[0]
+    publication = _PROTECTED_PUBLICATION.get()
+    return model_family_roles(None if publication is None else publication.role_policy)[0]
 
 
 async def _storage_owner(session, importer, schema, pairs, *, native_policy=None):
-    """Accept only physical SOURCE custody or the exact protected, ledger-bound family."""
-    from process.provider_directory_generic_source_policy import _PUBLISHER
+    """Validate the named family without using roles as published read authority."""
+    from process.provider_directory_generic_source_policy import _PUBLISHER, bound_publisher
 
+    generation._schema_name(schema)
+    names = tuple(name for name, _old_address in pairs)
+    _require(bool(names) and len(set(names)) == len(names), "family_invalid")
+    for name in names:
+        generation._schema_name(name)
     if native_policy is not None or _PUBLISHER.get() is not None:
-        return await _owner(session, schema, native_policy=native_policy)
-    oids = tuple(oid for _name, oid in pairs)
-    owner = await session.scalar(
-        text(
-            "SELECT CASE WHEN count(*)=:count AND count(DISTINCT relowner)=1 THEN min(relowner::bigint) END "
-            "FROM pg_class WHERE oid=ANY(:oids)"
-        ),
-        {"count": len(oids), "oids": list(oids)},
-    )
-    _require(type(owner) is int and owner > 0, "owner_unavailable")
-    publication = await _protected_reference_writer(session, importer, schema)
-    if owner == await _physical_owner(session, schema):
-        return owner
-    await _require_protected_storage_owner(session, owner)
-    if publication is None:
-        authority = await generation.read_reference_family_result_generation_authority(
-            session, importer_id=importer, schema_name=schema
-        )
-        _require(
-            tuple(name for name, _oid in pairs) == generation.RELATION_NAMES_BY_IMPORTER[importer]
-            and authority.relation_oids == oids,
-            "read_pointer_changed",
-        )
-    else:
-        _require(owner == publication.owner_oid, "protected_owner_changed")
-    return owner
-
-
-async def _require_protected_storage_owner(session, owner):
-    safe = await session.scalar(
-        text(
-            "SELECT r.oid=:owner AND NOT r.rolcanlogin AND NOT r.rolsuper AND NOT r.rolcreaterole "
-            "AND NOT r.rolcreatedb AND NOT r.rolreplication AND NOT r.rolbypassrls "
-            "AND NOT EXISTS(SELECT FROM pg_roles elevated WHERE "
-            "(pg_has_role(r.oid,elevated.oid,'SET') OR pg_has_role(r.oid,elevated.oid,'USAGE')) "
-            "AND (elevated.rolsuper OR elevated.rolcreaterole OR elevated.rolcreatedb "
-            "OR elevated.rolreplication OR elevated.rolbypassrls)) "
-            "FROM pg_namespace n JOIN pg_roles r ON r.oid=n.nspowner WHERE n.nspname='hp_snapshot_retention'"
-        ),
-        {"owner": owner},
-    )
-    _require(safe is True, "protected_owner_changed")
+        policy = bound_publisher().policy if _PUBLISHER.get() is not None else native_policy
+        return await _owner(session, policy.schema, native_policy=native_policy)
+    # Stage and retained heaps live outside the cutover's serving schema, under the same importer scope.
+    publication = await _protected_reference_writer(session, importer)
+    return None if publication is None else publication.owner_role
 
 
 async def _create_protected_predecessor_schema(session, importer, schema):
     publication = await _protected_reference_writer(session, importer)
     if publication is None:
         return None
-    owner = await session.scalar(
-        text("SELECT quote_ident(rolname) FROM pg_roles WHERE oid=:owner"), {"owner": publication.owner_oid}
+    await session.execute(
+        text(f"CREATE SCHEMA {storage_identifier(schema)} AUTHORIZATION {storage_identifier(publication.owner_role)}")
     )
-    _require(owner is not None, "protected_owner_changed")
-    await session.execute(text(f"CREATE SCHEMA {storage_identifier(schema)} AUTHORIZATION {owner}"))
-    return publication.owner_oid
+    return publication.owner_role
 
 
 async def _writer(session):
-    from process.provider_directory_generic_source_policy import bound_publisher, source_copy_session
+    from process.provider_directory_generic_source_policy import _require_active_source_session, bound_publisher
 
-    publisher, original = bound_publisher(), source_copy_session()
-    _require(original is session, "original_session_changed")
-    actor = await publisher.connection.fetchrow("SELECT session_user::text s,current_user::text c")
-    _require(
-        actor["s"] == publisher.policy.publisher_role and actor["c"] == publisher.policy.owner_role,
-        "publisher_changed",
-    )
-    return await _owner(session, publisher.policy.schema, native_policy=publisher.policy)
+    _require_active_source_session(session)
+    policy = bound_publisher().policy
+    storage_identifier(policy.owner_role)
+    return policy.owner_role
 
 
 async def create_doctors_stage(database, model, import_date, schema):
@@ -244,13 +147,6 @@ async def create_doctors_stage(database, model, import_date, schema):
     async with source_owner_transaction(database) as publisher:
         session = source_copy_session()
         _require(schema == publisher.policy.schema, "schema_changed")
-        _require(
-            await _owner(session, schema)
-            == await publisher.connection.fetchval(
-                "SELECT oid::bigint FROM pg_roles WHERE rolname=$1", publisher.policy.owner_role
-            ),
-            "owner_tuple_changed",
-        )
         stage = make_class(model, import_date, schema_override=schema)
         name = str(stage.__table__.name)
         relation = storage_relation(schema, name)
@@ -264,18 +160,14 @@ async def create_doctors_stage(database, model, import_date, schema):
         await connection.run_sync(lambda sync: table.create(sync, checkfirst=False))
         await _close_grants(publisher.connection, publisher.policy, name)
         oid = await publisher.connection.fetchval(
-            "SELECT oid::bigint FROM pg_class WHERE oid=to_regclass($1) AND relowner="
-            "(SELECT oid FROM pg_roles WHERE rolname=$2)",
+            "SELECT oid::bigint FROM pg_class WHERE oid=to_regclass($1)",
             relation,
-            publisher.policy.owner_role,
         )
         _require(type(oid) is int and oid > 0, "stage_owner_changed")
         await _shape(session, model, oid, indexed=False)
-        from process.entity_address_snapshot_preparation import _require_no_untrusted_mutation
         from process.mrf_address_publication import require_native_read_catalog
 
         await require_native_read_catalog(session, (oid,))
-        await _require_no_untrusted_mutation(session, [oid], await _owner(session, schema))
         return stage
 
 
@@ -283,7 +175,7 @@ async def create_doctors_archive_schema(session, schema, protected_owner=None):
     """Use original Publisher CREATE authority, retaining the physical SOURCE owner."""
     from uuid import UUID
 
-    from process.provider_directory_generic_source_policy import _PUBLISHER, bound_publisher, source_publisher_body
+    from process.provider_directory_generic_source_policy import _PUBLISHER, source_publisher_body
     from process.reference_family_archive import _STAGE_PREFIX, reference_family_stage_schema
 
     if protected_owner is not None or _PUBLISHER.get() is None:
@@ -292,7 +184,6 @@ async def create_doctors_archive_schema(session, schema, protected_owner=None):
         schema == reference_family_stage_schema(UUID(schema.removeprefix(_STAGE_PREFIX))), "stage_identity_invalid"
     )
     owner = await _writer(session)
-    _require(protected_owner is None or protected_owner == owner, "owner_tuple_changed")
     async with source_publisher_body(session) as publisher:
         await session.execute(
             text(
@@ -300,7 +191,6 @@ async def create_doctors_archive_schema(session, schema, protected_owner=None):
                 f"AUTHORIZATION {storage_identifier(publisher.policy.owner_role)}"
             )
         )
-        _require(publisher is bound_publisher(), "publisher_changed")
     return owner
 
 
@@ -310,22 +200,18 @@ async def create_model_family_export_clone(session, spec, schema):
 
     from process import reference_family_archive as archive
 
-    owner = await archive.protected_publisher_owner(session) if spec.importer_id == "cms-doctors" else None
     await archive._create_model_family(
         session,
         spec,
         schema,
         create_indexes=False,
         ordinary_heaps=True,
-        protected_owner_oid=owner,
     )
     ownership = await archive._capture_model_family_ownership(
         session,
         spec,
         UUID(schema.removeprefix(archive._STAGE_PREFIX)),
     )
-    if owner is not None:
-        await archive.seal_model_family_storage(session, ownership, owner, require_empty=True)
     return ownership
 
 
@@ -348,61 +234,59 @@ async def create_model_family_predecessor_schema(session, importer, schema):
 async def model_family_publisher_owner(session, importer):
     """Keep native SOURCE publication distinct from retained clone authority."""
     from process.provider_directory_generic_source_policy import _PUBLISHER
-    from process.reference_family_archive import protected_publisher_owner
+    from process.reference_family_archive import model_family_roles
 
     if importer == "cms-doctors" and _PUBLISHER.get() is not None:
         return await _writer(session)
-    return await protected_publisher_owner(session)
+    return model_family_roles()[0]
 
 
-async def seal_model_family_relation(session, ownership, oid, owner):
-    """Seal SOURCE Doctors under their physical owner; retained families keep their own authority."""
-    from dataclasses import replace
+async def _freeze_named_model_relations(session, schema, names, roles=None):
+    from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
+    from process.provider_directory_projection_stage import _copy_driver
+    from process.reference_family_archive import model_family_roles
 
-    from process.entity_address_snapshot_preparation import _require_no_untrusted_mutation, _seal_published_relation
-    from process.mrf_address_publication import require_native_read_catalog
-    from process.provider_directory_generic_source_policy import _PUBLISHER, bound_publisher
-    from process.provider_directory_generic_source_storage import _close_grants
-
-    if ownership.importer_id != "cms-doctors" or _PUBLISHER.get() is None:
-        await _seal_published_relation(session, oid, owner)
-        return
-    _require(await _writer(session) == owner and not ownership.sequence_oids, "owner_tuple_changed")
-    models_by_name = {str(model.__tablename__): model for model in _models()}
-    _require(set(dict(ownership.relation_oids)) == set(models_by_name), "family_invalid")
-    name = next(name for name, relation_oid in ownership.relation_oids if relation_oid == oid)
-    publisher = bound_publisher()
-    policy = replace(publisher.policy, schema=ownership.schema_name)
-    await _close_grants(publisher.connection, policy, name, readable=True)
-    await _heap_custody(session, models_by_name[name], ownership.schema_name, name, oid, owner)
-    _require(
-        not await session.scalar(
-            text("SELECT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=:oid AND NOT tgisinternal)"), {"oid": oid}
-        ),
-        "hooks_changed",
+    owner, readers = model_family_roles(roles)
+    await freeze_fhir_source_snapshot(
+        await _copy_driver(session),
+        schema,
+        namespace_owner=owner,
+        reader_roles=readers,
+        application_roles=(),
+        relation_names=tuple(names),
+        freeze_schema=False,
     )
-    await _require_no_untrusted_mutation(session, [oid], owner)
-    await require_native_read_catalog(session, (oid,))
+
+
+async def seal_model_family_relation(session, ownership, oid=None, owner=None):
+    """Close the complete declared model family, ignoring old physical compatibility arguments."""
+    from process.provider_directory_generic_source_policy import _PUBLISHER, bound_publisher
+
+    names = getattr(ownership, "relation_names", None)
+    if names is None:
+        names = tuple(name for name, _old_address in ownership.relation_oids)
+    policy = bound_publisher().policy if _PUBLISHER.get() is not None else None
+    protected = _PROTECTED_PUBLICATION.get()
+    if policy is None and protected is not None:
+        policy = protected.role_policy
+    await _freeze_named_model_relations(session, ownership.schema_name, names, policy)
 
 
 async def seal_doctors_stages(database, schema, import_date):
-    """Expose only SELECT after the complete private family is ready."""
+    """Close finished private heaps with configured SELECT; leave shared controls unchanged."""
     from process.ext.utils import make_class
     from process.provider_directory_generic_source_policy import bound_publisher, source_copy_session
-    from process.provider_directory_generic_source_storage import _close_grants
 
     publisher, session = bound_publisher(), source_copy_session()
-    _require(
-        database._transaction_binding().session is session and publisher.policy.schema == schema,
-        "original_session_changed",
+    from process.provider_directory_generic_source_policy import _require_active_source_session
+
+    _require_active_source_session(session)
+    _require(publisher.policy.schema == schema, "schema_changed")
+    names = tuple(str(make_class(model, import_date, schema_override=schema).__table__.name) for model in _models())
+    await _freeze_named_model_relations(session, schema, names, publisher.policy)
+    return await require_doctors_storage(
+        session, schema_name=schema, relation_names=names, native_policy=publisher.policy
     )
-    pairs = []
-    for model in _models():
-        name = str(make_class(model, import_date, schema_override=schema).__table__.name)
-        oid = await publisher.connection.fetchval("SELECT to_regclass($1)::oid::bigint", storage_relation(schema, name))
-        await _close_grants(publisher.connection, publisher.policy, name, readable=True)
-        pairs.append((name, oid))
-    return await require_doctors_storage(session, schema_name=schema, relation_pairs=pairs)
 
 
 def _column_shape(model):
@@ -477,97 +361,109 @@ def _index_shape_matches(model, required, actual, is_legacy_group, is_geo_incumb
 
 
 async def _executable_subjects(session, schema, native_policy):
-    from process.plan_release_storage_custody import storage_roles
-    from process.provider_directory_generic_source_policy import _PUBLISHER, GenericSourcePolicy, bound_publisher
-    from process.provider_directory_projection_stage import _copy_driver
+    from process.provider_directory_generic_source_policy import GenericSourcePolicy
 
     _require(type(native_policy) is GenericSourcePolicy and native_policy.schema == schema, "native_policy_changed")
-    if _PUBLISHER.get() is not None:
-        _require(bound_publisher().policy == native_policy, "native_policy_changed")
-    owner, _readers = await storage_roles(await _copy_driver(session), schema, **native_policy.role_arguments())
-    _require(owner == await _owner(session, schema, native_policy=native_policy), "owner_tuple_changed")
     return (native_policy.owner_role, native_policy.publisher_role)
 
 
-async def require_doctors_storage(session, *, schema_name, relation_pairs=None, legacy=False, native_policy=None):
+async def require_doctors_storage(
+    session, *, schema_name, relation_pairs=None, relation_names=None, legacy=False, native_policy=None
+):
     """Authenticate all three native heaps; callers cannot assert immutability."""
-    from process.entity_address_snapshot_preparation import _require_no_untrusted_mutation
     from process.mrf_address_publication import require_native_read_catalog
 
     schema = generation._schema_name(schema_name)
-    executable_roles = None if native_policy is None else await _executable_subjects(session, schema, native_policy)
     names = generation.RELATION_NAMES_BY_IMPORTER["cms-doctors"]
-    pairs = (
-        tuple(relation_pairs)
-        if relation_pairs is not None
-        else tuple(
-            zip(
-                names,
-                await generation.current_reference_family_relation_oids(
-                    session, importer_id="cms-doctors", schema_name=schema
-                ),
-            )
-        )
+    requested = (
+        tuple(relation_names)
+        if relation_names is not None
+        else (tuple(name for name, _old in relation_pairs) if relation_pairs is not None else names)
     )
     _require(
         session.in_transaction()
-        and len(pairs) == 3
-        and len({oid for _, oid in pairs}) == 3
-        and all(type(oid) is int and 0 < oid < 2**32 for _, oid in pairs),
+        and len(requested) == 3
+        and len(set(requested)) == 3
+        and not (relation_pairs is not None and relation_names is not None),
         "family_invalid",
     )
-    owner = await _storage_owner(session, "cms-doctors", schema, pairs, native_policy=native_policy)
+    from process.reference_family_archive import _relation_oid
+
+    pairs = tuple([(generation._schema_name(name), await _relation_oid(session, schema, name)) for name in requested])
+    _require(all(address is not None for _name, address in pairs), "family_invalid")
+    # Validates the declared names and active publication scope; the catalog owner is not compared.
+    await _storage_owner(session, "cms-doctors", schema, pairs, native_policy=native_policy)
     from process.provider_directory_generic_source_policy import _PUBLISHER
 
     if native_policy is None and _PUBLISHER.get() is None and _PROTECTED_PUBLICATION.get() is None:
         await _require_read_pointer(session, schema, pairs)
-    oids = [oid for _, oid in pairs]
-    hooks = await session.scalar(
-        text("SELECT count(*) FROM pg_trigger WHERE tgrelid=ANY(:oids) AND NOT tgisinternal"), {"oids": oids}
-    )
+    hooks = await _named_hook_count(session, schema, requested)
     is_legacy_group = False
     if hooks and legacy:
-        _require(tuple(name for name, _ in pairs) == names, "legacy_hooks_changed")
-        await _legacy_hooks(session, schema, oids)
+        _require(requested == names, "legacy_hooks_changed")
+        await _legacy_hooks(session, schema, requested)
         authority = await generation.read_reference_family_result_generation_authority(
             session,
             importer_id="cms-doctors",
             schema_name=schema,
         )
-        is_legacy_group = authority.serving_generation is not None and authority.relation_oids == tuple(oids)
-    for model, (name, oid) in zip(_models(), pairs, strict=True):
-        await _heap_custody(session, model, schema, name, oid, owner, is_legacy_group=is_legacy_group)
-    await _require_no_untrusted_mutation(session, oids, owner)
+        is_legacy_group = authority.serving_generation is not None and authority.relations == tuple(
+            (schema, name) for name, _ in pairs
+        )
+    for model, (name, _address) in zip(_models(), pairs, strict=True):
+        await _heap_custody(session, model, schema, name, is_legacy_group=is_legacy_group)
     if not (hooks and legacy):
         _require(hooks == 0, "hooks_changed")
-        if executable_roles is None:
-            await require_native_read_catalog(session, tuple(oids))
-        else:
-            await require_native_read_catalog(session, tuple(oids), executable_roles=executable_roles)
+        await require_native_read_catalog(session, tuple(address for _name, address in pairs))
     return pairs
+
+
+_NAMED_HOOKS_SQL = (
+    "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgrelid=ANY(ARRAY(SELECT "
+    "to_regclass(format('%I.%I',CAST(:schema AS text),name)) FROM unnest(CAST(:names AS text[])) name))"
+)
+
+
+async def _named_hook_count(session, schema, names):
+    """Count user triggers on the declared qualified names."""
+    return await session.scalar(text(_NAMED_HOOKS_SQL), {"schema": schema, "names": list(names)})
+
+
+def _authority_schema():
+    """The configured application schema holds every family's serving authority."""
+    import os
+
+    runtime, legacy = os.getenv("HLTHPRT_DB_SCHEMA"), os.getenv("DB_SCHEMA")
+    _require(not (runtime and legacy and runtime != legacy), "schema_configuration_changed")
+    return generation._schema_name(runtime or legacy or "mrf")
 
 
 async def _require_read_pointer(session, schema, pairs):
     names = generation.RELATION_NAMES_BY_IMPORTER["cms-doctors"]
     _require(tuple(name for name, _ in pairs) == names, "read_pointer_changed")
+    # Read the serving authority, not a ledger beside the heaps being validated.
     authority = await generation.read_reference_family_result_generation_authority(
         session,
         importer_id="cms-doctors",
-        schema_name=schema,
+        schema_name=_authority_schema(),
     )
     _require(
-        authority.relation_oids is None or authority.relation_oids == tuple(oid for _, oid in pairs),
+        authority.relations is None or authority.relations == tuple((schema, name) for name, _ in pairs),
         "read_pointer_changed",
     )
 
 
-async def _heap_custody(session, model, schema, name, oid, owner, *, is_legacy_group=False, is_geo_incumbent=False):
-    """Authenticate native identity before inspecting a fixed model or its payload."""
+async def _heap_custody(session, model, schema, name, *, is_legacy_group=False, is_geo_incumbent=False):
+    """Validate declared heap, columns, keys and complete indexes under reader locks."""
     relation = storage_relation(schema, name)
     await session.execute(text(f"LOCK TABLE ONLY {relation} IN ACCESS SHARE MODE NOWAIT"))
+    from process.reference_family_archive import _relation_oid
+
+    oid = await _relation_oid(session, schema, name)
+    _require(oid is not None, "storage_changed")
     safe = await session.scalar(
         text(
-            "SELECT oid=:oid AND relowner=:owner AND relkind='r' AND relpersistence='p' "
+            "SELECT relkind='r' AND relpersistence='p' "
             "AND NOT relispartition AND NOT relrowsecurity AND NOT relforcerowsecurity "
             "AND NOT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid) "
             "AND NOT EXISTS(SELECT FROM pg_constraint WHERE conrelid=c.oid AND "
@@ -588,13 +484,13 @@ async def _heap_custody(session, model, schema, name, oid, owner, *, is_legacy_g
             "OR op.opcnamespace<>'pg_catalog'::regnamespace))) "
             "FROM pg_class c WHERE oid=to_regclass(:relation)"
         ),
-        {"oid": oid, "owner": owner, "relation": relation},
+        {"relation": relation},
     )
     _require(safe is True, "storage_changed")
     await _shape(session, model, oid, indexed=True, is_legacy_group=is_legacy_group, is_geo_incumbent=is_geo_incumbent)
 
 
-async def _legacy_hooks(session, schema, oids):
+async def _legacy_hooks(session, schema, names):
     """Recognize only authentic old guards; new heaps always require no hooks."""
     from process import provider_directory_cms_native_inputs as inputs
     from process.reference_source_generation import _guarded_oids
@@ -605,12 +501,12 @@ async def _legacy_hooks(session, schema, oids):
         authority_schema=schema,
         relation_names=generation.RELATION_NAMES_BY_IMPORTER["cms-doctors"],
     )
-    _require(len(guarded) == 3 and set(guarded) == set(oids), "legacy_hooks_changed")
+    _require(len(set(guarded)) == 3, "legacy_hooks_changed")
     guard_rows = (
         (
             await session.execute(
                 text(
-                    "SELECT t.tgrelid::bigint oid,t.tgname::text name,t.tgtype,type.lanname,t.tgenabled::text enabled,"
+                    "SELECT c.relname::text relation,t.tgname::text name,t.tgtype,type.lanname,t.tgenabled::text enabled,"
                     "p.proname::text function,p.prosrc body,p.prosecdef,p.proconfig,p.prorettype='trigger'::regtype returns_trigger,"
                     "p.pronargs=0 AND p.prokind='f' AND NOT p.proisstrict AND NOT p.proleakproof AND NOT p.proretset "
                     "AND p.provolatile='v' AND p.proparallel='u' AND t.tgnargs=0 AND t.tgattr=''::int2vector "
@@ -618,32 +514,35 @@ async def _legacy_hooks(session, schema, oids):
                     "AND NOT t.tgdeferrable AND NOT t.tginitdeferred AND t.tgconstraint=0 AND t.tgconstrrelid=0 "
                     "AND n.nspname=:schema AS shape FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid "
                     "JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_language type ON type.oid=p.prolang "
-                    "WHERE t.tgrelid=ANY(:oids) AND NOT t.tgisinternal"
+                    "JOIN pg_class c ON c.oid=t.tgrelid "
+                    "WHERE t.tgrelid=ANY(ARRAY(SELECT to_regclass(format('%I.%I',CAST(:schema AS text),name)) "
+                    "FROM unnest(CAST(:names AS text[])) name)) AND NOT t.tgisinternal"
                 ),
-                {"schema": schema, "oids": oids},
+                {"schema": schema, "names": list(names)},
             )
         )
         .mappings()
         .all()
     )
     contracts = _legacy_contracts(schema)
-    native = _validate_legacy_hooks(guard_rows, oids, contracts)
+    native = _validate_legacy_hooks(guard_rows, names, contracts)
     if native:
         await inputs._require_ledger_guards(session, schema)
         matched = await session.scalar(
             text(
                 f"SELECT count(*)=1 FROM {storage_relation(schema, 'cms_native_input_revision')} "
-                "WHERE relation_oid=:oid AND schema_name=:schema AND table_name='doctor_clinician_address' AND revision>=0"
+                "WHERE schema_name=:schema AND table_name='doctor_clinician_address' AND revision>=0"
             ),
-            {"oid": oids[0], "schema": schema},
+            {"schema": schema},
         )
         _require(matched is True, "legacy_revision_changed")
 
 
-def _validate_legacy_hooks(rows, oids, contracts):
+def _validate_legacy_hooks(rows, relations, contracts):
     from process.reference_source_generation import REVISION_TRIGGER
 
-    oids_by_guard = {}
+    relations = list(relations)
+    relations_by_guard = {}
     for row in rows:
         _require(row["name"] in contracts, "legacy_hooks_changed")
         kind, function, security, body = contracts[row["name"]]
@@ -659,12 +558,12 @@ def _validate_legacy_hooks(rows, oids, contracts):
             and " ".join(row["body"].split()) == " ".join(body.split()),
             "legacy_hooks_changed",
         )
-        oids_by_guard.setdefault(row["name"], []).append(row["oid"])
-    _require(set(oids_by_guard.get(REVISION_TRIGGER, ())) == set(oids), "legacy_hooks_changed")
-    seal = oids_by_guard.get("cms_doctors_prepared_write_seal", ())
-    _require(not seal or set(seal) == set(oids), "legacy_hooks_changed")
-    native = oids_by_guard.get("cms_native_input_mutation", ())
-    _require(not native or native == [oids[0]], "legacy_hooks_changed")
+        relations_by_guard.setdefault(row["name"], []).append(row["relation"])
+    _require(set(relations_by_guard.get(REVISION_TRIGGER, ())) == set(relations), "legacy_hooks_changed")
+    seal = relations_by_guard.get("cms_doctors_prepared_write_seal", ())
+    _require(not seal or set(seal) == set(relations), "legacy_hooks_changed")
+    native = relations_by_guard.get("cms_native_input_mutation", ())
+    _require(not native or native == [relations[0]], "legacy_hooks_changed")
     return native
 
 
@@ -676,7 +575,8 @@ def _legacy_contracts(schema):
         BEGIN
             FOR affected_importer IN
                 SELECT importer_id FROM "{schema}"."reference_family_result_generation"
-                WHERE source_revision_tracked AND TG_RELID::bigint = ANY(relation_oids)
+                WHERE source_revision_tracked AND serving_schema=TG_TABLE_SCHEMA
+                  AND TG_TABLE_NAME=ANY(serving_relation_names)
                 ORDER BY importer_id FOR UPDATE
             LOOP
                 UPDATE "{schema}"."reference_family_result_generation"
@@ -708,7 +608,7 @@ async def capture_doctors_predecessor(session, schema):
     )
     pairs = await require_doctors_storage(session, schema_name=schema, legacy=True)
     _require(
-        authority.relation_oids is None or authority.relation_oids == tuple(oid for _, oid in pairs),
+        authority.relations is None or authority.relations == tuple((schema, name) for name, _ in pairs),
         "predecessor_changed",
     )
     return authority
@@ -763,25 +663,28 @@ async def _write_generation(session, schema, expected, fields, *, local):
         session, importer_id="cms-doctors", schema_name=schema, lock=True
     )
     _require(current.as_dict() == expected.as_dict(), "predecessor_changed")
-    row = await generation._first(
+    generation_row = await generation._first(
         session,
         text(
             f"UPDATE {storage_relation(schema, generation.TABLE_NAME)} SET "
             "local_generation=:next,origin_lineage_id=CAST(:origin AS uuid),origin_generation=:generation,"
             "published_at=" + ("clock_timestamp()" if local else "CAST(:published AS timestamptz)") + ","
-            "relation_oids=CAST(:oids AS bigint[]),source_revision_tracked=FALSE "
+            "serving_schema=:serving_schema,serving_relation_names=CAST(:names AS text[]),source_revision_tracked=FALSE "
             "WHERE importer_id='cms-doctors' AND local_lineage_id=CAST(:lineage AS uuid) AND local_generation=:prior "
-            "AND relation_oids IS NOT DISTINCT FROM CAST(:previous_oids AS bigint[]) "
-            "RETURNING importer_id,local_lineage_id,local_generation,origin_lineage_id,origin_generation,published_at,relation_oids"
+            "AND serving_schema IS NOT DISTINCT FROM :previous_schema "
+            "AND serving_relation_names IS NOT DISTINCT FROM CAST(:previous_names AS text[]) "
+            "RETURNING importer_id,local_lineage_id,local_generation,origin_lineage_id,origin_generation,published_at,serving_schema,serving_relation_names"
         ),
         **fields,
         prior=current.local_generation,
         lineage=current.local_lineage_id,
-        previous_oids=None if current.relation_oids is None else list(current.relation_oids),
-        oids=None if fields["origin"] is None else [oid for _, oid in pairs],
+        previous_schema=None if current.relations is None else current.relations[0][0],
+        previous_names=None if current.relations is None else [name for _, name in current.relations],
+        serving_schema=None if fields["origin"] is None else schema,
+        names=None if fields["origin"] is None else [name for name, _ in pairs],
     )
-    _require(row is not None, "generation_changed")
-    return generation.validate_reference_family_result_generation_authority(row)
+    _require(generation_row is not None, "generation_changed")
+    return generation.validate_reference_family_result_generation_authority(generation_row)
 
 
 async def doctors_capture_contract(session, schema, contract):
@@ -791,10 +694,7 @@ async def doctors_capture_contract(session, schema, contract):
     if contract is not None:
         return contract
     pairs = await require_doctors_storage(session, schema_name=schema, legacy=True)
-    hooks = await session.scalar(
-        text("SELECT count(*) FROM pg_trigger WHERE tgrelid=ANY(:oids) AND NOT tgisinternal"),
-        {"oids": [oid for _, oid in pairs]},
-    )
+    hooks = await _named_hook_count(session, schema, tuple(name for name, _address in pairs))
     return IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT if hooks == 0 else None
 
 
@@ -805,7 +705,7 @@ async def capture_doctors_serving_generation(session, schema):
         session, importer_id="cms-doctors", schema_name=schema
     )
     _require(
-        authority.serving_generation is not None and authority.relation_oids == tuple(oid for _, oid in pairs),
+        authority.serving_generation is not None and authority.relations == tuple((schema, name) for name, _ in pairs),
         "serving_generation_unavailable",
     )
     return authority.serving_generation

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from process import provider_directory_dataset_scoped_publication as publication
+from process import provider_directory_dataset_scoped_publication_support as support
 from process.provider_directory_dataset_scoped_publication import (
     LEGACY_PRACTITIONER_VARIANT,
     ROOTED_COMBINED_VARIANT,
@@ -377,17 +378,17 @@ async def test_registry_and_header_selection_reject_drift_and_split_brain(
 ) -> None:
     current = _legacy_current()
     database = _LegacyCurrentDatabase(current)
-    registry_by_coordinate = await publication._locked_registry_by_coordinate(
+    registry_by_coordinate = await support.exact_pair_registry_by_coordinate(
         database,
         exact_uhc_dataset_pair(),
     )
-    publication._validate_pair_registry(
+    support.validate_exact_pair_registry(
         registry_by_coordinate,
         exact_uhc_dataset_pair(),
     )
     registry_by_coordinate.pop(next(iter(registry_by_coordinate)))
     with pytest.raises(ProviderDirectoryDatasetScopedPublicationError) as drift:
-        publication._validate_pair_registry(
+        support.validate_exact_pair_registry(
             registry_by_coordinate,
             exact_uhc_dataset_pair(),
         )

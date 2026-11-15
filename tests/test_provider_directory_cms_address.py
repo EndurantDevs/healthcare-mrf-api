@@ -325,12 +325,12 @@ async def test_factory_prepares_full_desired_vector_and_retains_cleanup_ownershi
     factory = _factory(address_build_case)
     fhir, _execution, fence, dependencies = address_build_case[:4]
     prepared = SimpleNamespace(
-        stage_oids=tuple((name, name + "_staged", index + 1) for index, name in enumerate(factory.native_targets)),
+        stage_relations=tuple((name, name + "_staged") for name in factory.native_targets),
         committed=False,
         context={},
     )
     if failure == "targets":
-        prepared.stage_oids = prepared.stage_oids[:-1]
+        prepared.stage_relations = prepared.stage_relations[:-1]
     monkeypatch.setattr(address, "capture_native_dependencies", AsyncMock(return_value=dependencies))
     context_by_field = {"control_run_id": factory.run_id, "import_date": "synthetic"}
     monkeypatch.setattr(address, "_new_context", AsyncMock(return_value=context_by_field))
@@ -341,7 +341,8 @@ async def test_factory_prepares_full_desired_vector_and_retains_cleanup_ownershi
         assert build_context is context_by_field and task == address._RECIPE
         assert kwargs["native_input_hash"] == factory.input_hash
         preparation_input = kwargs["preparation_input"]
-        assert len(preparation_input.dataset_pins) == 2 and preparation_input.overlay_relation_oid == 42
+        assert len(preparation_input.dataset_pins) == 2 and preparation_input.overlay_table == "overlay_staged"
+        assert preparation_input.address_alias_generation == dependencies["alias_generation"]
         assert preparation_input.semantic_as_of == "2026-01-02"
         assert preparation_input.relation_overrides == (("provider_directory_location", "location_staged"),)
         if failure == "dependency":
@@ -461,7 +462,7 @@ async def test_factory_cleanup_runs_before_propagating_body_cancellation(address
     factory = _factory(address_build_case)
     prepared = SimpleNamespace(
         context={},
-        stage_oids=tuple((name, name + "_staged", index + 1) for index, name in enumerate(factory.native_targets)),
+        stage_relations=tuple((name, name + "_staged") for name in factory.native_targets),
     )
     monkeypatch.setattr(address, "capture_native_dependencies", AsyncMock(return_value=address_build_case[3]))
     monkeypatch.setattr(address, "_new_context", AsyncMock(return_value={}))
@@ -493,12 +494,12 @@ async def test_new_context_refuses_an_occupied_stage_and_ignores_shared_import_s
 
 @pytest.fixture
 def prepared_doctors_case(address_build_case, monkeypatch, tmp_path):
-    """Supply a typed source bundle; physical seal checks remain in separate native tests."""
+    """Supply a typed source bundle; native named storage checks remain in separate tests."""
     database = address_build_case[0].db
     monkeypatch.setattr(doctors_preparation._native(), "db", database)
     stages = tuple(
-        (model.__tablename__, doctors_preparation._native().make_class(model, "source").__tablename__, index + 70)
-        for index, model in enumerate(doctors_preparation._models())
+        (model.__tablename__, doctors_preparation._native().make_class(model, "source").__tablename__)
+        for model in doctors_preparation._models()
     )
     metrics = source_metrics(tmp_path, monkeypatch)
     provenance = mint_doctors_source_provenance(metrics)
@@ -511,14 +512,11 @@ def prepared_doctors_case(address_build_case, monkeypatch, tmp_path):
         None,
         metrics,
         {"publication_state": "prepared"},
-        sealed_filenodes=tuple((oid, oid + 1000) for _target, _stage, oid in stages),
         source_provenance_json=provenance,
     )
     bindings_by_name = json.loads(json.dumps(address_build_case[4]["geo_bindings"]))
-    bindings_by_name["fixture.doctor_clinician_address"].update(
-        table_name=stages[0][1], relation_oid=stages[0][2], relfilenode=doctors.sealed_filenodes[0][1]
-    )
-    return doctors, bindings_by_name
+    bindings_by_name["fixture.doctor_clinician_address"]["table_name"] = stages[0][1]
+    return doctors, address.source_dependencies._named_bindings("fixture", bindings_by_name)
 
 
 def test_prepared_doctors_bind_all_three_sealed_heaps_separately_from_incumbent(
@@ -529,16 +527,30 @@ def test_prepared_doctors_bind_all_three_sealed_heaps_separately_from_incumbent(
     payload = json.loads(factory.input_json)
     assert payload["native_input_fence"] == address_build_case[4]
     assert payload["native_dependencies"] == address_build_case[3]
-    assert payload["desired_doctors"]["stage_oids"] == [list(stage) for stage in doctors.stage_oids]
+    assert payload["desired_doctors"]["stage_relations"] == [list(stage) for stage in doctors.stage_relations]
     assert payload["desired_geo_bindings"] == bindings
     assert factory.source_relation_overrides == doctors.relation_overrides
     factory.source_relation_overrides.clear()
     assert len(factory.source_relation_overrides) == 3
-    bindings["fixture.doctor_clinician_address"]["relation_oid"] += 1
+    bindings["fixture.doctor_clinician_address"]["table_name"] = "changed_after_capture"
     assert factory._assert_inputs(address_build_case[2], _admission(factory)) == payload
 
 
-@pytest.mark.parametrize("change", ["missing", "incumbent", "other-input", "filenode"])
+def test_saved_source_names_keep_legacy_tokens_opaque(address_build_case, prepared_doctors_case):
+    from dataclasses import replace
+
+    doctors, bindings = prepared_doctors_case
+    factory = _factory(address_build_case, doctors=doctors, dependency_bindings=bindings)
+    saved = json.loads(factory.input_json)
+    desired = saved["desired_doctors"]
+    desired["stage_oids"] = [entry + [None] for entry in desired.pop("stage_relations")]
+    raw = json.dumps(saved)
+    old_factory = replace(factory, input_json=raw)
+    assert old_factory.source_relation_overrides == doctors.relation_overrides
+    assert old_factory.input_json == raw
+
+
+@pytest.mark.parametrize("change", ["missing", "incumbent", "other-input", "stage"])
 def test_prepared_doctors_require_exact_desired_geo_bindings(address_build_case, prepared_doctors_case, change):
     doctors, bindings = prepared_doctors_case
     if change == "missing":
@@ -546,23 +558,23 @@ def test_prepared_doctors_require_exact_desired_geo_bindings(address_build_case,
     elif change == "incumbent":
         bindings = address_build_case[4]["geo_bindings"]
     elif change == "other-input":
-        bindings["fixture.npi_address"]["relation_oid"] += 100
+        bindings["fixture.npi_address"]["table_name"] = "unproved_input"
     else:
-        bindings["fixture.doctor_clinician_address"]["relfilenode"] += 1
+        bindings["fixture.doctor_clinician_address"]["table_name"] = "unproved_doctors"
     with pytest.raises(RuntimeError, match="desired_geo_bindings"):
         _factory(address_build_case, doctors=doctors, dependency_bindings=bindings)
 
 
-@pytest.mark.parametrize("change", ["provenance", "seal", "published"])
+@pytest.mark.parametrize("change", ["provenance", "family", "published"])
 def test_unproved_doctors_source_cannot_enter_factory(address_build_case, prepared_doctors_case, change):
     doctors, bindings = prepared_doctors_case
     if change == "provenance":
         doctors.source_provenance_json = None
-    elif change == "seal":
-        doctors.sealed_filenodes = ()
+    elif change == "family":
+        doctors.stage_relations = doctors.stage_relations[:1]
     else:
         doctors.committed = True
-    with pytest.raises((ValueError, RuntimeError), match="provenance_required|physical_seal_required|not prepared"):
+    with pytest.raises((ValueError, RuntimeError), match="provenance_required|family_incomplete|not prepared"):
         _factory(address_build_case, doctors=doctors, dependency_bindings=bindings)
 
 
@@ -587,7 +599,7 @@ async def test_factory_checks_prepared_doctors_before_native_work_and_passes_exa
     monkeypatch.setattr(address, "_new_context", startup)
     prepared = SimpleNamespace(
         context={},
-        stage_oids=tuple((name, name + "_staged", index + 1) for index, name in enumerate(factory.native_targets)),
+        stage_relations=tuple((name, name + "_staged") for name in factory.native_targets),
     )
     prepare = AsyncMock(return_value=prepared)
     cleanup = AsyncMock()
@@ -617,7 +629,7 @@ async def test_factory_checks_prepared_doctors_before_native_work_and_passes_exa
         assert kwargs["doctors"] is doctors and kwargs["dependency_bindings"] == bindings
         assert dict(kwargs["preparation_input"].relation_overrides) == {
             "provider_directory_location": "location_staged",
-            "doctor_clinician_address": doctors.stage_oids[0][1],
+            "doctor_clinician_address": doctors.stage_relations[0][1],
         }
         assert not doctors.committed
     cleanup.assert_awaited_once_with(prepared)
@@ -663,9 +675,9 @@ def test_captured_tiger_desired_geo_keeps_exact_native_heaps_and_separate_doctor
     bindings.update(tiger.captured_tiger_bindings(proof))
     expected = address._desired_geo_bindings("fixture", native_fence, doctors, bindings)
     assert {name: expected[name] for name in ("tiger.zcta5", "tiger.zip_state")} == tiger.captured_tiger_bindings(proof)
-    assert expected["fixture.doctor_clinician_address"]["table_name"] == doctors.stage_oids[0][1]
+    assert expected["fixture.doctor_clinician_address"]["table_name"] == doctors.stage_relations[0][1]
     assert native_fence["geo_bindings"]["fixture.doctor_clinician_address"]["table_name"] == "doctor_clinician_address"
     changed_by_name = {name: dict(binding) for name, binding in bindings.items()}
-    changed_by_name["tiger.zcta5"]["relfilenode"] += 1
+    changed_by_name["tiger.zcta5"]["table_name"] = "another_zcta"
     with pytest.raises(RuntimeError, match="desired_geo_bindings_changed"):
         address._desired_geo_bindings("fixture", native_fence, doctors, changed_by_name)

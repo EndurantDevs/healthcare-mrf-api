@@ -150,7 +150,15 @@ async def test_lost_dependency_owner_blocks_native_publication_entry(monkeypatch
                 row_count=1,
             )
         else:
-            await entity_address._run_entity_address_cutover("mrf", [], [], [], [], {})
+            stage_name = "entity_address_unified_stage"
+            swaps = [
+                SimpleNamespace(
+                    stage_cls=SimpleNamespace(__tablename__=stage_name),
+                    live_cls=SimpleNamespace(__main_table__="entity_address_unified"),
+                )
+            ]
+            context_by_field = {"geo_assurance_candidate_relation": {"schema_name": "mrf", "relation_name": stage_name}}
+            await entity_address._run_entity_address_cutover("mrf", swaps, [], [], [], context_by_field)
     fence.assert_awaited_once_with(entity_address.db, "mrf")
     swap.assert_not_awaited()
     capture.assert_not_awaited()

@@ -36,7 +36,7 @@ async def _prepare_relations(connection, policy, previous):
     await connection.execute(
         f"CREATE TABLE {output} (LIKE {aliases} INCLUDING CONSTRAINTS INCLUDING STORAGE)" + storage.PRIVATE_HEAP_OPTIONS
     )
-    tables_by_root["resource_output_aliases"] = {"name": name}
+    tables_by_root["resource_output_aliases"] = {"schema": policy.schema, "name": name}
     await storage._close_grants(connection, policy, name)
     for root in storage.RELATIONS[1:]:
         name = prefix + "_" + storage._SUFFIXES[root]
@@ -47,9 +47,9 @@ async def _prepare_relations(connection, policy, previous):
             + storage.PRIVATE_HEAP_OPTIONS
         )
         await storage._close_grants(connection, policy, name)
-        tables_by_root[root] = {"name": name}
+        tables_by_root[root] = {"schema": policy.schema, "name": name}
     name = prefix + "_r"
-    tables_by_root[storage.RESOURCE] = {"name": name}
+    tables_by_root[storage.RESOURCE] = {"schema": policy.schema, "name": name}
     output_tables = _output_tables(policy, {**previous, "tables": tables_by_root})
     await connection.execute(
         f"CREATE VIEW {storage_relation(policy.schema, name)} AS " + compact.compact_resource_sql(output_tables)

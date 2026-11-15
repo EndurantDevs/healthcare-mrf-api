@@ -12,6 +12,8 @@ from process import npi_owned_publication as owned
 from process import npi_result_archive as archive
 from process.npi_canonical_publication import NpiCanonicalPublicationInput, build_npi_canonical_publication_receipt
 
+_PUBLISH_GENERATION = owned._publish_generation
+
 
 def _output_content():
     dataset_id = uuid4()
@@ -39,9 +41,9 @@ def _output_content():
         "package_id": "d" * 64,
         "profile_contract": archive.MODEL_CONTRACT,
         "stage_schema": ownership.schema_name,
-        "stage_schema_oid": ownership.schema_oid,
-        "relation_oids": [list(pair) for pair in ownership.relation_oids],
-        "sealed_owner_oid": 40,
+        "relations": [
+            {"schema_name": ownership.schema_name, "relation_name": name} for name, _oid in ownership.relation_oids
+        ],
         "manifest_sha256": archive._manifest_digest(manifest),
         "tables": [table.as_dict() for table in tables],
     }
@@ -81,8 +83,7 @@ def publication(monkeypatch):
         return AsyncMock(side_effect=call)
 
     for name, boundary_value in (
-        ("_lock_and_verify_activation", None),
-        ("_verify_stage_owner", None),
+        ("_lock_and_verify_activation", ownership),
         ("_preserve_npi_input_reads", None),
         ("_rotate_relations", "npi_predecessor_" + dataset_id.hex),
         ("_relation_pairs", pairs),
@@ -109,10 +110,10 @@ def publication(monkeypatch):
     options_by_name = dict(
         ownership=ownership,
         manifest=manifest,
-        incumbent=archive.NpiIncumbent("serving", tuple((name, index + 200) for index, (name, _) in enumerate(pairs))),
+        incumbent=archive.NpiIncumbent("serving", tuple((name, True) for name, _oid in pairs)),
         validation_receipt=validation,
         authority=owned.NpiOwnershipPublication(
-            archive.NpiCutoverAuthority("d" * 64, 40, 40, "manual"),
+            archive.NpiCutoverAuthority("d" * 64, "manual"),
             boundary("custody"),
             boundary("canonical", publication),
             boundary("settle"),
@@ -129,7 +130,6 @@ async def test_manual_owned_adoption_keeps_hooks_out_and_settles_after_real_gene
     receipt = await owned.activate_ownership_sealed_npi_stage(state.session, **state.options)
     assert state.events == [
         "_lock_and_verify_activation",
-        "_verify_stage_owner",
         "custody",
         "current",
         "_preserve_npi_input_reads",
@@ -159,7 +159,7 @@ async def test_failed_custody_cannot_rotate_or_settle(publication):
     state.options["authority"].verify_custody.side_effect = RuntimeError("custody refused")
     with pytest.raises(RuntimeError, match="custody refused"):
         await owned.activate_ownership_sealed_npi_stage(state.session, **state.options)
-    assert state.events == ["_lock_and_verify_activation", "_verify_stage_owner"]
+    assert state.events == ["_lock_and_verify_activation"]
     state.options["authority"].attach_canonical.assert_not_awaited()
     state.options["authority"].on_activated.assert_not_awaited()
 
@@ -191,12 +191,10 @@ async def test_callback_cannot_replace_underlying_database_transaction(publicati
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", ["authority", "expected_stage_owner_oid"])
-async def test_automatic_or_builder_handback_cannot_select_owned_activation(publication, field):
+async def test_automatic_or_builder_handback_cannot_select_owned_activation(publication):
     state = publication
     state.options["authority"] = replace(
-        state.options["authority"],
-        cutover=replace(state.options["authority"].cutover, **{field: "automatic" if field == "authority" else 41}),
+        state.options["authority"], cutover=replace(state.options["authority"].cutover, authority="automatic")
     )
     with pytest.raises(archive.NpiResultArchiveError, match="ownership-only activation authority differs"):
         await owned.activate_ownership_sealed_npi_stage(state.session, **state.options)
@@ -328,7 +326,8 @@ async def test_untyped_activation_identity_refuses_before_catalog_work(publicati
 async def test_inexact_native_family_order_refuses_before_adoption(publication, field):
     state = publication
     value = state.options[field]
-    state.options[field] = replace(value, relation_oids=tuple(reversed(value.relation_oids)))
+    attribute = "relation_oids" if field == "ownership" else "relations"
+    state.options[field] = replace(value, **{attribute: tuple(reversed(getattr(value, attribute)))})
     with pytest.raises(archive.NpiResultArchiveError, match="direct output contract differs"):
         await owned.activate_ownership_sealed_npi_stage(state.session, **state.options)
     assert state.events == []
@@ -375,3 +374,41 @@ async def test_valid_but_foreign_canonical_output_cannot_publish_generation(publ
         await owned.activate_ownership_sealed_npi_stage(state.session, **state.options)
     assert "generation" not in state.events
     state.options["authority"].on_activated.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manual_owned_adoption_settles_named_serving_generation(monkeypatch, publication):
+    """Settlement records the named serving relations; no relation identity column is written."""
+    from process.npi_result_generation import RELATION_NAMES
+
+    state = publication
+    lineage = "11111111-1111-4111-8111-111111111111"
+    monkeypatch.setattr(
+        owned,
+        "read_npi_result_generation_authority",
+        AsyncMock(return_value=SimpleNamespace(local_lineage_id=lineage, local_generation=4)),
+    )
+    monkeypatch.setattr(owned, "_publish_generation", _PUBLISH_GENERATION)
+    settled_by_field = {
+        "singleton": True,
+        "local_lineage_id": lineage,
+        "local_generation": 5,
+        "origin_lineage_id": lineage,
+        "origin_generation": 5,
+        "published_at": "2026-01-01T00:00:00+00:00",
+        "serving_schema": "serving",
+        "serving_relation_names": list(RELATION_NAMES),
+        "canonical_publication_ref": state.canonical.publication_ref,
+        "canonical_publication_generation": state.canonical.publication_generation,
+        "canonical_chain_ref": state.canonical.chain_ref,
+        "canonical_import_date": state.canonical.import_date,
+    }
+    state.session.execute = AsyncMock(
+        return_value=SimpleNamespace(mappings=lambda: SimpleNamespace(one_or_none=lambda: settled_by_field))
+    )
+    receipt = await owned.activate_ownership_sealed_npi_stage(state.session, **state.options)
+    statement, parameters = state.session.execute.await_args.args
+    assert "serving_relation_names" in str(statement) and "relation_oids" not in str(statement)
+    assert parameters["serving_schema"] == "serving" and parameters["relation_names"] == list(RELATION_NAMES)
+    assert receipt.adopted_authority.local_generation == 5
+    state.options["authority"].on_activated.assert_awaited_once_with(state.session, receipt)

@@ -186,7 +186,6 @@ async def test_complete_snapshot_closes_writers_before_catalog_and_parity(synthe
         model_by_table_name={table.table_name: fhir.ProviderDirectoryPractitioner},
         relation_by_table={table.table_name: "synthetic_complete"},
     )
-    monkeypatch.setattr(copy_scope, "_target_oid", AsyncMock(return_value=19))
     monkeypatch.setattr(copy_scope, "_resource_expected", lambda *_args: ("SELECT synthetic_expected", {}))
 
     @asynccontextmanager
@@ -261,7 +260,6 @@ async def test_partial_worker_issuance_drains_before_caller_cleanup(monkeypatch)
 def test_native_not_null_constraints_match_model_required_columns(model):
     constraints = [
         dict(
-            relation_oid=17,
             constraint_type="n",
             condeferrable=False,
             condeferred=False,
@@ -272,15 +270,15 @@ def test_native_not_null_constraints_match_model_required_columns(model):
         for column in model.__table__.columns
         if not column.nullable
     ]
-    fhir._assert_artifact_scope_native_not_null(model, 17, constraints)
+    fhir._assert_artifact_scope_native_not_null(model, constraints)
     if len(constraints) > 1:
         with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match="not_null_changed"):
-            fhir._assert_artifact_scope_native_not_null(model, 17, constraints[1:])
+            fhir._assert_artifact_scope_native_not_null(model, constraints[1:])
     with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match="not_null_changed"):
-        fhir._assert_artifact_scope_native_not_null(model, 17, [*constraints, constraints[0]])
+        fhir._assert_artifact_scope_native_not_null(model, [*constraints, constraints[0]])
     constraints[0]["convalidated"] = False
     with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match="not_null_changed"):
-        fhir._assert_artifact_scope_native_not_null(model, 17, constraints)
+        fhir._assert_artifact_scope_native_not_null(model, constraints)
 
 
 @pytest.mark.asyncio
@@ -396,14 +394,14 @@ async def test_prepared_family_drains_before_original_scratch_cleanup(synthetic_
 
     events = []
     fence, resource = object(), SimpleNamespace(source_ids=("synthetic_source",))
-    names, oids = {"synthetic_root": "synthetic_complete"}, {"synthetic_root": 17}
+    relation_by_root = {"synthetic_root": "synthetic_complete"}
     failure = ValueError("synthetic read body failed")
 
     @asynccontextmanager
-    async def prepared(directory, projection, relations, identities, full_fence, resource_fence):
+    async def prepared(directory, projection, relations, full_fence, resource_fence):
         assert directory is fhir and projection is synthetic_admission
-        assert (relations, identities, full_fence, resource_fence) == (names, oids, fence, resource)
-        assert fhir._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get() == names
+        assert (relations, full_fence, resource_fence) == (relation_by_root, fence, resource)
+        assert fhir._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get() == relation_by_root
         events.append("family_verified")
         try:
             yield
@@ -422,7 +420,7 @@ async def test_prepared_family_drains_before_original_scratch_cleanup(synthetic_
 
     async def run():
         async with fhir._yield_artifact_dataset_scope(
-            "synthetic", fence, resource, names, ["synthetic_complete"], projection=synthetic_admission
+            "synthetic", fence, resource, relation_by_root, ["synthetic_complete"], projection=synthetic_admission
         ) as selected:
             assert selected is fence
             events.append("reader_body")
@@ -521,9 +519,11 @@ async def test_profile_inputs_reuse_original_signing_or_observation_actor(monkey
     from process import provider_directory_profile_source_inputs as inputs
     from process import provider_directory_source_observation as observation
 
-    session = object()
+    session = SimpleNamespace(in_transaction=lambda: True)
     binding = SimpleNamespace(session=session)
-    actor = SimpleNamespace(connection=object())
+    actor = SimpleNamespace(
+        connection=object(), transaction_isolation="repeatable read", factory=object(), policy=object()
+    )
     unexpected = AsyncMock(side_effect=AssertionError("original actor must not open a second transaction"))
     monkeypatch.setattr(observation, "current_observation", lambda _directory: actor if readonly else None)
     monkeypatch.setattr(inputs.source, "source_transaction", unexpected)
@@ -553,32 +553,41 @@ async def test_failed_completed_capacity_cleans_exact_candidate_before_read_expo
 
 
 @pytest.mark.asyncio
-async def test_recovery_heap_keeps_native_null_constraints_and_strips_only_verified_pk(monkeypatch):
-    from process import provider_directory_cms_nonprofile_observation as observation
+async def test_recovery_heap_retains_named_columns_and_native_null_constraints(monkeypatch):
+    from process import provider_directory_profile_artifact_layout as layout
 
-    relation_by_field = dict(schema_name="synthetic", relation_name="candidate")
-    constraints = [
-        dict(relation_oid=17, constraint_type="n", constraint_definition="NOT NULL source_id"),
-        dict(relation_oid=17, constraint_type="p", constraint_definition="PRIMARY KEY (source_id)"),
-    ]
-    catalog = SimpleNamespace(
-        _profile_capacity_relation_row=AsyncMock(return_value=(relation_by_field, None)),
-        _profile_capacity_relation_catalog=AsyncMock(return_value=([], [], constraints, [])),
-    )
-    captured_constraints = []
-
-    def fingerprint(_relation, _attributes, _indexes, native_constraints, _triggers, _oid):
-        captured_constraints.extend(native_constraints)
-        return {}, {"constraints": native_constraints}
-
-    monkeypatch.setattr(
-        fhir, "_provider_directory_profile_relation_storage_fingerprint", AsyncMock(return_value="layout")
-    )
-    monkeypatch.setattr(fhir.db, "scalar", AsyncMock(return_value=True))
-    monkeypatch.setattr(observation, "catalog_observation", lambda *_args: catalog)
+    native_by_field = {
+        "relname": "candidate",
+        "topology": {
+            "kind": "r",
+            "persistence": "u",
+            "partition": False,
+            "rls": False,
+            "force_rls": False,
+            "parents": 0,
+            "children": 0,
+            "hooks": 0,
+            "rules": 0,
+            "access_method": "heap",
+        },
+        "columns": [{"number": 99, "name": "source_id", "type": "text", "required": True, "default": None}],
+        "indexes": [],
+        "constraints": [
+            {"type": "n", "definition": "NOT NULL source_id", "keys": [99]},
+            {"type": "p", "definition": "PRIMARY KEY(source_id)"},
+        ],
+    }
+    monkeypatch.setattr(fhir.db, "first", AsyncMock(return_value=native_by_field))
     phase = AsyncMock()
     monkeypatch.setattr(fhir, "_artifact_scope_recovery_index_phase", phase)
-    monkeypatch.setattr(fhir, "_profile_capacity_fingerprint_payloads", fingerprint)
-    result = await fhir._artifact_scope_recovery_heap_fingerprint("synthetic", "candidate", 17, object())
-    assert result[0] == "layout" and captured_constraints == constraints[:1]
-    phase.assert_awaited_once()
+    monkeypatch.setattr(layout, "_recovery_index_catalog", AsyncMock(return_value=([], [])))
+    indexes, heap = await fhir._artifact_scope_recovery_heap_fingerprint(
+        "synthetic", "candidate", fhir.ProviderDirectorySource
+    )
+    assert indexes == ()
+    assert heap["constraints"] == [{**native_by_field["constraints"][0], "keys": ["source_id"]}]
+    assert heap["columns"] == [
+        {key: column_value for key, column_value in native_by_field["columns"][0].items() if key != "number"}
+    ]
+    assert "relname" not in heap and "indexes" not in heap
+    phase.assert_awaited_once_with("synthetic", "candidate", fhir.ProviderDirectorySource, [], [])

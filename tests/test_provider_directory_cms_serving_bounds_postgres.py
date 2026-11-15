@@ -208,17 +208,36 @@ async def _assert_legacy_npi_unchanged(database, schema):
         assert await database.scalar(f"SELECT count(*) FROM {schema}.{table} WHERE npi IS NULL") == 2
 
 
+async def test_prepared_manifest_resolves_native_columns_and_indexes_by_name(monkeypatch):
+    async with _delta_database(monkeypatch) as (database, schema):
+        monkeypatch.setattr(importer, "db", database)
+        await database.status(f"CREATE TABLE {schema}.prepared(id integer PRIMARY KEY)")
+        relations = [
+            {
+                "schema": schema,
+                "relation": "prepared",
+                "role": "profile",
+                "required_indexes": ["prepared_pkey"],
+                "prepared_index_names": ["prepared_pkey"],
+                "primary_key_required": True,
+            }
+        ]
+        async with database.transaction():
+            await preparation._prepared_manifest_catalog(importer, relations)
+            assert relations[0]["columns"] == [{"number": 1, "name": "id"}]
+            assert relations[0]["indexes"][0]["index_name"] == "prepared_pkey"
+            assert all("oid" not in key for key in relations[0])
+            await database.status(f"ALTER TABLE {schema}.prepared DROP CONSTRAINT prepared_pkey")
+            with pytest.raises(RuntimeError, match="indexes_incomplete"):
+                await preparation._prepared_manifest_catalog(importer, relations)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("worker", ["contacts", "coordinates", "resource_npi", "location_key"])
 async def test_early_backfills_bound_actual_statements_and_preserve_owned_location(monkeypatch, worker):
     async with _delta_database(monkeypatch) as (database, schema):
         monkeypatch.setattr(importer, "db", database)
         relation = await _backfill_relations(database, schema, worker)
-        oid = (
-            None
-            if relation is None
-            else await database.scalar("SELECT to_regclass(:relation)::oid", relation=f"{schema}.{relation}")
-        )
         observed_rows = []
         _observe_backfill_calls(monkeypatch, database, observed_rows)
         async with database.transaction():
@@ -232,10 +251,6 @@ async def test_early_backfills_bound_actual_statements_and_preserve_owned_locati
                         {"provider_directory_location": relation}
                     ),
                 ),
-                (
-                    importer._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS,
-                    importer._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.set({"provider_directory_location": oid}),
-                ),
             )
             try:
                 backfill_result = await _run_backfill(monkeypatch, schema, relation, worker)
@@ -248,9 +263,6 @@ async def test_early_backfills_bound_actual_statements_and_preserve_owned_locati
                 0 if worker in {"resource_npi", "location_key"} else 1
             )
             if relation is not None:
-                assert (
-                    await database.scalar("SELECT to_regclass(:relation)::oid", relation=f"{schema}.{relation}") == oid
-                )
                 assert await database.scalar(f"SELECT value FROM {schema}.{relation}") == (
                     0 if worker == "location_key" else 1
                 )

@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Prepare deterministic resource identities without mutating accepted mappings."""
 
-import asyncio
 import json
 import re
 from contextlib import asynccontextmanager
@@ -31,18 +30,13 @@ def _require(condition, code):
         raise GenericCandidateError("provider_directory_resource_identity_candidate_" + code)
 
 
-def _stage_name(receipt):
+def _stage_name(receipt, schema):
     _require(
         type(receipt) is dict
-        and set(receipt) == {"name", "oid", "owner", "layout_sha256"}
+        and set(receipt) == {"schema", "name"}
+        and receipt["schema"] == schema
         and type(receipt["name"]) is str
-        and re.fullmatch(r"pdgs_[0-9a-f]{32}_re", receipt["name"]) is not None
-        and type(receipt["oid"]) is int
-        and receipt["oid"] > 0
-        and type(receipt["owner"]) is int
-        and receipt["owner"] > 0
-        and type(receipt["layout_sha256"]) is str
-        and re.fullmatch(r"[0-9a-f]{64}", receipt["layout_sha256"]) is not None,
+        and re.fullmatch(r"pdgs_[0-9a-f]{32}_re", receipt["name"]) is not None,
         "stage_receipt_changed",
     )
     return receipt["name"]
@@ -78,7 +72,7 @@ def _publisher_transaction(publisher):
 
 async def _protected_stage(publisher, identity, receipt, phases):
     _publisher_transaction(publisher)
-    _stage_name(receipt)
+    _stage_name(receipt, publisher.policy.schema)
     _source_release(publisher, identity)
     raw = await publisher.connection.fetchval(
         f"SELECT candidate_storage_json FROM {storage_relation(publisher.policy.schema, 'provider_directory_endpoint_dataset')} "
@@ -102,20 +96,18 @@ async def _protected_stage(publisher, identity, receipt, phases):
 
 @dataclass(frozen=True)
 class _ResourceScope:
-    publisher: object
     identity: dict
     receipt: dict
-    task: object
 
 
 @asynccontextmanager
 async def bind_resource_identity_candidate(publisher, full_identity, receipt):
-    """Bind the declared fifth stage to the genuine same-task COPY session."""
+    """Bind the declared fifth stage to its complete logical candidate."""
     _publisher_transaction(publisher)
-    _stage_name(receipt)
+    _stage_name(receipt, publisher.policy.schema)
     _source_release(publisher, full_identity)
     _require(_ACTIVE.get() is None, "scope_already_bound")
-    token = _ACTIVE.set(_ResourceScope(publisher, full_identity, receipt, asyncio.current_task()))
+    token = _ACTIVE.set(_ResourceScope(full_identity, receipt))
     try:
         yield
     finally:
@@ -127,10 +119,8 @@ async def stage_resource_identities(session, *, source_id, resource_type, identi
     from process.provider_directory_resource_identity import source_resource_uuid
 
     scope = _ACTIVE.get()
-    _require(
-        scope is not None and scope.task is asyncio.current_task() and session is source_copy_session(),
-        "physical_session_required",
-    )
+    _require(scope is not None, "candidate_scope_required")
+    publisher = bound_publisher()
     _require(
         source_id == "cms-npd"
         and type(identities_by_resource_id) is dict
@@ -144,10 +134,12 @@ async def stage_resource_identities(session, *, source_id, resource_type, identi
         ),
         "identity_changed",
     )
-    await _protected_stage(scope.publisher, scope.identity, scope.receipt, ("loading",))
+    await _protected_stage(publisher, scope.identity, scope.receipt, ("loading",))
     now = datetime.now(timezone.utc)
     rows = [(source_id, resource_type, key, entity, now) for key, entity in identities_by_resource_id.items()]
-    await copy_identity_rows(scope.publisher, _stage_name(scope.receipt), RESOURCE_IDENTITY_COLUMNS, rows)
+    await copy_identity_rows(
+        publisher, _stage_name(scope.receipt, publisher.policy.schema), RESOURCE_IDENTITY_COLUMNS, rows
+    )
 
 
 async def _verify_raw_identities(connection, relation):
@@ -163,9 +155,9 @@ async def _verify_raw_identities(connection, relation):
 
 
 async def _complete_source(connection, publisher, identity, binding, receipt):
-    stage = storage_relation(publisher.policy.schema, _stage_name(receipt))
+    stage = storage_relation(publisher.policy.schema, _stage_name(receipt, publisher.policy.schema))
     witness_receipt = binding.get("tables", {}).get("provider_directory_cms_npd_resource_witness", {})
-    expected = _stage_name(receipt).removesuffix("_re") + "_w"
+    expected = _stage_name(receipt, publisher.policy.schema).removesuffix("_re") + "_w"
     _require(witness_receipt.get("name") == expected, "witness_changed")
     witness = storage_relation(publisher.policy.schema, expected)
     await verify_resource_identity_source(
@@ -211,7 +203,7 @@ async def finish_resource_identity_stage(publisher, identity, receipt):
     connection, schema = publisher.connection, publisher.policy.schema
     canonical_schema = _canonical_schema(publisher.policy)
     binding = await _protected_stage(publisher, identity, receipt, ("loading",))
-    name = _stage_name(receipt)
+    name = _stage_name(receipt, schema)
     raw, reduced = storage_relation(schema, name), storage_relation(schema, name + "_u")
     async with connection.transaction():
         await _verify_raw_identities(connection, raw)
@@ -263,7 +255,7 @@ async def publish_resource_identity_stage(publisher, identity, receipt):
     connection, schema = publisher.connection, publisher.policy.schema
     canonical_schema = _canonical_schema(publisher.policy)
     await _protected_stage(publisher, identity, receipt, ("sealed",))
-    relation = storage_relation(schema, _stage_name(receipt))
+    relation = storage_relation(schema, _stage_name(receipt, schema))
     try:
         async with connection.transaction():
             await publish_resource_identity_relation(connection, relation, canonical_schema)

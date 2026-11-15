@@ -6,6 +6,7 @@ import contextlib
 import datetime
 import importlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
@@ -19,6 +20,7 @@ from process import provider_directory_generic_source_policy as source_policy
 from process import provider_directory_profile as profile
 
 importer = importlib.import_module("process.provider_directory_fhir")
+artifact_bundle = importlib.import_module("process.provider_directory_artifact_bundle_preparation")
 
 
 def _write_json(path: Path, payload: object) -> Path:
@@ -366,10 +368,12 @@ def _artifact_stage(
     schema: str = "mrf",
     stage_table: str = "profile_stage",
     target_relation: str = "provider_directory_profile",
-    target_oid: int | None = None,
+    target_publication: tuple = (False, None),
     fenced: bool = False,
 ) -> importer.ProviderDirectoryPreparedArtifactStage:
-    build_fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=target_oid) if fenced else None
+    build_fence = (
+        importer.ProviderDirectoryArtifactBuildFence((schema, target_relation), target_publication) if fenced else None
+    )
     return importer.ProviderDirectoryPreparedArtifactStage(
         schema=schema,
         stage_table=stage_table,
@@ -386,8 +390,8 @@ def _initial_profile_stages():
     try:
         return importer._prepare_profile_full_swap_stages(
             build,
-            importer.ProviderDirectoryArtifactBuildFence(target_oid=21),
-            importer.ProviderDirectoryArtifactBuildFence(target_oid=22),
+            importer.ProviderDirectoryArtifactBuildFence(target_publication=(True, ("synthetic-21", "revision-21"))),
+            importer.ProviderDirectoryArtifactBuildFence(target_publication=(True, ("synthetic-22", "revision-22"))),
         )
     finally:
         importer.profile_initial.REQUESTED.reset(token)
@@ -398,8 +402,8 @@ def _initial_profile_recovery(monkeypatch):
     monkeypatch.setattr(importer.profile_initial, "preparation_timeout_seconds", AsyncMock(return_value=2))
     stages = _initial_profile_stages()
     identities = tuple(
-        importer.ProviderDirectoryArtifactPromotionIdentity(stage, oid)
-        for stage, oid in zip(stages, (11, 12), strict=True)
+        importer.ProviderDirectoryArtifactPromotionIdentity(stage, publication_revision=("generation-a", "revision-a"))
+        for stage in stages
     )
     monkeypatch.setattr(
         importer,
@@ -477,6 +481,7 @@ def _profile_checkpoint_by_name(
         "profile_stage_storage_fingerprint": _PROFILE_STAGE_STORAGE_FINGERPRINT,
         "evidence_target_oid": None,
         "profile_target_oid": None,
+        "targets_json": importer._profile_build_target_coordinates(build),
         "current_source_vector_hash": build.current_source_vector_hash,
         "desired_source_vector_hash": build.desired_source_vector_hash,
         "current_source_context_vector_hash": build.current_source_context_vector_hash,
@@ -902,7 +907,7 @@ async def test_last_evidence_batch_failure_retries_only_finalization(
     """Retry ANALYZE and state after the last fact was committed."""
     build = _profile_build()
     controls = _patch_profile_finalize_retry(monkeypatch, build)
-    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    fence = importer.ProviderDirectoryArtifactBuildFence()
 
     with pytest.raises(RuntimeError, match="evidence analyze failed"):
         await importer._build_provider_directory_profile_stages(
@@ -1052,8 +1057,8 @@ async def _assert_logged_profile_retry_lineage(
     )
     monkeypatch.setattr(
         importer,
-        "_provider_directory_profile_stage_storage_fingerprint",
-        _profile_stage_storage_fingerprint_mock(build),
+        "_provider_directory_profile_capacity_relation_layout",
+        AsyncMock(return_value=None),
     )
     resumed_build = await importer._resolve_provider_directory_profile_build(
         "mrf",
@@ -1116,7 +1121,7 @@ async def test_profile_build_resolution_preserves_only_logged_retry_lineage(
     )
     first = AsyncMock(return_value=None)
     monkeypatch.setattr(importer.db, "first", first)
-    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=7)
+    fence = importer.ProviderDirectoryArtifactBuildFence(target_publication=(True, ("synthetic-7", "revision-7")))
     dataset_fence = importer.ProviderDirectoryArtifactDatasetFence(
         (
             importer.ProviderDirectoryArtifactDataset(
@@ -1184,7 +1189,7 @@ async def test_profile_checkpoint_rejects_compact_progress_before_evidence(
         "profile_total_batches": 1,
         "state": "building_profile",
     }
-    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    fence = importer.ProviderDirectoryArtifactBuildFence()
 
     assert not await importer._is_profile_build_checkpoint_reusable(
         build,
@@ -1221,7 +1226,7 @@ async def test_profile_batch_total_mismatch_invalidates_incompatible_checkpoint(
         "_provider_directory_profile_stage_relation_identity",
         stage_identity,
     )
-    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    fence = importer.ProviderDirectoryArtifactBuildFence()
 
     assert not await importer._is_profile_build_checkpoint_reusable(
         build,
@@ -1268,15 +1273,15 @@ async def test_profile_batch_total_mismatch_reinitializes_logged_stages(
     )
     monkeypatch.setattr(
         importer,
-        "_provider_directory_profile_stage_storage_fingerprint",
-        _profile_stage_storage_fingerprint_mock(build),
+        "_provider_directory_profile_capacity_relation_layout",
+        AsyncMock(return_value=None),
     )
 
     initialized = await importer._claim_provider_directory_profile_build_checkpoint(
         build,
         has_existing_artifacts=False,
-        evidence_build_fence=(importer.ProviderDirectoryArtifactBuildFence(target_oid=None)),
-        profile_build_fence=(importer.ProviderDirectoryArtifactBuildFence(target_oid=None)),
+        evidence_build_fence=(importer.ProviderDirectoryArtifactBuildFence()),
+        profile_build_fence=(importer.ProviderDirectoryArtifactBuildFence()),
     )
 
     drop_stages.assert_awaited_once_with(build, checkpoint_by_name)
@@ -1329,8 +1334,12 @@ def _patch_global_profile_resolution(monkeypatch):
         source_ids=source_ids,
         datasets=datasets,
         dataset_fence=importer.ProviderDirectoryArtifactDatasetFence(datasets),
-        evidence_fence=importer.ProviderDirectoryArtifactBuildFence(target_oid=101),
-        profile_fence=importer.ProviderDirectoryArtifactBuildFence(target_oid=102),
+        evidence_fence=importer.ProviderDirectoryArtifactBuildFence(
+            target_publication=(True, ("synthetic-101", "revision-101"))
+        ),
+        profile_fence=importer.ProviderDirectoryArtifactBuildFence(
+            target_publication=(True, ("synthetic-102", "revision-102"))
+        ),
         first=first,
     )
 
@@ -1385,13 +1394,13 @@ async def _assert_global_profile_reinitialized(
     )
     monkeypatch.setattr(
         importer,
-        "_require_provider_directory_profile_stage_oid",
-        AsyncMock(side_effect=[21, 22]),
+        "_provider_directory_profile_stage_relation_identity",
+        AsyncMock(side_effect=[(21, "r", "p"), (22, "r", "p")]),
     )
     monkeypatch.setattr(
         importer,
-        "_provider_directory_profile_stage_storage_fingerprint",
-        _profile_stage_storage_fingerprint_mock(resolved_build),
+        "_provider_directory_profile_capacity_relation_layout",
+        AsyncMock(return_value=None),
     )
     initialized = await importer._claim_provider_directory_profile_build_checkpoint(
         resolved_build,
@@ -1572,7 +1581,8 @@ async def test_profile_checkpoint_claim_initializes_and_reclaims_logged_stages(
 ):
     """Cover fresh initialization plus partial and ready reclaim states."""
     build = _profile_build()
-    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    build = replace(build, batch_plan=_checkpoint_batch_plan(build))
+    fence = importer.ProviderDirectoryArtifactBuildFence()
 
     @contextlib.asynccontextmanager
     async def transaction():
@@ -1591,8 +1601,8 @@ async def test_profile_checkpoint_claim_initializes_and_reclaims_logged_stages(
     )
     monkeypatch.setattr(
         importer,
-        "_provider_directory_profile_stage_storage_fingerprint",
-        _profile_stage_storage_fingerprint_mock(build),
+        "_provider_directory_profile_capacity_relation_layout",
+        AsyncMock(return_value=None),
     )
     fresh_state = await importer._claim_provider_directory_profile_build_checkpoint(
         build,
@@ -1640,6 +1650,7 @@ async def test_profile_claim_reopens_only_unfinalized_failed_evidence(
 ):
     """Use the pre-failure state marker to resume the correct phase."""
     build = _profile_build()
+    build = replace(build, batch_plan=_checkpoint_batch_plan(build))
     checkpoint_maps = _failed_profile_checkpoint_maps(build)
 
     @contextlib.asynccontextmanager
@@ -1667,10 +1678,10 @@ async def test_profile_claim_reopens_only_unfinalized_failed_evidence(
     )
     monkeypatch.setattr(
         importer,
-        "_provider_directory_profile_stage_storage_fingerprint",
-        _profile_stage_storage_fingerprint_mock(build),
+        "_provider_directory_profile_capacity_relation_layout",
+        AsyncMock(return_value=None),
     )
-    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    fence = importer.ProviderDirectoryArtifactBuildFence()
 
     unfinalized_claim = await importer._claim_provider_directory_profile_build_checkpoint(
         build,
@@ -1715,6 +1726,7 @@ async def _assert_profile_checkpoint_ownership_failures(build, status):
 async def test_profile_checkpoint_mutations_fail_closed(monkeypatch):
     """Require valid phases, ownership, and best-effort failure cleanup."""
     build = _profile_build()
+    build = replace(build, batch_plan=_checkpoint_batch_plan(build))
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status)
 
@@ -2110,69 +2122,46 @@ def test_stale_profile_reaper_rejects_non_deterministic_stage_names():
         )
 
 
-async def _assert_oid_fenced_stale_profile_cleanup(checkpoint_by_name, first, monkeypatch):
-    """Assert oid fenced stale profile cleanup."""
-    monkeypatch.setattr(
-        importer.db,
-        "all",
-        AsyncMock(return_value=[checkpoint_by_name, {}]),
-    )
+async def _assert_named_stale_profile_cleanup(checkpoint_by_name, first, monkeypatch):
+    """Preserve named cleanup, unconsumed-build admission and native shape refusals."""
+    monkeypatch.setattr(importer.db, "all", AsyncMock(return_value=[checkpoint_by_name, {}]))
     first.return_value = checkpoint_by_name
-    relation_identity = AsyncMock(
-        side_effect=[
-            (22, "r", "p"),
-            (22, "r", "p"),
-            (21, "r", "p"),
-            (21, "r", "p"),
-        ]
-    )
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_stage_relation_identity",
-        relation_identity,
-    )
+    relation_identity = AsyncMock(return_value=(22, "r", "p"))
+    monkeypatch.setattr(importer, "_provider_directory_profile_stage_relation_identity", relation_identity)
+    monkeypatch.setattr(importer, "_provider_directory_profile_stage_layout", AsyncMock())
+    unconsumed = AsyncMock()
+    monkeypatch.setattr(importer, "_assert_profile_capacity_build_unconsumed", unconsumed)
     status = AsyncMock(return_value=1)
     monkeypatch.setattr(importer.db, "status", status)
-    assert (
-        await importer._reap_stale_provider_directory_profile_builds(
-            "mrf",
-            current_build_id=f"pdpb_{'b' * 32}",
+    for current_native_id in (22, 23):
+        relation_identity.return_value = (current_native_id, "r", "p")
+        status.reset_mock()
+        assert (
+            await importer._reap_stale_provider_directory_profile_builds(
+                "mrf",
+                current_build_id=f"pdpb_{'b' * 32}",
+            )
+            == 1
         )
-        == 1
-    )
-    statements = [str(call.args[0]) for call in status.await_args_list]
-    assert sum(statement.startswith("LOCK TABLE") for statement in statements) == 2
-    assert sum(statement.startswith("DROP TABLE") for statement in statements) == 2
-
-    relation_identity.side_effect = [(21, "v", "p")]
-    with pytest.raises(
-        RuntimeError,
-        match="stale_stage_oid_mismatch",
-    ):
-        await importer._reap_stale_provider_directory_profile_builds(
-            "mrf",
-            current_build_id=f"pdpb_{'b' * 32}",
+        statements = [str(call.args[0]) for call in status.await_args_list]
+        assert sum(statement.startswith("LOCK TABLE") for statement in statements) == 2
+        assert (
+            sum(statement.startswith("DROP TABLE") and statement.endswith(" RESTRICT;") for statement in statements)
+            == 2
         )
-
-    relation_identity.side_effect = [
-        (22, "r", "p"),
-        (23, "r", "p"),
-    ]
-    with pytest.raises(
-        RuntimeError,
-        match="stale_stage_identity_changed",
-    ):
-        await importer._reap_stale_provider_directory_profile_builds(
-            "mrf",
-            current_build_id=f"pdpb_{'b' * 32}",
-        )
+    unconsumed.assert_awaited_with(checkpoint_by_name["build_id"])
+    relation_identity.return_value = (21, "v", "p")
+    status.reset_mock()
+    with pytest.raises(RuntimeError, match="stale_stage_shape_invalid"):
+        await importer._reap_stale_provider_directory_profile_builds("mrf", current_build_id=f"pdpb_{'b' * 32}")
+    assert not any(str(call.args[0]).startswith("DROP TABLE") for call in status.await_args_list)
 
 
 @pytest.mark.asyncio
-async def test_profile_stage_identity_and_stale_reaper_are_oid_fenced(
+async def test_profile_stage_names_and_stale_reaper_require_native_shape(
     monkeypatch,
 ):
-    """Lock, recheck, and remove only exact permanent stale stage tables."""
+    """Lock and remove only declared permanent stale stage tables."""
     build_id = f"pdpb_{'a' * 32}"
     evidence_stage = profile.profile_evidence_stage_table_name(build_id)
     profile_stage = profile.profile_stage_table_name(build_id)
@@ -2219,13 +2208,14 @@ async def test_profile_stage_identity_and_stale_reaper_are_oid_fenced(
 
     checkpoint_by_name = {
         "build_id": build_id,
+        "resume_lineage_hash": "a" * 64,
         "evidence_stage": evidence_stage,
         "profile_stage": profile_stage,
         "evidence_stage_oid": 21,
         "profile_stage_oid": 22,
     }
     monkeypatch.setattr(importer.db, "transaction", transaction)
-    await _assert_oid_fenced_stale_profile_cleanup(checkpoint_by_name, first, monkeypatch)
+    await _assert_named_stale_profile_cleanup(checkpoint_by_name, first, monkeypatch)
 
 
 async def _assert_profile_artifact_pair_contract(monkeypatch):
@@ -2266,7 +2256,7 @@ async def test_profile_stage_preparation_metrics_and_pair_contract(
 ):
     """Prepare both logged stages and reject a partial serving-table pair."""
     build = _profile_build()
-    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=9)
+    fence = importer.ProviderDirectoryArtifactBuildFence(target_publication=(True, ("synthetic-9", "revision-9")))
     assert_logged = AsyncMock()
     assert_ready = AsyncMock()
     monkeypatch.setattr(
@@ -2300,86 +2290,77 @@ async def test_profile_stage_preparation_metrics_and_pair_contract(
     await _assert_profile_artifact_pair_contract(monkeypatch)
 
 
-async def _assert_exact_artifact_cutover_recovery(
-    identity,
-    monkeypatch,
-    relation_attribute,
-    relation_oid,
-):
-    """Assert exact artifact cutover recovery."""
-    for relation_values, persistence in (
-        ((12, None, None), "p"),
-        ((11, 12, None), "p"),
-        ((11, None, 12), "p"),
-        ((11, None, None), "u"),
-    ):
-        relation_oid.side_effect = relation_values
-        relation_attribute.return_value = persistence
-        assert not (await importer._is_provider_directory_artifact_promotion_committed((identity,)))
+@pytest.mark.asyncio
+async def test_artifact_promotion_identity_recovers_only_exact_cutover(monkeypatch):
+    """Only a writer-observed logical stamp and absent stage names resolve lost acknowledgement."""
+    from process import provider_directory_artifact_bundle_preparation as artifacts
 
-    relation_oid.side_effect = [11, None, None]
-    relation_attribute.return_value = "p"
-    assert await importer._is_provider_directory_artifact_promotion_committed((identity,))
-    dataset_committed = AsyncMock(return_value=True)
-    monkeypatch.setattr(
-        importer,
-        "_is_provider_directory_dataset_cutover_committed",
-        dataset_committed,
-    )
+    stage = _artifact_stage()
+    identities = await importer._capture_provider_directory_artifact_promotion_identities((stage,))
+    identity = identities[0]
+    assert identity == importer.ProviderDirectoryArtifactPromotionIdentity(stage)
+    assert not await importer._is_provider_directory_artifact_promotion_committed(identities)
+    assert not await importer._is_provider_directory_artifact_promotion_committed(())
+    publication = AsyncMock(return_value=(True, ("generation-a", "revision-1")))
+    monkeypatch.setattr(artifacts, "artifact_publication", publication)
+    await importer._observe_provider_directory_artifact_promotion_revisions(identities, before=True)
+    await importer._observe_provider_directory_artifact_promotion_revisions(identities)
+    assert identity.publication_revision is None  # An unchanged singleton proves no publication.
+    publication.return_value = (True, ("generation-a", "revision-2"))
+    await importer._observe_provider_directory_artifact_promotion_revisions(identities)
+    assert identity.publication_revision == ("generation-a", "revision-2")
+    monkeypatch.setattr(importer.db, "session_factory", async_sessionmaker())
+    monkeypatch.setattr(importer.db, "status", AsyncMock())
+    monkeypatch.setattr(importer, "_lock_provider_directory_artifact_live_tables", AsyncMock())
+    absent = AsyncMock(return_value=True)
+    monkeypatch.setattr(importer.db, "scalar", absent)
+    persistence = AsyncMock(return_value="p")
+    monkeypatch.setattr(importer, "_provider_directory_relation_attribute", persistence)
+    assert await importer._is_provider_directory_artifact_promotion_committed(identities)
+    publication.return_value = (True, ("generation-a", "revision-3"))
+    assert not await importer._is_provider_directory_artifact_promotion_committed(identities)
+    publication.return_value = (True, identity.publication_revision)
+    absent.return_value = False
+    assert not await importer._is_provider_directory_artifact_promotion_committed(identities)
+    absent.return_value = True
+    persistence.return_value = "u"
+    assert not await importer._is_provider_directory_artifact_promotion_committed(identities)
+    persistence.return_value = "p"
+    committed = AsyncMock(return_value=False)
+    monkeypatch.setattr(importer, "_is_provider_directory_dataset_cutover_committed", committed)
     fence = importer.ProviderDirectoryArtifactDatasetFence(())
-    relation_oid.side_effect = [11, None, None]
-    assert await importer._is_provider_directory_artifact_promotion_committed(
-        (identity,),
-        fence,
-    )
-    dataset_committed.assert_awaited_once_with(fence)
+    assert not await importer._is_provider_directory_artifact_promotion_committed(identities, fence)
+    committed.assert_awaited_once_with(fence)
+
+    publication.reset_mock()
+    importer.db.status.reset_mock()
+    for binding_name in ("_transaction_binding", "_reader_binding"):
+        with monkeypatch.context() as bound:
+            bound.setattr(importer.db, binding_name, lambda: object())
+            assert not await importer._is_provider_directory_artifact_promotion_committed(identities)
+    publication.assert_not_awaited()
+    importer.db.status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_artifact_promotion_identity_recovers_only_exact_cutover(
-    monkeypatch,
-):
-    """Resolve ambiguous cutover results from exact stage and target OIDs."""
+@pytest.mark.parametrize("metadata", [None, (True, None), (True, ("generation-a", "revision-a"))])
+async def test_artifact_promotion_refuses_missing_or_unchanged_writer_revision(monkeypatch, metadata):
+    """A read after loss cannot manufacture an expected stamp for unversioned or unfinished work."""
+    from process import provider_directory_artifact_bundle_preparation as artifacts
 
-    async def rename_indexes(_schema, _stage):
-        return None
-
-    stage = importer.ProviderDirectoryPreparedArtifactStage(
-        schema="mrf",
-        stage_table="profile_stage",
-        target_relation="provider_directory_profile",
-        rename_stage_indexes=rename_indexes,
-    )
-    relation_oid = AsyncMock(side_effect=[11])
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_relation_oid",
-        relation_oid,
-    )
-    identities = await importer._capture_provider_directory_artifact_promotion_identities((stage,))
-    assert identities == (
-        importer.ProviderDirectoryArtifactPromotionIdentity(
-            stage=stage,
-            stage_oid=11,
-        ),
-    )
-    relation_oid.side_effect = [None]
-    assert await importer._capture_provider_directory_artifact_promotion_identities((stage,)) == ()
-    assert not await importer._is_provider_directory_artifact_promotion_committed(())
-
-    identity = identities[0]
-    relation_attribute = AsyncMock(return_value="p")
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_relation_attribute",
-        relation_attribute,
-    )
-    await _assert_exact_artifact_cutover_recovery(
-        identity,
-        monkeypatch,
-        relation_attribute,
-        relation_oid,
-    )
+    identities = await importer._capture_provider_directory_artifact_promotion_identities((_artifact_stage(),))
+    publication = AsyncMock(return_value=metadata)
+    if metadata is None:
+        publication.side_effect = importer.ProviderDirectoryArtifactBuildStale("artifact_publication_metadata_missing")
+    monkeypatch.setattr(artifacts, "artifact_publication", publication)
+    await importer._observe_provider_directory_artifact_promotion_revisions(identities)
+    publication.assert_not_awaited()
+    await importer._observe_provider_directory_artifact_promotion_revisions(identities, before=True)
+    await importer._observe_provider_directory_artifact_promotion_revisions(identities)
+    assert identities[0].publication_revision is None
+    publication.reset_mock()
+    assert not await importer._is_provider_directory_artifact_promotion_committed(identities)
+    publication.assert_not_awaited()
 
 
 async def _assert_dataset_cutover_row_contract(
@@ -2722,7 +2703,7 @@ async def test_profile_stage_build_retains_checkpointed_stage_after_failure(
 ):
     """Retain logged resumable stages and record compact-build failure."""
     build = _profile_build()
-    fence = importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    fence = importer.ProviderDirectoryArtifactBuildFence()
     mark_failed = AsyncMock()
     monkeypatch.setattr(
         importer,
@@ -3034,7 +3015,7 @@ async def test_candidate_bundle_restores_budget_before_table_lock(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_artifact_lock_prepare_and_build_fence_contract(monkeypatch):
-    """Lock tables only and reject missing locks or changed target OIDs."""
+    """Lock tables only and reject missing locks or changed logical publications."""
     relation_attribute = AsyncMock(side_effect=["r", "p", "v", None])
     status = AsyncMock()
     monkeypatch.setattr(
@@ -3055,7 +3036,10 @@ async def test_artifact_lock_prepare_and_build_fence_contract(monkeypatch):
         "_assert_provider_directory_logged_relation",
         assert_logged,
     )
+    freeze = AsyncMock()
+    monkeypatch.setattr(artifact_bundle, "freeze_artifact_stage", freeze)
     await importer._prepare_provider_directory_artifact_stage("mrf", "stage")
+    freeze.assert_awaited_once_with(importer, "mrf", "stage")
     assert "SET LOGGED" in status.await_args_list[-1].args[0]
     assert_logged.assert_awaited_once_with("mrf", "stage")
 
@@ -3066,17 +3050,13 @@ async def test_artifact_lock_prepare_and_build_fence_contract(monkeypatch):
     importer.db.scalar.return_value = True
     await importer._acquire_provider_directory_artifact_cutover_lock(stage)
 
-    relation_oid = AsyncMock(return_value=11)
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_relation_oid",
-        relation_oid,
-    )
+    publication = AsyncMock(return_value=(True, ("current", "revision")))
+    monkeypatch.setattr(artifact_bundle, "artifact_publication", publication)
     await importer._assert_provider_directory_artifact_build_fence(stage)
-    relation_oid.assert_not_awaited()
-    fenced_stage = _artifact_stage(target_oid=11, fenced=True)
+    publication.assert_not_awaited()
+    fenced_stage = _artifact_stage(target_publication=(True, ("current", "revision")), fenced=True)
     await importer._assert_provider_directory_artifact_build_fence(fenced_stage)
-    relation_oid.return_value = 12
+    publication.return_value = (True, ("next", "revision"))
     with pytest.raises(importer.ProviderDirectoryArtifactBuildStale):
         await importer._assert_provider_directory_artifact_build_fence(fenced_stage)
 
@@ -3333,7 +3313,7 @@ async def test_artifact_bundle_timeout_recovers_only_verified_commit(
     committed = AsyncMock(side_effect=[True, False])
     monkeypatch.setattr(
         importer,
-        "_is_provider_directory_artifact_promotion_committed",
+        "_match_provider_directory_artifact_promotion",
         committed,
     )
     await importer._promote_provider_directory_artifact_bundle(stages)
@@ -3363,7 +3343,7 @@ async def test_artifact_bundle_connection_loss_reconciles_verified_commit(
     committed = AsyncMock(return_value=True)
     monkeypatch.setattr(
         importer,
-        "_is_provider_directory_artifact_promotion_committed",
+        "_match_provider_directory_artifact_promotion",
         committed,
     )
 
@@ -3414,7 +3394,9 @@ async def test_single_artifact_timeout_recovers_only_verified_commit(
 ):
     """Resolve a one-stage timeout with the same exact-identity contract."""
     stage = _artifact_stage()
-    identities = (importer.ProviderDirectoryArtifactPromotionIdentity(stage, 11),)
+    identities = (
+        importer.ProviderDirectoryArtifactPromotionIdentity(stage, publication_revision=("generation-a", "revision-a")),
+    )
     monkeypatch.setattr(
         importer,
         "_capture_provider_directory_artifact_promotion_identities",
@@ -3728,8 +3710,8 @@ async def test_profile_checkpoint_reuse_requires_both_logged_stages(
         build,
         checkpoint,
         has_existing_artifacts=False,
-        evidence_build_fence=importer.ProviderDirectoryArtifactBuildFence(None),
-        profile_build_fence=importer.ProviderDirectoryArtifactBuildFence(None),
+        evidence_build_fence=importer.ProviderDirectoryArtifactBuildFence(),
+        profile_build_fence=importer.ProviderDirectoryArtifactBuildFence(),
         evidence_total_batches=1,
         profile_total_batches=1,
     )
@@ -3750,8 +3732,8 @@ async def test_stale_profile_reaper_handles_disappeared_rows_and_lost_delete(
         "build_id": build_id,
         "evidence_stage": profile.profile_evidence_stage_table_name(build_id),
         "profile_stage": profile.profile_stage_table_name(build_id),
-        "evidence_stage_oid": 21,
-        "profile_stage_oid": 22,
+        "resume_lineage_hash": "c" * 64,
+        "owner_run_id": "stale-run",
     }
     monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(
@@ -3761,6 +3743,8 @@ async def test_stale_profile_reaper_handles_disappeared_rows_and_lost_delete(
     )
     first = AsyncMock(return_value=None)
     monkeypatch.setattr(importer.db, "first", first)
+    consumed = AsyncMock(return_value=False)
+    monkeypatch.setattr(importer.db, "scalar", consumed)
     assert (
         await importer._reap_stale_provider_directory_profile_builds(
             "mrf",
@@ -3768,6 +3752,7 @@ async def test_stale_profile_reaper_handles_disappeared_rows_and_lost_delete(
         )
         == 0
     )
+    consumed.assert_not_awaited()
 
     first.return_value = checkpoint_by_name
     monkeypatch.setattr(
@@ -3781,6 +3766,9 @@ async def test_stale_profile_reaper_handles_disappeared_rows_and_lost_delete(
             "mrf",
             current_build_id=f"pdpb_{'b' * 32}",
         )
+    consumed.assert_awaited_once()
+    assert consumed.await_args.kwargs == {"build_id": build_id}
+    assert "admission_purpose = 'profile'" in consumed.await_args.args[0]
 
 
 @pytest.mark.asyncio
@@ -3970,9 +3958,7 @@ async def test_artifact_build_guard_connects_and_releases(monkeypatch):
         AsyncMock(return_value=connection),
     )
     monkeypatch.setattr(
-        importer,
-        "_provider_directory_relation_oid",
-        AsyncMock(return_value=17),
+        artifact_bundle, "artifact_publication", AsyncMock(return_value=(True, ("current", "revision")))
     )
     release = AsyncMock()
     monkeypatch.setattr(
@@ -3984,7 +3970,8 @@ async def test_artifact_build_guard_connects_and_releases(monkeypatch):
         "mrf",
         "profile",
     ) as fence:
-        assert fence.target_oid == 17
+        assert fence.target_name == ("mrf", "profile")
+        assert fence.target_publication == (True, ("current", "revision"))
     release.assert_awaited_once_with(
         connection,
         "provider-directory-artifact-build:mrf.profile",

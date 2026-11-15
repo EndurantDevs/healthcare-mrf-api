@@ -14,9 +14,13 @@ from process import provider_directory_cms_native_layout as layout
 from process.provider_directory_cms_preparation import OwnedRelation
 
 
+def _fixture_oid(relation):
+    return int(relation.relation.removeprefix("heap_"))
+
+
 def _physical_relation(relation, toast_oid=0):
     return dict(
-        relation_oid=relation.oid,
+        relation_oid=_fixture_oid(relation),
         schema_name=relation.schema,
         relation_name=relation.relation,
         relkind="r",
@@ -38,9 +42,9 @@ def _physical_relation(relation, toast_oid=0):
 
 def _catalog_backend():
     directory = importlib.import_module("process.provider_directory_fhir")
-    relations = tuple(OwnedRelation("synthetic", f"heap_{oid}", oid, 0, "p") for oid in (11, 21, 31))
-    relation_maps = [_physical_relation(relation, relation.oid + 1) for relation in relations]
-    catalog_by_name = dict(attributes=[], indexes=[], constraints=[], triggers=[], database_oid=7)
+    relations = tuple(OwnedRelation("synthetic", f"heap_{oid}", 0, "p") for oid in (11, 21, 31))
+    relation_maps = [_physical_relation(relation, _fixture_oid(relation) + 1) for relation in relations]
+    catalog_by_name = dict(attributes=[], indexes=[], constraints=[], triggers=[])
     for relation_map in relation_maps:
         for relation_oid in (relation_map["relation_oid"], relation_map["toast_oid"]):
             catalog_by_name["attributes"].append(dict(relation_oid=relation_oid, attnum=1, attname="identity"))
@@ -56,13 +60,18 @@ def _catalog_backend():
             },
         }
 
-    database = SimpleNamespace(first=AsyncMock(side_effect=first), all=AsyncMock(return_value=relation_maps))
+    database = SimpleNamespace(
+        first=AsyncMock(side_effect=first),
+        all=AsyncMock(return_value=relation_maps),
+        scalar=AsyncMock(side_effect=lambda _query, **kw: int(kw["name"].rsplit("_", 1)[1])),
+    )
 
     async def relation_row(*arguments):
         return await directory._profile_capacity_relation_row(*arguments, database=database)
 
     backend = SimpleNamespace(
         db=database,
+        _unscoped_qt=lambda schema, name: schema + "." + name,
         _pagination_checkpoint_row_mapping=lambda catalog_record: catalog_record,
         _validate_profile_capacity_relation_row=directory._validate_profile_capacity_relation_row,
         _profile_capacity_relation_row=relation_row,
@@ -76,8 +85,7 @@ def _catalog_backend():
 async def test_batch_replaces_two_queries_per_heap_with_two_fresh_queries():
     backend, relations, _relation_maps, _catalog_by_name = _catalog_backend()
     individual_by_coordinate = {
-        (relation.schema, relation.relation, relation.oid): await layout._observe_catalog(backend, relation)
-        for relation in relations
+        (relation.schema, relation.relation): await layout._observe_catalog(backend, relation) for relation in relations
     }
     assert backend.db.first.await_count == 2 * len(relations)
     backend.db.first.reset_mock()
@@ -85,10 +93,12 @@ async def test_batch_replaces_two_queries_per_heap_with_two_fresh_queries():
     assert batched_by_coordinate == individual_by_coordinate
     backend.db.all.assert_awaited_once()
     backend.db.first.assert_awaited_once()
-    assert backend.db.all.await_args.kwargs == {"relation_oids": [11, 21, 31]}
+    assert backend.db.all.await_args.kwargs == {
+        "relation_refs": ["synthetic.heap_11", "synthetic.heap_21", "synthetic.heap_31"]
+    }
     assert backend.db.first.await_args.kwargs == {"relation_oids": [11, 12, 21, 22, 31, 32]}
     for relation in relations:
-        coordinate = (relation.schema, relation.relation, relation.oid)
+        coordinate = (relation.schema, relation.relation)
         assert layout._observed_layout(
             backend, relation, *batched_by_coordinate[coordinate]
         ) == layout._observed_layout(backend, relation, *individual_by_coordinate[coordinate])
@@ -98,7 +108,6 @@ async def test_batch_replaces_two_queries_per_heap_with_two_fresh_queries():
 @pytest.mark.parametrize(
     "field,replacement,position",
     [
-        ("relation_oid", 99, 0),
         ("schema_name", "different", 0),
         ("relation_name", "different", 0),
         ("relpersistence", "u", 0),
@@ -126,15 +135,15 @@ async def test_batch_rejects_incomplete_relation_inventory(change):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["duplicate_oid", "duplicate_coordinate", "boolean_oid"])
+@pytest.mark.parametrize("change", ["duplicate_coordinate", "invalid_schema", "invalid_name"])
 async def test_batch_rejects_ambiguous_requested_inventory_before_sql(change):
     backend, relations, _relation_maps, _catalog_by_name = _catalog_backend()
-    if change == "duplicate_oid":
+    if change == "duplicate_coordinate":
         relations = (*relations, relations[0])
-    elif change == "duplicate_coordinate":
-        relations = (*relations, replace(relations[0], oid=99))
+    elif change == "invalid_schema":
+        relations = (replace(relations[0], schema=True),)
     else:
-        relations = (replace(relations[0], oid=True),)
+        relations = (replace(relations[0], relation=""),)
     with pytest.raises(RuntimeError, match="storage_shape_unsupported"):
         await layout.observe_native_catalog_batch(backend, relations)
     backend.db.all.assert_not_awaited()
@@ -150,9 +159,7 @@ async def test_batch_rejects_foreign_or_duplicate_catalog_members(change):
     elif change == "foreign_attribute":
         catalog_by_name["attributes"].append(dict(relation_oid=99, attnum=1))
     else:
-        index_by_field = dict(
-            relation_oid=99 if change == "foreign_index" else 11, index_oid=101, physical_present=True
-        )
+        index_by_field = dict(relation_oid=99 if change == "foreign_index" else 11, index_oid=101, catalog_present=True)
         catalog_by_name["indexes"] = [index_by_field] * (2 if change == "duplicate_index" else 1)
     backend.db.first.side_effect = None
     backend.db.first.return_value = catalog_by_name
@@ -164,7 +171,7 @@ async def test_batch_rejects_foreign_or_duplicate_catalog_members(change):
 @pytest.mark.parametrize("section", ["attributes", "indexes", "constraints", "triggers"])
 async def test_batch_rejects_foreign_oid_in_every_catalog_section(section):
     backend, relations, _relation_maps, catalog_by_name = _catalog_backend()
-    catalog_by_name[section].append(dict(relation_oid=99, physical_present=True))
+    catalog_by_name[section].append(dict(relation_oid=99, catalog_present=True))
     backend.db.first.side_effect = None
     backend.db.first.return_value = catalog_by_name
     with pytest.raises(RuntimeError, match="storage_shape_unsupported"):
@@ -188,7 +195,7 @@ async def test_batch_uses_only_explicit_executor_and_recaptures_each_call():
     relation_maps[0]["schema_name"] = "replaced"
     with pytest.raises(RuntimeError, match="storage_shape_unsupported"):
         await layout.observe_native_catalog_batch(backend, relations, database=executor)
-    assert executor.all.await_count == executor.first.await_count == 2
+    assert executor.all.await_count == 2 and executor.first.await_count == 1
     backend.db.all.assert_not_awaited()
     backend.db.first.assert_not_awaited()
 
@@ -198,11 +205,11 @@ async def test_passive_catalog_rejects_coordinate_change_without_queries():
     backend, relations, _relation_maps, _catalog_by_name = _catalog_backend()
     captured = await layout.observe_native_catalog_batch(backend, relations)
     relation = relations[0]
-    observed = captured[(relation.schema, relation.relation, relation.oid)]
+    observed = captured[(relation.schema, relation.relation)]
     backend.db.all.reset_mock()
     backend.db.first.reset_mock()
     with pytest.raises(RuntimeError, match="storage_shape_unsupported"):
-        await layout._observe_catalog(backend, replace(relation, oid=99), observed_catalog=observed)
+        await layout._observe_catalog(backend, replace(relation, relation="foreign"), observed_catalog=observed)
     backend.db.all.assert_not_awaited()
     backend.db.first.assert_not_awaited()
 
@@ -242,10 +249,10 @@ async def test_scratch_batch_groups_proof_members_and_preserves_fences(monkeypat
     from process import provider_directory_artifact_scratch_inputs as scratch
 
     backend, relations, _relation_maps, _catalog_by_name = _catalog_backend()
-    fallback = OwnedRelation("synthetic", "fallback", 99, 0, "p")
+    fallback = OwnedRelation("synthetic", "fallback", 0, "p")
     executor, events = object(), []
     proof_by_coordinate = {
-        (relation.schema, relation.relation): (object(), executor if relation.oid != 31 else None)
+        (relation.schema, relation.relation): (object(), executor if _fixture_oid(relation) != 31 else None)
         for relation in relations
     }
 
@@ -257,13 +264,13 @@ async def test_scratch_batch_groups_proof_members_and_preserves_fences(monkeypat
 
     async def census(_backend, members, *, database):
         events.append(("census", database))
-        return {(relation.schema, relation.relation, relation.oid): relation.oid for relation in members}
+        return {(relation.schema, relation.relation): _fixture_oid(relation) for relation in members}
 
     async def capture(_backend, relation, proof, *, database, observed_catalog):
         assert (proof, database) == proof_by_coordinate[(relation.schema, relation.relation)]
-        assert observed_catalog == relation.oid
-        events.append(relation.oid)
-        return layout.NativeRelationLayout(relation.oid, (42,), "a" * 64)
+        assert observed_catalog == _fixture_oid(relation)
+        events.append(_fixture_oid(relation))
+        return layout.NativeRelationLayout(relation.schema, relation.relation)
 
     observe = AsyncMock(side_effect=census)
     monkeypatch.setattr(scratch, "scratch_relation_batch", proof_scope)
@@ -276,3 +283,16 @@ async def test_scratch_batch_groups_proof_members_and_preserves_fences(monkeypat
     assert observe.await_args_list[0].args[1] == list(relations[:2])
     assert observe.await_args_list[1].args[1] == [relations[2]]
     assert captured == {}
+
+
+@pytest.mark.asyncio
+async def test_batch_re_resolves_named_snapshot_without_persisted_native_identity():
+    backend, relations, relation_maps, catalog_by_name = _catalog_backend()
+    expected = await layout.observe_native_catalog_batch(backend, relations)
+    relation_maps[0]["relation_oid"] = 99
+    for attribute in catalog_by_name["attributes"]:
+        if attribute["relation_oid"] == 11:
+            attribute["relation_oid"] = 99
+    current = await layout.observe_native_catalog_batch(backend, relations)
+    assert current.keys() == expected.keys() == {(entry.schema, entry.relation) for entry in relations}
+    assert current[(relations[0].schema, relations[0].relation)][0]["relation"]["relation_oid"] == 99

@@ -89,3 +89,56 @@ def test_application_conversion_preserves_unchanged_rows_and_metadata():
 def test_projection_rejects_non_native_eligibility(eligible):
     with pytest.raises(RuntimeError, match="npi_eligibility_changed"):
         repair.repair_npi_rows([{"repair_eligible": eligible}], datetime(2026, 1, 1))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["npi", "location"])
+async def test_maintenance_digest_excludes_legacy_physical_tokens(monkeypatch, kind):
+    from contextlib import asynccontextmanager
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+
+    from process import provider_directory_output_location_rebuild as locations
+    from process import provider_directory_output_snapshot_provision as provision
+    from tests.test_provider_directory_output_snapshot_custody import relation
+
+    module = repair if kind == "npi" else locations
+    target_names = repair.TARGETS if kind == "npi" else (locations.TARGET,)
+    publisher = SimpleNamespace(
+        policy=SimpleNamespace(schema="mrf"),
+        connection=SimpleNamespace(fetchval=AsyncMock(return_value=datetime(2026, 1, 1))),
+    )
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: 1)))
+
+    @asynccontextmanager
+    async def transaction(*args, **kwargs):
+        yield session
+
+    owner = _directory()
+    owner.db = SimpleNamespace(_transaction_binding=lambda: None, has_reader_session=lambda: False)
+    monkeypatch.setattr(module, "source_transaction", transaction)
+    monkeypatch.setattr(module, "bound_publisher", lambda: publisher)
+    monkeypatch.setattr(module, "uuid4", lambda: SimpleNamespace(hex="a" * 32))
+    selected_by_target = {
+        target_name: replace(relation(target_name, 1), schema="mrf", target=target_name) for target_name in target_names
+    }
+    monkeypatch.setattr(provision, "_capture", AsyncMock(return_value=selected_by_target))
+    monkeypatch.setattr(module.custody, "_native_receipt", lambda _policy, row, _target: row)
+
+    async def captured():
+        if kind == "npi":
+            return (await module._capture_operation(owner, {"run_id": None, "source_ids": None}))[0]
+        return (await module._captured_operation(owner, None))[0]
+
+    original = await captured()
+    selected_by_target.update(
+        {
+            target_name: replace(incumbent, oid=True, owner_oid=None, schema_oid="opaque")
+            for target_name, incumbent in selected_by_target.items()
+        }
+    )
+    assert await captured() == original
+    selected_by_target[target_names[0]] = replace(
+        selected_by_target[target_names[0]], relation="different_named_snapshot"
+    )
+    assert (await captured())["source_fence_digest"] != original["source_fence_digest"]

@@ -42,10 +42,6 @@ def _receipt():
             "root_run_id": "publication-root",
             "published_at": "2026-01-01T12:00:00+00:00",
             "resource_hash_contract": "historical-hash-v1",
-            "original_admission_version": 7,
-            "original_admission_kind": "historical",
-            "original_admission_sha256": "b" * 64,
-            "original_metadata_sha256": "c" * 64,
             "claimed_resource_count": 75,
         },
         "families": _families([_row()]),
@@ -160,17 +156,12 @@ def test_row_bound_applies_to_canonical_utf8_bytes():
     "missing_field",
     [
         "resource_hash_contract",
-        "original_admission_version",
-        "original_admission_kind",
-        "original_admission_sha256",
-        "original_metadata_sha256",
-        "all",
     ],
 )
 def test_missing_historical_proofs_remain_missing_independently(missing_field):
     receipt = _receipt()
     for field in receipt["publication"]:
-        if field == missing_field or (missing_field == "all" and field.startswith(("resource_hash", "original_"))):
+        if field == missing_field:
             receipt["publication"][field] = None
     validated = validate_catalog_observation_receipt(receipt)
     assert validated == receipt
@@ -191,13 +182,6 @@ def test_missing_historical_proofs_remain_missing_independently(missing_field):
         (("publication", "root_run_id"), "a\nroot"),
         (("publication", "root_run_id"), "é" * 33),
         (("publication", "resource_hash_contract"), "x" * 129),
-        (("publication", "original_admission_kind"), "x" * 65),
-        (("publication", "original_admission_kind"), False),
-        (("publication", "original_admission_version"), True),
-        (("publication", "original_admission_version"), 0),
-        (("publication", "original_admission_version"), 2**63),
-        (("publication", "original_admission_sha256"), "no-proof"),
-        (("publication", "original_metadata_sha256"), "A" * 64),
         (("publication", "published_at"), "2026-01-01T12:00:00"),
         (("publication", "published_at"), "2026-01-01T12:00:00+01:00"),
         (("publication", "published_at"), "invalid"),
@@ -250,9 +234,7 @@ def test_receipt_accepts_exact_text_and_count_bounds_and_utc_iso_spelling():
     receipt["publication"].update(
         root_run_id="é" * 32,
         resource_hash_contract="h" * 128,
-        original_admission_kind="k" * 64,
         published_at="2026-01-01T12:00:00Z",
-        original_admission_version=2**63 - 1,
         claimed_resource_count=2**63 - 1,
     )
     receipt["families"]["Organization"]["rows"] = 2**63 - 1
@@ -262,7 +244,7 @@ def test_receipt_accepts_exact_text_and_count_bounds_and_utc_iso_spelling():
 def test_descriptor_digest_excludes_only_circular_receipt_fields():
     descriptor_by_field = {
         "coordinates": {"source_id": "example", "dataset_id": "edition"},
-        "policy": {"schema_name": "example_source", "runtime_roles": ["example_reader"]},
+        "policy": {"schema_name": "example_source", "catalog_schema_name": "example_catalog"},
         "admission": _receipt(),
         "accepted_receipt_id": "old-id",
         "accepted_receipt_sha256": "old-digest",
@@ -300,5 +282,5 @@ def test_source_descriptor_refuses_a_corrupted_or_incomplete_observation_receipt
     else:
         selected["accepted_receipt_sha256"] = "f" * 64
         selected["accepted_receipt_id"] = CATALOG_OBSERVATION_CONTRACT + ":" + "f" * 64
-    with pytest.raises(ValueError, match="observation_invalid"):
+    with pytest.raises(ValueError, match="invalid"):
         validate_fhir_catalog_source_descriptor(selected)

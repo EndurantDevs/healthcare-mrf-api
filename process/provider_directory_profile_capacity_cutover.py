@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 from process.provider_directory_profile_capacity_cutover_contract import (
@@ -471,7 +472,9 @@ def _validated_cutover_layouts(
     layouts_by_name = {
         layout_field: _assert_cutover_layout(
             forecast[layout_field],
-            getattr(geometry, fingerprint_field),
+            geometry.legacy_payload[fingerprint_field]
+            if geometry.legacy_payload is not None
+            else geometry.relations[layout_field.removesuffix("_layout")],
             includes_inserted_toast_chunks=includes_inserted_chunks,
         )
         for (
@@ -511,8 +514,8 @@ class _TargetWindowPlan:
     relation_name: str
     target_ref: str
     stage_ref: str
-    target_oid: int
-    stage_oid: int
+    stage_schema: str
+    stage_table: str
     column_sql: str
     key_sql: str
     key_type: str
@@ -545,18 +548,60 @@ def _target_window_totals(fhir, admission, relation_name):
     )
 
 
+async def _target_window_coordinates(fhir, admission, relation_name, target_ref, stage_ref):
+    """Bind named SQL inputs to the signed target and locked checkpoint's stage."""
+    geometry = admission.geometry
+    control = geometry.relations["build_checkpoint"]
+    schema = control["schema"]
+    if (
+        admission.admitted_identity is None
+        or relation_name not in {"evidence_target", "profile_target"}
+        or fhir._provider_directory_profile_checkpoint_ref(schema) != fhir._unscoped_qt(schema, control["name"])
+    ):
+        raise fhir.ProviderDirectoryArtifactBuildStale("provider_directory_profile_target_window_scope_changed")
+    checkpoint = await fhir._lock_profile_delta_checkpoint(SimpleNamespace(schema=schema, build_id=admission.build_id))
+    coordinates = fhir._ProviderDirectoryProfileBuildCoordinates(
+        build_id=admission.build_id,
+        evidence_stage=checkpoint.get("evidence_stage"),
+        profile_stage=checkpoint.get("profile_stage"),
+        affected_npi_stage=checkpoint.get("affected_npi_stage"),
+        profile_as_of=geometry.profile_as_of,
+        capacity_geometry_status="verified",
+        capacity_geometry_hash=fhir.profile_capacity.capacity_geometry_hash(geometry),
+        capacity_geometry_json=fhir.profile_capacity.canonical_capacity_geometry_json(geometry),
+    )
+    build = fhir._profile_build_candidate(schema, admission.run_id, admission.admitted_identity, coordinates)
+    target_coordinate_by_field = geometry.relations[relation_name]
+    stage_table = checkpoint.get(relation_name.removesuffix("_target") + "_stage")
+    if (
+        checkpoint.get("owner_run_id") != admission.run_id
+        or checkpoint.get("state") != "ready"
+        or checkpoint.get("resume_lineage_hash") != build.resume_lineage_hash
+        or checkpoint.get("profile_as_of") != geometry.profile_as_of
+        or not fhir._is_checkpoint_source_lineage_matching(checkpoint, build)
+        or not fhir._is_profile_checkpoint_geometry_matching(checkpoint, build=build)
+        or fhir._json_object(checkpoint.get("targets_json")) != fhir._profile_build_target_coordinates(build)
+        or fhir._profile_build_target_coordinates(build)
+        != {
+            role: {name: geometry.relations[role + "_target"][name] for name in ("schema", "name")}
+            for role in ("evidence", "profile")
+        }
+        or target_ref != fhir._unscoped_qt(target_coordinate_by_field["schema"], target_coordinate_by_field["name"])
+        or not isinstance(stage_table, str)
+        or not stage_table
+        or len(stage_table) > 63
+        or "\0" in stage_table
+        or stage_ref != fhir._unscoped_qt(schema, stage_table)
+    ):
+        raise fhir.ProviderDirectoryArtifactBuildStale("provider_directory_profile_target_window_scope_changed")
+    return schema, stage_table
+
+
 async def _target_window_plan(fhir, relation_name, target_ref, stage_ref, selection_by_name):
     if fhir.db._transaction_binding() is None:
         raise RuntimeError("provider_directory_profile_target_requires_transaction")
     admission = fhir._provider_directory_profile_capacity_admission()
-    target_oid = getattr(admission.geometry, relation_name + "_oid")
-    stage_oid = int(
-        await fhir.db.scalar(
-            "SELECT to_regclass(:relation_ref)::oid::bigint;",
-            relation_ref=stage_ref,
-        )
-        or 0
-    )
+    stage_schema, stage_table = await _target_window_coordinates(fhir, admission, relation_name, target_ref, stage_ref)
     totals_by_metric = _target_window_totals(fhir, admission, relation_name)
     column_sql = ", ".join(fhir._q(column) for column in selection_by_name["columns"])
     key_sql = "target." + fhir._q(selection_by_name["key_column"])
@@ -569,8 +614,8 @@ async def _target_window_plan(fhir, relation_name, target_ref, stage_ref, select
         relation_name,
         target_ref,
         stage_ref,
-        target_oid,
-        stage_oid,
+        stage_schema,
+        stage_table,
         column_sql,
         key_sql,
         key_type,
@@ -609,8 +654,8 @@ async def _project_target_window(fhir, plan, operation, relation_ref, bound, par
     target_layout, stage_layout = await fhir._profile_cutover_layout_pair(
         plan.admission,
         plan.relation_name,
-        plan.target_oid,
-        plan.stage_oid,
+        plan.stage_schema,
+        plan.stage_table,
     )
     layout = target_layout if operation == "delete" else stage_layout
     observed_rows, logical_bytes = await fhir._profile_delta_deletion_projection(

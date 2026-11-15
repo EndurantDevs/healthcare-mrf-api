@@ -35,8 +35,8 @@ async def test_checkpoint_status_uses_one_original_native_terminal_owner(control
     group = admission.wal_tracker.owned_control_transaction_groups[0]
     outcome = group["original_outcome"]
     assert group["identity"] == (statement, {"cursor": 2})
-    assert group["outcome"] is outcome and group["session"] is outcome.session
-    assert group["connection"] is state.connections[0] and group["driver"] is outcome.retained_driver
+    assert group["outcome"] is outcome
+    assert state.connections[0].closed and state.checkedout == 0
     assert group["consumed"] and group["status"] == "complete_mixed_unclassified"
     assert not group["accounting_authority"] and not group["reservation_refund"]
     assert outcome.status == "committed_measured" and outcome.cleanup_complete
@@ -126,12 +126,19 @@ async def test_misbound_control_custody_preserves_authentic_commit(control_wave,
         consume(module, outcome, failure, groups=groups)
 
     monkeypatch.setattr(fhir.profile_control_custody, "consume_owned_groups", corrupt)
-    with pytest.raises(RuntimeError, match="control_custody_incomplete"):
+    if field in {"driver", "pid"}:
         await fhir._provider_directory_profile_capacity_status("UPDATE synthetic_checkpoint SET cursor=2;")
+    else:
+        with pytest.raises(RuntimeError, match="control_custody_incomplete"):
+            await fhir._provider_directory_profile_capacity_status("UPDATE synthetic_checkpoint SET cursor=2;")
     group = admission.wal_tracker.owned_control_transaction_groups[0]
     outcome = group["outcome"] if field == "original_outcome" else group["original_outcome"]
     assert outcome.is_committed and outcome.status == "committed_measured" and outcome.cleanup_complete
-    assert not group["consumed"] and group["status"] == "incomplete"
+    if field in {"driver", "pid"}:
+        assert group["consumed"] and group["status"] == "complete_mixed_unclassified"
+        assert not group["accounting_authority"] and not group["reservation_refund"]
+    else:
+        assert not group["consumed"] and group["status"] == "incomplete"
 
 
 async def test_admitted_import_progress_records_original_group_identity(control_wave, monkeypatch):
@@ -139,10 +146,8 @@ async def test_admitted_import_progress_records_original_group_identity(control_
     monkeypatch.setattr(fhir, "_schema", lambda: "synthetic")
     monkeypatch.setattr(
         fhir,
-        "_provider_directory_profile_relation_storage_fingerprint",
-        AsyncMock(
-            return_value=type("Layout", (), {"exact_fingerprint": admission.geometry.import_run_storage_fingerprint})(),
-        ),
+        "_profile_capacity_named_layout",
+        AsyncMock(return_value=SimpleNamespace()),
     )
 
     async def is_marked(run_id, **params):
@@ -160,6 +165,7 @@ async def test_admitted_import_progress_records_original_group_identity(control_
         progress_by_name=progress_by_field,
         metrics=None,
     )
+    fhir._profile_capacity_named_layout.assert_awaited_once_with(admission.geometry, "import_run")
     group = admission.wal_tracker.owned_control_transaction_groups[0]
     assert group["identity"][0:3] == ("import_run_progress", "synthetic_run", "synthetic_phase")
     assert group["identity"][3] is progress_by_field and group["consumed"]

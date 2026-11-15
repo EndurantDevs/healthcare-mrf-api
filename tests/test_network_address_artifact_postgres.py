@@ -5,6 +5,7 @@ import os
 from contextlib import AsyncExitStack
 from copy import deepcopy
 from datetime import UTC, datetime
+from itertools import product
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -15,6 +16,7 @@ from sqlalchemy.engine import make_url
 
 from process import entity_address_alias_guard as alias_guard
 from process import entity_address_snapshot_adoption as adoption
+from process import entity_address_snapshot_preparation as preparation
 from process import network_address_artifact as artifact
 from process.network_address_projection import PinnedAddressSource
 from tests.test_address_numeric_grid_alias_runtime_db import _create_alias_probe_schema
@@ -129,10 +131,8 @@ async def address_db():
         reader = await asyncpg.connect(reader_url.render_as_string(hide_password=False))
         cleanup.push_async_callback(reader.close)
         async with publisher.transaction(isolation="repeatable_read", readonly=True):
-            authority = await artifact.generation.read_entity_address_result_generation_authority(
-                artifact._CatalogSession(publisher), schema_name=schema
-            )
-            generation_id = artifact._digest(artifact._authority_document(authority))
+            authority, _legacy_key = await artifact._current_authority(publisher, schema)
+            generation_id = artifact._digest(authority)
             address_source = PinnedAddressSource(schema, "entity_address_unified", generation_id)
             descriptor = await artifact.capture_network_address_artifact(
                 publisher, address_source, runtime_roles=(role_by_kind["reader"],)
@@ -150,10 +150,18 @@ async def address_db():
         )
 
 
+class _NativeSession(artifact._CatalogSession):
+    async def connection(self):
+        return self
+
+    async def get_raw_connection(self):
+        return SimpleNamespace(driver_connection=self.native_connection)
+
+
 class _NativeDB:
     def __init__(self, connection):
         self.connection = connection
-        self.session = artifact._CatalogSession(connection)
+        self.session = _NativeSession(connection)
 
     def _transaction_binding(self):
         return SimpleNamespace(session=self.session)
@@ -183,47 +191,74 @@ async def _rotate(resources, monkeypatch):
         f'INSERT INTO "{schema}".entity_address_unified_next SELECT * FROM "{schema}".entity_address_unified'
     )
     await resources.admin.execute(f'UPDATE "{schema}".entity_address_unified_next SET location_key=$1', "new-office")
-    monkeypatch.setattr(adoption.entity_address_unified, "db", _NativeDB(resources.publisher))
-    async with resources.publisher.transaction():
-        retained = await adoption._swap_sealed_stage_table(
-            schema,
-            SimpleNamespace(__main_table__="entity_address_unified"),
-            SimpleNamespace(__tablename__="entity_address_unified_next", __my_additional_indexes__=[]),
-            resources.descriptor["protected_owner_oid"],
-        )
-        oid = await resources.publisher.fetchval(
-            "SELECT to_regclass($1)::oid::bigint", f'"{schema}".entity_address_unified'
-        )
-        await resources.publisher.execute(
-            f'UPDATE "{schema}".entity_address_result_generation SET local_generation=2,origin_generation=2,relation_oids[1]=$1',
-            oid,
-        )
-        await resources.publisher.execute(f'UPDATE "{schema}".address_alias_state_v1 SET generation=generation+1')
+    return await _native_swap(resources, monkeypatch)
+
+
+async def _native_swap(resources, monkeypatch):
+    """Swap the prepared next heap in as the native publisher and advance the logical generation."""
+    schema = resources.schema
+    native_db = _NativeDB(resources.publisher)
+    monkeypatch.setattr(adoption.entity_address_unified, "db", native_db)
+    # Compact runtimes re-create the retention namespace as administrator; production keeps the owner role.
+    previous_owner = await resources.admin.fetchval(
+        "SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='hp_snapshot_retention'"
+    )
+    await resources.admin.execute(f'ALTER SCHEMA hp_snapshot_retention OWNER TO "{resources.roles["owner"]}"')
+    try:
+        async with resources.publisher.transaction():
+            retained = await adoption._swap_sealed_stage_table(
+                schema,
+                SimpleNamespace(__main_table__="entity_address_unified"),
+                SimpleNamespace(__tablename__="entity_address_unified_next", __my_additional_indexes__=[]),
+                await preparation._publisher_authority(native_db.session),
+            )
+            oid = await resources.publisher.fetchval(
+                "SELECT to_regclass($1)::oid::bigint", f'"{schema}".entity_address_unified'
+            )
+            await resources.publisher.execute(
+                f'UPDATE "{schema}".entity_address_result_generation '
+                "SET local_generation=2,origin_generation=2,relation_oids[1]=$1",
+                oid,
+            )
+            await resources.publisher.execute(f'UPDATE "{schema}".address_alias_state_v1 SET generation=generation+1')
+    finally:
+        await resources.admin.execute("ALTER SCHEMA hp_snapshot_retention OWNER TO " + previous_owner)
     return retained
 
 
 async def _verify(resources):
-    async with resources.reader.transaction(readonly=True):
+    async with resources.reader.transaction(isolation="repeatable_read", readonly=True):
         return await artifact.verify_network_address_artifact(
             resources.reader, resources.descriptor, runtime_roles=(resources.roles["reader"],)
         )
 
 
-async def test_rotation_between_catalog_read_and_lock_rejects_replacement_name(address_db, monkeypatch):
+async def test_rotation_between_catalog_read_and_lock_keeps_the_recorded_generation(address_db, monkeypatch):
     class RotatingConnection:
         def __getattr__(self, name):
             return getattr(address_db.reader, name)
 
+        rotated = False
+
         async def execute(self, statement, *arguments):
-            await _rotate(address_db, monkeypatch)
+            # Rotate after resolution, before the reader's first named lock.
+            if statement.startswith("LOCK TABLE ONLY") and not self.rotated:
+                self.rotated = True
+                await _rotate(address_db, monkeypatch)
             return await address_db.reader.execute(statement, *arguments)
 
     async with address_db.reader.transaction(isolation="repeatable_read", readonly=True):
-        with pytest.raises(artifact.NetworkAddressArtifactError, match="table_changed"):
-            await artifact._locked_table(RotatingConnection(), address_db.schema, address_db.descriptor["table"]["oid"])
+        retained = await artifact.verify_network_address_artifact(RotatingConnection(), address_db.descriptor)
+        assert retained.table_name == address_db.descriptor["retained_table"]["table_name"]
+        assert (
+            await address_db.reader.fetchval(
+                f'SELECT location_key FROM "{retained.schema_name}"."{retained.table_name}"'
+            )
+            == "old-office"
+        )
     retained = await _verify(address_db)
-    assert retained.table_oid == address_db.descriptor["table"]["oid"]
-    assert retained.table_name.endswith("_retained_" + format(retained.table_oid, "x"))
+    assert retained.table_name == address_db.descriptor["retained_table"]["table_name"]
+    assert retained.table_name.startswith("entity_address_unified_retained_")
 
 
 async def test_native_rotation_keeps_pin_for_reader(address_db, monkeypatch):
@@ -237,8 +272,8 @@ async def test_native_rotation_keeps_pin_for_reader(address_db, monkeypatch):
     before = await _verify(address_db)
     retained = await _rotate(address_db, monkeypatch)
     after = await _verify(address_db)
-    assert before.table_oid == after.table_oid == retained["relation_oid"]
-    assert after.table_name == retained["retained_name"] == f"entity_address_unified_retained_{before.table_oid:x}"
+    assert before.table_name == "entity_address_unified"
+    assert after.table_name == retained["relation_name"] == address_db.descriptor["retained_table"]["table_name"]
     assert (
         await address_db.reader.fetchval(f'SELECT location_key FROM "{after.schema_name}"."{after.table_name}"')
         == "old-office"
@@ -247,9 +282,8 @@ async def test_native_rotation_keeps_pin_for_reader(address_db, monkeypatch):
         await address_db.reader.fetchval(f'SELECT location_key FROM "{after.schema_name}".entity_address_unified')
         == "new-office"
     )
-    assert not await address_db.reader.fetchval(
-        "SELECT pg_has_role(current_user,$1::oid,'SET')", address_db.descriptor["protected_owner_oid"]
-    )
+    # The reader cannot act as the protected owner role, named rather than by a stored identity.
+    assert not await address_db.reader.fetchval("SELECT pg_has_role(current_user,$1,'SET')", address_db.roles["owner"])
     async with address_db.publisher.transaction(isolation="repeatable_read", readonly=True):
         with pytest.raises(artifact.NetworkAddressArtifactError, match="source_generation_changed"):
             await artifact.capture_network_address_artifact(
@@ -257,79 +291,15 @@ async def test_native_rotation_keeps_pin_for_reader(address_db, monkeypatch):
             )
 
 
-@pytest.mark.parametrize(
-    "damage",
-    [
-        "new_oid",
-        "rewrite",
-        "table_owner",
-        "owner_login",
-        "namespace_owner",
-        "namespace_create",
-        "table_update",
-        "column_update",
-        "role_set",
-        "elevated_reach",
-        "new_index",
-        "reindex",
-        "column_added",
-        "authority_owner",
-        "authority_update",
-        "authority_index",
-        "wrong_name",
-    ],
-)
-async def test_changed_custody_or_structure_rejects(address_db, damage):
+async def test_changed_custody_or_structure_rejects(address_db):
+    """A pinned name that no longer exists is refused; frozen heaps leave nothing else to compare per read."""
     resources = address_db
-    admin, schema, roles = resources.admin, resources.schema, resources.roles
-    match damage:
-        case "new_oid":
-            await admin.execute(f'DROP TABLE "{schema}".entity_address_unified')
-            await admin.execute(
-                f'CREATE TABLE "{schema}".entity_address_unified(location_key text PRIMARY KEY,type text)'
-            )
-            await admin.execute(f'ALTER TABLE "{schema}".entity_address_unified OWNER TO "{roles["owner"]}"')
-            await admin.execute(f'GRANT SELECT ON "{schema}".entity_address_unified TO "{roles["reader"]}"')
-        case "rewrite":
-            await admin.execute(f'CLUSTER "{schema}".entity_address_unified USING address_npi')
-        case "table_owner":
-            await admin.execute(f'ALTER TABLE "{schema}".entity_address_unified OWNER TO "{roles["outsider"]}"')
-        case "owner_login":
-            await admin.execute(f'ALTER ROLE "{roles["owner"]}" LOGIN')
-        case "namespace_owner":
-            await admin.execute(f'ALTER SCHEMA "{schema}" OWNER TO "{roles["outsider"]}"')
-        case "namespace_create":
-            await admin.execute(f'GRANT CREATE ON SCHEMA "{schema}" TO "{roles["reader"]}"')
-        case "table_update":
-            await admin.execute(f'GRANT UPDATE ON "{schema}".entity_address_unified TO "{roles["reader"]}"')
-        case "column_update":
-            await admin.execute(f'GRANT UPDATE(npi) ON "{schema}".entity_address_unified TO "{roles["reader"]}"')
-        case "role_set":
-            await admin.execute(f'GRANT "{roles["owner"]}" TO "{roles["reader"]}" WITH INHERIT FALSE, SET TRUE')
-        case "elevated_reach":
-            quoted_admin = await admin.fetchval("SELECT quote_ident(current_user)")
-            await admin.execute(f'GRANT {quoted_admin} TO "{roles["reader"]}"')
-        case "new_index":
-            await admin.execute(f'CREATE INDEX changed_source ON "{schema}".entity_address_unified(inferred_npi)')
-        case "reindex":
-            await admin.execute(f'REINDEX INDEX "{schema}".address_npi')
-        case "column_added":
-            await admin.execute(f'ALTER TABLE "{schema}".entity_address_unified ADD COLUMN changed text')
-        case "authority_owner":
-            await admin.execute(
-                f'ALTER TABLE "{schema}".entity_address_result_generation OWNER TO "{roles["outsider"]}"'
-            )
-        case "authority_update":
-            await admin.execute(f'GRANT UPDATE ON "{schema}".entity_address_result_generation TO "{roles["outsider"]}"')
-        case "authority_index":
-            await admin.execute(
-                f'CREATE INDEX changed_authority ON "{schema}".entity_address_result_generation(local_generation)'
-            )
-        case "wrong_name":
-            await admin.execute(
-                f'ALTER TABLE "{schema}".entity_address_unified RENAME TO entity_address_unified_retained_1'
-            )
-    with pytest.raises((artifact.NetworkAddressArtifactError, RuntimeError)):
+    await resources.admin.execute(
+        f'ALTER TABLE "{resources.schema}".entity_address_unified RENAME TO entity_address_unified_retained_1'
+    )
+    with pytest.raises(
+        artifact.NetworkAddressArtifactError, match="network_address_artifact_retained_table_unavailable"
+    ):
         await _verify(resources)
 
 
@@ -349,9 +319,169 @@ async def test_pure_descriptor_digest_grants_no_generation_or_custody_authority(
         artifact._descriptor({**address_db.descriptor, "alias_generation": 999})
 
 
+async def test_historical_key_pin_captures_its_saved_authority(address_db):
+    async with address_db.publisher.transaction(isolation="repeatable_read", readonly=True):
+        authority, legacy_key = await artifact._current_authority(address_db.publisher, address_db.schema)
+        historical = PinnedAddressSource(address_db.schema, "entity_address_unified", legacy_key)
+        descriptor = await artifact.capture_network_address_artifact(
+            address_db.publisher, historical, runtime_roles=(address_db.roles["reader"],)
+        )
+    assert descriptor["generation_id"] == legacy_key == artifact._digest(descriptor["legacy_authority"])
+    assert descriptor["authority"] == authority and "legacy_authority" not in address_db.descriptor
+    assert artifact._descriptor(descriptor) == descriptor
+    async with address_db.reader.transaction(isolation="repeatable_read", readonly=True):
+        assert await artifact.verify_network_address_artifact(address_db.reader, descriptor) == (
+            artifact.CompactAddressRelation(address_db.schema, "entity_address_unified")
+        )
+
+
 async def test_capture_requires_a_repeatable_snapshot(address_db):
     async with address_db.reader.transaction(readonly=True):
         with pytest.raises(artifact.NetworkAddressArtifactError, match="snapshot_required"):
             await artifact.capture_network_address_artifact(
                 address_db.reader, address_db.source, runtime_roles=(address_db.roles["reader"],)
             )
+
+
+async def _prepare_ordinary_rotation(resources, outcome):
+    from process.entity_address_retained_names import retained_address_name
+
+    schema, table = resources.schema, "entity_address_unified"
+    stage = table + "_next"
+    # This empty namespace belongs only to this disposable fixture; no alternate owner is required.
+    await resources.admin.execute("DROP SCHEMA hp_snapshot_retention")
+    assert not await resources.publisher.fetchval(
+        "SELECT pg_has_role(current_user,$1,'SET')", resources.roles["outsider"]
+    )
+    for support in artifact.generation.RELATION_NAMES[1:]:
+        await resources.admin.execute(f'INSERT INTO "{schema}"."{support}" VALUES(1)')
+    await resources.admin.execute(f'CREATE TABLE "{schema}"."{stage}" (LIKE "{schema}"."{table}" INCLUDING ALL)')
+    await resources.admin.execute(f'INSERT INTO "{schema}"."{stage}" SELECT * FROM "{schema}"."{table}"')
+    await resources.admin.execute(f'UPDATE "{schema}"."{stage}" SET location_key=\'new-office\'')
+    await resources.admin.execute(f'ALTER TABLE "{schema}"."{stage}" OWNER TO "{resources.roles["owner"]}"')
+    await resources.admin.execute(
+        f'GRANT UPDATE(location_key) ON "{schema}"."{stage}" TO "{resources.roles["reader"]}"'
+    )
+    origin_by_field = {
+        field: resources.descriptor["authority"][field]
+        for field in ("origin_lineage_id", "origin_generation", "published_at")
+    }
+    retained = retained_address_name(table, origin_by_field)
+    if outcome == "collision":
+        await resources.admin.execute(f'CREATE TABLE "{schema}"."{retained}"(sentinel integer)')
+        await resources.admin.execute(f'INSERT INTO "{schema}"."{retained}" VALUES(9)')
+    return schema, table, stage, retained
+
+
+@pytest.mark.parametrize("outcome", ["commit", "collision", "rollback"])
+async def test_ordinary_main_only_rotation_preserves_reads_without_retention_role(address_db, monkeypatch, outcome):
+    """Exercise real permissions, named retention and transactional restoration on the actual scope."""
+    resources = address_db
+    schema, table, stage, retained = await _prepare_ordinary_rotation(resources, outcome)
+    database = _NativeDB(resources.publisher)
+    monkeypatch.setattr(adoption.entity_address_unified, "db", database)
+    swaps = [
+        SimpleNamespace(
+            live_cls=SimpleNamespace(__main_table__=table),
+            stage_cls=SimpleNamespace(__tablename__=stage, __my_additional_indexes__=[]),
+        )
+    ]
+    context_by_field = {"result_generation_mode": "ordinary"}
+
+    async def publish():
+        async with resources.publisher.transaction():
+            await resources.publisher.execute(
+                f'LOCK TABLE "{schema}"."{table}","{schema}"."{stage}" IN ACCESS EXCLUSIVE MODE'
+            )
+            serving = await adoption._prepare_protected_ordinary_rotation(schema, swaps, False, context_by_field)
+            await adoption._require_protected_cutover(schema, swaps, context_by_field)
+            await adoption._publish_result_swaps(schema, swaps, context_by_field, serving_generation=serving)
+            await resources.publisher.execute(
+                f'UPDATE "{schema}".entity_address_result_generation SET local_generation=local_generation+1,'
+                "origin_generation=origin_generation+1"
+            )
+            if outcome == "rollback":
+                raise RuntimeError("synthetic late publication rollback")
+
+    if outcome == "commit":
+        await publish()
+        assert context_by_field["retained_relations"] == [{"schema_name": schema, "relation_name": retained}]
+        assert await resources.reader.fetchval(f'SELECT location_key FROM "{schema}"."{retained}"') == "old-office"
+        assert await resources.reader.fetchval(f'SELECT location_key FROM "{schema}"."{table}"') == "new-office"
+        for role, name in product((resources.publisher, resources.reader), (table, retained)):
+            for mutation in (
+                f'UPDATE "{schema}"."{name}" SET location_key=\'changed\'',
+                f'DELETE FROM "{schema}"."{name}"',
+                f'TRUNCATE "{schema}"."{name}"',
+                f'INSERT INTO "{schema}"."{name}" SELECT * FROM "{schema}"."{name}" WHERE false',
+            ):
+                with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                    await role.execute(mutation)
+        selected = await _verify(resources)
+        assert selected.table_name == retained
+    else:
+        with pytest.raises(RuntimeError, match="already exists|late publication rollback"):
+            await publish()
+        assert await resources.reader.fetchval(f'SELECT location_key FROM "{schema}"."{table}"') == "old-office"
+        assert await resources.admin.fetchval(f'SELECT location_key FROM "{schema}"."{stage}"') == "new-office"
+        assert await resources.publisher.fetchval("SELECT has_table_privilege($1,'UPDATE')", f'"{schema}"."{stage}"')
+        if outcome == "collision":
+            assert await resources.admin.fetchval(f'SELECT sentinel FROM "{schema}"."{retained}"') == 9
+        else:
+            assert not await resources.admin.fetchval("SELECT to_regclass($1) IS NOT NULL", f'"{schema}"."{retained}"')
+    for support in artifact.generation.RELATION_NAMES[1:]:
+        assert await resources.reader.fetchval(f'SELECT count(*) FROM "{schema}"."{support}"') == 1
+
+
+async def test_ordinary_read_only_revokes_column_and_sequence_mutation_without_owner_transfer(address_db):
+    from process.entity_address_publication_permissions import make_relation_read_only
+
+    resources = address_db
+    schema = resources.schema
+    table = "ordinary_read_only_probe"
+    await resources.publisher.execute(f'CREATE TABLE "{schema}"."{table}"(id bigserial PRIMARY KEY,value text)')
+    await resources.publisher.execute(f'INSERT INTO "{schema}"."{table}"(value) VALUES(\'retained\')')
+    await resources.publisher.execute(
+        f'GRANT SELECT,UPDATE(value) ON "{schema}"."{table}" TO "{resources.roles["reader"]}"'
+    )
+    await resources.publisher.execute(
+        f'GRANT SELECT,UPDATE ON "{schema}"."{table}" TO "{resources.roles["outsider"]}" WITH GRANT OPTION'
+    )
+    await resources.publisher.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO "{resources.roles["outsider"]}"')
+    async with resources.admin.transaction():
+        await resources.admin.execute(f'SET LOCAL ROLE "{resources.roles["outsider"]}"')
+        await resources.admin.execute(f'GRANT UPDATE ON "{schema}"."{table}" TO "{resources.roles["reader"]}"')
+        await resources.admin.execute(f'UPDATE "{schema}"."{table}" SET value=value')
+    sequence = await resources.publisher.fetchval("SELECT pg_get_serial_sequence($1,'id')", f'"{schema}"."{table}"')
+    await resources.publisher.execute(f'GRANT USAGE,UPDATE ON SEQUENCE {sequence} TO "{resources.roles["reader"]}"')
+    owner = await resources.admin.fetchval(
+        "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid=to_regclass($1)", f'"{schema}"."{table}"'
+    )
+    with pytest.raises(RuntimeError, match="synthetic permission rollback"):
+        async with resources.publisher.transaction():
+            await make_relation_read_only(artifact._CatalogSession(resources.publisher), schema, table)
+            raise RuntimeError("synthetic permission rollback")
+    assert await resources.reader.fetchval("SELECT has_column_privilege($1,'value','UPDATE')", f'"{schema}"."{table}"')
+    assert await resources.admin.fetchval(
+        "SELECT has_table_privilege($1,$2,'UPDATE')", resources.roles["outsider"], f'"{schema}"."{table}"'
+    )
+    async with resources.publisher.transaction():
+        await make_relation_read_only(artifact._CatalogSession(resources.publisher), schema, table)
+    assert (
+        await resources.admin.fetchval(
+            "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid=to_regclass($1)", f'"{schema}"."{table}"'
+        )
+        == owner
+    )
+    for actor in (resources.publisher, resources.reader):
+        assert await actor.fetchval(f'SELECT value FROM "{schema}"."{table}"') == "retained"
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await actor.execute(f'UPDATE "{schema}"."{table}" SET value=\'changed\'')
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await actor.fetchval("SELECT nextval($1::regclass)", sequence)
+    async with resources.admin.transaction():
+        await resources.admin.execute(f'SET LOCAL ROLE "{resources.roles["outsider"]}"')
+        assert await resources.admin.fetchval(f'SELECT value FROM "{schema}"."{table}"') == "retained"
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with resources.admin.transaction():
+                await resources.admin.execute(f'UPDATE "{schema}"."{table}" SET value=\'changed\'')

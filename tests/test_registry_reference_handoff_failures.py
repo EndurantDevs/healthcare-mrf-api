@@ -73,7 +73,7 @@ async def test_wait_refuses_uncommitted_changed_or_inconsistent_owner_handoff(mo
         run = source_run(marker)
         message = "ready transition did not commit"
     if failure == "changed-ready":
-        run["metrics"]["nucc_source_ready"]["stage_oid"] += 1
+        run["metrics"]["nucc_source_ready"]["total_rows"] += 1
         message = "committed ready input differs"
     if failure == "copying":
         marker = stage.marker
@@ -239,48 +239,54 @@ async def test_acknowledgement_propagates_failed_projection_or_cas(acknowledgeme
         case.callbacks["_acknowledge_run"].assert_not_awaited()
 
 
-@pytest.mark.parametrize(
-    "candidate_oid,current_oid,safe", [(None, 99, True), (105, 105, True), (106, 99, False), (105, 99, True)]
-)
-async def test_cleanup_preserves_absent_published_and_replaced_candidates(
-    monkeypatch, candidate_oid, current_oid, safe
-):
-    stage_by_field = {"schema": "mrf", "name": "nucc_taxonomy_s_synthetic", "oid": 105, "owner_oid": 110}
-    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(return_value=safe))
-    catalog = AsyncMock()
-    monkeypatch.setattr(nucc.native, "_relation_oid", AsyncMock(side_effect=[candidate_oid, current_oid]))
-    monkeypatch.setattr(nucc.native, "require_native_read_catalog", catalog)
+def _plain_cleanup_session(monkeypatch, *, address, catalog=None):
+    """Answer the declared candidate layout and hook reads that precede its DROP."""
+    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(side_effect=[address, False]))
+    monkeypatch.setattr(nucc.native, "_require_nucc_native_columns", AsyncMock())
+    monkeypatch.setattr(nucc.native, "_native_model_copy_driver", AsyncMock())
+    monkeypatch.setattr(nucc.native, "require_native_read_catalog", catalog or AsyncMock())
     monkeypatch.setattr(nucc, "db", _database(session, []))
+    return session
+
+
+def _dropped(session):
+    return [str(call.args[0]) for call in session.execute.await_args_list if "DROP" in str(call.args[0])]
+
+
+@pytest.mark.parametrize("present,supported", [(False, True), (True, True), (True, False)])
+async def test_cleanup_preserves_absent_published_and_replaced_candidates(monkeypatch, present, supported):
+    stage_by_field = {"schema": "mrf", "name": "nucc_taxonomy_s_synthetic"}
+    session = _plain_cleanup_session(monkeypatch, address=105 if supported else None)
+    monkeypatch.setattr(nucc.native, "_relation_oid", AsyncMock(return_value=105 if present else None))
     context_by_field = {"context": {"nucc_plain_stage": stage_by_field}}
-    if candidate_oid is not None and current_oid != stage_by_field["oid"] and not safe:
-        with pytest.raises(nucc.native.ReferenceFamilyArchiveError, match="candidate identity changed"):
+    if present and not supported:
+        with pytest.raises(nucc.native.ReferenceFamilyArchiveError, match="candidate layout changed"):
             await nucc._cleanup_plain_stage(context_by_field)
     else:
         await nucc._cleanup_plain_stage(context_by_field)
-    if candidate_oid == 105 and current_oid != 105 and safe:
-        catalog.assert_awaited_once_with(session, (105,))
-        assert str(session.execute.await_args.args[0]) == 'DROP TABLE "mrf"."nucc_taxonomy_s_synthetic"'
+    if present and supported:
+        nucc.native.require_native_read_catalog.assert_awaited_once_with(session, (105,))
+        assert _dropped(session) == ['DROP TABLE "mrf"."nucc_taxonomy_s_synthetic"']
     else:
-        session.execute.assert_not_awaited()
-        catalog.assert_not_awaited()
-    if candidate_oid is not None and current_oid != 105:
-        statement, parameters = session.scalar.await_args.args
-        assert parameters == {"oid": 105, "owner": 110, "relation": '"mrf"."nucc_taxonomy_s_synthetic"'}
-        assert "c.oid=:oid AND c.relowner=:owner" in str(statement)
-        assert "session_user=current_user" in str(statement) and "pg_inherits" in str(statement)
+        assert _dropped(session) == []
+        nucc.native.require_native_read_catalog.assert_not_awaited()
+    with pytest.raises(nucc.native.ReferenceFamilyArchiveError, match="unpublished candidate name"):
+        await nucc._cleanup_plain_stage({"context": {"nucc_plain_stage": {**stage_by_field, "name": "nucc_taxonomy"}}})
 
 
 async def test_plain_cleanup_propagates_catalog_refusal_without_dropping_heap(monkeypatch):
-    stage_by_field = {"schema": "mrf", "name": "nucc_taxonomy_s_synthetic", "oid": 105, "owner_oid": 110}
-    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(return_value=True))
+    stage_by_field = {"schema": "mrf", "name": "nucc_taxonomy_s_synthetic"}
     failure = nucc.native.ReferenceFamilyArchiveError("synthetic changed ACL")
-    monkeypatch.setattr(nucc.native, "_relation_oid", AsyncMock(side_effect=[105, 99]))
-    monkeypatch.setattr(nucc.native, "require_native_read_catalog", AsyncMock(side_effect=failure))
-    monkeypatch.setattr(nucc, "db", _database(session, []))
+    session = _plain_cleanup_session(monkeypatch, address=105, catalog=AsyncMock(side_effect=failure))
+    monkeypatch.setattr(nucc.native, "_relation_oid", AsyncMock(return_value=105))
     with pytest.raises(nucc.native.ReferenceFamilyArchiveError) as caught:
         await nucc._cleanup_plain_stage({"context": {"nucc_plain_stage": stage_by_field}})
     assert caught.value is failure
-    session.execute.assert_not_awaited()
+    assert _dropped(session) == []
+
+
+_PUBLICATION = {"local_generation": 2, "relations": [{"schema_name": "mrf", "relation_name": "nucc_taxonomy"}]}
+_PUBLISHED_RESULT = {"rows": 42, "publication": _PUBLICATION}
 
 
 @pytest.fixture
@@ -294,7 +300,7 @@ def plain_readback_case(monkeypatch):
             "_control_attempt_started_at": marker["attempt_started_at"],
         },
     }
-    stage_by_field = {"schema": "mrf", "name": "nucc_taxonomy_s_synthetic", "oid": 105, "owner_oid": 110}
+    stage_by_field = {"schema": "mrf", "name": "nucc_taxonomy_s_synthetic"}
     observed_by_field = {
         "status": "succeeded",
         "progress": {
@@ -302,19 +308,21 @@ def plain_readback_case(monkeypatch):
             "attempt_started_at": marker["attempt_started_at"],
             "phase": "nucc published",
         },
-        "metrics": {"rows": 42},
+        "metrics": {"rows": 42, "nucc_named_publication": _PUBLICATION},
         "heartbeat_at": datetime(2026, 1, 1, 1, 2, 3),
         "finished_at": datetime(2026, 1, 1, 1, 2, 4),
         "error": None,
     }
     query_result = SimpleNamespace(mappings=lambda: SimpleNamespace(one_or_none=lambda: observed_by_field))
     session = SimpleNamespace(execute=AsyncMock(return_value=query_result), scalar=AsyncMock(return_value=True))
-    relation = AsyncMock(return_value=105)
-    catalog = AsyncMock()
+    # A published candidate no longer exists under its private name.
+    relation = AsyncMock(return_value=None)
+    require_stage = AsyncMock()
     census = AsyncMock(return_value={"row_count": 42})
     monkeypatch.setattr(nucc, "db", _database(session, []))
     monkeypatch.setattr(nucc.native, "_relation_oid", relation)
-    monkeypatch.setattr(nucc.native, "require_native_read_catalog", catalog)
+    monkeypatch.setattr(nucc, "_require_plain_stage", require_stage)
+    monkeypatch.setattr(nucc, "_plain_predecessor", AsyncMock(return_value=_PUBLICATION))
     monkeypatch.setattr(nucc.native, "_validate_nucc_table_set", census)
     return SimpleNamespace(
         context=context_by_field,
@@ -322,19 +330,19 @@ def plain_readback_case(monkeypatch):
         observed=observed_by_field,
         session=session,
         relation=relation,
-        catalog=catalog,
+        require_stage=require_stage,
         census=census,
     )
 
 
 async def test_lost_commit_readback_accepts_only_exact_published_heap_and_attempt(plain_readback_case):
     case = plain_readback_case
-    assert await nucc._read_plain_commit(case.context, case.stage, {"rows": 42}) == {
+    assert await nucc._read_plain_commit(case.context, case.stage, _PUBLISHED_RESULT) == {
         "heartbeat_at": "2026-01-01T01:02:03.000000+00:00",
         "finished_at": "2026-01-01T01:02:04.000000+00:00",
     }
-    case.relation.assert_awaited_once_with(case.session, "mrf", "nucc_taxonomy")
-    case.catalog.assert_awaited_once_with(case.session, (105,))
+    case.relation.assert_awaited_once_with(case.session, "mrf", case.stage["name"])
+    case.require_stage.assert_awaited_once_with(case.session, {**case.stage, "name": "nucc_taxonomy"})
     case.census.assert_awaited_once_with(case.session, "mrf", "nucc_taxonomy")
     statement, parameters = case.session.execute.await_args.args
     assert "FOR UPDATE" in str(statement) and parameters == {"run": "test-run"}
@@ -343,9 +351,10 @@ async def test_lost_commit_readback_accepts_only_exact_published_heap_and_attemp
 async def test_lost_commit_readback_distinguishes_original_unpublished_attempt(plain_readback_case):
     case = plain_readback_case
     case.observed["status"] = "running"
-    assert await nucc._read_plain_commit(case.context, case.stage, {"rows": 42}) is None
+    case.relation.return_value = 105
+    assert await nucc._read_plain_commit(case.context, case.stage, _PUBLISHED_RESULT) is None
     case.relation.assert_awaited_once_with(case.session, "mrf", case.stage["name"])
-    case.catalog.assert_not_awaited()
+    case.require_stage.assert_not_awaited()
     case.census.assert_not_awaited()
 
 
@@ -372,7 +381,7 @@ async def test_lost_commit_readback_refuses_changed_run_heap_or_census(plain_rea
         case.census.return_value = {"row_count": 43}
         message = "published census changed"
     with pytest.raises(nucc.native.ReferenceFamilyArchiveError, match=message):
-        await nucc._read_plain_commit(case.context, case.stage, {"rows": 42})
+        await nucc._read_plain_commit(case.context, case.stage, _PUBLISHED_RESULT)
     if failure != "census":
-        case.catalog.assert_not_awaited()
+        case.require_stage.assert_not_awaited()
         case.census.assert_not_awaited()

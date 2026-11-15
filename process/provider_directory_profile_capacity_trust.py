@@ -7,10 +7,7 @@ from __future__ import annotations
 import datetime
 from dataclasses import dataclass
 
-
-CAPACITY_TRUST_CONTRACT_ID = (
-    "provider-directory-database-capacity-trust-v2"
-)
+CAPACITY_TRUST_CONTRACT_ID = "provider-directory-database-capacity-trust-v3"
 CAPACITY_TRUST_MAX_DOCUMENT_BYTES = 16 * 1024
 CAPACITY_TRUST_MAX_KEYS = 16
 CAPACITY_TRUST_KEY_STATUSES = ("active", "retired")
@@ -29,24 +26,6 @@ class CapacityLeaseTrustKey:
 
 
 @dataclass(frozen=True)
-class CapacityLeaseTrustTablespace:
-    """One PostgreSQL tablespace pinned to an opaque physical volume."""
-
-    tablespace_name: str
-    tablespace_oid: int
-    usage: str
-    volume_digest: str
-
-
-@dataclass(frozen=True)
-class CapacityLeaseTrustVolume:
-    """One storage-class-to-volume identity pin."""
-
-    volume_class: str
-    volume_digest: str
-
-
-@dataclass(frozen=True)
 class CapacityLeaseTrust:
     """Closed public trust set for one stable capacity authority."""
 
@@ -54,11 +33,6 @@ class CapacityLeaseTrust:
     attestor_id: str
     active_key_id: str
     keys: tuple[CapacityLeaseTrustKey, ...]
-    database_system_identifier: str
-    database_oid: int
-    database_name: str
-    tablespaces: tuple[CapacityLeaseTrustTablespace, ...]
-    volumes: tuple[CapacityLeaseTrustVolume, ...]
 
 
 __all__ = (
@@ -68,6 +42,4 @@ __all__ = (
     "CAPACITY_TRUST_MAX_KEYS",
     "CapacityLeaseTrust",
     "CapacityLeaseTrustKey",
-    "CapacityLeaseTrustTablespace",
-    "CapacityLeaseTrustVolume",
 )

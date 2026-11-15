@@ -129,6 +129,8 @@ async def _completed_semantic_scope(database, dataset_id):
             yield
             return
         savepoint = await session.begin_nested()
+        # Emit this SAVEPOINT now; lazily, it would open inside the publisher savepoint and be released with it.
+        await session.connection()
         try:
             async with completed_source_scope(importer, database.semantic_candidates[dataset_id]):
                 yield

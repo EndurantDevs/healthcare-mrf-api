@@ -27,9 +27,7 @@ from process.nppes_public_evidence_writer import (
 from process.nppes_public_evidence_writer_contract import NppesPublicEvidenceWriterError
 from public_evidence.nppes_registry_merkle import NppesEvidenceRootAccumulator
 from tests.nppes_candidate_postgres_support import (
-    assert_source_callable_census,
     candidate_component,
-    capture_source_legacy_callable_custody,
     install_source_canonical_functions,
     loading_family,
     nppes_candidate_schema,
@@ -259,11 +257,11 @@ def _parent_transaction_fixture(driver, transactions):
     transaction_by_key = dict(materialized=False)
 
     async def execute(statement):
-        if str(statement) == "SELECT current_user=session_user":
+        if str(statement) == "SELECT 1":
             transaction_by_key["materialized"] = True
 
     async def raw_connection():
-        assert transaction_by_key["materialized"], "original native transaction must exist before custody capture"
+        assert transaction_by_key["materialized"], "native transaction must exist before control DCL"
         return SimpleNamespace(driver_connection=driver)
 
     connection = SimpleNamespace(
@@ -286,103 +284,59 @@ def _parent_transaction_fixture(driver, transactions):
     return connection, begin
 
 
-_PARENT_CUSTODY_EVENTS_BY_FUNCTION = {
-    "_provision_cms_epoch_controls": "epoch",
-    "provision_cms_callable_custody": "cms_callable",
-    "provision_cms_serving_receipt_custody": "cms_receipt",
-    "provision_initial_callable_custody": "initial",
-    "provision_source_namespace_custody": "namespace_provision",
-    "capture_source_namespace_custody": "namespace_capture",
-    "assert_source_callable_census": "census",
-    "capture_source_legacy_callable_custody": "legacy_source",
-    "lock_source_control_family": "parent_lock",
-    "adopt_cms_control_custody": "parent_adopt",
-    "adopt_nppes_control_custody": "nppes_adopt",
-    "attest_nppes_control_custody": "nppes_attest",
-}
-
-
-def _install_parent_custody_mocks(monkeypatch, support, failure, parent_identity, before, after, checks, events):
-    driver, policy = parent_identity
-
-    async def invoke(name, *arguments, **keywords):
-        events.append(name)
-        if name == failure:
-            raise RuntimeError("synthetic custody refusal")
-        if name == "parent_before":
-            assert keywords == dict(legacy=True, migration_role="migrator", namespace_owner_role="namespace")
-            return before
-        if name == "parent_adopt":
-            assert arguments == (driver, policy, before)
-            return checks
-        if name == "parent_after":
-            assert keywords == dict(migration_role="migrator", namespace_owner_role="namespace")
-            return after
-
-    for function, event in _PARENT_CUSTODY_EVENTS_BY_FUNCTION.items():
-
-        async def recorded(*arguments, _event=event, **keywords):
-            return await invoke(_event, *arguments, **keywords)
-
-        monkeypatch.setattr(support, function, recorded)
-
-    async def capture(*arguments, **keywords):
-        return await invoke("parent_before" if keywords.get("legacy") else "parent_after", *arguments, **keywords)
-
-    def delta(*arguments):
-        assert arguments == (before, after, checks)
-        events.append("parent_delta")
-        if failure == "parent_delta":
-            raise RuntimeError("synthetic custody refusal")
-
-    monkeypatch.setattr(support, "capture_cms_control_custody", capture)
-    monkeypatch.setattr(support, "require_cms_control_adoption_delta", delta)
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", (None, "cms_receipt", "parent_adopt", "parent_delta", "nppes_attest"))
-async def test_native_parent_custody_preserves_preimages_order_and_failure_barrier(monkeypatch, failure):
+@pytest.mark.parametrize("failure", [None, "epoch", "controls", "metadata", "cancel"])
+async def test_native_control_setup_propagates_refusal(monkeypatch, failure):
+    """Configured DCL and data validation finish before exposing synthetic producer identity."""
+    from process.provider_directory_cms_control_privileges import grant_cms_origin_metadata_read_privileges
     from tests import nppes_candidate_postgres_support as support
 
     events, transactions = [], []
-    driver, before, after, checks = object(), object(), object(), object()
+    driver = object()
     policy = source.GenericSourcePolicy("snapshot_schema", "owner", "publisher", ("reader", "builder"), ("builder",))
-    connection, begin = _parent_transaction_fixture(driver, transactions)
+    _, begin = _parent_transaction_fixture(driver, transactions)
+    component = SimpleNamespace(policy=policy, admin_engine=SimpleNamespace(begin=begin), factory=SimpleNamespace())
 
-    _install_parent_custody_mocks(monkeypatch, support, failure, (driver, policy), before, after, checks, events)
-    component = SimpleNamespace(
-        policy=policy,
-        admin_engine=SimpleNamespace(begin=begin),
-        retained_publisher="retained",
-        factory=SimpleNamespace(),
-    )
-    expected_entries = [
-        "epoch",
-        "cms_callable",
-        "cms_receipt",
-        "initial",
-        "namespace_provision",
-        "namespace_capture",
-        "census",
-        "legacy_source",
-        "parent_lock",
-        "parent_before",
-        "parent_adopt",
-        "parent_after",
-        "parent_delta",
-        "nppes_adopt",
-        "nppes_attest",
-    ]
+    async def event(name):
+        events.append(name)
+        if name == failure or name == "metadata" and failure == "cancel":
+            error = asyncio.CancelledError if failure == "cancel" else RuntimeError
+            raise error("configured_control_setup_refused")
+
+    async def epoch(actual):
+        assert actual is component
+        await event("epoch")
+
+    async def controls(actual, schema, configured, **legacy):
+        assert actual is driver and schema == policy.schema and configured is policy
+        assert legacy == dict(migration_role="builder", namespace_owner_role="owner")
+        await event("controls")
+
+    async def metadata(actual, configured, *, metadata_read_roles):
+        assert actual is driver and configured is policy and metadata_read_roles == ("metadata_reader",)
+        await event("metadata")
+
+    # The operator adoption stand-in is SQL-only; this case checks configured control ordering.
+    adoption = AsyncMock()
+    monkeypatch.setattr(support, "_adopt_acquisition_family", adoption)
+    monkeypatch.setattr(support, "_provision_cms_epoch_controls", epoch)
+    monkeypatch.setattr(support, "adopt_nppes_control_custody", controls)
+    monkeypatch.setattr(support, "grant_cms_origin_metadata_read_privileges", metadata)
+    assert grant_cms_origin_metadata_read_privileges is not metadata
     if failure:
-        with pytest.raises(RuntimeError, match="synthetic custody refusal"):
-            await support._enroll_native_custody(component, "namespace", "migrator")
-        assert events == expected_entries[: expected_entries.index(failure) + 1]
-        assert transactions[-1]["rolled_back"] and not vars(component.factory)
+        error = asyncio.CancelledError if failure == "cancel" else RuntimeError
+        with pytest.raises(error, match="configured_control_setup_refused"):
+            await support._provision_native_controls(component, metadata_read_roles=("metadata_reader",))
+        expected = "metadata" if failure == "cancel" else failure
+        assert events == ["epoch", "controls", "metadata"][: ["epoch", "controls", "metadata"].index(expected) + 1]
+        assert not vars(component.factory)
+        assert not transactions if failure == "epoch" else transactions[-1]["rolled_back"]
+        assert adoption.await_count == (failure != "epoch")
     else:
-        await support._enroll_native_custody(component, "namespace", "migrator")
-        assert events == expected_entries and all(state["committed"] for state in transactions)
+        await support._provision_native_controls(component, metadata_read_roles=("metadata_reader",))
+        assert events == ["epoch", "controls", "metadata"] and transactions[-1]["committed"]
+        adoption.assert_awaited_once_with(driver, policy)
         assert component.factory.producer_identity == support.SYNTHETIC_PRODUCER
-    assert not any("ALTER TABLE" in str(call.args[0]) for call in connection.execute.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -447,51 +401,6 @@ async def test_native_npi_pure_helper_uses_original_sql_and_builder_before_custo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", (None, "acl", "duplicate_acl", "other"))
-async def test_native_legacy_acl_diagnostic_retains_proof_and_identifies_exact_refusal(monkeypatch, failure):
-    from process.provider_directory_generic_source_policy import GenericSourcePolicy
-    from tests import nppes_candidate_postgres_support as support
-
-    policy = GenericSourcePolicy("snapshot_schema", "owner", "publisher", ("reader", "builder"), ("builder",))
-    arguments_by_key = dict(migration_role="migrator", namespace_owner_role="namespace_owner")
-    proof = object()
-    original = ValueError("source_callable_acl_changed" if failure != "other" else "source_callable_definition_changed")
-    capture = AsyncMock(return_value=proof, side_effect=original if failure else None)
-    monkeypatch.setattr(support, "capture_source_callable_custody", capture)
-    signature = '"snapshot_schema"."prepare_provider_directory_rooted_graph_storage"(text)'
-    acl_entries = [[12, 12, "EXECUTE", False]]
-    acl_entries.append([11, 12, "EXECUTE", False] if failure == "acl" else acl_entries[0])
-    roles = [dict(rolname=name, oid=oid) for name, oid in (("owner", 11), ("builder", 12), ("namespace_owner", 13))]
-    catalog_rows = [
-        dict(
-            signature=signature,
-            definition=dict(proname="prepare_provider_directory_rooted_graph_storage", proowner=12),
-            acl=acl_entries,
-        )
-    ]
-    connection = SimpleNamespace(fetch=AsyncMock(side_effect=(roles, catalog_rows)))
-    if failure is None:
-        assert await capture_source_legacy_callable_custody(connection, policy, **arguments_by_key) is proof
-        connection.fetch.assert_not_awaited()
-    elif failure == "other":
-        with pytest.raises(ValueError) as refused:
-            await capture_source_legacy_callable_custody(connection, policy, **arguments_by_key)
-        assert refused.value is original
-        connection.fetch.assert_not_awaited()
-    else:
-        with pytest.raises(ValueError, match="native_source_legacy_acl_refused") as refused:
-            await capture_source_legacy_callable_custody(connection, policy, **arguments_by_key)
-        assert "prepare_provider_directory_rooted_graph_storage" in str(refused.value)
-        assert "source_callable_acl_changed" in str(refused.value)
-        assert refused.value.__cause__ is original
-        assert connection.fetch.await_count == 2
-        assert connection.fetch.await_args_list[1].args[1] == list(
-            source_callables.source_callable_signatures(policy.schema)
-        )
-    capture.assert_awaited_once_with(connection, policy, legacy=True, **arguments_by_key)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", (None, "precondition", "installer"))
 async def test_native_canonical_fragment_plan_preserves_authentic_bodies_and_failures(monkeypatch, failure):
     from tests import nppes_candidate_postgres_support as support
@@ -544,29 +453,6 @@ async def test_native_canonical_fragment_plan_preserves_authentic_bodies_and_fai
     parameters = connection.scalar.await_args.args[1]
     assert len(parameters["signatures"]) == 7
     assert '"snapshot_schema".ptg_wave_ordinary_terminal_receipt_guard()' in parameters["signatures"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("change", (None, "missing", "unexpected"))
-async def test_native_callable_census_explains_missing_and_extra_overloads(change):
-    policy = SimpleNamespace(schema="native_fixture")
-    signatures = source_callables.source_callable_signatures(policy.schema)
-    expected_entries = [dict(signature=signature, oid=index) for index, signature in enumerate(signatures, 100)]
-    actual_entries = [dict(oid=record["oid"], name=record["signature"], arguments="") for record in expected_entries]
-    if change == "missing":
-        actual_entries.pop()
-        expected_entries[-1]["oid"] = None
-    elif change == "unexpected":
-        actual_entries.append(dict(oid=9999, name="unexpected_overload", arguments="text"))
-    connection = SimpleNamespace(fetch=AsyncMock(side_effect=(expected_entries, actual_entries)))
-    if change is None:
-        await assert_source_callable_census(connection, policy)
-    else:
-        with pytest.raises(
-            AssertionError, match="missing_signatures" if change == "missing" else "unexpected_overload"
-        ):
-            await assert_source_callable_census(connection, policy)
-    assert connection.fetch.await_count == 2
 
 
 async def _assert_constraints_and_triggers(connection: asyncpg.Connection, schema: str) -> None:

@@ -20,7 +20,7 @@ async def test_owned_catalog_read_keeps_share_nowait_and_mutations_keep_exclusiv
     owner = _owner()
     session = SimpleNamespace(execute=AsyncMock())
     await restore._lock_owned_restore_relations(session, owner, read_only=read_only)
-    mode = "SHARE MODE NOWAIT" if read_only else "ACCESS EXCLUSIVE MODE"
+    mode = "ACCESS SHARE MODE NOWAIT" if read_only else "ACCESS EXCLUSIVE MODE"
     targets = ", ".join(f'"{owner.schema_name}"."{name}"' for name, _oid in owner.relation_oids)
     session.execute.assert_awaited_once()
     assert str(session.execute.await_args.args[0]) == f"LOCK TABLE {targets} IN {mode}"
@@ -58,7 +58,7 @@ def test_valid_restore_record_round_trips_exact_owner_and_alias_generation():
     stored = _stored_restore()
     schema, date, names, stage_oids, integrity, context, validation = restore._validated_rehydration_state(stored)
     assert (schema, date) == ("mrf", "20260914")
-    assert dict(stage_oids) == {names[name]: oid for name, oid in _owner().relation_oids}
+    assert stage_oids == tuple(sorted(("mrf", names[name]) for name in _owner().relation_names))
     assert integrity.as_dict() == stored["stage_integrity"]
     assert context == {
         **stored["context"],
@@ -106,13 +106,13 @@ async def test_invalid_persisted_restore_fails_before_locks_or_ddl(field, value)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mutation", ["duplicate_oid", "foreign_oid", "missing", "semantic_object"])
+@pytest.mark.parametrize("mutation", ["duplicate_name", "foreign_name", "missing", "semantic_object"])
 async def test_restore_metadata_cannot_substitute_owned_stage_relations(mutation):
     stored = _stored_restore()
-    if mutation == "duplicate_oid":
-        stored["stage_relation_oids"][0]["oid"] = stored["stage_relation_oids"][1]["oid"]
-    elif mutation == "foreign_oid":
-        stored["stage_relation_oids"][0]["oid"] = 999
+    if mutation == "duplicate_name":
+        stored["stage_relation_oids"][0]["table_name"] = stored["stage_relation_oids"][1]["table_name"]
+    elif mutation == "foreign_name":
+        stored["stage_relation_oids"][0]["table_name"] = "foreign"
     elif mutation == "missing":
         stored["stage_relation_oids"].pop()
     else:
@@ -202,6 +202,7 @@ async def test_restore_rejects_duplicate_sequence_ownership_records():
 )
 async def test_restore_requires_its_owned_evidence_sequence(monkeypatch, sequences, sequence_value):
     monkeypatch.setattr(restore, "_owned_sequence_names", AsyncMock(return_value=sequences))
+    monkeypatch.setattr(restore, "_local_relation_handle", AsyncMock(return_value=17))
     session = SimpleNamespace(scalar=AsyncMock(return_value=sequence_value))
     with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="evidence sequence"):
         await restore._reset_restored_evidence_sequence(session, _owner())
@@ -210,19 +211,21 @@ async def test_restore_requires_its_owned_evidence_sequence(monkeypatch, sequenc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("catalog_results", [[100], [99, 1]])
+@pytest.mark.parametrize("catalog_results", [[False], [True, 1]])
 async def test_restore_never_drops_substituted_or_nonempty_namespace(catalog_results):
     session = SimpleNamespace(scalar=AsyncMock(side_effect=catalog_results), execute=AsyncMock())
-    with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="ownership"):
+    with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="namespace"):
         await restore._drop_empty_owned_schema(session, _owner())
     session.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_restore_rejects_substituted_stage_oid_before_activation():
-    session = SimpleNamespace(scalar=AsyncMock(return_value=999), execute=AsyncMock())
-    with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="stage OID differs"):
-        await restore._verify_stored_stage_oids(session, db_schema="mrf", stage_oids=(("address_20260914", 17),))
+async def test_restore_rejects_unavailable_named_stage_before_activation():
+    session = SimpleNamespace(scalar=AsyncMock(return_value=False), execute=AsyncMock())
+    with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="named stage is unavailable"):
+        await restore._verify_stored_stage_relations(
+            session, db_schema="mrf", stage_relations=(("mrf", "address_20260914"),)
+        )
     session.execute.assert_not_awaited()
 
 
@@ -236,3 +239,51 @@ async def test_restore_rejects_semantic_receipt_drift(monkeypatch):
     )
     with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="semantic receipt differs"):
         await restore._actual_receipt(SimpleNamespace(), schema_name="stage", expected=expected)
+
+
+def test_named_restore_and_opaque_legacy_handles_choose_the_same_closed_stage():
+    legacy = _stored_restore()
+    changed_by_field = {
+        **legacy,
+        "stage_relation_oids": [
+            {**entry, "oid": 10000 + index} for index, entry in enumerate(legacy["stage_relation_oids"])
+        ],
+    }
+    old_result = restore._validated_rehydration_state(legacy)
+    assert restore._validated_rehydration_state(changed_by_field) == old_result
+    named_by_field = {key: value for key, value in legacy.items() if key != "stage_relation_oids"}
+    named_by_field["stage_relations"] = [
+        {"schema_name": schema, "relation_name": name} for schema, name in old_result[3]
+    ]
+    assert restore._validated_rehydration_state(named_by_field) == old_result
+    named_by_field["stage_relations"][0]["schema_name"] = "foreign"
+    with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="stage ownership"):
+        restore._validated_rehydration_state(named_by_field)
+
+
+@pytest.mark.parametrize("named", [False, True])
+def test_restore_selected_inputs_compare_qualified_names_and_preserve_legacy_wire(named):
+    from process.entity_address_dependency_bindings import PUBLISHER_SELECTED_INPUTS_CONTRACT
+
+    original = _example_bindings()
+    current_by_field = {
+        key: {**binding, "relation_oid": binding["relation_oid"] + 1000} for key, binding in original.items()
+    }
+    if named:
+        current_by_field = {
+            key: {field: binding[field] for field in ("schema_name", "table_name")}
+            for key, binding in current_by_field.items()
+        }
+    context_by_field = {
+        "snapshot_contract": receipt.CONTRACT,
+        "dependency_bindings": current_by_field,
+        "publisher_selected_inputs": {"contract": PUBLISHER_SELECTED_INPUTS_CONTRACT, "dependency_bindings": original},
+    }
+    restore._rehydrate_dependency_context(context_by_field, "mrf")
+    assert context_by_field["dependency_bindings"] == current_by_field
+    assert context_by_field["publisher_selected_inputs"]["dependency_bindings"] == original
+    context_by_field["dependency_bindings"] = {
+        key: {**binding, "schema_name": "foreign"} for key, binding in current_by_field.items()
+    }
+    with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="selected inputs|dependency bindings"):
+        restore._rehydrate_dependency_context(context_by_field, "mrf")

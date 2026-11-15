@@ -253,27 +253,3 @@ async def _observe_profile(connection, storage_binding, policy, cms_profile):
     if profile["contract"] == CONTRACT:
         return await _observe(connection, storage_binding, policy, profile["fixed_descendant_oids"])
     return custody._evidence_digests(await _collect_profile(connection, storage_binding, policy, profile))
-
-
-async def compare_cms_preparation_policy(connection, *, storage_binding, policy, cms_profile):
-    """Compare a protected caller's versioned pin without changing strict v1."""
-    profile = _profile(cms_profile, storage_binding, policy)
-    _require(connection.is_in_transaction() is True, "transaction_required")
-    actor_by_field = dict(await connection.fetchrow(custody._ACTOR_SQL))
-    _require(
-        actor_by_field["session"] == policy.publisher_role
-        and actor_by_field["current"] in {policy.owner_role, policy.publisher_role}
-        and actor_by_field["backend"] == connection.get_server_pid()
-        and actor_by_field["database_oid"] == storage_binding.database_oid
-        and actor_by_field["replication"] == "origin"
-        and bool(actor_by_field["transaction"]),
-        "original_publisher_required",
-    )
-    observed = await _observe_profile(connection, storage_binding, policy, profile)
-    _require(observed == {field: profile[field] for field in custody._DIGEST_FIELDS}, "native_evidence_changed")
-    _require(
-        connection.is_in_transaction() is True
-        and dict(await connection.fetchrow(custody._ACTOR_SQL)) == actor_by_field,
-        "original_publisher_changed",
-    )
-    return observed

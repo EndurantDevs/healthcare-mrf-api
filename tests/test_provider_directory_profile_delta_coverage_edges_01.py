@@ -73,9 +73,7 @@ async def test_all_new_cleanup_edges_preserve_primary_failure(monkeypatch):
 
     database_status = AsyncMock(side_effect=RuntimeError("cleanup failed"))
     monkeypatch.setattr(importer.db, "status", database_status)
-    await importer._best_effort_drop_address_corroboration_stage(
-        '"mrf"."address_stage"'
-    )
+    await importer._best_effort_drop_address_corroboration_stage('"mrf"."address_stage"')
     await importer._drop_artifact_scope_tables(
         "mrf",
         ["scope_a", "scope_b"],
@@ -100,6 +98,7 @@ async def test_all_new_cleanup_edges_preserve_primary_failure(monkeypatch):
         )
     assert raised.value is primary
 
+
 @pytest.mark.asyncio
 async def test_cleanup_is_fail_closed_after_capacity_admission(monkeypatch):
     """Admitted cleanup failures propagate instead of losing reserved WAL."""
@@ -123,9 +122,7 @@ async def test_cleanup_is_fail_closed_after_capacity_admission(monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="admitted drop failed"):
-        await importer._remove_provider_directory_profile_delta_stages(
-            _prepared_delta()
-        )
+        await importer._remove_provider_directory_profile_delta_stages(_prepared_delta())
     reserve.assert_awaited_once_with(
         admission,
         control_operation_counts={"profile_stage_drop": 1},
@@ -135,38 +132,22 @@ async def test_cleanup_is_fail_closed_after_capacity_admission(monkeypatch):
         await importer._drop_artifact_scope_tables("mrf", ["scope_a"])
     assert reserve.await_count == 2
 
+
 @pytest.mark.asyncio
 async def test_delta_relation_and_checkpoint_identity_edges(monkeypatch):
     """Targets, stages, and a ready checkpoint are all immutable."""
 
     delta = _prepared_delta()
-    valid_identities = [
-        (delta.evidence_target_oid, "r", "p"),
-        (delta.profile_target_oid, "r", "p"),
-        (delta.evidence_stage_oid, "r", "p"),
-        (delta.profile_stage_oid, "r", "p"),
-        (delta.affected_npi_stage_oid, "r", "p"),
-    ]
-    identity = AsyncMock(side_effect=valid_identities)
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_stage_relation_identity",
-        identity,
-    )
+    logged_shape = AsyncMock()
+    monkeypatch.setattr(importer, "_assert_provider_directory_logged_relation", logged_shape)
     await importer._validate_profile_delta_relations(delta)
-
-    identity.side_effect = [(999, "r", "p")]
-    with pytest.raises(
-        importer.ProviderDirectoryArtifactBuildStale,
-        match="delta_target_changed",
-    ):
-        await importer._validate_profile_delta_relations(delta)
-
-    identity.side_effect = valid_identities[:2] + [(999, "r", "p")]
-    with pytest.raises(
-        importer.ProviderDirectoryArtifactBuildStale,
-        match="delta_stage_changed",
-    ):
+    assert logged_shape.await_count == 5
+    assert logged_shape.await_args_list[0].args == (
+        delta.targets["evidence"]["schema"],
+        delta.targets["evidence"]["name"],
+    )
+    logged_shape.side_effect = importer.ProviderDirectoryArtifactBuildStale("logged_relation_changed")
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="logged_relation_changed"):
         await importer._validate_profile_delta_relations(delta)
 
     monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
@@ -189,6 +170,7 @@ async def test_delta_relation_and_checkpoint_identity_edges(monkeypatch):
         delta,
         checkpoint_by_field,
     )
+
 
 @pytest.mark.parametrize(
     "field_name",
@@ -223,28 +205,19 @@ def test_delta_checkpoint_scalar_drift_is_rejected(field_name):
             checkpoint_by_field,
         )
 
+
 @pytest.mark.parametrize(
-    "field_name",
-    (
-        "evidence_stage_oid",
-        "profile_stage_oid",
-        "affected_npi_stage_oid",
-        "evidence_target_oid",
-        "profile_target_oid",
-    ),
+    "role,key", [("evidence", "schema"), ("evidence", "name"), ("profile", "schema"), ("profile", "name")]
 )
-def test_delta_checkpoint_oid_drift_is_rejected(field_name):
+def test_delta_checkpoint_named_target_drift_is_rejected(role, key):
     delta = _prepared_delta()
     checkpoint_by_field = _ready_delta_checkpoint(delta)
-    checkpoint_by_field[field_name] = 999
-    with pytest.raises(
-        importer.ProviderDirectoryArtifactBuildStale,
-        match="delta_checkpoint_changed",
-    ):
-        importer._validate_profile_delta_checkpoint_completion(
-            delta,
-            checkpoint_by_field,
-        )
+    targets = json.loads(checkpoint_by_field["targets_json"])
+    targets[role][key] = "changed"
+    checkpoint_by_field["targets_json"] = json.dumps(targets)
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="delta_checkpoint_changed:targets"):
+        importer._validate_profile_delta_checkpoint_completion(delta, checkpoint_by_field)
+
 
 def test_delta_checkpoint_geometry_and_completion_edges():
     delta = _prepared_delta()
@@ -302,6 +275,7 @@ def test_delta_checkpoint_geometry_and_completion_edges():
                 changed_checkpoint_by_field,
             )
 
+
 @pytest.mark.parametrize(
     ("field_name", "bad_value"),
     (
@@ -318,6 +292,7 @@ def test_delta_receipt_counts_are_nonnegative(field_name, bad_value):
     receipt_by_field[field_name] = bad_value
     assert not importer._has_nonnegative_profile_delta_counts(receipt_by_field)
 
+
 def test_delta_receipt_identity_and_geometry_edges():
     delta = _prepared_delta()
     receipt_by_field = _matching_delta_receipt(delta)
@@ -330,15 +305,10 @@ def test_delta_receipt_identity_and_geometry_edges():
         "build_id",
         "control_generation",
         "authority_revision",
-        "evidence_target_oid",
-        "profile_target_oid",
+        "targets_json",
     ):
         changed_receipt_by_field = dict(receipt_by_field)
-        changed_receipt_by_field[field_name] = (
-            "different"
-            if isinstance(receipt_by_field[field_name], str)
-            else "bad"
-        )
+        changed_receipt_by_field[field_name] = "different" if isinstance(receipt_by_field[field_name], str) else "bad"
         assert not (
             importer._is_provider_directory_profile_delta_receipt_matching(
                 changed_receipt_by_field,
@@ -366,11 +336,10 @@ def test_delta_receipt_identity_and_geometry_edges():
         delta,
     )
 
+
 def test_cutover_receipt_decoding_edges():
     empty_receipt_by_field = {}
-    assert importer._profile_cutover_receipt_parts(
-        empty_receipt_by_field
-    ) is None
+    assert importer._profile_cutover_receipt_parts(empty_receipt_by_field) is None
 
     partial_receipt_by_field = {"cutover_forecast_hash": "a" * 64}
     with pytest.raises(
@@ -408,13 +377,12 @@ def test_cutover_receipt_decoding_edges():
         ):
             importer._profile_cutover_receipt_parts(changed_fields_by_name)
 
+
 def test_cutover_actual_accepts_signed_values():
     """Canonical scalar values match their signed cutover receipt."""
 
     cutover_fields_by_name = _cutover_actual_fields_by_name()
-    cutover_scalars_by_name = importer._profile_cutover_actual_scalars(
-        cutover_fields_by_name
-    )
+    cutover_scalars_by_name = importer._profile_cutover_actual_scalars(cutover_fields_by_name)
     actual_by_field = dict(cutover_scalars_by_name)
     importer._validate_profile_cutover_actual(
         cutover_fields_by_name,
@@ -440,9 +408,7 @@ def test_cutover_actual_rejects_signed_mismatch(mismatch, replacement):
     """Each signed scalar mismatch invalidates the cutover receipt."""
 
     cutover_fields_by_name = _cutover_actual_fields_by_name()
-    cutover_scalars_by_name = importer._profile_cutover_actual_scalars(
-        cutover_fields_by_name
-    )
+    cutover_scalars_by_name = importer._profile_cutover_actual_scalars(cutover_fields_by_name)
     changed_actual_by_field = dict(cutover_scalars_by_name)
     changed_scalars_by_name = dict(cutover_scalars_by_name)
     forecast_hash = "a" * 64

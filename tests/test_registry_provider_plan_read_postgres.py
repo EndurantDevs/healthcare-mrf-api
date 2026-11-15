@@ -5,7 +5,7 @@ import hashlib
 import json
 from dataclasses import asdict
 from types import SimpleNamespace
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import ptg2_address_canon
 import pytest
@@ -19,16 +19,15 @@ from process.initial import _build_mrf_address_rows
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_legacy_membership_source import PinnedACAMembershipSource, read_aca_raw_fact_batch
-from process.network_membership_candidate_lifecycle import (
-    admit_network_membership_batch,
-    create_network_candidate,
-    seal_network_candidate,
-)
-from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
+from process.registry_candidate_composition import (
+    RegistryCompositionAddressSources,
+    compose_registry_membership_candidate,
+)
 from process.registry_record_store import RegistryRecordCommand
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+from tests.registry_named_preparation_postgres_support import cleanup_registry_network_preparations
 from tests.test_network_custom_address_source_postgres import _draft
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_network_initial_source_office_bindings_postgres import _insert_canonical_office
@@ -238,13 +237,10 @@ async def _approved_source_fixture(fixture, coordinates, address_evidence_rows):
 
 
 async def _publish_source(fixture, source_pin, coordinates, address_evidence_rows, copy_targets):
+    """Compose the reviewed recipe through the production pipeline, with its retained source rows."""
     networks, approval = await _approved_source_fixture(fixture, coordinates, address_evidence_rows)
-    identity = uuid4()
-    copy_target = MembershipCopyTarget(
-        *(str(uuid4()) for _ in range(3)), str(identity), "network_candidate_" + identity.hex
-    )
-    copy_targets.append(copy_target)
-    async with fixture.connection.transaction(isolation="repeatable_read"):
+    request = uuid4()
+    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
         approved = await pin_approved_membership_source(
             fixture.connection, approved_revision=approval["approved_revision"], control_schema=fixture.control_schema
         )
@@ -256,38 +252,28 @@ async def _publish_source(fixture, source_pin, coordinates, address_evidence_row
             binding_coordinates=coordinates,
             approved_only=True,
         )
-        assert batch.membership_rows == 2
-        await create_network_candidate(
-            fixture.connection,
-            copy_target,
-            source_generations={
-                "unified_address": fixture.base.generation_id,
-                "aca": batch.generation_id,
-                "custom_membership": approved.generation_id,
-            },
-            source_recipes=(RegistrySourceMembershipRecipe(source_pin, coordinates),),
-            approved_custom_revision=approved.approved_revision,
-            expected_head=0,
-            expected_rows=2,
-            control_schema=fixture.control_schema,
-        )
-        await fixture.connection.execute(
-            f'CREATE TABLE "{copy_target.schema_name}".provider_location_binding(provider_system text NOT NULL,provider_id text NOT NULL,location_id uuid NOT NULL,location_key varchar(64) NOT NULL,entity_type text NOT NULL,entity_id text NOT NULL,PRIMARY KEY(provider_system,provider_id,location_id))'
-        )
-        await fixture.connection.execute(
-            f'INSERT INTO "{copy_target.schema_name}".provider_location_binding SELECT \'npi\',entity_id,address_key,location_key,entity_type,entity_id FROM "{fixture.source_schema}".entity_address_unified'
-        )
-        await admit_network_membership_batch(
-            fixture.connection,
-            copy_target,
-            batch_id=uuid4(),
-            input_bytes=batch.input_bytes,
-            expected_input_sha256=batch.input_sha256,
-            control_schema=fixture.control_schema,
-        )
-        await seal_network_candidate(fixture.connection, copy_target, control_schema=fixture.control_schema)
+    assert batch.membership_rows == 2
+    fixture.composition_ids.append(uuid5(request, "address:" + approved.generation_id))
+    copy_target, addresses = await compose_registry_membership_candidate(
+        fixture.connection,
+        request_id=request,
+        approved_revision=approved.approved_revision,
+        expected_head=0,
+        source_manifest=None,
+        writer_roles=_roles(fixture),
+        control_schema=fixture.control_schema,
+        address_sources=RegistryCompositionAddressSources(
+            fixture.base, initial_source_recipes=(RegistrySourceMembershipRecipe(source_pin, coordinates),)
+        ),
+    )
+    copy_targets.append(copy_target)
     await prepare_and_publish_network_candidate(
-        fixture.connection, copy_target, fixture.base, **_roles(fixture), control_schema=fixture.control_schema
+        fixture.connection,
+        copy_target,
+        addresses,
+        **_roles(fixture),
+        control_schema=fixture.control_schema,
+        seal_candidate=fixture.seal_candidate,
     )
     return networks, copy_target
 
@@ -307,6 +293,7 @@ async def provider_plans_db(custom_db, monkeypatch, request):
         "producer-example",
         "edition-example",
     )
+    fixture.preparation_ids = []
     try:
         source_pin, address_evidence_rows = await _archive_source(
             fixture, coordinates, owner, role, getattr(request, "param", None)
@@ -320,8 +307,14 @@ async def provider_plans_db(custom_db, monkeypatch, request):
         )
         fixture.extra_targets = copy_targets
         fixture.extra_requests = []
+        fixture.source_coordinates = coordinates
         yield fixture, source_pin, networks, copy_target
     finally:
+        await cleanup_registry_network_preparations(
+            fixture.connection,
+            [*fixture.preparation_ids, *(published.candidate_id for published in copy_targets)],
+            fixture.control_schema,
+        )
         for copy_target in copy_targets:
             await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{copy_target.schema_name}" CASCADE')
         await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{coordinates.dataset_schema}" CASCADE')

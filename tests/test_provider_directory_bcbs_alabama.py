@@ -152,7 +152,6 @@ def named_candidate(carrier_source):
         "storage": {
             "catalog_schema": "catalog",
             "storage_schema": "source_candidate",
-            "producer": ["a" * 40, "sha256:" + "b" * 64],
         },
         "phase": "loading",
         "auxiliary": None,

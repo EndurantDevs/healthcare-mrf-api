@@ -97,6 +97,16 @@ async def _create_live_family(session, importer_id: str, schema_name: str) -> No
     await install_source_generation_guards(connection, schema_name)
 
 
+async def _assert_serves_stage(session, authority, ownership, schema_name):
+    """Named authority plus the test's own catalog observation of the heaps now serving."""
+    assert authority.relations == result_generation.declared_reference_family_relations(
+        ownership.importer_id, schema_name
+    )
+    for name, stage_oid in ownership.relation_oids:
+        relation = f'"{schema_name}"."{name}"'
+        assert await session.scalar(text("SELECT to_regclass(:name)::oid::bigint"), {"name": relation}) == stage_oid
+
+
 async def _manifest(sessions, importer_id: str, schema_name: str, *, dependencies=None):
     async with sessions() as session, session.begin():
         capture = await archive.capture_reference_family_source(
@@ -225,7 +235,7 @@ async def _create_places_fixture(session, live_schema: str, unrelated_schema: st
 
 @pytest.mark.asyncio
 async def test_native_single_table_activation_cas_rollback_and_cleanup():
-    """Prove cancellation cleanup, stale CAS rejection, and scope preservation."""
+    """Prove cancellation cleanup, stage validation, and scope preservation."""
 
     engine = create_async_engine(_database_url())
     sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -251,26 +261,13 @@ async def test_native_single_table_activation_cas_rollback_and_cleanup():
             )
             await _copy_live_to_stage(session, "places-zcta", live_schema, stage_schema)
             await archive.complete_reference_family_restore(session, owner)
+        # A same-name replacement of the live table is not a physical-identity refusal under named publication.
         async with sessions() as session, session.begin():
-            incumbent = await archive.capture_reference_family_incumbent(
-                session,
-                importer_id="places-zcta",
-                schema_name=live_schema,
-            )
-        async with sessions() as session, session.begin():
-            await _validate_and_change_incumbent(session, owner, manifest, live_schema)
-        async with sessions() as session, session.begin():
-            with pytest.raises(archive.ReferenceFamilyArchiveError, match="incumbent changed"):
-                await archive.activate_reference_family_stage(
-                    session,
-                    ownership=owner,
-                    manifest=manifest,
-                    expected_incumbent=incumbent,
-                    authority="manual",
-                )
+            await archive.validate_reference_family_stage(session, ownership=owner, manifest=manifest)
         async with sessions() as session, session.begin():
             assert (
-                await session.scalar(text(f'SELECT measure_name FROM "{live_schema}".pricing_places_zcta')) == "changed"
+                await session.scalar(text(f'SELECT measure_name FROM "{live_schema}".pricing_places_zcta'))
+                == "new-live"
             )
             assert await session.scalar(text(f'SELECT count(*) FROM "{stage_schema}".pricing_places_zcta')) == 1
             assert await session.scalar(text(f'SELECT count(*) FROM "{unrelated_schema}".keep_me')) == 1
@@ -402,9 +399,8 @@ async def test_legacy_tracked_archive_stays_manual_and_untracked_until_local_pub
             candidate = await _candidate_with_generation(
                 session, candidate, package_id, source_generation_by_field, guarded=False
             )
-        owner = candidate[-1]
         cutover = archive.ReferenceFamilyCutoverAuthority(
-            package_id, archive.CONTRACT, owner, owner, "automatic", source_generation_by_field
+            package_id, archive.CONTRACT, "automatic", source_generation_by_field
         )
         async with sessions.begin() as session:
             with pytest.raises(archive.ReferenceFamilyArchiveError, match="requires guarded source capture"):
@@ -461,12 +457,9 @@ async def test_automatic_generationless_bootstrap_requires_empty_incumbent(popul
             package_id,
             populated=populated,
         )
-        sealed_owner_oid = candidate[-1]
         cutover = archive.ReferenceFamilyCutoverAuthority(
             package_id,
             archive.CONTRACT,
-            sealed_owner_oid,
-            sealed_owner_oid,
             "automatic",
             {
                 "origin_lineage_id": str(uuid4()),
@@ -475,6 +468,14 @@ async def test_automatic_generationless_bootstrap_requires_empty_incumbent(popul
             },
         )
         async with sessions() as session, session.begin():
+            # Acquire fixture locks before exercising the adoption decision.
+            await archive._lock_family(
+                session,
+                live_schema,
+                archive.reference_family_spec("places-zcta").archive_names,
+                "ACCESS EXCLUSIVE",
+                nowait=True,
+            )
             candidate = await _candidate_with_generation(
                 session, candidate, package_id, cutover.source_serving_generation
             )
@@ -549,8 +550,6 @@ async def test_automatic_bootstrap_accepts_all_absent_incumbent():
         cutover = archive.ReferenceFamilyCutoverAuthority(
             package_id,
             archive.CONTRACT,
-            sealed_owner_oid,
-            sealed_owner_oid,
             "automatic",
             source_generation_by_field,
         )
@@ -573,7 +572,7 @@ async def test_automatic_bootstrap_accepts_all_absent_incumbent():
                 session, importer_id="places-zcta", schema_name=live_schema
             )
             assert authority.serving_generation.as_dict() == source_generation_by_field
-            assert authority.relation_oids == tuple(oid for _, oid in ownership.relation_oids)
+            await _assert_serves_stage(session, authority, ownership, live_schema)
             assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": stage_schema}) is None
             assert await session.scalar(text(f'SELECT count(*) FROM "{unrelated_schema}".keep_me')) == 1
     finally:
@@ -597,14 +596,14 @@ async def test_result_generation_validator_accepts_actual_asyncpg_record():
             "SELECT 'places-zcta'::text AS importer_id, $1::uuid AS local_lineage_id, "
             "0::bigint AS local_generation, NULL::uuid AS origin_lineage_id, "
             "NULL::bigint AS origin_generation, NULL::timestamptz AS published_at, "
-            "NULL::bigint[] AS relation_oids",
+            "NULL::varchar AS serving_schema, NULL::text[] AS serving_relation_names",
             lineage_id,
         )
         authority = result_generation.validate_reference_family_result_generation_authority(authority_row)
         assert authority.importer_id == "places-zcta"
         assert authority.local_lineage_id == str(lineage_id)
         assert authority.serving_generation is None
-        assert authority.relation_oids is None
+        assert authority.relations is None
     finally:
         await connection.close()
 
@@ -613,12 +612,8 @@ async def _assert_invalid_validation_cutovers(sessions, candidate, package_id):
     ownership, manifest, incumbent, validation, sealed_owner_oid = candidate
     forged_receipt = validation.as_dict()
     forged_receipt["package_id"] = "b" * 64
-    cases = (
-        (forged_receipt, sealed_owner_oid, sealed_owner_oid, "digest differs"),
-        (validation, sealed_owner_oid, sealed_owner_oid + 1, "owner differs"),
-        (validation, sealed_owner_oid + 1, sealed_owner_oid, "authority differs"),
-    )
-    for validation_receipt, original_owner_oid, current_owner_oid, error_message in cases:
+    # The cutover carries no owner identity; a forged validation digest is still refused.
+    for validation_receipt, error_message in ((forged_receipt, "digest differs"),):
         async with sessions() as session, session.begin():
             with pytest.raises(archive.ReferenceFamilyArchiveError, match=error_message):
                 await archive.activate_validated_reference_family_stage(
@@ -627,9 +622,7 @@ async def _assert_invalid_validation_cutovers(sessions, candidate, package_id):
                     manifest=manifest,
                     expected_incumbent=incumbent,
                     validation_receipt=validation_receipt,
-                    cutover=archive.ReferenceFamilyCutoverAuthority(
-                        package_id, archive.CONTRACT, original_owner_oid, current_owner_oid, "manual"
-                    ),
+                    cutover=archive.ReferenceFamilyCutoverAuthority(package_id, archive.CONTRACT, "manual"),
                 )
 
 
@@ -654,9 +647,7 @@ async def _assert_short_cutover_rollback(sessions, monkeypatch, candidate, packa
             manifest=manifest,
             expected_incumbent=incumbent,
             validation_receipt=validation,
-            cutover=archive.ReferenceFamilyCutoverAuthority(
-                package_id, archive.CONTRACT, sealed_owner_oid, sealed_owner_oid, "manual"
-            ),
+            cutover=archive.ReferenceFamilyCutoverAuthority(package_id, archive.CONTRACT, "manual"),
         )
         assert receipt.tables == manifest.tables
         cleared = await result_generation.read_reference_family_result_generation_authority(
@@ -666,7 +657,7 @@ async def _assert_short_cutover_rollback(sessions, monkeypatch, candidate, packa
         )
         assert cleared.local_generation == initial_generation.local_generation
         assert cleared.serving_generation is None
-        assert cleared.relation_oids is None
+        assert cleared.relations is None
         await transaction.rollback()
     async with sessions() as session, session.begin():
         assert (
@@ -678,17 +669,18 @@ async def _assert_short_cutover_rollback(sessions, monkeypatch, candidate, packa
         ) == initial_generation
 
 
-async def _replace_incumbent_and_reject(sessions, live_schema, candidate, package_id):
-    ownership, manifest, incumbent, validation, sealed_owner_oid = candidate
+async def _capture_absent_incumbent_and_reject(sessions, live_schema, candidate, package_id):
+    """A genuinely captured absent QName cannot replace a subsequently present family."""
+    ownership, manifest, _incumbent, validation, _legacy_owner = candidate
     async with sessions() as session, session.begin():
         await session.execute(
-            text(f'ALTER TABLE "{live_schema}".pricing_places_zcta RENAME TO pricing_places_zcta_stale')
+            text(f'ALTER TABLE "{live_schema}".pricing_places_zcta RENAME TO pricing_places_zcta_previous')
+        )
+        absent = await archive.capture_reference_family_incumbent(
+            session, importer_id="places-zcta", schema_name=live_schema
         )
         await session.execute(
-            text(
-                f'CREATE TABLE "{live_schema}".pricing_places_zcta '
-                f'(LIKE "{live_schema}".pricing_places_zcta_stale INCLUDING ALL)'
-            )
+            text(f'ALTER TABLE "{live_schema}".pricing_places_zcta_previous RENAME TO pricing_places_zcta')
         )
     async with sessions() as session, session.begin():
         with pytest.raises(archive.ReferenceFamilyArchiveError, match="incumbent changed"):
@@ -696,11 +688,9 @@ async def _replace_incumbent_and_reject(sessions, live_schema, candidate, packag
                 session,
                 ownership=ownership,
                 manifest=manifest,
-                expected_incumbent=incumbent,
+                expected_incumbent=absent,
                 validation_receipt=validation,
-                cutover=archive.ReferenceFamilyCutoverAuthority(
-                    package_id, archive.CONTRACT, sealed_owner_oid, sealed_owner_oid, "manual"
-                ),
+                cutover=archive.ReferenceFamilyCutoverAuthority(package_id, archive.CONTRACT, "manual"),
             )
         await archive.cleanup_reference_family_stage(session, ownership)
 
@@ -728,8 +718,6 @@ async def _activate_automatic_candidate(session, candidate, package_id, source_g
         cutover=archive.ReferenceFamilyCutoverAuthority(
             package_id,
             archive.CONTRACT,
-            sealed_owner_oid,
-            sealed_owner_oid,
             "automatic",
             source_generation_by_field,
         ),
@@ -750,7 +738,7 @@ async def _assert_automatic_rollback(sessions, candidate, package_id, live_schem
         )
         assert adopted.local_generation == 1
         assert adopted.serving_generation.origin_generation == 2
-        assert adopted.relation_oids == tuple(oid for _, oid in ownership.relation_oids)
+        await _assert_serves_stage(session, adopted, ownership, live_schema)
         await transaction.rollback()
     async with sessions() as session, session.begin():
         rolled_back = await result_generation.read_reference_family_result_generation_authority(
@@ -811,7 +799,7 @@ async def test_automatic_cutover_preserves_generation_and_rolls_back_atomically(
             )
             assert committed.local_generation == 1
             assert committed.serving_generation.origin_generation == 2
-            assert committed.relation_oids == tuple(oid for _, oid in ownership.relation_oids)
+            await _assert_serves_stage(session, committed, ownership, live_schema)
             assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": stage_schema}) is None
     finally:
         async with engine.begin() as connection:
@@ -839,27 +827,12 @@ async def test_publisher_validation_receipt_fences_short_cutover(monkeypatch):
         candidate = await _validated_places_candidate(sessions, live_schema, unrelated_schema, dataset_id, package_id)
         await _assert_invalid_validation_cutovers(sessions, candidate, package_id)
         await _assert_short_cutover_rollback(sessions, monkeypatch, candidate, package_id)
-        await _replace_incumbent_and_reject(sessions, live_schema, candidate, package_id)
+        await _capture_absent_incumbent_and_reject(sessions, live_schema, candidate, package_id)
     finally:
         async with engine.begin() as connection:
             for schema_name in (stage_schema, live_schema, unrelated_schema):
                 await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
         await engine.dispose()
-
-
-async def _validate_and_change_incumbent(session, owner, manifest, live_schema):
-    await archive.validate_reference_family_stage(session, ownership=owner, manifest=manifest)
-    await session.execute(text(f'ALTER TABLE "{live_schema}".pricing_places_zcta RENAME TO pricing_places_zcta_stale'))
-    await session.execute(
-        text(
-            f'CREATE TABLE "{live_schema}".pricing_places_zcta '
-            f'(LIKE "{live_schema}".pricing_places_zcta_stale INCLUDING ALL)'
-        )
-    )
-    await session.execute(
-        text(f'INSERT INTO "{live_schema}".pricing_places_zcta SELECT * FROM "{live_schema}".pricing_places_zcta_stale')
-    )
-    await session.execute(text(f"UPDATE \"{live_schema}\".pricing_places_zcta SET measure_name = 'changed'"))
 
 
 async def _activate_then_rollback(sessions, owner, manifest, incumbent, stage_schema: str) -> None:
@@ -887,7 +860,7 @@ async def _activate_then_rollback(sessions, owner, manifest, incumbent, stage_sc
         )
         assert cleared.local_generation == initial_generation.local_generation
         assert cleared.serving_generation is None
-        assert cleared.relation_oids is None
+        assert cleared.relations is None
         await transaction.rollback()
     async with sessions() as session, session.begin():
         assert (
@@ -1259,9 +1232,6 @@ async def test_scoped_models_native_copy_deferred_indexes_and_exact_custody():
             )
             await _assert_completed_scoped_catalog(session, ownership)
         async with sessions.begin() as session:
-            changed = replace(ownership, schema_oid=ownership.schema_oid + 1)
-            with pytest.raises(archive.ReferenceFamilyArchiveError, match="ownership"):
-                await archive.cleanup_model_family_stage(session, spec, changed, include_identity=True)
             assert await session.scalar(text(f'SELECT count(*) FROM "{stage}".scoped_child')) == 1
             await archive.cleanup_model_family_stage(session, spec, ownership, include_identity=True)
             assert await session.scalar(text("SELECT to_regnamespace(:stage)"), {"stage": stage}) is None
@@ -1406,3 +1376,569 @@ async def test_code_pricing_family_serves_by_name_in_this_lane(monkeypatch):
 
     monkeypatch.setattr(code_pricing, "_url", lambda: make_url(_database_url()))
     await code_pricing.serve_copied_family_by_name(monkeypatch)
+
+
+async def _create_frozen_lock_case(session, dataset_id, live_schema, predecessor_schema, role):
+    """Own fixture schemas and freeze ordinary table/column DML without removing DDL ownership."""
+    spec = archive.reference_family_spec("places-zcta")
+    await session.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
+    ownership = await archive.precreate_reference_family_restore(
+        session, importer_id=spec.importer_id, dataset_id=dataset_id
+    )
+    await archive.complete_reference_family_restore(session, ownership)
+    await archive._create_model_family(session, spec, live_schema)
+    await session.execute(text(f'CREATE SCHEMA "{predecessor_schema}"'))
+    for schema, value in ((ownership.schema_name, "new"), (live_schema, "old")):
+        table = f'"{schema}".pricing_places_zcta'
+        await session.execute(
+            text(
+                f"INSERT INTO {table}(zcta,year,measure_id,measure_name,data_value,source) VALUES ('10001',2026,'A',:name,1.0,'synthetic')"
+            ),
+            {"name": value},
+        )
+        await session.execute(text(f'ALTER TABLE {table} OWNER TO "{role}"'))
+        await session.execute(text(f'REVOKE ALL PRIVILEGES ON TABLE {table} FROM "{role}"'))
+        await session.execute(text(f'GRANT SELECT ON TABLE {table} TO "{role}"'))
+    for schema in (ownership.schema_name, live_schema, predecessor_schema):
+        await session.execute(text(f'ALTER SCHEMA "{schema}" OWNER TO "{role}"'))
+    incumbent = await archive.capture_reference_family_incumbent(
+        session, importer_id=spec.importer_id, schema_name=live_schema
+    )
+    return spec, ownership, incumbent
+
+
+async def _assert_frozen_reader_wait(sessions, case, role, predecessor_schema):
+    """Structural read locks coexist with a reader; the actual DDL waits and fails safely."""
+    spec, ownership, incumbent = case
+    async with sessions() as reader, reader.begin(), sessions() as session, session.begin():
+        await reader.execute(text(f'SELECT * FROM "{incumbent.schema_name}".pricing_places_zcta'))
+        await session.execute(text(f'SET LOCAL ROLE "{role}"'))
+        with pytest.raises(DBAPIError, match="permission denied"):
+            async with session.begin_nested():
+                await session.execute(
+                    text(f'LOCK TABLE "{ownership.schema_name}".pricing_places_zcta IN ACCESS EXCLUSIVE MODE NOWAIT')
+                )
+        async with archive._frozen_activation_lock_wait(session, True):
+            await archive._lock_and_verify_activation(session, spec, ownership, incumbent, stage_read_only=True)
+            with pytest.raises(DBAPIError) as blocked:
+                async with session.begin_nested():
+                    await session.execute(
+                        text(
+                            f'ALTER TABLE "{incumbent.schema_name}".pricing_places_zcta SET SCHEMA "{predecessor_schema}"'
+                        )
+                    )
+            assert blocked.value.orig.sqlstate == "55P03"
+        assert (
+            await session.scalar(text(f'SELECT measure_name FROM "{incumbent.schema_name}".pricing_places_zcta'))
+            == "old"
+        )
+
+
+async def _assert_frozen_activation_ddl_rolls_back(sessions, case, role, predecessor_schema):
+    """The same SELECT-only owner can perform real DDL, and caller rollback restores both heaps."""
+    spec, ownership, incumbent = case
+    async with sessions() as session, session.begin():
+        await session.execute(text(f'SET LOCAL ROLE "{role}"'))
+        with pytest.raises(RuntimeError, match="synthetic cutover failure"):
+            async with session.begin_nested(), archive._frozen_activation_lock_wait(session, True):
+                await archive._lock_and_verify_activation(session, spec, ownership, incumbent, stage_read_only=True)
+                await session.execute(
+                    text(f'ALTER TABLE "{incumbent.schema_name}".pricing_places_zcta SET SCHEMA "{predecessor_schema}"')
+                )
+                await session.execute(
+                    text(
+                        f'ALTER TABLE "{ownership.schema_name}".pricing_places_zcta SET SCHEMA "{incumbent.schema_name}"'
+                    )
+                )
+                assert (
+                    await session.scalar(
+                        text(f'SELECT measure_name FROM "{incumbent.schema_name}".pricing_places_zcta')
+                    )
+                    == "new"
+                )
+                raise RuntimeError("synthetic cutover failure")
+        assert (
+            await session.scalar(text(f'SELECT measure_name FROM "{incumbent.schema_name}".pricing_places_zcta'))
+            == "old"
+        )
+        assert (
+            await session.scalar(text(f'SELECT measure_name FROM "{ownership.schema_name}".pricing_places_zcta'))
+            == "new"
+        )
+
+
+async def _drop_frozen_lock_case(sessions, schemas, role):
+    """Remove only the committed UUID fixture schemas and their private role."""
+    async with sessions() as session, session.begin():
+        for schema in schemas:
+            await session.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        await session.execute(text(f'DROP ROLE "{role}"'))
+
+
+@pytest.mark.asyncio
+async def test_frozen_select_only_activation_preserves_readers_and_ddl_rollback():
+    """No UPDATE grant is needed for the immutable path's actual swap and rollback."""
+    engine = create_async_engine(_database_url())
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    token = uuid4().hex
+    dataset_id = uuid4()
+    role = "rf_frozen_" + token
+    live_schema, predecessor_schema = "rf_read_live_" + token, "rf_read_prev_" + token
+    schemas = (archive.reference_family_stage_schema(dataset_id), live_schema, predecessor_schema)
+    is_created = False
+    try:
+        async with sessions() as session, session.begin():
+            case = await _create_frozen_lock_case(session, dataset_id, live_schema, predecessor_schema, role)
+        is_created = True
+        await _assert_frozen_reader_wait(sessions, case, role, predecessor_schema)
+        await _assert_frozen_activation_ddl_rolls_back(sessions, case, role, predecessor_schema)
+    finally:
+        try:
+            if is_created:
+                await _drop_frozen_lock_case(sessions, schemas, role)
+        finally:
+            await engine.dispose()
+
+
+async def _nucc_generic_source_capture(resources, roles):
+    """Freeze a real source clone only after its native COPY and model completion."""
+
+    async def precreated(session, ownership):
+        await archive.verify_reference_family_stage_ownership(session, ownership)
+        assert not await session.scalar(text(f'SELECT EXISTS(SELECT FROM "{ownership.schema_name}".nucc_taxonomy)'))
+
+    async def retain(session, prepared):
+        await archive.seal_model_family_storage(session, prepared.ownership, roles=roles)
+
+    async def metadata(_session):
+        return {"source_release": "generic-restore-native"}
+
+    async def contract(_session):
+        return archive.IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT
+
+    return await archive.prepare_nucc_reference_archive_source(
+        resources.publisher.session_factory,
+        dataset_id=uuid4(),
+        on_prepared=retain,
+        on_precreated=precreated,
+        source_copy=archive.ReferenceFamilySourceCopy(archive.native_copy_projection, 8 * 1024**2, 30),
+        source_metadata_factory=metadata,
+        source_capture_contract_factory=contract,
+    )
+
+
+async def _nucc_receive_captured_model(session, prepared, roles):
+    """Receive only the captured model columns through bounded native COPY, then freeze."""
+    received = await archive.precreate_reference_family_restore(session, importer_id="nucc", dataset_id=uuid4())
+    model = archive.reference_family_spec("nucc").model_types[0]
+    columns = tuple(model.__table__.columns.keys())
+    query = (
+        "SELECT "
+        + ",".join(f'"{column}"' for column in columns)
+        + f' FROM "{prepared.ownership.schema_name}".nucc_taxonomy ORDER BY code COLLATE "C"'
+    )
+    await archive.native_copy_projection(
+        session,
+        query,
+        schema_name=received.schema_name,
+        table_name="nucc_taxonomy",
+        columns=columns,
+        max_bytes=8 * 1024**2,
+        timeout=30,
+    )
+    await archive.complete_reference_family_restore(session, received)
+    await archive.seal_model_family_storage(session, received, roles=roles)
+    return received
+
+
+async def _nucc_generic_restore_candidate(resources):
+    """Validate a real captured package over a separate frozen receive stage."""
+    import hashlib
+
+    roles = SimpleNamespace(
+        owner_role=resources.roles["owner"],
+        publisher_role=resources.roles["publisher"],
+        runtime_roles=(resources.roles["writer"],),
+    )
+    prepared = await _nucc_generic_source_capture(resources, roles)
+    async with resources.publisher.transaction() as session:
+        received = await _nucc_receive_captured_model(session, prepared, roles)
+        package = hashlib.sha256(archive._canonical_json(prepared.manifest.as_dict())).hexdigest()
+        validation = await archive.prepare_reference_family_activation(
+            session,
+            ownership=received,
+            manifest=prepared.manifest,
+            package_id=package,
+            profile_contract=archive.NUCC_CONTRACT,
+            roles=roles,
+        )
+    cutover = archive.ReferenceFamilyCutoverAuthority(
+        package,
+        archive.NUCC_CONTRACT,
+        "manual",
+        prepared.manifest.source_serving_generation.as_dict(),
+        roles=roles,
+        stage_read_only=True,
+    )
+    return received, prepared.manifest, validation, cutover
+
+
+async def _nucc_generic_activate(resources, candidate):
+    """Use the actual generic publisher validation and incumbent-generation CAS."""
+    ownership, manifest, validation, cutover = candidate
+    async with resources.publisher.transaction() as session:
+        incumbent = await archive.capture_reference_family_incumbent(session, importer_id="nucc", schema_name="mrf")
+        return await archive.activate_validated_reference_family_stage(
+            session,
+            ownership=ownership,
+            manifest=manifest,
+            expected_incumbent=incumbent,
+            validation_receipt=validation,
+            cutover=cutover,
+        )
+
+
+async def _nucc_assert_guard_and_rollback(resources, candidate, published_state):
+    """Refuse an actual additional hook and roll back a later completed generic rotation."""
+    from tests.test_nucc_plain_publication_postgres import _published_state
+
+    await resources.admin.execute(
+        "CREATE TRIGGER unknown_nucc_hook AFTER UPDATE ON mrf.nucc_taxonomy FOR EACH STATEMENT EXECUTE FUNCTION mrf.cms_native_input_advance()"
+    )
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="hooks differ"):
+        await _nucc_generic_activate(resources, candidate)
+    await resources.admin.execute("DROP TRIGGER unknown_nucc_hook ON mrf.nucc_taxonomy")
+    assert await _published_state(resources) == published_state
+    ownership, manifest, validation, cutover = candidate
+    with pytest.raises(RuntimeError, match="caller rejected rotation"):
+        async with resources.publisher.transaction() as session:
+            incumbent = await archive.capture_reference_family_incumbent(session, importer_id="nucc", schema_name="mrf")
+            await archive.activate_validated_reference_family_stage(
+                session,
+                ownership=ownership,
+                manifest=manifest,
+                expected_incumbent=incumbent,
+                validation_receipt=validation,
+                cutover=cutover,
+            )
+            assert await session.scalar(text("SELECT count(*) FROM mrf.nucc_taxonomy")) == 2
+            raise RuntimeError("caller rejected rotation")
+    assert await _published_state(resources) == published_state
+    assert await resources.admin.fetchval("SELECT to_regnamespace($1) IS NOT NULL", ownership.schema_name)
+
+
+async def _nucc_assert_retired_cleanup(resources, retained_schema):
+    """A pinned reader blocks native DROP; release permits guarded named retirement."""
+    from process.nucc_retention_read_view import require_unretained_nucc_relations
+
+    inventory_by_field = {"relations": [{"schema_name": retained_schema, "relation_name": "nucc_taxonomy"}]}
+
+    async def is_unreferenced(session, recorded):
+        assert recorded == inventory_by_field
+        await require_unretained_nucc_relations(session, schema_name=retained_schema, relation_names=("nucc_taxonomy",))
+        return True
+
+    async with resources.publisher.session_factory() as reader, reader.begin():
+        assert await reader.scalar(text(f'SELECT count(*) FROM "{retained_schema}".nucc_taxonomy')) == 3
+        async with resources.publisher.transaction() as session:
+            await session.execute(text("SET LOCAL lock_timeout='100ms'"))
+            with pytest.raises(DBAPIError) as blocked:
+                await archive.cleanup_nucc_retained_publication(
+                    session, inventory=inventory_by_field, assert_unreferenced=is_unreferenced
+                )
+            assert blocked.value.orig.sqlstate == "55P03"
+            assert await session.scalar(text(f'SELECT count(*) FROM "{retained_schema}".nucc_taxonomy')) == 3
+    async with resources.publisher.transaction() as session:
+        cleaned = await archive.cleanup_nucc_retained_publication(
+            session, inventory=inventory_by_field, assert_unreferenced=is_unreferenced
+        )
+        assert cleaned["removed_schema"] == retained_schema
+    assert await resources.admin.fetchval("SELECT to_regnamespace($1) IS NULL", retained_schema)
+
+
+async def _nucc_assert_role_readonly(resources, schema, role):
+    """Exercise real SELECT and native DML denial under one configured role."""
+    async with resources.admin.transaction():
+        await resources.admin.execute(f'SET LOCAL ROLE "{role}"')
+        assert await resources.admin.fetchval(f'SELECT count(*) FROM "{schema}".nucc_taxonomy') > 0
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            async with resources.admin.transaction():
+                await resources.admin.execute(
+                    f'UPDATE "{schema}".nucc_taxonomy SET display_name=display_name WHERE FALSE'
+                )
+        await resources.admin.execute("RESET ROLE")
+
+
+async def _nucc_assert_named_readonly_relations(resources, schema_names):
+    """Exercise native access on both named snapshots for every configured role."""
+    for schema in schema_names:
+        for role in resources.roles.values():
+            await _nucc_assert_role_readonly(resources, schema, role)
+
+
+async def _nucc_assert_generic_activation(resources, candidate, activated, captured, incumbent):
+    """Verify both complete row sets and logical generations after guard retirement."""
+    retained = activated.predecessor_schema_name
+    async with resources.publisher.transaction() as session:
+        authority = await result_generation.read_reference_family_result_generation_authority(
+            session, importer_id="nucc", schema_name="mrf"
+        )
+        assert authority.local_generation == 2 and authority.relations == (("mrf", "nucc_taxonomy"),)
+        assert authority.serving_generation == candidate[1].source_serving_generation
+        assert (
+            await session.scalar(
+                text("SELECT jsonb_agg(to_jsonb(row_value) ORDER BY code) FROM mrf.nucc_taxonomy row_value")
+            )
+            == captured[1]
+        )
+        assert (
+            await session.scalar(
+                text(f'SELECT jsonb_agg(to_jsonb(row_value) ORDER BY code) FROM "{retained}".nucc_taxonomy row_value')
+            )
+            == incumbent[1]
+        )
+    assert (
+        await resources.admin.fetchval(
+            "SELECT count(*) FROM pg_trigger WHERE tgrelid=to_regclass($1) AND NOT tgisinternal",
+            f'"{retained}".nucc_taxonomy',
+        )
+        == 0
+    )
+    assert (
+        await resources.admin.fetchval(
+            "SELECT revision FROM mrf.cms_native_input_revision WHERE schema_name='mrf' AND table_name='nucc_taxonomy'"
+        )
+        == 1
+    )
+    return retained
+
+
+@pytest.mark.asyncio
+async def test_native_nucc_generic_receive_retires_known_guard_and_cleans_retained_snapshot(monkeypatch):
+    """Real capture/receive/manual restore preserves data, counters, readers and rollback."""
+    from tests.test_nucc_plain_publication_postgres import (
+        _bootstrap_plain,
+        _install_existing_counter,
+        _new_attempt,
+        _published_state,
+        nucc,
+    )
+    from tests.test_nucc_protected_flow_postgres import _native_candidates
+
+    monkeypatch.setenv("HLTHPRT_ALIAS_GUARD_TEST_DSN", _database_url())
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    async with _native_candidates(monkeypatch) as resources:
+        assert not await resources.admin.fetchval(
+            "SELECT EXISTS(SELECT FROM pg_class WHERE relnamespace='hp_snapshot_retention'::regnamespace)"
+        )
+        await resources.admin.execute("DROP SCHEMA hp_snapshot_retention")
+        await resources.admin.execute(f'CREATE SCHEMA mrf AUTHORIZATION "{resources.roles["owner"]}"')
+        await resources.admin.execute(
+            f'GRANT USAGE ON SCHEMA mrf TO "{resources.roles["publisher"]}","{resources.roles["writer"]}"'
+        )
+        await _install_existing_counter(resources)
+        await _bootstrap_plain(resources)
+        captured = await _published_state(resources)
+        candidate = await _nucc_generic_restore_candidate(resources)
+        await nucc._publish_plain_generation(await _new_attempt(resources, 3))
+        before = await _published_state(resources)
+        assert before[0]["native_input"]["revision"] == 1 and before[0]["family_generation"]["local_generation"] == 2
+        await _nucc_assert_guard_and_rollback(resources, candidate, before)
+        activated = await _nucc_generic_activate(resources, candidate)
+        retained = await _nucc_assert_generic_activation(resources, candidate, activated, captured, before)
+        await _nucc_assert_named_readonly_relations(resources, ("mrf", retained))
+        await _nucc_assert_retired_cleanup(resources, retained)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_nucc_rotation_check_passes_after_the_named_preparation_upgrade():
+    """The upgrade adds the retention namespace alone; the next ordinary NUCC import must still rotate."""
+    from db.migration_named_preparation import upgrade_named_preparation_catalog
+    from process.nucc_retention_read_view import NuccRetentionReadError, require_unretained_nucc_relations
+
+    engine = create_async_engine(_database_url())
+    schema = "nucc_rotation_" + uuid4().hex
+    relation_names = ("nucc_taxonomy", "nucc_taxonomy_old")
+    is_upgraded = False
+
+    async def check_rotation():
+        async with AsyncSession(engine) as session, session.begin():
+            await require_unretained_nucc_relations(session, schema_name=schema, relation_names=relation_names)
+
+    try:
+        async with engine.begin() as connection:
+            assert await connection.scalar(text("SELECT to_regnamespace('hp_snapshot_retention') IS NULL"))
+            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            await connection.execute(text(f'CREATE TABLE "{schema}".nucc_taxonomy (code text)'))
+        await check_rotation()
+        is_upgraded = True
+        async with engine.begin() as connection:
+            await connection.run_sync(upgrade_named_preparation_catalog)
+        await check_rotation()
+        for claim_table, owner_column in (("relation", "generation_id"), ("preparation_relation", "preparation_id")):
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        f"INSERT INTO hp_snapshot_retention.{claim_table} (schema_name,relation_name,{owner_column}) "
+                        "VALUES (:schema,'nucc_taxonomy_old',CAST(:owner AS uuid))"
+                    ),
+                    {"schema": schema, "owner": str(uuid4())},
+                )
+            with pytest.raises(NuccRetentionReadError, match="retained claim exists"):
+                await check_rotation()
+            async with engine.begin() as connection:
+                await connection.execute(text(f"DELETE FROM hp_snapshot_retention.{claim_table}"))
+            await check_rotation()
+        async with engine.begin() as connection:
+            await connection.execute(text("CREATE TABLE hp_snapshot_retention.legacy_archive (receipt jsonb)"))
+        with pytest.raises(NuccRetentionReadError, match="catalogue is incomplete"):
+            await check_rotation()
+    finally:
+        async with engine.begin() as connection:
+            if is_upgraded:
+                await connection.execute(text("DROP SCHEMA IF EXISTS hp_snapshot_retention CASCADE"))
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_nucc_import_role_reads_claims_after_separate_migration_role_upgrade():
+    """A distinct migration role installs the catalog; the ordinary import role still rotates."""
+    from db.migration_named_preparation import upgrade_named_preparation_catalog
+    from process.nucc_retention_read_view import NuccRetentionReadError, require_unretained_nucc_relations
+
+    engine = create_async_engine(_database_url())
+    suffix = uuid4().hex
+    schema, migrator, importer = "nucc_rotation_" + suffix, "nucc_migrator_" + suffix, "nucc_importer_" + suffix
+    relation_names = ("nucc_taxonomy", "nucc_taxonomy_old")
+
+    async def check_rotation():
+        async with AsyncSession(engine) as session, session.begin():
+            await session.execute(text(f'SET LOCAL ROLE "{importer}"'))
+            await require_unretained_nucc_relations(session, schema_name=schema, relation_names=relation_names)
+
+    try:
+        async with engine.begin() as connection:
+            assert await connection.scalar(text("SELECT to_regnamespace('hp_snapshot_retention') IS NULL"))
+            database = await connection.scalar(text("SELECT quote_ident(current_database())"))
+            for role in (migrator, importer):
+                await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE'))
+            await connection.execute(text(f'GRANT CREATE ON DATABASE {database} TO "{migrator}"'))
+            await connection.execute(text(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{importer}"'))
+            await connection.execute(text(f'CREATE TABLE "{schema}".nucc_taxonomy (code text)'))
+            await connection.execute(text(f'ALTER TABLE "{schema}".nucc_taxonomy OWNER TO "{importer}"'))
+        await check_rotation()
+        async with engine.begin() as connection:
+            await connection.execute(text(f'SET LOCAL ROLE "{migrator}"'))
+            await connection.run_sync(upgrade_named_preparation_catalog)
+        await check_rotation()
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO hp_snapshot_retention.relation (schema_name,relation_name,generation_id) "
+                    "VALUES (:schema,'nucc_taxonomy_old',CAST(:owner AS uuid))"
+                ),
+                {"schema": schema, "owner": str(uuid4())},
+            )
+        with pytest.raises(NuccRetentionReadError, match="retained claim exists"):
+            await check_rotation()
+        async with AsyncSession(engine) as session, session.begin():
+            await session.execute(text(f'SET LOCAL ROLE "{importer}"'))
+            with pytest.raises(ProgrammingError, match="permission denied"):
+                await session.execute(text("SELECT generation_id FROM hp_snapshot_retention.relation"))
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text("DROP SCHEMA IF EXISTS hp_snapshot_retention CASCADE"))
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            for role in (migrator, importer):
+                if await connection.scalar(text("SELECT to_regrole(:role) IS NOT NULL"), {"role": role}):
+                    await connection.execute(text(f'DROP OWNED BY "{role}"'))
+                    await connection.execute(text(f'DROP ROLE "{role}"'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_address_owner_running_named_catalog_upgrade_keeps_ordinary_rotation(monkeypatch):
+    """Owning both the catalog and the address table does not make the ordinary table a protected snapshot."""
+    from db.connection import Database
+    from db.migration_named_preparation import upgrade_named_preparation_catalog
+    from process import entity_address_snapshot_adoption as adoption
+
+    engine = create_async_engine(_database_url())
+    suffix = uuid4().hex
+    schema, owner = "address_rotation_" + suffix, "address_owner_" + suffix
+    swap = SimpleNamespace(live_cls=SimpleNamespace(__main_table__="entity_address_unified"))
+    monkeypatch.setattr(
+        adoption.entity_address_unified, "db", Database(engine=engine, session_factory=async_sessionmaker(engine))
+    )
+    try:
+        async with engine.begin() as connection:
+            assert await connection.scalar(text("SELECT to_regnamespace('hp_snapshot_retention') IS NULL"))
+            database = await connection.scalar(text("SELECT quote_ident(current_database())"))
+            await connection.execute(text(f'CREATE ROLE "{owner}" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE'))
+            await connection.execute(text(f'GRANT CREATE ON DATABASE {database} TO "{owner}"'))
+            await connection.execute(text(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{owner}"'))
+            await connection.execute(text(f'CREATE TABLE "{schema}".entity_address_unified (location_key text)'))
+            await connection.execute(text(f'ALTER TABLE "{schema}".entity_address_unified OWNER TO "{owner}"'))
+            await connection.execute(text(f'SET LOCAL ROLE "{owner}"'))
+            await connection.run_sync(upgrade_named_preparation_catalog)
+        await adoption._require_protected_cutover(schema, [swap], {})
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO hp_snapshot_retention.relation (schema_name,relation_name,generation_id) "
+                    "VALUES (:schema,'entity_address_unified',CAST(:generation AS uuid))"
+                ),
+                {"schema": schema, "generation": str(uuid4())},
+            )
+        with pytest.raises(RuntimeError, match="cannot replace a protected snapshot"):
+            await adoption._require_protected_cutover(schema, [swap], {})
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text("DROP SCHEMA IF EXISTS hp_snapshot_retention CASCADE"))
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            if await connection.scalar(text("SELECT to_regrole(:role) IS NOT NULL"), {"role": owner}):
+                await connection.execute(text(f'DROP OWNED BY "{owner}"'))
+                await connection.execute(text(f'DROP ROLE "{owner}"'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_catalog_foreign_key_triggers_pass_tiger_preflight_user_triggers_refuse():
+    """Internal triggers from the catalog's existing foreign keys are expected; a user trigger is not."""
+    from process import tiger_held_inputs as held
+
+    engine = create_async_engine(_database_url())
+    try:
+        async with engine.begin() as connection:
+            assert await connection.scalar(text("SELECT to_regnamespace('hp_snapshot_retention') IS NULL"))
+            await connection.execute(text("CREATE SCHEMA hp_snapshot_retention"))
+            await connection.execute(
+                text("CREATE TABLE hp_snapshot_retention.generation (generation_id uuid PRIMARY KEY)")
+            )
+            # The existing retention migrations bind the current pointer to its generation.
+            await connection.execute(
+                text(
+                    "CREATE TABLE hp_snapshot_retention.current_generation (dataset_key text PRIMARY KEY,"
+                    "generation_id uuid NOT NULL REFERENCES hp_snapshot_retention.generation(generation_id))"
+                )
+            )
+        async with AsyncSession(engine) as session, session.begin():
+            for relation in (held._GENERATION, held._CURRENT):
+                selected = await held._protected_relation(session, relation, catalog=True)
+                assert (selected["schema_name"], selected["relation_name"]) == tuple(relation.split("."))
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "CREATE TRIGGER user_guard AFTER INSERT ON hp_snapshot_retention.generation "
+                    "FOR EACH STATEMENT EXECUTE FUNCTION suppress_redundant_updates_trigger()"
+                )
+            )
+        with pytest.raises(RuntimeError, match="protected TIGER input changed"):
+            async with AsyncSession(engine) as session, session.begin():
+                await held._protected_relation(session, held._GENERATION, catalog=True)
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text("DROP SCHEMA IF EXISTS hp_snapshot_retention CASCADE"))
+        await engine.dispose()

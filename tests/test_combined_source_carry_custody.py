@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Custody sequencing/SQL protocol regressions; doubles provide no native Source authority."""
+"""Source data validation ordering; doubles provide no native Source authority."""
 
 import asyncio
 import hashlib
@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from process import network_candidate_custody as final
+from process import network_membership_validation as final
 from process import network_source_contribution_custody as source
 from process import registry_fhir_serving_preservation as preservation
 from process import registry_source_office_custody as offices
@@ -99,7 +99,7 @@ async def test_preservation_scope_drains_cleanup_and_preserves_primary_identity(
     proof, entries, events = object(), object(), []
 
     async def rederive(*arguments, **options):
-        assert options == {"control_schema": "controls", "inventory_entries": entries}
+        assert options == {"control_schema": "controls", "inventory_entries": entries, "source_witness_runtime": None}
         events.append("rederive")
         return proof
 
@@ -118,6 +118,8 @@ async def test_preservation_scope_drains_cleanup_and_preserves_primary_identity(
     monkeypatch.setattr(preservation, "rederive_fhir_serving_preservation", rederive)
     monkeypatch.setattr(preservation, "verify_fhir_preservation_target_rows", copy_target)
     monkeypatch.setattr(preservation, "cleanup_fhir_serving_preservation", cleanup)
+    monkeypatch.setattr(preservation, "has_fresh_carried_typed_data", AsyncMock(return_value=False))
+    monkeypatch.setattr("process.network_sampled_custody.inherit_preserved_sampling", AsyncMock())
     try:
         async with final._preservation_scope(object(), _target(), {}, "controls", entries) as actual:
             assert failure is None and actual is proof
@@ -197,23 +199,21 @@ async def test_reconstruction_keeps_full_vector_and_actual_retained_manifest(mon
 
 
 async def test_compact_final_proof_keeps_carry_scope_through_last_proof_and_return(monkeypatch):
-    from contextlib import asynccontextmanager
-
     from process import network_compact_readiness as readiness
     from process import network_compact_validation as compact
-    from process import network_membership_publication as publication
+    from process import network_em_provider_inputs as provider_inputs
     from process import network_sampled_custody as sampled
 
     events, proof, entries = [], SimpleNamespace(receipt={"carried_rows": 0}), object()
 
-    @asynccontextmanager
-    async def scope(*arguments):
-        assert arguments[-1] is entries
+    async def enter(*arguments, **options):
+        assert options["inventory_entries"] is entries
         events.append("enter")
-        try:
-            yield proof
-        finally:
-            events.append("cleanup")
+        return proof
+
+    async def cleanup(*arguments, **options):
+        assert arguments[1] is proof
+        events.append("cleanup")
 
     def recorder(event):
         async def record(*arguments, **options):
@@ -234,16 +234,18 @@ async def test_compact_final_proof_keeps_carry_scope_through_last_proof_and_retu
             }
         }
     }
-    monkeypatch.setattr(final, "_preservation_scope", scope)
+    monkeypatch.setattr(preservation, "rederive_fhir_serving_preservation", enter)
+    monkeypatch.setattr(preservation, "verify_fhir_preservation_target_rows", recorder("carried"))
+    monkeypatch.setattr(preservation, "has_fresh_carried_typed_data", AsyncMock(return_value=False))
+    monkeypatch.setattr(preservation, "cleanup_fhir_serving_preservation", cleanup)
     monkeypatch.setattr(sampled, "inherit_preserved_sampling", recorder("sampling"))
     monkeypatch.setattr(final, "verify_registry_source_retention_rows", recorder("retention"))
-    monkeypatch.setattr(publication, "_publication_readiness", lambda _candidate: (None, None, None, {}))
-    monkeypatch.setattr(publication, "_verify_provider_custody", recorder("provider"))
+    monkeypatch.setattr(provider_inputs, "verify_candidate_em_provider_inputs", recorder("provider"))
     monkeypatch.setattr(source, "verify_independent_source_contributions", recorder("current"))
     monkeypatch.setattr(readiness, "is_compact_candidate", lambda _candidate: True)
     monkeypatch.setattr(compact, "verify_compact_final_proof", recorder("compact"))
     await final._final_proof(object(), _target(), candidate_by_field, "controls", inventory_entries=entries)
-    assert events == ["enter", "sampling", "retention", "current", "compact", "provider", "cleanup"]
+    assert events == ["enter", "carried", "sampling", "retention", "current", "compact", "provider", "cleanup"]
 
 
 @pytest.mark.parametrize("carried", [0, 3])
@@ -276,7 +278,7 @@ async def test_legacy_resume_selects_current_policy_with_combined_retention(monk
     example.candidate["source_generations"]["registry_source_retention"] = registry_source_retention_sha256(
         retention_by_field
     )
-    assert await policy.select_legacy_verified_office_inputs(object(), example.candidate) == example.inputs
+    assert await policy.select_legacy_verified_office_inputs(object(), example.candidate) == (example.inputs[0], ())
     staged = AsyncMock(return_value=example.stage)
     monkeypatch.setattr(policy, "stage_registry_source_recipes", staged)
     monkeypatch.setattr(policy, "verified_retained_source_office_summary", AsyncMock(return_value=example.summary))

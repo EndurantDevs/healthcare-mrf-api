@@ -17,43 +17,13 @@ from process.provider_directory_source_storage_binding import FHIRSourceStorageB
 
 
 def _prepared_input_metadata(policy):
-    """Keep fixture actor, custody and frozen-row metadata as separate mutable objects."""
+    """Separate configured roles, transaction modes and portable input names."""
     origin_by_field = dict(
-        session=policy.publisher_role,
-        current=policy.publisher_role,
-        backend=41,
-        database_oid=71,
-        readonly="off",
-        isolation="read committed",
-        replication_role="origin",
-        transaction="3/4",
+        current=policy.publisher_role, readonly="off", isolation="read committed", replication_role="origin"
     )
-    coordinates_by_field = dict(
-        catalog_schema_oid=72,
-        storage_schema_oid=73,
-        namespace_owner_oid=75,
-        source_owner_oid=74,
-        prepared_owner_oid=76,
-        source_owner_login=False,
-        source_publisher_login=True,
-        prepared_owner_login=False,
-        prepared_publisher_login=True,
-    )
-    relations = [
-        dict(
-            schema_name="private_source",
-            relation_name=f"frozen_input_{n}",
-            relation_oid=100 + n,
-            schema_oid=73,
-            schema_owner_oid=75,
-            owner_oid=76,
-            relfilenode=200 + n,
-        )
-        for n in range(8)
-    ]
-    inventory_by_field = dict(database_oid=71, relations=relations)
-    native_rows = [{**relation, "supported": True} for relation in relations]
-    return origin_by_field, coordinates_by_field, inventory_by_field, native_rows
+    relations = [dict(schema_name="private_source", relation_name=f"frozen_input_{n}") for n in range(8)]
+    inventory_by_field = {"relations": relations}
+    return origin_by_field, inventory_by_field, inventory_by_field, relations
 
 
 @pytest_asyncio.fixture
@@ -64,14 +34,13 @@ async def case():
     database._database_override = "synthetic"
     source_policy = source.GenericSourcePolicy("private_source", "source_owner", "source_publisher", ("reader",))
     policy = source.GenericSourcePolicy("private_source", "prepared_owner", "prepared_publisher", ("reader",))
-    storage = FHIRSourceStorageBinding("catalog", "private_source", 71, 72, 73, 74, 75, "a" * 64)
+    storage = FHIRSourceStorageBinding("catalog", "private_source")
     origin_by_field, coordinates_by_field, inventory_by_field, native_rows = _prepared_input_metadata(policy)
 
     async def fetchrow(query, *arguments):
         if query == prepared._ORIGIN_SQL:
             return origin_by_field.copy()
-        assert query == prepared._COORDINATES_SQL
-        return coordinates_by_field.copy()
+        raise AssertionError(query)
 
     driver = SimpleNamespace(
         is_closed=Mock(return_value=False),
@@ -79,6 +48,7 @@ async def case():
         get_server_pid=Mock(return_value=41),
         fetchrow=AsyncMock(side_effect=fetchrow),
         fetch=AsyncMock(side_effect=lambda *args: deepcopy(native_rows)),
+        execute=AsyncMock(),
     )
     physical = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver)))
     async with AsyncSession(bind=engine) as session:
@@ -118,109 +88,70 @@ def observe(case, **changes):
     )
 
 
-async def test_observes_separate_owners_without_context_or_transaction_changes(case):
+async def test_observes_complete_named_inputs_without_transaction_or_context_changes(case):
     ambient = (source._FACTORY.get(), source._PUBLISHER.get(), source._OWNER.get())
     async with case.session.begin(), case.database.bind_existing_session(case.session):
         transaction = case.session.get_transaction()
         async with observe(case) as evidence:
-            assert evidence["source_storage"]["owner_oid"] == 74
-            assert evidence["native_coordinates"]["prepared_owner_oid"] == 76
+            assert evidence["source_storage"] == {"catalog_schema": "catalog", "storage_schema": "private_source"}
             assert evidence["frozen_inventory"] == case.inventory
             evidence["frozen_inventory"]["relations"].clear()
-            assert case.storage.owner_oid == 74 and len(case.inventory["relations"]) == 8
+            assert len(case.inventory["relations"]) == 8
         assert case.session.get_transaction() is transaction
         assert (source._FACTORY.get(), source._PUBLISHER.get(), source._OWNER.get()) == ambient
-    assert case.driver.fetch.await_count == 2
-    assert not hasattr(prepared, "finalize_frozen_cms_source_candidate")
-    assert not hasattr(prepared, "bind_generic_source_publisher")
+    assert case.driver.execute.await_count == 16
+    assert all(
+        str(call.args[0]).startswith('SELECT 1 FROM "private_source".') for call in case.driver.execute.await_args_list
+    )
+    case.driver.fetch.assert_not_awaited()
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("session", "source_publisher"),
-        ("current", "prepared_owner"),
-        ("database_oid", 99),
-        ("backend", 99),
-        ("readonly", "on"),
-        ("replication_role", "replica"),
-        ("transaction", None),
-    ],
-)
-async def test_wrong_native_origin_fails_before_inventory(case, field, value):
+@pytest.mark.parametrize("field,value", [("readonly", "on"), ("isolation", "invalid"), ("replication_role", "replica")])
+async def test_invalid_preparation_transaction_refuses_before_reading_inputs(case, field, value):
     case.origin[field] = value
-    with pytest.raises(ValueError, match="original_publisher_required"):
+    with pytest.raises(ValueError, match="writable_transaction_required"):
         async with case.session.begin(), case.database.bind_existing_session(case.session), observe(case):
-            pytest.fail("wrong original actor reached the body")
-    case.driver.fetch.assert_not_awaited()
+            pytest.fail("invalid transaction reached the body")
+    case.driver.execute.assert_not_awaited()
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("source_owner_oid", 76),
-        ("prepared_owner_oid", 74),
-        ("storage_schema_oid", 99),
-        ("catalog_schema_oid", 99),
-        ("namespace_owner_oid", 99),
-        ("prepared_owner_login", True),
-    ],
-)
-async def test_source_binding_cannot_be_reinterpreted_as_prepared_custody(case, field, value):
-    case.coordinates[field] = value
-    with pytest.raises(ValueError, match="native_coordinates_changed"):
+async def test_missing_or_inaccessible_named_input_propagates_native_refusal(case):
+    case.driver.execute.side_effect = PermissionError("input read refused")
+    with pytest.raises(PermissionError, match="input read refused"):
         async with case.session.begin(), case.database.bind_existing_session(case.session), observe(case):
-            pytest.fail("incorrect native custody reached the body")
-    case.driver.fetch.assert_not_awaited()
+            pytest.fail("unreadable input reached the body")
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("owner_oid", 74),
-        ("relation_oid", 999),
-        ("relfilenode", 999),
-        ("relation_name", "replaced_input"),
-        ("schema_owner_oid", 999),
-        ("supported", False),
-    ],
-)
-async def test_native_frozen_identity_or_owner_drift_is_rejected(case, field, value):
-    case.native_rows[0][field] = value
-    with pytest.raises(ValueError, match="frozen_inventory_changed"):
-        async with case.session.begin(), case.database.bind_existing_session(case.session), observe(case):
-            pytest.fail("changed input reached the body")
-
-
-async def test_bridge_and_original_driver_are_required_before_native_io(case):
+async def test_borrowed_session_is_required_before_native_io(case):
     async with case.session.begin():
         with pytest.raises(ValueError, match="borrowed_session_required"):
             async with observe(case):
                 pytest.fail("unbound caller was accepted")
-    async with case.session.begin(), case.database.bind_existing_session(case.session):
-        case.physical.get_raw_connection.return_value.driver_connection = object()
-        with pytest.raises(ValueError, match="physical_connection_changed"):
-            async with observe(case):
-                pytest.fail("replaced driver was accepted")
     case.driver.fetchrow.assert_not_awaited()
 
 
-@pytest.mark.parametrize("change", ["inventory", "origin", "driver", "ended_transaction"])
-async def test_exit_rechecks_inputs_and_original_physical_transaction(case, change):
-    with pytest.raises(
-        ValueError,
-        match="inputs_changed|native_evidence_changed|physical_connection_changed|original_transaction_required",
-    ):
+async def test_virtual_session_transaction_is_materialized_before_raw_input_reads(case):
+    native_state_by_field = {"active": False}
+    case.driver.is_in_transaction.side_effect = lambda: native_state_by_field["active"]
+
+    async def materialize(statement):
+        assert str(statement) == "SELECT 1"
+        native_state_by_field["active"] = True
+
+    case.session.execute = AsyncMock(side_effect=materialize)
+    async with case.session.begin(), case.database.bind_existing_session(case.session), observe(case):
+        assert native_state_by_field["active"]
+    case.session.execute.assert_awaited_once()
+
+
+@pytest.mark.parametrize("change", ["inventory", "ended_transaction"])
+async def test_exit_rechecks_logical_inputs_and_transaction_lifetime(case, change):
+    with pytest.raises(ValueError, match="inputs_changed|original_transaction_required"):
         async with case.session.begin(), case.database.bind_existing_session(case.session), observe(case):
-            match change:
-                case "inventory":
-                    case.inventory["relations"][0]["relfilenode"] = 999
-                case "origin":
-                    case.origin["transaction"] = "3/5"
-                case "driver":
-                    case.physical.get_raw_connection.return_value.driver_connection = object()
-                case _:
-                    await case.session.rollback()
+            if change == "inventory":
+                case.inventory["relations"][0]["relation_name"] = "replacement"
+            else:
+                await case.session.rollback()
 
 
 async def test_inherited_task_and_nested_transaction_are_refused(case):
@@ -244,34 +175,23 @@ async def test_caller_failure_keeps_rollback_and_cleanup_with_caller(case, error
         async with case.session.begin(), case.database.bind_existing_session(case.session), observe(case):
             raise error
     assert not case.session.in_transaction()
-    assert case.driver.fetch.await_count == 1
+    assert case.driver.execute.await_count == 8
 
 
-async def test_closed_inventory_refuses_extra_or_source_owned_input_before_native_sql(case):
-    case.inventory["relations"][0]["owner_oid"] = case.storage.owner_oid
-    with pytest.raises(ValueError, match="frozen_coordinates_changed"):
-        async with case.session.begin(), case.database.bind_existing_session(case.session), observe(case):
-            pytest.fail("Source-owned input was accepted as frozen")
-    case.driver.fetchrow.assert_not_awaited()
-
-
-@pytest.mark.parametrize("change", ["count", "duplicate_oid", "duplicate_name", "extra_field", "boolean_oid", "schema"])
-async def test_malformed_frozen_inventory_is_refused_before_native_io(case, change):
+@pytest.mark.parametrize("change", ["count", "duplicate_name", "extra_field", "schema", "invalid_name"])
+async def test_malformed_named_inventory_is_refused_before_native_io(case, change):
     relations = case.inventory["relations"]
-    match change:
-        case "count":
-            relations.pop()
-        case "duplicate_oid":
-            relations[0]["relation_oid"] = relations[1]["relation_oid"]
-        case "duplicate_name":
-            relations[0]["relation_name"] = relations[1]["relation_name"]
-        case "extra_field":
-            relations[0]["authority"] = True
-        case "boolean_oid":
-            relations[0]["relation_oid"] = True
-        case _:
-            relations[0]["schema_name"] = "catalog"
-    with pytest.raises(ValueError, match="inventory_invalid|frozen_coordinates_changed"):
+    if change == "count":
+        relations.pop()
+    elif change == "duplicate_name":
+        relations[0]["relation_name"] = relations[1]["relation_name"]
+    elif change == "extra_field":
+        relations[0]["authority"] = True
+    elif change == "schema":
+        relations[0]["schema_name"] = "catalog"
+    else:
+        relations[0]["relation_name"] = "unsafe.name"
+    with pytest.raises(ValueError, match="inventory_invalid|frozen_coordinates_changed|identifier_invalid"):
         async with case.session.begin(), case.database.bind_existing_session(case.session), observe(case):
             pytest.fail("malformed input reached native IO")
     case.driver.fetchrow.assert_not_awaited()

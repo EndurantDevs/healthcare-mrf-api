@@ -26,7 +26,7 @@ from tests.generic_source_successor_postgres_support import (
     publish_edition,
     start_refresh_runtime,
 )
-from tests.test_registry_membership_refresh_execution_postgres import _counts, _heads, _storage_rows
+from tests.test_registry_membership_refresh_execution_postgres import _counts, _heads
 
 pytestmark = pytest.mark.asyncio
 
@@ -92,11 +92,9 @@ async def _assert_replay(fixture, queued, manifest, inputs):
     before = await _counts(fixture)
     command = fixture.command(inputs)
     request_query = (
-        f'SELECT request.*,xmin::text AS row_xmin,ctid::text AS row_ctid FROM "{fixture.control_schema}".'
-        "registry_publication_request request WHERE request_id=$1"
+        f'SELECT request.* FROM "{fixture.control_schema}".registry_publication_request request WHERE request_id=$1'
     )
     completed_record = await fixture.connection.fetchrow(request_query, UUID(queued["request_id"]))
-    relation_oids = await _heap_oids(fixture, manifest)
     commits_before, cas_before = fixture.calls.count(COMMIT_AUTHORITY_PATH), list(fixture.cas_checks)
     assert completed_record["state"] == "completed"
     assert validated_membership_refresh_request_status(completed_record) == command
@@ -105,16 +103,21 @@ async def _assert_replay(fixture, queued, manifest, inputs):
     assert await fixture.connection.fetchrow(request_query, UUID(queued["request_id"])) == completed_record
     assert await _counts(fixture) == before
     assert await _storage_rows(fixture, manifest.schema_name) == current_storage
-    assert await _heap_oids(fixture, manifest) == relation_oids
     assert fixture.calls.count(COMMIT_AUTHORITY_PATH) == commits_before == 2 and fixture.cas_checks == cas_before
 
 
-async def _heap_oids(fixture, manifest):
-    return await fixture.connection.fetch(
-        "SELECT relname,oid::bigint,relfilenode::bigint FROM pg_class "
-        "WHERE relnamespace=to_regnamespace($1) AND relkind='r' ORDER BY relname",
-        manifest.schema_name,
+async def _storage_rows(fixture, namespace):
+    """Compare every named table and its complete logical rows, including duplicates."""
+    tables = await fixture.connection.fetch(
+        "SELECT relname FROM pg_class WHERE relnamespace=to_regnamespace($1) AND relkind='r' ORDER BY relname",
+        namespace,
     )
+    return {
+        table["relname"]: await fixture.connection.fetch(
+            f'SELECT to_jsonb(row)::text FROM "{namespace}"."{table["relname"]}" row ORDER BY to_jsonb(row)::text'
+        )
+        for table in tables
+    }
 
 
 async def _transport_extension_receipt(fixture, record_property):
@@ -166,7 +169,7 @@ async def _assert_connected_transport(
 
 
 async def _exercise_source_successor(monkeypatch, *, layer_inputs=None, record_property=None):
-    async with native_generic_source(monkeypatch) as source_fixture:
+    async with native_generic_source(monkeypatch, named=True) as source_fixture:
         original_capture = await publish_edition(source_fixture, 1)
         async with generic_refresh_execution(source_fixture, monkeypatch) as (fixture, serving, stack, head_url):
             await transport._assert_inventory_migration(fixture)
@@ -182,12 +185,14 @@ async def _exercise_source_successor(monkeypatch, *, layer_inputs=None, record_p
                 old_reader = await native_driver(old_session)
                 assert await _read(fixture, old_reader) == original
                 successor = await publish_edition(source_fixture, 2)
+                assert successor.origin.schema_name != original_capture.origin.schema_name
+                assert successor.origin.header_relation == original_capture.origin.header_relation
                 assert successor.capture_id != original_capture.capture_id
                 assert successor.capture_sha256 != original_capture.capture_sha256
                 assert successor.content_sha256 != original_capture.content_sha256
                 second_inputs, queued, current = await _consume(fixture)
                 assert current[0].generation_id > original[0].generation_id
-                assert current[0].compact_layout.base.table_oid == original[0].compact_layout.base.table_oid
+                assert current[0].compact_layout.base == original[0].compact_layout.base
                 assert current[1] == [("Suite 1", []), ("Suite 2", [fixture.network_id])]
                 assert {provider_row["provider_id"] for provider_row in current[2]["providers"]} == {"1000000491"}
                 assert second_inputs["accepted_sources"][0]["capture_generation"] == successor.capture_sha256

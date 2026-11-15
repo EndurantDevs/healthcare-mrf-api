@@ -14,7 +14,6 @@ from api.network_provider_read import (
     NetworkProviderReadError,
     NetworkProviderReadUnavailable,
     _arguments,
-    _candidate_relations,
     _selector,
 )
 from process.network_address_projection import _identifier
@@ -23,10 +22,8 @@ from process.network_approved_source_bindings import (
     APPROVED_NETWORK_BINDINGS_SQL,
     require_retained_approved_network_source_bindings,
 )
-from process.network_compact_layout import CompactAddressRelation
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource, fhir_normalized_capture
 from process.network_membership_candidate_lifecycle import _control_namespace
-from process.network_read_identity import NetworkReadIdentityError, verify_consumed_network_relations
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
 from process.registry_source_contribution_artifacts import authenticate_anchored_source_fact_metadata
 from process.registry_source_contribution_store import (
@@ -96,22 +93,16 @@ def _binding_scope(source):
 
 
 async def _source_candidate(connection, current, control_schema):
-    from process.network_candidate_custody import read_network_control_relation_pins
-
     namespace = _control_namespace(control_schema)
-    relations = await read_network_control_relation_pins(
-        connection, ("network_membership_candidate",), control_schema=namespace[1:-1]
-    )
-    pid = connection.get_server_pid()
     candidate = await connection.fetchrow(
         f"""SELECT CASE WHEN octet_length(source_recipes_json::text)<=$2 THEN source_recipes_json::text END
           AS source_recipes_json,source_generations::text,
           CASE WHEN octet_length(validation_json::text)<=$2 THEN validation_json::text END AS validation_json
-          FROM ONLY {namespace}.network_membership_candidate WHERE candidate_id=$1 AND state='published'""",
+          FROM ONLY {namespace}.network_membership_candidate WHERE candidate_id=$1 AND schema_name=$3 AND state='published'""",
         UUID(current.candidate_id),
         MAX_SOURCE_RECIPE_INPUT_BYTES,
+        current.schema_name,
     )
-    await verify_consumed_network_relations(connection, relations, expected_backend_pid=pid)
     return None if candidate is None else dict(candidate)
 
 
@@ -124,7 +115,7 @@ async def _approved_mapping(connection, current, control_schema):
     return approved, relation
 
 
-async def _source_bindings(connection, current, control_schema, *, candidate=None, read_relations=None):
+async def _source_bindings(connection, current, control_schema, *, candidate=None):
     """Validate every complete historical recipe scope before using its bindings."""
     if SUMMARY_KEY not in current.source_generations:
         raise NetworkProviderReadUnavailable("Pinned provider-only source evidence is unavailable")
@@ -142,8 +133,6 @@ async def _source_bindings(connection, current, control_schema, *, candidate=Non
     if not recipes:
         raise NetworkProviderReadUnavailable("Pinned provider-only source evidence is unavailable")
     approved, approved_relation = await _approved_mapping(connection, current, control_schema)
-    if read_relations is not None:
-        read_relations.append(approved_relation)
     fragments, selected, arguments = [], [], []
     parameters_by_recipe = {}
     for index, recipe in enumerate(recipes):
@@ -152,7 +141,6 @@ async def _source_bindings(connection, current, control_schema, *, candidate=Non
             approved,
             recipe.binding_coordinates,
             control_schema=control_schema,
-            read_identity=(approved_relation, connection.get_server_pid()),
         )
         fragment = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=namespace)
         fragment = re.sub(r"\$(\d+)", lambda match: "$" + str(int(match[1]) + len(arguments)), fragment)
@@ -174,14 +162,12 @@ async def _source_bindings(connection, current, control_schema, *, candidate=Non
                 else ""
             )
         )
-    facts = await _fact_relations(
-        connection, current, receipt, parameters_by_recipe, namespace[1:-1], read_relations=read_relations
-    )
+    facts = await _fact_relations(connection, current, receipt, parameters_by_recipe, namespace[1:-1])
     fragments.append("provider_facts AS NOT MATERIALIZED (" + facts + ")")
     return fragments, selected, arguments
 
 
-async def _fact_relations(connection, current, receipt, parameters_by_recipe, control_schema, *, read_relations=None):
+async def _fact_relations(connection, current, receipt, parameters_by_recipe, control_schema):
     """Authenticate original fact owners and select only their explicit provider subset."""
     anchors = await authenticate_anchored_source_fact_metadata(
         connection, receipt["sources"], control_schema=control_schema, api_read=True
@@ -195,15 +181,6 @@ async def _fact_relations(connection, current, receipt, parameters_by_recipe, co
             if artifact is not None
             else (_identifier(current.schema_name) + ".network_source_contribution")
         )
-        if read_relations is not None:
-            pin = (
-                CompactAddressRelation(
-                    artifact.schema_name, "network_source_contribution", artifact.reference.fact_table_oid
-                )
-                if artifact is not None
-                else _candidate_relations(current, ("network_source_contribution",))[0]
-            )
-            read_relations.append(pin)
         parameters_by_relation.setdefault(relation, []).append(parameters_by_recipe[recipe_sha256])
     return " UNION ALL ".join(
         "SELECT recipe_sha256,fact_json FROM ONLY "
@@ -231,28 +208,21 @@ def _query(current, bindings, selected, arguments):
     )
 
 
-async def _page_query(connection, current, control_schema, *, read_relations=None):
+async def _page_query(connection, current, control_schema):
     from process.registry_source_inventory_reference import verify_source_recipe_metadata
 
     candidate = await _source_candidate(connection, current, control_schema)
     metadata = verify_source_recipe_metadata(candidate)
     if metadata.inventory is None:
-        bindings, selected, arguments = await _source_bindings(
-            connection, current, control_schema, candidate=candidate, read_relations=read_relations
-        )
+        bindings, selected, arguments = await _source_bindings(connection, current, control_schema, candidate=candidate)
         return _query(current, bindings, selected, arguments), arguments
     generations = candidate["source_generations"]
     if type(generations) is str:
         generations = json.loads(generations)
     if generations != current.source_generations:
-        raise NetworkProviderReadUnavailable("Pinned provider-only source generations differ")
+        raise NetworkProviderReadUnavailable("Pinned provider-only source generation differs")
     verify_registry_source_contributions(candidate)
     approved, approved_relation = await _approved_mapping(connection, current, control_schema)
-    if read_relations is not None:
-        read_relations.extend(
-            _candidate_relations(current, ("network_provider_only_evidence", "network_source_inventory"))
-        )
-        read_relations.append(approved_relation)
     from process.network_provider_only_projection import provider_only_page_sql
 
     return provider_only_page_sql(current.schema_name, control_schema=control_schema), [approved.approved_revision]
@@ -349,11 +319,7 @@ async def read_network_provider_only_page(connection, scope, *, limit=50, offset
         )
         if current != scope.manifest:
             raise NetworkProviderReadUnavailable("Canonical provider generation differs from the pinned scope")
-        relations = []
-        query, arguments = await _page_query(connection, current, control_schema, read_relations=relations)
-        if not relations:
-            raise NetworkProviderReadUnavailable("Pinned provider-only physical relations are unavailable")
-        pid = connection.get_server_pid()
+        query, arguments = await _page_query(connection, current, control_schema)
         receipt = await connection.fetchrow(
             query,
             *arguments,
@@ -364,13 +330,11 @@ async def read_network_provider_only_page(connection, scope, *, limit=50, offset
             MAX_RESPONSE_BYTES,
             current.generation_id,
         )
-        await verify_consumed_network_relations(connection, tuple(relations), expected_backend_pid=pid)
         return _result(receipt, scope, limit, offset)
     except NetworkProviderReadError:
         raise
     except (
         NetworkServingReadUnavailable,
-        NetworkReadIdentityError,
         asyncpg.PostgresError,
         ValueError,
         TypeError,

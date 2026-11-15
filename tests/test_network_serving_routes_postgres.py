@@ -148,6 +148,8 @@ async def _next_full_candidate(fixture):
         )
         await _prepare(next_fixture)
     await _freeze_fixture(next_fixture)
+    # Publication needs the recorded final validation of the configured preparation step.
+    await fixture.seal_candidate(copy_target)
     return next_fixture
 
 
@@ -264,7 +266,6 @@ async def test_control_auth_and_invalid_inputs_precede_native_reads(manifest_app
         "digest",
         "source",
         "custom",
-        "physical_oid",
         "catalog_permission",
     ),
 )
@@ -287,14 +288,6 @@ async def test_native_unavailability_is_sanitized_and_never_falls_back(manifest_
             await fixture.connection.execute(
                 f"UPDATE {namespace}.network_serving_manifest SET {changes_by_name[damage]}"
             )
-        case "physical_oid":
-            report_by_name = json.loads(
-                await fixture.connection.fetchval(
-                    f"SELECT validation_json FROM {namespace}.network_membership_candidate"
-                )
-            )
-            report_by_name["writer_closure"]["relation_oids"]["entity_address_unified"] = 1
-            await _write_report(fixture, report_by_name)
         case _:
             await fixture.connection.execute(
                 f'REVOKE SELECT ON {namespace}.network_serving_manifest FROM "{fixture.writer_roles["reader"]}"'

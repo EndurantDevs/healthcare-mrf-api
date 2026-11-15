@@ -368,15 +368,30 @@ async def test_retained_runner_uses_pinned_prepare_publish_and_closes(monkeypatc
     fhir._upsert_resource_rows.assert_not_awaited()
 
 
-def _published_outputs(*, run_id="earlier-repair", oid_offset=0):
+def _replay_output_relation(target, name):
+    """Describe portable layout in a unit double; native full-model parity is tested separately."""
+    from process.provider_directory_output_snapshot_catalog import encoded
+    from process.provider_directory_output_snapshot_custody import NativeOutputRelation
+
+    return NativeOutputRelation(
+        schema="source_schema",
+        target=target,
+        relation=name,
+        columns=(encoded({"name": "key", "type": "text", "required": True}),),
+        constraints=(encoded({"type": "p", "keys": [1]}),),
+        indexes=(encoded({"primary": True, "unique": True, "method": "btree", "keys": ["key"]}),),
+        table=encoded({"kind": "r", "persistence": "p"}),
+    )
+
+
+def _published_outputs(*, run_id="earlier-repair"):
     """Build structurally authentic receipts with the existing checkpoint protocol."""
     from process import provider_directory_dataset_rehydrate_journal as protocol
     from process.provider_directory_dataset_rehydrate_pages import _key_columns
-    from process.provider_directory_output_snapshot_catalog import output_models
+    from process.provider_directory_output_snapshot_catalog import encoded, output_models
     from process.provider_directory_output_snapshot_custody import PreparedOutputReceipt, _operation_digest
     from process.provider_directory_output_snapshot_retention import RetainedOutputReceipt, retained_name
-    from process.provider_directory_output_snapshot_stage import OutputStage
-    from tests.test_provider_directory_output_snapshot_retention import relation
+    from process.provider_directory_output_snapshot_stage import OutputStage, _descriptor
 
     scope, _ = _retained_scope()
     operation_by_field = dict(
@@ -394,10 +409,11 @@ def _published_outputs(*, run_id="earlier-repair", oid_offset=0):
     )
     retained_receipts = []
     for index, target_name in enumerate(output_targets):
-        incumbent = relation(target_name, target_name, 101 + index + oid_offset)
-        successor = relation(target_name, "isolated_" + str(index), 201 + index + oid_offset)
-        stage = OutputStage(incumbent.schema, target_name, successor.relation, successor.oid, digest, incumbent)
-        receipt = PreparedOutputReceipt(1, digest, incumbent, successor)
+        incumbent = _replay_output_relation(target_name, target_name)
+        successor = _replay_output_relation(target_name, "isolated_" + str(index))
+        stage = OutputStage(incumbent.schema, target_name, successor.relation, None, digest, incumbent)
+        successor = replace(successor, descriptor=encoded(_descriptor(stage, "sealed")))
+        receipt = PreparedOutputReceipt(2, digest, incumbent, successor)
         journal_by_field = protocol.record_stage(
             journal_by_field,
             stage,
@@ -407,12 +423,12 @@ def _published_outputs(*, run_id="earlier-repair", oid_offset=0):
         )
         retained_receipts.append(
             RetainedOutputReceipt(
-                1,
+                2,
                 digest,
                 incumbent.schema,
                 target_name,
-                retained_name(incumbent.oid),
-                replace(incumbent, relation=retained_name(incumbent.oid)),
+                retained_name(digest, target_name),
+                replace(incumbent, relation=retained_name(digest, target_name)),
                 replace(successor, relation=target_name),
             )
         )
@@ -441,7 +457,7 @@ async def test_completed_repair_replay_checks_native_receipts_without_mutating(m
 
     actual_by_name = {proof.relation: proof for receipt in receipts for proof in (receipt.incumbent, receipt.successor)}
     if native_damage == "index":
-        first = receipts[0].successor
+        first = receipts[0].incumbent
         actual_by_name[first.relation] = replace(first, indexes=())
     monkeypatch.setattr(custody, "output_snapshot_transaction", transaction)
     monkeypatch.setattr(
@@ -499,7 +515,7 @@ async def test_completed_replay_skips_older_native_generations(monkeypatch):
     from process import provider_directory_output_snapshot_custody as custody
 
     old_intent, old_history, _ = _published_outputs()
-    current_intent, current_history, receipts = _published_outputs(run_id="later-repair", oid_offset=1000)
+    current_intent, current_history, receipts = _published_outputs(run_id="later-repair")
     history_by_field = {
         **current_history,
         "generations": {**old_history["generations"], **current_history["generations"]},

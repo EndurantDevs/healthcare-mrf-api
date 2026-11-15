@@ -4,7 +4,7 @@
 import json
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, create_autospec
 
 import pytest
 from sanic.exceptions import BadRequest
@@ -42,12 +42,12 @@ def test_physical_identity_serializes_complete_binding_without_mutating_it():
     document = physical_identity(_tables(physical_binding=binding))
     assert json.loads(json.dumps(document)) == document
     assert document["dataset_id"] == str(binding.dataset_id)
-    assert document["relation_oids"] == [list(pair) for pair in binding.relation_oids]
-    assert document["sequence_oids"] == [list(entry) for entry in binding.sequence_oids]
+    assert document["relations"] == [list(pair) for pair in binding.relations]
+    assert document["sequences"] == [list(entry) for entry in binding.sequences]
     assert document["payload_snapshot_key"] == binding.payload_snapshot_key
     assert document["destination_layout_key"] == binding.destination_layout_key
-    document["relation_oids"][0][1] += 1
-    assert binding.relation_oids == _binding().relation_oids
+    document["relations"][0][1] = "changed"
+    assert binding.relations == _binding().relations
 
 
 @pytest.mark.parametrize(
@@ -65,7 +65,7 @@ def test_source_selectors_and_graph_contract_must_match(monkeypatch, changes):
 def test_supplied_descriptor_cannot_substitute_physical_custody(monkeypatch, kind):
     actual, expected = _tables(), _tables()
     if kind == "physical":
-        expected.physical_binding = replace(_binding(), owner_oid=999)
+        expected.physical_binding = replace(_binding(), payload_snapshot_id="another_payload")
     elif kind == "key":
         expected.shared_snapshot_key = 20
     else:
@@ -108,7 +108,8 @@ async def test_incomplete_source_inventory_never_uses_an_audit_attestation(rows)
 
 @pytest.mark.asyncio
 async def test_checked_attachment_is_reused_within_one_request_only(monkeypatch):
-    resolve, locate = AsyncMock(return_value=(None, None, PARAMS)), AsyncMock(return_value=object())
+    resolve = create_autospec(reader.source_identity, return_value=(None, None, PARAMS))
+    locate = create_autospec(reader.locate, return_value=object())
     monkeypatch.setattr(reader, "source_identity", resolve)
     monkeypatch.setattr(reader, "locate", locate)
     session, tables, request = object(), _tables(), _request()
@@ -189,3 +190,19 @@ async def test_import_admission_validates_closed_membership_params_before_writes
         await control_imports.create_import_run(dict(importer=IMPORTER, params=PARAMS | {"schema": "other"}))
     admit.assert_not_awaited()
     enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unindexed_code_request_keeps_graph_fallback_with_real_helper_signatures(monkeypatch):
+    """Autospec mocks bind the actual helper signatures; an absent index returns None for the graph path."""
+    resolve = create_autospec(reader.source_identity, return_value=(None, None, PARAMS))
+    locate = create_autospec(reader.locate, return_value=None)
+    monkeypatch.setattr(reader, "source_identity", resolve)
+    monkeypatch.setattr(reader, "locate", locate)
+    pairs = AsyncMock()
+    monkeypatch.setattr(reader, "_membership_pairs", pairs)
+    state = serving._LocalDistanceGraphState()
+    assert await reader.indexed_memberships(object(), _tables(), (1000000001,), _request(), state) is None
+    assert state.membership_index_checked is True and state.membership_index is None
+    locate.assert_awaited_once()
+    pairs.assert_not_awaited()

@@ -537,20 +537,54 @@ async def test_affected_lock_envelope_refuses_before_transaction(admitted_window
     assert admission.wal_tracker.unresolved_window
 
 
+def _affected_named_stage_fixture(build, geometry):
+    """Bind the complete durable checkpoint to the actual plan and named numeric stage."""
+    from tests.test_provider_directory_profile_delta_coverage_edges_08 import _named_stage_checkpoint
+
+    lineage_by_field = {
+        "current_source_vector_hash": geometry.current_source_vector_hash,
+        "desired_source_vector_hash": geometry.desired_source_vector_hash,
+        "current_source_context_vector_hash": geometry.current_context_vector_hash,
+        "desired_source_context_vector_hash": geometry.desired_context_vector_hash,
+    }
+    build = replace(build, **lineage_by_field)
+    build = replace(build, batch_plan=fhir._provider_directory_profile_build_plan(build, has_existing_artifacts=False))
+    checkpoint_by_field = {
+        **_named_stage_checkpoint(build),
+        **lineage_by_field,
+        "refresh_source_ids": list(build.source_ids),
+    }
+    layout = fhir._ProviderDirectoryProfileCapacityLayout(
+        schema_name=build.schema,
+        relation_name=build.affected_npi_stage,
+        relation_oid=17,
+        toast_oid=None,
+        main_index_oids=(18,),
+        main_index_pages=(1,),
+        toast_index_oids=(),
+        toast_index_pages=(),
+        toastable_columns=(),
+    )
+    return build, checkpoint_by_field, layout
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [None, "storage", "projection", "insert", "cancel", "deadline"])
 async def test_affected_reserve_precedes_lock_and_retains_failure_charge(admitted_window, monkeypatch, failure):
+    """Reserve the complete charge before checkpoint/name validation and retain uncertain spend."""
     admission, state, build, events = _affected_payload_setup(admitted_window, monkeypatch, 73728)
+    build, checkpoint_by_field, layout = _affected_named_stage_fixture(build, admission.geometry)
+    stage_layout = AsyncMock(return_value=layout)
 
     async def checkpoint_first(sql, **parameters):
         if "FOR SHARE" in sql:
             assert sum(admission.wal_tracker.pending_control_wal_bytes.values()) == 73728
             events.append("checkpoint_lock")
-            return {"affected_npi_stage_oid": 17, "affected_npi_stage_storage_fingerprint": "f" * 64}
+            return checkpoint_by_field
         return {"projected_rows": 0, "projected_logical_bytes": 0}
 
     monkeypatch.setattr(fhir.db, "first", checkpoint_first)
-    monkeypatch.setattr(fhir, "_provider_directory_profile_stage_storage_fingerprint", AsyncMock(return_value="f" * 64))
+    monkeypatch.setattr(fhir, "_provider_directory_profile_stage_layout", stage_layout)
 
     async def storage(*args, **kwargs):
         assert fhir._PROFILE_CAPACITY_MUTATION_WINDOW.get()[1] == "affected_npi_stage"
@@ -577,7 +611,10 @@ async def test_affected_reserve_precedes_lock_and_retains_failure_charge(admitte
         build, projection_sql="SELECT projection", insert_sql="INSERT", params={}
     )
     if failure:
-        with pytest.raises(asyncio.CancelledError if failure == "cancel" else RuntimeError):
+        expected = (
+            None if failure == "cancel" else ("deadline_reached" if failure == "deadline" else failure + "_failed")
+        )
+        with pytest.raises(asyncio.CancelledError if failure == "cancel" else RuntimeError, match=expected):
             await invocation
         assert sum(admission.wal_tracker.pending_control_wal_bytes.values()) == 73728
         assert admission.wal_tracker.unresolved_window
@@ -586,4 +623,5 @@ async def test_affected_reserve_precedes_lock_and_retains_failure_charge(admitte
         assert not admission.wal_tracker.pending_control_wal_bytes
         assert not admission.wal_tracker.unresolved_window
     assert events[:2] == ["transaction", "checkpoint_lock"]
+    stage_layout.assert_awaited_once_with(build.schema, build.affected_npi_stage, lock_relation=True)
     assert admission.wal_tracker.accounted_control_operation_counts == {"affected_npi_payload": 1}

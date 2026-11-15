@@ -25,7 +25,7 @@ async def test_predecessor_create_uses_original_publisher_only_for_doctors(monke
     incumbent = SimpleNamespace(schema_name="current", relation_oids=(("a", 1), ("b", 2), ("c", 3)))
     body_events = []
     reads = AsyncMock()
-    writer = AsyncMock(return_value=19)
+    writer = AsyncMock()
     driver = object()
     monkeypatch.setattr(access, "preserve_publication_reads", reads)
     monkeypatch.setattr(immutable, "_archive_writer", writer)
@@ -51,7 +51,6 @@ async def test_predecessor_create_uses_original_publisher_only_for_doctors(monke
                 live_table=name,
                 stage_schema="incoming",
                 stage_table=name,
-                expected_stage_owner_oid=19,
             )
             for name in spec.table_names
         ]

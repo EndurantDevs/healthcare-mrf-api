@@ -156,9 +156,9 @@ async def test_scope_and_loading_refuse_before_data_copy(copies, monkeypatch, ch
     if change == "handoff":
         copies.workspace._binding["handoff_sha256"] = "0" * 64
     elif change == "alias":
-        copies.workspace._receipts[derived.DERIVED_ROOTS[0]]["oid"] = copies.workspace._inputs["frozen_inventory"][
+        copies.workspace._receipts[derived.DERIVED_ROOTS[0]]["name"] = copies.workspace._inputs["frozen_inventory"][
             "relations"
-        ][0]["relation_oid"]
+        ][0]["relation_name"]
     elif change == "frozen":
         monkeypatch.setattr(derived.context, "_observe", AsyncMock(return_value={}))
     else:

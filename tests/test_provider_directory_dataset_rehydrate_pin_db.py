@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from db.connection import Database
 from db.models import (
@@ -135,7 +136,6 @@ async def _case(monkeypatch):
     await admin.connect()
     assert "test" in str(await admin.scalar("SELECT current_database()"))
     await admin.status(f'CREATE SCHEMA "{schema}"')
-    oid = await admin.scalar("SELECT to_regnamespace(:name)::oid", name=schema)
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     try:
         async with native_source_component(admin.engine, schema, monkeypatch) as case:
@@ -150,7 +150,6 @@ async def _case(monkeypatch):
             case.request = RehydrationRequest("source", "dataset", "root", "repair")
             yield case
     finally:
-        assert await admin.scalar("SELECT to_regnamespace(:name)::oid", name=schema) == oid
         await admin.status(f'DROP SCHEMA "{schema}" CASCADE')
         assert await admin.scalar("SELECT to_regnamespace(:name)", name=schema) is None
         await admin.disconnect()
@@ -166,11 +165,18 @@ async def _drop_probe(case, should_lock):
             await connection.execute(text(f'LOCK TABLE "{case.schema}"."{table}" IN ACCESS EXCLUSIVE MODE NOWAIT'))
 
 
+async def _assert_native_reader_denials(pinned):
+    """Native read-only transactions and grants reject actual source DML and DDL."""
+    relation = pinned.source_relation(fhir)
+    for statement in (f"DELETE FROM {relation} WHERE FALSE", f"ALTER TABLE {relation} ADD forbidden_column integer"):
+        with pytest.raises(DBAPIError, match="read-only|permission denied|must be owner"):
+            async with pinned.reader._session.begin_nested():
+                await pinned.reader.scalar(statement)
+
+
 async def test_native_original_reader_pins_without_binding_factory(monkeypatch):
     async with _case(monkeypatch) as case:
         async with pin.pinned_current_source(case.runtime, case.request, directory=fhir) as pinned:
-            reader_pid = await pinned.reader.scalar("SELECT pg_backend_pid()")
-            assert await pinned.reader.scalar("SELECT current_user") == case.reader
             assert await pinned.reader.scalar("SHOW transaction_read_only") == "on"
             assert await pinned.reader.scalar("SHOW transaction_isolation") == "repeatable read"
             assert not case.database.has_reader_session() and case.database._transaction_binding() is None
@@ -178,24 +184,25 @@ async def test_native_original_reader_pins_without_binding_factory(monkeypatch):
             relation = pinned.reader.relation(storage.RESOURCE)
             assert await pinned.reader.scalar(f"SELECT count(*) FROM {relation}") == 1
             async with source_transaction(case.database, isolation="read committed"):
-                assert await case.database.scalar("SELECT pg_backend_pid()") != reader_pid
                 await case.database.status(
                     f"UPDATE \"{case.schema}\".provider_directory_endpoint_dataset SET resource_count=resource_count WHERE dataset_id='dataset'"
                 )
+            await _assert_native_reader_denials(pinned)
             await _drop_probe(case, True)
         await _drop_probe(case, False)
-        with pytest.raises(DatasetRehydrationError, match="reader_owner_changed"):
+        with pytest.raises(DatasetRehydrationError, match="reader_transaction_ended"):
             await pinned.reader.scalar("SELECT 1")
 
 
-@pytest.mark.parametrize("mutation", ["oid", "layout_sha256", "owner", "missing", "source", "root", "hash"])
-async def test_native_pin_rejects_substituted_receipt_or_source(monkeypatch, mutation):
+@pytest.mark.parametrize("mutation", ["table_name", "column", "select_right", "incomplete", "source", "root", "hash"])
+async def test_native_pin_rejects_invalid_names_data_access_or_source(monkeypatch, mutation):
     async with _case(monkeypatch) as case:
         binding = case.binding
-        if mutation == "missing":
-            encoded_binding = None
-        elif mutation in {"oid", "layout_sha256", "owner"}:
-            binding["tables"][storage.RESOURCE][mutation] = "f" * 64 if mutation == "layout_sha256" else 123
+        table = binding["tables"][storage.RESOURCE]["name"]
+        if mutation == "incomplete":
+            encoded_binding = storage._encoded({})
+        elif mutation == "table_name":
+            binding["tables"][storage.RESOURCE]["name"] = "missing_resource"
             encoded_binding = storage._encoded(binding)
         else:
             encoded_binding = storage._encoded(binding)
@@ -220,9 +227,20 @@ async def test_native_pin_rejects_substituted_receipt_or_source(monkeypatch, mut
                         f"UPDATE \"{case.schema}\".provider_directory_source SET canonical_api_base='https://other.test/fhir'"
                     )
                 )
-        with pytest.raises((DatasetRehydrationError, GenericCandidateError)):
-            async with pin.pinned_current_source(case.runtime, case.request, directory=fhir):
+            if mutation == "column":
+                await connection.execute(
+                    text(
+                        f'ALTER TABLE "{case.schema}"."{storage.RESOURCE}" RENAME COLUMN payload_json TO incompatible_payload'
+                    )
+                )
+            if mutation == "select_right":
+                await connection.execute(text(f'REVOKE SELECT ON "{case.schema}"."{table}" FROM "{case.reader}"'))
+        with pytest.raises((DatasetRehydrationError, GenericCandidateError, DBAPIError)):
+            async with pin.pinned_current_source(case.runtime, case.request, directory=fhir) as pinned:
+                await pinned.reader.all(f"SELECT payload_json FROM {pinned.source_relation(fhir)}")
                 pytest.fail("unsafe source admitted")
+        # The deliberately missing name is a document error, not the real retained table.
+        binding["tables"][storage.RESOURCE]["name"] = table
         await _drop_probe(case, False)
 
 
@@ -230,8 +248,7 @@ async def test_native_pin_child_task_and_caught_error_release(monkeypatch):
     async with _case(monkeypatch) as case:
         with pytest.raises(RuntimeError, match="late failure"):
             async with pin.pinned_current_source(case.runtime, case.request, directory=fhir) as pinned:
-                with pytest.raises(DatasetRehydrationError, match="reader_owner_changed"):
-                    await asyncio.create_task(pinned.reader.scalar("SELECT 1"))
+                assert await asyncio.create_task(pinned.reader.scalar("SELECT 1")) == 1
                 raise RuntimeError("late failure")
         await _drop_probe(case, False)
 
@@ -254,12 +271,26 @@ async def test_native_pin_cancellation_releases_original_reader(monkeypatch):
         await _drop_probe(case, False)
 
 
-@pytest.mark.parametrize("mode", ["wrong_actor", "read_committed", "read_write"])
-async def test_native_pin_rejects_wrong_reader_pool(monkeypatch, mode):
+async def _assert_configured_pin(case, mode):
+    """Permit native read rights while refusing modes that break immutable snapshots."""
+    if mode == "alternate_principal":
+        async with pin.pinned_current_source(case.runtime, case.request, directory=fhir) as pinned:
+            assert await pinned.reader.scalar(f"SELECT count(*) FROM {pinned.source_relation(fhir)}") == 1
+            await _assert_native_reader_denials(pinned)
+            await _drop_probe(case, True)
+    else:
+        with pytest.raises(DatasetRehydrationError, match="reader_transaction_changed"):
+            async with pin.pinned_current_source(case.runtime, case.request, directory=fhir):
+                pytest.fail("unstable writable snapshot admitted")
+    await _drop_probe(case, False)
+
+
+@pytest.mark.parametrize("mode", ["alternate_principal", "read_committed", "read_write"])
+async def test_native_pin_preserves_read_modes_with_native_principals(monkeypatch, mode):
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     async with _case(monkeypatch) as case:
-        user = case.publisher if mode == "wrong_actor" else case.reader
+        user = case.publisher if mode == "alternate_principal" else case.reader
         engine = create_async_engine(
             case.admin.engine.url.set(username=user, password=None),
             isolation_level="READ COMMITTED" if mode == "read_committed" else "REPEATABLE READ",
@@ -273,29 +304,48 @@ async def test_native_pin_rejects_wrong_reader_pool(monkeypatch, mode):
 
         monkeypatch.setattr(case.database, "_connect_reader", substitute)
         try:
-            with pytest.raises(DatasetRehydrationError, match="reader_(identity|transaction)_changed"):
-                async with pin.pinned_current_source(case.runtime, case.request, directory=fhir):
-                    pytest.fail("incorrect Reader admitted")
-            await _drop_probe(case, False)
+            await _assert_configured_pin(case, mode)
         finally:
             await engine.dispose()
 
 
-async def test_native_pin_rechecks_layout_after_authentication(monkeypatch):
+async def test_native_pin_accepts_benign_index_and_opaque_legacy_metadata(monkeypatch):
     async with _case(monkeypatch) as case:
         original = pin._capture_source
+        saved_binding_by_field = {**case.binding, "database_oid": None}
+        saved_binding_by_field["tables"] = {
+            root: {**table, "oid": False, "owner": "opaque", "layout_sha256": None}
+            for root, table in case.binding["tables"].items()
+        }
+        async with case.admin.engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f'UPDATE "{case.schema}".provider_directory_endpoint_dataset SET candidate_storage_json=CAST(:binding AS jsonb)'
+                ),
+                {"binding": storage._encoded(saved_binding_by_field)},
+            )
 
-        async def substitute(runtime, request):
+        async def add_index(runtime, request):
             captured = await original(runtime, request)
             table = case.binding["tables"][storage.RESOURCE]["name"]
             async with case.admin.engine.begin() as connection:
-                await connection.execute(text(f'CREATE INDEX substituted ON "{case.schema}"."{table}" (payload_hash)'))
+                await connection.execute(
+                    text(f'CREATE INDEX additional_lookup ON "{case.schema}"."{table}" (payload_hash)')
+                )
             return captured
 
-        monkeypatch.setattr(pin, "_capture_source", substitute)
-        with pytest.raises(GenericCandidateError, match="storage_binding_changed"):
-            async with pin.pinned_current_source(case.runtime, case.request, directory=fhir):
-                pytest.fail("substituted child admitted")
+        monkeypatch.setattr(pin, "_capture_source", add_index)
+        async with pin.pinned_current_source(case.runtime, case.request, directory=fhir) as pinned:
+            assert await pinned.reader.all(f"SELECT resource_id,payload_json FROM {pinned.source_relation(fhir)}") == [
+                ("location", {"resource_id": "location"})
+            ]
+            await _drop_probe(case, True)
+        assert (
+            await case.admin.scalar(
+                f'SELECT candidate_storage_json FROM "{case.schema}".provider_directory_endpoint_dataset'
+            )
+            == saved_binding_by_field
+        )
         await _drop_probe(case, False)
 
 

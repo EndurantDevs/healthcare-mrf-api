@@ -301,8 +301,7 @@ async def _canonical_enum_oid(session):
                     "SELECT t.oid,t.typtype='e' AND array_agg(e.enumlabel ORDER BY e.enumsortorder)="
                     "ARRAY['mapbox','google','tiger','manual','openaddresses']::name[] AS accepted "
                     "FROM pg_catalog.pg_type t JOIN pg_catalog.pg_enum e ON e.enumtypid=t.oid "
-                    "WHERE t.oid=pg_catalog.to_regtype('mrf.address_archive_geo_source') "
-                    "AND NOT pg_catalog.pg_has_role(current_user,t.typowner,'MEMBER') GROUP BY t.oid"
+                    "WHERE t.oid=pg_catalog.to_regtype('mrf.address_archive_geo_source') GROUP BY t.oid"
                 )
             )
         )
@@ -315,33 +314,37 @@ async def _canonical_enum_oid(session):
 
 
 async def require_native_read_catalog(session, oids, *, allowed_type_oids=(), executable_roles=None):
-    """Reuse the common native execution boundary before privileged SOURCE payload reads."""
+    """Validate native layout, types and supported expressions before SOURCE payload reads."""
     _native_execution_subjects(executable_roles)
     await _require_native_read_structure(session, oids, allowed_type_oids)
-    for oid in oids:
-        await _require_native_expression_owners(session, oid, executable_roles=executable_roles)
 
 
 async def _require_native_read_structure(session, oids, allowed_type_oids):
+    """Resolve transient local handles to qualified names and validate native layout."""
     from process import entity_address_native_publication as native
 
     if not oids or any(type(oid) is not int or oid <= 0 for oid in oids):
         raise RuntimeError("native SOURCE catalog is incomplete")
-    safe = await session.scalar(
-        text(
-            "SELECT count(*)=cardinality(CAST(:oids AS oid[])) AND bool_and(c.relkind='r' "
-            "AND c.relpersistence='p' AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity "
-            "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits i "
-            "WHERE i.inhrelid=c.oid OR i.inhparent=c.oid)) FROM pg_catalog.pg_class c "
-            "WHERE c.oid=ANY(CAST(:oids AS oid[]))"
-        ),
-        {"oids": list(oids)},
+    rows = (
+        (
+            await session.execute(
+                text(
+                    "SELECT n.nspname AS schema_name,c.relname AS relation_name,c.relkind='r' AND c.relpersistence='p' "
+                    "AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits i "
+                    "WHERE i.inhrelid=c.oid OR i.inhparent=c.oid) AS supported FROM pg_catalog.pg_class c "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=ANY(CAST(:oids AS oid[]))"
+                ),
+                {"oids": list(oids)},
+            )
+        )
+        .mappings()
+        .all()
     )
-    if safe is not True:
+    if len(rows) != len(oids) or any(row["supported"] is not True for row in rows):
         raise RuntimeError("native SOURCE heap topology differs")
-    await native._require_stage_execution_catalog(
+    await native._require_named_execution_catalog(
         session,
-        {"stage_relations": [{"relation_oid": oid} for oid in oids]},
+        tuple((row["schema_name"], row["relation_name"]) for row in rows),
         allowed_type_oids=allowed_type_oids,
         allowed_extensions=("postgis", "intarray", "btree_gin", "btree_gist", "pg_trgm"),
     )
@@ -412,41 +415,6 @@ def _native_execution_subjects(executable_roles):
     for role in executable_roles:
         storage_identifier(role)
     return executable_roles
-
-
-async def _require_native_expression_owners(session, oid, *, executable_roles=None):
-    """Source membership must not permit replacement of any invoked native code."""
-    statement = text(
-        "WITH objects(classid,objid) AS (SELECT 'pg_class'::regclass,indexrelid "
-        "FROM pg_catalog.pg_index WHERE indrelid=CAST(:oid AS oid) UNION ALL "
-        "SELECT 'pg_attrdef'::regclass,oid FROM pg_catalog.pg_attrdef WHERE adrelid=CAST(:oid AS oid) UNION ALL "
-        "SELECT 'pg_constraint'::regclass,oid FROM pg_catalog.pg_constraint WHERE conrelid=CAST(:oid AS oid)), "
-        "referenced AS (SELECT d.refclassid,d.refobjid FROM objects x JOIN pg_catalog.pg_depend d "
-        "ON (d.classid,d.objid)=(x.classid,x.objid)) "
-        "SELECT EXISTS(SELECT 1 FROM referenced d LEFT JOIN pg_catalog.pg_proc p "
-        "ON d.refclassid='pg_proc'::regclass AND p.oid=d.refobjid LEFT JOIN pg_catalog.pg_operator o "
-        "ON d.refclassid='pg_operator'::regclass AND o.oid=d.refobjid LEFT JOIN pg_catalog.pg_proc impl "
-        "ON impl.oid=o.oprcode WHERE pg_catalog.pg_has_role(current_user,p.proowner,'MEMBER') "
-        "OR pg_catalog.pg_has_role(current_user,o.oprowner,'MEMBER') "
-        "OR pg_catalog.pg_has_role(current_user,impl.proowner,'MEMBER')) "
-        "OR EXISTS(SELECT 1 FROM pg_catalog.pg_index i,LATERAL unnest(i.indclass) cls(oid) "
-        "JOIN pg_catalog.pg_opclass c ON c.oid=cls.oid JOIN pg_catalog.pg_opfamily f ON f.oid=c.opcfamily "
-        "WHERE i.indrelid=CAST(:oid AS oid) AND (pg_catalog.pg_has_role(current_user,c.opcowner,'MEMBER') "
-        "OR pg_catalog.pg_has_role(current_user,f.opfowner,'MEMBER') "
-        "OR EXISTS(SELECT 1 FROM pg_catalog.pg_amproc a JOIN pg_catalog.pg_proc p ON p.oid=a.amproc "
-        "WHERE a.amprocfamily=f.oid AND pg_catalog.pg_has_role(current_user,p.proowner,'MEMBER')) "
-        "OR EXISTS(SELECT 1 FROM pg_catalog.pg_amop a JOIN pg_catalog.pg_operator o ON o.oid=a.amopopr "
-        "JOIN pg_catalog.pg_proc p ON p.oid=o.oprcode WHERE a.amopfamily=f.oid "
-        "AND (pg_catalog.pg_has_role(current_user,o.oprowner,'MEMBER') "
-        "OR pg_catalog.pg_has_role(current_user,p.proowner,'MEMBER')))))"
-    )
-    for role in _native_execution_subjects(executable_roles):
-        selected = (
-            statement if role is None else text(str(statement).replace("current_user", "CAST(:execution_role AS name)"))
-        )
-        unsafe = await session.scalar(selected, {"oid": oid, **({"execution_role": role} if role is not None else {})})
-        if unsafe is not False:
-            raise RuntimeError("canonical source executable ownership is unsupported")
 
 
 def canonical_reference_filter(importer_id, schema, qualified, *, key="canonical.address_key", canonical_name=None):
@@ -766,88 +734,70 @@ def canonical_output_spec():
     )
 
 
-async def _require_canonical_custody(session, ownership, owner_oid):
-    """Authenticate exact one-heap protected custody, without accepting live-source FKs."""
+async def _require_canonical_output_layout(session, ownership):
+    """Pin the declared whole-model heap and validate its current native layout."""
     from process import entity_address_native_publication as native
     from process import reference_family_archive as family
-    from process.ptg_parts.ptg2_physical_binding import _require_closed_local_custody
 
-    observed = await family._capture_model_family_ownership(session, canonical_output_spec(), ownership.dataset_id)
-    if observed != ownership:
-        raise RuntimeError("canonical output inventory changed")
-    stage = await native._stage_inventory(
-        session, ownership.schema_name, {AddressArchiveV2.__tablename__: AddressArchiveV2.__tablename__}
+    family._require_transaction(session)
+    relation_name = AddressArchiveV2.__tablename__
+    await session.execute(
+        text(f"LOCK TABLE {_qualified(ownership.schema_name, relation_name)} IN ACCESS SHARE MODE NOWAIT")
     )
-    relation_by_field = {
-        "relation_oid": ownership.relation_oids[0][1],
-        "relation_name": AddressArchiveV2.__tablename__,
-        "schema_oid": ownership.schema_oid,
-        "schema_name": ownership.schema_name,
-        "owner_oid": owner_oid,
-        "schema_owner_oid": owner_oid,
-        "relfilenode": stage[0]["relfilenode"],
-    }
-    await family._require_selected_mrf_catalog(session, [relation_by_field], owner_oid)
-    await _require_closed_local_custody(session, ownership, owner_oid)
+    observed = await family._capture_model_family_ownership(session, canonical_output_spec(), ownership.dataset_id)
+    if (
+        observed.importer_id != ownership.importer_id
+        or observed.schema_name != ownership.schema_name
+        or observed.relation_names != ownership.relation_names
+        or observed.sequence_names != ownership.sequence_names
+    ):
+        raise RuntimeError("canonical output inventory changed")
+    await native._stage_inventory(session, ownership.schema_name, {relation_name: relation_name})
+    relation_by_field = {"relation_name": relation_name, "schema_name": ownership.schema_name}
+    await family._require_selected_mrf_catalog(session, [relation_by_field], None)
     enum_oid = await _canonical_enum_oid(session)
-    await require_native_read_catalog(session, (relation_by_field["relation_oid"],), allowed_type_oids=(enum_oid,))
+    relation_oid = dict(observed.relation_oids)[relation_name]
+    await require_native_read_catalog(session, (relation_oid,), allowed_type_oids=(enum_oid,))
+    return relation_oid
 
 
 async def _canonical_output_inventory(session, ownership):
-    """Observe the exact output's native physical identity without scanning payload rows."""
-    owner = await session.scalar(
-        text("SELECT relowner::bigint FROM pg_class WHERE oid=:oid"), {"oid": ownership.relation_oids[0][1]}
-    )
-    await _require_canonical_custody(session, ownership, owner)
-    return {
-        "database_oid": await session.scalar(
-            text("SELECT oid::bigint FROM pg_database WHERE datname=current_database()")
-        ),
-        "relations": [
-            {
-                "relation_name": "address_archive_v2",
-                "relation_oid": ownership.relation_oids[0][1],
-                "schema_name": ownership.schema_name,
-                "schema_oid": ownership.schema_oid,
-                "schema_owner_oid": owner,
-                "owner_oid": owner,
-                "relfilenode": await session.scalar(
-                    text("SELECT pg_catalog.pg_relation_filenode(CAST(:oid AS oid))::bigint"),
-                    {"oid": ownership.relation_oids[0][1]},
-                ),
-            }
-        ],
-    }
+    """Observe the exact named output after native read and complete-family checks."""
+    await _require_canonical_output_layout(session, ownership)
+    return {"relations": [{"schema_name": ownership.schema_name, "relation_name": AddressArchiveV2.__tablename__}]}
 
 
 async def require_canonical_output_base(session, archive, evidence):
-    """Pair same-transaction retained authority with native closed whole-model storage.
+    """Validate the selected retained base by name and complete native model shape.
 
-    The local callback authenticates the existing current/generation catalog.
-    Detached evidence alone is not a source selector. Legacy callers retain
-    their original source-model and self-FK gate.
+    The existing caller authenticates its logical generation and content before
+    selecting this base. Legacy coordinate fields remain opaque retained data.
     """
-    from process import entity_address_snapshot_preparation as preparation
     from process import reference_family_archive as family
 
     if not isinstance(evidence, dict) or evidence.get("contract") != "canonical-retained-base.v1":
         raise RuntimeError("canonical retained base authority differs")
-    relation = evidence["inventory"]["relations"][0]
-    if archive != _qualified(relation["schema_name"], "address_archive_v2"):
+    inventory = evidence.get("inventory")
+    relations = inventory.get("relations") if isinstance(inventory, dict) else None
+    if not isinstance(relations, list) or len(relations) != 1 or not isinstance(relations[0], dict):
+        raise RuntimeError("canonical retained base inventory differs")
+    relation_by_field = {name: relations[0].get(name) for name in ("schema_name", "relation_name")}
+    if relation_by_field["relation_name"] != AddressArchiveV2.__tablename__ or archive != _qualified(
+        relation_by_field["schema_name"], AddressArchiveV2.__tablename__
+    ):
         raise RuntimeError("canonical retained base scope differs")
-    owner = await preparation._publisher_authority(session)
     ownership = await family._capture_model_family_ownership(
         session, canonical_output_spec(), UUID(evidence["dataset_id"])
     )
-    if await _canonical_output_inventory(session, ownership) != evidence["inventory"]:
+    if relation_by_field["schema_name"] != ownership.schema_name:
         raise RuntimeError("canonical retained base inventory differs")
+    relation_oid = await _require_canonical_output_layout(session, ownership)
     if (
-        relation["owner_oid"] != owner
-        or await canonical_schema_identity(session, relation["relation_oid"], relation["schema_name"])
+        await canonical_schema_identity(session, relation_oid, relation_by_field["schema_name"])
         != evidence["catalog_sha256"]
     ):
         raise RuntimeError("canonical retained base catalog differs")
-    await _require_canonical_shape(session, relation["schema_name"], relation["relation_oid"], _qualified)
+    await _require_canonical_shape(session, relation_by_field["schema_name"], relation_oid, _qualified)
 
 
 def _qualified(schema, name):

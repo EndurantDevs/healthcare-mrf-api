@@ -44,7 +44,7 @@ def _retention_policy():
             "cms-dataset",
             "a" * 64,
             "release-1",
-            123,
+            {"schema": "fixture", "name": "provider_directory_dataset_resource"},
             "cms-npd",
             "2026-07-30",
         ),
@@ -63,12 +63,38 @@ def test_retention_admission_preserves_real_dto_and_historical_request():
     historical = deepcopy(raw[contract.CMS_ADMISSION_FIELD])
     assert contract.validated_cms_capacity_admission(historical) == historical
     policy = _retention_policy()
+    assert policy["source_pin"]["resource_relation"] == {
+        "schema": "fixture",
+        "name": "provider_directory_dataset_resource",
+    }
+    assert contract.validated_registry_source_retention_policy(policy) == policy
     raw[contract.CMS_ADMISSION_FIELD]["registry_source_retention"] = policy
     parsed = preflight.validated_capacity_preflight_request(raw)
     assert parsed.request_payload == raw
     assert parsed.cms_nonprofile_admission["registry_source_retention"] == policy
     policy["runtime_roles"].append("another_reader")
     assert parsed.cms_nonprofile_admission["registry_source_retention"]["runtime_roles"] == ["reader", "writer"]
+
+
+@pytest.mark.parametrize(
+    "relation",
+    [
+        None,
+        True,
+        123,
+        {},
+        {"schema": "fixture"},
+        {"schema": "another_schema", "name": "provider_directory_dataset_resource"},
+        {"schema": 'unsafe"schema', "name": "provider_directory_dataset_resource"},
+        {"schema": "fixture", "name": 'unsafe"table'},
+        {"schema": "fixture", "name": "provider_directory_dataset_resource", "extra": True},
+    ],
+)
+def test_retention_policy_rejects_malformed_qualified_resource_relation(relation):
+    policy = _retention_policy()
+    policy["source_pin"]["resource_relation"] = relation
+    with pytest.raises(preflight.ProviderDirectoryProfileCapacityPreflightError, match="retention_policy_invalid"):
+        contract.validated_registry_source_retention_policy(policy)
 
 
 @pytest.mark.parametrize(
@@ -114,7 +140,7 @@ def test_retention_policy_rejects_malformed_closed_wire(change):
             "pin-extra": (policy["source_pin"], "retained_epoch", None),
             "source": (policy["source_pin"], "source_id", "other-source"),
             "scope": (policy["binding_coordinates"], "dataset_schema", "another_schema"),
-            "oid": (policy["source_pin"], "resource_table_oid", True),
+            "oid": (policy["source_pin"], "resource_relation", True),
             "date": (policy["source_pin"], "as_of", "20260730"),
             "digest": (policy, "expected_metadata_sha256", "C" * 64),
             "raw-family": (policy, "raw_tables", policy["raw_tables"][:-1]),
@@ -148,10 +174,13 @@ def test_explicit_cms_request_preserves_exact_desired_execution(projection):
     assert request.execution.attestation.desired_profile_as_of == "2026-07-30"
     assert request.execution.attestation.desired_cms_dataset["is_current"] is False
     pair = contract.verified_cms_paired_profile_lease(request, trust=_trust(), now=VALIDATION_TIME)
-    assert pair == _verify(raw[contract.CMS_ADMISSION_FIELD]["paired_profile_lease"])
+    pair_envelope = raw[contract.CMS_ADMISSION_FIELD]["paired_profile_lease"]
+    assert pair == _verify(
+        pair_envelope, expected_capacity_geometry_hash=pair_envelope["lease"]["capacity_geometry_hash"]
+    )
 
 
-def test_real_cms_signature_binds_complete_plan_and_database():
+def test_real_cms_signature_binds_complete_plan_and_authenticated_pair():
     plan, _fence, pair = cms_plan()
     guard = cms_guard(plan)
     lease = _verify(sign_guard(guard, cms=True), expected_capacity_geometry_hash=plan.capacity_geometry_hash)
@@ -162,15 +191,12 @@ def test_real_cms_signature_binds_complete_plan_and_database():
     assert lease.signing_preflight_guard["control_plane_receipt"]["contract_id"] == contract.CMS_CONTROL_CONTRACT
     assert lease.signing_preflight_guard["healthcare_receipt"]["contract_id"] == contract.CMS_PREFLIGHT_CONTRACT
     assert lease.reservation_bytes_by_storage_class == dict(plan.reservation_bytes)
-    binding = guard["healthcare_receipt"]["database_binding"]
-    assert contract.validated_cms_database_binding(binding) == binding
-    assert set(binding) == {
-        "database_system_identifier",
-        "database_oid",
-        "database_name",
-        "tablespace_oid",
-        "tablespace_name",
-    }
+    assert "database_binding" not in guard["healthcare_receipt"]
+    assert all(
+        entry.available_bytes - entry.reserved_bytes - entry.available_after_all_reservations_bytes
+        >= pair.reservation_bytes_by_storage_class[entry.storage_class]
+        for entry in lease.storage_classes
+    )
 
 
 def _cms_task():
@@ -345,7 +371,7 @@ def test_cms_outer_signature_is_verified():
         {"environment_id": "other-environment"},
         {"attestor_id": "other-authority"},
         {"attestor_release_digest": "99" * 32},
-        {"database_oid": 16402},
+        {"active_key_id": "other-key"},
     ],
 )
 def test_pair_requires_configured_trust_pins(override):
@@ -528,33 +554,15 @@ def test_resigned_cms_chain_rejects_changed_semantics(change):
         _verify(sign_guard(guard, cms=True), expected_capacity_geometry_hash=receipt["capacity_geometry_hash"])
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("database_system_identifier", "7527713908662902215"),
-        ("database_oid", 16402),
-        ("database_name", "other_database"),
-        ("tablespace_oid", 1664),
-        ("tablespace_name", "other_tablespace"),
-    ],
-)
-def test_resigned_cms_database_binding_must_match_outer_lease(field, value):
+def test_current_cms_refuses_retired_database_authority():
     guard = cms_guard()
-    guard["healthcare_receipt"]["database_binding"][field] = value
-    rehash_guard(guard)
-    with pytest.raises(attestation.ProviderDirectoryCapacityLeaseError, match="signing_preflight_guard"):
-        _verify(
-            sign_guard(guard, cms=True),
-            expected_capacity_geometry_hash=guard["healthcare_receipt"]["capacity_geometry_hash"],
-        )
-
-
-@pytest.mark.parametrize(
-    "missing", ["database_system_identifier", "database_oid", "database_name", "tablespace_oid", "tablespace_name"]
-)
-def test_cms_database_binding_requires_all_five_fields(missing):
-    guard = cms_guard()
-    guard["healthcare_receipt"]["database_binding"].pop(missing)
+    guard["healthcare_receipt"]["database_binding"] = {
+        "database_system_identifier": "123",
+        "database_oid": 42,
+        "database_name": "retired",
+        "tablespace_oid": 1663,
+        "tablespace_name": "retired",
+    }
     rehash_guard(guard)
     with pytest.raises(attestation.ProviderDirectoryCapacityLeaseError, match="signing_preflight_guard"):
         _verify(

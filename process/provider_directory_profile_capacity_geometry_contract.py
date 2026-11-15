@@ -8,8 +8,6 @@ import datetime
 from typing import Any, Mapping
 
 from process.provider_directory_profile_capacity_types import (
-    ProviderDirectoryProfileCapacityError,
-    ProviderDirectoryProfileRelationByteCaps,
     _DATE_PATTERN,
     _HASH_PATTERN,
     _MAX_SIGNED_BIGINT,
@@ -19,13 +17,13 @@ from process.provider_directory_profile_capacity_types import (
     _SCRATCH_RELATION_NAMES,
     _SYSTEM_IDENTIFIER_PATTERN,
     _TARGET_RELATION_NAMES,
+    ProviderDirectoryProfileCapacityError,
+    ProviderDirectoryProfileRelationByteCaps,
 )
 
 
 def _error(reason: str) -> ProviderDirectoryProfileCapacityError:
-    return ProviderDirectoryProfileCapacityError(
-        f"provider_directory_profile_capacity_{reason}"
-    )
+    return ProviderDirectoryProfileCapacityError(f"provider_directory_profile_capacity_{reason}")
 
 
 def _exact_fields(
@@ -70,11 +68,7 @@ def _bounded_integer(
     maximum: int,
 ) -> int:
     field_value = value_map.get(name)
-    if (
-        not isinstance(field_value, int)
-        or isinstance(field_value, bool)
-        or not minimum <= field_value <= maximum
-    ):
+    if not isinstance(field_value, int) or isinstance(field_value, bool) or not minimum <= field_value <= maximum:
         raise _error(f"{name}_invalid")
     return field_value
 
@@ -105,10 +99,7 @@ def _database_system_identifier(
         "database_system_identifier",
         maximum_length=20,
     )
-    if (
-        not _SYSTEM_IDENTIFIER_PATTERN.fullmatch(identifier)
-        or int(identifier) > _MAX_UNSIGNED_BIGINT
-    ):
+    if not _SYSTEM_IDENTIFIER_PATTERN.fullmatch(identifier) or int(identifier) > _MAX_UNSIGNED_BIGINT:
         raise _error("database_system_identifier_invalid")
     return identifier
 
@@ -130,12 +121,73 @@ def _profile_as_of(geometry_map: Mapping[str, Any]) -> str:
     return profile_date
 
 
+def validated_capacity_relations(raw: Any, *, initial: bool = False) -> dict[str, dict[str, Any]]:
+    """Validate logical targets and numeric bounds used by batch projections."""
+    roles = {
+        "evidence_target",
+        "profile_target",
+        "build_checkpoint",
+        "serving_generation",
+        "delta_receipt",
+        "import_run",
+        "capacity_consumption",
+    }
+    if initial:
+        roles.add("initial_receipt")
+    _exact_fields(raw, frozenset(roles), name="relations")
+    relation_by_role = {}
+    coordinates = set()
+    for role in sorted(roles):
+        entry = raw[role]
+        _exact_fields(
+            entry,
+            frozenset({"schema", "name", "main_index_pages", "toast_index_pages", "toastable_column_count"}),
+            name="logical_relation",
+        )
+        coordinate_values = tuple(_exact_text(entry, field, maximum_length=63) for field in ("schema", "name"))
+        if any("\x00" in field_value for field_value in coordinate_values) or coordinate_values in coordinates:
+            raise _error("logical_relation_coordinate_invalid")
+        coordinates.add(coordinate_values)
+        pages_by_kind = {}
+        for field in ("main_index_pages", "toast_index_pages"):
+            relation_by_field = entry[field]
+            if (
+                not isinstance(relation_by_field, list)
+                or (field == "main_index_pages" and not relation_by_field)
+                or any(
+                    type(field_value) is not int or not 1 <= field_value <= _MAX_SIGNED_BIGINT
+                    for field_value in relation_by_field
+                )
+            ):
+                raise _error("logical_relation_pages_invalid")
+            pages_by_kind[field] = list(relation_by_field)
+        relation_by_role[role] = {
+            "schema": coordinate_values[0],
+            "name": coordinate_values[1],
+            **pages_by_kind,
+            "toastable_column_count": _nonnegative_bigint(entry, "toastable_column_count"),
+        }
+    return relation_by_role
+
+
+def validated_capacity_targets(raw: Any) -> dict[str, dict[str, str]]:
+    """Require two distinct, fully qualified logical publication targets."""
+    _exact_fields(raw, frozenset({"evidence", "profile"}), name="targets")
+    target_by_role = {}
+    for role, target in raw.items():
+        _exact_fields(target, frozenset({"schema", "name"}), name="target")
+        target_by_role[role] = {name: _exact_text(target, name, maximum_length=63) for name in ("schema", "name")}
+        if any("\x00" in value for value in target_by_role[role].values()):
+            raise _error("target_coordinate_invalid")
+    if target_by_role["evidence"] == target_by_role["profile"]:
+        raise _error("target_coordinate_collision")
+    return target_by_role
+
+
 def _validated_relation_cap_sequence(
     relation_maps: Any,
 ) -> tuple[ProviderDirectoryProfileRelationByteCaps, ...]:
-    if not isinstance(relation_maps, list) or len(relation_maps) != len(
-        _RELATION_NAMES
-    ):
+    if not isinstance(relation_maps, list) or len(relation_maps) != len(_RELATION_NAMES):
         raise _error("relation_byte_caps_invalid")
     return tuple(
         _validated_single_relation_cap(
@@ -164,8 +216,7 @@ def _validated_single_relation_cap(
     if relation_name != expected_name:
         raise _error("relation_order_invalid")
     cap_values_by_name = {
-        field_name: _nonnegative_bigint(relation_map, field_name)
-        for field_name in _RELATION_FIELDS - {"relation_name"}
+        field_name: _nonnegative_bigint(relation_map, field_name) for field_name in _RELATION_FIELDS - {"relation_name"}
     }
     _assert_relation_cap_shape(relation_name, cap_values_by_name)
     return ProviderDirectoryProfileRelationByteCaps(
@@ -185,18 +236,12 @@ def _assert_relation_cap_shape(
     if relation_name in _SCRATCH_RELATION_NAMES:
         if cap_values_by_name["max_scratch_bytes"] < 1:
             raise _error("scratch_relation_cap_invalid")
-        if (
-            cap_values_by_name["max_target_growth_bytes"] != 0
-            or cap_values_by_name["max_deleted_logical_bytes"] != 0
-        ):
+        if cap_values_by_name["max_target_growth_bytes"] != 0 or cap_values_by_name["max_deleted_logical_bytes"] != 0:
             raise _error("scratch_relation_target_cap_invalid")
         return
     if relation_name not in _TARGET_RELATION_NAMES:
         raise _error("relation_name_invalid")
     if cap_values_by_name["max_scratch_bytes"] != 0:
         raise _error("target_relation_scratch_cap_invalid")
-    if (
-        cap_values_by_name["max_target_growth_bytes"] < 1
-        or cap_values_by_name["max_deleted_logical_bytes"] < 1
-    ):
+    if cap_values_by_name["max_target_growth_bytes"] < 1 or cap_values_by_name["max_deleted_logical_bytes"] < 1:
         raise _error("target_relation_cap_invalid")

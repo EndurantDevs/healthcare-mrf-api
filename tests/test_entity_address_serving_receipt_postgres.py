@@ -9,9 +9,16 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from db.connection import Database
+from process import entity_address_dependency_bindings as geo_dependencies
 from process import entity_address_serving_receipt as continuity
 from process import provider_directory_cms_serving_receipt as receipts
-from tests.test_provider_directory_cms_serving_receipt_postgres import _database, _publish_initial
+from tests.test_provider_directory_cms_serving_receipt_postgres import (
+    _apply,
+    _database,
+    _install_named_serving_fixture,
+    _migration,
+    _publish_initial,
+)
 
 native = importlib.import_module("process.entity_address_unified")
 
@@ -22,10 +29,16 @@ class _Stage:
 
 
 @asynccontextmanager
-async def _ordinary_publication(monkeypatch, *, history=True):
-    async with _database(monkeypatch) as (engine, schema):
+async def _ordinary_publication(monkeypatch, *, history=True, legacy=False):
+    async with _database(monkeypatch, named=not legacy) as (engine, schema):
         initial = await _publish_initial(engine, schema) if history else None
+        if legacy:
+            async with engine.begin() as connection:
+                await _install_named_serving_fixture(connection)
         async with engine.begin() as connection:
+            for prefix in ("20260825090000", "20261004000000"):
+                await connection.run_sync(lambda sync, prefix=prefix: _apply(sync, prefix))
+            await connection.execute(text(_migration("20261115120000")._generation_statement(schema)))
             await connection.execute(
                 text(f"ALTER TABLE {schema}.address_alias_state_v1 ADD COLUMN schema_version int DEFAULT 2")
             )
@@ -44,9 +57,12 @@ async def _ordinary_publication(monkeypatch, *, history=True):
         monkeypatch.setattr(native, "db", database)
         # Geo-assurance has independent native tests; retain the actual swap, authority and receipt SQL here.
         monkeypatch.setattr(
-            native,
-            "_activate_geo_assurance_candidate_sql",
-            lambda name: f"SELECT to_regclass('{name}.entity_address_unified')::oid::bigint",
+            geo_dependencies,
+            "activate_geo_assurance_candidate_sql",
+            lambda name, *, dependency_bindings=None: (
+                f"SELECT {native.geo_projection.GEO_ASSURANCE_VERSION}::bigint "
+                f"WHERE to_regclass('{name}.entity_address_unified') IS NOT NULL"
+            ),
         )
         try:
             yield database, engine, schema, initial
@@ -55,7 +71,10 @@ async def _ordinary_publication(monkeypatch, *, history=True):
 
 
 async def _publish(database, schema):
-    context_by_field = {"address_alias_generation": 0}
+    context_by_field = {
+        "address_alias_generation": 0,
+        "geo_assurance_candidate_relation": {"schema_name": schema, "relation_name": _Stage.__tablename__},
+    }
     await native._publish_staged_entity_address_tables(
         schema, _Stage, {}, partial_support_patch=False, affected_group_table="", context=context_by_field
     )
@@ -76,15 +95,18 @@ async def _assert_incumbent(engine, schema, initial):
 async def test_ordinary_swap_advances_address_and_common_receipt_in_one_transaction(monkeypatch):
     async with _ordinary_publication(monkeypatch) as (database, engine, schema, initial):
         context = await _publish(database, schema)
+        assert context["geo_assurance_active_version"] == native.geo_projection.GEO_ASSURANCE_VERSION
+        assert context["geo_assurance_active_relation"] == {
+            "schema_name": schema,
+            "relation_name": "entity_address_unified",
+        }
         async with engine.connect() as connection:
             current = await receipts.read_current_receipt(connection, schema)
             assert current["payload"]["predecessor_receipt_id"] == initial["receipt_id"]
             assert current["payload"]["expected_incumbent"] == initial["payload"]["desired_datasets"][0]
             assert current["payload"]["address"]["local_generation"] == 2
             assert context["result_generation"]["local_generation"] == 2
-            assert (
-                current["payload"]["address"]["relation_oids"][0] != initial["payload"]["address"]["relation_oids"][0]
-            )
+            assert set(current["payload"]) == receipts._PAYLOAD_FIELDS
             for key in (
                 "cms",
                 "selection",
@@ -92,11 +114,16 @@ async def test_ordinary_swap_advances_address_and_common_receipt_in_one_transact
                 "doctors",
                 "desired_datasets",
                 "alias_generation",
-                "overlay_oid",
+                "overlay",
             ):
                 assert current["payload"][key] == initial["payload"][key]
             assert await connection.scalar(text(f"SELECT synthetic_id FROM {schema}.entity_address_unified")) == 2
-            assert await connection.scalar(text(f"SELECT synthetic_id FROM {schema}.entity_address_unified_old")) == 1
+            (retained_by_field,) = context["retained_relations"]
+            assert set(retained_by_field) == {"schema_name", "relation_name"}
+            assert retained_by_field["schema_name"] == schema
+            assert retained_by_field["relation_name"] != "entity_address_unified"
+            retained_table = f'"{retained_by_field["schema_name"]}"."{retained_by_field["relation_name"]}"'
+            assert await connection.scalar(text(f"SELECT synthetic_id FROM {retained_table}")) == 1
             assert await receipts.verify_historical_receipt(
                 connection, schema, initial["receipt_id"], initial["payload"]
             )
@@ -171,22 +198,17 @@ async def test_competing_common_or_native_writer_fails_before_swap(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_inconsistent_existing_native_history_fails_before_address_swap(monkeypatch):
-    async with _ordinary_publication(monkeypatch) as (database, engine, schema, initial):
-        async with engine.begin() as connection:
-            await connection.execute(
-                text(f"ALTER TABLE {schema}.cms_doctor_education RENAME TO cms_doctor_education_retired")
-            )
-            await connection.execute(text(f"CREATE TABLE {schema}.cms_doctor_education (synthetic_id int)"))
-        with pytest.raises(RuntimeError, match="native_authority_drift"):
-            await _publish(database, schema)
+async def test_ordinary_successor_of_a_legacy_receipt_carries_only_named_fields(monkeypatch):
+    async with _ordinary_publication(monkeypatch, legacy=True) as (database, engine, schema, initial):
+        assert "overlay_oid" in initial["payload"] and "relation_oids" in initial["payload"]["address"]
+        context = await _publish(database, schema)
         async with engine.connect() as connection:
-            assert await connection.scalar(text(f"SELECT synthetic_id FROM {schema}.entity_address_unified")) == 1
-            assert await connection.scalar(text(f"SELECT synthetic_id FROM {schema}.{_Stage.__tablename__}")) == 2
-            assert (
-                await connection.scalar(text(f"SELECT count(*) FROM {schema}.provider_directory_cms_serving_receipt"))
-                == 1
-            )
+            current = await receipts.read_current_receipt(connection, schema)
+            assert current["payload"]["predecessor_receipt_id"] == initial["receipt_id"]
+            assert set(current["payload"]) == receipts._PAYLOAD_FIELDS
+            assert current["payload"]["address"]["local_generation"] == context["result_generation"]["local_generation"]
+            for key in ("cms", "selection", "desired_datasets", "alias_generation"):
+                assert current["payload"][key] == initial["payload"][key]
             assert await receipts.verify_historical_receipt(
                 connection, schema, initial["receipt_id"], initial["payload"]
             )

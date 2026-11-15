@@ -275,15 +275,17 @@ def test_all_work_units_must_be_qualified_together(monkeypatch):
     assert scoped.work_limits() == dict(raw_address=1, address=2, first=3, priced=4, factor=5, member_cell=6)
 
 
-def test_two_membership_dependencies_cannot_reuse_a_name_for_different_relations():
+def test_duplicate_membership_names_ignore_old_numeric_tokens_and_refuse_other_schemas():
     from api.plan_pricing_code_storage import _membership_views
     from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
     identity_by_field = _zip_identity()
     source_by_field = _source()
-    source_by_field["membership"]["active_attachment"]["relation_oid"] += 1
+    source_by_field["membership"]["active_attachment"]["relation_oid"] = None
     identity_by_field["sources"].append(source_by_field)
-    with pytest.raises(PTG2ManifestArtifactError, match="identity collides"):
+    assert _membership_views(identity_by_field) == ("pm_" + "a" * 52,)
+    source_by_field["membership"]["active_attachment"]["schema_name"] = "other_schema"
+    with pytest.raises(PTG2ManifestArtifactError, match="dependency identity"):
         _membership_views(identity_by_field)
 
 

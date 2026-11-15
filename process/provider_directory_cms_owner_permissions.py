@@ -692,29 +692,3 @@ def _routine_plans(inventory, actors, administrative_owners, proof_actors, effec
             )
         )
     return sorted(planned_routines, key=lambda routine: routine["oid"])
-
-
-def plan_cms_common_owner_permissions(inventory, *, storage_binding, policy, cms_profile, source_document):
-    """Derive expected data only; genuine record loading and every execution fence remain caller-owned."""
-    profile = _authenticated(inventory, storage_binding, policy, cms_profile)
-    by_name = _roles(inventory)
-    administrative_owners = {role["oid"] for role in by_name.values() if role["rolsuper"] is True}
-    target, source_owner, publisher, publication_owner = _source_roles(
-        source_document, storage_binding, policy, by_name
-    )
-    writer = _legacy_writer(inventory, source_document, target, by_name)
-    _require(writer not in {target, source_owner, publisher}, "ordinary_writer_unbound")
-    actors = target, writer, source_owner, publisher, publication_owner
-    rows, physical, readonly = _fixed_relations(inventory, storage_binding, profile)
-    effective = _effective_relations(inventory, rows, by_name)
-    proof_actors = cms_proof_actor_oids(source_document, inventory["roles"]["roles"], namespace_owner_oid=target)
-    routine_rights = _effective_routines(inventory, by_name)
-    return dict(
-        owner_oid=target,
-        ordinary_writer_oid=writer,
-        relations=[
-            _relation_plan(row, physical[row["oid"]], row["oid"] in readonly, actors, administrative_owners, effective)
-            for row in rows
-        ],
-        routines=_routine_plans(inventory, actors, administrative_owners, proof_actors, routine_rights),
-    )

@@ -14,7 +14,6 @@ import pytest
 from process import provider_directory_rooted_graph_operator as operator
 from process import provider_directory_rooted_graph_operator_contract as contract
 
-
 OPERATION_KEY = "a" * 64
 PUBLICATION_ACQUISITION_ID = "pdrga_" + "b" * 48
 
@@ -83,9 +82,7 @@ def test_contract_error_mapping_preserves_only_closed_codes() -> None:
 async def test_registration_rejects_wrong_result_type(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    registration_module = ModuleType(
-        "process.provider_directory_rooted_graph_registration"
-    )
+    registration_module = ModuleType("process.provider_directory_rooted_graph_registration")
 
     class Result:
         pass
@@ -148,30 +145,19 @@ class _Database:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("selected", "expected_code"),
-    ((None, "missing"), (object(), "evidence")),
-)
-async def test_current_selector_rejects_absent_or_wrong_typed_root(
+async def test_unconfigured_current_selector_refuses_before_legacy_read(
     monkeypatch: pytest.MonkeyPatch,
-    selected: object | None,
-    expected_code: str,
 ) -> None:
-    selection_module = ModuleType(
-        "process.provider_directory_dataset_scoped_publication"
-    )
+    selection_module = ModuleType("process.provider_directory_dataset_scoped_publication")
     selection_module.exact_uhc_dataset_pair = lambda: object()
 
     async def lock_current(_database: Any, *, pair: object) -> object | None:
-        assert pair is not None
-        return selected
+        pytest.fail("Unconfigured rooted selection attempted a legacy publication read")
 
     selection_module.lock_exact_current_dataset = lock_current
     monkeypatch.setitem(sys.modules, selection_module.__name__, selection_module)
-
-    with pytest.raises(contract.ProviderDirectoryRootedGraphOperatorError) as caught:
+    with pytest.raises(RuntimeError, match="configured isolated generation"):
         await operator._select_exact_current_root(_Database())
-    assert caught.value.code == expected_code
 
 
 def _identities() -> SimpleNamespace:
@@ -201,9 +187,7 @@ def test_acquisition_and_admission_reject_unbound_evidence() -> None:
     assert evidence.value.code == "evidence"
 
     current = SimpleNamespace(dataset_id="root")
-    matching_receipt = SimpleNamespace(
-        candidate=SimpleNamespace(rooted_graph_sha256="4" * 64)
-    )
+    matching_receipt = SimpleNamespace(candidate=SimpleNamespace(rooted_graph_sha256="4" * 64))
 
     class Admission:
         pass
@@ -254,9 +238,7 @@ async def test_acquisition_error_taxonomy(
 
 
 def _publication_module(raised_error: BaseException | None) -> ModuleType:
-    publication_module = ModuleType(
-        "process.provider_directory_rooted_graph_publication"
-    )
+    publication_module = ModuleType("process.provider_directory_rooted_graph_publication")
 
     class Result:
         pass

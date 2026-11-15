@@ -12,7 +12,6 @@ from api.network_address_scope import (
     scoped_address_parameters,
     scoped_address_relation_sql,
 )
-from api.network_read_execution import execute_network_read
 from api.plan_release_serving import PlanReleaseServingSelection
 from api.provider_service_source_policy import admitted_plan_release_bindings
 from api.ptg2_billing_search_contract import serving_unavailable
@@ -50,7 +49,7 @@ def network_scope_sha256(selection, bindings):
         "generation_id": scope.manifest.generation_id,
         "approved_custom_revision": scope.manifest.approved_custom_revision,
         "manifest_sha256": scope.manifest.manifest_sha256,
-        "address_table_oid": scope.manifest.address_table_oid,
+        "address_relation": asdict(scope.manifest.address_relation),
         "network_ids": scope.network_ids,
         "excluded_network_ids": scope.excluded_network_ids,
         "organization_policy": asdict(scope.organization_policy),
@@ -105,8 +104,7 @@ async def _retained_lineage(session, native, location_rows):
     from api.plan_pricing_projection_contract import address_provenance_sql
 
     query = address_provenance_sql(template.replace(marker, retained), native.PTG2_SCHEMA)
-    result = await execute_network_read(
-        session,
+    result = await session.execute(
         text(query),
         {
             "location_keys": [request[0] for request in requests],

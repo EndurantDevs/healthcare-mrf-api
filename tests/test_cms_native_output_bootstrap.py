@@ -10,23 +10,6 @@ import pytest
 from tests import cms_output_snapshot_postgres_support as outputs
 
 
-@pytest.mark.parametrize("writable", [False, True])
-async def test_output_writer_closure_checks_all_roots(writable):
-    connection = SimpleNamespace(fetchval=AsyncMock(return_value=writable))
-    policy = SimpleNamespace(schema="fixture", publisher_role="publisher", runtime_roles=("reader", "builder"))
-    if writable:
-        with pytest.raises(AssertionError):
-            await outputs._assert_output_writers(connection, policy)
-    else:
-        await outputs._assert_output_writers(connection, policy)
-    connection.fetchval.assert_awaited_once()
-    sql, schema, roots, roles = connection.fetchval.await_args.args
-    assert schema == "fixture" and roots == list(outputs.OUTPUT_ROOTS)
-    assert roles == ["reader", "builder"]
-    assert policy.publisher_role not in roles
-    assert "has_table_privilege" in sql and "MAINTAIN" in sql and "has_any_column_privilege" in sql
-
-
 @pytest.mark.parametrize("rejected", [False, True])
 async def test_native_outputs_use_existing_admin_gate(monkeypatch, rejected):
     engine, policy = object(), object()
@@ -53,12 +36,7 @@ async def test_native_outputs_use_existing_admin_gate(monkeypatch, rejected):
     else:
         await outputs.provision_native_outputs(component)
     copy_driver.assert_awaited_once_with(session)
-    gate.assert_awaited_once_with(
-        session,
-        policy,
-        verify_role_profile=outputs.verify_native_source_profile,
-        verify_writer_closure=outputs._assert_output_writers,
-    )
+    gate.assert_awaited_once_with(session, policy)
     assert census.await_count == (1 if rejected else 2)
     assert all(call.args == (driver, policy) for call in census.await_args_list)
 

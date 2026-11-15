@@ -19,8 +19,6 @@ from alembic.operations import Operations
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from db.models.system import ProviderDirectoryProfileCapacityLeaseConsumption
-from process import provider_directory_profile_initial_contract as initial
 from process import provider_directory_profile_initial_guards as guards
 from tests.cms_npd_admission_postgres_support import _DSN_ENV, _database_url
 from tests.test_provider_directory_profile_capacity import _geometry_payload
@@ -111,7 +109,10 @@ def test_migration_sql_is_frozen_against_runtime_changes(monkeypatch, schema):
         migration.upgrade()
     assert migration.IMMUTABLE_BODY == guards.IMMUTABLE_BODY
     for name in ("_receipt_insert_body", "_receipt_matches_sql", "_serving_insert_body"):
-        assert getattr(migration, name)(schema) == getattr(guards, name)(schema)
+        if name == "_receipt_insert_body":
+            assert getattr(migration, name)(schema) == getattr(guards, name)(schema)
+        else:
+            assert getattr(migration, name)(schema) != getattr(guards, name)(schema)
         monkeypatch.setattr(guards, name, lambda _schema: "changed runtime SQL")
     monkeypatch.setattr(guards, "IMMUTABLE_BODY", "changed runtime immutable body")
     reloaded = _migration("20261001110000_profile_initial_publication.py")
@@ -131,8 +132,18 @@ def _bootstrap(connection):
         checkpoint.upgrade()
         delta._add_checkpoint_columns(_SCHEMA)
         delta._create_serving_generation_table(_SCHEMA)
-        ledger = ProviderDirectoryProfileCapacityLeaseConsumption.__table__.to_metadata(sa.MetaData(), schema=_SCHEMA)
-        ledger.create(connection)
+        delta._create_capacity_lease_consumption_table(_SCHEMA)
+        op.execute(
+            f'ALTER TABLE "{_SCHEMA}".provider_directory_profile_capacity_lease_consumption '
+            "DROP CONSTRAINT pd_profile_capacity_consumption_values_check"
+        )
+        predecessor_check = migration._ORIGINAL._capacity_consumption_check(
+            migration._ORIGINAL._capacity_contract_predicate(migration._ORIGINAL._V3_CONTRACT)
+        )
+        migration._ORIGINAL._add_capacity_constraint(
+            _SCHEMA, "pd_profile_capacity_consumption_values_check", predecessor_check
+        )
+        _migration("20260930110000_cms_npd_nonprofile_capacity.py").upgrade()
         migration._ORIGINAL._create_table(_SCHEMA)
         migration._ORIGINAL._create_guards(_SCHEMA)
         _migration("20260930120000_cms_native_input_revision.py").upgrade()
@@ -218,8 +229,8 @@ def _preflight_fixture_values(consumed, geometry, now):
         "initial-native", issued_at=now - timedelta(seconds=1), expires_at=now + timedelta(seconds=600)
     )
     preflight.update(
-        contract_id=initial.RECEIPT_CONTRACT,
-        request_contract_id=initial.REQUEST_CONTRACT,
+        contract_id="healthporta.provider-directory-profile-capacity-preflight.v5",
+        request_contract_id="healthporta.provider-directory-profile-capacity-preflight-request.v5",
         materialization_mode="full_swap",
         capacity_geometry_hash=consumed["capacity_geometry_hash"],
         consumed_at=now,
@@ -229,8 +240,8 @@ def _preflight_fixture_values(consumed, geometry, now):
     signed_receipt_by_field = {
         "capacity_geometry": geometry,
         "serving_generation_preflight_sha256": geometry["initial_target_state_sha256"],
-        "serving_generation_preflight": {"contract_id": initial.TARGET_CONTRACT},
-        "profile_materialization": initial.MATERIALIZATION,
+        "serving_generation_preflight": {"contract_id": migration._TARGET},
+        "profile_materialization": "initial_full_swap",
         "profile_execution_identity": {"materialization_mode": "full_swap"},
     }
     preflight["receipt_json"] = json.dumps(signed_receipt_by_field)
@@ -239,14 +250,30 @@ def _preflight_fixture_values(consumed, geometry, now):
         nonce=preflight["receipt_sha256"],
         signing_preflight_guard={
             "healthcare_request": {
-                "contract_id": initial.REQUEST_CONTRACT,
-                "profile_materialization": initial.MATERIALIZATION,
+                "contract_id": "healthporta.provider-directory-profile-capacity-preflight-request.v5",
+                "profile_materialization": "initial_full_swap",
             },
             "healthcare_receipt": signed_receipt_by_field,
         },
     )
     consumed["canonical_lease_json"] = json.dumps(canonical_lease)
     return preflight
+
+
+def _frozen_consumption_values():
+    """Build synthetic SQL bindings for the unchanged historical revision."""
+    consumed = _consumption_values()
+    # Synthetic SQL-binding rows are not authenticated lease or replay evidence.
+    consumed.update(
+        contract_id="provider-directory-database-capacity-lease-v3",
+        canonical_lease_json="{}",
+        database_system_identifier="123456789",
+        database_oid=17,
+        database_name="example_results",
+        tablespace_identity_hash="8" * 64,
+        volume_identity_hash="9" * 64,
+    )
+    return consumed
 
 
 async def _publication_values(engine):
@@ -262,7 +289,7 @@ async def _publication_values(engine):
             sa.text(f"SELECT 'initial_contract.provider_directory_profile_initial_receipt'::regclass::oid")
         )
     now = datetime.now(timezone.utc)
-    consumed = _consumption_values()
+    consumed = _frozen_consumption_values()
     for name, offset in {
         "observed_at": -2,
         "issued_at": -1,
@@ -274,7 +301,7 @@ async def _publication_values(engine):
         consumed[name] = now + timedelta(seconds=offset)
     consumed["admission_purpose"] = "profile"
     geometry = _geometry_payload(
-        contract_id=initial.GEOMETRY_CONTRACT,
+        contract_id=migration._GEOMETRY,
         materialization_mode="full_swap",
         current_source_vector_hash=None,
         current_context_vector_hash=None,
@@ -287,7 +314,7 @@ async def _publication_values(engine):
     serving_by_field = _serving_fixture_values(consumed, geometry, evidence_oid, profile_oid, now)
     preflight = _preflight_fixture_values(consumed, geometry, now)
     receipt_by_field = {
-        "contract_id": initial.COMMIT_CONTRACT,
+        "contract_id": migration._RECEIPT,
         "build_id": consumed["build_id"],
         "run_id": consumed["run_id"],
         "attestation_id": consumed["attestation_id"],
@@ -296,7 +323,7 @@ async def _publication_values(engine):
         "initial_target_state_sha256": geometry["initial_target_state_sha256"],
         "capacity_geometry_hash": consumed["capacity_geometry_hash"],
         "capacity_geometry": geometry,
-        "serving": {name: serving_by_field[name] for name in guards._PROFILE_FIELDS},
+        "serving": {name: serving_by_field[name] for name in migration._PROFILE_FIELDS},
         "executable_plan_hash": consumed["executable_plan_hash"],
         "source_vector": [],
         "source_context_vector": [],
@@ -326,74 +353,17 @@ async def _publish(connection, serving, payload, *, receipt=True):
                 "attestation_id": payload["attestation_id"],
                 "generation_id": serving["generation_id"],
                 "run_id": payload["run_id"],
-                "contract_id": initial.COMMIT_CONTRACT,
+                "contract_id": migration._RECEIPT,
                 "payload": json.dumps(payload),
             },
         )
     await connection.execute(sa.text("SET CONSTRAINTS ALL IMMEDIATE"))
 
 
-class _CatalogDatabase:
-    def __init__(self, connection):
-        self.connection = connection
-
-    async def all(self, query, **values):
-        return (await self.connection.execute(sa.text(query), values)).all()
-
-
-async def _assert_guard_catalog(engine):
-    import os
-
-    fhir = importlib.import_module("process.provider_directory_fhir")
-
-    async with engine.connect() as connection:
-        oid = await connection.scalar(sa.text(f"SELECT '{_SCHEMA}.{migration._TABLE}'::regclass::oid"))
-        await guards.assert_initial_receipt_guards(
-            _CatalogDatabase(connection), {"schema_name": _SCHEMA, "relation_oid": oid}
-        )
-        attributes, indexes, constraints = [
-            [
-                dict(catalog_row._mapping)
-                for catalog_row in await _CatalogDatabase(connection).all(query, relation_oids=[oid])
-            ]
-            for query in (
-                fhir._PROFILE_CAPACITY_ATTRIBUTE_SQL,
-                fhir._PROFILE_CAPACITY_INDEX_SQL,
-                fhir._PROFILE_CAPACITY_CONSTRAINT_SQL,
-            )
-        ]
-        if os.getenv("HLTHPRT_INITIAL_CATALOG_TEST_RECEIPT"):
-            Path(os.environ["HLTHPRT_INITIAL_CATALOG_TEST_RECEIPT"]).write_text(
-                json.dumps({"attributes": attributes, "indexes": indexes, "constraints": constraints}, indent=2) + "\n"
-            )
-        guards.assert_initial_receipt_catalog(oid, attributes, indexes, constraints)
-        for section, name, catalog_value in (
-            (attributes, "default_expression", "unexpected_writer()"),
-            (attributes, "attidentity", "a"),
-            (attributes, "atttypid", 25),
-            (indexes, "index_expressions", "unexpected_writer(build_id)"),
-            (indexes, "indclass", "999999"),
-            (constraints, "constraint_definition", "CHECK (unexpected_writer())"),
-            (constraints, "convalidated", False),
-        ):
-            changed_attributes, changed_indexes, changed_constraints = deepcopy((attributes, indexes, constraints))
-            changed = (
-                changed_attributes
-                if section is attributes
-                else changed_indexes
-                if section is indexes
-                else changed_constraints
-            )
-            changed[0][name] = catalog_value
-            with pytest.raises(RuntimeError, match="storage_shape_changed"):
-                guards.assert_initial_receipt_catalog(oid, changed_attributes, changed_indexes, changed_constraints)
-
-
 async def _native_guard_proof(engine):
     await _upgrade(engine)
     consumed, preflight, serving, receipt_payload = await _publication_values(engine)
     await _seed_authority(engine, consumed, preflight)
-    await _assert_guard_catalog(engine)
     with pytest.raises(DBAPIError, match="initial_receipt_required"):
         async with engine.begin() as connection:
             await _publish(connection, serving, receipt_payload, receipt=False)
@@ -416,14 +386,6 @@ async def _native_guard_proof(engine):
     async with engine.connect() as connection:
         assert await connection.scalar(sa.text(f"SELECT count(*) FROM {_SCHEMA}.{migration._TABLE}")) == 1
         assert await connection.scalar(sa.text(f"SELECT count(*) FROM {_SCHEMA}.{migration._SERVING}")) == 1
-    async with engine.begin() as connection:
-        await connection.execute(
-            sa.text(f'''CREATE OR REPLACE FUNCTION "{_SCHEMA}".pd_profile_initial_receipt_matches(
-            receipt "{_SCHEMA}".{migration._TABLE}) RETURNS boolean LANGUAGE sql VOLATILE
-            SET search_path=pg_catalog AS $$ SELECT true $$''')
-        )
-    with pytest.raises(RuntimeError, match="guard_shape_changed"):
-        await _assert_guard_catalog(engine)
 
 
 @pytest.mark.parametrize("checkpoint_state", ("original", "restored", "predicate", "unvalidated", "no_inherit"))

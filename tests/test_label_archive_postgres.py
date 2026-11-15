@@ -198,7 +198,7 @@ async def _cutover(sessions, ownership, prepared, target_schema, source_authorit
             sealed_owner_oid=role_oid,
         )
     cutover = archive.ReferenceFamilyCutoverAuthority(
-        package, archive.CONTRACT, role_oid, role_oid, "manual", source_authority.serving_generation.as_dict()
+        package, archive.CONTRACT, "manual", source_authority.serving_generation.as_dict()
     )
 
     async def activate(session, authority=cutover):

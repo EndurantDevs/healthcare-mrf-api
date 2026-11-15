@@ -261,6 +261,17 @@ async def _prepare_postgres_case(monkeypatch, tmp_path, persisted_batches):
     async with database.engine.begin() as connection:
         await connection.run_sync(lambda sync: _apply(sync, "20260930120000"))
         await connection.execute(text(_migration("20261019130000")._counter_sql(schema)))
+        named_revision = _migration("20261114190000")
+        validate_key, replace_key = named_revision._key_sql(schema)
+        await connection.execute(text(validate_key))
+        await connection.execute(
+            text(
+                named_revision._function_sql(
+                    schema, names=("cms_native_input_advance", "cms_native_input_revision_guard")
+                )
+            )
+        )
+        await connection.execute(text(replace_key))
     live_table = OpenAddressesGeocode.__table__.to_metadata(MetaData(), schema=schema)
     await database.create_table(live_table)
     seed_row = openaddresses._record_from_feature(

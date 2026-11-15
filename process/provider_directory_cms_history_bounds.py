@@ -20,24 +20,24 @@ _BOUND_JSON_SQL = """pg_catalog.jsonb_build_object(
   'columns',COALESCE(k.conkey,ARRAY[]::smallint[]),'tree',k.conbin::text,
   'expression',pg_catalog.pg_get_expr(k.conbin,k.conrelid,true)) ORDER BY k.oid)
   FROM pg_catalog.pg_constraint k WHERE k.conrelid=c.oid AND k.conname='cms_history_bound'),'[]'::jsonb))"""
-_READ_SQL = f"""SELECT c.oid::bigint,c.relname,n.nspname,c.relowner::bigint,c.relkind::text,
- {_BOUND_JSON_SQL} AS bound FROM pg_catalog.pg_class c
- JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
- WHERE c.oid=ANY($1::oid[]) ORDER BY c.oid"""
-_SOURCE_READ_SQL = f"""WITH requested(root,old_oid) AS (
- SELECT * FROM ROWS FROM (pg_catalog.unnest($1::text[]),pg_catalog.unnest($2::oid[])))
- SELECT requested.root,c.oid::bigint,c.relname,n.nspname,c.relowner::bigint,c.relkind::text,
- ARRAY(SELECT inhparent::bigint FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid ORDER BY inhparent) AS parents,
+_READ_SQL = f"""WITH requested(name) AS (SELECT unnest($1::text[]))
+ SELECT c.relname,n.nspname,c.relkind::text,{_BOUND_JSON_SQL} AS bound
+ FROM requested JOIN pg_catalog.pg_namespace n ON n.nspname=$2
+ JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=requested.name ORDER BY c.relname"""
+_SOURCE_READ_SQL = f"""WITH requested(root,name) AS (
+ SELECT * FROM ROWS FROM (unnest($1::text[]),unnest($2::text[])))
+ SELECT requested.root,c.relname,n.nspname,c.relkind::text,
+ ARRAY(SELECT pn.nspname||'.'||p.relname FROM pg_inherits h JOIN pg_class p ON p.oid=h.inhparent
+ JOIN pg_namespace pn ON pn.oid=p.relnamespace WHERE h.inhrelid=c.oid ORDER BY pn.nspname,p.relname) AS parents,
  NOT EXISTS(SELECT FROM pg_catalog.pg_inherits WHERE inhparent=c.oid) AS leaf,
- canonical.oid::bigint AS canonical_oid,canonical.relowner::bigint AS canonical_owner,
  canonical.relkind::text AS canonical_kind,
- ARRAY(SELECT inhparent::bigint FROM pg_catalog.pg_inherits
-  WHERE inhrelid=canonical.oid ORDER BY inhparent) AS canonical_parents,
- {_BOUND_JSON_SQL} AS bound
- FROM requested JOIN pg_catalog.pg_class c ON c.oid=requested.old_oid
- JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
- JOIN pg_catalog.pg_class canonical ON canonical.relnamespace=c.relnamespace AND canonical.relname=requested.root
- WHERE n.nspname=$3 ORDER BY requested.root"""
+ ARRAY(SELECT pn.nspname||'.'||p.relname FROM pg_inherits h JOIN pg_class p ON p.oid=h.inhparent
+ JOIN pg_namespace pn ON pn.oid=p.relnamespace WHERE h.inhrelid=canonical.oid ORDER BY pn.nspname,p.relname) AS canonical_parents,
+ {_BOUND_JSON_SQL} AS bound FROM requested
+ JOIN pg_catalog.pg_namespace n ON n.nspname=$3
+ JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=requested.name
+ JOIN pg_catalog.pg_class canonical ON canonical.relnamespace=n.oid AND canonical.relname=requested.root
+ ORDER BY requested.root"""
 
 
 def _require(condition, code):
@@ -110,115 +110,98 @@ def require_cms_history_bound(observed, dataset_ids, *, validated=True):
         and bool(bound["tree"]),
         "validated_bound_changed",
     )
-    history._oid(bound["oid"])
     return {
         "column": deepcopy(column),
-        "constraint": {key: deepcopy(bound_value) for key, bound_value in bound.items() if key != "expression"},
+        "constraint": {
+            key: deepcopy(bound_value) for key, bound_value in bound.items() if key not in {"expression", "oid", "tree"}
+        },
     }
 
 
 def require_cms_history_expectations(expectations_by_root):
-    """Validate and detach the two bound data pins; this does not establish custody or authority."""
+    """Detach declared history names and complete logical dataset bounds.
+
+    Existing stored mappings may carry obsolete native metadata alongside a
+    declared relation; that metadata is never compared with live physical IDs.
+    An OID alone cannot identify a portable snapshot.
+    """
     _require(
         type(expectations_by_root) is dict and set(expectations_by_root) == set(history.ROOTS), "expectations_required"
     )
-    expected = deepcopy(expectations_by_root)
-    old_oids, constraint_oids = set(), set()
-    for entry in expected.values():
-        _require(type(entry) is dict and set(entry) == {"old_oid", "dataset_ids", "native"}, "expectations_required")
-        history._oid(entry["old_oid"])
-        history._bounds(entry["dataset_ids"])
-        native = entry["native"]
+    expected_by_root = {}
+    for root, entry in expectations_by_root.items():
         _require(
-            type(native) is dict
-            and set(native) == {"column", "constraint"}
-            and type(native["constraint"]) is dict
-            and "expression" not in native["constraint"],
-            "native_pin_required",
+            type(entry) is dict
+            and {"relation", "dataset_ids"} <= set(entry)
+            and set(entry) <= {"relation", "dataset_ids", "native", "old_oid"},
+            "expectations_required",
         )
-        checked = require_cms_history_bound(
-            {
-                "standard_strings": True,
-                "column": native["column"],
-                "constraints": [{**native["constraint"], "expression": _expression(entry["dataset_ids"], True)}],
-            },
-            entry["dataset_ids"],
-        )
-        _require(checked == native, "native_pin_changed")
-        old_oids.add(entry["old_oid"])
-        constraint_oids.add(checked["constraint"]["oid"])
-    _require(len(old_oids) == len(constraint_oids) == len(history.ROOTS), "oid_collision")
-    return expected
+        relation = entry["relation"]
+        _require(type(relation) is dict and set(relation) == {"schema", "name"}, "relation_required")
+        for value in relation.values():
+            storage_identifier(value)
+        history._bounds(entry["dataset_ids"])
+        expected_by_root[root] = {"relation": dict(relation), "dataset_ids": list(entry["dataset_ids"])}
+    _require(
+        len({(entry["relation"]["schema"], entry["relation"]["name"]) for entry in expected_by_root.values()}) == 2,
+        "name_collision",
+    )
+    return expected_by_root
 
 
 async def require_cms_source_history_bounds(connection, *, catalog_schema, expected, owner_oid=None):
-    """Check bound pins in fixed source-root context; caller authenticates root ownership and custody.
+    """Check the declared heap's current enforced bound and native parent edge.
 
-    A retained name is accepted only beside its same-owner canonical partitioned
-    root, with its exact planned parent (or no parent for an empty bound).
+    The legacy owner keyword is ignored; PostgreSQL controls access. Neither
+    table IDs nor owner IDs form part of the stored or returned contract.
     """
     storage_identifier(catalog_schema)
-    if owner_oid is not None:
-        history._oid(owner_oid)
     expected = require_cms_history_expectations(expected)
+    _require(all(entry["relation"]["schema"] == catalog_schema for entry in expected.values()), "identity_changed")
     bound_rows = await connection.fetch(
-        _SOURCE_READ_SQL, list(history.ROOTS), [expected[root]["old_oid"] for root in history.ROOTS], catalog_schema
+        _SOURCE_READ_SQL,
+        list(history.ROOTS),
+        [expected[root]["relation"]["name"] for root in history.ROOTS],
+        catalog_schema,
     )
     _require(
-        len(bound_rows) == len(history.ROOTS) and {bound_row["root"] for bound_row in bound_rows} == set(history.ROOTS),
+        len(bound_rows) == 2 and {bound_row["root"] for bound_row in bound_rows} == set(history.ROOTS),
         "inventory_changed",
     )
     for bound_row in bound_rows:
         root = bound_row["root"]
         entry = expected[root]
-        for key in ("oid", "relowner", "canonical_oid", "canonical_owner"):
-            history._oid(bound_row[key])
-        is_original = (
-            bound_row["relname"] == root
-            and bound_row["canonical_oid"] == entry["old_oid"]
-            and bound_row["canonical_kind"] == "r"
-            and bound_row["parents"] == []
-        )
+        is_original = bound_row["relname"] == root and bound_row["canonical_kind"] == "r" and bound_row["parents"] == []
         is_converted = (
-            bound_row["relname"] == "cms_history_" + str(entry["old_oid"])
-            and bound_row["canonical_oid"] != entry["old_oid"]
+            bound_row["relname"] != root
             and bound_row["canonical_kind"] == "p"
-            and bound_row["parents"] == ([bound_row["canonical_oid"]] if entry["dataset_ids"] else [])
+            and bound_row["parents"] == ([catalog_schema + "." + root] if entry["dataset_ids"] else [])
         )
         _require(
-            bound_row["oid"] == entry["old_oid"]
+            bound_row["relname"] == entry["relation"]["name"]
             and bound_row["nspname"] == catalog_schema
-            and bound_row["relowner"] == bound_row["canonical_owner"]
-            and (owner_oid is None or bound_row["relowner"] == owner_oid)
             and bound_row["relkind"] == "r"
             and bound_row["leaf"] is True
             and bound_row["canonical_parents"] == []
             and (is_original or is_converted),
             "identity_changed",
         )
-        _require(
-            require_cms_history_bound(bound_row["bound"], entry["dataset_ids"]) == entry["native"], "native_pin_changed"
-        )
+        require_cms_history_bound(bound_row["bound"], entry["dataset_ids"])
     return expected
 
 
 async def read_cms_history_bounds(connection, plan):
-    """Read two authenticated old OIDs before COPY; caller owns authority, custody and deadline."""
+    """Read enforced bounds by declared name without retaining physical IDs."""
     _require(type(plan) is dict and "request" in plan, "plan_required")
     _require(plan == history.plan_cms_history_conversion(plan["request"]), "plan_changed")
     request = plan["request"]
-    old_by_oid = {entry["old"]["oid"]: entry for entry in request["heaps"].values()}
-    rows = await connection.fetch(_READ_SQL, sorted(old_by_oid))
-    _require(len(rows) == 2 and {row["oid"] for row in rows} == set(old_by_oid), "inventory_changed")
-    proofs_by_oid = {}
+    old_by_name = {entry["old"]["name"]: entry for entry in request["heaps"].values()}
+    rows = await connection.fetch(_READ_SQL, sorted(old_by_name), request["catalog_schema"])
+    _require(len(rows) == 2 and {row["relname"] for row in rows} == set(old_by_name), "inventory_changed")
+    proofs_by_name = {}
     for row in rows:
-        old = old_by_oid[row["oid"]]["old"]
-        _require(
-            row["relname"] == old["name"]
-            and row["nspname"] == request["catalog_schema"]
-            and row["relowner"] == old["owner_oid"]
-            and row["relkind"] == "r",
-            "identity_changed",
+        _require(row["nspname"] == request["catalog_schema"] and row["relkind"] == "r", "identity_changed")
+        proofs_by_name[row["relname"]] = require_cms_history_bound(
+            row["bound"], old_by_name[row["relname"]]["dataset_ids"]
         )
-        proofs_by_oid[str(row["oid"])] = require_cms_history_bound(row["bound"], old_by_oid[row["oid"]]["dataset_ids"])
-    return proofs_by_oid
+    return proofs_by_name

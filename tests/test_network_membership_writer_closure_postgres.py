@@ -17,10 +17,6 @@ from process.network_membership_writer_closure import (
     verify_network_candidate_writer_closure,
 )
 from tests.test_network_address_projection_postgres import projection_db
-from tests.test_network_candidate_custody_q_reach_postgres import (
-    q_roles,
-    test_q_catalog_reach_uses_actual_schema_owner_even_without_effective_create,
-)
 from tests.test_network_serving_schema_postgres import serving_schema
 
 
@@ -390,8 +386,10 @@ async def test_wrong_scope_state_transaction_and_owner_set_rejected(writer_db):
     await fixture.connection.execute(
         f'GRANT "{fixture.roles["owner"]}" TO "{fixture.roles["publisher"]}" WITH SET FALSE'
     )
-    with pytest.raises(NetworkWriterClosureError, match="assume"):
+    # PostgreSQL itself refuses the ownership transfer when the publisher cannot assume the owner.
+    with pytest.raises(asyncpg.InsufficientPrivilegeError) as refused:
         await _freeze(fixture)
+    assert refused.value.sqlstate == "42501"
 
 
 async def test_global_default_acl_propagation_removed_without_global_changes(writer_db):

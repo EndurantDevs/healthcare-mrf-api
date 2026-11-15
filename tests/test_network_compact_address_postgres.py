@@ -2,16 +2,13 @@
 """Read exact offices across shared compact artifacts and manual overrides."""
 
 import json
-import os
 from dataclasses import asdict, replace
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import MetaData, select, text
-from sqlalchemy.dialects.postgresql import dialect
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.pool import NullPool
-from sqlalchemy.schema import CreateTable
+from sqlalchemy import select, text
+from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.network_address_scope import (
     current_network_address_scope,
@@ -24,98 +21,29 @@ from api.network_compact_address import (
     _membership_arms,
     compact_address_native_sql,
     compact_address_parameters,
+    compact_address_read_relations,
     compact_address_relation_sql,
     compact_address_selectable,
 )
-from api.network_read_execution import network_read_relations
+from api.network_read_execution import qualified_relation_sql
 from db.models import EntityAddressUnified
-from process import network_indexed_address_artifact as indexed
 from process.network_compact_layout import (
     CompactAddressRelation,
-    CompactEdgeArtifact,
     CompactNetworkLayout,
-    verify_compact_layout_catalog,
 )
-from process.network_serving_read import PinnedNetworkServingManifest, _attach_manifest_custody
 from tests import test_custom_import_provider_geo_sql as geo
-from tests.test_network_membership_slices_postgres import _candidate, _pin, _prepare, slice_db
+from tests.network_compact_address_postgres_support import (
+    _lookup_manifest,
+    _manifest,
+)
+from tests.network_compact_address_postgres_support import (
+    compact_db as compact_db,
+)
+from tests.test_network_membership_slices_postgres import _candidate, _prepare
+from tests.test_network_membership_slices_postgres import slice_db as slice_db
 
 _VISIBLE_MEMBERSHIP = """EXISTS(SELECT 1 FROM unnest(canonical_network_ids) visible_network(network_id)
     WHERE visible_network.network_id=ANY(CAST(:visible_ids AS integer[])))"""
-
-
-async def _address_heap(db, schema, records):
-    model_table = EntityAddressUnified.__table__.to_metadata(MetaData(), schema=schema)
-    await db.connection.execute(str(CreateTable(model_table).compile(dialect=dialect())))
-    await db.connection.copy_records_to_table(
-        "entity_address_unified",
-        schema_name=schema,
-        columns=("location_key", "entity_type", "entity_id", "npi", "entity_name", "row_origin", "checksum", "type"),
-        records=records,
-    )
-    oid = await db.connection.fetchval("SELECT to_regclass($1)::oid", schema + ".entity_address_unified")
-    return CompactAddressRelation(schema, "entity_address_unified", oid)
-
-
-@pytest.fixture
-async def compact_db(slice_db):
-    db = slice_db
-    manual_schema = "network_manual_test_" + uuid4().hex
-    db.schemas.append(manual_schema)
-    await db.connection.execute(f'CREATE SCHEMA "{manual_schema}"')
-    base = await _address_heap(
-        db,
-        db.source_schema,
-        [
-            (db.keys[0], "npi", "provider-a", 1111111111, "base name", "base", 1, "practice"),
-            (
-                db.keys[1],
-                "npi",
-                "provider-a",
-                1111111111,
-                "unsupported same-provider office",
-                "ptg_overlay",
-                2,
-                "practice",
-            ),
-        ],
-    )
-    custom = await _address_heap(
-        db,
-        manual_schema,
-        [
-            (db.keys[0], "npi", "provider-a", 1111111111, "manual override", "manual", 3, "practice"),
-            (db.keys[2], "npi", "provider-b", 2222222222, "manual custom", "manual", 4, "practice"),
-            (db.keys[3], "npi", "provider-c", 3333333333, "hidden manual", "manual", 5, "practice"),
-        ],
-    )
-    first = await _candidate(db, [(42, 0), (42, 0), (7, 0), (88, 2)])
-    async with db.connection.transaction():
-        first_receipt = await _prepare(db, first)
-    second = await _candidate(db, [(42, 0), (7, 0), (99, 2)])
-    async with db.connection.transaction():
-        second_receipt = await _prepare(db, second, previous=_pin(first, first_receipt))
-    old_artifact = CompactEdgeArtifact(first.candidate_id, first.schema_name, first_receipt.edge_heap_oid)
-    new_artifact = CompactEdgeArtifact(second.candidate_id, second.schema_name, second_receipt.edge_heap_oid)
-    db.first_layout = CompactNetworkLayout(
-        CompactAddressRelation(first.schema_name, "network_slice_ref", first_receipt.ref_map_oid),
-        base,
-        (old_artifact,),
-        custom,
-    )
-    db.second_layout = CompactNetworkLayout(
-        CompactAddressRelation(second.schema_name, "network_slice_ref", second_receipt.ref_map_oid),
-        base,
-        tuple(sorted((old_artifact, new_artifact), key=lambda artifact: artifact.candidate_id)),
-        custom,
-    )
-    db.engine = create_async_engine(
-        os.environ["NETWORK_REGISTRY_TEST_DSN"].replace("postgresql://", "postgresql+asyncpg://"), poolclass=NullPool
-    )
-    try:
-        yield db
-    finally:
-        await db.engine.dispose()
 
 
 async def _read(db, layout, *, network_ids=None, visible_ids=None, typed=False):
@@ -143,11 +71,11 @@ async def _inventory(db, layout):
     if layout.custom is not None:
         schemas.add(layout.custom.schema_name)
     rows = await db.connection.fetch(
-        """SELECT n.nspname,c.relname,c.oid FROM pg_class c
+        """SELECT n.nspname,c.relname FROM pg_class c
         JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=ANY($1::text[]) AND c.relkind='r'""",
         sorted(schemas),
     )
-    return {(row["nspname"], row["relname"]): row["oid"] for row in rows}
+    return {(row["nspname"], row["relname"]) for row in rows}
 
 
 @pytest.mark.asyncio
@@ -169,7 +97,9 @@ async def test_shared_generations_keep_exact_offices(compact_db):
 @pytest.mark.parametrize("component", ["base", "custom", "ref_map", "edge"])
 async def test_compact_raw_and_typed_reads_exclude_attached_child_rows(compact_db, component):
     db, layout = compact_db, compact_db.second_layout
-    assert verify_compact_layout_catalog(layout, await _inventory(db, layout)) is layout
+    assert {
+        (relation.schema_name, relation.table_name) for relation in compact_address_read_relations(layout)
+    } <= await _inventory(db, layout)
     baseline = await _read(db, layout, visible_ids=(7, 42, 99))
     if component == "edge":
         candidate_id = await db.connection.fetchval(
@@ -297,9 +227,10 @@ async def test_empty_artifacts_are_valid_and_select_nothing(compact_db):
     empty = await _candidate(db, [])
     async with db.connection.transaction():
         receipt = await _prepare(db, empty)
+    assert (receipt.membership_rows, receipt.total_slices, receipt.copied_edge_rows) == (0, 0, 0)
     layout = replace(
         db.second_layout,
-        ref_map=CompactAddressRelation(empty.schema_name, "network_slice_ref", receipt.ref_map_oid),
+        ref_map=CompactAddressRelation(empty.schema_name, "network_slice_ref"),
         artifacts=(),
     )
     for typed in (False, True):
@@ -309,64 +240,30 @@ async def test_empty_artifacts_are_valid_and_select_nothing(compact_db):
 
 
 @pytest.mark.asyncio
-async def test_legitimate_retained_name_requires_fresh_resolution(compact_db):
+async def test_explicit_retained_name_keeps_complete_rows_and_missing_name_fails(compact_db):
     db = compact_db
     layout = db.second_layout
-    assert verify_compact_layout_catalog(layout, await _inventory(db, layout)) is layout
-    retained_name = "entity_address_unified_retained_" + format(layout.base.table_oid, "x")
+    expected = await _read(db, layout, network_ids=(42,))
+    retained_name = "entity_address_unified_archived"
     await db.connection.execute(
         f'ALTER TABLE "{layout.base.schema_name}"."{layout.base.table_name}" RENAME TO "{retained_name}"'
     )
-    with pytest.raises(ValueError, match="physical relation"):
-        verify_compact_layout_catalog(layout, await _inventory(db, layout))
+    with pytest.raises(ProgrammingError):
+        await _read(db, layout, network_ids=(42,))
     resolved = replace(layout, base=replace(layout.base, table_name=retained_name))
-    assert verify_compact_layout_catalog(resolved, await _inventory(db, resolved)) is resolved
-    assert [row["location_key"] for row in await _read(db, resolved, network_ids=(42,))] == [db.keys[0]]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["ref_map", "base", "custom", "artifact"])
-async def test_physical_swaps_fail_fresh_inventory_verifier(compact_db, role):
-    db = compact_db
-    layout = db.second_layout
-    relation = layout.artifacts[0] if role == "artifact" else getattr(layout, role)
-    table_name = "network_office_edge" if role == "artifact" else relation.table_name
-    namespace = '"' + relation.schema_name + '".'
-    await db.connection.execute(f'ALTER TABLE {namespace}"{table_name}" RENAME TO swapped_original')
-    await db.connection.execute(
-        f'CREATE TABLE {namespace}"{table_name}"(LIKE {namespace}swapped_original INCLUDING ALL)'
-    )
-    assert layout.base.table_oid > 0
-    with pytest.raises(ValueError, match="physical relation"):
-        verify_compact_layout_catalog(layout, await _inventory(db, layout))
+    assert await _read(db, resolved, network_ids=(42,)) == expected
+    assert await _read(db, resolved, network_ids=(42,), typed=True) == expected
 
 
 @pytest.mark.parametrize("network_ids", [(), (0,), (2147483648,), (True,), (42, 42), (99, 42), [42]])
 def test_invalid_selectors_are_rejected(network_ids):
     layout = CompactNetworkLayout(
-        CompactAddressRelation("generation_a", "network_slice_ref", 1),
-        CompactAddressRelation("base_a", "entity_address_unified", 2),
+        CompactAddressRelation("generation_a", "network_slice_ref"),
+        CompactAddressRelation("base_a", "entity_address_unified"),
         (),
     )
     with pytest.raises(ValueError, match="selector"):
         compact_address_relation_sql(layout, network_ids=network_ids)
-
-
-def _manifest(layout):
-    candidate_hex = layout.ref_map.schema_name.removeprefix("network_candidate_")
-    candidate_id = str(UUID(candidate_hex))
-    manifest = PinnedNetworkServingManifest(
-        2,
-        candidate_id,
-        layout.ref_map.schema_name,
-        2,
-        {"unified_address": "address-edition-a"},
-        7,
-        "a" * 64,
-        layout.base.table_oid,
-    )
-    object.__setattr__(manifest, "_compact_layout", layout)
-    return manifest
 
 
 async def _scoped_rows(db):
@@ -401,7 +298,7 @@ async def test_actual_scope_reads_and_context_reset(compact_db, monkeypatch):
     with network_address_read_scope(manifest, (42,)) as scope:
         assert current_network_address_scope() is scope
         assert scope.manifest.compact_layout.ref_map.schema_name == manifest.schema_name
-        assert scope.manifest.compact_layout.base.table_oid == manifest.address_table_oid
+        assert scope.manifest.compact_layout.base == manifest.address_relation
         offices = await _scoped_rows(db)
         assert [(office["location_key"], office["canonical_network_ids"]) for office in offices] == [
             (db.keys[0], [7, 42])
@@ -443,18 +340,18 @@ async def test_scope_rejects_reserved_parameter_mixtures(compact_db):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["ref_schema", "base_oid"])
+@pytest.mark.parametrize("damage", ["ref_schema", "base_name"])
 async def test_scope_rejects_mismatched_layout_coordinates(compact_db, damage):
     layout = compact_db.second_layout
     manifest = _manifest(layout)
     if damage == "ref_schema":
         layout = replace(layout, ref_map=replace(layout.ref_map, schema_name="different_generation"))
     else:
-        layout = replace(layout, base=replace(layout.base, table_oid=4294967295))
+        layout = replace(layout, base=replace(layout.base, table_name="other_addresses"))
     object.__setattr__(manifest, "_compact_layout", layout)
     with pytest.raises(ValueError, match="scope_invalid"):
         with network_address_read_scope(manifest, (42,)):
-            pytest.fail("Mismatched physical coordinates must not enter a scope")
+            pytest.fail("Mismatched named layout must not enter a scope")
     assert current_network_address_scope() is None
 
 
@@ -472,17 +369,17 @@ async def test_legacy_scope_and_manifest_wire_stay_unchanged(compact_db):
         "source_generations",
         "approved_custom_revision",
         "manifest_sha256",
-        "address_table_oid",
+        "address_relation",
     }
     with network_address_read_scope(legacy, (42,)) as scope:
         relation = scoped_address_relation_sql("mrf.entity_address_unified")
-        relations = (
-            CompactAddressRelation(manifest.schema_name, "entity_address_unified", manifest.address_table_oid),
+        assert manifest.address_relation == scope.manifest.address_relation
+        assert (
+            qualified_relation_sql(manifest.schema_name, "entity_address_unified")
+            == '"' + manifest.schema_name + '"."entity_address_unified"'
         )
-        assert network_read_relations(relation) == relations
-        marker = scope.read_statements.marker(relations)
         assert relation == (
-            f'({marker} SELECT * FROM ONLY "{manifest.schema_name}".entity_address_unified '
+            f'(SELECT * FROM ONLY "{manifest.schema_name}".entity_address_unified '
             "WHERE canonical_network_ids && CAST(:_canonical_network_ids AS INTEGER[]))"
         )
         assert scoped_address_parameters({}) == {"_canonical_network_ids": [42]}
@@ -558,7 +455,7 @@ async def test_lookup_keeps_custom_geo_precedence(compact_db):
 @pytest.mark.parametrize("require_match", [False, True])
 async def test_compact_imported_geo_page_parity(compact_db, monkeypatch, direction, require_match):
     db, layout = compact_db, compact_db.second_layout
-    monkeypatch.setattr(geo.provider_list_sql, "NetworkReadConnectionProxy", geo._PostgresGeoProxy)
+    monkeypatch.setattr(geo.provider_list_sql, "ConnectionProxy", geo._PostgresGeoProxy)
     monkeypatch.setattr(geo.npi_module, "_plan_release_npi_scope", geo._empty_plan_scope)
     page_pairs = []
     async with AsyncSession(db.engine) as session:
@@ -596,16 +493,3 @@ async def test_compact_imported_geo_page_parity(compact_db, monkeypatch, directi
         (1000000002, geo._SECOND_ADDRESS_KEY),
     ]
     assert geo._provider_identities(second) == [(1000000002, geo._SECOND_ADDRESS_KEY)]
-
-
-def _lookup_manifest(layout, contract=indexed.CONTRACT):
-    manifest = _manifest(layout)
-    closure_by_field = {"relation_oids": {"network_slice_ref": layout.ref_map.table_oid}}
-    custody_by_field = {
-        "receipt": {"closure": closure_by_field, "control": {}},
-        "seal_sha256": "b" * 64,
-        "compact_layout": layout,
-    }
-    readiness = (None, None, {"address_artifact": {"contract": contract}}, closure_by_field)
-    _attach_manifest_custody(manifest, custody_by_field, readiness, True)
-    return manifest

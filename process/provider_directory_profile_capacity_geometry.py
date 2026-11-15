@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import json
@@ -22,8 +23,17 @@ from process.provider_directory_profile_capacity_geometry_contract import (
     _profile_as_of,
     _validated_relation_cap_sequence,
     _validated_single_relation_cap,
+    validated_capacity_relations,
 )
 from process.provider_directory_profile_capacity_types import (
+    _GEOMETRY_FIELDS,
+    _GEOMETRY_HASH_DOMAIN,
+    _HASH_FIELDS,
+    _MAX_OID,
+    _MAX_POOL_SIZE,
+    _MAX_SIGNED_BIGINT,
+    _MAX_WORKERS,
+    _POSITIVE_ROW_CAP_FIELDS,
     BOUNDED_ADMISSION_CONTRACT_ID,
     CAPACITY_GEOMETRY_CONTRACT_ID,
     METADATA_DATA_UPPER_BOUND_BYTES,
@@ -40,15 +50,8 @@ from process.provider_directory_profile_capacity_types import (
     PROFILE_MINIMUM_POOL_RESERVE,
     PROFILE_STRATEGY_VERSION,
     ProviderDirectoryProfileCapacityGeometry,
-    _GEOMETRY_FIELDS,
-    _GEOMETRY_HASH_DOMAIN,
-    _HASH_FIELDS,
-    _MAX_OID,
-    _MAX_POOL_SIZE,
-    _MAX_SIGNED_BIGINT,
-    _MAX_WORKERS,
-    _POSITIVE_ROW_CAP_FIELDS,
 )
+
 
 def _assert_wave_geometry(
     geometry: ProviderDirectoryProfileCapacityGeometry,
@@ -60,21 +63,13 @@ def _assert_wave_geometry(
     )
     if any((waves == 0) != (workers == 0) for waves, workers in wave_pairs):
         raise _error("wave_worker_geometry_invalid")
-    if (
-        geometry.pool_reserve_connections
-        < PROFILE_MINIMUM_POOL_RESERVE
-    ):
+    if geometry.pool_reserve_connections < PROFILE_MINIMUM_POOL_RESERVE:
         raise _error("profile_control_pool_reserve_invalid")
-    available_connections = (
-        geometry.database_pool_size
-        - geometry.pool_reserve_connections
-    )
+    available_connections = geometry.database_pool_size - geometry.pool_reserve_connections
     if available_connections < geometry.maximum_worker_count:
         raise _error("worker_pool_reserve_invalid")
     if (
-        PROFILE_DEDICATED_ADVISORY_LOCK_CONNECTIONS
-        + PROFILE_CONTROL_CONNECTION_RESERVE
-        + geometry.maximum_worker_count
+        PROFILE_DEDICATED_ADVISORY_LOCK_CONNECTIONS + PROFILE_CONTROL_CONNECTION_RESERVE + geometry.maximum_worker_count
         > geometry.database_pool_size
     ):
         raise _error("worker_pool_physical_capacity_invalid")
@@ -104,10 +99,7 @@ def _assert_session_execution_limits(
         or geometry.temp_file_limit_bytes % 1024 != 0
     ):
         raise _error("memory_setting_not_kib_aligned")
-    if any(
-        cap.max_temp_bytes != geometry.temp_file_limit_bytes
-        for cap in geometry.relation_byte_caps
-    ):
+    if any(cap.max_temp_bytes != geometry.temp_file_limit_bytes for cap in geometry.relation_byte_caps):
         raise _error("relation_temp_cap_not_session_limit")
     if geometry.lock_timeout_ms >= geometry.statement_timeout_ms:
         raise _error("lock_timeout_not_below_statement_timeout")
@@ -119,24 +111,17 @@ def _assert_postgres_storage_limits(
     geometry: ProviderDirectoryProfileCapacityGeometry,
 ) -> None:
     if (
-        geometry.postgres_server_version_num // 10_000
-        != POSTGRES_SUPPORTED_MAJOR
-        or geometry.postgres_block_size_bytes
-        != POSTGRES_BLOCK_SIZE_BYTES
-        or geometry.postgres_wal_block_size_bytes
-        != POSTGRES_BLOCK_SIZE_BYTES
-        or geometry.postgres_toast_max_chunk_size_bytes
-        != POSTGRES_TOAST_MAX_CHUNK_SIZE_BYTES
+        geometry.postgres_server_version_num // 10_000 != POSTGRES_SUPPORTED_MAJOR
+        or geometry.postgres_block_size_bytes != POSTGRES_BLOCK_SIZE_BYTES
+        or geometry.postgres_wal_block_size_bytes != POSTGRES_BLOCK_SIZE_BYTES
+        or geometry.postgres_toast_max_chunk_size_bytes != POSTGRES_TOAST_MAX_CHUNK_SIZE_BYTES
         or geometry.postgres_maxalign_bytes != POSTGRES_MAXALIGN_BYTES
         or geometry.postgres_btree_version != POSTGRES_BTREE_VERSION
     ):
         raise _error("postgres_storage_abi_unsupported")
     if (
-        geometry.postgres_wal_segment_size_bytes
-        < geometry.postgres_wal_block_size_bytes
-        or geometry.postgres_wal_segment_size_bytes
-        % geometry.postgres_wal_block_size_bytes
-        != 0
+        geometry.postgres_wal_segment_size_bytes < geometry.postgres_wal_block_size_bytes
+        or geometry.postgres_wal_segment_size_bytes % geometry.postgres_wal_block_size_bytes != 0
     ):
         raise _error("postgres_wal_segment_geometry_invalid")
 
@@ -163,10 +148,8 @@ def _assert_metadata_capacity_limits(
     geometry: ProviderDirectoryProfileCapacityGeometry,
 ) -> None:
     if (
-        geometry.metadata_wal_upper_bound_bytes
-        != METADATA_WAL_UPPER_BOUND_BYTES
-        or geometry.metadata_data_upper_bound_bytes
-        != METADATA_DATA_UPPER_BOUND_BYTES
+        geometry.metadata_wal_upper_bound_bytes != METADATA_WAL_UPPER_BOUND_BYTES
+        or geometry.metadata_data_upper_bound_bytes != METADATA_DATA_UPPER_BOUND_BYTES
     ):
         raise _error("metadata_upper_bound_invalid")
 
@@ -178,7 +161,6 @@ def _validated_scalar_geometry(
 
     _validate_scalar_identity(geometry_map)
     _validate_scalar_flags(geometry_map)
-    _validate_scalar_oids(geometry_map)
     _validate_scalar_row_caps(geometry_map)
     _validate_scalar_postgres_bounds(geometry_map)
 
@@ -187,26 +169,25 @@ def _validate_scalar_identity(geometry_map: Mapping[str, Any]) -> None:
     from process.provider_directory_profile_initial_contract import GEOMETRY_CONTRACT
 
     for name in _HASH_FIELDS:
-        if (geometry_map.get("contract_id") == GEOMETRY_CONTRACT
-            and name in {"current_source_vector_hash", "current_context_vector_hash"}):
+        if geometry_map.get("contract_id") == GEOMETRY_CONTRACT and name in {
+            "current_source_vector_hash",
+            "current_context_vector_hash",
+        }:
             if geometry_map.get(name) is not None:
                 raise _error("initial_current_vector_not_absent")
             continue
         _exact_hash(geometry_map, name)
-    _database_system_identifier(geometry_map)
     _profile_as_of(geometry_map)
-    for name in ("database_name", "tablespace_name"):
-        _exact_text(geometry_map, name, maximum_length=63)
     for name in (
         "postgres_wal_compression",
         "postgres_wal_level",
         "postgres_default_toast_compression",
     ):
         _exact_text(geometry_map, name, maximum_length=32)
-    if (
-        geometry_map.get("physical_projection_contract_id")
-        not in {PHYSICAL_PROJECTION_CONTRACT_ID, BOUNDED_ADMISSION_CONTRACT_ID}
-    ):
+    if geometry_map.get("physical_projection_contract_id") not in {
+        PHYSICAL_PROJECTION_CONTRACT_ID,
+        BOUNDED_ADMISSION_CONTRACT_ID,
+    }:
         raise _error("physical_projection_contract_invalid")
 
 
@@ -218,21 +199,6 @@ def _validate_scalar_flags(geometry_map: Mapping[str, Any]) -> None:
     ):
         if not isinstance(geometry_map.get(name), bool):
             raise _error(name + "_invalid")
-
-
-def _validate_scalar_oids(geometry_map: Mapping[str, Any]) -> None:
-    for name in (
-        "database_oid",
-        "tablespace_oid",
-        "evidence_target_oid",
-        "profile_target_oid",
-        "build_checkpoint_oid",
-        "serving_generation_oid",
-        "delta_receipt_oid",
-        "import_run_oid",
-        "capacity_consumption_oid",
-    ):
-        _bounded_integer(geometry_map, name, minimum=1, maximum=_MAX_OID)
 
 
 def _validate_scalar_row_caps(geometry_map: Mapping[str, Any]) -> None:
@@ -270,21 +236,19 @@ def _validated_execution_geometry(
     geometry_map: Mapping[str, Any],
 ) -> None:
     _positive_bigint(geometry_map, "profile_schema_version")
-    for name in (
-        "artifact_scope_wave_count", "evidence_wave_count", "compact_wave_count"
-    ):
+    for name in ("artifact_scope_wave_count", "evidence_wave_count", "compact_wave_count"):
         _nonnegative_bigint(geometry_map, name)
-    for name in (
-        "artifact_scope_worker_count", "evidence_worker_count", "compact_worker_count"
-    ):
+    for name in ("artifact_scope_worker_count", "evidence_worker_count", "compact_worker_count"):
         _bounded_integer(geometry_map, name, minimum=0, maximum=_MAX_WORKERS)
     _bounded_integer(
-        geometry_map, "database_pool_size",
+        geometry_map,
+        "database_pool_size",
         minimum=PROFILE_MINIMUM_POOL_RESERVE + 1,
         maximum=_MAX_POOL_SIZE,
     )
     _bounded_integer(
-        geometry_map, "pool_reserve_connections",
+        geometry_map,
+        "pool_reserve_connections",
         minimum=PROFILE_MINIMUM_POOL_RESERVE,
         maximum=_MAX_POOL_SIZE - 1,
     )
@@ -311,7 +275,9 @@ def validated_capacity_geometry(
 ) -> ProviderDirectoryProfileCapacityGeometry:
     """Validate exact executable geometry and return its immutable form."""
     from process.provider_directory_profile_initial_contract import (
-        GEOMETRY_CONTRACT, INITIAL_FIELDS, InitialCapacityGeometry,
+        GEOMETRY_CONTRACT,
+        INITIAL_FIELDS,
+        InitialCapacityGeometry,
     )
 
     initial = isinstance(geometry_map, Mapping) and geometry_map.get("contract_id") == GEOMETRY_CONTRACT
@@ -322,45 +288,21 @@ def validated_capacity_geometry(
         raise _error("materialization_mode_invalid")
     if initial:
         _exact_hash(geometry_map, "initial_target_state_sha256")
-        _exact_hash(geometry_map, "initial_receipt_storage_fingerprint")
-        _bounded_integer(geometry_map, "initial_receipt_oid", minimum=1, maximum=_MAX_OID)
         if geometry_map.get("physical_projection_contract_id") != BOUNDED_ADMISSION_CONTRACT_ID:
             raise _error("initial_physical_projection_invalid")
     if geometry_map.get("profile_strategy_version") != PROFILE_STRATEGY_VERSION:
         raise _error("profile_strategy_version_invalid")
     _validated_scalar_geometry(geometry_map)
     _validated_execution_geometry(geometry_map)
-    relation_caps = _validated_relation_cap_sequence(
-        geometry_map.get("relation_byte_caps")
-    )
+    relation_caps = _validated_relation_cap_sequence(geometry_map.get("relation_byte_caps"))
     scalar_map = dict(geometry_map)
     scalar_map["relation_byte_caps"] = relation_caps
+    scalar_map["relations"] = validated_capacity_relations(geometry_map["relations"], initial=initial)
     geometry = (InitialCapacityGeometry if initial else ProviderDirectoryProfileCapacityGeometry)(**scalar_map)
-    if len(
-        {
-            geometry.evidence_target_oid,
-            geometry.profile_target_oid,
-            geometry.build_checkpoint_oid,
-            geometry.serving_generation_oid,
-            geometry.delta_receipt_oid,
-            geometry.import_run_oid,
-            geometry.capacity_consumption_oid,
-        }
-    ) != 7:
-        raise _error("target_oid_collision")
-    if initial and geometry.initial_receipt_oid in {
-        geometry.evidence_target_oid, geometry.profile_target_oid, geometry.build_checkpoint_oid,
-        geometry.serving_generation_oid, geometry.delta_receipt_oid, geometry.import_run_oid,
-        geometry.capacity_consumption_oid,
-    }:
-        raise _error("initial_receipt_oid_collision")
     _assert_wave_geometry(geometry)
     _assert_execution_limits(geometry)
     reservation_bytes = geometry.reservation_bytes_by_storage_class.values()
-    if any(
-        reserved_bytes > _MAX_SIGNED_BIGINT
-        for reserved_bytes in reservation_bytes
-    ):
+    if any(reserved_bytes > _MAX_SIGNED_BIGINT for reserved_bytes in reservation_bytes):
         raise _error("storage_class_reservation_overflow")
     return geometry
 
@@ -371,13 +313,14 @@ def capacity_geometry_payload(
     """Return the exact JSON-compatible executable plan payload."""
     if not isinstance(geometry, ProviderDirectoryProfileCapacityGeometry):
         raise _error("geometry_type_invalid")
+    if geometry.legacy_payload is not None:
+        return copy.deepcopy(geometry.legacy_payload)
     payload = {
         field.name: getattr(geometry, field.name)
         for field in dataclasses.fields(geometry)
+        if field.name not in {"legacy_payload", "legacy_geometry_hash"}
     }
-    payload["relation_byte_caps"] = [
-        dataclasses.asdict(relation) for relation in geometry.relation_byte_caps
-    ]
+    payload["relation_byte_caps"] = [dataclasses.asdict(relation) for relation in geometry.relation_byte_caps]
     return payload
 
 
@@ -399,16 +342,114 @@ def capacity_geometry_hash(
     geometry: ProviderDirectoryProfileCapacityGeometry,
 ) -> str:
     """Return the deterministic executable-plan identity."""
+    if geometry.legacy_payload is not None:
+        return _legacy_geometry_hash(geometry.legacy_payload)
     canonical_geometry = canonical_capacity_geometry_json(geometry)
     from process.provider_directory_profile_initial_contract import GEOMETRY_CONTRACT, GEOMETRY_DOMAIN
 
     domain = GEOMETRY_DOMAIN if geometry.contract_id == GEOMETRY_CONTRACT else _GEOMETRY_HASH_DOMAIN
-    hash_input = f"{domain}:{canonical_geometry}"
-    return hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
+    return hashlib.sha256(domain.encode("ascii") + b"\0" + canonical_geometry.encode("ascii")).hexdigest()
 
 
 def revalidate_capacity_geometry(
     geometry: ProviderDirectoryProfileCapacityGeometry,
 ) -> ProviderDirectoryProfileCapacityGeometry:
     """Revalidate a retained plan before each executable wave."""
-    return validated_capacity_geometry(capacity_geometry_payload(geometry))
+    if geometry.legacy_payload is None:
+        return validated_capacity_geometry(capacity_geometry_payload(geometry))
+    if _legacy_geometry_hash(geometry.legacy_payload) != geometry.legacy_geometry_hash:
+        raise _error("legacy_geometry_changed")
+    current = validated_capacity_geometry(_logical_legacy_geometry_payload(geometry.legacy_payload, geometry.relations))
+    expected = dataclasses.replace(
+        current,
+        contract_id=geometry.contract_id,
+        legacy_payload=geometry.legacy_payload,
+        legacy_geometry_hash=geometry.legacy_geometry_hash,
+    )
+    if expected != geometry:
+        raise _error("legacy_geometry_projection_changed")
+    return geometry
+
+
+_LEGACY_GEOMETRY_COORDINATES = frozenset(
+    "database_system_identifier database_oid database_name tablespace_oid tablespace_name "
+    "evidence_target_oid profile_target_oid evidence_target_storage_fingerprint "
+    "profile_target_storage_fingerprint build_checkpoint_oid serving_generation_oid delta_receipt_oid "
+    "import_run_oid capacity_consumption_oid build_checkpoint_storage_fingerprint "
+    "serving_generation_storage_fingerprint delta_receipt_storage_fingerprint "
+    "import_run_storage_fingerprint capacity_consumption_storage_fingerprint".split()
+)
+
+
+def _legacy_geometry_hash(payload: Mapping[str, Any]) -> str:
+    """Authenticate original geometry bytes without interpreting physical history."""
+    contract = payload.get("contract_id")
+    domain_by_contract = {
+        "healthporta.provider-directory-profile-capacity-geometry.v5": "provider_directory_profile_capacity_geometry.v5",
+        "healthporta.provider-directory-profile-initial-capacity-geometry.v1": (
+            "provider_directory_profile_initial_capacity_geometry.v1"
+        ),
+    }
+    if contract not in domain_by_contract:
+        raise _error("legacy_geometry_contract_unsupported")
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    return hashlib.sha256(f"{domain_by_contract[contract]}:{encoded}".encode("utf-8")).hexdigest()
+
+
+def project_legacy_capacity_geometry(
+    original_by_field: Mapping[str, Any],
+    expected_hash: str,
+    *,
+    relations: Mapping[str, Any],
+    retained_evidence: Mapping[str, Any],
+) -> ProviderDirectoryProfileCapacityGeometry:
+    """Project authenticated history only with the caller's retained semantic fences."""
+    if _legacy_geometry_hash(original_by_field) != expected_hash:
+        raise _error("legacy_geometry_hash_invalid")
+    is_initial = original_by_field["contract_id"].endswith("initial-capacity-geometry.v1")
+    legacy_initial_fields = {
+        "initial_target_state_sha256",
+        "initial_receipt_oid",
+        "initial_receipt_storage_fingerprint",
+    }
+    fields = (_GEOMETRY_FIELDS - {"relations"}) | _LEGACY_GEOMETRY_COORDINATES
+    _exact_fields(original_by_field, fields | legacy_initial_fields if is_initial else fields, name="legacy_geometry")
+    geometry_field_by_retained_field = {
+        "selection_proof_id": "selection_proof_id",
+        "profile_input_digest": "profile_input_digest",
+        "executable_plan_hash": "executable_plan_hash",
+        "profile_as_of": "profile_as_of",
+        "source_vector_hash": "desired_source_vector_hash",
+        "source_context_vector_hash": "desired_context_vector_hash",
+    }
+    if not isinstance(retained_evidence, Mapping) or any(
+        retained_evidence.get(name) != original_by_field[field]
+        for name, field in geometry_field_by_retained_field.items()
+    ):
+        raise _error("legacy_semantic_evidence_required")
+    for name in ("evidence_rows", "profile_rows"):
+        _nonnegative_bigint(retained_evidence, name)
+    projected = _logical_legacy_geometry_payload(original_by_field, relations)
+    geometry = validated_capacity_geometry(projected)
+    return dataclasses.replace(
+        geometry,
+        contract_id=original_by_field["contract_id"],
+        legacy_payload=copy.deepcopy(dict(original_by_field)),
+        legacy_geometry_hash=expected_hash,
+    )
+
+
+def _logical_legacy_geometry_payload(payload, relations):
+    from process.provider_directory_profile_initial_contract import GEOMETRY_CONTRACT
+
+    is_initial = payload["contract_id"].endswith("initial-capacity-geometry.v1")
+    projected_by_field = {
+        name: copy.deepcopy(value)
+        for name, value in payload.items()
+        if name not in _LEGACY_GEOMETRY_COORDINATES | {"initial_receipt_oid", "initial_receipt_storage_fingerprint"}
+    }
+    projected_by_field.update(
+        contract_id=GEOMETRY_CONTRACT if is_initial else CAPACITY_GEOMETRY_CONTRACT_ID,
+        relations=copy.deepcopy(relations),
+    )
+    return projected_by_field

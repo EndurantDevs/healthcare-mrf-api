@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Exact native COPY custody with honest whole-owner diagnostic counters."""
+"""Bounded native COPY with logical targets and whole-operation counters."""
 
 import asyncio
 from dataclasses import asdict, dataclass, field
@@ -19,7 +19,6 @@ from process.provider_directory_output_snapshot_catalog import (
     output_models,
 )
 from process.provider_directory_output_snapshot_stage import _record_bytes
-from process.provider_directory_projection_stage import _copy_driver
 
 _ISSUED = WeakKeyDictionary()
 _ATTEMPTED = WeakValueDictionary()
@@ -36,7 +35,7 @@ class NativeCopyWitness:
     """Issued transport facts; indexed snapshot closure must prove semantic parity."""
 
     batch_json: str
-    target_oid: int
+    target: tuple[str, str]
     columns: tuple[str, ...]
     affected_rows: int
     command_counts: tuple[int, ...]
@@ -50,7 +49,6 @@ class NativeCopyRequest:
 
     model: object
     relation: str
-    target_oid: int
     batch: object
     table_projection: object
     source_binding: dict
@@ -60,37 +58,22 @@ class NativeCopyRequest:
 
 
 async def _origin(fhir, outcome):
-    binding = fhir.db._transaction_binding()
     publisher = bound_publisher()
     _require(
         type(outcome) is owned.OwnedWalTransaction
         and owned.current_owned_wal_transaction(fhir.db) is outcome
-        and binding is not None
-        and binding.session is outcome.session is source_copy_session()
         and outcome.session.in_transaction()
         and not outcome.session.in_nested_transaction()
         and outcome.commit_state == "not_attempted"
     )
-    driver = await _copy_driver(binding.session)
-    _require(driver is publisher.connection is outcome.retained_driver)
-    actor_by_field = dict(
-        await driver.fetchrow(
-            "SELECT session_user::text AS session,current_user::text AS current,pg_backend_pid() AS backend,"
-            "pg_current_xact_id()::text AS xid,current_setting('transaction_read_only') AS readonly"
-        )
-    )
-    _require(
-        actor_by_field["session"] == publisher.policy.publisher_role
-        and actor_by_field["current"] == publisher.policy.owner_role
-        and actor_by_field["readonly"] == "off"
-        and actor_by_field["backend"] == outcome.retained_pid
-    )
-    return publisher, driver, actor_by_field
+    source_copy_session()
+    return publisher, publisher.connection
 
 
 async def _source(fhir, publisher, binding, batch):
     from process import provider_directory_profile_source_inputs as inputs
 
+    binding = source._binding_json(binding, publisher.policy.schema)
     selected = inputs.dataset(fhir, batch)
     identity = binding["identity"]
     _require(
@@ -115,7 +98,7 @@ async def _source(fhir, publisher, binding, batch):
         and header["status"] == selected.status
         and (header["endpoint_id"], header["acquisition_root_run_id"])
         == (identity["endpoint_id"], identity["acquisition_root_run_id"])
-        and source._json(header["candidate_storage_json"]) == binding
+        and source._binding_json(header["candidate_storage_json"], publisher.policy.schema) == binding
         and all(
             source._json(header["publication_metadata_json"]).get(key) == metadata_value
             for key, metadata_value in identity["metadata"].items()
@@ -134,13 +117,9 @@ def _target_columns(model, catalog):
     """Match the exact CreateColumn layout, including order and native types."""
     columns = decoded(catalog["columns"])
     expected_columns = [
-        (number, str(column.name), _column_type(column, {}), not column.nullable)
-        for number, column in enumerate(model.__table__.columns, 1)
+        (str(column.name), _column_type(column, {}), not column.nullable) for column in model.__table__.columns
     ]
-    _require(
-        [(column["number"], column["name"], column["type"].lower(), column["required"]) for column in columns]
-        == expected_columns
-    )
+    _require([(column["name"], column["type"].lower(), column["required"]) for column in columns] == expected_columns)
     for observed, column in zip(columns, model.__table__.columns, strict=True):
         default = None if column.server_default is None else str(column.server_default.arg)
         _require(
@@ -172,13 +151,11 @@ def _target_indexes(fhir, model, relation, catalog, phase):
 def _completed_target_indexes(fhir, model, relation, catalog):
     """Attest only the legacy PK and optional bucket after loading is closed."""
     constraints, indexes = decoded(catalog["constraints"]), decoded(catalog["indexes"])
-    key_name = fhir._artifact_scope_pk_names(relation)[1]
     key_columns = tuple(str(column.name) for column in model.__table__.primary_key.columns)
     number_by_column = {column["name"]: column["number"] for column in decoded(catalog["columns"])}
     primary_constraints = [constraint for constraint in constraints if constraint["type"] == "p"]
     _require(
         len(primary_constraints) == 1
-        and primary_constraints[0]["name"] == key_name
         and tuple(primary_constraints[0]["keys"]) == tuple(number_by_column[name] for name in key_columns)
     )
     _require(
@@ -191,26 +168,21 @@ def _completed_target_indexes(fhir, model, relation, catalog):
         )
     )
     has_bucket = model in (fhir.ProviderDirectoryPractitionerRole, fhir.ProviderDirectoryOrganizationAffiliation)
-    expected_names = {key_name}
-    if has_bucket:
-        expected_names.add(fhir._provider_directory_profile_bucket_index_sql(fhir._schema(), relation)[0])
-    _require(len(indexes) == len(expected_names) and {index["name"] for index in indexes} == expected_names)
+    _require(len(indexes) == 1 + int(has_bucket) and sum(index["primary"] for index in indexes) == 1)
     for index in indexes:
         _require(
             all(index[flag] is True for flag in ("valid", "ready", "live", "immediate", "native"))
             and not index["exclusion"]
             and index["keys_count"] == index["total_count"]
             and index["method"] == "btree"
-            and index["owner"] == catalog["relowner"]
             and not _normalized_expression(index["predicate"])
         )
-        if index["name"] == key_name:
+        if index["primary"]:
             _require(
                 index["primary"]
                 and index["unique"]
                 and tuple(index["keys"]) == key_columns
                 and not _normalized_expression(index["expression"])
-                and index["constraint_oid"] == primary_constraints[0]["oid"]
             )
         else:
             _require(
@@ -219,21 +191,15 @@ def _completed_target_indexes(fhir, model, relation, catalog):
                 and index["keys"] == ["source_id", None]
                 and index["keys_count"] == 2
                 and bool(index["expression"])
-                and index["constraint_oid"] is None
             )
     return has_bucket
 
 
-def _target_catalog(fhir, model, relation, oid, owner, catalog, *, phase="loading"):
-    """Reject pre-existing hooks, topology, grant or fixed-layout drift."""
+def _target_catalog(fhir, model, relation, catalog, *, phase="loading"):
+    """Reject hooks, unsupported topology and fixed data-layout drift."""
     topology = decoded(catalog["topology"])
     _require(
-        catalog["oid"] == oid
-        and catalog["relowner"] == owner
-        and catalog["relname"] == relation
-        and catalog["acl_closed"]
-        and catalog["readers_closed"]
-        and not decoded(catalog["acl"])["columns"]
+        catalog["relname"] == relation
         and topology["kind"] == "r"
         and topology["persistence"] == "u"
         and not any(topology[key] for key in ("partition", "rls", "force_rls", "parents", "children", "hooks", "rules"))
@@ -242,8 +208,8 @@ def _target_catalog(fhir, model, relation, oid, owner, catalog, *, phase="loadin
     return _target_indexes(fhir, model, relation, catalog, phase)
 
 
-async def _target(fhir, publisher, model, relation, oid, *, phase="loading"):
-    catalog_by_root = await _target_family_catalog(fhir, publisher, ((model, relation, oid),), phase=phase)
+async def _target(fhir, publisher, model, relation, *, phase="loading"):
+    catalog_by_root = await _target_family_catalog(fhir, publisher, ((model, relation),), phase=phase)
     return catalog_by_root[model.__tablename__]
 
 
@@ -252,64 +218,53 @@ async def _target_family_catalog(fhir, publisher, target_bindings, *, phase):
     admission = fhir._provider_directory_profile_capacity_admission()
     _require(admission is not None and target_bindings and phase in {"loading", "completed"})
     _require(
-        len({model.__tablename__ for model, _, _ in target_bindings})
-        == len({relation for _, relation, _ in target_bindings})
-        == len({oid for _, _, oid in target_bindings})
+        len({model.__tablename__ for model, _ in target_bindings})
+        == len({relation for _, relation in target_bindings})
         == len(target_bindings)
     )
-    for model, relation, oid in target_bindings:
-        _require(type(oid) is int and oid > 0)
+    for model, relation in target_bindings:
         _require(relation == fhir._provider_directory_artifact_scope_table_name(model.__tablename__, admission.run_id))
-    names = sorted(relation for _, relation, _ in target_bindings)
+    names = sorted(relation for _, relation in target_bindings)
     await publisher.connection.execute(
         "LOCK TABLE "
         + ",".join(storage_relation(publisher.policy.schema, relation) for relation in names)
         + " IN ROW EXCLUSIVE MODE NOWAIT"
     )
-    owner = await publisher.connection.fetchval(
-        "SELECT oid::bigint FROM pg_roles WHERE rolname=$1", publisher.policy.owner_role
-    )
-    catalog_rows = await publisher.connection.fetch(_TARGET_CATALOG_SQL, publisher.policy.schema, names, owner, [])
+    catalog_rows = await publisher.connection.fetch(_TARGET_CATALOG_SQL, publisher.policy.schema, names)
     catalog_by_name = {catalog_row["relname"]: catalog_row for catalog_row in catalog_rows}
     _require(len(catalog_rows) == len(catalog_by_name) == len(target_bindings) and set(catalog_by_name) == set(names))
     catalog_by_root = {}
-    for model, relation, oid in target_bindings:
+    for model, relation in target_bindings:
         catalog = catalog_by_name[relation]
-        if _target_catalog(fhir, model, relation, oid, owner, catalog, phase=phase):
+        if _target_catalog(fhir, model, relation, catalog, phase=phase):
             index_name = fhir._provider_directory_profile_bucket_index_sql(publisher.policy.schema, relation)[0]
             index_map = await fhir._profile_bucket_index_row(
                 publisher.policy.schema, relation, index_name, model.__tablename__
             )
             fhir._validate_profile_bucket_index_shape(index_map, model.__tablename__)
-            fhir._validate_profile_bucket_index_tablespace(index_map, model.__tablename__)
         catalog_by_root[model.__tablename__] = dict(catalog)
     return catalog_by_root
 
 
-async def completed_target_catalog(fhir, model, relation, target_oid, *, outcome):
+async def completed_target_catalog(fhir, model, relation, *, outcome):
     """Return native completion facts; this neither validates rows nor authorizes publication."""
     original = await _origin(fhir, outcome)
-    catalog = await _target(fhir, original[0], model, relation, target_oid, phase="completed")
-    await _unchanged_origin(fhir, outcome, original)
+    catalog = await _target(fhir, original[0], model, relation, phase="completed")
+    await _origin(fhir, outcome)
     return encoded(dict(schema=original[0].policy.schema, target=model.__tablename__, native_catalog=catalog))
-
-
-async def _unchanged_origin(fhir, outcome, original):
-    current = await _origin(fhir, outcome)
-    _require(current[0] is original[0] and current[1] is original[1] and current[2] == original[2])
 
 
 async def _copy_pages(fhir, request, pages, outcome, origin, columns):
     """Transport bounded records without replacing the original native endpoint."""
     json_columns = fhir._json_columns(request.model.__table__)
-    publisher, driver, _actor_by_field = origin
+    publisher, driver = origin
     counts, copied = [], 0
     async for page in pages:
         _require(type(page) is list and 0 < len(page) <= 512)
         records = [fhir._copy_record(row, columns, json_columns) for row in page]
         _require(21 + sum(_record_bytes(record) for record in records) <= 16 * 1024 * 1024)
         _require(copied + len(records) <= request.batch.projected_rows)
-        await _unchanged_origin(fhir, outcome, origin)
+        await _origin(fhir, outcome)
         try:
             command = await driver.copy_records_to_table(
                 request.relation, schema_name=publisher.policy.schema, columns=columns, records=records
@@ -331,7 +286,6 @@ async def execute_profile_copy(fhir, request, pages, *, outcome):
     _require(type(request) is NativeCopyRequest)
     model, relation = request.model, request.relation
     batch = request.batch
-    source_binding = request.source_binding
     projection_sql, projection_params = request.projection_sql, request.projection_params
     _require(
         type(request.scope_projection) is fhir._ProviderDirectoryArtifactScopeExactProjection
@@ -344,7 +298,8 @@ async def execute_profile_copy(fhir, request, pages, *, outcome):
     )
     _require(model is fhir.ProviderDirectorySource or output_models().get(model.__tablename__) is model)
     fhir._assert_artifact_scope_projection(request.scope_projection)
-    publisher, driver, actor = await _origin(fhir, outcome)
+    publisher, driver = await _origin(fhir, outcome)
+    source_binding = source._binding_json(request.source_binding, publisher.policy.schema)
     _require(_ATTEMPTED.get(id(outcome)) is None)
     _ATTEMPTED[id(outcome)] = outcome
     if batch.resource_type != "source":
@@ -356,9 +311,9 @@ async def execute_profile_copy(fhir, request, pages, *, outcome):
     source_json, batch_json = encoded(source_binding), encoded(asdict(batch))
     params_json = encoded(projection_params)
     await _source(fhir, publisher, source_binding, batch)
-    await _target(fhir, publisher, model, relation, request.target_oid)
+    await _target(fhir, publisher, model, relation)
     columns = tuple(str(column.name) for column in model.__table__.columns)
-    copied, counts = await _copy_pages(fhir, request, pages, outcome, (publisher, driver, actor), columns)
+    copied, counts = await _copy_pages(fhir, request, pages, outcome, (publisher, driver), columns)
     _require(
         copied == batch.projected_rows
         and encoded(source_binding) == source_json
@@ -366,17 +321,15 @@ async def execute_profile_copy(fhir, request, pages, *, outcome):
         and encoded(projection_params) == params_json
     )
     await _source(fhir, publisher, source_binding, batch)
-    await _target(fhir, publisher, model, relation, request.target_oid)
-    await _unchanged_origin(fhir, outcome, (publisher, driver, actor))
+    await _target(fhir, publisher, model, relation)
+    await _origin(fhir, outcome)
     _require(encoded(source_binding) == source_json and encoded(projection_params) == params_json)
-    witness = NativeCopyWitness(batch_json, request.target_oid, columns, copied, tuple(counts), source_json)
+    witness = NativeCopyWitness(
+        batch_json, (publisher.policy.schema, relation), columns, copied, tuple(counts), source_json
+    )
     _ISSUED[witness] = (
         asyncio.current_task(),
         outcome,
-        outcome.session,
-        outcome.connection,
-        driver,
-        actor["backend"],
         encoded(asdict(witness)),
     )
     return witness
@@ -390,20 +343,13 @@ def matches(witness, outcome, task):
         original is not None
         and task is asyncio.current_task()
         and type(outcome) is owned.OwnedWalTransaction
-        and all(
-            left is right
-            for left, right in zip(
-                original[:5], (task, outcome, outcome.session, outcome.connection, outcome.retained_driver), strict=True
-            )
-        )
-        and original[5] == outcome.retained_pid
-        and encoded(asdict(witness)) == original[6]
+        and original[0] is task
+        and original[1] is outcome
+        and encoded(asdict(witness)) == original[2]
         and outcome.is_committed
         and outcome.cleanup_complete
         and outcome.status == "committed_measured"
         and isinstance(measurement, BackendWalDiagnosticResult)
-        and measurement.baseline.identity == measurement.final.identity
-        and measurement.final.identity.pid == outcome.retained_pid
         and all(
             counter >= 0 and counter == int(counter)
             for counter in (

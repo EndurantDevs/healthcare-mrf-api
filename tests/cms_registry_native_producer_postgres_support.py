@@ -219,8 +219,9 @@ async def _observe_preparation(module, original, prepared, factory, request, opt
 
 
 async def _prepared_source_identity(module, database, prepared):
-    """Read the exact original SOURCE fence, stage identities, content and sequence."""
+    """Read the original SOURCE fence, named stage content and sequence values."""
     schema = prepared.address.db_schema
+    stages_by_logical = dict(prepared.address.stage_relations)
     async with source.source_transaction(database._source_component.database, isolation="repeatable read") as session:
         source_fence = await inputs._capture_bound_fhir(session, schema)
     async with database.session_factory() as session, session.begin():
@@ -228,21 +229,10 @@ async def _prepared_source_identity(module, database, prepared):
         stage_receipt = await module.prepared_address.capture_entity_address_stage_integrity_receipt(
             session,
             schema_name=schema,
-            stage_table_names={logical: stage for logical, stage, _oid in prepared.address.stage_oids},
+            stage_table_names=stages_by_logical,
         )
-        observed_oids = tuple(
-            [
-                (
-                    logical,
-                    await session.scalar(
-                        text("SELECT to_regclass(:relation)::oid"), {"relation": schema + "." + stage}
-                    ),
-                )
-                for logical, stage, _oid in prepared.address.stage_oids
-            ]
-        )
-    assert observed_oids == tuple((logical, oid) for logical, _stage, oid in prepared.address.stage_oids)
-    return source_fence, observed_oids, stage_receipt, await module._source_evidence_sequence_state(prepared)
+    coordinates = tuple(sorted((logical, schema, stage) for logical, stage in stages_by_logical.items()))
+    return source_fence, coordinates, stage_receipt, await module._source_evidence_sequence_state(prepared)
 
 
 async def _observe_preparation_failures(module, original, prepared, factory, request, options, monkeypatch, state):
@@ -258,7 +248,7 @@ async def _observe_preparation_failures(module, original, prepared, factory, req
             await module._reject_preparation(
                 state.database, prepared, factory, request, state.roles, options["capture_id"], patch
             )
-            await module._reject_raw_oid(
+            await module._reject_raw_layout(
                 state.database, prepared, factory, request, state.roles, options["capture_id"], patch
             )
             await module._reject_copy_batch_interruptions(
@@ -454,7 +444,7 @@ async def refresh_native_receipt_head(state, monkeypatch):
             },
             **snapshot,
         }
-        for name in ("profile", "doctors", "overlay_oid", "alias_generation"):
+        for name in ("profile", "doctors", "overlay", "alias_generation"):
             assert payload_by_field[name] == predecessor["payload"][name]
         receipt_id = await receipts.append_serving_receipt(session, "mrf", payload_by_field)
 
@@ -490,9 +480,9 @@ async def _publish_budget_refusal(module, database, acquired, execution, session
     events = []
     original = retention.RegistryCMSRawEpochAdmission.__call__
 
-    async def observe(adapter, phase, schema, logical, oid):
+    async def observe(adapter, phase, schema, logical):
         events.append((phase, await adapter.connection.fetchval(f'SELECT count(*) FROM "{schema}"."{logical}"')))
-        await original(adapter, phase, schema, logical, oid)
+        await original(adapter, phase, schema, logical)
 
     with monkeypatch.context() as patch:
         patch.setattr(retention.RegistryCMSRawEpochAdmission, "__call__", observe)
@@ -536,9 +526,7 @@ async def _seed_historical_profile(session, execution, contexts):
         (
             await session.execute(
                 text(
-                    "SELECT 'mrf.provider_directory_profile'::regclass::oid::bigint AS profile_target_oid,"
-                    "'mrf.provider_directory_profile_evidence'::regclass::oid::bigint AS evidence_target_oid,"
-                    "(SELECT count(*) FROM mrf.provider_directory_profile) AS profile_rows,"
+                    "SELECT (SELECT count(*) FROM mrf.provider_directory_profile) AS profile_rows,"
                     "(SELECT count(*) FROM mrf.provider_directory_profile_evidence) AS evidence_rows"
                 )
             )
@@ -546,7 +534,11 @@ async def _seed_historical_profile(session, execution, contexts):
         .mappings()
         .one()
     )
-    profile_by_field = _historical_profile_values(execution, contexts, target_by_field)
+    profile_by_field = _historical_profile_values(
+        execution,
+        contexts,
+        {**target_by_field, "targets_json": json.dumps(fhir._provider_directory_profile_target_coordinates("mrf"))},
+    )
     assert profile_by_field["profile_rows"] == profile_by_field["evidence_rows"] == 0
     await session.execute(
         text(
@@ -1007,7 +999,7 @@ async def genuine_first_prepared_publication(monkeypatch, tmp_path, copy_bounds)
 
 
 async def _reject_nonoriginal_receipt_sessions(module, database, retained):
-    """Neither the administrator nor another native session is the original Publisher."""
+    """Keep the configured publisher/schema scope without requiring one connection identity."""
     import pytest
 
     from process.provider_directory_generic_candidate import GenericCandidateError
@@ -1023,32 +1015,24 @@ async def _reject_nonoriginal_receipt_sessions(module, database, retained):
         )
     async with source.source_transaction(database._source_component.database, isolation="repeatable read"):
         async with database.session_factory() as foreign, foreign.begin():
+            await module.serving.require_registry_receipt_owner(foreign, "mrf")
             with pytest.raises(ValueError, match="original_session_required"):
-                await module.serving.require_registry_receipt_owner(foreign, "mrf")
+                await module.serving.require_registry_receipt_owner(foreign, "other_schema")
 
 
 async def _reject_prepared_custody(module, database, retained, state):
     import pytest
+    from sqlalchemy.exc import DBAPIError
 
     from process.network_custom_address_source import NetworkCustomAddressSourceError
 
     schema = retained.address_ownership.schema_name
-    async with database.engine.begin() as connection:
-        await connection.execute(text(f'GRANT UPDATE ON {schema}.entity_address_unified TO "{state.roles[1]}"'))
-    try:
-        async with source.source_transaction(
-            database._source_component.database, isolation="repeatable read"
-        ) as session:
-            with pytest.raises(ValueError, match="privileges are not closed"):
-                await module.retention.bind_prepared_registry_cms_source_pair(
-                    session,
-                    retained,
-                    receipt_id=state.predecessor["receipt_id"],
-                    receipt_payload=state.predecessor["payload"],
-                )
-    finally:
+    with pytest.raises(DBAPIError, match="permission denied"):
         async with database.engine.begin() as connection:
-            await connection.execute(text(f'REVOKE UPDATE ON {schema}.entity_address_unified FROM "{state.roles[1]}"'))
+            await connection.execute(text(f'SET LOCAL ROLE "{state.roles[1]}"'))
+            await connection.execute(
+                text(f'UPDATE "{schema}".entity_address_unified SET location_key=location_key WHERE false')
+            )
     async with source.source_transaction(database._source_component.database, isolation="read committed") as session:
         with pytest.raises(NetworkCustomAddressSourceError, match="repeatable-read transaction"):
             await module.retention.bind_prepared_registry_cms_source_pair(

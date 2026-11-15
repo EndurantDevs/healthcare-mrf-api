@@ -15,12 +15,9 @@ from process.provider_directory_profile_capacity_types import (
     PROFILE_STRATEGY_VERSION,
 )
 
-
-CAPACITY_RUNTIME_WITNESS_DOMAIN = (
-    "healthporta.provider-directory.database-capacity-runtime-witness.v1"
-)
-# Lease-v3 uses source-neutral runtime provenance. Historical lease-v2 readers
-# retain their own closed legacy field set for replay compatibility.
+CAPACITY_RUNTIME_WITNESS_DOMAIN = "healthporta.provider-directory.database-capacity-runtime-witness.v1"
+# Current leases sign these source-neutral runtime fields directly. Original
+# witness-pair hashing below is retained only for authenticating historical bytes.
 CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD = "control_plane_source_commit"
 CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD = "control_plane_image_digest"
 
@@ -34,16 +31,6 @@ _RUNTIME_WITNESS_FIELDS = frozenset(
         "profile_schema_version",
         "profile_strategy_version",
         "postgres_server_version_num",
-    }
-)
-_DEPLOYMENT_WITNESS_FIELDS = frozenset(
-    {
-        "flux_revision",
-        "bootstrap_config_sha256",
-        "kubernetes_snapshot_sha256",
-        "preflight_pod_name",
-        "preflight_pod_uid",
-        "preflight_transport",
     }
 )
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -75,18 +62,6 @@ class CapacityLeaseRuntimeWitness:
     profile_schema_version: int
     profile_strategy_version: str
     postgres_server_version_num: int
-
-
-@dataclass(frozen=True)
-class CapacityLeaseDeploymentWitness:
-    """Signed deployment facts retained as audit-only healthcare evidence."""
-
-    flux_revision: str
-    bootstrap_config_sha256: str
-    kubernetes_snapshot_sha256: str
-    preflight_pod_name: str
-    preflight_pod_uid: str
-    preflight_transport: str
 
 
 def _error(code: str, field: str) -> ProviderDirectoryCapacityLeaseError:
@@ -141,23 +116,7 @@ def _hex_digest(candidate: Any, *, field: str) -> str:
 
 
 def _integer(candidate: Any, *, field: str) -> int:
-    if (
-        isinstance(candidate, bool)
-        or not isinstance(candidate, int)
-        or not 1 <= candidate <= _MAX_SIGNED_BIGINT
-    ):
-        raise _error("invalid_value", field)
-    return candidate
-
-
-def _bounded_text(candidate: Any, *, field: str, maximum_length: int) -> str:
-    if (
-        not isinstance(candidate, str)
-        or not candidate
-        or candidate != candidate.strip()
-        or len(candidate) > maximum_length
-        or any(character.isspace() for character in candidate)
-    ):
+    if isinstance(candidate, bool) or not isinstance(candidate, int) or not 1 <= candidate <= _MAX_SIGNED_BIGINT:
         raise _error("invalid_value", field)
     return candidate
 
@@ -231,13 +190,15 @@ def _runtime_witness_identity(
 
 def _runtime_profile_identity(
     witness: Mapping[str, Any],
+    *,
+    historical: bool = False,
 ) -> dict[str, Any]:
     strategy_version = _opaque_id(
         witness["profile_strategy_version"],
         field="profile_strategy_version",
         maximum_length=128,
     )
-    if strategy_version != PROFILE_STRATEGY_VERSION:
+    if not historical and strategy_version != PROFILE_STRATEGY_VERSION:
         raise _error("invalid_value", "profile_strategy_version")
     return {
         "profile_migration_revision": _text(
@@ -260,52 +221,17 @@ def _runtime_profile_identity(
 
 def _parse_capacity_runtime_witness(
     candidate: Any,
+    *,
+    historical: bool = False,
 ) -> CapacityLeaseRuntimeWitness:
     witness = _exact_mapping(
         candidate,
         _RUNTIME_WITNESS_FIELDS,
-        field="runtime_witness",
+        field="runtime",
     )
     return CapacityLeaseRuntimeWitness(
         **_runtime_witness_identity(witness),
-        **_runtime_profile_identity(witness),
-    )
-
-
-def _parse_capacity_deployment_witness(
-    candidate: Any,
-) -> CapacityLeaseDeploymentWitness:
-    witness = _exact_mapping(
-        candidate,
-        _DEPLOYMENT_WITNESS_FIELDS,
-        field="deployment_witness",
-    )
-    transport = witness["preflight_transport"]
-    if transport != "kubectl_exec_loopback_8080":
-        raise _error("invalid_value", "preflight_transport")
-    return CapacityLeaseDeploymentWitness(
-        flux_revision=_bounded_text(
-            witness["flux_revision"], field="flux_revision", maximum_length=512
-        ),
-        bootstrap_config_sha256=_hex_digest(
-            witness["bootstrap_config_sha256"],
-            field="bootstrap_config_sha256",
-        ),
-        kubernetes_snapshot_sha256=_hex_digest(
-            witness["kubernetes_snapshot_sha256"],
-            field="kubernetes_snapshot_sha256",
-        ),
-        preflight_pod_name=_opaque_id(
-            witness["preflight_pod_name"],
-            field="preflight_pod_name",
-            maximum_length=253,
-        ),
-        preflight_pod_uid=_opaque_id(
-            witness["preflight_pod_uid"],
-            field="preflight_pod_uid",
-            maximum_length=512,
-        ),
-        preflight_transport=transport,
+        **_runtime_profile_identity(witness, historical=historical),
     )
 
 
@@ -313,7 +239,6 @@ __all__ = (
     "CAPACITY_RUNTIME_CONTROL_PLANE_IMAGE_DIGEST_FIELD",
     "CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD",
     "CAPACITY_RUNTIME_WITNESS_DOMAIN",
-    "CapacityLeaseDeploymentWitness",
     "CapacityLeaseRuntimeWitness",
     "ProviderDirectoryCapacityLeaseError",
     "capacity_runtime_witness_sha256",

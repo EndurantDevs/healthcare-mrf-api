@@ -11,14 +11,8 @@ from db.plan_release_storage import storage_relation
 from process import provider_directory_output_snapshot_custody as custody
 from process import provider_directory_output_snapshot_journal as journal
 from process import provider_directory_output_snapshot_stage as stages
-from process.plan_release_storage_catalog import ROLE_SQL
 from process.provider_directory_dataset_rehydrate_pages import projected_pages
-from process.provider_directory_dataset_rehydrate_pin import (
-    _close_reader,
-    _require_reader,
-    _same_database,
-    _SourceReader,
-)
+from process.provider_directory_dataset_rehydrate_pin import _SourceReader
 from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
 from process.provider_directory_output_snapshot_catalog import output_models, require_output
 from process.uhc_flex_practitioner_async_safety import drain_operation
@@ -83,7 +77,7 @@ def repair_npi_rows(resource_rows, decision_at):
 
 
 async def _capture_operation(directory, selector):
-    """Issue a fresh maintenance locator from genuine role and owned-input proof."""
+    """Bind a fresh maintenance locator to named inputs and the exact value selection."""
     from process.provider_directory_output_snapshot_provision import _capture
 
     require_output(
@@ -100,13 +94,6 @@ async def _capture_operation(directory, selector):
             target_name: custody._native_receipt(policy, native_rows[target_name], target_name)
             for target_name in TARGETS
         }
-        roles = await publisher.connection.fetch(
-            ROLE_SQL,
-            [policy.owner_role, policy.publisher_role, *policy.runtime_roles],
-            policy.owner_role,
-            policy.publisher_role,
-            policy.schema,
-        )
         decision_at = await publisher.connection.fetchval("SELECT localtimestamp")
         counts_by_target = {}
         for target_name in TARGETS:
@@ -114,9 +101,7 @@ async def _capture_operation(directory, selector):
             counts_by_target[target_name] = (await session.execute(text(count), params_by_name)).scalar_one()
         input_digest = custody._digest(
             {
-                "roles": policy.role_arguments(),
-                "native_role_profile": [dict(role) for role in roles],
-                "incumbents": [incumbents_by_target[target_name].to_payload() for target_name in TARGETS],
+                "incumbents": [incumbents_by_target[target_name].named_payload() for target_name in TARGETS],
                 "selector": selector,
                 "attempt_id": attempt_id,
                 "decision_at": decision_at.isoformat(),
@@ -147,28 +132,25 @@ async def _preservation_reader(directory, operation, prepared_stages):
         async with custody.output_snapshot_transaction(directory, operation=operation, targets=TARGETS) as capability:
             for stage in prepared_stages:
                 await stages._stage_row(capability, stage, phases={"loading"})
-            driver = await _require_reader(session, reader_database, capability.policy)
-            await _same_database(capability.connection, driver)
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+            driver = (await (await session.connection()).get_raw_connection()).driver_connection
             await driver.execute(
                 "LOCK TABLE "
                 + ",".join(storage_relation(stage.schema, stage.target) for stage in prepared_stages)
                 + " IN ACCESS SHARE MODE NOWAIT"
             )
-            for stage in prepared_stages:
-                require_output(
-                    await driver.fetchval(
-                        "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=pg_backend_pid() AND locktype='relation' "
-                        "AND relation=$1::oid AND mode='AccessShareLock' AND granted)",
-                        stage.incumbent.oid,
-                    ),
-                    "npi_incumbent_changed",
-                )
+            observed = await custody.read_output_relations(
+                driver, capability.policy, {stage.target: stage.target for stage in prepared_stages}
+            )
+            require_output(
+                all(observed[stage.target] == stage.incumbent for stage in prepared_stages), "npi_incumbent_changed"
+            )
             reader = _SourceReader(session, capability.policy.schema, {})
         yield reader
     finally:
         if reader is not None:
             reader.deactivate()
-        await _close_reader(session)
+        await session.close()
 
 
 async def _verify_parity(capability, stage, projection, params_by_name):
@@ -239,11 +221,11 @@ async def _discard(directory, operation, prepared_stages):
     """Remove only the authenticated still-private heaps belonging to this attempt."""
     async with custody.output_snapshot_transaction(directory, operation=operation, targets=TARGETS) as capability:
         for stage in reversed(prepared_stages):
-            oid = await capability.connection.fetchval(
-                "SELECT to_regclass($1)::oid::bigint",
+            exists = await capability.connection.fetchval(
+                "SELECT to_regclass($1) IS NOT NULL",
                 storage_relation(stage.schema, stage.relation),
             )
-            if oid is not None:
+            if exists:
                 await stages.discard_output_stage(capability, stage)
 
 

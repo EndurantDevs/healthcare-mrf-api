@@ -19,9 +19,9 @@ from api.endpoint import npi
 from process import cms_doctors_immutable as immutable
 from process import cms_doctors_preparation as preparation
 from process import reference_family_result_generation as generation
-from process import reference_source_generation as revisions
-from tests.network_read_execution_support import with_read_identity_receipts
+from tests.network_read_execution_support import provider_snapshot_setup_result, with_read_session
 from tests.test_cms_doctors_organizations import _unit_source_transaction
+from tests.test_db_connection import _FakeSession
 from tests.test_provider_profile_cms import CMS_GENERATION, NPI, _credential_row, _education_row
 
 native = importlib.import_module("process.cms_doctors")
@@ -36,9 +36,11 @@ async def _reader_scope(session, state_by_field):
     state_by_field["reader"] = True
     session.info["api_reader_verified"] = True
     try:
+        await snapshot._prepare_provider_reader(session, "mrf", fresh=True)
         yield session
     finally:
         session.info.pop("api_reader_verified", None)
+        session.info.pop("provider_profile_relations", None)
         state_by_field.pop("reader", None)
 
 
@@ -56,13 +58,34 @@ def _mock_doctors_owner(monkeypatch):
 def _reader_and_writer_session(state_by_field):
     """Keep native receipt identity stable while semantic authority changes after publication."""
     session = SimpleNamespace(info={}, execute=AsyncMock(), scalar=AsyncMock(return_value=True))
+    session.begin_nested = _FakeSession().begin_nested
+
+    def scalar(statement, *args, **kwargs):
+        if str(statement).startswith("SHOW "):
+            return "0"
+        return session.scalar.return_value
+
+    session.scalar.side_effect = scalar
     session.in_transaction = lambda: bool(state_by_field.get("reader") or state_by_field.get("binding"))
-    with_read_identity_receipts(session)
+    with_read_session(session)
 
     async def execute(statement, _parameters=None):
+        if state_by_field.get("reader"):
+            setup = provider_snapshot_setup_result(statement, _parameters, state_by_field["available_relations"])
+            if setup is not NotImplemented:
+                return setup
         if "SELECT EXISTS" in str(statement) and generation.TABLE_NAME in str(statement):
             assert state_by_field.get("reader") is True
             return SimpleNamespace(scalar=lambda: session.scalar.return_value)
+        relation = f'"mrf"."{generation.TABLE_NAME}"'
+        if str(statement) == f"SELECT local_generation FROM {relation} WHERE FALSE":
+            return SimpleNamespace(all=lambda: [])
+        if str(statement) == (
+            "SELECT attname FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass(:relation) "
+            "AND attnum>0 AND NOT attisdropped AND attname IN ('serving_schema','serving_relation_names')"
+        ):
+            assert _parameters == {"relation": relation}
+            return SimpleNamespace(all=lambda: [("serving_schema",), ("serving_relation_names",)])
         return session.execute.return_value
 
     session.execute.side_effect = execute
@@ -74,6 +97,7 @@ def runtime(monkeypatch):
     """Keep Reader refusal proof and publication state under distinct mocked owners."""
     state_by_field = {
         "credentials": [],
+        "available_relations": {f"mrf.{name}" for name in (*RELATIONS, generation.TABLE_NAME)},
         "authority": {
             "importer_id": "cms-doctors",
             "local_lineage_id": "00000000-0000-0000-0000-000000000001",
@@ -81,7 +105,8 @@ def runtime(monkeypatch):
             "origin_lineage_id": "00000000-0000-0000-0000-000000000001",
             "origin_generation": 1,
             "published_at": datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
-            "relation_oids": list(OIDS),
+            "serving_schema": "mrf",
+            "serving_relation_names": list(RELATIONS),
         },
     }
     session = _reader_and_writer_session(state_by_field)
@@ -106,29 +131,22 @@ def runtime(monkeypatch):
             state_by_field["authority"].update(
                 local_generation=params["next"],
                 origin_generation=params["generation"],
-                relation_oids=list(params["oids"]),
+                serving_schema=params["serving_schema"],
+                serving_relation_names=list(params["names"]),
             )
         return state_by_field["authority"]
 
     _mock_doctors_owner(monkeypatch)
     database.transaction, database.all = transaction, rows
     database.reader_session = lambda: _reader_scope(session, state_by_field)
-    monkeypatch.setattr(cms, "db", database)
-    monkeypatch.setattr(npi, "db", database)
-    monkeypatch.setattr(native, "db", database)
+    for module in (cms, npi, native):
+        monkeypatch.setattr(module, "db", database)
     monkeypatch.setattr(npi, "_runtime_db_schema", lambda: "mrf")
     monkeypatch.setattr(profile, "fetch_state_profile_projection", AsyncMock(return_value=None))
     monkeypatch.setattr(profile, "fetch_additional_state_profile_projections", AsyncMock(return_value=[]))
     monkeypatch.setattr(npi, "_fetch_provider_directory_profile_map", AsyncMock(return_value={}))
-    oid_by_relation = {f"mrf.{name}": oid for name, oid in zip(RELATIONS, OIDS, strict=True)}
-    oid_by_relation.update(
-        {f"mrf.{generation.TABLE_NAME}": 22000, f"mrf.{snapshot.address_generation.TABLE_NAME}": None}
-    )
-    monkeypatch.setattr(snapshot, "_inventory_serving_relations", AsyncMock(return_value=oid_by_relation))
     monkeypatch.setattr(snapshot, "_requires_cms_receipt", AsyncMock(return_value=False))
     monkeypatch.setattr(generation, "_first", first)
-    monkeypatch.setattr(generation, "current_reference_family_relation_oids", AsyncMock(return_value=OIDS))
-    monkeypatch.setattr(revisions, "install_reference_revision_guards", AsyncMock())
     return SimpleNamespace(state_by_field=state_by_field, database=database, session=session)
 
 
@@ -145,7 +163,7 @@ async def republish(runtime, monkeypatch, mode):
     async def status(statement):
         if statement.startswith("LOCK TABLE "):
             live_lock_statements.append(statement)
-            assert len(live_lock_statements) == 1
+            assert False, "verification must read-lock through the current session"
 
     runtime.database.status.side_effect = status
     monkeypatch.setattr(native, "swap_education_stage", AsyncMock())
@@ -153,8 +171,8 @@ async def republish(runtime, monkeypatch, mode):
     stage = native.make_class(native.DoctorClinicianAddress, "synthetic")
     if mode == "ordinary":
         receipt = await native._publish_cms_doctors_stage(stage, "mrf", "synthetic")
-        prelock.assert_awaited_once_with(runtime.session, stage, "mrf", "synthetic")
-        assert len(live_lock_statements) == 1
+        prelock.assert_awaited_once_with(runtime.session, stage, "mrf", "synthetic", stage_read_only=False)
+        assert not live_lock_statements
         return receipt
     monkeypatch.setattr(preparation.archive, "_verify_incumbent", AsyncMock())
     for name in ("_assert_stage", "_assert_stage_indexes", "assert_prepared_cms_doctors_seal"):
@@ -162,7 +180,7 @@ async def republish(runtime, monkeypatch, mode):
     prepared = preparation.PreparedCMSDoctorsGeneration(
         "mrf",
         "synthetic",
-        tuple((name, name + "_synthetic", oid) for name, oid in zip(RELATIONS, OIDS, strict=True)),
+        tuple((name, name + "_synthetic") for name in RELATIONS),
         SimpleNamespace(relation_oids=tuple(zip(RELATIONS, OIDS, strict=True))),
         generation.validate_reference_family_result_generation_authority(runtime.state_by_field["authority"]),
         {},
@@ -170,8 +188,8 @@ async def republish(runtime, monkeypatch, mode):
     )
     async with runtime.database.transaction():
         receipt = await preparation.apply_prepared_cms_doctors_generation(prepared)
-    prelock.assert_awaited_once_with(runtime.session, stage, "mrf", "synthetic")
-    assert len(live_lock_statements) == 1
+    prelock.assert_awaited_once_with(runtime.session, stage, "mrf", "synthetic", stage_read_only=True)
+    assert not live_lock_statements
     return receipt
 
 
@@ -214,12 +232,12 @@ async def test_republication_refuses_old_credential_page(runtime, monkeypatch, m
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["missing", "oids", "source", "schema"])
+@pytest.mark.parametrize("fault", ["missing", "names", "source", "schema"])
 async def test_snapshot_and_source_drift_still_refuse(runtime, monkeypatch, fault):
     if fault == "missing":
         runtime.state_by_field["authority"] = None
-    elif fault == "oids":
-        runtime.state_by_field["authority"]["relation_oids"][2] += 1
+    elif fault == "names":
+        runtime.state_by_field["authority"]["serving_relation_names"][2] += "_other"
     elif fault == "source":
         runtime.state_by_field["credentials"] = [_credential_row(1, "MD", generation="d" * 64)]
     else:
@@ -227,7 +245,10 @@ async def test_snapshot_and_source_drift_still_refuse(runtime, monkeypatch, faul
     error, reason = {
         "missing": (RuntimeError, "^reference family generation authority is unavailable$"),
         "source": (RuntimeError, "^cms_education_profile_generation_mixed$"),
-        "oids": (ServiceUnavailable, r"^Provider data is temporarily unavailable\.$"),
+        "names": (
+            RuntimeError,
+            "^reference family serving generation is invalid or its schema declaration is missing$",
+        ),
         "schema": (ServiceUnavailable, r"^Provider data is temporarily unavailable\.$"),
     }[fault]
     with pytest.raises(error, match=reason):

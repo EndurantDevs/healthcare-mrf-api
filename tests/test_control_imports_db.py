@@ -515,12 +515,7 @@ async def test_native_profile_uses_persisted_job(monkeypatch, secret_selection, 
     """Verify the stored signed Profile when creating or reusing its ordinary Job."""
     await _reset_import_run_schema()
     try:
-        database_identity_by_field = {
-            "database_system_identifier": str(await db.scalar("SELECT system_identifier FROM pg_control_system()")),
-            "database_oid": int(await db.scalar("SELECT oid FROM pg_database WHERE datname=current_database()")),
-            "database_name": str(await db.scalar("SELECT current_database()")),
-        }
-        recorded_run = _signed_profile_run(monkeypatch, database_identity_by_field)
+        recorded_run = _signed_profile_run(monkeypatch)
         await _persist_source_run(recorded_run)
         monkeypatch.setattr(workers, "_is_kubernetes_configured", lambda: True)
         monkeypatch.setenv("HLTHPRT_WORKER_LAUNCHER", "kubernetes")

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import process.uhc_flex_practitioner_publication as publication
 from db.connection import Database
@@ -218,17 +218,21 @@ async def _prepare_publication_schema(
         await connection.close()
 
 
+def administrator_database(engine):
+    """Registration is an administrator operation; the Source owner only reads registration rows."""
+    return Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
+
+
 @asynccontextmanager
 async def _publication_test_scope(monkeypatch):
-    from process.provider_directory_generic_source_policy import source_transaction
     from process.provider_directory_rooted_graph_registration import register_provider_directory_rooted_graph_source
     from process.uhc_flex_practitioner_registration import register_uhc_flex_practitioner_source
     from tests.provider_directory_specialized_source_postgres_support import specialized_source_scope
 
     async with specialized_source_scope(monkeypatch) as context:
-        async with source_transaction(context.database):
-            await register_uhc_flex_practitioner_source(database=context.database)
-            await register_provider_directory_rooted_graph_source(database=context.database)
+        administrator = administrator_database(context.engine)
+        await register_uhc_flex_practitioner_source(database=administrator)
+        await register_provider_directory_rooted_graph_source(database=administrator)
         yield (
             context.url,
             context.schema,

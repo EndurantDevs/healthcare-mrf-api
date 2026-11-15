@@ -22,7 +22,6 @@ from tests.test_provider_directory_profile_selection_attestation import (
     _execution,
 )
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 profile = importlib.import_module("process.provider_directory_profile")
 
@@ -42,21 +41,13 @@ def _ready_delta_checkpoint(
         "affected_npi_stage": delta.affected_npi_stage,
         "current_source_vector_hash": delta.from_source_vector_hash,
         "desired_source_vector_hash": delta.to_source_vector_hash,
-        "current_source_context_vector_hash": (
-            delta.from_source_context_vector_hash
-        ),
-        "desired_source_context_vector_hash": (
-            delta.to_source_context_vector_hash
-        ),
+        "current_source_context_vector_hash": (delta.from_source_context_vector_hash),
+        "desired_source_context_vector_hash": (delta.to_source_context_vector_hash),
         "profile_as_of": delta.profile_as_of,
         "capacity_geometry_status": delta.capacity_geometry_status,
         "capacity_geometry_hash": delta.capacity_geometry_hash,
         "capacity_geometry_json": delta.capacity_geometry_json,
-        "evidence_stage_oid": delta.evidence_stage_oid,
-        "profile_stage_oid": delta.profile_stage_oid,
-        "affected_npi_stage_oid": delta.affected_npi_stage_oid,
-        "evidence_target_oid": delta.evidence_target_oid,
-        "profile_target_oid": delta.profile_target_oid,
+        "targets_json": json.dumps(delta.targets),
         "refresh_source_ids": list(delta.refresh_source_ids),
         "removed_source_ids": list(delta.removed_source_ids),
         "evidence_next_batch": 2,
@@ -65,13 +56,12 @@ def _ready_delta_checkpoint(
         "profile_total_batches": 3,
     }
 
+
 def _matching_delta_receipt(
     delta: importer.ProviderDirectoryPreparedProfileDelta,
 ) -> dict[str, object]:
     return {
-        **importer._provider_directory_profile_delta_receipt_static_values(
-            delta
-        ),
+        **importer._provider_directory_profile_delta_receipt_static_values(delta),
         "from_capacity_geometry_json": delta.from_capacity_geometry_json,
         "capacity_geometry_json": delta.capacity_geometry_json,
         "evidence_rows": delta.expected_evidence_rows,
@@ -81,6 +71,7 @@ def _matching_delta_receipt(
         "profile_inserted": 0,
         "profile_deleted": 0,
     }
+
 
 def _matching_delta_serving_state(
     delta: importer.ProviderDirectoryPreparedProfileDelta,
@@ -99,8 +90,7 @@ def _matching_delta_serving_state(
         source_context_vector=(("source-a", "a" * 64),),
         source_context_vector_hash=delta.from_source_context_vector_hash,
         executable_plan_hash="b" * 64,
-        evidence_target_oid=delta.evidence_target_oid,
-        profile_target_oid=delta.profile_target_oid,
+        targets=delta.targets,
         evidence_rows=delta.expected_evidence_rows,
         profile_rows=delta.expected_profile_rows,
         profile_as_of=delta.profile_as_of,
@@ -109,6 +99,7 @@ def _matching_delta_serving_state(
         capacity_geometry_hash=delta.from_capacity_geometry_hash,
         capacity_geometry_json=delta.from_capacity_geometry_json,
     )
+
 
 def _valid_serving_row() -> dict[str, object]:
     source_vector = (("source-a", "dataset-a"),)
@@ -122,32 +113,15 @@ def _valid_serving_row() -> dict[str, object]:
         "authority_revision": 7,
         "profile_schema_version": 1,
         "profile_strategy_version": profile.PROFILE_BUILD_STRATEGY_VERSION,
-        "source_vector_json": (
-            importer._provider_directory_profile_source_vector_json(
-                source_vector
-            )
-        ),
-        "source_vector_hash": (
-            importer._provider_directory_profile_source_vector_hash(
-                source_vector
-            )
-        ),
-        "source_context_vector_json": (
-            importer._provider_directory_profile_source_context_vector_json(
-                context_vector
-            )
-        ),
-        "source_context_vector_hash": (
-            importer._provider_directory_profile_source_context_vector_hash(
-                context_vector
-            )
-        ),
+        "source_vector_json": (importer._provider_directory_profile_source_vector_json(source_vector)),
+        "source_vector_hash": (importer._provider_directory_profile_source_vector_hash(source_vector)),
+        "source_context_vector_json": (importer._provider_directory_profile_source_context_vector_json(context_vector)),
+        "source_context_vector_hash": (importer._provider_directory_profile_source_context_vector_hash(context_vector)),
         "executable_plan_hash": "3" * 64,
         "capacity_geometry_status": "legacy_unavailable",
         "capacity_geometry_hash": None,
         "capacity_geometry_json": None,
-        "evidence_target_oid": 11,
-        "profile_target_oid": 12,
+        "targets_json": json.dumps(importer._provider_directory_profile_target_coordinates("mrf")),
         "evidence_rows": 3,
         "profile_rows": 2,
         "profile_as_of": "2026-07-30",

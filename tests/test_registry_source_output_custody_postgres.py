@@ -81,10 +81,10 @@ async def test_independent_seal_rejects_same_count_mapped_output_forgery(provide
         await fixture.seal_candidate(copy_target)
     assert (
         await fixture.connection.fetchval(
-            f'SELECT count(*) FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
+            f'SELECT state FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
             UUID(copy_target.candidate_id),
         )
-        == 0
+        != "published"
     )
     assert (
         await fixture.connection.fetchval(
@@ -104,8 +104,14 @@ async def test_independent_seal_rejects_same_count_mapped_output_forgery(provide
     )
     assert (
         await fixture.connection.fetchval(
-            f'SELECT count(*) FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
+            f'SELECT state FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
             UUID(copy_target.candidate_id),
         )
-        == 1
+        == "published"
+    )
+    assert (
+        await fixture.connection.fetchval(
+            f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control WHERE id=1'
+        )
+        > context.manifest.generation_id
     )

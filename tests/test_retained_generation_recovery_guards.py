@@ -62,11 +62,11 @@ async def test_recovery_with_no_extra_dependencies_does_not_lock_unrelated_relat
     monkeypatch.setattr(recovery.receipts, "lock", lock)
     assert await recovery._lock_recovery(directory, PIN, baseline, baseline) == recovery.receipts.ROOTS
     driver.execute.assert_not_awaited()
-    lock.assert_awaited_once_with(database, "sample", recovery.receipts.ROOTS, mode="SHARE")
+    lock.assert_awaited_once_with(database, "sample", recovery.receipts.ROOTS, mode="ACCESS SHARE")
 
 
 @pytest.mark.asyncio
-async def test_unchanged_root_oids_do_not_prepare_or_borrow_retained_heaps(monkeypatch):
+async def test_unchanged_root_contents_do_not_prepare_or_borrow_retained_heaps(monkeypatch):
     baseline, overlay, _ = serving_states()
     proofs_by_root = {
         root: SimpleNamespace(
@@ -76,18 +76,26 @@ async def test_unchanged_root_oids_do_not_prepare_or_borrow_retained_heaps(monke
     }
     replaced = recovery.receipts.ROOTS[0]
     retained = copy.deepcopy(baseline["roots"][replaced])
-    retained_name = recovery.receipts.retained_name(retained["native"]["oid"])
+    generation = recovery.publication_generation(PIN)
+    retained_name = recovery.receipts.retained_name(generation, replaced)
     retained["native"]["relname"] = retained_name
-    retained["native"]["indexes"][0]["name"] = recovery.receipts.retained_name(102, index=True)
-    retained["native"]["constraints"][0]["name"] = recovery.receipts.retained_name(102, index=True)
     retained_proof = SimpleNamespace(receipt_json=encoded(retained), elapsed_seconds=0, heap_bytes=1, total_bytes=2)
     prepare = AsyncMock(
         side_effect=lambda _db, _schema, name: retained_proof if name == retained_name else proofs_by_root[name]
     )
     monkeypatch.setattr(recovery.receipts, "prepare_relation", prepare)
     directory = SimpleNamespace(db=object(), _schema=lambda: "sample")
+    history_by_phase = {
+        "overlay": {
+            "document": {
+                "version": 2,
+                "generation": generation,
+                "preparation": {"retained_relations": {replaced: {"schema": "sample", "relation": retained_name}}},
+            }
+        }
+    }
     selected, retained_by_root, preparation = await recovery._prepare_inverse_receipts(
-        directory, baseline, overlay, None
+        directory, baseline, overlay, None, history=history_by_phase
     )
     assert selected == proofs_by_root and retained_by_root == {replaced: retained_proof}
     assert prepare.await_args_list == [
@@ -135,7 +143,13 @@ async def test_inverse_preserves_unchanged_heaps_and_handles_absent_optional_cal
         {"elapsed_seconds": 0},
     )
     assert restored_state is after
-    retain.assert_awaited_once_with(database, "sample", overlay["roots"][replaced])
+    retain.assert_awaited_once_with(
+        database,
+        "sample",
+        overlay["roots"][replaced],
+        generation=recovery.publication_generation(PIN),
+        phase="recovered",
+    )
     restore.assert_awaited_once_with(database, "sample", baseline["roots"][replaced], prepared=restored_proof)
     generations.publish_local_entity_address_generation.assert_awaited_once_with(database, schema_name="sample")
     assert append.await_args.args[3] == "recovered"

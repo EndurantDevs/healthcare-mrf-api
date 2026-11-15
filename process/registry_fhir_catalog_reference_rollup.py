@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Aggregate normalized provider reference facts in bounded native SQL pages."""
 
-import asyncio
 import json
 import re
 from contextlib import asynccontextmanager
@@ -19,7 +18,6 @@ from process.registry_fhir_catalog_extraction import (
     fhir_catalog_text,
     fhir_network_reference_target,
     fhir_source_uri,
-    verify_fhir_catalog_source_read,
 )
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
@@ -58,21 +56,8 @@ class FHIRCatalogReferenceRollup:
 @dataclass
 class FHIRCatalogReferenceWorkspace:
     connection: object
-    task: object
     table_name: str
-    table_oid: int
     active: bool = True
-
-    async def verify(self, connection):
-        """Require the active workspace, original task, connection and unchanged temporary table."""
-        if (
-            not self.active
-            or connection is not self.connection
-            or self.task is not asyncio.current_task()
-            or await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + self.table_name)
-            != self.table_oid
-        ):
-            _fail("workspace_closed")
 
 
 @asynccontextmanager
@@ -84,8 +69,7 @@ async def fhir_catalog_reference_workspace(connection):
     workspace = None
     try:
         await connection.execute(f"CREATE TEMP TABLE {_identifier(name)} ({_STAGE_COLUMNS}) ON COMMIT PRESERVE ROWS")
-        oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + name)
-        workspace = FHIRCatalogReferenceWorkspace(connection, asyncio.current_task(), name, oid)
+        workspace = FHIRCatalogReferenceWorkspace(connection, name)
         yield workspace
     finally:
         if workspace is not None:
@@ -232,15 +216,13 @@ def _edge(record, source_uri):
 
 @dataclass
 class FHIRCatalogReferenceStage:
-    """A task-owned temporary summary; it never grants Source admission or mapping authority."""
+    """A bounded temporary reference summary for an active snapshot."""
 
     connection: object
-    task: object
     table_name: str
     source_uri: str | None
     accounting: FHIRCatalogReferenceAccounting
     active: bool = True
-    source_read: object | None = None
 
     async def iter_batches(self, *, page_rows=MAX_OUTPUT_ROWS):
         """Yield bounded genuine representative edges while this stage remains active."""
@@ -248,9 +230,8 @@ class FHIRCatalogReferenceStage:
             _fail()
         cursor = ("", "", -1)
         while True:
-            if not self.active or self.task is not asyncio.current_task() or not self.connection.is_in_transaction():
+            if not self.active or not self.connection.is_in_transaction():
                 _fail("stage_closed")
-            await verify_fhir_catalog_source_read(self.connection, self.source_read)
             records = await self.connection.fetch(
                 f"SELECT * FROM pg_temp.{_identifier(self.table_name)} "
                 'WHERE (resource_type COLLATE "C",resource_id COLLATE "C",reference_ordinal)>'
@@ -265,14 +246,11 @@ class FHIRCatalogReferenceStage:
             yield tuple(_edge(record, self.source_uri) for record in records)
 
 
-async def _fill_stage(
-    connection, resources, table_name, dataset_id, page_rows, page_bytes, source_read=None, plan_tiers=False
-):
+async def _fill_stage(connection, resources, table_name, dataset_id, page_rows, page_bytes, *, plan_tiers=False):
     query = _PAGE_SQL.format(resources=resources, staging="pg_temp." + _identifier(table_name))
     totals_by_kind = {"source_rows": 0, "reference_rows": 0, "without_refs": 0, "source_bytes": 0}
     counts_by_type, cursor = {kind: 0 for kind in RESOURCE_TYPES}, ("", "")
     while True:
-        await verify_fhir_catalog_source_read(connection, source_read, dataset_id=dataset_id)
         report = await drain_operation(
             connection.fetchrow(
                 query, dataset_id, RESOURCE_TYPES, *cursor, page_rows, page_bytes, MAX_PAGE_REFERENCES, plan_tiers
@@ -340,7 +318,8 @@ async def _verify_reference_workspace(connection, workspace):
     if workspace is not None:
         if type(workspace) is not FHIRCatalogReferenceWorkspace:
             _fail("workspace_invalid")
-        await workspace.verify(connection)
+        if not workspace.active:
+            _fail("workspace_closed")
 
 
 def staged_fhir_catalog_references(
@@ -351,12 +330,12 @@ def staged_fhir_catalog_references(
     page_rows=MAX_SOURCE_ROWS,
     page_bytes=DEFAULT_BYTES,
     source_uri=None,
-    source_read=None,
+    resource_relation=None,
     workspace=None,
 ):
     """Stage bounded references using the original Organization policy."""
     return _staged_references(
-        connection, schema_name, dataset_id, (page_rows, page_bytes), (source_uri, source_read, workspace), False
+        connection, schema_name, dataset_id, (page_rows, page_bytes), (source_uri, resource_relation, workspace), False
     )
 
 
@@ -368,12 +347,12 @@ def staged_plan_tier_references(
     page_rows=MAX_SOURCE_ROWS,
     page_bytes=DEFAULT_BYTES,
     source_uri=None,
-    source_read=None,
+    resource_relation=None,
     workspace=None,
 ):
     """Stage bounded references using the typed published policy."""
     return _staged_references(
-        connection, schema_name, dataset_id, (page_rows, page_bytes), (source_uri, source_read, workspace), True
+        connection, schema_name, dataset_id, (page_rows, page_bytes), (source_uri, resource_relation, workspace), True
     )
 
 
@@ -381,12 +360,10 @@ def staged_plan_tier_references(
 async def _staged_references(connection, schema_name, dataset_id, bounds, readers, plan_tiers):
     """Roll up admitted normalized rows in the caller's pinned snapshot, without provider payload transfer."""
     page_rows, page_bytes = bounds
-    source_uri, source_read, workspace = readers
+    source_uri, resource_relation, workspace = readers
     _validate_reference_page(schema_name, dataset_id, page_rows, page_bytes)
     await _verify_reference_workspace(connection, workspace)
-    resources = await fhir_catalog_resource_relation(
-        connection, schema_name=schema_name, dataset_id=dataset_id, source_read=source_read
-    )
+    resources = fhir_catalog_resource_relation(schema_name=schema_name, resource_relation=resource_relation)
     source_uri = fhir_source_uri(source_uri)
     table_name = workspace.table_name if workspace is not None else "fhir_catalog_refs_" + uuid4().hex
     stage = None
@@ -398,15 +375,13 @@ async def _staged_references(connection, schema_name, dataset_id, bounds, reader
         )
         await drain_operation(connection.execute(statement), preserve_cancellation=True)
         accounting = await _fill_stage(
-            connection, resources, table_name, dataset_id, page_rows, page_bytes, source_read, plan_tiers
+            connection, resources, table_name, dataset_id, page_rows, page_bytes, plan_tiers=plan_tiers
         )
         stage = FHIRCatalogReferenceStage(
             connection,
-            asyncio.current_task(),
             table_name,
             source_uri,
             accounting,
-            source_read=source_read,
         )
         yield stage
     finally:

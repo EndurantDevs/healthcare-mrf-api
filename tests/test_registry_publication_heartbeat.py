@@ -90,8 +90,6 @@ def heartbeat_case(monkeypatch):
             release_markers.append("heartbeat_stopped")
             events.heartbeat_stopped.set()
 
-    monkeypatch.setattr(consumer, "_verify_execution", AsyncMock())
-    monkeypatch.setattr(consumer, "_verify_lifecycle", AsyncMock())
     monkeypatch.setattr(consumer, "_HEARTBEAT_SECONDS", 0)
     monkeypatch.setattr(consumer, "_heartbeat", observe_heartbeat)
     lifecycle = MagicMock()

@@ -344,42 +344,6 @@ async def _has_exact_triggers(connection: object, schema: str) -> bool:
     )
 
 
-async def _has_private_acl(connection: object, schema: str) -> bool:
-    is_public_denied = await connection.fetchval(
-        "SELECT bool_and(NOT has_table_privilege('public', "
-        "format('%I.%I', $1::text, table_name), privilege)) "
-        "FROM unnest($2::text[]) AS table_name "
-        "CROSS JOIN unnest($3::text[]) AS privilege",
-        schema,
-        list(_NEW_TABLES),
-        ["SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"],
-    )
-    public_helper_count = await connection.fetchval(
-        "SELECT count(*) FROM pg_proc AS procedure JOIN pg_namespace AS namespace "
-        "ON namespace.oid=procedure.pronamespace WHERE namespace.nspname=$1 "
-        "AND (procedure.proname LIKE 'public_evidence_nppes_%' "
-        "OR procedure.proname='nppes_registry_payload_digest' "
-        "OR procedure.proname LIKE 'validate_public_evidence_nppes_%' "
-        "OR procedure.proname LIKE 'guard_%_admission_append') "
-        "AND has_function_privilege('public', procedure.oid, 'EXECUTE')",
-        schema,
-    )
-    return is_public_denied is True and public_helper_count == 0
-
-
-async def _has_writer_maintain_privilege(connection: object, schema: str) -> bool:
-    """Require the PostgreSQL 18 privilege used by transactional ANALYZE."""
-
-    has_maintain = await connection.fetchval(
-        "SELECT bool_and(has_table_privilege(current_user, "
-        "format('%I.%I', $1::text, table_name), 'MAINTAIN')) "
-        "FROM unnest($2::text[]) AS table_name",
-        schema,
-        list((_SOURCE_RECORD, _MEMBER, _COMMON, _SOURCE_LINK, _TYPED)),
-    )
-    return has_maintain is True
-
-
 async def assert_nppes_admission_catalog(connection: object, schema: str) -> None:
     """Reject any stale or partially installed NPPES admission catalog."""
 
@@ -389,8 +353,6 @@ async def assert_nppes_admission_catalog(connection: object, schema: str) -> Non
             not _has_exact_columns(column_records)
             or not await _has_exact_constraints(connection, schema)
             or not await _has_exact_triggers(connection, schema)
-            or not await _has_private_acl(connection, schema)
-            or not await _has_writer_maintain_privilege(connection, schema)
         ):
             raise writer_error()
     except Exception:
@@ -709,14 +671,14 @@ def _has_candidate_triggers(records, schema):
 
 
 async def assert_nppes_candidate_catalog(connection, schema, policy):
-    """Require authenticated control custody before accepting retired archive guards."""
+    """Validate the candidate's native data schema and retained statement guards."""
     try:
         from process.nppes_isolated_catalog import verified_isolated_nppes_catalog
-        from process.nppes_public_evidence_control_custody import assert_nppes_control_custody
 
         if await verified_isolated_nppes_catalog(connection, schema, policy) is not None:
             return
-        await assert_nppes_control_custody(connection, schema, policy)
+        if policy.schema != schema or connection.is_in_transaction() is not True:
+            raise writer_error()
         if (
             not _has_candidate_columns(await _column_records(connection, schema, _CONTROL_COLUMNS))
             or not _has_candidate_constraints(await _candidate_constraints(connection, schema), schema)

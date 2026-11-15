@@ -128,7 +128,10 @@ async def test_two_projection_readers_drain_before_parent_stage_owner(owned_pref
     assert all(
         reader["wal_classification"] == "mixed_unclassified" for reader in capture["projection_readers"]["readers"]
     )
-    assert len({reader["measurement"]["backend_pid"] for reader in capture["projection_readers"]["readers"]}) == 2
+    assert len(capture["projection_readers"]["readers"]) == 2
+    for reader in capture["projection_readers"]["readers"]:
+        assert reader["measurement"]["wal_record_bytes"] == "128"
+        assert reader["measurement"]["global_physical_lsn_span"] == 256
     json.dumps(capture)
     for (_sql, params, _pid), batch in zip(state.reads[:2], batches, strict=True):
         assert params == {

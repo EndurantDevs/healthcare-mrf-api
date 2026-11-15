@@ -15,7 +15,6 @@ from process import provider_directory_owned_wal_transaction as owned
 from process import provider_directory_profile_native_copy as native_copy
 from process import provider_directory_profile_source_inputs as inputs
 from process.provider_directory_output_snapshot_catalog import encoded, require_output
-from process.provider_directory_projection_stage import _copy_driver
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 _ACTIVE = contextvars.ContextVar("provider_directory_profile_scope_reads", default=None)
@@ -40,7 +39,6 @@ class _Scope:
     full_json: str
     resource_json: str
     names_json: str
-    oids_json: str
     producer: tuple
 
 
@@ -77,8 +75,7 @@ def _require_scope(directory):
         and inputs._fence_json(scope.resource) == scope.resource_json == scope.pin.resource_json
         and directory._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get() is scope.full
         and tuple(scope.resource.source_ids) == directory._PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS.get()
-        and encoded(directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()) == scope.names_json
-        and encoded(directory._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.get()) == scope.oids_json,
+        and encoded(directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()) == scope.names_json,
         "profile_read_snapshot_changed",
     )
     return scope, scope_state_by_field
@@ -93,40 +90,24 @@ def is_active(directory):
 
 
 async def _native_actor(scope, publisher, session):
-    """Retain the real same-task owner, isolation and backend identity."""
-    driver = await _copy_driver(session)
-    require_output(driver is publisher.connection and driver.is_in_transaction() is True, "profile_read_driver_changed")
+    """Require the declared native transaction settings for each bounded read."""
+    driver = publisher.connection
+    require_output(session.in_transaction() and driver.is_in_transaction() is True, "profile_read_transaction_changed")
     require_output(
         await driver.fetchval("SHOW transaction_isolation") == publisher.transaction_isolation,
         "profile_read_transaction_changed",
     )
-    actor = await driver.fetchrow(
-        "SELECT session_user::text AS session,current_user::text AS current,"
-        "pg_backend_pid() AS backend,pg_current_xact_id()::text AS xid,"
-        "current_setting('transaction_read_only') AS readonly"
-    )
-    require_output(
-        actor is not None
-        and actor["session"] == publisher.policy.publisher_role
-        and actor["current"] == publisher.policy.owner_role
-        and actor["readonly"] == "off"
-        and type(actor["backend"]) is int
-        and actor["xid"] is not None,
-        "profile_read_actor_changed",
-    )
-    return driver, actor
+    return driver
 
 
-async def _attest(scope, scope_state_by_field, *, reusable_origin=None):
-    """Check the same native actor, pin and completed nine-table catalog."""
+async def _attest(scope, scope_state_by_field, *, reuse_catalog=False):
+    """Recheck the signed input, logical names and completed nine-table data shape."""
     directory = scope.directory
     _require_scope(directory)
     publisher = source.bound_publisher()
     session = source.source_copy_session()
-    binding = directory.db._transaction_binding()
     require_output(
-        binding is not None
-        and binding.session is session
+        session.in_transaction()
         and publisher.factory is scope.factory
         and publisher.policy is scope.pin.policy
         and publisher.policy.schema == directory._schema()
@@ -134,34 +115,19 @@ async def _attest(scope, scope_state_by_field, *, reusable_origin=None):
         "profile_read_transaction_changed",
     )
     await directory._provider_directory_profile_capacity_acceptance_time(scope.lease)
-    driver, actor = await _native_actor(scope, publisher, session)
-    require_output(
-        not await driver.fetchval("SELECT pg_try_advisory_xact_lock($1::bigint)", scope.pin.probe),
-        "profile_read_database_changed",
-    )
-    origin = publisher, session, driver, actor["backend"], actor["xid"]
-    if reusable_origin is not None:
+    driver = await _native_actor(scope, publisher, session)
+    if reuse_catalog:
         active = _READ.get()
-        require_output(
-            active is not None
-            and active[:2] == (scope, asyncio.current_task())
-            and active[2] is reusable_origin
-            and all(current is original for current, original in zip(origin[:3], reusable_origin[:3], strict=True))
-            and origin[3:] == reusable_origin[3:],
-            "profile_read_transaction_changed",
-        )
-        _require_scope(directory)
-        return reusable_origin
+        require_output(active == (scope, asyncio.current_task()), "profile_read_transaction_inherited")
+        return session
     names = directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()
-    oids = directory._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.get()
     await driver.execute(
         "LOCK TABLE "
         + ",".join(storage_relation(publisher.policy.schema, names[root]) for root in sorted(names))
         + " IN ACCESS SHARE MODE NOWAIT"
     )
     target_bindings = tuple(
-        (model, names[model.__tablename__], oids[model.__tablename__])
-        for model in (directory.ProviderDirectorySource, *directory.RESOURCE_MODELS)
+        (model, names[model.__tablename__]) for model in (directory.ProviderDirectorySource, *directory.RESOURCE_MODELS)
     )
     catalog_by_root = await native_copy._target_family_catalog(directory, publisher, target_bindings, phase="completed")
     require_output(all(type(facts) is dict for facts in catalog_by_root.values()), "profile_read_catalog_required")
@@ -170,24 +136,20 @@ async def _attest(scope, scope_state_by_field, *, reusable_origin=None):
         scope_state_by_field["catalog_by_root"] = catalog_json
     require_output(scope_state_by_field["catalog_by_root"] == catalog_json, "profile_read_catalog_changed")
     _require_scope(directory)
-    return origin
+    return session
 
 
 @asynccontextmanager
 async def _verified_read(scope, scope_state_by_field):
-    active = _READ.get()
-    reusable_origin = active[2] if active is not None else None
-    origin = await _attest(scope, scope_state_by_field, reusable_origin=reusable_origin)
-    token = _READ.set((scope, asyncio.current_task(), origin))
+    is_catalog_reused = _READ.get() is not None
+    session = await _attest(scope, scope_state_by_field, reuse_catalog=is_catalog_reused)
+    token = _READ.set((scope, asyncio.current_task()))
     try:
         try:
-            yield origin[1]
+            yield session
         except BaseException as error:
             try:
-                require_output(
-                    await _attest(scope, scope_state_by_field, reusable_origin=reusable_origin) == origin,
-                    "profile_read_transaction_changed",
-                )
+                await _attest(scope, scope_state_by_field, reuse_catalog=is_catalog_reused)
             except BaseException as verification_error:
                 failures = BaseExceptionGroup("profile_read_and_verification_failed", [error, verification_error])
                 if isinstance(error, asyncio.CancelledError):
@@ -195,10 +157,7 @@ async def _verified_read(scope, scope_state_by_field):
                 raise failures from error
             raise
         else:
-            require_output(
-                await _attest(scope, scope_state_by_field, reusable_origin=reusable_origin) == origin,
-                "profile_read_transaction_changed",
-            )
+            await _attest(scope, scope_state_by_field, reuse_catalog=is_catalog_reused)
     finally:
         _READ.reset(token)
 
@@ -233,8 +192,8 @@ async def _drain(scope_state_by_field):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _validated_admission(directory, projection, relation_by_table, oids_by_table):
-    """Keep the exact signed nine-root run names and positive native identities."""
+def _validated_admission(directory, projection, relation_by_table):
+    """Keep the exact signed nine-root run names and completed projection."""
     admission = directory._provider_directory_profile_capacity_admission()
     require_output(
         admission is not None
@@ -249,9 +208,8 @@ def _validated_admission(directory, projection, relation_by_table, oids_by_table
         len(models) == len(roots) == 9
         and len(projection.tables) == 9
         and {table.table_name for table in projection.tables} == roots
-        and set(relation_by_table) == set(oids_by_table) == roots
-        and len(set(oids_by_table.values())) == 9
-        and all(type(oid) is int and oid > 0 for oid in oids_by_table.values())
+        and set(relation_by_table) == roots
+        and len(set(relation_by_table.values())) == 9
         and all(
             relation_by_table[root] == directory._provider_directory_artifact_scope_table_name(root, admission.run_id)
             for root in roots
@@ -262,10 +220,10 @@ def _validated_admission(directory, projection, relation_by_table, oids_by_table
 
 
 @asynccontextmanager
-async def prepared_scope(directory, projection, relation_by_table, oids_by_table, full_fence, resource_fence):
+async def prepared_scope(directory, projection, relation_by_table, full_fence, resource_fence):
     """Issue read authority only after the original signed family is completed."""
     require_output(_ACTIVE.get() is None and source.is_source_storage_required(), "profile_read_scope_required")
-    admission = _validated_admission(directory, projection, relation_by_table, oids_by_table)
+    admission = _validated_admission(directory, projection, relation_by_table)
     pin, pin_state = inputs._require_scope(directory)
     scope = _Scope(
         directory,
@@ -282,7 +240,6 @@ async def prepared_scope(directory, projection, relation_by_table, oids_by_table
         inputs._fence_json(full_fence),
         inputs._fence_json(resource_fence),
         encoded(relation_by_table),
-        encoded(oids_by_table),
         source.source_producer_identity(),
     )
     scope_state_by_field = dict(active=True, tasks={}, catalog_by_root=None)
@@ -290,7 +247,7 @@ async def prepared_scope(directory, projection, relation_by_table, oids_by_table
     token = _ACTIVE.set(scope)
     try:
         async with read_transaction(directory) as session:
-            require_output(session is source.source_copy_session(), "profile_read_session_changed")
+            require_output(session.in_transaction(), "profile_read_transaction_changed")
         try:
             yield
         except BaseException:
@@ -299,7 +256,7 @@ async def prepared_scope(directory, projection, relation_by_table, oids_by_table
         else:
             await drain_operation(_drain(scope_state_by_field), preserve_cancellation=True)
             async with read_transaction(directory) as session:
-                require_output(session is source.source_copy_session(), "profile_read_session_changed")
+                require_output(session.in_transaction(), "profile_read_transaction_changed")
     finally:
         scope_state_by_field["active"] = False
         _ACTIVE.reset(token)

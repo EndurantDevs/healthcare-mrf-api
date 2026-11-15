@@ -11,7 +11,6 @@ from process.provider_directory_profile_capacity_runtime_witness import (
     CAPACITY_RUNTIME_CONTROL_PLANE_SOURCE_COMMIT_FIELD,
 )
 
-
 # This revision is signed into the neutral cross-repository execution golden.
 # Any repository head change requires regenerating that fixture and its hashes.
 PROFILE_RUNTIME_WITNESS_MIGRATION_REVISION = "20260917120000_entity_address_service_network"
@@ -86,3 +85,16 @@ def golden_capacity_storage() -> tuple[list[dict[str, object]], ...]:
             },
         ],
     )
+
+
+def golden_storage_classes() -> list[dict[str, object]]:
+    """Use one pool and one complete outstanding reservation across the three classes."""
+    return [
+        {
+            "storage_class": name,
+            "available_bytes": 1_000_000_000_000,
+            "reserved_bytes": reserved,
+            "available_after_all_reservations_bytes": 1_000_000_000_000 - 2 * reserved,
+        }
+        for name, reserved in (("data", 180_000_000_000), ("temp", 20_000_000_000), ("wal", 150_000_000_000))
+    ]

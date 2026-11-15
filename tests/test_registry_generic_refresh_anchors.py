@@ -5,7 +5,7 @@ import asyncio
 import json
 from dataclasses import asdict, replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import pytest
@@ -55,11 +55,11 @@ async def test_organization_scope_refuses_missing_duplicate_or_unrelated_evidenc
         release_id="release-one",
         capture_sha256="b" * 64,
     )
-    retained = SimpleNamespace(capture=capture, verify=AsyncMock())
+    retained = SimpleNamespace(capture=capture, require_ready=Mock())
     driver = SimpleNamespace(fetch=AsyncMock(return_value=rows))
     with pytest.raises(RegistryRefreshAnchorMismatch):
         await generic._organization_scopes(driver, retained, (_generic_binding(),), RegistryPTGGraphReadBudget(1048576))
-    retained.verify.assert_awaited_once_with(driver, capture)
+    retained.require_ready.assert_called_once_with(capture)
 
 
 @pytest.mark.asyncio
@@ -71,7 +71,7 @@ async def test_scope_keeps_original_capture_hash_and_native_approved_binding_fin
         capture_sha256="b" * 64,
     )
     binding = _generic_binding()
-    retained = SimpleNamespace(capture=capture, verify=AsyncMock())
+    retained = SimpleNamespace(capture=capture, require_ready=Mock())
     driver = SimpleNamespace(fetch=AsyncMock(return_value=[{"resource_id": "network-one"}]))
     scopes = await generic._organization_scopes(driver, retained, (binding,), RegistryPTGGraphReadBudget(1048576))
     scope = scopes[binding.binding_id]
@@ -107,7 +107,7 @@ async def test_scope_json_is_not_a_native_session_capability():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["coordinates", "producer", "transaction", "edition", "physical_oid"])
+@pytest.mark.parametrize("fault", ["coordinates", "producer", "transaction", "edition"])
 async def test_original_capture_requires_exact_typed_epoch_and_catalog_identity(monkeypatch, fault):
     from process import network_fhir_retained_capture as captures
     from tests.test_network_fhir_retained_capture import retained
@@ -129,7 +129,6 @@ async def test_original_capture_requires_exact_typed_epoch_and_catalog_identity(
         is_in_transaction=lambda: fault != "transaction",
         fetchrow=AsyncMock(
             return_value={
-                "schema_oid": capture.schema_oid + 1,
                 "capture_comment": generic._PREFIX + json.dumps(asdict(capture)),
             }
         ),
@@ -140,7 +139,7 @@ async def test_original_capture_requires_exact_typed_epoch_and_catalog_identity(
         await generic.read_original_generic_capture_metadata(
             driver, {} if fault == "coordinates" else coordinates, RegistryPTGGraphReadBudget(1048576)
         )
-    assert driver.fetchrow.await_count == int(fault == "physical_oid")
+    driver.fetchrow.assert_not_awaited()
     verify.assert_not_awaited()
 
 

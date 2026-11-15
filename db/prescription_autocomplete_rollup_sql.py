@@ -68,8 +68,8 @@ def prescription_autocomplete_source_fingerprint_sql(
 ) -> str:
     """Identify the provider relation summarized by one rollup generation."""
 
-    relation = _table(schema, provider_table).replace("'", "''")
-    return f"COALESCE(to_regclass('{relation}')::oid::text, '0')"
+    relation = f"{schema}.{provider_table}".replace("'", "''")
+    return f"'{relation}'"
 
 
 def prescription_autocomplete_rollup_insert_sql(

@@ -29,14 +29,7 @@ _COLUMNS = "provider_system,provider_id,location_id,location_key,entity_type,ent
 def _office_inputs(candidate):
     report = _json_object(candidate["validation_json"])
     address_source = PinnedAddressSource(**report["address_source"])
-    closure = report["writer_closure"]
-    artifact = report.get("serving_readiness", {}).get("address_artifact")
-    roles = (
-        tuple(artifact["runtime_roles"])
-        if type(artifact) is dict
-        else tuple(sorted(set(closure["loader_roles"] + closure["reader_roles"])))
-    )
-    return address_source, roles
+    return address_source, ()
 
 
 async def _native_candidate(connection, target, candidate, schema):
@@ -366,7 +359,7 @@ async def verify_verified_witness_bindings(connection, copy_target, candidate, a
     await _native_candidate(connection, copy_target, candidate, control_schema)
     expected = verify_initial_source_office_receipt(candidate)
     address_source, roles = _office_inputs(candidate)
-    context, _ = await _policy_context(connection, address_source, roles, approved, control_schema)
+    context = await _policy_context(connection, address_source, roles, approved, control_schema)
     if expected is None or expected["revision"] != 5 or context != stage.office_policy_context:
         raise RegistryInitialSourceError("registry_source_office_summary_differs")
     matches = stage.office_matches

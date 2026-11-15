@@ -6,7 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import MetaData
 
+from db.models import AddressAliasArtifactStateV1
 from tests.test_provider_directory_artifact_cutover import (
     _assert_artifact_relation_values,
     _create_artifact_bundle_relations,
@@ -93,6 +95,10 @@ async def test_prepared_bundle_obeys_outer_commit_and_rollback(monkeypatch, abor
             ["source_primary"], should_select_validated_candidates=True
         )
         await _create_artifact_bundle_relations(database, schema)
+        async with database.engine.begin() as connection:
+            metadata = MetaData(schema=schema)
+            AddressAliasArtifactStateV1.__table__.to_metadata(metadata, schema=schema)
+            await connection.run_sync(metadata.create_all)
         bundle = importer.ProviderDirectoryArtifactBundle(
             stages=[
                 await _prepared_bundle_stage(schema, "artifact_stage_a", "artifact_target_a", _keep_stage_indexes),

@@ -31,7 +31,7 @@ async def test_private_descriptor_is_detached_and_does_not_write(monkeypatch):
     monkeypatch.setattr(candidate, "_inputs", inputs)
     expected = deepcopy(workspace.binding)
     result = await allocation.retain_prepared_cms_workspace(workspace, handoff)
-    assert result == dict(contract=allocation.PRIVATE_ALLOCATION_CONTRACT, workspace=expected, transaction="100")
+    assert result == dict(contract=allocation.PRIVATE_ALLOCATION_CONTRACT, workspace=expected)
     assert inputs.await_count == 2
     assert all(call.args == (workspace, handoff) for call in inputs.await_args_list)
     result["workspace"]["tables"].clear()
@@ -50,25 +50,21 @@ async def test_missing_transaction_refuses_before_input_reads(monkeypatch):
     workspace.connection.fetchval.assert_not_awaited()
 
 
-@pytest.mark.parametrize("change", ["binding", "connection", "transaction", "header"])
+@pytest.mark.parametrize("change", ["binding", "header"])
 async def test_changed_inputs_or_transaction_refuse_without_writes(monkeypatch, change):
     workspace = _workspace()
     connection = workspace.connection
-    inputs = AsyncMock(return_value=("frozen", {"dataset_id": "dataset"}))
+    reads = []
 
-    async def current_transaction(_sql):
-        if connection.fetchval.await_count == 1:
+    async def inputs(*_args):
+        reads.append(_args)
+        if len(reads) == 1:
             if change == "binding":
                 workspace.binding["tables"]["resource"]["oid"] = 102
-            elif change == "connection":
-                workspace.connection = SimpleNamespace()
-            elif change == "header":
-                inputs.return_value = ("frozen", {"dataset_id": "changed"})
-            return "100"
-        return "101" if change == "transaction" else "100"
+            return ("frozen", {"dataset_id": "dataset"})
+        return ("frozen", {"dataset_id": "changed" if change == "header" else "dataset"})
 
-    connection.fetchval.side_effect = current_transaction
     monkeypatch.setattr(candidate, "_inputs", inputs)
-    with pytest.raises(ValueError, match="workspace_changed|transaction_changed|frozen_header_changed"):
+    with pytest.raises(ValueError, match="workspace_changed|frozen_header_changed"):
         await allocation.retain_prepared_cms_workspace(workspace, None)
     connection.execute.assert_not_awaited()

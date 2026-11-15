@@ -684,22 +684,18 @@ def _require_constraints(constraint_rows, expected, columns, root, schema_sql, c
     )
 
 
-def _without_authenticated_history_bounds(constraints, expected):
-    retained_constraints = []
-    seen = Counter()
-    by_oid = {entry["native"]["constraint"]["oid"]: entry["old_oid"] for entry in expected.values()}
+def _without_authenticated_history_bounds(constraints, expected, roots_by_name):
+    """Exclude only the fixed bound already validated in the same layout read."""
+    expected_by_oid = {roots_by_name[root]["oid"]: root for root in expected}
+    retained_constraints, seen_names = [], set()
     for constraint in constraints:
-        if constraint["oid"] in by_oid:
-            _require(
-                constraint["root"] == by_oid[constraint["oid"]]
-                and constraint["conname"] == "cms_history_bound"
-                and constraint["contype"] == "c",
-                "history_bound_changed",
-            )
-            seen[constraint["oid"]] += 1
+        root = expected_by_oid.get(constraint["root"])
+        if root is not None and constraint["conname"] == "cms_history_bound":
+            _require(root not in seen_names and constraint["contype"] == "c", "history_bound_changed")
+            seen_names.add(root)
         else:
             retained_constraints.append(constraint)
-    _require(seen == Counter(dict.fromkeys(by_oid, 1)), "history_bound_changed")
+    _require(seen_names == set(expected), "history_bound_changed")
     return retained_constraints
 
 
@@ -852,7 +848,10 @@ async def require_cms_canonical_layout(connection, *, catalog_schema, storage_cl
     if expected_history_bounds is not None:
         roots_by_name = {entry["relname"]: entry for entry in roots}
         _require(
-            all(roots_by_name[root]["oid"] == entry["old_oid"] for root, entry in expected_history_bounds.items()),
+            all(
+                entry["relation"] == {"schema": catalog_schema, "name": root}
+                for root, entry in expected_history_bounds.items()
+            ),
             "history_bound_changed",
         )
     oids = [root_row["oid"] for root_row in roots]
@@ -869,7 +868,7 @@ async def require_cms_canonical_layout(connection, *, catalog_schema, storage_cl
     columns = await connection.fetch(_COLUMNS_SQL, oids, sorted(_TYPES))
     constraints = await connection.fetch(_CONSTRAINTS_SQL, oids)
     if expected_history_bounds is not None:
-        constraints = _without_authenticated_history_bounds(constraints, expected_history_bounds)
+        constraints = _without_authenticated_history_bounds(constraints, expected_history_bounds, roots_by_name)
     indexes = await connection.fetch(_INDEXES_SQL, oids)
     _require_root_layouts(
         roots, catalog_schema, settings, clone_oid_set, partitions_by_oid, columns, constraints, indexes

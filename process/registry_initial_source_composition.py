@@ -97,7 +97,7 @@ class OfficeSummaryRequest:
 
 
 def validate_initial_source_recipes(recipes, *, inventory=False) -> tuple:
-    """Require bounded closed ACA or protected CMS recipes in canonical order."""
+    """Require bounded canonical source recipes with complete logical data scope."""
     try:
         if type(recipes) is not tuple:
             raise ValueError
@@ -121,14 +121,7 @@ def validate_initial_source_recipes(recipes, *, inventory=False) -> tuple:
                 source_pin.retained_epoch is not None or fhir_normalized_capture(source_pin) is not None
             ):
                 continue
-            if (
-                type(source_pin) is not PinnedFHIRMembershipSource
-                or source_pin.source_id != "cms-npd"
-                or source_pin.custody_owner_role is None
-                or not source_pin.custody_runtime_roles
-                or source_pin.custody_proof_sha256 is None
-                or source_pin.custody_catalog_sha256 is None
-            ):
+            if type(source_pin) is not PinnedFHIRMembershipSource or source_pin.source_id != "cms-npd":
                 raise ValueError
         return recipes
     except ValueError, TypeError, KeyError, UnicodeError, RecursionError:
@@ -1149,7 +1142,7 @@ async def record_verified_witness_offices(
         if type(approved) is not ApprovedMembershipSource or approved != native_approved:
             raise RegistryInitialSourceError("registry_initial_source_approved_pin_differs")
         receipt = _witness_office_receipt(candidate, recipes, approved, address_source, stage)
-        context, _identity = await _policy_context(connection, address_source, runtime_roles, approved, control_schema)
+        context = await _policy_context(connection, address_source, runtime_roles, approved, control_schema)
         if context != stage.office_policy_context:
             raise RegistryInitialSourceError("registry_initial_source_office_receipt_conflict")
         await verified_retained_offices(connection, stage.office_matches, address_source, runtime_roles, control_schema)

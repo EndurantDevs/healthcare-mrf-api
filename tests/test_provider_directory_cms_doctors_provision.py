@@ -46,10 +46,9 @@ def cut(monkeypatch):
         else:
             events.append("commit")
 
-    session, actor_by_field = _actor_session(events, savepoint)
+    session = _native_session(events, savepoint)
     pairs = tuple((relation_by_field["relname"], relation_by_field["oid"]) for relation_by_field in family_rows)
     monkeypatch.setattr(provision, "_copy_driver", AsyncMock(return_value=native))
-    monkeypatch.setattr(provision, "storage_roles", AsyncMock())
     close = AsyncMock(side_effect=lambda *args: events.append("close"))
     monkeypatch.setattr(provision, "_close_relation_grants", close)
     shape = AsyncMock(return_value=pairs)
@@ -67,22 +66,17 @@ def cut(monkeypatch):
         events=events,
         callbacks_by_name=callbacks_by_name,
         shape=shape,
-        actor_by_field=actor_by_field,
     )
 
 
-def _actor_session(events, savepoint):
-    actor_by_field = {"session": "native_admin", "current": "native_admin"}
-    actor_result = SimpleNamespace(mappings=lambda: SimpleNamespace(one=lambda: actor_by_field))
-
-    async def actor_read(statement):
-        assert "session_user" in str(statement)
-        events.append("actor_read")
-        return actor_result
+def _native_session(events, savepoint):
+    async def materialize(statement):
+        assert str(statement) == "SELECT 1"
+        events.append("transaction_read")
 
     return SimpleNamespace(
-        in_transaction=lambda: True, begin_nested=savepoint, execute=AsyncMock(side_effect=actor_read)
-    ), actor_by_field
+        in_transaction=lambda: True, begin_nested=savepoint, execute=AsyncMock(side_effect=materialize)
+    )
 
 
 def test_only_three_source_models_require_operator_owned_storage():
@@ -111,6 +105,7 @@ async def test_complete_cut_preserves_oids_and_orders_authority_before_retiremen
     statements = [call.args[0] for call in cut.native.execute.await_args_list]
     grant = next(sql for sql in statements if sql.startswith("GRANT"))
     assert 'UPDATE("local_generation"' in grant and 'UPDATE("importer_id"' not in grant
+    assert '"serving_schema","serving_relation_names"' in grant and '"relation_oids"' not in grant
     assert "EXECUTE" not in grant and not any("FUNCTION" in sql or "CREATE TRIGGER" in sql for sql in statements)
 
 
@@ -124,13 +119,11 @@ async def test_unqualified_writer_rolls_back_before_any_old_hook_is_dropped(cut)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("actor", ["source_publisher", "source_reader", "source_owner"])
-async def test_existing_runtime_role_cannot_invoke_the_native_admin_cut(cut, actor):
-    cut.actor_by_field.update(session=actor, current=actor)
-    with pytest.raises(GenericCandidateError, match="independent_admin_required"):
+async def test_native_ddl_denial_rolls_back_before_retiring_any_old_hook(cut):
+    cut.native.execute.side_effect = PermissionError("native DDL denied")
+    with pytest.raises(PermissionError, match="native DDL denied"):
         await provision.provision_doctors_source_storage(cut.session, cut.policy, **cut.callbacks_by_name)
-    assert cut.events == ["actor_read"]
-    cut.native.execute.assert_not_awaited()
+    assert cut.events[-1] == "rollback" and "drop" not in cut.events
 
 
 @pytest.mark.asyncio
@@ -142,17 +135,17 @@ async def test_missing_complete_profile_callback_refuses_before_physical_io(cut)
 
 
 @pytest.mark.asyncio
-async def test_original_session_actor_read_materializes_lazy_native_transaction(cut):
-    cut.native.is_in_transaction = lambda: "actor_read" in cut.events
+async def test_existing_session_read_materializes_lazy_native_transaction(cut):
+    cut.native.is_in_transaction = lambda: "transaction_read" in cut.events
 
     async def driver(session):
-        assert session is cut.session and "actor_read" in cut.events
+        assert session is cut.session and "transaction_read" in cut.events
         cut.events.append("driver")
         return cut.native
 
     provision._copy_driver.side_effect = driver
     await provision.provision_doctors_source_storage(cut.session, cut.policy, **cut.callbacks_by_name)
-    assert cut.events.index("actor_read") < cut.events.index("driver") < cut.events.index("savepoint")
+    assert cut.events.index("transaction_read") < cut.events.index("driver") < cut.events.index("savepoint")
 
 
 @pytest.mark.asyncio
@@ -160,5 +153,5 @@ async def test_missing_physical_transaction_refuses_before_storage_changes(cut):
     cut.native.is_in_transaction = lambda: False
     with pytest.raises(GenericCandidateError, match="explicit_admin_transaction_required"):
         await provision.provision_doctors_source_storage(cut.session, cut.policy, **cut.callbacks_by_name)
-    assert cut.events == ["actor_read"]
+    assert cut.events == ["transaction_read"]
     cut.native.execute.assert_not_awaited()

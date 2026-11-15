@@ -97,31 +97,11 @@ async def _rotate_source(fixture, monkeypatch):
     await address.admin.execute(
         f"UPDATE \"{schema}\".entity_address_unified_next SET location_key=location_key||'-next',city_name='New City'"
     )
-    monkeypatch.setattr(adoption.entity_address_unified, "db", publication.address_tests._NativeDB(address.publisher))
-    async with address.publisher.transaction():
-        retained = await adoption._swap_sealed_stage_table(
-            schema,
-            SimpleNamespace(__main_table__="entity_address_unified"),
-            SimpleNamespace(__tablename__="entity_address_unified_next", __my_additional_indexes__=[]),
-            address.descriptor["protected_owner_oid"],
-        )
-        oid = await address.publisher.fetchval(
-            "SELECT to_regclass($1)::oid::bigint", schema + ".entity_address_unified"
-        )
-        await address.publisher.execute(
-            f'UPDATE "{schema}".entity_address_result_generation '
-            "SET local_generation=2,origin_generation=2,relation_oids[1]=$1",
-            oid,
-        )
-        await address.publisher.execute(f'UPDATE "{schema}".address_alias_state_v1 SET generation=generation+1')
+    retained = await publication.address_tests._native_swap(address, monkeypatch)
     async with address.publisher.transaction(isolation="repeatable_read", readonly=True):
-        authority = await artifact.generation.read_entity_address_result_generation_authority(
-            artifact._CatalogSession(address.publisher), schema_name=schema
-        )
-    fixture.source = PinnedAddressSource(
-        schema, "entity_address_unified", artifact._digest(artifact._authority_document(authority))
-    )
-    return retained, oid
+        authority, _legacy_key = await artifact._current_authority(address.publisher, schema)
+    fixture.source = PinnedAddressSource(schema, "entity_address_unified", artifact._digest(authority))
+    return retained
 
 
 @pytest.mark.asyncio
@@ -130,14 +110,14 @@ async def test_address_rotation_keeps_old_and_new_scoped_readers(compact_publica
     first = await publication._candidate(fixture, (42, 88), 0)
     await _publish_ready(fixture, first)
     old_manifest, old_rows = await publication._read(fixture)
-    retained, replacement_oid = await _rotate_source(fixture, monkeypatch)
+    retained = await _rotate_source(fixture, monkeypatch)
     second = await publication._candidate(fixture, (42, 99), old_manifest.generation_id)
     await publication._prepare(fixture, second)
     await publication._seal(fixture, second)
     async with publication._reader(fixture) as (connection, native):
         old_pin = await resolve_network_serving_manifest(native, control_schema=fixture.control_schema)
-        assert old_pin.address_table_oid == retained["relation_oid"] == old_manifest.address_table_oid
-        assert old_pin.compact_layout.base.table_name == retained["retained_name"]
+        # The pinned generation reads the heap rotation retained for it, by name.
+        assert old_pin.compact_layout.base.table_name == retained["relation_name"]
         assert await publication._scoped_rows(connection, old_pin, (42,)) == old_rows
         published = await asyncio.wait_for(publication._publish(fixture, second), timeout=10)
         assert await publication._scoped_rows(connection, old_pin, (42,)) == old_rows
@@ -146,14 +126,16 @@ async def test_address_rotation_keeps_old_and_new_scoped_readers(compact_publica
         ).generation_id == (old_manifest.generation_id)
         fresh, new_rows = await publication._read(fixture)
         assert fresh.generation_id == published["generation_id"]
-        assert fresh.address_table_oid == replacement_oid != old_manifest.address_table_oid
+        assert (
+            fresh.compact_layout.base.table_name == "entity_address_unified" != old_pin.compact_layout.base.table_name
+        )
         assert fresh.source_generations != old_manifest.source_generations
         assert len(new_rows) == 1
         assert new_rows[0]["location_key"] == old_rows[0]["location_key"] + "-next"
         assert new_rows[0]["city_name"] == "New City"
         assert new_rows[0]["canonical_network_ids"] == [42]
     retained_pin, retained_rows = await publication._read(fixture, old_manifest.generation_id)
-    assert retained_pin.address_table_oid == old_manifest.address_table_oid and retained_rows == old_rows
+    assert retained_pin.compact_layout.base == old_pin.compact_layout.base and retained_rows == old_rows
     assert (await publication._read(fixture, network_ids=(88,)))[1] == []
     assert len((await publication._read(fixture, old_manifest.generation_id, network_ids=(88,)))[1]) == 1
 
@@ -180,13 +162,6 @@ async def test_stale_head_refuses_sealed_competitor_without_partial_manifest(com
             UUID(loser.candidate_id),
         )
         == 0
-    )
-    assert (
-        await fixture.connection.fetchval(
-            f'SELECT count(*) FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
-            UUID(loser.candidate_id),
-        )
-        == 1
     )
     current, current_rows = await publication._read(fixture)
     assert current.generation_id == winning_manifest.generation_id and current_rows == winning_rows

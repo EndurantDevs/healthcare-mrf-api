@@ -117,9 +117,9 @@ async def _adopt_selected(fixture, driver, manifest, catalog, provider):
     receipt = await resolve_retained_site_adoptions(
         driver, manifest, json.dumps([selection_by_field]).encode(), control_schema=fixture.control_schema
     )
-    assert receipt.address_table_oid == manifest.compact_layout.base.table_oid
+    assert receipt.address_relation == manifest.compact_layout.base
     assert receipt.as_dict()["compact_address_relations"] == [
-        ["base", fixture.address.schema, "entity_address_unified", manifest.address_table_oid]
+        ["base", fixture.address.schema, "entity_address_unified"]
     ]
     assert receipt.records[0].location_id == selected_id
     with pytest.raises(RetainedSiteAdoptionError):
@@ -193,9 +193,7 @@ async def _copy_selected(fixture, receipt):
             )
             damaged = replace(
                 receipt,
-                compact_address_relations=(
-                    ("base", fixture.address.schema, "entity_address_unified", receipt.address_table_oid + 1),
-                ),
+                compact_address_relations=(("base", fixture.address.schema, "entity_address_replaced"),),
             )
             with pytest.raises(RetainedSiteAdoptionError, match="receipt differs"):
                 await copy_approved_site_rows(connection, (damaged,), schema, control_schema=fixture.control_schema)

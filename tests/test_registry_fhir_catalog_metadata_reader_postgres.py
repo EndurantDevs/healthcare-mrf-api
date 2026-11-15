@@ -12,30 +12,35 @@ from db.plan_release_storage import storage_identifier
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_fhir_catalog_custody import PHYSICAL_TABLES
 from process.registry_fhir_catalog_read import FHIRCatalogQuery, read_fhir_catalog
-from process.registry_fhir_catalog_worker import run_fhir_catalog_sync
 from process.registry_network_catalog_read import RegistryNetworkCatalogError
 from tests.fhir_catalog_registry_reader_support import configured_catalog_reader
-from tests.fhir_catalog_sync_integration_support import adopt_existing_network, import_source, native_catalog_case
+from tests.fhir_catalog_sync_integration_support import (
+    adopt_existing_network,
+    import_source,
+    native_catalog_case,
+    run_catalog_sync,
+)
 
 
 def _decoded(value):
     return json.loads(value) if isinstance(value, str) else value
 
 
-async def _sync_catalog(case, config):
+async def _sync_catalog(case, config, *, withhold_reader=None):
     async with configured_catalog_reader(
         case.settings,
         case.reader_url.render_as_string(hide_password=False),
         case.reader_url.username,
         case.reader_url.password,
     ):
-        return await run_fhir_catalog_sync(config)
+        return await run_catalog_sync(case, config, withhold_reader=withhold_reader)
 
 
 async def _schema_state(connection, schema):
+    """Compare logical relation names and full row contents without physical metadata."""
     rows = await connection.fetch(
-        "SELECT c.oid::bigint,c.relname,c.relkind,c.relowner::bigint,c.relacl::text[] "
-        "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "SELECT c.relname,c.relkind::text AS relkind FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid=c.relnamespace "
         "WHERE n.nspname=$1 AND c.relkind IN ('r','p','i','I','S') ORDER BY c.relname",
         schema,
     )
@@ -51,11 +56,7 @@ async def _schema_state(connection, schema):
             + " t"
         )
         content_digests.append((row["relname"], hashlib.sha256(value.encode()).hexdigest()))
-    namespace = await connection.fetchrow(
-        "SELECT oid::bigint,nspowner::bigint,nspacl::text[] FROM pg_namespace WHERE nspname=$1",
-        schema,
-    )
-    return tuple(namespace), [tuple(row) for row in rows], content_digests
+    return [tuple(row) for row in rows], content_digests
 
 
 async def _snapshots(case):
@@ -114,21 +115,18 @@ async def _metadata_reader_refusal(case, config, execution, connection, original
         grant=replace(config.grant, version=config.grant.version + 1),
     )
     with pytest.raises(RuntimeError, match="registry_publication_consumer_unavailable") as refused:
-        await _sync_catalog(case, bad)
+        await _sync_catalog(case, bad, withhold_reader=execution)
     assert "42501" in _sqlstates(refused.value)
     assert await _head(case) == original_head
     snapshots = await _snapshots(case)
     assert snapshots[original_head[1]] == old and len(snapshots) == 2
     failed = next(row for generation, row in snapshots.items() if generation != original_head[1])
     assert failed["published_at"] is None and failed["standing_grant_sha256"] == bad.grant.sha256
-    assert execution not in failed["custody_json"]["reader_roles"]
     failed_physical = await _schema_state(connection, failed["schema_name"])
     login = await asyncpg.connect(
         config.execution_url.set(drivername="postgresql").render_as_string(hide_password=False)
     )
     try:
-        assert await login.fetchval("SELECT session_user=current_user AND current_user=$1", execution)
-        assert not await login.fetchval("SELECT has_schema_privilege(current_user,$1,'USAGE')", failed["schema_name"])
         with pytest.raises(asyncpg.InsufficientPrivilegeError) as direct:
             await login.fetchval('SELECT count(*) FROM "' + failed["schema_name"] + '".registry_fhir_catalog_network')
         assert direct.value.sqlstate == "42501"
@@ -164,15 +162,17 @@ async def _restore_metadata_reader(case, config, bad, execution, initial):
 
 
 async def _metadata_reader_login(config, fresh):
-    """Read the new physical snapshot using the actual metadata execution login."""
+    """Read every actual named catalog table through the metadata execution login."""
     login = await asyncpg.connect(
         config.execution_url.set(drivername="postgresql").render_as_string(hide_password=False)
     )
     try:
-        assert await login.fetchval("SELECT has_schema_privilege(current_user,$1,'USAGE')", fresh["schema_name"])
         for table in PHYSICAL_TABLES:
-            assert await login.fetchval(
-                "SELECT has_table_privilege(current_user,$1,'SELECT')", fresh["schema_name"] + "." + table
+            assert (
+                await login.fetchval(
+                    "SELECT count(*) FROM " + storage_identifier(fresh["schema_name"]) + "." + storage_identifier(table)
+                )
+                >= 0
             )
         assert (
             await login.fetchval('SELECT count(*) FROM "' + fresh["schema_name"] + '".registry_fhir_catalog_network')
@@ -191,11 +191,11 @@ def _record_metadata_reader_evidence(record_property):
                 "excluded_execution_refused_42501": True,
                 "independent_execution_login": True,
                 "same_scope_version_only_successor": True,
-                "ordinary_queue_seal_publication": True,
+                "ordinary_queue_named_publication": True,
                 "new_metadata_generation": True,
                 "old_published_and_failed_snapshots_unchanged": True,
                 "membership_generation_and_rows_unchanged": True,
-                "source_data_identity_and_acls_unchanged": True,
+                "source_relation_names_and_data_unchanged": True,
                 "candidate_all_tables_select": True,
                 "idempotent_replay": True,
             },
@@ -209,6 +209,10 @@ async def _publish_without_api_reader(case, config, api, execution, incumbent, c
     missing_api = replace(
         config,
         reader_roles=tuple(role for role in config.reader_roles if role != api),
+        preparation_roles={
+            **config.preparation_roles,
+            "application_roles": [role for role in config.preparation_roles["application_roles"] if role != api],
+        },
         grant=replace(config.grant, version=2),
     )
     assert execution in missing_api.reader_roles
@@ -217,7 +221,7 @@ async def _publish_without_api_reader(case, config, api, execution, incumbent, c
     original_head = await _head(case)
     assert original_head[0] == incumbent.generation_id
     old = (await _snapshots(case))[original_head[1]]
-    assert old["published_at"] is not None and api not in old["custody_json"]["reader_roles"]
+    assert old["published_at"] is not None
     old_physical = await _schema_state(connection, old["schema_name"])
     await _catalog_as_actor(case, case.reader_url, old, readable=False)
     assert await _head(case) == original_head
@@ -229,9 +233,15 @@ async def _restore_api_reader(case, config, api, execution, missing_api, first, 
     fixed = replace(
         missing_api,
         reader_roles=tuple(sorted((*missing_api.reader_roles, api))),
+        preparation_roles=config.preparation_roles,
         grant=replace(missing_api.grant, version=3),
     )
-    assert fixed == replace(missing_api, reader_roles=config.reader_roles, grant=replace(missing_api.grant, version=3))
+    assert fixed == replace(
+        missing_api,
+        reader_roles=config.reader_roles,
+        preparation_roles=config.preparation_roles,
+        grant=replace(missing_api.grant, version=3),
+    )
     assert {
         field_name: field_value for field_name, field_value in fixed.grant.document().items() if field_name != "version"
     } == {
@@ -254,8 +264,7 @@ async def _restore_api_reader(case, config, api, execution, missing_api, first, 
     fresh = snapshots[head[1]]
     assert fresh["published_at"] is not None and fresh["standing_grant_sha256"] == fixed.grant.sha256
     assert fresh["schema_name"] != old["schema_name"]
-    assert fresh["custody_json"]["reader_roles"] == list(fixed.reader_roles)
-    assert {api, execution} <= set(fresh["custody_json"]["reader_roles"])
+    assert {api, execution} <= set(fixed.preparation_roles["application_roles"])
     assert fresh["source_vector_json"] == old["source_vector_json"]
     return fixed, fresh
 
@@ -292,7 +301,6 @@ async def test_metadata_execution_reader_successor_preserves_incumbent(monkeypat
         fresh = final[head[1]]
         assert fresh["published_at"] is not None and fresh["standing_grant_sha256"] == fixed.grant.sha256
         assert fresh["schema_name"] not in {old["schema_name"], failed["schema_name"]}
-        assert fresh["custody_json"]["reader_roles"] == list(fixed.reader_roles)
         assert fresh["source_vector_json"] == failed["source_vector_json"] == old["source_vector_json"]
         await _metadata_reader_login(config, fresh)
         assert await _schema_state(connection, old["schema_name"]) == old_physical
@@ -311,12 +319,7 @@ async def test_metadata_execution_reader_successor_preserves_incumbent(monkeypat
 async def _catalog_as_actor(case, url, snapshot, *, readable):
     login = await asyncpg.connect(url.set(drivername="postgresql").render_as_string(hide_password=False))
     try:
-        assert await login.fetchval("SELECT session_user=current_user AND current_user=$1", url.username)
         async with login.transaction(isolation="repeatable_read", readonly=True):
-            assert (
-                await login.fetchval("SELECT has_schema_privilege(current_user,$1,'USAGE')", snapshot["schema_name"])
-                is readable
-            )
             if not readable:
                 with pytest.raises(RegistryNetworkCatalogError) as refused:
                     await read_fhir_catalog(
@@ -325,8 +328,14 @@ async def _catalog_as_actor(case, url, snapshot, *, readable):
                 assert "42501" in _sqlstates(refused.value)
                 return None
             for table in PHYSICAL_TABLES:
-                assert await login.fetchval(
-                    "SELECT has_table_privilege(current_user,$1,'SELECT')", snapshot["schema_name"] + "." + table
+                assert (
+                    await login.fetchval(
+                        "SELECT count(*) FROM "
+                        + storage_identifier(snapshot["schema_name"])
+                        + "."
+                        + storage_identifier(table)
+                    )
+                    >= 0
                 )
             return await read_fhir_catalog(
                 login, FHIRCatalogQuery(), excluded_network_ids=(), control_schema=case.fixture.control_schema
@@ -372,13 +381,13 @@ async def test_api_reader_successor_preserves_incumbent(monkeypatch, tmp_path, r
                     "published_without_api_reader": True,
                     "api_login_read_fhir_catalog_refused_42501": True,
                     "api_and_metadata_execution_own_logins_read_catalog": True,
-                    "native_seal_accepts_both_readers": True,
+                    "both_readers_select_actual_named_data": True,
                     "reader_list_and_version_2_to_3_only": True,
-                    "ordinary_queue_seal_publication": True,
+                    "ordinary_queue_named_publication": True,
                     "new_metadata_generation": True,
-                    "old_snapshot_data_and_acls_unchanged": True,
+                    "old_snapshot_names_and_data_unchanged": True,
                     "membership_generation_and_rows_unchanged": True,
-                    "source_data_identity_and_acls_unchanged": True,
+                    "source_relation_names_and_data_unchanged": True,
                     "idempotent_replay": True,
                 },
                 sort_keys=True,

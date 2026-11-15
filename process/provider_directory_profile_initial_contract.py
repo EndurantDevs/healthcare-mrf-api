@@ -13,35 +13,30 @@ from process.provider_directory_profile_capacity_runtime_types import ProviderDi
 from process.provider_directory_profile_capacity_types import ProviderDirectoryProfileCapacityGeometry
 
 MATERIALIZATION = "initial_full_swap"
-REQUEST_CONTRACT = "healthporta.provider-directory-profile-capacity-preflight-request.v5"
-RECEIPT_CONTRACT = "healthporta.provider-directory-profile-capacity-preflight.v5"
-PROJECTION_REQUEST_CONTRACT = "healthporta.provider-directory-profile-capacity-authority-projection-request.v3"
-PROJECTION_CONTRACT = "healthporta.provider-directory-profile-capacity-authority-projection.v3"
-CONTROL_REQUEST_CONTRACT = "healthporta.provider-directory-profile-capacity-control-plane-preflight-request.v3"
-CONTROL_RECEIPT_CONTRACT = "healthporta.provider-directory-profile-capacity-control-plane-preflight.v3"
-GEOMETRY_CONTRACT = "healthporta.provider-directory-profile-initial-capacity-geometry.v1"
-GEOMETRY_DOMAIN = "provider_directory_profile_initial_capacity_geometry.v1"
-TARGET_CONTRACT = "healthporta.provider-directory-profile-initial-target-state.v1"
-COMMIT_CONTRACT = "healthporta.provider-directory-profile-initial-receipt.v1"
+REQUEST_CONTRACT = "healthporta.provider-directory-profile-capacity-preflight-request.v7"
+RECEIPT_CONTRACT = "healthporta.provider-directory-profile-capacity-preflight.v7"
+PROJECTION_REQUEST_CONTRACT = "healthporta.provider-directory-profile-capacity-authority-projection-request.v5"
+PROJECTION_CONTRACT = "healthporta.provider-directory-profile-capacity-authority-projection.v5"
+CONTROL_REQUEST_CONTRACT = "healthporta.provider-directory-profile-capacity-control-plane-preflight-request.v5"
+CONTROL_RECEIPT_CONTRACT = "healthporta.provider-directory-profile-capacity-control-plane-preflight.v5"
+GEOMETRY_CONTRACT = "healthporta.provider-directory-profile-initial-capacity-geometry.v2"
+GEOMETRY_DOMAIN = "provider_directory_profile_initial_capacity_geometry.v2"
+TARGET_CONTRACT = "healthporta.provider-directory-profile-initial-target-state.v2"
+COMMIT_CONTRACT = "healthporta.provider-directory-profile-initial-receipt.v2"
 CONTROL_WAL_CONTRACT = "healthporta.provider-directory-profile-initial-control-wal.v1"
-FORECAST_CONTRACT = "healthporta.provider-directory-profile-initial-cutover-forecast.v1"
-ACTUAL_CONTRACT = "healthporta.provider-directory-profile-initial-cutover-actual.v1"
+FORECAST_CONTRACT = "healthporta.provider-directory-profile-initial-cutover-forecast.v2"
+ACTUAL_CONTRACT = "healthporta.provider-directory-profile-initial-cutover-actual.v2"
 INITIAL_CUTOVER_ATTEMPTS = 3
 INITIAL_CUTOVER_STATEMENTS = 15
 RECEIPT_TABLE = "provider_directory_profile_initial_receipt"
-INITIAL_FIELDS = frozenset(
-    {"initial_target_state_sha256", "initial_receipt_oid", "initial_receipt_storage_fingerprint"}
-)
+INITIAL_FIELDS = frozenset({"initial_target_state_sha256"})
 TARGET_FIELDS = frozenset(
     {
         "contract_id",
         "resolution",
         "serving_singleton_absent",
         "initial_commit_receipt_absent",
-        "evidence_target_oid",
-        "profile_target_oid",
-        "evidence_target_storage_fingerprint",
-        "profile_target_storage_fingerprint",
+        "targets",
         "evidence_target_bytes",
         "profile_target_bytes",
         "evidence_rows",
@@ -69,33 +64,36 @@ _RESULT_IDENTITIES = (
 @dataclass(frozen=True)
 class InitialCapacityGeometry(ProviderDirectoryProfileCapacityGeometry):
     initial_target_state_sha256: str
-    initial_receipt_oid: int
-    initial_receipt_storage_fingerprint: str
 
     @property
     def cutover_forecast_contract_id(self):
         """Identify the initial full-swap forecast contract."""
-        return FORECAST_CONTRACT
+        return (
+            "healthporta.provider-directory-profile-initial-cutover-forecast.v1"
+            if self.legacy_payload is not None
+            else FORECAST_CONTRACT
+        )
 
     @property
     def cutover_actual_contract_id(self):
         """Identify the initial full-swap observed receipt contract."""
-        return ACTUAL_CONTRACT
+        return (
+            "healthporta.provider-directory-profile-initial-cutover-actual.v1"
+            if self.legacy_payload is not None
+            else ACTUAL_CONTRACT
+        )
 
 
 @dataclass(frozen=True)
 class InitialCapacityGeometryInputs(ProviderDirectoryProfileCapacityGeometryInputs):
     initial_target_state_sha256: str
-    initial_receipt_oid: int
-    initial_receipt_storage_fingerprint: str
 
 
 @dataclass(frozen=True)
 class InitialTargets:
-    """Physical targets only: deliberately has no serving generation or date."""
+    """Named targets before their first serving generation or date."""
 
-    evidence_target_oid: int
-    profile_target_oid: int
+    targets: dict[str, dict[str, str]]
     payload: dict[str, Any]
 
 
@@ -172,14 +170,9 @@ def validated_target_state(raw: Any) -> dict[str, Any]:
         or target_by_field["initial_commit_receipt_absent"] is not True
     ):
         _invalid("target_absence_invalid")
-    for key in ("evidence_target_oid", "profile_target_oid"):
-        if type(target_by_field[key]) is not int or not 0 < target_by_field[key] < 2**32:
-            _invalid("target_oid_invalid")
-    if target_by_field["evidence_target_oid"] == target_by_field["profile_target_oid"]:
-        _invalid("target_oid_collision")
-    for key in ("evidence_target_storage_fingerprint", "profile_target_storage_fingerprint"):
-        if not isinstance(target_by_field[key], str) or not _HASH.fullmatch(target_by_field[key]):
-            _invalid("target_fingerprint_invalid")
+    from process.provider_directory_profile_capacity_geometry_contract import validated_capacity_targets
+
+    target_by_field["targets"] = validated_capacity_targets(target_by_field["targets"])
     for key in ("evidence_target_bytes", "profile_target_bytes", "evidence_rows", "profile_rows"):
         if type(target_by_field[key]) is not int or not 0 <= target_by_field[key] < 2**63:
             _invalid("target_size_invalid")

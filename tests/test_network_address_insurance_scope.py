@@ -11,8 +11,9 @@ import pytest
 from api import provider_list_sql
 from api.endpoint import npi
 from api.network_address_scope import network_address_read_scope, scoped_address_insurance_predicate
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
-from tests.network_read_execution_support import with_read_identity_receipts
+from tests.network_read_execution_support import with_read_session
 
 
 @pytest.mark.asyncio
@@ -31,7 +32,7 @@ async def test_real_list_branches_use_same_insurance_scope_before_count_and_limi
         {},
         8,
         "c" * 64,
-        1,
+        CompactAddressRelation("network_candidate_00000000000000000000000000000001", "entity_address_unified"),
     )
     context = nullcontext()
     if mode == "default":
@@ -115,7 +116,7 @@ def _record_insurance_statements(monkeypatch, statements):
         rows = await query(statement, **(parameters or {}))
         return SimpleNamespace(all=lambda: rows)
 
-    session = with_read_identity_receipts(SimpleNamespace(execute=execute, begin=transaction, begin_nested=transaction))
+    session = with_read_session(SimpleNamespace(execute=execute, begin=transaction, begin_nested=transaction))
 
     @asynccontextmanager
     async def session_scope():

@@ -52,11 +52,15 @@ def test_unselected_output_model_refuses():
 
 
 @pytest.mark.asyncio
-async def test_unissued_source_reader_cannot_authorize_projection():
+async def test_ended_source_reader_cannot_authorize_projection():
     session = SimpleNamespace(in_transaction=lambda: True)
-    reader = pin._SourceReader(session, "fixture", {"provider_directory_dataset_resource": {"name": "child"}})
+    reader = pin._SourceReader(
+        session, "fixture", {"provider_directory_dataset_resource": {"schema": "fixture", "name": "child"}}
+    )
+    assert reader.relation("provider_directory_dataset_resource") == '"fixture"."child"'
+    reader.deactivate()
     unissued = pin.PinnedDataset(SimpleNamespace(), reader, ())
-    with pytest.raises(DatasetRehydrationError, match="reader_unpinned"):
+    with pytest.raises(DatasetRehydrationError, match="reader_transaction_ended"):
         compatibility_projection(fhir, unissued, ProviderDirectoryLocation, ("Location",))
     with pytest.raises(DatasetRehydrationError, match="pin_required"):
         compatibility_projection(fhir, SimpleNamespace(reader=reader), ProviderDirectoryLocation, ("Location",))

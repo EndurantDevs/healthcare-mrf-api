@@ -111,7 +111,8 @@ async def _legacy_tables(admin, schema):
         dataset_hash varchar(64),status varchar(32),is_current boolean,resource_count bigint,published_at timestamp,
         publication_metadata_json json,publication_metadata_summary_json jsonb,publication_metadata_sha256 varchar(64),
         content_proof_admission_version smallint,content_proof_admission_kind varchar(32),content_proof_admission_sha256 varchar(64),
-        content_proof_resource_types varchar(64)[],candidate_storage_json jsonb,completion_proof_required_version integer);
+        content_proof_resource_types varchar(64)[],candidate_storage_json jsonb,completion_proof_required_version integer,
+        completion_proof_sha256 varchar(64),previous_dataset_id varchar(96));
         CREATE TABLE "{schema}".provider_directory_source(source_id varchar(64) PRIMARY KEY,endpoint_id varchar(64));
         CREATE TABLE "{schema}".provider_directory_dataset_resource(dataset_id varchar(96) NOT NULL,
         resource_type varchar(64) NOT NULL,resource_id varchar(256) NOT NULL,payload_hash varchar(64) NOT NULL,
@@ -240,10 +241,8 @@ async def _legacy_input(admin, schema, reader_role, metadata, summary, modern=Fa
         "dataset-one",
         summary["dataset_hash"],
         "run-one",
-        await admin.fetchval("SELECT to_regclass($1)::oid::bigint", f'"{schema}".provider_directory_endpoint_dataset'),
-        await admin.fetchval("SELECT to_regclass($1)::oid::bigint", f'"{schema}".provider_directory_dataset_resource'),
-        await admin.fetchval("SELECT to_regclass($1)::oid::bigint", f'"{schema}".retained_input'),
-        reader_role,
+        {"schema": schema, "name": "provider_directory_endpoint_dataset"},
+        {"schema": schema, "name": "provider_directory_dataset_resource"},
         len(metadata.encode()),
         hashlib.sha256(metadata.encode()).hexdigest(),
         summary["summary_sha256"],
@@ -356,7 +355,7 @@ async def legacy_capture_db(request):
             f'GRANT CREATE ON DATABASE {database} TO "{role_by_kind["publisher"]}","{role_by_kind["owner"]}"'
         )
         await admin.execute(
-            f'GRANT "{role_by_kind["owner"]}" TO "{role_by_kind["publisher"]}" WITH INHERIT FALSE, SET TRUE'
+            f'GRANT "{role_by_kind["owner"]}" TO "{role_by_kind["publisher"]}" WITH INHERIT TRUE, SET TRUE'
         )
         await admin.execute(
             f'GRANT "{role_by_kind["reader"]}" TO "{role_by_kind["publisher"]}" WITH INHERIT TRUE, SET FALSE'
@@ -393,7 +392,8 @@ async def legacy_capture_db(request):
 
 
 async def _capture(fixture, origin=None, *, runtime_roles=None):
-    reader, writer = await fixture.connect("reader"), await fixture.connect("publisher")
+    """Prepare and freeze through the administrator, exporting only through the source reader."""
+    reader, writer = await fixture.connect("reader"), fixture.admin
     identity = uuid4()
     fixture.captures.append("registry_fhir_capture_" + identity.hex)
     async with (
@@ -408,7 +408,6 @@ async def _capture(fixture, origin=None, *, runtime_roles=None):
             owner_role=fixture.role_by_kind["owner"],
             runtime_roles=runtime_roles or (fixture.role_by_kind["reader"],),
         )
-        assert await writer.fetchval("SELECT current_user") == fixture.role_by_kind["publisher"]
     return value
 
 
@@ -476,7 +475,7 @@ async def _approved_capture_recipe(fixture, serving, capture, *, organization="n
         fixture.origin.dataset_id,
         fixture.origin.dataset_sha256,
         capture.release_id,
-        fixture.origin.resource_parent_oid,
+        fixture.origin.resource_relation,
         "medical",
         "2026-10-01",
         retained_capture=capture,

@@ -26,8 +26,8 @@ from process.provider_directory_profile_capacity_trust_validation import (
     capacity_trust_key_for_assigned_lease,
 )
 
-STORAGE_CONTINUATION_CONTRACT = "provider-directory-capacity-storage-continuation-v1"
-STORAGE_CONTINUATION_DOMAIN = b"provider-directory-capacity-storage-continuation-v1\0"
+STORAGE_CONTINUATION_CONTRACT = "provider-directory-capacity-storage-continuation-v2"
+STORAGE_CONTINUATION_DOMAIN = b"provider-directory-capacity-storage-continuation-v2\0"
 _PHASES = frozenset({"pre_scratch", "pre_logging", "readiness", "cutover"})
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _TIME_FIELDS = frozenset({"issued_at", "expires_at", "storage_observation"})
@@ -132,7 +132,7 @@ class VerifiedStorageContinuation:
 
     observed_at: datetime.datetime
     expires_at: datetime.datetime
-    volume_observations: tuple[tuple[str, str, int, int], ...]
+    storage_observations: tuple[tuple[str, int, int], ...]
     witness_digest: str
     request_nonce: str
 
@@ -157,11 +157,6 @@ def request_storage_continuation(
             "attestation_id",
             "reservation_id",
             "capacity_geometry_hash",
-            "database_system_identifier",
-            "database_oid",
-            "database_name",
-            "tablespace_identity_hash",
-            "volume_identity_hash",
         )
     }
     binding_by_field.update(
@@ -194,7 +189,8 @@ def _assert_time(
         and issued <= now < expires
         and 0 < (expires - issued).total_seconds() <= 30
         and expires <= lease.max_build_deadline
-        and request.requested_at - datetime.timedelta(seconds=5) <= observed <= issued
+        and now - datetime.timedelta(seconds=5) <= observed <= issued
+        and request.requested_at - datetime.timedelta(seconds=5) <= observed
         and storage["issued_at"] == witness["issued_at"]
         and storage["expires_at"] == _utc(lease.expires_at)
         and storage["max_build_deadline"] == _utc(lease.max_build_deadline)
@@ -205,37 +201,19 @@ def _assert_time(
 
 def _assert_storage(
     lease: VerifiedDatabaseCapacityLease, storage: Mapping[str, Any]
-) -> tuple[tuple[str, str, int, int], ...]:
-    """Preserve all trusted tablespace and physical-volume identities."""
-    temp = next(item for item in lease.tablespaces if item.usage == "temp")
-    if storage["temp_tablespace"] != {
-        "tablespace_name": temp.tablespace_name,
-        "tablespace_oid": temp.tablespace_oid,
-        "volume_digest": temp.volume_digest,
-    }:
-        raise _error("tablespace_changed")
-    expected_by_class = {volume.volume_class: volume.volume_digest for volume in lease.volumes}
+) -> tuple[tuple[str, int, int], ...]:
+    """Return only the three closed numeric classes from a fresh observation."""
     observations = tuple(
-        (
-            volume["volume_class"],
-            volume["volume_digest"],
-            volume["available_bytes"],
-            volume["available_after_all_reservations_bytes"],
-        )
-        for volume in storage["volumes"]
+        (row["storage_class"], row["available_bytes"], row["available_after_all_reservations_bytes"])
+        for row in storage["storage_classes"]
     )
-    if {item[0]: item[1] for item in observations} != expected_by_class:
-        raise _error("volume_changed")
-    observation_by_volume: dict[str, tuple[int, int]] = {}
-    for _class, digest, available, remaining in observations:
-        if digest in observation_by_volume and observation_by_volume[digest] != (available, remaining):
-            raise _error("colocated_observation_changed")
-        observation_by_volume[digest] = (available, remaining)
+    if tuple(row[0] for row in observations) != tuple(entry.storage_class for entry in lease.storage_classes):
+        raise _error("storage_classes_changed")
     return observations
 
 
 def _verification_key(trust: Any, lease: VerifiedDatabaseCapacityLease, now: datetime.datetime) -> Any:
-    """Reuse current configured capacity key and every existing trust/storage pin."""
+    """Reuse current configured capacity key and the signed environment and key-release policy."""
     fields_by_name = dict(vars(lease))
     key, public_key = capacity_trust_key_for_assigned_lease(trust, fields_by_name, now=now)
     if key.status != "active" or trust.active_key_id != lease.key_id:
@@ -245,9 +223,6 @@ def _verification_key(trust: Any, lease: VerifiedDatabaseCapacityLease, now: dat
         trust=trust,
         trust_key=key,
         expected_capacity_geometry_hash=lease.capacity_geometry_hash,
-        expected_database_system_identifier=lease.database_system_identifier,
-        expected_database_oid=lease.database_oid,
-        expected_database_name=lease.database_name,
     )
     return public_key
 

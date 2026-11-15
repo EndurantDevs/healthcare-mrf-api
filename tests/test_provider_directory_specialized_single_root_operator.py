@@ -5,14 +5,15 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import fields, replace
-from datetime import UTC, datetime
 import json
-from pathlib import Path
 import runpy
 import sys
+from dataclasses import fields, replace
+from datetime import UTC, datetime
+from pathlib import Path
 from types import ModuleType
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -34,15 +35,15 @@ from process.provider_directory_rooted_graph_result_contract import (
     ProviderDirectoryRootedGraphAcquisitionSummary,
 )
 from process.provider_directory_rooted_graph_twin_contract import (
-    build_rooted_graph_single_root_admission,
     ProviderDirectoryRootedGraphTwinAdmission,
     ProviderDirectoryRootedGraphTwinError,
+    build_rooted_graph_single_root_admission,
 )
 from tests.provider_directory_rooted_graph_publication_test_support import (
     exact_current,
     sealed_roots,
 )
-
+from tests.provider_directory_rooted_graph_runtime_test_support import configure_rooted_generation
 
 OPERATION_KEY = "f" * 64
 RECORDED_AT = datetime(2026, 8, 10, 12, tzinfo=UTC)
@@ -73,16 +74,12 @@ def _enable_single_root(monkeypatch: pytest.MonkeyPatch) -> None:
     ):
         monkeypatch.setenv(
             gate_name,
-            "true"
-            if gate_name == contract.SINGLE_ROOT_ACQUISITION_ENABLED_ENV
-            else "false",
+            "true" if gate_name == contract.SINGLE_ROOT_ACQUISITION_ENABLED_ENV else "false",
         )
 
 
 def _identity():
-    return single_root.derive_single_root_identity(
-        exact_current(), operation_key=OPERATION_KEY
-    )
+    return single_root.derive_single_root_identity(exact_current(), operation_key=OPERATION_KEY)
 
 
 def _candidate():
@@ -90,11 +87,7 @@ def _candidate():
     proof = sealed_roots()[1]
     return type(proof)(
         **{
-            field.name: (
-                getattr(identity, field.name)
-                if hasattr(identity, field.name)
-                else getattr(proof, field.name)
-            )
+            field.name: (getattr(identity, field.name) if hasattr(identity, field.name) else getattr(proof, field.name))
             for field in fields(proof)
         }
     )
@@ -131,21 +124,15 @@ def _install_operator_fakes(
         return exact_current()
 
     monkeypatch.setattr(operator, "_select_exact_current_root", select)
-    acquisition_module = ModuleType(
-        "process.provider_directory_rooted_graph_acquisition"
-    )
+    acquisition_module = ModuleType("process.provider_directory_rooted_graph_acquisition")
 
     async def acquire(candidate: Any, **_values: Any) -> object:
         assert candidate == _identity().candidate
         return receipt
 
     acquisition_module.acquire_rooted_graph_single_root = acquire
-    acquisition_module.ProviderDirectoryRootedGraphAcquisitionConfig = (
-        ProviderDirectoryRootedGraphAcquisitionConfig
-    )
-    acquisition_module.ProviderDirectoryRootedGraphRootReceipt = (
-        ProviderDirectoryRootedGraphRootReceipt
-    )
+    acquisition_module.ProviderDirectoryRootedGraphAcquisitionConfig = ProviderDirectoryRootedGraphAcquisitionConfig
+    acquisition_module.ProviderDirectoryRootedGraphRootReceipt = ProviderDirectoryRootedGraphRootReceipt
     store_module = ModuleType("process.provider_directory_rooted_graph_twin_store")
 
     async def admit(acquisition_id: str, **values: Any) -> object:
@@ -154,9 +141,7 @@ def _install_operator_fakes(
         return admission
 
     store_module.admit_rooted_graph_single_root = admit
-    store_module.ProviderDirectoryRootedGraphTwinAdmission = (
-        ProviderDirectoryRootedGraphTwinAdmission
-    )
+    store_module.ProviderDirectoryRootedGraphTwinAdmission = ProviderDirectoryRootedGraphTwinAdmission
     monkeypatch.setitem(sys.modules, acquisition_module.__name__, acquisition_module)
     monkeypatch.setitem(sys.modules, store_module.__name__, store_module)
 
@@ -176,9 +161,7 @@ def _operator_arguments() -> dict[str, object]:
 
 def test_single_root_contract_guards_and_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = contract.single_root_operator_contract_payload()
-    identity = contract.build_rooted_graph_single_root_identity(
-        exact_current(), operation_key=OPERATION_KEY
-    )
+    identity = contract.build_rooted_graph_single_root_identity(exact_current(), operation_key=OPERATION_KEY)
     assert payload["reviewed_root_policy"]["required_root_count"] == 1
     assert identity == _identity()
     assert profile_contract._is_rooted_admission_metadata_valid({}) is False
@@ -196,9 +179,7 @@ def test_single_root_contract_guards_and_identity(monkeypatch: pytest.MonkeyPatc
             return "0" * 64
 
     monkeypatch.setattr(contract.hashlib, "sha256", lambda _payload: _BadDigest())
-    with pytest.raises(
-        RuntimeError, match="provider_directory_rooted_graph_single_root_contract_invalid"
-    ):
+    with pytest.raises(RuntimeError, match="provider_directory_rooted_graph_single_root_contract_invalid"):
         runpy.run_path(Path(contract.__file__))
 
 
@@ -244,18 +225,14 @@ async def test_single_root_acquisition_validates_role_and_seals(
     config = ProviderDirectoryRootedGraphAcquisitionConfig(enabled=True)
     with pytest.raises(acquisition.ProviderDirectoryRootedGraphAcquisitionError):
         acquisition._root_receipt(identity, summary, 1.25)
-    root_receipt = await acquisition.acquire_rooted_graph_single_root(
-        identity, config=config, database=object()
-    )
+    root_receipt = await acquisition.acquire_rooted_graph_single_root(identity, config=config, database=object())
     assert root_receipt == _receipt(completed_count=2)
     assert sealed_sources == [("exact-source",)]
     with pytest.raises(ValueError):
         await acquisition.acquire_rooted_graph_single_root(object(), config=config)
     with pytest.raises(ValueError):
         await acquisition.acquire_rooted_graph_single_root(
-            contract.build_rooted_graph_operator_identities(
-                exact_current(), operation_key=OPERATION_KEY
-            ).baseline,
+            contract.build_rooted_graph_operator_identities(exact_current(), operation_key=OPERATION_KEY).baseline,
             config=config,
         )
 
@@ -343,6 +320,10 @@ async def test_single_root_operator_rejects_invalid_request(
 async def test_single_root_store_rejects_invalid_key_and_replays(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from process import provider_directory_rooted_graph_current_preflight as preflight
+
+    configure_rooted_generation(monkeypatch)
+    monkeypatch.setattr(preflight, "prepare_current_root", AsyncMock())
     candidate = _candidate()
     admission = _admission()
     with pytest.raises(ValueError):

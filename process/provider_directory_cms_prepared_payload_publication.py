@@ -31,10 +31,8 @@ _MODELS = (
     models.ProviderDirectoryCMSNPDResourceWitness,
 )
 _INTEGER_COLUMNS = {"parent_ordinal", "reference_ordinal"}
-_TARGET_SQL = """SELECT wanted.root,c.oid::bigint,c.relowner::bigint,n.oid::bigint AS schema_oid,
+_TARGET_SQL = """SELECT wanted.root,n.nspname AS schema,
  c.relkind::text AS relkind,c.relispartition,c.relrowsecurity,c.relforcerowsecurity,
- pg_catalog.has_table_privilege(current_user,c.oid,'SELECT') AS can_select,
- pg_catalog.has_table_privilege(current_user,c.oid,'INSERT') AS can_insert,
  ARRAY(SELECT a.attname::text FROM pg_catalog.pg_attribute a
        WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum) AS columns,
  (SELECT jsonb_agg(jsonb_build_array(a.attname,a.atttypid::bigint,a.atttypmod,
@@ -84,32 +82,34 @@ async def _coordinates(workspace, handoff):
         root: document["tables"][root] if root in {storage.RESOURCE, storage.WITNESS} else receipts[root]
         for root in ROOTS
     }
-    _require(len({item["oid"] for item in sources_by_root.values()}) == len(ROOTS), "source_alias")
+    _require(len({(item["schema"], item["name"]) for item in sources_by_root.values()}) == len(ROOTS), "source_alias")
     return sources_by_root
 
 
 async def _targets(workspace):
     rows = await workspace.connection.fetch(_TARGET_SQL, list(ROOTS), workspace.catalog_schema)
-    excluded_oids = {row["relation_oid"] for row in workspace._inputs["frozen_inventory"]["relations"]}
-    excluded_oids.update(receipt["oid"] for receipt in workspace.receipts.values())
+    excluded_names = {
+        (row["schema_name"], row["relation_name"]) for row in workspace._inputs["frozen_inventory"]["relations"]
+    }
+    excluded_names.update((receipt["schema"], receipt["name"]) for receipt in workspace.receipts.values())
     _require(len(rows) == len(ROOTS) and {row["root"] for row in rows} == set(ROOTS), "targets_changed")
     targets_by_root = {}
     for row in rows:
+        reference_by_field = {"schema": workspace.catalog_schema, "name": row["root"]}
         _require(
-            row["oid"] is not None
-            and row["oid"] not in excluded_oids
-            and row["schema_oid"] == workspace.source_binding.catalog_schema_oid
+            row["schema"] == workspace.catalog_schema
+            and (reference_by_field["schema"], reference_by_field["name"]) not in excluded_names
             and row["relkind"] in {"r", "p"}
             and not row["relispartition"]
             and not row["relrowsecurity"]
             and not row["relforcerowsecurity"]
-            and row["can_select"] is True
-            and row["can_insert"] is True
             and tuple(row["columns"]) == _columns(row["root"], generated=True)[0],
             "target_unavailable",
         )
-        targets_by_root[row["root"]] = dict(row)
-    _require(len({row["oid"] for row in rows}) == len(ROOTS), "target_alias")
+        await workspace.connection.execute(
+            "SELECT 1 FROM " + storage_relation(reference_by_field["schema"], reference_by_field["name"]) + " LIMIT 0"
+        )
+        targets_by_root[row["root"]] = reference_by_field
     return targets_by_root
 
 
@@ -258,31 +258,38 @@ async def copy_prepared_cms_payloads(workspace, handoff):
 
 
 def _generic_leaves(workspace, inventory):
-    """Select only the four leaves already named by the authenticated allocation."""
-    parents_by_root = {entry["relname"]: entry for entry in inventory if entry["relname"] in ROOTS[:4]}
-    excluded_oids = {entry["relation_oid"] for entry in workspace._inputs["frozen_inventory"]["relations"]}
-    excluded_oids.update(receipt["oid"] for receipt in workspace.receipts.values())
+    """Select the complete four named leaves of this logical dataset allocation."""
+    _require(type(inventory) is list and len(inventory) == 8, "generic_inventory_required")
+    coordinates = {(entry["schema"], entry["name"]) for entry in inventory}
+    excluded_names = {
+        (entry["schema_name"], entry["relation_name"]) for entry in workspace._inputs["frozen_inventory"]["relations"]
+    }
+    excluded_names.update((receipt["schema"], receipt["name"]) for receipt in workspace.receipts.values())
+    parents_by_root = {entry["name"]: entry for entry in inventory if entry["name"] in ROOTS[:4]}
     _require(
-        len(inventory) == 8
+        len(coordinates) == 8
         and set(parents_by_root) == set(ROOTS[:4])
-        and len({entry["oid"] for entry in inventory}) == 8
-        and all(
-            entry["nspname"] == workspace.catalog_schema and entry["oid"] not in excluded_oids for entry in inventory
-        ),
+        and all(entry["schema"] == workspace.catalog_schema for entry in inventory)
+        and not coordinates & excluded_names,
         "generic_inventory_required",
     )
     leaves_by_root = {}
     for root, parent in parents_by_root.items():
-        child_tables = [entry for entry in inventory if entry["native"]["parents"] == [parent["oid"]]]
-        _require(parent["relkind"] == "p" and not parent["native"]["parents"], "generic_partition_required")
+        child_entries = [
+            entry for entry in inventory if entry["parent"] == {"schema": workspace.catalog_schema, "name": root}
+        ]
+        _require(parent["kind"] == "p" and parent["parent"] is None, "generic_partition_required")
         _require(
-            len(child_tables) == 1
-            and child_tables[0]["relkind"] == "r"
-            and child_tables[0]["relowner"] == parent["relowner"]
-            and not any(child_tables[0]["oid"] in entry["native"]["parents"] for entry in inventory),
+            len(child_entries) == 1
+            and child_entries[0]["kind"] == "r"
+            and child_entries[0]["name"] == allocations.generic_leaf_name(root, workspace.identity["dataset_id"])
+            and not any(
+                entry["parent"] == {"schema": workspace.catalog_schema, "name": child_entries[0]["name"]}
+                for entry in inventory
+            ),
             "generic_partition_required",
         )
-        leaves_by_root[root] = child_tables[0]
+        leaves_by_root[root] = {"schema": child_entries[0]["schema"], "name": child_entries[0]["name"]}
     return leaves_by_root
 
 
@@ -323,7 +330,7 @@ async def copy_allocated_cms_generic_payloads(workspace, handoff, *, allocation)
     async with _savepoint(workspace.connection):
         await allocations.adopt_prepared_cms_allocation(workspace, handoff, allocation)
         leaves_by_root = _generic_leaves(workspace, allocation["inventory"])
-        names = sorted(storage_relation(workspace.catalog_schema, leaf["relname"]) for leaf in leaves_by_root.values())
+        names = sorted(storage_relation(leaf["schema"], leaf["name"]) for leaf in leaves_by_root.values())
         await workspace.connection.execute(
             "LOCK TABLE " + ",".join("ONLY " + name for name in names) + " IN SHARE UPDATE EXCLUSIVE MODE NOWAIT"
         )

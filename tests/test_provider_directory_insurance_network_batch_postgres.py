@@ -369,7 +369,7 @@ async def test_native_unavailable_and_caller_transaction_required(network_batch_
         with pytest.raises(ValueError, match="transaction_required$"):
             await _apply(session, [_org()])
         async with session.begin():
-            with pytest.raises(GenericCandidateError, match="physical_session_required$"):
+            with pytest.raises(GenericCandidateError, match="candidate_scope_required$"):
                 await _apply(session, [_org()])
     async with db.session() as session:
         monkeypatch.setattr(batch, "_fast_module", lambda: None)

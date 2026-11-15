@@ -13,6 +13,9 @@ from api.endpoint import npi
 @pytest.fixture(autouse=True)
 def stub_provider_profile_snapshot(monkeypatch):
     """Stub only the snapshot boundary in tests that already replace database reads."""
+    monkeypatch.setattr(
+        "asyncpg.connect", AsyncMock(side_effect=AssertionError("loader-mocked route opened a database connection"))
+    )
 
     @asynccontextmanager
     async def snapshot(_database, _schema, *, include_detail=False):

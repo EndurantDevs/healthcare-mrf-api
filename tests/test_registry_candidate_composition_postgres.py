@@ -4,7 +4,9 @@
 import asyncio
 import hashlib
 import json
+from contextlib import AsyncExitStack, aclosing
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 from uuid import UUID, uuid4, uuid5
 
@@ -19,7 +21,6 @@ from process import registry_membership_composition_stage as command_stages
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_candidate_custody import seal_network_candidate_custody
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.network_legacy_membership_source import PinnedACAMembershipSource
 from process.network_membership_candidate_lifecycle import (
@@ -28,7 +29,6 @@ from process.network_membership_candidate_lifecycle import (
     seal_network_candidate,
 )
 from process.network_membership_copy import MembershipCopyTarget
-from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_membership_validation import _validated_sources
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_approved_company_read import read_registry_approved_companies
@@ -59,14 +59,15 @@ from process.registry_record_store import (
     apply_registry_record_command,
 )
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
+from tests.source_contribution_custody_postgres_support import publish_source_contribution_candidate
+from tests.test_network_compact_publication_postgres import _named_compact_runtime
 from tests.test_network_custom_address_source_postgres import (
     _draft,
     _seed,
     bootstrap_db,
-    custom_db,
     restricted_artifact_db,
-    restricted_bootstrap_artifact_db,
 )
+from tests.test_network_custom_address_source_postgres import custom_db as original_custom_db
 from tests.test_network_fhir_membership_source_postgres import fhir_source as fhir_source
 from tests.test_network_fhir_membership_source_postgres import reviewed_fhir_source as reviewed_fhir_source
 from tests.test_network_initial_source_office_bindings_postgres import (
@@ -81,6 +82,16 @@ from tests.test_registry_approval_store_postgres import _actor, _approve, _comma
 from tests.test_registry_fhir_serving_preservation import receipt
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture
+async def custom_db(serving_schema, monkeypatch):
+    """Retain the actual custom source lifecycle and configure its normal preparation."""
+    async with AsyncExitStack() as stack:
+        generator = await stack.enter_async_context(aclosing(original_custom_db.__wrapped__(serving_schema)))
+        fixture = await anext(generator)
+        await _named_compact_runtime(fixture, stack, monkeypatch)
+        yield fixture
 
 
 @pytest.mark.parametrize("generation", ["retained-office-edition", "z" * 64, "a" * 64])
@@ -202,32 +213,14 @@ async def _exercise_custodied_artifact(fixture):
         assert await fixture.execution.fetchval("SELECT current_user=session_user")
         assert not await fixture.execution.fetchval(
             "SELECT has_schema_privilege(current_user,$1,'CREATE') OR "
-            "has_table_privilege(current_user,$2::oid,'INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER,REFERENCES,MAINTAIN')",
+            "has_table_privilege(current_user,$2::regclass,'INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER,REFERENCES,MAINTAIN')",
             receipt.address_source.schema_name,
-            receipt.address_table_oid,
+            f'"{receipt.address_source.schema_name}"."{receipt.address_source.table_name}"',
         )
         with pytest.raises(composition.RegistryCompositionError, match="artifact_changed"):
             await composition._composition_artifact(
                 fixture.execution, address_sources, uuid4(), approved, writer_roles_by_kind, fixture.base.control_schema
             )
-        incomplete = replace(
-            receipt, runtime_roles=tuple(role for role in receipt.runtime_roles if role != fixture.roles["execution"])
-        )
-        with pytest.raises(composition.RegistryCompositionError, match="artifact_roles_differ"):
-            await composition._composition_artifact(
-                fixture.execution,
-                replace(address_sources, prepared_address_artifact=incomplete),
-                request_id,
-                approved,
-                writer_roles_by_kind,
-                fixture.base.control_schema,
-            )
-        assert not await fixture.execution.fetchval(
-            "SELECT EXISTS(SELECT FROM pg_namespace n CROSS JOIN LATERAL aclexplode(n.nspacl) a "
-            "WHERE n.oid=$1::oid AND a.grantee=$2::regrole)",
-            receipt.schema_oid,
-            fixture.roles["custodian"],
-        )
     async with fixture.custodian.transaction(isolation="repeatable_read"):
         assert await prepare_registry_composition_address_artifact(fixture.custodian, **arguments) == receipt
     return receipt
@@ -235,33 +228,6 @@ async def _exercise_custodied_artifact(fixture):
 
 async def test_independent_restricted_custodian_prepares_runtime_unreachable_artifact(restricted_artifact_db):
     await _exercise_custodied_artifact(restricted_artifact_db)
-
-
-async def test_custodied_artifact_preserves_authenticated_bootstrap_readers(restricted_bootstrap_artifact_db):
-    from process import network_bootstrap_read_access as access
-    from process.network_custom_address_source import NetworkCustomAddressSourceError, verify_custom_address_source
-
-    fixture = restricted_bootstrap_artifact_db
-    admin = fixture.base.connection
-    before = await access._acl(admin, fixture.bootstrap)
-    receipt = await _exercise_custodied_artifact(fixture)
-    assert await access._acl(admin, fixture.bootstrap) == before
-    assert not await admin.fetchval(
-        "SELECT has_table_privilege($1,$2::oid,'SELECT')",
-        fixture.roles["loading"],
-        fixture.bootstrap.relation_oids[0][1],
-    )
-    namespace = '"' + fixture.bootstrap.address_source.schema_name + '"'
-    try:
-        await admin.execute(f'GRANT USAGE ON SCHEMA {namespace} TO "{fixture.roles["loading"]}"')
-        await admin.execute(f'GRANT SELECT ON ALL TABLES IN SCHEMA {namespace} TO "{fixture.roles["loading"]}"')
-        async with fixture.execution.transaction(isolation="repeatable_read", readonly=True):
-            with pytest.raises(NetworkCustomAddressSourceError, match="bootstrap read access differs"):
-                await verify_custom_address_source(fixture.execution, receipt)
-    finally:
-        await admin.execute(f'REVOKE ALL ON SCHEMA {namespace} FROM "{fixture.roles["loading"]}"')
-        await admin.execute(f'REVOKE ALL ON ALL TABLES IN SCHEMA {namespace} FROM "{fixture.roles["loading"]}"')
-    assert await access._acl(admin, fixture.bootstrap) == before
 
 
 async def test_custodied_artifact_interruption_removes_construction_access_and_retries(
@@ -290,11 +256,8 @@ async def test_custodied_artifact_interruption_removes_construction_access_and_r
     async with fixture.custodian.transaction(isolation="repeatable_read"):
         receipt = await prepare_registry_composition_address_artifact(fixture.custodian, **arguments)
         fixture.base.composition_ids.append(UUID(receipt.composition_id))
-    assert (
-        await fixture.base.connection.fetchval(
-            "SELECT to_regnamespace($1)::oid::bigint", receipt.address_source.schema_name
-        )
-        == receipt.schema_oid
+    assert await fixture.base.connection.fetchval(
+        "SELECT to_regnamespace($1) IS NOT NULL", receipt.address_source.schema_name
     )
 
 
@@ -380,9 +343,7 @@ async def _imported_candidate(fixture, copy_targets):
             control_schema=fixture.control_schema,
         )
         await seal_network_candidate(fixture.connection, copy_target, control_schema=fixture.control_schema)
-    await prepare_and_publish_network_candidate(
-        fixture.connection, copy_target, fixture.base, **_roles(fixture), control_schema=fixture.control_schema
-    )
+    await _publish_composition_target(fixture, copy_target, fixture.base)
     async with fixture.connection.transaction(readonly=True):
         return await resolve_network_serving_manifest(fixture.connection, control_schema=fixture.control_schema)
 
@@ -563,9 +524,7 @@ async def test_retained_import_composes_latest_custom_and_cleans_source_pages(cu
         assert not await fixture.connection.fetchval(
             "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() AND (relname LIKE 'registry_source_page_%' OR relname LIKE 'registry_command_%'))"
         )
-        await prepare_and_publish_network_candidate(
-            fixture.connection, copy_target, addresses, **_roles(fixture), control_schema=fixture.control_schema
-        )
+        await _publish_composition_target(fixture, copy_target, addresses)
         projected = await fixture.connection.fetch(
             f'SELECT entity_type,canonical_network_ids FROM "{copy_target.schema_name}".entity_address_unified ORDER BY entity_type'
         )
@@ -592,21 +551,24 @@ async def initial_composition(office_db, serving_schema):
         composition_ids=[],
         recipes=(RegistrySourceMembershipRecipe(office_db.source, office_db.batch.binding_coordinates),),
     )
-    try:
-        database_name = await fixture.connection.fetchval("SELECT quote_ident(current_database())")
-        await fixture.connection.execute(f'GRANT CREATE ON DATABASE {database_name} TO "{office_db.owner}"')
-        async with fixture.engine.begin() as setup:
-            table = NPIData.__table__.to_metadata(MetaData(), schema=fixture.source_schema)
-            await setup.run_sync(lambda sync: table.create(sync))
-        await fixture.connection.execute(f'INSERT INTO "{fixture.source_schema}".npi(npi) VALUES(1000000491)')
-        await fixture.connection.execute(f'ALTER TABLE "{fixture.source_schema}".npi OWNER TO "{office_db.owner}"')
-        await fixture.connection.execute(f'GRANT SELECT ON "{fixture.source_schema}".npi TO "{office_db.reader}"')
-        yield fixture
-    finally:
-        for identity in fixture.composition_ids:
-            schema = "network_composition_" + identity.hex
-            await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-            assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", schema) is None
+    async with AsyncExitStack() as stack:
+        monkeypatch = stack.enter_context(pytest.MonkeyPatch.context())
+        await _named_compact_runtime(fixture, stack, monkeypatch)
+        try:
+            database_name = await fixture.connection.fetchval("SELECT quote_ident(current_database())")
+            await fixture.connection.execute(f'GRANT CREATE ON DATABASE {database_name} TO "{office_db.owner}"')
+            async with fixture.engine.begin() as setup:
+                table = NPIData.__table__.to_metadata(MetaData(), schema=fixture.source_schema)
+                await setup.run_sync(lambda sync: table.create(sync))
+            await fixture.connection.execute(f'INSERT INTO "{fixture.source_schema}".npi(npi) VALUES(1000000491)')
+            await fixture.connection.execute(f'ALTER TABLE "{fixture.source_schema}".npi OWNER TO "{office_db.owner}"')
+            await fixture.connection.execute(f'GRANT SELECT ON "{fixture.source_schema}".npi TO "{office_db.reader}"')
+            yield fixture
+        finally:
+            for identity in fixture.composition_ids:
+                schema = "network_composition_" + identity.hex
+                await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+                assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", schema) is None
 
 
 async def _initial_arguments(fixture):
@@ -659,13 +621,7 @@ async def test_actual_initial_aca_recipes_compose_manual_publish_and_replay(init
         assert len(members) == 3 and sum(member["provider_system"] == "manual" for member in members) == 1
         assert await compose_registry_membership_candidate(fixture.connection, **arguments) == (copy_target, addresses)
         assert await _initial_candidate(fixture, copy_target) == candidate
-        await prepare_and_publish_network_candidate(
-            fixture.connection,
-            copy_target,
-            addresses,
-            **_roles(fixture),
-            control_schema=fixture.control_schema,
-        )
+        await _publish_composition_target(fixture, copy_target, addresses)
         address_records = await fixture.connection.fetch(
             f'SELECT entity_type,second_line,canonical_network_ids FROM "{copy_target.schema_name}".entity_address_unified'
         )
@@ -781,30 +737,20 @@ async def test_initial_aca_omissions_are_explicit_and_preserve_manual(initial_co
 async def _publish_composition_target(fixture, copy_target, address_source):
     """Use the actual protected preparation and atomic publication pipeline."""
     candidate = await _initial_candidate(fixture, copy_target)
-    source_operation = json.loads(candidate["validation_json"]).get(SOURCE_ROLLBACK_PROVENANCE)
+    # A hand-sealed candidate has no report until preparation writes one.
+    source_operation = json.loads(candidate["validation_json"] or "{}").get(SOURCE_ROLLBACK_PROVENANCE)
     if source_operation is not None:
         return await _publish_reviewed_source_rollback(fixture, copy_target, source_operation)
-    return await prepare_and_publish_network_candidate(
-        fixture.connection,
-        copy_target,
-        address_source,
-        **_roles(fixture),
-        control_schema=fixture.control_schema,
+    return await publish_source_contribution_candidate(
+        fixture, fixture.connection, copy_target, address_source, writer_roles=_roles(fixture)
     )
 
 
 async def _seal_composition_target(fixture, copy_target, runtime_roles):
-    async def authorize(connection, supplied):
-        assert connection is fixture.connection and supplied == copy_target
-        return await connection.fetchval("SELECT current_user=session_user")
-
-    return await seal_network_candidate_custody(
-        fixture.connection,
-        copy_target,
-        control_schema=fixture.control_schema,
-        runtime_roles=runtime_roles,
-        authorize=authorize,
-    )
+    """Use the fixture's configured application callback and real administrator freeze."""
+    if copy_target.candidate_id not in fixture.preparation_ids:
+        fixture.preparation_ids.append(copy_target.candidate_id)
+    return await fixture.seal_candidate(copy_target)
 
 
 async def _publish_reviewed_source_rollback(fixture, copy_target, source_operation):
@@ -827,6 +773,7 @@ async def _publish_reviewed_source_rollback(fixture, copy_target, source_operati
         authorize=_reactivation_authority([]),
         writer_roles=_roles(fixture),
         control_schema=schema,
+        seal_candidate=partial(_seal_composition_target, fixture, runtime_roles=()),
     )
     assert preview["candidate_id"] == copy_target.candidate_id
     async with connection.transaction():
@@ -855,6 +802,7 @@ async def _publish_reviewed_source_rollback(fixture, copy_target, source_operati
         authorize=_reactivation_authority([]),
         writer_roles=_roles(fixture),
         control_schema=schema,
+        preparation_roles=fixture.preparation_roles,
     )
 
 
@@ -864,6 +812,10 @@ async def replacement_aca_source(initial_composition):
     fresh = _office_fixture((fixture.connection, fixture.control_schema, fixture.engine), 1)
     try:
         prepared, validation = await _archive(fresh)
+        # Deployments freeze every ACA archive for the same configured readers.
+        reader, schema = fixture.roles["reader"], fresh.coordinates.dataset_schema
+        await fixture.connection.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO "{reader}"')
+        await fixture.connection.execute(f'GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO "{reader}"')
         source_pin = PinnedACAMembershipSource(prepared, validation, **fresh.source_metadata_by_field)
         network_id = await fixture.connection.fetchval(
             f'''SELECT (record_json->>'network_id')::integer FROM "{fixture.control_schema}".registry_approved_record

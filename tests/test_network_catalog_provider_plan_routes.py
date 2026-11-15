@@ -10,7 +10,7 @@ import pytest
 from api.endpoint import network_catalog as endpoint
 from process import registry_network_catalog_read as catalog
 from process.registry_network_catalog_read import RegistryNetworkCatalogError
-from tests.test_network_catalog_routes import _OWNED_READ_EVENTS, envelope, send, v2_envelope
+from tests.test_network_catalog_routes import _OWNED_READ_EVENTS, _SNAPSHOT_SQL, envelope, send, v2_envelope
 from tests.test_network_catalog_routes import batch_boundary as batch_boundary
 from tests.test_network_catalog_routes import context as context
 
@@ -60,7 +60,7 @@ async def test_provider_plans_full_policy_and_one_snapshot(plans_context, header
     assert len(context.plan_calls) == 1 and context.api_pins == [9] and context.revisions == [4]
     assert catalog._PINNED_READ.get() is None
     assert context.session.events == _OWNED_READ_EVENTS
-    assert len(context.session.snapshot_queries) == 3
+    assert context.session.snapshot_queries == [_SNAPSHOT_SQL, _SNAPSHOT_SQL]
 
 
 @pytest.mark.asyncio

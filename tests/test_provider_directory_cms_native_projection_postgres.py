@@ -71,17 +71,15 @@ async def _seed_sources(database, schema):
 
 
 async def _inputs(database, schema):
-    """Use a real physical overlay only to compare virtual and ordinary builder SQL."""
-    oid = await database.scalar("SELECT to_regclass(:name)::oid::bigint", name=f"{schema}.desired_overlay")
+    """Use a real named overlay only to compare virtual and ordinary builder SQL."""
     return ProviderDirectoryAddressPreparationInput(
         (
             ProviderDirectoryAddressDatasetPin(
                 "synthetic-source", "cms-endpoint", "desired-dataset", "a" * 64, "desired-root"
             ),
         ),
-        "desired_overlay",
-        oid,
-        1,
+        overlay_table="desired_overlay",
+        address_alias_generation=1,
         semantic_as_of="2026-01-02",
     )
 

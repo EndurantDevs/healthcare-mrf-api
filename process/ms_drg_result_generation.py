@@ -96,7 +96,6 @@ async def capture_result(session, schema: str) -> dict:
             {
                 "table": name,
                 "sources": list(owned_sources),
-                "relation_oid": oid,
                 "row_count": count,
                 "row_sha256": digest,
                 "schema_sha256": await _table_shape(session, oid, model),

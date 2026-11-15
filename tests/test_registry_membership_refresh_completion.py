@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Completion and exact request claims cannot borrow ordinary queue authority."""
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -201,7 +202,7 @@ async def test_refresh_insert_race_rechecks_the_complete_immutable_request(monke
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["layout", "generation", "manifest", "address"])
+@pytest.mark.parametrize("changed", [None, "layout", "generation", "manifest", "address"])
 async def test_retained_address_reuse_requires_the_exact_current_source_epoch(monkeypatch, changed):
     selected = command()
     pinned = SimpleNamespace(
@@ -216,16 +217,92 @@ async def test_retained_address_reuse_requires_the_exact_current_source_epoch(mo
         pinned.generation_id += 1
     elif changed == "manifest":
         pinned.manifest_sha256 = "f" * 64
-    else:
+    elif changed == "address":
         pinned.source_generations["network_address_origin"] = "f" * 64
-    monkeypatch.setattr(queue, "resolve_network_serving_manifest", AsyncMock(return_value=pinned))
-    with pytest.raises(RegistryMembershipRefreshUnavailable, match="retained_address_unproved"):
-        await queue._has_retained_address(
-            object(),
-            selected,
-            {
-                "address_origin": selected["address_artifact_sha256"],
-                "generation_id": selected["expected_serving_generation"],
-            },
-            "registry",
+    resolve = AsyncMock(return_value=pinned)
+    monkeypatch.setattr(queue, "resolve_network_serving_manifest", resolve)
+    connection = object()
+    current_by_field = {
+        "address_origin": selected["address_artifact_sha256"],
+        "generation_id": selected["expected_serving_generation"],
+    }
+    if changed is None:
+        assert await queue._has_retained_address(connection, selected, current_by_field, "registry") is True
+    else:
+        with pytest.raises(RegistryMembershipRefreshUnavailable, match="retained_address_unproved"):
+            await queue._has_retained_address(connection, selected, current_by_field, "registry")
+    resolve.assert_awaited_once_with(
+        connection, generation_id=current_by_field["generation_id"], control_schema="registry"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "changed", "missing", "malformed", PermissionError, asyncio.CancelledError])
+async def test_queue_address_uses_current_logical_reader_and_preserves_refusals(monkeypatch, failure):
+    selected = command()
+    authority_by_field = {
+        "local_lineage_id": uuid4(),
+        "local_generation": 2,
+        "origin_lineage_id": uuid4(),
+        "origin_generation": 1,
+        "published_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "relation_oids": None,
+    }
+    if failure == "malformed":
+        authority_by_field["origin_generation"] = True
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=None if failure == "missing" else authority_by_field))
+    if isinstance(failure, type):
+        connection.fetchrow.side_effect = failure("native read failed")
+    capture = AsyncMock(
+        return_value={"descriptor_sha256": "f" * 64 if failure == "changed" else selected["address_artifact_sha256"]}
+    )
+    monkeypatch.setattr(queue.address, "capture_network_address_artifact", capture)
+    profile = queue.RegistryMembershipRefreshAddressProfile("addresses", ("reader",))
+    if failure is None:
+        await queue._require_address(connection, selected, {"address_origin": None}, profile, "registry")
+        pin = capture.await_args.args[1]
+        assert pin.schema_name == "addresses" and pin.table_name == "entity_address_unified"
+        logical, _legacy_key = await queue.address._current_authority(connection, "addresses")
+        assert pin.generation_id == queue.address._digest(logical)
+        capture.assert_awaited_once_with(connection, pin, runtime_roles=("reader",))
+    else:
+        expected = (
+            asyncio.CancelledError
+            if failure is asyncio.CancelledError
+            else RegistryApprovalConflict
+            if failure == "changed"
+            else RegistryMembershipRefreshUnavailable
         )
+        with pytest.raises(expected) as raised:
+            await queue._require_address(connection, selected, {"address_origin": None}, profile, "registry")
+        if failure != "changed":
+            capture.assert_not_awaited()
+        if failure is PermissionError:
+            assert isinstance(raised.value.__cause__, PermissionError)
+
+
+@pytest.mark.asyncio
+async def test_retained_queue_address_does_not_read_current_address_tables(monkeypatch):
+    selected = command()
+    pinned = SimpleNamespace(
+        compact_layout=object(),
+        generation_id=selected["expected_serving_generation"],
+        manifest_sha256=selected["expected_serving_manifest_sha256"],
+        source_generations={"network_address_origin": selected["address_artifact_sha256"]},
+    )
+    monkeypatch.setattr(queue, "resolve_network_serving_manifest", AsyncMock(return_value=pinned))
+    connection = SimpleNamespace(fetchrow=AsyncMock(side_effect=AssertionError("retained address was re-read")))
+    capture = AsyncMock()
+    monkeypatch.setattr(queue.address, "capture_network_address_artifact", capture)
+    await queue._require_address(
+        connection,
+        selected,
+        {
+            "address_origin": selected["address_artifact_sha256"],
+            "generation_id": selected["expected_serving_generation"],
+        },
+        queue.RegistryMembershipRefreshAddressProfile("addresses", ("reader",)),
+        "registry",
+    )
+    connection.fetchrow.assert_not_awaited()
+    capture.assert_not_awaited()

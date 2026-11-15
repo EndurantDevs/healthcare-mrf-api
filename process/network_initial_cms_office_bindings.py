@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass
 from uuid import UUID, uuid4
 
 from process.network_address_projection import PinnedAddressSource, _identifier
-from process.network_custom_address_source import _artifact_dependency_identity, _require_transaction
+from process.network_custom_address_source import _require_transaction
 from process.network_fhir_membership_source import (
     FHIRMembershipBatch,
     PinnedFHIRMembershipSource,
@@ -23,7 +23,7 @@ from process.network_fhir_membership_source import (
     read_fhir_membership_batch,
     read_retained_fhir_membership_batch,
 )
-from process.network_initial_source_office_bindings import _candidate, _copy_bindings, _validate_roles
+from process.network_initial_source_office_bindings import _candidate, _copy_bindings
 from process.network_membership_candidate_lifecycle import _control_namespace
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS, MembershipCopyTarget, _encode
 from process.registry_source_office_errors import SourceOfficeNotReady
@@ -40,7 +40,7 @@ class InitialCMSOfficeBindingError(ValueError):
 @dataclass(frozen=True)
 class PinnedCMSOfficeAddressSource:
     address_source: PinnedAddressSource
-    address_identity: tuple[int, int, int, str]
+    address_scope: tuple[str, str, str, str | None]
     source_generation_id: str
     membership_generation_id: str
     membership_input_sha256: str
@@ -105,13 +105,13 @@ async def _verify_retained_office_read(connection, source_pin, retained_read):
         if type(retained_read) is not SourceWitnessRead or source_pin.retained_successor is not None:
             raise InitialCMSOfficeBindingError("initial_retained_mapping_source_invalid")
         require_capture_anchor(source_pin.source_witness_capture, source_pin.source_witness_anchor)
-        await retained_read.verify(connection, source_pin.source_witness_capture)
+        retained_read.require_ready(source_pin.source_witness_capture)
         return
     physical = fhir_physical_source(source_pin)
     if physical is source_pin:
         if type(retained_read) is not RetainedFHIRRead:
             raise InitialCMSOfficeBindingError("initial_retained_mapping_source_invalid")
-        await retained_read.verify(connection, source_pin.retained_capture)
+        retained_read.require_ready(source_pin.retained_capture)
         return
     if (
         type(retained_read) is not RetainedFHIRSuccessorReads
@@ -120,8 +120,8 @@ async def _verify_retained_office_read(connection, source_pin, retained_read):
         or physical.retained_capture is None
     ):
         raise InitialCMSOfficeBindingError("initial_retained_mapping_source_invalid")
-    await retained_read.original.verify(connection, source_pin.retained_capture)
-    await retained_read.physical.verify(connection, physical.retained_capture)
+    retained_read.original.require_ready(source_pin.retained_capture)
+    retained_read.physical.require_ready(physical.retained_capture)
 
 
 _SOURCE_SQL = """WITH pairs AS MATERIALIZED (
@@ -237,21 +237,13 @@ def _page_key(batch, after_resource):
 @dataclass(frozen=True)
 class _OfficeMatches:
     table_name: str
-    table_oid: int
     address_source: PinnedAddressSource
-    address_identity: tuple
-    transaction: tuple
-    task: object
     page_proofs_by_key: dict
     recipe_sha256: str | None = None
     approved_generation_id: str | None = None
 
 
 _ACTIVE_OFFICE_MATCHES = ContextVar("initial_cms_office_matches", default=None)
-
-
-async def _transaction_identity(connection):
-    return tuple(await connection.fetchrow("SELECT pg_backend_pid(),pg_current_xact_id()::text,current_user::text"))
 
 
 async def _matched_page(connection, matches, page_key):
@@ -315,11 +307,9 @@ async def _match_complete_inputs(connection, input_name, result_name, address_so
 
 @asynccontextmanager
 async def prepare_cms_office_matches(connection, address_source, runtime_roles, pages, *, control_schema):
-    """Match bounded complete inputs once, retaining exact native transaction custody."""
+    """Match bounded complete inputs once against the selected named address edition."""
     await _require_transaction(connection)
-    identity = await _artifact_dependency_identity(
-        connection, address_source, runtime_roles, address=True, control_schema=control_schema
-    )
+    address_source.__post_init__()
     input_name, result_name = ("initial_cms_inputs_" + uuid4().hex, "initial_cms_matches_" + uuid4().hex)
     savepoint = connection.transaction()
     await savepoint.start()
@@ -331,11 +321,7 @@ async def prepare_cms_office_matches(connection, address_source, runtime_roles, 
         await _match_complete_inputs(connection, input_name, result_name, address_source)
         matches = _OfficeMatches(
             result_name,
-            await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + result_name),
             address_source,
-            identity,
-            await _transaction_identity(connection),
-            asyncio.current_task(),
             page_proofs_by_key,
         )
         for key, (count, _) in page_proofs_by_key.items():
@@ -367,14 +353,7 @@ async def _office_records(
     address_arguments=(),
 ):
     if office_matches is not None:
-        if (
-            type(office_matches) is not _OfficeMatches
-            or office_matches.task is not asyncio.current_task()
-            or office_matches.address_source != address_source
-            or office_matches.transaction != await _transaction_identity(connection)
-            or office_matches.table_oid
-            != await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + office_matches.table_name)
-        ):
+        if type(office_matches) is not _OfficeMatches or office_matches.address_source != address_source:
             raise InitialCMSOfficeBindingError("initial_cms_office_match_scope_differs")
         key = _page_key(batch, after_resource)
         matched_json = await _matched_page(connection, office_matches, key)
@@ -429,7 +408,6 @@ async def _capture_offices(
 ):
     if type(address_source) is not PinnedAddressSource or address_source.table_name != "entity_address_unified":
         raise InitialCMSOfficeBindingError("initial_cms_office_address_pin_invalid")
-    _validate_roles(runtime_roles)
     await _require_transaction(connection)
     if batch.source.retained_capture is None:
         await _verify_batch(connection, batch, after_resource, control_schema)
@@ -446,9 +424,8 @@ async def _capture_offices(
     office_matches = _ACTIVE_OFFICE_MATCHES.get()
     if office_matches is not None and (
         type(office_matches) is not _OfficeMatches
-        or office_matches.task is not asyncio.current_task()
         or origin_manifest_sha256 is not None
-        or origin.address_identity != office_matches.address_identity
+        or origin.address_source != office_matches.address_source
     ):
         raise InitialCMSOfficeBindingError("initial_cms_office_match_scope_differs")
     offices, bindings = await _office_records(
@@ -462,7 +439,7 @@ async def _capture_offices(
     )
     pin = PinnedCMSOfficeAddressSource(
         address_source,
-        origin.address_identity,
+        origin.address_scope,
         batch.source.generation_id,
         batch.generation_id,
         batch.input_sha256,
@@ -879,11 +856,9 @@ async def _prune_unmatched_members(connection, source_table, result_name, proofs
 async def prepare_verified_retained_office_mapping(
     connection, address_source, runtime_roles, pages, source_table, *, control_schema, mapping_scope
 ):
-    """Keep one private transaction-bound verified set for membership and binding construction."""
+    """Keep one complete mapped set for membership and binding construction."""
     await _require_transaction(connection)
-    identity = await _artifact_dependency_identity(
-        connection, address_source, runtime_roles, address=True, control_schema=control_schema
-    )
+    address_source.__post_init__()
     input_name, result_name = "initial_cms_inputs_" + uuid4().hex, "initial_cms_matches_" + uuid4().hex
     await connection.execute(
         f"CREATE TEMP TABLE {_identifier(input_name)}(page_key text NOT NULL,ordinal integer NOT NULL,office jsonb NOT NULL,canonical jsonb NOT NULL,PRIMARY KEY(page_key,ordinal)) ON COMMIT DROP"
@@ -896,11 +871,7 @@ async def prepare_verified_retained_office_mapping(
     await _prune_unmatched_members(connection, source_table, result_name, proofs_by_page)
     matches = _OfficeMatches(
         result_name,
-        await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + result_name),
         address_source,
-        identity,
-        await _transaction_identity(connection),
-        asyncio.current_task(),
         proofs_by_page,
         *mapping_scope,
     )
@@ -918,21 +889,12 @@ async def prepare_verified_retained_office_mapping(
 
 
 async def verified_retained_offices(connection, matches, address_source, runtime_roles, control_schema):
-    """Recheck the exact original task, native transaction, table and selected match hashes."""
+    """Compare the selected named address edition and complete bounded match content."""
     await _require_transaction(connection)
-    if (
-        type(matches) is not _OfficeMatches
-        or matches.task is not asyncio.current_task()
-        or matches.address_source != address_source
-        or matches.transaction != await _transaction_identity(connection)
-        or matches.table_oid
-        != await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + matches.table_name)
-        or matches.address_identity
-        != await _artifact_dependency_identity(
-            connection, address_source, runtime_roles, address=True, control_schema=control_schema
-        )
-    ):
+    if type(matches) is not _OfficeMatches or matches.address_source != address_source:
         raise InitialCMSOfficeBindingError("initial_cms_office_match_scope_differs")
+    _identifier(matches.table_name)
+    address_source.__post_init__()
     digest = hashlib.sha256()
     for key, (_, expected) in matches.page_proofs_by_key.items():
         raw = await _matched_page(connection, matches, key)
@@ -943,7 +905,6 @@ async def verified_retained_offices(connection, matches, address_source, runtime
         (
             _VERIFIED_POLICY,
             asdict(address_source),
-            matches.address_identity,
             matches.recipe_sha256,
             matches.approved_generation_id,
             digest.hexdigest(),

@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Original publication custody cannot survive changed native/session authority."""
+"""Logical publication scope keeps native transaction and accounting boundaries."""
 
 import asyncio
 from copy import deepcopy
@@ -13,22 +13,21 @@ from tests.test_provider_directory_cms_source_runtime import registry_publicatio
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["nested", "connection", "closed_transaction", "publisher_with_owner_context"])
-async def test_publication_rejects_changed_original_session_before_epoch_use(registry_publication_case, changed):
+@pytest.mark.parametrize("changed", ["closed_transaction", "isolation", "readonly", "lock"])
+async def test_publication_requires_active_bounded_native_transaction(registry_publication_case, changed):
     async with registry_publication_case() as case:
         async with runtime.registry_source_publication(
             case.session, case.prepared, case.row["receipt_id"], case.row["payload"]
         ):
-            original_connection = case.outcome.connection
             match changed:
-                case "nested":
-                    case.session.in_nested_transaction = lambda: True
-                case "connection":
-                    case.session.connection.return_value = SimpleNamespace()
                 case "closed_transaction":
                     case.native.active = False
-                case "publisher_with_owner_context":
-                    case.native.actor = "source_publisher"
+                case "isolation":
+                    case.native.isolation = "repeatable read"
+                case "readonly":
+                    case.native.readonly = "on"
+                case "lock":
+                    case.native.locked = False
             try:
                 with pytest.raises(ValueError, match="cms_registry_source_publication_invalid"):
                     await runtime.require_registry_epoch_transaction(
@@ -37,22 +36,21 @@ async def test_publication_rejects_changed_original_session_before_epoch_use(reg
                 assert case.group["consumed"] is False
                 assert case.outcome.commit_state == "not_attempted"
             finally:
-                case.session.in_nested_transaction = lambda: False
-                case.session.connection.return_value = original_connection
-                case.native.active, case.native.actor = True, "source_owner"
+                case.native.active, case.native.locked = True, True
+                case.native.isolation, case.native.readonly = "read committed", "off"
         assert runtime._REGISTRY_PUBLICATION.get() is None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["missing", "replacement"])
-async def test_publication_requires_the_same_registered_owned_group(registry_publication_case, changed):
+@pytest.mark.parametrize("changed", ["missing", "duplicate"])
+async def test_publication_requires_one_pending_logical_accounting_group(registry_publication_case, changed):
     async with registry_publication_case() as case:
         async with runtime.registry_source_publication(
             case.session, case.prepared, case.row["receipt_id"], case.row["payload"]
         ):
-            groups = case.prepared.nonprofile_admission.wal_tracker.owned_control_transaction_groups
+            groups = case.prepared.fhir._provider_directory_profile_capacity_admission().wal_tracker.owned_control_transaction_groups
             original_groups = list(groups)
-            groups[:] = [] if changed == "missing" else [dict(case.group)]
+            groups[:] = [] if changed == "missing" else [case.group, dict(case.group)]
             try:
                 with pytest.raises(ValueError, match="cms_registry_source_publication_invalid"):
                     await runtime.require_registry_epoch_transaction(

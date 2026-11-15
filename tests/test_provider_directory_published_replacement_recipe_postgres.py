@@ -8,8 +8,10 @@ from contextlib import asynccontextmanager
 
 import pytest
 from sqlalchemy import MetaData, text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from db.migration_generic_source_candidates import upgrade_generic_source_candidates
 from process import entity_address_result_generation as generations
 from process import provider_directory_published_replacement_address_followup as address_followup
 from process import provider_directory_serving_recovery as recovery
@@ -21,7 +23,8 @@ from tests.provider_directory_serving_recovery_postgres_support import ordinary_
 from tests.ptg2_serving_address_evidence_postgres_support import _create_geo_reference_tables
 from tests.test_address_format_db import FOUNDATION_MIGRATION_PATH, _load_migration
 from tests.test_address_numeric_grid_alias_db import _INSERT_ARCHIVE_ADDRESS_SQL
-from tests.test_entity_address_snapshot_destination import _seed_support_rows
+from tests.test_entity_address_snapshot_destination import _publish_npi_fixture_generation, _seed_support_rows
+from tests.test_mrf_result_archive_postgres import _provision_canonical_type, _retire_canonical_type
 from tests.test_provider_directory_published_replacement_postgres import _alias, _markers, _prepare
 from tests.test_provider_directory_serving_recovery_postgres import _state
 
@@ -48,6 +51,7 @@ async def _create_recipe_models(case):
         ):
             model.__table__.to_metadata(metadata, schema=schema)
         await connection.run_sync(metadata.create_all)
+        await connection.run_sync(lambda native: upgrade_generic_source_candidates(native, schema))
         foundation = _load_migration(FOUNDATION_MIGRATION_PATH, "replacement_recipe_foundation")
         await connection.run_sync(
             lambda sync: foundation._exec_sql_batch(sync, foundation._create_functions_sql(schema))
@@ -245,7 +249,10 @@ async def _seed_incumbent(case):
 async def _recipe_case(monkeypatch, *, archive_complete):
     """Own all native prerequisites and bind real database objects, never recipe mocks."""
     administrator = create_async_engine(_database_url())
+    sessions = async_sessionmaker(administrator, expire_on_commit=False)
+    canonical_type = None
     try:
+        canonical_type = await _provision_canonical_type(sessions)
         async with administrator.begin() as connection:
             for extension in ("postgis", "pg_trgm", "intarray", "btree_gin"):
                 await connection.execute(text(f"CREATE EXTENSION IF NOT EXISTS {extension}"))
@@ -253,6 +260,7 @@ async def _recipe_case(monkeypatch, *, archive_complete):
         async with ordinary_serving_case(monkeypatch) as case:
             async with administrator.begin() as connection:
                 await connection.execute(text(f'CREATE SCHEMA tiger AUTHORIZATION "{case.role}"'))
+                await connection.execute(text(f'GRANT USAGE ON SCHEMA mrf TO "{case.role}"'))
             try:
                 for module in (
                     native,
@@ -271,6 +279,7 @@ async def _recipe_case(monkeypatch, *, archive_complete):
                 monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_MIN_ROWS", "3")
                 await _create_recipe_models(case)
                 await _seed_spatial_inputs(case)
+                await _publish_npi_fixture_generation(case.database, case.schema)
                 await _seed_published_resources(case)
                 await _seed_incumbent(case)
                 if archive_complete:
@@ -279,9 +288,14 @@ async def _recipe_case(monkeypatch, *, archive_complete):
             finally:
                 async with administrator.begin() as connection:
                     await connection.execute(text("DROP SCHEMA tiger CASCADE"))
+                    await connection.execute(text(f'REVOKE USAGE ON SCHEMA mrf FROM "{case.role}"'))
                     assert await connection.scalar(text("SELECT to_regnamespace('tiger')")) is None
     finally:
-        await administrator.dispose()
+        try:
+            if canonical_type is not None:
+                await _retire_canonical_type(sessions, canonical_type)
+        finally:
+            await administrator.dispose()
 
 
 async def _seed_replacement_archive(case):
@@ -306,12 +320,12 @@ async def _rows(case, table):
 
 
 async def _support(case):
-    """Capture content and heap identity for all six unchanged supporting models."""
+    """Capture named full content for all six unchanged supporting models."""
     support_by_table = {}
     for model in native.SUPPORT_TABLE_MODELS:
         name = model.__tablename__
         support_by_table[name] = (
-            await case.database.scalar("SELECT to_regclass(:name)::oid::bigint", name=f"{case.schema}.{name}"),
+            (case.schema, name),
             await _rows(case, name),
         )
     return support_by_table
@@ -347,7 +361,7 @@ async def _assert_addresses(case, unrelated, *, archive_complete):
 
 
 async def _assert_recovered(case, before, published):
-    """Recovery restores exact heaps while recording its own new local publication generation."""
+    """Recovery restores complete named content and advances the local publication generation."""
     restored = await _state(case)
     assert restored["roots"] == before["roots"]
     for field in ("alias", "profile", "doctors", "geo", "relations", "common_receipt"):
@@ -355,7 +369,7 @@ async def _assert_recovered(case, before, published):
     old_address, recovered_address = before["metadata"]["address"], restored["metadata"]["address"]
     assert recovered_address["local_generation"] == published["metadata"]["address"]["local_generation"] + 1
     assert recovered_address["origin_generation"] == recovered_address["local_generation"]
-    for field in ("local_lineage_id", "origin_lineage_id", "relation_oids", "singleton"):
+    for field in ("local_lineage_id", "origin_lineage_id", "singleton"):
         assert recovered_address[field] == old_address[field]
     for field in ("generation", "artifact_name"):
         assert restored["metadata"]["overlay_alias"][field] == before["metadata"]["overlay_alias"][field]
@@ -377,10 +391,9 @@ async def test_native_published_replacement_runs_real_partial_recipe_and_recover
         await _assert_addresses(case, unrelated, archive_complete=archive_complete)
         after = await _state(case)
         assert after["metadata"]["address"]["local_generation"] == before["metadata"]["address"]["local_generation"] + 1
-        assert await case.database.scalar("SELECT session_user::text") == case.role
         assert (
-            after["roots"]["entity_address_unified"]["native"]["oid"]
-            != before["roots"]["entity_address_unified"]["native"]["oid"]
+            after["roots"]["entity_address_unified"]["data_sha256"]
+            != before["roots"]["entity_address_unified"]["data_sha256"]
         )
         assert await _support(case) == support
         assert (
@@ -408,31 +421,23 @@ async def test_native_published_replacement_runs_real_partial_recipe_and_recover
 
 
 async def _heap_inventory(case):
-    """Observe every table and sequence in this fixture's exact owned schema."""
+    """Observe the complete declared relation-name and kind roster in this fixture schema."""
     relations = await case.database.all(
-        "SELECT relname,oid::bigint FROM pg_class WHERE relnamespace=to_regnamespace(:schema) "
-        "AND relkind IN ('r','p','S') ORDER BY relname",
+        "SELECT relname,relkind::text FROM pg_class WHERE relnamespace=to_regnamespace(:schema) "
+        "AND relkind IN ('r','p','S','v') ORDER BY relname",
         schema=case.schema,
     )
     return {relation[0]: relation[1] for relation in relations}
 
 
-async def _replace_owned_stage(case, prepared):
-    """Replace only the exact created heap and register a distinct competing OID."""
+async def _add_stage_dependency(case, prepared):
+    """A real dependent view must prevent native restricted removal of its candidate."""
     stage_name = prepared.swaps[0].stage_cls.__tablename__
-    original_oid = dict((name, oid) for _target, name, oid in prepared.stage_oids)[stage_name]
-    assert (
-        await case.database.scalar("SELECT to_regclass(:relation)::oid::bigint", relation=f"{case.schema}.{stage_name}")
-        == original_oid
+    assert stage_name in {name for _target, name in prepared.stage_relations}
+    await case.database.status(
+        f'CREATE VIEW "{case.schema}".blocked_stage_reader AS SELECT 1 AS marker FROM "{case.schema}"."{stage_name}" LIMIT 0'
     )
-    await case.database.status(f'DROP TABLE "{case.schema}"."{stage_name}" RESTRICT')
-    await case.database.status(f'CREATE TABLE "{case.schema}"."{stage_name}" (marker text PRIMARY KEY)')
-    await case.database.status(f'INSERT INTO "{case.schema}"."{stage_name}" VALUES (\'foreign\')')
-    replacement_oid = await case.database.scalar(
-        "SELECT to_regclass(:relation)::oid::bigint", relation=f"{case.schema}.{stage_name}"
-    )
-    assert replacement_oid != original_oid
-    return stage_name, replacement_oid
+    return "blocked_stage_reader", stage_name
 
 
 def _failing_finalizer(case, failure_kind, observed_by_field, ready):
@@ -444,20 +449,34 @@ def _failing_finalizer(case, failure_kind, observed_by_field, ready):
     async def finalize(ctx, **options):
         prepared = await original(ctx, **options)
         owned = ordinary.current()
-        assert owned is not None and owned.owner is asyncio.current_task()
-        observed_by_field["cleanup_oids"] = tuple(owned.cleanup_oids)
-        assert {(name, oid) for _target, name, oid in prepared.stage_oids} <= {
-            (name, oid) for _target, name, oid in observed_by_field["cleanup_oids"]
+        assert owned is not None
+        observed_by_field["cleanup_relations"] = tuple(owned.cleanup_relations)
+        assert {name for _target, name in prepared.stage_relations} <= {
+            name for _target, name in observed_by_field["cleanup_relations"]
         }
-        assert observed_by_field["cleanup_oids"]
-        if failure_kind == "replaced-name":
-            observed_by_field["foreign"] = await _replace_owned_stage(case, prepared)
+        assert observed_by_field["cleanup_relations"]
+        if failure_kind == "restricted-dependency":
+            observed_by_field["blocked"] = await _add_stage_dependency(case, prepared)
         ready.set()
         if failure_kind == "cancellation":
             await asyncio.Event().wait()
         raise RuntimeError("recipe-fixture-finalizer")
 
     return finalize
+
+
+def _assert_native_dependency_failure(failure):
+    """Require both the injected finalizer failure and PostgreSQL's dependency refusal."""
+    errors = [failure]
+    leaves = []
+    while errors:
+        error = errors.pop()
+        if isinstance(error, BaseExceptionGroup):
+            errors.extend(error.exceptions)
+        else:
+            leaves.append(error)
+    assert any(isinstance(error, RuntimeError) and str(error) == "recipe-fixture-finalizer" for error in leaves)
+    assert any(isinstance(error, DBAPIError) and getattr(error.orig, "sqlstate", None) == "2BP01" for error in leaves)
 
 
 async def _run_failed_recipe(case, failure_kind, ready):
@@ -477,6 +496,10 @@ async def _run_failed_recipe(case, failure_kind, ready):
             publication.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await publication
+        elif failure_kind == "restricted-dependency":
+            with pytest.raises(BaseExceptionGroup) as failure:
+                await publication
+            _assert_native_dependency_failure(failure.value)
         else:
             with pytest.raises(RuntimeError, match="^recipe-fixture-finalizer$"):
                 await publication
@@ -488,21 +511,26 @@ async def _run_failed_recipe(case, failure_kind, ready):
 
 
 async def _assert_preparation_drained(case, baseline_inventory, observed_by_field):
-    """Prove every registered OID is absent and any competing same-name heap survives."""
-    for _target, _name, oid in observed_by_field["cleanup_oids"]:
-        assert not await case.database.scalar("SELECT EXISTS(SELECT FROM pg_class WHERE oid=:oid)", oid=oid)
-    expected_by_relation = dict(baseline_inventory)
-    if "foreign" in observed_by_field:
-        name, oid = observed_by_field["foreign"]
-        expected_by_relation[name] = oid
-        assert await case.database.scalar(f'SELECT marker FROM "{case.schema}"."{name}"') == "foreign"
-    assert await _heap_inventory(case) == expected_by_relation
+    """Native dependency refusal retains the candidate until the exact blocker is removed."""
+    names = {name for _target, name in observed_by_field["cleanup_relations"]}
+    if "blocked" in observed_by_field:
+        view, stage = observed_by_field["blocked"]
+        inventory = await _heap_inventory(case)
+        assert inventory[view] == "v" and inventory[stage] == "r"
+        assert set(inventory) - set(baseline_inventory) <= names | {view}
+        await case.database.status(f'DROP VIEW "{case.schema}"."{view}" RESTRICT')
+        from process import entity_address_candidate_preparation as preparation
+
+        await preparation._drain_owned_stages(case.schema, observed_by_field["cleanup_relations"])
+    inventory = await _heap_inventory(case)
+    assert not names.intersection(inventory)
+    assert inventory == baseline_inventory
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure_kind", ["exception", "cancellation", "replaced-name"])
-async def test_native_real_recipe_preparation_failure_drains_only_owned_heaps(monkeypatch, failure_kind):
-    """Failed full builds cannot leak stages or remove a same-name competing relation."""
+@pytest.mark.parametrize("failure_kind", ["exception", "cancellation", "restricted-dependency"])
+async def test_native_real_recipe_failure_drains_declared_candidates_after_native_refusal(monkeypatch, failure_kind):
+    """Failed full builds preserve serving data and use native dependency-safe cleanup."""
     async with _recipe_case(monkeypatch, archive_complete=True) as case:
         before = await _state(case)
         support = await _support(case)
@@ -546,7 +574,7 @@ def _address_child_task(generation_present):
 
 
 async def _address_replay_snapshot(case):
-    """Capture every serving, journal, Source and physical table identity before a read-only replay."""
+    """Capture complete serving, journal, Source and named layout before a read-only replay."""
     return {
         "serving": await _state(case),
         "heaps": await _heap_inventory(case),
@@ -630,7 +658,7 @@ def _invalid_address_children(task, internal_generation):
 
 @pytest.mark.asyncio
 async def test_native_address_child_refuses_changed_pin_flags_factory_and_output_proof(monkeypatch):
-    """A marker cannot substitute for exact current headers, published output or ordinary custody."""
+    """Replay requires exact current headers, published content and the ordinary request path."""
     from process import provider_directory_generic_source_policy as source
 
     async with _recipe_case(monkeypatch, archive_complete=True) as case:
@@ -647,10 +675,17 @@ async def test_native_address_child_refuses_changed_pin_flags_factory_and_output
         finally:
             source._FACTORY.reset(token)
         assert await _address_replay_snapshot(case) == before
-        await case.database.status(
+        mutation = (
             f"UPDATE {case.schema}.entity_address_unified SET first_line='CHANGED FIXTURE' "
             "WHERE npi=1234567893 AND second_line='Suite 2'"
         )
+        with pytest.raises(DBAPIError, match="permission denied"):
+            async with case.database.transaction():
+                await case.database.status(mutation)
+        assert await _address_replay_snapshot(case) == before
+        async with case.administrator.begin() as connection:
+            changed = await connection.execute(text(mutation))
+            assert changed.rowcount == 1
         changed_output = await _address_replay_snapshot(case)
         with pytest.raises(ValueError, match="current_serving_changed"):
             await native.process_entity_address_unified_data({"context": {}}, task_by_field)

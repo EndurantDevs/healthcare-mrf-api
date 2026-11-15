@@ -14,8 +14,9 @@ from sqlalchemy.dialects import postgresql
 
 from api import network_address_scope as scope
 from db.models import EntityAddressUnified
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
-from tests.network_read_execution_support import with_read_identity_receipts
+from tests.network_read_execution_support import with_read_session
 from tests.provider_network_read_support import approved_record_relation
 
 MANIFEST = PinnedNetworkServingManifest(
@@ -26,7 +27,7 @@ MANIFEST = PinnedNetworkServingManifest(
     {},
     4,
     "a" * 64,
-    81,
+    CompactAddressRelation("network_candidate_00000000000000000000000000000001", "entity_address_unified"),
 )
 
 
@@ -37,7 +38,7 @@ def request(checksums=None, *, query="network_ids=42&network_generation=7", auth
     if checksums is not None:
         headers["X-Network-Legacy-Checksums"] = checksums
     driver = SimpleNamespace(fetchrow=AsyncMock(return_value={"complete": True, "network_ids": [42]}))
-    session = with_read_identity_receipts(SimpleNamespace(execute=AsyncMock()), driver=driver)
+    session = with_read_session(SimpleNamespace(execute=AsyncMock()), driver=driver)
     return SimpleNamespace(headers=headers, query_string=query, ctx=SimpleNamespace(sa_session=session)), driver
 
 
@@ -203,7 +204,7 @@ async def test_http_pin_uses_bound_reader_instead_of_configuring_writer(monkeypa
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-legacy-token")
     incoming, driver = request()
     ordinary = incoming.ctx.sa_session
-    reader = with_read_identity_receipts(SimpleNamespace(execute=AsyncMock()), driver=driver)
+    reader = with_read_session(SimpleNamespace(execute=AsyncMock()), driver=driver)
     binder = AsyncMock(return_value=reader)
     monkeypatch.setattr("api.network_serving_read_context.bind_network_request_reader", binder)
     async with scope._pin_network_scope(incoming, scope._request_selector(incoming, None)) as selected:

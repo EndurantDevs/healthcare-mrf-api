@@ -114,14 +114,9 @@ async def _receipt_storage_layout(fhir, schema):
         oid=oid,
     ):
         raise RuntimeError("profile_common_receipt_storage_shape_unsupported")
-    exact, structural = fhir._profile_capacity_fingerprint_payloads(
-        relation, attributes, indexes, constraints, triggers, oid
-    )
-    layout = fhir._profile_capacity_storage_layout(oid, toast_oid, relation, attributes, indexes, exact, structural)
-    if layout.effective_tablespace_oids != (
-        fhir._provider_directory_profile_capacity_admission().geometry.tablespace_oid,
-    ):
-        raise RuntimeError("profile_common_receipt_tablespace_unsupported")
+    layout = await fhir._provider_directory_profile_capacity_relation_layout(oid, expected_persistence="p")
+    if (layout.schema_name, layout.relation_name) != (schema, receipts._TABLE):
+        raise RuntimeError("profile_common_receipt_storage_shape_unsupported")
     return layout
 
 

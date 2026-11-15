@@ -71,7 +71,9 @@ async def readonly_case(case, monkeypatch):
     monkeypatch.setattr(directory, "db", case.directory.db)
     monkeypatch.setattr(directory, "_schema", case.directory._schema)
     case.directory = directory
-    case.factory.observe_source_callable_capability = AsyncMock(return_value=(700, 800))
+    case.factory.session.in_transaction = lambda: case.factory.transaction.is_active
+    case.factory.driver.is_in_transaction = lambda: case.factory.transaction.is_active
+    case.factory.driver.fetchval = AsyncMock(return_value="on")
     case.proof = {"protected": "fixture"}
     case.capture = AsyncMock(return_value=case.proof)
     monkeypatch.setattr(provision, "capture_protected_fhir_input", case.capture)
@@ -82,9 +84,6 @@ async def test_cms_native_capture_uses_readonly_observation_without_publisher(re
     case = readonly_case
     async with observation.observation_transaction(case.directory, isolation="repeatable read") as session:
         assert await inputs._capture_bound_fhir(session, "synthetic") is case.proof
-        case.factory.observe_source_callable_capability.assert_awaited_once_with(
-            case.factory.driver, case.factory.policy
-        )
         case.capture.assert_awaited_once_with(case.factory.driver, source_policy=case.factory.policy)
         assert observation.source._PUBLISHER.get() is None and observation.source._OWNER.get() is None
 
@@ -122,57 +121,23 @@ async def test_substituted_capture_rejected_before_callable_or_catalog_reads(rea
                 object() if change == "session" else session, "other" if change == "schema" else "synthetic"
             )
         assert len(case.factory.driver.calls) == before
-    case.factory.observe_source_callable_capability.assert_not_awaited()
     case.capture.assert_not_awaited()
 
 
-async def test_child_task_cannot_borrow_readonly_cms_capture(readonly_case):
-    case = readonly_case
-    async with observation.observation_transaction(case.directory, isolation="repeatable read") as session:
-        before = len(case.factory.driver.calls)
-        with pytest.raises(RuntimeError, match="observation_changed"):
-            await asyncio.create_task(inputs._capture_bound_fhir(session, "synthetic"))
-        assert len(case.factory.driver.calls) == before
-    case.factory.observe_source_callable_capability.assert_not_awaited()
-    case.capture.assert_not_awaited()
-
-
-@pytest.mark.parametrize("capability", [None, [700], (True,), (0,), (2**32,), (700, 700)])
-async def test_invalid_callable_capability_never_reads_fhir_catalog(readonly_case, capability):
-    case = readonly_case
-    case.factory.observe_source_callable_capability.return_value = capability
-    async with observation.observation_transaction(case.directory, isolation="repeatable read") as session:
-        with pytest.raises(RuntimeError, match="observation_callable_capability_changed"):
-            await inputs._capture_bound_fhir(session, "synthetic")
-    case.capture.assert_not_awaited()
-
-
-@pytest.mark.parametrize("phase", ["callable", "capture"])
+@pytest.mark.parametrize("phase", ["capture"])
 async def test_native_transaction_change_during_capture_refuses_proof(readonly_case, phase):
     case = readonly_case
 
     async def change(*args, **kwargs):
-        case.factory.driver.actor_by_field["transaction"] = "7/92"
-        return (700,) if phase == "callable" else case.proof
+        case.factory.transaction.is_active = False
+        return case.proof
 
-    callback = case.factory.observe_source_callable_capability if phase == "callable" else case.capture
-    callback.side_effect = change
+    case.capture.side_effect = change
     with pytest.raises(ExceptionGroup, match="source_observation_and_verification_failed") as caught:
         async with observation.observation_transaction(case.directory, isolation="repeatable read") as session:
             await inputs._capture_bound_fhir(session, "synthetic")
     assert len(caught.value.exceptions) == 2
-    assert all("observation_transaction_changed" in str(error) for error in caught.value.exceptions)
-    if phase == "callable":
-        case.capture.assert_not_awaited()
-
-
-async def test_unavailable_callable_observer_fails_closed(readonly_case):
-    case = readonly_case
-    case.factory.observe_source_callable_capability = None
-    async with observation.observation_transaction(case.directory, isolation="repeatable read") as session:
-        with pytest.raises(RuntimeError, match="observation_callable_factory_required"):
-            await inputs._capture_bound_fhir(session, "synthetic")
-    case.capture.assert_not_awaited()
+    assert all("observation_transaction_required" in str(error) for error in caught.value.exceptions)
 
 
 async def test_absent_protected_fhir_proof_cannot_be_admitted(readonly_case):
@@ -197,7 +162,7 @@ async def test_dependency_session_issues_readonly_fhir_capture(readonly_case, mo
     async with preparation.source_dependency_session(case.directory.db, admission, "signed-native-input") as session:
         issued = observation.current_observation(case.directory)
         assert issued.session is session is case.factory.session
-        assert issued.database is case.directory.db and issued.factory is case.factory
+        assert issued.directory is case.directory and issued.factory is case.factory
         assert await inputs._capture_bound_fhir(session, "synthetic") is case.proof
         assert observation.source._PUBLISHER.get() is None and observation.source._OWNER.get() is None
     assert observation.current_observation(case.directory) is None
@@ -206,25 +171,22 @@ async def test_dependency_session_issues_readonly_fhir_capture(readonly_case, mo
 
 
 @pytest.mark.parametrize("owned", [True, False])
-async def test_archive_owner_prerequisite_uses_issued_readonly_observation(readonly_case, monkeypatch, owned):
+async def test_archive_named_read_uses_issued_readonly_observation(readonly_case, monkeypatch, owned):
     from process import provider_directory_cms_archive as archive
 
     case = readonly_case
     monkeypatch.setattr(archive, "_copy_driver", AsyncMock(return_value=case.factory.driver))
-    case.factory.driver.fetchval = AsyncMock(return_value=owned)
+    case.factory.driver.execute = AsyncMock(side_effect=None if owned else PermissionError("native SELECT refused"))
     async with observation.observation_transaction(case.directory, isolation="repeatable read") as session:
         if owned:
             await archive.require_source_archive_owner(session, "synthetic")
         else:
-            with pytest.raises(RuntimeError, match="cms_archive_source_owner_required"):
+            with pytest.raises(PermissionError, match="native SELECT refused"):
                 await archive.require_source_archive_owner(session, "synthetic")
         assert observation.current_observation(case.directory).session is session
         assert observation.source._PUBLISHER.get() is None and observation.source._OWNER.get() is None
-        assert case.factory.driver.fetchval.await_args.args[1:] == (
-            '"synthetic"."address_archive_v2"',
-            "owner",
-            "publisher",
-        )
+        case.factory.driver.execute.assert_awaited_once_with('SELECT 1 FROM "synthetic"."address_archive_v2" LIMIT 0')
+        case.factory.driver.fetchval.assert_not_awaited()
 
 
 async def test_archive_owner_prerequisite_preserves_legacy_capture(monkeypatch):
@@ -251,16 +213,16 @@ async def test_archive_owner_prerequisite_precedes_native_signing_capture(monkey
     capture.assert_not_awaited()
 
 
-async def test_archive_owner_prerequisite_rejects_foreign_session_before_query(readonly_case, monkeypatch):
+async def test_archive_native_read_requires_active_transaction_before_query(readonly_case, monkeypatch):
     from process import provider_directory_cms_archive as archive
 
     case = readonly_case
     monkeypatch.setattr(archive, "_copy_driver", AsyncMock(return_value=case.factory.driver))
-    case.factory.driver.fetchval = AsyncMock(return_value=True)
+    case.factory.driver.execute = AsyncMock()
     async with observation.observation_transaction(case.directory, isolation="repeatable read"):
-        with pytest.raises(RuntimeError, match="cms_archive_source_binding_changed"):
+        with pytest.raises(archive.source.GenericCandidateError, match="source_transaction_required"):
             await archive.require_source_archive_owner(object(), "synthetic")
-        case.factory.driver.fetchval.assert_not_awaited()
+        case.factory.driver.execute.assert_not_awaited()
 
 
 @pytest.fixture
@@ -344,38 +306,37 @@ async def test_retained_component_settings_borrow_original_savepoint(retained_se
 
 
 @pytest.mark.parametrize("field", ["database", "factory", "session", "binding", "policy"])
-async def test_retained_component_settings_refuse_substituted_scope(retained_settings_case, field):
+async def test_retained_component_settings_use_transaction_without_legacy_scope_tokens(retained_settings_case, field):
     async with retained_settings_case() as case:
         if field == "policy":
             case.scope.source_input = SimpleNamespace(_receipt=lambda: {"policy": object()})
         else:
             setattr(case.scope, field, object())
-        with pytest.raises(AssertionError):
+        async with native_source._native_component_transaction(case.database, case.factory) as session:
+            assert session is case.session and case.session.in_nested_transaction()
+        assert case.scope.verify_transaction.await_count == 2
+        assert not case.session.in_nested_transaction() and case.attempts == []
+        denied = PermissionError("native retained read refused")
+        case.scope.verify_transaction.side_effect = denied
+        with pytest.raises(PermissionError, match="native retained read refused") as caught:
             async with native_source._native_component_transaction(case.database, case.factory):
-                pytest.fail("substituted scope reached a savepoint body")
+                pytest.fail("native access refusal reached a savepoint body")
+        assert caught.value is denied
         assert not case.session.in_nested_transaction() and case.attempts == []
 
 
-@pytest.mark.parametrize("field", ["factory", "driver", "policy", "admission"])
+@pytest.mark.parametrize("field", ["driver", "policy"])
 async def test_retained_component_settings_verify_after_savepoint_release(retained_settings_case, field):
     async with retained_settings_case() as case:
-        context = native_source.source._FACTORY if field == "factory" else preparation._ACTIVE
         mutation = {
-            "factory": lambda: context.set(object()),
-            "admission": lambda: context.set(object()),
             "policy": lambda: setattr(case.factory, "policy", object()),
             "driver": lambda: setattr(case.scope, "driver", object()),
         }[field]
-        token = None
-        try:
-            with pytest.raises(AssertionError):
-                async with native_source._native_component_transaction(case.database, case.factory):
-                    token = mutation()
-            assert case.session.in_transaction() and not case.session.in_nested_transaction()
-            assert case.attempts == []
-        finally:
-            if token is not None:
-                context.reset(token)
+        with pytest.raises(AssertionError):
+            async with native_source._native_component_transaction(case.database, case.factory):
+                mutation()
+        assert case.session.in_transaction() and not case.session.in_nested_transaction()
+        assert case.attempts == []
 
 
 async def test_arbitrary_bound_session_still_uses_original_source_refusal(retained_settings_case, monkeypatch):

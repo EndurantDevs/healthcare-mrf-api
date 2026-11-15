@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -28,42 +29,72 @@ def targets(identity):
 
 
 async def capture_targets(fhir, schema):
-    """Observe existing physical targets and authentic history without creating serving state."""
+    """Observe named targets and authentic history without creating serving state."""
     await _assert_no_publication(fhir, schema)
-    evidence_ref = fhir._unscoped_qt(schema, fhir.profile_artifact.PROFILE_EVIDENCE_TABLE)
-    profile_ref = fhir._unscoped_qt(schema, fhir.profile_artifact.PROFILE_TABLE)
-    profile_oid, evidence_oid = await fhir._locked_profile_adoption_target_oids(schema, profile_ref, evidence_ref)
-    layouts = [
-        await fhir._provider_directory_profile_relation_storage_fingerprint(oid, expected_persistence="p")
-        for oid in (evidence_oid, profile_oid)
-    ]
-    history_by_field_name, evidence_rows, profile_rows = await _capture_legacy_history(
-        fhir, schema, profile_ref, evidence_ref
+    coordinates = fhir._provider_directory_profile_target_coordinates(schema)
+    ref_by_role = {role: fhir._unscoped_qt(value["schema"], value["name"]) for role, value in coordinates.items()}
+    await fhir._locked_profile_adoption_target_oids(schema, ref_by_role["profile"], ref_by_role["evidence"])
+    await _require_target_columns(fhir, schema, coordinates)
+    history, evidence_rows, profile_rows = await _capture_legacy_history(
+        fhir, schema, ref_by_role["profile"], ref_by_role["evidence"]
     )
+    bytes_by_field = {}
+    for role, ref in ref_by_role.items():
+        bytes_by_field[role + "_target_bytes"] = int(
+            await fhir.db.scalar("SELECT pg_total_relation_size(CAST(:ref AS regclass))", ref=ref)
+        )
     target_payload = contract.validated_target_state(
         {
             "contract_id": contract.TARGET_CONTRACT,
-            "resolution": "legacy_as_of_unknown" if history_by_field_name else "empty",
+            "resolution": "legacy_as_of_unknown" if history else "empty",
             "serving_singleton_absent": True,
             "initial_commit_receipt_absent": True,
-            "evidence_target_oid": evidence_oid,
-            "profile_target_oid": profile_oid,
-            "evidence_target_storage_fingerprint": layouts[0].exact_fingerprint,
-            "profile_target_storage_fingerprint": layouts[1].exact_fingerprint,
-            "evidence_target_bytes": int(
-                await fhir.db.scalar("SELECT pg_total_relation_size(CAST(:oid AS oid))", oid=evidence_oid)
-            ),
-            "profile_target_bytes": int(
-                await fhir.db.scalar("SELECT pg_total_relation_size(CAST(:oid AS oid))", oid=profile_oid)
-            ),
+            "targets": coordinates,
+            **bytes_by_field,
             "evidence_rows": evidence_rows,
             "profile_rows": profile_rows,
-            "historical_publication": history_by_field_name,
+            "historical_publication": history,
         }
     )
-    return contract.InitialTargets(
-        evidence_target_oid=evidence_oid, profile_target_oid=profile_oid, payload=target_payload
+    return contract.InitialTargets(targets=coordinates, payload=target_payload)
+
+
+async def _require_target_columns(fhir, schema, coordinates):
+    """Require the complete declared column shape of both named Profile targets."""
+    profile_types = "bigint|jsonb|jsonb|character varying[]|character varying[]|character varying[]|integer|integer|integer|character varying(64)|timestamp without time zone".split(
+        "|"
     )
+    evidence_types = "character(32)|bigint|character varying(64)|character(32)|jsonb|character varying(64)|character varying(64)|character varying(96)|text|character varying(256)|character varying(512)|character varying(64)|character varying(256)|character varying(256)|boolean|character varying(64)|character varying(64)|timestamp without time zone".split(
+        "|"
+    )
+    declarations_by_role = {
+        "profile": (fhir.profile_artifact.profile_columns(), profile_types),
+        "evidence": (fhir.profile_artifact.profile_evidence_columns(), evidence_types),
+    }
+    evidence_required_names = {*declarations_by_role["evidence"][0][:8], "resource_type", "resource_id"}
+    attribute_rows = await fhir.db.all(
+        "SELECT c.relname,a.attname,format_type(a.atttypid,a.atttypmod) AS type_name,"
+        "a.attnotnull,COALESCE(pg_get_expr(d.adbin,d.adrelid),'') AS default_expression,"
+        "a.attgenerated::text,a.attidentity::text FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid "
+        "JOIN pg_namespace n ON n.oid=c.relnamespace LEFT JOIN pg_attrdef d "
+        "ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE n.nspname=:schema "
+        "AND c.relname=ANY(CAST(:names AS text[])) AND a.attnum>0 AND NOT a.attisdropped "
+        "ORDER BY c.relname,a.attnum",
+        schema=schema,
+        names=[entry["name"] for entry in coordinates.values()],
+    )
+    actual_by_name = {entry["name"]: [] for entry in coordinates.values()}
+    fields = ("attname", "type_name", "attnotnull", "default_expression", "attgenerated", "attidentity")
+    for raw_column in attribute_rows:
+        column_by_field = fhir._pagination_checkpoint_row_mapping(raw_column)
+        actual_by_name[column_by_field["relname"]].append(tuple(column_by_field[field] for field in fields))
+    for role, (names, types) in declarations_by_role.items():
+        expected_columns = [
+            (name, kind, role == "profile" or name in evidence_required_names, "", "", "")
+            for name, kind in zip(names, types, strict=True)
+        ]
+        if actual_by_name[coordinates[role]["name"]] != expected_columns:
+            raise RuntimeError("provider_directory_profile_initial_target_changed")
 
 
 async def _assert_no_publication(fhir, schema):
@@ -104,27 +135,27 @@ def bind_identity(fhir, identity, initial_targets):
 
 
 async def receipt_layout(fhir, schema):
-    """Inspect the logged initial receipt relation and its exact immutable guards."""
-    oid = await fhir.db.scalar("SELECT CAST(:ref AS regclass)::oid::bigint", ref=f"{schema}.{contract.RECEIPT_TABLE}")
-    return await fhir._provider_directory_profile_relation_storage_fingerprint(
-        oid,
-        expected_persistence="p",
-        expected_user_trigger_count=3,
-        expected_immutable_trigger_error="provider_directory_profile_initial_receipt_immutable",
-    )
+    """Measure the named initial receipt relation for bounded metadata accounting."""
+    oid = await fhir._provider_directory_relation_oid(schema, contract.RECEIPT_TABLE)
+    if oid is None:
+        raise RuntimeError("provider_directory_profile_initial_receipt_missing")
+    return await fhir._provider_directory_profile_capacity_relation_layout(oid, expected_persistence="p")
 
 
 def geometry_inputs(fhir, identity, ordinary, receipt_storage):
-    """Bind initial receipt identity only when all of its storage uses the funded tablespace."""
+    """Include the logical initial ledger and its numeric metadata bounds."""
     from dataclasses import asdict
 
-    if receipt_storage.effective_tablespace_oids != (ordinary.tablespace_oid,):
-        raise RuntimeError("provider_directory_profile_initial_receipt_tablespace_unsupported")
+    values = asdict(ordinary)
+    values["relations"]["initial_receipt"] = {
+        "schema": receipt_storage.schema_name,
+        "name": receipt_storage.relation_name,
+        "main_index_pages": list(fhir._profile_capacity_index_page_union_bound(receipt_storage.main_index_pages)),
+        "toast_index_pages": list(fhir._profile_capacity_index_page_union_bound(receipt_storage.toast_index_pages)),
+        "toastable_column_count": len(receipt_storage.toastable_columns),
+    }
     return contract.InitialCapacityGeometryInputs(
-        **asdict(ordinary),
-        initial_target_state_sha256=contract.target_state_sha256(identity.initial_targets.payload),
-        initial_receipt_oid=receipt_storage.relation_oid,
-        initial_receipt_storage_fingerprint=receipt_storage.exact_fingerprint,
+        **values, initial_target_state_sha256=contract.target_state_sha256(identity.initial_targets.payload)
     )
 
 
@@ -188,9 +219,7 @@ def _fence_hash(fhir, fence):
 
 async def _metadata_projection(fhir, admission, receipt_storage, pending_items):
     capacity = fhir.profile_capacity
-    serving = await fhir._provider_directory_profile_relation_storage_fingerprint(
-        admission.geometry.serving_generation_oid, expected_persistence="p"
-    )
+    serving = await fhir._profile_capacity_named_layout(admission.geometry, "serving_generation")
     mutations = tuple(
         capacity.ProviderDirectoryProfileMetadataMutationInput(
             relation_name=name,
@@ -240,12 +269,7 @@ async def prepare_cutover(fhir, stages, fence):
     admission = fhir._provider_directory_profile_capacity_admission()
     statement_timeout_ms = await _freeze_targets(fhir, build, admission)
     layout = await receipt_layout(fhir, build.schema)
-    if (
-        layout.relation_oid != admission.geometry.initial_receipt_oid
-        or layout.exact_fingerprint != admission.geometry.initial_receipt_storage_fingerprint
-        or layout.effective_tablespace_oids != (admission.geometry.tablespace_oid,)
-    ):
-        raise RuntimeError("provider_directory_profile_initial_receipt_storage_changed")
+    fhir._assert_profile_capacity_layout_bounds(layout, admission.geometry, "initial_receipt")
     initial_stages = [stage for stage in stages if stage.profile_initial_build is not None]
     by_target = {stage.target_relation: stage for stage in initial_stages}
     await fhir._assert_provider_directory_profile_checkpoint_ready(
@@ -254,7 +278,7 @@ async def prepare_cutover(fhir, stages, fence):
         by_target[fhir.profile_artifact.PROFILE_TABLE].build_fence,
     )
     await fhir._assert_provider_directory_profile_capacity_consumption(admission, build)
-    oid_by_target, counts = await _inspect_cutover_stages(fhir, build, admission, initial_stages)
+    stage_by_target, counts = await _inspect_cutover_stages(fhir, build, admission, initial_stages)
     if admission.wal_tracker.unresolved_window:
         raise RuntimeError("provider_directory_profile_capacity_window_unresolved")
     projection = await _metadata_projection(fhir, admission, layout, len(stages) + len(fence.datasets) + 2)
@@ -264,7 +288,7 @@ async def prepare_cutover(fhir, stages, fence):
         "capacity_geometry_hash": build.capacity_geometry_hash,
         "initial_target_state_sha256": admission.geometry.initial_target_state_sha256,
         "dataset_fence_sha256": _fence_hash(fhir, fence),
-        "new_target_oids": oid_by_target,
+        "targets": admission.admitted_identity.initial_targets.targets,
         "metadata_data_bytes": projection.data_bytes,
         "metadata_wal_bytes": projection.wal_bytes,
         "commit_envelope_bytes": projection.commit_envelope_bytes,
@@ -274,7 +298,7 @@ async def prepare_cutover(fhir, stages, fence):
         "build": build,
         "admission": admission,
         "counts": counts,
-        "oids": oid_by_target,
+        "stages": stage_by_target,
         "projection": projection,
         "forecast": forecast_by_field,
         "forecast_hash": fhir._identity_hash(forecast_by_field),
@@ -309,17 +333,11 @@ async def begin_cutover(fhir, cutover, stages):
     build, admission = cutover["build"], cutover["admission"]
     await fhir._profile_capacity_remaining_ms(admission)
     await _assert_no_publication(fhir, build.schema)
-    for role, name in (
-        ("evidence", fhir.profile_artifact.PROFILE_EVIDENCE_TABLE),
-        ("profile", fhir.profile_artifact.PROFILE_TABLE),
-    ):
-        oid = await fhir._provider_directory_relation_oid(build.schema, name)
-        expected = admission.admitted_identity.initial_targets.payload
-        if oid != expected[role + "_target_oid"]:
-            raise RuntimeError("provider_directory_profile_initial_targets_changed")
-        layout = await fhir._provider_directory_profile_relation_storage_fingerprint(oid, expected_persistence="p")
-        if layout.exact_fingerprint != expected[role + "_target_storage_fingerprint"]:
-            raise RuntimeError("provider_directory_profile_initial_targets_changed")
+    expected_targets = admission.admitted_identity.initial_targets.targets
+    if fhir._provider_directory_profile_target_coordinates(build.schema) != expected_targets:
+        raise RuntimeError("provider_directory_profile_initial_targets_changed")
+    for role in ("evidence_target", "profile_target"):
+        await fhir._profile_capacity_named_layout(admission.geometry, role)
     initial_stage_by_target = {
         stage.target_relation: stage for stage in stages if stage.profile_initial_build is not None
     }
@@ -329,8 +347,9 @@ async def begin_cutover(fhir, cutover, stages):
         initial_stage_by_target[fhir.profile_artifact.PROFILE_TABLE].build_fence,
     )
     for name, stage in initial_stage_by_target.items():
-        if await fhir._provider_directory_relation_oid(stage.schema, stage.stage_table) != cutover["oids"][name]:
+        if {"schema": stage.schema, "name": stage.stage_table} != cutover["stages"][name]:
             raise RuntimeError("provider_directory_profile_initial_stage_changed")
+        await fhir._provider_directory_profile_stage_layout(stage.schema, stage.stage_table, lock_relation=False)
     await fhir._assert_provider_directory_profile_capacity_consumption(admission, build)
     await fhir._admission_database_guard(admission.admitted_identity, admission.database_identity)
     cutover["wal_start"] = await fhir.db.scalar("SELECT pg_current_wal_insert_lsn()::text")
@@ -367,8 +386,7 @@ def _serving_values(fhir, cutover):
         "source_context_vector_hash": build.desired_source_context_vector_hash,
         "executable_plan_hash": admission.geometry.executable_plan_hash,
         "profile_as_of": build.profile_as_of,
-        "evidence_target_oid": cutover["oids"][fhir.profile_artifact.PROFILE_EVIDENCE_TABLE],
-        "profile_target_oid": cutover["oids"][fhir.profile_artifact.PROFILE_TABLE],
+        "targets": fhir._provider_directory_profile_target_coordinates(build.schema),
         "evidence_rows": int(cutover["counts"]["evidence_rows"]),
         "profile_rows": int(cutover["counts"]["profile_rows"]),
     }
@@ -390,6 +408,7 @@ async def finish_cutover(fhir, cutover, fence):
         "capacity_geometry_json": build.capacity_geometry_json,
         "cutover_forecast_hash": cutover["forecast_hash"],
     }
+    serving_by_column["targets_json"] = contract.canonical_json(serving_by_column.pop("targets"))
     columns = tuple(serving_by_column)
     expressions = [f"CAST(:{name} AS jsonb)" if name.endswith("_json") else f":{name}" for name in columns]
     async with metadata_window(fhir, admission, projection):
@@ -458,9 +477,30 @@ def _assert_receipt_payload(fhir, receipt_by_field, receipt_payload, geometry):
     )
     from process.provider_directory_profile_initial_guards import _PROFILE_FIELDS
 
+    is_legacy = geometry.legacy_payload is not None
+    serving_fields = (
+        (set(_PROFILE_FIELDS) - {"targets"}) | {"evidence_target_oid", "profile_target_oid"}
+        if is_legacy
+        else set(_PROFILE_FIELDS) | {"targets"}
+    )
+    forecast_fields = (
+        (_initial_forecast_fields() - {"targets"}) | {"new_target_oids"} if is_legacy else _initial_forecast_fields()
+    )
+    expected_targets = (
+        {
+            fhir.profile_artifact.PROFILE_EVIDENCE_TABLE: serving_by_field.get("evidence_target_oid"),
+            fhir.profile_artifact.PROFILE_TABLE: serving_by_field.get("profile_target_oid"),
+        }
+        if is_legacy
+        else serving_by_field.get("targets")
+    )
+    target_field = "new_target_oids" if is_legacy else "targets"
+    actual_fields = {"contract_id", "forecast_hash", "wal_start_lsn", "wal_observed_lsn"} | (
+        {"evidence_target_storage_fingerprint", "profile_target_storage_fingerprint"} if is_legacy else {"targets"}
+    )
     if (
         set(receipt_payload) != _initial_receipt_fields()
-        or set(serving_by_field) != set(_PROFILE_FIELDS)
+        or set(serving_by_field) != serving_fields
         or any(
             receipt_payload.get(name) != receipt_by_field.get(name) for name in ("build_id", "run_id", "attestation_id")
         )
@@ -470,31 +510,24 @@ def _assert_receipt_payload(fhir, receipt_by_field, receipt_payload, geometry):
         or receipt_payload["executable_plan_hash"] != geometry.executable_plan_hash
         or receipt_payload["common_receipt_required"]
         is not any(pair.get("source_id") == "cms-npd" for pair in receipt_payload["source_vector"])
-        or forecast.get("contract_id") != contract.FORECAST_CONTRACT
+        or forecast.get("contract_id") != geometry.cutover_forecast_contract_id
         or forecast.get("build_id") != receipt_by_field["build_id"]
-        or set(forecast) != _initial_forecast_fields()
+        or set(forecast) != forecast_fields
         or forecast.get("capacity_geometry_hash") != receipt_payload["capacity_geometry_hash"]
         or forecast.get("initial_target_state_sha256") != geometry.initial_target_state_sha256
         or forecast.get("dataset_fence_sha256") != receipt_payload["dataset_fence_sha256"]
         or forecast.get("ddl_statement_upper_bound") != contract.INITIAL_CUTOVER_STATEMENTS
-        or forecast.get("new_target_oids")
-        != {
-            fhir.profile_artifact.PROFILE_EVIDENCE_TABLE: serving_by_field["evidence_target_oid"],
-            fhir.profile_artifact.PROFILE_TABLE: serving_by_field["profile_target_oid"],
-        }
-        or set(actual)
-        != {
-            "contract_id",
-            "forecast_hash",
-            "wal_start_lsn",
-            "wal_observed_lsn",
-            "evidence_target_storage_fingerprint",
-            "profile_target_storage_fingerprint",
-        }
-        or actual.get("contract_id") != contract.ACTUAL_CONTRACT
+        or forecast.get(target_field) != expected_targets
+        or set(actual) != actual_fields
+        or actual.get("contract_id") != geometry.cutover_actual_contract_id
         or actual.get("forecast_hash") != fhir._identity_hash(forecast)
+        or (not is_legacy and actual.get("targets") != serving_by_field["targets"])
     ):
         raise RuntimeError("provider_directory_profile_initial_receipt_binding_changed")
+    _assert_initial_receipt_forecast_bounds(forecast, geometry)
+
+
+def _assert_initial_receipt_forecast_bounds(forecast, geometry):
     if (
         any(
             type(forecast[name]) is not int or forecast[name] < 0
@@ -504,6 +537,61 @@ def _assert_receipt_payload(fhir, receipt_by_field, receipt_payload, geometry):
         or forecast["metadata_wal_bytes"] + forecast["commit_envelope_bytes"] > geometry.metadata_wal_upper_bound_bytes
     ):
         raise RuntimeError("provider_directory_profile_initial_receipt_bounds_invalid")
+
+
+async def _retained_receipt_geometry(fhir, schema, receipt, layout):
+    receipt_payload = receipt["payload"]
+    raw = receipt_payload.get("capacity_geometry")
+    if not isinstance(raw, Mapping):
+        raise RuntimeError("provider_directory_profile_initial_replay_geometry_invalid")
+    if raw.get("contract_id") != "healthporta.provider-directory-profile-initial-capacity-geometry.v1":
+        return fhir.profile_capacity.validated_capacity_geometry(raw)
+    from process.provider_directory_profile_capacity_attestation import authenticate_historical_capacity_lease
+    from process.provider_directory_profile_capacity_geometry import project_legacy_capacity_geometry
+
+    consumption = await fhir._replay_bound_consumption(
+        fhir._unscoped_qt(schema, fhir.ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__),
+        receipt["run_id"],
+        receipt["build_id"],
+    )
+    history = authenticate_historical_capacity_lease(
+        {"lease": json.loads(consumption["canonical_lease_json"]), "signature": consumption["signature"]},
+        trust=fhir.profile_capacity_runtime.configured_capacity_lease_trust(),
+        now=fhir._provider_directory_profile_replay_timestamp(consumption["accepted_at"], "accepted_at"),
+    )
+    if history.runtime is None or history.signing_preflight_guard is None:
+        raise RuntimeError("provider_directory_profile_legacy_semantic_evidence_required")
+    signed_receipt = history.signing_preflight_guard.get("healthcare_receipt", {})
+    serving = receipt_payload["serving"]
+    initial_targets = contract.InitialTargets(fhir._provider_directory_profile_target_coordinates(schema), {})
+    database = await fhir._provider_directory_profile_capacity_database_identity(schema, initial_targets)
+    relations_by_role = {
+        **database.relations,
+        "initial_receipt": {
+            "schema": layout.schema_name,
+            "name": layout.relation_name,
+            "main_index_pages": list(layout.main_index_pages),
+            "toast_index_pages": list(layout.toast_index_pages),
+            "toastable_column_count": len(layout.toastable_columns),
+        },
+    }
+    retained_by_field = {
+        "selection_proof_id": serving.get("selection_proof_id"),
+        "profile_input_digest": signed_receipt.get("profile_execution_identity", {}).get("profile_input_digest"),
+        "executable_plan_hash": receipt_payload.get("executable_plan_hash"),
+        "profile_as_of": serving.get("profile_as_of"),
+        "source_vector_hash": serving.get("source_vector_hash"),
+        "source_context_vector_hash": serving.get("source_context_vector_hash"),
+        "evidence_rows": serving.get("evidence_rows"),
+        "profile_rows": serving.get("profile_rows"),
+    }
+    geometry = project_legacy_capacity_geometry(
+        raw, receipt_payload["capacity_geometry_hash"], relations=relations_by_role, retained_evidence=retained_by_field
+    )
+    from process.provider_directory_profile_capacity_signing_guard import validated_historical_replay_guard
+
+    validated_historical_replay_guard(history, geometry)
+    return geometry
 
 
 async def _committed_receipt(fhir, schema, build_id):
@@ -519,18 +607,21 @@ async def _committed_receipt(fhir, schema, build_id):
     receipt_payload = receipt_by_field["payload"]
     if isinstance(receipt_payload, str):
         receipt_payload = json.loads(receipt_payload)
-    if receipt_by_field["valid_hash"] is not True or receipt_payload.get("contract_id") != contract.COMMIT_CONTRACT:
+    if receipt_by_field["valid_hash"] is not True or receipt_payload.get("contract_id") not in {
+        contract.COMMIT_CONTRACT,
+        "healthporta.provider-directory-profile-initial-receipt.v1",
+    }:
         raise RuntimeError("provider_directory_profile_initial_receipt_invalid")
     receipt_by_field["payload"] = receipt_payload
     layout = await receipt_layout(fhir, schema)
-    geometry = fhir.profile_capacity.validated_capacity_geometry(receipt_payload.get("capacity_geometry"))
-    if (
-        not isinstance(geometry, contract.InitialCapacityGeometry)
-        or layout.relation_oid != geometry.initial_receipt_oid
-        or layout.exact_fingerprint != geometry.initial_receipt_storage_fingerprint
-        or layout.effective_tablespace_oids != (geometry.tablespace_oid,)
-    ):
-        raise RuntimeError("provider_directory_profile_initial_receipt_storage_changed")
+    geometry = await _retained_receipt_geometry(fhir, schema, receipt_by_field, layout)
+    if not isinstance(geometry, contract.InitialCapacityGeometry):
+        raise RuntimeError("provider_directory_profile_initial_receipt_geometry_invalid")
+    if geometry.legacy_payload is None:
+        fhir._assert_profile_capacity_layout_bounds(layout, geometry, "initial_receipt")
+    if (geometry.legacy_payload is None) != (receipt_payload["contract_id"] == contract.COMMIT_CONTRACT):
+        raise RuntimeError("provider_directory_profile_initial_receipt_family_invalid")
+    receipt_by_field["_validated_geometry"] = geometry
     _assert_receipt_payload(fhir, receipt_by_field, receipt_payload, geometry)
     if await fhir.db.scalar(
         f"SELECT EXISTS(SELECT 1 FROM {fhir._provider_directory_profile_checkpoint_ref(schema)} WHERE build_id=:build)",
@@ -552,7 +643,16 @@ async def _assert_current_receipt(fhir, schema, receipt):
     serving = await fhir._provider_directory_profile_serving_state(schema)
     if (
         serving is None
-        or {key: getattr(serving, key) for key in payload["serving"]} != payload["serving"]
+        or {
+            key: getattr(serving, key)
+            for key in payload["serving"]
+            if key not in {"evidence_target_oid", "profile_target_oid"}
+        }
+        != {
+            key: value
+            for key, value in payload["serving"].items()
+            if key not in {"evidence_target_oid", "profile_target_oid"}
+        }
         or serving.capacity_geometry_hash != payload["capacity_geometry_hash"]
         or json.loads(serving.capacity_geometry_json) != payload["capacity_geometry"]
         or fhir._provider_directory_profile_source_vector_json(serving.source_vector) != payload["source_vector"]
@@ -560,19 +660,12 @@ async def _assert_current_receipt(fhir, schema, receipt):
         != payload["source_context_vector"]
     ):
         raise RuntimeError("provider_directory_profile_initial_receipt_not_current")
-    for prefix in ("evidence", "profile"):
-        target = (
-            fhir.profile_artifact.PROFILE_EVIDENCE_TABLE
-            if prefix == "evidence"
-            else fhir.profile_artifact.PROFILE_TABLE
+    if serving.targets != fhir._provider_directory_profile_target_coordinates(schema):
+        raise RuntimeError("provider_directory_profile_initial_receipt_targets_changed")
+    for coordinate in serving.targets.values():
+        await fhir._provider_directory_profile_stage_layout(
+            coordinate["schema"], coordinate["name"], lock_relation=False
         )
-        oid = await fhir._provider_directory_relation_oid(schema, target)
-        layout = await fhir._provider_directory_profile_relation_storage_fingerprint(oid, expected_persistence="p")
-        if (
-            oid != payload["serving"][prefix + "_target_oid"]
-            or layout.exact_fingerprint != payload["actual"][prefix + "_target_storage_fingerprint"]
-        ):
-            raise RuntimeError("provider_directory_profile_initial_receipt_targets_changed")
     return serving
 
 
@@ -660,7 +753,7 @@ async def _replay_authority(fhir, schema, consumption_ref, run_id, execution, re
         raise RuntimeError("provider_directory_profile_replay_current_consumption_conflict")
     consumption = await fhir._replay_bound_consumption(consumption_ref, owner, receipt["build_id"])
     await fhir._assert_replay_owner(schema, owner, run_id)
-    geometry = fhir.profile_capacity.validated_capacity_geometry(receipt_payload["capacity_geometry"])
+    geometry = receipt["_validated_geometry"]
     if not isinstance(geometry, contract.InitialCapacityGeometry):
         raise RuntimeError("provider_directory_profile_initial_replay_geometry_invalid")
     lease_by_field = {
@@ -689,7 +782,10 @@ async def _replay_authority(fhir, schema, consumption_ref, run_id, execution, re
         or geometry.profile_schema_version != serving_by_field["profile_schema_version"]
         or geometry.profile_strategy_version != serving_by_field["profile_strategy_version"]
         or geometry.profile_as_of != serving_by_field["profile_as_of"]
-        or geometry.sql_contract_digest != fhir._provider_directory_profile_sql_contract_digest()
+        or (
+            geometry.legacy_payload is None
+            and geometry.sql_contract_digest != fhir._provider_directory_profile_sql_contract_digest()
+        )
         or geometry.executable_plan_hash != serving_by_field["executable_plan_hash"]
         or geometry.desired_source_vector_hash != serving_by_field["source_vector_hash"]
         or geometry.desired_context_vector_hash != serving_by_field["source_context_vector_hash"]
@@ -723,8 +819,7 @@ async def committed_replay(fhir, schema, consumption_ref, run_id, execution, fen
     )
     serving = await _assert_current_receipt(fhir, schema, receipt) if is_current else current_serving
     database = await fhir._provider_directory_profile_capacity_database_identity(schema, serving)
-    # Initial admission bound the old physical targets. Their replacements are bound by
-    # the immutable transaction receipt; every unchanged database/metadata field still matches.
+    # The immutable transaction receipt retains the named publication and original capacity timeline.
     _assert_replay_database(fhir, database, geometry, lease, consumption, lease_by_field)
     if (
         is_current
@@ -760,16 +855,13 @@ async def committed_replay(fhir, schema, consumption_ref, run_id, execution, fen
 
 async def resolve_completion(fhir, stages, fence, promotion_identities):
     """Drain-safe bounded readback after the owning transaction has returned or aborted."""
-    async with asyncio.timeout(10):
-        async with fhir.db.transaction():
-            await fhir.db.status("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            await fhir.db.status("SET LOCAL statement_timeout='8s'")
-            await fhir.db.status("SET LOCAL lock_timeout='100ms'")
-            return (
-                await is_committed(fhir, stages)
-                and await fhir._is_provider_directory_artifact_promotion_committed(promotion_identities, fence)
-                and (fence is None or await fhir._is_provider_directory_dataset_cutover_committed(fence))
-            )
+    async with fhir._provider_directory_artifact_promotion_readback() as can_observe:
+        return (
+            can_observe
+            and await is_committed(fhir, stages)
+            and await fhir._match_provider_directory_artifact_promotion(promotion_identities, fence)
+            and (fence is None or await fhir._is_provider_directory_dataset_cutover_committed(fence))
+        )
 
 
 async def _capture_legacy_history(fhir, schema, profile_ref, evidence_ref):
@@ -816,13 +908,12 @@ async def _capture_legacy_history(fhir, schema, profile_ref, evidence_ref):
 
 async def _inspect_cutover_stages(fhir, build, admission, initial_stages):
     """Verify replacement identities and bounded row counts before metadata projection."""
-    oid_by_target = {}
+    stage_by_target = {}
     for stage in initial_stages:
         if await fhir._provider_directory_relation_oid(stage.schema, stage.target_relation + "_old") is not None:
             raise RuntimeError("provider_directory_profile_initial_old_target_conflict")
-        oid = await fhir._provider_directory_relation_oid(stage.schema, stage.stage_table)
-        await fhir._provider_directory_profile_relation_storage_fingerprint(oid, expected_persistence="p")
-        oid_by_target[stage.target_relation] = oid
+        await fhir._provider_directory_profile_stage_layout(stage.schema, stage.stage_table, lock_relation=False)
+        stage_by_target[stage.target_relation] = {"schema": stage.schema, "name": stage.stage_table}
     counts = await fhir._provider_directory_profile_stage_metrics(
         build.schema, build.evidence_stage, build.profile_stage, list(build.source_ids)
     )
@@ -833,24 +924,23 @@ async def _inspect_cutover_stages(fhir, build, admission, initial_stages):
         await fhir._assert_provider_directory_profile_capacity_scratch(
             name, (fhir._unscoped_qt(build.schema, table),), observed_rows=observed, maximum_rows=maximum
         )
-    return oid_by_target, counts
+    return stage_by_target, counts
 
 
 async def _initial_commit_payload(fhir, cutover, build, admission, serving, fence):
     """Capture the exact replacement layouts and signed initial commit payload."""
     source_vector = fhir._provider_directory_profile_source_vector_json(build.desired_source_vector)
     context_vector = fhir._provider_directory_profile_source_context_vector_json(build.desired_source_context_vector)
-    target_layouts = [
-        await fhir._provider_directory_profile_relation_storage_fingerprint(serving[name], expected_persistence="p")
-        for name in ("evidence_target_oid", "profile_target_oid")
-    ]
+    for coordinate in serving["targets"].values():
+        await fhir._provider_directory_profile_stage_layout(
+            coordinate["schema"], coordinate["name"], lock_relation=False
+        )
     actual_by_field = {
         "contract_id": contract.ACTUAL_CONTRACT,
         "forecast_hash": cutover["forecast_hash"],
         "wal_start_lsn": cutover["wal_start"],
         "wal_observed_lsn": await fhir.db.scalar("SELECT pg_current_wal_insert_lsn()::text"),
-        "evidence_target_storage_fingerprint": target_layouts[0].exact_fingerprint,
-        "profile_target_storage_fingerprint": target_layouts[1].exact_fingerprint,
+        "targets": serving["targets"],
     }
     receipt_by_field = {
         "contract_id": contract.COMMIT_CONTRACT,
@@ -905,7 +995,7 @@ def _initial_forecast_fields():
         "capacity_geometry_hash",
         "initial_target_state_sha256",
         "dataset_fence_sha256",
-        "new_target_oids",
+        "targets",
         "metadata_data_bytes",
         "metadata_wal_bytes",
         "commit_envelope_bytes",
@@ -914,39 +1004,19 @@ def _initial_forecast_fields():
 
 
 def _assert_replay_database(fhir, database, geometry, lease, consumption, lease_by_field):
-    """Check unchanged database identity and the original consumed authority timeline."""
-    for name in (
-        "database_system_identifier",
-        "database_oid",
-        "database_name",
-        "tablespace_oid",
-        "tablespace_name",
-        "postgres_server_version_num",
-        "postgres_block_size_bytes",
-        "postgres_wal_block_size_bytes",
-        "postgres_wal_segment_size_bytes",
-        "postgres_full_page_writes",
-        "postgres_wal_compression",
-        "postgres_wal_level",
-        "postgres_wal_log_hints",
-        "postgres_data_checksums",
-        "postgres_default_toast_compression",
-        "postgres_checkpoint_timeout_seconds",
-        "postgres_max_wal_size_bytes",
-        "build_checkpoint_oid",
-        "serving_generation_oid",
-        "delta_receipt_oid",
-        "import_run_oid",
-        "capacity_consumption_oid",
-        "build_checkpoint_storage_fingerprint",
-        "serving_generation_storage_fingerprint",
-        "delta_receipt_storage_fingerprint",
-        "import_run_storage_fingerprint",
-        "capacity_consumption_storage_fingerprint",
+    """Retain logical target/source fences and the original consumed timeline."""
+    for role in (
+        "evidence_target",
+        "profile_target",
+        "build_checkpoint",
+        "serving_generation",
+        "delta_receipt",
+        "import_run",
+        "capacity_consumption",
     ):
-        if getattr(database, name) != getattr(geometry, name):
-            raise RuntimeError("provider_directory_profile_initial_replay_database_changed")
-    fhir._assert_provider_directory_profile_capacity_tablespaces(lease, database)
+        current, recorded = database.relations[role], geometry.relations[role]
+        if any(current[name] != recorded[name] for name in ("schema", "name")):
+            raise RuntimeError("provider_directory_profile_initial_replay_target_changed")
     fhir._assert_replay_timeline(consumption, lease_by_field, lease)
 
 

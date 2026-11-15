@@ -24,7 +24,6 @@ from tests.test_provider_directory_profile_control_capacity import (
     _control_wal_plan_input,
 )
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -37,18 +36,11 @@ async def _create_delta_profile_tables(
 ) -> None:
     """Create target and scratch tables plus their exact indexes."""
     table_statements = (
-        profile.profile_evidence_table_sql(
-            schema, profile.PROFILE_EVIDENCE_TABLE, logged=True
-        ),
-        profile.profile_table_sql(
-            schema, profile.PROFILE_TABLE, logged=True
-        ),
-        profile.profile_evidence_table_sql(
-            schema, evidence_stage, logged=True
-        ),
+        profile.profile_evidence_table_sql(schema, profile.PROFILE_EVIDENCE_TABLE, logged=True),
+        profile.profile_table_sql(schema, profile.PROFILE_TABLE, logged=True),
+        profile.profile_evidence_table_sql(schema, evidence_stage, logged=True),
         profile.profile_table_sql(schema, profile_stage, logged=True),
-        f"CREATE TABLE {profile.qualified_table(schema, affected_stage)} "
-        "(npi bigint PRIMARY KEY);",
+        f"CREATE TABLE {profile.qualified_table(schema, affected_stage)} (npi bigint PRIMARY KEY);",
     )
     for statement in table_statements:
         await database.status(statement)
@@ -59,9 +51,7 @@ async def _create_delta_profile_tables(
         (profile_stage, False),
     )
     for table_name, is_evidence in indexed_tables:
-        for statement in profile.profile_index_statements(
-            schema, table_name, evidence=is_evidence
-        ):
+        for statement in profile.profile_index_statements(schema, table_name, evidence=is_evidence):
             await database.status(statement)
 
 
@@ -101,26 +91,16 @@ async def _create_delta_control_stubs(
 ) -> None:
     """Create import-run and immutable capacity-consumption stubs."""
     import_run_ref = profile.qualified_table(schema, "import_run")
-    consumption_ref = profile.qualified_table(
-        schema, "provider_directory_profile_capacity_lease_consumption"
-    )
-    guard_ref = profile.qualified_table(
-        schema, "provider_directory_profile_capacity_guard_test"
-    )
+    consumption_ref = profile.qualified_table(schema, "provider_directory_profile_capacity_lease_consumption")
+    guard_ref = profile.qualified_table(schema, "provider_directory_profile_capacity_guard_test")
     await database.status(
-        f"CREATE TABLE {import_run_ref} ("
-        "run_id varchar(64) PRIMARY KEY, progress jsonb, metrics jsonb);"
+        f"CREATE TABLE {import_run_ref} (run_id varchar(64) PRIMARY KEY, progress jsonb, metrics jsonb);"
     )
-    await database.status(
-        f"CREATE TABLE {consumption_ref} ("
-        "attestation_id varchar(64) PRIMARY KEY);"
-    )
+    await database.status(f"CREATE TABLE {consumption_ref} (attestation_id varchar(64) PRIMARY KEY);")
     for statement in _immutable_guard_statements(
         consumption_ref,
         guard_ref,
-        error_message=(
-            "provider_directory_profile_capacity_consumption_immutable"
-        ),
+        error_message=("provider_directory_profile_capacity_consumption_immutable"),
         trigger_prefix="provider_directory_profile_capacity",
     ):
         await database.status(statement)
@@ -128,9 +108,7 @@ async def _create_delta_control_stubs(
 
 def _checkpoint_table_sql(schema: str) -> str:
     """Return the delta checkpoint truth-table DDL."""
-    table_ref = profile.qualified_table(
-        schema, "provider_directory_profile_build_checkpoint"
-    )
+    table_ref = profile.qualified_table(schema, "provider_directory_profile_build_checkpoint")
     return f"""
     CREATE TABLE {table_ref} (
         build_id varchar(64) PRIMARY KEY,
@@ -144,11 +122,7 @@ def _checkpoint_table_sql(schema: str) -> str:
         evidence_stage varchar(63) NOT NULL,
         profile_stage varchar(63) NOT NULL,
         affected_npi_stage varchar(63),
-        evidence_stage_oid bigint NOT NULL,
-        profile_stage_oid bigint NOT NULL,
-        affected_npi_stage_oid bigint,
-        evidence_target_oid bigint,
-        profile_target_oid bigint,
+        targets_json jsonb,
         current_source_vector_hash varchar(64),
         desired_source_vector_hash varchar(64),
         current_source_context_vector_hash varchar(64),
@@ -172,9 +146,7 @@ def _checkpoint_table_sql(schema: str) -> str:
 
 def _serving_generation_table_sql(schema: str) -> str:
     """Return the serving-generation truth-table DDL."""
-    table_ref = profile.qualified_table(
-        schema, "provider_directory_profile_serving_generation"
-    )
+    table_ref = profile.qualified_table(schema, "provider_directory_profile_serving_generation")
     return f"""
     CREATE TABLE {table_ref} (
         singleton_key varchar(16) PRIMARY KEY,
@@ -195,8 +167,7 @@ def _serving_generation_table_sql(schema: str) -> str:
         capacity_geometry_hash varchar(64),
         capacity_geometry_json jsonb,
         cutover_forecast_hash varchar(64),
-        evidence_target_oid bigint NOT NULL,
-        profile_target_oid bigint NOT NULL,
+        targets_json jsonb NOT NULL,
         evidence_rows bigint NOT NULL,
         profile_rows bigint NOT NULL,
         profile_as_of varchar(10) NOT NULL,
@@ -209,9 +180,7 @@ def _serving_generation_table_sql(schema: str) -> str:
 
 def _delta_receipt_table_sql(schema: str) -> str:
     """Return the immutable delta-receipt truth-table DDL."""
-    table_ref = profile.qualified_table(
-        schema, "provider_directory_profile_delta_receipt"
-    )
+    table_ref = profile.qualified_table(schema, "provider_directory_profile_delta_receipt")
     return f"""
     CREATE TABLE {table_ref} (
         build_id varchar(64) PRIMARY KEY,
@@ -233,8 +202,7 @@ def _delta_receipt_table_sql(schema: str) -> str:
         selection_proof_id varchar(64) NOT NULL,
         control_generation bigint NOT NULL,
         authority_revision bigint NOT NULL,
-        evidence_target_oid bigint NOT NULL,
-        profile_target_oid bigint NOT NULL,
+        targets_json jsonb NOT NULL,
         evidence_rows bigint NOT NULL,
         profile_rows bigint NOT NULL,
         evidence_inserted bigint NOT NULL,
@@ -268,19 +236,13 @@ async def _create_delta_contract_tables(
     affected_stage: str,
 ) -> None:
     """Create the bounded delta targets, scratch, control, and guard tables."""
-    await _create_delta_profile_tables(
-        database, schema, evidence_stage, profile_stage, affected_stage
-    )
+    await _create_delta_profile_tables(database, schema, evidence_stage, profile_stage, affected_stage)
     await _create_delta_control_stubs(database, schema)
     await database.status(_checkpoint_table_sql(schema))
     await database.status(_serving_generation_table_sql(schema))
     await database.status(_delta_receipt_table_sql(schema))
-    receipt_ref = profile.qualified_table(
-        schema, "provider_directory_profile_delta_receipt"
-    )
-    guard_ref = profile.qualified_table(
-        schema, "provider_directory_profile_delta_receipt_immutable_test"
-    )
+    receipt_ref = profile.qualified_table(schema, "provider_directory_profile_delta_receipt")
+    guard_ref = profile.qualified_table(schema, "provider_directory_profile_delta_receipt_immutable_test")
     for statement in _immutable_guard_statements(
         receipt_ref,
         guard_ref,

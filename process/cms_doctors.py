@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import hashlib
 import logging
@@ -51,7 +52,7 @@ from process.cms_doctors_sites import bind_cms_doctors_sites
 from process.cms_doctors_source_provenance import read_doctors_source_provenance
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import mark_control_run
-from process.entity_address_cutover_contract import lock_live_serving_relations, wait_for_publication_lock
+from process.entity_address_cutover_contract import wait_for_publication_lock
 from process.ext.address_canon import resolve_into_archive, source_enabled, stamp_address_keys
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
 from process.provider_directory_cms_identity_candidate import CMSIdentityReprepareRequired
@@ -61,13 +62,15 @@ from process.provider_directory_generic_source_policy import (
     source_transaction,
 )
 from process.redis_config import build_redis_settings
-from process.reference_family_archive import _lock_family
+from process.reference_family_archive import _lock_family, _set_local_timeout, _timeout_value
 from process.serialization import deserialize_job, serialize_job
 
 logger = logging.getLogger(__name__)
 
 CMS_DOCTORS_QUEUE_NAME = "arq:CMSDoctors"
 POSTGRES_IDENTIFIER_MAX_LENGTH = 63
+# Provider-profile readers allow 250 ms, so the queued exclusive swap lock waits at most 100 ms.
+_CUTOVER_LOCK_TIMEOUT = "100ms"
 
 CMS_PROVIDER_DATA_JSON_URL = "https://data.cms.gov/provider-data/data.json"
 CMS_PROVIDER_METASTORE_DATASET_URL = (
@@ -489,8 +492,8 @@ async def _publish_cms_doctors_stage(stage_cls, db_schema: str, import_date: str
             await wait_for_publication_lock(error, attempt, max_attempts=max_attempts)
 
 
-async def _lock_cms_doctors_publication(session, stage_cls, db_schema, import_date):
-    """Drain readers briefly, retaining immediate private-stage ownership checks."""
+async def _lock_cms_doctors_publication(session, stage_cls, db_schema, import_date, *, stage_read_only=False):
+    """Read-lock frozen heaps; ordered native rename statements acquire cutover write locks."""
     models = (DoctorClinicianAddress, CMSDoctorEducation, CMSDoctorGroupSite)
     optional_names = tuple(name for model in models for name in (model.__main_table__, model.__main_table__ + "_old"))
     existing_names = (
@@ -507,19 +510,23 @@ async def _lock_cms_doctors_publication(session, stage_cls, db_schema, import_da
         .all()
     )
     stages = (stage_cls.__tablename__, *(make_class(model, import_date).__tablename__ for model in models[1:]))
-    await _lock_family(session, db_schema, tuple(sorted(stages)), "ACCESS EXCLUSIVE", nowait=True)
-    live_names = {model.__main_table__ for model in models}
-    await lock_live_serving_relations(db.status, db_schema, live_names.intersection(existing_names))
-    retired_names = tuple(sorted(set(existing_names) - live_names))
-    if retired_names:
-        await _lock_family(session, db_schema, retired_names, "ACCESS EXCLUSIVE", nowait=True)
+    if type(stage_read_only) is not bool:
+        raise RuntimeError("cms_doctors_prepared_lock_scope_invalid")
+    stage_mode = "ACCESS SHARE" if stage_read_only else "ACCESS EXCLUSIVE"
+    await _lock_family(session, db_schema, tuple(sorted(stages)), stage_mode, nowait=True)
+    if existing_names:
+        await _lock_family(session, db_schema, tuple(sorted(existing_names)), "ACCESS SHARE", nowait=True)
 
 
 async def _apply_cms_doctors_stage(stage_cls, db_schema: str, import_date: str, *, identity_ctx=None):
     """Lock and swap every Doctors relation without committing the owner."""
     if db._transaction_binding() is None:
         raise RuntimeError("cms_doctors_publication_requires_transaction")
-    await _lock_cms_doctors_publication(db._transaction_binding().session, stage_cls, db_schema, import_date)
+    # Stages sealed by preparation keep SELECT only, so they take the read lock; the swap DDL locks natively.
+    is_sealed = ((identity_ctx or {}).get("context") or {}).get("publication_state") == "prepared"
+    await _lock_cms_doctors_publication(
+        db._transaction_binding().session, stage_cls, db_schema, import_date, stage_read_only=is_sealed
+    )
     return await _apply_locked_cms_doctors_stage(stage_cls, db_schema, import_date, identity_ctx=identity_ctx)
 
 
@@ -532,11 +539,31 @@ async def _apply_locked_cms_doctors_stage(stage_cls, db_schema: str, import_date
         incumbent = await capture_doctors_predecessor(session, db_schema)
         await seal_doctors_stages(db, db_schema, import_date)
         await publish_doctors_identities(db, identity_ctx or {})
-        return await _swap_cms_doctors_tables(stage_cls, db_schema, import_date, incumbent)
+        previous_lock = await _timeout_value(session, "lock_timeout")
+        # A lock timeout aborts the transaction, so the caller rolls back the queued lock before retrying.
+        await _set_local_timeout(session, "lock_timeout", _CUTOVER_LOCK_TIMEOUT)
+        deadline = asyncio.get_running_loop().time() + 0.1
+        published = await _swap_cms_doctors_tables(stage_cls, db_schema, import_date, incumbent, deadline=deadline)
+        await _set_local_timeout(session, "lock_timeout", previous_lock)
+        return published
 
 
-async def _swap_cms_doctors_tables(stage_cls, db_schema, import_date, incumbent):
+async def _bound_cutover_wait(deadline):
+    """Share one 100 ms wait across the live tables, as the single pre-change LOCK statement did."""
+    if deadline is None:
+        return
+    remaining_ms = max(1, int((deadline - asyncio.get_running_loop().time()) * 1000))
+    await _set_local_timeout(db._transaction_binding().session, "lock_timeout", f"{remaining_ms}ms")
+
+
+async def _swap_cms_doctors_tables(stage_cls, db_schema, import_date, incumbent, *, deadline=None):
     """Apply only after the complete identity cut inside the shared savepoint."""
+    # Match the reader's alphabetical lock order without requiring DML rights on frozen tables.
+    await _bound_cutover_wait(deadline)
+    await swap_education_stage(import_date, db_schema)
+    await _bound_cutover_wait(deadline)
+    await swap_group_site_stage(import_date, db_schema)
+    await _bound_cutover_wait(deadline)
     table = DoctorClinicianAddress.__main_table__
     await db.status(f"DROP TABLE IF EXISTS {db_schema}.{table}_old;")
     await db.status(f"ALTER TABLE IF EXISTS {db_schema}.{table} RENAME TO {table}_old;")
@@ -558,8 +585,6 @@ async def _swap_cms_doctors_tables(stage_cls, db_schema, import_date, incumbent)
             f"ALTER INDEX IF EXISTS {db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
             f"RENAME TO {old_live_name};"
         )
-    await swap_education_stage(import_date, db_schema)
-    await swap_group_site_stage(import_date, db_schema)
     return await publish_doctors_generation(
         db._transaction_binding().session, schema_name=db_schema, expected_authority=incumbent
     )

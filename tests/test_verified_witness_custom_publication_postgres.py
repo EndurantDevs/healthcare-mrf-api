@@ -32,7 +32,6 @@ from tests import test_network_custom_address_source_postgres as custom
 from tests.test_network_core_layer_provider_postgres import _assert_inventory_migration
 from tests.test_network_membership_draft_store_postgres import _command as membership_command
 from tests.test_registry_approval_store_postgres import _approve, _command
-from tests.test_registry_generic_source_successor_postgres import _heap_oids
 from tests.test_registry_membership_refresh_execution_postgres import _counts, _storage_rows
 
 pytestmark = pytest.mark.asyncio
@@ -99,7 +98,7 @@ async def _metadata(fixture, manifest, custom_pairs):
     assert derivation["approved_generation_sha256"] == generations["custom_membership"]
     custom_receipt = compact_custom_receipt(candidate)
     assert custom_receipt is not None and custom_receipt.custom_pair_count == custom_pairs
-    assert custom_receipt.npi_source is None and custom_receipt.npi_identity is None
+    assert custom_receipt.npi_source is None
     assert custom_receipt.approved_revision == manifest.approved_custom_revision
     return descriptor, derivation, verify_registry_source_retention(candidate)
 
@@ -241,13 +240,14 @@ async def _assert_source_suppressed(fixture, published, removed, additions):
 
 
 async def _assert_replay(fixture, published):
-    """Completed command replay preserves request MVCC, every physical heap/OID and commit count."""
-    request_sql = f'SELECT request.*,xmin::text AS row_xmin,ctid::text AS row_ctid FROM "{fixture.control_schema}".registry_publication_request request WHERE request_id=$1'
+    """Completed command replay preserves every request/payload field and commit count."""
+    request_sql = (
+        f'SELECT request.* FROM "{fixture.control_schema}".registry_publication_request request WHERE request_id=$1'
+    )
     request_id = UUID(published.queued["request_id"])
     before_request = await fixture.connection.fetchrow(request_sql, request_id)
     before_counts = await _counts(fixture)
     before_storage = await _storage_rows(fixture, published.manifest.schema_name)
-    before_oids = await _heap_oids(fixture, published.manifest)
     commits = fixture.calls.count(COMMIT_AUTHORITY_PATH)
     cas = list(fixture.cas_checks)
     command = fixture.command(published.inputs)
@@ -257,7 +257,6 @@ async def _assert_replay(fixture, published):
     assert await fixture.connection.fetchrow(request_sql, request_id) == before_request
     assert await _counts(fixture) == before_counts
     assert await _storage_rows(fixture, published.manifest.schema_name) == before_storage
-    assert await _heap_oids(fixture, published.manifest) == before_oids
     assert fixture.calls.count(COMMIT_AUTHORITY_PATH) == commits and fixture.cas_checks == cas
 
 
@@ -272,7 +271,7 @@ async def _successor_and_custom_changes(fixture, source_fixture, approval_view, 
         assert len(current.snapshot[1]) == 2
         _assert_manual(current.snapshot, manual, True)
         assert current.snapshot[2] == ("1000000491",) and current.descriptor["fact_candidate_id"] is None
-        assert current.manifest.compact_layout.base.table_oid == added.manifest.compact_layout.base.table_oid
+        assert current.manifest.compact_layout.base == added.manifest.compact_layout.base
         async with fixture.api.transaction(isolation="repeatable_read", readonly=True):
             recipes = await resolve_retained_registry_source_recipes(
                 fixture.api, current.manifest, control_schema=fixture.control_schema
@@ -300,7 +299,7 @@ async def _successor_and_custom_changes(fixture, source_fixture, approval_view, 
 
 
 async def test_source_v2_manual_commands_preserve_custody_and_replay(monkeypatch, record_property):
-    async with source.native_generic_source(monkeypatch) as source_fixture:
+    async with source.native_generic_source(monkeypatch, named=True) as source_fixture:
         assert re.fullmatch(r"hc_cms_admission_test_[0-9a-f]{32}", source_fixture.component.admin_engine.url.database)
         await source.publish_edition(source_fixture, 1)
         async with source.generic_refresh_execution(source_fixture, monkeypatch) as (fixture, serving, stack, head_url):
@@ -345,7 +344,7 @@ async def test_source_v2_manual_commands_preserve_custody_and_replay(monkeypatch
             )
             record_property(
                 "qualification",
-                "genuine Source v2 + manual direct offices + exact Source remove + independent custody + pinned old Reader + completed replay",
+                "named Source + manual direct offices + exact Source remove + native DML refusal + pinned old Reader + completed replay",
             )
             record_property(
                 "missing_case", "NPI same-pair override requires separate genuine NPI capability and is not qualified"

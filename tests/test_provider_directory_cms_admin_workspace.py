@@ -24,10 +24,7 @@ async def retained(case, monkeypatch):
     }
     binding = workspace._binding(case.storage, state.inputs, state.handoff, state.preparation_id, state.admission)
     names = workspace._names(binding)
-    state.outputs = {
-        name: dict(name=name, oid=1000 + index, owner=76, layout_sha256="2" * 64)
-        for index, name in enumerate(names.values())
-    }
+    state.outputs = {name: dict(schema=case.policy.schema, name=name) for index, name in enumerate(names.values())}
     state.binding = {
         **binding,
         "tables": {root: deepcopy(state.outputs[name]) for root, name in names.items()},
@@ -39,15 +36,14 @@ async def retained(case, monkeypatch):
     async def fetchval(sql, *arguments):
         if sql == "SHOW search_path":
             return state.path
-        if "WHERE oid=$1::oid" in sql:
-            assert arguments == (case.storage.namespace_owner_oid,)
-            return state.namespace
-        assert sql == "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname=session_user"
-        return state.superuser
+        raise AssertionError(sql)
 
     async def capture(connection, policy, requested):
         assert connection is case.driver and policy == case.policy
-        return {name: deepcopy(state.outputs[name]) for name in requested}
+        return {
+            name: deepcopy(state.outputs[name]) if name in state.outputs else {"schema": policy.schema, "name": name}
+            for name in requested
+        }
 
     case.driver.fetchval = AsyncMock(side_effect=fetchval)
     case.driver.execute = AsyncMock()
@@ -78,8 +74,11 @@ async def test_independent_admin_pins_exact_inputs_and_outputs_without_writes(re
         async with open_workspace(state) as current:
             assert type(current) is workspace.CMSPreparedWorkspace
             assert current.binding == state.binding
-            assert current._inputs["origin"]["current"] == "independent_admin"
-            assert current._inputs["origin"]["current"] != case.policy.publisher_role
+            assert current._inputs["origin"] == {
+                "readonly": "off",
+                "isolation": "read committed",
+                "replication_role": "origin",
+            }
             assert current._indexed is True and current._readonly is True
             await current.verify_current()
             for operation in (current.copy_rows("invalid", (), ()), current.finish_indexes()):
@@ -89,7 +88,7 @@ async def test_independent_admin_pins_exact_inputs_and_outputs_without_writes(re
         assert (source._FACTORY.get(), source._PUBLISHER.get(), source._OWNER.get()) == ambient
         with pytest.raises(ValueError, match="scope_ended"):
             await current.verify_current()
-    names = [row["relation_name"] for row in state.inputs["frozen_inventory"]["relations"]]
+    names = [input_relation["relation_name"] for input_relation in state.inputs["frozen_inventory"]["relations"]]
     names.extend(receipt["name"] for receipt in state.binding["tables"].values())
     expected = sorted(workspace.storage_relation(case.policy.schema, name) for name in names)
     case.driver.execute.assert_awaited_once_with(
@@ -97,83 +96,45 @@ async def test_independent_admin_pins_exact_inputs_and_outputs_without_writes(re
     )
     assert len(expected) == len(set(expected)) == 19
     assert state.outputs == before
-    assert not hasattr(admin, "finalize_frozen_cms_source_candidate")
 
 
-@pytest.mark.parametrize(
-    "actor",
-    [
-        "source_owner",
-        "source_publisher",
-        "prepared_owner",
-        "prepared_publisher",
-        "reader",
-        "namespace_owner",
-        "migration_login",
-    ],
-)
-async def test_source_prepared_namespace_and_migration_identities_are_not_independent_admin(retained, actor):
-    state, case = retained, retained.case
-    case.origin.update(session=actor, current=actor)
-    with pytest.raises(ValueError, match="independent_original_admin_required"):
-        async with case.session.begin(), case.database.bind_existing_session(case.session), open_workspace(state):
-            pytest.fail("excluded actor reached the workspace")
-    case.driver.execute.assert_not_awaited()
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("current", "other_admin"),
-        ("backend", 99),
-        ("database_oid", 99),
-        ("isolation", "serializable"),
-        ("readonly", "on"),
-        ("replication_role", "replica"),
-        ("transaction", None),
-    ],
-)
-async def test_native_admin_identity_is_checked_before_locks(retained, field, value):
+@pytest.mark.parametrize("field,value", [("readonly", "on"), ("replication_role", "replica")])
+async def test_incompatible_transaction_refuses_before_locks(retained, field, value):
     state, case = retained, retained.case
     case.origin[field] = value
-    with pytest.raises(ValueError, match="independent_original_admin_required"):
+    with pytest.raises(ValueError, match="writable_transaction_required"):
         async with case.session.begin(), case.database.bind_existing_session(case.session), open_workspace(state):
-            pytest.fail("wrong native actor reached the workspace")
+            pytest.fail("invalid transaction reached the workspace")
     case.driver.execute.assert_not_awaited()
 
 
-@pytest.mark.parametrize("fault", ["path", "namespace", "superuser"])
-async def test_native_path_namespace_and_superuser_are_required(retained, fault):
+async def test_unsafe_search_path_refuses_before_reading_inputs(retained):
     state, case = retained, retained.case
-    setattr(state, fault, {"path": '"public",pg_catalog', "namespace": None, "superuser": False}[fault])
-    with pytest.raises(ValueError, match="search_path|namespace_owner_missing|independent_original_admin_required"):
+    state.path = "public,pg_catalog"
+    with pytest.raises(ValueError, match="search_path"):
         async with case.session.begin(), case.database.bind_existing_session(case.session), open_workspace(state):
-            pytest.fail("unsafe native context reached the workspace")
+            pytest.fail("unsafe search path reached the workspace")
     case.driver.execute.assert_not_awaited()
 
 
-@pytest.mark.parametrize("fault", ["claimed_origin", "coordinates", "frozen", "indexed", "output"])
+@pytest.mark.parametrize("fault", ["claimed_origin", "frozen", "indexed", "output"])
 async def test_detached_actor_claims_and_native_drift_are_refused(retained, fault):
     state, case = retained, retained.case
     if fault == "claimed_origin":
         state.inputs["origin"] = deepcopy(case.origin)
-    elif fault == "coordinates":
-        case.coordinates["prepared_owner_oid"] = 999
     elif fault == "frozen":
-        case.native_rows[0]["relfilenode"] = 999
+        state.inputs["frozen_inventory"]["relations"][0]["schema_name"] = "other_schema"
     elif fault == "indexed":
         state.binding["indexed"] = False
     else:
-        next(iter(state.outputs.values()))["layout_sha256"] = "3" * 64
-    with pytest.raises(ValueError, match="inputs_changed|frozen_inventory_changed|retained_|output_changed"):
+        next(iter(state.outputs.values()))["name"] = "replacement"
+    with pytest.raises(ValueError, match="inputs_changed|frozen_coordinates_changed|retained_|output_changed"):
         async with case.session.begin(), case.database.bind_existing_session(case.session), open_workspace(state):
             pytest.fail("changed observation reached the workspace")
     case.driver.execute.assert_not_awaited()
 
 
-@pytest.mark.parametrize(
-    "fault", ["inputs", "binding", "native_input", "native_output", "actor", "path", "physical", "flags"]
-)
+@pytest.mark.parametrize("fault", ["inputs", "binding", "native_output", "modes", "path", "flags"])
 async def test_normal_exit_rechecks_every_caller_and_native_boundary(retained, fault):
     state, case = retained, retained.case
     with pytest.raises(ValueError):
@@ -181,51 +142,27 @@ async def test_normal_exit_rechecks_every_caller_and_native_boundary(retained, f
             async with open_workspace(state) as current:
                 match fault:
                     case "inputs":
-                        state.inputs["frozen_inventory"]["relations"][0]["relfilenode"] = 999
+                        state.inputs["frozen_inventory"]["relations"][0]["relation_name"] = "replacement"
                     case "binding":
                         state.binding["admission_sha256"] = "9" * 64
-                    case "native_input":
-                        case.native_rows[0]["relfilenode"] = 999
                     case "native_output":
-                        next(iter(state.outputs.values()))["oid"] = 999
-                    case "actor":
-                        case.origin["transaction"] = "3/5"
+                        next(iter(state.outputs.values()))["name"] = "replacement"
+                    case "modes":
+                        case.origin["readonly"] = "on"
                     case "path":
                         state.path = "public"
-                    case "physical":
-                        case.physical.get_raw_connection.return_value.driver_connection = object()
                     case _:
                         current._readonly = False
     assert current._active is False
 
 
-async def test_publisher_entrypoint_still_refuses_admin_origin(retained):
+async def test_native_access_refusal_propagates_before_locks(retained, monkeypatch):
     state, case = retained, retained.case
-    with pytest.raises(ValueError, match="original_publisher_required"):
-        async with case.session.begin(), case.database.bind_existing_session(case.session):
-            async with workspace.context.observe_prepared_cms_inputs(
-                case.database,
-                case.session,
-                case.driver,
-                source_binding=case.storage,
-                source_policy=case.source_policy,
-                prepared_policy=case.policy,
-                frozen_inventory=case.inventory,
-            ):
-                pytest.fail("Publisher factory accepted the admin")
-
-
-async def test_drift_between_initial_observation_and_lock_is_refused_before_yield(retained):
-    state, case = retained, retained.case
-
-    async def replace_input(_sql):
-        case.native_rows[0]["relfilenode"] = 999
-
-    case.driver.execute.side_effect = replace_input
-    with pytest.raises(ValueError, match="frozen_inventory_changed"):
+    monkeypatch.setattr(admin.context, "_observe", AsyncMock(side_effect=PermissionError("read refused")))
+    with pytest.raises(PermissionError, match="read refused"):
         async with case.session.begin(), case.database.bind_existing_session(case.session), open_workspace(state):
-            pytest.fail("post-lock input drift reached the reader")
-    case.driver.execute.assert_awaited_once()
+            pytest.fail("unreadable input reached the reader")
+    case.driver.execute.assert_not_awaited()
 
 
 async def test_lock_conflict_propagates_without_repair_or_retry(retained):

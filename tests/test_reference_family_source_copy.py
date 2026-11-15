@@ -15,41 +15,69 @@ from process import reference_family_result_generation as generation
 from process import tiger_captured_epoch as captured
 
 
-def _nucc_stage_receipt():
-    """Synthetic closed metadata exercises decoders, not native authority."""
-    ctx_by_field = {
-        "control_run_id": "synthetic",
-        "context": {
-            "_control_attempt_id": "synthetic:" + "1" * 32,
-            "_control_attempt_started_at": "2026-10-01T00:00:00+00:00",
-        },
-    }
-    run_id, attempt, started, suffix = archive._nucc_attempt(ctx_by_field)
-    stage_by_field = {
-        "contract": "nucc-native-stage.v2",
-        "run_id": run_id,
-        "attempt_id": attempt,
-        "attempt_started_at": started,
-        "schema_name": "mrf",
-        "import_date": suffix,
-        "node_id": "synthetic",
-        "database_oid": 41,
-        "import_run_oid": 42,
-        "source_contract_sha256": "a" * 64,
-        "stage": {
-            "table_name": "nucc_taxonomy_" + suffix,
-            "relation_oid": 43,
-            "relfilenode": 44,
-            "owner_oid": 45,
-            "indexes": [],
-        },
-        "incumbent": generation.ReferenceFamilyResultGenerationAuthority(
+def _nucc_owning_transaction(session):
+    """A host transaction protocol that exposes savepoint release versus rollback."""
+    token = object()
+    if not hasattr(session, "get_transaction"):
+        session.get_transaction = lambda: token
+    session.nucc_savepoint_events = []
+
+    @asynccontextmanager
+    async def savepoint():
+        session.nucc_savepoint_events.append("savepoint")
+        try:
+            yield
+        except BaseException:
+            session.nucc_savepoint_events.append("rollback")
+            raise
+        else:
+            session.nucc_savepoint_events.append("release")
+
+    session.begin_nested = savepoint
+    if not hasattr(session, "connection"):
+        session.connection = AsyncMock()
+    return session
+
+
+def _nucc_stage_receipt(*, legacy=False):
+    """Current named metadata and an explicit unchanged historical wire edition."""
+    run, attempt, started, suffix = archive._nucc_attempt(
+        {
+            "control_run_id": "synthetic",
+            "context": {
+                "_control_attempt_id": "synthetic:" + "1" * 32,
+                "_control_attempt_started_at": "2026-10-01T00:00:00+00:00",
+            },
+        }
+    )
+    value_by_field = dict(
+        contract="nucc-native-stage.v2",
+        run_id=run,
+        attempt_id=attempt,
+        attempt_started_at=started,
+        schema_name="mrf",
+        import_date=suffix,
+        node_id="synthetic",
+        source_contract_sha256="a" * 64,
+        stage={"table_name": "nucc_taxonomy_" + suffix, "indexes": []},
+        incumbent=generation.ReferenceFamilyResultGenerationAuthority(
             "nucc", "c8f27af1-56ba-4cda-82d8-0fc67650918f", 0, None, None
         ).as_dict(),
-        "incumbent_relation_oid": 46,
-    }
-    stage_by_field["stage_sha256"] = archive.nucc_native_digest(stage_by_field)
-    return stage_by_field
+        incumbent_relation=["mrf", "nucc_taxonomy"],
+    )
+    if legacy:
+        del value_by_field["incumbent_relation"]
+        value_by_field.update(
+            database_oid="opaque original database",
+            import_run_oid="opaque original history",
+            incumbent_relation_oid="opaque original predecessor",
+        )
+        value_by_field["stage"].update(
+            relation_oid="opaque original heap", relfilenode="opaque original file", owner_oid="opaque original owner"
+        )
+        value_by_field["incumbent"]["relation_oids"] = value_by_field["incumbent"].pop("relations")
+    value_by_field["stage_sha256"] = archive.nucc_native_digest(value_by_field)
+    return value_by_field
 
 
 def test_nucc_v2_receipt_preserves_original_zero_and_exact_precreated_identity():
@@ -57,7 +85,7 @@ def test_nucc_v2_receipt_preserves_original_zero_and_exact_precreated_identity()
     assert archive._nucc_precreated_stage_value(stage_by_field) == stage_by_field
     assert stage_by_field["incumbent"]["local_generation"] == 0
     assert stage_by_field["incumbent"]["serving_generation"] is None
-    corrupt_by_field = {**stage_by_field, "incumbent_relation_oid": 47}
+    corrupt_by_field = {**stage_by_field, "node_id": "other-node"}
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="digest"):
         archive._nucc_precreated_stage_value(corrupt_by_field)
     foreign_authority_by_field = {
@@ -67,7 +95,7 @@ def test_nucc_v2_receipt_preserves_original_zero_and_exact_precreated_identity()
             "origin_generation": 9,
             "published_at": "2026-10-01T00:00:00Z",
         },
-        "relation_oids": [46],
+        "relations": [{"schema_name": "mrf", "relation_name": "nucc_taxonomy"}],
     }
     assert archive._nucc_result_authority(foreign_authority_by_field, allow_untracked=True).local_generation == 0
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="predecessor"):
@@ -101,6 +129,10 @@ async def test_owner_sealed_zero_still_requires_genuine_initial_source_adoption(
             "_control_attempt_started_at": stage_by_field["attempt_started_at"],
         },
     }
+    monkeypatch.setattr(
+        "process.reference_family_result_generation.require_nucc_native_predecessor_storage",
+        AsyncMock(return_value={"schema_name": "mrf", "table_name": "nucc_taxonomy"}),
+    )
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="untracked"):
         await archive.bind_nucc_native_attempt(object(), ctx_by_field, schema_name="mrf")
     create.assert_not_awaited()
@@ -132,7 +164,7 @@ async def test_nucc_precreation_reserves_before_ddl_and_records_exact_oid(monkey
         ),
     )
     monkeypatch.setattr(generation, "_require_nucc_native_builder", AsyncMock())
-    monkeypatch.setattr(archive, "_relation_oid", AsyncMock(side_effect=[42, None, 42]))
+    monkeypatch.setattr(archive, "_relation_oid", AsyncMock(return_value=None))
 
     async def create(*_args, **_kwargs):
         observed_operations.append(("DDL", "heap"))
@@ -147,7 +179,6 @@ async def test_nucc_precreation_reserves_before_ddl_and_records_exact_oid(monkey
         stage_by_field["attempt_started_at"],
         stage_by_field["import_date"],
         incumbent=stage_by_field["incumbent"],
-        incumbent_relation_oid=46,
     )
     assert [event[0] for event in observed_operations] == ["reservation", "DDL", "receipt"]
     assert archive._nucc_precreated_stage_value(receipt) == receipt
@@ -185,7 +216,12 @@ async def test_nucc_stage_cleanup_fences_active_runs_and_late_references(
             assert "jsonb_build_object(CAST(:digest AS text),CAST(:receipt AS jsonb))" in query
         return stage_by_field["run_id"] if query.startswith("UPDATE") else "transaction"
 
-    session = SimpleNamespace(in_transaction=lambda: True, execute=execute, scalar=scalar)
+    transaction = object()
+    session = _nucc_owning_transaction(
+        SimpleNamespace(
+            in_transaction=lambda: True, get_transaction=lambda: transaction, execute=execute, scalar=scalar
+        )
+    )
     monkeypatch.setattr(archive, "_require_nucc_native_location", AsyncMock())
     monkeypatch.setattr(archive, "_nucc_native_publisher_owner", AsyncMock(return_value=50))
     monkeypatch.setattr(archive, "_nucc_native_stage", AsyncMock(return_value=stage_by_field["stage"]))
@@ -232,23 +268,29 @@ def _nucc_abandoned_run(stage_by_field, status):
 
 
 def _nucc_completed_handoff(stage_by_field):
-    """Pure decoder metadata; native storage remains independently checked."""
-    handoff_by_field = {
-        **{
-            key: value
-            for key, value in stage_by_field.items()
-            if key not in {"contract", "stage_sha256", "incumbent_relation_oid"}
-        },
-        "contract": archive.NUCC_IMMUTABLE_HANDOFF_CONTRACT,
-        "stage": {
-            **stage_by_field["stage"],
-            "indexes": [{"index_oid": 47, "relfilenode": 48, "definition": "synthetic metadata"}],
-        },
-        "row_count": 1,
-        "precreated_stage": stage_by_field,
+    value_by_field = {
+        key: item
+        for key, item in stage_by_field.items()
+        if key not in {"contract", "stage_sha256", "incumbent_relation", "incumbent_relation_oid"}
     }
-    handoff_by_field["handoff_sha256"] = archive.nucc_native_digest(handoff_by_field)
-    return archive.validate_nucc_native_handoff(handoff_by_field)
+    index_by_field = {
+        "index_name": "candidate_pkey",
+        "definition": "CREATE UNIQUE INDEX candidate_pkey ON candidate USING btree(code)",
+    }
+    if "relation_oid" in stage_by_field["stage"]:
+        index_by_field = {
+            "index_oid": "opaque original index",
+            "relfilenode": "opaque original index file",
+            "definition": index_by_field["definition"],
+        }
+    value_by_field.update(
+        contract=archive.NUCC_IMMUTABLE_HANDOFF_CONTRACT,
+        stage={**stage_by_field["stage"], "indexes": [index_by_field]},
+        row_count=1,
+        precreated_stage=stage_by_field,
+    )
+    value_by_field["handoff_sha256"] = archive.nucc_native_digest(value_by_field)
+    return archive.validate_nucc_native_handoff(value_by_field)
 
 
 @pytest.mark.asyncio
@@ -525,8 +567,11 @@ async def test_native_source_seals_all_heaps_then_copies_then_builds_indexes(mon
         archive.reference_family_spec(importer, canonical=importer == "mrf").model_types
     )
     if importer in {"cms-doctors", "geo"}:
-        assert next(sql for sql in events if sql.startswith("CREATE SCHEMA")).endswith('AUTHORIZATION "retained_owner"')
-        archive.seal_model_family_storage.assert_awaited_once_with(session, ownership, 41, require_empty=True)
+        assert (
+            next(sql for sql in events if sql.startswith("CREATE SCHEMA"))
+            == f'CREATE SCHEMA "{archive.reference_family_stage_schema(ownership.dataset_id)}"'
+        )
+        assert events.count("seal") == 1
 
 
 @pytest.mark.asyncio

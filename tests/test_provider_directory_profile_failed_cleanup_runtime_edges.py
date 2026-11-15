@@ -70,7 +70,7 @@ def test_executor_import_closure_resolves_nested_relative_packages_without_exter
 
 
 @pytest.mark.parametrize("change", ["content", "mode", "inode"])
-def test_executor_manifest_refuses_real_changes_during_read_and_closes_descriptor(monkeypatch, executor_tree, change):
+def test_executor_content_change_refuses_and_metadata_change_preserves_digest(monkeypatch, executor_tree, change):
     root, _sources = executor_tree
     path = root / "requirements.txt"
     source_inode = path.stat().st_ino
@@ -91,8 +91,12 @@ def test_executor_manifest_refuses_real_changes_during_read_and_closes_descripto
         return content
 
     monkeypatch.setattr(os, "read", changed_read)
-    with pytest.raises(RuntimeError, match="failed_profile_cleanup_executor_source_changed"):
-        cleanup._executor_source_manifest(root)
+    if change == "content":
+        with pytest.raises(RuntimeError, match="failed_profile_cleanup_executor_source_changed"):
+            cleanup._executor_source_manifest(root)
+    else:
+        expected_by_path = {name: hashlib.sha256(content).hexdigest() for name, content in _sources.items()}
+        assert cleanup._executor_source_manifest(root) == expected_by_path
     with pytest.raises(OSError):
         os.fstat(descriptors[0])
 
@@ -266,15 +270,19 @@ def set_nested(values, path, replacement):
         (("attestor_release_digest",), "A" * 64, "digest_invalid"),
         (("checkpoint", "authority_revision"), True, "integer_invalid"),
         (("checkpoint", "build_id"), "build-a", "build_invalid"),
-        (("database", "tablespaces"), [], "tablespaces_invalid"),
-        (("database", "tablespaces", 0, "usage"), "temp", "tablespaces_invalid"),
+        (("database", "schema"), "", "identity_invalid"),
+        (("stages", 0, "schema"), None, "identity_invalid"),
         (("stages", 0, "role"), "profile", "stages_invalid"),
         (("limits", "lock_timeout_ms"), 30001, "timeout_invalid"),
-        (("volumes",), [], "volumes_invalid"),
-        (("volumes", 0, "reserved_bytes"), 1, "volume_limit_invalid"),
-        (("volumes", 0, "available_after_all_reservations_bytes"), 10**10 + 1, "volume_remaining_invalid"),
-        (("volumes", 0, "available_bytes"), 10**10 + 1, "colocated_volume_invalid"),
-        (("database", "tablespaces", 0, "volume_digest"), "b" * 64, "tablespace_volume_invalid"),
+        (("storage_classes",), [], "storage_classes_invalid"),
+        (("storage_classes", 0, "reserved_bytes"), 1, "storage_limit_invalid"),
+        (
+            ("storage_classes", 0, "available_after_all_reservations_bytes"),
+            10**10 + 1,
+            "reservation_accounting_invalid",
+        ),
+        (("storage_classes", 0, "available_bytes"), 1, "reservation_accounting_invalid"),
+        (("stages", 0, "name"), "unbounded name", "identity_invalid"),
         (
             ("observations", "accounted_reservation_ids"),
             ["reservation-a", "reservation-a"],
@@ -289,27 +297,30 @@ def test_signed_authority_refuses_invalid_closed_coordinates(path, replacement, 
         cleanup.validate_authorization(sign(envelope["authorization"], key), trust=trust, now=NOW)
 
 
-@pytest.mark.parametrize("change", ["binding", "database", "tablespaces", "volumes", "duplicate_key", "release"])
+@pytest.mark.parametrize("change", ["binding", "attestor", "active_key", "key_missing", "duplicate_key", "release"])
 def test_independent_trust_rejects_authority_from_a_different_epoch(change):
     envelope, trust, _key = authorization_fixture()
     reason_by_change = {
         "binding": "trust_binding_invalid",
-        "database": "trust_database_invalid",
-        "tablespaces": "trust_tablespaces_invalid",
-        "volumes": "trust_volumes_invalid",
+        "attestor": "trust_binding_invalid",
+        "active_key": "trust_key_invalid",
+        "key_missing": "trust_key_invalid",
         "duplicate_key": "trust_key_invalid",
         "release": "trust_key_invalid",
     }
-    if change == "binding":
-        trust.environment_id = "environment-b"
-    elif change == "database":
-        trust.database_oid += 1
-    elif change in {"tablespaces", "volumes"}:
-        setattr(trust, change, ())
-    elif change == "duplicate_key":
-        trust.keys = trust.keys * 2
-    else:
-        trust.keys[0].attestor_release_digest = "e" * 64
+    match change:
+        case "binding":
+            trust.environment_id = "environment-b"
+        case "attestor":
+            trust.attestor_id = "different-attestor"
+        case "active_key":
+            trust.active_key_id = "different-key"
+        case "key_missing":
+            trust.keys = ()
+        case "duplicate_key":
+            trust.keys = trust.keys * 2
+        case "release":
+            trust.keys[0].attestor_release_digest = "e" * 64
     with pytest.raises(RuntimeError, match="failed_profile_cleanup_" + reason_by_change[change]):
         cleanup.validate_authorization(envelope, trust=trust, now=NOW)
 
@@ -334,12 +345,12 @@ def test_signature_refuses_equivalent_encoding_or_unverified_bytes(change):
     "path,replacement,reason",
     [
         (("publication", "serving_state"), "multiple", "publication_invalid"),
-        (("publication", "targets"), [], "publication_invalid"),
-        (("publication", "targets", 0, "role"), "profile", "publication_invalid"),
-        (("physical", "stage_dependencies"), [], "dependencies_invalid"),
-        (("physical", "stage_dependencies", 0, "role"), "profile", "dependencies_invalid"),
-        (("physical", "postgres", "database_oid"), 123, "physical_database_changed"),
-        (("physical", "postgres", "postgres_full_page_writes"), 1, "physical_invalid"),
+        (("publication", "targets"), [], "stages_invalid"),
+        (("publication", "targets", 0, "role"), "profile", "stages_invalid"),
+        (("capacity", "stage_dependencies"), [], "dependencies_invalid"),
+        (("capacity", "stage_dependencies", 0, "role"), "profile", "dependencies_invalid"),
+        (("capacity", "checkpoint_layout", "schema"), None, "identity_invalid"),
+        (("capacity", "postgres", "postgres_full_page_writes"), 1, "capacity_invalid"),
         (("checkpoint", "lineage_kind"), "unknown", "legacy_lineage_partial"),
     ],
 )
@@ -416,26 +427,27 @@ def test_completion_refuses_tampered_receipts_and_cannot_advance_claimed_time(ch
 @pytest.mark.parametrize(
     "change,reason",
     [
-        ("empty", "drop_dependency_bound_unsupported"),
-        ("oversized", "drop_dependency_bound_unsupported"),
-        ("kind", "drop_object_kind_unsupported"),
-        ("external", "drop_external_dependency"),
+        ("missing", "stage_missing"),
+        ("objects", "drop_dependency_bound_unsupported"),
         ("relations", "drop_dependency_bound_unsupported"),
         ("shape", "drop_catalog_shape_unsupported"),
         ("rows", "drop_catalog_bound_unsupported"),
         ("wal", "drop_catalog_wal_exceeded"),
+        ("event", "drop_event_trigger_unsupported"),
     ],
 )
-async def test_drop_closure_rejects_unbounded_or_external_catalog_mutations(monkeypatch, change, reason):
-    objects = [] if change == "empty" else [(999 if change == "kind" else 1259, 17000, 0)]
-    if change == "oversized":
-        objects *= 129
+async def test_drop_numeric_projection_refuses_unbounded_catalog_cost(monkeypatch, change, reason):
+    layout = SimpleNamespace(
+        main_index_oids=tuple(range(33)) if change == "relations" else (), toast_index_oids=(), toast_oid=None
+    )
     fhir = SimpleNamespace(
         db=SimpleNamespace(
-            all=AsyncMock(return_value=objects),
-            scalar=AsyncMock(side_effect=[change == "external", 33 if change == "relations" else 1, change == "shape"]),
+            all=AsyncMock(return_value=[(20000 + i,) for i in range(129)] if change == "objects" else []),
+            scalar=AsyncMock(side_effect=[change == "shape", change == "event"]),
             status=AsyncMock(),
-        )
+        ),
+        _provider_directory_relation_oid=AsyncMock(return_value=None if change == "missing" else 17000),
+        _provider_directory_profile_capacity_relation_layout=AsyncMock(return_value=layout),
     )
     catalogs = [
         {
@@ -445,7 +457,9 @@ async def test_drop_closure_rejects_unbounded_or_external_catalog_mutations(monk
     ]
     monkeypatch.setattr(cleanup, "_catalog_deletion_manifest", AsyncMock(return_value=catalogs))
     with pytest.raises(RuntimeError, match="failed_profile_cleanup_" + reason):
-        await cleanup._stage_dependency_manifest(fhir, "synthetic", {"role": "evidence", "oid": 17000})
+        await cleanup._stage_dependency_manifest(
+            fhir, "synthetic", {"role": "evidence", "schema": "synthetic", "name": "stage"}
+        )
     fhir.db.status.assert_not_awaited()
 
 
@@ -574,23 +588,21 @@ def test_legacy_checkpoint_coordinates_require_complete_original_owner_preimage(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("legacy", [False, True])
-async def test_stage_storage_change_refuses_disposal_without_a_legacy_absence_witness(legacy):
+async def test_missing_named_stage_refuses_before_disposal(legacy):
     roles = ("evidence", "profile") if legacy else ("evidence", "profile", "affected_npi")
     checkpoint_by_field = dict(
         materialization_mode="full_swap" if legacy else "source_delta", capacity_geometry_status="legacy_unavailable"
     )
-    for position, role in enumerate(roles):
-        checkpoint_by_field[role + "_stage_oid"] = 17000 + position
-        checkpoint_by_field[role + "_stage_storage_fingerprint"] = "a" * 64
     fhir = SimpleNamespace(
         db=SimpleNamespace(status=AsyncMock()),
         _validated_profile_checkpoint_stage_names=lambda _checkpoint: tuple(role + "_stage" for role in roles),
-        _provider_directory_profile_stage_relation_identity=AsyncMock(return_value=(17000, "r", "p")),
-        _provider_directory_profile_stage_storage_fingerprint=AsyncMock(return_value="b" * 64),
+        _provider_directory_relation_oid=AsyncMock(return_value=None),
+        _provider_directory_profile_capacity_relation_layout=AsyncMock(),
     )
-    with pytest.raises(RuntimeError, match="failed_profile_cleanup_stage_storage_changed"):
+    with pytest.raises(RuntimeError, match="failed_profile_cleanup_stage_missing"):
         await cleanup._stage_manifest(fhir, "synthetic", checkpoint_by_field, locked=False)
     fhir.db.status.assert_not_awaited()
+    fhir._provider_directory_profile_capacity_relation_layout.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -692,7 +704,7 @@ async def test_disposal_refuses_exceeded_completion_bounds(monkeypatch, case, re
         await cleanup._dispose_claimed_stages(fhir, "synthetic", envelope, checkpoint, "0/100")
     statements = [call.args[0] for call in fhir.db.status.await_args_list]
     assert statements[:3] == [
-        "DROP TABLE synthetic." + name for name in ("evidence_stage", "profile_stage", "affected_stage")
+        "DROP TABLE synthetic." + name + " RESTRICT" for name in ("evidence_stage", "profile_stage", "affected_stage")
     ]
     assert len(statements) == (4 if case == "update" else 3)
 
@@ -732,28 +744,27 @@ async def test_disposed_checkpoint_requires_durable_claim_after_valid_marker():
 async def test_disposal_refuses_live_or_previously_published_stages(case, reason):
     envelope, _trust, _key = authorization_fixture()
     coordinates = envelope["authorization"]["checkpoint"]
-    checkpoint_by_field = {
-        role + "_stage_oid": stage["oid"]
-        for role, stage in zip(
-            ("evidence", "profile", "affected_npi"), envelope["authorization"]["stages"], strict=True
-        )
+    targets_by_role = {
+        "evidence": {"schema": "synthetic", "name": "evidence_failed" if case == "stage" else "published_evidence"},
+        "profile": {"schema": "synthetic", "name": "published_profile"},
     }
-    serving_by_field = {"evidence_target_oid": 17000 if case == "stage" else 18000, "profile_target_oid": 18001}
-    serving = None if case == "missing" else SimpleNamespace(_mapping=serving_by_field)
     fhir = SimpleNamespace(
         db=SimpleNamespace(
-            first=AsyncMock(return_value=serving),
-            scalar=AsyncMock(side_effect=[None, None, case == "delta", True]),
+            first=AsyncMock(return_value=None if case == "missing" else SimpleNamespace(_mapping={})),
+            scalar=AsyncMock(side_effect=[case == "delta", True]),
             status=AsyncMock(),
         ),
         _unscoped_qt=lambda schema, name: schema + "." + name,
         _provider_directory_profile_serving_generation_ref=lambda schema: schema + ".serving",
-        _profile_serving_state_from_row=Mock(),
+        _profile_serving_state_from_row=Mock(return_value=SimpleNamespace(targets=targets_by_role)),
+        _validated_profile_checkpoint_stage_names=lambda _checkpoint: tuple(
+            stage["name"] for stage in envelope["authorization"]["stages"]
+        ),
     )
     with pytest.raises(RuntimeError, match="failed_profile_cleanup_" + reason):
-        await cleanup._exclude_publication(fhir, "synthetic", checkpoint_by_field, coordinates)
+        await cleanup._exclude_publication(fhir, "synthetic", {}, coordinates)
     assert all(call.args[0].startswith("LOCK TABLE ") for call in fhir.db.status.await_args_list)
-    fhir._profile_serving_state_from_row.assert_not_called()
+    assert fhir._profile_serving_state_from_row.call_count == int(case != "missing")
 
 
 @pytest.mark.asyncio
@@ -797,7 +808,7 @@ def test_cleanup_authority_enforces_envelope_and_shared_volume_bounds(case, reas
             ["reservation-a", *(f"reservation-{index:06d}" for index in range(4000))]
         )
     elif case == "accounting":
-        for volume in envelope["authorization"]["volumes"]:
+        for volume in envelope["authorization"]["storage_classes"]:
             volume["available_after_all_reservations_bytes"] = volume["available_bytes"]
     envelope = sign(envelope["authorization"], key)
     if case == "signature":
@@ -820,13 +831,13 @@ def test_initial_cleanup_request_binds_original_target_layout_and_nonstage_objec
     envelope, _trust, _key, geometry = initial_authorization_fixture(with_geometry=True)
     body = envelope["authorization"]
     if case == "target":
-        geometry["evidence_target_oid"] += 1000
+        geometry["relations"]["evidence_target"]["name"] = "other_target"
         body["checkpoint"]["capacity_geometry_hash"] = capacity.capacity_geometry_hash(
             capacity.validated_capacity_geometry(geometry)
         )
     elif case == "layout":
-        body["physical"]["checkpoint_layout"]["oid"] += 1
+        body["capacity"]["checkpoint_layout"]["name"] = "other_checkpoint"
     else:
-        body["stages"][0]["oid"] = body["database"]["database_oid"]
+        body["stages"][0].update(body["initial"]["receipt"])
     with pytest.raises(RuntimeError, match="failed_profile_cleanup_" + reason):
         cleanup._validate_initial_request(dict(body, capacity_geometry=geometry))

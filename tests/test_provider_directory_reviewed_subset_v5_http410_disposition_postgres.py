@@ -283,7 +283,7 @@ async def test_v5_http410_guard_rollback_seal_replay_and_downgrade_fence(
 ):
     """Reject partial bypass, seal once, replay, and retain exact evidence."""
 
-    scenario = await create_committed_subset_schema(monkeypatch)
+    scenario = await create_committed_subset_schema(monkeypatch, owned_database=True)
     migration = _load_migration()
     migration._MARKER_SHA256 = SYNTHETIC_V5_MARKER_SHA256
     monkeypatch.setattr(
@@ -324,7 +324,7 @@ async def test_v5_http410_guard_rollback_seal_replay_and_downgrade_fence(
 async def test_v2_replay_survives_v3_upgrade_and_clean_downgrade(monkeypatch):
     """Keep one historical v2 root valid across the v3 round trip."""
 
-    scenario = await create_committed_subset_schema(monkeypatch)
+    scenario = await create_committed_subset_schema(monkeypatch, owned_database=True)
     migration = _load_migration(module_name="v5_http410_v2_round_trip")
     monkeypatch.setattr(
         v4_selection,

@@ -81,10 +81,8 @@ class RetainedFHIRInput:
     dataset_id: str
     dataset_sha256: str
     root_run_id: str
-    header_oid: int
-    resource_parent_oid: int
-    resource_leaf_oid: int
-    reader_role: str
+    header_relation: dict
+    resource_relation: dict
     metadata_bytes: int
     metadata_text_sha256: str
     summary_sha256: str
@@ -102,13 +100,15 @@ class RetainedFHIRInput:
     def __post_init__(self):
         """Validate the exact profile, metadata budget and retained publication coordinates."""
         _identifier(self.schema_name)
-        _identifier(self.reader_role)
         _identifier(self.preparation_schema)
         require(self.source_id != "cms-npd")
         for name, bound in (("source_id", 64), ("endpoint_id", 64), ("dataset_id", 96), ("root_run_id", 64)):
             text(getattr(self, name), bound)
-        for name in ("header_oid", "resource_parent_oid", "resource_leaf_oid"):
-            require(type(getattr(self, name)) is int and 0 < getattr(self, name) < 2**32)
+        for relation in (self.header_relation, self.resource_relation):
+            require(type(relation) is dict and set(relation) == {"schema", "name"})
+            _identifier(relation["schema"])
+            _identifier(relation["name"])
+        require(self.resource_relation["schema"] == self.schema_name)
         for name in ("dataset_sha256", "metadata_text_sha256", "summary_sha256", "proof_sha256"):
             require(is_sha256(getattr(self, name)))
         require(
@@ -129,61 +129,86 @@ class RetainedFHIRInput:
                 type(self.semantic_projection_as_of) is str
                 and date.fromisoformat(self.semantic_projection_as_of).isoformat() == self.semantic_projection_as_of
             )
-        require(type(self.resource_counts) is tuple and 0 < len(self.resource_counts) <= 64)
-        require(tuple(sorted(self.resource_counts)) == self.resource_counts)
-        require(
-            all(
-                type(name) is str and name and type(count) is int and count >= 0 for name, count in self.resource_counts
-            )
+        _validate_retained_resource_census(self)
+
+
+def _validate_retained_resource_census(origin):
+    """Require complete, ordered family counts and content hashes for the admission profile."""
+    require(type(origin.resource_counts) is tuple and 0 < len(origin.resource_counts) <= 64)
+    require(tuple(sorted(origin.resource_counts)) == origin.resource_counts)
+    require(
+        all(type(name) is str and name and type(count) is int and count >= 0 for name, count in origin.resource_counts)
+    )
+    require(
+        len(dict(origin.resource_counts)) == len(origin.resource_counts)
+        and sum(dict(origin.resource_counts).values()) > 0
+    )
+    require(
+        type(origin.resource_hashes) is tuple
+        and tuple(name for name, _ in origin.resource_hashes) == tuple(dict(origin.resource_counts))
+    )
+    require(all(is_sha256(family_hash) for _, family_hash in origin.resource_hashes))
+    require(
+        type(origin.descriptor_counts) is tuple
+        and tuple(name for name, _ in origin.descriptor_counts) == tuple(dict(origin.resource_counts))
+    )
+    require(
+        all(
+            type(count) is int and count >= dict(origin.resource_counts)[name]
+            for name, count in origin.descriptor_counts
         )
-        require(
-            len(dict(self.resource_counts)) == len(self.resource_counts)
-            and sum(dict(self.resource_counts).values()) > 0
-        )
-        require(
-            type(self.resource_hashes) is tuple
-            and tuple(name for name, _ in self.resource_hashes) == tuple(dict(self.resource_counts))
-        )
-        require(all(is_sha256(family_hash) for _, family_hash in self.resource_hashes))
-        require(
-            type(self.descriptor_counts) is tuple
-            and tuple(name for name, _ in self.descriptor_counts) == tuple(dict(self.resource_counts))
-        )
-        require(
-            all(
-                type(count) is int and count >= dict(self.resource_counts)[name]
-                for name, count in self.descriptor_counts
-            )
-        )
-        if self.admission_profile == LEGACY_PROFILE:
-            require(sum(count for _, count in self.descriptor_counts) > sum(dict(self.resource_counts).values()))
-        else:
-            require(self.descriptor_counts == self.resource_counts)
+    )
+    if origin.admission_profile == LEGACY_PROFILE:
+        require(sum(count for _, count in origin.descriptor_counts) > sum(dict(origin.resource_counts).values()))
+    else:
+        require(origin.descriptor_counts == origin.resource_counts)
 
 
 @dataclass(frozen=True)
 class RetainedFHIRCapture:
-    """Registry-only captured edition, complete content and native read-only custody."""
+    """Named captured edition with logical provenance and complete content accounting."""
 
     origin: RetainedFHIRInput
     capture_id: str
     schema_name: str
-    schema_oid: int
-    relation_oids: tuple[tuple[str, int], ...]
-    owner_role: str
-    runtime_roles: tuple[str, ...]
-    catalog_sha256: str
+    tables: dict
     content_sha256: str
     capture_sha256: str
+    contract: str = "retained-normalized-fhir-v2"
 
     @property
     def release_id(self):
-        """Name new capture evidence without inventing an original source release."""
+        """Return the logical release token used by this captured edition."""
         return "registry-capture:" + self.capture_id
 
     def as_dict(self):
-        """Return the exact bounded wire object."""
+        """Serialize the complete named capture using its canonical wire encoding."""
         return json.loads(canonical(asdict(self)))
+
+
+def retained_origin(value):
+    """Decode strict named provenance and the one supported historical layout."""
+    if type(value) is RetainedFHIRInput:
+        value.__post_init__()
+        return value
+    require(type(value) is dict)
+    fields = set(RetainedFHIRInput.__dataclass_fields__)
+    retired_fields = {"header_oid", "resource_parent_oid", "resource_leaf_oid", "reader_role"}
+    origin_by_field = dict(value)
+    if set(value) == fields - {"header_relation", "resource_relation"} | retired_fields:
+        origin_by_field = {key: field for key, field in value.items() if key not in retired_fields}
+        origin_by_field.update(
+            header_relation={"schema": origin_by_field["schema_name"], "name": TABLES[0]},
+            resource_relation={"schema": origin_by_field["schema_name"], "name": TABLES[1]},
+        )
+    require(set(origin_by_field) == fields)
+    for name in ("resource_counts", "resource_hashes", "descriptor_counts"):
+        require(
+            type(origin_by_field[name]) in {list, tuple}
+            and all(type(pair) in {list, tuple} and len(pair) == 2 for pair in origin_by_field[name])
+        )
+        origin_by_field[name] = tuple(tuple(pair) for pair in origin_by_field[name])
+    return RetainedFHIRInput(**origin_by_field)
 
 
 def capture_digest(capture):
@@ -194,50 +219,46 @@ def capture_digest(capture):
 
 
 def validate_capture(capture):
-    """Reject open, mixed or noncanonical capture coordinates before native reads."""
+    """Validate named content, retaining historical logical capture identifiers."""
     if type(capture) is dict:
-        require(set(capture) == set(RetainedFHIRCapture.__dataclass_fields__))
         capture_by_field = dict(capture)
-        origin_by_field = capture_by_field["origin"]
-        require(type(origin_by_field) is dict and set(origin_by_field) == set(RetainedFHIRInput.__dataclass_fields__))
-        origin_by_field = dict(origin_by_field)
-        for name in ("resource_counts", "resource_hashes", "descriptor_counts"):
-            require(
-                type(origin_by_field[name]) is list
-                and all(type(pair) is list and len(pair) == 2 for pair in origin_by_field[name])
+        legacy_fields = {
+            "origin",
+            "capture_id",
+            "schema_name",
+            "schema_oid",
+            "relation_oids",
+            "owner_role",
+            "runtime_roles",
+            "catalog_sha256",
+            "content_sha256",
+            "capture_sha256",
+        }
+        if set(capture_by_field) == legacy_fields:
+            capture_by_field = {
+                key: field_value
+                for key, field_value in capture_by_field.items()
+                if key in {"origin", "capture_id", "schema_name", "content_sha256", "capture_sha256"}
+            }
+            capture_by_field.update(
+                tables={name: {"schema": capture_by_field["schema_name"], "name": name} for name in TABLES},
+                contract="retained-normalized-fhir-v1",
             )
-            origin_by_field[name] = tuple(tuple(pair) for pair in origin_by_field[name])
-        capture_by_field["origin"] = RetainedFHIRInput(**origin_by_field)
-        require(
-            type(capture_by_field["relation_oids"]) is list
-            and all(type(pair) is list and len(pair) == 2 for pair in capture_by_field["relation_oids"])
-        )
-        capture_by_field["relation_oids"] = tuple(tuple(pair) for pair in capture_by_field["relation_oids"])
-        require(type(capture_by_field["runtime_roles"]) is list)
-        capture_by_field["runtime_roles"] = tuple(capture_by_field["runtime_roles"])
+        require(set(capture_by_field) == set(RetainedFHIRCapture.__dataclass_fields__))
+        capture_by_field["origin"] = retained_origin(capture_by_field["origin"])
         capture = RetainedFHIRCapture(**capture_by_field)
-    require(type(capture) is RetainedFHIRCapture and type(capture.origin) is RetainedFHIRInput)
+    require(type(capture) is RetainedFHIRCapture)
+    retained_origin(capture.origin)
     require(
         type(capture.capture_id) is str
         and str(UUID(capture.capture_id)) == capture.capture_id
         and UUID(capture.capture_id).int
     )
     require(capture.schema_name == "registry_fhir_capture_" + UUID(capture.capture_id).hex)
-    require(type(capture.schema_oid) is int and 0 < capture.schema_oid < 2**32)
-    _identifier(capture.owner_role)
-    require(type(capture.runtime_roles) is tuple and 0 < len(capture.runtime_roles) <= 32)
-    require(
-        tuple(sorted(set(capture.runtime_roles))) == capture.runtime_roles
-        and capture.owner_role not in capture.runtime_roles
-    )
-    for role in capture.runtime_roles:
-        _identifier(role)
-    require(
-        type(capture.relation_oids) is tuple
-        and tuple(name for name, _ in capture.relation_oids) == tuple(sorted(TABLES))
-    )
-    require(all(type(oid) is int and 0 < oid < 2**32 for _, oid in capture.relation_oids))
-    require(len(set(oid for _, oid in capture.relation_oids)) == len(TABLES))
-    require(all(is_sha256(getattr(capture, name)) for name in ("catalog_sha256", "content_sha256", "capture_sha256")))
-    require(capture.capture_sha256 == capture_digest(capture) and len(canonical(capture.as_dict()).encode()) <= 65536)
+    require(capture.tables == {name: {"schema": capture.schema_name, "name": name} for name in TABLES})
+    require(all(is_sha256(getattr(capture, name)) for name in ("content_sha256", "capture_sha256")))
+    require(capture.contract in {"retained-normalized-fhir-v1", "retained-normalized-fhir-v2"})
+    require(len(canonical(capture.as_dict()).encode()) <= 65536)
+    if capture.contract == "retained-normalized-fhir-v2":
+        require(capture.capture_sha256 == capture_digest(capture))
     return capture

@@ -511,6 +511,7 @@ async def source_transport(source_preparation, profile_transport, published_prof
     await _source_reviewed_payer(held)
     held.writer_statements.clear()
     held.calls, held.requests, held.source_sql, held.driver_proofs = [], [], [], []
+    held.has_ordered_source_validation = False
     held.prior = object()
     original_pin = serving_read.read_published_api_pin
     original_reader = managed._request_reader
@@ -543,6 +544,8 @@ async def source_transport(source_preparation, profile_transport, published_prof
 
     @event.listens_for(held.database._reader_database.engine.sync_engine, "after_cursor_execute")
     def observe_sql(connection, cursor, statement, parameters, context, executemany):
+        if "row_number() OVER" in statement and "EXCEPT" in statement:
+            held.has_ordered_source_validation = True
         if len(held.source_sql) < 5000:
             held.source_sql.append(statement)
 
@@ -698,7 +701,7 @@ async def test_native_managed_source_default_paging_and_public_facets(source_tra
     )
     assert any(source_item["status"] == "unresolved" and source_item["target_id"] is None for source_item in unproved)
     assert any("identity_count" in sql and "EXCEPT" in sql and "LIMIT" in sql for sql in held.source_sql)
-    assert any("row_number() OVER" in sql and "EXCEPT" in sql for sql in held.source_sql)
+    assert held.has_ordered_source_validation
 
 
 def _source_cursor_contents(document, generation, cursor):

@@ -13,7 +13,11 @@ from process import mrf_address_publication as address
 from process import reference_family_archive as archive
 from process import tiger_held_inputs as held
 from tests.test_reference_family_archive import _ownership
-from tests.test_reference_family_source_copy import _nucc_completed_handoff, _nucc_stage_receipt
+from tests.test_reference_family_source_copy import (
+    _nucc_completed_handoff,
+    _nucc_owning_transaction,
+    _nucc_stage_receipt,
+)
 
 
 def _session(*, rows=(), scalar=None):
@@ -93,25 +97,25 @@ async def test_nucc_aggregate_accepts_exact_inclusive_bounds(count, size):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("deferred", [False, True])
-@pytest.mark.parametrize("failure", [None, "missing", "catalog", "custody", "indexes", "replaced"])
-async def test_nucc_completion_fences_custody_before_indexes_and_rechecks_oid(monkeypatch, deferred, failure):
+@pytest.mark.parametrize("deferred", (False, True))
+@pytest.mark.parametrize("failure", (None, "missing", "catalog", "declaration", "columns", "indexes"))
+async def test_nucc_completion_locks_names_and_validates_columns_before_indexes_and_data(
+    monkeypatch, deferred, failure
+):
     receipt = _nucc_stage_receipt()
-    oid = receipt["stage"]["relation_oid"]
     model = SimpleNamespace(__tablename__=receipt["stage"]["table_name"])
+    if failure == "declaration":
+        receipt["schema_name"] = "other"
     events = []
-
-    async def relation_oid(*_args):
-        events.append("identity")
-        if failure == "missing":
-            return None
-        return oid + int(failure == "replaced" and events.count("identity") == 2)
-
-    async def custody(*_args):
-        events.append("custody")
+    session = _session()
+    session.scalar.side_effect = [failure != "catalog", failure != "indexes"]
+    monkeypatch.setattr(archive, "_relation_oid", AsyncMock(return_value=None if failure == "missing" else 42))
+    monkeypatch.setattr(archive, "_require_nucc_precreated_stage", AsyncMock())
 
     async def columns(*_args):
         events.append("columns")
+        if failure == "columns":
+            raise archive.ReferenceFamilyArchiveError("actual model column differs")
 
     async def indexes(*_args, **_kwargs):
         events.append("indexes")
@@ -120,18 +124,12 @@ async def test_nucc_completion_fences_custody_before_indexes_and_rechecks_oid(mo
         events.append("validate")
         return {"row_count": 3}
 
-    session = _session()
-    session.scalar.side_effect = [failure != "catalog", failure != "indexes"]
-    monkeypatch.setattr(archive, "_relation_oid", AsyncMock(side_effect=relation_oid))
-    monkeypatch.setattr(archive, "_require_nucc_precreated_stage", AsyncMock(side_effect=custody))
-    monkeypatch.setattr(archive, "_require_nucc_native_columns", AsyncMock(side_effect=columns))
+    monkeypatch.setattr(archive, "_require_nucc_native_columns", columns)
     indexer = AsyncMock(side_effect=indexes)
     monkeypatch.setattr(archive, "_create_model_indexes", indexer)
-    monkeypatch.setattr(archive, "_validate_nucc_table_set", AsyncMock(side_effect=validate))
-    if failure == "custody":
-        receipt["stage"]["relation_oid"] += 1
-    expected_failure = failure is not None and (failure != "custody" or deferred)
-    if expected_failure:
+    monkeypatch.setattr(archive, "_validate_nucc_table_set", validate)
+    failed = failure is not None and (failure != "declaration" or deferred)
+    if failed:
         with pytest.raises(archive.ReferenceFamilyArchiveError):
             await archive.prepare_nucc_native_publication_stage(
                 session, stage_model=model, schema_name="mrf", native_stage=receipt if deferred else None
@@ -139,28 +137,24 @@ async def test_nucc_completion_fences_custody_before_indexes_and_rechecks_oid(mo
     else:
         assert await archive.prepare_nucc_native_publication_stage(
             session, stage_model=model, schema_name="mrf", native_stage=receipt if deferred else None
-        ) == {"relation_oid": oid, "row_count": 3}
-    if failure == "missing":
-        session.execute.assert_not_awaited()
-    else:
-        assert "IN SHARE MODE NOWAIT" in str(session.execute.await_args_list[0].args[0])
-    if failure in {"missing", "catalog"} or (failure == "custody" and deferred):
+        ) == {"relation": ("mrf", model.__tablename__), "row_count": 3}
+    assert (
+        str(session.execute.await_args_list[0].args[0])
+        == f'LOCK TABLE ONLY "mrf"."{model.__tablename__}" IN SHARE MODE NOWAIT'
+    )
+    if failure in {"missing", "catalog", "columns"} or failure == "declaration" and deferred:
         indexer.assert_not_awaited()
         assert "validate" not in events
     else:
-        assert events.index("columns") < events.index("indexes") < events.index("validate")
+        assert events == ["columns", "indexes", "validate"]
         assert indexer.await_args.kwargs == ({"create_constraints": True} if deferred else {})
-    if session.scalar.await_args_list:
-        catalog = str(session.scalar.await_args_list[0].args[0])
-        assert "NOT EXISTS(SELECT 1 FROM pg_trigger" in catalog
-        assert "contype!='n'" in catalog if deferred else "conkey=ARRAY" in catalog
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("table", ["nucc_taxonomy", "other_candidate", "nucc_taxonomy_unsafe-name"])
 async def test_nucc_completion_refuses_foreign_names_without_catalog_reads(table):
     session = _session()
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="candidate identity"):
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="candidate name"):
         await archive.prepare_nucc_native_publication_stage(
             session, stage_model=SimpleNamespace(__tablename__=table), schema_name="candidate"
         )
@@ -169,6 +163,7 @@ async def test_nucc_completion_refuses_foreign_names_without_catalog_reads(table
 
 
 def _selected_family_view(monkeypatch, kind, failure):
+    """Build complete named selection and retain catalog, validation and failure ordering."""
     spec = archive.reference_family_spec("mrf", canonical=kind == "canonical")
     names = spec.archive_names if kind == "mrf" else spec.table_names
     inventory = _inventory(names)
@@ -187,7 +182,6 @@ def _selected_family_view(monkeypatch, kind, failure):
         return await original_execute(statement, *args)
 
     session.execute = AsyncMock(side_effect=execute)
-    monkeypatch.setattr(preparation, "_publisher_authority", AsyncMock(return_value=53))
 
     async def authenticate(_session):
         assert _session is session
@@ -197,7 +191,9 @@ def _selected_family_view(monkeypatch, kind, failure):
     async def check_catalog(_session, relations, owner):
         assert owner == 53
         assert {relation_entry["relation_name"] for relation_entry in relations} == set(names)
-        assert relations == sorted(relations, key=lambda relation_entry: relation_entry["relation_oid"])
+        assert relations == sorted(
+            relations, key=lambda relation_entry: (relation_entry["schema_name"], relation_entry["relation_name"])
+        )
         assert "LOCK TABLE" in events[-1]
         events.append("catalog")
         if failure == "catalog":
@@ -263,7 +259,6 @@ async def test_selected_family_view_holds_complete_heaps_and_never_masks_failure
 @pytest.mark.asyncio
 async def test_installed_mrf_requires_authenticating_callback_and_only_locks_archive(monkeypatch):
     session = _session()
-    monkeypatch.setattr(preparation, "_publisher_authority", AsyncMock(return_value=53))
     authenticate = AsyncMock(return_value=None)
     async with archive.selected_mrf_canonical_archive(
         session, schema_name="mrf", owner_oid=53, selected_relation={}, authenticate_inventory=authenticate
@@ -271,7 +266,7 @@ async def test_installed_mrf_requires_authenticating_callback_and_only_locks_arc
         assert view is None
     authenticate.assert_awaited_once_with(session)
     assert session.execute.await_count == 1
-    assert "IN SHARE MODE NOWAIT" in str(session.execute.await_args.args[0])
+    assert "IN ACCESS SHARE MODE NOWAIT" in str(session.execute.await_args.args[0])
     session.scalar.assert_not_awaited()
 
 
@@ -279,110 +274,111 @@ async def test_installed_mrf_requires_authenticating_callback_and_only_locks_arc
 @pytest.mark.parametrize(
     "change", ["missing", "extra", "duplicate_oid", "schema", "schema_oid", "owner", "schema_owner", "pin"]
 )
-def test_selected_family_refuses_incomplete_foreign_or_replaced_custody(kind, change):
+def test_selected_family_keeps_names_complete_and_old_coordinates_opaque(kind, change):
     names = archive.reference_family_spec("mrf").archive_names
     inventory = _inventory(names)
     relation = next(
-        row for row in inventory["relations"] if row["relation_name"] == archive.models.MRFAddress.__tablename__
+        entry for entry in inventory["relations"] if entry["relation_name"] == archive.models.MRFAddress.__tablename__
     )
     selected = _selected(relation)
     if change == "missing":
         inventory["relations"].pop()
     elif change == "extra":
-        inventory["relations"].append({**relation, "relation_name": "foreign_heap", "relation_oid": 999})
-    elif change == "duplicate_oid":
-        inventory["relations"][0]["relation_oid"] = inventory["relations"][1]["relation_oid"]
+        inventory["relations"].append({**relation, "relation_name": "foreign_heap"})
+    elif change == "schema":
+        inventory["relations"][0]["schema_name"] = "foreign"
     elif change == "pin":
-        selected["relfilenode"] += 1
+        selected["relfilenode"] = "opaque copied edition"
     else:
-        key = {"schema": "schema_name", "owner": "owner_oid", "schema_owner": "schema_owner_oid"}.get(change, change)
-        inventory["relations"][0][key] = "foreign" if change == "schema" else 999
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="custody|identity"):
-        if kind == "mrf":
-            archive._selected_mrf_relations(inventory, selected, 53)
-        else:
-            archive._selected_canonical_relations(inventory, selected, 53, names)
+        field = {"duplicate_oid": "relation_oid", "owner": "owner_oid", "schema_owner": "schema_owner_oid"}.get(
+            change, change
+        )
+        inventory["relations"][0][field] = "opaque copied edition"
+    operation = lambda: (
+        archive._selected_mrf_relations(inventory, selected, None)
+        if kind == "mrf"
+        else archive._selected_canonical_relations(inventory, selected, None, names)
+    )
+    if change in {"missing", "extra", "schema"}:
+        with pytest.raises(archive.ReferenceFamilyArchiveError, match="complete family|role identity"):
+            operation()
+    else:
+        actual = operation()
+        assert {entry["relation_name"] for entry in actual} == set(names)
+        assert all(
+            set(entry) == {"schema_name", "relation_name"} and entry["schema_name"] == "candidate" for entry in actual
+        )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", [None, "missing", "write_acl", "oid", "name", "schema", "file", "owner"])
-async def test_locked_catalog_rechecks_every_physical_field_and_closed_writes(change):
+async def test_locked_catalog_checks_named_shape_and_native_read_permissions(change):
     relations = _inventory(("first", "second"))["relations"]
-    observed_relations = [{**relation_entry, "closed": True} for relation_entry in relations]
-    if change == "missing":
-        observed_relations.pop()
-    elif change == "write_acl":
-        observed_relations[0]["closed"] = False
-    elif change:
-        key = {
-            "oid": "relation_oid",
-            "name": "relation_name",
-            "schema": "schema_oid",
-            "file": "relfilenode",
-            "owner": "owner_oid",
-        }[change]
-        observed_relations[0][key] = "foreign" if change == "name" else 999
-    session = _session(rows=observed_relations)
-    if change:
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="locked catalog"):
-            await archive._require_selected_mrf_catalog(session, relations, 53)
+    if change in {"oid", "file", "owner"}:
+        relations[0][{"oid": "relation_oid", "file": "relfilenode", "owner": "owner_oid"}[change]] = (
+            "opaque copied edition"
+        )
+    if change == "name":
+        relations[0]["relation_name"] = "missing"
+    if change == "schema":
+        relations[0]["schema_name"] = "foreign"
+    session = _session(scalar=change not in {"missing", "name", "schema"})
+    if change == "write_acl":
+        session.scalar.side_effect = PermissionError("native SELECT denied")
+    if change in {"missing", "name", "schema", "write_acl"}:
+        with pytest.raises(
+            (archive.ReferenceFamilyArchiveError, PermissionError), match="locked catalog|SELECT denied"
+        ):
+            await archive._require_selected_mrf_catalog(session, relations, None)
     else:
-        await archive._require_selected_mrf_catalog(session, relations, 53)
-    query, parameters = session.execute.await_args.args
-    assert parameters == {"oids": [100, 101], "owner_oid": 53}
-    for predicate in (
-        "NOT indisvalid",
-        "NOT indislive",
-        "NOT c.relispartition",
-        "'INSERT','UPDATE','DELETE'",
-        "pg_inherits",
-    ):
+        await archive._require_selected_mrf_catalog(session, relations, None)
+        assert session.scalar.await_count == 2
+    query, parameters = session.scalar.await_args_list[0].args
+    assert parameters == {"relation": f'"{relations[0]["schema_name"]}"."{relations[0]["relation_name"]}"'}
+    for predicate in ("NOT indisvalid", "NOT indislive", "NOT c.relispartition", "pg_inherits", "NOT c.relrowsecurity"):
         assert predicate in str(query)
+    assert "relowner" not in str(query) and "has_table_privilege" not in str(query)
+    session.execute.assert_not_awaited()
 
 
 def _captured_model():
-    inventory = _inventory(("first", "second"))
     identifier = "550e8400-e29b-41d4-a716-446655440000"
-    authority_by_field = {
-        "contract": "reference-family-source.v1",
-        "manifest": {"importer_id": "geo"},
-        "ownership": {
-            "dataset_id": identifier,
-            "schema_name": "candidate",
-            "schema_oid": 52,
-            "relation_oids": [
-                [relation_entry["relation_name"], relation_entry["relation_oid"]]
-                for relation_entry in inventory["relations"]
-            ],
-        },
-        "custody": {"catalog_sha256": held._digest([{"name": "first"}, {"name": "second"}])},
-    }
-    manifest_by_field = {
-        "producer_node_id": "synthetic",
-        "importer_id": "geo",
-        "dataset_key": "geo",
-        "contract_version": authority_by_field["contract"],
-        "adapter_metadata": {"family": authority_by_field["manifest"]},
-    }
-    registration_by_field = {
-        "generation_id": identifier,
-        "origin_kind": "captured",
-        "node_id": "synthetic",
-        "importer_id": "geo",
-        "dataset_key": "geo",
-        "validation_sha256": held._digest(authority_by_field),
-        "inventory": inventory,
-        "source_operation_id": identifier,
-        "source_capture": {"contract": "snapshot-captured-source.v1", "source_authority": authority_by_field},
-    }
-    return {
-        **registration_by_field,
-        "registration_sha256": held._digest(registration_by_field),
-        "selected_manifest": manifest_by_field,
-        "selected_package_id": held._digest(manifest_by_field),
-        "current_location_fence": None,
-        "state": "retained",
-    }
+    schema = "reference_family_archive_" + "a" * 32
+    inventory_by_field = {"relations": [dict(schema_name=schema, relation_name=name) for name in ("first", "second")]}
+    authority_by_field = dict(
+        contract="reference-family-source.v1",
+        manifest=dict(
+            importer_id="geo", tables=[dict(table_name=name, schema_sha256=name) for name in ("first", "second")]
+        ),
+        ownership=dict(
+            dataset_id=identifier,
+            schema_name=schema,
+            relations=[dict(schema_name=schema, relation_name=name) for name in ("first", "second")],
+        ),
+    )
+    manifest_by_field = dict(
+        producer_node_id="synthetic",
+        importer_id="geo",
+        dataset_key="geo",
+        contract_version=authority_by_field["contract"],
+        adapter_metadata=dict(family=authority_by_field["manifest"]),
+    )
+    return dict(
+        generation_id=identifier,
+        origin_kind="captured",
+        node_id="synthetic",
+        importer_id="geo",
+        dataset_key="geo",
+        validation_sha256="opaque old edition",
+        registration_sha256="opaque old edition",
+        inventory=inventory_by_field,
+        source_operation_id=identifier,
+        source_capture=dict(contract="snapshot-captured-source.v1", source_authority=authority_by_field),
+        selected_manifest=manifest_by_field,
+        selected_package_id=held._digest(manifest_by_field),
+        current_location_fence=None,
+        state="retained",
+    )
 
 
 @pytest.mark.asyncio
@@ -390,54 +386,40 @@ def _captured_model():
     "change",
     [None, "registration", "authority", "package", "database", "schema", "relation", "catalog", "fence", "state"],
 )
-async def test_captured_model_requires_registration_package_and_locked_physical_custody(monkeypatch, change):
+async def test_captured_model_validates_package_names_schema_and_retained_state(monkeypatch, change):
     capture_by_field = _captured_model()
-    if change in {"registration", "authority", "package"}:
-        capture_by_field[
-            {"registration": "registration_sha256", "authority": "validation_sha256", "package": "selected_package_id"}[
-                change
-            ]
-        ] = "a" * 64
+    if change in {"registration", "authority"}:
+        capture_by_field[{"registration": "registration_sha256", "authority": "validation_sha256"}[change]] = (
+            "different opaque edition"
+        )
+    if change == "package":
+        capture_by_field["selected_package_id"] = "a" * 64
+    if change == "database":
+        capture_by_field["inventory"]["database_oid"] = "opaque copied edition"
     if change == "fence":
-        capture_by_field["current_location_fence"] = {"relation_oid": 100}
+        capture_by_field["current_location_fence"] = {"opaque": "old"}
     if change == "state":
         capture_by_field["state"] = "current"
-    observed = deepcopy(capture_by_field["inventory"]["relations"])
-    if change == "relation":
-        observed[0]["relfilenode"] += 1
     if change == "schema":
-        capture_by_field["source_capture"]["source_authority"]["ownership"]["schema_oid"] += 1
-        capture_by_field["validation_sha256"] = held._digest(capture_by_field["source_capture"]["source_authority"])
-        capture_by_field["registration_sha256"] = held._digest(
-            {
-                key: capture_by_field[key]
-                for key in (
-                    "generation_id",
-                    "origin_kind",
-                    "node_id",
-                    "importer_id",
-                    "dataset_key",
-                    "validation_sha256",
-                    "inventory",
-                    "source_operation_id",
-                    "source_capture",
-                )
-            }
-        )
-    lock = AsyncMock(side_effect=observed)
-    identity = AsyncMock(side_effect=[{"name": "changed" if change == "catalog" else "first"}, {"name": "second"}])
+        capture_by_field["source_capture"]["source_authority"]["ownership"]["schema_name"] = "foreign"
+    if change == "relation":
+        capture_by_field["inventory"]["relations"][0]["relation_name"] = "other"
+    lock = AsyncMock(return_value={})
+    identity = AsyncMock(side_effect=["changed" if change == "catalog" else "first", "second"])
     monkeypatch.setattr(held, "_protected_relation", lock)
     monkeypatch.setattr(held, "_captured_schema_identity", identity)
-    session = _session(scalar=999 if change == "database" else 51)
-    if change:
+    session = _session()
+    failures = {"package", "schema", "relation", "catalog", "fence", "state"}
+    if change in failures:
         with pytest.raises(RuntimeError, match="protected TIGER input changed"):
-            await held._require_model_capture(session, capture_by_field, 53)
+            await held._require_model_capture(session, capture_by_field)
     else:
-        assert await held._require_model_capture(session, capture_by_field, 53) == capture_by_field["inventory"]
+        expected_by_field = {"relations": capture_by_field["inventory"]["relations"]}
+        assert await held._require_model_capture(session, capture_by_field) == expected_by_field
         assert lock.await_count == identity.await_count == 2
-        assert lock.await_args_list[0].args == (session, '"candidate"."first"')
-        assert lock.await_args_list[0].kwargs == {"expected_owner": 53}
-    if change in {"registration", "authority", "package", "database", "schema", "fence", "state"}:
+        assert lock.await_args_list[0].args == (session, '"reference_family_archive_' + "a" * 32 + '"."first"')
+        assert lock.await_args_list[0].kwargs == {}
+    if change in failures - {"catalog"}:
         lock.assert_not_awaited()
     session.execute.assert_not_awaited()
 
@@ -452,6 +434,7 @@ async def test_model_capture_reuses_the_correct_existing_schema_attester(monkeyp
     monkeypatch.setattr(npi_result_archive, "_npi_schema_identity", npi)
     monkeypatch.setattr(archive, "_family_schema_identity", family)
     relation = _inventory(("first",))["relations"][0]
+    monkeypatch.setattr(archive, "_relation_oid", AsyncMock(return_value=100))
     session = object()
     assert await held._captured_schema_identity(session, importer, relation) == (
         {"npi": True} if importer == "npi" else {"family": True}
@@ -465,6 +448,10 @@ async def test_model_capture_reuses_the_correct_existing_schema_attester(monkeyp
 
 
 def _nucc_cutover_fixture(monkeypatch, failure):
+    from dataclasses import replace
+
+    from process import provider_directory_generic_source_provision as provision
+
     handoff = _nucc_completed_handoff(_nucc_stage_receipt())
     incumbent = handoff["incumbent"]
     published = archive._nucc_result_authority(
@@ -476,48 +463,53 @@ def _nucc_cutover_fixture(monkeypatch, failure):
                 "origin_generation": 1,
                 "published_at": "2026-10-01T00:01:00Z",
             },
-            "relation_oids": [handoff["stage"]["relation_oid"] + int(failure == "generation")],
+            "relations": [{"schema_name": "mrf", "relation_name": "nucc_taxonomy"}],
         }
     )
-    session = _session(scalar="transaction-1")
+    if failure == "generation":
+        published = replace(published, relations=(("other", "nucc_taxonomy"),))
+    session = _nucc_owning_transaction(_session())
+    transaction = object()
+    session.get_transaction = lambda: transaction
+    session.nucc_events = []
     monkeypatch.setattr(archive, "require_nucc_native_handoff", AsyncMock(return_value=handoff))
-    monkeypatch.setattr(archive, "_nucc_native_publisher_owner", AsyncMock(return_value=53))
-    monkeypatch.setattr(archive, "_require_nucc_native_columns", AsyncMock())
     monkeypatch.setattr(
-        archive,
-        "_validate_nucc_table_set",
-        AsyncMock(
-            return_value={
-                "contract": "nucc-indexed-set.v1",
-                "row_count": 2 if failure == "count" else 1,
-                "csv_upper_bound": 64,
-            }
-        ),
+        archive, "model_family_roles", lambda: ("snapshot_owner", ("snapshot_owner", "publisher", "reader"))
     )
-    sealed = AsyncMock()
-    monkeypatch.setattr(archive, "_require_nucc_sealed_handoff", sealed)
+    monkeypatch.setattr(archive, "_native_model_copy_driver", AsyncMock(return_value="named-driver"))
+
+    async def freeze(*_args, **_kwargs):
+        session.nucc_events.append("freeze")
+
+    session.nucc_freeze = AsyncMock(side_effect=freeze)
+    monkeypatch.setattr(provision, "freeze_fhir_source_snapshot", session.nucc_freeze)
+
+    async def validate(*_args):
+        session.nucc_events.append("validate")
+        return {"contract": "nucc-indexed-set.v1", "row_count": 2 if failure == "count" else 1, "csv_upper_bound": 64}
+
+    monkeypatch.setattr(archive, "_validate_nucc_table_set", validate)
+    monkeypatch.setattr(archive, "_require_nucc_sealed_handoff", AsyncMock())
     monkeypatch.setattr(archive, "_relation_oid", AsyncMock(return_value=99 if failure == "predecessor" else None))
-    rename = AsyncMock()
+    rename, publish, finish = AsyncMock(), AsyncMock(return_value=published), AsyncMock()
     monkeypatch.setattr(archive, "rename_nucc_published_indexes", rename)
-    publish = AsyncMock(return_value=published)
-    finish = AsyncMock()
     monkeypatch.setattr(archive, "_publish_nucc_handoff_generation", publish)
     monkeypatch.setattr(archive, "_finish_nucc_native_attempt", finish)
     return handoff, session, rename, publish, finish
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "count", "unused", "reused", "transaction", "predecessor", "generation"])
-async def test_nucc_cutover_is_once_only_in_the_owning_transaction(monkeypatch, failure):
+@pytest.mark.parametrize("failure", (None, "count", "unused", "reused", "transaction", "predecessor", "generation"))
+async def test_nucc_cutover_runs_once_in_transaction_after_write_closure(monkeypatch, failure):
     handoff, session, rename, publish, finish = _nucc_cutover_fixture(monkeypatch, failure)
 
-    async def continuation(actual_session, prepared, cutover):
-        assert actual_session is session
-        assert prepared["handoff"] == handoff and prepared["sealed_owner_oid"] == 53
+    async def continuation(actual, prepared, cutover):
+        assert actual is session and prepared["handoff"] == handoff
+        assert set(prepared) == {"handoff", "validation", "validation_sha256"}
         if failure == "unused":
             return None
         if failure == "transaction":
-            session.scalar.return_value = "transaction-2"
+            session.get_transaction = lambda: object()
         receipt = await cutover()
         assert archive.validate_nucc_native_publication(receipt) == receipt
         if failure == "reused":
@@ -529,7 +521,17 @@ async def test_nucc_cutover_is_once_only_in_the_owning_transaction(monkeypatch, 
             await archive.complete_nucc_native_handoff(session, handoff, publication_continuation=continuation)
     else:
         receipt = await archive.complete_nucc_native_handoff(session, handoff, publication_continuation=continuation)
-        assert receipt["result_generation"]["relation_oids"] == [handoff["stage"]["relation_oid"]]
+        assert receipt["result_generation"]["relations"] == [{"schema_name": "mrf", "relation_name": "nucc_taxonomy"}]
+    assert session.nucc_events == ["freeze", "validate"]
+    session.nucc_freeze.assert_awaited_once_with(
+        "named-driver",
+        "mrf",
+        namespace_owner="snapshot_owner",
+        reader_roles=("snapshot_owner", "publisher", "reader"),
+        application_roles=(),
+        relation_names=(handoff["stage"]["table_name"],),
+        freeze_schema=False,
+    )
     if failure in {"count", "unused", "transaction", "predecessor"}:
         session.execute.assert_not_awaited()
         publish.assert_not_awaited()
@@ -540,15 +542,13 @@ async def test_nucc_cutover_is_once_only_in_the_owning_transaction(monkeypatch, 
             str(session.execute.await_args.args[0])
             == f'ALTER TABLE "mrf"."{handoff["stage"]["table_name"]}" RENAME TO nucc_taxonomy'
         )
-        rename.assert_awaited_once_with(
-            session, schema_name="mrf", expected_relation_oid=handoff["stage"]["relation_oid"]
-        )
+        rename.assert_awaited_once_with(session, schema_name="mrf")
         assert finish.await_count == int(failure != "generation")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", [None, "run", "publisher", "heap", "marker"])
-async def test_sealed_handoff_rechecks_owner_transition_and_original_marker(monkeypatch, change):
+@pytest.mark.parametrize("change", (None, "run", "phase", "heap", "index-definition"))
+async def test_completed_handoff_rechecks_persisted_run_and_named_native_layout(monkeypatch, change):
     handoff = _nucc_completed_handoff(_nucc_stage_receipt())
     run_by_field = {
         "metrics": {"nucc_handoff": handoff},
@@ -557,153 +557,159 @@ async def test_sealed_handoff_rechecks_owner_transition_and_original_marker(monk
     }
     if change == "run":
         run_by_field["finished_at"] = "closed"
+    if change == "phase":
+        run_by_field["phase_detail"] = "other"
+    observed = deepcopy(handoff["stage"])
+    if change == "heap":
+        observed["table_name"] = "other"
+    if change == "index-definition":
+        observed["indexes"][0]["definition"] = "other definition"
     monkeypatch.setattr(archive, "_nucc_locked_attempt", AsyncMock(return_value=run_by_field))
     monkeypatch.setattr(archive, "_require_nucc_native_location", AsyncMock())
-    monkeypatch.setattr(
-        archive, "_nucc_native_publisher_owner", AsyncMock(return_value=999 if change == "publisher" else 53)
-    )
-    heap_by_field = {
-        **handoff["stage"],
-        "owner_oid": 53,
-        "relfilenode": 999 if change == "heap" else handoff["stage"]["relfilenode"],
-    }
-    observed = AsyncMock(return_value=heap_by_field)
-    monkeypatch.setattr(archive, "_nucc_native_stage", observed)
-    marker_by_field = {key: handoff[key] for key in ("contract", "run_id", "attempt_id", "handoff_sha256")}
-    session = _session(scalar=None if change == "marker" else json.dumps(marker_by_field))
+    leaf = AsyncMock(return_value=observed)
+    monkeypatch.setattr(archive, "_nucc_native_stage", leaf)
+    session = _session()
     if change:
         with pytest.raises(archive.ReferenceFamilyArchiveError):
-            await archive._require_nucc_sealed_handoff(session, handoff, 53)
+            await archive._require_nucc_sealed_handoff(session, handoff)
     else:
-        await archive._require_nucc_sealed_handoff(session, handoff, 53)
-        assert session.scalar.await_args.args[1] == {"oid": handoff["stage"]["relation_oid"]}
-    if change in {"run", "publisher"}:
-        observed.assert_not_awaited()
-    session.execute.assert_not_awaited()
+        await archive._require_nucc_sealed_handoff(session, handoff)
+    assert leaf.await_count == int(change not in {"run", "phase"})
+    session.scalar.assert_not_awaited()
 
 
 def _retained_inventory():
-    inventory = _inventory(("nucc_taxonomy",))
-    inventory["relations"][0]["schema_name"] = archive._PREDECESSOR_PREFIX + "1" * 32
-    return inventory
+    return {"relations": [{"schema_name": archive._PREDECESSOR_PREFIX + "1" * 32, "relation_name": "nucc_taxonomy"}]}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "referenced", "late_reference", "transaction", "physical", "foreign_owner"])
-async def test_retained_nucc_cleanup_rechecks_references_and_custody_before_restrict_drop(monkeypatch, failure):
+@pytest.mark.parametrize("failure", (None, "referenced", "late_reference", "transaction", "layout"))
+async def test_retained_nucc_cleanup_keeps_named_scope_references_layout_and_restrictive_drop(monkeypatch, failure):
     inventory = _retained_inventory()
     schema = inventory["relations"][0]["schema_name"]
-    if failure == "foreign_owner":
-        inventory["relations"][0]["owner_oid"] = 999
-    session = _session()
-    transactions = iter(["transaction-1", "transaction-2" if failure == "transaction" else "transaction-1"])
+    session = _nucc_owning_transaction(_session())
+    session.first = AsyncMock(
+        return_value=dict(
+            importer_id="nucc",
+            local_lineage_id="11111111-1111-4111-8111-111111111111",
+            local_generation=0,
+            origin_lineage_id=None,
+            origin_generation=None,
+            published_at=None,
+            serving_schema=None,
+            serving_relation_names=None,
+        )
+    )
+    token = object()
+    current_entries = [token]
+    session.get_transaction = lambda: current_entries[0]
 
     async def scalar(statement, *_args):
-        query = str(statement)
-        if query == "SHOW search_path":
-            return "synthetic"
-        if "pg_current_xact_id" in query:
-            return next(transactions)
-        return failure != "physical"
+        return "synthetic" if str(statement) == "SHOW search_path" else failure != "layout"
 
     session.scalar.side_effect = scalar
-    monkeypatch.setattr(archive, "_nucc_native_publisher_owner", AsyncMock(return_value=53))
-    columns = AsyncMock()
-    monkeypatch.setattr(archive, "_require_nucc_native_columns", columns)
-    unreferenced = AsyncMock(side_effect=[failure != "referenced", failure != "late_reference"])
+    leaf = AsyncMock()
+    monkeypatch.setattr(archive, "_nucc_native_stage", leaf)
+    calls = []
+
+    async def is_unreferenced(*_args):
+        calls.append(1)
+        if failure == "transaction" and len(calls) == 2:
+            current_entries[0] = object()
+        return not (failure == "referenced" or failure == "late_reference" and len(calls) == 2)
+
     if failure:
         with pytest.raises(archive.ReferenceFamilyArchiveError):
             await archive.cleanup_nucc_retained_publication(
-                session, inventory=inventory, assert_unreferenced=unreferenced
+                session, inventory=inventory, assert_unreferenced=is_unreferenced
             )
     else:
         assert await archive.cleanup_nucc_retained_publication(
-            session, inventory=inventory, assert_unreferenced=unreferenced
-        ) == {
-            "inventory_sha256": archive.nucc_native_digest(inventory),
-            "removed_schema_oid": 52,
-        }
-    queries = [str(call.args[0]) for call in session.execute.await_args_list]
-    drops = [query for query in queries if query.startswith("DROP")]
-    assert drops == (
+            session, inventory=inventory, assert_unreferenced=is_unreferenced
+        ) == {"inventory_sha256": archive.nucc_native_digest(inventory), "removed_schema": schema}
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert [sql for sql in statements if sql.startswith("DROP")] == (
         [] if failure else [f'DROP TABLE "{schema}"."nucc_taxonomy" RESTRICT', f'DROP SCHEMA "{schema}" RESTRICT']
     )
-    assert queries[0] == "SET LOCAL search_path=pg_catalog,pg_temp"
-    assert queries[-1] == "SELECT set_config('search_path',:path,true)"
-    assert session.execute.await_args.args[1] == {"path": "synthetic"}
-    assert unreferenced.await_count == (1 if failure in {"referenced", "physical", "foreign_owner"} else 2)
-    if failure in {"referenced", "physical", "foreign_owner"}:
-        columns.assert_not_awaited()
-    else:
-        columns.assert_awaited_once_with(session, 100)
+    assert statements[-1] == "SELECT set_config('search_path',:path,true)"
+    assert len(calls) == (1 if failure in {"referenced", "layout"} else 2)
+    assert leaf.await_count == int(failure not in {"referenced", "layout"})
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "protected", "replaced", "claimed", "uncertain", "empty"])
+@pytest.mark.parametrize("failure", [None, "protected", "lookup", "claimed", "uncertain", "empty"])
 async def test_legacy_nucc_rotation_cannot_erase_any_protected_ledger_claim(monkeypatch, failure):
     from process import nucc_retention_read_view as claims
 
     session = _session()
     monkeypatch.setattr(archive, "is_nucc_native_handoff_required", AsyncMock(return_value=failure == "protected"))
-    oids = [None, None] if failure == "empty" else [100, 999 if failure == "replaced" else 100, None]
-    monkeypatch.setattr(archive, "_relation_oid", AsyncMock(side_effect=oids))
+    session.scalar.side_effect = (
+        [False, False] if failure == "empty" else [None if failure == "lookup" else True, False]
+    )
     check = AsyncMock(
         side_effect=claims.NuccRetentionReadError("protected claim exists or is uncertain")
         if failure in {"claimed", "uncertain"}
         else None
     )
-    monkeypatch.setattr(claims, "require_unretained_nucc_oids", check)
-    if failure in {"protected", "replaced", "claimed", "uncertain"}:
+    monkeypatch.setattr(claims, "require_unretained_nucc_relations", check)
+    if failure in {"protected", "lookup", "claimed", "uncertain"}:
         with pytest.raises(archive.ReferenceFamilyArchiveError):
             await archive.require_nucc_unretained_rotation(session, schema_name="mrf")
     else:
         await archive.require_nucc_unretained_rotation(session, schema_name="mrf")
-    if failure in {"protected", "empty"}:
+    if failure in {"protected", "empty", "lookup"}:
         session.execute.assert_not_awaited()
+    if failure == "protected":
         session.scalar.assert_not_awaited()
-    else:
+    if failure not in {"protected", "empty", "lookup"}:
         assert (
             str(session.execute.await_args.args[0])
-            == 'LOCK TABLE ONLY "mrf"."nucc_taxonomy" IN ACCESS EXCLUSIVE MODE NOWAIT'
+            == 'LOCK TABLE ONLY "mrf"."nucc_taxonomy" IN ACCESS SHARE MODE NOWAIT'
         )
         assert all("DROP" not in str(call.args[0]) for call in session.execute.await_args_list)
-    if failure in {"protected", "empty", "replaced"}:
+    if failure in {"protected", "empty", "lookup"}:
         check.assert_not_awaited()
     else:
-        check.assert_awaited_once_with(session, [100])
+        check.assert_awaited_once_with(session, schema_name="mrf", relation_names=["nucc_taxonomy"])
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [None, "publisher", "schema", "replaced", "nonempty", "closure"])
-async def test_model_sealing_checks_each_heap_and_revokes_schema_create_before_attesting(monkeypatch, failure):
-    from process.ptg_parts import ptg2_physical_binding as binding
+async def test_model_sealing_validates_named_inventory_before_configured_dcl(monkeypatch, failure):
+    from process import provider_directory_generic_source_provision as provision
 
     ownership = _ownership(relation_oids=(("first", 100), ("second", 101)))
-    session = _session(rows=["PUBLIC", '"synthetic_reader"'])
-    session.scalar.side_effect = [999 if failure == "schema" else 53, failure == "nonempty", False]
-    monkeypatch.setattr(
-        archive, "protected_publisher_owner", AsyncMock(return_value=999 if failure == "publisher" else 53)
+    session = _session(scalar=failure == "nonempty")
+    roles = SimpleNamespace(
+        owner_role="bad-role" if failure == "publisher" else "snapshot_owner",
+        publisher_role="publisher",
+        runtime_roles=("reader",),
     )
-    monkeypatch.setattr(archive, "_relation_oid", AsyncMock(side_effect=[999 if failure == "replaced" else 100, 101]))
-    seal = AsyncMock()
-    closed = AsyncMock(side_effect=RuntimeError("closure changed") if failure == "closure" else None)
-    monkeypatch.setattr(preparation, "_seal_published_relation", seal)
-    monkeypatch.setattr(binding, "_require_closed_local_custody", closed)
+    monkeypatch.setattr(archive, "_relation_oid", AsyncMock(side_effect=[None if failure == "replaced" else 100, 101]))
+    monkeypatch.setattr(archive, "_schema_oid", AsyncMock(return_value=52))
+    monkeypatch.setattr(archive, "_owned_sequences", AsyncMock(return_value=()))
+    namespace_relations = [dict(oid=100, relkind="v" if failure == "schema" else "r"), dict(oid=101, relkind="r")]
+    monkeypatch.setattr(archive, "_namespace_relations", AsyncMock(return_value=namespace_relations))
+    driver = SimpleNamespace(execute=AsyncMock())
+    monkeypatch.setattr(archive, "_native_model_copy_driver", AsyncMock(return_value=driver))
+    freeze = AsyncMock(side_effect=RuntimeError("native DCL denied") if failure == "closure" else None)
+    monkeypatch.setattr(provision, "freeze_fhir_source_snapshot", freeze)
     if failure:
-        with pytest.raises(RuntimeError):
-            await archive.seal_model_family_storage(session, ownership, 53, require_empty=True)
+        with pytest.raises((archive.ReferenceFamilyArchiveError, RuntimeError)):
+            await archive.seal_model_family_storage(session, ownership, require_empty=True, roles=roles)
     else:
-        await archive.seal_model_family_storage(session, ownership, 53, require_empty=True)
+        await archive.seal_model_family_storage(session, ownership, require_empty=True, roles=roles)
     if failure in {"publisher", "schema", "replaced", "nonempty"}:
-        seal.assert_not_awaited()
-        closed.assert_not_awaited()
-        session.execute.assert_not_awaited()
+        freeze.assert_not_awaited()
+        driver.execute.assert_not_awaited()
     else:
-        assert [call.args for call in seal.await_args_list] == [(session, 100, 53), (session, 101, 53)]
-        statements = [str(call.args[0]) for call in session.execute.await_args_list]
-        assert statements[1:] == [
-            f'REVOKE CREATE ON SCHEMA "{ownership.schema_name}" FROM PUBLIC',
-            f'REVOKE CREATE ON SCHEMA "{ownership.schema_name}" FROM "synthetic_reader"',
-        ]
-        closed.assert_awaited_once_with(session, ownership, 53)
-        assert "a.grantee<>:owner" in statements[0] and "a.privilege_type='CREATE'" in statements[0]
+        driver.execute.assert_awaited_once_with(f'ALTER SCHEMA "{ownership.schema_name}" OWNER TO "snapshot_owner"')
+        freeze.assert_awaited_once_with(
+            driver,
+            ownership.schema_name,
+            namespace_owner="snapshot_owner",
+            reader_roles=("snapshot_owner", "publisher", "reader"),
+            application_roles=(),
+            relation_names=None,
+            freeze_schema=True,
+        )

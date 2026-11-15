@@ -1,266 +1,228 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Opt-in billing pins keep cursor bytes and guard subsequent canonical reads.
-
-Protocol doubles establish physical-identity wiring, not native Source authority.
-"""
+"""API billing cursors use logical publication generations and named relations."""
 
 import asyncio
+import dataclasses
+import hashlib
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import asyncpg
 import pytest
-from sanic.exceptions import ServiceUnavailable
+from sqlalchemy.exc import DBAPIError
 
 from api import billing_search_pagination as pagination
-from api import network_read_execution as execution
-from process import network_read_identity as identity
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 from tests import test_billing_search_pagination as fixture
 
-
-class _Result:
-    def __init__(self, session, rows, *, payload=False):
-        self.session, self.rows, self.payload = session, rows, payload
-        self.before_guard, self.closed = session.guards, False
-
-    def all(self):
-        if self.payload:
-            assert self.session.guards > self.before_guard
-        return self.rows
-
-    def close(self):
-        self.closed = True
+_SNAPSHOT_NAMES = ["mrf.entity_address_evidence", "mrf.entity_address_unified"]
 
 
-class _Driver:
-    def __init__(self, session):
-        self.session, self.pid, self.active = session, 42, True
-        self.modes = ("repeatable read", "on")
-        self.after_guard = None
-
-    def get_server_pid(self):
-        return self.pid
-
-    def is_in_transaction(self):
-        return self.active
-
-    async def fetchrow(self, query, *arguments):
-        if "current_setting('transaction_isolation')" in query:
-            return self.modes
-        assert query == identity._BOUND_NAMES_SQL
-        names, oids, pid = arguments
-        self.session.guards += 1
-        receipt_by_field = {
-            "backend_matches": self.pid == pid,
-            "relation_count": len(names),
-            "valid": all(self.session.current.get(name) == oid for name, oid in zip(names, oids)),
-        }
-        if self.after_guard:
-            self.after_guard()
-        return receipt_by_field
+def _session(*, generation=1, modes=("repeatable read", "on"), snapshot_names=_SNAPSHOT_NAMES):
+    """Reuse names pinned before the request's first data snapshot."""
+    transaction = object()
+    return SimpleNamespace(
+        get_transaction=lambda: transaction,
+        in_transaction=lambda: True,
+        info={"provider_profile_relations": {name: name for name in snapshot_names}},
+        execute=AsyncMock(
+            side_effect=[
+                SimpleNamespace(one=lambda: modes),
+                SimpleNamespace(one_or_none=lambda: ("11111111-1111-4111-8111-111111111111", generation)),
+            ]
+        ),
+    )
 
 
-class _Session:
-    def __init__(self, schema="mrf", address_oid=1001, evidence_oid=1002):
-        self.info, self.transaction, self.guards = {}, object(), 0
-        self.driver = _Driver(self)
-        self.rows = [("entity_address_evidence", evidence_oid), ("entity_address_unified", address_oid)]
-        self.current = {f'"{schema}"."{name}"': oid for name, oid in self.rows}
-        self.statements, self.results = [], []
-        self.after_catalog = self.after_payload = None
-        self.kind, self.persistence = "r", "p"
-        self.has_inheritance = self.is_partition = False
+async def test_api_pin_matches_named_logical_generation_bundle():
+    session = _session()
+    pin = await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=True)
+    assert pin == fixture._pin()
+    statements = [str(call.args[0]) for call in session.execute.await_args_list]
+    assert len(statements) == 2 and statements[1].startswith("SELECT origin_lineage_id")
+    assert "pg_catalog" not in "".join(statements)
+    assert set(dataclasses.asdict(pin)) == {
+        "snapshot_set_sha256",
+        "generation_bundle_sha256",
+        "address_relation_name",
+        "address_evidence_relation_name",
+    }
 
-    def in_transaction(self):
-        return self.driver.active
 
-    def get_transaction(self):
-        return self.transaction
+async def test_changed_logical_publication_expires_the_previous_bundle():
+    first = await pagination.capture_billing_search_generation_pin(_session(), fixture._selection(), api_read=True)
+    second = await pagination.capture_billing_search_generation_pin(
+        _session(generation=2), fixture._selection(), api_read=True
+    )
+    assert first.snapshot_set_sha256 == second.snapshot_set_sha256
+    assert first.generation_bundle_sha256 != second.generation_bundle_sha256
 
-    async def connection(self):
-        return SimpleNamespace(
-            get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=self.driver))
+
+@pytest.mark.parametrize("modes", [("read committed", "on"), ("repeatable read", "off")])
+async def test_api_pin_requires_read_only_repeatable_transaction(modes):
+    with pytest.raises(PTG2ManifestArtifactError):
+        await pagination.capture_billing_search_generation_pin(
+            _session(modes=modes), fixture._selection(), api_read=True
         )
 
-    async def execute(self, statement, parameters=None):
+
+async def test_cancellation_reaches_the_transaction_owner():
+    failure = asyncio.CancelledError()
+    session = _session()
+    session.execute.side_effect = failure
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=True)
+    assert caught.value is failure
+
+
+async def test_generation_metadata_sql_failure_uses_the_normal_unavailable_error():
+    session = _session()
+    failure = DBAPIError(None, None, RuntimeError("missing metadata"))
+    session.execute.side_effect = failure
+    with pytest.raises(PTG2ManifestArtifactError) as caught:
+        await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=True)
+    assert caught.value.__cause__ is failure
+
+
+def _legacy_session(
+    *,
+    local_generation=0,
+    lineage="11111111-1111-4111-8111-111111111111",
+    origin=(None, None),
+    modes=("repeatable read", "on"),
+):
+    session = _session()
+
+    async def execute(statement, parameters=None):
         sql = str(statement)
-        self.statements.append(sql)
-        assert "LOCK TABLE" not in sql and "pg_advisory" not in sql and "WHERE false" not in sql
-        if "pg_catalog.pg_class" in sql:
-            assert "c.relkind='r'" in sql
-            assert "c.relpersistence IN ('p','u')" in sql and "NOT c.relispartition" in sql
-            assert "pg_catalog.pg_inherits" in sql and "i.inhrelid=c.oid OR i.inhparent=c.oid" in sql
-            assert parameters["names"] == list(pagination._ADDRESS_TABLES)
-            is_direct_heap = (
-                self.kind == "r"
-                and self.persistence in {"p", "u"}
-                and not self.has_inheritance
-                and not self.is_partition
-            )
-            result = _Result(self, self.rows if is_direct_heap else [])
-            if self.after_catalog:
-                self.after_catalog()
-        else:
-            result = _Result(self, [("billing payload",)], payload=True)
-            if self.after_payload:
-                self.after_payload()
-        self.results.append(result)
-        return result
+        if "current_setting" in sql:
+            return SimpleNamespace(one=lambda: modes)
+        if "SELECT origin_lineage_id" in sql:
+            return SimpleNamespace(one_or_none=lambda: origin)
+        if "SELECT local_lineage_id" in sql:
+            return SimpleNamespace(one_or_none=lambda: (lineage, local_generation))
+        raise AssertionError(sql)
+
+    session.execute.side_effect = execute
+    return session
 
 
-@pytest.mark.parametrize("schema", ["mrf", "billing_fixture"])
-@pytest.mark.parametrize("selected", [False, True])
-@pytest.mark.parametrize("source_pinned", [False, True])
-async def test_api_pin_and_sealed_cursor_bytes_match_the_original_path(monkeypatch, schema, selected, source_pinned):
-    monkeypatch.setattr(pagination.ptg2_serving, "PTG2_SCHEMA", schema)
-    monkeypatch.setattr(fixture.cursor.secrets, "token_bytes", lambda size: b"n" * size)
-    selection = fixture.source_pinned_selection() if source_pinned else fixture._selection()
-    options = {"contributing_bindings": selection.in_network_bindings} if selected else {}
-    legacy = AsyncMock()
-    legacy.scalar.return_value = (1001, 1002)
-    expected = await pagination.capture_billing_search_generation_pin(legacy, selection, **options)
-    session = _Session(schema)
-    actual = await pagination.capture_billing_search_generation_pin(session, selection, api_read=True, **options)
-    assert actual == expected
-    inventory = execution._installed_read_inventory(session)
-    assert {(pin.schema_name, pin.table_name, pin.table_oid) for pin in inventory.relations} == {
-        (schema, "entity_address_unified", 1001),
-        (schema, "entity_address_evidence", 1002),
-    }
-    assert inventory.connection is session.driver and inventory.backend_pid == 42
-    old_binding, new_binding = fixture._cursor_binding(pin=expected), fixture._cursor_binding(pin=actual)
-    assert old_binding == new_binding
-    sort_key = (0, 1.25, 0, fixture.SNAPSHOT_ID, 1396271656, "address-key")
-    old_cursor = pagination.seal_billing_search_page_cursor(sort_key, keyring=fixture.KEYRING, binding=old_binding)
-    new_cursor = pagination.seal_billing_search_page_cursor(sort_key, keyring=fixture.KEYRING, binding=new_binding)
-    assert fixture._wire_token(old_cursor, old_binding) == fixture._wire_token(new_cursor, new_binding)
+@pytest.mark.parametrize("api_read", [False, True])
+async def test_legacy_adoption_serves_first_page_with_pinned_names_and_local_edition(api_read):
+    session = _legacy_session()
+    pin = await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=api_read)
+    request = fixture._request()
+    binding = fixture._cursor_binding(request=request, pin=pin)
+    assert pagination.open_billing_search_page_cursor(request, keyring=fixture.KEYRING, binding=binding) is None
+    assert pin.address_relation_name == "mrf.entity_address_unified"
+    assert pin.address_evidence_relation_name == "mrf.entity_address_evidence"
+    assert len(session.execute.await_args_list) == 3
+    assert all(str(call.args[0]).startswith("SELECT ") for call in session.execute.await_args_list)
 
 
-@pytest.mark.parametrize("invalid", [None, 0, 1, "true", []])
-async def test_read_mode_requires_an_explicit_boolean(invalid):
-    with pytest.raises(PTG2ManifestArtifactError):
-        await pagination.capture_billing_search_generation_pin(object(), fixture._selection(), api_read=invalid)
-
-
-@pytest.mark.parametrize("modes", [("read committed", "on"), ("repeatable read", "off"), ("serializable", "off"), None])
-async def test_api_capture_requires_a_native_read_only_snapshot(modes):
-    session = _Session()
-    session.driver.modes = modes
-    with pytest.raises(PTG2ManifestArtifactError):
-        await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=True)
-    assert session.statements == [] and session.info == {}
-
-
-async def test_serializable_read_only_snapshot_is_supported():
-    session = _Session()
-    session.driver.modes = ("serializable", "on")
-    assert (
-        await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=True)
-        == fixture._pin()
+@pytest.mark.parametrize("change", ["successor", "lineage", "origin"])
+async def test_legacy_cursor_refuses_another_logical_edition(change):
+    previous = await pagination.capture_billing_search_generation_pin(_legacy_session(), fixture._selection())
+    previous_binding = fixture._cursor_binding(pin=previous)
+    sealed = pagination.seal_billing_search_page_cursor((1,), keyring=fixture.KEYRING, binding=previous_binding)
+    request = fixture._request(cursor=fixture._wire_token(sealed, previous_binding))
+    replacement = (
+        _legacy_session(local_generation=1)
+        if change == "successor"
+        else _legacy_session(lineage="22222222-2222-4222-8222-222222222222")
+        if change == "lineage"
+        else _session()
     )
+    current = await pagination.capture_billing_search_generation_pin(replacement, fixture._selection(), api_read=True)
+    assert current.snapshot_set_sha256 == previous.snapshot_set_sha256
+    assert current.generation_bundle_sha256 != previous.generation_bundle_sha256
+    with pytest.raises(fixture.cursor.BillingSearchCursorError):
+        pagination.open_billing_search_page_cursor(
+            request, keyring=fixture.KEYRING, binding=fixture._cursor_binding(request=request, pin=current)
+        )
 
 
-@pytest.mark.parametrize("missing", [False, True])
-async def test_the_complete_exact_address_pair_is_required(missing):
-    session = _Session()
-    if missing:
-        session.rows.pop()
-    else:
-        session.rows[0] = ("other_evidence", 1002)
+@pytest.mark.parametrize("generation", [None, -1, True, 2**63])
+async def test_legacy_pin_refuses_invalid_local_edition(generation):
+    with pytest.raises(PTG2ManifestArtifactError):
+        await pagination.capture_billing_search_generation_pin(
+            _legacy_session(local_generation=generation), fixture._selection()
+        )
+
+
+@pytest.mark.parametrize("origin", [(None, 1), ("11111111-1111-4111-8111-111111111111", None)])
+async def test_partial_source_origin_cannot_be_reinterpreted_as_legacy(origin):
+    session = _legacy_session(origin=origin)
+    with pytest.raises(PTG2ManifestArtifactError):
+        await pagination.capture_billing_search_generation_pin(session, fixture._selection())
+    assert session.execute.await_count == 1
+
+
+async def test_legacy_pin_requires_snapshot_even_without_explicit_api_option():
+    with pytest.raises(PTG2ManifestArtifactError):
+        await pagination.capture_billing_search_generation_pin(
+            _legacy_session(modes=("read committed", "on")), fixture._selection()
+        )
+
+
+async def test_legacy_named_read_refusal_remains_unavailable(monkeypatch):
+    from api import provider_profile_snapshot
+
+    session = _legacy_session()
+    failure = DBAPIError(None, None, RuntimeError("read refused"))
+    monkeypatch.setattr(provider_profile_snapshot, "_prepare_provider_reader", AsyncMock(side_effect=failure))
+    with pytest.raises(PTG2ManifestArtifactError) as caught:
+        await pagination.capture_billing_search_generation_pin(session, fixture._selection())
+    assert caught.value.__cause__ is failure
+
+
+async def test_cutover_after_snapshot_start_fails_before_any_address_read():
+    session = _session(snapshot_names=["mrf.entity_address_evidence", "mrf.entity_address_unified_stage"])
     with pytest.raises(PTG2ManifestArtifactError):
         await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=True)
-    assert session.info == {}
+    assert session.execute.await_count == 1
 
 
-@pytest.mark.parametrize("kind", ["v", "m", "f", "p"])
-async def test_only_ordinary_address_heaps_can_be_pinned(kind):
-    session = _Session()
-    session.kind = kind
+async def test_unprepared_borrowed_snapshot_is_refused_before_generation_read():
+    session = _session()
+    session.info.clear()
     with pytest.raises(PTG2ManifestArtifactError):
         await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=True)
-    assert session.info == {}
+    assert session.execute.await_count == 1
 
 
-@pytest.mark.parametrize("shape", ["inherited-parent", "inherited-child", "partition-leaf", "temporary"])
-async def test_catalog_topology_cannot_add_unlisted_payload_heaps(shape):
-    session = _Session()
-    session.has_inheritance = shape in {"inherited-parent", "inherited-child"}
-    session.is_partition = shape == "partition-leaf"
-    session.persistence = "t" if shape == "temporary" else "p"
-    with pytest.raises(PTG2ManifestArtifactError):
-        await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=True)
-    assert session.info == {}
+def _bundle_issued_before_upgrade(address_oid, evidence_oid):
+    """The previous version's bundle, written out independently of the current helpers."""
+    encoded = json.dumps(
+        {
+            "address_relation_oid": address_oid,
+            "address_evidence_relation_oid": evidence_oid,
+            "address_selection_contract": pagination.BILLING_ADDRESS_SELECTION_CONTRACT,
+            "snapshot_set_sha256": pagination.billing_search_snapshot_set_sha256(fixture._selection()),
+        },
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    digest = hashlib.sha256(b"HEALTHPORTA_BILLING_SEARCH_GENERATION_BUNDLE_V1\x00")
+    digest.update(len(encoded).to_bytes(8, "big"))
+    digest.update(encoded)
+    return digest.hexdigest()
 
 
-async def test_an_unlogged_direct_heap_keeps_the_same_generation_bytes():
-    session = _Session()
-    session.persistence = "u"
-    assert (
-        await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=True)
-        == fixture._pin()
+async def test_cursor_without_logical_generation_expires_and_a_new_cursor_continues():
+    previous_binding = dataclasses.replace(
+        fixture._cursor_binding(), generation_bundle_sha256=_bundle_issued_before_upgrade(101, 102)
     )
-
-
-@pytest.mark.parametrize("oids", [(None, 1002), (True, 1002), (0, 1002), (-1, 1002), (1001, 1001), (2**32, 1002)])
-async def test_missing_or_invalid_physical_oids_never_publish_a_pin(oids):
-    session = _Session(address_oid=oids[0], evidence_oid=oids[1])
-    with pytest.raises(PTG2ManifestArtifactError):
-        await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=True)
-    assert session.info == {}
-
-
-@pytest.mark.parametrize("phase", ["catalog", "install"])
-@pytest.mark.parametrize("change", ["driver", "pid", "transaction"])
-async def test_original_backend_and_root_transaction_survive_inventory_install(phase, change):
-    session = _Session()
-
-    def mutate():
-        if change == "driver":
-            session.driver = _Driver(session)
-        elif change == "pid":
-            session.driver.pid += 1
-        else:
-            session.transaction = object()
-
-    if phase == "catalog":
-        session.after_catalog = mutate
-    else:
-        session.driver.after_guard = mutate
-    with pytest.raises(PTG2ManifestArtifactError):
-        await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=True)
-
-
-@pytest.mark.parametrize("drift", [False, True])
-async def test_subsequent_buffered_billing_rows_are_guarded_before_cache(drift):
-    session, cached_rows = _Session(), []
-    await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=True)
-    if drift:
-        session.after_payload = lambda: session.current.update({'"mrf"."entity_address_unified"': 999})
-        with pytest.raises(ServiceUnavailable):
-            cached_rows.extend((await execution.execute_network_read(session, "SELECT billing_payload")).all())
-        assert session.results[-1].closed
-    else:
-        cached_rows.extend((await execution.execute_network_read(session, "SELECT billing_payload")).all())
-    assert cached_rows == ([] if drift else [("billing payload",)])
-
-
-@pytest.mark.parametrize("failure", ["postgres", "interface", "timeout", "closed", "cancel"])
-async def test_native_probe_failures_use_the_existing_billing_error_contract(failure):
-    session = _Session()
-    error = {
-        "postgres": asyncpg.PostgresError("native probe"),
-        "interface": asyncpg.InterfaceError("native probe"),
-        "timeout": TimeoutError("native probe"),
-        "closed": asyncpg.InterfaceError("closed driver"),
-        "cancel": asyncio.CancelledError(),
-    }[failure]
-    if failure == "closed":
-        session.connection = AsyncMock(side_effect=error)
-    else:
-        session.driver.fetchrow = AsyncMock(side_effect=error)
-    with pytest.raises(asyncio.CancelledError if failure == "cancel" else PTG2ManifestArtifactError) as caught:
-        await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=True)
-    if failure == "cancel":
-        assert caught.value is error
-    assert session.statements == [] and session.info == {}
+    sealed = pagination.seal_billing_search_page_cursor((1,), keyring=fixture.KEYRING, binding=previous_binding)
+    request = fixture._request(cursor=fixture._wire_token(sealed, previous_binding))
+    session = _session()
+    current = await pagination.capture_billing_search_generation_pin(session, fixture._selection(), api_read=True)
+    binding = fixture._cursor_binding(request=request, pin=current)
+    assert binding.generation_bundle_sha256 != previous_binding.generation_bundle_sha256
+    with pytest.raises(fixture.cursor.BillingSearchCursorGenerationExpired):
+        pagination.open_billing_search_page_cursor(request, keyring=fixture.KEYRING, binding=binding)
+    next_cursor = pagination.seal_billing_search_page_cursor((2,), keyring=fixture.KEYRING, binding=binding)
+    next_request = fixture._request(cursor=fixture._wire_token(next_cursor, binding))
+    assert pagination.open_billing_search_page_cursor(next_request, keyring=fixture.KEYRING, binding=binding) == (2,)

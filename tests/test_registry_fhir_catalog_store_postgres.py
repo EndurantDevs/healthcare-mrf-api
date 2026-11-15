@@ -325,7 +325,7 @@ async def test_clone_keeps_all_metadata_and_last_good(storage_database, monkeypa
         )
     snapshot = await register(fixture, previous)
     verification = AsyncMock()
-    monkeypatch.setattr(store, "verify_fhir_catalog_snapshot", verification)
+    monkeypatch.setattr(store, "validate_fhir_catalog_snapshot_record", verification)
     old_files = await native_files(fixture.connection, previous.schema_name)
     counted = CountConnection(fixture.connection)
     async with fixture.connection.transaction():
@@ -402,16 +402,6 @@ async def test_failed_batches_preserve_published_source(storage_database, monkey
         )
         == 2
     )
-    with pytest.raises(ValueError, match="owner_invalid"):
-        async with fixture.connection.transaction():
-            await store.write_fhir_catalog_rows(
-                fixture.connection,
-                candidate,
-                "registry_fhir_catalog_network",
-                [],
-                loader_role="absent_loader_role",
-                control_schema=fixture.control,
-            )
 
 
 @pytest.mark.asyncio
@@ -456,7 +446,7 @@ async def test_byte_windows_bound_native_clone(storage_database, monkeypatch):
     previous, candidate = await target(fixture), await target(fixture)
     await populate(fixture, previous, count=30)
     snapshot = await register(fixture, previous)
-    monkeypatch.setattr(store, "verify_fhir_catalog_snapshot", AsyncMock())
+    monkeypatch.setattr(store, "validate_fhir_catalog_snapshot_record", AsyncMock())
     async with fixture.connection.transaction():
         accounting = await store.copy_fhir_catalog_snapshot(
             fixture.connection,

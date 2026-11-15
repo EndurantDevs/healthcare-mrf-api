@@ -158,7 +158,7 @@ async def _normalize_receipt_session(session, schema_name: str) -> None:
         await session.execute(text(setting))
 
 
-async def _lock_relation_family(session, schema_name: str, table_names: tuple[str, ...]) -> None:
+async def _lock_relation_family(session, schema_name: str, table_names: tuple[str, ...], *, read_only=False) -> None:
     """Pin the named closed family before inspecting schema or row contents."""
     readonly = await session.scalar(text("SHOW transaction_read_only"))
     isolation = await session.scalar(text("SHOW transaction_isolation"))
@@ -166,15 +166,20 @@ async def _lock_relation_family(session, schema_name: str, table_names: tuple[st
         raise EntityAddressArchiveReceiptError("entity-address Reader requires one stable transaction")
     if readonly not in {"on", "off"}:
         raise EntityAddressArchiveReceiptError("entity-address transaction state is unavailable")
-    mode = "ACCESS SHARE" if readonly == "on" else "SHARE"
+    mode = "ACCESS SHARE" if readonly == "on" or read_only else "SHARE"
     relations = ", ".join(f"{_quoted(schema_name)}.{_quoted(table_name)}" for table_name in sorted(table_names))
     await session.execute(text(f"LOCK TABLE {relations} IN {mode} MODE"))
 
 
-async def _lock_model_family(session, schema_name: str, models: tuple[type, ...]) -> None:
+async def _lock_model_family(session, schema_name: str, models: tuple[type, ...], *, read_only=False) -> None:
     """Pin the portable model family before inspecting schema or row contents."""
 
-    await _lock_relation_family(session, schema_name, tuple(model.__tablename__ for model in models))
+    await _lock_relation_family(
+        session,
+        schema_name,
+        tuple(model.__tablename__ for model in models),
+        **({"read_only": True} if read_only else {}),
+    )
 
 
 async def _relation_oid(session, schema_name: str, table_name: str) -> int:
@@ -446,20 +451,22 @@ def _content_identity(tables: tuple[EntityAddressArchiveTableReceipt, ...], main
 
 
 async def capture_entity_address_archive_receipt(
-    session, *, schema_name: str, contract=LEGACY_CONTRACT
+    session, *, schema_name: str, contract=LEGACY_CONTRACT, read_only=False
 ) -> EntityAddressArchiveReceipt:
     """Capture a semantic receipt for exactly the reviewed seven-table family."""
     schema = _schema_name(schema_name)
     if contract == CONTRACT:
         from process.entity_address_snapshot_alias import EntityAddressAliasAuthority
 
-        tables = await _capture_set_tables(session, schema, (*_models(), EntityAddressAliasAuthority))
+        tables = await _capture_set_tables(
+            session, schema, (*_models(), EntityAddressAliasAuthority), **({"read_only": True} if read_only else {})
+        )
         return EntityAddressArchiveReceipt(tables, _table_schema_digest(tables), contract=CONTRACT)
     if contract != LEGACY_CONTRACT:
         raise EntityAddressArchiveReceiptError("entity-address archive contract is unsupported")
     await _normalize_receipt_session(session, schema)
     models = _models()
-    await _lock_model_family(session, schema, models)
+    await _lock_model_family(session, schema, models, **({"read_only": True} if read_only else {}))
     table_receipts = []
     for model in models:
         relation_oid = await _relation_oid(session, schema, model.__tablename__)
@@ -507,13 +514,16 @@ async def capture_entity_address_stage_integrity_receipt(
     schema_name: str,
     stage_table_names: Mapping[str, str],
     contract=LEGACY_STAGE_INTEGRITY_CONTRACT,
+    read_only=False,
 ) -> EntityAddressStageIntegrityReceipt:
     """Capture the prepared destination family under its physical stage names."""
 
     schema = _schema_name(schema_name)
     table_names = _validated_stage_table_names_by_source(stage_table_names)
     if contract == STAGE_INTEGRITY_CONTRACT:
-        tables = await _capture_set_tables(session, schema, _models(), table_names)
+        tables = await _capture_set_tables(
+            session, schema, _models(), table_names, **({"read_only": True} if read_only else {})
+        )
         return EntityAddressStageIntegrityReceipt(tables, _table_schema_digest(tables), contract=contract)
     if contract != LEGACY_STAGE_INTEGRITY_CONTRACT:
         raise EntityAddressArchiveReceiptError("entity-address stage contract is unsupported")
@@ -523,6 +533,7 @@ async def capture_entity_address_stage_integrity_receipt(
         session,
         schema,
         tuple(table_names[model.__tablename__] for model in models),
+        **({"read_only": True} if read_only else {}),
     )
     table_receipts = []
     logical_name_by_stage = {stage_name: logical_name for logical_name, stage_name in table_names.items()}
@@ -680,11 +691,11 @@ def _table_schema_digest(tables):
     )
 
 
-async def _capture_set_tables(session, schema, models, names=None):
+async def _capture_set_tables(session, schema, models, names=None, *, read_only=False):
     """Bounded accounting and catalog identity; payload equality is a separate set check."""
     names = names or {model.__tablename__: model.__tablename__ for model in models}
     await _normalize_receipt_session(session, schema)
-    await _lock_relation_family(session, schema, tuple(names.values()))
+    await _lock_relation_family(session, schema, tuple(names.values()), **({"read_only": True} if read_only else {}))
     logical_by_name = {physical: name for name, physical in names.items()}
     tables = []
     for model in models:

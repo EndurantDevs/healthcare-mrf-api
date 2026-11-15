@@ -14,9 +14,11 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from db.connection import Database
 from process import reference_family_archive as archive
 from process import tiger_captured_epoch as captured
 from tests.reference_family_generation_fixture import ReferenceSourceCustody
+from tests.test_entity_address_snapshot_destination import _publish_npi_fixture_generation
 
 
 def _capture_admin_url(raw):
@@ -176,19 +178,20 @@ async def _assert_reader_cannot_mutate(database, schema):
 
 @pytest.mark.asyncio
 async def test_default_projection_retains_inherited_source_compatibility():
-    """Existing NULL bindings keep canonical serving; explicit held roots are refused."""
+    """Canonical inheritance keeps its NPI origin; received children need named bindings."""
     from api import ptg2_geo_projection as projection
 
     async with owned_tiger_capture_database() as database:
         await database.admin.execute("CREATE SCHEMA mrf")
         for table in (
             "entity_address_unified",
-            "npi_address",
             "mrf_address",
             "doctor_clinician_address",
             "geo_zip_lookup",
         ):
             await database.admin.execute(f"CREATE TABLE mrf.{table}(id integer)")
+        sessions = database.sessions["source"]
+        await _publish_npi_fixture_generation(Database(engine=sessions.kw["bind"], session_factory=sessions), "mrf")
         await database.admin.execute(
             "CREATE TABLE mrf.entity_address_geo_assurance_state "
             "(singleton boolean, active_geo_assurance_version integer, active_table_oid oid, "
@@ -204,10 +207,7 @@ async def test_default_projection_retains_inherited_source_compatibility():
         )
         assert await database.admin.fetchval("SELECT " + projection.projection_state_available_sql("mrf"))
         await database.admin.execute(
-            "UPDATE mrf.entity_address_geo_assurance_state SET active_dependency_bindings="
-            "(SELECT jsonb_object_agg(key,jsonb_build_object('schema_name',split_part(key,'.',1),"
-            "'table_name',split_part(key,'.',2),'relation_oid',value->0,'relfilenode',value->1)) "
-            "FROM jsonb_each(active_relation_signature))"
+            "UPDATE mrf.entity_address_geo_assurance_state SET active_dependency_bindings='{}'::jsonb"
         )
         assert not await database.admin.fetchval("SELECT " + projection.projection_state_available_sql("mrf"))
         await _assert_received_child_requires_held_bindings(database, projection)
@@ -217,27 +217,19 @@ async def _assert_received_child_requires_held_bindings(database, projection):
     """The exact received child shape invalidates NULL, not ordinary source inheritance."""
     schema = archive.reference_family_stage_schema(uuid4())
     await database.admin.execute(f'CREATE SCHEMA "{schema}" AUTHORIZATION "{database.roles["owner"]}"')
-    for name in ("zip_state", "zcta5"):
-        await database.admin.execute(f'CREATE TABLE "{schema}"."{name}" () INHERITS(tiger."{name}")')
     await database.admin.execute("UPDATE mrf.entity_address_geo_assurance_state SET active_dependency_bindings=NULL")
-    # A name alone is not the protected received mode.
+    # An empty namespace does not introduce received TIGER inputs.
     assert await database.admin.fetchval("SELECT " + projection.projection_state_available_sql("mrf"))
     for name in ("zip_state", "zcta5"):
-        await database.admin.execute(f'ALTER TABLE "{schema}"."{name}" OWNER TO "{database.roles["owner"]}"')
+        await database.admin.execute(f'CREATE TABLE "{schema}"."{name}" () INHERITS(tiger."{name}")')
     assert not await database.admin.fetchval("SELECT " + projection.projection_state_available_sql("mrf"))
     bindings_by_name = {}
     for namespace, table in projection._PROJECTION_DEPENDENCIES:
         namespace = namespace or "mrf"
         physical = schema if namespace == "tiger" else namespace
-        identity = await database.admin.fetchrow(
-            "SELECT oid::bigint,pg_relation_filenode(oid)::bigint AS filenode FROM pg_class WHERE oid=to_regclass($1)",
-            f'"{physical}"."{table}"',
-        )
         bindings_by_name[f"{namespace}.{table}"] = {
             "schema_name": physical,
             "table_name": table,
-            "relation_oid": identity["oid"],
-            "relfilenode": identity["filenode"],
         }
     import json
 
@@ -251,8 +243,8 @@ async def _assert_received_child_requires_held_bindings(database, projection):
 
 
 @pytest.mark.asyncio
-async def test_capture_refuses_different_publisher_database_before_clone():
-    """Independent database OIDs cannot authorize a cross-database source/clone join."""
+async def test_capture_preserves_native_cross_database_snapshot_refusal():
+    """PostgreSQL rejects importing a snapshot from another database before candidate creation."""
 
     async def refuse_callback(*_args):
         raise AssertionError("different databases reached protected custody")
@@ -260,7 +252,9 @@ async def test_capture_refuses_different_publisher_database_before_clone():
     async with owned_tiger_capture_database() as source_database, owned_tiger_capture_database() as publisher_database:
         epoch_id = uuid4()
         custody = ReferenceSourceCustody(publisher_database.roles["owner"], ())
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="databases differ"):
+        from sqlalchemy.exc import DBAPIError
+
+        with pytest.raises(DBAPIError, match="different database"):
             await captured.prepare_captured_tiger_epoch(
                 source_database.sessions["source"],
                 publisher_database.sessions["publisher"],
@@ -326,7 +320,7 @@ async def test_readonly_finite_capture_keeps_concurrent_changes_outside_snapshot
 
         async def protect(session, prepared, graph):
             assert len(graph["relations"]) == 59
-            assert sum(len(oids) for oids in graph["projection_oids"].values()) == 59
+            assert sum(len(oids) for oids in graph["projection"].values()) == 59
             captured_graphs.append(graph)
             await custody.retain(session, prepared)
 
@@ -357,7 +351,7 @@ async def test_readonly_finite_capture_keeps_concurrent_changes_outside_snapshot
 
 
 @pytest.mark.asyncio
-async def test_readonly_finite_capture_refuses_truncate_between_discovery_and_locks(monkeypatch):
+async def test_readonly_finite_capture_reads_current_data_after_truncate_before_locks(monkeypatch):
     async with owned_tiger_capture_database() as database:
         await _seed_readonly_finite_graph(database)
         original = captured._pin_snapshot_graph
@@ -367,21 +361,23 @@ async def test_readonly_finite_capture_refuses_truncate_between_discovery_and_lo
             return await original(session, discovered)
 
         monkeypatch.setattr(captured, "_pin_snapshot_graph", changed)
-        custody = ReferenceSourceCustody(database.roles["owner"], ())
+        custody = ReferenceSourceCustody(database.roles["owner"], (database.roles["reader"],))
         epoch = uuid4()
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="changed before read locks"):
-            await captured.prepare_snapshot_tiger_epoch(
-                database.sessions["snapshot"],
-                database.sessions["publisher"],
-                epoch_id=epoch,
-                on_prepared=custody.retain,
-                source_copy=custody.source_copy,
-                on_precreated=custody.precreate,
-            )
-        assert (
-            await database.admin.fetchval("SELECT to_regnamespace($1)", archive.reference_family_stage_schema(epoch))
-            is None
+
+        async def protect(session, prepared, _graph):
+            await custody.retain(session, prepared)
+
+        prepared = await captured.prepare_snapshot_tiger_epoch(
+            database.sessions["snapshot"],
+            database.sessions["publisher"],
+            epoch_id=epoch,
+            on_prepared=protect,
+            source_copy=custody.source_copy,
+            on_precreated=custody.precreate,
         )
+        assert await database.admin.fetchval(f'SELECT count(*) FROM "{prepared.ownership.schema_name}".zip_state') == 0
+        assert await database.admin.fetchval(f'SELECT count(*) FROM "{prepared.ownership.schema_name}".zcta5') == 1
+        await _assert_reader_cannot_mutate(database, prepared.ownership.schema_name)
 
 
 async def _mutate_finite_snapshot(database, mutation):

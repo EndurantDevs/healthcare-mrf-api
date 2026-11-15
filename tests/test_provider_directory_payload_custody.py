@@ -75,7 +75,7 @@ async def test_affected_original_owner_one_execution_exact_params_and_terminal_w
     outcome = group["original_outcome"]
     assert group["identity"][0] == "affected_npi_payload" and group["identity"][1] is build
     assert statement_custody is group["original_statement_custody"]
-    assert statement_custody["outcome"] is outcome and statement_custody["session"] is outcome.session
+    assert statement_custody["outcome"] is outcome and "session" not in statement_custody
     assert statement_custody["witness"] is statement_custody["original_witness"]
     assert statement_custody["witness"].affected_rows == 1
     assert group["consumed"] and outcome.status == "committed_measured"
@@ -121,9 +121,7 @@ async def test_affected_original_row_guards_keep_failure_before_commit(affected_
     assert outcome.commit_state == "rolled_back" and "commit" not in state.connections[0].events
 
 
-@pytest.mark.parametrize(
-    "field", ["coordinate", "statement_custody", "witness", "params", "task", "session", "outcome"]
-)
+@pytest.mark.parametrize("field", ["coordinate", "statement_custody", "witness", "params", "task", "outcome"])
 async def test_compact_missing_or_misbound_statement_holds_original_committed_outcome(compact_wave, monkeypatch, field):
     _, _, admission, *_ = compact_wave
     execute = fhir._execute_provider_directory_profile_compact_batch
@@ -155,6 +153,27 @@ async def test_compact_missing_or_misbound_statement_holds_original_committed_ou
     assert not wave["accounting_authority"] and not wave["reservation_refund"]
     with pytest.raises(RuntimeError, match="compact_owned_capture_unconsumed"):
         await run_wave(compact_wave)
+
+
+async def test_compact_terminal_accounting_ignores_legacy_session_token(compact_wave, monkeypatch):
+    """A retained session token cannot override the actual one-write committed outcome."""
+    state, _, admission, *_ = compact_wave
+    execute = fhir._execute_provider_directory_profile_compact_batch
+
+    async def opaque_session(*args, **kwargs):
+        result = await execute(*args, **kwargs)
+        owner = admission.wal_tracker.owned_compact_worker_outcomes[asyncio.current_task()]
+        owner["statement_custody"]["session"] = object()
+        return result
+
+    monkeypatch.setattr(fhir, "_execute_provider_directory_profile_compact_batch", opaque_session)
+    assert await run_wave(compact_wave) == [1]
+    wave = admission.wal_tracker.owned_compact_wave_native_outcomes[0]
+    outcome = wave["workers"][0]["owner"]["outcome"]
+    assert wave["status"] == "complete" and outcome.is_committed and outcome.cleanup_complete
+    assert not wave["accounting_authority"] and not wave["reservation_refund"]
+    assert state.connections[0].events.count("write") == state.connections[0].events.count("commit") == 1
+    assert state.checkedout == 0
 
 
 async def test_borrowed_payload_remains_incomplete_until_authentic_terminal(control_wave):
@@ -197,7 +216,7 @@ async def test_missing_borrowed_owner_executes_original_once_but_never_fabricate
     assert outcome.is_committed and outcome.status == "committed_measured"
 
 
-@pytest.mark.parametrize("field", ["statement_custody", "witness", "params", "task", "session", "outcome"])
+@pytest.mark.parametrize("field", ["statement_custody", "witness", "params", "task", "outcome"])
 async def test_affected_misbound_custody_retains_authentic_committed_truth(affected_wave, monkeypatch, field):
     _, _, admission, *_ = affected_wave
     consume = fhir.profile_control_custody.consume_owned_groups
@@ -221,6 +240,23 @@ async def test_affected_misbound_custody_retains_authentic_committed_truth(affec
     assert group["original_outcome"].is_committed
     assert group["original_outcome"].status == "committed_measured"
     assert not group["consumed"] and group["status"] == "incomplete"
+
+
+async def test_affected_terminal_accounting_ignores_legacy_session_token(affected_wave, monkeypatch):
+    """A retained session token cannot replace the affected-row result or terminal commit."""
+    _, _, admission, *_ = affected_wave
+    consume = fhir.profile_control_custody.consume_owned_groups
+
+    def opaque_session(module, outcome, failure, *, groups=None):
+        groups[0]["statement_custody"]["session"] = object()
+        consume(module, outcome, failure, groups=groups)
+
+    monkeypatch.setattr(fhir.profile_control_custody, "consume_owned_groups", opaque_session)
+    assert await affected_insert(affected_wave, plain=True, expected_rows=1) == 1
+    group = admission.wal_tracker.owned_control_transaction_groups[0]
+    assert group["consumed"] and group["original_outcome"].is_committed
+    assert group["original_outcome"].status == "committed_measured"
+    assert not group["accounting_authority"] and not group["reservation_refund"]
 
 
 async def test_affected_original_body_failure_identity_is_preserved(affected_wave, monkeypatch):

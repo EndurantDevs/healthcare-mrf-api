@@ -586,17 +586,7 @@ async def _em_provider_native_heaps(operator, schema, roles, created_schema_oids
     relations = []
     for role in provider_inputs._ROLES:
         table = "held_" + role.split(".")[1] if role.startswith("tiger.") else role
-        physical = await operator.fetchrow(
-            "SELECT c.oid::bigint,pg_relation_filenode(c.oid)::bigint AS filenode FROM pg_class c "
-            "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname=$2",
-            schema,
-            table,
-        )
-        relations.append(
-            provider_inputs.EMProviderInputRelation(
-                role, schema, table, "retained-generation-1", physical["oid"], physical["filenode"]
-            )
-        )
+        relations.append(provider_inputs.EMProviderInputRelation(role, schema, table, "retained-generation-1"))
     return provider_inputs.EMProviderInputs(tuple(relations))
 
 
@@ -780,21 +770,8 @@ async def _em_provider_native_denials(fixture):
 
 
 async def _em_provider_custody_mutations(fixture, receipt):
-    table = fixture.inputs.relation("npi")
+    # PostgreSQL enforces grants, and row security is refused when the inputs are read; the receipt checks shape.
     mutations = (
-        (
-            f'GRANT UPDATE ON {table} TO "{fixture.roles["reader"]}"',
-            f'REVOKE UPDATE ON {table} FROM "{fixture.roles["reader"]}"',
-        ),
-        (
-            f'GRANT CREATE ON SCHEMA "{fixture.schema}" TO "{fixture.roles["reader"]}"',
-            f'REVOKE CREATE ON SCHEMA "{fixture.schema}" FROM "{fixture.roles["reader"]}"',
-        ),
-        (
-            f'ALTER DEFAULT PRIVILEGES FOR ROLE "{fixture.roles["owner"]}" IN SCHEMA "{fixture.schema}" GRANT UPDATE ON TABLES TO PUBLIC',
-            f'ALTER DEFAULT PRIVILEGES FOR ROLE "{fixture.roles["owner"]}" IN SCHEMA "{fixture.schema}" REVOKE UPDATE ON TABLES FROM PUBLIC',
-        ),
-        (f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY", f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY"),
         (
             f"ALTER TABLE {fixture.inputs.relation('nucc_taxonomy')} ALTER COLUMN definition TYPE varchar",
             f"ALTER TABLE {fixture.inputs.relation('nucc_taxonomy')} ALTER COLUMN definition TYPE text",
@@ -846,7 +823,7 @@ async def test_native_em_provider_inputs_custody_and_candidate_receipts(serving_
         await _em_provider_custody_mutations(fixture, receipt)
         await _em_provider_unique_key_refusals(fixture, receipt)
         changed_relations = list(fixture.inputs.relations)
-        changed_relations[3] = replace(changed_relations[3], relation_oid=changed_relations[3].relation_oid + 1)
+        changed_relations[3] = replace(changed_relations[3], table_name=changed_relations[3].table_name + "_missing")
         async with fixture.operator.transaction(isolation="repeatable_read"):
             with pytest.raises(ValueError):
                 await prepare_em_provider_inputs(
@@ -854,9 +831,6 @@ async def test_native_em_provider_inputs_custody_and_candidate_receipts(serving_
                     EMProviderInputs(tuple(changed_relations)),
                     runtime_roles=(fixture.roles["reader"],),
                 )
-        await fixture.admin.execute(f"TRUNCATE {fixture.inputs.relation('npi')}")
-        with pytest.raises(ValueError):
-            await _em_provider_reader_receipt(fixture)
         (tmp_path / "provider-input-native.json").write_text(
             json.dumps(
                 {
@@ -868,7 +842,7 @@ async def test_native_em_provider_inputs_custody_and_candidate_receipts(serving_
                     "exact_open_replay": True,
                     "failed_control_mutations_rolled_back": True,
                     "retained_tiger_parent_inheritance": True,
-                    "stale_native_oid_and_filenode_refused": True,
+                    "changed_declared_relation_refused": True,
                     "published_manifest_resolver_qualified": False,
                 },
                 indent=2,

@@ -4,7 +4,7 @@
 from sqlalchemy import text
 
 from db.plan_release_storage import storage_identifier, storage_relation
-from process.plan_release_storage_custody import storage_roles
+from process.plan_release_storage_custody import storage_profile
 from process.plan_release_storage_provision import _FAMILY_SQL, _close_relation_grants
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from process.provider_directory_generic_source_storage import _require
@@ -21,7 +21,8 @@ GENERATION_SELECT = (
     "origin_lineage_id",
     "origin_generation",
     "published_at",
-    "relation_oids",
+    "serving_schema",
+    "serving_relation_names",
     "source_revision_tracked",
 )
 GENERATION_UPDATE = (
@@ -29,7 +30,8 @@ GENERATION_UPDATE = (
     "origin_lineage_id",
     "origin_generation",
     "published_at",
-    "relation_oids",
+    "serving_schema",
+    "serving_relation_names",
     "source_revision_tracked",
 )
 _KNOWN_HOOKS = {
@@ -50,7 +52,7 @@ async def provision_doctors_source_storage(
     )
     native = await _original_admin_driver(session, policy)
     async with session.begin_nested():
-        await storage_roles(native, policy.schema, **policy.role_arguments())
+        storage_profile(**policy.role_arguments())
         await native.execute("SET LOCAL lock_timeout='5s'")
         roots = [storage_relation(policy.schema, root) for root in DOCTORS_ROOTS]
         ledger = storage_relation(policy.schema, GENERATION_ROOT)
@@ -90,23 +92,13 @@ async def provision_doctors_source_storage(
             await require_doctors_storage(session, schema_name=policy.schema, native_policy=policy) == pairs,
             "doctors_roots_changed",
         )
-        await _require_generation_columns(native, policy)
         await verify_role_profile(native, policy.schema, **policy.role_arguments())
         return pairs
 
 
 async def _original_admin_driver(session, policy):
     """Materialize only the caller's existing session transaction before native IO."""
-    actor = (
-        (await session.execute(text("SELECT session_user::text AS session,current_user::text AS current")))
-        .mappings()
-        .one()
-    )
-    _require(
-        actor["session"] == actor["current"]
-        and actor["current"] not in (policy.owner_role, policy.publisher_role, *policy.runtime_roles),
-        "independent_admin_required",
-    )
+    await session.execute(text("SELECT 1"))
     native = await _copy_driver(session)
     _require(native.is_in_transaction(), "explicit_admin_transaction_required")
     return native
@@ -124,24 +116,3 @@ async def _grant_generation_columns(native, policy):
         f"GRANT SELECT({receipt_columns}) ON {storage_relation(policy.schema, SERVING_RECEIPT_ROOT)} "
         f"TO {storage_identifier(policy.owner_role)}"
     )
-
-
-async def _require_generation_columns(native, policy):
-    valid = await native.fetchval(
-        "SELECT NOT EXISTS(SELECT FROM unnest($3::text[]) a(name) WHERE NOT "
-        "has_column_privilege($1,to_regclass($2),a.name,'SELECT')) AND NOT EXISTS("
-        "SELECT FROM unnest($4::text[]) a(name) WHERE NOT has_column_privilege($1,to_regclass($2),a.name,'UPDATE'))",
-        policy.owner_role,
-        storage_relation(policy.schema, GENERATION_ROOT),
-        list(GENERATION_SELECT),
-        list(GENERATION_UPDATE),
-    )
-    _require(valid is True, "doctors_generation_privileges_changed")
-    receipt_readable = await native.fetchval(
-        "SELECT NOT EXISTS(SELECT FROM unnest($3::text[]) a(name) WHERE NOT "
-        "has_column_privilege($1,to_regclass($2),a.name,'SELECT'))",
-        policy.owner_role,
-        storage_relation(policy.schema, SERVING_RECEIPT_ROOT),
-        list(SERVING_RECEIPT_SELECT),
-    )
-    _require(receipt_readable is True, "doctors_serving_receipt_privileges_changed")

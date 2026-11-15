@@ -85,13 +85,13 @@ async def test_support_primary_keys_preserve_owned_tables(monkeypatch, is_admitt
             for name in ("entity_address_unified_stage", "entity_address_evidence_stage"):
                 await admitted.create_stage_sql(schema, name, f"CREATE UNLOGGED TABLE {schema}.{name} (marker text)")
             await database.status(f"INSERT INTO {schema}.entity_address_unified_stage VALUES ('new')")
-            oid_by_name = dict(scope.owned_oids)
+            stage_names = set(scope.owned_relations)
             stage_by_name = {
                 name: SimpleNamespace(
                     __tablename__=name,
                     __table__=Table(name, MetaData(), Column("marker", String, primary_key=True)),
                 )
-                for name in oid_by_name
+                for name in stage_names
             }
             if not is_admitted:
                 admitted._ADMISSION.set(None)
@@ -101,18 +101,19 @@ async def test_support_primary_keys_preserve_owned_tables(monkeypatch, is_admitt
             await native._create_support_stage_indexes(stage_by_name, schema, context=context_by_field)
             assert progress_by_field == {"active": 0, "maximum": 1 if is_admitted else 2, "keys": 2}
             assert context_by_field["support_stage_index_concurrency"] == (1 if is_admitted else 2)
-            for name, oid in oid_by_name.items():
-                assert await database.scalar("SELECT to_regclass(:name)::oid", name=f"{schema}.{name}") == oid
+            for name in stage_names:
+                assert await database.scalar("SELECT to_regclass(:name) IS NOT NULL", name=f"{schema}.{name}")
                 assert (
                     await database.scalar(
-                        "SELECT count(*) FROM pg_constraint WHERE conrelid=:oid AND contype='p'", oid=oid
+                        "SELECT count(*) FROM pg_constraint WHERE conrelid=to_regclass(:name) AND contype='p'",
+                        name=f"{schema}.{name}",
                     )
                     == 1
                 )
             assert await database.scalar(f"SELECT marker FROM {schema}.entity_address_unified_stage") == "new"
         finally:
             admitted._ADMISSION.reset(token)
-            await preparation._drain_owned_stages(schema, scope.cleanup_oids)
+            await preparation._drain_owned_stages(schema, scope.cleanup_relations)
         await _assert_stages_absent(database, schema)
 
 
@@ -136,12 +137,18 @@ async def test_intermediate_create_failure_cleans_captured_family(monkeypatch, k
         build = native.process_entity_address_unified_data
         register = admission.register_external_relation
 
-        async def fail_after_registration(fhir, schema, name, oid):
-            await register(fhir, schema, name, oid)
+        async def fail_after_registration(fhir, schema, name):
+            await register(fhir, schema, name)
             if name == "extra_stage":
-                assert admitted._ADMISSION.get().owned_oids[name] == oid
+                assert name in admitted._ADMISSION.get().owned_relations
                 assert (schema, name) in admission._external_relations
-                assert await database.scalar("SELECT relpersistence::text FROM pg_class WHERE oid=:oid", oid=oid) == "u"
+                assert (
+                    await database.scalar(
+                        "SELECT relpersistence::text FROM pg_class WHERE oid=to_regclass(:name)",
+                        name=f"{schema}.{name}",
+                    )
+                    == "u"
+                )
                 raise RuntimeError("synthetic failure after scratch creation")
 
         async def create_scratch(ctx, task):
@@ -193,7 +200,7 @@ async def test_create_commit_ack_loss_retains_cleanup_identity(monkeypatch):
             async with transaction() as session:
                 yield session
             scope = admitted._ADMISSION.get()
-            if not has_lost_ack.is_set() and scope is not None and scope.owned_oids:
+            if not has_lost_ack.is_set() and scope is not None and scope.owned_relations:
                 has_lost_ack.set()
                 raise RuntimeError("synthetic create commit acknowledgement lost")
 
@@ -234,18 +241,18 @@ async def test_compact_rewrite_retains_original_oid_ownership(monkeypatch, fail_
     async with _temporary_schema() as (database, schema):
         ctx, inputs, admission, _states = await _admitted_fixture(database, schema, monkeypatch)
         build = native.process_entity_address_unified_data
-        oid_by_phase = {}
+        rows_by_phase = {}
         monkeypatch.setattr(native, "_entity_address_unified_columns", lambda: ["marker"])
 
         async def rewrite(ctx, task):
             await build(ctx, task)
-            oid_by_phase["before"] = admitted._ADMISSION.get().owned_oids["entity_address_unified_stage"]
+            rows_by_phase["before"] = await database.all(f"SELECT * FROM {schema}.entity_address_unified_stage")
             assert (
                 await native._rewrite_compacted_source_record_ids_stage(schema, "entity_address_unified_stage", {}) == 1
             )
-            oid_by_phase["after"] = admitted._ADMISSION.get().owned_oids["entity_address_unified_stage"]
+            rows_by_phase["after"] = await database.all(f"SELECT * FROM {schema}.entity_address_unified_stage")
             assert await native._stage_table_persistence(schema, "entity_address_unified_stage") == "u"
-            assert admission._relations[(schema, "entity_address_unified_stage")] == oid_by_phase["after"]
+            assert (schema, "entity_address_unified_stage") in admission._relations
             assert (schema, "entity_address_unified_stage_compact") not in admission._relations
             if fail_after_swap:
                 raise RuntimeError("synthetic failure after compact swap")
@@ -253,7 +260,7 @@ async def test_compact_rewrite_retains_original_oid_ownership(monkeypatch, fail_
 
         monkeypatch.setattr(native, "process_entity_address_unified_data", rewrite)
         await _finish_rewrite(ctx, inputs, admission, fail_after_swap)
-        assert oid_by_phase["before"] != oid_by_phase["after"]
+        assert rows_by_phase["before"] == rows_by_phase["after"]
         await _assert_stages_absent(database, schema, "entity_address_unified_stage_compact")
 
 

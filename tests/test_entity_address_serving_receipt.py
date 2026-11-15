@@ -35,7 +35,7 @@ def current_pair(monkeypatch):
     payload = _payload()
     payload["address"].update(local_lineage_id="lineage", local_generation=1)
     snapshot_by_field = {
-        key: deepcopy(payload[key]) for key in ("address", "doctors", "profile", "alias_generation", "overlay_oid")
+        key: deepcopy(payload[key]) for key in ("address", "doctors", "profile", "alias_generation", "overlay")
     }
     result = deepcopy(snapshot_by_field)
     result["address"].update(local_generation=2, origin_lineage_id="lineage", origin_generation=2)
@@ -94,7 +94,7 @@ async def test_inconsistent_existing_history_fails_before_swap(current_pair, mis
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", ["profile", "doctors", "alias_generation", "overlay_oid", "address"])
+@pytest.mark.parametrize("field", ["profile", "doctors", "alias_generation", "overlay", "address"])
 async def test_after_publish_rejects_unrelated_drift_or_missing_address_advance(current_pair, field):
     if field == "address":
         current_pair[2][field] = current_pair[1][field]

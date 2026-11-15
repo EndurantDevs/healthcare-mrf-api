@@ -29,7 +29,6 @@ from process.registry_source_inventory_store import source_inventory_entry
 from tests.test_network_provider_routes_postgres import _durable_state
 from tests.test_registry_generic_fhir_reuse_postgres import (
     _add_mapping,
-    _assert_independent_owners,
     _compose,
     _publish,
     _read,
@@ -175,7 +174,6 @@ async def _published_generations(context):
     assert {fact_kind["kind"]: fact_kind["fact_rows"] for fact_kind in fact_kinds} == {"resource": 5, "edge": 9}
     assert all(fact_kind["witness_v2"] for fact_kind in fact_kinds)
     before = await _read(context, original)
-    await _assert_independent_owners(context)
     revision = await _add_mapping(context, "network-unapproved")
     rebound = await _publish(context, await _compose(context, revision, original))
     assert rebound.generation_id > original.generation_id

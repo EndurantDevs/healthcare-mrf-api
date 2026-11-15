@@ -103,7 +103,7 @@ def _inputs(request):
     observed_runtime_by_field = {
         "contract_id": runtime.PROFILE_RUNTIME_OBSERVATION_CONTRACT_ID,
         **{
-            name: getattr(profile_lease.runtime_witness, name)
+            name: getattr(profile_lease.runtime, name)
             for name in runtime.CAPACITY_LEASE_LOCALLY_VERIFIED_RUNTIME_FIELDS
         },
     }
@@ -114,23 +114,12 @@ def _inputs(request):
         {"accepted": 1},
         {"revision": 3},
         observed_runtime_by_field,
-        receipt["database_binding"],
         serving,
     ), profile_lease
 
 
 def _database_observation(inputs, profile_lease):
-    data_tablespace = next(entry for entry in profile_lease.tablespaces if entry.usage == "data")
-    temp_tablespace = next(entry for entry in profile_lease.tablespaces if entry.usage == "temp")
     return {
-        **{
-            name: getattr(profile_lease, name)
-            for name in ("database_system_identifier", "database_oid", "database_name")
-        },
-        "data_tablespace_oid": data_tablespace.tablespace_oid,
-        "data_tablespace_name": data_tablespace.tablespace_name,
-        "temp_tablespace_oid": temp_tablespace.tablespace_oid,
-        "temp_tablespace_name": temp_tablespace.tablespace_name,
         "query_parallel_workers": 0,
         "maintenance_parallel_workers": 0,
         "temp_limit_bytes": inputs.plan.temp_file_limit_bytes_per_backend,
@@ -219,7 +208,7 @@ async def test_registration_commits_before_read_snapshot_and_restores_context(mo
     result = await producer.capacity_authority_projection(fhir, request)
     assert result["contract_id"] == contract.CMS_PROJECTION_CONTRACT
     assert result["required_reservation_bytes_by_storage_class"] == dict(inputs.plan.reservation_bytes)
-    assert result["database_binding"] == inputs.database_binding
+    assert "database_binding" not in result
     assert result["capacity_geometry"] == inputs.plan.payload
     assert fhir._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.get() is prior
     assert events == ["read"]
@@ -392,7 +381,7 @@ async def test_preflight_may_not_outlive_profile_pair(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", [None, "native", "runtime", "serving", "tablespace"])
+@pytest.mark.parametrize("changed", [None, "native", "runtime", "serving", "execution_limits"])
 async def test_fresh_bounded_checks_keep_endpoint_first_and_detect_drift(monkeypatch, changed):
     request = _request()
     inputs, profile_lease = _inputs(request)
@@ -413,8 +402,8 @@ async def test_fresh_bounded_checks_keep_endpoint_first_and_detect_drift(monkeyp
     monkeypatch.setattr(producer, "assert_native_address_input_fence", native)
     monkeypatch.setattr(producer.receipts, "assert_native_dependencies", AsyncMock())
     observation = _database_observation(inputs, profile_lease)
-    if changed == "tablespace":
-        observation["data_tablespace_oid"] += 1
+    if changed == "execution_limits":
+        observation["query_parallel_workers"] = 1
     monkeypatch.setattr(producer, "_database_observation", AsyncMock(return_value=observation))
     actual_runtime_by_field = {
         **inputs.runtime,

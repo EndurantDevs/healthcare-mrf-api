@@ -21,6 +21,7 @@ from api.endpoint import npi as provider
 from api.network_address_scope import current_network_address_scope
 from api.provider_collection_network_contract import parse_managed_collection_query
 from process import registry_network_catalog_read as catalog
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 from process.registry_network_catalog_read import RegistryNetworkCatalogError
@@ -34,9 +35,9 @@ DIGEST = "a" * 64
 def boundary(monkeypatch):
     """Isolate route orchestration; native pin authority is tested independently."""
     candidate = "11111111-1111-4111-8111-111111111111"
-    manifest = PinnedNetworkServingManifest(
-        9, candidate, "network_candidate_" + candidate.replace("-", ""), 1, {}, 4, "b" * 64, 123
-    )
+    schema_name = "network_candidate_" + candidate.replace("-", "")
+    address_relation = CompactAddressRelation(schema_name, "entity_address_unified")
+    manifest = PinnedNetworkServingManifest(9, candidate, schema_name, 1, {}, 4, "b" * 64, address_relation)
     driver, session = provider_reader_double(
         lambda: detail.resolve_registry_network_catalog_legacy.return_value["items"]
     )

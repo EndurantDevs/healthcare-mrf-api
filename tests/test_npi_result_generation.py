@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -161,6 +163,15 @@ _HOSPITAL_UPGRADE_REVISIONS = (
     "20261115010000_ms_drg_companion_tables",
     "20261114010000_custom_import_snapshot_names",
     "20261114020000_custom_import_snapshot_metadata",
+    "20261114130000_named_preparation_catalog",
+    "20261114160000_npi_named_generation",
+    "20261114170000_source_profile_named_attachment",
+    "20261114180000_reference_family_named_generation",
+    "20261114190000_cms_native_input_named_revision",
+    "20261115100000_prescription_rollup_named_fingerprint",
+    "20261115110000_network_retained_read_grant_ledger",
+    "20261115120000_named_output_recovery_document",
+    "20261116090000_profile_capacity_logical_names",
 )
 _SERVICE_NETWORK_UPGRADE_REVISIONS = (
     "20260914100000_entity_address_result_generation",
@@ -360,12 +371,19 @@ def _authority_row(**overrides: object) -> dict[str, object]:
         "origin_lineage_id": None,
         "origin_generation": None,
         "published_at": None,
-        "relation_oids": None,
+        "serving_schema": None,
+        "serving_relation_names": None,
         "canonical_publication_ref": None,
         "canonical_publication_generation": None,
         "canonical_chain_ref": None,
         "canonical_import_date": None,
     }
+    if "relation_oids" in overrides:
+        old = overrides.pop("relation_oids")
+        overrides.update(
+            serving_schema="mrf" if old is not None else None,
+            serving_relation_names=list(generation.RELATION_NAMES) if old is not None else None,
+        )
     authority_dict.update(overrides)
     return authority_dict
 
@@ -375,7 +393,7 @@ def test_generation_authority_keeps_legacy_state_explicit() -> None:
 
     assert authority.local_generation == 4
     assert authority.serving_generation is None
-    assert authority.relation_oids is None
+    assert authority.relations is None
     assert authority.canonical_provenance is None
 
 
@@ -398,13 +416,13 @@ def test_generation_authority_accepts_complete_tracked_state() -> None:
         3,
         datetime.datetime(2026, 9, 14, 12, tzinfo=datetime.UTC),
     )
-    assert authority.relation_oids == (10, 11, 12, 13, 14, 15)
+    assert authority.relations == tuple(("mrf", name) for name in generation.RELATION_NAMES)
     assert authority.canonical_provenance.publication_generation == 2
     assert authority.as_dict() == {
         "local_lineage_id": authority_row["local_lineage_id"],
         "local_generation": 4,
         "serving_generation": _serving(lineage_id, 3),
-        "relation_oids": [10, 11, 12, 13, 14, 15],
+        "relations": [{"schema_name": "mrf", "relation_name": name} for name in generation.RELATION_NAMES],
         "canonical_provenance": {
             "publication_ref": "nppub1_" + "a" * 43,
             "publication_generation": 2,
@@ -422,13 +440,15 @@ def test_generation_authority_accepts_complete_tracked_state() -> None:
             "origin_lineage_id": str(uuid4()),
             "origin_generation": 1,
             "published_at": "2026-09-14T12:00:00Z",
-            "relation_oids": [10, 11, 12, 13, 14, 14],
+            "serving_schema": "mrf",
+            "serving_relation_names": ["npi"] * 6,
         },
         {
             "origin_lineage_id": str(uuid4()),
             "origin_generation": 1,
             "published_at": "2026-09-14T12:00:00Z",
-            "relation_oids": [],
+            "serving_schema": "mrf",
+            "serving_relation_names": [],
         },
         {"canonical_publication_ref": "nppub1_" + "a" * 43},
     ],
@@ -629,7 +649,7 @@ async def test_capture_serving_generation_requires_current_relation_identity(mon
 
     async def matching_oids(_session, *, schema_name: str):
         assert schema_name == "mrf"
-        return authority.relation_oids
+        return (10, 11, 12, 13, 14, 15)
 
     monkeypatch.setattr(generation, "read_npi_result_generation_authority", read_authority)
     monkeypatch.setattr(generation, "current_npi_relation_oids", matching_oids)
@@ -640,6 +660,16 @@ async def test_capture_serving_generation_requires_current_relation_identity(mon
         return (10, 11, 12, 13, 14, 16)
 
     monkeypatch.setattr(generation, "current_npi_relation_oids", drifted_oids)
+    assert await generation.capture_npi_serving_generation(object(), schema_name="mrf") == authority
+    from dataclasses import replace
+
+    monkeypatch.setattr(
+        generation,
+        "read_npi_result_generation_authority",
+        AsyncMock(
+            return_value=replace(authority, relations=tuple(("other", name) for name in generation.RELATION_NAMES))
+        ),
+    )
     with pytest.raises(RuntimeError, match="unavailable or drifted"):
         await generation.capture_npi_serving_generation(object(), schema_name="mrf")
 
@@ -679,3 +709,77 @@ def test_cms_candidate_coverage_appends_to_serving_coverage():
     assert script.get_revision("20260930100000_cms_npd_serving_receipt").down_revision == (
         "20260930090000_cms_npd_candidate_coverage"
     )
+
+
+@pytest.mark.parametrize("named", [False, True], ids=["legacy", "named"])
+def test_logical_generation_projection_preserves_original_origin(named):
+    row = _authority_row(
+        origin_lineage_id="edfc559e-0067-43ed-b7fa-983fdb7077fe",
+        origin_generation=3,
+        published_at="2026-09-14T12:00:00Z",
+        serving_schema="mrf",
+        serving_relation_names=list(generation.RELATION_NAMES),
+        canonical_publication_ref="nppub1_" + "a" * 43,
+        canonical_publication_generation=2,
+        canonical_chain_ref="penpc1_" + "b" * 43,
+        canonical_import_date="2026-09-14",
+    )
+    if not named:
+        row.pop("serving_schema")
+        row.pop("serving_relation_names")
+    authority = generation.validate_npi_result_generation_authority(row, declared_schema="mrf")
+    assert authority.local_generation == row["local_generation"]
+    assert authority.serving_generation.origin_lineage_id == row["origin_lineage_id"]
+    assert authority.serving_generation.origin_generation == 3
+    assert authority.relations == tuple(("mrf", name) for name in generation.RELATION_NAMES)
+    assert authority.canonical_provenance.import_date == datetime.date(2026, 9, 14)
+    assert "relation_oids" not in row
+
+
+@pytest.mark.parametrize(
+    "named_fields",
+    [
+        {"serving_schema": "mrf"},
+        {"serving_relation_names": list(generation.RELATION_NAMES)},
+        {"serving_schema": None, "serving_relation_names": list(generation.RELATION_NAMES)},
+        {"serving_schema": "mrf", "serving_relation_names": []},
+    ],
+)
+def test_logical_generation_never_reinterprets_partial_named_metadata(named_fields):
+    row = _authority_row(
+        origin_lineage_id="edfc559e-0067-43ed-b7fa-983fdb7077fe",
+        origin_generation=3,
+        published_at="2026-09-14T12:00:00Z",
+    )
+    row.pop("serving_schema")
+    row.pop("serving_relation_names")
+    row.update(named_fields)
+    with pytest.raises(RuntimeError, match="authority is invalid"):
+        generation.validate_npi_result_generation_authority(row, declared_schema="mrf")
+
+
+@pytest.mark.parametrize(
+    "columns", [(), ("serving_schema", "serving_relation_names"), ("serving_schema",), ("serving_relation_names",)]
+)
+async def test_reader_selects_only_complete_logical_metadata_edition(columns):
+    """Protect edition selection with a native read and reject partial migrations."""
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                None,
+                SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: list(columns))),
+            ]
+        )
+    )
+    if len(columns) == 1:
+        with pytest.raises(RuntimeError, match="authority is invalid"):
+            await generation._has_named_generation_columns(session, "mrf")
+    else:
+        assert await generation._has_named_generation_columns(session, "mrf") is bool(columns)
+        projection = generation._state_projection("mrf", lock=False, named=bool(columns))
+        assert ("serving_schema" in projection) is bool(columns)
+        assert "to_jsonb" not in projection and "relation_oids" not in projection
+    calls = session.execute.await_args_list
+    assert str(calls[0].args[0]) == 'SELECT local_generation FROM "mrf"."npi_result_generation" WHERE FALSE'
+    assert "pg_catalog.pg_attribute" in str(calls[1].args[0])
+    assert calls[1].args[1] == {"relation": '"mrf"."npi_result_generation"'}

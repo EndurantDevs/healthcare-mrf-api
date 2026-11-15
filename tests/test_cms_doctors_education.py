@@ -421,7 +421,7 @@ async def _assert_native_family_rollback(fixture):
                     await preparation.apply_prepared_cms_doctors_generation(prepared)
             assert postgres_sqlstate(rejected_generation.value) == "23514"
             assert await authority(fixture) == incumbent
-            assert await stage_oids(fixture, ctx) == prepared.stage_oids
+            assert await stage_oids(fixture, ctx) == preparation.prepared_stage_relations(prepared)
         finally:
             async with fixture.engine.begin() as admin:
                 await admin.execute(

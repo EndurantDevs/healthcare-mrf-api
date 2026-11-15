@@ -219,7 +219,7 @@ async def test_relationship_replacement_rejects_invalid_or_unbounded_source_sele
 async def test_carry_forward_cannot_target_its_sealed_source_schema(monkeypatch):
     connection, target = _connection(), _candidate()
     verify = AsyncMock()
-    monkeypatch.setattr(store, "verify_fhir_catalog_snapshot", verify)
+    monkeypatch.setattr(store, "validate_fhir_catalog_snapshot_record", verify)
     with pytest.raises(ValueError, match="registry_fhir_catalog_store_snapshot_immutable"):
         await store.copy_fhir_catalog_snapshot(
             connection,
@@ -237,9 +237,9 @@ async def test_carry_forward_cannot_target_its_sealed_source_schema(monkeypatch)
 async def test_carry_forward_oversized_first_row_rolls_back_without_advancing_cursor(monkeypatch):
     connection = _connection()
     verify = AsyncMock()
-    monkeypatch.setattr(store, "verify_fhir_catalog_snapshot", verify)
+    monkeypatch.setattr(store, "validate_fhir_catalog_snapshot_record", verify)
     page_by_field = {"seen": 1, "first_bytes": 128, "copied": 0}
-    connection.fetchrow.side_effect = [connection.fetchrow.return_value, page_by_field]
+    connection.fetchrow.return_value = page_by_field
     previous_by_field = {"schema_name": "previous_catalog"}
     with pytest.raises(ValueError, match="registry_fhir_catalog_store_row_too_large"):
         await store.copy_fhir_catalog_snapshot(
@@ -253,4 +253,4 @@ async def test_carry_forward_oversized_first_row_rolls_back_without_advancing_cu
         )
     verify.assert_awaited_once_with(connection, previous_by_field)
     assert connection.events == ["begin", "rollback"]
-    assert connection.fetchrow.await_count == 2
+    assert connection.fetchrow.await_count == 1

@@ -26,10 +26,7 @@ from process import registry_record_store as record_store
 from process.company_registry_assertion_values import CONTRACT
 from process.registry_approval_preview import preview_registry_approval
 from process.registry_approval_store import RegistryApprovalConflict, approve_registry_records
-from process.registry_management_permissions import (
-    install_registry_management_permissions,
-    verify_registry_management_permissions,
-)
+from process.registry_management_permissions import install_registry_management_permissions
 from process.registry_manual_undo import (
     RegistryManualUndoCommand,
     prepare_registry_manual_undo,
@@ -589,7 +586,6 @@ async def test_outer_rollback_and_post_head_privilege_failure_preserve_state(ass
         assert await _accounting(fixture) == before
     finally:
         await _install(fixture)
-    assert await verify_registry_management_permissions(fixture.connection, **fixture.permission_arguments())
 
 
 async def test_legacy_empty_history_rejects_populated_assertion_rows(assertion_db):

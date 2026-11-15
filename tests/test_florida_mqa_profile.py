@@ -1585,9 +1585,8 @@ class _WorkflowTransaction:
     def in_transaction(self):
         return True
 
-    async def scalar(self, statement, parameters):
-        assert "n.nspname='hp_snapshot_retention'" in str(statement)
-        assert parameters["relation"].endswith('."provider_profile_source_pin"')
+    async def scalar(self, statement):
+        assert "to_regclass('hp_snapshot_retention.reference_preparation')" in str(statement)
         return None
 
     async def execute(self, statement):

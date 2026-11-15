@@ -158,12 +158,12 @@ def _reject_documents(original):
         (("extra",), True),
         (("lease_digest",), "invalid"),
         (("runtime_roles",), [original.owner_role]),
-        (("address_stages", 0, 2), True),
-        (("address_ownership", "schema_oid"), 0),
-        (("address_ownership", "schema_oid"), 2**32),
-        (("address_ownership", "relation_oids", 0, "oid"), 2**32),
+        (("address_stages", 0, 0), "unexpected_target"),
+        (("address_stages", 0, 1), "invalid.stage"),
+        (("address_ownership", "relations", 0, "schema_name"), "another_schema"),
+        (("address_ownership", "relations", 0, "relation_name"), "unexpected_relation"),
         (("recipe", "source_pin", "retained_epoch", "epoch_id"), str(uuid4())),
-        (("request", "source_pin", "resource_table_oid"), True),
+        (("request", "source_pin", "dataset_id"), ""),
         (("request", "extra_data_upper_bound_bytes"), False),
         (("request", "binding_coordinates", "extra"), True),
     )
@@ -191,7 +191,7 @@ async def test_native_catalog_identity_preserves_search_path_and_rejects_index_l
             await session.execute(text("SELECT set_config('search_path',:path,true)"), {"path": search_path})
             assert await _probe(session, capture) == capture.retained
             assert await session.scalar(text("SELECT current_setting('search_path')")) == search_path
-        with pytest.raises(ValueError, match="registry_cms_prepared_pair_invalid"):
+        with pytest.raises(ValueError, match="registry_cms_source_pair_invalid"):
             async with session.begin_nested():
                 await session.execute(
                     text(f'DROP INDEX "{address_schema}".entity_address_unified_canonical_network_ids_idx')
@@ -232,27 +232,18 @@ async def test_native_finalized_v2_probe_preserves_witness(prepared_capture):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tamper", ["oid", "comment", "address_acl", "raw_acl"])
+@pytest.mark.parametrize("tamper", ["name", "comment"])
 async def test_native_tampering_refuses_removal(prepared_capture, tamper):
     capture = prepared_capture
     address = capture.retained.address_ownership.schema_name
-    raw = capture.retained.recipe.source_pin.retained_epoch.schema_name
     async with capture.database.session_factory() as session, session.begin():
-        if tamper in {"oid", "comment"}:
-            document = json.loads(_json(capture.retained.as_dict()))
-            if tamper == "oid":
-                document["address_ownership"]["schema_oid"] += 1
-            else:
-                document["lease_digest"] = "0" * 64
-            comment = (retention._PREPARED_COMMENT + _json(document)).replace("'", "''")
-            await (await cleanup.native_driver(session)).execute(f"COMMENT ON SCHEMA \"{address}\" IS '{comment}'")
+        document = json.loads(_json(capture.retained.as_dict()))
+        if tamper == "name":
+            document["address_ownership"]["relations"][0]["relation_name"] = "other_relation"
         else:
-            schema, table = (
-                (address, "entity_address_unified")
-                if tamper == "address_acl"
-                else (raw, "provider_directory_dataset_resource")
-            )
-            await session.execute(text(f'GRANT UPDATE ON "{schema}"."{table}" TO "{capture.roles[1]}"'))
+            document["lease_digest"] = "0" * 64
+        comment = (retention._PREPARED_COMMENT + _json(document)).replace("'", "''")
+        await (await cleanup.native_driver(session)).execute(f"COMMENT ON SCHEMA \"{address}\" IS '{comment}'")
     async with capture.database.session_factory() as session, session.begin():
         await _repeatable_read(session)
         with pytest.raises(ValueError):

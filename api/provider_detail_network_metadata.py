@@ -16,10 +16,8 @@ from api.network_address_scope import (
     scoped_address_parameters,
     scoped_address_relation_sql,
 )
-from api.network_read_execution import execute_network_read, has_network_read_inventory
 from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
-from process.network_read_identity import NetworkReadIdentityError
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_network_catalog_read import RegistryNetworkCatalogError, _closed_json
 
@@ -220,9 +218,7 @@ async def _read_memberships(session, manifest, copies_by_office, scope, include_
             candidate=_identifier(manifest.schema_name),
             control=_identifier(registry_schema()),
         )
-        summary_by_field = (
-            (await execute_network_read(session, text(statement), parameters_by_name)).mappings().one_or_none()
-        )
+        summary_by_field = (await session.execute(text(statement), parameters_by_name)).mappings().one_or_none()
         if summary_by_field is None or summary_by_field["bounded"] is not True:
             raise RegistryNetworkCatalogError("registry_network_catalog_response_bounds")
         memberships_by_office = _membership_map(
@@ -311,30 +307,9 @@ async def project_provider_network_metadata(provider_rows, *, session, include_s
         ) from error
 
 
-def _can_reconstruct_detail_read(request, provider):
-    """Only an owned read without geocoding side effects can start a fresh response."""
-    session = getattr(getattr(request, "ctx", None), "sa_session", None)
-    config = getattr(getattr(request, "app", None), "config", {})
-    return (
-        not getattr(request, "responded", False)
-        and not provider.db.has_reader_session()
-        and provider.db._transaction_binding() is None
-        and not has_network_read_inventory(session)
-        and (session is None or not session.in_transaction())
-        and not config.get("NPI_API_UPDATE_GEOCODE")
-        and not provider._is_truthy_arg(request.args.get("force_address_update"), default=False)
-        and not provider._is_truthy_arg(
-            request.args.get("sync_geocode"),
-            default=provider._is_environment_flag_enabled(
-                "HLTHPRT_NPI_DETAIL_SYNC_GEOCODE", "HLTHPRT_NPI_API_SYNC_GEOCODE"
-            ),
-        )
-    )
-
-
 async def read_direct_detail_response(request, npi):
     """Keep direct detail and exact membership on the same active Reader."""
-    from sanic.exceptions import SanicException, ServiceUnavailable
+    from sanic.exceptions import SanicException
 
     from api.endpoint import npi as provider
 
@@ -354,17 +329,7 @@ async def read_direct_detail_response(request, npi):
         refusal.headers = {**(refusal.headers or {}), "Cache-Control": "private, no-store"}
         raise
     if selector is None:
-        max_attempts = 3 if _can_reconstruct_detail_read(request, provider) else 1
-        for attempt in range(1, max_attempts + 1):
-            try:
-                return await provider.read_npi_detail(request, npi)
-            except ServiceUnavailable as error:
-                if (
-                    attempt == max_attempts
-                    or type(error.__cause__) is not NetworkReadIdentityError
-                    or not _can_reconstruct_detail_read(request, provider)
-                ):
-                    raise
+        return await provider.read_npi_detail(request, npi)
     async with provider.provider_profile_read_snapshot(
         provider.db, provider._runtime_db_schema(), include_detail=True
     ) as session:

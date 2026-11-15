@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from process.network_address_projection import PinnedAddressSource
+from process.network_compact_layout import CompactAddressRelation
 from process.network_compact_retention import (
     NetworkCompactRetentionError,
     require_network_compact_artifacts_unreferenced,
@@ -24,6 +25,7 @@ from process.registry_candidate_composition import (
     compose_registry_membership_candidate,
 )
 from process.registry_initial_source_composition import RegistryInitialSourceError
+from process.registry_publication_worker import CONFIG_ENV
 from process.registry_record_store import RegistryRecordCommand, apply_registry_record_command
 from process.uhc_flex_practitioner_async_safety import drain_operation
 from tests import test_network_compact_publication_postgres as publication_tests
@@ -196,7 +198,7 @@ async def _current_predecessor(fixture, historical):
         manifest = await resolve_network_serving_manifest(
             fixture.execution_connection, control_schema=fixture.control_schema
         )
-    assert manifest.compact_layout.base.table_oid == fixture.address.descriptor["table"]["oid"]
+    assert manifest.compact_layout.base == CompactAddressRelation(**fixture.address.descriptor["table"])
     return manifest
 
 
@@ -291,7 +293,8 @@ async def _assert_no_seal(fixture, copy_target):
 async def _reject_extra_heap_row(fixture, copy_target, selected):
     table = f'"{copy_target.schema_name}".entity_address_unified'
     extra_key = "f" * 64
-    await fixture.execution_connection.execute(
+    # The ready candidate is closed to its writer, so the administrator changes its data.
+    await fixture.connection.execute(
         f"INSERT INTO {table} SELECT (jsonb_populate_record(NULL::{table},to_jsonb(original)||$1::jsonb)).* "
         f"FROM {table} original WHERE location_key=$2",
         json.dumps({"location_key": extra_key}),
@@ -302,13 +305,13 @@ async def _reject_extra_heap_row(fixture, copy_target, selected):
             await _seal(fixture, copy_target)
         await _assert_no_seal(fixture, copy_target)
     finally:
-        await fixture.execution_connection.execute(f"DELETE FROM {table} WHERE location_key=$1", extra_key)
+        await fixture.connection.execute(f"DELETE FROM {table} WHERE location_key=$1", extra_key)
 
 
 async def _reject_extra_binding(fixture, copy_target, selected):
     table = f'"{copy_target.schema_name}".provider_location_binding'
     location = uuid4()
-    await fixture.execution_connection.execute(
+    await fixture.connection.execute(
         f"INSERT INTO {table} VALUES('provider_directory','unselected-provider',$1,$2,'provider_directory',$3)",
         location,
         selected["location_key"],
@@ -319,7 +322,7 @@ async def _reject_extra_binding(fixture, copy_target, selected):
             await _seal(fixture, copy_target)
         await _assert_no_seal(fixture, copy_target)
     finally:
-        await fixture.execution_connection.execute(f"DELETE FROM {table} WHERE location_id=$1", location)
+        await fixture.connection.execute(f"DELETE FROM {table} WHERE location_id=$1", location)
 
 
 async def _publish_with_refusals(fixture, copy_target, selected):
@@ -336,14 +339,16 @@ async def _publish_with_refusals(fixture, copy_target, selected):
         await _reject_extra_binding(fixture, target, selected)
         return await _seal(fixture, target)
 
-    return await prepare_and_publish_network_candidate(
-        fixture.execution_connection,
-        copy_target,
-        fixture.source,
-        **fixture.writer_roles,
-        control_schema=fixture.control_schema,
-        seal_candidate=independently_seal,
-    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv(CONFIG_ENV, json.dumps({"preparation_roles": fixture.preparation_roles}))
+        return await prepare_and_publish_network_candidate(
+            fixture.execution_connection,
+            copy_target,
+            fixture.source,
+            **fixture.writer_roles,
+            control_schema=fixture.control_schema,
+            seal_candidate=independently_seal,
+        )
 
 
 async def _remove_offices(fixture, reviewed, first_pin):
@@ -418,12 +423,10 @@ async def _assert_native_projection(fixture, copy_target, retained_source, offic
 
 async def _assert_historical_carrier_retained(fixture, manifest):
     assert not fixture.connection.is_in_transaction()
-    oids = await fixture.connection.fetchrow(
-        "SELECT to_regclass($1)::oid::bigint,to_regclass($2)::oid::bigint",
-        manifest.schema_name + ".entity_address_unified",
-        manifest.schema_name + ".provider_location_binding",
-    )
-    assert all(type(oid) is int for oid in oids.values())
+    relations = [
+        CompactAddressRelation(manifest.schema_name, name)
+        for name in ("entity_address_unified", "provider_location_binding")
+    ]
     transaction = fixture.connection.transaction(isolation="read_committed")
     await transaction.start()
     try:
@@ -431,10 +434,10 @@ async def _assert_historical_carrier_retained(fixture, manifest):
             f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false WHERE generation_id=$1',
             manifest.generation_id,
         )
-        for oid in oids.values():
+        for relation in relations:
             with pytest.raises(NetworkCompactRetentionError, match="network_compact_retention_artifact_referenced"):
                 await require_network_compact_artifacts_unreferenced(
-                    fixture.connection, (oid,), control_schema=fixture.control_schema
+                    fixture.connection, (relation,), control_schema=fixture.control_schema
                 )
     finally:
         await transaction.rollback()

@@ -8,6 +8,7 @@ import secrets
 from typing import Any
 
 from db.connection import db
+from process.entity_address_cutover_contract import postgres_sqlstate
 from process.provider_directory_rooted_graph_bulk import copy_initial_root_work
 from process.provider_directory_rooted_graph_persistence_sql import (
     root_closure_sql,
@@ -40,12 +41,10 @@ from process.provider_directory_rooted_graph_store_support import (
     ACQUISITION_TABLE,
     WORK_TABLE,
     assert_identity_row,
-    function_ref,
     identity_fields,
     insert_work_spec,
     rooted_graph_transaction,
     row_fields,
-    set_store_action,
     table_ref,
 )
 
@@ -115,7 +114,7 @@ async def _initial_work_census(
                    count(*) FILTER (
                        WHERE kind = 'full_insurance_plan_census'
                    )::bigint AS plan_count
-              FROM {table_ref("pdrgw_" + identity.acquisition_id[6:])}
+              FROM {table_ref(WORK_TABLE)}
              WHERE acquisition_id = :acquisition_id
                AND kind = 'exact_reference_search' AND resource_type = 'PractitionerRole';
             """,
@@ -148,11 +147,6 @@ async def initialize_provider_directory_rooted_graph_acquisition(
         )
         if header["status"] == "sealed":
             return created_count
-        await database.scalar(
-            f"SELECT {function_ref('prepare_provider_directory_rooted_graph_storage')}(:acquisition_id);",
-            acquisition_id=identity.acquisition_id,
-        )
-        await set_store_action(database, "initialize", identity.acquisition_id)
         await _insert_initial_root_work(database, identity)
         census = await _initial_work_census(database, identity)
         if census != {
@@ -161,10 +155,6 @@ async def initialize_provider_directory_rooted_graph_acquisition(
             "plan_count": 0,
         }:
             raise ProviderDirectoryRootedGraphStoreError("state")
-        await database.scalar(
-            f"SELECT {function_ref('attach_provider_directory_rooted_graph_storage')}(:acquisition_id)",
-            acquisition_id=identity.acquisition_id,
-        )
         initialized_count = created_count
     return initialized_count
 
@@ -254,9 +244,16 @@ async def _root_closure_fields(
             acquisition_id=identity.acquisition_id,
         ),
     )
+    from db.plan_release_storage import storage_relation
+    from process.provider_directory_rooted_graph_store_support import schema_name
+    from process.provider_directory_source_storage_binding import dataset_source_relations
+
+    root = "provider_directory_dataset_resource"
+    relations = await dataset_source_relations(database, schema_name(), identity.root_dataset_id, (root,))
+    resource_relation = storage_relation(relations[root]["schema"], relations[root]["name"])
     closure_fields = row_fields(
         await database.first(
-            root_closure_sql(),
+            root_closure_sql(resource_relation=resource_relation),
             acquisition_id=identity.acquisition_id,
         )
     )
@@ -283,14 +280,7 @@ async def _admit_and_claim_census(
         closure_scope="census",
     )
     if closure_fields["census_count"] == 0:
-        await set_store_action(database, "census", identity.acquisition_id)
         await insert_work_spec(database, identity.acquisition_id, census_spec)
-    await set_store_action(
-        database,
-        "claim_census",
-        identity.acquisition_id,
-        lease_token,
-    )
     claimed_row = await _claim_work_row(
         database,
         identity.acquisition_id,
@@ -355,7 +345,6 @@ async def claim_provider_directory_rooted_graph_work(
         raise ValueError("provider_directory_rooted_graph_lease_invalid")
     lease_token = secrets.token_hex(32)
     async with rooted_graph_transaction(database):
-        await set_store_action(database, "claim", acquisition_id, lease_token)
         claimed_row = await _claim_work_row(
             database,
             acquisition_id,
@@ -372,17 +361,24 @@ async def heartbeat_provider_directory_rooted_graph_work(
     *,
     lease_seconds: int = 300,
     database: Any = db,
-) -> None:
-    """Extend only the exact active query lease generation."""
+) -> int:
+    """Return renewed row count, or zero when the exact row is busy."""
 
     if type(claim) is not ProviderDirectoryRootedGraphWorkClaim:
         raise ValueError("provider_directory_rooted_graph_claim_invalid")
     if type(lease_seconds) is not int or not 30 <= lease_seconds <= 3600:
         raise ValueError("provider_directory_rooted_graph_lease_invalid")
-    async with rooted_graph_transaction(database):
-        await set_store_action(database, "heartbeat", claim.acquisition_id, claim.lease_token)
-        count = await database.status(
-            f"""
+    try:
+        async with rooted_graph_transaction(database, renewal=True):
+            # Probe before the clock check: an admitted writer can hold this row past expiry.
+            await database.first(
+                f"SELECT query_id FROM {table_ref(WORK_TABLE)} "
+                "WHERE acquisition_id=:acquisition_id AND query_id=:query_id FOR UPDATE NOWAIT",
+                acquisition_id=claim.acquisition_id,
+                query_id=claim.query_id,
+            )
+            count = await database.status(
+                f"""
             UPDATE {table_ref(WORK_TABLE)}
                SET lease_expires_at = transaction_timestamp()
                        + make_interval(secs => :lease_seconds),
@@ -393,14 +389,19 @@ async def heartbeat_provider_directory_rooted_graph_work(
                AND lease_token = :lease_token
                AND lease_expires_at > clock_timestamp();
             """,
-            acquisition_id=claim.acquisition_id,
-            query_id=claim.query_id,
-            attempt=claim.attempt,
-            lease_token=claim.lease_token,
-            lease_seconds=lease_seconds,
-        )
+                acquisition_id=claim.acquisition_id,
+                query_id=claim.query_id,
+                attempt=claim.attempt,
+                lease_token=claim.lease_token,
+                lease_seconds=lease_seconds,
+            )
+    except Exception as error:
+        if postgres_sqlstate(error) == "55P03":
+            return 0
+        raise
     if count != 1:
         raise ProviderDirectoryRootedGraphStoreError("lease_lost")
+    return count
 
 
 async def release_provider_directory_rooted_graph_work(
@@ -413,7 +414,6 @@ async def release_provider_directory_rooted_graph_work(
     if type(claim) is not ProviderDirectoryRootedGraphWorkClaim:
         raise ValueError("provider_directory_rooted_graph_claim_invalid")
     async with rooted_graph_transaction(database):
-        await set_store_action(database, "release", claim.acquisition_id, claim.lease_token)
         count = await database.status(
             f"""
             UPDATE {table_ref(WORK_TABLE)}

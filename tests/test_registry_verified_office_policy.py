@@ -171,7 +171,7 @@ def _fixture(*, mode="verified"):
         recipes=recipes,
         approved=approved,
         address=address,
-        inputs=(address, ("fixture_reader",)),
+        inputs=(address, ()),
         stage=stage,
         summary=summary,
         request=request,
@@ -350,7 +350,7 @@ async def test_office_replay_uses_real_retention_multiset_comparison_and_cleans_
     )
     fixture.stage.office_matches.page_proofs_by_key = {"page": (1, hashlib.sha256(raw.encode()).hexdigest())}
     connection = SimpleNamespace(
-        is_in_transaction=lambda: True, fetchval=AsyncMock(side_effect=[True, 2, False]), execute=AsyncMock()
+        is_in_transaction=lambda: True, fetchval=AsyncMock(side_effect=[2, False]), execute=AsyncMock()
     )
     from process import network_initial_cms_office_bindings as native_offices
 
@@ -363,10 +363,11 @@ async def test_office_replay_uses_real_retention_multiset_comparison_and_cleans_
     await offices._legacy_verified_bindings(
         connection, fixture.target, fixture.candidate, fixture.approved, "expected_offices", "fixture"
     )
-    assert "EXCEPT ALL" in connection.fetchval.await_args_list[2].args[0]
+    assert "EXCEPT ALL" in connection.fetchval.await_args_list[1].args[0]
     assert copier.await_args.args[3] == [("npi", "1234567893", UUID(int=1), "a" * 64, "npi", "1234567893")]
     verify.assert_awaited_once()
     assert [call.args[0] for call in connection.execute.await_args_list] == [
+        f'LOCK TABLE "{fixture.target.schema_name}".network_membership_source IN ACCESS SHARE MODE',
         f'DROP TABLE pg_temp."{fixture.stage.table_name}"',
         f'DROP TABLE pg_temp."{fixture.stage.office_matches.table_name}"',
     ]
@@ -375,7 +376,7 @@ async def test_office_replay_uses_real_retention_multiset_comparison_and_cleans_
 async def test_office_retention_difference_is_fatal_before_any_binding_copy(monkeypatch):
     fixture = _fixture()
     connection = SimpleNamespace(
-        is_in_transaction=lambda: True, fetchval=AsyncMock(side_effect=[True, 2, True]), execute=AsyncMock()
+        is_in_transaction=lambda: True, fetchval=AsyncMock(side_effect=[2, True]), execute=AsyncMock()
     )
     monkeypatch.setattr(policy, "reconstruct_legacy_verified_office_stage", AsyncMock(return_value=fixture.stage))
     copier = AsyncMock()
@@ -385,7 +386,7 @@ async def test_office_retention_difference_is_fatal_before_any_binding_copy(monk
             connection, fixture.target, fixture.candidate, fixture.approved, "expected_offices", "fixture"
         )
     copier.assert_not_awaited()
-    assert connection.execute.await_count == 2
+    assert connection.execute.await_count == 3
 
 
 async def test_failed_reconstruction_drains_cleanup_even_when_cancellation_arrives(monkeypatch):
@@ -438,7 +439,7 @@ async def test_office_copy_drains_one_page_before_stage_cleanup_and_preserves_ca
     from process import network_initial_cms_office_bindings as native_offices
 
     connection = SimpleNamespace(
-        is_in_transaction=lambda: True, fetchval=AsyncMock(side_effect=[True, 2, False]), execute=AsyncMock()
+        is_in_transaction=lambda: True, fetchval=AsyncMock(side_effect=[2, False]), execute=AsyncMock()
     )
     entered, release, events = asyncio.Event(), asyncio.Event(), []
 

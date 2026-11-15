@@ -18,9 +18,9 @@ import pytest
 from db.connection import Database
 from process import provider_directory_profile_capacity as capacity
 from tests.provider_directory_profile_artifact_pg_fixtures import (
-    _ArtifactFixture,
     _POSTGRES_DSN_ENV,
     _SELECTED_RESOURCE_TYPES,
+    _ArtifactFixture,
     _configure_database,
     _create_complete_empty_scope_layout,
     _create_source_and_resource_fixture,
@@ -31,9 +31,9 @@ from tests.test_provider_directory_profile_control_capacity import (
     _control_wal_plan_input,
 )
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 _RUN_ID = "run_" + "a" * 32
+
 
 def _artifact_relation_caps(
     artifact_scratch_cap: int,
@@ -76,22 +76,19 @@ def _capacity_geometry(
             artifact_scope_worker_count=2,
             artifact_scope_batch_size=1,
             artifact_scope_projection_hash=fixture.projection.projection_hash,
-            artifact_scope_projected_logical_bytes=(
-                fixture.projection.projected_logical_bytes
-            ),
+            artifact_scope_projected_logical_bytes=(fixture.projection.projected_logical_bytes),
             max_artifact_scope_rows=fixture.projection.projected_rows,
-            tablespace_oid=fixture.tablespace_oid,
+            relations={
+                role: {**coordinate, "schema": fixture.schema}
+                for role, coordinate in _geometry_payload()["relations"].items()
+            },
             temp_file_limit_bytes=1024 * 1024,
             minimum_remaining_bytes=1,
             relation_byte_caps=_artifact_relation_caps(
                 artifact_scratch_cap,
                 artifact_wal_cap,
             ),
-            control_wal_plan_input_hash=(
-                capacity.profile_control_wal_plan_input_hash(
-                    control_plan_input
-                )
-            ),
+            control_wal_plan_input_hash=(capacity.profile_control_wal_plan_input_hash(control_plan_input)),
             control_wal_upper_bound_bytes=1,
             control_metadata_data_upper_bound_bytes=1,
         )
@@ -104,12 +101,8 @@ def _capacity_geometry(
         capacity.capacity_geometry_payload(
             replace(
                 seed_geometry,
-                control_wal_upper_bound_bytes=(
-                    seed_projection.total_control_wal_bytes
-                ),
-                control_metadata_data_upper_bound_bytes=(
-                    seed_projection.total_control_metadata_data_bytes
-                ),
+                control_wal_upper_bound_bytes=(seed_projection.total_control_wal_bytes),
+                control_metadata_data_upper_bound_bytes=(seed_projection.total_control_metadata_data_bytes),
             )
         )
     )
@@ -125,14 +118,12 @@ def _admission(
         compact_batch_count=100,
         affected_source_count=100,
     )
-    control_projection = (
-        capacity.revalidate_profile_control_wal_projection(
+    control_projection = capacity.revalidate_profile_control_wal_projection(
+        geometry,
+        capacity.project_profile_control_wal_capacity(
             geometry,
-            capacity.project_profile_control_wal_capacity(
-                geometry,
-                control_plan_input,
-            ),
-        )
+            control_plan_input,
+        ),
     )
     return importer._ProviderDirectoryProfileCapacityAdmission(
         geometry=geometry,
@@ -140,10 +131,7 @@ def _admission(
         lease=SimpleNamespace(
             attestation_id="1" * 64,
             lease_digest="2" * 64,
-            max_build_deadline=(
-                datetime.datetime.now(datetime.UTC)
-                + datetime.timedelta(minutes=10)
-            )
+            max_build_deadline=(datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=10)),
         ),
         database_identity=SimpleNamespace(),
         build_id="pdpb_" + "b" * 32,
@@ -175,15 +163,11 @@ async def _project_scope_relation(
         )
         or 0
     )
-    layout = (
-        await importer._provider_directory_profile_relation_storage_fingerprint(
-            relation_oid,
-            expected_persistence="u",
-        )
+    layout = await importer._provider_directory_profile_relation_storage_fingerprint(
+        relation_oid,
+        expected_persistence="u",
     )
-    projected_table_by_name = {
-        table.table_name: table for table in fixture.projection.tables
-    }
+    projected_table_by_name = {table.table_name: table for table in fixture.projection.tables}
     projected_table = projected_table_by_name[base_table_name]
     projection = capacity.project_profile_scratch_capacity(
         probe_geometry,
@@ -218,9 +202,7 @@ async def _project_scope_budget(
         capacity.ProviderDirectoryProfileScratchProjection,
     ] = {}
     relation_refs: list[str] = []
-    for base_table_name, scope_table_name in sorted(
-        fixture.relation_by_table.items()
-    ):
+    for base_table_name, scope_table_name in sorted(fixture.relation_by_table.items()):
         relation_ref, scope_projection = await _project_scope_relation(
             fixture,
             probe_geometry,
@@ -229,19 +211,9 @@ async def _project_scope_budget(
         )
         projections_by_table[base_table_name] = scope_projection
         relation_refs.append(relation_ref)
-    base_bytes = (
-        await importer._provider_directory_profile_capacity_relation_bytes(
-            relation_refs
-        )
-    )
-    growth_bytes = sum(
-        projection.growth_bytes
-        for projection in projections_by_table.values()
-    )
-    wal_bytes = sum(
-        projection.wal_bytes
-        for projection in projections_by_table.values()
-    )
+    base_bytes = await importer._provider_directory_profile_capacity_relation_bytes(relation_refs)
+    growth_bytes = sum(projection.growth_bytes for projection in projections_by_table.values())
+    wal_bytes = sum(projection.wal_bytes for projection in projections_by_table.values())
     return base_bytes, growth_bytes, wal_bytes, projections_by_table
 
 
@@ -250,9 +222,7 @@ async def _scope_row_count(fixture: _ArtifactFixture) -> int:
     for table_name in fixture.relation_by_table.values():
         total_rows += int(
             await fixture.database.scalar(
-                "SELECT count(*) FROM "
-                + importer._unscoped_qt(fixture.schema, table_name)
-                + ";"
+                "SELECT count(*) FROM " + importer._unscoped_qt(fixture.schema, table_name) + ";"
             )
             or 0
         )
@@ -295,19 +265,15 @@ async def _artifact_fixture(monkeypatch: pytest.MonkeyPatch):
     try:
         await database.connect()
         await _require_postgresql_18(database)
-        await database.status(
-            f"CREATE SCHEMA {importer._q(schema)};"
-        )
+        await database.status(f"CREATE SCHEMA {importer._q(schema)};")
         is_database_created = True
         monkeypatch.setattr(importer, "db", database)
         fence = await _create_source_and_resource_fixture(database, schema)
-        projection = (
-            await importer._provider_directory_artifact_scope_exact_projection(
-                schema,
-                fence,
-                _SELECTED_RESOURCE_TYPES,
-                batch_size=1,
-            )
+        projection = await importer._provider_directory_artifact_scope_exact_projection(
+            schema,
+            fence,
+            _SELECTED_RESOURCE_TYPES,
+            batch_size=1,
         )
         relation_by_table = await _create_complete_empty_scope_layout(
             database,
@@ -334,9 +300,7 @@ async def _artifact_fixture(monkeypatch: pytest.MonkeyPatch):
     finally:
         importer.db = original_db
         if is_database_created:
-            await database.status(
-                f"DROP SCHEMA IF EXISTS {importer._q(schema)} CASCADE;"
-            )
+            await database.status(f"DROP SCHEMA IF EXISTS {importer._q(schema)} CASCADE;")
         await database.disconnect()
 
 
@@ -344,16 +308,10 @@ def _assert_artifact_projection_is_nontrivial(
     fixture: _ArtifactFixture,
 ) -> None:
     """Require high-entropy source, role, and affiliation projections."""
-    projection_by_type = {
-        table.resource_type: table for table in fixture.projection.tables
-    }
+    projection_by_type = {table.resource_type: table for table in fixture.projection.tables}
     assert fixture.projection.tables[0].projected_logical_bytes > 16_000
-    assert projection_by_type[
-        "PractitionerRole"
-    ].projected_logical_bytes > 32_000
-    assert projection_by_type[
-        "OrganizationAffiliation"
-    ].projected_logical_bytes > 32_000
+    assert projection_by_type["PractitionerRole"].projected_logical_bytes > 32_000
+    assert projection_by_type["OrganizationAffiliation"].projected_logical_bytes > 32_000
 
 
 async def _admit_artifact_geometry(
@@ -361,23 +319,15 @@ async def _admit_artifact_geometry(
     geometry: capacity.ProviderDirectoryProfileCapacityGeometry,
 ):
     """Install one exact capacity admission and return its context token."""
-    initial_wal_lsn = str(
-        await fixture.database.scalar(
-            "SELECT pg_current_wal_insert_lsn()::text;"
-        )
-    )
-    return importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
-        _admission(geometry, initial_wal_lsn)
-    )
+    initial_wal_lsn = str(await fixture.database.scalar("SELECT pg_current_wal_insert_lsn()::text;"))
+    return importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(_admission(geometry, initial_wal_lsn))
 
 
 async def _materialize_two_worker_artifact_scope(
     fixture: _ArtifactFixture,
 ) -> None:
     """Materialize the source then the two selected resource tables."""
-    projection_by_table = {
-        table.table_name: table for table in fixture.projection.tables
-    }
+    projection_by_table = {table.table_name: table for table in fixture.projection.tables}
     source_table = importer.ProviderDirectorySource.__tablename__
     await importer._materialize_provider_directory_artifact_source_scope(
         fixture.schema,

@@ -84,7 +84,7 @@ def runtime(monkeypatch):
 
     async def capture(driver, actual_policy, names, **kwargs):
         events.append(("capture", names))
-        return {name: {"name": name, "oid": 10, "owner": 20, "layout_sha256": "c" * 64} for name in names}
+        return {name: {"name": name, "kind": "r", "persistence": "p"} for name in names}
 
     async def complete(*args):
         events.append(("complete", None))
@@ -99,7 +99,7 @@ def runtime(monkeypatch):
     monkeypatch.setattr(identities, "source_copy_session", lambda: session)
     monkeypatch.setattr(identities, "source_transaction", connection.transaction)
     monkeypatch.setattr(identities, "source_owner_transaction", connection.owner)
-    monkeypatch.setattr(identities, "_source_identity", AsyncMock(return_value=99))
+    monkeypatch.setattr(identities, "_source_identity", AsyncMock(return_value=(stage.schema, stage.name)))
     monkeypatch.setattr(identities, "_complete", complete)
     monkeypatch.setattr(identities.storage, "_close_grants", AsyncMock())
     monkeypatch.setattr(identities.storage, "_capture", capture)
@@ -165,7 +165,7 @@ async def test_private_preparation_uses_bounded_copy_then_indexes_then_complete_
         if event == "statement":
             assert "INSERT INTO" not in payload and "pg_advisory" not in payload
     receipt = runtime.context["context"][identities._CONTEXT_KEY]["group"]
-    assert receipt.source_oid == 99 and receipt.count == count
+    assert receipt.source_schema == "mrf" and receipt.count == count
 
 
 @pytest.mark.asyncio
@@ -251,13 +251,13 @@ async def test_successful_identity_cut_is_four_grouped_writes_in_one_savepoint(r
 
 
 @pytest.mark.asyncio
-async def test_changed_native_policy_or_layout_refuses_before_global_dml(runtime):
+async def test_changed_source_schema_or_layout_refuses_before_global_dml(runtime):
     await prepare(runtime, "group")
     entry = runtime.context["context"][identities._CONTEXT_KEY]["group"]
-    changed = replace(entry, policy_identity=("wrong",))
-    with pytest.raises(RuntimeError, match="policy_changed"):
+    changed = replace(entry, source_schema="wrong")
+    with pytest.raises(RuntimeError, match="source_schema_changed"):
         await identities._verify_candidate(runtime.database, changed, runtime.context)
-    changed = replace(entry, table={**entry.table, "oid": 11})
+    changed = replace(entry, table={**entry.table, "kind": "p"})
     with pytest.raises(RuntimeError, match="storage_changed"):
         await identities._verify_candidate(runtime.database, changed, runtime.context)
 
@@ -289,6 +289,8 @@ async def test_scalar_compatibility_only_reads_prepared_map_and_preserves_order(
 async def test_family_failure_rolls_back_identity_cut_after_catch(runtime, monkeypatch, failure):
     doctors = importlib.import_module("process.cms_doctors")
 
+    ddl_session = SimpleNamespace(scalar=AsyncMock(return_value="0"), execute=AsyncMock())
+    runtime.database._transaction_binding = lambda: SimpleNamespace(session=ddl_session)
     monkeypatch.setattr(doctors, "db", runtime.database)
     monkeypatch.setattr(doctors, "source_owner_transaction", runtime.owner)
     publish = AsyncMock(side_effect=lambda *args: runtime.events.append(("published identities", None)))
@@ -302,6 +304,9 @@ async def test_family_failure_rolls_back_identity_cut_after_catch(runtime, monke
         await doctors._apply_locked_cms_doctors_stage(object(), "mrf", "identitytest", identity_ctx=runtime.context)
     publish.assert_awaited_once_with(runtime.database, runtime.context)
     assert runtime.events == [("savepoint", None), ("published identities", None), ("rollback", None)]
+
+    assert str(ddl_session.scalar.await_args.args[0]) == "SHOW lock_timeout"
+    assert ddl_session.execute.await_args.args[1] == {"setting": "lock_timeout", "value": "100ms"}
 
 
 @pytest.mark.asyncio
@@ -333,16 +338,16 @@ async def test_global_winner_reprepares_both_maps_with_fixed_retry_bound(runtime
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replacement", [False, True])
-async def test_cleanup_verifies_exact_private_oid_before_drop(runtime, monkeypatch, replacement):
+async def test_cleanup_verifies_named_map_structure_before_drop(runtime, monkeypatch, replacement):
     await prepare(runtime, "group")
     candidate = runtime.context["context"][identities._CONTEXT_KEY]["group"]
     runtime.database._transaction_binding = lambda: None
-    runtime.connection.fetchval = AsyncMock(return_value=11 if replacement else 10)
+    runtime.connection.fetchval = AsyncMock(return_value=True)
     if replacement:
         monkeypatch.setattr(
             identities.storage,
             "_capture",
-            AsyncMock(return_value={candidate.table["name"]: {**candidate.table, "oid": 11}}),
+            AsyncMock(return_value={candidate.table["name"]: {**candidate.table, "kind": "p"}}),
         )
     runtime.events.clear()
     if replacement:
@@ -402,7 +407,7 @@ async def test_retained_late_failure_rolls_back_cut_without_receipt(runtime, mon
         committed=False,
         schema="mrf",
         import_date="identitytest",
-        stage_oids=(("target", "stage", 41),),
+        stage_relations=(("target", "stage"),),
         incumbent=object(),
         incumbent_authority=object(),
         context=runtime.context["context"],
@@ -413,18 +418,18 @@ async def test_retained_late_failure_rolls_back_cut_without_receipt(runtime, mon
         runtime.events.append(("published identities and family", None))
         if cancelled:
             raise asyncio.CancelledError
-        return SimpleNamespace(relation_oids=(99,))
+        return SimpleNamespace(relations=(("mrf", "wrong_target"),))
 
     native = SimpleNamespace(
         db=runtime.database,
-        make_class=lambda *args: object(),
-        DoctorClinicianAddress=object(),
+        make_class=lambda *args: SimpleNamespace(__tablename__="stage"),
+        DoctorClinicianAddress=SimpleNamespace(__tablename__="target"),
         _lock_cms_doctors_publication=AsyncMock(),
         _apply_locked_cms_doctors_stage=_apply,
     )
     monkeypatch.setattr(preparation, "_native", lambda: native)
     monkeypatch.setattr(preparation, "source_owner_transaction", runtime.owner)
-    monkeypatch.setattr(preparation, "_models", lambda: (object(),))
+    monkeypatch.setattr(preparation, "_models", lambda: (native.DoctorClinicianAddress,))
     for name in ("_assert_stage", "_assert_stage_indexes", "assert_prepared_cms_doctors_seal"):
         monkeypatch.setattr(preparation, name, AsyncMock())
     monkeypatch.setattr(preparation.archive, "_verify_incumbent", AsyncMock())
@@ -445,11 +450,17 @@ async def test_retained_source_cleanup_failure_still_cleans_private_maps(runtime
     from process import cms_doctors_preparation as preparation
 
     runtime.database._transaction_binding = lambda: None
-    monkeypatch.setattr(preparation, "_native", lambda: SimpleNamespace(db=runtime.database))
+    make_class = preparation._native().make_class
+    stages = tuple(
+        (model.__tablename__, make_class(model, "identitytest").__tablename__) for model in preparation._models()
+    )
+    monkeypatch.setattr(preparation, "_native", lambda: SimpleNamespace(db=runtime.database, make_class=make_class))
     monkeypatch.setattr(preparation, "_shielded_cleanup", AsyncMock(side_effect=failure))
     discard = AsyncMock()
     monkeypatch.setattr(preparation, "discard_doctors_identities", discard)
-    prepared = SimpleNamespace(committed=False, schema="mrf", stage_oids=(), import_date="identitytest", context={})
+    prepared = SimpleNamespace(
+        committed=False, schema="mrf", stage_relations=stages, import_date="identitytest", context={}
+    )
     with pytest.raises(type(failure)):
         await preparation.cleanup_prepared_cms_doctors(prepared)
     discard.assert_awaited_once_with(

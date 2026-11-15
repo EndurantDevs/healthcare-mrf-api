@@ -6,7 +6,11 @@ import json
 
 from process.network_address_projection import PinnedAddressSource
 from process.network_fhir_membership_source import FHIR_PLAN_TIER_WITNESS_TRANSFORM, FHIR_SOURCE_WITNESS_TRANSFORM_V2
-from process.registry_source_contribution_store import FACT_ANCHOR_FIELDS, _validate_fact_anchor
+from process.registry_source_contribution_store import (
+    FACT_ANCHOR_FIELDS,
+    LEGACY_FACT_ANCHOR_FIELDS,
+    _validate_fact_anchor,
+)
 from process.registry_source_office_summary_v3 import MAX_V3_RECEIPT_BYTES, _counter, _sha, canonical
 
 VERIFIED_OFFICE_POLICY_V2 = "retained-fhir-verified-office-v2"
@@ -15,7 +19,6 @@ _CONTEXT_FIELDS = {
     "approved_revision",
     "approved_generation_sha256",
     "address_source",
-    "address_identity",
     "origin_manifest_sha256",
     "canonicalizer_version",
 }
@@ -41,7 +44,10 @@ def _closed(document, fields):
 
 
 def _context(context):
-    _closed(context, _CONTEXT_FIELDS)
+    if type(context) is not dict or set(context) not in (_CONTEXT_FIELDS, _CONTEXT_FIELDS | {"address_identity"}):
+        raise ValueError
+    if "address_identity" in context:
+        _closed(context["address_identity"], {"schema_oid", "table_oid", "owner_oid", "identity_sha256"})
     if context["policy_version"] != VERIFIED_OFFICE_POLICY_V2:
         raise ValueError
     _counter(context["approved_revision"])
@@ -51,12 +57,6 @@ def _context(context):
     source = context["address_source"]
     _closed(source, {"schema_name", "table_name", "generation_id"})
     PinnedAddressSource(**source)
-    identity = context["address_identity"]
-    _closed(identity, {"schema_oid", "table_oid", "owner_oid", "identity_sha256"})
-    for name in ("schema_oid", "table_oid", "owner_oid"):
-        if type(identity[name]) is not int or not 0 < identity[name] < 2**32:
-            raise ValueError
-    _sha(identity["identity_sha256"])
     version = context["canonicalizer_version"]
     _closed(version, {"identity_version", "identity_prefix", "ruleset_version", "pub28_sha256"})
     for name in ("identity_version", "ruleset_version"):
@@ -92,10 +92,14 @@ def verified_office_context_sha256(context):
 def validate_verified_office_derivation_v2(document):
     """Validate bounded policy output and its full witness binding; execution needs independent proof."""
     try:
-        _closed(document, _DERIVATION_FIELDS)
+        if type(document) is not dict or set(document) not in (
+            _DERIVATION_FIELDS,
+            _DERIVATION_FIELDS | {"address_identity"},
+        ):
+            raise ValueError
         if type(document["derivation_version"]) is not int or document["derivation_version"] != 2:
             raise ValueError
-        _context({field: document[field] for field in _CONTEXT_FIELDS})
+        _context({field: document[field] for field in _CONTEXT_FIELDS | ({"address_identity"} & document.keys())})
         for name in ("recipe_sha256", "contribution_sha256", "mapping_sha256", "correspondence_sha256"):
             _sha(document[name])
         binding = document["source_binding"]
@@ -103,7 +107,12 @@ def validate_verified_office_derivation_v2(document):
         for digest in binding.values():
             _sha(digest)
         artifact = document["fact_artifact"]
-        _closed(artifact, FACT_ANCHOR_FIELDS | {"capture_sha256", "transform_version", "fact_sha256", "fact_rows"})
+        content_fields = {"capture_sha256", "transform_version", "fact_sha256", "fact_rows"}
+        if type(artifact) is not dict or set(artifact) not in (
+            FACT_ANCHOR_FIELDS | content_fields,
+            LEGACY_FACT_ANCHOR_FIELDS | content_fields,
+        ):
+            raise ValueError
         _validate_fact_anchor(artifact)
         if artifact["transform_version"] not in (FHIR_SOURCE_WITNESS_TRANSFORM_V2, FHIR_PLAN_TIER_WITNESS_TRANSFORM):
             raise ValueError

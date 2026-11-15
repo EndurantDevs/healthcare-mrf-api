@@ -29,12 +29,11 @@ from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
-from tests.network_read_execution_support import with_read_identity_receipts
+from tests.network_read_execution_support import with_read_session
 from tests.provider_network_read_support import approved_record_relation
 from tests.test_network_catalog_routes import v2_envelope
 from tests.test_provider_collection_network_read import boundary as boundary
 from tests.test_provider_directory_entities import ENTITY_ID, KEY
-from tests.test_provider_directory_medical_groups_identity import _catalog
 
 PATH = "/api/v1/registry/serving/directory/entities"
 AUTH = {"Authorization": "Bearer synthetic-source-control-token"}
@@ -405,16 +404,13 @@ async def test_retained_scope_generation_resolves_its_committed_pair_as_an_api_r
 @pytest.mark.parametrize("kind", ["medical-groups", "sites"])
 async def test_doctors_default_stays_public_on_same_snapshot(directory_boundary, monkeypatch, kind):
     held = directory_boundary
-    with_read_identity_receipts(held.session, driver=held.driver)
+    with_read_session(held.session, driver=held.driver)
     held.driver = held.session.connection.return_value.get_raw_connection.return_value.driver_connection
 
     async def execute(statement, parameters=None):
         sql = str(statement)
         if "current_setting('transaction_isolation')" in sql:
             return SimpleNamespace(one=lambda: ("repeatable read", "on"))
-        if "pg_catalog.pg_class" in sql:
-            assert parameters == {"names": list(doctors._READ_TABLES), "schema": "mrf"}
-            return SimpleNamespace(mappings=lambda: SimpleNamespace(all=_catalog))
         assert sql in {"SET LOCAL lock_timeout = '250ms'", "SET LOCAL work_mem = '4MB'"}
 
     held.session.execute.side_effect = execute

@@ -23,9 +23,12 @@ async def _parent(connection, schema, root, ordinal):
     return relation
 
 
-async def _index_oids(connection, oid):
+async def _index_oids(connection, relation):
+    if isinstance(relation, dict):
+        relation = storage_relation(relation["schema"], relation["name"])
     return await connection.fetchval(
-        "SELECT array_agg(indexrelid::bigint ORDER BY indexrelid) FROM pg_index WHERE indrelid=$1", oid
+        "SELECT array_agg(indexrelid::bigint ORDER BY indexrelid) FROM pg_index WHERE indrelid=$1::regclass",
+        str(relation),
     )
 
 
@@ -46,9 +49,9 @@ async def test_six_payloads_attach_without_rebuilding_fixed_parent_indexes(nativ
                     parent = await _parent(driver, current.policy.schema, root, ordinal)
                     receipt = original_receipts[root]
                     child = storage_relation(current.policy.schema, receipt["name"])
-                    before = await _index_oids(driver, receipt["oid"])
+                    before = await _index_oids(driver, receipt)
                     await driver.execute(f"ALTER TABLE {parent} ATTACH PARTITION {child} FOR VALUES IN ({literal})")
-                    assert await _index_oids(driver, receipt["oid"]) == before
+                    assert await _index_oids(driver, receipt) == before
                     assert await driver.fetchval("SELECT count(*) FROM " + parent) == 1
             finally:
                 await savepoint.rollback()

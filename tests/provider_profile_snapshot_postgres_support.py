@@ -29,6 +29,7 @@ TABLES = (
 READ_TABLES = tuple(
     dict.fromkeys(
         (
+            *snapshot._COMMON_TABLES,
             *snapshot._DOCTORS_TABLES,
             *snapshot._PROFILE_TABLES,
             *snapshot._DETAIL_TABLES,
@@ -298,7 +299,12 @@ async def create_composite_families(database, schema, *, install_receipt=True):
         await connection.run_sync(lambda sync: receipt_fixture._create_profile_table(sync, schema))
         await receipt_fixture._create_native_tables(connection, schema)
         if install_receipt:
+            # Same order as the receipt fixture: the receipt functions predate the named generation columns.
+            await connection.run_sync(lambda sync: receipt_fixture._apply(sync, "20260929040000"))
             await connection.run_sync(lambda sync: receipt_fixture._apply(sync, "20260930100000"))
+            repair = receipt_fixture._migration("20261019130000")._repair_sql(schema)
+            await connection.run_sync(lambda sync: sync.exec_driver_sql(repair))
+            await receipt_fixture._install_named_serving_fixture(connection)
     await grant_profile_reader(database, schema, READ_TABLES)
 
 

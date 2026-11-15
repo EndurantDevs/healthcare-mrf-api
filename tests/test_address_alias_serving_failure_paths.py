@@ -14,6 +14,7 @@ import pytest
 
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 provider_directory_fhir = importlib.import_module("process.provider_directory_fhir")
+artifact_bundle = importlib.import_module("process.provider_directory_artifact_bundle_preparation")
 
 
 @pytest.mark.asyncio
@@ -66,7 +67,7 @@ async def test_serving_consumers_reject_unsupported_alias_state(
     (
         (None, "alias-generation receipt is missing"),
         (
-            SimpleNamespace(generation=1, relation_oid=None),
+            SimpleNamespace(generation=1, relation_exists=False),
             "overlay relation is missing",
         ),
     ),
@@ -344,14 +345,15 @@ async def test_unified_overlay_fence_accepts_unchanged_receipt(monkeypatch):
     monkeypatch.setattr(
         entity_address_unified,
         "_provider_directory_overlay_alias_fence",
-        AsyncMock(return_value=(2, 11)),
+        AsyncMock(return_value=(2, ("mrf", "provider_directory_address_overlay"), "revision")),
     )
 
     await entity_address_unified._assert_provider_directory_overlay_alias_fence(
         "mrf",
         {
             "provider_directory_overlay_alias_generation": 2,
-            "provider_directory_overlay_relation_oid": 11,
+            "provider_directory_overlay_relation": ("mrf", "provider_directory_address_overlay"),
+            "provider_directory_overlay_publication": "revision",
         },
     )
 
@@ -374,7 +376,7 @@ async def test_corroboration_fence_rejects_scoped_stale_generation(monkeypatch):
             "mrf",
             "provider_directory_address_corroboration",
             ["synthetic-source"],
-            provider_directory_fhir.ProviderDirectoryArtifactBuildFence(target_oid=None),
+            provider_directory_fhir.ProviderDirectoryArtifactBuildFence(),
         )
 
 
@@ -391,17 +393,17 @@ async def test_corroboration_fence_requires_overlay_dependency(monkeypatch):
         AsyncMock(return_value=1),
     )
     monkeypatch.setattr(
-        provider_directory_fhir,
-        "_provider_directory_relation_oid",
+        artifact_bundle,
+        "address_overlay_publication",
         AsyncMock(return_value=None),
     )
 
-    with pytest.raises(RuntimeError, match="overlay dependency is missing"):
+    with pytest.raises(RuntimeError, match="stale address alias generation"):
         await provider_directory_fhir._capture_address_corroboration_fence(
             "mrf",
             "provider_directory_address_corroboration",
             [],
-            provider_directory_fhir.ProviderDirectoryArtifactBuildFence(target_oid=None),
+            provider_directory_fhir.ProviderDirectoryArtifactBuildFence(),
         )
 
 
@@ -418,11 +420,8 @@ async def test_corroboration_fence_accepts_fenced_overlay_override(monkeypatch):
         "_address_alias_artifact_generation",
         artifact_generation,
     )
-    monkeypatch.setattr(
-        provider_directory_fhir,
-        "_provider_directory_relation_oid",
-        AsyncMock(return_value=17),
-    )
+    dependency_present = AsyncMock(return_value=True)
+    monkeypatch.setattr(provider_directory_fhir.db, "scalar", dependency_present)
     relation_override_by_target = {
         provider_directory_fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE: "provider_directory_address_overlay_stage"
     }
@@ -434,12 +433,18 @@ async def test_corroboration_fence_accepts_fenced_overlay_override(monkeypatch):
             "mrf",
             "provider_directory_address_corroboration",
             [],
-            provider_directory_fhir.ProviderDirectoryArtifactBuildFence(target_oid=5),
+            provider_directory_fhir.ProviderDirectoryArtifactBuildFence(
+                target_publication=(True, ("synthetic-5", "revision-5"))
+            ),
         )
     finally:
         provider_directory_fhir._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(override_token)
 
     assert fence.alias_generation == 1
     assert fence.dependency_relation == "provider_directory_address_overlay_stage"
-    assert fence.dependency_relation_oid == 17
+    assert fence.dependency_publication is None
+    dependency_present.assert_awaited_once_with(
+        "SELECT to_regclass(:relation) IS NOT NULL",
+        relation='"mrf"."provider_directory_address_overlay_stage"',
+    )
     artifact_generation.assert_awaited_once()

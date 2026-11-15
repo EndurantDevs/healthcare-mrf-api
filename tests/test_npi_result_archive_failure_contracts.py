@@ -92,9 +92,9 @@ def _validation(
         "package_id": "c" * 64,
         "profile_contract": manifest.contract,
         "stage_schema": ownership.schema_name,
-        "stage_schema_oid": ownership.schema_oid,
-        "relation_oids": [list(pair) for pair in ownership.relation_oids],
-        "sealed_owner_oid": 501,
+        "relations": [
+            {"schema_name": ownership.schema_name, "relation_name": name} for name, _ in ownership.relation_oids
+        ],
         "manifest_sha256": archive._manifest_digest(manifest),
         "tables": [table.as_dict() for table in manifest.tables],
     }
@@ -108,12 +108,13 @@ def _authority(
     serving: generation.NpiServingGeneration | None = None,
     relation_oids: tuple[int, ...] | None = None,
     local_generation: int = 7,
+    schema_name: str = "mrf",
 ) -> generation.NpiResultGenerationAuthority:
     return generation.NpiResultGenerationAuthority(
         str(uuid4()),
         local_generation,
         serving,
-        relation_oids,
+        tuple((schema_name, name) for name in generation.RELATION_NAMES) if relation_oids is not None else None,
         None,
     )
 
@@ -131,7 +132,8 @@ def _authority_row(
         "origin_lineage_id": None if serving is None else serving.origin_lineage_id,
         "origin_generation": None if serving is None else serving.origin_generation,
         "published_at": None if serving is None else serving.published_at,
-        "relation_oids": None if relation_oids is None else list(relation_oids),
+        "serving_schema": "mrf" if relation_oids is not None else None,
+        "serving_relation_names": list(generation.RELATION_NAMES) if relation_oids is not None else None,
         "canonical_publication_ref": None,
         "canonical_publication_generation": None,
         "canonical_chain_ref": None,
@@ -314,7 +316,7 @@ async def test_source_capture_rejects_incoherent_family_authority(monkeypatch, f
         authority = _authority(relation_oids=oids)
         message = "source generation is incomplete"
     elif failure == "drifted":
-        authority = _authority(serving=_serving(), relation_oids=tuple(range(11, 17)))
+        authority = _authority(serving=_serving(), relation_oids=tuple(range(11, 17)), schema_name="other")
         message = "source generation is drifted"
     else:
         message = "source snapshot is invalid"
@@ -392,7 +394,7 @@ def test_manifest_table_inventory_is_exact_and_typed(mutate) -> None:
         ("stage_schema_oid", True, "receipt is invalid"),
         ("sealed_owner_oid", 0, "receipt is invalid"),
         ("stage_schema", "bad-name", "schema is invalid"),
-        ("relation_oids", [], "inventory is invalid"),
+        ("relations", [], "inventory is invalid"),
         ("validation_sha256", "0" * 64, "digest differs"),
     ],
 )
@@ -412,9 +414,9 @@ def test_validation_receipt_rejects_non_mapping_input() -> None:
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda pairs: pairs[0].__setitem__(0, "wrong"),
-        lambda pairs: pairs[0].__setitem__(1, True),
-        lambda pairs: pairs[0].__setitem__(1, 0),
+        lambda pairs: pairs[0].__setitem__("relation_name", "wrong"),
+        lambda pairs: pairs[0].__setitem__("schema_name", "other"),
+        lambda pairs: pairs.__setitem__(1, dict(pairs[0])),
         lambda pairs: pairs.__setitem__(0, ["only-one"]),
         lambda pairs: pairs.__setitem__(0, "not-a-pair"),
         lambda pairs: pairs.pop(),
@@ -423,7 +425,7 @@ def test_validation_receipt_rejects_non_mapping_input() -> None:
 def test_validation_inventory_rejects_wrong_names_oids_and_shapes(mutate) -> None:
     ownership = _ownership()
     candidate = _validation(ownership, _manifest()).as_dict()
-    mutate(candidate["relation_oids"])
+    mutate(candidate["relations"])
     with pytest.raises(archive.NpiResultArchiveError, match="inventory is invalid"):
         archive.validate_npi_validation_receipt(candidate)
 
@@ -432,9 +434,9 @@ def test_validation_inventory_rejects_wrong_names_oids_and_shapes(mutate) -> Non
     "change",
     [
         {"package_id": "d" * 64},
-        {"sealed_owner_oid": 502},
+        {"profile_contract": "other"},
         {"stage_schema": "other_stage"},
-        {"stage_schema_oid": 91},
+        {"package_id": "e" * 64},
         {"relation_oids": (("wrong", 1),)},
         {"manifest_sha256": "d" * 64},
         {"tables": ()},
@@ -444,7 +446,7 @@ def test_cutover_binding_mismatch_is_rejected_before_mutation(change: dict[str, 
     ownership = _ownership()
     manifest = _manifest()
     validation = replace(_validation(ownership, manifest), **change)
-    cutover = archive.NpiCutoverAuthority("c" * 64, 501, 501, "manual")
+    cutover = archive.NpiCutoverAuthority("c" * 64, "manual")
     with pytest.raises(archive.NpiResultArchiveError, match="authority differs"):
         archive._validate_cutover_bindings(ownership, manifest, validation, cutover)
 
@@ -464,9 +466,9 @@ async def test_public_activation_rejects_wrong_binding_before_mutation_or_callba
             session,
             ownership=ownership,
             manifest=manifest,
-            incumbent=archive.NpiIncumbent("mrf", tuple((name, None) for name in generation.RELATION_NAMES)),
+            incumbent=archive.NpiIncumbent("mrf", tuple((name, False) for name in generation.RELATION_NAMES)),
             validation_receipt=validation,
-            cutover=archive.NpiCutoverAuthority("d" * 64, 501, 501, "manual"),
+            cutover=archive.NpiCutoverAuthority("d" * 64, "manual"),
             on_activated=callback,
         )
 
@@ -500,9 +502,9 @@ async def test_activation_rejects_inexact_incumbent_inventory_before_locks(monke
             session,
             ownership=ownership,
             manifest=manifest,
-            incumbent=archive.NpiIncumbent("mrf", tuple((name, None) for name in names)),
+            incumbent=archive.NpiIncumbent("mrf", tuple((name, False) for name in names)),
             validation_receipt=_validation(ownership, manifest),
-            cutover=archive.NpiCutoverAuthority("c" * 64, 501, 501, "manual"),
+            cutover=archive.NpiCutoverAuthority("c" * 64, "manual"),
             on_activated=callback,
         )
     lock.assert_not_awaited()
@@ -518,7 +520,7 @@ async def test_matching_incumbent_inventory_reaches_activation_lock_boundary(mon
     ownership = _ownership(canonical=canonical)
     manifest = _manifest(canonical=canonical)
     incumbent = archive.NpiIncumbent(
-        "mrf", tuple((name, None) for name in archive.npi_archive_names(canonical=canonical))
+        "mrf", tuple((name, False) for name in archive.npi_archive_names(canonical=canonical))
     )
     lock = AsyncMock(side_effect=RuntimeError("synthetic lock boundary"))
     callback = AsyncMock()
@@ -531,7 +533,7 @@ async def test_matching_incumbent_inventory_reaches_activation_lock_boundary(mon
             manifest=manifest,
             incumbent=incumbent,
             validation_receipt=_validation(ownership, manifest),
-            cutover=archive.NpiCutoverAuthority("c" * 64, 501, 501, "manual"),
+            cutover=archive.NpiCutoverAuthority("c" * 64, "manual"),
             on_activated=callback,
         )
     lock.assert_awaited_once_with(session, ownership, incumbent)
@@ -540,7 +542,7 @@ async def test_matching_incumbent_inventory_reaches_activation_lock_boundary(mon
 
 @pytest.mark.asyncio
 async def test_automatic_cutover_rejects_missing_legacy_and_drifted_authority(monkeypatch) -> None:
-    incumbent = archive.NpiIncumbent("mrf", tuple((name, oid) for oid, name in enumerate(generation.RELATION_NAMES, 1)))
+    incumbent = archive.NpiIncumbent("mrf", tuple((name, True) for name in generation.RELATION_NAMES))
     authority = _authority()
     with pytest.raises(archive.NpiResultArchiveError, match="source generation is unavailable"):
         await archive._admit_automatic_cutover(
@@ -553,8 +555,8 @@ async def test_automatic_cutover_rejects_missing_legacy_and_drifted_authority(mo
             object(), incumbent=incumbent, current_authority=authority, source_generation=_serving()
         )
 
-    tracked = _authority(serving=_serving(), relation_oids=(10, 11, 12, 13, 14, 15))
-    with pytest.raises(archive.NpiResultArchiveError, match="incumbent generation is drifted"):
+    tracked = _authority(serving=_serving(), relation_oids=(10, 11, 12, 13, 14, 15), schema_name="other")
+    with pytest.raises(archive.NpiResultArchiveError, match="incumbent generation name differs"):
         await archive._admit_automatic_cutover(
             object(), incumbent=incumbent, current_authority=tracked, source_generation=_serving()
         )
@@ -562,7 +564,7 @@ async def test_automatic_cutover_rejects_missing_legacy_and_drifted_authority(mo
 
 @pytest.mark.asyncio
 async def test_automatic_cutover_accepts_empty_first_copy_and_strict_successor(monkeypatch) -> None:
-    empty = archive.NpiIncumbent("mrf", tuple((name, None) for name in generation.RELATION_NAMES))
+    empty = archive.NpiIncumbent("mrf", tuple((name, False) for name in generation.RELATION_NAMES))
     populated = AsyncMock(return_value=False)
     monkeypatch.setattr(archive, "_has_populated_incumbent", populated)
     await archive._admit_automatic_cutover(
@@ -571,7 +573,7 @@ async def test_automatic_cutover_accepts_empty_first_copy_and_strict_successor(m
     populated.assert_awaited_once()
 
     lineage = str(uuid4())
-    incumbent = archive.NpiIncumbent("mrf", tuple((name, oid) for oid, name in enumerate(generation.RELATION_NAMES, 1)))
+    incumbent = archive.NpiIncumbent("mrf", tuple((name, True) for name in generation.RELATION_NAMES))
     await archive._admit_automatic_cutover(
         object(),
         incumbent=incumbent,
@@ -585,7 +587,7 @@ async def test_automatic_cutover_accepts_empty_first_copy_and_strict_successor(m
 @pytest.mark.asyncio
 async def test_automatic_cutover_wraps_stale_or_foreign_generation() -> None:
     lineage = str(uuid4())
-    incumbent = archive.NpiIncumbent("mrf", tuple((name, oid) for oid, name in enumerate(generation.RELATION_NAMES, 1)))
+    incumbent = archive.NpiIncumbent("mrf", tuple((name, True) for name in generation.RELATION_NAMES))
     authority = _authority(serving=_serving(revision=2, lineage_id=lineage), relation_oids=tuple(range(1, 7)))
     for candidate in (_serving(revision=2, lineage_id=lineage), _serving(revision=3)):
         with pytest.raises(archive.NpiResultArchiveError, match="stale or unrelated"):
@@ -596,12 +598,12 @@ async def test_automatic_cutover_wraps_stale_or_foreign_generation() -> None:
 
 @pytest.mark.asyncio
 async def test_populated_incumbent_short_circuits_and_empty_family_does_not_query() -> None:
-    empty = archive.NpiIncumbent("mrf", tuple((name, None) for name in generation.RELATION_NAMES))
+    empty = archive.NpiIncumbent("mrf", tuple((name, False) for name in generation.RELATION_NAMES))
     session = SimpleNamespace(scalar=AsyncMock())
     assert await archive._has_populated_incumbent(session, empty) is False
     session.scalar.assert_not_awaited()
 
-    present = archive.NpiIncumbent("mrf", tuple((name, oid) for oid, name in enumerate(generation.RELATION_NAMES, 1)))
+    present = archive.NpiIncumbent("mrf", tuple((name, True) for name in generation.RELATION_NAMES))
     session.scalar.side_effect = [False, True]
     assert await archive._has_populated_incumbent(session, present) is True
     assert session.scalar.await_count == 2
@@ -706,57 +708,45 @@ async def test_clone_and_schema_identity_reject_invalid_catalog_tokens() -> None
         await archive._schema_oid(session, "stage")
 
 
-def test_freeze_seals_reject_mutable_function_and_incomplete_triggers() -> None:
-    function_row_dict = {
-        "oid": 1,
-        "lanname": "sql",
-        "prosecdef": True,
-        "prosrc": archive._FREEZE_FUNCTION_BODY,
-        "proconfig": ["search_path=pg_catalog"],
-    }
-    with pytest.raises(archive.NpiResultArchiveError, match="freeze function differs"):
-        archive._validate_freeze_function(function_row_dict)
-
-    with pytest.raises(archive.NpiResultArchiveError, match="trigger set differs"):
-        archive._validate_freeze_triggers([], 1)
-    trigger_row_dict = {
-        "table_name": generation.RELATION_NAMES[0],
-        "tgname": archive._FREEZE_WRITE_TRIGGER,
-        "tgenabled": "D",
-        "tgtype": 30,
-        "tgfoid": 1,
-        "unconditional": True,
-        "tgnargs": 0,
-        "trigger_columns": "",
-        "oid": 2,
-    }
-    with pytest.raises(archive.NpiResultArchiveError, match="freeze trigger differs"):
-        archive._validate_freeze_triggers([trigger_row_dict], 1)
-
-
 @pytest.mark.asyncio
-async def test_freeze_seal_rejects_orphan_triggers(monkeypatch) -> None:
-    monkeypatch.setattr(archive, "_read_freeze_function", AsyncMock(return_value=None))
-    monkeypatch.setattr(archive, "_read_freeze_triggers", AsyncMock(return_value=[{"oid": 1}]))
-    with pytest.raises(archive.NpiResultArchiveError, match="freeze function differs"):
-        await archive._freeze_seal(object(), 90)
+async def test_administrative_freeze_requires_explicit_safe_role_names():
+    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
+    for options in (
+        {},
+        {"owner_role": "bad;role", "reader_roles": ("reader",)},
+        {"owner_role": "owner", "reader_roles": ()},
+    ):
+        with pytest.raises(archive.NpiResultArchiveError, match="freeze requires|role declaration"):
+            await archive.freeze_npi_stage(session, ownership=_ownership(), **options)
+    session.execute.assert_not_awaited()
+
+
+def test_legacy_validation_metadata_is_opaque_and_unchanged():
+    from copy import deepcopy
+
+    ownership = _ownership()
+    receipt = _validation(ownership, _manifest()).as_dict()
+    relations = receipt.pop("relations")
+    receipt.update(
+        stage_schema_oid="historical",
+        sealed_owner_oid=None,
+        relation_oids=[[entry["relation_name"], False] for entry in relations],
+        validation_sha256="b" * 64,
+    )
+    before = deepcopy(receipt)
+    parsed = archive.validate_npi_validation_receipt(receipt)
+    assert parsed.as_dict() == before and receipt == before
+    assert tuple(name for name, _ in parsed.relation_oids) == tuple(sorted(generation.RELATION_NAMES))
 
 
 @pytest.mark.asyncio
 async def test_stage_guard_entry_points_reject_invalid_or_unfrozen_tokens(monkeypatch) -> None:
     session = SimpleNamespace(in_transaction=lambda: True)
-    with pytest.raises(archive.NpiResultArchiveError, match="ownership is invalid"):
+    with pytest.raises(archive.NpiResultArchiveError, match="declaration is invalid"):
         await archive.freeze_npi_stage(session, ownership=object())
-    with pytest.raises(archive.NpiResultArchiveError, match="ownership is invalid"):
+    with pytest.raises(archive.NpiResultArchiveError, match="declaration is invalid"):
         await archive.verify_npi_stage_ownership(session, object())
 
-    ownership = replace(_ownership(), freeze_function_oid=None, freeze_trigger_oids=(), freeze_catalog_versions=())
-    with pytest.raises(archive.NpiResultArchiveError, match="not frozen"):
-        await archive.export_prepared_npi_archive(
-            object(),
-            prepared=archive.NpiPreparedSource(_manifest(), ownership),
-            archive_copy=AsyncMock(),
-        )
     with pytest.raises(archive.NpiResultArchiveError, match="prepared source is invalid"):
         await archive.export_prepared_npi_archive(object(), prepared=object(), archive_copy=AsyncMock())
 
@@ -775,19 +765,17 @@ async def test_stage_guard_entry_points_reject_invalid_or_unfrozen_tokens(monkey
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("historical_freeze", (False, True))
-async def test_canonical_export_requires_custody_verifier_before_opening_archive_session(historical_freeze):
+async def test_canonical_export_reaches_native_reader_without_a_physical_seal(historical_freeze):
     ownership = _ownership(canonical=True)
     if not historical_freeze:
         ownership = replace(ownership, freeze_function_oid=None, freeze_trigger_oids=(), freeze_catalog_versions=())
-    factory = Mock()
+    factory = Mock(side_effect=RuntimeError("native reader boundary"))
     copy = AsyncMock()
-    with pytest.raises(archive.NpiResultArchiveError, match="canonical prepared source requires a custody verifier"):
+    with pytest.raises(RuntimeError, match="native reader boundary"):
         await archive.export_prepared_npi_archive(
-            factory,
-            prepared=archive.NpiPreparedSource(_manifest(canonical=True), ownership),
-            archive_copy=copy,
+            factory, prepared=archive.NpiPreparedSource(_manifest(canonical=True), ownership), archive_copy=copy
         )
-    factory.assert_not_called()
+    factory.assert_called_once_with()
     copy.assert_not_awaited()
 
 
@@ -812,23 +800,17 @@ async def test_canonical_export_with_custody_verifier_does_not_require_historica
 
 
 @pytest.mark.asyncio
-async def test_stage_owner_rejects_invalid_schema_and_relation_owners() -> None:
-    ownership = _ownership()
-    session = SimpleNamespace(scalar=AsyncMock(return_value=501), execute=AsyncMock())
-    with pytest.raises(archive.NpiResultArchiveError, match="owner is invalid"):
-        await archive._verify_stage_owner(session, ownership, True)
-    session.scalar.assert_not_awaited()
+async def test_named_stage_resolution_rejects_missing_names_without_saved_id_authority(monkeypatch):
+    from copy import deepcopy
 
-    session.scalar.return_value = 999
-    with pytest.raises(archive.NpiResultArchiveError, match="owner differs"):
-        await archive._verify_stage_owner(session, ownership, 501)
-    session.execute.assert_not_awaited()
-
-    session.scalar.return_value = 501
-    rows_result = SimpleNamespace(mappings=lambda: [])
-    session.execute.return_value = rows_result
-    with pytest.raises(archive.NpiResultArchiveError, match="owner differs"):
-        await archive._verify_stage_owner(session, ownership, 501)
+    old = _ownership()
+    live = replace(old, schema_oid=900, relation_oids=tuple((name, oid + 1000) for name, oid in old.relation_oids))
+    before = deepcopy(old)
+    monkeypatch.setattr(archive, "capture_npi_stage_ownership", AsyncMock(return_value=live))
+    assert await archive.verify_npi_stage_ownership(object(), old) == live
+    assert old == before
+    with pytest.raises(archive.NpiResultArchiveError, match="declaration differs"):
+        await archive.verify_npi_stage_ownership(object(), replace(old, relation_oids=old.relation_oids[:-1]))
 
 
 @pytest.mark.asyncio
@@ -860,14 +842,14 @@ async def test_incumbent_capture_rejects_partial_and_changed_families(monkeypatc
 @pytest.mark.asyncio
 async def test_activation_entry_rejects_untyped_authority_and_missing_callback() -> None:
     ownership = _ownership()
-    incumbent = archive.NpiIncumbent("mrf", tuple((name, None) for name in generation.RELATION_NAMES))
+    incumbent = archive.NpiIncumbent("mrf", tuple((name, False) for name in generation.RELATION_NAMES))
     session = SimpleNamespace(in_transaction=lambda: True)
     for activation_ownership, cutover, callback, message in (
-        (object(), archive.NpiCutoverAuthority("c" * 64, 501, 501, "manual"), AsyncMock(), "ownership"),
+        (object(), archive.NpiCutoverAuthority("c" * 64, "manual"), AsyncMock(), "ownership"),
         (ownership, object(), AsyncMock(), "authority is unsupported"),
         (
             ownership,
-            archive.NpiCutoverAuthority("c" * 64, 501, 501, "manual"),
+            archive.NpiCutoverAuthority("c" * 64, "manual"),
             None,
             "callback is required",
         ),
@@ -931,10 +913,12 @@ def test_generation_authority_rejects_missing_singleton_and_local_counter() -> N
 @pytest.mark.asyncio
 async def test_generation_reads_reject_absent_and_malformed_relation_rows() -> None:
     empty = SimpleNamespace(mappings=lambda: SimpleNamespace(one_or_none=lambda: None))
-    session = SimpleNamespace(execute=AsyncMock(return_value=empty))
+    columns = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: ["serving_schema", "serving_relation_names"]))
+    session = SimpleNamespace(execute=AsyncMock(side_effect=[None, columns, empty]))
     with pytest.raises(RuntimeError, match="authority is unavailable"):
         await generation.read_npi_result_generation_authority(session, schema_name="mrf")
 
+    session.execute.side_effect = None
     for rows in ([("npi", None)], [(name, oid) for oid, name in enumerate(reversed(generation.RELATION_NAMES), 1)]):
         result = SimpleNamespace(all=lambda rows=rows: rows)
         session.execute.return_value = result
@@ -955,7 +939,7 @@ async def test_capture_generation_rejects_legacy_and_oid_drift(monkeypatch) -> N
     read.return_value = matching
     assert await generation.capture_npi_serving_generation(object(), schema_name="mrf") == matching
 
-    read.return_value = _authority(serving=_serving(), relation_oids=tuple(range(11, 17)))
+    read.return_value = _authority(serving=_serving(), relation_oids=tuple(range(11, 17)), schema_name="other")
     with pytest.raises(RuntimeError, match="unavailable or drifted"):
         await generation.capture_npi_serving_generation(object(), schema_name="mrf")
 
@@ -964,31 +948,35 @@ async def test_capture_generation_rejects_legacy_and_oid_drift(monkeypatch) -> N
 async def test_matching_provenance_returns_none_without_a_sealed_receipt() -> None:
     result = SimpleNamespace(mappings=lambda: SimpleNamespace(one_or_none=lambda: None))
     session = SimpleNamespace(execute=AsyncMock(return_value=result))
-    assert (
-        await generation._matching_canonical_provenance(
-            session,
-            schema_name="mrf",
-            relation_oids=tuple(range(1, 7)),
-        )
-        is None
-    )
+    assert await generation._matching_canonical_provenance(session, schema_name="mrf") is None
+    session.execute.assert_awaited_once()
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_family", [True, False])
+async def test_bootstrap_provenance_requires_the_sealed_receipt_of_this_family(same_family) -> None:
+    """An unrelated newer sealed receipt cannot lend its publication reference to replacement tables."""
     provenance = _provenance()
-    receipt_dict = {
+    receipt_by_field = {
         "publication_ref": provenance.publication_ref,
         "publication_generation": provenance.publication_generation,
         "chain_ref": provenance.chain_ref,
         "import_date": provenance.import_date,
+        **{f"{name}_row_count": 10 + ordinal for ordinal, name in enumerate(generation.RELATION_NAMES)},
     }
-    result.mappings = lambda: SimpleNamespace(one_or_none=lambda: receipt_dict)
-    assert (
-        await generation._matching_canonical_provenance(
-            session,
-            schema_name="mrf",
-            relation_oids=tuple(range(1, 7)),
+    current_counts = tuple(10 + ordinal for ordinal in range(6)) if same_family else (99, 11, 12, 13, 14, 15)
+    session = SimpleNamespace(
+        execute=AsyncMock(
+            side_effect=[
+                SimpleNamespace(mappings=lambda: SimpleNamespace(one_or_none=lambda: receipt_by_field)),
+                SimpleNamespace(one=lambda: current_counts),
+            ]
         )
-        == provenance
     )
+    expected = provenance if same_family else None
+    assert await generation._matching_canonical_provenance(session, schema_name="mrf") == expected
+    counted = str(session.execute.await_args_list[1].args[0])
+    assert all(f'"mrf"."{name}"' in counted for name in generation.RELATION_NAMES)
 
 
 @pytest.mark.asyncio
@@ -1001,7 +989,9 @@ async def test_bootstrap_rejects_drift_and_exhaustion_without_writing(monkeypatc
 
     monkeypatch.setattr(generation, "_bounded_bootstrap", bounded)
     monkeypatch.setattr(generation, "current_npi_relation_oids", AsyncMock(return_value=tuple(range(1, 7))))
-    read = AsyncMock(return_value=_authority(serving=_serving(), relation_oids=tuple(range(11, 17))))
+    read = AsyncMock(
+        return_value=_authority(serving=_serving(), relation_oids=tuple(range(11, 17)), schema_name="other")
+    )
     monkeypatch.setattr(generation, "read_npi_result_generation_authority", read)
     write = AsyncMock()
     monkeypatch.setattr(generation, "_write_bootstrap_authority", write)
@@ -1084,8 +1074,8 @@ async def test_local_publication_rejects_unbound_state_before_update(failure: st
         responses = [current, None]
         message = "relations are unavailable"
     else:
-        responses = [current, {**live_oids_by_field, "relation_6": 999}]
-        message = "relation identity differs"
+        responses = [current, live_oids_by_field, {f"count_{index}": 999 for index in range(6)}]
+        message = "row counts differ"
     connection = SimpleNamespace(fetchrow=AsyncMock(side_effect=responses))
     with pytest.raises(RuntimeError, match=message):
         await generation.publish_local_npi_result_generation(
@@ -1101,14 +1091,18 @@ async def test_local_publication_rejects_unbound_state_before_update(failure: st
 async def test_local_publication_rejects_missing_update_returning() -> None:
     oids = tuple(range(101, 107))
     live_oids_by_field = {f"relation_{ordinal}": oid for ordinal, oid in enumerate(oids, 1)}
-    connection = SimpleNamespace(fetchrow=AsyncMock(side_effect=[_authority_row(), live_oids_by_field, None]))
+    receipt = _publication_receipt(oids)
+    counts_by_field = {f"count_{index}": count for index, count in enumerate(receipt.row_counts)}
+    connection = SimpleNamespace(
+        fetchrow=AsyncMock(side_effect=[_authority_row(), live_oids_by_field, counts_by_field, None])
+    )
     with pytest.raises(RuntimeError, match="authority is unavailable"):
         await generation.publish_local_npi_result_generation(
             connection,
             schema_name="mrf",
             receipt=_publication_receipt(oids),
         )
-    assert connection.fetchrow.await_count == 3
+    assert connection.fetchrow.await_count == 4
 
 
 @pytest.mark.asyncio
@@ -1202,13 +1196,19 @@ def test_model_index_normalizes_postgis_and_preserves_bounded_options() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cleanup_skips_absent_stage_and_rejects_changed_owner_before_drop(monkeypatch) -> None:
+async def test_cleanup_skips_absent_stage_and_rejects_changed_declaration_before_drop(monkeypatch) -> None:
     ownership = _ownership()
     session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value=None), execute=AsyncMock())
     await archive.cleanup_npi_stage(session, ownership)
     session.execute.assert_not_awaited()
 
-    session.scalar.return_value = ownership.schema_oid
+    session.scalar.return_value = True
+
+    @asynccontextmanager
+    async def nested():
+        yield
+
+    session.begin_nested = nested
 
     @asynccontextmanager
     async def bounded(_session):
@@ -1219,9 +1219,9 @@ async def test_cleanup_skips_absent_stage_and_rejects_changed_owner_before_drop(
     monkeypatch.setattr(
         archive,
         "verify_npi_stage_ownership",
-        AsyncMock(side_effect=archive.NpiResultArchiveError("NPI archive stage ownership differs")),
+        AsyncMock(side_effect=archive.NpiResultArchiveError("NPI archive stage declaration differs")),
     )
-    with pytest.raises(archive.NpiResultArchiveError, match="ownership differs"):
+    with pytest.raises(archive.NpiResultArchiveError, match="declaration differs"):
         await archive.cleanup_npi_stage(session, ownership)
     assert all("DROP" not in str(call.args[0]) for call in session.execute.await_args_list)
 
@@ -1283,17 +1283,12 @@ async def test_shielded_cleanup_finishes_once_before_forwarding_cancellation(mon
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("read_access_fails", [False, True])
-@pytest.mark.parametrize("expected_owner", [501, 502])
-async def test_received_npi_replays_six_reads_before_any_activation_mutation(
-    monkeypatch, read_access_fails, expected_owner
-):
+async def test_received_npi_replays_six_reads_before_any_activation_mutation(monkeypatch, read_access_fails):
     from process import native_publication_read_access
 
     ownership = _ownership()
     manifest = _manifest()
-    incumbent = archive.NpiIncumbent(
-        "canonical", tuple((name, index) for index, name in enumerate(generation.RELATION_NAMES, 1))
-    )
+    incumbent = archive.NpiIncumbent("canonical", tuple((name, True) for name in generation.RELATION_NAMES))
     driver = object()
     session = SimpleNamespace(
         in_transaction=lambda: True,
@@ -1312,9 +1307,9 @@ async def test_received_npi_replays_six_reads_before_any_activation_mutation(
         "_advance_and_verify_stage_sequences",
         "read_npi_result_generation_authority",
     ):
-        monkeypatch.setattr(archive, name, AsyncMock())
-    owner_check = AsyncMock()
-    monkeypatch.setattr(archive, "_verify_stage_owner", owner_check)
+        monkeypatch.setattr(
+            archive, name, AsyncMock(return_value=ownership) if name == "_lock_and_verify_activation" else AsyncMock()
+        )
     with pytest.raises(RuntimeError, match="read ACL denied" if read_access_fails else "stop before mutation"):
         await archive.activate_validated_npi_stage(
             session,
@@ -1322,10 +1317,9 @@ async def test_received_npi_replays_six_reads_before_any_activation_mutation(
             incumbent=incumbent,
             manifest=manifest,
             validation_receipt=_validation(ownership, manifest),
-            cutover=archive.NpiCutoverAuthority("c" * 64, 501, expected_owner, "manual"),
+            cutover=archive.NpiCutoverAuthority("c" * 64, "manual"),
             on_activated=AsyncMock(),
         )
-    owner_check.assert_awaited_once_with(session, ownership, expected_owner)
     expected = generation.RELATION_NAMES[:1] if read_access_fails else generation.RELATION_NAMES
     assert [call.args[0] for call in preserved.await_args_list] == [driver] * len(expected)
     assert [call.kwargs for call in preserved.await_args_list] == [
@@ -1334,7 +1328,6 @@ async def test_received_npi_replays_six_reads_before_any_activation_mutation(
             live_table=name,
             stage_schema=ownership.schema_name,
             stage_table=name,
-            expected_stage_owner_oid=expected_owner,
         )
         for name in expected
     ]

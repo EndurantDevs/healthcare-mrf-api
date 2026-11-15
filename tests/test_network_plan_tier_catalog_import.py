@@ -115,7 +115,6 @@ async def test_typed_import_skips_legacy_adoption_and_uses_same_seed(tmp_path, m
         ),
         begin_nested=transaction,
     )
-    monkeypatch.setattr(catalog_import, "verify_registry_management_permissions", AsyncMock())
     monkeypatch.setattr(catalog_import, "assume_registry_source_owner", AsyncMock())
     monkeypatch.setattr(
         catalog_import, "adopt_legacy_network_aliases", AsyncMock(side_effect=AssertionError("typed path cannot adopt"))

@@ -312,10 +312,10 @@ def _changed_retention_policy(policy, change):
     changed_policy = deepcopy(policy)
     mutations_by_name = {
         "capture": (changed_policy, "capture_id", "00000000-0000-0000-0000-000000000002"),
-        "source-oid": (
-            changed_policy["source_pin"],
-            "resource_table_oid",
-            policy["source_pin"]["resource_table_oid"] + 1,
+        "source-relation": (
+            changed_policy["source_pin"]["resource_relation"],
+            "name",
+            "other_resource",
         ),
         "schema": (changed_policy["source_pin"], "schema_name", "other_schema"),
         "hash": (changed_policy["source_pin"], "dataset_sha256", "f" * 64),
@@ -327,6 +327,7 @@ def _changed_retention_policy(policy, change):
         policy_section[field_name] = field_value
     if change == "schema":
         changed_policy["binding_coordinates"]["dataset_schema"] = "other_schema"
+        changed_policy["source_pin"]["resource_relation"]["schema"] = "other_schema"
     return changed_policy
 
 
@@ -369,7 +370,7 @@ def _retained_execution(address_build_case, execution, change):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "change", [None, "missing", "capture", "source-oid", "schema", "hash", "date", "selection", "fence"]
+    "change", [None, "missing", "capture", "source-relation", "schema", "hash", "date", "selection", "fence"]
 )
 async def test_signed_retention_policy_is_reconstructed_before_admission_and_scratch(
     monkeypatch, execution, address_build_case, change

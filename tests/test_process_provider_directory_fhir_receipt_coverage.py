@@ -110,10 +110,7 @@ async def test_existing_receipt_ledger_guards(monkeypatch):
     request = _request()
     receipt_rows = AsyncMock(return_value=[])
     monkeypatch.setattr(importer.db, "all", receipt_rows)
-    assert (
-        await importer._profile_capacity_preflight_existing_receipt("mrf", request)
-        is None
-    )
+    assert await importer._profile_capacity_preflight_existing_receipt("mrf", request) is None
     receipt_rows.return_value = [{}, {}]
     with pytest.raises(RuntimeError, match="ledger_corrupt"):
         await importer._profile_capacity_preflight_existing_receipt("mrf", request)
@@ -123,10 +120,7 @@ async def test_existing_receipt_ledger_guards(monkeypatch):
             "request_nonce": request.request_nonce,
         }
     ]
-    assert (
-        await importer._profile_capacity_preflight_existing_receipt("mrf", request)
-        == receipt_rows.return_value[0]
-    )
+    assert await importer._profile_capacity_preflight_existing_receipt("mrf", request) == receipt_rows.return_value[0]
 
 
 @pytest.mark.asyncio
@@ -140,7 +134,16 @@ async def test_quiescence_ledger_guards(monkeypatch):
             observed_at=ISSUED_AT,
             request_sha256="a" * 64,
         )
-    count_row.return_value = {"active_profile_run_count": 1}
+    zero_counts = dict.fromkeys(
+        (
+            "active_profile_run_count",
+            "claimed_profile_checkpoint_count",
+            "unexpired_capacity_consumption_count",
+            "outstanding_preflight_receipt_count",
+        ),
+        0,
+    )
+    count_row.return_value = {**zero_counts, "active_profile_run_count": 1}
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
         match="not_quiescent",
@@ -150,7 +153,7 @@ async def test_quiescence_ledger_guards(monkeypatch):
             observed_at=ISSUED_AT,
             request_sha256="a" * 64,
         )
-    count_row.return_value = {}
+    count_row.return_value = zero_counts
     quiescence, digest = await importer._profile_capacity_quiescence(
         "mrf",
         observed_at=ISSUED_AT,
@@ -176,9 +179,7 @@ async def test_existing_receipt_replay_guards():
     """Replay one open exact row and reject a consumed row."""
     request = _request()
     receipt = _receipt()
-    value_by_field = importer._profile_capacity_preflight_receipt_values(
-        request, receipt, issued_at=ISSUED_AT
-    )
+    value_by_field = importer._profile_capacity_preflight_receipt_values(request, receipt, issued_at=ISSUED_AT)
     existing_row_by_field = {
         **value_by_field,
         "receipt_json": json.dumps(receipt),
@@ -280,9 +281,7 @@ def test_dataset_materialization_unsupported_and_invalid(monkeypatch):
         "parse_fhir_resource",
         lambda *_args, **_kwargs: (object(), {}),
     )
-    monkeypatch.setattr(
-        importer, "_endpoint_dataset_resource_rows", lambda *_a, **_k: []
-    )
+    monkeypatch.setattr(importer, "_endpoint_dataset_resource_rows", lambda *_a, **_k: [])
     with pytest.raises(ValueError, match="resource_invalid"):
         importer.materialize_provider_directory_dataset_fhir_resource(
             source_id="source",
@@ -352,24 +351,16 @@ def test_remaining_flex_boundary_branches(monkeypatch):
 
 def test_remaining_profile_control_boundary_branches():
     """Reject layout, strategy, trigger, and index contract drift."""
-    control_identity = types.SimpleNamespace(
-        build_checkpoint_storage_fingerprint="a",
-        import_run_storage_fingerprint="b",
-        capacity_consumption_storage_fingerprint="c",
-        serving_generation_storage_fingerprint="d",
-    )
+    roles = ("build_checkpoint", "import_run", "capacity_consumption", "serving_generation")
+    control_identity = types.SimpleNamespace(relations={role: {"schema": "example", "name": role} for role in roles})
     control_layouts = tuple(
-        types.SimpleNamespace(exact_fingerprint=fingerprint)
-        for fingerprint in ("a", "b", "c", "changed")
+        types.SimpleNamespace(schema_name="example", relation_name=role) for role in (*roles[:3], "changed")
     )
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
-        match="control_metadata_layout_changed",
+        match="control_relation_changed",
     ):
-        importer._assert_profile_control_layout_identities(
-            control_identity,
-            control_layouts,
-        )
+        importer._assert_profile_control_layout_identities(control_identity, control_layouts)
 
     invalid_execution = types.SimpleNamespace(
         attestation=types.SimpleNamespace(
@@ -399,9 +390,7 @@ def test_profile_resource_scope_boundary_branch():
         materialization_mode="source_delta",
         source_ids=["source-a"],
     )
-    scope_token = importer._PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS.set(
-        ("source-b",)
-    )
+    scope_token = importer._PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS.set(("source-b",))
     try:
         with pytest.raises(
             importer.ProviderDirectoryArtifactBuildStale,
@@ -409,6 +398,4 @@ def test_profile_resource_scope_boundary_branch():
         ):
             importer._validate_profile_materialized_resource_scope(materialization)
     finally:
-        importer._PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS.reset(
-            scope_token
-        )
+        importer._PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS.reset(scope_token)

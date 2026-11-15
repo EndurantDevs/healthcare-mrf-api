@@ -1,9 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""The fixed all-state projection must refuse unsafe or stale negative proofs."""
+"""All-state named NUCC claims protect retained tables before legacy rotation."""
 
 import asyncio
-from contextlib import asynccontextmanager
-from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,152 +10,142 @@ import pytest
 from process import nucc_retention_read_view as view
 
 
-def native_catalog():
-    owner, builder = 11, 12
-    return dict(
-        namespace=dict(oid=10, owner=owner, safe=True),
-        ledgers=[dict(name=name, oid=20 + index, owner=owner, safe=True) for index, name in enumerate(view.LEDGERS)],
-        view=dict(
-            oid=30,
-            owner=owner,
-            safe=True,
-            definition=view.CLAIMS_SQL + ";",
-            columns=[["relation_oid", "bigint", "", "", False, None]],
-            acl=sorted(
-                [[owner, owner, privilege, False] for privilege in view.OWNER_PRIVILEGES]
-                + [[builder, owner, "SELECT", False]]
-            ),
-            dependencies=[20, 21, 22, 23],
-            other_dependencies=False,
-        ),
-    )
-
-
-def test_all_four_claim_ledgers_are_unfiltered_and_indexed():
-    assert len(view.LEDGERS) == 4 and view.CLAIMS_SQL.count("UNION ALL") == 3
+def test_claim_projection_uses_all_recorded_name_sources_without_state_filters():
+    assert view.CLAIMS_SQL.count("UNION ALL") == 3
+    for name in ("relation", "preparation_relation", "reference_preparation_relation", "legacy_archive"):
+        assert "FROM hp_snapshot_retention." + name in view.CLAIMS_SQL
+    assert "preparation.stage_schema" in view.CLAIMS_SQL and "relation.table_name" in view.CLAIMS_SQL
+    assert "{inventory,relations}" in view.CLAIMS_SQL and "'[null]'::jsonb" in view.CLAIMS_SQL
     assert "WHERE" not in view.CLAIMS_SQL and "state" not in view.CLAIMS_SQL
-    assert all(f"FROM hp_snapshot_retention.{name}" in view.CLAIMS_SQL for name in view.LEDGERS)
-    assert "i.indisunique AND i.indisvalid AND i.indisready" in view.CATALOG_SQL
-    assert "i.indkey[0]=a.attnum" in view.CATALOG_SQL
+    assert "relation_oid" not in view.CLAIMS_SQL and "owner" not in view.CLAIMS_SQL
     assert "security_invoker=false" in view.CREATE_VIEW_SQL
 
 
-@pytest.mark.parametrize(
-    "path,replacement",
-    [
-        (("view", "owner"), 91),
-        (("view", "definition"), "SELECT relation_oid FROM hp_snapshot_retention.relation WHERE false"),
-        (("view", "dependencies"), [20, 21, 22, 23, 99]),
-        (("view", "acl"), [[0, 11, "SELECT", False]]),
-        (("view", "columns"), [["relation_oid", "bigint", "", "", False, "{reader=r/owner}"]]),
-        (("view", "safe"), False),
-        (("ledgers",), []),
-        (("namespace", "safe"), False),
-    ],
-)
-def test_projection_refuses_every_native_contract_change(path, replacement):
-    captured = native_catalog()
-    parent = captured
-    for key in path[:-1]:
-        parent = parent[key]
-    parent[path[-1]] = replacement
-    with pytest.raises(view.NuccRetentionReadError):
-        view.validate_projection(captured, builder_oid=12)
-
-
-def test_only_native_total_absence_preserves_legacy_catalog_branch():
-    assert view.retention_catalog(dict(namespace=None, ledgers=[], view=None)) is None
-    for catalog in (dict(namespace=None, ledgers=[], view={}), dict(namespace=None, ledgers=[{}], view=None)):
-        with pytest.raises(view.NuccRetentionReadError):
-            view.retention_catalog(catalog)
-    first = native_catalog()
-    identity = view.validate_projection(first, builder_oid=12)
-    replacement = deepcopy(first)
-    replacement["view"]["oid"] += 1
-    with pytest.raises(view.NuccRetentionReadError, match="identity"):
-        view.validate_projection(replacement, builder_oid=12, previous=identity)
-
-
-class _Savepoint:
-    def __init__(self, events):
-        self.events = events
-
-    async def __aenter__(self):
-        self.events.append("savepoint")
-
-    async def __aexit__(self, error_type, *_args):
-        self.events.append("rollback" if error_type else "release")
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "claimed", "uncertain", "actor", "replacement", "cancel"])
-async def test_negative_check_uses_one_fresh_query_after_pinned_view(monkeypatch, failure):
-    events, original = [], native_catalog()
-    replacement = deepcopy(original)
-    if failure == "replacement":
-        replacement["view"]["oid"] += 1
-    scalar_results = [
-        dict(oid=12, safe=failure != "actor"),
-        original,
-        replacement,
-        True if failure == "claimed" else None if failure == "uncertain" else False,
-    ]
-
-    async def scalar(statement, *_args):
-        query = str(statement)
-        events.append(query)
-        if failure == "cancel" and "SELECT EXISTS" in query:
-            raise asyncio.CancelledError
-        return scalar_results.pop(0)
-
+@pytest.mark.parametrize("claim", [False, True, None, asyncio.CancelledError()])
+@pytest.mark.parametrize("claim_source", ("retention", "current"))
+async def test_fresh_named_claim_read_refuses_claimed_or_uncertain_tables(claim, claim_source):
     session = SimpleNamespace(
         in_transaction=lambda: True,
-        scalar=AsyncMock(side_effect=scalar),
-        execute=AsyncMock(side_effect=lambda statement: events.append(str(statement))),
+        scalar=AsyncMock(side_effect=["read committed", True, claim_source, claim]),
     )
-
-    @asynccontextmanager
-    async def search_path(_session):
-        yield
-
-    monkeypatch.setattr(view, "catalog_search_path", search_path)
-    if failure:
-        with pytest.raises(asyncio.CancelledError if failure == "cancel" else view.NuccRetentionReadError):
-            await view.require_unretained_nucc_oids(session, [71, 72])
+    if claim is False:
+        await view.require_unretained_nucc_relations(
+            session, schema_name="mrf", relation_names=("nucc_taxonomy_old", "nucc_taxonomy")
+        )
     else:
-        await view.require_unretained_nucc_oids(session, [72, 71])
-        assert session.scalar.await_args.args[1] == {"oids": [71, 72]}
-    queries = [query for query in events if "SELECT EXISTS" in query]
-    assert len(queries) == int(failure not in {"actor", "replacement"})
-    if queries:
-        lock_index = events.index(f"LOCK TABLE ONLY {view.VIEW} IN ACCESS SHARE MODE NOWAIT")
-        assert lock_index < events.index(queries[0])
-        assert "ANY(CAST(:oids AS bigint[]))" in queries[0]
+        with pytest.raises(asyncio.CancelledError if isinstance(claim, BaseException) else view.NuccRetentionReadError):
+            await view.require_unretained_nucc_relations(
+                session, schema_name="mrf", relation_names=("nucc_taxonomy_old", "nucc_taxonomy")
+            )
+    statement, parameters = session.scalar.await_args.args
+    assert view.claim_relations_source(claim_source) in str(statement)
+    assert "schema_name IS NULL OR relation_name IS NULL" in str(statement)
+    assert parameters == {"schema": "mrf", "relations": ["nucc_taxonomy", "nucc_taxonomy_old"]}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, RuntimeError, asyncio.CancelledError])
-async def test_search_path_rollback_does_not_execute_restore_in_aborted_savepoint(failure):
-    events = []
+@pytest.mark.parametrize("claim", [False, True])
+async def test_named_preparation_catalog_alone_reads_its_own_claims_without_the_view(claim):
     session = SimpleNamespace(
-        begin_nested=lambda: _Savepoint(events), scalar=AsyncMock(return_value='"$user", public'), execute=AsyncMock()
+        in_transaction=lambda: True,
+        scalar=AsyncMock(side_effect=["read committed", True, "named", claim]),
     )
-    if failure:
-        with pytest.raises(failure):
-            async with view.catalog_search_path(session):
-                raise failure()
-        assert events == ["savepoint", "rollback"] and session.execute.await_count == 1
+    rotation = view.require_unretained_nucc_relations(session, schema_name="mrf", relation_names=("nucc_taxonomy",))
+    if claim:
+        with pytest.raises(view.NuccRetentionReadError, match="retained claim exists"):
+            await rotation
     else:
-        async with view.catalog_search_path(session):
-            assert events == ["savepoint"]
-        assert events == ["savepoint", "release"] and session.execute.await_count == 2
-        assert session.execute.await_args.args[1] == {"path": '"$user", public'}
+        await rotation
+    statement = str(session.scalar.await_args.args[0])
+    assert view.VIEW not in statement and view.NAMED_CLAIMS_SQL in statement
+    assert "schema_name IS NULL OR relation_name IS NULL" in statement
+    assert view.CLAIMS_SQL.startswith(view.NAMED_CLAIMS_SQL + "\nUNION ALL\n")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("oids", [[], [1, 2, 3], [True], [0], [2**32], ["1"]])
-async def test_unbounded_or_ambiguous_oid_scope_refuses_before_catalogue(oids):
+@pytest.mark.parametrize("claim_source", ["incomplete", None, "other"])
+async def test_incomplete_retention_installation_refuses_before_reading_claims(claim_source):
+    session = SimpleNamespace(
+        in_transaction=lambda: True,
+        scalar=AsyncMock(side_effect=["read committed", True, claim_source]),
+    )
+    with pytest.raises(view.NuccRetentionReadError, match="catalogue is incomplete"):
+        await view.require_unretained_nucc_relations(session, schema_name="mrf", relation_names=("nucc_taxonomy",))
+    assert session.scalar.await_count == 3
+    source_sql = str(session.scalar.await_args.args[0])
+    for retention_only in ("publication", "legacy_archive", "reference_preparation", "reference_preparation_relation"):
+        assert f"to_regclass('hp_snapshot_retention.{retention_only}') IS NULL" in source_sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("installed", [False, None])
+async def test_only_absent_retention_catalog_allows_untracked_rotation(installed):
+    session = SimpleNamespace(
+        in_transaction=lambda: True,
+        scalar=AsyncMock(side_effect=["read committed", installed]),
+    )
+    if installed is False:
+        await view.require_unretained_nucc_relations(session, schema_name="mrf", relation_names=("nucc_taxonomy",))
+    else:
+        with pytest.raises(view.NuccRetentionReadError, match="uncertain"):
+            await view.require_unretained_nucc_relations(session, schema_name="mrf", relation_names=("nucc_taxonomy",))
+    assert session.scalar.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_rotation_requires_fresh_read_committed_claims():
+    session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value="repeatable read"))
+    with pytest.raises(view.NuccRetentionReadError, match="fresh claim read"):
+        await view.require_unretained_nucc_relations(session, schema_name="mrf", relation_names=("nucc_taxonomy",))
+    session.scalar.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("names", [[], ["one", "two", "three"], [True], [0], [None], [{}], ["unsafe.name"]])
+async def test_invalid_named_scope_refuses_before_database_reads(names):
     session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock())
-    with pytest.raises(view.NuccRetentionReadError, match="OID scope"):
-        await view.require_unretained_nucc_oids(session, oids)
+    with pytest.raises(view.NuccRetentionReadError, match="relation scope"):
+        await view.require_unretained_nucc_relations(session, schema_name="mrf", relation_names=names)
     session.scalar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_plain_rotation_uses_read_locks_before_fresh_retained_claim_check(monkeypatch):
+    from process import reference_family_archive as archive
+
+    monkeypatch.setattr(archive, "is_nucc_native_handoff_required", AsyncMock(return_value=False))
+    claims = AsyncMock()
+    monkeypatch.setattr(view, "require_unretained_nucc_relations", claims)
+    session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(return_value=True), execute=AsyncMock())
+    await view.require_nucc_unretained_rotation(session, schema_name="mrf")
+    assert [str(call.args[0]) for call in session.execute.await_args_list] == [
+        'LOCK TABLE ONLY "mrf"."nucc_taxonomy" IN ACCESS SHARE MODE NOWAIT',
+        'LOCK TABLE ONLY "mrf"."nucc_taxonomy_old" IN ACCESS SHARE MODE NOWAIT',
+    ]
+    claims.assert_awaited_once_with(session, schema_name="mrf", relation_names=["nucc_taxonomy", "nucc_taxonomy_old"])
+
+
+def test_current_catalog_requires_every_claim_and_pin_source_without_legacy_view():
+    assert "legacy_archive_relation" in view.CURRENT_CLAIMS_SQL
+    assert view.CURRENT_CLAIMS_SQL.startswith(view.CLAIMS_SQL)
+    assert "WHERE" not in view.CURRENT_CLAIMS_SQL and "state" not in view.CURRENT_CLAIMS_SQL
+    current_clause = view._CLAIM_SOURCE_SQL.split("THEN 'current'")[0]
+    for table in view._CURRENT_CATALOG_TABLES:
+        assert f"to_regclass('hp_snapshot_retention.{table}') IS NOT NULL" in current_clause
+    assert view.claim_relations_source("current") == "(" + view.CURRENT_CLAIMS_SQL + ")"
+    assert view.claim_relations_source("retention") == view.VIEW
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claim_source,claimed", [("current", False), ("current", True), ("incomplete", None)])
+async def test_address_snapshot_uses_same_current_claims_and_conservative_partial_refusal(claim_source, claimed):
+    from process.entity_address_snapshot_adoption import _is_registered_snapshot
+
+    answers = [False, claim_source] + ([claimed] if claimed is not None else [])
+    database = SimpleNamespace(scalar=AsyncMock(side_effect=answers))
+    assert await _is_registered_snapshot(database, "retained_snapshot", ("nucc_taxonomy",)) is (claimed is not False)
+    assert database.scalar.await_count == len(answers)
+    if claimed is not None:
+        assert view.CURRENT_CLAIMS_SQL in database.scalar.await_args.args[0]
+        assert database.scalar.await_args.kwargs == {"schema": "retained_snapshot", "names": ["nucc_taxonomy"]}

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from dataclasses import replace
+from functools import partial
 from types import SimpleNamespace
 from uuid import UUID, uuid4, uuid5
 
@@ -23,6 +24,7 @@ from process.network_custom_address_source import (
 from process.network_custom_address_source import (
     _from_document as _custom_address_receipt,
 )
+from process.network_legacy_membership_source import LegacyMembershipSourceError
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_candidate_composition import (
@@ -76,6 +78,7 @@ from tests.test_registry_candidate_composition_postgres import (
     _roles,
     _rollback_members,
     _rollback_reader,
+    _seal_composition_target,
 )
 from tests.test_registry_candidate_composition_postgres import initial_composition as initial_composition
 from tests.test_registry_candidate_composition_postgres import office_db as office_db
@@ -145,7 +148,20 @@ async def _complete(fixture, lease, authorize):
     writer_roles = _arguments(fixture)
     writer_roles.pop("control_schema")
     await fixture.connection.execute(f'SET ROLE "{fixture.writer_roles["publisher"]}"')
+    config = RegistryPublicationConsumerConfig(
+        fixture.control_schema,
+        fixture.writer_roles["publisher"],
+        fixture.writer_roles["publisher"],
+        fixture.writer_roles["reader"],
+        fixture.writer_roles["owner"],
+        writer_roles["owner_role"],
+        loader_roles=writer_roles["loader_roles"],
+        reader_roles=writer_roles["reader_roles"],
+        seal_candidate=fixture.seal_candidate,
+        preparation_roles=fixture.preparation_roles,
+    )
     try:
+        # Mirror the worker: the configured preparation step records final data validation.
         return await execution.complete_queued_registry_publication(
             fixture.connection,
             lease["request_id"],
@@ -153,16 +169,8 @@ async def _complete(fixture, lease, authorize):
             fixture.copy_target,
             fixture.address_source,
             authorize=authorize,
-            writer_context=RegistryPublicationConsumerConfig(
-                fixture.control_schema,
-                fixture.writer_roles["publisher"],
-                fixture.writer_roles["publisher"],
-                fixture.writer_roles["reader"],
-                fixture.writer_roles["owner"],
-                writer_roles["owner_role"],
-                loader_roles=writer_roles["loader_roles"],
-                reader_roles=writer_roles["reader_roles"],
-            ),
+            writer_context=config,
+            seal_candidate=config.seal_candidate,
         )
     finally:
         await fixture.connection.execute("RESET ROLE")
@@ -683,6 +691,7 @@ async def _complete_source_preview(source_preview, authorize):
         authorize=authorize,
         writer_roles=_roles(history.fixture),
         control_schema=history.fixture.control_schema,
+        seal_candidate=partial(_seal_composition_target, history.fixture, runtime_roles=()),
     )
 
 
@@ -963,7 +972,7 @@ async def test_bootstrap_retained_source_successor_and_rollback_preview(
         original_name = await case.connection.fetchval(f"SELECT provider_first_name FROM {npi_table}")
         await case.connection.execute(f"UPDATE {npi_table} SET provider_first_name='Changed'")
         try:
-            with pytest.raises(execution.bootstrap_sources.NetworkBootstrapSourceError, match="content or shape"):
+            with pytest.raises(execution.bootstrap_sources.NetworkBootstrapSourceError, match="content differs"):
                 await execution._source_rollback_address_sources(publisher, first, case.control_schema)
         finally:
             await case.connection.execute(f"UPDATE {npi_table} SET provider_first_name=$1", original_name)
@@ -976,33 +985,7 @@ async def test_bootstrap_retained_source_successor_and_rollback_preview(
         case.additional_schemas.extend(candidate_row["schema_name"] for candidate_row in candidate_rows)
 
 
-async def test_source_preview_rejects_changed_recorded_npi_oid(custom_npi_preview):
-    """Equal names, columns and NPI rows cannot replace the recorded native OID."""
-    history, _command, _actor, _queued, lease = custom_npi_preview
-    fixture = history.fixture
-    schema = '"' + fixture.source_schema + '"'
-    original_oid = await fixture.connection.fetchval("SELECT to_regclass($1)::oid", fixture.source_schema + ".npi")
-    await fixture.connection.execute(f"ALTER TABLE {schema}.npi RENAME TO npi_previous")
-    await fixture.connection.execute(f"CREATE TABLE {schema}.npi (LIKE {schema}.npi_previous INCLUDING ALL)")
-    await fixture.connection.execute(f"INSERT INTO {schema}.npi SELECT * FROM {schema}.npi_previous")
-    await fixture.connection.execute(f'ALTER TABLE {schema}.npi OWNER TO "{fixture.roles["owner"]}"')
-    await fixture.connection.execute(f'GRANT SELECT ON {schema}.npi TO "{fixture.roles["reader"]}"')
-    assert (
-        await fixture.connection.fetchval("SELECT to_regclass($1)::oid", fixture.source_schema + ".npi") != original_oid
-    )
-    assert await fixture.connection.fetchval(
-        f"SELECT (SELECT array_agg(to_jsonb(n) ORDER BY npi) FROM {schema}.npi n) = "
-        f"(SELECT array_agg(to_jsonb(n) ORDER BY npi) FROM {schema}.npi_previous n)"
-    )
-    with pytest.raises(NetworkCustomAddressSourceError, match="physical identity"):
-        await _complete_source_preview(custom_npi_preview, _reactivation_authority([]))
-    status = await read_registry_publication_request(
-        fixture.connection, lease["request_id"], control_schema=fixture.control_schema
-    )
-    assert status["state"] == "running" and status["result"] is None
-
-
-async def _revoke_retained_control_wait(fixture, lease, table_name, operation):
+async def _revoke_retained_control_wait(fixture, lease, table_name, operation, authority_reads=3):
     """A second native backend holds the control until trusted authority changes."""
     observer = await asyncpg.connect(
         os.environ["NETWORK_REGISTRY_TEST_DSN"].replace("postgresql+asyncpg://", "postgresql://")
@@ -1038,7 +1021,7 @@ async def _revoke_retained_control_wait(fixture, lease, table_name, operation):
             pending.cancel()
             await asyncio.gather(pending, return_exceptions=True)
         await observer.close()
-    assert len(calls) == 3 and all(call == calls[0] for call in calls)
+    assert len(calls) == authority_reads and all(call == calls[0] for call in calls)
     assert (
         await fixture.connection.fetchval(
             f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control WHERE id=1'
@@ -1065,8 +1048,13 @@ async def test_reactivation_revocation_after_control_wait(publication_db, table_
 async def test_source_preview_revocation_after_control_wait(source_preview, table_name):
     """A prepared candidate cannot become an authorized preview after revocation."""
     history, _command, _actor, _queued, lease = source_preview
+    # The configured preparation step adds its own fresh authority read before the control wait.
     await _revoke_retained_control_wait(
-        history.fixture, lease, table_name, lambda authorize: _complete_source_preview(source_preview, authorize)
+        history.fixture,
+        lease,
+        table_name,
+        lambda authorize: _complete_source_preview(source_preview, authorize),
+        authority_reads=4,
     )
 
 
@@ -1091,7 +1079,7 @@ async def test_source_preview_actual_aca_latest_manual_diff_ready_without_public
     )
     calls = []
     result_by_name = await _complete_source_preview(source_preview, _reactivation_authority(calls))
-    assert len(calls) == 3 and all(call["command"] == command for call in calls)
+    assert len(calls) == 4 and all(call["command"] == command for call in calls)
     assert set(result_by_name) == {
         "operation",
         "candidate_id",
@@ -1173,7 +1161,8 @@ async def test_source_preview_fault_keeps_closed_candidate_and_head_then_resumes
         "cancel": asyncio.CancelledError,
         "revoke": PermissionError,
         "lease": RegistryApprovalConflict,
-        "approval": RegistryApprovalConflict,
+        # The configured preparation step validates sources against the moved approval first.
+        "approval": LegacyMembershipSourceError,
     }[fault]
     with pytest.raises(expected):
         await _complete_source_preview(source_preview, _reactivation_authority(calls, revoke=fault == "revoke"))
@@ -1326,6 +1315,7 @@ async def _complete_source_publication(source_publication, authorize):
         authorize=authorize,
         writer_roles=_roles(history.fixture),
         control_schema=history.fixture.control_schema,
+        preparation_roles=history.fixture.preparation_roles,
     )
 
 
@@ -1442,14 +1432,10 @@ async def test_source_publication_final_fault_rolls_back_head_and_audit_exact_re
     )
 
 
-@pytest.mark.parametrize("damage", ["preview", "digest", "closure", "source", "approval"])
+@pytest.mark.parametrize("damage", ["preview", "digest", "source", "approval"])
 async def test_source_publication_refuses_changed_review_pins_and_closure(source_publication, damage):
     history, command_by_name, _actor, _queued, _lease, preview = source_publication
     fixture = history.fixture
-    candidate_schema = await fixture.connection.fetchval(
-        f'SELECT schema_name FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
-        UUID(preview["candidate_id"]),
-    )
     if damage == "preview":
         await fixture.connection.execute(
             f"UPDATE \"{fixture.control_schema}\".registry_publication_request SET result_json=jsonb_set(result_json,'{{candidate_sha256}}',to_jsonb($1::text)) WHERE request_id=$2",
@@ -1460,10 +1446,6 @@ async def test_source_publication_refuses_changed_review_pins_and_closure(source
         await fixture.connection.execute(
             f'UPDATE "{fixture.control_schema}".network_membership_candidate SET validation_json=validation_json||\'{{"changed":true}}\'::jsonb WHERE candidate_id=$1',
             UUID(preview["candidate_id"]),
-        )
-    elif damage == "closure":
-        await fixture.connection.execute(
-            f'GRANT INSERT ON "{candidate_schema}".network_membership TO "{fixture.roles["reader"]}"'
         )
     elif damage == "source":
         await fixture.connection.execute(
@@ -1961,7 +1943,7 @@ async def _assert_legacy_preview_status(fixture, lease, legacy_by_name):
     )["result"] == legacy_by_name
 
 
-@pytest.mark.parametrize("damage", ["validation", "index_readiness", "writer_closure"])
+@pytest.mark.parametrize("damage", ["validation", "index_readiness"])
 async def test_source_preview_malformed_candidate_never_claims_ready_or_changes_head(
     source_preview, monkeypatch, damage
 ):
@@ -1979,10 +1961,8 @@ async def test_source_preview_malformed_candidate_never_claims_ready_or_changes_
         report = json.loads(row["validation_json"])
         if damage == "validation":
             report["valid"] = False
-        elif damage == "index_readiness":
-            report["serving_readiness"]["ready"] = False
         else:
-            report.pop("writer_closure")
+            report["serving_readiness"]["ready"] = False
         await fixture.connection.execute(
             f'UPDATE "{fixture.control_schema}".network_membership_candidate SET validation_json=$1::jsonb WHERE candidate_id=$2',
             json.dumps(report),

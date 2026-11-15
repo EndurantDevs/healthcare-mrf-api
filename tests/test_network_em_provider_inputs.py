@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Pure custody/control regressions; genuine PostgreSQL qualification is separate."""
+"""Named provider data and control regressions using synthetic catalog rows."""
 
 import asyncio
 import copy
@@ -12,6 +12,7 @@ from uuid import UUID
 import pytest
 
 from process import network_em_provider_inputs as inputs
+from process.network_compact_layout import CompactAddressRelation
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_serving_read import PinnedNetworkServingManifest
 
@@ -19,7 +20,7 @@ from process.network_serving_read import PinnedNetworkServingManifest
 def family():
     return inputs.EMProviderInputs(
         tuple(
-            inputs.EMProviderInputRelation(role, "retained_inputs", "held_" + str(i), "generation-1", 100 + i, 200 + i)
+            inputs.EMProviderInputRelation(role, "retained_inputs", "held_" + str(i), "generation-1")
             for i, role in enumerate(inputs._ROLES)
         )
     )
@@ -27,17 +28,13 @@ def family():
 
 def catalog():
     catalog_rows = []
-    for i, role in enumerate(inputs._ROLES):
+    for role in inputs._ROLES:
         columns = [
             dict(
                 attnum=n,
                 attname=name,
                 type_name=kind,
                 type_schema="public" if kind == "geometry" else "pg_catalog",
-                type_oid=300 + n,
-                atttypmod=-1,
-                attnotnull=False,
-                default_expr=None,
                 canonical_geometry=kind == "geometry",
                 geometry_srid=4269 if kind == "geometry" else None,
                 geometry_type="MultiPolygon" if kind == "geometry" else None,
@@ -53,27 +50,12 @@ def catalog():
         catalog_rows.append(
             dict(
                 role=role,
-                schema_oid=10,
-                relation_oid=100 + i,
-                relfilenode=200 + i,
-                owner_oid=20,
-                owner_role="retained_owner",
-                rolcanlogin=False,
-                rolsuper=False,
-                rolcreatedb=False,
-                rolcreaterole=False,
-                rolreplication=False,
-                rolbypassrls=False,
-                same_owner=True,
                 relkind="r",
                 relpersistence="p",
                 relispartition=False,
-                relrowsecurity=False,
-                relforcerowsecurity=False,
-                has_triggers=False,
                 inheritance_ok=True,
                 columns_json=json.dumps(columns),
-                keys_json=json.dumps([dict(index_oid=400 + i, columns=key)] if key else []),
+                keys_json=json.dumps([dict(columns=key)] if key else []),
             )
         )
     return catalog_rows
@@ -118,7 +100,7 @@ def manifest(receipt):
         {"em_provider_inputs": receipt["receipt_sha256"]},
         3,
         "a" * 64,
-        77,
+        CompactAddressRelation(target().schema_name, "entity_address_unified"),
     )
 
 
@@ -127,13 +109,13 @@ def test_closed_family_renders_only_held_relations_and_shared_geo_bindings():
     assert held.relation("npi") == '"retained_inputs"."held_3"'
     bindings = held.geo_bindings("address_snapshot")
     assert len(bindings) == 6 and bindings["tiger.zcta5"]["table_name"] == "held_7"
-    assert bindings["address_snapshot.npi_address"]["relation_oid"] == 104
+    assert bindings["address_snapshot.npi_address"] == {"schema_name": "retained_inputs", "table_name": "held_4"}
     with pytest.raises(ValueError):
         held.relation("npi; DROP TABLE x")
 
 
-@pytest.mark.parametrize("change", ["missing", "extra", "order", "duplicate_oid", "duplicate_name", "list"])
-def test_roster_is_exact_sorted_tuple_with_unique_physical_relations(change):
+@pytest.mark.parametrize("change", ["missing", "extra", "order", "duplicate_name", "list"])
+def test_roster_is_exact_sorted_tuple_with_unique_named_relations(change):
     rows = list(family().relations)
     if change == "missing":
         rows.pop()
@@ -141,8 +123,6 @@ def test_roster_is_exact_sorted_tuple_with_unique_physical_relations(change):
         rows.append(rows[-1])
     if change == "order":
         rows.reverse()
-    if change == "duplicate_oid":
-        rows[1] = replace(rows[1], relation_oid=rows[0].relation_oid)
     if change == "duplicate_name":
         rows[1] = replace(rows[1], table_name=rows[0].table_name)
     with pytest.raises(ValueError):
@@ -158,9 +138,6 @@ def test_roster_is_exact_sorted_tuple_with_unique_physical_relations(change):
         ("generation_id", ""),
         ("generation_id", "x" * 129),
         ("generation_id", "x\n"),
-        ("relation_oid", True),
-        ("relation_oid", 0),
-        ("relfilenode", 2**32),
     ],
 )
 def test_relation_identity_refuses_unbounded_or_executable_values(field, value):
@@ -168,23 +145,21 @@ def test_relation_identity_refuses_unbounded_or_executable_values(field, value):
         replace(family().relations[0], **{field: value})
 
 
-def test_preparation_batches_catalog_and_acl_without_source_rows_locks_or_writes():
+def test_preparation_batches_native_column_and_key_checks_without_locks_or_writes():
     conn = connection()
     receipt = prepare(conn)
     assert inputs._receipt(receipt) == family()
-    assert receipt["relations"][6]["shape_sha256"]
+    assert receipt["revision"] == 2
+    assert set(receipt["relations"][6]) == {"role", "schema_name", "table_name", "generation_id"}
     assert len(json.dumps(receipt)) < 32768
     assert conn.fetch.await_count == 1
     sql, encoded = conn.fetch.await_args.args
     assert json.loads(encoded)[3]["table_name"] == "held_3"
-    assert "pg_attribute" in sql and "pg_index" in sql and "pg_trigger" in sql
+    assert "pg_attribute" in sql and "pg_index" in sql
     assert "NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits" in sql
     assert "to_regclass('tiger.zcta5')" in sql
-    assert all("SELECT * FROM" not in call.args[0] for call in conn.fetch.await_args_list)
-    assert conn.fetchval.await_count == 2
-    acl = conn.fetchval.await_args.args
-    assert "has_table_privilege" in acl[0] and "pg_default_acl" in acl[0]
-    assert acl[1:] == (10, 20, ["runtime_reader"], ["held_" + str(i) for i in range(9)])
+    assert all(term not in sql for term in ("pg_roles", "pg_trigger", "filenode", "has_table_privilege"))
+    assert conn.fetchval.await_count == 1
     conn.execute.assert_not_awaited()
     assert inputs._required_columns("nucc_taxonomy")["definition"] == "text"
 
@@ -192,22 +167,13 @@ def test_preparation_batches_catalog_and_acl_without_source_rows_locks_or_writes
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("relation_oid", 999),
-        ("relfilenode", 999),
-        ("same_owner", False),
-        ("rolcanlogin", True),
-        ("rolsuper", True),
-        ("rolbypassrls", True),
         ("relkind", "v"),
         ("relpersistence", "u"),
         ("relispartition", True),
-        ("relrowsecurity", True),
-        ("relforcerowsecurity", True),
-        ("has_triggers", True),
         ("inheritance_ok", False),
     ],
 )
-def test_native_custody_damage_fails_before_acl_or_writes(field, value):
+def test_native_relation_structure_damage_fails_before_writes(field, value):
     rows = catalog()
     rows[0][field] = value
     conn = connection(rows)
@@ -260,15 +226,7 @@ def test_semantic_columns_and_relevant_unique_keys_are_required(role, damage):
         prepare(connection(rows))
 
 
-@pytest.mark.parametrize("roles", [(), ("reader", "reader"), ("z", "a"), ("bad-role",), ["reader"], (None,)])
-def test_runtime_roles_are_bounded_closed_sorted_identifiers(roles):
-    conn = connection()
-    with pytest.raises(ValueError):
-        asyncio.run(inputs.prepare_em_provider_inputs(conn, family(), runtime_roles=roles))
-    conn.fetch.assert_not_awaited()
-
-
-def test_repeatable_read_and_actual_privilege_closure_are_required():
+def test_repeatable_read_is_required_before_native_structure_checks():
     conn = connection()
     conn.is_in_transaction = lambda: False
     with pytest.raises(ValueError):
@@ -280,22 +238,15 @@ def test_repeatable_read_and_actual_privilege_closure_are_required():
     with pytest.raises(ValueError):
         prepare(conn)
     conn.fetch.assert_not_awaited()
-    conn = connection()
-    conn.fetchval.side_effect = ["repeatable read", False]
-    with pytest.raises(ValueError):
-        prepare(conn)
-    conn.execute.assert_not_awaited()
 
 
-@pytest.mark.parametrize("damage", ["extra", "revision_bool", "roles_tuple", "missing_role", "digest", "custody_extra"])
+@pytest.mark.parametrize("damage", ["extra", "revision_bool", "missing_role", "digest", "custody_extra"])
 def test_receipt_parser_is_closed_and_hash_checked(damage):
     receipt = prepare()
     if damage == "extra":
         receipt["unexpected"] = True
     if damage == "revision_bool":
         receipt["revision"] = True
-    if damage == "roles_tuple":
-        receipt["runtime_roles"] = ("runtime_reader",)
     if damage == "missing_role":
         receipt["relations"].pop()
     if damage == "digest":
@@ -355,7 +306,7 @@ def resolver(monkeypatch, *, receipt=None):
     return conn, pinned, resolve
 
 
-def test_resolver_rechecks_retained_full_manifest_and_native_custody_readonly(monkeypatch):
+def test_resolver_rechecks_retained_full_manifest_and_named_structure_readonly(monkeypatch):
     conn, pinned, resolve = resolver(monkeypatch)
     assert asyncio.run(inputs.resolve_em_provider_inputs(conn, pinned, "control")) == family()
     resolve.assert_awaited_once_with(conn, generation_id=17, control_schema="control")
@@ -374,14 +325,11 @@ def test_resolver_rechecks_retained_full_manifest_and_native_custody_readonly(mo
         "candidate_sources",
         "receipt_missing",
         "receipt_digest",
-        "native",
-        "owner",
         "shape",
         "keys",
-        "acl",
     ],
 )
-def test_resolver_refuses_stale_or_absent_custody_without_fallback(monkeypatch, damage):
+def test_resolver_refuses_stale_or_absent_logical_data_without_fallback(monkeypatch, damage):
     conn, pinned, resolve = resolver(monkeypatch)
     if damage == "manifest":
         resolve.return_value = replace(pinned, manifest_sha256="b" * 64)
@@ -394,19 +342,13 @@ def test_resolver_refuses_stale_or_absent_custody_without_fallback(monkeypatch, 
     if damage == "receipt_digest":
         conn.fetchrow.return_value["validation_json"]["em_provider_inputs"]["receipt_sha256"] = "0" * 64
     rows = catalog()
-    if damage == "native":
-        rows[0]["relfilenode"] = 900
-    if damage == "owner":
-        rows[0]["owner_oid"] = 900
     if damage == "shape":
         columns = json.loads(rows[0]["columns_json"])
-        columns[0]["attnotnull"] = True
+        columns[0]["type_name"] = "invalid"
         rows[0]["columns_json"] = json.dumps(columns)
     if damage == "keys":
-        rows[0]["keys_json"] = json.dumps([dict(index_oid=900, columns=["npi"])])
+        rows[inputs._ROLES.index("npi")]["keys_json"] = "[]"
     conn.fetch.return_value = rows
-    if damage == "acl":
-        conn.fetchval.side_effect = lambda sql, *args: "repeatable read" if sql.startswith("SHOW") else False
     with pytest.raises(inputs.PlanPricingProjectionUnavailable, match="unavailable"):
         asyncio.run(inputs.resolve_em_provider_inputs(conn, pinned))
     conn.execute.assert_not_awaited()
@@ -496,38 +438,33 @@ async def test_session_input_read_refuses_missing_root_transaction_before_resolu
     resolve.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_session_input_read_installs_every_verified_relation_on_original_backend(monkeypatch):
-    from api import network_read_execution as execution
-    from tests.test_network_optional_sql_recovery import _Session
+def _query_session():
+    driver = SimpleNamespace(fetchrow=AsyncMock())
+    transaction = object()
+    connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver)))
+    return SimpleNamespace(
+        info={}, get_transaction=lambda: transaction, connection=AsyncMock(return_value=connection)
+    ), driver
 
+
+@pytest.mark.asyncio
+async def test_session_input_read_resolves_the_recipe_on_its_configured_session(monkeypatch):
     held = family()
-    session = _Session()
-    session.names.update(
-        {f'"{relation.schema_name}"."{relation.table_name}"': relation.relation_oid for relation in held.relations}
-    )
+    session, driver = _query_session()
     pinned = manifest(
         await inputs.prepare_em_provider_inputs(connection(), family(), runtime_roles=("runtime_reader",))
     )
-    resolved = AsyncMock(return_value=held)
-    monkeypatch.setattr(inputs, "resolve_em_provider_inputs", resolved)
+    resolve = AsyncMock(return_value=held)
+    monkeypatch.setattr(inputs, "resolve_em_provider_inputs", resolve)
     assert await inputs.resolve_em_provider_inputs_in_session(session, pinned, "control") is held
-    installed = session.info[execution._SESSION_INVENTORY_KEY]
-    assert installed.transaction is session.transaction
-    assert installed.inventory.connection is session.driver and installed.inventory.backend_pid == 42
-    assert {pin.table_oid for pin in installed.inventory.relations} == {
-        relation.relation_oid for relation in held.relations
-    }
-    resolved.assert_awaited_once_with(session.driver, pinned, "control", api_read=True)
-    assert session.events == ["names"]
+    resolve.assert_awaited_once_with(driver, pinned, "control", api_read=True)
+    assert session.info == {}
+    driver.fetchrow.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_canceled_input_resolution_never_installs_partial_relation_inventory(monkeypatch):
-    from api import network_read_execution as execution
-    from tests.test_network_optional_sql_recovery import _Session
-
-    session = _Session()
+async def test_canceled_input_resolution_preserves_the_transaction_owner(monkeypatch):
+    session, _driver = _query_session()
     entered = asyncio.Event()
 
     async def pending(*_arguments, **_options):
@@ -538,10 +475,184 @@ async def test_canceled_input_resolution_never_installs_partial_relation_invento
     pinned = manifest(
         await inputs.prepare_em_provider_inputs(connection(), family(), runtime_roles=("runtime_reader",))
     )
+    transaction = session.get_transaction()
     task = asyncio.create_task(inputs.resolve_em_provider_inputs_in_session(session, pinned, "control"))
     await entered.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert execution._SESSION_INVENTORY_KEY not in session.info
-    assert session.events == []
+    assert session.get_transaction() is transaction and session.info == {}
+
+
+def _legacy_provider_receipt():
+    legacy = prepare()
+    legacy.update(revision=1, runtime_roles=["old_reader"])
+    for relation in legacy["relations"]:
+        relation.update(
+            relation_oid=1,
+            relfilenode=2,
+            schema_oid=3,
+            owner_oid=4,
+            owner_role="old_owner",
+            shape_sha256="a" * 64,
+            keys_sha256="b" * 64,
+        )
+    legacy["receipt_sha256"] = inputs._digest({key: value for key, value in legacy.items() if key != "receipt_sha256"})
+    return legacy
+
+
+def test_retained_legacy_provider_receipt_projects_names_and_ignores_physical_drift(monkeypatch):
+    legacy = _legacy_provider_receipt()
+    conn, pinned, _ = resolver(monkeypatch, receipt=legacy)
+    for row in conn.fetch.return_value:
+        row.update(relation_oid=999, relfilenode=999, owner_oid=999, owner_role="copied_owner")
+    assert asyncio.run(inputs.resolve_em_provider_inputs(conn, pinned)) == family()
+    assert legacy["relations"][0]["owner_oid"] == 4
+    assert conn.fetch.await_count == 1
+    assert "pg_roles" not in conn.fetch.await_args.args[0]
+    changed = copy.deepcopy(legacy)
+    changed["relations"][0]["table_name"] = "wrong_table"
+    with pytest.raises(ValueError):
+        inputs._receipt(changed)
+
+
+def test_named_geo_rendering_decodes_legacy_receipts_without_reconstructing_physical_identity():
+    from api import ptg2_geo_projection as projection
+
+    decoded = inputs._receipt(_legacy_provider_receipt())
+    bindings = decoded.geo_bindings("mrf")
+    assert bindings == family().geo_bindings("mrf")
+    assert all(set(binding) == {"schema_name", "table_name"} for binding in bindings.values())
+    rendered = " ".join(
+        projection.projection_dependency_relation_sql("mrf", name, dependency_bindings=bindings) for name in bindings
+    )
+    evidence = projection.legacy_evidence_source_id_sql(
+        "addr", schema_name="mrf", dependency_bindings=bindings, unified_schema_name="network_snapshot"
+    )
+    assert '"retained_inputs"."held_4"' in rendered
+    assert 'FROM "network_snapshot"."entity_address_unified" AS geo_nppes_anchor' in evidence
+    for forbidden in ("relation_oid", "filenode", "pg_class", "pg_roles", "pg_backend_pid", "to_regclass"):
+        assert forbidden not in rendered + evidence
+
+
+def test_named_geo_validator_returns_a_detached_complete_qname_map():
+    from api import ptg2_geo_projection as projection
+
+    bindings = family().geo_bindings("mrf")
+    normalized = projection.validate_projection_dependency_qnames("mrf", bindings)
+    bindings["mrf.npi_address"]["table_name"] = "other_table"
+    assert normalized == family().geo_bindings("mrf")
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["missing", "extra_role", "extra_field", "legacy", "mixed", "schema_type", "table_type", "sql", "duplicate"],
+)
+def test_named_geo_validator_and_renderer_refuse_open_or_unsafe_maps(damage):
+    from api import ptg2_geo_projection as projection
+
+    bindings = family().geo_bindings("mrf")
+    entry = bindings["mrf.npi_address"]
+    match damage:
+        case "missing":
+            bindings.pop("tiger.zcta5")
+        case "extra_role":
+            bindings["mrf.unreviewed"] = dict(entry)
+        case "extra_field":
+            entry["sql"] = "SELECT 1"
+        case "legacy" | "mixed":
+            for index, binding in enumerate(bindings.values()):
+                if damage == "legacy" or binding is entry:
+                    binding.update(relation_oid=index + 1, relfilenode=index + 101)
+        case "schema_type":
+            entry["schema_name"] = 42
+        case "table_type":
+            entry["table_name"] = True
+        case "sql":
+            entry["table_name"] = "table; SELECT 1"
+        case _:
+            bindings["mrf.mrf_address"] = dict(entry)
+    with pytest.raises(ValueError):
+        projection.validate_projection_dependency_qnames("mrf", bindings)
+    if damage != "legacy":
+        with pytest.raises(ValueError):
+            projection.projection_dependency_relation_sql("mrf", "mrf.npi_address", dependency_bindings=bindings)
+
+
+@pytest.mark.parametrize("schema", [None, True, 42, "mrf; SELECT 1", "mrf.schema"])
+def test_named_geo_validator_requires_a_safe_string_schema(schema):
+    from api import ptg2_geo_projection as projection
+
+    with pytest.raises(ValueError):
+        projection.validate_projection_dependency_qnames(schema, family().geo_bindings("mrf"))
+
+
+def test_named_geo_bindings_use_shared_signature_and_state_paths(monkeypatch):
+    from api import ptg2_geo_projection as projection
+    from process import entity_address_dependency_bindings as state
+
+    bindings = family().geo_bindings("mrf")
+    with pytest.raises(ValueError):
+        projection.validate_projection_dependency_bindings("mrf", bindings)
+    assert projection.validate_projection_dependency_qnames("mrf", bindings) == bindings
+    match_sql = projection.projection_dependency_bindings_match_sql("mrf", bindings)
+    lock_sql = projection.projection_dependency_lock_sql("mrf", dependency_bindings=bindings)
+    signature_sql = projection.projection_relation_signature_sql("mrf", dependency_bindings=bindings)
+    state_sql = state.record_geo_assurance_candidate_sql("mrf", "address_stage", 1, dependency_bindings=bindings)
+    for binding in bindings.values():
+        qualified_name = f'"{binding["schema_name"]}"."{binding["table_name"]}"'
+        assert qualified_name in lock_sql and qualified_name in match_sql
+        assert repr(binding["schema_name"]) in signature_sql and repr(binding["table_name"]) in signature_sql
+    assert "ACCESS SHARE MODE" in lock_sql
+    assert "relfilenode" not in state_sql and '"relation_oid"' not in state_sql
+    assert "RETURNING candidate_geo_assurance_version" in state_sql
+    invalid_binding_by_name = dict(bindings, unreviewed={"schema_name": "mrf", "table_name": "unreviewed"})
+    with pytest.raises(ValueError):
+        state.record_geo_assurance_candidate_sql("mrf", "address_stage", 1, dependency_bindings=invalid_binding_by_name)
+
+
+def test_named_geo_signature_keeps_complete_qualified_dependency_map():
+    from api import ptg2_geo_projection as projection
+
+    bindings = family().geo_bindings("mrf")
+    signature = projection.projection_relation_signature_sql("mrf", dependency_bindings=bindings)
+    assert signature.startswith("jsonb_build_object(")
+    for canonical, binding in bindings.items():
+        assert repr(canonical) in signature
+        assert f"jsonb_build_array({binding['schema_name']!r}, {binding['table_name']!r})" in signature
+    assert "to_regclass" not in signature and "pg_relation_filenode" not in signature
+
+
+def test_legacy_geo_token_changes_preserve_recorded_names_and_raw_editions():
+    from api import ptg2_geo_projection as projection
+
+    named = family().geo_bindings("mrf")
+    legacy_by_name = {name: {**binding, "relation_oid": 17, "relfilenode": 29} for name, binding in named.items()}
+    raw = copy.deepcopy(legacy_by_name)
+    expected = projection.projection_relation_signature_sql("mrf", dependency_bindings=named)
+    assert projection.projection_relation_signature_sql("mrf", dependency_bindings=legacy_by_name) == expected
+    checks = projection.projection_dependency_bindings_match_sql("mrf", legacy_by_name)
+    assert checks == projection.projection_named_dependency_match_sql("mrf", named)
+    assert legacy_by_name == raw
+    changed = copy.deepcopy(legacy_by_name)
+    changed["mrf.npi_address"]["table_name"] = "another_named_heap"
+    assert projection.projection_relation_signature_sql("mrf", dependency_bindings=changed) != expected
+
+
+def test_geo_api_uses_named_projection_with_complete_semantic_fallback():
+    from api import ptg2_geo_projection as projection
+
+    state = projection.projection_state_available_sql("mrf")
+    available = projection.projected_evidence_available_sql("address", schema_name="mrf")
+    evidence = projection.projected_evidence_level_sql(
+        "address", schema_name="mrf", legacy_level_sql="validated_evidence_level"
+    )
+    boolean = projection.projected_boolean_sql(
+        "address", "has_geo_assurance", schema_name="mrf", legacy_sql="validated_row_predicate"
+    )
+    assert available == "FALSE"
+    assert evidence == "(validated_evidence_level)"
+    assert boolean == "(validated_row_predicate)"
+    for forbidden in ("pg_relation_filenode", "pg_roles", "relowner", "nspowner", "active_table_oid"):
+        assert forbidden not in state
+    assert "active_relation_signature" in state and "active_dependency_bindings" in state

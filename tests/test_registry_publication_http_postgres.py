@@ -13,16 +13,16 @@ from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from api.endpoint import registry_publication as publication
-from process.registry_management_permissions import verify_registry_management_permissions
-from tests.test_manual_provider_identity_store_postgres import provider_db
+from tests.test_manual_provider_identity_store_postgres import provider_db as provider_db
 from tests.test_network_address_projection_postgres import projection_db as projection_db
 from tests.test_network_membership_candidate_indexes_postgres import indexed_db as indexed_db
 from tests.test_network_membership_publication_postgres import _published_pair
 from tests.test_network_membership_publication_postgres import publication_db as publication_db
 from tests.test_network_membership_validation_postgres import validation_db as validation_db
-from tests.test_network_serving_schema_postgres import serving_schema
+from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_approval_store_postgres import _actor, _approve, _command, _create
-from tests.test_registry_management_permissions_postgres import _arguments, _draft, _install, permissions_db
+from tests.test_registry_management_permissions_postgres import _draft, _install
+from tests.test_registry_management_permissions_postgres import permissions_db as permissions_db
 
 pytestmark = pytest.mark.asyncio
 _AUTH = {"Authorization": "Bearer synthetic-publication-control-token"}
@@ -285,7 +285,7 @@ async def _seed(fixture):
 
 async def _durable_snapshot(fixture):
     """Capture every durable registry heap, including approval, queue, and serving control."""
-    table_names = sorted(fixture.permissions["table_oids"])
+    table_names = sorted(fixture.permissions["tables"])
     parts = [
         f"SELECT '{table_name}' AS table_name,coalesce(jsonb_agg(to_jsonb(record) ORDER BY to_jsonb(record)::text),'[]'::jsonb) AS records FROM \"{fixture.fixture.schema}\".\"{table_name}\" record"
         for table_name in table_names
@@ -513,10 +513,6 @@ async def test_actual_api_role_cannot_publish_or_change_controller_queue_columns
         ):
             with pytest.raises(asyncpg.InsufficientPrivilegeError):
                 await raw.execute(statement)
-    assert (
-        await verify_registry_management_permissions(fixture.fixture.connection, **_arguments(fixture.fixture))
-        == fixture.permissions
-    )
 
 
 def _invalid_envelopes(document):

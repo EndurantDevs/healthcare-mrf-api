@@ -39,7 +39,7 @@ def _handoff():
     suffix = publication._attempt_suffix(attempt)
     names = publication._stage_names("mrf", suffix)
     handoff_by_field = {
-        "contract": publication.HANDOFF_CONTRACT,
+        "contract": publication.LEGACY_HANDOFF_CONTRACT,
         "run_id": "synthetic",
         "attempt_id": attempt,
         "attempt_started_at": "2026-01-01T00:00:00Z",
@@ -92,7 +92,7 @@ def _publication_receipt(handoff_by_field):
         },
     }
     return {
-        "contract": publication.PUBLICATION_CONTRACT,
+        "contract": publication.LEGACY_PUBLICATION_CONTRACT,
         "handoff": handoff_by_field,
         "validation": validation_by_field,
         "validation_sha256": publication._digest(validation_by_field),
@@ -148,12 +148,12 @@ def test_handoff_decoder_requires_exact_attempt_and_complete_seven_table_identit
         "attempt": lambda: handoff_by_field.update(import_date="a" * 26),
         "rows": lambda: handoff_by_field.update(row_count=True),
         "alias": lambda: handoff_by_field.update(alias_generation=-1),
-        "database": lambda: handoff_by_field.update(database_oid=0),
+        "database": lambda: handoff_by_field.update(schema_name="invalid;schema"),
         "missing_heap": lambda: handoff_by_field["stage_relations"].pop(),
-        "duplicate_heap": lambda: handoff_by_field["stage_relations"][0].update(relation_oid=101),
+        "duplicate_heap": lambda: handoff_by_field["stage_relations"][0].update(table_name="duplicate"),
         "stage_name": lambda: handoff_by_field["stage_relations"][0].update(stage_name="foreign_stage"),
-        "missing_index": lambda: handoff_by_field["indexes"].pop(),
-        "index_owner": lambda: handoff_by_field["indexes"][0].update(relation_oid=999),
+        "missing_index": lambda: handoff_by_field["indexes"].clear(),
+        "index_owner": lambda: handoff_by_field["indexes"][0].update(definition=""),
         "digest": lambda: handoff_by_field.update(handoff_sha256="a" * 64),
     }
     if change:
@@ -163,7 +163,7 @@ def test_handoff_decoder_requires_exact_attempt_and_complete_seven_table_identit
             {key: field_value for key, field_value in handoff_by_field.items() if key != "handoff_sha256"}
         )
     if change:
-        with pytest.raises(RuntimeError, match="address native publication"):
+        with pytest.raises((RuntimeError, ValueError)):
             publication.validate_entity_address_native_handoff(handoff_by_field)
     else:
         assert publication.validate_entity_address_native_handoff(handoff_by_field) == handoff_by_field
@@ -193,13 +193,13 @@ def test_publication_decoder_keeps_generation_accounting_and_physical_catalog_bo
         "counter": lambda: receipt["result_generation"].update(local_generation=2),
         "lineage": lambda: receipt["result_generation"].update(local_lineage_id="550e8400-e29b-41d4-a716-446655440001"),
         "origin": lambda: receipt["result_generation"]["serving_generation"].update(origin_generation=2),
-        "oid_order": lambda: receipt["result_generation"]["relation_oids"].reverse(),
+        "oid_order": lambda: receipt["inventory"]["relations"].pop(),
         "row_count": lambda: receipt["validation"].update(rows=2),
         "source": lambda: receipt.update(source_contract_sha256="c" * 64),
-        "inventory_file": lambda: receipt["inventory"]["relations"][0].update(relfilenode=999),
-        "inventory_owner": lambda: receipt["inventory"]["relations"][0].update(owner_oid=999),
-        "shape": lambda: receipt["validation"]["catalog"]["shapes"][0].__setitem__(1, 999),
-        "catalog_family": lambda: receipt["validation"]["catalog"]["columns"].pop(),
+        "inventory_file": lambda: receipt["inventory"]["relations"][0].update(schema_name="foreign"),
+        "inventory_owner": lambda: receipt["inventory"]["relations"][0].update(relation_name="foreign"),
+        "shape": lambda: receipt["validation"]["catalog"]["shapes"][0].__setitem__(0, "foreign"),
+        "catalog_family": lambda: receipt["validation"]["catalog"]["shapes"].pop(),
         "payload_fk": lambda: receipt["validation"]["catalog"]["constraints"][0].update(kind="f"),
         "alias": lambda: receipt["alias"].update(generation=4),
     }
@@ -210,6 +210,40 @@ def test_publication_decoder_keeps_generation_accounting_and_physical_catalog_bo
             publication.validate_entity_address_native_publication(receipt)
     else:
         assert publication.validate_entity_address_native_publication(receipt) == receipt
+
+
+@pytest.mark.parametrize("published", [False, True])
+def test_retained_wire_keeps_opaque_tokens_and_logical_generations(published):
+    handoff = _handoff()
+    invalid = deepcopy(handoff)
+    next(iter(invalid["dependency_bindings"].values()))["unknown"] = True
+    invalid["handoff_sha256"] = publication._digest(
+        {key: field_value for key, field_value in invalid.items() if key != "handoff_sha256"}
+    )
+    with pytest.raises(RuntimeError, match="dependencies differ"):
+        publication.validate_entity_address_native_handoff(invalid)
+    handoff["database_oid"], handoff["import_run_oid"] = None, False
+    handoff["incumbent"]["relation_oids"] = {"opaque": "original"}
+    for entry in handoff["stage_relations"]:
+        entry["relation_oid"], entry["relfilenode"] = False, None
+    for entry in handoff["indexes"]:
+        entry["relation_oid"], entry["index_oid"], entry["relfilenode"] = None, False, -1
+    handoff["handoff_sha256"] = publication._digest(
+        {key: field_value for key, field_value in handoff.items() if key != "handoff_sha256"}
+    )
+    retained = _publication_receipt(handoff) if published else handoff
+    if published:
+        for entry in retained["inventory"]["relations"]:
+            entry["schema_oid"], entry["schema_owner_oid"], entry["owner_oid"] = None, False, -1
+        retained["result_generation"]["relation_oids"] = None
+    original = publication._json(retained)
+    validate = (
+        publication.validate_entity_address_native_publication
+        if published
+        else publication.validate_entity_address_native_handoff
+    )
+    assert publication._json(validate(retained)) == original
+    assert publication._json(retained) == original
 
 
 def _clone_session(events, equality_probes, failure):
@@ -396,14 +430,25 @@ def _cleanup_run(handoff_by_field, abandonment, failure):
 def _cleanup_catalog_rows(query, run_by_field, stages, indexes, failure):
     if query.startswith('SELECT * FROM "mrf".import_run'):
         return _result([run_by_field])
-    if query.startswith("SELECT owner.oid AS owner_oid"):
-        return _result([{"owner_oid": 52, "owner_safe": True, "caller_safe": True}])
-    if query.startswith("SELECT (SELECT oid::bigint FROM pg_database"):
-        return _result([(999 if failure == "database" else 41, 42)])
-    if query.startswith("SELECT c.relname,c.oid"):
+    if query.startswith("SELECT c.relname FROM pg_class"):
         return _result(stages)
-    if query.startswith("SELECT i.indrelid::bigint"):
+    if query.startswith("SELECT c.relname,pg_get_indexdef"):
         return _result(indexes)
+    if query.startswith("SELECT singleton, local_lineage_id"):
+        return _result(
+            [
+                {
+                    "singleton": True,
+                    "local_lineage_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "local_generation": 0,
+                    "origin_lineage_id": None,
+                    "origin_generation": None,
+                    "published_at": None,
+                }
+            ]
+        )
+    if query.startswith("DROP TABLE") and failure == "owner":
+        raise PermissionError("native publication cleanup denied")
     assert query.startswith(("LOCK TABLE", "SET LOCAL", "SELECT set_config", "DROP TABLE")), query
     return _result()
 
@@ -411,40 +456,23 @@ def _cleanup_catalog_rows(query, run_by_field, stages, indexes, failure):
 def _cleanup_scalar(query, handoff_by_field, transactions, failure):
     if query == "SHOW search_path":
         return "synthetic"
-    if "pg_current_xact_id" in query:
-        return next(transactions)
-    if "relation_oids OPERATOR" in query:
-        return failure != "serving"
-    if "SELECT count(DISTINCT relation.relowner)" in query:
-        return failure != "owner"
     if "pg_index i JOIN pg_class idx" in query:
         return failure != "executable"
-    if "obj_description" in query:
-        return (
-            "changed"
-            if failure == "marker"
-            else publication._json(
-                {key: handoff_by_field[key] for key in ("contract", "run_id", "attempt_id", "handoff_sha256")}
-            )
-        )
     raise AssertionError(query)
 
 
 def _cleanup_session(handoff_by_field, run_by_field, failure, queries):
-    stages = [
-        {
-            "relname": relation_entry["stage_name"],
-            "oid": relation_entry["relation_oid"],
-            "relfilenode": relation_entry["relfilenode"],
-        }
-        for relation_entry in handoff_by_field["stage_relations"]
+    stages = [{"relname": entry["stage_name"]} for entry in handoff_by_field["stage_relations"]]
+    indexes = [
+        {"relname": entry["stage_name"], "definition": index["definition"]}
+        for entry, index in zip(handoff_by_field["stage_relations"], handoff_by_field["indexes"], strict=True)
     ]
-    indexes = deepcopy(handoff_by_field["indexes"])
     if failure == "heap":
-        stages[0]["relfilenode"] += 1
+        stages[0]["relname"] = "foreign"
     if failure == "index":
-        indexes[0]["index_oid"] += 1
-    transactions = iter(["transaction-1", "transaction-2" if failure == "transaction" else "transaction-1"])
+        indexes[0]["definition"] = "changed native index"
+    if failure == "database":
+        run_by_field["progress"]["attempt_id"] = "changed"
 
     async def execute(statement, *_args):
         query = str(statement)
@@ -454,10 +482,12 @@ def _cleanup_session(handoff_by_field, run_by_field, failure, queries):
     async def scalar(statement, *_args):
         query = str(statement)
         queries.append(query)
-        return _cleanup_scalar(query, handoff_by_field, transactions, failure)
+        return _cleanup_scalar(query, handoff_by_field, None, failure)
 
     return SimpleNamespace(
-        in_transaction=lambda: True, execute=AsyncMock(side_effect=execute), scalar=AsyncMock(side_effect=scalar)
+        in_transaction=lambda: failure != "transaction",
+        execute=AsyncMock(side_effect=execute),
+        scalar=AsyncMock(side_effect=scalar),
     )
 
 
@@ -483,10 +513,15 @@ def _cleanup_session(handoff_by_field, run_by_field, failure, queries):
 async def test_native_cleanup_rechecks_catalog_and_reference_guards_before_drop(failure):
     handoff_by_field, queries = _handoff(), []
     abandonment = _abandonment(handoff_by_field)
+    if failure == "marker":
+        abandonment["candidate_custody"]["source_contract_sha256"] = "c" * 64
+    if failure == "serving":
+        abandonment["candidate_custody"]["stage_relations"] = deepcopy(handoff_by_field["stage_relations"])
+        abandonment["candidate_custody"]["stage_relations"][0]["stage_name"] = "entity_address_unified"
     session = _cleanup_session(handoff_by_field, _cleanup_run(handoff_by_field, abandonment, failure), failure, queries)
     unreferenced = AsyncMock(side_effect=[True, failure != "late_reference"])
     if failure:
-        with pytest.raises(RuntimeError, match="address native publication"):
+        with pytest.raises((RuntimeError, PermissionError), match="native publication"):
             await publication.cleanup_entity_address_native_handoff(
                 session,
                 handoff_by_field,
@@ -503,11 +538,13 @@ async def test_native_cleanup_rechecks_catalog_and_reference_guards_before_drop(
             assert_unreferenced=unreferenced,
         )
         assert query_result["physical_cleanup_completed"] is True
-        assert query_result["stage_relations"] == handoff_by_field["stage_relations"]
+        assert query_result["stage_relations"] == [
+            {key: entry[key] for key in ("table_name", "stage_name")} for entry in handoff_by_field["stage_relations"]
+        ]
     drops = [query for query in queries if query.startswith("DROP")]
     assert drops == (
         []
-        if failure
+        if failure not in {None, "owner"}
         else [
             "DROP TABLE "
             + ",".join(
@@ -516,7 +553,10 @@ async def test_native_cleanup_rechecks_catalog_and_reference_guards_before_drop(
             + " RESTRICT"
         ]
     )
-    assert queries[-1] == "SELECT set_config('search_path',:path,true)"
+    if queries:
+        assert queries[-1] == "SELECT set_config('search_path',:path,true)"
+    else:
+        assert failure in {"marker", "serving", "transaction"}
     assert not any("CASCADE" in query or query == "COMMIT" for query in queries)
 
 
@@ -526,64 +566,34 @@ async def test_native_cleanup_rechecks_catalog_and_reference_guards_before_drop(
 @pytest.mark.parametrize("previous_select", [False, True])
 @pytest.mark.parametrize("previous_read_columns", [[], ['"evidence_id"']])
 async def test_native_sealing_read_authority(already_owned, unsafe, previous_select, previous_read_columns):
-    """Preserve only existing reads while refusing every ordinary mutation path."""
-    queries = []
+    """The shared native freeze closes actual writer grants and preserves declared read access."""
+    from process.provider_directory_generic_source_provision import _freeze_snapshot_relation
 
-    async def execute(statement, *_args):
-        query = str(statement)
-        queries.append(query)
-        if query.startswith("SELECT owner.oid AS owner_oid"):
-            return _result([{"owner_oid": 52, "owner_safe": True, "caller_safe": True}])
-        if query.startswith("SELECT quote_ident(n.nspname)"):
-            assert "has_table_privilege(c.relowner,c.oid,'SELECT') AND EXISTS(SELECT 1" in query
-            assert "acl.grantee=c.relowner AND acl.privilege_type='SELECT') AS previous_owner_can_select" in query
-            assert "AND acl.grantee=c.relowner AND acl.privilege_type='SELECT' ORDER BY a.attnum)" in query
-            catalog_by_field = {
-                "name": '"candidate"."entity_address_evidence"',
-                "owner": '"synthetic_owner"',
-                "relowner": 52 if already_owned else 54,
-                "previous_owner": '"prior_reader"',
-                "previous_owner_can_select": previous_select,
-                "previous_owner_read_columns": previous_read_columns,
-            }
-            return _result([catalog_by_field])
-        if query.startswith("SELECT DISTINCT quote_ident(principal.rolname)"):
-            return _result(['"synthetic_reader"'])
-        if query.startswith("SELECT quote_ident(attname)"):
-            return _result(['"evidence_id"', '"payload"'])
-        if query.startswith("SELECT s.oid"):
-            return _result([{"oid": 201, "name": '"candidate"."entity_address_evidence_evidence_id_seq"'}])
-        assert query.startswith(("ALTER TABLE", "ALTER SEQUENCE", "REVOKE", "GRANT SELECT")), query
-        return _result()
-
-    session = SimpleNamespace(
-        in_transaction=lambda: True, execute=AsyncMock(side_effect=execute), scalar=AsyncMock(return_value=unsafe)
-    )
+    prior_role = "snapshot_owner" if already_owned else "previous_writer"
+    grants = [{"role": prior_role, "column_name": None}]
     if unsafe:
-        with pytest.raises(RuntimeError, match="ordinary mutation"):
-            await preparation._seal_published_relation(session, 100, 52)
-    else:
-        await preparation._seal_published_relation(session, 100, 52)
-    assert not any(
-        "REVOKE SELECT" in query or "REVOKE ALL" in query or "WITH GRANT OPTION" in query for query in queries
+        grants.append({"role": "additional_writer", "column_name": None})
+    if previous_read_columns:
+        grants.append({"role": prior_role, "column_name": "evidence_id"})
+    readers = ('"snapshot_owner"', '"api_reader"') if previous_select else ('"snapshot_owner"',)
+    connection = SimpleNamespace(fetch=AsyncMock(return_value=grants), execute=AsyncMock())
+    await _freeze_snapshot_relation(
+        connection, "candidate", {"relname": "entity_address_evidence", "relkind": "r"}, '"snapshot_owner"', readers
     )
-    expected_grants = []
-    if not already_owned and previous_select:
-        expected_grants.append('GRANT SELECT ON "candidate"."entity_address_evidence" TO "prior_reader"')
-    if not already_owned and previous_read_columns:
-        expected_grants.append(
-            'GRANT SELECT ("evidence_id") ON "candidate"."entity_address_evidence" TO "prior_reader"'
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    assert statements[0] == 'ALTER TABLE "candidate"."entity_address_evidence" OWNER TO "snapshot_owner"'
+    for grant in grants:
+        column = ' ("evidence_id")' if grant["column_name"] else ""
+        assert (
+            f'REVOKE ALL PRIVILEGES{column} ON TABLE "candidate"."entity_address_evidence" FROM "{grant["role"]}" CASCADE'
+            in statements
         )
-    assert [query for query in queries if query.startswith("GRANT SELECT")] == expected_grants
-    if already_owned:
-        assert not any(query.startswith("ALTER TABLE") for query in queries)
-    else:
-        assert sum(query.startswith("REVOKE INSERT,UPDATE") for query in queries) == 2
-        assert not any(query.startswith("REVOKE INSERT (") for query in queries)
-    if not unsafe:
-        assert sum(query.startswith("REVOKE USAGE,UPDATE ON SEQUENCE") for query in queries) == 2
-        assert session.scalar.await_args.args[1] == {"relation_oids": [201], "owner_oid": 52}
-        assert "has_sequence_privilege" in str(session.scalar.await_args.args[0])
+    assert statements[-1] == 'GRANT SELECT ON TABLE "candidate"."entity_address_evidence" TO ' + ",".join(readers)
+    assert not any(
+        token in statement
+        for statement in statements
+        for token in ("pg_has_role", "relfilenode", "has_table_privilege")
+    )
 
 
 def _sealing_acl_principals(query, parameters):
@@ -608,62 +618,23 @@ def _sealing_acl_principals(query, parameters):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("already_owned", [False, True])
 async def test_sealing_ignores_unrelated_disappearing_roles(monkeypatch, already_owned):
-    """Close actual write grants without targeting unrelated or other-sequence principals."""
-    queries = []
-    revoked_principals = set()
+    """Operate only on current ACL grantees, with no scan or comparison of unrelated roles."""
+    from process.provider_directory_generic_source_provision import _freeze_snapshot_relation
 
-    async def execute_sealing(statement, parameters=None):
-        query = str(statement)
-        queries.append(query)
-        if query.startswith("SELECT quote_ident(n.nspname)"):
-            return _result(
-                [
-                    {
-                        "name": '"candidate"."fact"',
-                        "owner": '"owner"',
-                        "relowner": 52 if already_owned else 54,
-                        "previous_owner": '"prior"',
-                        "previous_owner_can_select": False,
-                        "previous_owner_read_columns": [],
-                    }
-                ]
-            )
-        if "quote_ident(principal.rolname)" in query:
-            return _sealing_acl_principals(query, parameters)
-        if query.startswith("SELECT quote_ident(attname)"):
-            return _result(['"id"'])
-        if query.startswith("SELECT s.oid"):
-            return _result([{"oid": oid, "name": f'"candidate"."sequence_{oid}"'} for oid in (201, 202)])
-        if 'FROM "unrelated_dropped"' in query:
-            raise RuntimeError("unrelated role disappeared")
-        if query.startswith("REVOKE"):
-            principal = query.rsplit(" FROM ", 1)[1]
-            if principal != "PUBLIC":
-                if principal in revoked_principals:
-                    raise RuntimeError("write grantee disappeared after its last grant was revoked")
-                revoked_principals.add(principal)
-        assert query.startswith(("ALTER TABLE", "ALTER SEQUENCE", "REVOKE")), query
-        return _result()
-
-    monkeypatch.setattr(preparation, "_publisher_authority", AsyncMock(return_value=52))
-    session = SimpleNamespace(execute=AsyncMock(side_effect=execute_sealing), scalar=AsyncMock(return_value=False))
-    await preparation._seal_published_relation(session, 100, 52)
-    expected_revocations = []
-    if not already_owned:
-        for principal in ("PUBLIC", '"table_writer"', '"column_writer"'):
-            expected_revocations.append(
-                f'REVOKE INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER ON "candidate"."fact" FROM {principal}'
-            )
-    for oid in (201, 202):
-        for principal in ("PUBLIC", f'"sequence_writer_{oid}"'):
-            expected_revocations.append(
-                f'REVOKE USAGE,UPDATE ON SEQUENCE "candidate"."sequence_{oid}" FROM {principal}'
-            )
-    assert [query for query in queries if query.startswith("REVOKE")] == expected_revocations
-    assert [call.args[1] for call in session.scalar.await_args_list] == [
-        {"relation_oids": [100], "owner_oid": 52},
-        {"relation_oids": [201, 202], "owner_oid": 52},
+    grants = [
+        {"role": "snapshot_owner" if already_owned else "writer", "column_name": None},
+        {"role": "column_writer", "column_name": "evidence_id"},
     ]
+    connection = SimpleNamespace(fetch=AsyncMock(return_value=grants), execute=AsyncMock())
+    await _freeze_snapshot_relation(
+        connection, "candidate", {"relname": "fact", "relkind": "r"}, '"snapshot_owner"', ('"api_reader"',)
+    )
+    query = connection.fetch.await_args.args[0]
+    assert "aclexplode" in query and "WHERE c.oid=to_regclass($1)" in query
+    assert "pg_roles" not in query and "pg_auth_members" not in query
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    assert not any("unrelated_dropped" in statement for statement in statements)
+    assert statements[-1] == 'GRANT SELECT ON TABLE "candidate"."fact" TO "api_reader"'
 
 
 def _loaded_inputs():
@@ -711,28 +682,27 @@ async def test_loaded_preparation_rejects_unbound_inputs_before_privileged_catal
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed", [False, True])
 async def test_loaded_publication_receipt_retains_exact_seven_serving_oids_and_alias_custody(changed):
+    """Fresh publication is a portable QName inventory; old tokens never select or locate it."""
+    from dataclasses import replace
+
     owner = _set_owner()
-    queries = []
-
-    async def scalar(statement, parameters):
-        queries.append(str(statement))
-        name = parameters["relation"].rsplit(".", 1)[1].strip('"')
-        return dict(owner.relation_oids)[name] + int(changed)
-
-    session = SimpleNamespace(scalar=AsyncMock(side_effect=scalar))
-    prepared = SimpleNamespace(context={"retained_relations": [{"synthetic": True}]})
     if changed:
-        with pytest.raises(RuntimeError, match="published OID"):
-            await preparation._publication_receipt(session, "mrf", owner, prepared, {"published": True})
-        assert len(queries) == 1
-    else:
-        receipt = await preparation._publication_receipt(session, "mrf", owner, prepared, {"published": True})
-        assert receipt["published"] is True and len(receipt["publication"]["relations"]) == 7
-        assert (
-            receipt["publication"]["alias_authority"]["relation_oid"]
-            == dict(owner.relation_oids)[preparation.alias.AUTHORITY_TABLE]
-        )
-        assert receipt["publication"]["retained_relations"] == prepared.context["retained_relations"]
+        owner = replace(owner, schema_oid=None, relation_oids=tuple((name, True) for name in owner.relation_names))
+    session = SimpleNamespace(scalar=AsyncMock())
+    retained_relations = [{"schema_name": "mrf", "relation_name": "entity_address_retained"}]
+    prepared = SimpleNamespace(context={"retained_relations": retained_relations})
+    result = await preparation._publication_receipt(session, "mrf", owner, prepared, {"published": True})
+    published = result["publication"]
+    assert result["published"] is True and published["contract"] == "entity-address-table-publication.v3"
+    assert published["relations"] == [
+        {"schema_name": "mrf", "relation_name": model.__tablename__} for model in restore._models()
+    ]
+    assert published["alias_authority"] == {
+        "schema_name": owner.schema_name,
+        "relation_name": preparation.alias.AUTHORITY_TABLE,
+    }
+    assert published["retained_relations"] == retained_relations
+    session.scalar.assert_not_awaited()
 
 
 def _attempt_context(handoff_by_field):
@@ -779,39 +749,32 @@ def test_controlled_attempt_uses_uuid_stages_and_preserves_only_same_attempt_rep
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("supplied,changed", [(False, False), (True, False), (True, True)])
-async def test_dependency_binding_locks_then_rechecks_exact_physical_inputs(supplied, changed):
+async def test_dependency_binding_locks_then_rechecks_selected_relations(supplied, changed):
     bindings_by_name = _example_bindings() if supplied else None
-    queries = []
-
-    async def execute(statement, *args):
-        query = str(statement)
-        queries.append(query)
-        if query.startswith("LOCK TABLE"):
-            return _result()
-        assert "FROM pg_class WHERE oid=to_regclass(:name)" in query
-        assert args[0]["name"].startswith(('"mrf".', '"tiger".'))
-        return _result([{"relation_oid": len(queries), "relfilenode": 100 + len(queries)}])
-
-    session = SimpleNamespace(execute=AsyncMock(side_effect=execute), scalar=AsyncMock(return_value=not changed))
     if changed:
-        with pytest.raises(RuntimeError, match="dependencies changed"):
+        bindings_by_name["tiger.zip_state"]["table_name"] = "unsafe;relation"
+    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock())
+    if changed:
+        with pytest.raises(ValueError):
             await publication._dependency_bindings(session, "mrf", bindings_by_name)
+        session.execute.assert_not_awaited()
     else:
         observed_by_name = await publication._dependency_bindings(session, "mrf", bindings_by_name)
-        assert set(observed_by_name) == set(_example_bindings())
-        if supplied:
-            assert observed_by_name == bindings_by_name
-        else:
-            for index, (namespace, table) in enumerate(publication.projection._PROJECTION_DEPENDENCIES, 1):
-                namespace = namespace or "mrf"
-                assert observed_by_name[f"{namespace}.{table}"] == {
-                    "schema_name": namespace,
-                    "table_name": table,
-                    "relation_oid": index,
-                    "relfilenode": 100 + index,
-                }
-    assert queries[-1].startswith("LOCK TABLE ONLY") and queries[-1].endswith(" IN ACCESS SHARE MODE;")
-    assert "pg_relation_filenode" in str(session.scalar.await_args.args[0])
+        expected_by_name = {
+            key: {field: value[field] for field in ("schema_name", "table_name")}
+            for key, value in _example_bindings().items()
+        }
+        if not supplied:
+            expected_by_name = {
+                f"{schema or 'mrf'}.{table}": {"schema_name": schema or "mrf", "table_name": table}
+                for schema, table in publication.projection._PROJECTION_DEPENDENCIES
+            }
+        assert observed_by_name == expected_by_name
+        query = str(session.execute.await_args.args[0])
+        assert query.startswith("LOCK TABLE ONLY") and query.endswith(" IN ACCESS SHARE MODE;")
+        for binding in observed_by_name.values():
+            assert f'"{binding["schema_name"]}"."{binding["table_name"]}"' in query
+    session.scalar.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -837,7 +800,7 @@ async def test_control_transition_uses_exact_attempt_cas_and_never_commits(compl
     assert "finished_at IS NULL" in str(query) and str(query).endswith(" RETURNING run_id")
     assert json.loads(parameters["handoff"]) == handoff_by_field
     comments = [str(call.args[0]) for call in session.execute.await_args_list]
-    assert len(comments) == (0 if completed else 7)
+    assert comments == []
     assert all(
         query.startswith('COMMENT ON TABLE "mrf".') and handoff_by_field["handoff_sha256"] in query
         for query in comments
@@ -869,6 +832,7 @@ async def test_native_attempt_requires_finalizing_source_and_database_identity(f
         "phase": lambda: run_by_field.update(phase_detail="foreign"),
         "handoff": lambda: run_by_field["metrics"].clear(),
         "params": lambda: run_by_field["params"].update(unreviewed=True),
+        "database": lambda: run_by_field["metrics"].update(address_handoff={"changed": True}),
     }
     if failure in mutations_by_name:
         mutations_by_name[failure]()
@@ -886,7 +850,7 @@ async def test_native_attempt_requires_finalizing_source_and_database_identity(f
     else:
         await publication._require_native_attempt(session, handoff_by_field)
     assert "FOR UPDATE" in str(session.execute.await_args_list[0].args[0])
-    assert session.execute.await_count == (2 if failure in {None, "database"} else 1)
+    assert session.execute.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -912,6 +876,7 @@ async def test_durable_outcome_requires_exact_receipt_and_successful_source_atte
         "phase": lambda: run_by_field.update(phase_detail="foreign"),
         "handoff": lambda: run_by_field["metrics"].update(address_handoff=None),
         "params": lambda: run_by_field["params"].update(unreviewed=True),
+        "database": lambda: run_by_field["metrics"].update(address_handoff={"changed": True}),
     }
     if failure in mutations_by_name:
         mutations_by_name[failure]()
@@ -939,22 +904,16 @@ def _guard_result(rows):
 
 def _retirement_proof():
     owner = _set_owner()
-    relations = [
-        {"table_name": model.__tablename__, "relation_oid": dict(owner.relation_oids)[model.__tablename__]}
-        for model in ownership._models()
-    ]
-    publication_by_field = {
-        "contract": "entity-address-table-publication.v2",
+    return owner, {
+        "contract": "entity-address-table-publication.v3",
         "schema_name": "mrf",
-        "relations": relations,
+        "relations": [
+            {"schema_name": "mrf", "relation_name": model.__tablename__ + "_retained_example"}
+            for model in ownership._models()
+        ],
         "retained_relations": [],
-        "alias_authority": {
-            "schema_name": owner.schema_name,
-            "schema_oid": owner.schema_oid,
-            "relation_oid": dict(owner.relation_oids)[preparation.alias.AUTHORITY_TABLE],
-        },
+        "alias_authority": {"schema_name": owner.schema_name, "relation_name": preparation.alias.AUTHORITY_TABLE},
     }
-    return owner, publication_by_field
 
 
 @pytest.mark.parametrize("fault", [None, "fields", "contract", "inventory", "alias", "absent_alias"])
@@ -963,8 +922,8 @@ def test_retirement_owner_rejects_substituted_publication(fault):
     mutations_by_name = {
         "fields": lambda: proof.update(foreign=True),
         "contract": lambda: proof.update(contract="unsupported"),
-        "inventory": lambda: proof["relations"][0].update(relation_oid=999),
-        "alias": lambda: proof["alias_authority"].update(schema_oid=999),
+        "inventory": lambda: proof["relations"][0].update(relation_name="foreign"),
+        "alias": lambda: proof["alias_authority"].update(schema_name="foreign"),
     }
     if fault in mutations_by_name:
         mutations_by_name[fault]()
@@ -981,45 +940,26 @@ def test_retirement_owner_rejects_substituted_publication(fault):
 
 
 def _retired_catalog(owner, proof):
-    rows = []
-    for entry in proof["relations"]:
-        oid = entry["relation_oid"]
-        rows.append(
-            {
-                "oid": oid,
-                "nspname": "mrf",
-                "relname": ownership.entity_address_unified._archived_identifier(
-                    f"{entry['table_name']}_retained_{oid:x}", suffix=""
-                ),
-            }
-        )
-    rows.append({"oid": 8, "nspname": owner.schema_name, "relname": preparation.alias.AUTHORITY_TABLE})
     return [
         {
-            **row,
-            "relowner": 52,
+            "nspname": entry["schema_name"],
+            "relname": entry["relation_name"],
             "relkind": "r",
             "relpersistence": "p",
-            "relrowsecurity": False,
-            "relforcerowsecurity": False,
             "inherited": False,
         }
-        for row in rows
+        for entry in [*proof["relations"], proof["alias_authority"]]
     ]
 
 
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("relowner", 99),
         ("relkind", "v"),
         ("relpersistence", "u"),
-        ("relrowsecurity", True),
-        ("relforcerowsecurity", True),
         ("inherited", True),
         ("nspname", "foreign"),
         ("relname", "entity_address_unified"),
-        ("oid", 99),
         (None, None),
     ],
 )
@@ -1030,32 +970,33 @@ def test_retired_catalog_rejects_serving_or_foreign_heap(field, value):
         rows.pop()
     else:
         rows[0][field] = value
-    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="catalog differs|serving or substituted"):
-        ownership._require_retained_catalog(rows, 52, owner, "mrf", proof["relations"])
+    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="named catalog differs"):
+        ownership._require_retained_catalog(rows, owner, [*proof["relations"], proof["alias_authority"]])
 
 
 def test_retired_catalog_accepts_only_exact_retained_names():
     owner, proof = _retirement_proof()
     rows = _retired_catalog(owner, proof)
-    ownership._require_retained_catalog(rows, 52, owner, "mrf", proof["relations"])
+    names = [*proof["relations"], proof["alias_authority"]]
+    ownership._require_retained_catalog(rows, owner, names)
     rows[-1]["nspname"] = "mrf"
-    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="serving or substituted"):
-        ownership._require_retained_catalog(rows, 52, owner, "mrf", proof["relations"])
+    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="named catalog differs"):
+        ownership._require_retained_catalog(rows, owner, names)
 
 
 def _retirement_session(owner, rows, queries, fault):
-    catalog_observations = []
+    observations = []
 
     async def execute(statement, _parameters=None):
         query = str(statement)
         queries.append(query)
-        if query.startswith("SELECT owner.oid AS owner_oid"):
-            return _guard_result([{"owner_oid": 52, "owner_safe": True, "caller_safe": True}])
-        if query.startswith("SELECT c.oid,n.nspname"):
-            catalog_observations.append(query)
-            return _guard_result(rows if len(catalog_observations) == 1 or fault != "catalog" else [])
+        if query.startswith("SELECT n.nspname,c.relname"):
+            observations.append(query)
+            return _guard_result(rows if len(observations) == 1 or fault != "catalog" else [])
+        if query.startswith("SELECT c.relname,c.oid"):
+            return _guard_result([{"relname": preparation.alias.AUTHORITY_TABLE, "oid": 8}])
         if query.startswith("SELECT relation.oid"):
-            return _guard_result([{"oid": 8, "relkind": "r", "index_table_oid": None}])
+            return _guard_result([{"oid": 8, "relkind": "v" if fault == "namespace" else "r", "index_table_oid": None}])
         if query.startswith("DROP TABLE") and fault == "table_drop":
             raise RuntimeError("synthetic table drop failed")
         if query.startswith("DROP SCHEMA") and fault == "schema_drop":
@@ -1064,9 +1005,7 @@ def _retirement_session(owner, rows, queries, fault):
         return _guard_result([])
 
     return SimpleNamespace(
-        in_transaction=lambda: True,
-        execute=AsyncMock(side_effect=execute),
-        scalar=AsyncMock(return_value=999 if fault == "namespace" else owner.schema_oid),
+        in_transaction=lambda: True, execute=AsyncMock(side_effect=execute), scalar=AsyncMock(return_value=99)
     )
 
 
@@ -1082,7 +1021,7 @@ async def test_retirement_failure_preserves_exact_cleanup_fences(fault, monkeypa
     queries = []
     session = _retirement_session(owner, _retired_catalog(owner, proof), queries, fault)
     unreferenced = AsyncMock(side_effect=[fault != "early_pin", fault != "late_pin"])
-    with pytest.raises(RuntimeError, match="referenced|catalog changed|namespace changed|drop failed"):
+    with pytest.raises(RuntimeError, match="referenced|named catalog differs|unexpected relation|drop failed"):
         await ownership.cleanup_entity_address_archive_publication(
             session, owner=owner, publication=proof, assert_unreferenced=unreferenced
         )
@@ -1092,7 +1031,7 @@ async def test_retirement_failure_preserves_exact_cleanup_fences(fault, monkeypa
     assert not any("CASCADE" in query or query == "COMMIT" for query in queries)
     locks = [query for query in queries if query.startswith("LOCK TABLE")]
     assert len(locks) == int(fault != "early_pin")
-    assert all(query.endswith(" ACCESS EXCLUSIVE MODE NOWAIT") for query in locks)
+    assert all(query.endswith(" ACCESS SHARE MODE NOWAIT") for query in locks)
     assert unreferenced.await_count == (2 if fault in {"late_pin", "table_drop", "schema_drop"} else 1)
 
 
@@ -1105,29 +1044,31 @@ async def test_retirement_requires_a_reference_probe():
         await ownership.cleanup_entity_address_archive_publication(
             session, owner=owner, publication=proof, assert_unreferenced=None
         )
-    assert len(queries) == 1 and queries[0].startswith("SELECT owner.oid AS owner_oid")
+    assert queries == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["inventory", "oid", "legacy"])
-async def test_protected_cutover_refuses_inventory_and_oid_drift(monkeypatch, fault):
+@pytest.mark.parametrize("fault", ["inventory", "relation", "legacy"])
+async def test_protected_cutover_refuses_incomplete_or_crossed_named_inventory(monkeypatch, fault):
     stage = SimpleNamespace(__tablename__="entity_address_unified_synthetic")
     swap = SimpleNamespace(stage_cls=stage, live_cls=SimpleNamespace(__main_table__="entity_address_unified"))
     context_by_field = {
         "snapshot_contract": source.CONTRACT,
-        "protected_stage_oids": {stage.__tablename__: 41},
+        "stage_relations": [{"schema_name": "mrf", "relation_name": stage.__tablename__}],
     }
     if fault == "inventory":
-        context_by_field["protected_stage_oids"] = {}
-    if fault == "legacy":
+        context_by_field["stage_relations"] = []
+    elif fault == "relation":
+        context_by_field["stage_relations"][0]["schema_name"] = "foreign"
+    else:
         context_by_field.clear()
-    scalar = AsyncMock(return_value=True if fault == "legacy" else 99)
+    scalar = AsyncMock(side_effect=[False, "named", True] if fault == "legacy" else [])
     monkeypatch.setattr(adoption.entity_address_unified.db, "scalar", scalar)
     before = deepcopy(context_by_field)
-    with pytest.raises(RuntimeError, match="inventory differs|OID differs|legacy address rotation"):
+    with pytest.raises(RuntimeError, match="inventory differs|legacy address rotation"):
         await adoption._require_protected_cutover("mrf", [swap], context_by_field)
     assert context_by_field == before
-    assert scalar.await_count == int(fault != "inventory")
+    assert scalar.await_count == (3 if fault == "legacy" else 0)
 
 
 @asynccontextmanager
@@ -1141,52 +1082,56 @@ async def _observed_transaction(session, events):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("partial", [False, True])
-async def test_protected_reimport_requires_full_publisher_custody(monkeypatch, partial):
+async def test_ordinary_reimport_refuses_partial_and_propagates_native_origin_read_denial(monkeypatch, partial):
     events, context = [], {"retained": "unchanged"}
-    session = SimpleNamespace(
-        in_transaction=lambda: True,
-        execute=AsyncMock(return_value=_guard_result([{"owner_oid": 52, "owner_safe": True, "caller_safe": False}])),
-    )
+    session = SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock())
     database = adoption.entity_address_unified.db
-    monkeypatch.setattr(database, "scalar", AsyncMock(return_value=52))
+    monkeypatch.setattr(database, "_transaction_binding", lambda: SimpleNamespace(session=session))
     monkeypatch.setattr(database, "transaction", lambda: _observed_transaction(session, events))
+    prepare = AsyncMock(side_effect=PermissionError("native publication denied"))
+    monkeypatch.setattr(adoption, "prepare_entity_address_publisher_reimport", prepare)
+    capture = AsyncMock(return_value={"origin_generation": 3})
+    if not partial:
+        capture.side_effect = PermissionError("native publication denied")
+    monkeypatch.setattr(adoption, "_retained_serving_generation", capture)
     stage = SimpleNamespace(__tablename__="entity_address_unified_synthetic")
-    reason = "full isolated replacement" if partial else "publisher is unavailable"
-    with pytest.raises(RuntimeError, match=reason):
-        await adoption._prepare_protected_ordinary_rotation("mrf", stage, partial, context)
+    swap = SimpleNamespace(stage_cls=stage, live_cls=SimpleNamespace(__main_table__="entity_address_unified"))
+    with pytest.raises(
+        (RuntimeError, PermissionError), match="full isolated replacement" if partial else "native publication denied"
+    ):
+        await adoption._prepare_protected_ordinary_rotation("mrf", [swap], partial, context)
     assert context == {"retained": "unchanged"}
-    assert events == ([] if partial else ["entered", "exited"])
-    assert session.execute.await_count == int(not partial)
+    assert events == []
+    capture.assert_awaited_once_with(session, "mrf")
+    prepare.assert_not_awaited()
 
 
 def _sealed_guard_session(queries):
     async def execute(statement, parameters=None):
-        query = str(statement)
-        queries.append(query)
-        if query.startswith("SELECT owner.oid AS owner_oid"):
-            return _guard_result([{"owner_oid": 52, "owner_safe": True, "caller_safe": True}])
-        if query.startswith("SELECT quote_ident(n.nspname)"):
-            return _guard_result(
-                [{"name": f'"mrf"."heap_{parameters["oid"]}"', "owner": '"synthetic_owner"', "relowner": 52}]
-            )
-        assert query.startswith(("SELECT s.oid", "SELECT quote_ident(principal.rolname)")), query
+        queries.append(str(statement))
         return _guard_result([])
 
-    return SimpleNamespace(
-        in_transaction=lambda: True, execute=AsyncMock(side_effect=execute), scalar=AsyncMock(return_value=False)
-    )
+    return SimpleNamespace(in_transaction=lambda: True, execute=AsyncMock(side_effect=execute), scalar=AsyncMock())
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["transaction", "stage", "collision", "rename"])
 async def test_sealed_rotation_failure_never_overwrites_predecessor(monkeypatch, fault):
+    from process import entity_address_publication_permissions as permissions
+    from process import native_publication_read_access as access
+    from process import reference_family_archive as archive
+
     queries = []
     session = _sealed_guard_session(queries)
     database = adoption.entity_address_unified.db
     binding = None if fault == "transaction" else SimpleNamespace(session=session)
     monkeypatch.setattr(database, "_transaction_binding", lambda: binding)
-    values = [None if fault == "rename" else 41, None if fault == "stage" else 42, 99]
-    scalar = AsyncMock(side_effect=values)
+    monkeypatch.setattr(archive, "_native_model_copy_driver", AsyncMock(return_value=object()))
+    monkeypatch.setattr(access, "preserve_publication_reads", AsyncMock())
+    readonly = AsyncMock()
+    monkeypatch.setattr(permissions, "make_relation_read_only", readonly)
+    scalar_results = [None if fault == "rename" else 41, None if fault == "stage" else 42, 99]
+    scalar = AsyncMock(side_effect=scalar_results)
     status = AsyncMock(side_effect=RuntimeError("synthetic rename failed"))
     monkeypatch.setattr(database, "scalar", scalar)
     monkeypatch.setattr(database, "status", status)
@@ -1199,10 +1144,11 @@ async def test_sealed_rotation_failure_never_overwrites_predecessor(monkeypatch,
         "rename": "rename failed",
     }
     with pytest.raises(RuntimeError, match=reasons_by_fault[fault]):
-        await adoption._swap_sealed_stage_table("mrf", live, stage, 52)
+        await adoption._swap_sealed_stage_table("mrf", live, stage, 52, serving_generation=None)
     assert status.await_count == int(fault == "rename")
     assert scalar.await_count == {"transaction": 0, "stage": 2, "collision": 3, "rename": 2}[fault]
     assert not any(query.startswith("ALTER") for query in queries)
+    assert readonly.await_count == {"transaction": 0, "stage": 0, "collision": 2, "rename": 1}[fault]
     if fault == "rename":
         assert (
             status.await_args.args[0]
@@ -1272,15 +1218,11 @@ async def test_restore_completion_requires_the_v2_inventory():
 
 
 @pytest.mark.asyncio
-async def test_restore_namespace_rejects_alias_oid_substitution():
-    owner = _set_owner()
-    session = SimpleNamespace(scalar=AsyncMock(side_effect=[owner.schema_oid, 1, 999]), execute=AsyncMock())
-    with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="alias authority OID differs"):
-        await restore._drop_empty_owned_schema(session, owner)
+async def test_restore_namespace_rejects_unexpected_remaining_objects():
+    session = SimpleNamespace(scalar=AsyncMock(side_effect=[True, 1]), execute=AsyncMock())
+    with pytest.raises(restore.EntityAddressSnapshotRestoreError, match="namespace is not empty"):
+        await restore._drop_empty_owned_schema(session, _set_owner())
     session.execute.assert_not_awaited()
-    assert session.scalar.await_args.args[1] == {
-        "relation": f'"{owner.schema_name}"."{preparation.alias.AUTHORITY_TABLE}"'
-    }
 
 
 def test_restore_input_cannot_mix_seven_and_eight_tables():
@@ -1481,3 +1423,22 @@ async def test_copy_deadline_refuses_driver_before_payload():
 def test_source_inventory_rejects_unsupported_contract(contract):
     with pytest.raises(ValueError, match="contract is unsupported"):
         source.entity_address_archive_relations(contract)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "claim_source,expected", [(None, False), ("incomplete", True), ("retention", True), ("named", False)]
+)
+async def test_protected_address_snapshot_follows_each_retention_claim_source(claim_source, expected):
+    from process.nucc_retention_read_view import NAMED_CLAIMS_SQL, VIEW
+
+    answers = [claim_source is None] + ([] if claim_source is None else [claim_source])
+    answers += [expected] if claim_source in ("retention", "named") else []
+    database = SimpleNamespace(scalar=AsyncMock(side_effect=answers))
+    assert await adoption._is_registered_snapshot(database, "mrf", ("entity_address_unified",)) is expected
+    assert database.scalar.await_count == len(answers)
+    if claim_source in ("retention", "named"):
+        query = database.scalar.await_args.args[0]
+        assert (VIEW in query) is (claim_source == "retention") and (NAMED_CLAIMS_SQL in query) is (
+            claim_source == "named"
+        )

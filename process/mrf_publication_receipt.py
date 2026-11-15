@@ -18,7 +18,9 @@ from db.connection import db
 from process.mrf_address_publication import capture_address_content, require_address_coverage
 from process.reference_family_result_generation import (
     current_reference_family_relation_oids,
+    declared_reference_family_relations,
     read_reference_family_result_generation_authority,
+    validate_reference_family_serving_generation,
 )
 
 TABLE = "mrf_publication_receipt"
@@ -30,6 +32,41 @@ def qualified(schema: str, name: str) -> str:
     if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", value) for value in (schema, name)):
         raise ValueError("invalid MRF receipt identifier")
     return f'"{schema}"."{name}"'
+
+
+def _is_reference_generation_current(document, expected, schema):
+    """Compare known logical editions without interpreting old relation ID tokens."""
+    logical_fields = {"importer_id", "local_lineage_id", "local_generation", "serving_generation"}
+    relations = [
+        {"schema_name": namespace, "relation_name": name}
+        for namespace, name in declared_reference_family_relations("mrf", schema)
+    ]
+    if (
+        type(document) is not dict
+        or type(expected) is not dict
+        or set(expected) != logical_fields | {"relations"}
+        or expected["importer_id"] != "mrf"
+        or expected["relations"] != relations
+        or type(document.get("local_generation")) is not int
+    ):
+        return False
+    if set(document) == logical_fields | {"relations"}:
+        normalized_by_field = dict(document)
+    elif set(document) == logical_fields | {"relation_oids"}:
+        tokens = document["relation_oids"]
+        if type(tokens) is not list or len(tokens) != len(relations):
+            return False
+        normalized_by_field = {key: document[key] for key in logical_fields}
+        normalized_by_field["relations"] = relations
+    else:
+        return False
+    try:
+        normalized_by_field["serving_generation"] = validate_reference_family_serving_generation(
+            document["serving_generation"]
+        ).as_dict()
+    except TypeError, ValueError:
+        return False
+    return normalized_by_field == expected
 
 
 async def begin_publication(schema: str, import_id: str) -> str:
@@ -99,8 +136,8 @@ async def complete_publication(
         schema_name=schema,
         lock=True,
     )
-    oids = await current_reference_family_relation_oids(session, importer_id="mrf", schema_name=schema)
-    if current != generation or current.relation_oids != oids:
+    await current_reference_family_relation_oids(session, importer_id="mrf", schema_name=schema)
+    if current != generation or current.relations != declared_reference_family_relations("mrf", schema):
         raise RuntimeError("MRF publication generation changed")
     address_content = await capture_address_content(session, schema, qualified)
     summary_name = "plan_search_summary_refresh" if refresh_summary else "plan_search_summary"
@@ -157,8 +194,8 @@ async def require_completed_publication(session, schema: str, *, native_set=Fals
         importer_id="mrf",
         schema_name=schema,
     )
-    oids = await current_reference_family_relation_oids(session, importer_id="mrf", schema_name=schema)
-    if publication_receipt["generation"] != current.as_dict() or current.relation_oids != oids:
+    await current_reference_family_relation_oids(session, importer_id="mrf", schema_name=schema)
+    if not _is_reference_generation_current(publication_receipt["generation"], current.as_dict(), schema):
         raise RuntimeError("MRF publication completion generation differs")
     inputs = await capture_summary_inputs(session, schema)
     # Use the finalizer's input-before-summary lock order; never lock its generation row.

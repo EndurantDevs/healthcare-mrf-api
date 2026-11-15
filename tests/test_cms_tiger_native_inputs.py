@@ -78,9 +78,9 @@ def _catalog(proof):
 def _physical():
     return {
         f'"tiger"."{name}"': dict(
-            relation_oid=oid, relfilenode=oid + 500, relkind="r", relpersistence="p", inherited=True
+            schema_name="tiger", table_name=name, present=True, relkind="r", relpersistence="p", inherited=True
         )
-        for name, oid in _proof()["parent_oids"]
+        for name in tiger.ROOTS
     }
 
 
@@ -108,8 +108,8 @@ class SourceSession:
             return SimpleNamespace(scalar_one=lambda: 701)
         if "WHERE importer_id=ANY" in sql:
             return SimpleNamespace(mappings=lambda: [])
-        if sql.startswith("LOCK"):
-            assert not any(f'"tiger"."{name}"' in sql for name in tiger.ROOTS)
+        if sql.startswith("LOCK") and any(f'"tiger"."{name}"' in sql for name in tiger.ROOTS):
+            assert sql.endswith("IN ACCESS SHARE MODE NOWAIT")
         return SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: []))
 
 
@@ -133,7 +133,6 @@ class IssuedFactory:
     "field,bad",
     [
         ("version", True),
-        ("database_oid", True),
         ("node_id", ""),
         ("node_id", "x" * 129),
         ("package_id", "file/path"),
@@ -145,7 +144,6 @@ class IssuedFactory:
         ("receipt_sha256", "x" * 64),
         ("parent_inventory_sha256", "c" * 63),
         ("parent_oids", [["zcta5", 101]]),
-        ("parent_oids", [["zcta5", 101], ["zip_state", 101]]),
         ("parent_oids", [["zip_state", 102], ["zcta5", 101]]),
         ("parent_oids", [["zcta5", 101], ["zip_state", 102], ["other", 103]]),
     ],
@@ -162,11 +160,6 @@ def test_typed_tiger_linkage_rejects_changed_identity(field, bad):
     [
         ("schema_name", "other"),
         ("relation_name", "other"),
-        ("relation_oid", True),
-        ("schema_oid", 0),
-        ("schema_owner_oid", 999),
-        ("owner_oid", 999),
-        ("relfilenode", 0),
     ],
 )
 def test_typed_tiger_inventory_preserves_exact_two_child_contract(field, bad):
@@ -179,13 +172,9 @@ def test_typed_tiger_inventory_preserves_exact_two_child_contract(field, bad):
 @pytest.mark.parametrize(
     "field,bad",
     [
-        ("parent_oid", 999),
-        ("database_oid", 82),
         ("parent_name", "other"),
         ("parent_kind", "p"),
         ("parent_persistence", "u"),
-        ("parent_filenode", 0),
-        ("parent_owner", 999),
         ("child_count", 2),
         ("child_parent_count", 2),
         ("parent_partition", True),
@@ -198,9 +187,6 @@ def test_typed_tiger_inventory_preserves_exact_two_child_contract(field, bad):
         ("child_rls", True),
         ("child_force_rls", True),
         ("child_has_children", True),
-        ("parent_read_lock", False),
-        ("child_read_lock", False),
-        ("relfilenode", 999),
         ("schema_name", "other"),
     ],
 )
@@ -222,7 +208,8 @@ async def test_source_callback_keeps_actual_factory_task_and_session():
         callback.assert_awaited_once_with(session)
         with pytest.raises(AssertionError):
             await asyncio.create_task(tiger.capture_protected_tiger_input(session, _physical()))
-    assert session.calls == [(tiger.CATALOG_SQL, None)]
+    assert session.calls[-1] == (tiger.CATALOG_SQL, None)
+    assert session.calls[0][0].startswith("LOCK TABLE ONLY ")
 
 
 @pytest.mark.asyncio
@@ -233,9 +220,9 @@ async def test_source_callback_keeps_actual_factory_task_and_session():
         "missing_callback",
         "transaction",
         "producer",
-        "database",
+        "schema",
         "partial",
-        "filenode",
+        "graph",
         "closed_after_query",
     ],
 )
@@ -260,10 +247,10 @@ async def test_source_callback_rejects_missing_or_changed_binding(fault):
             return _proof()
 
         factory.native_tiger_input_fence = changed_producer
-    if fault == "database":
-        session.rows[0]["database_oid"] = 82
-    if fault == "filenode":
-        physical_by_name['"tiger"."zcta5"']["relfilenode"] += 1
+    if fault == "schema":
+        session.rows[0]["schema_name"] = "other"
+    if fault == "graph":
+        session.rows[0]["child_count"] = 2
     if fault == "partial":
         physical_by_name.pop('"tiger"."zip_state"')
     async with policy.bind_generic_source_transaction_factory(factory):
@@ -280,12 +267,12 @@ async def test_common_capture_preserves_geo_and_mutable_input_authorities(monkey
     archive_owner = AsyncMock()
     monkeypatch.setattr("process.provider_directory_cms_archive.require_source_archive_owner", archive_owner)
     physical_by_name = {
-        f'"{schema}"."{name}"': dict(relation_oid=None, relkind=None, inherited=False)
+        f'"{schema}"."{name}"': dict(schema_name=None, table_name=None, present=False, relkind=None, inherited=False)
         for schema, name in inputs._relations("mrf")
     }
     physical_by_name.update(_physical())
     physical_by_name['"mrf"."mrf_address"'] = dict(
-        relation_oid=901, relfilenode=902, relkind="r", relpersistence="p", inherited=False
+        schema_name="mrf", table_name="mrf_address", present=True, relkind="r", relpersistence="p", inherited=False
     )
     monkeypatch.setattr(inputs, "_physical_relations", AsyncMock(return_value=physical_by_name))
     monkeypatch.setattr(inputs, "_npi_revision", AsyncMock(return_value={"literal": "npi"}))
@@ -302,7 +289,6 @@ async def test_common_capture_preserves_geo_and_mutable_input_authorities(monkey
     assert fence == dict(
         version=3,
         schema="mrf",
-        database=dict(database_oid=81),
         relations=physical_by_name,
         npi={"literal": "npi"},
         reference_authorities={family: {} for family in ("cms-doctors", "geo", "mrf")},
@@ -314,7 +300,7 @@ async def test_common_capture_preserves_geo_and_mutable_input_authorities(monkey
     authorities.assert_awaited_once_with(session, "mrf", protected_tiger=_proof())
     revisions.assert_awaited_once_with(session, "mrf", physical_by_name, protected_tiger=_proof())
     mode = "SHARE" if cutover else "ACCESS SHARE"
-    locks = [sql for sql, _ in session.calls if sql.startswith("LOCK")]
+    locks = [sql for sql, _ in session.calls if sql.startswith("LOCK") and "reference_family_archive_" not in sql]
     assert locks == [
         f'LOCK TABLE "mrf"."mrf_address" IN {mode} MODE NOWAIT',
         f'LOCK TABLE "mrf"."npi_result_generation" IN {mode} MODE NOWAIT',
@@ -325,7 +311,6 @@ async def test_common_capture_preserves_geo_and_mutable_input_authorities(monkey
         dict(fence, version=1),
         dict(fence, version=2),
         dict(fence, tiger_protected=None),
-        dict(fence, database=dict(database_oid=82)),
     ]:
         with pytest.raises(RuntimeError):
             inputs.require_supported_native_address_inputs(changed)
@@ -336,8 +321,8 @@ async def test_generic_revision_and_lock_sets_exclude_only_verified_tiger(monkey
     session = SourceSession()
     monkeypatch.setattr(inputs, "_require_ledger_guards", AsyncMock())
     assert await inputs._revision_guards(session, "mrf", _physical(), protected_tiger=_proof()) == []
-    assert all(parameters["oids"] == [] for _, parameters in session.calls if parameters and "oids" in parameters)
-    for bad in [None, dict(_proof(), parent_oids=[["zcta5", 101], ["zip_state", 999]])]:
+    assert all(parameters["names"] == [] for _, parameters in session.calls if parameters and "names" in parameters)
+    for bad in [None, dict(_proof(), parent_oids=[["other", 101], ["zip_state", 102]])]:
         session.calls.clear()
         with pytest.raises(RuntimeError, match="tiger_proof_changed"):
             await inputs._lock_inputs(session, "mrf", _physical(), cutover=True, protected_tiger=bad)
@@ -356,7 +341,7 @@ class AdminConnection:
             dict(
                 namespace=schema,
                 name=name,
-                oid=dict(_proof()["parent_oids"]).get(name) if schema == "tiger" else None,
+                present=schema == "tiger" and name in tiger.ROOTS,
                 kind="r",
             )
             for schema, name in inputs.native_input_registration_roots("mrf")
@@ -364,6 +349,9 @@ class AdminConnection:
 
     def is_in_transaction(self):
         return True
+
+    async def execute(self, sql):
+        assert sql.startswith("LOCK TABLE ONLY ") and sql.endswith("IN ACCESS SHARE MODE NOWAIT")
 
     async def fetch(self, sql, *arguments):
         self.calls.append((sql, arguments))
@@ -385,20 +373,20 @@ async def test_raw_capture_reports_two_verified_roots_without_factory_or_enrollm
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["database", "oid", "extra", "shape", "root_oid"])
+@pytest.mark.parametrize("fault", ["catalog_schema", "parent_name", "extra", "shape", "root_kind"])
 async def test_raw_capture_never_accepts_changed_proof_or_physical_pair(fault):
     native = AdminConnection()
     proof = _proof()
-    if fault == "database":
-        proof["database_oid"] = proof["inventory"]["database_oid"] = 82
-    elif fault == "oid":
-        proof["parent_oids"][0][1] = 999
+    if fault == "catalog_schema":
+        native.catalog[0]["schema_name"] = "other"
+    elif fault == "parent_name":
+        proof["parent_oids"][0][0] = "other"
     elif fault == "extra":
         proof["parent_oids"].append(["other", 103])
     elif fault == "shape":
         proof["unexpected"] = True
     else:
-        native.roots[-1]["oid"] = 999
+        native.roots[-1]["kind"] = "v"
     with pytest.raises(RuntimeError):
         await inputs.capture_current_native_input_candidates(native, ledger_schema="mrf", protected_tiger=proof)
 
@@ -418,14 +406,16 @@ async def test_tiger_version_three_preserves_optional_verified_nucc_wire():
     from process.provider_directory_cms_typed_offices import CMS_OFFICE_READ_TABLES
     from tests.test_cms_native_input_registration import ProtectedNuccProtocol
 
-    nucc_proof = await inputs.capture_protected_nucc_input(_NativeNuccSession(ProtectedNuccProtocol()), schema="mrf")
-    physical_by_name = {f'"{schema}"."{name}"': dict(relation_oid=None) for schema, name in inputs._relations("mrf")}
+    protocol = ProtectedNuccProtocol()
+    nucc_proof = await inputs.capture_protected_nucc_input(_NativeNuccSession(protocol), schema="mrf")
+    physical_by_name = {f'"{schema}"."{name}"': dict(present=False) for schema, name in inputs._relations("mrf")}
     physical_by_name.update(_physical())
-    physical_by_name['"mrf"."nucc_taxonomy"'] = dict(relation_oid=201, relkind="p", inherited=True)
+    physical_by_name['"mrf"."nucc_taxonomy"'] = dict(
+        schema_name="mrf", table_name="nucc_taxonomy", present=True, relkind="p", relpersistence="p", inherited=True
+    )
     fence_by_field = dict(
         version=3,
         schema="mrf",
-        database=dict(database_oid=81),
         relations=physical_by_name,
         tiger_protected=_proof(),
         nucc_protected=nucc_proof,
@@ -440,7 +430,7 @@ async def test_tiger_version_three_preserves_optional_verified_nucc_wire():
 
 
 @pytest.mark.parametrize(
-    "fault", ["extra_field", "missing_child", "reordered_children", "duplicate_file", "child_parent_overlap"]
+    "fault", ["extra_field", "missing_child", "reordered_children", "duplicate_name", "different_schema"]
 )
 def test_exact_proof_rejects_ambiguous_or_incomplete_inventory(fault):
     proof = _proof()
@@ -449,11 +439,12 @@ def test_exact_proof_rejects_ambiguous_or_incomplete_inventory(fault):
     elif fault == "missing_child":
         proof["inventory"]["relations"].pop()
     elif fault == "reordered_children":
+        proof = _captured_proof()
         proof["inventory"]["relations"].reverse()
-    elif fault == "duplicate_file":
-        proof["inventory"]["relations"][1]["relfilenode"] = 501
+    elif fault == "duplicate_name":
+        proof["inventory"]["relations"][1]["relation_name"] = "zcta5"
     else:
-        proof["parent_oids"][0][1] = 201
+        proof["inventory"]["relations"][0]["schema_name"] = "reference_family_archive_" + "b" * 32
     with pytest.raises(RuntimeError, match="tiger_proof_changed"):
         tiger.require_protected_tiger_proof(proof)
 
@@ -461,25 +452,18 @@ def test_exact_proof_rejects_ambiguous_or_incomplete_inventory(fault):
 def _captured_proof():
     from process import tiger_held_inputs as held
 
-    proof_by_field = dict(
-        version=2,
-        database_oid=81,
-        node_id="fixture-node",
-        selection_kind="captured-source",
-        source_id="11111111-1111-4111-8111-111111111111",
-        package_id="d" * 64,
-        registration_sha256="e" * 64,
-        inventory=_proof()["inventory"],
+    return held._captured_tiger_proof(
+        "captured-source",
+        "fixture-node",
+        "11111111-1111-4111-8111-111111111111",
+        "d" * 64,
+        "e" * 64,
+        _proof()["inventory"],
     )
-    proof_by_field["selection_sha256"] = held._digest(proof_by_field)
-    return proof_by_field
 
 
 def _captured_catalog(proof):
-    return [
-        dict(child, database_oid=proof["database_oid"], protected=True, inherited=False, read_lock=True)
-        for child in proof["inventory"]["relations"]
-    ]
+    return [dict(child, valid=True, inherited=False) for child in proof["inventory"]["relations"]]
 
 
 class CapturedSourceSession(SourceSession):
@@ -488,18 +472,24 @@ class CapturedSourceSession(SourceSession):
         self.captured_rows = _captured_catalog(_captured_proof())
         self.physical = {
             f'"{namespace}"."{name}"': dict(
-                name=f'"{namespace}"."{name}"', relation_oid=None, relkind=None, inherited=False
+                name=f'"{namespace}"."{name}"',
+                schema_name=None,
+                table_name=None,
+                present=False,
+                relkind=None,
+                inherited=False,
             )
             for namespace, name in inputs._relations("mrf")
         }
         for index, name in enumerate(inputs._GEO):
             self.physical[f'"mrf"."{name}"'].update(
-                relation_oid=1001 + index, relfilenode=2001 + index, relkind="r", relpersistence="p"
+                schema_name="mrf", table_name=name, present=True, relkind="r", relpersistence="p"
             )
-        for canonical, binding in tiger.captured_tiger_bindings(_captured_proof()).items():
+        for index, (canonical, binding) in enumerate(tiger.captured_tiger_bindings(_captured_proof()).items()):
             self.physical['"' + canonical.replace(".", '"."') + '"'].update(
-                relation_oid=binding["relation_oid"],
-                relfilenode=binding["relfilenode"],
+                present=True,
+                schema_name=binding["schema_name"],
+                table_name=binding["table_name"],
                 relkind="r",
                 relpersistence="p",
             )
@@ -522,13 +512,12 @@ class CapturedSourceSession(SourceSession):
     "field,bad",
     [
         ("version", True),
-        ("database_oid", True),
         ("node_id", ""),
         ("selection_kind", "installed"),
         ("source_id", "not-uuid"),
         ("package_id", "A" * 64),
         ("registration_sha256", "x" * 64),
-        ("selection_sha256", "f" * 64),
+        ("selection_sha256", "F" * 64),
         ("extra", 1),
     ],
 )
@@ -542,14 +531,9 @@ def test_captured_proof_rejects_malformed_or_relabelled_linkage(field, bad):
 @pytest.mark.parametrize(
     "field,bad",
     [
-        ("protected", False),
+        ("valid", False),
         ("inherited", True),
-        ("read_lock", False),
-        ("database_oid", 82),
-        ("relation_oid", 999),
-        ("relfilenode", 999),
-        ("owner_oid", 999),
-        ("schema_owner_oid", 999),
+        ("schema_name", "other"),
     ],
 )
 def test_captured_native_catalog_rejects_drift_without_actor_privilege_waiver(field, bad):
@@ -558,9 +542,7 @@ def test_captured_native_catalog_rejects_drift_without_actor_privilege_waiver(fi
     with pytest.raises(RuntimeError, match="tiger_proof_changed"):
         tiger.require_captured_tiger_catalog(_captured_proof(), catalog)
     assert "current_user" not in tiger.CAPTURED_CATALOG_SQL
-    assert (
-        "NOT r.rolcanlogin" in tiger.CAPTURED_CATALOG_SQL and "privilege_type<>'SELECT'" in tiger.CAPTURED_CATALOG_SQL
-    )
+    assert not any(term in tiger.CAPTURED_CATALOG_SQL for term in ("pg_roles", "owner", "aclexplode", "filenode"))
 
 
 @pytest.mark.asyncio
@@ -612,14 +594,17 @@ async def test_raw_captured_verification_uses_same_driver_catalog_and_requires_h
         def is_in_transaction(self):
             return self.active
 
+        async def execute(self, statement):
+            assert statement.startswith("LOCK TABLE ONLY ") and statement.endswith("IN ACCESS SHARE MODE NOWAIT")
+
         async def fetch(self, statement, *arguments):
-            assert "AS protected" in statement and arguments == (tiger.captured_tiger_names(_captured_proof()),)
+            assert "AS valid" in statement and arguments == (tiger.captured_tiger_names(_captured_proof()),)
             return deepcopy(self.rows)
 
     raw = Raw()
     assert policy._FACTORY.get() is None
     assert await tiger.verify_raw_protected_tiger_input(raw, _captured_proof()) == _captured_proof()
-    raw.rows[0]["read_lock"] = False
+    raw.rows[0]["valid"] = False
     with pytest.raises(RuntimeError, match="tiger_proof_changed"):
         await tiger.verify_raw_protected_tiger_input(raw, _captured_proof())
 
@@ -632,17 +617,35 @@ async def test_captured_revision_exclusion_keeps_mutable_guards_and_exact_pair(m
     }
     monkeypatch.setattr(inputs, "_require_ledger_guards", AsyncMock())
     assert await inputs._revision_guards(session, "mrf", relations_by_name, captured_tiger=_captured_proof()) == []
-    assert all(parameters["oids"] == [] for _, parameters in session.calls if parameters and "oids" in parameters)
+    assert all(parameters["names"] == [] for _, parameters in session.calls if parameters and "names" in parameters)
     relations_by_name['"mrf"."openaddresses_geocode"'] = dict(
-        relation_oid=777, relfilenode=778, relkind="r", relpersistence="p", inherited=False
+        schema_name="mrf",
+        table_name="openaddresses_geocode",
+        present=True,
+        relkind="r",
+        relpersistence="p",
+        inherited=False,
     )
     with pytest.raises(RuntimeError, match="native_revision_guard_unavailable"):
         await inputs._revision_guards(session, "mrf", relations_by_name, captured_tiger=_captured_proof())
-    assert any(parameters and parameters.get("oids") == [777] for _, parameters in session.calls)
+    assert any(parameters and parameters.get("names") == ["openaddresses_geocode"] for _, parameters in session.calls)
     await inputs._lock_inputs(session, "mrf", relations_by_name, cutover=True, captured_tiger=_captured_proof())
     assert any('"mrf"."openaddresses_geocode" IN SHARE MODE' in sql for sql, _ in session.calls)
-    relations_by_name['"tiger"."zcta5"']["relfilenode"] += 100
+    relations_by_name['"tiger"."zcta5"']["schema_name"] = "other"
     session.calls.clear()
     with pytest.raises(RuntimeError, match="tiger_proof_changed"):
         await inputs._lock_inputs(session, "mrf", relations_by_name, cutover=True, captured_tiger=_captured_proof())
     assert session.calls == []
+
+
+def test_legacy_tokens_remain_opaque_and_captured_bindings_use_names():
+    proof = _proof()
+    proof["database_oid"] = proof["inventory"]["database_oid"] = 999
+    proof["parent_oids"][0][1] = None
+    for row in proof["inventory"]["relations"]:
+        row.update(relation_oid=None, owner_oid=999, relfilenode=0, schema_owner_oid=123)
+    tiger.require_protected_tiger_proof(proof)
+    captured = _captured_proof()
+    assert "database_oid" not in captured
+    assert all(set(row) == {"schema_name", "relation_name"} for row in captured["inventory"]["relations"])
+    assert all(set(row) == {"schema_name", "table_name"} for row in tiger.captured_tiger_bindings(captured).values())

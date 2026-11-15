@@ -20,43 +20,24 @@ from process.provider_directory_profile_capacity_runtime_types import (
     ProviderDirectoryProfileCapacityLimits,
 )
 from process.provider_directory_profile_selection_contract import (
+    _GLOBAL_PROFILE_PARAMS,
     PROFILE_EXECUTION_CONTRACT_ID,
     ProviderDirectoryProfileExecution,
-    _GLOBAL_PROFILE_PARAMS,
     validated_profile_execution,
 )
 
-
-CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-capacity-preflight-request.v3"
-)
-CAPACITY_PREFLIGHT_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-capacity-preflight.v3"
-)
+CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID = "healthporta.provider-directory-profile-capacity-preflight-request.v6"
+CAPACITY_PREFLIGHT_CONTRACT_ID = "healthporta.provider-directory-profile-capacity-preflight.v6"
 CAPACITY_AUTHORITY_PROJECTION_REQUEST_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-capacity-authority-projection-request.v1"
+    "healthporta.provider-directory-profile-capacity-authority-projection-request.v4"
 )
-CAPACITY_AUTHORITY_PROJECTION_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-capacity-authority-projection.v1"
-)
-CAPACITY_SIGNING_GUARD_REQUEST_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-capacity-signing-guard-request.v1"
-)
-CAPACITY_LIMITS_DIGEST_DOMAIN = (
-    "healthporta.provider-directory-profile-capacity-limits-digest.v1"
-)
-CAPACITY_SERVING_PREFLIGHT_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-serving-generation-preflight.v1"
-)
-CAPACITY_QUIESCENCE_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-capacity-signing-quiescence.v1"
-)
-CAPACITY_SERVING_PREFLIGHT_DIGEST_DOMAIN = (
-    "healthporta.provider-directory-profile-serving-generation-preflight.v1"
-)
-CAPACITY_QUIESCENCE_DIGEST_DOMAIN = (
-    "healthporta.provider-directory-profile-capacity-signing-quiescence.v1"
-)
+CAPACITY_AUTHORITY_PROJECTION_CONTRACT_ID = "healthporta.provider-directory-profile-capacity-authority-projection.v4"
+CAPACITY_SIGNING_GUARD_REQUEST_CONTRACT_ID = "healthporta.provider-directory-profile-capacity-signing-guard-request.v1"
+CAPACITY_LIMITS_DIGEST_DOMAIN = "healthporta.provider-directory-profile-capacity-limits-digest.v1"
+CAPACITY_SERVING_PREFLIGHT_CONTRACT_ID = "healthporta.provider-directory-profile-serving-generation-preflight.v2"
+CAPACITY_QUIESCENCE_CONTRACT_ID = "healthporta.provider-directory-profile-capacity-signing-quiescence.v2"
+CAPACITY_SERVING_PREFLIGHT_DIGEST_DOMAIN = "healthporta.provider-directory-profile-serving-generation-preflight.v2"
+CAPACITY_QUIESCENCE_DIGEST_DOMAIN = "healthporta.provider-directory-profile-capacity-signing-quiescence.v2"
 # Lease-v3 uses a source-neutral controller identity. Historical lease-v2 field
 # names remain isolated in the coordinator's version-aware replay parser.
 CAPACITY_CONTROL_PLANE_RECEIPT_SHA256_FIELD = "control_plane_receipt_sha256"
@@ -93,9 +74,7 @@ _SIGNING_GUARD_FIELDS = frozenset(
     }
 )
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
-_UTC_TIMESTAMP = re.compile(
-    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T" r"[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z"
-)
+_UTC_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T" r"[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
 _MAX_RECEIPT_LIFETIME_SECONDS = 24 * 60 * 60
 
 
@@ -154,9 +133,7 @@ def canonical_preflight_json(value: Any) -> str:
 def preflight_domain_sha256(domain: str, value: Any) -> str:
     """Hash canonical JSON with an explicit ASCII/NUL domain boundary."""
 
-    return hashlib.sha256(
-        domain.encode("ascii") + b"\0" + canonical_preflight_json(value).encode("ascii")
-    ).hexdigest()
+    return hashlib.sha256(domain.encode("ascii") + b"\0" + canonical_preflight_json(value).encode("ascii")).hexdigest()
 
 
 def canonical_capacity_limits_payload(
@@ -194,17 +171,13 @@ def _exact_mapping(
     reason: str,
 ) -> Mapping[str, Any]:
     if not isinstance(value, Mapping) or set(value) != fields:
-        raise ProviderDirectoryProfileCapacityPreflightError(
-            "provider_directory_profile_capacity_preflight_" + reason
-        )
+        raise ProviderDirectoryProfileCapacityPreflightError("provider_directory_profile_capacity_preflight_" + reason)
     return value
 
 
 def _hex_digest(value: Any, *, reason: str) -> str:
     if not isinstance(value, str) or _LOWER_HEX_64.fullmatch(value) is None:
-        raise ProviderDirectoryProfileCapacityPreflightError(
-            "provider_directory_profile_capacity_preflight_" + reason
-        )
+        raise ProviderDirectoryProfileCapacityPreflightError("provider_directory_profile_capacity_preflight_" + reason)
     return value
 
 
@@ -274,10 +247,7 @@ def _validated_signing_guard(
             reason="signing_guard_fields_invalid",
         )
     )
-    if (
-        signing_guard_by_field.get("contract_id")
-        != CAPACITY_SIGNING_GUARD_REQUEST_CONTRACT_ID
-    ):
+    if signing_guard_by_field.get("contract_id") != CAPACITY_SIGNING_GUARD_REQUEST_CONTRACT_ID:
         raise ProviderDirectoryProfileCapacityPreflightError(
             "provider_directory_profile_capacity_preflight_signing_guard_contract_invalid"
         )
@@ -308,10 +278,7 @@ def validated_capacity_preflight_request(
         validated_cms_preflight_request,
     )
 
-    if (
-        isinstance(raw_request, Mapping)
-        and raw_request.get("contract_id") == CMS_PREFLIGHT_REQUEST_CONTRACT
-    ):
+    if isinstance(raw_request, Mapping) and raw_request.get("contract_id") == CMS_PREFLIGHT_REQUEST_CONTRACT:
         return validated_cms_preflight_request(raw_request)
 
     return _validated_profile_capacity_preflight_request(raw_request)
@@ -333,15 +300,11 @@ def _validated_profile_capacity_preflight_request(
         raise ProviderDirectoryProfileCapacityPreflightError(
             "provider_directory_profile_capacity_preflight_request_contract_invalid"
         )
-    execution, execution_payload = _validated_execution_payload(
-        request_map["profile_execution"]
-    )
+    execution, execution_payload = _validated_execution_payload(request_map["profile_execution"])
     limits, limits_payload, limits_digest = _validated_limits_payload(
         request_map["provider_directory_profile_capacity_limits"]
     )
-    request_nonce, control_plane_receipt, expires_at = _validated_signing_guard(
-        request_map["signing_guard"]
-    )
+    request_nonce, control_plane_receipt, expires_at = _validated_signing_guard(request_map["signing_guard"])
     normalized_by_field = {
         "contract_id": CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID,
         "profile_execution": execution_payload,
@@ -389,10 +352,7 @@ def validated_capacity_authority_projection_request(
         validated_cms_preflight_request,
     )
 
-    if (
-        isinstance(raw_request, Mapping)
-        and raw_request.get("contract_id") == CMS_PROJECTION_REQUEST_CONTRACT
-    ):
+    if isinstance(raw_request, Mapping) and raw_request.get("contract_id") == CMS_PROJECTION_REQUEST_CONTRACT:
         return validated_cms_preflight_request(raw_request, projection=True)
 
     return _validated_profile_projection_request(raw_request)
@@ -407,16 +367,11 @@ def _validated_profile_projection_request(raw_request):
             reason="authority_projection_request_fields_invalid",
         )
     )
-    if (
-        request_map.get("contract_id")
-        != CAPACITY_AUTHORITY_PROJECTION_REQUEST_CONTRACT_ID
-    ):
+    if request_map.get("contract_id") != CAPACITY_AUTHORITY_PROJECTION_REQUEST_CONTRACT_ID:
         raise ProviderDirectoryProfileCapacityPreflightError(
             "provider_directory_profile_capacity_preflight_authority_projection_request_contract_invalid"
         )
-    execution, execution_payload = _validated_execution_payload(
-        request_map["profile_execution"]
-    )
+    execution, execution_payload = _validated_execution_payload(request_map["profile_execution"])
     limits, limits_payload, limits_digest = _validated_limits_payload(
         request_map["provider_directory_profile_capacity_limits"]
     )
@@ -452,11 +407,7 @@ def assert_preflight_expiry(
 
     normalized_issued_at = issued_at.astimezone(datetime.timezone.utc)
     lifetime = request.expires_at - normalized_issued_at
-    if (
-        not datetime.timedelta(0)
-        < lifetime
-        <= datetime.timedelta(seconds=_MAX_RECEIPT_LIFETIME_SECONDS)
-    ):
+    if not datetime.timedelta(0) < lifetime <= datetime.timedelta(seconds=_MAX_RECEIPT_LIFETIME_SECONDS):
         raise ProviderDirectoryProfileCapacityPreflightError(
             "provider_directory_profile_capacity_preflight_expiry_invalid"
         )
@@ -470,22 +421,29 @@ def _validated_initial_request(raw_request: Mapping[str, Any], *, projection: bo
         raise ProviderDirectoryProfileCapacityPreflightError("provider_directory_profile_initial_mode_invalid")
     ordinary_by_field = dict(raw_request)
     ordinary_by_field.pop("profile_materialization")
-    ordinary_by_field["contract_id"] = (CAPACITY_AUTHORITY_PROJECTION_REQUEST_CONTRACT_ID
-                               if projection else CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID)
-    request = (validated_capacity_authority_projection_request(ordinary_by_field) if projection
-               else _validated_profile_capacity_preflight_request(ordinary_by_field))
-    if request.execution.attestation.operation != "publish" or request.execution.attestation.desired_profile_as_of is None:
-        raise ProviderDirectoryProfileCapacityPreflightError("provider_directory_profile_initial_explicit_date_required")
+    ordinary_by_field["contract_id"] = (
+        CAPACITY_AUTHORITY_PROJECTION_REQUEST_CONTRACT_ID if projection else CAPACITY_PREFLIGHT_REQUEST_CONTRACT_ID
+    )
+    request = (
+        validated_capacity_authority_projection_request(ordinary_by_field)
+        if projection
+        else _validated_profile_capacity_preflight_request(ordinary_by_field)
+    )
+    if (
+        request.execution.attestation.operation != "publish"
+        or request.execution.attestation.desired_profile_as_of is None
+    ):
+        raise ProviderDirectoryProfileCapacityPreflightError(
+            "provider_directory_profile_initial_explicit_date_required"
+        )
     payload = dict(raw_request)
-    return dataclasses.replace(request, request_payload=payload,
-                               request_sha256=preflight_domain_sha256(payload["contract_id"], payload))
+    return dataclasses.replace(
+        request, request_payload=payload, request_sha256=preflight_domain_sha256(payload["contract_id"], payload)
+    )
 
 
 def profile_execution_identity_payload(
-    request: (
-        ProviderDirectoryProfileCapacityPreflightRequest
-        | ProfileCapacityAuthorityProjectionRequest
-    ),
+    request: (ProviderDirectoryProfileCapacityPreflightRequest | ProfileCapacityAuthorityProjectionRequest),
 ) -> dict[str, Any]:
     """Return the exact v6/source-delta identity exposed to the signer."""
 

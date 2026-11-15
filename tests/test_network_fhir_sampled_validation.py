@@ -10,6 +10,7 @@ import random
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import datetime
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -20,10 +21,10 @@ from asyncpg import InsufficientPrivilegeError
 
 from process import network_fhir_sampled_validation as sampled
 from process import network_fhir_typed_capture as capture
-from process.network_fhir_source_witness_contract import canonical, database_identity, digest, source_origin
+from process.network_fhir_source_witness_contract import canonical, digest, source_origin
 from process.network_fhir_typed_contract import PAIR_COLUMNS, TypedFHIRGraphError, graph_document
 from process.network_fhir_typed_source import _raw_projection
-from tests.test_network_fhir_source_witness_contract import database_fields, origin_fields
+from tests.test_network_fhir_source_witness_contract import origin_fields
 
 _SEED = "1" * 64
 _NETWORKS = ("network-one",)
@@ -101,15 +102,51 @@ def _origin():
     return source_origin(fields)
 
 
-def _identity():
-    return asdict(database_identity(database_fields()))
-
-
 def _graph():
     counts_by_kind = dict.fromkeys(
         ("source_rows", "projected_rows", "pair_rows", "reference_rows", "provider_only_roles"), 0
     )
-    return graph_document(_origin(), _identity(), "2026-01-01", counts_by_kind)
+    return graph_document(_origin(), "2026-01-01", counts_by_kind)
+
+
+def _capture(graph):
+    from process.registry_fhir_catalog_observation import FHIRCatalogObservationDigests
+    from process.registry_fhir_catalog_observed_source import build_fhir_catalog_observation_descriptor
+    from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
+
+    origin = _origin()
+    header_by_field = {
+        "dataset_id": origin.dataset_id,
+        "endpoint_id": origin.endpoint_id,
+        "dataset_hash": origin.dataset_sha256,
+        "root_run_id": origin.root_run_id,
+        "published_at": datetime(2026, 1, 1),
+        "resource_hash_contract": None,
+        "resource_count": sum(dict(origin.resource_counts).values()),
+        "previous_dataset_id": None,
+    }
+    descriptor = build_fhir_catalog_observation_descriptor(
+        FHIRCatalogSourceReadProfile(origin.schema_name, origin.header_relation["schema"]),
+        header_by_field,
+        {"header": origin.header_relation, "resource": origin.resource_relation},
+        (origin.source_uri, list(origin.source_aliases)),
+        FHIRCatalogObservationDigests().document(),
+    )
+    capture_id = str(UUID(int=1))
+    schema = capture.PREFIX + UUID(capture_id).hex
+    capture_by_field = {
+        "component": capture.COMPONENT,
+        "descriptor_version": 5,
+        "capture_id": capture_id,
+        "observed_at": "2026-01-02T00:00:00.000000+00:00",
+        "schema_name": schema,
+        "tables": {kind: {"schema": schema, "name": name} for kind, name in capture.TABLES.items()},
+        "content": {kind: {"rows": 0, "sha256": "a" * 64} for kind in capture.TABLES},
+        "graph": graph,
+        "catalog_descriptor": descriptor,
+    }
+    capture_by_field["capture_sha256"] = digest(capture_by_field)
+    return capture_by_field
 
 
 def _export(*, population=1):
@@ -117,7 +154,6 @@ def _export(*, population=1):
     return {
         "contract": sampled.SOURCE_CONTRACT,
         "origin": _origin(),
-        "database_identity": _identity(),
         "sampling": {
             "unit": "source-role-witness",
             "algorithm": sampled.ALGORITHM,
@@ -168,8 +204,7 @@ def _receipt():
         "source_origin_sha256": digest(asdict(_origin())),
         "capture_id": str(UUID(int=1)),
         "observed_at": "2026-01-02T00:00:00.000000+00:00",
-        "capture_sha256": "2" * 64,
-        "database_identity": _identity(),
+        "capture_sha256": _capture(_graph())["capture_sha256"],
         "membership_as_of": "2026-01-01",
         "networks": [
             {
@@ -382,14 +417,14 @@ async def test_candidate_replay_cancellation_never_flushes_pending_again(monkeyp
 @pytest.mark.parametrize("population", [0, 1, 99, 100, 101, 1000, 1700])
 def test_source_selection_declares_actual_role_coverage(population):
     networks = sampled._source_selection(
-        _export(population=population), _origin(), _identity(), sampled.SemanticSamplingPolicy(_SEED), _NETWORKS
+        _export(population=population), _origin(), sampled.SemanticSamplingPolicy(_SEED), _NETWORKS
     )
     assert networks[0]["population"] == population
     assert sum(map(len, networks[0]["series"])) == min(population, 1000)
 
 
 @pytest.mark.parametrize(
-    "damage", ["contract", "seed", "unit", "origin", "database", "duplicate", "kind", "population", "series"]
+    "damage", ["contract", "seed", "unit", "origin", "resources", "duplicate", "kind", "population", "series"]
 )
 def test_missing_or_unsupported_sampling_contract_refuses(damage):
     export = _export()
@@ -400,8 +435,8 @@ def test_missing_or_unsupported_sampling_contract_refuses(damage):
             export["sampling"][damage] = "other"
         case "origin":
             export["origin"] = source_origin(origin_fields())
-        case "database":
-            export["database_identity"]["database_oid"] += 1
+        case "resources":
+            export["resources"] = None
         case "duplicate":
             export["sampling"]["networks"][0]["series"][0] *= 2
         case "kind":
@@ -411,7 +446,7 @@ def test_missing_or_unsupported_sampling_contract_refuses(damage):
         case "series":
             export["sampling"]["networks"][0]["series"].pop()
     with pytest.raises(ValueError):
-        sampled._source_selection(export, _origin(), _identity(), sampled.SemanticSamplingPolicy(_SEED), _NETWORKS)
+        sampled._source_selection(export, _origin(), sampled.SemanticSamplingPolicy(_SEED), _NETWORKS)
 
 
 def test_raw_dependencies_preserve_scoped_refs_dates_npi_and_site_identity():
@@ -498,7 +533,7 @@ async def test_absent_dependency_is_accepted_only_after_subset_eof(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_missing_sampled_role_refuses_before_dependency_replay(monkeypatch):
-    replay = SimpleNamespace(verify=AsyncMock(), names={"cells": "cells"}, relation=lambda _: "pg_temp.cells")
+    replay = SimpleNamespace(require_ready=Mock(), names={"cells": "cells"}, relation=lambda _: "pg_temp.cells")
     monkeypatch.setattr(sampled, "_fetch_resources", AsyncMock(return_value=set()))
     connection = SimpleNamespace(execute=AsyncMock())
     with pytest.raises(TypedFHIRGraphError, match="sample_role_missing"):
@@ -549,7 +584,7 @@ async def test_candidate_fanout_budget_follows_complete_role_stream(monkeypatch,
             yield
 
     connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(side_effect=budget), cursor=dependencies)
-    replay = SimpleNamespace(verify=AsyncMock(), names={"checks": "checks"}, relation=lambda kind: "pg_temp." + kind)
+    replay = SimpleNamespace(require_ready=Mock(), names={"checks": "checks"}, relation=lambda kind: "pg_temp." + kind)
     monkeypatch.setattr(sampled, "_check_page", AsyncMock())
     monkeypatch.setattr(sampled, "_canonicalize", AsyncMock())
     monkeypatch.setattr(sampled, "_pairs", AsyncMock())
@@ -714,10 +749,12 @@ async def test_cancelled_start_still_closes_savepoint(monkeypatch):
             parent.cancel()
             await asyncio.sleep(0)
 
-    monkeypatch.setattr(sampled, "_sample_replay_indexes", AsyncMock(return_value={}))
-    connection = SimpleNamespace(execute=execute, terminate=Mock())
+    connection = SimpleNamespace(execute=execute, fetchval=AsyncMock(return_value=True), terminate=Mock())
     with pytest.raises(asyncio.CancelledError):
-        async with sampled._sample_replay_batch(connection, SimpleNamespace(oids={})):
+        async with sampled._sample_replay_batch(
+            connection,
+            sampled.TypedFHIRGraphStage({kind: "replay_" + kind for kind in ("cells", "checks", "pairs", "addresses")}),
+        ):
             pytest.fail("cancelled batch started replay")
     while parent.cancelling():
         parent.uncancel()
@@ -729,13 +766,19 @@ async def test_cancelled_start_still_closes_savepoint(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sample_cleanup_failure_closes_connection(monkeypatch):
-    monkeypatch.setattr(sampled, "_sample_replay_indexes", AsyncMock(return_value={}))
+    async def execute(query):
+        if query.startswith("ROLLBACK TO SAVEPOINT"):
+            raise RuntimeError("cleanup failed")
+
     connection = SimpleNamespace(
-        execute=AsyncMock(side_effect=[None, RuntimeError("cleanup failed")]), terminate=Mock()
+        execute=AsyncMock(side_effect=execute), fetchval=AsyncMock(return_value=True), terminate=Mock()
     )
     with pytest.raises(RuntimeError, match="cleanup failed"):
-        async with sampled._sample_replay_batch(connection, SimpleNamespace(oids={})):
-            assert connection.execute.await_count == 1
+        async with sampled._sample_replay_batch(
+            connection,
+            sampled.TypedFHIRGraphStage({kind: "replay_" + kind for kind in ("cells", "checks", "pairs", "addresses")}),
+        ):
+            assert connection.execute.await_count == 5
     connection.terminate.assert_called_once_with()
 
 
@@ -751,25 +794,25 @@ def test_receipt_is_closed_bound_and_contains_no_provider_payload():
 
 
 @pytest.mark.asyncio
-async def test_read_cannot_be_forged_mutated_or_promoted_to_full_authority():
-    receipt = _receipt()
+async def test_read_preserves_sampling_mode_and_checks_logical_content_bindings():
     graph = _graph()
-    stage = SimpleNamespace(
-        document=graph, verify=AsyncMock(), checked=False, relation=lambda kind: "synthetic." + kind
+    document = _capture(graph)
+    stage = sampled.TypedFHIRGraphStage(dict(capture.TABLES), schema_name=document["schema_name"], document=graph)
+    graph_read = capture.TypedGraphRead(
+        stage, document, capture.TypedGraphAnchor(document["capture_id"], document["observed_at"])
     )
-    sealed = capture.SealedTypedGraphRead(
-        stage,
-        {"capture_sha256": receipt["capture_sha256"]},
-        capture.TypedGraphAnchor(receipt["capture_id"], receipt["observed_at"]),
-        capture._SEALED_READ,
-    )
-    read = sampled.SampledTypedGraphRead(sealed, json.dumps(receipt), sampled._READ_BRAND)
+    receipt = _receipt()
+    read = sampled.SampledTypedGraphRead(graph_read, json.dumps(receipt))
     read.receipt["seed"] = "changed"
-    await read.verify(object())
+    read.require_ready()
     assert read.receipt == receipt and stage.checked is False and not hasattr(read, "checked")
-    assert read.relation("pairs") == "synthetic.pairs"
+    assert read.relation("pairs") == stage.relation("pairs")
+    changed_receipt_by_field = dict(receipt, capture_id=str(UUID(int=2)))
+    changed_receipt_by_field["receipt_sha256"] = digest(
+        {key: value for key, value in changed_receipt_by_field.items() if key != "receipt_sha256"}
+    )
     with pytest.raises(TypedFHIRGraphError, match="sample_read"):
-        await sampled.SampledTypedGraphRead(sealed, json.dumps(receipt), object()).verify(object())
+        sampled.SampledTypedGraphRead(graph_read, json.dumps(changed_receipt_by_field)).require_ready()
 
 
 @pytest.mark.asyncio
@@ -777,18 +820,12 @@ async def test_read_cannot_be_forged_mutated_or_promoted_to_full_authority():
 async def test_verification_refuses_sample_failure_and_attaches_payload_free_receipt(monkeypatch, direction):
     receipt = _receipt()
     graph = _graph()
-    document_by_field = {
-        "capture_id": receipt["capture_id"],
-        "observed_at": receipt["observed_at"],
-        "capture_sha256": receipt["capture_sha256"],
-        "graph": graph,
-    }
-    stage = SimpleNamespace(document=graph, verify=AsyncMock(), checked=False)
-    sealed = capture.SealedTypedGraphRead(
-        stage,
-        document_by_field,
-        capture.TypedGraphAnchor(receipt["capture_id"], receipt["observed_at"]),
-        capture._SEALED_READ,
+    document_by_field = _capture(graph)
+    stage = sampled.TypedFHIRGraphStage(
+        dict(capture.TABLES), schema_name=document_by_field["schema_name"], document=graph
+    )
+    sealed = capture.TypedGraphRead(
+        stage, document_by_field, capture.TypedGraphAnchor(receipt["capture_id"], receipt["observed_at"])
     )
 
     @asynccontextmanager
@@ -798,7 +835,6 @@ async def test_verification_refuses_sample_failure_and_attaches_payload_free_rec
     monkeypatch.setitem(
         sys.modules, "directory_membership_runtime", SimpleNamespace(open_membership_source_sample=context)
     )
-    monkeypatch.setattr(sampled, "_original_source_factory", Mock())
     monkeypatch.setattr(sampled, "load_typed_graph_capture", AsyncMock(return_value=sealed))
     monkeypatch.setattr(sampled, "_borrowed_epoch_settings", context)
     monkeypatch.setattr(sampled, "_replay_workspace", context)
@@ -816,7 +852,7 @@ async def test_verification_refuses_sample_failure_and_attaches_payload_free_rec
     )
     arguments_by_name = dict(
         scope=sampled.SampledCaptureScope(
-            SimpleNamespace(schema_name=_origin().schema_name), _origin(), sealed.anchor, _NETWORKS
+            SimpleNamespace(catalog_schema=_origin().header_relation["schema"]), _origin(), sealed.anchor, _NETWORKS
         ),
         policy=sampled.SemanticSamplingPolicy(_SEED),
     )
@@ -832,4 +868,24 @@ async def test_verification_refuses_sample_failure_and_attaches_payload_free_rec
             )
         assert sampled.validate_sampled_semantic_receipt(failure.value.receipt)
         assert "provider_id" not in str(failure.value) + json.dumps(failure.value.receipt)
-    sampled._original_source_factory.assert_called_once()
+
+
+def test_legacy_source_origin_projects_named_provenance_and_preserves_content():
+    original = origin_fields()
+    projected = source_origin(original)
+    assert projected.header_relation == {
+        "schema": original["schema_name"],
+        "name": "provider_directory_endpoint_dataset",
+    }
+    assert projected.resource_relation == {
+        "schema": original["schema_name"],
+        "name": "provider_directory_dataset_resource",
+    }
+    assert projected.dataset_sha256 == original["dataset_sha256"]
+    assert projected.resource_counts == original["resource_counts"]
+    assert projected.resource_hashes == original["resource_hashes"]
+    named = asdict(projected)
+    assert source_origin(named) == projected
+    named["unexpected_scope"] = "other"
+    with pytest.raises(ValueError):
+        source_origin(named)

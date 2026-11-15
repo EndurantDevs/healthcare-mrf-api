@@ -14,7 +14,6 @@ from api import plan_pricing_projection_contract as projection_contract
 from api import plan_pricing_projection_materialize as projection_materialize
 from api.plan_release_serving import PlanReleaseServingSelection
 
-
 PROJECTION_ID = "a" * 64
 
 
@@ -52,11 +51,7 @@ class _Session:
         self.statements = []
 
     async def execute(self, statement, params=None):
-        captured_params = (
-            [dict(row) for row in params]
-            if isinstance(params, list)
-            else dict(params or {})
-        )
+        captured_params = [dict(row) for row in params] if isinstance(params, list) else dict(params or {})
         self.statements.append((str(statement), captured_params))
         return _Rows(self.rows)
 
@@ -75,6 +70,9 @@ class _ScalarSession:
 
     async def execute(self, *_args, **_kwargs):
         return _ScalarResult(self.value)
+
+    async def scalar(self, *_args, **_kwargs):
+        return None
 
 
 def _selection(*, projection_id=PROJECTION_ID):
@@ -140,9 +138,7 @@ def test_projection_build_uses_existing_durable_single_job_worker():
         for importer_contract in control_imports.importer_registry()
         if importer_contract["name"] == "plan-pricing-projection"
     )
-    adapter = control_imports._SINGLE_JOB_ADAPTERS[
-        "plan-pricing-projection"
-    ]
+    adapter = control_imports._SINGLE_JOB_ADAPTERS["plan-pricing-projection"]
     worker_payload = control_imports._adapter_payload(
         adapter,
         {
@@ -167,21 +163,20 @@ def test_projection_build_uses_existing_durable_single_job_worker():
     assert worker_payload["target_module"] == "api.plan_pricing_projection"
     assert worker_payload["target_function"] == "build_plan_pricing_projection"
     assert worker_payload["call_style"] == "kwargs"
-    assert worker_payload["task"]["projection_contract"] == (
-        "plan_pricing_factorized_v4"
-    )
+    assert worker_payload["task"]["projection_contract"] == ("plan_pricing_factorized_v4")
     assert worker_payload["task"]["bindings"] == [{"snapshot_id": "synthetic"}]
-    worker = control_workers._BY_IMPORTER_ROLE[
-        ("plan-pricing-projection", "start")
-    ]
+    worker = control_workers._BY_IMPORTER_ROLE[("plan-pricing-projection", "start")]
     assert worker.worker_class == "process.PTGCandidateAudit"
-    assert control_workers._single_job_worker_target(
-        worker,
-        {
-            "importer": "plan-pricing-projection",
-            "run_id": "run_projection",
-        },
-    ) == "plan_pricing_projection_run_projection"
+    assert (
+        control_workers._single_job_worker_target(
+            worker,
+            {
+                "importer": "plan-pricing-projection",
+                "run_id": "run_projection",
+            },
+        )
+        == "plan_pricing_projection_run_projection"
+    )
 
 
 def test_card_and_aggregate_fragments_are_fixed_and_distinct():
@@ -264,10 +259,13 @@ def test_ruled_numeric_cpt_and_hcpcs_share_fail_closed_taxonomy_eligibility():
 
     assert [provider["npi"] for provider in cpt_eligible] == [1111111111]
     assert hcpcs_eligible == cpt_eligible
-    assert projection._eligible_projection_providers(
-        providers,
-        ("HCPCS", "G0439"),
-    ) == providers
+    assert (
+        projection._eligible_projection_providers(
+            providers,
+            ("HCPCS", "G0439"),
+        )
+        == providers
+    )
 
 
 @pytest.mark.asyncio
@@ -293,8 +291,7 @@ async def test_project_code_card_insert_matches_its_bound_row(monkeypatch):
     card_sql, card_rows = next(
         statement
         for statement in session.statements
-        if "INSERT INTO" in statement[0]
-        and "plan_pricing_card" in statement[0]
+        if "INSERT INTO" in statement[0] and "plan_pricing_card" in statement[0]
     )
     card_columns = card_sql.split(") VALUES", 1)[0]
     assert card_columns.count("minimum_negotiated_rate") == 1
@@ -328,36 +325,39 @@ def test_projection_result_type_preserves_omitted_view_contract(args, expected):
 @pytest.mark.asyncio
 async def test_provider_signature_checks_relations_without_rejecting_strings():
     signature_dict = {
-        "npi": [1, 11],
-        "taxonomy": [2, 12],
-        "vocabulary": [3, 13],
-        "address": [4, 14],
-        "address_evidence": [6, 16, 4, 14],
-        "zip": [5, 15],
-        "geo_assurance": {"version": "annulled-name-is-still-valid"},
+        "contract": projection_contract._PROVIDER_SIGNATURE_CONTRACT,
+        "generations": {
+            family: {"origin_lineage_id": f"00000000-0000-0000-0000-{index + 1:012d}", "origin_generation": 1}
+            for index, family in enumerate(projection_contract._PROVIDER_GENERATIONS)
+        },
+        "relations_available": True,
+        "geo_assurance": {
+            "version": 1,
+            "signature": {
+                f"{schema or projection_contract.SCHEMA}.{name}": {
+                    "schema_name": schema or projection_contract.SCHEMA,
+                    "table_name": name,
+                }
+                for schema, name in projection_contract.geo_projection._PROJECTION_DEPENDENCIES
+            },
+        },
         "geo_assurance_ready": True,
     }
 
-    signature_digest = await projection._provider_signature(
-        _ScalarSession(orjson.dumps(signature_dict).decode())
+    signature_digest = await projection._provider_signature(_ScalarSession(orjson.dumps(signature_dict).decode()))
+
+    assert (
+        signature_digest == projection.hashlib.sha256(projection._canonical_json(signature_dict).encode()).hexdigest()
     )
 
-    assert signature_digest == projection.hashlib.sha256(
-        projection._canonical_json(signature_dict).encode()
-    ).hexdigest()
-
-    signature_dict["zip"] = [None, None]
+    signature_dict["relations_available"] = False
     with pytest.raises(ValueError, match="relations are incomplete"):
-        await projection._provider_signature(
-            _ScalarSession(orjson.dumps(signature_dict).decode())
-        )
+        await projection._provider_signature(_ScalarSession(orjson.dumps(signature_dict).decode()))
 
-    signature_dict["zip"] = [5, 15]
-    signature_dict["address_evidence"] = [6, 16]
-    with pytest.raises(ValueError, match="relations are incomplete"):
-        await projection._provider_signature(
-            _ScalarSession(orjson.dumps(signature_dict).decode())
-        )
+    signature_dict["relations_available"] = True
+    signature_dict["generations"]["geo"]["origin_generation"] = None
+    with pytest.raises(ValueError, match="generations are incomplete"):
+        await projection._provider_signature(_ScalarSession(orjson.dumps(signature_dict).decode()))
 
 
 @pytest.mark.asyncio
@@ -366,9 +366,7 @@ async def test_provider_generation_is_repeatable_and_locked_before_signature():
 
     await projection._lock_provider_generation(session)
 
-    assert session.statements[0][0].strip() == (
-        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
-    )
+    assert session.statements[0][0].strip() == ("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
     assert "mrf.npi_address" in session.statements[1][0]
     assert "mrf.mrf_address" in session.statements[1][0]
     assert "mrf.doctor_clinician_address" in session.statements[1][0]

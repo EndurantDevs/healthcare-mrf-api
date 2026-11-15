@@ -15,7 +15,6 @@ from sqlalchemy import String, column, select, values
 
 from api.endpoint import npi
 from api.endpoint.pagination import parse_pagination
-from api.network_read_execution import execute_network_read
 from api.provider_profile_snapshot import provider_directory_snapshot_read
 from process.custom_import.read_contracts import CustomImportReadUnavailableError
 
@@ -258,7 +257,7 @@ async def _imported_batch_npis(context, found, session):
     for ordinal, term in enumerate(context.prepared.normalized_order_terms):
         expression = imported.c[f"sort_{ordinal}"]
         order_expressions.append((expression.asc() if term.direction == "asc" else expression.desc()).nulls_last())
-    result = await execute_network_read(session, statement.order_by(*order_expressions, eligible.c.npi.asc()))
+    result = await session.execute(statement.order_by(*order_expressions, eligible.c.npi.asc()))
     return [int(value) for value in result.scalars().all()]
 
 

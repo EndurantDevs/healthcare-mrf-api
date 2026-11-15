@@ -117,21 +117,19 @@ def test_flex_dispatch_and_trigger_shape_guards(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_profile_control_layout_missing_and_unbudgeted(monkeypatch):
+async def test_profile_control_layout_missing_and_named_coordinate_drift(monkeypatch):
+    relations_by_role = {
+        role: {"schema": "fixture", "name": role}
+        for role in ("build_checkpoint", "import_run", "capacity_consumption", "serving_generation")
+    }
     layouts = tuple(
         types.SimpleNamespace(
-            exact_fingerprint=str(index),
-            effective_tablespace_oids=(1663,),
+            schema_name=coordinate["schema"],
+            relation_name=coordinate["name"],
         )
-        for index in range(4)
+        for coordinate in relations_by_role.values()
     )
-    identity = types.SimpleNamespace(
-        build_checkpoint_storage_fingerprint="0",
-        import_run_storage_fingerprint="1",
-        capacity_consumption_storage_fingerprint="2",
-        serving_generation_storage_fingerprint="3",
-        tablespace_oid=1663,
-    )
+    identity = types.SimpleNamespace(relations=relations_by_role)
     monkeypatch.setattr(
         importer,
         "_profile_primary_control_layouts",
@@ -146,20 +144,21 @@ async def test_profile_control_layout_missing_and_unbudgeted(monkeypatch):
         await importer._profile_control_layouts(identity)
 
     relation_oid.return_value = 20_008
+    preflight_layout = AsyncMock(return_value=types.SimpleNamespace())
     monkeypatch.setattr(
         importer,
-        "_provider_directory_profile_relation_storage_fingerprint",
-        AsyncMock(
-            return_value=types.SimpleNamespace(
-                effective_tablespace_oids=(9999,),
-            )
-        ),
+        "_provider_directory_profile_capacity_relation_layout",
+        preflight_layout,
     )
+    layouts[0].relation_name = "other_checkpoint"
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
-        match="preflight_layout_unbudgeted",
+        match="control_relation_changed",
     ):
         await importer._profile_control_layouts(identity)
+    preflight_layout.assert_awaited_once_with(
+        20_008, expected_persistence="p", expected_user_trigger_count=3, expected_single_use_receipt=True
+    )
 
 
 def test_stored_receipt_shape_digest_and_execution_identity():
@@ -199,11 +198,7 @@ def test_stored_receipt_shape_digest_and_execution_identity():
             capacity_lease,
         )
 
-    expected_execution_identity = (
-        importer._profile_capacity_expected_execution_identity(
-            synthetic_profile_execution()
-        )
-    )
+    expected_execution_identity = importer._profile_capacity_expected_execution_identity(synthetic_profile_execution())
     assert expected_execution_identity["materialization_mode"] == "source_delta"
     assert expected_execution_identity["profile_strategy_version"] == (
         synthetic_profile_execution().attestation.profile_strategy_version
@@ -219,9 +214,7 @@ def test_receipt_body_binding_guard():
     workload = _workload()
     geometry = _geometry()
 
-    importer._assert_profile_capacity_receipt_body_binding(
-        row_by_field, receipt, execution, workload, geometry, lease
-    )
+    importer._assert_profile_capacity_receipt_body_binding(row_by_field, receipt, execution, workload, geometry, lease)
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
         match="binding_changed",
@@ -291,9 +284,7 @@ def test_receipt_serving_guard():
         importer.ProviderDirectoryArtifactBuildStale,
         match="serving_changed",
     ):
-        importer._assert_profile_capacity_receipt_serving(
-            {**receipt, "serving_generation_preflight": None}, identity
-        )
+        importer._assert_profile_capacity_receipt_serving({**receipt, "serving_generation_preflight": None}, identity)
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
         match="serving_changed",
@@ -331,23 +322,17 @@ async def test_receipt_storage_state_and_single_use_consume_guards(monkeypatch):
         importer.ProviderDirectoryArtifactBuildStale,
         match="state_changed",
     ):
-        await importer._assert_profile_capacity_receipt_state(
-            "mrf", "run-1", receipt, {"changed": True}, ISSUED_AT
-        )
+        await importer._assert_profile_capacity_receipt_state("mrf", "run-1", receipt, {"changed": True}, ISSUED_AT)
 
     status = AsyncMock(return_value="UPDATE 1")
     monkeypatch.setattr(importer.db, "status", status)
-    await importer._mark_profile_capacity_receipt_consumed(
-        "mrf", "run-1", _lease(receipt), ISSUED_AT
-    )
+    await importer._mark_profile_capacity_receipt_consumed("mrf", "run-1", _lease(receipt), ISSUED_AT)
     status.return_value = "UPDATE 0"
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
         match="consume_lost",
     ):
-        await importer._mark_profile_capacity_receipt_consumed(
-            "mrf", "run-1", _lease(receipt), ISSUED_AT
-        )
+        await importer._mark_profile_capacity_receipt_consumed("mrf", "run-1", _lease(receipt), ISSUED_AT)
 
     monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
     with pytest.raises(
@@ -374,11 +359,7 @@ async def test_locked_serving_adoption_paths(monkeypatch):
         AsyncMock(return_value=None),
     )
     bad_lease = types.SimpleNamespace(
-        signing_preflight_guard={
-            "healthcare_receipt": {
-                "serving_generation_preflight": {"resolution": "existing"}
-            }
-        }
+        signing_preflight_guard={"healthcare_receipt": {"serving_generation_preflight": {"resolution": "existing"}}}
     )
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
@@ -394,9 +375,7 @@ async def test_locked_serving_adoption_paths(monkeypatch):
     )
     good_lease = types.SimpleNamespace(
         signing_preflight_guard={
-            "healthcare_receipt": {
-                "serving_generation_preflight": {"resolution": "legacy_adoption"}
-            }
+            "healthcare_receipt": {"serving_generation_preflight": {"resolution": "legacy_adoption"}}
         }
     )
     assert await importer._locked_profile_admission_serving_state(good_lease) == adopted

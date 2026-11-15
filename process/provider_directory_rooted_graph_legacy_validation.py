@@ -5,13 +5,6 @@ import hashlib
 import json
 import re
 
-from db.migration_rooted_publication_freeze import (
-    LEGACY,
-    ORIGINAL_DIGESTS,
-    body_digest,
-    is_approved_successor,
-    original_query,
-)
 from db.plan_release_storage import storage_relation
 from process.provider_directory_dataset_scoped_publication_support import database_row_fields, schema_name
 
@@ -27,14 +20,10 @@ def require(condition):
 
 def legacy_metadata_query(body, schema):
     """Retain every original metadata predicate after authenticating its exact installed body."""
-    expected = ORIGINAL_DIGESTS[LEGACY]
-    if body_digest(body, schema) != expected:
-        require(is_approved_successor(LEGACY, schema, body, expected))
-        body = original_query(body)
     require(body.count(_CONTENT_ANCHOR) == 1)
     query = body.split(_CONTENT_ANCHOR, 1)[0]
     require(query.count("candidate_dataset_id") == 1)
-    query = re.sub(r"(?<!:):(?!:)", r"\\:", query)
+    query = re.sub(r"(?<![:\\]):(?!:)", r"\\:", query)
     return query.replace("candidate_dataset_id", ":dataset_id") + " AND header.status='published'"
 
 
@@ -46,7 +35,7 @@ async def _resource_commitment(database, dataset_id, relation):
         if cursor is not None:
             parameters_by_name.update(kind=cursor[0], identity=cursor[1])
         resources = await database.all(
-            f"SELECT tableoid::bigint AS leaf,resource_type,resource_id,payload_hash FROM {relation} "
+            f"SELECT resource_type,resource_id,payload_hash FROM {relation} "
             f"WHERE dataset_id=:dataset_id {predicate} ORDER BY resource_type,resource_id LIMIT :page_rows",
             **parameters_by_name,
         )
@@ -60,7 +49,6 @@ async def _resource_commitment(database, dataset_id, relation):
                 digest.update(b"\n")
             digest.update(json.dumps(resource_fields, ensure_ascii=False, separators=(",", ":")).encode())
             total += 1
-            leaves.add(fields["leaf"])
             cursor = resource_fields[:2]
 
 
@@ -75,11 +63,10 @@ async def _provenance_content(database, dataset_id, acquisition_id, relations):
             parameters_by_name.update(kind=cursor[0], identity=cursor[1])
         evidence = await database.all(
             f"""WITH page AS MATERIALIZED (
-                SELECT tableoid::bigint AS leaf,* FROM {provenance}
+                SELECT * FROM {provenance}
                 WHERE dataset_id=:dataset_id {predicate}
                 ORDER BY resource_type,resource_id LIMIT :page_rows)
-            SELECT p.leaf,p.resource_type,p.resource_id,r.tableoid::bigint AS raw_leaf,
-                w.tableoid::bigint AS work_leaf,
+            SELECT p.resource_type,p.resource_id,
                 p.resource_type='Practitioner' AND p.candidate_acquisition_id=:acquisition_id
                 AND s.dataset_id IS NOT NULL AND s.payload_hash=p.payload_hash
                 AND s.acquired_resource_sha256 IS NULL AND r.acquisition_id IS NOT NULL
@@ -99,9 +86,6 @@ async def _provenance_content(database, dataset_id, acquisition_id, relations):
         for entry in evidence:
             fields = database_row_fields(entry)
             require(fields["valid"] is True)
-            leaves["provenance"].add(fields["leaf"])
-            leaves["raw"].add(fields["raw_leaf"])
-            leaves["work"].add(fields["work_leaf"])
             cursor = fields["resource_type"], fields["resource_id"]
             total += 1
 
@@ -117,9 +101,9 @@ async def _raw_references(database, dataset_id, acquisition_id, relations):
             parameters_by_name.update(npi=cursor[0], identity=cursor[1])
         references = await database.all(
             f"""WITH page AS MATERIALIZED (
-                SELECT tableoid::bigint AS leaf,* FROM {raw} WHERE acquisition_id=:acquisition_id {predicate}
+                SELECT * FROM {raw} WHERE acquisition_id=:acquisition_id {predicate}
                 ORDER BY npi,resource_id LIMIT :page_rows)
-            SELECT r.leaf,r.npi,r.resource_id,w.tableoid::bigint AS work_leaf,
+            SELECT r.npi,r.resource_id,
                 w.acquisition_id IS NULL OR p.dataset_id IS NOT NULL AS valid
             FROM page r LEFT JOIN {work} w ON w.acquisition_id=r.acquisition_id
                 AND w.cohort_id=r.cohort_id AND w.npi=r.npi
@@ -135,24 +119,22 @@ async def _raw_references(database, dataset_id, acquisition_id, relations):
         for reference in references:
             fields = database_row_fields(reference)
             require(fields["valid"] is True)
-            leaves["raw"].add(fields["leaf"])
-            if fields["work_leaf"] is not None:
-                leaves["work"].add(fields["work_leaf"])
             cursor = fields["npi"], fields["resource_id"]
 
 
 async def validate_legacy_content(database, current, header):
     """Conserve source counts, DEFAULT-order digest and both original provenance directions."""
     schema = schema_name()
-    relations = tuple(
-        storage_relation(schema, name)
-        for name in (
-            "provider_directory_dataset_resource",
-            "provider_directory_uhc_flex_practitioner_dataset_resource",
-            "provider_directory_uhc_flex_practitioner_resource",
-            "provider_directory_uhc_flex_practitioner_work",
-        )
+    from process.provider_directory_source_storage_binding import dataset_source_relations
+
+    roots = (
+        "provider_directory_dataset_resource",
+        "provider_directory_uhc_flex_practitioner_dataset_resource",
+        "provider_directory_uhc_flex_practitioner_resource",
+        "provider_directory_uhc_flex_practitioner_work",
     )
+    by_root = await dataset_source_relations(database, schema, current.dataset_id, roots, canonical_roots=roots[2:])
+    relations = tuple(storage_relation(by_root[root]["schema"], by_root[root]["name"]) for root in roots)
     digest, total, leaves = await _resource_commitment(database, current.dataset_id, relations[0])
     require(digest == current.dataset_hash and total == current.resource_count)
     evidence_count, evidence_leaves = await _provenance_content(

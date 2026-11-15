@@ -10,7 +10,7 @@ import hashlib
 
 import sqlalchemy as sa
 
-from db.migration_generic_source_candidates import _COPY_GUARD_SNAPSHOT, _canonical_copy_guard_snapshot
+from db.migration_generic_source_candidates import _canonical_copy_guard_snapshot
 from db.migration_provider_directory_dataset_candidates import candidate_functions
 from db.plan_release_storage import storage_identifier, storage_relation
 
@@ -169,17 +169,3 @@ def upgrade_cms_generic_finalization_guard(connection, schema, *, expected):
             after["identity"] == before["identity"] and after["description"] == before["description"],
             "identity_changed",
         )
-
-
-async def require_cms_snapshot_allocator(connection, schema, *, expected):
-    """Compare the approved body on the existing transaction, without repairing it."""
-    from process.network_cms_registry_address_capture import NativeReceiptSession
-
-    _require(connection.is_in_transaction() and not connection.is_closed(), "transaction_required")
-    _require(await connection.fetchval("SHOW search_path") in {"pg_catalog", "pg_catalog, pg_temp"}, "search_path")
-    signature = storage_relation(schema, "prepare_pd_generic_dataset_storage") + "()"
-    observed = (
-        await NativeReceiptSession(connection).execute(_COPY_GUARD_SNAPSHOT, {"signature": signature})
-    ).one_or_none()
-    _identity(observed, expected, (bound_cms_allocator_body(schema),))
-    return expected.copy()

@@ -18,7 +18,6 @@ from process import (
 from process import provider_directory_profile_capacity_signing_receipts as receipts
 from tests import provider_directory_profile_capacity_signing_guard_builder as builder
 
-
 UTC = datetime.timezone.utc
 OBSERVED_AT = datetime.datetime(2026, 8, 10, 8, 50, tzinfo=UTC)
 ISSUED_AT = datetime.datetime(2026, 8, 10, 9, 0, tzinfo=UTC)
@@ -43,7 +42,7 @@ def receipt_material() -> tuple[dict[str, object], ...]:
 @pytest.fixture
 def guard_material() -> tuple[dict[str, object], str, str]:
     return builder.build_capacity_signing_guard(
-        capacity_geometry_hash=CAPACITY_GEOMETRY_HASH,
+        capacity_geometry_hash=None,
         observed_at=OBSERVED_AT,
         issued_at=ISSUED_AT,
         expires_at=EXPIRES_AT,
@@ -185,9 +184,7 @@ def test_preflight_expiry_and_clock_are_strict(receipt_material) -> None:
         preflight.ProviderDirectoryProfileCapacityPreflightError,
         match="clock_invalid",
     ):
-        preflight.utc_second_text(
-            datetime.datetime(2026, 8, 10, 9, 0, 0, 1, tzinfo=UTC)
-        )
+        preflight.utc_second_text(datetime.datetime(2026, 8, 10, 9, 0, 0, 1, tzinfo=UTC))
 
 
 def test_signing_guard_primitives_reject_invalid_scalars(monkeypatch) -> None:
@@ -210,10 +207,10 @@ def test_signing_guard_primitives_reject_invalid_scalars(monkeypatch) -> None:
     ("mutation", "error"),
     (
         ("interval", "storage_interval_invalid"),
-        ("tablespace", "temp_tablespace_invalid"),
-        ("volume_shape", "volumes_invalid"),
-        ("volume_order", "volume_order_invalid"),
-        ("volume_accounting", "volume_accounting_invalid"),
+        ("unknown_field", "storage_observation_invalid"),
+        ("class_shape", "volumes_invalid"),
+        ("class_order", "volume_order_invalid"),
+        ("class_accounting", "volume_accounting_invalid"),
     ),
 )
 def test_storage_receipt_rejects_invalid_capacity_coordinates(
@@ -224,15 +221,15 @@ def test_storage_receipt_rejects_invalid_capacity_coordinates(
     storage = copy.deepcopy(receipt_material[0]["storage_observation"])
     if mutation == "interval":
         storage["observed_at"] = "2026-08-10T09:01:00Z"
-    elif mutation == "tablespace":
-        storage["temp_tablespace"]["tablespace_name"] = " invalid"
-    elif mutation == "volume_shape":
-        storage["volumes"] = []
-    elif mutation == "volume_order":
-        storage["volumes"][0]["volume_class"] = "temp"
+    elif mutation == "unknown_field":
+        storage["unsupported_storage"] = {}
+    elif mutation == "class_shape":
+        storage["storage_classes"] = []
+    elif mutation == "class_order":
+        storage["storage_classes"][0]["storage_class"] = "temp"
     else:
-        storage["volumes"][0]["available_after_all_reservations_bytes"] = (
-            storage["volumes"][0]["available_bytes"] + 1
+        storage["storage_classes"][0]["available_after_all_reservations_bytes"] = (
+            storage["storage_classes"][0]["available_bytes"] + 1
         )
 
     with pytest.raises(guard_fields.ProfileCapacitySigningGuardError, match=error):
@@ -340,7 +337,7 @@ def test_capacity_signing_guard_rejects_every_replay_boundary(
     monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
     raw_guard, guard_sha256, lease_nonce = guard_material
     raw_guard = copy.deepcopy(raw_guard)
-    lease_capacity_geometry_hash = CAPACITY_GEOMETRY_HASH
+    lease_capacity_geometry_hash = raw_guard["healthcare_receipt"]["capacity_geometry_hash"]
     if mutation == "path":
         raw_guard["healthcare_preflight_path"] = "/synthetic/invalid"
     elif mutation == "digest":

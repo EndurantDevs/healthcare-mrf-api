@@ -85,7 +85,7 @@ def test_retained_reader_keeps_complete_contract_with_exact_settings_successor(n
 def _run_catalog():
     statements, _triggers = _migration_statements(_SCHEMA)
     functions = []
-    for oid, (name, spec) in enumerate(run_guards._FUNCTIONS.items(), 1000):
+    for name, spec in run_guards._FUNCTIONS.items():
         match = re.search(r"\bAS\s+(\$(?:[a-zA-Z_][a-zA-Z_0-9]*)?\$)", statements[name])
         body = statements[name][match.end() :].rsplit(match[1], 1)[0]
         functions.append(
@@ -93,7 +93,6 @@ def _run_catalog():
                 _mapping={
                     **{key: expected_value for key, expected_value in spec.items() if key != "source_sha256"},
                     **run_guards._FUNCTION_DEFAULTS,
-                    "function_oid": oid,
                     "function_name": name,
                     "function_schema": _SCHEMA,
                     "source": body,
@@ -107,10 +106,6 @@ def _run_catalog():
                 }
             )
         )
-    by_name = {
-        function_record._mapping["function_name"]: function_record._mapping["function_oid"]
-        for function_record in functions
-    }
     triggers = [
         SimpleNamespace(
             _mapping={
@@ -119,7 +114,6 @@ def _run_catalog():
                 "event_mask": kind,
                 "function_name": function,
                 "function_schema": _SCHEMA,
-                "function_oid": by_name[function],
             }
         )
         for name, (kind, function) in run_guards._TRIGGERS.items()
@@ -130,7 +124,7 @@ def _run_catalog():
 @pytest.mark.asyncio
 async def test_import_run_catalog_preserves_all_thirteen_functions_and_twelve_hooks():
     functions, triggers = _run_catalog()
-    relation_by_field = {"schema_name": _SCHEMA, "relation_oid": 11}
+    relation_by_field = {"schema_name": _SCHEMA, "relation_name": "import_run"}
     database = SimpleNamespace(all=AsyncMock(side_effect=[functions, triggers]))
     verified = await run_guards.assert_import_run_guards(database, relation_by_field)
     assert len(verified) == 25 and len(functions) == 13 and len(triggers) == 12
@@ -142,6 +136,23 @@ async def test_import_run_catalog_preserves_all_thirteen_functions_and_twelve_ho
 
 
 @pytest.mark.asyncio
+async def test_import_run_semantics_ignore_old_physical_catalog_tokens():
+    """Old physical tokens neither select the named family nor enter fresh semantic dependencies."""
+    functions, triggers = _run_catalog()
+    database = SimpleNamespace(all=AsyncMock(side_effect=[functions, triggers]))
+    named_by_field = {"schema_name": _SCHEMA, "relation_name": "import_run"}
+    expected = await run_guards.assert_import_run_guards(database, named_by_field)
+    for catalog_row in (*functions, *triggers):
+        catalog_row._mapping["function_oid"] = object()
+    prior_rows = [dict(catalog_row._mapping) for catalog_row in (*functions, *triggers)]
+    database.all = AsyncMock(side_effect=[functions, triggers])
+    assert await run_guards.assert_import_run_guards(database, {**named_by_field, "relation_oid": object()}) == expected
+    assert [dict(catalog_row._mapping) for catalog_row in (*functions, *triggers)] == prior_rows
+    assert all("function_oid" not in entry and "relation_oid" not in entry for entry in expected)
+    assert database.all.await_args_list[1].kwargs == {"schema": _SCHEMA}
+
+
+@pytest.mark.asyncio
 async def test_import_run_settings_outside_fixed_transition_stay_exact():
     functions, _triggers = _run_catalog()
     original = next(
@@ -150,4 +161,4 @@ async def test_import_run_settings_outside_fixed_transition_stay_exact():
     original._mapping["settings"] = ["search_path=pg_catalog, pg_temp"]
     database = SimpleNamespace(all=AsyncMock(return_value=functions))
     with pytest.raises(RuntimeError, match="guard_shape_changed"):
-        await run_guards.assert_import_run_guards(database, {"schema_name": _SCHEMA, "relation_oid": 11})
+        await run_guards.assert_import_run_guards(database, {"schema_name": _SCHEMA, "relation_name": "import_run"})

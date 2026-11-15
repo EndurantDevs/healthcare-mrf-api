@@ -16,6 +16,7 @@ from process import provider_directory_cms_replay as replay
 from process import provider_directory_profile_selection as selection
 from process import provider_directory_profile_selection_contract as contract
 from tests import provider_directory_profile_replay_seed as seed_support
+from tests.provider_directory_cms_capacity_test_support import cms_execution
 from tests.provider_directory_profile_capacity_trust_fixtures import capacity_trust_from_envelope
 from tests.provider_directory_profile_delta_test_support import _delta_database
 from tests.test_provider_directory_cms_serving_receipt_postgres import _migration
@@ -24,12 +25,12 @@ from tests.test_provider_directory_profile_replay_postgres import (
     _seed_committed_replay,
     importer,
 )
-from tests.test_provider_directory_profile_selection_desired import _desired, _proof
+from tests.test_provider_directory_profile_selection_desired import _proof
 
 
 def _execution(*, purge=False):
     """Use a canonical desired proof with the original seeded authority revision."""
-    payload_by_field = {**_proof(_desired(day="2026-07-30")).payload, "authority_revision": 7}
+    payload_by_field = dict(cms_execution().attestation.payload)
     if purge:
         for name in contract._DESIRED_SELECTION_FIELDS:
             payload_by_field.pop(name)
@@ -88,6 +89,8 @@ async def _common_payload(database, schema, execution):
         profile_strategy_version=execution.attestation.profile_strategy_version,
         source_vector_hash=delta_by_field["to_source_vector_hash"],
         source_context_vector_hash=delta_by_field["to_source_context_vector_hash"],
+        evidence_target={"schema_name": schema, "relation_name": "provider_directory_profile_evidence"},
+        profile_target={"schema_name": schema, "relation_name": "provider_directory_profile"},
     )
     authority_by_field = {
         "local_lineage_id": "00000000-0000-4000-8000-000000000001",
@@ -95,7 +98,7 @@ async def _common_payload(database, schema, execution):
         "origin_lineage_id": "00000000-0000-4000-8000-000000000001",
         "origin_generation": 1,
         "published_at": "2026-07-30T00:00:00+00:00",
-        "relation_oids": [1, 2, 3],
+        "relations": [{"schema_name": schema, "relation_name": "entity_address_unified"}],
     }
     pin = lambda pair: {key: pair[key] for key in replay.common._PIN_FIELDS}
     attestation = execution.attestation
@@ -118,7 +121,7 @@ async def _common_payload(database, schema, execution):
         "address": authority_by_field,
         "doctors": {**authority_by_field, "importer_id": "cms-doctors"},
         "alias_generation": 1,
-        "overlay_oid": 4,
+        "overlay": {"schema_name": schema, "relation_name": "provider_directory_address_overlay"},
     }
 
 
@@ -159,7 +162,7 @@ async def _setup(database, schema, monkeypatch, *, purge=False):
         source_vector=source_pairs,
         source_context_vector=tuple((source_id, "5" * 64) for source_id, _dataset in source_pairs),
     )
-    envelope = await _seed_committed_replay(database, schema, scenario)
+    envelope = await _seed_committed_replay(database, schema, scenario, execution=execution)
     monkeypatch.setattr(
         importer.profile_capacity_runtime,
         "configured_capacity_lease_trust",

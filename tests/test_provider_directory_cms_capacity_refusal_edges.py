@@ -26,8 +26,8 @@ async def test_prepared_layout_refusals_close_transaction_before_publication(mon
         build.selection_proof_id = "other-proof"
         reason = "prepared_manifest_profile_changed"
     elif corruption == "native-target":
-        target, name, oid = fixture.address.stage_oids[0]
-        fixture.address.stage_oids = ((target + "_foreign", name, oid), *fixture.address.stage_oids[1:])
+        target, name = fixture.address.stage_relations[0]
+        fixture.address.stage_relations = ((target + "_foreign", name), *fixture.address.stage_relations[1:])
         reason = "prepared_manifest_native_changed"
     else:
         oid = fixture.heaps["profile_stage"]["oid"]
@@ -45,7 +45,14 @@ async def test_prepared_layout_refusals_close_transaction_before_publication(mon
     assert fixture.fhir._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.get() is None
 
 
-@pytest.mark.parametrize("relations", [[], [{"oid": 7}, {"oid": 7}], [{"oid": n} for n in range(65)]])
+@pytest.mark.parametrize(
+    "relations",
+    [
+        [],
+        [{"schema": "fixture", "relation": "same"}] * 2,
+        [{"schema": "fixture", "relation": "stage_" + str(n)} for n in range(65)],
+    ],
+)
 async def test_manifest_inventory_refused_before_catalog_reads(relations):
     fhir = SimpleNamespace(_artifact_scope_relation_identities=AsyncMock())
     with pytest.raises(RuntimeError, match="prepared_manifest_inventory_invalid"):
@@ -53,20 +60,22 @@ async def test_manifest_inventory_refused_before_catalog_reads(relations):
     fhir._artifact_scope_relation_identities.assert_not_awaited()
 
 
-@pytest.mark.parametrize("corruption", ["missing", "changed-oid", "claimed-role"])
+@pytest.mark.parametrize("corruption", ["missing", "changed-name", "claimed-role"])
 def test_owned_manifest_relation_cannot_be_replaced_or_claimed_twice(corruption):
-    relation_by_field = {"oid": 7}
+    relation_by_field = {"schema": "test_schema", "relation": "owned_stage"}
     relations_by_identity = {("test_schema", "owned_stage"): relation_by_field}
     if corruption == "missing":
         relations_by_identity.clear()
-    elif corruption == "changed-oid":
-        relation_by_field["oid"] = 8
+    elif corruption == "changed-name":
+        relations_by_identity[("test_schema", "another_stage")] = relations_by_identity.pop(
+            ("test_schema", "owned_stage")
+        )
     else:
         relation_by_field["role"] = "profile"
     original_by_field = dict(relation_by_field)
     with pytest.raises(RuntimeError, match="prepared_manifest_ownership_changed"):
         preparation._manifest_relation(
-            relations_by_identity, "test_schema", "owned_stage", target="profile", role="profile", oid=7
+            relations_by_identity, "test_schema", "owned_stage", target="profile", role="profile"
         )
     assert relation_by_field == original_by_field
 

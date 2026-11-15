@@ -5,8 +5,10 @@ import asyncio
 import json
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import asdict, replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -240,25 +242,18 @@ async def test_api_default_disabled_is_none_and_never_allocates_resources(monkey
 
 
 @pytest.mark.asyncio
-async def test_api_namespace_and_actual_database_are_bound_before_installation(monkeypatch):
-    from contextlib import AsyncExitStack
-    from unittest.mock import AsyncMock
-
+async def test_api_uses_configured_registry_and_logical_bundle(monkeypatch):
     monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", "other_registry")
-    allocate = AsyncMock(side_effect=AssertionError("unexpected native resources"))
+    installed = object()
+    allocate = AsyncMock(return_value=installed)
     monkeypatch.setattr(runtime, "_build_native_bundle", allocate)
     async with AsyncExitStack() as cleanup:
         with pytest.raises(RegistryMembershipRefreshUnavailable):
             await runtime.build_registry_membership_refresh_runtime(configuration(), cleanup)
         allocate.assert_not_awaited()
         monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", "registry")
-        allocate.side_effect = None
-        allocate.return_value = SimpleNamespace(
-            inputs_service=SimpleNamespace(resources=SimpleNamespace(identity=("expected",)))
-        )
-        monkeypatch.setattr(runtime, "_api_identity", AsyncMock(return_value=("foreign",)))
-        with pytest.raises(RegistryMembershipRefreshUnavailable):
-            await runtime.build_registry_membership_refresh_runtime(configuration(), cleanup)
+        assert await runtime.build_registry_membership_refresh_runtime(configuration(), cleanup) is installed
+    allocate.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -595,24 +590,20 @@ async def test_observed_head_must_match_the_freshly_resolved_manifest(monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["database", "login"])
-async def test_source_pins_refuse_changed_execution_identity_before_acquiring_fences(monkeypatch, changed):
+async def test_source_pins_refuse_malformed_operation_before_fences(monkeypatch):
     from tests.test_registry_membership_refresh_contract import envelope
 
-    resources = SimpleNamespace(settings=runtime._settings(configuration()), identity=("original", 1))
-    monkeypatch.setattr(
-        runtime,
-        "_native_identity",
-        AsyncMock(return_value=("other", 2) if changed == "database" else resources.identity),
-    )
-    fence = AsyncMock()
-    monkeypatch.setattr(runtime, "registry_company_approval_transaction", fence)
-    connection = SimpleNamespace(fetchval=AsyncMock(return_value="other_login"))
-    with pytest.raises(RegistryMembershipRefreshUnavailable):
-        async with runtime._SourceResolver(resources, "publisher").pin_sources(connection, envelope(), None):
-            pytest.fail("changed execution identity yielded source capabilities")
-    fence.assert_not_called()
-    assert connection.fetchval.await_count == int(changed == "login")
+    resources = SimpleNamespace(settings=runtime._settings(configuration()))
+    acquire = AsyncMock()
+    monkeypatch.setattr(runtime, "registry_company_approval_transaction", acquire)
+    connection = SimpleNamespace(is_in_transaction=lambda: True, fetchval=AsyncMock())
+    malformed = envelope()
+    malformed["command"]["operation"] = "unknown"
+    with pytest.raises(ValueError):
+        async with runtime._SourceResolver(resources).pin_sources(connection, malformed, None):
+            pytest.fail("malformed operation yielded source pins")
+    acquire.assert_not_called()
+    connection.fetchval.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -652,15 +643,20 @@ async def test_specialized_office_failure_is_not_cached_as_a_known_missing_offic
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rows", [[], [("one",), ("two",)]])
-async def test_api_database_identity_requires_exactly_one_native_row(monkeypatch, rows):
-    from db.models import db
-
-    read = AsyncMock(return_value=rows)
-    monkeypatch.setattr(db, "all", read)
-    with pytest.raises(RegistryMembershipRefreshUnavailable):
-        await runtime._api_identity("registry")
-    assert read.await_args.kwargs == {"schema": "registry"}
+@pytest.mark.parametrize("failure", [PermissionError("denied"), asyncio.CancelledError()])
+async def test_configured_bundle_failure_propagates_without_identity_fallback(monkeypatch, failure):
+    monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", "registry")
+    allocate = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(runtime, "_build_native_bundle", allocate)
+    async with AsyncExitStack() as cleanup:
+        expected = (
+            asyncio.CancelledError
+            if isinstance(failure, asyncio.CancelledError)
+            else RegistryMembershipRefreshUnavailable
+        )
+        with pytest.raises(expected):
+            await runtime.build_registry_membership_refresh_runtime(configuration(), cleanup)
+    allocate.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -709,4 +705,151 @@ async def test_worker_applies_its_exact_profile_and_stricter_limits_before_insta
             build.assert_not_awaited()
         else:
             assert build.await_args.args[0].sql_limits == limits
-            assert build.await_args.args[2] == worker.consumer.execution_role
+            assert len(build.await_args.args) == 2
+
+
+@pytest.mark.asyncio
+async def test_bundle_allocates_configured_pools_without_catalog_acceptance(monkeypatch):
+    from unittest.mock import Mock
+
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
+    connect = Mock(side_effect=AssertionError("installation queried a database"))
+    monkeypatch.setattr(AsyncEngine, "connect", connect)
+    configured = configuration()
+    configured["source_profiles"] = {"generic": {"head_fence_dsn": configured["source_reader_dsn"]}}
+    async with AsyncExitStack() as cleanup:
+        bundle = await runtime._build_native_bundle(runtime._settings(configured), cleanup)
+        assert bundle.inputs_service.resources.settings.control_schema == "registry"
+        assert not hasattr(bundle.inputs_service.resources, "identity")
+        assert bundle.inputs_service.resources.readers.head_fences.generic_sessions is not None
+    connect.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "source", "address"])
+@pytest.mark.parametrize("active", [False, True])
+async def test_source_pin_compares_complete_logical_inputs_and_releases_context(monkeypatch, change, active):
+    from process import registry_membership_refresh_sources as sources
+    from tests.test_registry_membership_refresh_contract import envelope
+
+    request = envelope()
+    events = []
+    selected = SimpleNamespace(accepted_sources=tuple(request["command"]["accepted_sources"]), recipes=())
+    if change == "source":
+        selected.accepted_sources = ({**selected.accepted_sources[0], "bindings_sha256": "d" * 64},)
+    descriptor_by_field = {
+        "descriptor_sha256": "d" * 64 if change == "address" else request["command"]["address_artifact_sha256"]
+    }
+
+    @asynccontextmanager
+    async def approval(*args, **kwargs):
+        events.append("approval")
+        try:
+            yield object()
+        finally:
+            events.append("approval_release")
+
+    @asynccontextmanager
+    async def accepted(*args, **kwargs):
+        events.append("source")
+        try:
+            yield selected
+        finally:
+            events.append("source_release")
+
+    @asynccontextmanager
+    async def address():
+        yield object(), "pin", descriptor_by_field
+
+    resources = SimpleNamespace(
+        settings=runtime._settings(configuration()), fence_sessions=object(), readers=object(), address=address
+    )
+    resolver = runtime._SourceResolver(resources)
+    composed = object()
+    monkeypatch.setattr(resolver, "_composition", lambda *args: composed)
+    monkeypatch.setattr(runtime, "registry_company_approval_transaction", approval)
+    monkeypatch.setattr(sources, "pin_registry_membership_refresh_sources", accepted)
+    connection = SimpleNamespace(is_in_transaction=lambda: active, fetchrow=AsyncMock())
+    if change is None:
+        async with resolver.pin_sources(connection, request, None) as composition:
+            assert composition is composed and events == ["approval", "source"]
+    else:
+        with pytest.raises(RegistryMembershipRefreshUnavailable):
+            async with resolver.pin_sources(connection, request, None):
+                pytest.fail("changed logical input yielded")
+    assert events[-2:] == ["source_release", "approval_release"]
+    connection.fetchrow.assert_not_awaited()
+
+
+def _address_authority_row():
+    """Model the actual named publication row, without a physical relation packet."""
+    return {
+        "local_lineage_id": uuid4(),
+        "local_generation": 2,
+        "origin_lineage_id": uuid4(),
+        "origin_generation": 1,
+        "published_at": datetime(2026, 1, 1, tzinfo=UTC),
+        "relation_oids": None,
+    }
+
+
+@asynccontextmanager
+async def _address_sessions(events):
+    """Record snapshot cleanup for both yielded pins and native read failures."""
+
+    @asynccontextmanager
+    async def transaction():
+        events.append("begin")
+        try:
+            yield
+        finally:
+            events.append("transaction_closed")
+
+    session = SimpleNamespace(begin=transaction, execute=AsyncMock())
+    try:
+        yield session
+    finally:
+        events.append("session_closed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "missing", "malformed", PermissionError, asyncio.CancelledError])
+async def test_address_pin_reads_logical_publication_and_closes_snapshot(monkeypatch, failure):
+    authority_by_field = _address_authority_row()
+    if failure == "malformed":
+        authority_by_field["local_generation"] = True
+    driver = SimpleNamespace(fetchrow=AsyncMock(return_value=None if failure == "missing" else authority_by_field))
+    if isinstance(failure, type):
+        driver.fetchrow.side_effect = failure("native read failed")
+    monkeypatch.setattr(runtime, "_driver", AsyncMock(return_value=driver))
+    capture = AsyncMock(return_value={"descriptor_sha256": "a" * 64})
+    monkeypatch.setattr(runtime.address, "capture_network_address_artifact", capture)
+    events = []
+    resources = runtime._Resources(
+        runtime._settings(configuration()), None, None, lambda: _address_sessions(events), None
+    )
+    if failure is None:
+        async with resources.address() as (actual_driver, pin, descriptor):
+            assert actual_driver is driver and descriptor == capture.return_value
+            expected = runtime.address._authority_document(
+                {
+                    **authority_by_field,
+                    "local_lineage_id": str(authority_by_field["local_lineage_id"]),
+                    "origin_lineage_id": str(authority_by_field["origin_lineage_id"]),
+                    "published_at": "2026-01-01T00:00:00.000000Z",
+                }
+            )
+            assert pin == runtime.PinnedAddressSource(
+                "mrf", "entity_address_unified", runtime.address._digest(expected)
+            )
+            capture.assert_awaited_once_with(driver, pin, runtime_roles=("network_reader",))
+            assert events == ["begin"]
+    else:
+        error_type = failure if isinstance(failure, type) else runtime.address.NetworkAddressArtifactError
+        with pytest.raises(error_type):
+            async with resources.address():
+                pytest.fail("invalid address publication yielded")
+        capture.assert_not_awaited()
+    assert events == ["begin", "transaction_closed", "session_closed"]
+    assert 'FROM "mrf".entity_address_result_generation WHERE singleton IS TRUE' in driver.fetchrow.await_args.args[0]

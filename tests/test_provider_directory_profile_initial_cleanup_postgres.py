@@ -44,8 +44,10 @@ async def _signed_failed_initial(database, monkeypatch, *, fault=None):
     match fault:
         case "signature":
             consumed["signature"] = "A" * 86
-        case "database":
-            consumed["database_oid"] += 1
+        case "runtime":
+            body = cleanup.json.loads(consumed["canonical_lease_json"])
+            body["runtime"]["healthcare_source_commit"] = "0" * 40
+            consumed["canonical_lease_json"] = cleanup.canonical(body)
         case "source":
             consumed["source_vector_hash"] = "ff" * 32
         case "owner":
@@ -166,7 +168,7 @@ async def test_native_vacuum_size_drift_uses_expired_original_and_fresh_cleanup(
         ("missing", "replay_consumption_missing"),
         ("owner", "replay_consumption_missing"),
         ("signature", "replay_capacity_invalid"),
-        ("database", "replay_capacity_consumption_changed"),
+        ("runtime", "replay_capacity_invalid"),
         ("geometry", "replay_capacity_invalid"),
         ("source", "replay_capacity_consumption_changed"),
     ],
@@ -220,6 +222,18 @@ async def test_native_size_exception_keeps_live_target_guards(monkeypatch, fault
     async with admission_database(monkeypatch) as database:
         names, original, _consumed = await _signed_failed_initial(database, monkeypatch)
         await _vacuum_and_assert_size_only(database, original)
+        if fault == "layout":
+            await database.status("ALTER TABLE mrf.provider_directory_profile RENAME TO copied_profile_predecessor")
+            await database.status(
+                "CREATE TABLE mrf.provider_directory_profile (LIKE mrf.copied_profile_predecessor INCLUDING ALL)"
+            )
+            await database.status(
+                "INSERT INTO mrf.provider_directory_profile SELECT * FROM mrf.copied_profile_predecessor"
+            )
+            assert await database.scalar(
+                "SELECT NOT EXISTS((SELECT * FROM mrf.provider_directory_profile EXCEPT ALL SELECT * FROM mrf.copied_profile_predecessor) UNION ALL (SELECT * FROM mrf.copied_profile_predecessor EXCEPT ALL SELECT * FROM mrf.provider_directory_profile))"
+            )
+            await initial.capture_targets(fhir, "mrf")
         envelope, trust = await common._fresh_fixture_authorization(database)
         if fault == "layout":
             await database.status("ALTER TABLE mrf.provider_directory_profile ADD COLUMN unexpected integer")

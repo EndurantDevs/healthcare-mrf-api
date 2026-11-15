@@ -97,15 +97,15 @@ async def test_unregistered_family_precreates_ordinary_heaps_with_exact_identity
 
 
 @pytest.mark.asyncio
-async def test_identity_is_opt_in_and_its_oid_is_reverified(scoped_family_fixture):
+async def test_identity_is_opt_in_and_verification_returns_the_current_sequence(scoped_family_fixture):
     spec, ownership, catalog, session = scoped_family_fixture
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="sequence set"):
         await archive.capture_model_family_stage_ownership(session, spec, ownership.dataset_id)
     catalog.sequences.assert_awaited_with(session, ownership.schema_oid, include_identity=False)
     catalog.sequences.return_value = (("synthetic_parent_id_seq", 999, "synthetic_parent", "id"),)
     catalog.namespace.return_value[-2]["oid"] = 999
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="ownership differs"):
-        await archive.verify_model_family_stage_ownership(session, spec, ownership, include_identity=True)
+    observed = await archive.verify_model_family_stage_ownership(session, spec, ownership, include_identity=True)
+    assert observed == replace(ownership, sequence_oids=catalog.sequences.return_value)
 
 
 @pytest.mark.asyncio
@@ -151,7 +151,7 @@ async def test_ptg_completion_preserves_custody_errors_and_native_relationship_f
             await binding.complete_local_data_family(session, ownership)
         assert session.execute.await_count
     else:
-        token = object() if failure == "invalid" else replace(ownership, schema_oid=999)
+        token = object() if failure == "invalid" else replace(ownership, importer_id="synthetic-other")
         message = "ownership is invalid" if failure == "invalid" else "ownership changed"
         with pytest.raises(binding.PTG2PhysicalBindingError, match=message):
             await binding.complete_local_data_family(session, token)
@@ -160,17 +160,15 @@ async def test_ptg_completion_preserves_custody_errors_and_native_relationship_f
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ("verify", "complete", "cleanup"))
-@pytest.mark.parametrize("mismatch", ("schema", "relation", "sequence", "scope", "incomplete"))
-async def test_mismatched_stage_ownership_refuses_before_completion_or_cleanup_ddl(
+@pytest.mark.parametrize("mismatch", ("scope", "incomplete", "sequence"))
+async def test_mismatched_stage_declaration_refuses_before_completion_or_cleanup_ddl(
     scoped_family_fixture, operation, mismatch
 ):
     spec, ownership, _catalog, session = scoped_family_fixture
     ownership_by_mismatch = {
-        "schema": {"schema_oid": 999},
-        "relation": {"relation_oids": (("synthetic_child", 999), ("synthetic_parent", 102))},
-        "sequence": {"sequence_oids": (("synthetic_parent_id_seq", 999, "synthetic_parent", "id"),)},
         "scope": {"importer_id": "synthetic-other"},
         "incomplete": {"relation_oids": (("synthetic_child", 101),)},
+        "sequence": {"sequence_oids": (("synthetic_other_id_seq", 103, "synthetic_parent", "id"),)},
     }
     session.scalar.return_value = ownership.schema_oid
     function = {
@@ -178,7 +176,7 @@ async def test_mismatched_stage_ownership_refuses_before_completion_or_cleanup_d
         "complete": archive.complete_model_family_stage,
         "cleanup": archive.cleanup_model_family_stage,
     }[operation]
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="ownership differs"):
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="stage (declaration|ownership) differs"):
         await function(session, spec, replace(ownership, **ownership_by_mismatch[mismatch]), include_identity=True)
     session.execute.assert_not_awaited()
 
@@ -209,11 +207,11 @@ async def test_cleanup_locks_exact_family_and_uses_restrict_without_cascade(scop
     spec, ownership, catalog, session = scoped_family_fixture
     session.scalar.side_effect = (ownership.schema_oid, 0)
     await archive.cleanup_model_family_stage(session, spec, ownership, include_identity=True)
-    catalog.lock.assert_awaited_once_with(
-        session, ownership.schema_name, spec.archive_names, "ACCESS EXCLUSIVE", nowait=True
-    )
+    # A sealed owner keeps SELECT only, so DROP takes its own lock within a bounded wait.
+    catalog.lock.assert_not_awaited()
     catalog.sequences.assert_awaited_once_with(session, ownership.schema_oid, include_identity=True)
     assert _statements(session) == [
+        "SET LOCAL lock_timeout='1s'",
         f'DROP TABLE "{ownership.schema_name}"."synthetic_child", "{ownership.schema_name}"."synthetic_parent" RESTRICT',
         f'DROP SCHEMA "{ownership.schema_name}"',
     ]

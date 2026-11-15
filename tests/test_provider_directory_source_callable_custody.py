@@ -261,7 +261,7 @@ def test_all_fixed_native_signatures_and_output_modes(monkeypatch):
         custody._require_definition(
             _entry(key), specification, "sample", 201, dict(custody._TYPE_OIDS, **{"@work": "301"}), "sample"
         )
-    assert len(custody._CONTRACTS) == 87
+    assert len(custody._CONTRACTS) == 86
     assert set(key for key in custody._CONTRACTS if key.startswith("ptg_wave_canonical_json_ascii_v1(")) == {
         "ptg_wave_canonical_json_ascii_v1(json)",
         "ptg_wave_canonical_json_ascii_v1(jsonb)",
@@ -647,3 +647,12 @@ async def test_metadata_public_helper_direct_pin_grant_refuses(metadata_catalog)
     entry["acl"].append([106, 101, "EXECUTE", False])
     with pytest.raises(ValueError, match="acl_changed"):
         await _metadata_capability(metadata_catalog)
+
+
+def test_current_callable_roster_omits_retired_plan_owner_hook():
+    signature = "guard_pd_dataset_migration_owner()"
+    assert signature not in custody._GUARD_BODIES
+    assert signature not in custody._CONTRACTS
+    assert not any(
+        "guard_pd_dataset_migration_owner" in entry for entry in custody.source_callable_signatures("source_schema")
+    )

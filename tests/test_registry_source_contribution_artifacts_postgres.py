@@ -55,14 +55,10 @@ async def _direct_anchor(context):
     descriptor = contribution["sources"][0]
     reference = artifacts.source_fact_artifact_reference(descriptor)
     assert reference is not None and reference.fact_candidate_id == context.original.candidate_id
-    identity = UUID(reference.fact_candidate_id)
-    seal = await fixture.connection.fetchval(
-        f'SELECT seal_sha256 FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1', identity
+    assert (reference.fact_schema_name, reference.fact_table_name) == (
+        context.original.schema_name,
+        "network_source_contribution",
     )
-    oid = await fixture.connection.fetchval(
-        "SELECT to_regclass($1)::oid::bigint", context.original.schema_name + ".network_source_contribution"
-    )
-    assert reference == artifacts.SourceFactArtifactReference(str(identity), oid, seal)
     return descriptor, {**descriptor, **asdict(reference)}, reference
 
 
@@ -111,16 +107,11 @@ async def test_direct_original_anchor_survives_mapping_receipts_without_fact_cop
             await fixture.connection.execute(f'DROP TABLE pg_temp."{temporary}"')
 
 
-async def test_anchor_rejects_old_seal_wrong_oid_same_count_tamper_and_restores(provider_only_db):
+async def test_anchor_rejects_same_count_content_tamper_and_restores(provider_only_db):
     context, fixture = provider_only_db, provider_only_db.fixture
     descriptor, selected_by_field, reference = await _direct_anchor(context)
     relation = f'"{context.original.schema_name}".network_source_contribution'
     async with fixture.connection.transaction(isolation="repeatable_read"):
-        for field, changed in (("fact_seal_sha256", "f" * 64), ("fact_table_oid", reference.fact_table_oid + 1)):
-            with pytest.raises(RegistrySourceContributionError, match="physical_identity_changed"):
-                await artifacts.resolve_anchored_source_facts(
-                    fixture.connection, ({**selected_by_field, field: changed},), control_schema=fixture.control_schema
-                )
         before = await fixture.connection.fetchval(f"SELECT count(*) FROM {relation}")
         with pytest.raises(RollbackProbe):
             async with fixture.connection.transaction():

@@ -228,13 +228,19 @@ async def test_recovery_refuses_protected_or_referenced_relations(
     referenced,
 ):
     """Serving and checkpoint identities can never be reclaimed as residue."""
-    admission = _wal_tracker_admission()
+    admission = SimpleNamespace(
+        geometry=SimpleNamespace(
+            relations={
+                "evidence_target": {"schema": "mrf", "name": "current_evidence"},
+            }
+        )
+    )
     if referenced:
-        relation_oids = [999_999]
+        relation_names = ["old_candidate"]
         error = "scope_referenced"
     else:
-        relation_oids = [admission.geometry.evidence_target_oid]
-        error = "protected_oid"
+        relation_names = ["current_evidence"]
+        error = "protected_relation"
     monkeypatch.setattr(
         importer,
         "_is_artifact_scope_recovery_referenced",
@@ -246,7 +252,7 @@ async def test_recovery_refuses_protected_or_referenced_relations(
     ):
         await importer._assert_artifact_scope_recovery_unreferenced(
             "mrf",
-            relation_oids,
+            relation_names,
             admission,
         )
 
@@ -272,9 +278,9 @@ def test_recovery_identity_requires_exact_unlogged_heap(observed):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["structure", "tablespace", "indexes"])
-async def test_recovery_layout_refuses_structure_or_tablespace_drift(monkeypatch, drift):
-    """Takeover requires structural identity in the admitted tablespace."""
+@pytest.mark.parametrize("drift", ["structure", "columns", "indexes"])
+async def test_recovery_layout_refuses_structure_or_index_drift(monkeypatch, drift):
+    """Takeover requires complete portable layout and an empty destination index phase."""
     admission = _wal_tracker_admission()
     coordinate = importer._ArtifactScopeRecoveryCoordinate(
         base_table_name="provider_directory_source",
@@ -284,21 +290,18 @@ async def test_recovery_layout_refuses_structure_or_tablespace_drift(monkeypatch
     monkeypatch.setattr(
         importer,
         "_artifact_scope_relation_identities",
-        AsyncMock(return_value={"current": (22, "r", "u")}),
+        AsyncMock(return_value={"current": ("current", "r", "u")}),
     )
-    expected_tablespace = admission.geometry.tablespace_oid
+    prior_heap_by_field = {"columns": [{"name": "source_id", "type": "text"}], "constraints": []}
+    current_heap_by_field = dict(prior_heap_by_field)
+    if drift == "structure":
+        current_heap_by_field["constraints"] = [{"type": "c", "definition": "CHECK (false)"}]
+    if drift == "columns":
+        current_heap_by_field["columns"] = [{"name": "source_id", "type": "bigint"}]
     fingerprint = AsyncMock(
         side_effect=(
-            (SimpleNamespace(effective_tablespace_oids=(expected_tablespace,)), "prior"),
-            (
-                SimpleNamespace(
-                    main_index_oids=(31,) if drift == "indexes" else (),
-                    effective_tablespace_oids=(
-                        expected_tablespace + 1 if drift == "tablespace" else expected_tablespace,
-                    ),
-                ),
-                "current" if drift == "structure" else "prior",
-            ),
+            ((), prior_heap_by_field),
+            (("current_pkey",) if drift == "indexes" else (), current_heap_by_field),
         )
     )
     monkeypatch.setattr(importer, "_artifact_scope_recovery_heap_fingerprint", fingerprint)
@@ -309,7 +312,7 @@ async def test_recovery_layout_refuses_structure_or_tablespace_drift(monkeypatch
         await importer._assert_artifact_scope_recovery_layouts(
             "mrf",
             (coordinate,),
-            {"prior": (11, "r", "u")},
+            {"prior": ("prior", "r", "u")},
             admission,
         )
 

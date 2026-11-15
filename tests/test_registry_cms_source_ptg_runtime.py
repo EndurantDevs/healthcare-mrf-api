@@ -107,8 +107,6 @@ async def test_mixed_attempt_dispatches_real_adapter_after_snapshot_and_keeps_ra
         configured = generic_worker._ptg_runtime(parsed(), stack)
         config = replace(configured, coordinates=notice.pair.recipe.binding_coordinates)
         runtime = config.composition_runtime
-        identity = AsyncMock()
-        monkeypatch.setattr(adapter.RegistryPublicationPTGRuntime, "_same_execution_database", identity)
         factory_calls = []
 
         async def compose(sessions, **arguments):
@@ -143,7 +141,6 @@ async def test_mixed_attempt_dispatches_real_adapter_after_snapshot_and_keeps_ra
             connection, notice, consumer._event(notice, config), config, "endpoint-one"
         )
         assert publication["state"] == "completed" and not connection.active and len(factory_calls) == 1
-        identity.assert_awaited_once_with(connection, config.control_schema)
         connection.active = True
         with pytest.raises(ValueError, match="registry_publication_ptg_runtime_invalid"):
             await runtime.compose(
@@ -151,7 +148,6 @@ async def test_mixed_attempt_dispatches_real_adapter_after_snapshot_and_keeps_ra
                 address_sources=RegistryCompositionAddressSources(notice.pair.address_source),
                 control_schema=config.control_schema,
             )
-        identity.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -181,6 +177,11 @@ async def test_worker_qualifies_genuine_execution_factory_and_disposes_it_after_
     actual_listen = worker.event.listen
     events, options, _verify, sessions = worker_support.resources(monkeypatch)
     reader_listen = worker.event.listen
+
+    async def configured_runtime(config, stack):
+        return generic_worker._ptg_runtime(config, stack)
+
+    monkeypatch.setattr(worker, "_configured_worker_runtime", configured_runtime)
 
     def listen(target, name, callback, **options):
         if target is worker_support.Engine.sync_engine:
@@ -292,16 +293,17 @@ async def test_worker_refuses_external_runtime_before_owning_resources():
 
 @pytest.mark.asyncio
 async def test_runtime_identity_refusal_has_no_raw_composer_fallback(monkeypatch):
+    """A configured composition refusal cannot fall back to raw candidate writes."""
     connection, notice, _retained_ptg, _pin = _attempt_inputs(monkeypatch)
     async with AsyncExitStack() as stack:
         config = generic_worker._ptg_runtime(parsed(), stack)
         config = replace(config, coordinates=notice.pair.recipe.binding_coordinates)
-        identity = AsyncMock(side_effect=ValueError("registry_publication_ptg_execution_changed"))
+        compose = AsyncMock(side_effect=ValueError("registry_composition_source_changed"))
         raw_compose, prepare = AsyncMock(), AsyncMock()
-        monkeypatch.setattr(adapter.RegistryPublicationPTGRuntime, "_same_execution_database", identity)
+        monkeypatch.setattr(adapter, "compose_registry_membership_candidate", compose)
         monkeypatch.setattr(consumer, "compose_registry_membership_candidate", raw_compose)
         monkeypatch.setattr(consumer, "prepare_registry_candidate_for_context", prepare)
-        with pytest.raises(ValueError, match="registry_publication_ptg_execution_changed"):
+        with pytest.raises(ValueError, match="registry_composition_source_changed"):
             await consumer._attempt(connection, notice, consumer._event(notice, config), config, "endpoint-one")
         assert not connection.active
         raw_compose.assert_not_awaited()

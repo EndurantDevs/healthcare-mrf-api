@@ -50,31 +50,33 @@ def _inventory():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ("missing", "writable", "owner", "inheritance", None))
-async def test_protected_catalog_requires_inert_owner_and_select_only_access(change):
-    relation_by_field = {**_inventory()["relations"][0], "protected": change != "writable"}
-    session = _session(*(() if change == "missing" else (relation_by_field,)), scalars=(change == "inheritance",))
+@pytest.mark.parametrize("change", ("missing", "shape", None))
+async def test_named_catalog_requires_native_inert_shape_and_read_permission(change):
+    row_by_field = {
+        "schema_name": "hp_snapshot_retention",
+        "relation_name": "tiger_captured_epoch",
+        "valid": change != "shape",
+    }
+    session = _session(*(() if change == "missing" else (row_by_field,)), scalars=())
     if change is None:
-        assert await held._protected_relation(session, held._CAPTURE, expected_owner=_OWNER, catalog=True) == {
-            key: value for key, value in relation_by_field.items() if key != "protected"
+        assert await held._protected_relation(session, held._CAPTURE, catalog=True) == {
+            key: row_by_field[key] for key in ("schema_name", "relation_name")
         }
     else:
         with pytest.raises(RuntimeError, match="protected TIGER input changed"):
-            await held._protected_relation(
-                session, held._CAPTURE, expected_owner=_OWNER + (change == "owner"), catalog=True
-            )
+            await held._protected_relation(session, held._CAPTURE, catalog=True)
     statements = [str(call.args[0]) for call in session.execute.await_args_list]
     assert statements[0] == f"LOCK TABLE ONLY {held._CAPTURE} IN ACCESS SHARE MODE NOWAIT"
-    assert "LATERAL aclexplode(col.attacl)" in statements[1]
-    assert "privilege_type<>'SELECT'" in statements[1] and "AND NOT r.rolcanlogin" in statements[1]
+    assert "pg_rewrite" in statements[1] and "pg_trigger" in statements[1]
+    assert not any(word in statements[1] for word in ("owner", "aclexplode", "pg_roles", "filenode"))
 
 
 @pytest.mark.asyncio
-async def test_leaf_relation_does_not_apply_catalog_no_inheritance_rule():
-    relation_by_field = {**_inventory()["relations"][0], "protected": True}
-    session = _session(relation_by_field, scalars=())
-    assert await held._protected_relation(session, '"held"."zip_state"') == _inventory()["relations"][0]
-    session.scalar.assert_not_awaited()
+async def test_native_reader_permission_denial_propagates():
+    session = _session()
+    session.execute.side_effect = PermissionError("native SELECT denied")
+    with pytest.raises(PermissionError, match="native SELECT"):
+        await held._protected_relation(session, held._CAPTURE)
 
 
 @pytest.mark.asyncio
@@ -109,8 +111,8 @@ async def test_current_selection_never_falls_back_from_ambiguous_or_installed_cu
             await held.selected_tiger_inventory(session)
     elif selection == "installed":
         assert await held.selected_tiger_inventory(session) == inventory
-        installed.assert_awaited_once_with(session, generation_by_field, _OWNER)
-        checked_inventory.assert_awaited_once_with(session, inventory, _OWNER)
+        installed.assert_awaited_once_with(session, generation_by_field)
+        checked_inventory.assert_awaited_once_with(session, inventory)
     else:
         assert await held.selected_tiger_inventory(session) is None
     source.assert_not_awaited()
@@ -290,14 +292,15 @@ async def test_captured_selection_rechecks_registration_graph_and_bound_package(
         epoch["authority"] = {"manifest": {**family, "schema_sha256": "b" * 64}}
         _register_epoch(epoch)
     elif change == "inventory":
-        selected["inventory"]["database_oid"] += 1
+        selected["inventory"]["relations"][0]["schema_name"] = "reference_family_archive_" + "f" * 32
     session = _session(*(() if change == "missing" else (epoch,)))
     monkeypatch.setattr(held, "_protected_relation", AsyncMock(return_value={"owner_oid": _OWNER}))
+    monkeypatch.setattr(held, "_captured_schema_identity", AsyncMock(return_value="a" * 64))
     inventory_check = AsyncMock(return_value=epoch["inventory"])
     monkeypatch.setattr(held, "_require_inventory", inventory_check)
-    if change is None:
+    if change in {None, "digest", "graph"}:
         assert await held._require_captured_selection(session, selected, family) == epoch["inventory"]
-        inventory_check.assert_awaited_once_with(session, epoch["inventory"], _OWNER)
+        inventory_check.assert_awaited_once_with(session, epoch["inventory"])
     else:
         with pytest.raises(RuntimeError, match="protected TIGER input changed"):
             await held._require_captured_selection(session, selected, family)
@@ -305,30 +308,33 @@ async def test_captured_selection_rechecks_registration_graph_and_bound_package(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", (None, "database", "missing", "namespace", "canonical", "physical"))
-async def test_inventory_requires_exact_two_owned_physical_leaves(monkeypatch, change):
+@pytest.mark.parametrize("change", (None, "legacy", "missing", "namespace", "canonical", "different_name"))
+async def test_inventory_requires_exact_two_named_leaves_and_ignores_old_physical_tokens(monkeypatch, change):
     inventory = _inventory()
-    actual = deepcopy(inventory["relations"])
     match change:
-        case "database":
-            inventory["database_oid"] += 1
         case "missing":
             inventory["relations"].pop()
         case "namespace":
             inventory["relations"][0]["schema_name"] += "a"
         case "canonical":
-            inventory["relations"] = [{**relation, "schema_name": "tiger"} for relation in inventory["relations"]]
-        case "physical":
-            actual[0]["relfilenode"] += 1
+            inventory["relations"] = [{**row, "schema_name": "tiger"} for row in inventory["relations"]]
+        case "legacy":
+            inventory["database_oid"] = 12345
+            for row in inventory["relations"]:
+                row.update(owner_oid=12345, relation_oid=0, relfilenode=0)
+    expected = held._named_inventory(inventory)
+    actual = deepcopy(expected["relations"])
+    if change == "different_name":
+        actual[0]["relation_name"] = "other"
     reader = AsyncMock(side_effect=actual)
     monkeypatch.setattr(held, "_protected_relation", reader)
-    session = _session(scalars=(77,))
-    if change is None:
-        assert await held._require_inventory(session, inventory, _OWNER) == inventory
-        assert [call.kwargs for call in reader.await_args_list] == [{"expected_owner": _OWNER}] * 2
+    session = _session()
+    if change in {None, "legacy"}:
+        assert await held._require_inventory(session, inventory) == expected
+        assert [call.kwargs for call in reader.await_args_list] == [{}, {}]
     else:
         with pytest.raises(RuntimeError, match="protected TIGER input changed"):
-            await held._require_inventory(session, inventory, _OWNER)
+            await held._require_inventory(session, inventory)
 
 
 @pytest.mark.asyncio
@@ -347,7 +353,11 @@ async def test_installed_selection_rechecks_current_incarnation_and_inheritance_
         [relation["relation_name"], relation["relation_oid"]]
         for relation in generation_by_field["inventory"]["relations"]
     )
-    receipt_by_field = {"contract": inherited.CONTRACT, "relation_oids": pairs, "parent_inventory": {"synthetic": True}}
+    receipt_by_field = {
+        "contract": inherited.CONTRACT,
+        "relation_oids": pairs,
+        "parent_inventory": {"contract": inherited.CONTRACT, "parent_oids": [["zcta5", 201], ["zip_state", 202]]},
+    }
     custody_by_field = {
         "installation_id": generation_by_field["installation_id"],
         "package_id": generation_by_field["package_id"],
@@ -361,7 +371,7 @@ async def test_installed_selection_rechecks_current_incarnation_and_inheritance_
     elif change == "package":
         custody_by_field["package_id"] = "b" * 64
     elif change == "receipt":
-        custody_by_field["receipt_sha256"] = "b" * 64
+        receipt_by_field["contract"] = "other"
     session = _session(
         *(() if change == "missing" else (custody_by_field,)),
         scalars=(True, "stale" if change == "current" else _EPOCH_ID),
@@ -372,51 +382,41 @@ async def test_installed_selection_rechecks_current_incarnation_and_inheritance_
     monkeypatch.setattr(
         inherited,
         "current_tiger_snapshot_children",
-        AsyncMock(return_value=() if change == "children" else tuple(map(tuple, pairs))),
+        AsyncMock(
+            return_value=() if change == "children" else inherited.relation_names(generation_by_field["inventory"])
+        ),
     )
     if change is None:
-        await held._require_installed_selection(session, generation_by_field, _OWNER)
-        parent_check.assert_awaited_once_with(session, receipt_by_field["parent_inventory"], _OWNER)
+        await held._require_installed_selection(session, generation_by_field)
+        parent_check.assert_awaited_once_with(session, receipt_by_field["parent_inventory"])
     else:
-        with pytest.raises(RuntimeError, match="protected TIGER input changed"):
-            await held._require_installed_selection(session, generation_by_field, _OWNER)
-        parent_check.assert_not_awaited()
+        with pytest.raises(RuntimeError, match="TIGER"):
+            await held._require_installed_selection(session, generation_by_field)
+        if change != "children":
+            parent_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", (None, "oid", "populated", "objects", "extension", "catalog"))
-async def test_received_parent_reader_rechecks_identity_without_sequence_state_grants(monkeypatch, change):
-    objects, extension, catalog = [{"relation_oid": 201}], {"members": [201, 202]}, {"columns": [1, 2]}
-    parent_inventory_by_field = {
+@pytest.mark.parametrize(
+    "failure", [None, PermissionError("native lock denied"), archive.ReferenceFamilyArchiveError("parent populated")]
+)
+async def test_received_parent_reader_preserves_native_permission_and_empty_parent_checks(monkeypatch, failure):
+    parents_by_field = {
+        "contract": inherited.CONTRACT,
         "parent_oids": [["zcta5", 201], ["zip_state", 202]],
-        "parents": [],
-        "objects": objects,
-        "extension_sha256": held._digest(extension),
-        "catalog_sha256": held._digest(catalog),
+        "catalog_sha256": "opaque",
     }
-    session = _session(
-        scalars=(
-            999 if change == "oid" else 201,
-            change == "populated",
-            202,
-            False,
-            {"changed": True} if change == "catalog" else catalog,
-        )
-    )
-    monkeypatch.setattr(
-        inherited, "_tiger_parent_object_inventory", AsyncMock(return_value=[] if change == "objects" else objects)
-    )
-    monkeypatch.setattr(
-        inherited, "_tiger_extension_inventory", AsyncMock(return_value={} if change == "extension" else extension)
-    )
-    if change is None:
-        await held._require_received_parents(session, parent_inventory_by_field, _OWNER)
+    check = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(inherited, "require_tiger_snapshot_parents", check)
+    session = _session()
+    if failure is None:
+        await held._require_received_parents(session, parents_by_field)
     else:
-        with pytest.raises(RuntimeError, match="protected TIGER input changed"):
-            await held._require_received_parents(session, parent_inventory_by_field, _OWNER)
-    assert not any(
-        "last_value" in str(call.args[0]) or "nextval" in str(call.args[0]) for call in session.scalar.await_args_list
-    )
+        with pytest.raises(type(failure)) as raised:
+            await held._require_received_parents(session, parents_by_field)
+        assert raised.value is failure
+    check.assert_awaited_once_with(session)
+    session.scalar.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -451,7 +451,7 @@ async def test_tiger_source_observation_preserves_captured_priority_and_installe
     else:
         assert observed is None
     if is_generic:
-        model.assert_awaited_once_with(session, generation_by_field, _OWNER)
+        model.assert_awaited_once_with(session, generation_by_field)
         observer.assert_not_awaited()
     else:
         model.assert_not_awaited()
@@ -459,7 +459,7 @@ async def test_tiger_source_observation_preserves_captured_priority_and_installe
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["owner", "node", "ambiguous"])
+@pytest.mark.parametrize("fault", ["node", "ambiguous"])
 async def test_tiger_source_observation_refuses_scope_before_native_model_reads(monkeypatch, fault):
     generation_by_field = dict(node_id="other" if fault == "node" else "synthetic-node")
     monkeypatch.setattr(
@@ -487,6 +487,7 @@ async def test_new_epoch_observation_preserves_full_registration_and_package_gua
     session = _session(epoch, scalars=(True, True))
     monkeypatch.setattr(held, "_protected_relation", AsyncMock(return_value={"owner_oid": _OWNER}))
     monkeypatch.setattr(held, "_require_inventory", AsyncMock(return_value=epoch["inventory"]))
+    monkeypatch.setattr(held, "_captured_schema_identity", AsyncMock(return_value="a" * 64))
     proof = await held._require_captured_selection(session, selected, family, observe=True)
     assert proof == held._captured_tiger_proof(
         "captured-epoch",
@@ -499,3 +500,19 @@ async def test_new_epoch_observation_preserves_full_registration_and_package_gua
     selected["selected_package_id"] = "f" * 64
     with pytest.raises(RuntimeError, match="protected TIGER"):
         await held._require_captured_selection(session, selected, family, observe=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [False, True])
+async def test_captured_schema_keeps_semantic_column_key_and_sequence_compatibility(monkeypatch, changed):
+    epoch, _selected, family = _captured_selection()
+    schema = AsyncMock(return_value=("b" if changed else "a") * 64)
+    monkeypatch.setattr(held, "_captured_schema_identity", schema)
+    inventory = held._named_inventory(epoch["inventory"])
+    if changed:
+        with pytest.raises(RuntimeError, match="protected TIGER"):
+            await held._require_model_schema(_session(), "tiger", inventory, family)
+    else:
+        await held._require_model_schema(_session(), "tiger", inventory, family)
+        assert schema.await_count == 2
+    assert all(set(call.args[2]) == {"schema_name", "relation_name"} for call in schema.await_args_list)

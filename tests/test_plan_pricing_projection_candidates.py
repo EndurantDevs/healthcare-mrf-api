@@ -3,6 +3,7 @@
 
 import json
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -20,18 +21,23 @@ from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
 
 
 def candidate_inputs():
-    """Return synthetic identities, not a native custody or authorization fixture."""
+    """Return named inputs and synthetic portable family publications."""
     inputs = contract.ProjectionCandidateInputs(
         (PTG2CandidateAuditAccess("candidate-snapshot", "source", "plan", "group"),),
         tuple(
-            (role, f"candidate_{index}", role.split(".")[-1], index + 10, index + 100)
+            (role, contract.SCHEMA if role == "entity_address_unified" else f"candidate_{index}", role.split(".")[-1])
             for index, role in enumerate(contract._CANDIDATE_PROVIDER_RELATIONS)
+        ),
+        provider_generations=tuple(
+            (family, f"00000000-0000-0000-0000-{index + 1:012d}", index + 1)
+            for index, family in enumerate(contract._PROVIDER_GENERATIONS)
         ),
     )
     geo = EntityAddressGeoAssurancePreparation(
-        next(entry[3] for entry in inputs.relations if entry[0] == "entity_address_unified"),
+        None,
         5,
-        tuple((name, entry["relation_oid"], entry["relfilenode"]) for name, entry in inputs.geo_bindings().items()),
+        tuple((name, entry["schema_name"], entry["table_name"]) for name, entry in inputs.geo_bindings().items()),
+        stage_relation=(contract.SCHEMA, "entity_address_unified"),
     )
     return replace(inputs, geo_preparation=geo)
 
@@ -69,9 +75,7 @@ class _Result:
 
 def provider_session(inputs, *, change=None):
     statements = []
-    signature_by_relation = {
-        name: [entry["relation_oid"], entry["relfilenode"]] for name, entry in inputs.geo_bindings().items()
-    }
+    signature_by_relation = {name: [schema, table] for name, schema, table in inputs.geo_preparation.relation_signature}
     state_by_field = {
         "candidate_geo_assurance_version": 1,
         "candidate_table_oid": inputs.geo_preparation.stage_table_oid,
@@ -82,7 +86,7 @@ def provider_session(inputs, *, change=None):
         "bindings_match": True,
     }
     if change == "geo-state":
-        state_by_field["candidate_table_oid"] += 1
+        state_by_field["candidate_projected_rows"] += 1
 
     async def execute(statement, parameters=None):
         sql = str(statement)
@@ -95,15 +99,10 @@ def provider_session(inputs, *, change=None):
         if "geo_assurance_state" in sql:
             return _Result(row=state_by_field)
         if "jsonb_build_object" in sql:
-            identity_by_role = {entry[0]: list(entry[3:]) for entry in inputs.relations}
             identity_by_field = {
-                "npi": identity_by_role["npi"],
-                "taxonomy": identity_by_role["npi_taxonomy"],
-                "vocabulary": identity_by_role["nucc_taxonomy"],
-                "address": identity_by_role["entity_address_unified"],
-                "address_evidence": identity_by_role["entity_address_evidence"]
-                + identity_by_role["entity_address_unified"],
-                "zip": identity_by_role["geo_zip_lookup"],
+                "contract": contract._PROVIDER_SIGNATURE_CONTRACT,
+                "generations": json.loads(parameters["candidate_generations"]),
+                "relations_available": True,
                 "geo_assurance": json.loads(parameters["candidate_geo"]),
                 "geo_assurance_ready": True,
             }
@@ -113,18 +112,18 @@ def provider_session(inputs, *, change=None):
     return SimpleNamespace(execute=AsyncMock(side_effect=execute), in_transaction=lambda: True, statements=statements)
 
 
-@pytest.mark.parametrize("change", ["partial", "duplicate", "identifier", "oid", "untrusted-access"])
-def test_candidate_inputs_refuse_open_or_ambiguous_physical_scope(change):
+@pytest.mark.parametrize("change", ["partial", "duplicate", "identifier", "tuple", "untrusted-access"])
+def test_candidate_inputs_refuse_open_or_ambiguous_named_scope(change):
     inputs = candidate_inputs()
     relations = list(inputs.relations)
     if change == "partial":
         relations.pop()
     elif change == "duplicate":
-        relations[-1] = (*relations[-1][:3], relations[0][3], relations[-1][4])
+        relations[-1] = (relations[-1][0], *relations[0][1:])
     elif change == "identifier":
         relations[0] = (relations[0][0], 'unsafe"; SELECT 1', *relations[0][2:])
-    elif change == "oid":
-        relations[0] = (*relations[0][:3], True, relations[0][4])
+    elif change == "tuple":
+        relations[0] = (*relations[0], None)
     with pytest.raises(ValueError):
         replace(
             inputs,
@@ -134,60 +133,107 @@ def test_candidate_inputs_refuse_open_or_ambiguous_physical_scope(change):
 
 
 @pytest.mark.asyncio
-async def test_future_provider_signature_survives_physical_relation_rename():
+async def test_changed_selected_names_require_new_geo_preparation():
     inputs = candidate_inputs()
     original = provider_session(inputs)
     digest = await contract.provider_signature(original, candidate_inputs=inputs)
     renamed = replace(
         inputs,
         relations=tuple(
-            (role, "published", f"live_{index}", oid, filenode)
-            for index, (role, _schema, _relation, oid, filenode) in enumerate(inputs.relations)
+            (role, "published", f"live_{index}") for index, (role, _schema, _relation) in enumerate(inputs.relations)
         ),
     )
-    assert await contract.provider_signature(provider_session(renamed), candidate_inputs=renamed) == digest
+    assert len(digest) == 64
+    with pytest.raises(ValueError, match="geo (authority changed|stage differs)"):
+        await contract.provider_signature(provider_session(renamed), candidate_inputs=renamed)
     sql, parameters = original.statements[-1]
     assert "active_geo_assurance_version" not in sql
     assert parameters["npi_relation"] == inputs.relation("npi")
     assert original.statements[0][0] == "SHOW transaction_isolation"
     assert original.statements[1][0].startswith("LOCK TABLE ONLY ")
     catalog_sql, catalog_parameters = original.statements[2]
-    assert "NOT relation.relispartition OR relation.oid=ANY" in catalog_sql
-    assert catalog_parameters["tiger_oids"] == [entry[3] for entry in inputs.relations if entry[0].startswith("tiger.")]
+    assert "NOT relation.relispartition OR" in catalog_sql
+    assert catalog_parameters["tiger_names"] == [
+        f"{schema}.{relation}" for role, schema, relation in inputs.relations if role.startswith("tiger.")
+    ]
+    assert "relfilenode" not in catalog_sql and "relation.oid::" not in catalog_sql
     assert any("FOR SHARE" in statement for statement, _parameters in original.statements)
 
 
 @pytest.mark.asyncio
-async def test_candidate_signature_matches_published_oid_encoding():
-    """Match PostgreSQL's oid JSON string without changing the numeric custody identity."""
+async def test_candidate_signature_matches_transferred_publication_origins():
+    """Stage names and discarded legacy tuple tails cannot change publication identity."""
     inputs = candidate_inputs()
     candidate = provider_session(inputs)
     candidate_digest = await contract.provider_signature(candidate, candidate_inputs=inputs)
-    identities_by_role = {entry[0]: list(entry[3:]) for entry in inputs.relations}
     published_by_field = {
-        "npi": identities_by_role["npi"],
-        "taxonomy": identities_by_role["npi_taxonomy"],
-        "vocabulary": identities_by_role["nucc_taxonomy"],
-        "address": identities_by_role["entity_address_unified"],
-        "address_evidence": identities_by_role["entity_address_evidence"]
-        + identities_by_role["entity_address_unified"],
-        "zip": identities_by_role["geo_zip_lookup"],
+        "contract": contract._PROVIDER_SIGNATURE_CONTRACT,
+        "generations": json.loads(candidate.statements[-1][1]["candidate_generations"]),
+        "relations_available": True,
         "geo_assurance": {
             "version": 1,
-            "table_oid": str(inputs.geo_preparation.stage_table_oid),
-            "signature": {
-                name: [entry["relation_oid"], entry["relfilenode"]] for name, entry in inputs.geo_bindings().items()
-            },
+            "signature": inputs.geo_bindings(),
         },
         "geo_assurance_ready": True,
     }
-    published = SimpleNamespace(execute=AsyncMock(return_value=_Result(scalar=json.dumps(published_by_field))))
+    published = SimpleNamespace(
+        execute=AsyncMock(return_value=_Result(scalar=json.dumps(published_by_field))),
+        scalar=AsyncMock(return_value=inputs.geo_bindings()),
+    )
     assert candidate_digest == await contract.provider_signature(published)
     assert json.loads(candidate.statements[-1][1]["candidate_geo"]) == published_by_field["geo_assurance"]
-    assert type(inputs.geo_preparation.stage_table_oid) is int
+    assert inputs.geo_preparation.stage_table_oid is None
     published_sql = str(published.execute.await_args.args[0])
-    assert "'table_oid', active_table_oid," in published_sql
-    assert "active_table_oid::" not in published_sql
+    assert "origin_lineage_id" in published_sql and "origin_generation" in published_sql
+    assert "active_table_oid" not in published_sql and "pg_relation_filenode" not in published_sql
+    renamed = replace(
+        inputs,
+        relations=tuple(
+            (
+                role,
+                "relocated"
+                if role
+                not in {
+                    "entity_address_unified",
+                    *(name.removeprefix(f"{contract.SCHEMA}.") for name in inputs.geo_bindings()),
+                }
+                else schema,
+                name,
+            )
+            for role, schema, name in inputs.relations
+        ),
+    )
+    assert await contract.provider_signature(provider_session(renamed), candidate_inputs=renamed) == candidate_digest
+    for family in contract._PROVIDER_GENERATIONS:
+        changed_by_field = deepcopy(published_by_field)
+        changed_by_field["generations"][family]["origin_generation"] += 1
+        assert contract._validated_provider_signature(json.dumps(changed_by_field)) != candidate_digest
+
+
+def test_legacy_candidate_tuple_tails_are_discarded_without_identity_checks():
+    inputs = candidate_inputs()
+    legacy = replace(inputs, relations=tuple((*entry, None, "unrelated") for entry in inputs.relations))
+    assert legacy == inputs
+    assert all(len(entry) == 3 for entry in legacy.relations)
+
+
+@pytest.mark.parametrize("change", ["missing", "lineage", "generation", "boolean", "extra"])
+def test_candidate_requires_complete_portable_origins(change):
+    inputs = candidate_inputs()
+    generations = list(inputs.provider_generations)
+    if change == "missing":
+        generations.pop()
+    elif change == "extra":
+        generations.append(("unknown", generations[0][1], 1))
+    else:
+        family, lineage, generation = generations[0]
+        generations[0] = (
+            family,
+            "unknown" if change == "lineage" else lineage,
+            True if change == "boolean" else 0 if change == "generation" else generation,
+        )
+    with pytest.raises(ValueError, match="provider"):
+        replace(inputs, provider_generations=tuple(generations))
 
 
 @pytest.mark.asyncio
@@ -239,6 +285,7 @@ async def test_geo_recapture_preserves_the_sealed_selected_input_digest(monkeypa
         stage_table_oid=inputs.geo_preparation.stage_table_oid,
         projected_rows=inputs.geo_preparation.projected_rows,
         publisher_selected_inputs_sha256="a" * 64,
+        stage_relation=inputs.geo_preparation.stage_relation,
     )
     inputs = replace(inputs, geo_preparation=expected)
     capture = AsyncMock(return_value=expected)
@@ -250,10 +297,106 @@ async def test_geo_recapture_preserves_the_sealed_selected_input_digest(monkeypa
         session,
         db_schema=contract.SCHEMA,
         stage_table_oid=expected.stage_table_oid,
+        stage_relation_name=expected.stage_relation[1],
         projected_rows=expected.projected_rows,
         dependency_bindings=inputs.geo_bindings(),
         publisher_selected_inputs_sha256="a" * 64,
     )
+
+
+def _retained_candidate_inputs(binding_mode):
+    inputs = candidate_inputs()
+    dependency_roles = {name.removeprefix(f"{contract.SCHEMA}.") for name in inputs.geo_bindings()}
+    relations = []
+    for role, schema, relation in inputs.relations:
+        if role in dependency_roles or role == "entity_address_unified":
+            schema, relation = role.split(".") if role.startswith("tiger.") else (contract.SCHEMA, role)
+        if role in dependency_roles and binding_mode.startswith("held"):
+            schema = "held_inputs"
+        relations.append((role, schema, relation))
+    inputs = replace(inputs, relations=tuple(relations), geo_preparation=None)
+    active_bindings_by_name = inputs.geo_bindings()
+    if binding_mode == "canonical_null":
+        active_bindings_by_name = None
+    elif binding_mode == "held_legacy":
+        active_bindings_by_name = {
+            name: {**entry, "relation_oid": None, "relfilenode": 1} for name, entry in active_bindings_by_name.items()
+        }
+    return inputs, {"active_geo_assurance_version": 1, "active_dependency_bindings": active_bindings_by_name}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding_mode", ["canonical_null", "canonical_named", "held", "held_legacy"])
+async def test_retained_geo_requires_matching_named_active_inputs(binding_mode):
+    inputs, state = _retained_candidate_inputs(binding_mode)
+    session = SimpleNamespace(execute=AsyncMock(return_value=_Result(scalar=True)))
+    identity = await contract._candidate_geo_identity(session, inputs, state)
+    assert identity["signature"] == inputs.geo_bindings()
+    assert identity["version"] == 1
+    readiness_sql = str(session.execute.await_args.args[0])
+    assert ("FROM mrf.npi_result_generation" in readiness_sql) is not binding_mode.startswith("held")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding_mode", ["canonical_null", "held"])
+@pytest.mark.parametrize(
+    "changed_role",
+    [
+        "entity_address_unified",
+        "npi_address",
+        "mrf_address",
+        "doctor_clinician_address",
+        "geo_zip_lookup",
+        "tiger.zip_state",
+        "tiger.zcta5",
+    ],
+)
+async def test_retained_geo_refuses_a_different_address_or_dependency(binding_mode, changed_role):
+    inputs, state = _retained_candidate_inputs(binding_mode)
+    inputs = replace(
+        inputs,
+        relations=tuple(
+            (role, schema, relation + "_older" if role == changed_role else relation)
+            for role, schema, relation in inputs.relations
+        ),
+    )
+    session = SimpleNamespace(execute=AsyncMock(return_value=_Result(scalar=True)))
+    with pytest.raises(ValueError, match="retained geo authority changed"):
+        await contract._candidate_geo_identity(session, inputs, state)
+    session.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retained_geo_keeps_the_logical_generation_readiness_check():
+    inputs, state = _retained_candidate_inputs("canonical_named")
+    session = SimpleNamespace(execute=AsyncMock(return_value=_Result(scalar=False)))
+    with pytest.raises(ValueError, match="retained geo authority changed"):
+        await contract._candidate_geo_identity(session, inputs, state)
+    assert "origin_generation" in str(session.execute.await_args.args[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["missing_state", "version", "incomplete_map", "address_schema"])
+async def test_retained_geo_refuses_incomplete_or_unrelated_publication_state(change):
+    inputs, state = _retained_candidate_inputs("canonical_named")
+    if change == "missing_state":
+        state = None
+    elif change == "version":
+        state["active_geo_assurance_version"] = 2
+    elif change == "incomplete_map":
+        state["active_dependency_bindings"].pop(f"{contract.SCHEMA}.mrf_address")
+    else:
+        inputs = replace(
+            inputs,
+            relations=tuple(
+                (role, "older" if role == "entity_address_unified" else schema, relation)
+                for role, schema, relation in inputs.relations
+            ),
+        )
+    session = SimpleNamespace(execute=AsyncMock())
+    with pytest.raises(ValueError):
+        await contract._candidate_geo_identity(session, inputs, state)
+    session.execute.assert_not_awaited()
 
 
 def test_candidate_provider_and_provenance_queries_use_the_same_closed_relations():
@@ -397,9 +540,9 @@ async def test_candidate_read_dedup_includes_authenticated_physical_family_not_j
     """Independent source databases may legitimately reuse snapshot keys and coverage scopes."""
     physical = SimpleNamespace(
         dataset_id="candidate-dataset",
-        schema_oid=11,
+        schema_name="payload_one",
         payload_snapshot_id="source-snapshot",
-        relation_oids=(("code", 21),),
+        relations=(("payload_one", "code"),),
     )
     tables = SimpleNamespace(
         snapshot_id="candidate-snapshot",
@@ -417,11 +560,11 @@ async def test_candidate_read_dedup_includes_authenticated_physical_family_not_j
     tables.snapshot_id = "another-candidate"
     _, reused_identity = await source.binding_source(session, {**binding(), "snapshot_id": tables.snapshot_id})
     assert first_identity == reused_identity
-    physical.schema_oid += 1
+    physical.schema_name = "payload_two"
     _, separate_identity = await source.binding_source(session, {**binding(), "snapshot_id": tables.snapshot_id})
     assert separate_identity != first_identity
-    physical.schema_oid -= 1
-    physical.relation_oids = (("code", 22),)
+    physical.schema_name = "payload_one"
+    physical.relations = (("payload_one", "code_v2"),)
     _, replaced_identity = await source.binding_source(session, {**binding(), "snapshot_id": tables.snapshot_id})
     assert replaced_identity != first_identity
     tables.physical_binding = None

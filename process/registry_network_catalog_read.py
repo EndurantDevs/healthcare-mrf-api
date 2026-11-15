@@ -23,7 +23,6 @@ from process.network_approved_membership_source import (
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_fhir_retained_capture_contract import PRODUCER as RETAINED_FHIR_PRODUCER
 from process.network_fhir_retained_capture_contract import is_sha256
-from process.network_read_identity import NetworkReadIdentityError, verify_consumed_network_relations
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 from process.registry_fhir_plan_tier import (
@@ -441,35 +440,14 @@ _ORGANIZATION_SQL = _BASE_SQL.replace(
 
 
 def catalog_directory_relation(manifest, *, first_parameter):
-    """Render addresses and consumed pins from an already authenticated catalog manifest."""
+    """Render addresses using the selected generation's schema-qualified inputs."""
     if manifest.compact_layout is None:
-        return _identifier(manifest.schema_name) + ".entity_address_unified", (), ()
-    from api.network_compact_address import compact_address_native_sql, compact_address_read_relations
-    from process.network_compact_layout import CompactAddressRelation
+        return _identifier(manifest.schema_name) + ".entity_address_unified", ()
+    from api.network_compact_address import compact_address_native_sql
 
-    pins = manifest.candidate_relation_pins
-    if type(pins) is not tuple or any(type(pin) is not CompactAddressRelation for pin in pins):
-        raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
-    relations = []
-    for name in ("network_membership", "provider_location_binding"):
-        matches = [pin for pin in pins if pin.schema_name == manifest.schema_name and pin.table_name == name]
-        if len(matches) != 1:
-            raise RegistryNetworkCatalogError("registry_network_catalog_source_changed")
-        relations.append(matches[0])
-    # The bounded lookup proves this network's exact office membership.
-    addresses, parameters = compact_address_native_sql(
+    return compact_address_native_sql(
         manifest.compact_layout, first_parameter=first_parameter, visible_membership_sql="TRUE"
     )
-    return addresses, parameters, tuple(relations) + compact_address_read_relations(manifest.compact_layout)
-
-
-async def catalog_directory_fetchrow(connection, sql, parameters, relations):
-    """Guard consumed compact relations on the page's original backend before exposing its result."""
-    backend_pid = connection.get_server_pid() if relations else None
-    entry = await connection.fetchrow(sql, *parameters)
-    if relations:
-        await verify_consumed_network_relations(connection, relations, expected_backend_pid=backend_pid)
-    return entry
 
 
 async def catalog_pin(connection, generation_id, control_schema):
@@ -501,7 +479,7 @@ _pin = catalog_pin
 async def registry_catalog_read_snapshot(connection, generation_id, control_schema):
     """Reuse only a manifest verified on this connection in the active read scope."""
     manifest = await _pin(connection, generation_id, control_schema)
-    token = _PINNED_READ.set((connection, manifest, control_schema))
+    token = _PINNED_READ.set((manifest, control_schema))
     try:
         yield manifest
     finally:
@@ -512,9 +490,8 @@ def _reuse_manifest(connection, manifest, generation_id, control_schema):
     pinned = _PINNED_READ.get()
     if (
         pinned is None
-        or pinned[0] is not connection
-        or pinned[1] is not manifest
-        or pinned[2] != control_schema
+        or pinned[0] != manifest
+        or pinned[1] != control_schema
         or not connection.is_in_transaction()
         or (generation_id is not None and generation_id != manifest.generation_id)
     ):
@@ -667,14 +644,12 @@ async def _page(connection, manifest, query, exclusions, control_schema, network
     )
     if organization_policy is not None:
         parameters += (organization_policy.excluded_company_ids, organization_policy.excluded_group_ids)
-    addresses, address_parameters, relations = catalog_directory_relation(manifest, first_parameter=len(parameters) + 1)
-    entry = await catalog_directory_fetchrow(
-        connection,
+    addresses, address_parameters = catalog_directory_relation(manifest, first_parameter=len(parameters) + 1)
+    entry = await connection.fetchrow(
         sql.format(
             control=_identifier(control_schema), candidate=_identifier(manifest.schema_name), addresses=addresses
         ),
-        parameters + address_parameters,
-        relations,
+        *(parameters + address_parameters),
     )
     if entry is None or entry["bounded"] is not True:
         raise RegistryNetworkCatalogError("registry_network_catalog_response_bounds")
@@ -724,7 +699,7 @@ async def read_registry_network_catalog(
         return await _page(
             connection, manifest, query, exclusions, control_schema, organization_policy=organization_policy
         )
-    except (NetworkReadIdentityError, asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
+    except (asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
         if isinstance(error, RegistryNetworkCatalogError):
             raise
         raise RegistryNetworkCatalogError("registry_network_catalog_unavailable") from error
@@ -754,7 +729,7 @@ async def read_registry_network_catalog_detail(
         if page["total"] != 1 or len(page["items"]) != 1 or page["items"][0]["network_id"] != network_id:
             raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
         return page
-    except (NetworkReadIdentityError, asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
+    except (asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
         if isinstance(error, RegistryNetworkCatalogError):
             raise
         raise RegistryNetworkCatalogError("registry_network_catalog_unavailable") from error
@@ -803,7 +778,7 @@ async def resolve_registry_network_catalog_legacy(
         if page["total"] != 1 or page["items"][0]["network_id"] != network_id:
             raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
         return page
-    except (NetworkReadIdentityError, asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
+    except (asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
         if isinstance(error, RegistryNetworkCatalogError):
             raise
         raise RegistryNetworkCatalogError("registry_network_catalog_unavailable") from error
@@ -880,7 +855,7 @@ async def _resolve_legacy_batch(
         ):
             raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")
         return page
-    except (NetworkReadIdentityError, asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
+    except (asyncpg.PostgresError, KeyError, TypeError, ValueError) as error:
         if isinstance(error, RegistryNetworkCatalogError):
             raise
         raise RegistryNetworkCatalogError("registry_network_catalog_unavailable") from error

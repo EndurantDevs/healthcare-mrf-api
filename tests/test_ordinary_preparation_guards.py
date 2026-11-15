@@ -69,29 +69,27 @@ async def test_scope_cancels_and_settles_inherited_children_before_cleanup(ordin
 
 
 @pytest.mark.asyncio
-async def test_recreated_name_retains_the_original_oid_until_cleanup(ordinary_case):
+async def test_created_named_candidate_is_kept_without_physical_bookkeeping(ordinary_case):
     async with ordinary.scope("sample", {"stage"}) as owned:
-        owned.owned_oids["stage"] = 101
-        ordinary_case.database.scalar.side_effect = [None, 202]
+        ordinary_case.database.scalar.side_effect = [None, True]
         create = AsyncMock()
         assert await ordinary.create("sample", "stage", create) is owned
         create.assert_awaited_once_with(ordinary_case.session)
-        assert owned.retired_oids == [("stage", "stage", 101)]
-        assert owned.owned_oids == {"stage": 202}
-        owned.keep((("stage", "stage", 202),))
-    ordinary_case.drain.assert_awaited_once_with("sample", (("stage", "stage", 101),))
+        assert owned.owned_relations == {"stage"} and owned.retired_relations == []
+        owned.keep((("stage", "stage"),))
+    ordinary_case.drain.assert_awaited_once_with("sample", ())
 
 
 @pytest.mark.asyncio
 async def test_missing_stage_is_not_locked_or_dropped_and_custody_is_retained(ordinary_case):
     async with ordinary.scope("sample", {"stage"}) as owned:
-        owned.owned_oids["stage"] = 101
+        owned.owned_relations.add("stage")
         ordinary_case.database.scalar.return_value = None
         assert await ordinary.drop("sample", "stage") is owned
         statements = [call.args[0] for call in ordinary_case.database.status.await_args_list]
         assert not any("LOCK TABLE" in sql or "DROP TABLE" in sql for sql in statements)
-        assert owned.owned_oids == {"stage": 101} and not owned.pending_names
-    ordinary_case.drain.assert_awaited_once_with("sample", (("stage", "stage", 101),))
+        assert owned.owned_relations == set() and not owned.pending_names
+    ordinary_case.drain.assert_awaited_once_with("sample", ())
 
 
 @pytest.mark.asyncio
@@ -102,7 +100,7 @@ async def test_create_failure_clears_pending_names_and_preserves_the_error(ordin
             ordinary_case.database.scalar.return_value = None
             await ordinary.create("sample", "stage", AsyncMock(side_effect=failure))
     assert raised.value is failure and not owned.pending_names
-    assert not owned.owned_oids and not owned.active and ordinary.current() is None
+    assert not owned.owned_relations and not owned.active and ordinary.current() is None
     ordinary_case.drain.assert_awaited_once_with("sample", ())
 
 
@@ -131,16 +129,14 @@ async def test_conflicting_authority_is_refused_before_opening_a_transaction(ord
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "identity,owned_oid", [((), 101), ((("stage", "stage", 999),), 101), ((("stage", "stage", True),), 1)]
-)
-async def test_keep_cannot_transfer_missing_foreign_or_boolean_oids(ordinary_case, identity, owned_oid):
+@pytest.mark.parametrize("relations", [(), (("stage", "other"),), (("stage", "unsafe;name"),)])
+async def test_keep_requires_closed_declared_finalized_names(ordinary_case, relations):
     async with ordinary.scope("sample", {"stage"}) as owned:
-        owned.owned_oids["stage"] = owned_oid
-        with pytest.raises(RuntimeError, match="finalized_"):
-            owned.keep(identity)
-        assert not owned.kept_oids and owned.owned_oids == {"stage": owned_oid}
-    ordinary_case.drain.assert_awaited_once_with("sample", (("stage", "stage", owned_oid),))
+        owned.owned_relations.add("stage")
+        with pytest.raises((RuntimeError, ValueError)):
+            owned.keep(relations)
+        assert not owned.kept_relations and owned.owned_relations == {"stage"}
+    ordinary_case.drain.assert_awaited_once_with("sample", (("stage", "stage"),))
 
 
 @pytest.mark.asyncio
@@ -151,7 +147,9 @@ async def test_scratch_entry_refuses_empty_or_borrowed_custody_before_opening_a_
     admitted = ordinary.admitted
     capability = object()
     monkeypatch.setattr(
-        admitted, "_row_scratch_state", lambda _: SimpleNamespace(owned_oids={} if unregistered else {"stage": 101})
+        admitted,
+        "_row_scratch_state",
+        lambda _: SimpleNamespace(owned_relations={} if unregistered else {"stage": 101}),
     )
     ordinary_case.database._transaction_binding.return_value = object() if borrowed else None
     token = admitted._ROW_SCRATCH.set(None)
@@ -209,7 +207,7 @@ async def test_logging_cannot_borrow_another_schema_or_unowned_stage(ordinary_ca
     admitted = ordinary.admitted
     callback = AsyncMock()
     scope = SimpleNamespace(
-        db_schema="sample", stage_oids=(("live", "stage", 101),), admission=SimpleNamespace(before_logging=callback)
+        db_schema="sample", stage_relations=(("live", "stage"),), admission=SimpleNamespace(before_logging=callback)
     )
     token = admitted._ADMISSION.set(scope)
     try:
@@ -236,7 +234,7 @@ async def test_runner_scratch_cannot_be_renamed_by_the_shared_stage_swap(ordinar
 @pytest.mark.asyncio
 async def test_candidate_preparation_cannot_enter_an_existing_cutover_transaction(ordinary_case, monkeypatch):
     pin = candidate.ProviderDirectoryAddressDatasetPin("source", "endpoint", "dataset", "a" * 64, "root")
-    inputs = candidate.ProviderDirectoryAddressPreparationInput((pin,), "overlay_next", 101, 0)
+    inputs = candidate.ProviderDirectoryAddressPreparationInput((pin,), "overlay_next", 0)
     monkeypatch.setattr(candidate, "_native", lambda: SimpleNamespace(db=ordinary_case.database))
     ordinary_case.database._transaction_binding.return_value = object()
     with pytest.raises(RuntimeError, match="must precede the cutover transaction"):

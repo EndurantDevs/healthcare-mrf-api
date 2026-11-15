@@ -182,9 +182,9 @@ def test_v3_candidate_verification_binds_approved_generation_origin_and_recipe_i
 
 def test_v3_receipt_does_not_widen_the_parent_candidate_custody_cap():
     from process import network_candidate_custody as custody
-    from tests.test_network_candidate_custody import Connection
+    from tests.test_network_candidate_custody import _candidate_record
 
-    candidate = Connection().candidate
+    candidate = _candidate_record()
     candidate["validation_json"] = {composition.SUMMARY_KEY: _summary()}
     assert custody._evidence(candidate)["validation_json"] == candidate["validation_json"]
     assert composition.MAX_RECEIPT_BYTES == 4096

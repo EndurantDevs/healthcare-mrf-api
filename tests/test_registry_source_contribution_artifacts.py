@@ -13,21 +13,23 @@ from tests.test_registry_source_contributions import _descriptor, _recipe
 
 
 def _reference():
-    return artifacts.SourceFactArtifactReference(str(uuid4()), 42, "a" * 64)
+    return artifacts.SourceFactArtifactReference(
+        str(uuid4()), "synthetic_facts", artifacts.CONTRIBUTION_TABLE, "a" * 64
+    )
 
 
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("remove", "fact_table_oid"),
+        ("remove", "fact_table_name"),
         ("fact_candidate_id", "00000000-0000-0000-0000-000000000000"),
-        ("fact_table_oid", True),
-        ("fact_seal_sha256", "A" * 64),
+        ("fact_table_name", "other_facts"),
+        ("fact_generation_id", "A" * 64),
         ("predecessor", "synthetic-predecessor"),
-        ("fact_table_oid", None),
+        ("fact_schema_name", None),
     ],
 )
-def test_anchor_reference_is_closed_and_physical(field, value):
+def test_anchor_reference_requires_closed_names_and_logical_generation(field, value):
     descriptor_by_field = {**_descriptor(_recipe()), **asdict(_reference())}
     if field == "remove":
         descriptor_by_field.pop(value)
@@ -40,7 +42,7 @@ def test_anchor_reference_is_closed_and_physical(field, value):
 def test_mapping_changes_keep_original_capture_and_direct_owner():
     descriptor = _descriptor(_recipe())
     reference = _reference()
-    artifact = artifacts.ResolvedSourceFactArtifact(reference, "network_candidate_" + uuid4().hex, descriptor)
+    artifact = artifacts.ResolvedSourceFactArtifact(reference, reference.fact_schema_name, descriptor)
     current = descriptor
     for mapping in ("b" * 64, "c" * 64, "d" * 64):
         changed_by_field = {
@@ -112,7 +114,7 @@ async def test_missing_owner_receipt_refuses_before_inventory_or_fact_loading():
     connection = AsyncMock()
     candidate_by_field = {"source_generations": {}, "validation_json": {}, "source_recipes_json": []}
     with pytest.raises(RegistrySourceContributionError, match="owner_missing"):
-        await artifacts._owner_sources(connection, candidate_by_field, {}, "synthetic_control")
+        await artifacts._owner_sources(connection, candidate_by_field, "synthetic_control")
     connection.fetch.assert_not_awaited()
     connection.fetchrow.assert_not_awaited()
     connection.execute.assert_not_awaited()
@@ -150,3 +152,46 @@ async def test_api_artifact_read_requires_readonly_before_any_owner_metadata():
         )
     connection.fetch.assert_not_awaited()
     connection.fetchrow.assert_not_awaited()
+
+
+def test_known_legacy_anchor_discards_obsolete_ids_and_seal_without_changing_content():
+    descriptor = _descriptor(_recipe())
+    identity = str(uuid4())
+    legacy_by_field = {
+        **descriptor,
+        "fact_candidate_id": identity,
+        "fact_table_oid": -999,
+        "fact_seal_sha256": "obsolete",
+    }
+    reference = artifacts.source_fact_artifact_reference(legacy_by_field)
+    assert reference == artifacts.SourceFactArtifactReference(identity)
+    assert artifacts._validated_descriptor(legacy_by_field) == descriptor
+    candidate_by_field = {"candidate_id": identity, "schema_name": "copied_facts"}
+    resolved = artifacts._resolved_owned_source(
+        candidate_by_field, "b" * 64, legacy_by_field, reference, sources=[descriptor]
+    )
+    assert resolved.reference == artifacts.SourceFactArtifactReference(
+        identity, "copied_facts", artifacts.CONTRIBUTION_TABLE, "b" * 64
+    )
+    named = artifacts.anchored_source_fact_descriptor(legacy_by_field, resolved)
+    assert "fact_table_oid" not in named and "fact_seal_sha256" not in named
+    assert named["fact_generation_id"] == "b" * 64 and named["fact_sha256"] == descriptor["fact_sha256"]
+
+
+@pytest.mark.parametrize("damage", ["candidate", "schema", "generation", "facts"])
+def test_named_fact_reference_refuses_wrong_logical_scope_or_content(damage):
+    descriptor = _descriptor(_recipe())
+    reference = _reference()
+    candidate_by_field = {"candidate_id": reference.fact_candidate_id, "schema_name": reference.fact_schema_name}
+    generation = reference.fact_generation_id
+    sources = [dict(descriptor)]
+    if damage == "candidate":
+        candidate_by_field["candidate_id"] = str(uuid4())
+    if damage == "schema":
+        candidate_by_field["schema_name"] = "different_facts"
+    if damage == "generation":
+        generation = "f" * 64
+    if damage == "facts":
+        sources[0]["fact_sha256"] = "f" * 64
+    with pytest.raises(RegistrySourceContributionError):
+        artifacts._resolved_owned_source(candidate_by_field, generation, descriptor, reference, sources=sources)

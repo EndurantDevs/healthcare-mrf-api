@@ -31,7 +31,10 @@ from process.facility_address_contribution_capture import (
     require_capture_bounds,
     require_local_family_publication,
 )
-from process.provider_directory_cms_native_inputs import prepare_local_native_input_publication
+from process.provider_directory_cms_native_inputs import (
+    finish_local_native_input_publication,
+    prepare_local_native_input_publication,
+)
 from process.redis_config import build_redis_settings
 from process.reference_family_result_generation import publish_local_reference_family_generation
 from process.serialization import deserialize_job, serialize_job
@@ -722,7 +725,7 @@ async def publish_facility_anchors_generation(ctx):
                     enabled=False,
                 )
 
-        await prepare_local_native_input_publication(
+        native_input_publication = await prepare_local_native_input_publication(
             session,
             ledger_schema=db_schema,
             relations=(
@@ -758,19 +761,21 @@ async def publish_facility_anchors_generation(ctx):
                         f"{db_schema}.{_stage_index_name(stage_cls.__tablename__, index_name)} "
                         f"RENAME TO {old_live_name};"
                     )
-            contribution_table = FacilityAddressContribution.__main_table__
-            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{contribution_table}_old;")
+            await db.status(f"DROP TABLE IF EXISTS {db_schema}.{FacilityAddressContribution.__main_table__}_old;")
             await db.status(
-                f"ALTER TABLE IF EXISTS {db_schema}.{contribution_table} RENAME TO {contribution_table}_old;"
+                f"ALTER TABLE IF EXISTS {db_schema}.{FacilityAddressContribution.__main_table__} RENAME TO {FacilityAddressContribution.__main_table__}_old;"
             )
             await db.status(
-                f"ALTER INDEX IF EXISTS {db_schema}.{contribution_table}_pkey RENAME TO {contribution_table}_old_pkey;"
+                f"ALTER INDEX IF EXISTS {db_schema}.{FacilityAddressContribution.__main_table__}_pkey RENAME TO {FacilityAddressContribution.__main_table__}_old_pkey;"
             )
-            await db.status(f"ALTER TABLE {db_schema}.{contribution_stage} RENAME TO {contribution_table};")
+            await db.status(
+                f"ALTER TABLE {db_schema}.{contribution_stage} RENAME TO {FacilityAddressContribution.__main_table__};"
+            )
             await db.status(
                 f"ALTER INDEX {db_schema}.{_archived_identifier(contribution_stage, '_pkey')} "
-                f"RENAME TO {contribution_table}_pkey;"
+                f"RENAME TO {FacilityAddressContribution.__main_table__}_pkey;"
             )
+            await finish_local_native_input_publication(session, prepared=native_input_publication)
             await publish_local_reference_family_generation(db, importer_id="facility-anchors", schema_name=db_schema)
 
     logger.info(

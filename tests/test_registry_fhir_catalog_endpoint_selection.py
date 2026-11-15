@@ -78,7 +78,7 @@ async def test_startup_binds_selection_before_source_runtime_and_reports_narrow_
 async def test_selected_discovery_rejects_missing_and_unrequested_endpoints(returned):
     from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
 
-    selected_profile = FHIRCatalogSourceReadProfile("sample", "sample_owner", ("sample_reader",))
+    selected_profile = FHIRCatalogSourceReadProfile("sample")
 
     async def inventory():
         if returned:

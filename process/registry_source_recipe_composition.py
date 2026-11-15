@@ -13,8 +13,10 @@ from process.network_address_projection import _identifier
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_fhir_membership_source import (
     FHIRMembershipBatchBoundsError,
+    FHIRMembershipSourceError,
     PinnedFHIRMembershipSource,
     RetainedFHIRSuccessorReads,
+    _require_pinned_source,
     _reviewed_descriptor,
     fhir_normalized_capture,
     fhir_physical_source,
@@ -24,11 +26,6 @@ from process.network_fhir_membership_source import (
 )
 from process.network_fhir_membership_source import (
     _generation_id as fhir_membership_generation,
-)
-from process.network_fhir_source_custody import (
-    FHIRSourceCustodyError,
-    RetainedCMSFHIRSourceCustody,
-    require_retained_cms_fhir_source_custody,
 )
 from process.network_fhir_source_epoch import FHIRSourceEpochError, require_retained_cms_fhir_source_epoch
 from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
@@ -267,9 +264,11 @@ async def require_source_witness_read(
     capture = await _approved_source_witness_capture(
         connection, recipe, approved, control_schema, retained_approval=retained_approval
     )
-    if (capture.owner_role, capture.runtime_roles) != (runtime.capture_owner_role, runtime.runtime_roles):
-        raise RegistrySourceCompositionError("registry_source_witness_runtime_census_differs")
-    profiles = [profile for profile in runtime.source_profiles if profile.schema_name == capture.origin.schema_name]
+    profiles = [
+        profile
+        for profile in runtime.source_profiles
+        if profile.catalog_schema == capture.origin.header_relation["schema"]
+    ]
     if len(profiles) != 1:
         raise RegistrySourceCompositionError("registry_source_witness_profile_unavailable")
     try:
@@ -304,21 +303,10 @@ async def _typed_source_read_scope(connection, recipe, approved, control_schema,
     pin = recipe.source_pin
     pin.__post_init__()
     capture = pin.capture
-    if (capture["owner_role"], tuple(capture["runtime_roles"])) != (runtime.capture_owner_role, runtime.runtime_roles):
-        raise RegistrySourceCompositionError("registry_source_typed_runtime_census_differs")
     origin = source_origin(capture["graph"]["origin"])
-    from directory_membership_runtime import FHIRSourceMembershipCompletionInput, FHIRSourceMembershipInput
-
-    from process.network_fhir_source_witness_capture import _original_source_factory
-    from process.network_fhir_source_witness_contract import SourceWitnessCompletionOrigin
-
-    origin_type = (
-        FHIRSourceMembershipCompletionInput
-        if type(origin) is SourceWitnessCompletionOrigin
-        else FHIRSourceMembershipInput
-    )
-    _original_source_factory(runtime.source_export, origin_type(**asdict(origin)))
-    profiles = [profile for profile in runtime.source_profiles if profile.schema_name == origin.schema_name]
+    profiles = [
+        profile for profile in runtime.source_profiles if profile.catalog_schema == origin.header_relation["schema"]
+    ]
     if len(profiles) != 1 or type(retained_approval) is not bool:
         raise RegistrySourceCompositionError("registry_source_typed_profile_unavailable")
     require_bindings = (
@@ -575,7 +563,7 @@ async def require_registry_source_recipe_custody(
 
 
 async def _require_fhir_custody(connection, source):
-    """Authenticate each flat original or successor capture with its own native receipt."""
+    """Validate each selected original or successor's named publication data."""
     if source.source_witness_capture is not None:
         # Source replay and final independent custody are wired by the publication owner.
         raise RegistrySourceCompositionError("registry_source_composition_source_witness_custody_unavailable")
@@ -587,18 +575,9 @@ async def _require_fhir_custody(connection, source):
             return
         except FHIRSourceEpochError as error:
             raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable") from error
-    if source.custody_owner_role is None:
-        raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable")
-    custody = RetainedCMSFHIRSourceCustody(
-        source,
-        source.custody_owner_role,
-        source.custody_runtime_roles,
-        source.custody_proof_sha256,
-        source.custody_catalog_sha256,
-    )
     try:
-        await require_retained_cms_fhir_source_custody(connection, custody)
-    except FHIRSourceCustodyError as error:
+        await _require_pinned_source(connection, source)
+    except FHIRMembershipSourceError as error:
         raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable") from error
 
 
@@ -606,19 +585,22 @@ _require_recipe_custody = require_registry_source_recipe_custody
 
 
 async def _retained_recipe_read(connection, capture, retained_fhir_reads):
-    """Share one full admission, retaining native custody checks at every use."""
+    """Share one full content validation for the selected immutable named edition."""
     from process.network_fhir_retained_capture import RetainedFHIRRead, pin_retained_fhir_read
+    from process.network_fhir_retained_capture_contract import validate_capture
 
     if retained_fhir_reads is None:
         return await pin_retained_fhir_read(connection, capture)
     if type(retained_fhir_reads) is not dict:
         raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable")
-    if capture not in retained_fhir_reads:
-        retained_fhir_reads[capture] = await pin_retained_fhir_read(connection, capture)
-    read = retained_fhir_reads[capture]
+    capture = validate_capture(capture)
+    cache_key = capture.schema_name, capture.capture_id, capture.capture_sha256
+    if cache_key not in retained_fhir_reads:
+        retained_fhir_reads[cache_key] = await pin_retained_fhir_read(connection, capture)
+    read = retained_fhir_reads[cache_key]
     if type(read) is not RetainedFHIRRead:
         raise RegistrySourceCompositionError("registry_source_composition_custody_unavailable")
-    await read.verify(connection, capture)
+    read.require_ready(capture)
     return read
 
 

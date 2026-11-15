@@ -5,22 +5,22 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-CAPACITY_GEOMETRY_CONTRACT_ID = "healthporta.provider-directory-profile-capacity-geometry.v5"
+CAPACITY_GEOMETRY_CONTRACT_ID = "healthporta.provider-directory-profile-capacity-geometry.v6"
 PROFILE_MATERIALIZATION_MODE = "source_delta"
 PROFILE_STRATEGY_VERSION = "source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6"
 
-_GEOMETRY_HASH_DOMAIN = "provider_directory_profile_capacity_geometry.v5"
+_GEOMETRY_HASH_DOMAIN = "provider_directory_profile_capacity_geometry.v6"
 _CONTROL_WAL_PLAN_INPUT_HASH_DOMAIN = "provider_directory_profile_control_wal_plan_input.v3"
 _CONTROL_WAL_HASH_DOMAIN = "provider_directory_profile_control_wal_projection.v4"
 PHYSICAL_PROJECTION_CONTRACT_ID = "healthporta.provider-directory-profile-delta-physical-projection.v1"
 BOUNDED_ADMISSION_CONTRACT_ID = "healthporta.provider-directory-profile-bounded-admission.v2"
-BOUNDED_CUTOVER_FORECAST_CONTRACT_ID = "healthporta.provider-directory-profile-cutover-forecast.v2"
-BOUNDED_CUTOVER_ACTUAL_CONTRACT_ID = "healthporta.provider-directory-profile-cutover-actual.v2"
-CUTOVER_FORECAST_CONTRACT_ID = "healthporta.provider-directory-profile-cutover-forecast.v1"
-CUTOVER_ACTUAL_CONTRACT_ID = "healthporta.provider-directory-profile-cutover-actual.v1"
+BOUNDED_CUTOVER_FORECAST_CONTRACT_ID = "healthporta.provider-directory-profile-cutover-forecast.v4"
+BOUNDED_CUTOVER_ACTUAL_CONTRACT_ID = "healthporta.provider-directory-profile-cutover-actual.v4"
+CUTOVER_FORECAST_CONTRACT_ID = "healthporta.provider-directory-profile-cutover-forecast.v3"
+CUTOVER_ACTUAL_CONTRACT_ID = "healthporta.provider-directory-profile-cutover-actual.v3"
 CONTROL_WAL_PROJECTION_CONTRACT_ID = "healthporta.provider-directory-profile-control-wal-projection.v4"
 ARTIFACT_SCOPE_RECOVERY_CONTRACT_ID = "provider-directory-artifact-scope-recovery-v1"
 POSTGRES_SUPPORTED_MAJOR = 18
@@ -138,62 +138,82 @@ _RELATION_FIELDS = frozenset(
     }
 )
 _GEOMETRY_FIELDS = frozenset(
-    """
-    contract_id selection_proof_id profile_input_digest materialization_mode
-    profile_schema_version profile_strategy_version executable_plan_hash
-    profile_as_of current_source_vector_hash desired_source_vector_hash
-    current_context_vector_hash desired_context_vector_hash sql_contract_digest
-    database_system_identifier database_oid database_name tablespace_oid
-    tablespace_name evidence_target_oid profile_target_oid evidence_wave_count
-    postgres_server_version_num postgres_block_size_bytes
-    postgres_toast_max_chunk_size_bytes postgres_maxalign_bytes
-    postgres_btree_version
-    postgres_wal_block_size_bytes postgres_wal_segment_size_bytes
-    postgres_full_page_writes postgres_wal_compression postgres_wal_level
-    postgres_wal_log_hints postgres_data_checksums
-    postgres_default_toast_compression postgres_checkpoint_timeout_seconds
-    postgres_max_wal_size_bytes evidence_target_storage_fingerprint
-    profile_target_storage_fingerprint build_checkpoint_oid
-    serving_generation_oid delta_receipt_oid import_run_oid
-    capacity_consumption_oid
-    build_checkpoint_storage_fingerprint serving_generation_storage_fingerprint
-    delta_receipt_storage_fingerprint import_run_storage_fingerprint
-    capacity_consumption_storage_fingerprint
-    control_wal_plan_input_hash control_wal_upper_bound_bytes
-    control_metadata_data_upper_bound_bytes
-    physical_projection_contract_id
-    metadata_data_upper_bound_bytes metadata_wal_upper_bound_bytes
-    compact_wave_count artifact_scope_wave_count evidence_worker_count
-    compact_worker_count artifact_scope_worker_count artifact_scope_batch_size
-    artifact_scope_projection_hash artifact_scope_projected_logical_bytes
-    database_pool_size pool_reserve_connections
-    max_parallel_workers_per_gather max_parallel_maintenance_workers
-    work_mem_bytes maintenance_work_mem_bytes temp_file_limit_bytes
-    max_build_seconds statement_timeout_ms lock_timeout_ms minimum_remaining_bytes
-    max_artifact_scope_rows max_evidence_rows max_affected_npis
-    max_profile_rows relation_byte_caps
-    """.split()
+    [
+        "artifact_scope_batch_size",
+        "artifact_scope_projected_logical_bytes",
+        "artifact_scope_projection_hash",
+        "artifact_scope_wave_count",
+        "artifact_scope_worker_count",
+        "compact_wave_count",
+        "compact_worker_count",
+        "contract_id",
+        "control_metadata_data_upper_bound_bytes",
+        "control_wal_plan_input_hash",
+        "control_wal_upper_bound_bytes",
+        "current_context_vector_hash",
+        "current_source_vector_hash",
+        "database_pool_size",
+        "desired_context_vector_hash",
+        "desired_source_vector_hash",
+        "evidence_wave_count",
+        "evidence_worker_count",
+        "executable_plan_hash",
+        "lock_timeout_ms",
+        "maintenance_work_mem_bytes",
+        "materialization_mode",
+        "max_affected_npis",
+        "max_artifact_scope_rows",
+        "max_build_seconds",
+        "max_evidence_rows",
+        "max_parallel_maintenance_workers",
+        "max_parallel_workers_per_gather",
+        "max_profile_rows",
+        "metadata_data_upper_bound_bytes",
+        "metadata_wal_upper_bound_bytes",
+        "minimum_remaining_bytes",
+        "physical_projection_contract_id",
+        "pool_reserve_connections",
+        "postgres_block_size_bytes",
+        "postgres_btree_version",
+        "postgres_checkpoint_timeout_seconds",
+        "postgres_data_checksums",
+        "postgres_default_toast_compression",
+        "postgres_full_page_writes",
+        "postgres_max_wal_size_bytes",
+        "postgres_maxalign_bytes",
+        "postgres_server_version_num",
+        "postgres_toast_max_chunk_size_bytes",
+        "postgres_wal_block_size_bytes",
+        "postgres_wal_compression",
+        "postgres_wal_level",
+        "postgres_wal_log_hints",
+        "postgres_wal_segment_size_bytes",
+        "profile_as_of",
+        "profile_input_digest",
+        "profile_schema_version",
+        "profile_strategy_version",
+        "relation_byte_caps",
+        "relations",
+        "selection_proof_id",
+        "sql_contract_digest",
+        "statement_timeout_ms",
+        "temp_file_limit_bytes",
+        "work_mem_bytes",
+    ]
 )
 _HASH_FIELDS = frozenset(
-    {
-        "selection_proof_id",
-        "profile_input_digest",
-        "executable_plan_hash",
-        "current_source_vector_hash",
-        "desired_source_vector_hash",
-        "current_context_vector_hash",
-        "desired_context_vector_hash",
-        "sql_contract_digest",
-        "evidence_target_storage_fingerprint",
-        "profile_target_storage_fingerprint",
-        "build_checkpoint_storage_fingerprint",
-        "serving_generation_storage_fingerprint",
-        "delta_receipt_storage_fingerprint",
-        "import_run_storage_fingerprint",
-        "capacity_consumption_storage_fingerprint",
-        "control_wal_plan_input_hash",
+    [
         "artifact_scope_projection_hash",
-    }
+        "control_wal_plan_input_hash",
+        "current_context_vector_hash",
+        "current_source_vector_hash",
+        "desired_context_vector_hash",
+        "desired_source_vector_hash",
+        "executable_plan_hash",
+        "profile_input_digest",
+        "selection_proof_id",
+        "sql_contract_digest",
+    ]
 )
 _POSITIVE_ROW_CAP_FIELDS = frozenset(
     {
@@ -378,13 +398,7 @@ class ProviderDirectoryProfileCapacityGeometry:
     current_context_vector_hash: str
     desired_context_vector_hash: str
     sql_contract_digest: str
-    database_system_identifier: str
-    database_oid: int
-    database_name: str
-    tablespace_oid: int
-    tablespace_name: str
-    evidence_target_oid: int
-    profile_target_oid: int
+    relations: dict[str, dict[str, Any]]
     postgres_server_version_num: int
     postgres_block_size_bytes: int
     postgres_toast_max_chunk_size_bytes: int
@@ -400,18 +414,6 @@ class ProviderDirectoryProfileCapacityGeometry:
     postgres_default_toast_compression: str
     postgres_checkpoint_timeout_seconds: int
     postgres_max_wal_size_bytes: int
-    evidence_target_storage_fingerprint: str
-    profile_target_storage_fingerprint: str
-    build_checkpoint_oid: int
-    serving_generation_oid: int
-    delta_receipt_oid: int
-    import_run_oid: int
-    capacity_consumption_oid: int
-    build_checkpoint_storage_fingerprint: str
-    serving_generation_storage_fingerprint: str
-    delta_receipt_storage_fingerprint: str
-    import_run_storage_fingerprint: str
-    capacity_consumption_storage_fingerprint: str
     control_wal_plan_input_hash: str
     control_wal_upper_bound_bytes: int
     control_metadata_data_upper_bound_bytes: int
@@ -443,6 +445,8 @@ class ProviderDirectoryProfileCapacityGeometry:
     max_affected_npis: int
     max_profile_rows: int
     relation_byte_caps: tuple[ProviderDirectoryProfileRelationByteCaps, ...]
+    legacy_payload: dict[str, Any] | None = field(default=None, kw_only=True, repr=False)
+    legacy_geometry_hash: str | None = field(default=None, kw_only=True, repr=False)
 
     @property
     def is_bounded_admission(self) -> bool:
@@ -454,11 +458,23 @@ class ProviderDirectoryProfileCapacityGeometry:
     @property
     def cutover_forecast_contract_id(self) -> str:
         """Return the forecast wire contract for this admission model."""
+        if self.legacy_payload is not None:
+            return (
+                "healthporta.provider-directory-profile-cutover-forecast.v2"
+                if self.bounded_admission
+                else "healthporta.provider-directory-profile-cutover-forecast.v1"
+            )
         return BOUNDED_CUTOVER_FORECAST_CONTRACT_ID if self.bounded_admission else CUTOVER_FORECAST_CONTRACT_ID
 
     @property
     def cutover_actual_contract_id(self) -> str:
         """Return the actual wire contract for this admission model."""
+        if self.legacy_payload is not None:
+            return (
+                "healthporta.provider-directory-profile-cutover-actual.v2"
+                if self.bounded_admission
+                else "healthporta.provider-directory-profile-cutover-actual.v1"
+            )
         return BOUNDED_CUTOVER_ACTUAL_CONTRACT_ID if self.bounded_admission else CUTOVER_ACTUAL_CONTRACT_ID
 
     @property

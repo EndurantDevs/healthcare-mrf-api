@@ -31,7 +31,10 @@ async def _stages(connection):
 
 
 async def test_genuine_typed_source_complete_export_and_independent_replay(monkeypatch):
-    async with source_witness_case(monkeypatch) as case, case.writer.transaction(isolation="repeatable_read"):
+    async with (
+        source_witness_case(monkeypatch, named=True) as case,
+        case.writer.transaction(isolation="repeatable_read"),
+    ):
         async with typed.typed_source_graph(case.source_export, case.writer, **_arguments(case)) as stage:
             document = validate_graph_document(json.loads(json.dumps(stage.document)))
             assert document["derivation_version"] == 3
@@ -40,7 +43,7 @@ async def test_genuine_typed_source_complete_export_and_independent_replay(monke
             assert len(rows) == 1
             pair_by_field = dict(rows[0])
             assert pair_by_field["network_source_key"] == "network-one" and pair_by_field["provider_id"] == "1234567893"
-            assert pair_by_field["location_id"] == registry_location_id(source.SOURCE, "office-one")
+            assert pair_by_field["location_id"] == registry_location_id(case.origin.source_id, "office-one")
             assert pair_by_field["reference_rows"] == 1 and pair_by_field["canonical_identity"].endswith("|street")
             assert document["counts"]["source_rows"] == sum(dict(case.origin.resource_counts).values())
             assert document["counts"]["projected_rows"] == document["counts"]["source_rows"] - 1
@@ -55,7 +58,7 @@ async def test_genuine_typed_source_complete_export_and_independent_replay(monke
             assert "payload_json" not in CELL_COLUMNS
         assert await _stages(case.writer) == 0
         with pytest.raises(TypedFHIRGraphError, match="workspace_closed"):
-            await stage.verify(case.writer)
+            stage.require_ready()
 
 
 def _affiliation_fixture_rows(dataset):
@@ -116,7 +119,10 @@ def _strict_rows(edition, dataset):
         "inactive": {"active": False},
         "expired": {"period_end": "2026-09-30"},
         "future": {"period_start": "2026-10-02"},
-        "acceptance": {"network_refs": [], "accepting_patients": [{"from_network_ref": "Organization/network-one"}]},
+        "acceptance": {
+            "network_refs": [],
+            "accepting_patients": [{"code": "newpt", "from_network_ref": "Organization/network-one"}],
+        },
         "service": {"location_refs": [], "healthcare_service_refs": ["HealthcareService/service-one"]},
         "organization-address": {"location_refs": [], "organization_ref": "Organization/provider-org"},
     }
@@ -131,7 +137,7 @@ def _strict_rows(edition, dataset):
 async def test_strict_subject_reference_and_acceptance_boundaries(monkeypatch):
     monkeypatch.setattr(source, "_edition_rows", _strict_rows)
     async with (
-        source_witness_case(monkeypatch) as case,
+        source_witness_case(monkeypatch, named=True) as case,
         case.writer.transaction(isolation="repeatable_read"),
         typed.typed_source_graph(case.source_export, case.writer, **_arguments(case)) as stage,
     ):
@@ -162,7 +168,7 @@ def _role_page_boundary_rows(edition, dataset):
                 {
                     field: subject,
                     "network_refs": ["Organization/network-one"] * 2,
-                    "location_refs": ["Location/office-one"] * 3,
+                    "location_refs": ["Location/office-one"] * (3 if kind == "OrganizationAffiliation" else 6),
                 },
                 dataset,
             )
@@ -206,20 +212,30 @@ async def test_role_pages_preserve_type_boundaries_and_reference_multiplicity(mo
     monkeypatch.setattr(source, "_edition_rows", _role_page_boundary_rows)
     monkeypatch.setattr(typed, "_pairs", indexed_pairs)
     async with (
-        source_witness_case(monkeypatch) as case,
+        source_witness_case(monkeypatch, named=True) as case,
         case.writer.transaction(isolation="repeatable_read"),
         typed.typed_source_graph(case.source_export, case.writer, **_arguments(case)) as stage,
     ):
-        rows = await case.writer.fetch(
+        pair_rows = await case.writer.fetch(
             "SELECT resource_type,resource_id,provider_id,reference_rows FROM "
             + stage.relation("pairs")
             + " ORDER BY resource_type,resource_id"
         )
+        reference_counts = await case.writer.fetch(
+            "SELECT resource_type,count(*),min(cardinality(network_refs)),max(cardinality(network_refs)),"
+            "min(cardinality(location_refs)),max(cardinality(location_refs)) FROM "
+            + stage.relation("cells")
+            + " WHERE resource_id LIKE 'range-%' GROUP BY resource_type ORDER BY resource_type"
+        )
+        assert [tuple(reference_count) for reference_count in reference_counts] == [
+            ("OrganizationAffiliation", 130, 2, 2, 3, 3),
+            ("PractitionerRole", 130, 1, 1, 6, 6),
+        ]
         expected_rows = [("OrganizationAffiliation", "participant", "1000000004", 1)]
         expected_rows.extend(("OrganizationAffiliation", f"range-{index:04d}", "1000000004", 6) for index in range(130))
         expected_rows.extend(("PractitionerRole", f"range-{index:04d}", "1234567893", 6) for index in range(130))
         expected_rows.append(("PractitionerRole", "role-office", "1234567893", 1))
-        assert [tuple(row) for row in rows] == expected_rows
+        assert [tuple(pair) for pair in pair_rows] == expected_rows
     assert checked_plans == [True]
 
 
@@ -232,7 +248,10 @@ async def test_raw_checker_refuses_producer_npi_substitution(monkeypatch):
             "UPDATE " + stage.relation("cells") + " SET npi='1000000004' WHERE resource_type='Practitioner'"
         )
 
-    async with source_witness_case(monkeypatch) as case, case.writer.transaction(isolation="repeatable_read"):
+    async with (
+        source_witness_case(monkeypatch, named=True) as case,
+        case.writer.transaction(isolation="repeatable_read"),
+    ):
         with monkeypatch.context() as patch:
             patch.setattr(typed, "_project_page", corrupt)
             with pytest.raises(TypedFHIRGraphError, match="raw_graph_differs"):
@@ -244,10 +263,18 @@ async def test_raw_checker_refuses_producer_npi_substitution(monkeypatch):
 
 
 async def test_authority_alias_and_cancelled_source_restart_at_zero(monkeypatch):
-    async with source_witness_case(monkeypatch) as case, case.writer.transaction(isolation="repeatable_read"):
-        with pytest.raises(ValueError):
-            async with typed.typed_source_graph(lambda **_kwargs: None, case.writer, **_arguments(case)):
-                pytest.fail("forged factory admitted")
+    async with (
+        source_witness_case(monkeypatch, named=True) as case,
+        case.writer.transaction(isolation="repeatable_read"),
+    ):
+        changed_profile = replace(
+            case.source_profile, catalog_schema_name=case.source_profile.catalog_schema + "_missing"
+        )
+        with pytest.raises(ValueError, match="source_profile"):
+            async with typed.typed_source_graph(
+                case.source_export, case.writer, **{**_arguments(case), "source_profile": changed_profile}
+            ):
+                pytest.fail("different named catalog scope admitted")
         changed = replace(case.origin, source_aliases=tuple(sorted((*case.origin.source_aliases, "foreign-alias"))))
         with pytest.raises(ValueError):
             async with typed.typed_source_graph(
@@ -318,7 +345,7 @@ def _fanout_rows(edition, dataset):
 async def test_native_13542_unique_and_repeated_edges_remain_streamed(monkeypatch):
     monkeypatch.setattr(source, "_edition_rows", _fanout_rows)
     async with (
-        source_witness_case(monkeypatch) as case,
+        source_witness_case(monkeypatch, named=True) as case,
         case.writer.transaction(isolation="repeatable_read"),
         typed.typed_source_graph(case.source_export, case.writer, **_arguments(case)) as stage,
     ):
@@ -442,8 +469,6 @@ async def _check_persistent_capture_reader(case, document, anchor, descriptor, n
             expected_anchor=anchor,
             capture_sha256=document["capture_sha256"],
             catalog_generation=fhir_catalog_source_generation(descriptor),
-            owner_role=case.fixture.role_by_kind["owner"],
-            runtime_roles=(case.fixture.component.reader,),
         )
         assert resolved == document
         with pytest.raises(TypedFHIRGraphError, match="reference_context"):
@@ -452,10 +477,7 @@ async def _check_persistent_capture_reader(case, document, anchor, descriptor, n
                 expected_anchor=anchor,
                 capture_sha256="0" * 64,
                 catalog_generation=fhir_catalog_source_generation(descriptor),
-                owner_role=case.fixture.role_by_kind["owner"],
-                runtime_roles=(case.fixture.component.reader,),
             )
-        assert await case.reader.fetchval("SELECT session_user::text=current_user::text")
         assert await case.reader.fetchval("SHOW transaction_read_only") == "on"
         wrong = custody.TypedGraphAnchor(str(uuid4()), anchor.observed_at)
         with pytest.raises(TypedFHIRGraphError, match="anchor"):
@@ -476,26 +498,27 @@ async def _make_persistent_capture(case):
     identity = uuid4()
     schema = custody.PREFIX + identity.hex
     case.fixture.namespaces.append(schema)
-    async with case.writer.transaction(isolation="repeatable_read"):
+    administrator = case.fixture.admin
+    async with administrator.transaction(isolation="repeatable_read"):
         anchor = custody.TypedGraphAnchor(
-            str(identity), canonical_timestamp(await case.writer.fetchval("SELECT transaction_timestamp()"))
+            str(identity), canonical_timestamp(await administrator.fetchval("SELECT transaction_timestamp()"))
         )
         document = await custody.capture_typed_source_graph(
             case.source_export,
-            case.writer,
+            administrator,
             **{
                 **_arguments(case),
                 "membership_as_of": case.origin.semantic_projection_as_of or anchor.observed_at[:10],
             },
             capture_options=custody.TypedGraphCaptureOptions(
                 expected_anchor=anchor,
-                owner_role=case.fixture.role_by_kind["owner"],
+                owner_role=case.fixture.issued.namespace_owner_role,
                 runtime_roles=(case.fixture.component.reader,),
             ),
             catalog_descriptor=descriptor,
         )
-        assert document["descriptor_version"] == 4
-        assert set(document["catalog"]["relation_oids"]) == {"cells", "addresses", "pairs"}
+        assert document["descriptor_version"] == 5
+        assert document["tables"] == {kind: {"schema": schema, "name": name} for kind, name in custody.TABLES.items()}
     return document, anchor, descriptor, schema
 
 
@@ -506,20 +529,28 @@ async def _assert_closed_capture_writes(case, schema):
         with pytest.raises(asyncpg.InsufficientPrivilegeError):
             async with case.reader.transaction():
                 await case.reader.execute('DELETE FROM "' + schema + '".source_pairs')
-    async with case.writer.transaction(isolation="repeatable_read"):
-        with pytest.raises(asyncpg.InsufficientPrivilegeError):
-            async with case.writer.transaction():
-                await case.writer.execute('UPDATE "' + schema + '".source_cells SET npi=NULL')
+    writer = await asyncpg.connect(
+        case.fixture.component.admin_engine.url.set(
+            drivername="postgresql", username=case.fixture.component.retained_publisher
+        ).render_as_string(hide_password=False)
+    )
+    try:
+        async with writer.transaction(isolation="repeatable_read"):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                async with writer.transaction():
+                    await writer.execute('UPDATE "' + schema + '".source_cells SET npi=NULL')
+    finally:
+        await writer.close()
 
 
 @pytest.mark.parametrize("invalid_locations", [False, True], ids=["valid-locations", "invalid-locations"])
 async def test_persistent_typed_capture_closed_native_reader_and_independent_replay(monkeypatch, invalid_locations):
-    """Verify sealed custody, read-only replay, changed-pin refusal and denied writes."""
+    """Verify named content, read-only replay, changed-pin refusal and denied writes."""
     from uuid import uuid4
 
     if invalid_locations:
         monkeypatch.setattr(source, "_edition_rows", _invalid_location_rows)
-    async with source_witness_case(monkeypatch) as case:
+    async with source_witness_case(monkeypatch, named=True) as case:
         document, anchor, descriptor, schema = await _make_persistent_capture(case)
         # Precreate only temporary checker scratch before the genuine Reader read-only snapshot.
         names_by_kind = {kind: "typed_replay_" + kind + "_" + uuid4().hex for kind in typed._DDL}
@@ -577,7 +608,7 @@ async def test_typed_approved_catalog_and_native_office_mapping(monkeypatch):
     from process import network_fhir_typed_mapping as mapping
 
     async with (
-        source_witness_case(monkeypatch) as case,
+        source_witness_case(monkeypatch, named=True) as case,
         source.generic_refresh_execution(case.fixture, monkeypatch) as (execution, serving, _stack, _head),
     ):
         descriptor, coordinates, network, approved = await _approve_typed_catalog_network(case, serving)
@@ -605,9 +636,9 @@ async def test_typed_approved_catalog_and_native_office_mapping(monkeypatch):
             )
             assert await case.reader.fetchval(
                 "SELECT location_id FROM " + graph_mapping.relation("bindings")
-            ) == registry_location_id(source.SOURCE, "office-one")
+            ) == registry_location_id(case.origin.source_id, "office-one")
             changed = copy.deepcopy(descriptor)
-            changed["native_catalog_sha256"] = "0" * 64
+            changed["dataset_sha256"] = "0" * 64
             with pytest.raises(ValueError):
                 mapping.require_catalog_graph_scope(stage, coordinates, changed)
             for name in graph_mapping.table_names.values():
@@ -645,7 +676,7 @@ async def test_provider_only_pages_keep_networked_rows_and_type_boundaries(monke
         lambda edition, dataset: _provider_page_boundary_rows(edition, dataset, include_affiliations),
     )
     async with (
-        source_witness_case(monkeypatch) as case,
+        source_witness_case(monkeypatch, named=True) as case,
         source.generic_refresh_execution(case.fixture, monkeypatch) as (execution, serving, _stack, _head),
     ):
         descriptor, coordinates, _network, approved = await _approve_typed_catalog_network(case, serving)
@@ -685,18 +716,25 @@ async def _produce_recipe_capture(case, descriptor, runtime_roles):
 
     capture_id = uuid4()
     case.fixture.namespaces.append(custody.PREFIX + capture_id.hex)
-    async with case.writer.transaction(isolation="repeatable_read"):
+    administrator = case.fixture.admin
+    async with administrator.transaction(isolation="repeatable_read"):
         anchor = custody.TypedGraphAnchor(
-            str(capture_id), canonical_timestamp(await case.writer.fetchval("SELECT transaction_timestamp()"))
+            str(capture_id), canonical_timestamp(await administrator.fetchval("SELECT transaction_timestamp()"))
         )
         capture = await custody.capture_typed_source_graph(
             case.source_export,
-            case.writer,
+            administrator,
             source_profile=case.source_profile,
             reviewed_origin=case.origin,
             membership_as_of=case.origin.semantic_projection_as_of or anchor.observed_at[:10],
             capture_options=custody.TypedGraphCaptureOptions(
-                expected_anchor=anchor, owner_role=case.fixture.role_by_kind["owner"], runtime_roles=runtime_roles
+                expected_anchor=anchor,
+                owner_role=(
+                    case.fixture.issued.namespace_owner_role
+                    if getattr(case.fixture, "named", False)
+                    else case.fixture.role_by_kind["owner"]
+                ),
+                runtime_roles=runtime_roles,
             ),
             catalog_descriptor=descriptor,
         )
@@ -704,7 +742,7 @@ async def _produce_recipe_capture(case, descriptor, runtime_roles):
 
 
 async def _make_typed_publication_recipe(case, serving, runtime_roles, *, target_network_id=None):
-    """Create a sealed graph and approve its exact catalog network for publication."""
+    """Create a frozen graph and approve its exact catalog network for publication."""
     from dataclasses import asdict
     from types import SimpleNamespace
 
@@ -788,28 +826,28 @@ async def _typed_worker_capture(
 def _observe_typed_verification(monkeypatch):
     from process import network_fhir_typed_capture as custody
 
-    checked_actors = []
+    checked_captures = []
     original_verify = custody.verify_typed_graph_capture
 
     async def observe_raw_verification(factory, connection, document, **options):
         result = await original_verify(factory, connection, document, **options)
-        checked_actors.append(await connection.fetchval("SELECT session_user"))
+        checked_captures.append(document["capture_id"])
         return result
 
     monkeypatch.setattr(custody, "verify_typed_graph_capture", observe_raw_verification)
-    return checked_actors
+    return checked_captures
 
 
 def _substitute_typed_mapping(monkeypatch):
     from process import registry_typed_source_stage as staging
-    from process.network_fhir_typed_capture import SealedTypedGraphRead
+    from process.network_fhir_typed_capture import TypedGraphRead
 
     original_mapping = staging.map_typed_graph_batch
 
     async def substitute(connection, inputs, **options):
         results = await original_mapping(connection, inputs, **options)
         for result in results:
-            if type(result.source_stage) is SealedTypedGraphRead:
+            if type(result.source_stage) is TypedGraphRead:
                 await connection.execute("UPDATE " + result.relation("memberships") + " SET evidence_id=repeat('0',64)")
         return results
 
@@ -825,7 +863,7 @@ def _observe_typed_accounting(monkeypatch):
 
     async def observe(connection, schema, addresses, work, affected):
         result = await original_build(connection, schema, addresses, work, affected)
-        work_builds.append((await connection.fetchval("SELECT session_user"), schema, work))
+        work_builds.append((schema, work))
         return result
 
     monkeypatch.setattr(native, "build_matched_facts", observe)
@@ -833,7 +871,7 @@ def _observe_typed_accounting(monkeypatch):
     return work_builds
 
 
-async def _assert_rejected_typed_publication(context, checked_actors):
+async def _assert_rejected_typed_publication(context, checked_captures):
     from tests import test_network_fhir_source_witness_publication_postgres as publication
 
     async with publication._consumer(context.worker) as (arguments, _calls):
@@ -843,7 +881,7 @@ async def _assert_rejected_typed_publication(context, checked_actors):
             await publication.consume_registry_publication_once(**arguments)
         assert (await publication._status(context.worker, queued))["state"] == "rejected"
         assert await publication._head(context.worker) is None
-        assert checked_actors == [await context.operator.connection.fetchval("SELECT session_user")]
+        assert checked_captures == [context.capture["capture_id"]]
         assert context.ready_targets and not context.sealed_targets
     for _ in range(2):
         async with publication._consumer(context.worker) as (arguments, _calls):
@@ -877,12 +915,42 @@ async def _assert_typed_candidate_counts(context):
     )
 
 
+async def _assert_legacy_typed_publication(context):
+    """Match the complete logical observation to the genuine original publication."""
+    from datetime import UTC
+
+    from db.plan_release_storage import storage_relation
+    from process.network_fhir_source_witness_contract import OBSERVED_LEGACY_PROFILE
+
+    origin = context.case.origin
+    header_relation = storage_relation(origin.header_relation["schema"], origin.header_relation["name"])
+    header = await context.case.fixture.admin.fetchrow(
+        "SELECT acquisition_root_run_id,published_at,resource_count,"
+        "publication_metadata_json->>'resource_hash_contract' AS resource_hash_contract "
+        f"FROM {header_relation} WHERE dataset_id=$1",
+        origin.dataset_id,
+    )
+    assert header is not None
+    published_at = header["published_at"]
+    published_at = published_at.replace(tzinfo=UTC) if published_at.tzinfo is None else published_at.astimezone(UTC)
+    assert context.capture["graph"]["origin"]["admission_profile"] == OBSERVED_LEGACY_PROFILE
+    assert context.capture["graph"]["origin"]["semantic_projection_as_of"] is None
+    assert context.capture["catalog_descriptor"]["admission"]["publication"] == {
+        "root_run_id": header["acquisition_root_run_id"],
+        "published_at": published_at.isoformat(),
+        "resource_hash_contract": header["resource_hash_contract"],
+        "claimed_resource_count": header["resource_count"],
+    }
+    assert header["acquisition_root_run_id"] == origin.root_run_id
+    assert header["resource_count"] == sum(dict(origin.resource_counts).values())
+
+
 @pytest.mark.parametrize(
     "source_profile_kind,substitute_execution_output",
     [("modern", False), ("modern", True), ("legacy_missing_source_id", False)],
 )
 async def test_typed_source_ordinary_compact_publication(monkeypatch, source_profile_kind, substitute_execution_output):
-    """Publish typed inputs through ordinary custody and reject substituted producer output."""
+    """Publish typed inputs through named preparation and reject substituted producer output."""
 
     from tests import test_network_fhir_source_witness_publication_postgres as publication
 
@@ -900,34 +968,28 @@ async def test_typed_source_ordinary_compact_publication(monkeypatch, source_pro
 
         monkeypatch.setattr(legacy_fixture, "legacy_resources", resources_without_embedded_source)
 
-    checked_actors = _observe_typed_verification(monkeypatch)
+    checked_captures = _observe_typed_verification(monkeypatch)
     built_work = _observe_typed_accounting(monkeypatch)
     monkeypatch.setattr(publication, "_source_capture_for_workers", _typed_worker_capture)
     if substitute_execution_output:
         _substitute_typed_mapping(monkeypatch)
     async with publication._publication_case(monkeypatch, legacy=is_legacy) as context:
         if is_legacy:
-            from process.network_fhir_source_witness_contract import OBSERVED_LEGACY_PROFILE
-
-            assert context.capture["graph"]["origin"]["admission_profile"] == OBSERVED_LEGACY_PROFILE
-            assert context.capture["graph"]["origin"]["semantic_projection_as_of"] is None
-            assert context.capture["catalog_descriptor"]["admission"]["publication"]["original_metadata_sha256"] is None
+            await _assert_legacy_typed_publication(context)
         if substitute_execution_output:
-            await _assert_rejected_typed_publication(context, checked_actors)
+            await _assert_rejected_typed_publication(context, checked_captures)
             return
         manifest = await publication._publish_once(context)
         assert manifest.compact_layout is not None and manifest.generation_id > 0
-        assert checked_actors == [await context.operator.connection.fetchval("SELECT session_user")]
-        assert context.worker.roles_by_kind["execution"] not in checked_actors
-        assert [actor for actor, _, _ in built_work] == [context.worker.roles_by_kind["execution"], checked_actors[0]]
-        assert len({work for _, _, work in built_work}) == 2
+        assert checked_captures == [context.capture["capture_id"]]
+        assert len(built_work) == 2 and len({work for _, work in built_work}) == 2
         await _assert_typed_candidate_counts(context)
         if not is_legacy:
             # A newer, unselected Source publication must not invalidate the last-good closed contribution.
             await source.publish_edition(context.case.fixture, 2)
             second = await publication._publish_once(context, head=manifest.generation_id)
             assert second.generation_id > manifest.generation_id
-            assert checked_actors == [await context.operator.connection.fetchval("SELECT session_user")]
+            assert checked_captures == [context.capture["capture_id"]]
             async with (
                 publication._login(context.worker, "api") as reader,
                 reader.transaction(isolation="repeatable_read", readonly=True),
@@ -935,13 +997,14 @@ async def test_typed_source_ordinary_compact_publication(monkeypatch, source_pro
                 assert await publication._membership_snapshot(reader, second) == await publication._membership_snapshot(
                     reader, manifest
                 )
-        # Reopen the real worker twice to exercise unchanged permission verification and an empty queue.
+        # Reopen the real worker twice to exercise unchanged configuration and an empty queue.
         for _ in range(2):
             async with publication._consumer(context.worker) as (arguments, _calls):
                 assert await publication.consume_registry_publication_once(**arguments) is None
 
 
 async def _assert_sealed_resume_failure(context, address_sources, head):
+    """Retain named input evidence while the sealed candidate lacks final readiness."""
     from uuid import UUID, uuid5
 
     from process import registry_publication_consumer as consumer
@@ -969,7 +1032,19 @@ async def _assert_sealed_resume_failure(context, address_sources, head):
         )
         report = json.loads(candidate_by_field["validation_json"])
         assert candidate_by_field["state"] == "sealed" and candidate_by_field["expected_rows"] > 0
-        assert "writer_closure" in report and "address_source" not in report and "serving_readiness" not in report
+        expected_address_by_field = {
+            "schema_name": address_sources.base_source.schema_name,
+            "table_name": address_sources.base_source.table_name,
+            "generation_id": address_sources.base_source.generation_id,
+        }
+        assert report["address_source"] == expected_address_by_field
+        assert report["registry_initial_source_offices"]["revision"] == 6
+        assert report["registry_initial_source_offices"]["context"]["address_source"] == expected_address_by_field
+        assert (
+            json.loads(candidate_by_field["source_generations"])["unified_address"]
+            == expected_address_by_field["generation_id"]
+        )
+        assert "serving_readiness" not in report
         assert (await publication._status(context.worker, queued))["state"] == "running"
         assert await publication._head(context.worker) == head
         revision_by_field = dict(
@@ -991,7 +1066,7 @@ async def _assert_sealed_resume_failure(context, address_sources, head):
 
 
 async def _assert_sealed_resume_publication(context, address_sources, failed_by_field):
-    """Wait for the real lease, then verify unchanged approval and candidate custody."""
+    """Wait for the real lease, then verify unchanged approval and named candidate data."""
     from uuid import UUID
 
     from process import registry_publication_consumer as consumer
@@ -1038,6 +1113,9 @@ async def _assert_sealed_resume_publication(context, address_sources, failed_by_
         for field in identity_fields + ("expected_rows", "source_generations", "source_recipes_json"):
             assert published_by_field[field] == candidate_by_field[field]
         assert published_by_field["state"] == "published"
+        published_report = json.loads(published_by_field["validation_json"])
+        assert published_report["address_source"] == json.loads(candidate_by_field["validation_json"])["address_source"]
+        assert published_report["serving_readiness"]["ready"] is True
         assert await publication._head(context.worker) == completed["result"]["serving_generation"]
         assert completed["result"]["serving_generation"] > candidate_by_field["expected_head"]
         assert context.ready_targets[-1] == context.sealed_targets[-1]
@@ -1046,7 +1124,7 @@ async def _assert_sealed_resume_publication(context, address_sources, failed_by_
 
 
 async def test_sealed_typed_candidate_resumes_after_transient_readiness_failure(monkeypatch):
-    """Fresh workers resume the same sealed candidate before its validation report exists."""
+    """Fresh workers resume the same sealed candidate before its serving readiness is complete."""
     from process import registry_candidate_composition as composition
     from process import registry_publication_consumer as consumer
     from process import registry_typed_office_parity as parity
@@ -1055,18 +1133,17 @@ async def test_sealed_typed_candidate_resumes_after_transient_readiness_failure(
     monkeypatch.setattr(publication, "_source_capture_for_workers", _typed_worker_capture)
     monkeypatch.setattr(consumer, "_LEASE_SECONDS", 30)
     monkeypatch.setattr(consumer, "_HEARTBEAT_SECONDS", 10)
-    checked_actors = _observe_typed_verification(monkeypatch)
+    checked_captures = _observe_typed_verification(monkeypatch)
     async with publication._publication_case(monkeypatch) as context:
         initial_sources = publication._initial_sources(context)
         previous = await publication._publish_once(context, sources=replace(initial_sources, initial_source_recipes=()))
         address_sources = replace(
             initial_sources, initial_source_recipes=(), replacement_source_recipes=(context.recipe,)
         )
-        connection = context.worker.fixture.connection
         original_domain = parity.has_binding_domain_difference
         original_approve = consumer.approve_queued_registry_publication
         approvals = []
-        backends = []
+        readiness_calls = []
 
         async def approve(*args, **kwargs):
             result = await original_approve(*args, **kwargs)
@@ -1074,15 +1151,14 @@ async def test_sealed_typed_candidate_resumes_after_transient_readiness_failure(
             return result
 
         async def fail_readiness(active, receipt, carrier):
-            backends.append(await active.fetchval("SELECT pg_backend_pid()"))
+            readiness_calls.append(True)
             raise RuntimeError("synthetic_readiness_unavailable")
 
         monkeypatch.setattr(consumer, "approve_queued_registry_publication", approve)
         monkeypatch.setattr(parity, "has_binding_domain_difference", fail_readiness)
         failed_by_field = await _assert_sealed_resume_failure(context, address_sources, previous.generation_id)
-        assert checked_actors == []
-        assert len(backends) == 1
-        assert await connection.fetchval("SELECT count(*) FROM pg_stat_activity WHERE pid=$1", backends[0]) == 0
+        assert checked_captures == []
+        assert readiness_calls == [True]
         monkeypatch.setattr(parity, "has_binding_domain_difference", original_domain)
 
         async def refuse_recopy(*args, **kwargs):
@@ -1092,8 +1168,7 @@ async def test_sealed_typed_candidate_resumes_after_transient_readiness_failure(
         await _assert_sealed_resume_publication(context, address_sources, failed_by_field)
         assert approvals[0]["replayed"] is False and approvals[1]["replayed"] is True
         assert approvals[0]["approved_revision"] == approvals[1]["approved_revision"]
-        assert checked_actors == [await context.operator.connection.fetchval("SELECT session_user")]
-        assert context.worker.roles_by_kind["execution"] not in checked_actors
+        assert checked_captures == [context.capture["capture_id"]]
 
 
 def _typed_replacement_inputs(source_inputs, first_typed, reference):
@@ -1294,50 +1369,50 @@ async def test_typed_bounded_multiset_parity_hot_duplicate_bucket(monkeypatch):
         require_order_index,
     )
 
-    async with source_witness_case(monkeypatch) as case, case.writer.transaction():
+    async with source_witness_case(monkeypatch, named=True) as case, case.reader.transaction():
         for name in ("typed_parity_actual", "typed_parity_expected"):
-            await case.writer.execute(
+            await case.reader.execute(
                 "CREATE TEMP TABLE "
                 + name
                 + "(network_id integer NOT NULL,provider_system text NOT NULL,provider_id text NOT NULL,location_id uuid NOT NULL,evidence_id text NOT NULL)"
             )
-            await create_order_index(case.writer, name, name + "_idx")
-            await require_order_index(case.writer, name)
+            await create_order_index(case.reader, name, name + "_idx")
+            await require_order_index(case.reader, name)
             # Independently declared identical multisets: one hot duplicate key plus 12,000 wide keys.
-            await case.writer.execute(
+            await case.reader.execute(
                 "INSERT INTO "
                 + name
                 + " SELECT 1,'npi','1234567893','00000000-0000-4000-8000-000000000001'::uuid,repeat('a',900) FROM generate_series(1,20000) UNION ALL SELECT 1,'provider_directory',repeat('z',900)||n::text,md5(n::text)::uuid,repeat('b',900) FROM generate_series(1,12000) n"
             )
-            await case.writer.execute("CREATE INDEX ON " + name + "(network_id)")
-            await case.writer.execute("ANALYZE " + name)
+            await case.reader.execute("CREATE INDEX ON " + name + "(network_id)")
+            await case.reader.execute("ANALYZE " + name)
         actual, expected = "SELECT * FROM typed_parity_actual", "SELECT * FROM typed_parity_expected"
         for memory in ("4MB", "16MB"):
-            await case.writer.execute("SET LOCAL work_mem='" + memory + "'")
-            assert await case.writer.fetchval("SHOW temp_file_limit") == "256MB"
-            assert not await has_multiset_difference(case.writer, actual, expected)
-            async with case.writer.transaction():
-                await case.writer.execute(
+            await case.reader.execute("SET LOCAL work_mem='" + memory + "'")
+            assert await case.reader.fetchval("SHOW temp_file_limit") == "256MB"
+            assert not await has_multiset_difference(case.reader, actual, expected)
+            async with case.reader.transaction():
+                await case.reader.execute(
                     "DELETE FROM typed_parity_actual WHERE ctid=(SELECT ctid FROM typed_parity_actual WHERE provider_system='npi' LIMIT 1)"
                 )
-                assert await has_multiset_difference(case.writer, actual, expected)
-                await case.writer.execute(
+                assert await has_multiset_difference(case.reader, actual, expected)
+                await case.reader.execute(
                     "INSERT INTO typed_parity_actual SELECT * FROM typed_parity_expected WHERE provider_system='npi' LIMIT 1"
                 )
-            await _assert_typed_field_corruption(case.writer, actual, expected)
-            assert not await has_multiset_difference(case.writer, actual, expected)
-            transaction = case.writer.transaction()
+            await _assert_typed_field_corruption(case.reader, actual, expected)
+            assert not await has_multiset_difference(case.reader, actual, expected)
+            transaction = case.reader.transaction()
             await transaction.start()
             try:
-                await case.writer.execute("DELETE FROM typed_parity_actual WHERE provider_system='npi'")
-                await case.writer.execute(
+                await case.reader.execute("DELETE FROM typed_parity_actual WHERE provider_system='npi'")
+                await case.reader.execute(
                     "INSERT INTO typed_parity_actual VALUES(9,'manual','custom-provider','00000000-0000-4000-8000-000000000003','approved-custom')"
                 )
                 effective = (
                     expected
                     + " WHERE provider_system<>'npi' UNION ALL SELECT 9,'manual','custom-provider','00000000-0000-4000-8000-000000000003'::uuid,'approved-custom'"
                 )
-                assert not await has_multiset_difference(case.writer, actual, effective)
+                assert not await has_multiset_difference(case.reader, actual, effective)
             finally:
                 await transaction.rollback()
 

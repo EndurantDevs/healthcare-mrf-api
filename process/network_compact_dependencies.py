@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Verify retained physical dependencies of an independently sealed compact candidate."""
+"""Resolve named compact dependencies and their logical candidate readiness."""
 
 import json
 from uuid import UUID
@@ -11,34 +11,27 @@ from process.network_compact_layout import (
     CompactNetworkLayout,
     bind_compact_geo_search_candidate,
 )
-from process.network_compact_readiness import _require
-from process.network_membership_copy import MembershipCopyTarget
-from process.network_membership_validation import _json_object
+from process.network_compact_readiness import _require, compact_readiness
+from process.network_membership_validation import _json_object, _scope_report
 
 
-async def _retained_edge(connection, candidate_id, control_schema):
-    from process.network_candidate_custody import verify_network_candidate_custody
+async def _retained_edge(connection, candidate_id, control_schema, *, api_read=False):
+    from process.network_address_artifact import _require_api_read_context
 
+    await _require_api_read_context(connection, api_read)
     candidate = await connection.fetchrow(
         f"SELECT * FROM {_identifier(control_schema)}.network_membership_candidate WHERE candidate_id=$1",
         UUID(candidate_id),
     )
     _require(candidate is not None and candidate["state"] in ("ready", "published"))
-    target = MembershipCopyTarget(
-        *(str(candidate[field]) for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name"))
-    )
-    seal = await verify_network_candidate_custody(connection, target, control_schema=control_schema)
-    _require(seal["receipt"]["revision"] in (4, 5))
-    return {
-        "candidate_id": target.candidate_id,
-        "schema_name": target.schema_name,
-        "table_oid": seal["receipt"]["closure"]["relation_oids"]["network_office_edge"],
-        "seal_sha256": seal["seal_sha256"],
-    }
+    report = _json_object(candidate["validation_json"])
+    source = PinnedAddressSource(**report["address_source"])
+    compact_readiness(candidate, report, _scope_report(candidate, source))
+    return {"candidate_id": str(candidate["candidate_id"]), "schema_name": candidate["schema_name"]}
 
 
 async def capture_compact_edge_artifacts(connection, target, *, control_schema):
-    """Pin old slice heaps directly; their historical address dependencies are irrelevant."""
+    """Retain each referenced slice generation by its candidate and schema names."""
     references = await connection.fetch(
         f"SELECT DISTINCT artifact_candidate_id FROM {_identifier(target.schema_name)}.network_slice_ref "
         "ORDER BY artifact_candidate_id"
@@ -47,95 +40,74 @@ async def capture_compact_edge_artifacts(connection, target, *, control_schema):
     for row in references:
         identity = str(row["artifact_candidate_id"])
         if identity == target.candidate_id:
-            oid = await connection.fetchval(
-                "SELECT to_regclass($1)::oid", _identifier(target.schema_name) + ".network_office_edge"
-            )
-            artifacts.append(
-                {"candidate_id": identity, "schema_name": target.schema_name, "table_oid": oid, "seal_sha256": None}
-            )
+            artifact = CompactEdgeArtifact(identity, target.schema_name)
+            artifacts.append({"candidate_id": artifact.candidate_id, "schema_name": artifact.schema_name})
         else:
             artifacts.append(await _retained_edge(connection, identity, control_schema))
     return artifacts
 
 
-async def verify_compact_dependencies(connection, candidate, *, control_schema):
-    """Resolve authenticated dependency metadata for producers and custodians."""
-    from process.network_address_artifact import verify_network_address_artifact
+async def verify_compact_dependencies(connection, candidate, *, control_schema, api_read=False):
+    """Read the declared address edition and retained edge generations."""
+    from process.network_address_artifact import _require_api_read_context, verify_network_address_artifact
 
+    await _require_api_read_context(connection, api_read)
     report = _json_object(candidate["validation_json"])
-    serving = report["serving_readiness"]
-    closure = report["writer_closure"]
-    runtime_roles = tuple(sorted(set(closure["loader_roles"] + closure["reader_roles"])))
-    base = await verify_network_address_artifact(connection, serving["address_artifact"], runtime_roles=runtime_roles)
-    return await _verified_layout(connection, candidate, base, control_schema)
+    base = await verify_network_address_artifact(
+        connection, report["serving_readiness"]["address_artifact"], api_read=api_read
+    )
+    return await _verified_layout(connection, candidate, base, control_schema, api_read=api_read)
 
 
 async def capture_compact_dependencies(connection, candidate, *, control_schema):
-    """Independently capture current address authority once within final sealing."""
+    """Resolve current or retained address data within the candidate's logical scope."""
+    from process.network_address_artifact import address_artifact_data
     from process.network_compact_address_origin import resolve_compact_address_origin
 
     report = _json_object(candidate["validation_json"])
     address_source = PinnedAddressSource(**report["address_source"])
-    closure = report["writer_closure"]
-    roles = tuple(sorted(set(closure["loader_roles"] + closure["reader_roles"])))
     captured, base = await resolve_compact_address_origin(
-        connection, candidate, address_source, runtime_roles=roles, control_schema=control_schema
+        connection, candidate, address_source, control_schema=control_schema
     )
-    _require(captured == report["serving_readiness"]["address_artifact"])
+    _require(address_artifact_data(captured) == address_artifact_data(report["serving_readiness"]["address_artifact"]))
     return await _verified_layout(connection, candidate, base, control_schema)
 
 
-async def _verified_layout(connection, candidate, base, control_schema):
-    """Bind every layout coordinate to verified metadata without authorizing data consumption."""
+async def _verified_layout(connection, candidate, base, control_schema, *, api_read=False):
+    """Bind qualified relation names after complete candidate readiness validation."""
+    from process.network_address_artifact import _require_api_read_context
     from process.network_compact_custom_preparation import compact_carrier_receipt, compact_custom_receipt
 
+    await _require_api_read_context(connection, api_read)
     report = _json_object(candidate["validation_json"])
-    serving, canonical = report["serving_readiness"], report["candidate_readiness"]
-    closure = report["writer_closure"]
-    _require(
-        closure["relation_oids"].get("network_slice_ref") == canonical["ref_map_oid"]
-        and closure["relation_oids"].get("network_office_edge") == canonical["edge_heap_oid"]
-    )
-    _require(base.table_oid == serving["address_artifact"]["table"]["oid"])
+    address_source = PinnedAddressSource(**report["address_source"])
+    _canonical, serving = compact_readiness(candidate, report, _scope_report(candidate, address_source))
     artifacts = []
-    for expected in serving["edge_artifacts"]:
+    for expected_by_field in serving["edge_artifacts"]:
+        names = {"candidate_id", "schema_name"}
         _require(
-            type(expected) is dict and set(expected) == {"candidate_id", "schema_name", "table_oid", "seal_sha256"}
+            type(expected_by_field) is dict and set(expected_by_field) in (names, names | {"table_oid", "seal_sha256"})
         )
-        artifact = CompactEdgeArtifact(expected["candidate_id"], expected["schema_name"], expected["table_oid"])
+        expected_by_field = {key: expected_by_field[key] for key in names}
+        artifact = CompactEdgeArtifact(**expected_by_field)
         if artifact.candidate_id == str(candidate["candidate_id"]):
-            _require(
-                artifact.schema_name == candidate["schema_name"]
-                and expected["seal_sha256"] is None
-                and artifact.table_oid == canonical["edge_heap_oid"]
-            )
+            _require(artifact.schema_name == candidate["schema_name"])
         else:
-            _require(await _retained_edge(connection, artifact.candidate_id, control_schema) == expected)
+            _require(
+                await _retained_edge(connection, artifact.candidate_id, control_schema, api_read=api_read)
+                == expected_by_field
+            )
         artifacts.append(artifact)
     custom = compact_custom_receipt(candidate)
     carriers = compact_carrier_receipt(candidate)
     custom_relation = None
     if custom is not None:
-        _require(
-            custom.base_source == PinnedAddressSource(**report["address_source"])
-            and custom.base_artifact_sha256 == serving["address_artifact"]["descriptor_sha256"]
-            and custom.binding_table_oid == closure["relation_oids"].get("provider_location_binding")
-            and custom.runtime_roles == tuple(sorted(set(closure["loader_roles"] + closure["reader_roles"])))
-        )
-        custom_oid = custom.address_table_oid
+        _require(custom.base_source == address_source)
         if carriers is not None:
-            _require(
-                carriers.base_source == custom.base_source
-                and carriers.runtime_roles == custom.runtime_roles
-                and carriers.base_artifact_sha256 == custom.base_artifact_sha256
-                and carriers.binding_table_oid == custom.binding_table_oid
-                and (not custom.custom_pair_count or custom_oid == carriers.address_table_oid)
-            )
-            custom_oid = carriers.address_table_oid
+            _require(carriers.base_source == custom.base_source)
         if custom.custom_pair_count or carriers is not None and carriers.materialized_address_rows:
-            _require(custom_oid == closure["relation_oids"].get("entity_address_unified"))
-            custom_relation = CompactAddressRelation(candidate["schema_name"], "entity_address_unified", custom_oid)
-    ref_map = CompactAddressRelation(candidate["schema_name"], "network_slice_ref", canonical["ref_map_oid"])
+            custom_relation = CompactAddressRelation(candidate["schema_name"], "entity_address_unified")
+    ref_map = CompactAddressRelation(candidate["schema_name"], "network_slice_ref")
     layout = CompactNetworkLayout(ref_map, base, tuple(artifacts), custom_relation)
     return bind_compact_geo_search_candidate(layout, candidate)
 

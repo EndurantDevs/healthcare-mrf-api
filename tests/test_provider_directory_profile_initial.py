@@ -23,30 +23,35 @@ fhir = importlib.import_module("process.provider_directory_fhir")
 
 
 def _geometry():
-    return capacity.validated_capacity_geometry(
-        _geometry_payload(
-            contract_id=contract.GEOMETRY_CONTRACT,
-            materialization_mode="full_swap",
-            physical_projection_contract_id=capacity.BOUNDED_ADMISSION_CONTRACT_ID,
-            current_source_vector_hash=None,
-            current_context_vector_hash=None,
-            initial_target_state_sha256="ab" * 32,
-            initial_receipt_oid=29000,
-            initial_receipt_storage_fingerprint="cd" * 32,
-        )
+    raw = _geometry_payload(
+        contract_id=contract.GEOMETRY_CONTRACT,
+        materialization_mode="full_swap",
+        physical_projection_contract_id=capacity.BOUNDED_ADMISSION_CONTRACT_ID,
+        current_source_vector_hash=None,
+        current_context_vector_hash=None,
+        initial_target_state_sha256=contract.target_state_sha256(_target()),
     )
+    raw["relations"]["initial_receipt"] = {
+        "schema": "fixture",
+        "name": contract.RECEIPT_TABLE,
+        "main_index_pages": [2, 2],
+        "toast_index_pages": [1],
+        "toastable_column_count": 2,
+    }
+    return capacity.validated_capacity_geometry(raw)
 
 
 def _target():
+    relations = _geometry_payload()["relations"]
     return {
         "contract_id": contract.TARGET_CONTRACT,
         "resolution": "empty",
         "serving_singleton_absent": True,
         "initial_commit_receipt_absent": True,
-        "evidence_target_oid": 20001,
-        "profile_target_oid": 20002,
-        "evidence_target_storage_fingerprint": "aa" * 32,
-        "profile_target_storage_fingerprint": "bb" * 32,
+        "targets": {
+            role: {key: relations[role + "_target"][key] for key in ("schema", "name")}
+            for role in ("evidence", "profile")
+        },
         "evidence_target_bytes": 8192,
         "profile_target_bytes": 8192,
         "evidence_rows": 0,
@@ -75,12 +80,12 @@ def test_initial_geometry_keeps_delta_wire_contract_closed():
         )
 
 
-@pytest.mark.parametrize("tablespaces", [(), (20001,), (1663, 20001)])
-def test_initial_geometry_refuses_unfunded_receipt_storage(tablespaces):
-    with pytest.raises(RuntimeError, match="initial_receipt_tablespace_unsupported"):
-        initial.geometry_inputs(
-            fhir, None, SimpleNamespace(tablespace_oid=1663), SimpleNamespace(effective_tablespace_oids=tablespaces)
-        )
+@pytest.mark.parametrize("pages", [(), (0,), (-1,)])
+def test_initial_geometry_refuses_unfunded_receipt_storage(pages):
+    raw = capacity.capacity_geometry_payload(_geometry())
+    raw["relations"]["initial_receipt"]["main_index_pages"] = list(pages)
+    with pytest.raises(capacity.ProviderDirectoryProfileCapacityError):
+        capacity.validated_capacity_geometry(raw)
 
 
 def test_initial_control_plan_has_finite_swap_attempts():
@@ -143,7 +148,12 @@ def test_legacy_result_is_validated_without_a_manufactured_date():
         {"serving_singleton_absent": False},
         {"initial_commit_receipt_absent": False},
         {"evidence_rows": 1},
-        {"profile_target_oid": 20001},
+        {
+            "targets": {
+                "evidence": {"schema": "fixture", "name": "same"},
+                "profile": {"schema": "fixture", "name": "same"},
+            }
+        },
     ],
 )
 def test_target_snapshot_refuses_ambiguous_absence(change):

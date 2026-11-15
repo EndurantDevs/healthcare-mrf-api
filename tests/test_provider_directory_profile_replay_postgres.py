@@ -32,21 +32,20 @@ from process.provider_directory_profile_selection_contract import (
     ProviderDirectoryProfileExecution,
     ProviderDirectoryProfileSelectionAttestation,
 )
-from tests.test_provider_directory_profile_capacity import _geometry_payload
-from tests.test_provider_directory_profile_capacity_attestation import (
-    _signed_envelope,
-)
 from tests.provider_directory_profile_capacity_trust_fixtures import (
     capacity_trust_from_envelope,
 )
 from tests.provider_directory_profile_delta_test_support import _delta_database
-
+from tests.test_provider_directory_profile_capacity import _geometry_payload
+from tests.test_provider_directory_profile_capacity_attestation import (
+    _signed_envelope,
+)
 
 importer = importlib.import_module("process.provider_directory_fhir")
 UTC = datetime.timezone.utc
 from tests.provider_directory_profile_replay_seed import (
-    _ReplaySeed,
     _insert_replay_rows,
+    _ReplaySeed,
 )
 from tests.provider_directory_profile_replay_test_support import (
     _capacity_envelope,
@@ -78,8 +77,9 @@ class _ReplayScenario:
 def _replay_scenario(is_cross_run: bool) -> _ReplayScenario:
     """Return deterministic replay identities for one test variant."""
     receipt_run_id = "run_" + "6" * 32
-    source_id = "pdfhir_payer"
-    dataset_id = "dataset-replay"
+    execution = _default_replay_execution()
+    (pair,) = execution.attestation.pairs
+    source_id, dataset_id = pair["source_id"], pair["dataset_id"]
     accepted_at = datetime.datetime(2026, 7, 29, 0, 0, 2, tzinfo=UTC)
     requested_run_id = "run_" + "8" * 32 if is_cross_run else receipt_run_id
     return _ReplayScenario(
@@ -93,8 +93,8 @@ def _replay_scenario(is_cross_run: bool) -> _ReplayScenario:
         source_context_vector=((source_id, "5" * 64),),
         accepted_at=accepted_at,
         committed_at=accepted_at + datetime.timedelta(hours=1),
-        proof_id="3" * 64,
-        profile_input_digest="4" * 64,
+        proof_id=execution.attestation.proof_id,
+        profile_input_digest=execution.attestation.profile_input_digest,
         plan_hash="2" * 64,
     )
 
@@ -107,15 +107,13 @@ async def _insert_replay_import_runs(
     """Insert the receipt owner and optional new requesting run."""
     import_run_ref = profile.qualified_table(schema, "import_run")
     await database.status(
-        f"INSERT INTO {import_run_ref} "
-        "VALUES (:run_id, 'provider-directory-fhir', :status);",
+        f"INSERT INTO {import_run_ref} VALUES (:run_id, 'provider-directory-fhir', :status);",
         run_id=scenario.receipt_run_id,
         status="succeeded" if scenario.is_cross_run else "running",
     )
     if scenario.is_cross_run:
         await database.status(
-            f"INSERT INTO {import_run_ref} "
-            "VALUES (:run_id, 'provider-directory-fhir', 'running');",
+            f"INSERT INTO {import_run_ref} VALUES (:run_id, 'provider-directory-fhir', 'running');",
             run_id=scenario.requested_run_id,
         )
 
@@ -138,37 +136,7 @@ async def _replay_target_oids(database, schema: str) -> tuple[int, int]:
 
 def _database_geometry_by_field(database_identity) -> dict[str, object]:
     """Project runtime PostgreSQL identity into capacity geometry fields."""
-    identity_fields = (
-        "database_system_identifier",
-        "database_oid",
-        "database_name",
-        "tablespace_oid",
-        "tablespace_name",
-        "postgres_server_version_num",
-        "postgres_block_size_bytes",
-        "postgres_wal_block_size_bytes",
-        "postgres_wal_segment_size_bytes",
-        "postgres_full_page_writes",
-        "postgres_wal_compression",
-        "postgres_wal_level",
-        "postgres_wal_log_hints",
-        "postgres_data_checksums",
-        "postgres_default_toast_compression",
-        "postgres_checkpoint_timeout_seconds",
-        "postgres_max_wal_size_bytes",
-        "evidence_target_storage_fingerprint",
-        "profile_target_storage_fingerprint",
-        "build_checkpoint_oid",
-        "serving_generation_oid",
-        "delta_receipt_oid",
-        "build_checkpoint_storage_fingerprint",
-        "serving_generation_storage_fingerprint",
-        "delta_receipt_storage_fingerprint",
-    )
-    return {
-        field_name: getattr(database_identity, field_name)
-        for field_name in identity_fields
-    }
+    return importer._geometry_postgres_values(database_identity) | {"relations": database_identity.relations}
 
 
 def _replay_geometry(
@@ -178,14 +146,8 @@ def _replay_geometry(
     profile_target_oid: int,
 ):
     """Bind selection lineage and exact PostgreSQL identity into geometry."""
-    source_hash = importer._provider_directory_profile_source_vector_hash(
-        scenario.source_vector
-    )
-    context_hash = (
-        importer._provider_directory_profile_source_context_vector_hash(
-            scenario.source_context_vector
-        )
-    )
+    source_hash = importer._provider_directory_profile_source_vector_hash(scenario.source_vector)
+    context_hash = importer._provider_directory_profile_source_context_vector_hash(scenario.source_context_vector)
     return capacity.validated_capacity_geometry(
         _geometry_payload(
             selection_proof_id=scenario.proof_id,
@@ -197,37 +159,27 @@ def _replay_geometry(
             desired_source_vector_hash=source_hash,
             current_context_vector_hash="1" * 64,
             desired_context_vector_hash=context_hash,
-            sql_contract_digest=(
-                importer._provider_directory_profile_sql_contract_digest()
-            ),
-            evidence_target_oid=evidence_target_oid,
-            profile_target_oid=profile_target_oid,
+            sql_contract_digest=(importer._provider_directory_profile_sql_contract_digest()),
             **_database_geometry_by_field(database_identity),
         )
     )
 
 
-async def _seed_committed_replay(database, schema, scenario):
+async def _seed_committed_replay(database, schema, scenario, *, execution=None):
     """Seed the committed receipt and return its execution dependencies."""
     tables = await _create_replay_tables(database, schema)
     await _insert_replay_import_runs(database, schema, scenario)
-    evidence_target_oid, profile_target_oid = await _replay_target_oids(
-        database, schema
-    )
-    identity_state = _serving_state_for_identity(
-        evidence_target_oid, profile_target_oid
-    )
-    database_identity = (
-        await importer._provider_directory_profile_capacity_database_identity(
-            schema, identity_state
+    evidence_target_oid, profile_target_oid = await _replay_target_oids(database, schema)
+    identity_state = _serving_state_for_identity(schema)
+    database_identity = await importer._provider_directory_profile_capacity_database_identity(schema, identity_state)
+    geometry = _replay_geometry(scenario, database_identity, evidence_target_oid, profile_target_oid)
+    if execution is not None and execution.attestation.desired_profile_as_of is not None:
+        geometry = capacity.revalidate_capacity_geometry(
+            dataclasses.replace(geometry, profile_as_of=execution.attestation.desired_profile_as_of)
         )
-    )
-    geometry = _replay_geometry(
-        scenario, database_identity, evidence_target_oid, profile_target_oid
-    )
     envelope = _capacity_envelope(
-        capacity.capacity_geometry_hash(geometry),
-        database_identity,
+        geometry,
+        execution or _default_replay_execution(),
         scenario.accepted_at,
     )
     seed = _ReplaySeed(
@@ -253,13 +205,22 @@ def _replay_execution(
     proof_id: str | None = None,
 ) -> ProviderDirectoryProfileExecution:
     """Bind a replay request to the seeded selection and lease."""
-    return _execution(
-        proof_id=proof_id or scenario.proof_id,
-        profile_input_digest=scenario.profile_input_digest,
-        source_id=scenario.source_id,
-        dataset_id=scenario.dataset_id,
+    execution = _default_replay_execution()
+    return dataclasses.replace(
+        execution,
+        attestation=dataclasses.replace(execution.attestation, proof_id=proof_id or scenario.proof_id),
+        generation=7,
         capacity_attestation=envelope,
     )
+
+
+def _default_replay_execution():
+    from tests.provider_directory_profile_capacity_signing_guard_test_support import (
+        GOLDEN_PROFILE_INPUT_DIGEST,
+        synthetic_profile_execution,
+    )
+
+    return synthetic_profile_execution(frozen_profile_input_digest=GOLDEN_PROFILE_INPUT_DIGEST)
 
 
 def _configure_replay_dependencies(monkeypatch, scenario, envelope) -> None:
@@ -308,18 +269,12 @@ def _assert_replay(
     assert replay["evidence_rows"] == 0
     assert replay["profile_rows"] == 0
     assert replay["committed_replay"]["build_id"] == scenario.build_id
-    assert (
-        replay["committed_replay"]["run_id"] == scenario.receipt_run_id
-    )
+    assert replay["committed_replay"]["run_id"] == scenario.receipt_run_id
     if scenario.is_cross_run:
-        assert replay["committed_replay"]["replayed_by_run_id"] == (
-            scenario.requested_run_id
-        )
+        assert replay["committed_replay"]["replayed_by_run_id"] == (scenario.requested_run_id)
     else:
         assert "replayed_by_run_id" not in replay["committed_replay"]
-    assert replay["capacity"]["attestation_id"] == (
-        envelope["lease"]["attestation_id"]
-    )
+    assert replay["capacity"]["attestation_id"] == (envelope["lease"]["attestation_id"])
 
 
 async def _assert_replay_identity_conflict(
@@ -327,9 +282,7 @@ async def _assert_replay_identity_conflict(
     envelope: dict[str, object],
 ) -> None:
     """Refuse a cross-run replay with a conflicting proof identity."""
-    conflicting_execution = _replay_execution(
-        scenario, envelope, proof_id="9" * 64
-    )
+    conflicting_execution = _replay_execution(scenario, envelope, proof_id="9" * 64)
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
         match="provider_directory_profile_replay_receipt_identity_conflict",
@@ -375,10 +328,7 @@ async def _assert_ambiguous_receipt_refused(
     }
     with pytest.raises(DBAPIError):
         await database.status(duplicate_receipt_sql, **clone_params_by_name)
-    await database.status(
-        f"ALTER TABLE {receipt_ref} DROP CONSTRAINT "
-        '"pd_profile_delta_receipt_control_proof_key";'
-    )
+    await database.status(f'ALTER TABLE {receipt_ref} DROP CONSTRAINT "pd_profile_delta_receipt_control_proof_key";')
     await database.status(duplicate_receipt_sql, **clone_params_by_name)
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
@@ -412,6 +362,4 @@ async def test_expired_receipt_replays_without_new_admission_or_scratch(
         _assert_replay(replay, scenario, envelope)
         if scenario.is_cross_run:
             await _assert_replay_identity_conflict(scenario, envelope)
-            await _assert_ambiguous_receipt_refused(
-                database, schema, scenario, execution
-            )
+            await _assert_ambiguous_receipt_refused(database, schema, scenario, execution)

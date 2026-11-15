@@ -25,7 +25,7 @@ from process.ptg_parts.result_archive_published_authority import _authority_from
 from process.ptg_parts.result_archive_published_identity import validate_published_result_identity
 from process.ptg_parts.result_archive_source_authority import PtgResultArchiveSourceAuthority
 from tests.ptg2_v4_attempt_migration_postgres_support import FENCE_MIGRATION, migration
-from tests.test_ptg2_local_physical_read_view import _view_fixture
+from tests.test_ptg2_local_physical_read_view import _installed_fixture, _view_fixture
 from tests.test_ptg2_local_preparation_authority import (
     _control_fixture,
     _ownership,
@@ -845,13 +845,13 @@ async def test_stage_refuses_auxiliary_custody_before_candidate_reads(monkeypatc
             },
             initialized=initialized,
             audit={"control_sha256": "a" * 64},
-            owner_oid=physical.owner_oid,
+            owner_oid=102,
         )
     reader.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
-    "drift", [None, "snapshot", "contract", "audit-contract", "audit-identity", "audit-model", "catalog", "control"]
+    "drift", [None, "snapshot", "contract", "audit-contract", "audit-identity", "audit-model", "content", "control"]
 )
 def test_read_authority_preserves_complete_protected_validation(drift):
     physical, authority = _view_fixture()
@@ -862,77 +862,57 @@ def test_read_authority_preserves_complete_protected_validation(drift):
         "audit-contract": (evidence["native_audit"], "contract", "other-contract"),
         "audit-identity": (evidence["native_audit"], "identity", []),
         "audit-model": (evidence["native_audit"], "model_sha256", "0" * 64),
-        "catalog": (evidence["native_audit"], "catalog_sha256", "0" * 64),
+        "content": (evidence, "metadata_sha256", "not-a-checksum"),
         "control": (evidence["activation_evidence"], "control_sha256", "0" * 64),
     }
     if drift:
         target, field, value = changes_by_drift[drift]
         target[field] = value
     if drift:
-        with pytest.raises(native.PTG2PhysicalBindingError, match="read authority differs"):
-            validation._local_read_authority_binding(
-                authority, physical.snapshot_id, physical.owner_oid, is_prepared=True
-            )
+        with pytest.raises(native.PTG2PhysicalBindingError, match="read data differs|evidence differs"):
+            validation._local_read_authority_binding(authority, physical.snapshot_id, is_prepared=True)
     else:
         assert (
-            validation._local_read_authority_binding(
-                authority, physical.snapshot_id, physical.owner_oid, is_prepared=True
-            )[1]
-            == physical
+            validation._local_read_authority_binding(authority, physical.snapshot_id, is_prepared=True)[0] == physical
         )
 
 
-@pytest.mark.parametrize("drift", [None, "layout", "owner"])
-def test_installed_read_binding_rejoins_actual_publication_inventory(drift):
-    physical, authority = _view_fixture()
-    _published, _candidate, _evidence, publication = _published_control_fixture()
-    installed_by_field = {**dict.fromkeys(native._local_read_view_columns(False)), **authority}
-    installed_by_field.update(contract="ptg.installed-physical-binding-read.v1", native_publication=publication)
+@pytest.mark.parametrize("drift", [None, "layout", "schema"])
+def test_installed_read_binding_rejoins_logical_publication_inventory(drift):
+    physical, installed_by_field, _candidate = _installed_fixture()
+    publication = installed_by_field["native_publication"]
     if drift == "layout":
         publication["destination_layout_key"] += 1
-    elif drift == "owner":
-        publication["owner_oid"] += 1
+    elif drift == "schema":
+        publication["schema_name"] = "other_snapshot"
     if drift:
         with pytest.raises(native.PTG2PhysicalBindingError):
-            validation._local_read_authority_binding(
-                installed_by_field, physical.snapshot_id, physical.owner_oid, is_prepared=False
-            )
+            validation._local_read_authority_binding(installed_by_field, physical.snapshot_id, is_prepared=False)
     else:
         assert (
-            validation._local_read_authority_binding(
-                installed_by_field, physical.snapshot_id, physical.owner_oid, is_prepared=False
-            )[1]
+            validation._local_read_authority_binding(installed_by_field, physical.snapshot_id, is_prepared=False)[0]
             == physical
         )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("publisher,prepared,count", [(False, False, 0), (False, True, 2), (True, True, 1)])
-async def test_read_authority_requires_one_row_from_the_fixed_role_view(monkeypatch, publisher, prepared, count):
-    monkeypatch.setattr(native, "local_preparation_catalog_owner", AsyncMock(return_value=73))
-    reader, writer = AsyncMock(return_value=73), AsyncMock(return_value=73)
-    monkeypatch.setattr(native, "require_local_physical_read_view", reader)
-    monkeypatch.setattr(native, "require_local_physical_publisher_view", writer)
-    session = _session([{"owner_oid": 73}] * count, scalars=[publisher])
+@pytest.mark.parametrize("prepared,count", [(False, 0), (True, 2), (True, 1)])
+async def test_read_requires_one_row_from_fixed_named_view(prepared, count):
+    row_by_field = {"destination_snapshot_id": "local-snapshot"}
+    session = _session([row_by_field] * count)
     if count != 1:
-        with pytest.raises(native.PTG2PhysicalBindingError, match="authority is unavailable"):
+        with pytest.raises(native.PTG2PhysicalBindingError, match="named read is unavailable"):
             await validation._local_read_authority(session, "local-snapshot", is_prepared=prepared)
     else:
-        assert await validation._local_read_authority(session, "local-snapshot", is_prepared=prepared) == (
-            True,
-            73,
-            {"owner_oid": 73},
-        )
-    assert reader.await_count == int(not publisher) and writer.await_count == int(publisher)
+        assert await validation._local_read_authority(session, "local-snapshot", is_prepared=prepared) == row_by_field
+    session.scalar.assert_not_awaited()
     query = str(session.execute.await_args.args[0])
-    assert "LIMIT 2" in query
-    assert ("prepared_physical_binding" in query) is prepared
+    assert "LIMIT 2" in query and ("prepared_physical_binding" in query) is prepared
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transaction", [False, None])
 async def test_qualified_payload_reader_requires_an_open_caller_transaction(monkeypatch, transaction):
-    monkeypatch.setattr(native, "PREPARED_LOCAL_READ_VIEW_SHA256", "a" * 64)
     session = _session()
     session.in_transaction = (lambda: False) if transaction is False else None
     with pytest.raises(native.PTG2PhysicalBindingError, match="caller transaction"):
@@ -991,36 +971,20 @@ def test_serving_scope_requires_the_exact_tagged_shape(scope):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", ["header", "binding", "catalog", "control"])
-async def test_payload_reader_refuses_changed_preimages_before_serving(monkeypatch, drift):
+async def test_payload_reader_refuses_absent_control_before_serving(monkeypatch):
     physical, authority = _view_fixture()
-    is_publisher = drift in {"header", "binding"}
-    monkeypatch.setattr(native, "PREPARED_LOCAL_READ_VIEW_SHA256", "a" * 64)
-    monkeypatch.setattr(native, "local_preparation_catalog_owner", AsyncMock(return_value=physical.owner_oid))
-    monkeypatch.setattr(native, "require_local_physical_read_view", AsyncMock(return_value=physical.owner_oid))
-    monkeypatch.setattr(native, "require_local_physical_publisher_view", AsyncMock(return_value=physical.owner_oid))
-    header_binding = replace(physical, destination_layout_key=702) if drift == "binding" else physical
-    header_by_field = {"validation_sha256": "0" * 64 if drift == "header" else authority["validation_sha256"]}
-    monkeypatch.setattr(native, "_prepared_local_header", AsyncMock(return_value=(header_by_field, {}, header_binding)))
-    monkeypatch.setattr(native, "verify_local_data_family", AsyncMock())
-    monkeypatch.setattr(native, "_require_closed_local_custody", AsyncMock())
-    monkeypatch.setattr(
-        native, "local_data_catalog_digest", AsyncMock(return_value="0" * 64 if drift == "catalog" else "c" * 64)
-    )
     control = AsyncMock(return_value=None)
     monkeypatch.setattr(native, "_local_candidate_control", control)
-    session = _session([authority], *[[] for _ in physical.relation_oids], scalars=[is_publisher])
+    session = _session([authority], *[[] for _ in physical.relations])
     session.info = {}
-    with pytest.raises(
-        native.PTG2PhysicalBindingError, match="preimage differs|catalog changed|control is unavailable"
-    ):
+    with pytest.raises(native.PTG2PhysicalBindingError, match="control is unavailable"):
         await validation.local_data_physical_read_state(session, physical.snapshot_id, is_prepared=True)
     assert session.info == {}
-    assert control.await_count == int(drift == "control")
+    control.assert_awaited_once()
     locks = [
         str(call.args[0]) for call in session.execute.await_args_list if str(call.args[0]).startswith("LOCK TABLE ONLY")
     ]
-    assert len(locks) == (0 if is_publisher else len(physical.relation_oids))
+    assert len(locks) == len(physical.relations)
 
 
 @pytest.mark.asyncio
@@ -1058,26 +1022,12 @@ async def test_serving_row_uses_the_pinned_payload_source_dictionary(monkeypatch
 
 @pytest.mark.asyncio
 async def test_installed_reader_checks_the_published_control_before_caching(monkeypatch):
-    physical, authority = _view_fixture()
-    _physical, candidate, published_evidence, publication = _published_control_fixture()
-    evidence = authority["native_validation"]
-    for field in ("initialization", "data", "native_audit", "activation_evidence"):
-        evidence[field].update(published_evidence[field])
-    evidence["control_sha256"] = published_evidence["control_sha256"]
-    evidence["activation_evidence"]["control_sha256"] = evidence["control_sha256"]
-    installed_by_field = {**dict.fromkeys(native._local_read_view_columns(False)), **authority}
-    installed_by_field.update(contract="ptg.installed-physical-binding-read.v1", native_publication=publication)
-    monkeypatch.setattr(native, "INSTALLED_LOCAL_READ_VIEW_SHA256", "a" * 64)
-    monkeypatch.setattr(native, "local_preparation_catalog_owner", AsyncMock(return_value=physical.owner_oid))
-    monkeypatch.setattr(native, "require_local_physical_read_view", AsyncMock(return_value=physical.owner_oid))
-    monkeypatch.setattr(native, "verify_local_data_family", AsyncMock())
-    monkeypatch.setattr(native, "_require_closed_local_custody", AsyncMock())
-    monkeypatch.setattr(native, "local_data_catalog_digest", AsyncMock(return_value="c" * 64))
+    physical, installed_by_field, candidate = _installed_fixture()
     reader = AsyncMock(return_value=candidate)
     monkeypatch.setattr(native, "_local_candidate_control", reader)
     session = _session(
         [installed_by_field],
-        *[[] for _ in physical.relation_oids],
+        *[[] for _ in physical.relations],
         [{"plan_id": "12-3456789", "plan_market_type": "group"}],
         scalars=[False],
     )
@@ -1086,7 +1036,6 @@ async def test_installed_reader_checks_the_published_control_before_caching(monk
         3
     ] == candidate
     assert session.info["ptg2_local_read_bindings"][physical.schema_name] == physical
-    assert session.info["ptg2_local_read_catalog_sha256"][physical.schema_name] == "c" * 64
     assert reader.await_args.kwargs == {"lock_controls": False}
 
 

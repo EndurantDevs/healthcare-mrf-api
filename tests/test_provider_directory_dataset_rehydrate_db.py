@@ -6,6 +6,8 @@ import json
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from db.models import ProviderDirectoryLocation
 from process import provider_directory_dataset_rehydrate_prepare as preparation
@@ -67,7 +69,7 @@ def _retained_locations():
 
 
 async def _output_state(case):
-    """Capture exact serving identities and row counts before and after private preparation."""
+    """Capture complete named serving content before and after private preparation."""
     tables = (
         "provider_directory_location",
         "provider_directory_canonical_resource",
@@ -77,7 +79,15 @@ async def _output_state(case):
         return tuple(
             [
                 (
-                    await case.database.scalar("SELECT to_regclass(:name)::oid", name=f"{case.schema}.{name}"),
+                    (
+                        case.schema,
+                        name,
+                        tuple(
+                            await case.database.all(
+                                f'SELECT to_jsonb(output) FROM "{case.schema}"."{name}" AS output ORDER BY to_jsonb(output)::text'
+                            )
+                        ),
+                    ),
                     await case.database.scalar(f'SELECT count(*) FROM "{case.schema}"."{name}"'),
                 )
                 for name in tables
@@ -117,7 +127,7 @@ def test_fixture_payloads_use_historical_transport_hashes():
 
 
 async def _complete_and_replay(case, entry):
-    """Complete the same original stages, then reuse exactly the committed physical cut."""
+    """Complete the original named stages and reuse the committed validated output."""
     completed = await fhir._rehydrate_prepared_dataset(case.runtime, case.request)
     assert tuple(count for _, count in await _output_state(case)) == (3, 3, 3)
     assert completed["resources"]["Location"] == {
@@ -134,7 +144,14 @@ async def _complete_and_replay(case, entry):
         "reused_complete_checkpoint": False,
     }
     published = await _output_state(case)
-    assert published[0][0] == entry["stage"]["oid"]
+    assert published[0][0][:2] == (case.schema, entry["stage"]["target"])
+    async with source_transaction(case.database):
+        assert (
+            await case.database.scalar(
+                "SELECT to_regclass(:name)", name=f"{entry['stage']['schema']}.{entry['stage']['relation']}"
+            )
+            is None
+        )
     replay = await fhir._rehydrate_prepared_dataset(case.runtime, case.request)
     assert replay["resources"]["Location"]["reused_complete_checkpoint"] is True
     assert await _output_state(case) == published
@@ -143,18 +160,27 @@ async def _complete_and_replay(case, entry):
 
 async def _assert_extra_membership_refused(case):
     """An extraneous same-root identity cannot reuse the completed exact-membership proof."""
-    async with source_transaction(case.database):
-        for statement in (
-            "INSERT INTO mrf.provider_directory_location (source_id,resource_id,last_seen_run_id) "
-            "VALUES (:source,'outside-dataset',:root)",
-            "INSERT INTO mrf.provider_directory_canonical_resource "
-            "(canonical_api_base,resource_type,resource_id,payload_hash,first_seen_run_id,last_seen_run_id) "
-            "VALUES (:base,'Location','outside-dataset',repeat('e',64),:root,:root)",
-            "INSERT INTO mrf.provider_directory_source_resource "
-            "(source_id,canonical_api_base,resource_type,resource_id,last_seen_run_id) "
-            "VALUES (:source,:base,'Location','outside-dataset',:root)",
-        ):
-            await case.database.status(statement, source=SOURCE_ID, base=CANONICAL_BASE, root=ROOT_RUN_ID)
+    statements = (
+        "INSERT INTO mrf.provider_directory_location (source_id,resource_id,last_seen_run_id) "
+        "VALUES (:source,'outside-dataset',:root)",
+        "INSERT INTO mrf.provider_directory_canonical_resource "
+        "(canonical_api_base,resource_type,resource_id,payload_hash,first_seen_run_id,last_seen_run_id) "
+        "VALUES (:base,'Location','outside-dataset',repeat('e',64),:root,:root)",
+        "INSERT INTO mrf.provider_directory_source_resource "
+        "(source_id,canonical_api_base,resource_type,resource_id,last_seen_run_id) "
+        "VALUES (:source,:base,'Location','outside-dataset',:root)",
+    )
+    original = await _output_state(case)
+    for statement in statements:
+        with pytest.raises(DBAPIError, match="permission denied"):
+            async with source_transaction(case.database):
+                await case.database.status(statement, source=SOURCE_ID, base=CANONICAL_BASE, root=ROOT_RUN_ID)
+    assert await _output_state(case) == original
+    async with case.component.admin_engine.begin() as connection:
+        for statement in statements:
+            await connection.execute(
+                text(statement), {"source": SOURCE_ID, "base": CANONICAL_BASE, "root": ROOT_RUN_ID}
+            )
     changed = await _output_state(case)
     assert tuple(count for _, count in changed) == (4, 4, 4)
     with pytest.raises(DatasetRehydrationError, match="generation_exists"):

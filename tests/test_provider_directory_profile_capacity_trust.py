@@ -52,35 +52,13 @@ def _active_key(
 
 
 def _trust_payload(**overrides: object) -> dict[str, object]:
-    trust_by_field: dict[str, object] = {
+    trust_by_field = {
         "contract_id": runtime.CAPACITY_TRUST_CONTRACT_ID,
         "signature_algorithm": lease.CAPACITY_LEASE_SIGNATURE_ALGORITHM,
         "environment_id": "dev-us",
         "attestor_id": "capacity-authority-dev",
         "active_key_id": "capacity-key-2026-07",
         "keys": [_active_key()],
-        "database_system_identifier": "7527713908662902214",
-        "database_oid": 16401,
-        "database_name": "healthporta_test",
-        "tablespaces": [
-            {
-                "tablespace_name": "pg_default",
-                "tablespace_oid": 1663,
-                "usage": "data",
-                "volume_digest": "33" * 32,
-            },
-            {
-                "tablespace_name": "pg_default",
-                "tablespace_oid": 1663,
-                "usage": "temp",
-                "volume_digest": "33" * 32,
-            },
-        ],
-        "volumes": [
-            {"volume_class": "data", "volume_digest": "33" * 32},
-            {"volume_class": "temp", "volume_digest": "33" * 32},
-            {"volume_class": "wal", "volume_digest": "44" * 32},
-        ],
     }
     trust_by_field.update(overrides)
     return trust_by_field
@@ -114,58 +92,28 @@ def _retired_trust(
     )
 
 
-def test_trust_v2_is_mandatory_closed_public_configuration(monkeypatch):
+def test_trust_v3_is_mandatory_closed_public_configuration(monkeypatch):
     monkeypatch.delenv(runtime.CAPACITY_TRUST_ENV, raising=False)
-    with pytest.raises(
-        runtime.ProviderDirectoryProfileCapacityConfigurationError,
-        match="trust_missing",
-    ):
+    with pytest.raises(runtime.ProviderDirectoryProfileCapacityConfigurationError, match="trust_missing"):
         runtime.configured_capacity_lease_trust()
-
     trust = runtime.configured_capacity_lease_trust(json.dumps(_trust_payload()))
-    assert trust.environment_id == "dev-us"
-    assert trust.active_key_id == "capacity-key-2026-07"
+    assert trust.environment_id == "dev-us" and trust.active_key_id == "capacity-key-2026-07"
     assert trust.keys[0].public_key == bytes.fromhex(PUBLIC_KEY_HEX)
-    assert trust.database_name == "healthporta_test"
-    assert not hasattr(trust, "private_key")
+    assert not hasattr(trust, "database_name") and not hasattr(trust, "private_key")
 
 
-def test_execution_v2_golden_freezes_neutral_cross_repository_envelope(
-    monkeypatch,
-):
-    """Freeze bytes consumers must refresh when the signed runtime head moves."""
+def test_execution_v2_golden_authenticates_without_fresh_admission():
     fixture_bytes = EXECUTION_V2_FIXTURE.read_bytes()
-    regenerated_bytes = (
-        json.dumps(
-            synthetic_profile_task(_signed_envelope()),
-            indent=2,
-            sort_keys=True,
-            ensure_ascii=True,
-        )
-        + "\n"
-    ).encode("ascii")
-    assert fixture_bytes == regenerated_bytes
-    assert len(fixture_bytes) == 27_808
-    assert fixture_bytes.endswith(b"\n")
-    assert not fixture_bytes.endswith(b"\n\n")
-    assert hashlib.sha256(fixture_bytes).hexdigest() == (EXECUTION_V2_FILE_SHA256)
-    task_map = json.loads(fixture_bytes)
-    canonical = json.dumps(
-        task_map,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("ascii")
-    assert hashlib.sha256(canonical).hexdigest() == (EXECUTION_V2_CANONICAL_SHA256)
-    monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
-    execution = selection.validated_profile_execution(task_map)
-    assert execution.generation == 11
-    assert execution.capacity_attestation == task_map["provider_directory_profile_capacity_attestation"]
-    verified = _verify(dict(execution.capacity_attestation))
-    assert (
-        verified.attestation_id
-        == task_map["provider_directory_profile_capacity_attestation"]["lease"]["attestation_id"]
-    )
+    assert len(fixture_bytes) == 27_808 and fixture_bytes.endswith(b"\n")
+    assert hashlib.sha256(fixture_bytes).hexdigest() == EXECUTION_V2_FILE_SHA256
+    task = json.loads(fixture_bytes)
+    canonical = json.dumps(task, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    assert hashlib.sha256(canonical).hexdigest() == EXECUTION_V2_CANONICAL_SHA256
+    envelope = task["provider_directory_profile_capacity_attestation"]
+    authenticated = lease.authenticate_historical_capacity_lease(envelope, trust=capacity_trust(), now=VALIDATION_TIME)
+    assert authenticated.has_semantic_admission_proof is False
+    with pytest.raises(lease.ProviderDirectoryCapacityLeaseError, match="unsupported_contract"):
+        _verify(envelope)
 
 
 @pytest.mark.parametrize(
@@ -206,20 +154,12 @@ def test_trust_rejects_legacy_shape_duplicate_json_and_oversize():
 
 
 @pytest.mark.parametrize(
-    "mutation",
-    ("tablespace_binding", "volume_order", "database_oid_bool"),
+    "field", ["database_name", "database_oid", "database_system_identifier", "tablespaces", "volumes", "pool"]
 )
-def test_trust_storage_identity_is_closed_and_physically_bound(mutation):
-    trust_by_field = json.loads(json.dumps(_trust_payload()))
-    if mutation == "tablespace_binding":
-        trust_by_field["tablespaces"][0]["volume_digest"] = "99" * 32
-    elif mutation == "volume_order":
-        trust_by_field["volumes"].reverse()
-    else:
-        trust_by_field["database_oid"] = True
-
+def test_current_trust_refuses_physical_identity_and_pool_configuration(field):
+    payload = _trust_payload(**{field: None})
     with pytest.raises(runtime.ProviderDirectoryProfileCapacityConfigurationError):
-        runtime.validated_capacity_lease_trust(trust_by_field)
+        runtime.validated_capacity_lease_trust(payload)
 
 
 @pytest.mark.parametrize(
@@ -330,33 +270,24 @@ def test_retired_key_cannot_verify_post_retirement_or_overlong_lease():
         )
 
 
-def test_unknown_key_release_database_and_storage_pins_fail_closed():
-    mismatched_trusts = (
+def test_unknown_key_release_and_environment_fail_closed():
+    for trust in (
         capacity_trust(key_id="other-key"),
         capacity_trust(attestor_release_digest="99" * 32),
-        dataclasses.replace(capacity_trust(), database_oid=16402),
-        dataclasses.replace(
-            capacity_trust(),
-            volumes=(
-                *capacity_trust().volumes[:2],
-                dataclasses.replace(
-                    capacity_trust().volumes[2],
-                    volume_digest="99" * 32,
-                ),
-            ),
-        ),
-    )
-    for trust in mismatched_trusts:
+        capacity_trust(environment_id="other-environment"),
+        capacity_trust(attestor_id="other-attestor"),
+    ):
         with pytest.raises(lease.ProviderDirectoryCapacityLeaseError):
             _verify(trust=trust)
 
 
-def test_runtime_database_name_is_an_exact_observed_pin():
-    with pytest.raises(
-        lease.ProviderDirectoryCapacityLeaseError,
-        match="pin_mismatch",
-    ):
-        _verify(expected_database_name="other_database")
+def test_current_trust_has_only_logical_authority_fields():
+    assert {field.name for field in dataclasses.fields(capacity_trust())} == {
+        "environment_id",
+        "attestor_id",
+        "active_key_id",
+        "keys",
+    }
 
 
 def test_retired_key_verification_window_must_still_be_open():

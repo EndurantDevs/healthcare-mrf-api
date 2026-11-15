@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Observe admitted SOURCE and retained storage on their original actors."""
+"""Observe admitted SOURCE and retained named storage in their native transactions."""
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -40,8 +40,8 @@ class _CatalogObservation:
     async def _profile_bucket_index_row(self, *args):
         return await self.directory._profile_bucket_index_row(*args, database=self.db)
 
-    async def _provider_directory_profile_relation_storage_fingerprint(self, *args, **kwargs):
-        return await self.directory._provider_directory_profile_relation_storage_fingerprint(
+    async def _provider_directory_profile_capacity_relation_layout(self, *args, **kwargs):
+        return await self.directory._provider_directory_profile_capacity_relation_layout(
             *args, **kwargs, database=self.db
         )
 
@@ -99,10 +99,19 @@ async def pinned_raw_attributes(directory, source_input, policy, root):
 
 
 def _require_epoch_policy(source_input, policy):
-    """Bind the complete original pin and both actual seals to the signed recipe."""
-    from process.network_fhir_source_epoch import _ORIGIN_FIELDS
-
-    _require({name: getattr(source_input.source_pin, name) for name in _ORIGIN_FIELDS} == policy["source_pin"])
+    """Bind the exact logical source and immutable data selection to the signed recipe."""
+    fields = (
+        "schema_name",
+        "source_id",
+        "endpoint_id",
+        "dataset_id",
+        "dataset_sha256",
+        "release_id",
+        "resource_relation",
+        "alias_scope",
+        "as_of",
+    )
+    _require({name: getattr(source_input.source_pin, name) for name in fields} == policy["source_pin"])
     _require(
         (source_input.admission_sha256, source_input.metadata_sha256)
         == (policy["expected_admission_sha256"], policy["expected_metadata_sha256"])
@@ -123,19 +132,17 @@ class _Observers:
         self.scope.require_active()
         coordinate = (relation.schema, relation.relation)
         if coordinate in self.scope.source_relations:
-            _require(self.scope.source_relations[coordinate] == relation.oid)
             if coordinate in self.scope.address_relations:
                 return self._reader
             return self.controls
         _require(relation.relation in self.scope.retained_tables.get(relation.schema, ()))
-        _require(self.scope.retained_relations.get(coordinate, relation.oid) == relation.oid)
         return None  # The verified original Ret binding owns uncommitted heaps.
 
     def record(self, relation):
         """Keep every observed native heap in all subsequent aggregate checks."""
         coordinate = (relation.schema, relation.relation)
         if coordinate not in self.scope.source_relations:
-            self.scope.retained_relations[coordinate] = relation.oid
+            self.scope.retained_relations.add(coordinate)
 
 
 class _RetainedObservations:
@@ -151,9 +158,9 @@ class _RetainedObservations:
         self.database = prepared.fhir.db
         self.source_input, self.address_input = source_input, address_input
         self.session, self.factory, self.task = session, factory, asyncio.current_task()
-        self.source_relations = dict(self.admission._relations)
-        self.retained_relations = {}
-        self.address_relations = {(prepared.address.db_schema, name): oid for _, name, oid in address_input.stages}
+        self.source_relations = set(self.admission._relations)
+        self.retained_relations = set()
+        self.address_relations = {(prepared.address.db_schema, name) for _, name in address_input.stages}
         policy = retained_raw_policy(self.admission.lease)
         _require_epoch_policy(source_input, policy)
         capture = UUID(policy["capture_id"]).hex
@@ -161,9 +168,6 @@ class _RetainedObservations:
             "registry_cms_epoch_" + capture: tuple(_TABLES),
             entity_address_archive_stage_schema(UUID(policy["capture_id"])): tuple(policy["address_tables"]),
         }
-        self.owner_role = policy["owner_role"]
-        self.binding = prepared.fhir.db._transaction_binding()
-        self.driver = self.virtual_xid = None
 
     def require_active(self):
         """Reject unissued, changed-admission and cross-task observation scopes."""
@@ -171,54 +175,29 @@ class _RetainedObservations:
 
         _require(self in _ISSUED and _ACTIVE.get() is self and self.task is asyncio.current_task())
         _require(self.prepared.nonprofile_admission is self.admission and self.prepared.fhir is self.directory)
-        _require(self.directory.db is self.database)
         _require(active_admission.get() is self.admission and self.admission.check_phase == self.check_phase)
         self.require_inventory()
-        _require(self.prepared.fhir.db._transaction_binding() is self.binding and self.binding.session is self.session)
         self.source_input.require_active()
         self.address_input.require_active()
         self.admission._assert_lease()
 
     def require_inventory(self):
         """Never lose an original or already measured retained member from the budget."""
-        _require(all(self.admission._relations.get(key) == oid for key, oid in self.source_relations.items()))
-        _require(all(self.admission._relations.get(key) == oid for key, oid in self.retained_relations.items()))
+        _require(self.source_relations <= self.admission._relations)
+        _require(self.retained_relations <= self.admission._relations)
 
     async def verify_transaction(self):
-        """Keep the original Ret binding, actor and virtual transaction unchanged."""
-        from process.network_fhir_source_epoch_pin import _virtual_xid
-
+        """Keep the issued logical source selection active through the transaction."""
         self.require_active()
-        _require(await native_driver(self.session) is self.driver)
-        _require(await _virtual_xid(self.driver) == self.virtual_xid)
         await self.source_input.verify_transaction()
-        await self.source_input.require_target(self.driver, self.owner_role)
 
     @asynccontextmanager
     async def observers(self):
-        """Open a short authenticated SOURCE observation without ambient binding."""
-        from process.network_fhir_source_epoch_pin import _same_database, _virtual_xid
-
+        """Open a configured read-only SOURCE observation without ambient binding."""
         await self.verify_transaction()
         async with self.factory.observation_transaction(isolation="read committed") as session:
             connection = await native_driver(session)
-            policy = self.source_input._receipt()["policy"]
-            _require(connection is not self.driver and connection is not self.source_input.connection)
-            actor = await connection.fetchrow(
-                "SELECT session_user::text AS login,current_user::text AS actor,"
-                "current_setting('transaction_read_only') AS read_only,"
-                "current_setting('transaction_isolation') AS isolation"
-            )
-            _require(
-                dict(actor)
-                == dict(
-                    login=policy.publisher_role, actor=policy.owner_role, read_only="on", isolation="read committed"
-                )
-            )
-            await _same_database(connection, self.driver)
-            transaction = await _virtual_xid(connection)
             yield _Observers(self, ConnectionProxy(None, session, connection))
-            _require(await _virtual_xid(connection) == transaction)
             await self.verify_transaction()
         await self.verify_transaction()
 
@@ -245,7 +224,7 @@ async def retained_nonprofile_observations(prepared, source_input, address_input
         _require(not is_source_storage_required())
         yield
         return
-    from process.network_fhir_source_epoch_pin import PinnedCMSFHIRSourceEpochInput, _virtual_xid
+    from process.network_fhir_source_epoch_pin import PinnedCMSFHIRSourceEpochInput
     from process.network_registry_cms_prepared_address_pin import PinnedRegistryCMSAddressInput
     from process.provider_directory_cms_preparation import _ACTIVE as active_admission
     from process.provider_directory_generic_source_policy import _publication_factory
@@ -257,12 +236,7 @@ async def retained_nonprofile_observations(prepared, source_input, address_input
     _require(factory.policy is source_input._receipt()["policy"])
     _require(callable(getattr(factory, "observation_transaction", None)))
     scope = _RetainedObservations(prepared, source_input, address_input, session, factory)
-    _require(scope.binding is not None and scope.binding.session is session)
-    _require(all(type(oid) is int and oid > 0 for oid in scope.source_relations.values()))
-    _require(all(scope.source_relations.get(coordinate) == oid for coordinate, oid in scope.address_relations.items()))
-    scope.driver = await native_driver(session)
-    await source_input.require_target(scope.driver, scope.owner_role)
-    scope.virtual_xid = await _virtual_xid(scope.driver)
+    _require(scope.address_relations <= scope.source_relations)
     _ISSUED.add(scope)
     token = _ACTIVE.set(scope)
     try:

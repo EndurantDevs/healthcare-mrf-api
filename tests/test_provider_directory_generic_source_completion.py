@@ -24,11 +24,9 @@ async def _prepared_detached(harness, monkeypatch, *, named=False):
     async with _isolated_harness(harness, monkeypatch, named=named) as publisher:
         binding = harness.header["candidate_storage_json"]
         binding["phase"] = "prepared"
-        for index, root in enumerate(completion.storage.RELATIONS):
+        for root in completion.storage.RELATIONS:
             name = "pdgs_" + "a" * 32 + "_" + completion.storage._SUFFIXES[root]
-            binding["tables"][root] = {"name": name}
-            if not named:
-                binding["tables"][root].update(oid=30 + index, owner=100, layout_sha256="e" * 64)
+            binding["tables"][root] = {"schema": publisher.policy.schema, "name": name}
         harness.header.update(
             status="validated",
             is_current=False,
@@ -42,7 +40,17 @@ async def _prepared_detached(harness, monkeypatch, *, named=False):
             content_proof_admission_kind="generic",
             content_proof_admission_sha256="c" * 64,
         )
-        harness.connection.fetchval = AsyncMock(return_value=False)
+        scalar = harness.connection.fetchval.side_effect
+
+        def snapshot_scalar(sql, *args):
+            if sql.startswith("SELECT candidate_storage_json"):
+                return scalar(sql, *args)
+            if sql.startswith("SELECT EXISTS"):
+                return False
+            assert sql == "SELECT to_regclass($1)::oid::bigint"
+            return None
+
+        harness.connection.fetchval = AsyncMock(side_effect=snapshot_scalar)
         harness.connection.fetch = AsyncMock(
             side_effect=lambda sql, *args: (
                 [{"attname": "dataset_id"}, {"attname": "candidate_storage_json"}]
@@ -51,7 +59,6 @@ async def _prepared_detached(harness, monkeypatch, *, named=False):
             )
         )
         execute = harness.connection.execute.side_effect
-        capture = completion.storage._capture.side_effect
 
         async def snapshot_execute(sql, *args):
             if sql.startswith("INSERT INTO") or sql.startswith("UPDATE") and '_h"' in sql:
@@ -59,17 +66,9 @@ async def _prepared_detached(harness, monkeypatch, *, named=False):
                 return "INSERT 0 1" if sql.startswith("INSERT") else "UPDATE 1"
             return await execute(sql, *args)
 
-        async def snapshot_capture(connection, policy, names, **kwargs):
-            captured_by_name = await capture(connection, policy, names, **kwargs)
-            for index, suffix in enumerate(("h", "p")):
-                name = "pdgs_" + "a" * 32 + "_" + suffix
-                if name in names:
-                    captured_by_name[name] = dict(name=name, oid=90 + index, owner=100, layout_sha256="f" * 64)
-            return {name: captured_by_name[name] for name in names}
-
         harness.connection.execute.side_effect = snapshot_execute
-        monkeypatch.setattr(completion.storage, "_capture", AsyncMock(side_effect=snapshot_capture))
-        token = policy._OWNER.set((publisher, object()))
+        monkeypatch.setattr(completion.storage, "_capture", AsyncMock(wraps=completion.storage._capture))
+        token = policy._OWNER.set((publisher, SimpleNamespace(in_transaction=lambda: True)))
         try:
             yield publisher, binding
         finally:
@@ -83,21 +82,20 @@ async def test_named_handoff_closes_intake_and_replays_without_physical_table_id
         document = handoff.document
         assert document["phase"] == "ready_for_freeze"
         assert set(document["tables"]) == set(completion.storage.RELATIONS + completion.storage.HANDOFF_CONTROL_ROOTS)
-        assert all(set(table) == {"name"} for table in document["tables"].values())
+        assert all(set(table) == {"schema", "name"} for table in document["tables"].values())
         assert sum(statement.startswith("DROP TABLE") for statement in harness.sql) == 2
         assert not any("ATTACH" in statement or "GRANT" in statement for statement in harness.sql)
         previous_statements = list(harness.sql)
         replay = await completion.prepare_generic_source_handoff(publisher, document)
         assert replay.document_sha256 == handoff.document_sha256
-        assert harness.sql == previous_statements
+        assert harness.sql[: len(previous_statements)] == previous_statements
+        assert all(statement.startswith("SELECT 1 FROM ") for statement in harness.sql[len(previous_statements) :])
         completion.storage._capture.assert_not_awaited()
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
         execute=AsyncMock(),
         fetchval=AsyncMock(return_value=False),
     )
-    inventory = AsyncMock(side_effect=AssertionError("named editions do not read a physical inventory"))
-    monkeypatch.setattr(completion, "_frozen_source_inventory", inventory)
     header = AsyncMock(return_value=harness.header)
     monkeypatch.setattr(completion, "_frozen_handoff_header", header)
     stored = SimpleNamespace(
@@ -115,12 +113,11 @@ async def test_named_handoff_closes_intake_and_replays_without_physical_table_id
     validation = await completion.validate_frozen_source_handoff(
         connection, harness.directory, handoff, protected_owner_role="source_owner"
     )
-    assert validation["handoff_sha256"] == handoff.document_sha256
+    assert validation["dataset_hash"] == stored.dataset_hash
     assert validation["resource_counts"] == stored.resource_counts
     assert connection.execute.await_args.args[0].endswith(" IN ACCESS SHARE MODE NOWAIT")
     assert connection.fetchval.await_count == len(document["tables"])
     assert all(call.args[1:] == ("dataset",) for call in connection.fetchval.await_args_list)
-    inventory.assert_not_awaited()
     content.reset_mock()
     connection.fetchval.return_value = True
     with pytest.raises(GenericCandidateError, match="dataset_changed"):
@@ -149,8 +146,103 @@ async def test_protected_handoff_shape_reuses_checks_without_issuing_source_auth
         with pytest.raises(GenericCandidateError):
             completion.storage.validate_handoff_document(invalid_by_field, expected_storage)
     with pytest.raises(GenericCandidateError, match="storage_binding_changed"):
-        completion.storage.validate_handoff_document(document, {**expected_storage, "owner_oid": 999})
+        completion.storage.validate_handoff_document(document, {**expected_storage, "catalog_schema": "other_schema"})
     assert policy._PUBLISHER.get() is None
+
+
+def _legacy_frozen_handoff(saved, content_proof_sha256):
+    """Preserve a complete historical raw handoff while exposing its logical projection."""
+    saved["contract"] = completion.storage.ISOLATED_CONTRACT
+    saved["storage"].update(database_oid=900, owner_oid=901)
+    saved["admission"]["content_proof_admission_sha256"] = content_proof_sha256
+    saved["relationship_sha256"] = "e" * 64
+    for table in saved["tables"].values():
+        table.pop("schema")
+        table.update(oid=902, owner="historical_owner", layout_sha256="f" * 64)
+    document = completion.FHIRSourceCandidateHandoff(completion.storage._encoded(saved)).document
+    assert document["contract"] == "generic-source-detached-v1"
+    return document
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        None,
+        "legacy",
+        "physical",
+        "contract",
+        "schema",
+        "table",
+        "handoff_data",
+        "admission_data",
+        "header_data",
+        "metadata",
+        "status",
+        "current",
+        "scope",
+        "completion",
+        "rows",
+    ],
+)
+async def test_frozen_header_compares_complete_logical_handoff_and_preserves_legacy_document(
+    harness, monkeypatch, change
+):
+    from copy import deepcopy
+
+    async with _prepared_detached(harness, monkeypatch) as (publisher, binding):
+        handoff = await completion.prepare_generic_source_handoff(publisher, binding)
+    document = handoff.document
+    saved = deepcopy(document)
+    if change is not None:
+        document = _legacy_frozen_handoff(saved, harness.header["content_proof_admission_sha256"])
+    header = deepcopy(harness.header)
+    header["dataset_id"] = document["identity"]["dataset_id"]
+    match change:
+        case "physical":
+            saved["storage"]["owner_oid"] = 990
+            for table in saved["tables"].values():
+                table["oid"] = 991
+        case "contract":
+            saved["contract"] = completion.storage.NAMED_ISOLATED_CONTRACT
+        case "schema":
+            saved["storage"]["storage_schema"] = "other_schema"
+        case "table":
+            saved["tables"][completion.storage.RESOURCE]["name"] = "other_resource"
+        case "handoff_data":
+            saved["admission"]["dataset_hash"] = "0" * 64
+        case "admission_data":
+            saved["admission"]["content_proof_admission_sha256"] = "0" * 64
+        case "header_data":
+            header["resource_count"] += 1
+        case "metadata":
+            metadata = dict(completion.storage._json(header["publication_metadata_json"]))
+            metadata["source_ids"] = ["other_source"]
+            header["publication_metadata_json"] = completion.storage._encoded(metadata)
+        case "status":
+            header["status"] = "published"
+        case "current":
+            header["is_current"] = True
+        case "scope":
+            header["endpoint_id"] = "other_endpoint"
+        case "completion":
+            header["completion_proof_json"] = {"changed": True}
+    header["candidate_storage_json"] = completion.storage._encoded(saved)
+    before = deepcopy(header)
+    read_headers = AsyncMock(return_value=[] if change == "rows" else [header])
+    monkeypatch.setattr(completion, "_FrozenSourceRows", lambda _connection: SimpleNamespace(all=read_headers))
+    policy = SimpleNamespace(schema=document["storage"]["storage_schema"])
+    if change in {None, "legacy", "physical"}:
+        assert await completion._frozen_handoff_header(object(), policy, document) == header
+    else:
+        reason = "completion_proof_unexpected" if change == "completion" else "header_snapshot_changed"
+        with pytest.raises(GenericCandidateError, match=reason):
+            await completion._frozen_handoff_header(object(), policy, document)
+    read_headers.assert_awaited_once_with(
+        "SELECT * FROM "
+        + completion.storage_relation(policy.schema, document["tables"][completion.storage.HEADER]["name"])
+    )
+    assert header == before
 
 
 @pytest.mark.asyncio
@@ -194,7 +286,8 @@ async def test_detached_handoff_preserves_complete_checks_without_live_ddl_and_r
         assert handoff.document == harness.header["candidate_storage_json"]
         assert handoff.document["phase"] == "ready_for_freeze"
         assert all(
-            table["owner"] == publisher.storage_binding.owner_oid for table in handoff.document["tables"].values()
+            set(table) == {"schema", "name"} and table["schema"] == publisher.storage_binding.storage_schema
+            for table in handoff.document["tables"].values()
         )
         assert set(handoff.document["tables"]) == set(
             completion.storage.RELATIONS + completion.storage.HANDOFF_CONTROL_ROOTS
@@ -221,7 +314,8 @@ async def test_detached_handoff_preserves_complete_checks_without_live_ddl_and_r
         harness.connection.execute.reset_mock()
         replay = await completion.prepare_generic_source_handoff(publisher, handoff.document)
         assert replay.document_sha256 == handoff.document_sha256
-        harness.connection.execute.assert_not_awaited()
+        assert harness.connection.execute.await_count == len(handoff.document["tables"])
+        assert all(call.args[0].startswith("SELECT 1 FROM ") for call in harness.connection.execute.await_args_list)
         with pytest.raises(FrozenInstanceError):
             replay.document_json = "{}"
         changed = replay.document
@@ -337,13 +431,14 @@ async def test_run_handoff_requires_committed_native_recheck(harness, monkeypatc
             harness.candidate.dataset_id: {
                 "document": prepared.document,
                 "sha256": prepared.document_sha256,
+                "producer": ["a" * 40, "sha256:" + "b" * 64],
             }
         }
         await completion.record_candidate_handoff(harness.directory, harness.candidate, handoffs_by_dataset)
         handoffs_by_dataset[harness.candidate.dataset_id]["sha256"] = "f" * 64
         with pytest.raises(GenericCandidateError, match="handoff_changed"):
             await completion.record_candidate_handoff(harness.directory, harness.candidate, handoffs_by_dataset)
-        harness.connection.execute.assert_not_awaited()
+        assert all(call.args[0].startswith("SELECT 1 FROM ") for call in harness.connection.execute.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -378,21 +473,21 @@ async def test_detached_handoff_replay_refuses_changed_content_or_predecessor(ha
         harness.connection.execute.reset_mock()
         with pytest.raises(GenericCandidateError, match="admission_changed"):
             await completion.prepare_generic_source_handoff(publisher, result.document)
-        harness.connection.execute.assert_not_awaited()
+        assert all(call.args[0].startswith("SELECT 1 FROM ") for call in harness.connection.execute.await_args_list)
 
 
 @pytest.mark.asyncio
-async def test_detached_handoff_replay_refuses_replaced_heap_before_mutation(harness, monkeypatch):
+async def test_detached_handoff_replay_refuses_unavailable_named_relation_before_mutation(harness, monkeypatch):
     async with _prepared_detached(harness, monkeypatch) as (publisher, binding):
         result = await completion.prepare_generic_source_handoff(publisher, binding)
-        actual_by_name = {
-            proof["name"]: {**proof, "oid": proof["oid"] + 1} for proof in result.document["tables"].values()
-        }
-        monkeypatch.setattr(completion.storage, "_capture", AsyncMock(return_value=actual_by_name))
+        failure = RuntimeError("named relation unavailable")
         harness.connection.execute.reset_mock()
-        with pytest.raises(GenericCandidateError, match="storage_binding_changed"):
+        harness.connection.execute.side_effect = failure
+        with pytest.raises(RuntimeError) as caught:
             await completion.prepare_generic_source_handoff(publisher, result.document)
-        harness.connection.execute.assert_not_awaited()
+        assert caught.value is failure
+        harness.connection.execute.assert_awaited_once()
+        assert harness.connection.execute.await_args.args[0].startswith('SELECT 1 FROM "source_schema".')
 
 
 @pytest.mark.asyncio
@@ -691,12 +786,7 @@ async def test_raw_witness_replay_requires_actual_hash_and_exact_complete_observ
 @pytest.mark.asyncio
 async def test_attach_refuses_unvalidated_header_before_indexes_or_attach(monkeypatch):
     connection = SimpleNamespace(
-        fetchrow=AsyncMock(
-            side_effect=[
-                {"session": "publisher", "current": "owner"},
-                {"status": "acquiring", "is_current": False},
-            ]
-        ),
+        fetchrow=AsyncMock(return_value={"status": "acquiring", "is_current": False}),
         execute=AsyncMock(),
     )
     publisher = SimpleNamespace(
@@ -737,7 +827,10 @@ async def test_global_publication_conflict_occurs_after_checks_and_before_any_at
         "phase": "prepared",
         "identity": {"dataset_id": "dataset", "metadata": {}},
         "relationship_sha256": None,
-        "tables": {root: {"name": "heap_" + str(index)} for index, root in enumerate(completion.storage.RELATIONS)},
+        "tables": {
+            root: {"schema": "source_schema", "name": "heap_" + str(index)}
+            for index, root in enumerate(completion.storage.RELATIONS)
+        },
     }
     header_by_field = {
         "status": "validated",
@@ -750,7 +843,7 @@ async def test_global_publication_conflict_occurs_after_checks_and_before_any_at
     }
     publisher = SimpleNamespace(
         connection=SimpleNamespace(
-            fetchrow=AsyncMock(side_effect=[{"session": "publisher", "current": "owner"}, header_by_field]),
+            fetchrow=AsyncMock(return_value=header_by_field),
             execute=AsyncMock(),
         ),
         policy=SimpleNamespace(schema="source_schema", owner_role="owner", publisher_role="publisher"),

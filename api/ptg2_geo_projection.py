@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from uuid import UUID
 
 GEO_ASSURANCE_VERSION = 1
 GEO_ASSURANCE_STATE_TABLE = "entity_address_geo_assurance_state"
@@ -38,7 +39,7 @@ def _sql_identifier(value: str, *, field_name: str) -> str:
 
 
 def validate_projection_dependency_bindings(schema_name: str, bindings: object) -> dict:
-    """Copy one closed, native-identity-bound map supplied by a trusted caller."""
+    """Decode the closed old map edition; physical tokens remain opaque compatibility data."""
 
     schema_name = _sql_identifier(schema_name, field_name="address schema")
     expected_names = {f"{schema or schema_name}.{table}" for schema, table in _PROJECTION_DEPENDENCIES}
@@ -57,17 +58,93 @@ def validate_projection_dependency_bindings(schema_name: str, bindings: object) 
             if type(binding_by_field[field]) is not str:
                 raise ValueError("geo projection dependency identifier is invalid")
             _sql_identifier(binding_by_field[field], field_name=field)
-        if any(
-            type(binding_by_field[field]) is not int or not 0 < binding_by_field[field] < 2**32
-            for field in ("relation_oid", "relfilenode")
-        ):
-            raise ValueError("geo projection dependency identity is invalid")
         bindings_by_name[name] = binding_by_field
-    relation_oids = {binding["relation_oid"] for binding in bindings_by_name.values()}
-    physical_names = {(binding["schema_name"], binding["table_name"]) for binding in bindings_by_name.values()}
-    if len(relation_oids) != len(expected_names) or len(physical_names) != len(expected_names):
+    qualified_names = {(binding["schema_name"], binding["table_name"]) for binding in bindings_by_name.values()}
+    if len(qualified_names) != len(expected_names):
         raise ValueError("geo projection dependency identities are duplicated")
     return bindings_by_name
+
+
+def validate_projection_dependency_qnames(schema_name: str, bindings: object) -> dict:
+    """Copy the closed QName family for named reads, without assigning projection freshness."""
+    if type(schema_name) is not str:
+        raise ValueError("geo projection dependency identifier is invalid")
+    schema_name = _sql_identifier(schema_name, field_name="address schema")
+    expected_names = {f"{schema or schema_name}.{table}" for schema, table in _PROJECTION_DEPENDENCIES}
+    if not isinstance(bindings, Mapping) or set(bindings) != expected_names:
+        raise ValueError("geo projection dependency name family is invalid")
+    bindings_by_name = {}
+    for name in sorted(expected_names):
+        supplied = bindings[name]
+        if not isinstance(supplied, Mapping) or set(supplied) != {"schema_name", "table_name"}:
+            raise ValueError("geo projection dependency name fields are invalid")
+        binding_by_field = dict(supplied)
+        for field, value in binding_by_field.items():
+            if type(value) is not str:
+                raise ValueError("geo projection dependency identifier is invalid")
+            _sql_identifier(value, field_name=field)
+        bindings_by_name[name] = binding_by_field
+    if len({(value["schema_name"], value["table_name"]) for value in bindings_by_name.values()}) != len(expected_names):
+        raise ValueError("geo projection dependency names are duplicated")
+    return bindings_by_name
+
+
+ProjectionRelationSignature = tuple[tuple[str, object, object], ...]
+
+
+def projection_relation_signature_tuple(
+    schema_name: str, value: object, *, allow_opaque_legacy=False
+) -> ProjectionRelationSignature:
+    """Read six name pairs and an optional canonical NPI origin, without assigning freshness."""
+    signature_by_name = value
+    schema_name = _sql_identifier(schema_name, field_name="address schema")
+    expected_names = {f"{schema or schema_name}.{table}" for schema, table in _PROJECTION_DEPENDENCIES}
+    generation_name = f"{schema_name}.npi_result_generation"
+    if not isinstance(signature_by_name, Mapping) or set(signature_by_name) not in (
+        expected_names,
+        expected_names | {generation_name},
+    ):
+        raise ValueError("geo projection dependency signature is invalid")
+    pairs_by_name = {name: signature_by_name[name] for name in expected_names}
+    if any(not isinstance(pair, (list, tuple)) or len(pair) != 2 for pair in pairs_by_name.values()):
+        raise ValueError("geo projection dependency signature is invalid")
+    if all(type(component) is str for pair in pairs_by_name.values() for component in pair):
+        validate_projection_dependency_qnames(
+            schema_name, {name: {"schema_name": pair[0], "table_name": pair[1]} for name, pair in pairs_by_name.items()}
+        )
+    elif not allow_opaque_legacy and not all(
+        type(component) is int and component > 0 for pair in pairs_by_name.values() for component in pair
+    ):
+        raise ValueError("geo projection dependency signature is invalid")
+    if generation_name in signature_by_name:
+        pairs_by_name[generation_name] = _npi_signature_pair(schema_name, signature_by_name)
+    return tuple(sorted((name, pair[0], pair[1]) for name, pair in pairs_by_name.items()))
+
+
+def projection_named_relation_signature(schema_name, value, dependency_bindings=None):
+    """Normalize old declarations to names; preserve only an explicitly supplied logical origin."""
+    signature = projection_relation_signature_tuple(schema_name, value, allow_opaque_legacy=True)
+    generation_name = f"{schema_name}.npi_result_generation"
+    relations = tuple(entry for entry in signature if entry[0] != generation_name)
+    if all(type(namespace) is str and type(table) is str for _, namespace, table in relations):
+        return signature
+    selected = (
+        {name: {"schema_name": name.split(".", 1)[0], "table_name": name.split(".", 1)[1]} for name, _, _ in relations}
+        if dependency_bindings is None
+        else {
+            name: {field: binding[field] for field in ("schema_name", "table_name")}
+            for name, binding in dependency_bindings.items()
+        }
+    )
+    named = validate_projection_dependency_qnames(schema_name, selected)
+    return tuple((name, binding["schema_name"], binding["table_name"]) for name, binding in sorted(named.items()))
+
+
+def _is_named_binding_family(dependency_bindings) -> bool:
+    return isinstance(dependency_bindings, Mapping) and all(
+        isinstance(binding, Mapping) and set(binding) == {"schema_name", "table_name"}
+        for binding in dependency_bindings.values()
+    )
 
 
 def projection_dependency_relation_sql(schema_name: str, canonical_name: str, *, dependency_bindings=None) -> str:
@@ -79,26 +156,58 @@ def projection_dependency_relation_sql(schema_name: str, canonical_name: str, *,
         raise ValueError("geo projection dependency name is invalid")
     if dependency_bindings is None:
         return canonical_name
-    binding = validate_projection_dependency_bindings(schema_name, dependency_bindings)[canonical_name]
+    validator = (
+        validate_projection_dependency_qnames
+        if _is_named_binding_family(dependency_bindings)
+        else validate_projection_dependency_bindings
+    )
+    binding = validator(schema_name, dependency_bindings)[canonical_name]
     return f'"{binding["schema_name"]}"."{binding["table_name"]}"'
 
 
-def projection_dependency_bindings_match_sql(schema_name: str, dependency_bindings) -> str:
-    """Recapture exact physical identities after the caller locks every held heap."""
+def projection_named_dependency_lock_sql(schema_name: str, dependency_bindings) -> str:
+    """Pin canonical roots recursively and separate held leaves independently."""
+    bindings = validate_projection_dependency_qnames(schema_name, dependency_bindings)
+    relations = ", ".join(
+        (
+            ""
+            if name in {"tiger.zip_state", "tiger.zcta5"} and name == f"{value['schema_name']}.{value['table_name']}"
+            else "ONLY "
+        )
+        + f'"{value["schema_name"]}"."{value["table_name"]}"'
+        for name, value in bindings.items()
+    )
+    return f"LOCK TABLE {relations} IN ACCESS SHARE MODE;"
 
-    bindings_by_name = validate_projection_dependency_bindings(schema_name, dependency_bindings)
+
+def projection_named_dependency_match_sql(schema_name: str, dependency_bindings) -> str:
+    """Check current native shape; logical generation and data validation govern freshness."""
+    bindings = validate_projection_dependency_qnames(schema_name, dependency_bindings)
     checks = []
-    for name, binding in bindings_by_name.items():
-        relation = projection_dependency_relation_sql(schema_name, name, dependency_bindings=bindings_by_name)
-        inheritance = _held_inheritance_sql(name)
+    for name, binding in bindings.items():
+        relation = f'"{binding["schema_name"]}"."{binding["table_name"]}"'
         checks.append(
             f"EXISTS (SELECT 1 FROM pg_catalog.pg_class held WHERE held.oid=to_regclass('{relation}') "
-            f"AND held.oid={binding['relation_oid']} AND pg_relation_filenode(held.oid)={binding['relfilenode']} "
             "AND held.relkind='r' AND held.relpersistence='p' AND NOT held.relispartition "
             "AND NOT held.relrowsecurity AND NOT held.relforcerowsecurity "
-            f"AND {inheritance})"
+            f"AND {(_canonical_tiger_inheritance_sql() if name in {'tiger.zip_state', 'tiger.zcta5'} and name == binding['schema_name'] + '.' + binding['table_name'] else _held_inheritance_sql(name))})"
         )
     return " AND ".join(checks)
+
+
+def projection_dependency_bindings_match_sql(schema_name: str, dependency_bindings) -> str:
+    """Check saved logical names and native shape, ignoring the old numeric token values."""
+    validator = (
+        validate_projection_dependency_qnames
+        if _is_named_binding_family(dependency_bindings)
+        else validate_projection_dependency_bindings
+    )
+    saved_bindings = validator(schema_name, dependency_bindings)
+    names_by_dependency = {
+        name: {field: binding[field] for field in ("schema_name", "table_name")}
+        for name, binding in saved_bindings.items()
+    }
+    return projection_named_dependency_match_sql(schema_name, names_by_dependency)
 
 
 def _held_inheritance_sql(canonical_name):
@@ -114,27 +223,35 @@ def _held_inheritance_sql(canonical_name):
     )
 
 
-def projection_relation_signature_sql(schema_name: str, *, dependency_bindings=None) -> str:
-    """Return the exact relation identity used by one stored projection."""
-
+def projection_relation_signature_sql(schema_name: str, *, dependency_bindings=None, include_generation=True) -> str:
+    """Describe only the complete declared dependency QNames, for either saved map edition."""
     schema_name = _sql_identifier(schema_name, field_name="address schema")
-    signature_fields: list[str] = []
-    for dependency_schema, table_name in _PROJECTION_DEPENDENCIES:
-        relation_schema = dependency_schema or schema_name
-        qualified_name = f"{relation_schema}.{table_name}"
-        physical_name = projection_dependency_relation_sql(
-            schema_name, qualified_name, dependency_bindings=dependency_bindings
+    if dependency_bindings is None:
+        bindings_by_name = {
+            f"{schema or schema_name}.{table}": {"schema_name": schema or schema_name, "table_name": table}
+            for schema, table in _PROJECTION_DEPENDENCIES
+        }
+    else:
+        validator = (
+            validate_projection_dependency_qnames
+            if _is_named_binding_family(dependency_bindings)
+            else validate_projection_dependency_bindings
         )
-        signature_fields.extend(
-            (
-                repr(qualified_name),
-                "jsonb_build_array("
-                f"COALESCE(to_regclass('{physical_name}')::oid::bigint, -1), "
-                "COALESCE(pg_relation_filenode("
-                f"to_regclass('{physical_name}'))::bigint, -1))",
-            )
+        bindings_by_name = validator(schema_name, dependency_bindings)
+    fields = []
+    for name, binding in sorted(bindings_by_name.items()):
+        fields.extend((repr(name), f"jsonb_build_array({binding['schema_name']!r}, {binding['table_name']!r})"))
+    signature = f"jsonb_build_object({', '.join(fields)})"
+    selected_npi = bindings_by_name[f"{schema_name}.npi_address"]
+    if (
+        include_generation
+        and selected_npi["schema_name"] == schema_name
+        and selected_npi["table_name"] == "npi_address"
+    ):
+        signature += (
+            f" || jsonb_build_object('{schema_name}.npi_result_generation',({_npi_generation_sql(schema_name)}))"
         )
-    return f"jsonb_build_object({', '.join(signature_fields)})"
+    return signature
 
 
 def projection_dependency_lock_sql(schema_name: str, *, dependency_bindings=None) -> str:
@@ -142,12 +259,17 @@ def projection_dependency_lock_sql(schema_name: str, *, dependency_bindings=None
 
     schema_name = _sql_identifier(schema_name, field_name="address schema")
     if dependency_bindings is not None:
-        bindings_by_name = validate_projection_dependency_bindings(schema_name, dependency_bindings)
-        relations = [
-            "ONLY " + projection_dependency_relation_sql(schema_name, name, dependency_bindings=bindings_by_name)
-            for name in sorted(bindings_by_name)
-        ]
-        return f"LOCK TABLE {', '.join(relations)} IN ACCESS SHARE MODE;"
+        validator = (
+            validate_projection_dependency_qnames
+            if _is_named_binding_family(dependency_bindings)
+            else validate_projection_dependency_bindings
+        )
+        bindings_by_name = validator(schema_name, dependency_bindings)
+        bindings_by_name = {
+            name: {field: binding[field] for field in ("schema_name", "table_name")}
+            for name, binding in bindings_by_name.items()
+        }
+        return projection_named_dependency_lock_sql(schema_name, bindings_by_name)
     relations = (
         f"{dependency_schema or schema_name}.{table_name}" for dependency_schema, table_name in _PROJECTION_DEPENDENCIES
     )
@@ -155,93 +277,95 @@ def projection_dependency_lock_sql(schema_name: str, *, dependency_bindings=None
 
 
 def projection_stored_bindings_sql(schema_name: str, column: str) -> tuple[str, str]:
-    """Read closed persisted bindings without interpolating their values into SQL.
-
-    The second expression rejects malformed maps and changed physical heaps.
-    NULL preserves the existing canonical-name projection contract.
-    """
+    """Read either closed edition while current maps use only their declared names."""
     schema_name = _sql_identifier(schema_name, field_name="address schema")
     if column not in {"active_dependency_bindings", "candidate_dependency_bindings"}:
         raise ValueError("geo projection binding column is invalid")
+    signature, matches = _stored_named_bindings_sql(schema_name, column)
+    legacy_signature, legacy_matches = _legacy_stored_bindings_sql(schema_name, column)
+    return (
+        f"CASE WHEN {matches} THEN {signature} ELSE ({legacy_signature}) END",
+        f"(({matches}) OR ({legacy_matches}))",
+    )
+
+
+def _stored_named_bindings_sql(schema_name, column, *, legacy=False):
+    """Require the complete finite names and native read shape, without physical tokens."""
     names = [f"{schema or schema_name}.{table}" for schema, table in _PROJECTION_DEPENDENCIES]
+    allowed_fields = (
+        "'schema_name','table_name','relation_oid','relfilenode'" if legacy else "'schema_name','table_name'"
+    )
+    legacy_shape = " AND {entry} ? 'relation_oid' AND {entry} ? 'relfilenode'" if legacy else ""
     safe_object = f"CASE WHEN jsonb_typeof({column})='object' THEN {column} ELSE '{{}}'::jsonb END"
     checks = [
         f"(SELECT count(*) FROM jsonb_object_keys({safe_object}))=6",
-        f"(SELECT count(DISTINCT value->>'relation_oid') FROM jsonb_each({safe_object}))=6",
+        f"(SELECT count(DISTINCT (value->>'schema_name',value->>'table_name')) FROM jsonb_each({safe_object}))=6",
     ]
-    pairs = []
+    fields = []
     for name in names:
         entry = f"({column}->'{name}')"
-        physical = (
+        relation = (
             f"CASE WHEN {entry}->>'schema_name' ~ '^[A-Za-z_][A-Za-z0-9_]{{0,62}}$' "
             f"AND {entry}->>'table_name' ~ '^[A-Za-z_][A-Za-z0-9_]{{0,62}}$' "
             f"THEN to_regclass(format('%I.%I',{entry}->>'schema_name',{entry}->>'table_name')) END"
         )
-        pairs.extend(
-            (
-                repr(name),
-                f"jsonb_build_array(COALESCE(({physical})::oid::bigint,-1), "
-                f"COALESCE(pg_relation_filenode({physical})::bigint,-1))",
-            )
-        )
+        fields.extend((repr(name), f"jsonb_build_array({entry}->>'schema_name', {entry}->>'table_name')"))
         checks.append(
             f"(jsonb_typeof({entry})='object' AND "
-            f"{entry} - ARRAY['schema_name','table_name','relation_oid','relfilenode']='{{}}'::jsonb "
-            f"AND jsonb_typeof({entry}->'relation_oid')='number' "
-            f"AND jsonb_typeof({entry}->'relfilenode')='number' "
-            f"AND EXISTS (SELECT 1 FROM pg_catalog.pg_class held WHERE held.oid=({physical}) "
-            f"AND held.oid::text={entry}->>'relation_oid' "
-            f"AND pg_relation_filenode(held.oid)::text={entry}->>'relfilenode' "
+            f"{entry} - ARRAY[{allowed_fields}]='{{}}'::jsonb "
+            f"AND jsonb_typeof({entry}->'schema_name')='string' "
+            f"AND jsonb_typeof({entry}->'table_name')='string' "
+            f"{legacy_shape.format(entry=entry)} "
+            f"AND EXISTS (SELECT 1 FROM pg_catalog.pg_class held WHERE held.oid=({relation}) "
             "AND held.relkind='r' AND held.relpersistence='p' AND NOT held.relispartition "
             "AND NOT held.relrowsecurity AND NOT held.relforcerowsecurity "
-            f"AND {_held_inheritance_sql(name)}))"
+            f"AND (CASE WHEN {entry}->>'schema_name'||'.'||({entry}->>'table_name')='{name}' "
+            f"AND '{name}' IN ('tiger.zip_state','tiger.zcta5') THEN {_canonical_tiger_inheritance_sql()} "
+            f"ELSE {_held_inheritance_sql(name)} END)))"
         )
-    signature = (
-        f"CASE WHEN {column} IS NULL THEN {projection_relation_signature_sql(schema_name)} "
-        f"ELSE jsonb_build_object({', '.join(pairs)}) END"
+    return f"jsonb_build_object({', '.join(fields)})", "(" + " AND ".join(checks) + ")"
+
+
+def _legacy_stored_bindings_sql(schema_name: str, column: str) -> tuple[str, str]:
+    """Project old maps by recorded names; immutable old numeric signatures stay opaque."""
+    signature, matches = _stored_named_bindings_sql(schema_name, column, legacy=True)
+    canonical = projection_relation_signature_sql(schema_name, include_generation=False)
+    present = " AND ".join(
+        f"to_regclass('{schema or schema_name}.{table}') IS NOT NULL" for schema, table in _PROJECTION_DEPENDENCIES
     )
-    return signature, f"(({column} IS NULL AND NOT ({retained_tiger_children_sql()})) OR ({' AND '.join(checks)}))"
+    return (
+        f"CASE WHEN {column} IS NULL THEN {canonical} ELSE {signature} END",
+        f"(({column} IS NULL AND ({present}) AND NOT ({retained_tiger_children_sql()})) OR {matches})",
+    )
 
 
 def retained_tiger_children_sql() -> str:
-    """Legacy root signatures cannot identify protected received snapshot children.
-
-    Ordinary geocoder source inheritance remains compatible with legacy state.
-    This is only a refusal predicate, never authority for a held binding.
-    """
+    """Require explicit selection when fixed TIGER roots include retained child QNames."""
     return """EXISTS (
         SELECT 1 FROM pg_catalog.pg_inherits edge
         JOIN pg_catalog.pg_class child ON child.oid=edge.inhrelid
         JOIN pg_catalog.pg_namespace namespace ON namespace.oid=child.relnamespace
-        JOIN pg_catalog.pg_roles owner ON owner.oid=child.relowner
-        JOIN pg_catalog.pg_depend membership ON membership.classid='pg_class'::regclass
-          AND membership.objid=edge.inhparent AND membership.objsubid=0
-          AND membership.refclassid='pg_extension'::regclass AND membership.deptype='e'
-        JOIN pg_catalog.pg_extension extension ON extension.oid=membership.refobjid
         WHERE edge.inhparent IN (to_regclass('tiger.zip_state'),to_regclass('tiger.zcta5'))
           AND namespace.nspname ~ '^reference_family_archive_[0-9a-f]{32}$'
-          AND namespace.nspowner=child.relowner AND NOT owner.rolcanlogin AND NOT owner.rolsuper
-          AND NOT owner.rolcreaterole AND NOT owner.rolcreatedb AND NOT owner.rolreplication
-          AND NOT owner.rolbypassrls AND extension.extname='postgis_tiger_geocoder'
     )"""
 
 
-def projection_state_available_sql(schema_name: str) -> str:
-    """Require the active projection to match every published dependency."""
-
+def projection_state_available_sql(schema_name: str, *, dependency_bindings=None, has_canonical_generation=True) -> str:
+    """Require current logical NPI publication while held inputs use their immutable names."""
     schema_name = _sql_identifier(schema_name, field_name="address schema")
-    live_table = f"{schema_name}.entity_address_unified"
-    state_relation = f"{schema_name}.{GEO_ASSURANCE_STATE_TABLE}"
     signature, binding_matches = projection_stored_bindings_sql(schema_name, "active_dependency_bindings")
-    return f"""EXISTS (
-        SELECT 1
-          FROM {state_relation} AS geo_assurance_state
-         WHERE geo_assurance_state.singleton IS TRUE
-           AND geo_assurance_state.active_geo_assurance_version = {GEO_ASSURANCE_VERSION}
-           AND geo_assurance_state.active_table_oid = to_regclass('{live_table}')::oid
-           AND {binding_matches}
-           AND geo_assurance_state.active_relation_signature = ({signature})
-    )"""
+    generation_matches = projection_npi_generation_match_sql(
+        schema_name,
+        "active",
+        dependency_bindings=dependency_bindings,
+        has_canonical_generation=has_canonical_generation,
+    )
+    return f"""EXISTS (SELECT 1 FROM {schema_name}.{GEO_ASSURANCE_STATE_TABLE} AS geo_assurance_state
+        WHERE singleton IS TRUE AND active_geo_assurance_version = {GEO_ASSURANCE_VERSION}
+        AND {binding_matches} AND active_relation_signature - '{schema_name}.npi_result_generation' = ({signature})
+        AND {generation_matches}
+        AND EXISTS(SELECT 1 FROM pg_class live WHERE live.oid=to_regclass('{schema_name}.entity_address_unified')
+          AND live.relkind='r' AND live.relpersistence='p' AND NOT live.relrowsecurity AND NOT live.relforcerowsecurity))"""
 
 
 def projection_external_evidence_ctes_sql(schema_name: str, *, dependency_bindings=None) -> str:
@@ -522,28 +646,17 @@ def projected_evidence_level_sql(
     schema_name: str,
     legacy_level_sql: str,
 ) -> str:
-    """Prefer a valid stored evidence class and otherwise evaluate legacy SQL."""
-
-    alias = _sql_identifier(alias, field_name="unified address alias")
-    projected_level = evidence_level_from_source_id_sql(f"{alias}.geo_evidence_source_id")
-    return f"""CASE
-        WHEN {projected_evidence_available_sql(alias, schema_name=schema_name)}
-        THEN {projected_level}
-        ELSE ({legacy_level_sql})
-    END"""
+    """Recheck source semantics until a portable logical freshness proof is available."""
+    _sql_identifier(alias, field_name="unified address alias")
+    _sql_identifier(schema_name, field_name="address schema")
+    return f"({legacy_level_sql})"
 
 
 def projected_evidence_available_sql(alias: str, *, schema_name: str) -> str:
-    """Return the predicate for a supported stored evidence projection."""
-
-    alias = _sql_identifier(alias, field_name="unified address alias")
-    schema_name = _sql_identifier(schema_name, field_name="address schema")
-    valid_source_ids = ", ".join(str(value) for value in GEO_EVIDENCE_SOURCE_IDS)
-    return (
-        f"({alias}.geo_assurance_version = {GEO_ASSURANCE_VERSION} "
-        f"AND {alias}.geo_evidence_source_id IN ({valid_source_ids})"
-        f" AND {projection_state_available_sql(schema_name)})"
-    )
+    """Named metadata alone cannot authorize skipping current source evidence."""
+    _sql_identifier(alias, field_name="unified address alias")
+    _sql_identifier(schema_name, field_name="address schema")
+    return "FALSE"
 
 
 def projected_boolean_sql(
@@ -553,15 +666,26 @@ def projected_boolean_sql(
     schema_name: str,
     legacy_sql: str,
 ) -> str:
-    """Prefer a valid stored boolean and otherwise evaluate legacy SQL."""
-
+    """Recheck mutable postal inputs while retaining the selected immutable TIGER point."""
     alias = _sql_identifier(alias, field_name="unified address alias")
     column_name = _sql_identifier(column_name, field_name="geo assurance column")
     schema_name = _sql_identifier(schema_name, field_name="address schema")
+    if column_name != "geo_point_coherent":
+        return f"({legacy_sql})"
     return f"""CASE
         WHEN {alias}.geo_assurance_version = {GEO_ASSURANCE_VERSION}
          AND {alias}.{column_name} IS NOT NULL
-         AND {projection_state_available_sql(schema_name)}
+         AND {_read_projection_available_sql(schema_name)}
+         AND EXISTS (
+             SELECT 1 FROM {schema_name}.{GEO_ASSURANCE_STATE_TABLE} point_state
+             WHERE point_state.singleton IS TRUE
+               AND point_state.active_dependency_bindings->'tiger.zcta5'->>'schema_name'
+                   ~ '^reference_family_archive_[0-9a-f]{{32}}$'
+               AND point_state.active_dependency_bindings->'tiger.zcta5'->>'table_name' = 'zcta5'
+               AND point_state.active_dependency_bindings->'tiger.zip_state'->>'schema_name'
+                   = point_state.active_dependency_bindings->'tiger.zcta5'->>'schema_name'
+               AND point_state.active_dependency_bindings->'tiger.zip_state'->>'table_name' = 'zip_state'
+         )
         THEN {alias}.{column_name}
         ELSE ({legacy_sql})
     END"""
@@ -584,10 +708,82 @@ __all__ = [
     "projection_dependency_lock_sql",
     "projection_dependency_bindings_match_sql",
     "projection_dependency_relation_sql",
+    "projection_named_dependency_lock_sql",
+    "projection_named_dependency_match_sql",
     "projection_external_evidence_ctes_sql",
     "projection_cms_anchor_ctes_sql",
     "projection_cms_evidence_cte_sql",
     "projection_relation_signature_sql",
     "projection_state_available_sql",
     "validate_projection_dependency_bindings",
+    "validate_projection_dependency_qnames",
 ]
+
+
+def _canonical_tiger_inheritance_sql():
+    """Keep ordinary geocoder descendants while excluding retained archive children by name."""
+    return """NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits edge
+        JOIN pg_catalog.pg_class child ON child.oid=edge.inhrelid
+        JOIN pg_catalog.pg_namespace namespace ON namespace.oid=child.relnamespace
+        WHERE edge.inhparent=held.oid AND namespace.nspname ~ '^reference_family_archive_[0-9a-f]{32}$')
+        AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid=held.oid)"""
+
+
+def _npi_generation_sql(schema_name):
+    """Read only the portable origin columns shared by ordinary and adopted publications."""
+    return f"SELECT jsonb_build_array(origin_lineage_id::text,origin_generation) FROM {schema_name}.npi_result_generation WHERE origin_lineage_id IS NOT NULL AND origin_generation > 0"
+
+
+def projection_npi_generation_match_sql(schema_name, phase, *, dependency_bindings=None, has_canonical_generation=True):
+    """Require the captured canonical origin without writing another profile's geo state."""
+    schema_name = _sql_identifier(schema_name, field_name="address schema")
+    if phase not in {"active", "candidate"}:
+        raise ValueError("geo projection phase is invalid")
+    binding = f"{phase}_dependency_bindings->'{schema_name}.npi_address'"
+    if dependency_bindings is not None:
+        selected = dependency_bindings[f"{schema_name}.npi_address"]
+        npi_binding_by_field = {field: selected[field] for field in ("schema_name", "table_name")}
+        validate_projection_dependency_qnames(
+            schema_name,
+            {
+                name: {field: entry[field] for field in ("schema_name", "table_name")}
+                for name, entry in dependency_bindings.items()
+            },
+        )
+        if npi_binding_by_field != {"schema_name": schema_name, "table_name": "npi_address"}:
+            return f"({binding}->>'schema_name'='{npi_binding_by_field['schema_name']}' AND {binding}->>'table_name'='{npi_binding_by_field['table_name']}' AND NOT ({phase}_relation_signature ? '{schema_name}.npi_result_generation'))"
+    held = f"({binding}->>'schema_name'<>'{schema_name}' OR {binding}->>'table_name'<>'npi_address')"
+    if not has_canonical_generation:
+        return held
+    return f"({held} OR ({phase}_relation_signature->'{schema_name}.npi_result_generation')=({_npi_generation_sql(schema_name)}))"
+
+
+def _read_projection_available_sql(schema_name):
+    """Use pinned bindings; outside a metadata snapshot, retain live evidence evaluation."""
+    from api.provider_profile_snapshot import snapshot_geo_dependency_bindings, snapshot_relation_available
+
+    available = snapshot_relation_available(f"{schema_name}.npi_result_generation")
+    if available is None:
+        return "FALSE"
+    return projection_state_available_sql(
+        schema_name,
+        dependency_bindings=snapshot_geo_dependency_bindings(schema_name),
+        has_canonical_generation=available,
+    )
+
+
+def _npi_signature_pair(schema_name, signature_by_name):
+    """Validate only an explicitly captured canonical origin beside the six name pairs."""
+    token = signature_by_name[f"{schema_name}.npi_result_generation"]
+    npi_pair = signature_by_name[f"{schema_name}.npi_address"]
+    if not isinstance(token, (list, tuple)) or len(token) != 2 or tuple(npi_pair) != (schema_name, "npi_address"):
+        raise ValueError("geo projection NPI origin is invalid")
+    lineage, generation = token
+    if (
+        type(lineage) is not str
+        or str(UUID(lineage)) != lineage
+        or type(generation) is not int
+        or not 0 < generation < 2**63
+    ):
+        raise ValueError("geo projection NPI origin is invalid")
+    return token

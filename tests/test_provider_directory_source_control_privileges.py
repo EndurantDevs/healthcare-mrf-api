@@ -13,7 +13,7 @@ from process.provider_directory_generic_source_policy import GenericSourcePolicy
 
 @pytest.mark.asyncio
 async def test_fixed_admission_rights_have_no_payload_or_function_ownership_changes():
-    connection = SimpleNamespace(execute=AsyncMock())
+    connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(return_value=False))
     policy = SimpleNamespace(schema="source_schema", owner_role="source_owner")
     await privileges.grant_source_admission_controls(connection, policy)
     statements = [call.args[0] for call in connection.execute.await_args_list]
@@ -75,6 +75,7 @@ async def test_existing_profile_repair_includes_disposition_insert(monkeypatch):
         is_in_transaction=lambda: True,
         transaction=transaction,
         execute=AsyncMock(),
+        fetchval=AsyncMock(return_value=False),
         fetchrow=AsyncMock(
             return_value={
                 "session": "native_admin",
@@ -172,3 +173,48 @@ async def test_read_upgrade_checks_family_before_and_after(monkeypatch, fail_pos
     else:
         await privileges.provision_source_control_reads(connection, policy, verify_role_profile=verify_profile)
         assert events == ["profile", "family", "admission", "family", "profile"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("installed", [False, True])
+async def test_installed_artifact_revision_gets_exact_column_grants(installed):
+    connection = SimpleNamespace(
+        execute=AsyncMock(),
+        fetchval=AsyncMock(side_effect=lambda query, *_: installed and "address_alias_artifact_state_v1" in query),
+    )
+    policy = SimpleNamespace(schema="source_schema", owner_role="source_owner")
+    await privileges.grant_source_admission_controls(connection, policy)
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    revision_statements = [statement for statement in statements if "address_alias_artifact_state_v1" in statement]
+    assert revision_statements == (
+        [
+            "GRANT SELECT(artifact_name,generation,updated_at),INSERT(artifact_name,generation,updated_at),"
+            'UPDATE(generation,updated_at) ON "source_schema"."address_alias_artifact_state_v1" TO "source_owner"'
+        ]
+        if installed
+        else []
+    )
+    assert len(statements) == 11 + int(installed)
+    assert connection.fetchval.await_args.args[1:] == ("source_schema",)
+    assert "pg_roles" not in connection.fetchval.await_args.args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("installed", [False, True])
+async def test_admission_grants_only_installed_npi_origin_columns(installed):
+    connection = SimpleNamespace(
+        execute=AsyncMock(),
+        fetchval=AsyncMock(side_effect=lambda query, *_: installed and "npi_result_generation" in query),
+    )
+    policy = SimpleNamespace(schema="source_schema", owner_role="source_owner")
+    await privileges.grant_source_admission_controls(connection, policy)
+    statements = [call.args[0] for call in connection.execute.await_args_list]
+    npi_statements = [statement for statement in statements if "npi_result_generation" in statement]
+    assert npi_statements == (
+        [
+            'GRANT SELECT(origin_lineage_id,origin_generation) ON "source_schema"."npi_result_generation" TO "source_owner"'
+        ]
+        if installed
+        else []
+    )
+    assert connection.fetchval.await_args.args[1:] == ("source_schema",)

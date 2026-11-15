@@ -8,6 +8,7 @@ all affected writers before and after these grants in its original transaction.
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
+from process.provider_directory_source_control_privileges import grant_npi_generation_read
 
 IMPORT_RUN_SELECT = (
     "run_id",
@@ -184,8 +185,7 @@ PROFILE_GENERATION_UPDATE = (
 PROFILE_GENERATION_INSERT = (
     "singleton_key",
     *PROFILE_GENERATION_UPDATE,
-    "evidence_target_oid",
-    "profile_target_oid",
+    "targets_json",
 )
 PROFILE_DELTA_INSERT = (
     "build_id",
@@ -207,8 +207,7 @@ PROFILE_DELTA_INSERT = (
     "selection_proof_id",
     "control_generation",
     "authority_revision",
-    "evidence_target_oid",
-    "profile_target_oid",
+    "targets_json",
     "evidence_rows",
     "profile_rows",
     "evidence_inserted",
@@ -341,6 +340,7 @@ async def grant_cms_control_privileges(connection, policy):
     maintain_statements = tuple(
         f"GRANT MAINTAIN ON {storage_relation(policy.schema, root)} TO {owner}" for root in MAINTAIN_TABLES
     )
+    await grant_npi_generation_read(connection, policy)
     for statement in (
         *table_statements,
         *column_statements,
@@ -376,8 +376,7 @@ READ_COLUMN_GRANTS = {
         "source_context_vector_hash",
         "executable_plan_hash",
         "profile_as_of",
-        "evidence_target_oid",
-        "profile_target_oid",
+        "targets_json",
         "evidence_rows",
         "profile_rows",
     ),
@@ -388,7 +387,8 @@ READ_COLUMN_GRANTS = {
         "origin_lineage_id",
         "origin_generation",
         "published_at",
-        "relation_oids",
+        "serving_schema",
+        "serving_relation_names",
     ),
     "address_alias_state_v1": ("singleton", "generation"),
 }

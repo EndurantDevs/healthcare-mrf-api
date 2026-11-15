@@ -19,10 +19,11 @@ from api import provider_batch as native_batch
 from api.network_address_scope import current_network_address_scope, scoped_address_relation_sql
 from api.provider_list_sql import _provider_import_count_page
 from process.custom_import.read_contracts import CustomImportReadRequestError
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import NetworkServingReadUnavailable, PinnedNetworkServingManifest
 from tests import test_custom_import_provider_batch as batch_fixtures
 from tests import test_custom_import_provider_http as page_fixtures
-from tests.network_read_execution_support import _ReceiptDriver, mock_approved_control_metadata
+from tests.network_read_execution_support import _QueryDriver, mock_approved_control_metadata
 from tests.openapi_route_contract_support import load_openapi_document
 
 _MANIFEST = PinnedNetworkServingManifest(
@@ -33,7 +34,7 @@ _MANIFEST = PinnedNetworkServingManifest(
     {},
     0,
     "c" * 64,
-    1,
+    CompactAddressRelation("network_candidate_00000000000000000000000000000001", "entity_address_unified"),
 )
 
 
@@ -60,7 +61,7 @@ class _ScopedSession(page_fixtures._Session):
     def __init__(self):
         super().__init__()
         self._transaction = object()
-        self.driver = _ReceiptDriver(self, None)
+        self.driver = _QueryDriver(self, None)
 
     def in_transaction(self):
         return self.already_active or "begin" in self.events and "end" not in self.events

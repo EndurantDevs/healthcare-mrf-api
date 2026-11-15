@@ -170,7 +170,6 @@ def _install_control_fakes(monkeypatch, state):
     }
     for collaborator_name, collaborator in collaborator_by_name.items():
         monkeypatch.setattr(source_pointers, collaborator_name, collaborator)
-    monkeypatch.setattr(source_snapshot_control, "_clear_ptg2_snapshot_cache", lambda: None)
 
 
 async def _run_interleaving(state):

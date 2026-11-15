@@ -42,19 +42,7 @@ async def _reader(admin, *, readonly=True, isolation="REPEATABLE READ", assumed=
 
 
 async def _expected(admin):
-    roots_by_name = {
-        row["relname"]: {"oid": row["oid"], "owner": row["owner"]}
-        for row in await admin.fetch(
-            "SELECT relname,oid::bigint,relowner::bigint AS owner FROM pg_catalog.pg_class "
-            "WHERE relnamespace='mrf'::regnamespace AND relname=ANY($1::text[])",
-            list(history.ROOTS),
-        )
-    }
-    return {
-        "database_oid": await admin.fetchval("SELECT oid::bigint FROM pg_database WHERE datname=current_database()"),
-        "schema_oid": await admin.fetchval("SELECT 'mrf'::regnamespace::oid::bigint"),
-        "roots": roots_by_name,
-    }
+    return {"schema": "mrf", "roots": {root: {"schema": "mrf", "name": root} for root in history.ROOTS}}
 
 
 async def _read(reader, expected, datasets):
@@ -142,14 +130,14 @@ async def test_history_native_paths_preserve_original_admin_and_settings(native_
         await connection.fetchval("SELECT pg_catalog.set_config('search_path',$1,true)", search_path)
         if permitted:
             actor = await history._state(database, session, connection)
-            assert actor["session"] == actor["current"] and actor["readonly"] == "on"
+            assert actor["readonly"] == "on" and actor["isolation"] == "repeatable read"
         else:
             with pytest.raises(ValueError, match="search_path"):
                 await history._state(database, session, connection)
         assert await connection.fetchval("SHOW search_path") == search_path
 
 
-@pytest.mark.parametrize("mode", ["write", "read_committed", "assumed", "unbounded"])
+@pytest.mark.parametrize("mode", ["write", "read_committed", "unbounded"])
 async def test_wrong_snapshot_or_actor_refuses_without_changing_settings(native_layout, mode):
     expected = await _expected(native_layout)
     async with _reader(
@@ -164,28 +152,36 @@ async def test_wrong_snapshot_or_actor_refuses_without_changing_settings(native_
         settings = await connection.fetchrow(
             "SELECT current_setting('statement_timeout'),current_setting('search_path')"
         )
-        with pytest.raises(ValueError, match="original_admin_snapshot_required|bounded_settings_required"):
+        with pytest.raises(ValueError, match="read_only_snapshot_required|bounded_settings_required"):
             await _read(reader, expected, [])
         assert settings == await connection.fetchrow(
             "SELECT current_setting('statement_timeout'),current_setting('search_path')"
         )
 
 
-@pytest.mark.parametrize("field", ["oid", "owner"])
-async def test_changed_native_history_identity_refuses(native_layout, field):
+async def test_configured_reader_role_can_read_named_history(native_layout):
     expected = await _expected(native_layout)
-    expected["roots"][history.WITNESS][field] += 1
+    async with _reader(native_layout, assumed=True) as reader:
+        state = await history._state(*reader)
+        assert state["readonly"] == "on"
+        await reader[2].fetchval("SELECT 1 FROM mrf.provider_directory_cms_npd_resource_witness LIMIT 0")
+        assert await reader[2].fetchval("SELECT current_user") == "pg_read_all_data"
+
+
+@pytest.mark.parametrize("field", ["schema", "name"])
+async def test_changed_declared_history_name_refuses_before_copy(native_layout, field):
+    expected = await _expected(native_layout)
+    expected["roots"][history.WITNESS][field] = "another_name"
     async with _reader(native_layout) as reader:
-        with pytest.raises(ValueError, match="roots_changed"):
+        with pytest.raises(ValueError, match="roots_required"):
             await _read(reader, expected, [])
 
 
-@pytest.mark.parametrize("field,reason", [("database_oid", "database_changed"), ("schema_oid", "roots_changed")])
-async def test_wrong_catalog_identity_refuses(native_layout, field, reason):
+async def test_wrong_declared_catalog_refuses(native_layout):
     expected = await _expected(native_layout)
-    expected[field] += 1
+    expected["schema"] = "another_catalog"
     async with _reader(native_layout) as reader:
-        with pytest.raises(ValueError, match=reason):
+        with pytest.raises(ValueError, match="catalog_required"):
             await _read(reader, expected, [])
 
 
@@ -218,3 +214,40 @@ async def test_native_composite_anti_joins_reject_cross_dataset_orphans(native_l
             await history._relationships(native_layout, relations_by_root)
         for relation in reversed(list(relations_by_root.values())):
             await native_layout.execute("DROP TABLE " + relation)
+
+
+async def test_named_history_capture_reads_actual_plan_metadata_and_complete_content(native_layout):
+    from process import provider_directory_cms_history_capture as capture
+    from process import provider_directory_cms_snapshot_parents as parents
+
+    parents_by_root = {
+        root: {"schema": "mrf", "name": "history_future_" + str(index)}
+        for index, root in enumerate(capture.history.ROOTS)
+    }
+    try:
+        for root, relation in parents_by_root.items():
+            for statement in parents.cms_snapshot_parent_statements("mrf", root, relation["name"]):
+                await native_layout.execute(statement)
+        async with _reader(native_layout) as reader:
+            record_by_field = await capture.capture_cms_history_data(
+                reader[2],
+                reader[1],
+                storage={"catalog_schema": "mrf"},
+                family=[{"schema": "mrf", "name": root} for root in history.ROOTS],
+                parents=parents_by_root,
+                history_names={
+                    root: "retained_history_" + str(index) for index, root in enumerate(capture.history.ROOTS)
+                },
+            )
+            assert set(record_by_field) == {"request", "dataset_rows", "content"}
+            for root, heap in record_by_field["request"]["heaps"].items():
+                assert heap["old"]["name"] == root and heap["parent"]["schema"] == "mrf"
+                assert record_by_field["content"][root]["rows"] == sum(record_by_field["dataset_rows"][root].values())
+                assert record_by_field["content"][root]["bytes"] >= 21
+                assert len(record_by_field["content"][root]["sha256"]) == 64
+                assert set(heap["old"]) == {"schema", "name", "kind", "indexes", "foreign_keys", "hooks"}
+    finally:
+        for relation in reversed(list(parents_by_root.values())):
+            await native_layout.execute(
+                "DROP TABLE IF EXISTS " + storage_relation(relation["schema"], relation["name"])
+            )

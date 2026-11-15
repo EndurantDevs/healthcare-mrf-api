@@ -1,7 +1,8 @@
-"""Candidate orchestration checks; native catalog and permission acceptance is separate."""
+"""Named candidate orchestration; actual native grants require PostgreSQL proof."""
 
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
@@ -13,255 +14,195 @@ DATASET = UUID("11111111-1111-4111-8111-111111111111")
 
 def ownership():
     return stage.native.ReferenceFamilyStageOwnership(
-        "nucc",
-        DATASET,
-        stage.native.reference_family_stage_schema(DATASET),
-        301,
-        (("nucc_taxonomy", 201),),
+        "nucc", DATASET, stage.native.reference_family_stage_schema(DATASET), None, (("nucc_taxonomy", None),)
     )
 
 
 class Transaction:
+    def __init__(self):
+        self.statements = []
+        self.events = []
+        self.scalar = AsyncMock(return_value=False)
+
     def in_transaction(self):
-        return self
+        return True
 
     @asynccontextmanager
     async def begin_nested(self):
-        yield self
+        self.events.append("savepoint")
+        try:
+            yield self
+        except BaseException:
+            self.events.append("rollback")
+            raise
+        else:
+            self.events.append("release")
 
     async def connection(self):
+        self.events.append("materialize")
         return self
 
     async def execute(self, statement):
-        assert str(statement).startswith("LOCK TABLE ONLY ") and "IN SHARE MODE NOWAIT" in str(statement)
+        self.statements.append(str(statement))
 
 
 @pytest.mark.asyncio
-async def test_precreate_defers_all_indexes_and_seals_empty_model(monkeypatch):
-    events = []
-    candidate = ownership()
-
-    async def owner(_session):
-        return 101
-
-    async def create(_session, spec, schema, **options):
-        assert spec.importer_id == "nucc" and schema == candidate.schema_name
-        assert options == dict(create_indexes=False, ordinary_heaps=True, protected_owner_oid=101)
-        events.append("empty-model-without-indexes")
-
-    async def capture(_session, spec, dataset):
-        assert spec.importer_id == "nucc" and dataset == DATASET
-        return candidate
-
-    async def seal(_session, actual, owner_oid, *, require_empty):
-        assert actual is candidate and owner_oid == 101 and require_empty is True
-        events.append("closed-owner-heaps")
-
-    monkeypatch.setattr(stage.native, "protected_publisher_owner", owner)
+@pytest.mark.parametrize("source", (False, True))
+async def test_precreate_freezes_empty_model_and_grants_candidate_insert(monkeypatch, source):
+    candidate, session = ownership(), Transaction()
+    create, seal = AsyncMock(), AsyncMock()
     monkeypatch.setattr(stage.native, "_create_model_family", create)
-    monkeypatch.setattr(stage.native, "capture_model_family_stage_ownership", capture)
+    monkeypatch.setattr(stage.native, "capture_model_family_stage_ownership", AsyncMock(return_value=candidate))
     monkeypatch.setattr(stage.native, "seal_model_family_storage", seal)
-    assert await stage.precreate_nucc_stage(Transaction(), dataset_id=DATASET) is candidate
-    assert events == ["empty-model-without-indexes", "closed-owner-heaps"]
+    actor = AsyncMock(return_value={"role": "source_builder"})
+    monkeypatch.setattr(stage, "_source_actor", actor)
+    source_session = object() if source else None
+    assert await stage.precreate_nucc_stage(session, dataset_id=DATASET, source_session=source_session) is candidate
+    create.assert_awaited_once_with(
+        session,
+        stage.native.reference_family_spec("nucc"),
+        candidate.schema_name,
+        create_indexes=False,
+        ordinary_heaps=True,
+    )
+    seal.assert_awaited_once_with(session, candidate, require_empty=True, freeze_schema=False)
+    assert session.events == ["savepoint", "materialize", "release"]
+    assert session.statements == (
+        [
+            f'GRANT USAGE ON SCHEMA "{candidate.schema_name}" TO "source_builder"',
+            f'GRANT INSERT ON "{candidate.schema_name}"."nucc_taxonomy" TO "source_builder"',
+        ]
+        if source
+        else []
+    )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("dataset", [str(DATASET), None, 101])
+@pytest.mark.parametrize("dataset", (None, "11111111-1111-4111-8111-111111111111", True))
 async def test_precreate_refuses_non_native_dataset(monkeypatch, dataset):
+    create = AsyncMock()
+    monkeypatch.setattr(stage, "_precreate_nucc_stage", create)
     with pytest.raises(stage.native.ReferenceFamilyArchiveError, match="dataset differs"):
         await stage.precreate_nucc_stage(Transaction(), dataset_id=dataset)
+    create.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("records", [[], (), [None] * 5001, {"code": "111111111A"}])
-async def test_copy_refuses_outside_bounded_batch_before_native_io(records):
+@pytest.mark.parametrize("records", ([], None, "rows", [()] * 5001))
+async def test_copy_refuses_outside_bounded_batch_before_native_io(monkeypatch, records):
+    copy = AsyncMock()
+    monkeypatch.setattr(stage.native, "native_copy_record_batch", copy)
     with pytest.raises(stage.native.ReferenceFamilyArchiveError, match="batch exceeds bound"):
         await stage.copy_nucc_stage(Transaction(), ownership(), records)
+    copy.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_finish_closes_writes_then_indexes_then_set_validation(monkeypatch):
-    events = []
-    candidate = ownership()
+@pytest.mark.parametrize("denied", (False, True))
+async def test_copy_uses_fixed_model_column_order_and_preserves_native_permission_denial(monkeypatch, denied):
+    candidate, session = ownership(), Transaction()
+    verify = AsyncMock()
+    copy = AsyncMock(side_effect=PermissionError("native INSERT denied") if denied else None, return_value=1)
+    monkeypatch.setattr(stage.native, "verify_reference_family_stage_ownership", verify)
+    monkeypatch.setattr(stage.native, "native_copy_record_batch", copy)
+    if denied:
+        with pytest.raises(PermissionError, match="native INSERT denied"):
+            await stage.copy_nucc_stage(session, candidate, [(1,)])
+    else:
+        assert await stage.copy_nucc_stage(session, candidate, [(1,)]) == 1
+    privilege_query, parameters = session.scalar.await_args.args
+    assert "has_table_privilege" in str(privilege_query)
+    assert parameters == {"relation": f'"{candidate.schema_name}"."nucc_taxonomy"'}
+    verify.assert_awaited_once_with(session, candidate)
+    model = stage.native.reference_family_spec("nucc").model_types[0]
+    copy.assert_awaited_once_with(
+        session,
+        model,
+        schema_name=candidate.schema_name,
+        table_name="nucc_taxonomy",
+        columns=tuple(model.__table__.columns.keys()),
+        records=[(1,)],
+    )
+    assert session.statements[0] == f'GRANT INSERT ON "{candidate.schema_name}"."nucc_taxonomy" TO CURRENT_USER'
+    if denied:
+        assert session.events[-1] == "rollback"
+    else:
+        assert session.statements[-1] == f'REVOKE INSERT ON "{candidate.schema_name}"."nucc_taxonomy" FROM CURRENT_USER'
+        assert session.events[-1] == "release"
 
-    async def owner(_session):
-        return 101
 
-    async def verify(_session, actual):
-        assert actual is candidate
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", (False, True))
+async def test_candidate_close_revokes_source_insert_before_configured_freeze(monkeypatch, source):
+    session, candidate = Transaction(), ownership()
+    seal = AsyncMock()
+    monkeypatch.setattr(stage.native, "seal_model_family_storage", seal)
+    actor = AsyncMock(return_value={"role": "source_builder"})
+    monkeypatch.setattr(stage, "_source_actor", actor)
+    source_session = object() if source else None
+    await stage._close_candidate_grants(session, candidate, source_session=source_session)
+    assert session.statements == [
+        f'LOCK TABLE ONLY "{candidate.schema_name}"."nucc_taxonomy" IN ACCESS SHARE MODE NOWAIT',
+        *([f'REVOKE INSERT ON "{candidate.schema_name}"."nucc_taxonomy" FROM "source_builder"'] if source else []),
+    ]
+    seal.assert_awaited_once_with(session, candidate, freeze_schema=False)
+    assert actor.await_count == int(source)
 
-    async def close(_session, actual, owner_oid, source):
-        assert actual is candidate and owner_oid == 101 and source is None
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", (None, "freeze", "indexes", "validation", "content", "layout"))
+async def test_finish_closes_writes_before_indexes_and_full_semantic_validation(monkeypatch, failure):
+    candidate, session, events = ownership(), Transaction(), []
+
+    async def close(*_args, **_options):
         events.append("close-writes")
+        if failure == "freeze":
+            raise PermissionError("freeze denied")
 
-    async def indexes(_session, actual):
-        assert actual is candidate
+    async def indexes(*_args):
         events.append("indexes")
+        if failure == "indexes":
+            raise RuntimeError("index failure")
 
-    async def validate(_session, *, ownership):
-        assert ownership is candidate
+    async def validate(*_args, **_options):
         events.append("set-validation")
+        if failure == "validation":
+            raise RuntimeError("invalid indexed set")
         return {"row_count": 4}
 
-    async def incoming(_session, oid, owner_oid):
-        assert (oid, owner_oid) == (201, 101)
-        return {"oid": oid}
+    async def freeze(*_args):
+        events.append("full-schema-freeze")
 
-    async def content(*_arguments, **_keywords):
-        return 4, "a" * 64
-
-    async def schema(*_arguments):
-        return "b" * 64
-
-    for name, callback in (
-        ("protected_publisher_owner", owner),
-        ("verify_reference_family_stage_ownership", verify),
-        ("complete_reference_family_restore", indexes),
-        ("validate_nucc_reference_set", validate),
-        ("_projected_row_identity", content),
-        ("_family_schema_identity", schema),
-    ):
-        monkeypatch.setattr(stage.native, name, callback)
+    monkeypatch.setattr(stage.native, "seal_model_family_storage", freeze)
+    child_by_field = {"schema": candidate.schema_name, "name": "nucc_taxonomy"}
+    incoming = AsyncMock(
+        side_effect=[child_by_field, {**child_by_field, "schema": "other"}] if failure == "layout" else None,
+        return_value=child_by_field,
+    )
     monkeypatch.setattr(stage, "_close_candidate_grants", close)
+    monkeypatch.setattr(stage.native, "verify_reference_family_stage_ownership", AsyncMock())
+    monkeypatch.setattr(stage.native, "complete_reference_family_restore", indexes)
+    monkeypatch.setattr(stage.native, "validate_nucc_reference_set", validate)
+    monkeypatch.setattr(
+        stage.native, "_projected_row_identity", AsyncMock(return_value=(5 if failure == "content" else 4, "a" * 64))
+    )
+    monkeypatch.setattr(stage.native, "_family_schema_identity", AsyncMock(return_value="b" * 64))
+    monkeypatch.setattr(stage.native, "_relation_oid", AsyncMock(return_value=1))
     monkeypatch.setattr(stage.partition, "_capture_incoming", incoming)
-    finished_by_field = await stage.finish_nucc_stage(Transaction(), candidate)
-    assert events == ["close-writes", "indexes", "set-validation"]
-    assert finished_by_field["validation"] == {"row_count": 4} and finished_by_field["semantic_sha256"] == "a" * 64
-    events.clear()
-    assert await stage.revalidate_nucc_stage(Transaction(), candidate) == finished_by_field
-    assert await stage.revalidate_nucc_stage(Transaction(), candidate) == finished_by_field
-    assert events == ["set-validation", "set-validation"]
-
-
-class CandidateGrants:
-    def __init__(self, edges):
-        self.edges, self.statements = edges, []
-
-    async def execute(self, statement, parameters=None):
-        sql = str(statement)
-        if "aclexplode" in sql:
-            assert parameters == {"oid": 201}
-            return self
-        self.statements.append(sql)
-
-    def all(self):
-        return self.edges
-
-    async def scalar(self, statement, parameters=None):
-        sql = str(statement)
-        if "quote_ident" in sql:
-            assert parameters == {"oid": 103}
-            return '"source_builder"'
-        assert sql == "SELECT (SELECT oid FROM pg_roles WHERE rolname=current_user)::bigint"
-        return 102
-
-
-def candidate_acl(*, source=False):
-    edges = [(101, 101, right, False) for right in sorted(stage.partition._OWNER_RIGHTS)]
-    edges.append((102, 101, "SELECT", False))
-    return edges + ([(103, 101, "INSERT", False)] if source else [])
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("source", [False, True])
-async def test_close_preserves_only_actual_publisher_read_and_closes_source_insert(monkeypatch, source):
-    session = CandidateGrants(candidate_acl(source=source))
-    source_session = object() if source else None
-
-    async def actor(publisher, actual_source, owner):
-        assert publisher is session and actual_source is source_session and owner == 101
-        return {"actor_oid": 103}
-
-    async def seal(publisher, oid, owner):
-        assert publisher is session and (oid, owner) == (201, 101)
-        session.statements.append("seal")
-
-    monkeypatch.setattr(stage, "_source_actor", actor)
-    monkeypatch.setattr(stage, "_seal_published_relation", seal)
-    await stage._close_candidate_grants(session, ownership(), 101, source_session)
-    assert session.statements[0].startswith("LOCK TABLE ONLY ") and "ACCESS EXCLUSIVE" in session.statements[0]
-    assert session.statements[-1] == "seal"
-    assert any(sql.startswith("REVOKE INSERT ON ") for sql in session.statements) is source
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "edge",
-    [
-        (104, 101, "SELECT", False),
-        (102, 101, "SELECT", True),
-        (102, 104, "SELECT", False),
-        (102, 101, "UPDATE", False),
-        (103, 101, "SELECT", False),
-    ],
-)
-async def test_close_refuses_foreign_reader_option_grantor_or_mutation(monkeypatch, edge):
-    session = CandidateGrants(candidate_acl(source=True) + [edge])
-
-    async def actor(*_arguments):
-        return {"actor_oid": 103}
-
-    monkeypatch.setattr(stage, "_source_actor", actor)
-    with pytest.raises(stage.native.ReferenceFamilyArchiveError, match="candidate grants differ"):
-        await stage._close_candidate_grants(session, ownership(), 101, object())
-    assert session.statements == []
-
-
-@pytest.fixture
-def candidate_grants(monkeypatch):
-    class Session:
-        publisher_oid = 102
-
-        def __init__(self):
-            rights = ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN")
-            self.entries = [(101, 101, right, False) for right in rights] + [(102, 101, "SELECT", False)]
-            self.events = []
-
-        async def execute(self, statement, parameters=None):
-            if parameters is not None:
-                assert parameters == {"oid": 201} and "aclexplode" in str(statement)
-                return SimpleNamespace(all=lambda: self.entries)
-            assert "LOCK TABLE ONLY" in str(statement) and "ACCESS EXCLUSIVE" in str(statement)
-            self.events.append("locked")
-
-        async def scalar(self, statement):
-            assert str(statement) == "SELECT (SELECT oid FROM pg_roles WHERE rolname=current_user)::bigint"
-            return self.publisher_oid
-
-    async def seal(session, oid, owner_oid):
-        assert (oid, owner_oid) == (201, 101) and session.events == ["locked"]
-        session.events.append("sealed")
-
-    monkeypatch.setattr(stage, "_seal_published_relation", seal)
-    return Session()
-
-
-@pytest.mark.asyncio
-async def test_close_candidate_accepts_only_exact_publisher_select(candidate_grants):
-    await stage._close_candidate_grants(candidate_grants, ownership(), 101, None)
-    assert candidate_grants.events == ["locked", "sealed"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("publisher_oid", [None, 0, 101, True, "102"])
-async def test_close_candidate_requires_actual_distinct_publisher_oid(candidate_grants, publisher_oid):
-    candidate_grants.publisher_oid = publisher_oid
-    with pytest.raises(stage.native.ReferenceFamilyArchiveError, match="Publisher identity differs"):
-        await stage._close_candidate_grants(candidate_grants, ownership(), 101, None)
-    assert candidate_grants.events == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["missing", "other", "grantable", "grantor", "write", "duplicate"])
-async def test_close_candidate_refuses_changed_publisher_acl_before_sealing(candidate_grants, change):
-    candidate_grants.entries[-1:] = {
-        "missing": [],
-        "other": [(103, 101, "SELECT", False)],
-        "grantable": [(102, 101, "SELECT", True)],
-        "grantor": [(102, 104, "SELECT", False)],
-        "write": [(102, 101, "SELECT", False), (102, 101, "INSERT", False)],
-        "duplicate": [(102, 101, "SELECT", False), (102, 101, "SELECT", False)],
-    }[change]
-    with pytest.raises(stage.native.ReferenceFamilyArchiveError, match="candidate grants differ"):
-        await stage._close_candidate_grants(candidate_grants, ownership(), 101, None)
-    assert candidate_grants.events == []
+    if failure:
+        with pytest.raises(
+            (RuntimeError, PermissionError),
+            match="freeze denied|index failure|invalid indexed set|census changed|layout changed",
+        ):
+            await stage.finish_nucc_stage(session, candidate)
+        assert "rollback" in session.events
+    else:
+        prepared = await stage.finish_nucc_stage(session, candidate)
+        assert prepared["validation"] == {"row_count": 4} and prepared["semantic_sha256"] == "a" * 64
+        assert prepared["schema_sha256"] == "b" * 64
+        assert all(
+            call.args == (session, (candidate.schema_name, "nucc_taxonomy")) for call in incoming.await_args_list
+        )
+    assert events[:1] == ["close-writes"]
+    if failure not in {"freeze", "indexes"}:
+        assert events == ["close-writes", "indexes", "full-schema-freeze", "set-validation"]

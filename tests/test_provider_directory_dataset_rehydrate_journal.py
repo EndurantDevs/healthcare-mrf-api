@@ -38,15 +38,15 @@ def _case():
     )
     digest = _operation_digest(operation_by_field, (target_name,))
     old, new = relation(target_name, target_name, 101), relation(target_name, "stage", 201)
-    stage = OutputStage(old.schema, target_name, "stage", new.oid, digest, old)
-    prepared = PreparedOutputReceipt(1, digest, old, new)
+    stage = OutputStage(old.schema, target_name, "stage", None, digest, old)
+    prepared = PreparedOutputReceipt(2, digest, old, new)
     retained = RetainedOutputReceipt(
-        1,
+        2,
         digest,
         old.schema,
         target_name,
-        retained_name(old.oid),
-        replace(old, relation=retained_name(old.oid)),
+        retained_name(digest, target_name),
+        replace(old, relation=retained_name(digest, target_name)),
         replace(new, relation=target_name),
     )
     journal_value = journal.begin_preparation(
@@ -72,15 +72,15 @@ def test_same_intent_resumes_exact_stages_and_changed_intent_refuses():
     assert value["active"]["stages"] == {}
 
 
-@pytest.mark.parametrize("mutation", ["oid", "incumbent", "rows", "cursor"])
+@pytest.mark.parametrize("mutation", ["relation", "incumbent", "rows", "cursor"])
 def test_active_stage_substitution_or_cursor_rewind_refuses(mutation):
     value, stage, _, _ = _case()
     copied = journal.record_stage(value, stage, cursor=["source", "last"], rows=2)
     candidate, cursor_values, rows = stage, ["source", "last"], 2
-    if mutation == "oid":
-        candidate = replace(stage, oid=202)
+    if mutation == "relation":
+        candidate = replace(stage, relation="another_stage")
     elif mutation == "incumbent":
-        candidate = replace(stage, incumbent=replace(stage.incumbent, oid=102))
+        candidate = replace(stage, incumbent=replace(stage.incumbent, relation="another_incumbent"))
     elif mutation == "rows":
         rows = 1
     else:
@@ -113,12 +113,12 @@ def test_publish_and_inverse_cut_preserve_all_previous_generations():
     operation_by_field = {**sealed["active"]["operation"], "kind": "rollback", "rollback_of": digest}
     inverse_digest = _operation_digest(operation_by_field, tuple(sealed["active"]["targets"]))
     inverse = RetainedOutputReceipt(
-        1,
+        2,
         inverse_digest,
         retained.schema,
         retained.target,
-        retained_name(retained.new_oid),
-        replace(retained.successor, relation=retained_name(retained.new_oid)),
+        retained_name(inverse_digest, retained.target),
+        replace(retained.successor, relation=retained_name(inverse_digest, retained.target)),
         replace(retained.incumbent, relation=retained.target),
     )
     restored = journal.record_rollback(
@@ -130,7 +130,7 @@ def test_publish_and_inverse_cut_preserve_all_previous_generations():
 
 
 @pytest.mark.parametrize("mutation", ["remove", "prepared", "published", "active"])
-def test_store_cannot_erase_active_custody_or_retained_history(mutation):
+def test_store_cannot_erase_active_preparation_or_retained_history(mutation):
     sealed, retained = _sealed()
     old = journal.publish_generation(sealed, retained.operation_digest, (retained,), {"Location": {"input": 2}})
     journal_by_field = deepcopy(old)
@@ -179,3 +179,28 @@ def test_completed_history_merge_refuses_active_or_conflicting_member_evidence(d
         other["generations"][retained.operation_digest]["proofs"]["Location"]["input"] = 3
     with pytest.raises(DatasetRehydrationError, match="member_receipts_disagree"):
         journal.merge_completed_histories([published, other])
+
+
+def test_legacy_resume_preserves_raw_metadata_with_named_comparison():
+    value, stage, prepared, _ = _case()
+    legacy_stage_by_field = {key: atom for key, atom in stage.named_payload().items() if key != "protocol"}
+    legacy_stage_by_field.update(oid=None, incumbent=stage.incumbent.to_payload())
+    legacy_prepared_by_field = {
+        **prepared.to_payload(),
+        "protocol": 1,
+        "incumbent": prepared.incumbent.to_payload(),
+        "successor": prepared.successor.to_payload(),
+    }
+    legacy_prepared_by_field["incumbent"].update(oid=None, owner_oid=False, schema_oid="opaque")
+    legacy_prepared_by_field["successor"].update(oid=False, owner_oid=None, schema_oid="another opaque token")
+    value["active"]["stages"][stage.target] = dict(
+        stage=legacy_stage_by_field, cursor=["source", "last"], rows=2, receipt=legacy_prepared_by_field
+    )
+    saved = deepcopy(value)
+    assert journal.output_journal({"output_snapshots": value}) == saved
+    current_stage = OutputStage.from_payload(stage.named_payload())
+    current_receipt = PreparedOutputReceipt.from_payload(prepared.named_payload())
+    assert (
+        journal.record_stage(value, current_stage, cursor=["source", "last"], rows=2, receipt=current_receipt) == saved
+    )
+    assert value == saved

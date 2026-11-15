@@ -12,10 +12,7 @@ from uuid import UUID, uuid4
 from process.network_address_projection import _identifier
 from process.network_legacy_alias_adoption import MAX_ADOPTION_ROWS, LegacyNetworkAdoptionRow
 from process.registry_fhir_catalog_identity import ALIAS_SCOPE, FHIRNetworkIdentityInput, _allocation_key
-from process.registry_management_permissions import (
-    assume_registry_source_owner,
-    verify_registry_management_permissions,
-)
+from process.registry_management_permissions import assume_registry_source_owner
 from process.registry_record_store import _bounded_text, _record_identity, _validated_actor, _validated_fields
 from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
 
@@ -367,9 +364,6 @@ async def seed_network_catalog_drafts(
     caller = await connection.fetchval("SELECT quote_ident(current_user)")
     try:
         async with connection.transaction():
-            await verify_registry_management_permissions(
-                connection, api_role=api_role, owner_role=owner_role, control_schema=control_schema
-            )
             await assume_registry_source_owner(connection, owner_role, control_schema=control_schema)
             control = await connection.fetchrow(
                 f"SELECT * FROM {namespace}.registry_revision_control WHERE id=1 FOR UPDATE"

@@ -2,22 +2,45 @@
 """Strict recognition of the installed common-receipt guards in Profile capacity fingerprints."""
 
 import importlib
+from contextlib import asynccontextmanager
 
 import pytest
 from sqlalchemy import text
 
 from db.connection import Database
 from process.provider_directory_cms_receipt_guard import profile_transition_body
-from tests.test_provider_directory_cms_serving_receipt_postgres import _database
+from tests.test_provider_directory_cms_serving_receipt_postgres import _database as _historical_database
+from tests.test_provider_directory_cms_serving_receipt_postgres import _migration
 
 fhir = importlib.import_module("process.provider_directory_fhir")
+
+
+@asynccontextmanager
+async def _database(monkeypatch, *, install_receipt=True):
+    """Install the current named Profile guard without changing historical fixtures."""
+    async with _historical_database(monkeypatch, install_receipt=install_receipt) as (engine, schema):
+        if install_receipt:
+            revision = _migration("20261116090000")
+            body = revision.named_profile_transition_body('"' + schema + '"')
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        f'ALTER TABLE "{schema}".provider_directory_profile_serving_generation ADD COLUMN targets_json jsonb'
+                    )
+                )
+                await connection.execute(
+                    text(
+                        f'CREATE OR REPLACE FUNCTION "{schema}".cms_serving_profile_transition() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$ {body} $$'
+                    )
+                )
+        yield engine, schema
 
 
 async def _fingerprint(database, schema):
     oid = await database.scalar(
         "SELECT to_regclass(:relation)::oid::bigint", relation=f"{schema}.provider_directory_profile_serving_generation"
     )
-    return await fhir._provider_directory_profile_relation_storage_fingerprint(oid, expected_persistence="p")
+    return await fhir._provider_directory_profile_capacity_relation_layout(oid, expected_persistence="p")
 
 
 @pytest.mark.asyncio
@@ -29,7 +52,10 @@ async def test_exact_serving_receipt_guards_and_legacy_catalog_are_supported(mon
         monkeypatch.setattr(fhir, "db", database)
         try:
             layout = await _fingerprint(database, schema)
-            assert layout.relation_oid > 0
+            assert (layout.schema_name, layout.relation_name) == (
+                schema,
+                "provider_directory_profile_serving_generation",
+            )
             assert layout.main_index_pages
         finally:
             await database.disconnect()
@@ -106,8 +132,8 @@ async def test_fingerprint_rejects_unsupported_body_in_captured_catalog(monkeypa
         monkeypatch.setattr(fhir, "db", database)
         catalog = fhir._profile_capacity_relation_catalog
 
-        async def stale_catalog(relation_oids):
-            attributes, indexes, constraints, triggers = await catalog(relation_oids)
+        async def stale_catalog(relation_oids, **kwargs):
+            attributes, indexes, constraints, triggers = await catalog(relation_oids, **kwargs)
             triggers[0]["trigger_function_source"] = "BEGIN RETURN NULL; END"
             return attributes, indexes, constraints, triggers
 

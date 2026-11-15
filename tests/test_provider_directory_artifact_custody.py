@@ -37,7 +37,9 @@ def _status_source_case(kind, status):
         metadata=dict(source_ids=[selected.source_id]),
     )
     tables_by_root = {
-        root: dict(name="pdgs_" + format(number + 1, "032x") + "_r", oid=number + 100, owner=23, layout_sha256="a" * 64)
+        root: dict(
+            schema="synthetic", name="pdgs_" + format(number + 1, "032x") + "_" + native_copy.source._SUFFIXES[root]
+        )
         for number, root in enumerate(native_copy.source.RELATIONS)
     }
     binding_by_field = dict(
@@ -85,7 +87,9 @@ async def test_copy_header_status_matches_exact_issued_selection(monkeypatch, ki
         verify.assert_not_awaited()
     else:
         await native_copy._source(fhir, publisher, binding, coordinate)
-        verify.assert_awaited_once_with(publisher.connection, publisher.policy, binding)
+        verify.assert_awaited_once_with(
+            publisher.connection, publisher.policy, native_copy.source._binding_json(binding, "synthetic")
+        )
         assert selected.status == selected_status and binding["phase"] == "published"
 
 
@@ -234,23 +238,23 @@ def _drift_target_catalog(catalog, drift):
             catalog["indexes"].append({**catalog["indexes"][0], "name": "unexpected"})
         case "index_flags":
             catalog["indexes"][0]["valid"] = False
-        case "index_owner":
-            catalog["indexes"][0]["owner"] = 999
-        case "acl":
-            catalog["acl_closed"] = False
+        case "pk_unique":
+            catalog["indexes"][0]["unique"] = False
+        case "constraint_deferred":
+            catalog["constraints"][0]["deferred"] = True
 
 
 @pytest.mark.parametrize("model", (fhir.ProviderDirectorySource, *fhir.RESOURCE_MODELS))
 async def test_profile_copy_loading_accepts_exact_unindexed_heaps(model):
     catalog = _legacy_target_catalog(model)
     catalog["constraints"], catalog["indexes"] = [], []
-    assert native_copy._target_catalog(fhir, model, "scope_target", 17, 23, catalog) is False
+    assert native_copy._target_catalog(fhir, model, "scope_target", catalog) is False
 
 
 async def test_profile_copy_loading_refuses_premature_index():
     model = fhir.ProviderDirectorySource
     with pytest.raises(RuntimeError, match="native_copy_custody_invalid"):
-        native_copy._target_catalog(fhir, model, "scope_target", 17, 23, _legacy_target_catalog(model))
+        native_copy._target_catalog(fhir, model, "scope_target", _legacy_target_catalog(model))
 
 
 async def test_completed_catalog_requires_original_source_owner(artifact_wave):
@@ -258,14 +262,14 @@ async def test_completed_catalog_requires_original_source_owner(artifact_wave):
     async with custody.registry_owned_wal_transaction(database) as outcome:
         with pytest.raises(Exception, match="publisher_connection_required"):
             await native_copy.completed_target_catalog(
-                fhir, fhir.ProviderDirectorySource, "scope_target", 17, outcome=outcome
+                fhir, fhir.ProviderDirectorySource, "scope_target", outcome=outcome
             )
 
 
 @pytest.mark.parametrize("model", (fhir.ProviderDirectorySource, *fhir.RESOURCE_MODELS))
 async def test_profile_copy_keeps_exact_original_nine_layouts(model):
     catalog = _legacy_target_catalog(model)
-    assert native_copy._target_catalog(fhir, model, "scope_target", 17, 23, catalog, phase="completed") is (
+    assert native_copy._target_catalog(fhir, model, "scope_target", catalog, phase="completed") is (
         model in (fhir.ProviderDirectoryPractitionerRole, fhir.ProviderDirectoryOrganizationAffiliation)
     )
 
@@ -287,8 +291,8 @@ async def test_profile_copy_keeps_exact_original_nine_layouts(model):
         "collation",
         "extra_index",
         "index_flags",
-        "index_owner",
-        "acl",
+        "pk_unique",
+        "constraint_deferred",
     ],
 )
 async def test_profile_copy_target_drift_refuses_before_transport(drift):
@@ -296,7 +300,7 @@ async def test_profile_copy_target_drift_refuses_before_transport(drift):
     catalog = _legacy_target_catalog(model)
     _drift_target_catalog(catalog, drift)
     with pytest.raises(RuntimeError, match="native_copy_custody_invalid"):
-        native_copy._target_catalog(fhir, model, "scope_target", 17, 23, catalog, phase="completed")
+        native_copy._target_catalog(fhir, model, "scope_target", catalog, phase="completed")
 
 
 async def test_profile_copy_bucket_expression_uses_existing_native_guard(monkeypatch):
@@ -311,50 +315,46 @@ async def test_profile_copy_bucket_expression_uses_existing_native_guard(monkeyp
     index_map = deepcopy(catalog["indexes"][1])
     monkeypatch.setattr(fhir, "_profile_bucket_index_row", AsyncMock(return_value=index_map))
     with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match="bucket_index_changed"):
-        await native_copy._target(fhir, publisher, model, "scope_target", 17, phase="completed")
+        await native_copy._target(fhir, publisher, model, "scope_target", phase="completed")
     driver.execute.assert_awaited_once_with('LOCK TABLE "synthetic"."scope_target" IN ROW EXCLUSIVE MODE NOWAIT')
 
 
 def _completed_target_family(monkeypatch):
     models = (fhir.ProviderDirectorySource, *fhir.RESOURCE_MODELS)
-    targets = tuple((model, "scope_" + str(number), 100 + number) for number, model in enumerate(models))
-    catalog_by_root = {
-        model.__tablename__: {**_legacy_target_catalog(model, name), "oid": oid} for model, name, oid in targets
-    }
+    targets = tuple((model, "scope_" + str(number)) for number, model in enumerate(models))
+    catalog_by_root = {model.__tablename__: _legacy_target_catalog(model, name) for model, name in targets}
     driver = SimpleNamespace(
         execute=AsyncMock(),
         fetchval=AsyncMock(return_value=23),
         fetch=AsyncMock(return_value=list(reversed(catalog_by_root.values()))),
     )
     publisher = SimpleNamespace(connection=driver, policy=SimpleNamespace(schema="synthetic", owner_role="owner"))
-    name_by_root = {model.__tablename__: name for model, name, _ in targets}
+    name_by_root = {model.__tablename__: name for model, name in targets}
     monkeypatch.setattr(fhir, "_provider_directory_profile_capacity_admission", lambda: SimpleNamespace(run_id="run"))
     monkeypatch.setattr(fhir, "_provider_directory_artifact_scope_table_name", lambda root, _run: name_by_root[root])
     monkeypatch.setattr(fhir, "_profile_bucket_index_row", AsyncMock(return_value={"synthetic": True}))
     monkeypatch.setattr(fhir, "_validate_profile_bucket_index_shape", Mock())
-    monkeypatch.setattr(fhir, "_validate_profile_bucket_index_tablespace", Mock())
     return publisher, targets, catalog_by_root
 
 
 async def test_completed_family_uses_one_fresh_catalog_and_checks_both_bucket_indexes(monkeypatch):
     publisher, targets, expected = _completed_target_family(monkeypatch)
     assert await native_copy._target_family_catalog(fhir, publisher, targets, phase="completed") == expected
-    names = sorted(name for _, name, _ in targets)
+    names = sorted(name for _, name in targets)
     publisher.connection.execute.assert_awaited_once_with(
         "LOCK TABLE " + ",".join(f'"synthetic"."{name}"' for name in names) + " IN ROW EXCLUSIVE MODE NOWAIT"
     )
-    publisher.connection.fetchval.assert_awaited_once()
-    publisher.connection.fetch.assert_awaited_once_with(native_copy._TARGET_CATALOG_SQL, "synthetic", names, 23, [])
+    publisher.connection.fetchval.assert_not_awaited()
+    publisher.connection.fetch.assert_awaited_once_with(native_copy._TARGET_CATALOG_SQL, "synthetic", names)
     assert fhir._profile_bucket_index_row.await_count == 2
     assert fhir._validate_profile_bucket_index_shape.call_count == 2
-    assert fhir._validate_profile_bucket_index_tablespace.call_count == 2
-    expected[targets[-1][0].__tablename__]["acl_closed"] = False
+    expected[targets[-1][0].__tablename__]["topology"]["hooks"] = 1
     with pytest.raises(RuntimeError, match="native_copy_custody_invalid"):
         await native_copy._target_family_catalog(fhir, publisher, targets, phase="completed")
     assert publisher.connection.fetch.await_count == 2
 
 
-@pytest.mark.parametrize("damage", ["missing", "duplicate", "unexpected", "replaced_oid"])
+@pytest.mark.parametrize("damage", ["missing", "duplicate", "unexpected", "shape"])
 async def test_completed_family_refuses_incomplete_or_replaced_catalog(monkeypatch, damage):
     publisher, targets, _expected = _completed_target_family(monkeypatch)
     rows = publisher.connection.fetch.return_value
@@ -365,7 +365,7 @@ async def test_completed_family_refuses_incomplete_or_replaced_catalog(monkeypat
     elif damage == "unexpected":
         rows[-1]["relname"] = "other_scope"
     else:
-        rows[-1]["oid"] += 1000
+        rows[-1]["columns"][0]["type"] = "unsupported"
     with pytest.raises(RuntimeError, match="native_copy_custody_invalid"):
         await native_copy._target_family_catalog(fhir, publisher, targets, phase="completed")
 
@@ -384,7 +384,6 @@ def _copy_request():
     return native_copy.NativeCopyRequest(
         fhir.ProviderDirectorySource,
         "scratch_source",
-        17,
         coordinate,
         table,
         {},
@@ -396,7 +395,7 @@ def _copy_request():
 
 async def test_native_copy_unissued_and_missing_source_custody_refuse(artifact_wave):
     _, database, _, *_ = artifact_wave
-    forged = native_copy.NativeCopyWitness("{}", 17, ("npi",), 1, (1,), "{}")
+    forged = native_copy.NativeCopyWitness("{}", ("synthetic", "scratch_source"), ("npi",), 1, (1,), "{}")
     assert not native_copy.matches(forged, None, asyncio.current_task())
     async with custody.registry_owned_wal_transaction(database) as outcome:
         with pytest.raises(Exception, match="publisher_connection_required"):
@@ -412,9 +411,7 @@ async def test_native_copy_transport_retains_whole_original_owner(artifact_wave,
 
     async def authenticate(_module, outcome):
         publisher = SimpleNamespace(policy=SimpleNamespace(schema="synthetic"))
-        return origin_by_outcome.setdefault(
-            id(outcome), (publisher, outcome.retained_driver, {"backend": outcome.retained_pid})
-        )
+        return origin_by_outcome.setdefault(id(outcome), (publisher, outcome.retained_driver))
 
     monkeypatch.setattr(native_copy, "_origin", authenticate)
     monkeypatch.setattr(fhir, "_assert_artifact_scope_projection", lambda projection: None)
@@ -449,7 +446,7 @@ async def test_native_copy_transport_retains_whole_original_owner(artifact_wave,
     outcome.cleanup_complete = False
     assert not native_copy.matches(witness, outcome, asyncio.current_task())
     outcome.cleanup_complete = True
-    object.__setattr__(witness, "target_oid", 18)
+    object.__setattr__(witness, "target", ("synthetic", "other"))
     assert not native_copy.matches(witness, outcome, asyncio.current_task())
 
 
@@ -466,7 +463,7 @@ async def test_native_copy_transport_refuses_invalid_page_or_command(artifact_wa
     monkeypatch.setattr(fhir, "_copy_record", lambda row, columns, json_columns: tuple(row.values()))
     async with custody.registry_owned_wal_transaction(database) as outcome:
         publisher = SimpleNamespace(policy=SimpleNamespace(schema="synthetic"))
-        origin = publisher, outcome.retained_driver, {"backend": outcome.retained_pid}
+        origin = publisher, outcome.retained_driver
         monkeypatch.setattr(native_copy, "_origin", AsyncMock(return_value=origin))
         command = AsyncMock(return_value="COPY 0")
         outcome.retained_driver.copy_records_to_table = command
@@ -476,7 +473,7 @@ async def test_native_copy_transport_refuses_invalid_page_or_command(artifact_wa
 
 
 async def test_native_copy_transport_requires_separate_completed_snapshot_closure():
-    witness = native_copy.NativeCopyWitness("{}", 17, ("source_id",), 1, (1,), "{}")
+    witness = native_copy.NativeCopyWitness("{}", ("synthetic", "scratch_source"), ("source_id",), 1, (1,), "{}")
     assert witness.semantic_scope == "transport_only"
     assert not native_copy.matches(witness, None, asyncio.current_task())
 
@@ -599,7 +596,7 @@ async def test_artifact_original_coordinate_statement_and_native_terminal_owner(
     record = group["statement_custody"]
     outcome = group["original_outcome"]
     assert record is group["original_statement_custody"]
-    assert record["outcome"] is outcome and record["session"] is outcome.session
+    assert record["outcome"] is outcome
     assert record["witness"] is record["original_witness"] and record["witness"].affected_rows == 1
     assert record["statement"] is statement and record["params"] == identity[6]
     assert group["consumed"] and outcome.is_committed and outcome.cleanup_complete

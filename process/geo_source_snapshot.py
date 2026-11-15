@@ -68,7 +68,11 @@ async def _prepare(session, schema, deadline):
         importer_id="geo",
         schema_name=schema,
     )
-    require(authority.relation_oids is None or authority.relation_oids == (oid,), "incumbent_changed")
+    require(
+        authority.relations is None
+        or authority.relations == generation.declared_reference_family_relations("geo", schema),
+        "incumbent_changed",
+    )
     token = uuid4().hex
     candidate = GeoCandidate(schema, "geo_raw_" + token, "geo_candidate_" + token, oid, authority, deadline)
     root = storage_relation(schema, ROOT)

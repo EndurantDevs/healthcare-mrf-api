@@ -2,7 +2,8 @@
 """Bounded COPY and finished native indexes for the fixed output candidates."""
 
 import asyncio
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from uuid import uuid4
@@ -17,7 +18,6 @@ from process.provider_directory_generic_candidate import (
 from process.provider_directory_generic_source_storage import _close_grants
 from process.provider_directory_output_snapshot_catalog import (
     OUTPUT_CATALOG_SQL,
-    decoded,
     encoded,
     output_models,
     require_output,
@@ -28,6 +28,7 @@ from process.provider_directory_output_snapshot_custody import (
     _capture,
     _digest,
     _require_capability,
+    logical_output_descriptor,
 )
 
 OUTPUT_COPY_MAX_BYTES = COPY_MAX_BYTES
@@ -65,58 +66,71 @@ def _record_batches(records):
         yield batch
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class OutputStage:
     schema: str
     target: str
     relation: str
-    oid: int
+    oid: object
     operation_digest: str
     incumbent: NativeOutputRelation
+    legacy_payload: dict | None = field(default=None, compare=False, repr=False)
 
-    def to_payload(self):
-        """Serialize the exact private heap and original incumbent identity."""
+    def named_payload(self):
+        """Return fresh portable operation and named-stage coordinates."""
         return {
+            "protocol": 2,
             "schema": self.schema,
             "target": self.target,
             "relation": self.relation,
-            "oid": self.oid,
             "operation_digest": self.operation_digest,
-            "incumbent": self.incumbent.to_payload(),
+            "incumbent": self.incumbent.named_payload(),
         }
+
+    def to_payload(self):
+        """Keep retained old data raw; new stages contain only logical names/layout."""
+        return deepcopy(self.legacy_payload) if self.legacy_payload is not None else self.named_payload()
+
+    def __eq__(self, other):
+        return isinstance(other, OutputStage) and self.named_payload() == other.named_payload()
 
     @classmethod
     def from_payload(cls, value):
-        """Decode the closed stage identity; native custody must still be verified."""
+        """Decode the closed named shape or retain old raw tokens opaquely."""
+        fields = {"schema", "target", "relation", "operation_digest", "incumbent"}
         require_output(
-            type(value) is dict
-            and set(value) == {"schema", "target", "relation", "oid", "operation_digest", "incumbent"}
-            and type(value["oid"]) is int
-            and 0 < value["oid"] < 2**32,
+            isinstance(value, dict) and set(value) in (fields | {"oid"}, fields | {"protocol"}), "stage_receipt_invalid"
+        )
+        is_legacy = "oid" in value
+        require_output(is_legacy or type(value["protocol"]) is int and value["protocol"] == 2, "stage_receipt_invalid")
+        incumbent = NativeOutputRelation.from_payload(value["incumbent"])
+        require_output(
+            value["schema"] == incumbent.schema
+            and value["target"] == incumbent.target
+            and type(value["operation_digest"]) is str
+            and len(value["operation_digest"]) == 64
+            and set(value["operation_digest"]) <= set("0123456789abcdef"),
             "stage_receipt_invalid",
         )
-        stage_by_field = dict(value)
-        stage_by_field["incumbent"] = NativeOutputRelation.from_payload(stage_by_field["incumbent"])
-        require_output(
-            stage_by_field["schema"] == stage_by_field["incumbent"].schema
-            and stage_by_field["target"] == stage_by_field["incumbent"].target
-            and type(stage_by_field["operation_digest"]) is str
-            and len(stage_by_field["operation_digest"]) == 64
-            and set(stage_by_field["operation_digest"]) <= set("0123456789abcdef"),
-            "stage_receipt_invalid",
+        storage_identifier(value["relation"])
+        return cls(
+            value["schema"],
+            value["target"],
+            value["relation"],
+            value.get("oid"),
+            value["operation_digest"],
+            incumbent,
+            deepcopy(value) if is_legacy else None,
         )
-        storage_identifier(stage_by_field["relation"])
-        return cls(**stage_by_field)
 
 
 def _descriptor(stage, phase):
     return {
-        "protocol": 1,
+        "protocol": 2,
         "operation_digest": stage.operation_digest,
         "target": stage.target,
         "phase": phase,
-        "incumbent_oid": stage.incumbent.oid,
-        "incumbent_digest": _digest(stage.incumbent.to_payload()),
+        "incumbent_digest": _digest(stage.incumbent.named_payload()),
     }
 
 
@@ -142,36 +156,23 @@ async def _stage_row(capability, stage, *, phases):
         "stage_identity_changed",
     )
     storage_identifier(stage.relation)
-    catalog_entries = await capability.connection.fetch(
-        OUTPUT_CATALOG_SQL,
-        stage.schema,
-        [stage.relation],
-        stage.incumbent.owner_oid,
-        [],
-    )
-    require_output(len(catalog_entries) == 1, "stage_missing")
-    catalog_entry = catalog_entries[0]
-    descriptor = decoded(catalog_entry["descriptor"])
+    entries = await capability.connection.fetch(OUTPUT_CATALOG_SQL, stage.schema, [stage.relation])
+    require_output(len(entries) == 1, "stage_missing")
+    entry = entries[0]
+    descriptor = logical_output_descriptor(entry["descriptor"])
     require_output(
-        catalog_entry["oid"] == stage.oid
-        and catalog_entry["schema_oid"] == stage.incumbent.schema_oid
-        and catalog_entry["relowner"] == stage.incumbent.owner_oid
-        and catalog_entry["acl_closed"]
-        and catalog_entry["readers_closed"]
-        and type(descriptor) is dict
-        and descriptor.get("phase") in phases
-        and descriptor == _descriptor(stage, descriptor["phase"]),
-        "stage_custody_changed",
+        isinstance(descriptor, dict)
+        and descriptor["operation_digest"] == stage.operation_digest
+        and descriptor["target"] == stage.target
+        and descriptor["phase"] in phases
+        and (
+            descriptor["incumbent_digest"] is None
+            or descriptor["incumbent_digest"] == _digest(stage.incumbent.named_payload())
+        ),
+        "stage_scope_changed",
     )
-    require_output_shape(catalog_entry, stage.target, indexed=descriptor["phase"] != "loading")
-    from process.mrf_address_publication import require_native_read_catalog
-
-    await require_native_read_catalog(
-        capability.session,
-        (stage.oid,),
-        executable_roles=(capability.policy.owner_role, capability.policy.publisher_role),
-    )
-    return catalog_entry
+    require_output_shape(entry, stage.target, indexed=descriptor["phase"] != "loading")
+    return entry
 
 
 async def prepare_output_stage(directory, capability, target):
@@ -190,8 +191,7 @@ async def prepare_output_stage(directory, capability, target):
         f"CREATE TABLE {relation} (LIKE {storage_relation(capability.policy.schema, target)} INCLUDING STORAGE)"
     )
     await _close_grants(capability.connection, capability.policy, name)
-    oid = await capability.connection.fetchval("SELECT to_regclass($1)::oid::bigint", relation)
-    stage = OutputStage(capability.policy.schema, target, name, oid, capability.operation_digest, incumbent)
+    stage = OutputStage(capability.policy.schema, target, name, None, capability.operation_digest, incumbent)
     await _comment(capability, stage, "loading")
     await _stage_row(capability, stage, phases={"loading"})
     return stage
@@ -246,6 +246,17 @@ async def finish_output_indexes(directory, capability, stage):
         )
     await capability.connection.execute(f"ANALYZE {relation}")
     await _comment(capability, stage, "indexed")
+    from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
+
+    await freeze_fhir_source_snapshot(
+        capability.connection,
+        stage.schema,
+        namespace_owner=capability.policy.owner_role,
+        reader_roles=(capability.policy.owner_role, capability.policy.publisher_role, *capability.policy.runtime_roles),
+        application_roles=(),
+        relation_names=(stage.relation,),
+        freeze_schema=False,
+    )
     await _stage_row(capability, stage, phases={"indexed"})
 
 

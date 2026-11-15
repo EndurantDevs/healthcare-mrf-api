@@ -5,25 +5,25 @@ from copy import deepcopy
 
 import pytest
 
-from db.plan_release_storage import storage_identifier, storage_relation
+from db.plan_release_storage import storage_relation
 from process import provider_directory_cms_prepared_allocation as allocation
 from process import provider_directory_generic_source_storage as storage
 from process.provider_directory_source_storage_binding import FHIRSourceCandidateHandoff
 from tests.test_provider_directory_cms_prepared_candidate_postgres import (
     canonical_snapshot,
-    unallocated_candidate_case,
-)
-from tests.test_provider_directory_cms_prepared_identity_publication_postgres import publication_case
-from tests.test_provider_directory_cms_prepared_outputs_postgres import (
     full_private_case,
     native_case,
     native_derived_case,
     native_frozen_case,
+    payload_case,
+    publication_case,
+    unallocated_candidate_case,
+)
+from tests.test_provider_directory_cms_prepared_outputs_postgres import (
     observe,
     prepare,
     publisher,
 )
-from tests.test_provider_directory_cms_prepared_payload_publication_postgres import payload_case
 
 pytestmark = pytest.mark.asyncio
 
@@ -46,9 +46,7 @@ async def test_private_record_preserves_canonical_storage_and_original_publisher
             binding = workspace.binding
             transaction = await driver.fetchval("SELECT pg_current_xact_id()::text")
             result = await allocation.retain_prepared_cms_workspace(workspace, case.handoff)
-            assert result == dict(
-                contract=allocation.PRIVATE_ALLOCATION_CONTRACT, workspace=binding, transaction=transaction
-            )
+            assert result == dict(contract=allocation.PRIVATE_ALLOCATION_CONTRACT, workspace=binding)
             assert await allocation.retain_prepared_cms_workspace(workspace, case.handoff) == result
             assert await workspace.verify_current() == binding["tables"]
             assert await driver.fetchval(
@@ -61,7 +59,7 @@ async def test_private_record_preserves_canonical_storage_and_original_publisher
     assert await _canonical_state(case, case.admin) == before
 
 
-@pytest.mark.parametrize("invalid", ["unindexed", "handoff", "assumed_owner"])
+@pytest.mark.parametrize("invalid", ["unindexed", "handoff"])
 async def test_private_record_rejects_invalid_inputs_without_canonical_writes(unallocated_candidate_case, invalid):
     case = unallocated_candidate_case
     before = await _canonical_state(case, case.admin)
@@ -74,10 +72,8 @@ async def test_private_record_rejects_invalid_inputs_without_canonical_writes(un
                 document = deepcopy(handoff.document)
                 document["identity"]["dataset_id"] = "another-dataset"
                 handoff = FHIRSourceCandidateHandoff(storage._encoded(document))
-            else:
-                await driver.execute("SET LOCAL ROLE " + storage_identifier(case.policy.owner_role))
             try:
-                with pytest.raises(ValueError, match="handoff_changed|original_publisher_changed"):
+                with pytest.raises(ValueError, match="handoff_changed|indexed_required"):
                     await allocation.retain_prepared_cms_workspace(workspace, handoff)
             finally:
                 workspace._indexed = True

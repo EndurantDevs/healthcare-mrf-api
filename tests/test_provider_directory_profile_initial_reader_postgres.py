@@ -13,6 +13,7 @@ from sqlalchemy.exc import DBAPIError
 from process import provider_directory_profile_initial as initial
 from process import provider_directory_profile_initial_contract as contract
 from process import provider_directory_profile_selection as selection
+from process.provider_directory_artifact_bundle_preparation import ArtifactBundlePublication
 from tests import test_provider_directory_profile_initial_migration as fixture
 from tests.provider_directory_profile_capacity_signing_guard_test_support import synthetic_profile_execution
 from tests.test_provider_directory_profile_initial_cutover_postgres import _cutover_fixture, _seed_legacy_snapshot, fhir
@@ -20,23 +21,26 @@ from tests.test_provider_directory_profile_initial_migration import _SCHEMA, _da
 
 
 async def _reader_fixture(engine, monkeypatch):
-    publication_values = fixture._publication_values
+    from tests import test_provider_directory_profile_initial as initial_fixture
 
-    async def page_funded_values(engine):
-        values = await publication_values(engine)
-        for cap in values[3]["capacity_geometry"]["relation_byte_caps"]:
-            if cap["relation_name"] in {"evidence_stage", "profile_stage"}:
-                cap["max_scratch_bytes"] = 1024**2
-        return values
+    original_geometry = initial_fixture._geometry
 
-    monkeypatch.setattr(fixture, "_publication_values", page_funded_values)
+    def page_funded_geometry():
+        geometry = original_geometry()
+        return replace(
+            geometry,
+            relation_byte_caps=tuple(
+                replace(cap, max_scratch_bytes=1024**2)
+                if cap.relation_name in {"evidence_stage", "profile_stage"}
+                else cap
+                for cap in geometry.relation_byte_caps
+            ),
+        )
+
+    monkeypatch.setattr(initial_fixture, "_geometry", page_funded_geometry)
     database, cutover, stages = await _cutover_fixture(engine, monkeypatch)
     build = cutover["build"]
     async with database.transaction():
-        await database.status(
-            f'ALTER TABLE "{_SCHEMA}".import_run ADD COLUMN importer text, '
-            "ADD COLUMN finished_at timestamptz, ADD COLUMN metrics jsonb"
-        )
         await _seed_legacy_snapshot(database, _SCHEMA, "legacy", selection, synthetic_profile_execution)
         await database.status(
             f'''INSERT INTO "{_SCHEMA}".initial_profile_stage
@@ -69,8 +73,21 @@ async def _assert_writer_fenced(engine, table):
         assert refused.value.orig.sqlstate == "55P03"
 
 
-async def _observe_census(engine, census_started, release):
-    await asyncio.wait_for(census_started.wait(), 5)
+async def _await_census_started(census_started, owner):
+    waiting = asyncio.create_task(census_started.wait())
+    try:
+        done, _ = await asyncio.wait((waiting, owner), timeout=5, return_when=asyncio.FIRST_COMPLETED)
+        if owner in done:
+            await owner
+        if waiting not in done:
+            raise TimeoutError("initial census did not start within five seconds")
+    finally:
+        waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
+
+
+async def _observe_census(engine, census_started, release, owner):
+    await _await_census_started(census_started, owner)
     async with engine.connect() as reader:
         await reader.execute(text("SET LOCAL statement_timeout='250ms'"))
         assert (
@@ -113,7 +130,13 @@ async def _publish_census(database, admission, stages, composite, observations_b
 
         schema, relations, _lock, _statement = fhir._provider_directory_artifact_bundle_context(stages, None)
         await fhir._apply_locked_provider_directory_artifact_bundle(
-            stages, schema, relations, None, fence, timeout, before_swaps if composite else None
+            stages,
+            schema,
+            relations,
+            None,
+            fence,
+            timeout,
+            ArtifactBundlePublication(before_swaps=before_swaps) if composite else None,
         )
         assert timeout.when() - asyncio.get_running_loop().time() <= (12 if composite else 2)
         await database.status("SET CONSTRAINTS ALL IMMEDIATE")
@@ -179,7 +202,7 @@ def test_native_initial_census_preserves_readers_and_fences_writers(monkeypatch,
             execution_token = fhir._PROVIDER_DIRECTORY_PROFILE_SELECTION_EXECUTION.set(execution)
             owner = asyncio.create_task(_publish_census(database, admission, stages, composite, observations_by_field))
             try:
-                await _observe_census(engine, census_started, release)
+                await _observe_census(engine, census_started, release, owner)
                 await asyncio.wait_for(owner, 5)
                 await _assert_census_commit(database, admission, build, composite, observations_by_field)
             finally:

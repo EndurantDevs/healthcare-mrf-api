@@ -17,7 +17,7 @@ from db.models.company_registry import CompanyRegistry
 ROOT = Path(__file__).parents[1]
 REVISION = "20261012010000_company_registry_name_origin"
 PREDECESSOR = "20261011010000_company_registry_group_assertions"
-CURRENT_HEAD = "20261114020000_custom_import_snapshot_metadata"
+CURRENT_HEAD = "20261116090000_profile_capacity_logical_names"
 _ORIGIN_UPGRADE_REVISIONS = [
     REVISION,
     "20261013010000_registry_custom_history_events",
@@ -74,6 +74,15 @@ _ORIGIN_UPGRADE_REVISIONS = [
     "20261113010000_address_canonical_space_normalization",
     "20261115010000_ms_drg_companion_tables",
     "20261114010000_custom_import_snapshot_names",
+    "20261114020000_custom_import_snapshot_metadata",
+    "20261114130000_named_preparation_catalog",
+    "20261114160000_npi_named_generation",
+    "20261114170000_source_profile_named_attachment",
+    "20261114180000_reference_family_named_generation",
+    "20261114190000_cms_native_input_named_revision",
+    "20261115100000_prescription_rollup_named_fingerprint",
+    "20261115110000_network_retained_read_grant_ledger",
+    "20261115120000_named_output_recovery_document",
     CURRENT_HEAD,
 ]
 
@@ -198,13 +207,8 @@ def _assert_custom_import_manual_acceptance_lineage(script):
 def _assert_snapshot_migration_head(script):
     """Keep the current head and staged snapshot predecessors explicit."""
     assert script.get_heads() == [CURRENT_HEAD]
-    assert script.get_revision(CURRENT_HEAD).down_revision == "20261114010000_custom_import_snapshot_names"
-    assert script.get_revision("20261114010000_custom_import_snapshot_names").down_revision == (
-        "20261115010000_ms_drg_companion_tables"
-    )
-    assert script.get_revision("20261115010000_ms_drg_companion_tables").down_revision == (
-        "20261113010000_address_canonical_space_normalization"
-    )
+    for parent, child in zip(_ORIGIN_UPGRADE_REVISIONS[-11:-1], _ORIGIN_UPGRADE_REVISIONS[-10:]):
+        assert script.get_revision(child).down_revision == parent
     assert script.get_revision("20261113010000_address_canonical_space_normalization").down_revision == (
         "20261111010000_code_sets_publication_idempotency"
     )

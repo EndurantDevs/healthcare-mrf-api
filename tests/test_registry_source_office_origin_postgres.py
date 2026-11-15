@@ -1,14 +1,13 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Native source-office origin survives rotation under the original independent seal."""
 
-from types import SimpleNamespace
+from dataclasses import replace
 from uuid import UUID
 
 import pytest
 
-from process import entity_address_snapshot_adoption as adoption
 from process.registry_source_office_origin import resolve_source_office_origin
-from tests.test_network_address_artifact_postgres import _NativeDB
+from tests.test_network_address_artifact_postgres import _native_swap
 from tests.test_network_compact_publication_postgres import (
     _candidate,
     _prepare,
@@ -58,22 +57,7 @@ async def _rotate(fixture, monkeypatch, *, old_key="old-office", new_key="new-of
     await address.admin.execute(
         f"UPDATE {schema}.entity_address_unified_next SET location_key=$2 WHERE location_key=$1", old_key, new_key
     )
-    monkeypatch.setattr(adoption.entity_address_unified, "db", _NativeDB(address.publisher))
-    async with address.publisher.transaction():
-        await adoption._swap_sealed_stage_table(
-            address.schema,
-            SimpleNamespace(__main_table__="entity_address_unified"),
-            SimpleNamespace(__tablename__="entity_address_unified_next", __my_additional_indexes__=[]),
-            address.descriptor["protected_owner_oid"],
-        )
-        oid = await address.publisher.fetchval(
-            "SELECT to_regclass($1)::oid::bigint", schema + ".entity_address_unified"
-        )
-        await address.publisher.execute(
-            f"UPDATE {schema}.entity_address_result_generation SET local_generation=2,origin_generation=2,relation_oids[1]=$1",
-            oid,
-        )
-        await address.publisher.execute(f"UPDATE {schema}.address_alias_state_v1 SET generation=generation+1")
+    await _native_swap(address, monkeypatch)
 
 
 async def test_retained_office_origin_is_sealed_logical_scope_after_rotation(compact_publication_db, monkeypatch):
@@ -84,14 +68,14 @@ async def test_retained_office_origin_is_sealed_logical_scope_after_rotation(com
     await _publish(fixture, copy_target)
     manifest, _ = await _read(fixture)
     first, expected = await _origin(fixture, manifest)
-    assert first.address_identity[3] == manifest.manifest_sha256
+    assert first.address_scope[3] == manifest.manifest_sha256
     assert expected == [
         dict(location_key="old-office", canonical_network_ids=[42]),
         dict(location_key="other-office", canonical_network_ids=[88]),
     ]
     await _rotate(fixture, monkeypatch)
     second, actual = await _origin(fixture, manifest)
-    assert actual == expected and second.address_identity == first.address_identity
+    assert actual == expected and second.address_scope == first.address_scope
     assert "entity_address_unified_retained_" in second.relation_sql
     with pytest.raises(ValueError):
         async with fixture.execution_connection.transaction(isolation="repeatable_read", readonly=True):
@@ -101,8 +85,16 @@ async def test_retained_office_origin_is_sealed_logical_scope_after_rotation(com
                 runtime_roles=fixture.runtime_roles,
                 control_schema=fixture.control_schema,
             )
+    # Runtime roles grant no origin authority; a different logical address edition does not match the pin.
     with pytest.raises(ValueError, match="origin_differs"):
-        await _origin(fixture, manifest, roles=fixture.runtime_roles)
+        async with fixture.execution_connection.transaction(isolation="repeatable_read", readonly=True):
+            await resolve_source_office_origin(
+                fixture.execution_connection,
+                replace(fixture.source, generation_id="0" * 64),
+                runtime_roles=fixture.runtime_roles,
+                control_schema=fixture.control_schema,
+                origin_manifest_sha256=manifest.manifest_sha256,
+            )
     await fixture.connection.execute(
         f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false WHERE candidate_id=$1',
         UUID(copy_target.candidate_id),
@@ -111,8 +103,9 @@ async def test_retained_office_origin_is_sealed_logical_scope_after_rotation(com
     transaction = fixture.connection.transaction(isolation="repeatable_read")
     await transaction.start()
     try:
+        # Retained reuse follows the published logical state, not a custody row.
         await fixture.connection.execute(
-            f'DELETE FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
+            f"UPDATE \"{fixture.control_schema}\".network_membership_candidate SET state='ready' WHERE candidate_id=$1",
             UUID(copy_target.candidate_id),
         )
         with pytest.raises(ValueError):

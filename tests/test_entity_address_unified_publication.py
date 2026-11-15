@@ -26,7 +26,17 @@ class _GenerationAuthority:
 
 @pytest.fixture(autouse=True)
 def _stub_generation_publication(monkeypatch):
+    from process import entity_address_snapshot_adoption as adoption
     from process import provider_directory_artifact_read_access as read_access
+
+    ordinary_rotation = adoption._prepare_protected_ordinary_rotation
+    monkeypatch.setattr(adoption, "_prepare_protected_ordinary_rotation", AsyncMock(return_value=None))
+
+    async def rotate(schema, live, stage, *, serving_generation):
+        assert serving_generation is None
+        await entity_address_unified._swap_stage_table(schema, live, stage)
+
+    monkeypatch.setattr(adoption, "_swap_sealed_stage_table", rotate)
 
     # These SQL recorders have no native actor; separate tests verify ACL custody.
     monkeypatch.setattr(
@@ -46,6 +56,7 @@ def _stub_generation_publication(monkeypatch):
         "publish_local_entity_address_generation",
         AsyncMock(side_effect=publish),
     )
+    return ordinary_rotation
 
 
 class _LiveTable:
@@ -56,6 +67,11 @@ class _LiveTable:
 class _StageTable:
     __tablename__ = "entity_address_unified_stage"
     __my_additional_indexes__ = []
+
+
+def _candidate_context():
+    """Describe the already materialized main stage used by these SQL fixtures."""
+    return {"geo_assurance_candidate_relation": {"schema_name": "mrf", "relation_name": _StageTable.__tablename__}}
 
 
 class _SupportLiveTable:
@@ -92,6 +108,8 @@ class _RecordingDB:
 
     async def scalar(self, statement, **_params):
         self.events.append(statement)
+        if statement == "SELECT pg_catalog.to_regnamespace('hp_snapshot_retention') IS NULL":
+            return True
         if "SELECT c.relowner FROM pg_class" in statement and "hp_snapshot_retention" in statement:
             return None
         if "SELECT EXISTS(SELECT 1 FROM pg_class" in statement and "hp_snapshot_retention" in statement:
@@ -104,8 +122,13 @@ class _RecordingDB:
             return 1
         if "pg_try_advisory_xact_lock" in statement:
             return self.advisory_values.pop(0)
+        if statement.startswith("SELECT candidate_dependency_bindings FROM"):
+            return {
+                f"{namespace or 'mrf'}.{name}": {"schema_name": namespace or "mrf", "table_name": name}
+                for namespace, name in entity_address_unified.geo_projection._PROJECTION_DEPENDENCIES
+            }
         if "entity_address_geo_assurance_state" in statement:
-            return 123
+            return entity_address_unified.geo_projection.GEO_ASSURANCE_VERSION
         raise AssertionError(f"unexpected scalar SQL: {statement}")
 
     async def all(self, statement, **params):
@@ -141,13 +164,18 @@ class _RecordingDB:
             self.transaction_events.append("COMMIT")
 
 
+def _event_position(events, fragment):
+    return next(index for index, statement in enumerate(events) if fragment in statement)
+
+
 @pytest.mark.asyncio
 async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch):
+    """Keep semantic checks, callbacks and the complete swap inside one bounded transaction."""
     recording_db = _RecordingDB()
     monkeypatch.setattr(entity_address_unified, "db", recording_db)
     monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_LOCK_TIMEOUT", raising=False)
 
-    cutover_context_map = {}
+    cutover_context_map = _candidate_context()
     await entity_address_unified._publish_staged_entity_address_tables(
         "mrf",
         _StageTable,
@@ -170,7 +198,14 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
     ]
     assert cutover_context_map["cutover_attempts"] == 1
     assert cutover_context_map["stage_persistence"] == "p"
-    assert cutover_context_map["geo_assurance_active_table_oid"] == 123
+    assert (
+        cutover_context_map["geo_assurance_active_version"]
+        == entity_address_unified.geo_projection.GEO_ASSURANCE_VERSION
+    )
+    assert cutover_context_map["geo_assurance_active_relation"] == {
+        "schema_name": "mrf",
+        "relation_name": "entity_address_unified",
+    }
     assert cutover_context_map["result_generation_mode"] == "ordinary"
     assert cutover_context_map["result_generation"]["local_generation"] == 1
     entity_address_unified.result_generation.publish_local_entity_address_generation.assert_awaited_once_with(
@@ -180,16 +215,10 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
     stage_rename_at = recording_db.events.index(
         "ALTER TABLE mrf.entity_address_unified_stage RENAME TO entity_address_unified;"
     )
-    activation_at = next(
-        index
-        for index, statement in enumerate(recording_db.events)
-        if "entity_address_geo_assurance_state" in statement
-    )
+    activation_at = _event_position(recording_db.events, "entity_address_geo_assurance_state")
     generation_at = recording_db.events.index("result generation published")
     assert stage_rename_at < activation_at < generation_at
-    dependency_check_at = next(
-        index for index, statement in enumerate(recording_db.events) if "pg_depend AS dependency" in statement
-    )
+    dependency_check_at = _event_position(recording_db.events, "pg_depend AS dependency")
     lock_at = recording_db.events.index(
         "LOCK TABLE mrf.entity_address_unified, mrf.entity_address_unified_stage IN ACCESS EXCLUSIVE MODE NOWAIT;"
     )
@@ -198,7 +227,9 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_partial_evidence_patch_is_bound_to_main_generation_swap(monkeypatch):
+async def test_partial_evidence_patch_refuses_before_any_swap_or_patch(monkeypatch, _stub_generation_publication):
+    from process import entity_address_snapshot_adoption as adoption
+
     recording_db = _RecordingDB(
         existing_names={
             "entity_address_unified",
@@ -209,6 +240,18 @@ async def test_partial_evidence_patch_is_bound_to_main_generation_swap(monkeypat
         }
     )
     monkeypatch.setattr(entity_address_unified, "db", recording_db)
+
+    async def require_ordinary(*args):
+        with monkeypatch.context() as binding:
+            binding.setattr(
+                recording_db, "_transaction_binding", lambda: SimpleNamespace(session=object()), raising=False
+            )
+            return await _stub_generation_publication(*args)
+
+    monkeypatch.setattr(adoption, "_prepare_protected_ordinary_rotation", require_ordinary)
+    monkeypatch.setattr(adoption, "_retained_serving_generation", AsyncMock(return_value={"logical": "generation"}))
+    rotate = AsyncMock()
+    monkeypatch.setattr(adoption, "_swap_sealed_stage_table", rotate)
     monkeypatch.setattr(
         entity_address_unified,
         "_partial_support_patch_sql",
@@ -218,27 +261,21 @@ async def test_partial_evidence_patch_is_bound_to_main_generation_swap(monkeypat
         ],
     )
 
-    await entity_address_unified._publish_staged_entity_address_tables(
-        "mrf",
-        _StageTable,
-        {_SupportLiveTable: _SupportStageTable},
-        partial_support_patch=True,
-        affected_group_table="affected_groups",
-        context={},
+    with pytest.raises(RuntimeError, match="full isolated replacement"):
+        await entity_address_unified._publish_staged_entity_address_tables(
+            "mrf",
+            _StageTable,
+            {_SupportLiveTable: _SupportStageTable},
+            partial_support_patch=True,
+            affected_group_table="affected_groups",
+            context=_candidate_context(),
+        )
+    rotate.assert_not_awaited()
+    assert recording_db.transaction_events == ["BEGIN", "ROLLBACK"]
+    assert not any(
+        "RENAME TO" in statement or statement.startswith(("DROP ", "INSERT ", "DELETE "))
+        for statement in recording_db.events
     )
-
-    main_swap_at = recording_db.events.index(
-        "ALTER TABLE mrf.entity_address_unified_stage RENAME TO entity_address_unified;"
-    )
-    delete_at = recording_db.events.index("DELETE FROM mrf.entity_address_evidence;")
-    insert_at = recording_db.events.index("INSERT INTO mrf.entity_address_evidence SELECT 1;")
-    activation_at = next(
-        index
-        for index, statement in enumerate(recording_db.events)
-        if "entity_address_geo_assurance_state" in statement
-    )
-    assert recording_db.transaction_events == ["BEGIN", "COMMIT"]
-    assert main_swap_at < delete_at < insert_at < activation_at
 
 
 @pytest.mark.asyncio
@@ -252,7 +289,7 @@ async def test_entity_address_cutover_converts_unlogged_stage_before_transaction
         {},
         partial_support_patch=False,
         affected_group_table="",
-        context={},
+        context=_candidate_context(),
     )
 
     assert recording_db.statements[0] == "ALTER TABLE mrf.entity_address_unified_stage SET LOGGED;"
@@ -279,7 +316,7 @@ async def test_entity_address_cutover_converts_every_promoted_stage_to_logged(mo
         {_SupportLiveTable: _SupportStageTable},
         partial_support_patch=False,
         affected_group_table="",
-        context={},
+        context=_candidate_context(),
     )
 
     assert recording_db.statements[:3] == [
@@ -310,7 +347,7 @@ async def test_entity_address_cutover_stops_when_stage_analyze_fails(monkeypatch
             {},
             partial_support_patch=False,
             affected_group_table="",
-            context={},
+            context=_candidate_context(),
         )
 
     assert recording_db.statements == ["ANALYZE mrf.entity_address_unified_stage;"]
@@ -325,7 +362,7 @@ async def test_entity_address_cutover_retries_only_within_bound(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_BACKOFF_MS", "0")
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_CUTOVER_RETRY_MAX_BACKOFF_MS", "0")
 
-    cutover_context_map = {}
+    cutover_context_map = _candidate_context()
     await entity_address_unified._publish_staged_entity_address_tables(
         "mrf",
         _StageTable,
@@ -364,7 +401,7 @@ async def test_entity_address_cutover_does_not_retry_non_lock_failure(monkeypatc
             {},
             partial_support_patch=False,
             affected_group_table="",
-            context={},
+            context=_candidate_context(),
         )
 
     assert recording_db.transaction_events == ["BEGIN", "ROLLBACK"]

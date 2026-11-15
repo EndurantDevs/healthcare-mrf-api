@@ -75,7 +75,9 @@ async def test_prepared_provenance_requires_actual_bytes_and_stage_validation(mo
                 proof = read_doctors_source_provenance(prepared.source_provenance_json)
                 assert proof["artifact"] == ctx["context"]["artifact"]
                 assert proof["education"] == ctx["context"]["education"]
-                assert len(prepared.sealed_filenodes) == 3
+                assert tuple(target_relation for target_relation, _stage in prepared.stage_relations) == tuple(
+                    model.__tablename__ for model in preparation._models()
+                )
                 assert prepared.native_receipt is None and not prepared.committed
                 assert proof["rows"] == 1
         assert await stage_oids(fixture, ctx) == ()

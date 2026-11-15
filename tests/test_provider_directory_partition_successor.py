@@ -7,6 +7,7 @@ from copy import deepcopy
 
 import pytest
 
+from process import provider_directory_generic_source_storage as storage
 from process.provider_directory_generic_candidate import GenericCandidateError
 from tests.test_provider_directory_generic_source_transition import _include_completed_empty_collection, _transition
 from tests.test_provider_directory_generic_source_transition import case as case
@@ -78,11 +79,22 @@ async def test_partition_successor_preserves_counting_passes_and_post_census(cas
     assert receipt["rows"] == sum(counts_by_resource.values()) and receipt["already_applied"] is False
     assert case.header == {
         **before[0],
-        "candidate_storage_json": {**before[0]["candidate_storage_json"], "storage": case.new},
+        "candidate_storage_json": {
+            **before[0]["candidate_storage_json"],
+            "contract": storage.NAMED_ISOLATED_CONTRACT,
+            "storage": {key: case.old[key] for key in ("catalog_schema", "storage_schema")},
+            "tables": {
+                kind: {"schema": table.get("schema", case.old["storage_schema"]), "name": table["name"]}
+                for kind, table in before[0]["candidate_storage_json"]["tables"].items()
+            },
+            "admission": None,
+        },
     }
     assert (case.checkpoints, case.input_rows, case.runs) == before[1:]
     assert (await _transition(case, counts_by_resource))["already_applied"] is True
-    assert len(case.writes) == 1
+    assert len(case.writes) == 2
+    assert json.loads(case.writes[1][1][1]) == case.header["candidate_storage_json"]
+    assert json.loads(case.writes[1][1][2]) == case.header["candidate_storage_json"]
 
 
 @pytest.mark.asyncio
@@ -221,7 +233,16 @@ async def test_partition_successor_keeps_completed_collection_and_pending_census
     assert receipt["rows"] == 9
     assert case.header == {
         **before[0],
-        "candidate_storage_json": {**before[0]["candidate_storage_json"], "storage": case.new},
+        "candidate_storage_json": {
+            **before[0]["candidate_storage_json"],
+            "contract": storage.NAMED_ISOLATED_CONTRACT,
+            "storage": {key: case.old[key] for key in ("catalog_schema", "storage_schema")},
+            "tables": {
+                kind: {"schema": table.get("schema", case.old["storage_schema"]), "name": table["name"]}
+                for kind, table in before[0]["candidate_storage_json"]["tables"].items()
+            },
+            "admission": None,
+        },
     }
     assert (case.checkpoints, case.input_rows) == before[1:]
     assert case.checkpoints[0]["state"] == "active"
@@ -271,6 +292,7 @@ def _record_failed_candidate_metadata(case):
         import_run_id=case.header["import_run_id"],
         previous_dataset_id=None,
         reused_from_checkpoint=True,
+        resource_hash_contract=directory.LEGACY_RESOURCE_HASH_CONTRACT,
     )
     identity["metadata"] = directory._endpoint_dataset_candidate_metadata(candidate)
     case.header.update(
@@ -291,11 +313,22 @@ async def test_partition_successor_retains_the_real_failure_metadata_and_replays
     await _transition(case, counts_by_resource)
     assert case.header == {
         **before[0],
-        "candidate_storage_json": {**before[0]["candidate_storage_json"], "storage": case.new},
+        "candidate_storage_json": {
+            **before[0]["candidate_storage_json"],
+            "contract": storage.NAMED_ISOLATED_CONTRACT,
+            "storage": {key: case.old[key] for key in ("catalog_schema", "storage_schema")},
+            "tables": {
+                kind: {"schema": table.get("schema", case.old["storage_schema"]), "name": table["name"]}
+                for kind, table in before[0]["candidate_storage_json"]["tables"].items()
+            },
+            "admission": None,
+        },
     }
     assert (case.checkpoints, case.input_rows, case.runs) == before[1:]
     assert (await _transition(case, counts_by_resource))["already_applied"] is True
-    assert len(case.writes) == 1
+    assert len(case.writes) == 2
+    assert json.loads(case.writes[1][1][1]) == case.header["candidate_storage_json"]
+    assert json.loads(case.writes[1][1][2]) == case.header["candidate_storage_json"]
 
 
 @pytest.mark.asyncio

@@ -249,18 +249,29 @@ def _control(**changes):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "changes",
-    ({"relowner": 99}, {"relkind": "v"}, {"columns": INSERT_COLUMNS}, {"relhastriggers": True}),
+    ({"relkind": "v"}, {"columns": INSERT_COLUMNS}, {"relpersistence": "t"}),
 )
-async def test_protected_control_catalog_refuses_owner_layout_and_hook_drift(changes):
+async def test_control_catalog_refuses_wrong_layout_or_nonpersistent_tables(changes):
     connection = Connection(owner=_control(**changes))
     with pytest.raises(management.RegistryManagementPermissionError):
         await management._aca_controls(connection, "registry_control")
 
 
 @pytest.mark.asyncio
-async def test_control_inventory_keeps_exact_staging_head_owner_for_operator_transfer():
+async def test_control_inventory_returns_only_named_data_columns_for_operator_transfer():
     staged = _control(rolcanlogin=True)
-    assert await management._aca_controls(Connection(owner=staged), "registry_control") == [staged]
+    assert await management._aca_controls(Connection(owner=staged), "registry_control") == [
+        {"relname": staged["relname"], "columns": list(staged["columns"])}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changes", [{"relowner": 99}, {"relhastriggers": True}])
+async def test_control_inventory_does_not_use_retired_physical_metadata(changes):
+    staged = _control(**changes)
+    assert await management._aca_controls(Connection(owner=staged), "registry_control") == [
+        {"relname": staged["relname"], "columns": list(staged["columns"])}
+    ]
 
 
 @pytest.mark.asyncio
@@ -487,9 +498,13 @@ async def test_namespace_move_excludes_native_owner_from_single_publisher_acl_co
 
     async def fetch(statement, *arguments):
         calls.append((statement, arguments))
-        return [{"grantee": 12, "rolname": "publisher", "safe": True}]
+        return [{"rolname": "publisher"}]
 
-    rows = await management._aca_readers(SimpleNamespace(fetch=fetch), "registry_control", [_control()])
-    assert rows == [{"grantee": 12, "rolname": "publisher", "safe": True}]
-    assert "privilege_type='INSERT' AND grantee<>s.owner_oid" in calls[0][0]
-    assert calls[0][1][:3] == (30, 11, "registry_control")
+    rows = await management._existing_readers(
+        SimpleNamespace(fetch=fetch), "registry_control", [TABLE], include_writers=True
+    )
+    assert rows == ["publisher"]
+    assert "a.grantee<>c.relowner" in calls[0][0]
+    # Inbox writers that can create in the old namespace are not carried forward.
+    assert "NOT ($3::boolean AND has_schema_privilege(r.oid,n.oid,'CREATE'))" in calls[0][0]
+    assert calls[0][1] == ("registry_control", [TABLE], True)

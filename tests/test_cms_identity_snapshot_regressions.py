@@ -574,28 +574,6 @@ def test_cms_geometry_refuses_noncanonical_authenticated_plan_shapes(field, valu
     assert raw == original
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("database_system_identifier", "invalid"),
-        ("database_oid", True),
-        ("database_name", ""),
-        ("tablespace_oid", 0),
-        ("tablespace_name", ""),
-    ],
-)
-def test_cms_database_binding_rejects_unusable_database_and_tablespace_identity(field, value):
-    binding = deepcopy(cms_guard()["healthcare_receipt"]["database_binding"])
-    binding[field] = value
-    original = deepcopy(binding)
-    with pytest.raises(
-        preflight.ProviderDirectoryProfileCapacityPreflightError,
-        match="^provider_directory_cms_capacity_database_binding_invalid$",
-    ):
-        cms_contract.validated_cms_database_binding(binding)
-    assert binding == original
-
-
 def test_valid_cms_geometry_and_request_retain_exact_plan_and_independent_pair():
     plan, _fence, _pair = cms_plan()
     guard = cms_guard(plan)
@@ -668,10 +646,15 @@ async def test_doctors_site_pages_finish_one_private_cohort_or_roll_back(identit
 @pytest.mark.parametrize("active,committed", [(True, False), (False, True), (False, False)])
 async def test_doctors_cleanup_respects_publication_transaction_and_committed_ownership(monkeypatch, active, committed):
     prepared = SimpleNamespace(
-        schema="mrf", import_date="20260730", context={}, stage_oids=(("target", "stage", 41),), committed=committed
+        schema="mrf",
+        import_date="20260730",
+        context={},
+        stage_relations=_doctors_family()[1].stage_relations,
+        committed=committed,
     )
     database = SimpleNamespace(_transaction_binding=lambda: object() if active else None)
-    monkeypatch.setattr(preparation, "_native", lambda: SimpleNamespace(db=database))
+    make_class = preparation._native().make_class
+    monkeypatch.setattr(preparation, "_native", lambda: SimpleNamespace(db=database, make_class=make_class))
     drop = AsyncMock()
     monkeypatch.setattr(preparation, "_drop_owned_stages", drop)
     if active:
@@ -683,7 +666,7 @@ async def test_doctors_cleanup_respects_publication_transaction_and_committed_ow
         if committed:
             drop.assert_not_awaited()
         else:
-            drop.assert_awaited_once_with("mrf", prepared.stage_oids)
+            drop.assert_awaited_once_with("mrf", prepared.stage_relations)
 
 
 @pytest.mark.asyncio
@@ -692,14 +675,21 @@ async def test_doctors_cleanup_finishes_owned_drop_before_propagating_cancellati
     release = asyncio.Event()
     finished = asyncio.Event()
     prepared = SimpleNamespace(
-        schema="mrf", import_date="20260730", context={}, stage_oids=(("target", "stage", 41),), committed=False
+        schema="mrf",
+        import_date="20260730",
+        context={},
+        stage_relations=_doctors_family()[1].stage_relations,
+        committed=False,
     )
+    make_class = preparation._native().make_class
     monkeypatch.setattr(
-        preparation, "_native", lambda: SimpleNamespace(db=SimpleNamespace(_transaction_binding=lambda: None))
+        preparation,
+        "_native",
+        lambda: SimpleNamespace(db=SimpleNamespace(_transaction_binding=lambda: None), make_class=make_class),
     )
 
     async def drop(schema, stages):
-        assert (schema, stages) == (prepared.schema, prepared.stage_oids)
+        assert (schema, stages) == (prepared.schema, prepared.stage_relations)
         entered.set()
         await release.wait()
         finished.set()
@@ -776,7 +766,7 @@ async def test_doctors_apply_refuses_stale_authority_or_already_consumed_prepara
         lock.assert_not_awaited()
         read.assert_not_awaited()
     else:
-        lock.assert_awaited_once_with(session, stage_cls, "mrf", "20260730")
+        lock.assert_awaited_once_with(session, stage_cls, "mrf", "20260730", stage_read_only=True)
         read.assert_awaited_once_with(session, importer_id="cms-doctors", schema_name="mrf", lock=True)
 
 
@@ -1165,7 +1155,7 @@ async def test_candidate_catalog_keeps_exact_owner_endpoint_and_refreshed_incumb
 def test_cms_request_rejects_noncanonical_python_sequence_without_bypassing_signed_pair():
     request = cms_request()
     body = request[cms_contract.CMS_ADMISSION_FIELD]["paired_profile_lease"]["lease"]
-    body["tablespaces"] = tuple(body["tablespaces"])
+    body["storage_classes"] = tuple(body["storage_classes"])
     original = deepcopy(request)
     with pytest.raises(
         preflight.ProviderDirectoryProfileCapacityPreflightError,
@@ -1178,18 +1168,20 @@ def test_cms_request_rejects_noncanonical_python_sequence_without_bypassing_sign
 def _doctors_family():
     native = preparation._native()
     stages = tuple(
-        (model.__tablename__, native.make_class(model, "20260730").__tablename__, 41 + index)
-        for index, model in enumerate(preparation._models())
+        (model.__tablename__, native.make_class(model, "20260730").__tablename__) for model in preparation._models()
     )
     incumbent = archive.ReferenceFamilyIncumbent(
-        "cms-doctors", "mrf", tuple((target, 11 + index) for index, (target, _stage, _oid) in enumerate(stages))
+        "cms-doctors", "mrf", tuple((target, 11 + index) for index, (target, _stage) in enumerate(stages))
     )
     serving = generation.ReferenceFamilyServingGeneration("00000000-0000-0000-0000-000000000001", 1, VALIDATION_TIME)
     authority = generation.ReferenceFamilyResultGenerationAuthority(
-        "cms-doctors", serving.origin_lineage_id, 1, serving, tuple(oid for _name, oid in incumbent.relation_oids)
+        "cms-doctors",
+        serving.origin_lineage_id,
+        1,
+        serving,
+        tuple(("mrf", name) for name, _old in incumbent.relation_oids),
     )
     prepared = preparation.PreparedCMSDoctorsGeneration("mrf", "20260730", stages, incumbent, authority, {}, {})
-    prepared.sealed_filenodes = tuple((oid, 1000 + oid) for _target, _stage, oid in stages)
     return native, prepared
 
 
@@ -1198,31 +1190,24 @@ def _doctors_family():
 async def test_doctors_apply_rejects_catalog_or_result_drift_without_consuming_preparation(monkeypatch, failure):
     monkeypatch.setattr(preparation, "source_owner_transaction", _unit_source_transaction)
     original_native, prepared = _doctors_family()
-    relation_oids_by_name = {f"mrf.{stage}": oid for _target, stage, oid in prepared.stage_oids}
-
-    async def execute(statement, params):
-        assert "SELECT oid::bigint,relpersistence" in str(statement)
-        oid = relation_oids_by_name[params["relation"]]
-        return SimpleNamespace(one_or_none=lambda: (oid, "p", 1000 + oid))
 
     async def scalar(statement, params):
         sql = str(statement)
         if "SELECT count(*) FROM pg_index" in sql:
             return max(0, len(params["names"]) - (failure == "indexes"))
-        if "SELECT p.oid::bigint FROM pg_proc" in sql:
-            return 71
-        assert "SELECT EXISTS(SELECT 1 FROM pg_trigger" in sql
+        assert "relkind='r'" in sql and params["logged"] is True
         return True
 
-    session = SimpleNamespace(execute=AsyncMock(side_effect=execute), scalar=AsyncMock(side_effect=scalar))
+    session = SimpleNamespace(execute=AsyncMock(), scalar=AsyncMock(side_effect=scalar))
     storage = AsyncMock()
     monkeypatch.setattr(cms_doctors_immutable, "require_doctors_storage", storage)
-    expected_oids = tuple(oid for _target, _stage, oid in prepared.stage_oids)
     returned = replace(
         prepared.incumbent_authority,
         local_generation=2,
         serving_generation=replace(prepared.incumbent_authority.serving_generation, origin_generation=2),
-        relation_oids=(*expected_oids[:-1], expected_oids[-1] + 1),
+        relations=tuple(
+            (prepared.schema, target_relation + "_other") for target_relation, _stage in prepared.stage_relations
+        ),
     )
     apply = AsyncMock(return_value=returned)
     native = SimpleNamespace(
@@ -1246,8 +1231,8 @@ async def test_doctors_apply_rejects_catalog_or_result_drift_without_consuming_p
     assert not prepared.committed and prepared.context == {} and prepared.metrics == {}
     if failure == "result":
         apply.assert_awaited_once()
-        expected_pairs = tuple((stage, oid) for _target, stage, oid in prepared.stage_oids)
-        storage.assert_awaited_once_with(session, schema_name=prepared.schema, relation_pairs=expected_pairs)
+        expected_names = tuple(stage for _target, stage in prepared.stage_relations)
+        storage.assert_awaited_once_with(session, schema_name=prepared.schema, relation_names=expected_names)
         assert prepared.native_receipt is None
     else:
         apply.assert_not_awaited()
@@ -1283,11 +1268,11 @@ async def test_doctors_preparation_fences_authority_and_defers_active_cleanup(mo
     )
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
     monkeypatch.setattr(preparation, "_native", lambda: native)
-    monkeypatch.setattr(preparation, "_stage_inventory", AsyncMock(return_value=expected.stage_oids))
+    monkeypatch.setattr(preparation, "_stage_inventory", AsyncMock(return_value=expected.stage_relations))
     monkeypatch.setattr(archive, "capture_reference_family_incumbent", AsyncMock(return_value=expected.incumbent))
     observed = expected.incumbent_authority
     if failure == "capture-authority":
-        observed = replace(observed, relation_oids=(21, 22, 23))
+        observed = replace(observed, relations=tuple(("other", name) for _schema, name in observed.relations))
     monkeypatch.setattr(
         generation, "read_reference_family_result_generation_authority", AsyncMock(return_value=observed)
     )
@@ -1304,7 +1289,7 @@ async def test_doctors_preparation_fences_authority_and_defers_active_cleanup(mo
             async with preparation.prepare_cms_doctors_generation(context_by_name):
                 pytest.fail("changed native authority must not yield prepared tables")
         prepare_sources.assert_not_awaited()
-        drop.assert_awaited_once_with("mrf", expected.stage_oids)
+        drop.assert_awaited_once_with("mrf", expected.stage_relations)
         assert context_by_name["context"] == {"run": True}
     else:
         try:
@@ -1317,4 +1302,4 @@ async def test_doctors_preparation_fences_authority_and_defers_active_cleanup(mo
         drop.assert_not_awaited()
         assert not prepared.committed
         await preparation.cleanup_prepared_cms_doctors(prepared)
-        drop.assert_awaited_once_with("mrf", expected.stage_oids)
+        drop.assert_awaited_once_with("mrf", expected.stage_relations)

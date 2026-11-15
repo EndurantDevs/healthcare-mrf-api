@@ -1,18 +1,14 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Keep admitted address candidates on their original SOURCE owner until sealed."""
+"""Keep admitted named Address candidates through native freeze and publication."""
 
-import asyncio
 import importlib
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
-from weakref import WeakSet, ref
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_generic_source_policy as source
 from process.provider_directory_generic_source_storage import _close_grants
-
-_ISSUED = WeakSet()
 
 
 def _require(condition):
@@ -25,23 +21,20 @@ class _SourcePreparation:
     factory: object
     admission: object
     input_hash: str
-    task: object
     phase: str = "building"
-    prepared: object = None
     capture: object = None
     reader: str = ""
-    sequences: dict = field(default_factory=dict)
     original_relations: set = field(default_factory=set)
     validation: object = None
     inputs: object = None
+    relations: tuple = ()
 
 
 def issue_source_preparation(admission, input_hash):
-    """A configured factory and the active signed admission, never a mapping, issue this scope."""
+    """Use the configured factory with the active capacity admission and logical input hash."""
     if not source.is_source_storage_required():
         return None
-    issued = _SourcePreparation(_active_factory(admission, input_hash), admission, input_hash, asyncio.current_task())
-    _ISSUED.add(issued)
+    issued = _SourcePreparation(_active_factory(admission, input_hash), admission, input_hash)
     return issued
 
 
@@ -72,15 +65,14 @@ async def source_dependency_transaction(database, admission, input_hash):
     """Bind the original SOURCE session only for existing database-based dependency verifiers."""
     factory = _active_factory(admission, input_hash)
     async with source.source_transaction(database, isolation="repeatable read"):
-        _require(source.bound_publisher().policy is factory.policy)
         yield
 
 
 def _original(issued, *, phases):
     from process.provider_directory_cms_preparation import _ACTIVE
 
-    _require(type(issued) is _SourcePreparation and issued in _ISSUED and issued.phase in phases)
-    _require(source._FACTORY.get() is issued.factory and _ACTIVE.get() is issued.admission)
+    _require(type(issued) is _SourcePreparation and issued.phase in phases)
+    _require(_ACTIVE.get() is issued.admission)
     _require(issued.input_hash == issued.admission.plan.native_address_input_hash)
     return issued
 
@@ -114,121 +106,93 @@ async def preparation_transaction(database, scope, *, phases=("building",)):
     _require(scope.admission is issued.admission and scope.native_input_hash == issued.input_hash)
     _require(scope.db_schema in (None, issued.factory.policy.schema))
     async with source.source_transaction(database):
-        publisher = source.bound_publisher()
-        _require(publisher.policy is issued.factory.policy)
         yield source.source_copy_session()
 
 
-async def _close_sequences(connection, policy, oid):
-    """Close only native sequences owned by this exact created table."""
-    sequences = await connection.fetch(
-        "SELECT c.oid::bigint,n.nspname,c.relname,c.relowner::bigint FROM pg_class c "
-        "JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_depend d "
-        "ON d.classid='pg_class'::regclass AND d.objid=c.oid AND d.refclassid='pg_class'::regclass "
-        "AND d.refobjid=$1::oid AND d.deptype IN ('a','i') WHERE c.relkind='S' ORDER BY c.oid",
-        oid,
-    )
-    owner = await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", policy.owner_role)
+async def _close_sequences(connection, policy, name):
+    """Close native sequence grants by the table's named dependency selection."""
+    from process.provider_directory_generic_source_provision import _snapshot_freeze_sequences
+
+    sequences = await _snapshot_freeze_sequences(connection, policy.schema, (name,))
     for sequence in sequences:
-        _require(sequence["nspname"] == policy.schema and sequence["relowner"] == owner)
-        grantees = await connection.fetch(
-            "SELECT DISTINCT a.grantee,r.rolname FROM pg_class c CROSS JOIN LATERAL "
-            "aclexplode(coalesce(c.relacl,acldefault('s',c.relowner))) a "
-            "LEFT JOIN pg_roles r ON r.oid=a.grantee WHERE c.oid=$1::oid AND a.grantee<>c.relowner",
-            sequence["oid"],
-        )
-        for grantee in grantees:
-            principal = "PUBLIC" if grantee["grantee"] == 0 else storage_identifier(grantee["rolname"])
-            await connection.execute(
-                f"REVOKE ALL ON SEQUENCE {storage_relation(policy.schema, sequence['relname'])} FROM {principal} CASCADE"
-            )
-    return tuple((sequence["relname"], sequence["oid"]) for sequence in sequences)
+        await _close_grants(connection, policy, sequence["relname"], sequence=True)
+    return tuple((policy.schema, sequence["relname"]) for sequence in sequences)
 
 
-async def register_source_relation(scope, name, oid):
-    """Close default grants in the first DDL transaction before any other writer can use them."""
+async def register_source_relation(scope, name):
+    """Close default grants before first COPY through the configured native transaction."""
     issued = require_building(scope)
     if issued is None:
         return
     publisher = source.bound_publisher()
     policy, connection = publisher.policy, publisher.connection
-    _require(policy is issued.factory.policy and scope.db_schema == policy.schema)
-    actual = await connection.fetchrow(
-        "SELECT c.oid::bigint,c.relowner::bigint,r.oid::bigint AS owner FROM pg_class c "
-        "JOIN pg_roles r ON r.rolname=$2 WHERE c.oid=to_regclass($1) AND c.relkind='r'",
-        storage_relation(policy.schema, name),
-        policy.owner_role,
+    _require(scope.db_schema == policy.schema)
+    _require(
+        await connection.fetchval(
+            "SELECT EXISTS(SELECT FROM pg_class WHERE oid=to_regclass($1) AND relkind='r')",
+            storage_relation(policy.schema, name),
+        )
     )
-    _require(actual is not None and actual["oid"] == oid and actual["relowner"] == actual["owner"])
     await _close_grants(connection, policy, name)
-    issued.sequences[name] = await _close_sequences(connection, policy, oid)
-    issued.original_relations.add((name, oid))
+    await _close_sequences(connection, policy, name)
+    issued.original_relations.add(name)
 
 
-def require_owned_relation(scope, name, oid):
-    """A mutable scope name cannot authorize an unrelated SOURCE table."""
+def require_owned_relation(scope, name):
+    """Limit candidate work to the declared preparation names, with native access enforced by PostgreSQL."""
     issued = require_building(scope)
     if issued is not None:
-        _require(scope.db_schema == issued.factory.policy.schema and (name, oid) in issued.original_relations)
+        _require(scope.db_schema == issued.factory.policy.schema and name in issued.original_relations)
 
 
-def record_source_rename(scope, old_name, new_name, oid):
-    """Retain both exact names through an acknowledged native rename or rollback."""
+def record_source_rename(scope, old_name, new_name):
+    """Retain explicit possible names through native rename acknowledgement or rollback."""
     issued = require_building(scope)
     if issued is not None:
-        _require((old_name, oid) in issued.original_relations)
-        issued.original_relations.add((new_name, oid))
-        issued.sequences[new_name] = issued.sequences[old_name]
+        _require(old_name in issued.original_relations)
+        issued.original_relations.add(new_name)
 
 
 async def _freeze_native(database, prepared, scope, issued):
     from process import network_registry_cms_prepared_address as address
-    from process.mrf_address_publication import require_native_read_catalog
     from process.network_cms_registry_address_equivalence import capture_registry_cms_address_copy_source
-    from process.network_registry_cms_prepared_address_pin import _custody
     from process.provider_directory_cms_native_layout import capture_retained_native_source
+    from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
 
     publisher = source.bound_publisher()
     policy, connection = publisher.policy, publisher.connection
     stages = address.prepared_address_stages(prepared)
-    _require(stages == tuple(sorted(scope.stage_oids)))
-    _require(tuple(logical for logical, _, _ in stages) == scope.admission.plan.native_address_targets)
-    _require(scope.owned_oids == {name: oid for _, name, oid in stages})
-    _require(all((name, oid) in issued.original_relations for _, name, oid in stages))
+    _require(stages == tuple(sorted(scope.stage_relations)))
+    _require(tuple(logical for logical, _ in stages) == scope.admission.plan.native_address_targets)
+    names = {name for _, name in stages}
+    _require(scope.owned_relations == names and names <= issued.original_relations)
     await connection.execute(
         "LOCK TABLE "
-        + ",".join(storage_relation(policy.schema, name) for _, name, _ in stages)
-        + " IN ACCESS EXCLUSIVE MODE NOWAIT"
+        + ",".join(storage_relation(policy.schema, name) for _, name in stages)
+        + " IN ACCESS SHARE MODE NOWAIT"
     )
     directory = importlib.import_module("process.provider_directory_fhir")
-    _require(directory.db is database)
-    measured_by_identity = {
-        (entry.relation, entry.oid): entry for entry in await scope.admission.measure(directory, policy.schema)
-    }
-    for _, name, oid in stages:
-        _require((name, oid) in measured_by_identity)
+    measured_by_name = {entry.relation: entry for entry in await scope.admission.measure(directory, policy.schema)}
+    for _, name in stages:
+        _require(name in measured_by_name)
         await capture_retained_native_source(
-            directory, measured_by_identity[(name, oid)], scope.admission.plan.native_address_targets
+            directory, measured_by_name[name], scope.admission.plan.native_address_targets
         )
     reader_database = await database._connect_reader()
     reader = reader_database._reader_login[0]
-    _require(reader in policy.runtime_roles and reader not in policy.control_runtime_roles)
-    for _, name, oid in stages:
-        _require(await _close_sequences(connection, policy, oid) == issued.sequences[name])
-        await _close_grants(connection, policy, name)
-        await connection.execute(
-            f"GRANT SELECT ON TABLE {storage_relation(policy.schema, name)} TO {storage_identifier(reader)}"
-        )
-    await _custody(connection, policy, stages, reader)
-    session = source.source_copy_session()
-    await require_native_read_catalog(
-        session, tuple(oid for _, _, oid in stages), executable_roles=(policy.owner_role, policy.publisher_role)
+    await freeze_fhir_source_snapshot(
+        connection,
+        policy.schema,
+        namespace_owner=policy.owner_role,
+        reader_roles=tuple(dict.fromkeys((policy.owner_role, policy.publisher_role, *policy.runtime_roles, reader))),
+        relation_names=tuple(sorted(names)),
+        freeze_schema=False,
     )
     capture = await capture_registry_cms_address_copy_source(
-        session,
+        source.source_copy_session(),
         source_schema=policy.schema,
-        expected_relation_oids=tuple((logical, oid) for logical, _, oid in stages),
-        stage_table_names={logical: name for logical, name, _ in stages},
+        expected_relation_names=tuple(logical for logical, _ in stages),
+        stage_table_names=dict(stages),
     )
     return reader, capture
 
@@ -238,7 +202,7 @@ async def freeze_source_generation(database, prepared, scope):
     issued = require_building(scope)
     if issued is None:
         return
-    _require(issued.task is asyncio.current_task() and not scope.worker_tasks)
+    _require(not scope.worker_tasks)
     _require(database._transaction_binding() is None and bool(prepared.publish_validation))
     _require(
         not prepared.context.get("publish_validation_deferred") and not prepared.publish_validation.get("deferred")
@@ -253,34 +217,41 @@ async def freeze_source_generation(database, prepared, scope):
     except BaseException:
         issued.phase = "failed"
         raise
-    issued.reader, issued.capture, issued.prepared = reader, capture, ref(prepared)
+    issued.reader, issued.capture, issued.relations = reader, capture, tuple(prepared.stage_relations)
     issued.validation, issued.inputs = deepcopy(prepared.publish_validation), prepared.preparation_input
     issued.phase = "prepared"
     prepared.source_preparation = issued
 
 
 def require_source_generation(prepared, admission, *, policy=None):
-    """A forged PreparedGeneration cannot substitute for the committed issued handoff."""
+    """Recheck the complete named result and its original logical input and validation."""
     issued = _issued(prepared.source_preparation, phases={"prepared"})
-    _require(issued.task is asyncio.current_task() and issued.prepared() is prepared and issued.admission is admission)
-    _require(policy is None or policy is issued.factory.policy)
+    _require(issued.admission is admission)
+    _require(policy is None or policy.schema == prepared.db_schema)
     _require(prepared.publish_validation == issued.validation and prepared.preparation_input == issued.inputs)
-    _require(issued.capture.relation_oids == tuple((logical, oid) for logical, _, oid in sorted(prepared.stage_oids)))
+    _require(issued.relations == tuple(prepared.stage_relations))
+    _require(
+        issued.capture.relations
+        == tuple((logical, prepared.db_schema, name) for logical, name in sorted(issued.relations))
+    )
     return issued.capture
 
 
 def require_source_cleanup(prepared):
     """Authenticate exact issued cleanup without renewing an expired spend reservation."""
     issued = _original(prepared.source_preparation, phases={"prepared"})
-    _require(issued.task is asyncio.current_task() and issued.prepared() is prepared)
     _require(prepared.db_schema == issued.factory.policy.schema)
-    _require(issued.capture.relation_oids == tuple((logical, oid) for logical, _, oid in sorted(prepared.stage_oids)))
+    _require(issued.relations == tuple(prepared.stage_relations))
+    _require(
+        issued.capture.relations
+        == tuple((logical, prepared.db_schema, name) for logical, name in sorted(issued.relations))
+    )
     return issued
 
 
 @asynccontextmanager
 async def cleanup_transaction(database, issued, *, relation=None):
-    """Cleanup keeps the original Factory and exact caller-owned OIDs after scope teardown."""
+    """Cleanup retains declared candidate names through transaction and scope teardown."""
     if issued is None:
         _require(not source.is_source_storage_required())
         async with database.transaction():
@@ -289,10 +260,9 @@ async def cleanup_transaction(database, issued, *, relation=None):
     _original(issued, phases={"building", "closing", "failed", "prepared"})
     _require(
         type(relation) is tuple
-        and len(relation) == 3
+        and len(relation) == 2
         and relation[0] == issued.factory.policy.schema
-        and relation[1:] in issued.original_relations
+        and relation[1] in issued.original_relations
     )
     async with source.source_transaction(database):
-        _require(source.bound_publisher().policy is issued.factory.policy)
         yield

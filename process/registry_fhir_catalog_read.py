@@ -343,7 +343,7 @@ def _network_item(document, query):
 
 
 async def _metadata_pin(connection, query, namespace):
-    from process.registry_fhir_catalog_custody import verify_fhir_catalog_snapshot
+    from process.registry_fhir_catalog_custody import validate_fhir_catalog_snapshot_record
 
     snapshot = await connection.fetchrow(
         f"SELECT {','.join(SNAPSHOT_COLUMNS)} "
@@ -356,7 +356,7 @@ async def _metadata_pin(connection, query, namespace):
     _digest(snapshot["metadata_generation"])
     catalog_integer(snapshot["metadata_approved_revision"], 9223372036854775807, minimum=0)
     storage_identifier(snapshot["schema_name"])
-    await verify_fhir_catalog_snapshot(connection, snapshot)
+    await validate_fhir_catalog_snapshot_record(connection, snapshot)
     return snapshot
 
 
@@ -582,17 +582,16 @@ SELECT (SELECT count(*) FROM filtered)::bigint AS total,
 
 
 def _catalog_page_statement(snapshot, manifest):
-    parameters, relations = (), ()
+    parameters = ()
     directory_available = "false"
     if manifest is not None:
-        addresses, parameters, relations = catalog_directory_relation(manifest, first_parameter=20)
+        addresses, parameters = catalog_directory_relation(manifest, first_parameter=20)
         directory_available = _DIRECTORY_AVAILABLE_SQL.format(
             candidate=storage_identifier(manifest.schema_name), addresses=addresses
         )
     return (
         _PAGE_SQL.format(control=storage_identifier(snapshot["schema_name"]), directory_available=directory_available),
         parameters,
-        relations,
     )
 
 
@@ -697,7 +696,7 @@ async def read_fhir_catalog(
         continuation_scope_sha256 = _continuation_scope(
             query, manifest, snapshot, exclusions, policy, access_scope_sha256
         )
-        sql, address_parameters, _ = _catalog_page_statement(snapshot, manifest)
+        sql, address_parameters = _catalog_page_statement(snapshot, manifest)
         entry = await connection.fetchrow(
             sql,
             *(

@@ -30,21 +30,16 @@ async def _discard_original(directory, scope):
 
 
 def _relations(metadata):
-    require_output(
-        type(metadata) is dict and set(metadata) == {"relation_by_table", "relation_oids"}, "scratch_metadata_changed"
-    )
-    names, oids = metadata["relation_by_table"], metadata["relation_oids"]
+    require_output(type(metadata) is dict and set(metadata) == {"relation_by_table"}, "scratch_metadata_changed")
+    names = metadata["relation_by_table"]
     require_output(
         type(names) is dict
-        and type(oids) is dict
-        and set(names) == set(oids) == {inputs.SOURCE, *inputs.TYPED_ROOTS}
+        and set(names) == {inputs.SOURCE, *inputs.TYPED_ROOTS}
         and all(type(name) is str and name for name in names.values())
-        and all(type(oid) is int and oid > 0 for oid in oids.values())
-        and len(set(names.values())) == len(names)
-        and len(set(oids.values())) == len(oids),
+        and len(set(names.values())) == len(names),
         "scratch_metadata_changed",
     )
-    return names, oids
+    return names
 
 
 @asynccontextmanager
@@ -53,10 +48,10 @@ async def prepared_scratch_scope(directory, admission, fence, resource_types, pr
     scope = await inputs.prepare_scratch_inputs(directory, admission, fence, resource_types, projection)
     try:
         metadata = await inputs.scratch_input_metadata(directory, scope)
-        names, oids = _relations(metadata)
+        names = _relations(metadata)
         token = _PROJECTION.set((scope, projection))
         try:
-            with inputs.scratch_input_scope(scope), directory._artifact_scope_tokens(fence, fence, names, oids):
+            with inputs.scratch_input_scope(scope), directory._artifact_scope_tokens(fence, fence, names):
                 yield dict(names)
         finally:
             _PROJECTION.reset(token)
@@ -102,10 +97,9 @@ async def reuse_scratch_scope(directory, fence, resource_fence, resource_types):
         "scratch_plan_changed",
     )
     metadata = await inputs.scratch_input_metadata(directory, scope)
-    names, oids = _relations(metadata)
+    names = _relations(metadata)
     require_output(
-        names == directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()
-        and oids == directory._PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.get(),
+        names == directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get(),
         "scratch_metadata_changed",
     )
     return projection

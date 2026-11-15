@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Selected inventory rows prove raw registration only; native source replay remains mandatory."""
 
+import asyncio
 import hashlib
 import json
 import re
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
 
+import asyncpg
 import pytest
 
 from process import network_initial_cms_office_bindings as cms
@@ -27,9 +29,9 @@ from process.registry_ptg_office_membership import PTGOfficeMembershipBatch
 from process.registry_source_inventory_preparation import SourceInventoryPreparation
 from process.registry_source_inventory_reference import SourceInventoryReference
 from process.registry_source_recipe_store import MAX_SOURCE_RECIPE_BYTES, canonical_registry_source_recipes
+from tests.registry_source_recipe_support import _capture_recipe, _derivation, _descriptor
 from tests.test_registry_ptg_office_membership_recipe import _recipe as _ptg_recipe
-from tests.test_registry_source_inventory_preparation import _aca_recipe, _derivation, _descriptor
-from tests.test_registry_source_inventory_store_postgres import _capture_recipe
+from tests.test_registry_source_inventory_preparation import _aca_recipe
 from tests.test_registry_source_recipe_store_postgres import _cms_epoch_recipe
 
 _APPROVED = ApprovedMembershipSource(7, "b" * 64)
@@ -134,9 +136,7 @@ def _native(monkeypatch, scope, *, native_records=None):
         fetchrow=AsyncMock(side_effect=lookup),
     )
     monkeypatch.setattr(offices, "_locked_candidate", AsyncMock(return_value=scope.candidate))
-    physical = AsyncMock(return_value='"synthetic_candidate".network_source_inventory')
-    monkeypatch.setattr(inventory_store, "_physical_context", physical)
-    return connection, physical
+    return connection
 
 
 @pytest.mark.asyncio
@@ -147,10 +147,10 @@ async def test_registered_pin_uses_full_source(monkeypatch, family, encoded):
     if encoded:
         for field in ("source_recipes_json", "source_generations"):
             scope.candidate[field] = json.dumps(scope.candidate[field])
-    connection, physical = _native(monkeypatch, scope)
+    connection = _native(monkeypatch, scope)
     await offices._candidate(connection, scope.copy_target, scope.batch, _ADDRESS, _CONTROL)
-    physical.assert_awaited_once_with(connection, scope.copy_target, 42, "synthetic_control")
     statement, identity, payload, *fields = connection.fetchrow.await_args.args
+    assert "FROM " + inventory_store._relation(scope.copy_target) in statement
     singleton = canonical_registry_source_recipes((scope.recipe,))
     assert identity == hashlib.sha256(singleton.encode()).hexdigest() and payload == singleton[1:-1]
     assert tuple(fields[:6]) == scope.recipe.binding_coordinates.sql_parameters
@@ -179,7 +179,6 @@ def _document(native_value):
         "approved",
         "root",
         "incomplete",
-        "oid",
         "isolation",
         "batch_type",
         "selection",
@@ -222,16 +221,25 @@ async def test_registered_pin_refuses_drift(monkeypatch, damage):
             scope.batch = SimpleNamespace(**vars(scope.batch))
         case "selection":
             scope.batch = replace(scope.batch, approved_only=False)
-    connection, physical = _native(monkeypatch, scope, native_records=native_records)
-    if damage == "oid":
-        physical.side_effect = ValueError("physical_identity_invalid")
+    connection = _native(monkeypatch, scope, native_records=native_records)
     if damage == "isolation":
         connection.fetchval.side_effect = None
         connection.fetchval.return_value = "read committed"
     with pytest.raises(ValueError):
         await offices._candidate(connection, scope.copy_target, scope.batch, _ADDRESS, _CONTROL)
-    if damage in {"approved", "root", "incomplete", "oid", "isolation", "batch_type", "selection"}:
+    if damage in {"approved", "root", "incomplete", "isolation", "batch_type", "selection"}:
         connection.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [asyncpg.InsufficientPrivilegeError("read denied"), asyncio.CancelledError()])
+async def test_registered_pin_preserves_native_access_failure_and_cancellation(monkeypatch, failure):
+    scope = _scope("cms")
+    connection = _native(monkeypatch, scope)
+    connection.fetchrow.side_effect = failure
+    with pytest.raises(type(failure)) as rejected:
+        await offices._candidate(connection, scope.copy_target, scope.batch, _ADDRESS, _CONTROL)
+    assert rejected.value is failure
 
 
 @pytest.mark.asyncio
@@ -246,13 +254,12 @@ async def test_legacy_generation_guard_stays_exact(monkeypatch, family, register
     }
     if registered:
         scope.candidate["source_generations"]["legacy_source"] = scope.batch.generation_id
-    connection, physical = _native(monkeypatch, scope)
+    connection = _native(monkeypatch, scope)
     if registered:
         await offices._candidate(connection, scope.copy_target, scope.batch, _ADDRESS, _CONTROL)
     else:
         with pytest.raises(offices.InitialACAOfficeBindingError, match="candidate_pin_differs"):
             await offices._candidate(connection, scope.copy_target, scope.batch, _ADDRESS, _CONTROL)
-    physical.assert_not_awaited()
     connection.fetchrow.assert_not_awaited()
     connection.fetchval.assert_not_awaited()
 
@@ -317,7 +324,7 @@ def test_scalar_sql_checks_nullable_registration(damage):
 async def test_registration_never_skips_native_replay(monkeypatch, family):
     """Passing raw registration cannot authorize copying a changed or unadmitted source page."""
     scope = _scope(family)
-    connection, _physical = _native(monkeypatch, scope)
+    connection = _native(monkeypatch, scope)
     monkeypatch.setattr(offices, "_require_transaction", AsyncMock())
     module = {"cms": cms, "aca": offices, "ptg": ptg}[family]
     capture_name = {

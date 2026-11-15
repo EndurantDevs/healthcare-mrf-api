@@ -178,11 +178,12 @@ async def test_all_heaps_and_custody_precede_copy_all_indexes_precede_set_valida
     async def execute(statement):
         events.append(("sql", str(statement)))
 
-    session = SimpleNamespace(execute=execute)
     source_relations = [{"model": model, "source_ref": f'"mrf"."{model.__tablename__}"'} for model in MODELS]
     monkeypatch.setattr(source, "_legacy_source_catalog", AsyncMock(return_value=source_relations))
-    monkeypatch.setattr(source, "_require_legacy_target_custody", AsyncMock())
+    monkeypatch.setattr(source, "_require_legacy_target_layout", AsyncMock())
 
+    monkeypatch.setattr(source.family_archive, "_native_model_copy_driver", AsyncMock(return_value=object()))
+    monkeypatch.setattr(source, "_close_clone_grants", AsyncMock())
     monkeypatch.setattr(source, "_legacy_source_indexes", _source_indexes)
 
     async def custody(_session):
@@ -211,10 +212,9 @@ async def test_all_heaps_and_custody_precede_copy_all_indexes_precede_set_valida
     monkeypatch.setattr(source.family_archive, "_is_model_table_equal", is_equal)
     if failure == "index":
         _break_last_index(monkeypatch)
-    capture = _source_capture()
     work = source._clone_entity_address_archive_source(
-        session,
-        source_capture=capture,
+        SimpleNamespace(execute=execute),
+        source_capture=_source_capture(),
         stage_schema="owned",
         source_copy=source.EntityAddressSourceCopy(copy, 64, 5),
         copy_deadline=asyncio.get_running_loop().time() + 5,
@@ -274,7 +274,8 @@ async def test_receipt_wrapper_forwards_copy_and_drains_exact_owned_cleanup_on_c
 
     async def stage(_sessions, **options):
         assert options["source_copy"] is native_copy
-        await options["stage_created"](object())
+        await options["hooks"].stage_created(object())
+        options["hooks"]._clone_outcome_by_field["committed"] = True
         raise asyncio.CancelledError
 
     monkeypatch.setattr(source, "export_entity_address_archive_stage", stage)
@@ -316,7 +317,6 @@ async def test_cms_pair_passes_explicit_capability_and_retains_original_receipt_
     monkeypatch.setattr(pair, "_retained_pair", AsyncMock(return_value=None))
     monkeypatch.setattr(pair, "_publication", AsyncMock(return_value={"address": "exact"}))
     monkeypatch.setattr(pair.serving, "capture_native_dependencies", AsyncMock(return_value={"address": "exact"}))
-    monkeypatch.setattr(pair, "_address_oid_vector", Mock(return_value=(1,)))
     monkeypatch.setattr(pair, "capture_registry_cms_address_copy_source", AsyncMock(return_value=captured))
     monkeypatch.setattr(pair, "capture_created_entity_address_archive_stage", AsyncMock(return_value=owner))
     stamp, freeze = AsyncMock(), AsyncMock(return_value=frozen_pair)
@@ -342,22 +342,14 @@ async def test_cms_pair_passes_explicit_capability_and_retains_original_receipt_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["foreign_owner", "foreign_schema_owner", "column_writer", "schema_writer"])
-async def test_target_custody_refuses_foreign_writer_before_payload(monkeypatch, damage):
-    relation_by_field = {"owner_oid": 10, "schema_owner_oid": 10, "schema_oid": 20}
-    if damage == "foreign_owner":
-        relation_by_field["owner_oid"] = 11
-    if damage == "foreign_schema_owner":
-        relation_by_field["schema_owner_oid"] = 11
-    monkeypatch.setattr(source, "_legacy_source_catalog", AsyncMock(return_value=[relation_by_field]))
-    guard = AsyncMock(side_effect=RuntimeError("column writer") if damage == "column_writer" else None)
-    monkeypatch.setattr(source.family_archive, "_require_selected_mrf_catalog", guard)
-    session = SimpleNamespace(scalar=AsyncMock(side_effect=[10, damage != "schema_writer"]))
+async def test_target_layout_is_validated_after_callback_without_owner_checks(monkeypatch):
+    catalog = AsyncMock(return_value=[])
+    monkeypatch.setattr(source, "_legacy_source_catalog", catalog)
+    session = SimpleNamespace(scalar=AsyncMock())
     capture = _source_capture()
-    with pytest.raises(RuntimeError, match="owner|writer"):
-        await source._require_legacy_target_custody(session, capture, "owned")
-    if damage.startswith("foreign"):
-        guard.assert_not_awaited()
+    await source._require_legacy_target_layout(session, capture, "owned")
+    assert catalog.await_args.args[1].schema_name == "owned"
+    session.scalar.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -472,3 +464,79 @@ async def test_stage_hook_compatibility_is_closed_before_io(invalid):
             **callback_by_name,
         )
     factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RuntimeError("commit outcome unknown"), asyncio.CancelledError()])
+async def test_receipt_wrapper_never_cleans_an_unconfirmed_clone(monkeypatch, error):
+    owner = object()
+    monkeypatch.setattr(
+        source.importlib,
+        "import_module",
+        lambda _: SimpleNamespace(capture_created_entity_address_archive_stage=AsyncMock(return_value=owner)),
+    )
+
+    async def unconfirmed(_sessions, **options):
+        await options["hooks"].stage_created(object())
+        raise error
+
+    monkeypatch.setattr(source, "export_entity_address_archive_stage", unconfirmed)
+    cleanup = AsyncMock()
+    monkeypatch.setattr(source, "_cleanup_owned_archive_stage", cleanup)
+    with pytest.raises(type(error)):
+        await source.export_entity_address_archive_with_receipt(
+            object(),
+            schema_name="mrf",
+            dataset_id=DATASET,
+            queued_serving_capture={},
+            archive_copy=AsyncMock(),
+            source_copy=source.native_entity_address_source_copy(max_bytes=1024, timeout=5),
+        )
+    cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "clone", "commit", "dump"])
+async def test_export_marks_clone_committed_only_after_transaction_exit(monkeypatch, failure):
+    transaction_positions = iter((1, 2, 3))
+
+    @asynccontextmanager
+    async def transaction():
+        position = next(transaction_positions)
+        yield
+        if position == 2 and failure == "commit":
+            raise RuntimeError("commit outcome unknown")
+
+    @asynccontextmanager
+    async def sessions():
+        yield SimpleNamespace(begin=transaction)
+
+    monkeypatch.setattr(source, "capture_entity_address_archive_source", AsyncMock(return_value=object()))
+
+    async def clone(session, **options):
+        await options["on_precreated"](session)
+        if failure == "clone":
+            raise RuntimeError("clone failed")
+
+    monkeypatch.setattr(source, "_clone_entity_address_archive_source", clone)
+    capture = source.EntityAddressArchiveStageCapture(source.LEGACY_CONTRACT, DATASET, "owned", (), "snapshot")
+    monkeypatch.setattr(source, "_capture_entity_address_archive_stage", AsyncMock(return_value=capture))
+    hooks = source.EntityAddressArchiveStageHooks(
+        archive_copy=AsyncMock(side_effect=RuntimeError("dump failed") if failure == "dump" else None),
+        stage_created=AsyncMock(),
+    )
+    operation = source._export_archive_stage(
+        sessions,
+        "mrf",
+        DATASET,
+        {},
+        source.native_entity_address_source_copy(max_bytes=1024, timeout=5),
+        hooks,
+    )
+    if failure is None:
+        await operation
+    else:
+        with pytest.raises(RuntimeError):
+            await operation
+    assert bool(hooks._clone_outcome_by_field.get("committed")) == (failure in {None, "dump"})
+    hooks.stage_created.assert_awaited_once()

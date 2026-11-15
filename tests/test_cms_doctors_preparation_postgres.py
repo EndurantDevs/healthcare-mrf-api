@@ -13,7 +13,7 @@ from sqlalchemy.exc import DBAPIError
 from process import cms_doctors_identity_candidate as identities
 from process import cms_doctors_preparation as preparation
 from process import provider_directory_generic_source_policy as source_policy
-from process.entity_address_cutover_contract import _ServingRelationLockTimeout
+from process.entity_address_cutover_contract import postgres_sqlstate
 from tests import cms_doctors_component_postgres_support as component_support
 from tests import cms_doctors_preparation_postgres_support as fixture_support
 from tests.cms_doctors_preparation_postgres_support import (
@@ -39,19 +39,23 @@ async def test_preparation_finishes_three_stages_without_publishing(monkeypatch)
             candidates = identities._candidates(ctx)
             assert set(candidates) == {"group", "site"}
             assert all(candidate.count == candidate.source_rows == 1 for candidate in candidates.values())
-            assert len(prepared.stage_oids) == 3
+            assert len(prepared.stage_relations) == 3
             assert len(prepared.relation_overrides) == 3
             assert not prepared.committed and not prepared.metrics["published"]
             assert ctx["context"]["publication_state"] == "prepared"
             assert await authority(fixture) == incumbent
             async with fixture.database.transaction() as session:
-                for model, (_target, stage, oid) in zip(preparation._models(), prepared.stage_oids, strict=True):
-                    await preparation._assert_stage(session, fixture.schema, stage, oid, logged=True)
+                for model, (_target, stage) in zip(preparation._models(), prepared.stage_relations, strict=True):
+                    await preparation._assert_stage(session, fixture.schema, stage, logged=True)
                     await preparation._assert_stage_indexes(
                         session, fixture.schema, native.make_class(model, ctx["import_date"])
                     )
                     assert (
-                        await session.scalar(text("SELECT reltuples FROM pg_class WHERE oid=:oid"), {"oid": oid}) == 1
+                        await session.scalar(
+                            text("SELECT reltuples FROM pg_class WHERE oid=to_regclass(:relation)"),
+                            {"relation": f"{fixture.schema}.{stage}"},
+                        )
+                        == 1
                     )
         assert await stage_oids(fixture, ctx) == ()
         assert await authority(fixture) == incumbent
@@ -69,7 +73,7 @@ async def test_outer_rollback_keeps_all_three_stages_retryable(monkeypatch):
             with pytest.raises(RuntimeError, match="late failure"):
                 await _apply_then_fail(fixture, prepared, failed_receipts)
             assert await authority(fixture) == incumbent
-            assert await stage_oids(fixture, ctx) == prepared.stage_oids
+            assert await stage_oids(fixture, ctx) == prepared.stage_relations
             assert not prepared.committed and not prepared.metrics["published"]
             with pytest.raises(RuntimeError, match="commit_unproved"):
                 await prepared.mark_committed(**failed_receipts[0])
@@ -79,7 +83,9 @@ async def test_outer_rollback_keeps_all_three_stages_retryable(monkeypatch):
             await prepared.mark_committed(**receipt)
             assert prepared.committed and prepared.metrics["published"]
         assert await stage_oids(fixture, ctx) == ()
-        assert (await authority(fixture)).relation_oids == tuple(oid for _, _, oid in prepared.stage_oids)
+        assert (await authority(fixture)).relations == tuple(
+            (fixture.schema, target) for target, _ in prepared.stage_relations
+        )
 
 
 async def _apply_then_fail(fixture, prepared, failed_receipts):
@@ -104,7 +110,7 @@ async def test_common_guard_rejects_independent_doctors_publication(monkeypatch)
                 async with fixture.database.transaction():
                     await preparation.apply_prepared_cms_doctors_generation(prepared)
             assert await authority(fixture) == incumbent
-            assert await stage_oids(fixture, ctx) == prepared.stage_oids
+            assert await stage_oids(fixture, ctx) == prepared.stage_relations
             with pytest.raises(RuntimeError, match="receipt_changed"):
                 await prepared.mark_committed(**fixture.initial)
 
@@ -129,21 +135,32 @@ async def test_historical_proof_consumes_after_a_later_doctors_publication(monke
             assert first.committed
 
 
+async def _replace_stage_with_invalid_layout(fixture, stage, prepared):
+    """Use an administrator to put an unsupported layout at the declared private name."""
+    async with fixture.engine.begin() as admin:
+        await admin.execute(text(f'DROP TABLE "{fixture.schema}"."{stage}"'))
+        await admin.execute(text(f'CREATE TABLE "{fixture.schema}"."{stage}" (marker int)'))
+        owner = fixture.component.policy.owner_role.replace('"', '""')
+        await admin.execute(text(f'GRANT SELECT ON "{fixture.schema}"."{stage}" TO "{owner}"'))
+    with pytest.raises(RuntimeError, match="indexes_missing"):
+        async with fixture.database.transaction():
+            await preparation.apply_prepared_cms_doctors_generation(prepared)
+
+
 @pytest.mark.asyncio
-async def test_cleanup_preserves_foreign_replacement_with_reused_stage_name(monkeypatch):
+async def test_cleanup_refuses_malformed_table_at_declared_stage_name(monkeypatch):
     async with doctors_database(monkeypatch) as fixture:
         ctx = await stage_family(fixture.database, fixture.schema)
-        async with preparation.prepare_cms_doctors_generation(ctx) as prepared:
-            _target, stage, original_oid = prepared.stage_oids[0]
-            async with fixture.database.transaction() as session:
-                await session.execute(text(f'DROP TABLE "{fixture.schema}"."{stage}"'))
-                await session.execute(text(f'CREATE TABLE "{fixture.schema}"."{stage}" (marker int)'))
-            with pytest.raises(RuntimeError, match="stage_changed"):
-                async with fixture.database.transaction():
-                    await preparation.apply_prepared_cms_doctors_generation(prepared)
+        with pytest.raises(RuntimeError, match="cms_doctors_immutable_columns_changed"):
+            async with preparation.prepare_cms_doctors_generation(ctx) as prepared:
+                _target, stage = prepared.stage_relations[0]
+                await _replace_stage_with_invalid_layout(fixture, stage, prepared)
         retained_stages = await stage_oids(fixture, ctx)
-        assert len(retained_stages) == 1
-        assert retained_stages[0][1] == stage and retained_stages[0][2] != original_oid
+        assert retained_stages == prepared.stage_relations
+        async with fixture.engine.begin() as admin:
+            for index, (_target, retained_stage) in enumerate(retained_stages):
+                count = await admin.scalar(text(f'SELECT count(*) FROM "{fixture.schema}"."{retained_stage}"'))
+                assert count == (0 if index == 0 else 1)
 
 
 @pytest.mark.asyncio
@@ -199,15 +216,16 @@ async def test_reader_lock_conflict_fails_without_partial_apply(monkeypatch):
                 await reader.execute(text(f'LOCK TABLE "{fixture.schema}".cms_doctor_education IN ACCESS SHARE MODE'))
                 await _assert_lock_conflict(fixture, prepared)
             assert await authority(fixture) == incumbent
-            assert await stage_oids(fixture, ctx) == prepared.stage_oids
+            assert await stage_oids(fixture, ctx) == prepared.stage_relations
         assert await stage_oids(fixture, ctx) == ()
 
 
 async def _assert_lock_conflict(fixture, prepared):
     """The native lock policy must abort instead of committing an earlier family swap."""
-    with pytest.raises(_ServingRelationLockTimeout, match="serving_relation_lock_timeout"):
+    with pytest.raises(DBAPIError) as blocked:
         async with fixture.database.transaction():
             await preparation.apply_prepared_cms_doctors_generation(prepared)
+    assert postgres_sqlstate(blocked.value) == "55P03"
 
 
 @pytest.mark.asyncio
@@ -279,8 +297,9 @@ async def test_ordinary_publisher_keeps_late_readers_on_incumbent(monkeypatch):
             pending = await pending_publisher_locks(fixture, publisher)
             assert await doctors_snapshot(fixture) == (("incumbent",) * 3, incumbent)
             assert pending
-            with pytest.raises(_ServingRelationLockTimeout, match="serving_relation_lock_timeout"):
+            with pytest.raises(DBAPIError) as blocked:
                 await publisher
+            assert postgres_sqlstate(blocked.value) == "55P03"
             assert len(transaction_ids) > 1 and len(set(transaction_ids)) == len(transaction_ids)
             assert await authority(fixture) == incumbent and await stage_oids(fixture, ctx) == stages
             release.set()
@@ -292,7 +311,7 @@ async def test_ordinary_publisher_keeps_late_readers_on_incumbent(monkeypatch):
                 identity_ctx=ctx,
             )
             assert published.local_generation == incumbent.local_generation + 1
-            assert published.relation_oids == tuple(oid for _, _, oid in stages)
+            assert published.relations == tuple((fixture.schema, target_relation) for target_relation, _ in stages)
             assert await doctors_snapshot(fixture) == (("prepared",) * 3, published)
             assert await stage_oids(fixture, ctx) == ()
         finally:

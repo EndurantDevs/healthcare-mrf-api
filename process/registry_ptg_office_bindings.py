@@ -38,7 +38,7 @@ async def _offices(connection, batch, address_source, after, control_schema, *, 
         raise ValueError("registry_ptg_office_binding_page_changed")
     office_records = [asdict(adoption) for adoption in batch.office_records]
     serving = batch.verified_source.serving
-    retained, retained_oid, arguments = _source_addresses(serving, _identifier(serving.schema_name))
+    retained, arguments = _source_addresses(serving, _identifier(serving.schema_name))
     _, conflict = _address_overlap_sql(retained, _identifier(address_source.schema_name), True)
     address_relation = (
         _identifier(address_source.schema_name) + "." + _identifier(address_source.table_name)
@@ -56,11 +56,9 @@ async def _offices(connection, batch, address_source, after, control_schema, *, 
       SELECT count(*) OVER(PARTITION BY site.ordinal) AS matches,
         address.location_key IS NULL OR ({conflict}) AS differs
       FROM selected site {joins}
-    ) SELECT to_regnamespace($2)::oid IS NULL OR ({retained_oid}) IS DISTINCT FROM {serving.address_table_oid}
-      OR EXISTS(SELECT 1 FROM matched WHERE matches<>1 OR differs)
+    ) SELECT EXISTS(SELECT 1 FROM matched WHERE matches<>1 OR differs)
       OR (SELECT count(*)<>count(DISTINCT (provider_system,provider_id,location_id)) FROM selected)""",
         _canonical(office_records).decode(),
-        serving.schema_name,
         *arguments,
         *(() if address_origin is None else address_origin.arguments),
     )
@@ -79,11 +77,11 @@ async def capture_ptg_office_address_source(
     control_schema=None,
     origin_manifest_sha256=None,
 ):
-    """Revalidate retained page and immutable address identity before candidate creation."""
+    """Revalidate the retained page and named address edition before candidate creation."""
     if type(address_source) is not PinnedAddressSource or address_source.table_name != "entity_address_unified":
         raise ValueError("registry_ptg_office_binding_source_invalid")
     _validate_roles(runtime_roles)
-    _, _, retained_arguments = _source_addresses(
+    _, retained_arguments = _source_addresses(
         batch.verified_source.serving, _identifier(batch.verified_source.serving.schema_name)
     )
     origin = await resolve_source_office_origin(
@@ -92,14 +90,14 @@ async def capture_ptg_office_address_source(
         runtime_roles=runtime_roles,
         control_schema=_control_namespace(control_schema)[1:-1],
         origin_manifest_sha256=origin_manifest_sha256,
-        first_parameter=3 + len(retained_arguments),
+        first_parameter=2 + len(retained_arguments),
     )
     office_records = await _offices(
         connection, batch, address_source, after_ordinal, control_schema, address_origin=origin
     )
     pin = PinnedPTGOfficeAddressSource(
         address_source,
-        origin.address_identity,
+        origin.address_scope,
         batch.source.generation_id,
         batch.generation_id,
         batch.input_sha256,

@@ -53,6 +53,19 @@ def _assert_custom_import_manual_acceptance_lineage(script):
     )
 
 
+_NAMED_GENERATION_REVISIONS = (
+    "20261114130000_named_preparation_catalog",
+    "20261114160000_npi_named_generation",
+    "20261114170000_source_profile_named_attachment",
+    "20261114180000_reference_family_named_generation",
+    "20261114190000_cms_native_input_named_revision",
+    "20261115100000_prescription_rollup_named_fingerprint",
+    "20261115110000_network_retained_read_grant_ledger",
+    "20261115120000_named_output_recovery_document",
+    "20261116090000_profile_capacity_logical_names",
+)
+
+
 def _assert_projection_upgrade_order(script, module):
     """Preserve the exact projection upgrade order through both joined histories."""
     assert [step.revision.revision for step in script._upgrade_revs("head", module.down_revision)] == [
@@ -110,6 +123,7 @@ def _assert_projection_upgrade_order(script, module):
         "20261115010000_ms_drg_companion_tables",
         "20261114010000_custom_import_snapshot_names",
         "20261114020000_custom_import_snapshot_metadata",
+        *_NAMED_GENERATION_REVISIONS,
     ]
 
 
@@ -121,16 +135,24 @@ def test_projection_migration_extends_the_single_installed_head():
     script = ScriptDirectory.from_config(config)
     module = migration()
     assert module.down_revision == "20261013010000_registry_custom_history_events"
-    assert script.get_heads() == ["20261114020000_custom_import_snapshot_metadata"]
-    assert script.get_revision("20261114020000_custom_import_snapshot_metadata").down_revision == (
-        "20261114010000_custom_import_snapshot_names"
+    assert script.get_heads() == ["20261116090000_profile_capacity_logical_names"]
+    assert (
+        script.get_revision("20261116090000_profile_capacity_logical_names").down_revision
+        == "20261115120000_named_output_recovery_document"
     )
-    assert script.get_revision("20261114010000_custom_import_snapshot_names").down_revision == (
-        "20261115010000_ms_drg_companion_tables"
+    assert (
+        script.get_revision("20261115120000_named_output_recovery_document").down_revision
+        == "20261115110000_network_retained_read_grant_ledger"
     )
-    assert script.get_revision("20261115010000_ms_drg_companion_tables").down_revision == (
-        "20261113010000_address_canonical_space_normalization"
+    revisions = (
+        "20261113010000_address_canonical_space_normalization",
+        "20261115010000_ms_drg_companion_tables",
+        "20261114010000_custom_import_snapshot_names",
+        "20261114020000_custom_import_snapshot_metadata",
     )
+    revisions += _NAMED_GENERATION_REVISIONS
+    for parent, child in zip(revisions, revisions[1:]):
+        assert script.get_revision(child).down_revision == parent
     assert script.get_revision("20261113010000_address_canonical_space_normalization").down_revision == (
         "20261111010000_code_sets_publication_idempotency"
     )

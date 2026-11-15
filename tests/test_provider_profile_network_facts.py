@@ -10,6 +10,7 @@ import pytest
 from api import provider_profile_network_facts as facts
 from api.provider_directory_cms_network_scope import CMSNetworkScope, _mapped_networks
 from api.provider_directory_entities_contract import DirectoryReadError
+from process.network_compact_layout import CompactAddressRelation
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
 
 NPI = "1000000004"
@@ -165,7 +166,14 @@ async def test_missing_exact_retained_recipe_refuses_before_fact_query(monkeypat
     from process.network_serving_read import PinnedNetworkServingManifest
 
     manifest = PinnedNetworkServingManifest(
-        1, "11111111-1111-4111-8111-111111111111", "network_candidate_" + "1" * 32, 1, {}, 1, "a" * 64, 7
+        1,
+        "11111111-1111-4111-8111-111111111111",
+        "network_candidate_" + "1" * 32,
+        1,
+        {},
+        1,
+        "a" * 64,
+        CompactAddressRelation("network_candidate_" + "1" * 32, "entity_address_unified"),
     )
     native = object()
     connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=native)))
@@ -184,35 +192,19 @@ async def test_missing_exact_retained_recipe_refuses_before_fact_query(monkeypat
     session.execute.assert_not_awaited()
 
 
-@pytest.mark.parametrize("refuse", [False, True])
-async def test_profile_payload_guard_precedes_fact_decode(monkeypatch, refuse):
+async def test_profile_read_decodes_facts_on_the_request_session(monkeypatch):
     from dataclasses import replace
 
-    from sanic.exceptions import ServiceUnavailable
-
     from process.network_compact_layout import CompactAddressRelation
-    from tests.test_network_read_execution import _session
 
-    session, driver, buffered = _session([])
-    driver.is_in_transaction = lambda: True
-    driver.fetchrow = AsyncMock(return_value={"backend_matches": True, "relation_count": 1, "valid": not refuse})
     pinned = replace(
-        scope(()), read_relations=(CompactAddressRelation("source", "provider_directory_dataset_resource", 7),)
+        scope(()), read_relations=(CompactAddressRelation("source", "provider_directory_dataset_resource"),)
     )
     monkeypatch.setattr(facts, "pin_cms_profile_scope", AsyncMock(return_value=pinned))
-
-    def scalar_one():
-        assert driver.fetchrow.await_count == 1 and not refuse
-        return json.dumps([row()])
-
-    buffered.scalar_one = scalar_one
-    operation = facts.read_cms_profile_plan_inputs(session, object(), NPI, excluded_network_ids=())
-    if refuse:
-        with pytest.raises(ServiceUnavailable):
-            await operation
-        buffered.close.assert_called_once()
-    else:
-        assert (await operation).facts == (row(),)
+    session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one=lambda: json.dumps([row()]))))
+    inputs = await facts.read_cms_profile_plan_inputs(session, object(), NPI, excluded_network_ids=())
+    assert inputs.facts == (row(),)
+    session.execute.assert_awaited_once()
 
 
 async def test_unbound_profile_source_inventory_refuses_before_query():

@@ -29,7 +29,7 @@ from process.provider_directory_rooted_graph_store import (
     initialize_provider_directory_rooted_graph_acquisition,
 )
 from process.provider_directory_rooted_graph_store_contract import ProviderDirectoryRootedGraphStoreError
-from process.provider_directory_rooted_graph_store_support import work_fields
+from process.provider_directory_rooted_graph_store_support import set_store_action, work_fields
 from tests.formulary_fhir_twin_admission_pg_support import connect, database_url, load_migration, run_migration
 from tests.test_provider_directory_rooted_graph_acquisition_postgres import (
     MIGRATION_PATH,
@@ -102,12 +102,12 @@ async def test_root_initialization_builds_detached_and_rolls_back_before_attach(
             with pytest.raises(RuntimeError, match="synthetic root initialization failure"):
                 await initialize_provider_directory_rooted_graph_acquisition(replacement, database=context.database)
         assert await context.connection.fetchval(
-            f"SELECT count(*)=0 FROM {context.schema}.provider_directory_rooted_graph_acquisition WHERE acquisition_id=$1",
+            f'SELECT count(*)=0 FROM "{context.rooted_input_schema}".provider_directory_rooted_graph_acquisition WHERE acquisition_id=$1',
             replacement.acquisition_id,
         )
         assert (
             await context.connection.fetchval(
-                f"SELECT count(*) FROM {context.schema}.provider_directory_rooted_graph_work WHERE acquisition_id=$1",
+                f'SELECT count(*) FROM "{context.rooted_input_schema}".provider_directory_rooted_graph_work WHERE acquisition_id=$1',
                 replacement.acquisition_id,
             )
             == 0
@@ -120,7 +120,7 @@ async def test_root_initialization_builds_detached_and_rolls_back_before_attach(
 async def _census(context, identity):
     return tuple(
         await context.connection.fetchrow(
-            f"SELECT used_resource_rows,used_edge_rows,used_payload_bytes FROM {context.schema}."
+            f'SELECT used_resource_rows,used_edge_rows,used_payload_bytes FROM "{context.rooted_input_schema}".'
             "provider_directory_rooted_graph_acquisition WHERE acquisition_id=$1",
             identity.acquisition_id,
         )
@@ -156,7 +156,7 @@ async def test_rooted_short_copy_rolls_back_before_admission(monkeypatch):
         assert await _census(context, identity) == (0, 0, 0)
         assert (
             await context.connection.fetchval(
-                f"SELECT count(*) FROM {context.schema}.provider_directory_rooted_graph_resource WHERE acquisition_id=$1",
+                f'SELECT count(*) FROM "{context.rooted_input_schema}".provider_directory_rooted_graph_resource WHERE acquisition_id=$1',
                 identity.acquisition_id,
             )
             == 0
@@ -188,9 +188,7 @@ def _malformed_result(query_result, failure):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure", ("resource_invalid", "edge_invalid", "stage_invalid", "could not create unique index")
-)
+@pytest.mark.parametrize("failure", ("resource_invalid", "edge_invalid", "stage_invalid", "duplicate_resource"))
 async def test_rooted_copy_isolated_exact_and_failed_result_rolls_back(monkeypatch, failure):
     async with _lifecycle_scope(monkeypatch) as context:
         identity, claim, query_result = await _claim(context)
@@ -198,7 +196,11 @@ async def test_rooted_copy_isolated_exact_and_failed_result_rolls_back(monkeypat
         # Exercise multiple binary COPY batches without introducing synthetic scale claims.
         monkeypatch.setattr(bulk, "_COPY_ROWS", 1)
         malformed = _malformed_result(query_result, failure)
-        with pytest.raises(DBAPIError, match=failure):
+        error_type = {
+            "duplicate_resource": DBAPIError,
+            "stage_invalid": asyncpg.CheckViolationError,
+        }.get(failure, ProviderDirectoryRootedGraphStoreError)
+        with pytest.raises(error_type):
             async with context.database.transaction() as transaction:
                 await bulk.admit_result_witnesses(context.database, transaction, claim, malformed)
         assert await _census(context, identity) == (0, 0, 0)
@@ -209,32 +211,20 @@ async def test_rooted_copy_isolated_exact_and_failed_result_rolls_back(monkeypat
             sum(len(witness.payload_json_text.encode()) for witness in query_result.resources),
         )
         witnesses = await context.connection.fetch(
-            f"SELECT resource_type,resource_id,payload_sha256,payload_json_text,closure_scope,tableoid::regclass::text "
-            f"FROM {context.schema}.provider_directory_rooted_graph_resource WHERE acquisition_id=$1 ORDER BY resource_id",
+            f"SELECT resource_type,resource_id,payload_sha256,payload_json_text,closure_scope "
+            f'FROM "{context.rooted_input_schema}".provider_directory_rooted_graph_resource WHERE acquisition_id=$1 ORDER BY resource_id',
             identity.acquisition_id,
         )
-        assert [tuple(witness[:5]) for witness in witnesses] == [
+        assert [tuple(witness) for witness in witnesses] == [
             tuple(getattr(witness, name) for name in bulk._RESOURCE_COLUMNS[4:])
             for witness in sorted(query_result.resources, key=lambda item: item.resource_id)
         ]
-        assert all(witness[5].endswith("pdrgr_" + identity.acquisition_id[6:]) for witness in witnesses)
         await _assert_no_row_insert_guards(context)
-        candidate = f"{context.schema_name}.pdrgr_{identity.acquisition_id[6:]}"
+        with pytest.raises(ProviderDirectoryRootedGraphStoreError):
+            await rooted_store.seal_provider_directory_rooted_graph_acquisition(identity, database=context.database)
         assert (
             await context.connection.fetchval(
-                "SELECT count(*) FROM pg_index WHERE indrelid=$1::regclass AND NOT indisprimary",
-                candidate,
-            )
-            == 0
-        )
-        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="acquisition_incomplete"):
-            await context.connection.execute(
-                f"SELECT {context.schema}.finish_provider_directory_rooted_graph_storage($1)",
-                identity.acquisition_id,
-            )
-        assert (
-            await context.connection.fetchval(
-                f"SELECT status FROM {context.schema}.provider_directory_rooted_graph_acquisition WHERE acquisition_id=$1",
+                f'SELECT status FROM "{context.rooted_input_schema}".provider_directory_rooted_graph_acquisition WHERE acquisition_id=$1',
                 identity.acquisition_id,
             )
             == "building"
@@ -246,144 +236,30 @@ async def _assert_no_row_insert_guards(context):
         "SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE NOT tgisinternal AND tgtype & 1=1 AND tgtype & 4=4 "
         "AND tgrelid IN (SELECT inhrelid FROM pg_inherits WHERE inhparent IN ($1::regclass,$2::regclass,$3::regclass) "
         "UNION SELECT $1::regclass UNION SELECT $2::regclass UNION SELECT $3::regclass))",
-        f"{context.schema_name}.provider_directory_rooted_graph_resource",
-        f"{context.schema_name}.provider_directory_rooted_graph_edge",
-        f"{context.schema_name}.provider_directory_rooted_graph_work",
+        f"{context.rooted_input_schema}.provider_directory_rooted_graph_resource",
+        f"{context.rooted_input_schema}.provider_directory_rooted_graph_edge",
+        f"{context.rooted_input_schema}.provider_directory_rooted_graph_work",
     )
-
-
-async def _assert_authorized_lease_shape(context, role, claim):
-    async with context.connection.transaction():
-        await context.connection.execute(f'SET LOCAL ROLE "{role}"')
-        await context.connection.execute(
-            "SELECT set_config('healthporta.rooted_graph_action','heartbeat',true),"
-            "set_config('healthporta.rooted_graph_acquisition',$1,true),"
-            "set_config('healthporta.rooted_graph_lease',$2,true)",
-            claim.acquisition_id,
-            claim.lease_token,
-        )
-        with pytest.raises(asyncpg.CheckViolationError, match="work_state_check"):
-            async with context.connection.transaction():
-                await context.connection.execute(
-                    f"UPDATE {context.schema}.provider_directory_rooted_graph_work "
-                    "SET lease_expires_at=lease_expires_at+interval '1 minute',lease_heartbeat_at=transaction_timestamp(),"
-                    "updated_at=transaction_timestamp(),result_sha256=repeat('a',64),resource_count=1 "
-                    "WHERE acquisition_id=$1 AND query_id=$2",
-                    claim.acquisition_id,
-                    claim.query_id,
-                )
-
-
-async def _assert_registry_write_denied(context, role):
-    async with context.connection.transaction():
-        await context.connection.execute(f'SET LOCAL ROLE "{role}"')
-        with pytest.raises(asyncpg.InsufficientPrivilegeError, match="copy_unauthorized"):
-            async with context.connection.transaction():
-                await context.connection.execute(f"UPDATE {context.schema}.pdrg_storage_migration SET complete=false")
-
-
-async def _assert_direct_writes_denied(context, identity, role):
-    for relation in (
-        "provider_directory_rooted_graph_resource",
-        "pdrgr_" + identity.acquisition_id[6:],
-        "provider_directory_rooted_graph_work",
-        "pdrgw_" + identity.acquisition_id[6:],
-    ):
-        with pytest.raises(asyncpg.InsufficientPrivilegeError):
-            async with context.connection.transaction():
-                await context.connection.execute(f'SET LOCAL ROLE "{role}"')
-                await context.connection.execute(f"INSERT INTO {context.schema}.{relation} DEFAULT VALUES")
-
-
-async def _assert_stage_alter_denied(connection):
-    with pytest.raises(asyncpg.InsufficientPrivilegeError):
-        async with connection.transaction():
-            await connection.execute("ALTER TABLE pg_temp.pdrg_resource_stage ADD COLUMN unsafe text")
-
-
-async def _migrate_restricted_writer(context, role):
-    await context.connection.execute(f'GRANT USAGE ON SCHEMA {context.schema} TO "{role}"')
-    for relation in ("work", "resource", "edge"):
-        await context.connection.execute(
-            f'GRANT SELECT,INSERT,UPDATE ON {context.schema}.provider_directory_rooted_graph_{relation} TO "{role}"'
-        )
-    await context.connection.execute(
-        f'ALTER DEFAULT PRIVILEGES IN SCHEMA {context.schema} GRANT INSERT,UPDATE ON TABLES TO "{role}"'
-    )
-    await context.connection.execute(
-        f"GRANT INSERT(payload_json_text) ON {context.schema}.provider_directory_rooted_graph_resource TO PUBLIC"
-    )
-    migration = load_migration(MIGRATION_PATH.with_name("20261005100000_rooted_graph_set_validation.py"), "rooted_acl")
-    await run_migration(context.engine, migration, "upgrade")
-
-
-async def _assert_forged_stage_denied(context, role, claim):
-    with pytest.raises(asyncpg.CheckViolationError, match="stage_invalid"):
-        async with context.connection.transaction():
-            await context.connection.execute(f'SET LOCAL ROLE "{role}"')
-            await context.connection.execute("CREATE TEMP TABLE pdrg_resource_stage(acquisition_id text)")
-            await context.connection.execute("CREATE TEMP TABLE pdrg_edge_stage(acquisition_id text)")
-            await context.connection.fetchval(
-                f"SELECT {context.schema}.admit_provider_directory_rooted_graph_witnesses($1,$2,$3,$4,"
-                "'pg_temp.pdrg_resource_stage'::regclass,'pg_temp.pdrg_edge_stage'::regclass)",
-                claim.acquisition_id,
-                claim.query_id,
-                claim.attempt,
-                claim.lease_token,
-            )
 
 
 @pytest.mark.asyncio
-async def test_rooted_definer_stage_closes_direct_and_forged_writes(monkeypatch):
-    role = "pdrg_test_" + uuid.uuid4().hex
-    admin = await connect(database_url())
-    await admin.execute(f'CREATE ROLE "{role}" NOLOGIN')
-    try:
-        async with _lifecycle_scope(monkeypatch, set_validation=False) as context:
-            await _migrate_restricted_writer(context, role)
-            identity, claim, query_result = await _claim(context)
-            await _assert_authorized_lease_shape(context, role, claim)
-            await _assert_direct_writes_denied(context, identity, role)
-            await context.connection.execute(f'GRANT pg_write_all_data TO "{role}"')
-            await _assert_direct_writes_denied(context, identity, role)
-            await _assert_registry_write_denied(context, role)
-            await _assert_forged_stage_denied(context, role, claim)
-            async with context.connection.transaction():
-                await context.connection.execute(f'SET LOCAL ROLE "{role}"')
-                await context.connection.execute(
-                    f"SELECT {context.schema}.prepare_provider_directory_rooted_graph_witness_stage()"
-                )
-                prefix = (claim.acquisition_id, claim.scope_id, claim.query_id, claim.attempt)
-                for name, columns, witnesses in (
-                    ("pdrg_resource_stage", bulk._RESOURCE_COLUMNS, query_result.resources),
-                    ("pdrg_edge_stage", bulk._EDGE_COLUMNS, query_result.edges),
-                ):
-                    await context.connection.copy_records_to_table(
-                        name,
-                        schema_name="pg_temp",
-                        columns=columns,
-                        records=[
-                            prefix + tuple(getattr(witness, field) for field in columns[4:]) for witness in witnesses
-                        ],
+async def test_rooted_candidate_inputs_refuse_reader_writes(monkeypatch):
+    async with _lifecycle_scope(monkeypatch) as context:
+        identity, claim, query_result = await _claim(context)
+        for suffix in ("acquisition", "work", "resource", "edge", "twin_attempt", "twin_admission"):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                async with context.connection.transaction():
+                    await context.connection.execute(f'SET LOCAL ROLE "{context.component.reader}"')
+                    await context.connection.execute(
+                        f'DELETE FROM "{context.rooted_input_schema}".provider_directory_rooted_graph_{suffix} WHERE false'
                     )
-                await _assert_stage_alter_denied(context.connection)
-                counts = await context.connection.fetchval(
-                    f"SELECT {context.schema}.admit_provider_directory_rooted_graph_witnesses($1,$2,$3,$4,"
-                    "'pg_temp.pdrg_resource_stage'::regclass,'pg_temp.pdrg_edge_stage'::regclass)",
-                    claim.acquisition_id,
-                    claim.query_id,
-                    claim.attempt,
-                    claim.lease_token,
-                )
-                assert counts == [len(query_result.resources), len(query_result.edges)]
-            assert await _census(context, identity) == (
-                len(query_result.resources),
-                len(query_result.edges),
-                sum(len(witness.payload_json_text.encode()) for witness in query_result.resources),
-            )
-    finally:
-        await admin.execute(f'DROP ROLE "{role}"')
-        await admin.close()
+        assert await _census(context, identity) == (0, 0, 0)
+        await complete_provider_directory_rooted_graph_result(claim, query_result, database=context.database)
+        assert await _census(context, identity) == (
+            len(query_result.resources),
+            len(query_result.edges),
+            sum(len(witness.payload_json_text.encode()) for witness in query_result.resources),
+        )
 
 
 def _legacy_initial_root_work_sql() -> str:
@@ -437,9 +313,22 @@ def _legacy_initial_root_work_sql() -> str:
     """
 
 
+async def _legacy_initial_root_work_insert(database, identity):
+    """Insert the original root work through its pre-migration row guards."""
+    await set_store_action(database, "initialize", identity.acquisition_id)
+    return await database.status(
+        _legacy_initial_root_work_sql(),
+        acquisition_id=identity.acquisition_id,
+        scope_id=identity.scope_id,
+        root_dataset_id=identity.root_dataset_id,
+        identity_contract="healthporta.provider-directory.rooted-graph-identity.v1",
+        page_size="100",
+    )
+
+
 async def _legacy_witness_insert(database, transaction, claim, query_result):
     """Exercise the replaced writer against its original immutable row guards."""
-    await rooted_store.set_store_action(database, "witness", claim.acquisition_id, claim.lease_token)
+    await set_store_action(database, "witness", claim.acquisition_id, claim.lease_token)
     prefix_by_column = dict(
         zip(
             bulk._RESOURCE_COLUMNS[:4],
@@ -465,7 +354,7 @@ async def _legacy_witness_insert(database, transaction, claim, query_result):
 
 
 async def _legacy_work_insert(database, acquisition_id, work_specs, *, action):
-    await rooted_store.set_store_action(database, action, acquisition_id)
+    await set_store_action(database, action, acquisition_id)
     for spec in work_specs:
         fields_by_column = {
             "acquisition_id": acquisition_id,
@@ -485,46 +374,39 @@ async def _legacy_work_insert(database, acquisition_id, work_specs, *, action):
 
 
 async def _historical_acquisitions(context, monkeypatch):
+    """Seed authentic old guarded data for online-migration preservation proofs."""
+    from tests.provider_directory_rooted_graph_runtime_test_support import configure_rooted_generation
+
+    configure_rooted_generation(monkeypatch, schema=context.schema_name)
     current = await _publish_legacy_root(context.database)
     historical = _identity(current, "baseline", "2", "3")
     abandoned = _identity(current, "candidate", "4", "5")
-    scalar = context.database.scalar
     first = context.database.first
+    status = context.database.status
 
     async def historical_first(query, **parameters):
+        if "SET status = 'leased'" in query:
+            action = "claim_census" if "AND work.kind = 'full_insurance_plan_census'" in query else "claim"
+            await set_store_action(context.database, action, parameters["acquisition_id"], parameters["lease_token"])
         for identity in (historical, abandoned):
             query = query.replace("pdrgw_" + identity.acquisition_id[6:], "provider_directory_rooted_graph_work")
         return await first(query, **parameters)
 
-    async def historical_scalar(query, **parameters):
-        if (
-            "prepare_provider_directory_rooted_graph_storage" in query
-            or "finish_provider_directory_rooted_graph_storage" in query
-            or "attach_provider_directory_rooted_graph_storage" in query
-        ):
-            return None
-        if "initialize_provider_directory_rooted_graph_work" in query:
-            identity = historical if parameters["acquisition_id"] == historical.acquisition_id else abandoned
-            return await context.database.status(
-                _legacy_initial_root_work_sql(),
-                acquisition_id=identity.acquisition_id,
-                scope_id=identity.scope_id,
-                root_dataset_id=identity.root_dataset_id,
-                identity_contract="healthporta.provider-directory.rooted-graph-identity.v1",
-                page_size="100",
+    async def historical_status(query, **parameters):
+        if "SET status = 'completed'" in query or "SET status = 'error'" in query:
+            await set_store_action(
+                context.database, "terminal", parameters["acquisition_id"], parameters["lease_token"]
             )
-        return await scalar(query, **parameters)
+        return await status(query, **parameters)
 
     with monkeypatch.context() as scoped:
-        scoped.setattr(context.database, "scalar", historical_scalar)
         scoped.setattr(context.database, "first", historical_first)
+        scoped.setattr(context.database, "status", historical_status)
+        # Original row guards charged missing response bytes before set-based accounting existed.
+        scoped.setattr(result_store, "_account_missing_response", AsyncMock())
+        scoped.setattr(bulk, "finish_named_acquisition_storage", AsyncMock())
 
-        async def initialize_legacy(database, identity):
-            await historical_scalar(
-                "initialize_provider_directory_rooted_graph_work", acquisition_id=identity.acquisition_id
-            )
-
-        scoped.setattr(rooted_store, "_insert_initial_root_work", initialize_legacy)
+        scoped.setattr(rooted_store, "_insert_initial_root_work", _legacy_initial_root_work_insert)
         scoped.setattr(result_store, "admit_result_witnesses", _legacy_witness_insert)
         scoped.setattr(bulk, "admit_work_specs", _legacy_work_insert)
         scoped.setattr(frontier, "admit_work_specs", _legacy_work_insert)
@@ -570,8 +452,15 @@ async def test_rooted_migration_preserves_sealed_heaps_and_requires_new_run(monk
             == payloads_before
         )
         assert await initialize_provider_directory_rooted_graph_acquisition(historical, database=context.database) == 0
-        with pytest.raises(DBAPIError, match="rerun_required"):
-            await initialize_provider_directory_rooted_graph_acquisition(abandoned, database=context.database)
+        with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="rerun_required"):
+            await context.connection.fetchval(
+                f"SELECT {context.schema}.prepare_provider_directory_rooted_graph_storage($1)", abandoned.acquisition_id
+            )
+        from tests.provider_directory_rooted_graph_runtime_test_support import configure_rooted_generation
+
+        configure_rooted_generation(
+            monkeypatch, schema=context.schema_name, candidate_schema=context.rooted_input_schema
+        )
         rerun = _identity(current, "candidate", "6", "7")
         replacement = await _complete_success(context.database, rerun)
         assert replacement.rooted_graph_sha256 == sealed.rooted_graph_sha256
@@ -591,12 +480,12 @@ async def test_rooted_frontier_failure_rolls_back_terminal_and_witness_sets(monk
 
         with monkeypatch.context() as scoped:
             scoped.setattr(frontier, "_derived_work_specs", invalid_frontier)
-            with pytest.raises(DBAPIError, match="discovery_invalid"):
+            with pytest.raises(ProviderDirectoryRootedGraphStoreError):
                 await complete_provider_directory_rooted_graph_result(claim, query_result, database=context.database)
         assert await _census(context, identity) == (0, 0, 0)
         assert (
             await context.connection.fetchval(
-                f"SELECT status FROM {context.schema}.provider_directory_rooted_graph_work WHERE acquisition_id=$1 AND query_id=$2",
+                f'SELECT status FROM "{context.rooted_input_schema}".provider_directory_rooted_graph_work WHERE acquisition_id=$1 AND query_id=$2',
                 identity.acquisition_id,
                 claim.query_id,
             )
@@ -604,39 +493,35 @@ async def test_rooted_frontier_failure_rolls_back_terminal_and_witness_sets(monk
         )
         await complete_provider_directory_rooted_graph_result(claim, query_result, database=context.database)
         assert await context.connection.fetchval(
-            f"SELECT used_work_items=count(*) FROM {context.schema}.provider_directory_rooted_graph_acquisition "
-            f"JOIN {context.schema}.provider_directory_rooted_graph_work USING(acquisition_id) "
+            f'SELECT used_work_items=count(*) FROM "{context.rooted_input_schema}".provider_directory_rooted_graph_acquisition '
+            f'JOIN "{context.rooted_input_schema}".provider_directory_rooted_graph_work USING(acquisition_id) '
             "WHERE acquisition_id=$1 GROUP BY used_work_items",
             identity.acquisition_id,
         )
 
 
 @pytest.mark.asyncio
-async def test_rooted_seal_rejects_missing_candidate_indexes_and_retries(monkeypatch):
+async def test_rooted_seal_rejects_missing_terminal_work_and_retries(monkeypatch):
     async with _lifecycle_scope(monkeypatch) as context:
         current = await _publish_legacy_root(context.database)
         identity = _identity(current, "baseline", "2", "3")
-        scalar = context.database.scalar
+        complete_initial = rooted_store._insert_initial_root_work
 
-        async def skip_index_build(query, **parameters):
-            if "finish_provider_directory_rooted_graph_storage" in query:
-                return None
-            return await scalar(query, **parameters)
+        async def inspect_incomplete(database, candidate):
+            inserted = await complete_initial(database, candidate)
+            with pytest.raises(ProviderDirectoryRootedGraphStoreError):
+                await rooted_store.seal_provider_directory_rooted_graph_acquisition(candidate, database=database)
+            assert tuple(
+                await database.first(
+                    f'SELECT used_resource_rows,used_edge_rows,used_payload_bytes FROM "{context.rooted_input_schema}".provider_directory_rooted_graph_acquisition WHERE acquisition_id=:identity',
+                    identity=candidate.acquisition_id,
+                )
+            ) == (0, 0, 0)
+            return inserted
 
-        with monkeypatch.context() as scoped:
-            scoped.setattr(context.database, "scalar", skip_index_build)
-            with pytest.raises(DBAPIError, match="indexes_incomplete"):
-                await _complete_success(context.database, identity)
-        assert (
-            await context.connection.fetchval(
-                f"SELECT status FROM {context.schema}.provider_directory_rooted_graph_acquisition WHERE acquisition_id=$1",
-                identity.acquisition_id,
-            )
-            == "building"
-        )
-        sealed = await rooted_store.seal_provider_directory_rooted_graph_acquisition(
-            identity, database=context.database
-        )
+        with monkeypatch.context() as patch:
+            patch.setattr(rooted_store, "_insert_initial_root_work", inspect_incomplete)
+            sealed = await _complete_success(context.database, identity)
         assert sealed.rooted_graph_complete
 
 
@@ -681,12 +566,12 @@ async def test_rooted_default_function_grants_do_not_authorize_admission(monkeyp
             )
             assert len(privileges) == len(function_names)
             assert not any(privilege["allowed"] for privilege in privileges)
-            identity, _claim_row, _result = await _claim(context)
-            for prefix in ("pdrgw_", "pdrgr_", "pdrge_"):
+            await _claim(context)
+            for suffix in ("work", "resource", "edge"):
                 assert not await context.connection.fetchval(
                     "SELECT has_table_privilege($1,$2,'SELECT')",
                     role,
-                    f"{context.schema}.{prefix}{identity.acquisition_id[6:]}",
+                    f"{context.rooted_input_schema}.provider_directory_rooted_graph_{suffix}",
                 )
             async with context.connection.transaction():
                 await context.connection.execute(f'SET LOCAL ROLE "{role}"')
@@ -700,54 +585,38 @@ async def test_rooted_default_function_grants_do_not_authorize_admission(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_root_native_copy_precedes_indexes_and_attach_reuses_them(monkeypatch):
+async def test_root_native_copy_precedes_stage_indexes(monkeypatch):
     async with _lifecycle_scope(monkeypatch) as context:
         current = await _publish_legacy_root(context.database)
         identity = _identity(current, "baseline", "2", "3")
-        candidate = f"{context.schema}.pdrgw_{identity.acquisition_id[6:]}"
         copy_stage = bulk._copy_stage
-        scalar = context.database.scalar
+        status = context.database.status
         observed_phases = []
 
         async def observe_copy(driver, name, columns, records):
             assert name == "pdrg_work_stage"
-            assert not await scalar(
-                "SELECT EXISTS(SELECT FROM pg_index WHERE indrelid=CAST(:relation AS regclass))", relation=candidate
-            )
-            assert not await scalar(
-                "SELECT EXISTS(SELECT FROM pg_constraint WHERE conrelid=CAST(:relation AS regclass) AND contype IN ('f','c'))",
-                relation=candidate,
-            )
-            assert not await scalar(
-                "SELECT EXISTS(SELECT FROM pg_constraint WHERE conrelid='pg_temp.pdrg_work_stage'::regclass AND contype IN ('f','c'))"
+            assert not await context.database.scalar(
+                "SELECT EXISTS(SELECT FROM pg_index WHERE indrelid='pg_temp.pdrg_work_stage'::regclass)"
             )
             observed_phases.append("copy")
             return await copy_stage(driver, name, columns, records)
 
-        async def observe_attach(query, **parameters):
-            if "attach_provider_directory_rooted_graph_storage" not in query:
-                return await scalar(query, **parameters)
-            indexes_sql = "SELECT array_agg(indexrelid ORDER BY indexrelid) FROM pg_index WHERE indrelid=CAST(:relation AS regclass) AND indisvalid AND indisready"
-            before = await scalar(indexes_sql, relation=candidate)
-            assert before and len(before) >= 4
-            check_names = await scalar(
-                "SELECT array_agg(conname::text ORDER BY conname) FROM pg_constraint WHERE conrelid=CAST(:relation AS regclass) AND contype='c' AND convalidated",
-                relation=candidate,
+        async def observe_index(query, **parameters):
+            if "pdrg_work_stage" not in query or "ADD PRIMARY KEY" not in query:
+                return await status(query, **parameters)
+            assert (
+                await context.database.scalar("SELECT count(*) FROM pg_temp.pdrg_work_stage")
+                == identity.root_resource_count
             )
-            assert check_names == [
-                "provider_directory_rooted_graph_work_shape_check",
-                "provider_directory_rooted_graph_work_state_check",
-                "provider_directory_rooted_graph_work_value_check",
-            ]
-            assert not await scalar(
-                "SELECT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=CAST(:relation AS regclass))", relation=candidate
+            assert observed_phases == ["copy"]
+            result = await status(query, **parameters)
+            assert await context.database.scalar(
+                "SELECT EXISTS(SELECT FROM pg_index WHERE indrelid='pg_temp.pdrg_work_stage'::regclass AND indisprimary AND indisvalid)"
             )
-            result = await scalar(query, **parameters)
-            assert await scalar(indexes_sql, relation=candidate) == before
-            observed_phases.append("attach")
+            observed_phases.append("index")
             return result
 
         monkeypatch.setattr(bulk, "_copy_stage", observe_copy)
-        monkeypatch.setattr(context.database, "scalar", observe_attach)
+        monkeypatch.setattr(context.database, "status", observe_index)
         await initialize_provider_directory_rooted_graph_acquisition(identity, database=context.database)
-        assert observed_phases == ["copy", "attach"]
+        assert observed_phases == ["copy", "index"]

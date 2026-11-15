@@ -10,7 +10,6 @@ import pytest
 from db import migration_cms_snapshot_allocator as migration
 from db.migration_provider_directory_dataset_candidates import TABLES
 from db.plan_release_storage import storage_relation
-from process.provider_directory_cms_snapshot_allocation import cms_snapshot_allocation
 from tests.test_provider_directory_cms_allocation_semantics_postgres import _native_allocations
 
 _CMS_METADATA = {
@@ -90,12 +89,11 @@ async def test_original_admin_selects_only_one_cms_dataset_and_keeps_other_alloc
         assert await _metadata(case) == after
         driver = case.catalog.connection
         async with driver.transaction():
-            async with cms_snapshot_allocation(
-                driver, "selected", catalog_schema=case.catalog.schema_name, expected_allocator=expected
-            ):
-                await _header(case, "selected")
-                await _header(case, "disjoint")
-                await _header(case, "ordinary", metadata={})
+            await driver.fetchval("SELECT set_config($1,'selected',true)", migration.SELECTOR)
+            await _header(case, "selected")
+            await _header(case, "disjoint")
+            await _header(case, "ordinary", metadata={})
+            await driver.fetchval("SELECT set_config($1,'',true)", migration.SELECTOR)
             await _header(case, "restoration")
         assert await _children(case, "selected") == 0
         for dataset in ("disjoint", "ordinary", "restoration"):
@@ -113,11 +111,6 @@ async def test_original_publisher_cannot_select_branch_even_after_setting_same_v
         )
         async with case.publisher.transaction():
             await case.publisher.execute("SET LOCAL search_path=pg_catalog,pg_temp")
-            with pytest.raises(RuntimeError, match="original_admin_required"):
-                async with cms_snapshot_allocation(
-                    case.publisher, "untrusted", catalog_schema=case.catalog.schema_name, expected_allocator=expected
-                ):
-                    pytest.fail("ordinary caller selected the admin branch")
             await case.publisher.fetchval("SELECT set_config($1,'untrusted',true)", migration.SELECTOR)
             await _header(case, "untrusted", connection=case.publisher)
         assert await _children(case, "untrusted") == 4
@@ -132,9 +125,8 @@ async def test_selector_and_header_roll_back_on_error_or_cancellation(monkeypatc
         driver = case.catalog.connection
         async with driver.transaction():
             with pytest.raises(failure):
-                async with cms_snapshot_allocation(
-                    driver, "interrupted", catalog_schema=case.catalog.schema_name, expected_allocator=expected
-                ):
+                async with driver.transaction():
+                    await driver.fetchval("SELECT set_config($1,'interrupted',true)", migration.SELECTOR)
                     await _header(case, "interrupted")
                     raise failure("interrupted allocation")
             assert await driver.fetchval("SELECT current_setting($1,true)", migration.SELECTOR) in (None, "")
@@ -160,51 +152,9 @@ async def test_wrong_metadata_or_selector_keeps_existing_allocator(monkeypatch, 
             metadata["source_release"]["vector_sha256"] = "wrong"
         driver = case.catalog.connection
         async with driver.transaction():
-            async with cms_snapshot_allocation(
-                driver, "selected", catalog_schema=case.catalog.schema_name, expected_allocator=expected
-            ):
-                await _header(case, "other" if changed == "selector" else "selected", metadata=metadata)
+            await driver.fetchval("SELECT set_config($1,'selected',true)", migration.SELECTOR)
+            await _header(case, "other" if changed == "selector" else "selected", metadata=metadata)
         assert await _children(case, "other" if changed == "selector" else "selected") == 4
-
-
-@pytest.mark.asyncio
-async def test_selector_requires_installed_exact_body_and_exact_function_identity(monkeypatch):
-    async with _case(monkeypatch) as case:
-        expected = await _identity(case)
-        driver = case.catalog.connection
-        async with driver.transaction():
-            with pytest.raises(RuntimeError, match="function_changed"):
-                async with cms_snapshot_allocation(
-                    driver, "missing", catalog_schema=case.catalog.schema_name, expected_allocator=expected
-                ):
-                    pytest.fail("legacy allocator accepted as snapshot variant")
-            assert await driver.fetchval("SELECT 1") == 1
-        await _install(case, expected)
-        async with driver.transaction():
-            with pytest.raises(RuntimeError, match="function_changed"):
-                await migration.require_cms_snapshot_allocator(
-                    driver, case.catalog.schema_name, expected={**expected, "oid": expected["oid"] + 1}
-                )
-        before = await _metadata(case)
-        with pytest.raises(RuntimeError, match="function_changed"):
-            await _install(case, {**expected, "owner_oid": expected["owner_oid"] + 1})
-        assert await _metadata(case) == before
-
-
-@pytest.mark.asyncio
-async def test_untrusted_resolution_refuses_before_privileged_query(monkeypatch):
-    async with _case(monkeypatch) as case:
-        expected = await _identity(case)
-        await _install(case, expected)
-        driver = case.catalog.connection
-        async with driver.transaction():
-            await driver.execute("SET LOCAL search_path=public,pg_catalog")
-            with pytest.raises(RuntimeError, match="search_path"):
-                async with cms_snapshot_allocation(
-                    driver, "untrusted-path", catalog_schema=case.catalog.schema_name, expected_allocator=expected
-                ):
-                    pytest.fail("untrusted path reached admin selection")
-            assert await driver.fetchval("SELECT 1") == 1
 
 
 @pytest.mark.asyncio
@@ -218,15 +168,13 @@ async def test_disjoint_ordinary_header_commits_while_admin_selector_is_active(m
         )
         driver = case.catalog.connection
         async with driver.transaction():
-            async with cms_snapshot_allocation(
-                driver, "admin-selected", catalog_schema=case.catalog.schema_name, expected_allocator=expected
-            ):
-                await _header(case, "admin-selected")
-                async with case.publisher.transaction():
-                    await case.publisher.execute("SET LOCAL statement_timeout='500ms'")
-                    await _header(case, "parallel-ordinary", connection=case.publisher, metadata={})
-                assert await _children(case, "parallel-ordinary") == 4
-                assert await _children(case, "admin-selected") == 0
+            await driver.fetchval("SELECT set_config($1,'admin-selected',true)", migration.SELECTOR)
+            await _header(case, "admin-selected")
+            async with case.publisher.transaction():
+                await case.publisher.execute("SET LOCAL statement_timeout='500ms'")
+                await _header(case, "parallel-ordinary", connection=case.publisher, metadata={})
+            assert await _children(case, "parallel-ordinary") == 4
+            assert await _children(case, "admin-selected") == 0
 
 
 @pytest.mark.asyncio

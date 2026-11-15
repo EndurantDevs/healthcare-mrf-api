@@ -279,7 +279,7 @@ def authenticated(frozen, monkeypatch):
 
     frozen.raw = _raw_allocation_evidence(frozen)
     frozen.policy = GenericSourcePolicy("private_source", "preparation_owner", "preparation_publisher", ("reader",))
-    frozen.storage = FHIRSourceStorageBinding("snapshot_schema", "private_source", 1, 42, 44, 101, 104, "a" * 64)
+    frozen.storage = FHIRSourceStorageBinding("snapshot_schema", "private_source")
     frozen.profile = dict(
         contract=custody.CONTRACT,
         source_ids=["cms-npd"],
@@ -531,19 +531,19 @@ def test_admission_projection_preserves_validated_history_without_expanding_its_
     assert source_custody == original
 
 
-@pytest.mark.parametrize("fault", ["pending", "shape", "unknown"])
+@pytest.mark.parametrize("fault", ["dataset_scope", "shape", "unknown"])
 def test_admission_projection_refuses_unissued_history_or_unknown_fields(authenticated, fault):
     from tests.test_provider_directory_cms_history_bounds import _expectations
 
     authority_by_kind = authenticated.source_custody["canonical_authority"]
     authority_by_kind["history_bounds"] = _expectations([])
-    if fault == "pending":
-        next(iter(authority_by_kind["history_bounds"].values()))["native"]["constraint"]["validated"] = False
+    if fault == "dataset_scope":
+        next(iter(authority_by_kind["history_bounds"].values()))["dataset_ids"] = ["one", "one"]
     elif fault == "shape":
         authority_by_kind["history_bounds"] = {}
     else:
         authority_by_kind["unissued"] = True
-    with pytest.raises(ValueError, match="cms_history_bounds|allocation_source_metadata_required"):
+    with pytest.raises(ValueError, match="cms_history_(bounds|plan_bounds)|allocation_source_metadata_required"):
         custody._allocation_admission_relations(authenticated.source_custody)
     authenticated.connection.execute.assert_not_awaited()
 

@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Retain one committed CMS source/address pair behind native closed custody."""
+"""Retain one committed CMS source/address pair at immutable qualified names."""
 
 import asyncio
 import hashlib
@@ -101,7 +101,6 @@ class RegistryCMSPublicationProof:
             or pin.retained_epoch is not None
             or pin.retained_successor is not None
             or pin.retained_capture is not None
-            or pin.custody_owner_role is not None
         ):
             raise ValueError("registry_cms_publication_proof_invalid")
         RegistrySourceMembershipRecipe(pin, self.binding_coordinates)
@@ -181,15 +180,13 @@ class RegistryCMSRetainedSourcePair:
             or self.address_source.table_name != "entity_address_unified"
             or self.address_source.generation_id != _digest(receipt_payload["address"])
             or str(self.address_ownership.dataset_id) != str(epoch.epoch_id)
-            or self.owner_role != epoch.owner_role
-            or self.runtime_roles != epoch.runtime_roles
             or tuple(receipt_payload["cms"][field] for field in _CMS_FIELDS) != self.proof.cms_authority
             or receipt_payload["selection"]["proof_id"] != self.proof.selection_proof_id
             or not _is_profile_identity(receipt_payload, self.proof)
         ):
             raise ValueError("registry_cms_source_pair_invalid")
         if self.witness_json is not None:
-            _bound_copy_witness(self, receipt_payload)
+            _bound_copy_witness(self)
 
     def as_dict(self):
         """Return the complete bounded checkpoint without database handles."""
@@ -273,7 +270,7 @@ async def _sealed_scope(connection, proof):
 
 
 async def require_registry_cms_source_pair(session, pair, *, verify_content=True):
-    """Verify retained custody independently of later origin cutovers."""
+    """Verify retained names and semantic content independently of later cutovers."""
     if type(pair) is not RegistryCMSRetainedSourcePair or type(verify_content) is not bool:
         raise ValueError("registry_cms_source_pair_invalid")
     await _normalize_receipt_session(session, pair.address_ownership.schema_name)
@@ -285,10 +282,10 @@ async def require_registry_cms_source_pair(session, pair, *, verify_content=True
         session, pair.address_ownership, pair.owner_role, pair.runtime_roles, verify_content=verify_content
     )
     comment = await connection.fetchval(
-        "SELECT obj_description($1::oid,'pg_namespace')", pair.address_ownership.schema_oid
+        "SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=$1",
+        pair.address_ownership.schema_name,
     )
-    if (verify_content and receipt != pair.address_receipt) or catalog != pair.address_catalog_sha256:
-        raise ValueError("registry_cms_source_pair_invalid")
+    await _require_address_pair_layout(session, pair, catalog, receipt=receipt, verify_content=verify_content)
     if comment != _pair_comment(pair) + _json(pair.as_dict()):
         from process.network_registry_cms_prepared_cleanup import decode_prepared_registry_cms_source_pair
         from process.network_registry_cms_prepared_pair import _pair_from_prepared_receipt
@@ -353,11 +350,11 @@ async def resolve_committed_registry_cms_source_pair(session, recipe, *, api_rea
         raise ValueError("registry_cms_source_pair_read_transaction_required")
     epoch = recipe.source_pin.retained_epoch
     schema = entity_address_archive_stage_schema(epoch.epoch_id)
-    pair, schema_oid = await _read_committed_pair(connection, schema)
+    pair, observed_schema = await _read_committed_pair(connection, schema)
     if (
         pair.recipe != recipe
         or pair.address_ownership.schema_name != schema
-        or (not api_read and pair.address_ownership.schema_oid != schema_oid)
+        or observed_schema != schema
         or epoch.admission_sha256 != pair.proof.expected_admission_sha256
         or epoch.metadata_sha256 != pair.proof.expected_metadata_sha256
     ):
@@ -367,8 +364,7 @@ async def resolve_committed_registry_cms_source_pair(session, recipe, *, api_rea
         _, catalog = await address_clone_identity(
             session, pair.address_ownership, pair.owner_role, pair.runtime_roles, verify_content=False
         )
-        if catalog != pair.address_catalog_sha256:
-            raise ValueError("registry_cms_source_pair_invalid")
+        await _require_address_pair_layout(session, pair, catalog, verify_content=False)
     if await _publication(session, pair.proof, current=False) != json.loads(pair.cms_receipt_payload):
         raise ValueError("registry_cms_source_pair_invalid")
     if pair.witness_json is not None and not api_read:
@@ -388,7 +384,7 @@ async def _read_committed_pair(connection, schema):
     )
 
     metadata_record = await connection.fetchrow(
-        """SELECT oid::bigint AS schema_oid,
+        """SELECT nspname AS schema_name,
         CASE WHEN octet_length(obj_description(oid,'pg_namespace')) <= $2
         THEN obj_description(oid,'pg_namespace') END AS comment
         FROM pg_catalog.pg_namespace WHERE nspname=$1""",
@@ -414,7 +410,7 @@ async def _read_committed_pair(connection, schema):
         raise ValueError("registry_cms_source_pair_invalid") from None
     if comment != _pair_comment(pair) + _json(pair.as_dict()):
         raise ValueError("registry_cms_source_pair_invalid")
-    return pair, metadata_record["schema_oid"]
+    return pair, metadata_record["schema_name"]
 
 
 async def _read_prepared_committed_pair(connection, schema, metadata_record):
@@ -426,7 +422,6 @@ async def _read_prepared_committed_pair(connection, schema, metadata_record):
     prepared = decode_prepared_registry_cms_source_pair(metadata_record["comment"])
     if metadata_record["comment"] != _prepared_comment_prefix(prepared) + _json(prepared.as_dict()):
         raise ValueError("registry_cms_source_pair_invalid")
-    # Callers that verify custody compare the returned schema identifier themselves.
     if prepared.address_ownership.schema_name != schema:
         raise ValueError("registry_cms_source_pair_invalid")
     row = await serving.read_registry_source_pair_receipt(
@@ -436,17 +431,13 @@ async def _read_prepared_committed_pair(connection, schema, metadata_record):
     )
     if row is None:
         raise ValueError("registry_cms_source_pair_unavailable")
-    return _pair_from_prepared_receipt(prepared, row), metadata_record["schema_oid"]
+    return _pair_from_prepared_receipt(prepared, row), metadata_record["schema_name"]
 
 
 async def _retained_source_publication_time(connection, pair, *, api_read=False):
     """Read exact copied metadata; receipt time is not source publication time."""
     pin = pair.recipe.source_pin
     dataset_table = _identifier(pin.read_schema_name) + ".provider_directory_endpoint_dataset"
-    if api_read:
-        backend_pid = await connection.fetchval("SELECT pg_backend_pid()")
-        # The table this name resolves to now; a table replaced during the read is refused below.
-        current_oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", dataset_table)
     metadata_record = await connection.fetchrow(
         f"""SELECT endpoint_id,dataset_hash,acquisition_root_run_id,status,published_at,
         content_proof_admission_sha256,publication_metadata_sha256,
@@ -456,15 +447,6 @@ async def _retained_source_publication_time(connection, pair, *, api_read=False)
         FROM {dataset_table} WHERE dataset_id=$1""",
         pin.dataset_id,
     )
-    if api_read:
-        from process.network_compact_layout import CompactAddressRelation
-        from process.network_read_identity import verify_consumed_network_relations
-
-        await verify_consumed_network_relations(
-            connection,
-            (CompactAddressRelation(pin.read_schema_name, "provider_directory_endpoint_dataset", current_oid),),
-            expected_backend_pid=backend_pid,
-        )
     declaration_by_field = {
         **asdict(pair.proof.binding_coordinates),
         "source_key_kind": "organization_resource_id",
@@ -624,12 +606,12 @@ async def _capture_pair(session_factory, proof, capture_id, owner_role, runtime_
             await capture_registry_cms_address_copy_source(
                 session,
                 source_schema=proof.source_pin.schema_name,
-                expected_relation_oids=_address_oid_vector(receipt_payload[0]),
+                expected_relation_names=tuple(sorted(model.__tablename__ for model in _models())),
             )
         )
 
     async def created(session):
-        """Persist exact clone OIDs atomically for safe interrupted-capture recovery."""
+        """Persist the exact named clone atomically for interrupted-capture recovery."""
         ownership.append(await capture_created_entity_address_archive_stage(session, dataset_id=capture_id))
         await _stamp_stage(session, schema, proof, owner_role, runtime_roles, ownership[0])
 
@@ -672,7 +654,7 @@ async def _copy_compatibility_address(session_factory, proof, capture_id, source
 
 
 async def _stamp_stage(session, schema, proof, owner_role, runtime_roles, ownership):
-    """Bind interrupted clone cleanup to its exact native OIDs and requested scope."""
+    """Bind interrupted clone cleanup to its complete names and requested scope."""
     stage_by_field = {
         "proof": proof.as_dict(),
         "owner_role": owner_role,
@@ -690,8 +672,8 @@ async def _cleanup_capture(session_factory, ownership, *, source_schema=None):
     """Clean only the exact clone; a committed pair survives lost acknowledgement."""
     async with session_factory() as session, session.begin():
         comment = await session.scalar(
-            text("SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE oid=:oid"),
-            {"oid": ownership.schema_oid},
+            text("SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=:schema"),
+            {"schema": ownership.schema_name},
         )
         if comment is not None and comment.startswith((_COMMENT, _COMMENT_V2)):
             return
@@ -773,25 +755,50 @@ def _pair_comment(pair):
     return _COMMENT if pair.witness_json is None else _COMMENT_V2
 
 
-def _address_oid_vector(payload):
-    names = tuple(model.__tablename__ for model in _models())
-    oids = payload["address"]["relation_oids"]
-    if type(oids) is not list or len(oids) != len(names):
-        raise ValueError("registry_cms_address_authority_changed")
-    return tuple(sorted(zip(names, oids, strict=True)))
-
-
-def _bound_copy_witness(pair, receipt_payload):
+def _bound_copy_witness(pair):
     if type(pair.witness_json) is not str:
         raise ValueError("registry_cms_source_pair_invalid")
     document = json.loads(pair.witness_json)
     if (
         decode_registry_cms_address_copy_witness(document) != pair.witness_json
         or document["source"]["schema_name"] != pair.proof.source_pin.schema_name
-        or document["source"]["relation_oids"] != [list(entry) for entry in _address_oid_vector(receipt_payload)]
         or document["clone"]["schema_name"] != pair.address_ownership.schema_name
-        or document["clone"]["schema_oid"] != pair.address_ownership.schema_oid
-        or document["clone"]["relation_oids"] != [list(entry) for entry in pair.address_ownership.relation_oids]
+        or _witness_relation_names(document["clone"]) != pair.address_ownership.relation_names
         or document["clone"]["receipt"] != pair.address_receipt.as_dict()
     ):
         raise ValueError("registry_cms_source_pair_invalid")
+
+
+def _witness_relation_names(side):
+    """Project either closed witness edition to its declared relation names."""
+    if "relations" in side:
+        return tuple(entry["relation_name"] for entry in side["relations"])
+    return tuple(entry[0] for entry in side["relation_oids"])
+
+
+async def _require_address_pair_layout(session, pair, catalog, *, receipt=None, verify_content):
+    """Use named layout evidence or retained semantic receipts, never old catalog IDs."""
+    from process import entity_address_snapshot_receipt as receipts
+
+    ownership = pair.address_ownership
+    if "relations" in ownership.as_dict():
+        if catalog != pair.address_catalog_sha256 or (verify_content and receipt != pair.address_receipt):
+            raise ValueError("registry_cms_source_pair_invalid")
+        return
+    if getattr(pair, "witness_json", None) is not None:
+        await require_registry_cms_address_copy_witness(
+            session, json.loads(pair.witness_json), clone_ownership=ownership, verify_content=verify_content
+        )
+        return
+    if verify_content:
+        observed = await capture_entity_address_archive_receipt(
+            session, schema_name=ownership.schema_name, contract=pair.address_receipt.contract, read_only=True
+        )
+        if observed != pair.address_receipt:
+            raise ValueError("registry_cms_source_pair_legacy_semantic_receipt_changed")
+        return
+    for table in pair.address_receipt.tables:
+        handle = await receipts._relation_oid(session, ownership.schema_name, table.table_name)
+        observed = await receipts._schema_identity(session, handle, ownership.schema_name, table.table_name)
+        if observed != table.schema_sha256:
+            raise ValueError("registry_cms_source_pair_legacy_semantic_layout_changed")

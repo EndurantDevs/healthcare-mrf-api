@@ -71,7 +71,7 @@ def cutover_wave(control_wave, monkeypatch):
         finally:
             events.append("continuity_exit")
 
-    async def apply(original_stages, *, profile_delta, cutover_timeout):
+    async def apply(original_stages, *, profile_delta, cutover_timeout, promotion_identities=()):
         assert original_stages is stages and profile_delta is delta
         assert custody.current_owned_wal_transaction(database) is not None
         assert database._transaction_binding().session.in_transaction()
@@ -84,6 +84,7 @@ def cutover_wave(control_wave, monkeypatch):
     monkeypatch.setattr(fhir.profile_initial, "build_from_stages", Mock(return_value=None))
     monkeypatch.setattr(receipt, "ordinary_profile_receipt_continuity", continuity)
     monkeypatch.setattr(fhir, "_apply_prepared_artifact_bundle_in_transaction", apply)
+    monkeypatch.setattr(fhir, "_observe_provider_directory_artifact_promotion_revisions", AsyncMock())
     token = fhir._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(fence)
     try:
         yield state, database, admission, stages, delta, fence, events
@@ -100,7 +101,7 @@ def outer_group(fixture):
     return fixture[2].wal_tracker.owned_control_transaction_groups[0]
 
 
-async def test_atomic_bundle_has_one_original_native_owner_and_identity(cutover_wave):
+async def test_atomic_bundle_commits_one_logical_group_and_releases_transaction(cutover_wave):
     state, database, _, stages, delta, fence, events = cutover_wave
     await promote(cutover_wave)
     group = outer_group(cutover_wave)
@@ -108,13 +109,12 @@ async def test_atomic_bundle_has_one_original_native_owner_and_identity(cutover_
     assert group["identity"][0:2] == ("artifact_cutover", "bundle")
     assert group["identity"][2][0] is stages and group["identity"][2][1] is delta
     assert group["identity"][3] is fence and group["outcome"] is outcome
-    assert group["session"] is outcome.session and group["connection"] is state.connections[0]
-    assert group["driver"] is outcome.retained_driver and group["pid"] == outcome.retained_pid
     assert group["consumed"] and outcome.is_committed and outcome.cleanup_complete
     assert not group["accounting_authority"] and not group["reservation_refund"]
     assert events == ["configure", "lock_metadata", "continuity_enter", "target_metadata", "continuity_exit"]
     assert database._transaction_binding() is None
     assert state.connections[0].events.count("begin") == state.connections[0].events.count("commit") == 1
+    assert state.checkedout == 0 and all(connection.closed for connection in state.connections)
 
 
 @pytest.mark.parametrize("mode", ["rollback", "cancel", "postcommit_sample", "unknown_commit", "restore_failure"])
@@ -188,7 +188,7 @@ async def test_borrowed_cutover_does_not_claim_future_outer_completion(cutover_w
 async def test_nested_control_is_not_completed_before_atomic_owner_exit(cutover_wave, monkeypatch):
     _, database, admission, stages, delta, _, _ = cutover_wave
 
-    async def apply(original_stages, *, profile_delta, cutover_timeout):
+    async def apply(original_stages, *, profile_delta, cutover_timeout, promotion_identities=()):
         assert original_stages is stages and profile_delta is delta
         await fhir._provider_directory_profile_capacity_status("UPDATE synthetic_checkpoint SET cursor=2;")
         outer, inner = admission.wal_tracker.owned_control_transaction_groups

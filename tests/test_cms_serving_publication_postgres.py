@@ -246,8 +246,10 @@ async def test_archive_and_native_families_share_commit_and_recovery(monkeypatch
                 is_committed
             )
             revision = await connection.scalar(
-                text(f"SELECT revision FROM {schema}.cms_native_input_revision WHERE relation_oid=:oid"),
-                {"oid": proof["target_oid"]},
+                text(
+                    f"SELECT revision FROM {schema}.cms_native_input_revision WHERE schema_name=:schema AND table_name=:table"
+                ),
+                {"schema": proof["target_schema"], "table": proof["target_table"]},
             )
             assert revision == (2 if is_committed else 0)
             if is_committed:
@@ -284,11 +286,21 @@ async def test_retained_fence_precedes_native_input_checks(monkeypatch):
 
 def _bind_family_applications(monkeypatch, database, schema, failure, prepared, address, doctors):
     """Exercise the owning transaction with writes to both native family ledgers."""
+    bound_overlays = []
 
     async def apply_profile(
-        _fhir, _stages, *, profile_delta, cutover_timeout, settings_configured, before_swaps, extra_live_relations
+        _fhir,
+        _stages,
+        *,
+        profile_delta,
+        cutover_timeout,
+        settings_configured,
+        before_swaps,
+        extra_live_relations,
+        read_only,
     ):
         assert profile_delta is prepared.profile_delta
+        assert read_only is True
         assert cutover_timeout is None and settings_configured is True
         assert extra_live_relations == publication._live_swap_relations(prepared, address, doctors)
         await database.connection.execute(text(f"INSERT INTO {schema}.provider_directory_profile VALUES (2)"))
@@ -304,14 +316,27 @@ def _bind_family_applications(monkeypatch, database, schema, failure, prepared, 
         if failure == "cancel":
             raise asyncio.CancelledError("synthetic cancellation before commit")
 
+    async def bind_overlay(prepared_address, stages):
+        assert prepared_address is address and stages is prepared.stages
+        assert database.connection.in_transaction()
+        assert (
+            await database.connection.scalar(
+                text(f"SELECT control_generation FROM {schema}.provider_directory_profile_serving_generation")
+            )
+            == 2
+        )
+        bound_overlays.append(prepared_address)
+
     async def apply_address(prepared_address):
         assert prepared_address is address
+        assert bound_overlays == [address]
         await database.connection.execute(text(f"INSERT INTO {schema}.entity_address_unified VALUES (3)"))
         await native._advance_native(database.connection, schema)
         if failure == "address":
             raise RuntimeError("synthetic address failure")
 
     monkeypatch.setattr(publication, "apply_prepared_artifact_bundle", apply_profile)
+    monkeypatch.setattr(publication, "bind_published_overlay", bind_overlay)
     monkeypatch.setattr(publication, "publish_prepared_entity_address_generation", apply_address)
 
 

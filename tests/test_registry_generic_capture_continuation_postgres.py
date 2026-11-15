@@ -81,7 +81,7 @@ async def test_native_capture_current_lookup_and_exact_postcommit_replay(legacy_
 
     monkeypatch.setattr(continuation, "capture_retained_fhir_source", no_copy)
     assert await _continue(fixture) == first
-    assert await fixture.admin.fetchval("SELECT count(*) FROM pg_namespace WHERE oid=$1", first.schema_oid) == 1
+    assert await fixture.admin.fetchval("SELECT count(*) FROM pg_namespace WHERE nspname=$1", first.schema_name) == 1
 
 
 @pytest.mark.parametrize("legacy_capture_db", ["modern"], indirect=True)

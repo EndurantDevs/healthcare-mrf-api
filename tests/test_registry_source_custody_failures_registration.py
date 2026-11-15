@@ -33,7 +33,7 @@ async def test_candidate_description_preserves_exact_heap_identity_without_enrol
     assert (native.rows, native.guards, native.heap) == before
     assert not _writes(native)
     assert len(native.calls) == 1
-    assert native.calls[0][2] == ('"stage"."incoming"', '"sample"."mrf_address"')
+    assert native.calls[0][2] == ('"stage"."incoming"',)
 
 
 @pytest.mark.asyncio
@@ -105,7 +105,7 @@ async def test_local_publication_refuses_ambiguous_replacement_requests_before_s
 @pytest.mark.asyncio
 async def test_valid_local_replacement_still_requires_a_caller_owned_transaction():
     session = SimpleNamespace(in_transaction=lambda: False, execute=AsyncMock(), connection=AsyncMock())
-    with pytest.raises(RuntimeError, match="cms_native_input_original_transaction_required"):
+    with pytest.raises(ValueError, match="transaction_required"):
         await registration.prepare_local_native_input_publication(
             session, ledger_schema="sample", relations=(("mrf_address", "incoming"),)
         )

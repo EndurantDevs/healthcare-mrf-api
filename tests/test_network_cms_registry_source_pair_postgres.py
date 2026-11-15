@@ -35,6 +35,7 @@ from process.network_cms_registry_source_pair import (
     require_registry_cms_source_pair,
     require_registry_cms_source_pair_connection,
 )
+from process.network_compact_layout import CompactAddressRelation
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource, read_fhir_membership_batch
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.provider_directory_mrf_payer_binding import (
@@ -321,8 +322,7 @@ async def _assert_absent(database, capture_id):
     async with database.session_factory() as session:
         for schema in ("registry_cms_epoch_" + capture_id.hex, "entity_address_archive_" + capture_id.hex):
             assert (
-                await session.scalar(text("SELECT oid FROM pg_namespace WHERE nspname=:schema"), {"schema": schema})
-                is None
+                await session.scalar(text("SELECT to_regnamespace(:schema) IS NOT NULL"), {"schema": schema}) is False
             )
 
 
@@ -432,7 +432,6 @@ async def _verify_current_pair(session, pair, monkeypatch, roles, physical, proo
         changed["profile"][field] = value
         with pytest.raises(ValueError, match="source_pair_invalid"):
             replace(pair, cms_receipt_payload=json.dumps(changed))
-    await _reject_address_write_grant(session, pair, roles[1])
 
 
 @pytest.mark.asyncio
@@ -467,7 +466,6 @@ async def test_native_pair_capture_replay_and_closed_custody(monkeypatch, tmp_pa
             await _verify_read_pair(database, pair, monkeypatch, published=True)
             await _verify_retained_entity_read(database, pair, monkeypatch)
             await _reject_read_pair_comments(database, pair)
-            await _reject_read_pair_write_grant(database, pair)
             async with database.session_factory() as session, session.begin():
                 await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
                 assert await require_registry_cms_source_pair(session, pair) == pair
@@ -493,10 +491,10 @@ async def _verify_physical_pair_replay(database, pair, proof, roles, monkeypatch
     async with database.session_factory() as session:
         assert (
             await session.scalar(
-                text("SELECT oid FROM pg_namespace WHERE nspname=:schema"),
+                text("SELECT to_regnamespace(:schema) IS NOT NULL"),
                 {"schema": pair.address_ownership.schema_name},
             )
-            == pair.address_ownership.schema_oid
+            is True
         )
     await _prove_lost_acknowledgement(database, proof, roles, monkeypatch)
 
@@ -608,36 +606,6 @@ async def _reject_read_pair_comments(database, pair):
             )
 
 
-async def _reject_read_pair_write_grant(database, pair):
-    """Actual opened native custody is refused without changing reader settings."""
-    schema, role = pair.address_source.schema_name, pair.runtime_roles[0]
-    try:
-        async with database.session_factory() as session, session.begin():
-            await session.execute(text(f'GRANT UPDATE ON "{schema}".entity_address_unified TO "{role}"'))
-        async with database.session_factory() as session, session.begin():
-            await _read_transaction(session)
-            before = await _read_settings(session)
-            with pytest.raises(ValueError):
-                await capture.resolve_committed_registry_cms_source_pair(session, pair.recipe)
-            assert await _read_settings(session) == before
-    finally:
-        async with database.session_factory() as session, session.begin():
-            await session.execute(text(f'REVOKE UPDATE ON "{schema}".entity_address_unified FROM "{role}"'))
-
-
-async def _reject_address_write_grant(session, pair, runtime_role):
-    """Both semantic and cheap final validators reject newly opened write custody."""
-    await session.execute(
-        text(f'GRANT UPDATE ON "{pair.address_source.schema_name}".entity_address_unified TO "{runtime_role}"')
-    )
-    with pytest.raises(ValueError):
-        await require_registry_cms_source_pair(session, pair)
-    with pytest.raises(ValueError):
-        await require_registry_cms_source_pair_connection(
-            await capture.native_driver(session), pair, verify_content=False
-        )
-
-
 async def _assert_v1_wire(session, pair):
     """Preserve the exact historical nine-key encoder, hash and native comment."""
     from dataclasses import asdict
@@ -658,7 +626,8 @@ async def _assert_v1_wire(session, pair):
     assert pair.as_dict() == legacy_by_field
     assert pair.pair_sha256 == capture._digest(legacy_by_field)
     comment = await session.scalar(
-        text("SELECT obj_description(:oid,'pg_namespace')"), {"oid": pair.address_ownership.schema_oid}
+        text("SELECT obj_description(oid,'pg_namespace') FROM pg_namespace WHERE nspname=:schema"),
+        {"schema": pair.address_ownership.schema_name},
     )
     assert comment == capture._COMMENT + capture._json(legacy_by_field)
     assert decode_registry_cms_source_pair(json.loads(capture._json(legacy_by_field))) == pair
@@ -674,14 +643,14 @@ async def _reject_v2_tampering(session, pair):
     changes = (
         ((), "unknown", 1),
         (("source",), "schema_name", "foreign_schema"),
-        (("clone",), "schema_oid", pair.address_ownership.schema_oid + 1),
+        (("clone",), "schema_name", pair.address_ownership.schema_name + "_other"),
         (("source",), "catalog_sha256", "0" * 64),
         (("clone",), "catalog_sha256", "0" * 64),
-        (("clone", "sequence"), "sequence_oid", witness["clone"]["sequence"]["sequence_oid"] + 1),
+        (("clone", "sequence"), "sequence_name", "other_sequence"),
         (("source", "sequence", "settings"), "seqincrement", 2),
         (("source", "receipt", "tables", 0), "row_count", 99),
-        (("source", "relation_oids", 0), 1, witness["source"]["relation_oids"][0][1] + 1),
-        (("clone", "relation_oids", 0), 1, witness["clone"]["relation_oids"][0][1] + 1),
+        (("source", "relations", 0), "relation_name", "other_source_relation"),
+        (("clone", "relations", 0), "relation_name", "other_clone_relation"),
         (("source", "ordinals", 0, 1, 0), 2, 99),
     )
     for path, key, changed in changes:
@@ -847,7 +816,9 @@ def _retained_entity_scope(pair, monkeypatch):
     recipe = pair.recipe
 
     async def manifest(*_args, **_kwargs):
-        return PinnedNetworkServingManifest(9, str(uuid4()), "mrf", 1, {}, 7, "c" * 64, 1)
+        return PinnedNetworkServingManifest(
+            9, str(uuid4()), "mrf", 1, {}, 7, "c" * 64, CompactAddressRelation("mrf", "entity_address_unified")
+        )
 
     async def recipes(*_args, **_kwargs):
         return (recipe,)

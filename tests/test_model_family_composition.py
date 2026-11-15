@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Host checks for composition SQL and custody ordering, not PostgreSQL acceptance."""
+"""Host checks for composition scopes, native locks and content ordering."""
 
 import asyncio
 import subprocess
@@ -63,7 +63,6 @@ EFFECTS.__table__ = Table(
     MetaData(),
     Column("system", String, primary_key=True),
     Column("code", String, primary_key=True),
-    Column("destination_oid", postgresql.OID, nullable=False),
     Column("before_image", postgresql.JSONB),
     Column("after_image", postgresql.JSONB),
     Column("baseline_image", postgresql.JSONB),
@@ -94,17 +93,15 @@ def _session():
     async def execute(statement, parameters=None):
         events.append(("execute", str(statement), parameters))
 
-    async def scalar(statement, parameters=None):
+    async def is_empty(statement, parameters=None):
         query = str(statement)
         events.append(("scalar", query, parameters))
-        if query == "SELECT pg_current_xact_id()::text":
-            return "700"
         return query.startswith("SELECT NOT EXISTS(")
 
     return SimpleNamespace(
         events=events,
         execute=execute,
-        scalar=scalar,
+        scalar=is_empty,
         in_transaction=lambda: True,
         commit=AsyncMock(),
         rollback=AsyncMock(),
@@ -129,7 +126,7 @@ def _composition_case(monkeypatch, *, effects=False):
 
     async def verify(_session, observed_spec, observed_ownership, **_options):
         assert (observed_spec, observed_ownership) in ((spec, ownership), (incoming_spec, incoming))
-        session.events.append(("custody", observed_ownership.schema_name))
+        session.events.append(("inventory", observed_ownership.schema_name))
         return observed_ownership
 
     monkeypatch.setattr(archive, "_bounded_capture", _bounded)
@@ -288,7 +285,7 @@ async def test_composition_finishes_entire_family_before_indexes_and_set_checks(
 
 
 @pytest.mark.asyncio
-async def test_composition_locks_and_authenticates_all_custody_before_payloads(monkeypatch):
+async def test_composition_locks_and_validates_complete_named_inputs_before_payloads(monkeypatch):
     case = _composition_case(monkeypatch)
     await _compose(case)
     events = case.session.events
@@ -296,12 +293,18 @@ async def test_composition_locks_and_authenticates_all_custody_before_payloads(m
     assert len(locks) == 3 and locks == sorted(locks)
     assert all(statement.endswith(" NOWAIT") for statement in locks)
     assert sum("ACCESS EXCLUSIVE" in statement for statement in locks) == 1
-    assert sum("IN SHARE MODE" in statement for statement in locks) == 2
+    assert sum("IN ACCESS SHARE MODE" in statement for statement in locks) == 2
     first_copy = next(index for index, event in enumerate(events) if event[0] == "copy")
-    assert sum(event[0] == "custody" for event in events[:first_copy]) == 2
+    assert {event[1] for event in events[:first_copy] if event[0] == "inventory"} == {
+        case.arguments["ownership"].schema_name,
+        case.arguments["incoming"].schema_name,
+    }
     archive.require_native_read_catalog.assert_awaited_once_with(case.session, (10, 11, 20, 31, 32))
     assert archive._incumbent_pairs.await_count == 2
-    assert archive.verify_model_family_stage_ownership.await_count == 5
+    assert {call.args[2].schema_name for call in archive.verify_model_family_stage_ownership.await_args_list[-2:]} == {
+        case.arguments["ownership"].schema_name,
+        case.arguments["incoming"].schema_name,
+    }
 
 
 @pytest.mark.asyncio
@@ -315,8 +318,6 @@ async def test_effect_composition_requires_exact_preimages_and_closed_afterimage
     checks = [event for event in case.session.events if event[0] == "scalar" and "effect.before_image" in event[1]]
     assert len(checks) == 1
     _, validation, parameters = checks[0]
-    assert parameters == {"incumbent_oid": 31}
-    assert "effect.destination_oid IS DISTINCT FROM :incumbent_oid" in validation
     assert "effect.before_image IS DISTINCT FROM pg_catalog.to_jsonb(live)" in validation
     assert (
         "FULL JOIN" in validation and "effect.after_image IS DISTINCT FROM pg_catalog.to_jsonb(incoming)" in validation
@@ -357,17 +358,17 @@ def test_source_scopes_reject_invalid_or_ambiguous_values(monkeypatch, source_va
     assert case.session.events == []
 
 
-@pytest.mark.parametrize("changed", ["key_type", "nullable_oid", "oid_type", "image_type"])
-def test_effect_declarations_require_model_keys_oid_and_json_images(monkeypatch, changed):
+@pytest.mark.parametrize("changed", ["key_type", "missing_before", "missing_after", "image_type"])
+def test_effect_declarations_require_model_keys_and_closed_json_images(monkeypatch, changed):
     case = _composition_case(monkeypatch, effects=True)
     effect_model = _model("altered_effects", EFFECTS)
     columns = effect_model.__table__.c
     if changed == "key_type":
         columns.code.type = String(9)
-    elif changed == "nullable_oid":
-        columns.destination_oid.nullable = True
-    elif changed == "oid_type":
-        columns.destination_oid.type = String()
+    elif changed == "missing_before":
+        effect_model.__table__._columns.remove(columns.before_image)
+    elif changed == "missing_after":
+        effect_model.__table__._columns.remove(columns.after_image)
     else:
         columns.after_image.type = JSON()
     incoming_spec = replace(case.arguments["incoming_spec"], model_types=(INCOMING, effect_model))
@@ -391,18 +392,20 @@ def test_incoming_payload_shape_must_match_declared_output(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["missing", "reordered", "boolean", "absent", "foreign", "same_schema", "same_oid"])
+@pytest.mark.parametrize(
+    "change", ["missing", "reordered", "wrong_name", "absent", "foreign", "same_schema", "incoming_schema"]
+)
 async def test_invalid_incumbent_vectors_fail_before_catalog_access(monkeypatch, change):
     case = _composition_case(monkeypatch)
     incumbent = case.arguments["incumbent"]
     changes_by_name = {
         "missing": {"relation_oids": incumbent.relation_oids[:1]},
         "reordered": {"relation_oids": incumbent.relation_oids[::-1]},
-        "boolean": {"relation_oids": (("catalog_rows", True), ("unchanged_rows", 32))},
+        "wrong_name": {"relation_oids": (("other_rows", 31), ("unchanged_rows", 32))},
         "absent": {"relation_oids": (("catalog_rows", None), ("unchanged_rows", 32))},
         "foreign": {"importer_id": "other-family"},
         "same_schema": {"schema_name": case.arguments["ownership"].schema_name},
-        "same_oid": {"relation_oids": (("catalog_rows", 10), ("unchanged_rows", 32))},
+        "incoming_schema": {"schema_name": case.arguments["incoming"].schema_name},
     }
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="composition"):
         await _compose(case, incumbent=replace(incumbent, **changes_by_name[change]))
@@ -417,7 +420,7 @@ async def test_scope_or_preimage_refusal_never_copies(monkeypatch, effects, obse
     original = case.session.scalar
 
     async def scalar(statement, parameters=None):
-        if parameters and ("sources" in parameters or "incumbent_oid" in parameters):
+        if (parameters and "sources" in parameters) or "effect.before_image" in str(statement):
             return observed
         return await original(statement, parameters)
 
@@ -428,18 +431,20 @@ async def test_scope_or_preimage_refusal_never_copies(monkeypatch, effects, obse
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("boundary", ["candidate", "custody", "catalog", "incumbent"])
+@pytest.mark.parametrize("boundary", ["candidate", "inventory", "catalog", "incumbent"])
 async def test_unsafe_inputs_refuse_before_copy(monkeypatch, boundary):
     case = _composition_case(monkeypatch)
     if boundary == "candidate":
         case.session.scalar = AsyncMock(return_value=True)
-    elif boundary == "custody":
-        archive.verify_model_family_stage_ownership.side_effect = archive.ReferenceFamilyArchiveError("custody differs")
+    elif boundary == "inventory":
+        archive.verify_model_family_stage_ownership.side_effect = archive.ReferenceFamilyArchiveError(
+            "inventory differs"
+        )
     elif boundary == "catalog":
         archive.require_native_read_catalog.side_effect = RuntimeError("catalog differs")
     else:
-        archive._incumbent_pairs.return_value = (("catalog_rows", 99), ("unchanged_rows", 32))
-    with pytest.raises(RuntimeError, match="empty|custody|catalog|incumbent"):
+        archive._incumbent_pairs.return_value = (("catalog_rows", None), ("unchanged_rows", 32))
+    with pytest.raises(RuntimeError, match="empty|inventory|catalog|incumbent"):
         await _compose(case)
     assert case.copies == []
 
@@ -460,11 +465,8 @@ async def test_incomplete_family_never_builds_indexes(monkeypatch, copied):
 async def test_late_changes_never_return_a_completed_candidate(monkeypatch, changed):
     case = _composition_case(monkeypatch)
     original = case.session.scalar
-    transaction_ids = iter(("700", "701" if changed == "transaction" else "700"))
 
     async def scalar(statement, parameters=None):
-        if str(statement) == "SELECT pg_current_xact_id()::text":
-            return next(transaction_ids)
         if changed == "rows" and str(statement).startswith("SELECT NOT EXISTS("):
             return False
         return await original(statement, parameters)
@@ -473,9 +475,21 @@ async def test_late_changes_never_return_a_completed_candidate(monkeypatch, chan
     if changed == "incumbent":
         archive._incumbent_pairs.side_effect = [
             case.arguments["incumbent"].relation_oids,
-            (("catalog_rows", 99), ("unchanged_rows", 32)),
+            (("catalog_rows", None), ("unchanged_rows", 32)),
         ]
-    with pytest.raises(archive.ReferenceFamilyArchiveError, match="candidate rows|transaction or incumbent"):
+    if changed == "transaction":
+        copy_rows = case.arguments["source_copy"].copy_rows
+
+        async def ended_session(*arguments, **options):
+            result = await copy_rows(*arguments, **options)
+            if len(case.copies) == 2:
+                case.session.in_transaction = lambda: False
+            return result
+
+        case.arguments["source_copy"] = archive.ReferenceFamilySourceCopy(ended_session, 7, 30)
+    with pytest.raises(
+        archive.ReferenceFamilyArchiveError, match="candidate rows|transaction or incumbent|caller transaction"
+    ):
         await _compose(case)
     assert len(case.copies) == 2
     case.session.commit.assert_not_awaited()
@@ -511,4 +525,18 @@ async def test_operation_requires_transaction_and_bounded_capability(monkeypatch
         )
     with pytest.raises(archive.ReferenceFamilyArchiveError, match="transaction|capability"):
         await _compose(case, **overrides_by_field)
+    assert case.session.events == [] and case.copies == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["destination", "source"])
+async def test_effect_validation_rejects_foreign_qualified_names_before_payload_reads(monkeypatch, changed):
+    case = _composition_case(monkeypatch, effects=True)
+    live = '"serving"."catalog_rows"' if changed != "destination" else '"other"."catalog_rows"'
+    incoming_schema = case.arguments["incoming"].schema_name
+    incoming = f'"{incoming_schema}"."incoming_catalog"' if changed != "source" else '"other"."incoming_catalog"'
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="effect destination differs"):
+        await composition._validate_composition_effects(
+            case.session, case.contribution, live, incoming, case.arguments["incumbent"], incoming_schema
+        )
     assert case.session.events == [] and case.copies == []

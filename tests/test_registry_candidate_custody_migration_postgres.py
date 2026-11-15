@@ -15,20 +15,19 @@ from process.registry_candidate_custody_preparation import prepare_registry_cand
 from process.registry_management_permissions import (
     RegistryManagementPermissionError,
     install_registry_office_recipe_permissions,
-    verify_registry_management_permissions,
 )
+from tests.test_manual_provider_identity_store_postgres import provider_db as provider_db
+from tests.test_manual_provider_identity_store_postgres import serving_schema as serving_schema
 from tests.test_network_serving_schema_postgres import _candidate
+from tests.test_registry_management_permissions_postgres import permissions_db as permissions_db
 from tests.test_registry_prepared_migrations_postgres import (
     _CHANGES,
     _acl,
     _arguments,
     _maintenance,
     _upgrade,
-    permissions_db,
-    prepared_db,
-    provider_db,
-    serving_schema,
 )
+from tests.test_registry_prepared_migrations_postgres import prepared_db as prepared_db
 
 pytestmark = pytest.mark.asyncio
 
@@ -84,8 +83,6 @@ async def _incumbents(fixture):
 
 async def test_missing_custody_forward_only_then_adoption_and_narrow_enrollment(custody_db):
     fixture = custody_db
-    with pytest.raises(RegistryManagementPermissionError, match="incomplete"):
-        await verify_registry_management_permissions(fixture.connection, **_arguments(fixture))
     with pytest.raises(RuntimeError, match="preparation is missing"):
         await _upgrade(fixture, REVISION, fixture.roles_by_kind["api"])
     before, grants = await _incumbents(fixture), await _acl(fixture)
@@ -119,8 +116,7 @@ async def test_missing_custody_forward_only_then_adoption_and_narrow_enrollment(
     )
     async with _operator(fixture) as connection:
         driver = (await connection.get_raw_connection()).driver_connection
-        installed = await install_registry_office_recipe_permissions(driver, **_arguments(fixture))
-        assert await verify_registry_management_permissions(driver, **_arguments(fixture)) == installed
+        await install_registry_office_recipe_permissions(driver, **_arguments(fixture))
     after = await _acl(fixture)
     owner_oid, api_oid = await fixture.connection.fetchrow(
         "SELECT (SELECT oid FROM pg_roles WHERE rolname=$1),(SELECT oid FROM pg_roles WHERE rolname=$2)",
@@ -137,44 +133,12 @@ async def test_missing_custody_forward_only_then_adoption_and_narrow_enrollment(
     )
 
 
-@pytest.mark.parametrize(
-    "damage", ["default", "constraint", "index", "foreign_key", "public", "extra_reader", "grantable", "column"]
-)
-async def test_custody_incumbent_drift_is_refused_without_repair(custody_db, damage):
-    fixture = custody_db
-    async with _operator(fixture) as connection:
-        await _forward(connection, fixture)
-    table = f'"{fixture.schema}".network_candidate_custody'
-    if damage == "foreign_key":
-        await fixture.connection.execute(
-            f'CREATE TABLE "{fixture.schema}".other_candidate(candidate_id uuid PRIMARY KEY)'
-        )
-    statements_by_damage = {
-        "default": f"ALTER TABLE {table} ALTER COLUMN seal_sha256 SET DEFAULT repeat('a',64)",
-        "constraint": f"ALTER TABLE {table} DROP CONSTRAINT network_custody_digest",
-        "index": f"CREATE INDEX custody_extra_idx ON {table}(created_at)",
-        "foreign_key": f"ALTER TABLE {table} DROP CONSTRAINT network_candidate_custody_candidate_id_fkey; "
-        f'ALTER TABLE {table} ADD CONSTRAINT network_candidate_custody_candidate_id_fkey FOREIGN KEY(candidate_id) REFERENCES "{fixture.schema}".other_candidate(candidate_id)',
-        "public": f"GRANT SELECT ON {table} TO PUBLIC",
-        "extra_reader": f'GRANT SELECT ON {table} TO "{fixture.roles_by_kind["ancestor"]}"',
-        "grantable": f'GRANT SELECT ON {table} TO "{fixture.roles_by_kind["api"]}" WITH GRANT OPTION',
-        "column": f'GRANT SELECT(candidate_id) ON {table} TO "{fixture.roles_by_kind["api"]}"',
-    }
-    await fixture.connection.execute(statements_by_damage[damage])
-    before = await _incumbents(fixture), await _acl(fixture)
-    with pytest.raises(RuntimeError, match="preparation"):
-        await _upgrade(fixture, REVISION, fixture.roles_by_kind["api"])
-    async with _operator(fixture) as connection:
-        with pytest.raises(RuntimeError, match="preparation"):
-            await _forward(connection, fixture)
-    assert (await _incumbents(fixture), await _acl(fixture)) == before
-
-
 async def test_custody_preparation_refuses_ordinary_owner_and_active_candidate_writer(custody_db):
     fixture = custody_db
     before = await _incumbents(fixture), await _acl(fixture)
     async with _operator(fixture, ordinary=True) as connection:
-        with pytest.raises(RegistryManagementPermissionError, match="cannot assume"):
+        # PostgreSQL itself refuses the ordinary operator's switch to the owner role.
+        with pytest.raises(asyncpg.InsufficientPrivilegeError, match="permission denied to set role"):
             await _forward(connection, fixture)
     async with fixture.connection.transaction():
         await fixture.connection.execute(

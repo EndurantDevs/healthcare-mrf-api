@@ -2,13 +2,18 @@
 """Publication receipts fail closed when durable identities change."""
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
+from dataclasses import replace
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+from uuid import UUID
 
 import pytest
 
 from process import mrf_address_publication as address
 from process import mrf_publication_receipt as receipt
+from process import reference_family_result_generation as authority
 
 
 def _result(value):
@@ -20,7 +25,13 @@ def _result(value):
 
 
 def _publication(monkeypatch):
-    generation = SimpleNamespace(relation_oids=(11,), as_dict=lambda: {"generation": 1})
+    generation = authority.ReferenceFamilyResultGenerationAuthority(
+        "mrf",
+        str(UUID(int=1)),
+        1,
+        authority.ReferenceFamilyServingGeneration(str(UUID(int=2)), 3, datetime(2026, 1, 1, tzinfo=timezone.utc)),
+        authority.declared_reference_family_relations("mrf", "synthetic"),
+    )
     address_content_map = {"archive_oid": 12, "tables": {"mrf_address": {"uncovered": 0}}}
     publication_row_map = {
         "contract_version": 1,
@@ -77,7 +88,7 @@ async def test_pending_claim_cannot_replace_an_existing_pending_writer(monkeypat
         ("execution", "explicit boolean"),
         ("inputs", "summary inputs changed"),
         ("generation", "generation changed"),
-        ("oids", "generation changed"),
+        ("relations", "generation changed"),
         ("claim", "claim changed"),
     ],
 )
@@ -86,8 +97,11 @@ async def test_completion_rejects_changed_publication_authority(monkeypatch, fai
     session = SimpleNamespace(execute=AsyncMock(side_effect=[_result(14), _result(None)]))
     if failure == "generation":
         monkeypatch.setattr(receipt, "read_reference_family_result_generation_authority", AsyncMock(return_value=None))
-    if failure == "oids":
-        monkeypatch.setattr(receipt, "current_reference_family_relation_oids", AsyncMock(return_value=(99,)))
+    if failure == "relations":
+        changed = replace(generation, relations=(("other", "plan"),))
+        monkeypatch.setattr(
+            receipt, "read_reference_family_result_generation_authority", AsyncMock(return_value=changed)
+        )
     with pytest.raises((ValueError, RuntimeError), match=message):
         await receipt.complete_publication(
             session,
@@ -128,21 +142,24 @@ async def test_completion_rejects_non_boolean_fixed_summary_selection(monkeypatc
         ("version", "completion is unavailable"),
         ("pending", "completion is unavailable"),
         ("generation", "generation differs"),
-        ("oids", "generation differs"),
+        ("relations", "generation differs"),
         ("summary", "summary identity differs"),
         ("address", "address content differs"),
     ],
 )
 async def test_export_admission_rechecks_all_completed_identities(monkeypatch, failure, message):
-    _, row = _publication(monkeypatch)
+    generation, row = _publication(monkeypatch)
     if failure == "version":
         row["contract_version"] = 2
     if failure == "pending":
         row["state"] = "pending"
     if failure == "generation":
         row["generation"] = {}
-    if failure == "oids":
-        monkeypatch.setattr(receipt, "current_reference_family_relation_oids", AsyncMock(return_value=(99,)))
+    if failure == "relations":
+        changed = replace(generation, relations=(("other", "plan"),))
+        monkeypatch.setattr(
+            receipt, "read_reference_family_result_generation_authority", AsyncMock(return_value=changed)
+        )
     if failure == "summary":
         row["summary_oid"] = 99
     if failure == "address":
@@ -167,3 +184,55 @@ async def test_missing_canonical_archive_records_uncovered_addresses(monkeypatch
     session.execute.assert_not_awaited()
     with pytest.raises(RuntimeError, match="coverage is incomplete"):
         address.require_address_coverage(content)
+
+
+@pytest.mark.parametrize("edition", ["named", "legacy"])
+@pytest.mark.parametrize(
+    "change", [None, "local", "origin", "lineage", "relations", "mixed", "boolean", "serving", "shape"]
+)
+def test_generation_documents_keep_logical_data_and_opaque_history(monkeypatch, edition, change):
+    generation, _row = _publication(monkeypatch)
+    expected = generation.as_dict()
+    document = deepcopy(expected)
+    if edition == "legacy":
+        document["relation_oids"] = ["opaque prior token"] * len(document.pop("relations"))
+    match change:
+        case "local":
+            document["local_generation"] += 1
+        case "origin":
+            document["serving_generation"]["origin_generation"] += 1
+        case "lineage":
+            document["local_lineage_id"] = str(UUID(int=3))
+        case "relations":
+            expected["relations"][0]["schema_name"] = "other"
+        case "mixed":
+            document["relations" if edition == "legacy" else "relation_oids"] = []
+        case "boolean":
+            document["local_generation"] = True
+        case "serving":
+            document["serving_generation"]["origin_generation"] = True
+        case "shape":
+            if edition == "legacy":
+                document["relation_oids"] = {}
+            else:
+                document["relations"][0]["relation_name"] = "other"
+    before = deepcopy(document)
+    assert receipt._is_reference_generation_current(document, expected, "synthetic") is (change is None)
+    assert document == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edition", ["named", "legacy"])
+async def test_completed_receipt_preserves_raw_generation_edition(monkeypatch, edition):
+    generation, row = _publication(monkeypatch)
+    if edition == "legacy":
+        row["generation"]["relation_oids"] = ["opaque prior token"] * len(row["generation"].pop("relations"))
+    before = deepcopy(row)
+    session = SimpleNamespace(
+        in_transaction=lambda: True, execute=AsyncMock(side_effect=[_result(10), _result(row), None, _result(14)])
+    )
+    assert (await receipt.require_completed_publication(session, "synthetic"))["generation"] == row["generation"]
+    assert row == before
+    receipt.current_reference_family_relation_oids.assert_awaited_once_with(
+        session, importer_id="mrf", schema_name="synthetic"
+    )

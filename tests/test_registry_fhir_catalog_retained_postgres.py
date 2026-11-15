@@ -11,9 +11,7 @@ from uuid import UUID, uuid4, uuid5
 import pytest
 
 from process import network_fhir_retained_capture as captures
-from process import registry_fhir_catalog_retained as retained
 from process import registry_fhir_catalog_sync as catalog_sync
-from process.network_fhir_retained_capture_contract import RetainedFHIRCaptureError
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
 from process.network_source_binding_store import NetworkSourceBindingBatchCommand, apply_network_source_binding_batch
@@ -35,18 +33,23 @@ from process.registry_fhir_catalog_publication import (
 from process.registry_fhir_catalog_read import FHIRCatalogQuery, read_fhir_catalog
 from process.registry_fhir_catalog_registry_reader import (
     fhir_catalog_registry_reads,
-    verify_fhir_catalog_registry_reads,
 )
 from process.registry_fhir_catalog_sources import fhir_catalog_source_generation
-from process.registry_fhir_catalog_store import discard_fhir_catalog_candidate
+from process.registry_fhir_catalog_store import load_named_catalog_preparation
 from process.registry_fhir_catalog_sync import prepare_fhir_catalog_snapshot
 from process.registry_publication_queue import claim_registry_publication_request
 from tests import test_network_fhir_retained_capture_postgres as retained_fixtures
 from tests.fhir_catalog_registry_reader_support import configured_catalog_reader
+from tests.registry_named_preparation_postgres_support import (
+    cleanup_registry_network_preparations,
+    freeze_named_preparation,
+    network_publication_lifecycle,
+)
 from tests.test_network_fhir_retained_capture_postgres import _approved_capture_recipe, _capture, _retained_addresses
 from tests.test_network_fhir_retained_capture_postgres import legacy_capture_db as legacy_capture_db
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_approval_store_postgres import _actor, _approve, _command, _create, _draft
+from tests.test_registry_fhir_catalog_custody_postgres import cleanup_catalog_preparations, metadata_preparation_roles
 from tests.test_registry_fhir_catalog_custody_postgres import metadata_custody as metadata_custody
 from tests.test_registry_fhir_catalog_retained import descriptor_fixture
 
@@ -57,9 +60,6 @@ async def test_catalog_pages_use_retained_heap_and_one_content_admission(legacy_
     capture = await _capture(fixture)
     disposition, recipe, _ = await descriptor_fixture(monkeypatch, value=capture)
     reader = await fixture.connect("reader")
-    disposition.descriptor["database_oid"] = await reader.fetchval(
-        "SELECT oid::bigint FROM pg_database WHERE datname=current_database()"
-    )
     original = captures.require_retained_fhir_capture
     admissions = []
 
@@ -69,7 +69,7 @@ async def test_catalog_pages_use_retained_heap_and_one_content_admission(legacy_
 
     monkeypatch.setattr(captures, "require_retained_fhir_capture", verify)
     async with reader.transaction(isolation="repeatable_read", readonly=True):
-        pin = await retained.pin_retained_fhir_catalog_source(reader, disposition.descriptor)
+        pin = await captures.pin_retained_fhir_read(reader, capture)
         resource_rows = [
             resource_row
             async for page in iter_fhir_catalog_pages(
@@ -77,43 +77,32 @@ async def test_catalog_pages_use_retained_heap_and_one_content_admission(legacy_
                 schema_name=recipe.source_pin.read_schema_name,
                 dataset_id=recipe.source_pin.dataset_id,
                 page_rows=1,
-                source_read=pin,
+                resource_relation=disposition.descriptor["tables"]["resource"],
             )
             for resource_row in page
         ]
-        await pin.verify(reader, capture)
+        pin.require_ready(capture)
         assert resource_rows and any(resource_row["resource_type"] == "Organization" for resource_row in resource_rows)
         batch = extract_fhir_catalog_batch(tuple(resource_rows), profile="retained_normalized")
         assert batch.organizations and batch.edges
         assert admissions.count(True) == 1
-        assert admissions.count(False) >= len(resource_rows) + 1
-        with pytest.raises(FHIRCatalogExtractionError, match="retained_read_changed"):
+        assert admissions == [True]
+        with pytest.raises(FHIRCatalogExtractionError):
             async for _ in iter_fhir_catalog_pages(
                 reader,
-                schema_name=recipe.source_pin.schema_name,
+                schema_name=recipe.source_pin.read_schema_name,
                 dataset_id=recipe.source_pin.dataset_id,
-                source_read=pin,
+                resource_relation=capture.origin.resource_relation,
             ):
                 pytest.fail("an original mutable source heap was accepted")
-    async with reader.transaction(isolation="repeatable_read", readonly=True):
-        with pytest.raises(RetainedFHIRCaptureError):
-            await pin.verify(reader, capture)
-
-
-async def test_catalog_capture_pin_rejects_database_identity_before_content(legacy_capture_db, monkeypatch):
-    fixture = legacy_capture_db
-    capture = await _capture(fixture)
-    disposition, _, _ = await descriptor_fixture(monkeypatch, value=capture)
-    reader = await fixture.connect("reader")
-    disposition.descriptor["database_oid"] = 1 + await reader.fetchval(
-        "SELECT oid::bigint FROM pg_database WHERE datname=current_database()"
-    )
-    pinner = AsyncMock()
-    monkeypatch.setattr(retained, "pin_retained_fhir_read", pinner)
-    async with reader.transaction(isolation="repeatable_read", readonly=True):
-        with pytest.raises(retained.FHIRCatalogRetainedError):
-            await retained.pin_retained_fhir_catalog_source(reader, disposition.descriptor)
-    pinner.assert_not_awaited()
+    with pytest.raises(FHIRCatalogExtractionError, match="transaction_required"):
+        async for _ in iter_fhir_catalog_pages(
+            reader,
+            schema_name=recipe.source_pin.read_schema_name,
+            dataset_id=recipe.source_pin.dataset_id,
+            resource_relation=disposition.descriptor["tables"]["resource"],
+        ):
+            pytest.fail("a catalog page escaped its reader transaction")
 
 
 @asynccontextmanager
@@ -168,7 +157,7 @@ def catalog_organization_capture(source_organization_inputs, legacy_capture_db):
 
 
 async def _publish_retained_membership(fixture, serving, recipe, approved, addresses, expected_head):
-    connection, control, _ = serving
+    connection, control, engine = serving
     previous = None
     if expected_head:
         async with connection.transaction(isolation="repeatable_read", readonly=True):
@@ -197,9 +186,17 @@ async def _publish_retained_membership(fixture, serving, recipe, approved, addre
             source_manifest=previous,
             control_schema=control,
         )
-        await prepare_and_publish_network_candidate(
-            connection, copy_target, candidate_addresses, **roles_by_kind, control_schema=control
-        )
+        fixture.membership_preparation_ids.append(copy_target.candidate_id)
+        runtime = SimpleNamespace(connection=connection, control_schema=control, engine=engine)
+        async with network_publication_lifecycle(runtime, fixture.membership_preparation_roles) as lifecycle:
+            await prepare_and_publish_network_candidate(
+                connection,
+                copy_target,
+                candidate_addresses,
+                **roles_by_kind,
+                control_schema=control,
+                seal_candidate=lifecycle.seal_candidate,
+            )
         async with connection.transaction(isolation="repeatable_read", readonly=True):
             return await resolve_network_serving_manifest(connection, control_schema=control)
     finally:
@@ -237,7 +234,6 @@ async def _publish_catalog(connection, config, source_pool, snapshot, previous):
             request_id=UUID(queued["request_id"]),
             control_schema=config.grant.control_schema,
         )
-        await verify_fhir_catalog_registry_reads()
     return await complete_queued_fhir_catalog_publication(
         connection,
         claimed["request_id"],
@@ -246,10 +242,31 @@ async def _publish_catalog(connection, config, source_pool, snapshot, previous):
         verify_sources=runtime.verify_sources,
         source_fence=runtime.source_fence,
         control_schema=config.grant.control_schema,
+        preparation_roles=config.preparation_roles,
     )
 
 
-async def _retained_catalog_config(source, metadata, serving, *, retained_sources=()):
+async def _prepare_catalog_snapshot(config, loader, source_pool, sealer_pool):
+    """Resume the exact persisted candidate after its genuine administrator freeze."""
+    result = await prepare_fhir_catalog_snapshot(config, loader, source_pool, sealer_pool)
+    snapshot, _previous, accounting = result
+    if snapshot is not None and snapshot["schema_name"] not in config.schemas:
+        config.schemas.append(snapshot["schema_name"])
+    if snapshot is None or accounting.get("preparation_state") != "handed_off":
+        return result
+    async with sealer_pool.acquire() as sealer, sealer.transaction():
+        from process.registry_fhir_catalog_store import catalog_snapshot_preparation
+
+        candidate_id = catalog_snapshot_preparation(snapshot)["target"]["candidate_id"]
+        handoff = await load_named_catalog_preparation(sealer, candidate_id, control_schema=config.grant.control_schema)
+    assert handoff is not None
+    await freeze_named_preparation(config.admin_engine, handoff, config.preparation_roles)
+    result = await prepare_fhir_catalog_snapshot(config, loader, source_pool, sealer_pool)
+    assert result[2]["preparation_state"] == "validated"
+    return result
+
+
+async def _retained_catalog_config(source_fixture, metadata, serving, *, retained_sources=()):
     """Configure fixture metadata roles without granting any Source write authority."""
     connection, control, _ = serving
     metadata.control_schema = control
@@ -264,10 +281,24 @@ async def _retained_catalog_config(source, metadata, serving, *, retained_source
     config = SimpleNamespace(
         grant=grant,
         loader_role=metadata.roles["loader"],
-        reader_roles=(source.role_by_kind["reader"],),
+        reader_roles=(source_fixture.role_by_kind["reader"],),
         consumer=SimpleNamespace(physical_owner_role=metadata.roles["owner"]),
+        preparation_roles={
+            **metadata_preparation_roles(metadata),
+            "application_roles": sorted(
+                {*metadata_preparation_roles(metadata)["application_roles"], source_fixture.role_by_kind["reader"]}
+            ),
+        },
+        admin_engine=metadata.engine,
+        schemas=metadata.schemas,
     )
-    reader = await source.connect("reader")
+    await connection.execute(
+        f'GRANT UPDATE(custody_json,accounting_json) ON "{control}".registry_fhir_catalog_snapshot TO "{metadata.roles["publisher"]}"'
+    )
+    await connection.execute(
+        f'GRANT DELETE ON "{control}".registry_fhir_catalog_snapshot TO "{metadata.roles["publisher"]}"'
+    )
+    reader = await source_fixture.connect("reader")
     return (
         config,
         reader,
@@ -280,24 +311,31 @@ async def _retained_catalog_config(source, metadata, serving, *, retained_source
 async def _retained_roundtrip_case(source_fixture, serving, metadata, *, attach_directory=True):
     """Own real capture, recipe and metadata resources through both publications."""
     connection, control, _ = serving
-    capture = await _capture(source_fixture)
-    recipe, approved, canonical_id = await _approved_capture_recipe(source_fixture, serving, capture)
-    canonical_name = await connection.fetchval(
-        f"SELECT record_json->>'display_name' FROM \"{control}\".registry_approved_record "
-        "WHERE approved_revision=$1 AND record_kind='network' AND record_key=$2",
-        approved.approved_revision,
-        str(canonical_id),
-    )
-    addresses = manifest = None
-    if attach_directory:
-        addresses = await _retained_addresses(source_fixture, serving)
-        for extension in ("intarray", "btree_gin", "postgis"):
-            await connection.execute(f"CREATE EXTENSION IF NOT EXISTS {extension}")
-        manifest = await _publish_retained_membership(source_fixture, serving, recipe, approved, addresses, 0)
-    config, reader, source_pool, sealer_pool = await _retained_catalog_config(
-        source_fixture, metadata, serving, retained_sources=() if attach_directory else (recipe,)
-    )
+    source_fixture.membership_preparation_ids = []
+    source_fixture.membership_preparation_roles = {
+        **metadata_preparation_roles(metadata),
+        "application_roles": sorted(
+            set(metadata_preparation_roles(metadata)["application_roles"]) | set(source_fixture.role_by_kind.values())
+        ),
+    }
     try:
+        capture = await _capture(source_fixture)
+        recipe, approved, canonical_id = await _approved_capture_recipe(source_fixture, serving, capture)
+        canonical_name = await connection.fetchval(
+            f"SELECT record_json->>'display_name' FROM \"{control}\".registry_approved_record "
+            "WHERE approved_revision=$1 AND record_kind='network' AND record_key=$2",
+            approved.approved_revision,
+            str(canonical_id),
+        )
+        addresses = manifest = None
+        if attach_directory:
+            addresses = await _retained_addresses(source_fixture, serving)
+            for extension in ("intarray", "btree_gin", "postgis"):
+                await connection.execute(f"CREATE EXTENSION IF NOT EXISTS {extension}")
+            manifest = await _publish_retained_membership(source_fixture, serving, recipe, approved, addresses, 0)
+        config, reader, source_pool, sealer_pool = await _retained_catalog_config(
+            source_fixture, metadata, serving, retained_sources=() if attach_directory else (recipe,)
+        )
         with pytest.MonkeyPatch.context() as settings:
             async with configured_catalog_reader(
                 settings, source_fixture.dsn, source_fixture.role_by_kind["reader"], source_fixture.role_password
@@ -320,11 +358,8 @@ async def _retained_roundtrip_case(source_fixture, serving, metadata, *, attach_
                     sealer_pool=sealer_pool,
                 )
     finally:
-        schemas = await connection.fetch(
-            "SELECT nspname FROM pg_namespace WHERE nspowner=ANY(SELECT oid FROM pg_roles WHERE rolname=ANY($1::text[]))",
-            [metadata.roles["loader"], metadata.roles["owner"]],
-        )
-        metadata.schemas.extend(entry["nspname"] for entry in schemas if entry["nspname"] not in metadata.schemas)
+        await cleanup_catalog_preparations(connection, metadata.schemas)
+        await cleanup_registry_network_preparations(connection, source_fixture.membership_preparation_ids, control)
 
 
 async def _retained_source_row(case, snapshot, generation):
@@ -433,7 +468,7 @@ async def _product_sealer_read_access(case, metadata):
 
 
 async def _publish_reviewed_products(case, products):
-    snapshot, previous, accounting = await prepare_fhir_catalog_snapshot(
+    snapshot, previous, accounting = await _prepare_catalog_snapshot(
         case.config, case.connection, case.source_pool, case.sealer_pool
     )
     assert previous is None
@@ -485,16 +520,81 @@ async def test_reviewed_retained_products_publish_through_native_sealer(
         products = await _approve_catalog_products(case)
         snapshot = await _publish_reviewed_products(case, products)
         assert case.sealer_pool.get_size() == case.sealer_pool.get_max_size() == 2
-        replay, previous, _ = await prepare_fhir_catalog_snapshot(
+        replay, previous, _ = await _prepare_catalog_snapshot(
             case.config, case.connection, case.source_pool, case.sealer_pool
         )
         assert replay is None and previous["metadata_generation"] == snapshot["metadata_generation"]
+
+
+async def _damage_product_candidate(case, target, damage, products):
+    """Change candidate data before its freeze; the seal must refuse it."""
+    namespace = '"' + target.schema_name + '"'
+    if damage == "omitted_products":
+        await case.connection.execute(
+            f"DELETE FROM {namespace}.registry_fhir_catalog_relationship WHERE binding_id=ANY($1::uuid[])",
+            [UUID(product["binding_id"]) for product in products],
+        )
+        await case.connection.execute(
+            f"DELETE FROM {namespace}.registry_fhir_catalog_binding WHERE document_json->'source_scope' ? 'insurance_plan_id'"
+        )
+        return
+    assert (
+        await case.connection.execute(
+            f"UPDATE {namespace}.registry_fhir_catalog_observation SET document_json="
+            "jsonb_set(document_json,'{plan_name}','\"Changed retained plan\"'::jsonb) "
+            "WHERE resource_type='InsurancePlan' AND resource_id='plan-one' AND observation_kind='edge'"
+        )
+        == "UPDATE 2"
+    )
+
+
+async def _assert_refused_candidate_abandoned(case, target):
+    """Refusal abandons the named preparation and frees its generation's checkpoint."""
+    preparation = await case.connection.fetchrow(
+        "SELECT state,cancellation_requested,abandonment_sha256 FROM hp_snapshot_retention.preparation "
+        "WHERE preparation_id=$1",
+        UUID(target.candidate_id),
+    )
+    assert preparation["state"] == "abandoned" and preparation["cancellation_requested"]
+    assert preparation["abandonment_sha256"] is not None
+    assert not await case.connection.fetchval(
+        f'SELECT EXISTS(SELECT FROM "{case.control}".registry_fhir_catalog_snapshot WHERE schema_name=$1)',
+        target.schema_name,
+    )
+
+
+async def _rerun_builds_new_candidate(case, refused):
+    """A rerun of the same metadata generation validates a new candidate instead of resuming."""
+    rerun, _previous, accounting = await _prepare_catalog_snapshot(
+        case.config, case.connection, case.source_pool, case.sealer_pool
+    )
+    assert rerun["schema_name"] != refused.schema_name
+    assert accounting["preparation_state"] == "validated"
+    return rerun
+
+
+async def _retire_abandoned_catalog_candidate(case, target):
+    """Administrator cleanup drops the abandoned candidate tables and its preparation records."""
+    handoff = await case.connection.fetchval(
+        "SELECT handoff->>'storage_schema' FROM hp_snapshot_retention.preparation "
+        "WHERE preparation_id=$1 AND state='abandoned'",
+        UUID(target.candidate_id),
+    )
+    assert handoff == target.schema_name
+    await case.connection.execute(f'DROP SCHEMA "{handoff}" CASCADE')
+    await cleanup_catalog_preparations(case.connection, [handoff])
+    assert await case.connection.fetchval("SELECT to_regnamespace($1)", handoff) is None
+    assert not await case.connection.fetchval(
+        "SELECT EXISTS(SELECT FROM hp_snapshot_retention.preparation WHERE preparation_id=$1)",
+        UUID(target.candidate_id),
+    )
 
 
 @pytest.mark.parametrize("damage", ["omitted_products", "fresh_observation", "carried_observation"])
 async def test_reviewed_retained_product_seal_rejects_untrusted_candidate(
     reviewed_product_capture, serving_schema, metadata_custody, monkeypatch, damage
 ):
+    """Seal-time content validation refuses omitted reviewed products and changed observations."""
     async with _retained_roundtrip_case(
         reviewed_product_capture, serving_schema, metadata_custody, attach_directory=False
     ) as case:
@@ -510,97 +610,85 @@ async def test_reviewed_retained_product_seal_rejects_untrusted_candidate(
         changed_candidates = []
 
         async def corrupt_then_seal(config, target, snapshot, pool, *, source_pool=None):
-            changed_candidates.append(target)
-            namespace = '"' + target.schema_name + '"'
-            if previous:
-                assert snapshot["source_vector_json"] == previous["source_vector_json"]
-            if damage == "omitted_products":
-                await case.connection.execute(
-                    f"DELETE FROM {namespace}.registry_fhir_catalog_relationship WHERE binding_id=ANY($1::uuid[])",
-                    [UUID(product["binding_id"]) for product in products],
-                )
-                await case.connection.execute(
-                    f"DELETE FROM {namespace}.registry_fhir_catalog_binding WHERE document_json->'source_scope' ? 'insurance_plan_id'"
-                )
-            else:
-                assert (
-                    await case.connection.execute(
-                        f"UPDATE {namespace}.registry_fhir_catalog_observation SET document_json="
-                        "jsonb_set(document_json,'{plan_name}','\"Changed retained plan\"'::jsonb) "
-                        "WHERE resource_type='InsurancePlan' AND resource_id='plan-one' AND observation_kind='edge'"
-                    )
-                    == "UPDATE 2"
-                )
-            await real_seal(config, target, snapshot, pool, source_pool=source_pool)
+            # Damage only the first candidate, once, before its freeze; the rerun's new candidate stays intact.
+            if not changed_candidates:
+                changed_candidates.append(target)
+                if previous:
+                    assert snapshot["source_vector_json"] == previous["source_vector_json"]
+                await _damage_product_candidate(case, target, damage, products)
+            return await real_seal(config, target, snapshot, pool, source_pool=source_pool)
 
         monkeypatch.setattr(catalog_sync, "_seal_catalog_snapshot", corrupt_then_seal)
         message = "observed_projection_changed" if damage == "omitted_products" else "observation_facts_changed"
         with pytest.raises(ValueError, match=message):
-            await prepare_fhir_catalog_snapshot(case.config, case.connection, case.source_pool, case.sealer_pool)
+            await _prepare_catalog_snapshot(case.config, case.connection, case.source_pool, case.sealer_pool)
         assert len(changed_candidates) == 1
-        async with metadata_custody.loader.transaction():
-            assert await discard_fhir_catalog_candidate(
-                metadata_custody.loader,
-                changed_candidates[0],
-                loader_role=case.config.loader_role,
-                control_schema=case.control,
-            )
-        assert await case.connection.fetchval("SELECT to_regnamespace($1)", changed_candidates[0].schema_name) is None
+        await _assert_refused_candidate_abandoned(case, changed_candidates[0])
+        await _rerun_builds_new_candidate(case, changed_candidates[0])
+        await _retire_abandoned_catalog_candidate(case, changed_candidates[0])
         assert await case.connection.fetchval(
             f'SELECT metadata_generation FROM "{case.control}".network_serving_control WHERE id=1'
         ) == (previous["metadata_generation"] if previous else None)
 
 
+async def _approve_legacy_product_scope(case):
+    """Keep the binding's old organization scope distinct from its typed plan key."""
+    actor = _actor()
+    network = await _draft(case.serving[2], case.control, _create("network"), actor)
+    binding_input_by_key = {
+        "binding_id": str(uuid4()),
+        **asdict(case.recipe.binding_coordinates),
+        "source_key": "InsurancePlan/plan-one",
+        "source_scope_json": {"organization_id": "network-two", "capture_sha256": case.capture.capture_sha256},
+        "network_id": network["record_id"],
+        "evidence_id": "reviewed-legacy-scope",
+        "evidence_sha256": "e" * 64,
+        "operation": "bind",
+        "expected_revision": 0,
+        "expected_network_id": None,
+    }
+    async with case.connection.transaction():
+        binding = (
+            await apply_network_source_binding_batch(
+                case.connection,
+                NetworkSourceBindingBatchCommand(
+                    json.dumps([binding_input_by_key]).encode(), "Retain exact legacy scope", uuid4().hex
+                ),
+                actor,
+                control_schema=case.control,
+            )
+        )["records"][0]
+    await _approve(
+        case.connection, case.control, await _command(case.connection, case.control, network, binding), actor
+    )
+
+
 async def test_typed_plan_key_without_product_scope_cannot_bypass_sealing(
     reviewed_product_capture, serving_schema, metadata_custody, monkeypatch
 ):
+    """Reject a typed key whose retained scope omits the reviewed product on both attempts."""
     async with _retained_roundtrip_case(
         reviewed_product_capture, serving_schema, metadata_custody, attach_directory=False
     ) as case:
         await _product_sealer_read_access(case, metadata_custody)
-        actor = _actor()
-        network = await _draft(case.serving[2], case.control, _create("network"), actor)
-        binding_input_by_key = {
-            "binding_id": str(uuid4()),
-            **asdict(case.recipe.binding_coordinates),
-            "source_key": "InsurancePlan/plan-one",
-            "source_scope_json": {"organization_id": "network-two", "capture_sha256": case.capture.capture_sha256},
-            "network_id": network["record_id"],
-            "evidence_id": "reviewed-legacy-scope",
-            "evidence_sha256": "e" * 64,
-            "operation": "bind",
-            "expected_revision": 0,
-            "expected_network_id": None,
-        }
-        async with case.connection.transaction():
-            binding = (
-                await apply_network_source_binding_batch(
-                    case.connection,
-                    NetworkSourceBindingBatchCommand(
-                        json.dumps([binding_input_by_key]).encode(), "Retain exact legacy scope", uuid4().hex
-                    ),
-                    actor,
-                    control_schema=case.control,
-                )
-            )["records"][0]
-        await _approve(
-            case.connection, case.control, await _command(case.connection, case.control, network, binding), actor
-        )
-        omitted = AsyncMock(return_value={"binding": 0, "relationship": 0})
-        monkeypatch.setattr(catalog_sync, "project_reviewed_fhir_catalog_products", omitted)
+        await _approve_legacy_product_scope(case)
+        omitted_projection = AsyncMock(return_value={"binding": 0, "relationship": 0})
+        monkeypatch.setattr(catalog_sync, "project_reviewed_fhir_catalog_products", omitted_projection)
         with pytest.raises(ValueError) as refused:
-            await prepare_fhir_catalog_snapshot(case.config, case.connection, case.source_pool, case.sealer_pool)
+            await _prepare_catalog_snapshot(case.config, case.connection, case.source_pool, case.sealer_pool)
         assert refused.value.args == ("registry_fhir_catalog_product_unavailable",)
-        omitted.assert_awaited_once()
-        candidate = omitted.await_args.args[1]
-        async with metadata_custody.loader.transaction():
-            assert await discard_fhir_catalog_candidate(
-                metadata_custody.loader,
-                candidate,
-                loader_role=case.config.loader_role,
-                control_schema=case.control,
-            )
-        assert await case.connection.fetchval("SELECT to_regnamespace($1)", candidate.schema_name) is None
+        omitted_projection.assert_awaited_once()
+        candidate = omitted_projection.await_args.args[1]
+        await _assert_refused_candidate_abandoned(case, candidate)
+        # The rerun builds a new candidate instead of resuming the abandoned one, and sealing refuses it too.
+        with pytest.raises(ValueError) as rerun_refused:
+            await _prepare_catalog_snapshot(case.config, case.connection, case.source_pool, case.sealer_pool)
+        assert rerun_refused.value.args == refused.value.args
+        rerun = omitted_projection.await_args.args[1]
+        assert omitted_projection.await_count == 2 and rerun.schema_name != candidate.schema_name
+        await _assert_refused_candidate_abandoned(case, rerun)
+        for refused_candidate in (candidate, rerun):
+            await _retire_abandoned_catalog_candidate(case, refused_candidate)
         assert (
             await case.connection.fetchval(
                 f'SELECT metadata_generation FROM "{case.control}".network_serving_control WHERE id=1'
@@ -627,7 +715,7 @@ async def _assert_retained_catalog_page(case):
 
 async def _initial_retained_catalog(case):
     """Stage, seal, publish and query the first genuinely admitted retained recipe."""
-    snapshot, previous, accounting = await prepare_fhir_catalog_snapshot(
+    snapshot, previous, accounting = await _prepare_catalog_snapshot(
         case.config, case.connection, case.source_pool, case.sealer_pool
     )
     assert previous is None and accounting["accepted_sources"] == 1
@@ -661,7 +749,7 @@ async def _replace_retained_manifest(case):
 
 async def _assert_cached_retained_catalog(case, first, manifest):
     """Reuse facts across manifest retirement while preserving source identity and timestamp."""
-    snapshot, previous, accounting = await prepare_fhir_catalog_snapshot(
+    snapshot, previous, accounting = await _prepare_catalog_snapshot(
         case.config, case.connection, case.source_pool, case.sealer_pool
     )
     assert snapshot["source_vector_json"] == first.snapshot["source_vector_json"]
@@ -731,7 +819,7 @@ async def test_granted_capture_catalog_publishes_and_replays_without_directory(
             )
             is None
         )
-        snapshot, previous, _ = await prepare_fhir_catalog_snapshot(
+        snapshot, previous, _ = await _prepare_catalog_snapshot(
             case.config, case.connection, case.source_pool, case.sealer_pool
         )
         assert snapshot is None and previous["metadata_generation"] == first.snapshot["metadata_generation"]

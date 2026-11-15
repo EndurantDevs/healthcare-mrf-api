@@ -13,8 +13,6 @@ from db.connection import db
 from process.provider_directory_dataset_scoped_publication import (
     EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
     exact_current_matches_root,
-    exact_uhc_dataset_pair,
-    lock_exact_current_dataset,
 )
 from process.provider_directory_rooted_graph_identity import SHA256_PATTERN
 from process.provider_directory_rooted_graph_store_contract import (
@@ -66,7 +64,9 @@ def _schema() -> str:
 
 
 def _table(name: str) -> str:
-    return f'"{_schema()}"."{name}"'
+    from process.provider_directory_rooted_graph_store_support import table_ref
+
+    return table_ref(name)
 
 
 def _row_fields(row: Any) -> dict[str, Any]:
@@ -114,15 +114,23 @@ async def _lock_roots(
     first_id, second_id = sorted(acquisition_ids)
     if first_id == second_id:
         raise ProviderDirectoryRootedGraphTwinError("identity")
-    rows = await database.all(
-        f"SELECT {', '.join(_ROOT_COLUMNS)}, status, rooted_graph_complete, "
-        "endpoint_collection_complete, endpoint_complete, sealed_at "
-        f"FROM {_table(ACQUISITION_TABLE)} WHERE acquisition_id IN "
-        "(:first_id, :second_id) ORDER BY acquisition_id FOR SHARE;",
-        first_id=first_id,
-        second_id=second_id,
-    )
-    roots = tuple(_root_from_row(row) for row in rows)
+    from db.plan_release_storage import storage_relation
+    from process.provider_directory_rooted_graph_source_runtime import rooted_input_relations
+
+    acquisition_rows = []
+    for acquisition_id in (first_id, second_id):
+        tables = await rooted_input_relations(database, acquisition_id)
+        table = tables[ACQUISITION_TABLE]
+        relation = storage_relation(table["schema"], table["name"])
+        acquisition_row = await database.first(
+            f"SELECT {', '.join(_ROOT_COLUMNS)}, status, rooted_graph_complete, "
+            f"endpoint_collection_complete,endpoint_complete,sealed_at FROM {relation} "
+            "WHERE acquisition_id=:acquisition_id FOR SHARE",
+            acquisition_id=acquisition_id,
+        )
+        if acquisition_row is not None:
+            acquisition_rows.append(acquisition_row)
+    roots = tuple(_root_from_row(acquisition_row) for acquisition_row in acquisition_rows)
     if len(roots) != 2 or tuple(root.acquisition_id for root in roots) != (
         first_id,
         second_id,
@@ -135,11 +143,15 @@ async def _lock_single_root(
     database: Any,
     acquisition_id: str,
 ) -> ProviderDirectoryRootedGraphSealedRoot:
+    from db.plan_release_storage import storage_relation
+    from process.provider_directory_rooted_graph_source_runtime import rooted_input_relations
+
+    tables = await rooted_input_relations(database, acquisition_id)
+    table = tables[ACQUISITION_TABLE]
     row = await database.first(
         f"SELECT {', '.join(_ROOT_COLUMNS)}, status, rooted_graph_complete, "
-        "endpoint_collection_complete, endpoint_complete, sealed_at "
-        f"FROM {_table(ACQUISITION_TABLE)} "
-        "WHERE acquisition_id = :acquisition_id FOR SHARE;",
+        f"endpoint_collection_complete,endpoint_complete,sealed_at FROM {storage_relation(table['schema'], table['name'])} "
+        "WHERE acquisition_id=:acquisition_id FOR SHARE",
         acquisition_id=acquisition_id,
     )
     return _root_from_row(row)
@@ -267,10 +279,9 @@ async def _store_single_root_authority(
     else:
         _require_exact(stored, expected, _ADMISSION_IDENTITY_COLUMNS)
         return stored
-    computed = await database.scalar(
-        f"SELECT {_table('provider_directory_rooted_graph_request_failure_coverage')}(:acquisition_id);",
-        acquisition_id=expected.publication_acquisition_id,
-    )
+    from process.provider_directory_rooted_graph_bulk import named_request_coverage
+
+    computed = await named_request_coverage(database, expected.publication_acquisition_id)
     coverage = _row_fields({"request_failure_coverage": computed})["request_failure_coverage"]
     if coverage != expected.request_failure_coverage:
         raise ProviderDirectoryRootedGraphTwinError("state")
@@ -302,10 +313,9 @@ async def _lock_logical_current(database: Any):
         "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:lock_identity, 0));",
         lock_identity=EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
     )
-    return await lock_exact_current_dataset(
-        database,
-        pair=exact_uhc_dataset_pair(),
-    )
+    from process.provider_directory_rooted_graph_current_preflight import current_root_proof, require_current_root_fence
+
+    return await require_current_root_fence(database, current_root_proof(database), lock_rows=False)
 
 
 async def admit_provider_directory_rooted_graph_twins(
@@ -317,6 +327,9 @@ async def admit_provider_directory_rooted_graph_twins(
     """Persist every valid comparison and admit only an exact sealed match."""
 
     _validate_admission_request(first_acquisition_id, second_acquisition_id)
+    from process.provider_directory_rooted_graph_current_preflight import prepare_current_root
+
+    await prepare_current_root(database)
     stored_attempt: ProviderDirectoryRootedGraphTwinAttempt | None = None
     stored_admission: ProviderDirectoryRootedGraphTwinAdmission | None = None
     is_root_current = False
@@ -369,6 +382,9 @@ async def admit_rooted_graph_single_root(
     """Admit one still-current candidate seal under explicit policy one."""
 
     _validate_admission_request(publication_acquisition_id)
+    from process.provider_directory_rooted_graph_current_preflight import prepare_current_root
+
+    await prepare_current_root(database)
     if type(acquisition_operation_key) is not str or SHA256_PATTERN.fullmatch(acquisition_operation_key) is None:
         raise ValueError("provider_directory_rooted_graph_operation_key_invalid")
     stored_admission: ProviderDirectoryRootedGraphTwinAdmission | None = None

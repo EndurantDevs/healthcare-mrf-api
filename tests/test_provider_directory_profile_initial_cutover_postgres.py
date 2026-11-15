@@ -21,58 +21,59 @@ from process import provider_directory_profile_capacity as capacity
 from process import provider_directory_profile_initial as initial
 from process import provider_directory_profile_initial_contract as contract
 from process import provider_directory_profile_selection as selection
+from process.provider_directory_artifact_bundle_preparation import artifact_publication
 from tests import test_provider_directory_profile_capacity_preflight_postgres as ordinary_fixture
 from tests import test_provider_directory_profile_initial_migration as fixture
 from tests.test_provider_directory_profile_control_capacity import _control_wal_plan_input
-from tests.test_provider_directory_profile_failed_cleanup_postgres import _server_tablespace
 
 fhir = importlib.import_module("process.provider_directory_fhir")
 
 
-def _initial_tablespace_identity():
-    """Return exact native fixture coordinates before resource creation."""
-    return "hc_initial_test_" + uuid4().hex
-
-
-@pytest.mark.parametrize("object_kind", ["heap", "index"])
-def test_native_initial_receipt_refuses_unfunded_tablespace(monkeypatch, object_kind):
+@pytest.mark.parametrize("growth", ["index", "toastable_column"])
+def test_native_initial_receipt_refuses_unfunded_numeric_layout(monkeypatch, growth):
     async def exercise():
         async with fixture._database(monkeypatch) as engine:
-            await fixture._upgrade(engine)
-            database = Database()
-            database.engine = engine
-            database.session_factory = async_sessionmaker(engine, expire_on_commit=False)
-            monkeypatch.setattr(fhir, "db", database)
-            before = await initial.receipt_layout(fhir, fixture._SCHEMA)
-            funded_oid = await database.scalar("SELECT dattablespace FROM pg_database WHERE datname=current_database()")
-            index_name = await database.scalar(
-                "SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid "
-                "WHERE i.indrelid=CAST(:oid AS oid) ORDER BY c.relname LIMIT 1",
-                oid=before.relation_oid,
-            )
-            metadata_ref = (
-                f'TABLE "{fixture._SCHEMA}".{contract.RECEIPT_TABLE}'
-                if object_kind == "heap"
-                else f'INDEX "{fixture._SCHEMA}"."{index_name}"'
-            )
-            name = _initial_tablespace_identity()
-            async with _server_tablespace(database, name, metadata_ref):
-                observed = await initial.receipt_layout(fhir, fixture._SCHEMA)
-                assert observed.exact_fingerprint != before.exact_fingerprint
-                # Even a fresh fingerprint cannot fund storage on an unreserved volume.
-                with pytest.raises(RuntimeError, match="initial_receipt_tablespace_unsupported"):
-                    initial.geometry_inputs(fhir, None, SimpleNamespace(tablespace_oid=funded_oid), observed)
-                assert await database.scalar(f'SELECT count(*) FROM "{fixture._SCHEMA}".{contract.RECEIPT_TABLE}') == 0
+            database, cutover, _stages = await _cutover_fixture(engine, monkeypatch)
+            schema = fixture._SCHEMA
+            receipt_ref = fhir._unscoped_qt(schema, contract.RECEIPT_TABLE)
+            async with database.transaction():
+                if growth == "index":
+                    await database.status(f"CREATE INDEX extra_receipt_index ON {receipt_ref}(run_id)")
+                else:
+                    await database.status(f"ALTER TABLE {receipt_ref} ADD COLUMN extra_payload text")
+                with pytest.raises(
+                    RuntimeError,
+                    match="initial_receipt_storage_shape_changed|capacity_(index_bound|layout_scope)_changed",
+                ):
+                    observed = await initial.receipt_layout(fhir, schema)
+                    fhir._assert_profile_capacity_layout_bounds(
+                        observed, cutover["admission"].geometry, "initial_receipt"
+                    )
+                assert await database.scalar(f"SELECT count(*) FROM {receipt_ref}") == 0
 
     asyncio.run(exercise())
+
+
+def _create_delta_receipt_fixture(connection):
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    with Operations.context(MigrationContext.configure(connection)):
+        fixture.delta._create_delta_receipt_table(fixture._SCHEMA)
 
 
 async def _create_cutover_tables(engine, schema, consumed):
     # No import-run write or admission is exercised here; its twelve-guard proof is separate.
     async with engine.begin() as connection:
-        await connection.execute(text(f'ALTER TABLE "{schema}".import_run ADD COLUMN status text'))
+        await connection.run_sync(_create_delta_receipt_fixture)
         await connection.execute(
-            text(f"INSERT INTO \"{schema}\".import_run VALUES (:run,'running')"), {"run": consumed["run_id"]}
+            text(
+                f'ALTER TABLE "{schema}".import_run ADD COLUMN status text, ADD COLUMN importer text, ADD COLUMN finished_at timestamptz, ADD COLUMN metrics jsonb'
+            )
+        )
+        await connection.execute(
+            text(f"INSERT INTO \"{schema}\".import_run(run_id,status) VALUES (:run,'running')"),
+            {"run": consumed["run_id"]},
         )
         for table, evidence in (("initial_evidence_stage", True), ("initial_profile_stage", False)):
             statement = (
@@ -83,59 +84,49 @@ async def _create_cutover_tables(engine, schema, consumed):
             await connection.execute(text(statement(schema, table, logged=True)))
             for sql in fhir.profile_artifact.profile_index_statements(schema, table, evidence=evidence):
                 await connection.execute(text(sql))
+    from unittest.mock import patch
+
     from alembic.migration import MigrationContext
     from alembic.operations import Operations
 
-    from process import provider_directory_cms_receipt_guard as common_guards
-    from tests.test_provider_directory_cms_serving_receipt_postgres import _migration
+    from tests import test_provider_directory_cms_serving_receipt_postgres as common
 
     async with engine.begin() as connection:
-
-        def create_common(sync):
-            with Operations.context(MigrationContext.configure(sync)):
-                _migration("20260930100000")._create_table('"' + schema + '"')
-
-        await connection.run_sync(create_common)
-        for name, mask, body in (
-            (
-                "cms_serving_profile_transition",
-                "AFTER INSERT OR UPDATE OR DELETE",
-                common_guards.profile_transition_body('"' + schema + '"'),
-            ),
-            (
-                "cms_serving_no_truncate",
-                "BEFORE TRUNCATE",
-                f"BEGIN IF EXISTS (SELECT 1 FROM \"{schema}\".provider_directory_cms_serving_receipt) THEN RAISE EXCEPTION 'cms_serving_native_truncate_forbidden'; END IF; RETURN NULL; END",
-            ),
-        ):
-            await connection.execute(
-                text(
-                    f'CREATE FUNCTION "{schema}".{name}() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $body${body}$body$'
-                )
-            )
-            trigger = (
-                f'CREATE CONSTRAINT TRIGGER {name} {mask} ON "{schema}".provider_directory_profile_serving_generation DEFERRABLE INITIALLY DEFERRED FOR EACH ROW'
-                if name.endswith("transition")
-                else f'CREATE TRIGGER {name} {mask} ON "{schema}".provider_directory_profile_serving_generation FOR EACH STATEMENT'
-            )
-            await connection.execute(text(trigger + f' EXECUTE FUNCTION "{schema}".{name}()'))
+        native_names = tuple(
+            name
+            for name in common.receipts._NATIVE_RELATIONS
+            if name not in {fhir.profile_artifact.PROFILE_TABLE, fhir.profile_artifact.PROFILE_EVIDENCE_TABLE}
+        )
+        with patch.object(common.receipts, "_NATIVE_RELATIONS", native_names):
+            await common._create_scalar_tables(connection, schema)
+        await common._create_native_tables(connection, schema)
+        await connection.run_sync(lambda sync: common._apply(sync, "20260929040000"))
+        await connection.run_sync(lambda sync: common._apply(sync, "20260930100000"))
+        await connection.run_sync(
+            lambda sync: sync.exec_driver_sql(common._migration("20261019130000")._repair_sql(schema))
+        )
+        await common._install_named_serving_fixture(connection, native_revision_installed=True)
 
 
 async def _bind_fixture_geometry(consumed, preflight, receipt_payload, schema):
-    raw = receipt_payload["capacity_geometry"]
-    raw.update(
-        executable_plan_hash=consumed["executable_plan_hash"],
-        selection_proof_id=consumed["selection_proof_id"],
-        desired_source_vector_hash=consumed["source_vector_hash"],
-        desired_context_vector_hash=consumed["source_context_vector_hash"],
-    )
-    raw["physical_projection_contract_id"] = capacity.BOUNDED_ADMISSION_CONTRACT_ID
-    raw["serving_generation_oid"] = await fhir._provider_directory_relation_oid(
-        schema, "provider_directory_profile_serving_generation"
-    )
-    geometry = capacity.validated_capacity_geometry(raw)
+    from tests.test_provider_directory_profile_initial import _geometry
+
+    initial_targets = contract.InitialTargets(fhir._provider_directory_profile_target_coordinates(schema), {})
+    database = await fhir._provider_directory_profile_capacity_database_identity(schema, initial_targets)
     receipt_layout = await initial.receipt_layout(fhir, schema)
-    geometry = replace(geometry, initial_receipt_storage_fingerprint=receipt_layout.exact_fingerprint)
+    raw = capacity.capacity_geometry_payload(_geometry())
+    raw.update(fhir._geometry_postgres_values(database))
+    raw["relations"] = {
+        **database.relations,
+        "initial_receipt": {
+            "schema": receipt_layout.schema_name,
+            "name": receipt_layout.relation_name,
+            "main_index_pages": list(fhir._profile_capacity_index_page_union_bound(receipt_layout.main_index_pages)),
+            "toast_index_pages": list(fhir._profile_capacity_index_page_union_bound(receipt_layout.toast_index_pages)),
+            "toastable_column_count": len(receipt_layout.toastable_columns),
+        },
+    }
+    geometry = capacity.validated_capacity_geometry(raw)
     plan = _control_wal_plan_input(admission_row_lock_count=fhir.PROVIDER_DIRECTORY_PROFILE_ADMISSION_ROW_LOCK_COUNT)
     geometry = replace(geometry, control_wal_plan_input_hash=capacity.profile_control_wal_plan_input_hash(plan))
     projection = capacity.project_profile_control_wal_capacity(geometry, plan)
@@ -145,17 +136,13 @@ async def _bind_fixture_geometry(consumed, preflight, receipt_payload, schema):
         control_metadata_data_upper_bound_bytes=projection.total_control_metadata_data_bytes,
     )
     projection = capacity.project_profile_control_wal_capacity(geometry, plan)
-    geometry_hash = capacity.capacity_geometry_hash(geometry)
-    raw = capacity.capacity_geometry_payload(geometry)
-    consumed["capacity_geometry_hash"] = geometry_hash
-    preflight["capacity_geometry_hash"] = geometry_hash
-    preflight_payload = json.loads(preflight["receipt_json"])
-    preflight_payload["capacity_geometry"] = raw
-    preflight["receipt_json"] = json.dumps(preflight_payload)
-    envelope = json.loads(consumed["canonical_lease_json"])
-    envelope["signing_preflight_guard"]["healthcare_receipt"] = preflight_payload
-    consumed["canonical_lease_json"] = json.dumps(envelope)
-    return geometry, receipt_layout, projection, geometry_hash, raw
+    return (
+        geometry,
+        receipt_layout,
+        projection,
+        capacity.capacity_geometry_hash(geometry),
+        capacity.capacity_geometry_payload(geometry),
+    )
 
 
 async def _prepare_fixture_stages(
@@ -179,7 +166,7 @@ async def _prepare_fixture_stages(
         "capacity_geometry_hash": geometry_hash,
         "initial_target_state_sha256": geometry.initial_target_state_sha256,
         "dataset_fence_sha256": initial._fence_hash(fhir, fhir.ProviderDirectoryArtifactDatasetFence(())),
-        "new_target_oids": oid_by_target,
+        "targets": fhir._provider_directory_profile_target_coordinates(schema),
         "metadata_data_bytes": metadata_projection.data_bytes,
         "metadata_wal_bytes": metadata_projection.wal_bytes,
         "commit_envelope_bytes": metadata_projection.commit_envelope_bytes,
@@ -189,7 +176,10 @@ async def _prepare_fixture_stages(
         "build": build,
         "admission": admission,
         "counts": {"evidence_rows": 0, "profile_rows": 0},
-        "oids": oid_by_target,
+        "stages": {
+            fhir.profile_artifact.PROFILE_EVIDENCE_TABLE: {"schema": schema, "name": build.evidence_stage},
+            fhir.profile_artifact.PROFILE_TABLE: {"schema": schema, "name": build.profile_stage},
+        },
         "projection": metadata_projection,
         "forecast": forecast_by_field,
         "forecast_hash": fhir._identity_hash(forecast_by_field),
@@ -200,16 +190,77 @@ async def _prepare_fixture_stages(
     try:
         stages = fhir._prepare_profile_full_swap_stages(
             build,
-            fhir.ProviderDirectoryArtifactBuildFence(raw["evidence_target_oid"]),
-            fhir.ProviderDirectoryArtifactBuildFence(raw["profile_target_oid"]),
+            fhir.ProviderDirectoryArtifactBuildFence(
+                (schema, fhir.profile_artifact.PROFILE_EVIDENCE_TABLE),
+                await artifact_publication(fhir, schema, fhir.profile_artifact.PROFILE_EVIDENCE_TABLE),
+            ),
+            fhir.ProviderDirectoryArtifactBuildFence(
+                (schema, fhir.profile_artifact.PROFILE_TABLE),
+                await artifact_publication(fhir, schema, fhir.profile_artifact.PROFILE_TABLE),
+            ),
         )
     finally:
         initial.REQUESTED.reset(token)
     return cutover_by_field, stages
 
 
+async def _fresh_fixture_authority(database, engine, consumed, preflight, geometry, projection):
+    from datetime import datetime, timezone
+
+    from tests.provider_directory_profile_capacity_trust_fixtures import capacity_trust_from_envelope
+    from tests.provider_directory_profile_initial_test_support import (
+        signed_initial_envelope,
+        synthetic_initial_execution,
+    )
+    from tests.test_provider_directory_profile_initial_replay import _consume_replay_authority
+
+    execution = synthetic_initial_execution()
+    pairs = tuple((pair["source_id"], pair["dataset_id"]) for pair in execution.attestation.pairs)
+    contexts = tuple((source_id, "a" * 64) for source_id, _dataset in pairs)
+    async with database.transaction():
+        initial_targets = await initial.capture_targets(fhir, fixture._SCHEMA)
+    geometry = replace(
+        geometry,
+        selection_proof_id=execution.attestation.proof_id,
+        profile_input_digest=execution.attestation.profile_input_digest,
+        desired_source_vector_hash=fhir._provider_directory_profile_source_vector_hash(pairs),
+        desired_context_vector_hash=fhir._provider_directory_profile_source_context_vector_hash(contexts),
+        initial_target_state_sha256=contract.target_state_sha256(initial_targets.payload),
+    )
+    accepted = datetime.now(timezone.utc).replace(microsecond=0)
+    envelope, receipt = signed_initial_envelope(geometry, None, initial_targets.payload, execution, accepted)
+    preflight.update(
+        contract_id=contract.RECEIPT_CONTRACT,
+        request_contract_id=contract.REQUEST_CONTRACT,
+        profile_input_digest=geometry.profile_input_digest,
+        selection_proof_id=geometry.selection_proof_id,
+    )
+    verified, consumed = _consume_replay_authority(
+        envelope, capacity_trust_from_envelope(envelope), accepted, geometry, consumed, preflight, receipt
+    )
+    projection = replace(projection, capacity_geometry_hash=capacity.capacity_geometry_hash(geometry))
+    return (
+        consumed,
+        preflight,
+        geometry,
+        projection,
+        {
+            "verified_lease": verified,
+            "database_identity": None,
+            "build": {
+                "selection_proof_id": geometry.selection_proof_id,
+                "desired_source_vector": pairs,
+                "desired_source_context_vector": contexts,
+                "desired_source_vector_hash": geometry.desired_source_vector_hash,
+                "desired_source_context_vector_hash": geometry.desired_context_vector_hash,
+            },
+        },
+    )
+
+
 async def _cutover_fixture(engine, monkeypatch, prepare_authority=None):
     """Prepare seeded native cutover state without claiming runtime admission."""
+    monkeypatch.setenv("HLTHPRT_IMPORT_NODE_ID", "dev-node")
     await fixture._upgrade(engine)
     database = Database()
     database.engine = engine
@@ -218,10 +269,16 @@ async def _cutover_fixture(engine, monkeypatch, prepare_authority=None):
     consumed, preflight, serving, receipt_payload = await fixture._publication_values(engine)
     schema = fixture._SCHEMA
     await _create_cutover_tables(engine, schema, consumed)
+    from tests.test_profile_capacity_logical_names_migration import _apply, logical
+
+    async with engine.begin() as connection:
+        await connection.run_sync(lambda sync: _apply(sync, logical.upgrade))
     geometry, receipt_layout, projection, geometry_hash, raw = await _bind_fixture_geometry(
         consumed, preflight, receipt_payload, schema
     )
     extra_by_field = {}
+    if prepare_authority is None:
+        prepare_authority = _fresh_fixture_authority
     if prepare_authority is not None:
         consumed, preflight, geometry, projection, extra_by_field = await prepare_authority(
             database, engine, consumed, preflight, geometry, projection
@@ -320,7 +377,7 @@ def test_native_initial_target_snapshot_and_evolved_legacy_context(monkeypatch, 
             schema = fixture._SCHEMA
             async with database.transaction():
                 await database.status(
-                    f'ALTER TABLE "{schema}".import_run ADD COLUMN importer text, ADD COLUMN finished_at timestamptz, ADD COLUMN metrics jsonb'
+                    f'ALTER TABLE "{schema}".import_run ADD COLUMN IF NOT EXISTS importer text, ADD COLUMN IF NOT EXISTS finished_at timestamptz, ADD COLUMN IF NOT EXISTS metrics jsonb'
                 )
                 if state != "empty":
                     legacy_result = await _seed_legacy_snapshot(
@@ -377,9 +434,9 @@ async def _seed_cutover_checkpoint(engine, schema, build, geometry, oid_by_targe
         await connection.execute(
             text(f'''INSERT INTO "{schema}".provider_directory_profile_build_checkpoint
             (build_id,strategy_version,schema_version,resume_lineage_hash,source_ids,retained_source_ids,dataset_ids,
-             evidence_stage,profile_stage,evidence_stage_oid,profile_stage_oid,state,profile_as_of,has_existing_artifacts,evidence_total_batches,profile_total_batches,
+             evidence_stage,profile_stage,targets_json,state,profile_as_of,has_existing_artifacts,evidence_total_batches,profile_total_batches,
              evidence_next_batch,profile_next_batch) VALUES (:build,:strategy,1,:lineage,'[]','[]','[]',
-             :evidence,:profile,:evidence_oid,:profile_oid,'ready',:asof,false,0,0,0,0)'''),
+             :evidence,:profile,CAST(:targets AS jsonb),'ready',:asof,false,0,0,0,0)'''),
             {
                 "build": build.build_id,
                 "strategy": geometry.profile_strategy_version,
@@ -387,8 +444,7 @@ async def _seed_cutover_checkpoint(engine, schema, build, geometry, oid_by_targe
                 "evidence": build.evidence_stage,
                 "profile": build.profile_stage,
                 "asof": build.profile_as_of,
-                "evidence_oid": oid_by_target[fhir.profile_artifact.PROFILE_EVIDENCE_TABLE],
-                "profile_oid": oid_by_target[fhir.profile_artifact.PROFILE_TABLE],
+                "targets": json.dumps(fhir._provider_directory_profile_target_coordinates(schema)),
             },
         )
 
@@ -457,10 +513,10 @@ async def _seed_legacy_snapshot(database, schema, state, selection, synthetic_pr
         key="a" * 32,
     )
     # Current registry context differs from the old attestation; full replacement does not adopt it.
-    await database.status(f'''CREATE TABLE "{schema}".provider_directory_source (
-                        source_id text,endpoint_id text,canonical_api_base text,org_name text,plan_name text)''')
+    await database.status(f'''ALTER TABLE "{schema}".provider_directory_source
+                        ADD COLUMN canonical_api_base text, ADD COLUMN org_name text, ADD COLUMN plan_name text''')
     await database.status(f'''INSERT INTO "{schema}".provider_directory_source
-                        VALUES ('synthetic_profile_source','synthetic-endpoint-1','https://changed.invalid','Changed context',NULL)''')
+                        (source_id,endpoint_id,canonical_api_base,org_name,plan_name) VALUES ('synthetic_profile_source','synthetic-endpoint-1','https://changed.invalid','Changed context',NULL)''')
     if state == "mixed":
         await database.status(
             f'''INSERT INTO "{schema}".provider_directory_profile

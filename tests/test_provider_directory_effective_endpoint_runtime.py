@@ -327,9 +327,10 @@ async def test_atomic_artifact_promotion_failure_rolls_back_transaction(
             raise
         events.append("commit")
 
-    async def fail_publication(*_args, before_swaps=None, extra_live_relations=()):
-        assert before_swaps is None
-        assert extra_live_relations == ()
+    async def fail_publication(*_args, publication):
+        assert publication.before_swaps is None
+        assert publication.extra_live_relations == ()
+        assert publication.promotion_identities == ()
         assert importer.db._transaction_binding() is not None
         raise RuntimeError("publication failed")
 

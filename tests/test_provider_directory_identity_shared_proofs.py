@@ -183,7 +183,7 @@ async def test_address_overlay_filter_owner_and_precreate_failure(monkeypatch):
             ["source-a"],
             None,
             '"mrf"."provider_directory_address_overlay"',
-            fhir.ProviderDirectoryArtifactBuildFence(target_oid=1),
+            fhir.ProviderDirectoryArtifactBuildFence(target_publication=(True, ("synthetic-1", "revision-1"))),
             False,
         )
     drop.assert_not_awaited()

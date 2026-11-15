@@ -40,7 +40,7 @@ _ARCHIVED = 9003
 
 def _candidate_lookup_queries(queries, control_schema):
     # The request snapshot reads the published routing metadata once; no other statement looks up the candidate.
-    lookups = [query for query in queries if "to_jsonb(candidate)::text AS candidate_json" in query.query]
+    lookups = [query for query in queries if "::text AS candidate_json" in query.query]
     assert [query.query for query in lookups] == [published_api_pin_statement(control_schema)]
     return lookups
 

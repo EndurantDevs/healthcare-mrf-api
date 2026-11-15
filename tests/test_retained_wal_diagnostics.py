@@ -157,7 +157,7 @@ def _install_bound_probe(monkeypatch, wrapped):
 
         if wrapped:
             await native.epoch_capture._admit_epoch_copy(
-                actual_admission, "before_copy_batch", "synthetic", "synthetic", 1
+                actual_admission, "before_copy_batch", "synthetic", "synthetic"
             )
         else:
             await actual_admission()

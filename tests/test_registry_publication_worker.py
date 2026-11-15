@@ -52,10 +52,24 @@ def configuration():
     }
 
 
-def test_publication_custody_census_matches_existing_role_contract():
-    parsed = worker.parse_registry_publication_worker_config(json.dumps(configuration()))
-    expected = ("registry_api", "registry_reader", "registry_snapshot_owner", "worker_execution", "worker_lifecycle")
-    assert parsed.consumer.custody_roles == worker._custody_roles(parsed) == expected
+def _runtime_configuration(document=None):
+    """Supply the real named-preparation profile for resource-orchestration fixtures."""
+    config = worker.parse_registry_publication_worker_config(
+        json.dumps(configuration() if document is None else document)
+    )
+    application_roles = set(worker._application_role_names(config))
+    if config.source_witness is not None:
+        application_roles.update(config.source_witness.runtime_roles)
+    namespace_owner = "frozen_snapshot_owner"
+    assert namespace_owner not in application_roles
+    return replace(
+        config,
+        preparation_roles={
+            "namespace_owner_role": namespace_owner,
+            "publisher_role": config.consumer.execution_role,
+            "application_roles": sorted(application_roles),
+        },
+    )
 
 
 def test_optional_request_selector_preserves_existing_consumer_and_authority():
@@ -239,13 +253,9 @@ def _configured_recipe(kind="fhir"):
             "dataset-one",
             "a" * 64,
             "e" * 64,
-            123,
+            {"schema": "source_example", "name": "provider_directory_dataset_resource"},
             "medical",
             "2026-10-01",
-            custody_owner_role="source_owner",
-            custody_runtime_roles=("source_reader",),
-            custody_proof_sha256="b" * 64,
-            custody_catalog_sha256="c" * 64,
         )
     else:
         pin = PinnedPTGOfficeMembershipSource(_ID, "example-client", "a" * 64, "b" * 64, "c" * 64, coordinates, 1, 1)
@@ -278,7 +288,6 @@ def test_configuration_decodes_closed_typed_source_recipes(phase, kind):
         "kind",
         "pin",
         "coordinates",
-        "unprotected",
         "unsupported",
         "duplicate",
         "both",
@@ -306,10 +315,6 @@ def test_configuration_refuses_unqualified_or_cross_source_recipes(phase, damage
             recipe["source_pin"]["unexpected"] = _PRIVATE
         case "coordinates":
             recipe["binding_coordinates"]["dataset_id"] = "other-dataset"
-        case "unprotected":
-            for name in tuple(recipe["source_pin"]):
-                if name.startswith("custody_"):
-                    recipe["source_pin"].pop(name)
         case "unsupported":
             recipe["source_pin"]["source_id"] = recipe["binding_coordinates"]["source_id"] = "other-source"
         case "duplicate":
@@ -383,7 +388,7 @@ def resources(monkeypatch, *, second_failure=False, close_failure=False):
 
     async def create_pool(**configured):
         options.append(configured)
-        name = "lifecycle" if len(options) == 1 else "execution"
+        name = ("lifecycle", "execution", "preparation")[len(options) - 1]
         if second_failure and len(options) == 2:
             raise RuntimeError(_PRIVATE)
         events.append(name + " open")
@@ -394,7 +399,25 @@ def resources(monkeypatch, *, second_failure=False, close_failure=False):
 
 
 @pytest.mark.asyncio
-async def test_postclaim_backend_refusal_keeps_the_same_durable_request_resumable(monkeypatch):
+async def test_pool_checkout_retains_effective_sql_limits():
+    config = _runtime_configuration()
+    calls = []
+
+    async def verify_limits(connection):
+        calls.append(connection)
+
+    limits = SimpleNamespace(
+        verify=verify_limits, connect_timeout_seconds=5, statement_timeout_ms=1000, server_settings=lambda: {}
+    )
+    options = worker._pool_options(config.execution_url, 1, limits)
+    connection = object()
+    await options["init"](connection)
+    await options["setup"](connection)
+    assert calls == [connection, connection]
+
+
+@pytest.mark.asyncio
+async def test_postclaim_sql_limit_refusal_keeps_the_same_durable_request_resumable(monkeypatch):
     from process import registry_publication_consumer as consumer
 
     limits = worker.RegistryPublicationSQLLimits()
@@ -403,9 +426,12 @@ async def test_postclaim_backend_refusal_keeps_the_same_durable_request_resumabl
 
     @asynccontextmanager
     async def acquire():
-        observed_by_name = {**asdict(limits), "parallel_query": 0, "parallel_maintenance": 0}
-        observed_by_name["replication_role"] = "replica" if next(checkout_numbers) == 2 else "origin"
-        connection = SimpleNamespace(fetchrow=AsyncMock(return_value=observed_by_name))
+        settings = asdict(limits)
+        settings.pop("connect_timeout_seconds")
+        settings.update(parallel_query=0, parallel_maintenance=0, replication_role="origin")
+        if next(checkout_numbers) == 1:
+            settings["work_mem_bytes"] = limits.work_mem_bytes * 2
+        connection = SimpleNamespace(fetchrow=AsyncMock(return_value=settings))
         await checkout_verifier(connection)
         yield connection
 
@@ -419,7 +445,6 @@ async def test_postclaim_backend_refusal_keeps_the_same_durable_request_resumabl
     claim = AsyncMock(return_value=request_by_field)
     reject = AsyncMock()
     complete = AsyncMock(return_value={"generation": 7})
-    monkeypatch.setattr(consumer, "_verify_execution", AsyncMock())
     monkeypatch.setattr(consumer, "_claim", claim)
     monkeypatch.setattr(consumer, "_reject", reject)
     monkeypatch.setattr(consumer, "_ordinary_publication", complete)
@@ -436,11 +461,11 @@ async def test_postclaim_backend_refusal_keeps_the_same_durable_request_resumabl
     reject.assert_not_awaited()
     complete.assert_not_awaited()
     assert request_by_field == original_request_by_field and claim.await_count == 1
-    assert checkout_verifier.await_count == 2
+    assert checkout_verifier.await_count == 1
     completed_by_field = await consumer.consume_registry_publication_once(**arguments_by_field)
     assert completed_by_field == {"request_id": _ID, "state": "completed", "result": {"generation": 7}}
     assert (
-        request_by_field == original_request_by_field and claim.await_count == 2 and checkout_verifier.await_count == 4
+        request_by_field == original_request_by_field and claim.await_count == 2 and checkout_verifier.await_count == 2
     )
     reject.assert_not_awaited()
     complete.assert_awaited_once()
@@ -456,7 +481,7 @@ async def test_worker_forwards_typed_recipes_without_opening_an_alternate_source
         "base_source": {"schema_name": "addresses", "table_name": "entity_address_unified", "generation_id": "a" * 64},
         phase: json.loads(canonical_registry_source_recipes((recipe,))),
     }
-    parsed = worker.parse_registry_publication_worker_config(json.dumps(configured))
+    parsed = _runtime_configuration(configured)
 
     async def consume(**arguments):
         assert arguments["initial_address_sources"] is parsed.initial_address_sources
@@ -482,15 +507,24 @@ async def test_actual_runner_owns_fixed_pools_and_cleans_every_exit(monkeypatch,
         return None if outcome == "idle" else {"request_id": _ID, "state": "completed", "result": {"private": _PRIVATE}}
 
     monkeypatch.setattr(worker, "consume_registry_publication_once", consume)
-    config = worker.parse_registry_publication_worker_config(json.dumps(configuration()))
+    config = _runtime_configuration()
     if outcome in {"error", "cancel", "close_error"}:
         with pytest.raises(asyncio.CancelledError if outcome == "cancel" else RuntimeError):
             await worker.run_registry_publication_worker(config)
     else:
-        result = await worker.run_registry_publication_worker(config)
-        assert result == ({"state": "no_work"} if outcome == "idle" else {"request_id": _ID, "state": "completed"})
-    assert [(entry["min_size"], entry["max_size"]) for entry in options] == [(1, 2), (1, 1)]
-    expected_events = ["authority open", "lifecycle open", "execution open", "execution close"]
+        summary_by_field = await worker.run_registry_publication_worker(config)
+        assert summary_by_field == (
+            {"state": "no_work"} if outcome == "idle" else {"request_id": _ID, "state": "completed"}
+        )
+    assert [(entry["min_size"], entry["max_size"]) for entry in options] == [(1, 2), (1, 1), (1, 1)]
+    expected_events = [
+        "authority open",
+        "lifecycle open",
+        "execution open",
+        "preparation open",
+        "preparation close",
+        "execution close",
+    ]
     if outcome == "close_error":
         expected_events.append("execution terminate")
     assert events == expected_events + ["lifecycle close", "authority close"]
@@ -500,9 +534,7 @@ async def test_actual_runner_owns_fixed_pools_and_cleans_every_exit(monkeypatch,
 async def test_second_pool_startup_failure_closes_first_and_authority(monkeypatch):
     events, _ = resources(monkeypatch, second_failure=True)
     with pytest.raises(RuntimeError):
-        await worker.run_registry_publication_worker(
-            worker.parse_registry_publication_worker_config(json.dumps(configuration()))
-        )
+        await worker.run_registry_publication_worker(_runtime_configuration())
     assert events == ["authority open", "lifecycle open", "lifecycle close", "authority close"]
 
 
@@ -541,11 +573,16 @@ async def test_runner_uses_real_authority_transport_without_returning_private_re
         return {"request_id": _ID, "state": "completed", "result": {"private": _PRIVATE}}
 
     monkeypatch.setattr(worker, "consume_registry_publication_once", consume)
-    summary_by_name = await worker.run_registry_publication_worker(
-        worker.parse_registry_publication_worker_config(json.dumps(configuration()))
-    )
+    summary_by_name = await worker.run_registry_publication_worker(_runtime_configuration())
     assert summary_by_name == {"request_id": _ID, "state": "completed"} and _PRIVATE not in json.dumps(summary_by_name)
-    assert events == ["lifecycle open", "execution open", "execution close", "lifecycle close"]
+    assert events == [
+        "lifecycle open",
+        "execution open",
+        "preparation open",
+        "preparation close",
+        "execution close",
+        "lifecycle close",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -686,7 +723,7 @@ def test_ptg_configuration_is_closed_bounded_and_cannot_supply_runtime(damage):
         assert parsed.ptg.read_budget.maximum_bytes == 1048576
 
 
-def _observe_ptg_engine(monkeypatch, config, events, password):
+def _observe_ptg_engine(monkeypatch, config, events, login_value):
     """Inspect actual driver arguments while observing the owned engine lifetime."""
     from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -697,7 +734,7 @@ def _observe_ptg_engine(monkeypatch, config, events, password):
         assert url == config.execution_url
         assert arguments == {
             "connect_args": {
-                "password": password or "",
+                "password": login_value or "",
                 "timeout": config.sql_limits.connect_timeout_seconds,
                 "command_timeout": config.sql_limits.statement_timeout_ms / 1000
                 + config.sql_limits.connect_timeout_seconds,
@@ -710,7 +747,7 @@ def _observe_ptg_engine(monkeypatch, config, events, password):
         }
         engine = original_create(url, **arguments)
         assert (engine.dialect.create_connect_args(engine.url)[1] | arguments["connect_args"])["password"] == (
-            password or ""
+            login_value or ""
         )
         engines.append(engine)
         events.append("sqlalchemy open")
@@ -727,25 +764,24 @@ def _observe_ptg_engine(monkeypatch, config, events, password):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["idle", "error", "cancel"])
-@pytest.mark.parametrize("password", [None, "configured-password"])
-async def test_ptg_assembly_uses_execution_url_and_disposes_genuine_single_engine(monkeypatch, outcome, password):
+@pytest.mark.parametrize("login_value", [None, "configured-password"])
+async def test_ptg_assembly_uses_execution_url_and_disposes_genuine_single_engine(monkeypatch, outcome, login_value):
     """Keep explicit credentials and close the genuine engine for every terminal outcome."""
     from process.registry_publication_ptg_runtime import RegistryPublicationPTGRuntime
 
     events, options = resources(monkeypatch)
     configured = ptg_configuration()
     configured["execution_dsn"] = (
-        "postgresql://worker_execution" + (":" + password if password else "") + "@db.example.test:5432/example"
+        "postgresql://worker_execution" + (":" + login_value if login_value else "") + "@db.example.test:5432/example"
     )
-    config = worker.parse_registry_publication_worker_config(json.dumps(configured))
+    config = _runtime_configuration(configured)
     monkeypatch.setenv("PGPASSWORD", "unrelated-ambient-password")
 
-    engines = _observe_ptg_engine(monkeypatch, config, events, password)
+    engines = _observe_ptg_engine(monkeypatch, config, events, login_value)
 
     async def consume(**arguments):
         runtime = arguments["config"].composition_runtime
         assert type(runtime) is RegistryPublicationPTGRuntime
-        assert arguments["config"].custody_roles == worker._custody_roles(config)
         assert runtime.sessions.kw["bind"] is engines[0]
         assert runtime.sessions.kw["bind"].pool.size() == 1 and runtime.sessions.kw["bind"].pool._max_overflow == 0
         if outcome == "error":
@@ -760,12 +796,14 @@ async def test_ptg_assembly_uses_execution_url_and_disposes_genuine_single_engin
     else:
         with pytest.raises(asyncio.CancelledError if outcome == "cancel" else RuntimeError):
             await worker.run_registry_publication_worker(config)
-    assert [(entry["min_size"], entry["max_size"]) for entry in options] == [(1, 2), (1, 1)]
+    assert [(entry["min_size"], entry["max_size"]) for entry in options] == [(1, 2), (1, 1), (1, 1)]
     assert events == [
         "authority open",
         "lifecycle open",
         "execution open",
         "sqlalchemy open",
+        "preparation open",
+        "preparation close",
         "sqlalchemy close",
         "execution close",
         "lifecycle close",
@@ -815,7 +853,7 @@ async def test_operation_timeout_drains_before_owned_pool_and_ptg_cleanup(monkey
     events, options = resources(monkeypatch)
     configured = ptg_configuration()
     configured["operation_seconds"] = seconds
-    config = worker.parse_registry_publication_worker_config(json.dumps(configured))
+    config = _runtime_configuration(configured)
     _observe_ptg_engine(monkeypatch, config, events, "{synthetic-password}")
     completed = asyncio.Event()
     started = asyncio.Event()
@@ -848,14 +886,16 @@ async def test_operation_timeout_drains_before_owned_pool_and_ptg_cleanup(monkey
         "lifecycle open",
         "execution open",
         "sqlalchemy open",
+        "preparation open",
         "work drain",
         "work drained",
+        "preparation close",
         "sqlalchemy close",
         "execution close",
         "lifecycle close",
         "authority close",
     ]
-    assert [(entry["min_size"], entry["max_size"]) for entry in options] == [(1, 2), (1, 1)]
+    assert [(entry["min_size"], entry["max_size"]) for entry in options] == [(1, 2), (1, 1), (1, 1)]
 
 
 @pytest.mark.parametrize("field", list(asdict(worker.RegistryPublicationSQLLimits())))
@@ -932,17 +972,6 @@ async def test_sql_limits_verify_actual_effective_values(field, value):
             await limits.verify(connection)
 
 
-@pytest.mark.parametrize("mode", ["replica", "local", "", None])
-async def test_sql_limits_refuse_non_origin_backend(mode):
-    limits = worker.RegistryPublicationSQLLimits()
-    values = asdict(limits)
-    values.pop("connect_timeout_seconds")
-    values.update(parallel_query=0, parallel_maintenance=0, replication_role=mode)
-    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=values))
-    with pytest.raises(RuntimeError, match="registry_publication_worker_sql_limits_unavailable"):
-        await limits.verify(connection)
-
-
 async def test_bounded_pool_preserves_explicit_stricter_checkout():
     pool = SimpleNamespace(acquire=lambda **kwargs: kwargs)
     bounded = worker._BoundedPool(pool, 5)
@@ -957,6 +986,7 @@ class _CandidateSealConnection:
         self.candidate = candidate
         self.transaction_options = []
         self.active_options = None
+        self.executed_sql = []
 
     def is_in_transaction(self):
         return self.active
@@ -973,6 +1003,11 @@ class _CandidateSealConnection:
             self.active = False
             self.active_options = None
 
+    async def execute(self, sql):
+        assert self.active and sql.startswith("SELECT set_config(")
+        self.executed_sql.append(sql)
+        return "SELECT 2"
+
     async def fetchrow(self, *args):
         return self.candidate
 
@@ -988,13 +1023,11 @@ def _queued_publication_phases(monkeypatch, outcome):
         "request_sha256": "a" * 64,
         "command_json": {"expected_serving_generation": 1},
     }
-    requests = AsyncMock(
-        side_effect=[
-            request_by_name,
-            request_by_name,
-            {**request_by_name, "request_sha256": "b" * 64} if outcome == "lease" else request_by_name,
-        ]
-    )
+    request_versions = [request_by_name] * 3
+    if outcome == "lease":
+        # The third read locks the request inside the final transaction.
+        request_versions[-1] = {**request_by_name, "request_sha256": "b" * 64}
+    requests = AsyncMock(side_effect=request_versions)
     monkeypatch.setattr(execution, "_request", requests)
 
     async def prepare(*args, **kwargs):
@@ -1004,9 +1037,9 @@ def _queued_publication_phases(monkeypatch, outcome):
     monkeypatch.setattr(execution, "prepare_network_candidate", prepare)
 
     async def authorize(*args):
-        if not connection.active:
-            events.append("authorized")
-        elif outcome == "revoked":
+        # One read precedes the seal; two follow the request and control locks inside the final transaction.
+        events.append("authorized_locked" if connection.active else "authorized")
+        if outcome == "revoked" and connection.active:
             raise ValueError("authority_revoked")
         return 3
 
@@ -1026,7 +1059,10 @@ def _queued_publication_phases(monkeypatch, outcome):
     monkeypatch.setattr(execution, "_source_selection_counts", lambda row: {})
 
     async def publish(*args, **kwargs):
-        assert connection.active and (outcome == "legacy" or events[-1] == "sealed")
+        assert connection.active
+        locked_events = ["authorized_locked", "authorized_locked"]
+        seal_events = [] if outcome == "legacy" else ["sealed"]
+        assert events == ["prepared", "authorized", *seal_events, *locked_events]
         return {"generation_id": 2}
 
     publisher = AsyncMock(side_effect=publish)
@@ -1122,53 +1158,76 @@ async def test_source_rollback_seals_before_review_hash_without_modifying_valida
         assert await operation == {"state": "completed"}
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("sealed", [False, True])
-async def test_rollback_hash_binds_verified_final_custody_and_preserves_validation(monkeypatch, sealed):
-    from process import network_candidate_custody
+def _rollback_data_boundary(monkeypatch):
     from process import registry_publication_execution as execution
+    from tests.test_named_network_preparation import TARGET, candidate, completed_validation
 
-    validation_by_name = {"valid": True, "writer_closure": {"owner_role": "original_owner"}}
-    candidate_by_name = {
-        "state": "ready",
+    candidate_by_field = candidate() | {
         "expected_head": 1,
         "approved_custom_revision": 2,
-        "validation_json": validation_by_name,
         "source_recipes_json": [],
-        "source_generations": {},
     }
-    copy_target = SimpleNamespace(schema_name="candidate")
-    command = SimpleNamespace(expected_serving_generation=1, expected_approved_revision=2)
-    monkeypatch.setattr(execution, "_locked_candidate", AsyncMock(return_value=candidate_by_name))
-    custody = {"seal_sha256": "a" * 64, "receipt": {"closure": {"owner_role": "final_owner"}}} if sealed else None
-
-    async def verify_native(connection, supplied, *, control_schema, required=True):
-        assert required is False and control_schema == "control" and supplied is copy_target
-        return custody
-
-    native = AsyncMock(side_effect=verify_native)
-    monkeypatch.setattr(network_candidate_custody, "verify_network_candidate_custody", native)
-    legacy = AsyncMock()
-    monkeypatch.setattr(execution, "verify_network_candidate_writer_closure", legacy)
+    candidate_by_field["validation_json"] = {
+        **candidate_by_field["validation_json"],
+        "final_validation": completed_validation(),
+    }
+    monkeypatch.setattr(execution, "_locked_candidate", AsyncMock(return_value=candidate_by_field))
     monkeypatch.setattr(
-        execution, "_publication_readiness", lambda candidate_by_name: ({}, None, {"index_definition_sha256": "b" * 64})
+        execution,
+        "_publication_readiness",
+        lambda selected: ({"candidate_id": selected["candidate_id"]}, None, {"index_definition_sha256": "b" * 64}),
     )
     monkeypatch.setattr(execution, "_catalog_readiness", AsyncMock())
-    monkeypatch.setattr(execution, "_index_digest", AsyncMock(return_value="b" * 64))
-    before = json.dumps(validation_by_name, sort_keys=True)
-    actual, first = await execution._verified_source_rollback_candidate(object(), copy_target, command, {}, "control")
-    assert actual["validation_json"] is validation_by_name and json.dumps(validation_by_name, sort_keys=True) == before
-    assert legacy.await_count == int(not sealed)
-    if sealed:
-        custody["receipt"]["closure"]["owner_role"] = "another_final_owner"
-        _, second = await execution._verified_source_rollback_candidate(object(), copy_target, command, {}, "control")
-        assert first != second and legacy.await_count == 0
-        refusal = network_candidate_custody.NetworkCandidateCustodyError("changed_seal")
-        native.side_effect = refusal
-        with pytest.raises(network_candidate_custody.NetworkCandidateCustodyError, match="changed_seal") as error:
-            await execution._verified_source_rollback_candidate(object(), copy_target, command, {}, "control")
-        assert error.value is refusal
-        legacy.assert_not_awaited()
+    indexes = AsyncMock(return_value="b" * 64)
+    monkeypatch.setattr(execution, "_index_digest", indexes)
+    return execution, TARGET, candidate_by_field, indexes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["source_generation", "accounting"])
+async def test_rollback_hash_binds_complete_logical_data_without_changing_validation(monkeypatch, changed):
+    execution, target, candidate, indexes = _rollback_data_boundary(monkeypatch)
+    command = SimpleNamespace(expected_serving_generation=1, expected_approved_revision=2)
+    validation = candidate["validation_json"]
+    before = deepcopy(candidate)
+    actual, first = await execution._verified_source_rollback_candidate(object(), target, command, {}, "control")
+    assert actual["validation_json"] is validation and candidate == before
+    if changed == "source_generation":
+        candidate["source_generations"] = {"edition": "another-edition"}
+        validation["final_validation"]["source_generations"] = dict(candidate["source_generations"])
+    else:
+        validation["raw_rows"] += 1
+        validation["final_validation"]["counts"] = {
+            **validation["final_validation"]["counts"],
+            "raw_rows": validation["raw_rows"],
+        }
+    changed_candidate = deepcopy(candidate)
+    _, second = await execution._verified_source_rollback_candidate(object(), target, command, {}, "control")
+    assert first != second and candidate == changed_candidate
+    assert indexes.await_count == execution._catalog_readiness.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["missing", "candidate", "generation", "accounting", "index"])
+async def test_rollback_refuses_incomplete_data_or_changed_serving_indexes(monkeypatch, changed):
+    execution, target, candidate, indexes = _rollback_data_boundary(monkeypatch)
+    command = SimpleNamespace(expected_serving_generation=1, expected_approved_revision=2)
+    validation = candidate["validation_json"]["final_validation"]
+    if changed == "missing":
+        candidate["validation_json"].pop("final_validation")
+    elif changed == "candidate":
+        validation["candidate_id"] = str(UUID(int=99))
+    elif changed == "generation":
+        validation["source_generations"] = {"edition": "another-edition"}
+    elif changed == "accounting":
+        validation["counts"] = {**validation["counts"], "raw_rows": 1}
+    else:
+        indexes.return_value = "c" * 64
+    before = deepcopy(candidate)
+    with pytest.raises(ValueError):
+        await execution._verified_source_rollback_candidate(object(), target, command, {}, "control")
+    assert candidate == before
+    assert indexes.await_count == int(changed == "index")
 
 
 def test_publication_custody_callback_is_runtime_only():
@@ -1292,7 +1351,6 @@ async def test_execution_dispatch_cannot_invent_a_refresh_runtime_or_operation(m
         finally:
             close_events.append(True)
 
-    monkeypatch.setattr(consumer, "_verify_execution", AsyncMock())
     execute = AsyncMock()
     monkeypatch.setattr(consumer, "complete_queued_membership_refresh", execute)
     async with AsyncExitStack() as cleanup:
@@ -1379,11 +1437,10 @@ async def test_ptg_published_candidate_resume_never_reopens_raw_preparation(monk
     from process.registry_compact_composition import COMPACT_FORMAT, COMPACT_FORMAT_KEY
 
     candidate_by_field = {"state": "published", "source_generations": {COMPACT_FORMAT_KEY: COMPACT_FORMAT}}
-    monkeypatch.setattr(ptg_runtime.RegistryPublicationPTGRuntime, "_same_execution_database", AsyncMock())
     inspect = AsyncMock(return_value=candidate_by_field)
-    close = AsyncMock()
+    prepare = AsyncMock()
     monkeypatch.setattr(pipeline, "_inspect_candidate", inspect)
-    monkeypatch.setattr(pipeline, "_close_raw_phase", close)
+    monkeypatch.setattr(pipeline, "_prepare_phase_snapshot", prepare)
     assert (
         await isolated_ptg_runtime.prepare(
             SimpleNamespace(is_in_transaction=lambda: False), None, None, writer_roles={}, control_schema="registry"
@@ -1391,7 +1448,7 @@ async def test_ptg_published_candidate_resume_never_reopens_raw_preparation(monk
         is candidate_by_field
     )
     inspect.assert_awaited_once()
-    close.assert_not_awaited()
+    prepare.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1428,11 +1485,9 @@ async def test_ptg_sealed_preparation_requires_fence_before_raw_driver(
 
     inspect = AsyncMock(side_effect=[candidate_by_field, prepared_by_field])
     prepare = AsyncMock()
-    monkeypatch.setattr(ptg_runtime.RegistryPublicationPTGRuntime, "_same_execution_database", AsyncMock())
     monkeypatch.setattr(ptg_runtime, "registry_company_approval_transaction", transaction)
-    monkeypatch.setattr(ptg_runtime, "require_registry_company_approval_fence", require_fence, raising=False)
+    monkeypatch.setattr(ptg_runtime, "require_registry_company_approval_fence", require_fence)
     monkeypatch.setattr(pipeline, "_inspect_candidate", inspect)
-    monkeypatch.setattr(pipeline, "_close_raw_phase", AsyncMock())
     monkeypatch.setattr(pipeline, "_prepare_phase_snapshot", prepare)
     operation = isolated_ptg_runtime.prepare(
         SimpleNamespace(is_in_transaction=lambda: False), None, None, writer_roles={}, control_schema="registry"

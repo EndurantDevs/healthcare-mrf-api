@@ -31,7 +31,9 @@ def _prepared_scope():
             indexes=(encoded(_native_index("native_typed_key_" + str(number), 300 + number)),),
         )
         receipts.append(SimpleNamespace(successor=successor))
-    return SimpleNamespace(source_copy_json=encoded(dict(copy=source_by_field)), prepared=tuple(receipts))
+    return SimpleNamespace(
+        source_copy_json=encoded(dict(name=source_by_field["relname"], copy=source_by_field)), prepared=tuple(receipts)
+    )
 
 
 @pytest.mark.parametrize("flag", ["valid", "ready", "live"])
@@ -39,22 +41,20 @@ def test_unfinished_native_index_is_refused(flag):
     native_index = _native_index("native_key", 101)
     native_index[flag] = False
     with pytest.raises(RuntimeError, match="scratch_index_inventory_changed"):
-        indexes._relation_indexes("synthetic", "pdout_synthetic", 100, [native_index])
+        indexes._relation_indexes("synthetic", "pdout_synthetic", [native_index])
 
 
-@pytest.mark.parametrize("changed", ["duplicate_name", "duplicate_oid", "boolean_oid", "empty"])
+@pytest.mark.parametrize("changed", ["duplicate_name", "invalid_name", "empty"])
 def test_index_inventory_refuses_ambiguous_or_missing_identity(changed):
     native_indexes = [_native_index("native_a", 101), _native_index("native_b", 102)]
     if changed == "duplicate_name":
         native_indexes[1]["name"] = native_indexes[0]["name"]
-    elif changed == "duplicate_oid":
-        native_indexes[1]["oid"] = native_indexes[0]["oid"]
-    elif changed == "boolean_oid":
-        native_indexes[1]["oid"] = True
+    elif changed == "invalid_name":
+        native_indexes[1]["name"] = None
     else:
         native_indexes = []
     with pytest.raises(RuntimeError, match="scratch_index_inventory_changed"):
-        indexes._relation_indexes("synthetic", "pdout_synthetic", 100, native_indexes)
+        indexes._relation_indexes("synthetic", "pdout_synthetic", native_indexes)
 
 
 @pytest.mark.asyncio
@@ -92,7 +92,22 @@ async def test_exact_nine_native_index_identities_use_verified_boundary(monkeypa
         # Exercise boundary ordering and formatting, without representing native authority.
         assert selected_directory is directory and selected_scope is scope
         events.append("verified_boundary_entered")
-        yield SimpleNamespace(policy=SimpleNamespace(schema="synthetic"))
+        rows = iter(
+            [
+                [_native_index("native_control_key", 101)],
+                *[
+                    [_native_index("native_typed_key_" + str(number), 300 + number)]
+                    for number in range(len(indexes.inputs.TYPED_ROOTS))
+                ],
+            ]
+            * 2
+        )
+        from unittest.mock import AsyncMock
+
+        yield SimpleNamespace(
+            policy=SimpleNamespace(schema="synthetic"),
+            connection=SimpleNamespace(fetch=AsyncMock(side_effect=lambda *args: next(rows))),
+        )
         events.append("verified_boundary_closed")
 
     monkeypatch.setattr(indexes.inputs, "scratch_input_transaction", transaction)
@@ -100,10 +115,10 @@ async def test_exact_nine_native_index_identities_use_verified_boundary(monkeypa
     assert events == ["verified_boundary_entered", "verified_boundary_closed"]
     assert set(observed) == {indexes.inputs.SOURCE, *indexes.inputs.TYPED_ROOTS}
     assert observed[indexes.inputs.SOURCE] == dict(
-        schema="synthetic", relation="pdsi_synthetic", oid=100, indexes=(("native_control_key", 101),)
+        schema="synthetic", relation="pdsi_synthetic", indexes=("native_control_key",)
     )
     for number, root in enumerate(indexes.inputs.TYPED_ROOTS):
-        assert observed[root]["indexes"] == (("native_typed_key_" + str(number), 300 + number),)
-        assert observed[root]["oid"] == 200 + number
+        assert observed[root]["indexes"] == ("native_typed_key_" + str(number),)
+        assert set(observed[root]) == {"schema", "relation", "indexes"}
     observed[indexes.inputs.SOURCE]["indexes"] = ()
     assert (await indexes.scratch_index_metadata(directory, scope))[indexes.inputs.SOURCE]["indexes"]

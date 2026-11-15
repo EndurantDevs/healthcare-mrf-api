@@ -11,27 +11,21 @@ from tests.test_provider_directory_cms_history_bounds import _expectations
 
 
 def _catalog():
-    return {
-        "database_oid": 51,
-        "schema_oid": 52,
-        "roots": {root: {"oid": index + 1, "owner": 42} for index, root in enumerate(history.ROOTS)},
-    }
+    return {"schema": "example", "roots": {root: {"schema": "example", "name": root} for root in history.ROOTS}}
 
 
-@pytest.mark.parametrize("fault", ["missing", "extra", "alias", "owner", "bool_oid", "fields"])
+@pytest.mark.parametrize("fault", ["missing", "extra", "alias", "schema", "fields"])
 async def test_invalid_history_coordinates_refuse_before_io(fault):
     expected_by_field = _catalog()
     expected_by_root = expected_by_field["roots"]
     if fault == "missing":
         del expected_by_root[history.WITNESS]
     if fault == "extra":
-        expected_by_root["unrelated"] = {"oid": 43, "owner": 42}
+        expected_by_root["unrelated"] = {"schema": "example", "name": "unrelated"}
     if fault == "alias":
         expected_by_root[history.WITNESS] = deepcopy(expected_by_root[history.RESOURCE])
-    if fault == "owner":
-        expected_by_root[history.WITNESS]["owner"] = 0
-    if fault == "bool_oid":
-        expected_by_root[history.WITNESS]["oid"] = True
+    if fault == "schema":
+        expected_by_root[history.WITNESS]["schema"] = "unrelated"
     if fault == "fields":
         expected_by_root[history.WITNESS]["name"] = "unrelated"
     with pytest.raises(ValueError, match="roots_required"):
@@ -48,7 +42,7 @@ async def test_invalid_history_bounds_refuse_before_io(datasets):
         )
 
 
-@pytest.mark.parametrize("field,value", [("database_oid", True), ("database_oid", 0), ("schema_oid", "52")])
+@pytest.mark.parametrize("field,value", [("schema", True), ("schema", 0), ("schema", "unrelated")])
 async def test_invalid_catalog_coordinates_refuse_before_io(field, value):
     expected_by_field = _catalog()
     expected_by_field[field] = value
@@ -62,9 +56,9 @@ def test_request_detaches_native_coordinates_and_bounds():
     expected_by_field = _catalog()
     datasets = ["one"]
     native, bounds = history._request("example", expected_by_field, datasets)
-    native["roots"][history.WITNESS]["owner"] += 1
+    native["roots"][history.WITNESS]["name"] = "changed"
     bounds.append("two")
-    assert expected_by_field["roots"][history.WITNESS]["owner"] == 42 and datasets == ["one"]
+    assert expected_by_field["roots"][history.WITNESS]["name"] == history.WITNESS and datasets == ["one"]
 
 
 async def test_shared_scan_preserves_full_content_counts_and_both_layout_checks(monkeypatch):
@@ -85,7 +79,9 @@ async def test_shared_scan_preserves_full_content_counts_and_both_layout_checks(
     assert observed["catalog"] == expected
     assert set(observed["dataset_rows"]) == set(observed["content"]) == {history.WITNESS, history.RELATIONSHIP}
     assert roots.await_count == 2 and relationships.await_count == 1 and copies.await_count == 2
-    assert [call.kwargs["receipt"]["oid"] for call in copies.await_args_list] == [2, 3]
+    assert [call.kwargs["receipt"] for call in copies.await_args_list] == [
+        expected["roots"][root] for root in (history.WITNESS, history.RELATIONSHIP)
+    ]
 
 
 async def test_shared_scan_refuses_incomplete_copy_before_relationships(monkeypatch):
@@ -99,19 +95,17 @@ async def test_shared_scan_refuses_incomplete_copy_before_relationships(monkeypa
     relationships.assert_not_awaited()
 
 
-@pytest.mark.parametrize("fault", ["oid", "datasets", "partial"])
+@pytest.mark.parametrize("fault", ["name", "datasets", "partial"])
 async def test_explicit_history_expectation_mismatch_refuses_before_session_io(fault):
     expected = _catalog()
     checked = _expectations()
     for root, entry in checked.items():
-        entry["old_oid"] = expected["roots"][root]["oid"]
-    if fault == "oid":
-        checked[history.WITNESS]["old_oid"] = 999
+        entry["relation"] = dict(expected["roots"][root])
+    if fault == "name":
+        checked[history.WITNESS]["relation"]["name"] = "wrong"
     elif fault == "datasets":
         checked[history.WITNESS]["dataset_ids"] = []
         checked[history.RELATIONSHIP]["dataset_ids"] = []
-        for entry in checked.values():
-            entry["native"]["constraint"]["columns"] = []
     else:
         checked.pop(history.RELATIONSHIP)
     with pytest.raises(ValueError, match="history_bounds_changed|expectations_required"):
@@ -130,7 +124,7 @@ async def test_explicit_history_scan_preserves_each_sealed_bound_and_both_layout
     expected = _catalog()
     checked = _expectations()
     for root, entry in checked.items():
-        entry["old_oid"] = expected["roots"][root]["oid"]
+        entry["relation"] = dict(expected["roots"][root])
     checked[history.RELATIONSHIP]["dataset_ids"] = ["two"]
     roots = AsyncMock()
     scanner = AsyncMock(return_value={"dataset_rows": {}, "content": {}})
@@ -156,15 +150,13 @@ async def test_root_layout_forwards_explicit_expectations_without_replacing_nati
     expected = _catalog()
     checked = _expectations()
     for root, entry in checked.items():
-        entry["old_oid"] = expected["roots"][root]["oid"]
+        entry["relation"] = dict(expected["roots"][root])
     rows = [
         dict(
             name=root,
             nspname="example",
-            schema_oid=52,
             relkind="p" if root == history.RESOURCE else "r",
             leaf=True,
-            **proof,
         )
         for root, proof in expected["roots"].items()
     ]

@@ -164,7 +164,7 @@ async def test_test_target_keeps_existing_no_suffix_semantics(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_generation_cas_binds_old_and_new_native_oids(monkeypatch):
+async def test_generation_cas_preserves_named_scope_and_revisions(monkeypatch):
     from datetime import datetime, timezone
     from uuid import UUID
 
@@ -175,10 +175,11 @@ async def test_generation_cas_binds_old_and_new_native_oids(monkeypatch):
         origin_lineage_id=UUID(int=1),
         origin_generation=1,
         published_at=datetime.now(timezone.utc),
-        relation_oids=[555],
+        serving_schema="mrf",
+        serving_relation_names=[storage.ROOT],
     )
     incumbent = generation.validate_reference_family_result_generation_authority(current_by_field)
-    successor_by_field = {**current_by_field, "local_generation": 2, "origin_generation": 2, "relation_oids": [777]}
+    successor_by_field = {**current_by_field, "local_generation": 2, "origin_generation": 2}
     first = AsyncMock(return_value=successor_by_field)
     monkeypatch.setattr(storage, "_writer", AsyncMock())
     monkeypatch.setattr(storage, "require_geo_storage", AsyncMock(return_value=777))
@@ -186,11 +187,16 @@ async def test_generation_cas_binds_old_and_new_native_oids(monkeypatch):
         generation, "read_reference_family_result_generation_authority", AsyncMock(return_value=incumbent)
     )
     monkeypatch.setattr(generation, "_first", first)
-    result = await storage.publish_geo_generation(None, schema_name="mrf", expected_authority=incumbent)
-    assert result.relation_oids == (777,) and result.local_generation == 2
-    assert first.await_args.kwargs["previous"] == [555]
-    assert first.await_args.kwargs["oids"] == [777]
-    assert "relation_oids IS NOT DISTINCT FROM CAST(:previous AS bigint[])" in str(first.await_args.args[1])
+    successor = await storage.publish_geo_generation(None, schema_name="mrf", expected_authority=incumbent)
+    assert successor.relations == (("mrf", storage.ROOT),) and successor.local_generation == 2
+    assert first.await_args.kwargs["previous_schema"] == "mrf"
+    assert first.await_args.kwargs["previous_names"] == [storage.ROOT]
+    assert first.await_args.kwargs["serving_names"] == [storage.ROOT]
+    assert first.await_args.kwargs["prior"] == 1
+    assert first.await_args.kwargs["generation"] == 2
+    assert "serving_relation_names IS NOT DISTINCT FROM CAST(:previous_names AS text[])" in str(
+        first.await_args.args[1]
+    )
     assert "source_revision_tracked=FALSE" in str(first.await_args.args[1])
 
 
@@ -263,18 +269,26 @@ async def test_reader_grant_precedes_preserved_select_and_locked_geo_swap(monkey
 
 
 @pytest.mark.asyncio
-async def test_loading_raw_and_final_heaps_never_receive_reader_access(monkeypatch):
+@pytest.mark.parametrize("relations", [None, (("mrf", storage.ROOT),), (("other", storage.ROOT),), (("mrf", "other"),)])
+async def test_loading_raw_and_final_heaps_never_receive_reader_access(monkeypatch, relations):
     publisher = SimpleNamespace(connection=object(), policy=SimpleNamespace(schema="mrf"))
     monkeypatch.setattr(snapshot, "bound_publisher", lambda: publisher)
     monkeypatch.setattr(snapshot, "require_geo_storage", AsyncMock(return_value=11))
     monkeypatch.setattr(
         generation,
         "read_reference_family_result_generation_authority",
-        AsyncMock(return_value=SimpleNamespace(relation_oids=(11,))),
+        AsyncMock(return_value=SimpleNamespace(relations=relations)),
     )
     close = AsyncMock()
     monkeypatch.setattr(snapshot, "_close_grants", close)
-    candidate = await snapshot._prepare(SimpleNamespace(execute=AsyncMock()), "mrf", time.monotonic() + 10)
+    session = SimpleNamespace(execute=AsyncMock())
+    if relations not in (None, (("mrf", storage.ROOT),)):
+        with pytest.raises(RuntimeError, match="incumbent_changed"):
+            await snapshot._prepare(session, "mrf", time.monotonic() + 10)
+        session.execute.assert_not_awaited()
+        close.assert_not_awaited()
+        return
+    candidate = await snapshot._prepare(session, "mrf", time.monotonic() + 10)
     assert [call.args for call in close.await_args_list] == [
         (publisher.connection, publisher.policy, candidate.raw),
         (publisher.connection, publisher.policy, candidate.stage),

@@ -11,6 +11,7 @@ from process.provider_directory_rooted_graph_query import (
     build_provider_directory_practitioner_role_query,
 )
 from process.provider_directory_rooted_graph_store_contract import (
+    ProviderDirectoryRootedGraphStoreError,
     build_provider_directory_rooted_graph_work_spec,
 )
 from process.provider_directory_rooted_graph_store_support import (
@@ -18,12 +19,8 @@ from process.provider_directory_rooted_graph_store_support import (
     set_store_action,
     table_ref,
 )
-from tests.formulary_fhir_twin_admission_pg_support import assert_sqlstate
-from tests.formulary_fhir_twin_admission_pg_support import quoted
-from tests.provider_directory_rooted_graph_pg_support import API_BASE
-from tests.provider_directory_rooted_graph_pg_support import EDGE_TABLE
-from tests.provider_directory_rooted_graph_pg_support import RESOURCE_TABLE
-from tests.provider_directory_rooted_graph_pg_support import ROOT_RESOURCE_ID
+from tests.formulary_fhir_twin_admission_pg_support import assert_sqlstate, quoted
+from tests.provider_directory_rooted_graph_pg_support import API_BASE, EDGE_TABLE, RESOURCE_TABLE, ROOT_RESOURCE_ID
 
 
 async def assert_setwise_root_query_identity(database, identity) -> None:
@@ -57,10 +54,15 @@ async def assert_separate_registration_is_rejected(
 ) -> None:
     """Prove derived work cannot lag its parent's terminal transaction."""
 
-    with pytest.raises(DBAPIError, match="discovery_invalid"):
+    with pytest.raises((ProviderDirectoryRootedGraphStoreError, DBAPIError)) as refusal:
         async with database.transaction():
             await set_store_action(database, "derive", identity.acquisition_id)
             await insert_work_spec(database, identity.acquisition_id, direct_spec)
+    if isinstance(refusal.value, ProviderDirectoryRootedGraphStoreError):
+        assert refusal.value.code == "state"
+    else:
+        assert refusal.value.orig.sqlstate == "23514"
+        assert "provider_directory_rooted_graph_discovery_invalid" in str(refusal.value)
 
 
 async def assert_missing_terminal_witnesses(connection, schema_name: str) -> None:
@@ -80,10 +82,7 @@ async def assert_missing_terminal_witnesses(connection, schema_name: str) -> Non
     for row in rows:
         encoded_response = row["missing_response_json_text"].encode("utf-8")
         assert row["missing_response_bytes"] == len(encoded_response)
-        assert (
-            row["missing_response_sha256"]
-            == hashlib.sha256(encoded_response).hexdigest()
-        )
+        assert row["missing_response_sha256"] == hashlib.sha256(encoded_response).hexdigest()
 
 
 async def assert_witness_immutability(connection, schema_name: str) -> None:

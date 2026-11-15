@@ -44,8 +44,7 @@ async def bound_connection(native_tables):
 
 
 async def _row(connection):
-    oid = await connection.fetchval("SELECT 'bound_fixture.history_heap'::regclass::oid")
-    rows = await connection.fetch(bounds._READ_SQL, [oid])
+    rows = await connection.fetch(bounds._READ_SQL, ["history_heap"], "bound_fixture")
     assert len(rows) == 1
     return rows[0]["bound"]
 
@@ -68,7 +67,7 @@ async def test_native_empty_single_multi_and_escaped_source_bounds(bound_connect
     await connection.execute("SET LOCAL standard_conforming_strings=" + ("on" if standard_strings else "off"))
     proof = bounds.require_cms_history_bound(await _row(connection), dataset_ids)
     assert proof["constraint"]["validated"] is True and proof["constraint"]["enforced"] is True
-    assert proof["constraint"]["oid"] > 0
+    assert "oid" not in proof["constraint"] and "tree" not in proof["constraint"]
 
 
 async def test_native_missing_unvalidated_and_different_bounds_refuse(bound_connection):
@@ -104,7 +103,7 @@ async def test_native_read_is_readonly_and_does_not_change_catalog(native_tables
         before = await _row(connection)
         async with observer.transaction(readonly=True):
             proof = bounds.require_cms_history_bound(await _row(observer), ["one"])
-            assert proof["constraint"]["oid"] > 0
+            assert "oid" not in proof["constraint"] and "tree" not in proof["constraint"]
             assert await observer.fetchval("SELECT pg_current_xact_id_if_assigned()::text") is None
             assert await connection.fetchval("SELECT count(*) FROM bound_fixture.history_heap") == 0
         assert bounds._decoded(before) == bounds._decoded(await _row(connection))

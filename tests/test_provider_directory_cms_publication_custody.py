@@ -287,12 +287,10 @@ async def test_actual_prepared_results_consumes_actual_bundle_helper_inside_sour
     monkeypatch.setattr(publication, "_copy_driver", copy_driver)
     monkeypatch.setattr(publication, "preserve_publication_reads", preserve_reads)
 
-    async def apply(
-        stages, schema, relations, profile_delta, active_fence, timeout, *, before_swaps, extra_live_relations
-    ):
+    async def apply(stages, schema, relations, profile_delta, active_fence, timeout, *, publication):
         assert custody.current_owned_wal_transaction(database) is not None
-        assert extra_live_relations == ("target",)
-        await before_swaps()
+        assert publication.extra_live_relations == ("target",) and publication.read_only is True
+        await publication.before_swaps()
         session = database._transaction_binding().session
         copy_driver.assert_awaited_once_with(session)
         preserve_reads.assert_awaited_once_with(
@@ -505,9 +503,12 @@ async def test_source_final_selects_rc_before_original_body_and_retains_factory(
         yield database._transaction_binding().session
 
     monkeypatch.setattr(policy, "source_publication_body", publication_body)
-    trusted_factory = SimpleNamespace(
-        transaction=lambda: None, bind_existing_transaction=bind, publication_session_factory=lambda: None
-    )
+    from tests.test_provider_directory_generic_source_policy import _identity_factory
+
+    trusted_factory = _identity_factory()
+    trusted_factory.transaction = lambda: None
+    trusted_factory.bind_existing_transaction = bind
+    trusted_factory.publication_session_factory = lambda: None
     monkeypatch.setattr(SourceSession, "execute", execute)
     monkeypatch.setattr(wal, "source_body", body)
     async with policy.bind_generic_source_transaction_factory(trusted_factory):

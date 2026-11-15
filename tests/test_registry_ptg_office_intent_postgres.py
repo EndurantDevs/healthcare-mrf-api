@@ -9,9 +9,8 @@ import pytest
 from sqlalchemy import text
 
 from process.network_cms_registry_address_capture import native_driver
-from process.registry_management_permissions import verify_registry_management_permissions
 from process.registry_ptg_office_intent import reserve_registry_ptg_office_prepare_intent
-from tests.test_registry_management_permissions_postgres import _arguments, _install
+from tests.test_registry_management_permissions_postgres import _install
 from tests.test_registry_management_permissions_postgres import permissions_db as permissions_db
 from tests.test_registry_management_permissions_postgres import provider_db as provider_db
 from tests.test_registry_management_permissions_postgres import serving_schema as serving_schema
@@ -29,7 +28,6 @@ async def _reserve(session, fixture, digest="a" * 64):
 async def test_native_concurrent_same_semantic_and_lost_ack_keep_one_original_audit(permissions_db):
     fixture = permissions_db
     await _install(fixture)
-    await verify_registry_management_permissions(fixture.connection, **_arguments(fixture))
     async with fixture.sessions() as first, fixture.sessions() as second:
         await first.begin()
         await second.begin()

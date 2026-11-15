@@ -99,22 +99,10 @@ class EntityAddressResultGeneration(Base, JSONOutputMixin):
         CheckConstraint(
             "singleton IS TRUE AND local_generation >= 0 AND ("
             "(origin_lineage_id IS NULL AND origin_generation IS NULL "
-            "AND published_at IS NULL AND relation_oids IS NULL) OR ("
+            "AND published_at IS NULL) OR ("
             "origin_lineage_id IS NOT NULL AND origin_generation IS NOT NULL "
             "AND origin_generation > 0 "
-            "AND published_at IS NOT NULL AND relation_oids IS NOT NULL "
-            "AND array_ndims(relation_oids) = 1 "
-            "AND array_lower(relation_oids, 1) = 1 "
-            "AND cardinality(relation_oids) = 7 "
-            "AND array_position(relation_oids, NULL) IS NULL "
-            "AND 0 < ALL(relation_oids) "
-            "AND 4294967295 >= ALL(relation_oids) "
-            "AND relation_oids[1] <> ALL(relation_oids[2:7]) "
-            "AND relation_oids[2] <> ALL(relation_oids[3:7]) "
-            "AND relation_oids[3] <> ALL(relation_oids[4:7]) "
-            "AND relation_oids[4] <> ALL(relation_oids[5:7]) "
-            "AND relation_oids[5] <> ALL(relation_oids[6:7]) "
-            "AND relation_oids[6] <> relation_oids[7]))",
+            "AND published_at IS NOT NULL))",
             name="entity_address_result_generation_shape_check",
         ),
         {
@@ -2453,29 +2441,12 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
     __table_args__ = (
         PrimaryKeyConstraint("build_id"),
         CheckConstraint(
+            "targets_json IS NULL OR (jsonb_typeof(targets_json::jsonb)='object' AND targets_json::jsonb - ARRAY['evidence','profile'] = '{}'::jsonb AND targets_json::jsonb ?& ARRAY['evidence','profile'] AND jsonb_typeof(targets_json::jsonb->'evidence')='object' AND (targets_json::jsonb->'evidence') - ARRAY['schema','name'] = '{}'::jsonb AND (targets_json::jsonb->'evidence') ?& ARRAY['schema','name'] AND jsonb_typeof(targets_json::jsonb->'evidence'->'schema')='string' AND length(targets_json::jsonb->'evidence'->>'schema') BETWEEN 1 AND 63 AND jsonb_typeof(targets_json::jsonb->'evidence'->'name')='string' AND length(targets_json::jsonb->'evidence'->>'name') BETWEEN 1 AND 63 AND jsonb_typeof(targets_json::jsonb->'profile')='object' AND (targets_json::jsonb->'profile') - ARRAY['schema','name'] = '{}'::jsonb AND (targets_json::jsonb->'profile') ?& ARRAY['schema','name'] AND jsonb_typeof(targets_json::jsonb->'profile'->'schema')='string' AND length(targets_json::jsonb->'profile'->>'schema') BETWEEN 1 AND 63 AND jsonb_typeof(targets_json::jsonb->'profile'->'name')='string' AND length(targets_json::jsonb->'profile'->>'name') BETWEEN 1 AND 63 AND targets_json::jsonb->'evidence' <> targets_json::jsonb->'profile')",
+            name="pd_profile_build_checkpoint_targets_check",
+        ),
+        CheckConstraint(
             "resume_lineage_hash ~ '^[0-9a-f]{64}$'",
             name="pd_profile_build_checkpoint_lineage_hash_check",
-        ),
-        CheckConstraint(
-            "evidence_stage_oid > 0 AND profile_stage_oid > 0 "
-            "AND (evidence_target_oid IS NULL OR evidence_target_oid > 0) "
-            "AND (profile_target_oid IS NULL OR profile_target_oid > 0)",
-            name="pd_profile_build_checkpoint_oid_check",
-        ),
-        CheckConstraint(
-            "(evidence_stage_storage_fingerprint IS NULL "
-            "AND profile_stage_storage_fingerprint IS NULL "
-            "AND affected_npi_stage_storage_fingerprint IS NULL) "
-            "OR (evidence_stage_storage_fingerprint "
-            "~ '^[0-9a-f]{64}$' "
-            "AND profile_stage_storage_fingerprint "
-            "~ '^[0-9a-f]{64}$' "
-            "AND ((materialization_mode = 'source_delta' "
-            "AND affected_npi_stage_storage_fingerprint "
-            "~ '^[0-9a-f]{64}$') "
-            "OR (materialization_mode = 'full_swap' "
-            "AND affected_npi_stage_storage_fingerprint IS NULL)))",
-            name="pd_profile_build_checkpoint_stage_storage_check",
         ),
         CheckConstraint(
             "state IN ('building_evidence', 'evidence_complete', 'building_profile', 'ready', 'failed')",
@@ -2501,35 +2472,7 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
             name="pd_profile_build_checkpoint_mode_check",
         ),
         CheckConstraint(
-            "(materialization_mode = 'full_swap' "
-            "AND current_source_vector_hash IS NULL "
-            "AND desired_source_vector_hash IS NULL "
-            "AND current_source_context_vector_hash IS NULL "
-            "AND desired_source_context_vector_hash IS NULL "
-            "AND affected_npi_stage IS NULL "
-            "AND affected_npi_stage_oid IS NULL "
-            "AND capacity_geometry_status = 'legacy_unavailable' "
-            "AND capacity_geometry_hash IS NULL "
-            "AND capacity_geometry_json IS NULL) "
-            "OR (materialization_mode = 'source_delta' "
-            "AND current_source_vector_hash IS NOT NULL "
-            "AND current_source_vector_hash ~ '^[0-9a-f]{64}$' "
-            "AND desired_source_vector_hash IS NOT NULL "
-            "AND desired_source_vector_hash ~ '^[0-9a-f]{64}$' "
-            "AND current_source_context_vector_hash IS NOT NULL "
-            "AND current_source_context_vector_hash "
-            "~ '^[0-9a-f]{64}$' "
-            "AND desired_source_context_vector_hash IS NOT NULL "
-            "AND desired_source_context_vector_hash "
-            "~ '^[0-9a-f]{64}$' "
-            "AND affected_npi_stage IS NOT NULL "
-            "AND affected_npi_stage_oid IS NOT NULL "
-            "AND affected_npi_stage_oid > 0 "
-            "AND capacity_geometry_status = 'verified' "
-            "AND capacity_geometry_hash IS NOT NULL "
-            "AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' "
-            "AND capacity_geometry_json IS NOT NULL "
-            "AND jsonb_typeof(capacity_geometry_json::jsonb) = 'object')",
+            "((materialization_mode = 'full_swap' AND current_source_vector_hash IS NULL AND desired_source_vector_hash IS NULL AND current_source_context_vector_hash IS NULL AND desired_source_context_vector_hash IS NULL AND affected_npi_stage IS NULL AND capacity_geometry_status = 'legacy_unavailable' AND capacity_geometry_hash IS NULL AND capacity_geometry_json IS NULL) OR (materialization_mode = 'source_delta' AND current_source_vector_hash IS NOT NULL AND current_source_vector_hash ~ '^[0-9a-f]{64}$' AND desired_source_vector_hash IS NOT NULL AND desired_source_vector_hash ~ '^[0-9a-f]{64}$' AND current_source_context_vector_hash IS NOT NULL AND current_source_context_vector_hash ~ '^[0-9a-f]{64}$' AND desired_source_context_vector_hash IS NOT NULL AND desired_source_context_vector_hash ~ '^[0-9a-f]{64}$' AND affected_npi_stage IS NOT NULL AND capacity_geometry_status = 'verified' AND capacity_geometry_hash IS NOT NULL AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' AND capacity_geometry_json IS NOT NULL AND jsonb_typeof(capacity_geometry_json::jsonb) = 'object')) OR (materialization_mode='full_swap' AND current_source_vector_hash IS NULL AND current_source_context_vector_hash IS NULL AND desired_source_vector_hash ~ '^[0-9a-f]{64}$' AND desired_source_context_vector_hash ~ '^[0-9a-f]{64}$' AND affected_npi_stage IS NULL AND capacity_geometry_status='verified' AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' AND jsonb_typeof(capacity_geometry_json::jsonb)='object' AND capacity_geometry_json::jsonb->>'contract_id' IN ('healthporta.provider-directory-profile-initial-capacity-geometry.v1','healthporta.provider-directory-profile-initial-capacity-geometry.v2') AND capacity_geometry_json::jsonb->>'desired_source_vector_hash'=desired_source_vector_hash AND capacity_geometry_json::jsonb->>'desired_context_vector_hash'=desired_source_context_vector_hash AND capacity_geometry_json::jsonb->>'profile_as_of'=profile_as_of AND capacity_geometry_json::jsonb->>'executable_plan_hash'=executable_plan_hash AND capacity_geometry_json::jsonb->>'initial_target_state_sha256' ~ '^[0-9a-f]{64}$')",
             name="pd_profile_build_checkpoint_delta_identity_check",
         ),
         CheckConstraint(
@@ -2561,6 +2504,7 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
             "extend_existing": True,
         },
     )
+    targets_json = Column(JSON, nullable=True)
     __my_index_elements__ = ["build_id"]
     __my_additional_indexes__ = [
         {
@@ -2591,13 +2535,6 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
     dataset_ids = Column(JSON, nullable=False)
     evidence_stage = Column(String(63), nullable=False)
     profile_stage = Column(String(63), nullable=False)
-    evidence_stage_oid = Column(BigInteger, nullable=False)
-    profile_stage_oid = Column(BigInteger, nullable=False)
-    evidence_stage_storage_fingerprint = Column(String(64))
-    profile_stage_storage_fingerprint = Column(String(64))
-    affected_npi_stage_storage_fingerprint = Column(String(64))
-    evidence_target_oid = Column(BigInteger)
-    profile_target_oid = Column(BigInteger)
     current_source_vector_hash = Column(String(64))
     desired_source_vector_hash = Column(String(64))
     current_source_context_vector_hash = Column(String(64))
@@ -2605,7 +2542,6 @@ class ProviderDirectoryProfileBuildCheckpoint(Base, JSONOutputMixin):
     refresh_source_ids = Column(JSON)
     removed_source_ids = Column(JSON)
     affected_npi_stage = Column(String(63))
-    affected_npi_stage_oid = Column(BigInteger)
     capacity_geometry_status = Column(
         String(32),
         nullable=False,
@@ -2642,32 +2578,11 @@ class ProviderDirectoryProfileServingGeneration(Base, JSONOutputMixin):
     __table_args__ = (
         PrimaryKeyConstraint("singleton_key"),
         CheckConstraint(
-            "singleton_key = 'global' "
-            "AND ((status = 'published' AND operation = 'publish') "
-            "OR (status = 'purged' AND operation = 'purge')) "
-            "AND generation_id ~ '^pdprofile_[0-9a-f]{32}$' "
-            "AND selection_proof_id ~ '^[0-9a-f]{64}$' "
-            "AND source_vector_hash ~ '^[0-9a-f]{64}$' "
-            "AND source_context_vector_hash ~ '^[0-9a-f]{64}$' "
-            "AND executable_plan_hash ~ '^[0-9a-f]{64}$' "
-            "AND ((capacity_geometry_status = 'legacy_unavailable' "
-            "AND capacity_geometry_hash IS NULL "
-            "AND capacity_geometry_json IS NULL) "
-            "OR (capacity_geometry_status = 'verified' "
-            "AND capacity_geometry_hash IS NOT NULL "
-            "AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' "
-            "AND capacity_geometry_json IS NOT NULL "
-            "AND jsonb_typeof(capacity_geometry_json::jsonb) = 'object')) "
-            "AND profile_as_of ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' "
-            "AND control_generation > 0 "
-            "AND authority_revision > 0 "
-            "AND profile_schema_version > 0 "
-            "AND evidence_target_oid > 0 "
-            "AND profile_target_oid > 0 "
-            "AND evidence_rows >= 0 "
-            "AND profile_rows >= 0 "
-            "AND (cutover_forecast_hash IS NULL "
-            "OR cutover_forecast_hash ~ '^[0-9a-f]{64}$')",
+            "jsonb_typeof(targets_json::jsonb)='object' AND targets_json::jsonb - ARRAY['evidence','profile'] = '{}'::jsonb AND targets_json::jsonb ?& ARRAY['evidence','profile'] AND jsonb_typeof(targets_json::jsonb->'evidence')='object' AND (targets_json::jsonb->'evidence') - ARRAY['schema','name'] = '{}'::jsonb AND (targets_json::jsonb->'evidence') ?& ARRAY['schema','name'] AND jsonb_typeof(targets_json::jsonb->'evidence'->'schema')='string' AND length(targets_json::jsonb->'evidence'->>'schema') BETWEEN 1 AND 63 AND jsonb_typeof(targets_json::jsonb->'evidence'->'name')='string' AND length(targets_json::jsonb->'evidence'->>'name') BETWEEN 1 AND 63 AND jsonb_typeof(targets_json::jsonb->'profile')='object' AND (targets_json::jsonb->'profile') - ARRAY['schema','name'] = '{}'::jsonb AND (targets_json::jsonb->'profile') ?& ARRAY['schema','name'] AND jsonb_typeof(targets_json::jsonb->'profile'->'schema')='string' AND length(targets_json::jsonb->'profile'->>'schema') BETWEEN 1 AND 63 AND jsonb_typeof(targets_json::jsonb->'profile'->'name')='string' AND length(targets_json::jsonb->'profile'->>'name') BETWEEN 1 AND 63 AND targets_json::jsonb->'evidence' <> targets_json::jsonb->'profile'",
+            name="pd_profile_serving_generation_targets_check",
+        ),
+        CheckConstraint(
+            "singleton_key = 'global' AND ((status = 'published' AND operation = 'publish') OR (status = 'purged' AND operation = 'purge')) AND generation_id ~ '^pdprofile_[0-9a-f]{32}$' AND selection_proof_id ~ '^[0-9a-f]{64}$' AND source_vector_hash ~ '^[0-9a-f]{64}$' AND source_context_vector_hash ~ '^[0-9a-f]{64}$' AND executable_plan_hash ~ '^[0-9a-f]{64}$' AND ((capacity_geometry_status = 'legacy_unavailable' AND capacity_geometry_hash IS NULL AND capacity_geometry_json IS NULL) OR (capacity_geometry_status = 'verified' AND capacity_geometry_hash IS NOT NULL AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' AND capacity_geometry_json IS NOT NULL AND jsonb_typeof(capacity_geometry_json::jsonb) = 'object')) AND profile_as_of ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' AND control_generation > 0 AND authority_revision > 0 AND profile_schema_version > 0 AND evidence_rows >= 0 AND profile_rows >= 0 AND (cutover_forecast_hash IS NULL OR cutover_forecast_hash ~ '^[0-9a-f]{64}$')",
             name="pd_profile_serving_generation_values_check",
         ),
         {
@@ -2675,6 +2590,7 @@ class ProviderDirectoryProfileServingGeneration(Base, JSONOutputMixin):
             "extend_existing": True,
         },
     )
+    targets_json = Column(JSON, nullable=False)
     __my_index_elements__ = ["singleton_key"]
 
     singleton_key = Column(String(16), nullable=False)
@@ -2695,8 +2611,6 @@ class ProviderDirectoryProfileServingGeneration(Base, JSONOutputMixin):
     capacity_geometry_hash = Column(String(64))
     capacity_geometry_json = Column(JSON)
     cutover_forecast_hash = Column(String(64))
-    evidence_target_oid = Column(BigInteger, nullable=False)
-    profile_target_oid = Column(BigInteger, nullable=False)
     evidence_rows = Column(BigInteger, nullable=False)
     profile_rows = Column(BigInteger, nullable=False)
     profile_as_of = Column(String(10), nullable=False)
@@ -2713,60 +2627,17 @@ class ProviderDirectoryProfileDeltaReceipt(Base, JSONOutputMixin):
     __main_table__ = __tablename__
     __table_args__ = (
         PrimaryKeyConstraint("build_id"),
+        CheckConstraint(
+            "jsonb_typeof(targets_json::jsonb)='object' AND targets_json::jsonb - ARRAY['evidence','profile'] = '{}'::jsonb AND targets_json::jsonb ?& ARRAY['evidence','profile'] AND jsonb_typeof(targets_json::jsonb->'evidence')='object' AND (targets_json::jsonb->'evidence') - ARRAY['schema','name'] = '{}'::jsonb AND (targets_json::jsonb->'evidence') ?& ARRAY['schema','name'] AND jsonb_typeof(targets_json::jsonb->'evidence'->'schema')='string' AND length(targets_json::jsonb->'evidence'->>'schema') BETWEEN 1 AND 63 AND jsonb_typeof(targets_json::jsonb->'evidence'->'name')='string' AND length(targets_json::jsonb->'evidence'->>'name') BETWEEN 1 AND 63 AND jsonb_typeof(targets_json::jsonb->'profile')='object' AND (targets_json::jsonb->'profile') - ARRAY['schema','name'] = '{}'::jsonb AND (targets_json::jsonb->'profile') ?& ARRAY['schema','name'] AND jsonb_typeof(targets_json::jsonb->'profile'->'schema')='string' AND length(targets_json::jsonb->'profile'->>'schema') BETWEEN 1 AND 63 AND jsonb_typeof(targets_json::jsonb->'profile'->'name')='string' AND length(targets_json::jsonb->'profile'->>'name') BETWEEN 1 AND 63 AND targets_json::jsonb->'evidence' <> targets_json::jsonb->'profile'",
+            name="pd_profile_delta_receipt_targets_check",
+        ),
         UniqueConstraint(
             "control_generation",
             "selection_proof_id",
             name="pd_profile_delta_receipt_control_proof_key",
         ),
         CheckConstraint(
-            "build_id ~ '^pdpb_[0-9a-f]{32}$' "
-            "AND executable_plan_hash ~ '^[0-9a-f]{64}$' "
-            "AND ((from_capacity_geometry_status = 'legacy_unavailable' "
-            "AND from_capacity_geometry_hash IS NULL "
-            "AND from_capacity_geometry_json IS NULL) "
-            "OR (from_capacity_geometry_status = 'verified' "
-            "AND from_capacity_geometry_hash IS NOT NULL "
-            "AND from_capacity_geometry_hash ~ '^[0-9a-f]{64}$' "
-            "AND from_capacity_geometry_json IS NOT NULL "
-            "AND jsonb_typeof("
-            "from_capacity_geometry_json::jsonb) = 'object')) "
-            "AND capacity_geometry_status = 'verified' "
-            "AND capacity_geometry_hash IS NOT NULL "
-            "AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' "
-            "AND capacity_geometry_json IS NOT NULL "
-            "AND jsonb_typeof(capacity_geometry_json::jsonb) = 'object' "
-            "AND from_source_vector_hash ~ '^[0-9a-f]{64}$' "
-            "AND to_source_vector_hash ~ '^[0-9a-f]{64}$' "
-            "AND from_source_context_vector_hash ~ '^[0-9a-f]{64}$' "
-            "AND to_source_context_vector_hash ~ '^[0-9a-f]{64}$' "
-            "AND from_generation_id ~ '^pdprofile_[0-9a-f]{32}$' "
-            "AND generation_id ~ '^pdprofile_[0-9a-f]{32}$' "
-            "AND operation IN ('publish', 'purge') "
-            "AND profile_as_of ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' "
-            "AND selection_proof_id ~ '^[0-9a-f]{64}$' "
-            "AND control_generation > 0 "
-            "AND authority_revision > 0 "
-            "AND evidence_target_oid > 0 "
-            "AND profile_target_oid > 0 "
-            "AND evidence_rows >= 0 "
-            "AND profile_rows >= 0 "
-            "AND evidence_inserted >= 0 "
-            "AND evidence_deleted >= 0 "
-            "AND profile_inserted >= 0 "
-            "AND profile_deleted >= 0 "
-            "AND cutover_forecast_hash ~ '^[0-9a-f]{64}$' "
-            "AND jsonb_typeof(cutover_forecast_json::jsonb) = 'object' "
-            "AND cutover_actual_hash ~ '^[0-9a-f]{64}$' "
-            "AND jsonb_typeof(cutover_actual_json::jsonb) = 'object' "
-            "AND cutover_wal_start_lsn IS NOT NULL "
-            "AND cutover_wal_observed_lsn IS NOT NULL "
-            "AND cutover_wal_bytes >= 0 "
-            "AND evidence_target_bytes_before >= 0 "
-            "AND evidence_target_bytes_after >= 0 "
-            "AND evidence_target_growth_bytes >= 0 "
-            "AND profile_target_bytes_before >= 0 "
-            "AND profile_target_bytes_after >= 0 "
-            "AND profile_target_growth_bytes >= 0",
+            "build_id ~ '^pdpb_[0-9a-f]{32}$' AND executable_plan_hash ~ '^[0-9a-f]{64}$' AND ((from_capacity_geometry_status = 'legacy_unavailable' AND from_capacity_geometry_hash IS NULL AND from_capacity_geometry_json IS NULL) OR (from_capacity_geometry_status = 'verified' AND from_capacity_geometry_hash IS NOT NULL AND from_capacity_geometry_hash ~ '^[0-9a-f]{64}$' AND from_capacity_geometry_json IS NOT NULL AND jsonb_typeof(from_capacity_geometry_json::jsonb) = 'object')) AND capacity_geometry_status = 'verified' AND capacity_geometry_hash IS NOT NULL AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' AND capacity_geometry_json IS NOT NULL AND jsonb_typeof(capacity_geometry_json::jsonb) = 'object' AND from_source_vector_hash ~ '^[0-9a-f]{64}$' AND to_source_vector_hash ~ '^[0-9a-f]{64}$' AND from_source_context_vector_hash ~ '^[0-9a-f]{64}$' AND to_source_context_vector_hash ~ '^[0-9a-f]{64}$' AND from_generation_id ~ '^pdprofile_[0-9a-f]{32}$' AND generation_id ~ '^pdprofile_[0-9a-f]{32}$' AND operation IN ('publish', 'purge') AND profile_as_of ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' AND selection_proof_id ~ '^[0-9a-f]{64}$' AND control_generation > 0 AND authority_revision > 0 AND evidence_rows >= 0 AND profile_rows >= 0 AND evidence_inserted >= 0 AND evidence_deleted >= 0 AND profile_inserted >= 0 AND profile_deleted >= 0 AND cutover_forecast_hash ~ '^[0-9a-f]{64}$' AND jsonb_typeof(cutover_forecast_json::jsonb) = 'object' AND cutover_actual_hash ~ '^[0-9a-f]{64}$' AND jsonb_typeof(cutover_actual_json::jsonb) = 'object' AND cutover_wal_start_lsn IS NOT NULL AND cutover_wal_observed_lsn IS NOT NULL AND cutover_wal_bytes >= 0 AND evidence_target_bytes_before >= 0 AND evidence_target_bytes_after >= 0 AND evidence_target_growth_bytes >= 0 AND profile_target_bytes_before >= 0 AND profile_target_bytes_after >= 0 AND profile_target_growth_bytes >= 0",
             name="pd_profile_delta_receipt_values_check",
         ),
         {
@@ -2774,6 +2645,7 @@ class ProviderDirectoryProfileDeltaReceipt(Base, JSONOutputMixin):
             "extend_existing": True,
         },
     )
+    targets_json = Column(JSON, nullable=False)
     __my_index_elements__ = ["build_id"]
     __my_additional_indexes__ = [
         {
@@ -2801,8 +2673,6 @@ class ProviderDirectoryProfileDeltaReceipt(Base, JSONOutputMixin):
     selection_proof_id = Column(String(64), nullable=False)
     control_generation = Column(BigInteger, nullable=False)
     authority_revision = Column(BigInteger, nullable=False)
-    evidence_target_oid = Column(BigInteger, nullable=False)
-    profile_target_oid = Column(BigInteger, nullable=False)
     evidence_rows = Column(BigInteger, nullable=False)
     profile_rows = Column(BigInteger, nullable=False)
     evidence_inserted = Column(BigInteger, nullable=False)
@@ -2849,48 +2719,7 @@ class ProviderDirectoryProfileCapacityLeaseConsumption(
             name="pd_profile_capacity_consumption_purpose_check",
         ),
         CheckConstraint(
-            "attestation_id ~ '^[0-9a-f]{64}$' "
-            "AND reservation_id ~ "
-            "'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' "
-            "AND lease_digest ~ '^[0-9a-f]{64}$' "
-            "AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' "
-            "AND executable_plan_hash ~ '^[0-9a-f]{64}$' "
-            "AND selection_proof_id ~ '^[0-9a-f]{64}$' "
-            "AND source_vector_hash ~ '^[0-9a-f]{64}$' "
-            "AND source_context_vector_hash ~ '^[0-9a-f]{64}$' "
-            "AND run_id ~ '^run_[0-9a-f]{32}$' "
-            "AND build_id ~ '^pdpb_[0-9a-f]{32}$' "
-            "AND profile_as_of ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' "
-            "AND contract_id IN ("
-            "'provider-directory-database-capacity-lease-v1', "
-            "'provider-directory-database-capacity-lease-v2', "
-            "'provider-directory-database-capacity-lease-v3') "
-            "AND key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
-            "AND environment_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
-            "AND attestor_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
-            "AND attestor_release_digest ~ '^[0-9a-f]{64}$' "
-            "AND public_key_fingerprint ~ '^[0-9a-f]{64}$' "
-            "AND database_system_identifier ~ '^[1-9][0-9]{0,19}$' "
-            "AND database_system_identifier::numeric "
-            "<= 18446744073709551615 "
-            "AND database_oid BETWEEN 1 AND 4294967295 "
-            "AND database_name ~ "
-            "'^[A-Za-z0-9_$][A-Za-z0-9_$.-]{0,62}$' "
-            "AND tablespace_identity_hash ~ '^[0-9a-f]{64}$' "
-            "AND volume_identity_hash ~ '^[0-9a-f]{64}$' "
-            "AND signature ~ '^[A-Za-z0-9_-]{86}$' "
-            "AND observed_at <= issued_at "
-            "AND issued_at - observed_at <= interval '300 seconds' "
-            "AND accepted_at + interval '5 seconds' >= issued_at "
-            "AND accepted_at - observed_at <= interval '305 seconds' "
-            "AND accepted_at < expires_at "
-            "AND accepted_at < max_build_deadline "
-            "AND recorded_at = accepted_at "
-            "AND recorded_at < expires_at "
-            "AND recorded_at < max_build_deadline "
-            "AND issued_at < max_build_deadline "
-            "AND max_build_deadline <= expires_at "
-            "AND expires_at - issued_at <= interval '86400 seconds'",
+            "attestation_id ~ '^[0-9a-f]{64}$' AND reservation_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' AND lease_digest ~ '^[0-9a-f]{64}$' AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' AND executable_plan_hash ~ '^[0-9a-f]{64}$' AND selection_proof_id ~ '^[0-9a-f]{64}$' AND source_vector_hash ~ '^[0-9a-f]{64}$' AND source_context_vector_hash ~ '^[0-9a-f]{64}$' AND run_id ~ '^run_[0-9a-f]{32}$' AND build_id ~ '^pdpb_[0-9a-f]{32}$' AND profile_as_of ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' AND contract_id IN ('provider-directory-database-capacity-lease-v1', 'provider-directory-database-capacity-lease-v2', 'provider-directory-database-capacity-lease-v3', 'provider-directory-database-capacity-lease-v4') AND key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' AND environment_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' AND attestor_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' AND attestor_release_digest ~ '^[0-9a-f]{64}$' AND public_key_fingerprint ~ '^[0-9a-f]{64}$' AND signature ~ '^[A-Za-z0-9_-]{86}$' AND observed_at <= issued_at AND issued_at - observed_at <= interval '300 seconds' AND accepted_at + interval '5 seconds' >= issued_at AND accepted_at - observed_at <= interval '305 seconds' AND accepted_at < expires_at AND accepted_at < max_build_deadline AND recorded_at = accepted_at AND recorded_at < expires_at AND recorded_at < max_build_deadline AND issued_at < max_build_deadline AND max_build_deadline <= expires_at AND expires_at - issued_at <= interval '86400 seconds'",
             name="pd_profile_capacity_consumption_values_check",
         ),
         {
@@ -2924,11 +2753,6 @@ class ProviderDirectoryProfileCapacityLeaseConsumption(
     attestor_id = Column(String(64), nullable=False)
     attestor_release_digest = Column(String(64), nullable=False)
     public_key_fingerprint = Column(String(64), nullable=False)
-    database_system_identifier = Column(String(20), nullable=False)
-    database_oid = Column(BigInteger, nullable=False)
-    database_name = Column(String(63), nullable=False)
-    tablespace_identity_hash = Column(String(64), nullable=False)
-    volume_identity_hash = Column(String(64), nullable=False)
     canonical_lease_json = Column(TEXT, nullable=False)
     signature = Column(String(86), nullable=False)
     observed_at = Column(TIMESTAMP(timezone=True), nullable=False)
@@ -2965,37 +2789,7 @@ class ProviderDirectoryProfileCapacityPreflightReceipt(
             name="pd_profile_capacity_preflight_request_sha_key",
         ),
         CheckConstraint(
-            "contract_id = "
-            "'healthporta.provider-directory-profile-capacity-preflight.v3' "
-            "AND request_contract_id = "
-            "'healthporta.provider-directory-profile-capacity-preflight-request.v3' "
-            "AND limits_contract_id = "
-            "'healthporta.provider-directory-profile-capacity-limits.v2' "
-            "AND materialization_mode = 'source_delta' "
-            "AND profile_strategy_version = "
-            "'source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6' "
-            "AND receipt_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND request_nonce ~ '^[0-9a-f]{64}$' "
-            "AND request_sha256 ~ '^[0-9a-f]{64}$' "
-            f"AND {_PROFILE_CAPACITY_CONTROL_PLANE_RECEIPT_COLUMN} "
-            "~ '^[0-9a-f]{64}$' "
-            "AND selection_proof_id ~ '^[0-9a-f]{64}$' "
-            "AND profile_input_digest ~ '^[0-9a-f]{64}$' "
-            "AND limits_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' "
-            "AND serving_preflight_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND quiescence_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND control_generation > 0 "
-            "AND profile_schema_version > 0 "
-            "AND issued_at < expires_at "
-            "AND expires_at - issued_at <= interval '86400 seconds' "
-            "AND jsonb_typeof(receipt_json::jsonb) = 'object' "
-            "AND ((consumed_at IS NULL AND consumed_run_id IS NULL "
-            "AND consumed_attestation_id IS NULL) "
-            "OR (consumed_at IS NOT NULL "
-            "AND consumed_at >= issued_at AND consumed_at < expires_at "
-            "AND consumed_run_id ~ '^run_[0-9a-f]{32}$' "
-            "AND consumed_attestation_id ~ '^[0-9a-f]{64}$'))",
+            "((contract_id='healthporta.provider-directory-profile-capacity-preflight.v3' AND request_contract_id='healthporta.provider-directory-profile-capacity-preflight-request.v3') OR (contract_id='healthporta.provider-directory-profile-capacity-preflight.v4' AND request_contract_id='healthporta.provider-directory-profile-capacity-preflight-request.v4') OR (contract_id='healthporta.provider-directory-profile-capacity-preflight.v5' AND request_contract_id='healthporta.provider-directory-profile-capacity-preflight-request.v5') OR (contract_id='healthporta.provider-directory-profile-capacity-preflight.v6' AND request_contract_id='healthporta.provider-directory-profile-capacity-preflight-request.v6') OR (contract_id='healthporta.provider-directory-profile-capacity-preflight.v7' AND request_contract_id='healthporta.provider-directory-profile-capacity-preflight-request.v7') OR (contract_id='healthporta.provider-directory-profile-capacity-preflight.v8' AND request_contract_id='healthporta.provider-directory-profile-capacity-preflight-request.v8')) AND limits_contract_id = 'healthporta.provider-directory-profile-capacity-limits.v2' AND ((contract_id IN ('healthporta.provider-directory-profile-capacity-preflight.v3','healthporta.provider-directory-profile-capacity-preflight.v6') AND materialization_mode='source_delta') OR (contract_id IN ('healthporta.provider-directory-profile-capacity-preflight.v5','healthporta.provider-directory-profile-capacity-preflight.v7') AND materialization_mode='full_swap' AND receipt_json::jsonb->>'profile_materialization'='initial_full_swap') OR (contract_id IN ('healthporta.provider-directory-profile-capacity-preflight.v4','healthporta.provider-directory-profile-capacity-preflight.v8') AND materialization_mode IN ('source_delta','full_swap') AND receipt_json::jsonb->'capacity_geometry'->>'contract_id'='provider-directory-cms-nonprofile-capacity.v1' AND receipt_json::jsonb->'capacity_geometry'->>'admission_purpose'='cms_nonprofile')) AND profile_strategy_version = 'source-fact-role32-org32-member32-dataset-graph8-auth-npi5m-v6' AND receipt_sha256 ~ '^[0-9a-f]{64}$' AND request_nonce ~ '^[0-9a-f]{64}$' AND request_sha256 ~ '^[0-9a-f]{64}$' AND control_plane_receipt_sha256 ~ '^[0-9a-f]{64}$' AND selection_proof_id ~ '^[0-9a-f]{64}$' AND profile_input_digest ~ '^[0-9a-f]{64}$' AND limits_sha256 ~ '^[0-9a-f]{64}$' AND capacity_geometry_hash ~ '^[0-9a-f]{64}$' AND serving_preflight_sha256 ~ '^[0-9a-f]{64}$' AND quiescence_sha256 ~ '^[0-9a-f]{64}$' AND control_generation > 0 AND profile_schema_version > 0 AND issued_at < expires_at AND expires_at - issued_at <= interval '86400 seconds' AND jsonb_typeof(receipt_json::jsonb) = 'object' AND ((consumed_at IS NULL AND consumed_run_id IS NULL AND consumed_attestation_id IS NULL) OR (consumed_at IS NOT NULL AND consumed_at >= issued_at AND consumed_at < expires_at AND consumed_run_id ~ '^run_[0-9a-f]{32}$' AND consumed_attestation_id ~ '^[0-9a-f]{64}$'))",
             name="pd_profile_capacity_preflight_values_check",
         ),
         {

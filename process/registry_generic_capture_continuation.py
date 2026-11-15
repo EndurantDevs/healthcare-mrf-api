@@ -18,7 +18,7 @@ from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
 
 @dataclass(frozen=True)
 class RegistryGenericCaptureTarget:
-    """Fixed host custody policy, never supplied by a publication request."""
+    """Fixed administrator freeze configuration for one named retained generation."""
 
     owner_role: str
     runtime_roles: tuple[str, ...]
@@ -39,11 +39,7 @@ class RegistryGenericCaptureTarget:
 
 async def _existing_capture(reader, head, target):
     capture = await read_accepted_generic_capture_metadata(reader, head, RegistryPTGGraphReadBudget(1048576))
-    require(
-        capture.owner_role == target.owner_role
-        and capture.runtime_roles == target.runtime_roles
-        and capture.origin.preparation_schema == target.preparation_schema
-    )
+    require(capture.origin.preparation_schema == target.preparation_schema)
     return await require_retained_fhir_capture(reader, capture)
 
 
@@ -87,9 +83,5 @@ async def _committed_capture_identity(reader, schema_name, source_id, endpoint_i
 
 
 def _require_capture_request(reader, writer, target, expected_head):
-    require(
-        type(target) is RegistryGenericCaptureTarget
-        and type(expected_head) is AcceptedGenericFHIRHead
-        and reader is not writer
-    )
+    require(type(target) is RegistryGenericCaptureTarget and type(expected_head) is AcceptedGenericFHIRHead)
     require(reader.is_in_transaction() and writer.is_in_transaction())

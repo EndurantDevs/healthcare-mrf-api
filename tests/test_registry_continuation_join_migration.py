@@ -29,7 +29,7 @@ COMPANY_JOIN = "20261025020000_company_affiliation_join"
 CATALOG_HEAD = "20261028010000_registry_fhir_catalog"
 REFRESH_HEAD = "20261028020000_registry_membership_refresh"
 INVENTORY_HEAD = "20261029010000_registry_source_inventory"
-LIFECYCLE_HEAD = "20261114020000_custom_import_snapshot_metadata"
+LIFECYCLE_HEAD = "20261116090000_profile_capacity_logical_names"
 PTG_MEMBERSHIP = "20261021110000_ptg_membership_import_idempotency"
 
 
@@ -40,6 +40,8 @@ def _script():
 
 
 def test_join_preserves_both_completed_parent_histories():
+    from tests.test_company_registry_group_assertion_migration import _assert_source_inventory_migration_head
+
     script = _script()
     parents = (
         "20261023100000_provider_directory_retirement_parent_updates",
@@ -51,16 +53,7 @@ def test_join_preserves_both_completed_parent_histories():
     assert script.get_revision(FIRST_RETIREMENT).down_revision == CHECKER_EXECUTION
     assert script.get_revision(SERVING_RECOVERY).down_revision == CURRENT_HEAD
     assert script.get_heads() == [LIFECYCLE_HEAD]
-    assert script.get_revision(LIFECYCLE_HEAD).down_revision == "20261114010000_custom_import_snapshot_names"
-    assert script.get_revision("20261114010000_custom_import_snapshot_names").down_revision == (
-        "20261115010000_ms_drg_companion_tables"
-    )
-    assert script.get_revision("20261115010000_ms_drg_companion_tables").down_revision == (
-        "20261113010000_address_canonical_space_normalization"
-    )
-    assert script.get_revision("20261113010000_address_canonical_space_normalization").down_revision == (
-        "20261111010000_code_sets_publication_idempotency"
-    )
+    _assert_source_inventory_migration_head(script)
     assert script.get_revision(INVENTORY_HEAD).down_revision == REFRESH_HEAD
     assert script.get_revision(REFRESH_HEAD).down_revision == CATALOG_HEAD
     assert script.get_revision(CATALOG_HEAD).down_revision == COMPANY_JOIN

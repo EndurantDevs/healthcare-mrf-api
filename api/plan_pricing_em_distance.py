@@ -8,7 +8,6 @@ from typing import Any, Mapping
 
 from sqlalchemy import text
 
-from api.network_read_execution import execute_network_read
 from api.plan_pricing_projection_contract import SCHEMA, PlanPricingProjectionUnavailable
 from api.plan_release_serving import (
     PlanReleaseServingSelection,
@@ -408,8 +407,7 @@ async def _progressive_page_rows(
     zip5, latitude, longitude = location
     candidate_limit = max(_INITIAL_LOCATION_WINDOW, (int(pagination.offset) + int(pagination.limit) + 1) * 4)
     while True:
-        page_result = await execute_network_read(
-            session,
+        page_result = await session.execute(
             text(_PAGE_SQL if page_sql is None else page_sql),
             {
                 "serving_revision_id": selection.serving_revision_id,

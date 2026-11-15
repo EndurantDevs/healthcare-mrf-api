@@ -21,7 +21,7 @@ from tests.test_network_serving_schema_postgres import serving_schema
 
 @pytest.fixture
 async def projection_db(serving_schema):
-    connection, control_schema, _ = serving_schema
+    connection, control_schema, engine = serving_schema
     candidate_id = uuid4()
     copy_target = MembershipCopyTarget(
         str(uuid4()), str(uuid4()), str(uuid4()), str(candidate_id), "network_candidate_" + candidate_id.hex
@@ -49,6 +49,7 @@ async def projection_db(serving_schema):
         )
         yield SimpleNamespace(
             connection=connection,
+            engine=engine,
             observer=observer,
             control_schema=control_schema,
             copy_target=copy_target,

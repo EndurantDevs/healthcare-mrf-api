@@ -1,5 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock
 
 import pytest
@@ -12,9 +13,7 @@ from tests.ptg2_serving_coverage_paydown_support import strict_v3_tables
 async def test_spatial_location_query_fails_closed_without_geo_capability(
     monkeypatch,
 ):
-    address_table_lookup = AsyncMock(
-        return_value="mrf.entity_address_unified"
-    )
+    address_table_lookup = AsyncMock(return_value="mrf.entity_address_unified")
     monkeypatch.setattr(
         serving,
         "_ptg2_address_serving_table",
@@ -32,7 +31,7 @@ async def test_spatial_location_query_fails_closed_without_geo_capability(
         match="requires canonical ZIP geometry",
     ):
         await serving._membership_location_query(
-            object(),
+            SimpleNamespace(scalar=AsyncMock(return_value=False)),
             strict_v3_tables(),
             {"zip5": "00000"},
             candidate_npis=None,
@@ -43,9 +42,7 @@ async def test_spatial_location_query_fails_closed_without_geo_capability(
         ANY,
         schema_name=serving.PTG2_SCHEMA,
     )
-    assert address_table_lookup.await_args.args[1] == (
-        serving._PTG2_UNIFIED_ADDRESS_COLUMNS
-    )
+    assert address_table_lookup.await_args.args[1] == (serving._PTG2_UNIFIED_ADDRESS_COLUMNS)
 
 
 @pytest.mark.asyncio
@@ -66,6 +63,4 @@ async def test_text_location_filter_requires_complete_unified_schema(monkeypatch
             {"state": "TS"},
         )
 
-    assert address_table_lookup.await_args.args[1] == (
-        serving._PTG2_UNIFIED_ADDRESS_COLUMNS
-    )
+    assert address_table_lookup.await_args.args[1] == (serving._PTG2_UNIFIED_ADDRESS_COLUMNS)

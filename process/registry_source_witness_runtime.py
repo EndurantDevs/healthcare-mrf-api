@@ -65,7 +65,7 @@ async def install_source_witness_runtime(config, resources, *, membership_refres
         return config
     if membership_refresh_request_id is not None:
         raise ValueError("registry_source_witness_refresh_unsupported")
-    if config.custody_url is None or address_sources is None or not address_sources.compact:
+    if address_sources is None or not address_sources.compact:
         raise ValueError("registry_source_witness_worker_config_invalid")
     if settings is None:
         existing.__post_init__()

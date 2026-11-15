@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from api import plan_pricing_code_build as build
 from api import plan_pricing_projection_v3_price as prices
 from api import ptg2_serving as serving
+from api import ptg_membership_storage as attachments
 from api.plan_pricing_code_contract import SPEC, capability_identity, identity_digest
 from api.plan_pricing_code_read import CodePricingCapability
 from api.plan_pricing_code_storage import attachment_name, locate, receipt, retire_unreferenced
@@ -245,23 +246,20 @@ async def _source_database(db):
                 "INSERT INTO mrf.code_source_provider_set VALUES (1,100,2,decode(repeat('01',16),'hex')),(1,101,2,decode(repeat('02',16),'hex')),(1,102,1,decode(repeat('03',16),'hex')),(1,104,1,decode(repeat('04',16),'hex'))"
             )
         )
-        owner = await native.protected_publisher_owner(session)
-        role = await session.scalar(text("SELECT quote_ident(rolname) FROM pg_roles WHERE oid=:oid"), {"oid": owner})
         name = "pm_" + "a" * 52
         await session.execute(text(f'CREATE VIEW hp_snapshot_retention."{name}" AS SELECT 1 AS witness'))
-        await session.execute(text(f'ALTER VIEW hp_snapshot_retention."{name}" OWNER TO {role}'))
-        return int(
-            await session.scalar(text("SELECT to_regclass(:name)::oid"), {"name": "hp_snapshot_retention." + name})
-        )
+        view = "hp_snapshot_retention." + name
+        await attachments.freeze_attachment(session, view, ('"' + db.reader + '"',))
+        return view
 
 
-def _fixture(monkeypatch, db, oid, *, failure=None):
+def _fixture(monkeypatch, db, view, *, failure=None):
     """Install complete alias inputs while keeping publication and reads native."""
     monkeypatch.setattr(build, "MAX_CODE_MEMBER_CELL_WORK_ROWS", 1000)
     monkeypatch.setattr(build, "MAX_CODE_FACTOR_JOIN_WORK_ROWS", 1000)
     code_identity = ("CPT", "27447")
     source_by_key = _source()
-    source_by_key["membership"]["active_attachment"]["relation_oid"] = oid
+    assert view == "hp_snapshot_retention." + source_by_key["membership"]["active_attachment"]["name"]
     source_by_key["code_rows"] = [{"code_key": 7, "occurrence_count": 5}]
     alias = copy.deepcopy(source_by_key)
     alias["binding_ordinal"] = 1

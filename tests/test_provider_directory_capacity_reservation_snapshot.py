@@ -5,23 +5,27 @@ import datetime
 import json
 from copy import deepcopy
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 
 from process import provider_directory_capacity_reservation_snapshot as snapshot
 from process import provider_directory_cms_capacity_contract as cms_contract
+from process import provider_directory_profile_capacity_attestation as leases
 from process import provider_directory_profile_capacity_preflight_contract as preflight
 from process import provider_directory_profile_failed_cleanup as cleanup
 from process import provider_directory_profile_initial_contract as initial_contract
 from process.provider_directory_profile_capacity_attestation_contract import CapacityLeaseConsumptionBinding
 from process.provider_directory_profile_capacity_consumption import capacity_lease_consumption_values
 from tests.provider_directory_cms_capacity_test_support import cms_guard, sign_guard
-from tests.test_provider_directory_profile_capacity_attestation import VALIDATION_TIME, _signed_envelope, _verify
+from tests.provider_directory_profile_initial_test_support import signed_initial_envelope, synthetic_initial_execution
+from tests.test_provider_directory_profile_capacity_attestation import (
+    VALIDATION_TIME,
+    _historical_envelope,
+    _signed_envelope,
+    _verify,
+)
 from tests.test_provider_directory_profile_failed_cleanup import authorization_fixture
-from tests.provider_directory_profile_initial_test_support import signed_initial_envelope
 from tests.test_provider_directory_profile_initial import _geometry, _target, fhir
-from tests.test_provider_directory_profile_initial_replay import _selection
 
 RUN_ID = "run_" + "a" * 32
 
@@ -34,10 +38,7 @@ def _node(monkeypatch):
 def _metadata(*, observed_at=VALIDATION_TIME):
     return {
         "observed_at": observed_at,
-        "database_snapshot": "100:100:",
-        "database_system_identifier": "7527713908662902214",
-        "database_oid": 16401,
-        "database_name": "healthporta_test",
+        "schema": "fixture",
     }
 
 
@@ -71,7 +72,7 @@ def _preflight(envelope):
 
 
 def _initial_envelope(accepted_at=VALIDATION_TIME):
-    execution = _selection()
+    execution = synthetic_initial_execution()
     target = _target()
     geometry = _geometry()
     pairs = tuple((pair["source_id"], pair["dataset_id"]) for pair in execution.attestation.pairs)
@@ -86,10 +87,7 @@ def _initial_envelope(accepted_at=VALIDATION_TIME):
         initial_target_state_sha256=initial_contract.target_state_sha256(target),
         **{name: value for name, value in target.items() if "_target_" in name and name in vars(geometry)},
     )
-    database = SimpleNamespace(
-        **vars(geometry), temp_tablespace_oid=geometry.tablespace_oid, temp_tablespace_name=geometry.tablespace_name
-    )
-    return signed_initial_envelope(geometry, database, target, execution, accepted_at)[0]
+    return signed_initial_envelope(geometry, None, target, execution, accepted_at)[0]
 
 
 def _run(envelope, *, status="running", run_id=RUN_ID):
@@ -111,7 +109,11 @@ def _run(envelope, *, status="running", run_id=RUN_ID):
 
 def _project(*, consumptions=(), runs=(), preflights=(), stages=(), cleanup_claims=(), observed_at=VALIDATION_TIME):
     return snapshot.reservation_projection(
-        _metadata(observed_at=observed_at), list(consumptions), list(runs), list(preflights), list(stages),
+        _metadata(observed_at=observed_at),
+        list(consumptions),
+        list(runs),
+        list(preflights),
+        list(stages),
         list(cleanup_claims),
     )
 
@@ -164,7 +166,9 @@ def test_consumption_and_pending_run_share_one_original_reservation(monkeypatch)
     reservation = result["reservations"][0]
     assert reservation["envelope"] == envelope
     assert reservation["lease_digest"] == consumption["lease_digest"]
-    assert reservation["database_binding"] == {name: consumption[name] for name in snapshot._DATABASE_FIELDS}
+    assert result["schema"] == "fixture"
+    assert "database_binding" not in reservation
+    assert reservation["envelope"]["lease"]["storage_classes"] == envelope["lease"]["storage_classes"]
     assert reservation["durable_preflight_present"] is True
     assert [item["kind"] for item in reservation["observations"]] == ["consumption", "import_run"]
     assert result["capacity_complete"] is False
@@ -207,8 +211,9 @@ def test_initial_receipt_lifecycle_preserves_conservative_snapshot(state):
     row = _preflight(envelope)
     observed = VALIDATION_TIME
     if state == "consumed":
-        row.update(consumed_at=observed, consumed_run_id=RUN_ID,
-                   consumed_attestation_id=envelope["lease"]["attestation_id"])
+        row.update(
+            consumed_at=observed, consumed_run_id=RUN_ID, consumed_attestation_id=envelope["lease"]["attestation_id"]
+        )
     elif state == "expired":
         observed = row["expires_at"] + datetime.timedelta(seconds=1)
     before = deepcopy(row)
@@ -269,8 +274,19 @@ def test_initial_receipt_refuses_corruption_and_other_contract_hash_domain(wrong
         _project(preflights=[row])
 
 
-@pytest.mark.parametrize("field", ["contract_id", "request_contract_id", "request_sha256", "request_nonce",
-                                  "control_plane_receipt_sha256", "capacity_geometry_hash", "issued_at", "expires_at"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "contract_id",
+        "request_contract_id",
+        "request_sha256",
+        "request_nonce",
+        "control_plane_receipt_sha256",
+        "capacity_geometry_hash",
+        "issued_at",
+        "expires_at",
+    ],
+)
 def test_initial_receipt_retains_all_row_metadata_checks(field):
     row = _preflight(_initial_envelope())
     row[field] = row[field] + datetime.timedelta(seconds=1) if field.endswith("_at") else "changed"
@@ -301,8 +317,8 @@ def test_cms_run_retains_two_independent_exact_envelopes_once(monkeypatch):
     [
         ("reservation_id", "changed"),
         ("lease_digest", "00" * 32),
-        ("volume_identity_hash", "00" * 32),
-        ("database_oid", 1),
+        ("capacity_geometry_hash", "00" * 32),
+        ("key_id", "untrusted-key"),
         ("admission_purpose", "cms_nonprofile"),
     ],
 )
@@ -346,9 +362,10 @@ def test_active_owner_without_envelope_remains_an_explicit_gap():
 
 def test_stage_presence_does_not_become_cleanup_proof():
     stage_by_field = {
-        "expected_oid": 42,
-        "current_name_oid": None,
-        "expected_oid_current_name": "published_profile",
+        "schema": "fixture",
+        "stage_name": "candidate_profile",
+        "relation_kind": None,
+        "persistence": None,
         "state": "ready",
     }
     result = _project(stages=[stage_by_field])
@@ -359,24 +376,31 @@ def test_stage_presence_does_not_become_cleanup_proof():
 def _legacy_consumption(version):
     """Retain opaque synthetic historical bytes; their old signature is not reverified."""
     row = _consumption()
-    body = json.loads(row["canonical_lease_json"])
-    body.pop("signing_preflight_guard")
-    body.pop("signing_preflight_guard_sha256")
-    body["contract_id"] = f"provider-directory-database-capacity-lease-v{version}"
-    body["reservation_id"] = f"retained-reservation-{version}"
-    body["attestation_id"] = str(version) * 64
+    if version == 3:
+        envelope = _historical_envelope()
+        body = envelope["lease"]
+        row.update(signature=envelope["signature"])
+        lease_digest = leases._domain_hash("healthporta.provider-directory.database-capacity-lease-digest.v3", envelope)
+    else:
+        body = json.loads(row["canonical_lease_json"])
+        body.pop("signing_preflight_guard")
+        body.pop("signing_preflight_guard_sha256")
+        body["contract_id"] = "provider-directory-database-capacity-lease-v1"
+        body["reservation_id"] = "retained-reservation-1"
+        body["attestation_id"] = "1" * 64
+        lease_digest = "4" * 64
     row.update(
         contract_id=body["contract_id"],
         run_id="run_" + str(version) * 32,
         reservation_id=body["reservation_id"],
         attestation_id=body["attestation_id"],
-        lease_digest=str(version + 3) * 64,
+        lease_digest=lease_digest,
         canonical_lease_json=json.dumps(body, indent=2),
     )
     return row
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 3])
 def test_legacy_consumption_retains_exact_opaque_record_and_stored_digests(version):
     row = _legacy_consumption(version)
     original = deepcopy(row)
@@ -389,13 +413,15 @@ def test_legacy_consumption_retains_exact_opaque_record_and_stored_digests(versi
         "reservation_id",
         "attestation_id",
         "lease_digest",
-        "tablespace_identity_hash",
-        "volume_identity_hash",
     ):
         assert reservation[name] == row[name]
-    assert reservation["signature_verification"] == "unresolved_legacy_contract"
+    assert reservation["signature_verification"] == (
+        "unresolved_legacy_contract" if version == 1 else "required_by_authority"
+    )
     assert reservation["opaque_legacy"] is True
-    assert reservation["preflight_receipt_sha256"] is None
+    assert reservation["preflight_receipt_sha256"] == (
+        None if version == 1 else json.loads(row["canonical_lease_json"])["nonce"]
+    )
     assert reservation["durable_preflight_present"] is False
     assert len(reservation["observations"]) == 1
     assert reservation["observations"][0]["record"] == snapshot._json_values(row)
@@ -406,20 +432,20 @@ def test_legacy_consumption_retains_exact_opaque_record_and_stored_digests(versi
 
 
 def test_legacy_versions_coexist_with_current_lease_without_nonce_inference():
-    envelope = _signed_envelope()
+    envelope = _signed_envelope(body_mutator=lambda body: body.update(reservation_id="current-reservation"))
     result = _project(
-        consumptions=[_legacy_consumption(1), _legacy_consumption(2), _consumption(envelope)],
+        consumptions=[_legacy_consumption(1), _legacy_consumption(3), _consumption(envelope)],
         preflights=[_preflight(envelope)],
     )
     assert len(result["reservations"]) == 3
     assert sum(item["opaque_legacy"] for item in result["reservations"]) == 2
-    # Both synthetic legacy nonces equal this receipt's hash. Only v3 supplies its binding.
+    # Only the current lease supplies a verified current preflight binding.
     assert result["preflight_receipts"][0]["reservation_id"] == envelope["lease"]["reservation_id"]
 
 
 @pytest.mark.parametrize("status", ["running", "succeeded"])
 def test_legacy_consumption_owner_is_retained_with_unresolved_execution(status):
-    row = _legacy_consumption(2)
+    row = _legacy_consumption(3)
     envelope_by_field = {"lease": json.loads(row["canonical_lease_json"]), "signature": row["signature"]}
     owner_by_field = {
         "run_id": row["run_id"],
@@ -452,5 +478,8 @@ def test_changed_legacy_owner_envelope_is_rejected():
 def test_legacy_reservation_conflict_still_rejected(field):
     row = _legacy_consumption(1)
     changed_record_by_field = {**row, field: "f" * 64 if field == "lease_digest" else '{"changed":true}'}
-    with pytest.raises(RuntimeError, match="reservation_identity_conflict"):
+    with pytest.raises(
+        RuntimeError,
+        match=("reservation_identity_conflict" if field == "lease_digest" else "envelope_contract_unsupported"),
+    ):
         _project(consumptions=[row, changed_record_by_field])

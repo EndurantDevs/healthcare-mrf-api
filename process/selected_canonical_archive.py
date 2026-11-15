@@ -11,7 +11,6 @@ from sqlalchemy import text
 async def _selection_projection(session, schema_name, owner_oid, selected_relations, authenticators, alias_authority):
     """Authenticate and fence the exact base and selected native inventories."""
     from process import reference_family_archive as archive
-    from process.entity_address_snapshot_preparation import _publisher_authority
     from process.mrf_address_publication import (
         canonical_archive_projection,
         require_canonical_output_base,
@@ -21,7 +20,7 @@ async def _selection_projection(session, schema_name, owner_oid, selected_relati
 
     authenticate_inventory, authenticate_base = authenticators
     archive._require_transaction(session)
-    if not callable(authenticate_inventory) or await _publisher_authority(session) != owner_oid:
+    if not callable(authenticate_inventory):
         raise archive.ReferenceFamilyArchiveError("selected canonical publisher authority differs")
     inventories = await authenticate_inventory(session)
     if not isinstance(inventories, Mapping) or not inventories or not set(inventories) <= {"npi", "mrf"}:
@@ -38,13 +37,15 @@ async def _selection_projection(session, schema_name, owner_oid, selected_relati
             "LOCK TABLE "
             + ",".join(
                 f"{archive._quoted(relation['schema_name'])}.{archive._quoted(relation['relation_name'])}"
-                for relation in sorted(relations, key=lambda relation: relation["relation_oid"])
+                for relation in sorted(
+                    relations, key=lambda relation: (relation["schema_name"], relation["relation_name"])
+                )
             )
             + " IN ACCESS SHARE MODE NOWAIT"
         )
     )
     await archive._require_selected_mrf_catalog(
-        session, sorted(relations, key=lambda relation: relation["relation_oid"]), owner_oid
+        session, sorted(relations, key=lambda relation: (relation["schema_name"], relation["relation_name"])), owner_oid
     )
     alias_arguments = {} if alias_authority is None else {"npi_alias_authority": alias_authority}
     await validate_canonical_contributions(session, contributions, base, **alias_arguments)

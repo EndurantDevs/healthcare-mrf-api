@@ -282,10 +282,10 @@ class ProfileAcceptance:
         patches.setattr(copying, "_parity_sql", parity)
         original_catalog = native.completed_target_catalog
 
-        async def catalog(fhir, model, relation, oid, *, outcome):
-            result = await original_catalog(fhir, model, relation, oid, outcome=outcome)
+        async def catalog(fhir, model, relation, *, outcome):
+            result = await original_catalog(fhir, model, relation, outcome=outcome)
             facts = json.loads(result)["native_catalog"]
-            # Store decoded native facts, including each actual index OID and definition.
+            # Store decoded native facts, including every index key and definition.
             facts["indexes"] = native.decoded(facts["indexes"])
             encoded = json.dumps(facts, sort_keys=True)
             prior = self.catalogs.setdefault(model.__tablename__, encoded)
@@ -308,8 +308,8 @@ class ProfileAcceptance:
     def _observe_reads(self, patches, reads, native):
         original_read = reads._attest
 
-        async def read(scope, state, *, reusable_origin=None):
-            result = await original_read(scope, state, reusable_origin=reusable_origin)
+        async def read(scope, state, *, reuse_catalog=False):
+            result = await original_read(scope, state, reuse_catalog=reuse_catalog)
             assert self.validated and json.loads(scope.names_json) == self.relations
             facts = json.loads(state["catalog_by_root"])
             assert set(facts) == set(self.relations)

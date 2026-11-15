@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from process.network_compact_layout import CompactAddressRelation
 from process.network_custom_address_source import NetworkCustomAddressSourceError, NetworkCustomAddressUnresolved
 from process.network_custom_office_rows import CustomOfficeRowsUnsupported, prepare_custom_office_rows
 from process.network_membership_copy import MembershipCopyTarget
@@ -111,7 +112,7 @@ async def test_direct_rows_match_complete_composition(office_rows_db, system):
     assert contribution == await _addresses(fixture, complete.address_source.schema_name, custom_only=True)
     assert len(contribution) == receipt.custom_pair_count == 1
     assert receipt.approved_records_sha256 == complete.approved_records_sha256
-    assert receipt.base_identity == complete.source_oids and receipt.npi_identity == complete.npi_oids
+    assert receipt.base_source == complete.base_source and receipt.npi_source == complete.npi_source
     custom_binding = await fixture.connection.fetch(
         f'SELECT * FROM "{copy_target.schema_name}".custom_provider_location_binding'
     )
@@ -127,14 +128,15 @@ async def test_direct_rows_match_complete_composition(office_rows_db, system):
     )
     assert any("WHERE base.location_key=custom.location_key LIMIT 1" in query.query for query in statements)
     base_name = f'"{fixture.base.schema_name}"."{fixture.base.table_name}"'
+    # A LIMIT 0 shape probe reads no rows; any other full base read is refused.
     assert not any(
-        f"SELECT * FROM {base_name}" in query.query or "ORDER BY a.location_key" in query.query for query in statements
+        (f"SELECT * FROM {base_name}" in query.query and not query.query.endswith(" LIMIT 0"))
+        or "ORDER BY a.location_key" in query.query
+        for query in statements
     )
-    assert receipt.address_table_oid == await fixture.connection.fetchval(
-        "SELECT to_regclass($1)::oid", copy_target.schema_name + ".entity_address_unified"
-    )
-    assert receipt.binding_table_oid == await fixture.connection.fetchval(
-        "SELECT to_regclass($1)::oid", copy_target.schema_name + ".custom_provider_location_binding"
+    assert receipt.address_relation == CompactAddressRelation(copy_target.schema_name, "entity_address_unified")
+    assert receipt.binding_relation == CompactAddressRelation(
+        copy_target.schema_name, "custom_provider_location_binding"
     )
     assert receipt.as_dict()["component"] == "network_custom_office_rows"
 

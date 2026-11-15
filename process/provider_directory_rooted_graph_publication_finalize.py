@@ -16,14 +16,14 @@ from process.provider_directory_rooted_graph_current_preflight import (
     current_root_proof,
     require_current_root_fence,
 )
-from process.provider_directory_rooted_graph_publication_candidate import HEADER, PARENT, ROOTS
+from process.provider_directory_rooted_graph_publication_candidate import HEADER, PARENT
 from process.provider_directory_rooted_graph_source_runtime import current_rooted_graph_runtime
 
 
 async def _insert_frozen_header(connection, runtime, document, root):
     """Copy one immutable header while preserving the existing canonical insert transition."""
     target = storage_relation(runtime.catalog_schema, root)
-    source = storage_relation(runtime.candidate_schema, document["tables"][root]["name"])
+    source = storage_relation(document["tables"][root]["schema"], document["tables"][root]["name"])
     columns = await connection.fetch(
         "SELECT attname FROM pg_attribute WHERE attrelid=to_regclass($1) AND attnum>0 "
         "AND NOT attisdropped AND attgenerated='' ORDER BY attnum",
@@ -39,26 +39,6 @@ async def _insert_frozen_header(connection, runtime, document, root):
         document["identity"]["dataset_id"],
     )
     _require(result == "INSERT 0 1", "rooted_header_changed")
-
-
-async def _attach_frozen_group(connection, runtime, document):
-    """Attach only existing indexed, dataset-bound heaps without changing their protected ACLs."""
-    roots = [root for root in ROOTS if root not in {HEADER, PARENT}]
-    from process.provider_directory_rooted_graph_candidate_indexes import require_prepared_parent_indexes
-
-    relations_by_root = {root: document["tables"][root]["name"] for root in roots}
-    targets = [storage_relation(runtime.catalog_schema, root) for root in sorted(roots)]
-    await connection.execute("LOCK TABLE " + ",".join(targets) + " IN SHARE UPDATE EXCLUSIVE MODE NOWAIT")
-    await require_prepared_parent_indexes(
-        connection, runtime.catalog_schema, runtime.candidate_schema, relations_by_root
-    )
-    literal = "'" + document["identity"]["dataset_id"].replace("'", "''") + "'"
-    for root in roots:
-        frozen = storage_relation(runtime.candidate_schema, document["tables"][root]["name"])
-        await connection.execute(
-            f"ALTER TABLE {storage_relation(runtime.catalog_schema, root)} ATTACH PARTITION {frozen} "
-            f"FOR VALUES IN ({literal})"
-        )
 
 
 async def _switch_frozen_headers(database, document, previous):
@@ -89,11 +69,11 @@ async def publish_prepared_rooted_graph_dataset(preparations, claim, before, *, 
     _require(runtime is not None, "rooted_runtime_required")
     transaction = runtime.current_transaction(database)
     connection = transaction.connection
-    _require(connection is preparations.connection and before["state"] == "validated", "rooted_transaction_changed")
+    _require(connection.is_in_transaction() and before["state"] == "validated", "rooted_transaction_changed")
     document = preparations.fhir_source[1].document
     proof = current_root_proof(database)
     _require(proof.current.dataset_id == document["identity"]["root_dataset_id"], "rooted_predecessor_changed")
-    await connection.execute("SET LOCAL lock_timeout='1s'")
+    await connection.execute("SET LOCAL lock_timeout='250ms'")
     await connection.execute("SET LOCAL statement_timeout='3s'")
     started = monotonic()
     _require(
@@ -106,7 +86,6 @@ async def publish_prepared_rooted_graph_dataset(preparations, claim, before, *, 
     await connection.execute("SELECT set_config($1,$2,true)", SELECTOR, document["identity"]["dataset_id"])
     for root in (PARENT, HEADER):
         await _insert_frozen_header(connection, runtime, document, root)
-    await _attach_frozen_group(connection, runtime, document)
     await _switch_frozen_headers(database, document, previous)
     post_fence = json.loads(await capture_root_input_fence(database, previous))
     completed = await connection.fetchval("SELECT clock_timestamp()")

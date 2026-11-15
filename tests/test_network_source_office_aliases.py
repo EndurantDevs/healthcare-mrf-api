@@ -10,7 +10,7 @@ import pytest
 
 from process import network_custom_address_source as custom
 from process.network_address_projection import PinnedAddressSource
-from tests.test_registry_ptg_address_carry import _artifact, _receipt
+from tests.test_registry_ptg_address_carry import _artifact, _legacy_artifact_document, _receipt
 
 
 @pytest.mark.parametrize(
@@ -22,22 +22,26 @@ from tests.test_registry_ptg_address_carry import _artifact, _receipt
         ("f" * 64, "e" * 64, "4c9ddd9a4f7ec4cd520245651d88a6de650699029662c842239ccf34d962dafb"),
     ],
 )
-def test_existing_receipt_generation_hashes_remain_byte_identical(ptg, aca, digest):
-    receipt = replace(_artifact(), ptg_carry_sha256=ptg, aca_carry_sha256=aca)
+def test_saved_receipt_generation_remains_opaque_after_named_projection(ptg, aca, digest):
+    document = _legacy_artifact_document(ptg=ptg, aca=aca, generation=digest)
+    receipt = custom._from_document(json.dumps(document))
     assert custom._generation(receipt) == digest
-    assert "source_aliases" not in receipt.as_dict()
+    assert not set(receipt.as_dict()) & custom._LEGACY_PHYSICAL_FIELDS
 
 
 @pytest.mark.parametrize("ptg", [None, "f" * 64])
 @pytest.mark.parametrize("aca", [None, "e" * 64])
-def test_v5_alias_layout_preserves_carry_contracts(ptg, aca):
-    old = replace(_artifact(), ptg_carry_sha256=ptg, aca_carry_sha256=aca)
-    receipt = replace(old, source_aliases=True)
-    assert "source_aliases" not in old.as_dict() and old.as_dict()["revision"] in (2, 3, 4)
-    assert receipt.as_dict()["revision"] == 5 and receipt.as_dict()["source_aliases"] is True
+def test_named_alias_layout_preserves_carry_contracts(ptg, aca):
+    original = replace(_artifact(), ptg_carry_sha256=ptg, aca_carry_sha256=aca)
+    receipt = replace(original, source_aliases=True)
+    generation = custom._generation(receipt)
+    receipt = replace(
+        receipt, generation_sha256=generation, address_source=replace(receipt.address_source, generation_id=generation)
+    )
+    assert receipt.as_dict()["revision"] == 7 and receipt.source_aliases
     assert custom._from_document(json.dumps(receipt.as_dict())) == receipt
-    assert custom._generation(old) != custom._generation(receipt)
-    assert custom._recipe_identity(old) != custom._recipe_identity(receipt)
+    assert custom._generation(original) != custom._generation(receipt)
+    assert custom._recipe_identity(original) != custom._recipe_identity(receipt)
 
 
 @pytest.mark.parametrize(
@@ -54,7 +58,7 @@ def test_v5_alias_layout_preserves_carry_contracts(ptg, aca):
 )
 def test_alias_layout_cannot_be_smuggled_into_an_old_or_open_receipt(changes):
     with pytest.raises(custom.NetworkCustomAddressSourceError):
-        custom._from_document(json.dumps({**_artifact().as_dict(), **changes}))
+        custom._from_document(json.dumps({**_legacy_artifact_document(), **changes}))
 
 
 def test_layout_requirement_compares_aliases_across_authenticated_pages():
@@ -91,7 +95,7 @@ async def test_supplied_layout_flag_is_rederived_before_native_receipt_acceptanc
     monkeypatch.setattr(custom, "verify_approved_site_sources", AsyncMock(return_value=(_receipt(),)))
     monkeypatch.setattr(custom, "_source_alias_layout", AsyncMock(return_value=native_aliases))
     native = AsyncMock()
-    monkeypatch.setattr(custom, "_artifact_identity", native)
+    monkeypatch.setattr(custom, "_source_columns", native)
     with pytest.raises(custom.NetworkCustomAddressSourceError, match="source alias layout differs"):
         await custom._verify_custom_address_source(object(), receipt)
     native.assert_not_awaited()
@@ -138,7 +142,9 @@ async def test_sealed_binding_constraint_layout_remains_exact(source_aliases, un
         constraints.append({"definition": "UNIQUE (location_key)"})
     connection = SimpleNamespace(fetch=AsyncMock(side_effect=[columns, constraints]))
     if unique is not source_aliases:
-        await custom._binding_shape(connection, 1, source_aliases=source_aliases)
+        await custom._binding_shape(connection, '"example".provider_location_binding', source_aliases=source_aliases)
     else:
         with pytest.raises(custom.NetworkCustomAddressSourceError, match="binding shape differs"):
-            await custom._binding_shape(connection, 1, source_aliases=source_aliases)
+            await custom._binding_shape(
+                connection, '"example".provider_location_binding', source_aliases=source_aliases
+            )

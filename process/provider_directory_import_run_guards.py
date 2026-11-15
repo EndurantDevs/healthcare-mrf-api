@@ -157,7 +157,7 @@ _TRIGGERS = {
 
 
 _FUNCTION_CATALOG = """
-SELECT p.oid::bigint AS function_oid,n.nspname AS function_schema,p.proname AS function_name,
+SELECT n.nspname AS function_schema,p.proname AS function_name,
        p.prosrc AS source,oidvectortypes(p.proargtypes) AS argument_types,p.proargnames AS argument_names,
        format_type(p.prorettype,NULL) AS return_type,l.lanname AS language,p.provolatile::text AS volatility,
        p.prosecdef AS security_definer,p.proconfig AS settings,p.prokind::text AS kind,
@@ -167,17 +167,19 @@ SELECT p.oid::bigint AS function_oid,n.nspname AS function_schema,p.proname AS f
        p.probin IS NULL AS no_binary,p.prosqlbody IS NULL AS no_sql_body,p.prosupport=0 AS no_support,
        p.procost::float8 AS cost,p.prorows::float8 AS rows
 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_language l ON l.oid=p.prolang
-WHERE n.nspname=:schema AND p.proname=ANY(CAST(:names AS text[])) ORDER BY p.proname,p.oid
+WHERE n.nspname=:schema AND p.proname=ANY(CAST(:names AS text[])) ORDER BY p.proname,oidvectortypes(p.proargtypes)
 """
 _TRIGGER_CATALOG = """
 SELECT t.tgname AS trigger_name,t.tgtype AS event_mask,t.tgenabled::text AS enabled,
        t.tgdeferrable AS deferrable,t.tginitdeferred AS initially_deferred,t.tgnargs AS argument_count,
        t.tgqual IS NULL AS no_condition,t.tgattr::text AS update_columns,
        encode(t.tgargs,'hex') AS arguments,t.tgoldtable IS NULL AS no_old_table,t.tgnewtable IS NULL AS no_new_table,
-       t.tgconstraint=0 AS no_constraint,t.tgfoid::bigint AS function_oid,
+       t.tgconstraint=0 AS no_constraint,
        n.nspname AS function_schema,p.proname AS function_name
-FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid JOIN pg_namespace n ON n.oid=p.pronamespace
-WHERE t.tgrelid=:relation_oid AND NOT t.tgisinternal ORDER BY t.tgname
+FROM pg_trigger t JOIN pg_class r ON r.oid=t.tgrelid
+JOIN pg_namespace target_namespace ON target_namespace.oid=r.relnamespace
+JOIN pg_proc p ON p.oid=t.tgfoid JOIN pg_namespace n ON n.oid=p.pronamespace
+WHERE target_namespace.nspname=:schema AND r.relname='import_run' AND NOT t.tgisinternal ORDER BY t.tgname
 """
 _FUNCTION_DEFAULTS = {
     "kind": "f",
@@ -232,7 +234,7 @@ def _is_approved_source(name, source, schema):
 
 
 async def assert_import_run_guards(database, relation_map, captured=None):
-    """Validate all migration guards and return their complete dependency fingerprint entries."""
+    """Validate complete named guard semantics without retaining physical catalog identities."""
     schema = relation_map["schema_name"]
     functions = [
         dict(catalog_row._mapping)
@@ -244,6 +246,7 @@ async def assert_import_run_guards(database, relation_map, captured=None):
         _fail()
     functions_by_name = {}
     for catalog_row in functions:
+        catalog_row.pop("function_oid", None)
         function_source = catalog_row.pop("source")
         if not _is_approved_source(catalog_row["function_name"], function_source, schema):
             _fail()
@@ -258,10 +261,7 @@ async def assert_import_run_guards(database, relation_map, captured=None):
         catalog_row["raw_source_sha256"] = hashlib.sha256(function_source.encode("utf-8")).hexdigest()
         catalog_row["dependency_kind"] = "function"
         functions_by_name[catalog_row["function_name"]] = catalog_row
-    triggers = [
-        dict(catalog_row._mapping)
-        for catalog_row in await database.all(_TRIGGER_CATALOG, relation_oid=relation_map["relation_oid"])
-    ]
+    triggers = [dict(catalog_row._mapping) for catalog_row in await database.all(_TRIGGER_CATALOG, schema=schema)]
     if len(triggers) != len(_TRIGGERS) or {catalog_row["trigger_name"] for catalog_row in triggers} != set(_TRIGGERS):
         _fail()
     if captured is not None and (
@@ -270,13 +270,13 @@ async def assert_import_run_guards(database, relation_map, captured=None):
         _fail()
     captured_by_name = {catalog_row["trigger_name"]: catalog_row for catalog_row in captured or ()}
     for catalog_row in triggers:
+        catalog_row.pop("function_oid", None)
         event_mask, function_name = _TRIGGERS[catalog_row["trigger_name"]]
         function = functions_by_name[function_name]
         expected = _TRIGGER_DEFAULTS | {
             "event_mask": event_mask,
             "function_name": function_name,
             "function_schema": schema,
-            "function_oid": function["function_oid"],
         }
         if any(catalog_row[name] != expected_value for name, expected_value in expected.items()):
             _fail()
@@ -285,7 +285,6 @@ async def assert_import_run_guards(database, relation_map, captured=None):
             if (
                 prior["tgtype"] != event_mask
                 or prior["trigger_enabled"] != "A"
-                or prior["trigger_function_oid"] != function["function_oid"]
                 or _source_hash(prior["trigger_function_source"], schema) != function["source_sha256"]
             ):
                 _fail()

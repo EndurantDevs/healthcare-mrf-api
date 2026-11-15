@@ -9,7 +9,7 @@ import pytest
 
 from process.npi_canonical_publication import NpiCanonicalPublicationError
 from process.npi_canonical_publication_store import NpiCanonicalPublicationCommit
-from process.npi_result_generation import publish_unreceipted_npi_result_generation
+from process.npi_result_generation import RELATION_NAMES, publish_unreceipted_npi_result_generation
 from process.npi_unreceipted_publication import commit_unreceipted_npi_publication, load_unreceipted_npi_commit
 from process.nppes_public_evidence_listing import listed_nppes_archive_names
 from tests.test_npi_result_generation import _authority_row
@@ -39,7 +39,8 @@ class Connection:
                 "origin_lineage_id": self.authority["local_lineage_id"],
                 "origin_generation": arguments[0],
                 "published_at": FINISHED,
-                "relation_oids": arguments[1],
+                "serving_schema": arguments[1],
+                "serving_relation_names": arguments[2],
                 "canonical_publication_ref": None,
                 "canonical_publication_generation": None,
                 "canonical_chain_ref": None,
@@ -69,11 +70,12 @@ async def test_unreceipted_generation_binds_the_live_tables_without_provenance(a
     connection = Connection(authority)
     published = await publish_unreceipted_npi_result_generation(connection, schema_name="mrf")
     assert published.local_generation == authority["local_generation"] + 1
-    assert published.relation_oids == LIVE_OIDS and published.canonical_provenance is None
+    assert published.relations == tuple(("mrf", name) for name in RELATION_NAMES)
+    assert published.canonical_provenance is None
     assert published.serving_generation.origin_generation == published.local_generation
     update, arguments = connection.statements[-1]
     assert "canonical_publication_ref=NULL" in update and "canonical_chain_ref=NULL" in update
-    assert arguments == (authority["local_generation"] + 1, list(LIVE_OIDS))
+    assert arguments == (authority["local_generation"] + 1, "mrf", list(RELATION_NAMES))
 
 
 @pytest.mark.asyncio

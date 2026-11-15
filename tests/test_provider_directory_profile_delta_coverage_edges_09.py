@@ -17,12 +17,10 @@ from tests.provider_directory_profile_delta_coverage_support import (
 from tests.test_provider_directory_profile_capacity_runtime import (
     _limits_payload,
 )
-
-
-@dataclasses.dataclass(frozen=True)
-class _DatabaseIdentityStub:
-    wal_lsn: str
-    database_oid: int
+from tests.test_provider_directory_profile_delta_coverage_edges_04 import (
+    _logical_capacity_layout,
+    _numeric_database_identity,
+)
 
 
 def _safe_relation_by_field():
@@ -70,9 +68,7 @@ async def test_capacity_relation_missing_and_safe_edges(monkeypatch):
     ):
         await importer._profile_capacity_relation_row(12, "p", 0)
     importer.db.first.return_value = _safe_relation_by_field()
-    relation_by_field, toast_oid = await importer._profile_capacity_relation_row(
-        12, "p", 0
-    )
+    relation_by_field, toast_oid = await importer._profile_capacity_relation_row(12, "p", 0)
     assert relation_by_field["relkind"] == "r"
     assert toast_oid is None
 
@@ -101,73 +97,51 @@ def test_capacity_trigger_and_index_success_edges():
 
 
 @pytest.mark.asyncio
-async def test_explicit_temp_tablespace_success_edge(monkeypatch):
-    identity_by_field = {
-        "temp_tablespaces": "profile_temp",
-        "database_tablespace_name": "pg_default",
-    }
-    monkeypatch.setattr(
-        importer.db,
-        "first",
-        AsyncMock(
-            return_value={
-                "tablespace_oid": 42,
-                "tablespace_name": "profile_temp",
-            }
-        ),
-    )
-    assert await importer._profile_capacity_temp_tablespace(
-        identity_by_field,
-        1,
-    ) == (42, "profile_temp")
+async def test_explicit_named_control_layouts_success_edge(monkeypatch):
+    identity = _numeric_database_identity()
+    geometry = _wal_tracker_admission().geometry
+    roles = ("build_checkpoint", "import_run", "capacity_consumption", "serving_generation")
+    layouts = tuple(_logical_capacity_layout(geometry, role) for role in roles)
+    resolver = AsyncMock(return_value=12)
+    capture = AsyncMock(side_effect=layouts)
+    monkeypatch.setattr(importer, "_provider_directory_relation_oid", resolver)
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_relation_layout", capture)
+    assert await importer._profile_primary_control_layouts(identity) == layouts
+    assert [call.args for call in resolver.await_args_list] == [
+        (identity.relations[role]["schema"], identity.relations[role]["name"]) for role in roles
+    ]
+    assert all(call.kwargs == {"expected_persistence": "p"} for call in capture.await_args_list)
 
 
 @pytest.mark.asyncio
-async def test_capacity_metadata_identity_missing_edge(monkeypatch):
-    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
-    with pytest.raises(RuntimeError, match="metadata_identity_missing"):
-        await importer._profile_capacity_metadata_oids("mrf")
+async def test_capacity_named_control_relation_missing_edge(monkeypatch):
+    capture = AsyncMock()
+    monkeypatch.setattr(importer, "_provider_directory_relation_oid", AsyncMock(return_value=None))
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_relation_layout", capture)
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="control_relation_missing"):
+        await importer._profile_primary_control_layouts(_numeric_database_identity())
+    capture.assert_not_awaited()
 
 
-def _tablespace_identity():
-    return SimpleNamespace(
-        tablespace_oid=1,
-        tablespace_name="data",
-        temp_tablespace_oid=2,
-        temp_tablespace_name="temp",
+def _control_layouts():
+    geometry = _wal_tracker_admission().geometry
+    return tuple(
+        _logical_capacity_layout(geometry, role)
+        for role in ("build_checkpoint", "import_run", "capacity_consumption", "serving_generation")
     )
 
 
-def test_capacity_tablespace_set_and_pin_edges():
-    identity = _tablespace_identity()
-    with pytest.raises(
-        importer.ProviderDirectoryCapacityLeaseError,
-        match="tablespaces",
+def test_capacity_complete_named_control_scope_edges():
+    identity = _numeric_database_identity()
+    layouts = _control_layouts()
+    importer._assert_profile_control_layout_identities(identity, layouts)
+    for changed in (
+        layouts[:-1],
+        (dataclasses.replace(layouts[0], schema_name="other_schema"), *layouts[1:]),
+        tuple(reversed(layouts)),
     ):
-        importer._assert_provider_directory_profile_capacity_tablespaces(
-            SimpleNamespace(tablespaces=[]),
-            identity,
-        )
-    wrong_tablespaces = [
-        SimpleNamespace(
-            usage="data",
-            tablespace_oid=9,
-            tablespace_name="wrong",
-        ),
-        SimpleNamespace(
-            usage="temp",
-            tablespace_oid=2,
-            tablespace_name="temp",
-        ),
-    ]
-    with pytest.raises(
-        importer.ProviderDirectoryCapacityLeaseError,
-        match="data_tablespace",
-    ):
-        importer._assert_provider_directory_profile_capacity_tablespaces(
-            SimpleNamespace(tablespaces=wrong_tablespaces),
-            identity,
-        )
+        with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="control_relation_changed"):
+            importer._assert_profile_control_layout_identities(identity, changed)
 
 
 @pytest.mark.asyncio
@@ -186,9 +160,7 @@ async def test_profile_admission_identity_invalid_and_valid_edges(monkeypatch):
         desired_source_context_vector_hash="d",
     )
     resolver.return_value = valid_identity
-    assert (
-        await importer._profile_admission_identity(SimpleNamespace()) is valid_identity
-    )
+    assert await importer._profile_admission_identity(SimpleNamespace()) is valid_identity
 
 
 @pytest.mark.asyncio
@@ -205,9 +177,7 @@ async def test_admission_workload_scope_edge():
         batch_plan=object(),
     )
     source_fence = SimpleNamespace(datasets=[])
-    wrong_resource_fence = SimpleNamespace(
-        datasets=[SimpleNamespace(source_id="source-b")]
-    )
+    wrong_resource_fence = SimpleNamespace(datasets=[SimpleNamespace(source_id="source-b")])
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
         match="resource_scope_changed",
@@ -292,9 +262,7 @@ def test_admission_run_id_and_lock_projection_edges():
         operations=[
             SimpleNamespace(
                 operation_name="admission_row_lock",
-                operation_count=(
-                    importer.PROVIDER_DIRECTORY_PROFILE_ADMISSION_ROW_LOCK_COUNT
-                ),
+                operation_count=(importer.PROVIDER_DIRECTORY_PROFILE_ADMISSION_ROW_LOCK_COUNT),
             )
         ]
     )
@@ -304,60 +272,39 @@ def test_admission_run_id_and_lock_projection_edges():
 
 
 @pytest.mark.asyncio
-async def test_admission_database_guard_success_and_failure_edges(monkeypatch):
-    expected = _DatabaseIdentityStub(wal_lsn="0/1", database_oid=1)
-    observed = _DatabaseIdentityStub(wal_lsn="0/2", database_oid=1)
+async def test_admission_named_scope_and_numeric_settings_guard_edges(monkeypatch):
+    expected = _numeric_database_identity("0/1")
+    observed = dataclasses.replace(expected, wal_lsn="0/2")
     resolver = AsyncMock(return_value=observed)
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_capacity_database_identity",
-        resolver,
-    )
-    assert (
-        await importer._admission_database_guard(
-            SimpleNamespace(serving_state=object(), initial_targets=None),
-            expected,
-        )
-        is observed
-    )
-    resolver.return_value = _DatabaseIdentityStub(
-        wal_lsn="0/2",
-        database_oid=2,
-    )
-    with pytest.raises(
-        importer.ProviderDirectoryArtifactBuildStale,
-        match="database_identity_changed",
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_database_identity", resolver)
+    build_identity = SimpleNamespace(serving_state=object(), initial_targets=None)
+    assert await importer._admission_database_guard(build_identity, expected) is observed
+    changed_by_role = {
+        **expected.relations,
+        "evidence_target": {**expected.relations["evidence_target"], "name": "other_evidence"},
+    }
+    for changed in (
+        dataclasses.replace(observed, relations=changed_by_role),
+        dataclasses.replace(observed, postgres_block_size_bytes=observed.postgres_block_size_bytes * 2),
     ):
-        await importer._admission_database_guard(
-            SimpleNamespace(serving_state=object(), initial_targets=None),
-            expected,
-        )
+        resolver.return_value = changed
+        with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="scope_or_settings_changed"):
+            await importer._admission_database_guard(build_identity, expected)
 
 
 @pytest.mark.asyncio
 async def test_admission_run_toast_success_and_failure_edges(monkeypatch):
+    geometry_payload = _wal_tracker_admission().geometry
+    layout = _logical_capacity_layout(geometry_payload, "import_run")
+    monkeypatch.setattr(importer, "_provider_directory_relation_oid", AsyncMock(return_value=12))
     monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_relation_storage_fingerprint",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                relation_oid=1,
-                toast_oid=2,
-                toastable_columns=("payload",),
-            )
-        ),
+        importer, "_provider_directory_profile_capacity_relation_layout", AsyncMock(return_value=layout)
     )
     chunk_count = AsyncMock(return_value=1)
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_toast_chunk_count",
-        chunk_count,
-    )
-    database_identity = SimpleNamespace(import_run_oid=1)
+    monkeypatch.setattr(importer, "_provider_directory_profile_toast_chunk_count", chunk_count)
+    database_identity = _numeric_database_identity()
     geometry = SimpleNamespace(postgres_default_toast_compression="pglz")
-    wal_input = SimpleNamespace(
-        import_run_update=SimpleNamespace(deleted_toast_chunks=1)
-    )
+    wal_input = SimpleNamespace(import_run_update=SimpleNamespace(deleted_toast_chunks=1))
     await importer._assert_admission_run_toast(
         "run_" + "1" * 32,
         database_identity,
@@ -390,9 +337,7 @@ def test_capacity_admission_context_invalid_edge():
 async def test_capacity_scratch_row_byte_and_deadline_edges(monkeypatch):
     admission = _wal_tracker_admission()
     future_lease = SimpleNamespace(
-        max_build_deadline=(
-            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
-        )
+        max_build_deadline=(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1))
     )
     admission = dataclasses.replace(admission, lease=future_lease)
     token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(admission)
@@ -426,10 +371,7 @@ async def test_capacity_scratch_row_byte_and_deadline_edges(monkeypatch):
         expired = dataclasses.replace(
             admission,
             lease=SimpleNamespace(
-                max_build_deadline=(
-                    datetime.datetime.now(datetime.timezone.utc)
-                    - datetime.timedelta(seconds=1)
-                )
+                max_build_deadline=(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1))
             ),
         )
         importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(expired)

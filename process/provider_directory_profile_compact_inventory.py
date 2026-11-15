@@ -158,19 +158,20 @@ def _desired_query(fhir, schema, fence):
 
 
 async def _incumbent_refs(fhir, schema, serving_state):
-    """Lock the routed incumbent pair and require the already resolved serving OIDs."""
-    names = (profile.PROFILE_EVIDENCE_TABLE, profile.PROFILE_TABLE)
-    expected = (serving_state.evidence_target_oid, serving_state.profile_target_oid)
-    _require(all(type(oid) is int and 0 < oid < 2**32 for oid in expected))
-    refs = tuple(fhir._qt(schema, name) for name in names)
+    """Pin the resolved named incumbent pair before reading its complete NPI census."""
+    expected = fhir._provider_directory_profile_target_coordinates(schema)
+    _require(serving_state.targets == expected)
+    refs = tuple(
+        fhir._unscoped_qt(expected[role]["schema"], expected[role]["name"]) for role in ("evidence", "profile")
+    )
     await fhir.db.status("LOCK TABLE " + ",".join(refs) + " IN ACCESS SHARE MODE NOWAIT")
     rows = await fhir.db.all(
-        "SELECT requested.relation,c.oid::bigint FROM unnest(CAST(:compact_incumbent_refs AS text[])) "
-        "WITH ORDINALITY requested(relation,ordinal) LEFT JOIN pg_class c ON c.oid=to_regclass(requested.relation) "
-        "AND c.relkind='r' AND c.relpersistence='p' ORDER BY requested.ordinal",
+        "SELECT requested.relation,c.relkind::text,c.relpersistence::text "
+        "FROM unnest(CAST(:compact_incumbent_refs AS text[])) WITH ORDINALITY requested(relation,ordinal) "
+        "LEFT JOIN pg_class c ON c.oid=to_regclass(requested.relation) ORDER BY requested.ordinal",
         compact_incumbent_refs=list(refs),
     )
-    _require([(row[0], row[1]) for row in rows] == list(zip(refs, expected, strict=True)))
+    _require([tuple(row) for row in rows] == [(reference, "r", "p") for reference in refs])
     return refs
 
 

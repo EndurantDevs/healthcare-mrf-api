@@ -130,6 +130,7 @@ async def complete_queued_membership_refresh(
     if writer_context.seal_candidate is None:
         raise ValueError("registry_membership_refresh_custodian_required")
     await writer_context.seal_candidate(copy_target)
+    authority = await authorize_commit(**envelope)
     async with runtime.pin_sources(connection, envelope, source_pin) as final_sources:
         return await _finish_refresh(
             connection,
@@ -137,11 +138,11 @@ async def complete_queued_membership_refresh(
             (envelope, address_sources, final_sources),
             copy_target,
             writer_context,
-            authorize_commit,
+            authority,
         )
 
 
-async def _finish_refresh(connection, request_scope, inputs, copy_target, writer_context, authorize_commit):
+async def _finish_refresh(connection, request_scope, inputs, copy_target, writer_context, authority):
     identity, lease, initial_request = request_scope
     envelope, original_sources, final_sources = inputs
     command = envelope["command"]
@@ -157,8 +158,9 @@ async def _finish_refresh(connection, request_scope, inputs, copy_target, writer
         )
         candidate = await _candidate_scope(connection, copy_target, command, schema)
         _require_prepared_recipes(candidate, original_sources, final_sources)
-        authority = await authorize_commit(**envelope)
-        manifest = await publish_network_candidate(connection, copy_target, control_schema=schema)
+        manifest = await publish_network_candidate(
+            connection, copy_target, control_schema=schema, preparation_roles=writer_context.preparation_roles
+        )
         receipt_by_field = _refresh_completion(command, copy_target, manifest, authority, candidate)
         await finish_registry_publication_request(
             connection, identity, lease, state="completed", result=receipt_by_field, control_schema=schema

@@ -184,9 +184,9 @@ async def test_inputs_changed_during_canonical_read_refuse(candidate_read_case, 
             case "native_input":
                 state.native_input["invalid"] = True
             case "seal":
-                state.sealed["owner_oid"] += 1
+                state.sealed["tables"].pop(next(iter(state.sealed["tables"])))
             case "attachment":
-                state.attached["parents"][readback.attach.ROOTS[0]] += 1
+                state.attached["parents"][readback.attach.ROOTS[0]]["name"] = "different_parent"
             case "request":
                 state.request["migration_role"] = "changed_migration"
         return report

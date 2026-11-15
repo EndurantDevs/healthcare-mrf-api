@@ -13,7 +13,6 @@ from process.network_approved_source_bindings import (
     APPROVED_NETWORK_BINDINGS_SQL,
     require_approved_network_source_bindings,
 )
-from process.network_custom_address_source import _artifact_dependency_identity
 from process.network_fhir_source_witness_contract import digest, source_origin
 from process.network_fhir_typed_contract import ADDRESS_FIELDS, POLICY, require
 from process.network_fhir_typed_sql import PROVIDER_ONLY_SQL
@@ -39,22 +38,22 @@ _MAPPING_DDL = {
 class TypedGraphMapping:
     source_stage: object
     table_names: dict
-    oids: dict
     metadata: dict
 
     def relation(self, kind):
         """Resolve a declared mapping relation in the current temporary workspace."""
         return "pg_temp." + _identifier(self.table_names[kind])
 
-    async def verify(self, connection):
-        """Recheck source custody and every temporary mapping relation identity."""
-        await self.source_stage.verify(connection)
-        for kind, oid in self.oids.items():
-            require(
-                await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + self.table_names[kind])
-                == oid,
-                "mapping_workspace_changed",
-            )
+    def require_ready(self):
+        """Require a validated Source edition and declared temporary mapping names."""
+        self.source_stage.require_ready()
+        require(
+            type(self.table_names) is dict
+            and set(self.table_names) == {*set(_MAPPING_DDL), "office_keys", "office_matches"},
+            "mapping_tables",
+        )
+        for name in self.table_names.values():
+            _identifier(name)
 
 
 async def create_typed_mapping_tables(connection):
@@ -91,22 +90,16 @@ def require_catalog_graph_scope(stage, coordinates, descriptor):
             descriptor["dataset_sha256"],
             descriptor["source_uri"],
             tuple(descriptor["source_aliases"]),
-            descriptor["header_table_oid"],
-            descriptor["resource_table_oid"],
-            descriptor["resource_leaf_oids"],
-            descriptor["native_catalog_sha256"],
-            descriptor["database_oid"],
+            descriptor["tables"]["header"],
+            descriptor["tables"]["resource"],
         )
         == (
             origin.endpoint_id,
             origin.dataset_sha256,
             origin.source_uri,
             origin.source_aliases,
-            origin.header_oid,
-            origin.resource_parent_oid,
-            [origin.resource_leaf_oid],
-            origin.native_catalog_sha256,
-            origin.database_oid,
+            origin.header_relation,
+            origin.resource_relation,
         ),
         "catalog_origin",
     )
@@ -115,7 +108,6 @@ def require_catalog_graph_scope(stage, coordinates, descriptor):
         publication = admission["publication"]
         require(
             publication["root_run_id"] == origin.root_run_id
-            and publication["original_metadata_sha256"] == origin.admission_metadata_sha256
             and publication["claimed_resource_count"] == sum(dict(origin.resource_counts).values()),
             "catalog_publication",
         )
@@ -278,16 +270,13 @@ async def _mapping_workspace(connection, stage, table_names):
     names_by_kind = await create_typed_mapping_tables(connection) if table_names is None else table_names
     require(type(names_by_kind) is dict and set(names_by_kind) == set(_MAPPING_DDL), "mapping_tables")
     names_by_kind = {**names_by_kind, **office_lookup_names(names_by_kind["offices"])}
-    oids_by_kind = {}
     for kind, name in names_by_kind.items():
         _identifier(name)
-        oids_by_kind[kind] = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + name)
         require(
-            type(oids_by_kind[kind]) is int
-            and await connection.fetchval("SELECT NOT EXISTS(SELECT FROM pg_temp." + _identifier(name) + ")"),
+            await connection.fetchval("SELECT NOT EXISTS(SELECT FROM pg_temp." + _identifier(name) + ")"),
             "restart_from_zero",
         )
-    mapping = TypedGraphMapping(stage, names_by_kind, oids_by_kind, {})
+    mapping = TypedGraphMapping(stage, names_by_kind, {})
     return mapping
 
 
@@ -427,6 +416,7 @@ class TypedGraphApproval:
     approved_source: object
     binding_coordinates: object
     catalog_descriptor: dict
+    catalog_generation: str | None = None
 
 
 async def prepare_typed_graph_mapping(
@@ -453,8 +443,14 @@ async def prepare_typed_graph_mapping(
 async def _prepare_mapping_offices(connection, stage, approval, table_names, control_schema):
     approved_source = approval.approved_source
     binding_coordinates, catalog_descriptor = approval.binding_coordinates, approval.catalog_descriptor
-    await stage.verify(connection)
+    stage.require_ready()
     generation = require_catalog_graph_scope(stage, binding_coordinates, catalog_descriptor)
+    if approval.catalog_generation is not None:
+        require(
+            type(approval.catalog_generation) is str and re.fullmatch(r"[0-9a-f]{64}", approval.catalog_generation),
+            "catalog_generation",
+        )
+        generation = approval.catalog_generation
     await require_approved_network_source_bindings(
         connection, approved_source, binding_coordinates, control_schema=control_schema
     )
@@ -466,7 +462,7 @@ async def _prepare_mapping_offices(connection, stage, approval, table_names, con
     return mapping, approval, generation, arguments
 
 
-async def _finish_mapping(connection, prepared, address_source, address_identity, matches, control_schema):
+async def _finish_mapping(connection, prepared, address_source, matches, control_schema):
     mapping, approval, generation, arguments = prepared
     stage, approved_source = mapping.source_stage, approval.approved_source
     bindings = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema))
@@ -481,14 +477,11 @@ async def _finish_mapping(connection, prepared, address_source, address_identity
         "approved_revision": approved_source.approved_revision,
         "approved_generation_sha256": approved_source.generation_id,
         "address_source": asdict(address_source),
-        "address_identity": dict(
-            zip(("schema_oid", "table_oid", "owner_oid", "identity_sha256"), address_identity, strict=True)
-        ),
         "counters": {**stage.document["counts"], **totals, **dict(office_counts)},
     }
     mapping.metadata["counters"]["strict_pair_rows"] = mapping.metadata["counters"].pop("pair_rows")
     mapping.metadata["mapping_sha256"] = digest(mapping.metadata)
-    await mapping.verify(connection)
+    mapping.require_ready()
     return mapping
 
 
@@ -498,9 +491,6 @@ async def map_typed_graph_batch(connection, inputs, *, address_source, runtime_r
 
     require(bool(inputs), "mapping_inputs")
     async with connection.transaction():
-        address_identity = await _artifact_dependency_identity(
-            connection, address_source, runtime_roles, address=True, control_schema=control_schema
-        )
         prepared_mappings = [
             await _prepare_mapping_offices(connection, stage, approval, names, control_schema)
             for stage, approval, names in inputs
@@ -508,14 +498,7 @@ async def map_typed_graph_batch(connection, inputs, *, address_source, runtime_r
         office_names = [mapping.table_names["offices"] for mapping, _, _, _ in prepared_mappings]
         async with typed_office_lookup(connection, office_names, address_source) as matches:
             mappings = [
-                await _finish_mapping(connection, selected, address_source, address_identity, matches, control_schema)
+                await _finish_mapping(connection, selected, address_source, matches, control_schema)
                 for selected in prepared_mappings
             ]
-            require(
-                await _artifact_dependency_identity(
-                    connection, address_source, runtime_roles, address=True, control_schema=control_schema
-                )
-                == address_identity,
-                "office_native_identity",
-            )
         return mappings

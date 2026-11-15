@@ -3,16 +3,18 @@
 
 import json
 from dataclasses import replace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
 
 from process import network_cms_registry_source_pair as retained
 from process import network_registry_cms_prepared_pair as prepared
+from process.entity_address_snapshot_ownership import validate_entity_address_archive_stage_ownership
 from process.entity_address_snapshot_receipt import validate_entity_address_archive_receipt
 from process.registry_source_recipe_store import canonical_registry_source_recipes
 from tests.test_cms_registry_source_pair_slot import _prepared, _row
-from tests.test_network_cms_registry_address_witness_decode import _witness
+from tests.test_network_cms_registry_address_witness_decode import _named_witness, _witness
 
 
 def _retained_pair():
@@ -21,32 +23,45 @@ def _retained_pair():
     return prepared._pair_from_prepared_receipt(candidate, _row(candidate))
 
 
-def _witness_pair():
+def _witness_pair(*, named=False):
     """Bind the existing synthetic seven-table wire to one retained parser input."""
     pair = _retained_pair()
-    document = _witness()
+    document = _named_witness() if named else _witness()
     for side, schema in (
         ("source", pair.proof.source_pin.schema_name),
         ("clone", pair.address_ownership.schema_name),
     ):
         document[side]["schema_name"] = schema
         document[side]["sequence"]["schema_name"] = schema
+        if "relations" in document[side]:
+            for relation in document[side]["relations"]:
+                relation["schema_name"] = schema
     clone = document["clone"]
-    ownership = replace(
-        pair.address_ownership,
-        schema_oid=clone["schema_oid"],
-        relation_oids=tuple(tuple(entry) for entry in clone["relation_oids"]),
+    coordinates = (
+        {
+            "relations": [
+                {"schema_name": clone["schema_name"], "relation_name": entry["relation_name"]}
+                for entry in clone["relations"]
+            ]
+        }
+        if named
+        else {
+            "schema_oid": clone["schema_oid"],
+            "relation_oids": [{"table_name": name, "oid": token} for name, token in clone["relation_oids"]],
+        }
     )
-    payload = json.loads(pair.cms_receipt_payload)
-    source_oid_by_table = dict(document["source"]["relation_oids"])
-    payload["address"]["relation_oids"] = [source_oid_by_table[model.__tablename__] for model in retained._models()]
+    ownership = validate_entity_address_archive_stage_ownership(
+        {
+            "dataset_id": str(pair.address_ownership.dataset_id),
+            "schema_name": clone["schema_name"],
+            **coordinates,
+        }
+    )
     return replace(
         pair,
-        address_source=replace(pair.address_source, generation_id=retained._digest(payload["address"])),
         address_ownership=ownership,
         address_receipt=validate_entity_address_archive_receipt(clone["receipt"]),
         address_catalog_sha256=clone["catalog_sha256"],
-        cms_receipt_payload=retained._json(payload),
         witness_json=retained.decode_registry_cms_address_copy_witness(document),
     )
 
@@ -63,7 +78,7 @@ def test_retained_wire_roundtrip_preserves_original_capture(make_pair):
     assert replay.recipe.source_pin.read_schema_name != replay.proof.source_pin.schema_name
 
 
-@pytest.mark.parametrize("pin_kind", ["foreign-source", "retained", "custody", "untyped"])
+@pytest.mark.parametrize("pin_kind", ["foreign-source", "retained", "untyped"])
 def test_publication_proof_refuses_prebound_or_foreign_source(pin_kind):
     pair = _retained_pair()
     pin = pair.proof.source_pin
@@ -71,14 +86,6 @@ def test_publication_proof_refuses_prebound_or_foreign_source(pin_kind):
         pin = replace(pin, source_id="other-source")
     elif pin_kind == "retained":
         pin = pair.recipe.source_pin
-    elif pin_kind == "custody":
-        pin = replace(
-            pin,
-            custody_owner_role="retained_owner",
-            custody_runtime_roles=("retained_reader",),
-            custody_proof_sha256="1" * 64,
-            custody_catalog_sha256="2" * 64,
-        )
     else:
         pin = pair.proof.source_pin.coordinates
     with pytest.raises(ValueError, match="^registry_cms_publication_proof_invalid$"):
@@ -191,13 +198,12 @@ def test_decoder_refuses_unclosed_pair_metadata(container):
     "side,coordinate",
     [
         ("source", "schema_name"),
-        ("source", "relation_oids"),
         ("clone", "schema_name"),
         ("clone", "schema_oid"),
         ("clone", "relation_oids"),
     ],
 )
-def test_pair_refuses_valid_witness_for_another_address_family(side, coordinate):
+def test_pair_binds_witness_names_and_preserves_opaque_legacy_tokens(side, coordinate):
     pair = _witness_pair()
     document = json.loads(pair.witness_json)
     if coordinate == "schema_name":
@@ -208,6 +214,48 @@ def test_pair_refuses_valid_witness_for_another_address_family(side, coordinate)
     else:
         next(entry for entry in document[side][coordinate] if entry[0] == "entity_address_unified")[1] += 1000
     foreign_wire = retained.decode_registry_cms_address_copy_witness(document)
-    with pytest.raises(ValueError, match="^registry_cms_source_pair_invalid$"):
-        replace(pair, witness_json=foreign_wire)
+    if coordinate == "schema_name":
+        with pytest.raises(ValueError, match="^registry_cms_source_pair_invalid$"):
+            replace(pair, witness_json=foreign_wire)
+    else:
+        rebound = replace(pair, witness_json=foreign_wire)
+        assert rebound.address_ownership.relation_names == pair.address_ownership.relation_names
+        assert rebound.witness_json == foreign_wire
     assert retained.decode_registry_cms_source_pair(pair.as_dict()) == pair
+
+
+def test_named_witness_pair_roundtrip_uses_complete_qualified_names():
+    pair = _witness_pair(named=True)
+    document = pair.as_dict()
+    assert set(document["address_ownership"]) == {"dataset_id", "schema_name", "relations"}
+    assert set(document["address_copy_witness"]["clone"]) >= {"schema_name", "relations", "receipt"}
+    assert "schema_oid" not in document["address_copy_witness"]["clone"]
+    assert retained.decode_registry_cms_source_pair(document).as_dict() == document
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", [None, "rows", "layout"])
+async def test_legacy_pair_uses_semantic_receipt_after_catalog_renumbering(monkeypatch, drift):
+    pair = replace(_witness_pair(), witness_json=None)
+    original_wire = retained._json(pair.as_dict())
+    table = pair.address_receipt.tables[0]
+    if drift == "rows":
+        table = replace(table, row_count=table.row_count + 1, row_sha256="e" * 64)
+    elif drift == "layout":
+        table = replace(table, schema_sha256="e" * 64)
+    observed = replace(pair.address_receipt, tables=(table, *pair.address_receipt.tables[1:]))
+    capture = AsyncMock(return_value=observed)
+    monkeypatch.setattr(retained, "capture_entity_address_archive_receipt", capture)
+    session = object()
+    if drift is None:
+        await retained._require_address_pair_layout(session, pair, "f" * 64, verify_content=True)
+    else:
+        with pytest.raises(ValueError, match="^registry_cms_source_pair_legacy_semantic_receipt_changed$"):
+            await retained._require_address_pair_layout(session, pair, "f" * 64, verify_content=True)
+    capture.assert_awaited_once_with(
+        session,
+        schema_name=pair.address_ownership.schema_name,
+        contract=pair.address_receipt.contract,
+        read_only=True,
+    )
+    assert retained._json(pair.as_dict()) == original_wire

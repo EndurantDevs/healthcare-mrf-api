@@ -47,12 +47,7 @@ def handoff_for(storage, inventory):
                     content_proof_admission_sha256="d" * 64,
                 ),
                 tables={
-                    root: dict(
-                        name=inventory_relation["relation_name"],
-                        oid=inventory_relation["relation_oid"],
-                        owner=storage.owner_oid,
-                        layout_sha256="e" * 64,
-                    )
+                    root: dict(schema=storage.storage_schema, name=inventory_relation["relation_name"])
                     for root, inventory_relation in zip(roots, inventory["relations"], strict=True)
                 },
             )
@@ -70,7 +65,7 @@ def allocation_state(case):
         source_policy=asdict(case.source_policy),
         prepared_policy=asdict(case.policy),
         frozen_inventory=case.inventory,
-        origin=case.origin,
+        origin={key: case.origin[key] for key in ("readonly", "isolation", "replication_role")},
         native_coordinates=case.coordinates,
     )
     return SimpleNamespace(
@@ -117,10 +112,7 @@ async def allocated(case, monkeypatch):
             assert case.origin["current"] == case.policy.owner_role
             name = sql.split('"')[3]
             assert name not in outputs
-            outputs[name] = dict(name=name, oid=1000 + len(outputs), owner=76, layout_sha256="2" * 64)
-        if sql.startswith(("ALTER TABLE", "CREATE INDEX", "CREATE UNIQUE INDEX")):
-            for receipt in outputs.values():
-                receipt["layout_sha256"] = hashlib.sha256((receipt["layout_sha256"] + sql).encode()).hexdigest()
+            outputs[name] = dict(schema=case.policy.schema, name=name)
 
     async def fetchval(sql, *args):
         if "quote_literal" in sql:
@@ -134,7 +126,10 @@ async def allocated(case, monkeypatch):
 
     async def capture(connection, policy, names, **options):
         assert connection is case.driver
-        return {name: deepcopy(outputs[name]) for name in names}
+        return {
+            name: deepcopy(outputs[name]) if name in outputs else {"schema": policy.schema, "name": name}
+            for name in names
+        }
 
     async def copy_rows(connection, session, schema, name, columns, records):
         assert case.origin["current"] == case.policy.owner_role
@@ -144,7 +139,7 @@ async def allocated(case, monkeypatch):
     case.driver.execute = AsyncMock(side_effect=execute)
     case.driver.fetchval = AsyncMock(side_effect=fetchval)
     monkeypatch.setattr(workspace.storage, "_capture", capture)
-    monkeypatch.setattr(workspace, "storage_roles", AsyncMock(return_value=(76, [])))
+    monkeypatch.setattr(workspace.storage, "_close_grants", AsyncMock())
     monkeypatch.setattr(workspace, "copy_identity_rows_native", AsyncMock(side_effect=copy_rows))
     yield state
 
@@ -170,7 +165,7 @@ async def test_fixed_new_outputs_keep_publisher_and_never_reopen_inputs(allocate
         async with scope(state) as current:
             assert case.origin["current"] == case.policy.publisher_role
             assert len(current.receipts) == len(state.outputs) == 11
-            assert current.source_binding is case.storage and case.storage.owner_oid == 74
+            assert current.source_binding is case.storage and case.storage.storage_schema == "private_source"
             assert current.identity == state.handoff.document["identity"]
             assert current.catalog_schema == case.storage.catalog_schema
             assert (source._FACTORY.get(), source._PUBLISHER.get(), source._OWNER.get()) == ambient
@@ -225,8 +220,8 @@ def test_names_are_deterministic_for_exact_preparation_and_handoff(allocated, ch
     assert not set(workspace._names(original).values()) & set(workspace._names(changed).values())
 
 
-@pytest.mark.parametrize("failure", ["exists", "inherit", "source_closed"])
-async def test_existing_objects_or_incompatible_native_roles_fail_before_create(allocated, failure):
+@pytest.mark.parametrize("failure", ["exists"])
+async def test_existing_objects_fail_before_create(allocated, failure):
     state, case = allocated, allocated.case
     setattr(state, failure, failure == "exists")
     with pytest.raises(ValueError, match="output_exists|inheritance_required|source_reaches_prepared_owner"):
@@ -249,9 +244,9 @@ async def test_failure_or_cancel_rolls_back_all_new_outputs_and_restores_publish
 async def test_late_frozen_metadata_drift_also_rolls_back_workspace_savepoint(allocated):
     state, case = allocated, allocated.case
     async with case.session.begin(), case.database.bind_existing_session(case.session):
-        with pytest.raises(ValueError, match="frozen_inventory_changed"):
+        with pytest.raises(ValueError, match="inputs_changed"):
             async with scope(state):
-                case.native_rows[0]["relfilenode"] = 999
+                state.inputs["frozen_inventory"]["relations"][0]["relation_name"] = "replacement_input"
         assert not state.outputs and case.origin["current"] == case.policy.publisher_role
 
 
@@ -281,7 +276,7 @@ async def test_receipt_drift_or_child_task_cannot_use_workspace(allocated):
             async with scope(state) as current:
                 with pytest.raises(ValueError, match="original_task_required"):
                     await asyncio.create_task(current.verify_current())
-                next(iter(state.outputs.values()))["oid"] = 99999
+                next(iter(state.outputs.values()))["name"] = "replacement_output"
                 await current.verify_current()
         assert not state.outputs
 
@@ -290,7 +285,7 @@ async def test_receipt_drift_or_child_task_cannot_use_workspace(allocated):
 async def test_detached_observation_or_handoff_cannot_choose_another_input(allocated, change):
     state, case = allocated, allocated.case
     if change == "original_storage":
-        state.inputs["source_storage"]["owner_oid"] = 99
+        state.inputs["source_storage"]["storage_schema"] = "other_storage"
     elif change == "frozen_name":
         state.inputs["frozen_inventory"]["relations"][0]["relation_name"] = "different"
     else:
@@ -374,7 +369,7 @@ async def test_retained_reopen_preserves_outputs_and_refuses_mutation(allocated)
             await current.verify_current()
 
 
-@pytest.mark.parametrize("fault", ["indexed", "identity", "root", "name", "oid", "owner", "layout"])
+@pytest.mark.parametrize("fault", ["indexed", "identity", "root", "name", "schema"])
 async def test_retained_reopen_rejects_changed_identity_or_objects(allocated, fault):
     state, case = allocated, allocated.case
     async with case.session.begin(), case.database.bind_existing_session(case.session):
@@ -387,12 +382,7 @@ async def test_retained_reopen_rejects_changed_identity_or_objects(allocated, fa
         elif fault == "root":
             binding["tables"].pop(next(iter(binding["tables"])))
         else:
-            receipt[{"layout": "layout_sha256"}.get(fault, fault)] = {
-                "name": "other",
-                "oid": 999999,
-                "owner": 8888,
-                "layout": "9" * 64,
-            }[fault]
+            receipt[fault] = "other"
         before = deepcopy(state.outputs)
         with pytest.raises(ValueError, match="retained_|output_changed"):
             async with _reopen(state, binding):

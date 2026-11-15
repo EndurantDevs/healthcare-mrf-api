@@ -209,6 +209,35 @@ async def _settle_publication_tasks(
         await relation_reader_task
 
 
+async def _wait_for_pointer_pause(promotion_entered, promotion_task):
+    pause_task = importer.asyncio.create_task(promotion_entered.wait())
+    try:
+        done, _ = await importer.asyncio.wait(
+            (pause_task, promotion_task), timeout=5, return_when=importer.asyncio.FIRST_COMPLETED
+        )
+        if promotion_task in done:
+            await promotion_task
+        assert pause_task in done, "Publication did not reach the pointer cutover"
+    finally:
+        pause_task.cancel()
+        await importer.asyncio.gather(pause_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_pointer_pause_propagates_early_publisher_failure():
+    promotion_entered = importer.asyncio.Event()
+    error = RuntimeError("synthetic early publication failure")
+
+    async def fail():
+        raise error
+
+    promotion_task = importer.asyncio.create_task(fail())
+    with pytest.raises(RuntimeError) as caught:
+        await _wait_for_pointer_pause(promotion_entered, promotion_task)
+    assert caught.value is error
+    assert not promotion_entered.is_set()
+
+
 @pytest.mark.asyncio
 async def test_full_scope_uses_candidate_while_targeted_uses_current(monkeypatch):
     async with _dataset_database(monkeypatch) as (database, schema):
@@ -375,7 +404,7 @@ async def test_multi_endpoint_reader_sees_atomic_bundle_and_pointers(monkeypatch
                 )
                 relation_reader_task = None
                 try:
-                    await promotion_entered.wait()
+                    await _wait_for_pointer_pause(promotion_entered, promotion_task)
                     assert await _published_dataset_pointers(observer, schema) == [
                         ("endpoint_shared", "dataset_shared"),
                         ("endpoint_z", "dataset_z_current"),

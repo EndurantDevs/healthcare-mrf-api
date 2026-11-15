@@ -23,6 +23,7 @@ from db.migration_provider_directory_terminal_root_retirement_guards import (
 )
 from process import uhc_flex_practitioner_publication_materialization as practitioner_materialization
 from process import uhc_flex_practitioner_publication_store as practitioner_store
+from process.provider_directory_generic_source_policy import is_source_storage_required
 from process.uhc_flex_practitioner_publication import build_uhc_flex_practitioner_dataset_identity
 from process.uhc_flex_practitioner_publication_store import _insert_building_headers
 from tests.formulary_fhir_twin_admission_pg_support import (
@@ -1082,7 +1083,7 @@ async def test_candidate_attach_reuses_every_prepared_native_index(monkeypatch, 
              WHERE NOT before.attached ORDER BY relation
         """)
         expected_relations = await _indexed_candidate_relations(context) - initial_relations
-        assert len(expected_relations) >= 7
+        assert len(expected_relations) == (7 if current_source else 4)
         assert {observation["relation_oid"] for observation in observations} == expected_relations
         dataset_prefix = "pdgs_" if current_source else "pd_ds_"
         assert sum(observation["relname"].startswith(dataset_prefix) for observation in observations) == (
@@ -1191,13 +1192,27 @@ async def test_sealed_provider_candidate_rejects_global_write_role(monkeypatch):
             schema,
         )
         assert candidate
+        from tests.test_named_output_recovery_document import _migration as _current_retirement
+
+        for statement in _current_retirement()._retire_dataset_plan_owner(context.schema_name):
+            await connection.execute(statement)
+        plan_json = await connection.fetchval(
+            f"SELECT plan::text FROM {schema}.pd_dataset_migration_plan WHERE singleton"
+        )
         role = roles_by_kind["column"]
+        async with connection.transaction():
+            await connection.execute(f"SET LOCAL ROLE {quoted(role)}")
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                async with connection.transaction():
+                    await connection.execute(f"UPDATE {schema}.pd_dataset_migration_plan SET plan=$1::jsonb", plan_json)
+        await connection.execute("RESET ROLE")
         await connection.execute(f"GRANT pg_write_all_data TO {quoted(role)}")
         async with connection.transaction():
             await connection.execute(f"SET LOCAL ROLE {quoted(role)}")
-            with pytest.raises(asyncpg.InsufficientPrivilegeError, match="migration_unauthorized"):
-                async with connection.transaction():
-                    await connection.execute(f"UPDATE {schema}.pd_dataset_migration_plan SET plan='{{}}'")
+            assert (
+                await connection.execute(f"UPDATE {schema}.pd_dataset_migration_plan SET plan=$1::jsonb", plan_json)
+                == "UPDATE 1"
+            )
             with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError, match="candidate_immutable"):
                 async with connection.transaction():
                     await connection.execute(f"INSERT INTO {candidate} DEFAULT VALUES")

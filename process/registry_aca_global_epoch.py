@@ -9,7 +9,11 @@ from uuid import UUID
 from sqlalchemy import text
 
 from process.mrf_address_publication import ADDRESS_COVERAGE_CONTRACT, REFERENCES, require_address_coverage
-from process.mrf_publication_receipt import SUMMARY_INPUTS, require_completed_publication
+from process.mrf_publication_receipt import (
+    SUMMARY_INPUTS,
+    _is_reference_generation_current,
+    require_completed_publication,
+)
 from process.network_address_projection import _identifier
 from process.network_cms_registry_address_capture import native_driver
 from process.network_legacy_membership_source import _validated_archive
@@ -23,6 +27,7 @@ from process.reference_family_archive import (
     prepare_reference_family_activation,
     protected_publisher_owner,
     reference_family_profile_contract,
+    reference_family_spec,
     validate_reference_family_manifest,
     validate_reference_family_validation_receipt,
 )
@@ -100,26 +105,35 @@ def _completion(completion, publication):
 
 
 def _generation(generation, publication):
-    if type(generation) is not dict or set(generation) != {
-        "importer_id",
-        "local_lineage_id",
-        "local_generation",
-        "serving_generation",
-        "relation_oids",
-    }:
+    """Validate closed named or saved legacy editions without rewriting either."""
+    logical_fields = {"importer_id", "local_lineage_id", "local_generation", "serving_generation"}
+    if type(generation) is not dict or set(generation) not in (
+        logical_fields | {"relations"},
+        logical_fields | {"relation_oids"},
+    ):
         _invalid()
     serving = _publication(publication)
     if type(generation["serving_generation"]) is not dict:
         _invalid()
-    authority = validate_reference_family_result_generation_authority(
-        {
-            **{
-                key: generation[key] for key in ("importer_id", "local_lineage_id", "local_generation", "relation_oids")
+    relation_field = "relations" if "relations" in generation else "relation_oids"
+    try:
+        authority = validate_reference_family_result_generation_authority(
+            {
+                **{
+                    key: generation[key]
+                    for key in ("importer_id", "local_lineage_id", "local_generation", relation_field)
+                },
+                **generation["serving_generation"],
             },
-            **generation["serving_generation"],
-        }
-    )
-    if generation != authority.as_dict() or authority.importer_id != "mrf" or authority.serving_generation != serving:
+            declared_schema=reference_family_spec("mrf").model_types[0].__table__.schema,
+        )
+    except RuntimeError, TypeError, ValueError:
+        _invalid()
+    if (
+        authority.importer_id != "mrf"
+        or authority.serving_generation != serving
+        or not _is_reference_generation_current(generation, authority.as_dict(), authority.relations[0][0])
+    ):
         _invalid()
 
 

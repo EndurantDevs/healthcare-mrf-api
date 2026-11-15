@@ -41,9 +41,9 @@ def test_generation_authority_accepts_complete_state():
 
     assert authority.local_generation == 14
     assert authority.serving_generation.origin_generation == 8
-    assert authority.relation_oids == tuple(range(10, 17))
+    assert authority.relation_oids is None
     assert authority.as_dict()["serving_generation"]["origin_generation"] == 8
-    assert authority.as_dict()["relation_oids"] == list(range(10, 17))
+    assert authority.as_dict()["relation_oids"] is None
 
 
 @pytest.mark.parametrize(
@@ -54,7 +54,7 @@ def test_generation_authority_accepts_complete_state():
         [10, 11, 12, 13, 14, 15],
     ],
 )
-def test_generation_authority_rejects_non_distinct_non_positive_or_incomplete_oids(
+def test_generation_authority_ignores_opaque_legacy_catalog_values(
     relation_oids,
 ):
     authority_by_field = {
@@ -67,8 +67,7 @@ def test_generation_authority_rejects_non_distinct_non_positive_or_incomplete_oi
         "relation_oids": relation_oids,
     }
 
-    with pytest.raises(RuntimeError, match="serving generation is invalid"):
-        generation.validate_entity_address_result_generation_authority(authority_by_field)
+    assert generation.validate_entity_address_result_generation_authority(authority_by_field).relation_oids is None
 
 
 def test_automatic_order_requires_strictly_newer_same_lineage():
@@ -219,17 +218,12 @@ async def test_generation_reads_require_authority_rows():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "rows",
-    [
-        [("wrong", value) for value in range(10, 17)],
-        [(name, None) for name in generation.RELATION_NAMES],
-    ],
-)
-async def test_relation_oid_read_rejects_malformed_rows(rows):
-    database = SimpleNamespace(all=AsyncMock(return_value=rows))
-    with pytest.raises(RuntimeError, match="relations are unavailable"):
-        await generation._current_relation_oids(database, "mrf")
+@pytest.mark.parametrize("error", [PermissionError("no SELECT"), RuntimeError("missing relation")])
+async def test_named_relation_access_propagates_actual_native_failure(error):
+    database = SimpleNamespace(scalar=AsyncMock(side_effect=error))
+    with pytest.raises(type(error), match=str(error)):
+        await generation._current_relation_names(database, "mrf")
+    assert "entity_address_unified" in str(database.scalar.await_args.args[0])
 
 
 @pytest.mark.asyncio
@@ -247,7 +241,7 @@ async def test_generation_publication_rejects_exhausted_missing_and_changed_auth
 
     current = generation.EntityAddressResultGenerationAuthority(lineage, 1, None, None)
     monkeypatch.setattr(generation, "_locked_authority", AsyncMock(return_value=current))
-    monkeypatch.setattr(generation, "_current_relation_oids", AsyncMock(return_value=tuple(range(10, 17))))
+    monkeypatch.setattr(generation, "_current_relation_names", AsyncMock(return_value=generation.RELATION_NAMES))
     database = SimpleNamespace(first=AsyncMock(return_value=None))
     with pytest.raises(RuntimeError, match="singleton is unavailable"):
         await generation.publish_local_entity_address_generation(database, schema_name="mrf")
@@ -264,6 +258,56 @@ async def test_generation_publication_rejects_exhausted_missing_and_changed_auth
     monkeypatch.setattr(generation, "validate_entity_address_result_generation_authority", lambda _row: changed)
     with pytest.raises(RuntimeError, match="changed during adoption"):
         await generation.publish_adopted_entity_address_generation(database, schema_name="mrf", source_generation=None)
+
+
+@pytest.mark.asyncio
+async def test_legacy_adoption_advances_local_edition_without_inventing_source_or_physical_identity():
+    authority_by_field = {
+        "singleton": True,
+        "local_lineage_id": "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+        "local_generation": 7,
+        "origin_lineage_id": None,
+        "origin_generation": None,
+        "published_at": None,
+        "relation_oids": None,
+    }
+    database = SimpleNamespace(
+        first=AsyncMock(side_effect=[authority_by_field, {**authority_by_field, "local_generation": 8}]),
+        all=AsyncMock(side_effect=AssertionError("legacy adoption attempted a physical lookup")),
+    )
+    adopted = await generation.publish_adopted_entity_address_generation(
+        database, schema_name="mrf", source_generation=None
+    )
+    assert adopted.local_generation == 8 and adopted.serving_generation is None and adopted.relation_oids is None
+    assert "FOR UPDATE" in str(database.first.await_args_list[0].args[0])
+    statement, parameters = database.first.await_args.args[0], database.first.await_args.kwargs
+    assert "local_generation=:local_generation" in str(statement)
+    assert parameters == {
+        "local_generation": 8,
+        "origin_lineage_id": None,
+        "origin_generation": None,
+        "published_at": None,
+        "relation_oids": None,
+    }
+    database.all.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_legacy_adoption_exhaustion_refuses_before_write_or_physical_lookup():
+    authority_by_field = {
+        "singleton": True,
+        "local_lineage_id": "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+        "local_generation": generation._MAX_GENERATION,
+        "origin_lineage_id": None,
+        "origin_generation": None,
+        "published_at": None,
+        "relation_oids": None,
+    }
+    database = SimpleNamespace(first=AsyncMock(return_value=authority_by_field), all=AsyncMock())
+    with pytest.raises(RuntimeError, match="exhausted"):
+        await generation.publish_adopted_entity_address_generation(database, schema_name="mrf", source_generation=None)
+    assert database.first.await_count == 1
+    database.all.assert_not_awaited()
 
 
 @pytest.mark.asyncio

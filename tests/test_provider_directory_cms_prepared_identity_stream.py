@@ -40,7 +40,7 @@ def streaming(monkeypatch):
     """Provide a bounded frozen reader and caller-owned rollback events."""
     document_by_field = {
         "identity": _identity(),
-        "tables": {storage.WITNESS: {"name": "frozen_witness", "oid": 17}},
+        "tables": {storage.WITNESS: {"schema": "private_source", "name": "frozen_witness"}},
     }
     handoff = FHIRSourceCandidateHandoff(storage._encoded(document_by_field))
     workspace = object.__new__(CMSPreparedWorkspace)
@@ -48,7 +48,9 @@ def streaming(monkeypatch):
     workspace._binding = {"identity": document_by_field["identity"], "handoff_sha256": handoff.document_sha256}
     workspace._receipts = {}
     workspace._indexed = False
-    workspace._inputs = {"frozen_inventory": {"relations": [{"relation_oid": 17, "relation_name": "frozen_witness"}]}}
+    workspace._inputs = {
+        "frozen_inventory": {"relations": [{"schema_name": "private_source", "relation_name": "frozen_witness"}]}
+    }
     workspace.verify_current = AsyncMock()
     events, calls = [], []
     rows_by_family = frozen_identity_rows(document_by_field)
@@ -136,10 +138,10 @@ async def test_missing_family_rows_rollback_prior_private_batches(streaming):
 
 
 @pytest.mark.asyncio
-async def test_replaced_handoff_or_frozen_oid_refuses_before_sql(streaming):
+async def test_replaced_handoff_or_frozen_name_refuses_before_sql(streaming):
     state = streaming
     document = deepcopy(state.handoff.document)
-    document["tables"][storage.WITNESS]["oid"] = 18
+    document["tables"][storage.WITNESS]["name"] = "other_witness"
     handoff = FHIRSourceCandidateHandoff(storage._encoded(document))
     with pytest.raises(ValueError, match="handoff_changed"):
         await stream.stage_prepared_identities(state.workspace, handoff)

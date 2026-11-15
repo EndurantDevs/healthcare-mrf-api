@@ -4,6 +4,7 @@
 import asyncio
 import dataclasses
 import importlib
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -86,6 +87,63 @@ def test_historical_result_rejects_changed_execution_or_cms_pin(section, key, fi
     receipt["payload"][section][key] = field_value
     with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale):
         replay._assert_common_execution(fhir, execution, delta_by_field, receipt)
+
+
+def _named_result(**target_overrides):
+    """Project a bound result to the named receipt shape the current publisher writes."""
+    execution, delta_by_field, receipt = _bound_result()
+    profile = receipt["payload"]["profile"]
+    delta_by_field["targets"] = {}
+    for name, relation in (
+        ("evidence", "provider_directory_profile_evidence"),
+        ("profile", "provider_directory_profile"),
+    ):
+        del profile[name + "_target_oid"], delta_by_field[name + "_target_oid"]
+        delta_by_field["targets"][name] = {"schema": fhir._schema(), "name": relation}
+        profile[name + "_target"] = {"schema_name": fhir._schema(), "relation_name": relation}
+    profile.update(target_overrides)
+    return execution, delta_by_field, receipt
+
+
+def test_named_receipt_replay_compares_qualified_targets():
+    execution, delta_by_field, receipt = _named_result()
+    assert replay._assert_common_execution(fhir, execution, delta_by_field, receipt)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"evidence_target": {"schema_name": "other_schema", "relation_name": "provider_directory_profile_evidence"}},
+        {"profile_target": {"schema_name": fhir._schema(), "relation_name": "provider_directory_profile_evidence"}},
+        {"profile_target": None},
+    ],
+)
+def test_named_receipt_replay_rejects_changed_qualified_target(target):
+    execution, delta_by_field, receipt = _named_result(**target)
+    with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match="common_result_changed"):
+        replay._assert_common_execution(fhir, execution, delta_by_field, receipt)
+
+
+@pytest.mark.parametrize("stored_field", ["targets", "targets_json"])
+@pytest.mark.parametrize("changed", [False, True])
+def test_named_replay_binds_recorded_targets_including_noncanonical_names(stored_field, changed):
+    execution, delta_by_field, receipt = _bound_result()
+    target_by_role = {
+        "evidence": {"schema": "published_profile", "name": "edition_evidence"},
+        "profile": {"schema": "published_profile", "name": "edition_profile"},
+    }
+    delta_by_field[stored_field] = json.dumps(target_by_role) if stored_field == "targets_json" else target_by_role
+    profile = receipt["payload"]["profile"]
+    for role, coordinate in target_by_role.items():
+        delta_by_field.pop(role + "_target_oid")
+        profile.pop(role + "_target_oid")
+        profile[role + "_target"] = {"schema_name": coordinate["schema"], "relation_name": coordinate["name"]}
+    if changed:
+        profile["evidence_target"]["relation_name"] = "another_edition"
+        with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match="common_result_changed"):
+            replay._assert_common_execution(fhir, execution, delta_by_field, receipt)
+    else:
+        assert replay._assert_common_execution(fhir, execution, delta_by_field, receipt)
 
 
 @pytest.mark.asyncio

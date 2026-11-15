@@ -127,6 +127,7 @@ async def _database(monkeypatch):
     suffix = uuid4().hex
     role_names = tuple("pm_" + role + "_" + suffix for role in ("owner", "publisher", "reader"))
     _owner, publisher, reader = role_names
+    monkeypatch.setattr(native, "model_family_roles", lambda roles=None: (_owner, role_names))
     role_password_by_name = {role: secrets.token_hex(24) for role in (publisher, reader)}
     admin = create_async_engine(url)
     publisher_engine = None
@@ -448,10 +449,16 @@ async def test_concurrent_duplicate_builds_adopt_one_identity_and_reader_cannot_
                     )
         finally:
             await reader_engine.dispose()
-        async with db.sessions() as session, session.begin():
-            await session.execute(
-                text(f'UPDATE "{db.stages[0].schema_name}".ptg_membership_code_coverage SET set_count=3')
+        with pytest.raises(DBAPIError):
+            async with db.sessions() as session, session.begin():
+                await session.execute(
+                    text(f'UPDATE "{db.stages[0].schema_name}".ptg_membership_code_coverage SET set_count=set_count+1')
+                )
+        async with db.admin.begin() as session:
+            changed = await session.execute(
+                text(f'UPDATE "{db.stages[0].schema_name}".ptg_membership_code_coverage SET set_count=set_count+1')
             )
+            assert changed.rowcount > 0
         async with db.sessions() as session:
             with pytest.raises(PTG2ManifestArtifactError, match="coverage differs"):
                 async with session.begin():

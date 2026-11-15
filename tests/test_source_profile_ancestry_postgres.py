@@ -117,7 +117,10 @@ async def _exercise_set_validated_descendant(case):
         }
         async with case.sessions() as session, session.begin():
             validation = await archive.prepare_activation(
-                session, **activation_by_field, publication_request={"source_copy": native_source_copy()}
+                session,
+                **activation_by_field,
+                publication_request={"source_copy": native_source_copy()},
+                roles=case.preparation_by_field["roles"],
             )
             assert await archive._run(session, case.destination_schema, descendant) is None
             assert await archive._pin_group(session, case.destination_schema, activation_by_field["pin_id"]) == []

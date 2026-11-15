@@ -18,7 +18,7 @@ SQL_CONTRACT = (
     CONTROL_MAINTENANCE_FENCE_CONTRACT_ID + ":existing-artifact-scope-connection:extra-connections=0:"
     "build_checkpoint,serving_generation,delta_receipt,import_run,capacity_consumption:"
     "LOCK TABLE IN SHARE UPDATE EXCLUSIVE MODE NOWAIT:"
-    "recheck-admitted-identity:verify-native-locks-every-window:release-before-prepared-bundle-yield"
+    "recheck-admitted-logical-scope:native-lock-transaction-lifetime:release-before-prepared-bundle-yield"
 )
 _ACTIVE = contextvars.ContextVar("profile_control_maintenance_fence", default=None)
 
@@ -51,28 +51,12 @@ async def _rollback_drained(lease):
 
 
 async def assert_held(fhir):
-    """Refuse a lost native lease before a bounded worker window proceeds."""
+    """Native relation locks remain held for the lifetime of this transaction."""
     lease = _ACTIVE.get()
     if lease is None or lease.released or not lease.has_acquired:
         return
     if lease.fhir is not fhir or not lease.connection.in_transaction():
         raise RuntimeError("provider_directory_profile_maintenance_lease_lost")
-    async with lease.query_lock:
-        async with asyncio.timeout(await fhir._profile_capacity_remaining_ms(lease.admission) / 1000):
-            lock_result = await lease.connection.execute(
-                text(
-                    "SELECT count(DISTINCT relation)::integer FROM pg_locks "
-                    "WHERE pid = pg_backend_pid() AND database = CAST(:database_oid AS oid) "
-                    "AND locktype = 'relation' AND mode = 'ShareUpdateExclusiveLock' AND granted "
-                    "AND relation = ANY(CAST(:relation_oids AS oid[]))"
-                ),
-                {
-                    "database_oid": lease.admission.geometry.database_oid,
-                    "relation_oids": [oid for oid, _ in lease.coordinates],
-                },
-            )
-            if lock_result.scalar_one() != 5:
-                raise RuntimeError("provider_directory_profile_maintenance_lease_lost")
 
 
 def _begin_owned_maintenance_custody(lease):
@@ -84,12 +68,9 @@ def _begin_owned_maintenance_custody(lease):
     lease.owned_custody = {
         "lease": lease,
         "task": lease.owner,
-        "connection": lease.connection,
         "admission": lease.admission,
         "acquisition_window": lease.fhir._PROFILE_CAPACITY_MUTATION_WINDOW.get(),
         "original_outcome": None,
-        "retained_driver": None,
-        "retained_pid": None,
         "outcome": None,
         "terminal_window": None,
         "identity_check_identity": ("maintenance_identity_check", lease, lease.admission.admitted_identity),
@@ -111,8 +92,6 @@ def _retain_maintenance_origin(lease, outcome):
     custody_by_field = lease.owned_custody
     if custody_by_field is not None and custody_by_field["original_outcome"] is None and outcome is not None:
         custody_by_field["original_outcome"] = outcome
-        custody_by_field["retained_driver"] = outcome.retained_driver
-        custody_by_field["retained_pid"] = outcome.retained_pid
 
 
 def _ordinary_body_physical_wal_upper(measurement, geometry):
@@ -160,26 +139,10 @@ def _maintenance_identity_check_outcome(lease, custody_by_field):
         and isinstance(outcome, OwnedWalTransaction)
         and group.get("outcome") is outcome
         and outcome is not custody_by_field["original_outcome"]
-        and group.get("session") is outcome.session
-        and group.get("connection") is outcome.connection
-        and outcome.connection is not lease.connection
-        and group.get("driver") is outcome.retained_driver
-        and outcome.retained_driver is not None
-        and outcome.retained_driver is not custody_by_field["retained_driver"]
-        and type(group.get("pid")) is int
-        and group["pid"] == outcome.retained_pid
-        and outcome.retained_pid != custody_by_field["retained_pid"]
         and outcome.is_committed
         and outcome.cleanup_complete
         and outcome.status == "committed_measured"
         and isinstance(outcome.measurement, BackendWalDiagnosticResult)
-        and outcome.measurement.baseline.identity == outcome.measurement.final.identity
-        and outcome.retained_pid == outcome.measurement.final.identity.pid
-        and all(
-            getattr(outcome.measurement.final.identity, name)
-            == getattr(custody_by_field["original_outcome"].measurement.final.identity, name)
-            for name in ("database_oid", "database_name", "system_identifier")
-        )
     ):
         raise RuntimeError("provider_directory_profile_maintenance_identity_custody_incomplete")
     return outcome
@@ -223,8 +186,6 @@ def _consume_owned_maintenance_custody(lease, outcome):
         and outcome.cleanup_complete
         and outcome.status == "committed_measured"
         and isinstance(outcome.measurement, BackendWalDiagnosticResult)
-        and outcome.measurement.baseline.identity == outcome.measurement.final.identity
-        and outcome.retained_pid == outcome.measurement.final.identity.pid
     )
     matched = (
         measured
@@ -232,13 +193,8 @@ def _consume_owned_maintenance_custody(lease, outcome):
         and lease.admission.wal_tracker.owned_control_maintenance_custody is custody_by_field
         and custody_by_field["lease"] is lease
         and custody_by_field["task"] is asyncio.current_task() is lease.owner
-        and custody_by_field["connection"] is lease.connection is outcome.connection
         and custody_by_field["admission"] is lease.admission
         and custody_by_field["original_outcome"] is outcome is custody_by_field["outcome"]
-        and custody_by_field["retained_driver"] is outcome.retained_driver
-        and outcome.retained_driver is not None
-        and type(custody_by_field["retained_pid"]) is int
-        and custody_by_field["retained_pid"] == outcome.retained_pid
         and isinstance(acquisition_window, tuple)
         and len(acquisition_window) == 2
         and acquisition_window[1] is None
@@ -323,7 +279,7 @@ async def release_before_cutover(fhir):
 
 
 def _coordinates(fhir, connection, admission):
-    """Bind server-selected names, physical identities and the existing pool."""
+    """Bind logical control names and the existing finite connection budget."""
     geometry = admission.geometry
     if (
         geometry.sql_contract_digest != fhir._provider_directory_profile_sql_contract_digest()
@@ -337,25 +293,16 @@ def _coordinates(fhir, connection, admission):
     pool = fhir.db.engine.pool
     if pool.size() + pool._max_overflow != geometry.database_pool_size:
         raise RuntimeError("provider_directory_profile_maintenance_pool_changed")
-    schema = fhir._schema()
-    identity = admission.database_identity
-    refs_by_name = {
-        "build_checkpoint": fhir._provider_directory_profile_checkpoint_ref(schema),
-        "serving_generation": fhir._provider_directory_profile_serving_generation_ref(schema),
-        "delta_receipt": fhir._provider_directory_profile_delta_receipt_ref(schema),
-        "import_run": fhir._unscoped_qt(schema, fhir.ImportRun.__tablename__),
-        "capacity_consumption": fhir._unscoped_qt(
-            schema, fhir.ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__
-        ),
-    }
-    coordinates = sorted((getattr(identity, name + "_oid"), ref) for name, ref in refs_by_name.items())
-    if len({oid for oid, _ in coordinates}) != 5 or any(
-        type(oid) is not int or not 0 < oid < 2**32 for oid, _ in coordinates
-    ):
-        raise RuntimeError("provider_directory_profile_maintenance_identity_invalid")
-    if any(getattr(geometry, name + "_oid") != getattr(identity, name + "_oid") for name in refs_by_name):
-        raise RuntimeError("provider_directory_profile_maintenance_identity_changed")
-    return coordinates
+    refs = []
+    for role in ("build_checkpoint", "serving_generation", "delta_receipt", "import_run", "capacity_consumption"):
+        expected = geometry.relations[role]
+        observed = admission.database_identity.relations[role]
+        if any(expected[name] != observed[name] for name in ("schema", "name")):
+            raise RuntimeError("provider_directory_profile_maintenance_scope_changed")
+        refs.append(fhir._unscoped_qt(expected["schema"], expected["name"]))
+    if len(set(refs)) != 5:
+        raise RuntimeError("provider_directory_profile_maintenance_scope_invalid")
+    return sorted(refs)
 
 
 async def _check_admitted_identity(fhir, admission, lease):
@@ -409,28 +356,19 @@ async def _acquire(fhir, connection, admission, coordinates, *, lease=None):
                 await connection.execute(
                     text("SELECT set_config(:name, :value, true)"), {"name": name, "value": f"{setting_ms}ms"}
                 )
-            identity_result = await connection.execute(
-                text(
-                    "SELECT count(*)::integer FROM unnest(CAST(:refs AS text[]), CAST(:oids AS bigint[])) "
-                    "AS expected(ref, oid) JOIN pg_class AS c ON c.oid = expected.oid "
-                    "AND c.oid = to_regclass(expected.ref) JOIN pg_namespace AS n ON n.oid = c.relnamespace "
-                    "WHERE n.nspname = :schema AND c.relkind = 'r' AND c.relpersistence = 'p' "
-                    "AND current_database() = :database"
-                ),
-                {
-                    "refs": [ref for _, ref in coordinates],
-                    "oids": [oid for oid, _ in coordinates],
-                    "schema": fhir._schema(),
-                    "database": admission.database_identity.database_name,
-                },
-            )
-            if identity_result.scalar_one() != 5:
-                raise RuntimeError("provider_directory_profile_maintenance_relation_changed")
             await connection.execute(
-                text(
-                    "LOCK TABLE " + ", ".join(ref for _, ref in coordinates) + " IN SHARE UPDATE EXCLUSIVE MODE NOWAIT"
-                )
+                text("LOCK TABLE " + ", ".join(coordinates) + " IN SHARE UPDATE EXCLUSIVE MODE NOWAIT")
             )
+            shape_result = await connection.execute(
+                text(
+                    "SELECT count(*)::integer FROM unnest(CAST(:refs AS text[])) AS expected(ref) "
+                    "JOIN pg_class AS c ON c.oid = to_regclass(expected.ref) "
+                    "WHERE c.relkind = 'r' AND c.relpersistence = 'p'"
+                ),
+                {"refs": coordinates},
+            )
+            if shape_result.scalar_one() != 5:
+                raise RuntimeError("provider_directory_profile_maintenance_relation_changed")
             await _check_admitted_identity(fhir, admission, lease)
 
 

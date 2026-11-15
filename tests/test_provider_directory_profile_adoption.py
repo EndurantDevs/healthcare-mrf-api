@@ -11,7 +11,6 @@ import pytest
 
 from .test_provider_directory_profile_selection_attestation import _execution
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -33,9 +32,7 @@ def test_serving_adoption_uses_terminal_counts_without_target_scan(
         "profile_strategy_version": "legacy-profile-v3",
     }
 
-    assert importer._profile_adoption_attested_row_counts(
-        selection_proof_by_field
-    ) == (3, 5)
+    assert importer._profile_adoption_attested_row_counts(selection_proof_by_field) == (3, 5)
     scalar.assert_not_awaited()
 
 
@@ -43,8 +40,8 @@ def test_serving_adoption_uses_terminal_counts_without_target_scan(
 async def test_serving_adoption_binds_locked_targets_without_heap_scan(
     monkeypatch,
 ):
-    """Use relation identity and an indexed generation witness only."""
-    relation_oid = AsyncMock(side_effect=[101, 102, 101, 102])
+    """Lock named targets and check indexed generation data without scanning heaps."""
+    relation_oid = AsyncMock(side_effect=[(101, "r", "p"), (102, "r", "p")])
     status = AsyncMock()
     first = AsyncMock(
         return_value={
@@ -55,7 +52,7 @@ async def test_serving_adoption_binds_locked_targets_without_heap_scan(
     )
     monkeypatch.setattr(
         importer,
-        "_provider_directory_relation_oid",
+        "_provider_directory_profile_stage_relation_identity",
         relation_oid,
     )
     monkeypatch.setattr(importer.db, "status", status)
@@ -68,11 +65,8 @@ async def test_serving_adoption_binds_locked_targets_without_heap_scan(
         evidence_rows=5,
     )
 
-    observed_oids = (
-        adoption_targets.profile_target_oid,
-        adoption_targets.evidence_target_oid,
-    )
-    assert observed_oids == (101, 102)
+    assert adoption_targets.targets == importer._provider_directory_profile_target_coordinates("mrf")
+    assert relation_oid.await_count == 2
     status.assert_awaited_once()
     query = first.await_args.args[0]
     assert "generation_id = :generation_id" in query
@@ -92,7 +86,10 @@ def test_serving_adoption_accepts_real_selection_result_contract():
         profile_source_evidence_rows=5,
     )
 
-    assert importer._provider_directory_profile_adoption_result(
-        producer_result,
-        generation_id=generation_id,
-    ) == producer_result
+    assert (
+        importer._provider_directory_profile_adoption_result(
+            producer_result,
+            generation_id=generation_id,
+        )
+        == producer_result
+    )

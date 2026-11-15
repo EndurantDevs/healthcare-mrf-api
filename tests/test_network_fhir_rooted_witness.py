@@ -88,7 +88,7 @@ def _rooted_publication(*, partial=False):
         metadata_bytes=len(encoded.encode()),
         metadata_text_sha256=hashlib.sha256(encoded.encode()).hexdigest(),
     )
-    header = _publication_header(SimpleNamespace(**fields), None)
+    header = _publication_header(contract.source_origin(fields), None)
     header.update(
         hash_contract="semantic_content_v3",
         hash_contract_type="string",
@@ -114,7 +114,18 @@ def _native_reader(metadata, origin, count_by_resource):
     }
     for kind, field in publication.ROOTED_RESOURCE_COUNT_COLUMNS:
         native_by_field[field] = count_by_resource[kind]
-    reader = SimpleNamespace(fetchrow=AsyncMock(return_value={"document": native_by_field, "intrinsic_valid": True}))
+    proof_by_field = {"document": native_by_field}
+
+    async def fetchrow(query, dataset_id):
+        """Resolve the declared original header before reading its native rooted dataset."""
+        assert dataset_id == origin.dataset_id
+        if query.startswith("SELECT candidate_storage_json FROM "):
+            assert f'"{origin.header_relation["schema"]}"."{origin.header_relation["name"]}"' in query
+            return {"candidate_storage_json": None}
+        assert f'FROM "{origin.header_relation["schema"]}"."provider_directory_rooted_graph_dataset" rooted' in query
+        return proof_by_field
+
+    reader = SimpleNamespace(fetchrow=AsyncMock(side_effect=fetchrow, return_value=proof_by_field))
     return reader
 
 
@@ -127,14 +138,42 @@ async def test_rooted_witness_requires_actual_native_proof_without_generic_admis
     assert origin.admission_metadata_sha256 is None and origin.descriptor_counts is None
     assert header["summary"] is None
     assert json.loads(header["rooted_metadata"])["cohort_complete"] is (not partial)
-    assert "provider_directory_rooted_graph_dataset_intrinsic_valid" in reader.fetchrow.call_args.args[0]
+    assert (
+        '"provider_directory_rooted_graph_dataset" rooted WHERE rooted.dataset_id=$1'
+        in reader.fetchrow.call_args.args[0]
+    )
+
+
+@pytest.mark.asyncio
+async def test_rooted_publication_uses_canonical_lifecycle_header_for_named_payload():
+    reader, origin, header = _rooted_publication()
+    native = reader.fetchrow.return_value
+
+    async def selected(query, dataset_id):
+        assert dataset_id == origin.dataset_id
+        if "candidate_storage_json" in query:
+            return {
+                "candidate_storage_json": {
+                    "identity": {"dataset_id": origin.dataset_id},
+                    "storage": {"catalog_schema": origin.header_relation["schema"], "storage_schema": "snapshot"},
+                    "tables": {
+                        "provider_directory_rooted_graph_dataset": {"schema": "snapshot", "name": "frozen_header"}
+                    },
+                }
+            }
+        assert f'FROM "{origin.header_relation["schema"]}"."provider_directory_rooted_graph_dataset" rooted' in query
+        return native
+
+    reader.fetchrow.side_effect = selected
+    await publication.verify_publication(reader, origin, header)
+    assert reader.fetchrow.await_count == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("section", "field", "replacement"),
     [
-        ("proof", "intrinsic_valid", False),
+        ("document", "status", "acquiring"),
         ("document", "root_cohort_id", "different-cohort"),
         ("document", "dataset_hash", "0" * 64),
         ("document", "organization_resource_count", 0),

@@ -17,7 +17,10 @@ from process import provider_directory_generic_source_policy as policy
 
 def _input():
     source_pin = SimpleNamespace(schema_name="synthetic", dataset_id="dataset", release_id="release")
-    driver = SimpleNamespace(is_in_transaction=lambda: True)
+    driver = SimpleNamespace(
+        is_in_transaction=lambda: True,
+        fetchrow=AsyncMock(return_value={"isolation": "repeatable read", "readonly": "on"}),
+    )
     return pin.PinnedCMSFHIRSourceEpochInput(source_pin, "a" * 64, "b" * 64, driver)
 
 
@@ -33,19 +36,16 @@ async def test_unissued_input_cannot_reach_destination():
 
 
 @pytest.mark.asyncio
-async def test_copy_input_expires_and_cannot_cross_tasks():
+async def test_copy_input_expires_and_allows_sequential_tasks():
     source = _input()
     pin._INPUTS[source] = dict(
-        task=asyncio.current_task(),
-        connection=source.connection,
         identity=(source.source_pin, source.admission_sha256, source.metadata_sha256),
     )
     try:
         assert source.require_active() is None
 
         async def another_task():
-            with pytest.raises(epoch.FHIRSourceEpochError):
-                source.require_active()
+            await source.verify_transaction()
 
         await asyncio.create_task(another_task())
     finally:
@@ -55,22 +55,25 @@ async def test_copy_input_expires_and_cannot_cross_tasks():
 
 
 @pytest.mark.asyncio
-async def test_source_target_cannot_inherit_source_owner():
+@pytest.mark.parametrize("target_isolation", [None, "read committed"])
+async def test_source_capture_requires_actual_target_transaction(monkeypatch, target_isolation):
     source = _input()
     pin._INPUTS[source] = dict(
-        task=asyncio.current_task(),
-        connection=source.connection,
         identity=(source.source_pin, source.admission_sha256, source.metadata_sha256),
-        policy=SimpleNamespace(owner_role="source_owner"),
-        virtual_xid="1/1",
     )
-    source.connection.fetchval = AsyncMock(return_value="1/1")
     destination = SimpleNamespace(
-        fetchrow=AsyncMock(return_value=dict(login="retained_publisher", actor="retained_publisher", source_owner=True))
+        is_in_transaction=lambda: target_isolation is not None,
+        fetchval=AsyncMock(return_value=target_isolation),
+        execute=AsyncMock(),
     )
+    monkeypatch.setattr(epoch, "_origin", lambda _pin: tuple(range(9)))
     try:
-        with pytest.raises(epoch.FHIRSourceEpochError):
-            await source.require_target(destination, "retained_owner")
+        with pytest.raises(ValueError, match="repeatable-read transaction"):
+            await epoch.capture_source_cms_fhir_source_epoch(
+                destination, source, epoch_id=uuid4(), owner_role="retained_owner", runtime_roles=("reader",)
+            )
+        source.connection.fetchrow.assert_awaited_once()
+        destination.execute.assert_not_awaited()
     finally:
         pin._INPUTS.pop(source)
 
@@ -194,18 +197,42 @@ async def test_source_copy_checks_complete_aggregate_before_receipt(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_new_reader_transaction_does_not_inherit_original_pins():
+@pytest.mark.parametrize(
+    "isolation,readonly,allowed",
+    [
+        ("repeatable read", "on", True),
+        ("serializable", "on", True),
+        ("read committed", "on", False),
+        ("repeatable read", "off", False),
+    ],
+)
+async def test_named_input_requires_stable_native_readonly_transaction(isolation, readonly, allowed):
     source = _input()
-    source.connection.fetchval = AsyncMock(return_value="1/2")
+    source.connection.fetchrow.return_value = {"isolation": isolation, "readonly": readonly}
+    source.connection.fetchval = AsyncMock(side_effect=AssertionError("unexpected physical identity query"))
     pin._INPUTS[source] = dict(
-        task=asyncio.current_task(),
-        connection=source.connection,
         identity=(source.source_pin, source.admission_sha256, source.metadata_sha256),
-        virtual_xid="1/1",
     )
+    try:
+        if allowed:
+            await source.verify_transaction()
+        else:
+            with pytest.raises(epoch.FHIRSourceEpochError):
+                await source.verify_transaction()
+        source.connection.fetchval.assert_not_awaited()
+    finally:
+        pin._INPUTS.pop(source)
+
+
+@pytest.mark.asyncio
+async def test_closed_source_refuses_before_native_transaction_probe():
+    source = _input()
+    source.connection.is_in_transaction = lambda: False
+    pin._INPUTS[source] = dict(identity=(source.source_pin, source.admission_sha256, source.metadata_sha256))
     try:
         with pytest.raises(epoch.FHIRSourceEpochError):
             await source.verify_transaction()
+        source.connection.fetchrow.assert_not_awaited()
     finally:
         pin._INPUTS.pop(source)
 

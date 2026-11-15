@@ -143,7 +143,7 @@ class NativePreparationDB:
 
 
 async def _staged_address(database, monkeypatch):
-    """Create finalized native models, declarations and owned sequences with exact stage OIDs."""
+    """Create finalized named stages, declarations and native sequence defaults."""
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE", "all")
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SUPPORT_CODE_LOCATION_INDEXES", "1")
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_ADDITIONAL_INDEXES", "0")
@@ -188,11 +188,8 @@ async def _staged_address(database, monkeypatch):
             }
             columns = ",".join(column.name for column in model.__table__.columns)
             await connection.execute(text(f"INSERT INTO mrf.{stage} ({columns}) SELECT {columns} FROM mrf.{logical}"))
-            oid = await connection.scalar(
-                text("SELECT to_regclass(:relation)::oid::bigint"), {"relation": "mrf." + stage}
-            )
-            stages.append((logical, stage, oid))
-        await _seed_support_stages(connection, {logical: stage for logical, stage, _oid in stages})
+            stages.append((logical, stage))
+        await _seed_support_stages(connection, dict(stages))
         assert (
             tuple((await connection.execute(text(f"SELECT last_value,is_called FROM {live_sequence}"))).one())
             == live_sequence_values
@@ -203,64 +200,49 @@ async def _staged_address(database, monkeypatch):
 
 
 async def _transfer_address_publication_custody(database, address):
-    """Transfer only exact fixture live/stage OIDs and their owned native sequences."""
+    """Provision native fixture publication rights for the exact named family."""
     owner = database._source_component.owner
-    expected_by_name = {stage: oid for _logical, stage, oid in address.stage_oids}
+    relation_names = sorted({name for logical, stage in address.stage_relations for name in (logical, stage)})
     async with database.engine.begin() as connection:
-        for logical, _stage, _oid in address.stage_oids:
-            expected_by_name[logical] = await connection.scalar(
-                text("SELECT to_regclass(:relation)::oid::bigint"), {"relation": "mrf." + logical}
-            )
-        assert all(type(oid) is int and oid > 0 for oid in expected_by_name.values())
         heaps = (
             (
                 await connection.execute(
                     text(
-                        "SELECT c.relname,c.oid::bigint,c.relkind::text AS relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-                        "WHERE n.nspname='mrf' AND c.oid=ANY(CAST(:oids AS oid[])) ORDER BY c.relname"
+                        "SELECT c.relname,c.relkind::text AS relkind FROM pg_class c "
+                        "JOIN pg_namespace n ON n.oid=c.relnamespace "
+                        "WHERE n.nspname='mrf' AND c.relname=ANY(:names) ORDER BY c.relname"
                     ),
-                    {"oids": list(expected_by_name.values())},
+                    {"names": relation_names},
                 )
             )
             .mappings()
             .all()
         )
-        assert {entry["relname"]: entry["oid"] for entry in heaps} == expected_by_name
+        assert [entry["relname"] for entry in heaps] == relation_names
         assert all(entry["relkind"] == "r" for entry in heaps)
         sequences = (
             (
                 await connection.execute(
                     text(
-                        "SELECT s.relname,s.oid::bigint,n.nspname AS schema_name FROM pg_depend d JOIN pg_class s ON s.oid=d.objid JOIN pg_namespace n ON n.oid=s.relnamespace "
+                        "SELECT DISTINCT s.relname,n.nspname AS schema_name FROM pg_depend d "
+                        "JOIN pg_class s ON s.oid=d.objid JOIN pg_namespace n ON n.oid=s.relnamespace "
+                        "JOIN pg_class target ON target.oid=d.refobjid "
+                        "JOIN pg_namespace target_ns ON target_ns.oid=target.relnamespace "
                         "WHERE d.classid='pg_class'::regclass AND d.refclassid='pg_class'::regclass "
-                        "AND d.refobjid=ANY(CAST(:oids AS oid[])) AND d.deptype IN ('a','i') AND s.relkind='S'"
+                        "AND target_ns.nspname='mrf' AND target.relname=ANY(:names) "
+                        "AND d.deptype IN ('a','i') AND s.relkind='S'"
                     ),
-                    {"oids": list(expected_by_name.values())},
+                    {"names": relation_names},
                 )
             )
             .mappings()
             .all()
         )
         assert all(entry["schema_name"] == "mrf" for entry in sequences)
-        for name in expected_by_name:
+        for name in relation_names:
             await connection.execute(text(f'ALTER TABLE mrf."{name}" OWNER TO "{owner}"'))
         for sequence in sequences:
             await connection.execute(text(f'ALTER SEQUENCE mrf."{sequence["relname"]}" OWNER TO "{owner}"'))
-        owned_oids = [*expected_by_name.values(), *(entry["oid"] for entry in sequences)]
-        assert await connection.scalar(
-            text(
-                "SELECT count(*) FROM pg_class WHERE oid=ANY(CAST(:oids AS oid[])) "
-                "AND relowner=(SELECT oid FROM pg_roles WHERE rolname=:owner)"
-            ),
-            {"oids": owned_oids, "owner": owner},
-        ) == len(owned_oids)
-        assert not await connection.scalar(
-            text(
-                "SELECT EXISTS(SELECT FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid "
-                "WHERE i.indrelid=ANY(CAST(:oids AS oid[])) AND c.relowner<>(SELECT oid FROM pg_roles WHERE rolname=:owner))"
-            ),
-            {"oids": list(expected_by_name.values()), "owner": owner},
-        )
 
 
 async def _seed_support_stages(connection, stages_by_logical):
@@ -312,11 +294,9 @@ async def _prepared_input(database, proof, capture_id, roles, monkeypatch, batch
     monkeypatch.setattr(fhir, "_profile_capacity_preflight_clock", signed_fixture_clock)
     execution = cms_execution(day=proof.source_pin.as_of)
     assert execution.attestation.proof_id == proof.selection_proof_id
-    database_identity = await _native_database_identity(fhir)
+    profile_envelope = paired_profile_envelope(execution)
     profile_lease = _verify(
-        paired_profile_envelope(execution, database_identity=database_identity),
-        trust=replace(_trust(), **database_identity),
-        **{"expected_" + field: field_value for field, field_value in database_identity.items()},
+        profile_envelope, expected_capacity_geometry_hash=profile_envelope["lease"]["capacity_geometry_hash"]
     )
     request = RegistryCMSRetentionRequest(
         proof.source_pin,
@@ -362,8 +342,8 @@ async def _prepared_input(database, proof, capture_id, roles, monkeypatch, batch
 
 async def _admit_address_stages(prepared):
     """Include the actual finalized candidate heaps in native aggregate accounting."""
-    for _logical, stage, oid in prepared.address.stage_oids:
-        await prepared.nonprofile_admission.register_external_relation(prepared.fhir, "mrf", stage, oid)
+    for _logical, stage in prepared.address.stage_relations:
+        await prepared.nonprofile_admission.register_external_relation(prepared.fhir, "mrf", stage)
 
 
 async def _native_admission(fhir, plan, policy, execution):
@@ -374,7 +354,10 @@ async def _native_admission(fhir, plan, policy, execution):
         native_by_coordinate = {(entry.schema, entry.relation): entry for entry in check.native_relations}
         for relation in check.relations:
             assert (
-                await fhir.db.scalar("SELECT pg_total_relation_size(CAST(:oid AS oid))", oid=relation.oid)
+                await fhir.db.scalar(
+                    "SELECT pg_total_relation_size(to_regclass(:relation))",
+                    relation=f'"{relation.schema}"."{relation.relation}"',
+                )
                 == relation.total_bytes
             )
             annotation = native_by_coordinate.get((relation.schema, relation.relation))
@@ -382,7 +365,7 @@ async def _native_admission(fhir, plan, policy, execution):
                 captured = await native_layout.capture_retained_native_layout(
                     fhir, relation, annotation.source_layout, check.plan.native_address_targets
                 )
-                assert captured.relation_oid == relation.oid
+                assert (captured.schema_name, captured.relation_name) == (relation.schema, relation.relation)
         wal_bytes = await fhir.db.scalar(
             "SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(),CAST(CAST(:start AS text) AS pg_lsn))::bigint",
             start=start,
@@ -401,9 +384,7 @@ async def _native_admission(fhir, plan, policy, execution):
         )
 
     admission = NonprofileAdmission(
-        signed_cms_plan(
-            plan, retention_policy=policy, execution=execution, database_identity=await _native_database_identity(fhir)
-        ),
+        signed_cms_plan(plan, retention_policy=policy, execution=execution),
         plan,
         check_phase,
     )
@@ -411,22 +392,10 @@ async def _native_admission(fhir, plan, policy, execution):
     return admission
 
 
-async def _native_database_identity(fhir):
-    """Sign the genuine fixture lease for its exact current ephemeral database."""
-    database_identity = await fhir.db.first(
-        """SELECT database_row.oid::bigint AS database_oid,database_row.datname AS database_name,
-        control.system_identifier::text AS database_system_identifier
-        FROM pg_database database_row CROSS JOIN pg_control_system() control
-        WHERE database_row.datname=current_database()"""
-    )
-    assert database_identity is not None
-    return dict(support.fhir._pagination_checkpoint_row_mapping(database_identity))
-
-
 async def _publish_stages(session, prepared_pair, predecessor):
-    """Apply an actual native OID swap and append its guarded common receipt."""
+    """Apply the named native swap and append its common publication receipt."""
     await _publish_retained_candidate(session, prepared_pair)
-    for logical, stage, _oid in prepared_pair.address_stages:
+    for logical, stage in prepared_pair.address_stages:
         await session.execute(text(f"ALTER TABLE mrf.{logical} RENAME TO retained_old_{logical}"))
         await session.execute(text(f"ALTER TABLE mrf.{stage} RENAME TO {logical}"))
     await native._advance_native(session, "mrf")
@@ -561,41 +530,6 @@ async def test_prepared_retention_native_binding(monkeypatch, tmp_path, copy_bou
         await _verify_genuine_retained_state(state, monkeypatch)
 
 
-async def _origin_source_authority(database):
-    """Observe original Source namespace, role and relation custody without changing it."""
-    from process.provider_directory_source_namespace_custody import capture_source_namespace_custody
-
-    component = database._source_component
-    component.factory._require_current_policy()
-    assert component.factory.policy is component.policy
-    async with component.admin_engine.connect() as connection, connection.begin():
-        await connection.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
-        driver = (await connection.get_raw_connection()).driver_connection
-        namespace = await capture_source_namespace_custody(
-            driver, component.policy, namespace_owner_role=component.factory.namespace_owner_role
-        )
-        assert await driver.fetchval("SELECT to_regclass('mrf.provider_directory_dataset_resource')") is not None
-        publisher = next(
-            role["oid"] for role in namespace["role_graph"]["roles"] if role["rolname"] == component.retained_publisher
-        )
-        actor = await driver.fetchrow(
-            "SELECT r.oid::bigint AS oid,pg_has_role(r.oid,$2::regrole,'USAGE') AS owner_usage,"
-            "pg_has_role(r.oid,$2::regrole,'SET') AS owner_set FROM pg_roles r WHERE r.rolname=$1::name",
-            component.retained_publisher,
-            component.policy.owner_role,
-        )
-        assert actor is not None and actor["oid"] == int(publisher)
-        assert actor["owner_usage"] is False and actor["owner_set"] is False
-        relations = await driver.fetch(
-            "SELECT c.oid,c.relowner,c.relacl,"
-            "COALESCE((SELECT jsonb_agg(jsonb_build_array(a.attnum,a.attacl) ORDER BY a.attnum) "
-            "FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0),'[]'::jsonb) AS columns "
-            "FROM pg_class c WHERE c.relnamespace=$1::oid ORDER BY c.oid",
-            int(namespace["namespace"]["oid"]),
-        )
-        return component.policy, namespace, relations
-
-
 async def _origin_pair_read(connection, pair, *, granted):
     from process import network_cms_registry_source_pair as pair_reader
 
@@ -605,8 +539,9 @@ async def _origin_pair_read(connection, pair, *, granted):
             with pytest.raises(asyncpg.InsufficientPrivilegeError):
                 await pair_reader._publication(session, pair.proof, current=False)
             return
-        resolved, oid = await pair_reader._read_committed_pair(connection, pair.address_source.schema_name)
-        assert resolved == pair and oid == pair.address_ownership.schema_oid
+        resolved, _catalog_handle = await pair_reader._read_committed_pair(connection, pair.address_source.schema_name)
+        assert resolved == pair
+        assert resolved.address_ownership.schema_name == pair.address_source.schema_name
         assert (
             await pair_reader.require_registry_cms_source_pair_connection(connection, pair, verify_content=False)
             == pair
@@ -932,7 +867,7 @@ async def _prepare_successor_pair(database, tmp_path, execution, roles, capture_
     prepared, factory, request = await _prepared_input(database, proof, capture_id, roles, monkeypatch, copy_bounds[0])
     await _reject_preparation(database, prepared, factory, request, roles, capture_id, monkeypatch)
     await _reject_copy_budget(prepared, factory, request, capture_id, roles, monkeypatch)
-    await _reject_raw_oid(database, prepared, factory, request, roles, capture_id, monkeypatch)
+    await _reject_raw_layout(database, prepared, factory, request, roles, capture_id, monkeypatch)
     retained = await _prepare_observed(prepared, factory, request, roles, capture_id, monkeypatch)
     await _assert_retained_raw_parity(database, retained)
     await _assert_retained_address_parity(database, retained, prepared)
@@ -996,9 +931,9 @@ async def _reject_copy_budget(prepared, factory, request, capture_id, roles, mon
     budget_events = []
     original = retention.RegistryCMSRawEpochAdmission.__call__
 
-    async def observe_denial(adapter, phase, schema, logical, oid):
+    async def observe_denial(adapter, phase, schema, logical):
         budget_events.append((phase, await adapter.connection.fetchval(f'SELECT count(*) FROM "{schema}"."{logical}"')))
-        await original(adapter, phase, schema, logical, oid)
+        await original(adapter, phase, schema, logical)
 
     with monkeypatch.context() as patch:
         patch.setattr(retention.RegistryCMSRawEpochAdmission, "__call__", observe_denial)
@@ -1019,13 +954,16 @@ async def _reject_copy_budget(prepared, factory, request, capture_id, roles, mon
         assert await prepared.fhir.db.scalar("SELECT to_regnamespace(:schema)", schema=prefix + capture_id.hex) is None
 
 
-async def _reject_raw_oid(database, prepared, factory, request, roles, capture_id, monkeypatch):
-    """A substituted original OID fails at registration with exact rollback retirement."""
-    before_oid_by_relation = dict(prepared.nonprofile_admission._relations)
+async def _reject_raw_layout(database, prepared, factory, request, roles, capture_id, monkeypatch):
+    """A missing required raw column fails admission and retires the whole attempt."""
+    registered_coordinates = set(prepared.nonprofile_admission._relations)
     original = retention.RegistryCMSRawEpochAdmission.__call__
 
-    async def substitute(adapter, phase, schema, logical, oid):
-        await original(adapter, phase, schema, logical, oid + 1 if phase == "created" else oid)
+    async def substitute(adapter, phase, schema, logical):
+        if phase == "created":
+            key = epoch_capture._COPY_KEYS[logical][0]
+            await adapter.connection.execute(f'ALTER TABLE "{schema}"."{logical}" DROP COLUMN "{key}"')
+        await original(adapter, phase, schema, logical)
 
     with monkeypatch.context() as patch:
         patch.setattr(retention.RegistryCMSRawEpochAdmission, "__call__", substitute)
@@ -1038,7 +976,7 @@ async def _reject_raw_oid(database, prepared, factory, request, roles, capture_i
                 owner_role=roles[0],
                 runtime_roles=tuple(sorted(roles[1:])),
             )
-    assert prepared.nonprofile_admission._relations == before_oid_by_relation
+    assert prepared.nonprofile_admission._relations == registered_coordinates
     async with database.session_factory() as session:
         assert (
             await session.scalar(
@@ -1061,7 +999,7 @@ def _address_copy_observer(prepared, created_relations, address_inputs, address_
 
     async def observe_address_copy(connection, query, arguments, schema, table, expected_count, **options):
         """Keep real admission checks and observe each seven-family import boundary."""
-        assert {logical for created_schema, logical, _oid in created_relations if created_schema == schema} == set(
+        assert {logical for created_schema, logical in created_relations if created_schema == schema} == set(
             RELATION_NAMES
         )
         assert {
@@ -1091,18 +1029,20 @@ def _retained_creation_observer(prepared, capture_id, created_relations):
     """Keep creator annotations intact while observing original empty retained heaps."""
     original_create = NonprofileAdmission.register_external_relation
 
-    async def observe_creation(admission, fhir, schema, logical, oid, *, raw_relation=None, native_relation=None):
+    async def observe_creation(admission, fhir, schema, logical, *, raw_relation=None, native_relation=None):
         if schema in {"registry_cms_epoch_" + capture_id.hex, "entity_address_archive_" + capture_id.hex}:
             assert await fhir.db.scalar(f'SELECT count(*) FROM "{schema}"."{logical}"') == 0
-            created_relations.append((schema, logical, oid))
+            created_relations.append((schema, logical))
         if schema == "entity_address_archive_" + capture_id.hex:
             assert raw_relation is None and native_relation is not None
-            assert (native_relation.schema, native_relation.relation, native_relation.oid) == (schema, logical, oid)
-            assert native_relation.source_layout.oid == next(
-                source_oid for target, _stage, source_oid in prepared.address.stage_oids if target == logical
+            assert (native_relation.schema, native_relation.relation) == (schema, logical)
+            source_stage = dict(prepared.address.stage_relations)[logical]
+            assert (native_relation.source_layout.schema, native_relation.source_layout.relation) == (
+                prepared.address.db_schema,
+                source_stage,
             )
         await original_create(
-            admission, fhir, schema, logical, oid, raw_relation=raw_relation, native_relation=native_relation
+            admission, fhir, schema, logical, raw_relation=raw_relation, native_relation=native_relation
         )
 
     return observe_creation
@@ -1202,7 +1142,7 @@ async def _prepare_with_retained_notes(prepared, factory, request, capture_id, r
 async def _prepare_observed(prepared, factory, request, roles, capture_id, monkeypatch):
     """Observe real callbacks and registration while preserving actual admission checks."""
     source_sequence_state = await _source_evidence_sequence_state(prepared)
-    previous_oid_by_relation = dict(prepared.nonprofile_admission._relations)
+    registered_coordinates = set(prepared.nonprofile_admission._relations)
     growth_events, created_relations, binary_inputs = [], [], []
     address_inputs, address_phases = [], []
     original_growth = retention.RegistryCMSRawEpochAdmission.__call__
@@ -1218,14 +1158,16 @@ async def _prepare_observed(prepared, factory, request, roles, capture_id, monke
         assert all(0 < byte_count <= options["byte_limit"] for byte_count in proxy.import_bytes)
         binary_inputs.extend(proxy.import_bytes)
 
-    async def observe_growth(adapter, phase, schema, logical, oid):
+    async def observe_growth(adapter, phase, schema, logical):
         diagnostic_state.diagnostic.enter(
             "raw_create" if phase == "created" else "raw_index" if "index" in phase else "raw_copy"
         )
         row_count = await adapter.connection.fetchval(f'SELECT count(*) FROM "{schema}"."{logical}"')
-        indexes = await adapter.connection.fetchval("SELECT count(*) FROM pg_index WHERE indrelid=$1", oid)
-        growth_events.append((phase, logical, oid, row_count, indexes))
-        await original_growth(adapter, phase, schema, logical, oid)
+        indexes = await adapter.connection.fetchval(
+            "SELECT count(*) FROM pg_index WHERE indrelid=to_regclass($1)", f'"{schema}"."{logical}"'
+        )
+        growth_events.append((phase, logical, (schema, logical), row_count, indexes))
+        await original_growth(adapter, phase, schema, logical)
 
     with monkeypatch.context() as patch:
         _install_retained_diagnostic_observers(patch, prepared.nonprofile_admission, diagnostic_state)
@@ -1244,7 +1186,7 @@ async def _prepare_observed(prepared, factory, request, roles, capture_id, monke
         retained = await _prepare_with_retained_notes(
             prepared, factory, request, capture_id, roles, diagnostic_state.failure_notes
         )
-    _assert_original_heap_growth(growth_events, created_relations, retained, prepared, previous_oid_by_relation)
+    _assert_original_heap_growth(growth_events, created_relations, retained, prepared, registered_coordinates)
     assert binary_inputs
     _assert_address_copy_counts(address_inputs, retained.address_receipt)
     assert len(address_phases) == 2 * len(address_inputs)
@@ -1272,7 +1214,7 @@ def _assert_address_copy_counts(address_inputs, receipt):
 
 async def _source_evidence_sequence_state(prepared):
     """Native explicit-ID imports must neither change nor advance the source default."""
-    stage = next(stage for logical, stage, _oid in prepared.address.stage_oids if logical == "entity_address_evidence")
+    stage = next(stage for logical, stage in prepared.address.stage_relations if logical == "entity_address_evidence")
     default = await prepared.fhir.db.first(
         """SELECT pg_get_expr(d.adbin,d.adrelid) AS default_expr,s.oid::regclass::text AS sequence
         FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum
@@ -1288,14 +1230,14 @@ async def _source_evidence_sequence_state(prepared):
     return dict(default), dict(support.fhir._pagination_checkpoint_row_mapping(state))
 
 
-def _assert_original_heap_growth(growth_events, created_relations, retained, prepared, previous_oid_by_relation):
+def _assert_original_heap_growth(growth_events, created_relations, retained, prepared, registered_coordinates):
     """All eighteen retained heaps enroll once; each native index growth is bracketed."""
     assert len(created_relations) == len(set(created_relations)) == 18
-    assert len({oid for _schema, _logical, oid in created_relations}) == 18
     epoch = retained.recipe.source_pin.retained_epoch
-    for logical, oid in epoch.relation_oids:
+    for schema, logical in created_relations:
+        if schema != epoch.schema_name:
+            continue
         events = [event for event in growth_events if event[1] == logical]
-        assert all(event[2] == oid for event in events)
         for phase in ("created", "before_insert"):
             assert [event[3:] for event in events if event[0] == phase] == [(0, 0)]
         assert len([event for event in events if event[0] == "after_insert"]) == 1
@@ -1316,27 +1258,21 @@ def _assert_original_heap_growth(growth_events, created_relations, retained, pre
         for before, after in zip(before_indexes, after_indexes, strict=True):
             assert before[3] == after[3]
             assert before[4] + 1 == after[4]
-    native_relations = prepared.nonprofile_admission._relations
-    for schema, logical, oid in created_relations:
-        assert native_relations[(schema, logical)] == oid
-    assert native_relations == {
-        **previous_oid_by_relation,
-        **{(schema, logical): oid for schema, logical, oid in created_relations},
-    }
+    assert prepared.nonprofile_admission._relations == registered_coordinates | set(created_relations)
 
 
 async def _reject_copy_batch_interruptions(prepared, factory, request, roles, capture_id, monkeypatch):
     """Actual completed COPY failures retire heaps and preserve an exact retry."""
     original = retention.RegistryCMSRawEpochAdmission.__call__
-    previous_oid_by_relation = dict(prepared.nonprofile_admission._relations)
+    registered_coordinates = set(prepared.nonprofile_admission._relations)
     for interruption in (RuntimeError, asyncio.CancelledError):
         completed_batches = []
 
-        async def refuse_after_import(adapter, phase, schema, logical, oid, interruption=interruption):
+        async def refuse_after_import(adapter, phase, schema, logical, interruption=interruption):
             """Fail only after the real batch and its native admission checks."""
-            await original(adapter, phase, schema, logical, oid)
+            await original(adapter, phase, schema, logical)
             if phase == "after_copy_batch":
-                completed_batches.append((schema, logical, oid))
+                completed_batches.append((schema, logical))
                 raise interruption("synthetic completed COPY interruption")
 
         expected = epoch_capture.FHIRSourceEpochError if interruption is RuntimeError else interruption
@@ -1354,13 +1290,13 @@ async def _reject_copy_batch_interruptions(prepared, factory, request, roles, ca
         assert len(completed_batches) == 1
         for schema in ("registry_cms_epoch_" + capture_id.hex, "entity_address_archive_" + capture_id.hex):
             assert await prepared.fhir.db.scalar("SELECT to_regnamespace(:schema)", schema=schema) is None
-        assert prepared.nonprofile_admission._relations == previous_oid_by_relation
+        assert prepared.nonprofile_admission._relations == registered_coordinates
 
 
 async def _reject_address_copy_interruptions(prepared, factory, request, roles, capture_id, monkeypatch):
     """Completed address COPY refusal and cancellation retire the complete candidate."""
     original_copy = prepared_address._copy_native_batch
-    previous_oid_by_relation = dict(prepared.nonprofile_admission._relations)
+    registered_coordinates = set(prepared.nonprofile_admission._relations)
     previous_external_coordinates = set(prepared.nonprofile_admission._external_relations)
     for interruption in (RuntimeError, asyncio.CancelledError):
         completed_copies = []
@@ -1397,7 +1333,7 @@ async def _reject_address_copy_interruptions(prepared, factory, request, roles, 
             assert (
                 await prepared.fhir.db.scalar("SELECT to_regnamespace(:schema)", schema=prefix + capture_id.hex) is None
             )
-        assert prepared.nonprofile_admission._relations == previous_oid_by_relation
+        assert prepared.nonprofile_admission._relations == registered_coordinates
         assert prepared.nonprofile_admission._external_relations == previous_external_coordinates
 
 
@@ -1408,18 +1344,16 @@ async def _assert_retained_address_parity(database, retained, prepared):
         source_receipt = await prepared_address.capture_entity_address_stage_integrity_receipt(
             session,
             schema_name=prepared.address.db_schema,
-            stage_table_names={logical: stage for logical, stage, _oid in prepared.address.stage_oids},
+            stage_table_names={logical: stage for logical, stage in prepared.address.stage_relations},
         )
         source_capture = await address_equivalence.capture_registry_cms_address_copy_source(
             session,
             source_schema=prepared.address.db_schema,
-            expected_relation_oids=tuple(
-                sorted((logical, oid) for logical, _stage, oid in prepared.address.stage_oids)
-            ),
-            stage_table_names={logical: stage for logical, stage, _oid in prepared.address.stage_oids},
+            expected_relation_names=tuple(sorted(logical for logical, _stage in prepared.address.stage_relations)),
+            stage_table_names={logical: stage for logical, stage in prepared.address.stage_relations},
         )
         assert (
-            prepared_address.portable_prepared_receipt(source_receipt, prepared.address.stage_oids)
+            prepared_address.portable_prepared_receipt(source_receipt, prepared.address.stage_relations)
             == source_capture.semantic_receipt
         )
         witness = await address_equivalence.validate_registry_cms_address_copy(
@@ -1427,8 +1361,8 @@ async def _assert_retained_address_parity(database, retained, prepared):
         )
         assert witness.source == source_capture
         assert witness.clone_receipt == retained.address_receipt
-        assert set(dict(source_capture.relation_oids).values()).isdisjoint(
-            dict(retained.address_ownership.relation_oids).values()
+        assert {(schema, name) for _logical, schema, name in source_capture.relations}.isdisjoint(
+            (retained.address_ownership.schema_name, name) for name in retained.address_ownership.relation_names
         )
         assert source_capture.schema_name != retained.address_ownership.schema_name
         assert source_capture.semantic_receipt.main_input_sha256 == retained.address_receipt.main_input_sha256
@@ -1436,12 +1370,10 @@ async def _assert_retained_address_parity(database, retained, prepared):
         schema = retained.address_ownership.schema_name
         await _assert_live_retained_ordinals(driver, prepared.address, source_capture, witness)
         await _assert_prepared_native_copy_key(driver, prepared.address)
-        for logical, stage, oid in prepared.address.stage_oids:
+        for logical, stage in prepared.address.stage_relations:
             source_ref = f'"{prepared.address.db_schema}"."{stage}"'
             target_ref = f'"{schema}"."{logical}"'
-            await prepared_address._require_prepared_copy_key(
-                driver, source_ref, oid, prepared_address._COPY_KEYS[logical]
-            )
+            await prepared_address._require_prepared_copy_key(driver, source_ref, prepared_address._COPY_KEYS[logical])
             source_options = await _native_storage_options(driver, source_ref)
             assert await _native_storage_options(driver, target_ref) == source_options
             assert await driver.fetchval(
@@ -1458,11 +1390,12 @@ async def _assert_retained_address_parity(database, retained, prepared):
 
 
 async def _assert_live_retained_ordinals(driver, address, source_capture, witness):
-    """Compare physical source holes and packed clone columns with original live OIDs."""
-    for logical, _stage, oid in address.stage_oids:
+    """Compare source column holes and packed clone layouts by qualified name."""
+    for logical, stage in address.stage_relations:
         columns = await driver.fetch(
-            "SELECT attname,attnum FROM pg_attribute WHERE attrelid=$1 AND attnum>0 AND NOT attisdropped ORDER BY attnum",
-            oid,
+            "SELECT attname,attnum FROM pg_attribute WHERE attrelid=to_regclass($1) "
+            "AND attnum>0 AND NOT attisdropped ORDER BY attnum",
+            f'"{address.db_schema}"."{stage}"',
         )
         actual_ordinals = tuple(
             (column["attname"], column["attnum"], ordinal) for ordinal, column in enumerate(columns, 1)
@@ -1487,26 +1420,25 @@ async def _native_storage_options(driver, relation):
 
 async def _assert_prepared_native_copy_key(driver, address):
     """Refuse missing, substituted and deferred native ordering keys without source edits."""
-    logical, stage, _oid = next(entry for entry in address.stage_oids if entry[0] == "entity_address_unified")
+    logical, stage = next(entry for entry in address.stage_relations if entry[0] == "entity_address_unified")
     source = f'"{address.db_schema}"."{stage}"'
     probe = "pg_temp.prepared_address_key_probe"
     await driver.execute(
         f"CREATE TEMP TABLE prepared_address_key_probe (LIKE {source} INCLUDING STORAGE) ON COMMIT DROP"
     )
-    oid = await driver.fetchval("SELECT to_regclass($1)::oid::bigint", probe)
     keys = prepared_address._COPY_KEYS[logical]
     with pytest.raises(ValueError, match="copy_key_invalid"):
-        await prepared_address._require_prepared_copy_key(driver, probe, oid, keys)
+        await prepared_address._require_prepared_copy_key(driver, probe, keys)
     await driver.execute(f"ALTER TABLE {probe} ADD CONSTRAINT probe_key PRIMARY KEY(entity_id)")
     with pytest.raises(ValueError, match="copy_key_invalid"):
-        await prepared_address._require_prepared_copy_key(driver, probe, oid, keys)
+        await prepared_address._require_prepared_copy_key(driver, probe, keys)
     await driver.execute(f"ALTER TABLE {probe} DROP CONSTRAINT probe_key")
     await driver.execute(f"ALTER TABLE {probe} ADD CONSTRAINT probe_key PRIMARY KEY(location_key) DEFERRABLE")
     with pytest.raises(ValueError, match="copy_key_invalid"):
-        await prepared_address._require_prepared_copy_key(driver, probe, oid, keys)
+        await prepared_address._require_prepared_copy_key(driver, probe, keys)
     await driver.execute(f"ALTER TABLE {probe} DROP CONSTRAINT probe_key")
     await driver.execute(f"ALTER TABLE {probe} ADD CONSTRAINT probe_key PRIMARY KEY(location_key)")
-    await prepared_address._require_prepared_copy_key(driver, probe, oid, keys)
+    await prepared_address._require_prepared_copy_key(driver, probe, keys)
 
 
 async def _assert_retained_raw_parity(database, retained):

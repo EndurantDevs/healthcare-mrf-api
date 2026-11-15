@@ -228,7 +228,10 @@ async def create_native_npi_family(runtime, schema, *, populated=True, publicati
             text(
                 f'CREATE TABLE "{schema}".npi_canonical_publication_receipt ('
                 "publication_ref text PRIMARY KEY,publication_generation bigint NOT NULL,chain_ref text NOT NULL,import_date date NOT NULL,"
-                + ",".join(f"{model.__tablename__}_table_oid bigint NOT NULL" for model in archive.npi_archive_models())
+                + ",".join(
+                    f"{model.__tablename__}_table_oid bigint NOT NULL,{model.__tablename__}_row_count bigint NOT NULL"
+                    for model in archive.npi_archive_models()
+                )
                 + ")"
             )
         )

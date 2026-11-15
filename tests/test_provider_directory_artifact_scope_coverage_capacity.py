@@ -47,17 +47,13 @@ def _source_batch():
 def test_legacy_capacity_check_binds_signed_projection():
     """An admitted projection cannot drift from its exact row ceiling."""
     admission = _wal_tracker_admission()
-    token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
-        admission
-    )
+    token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(admission)
     try:
         with pytest.raises(
             importer.ProviderDirectoryArtifactBuildStale,
             match="artifact_projection_changed",
         ):
-            importer._assert_provider_directory_artifact_scope_capacity(
-                {"projected_rows": 0}
-            )
+            importer._assert_provider_directory_artifact_scope_capacity({"projected_rows": 0})
     finally:
         importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(token)
 
@@ -71,12 +67,15 @@ async def test_unprojected_source_insert_and_unadmitted_usage_are_direct(
     scalar = AsyncMock()
     monkeypatch.setattr(importer.db, "status", status)
     monkeypatch.setattr(importer.db, "scalar", scalar)
-    assert await importer._insert_artifact_source_batch(
-        _source_batch(),
-        None,
-        "SELECT projected",
-        "INSERT source",
-    ) == 1
+    assert (
+        await importer._insert_artifact_source_batch(
+            _source_batch(),
+            None,
+            "SELECT projected",
+            "INSERT source",
+        )
+        == 1
+    )
     status.assert_awaited_once()
 
     monkeypatch.setattr(
@@ -94,45 +93,30 @@ async def test_unprojected_source_insert_and_unadmitted_usage_are_direct(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("relation_oid", (0, 11))
-async def test_scratch_projection_rejects_oid_or_tablespace_drift(
-    monkeypatch,
-    relation_oid,
-):
-    """Scratch projection requires a real OID in the signed tablespace."""
+async def test_scratch_projection_requires_present_native_layout(monkeypatch, relation_oid):
+    """Resolve current native storage by name without comparing historical tablespace tokens."""
     admission = _wal_tracker_admission()
-    monkeypatch.setattr(
-        importer.db,
-        "scalar",
-        AsyncMock(return_value=relation_oid),
-    )
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_relation_storage_fingerprint",
-        AsyncMock(
-            return_value=SimpleNamespace(
-                effective_tablespace_oids=(999_999,),
-                toastable_columns=(),
-                main_index_pages=(),
-                toast_index_pages=(),
-            )
-        ),
-    )
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=relation_oid))
+    layout = SimpleNamespace(toastable_columns=(), main_index_pages=(1,), toast_index_pages=())
+    measure = AsyncMock(return_value=layout)
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_relation_layout", measure)
     table_projection = importer._ProviderDirectoryArtifactScopeTableProjection(
         table_name="base",
         resource_type="source",
         projected_rows=1,
         projected_logical_bytes=128,
     )
-    with pytest.raises(
-        importer.ProviderDirectoryArtifactBuildStale,
-        match="scratch_oid_changed|scratch_tablespace_changed",
-    ):
-        await importer._artifact_scope_scratch_projection(
-            "mrf",
-            "source_scope",
-            table_projection,
-            admission,
+    if relation_oid == 0:
+        with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="scratch_oid_changed"):
+            await importer._artifact_scope_scratch_projection("mrf", "source_scope", table_projection, admission)
+        measure.assert_not_awaited()
+    else:
+        relation_ref, scratch_projection = await importer._artifact_scope_scratch_projection(
+            "mrf", "source_scope", table_projection, admission
         )
+        assert relation_ref == '"mrf"."source_scope"'
+        assert scratch_projection.growth_bytes > 0
+        measure.assert_awaited_once_with(relation_oid, expected_persistence="u")
 
 
 @pytest.mark.asyncio
@@ -269,9 +253,7 @@ async def test_exact_projection_plan_uses_admitted_batch_geometry(monkeypatch):
         frozenset({"Practitioner"}),
         admission,
     ) == (projection, projection, [])
-    assert exact.call_args.kwargs["batch_size"] == (
-        admission.geometry.artifact_scope_batch_size
-    )
+    assert exact.call_args.kwargs["batch_size"] == (admission.geometry.artifact_scope_batch_size)
     capacity_check.assert_called_once_with(projection)
 
 
@@ -282,13 +264,9 @@ def _payload_plan_and_projection():
         created_tables=["source_scope"],
         relation_by_table={
             importer.ProviderDirectorySource.__tablename__: "source_scope",
-            importer.ProviderDirectoryPractitioner.__tablename__: (
-                "practitioner_scope"
-            ),
+            importer.ProviderDirectoryPractitioner.__tablename__: ("practitioner_scope"),
         },
-        resource_scope_jobs=(
-            (importer.ProviderDirectoryPractitioner, "practitioner_scope"),
-        ),
+        resource_scope_jobs=((importer.ProviderDirectoryPractitioner, "practitioner_scope"),),
         model_by_table_name={},
     )
     source_projection = importer._ProviderDirectoryArtifactScopeTableProjection(

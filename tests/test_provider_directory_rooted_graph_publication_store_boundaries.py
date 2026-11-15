@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from contextlib import asynccontextmanager
 from dataclasses import fields
 from datetime import date
 from types import SimpleNamespace
@@ -16,15 +15,8 @@ from process import (
 )
 from process import provider_directory_rooted_graph_publication_store as store
 from process import provider_directory_rooted_graph_publication_store_support as support
-from process.provider_directory_dataset_scoped_publication import (
-    ProviderDirectoryDatasetScopedPublicationError,
-)
 from process.provider_directory_rooted_graph_publication import (
     ProviderDirectoryRootedGraphPublicationError,
-    ProviderDirectoryRootedGraphPublicationResult,
-)
-from process.provider_directory_rooted_graph_publication_materialization import (
-    ProviderDirectoryRootedGraphMaterialization,
 )
 from tests.provider_directory_rooted_graph_publication_test_support import (
     dataset_identity,
@@ -235,233 +227,12 @@ async def test_dataset_hash_streams_the_existing_canonical_bytes_and_default_ord
 
 
 @pytest.mark.asyncio
-async def test_dataset_hash_and_atomic_status_transitions(monkeypatch) -> None:
-    identity = dataset_identity()
-
-    async def dataset_hash(*_arguments):
-        return "b" * 64
-
-    monkeypatch.setattr(store, "_dataset_hash", dataset_hash)
-    superseded_currents: list[object] = []
-
-    async def supersede(_database, previous):
-        superseded_currents.append(previous)
-
-    monkeypatch.setattr(store, "supersede_exact_current_dataset", supersede)
-    current = exact_current()
-    await store._validate_and_publish(
-        _ScriptedDatabase(
-            scalars=("b" * 64,),
-            statuses=(1, 1, 1, 1),
-        ),
-        identity,
-        current,
-    )
-    assert superseded_currents == [current]
-    for statuses in ((0, 1), (1, 0), (1, 1, 0, 1), (1, 1, 1, 0)):
-        with pytest.raises(ProviderDirectoryRootedGraphPublicationError):
-            await store._validate_and_publish(
-                _ScriptedDatabase(scalars=("b" * 64,), statuses=statuses),
-                identity,
-                current,
-            )
-
-
-async def _no_op(*_arguments, **_keywords) -> None:
-    return None
-
-
-@asynccontextmanager
-async def _candidate_scope(*_arguments, **_keywords):
-    yield {}
-
-
-@pytest.mark.asyncio
-async def test_materialize_publish_pipeline_proves_counts_and_readiness(
-    monkeypatch,
-) -> None:
-    """The atomic pipeline returns only its exact proved readiness."""
-    identity = dataset_identity()
-    admission = twin_admission()
-    current = exact_current()
-    counts_by_resource_type = resource_counts()
-    ready = readiness()
-    monkeypatch.setattr(store, "_assert_no_orphan_parent", _no_op)
-    monkeypatch.setattr(store, "_insert_headers", _no_op)
-    monkeypatch.setattr(store, "prepare_dataset_candidate", _candidate_scope)
-    monkeypatch.setattr(store, "build_provider_directory_dataset_serving_relations", _no_op)
-    monkeypatch.setattr(store, "_validate_and_publish", _no_op)
-
-    async def preflight(*_arguments):
-        return counts_by_resource_type
-
-    async def materialize(*_arguments, **_keywords):
-        return ProviderDirectoryRootedGraphMaterialization(counts_by_resource_type)
-
-    async def load_ready(*_arguments, **_keywords):
-        return ready
-
-    monkeypatch.setattr(store, "_preflight_counts", preflight)
-    monkeypatch.setattr(
-        store,
-        "materialize_provider_directory_rooted_graph_dataset",
-        materialize,
-    )
-    monkeypatch.setattr(store, "load_dataset_readiness", load_ready)
-    publication_result = await store._materialize_and_publish(
-        object(),
-        admission,
-        current,
-        64,
-    )
-    assert publication_result == ProviderDirectoryRootedGraphPublicationResult(ready, False)
-
-
-@pytest.mark.asyncio
-async def test_materialize_publish_pipeline_rejects_unproved_outputs(
-    monkeypatch,
-) -> None:
-    """Count drift and absent readiness both fail the atomic pipeline."""
-    admission = twin_admission()
-    current = exact_current()
-    counts_by_resource_type = resource_counts()
-    monkeypatch.setattr(store, "_assert_no_orphan_parent", _no_op)
-    monkeypatch.setattr(store, "_insert_headers", _no_op)
-    monkeypatch.setattr(store, "prepare_dataset_candidate", _candidate_scope)
-    monkeypatch.setattr(store, "build_provider_directory_dataset_serving_relations", _no_op)
-    monkeypatch.setattr(store, "_validate_and_publish", _no_op)
-
-    async def preflight(*_arguments):
-        return counts_by_resource_type
-
-    async def mismatched(*_arguments, **_keywords):
-        return ProviderDirectoryRootedGraphMaterialization({**counts_by_resource_type, "Organization": 1})
-
-    monkeypatch.setattr(store, "_preflight_counts", preflight)
-    monkeypatch.setattr(
-        store,
-        "materialize_provider_directory_rooted_graph_dataset",
-        mismatched,
-    )
-    with pytest.raises(ProviderDirectoryRootedGraphPublicationError):
-        await store._materialize_and_publish(object(), admission, current, 64)
-
-    async def materialize(*_arguments, **_keywords):
-        return ProviderDirectoryRootedGraphMaterialization(counts_by_resource_type)
-
-    monkeypatch.setattr(
-        store,
-        "materialize_provider_directory_rooted_graph_dataset",
-        materialize,
-    )
-
-    async def no_readiness(*_arguments, **_keywords):
-        return None
-
-    monkeypatch.setattr(store, "load_dataset_readiness", no_readiness)
-    with pytest.raises(ProviderDirectoryRootedGraphPublicationError):
-        await store._materialize_and_publish(object(), admission, current, 64)
-
-
-@pytest.mark.asyncio
-async def test_locked_result_handles_replay_drift_and_new_publication(
-    monkeypatch,
-) -> None:
-    current = exact_current()
-    admission = twin_admission()
-    ready = readiness()
-    expected = ProviderDirectoryRootedGraphPublicationResult(ready, False)
-
-    async def lock_current(*_arguments, **_keywords):
-        return current
-
-    async def require_admission(*_arguments, **_keywords):
-        return admission
-
-    async def replay(*_arguments, **_keywords):
-        return ready
-
-    monkeypatch.setattr(store, "lock_exact_current_dataset", lock_current)
-    monkeypatch.setattr(
-        store,
-        "require_provider_directory_rooted_graph_admission",
-        require_admission,
-    )
-    monkeypatch.setattr(store, "load_replay_readiness", replay)
-    replayed = await store._locked_publication_result(object(), "acquisition", 64)
-    assert replayed.replayed is True
-
-    async def no_replay(*_arguments, **_keywords):
-        return None
-
-    monkeypatch.setattr(store, "load_replay_readiness", no_replay)
-    monkeypatch.setattr(store, "exact_current_matches_root", lambda *_args: False)
-    with pytest.raises(ProviderDirectoryRootedGraphPublicationError) as drift:
-        await store._locked_publication_result(object(), "acquisition", 64)
-    assert drift.value.code == "foreign_current"
-
-    monkeypatch.setattr(store, "exact_current_matches_root", lambda *_args: True)
-
-    async def publish(*_arguments, **_keywords):
-        return expected
-
-    monkeypatch.setattr(store, "_materialize_and_publish", publish)
-    assert await store._locked_publication_result(object(), "acquisition", 64) == expected
-
-
-@pytest.mark.asyncio
-async def test_public_store_validates_batch_and_maps_shared_errors(monkeypatch) -> None:
-    from process import provider_directory_generic_source_adapters as adapters
-    from process import provider_directory_generic_source_policy as policy
-
-    @asynccontextmanager
-    async def transaction(database, **_coordinates):
-        async with database.transaction():
-            yield
-
-    monkeypatch.setattr(adapters, "require_source_transaction", lambda **_coordinates: None)
-    monkeypatch.setattr(policy, "source_transaction", transaction)
-    monkeypatch.setattr(policy, "source_owner_transaction", transaction)
-    for invalid_batch in (False, 0, 4097):
-        with pytest.raises(ValueError, match="batch_size_invalid"):
-            await store.publish_admitted_rooted_graph_dataset(
-                "acquisition",
-                database=object(),
-                batch_size=invalid_batch,
-            )
-
-    ready = readiness()
-    expected = ProviderDirectoryRootedGraphPublicationResult(ready, True)
-
-    async def publish(*_arguments, **_keywords):
-        return expected
-
-    monkeypatch.setattr(store, "_locked_publication_result", publish)
-    database = _ScriptedDatabase(scalars=(None,))
-    assert (
+async def test_ambient_publication_requires_a_prepared_named_generation():
+    database = _ScriptedDatabase()
+    with pytest.raises(RuntimeError, match="prepared named generation through the Source operator"):
         await store.publish_admitted_rooted_graph_dataset(
-            "acquisition",
+            "pdrga_" + "1" * 48,
             database=database,
             batch_size=64,
         )
-        == expected
-    )
-    assert "pg_advisory_xact_lock" in database.calls[0][1]
-
-    for shared_code, expected_code in (
-        ("foreign_current", "foreign_current"),
-        ("source_drift", "source_drift"),
-        ("both_current", "state"),
-    ):
-
-        async def fail(*_arguments, **_keywords):
-            raise ProviderDirectoryDatasetScopedPublicationError(shared_code)
-
-        monkeypatch.setattr(store, "_locked_publication_result", fail)
-        with pytest.raises(ProviderDirectoryRootedGraphPublicationError) as error:
-            await store.publish_admitted_rooted_graph_dataset(
-                "acquisition",
-                database=_ScriptedDatabase(scalars=(None,)),
-                batch_size=64,
-            )
-        assert error.value.code == expected_code
+    assert database.calls == []

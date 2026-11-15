@@ -7,12 +7,10 @@ from uuid import UUID
 
 from sqlalchemy import text
 
-from api.plan_pricing_code_contract import CONTRACT, SPEC, ZIP_CONTRACT, identity_digest
-from api.ptg_membership_storage import protected_owner
+from api import ptg_membership_storage as attachments
+from api.plan_pricing_code_contract import CONTRACT, SPEC, ZIP_CONTRACT, identity_digest, logical_identity
 from process import reference_family_archive as native
-from process.entity_address_snapshot_preparation import _require_no_untrusted_mutation, _seal_published_relation
 from process.ptg_parts.ptg2_manifest_artifacts import PTG2ManifestArtifactError
-from process.ptg_parts.ptg2_physical_binding import _require_closed_local_custody
 
 
 def attachment_name(identity):
@@ -74,58 +72,23 @@ async def source_pins(session, identity, *, create=False):
 
 
 def _membership_views(identity):
-    view_oid_by_name = {}
+    """Retain only validated named membership dependencies, including old receipt editions."""
+    names = set()
     for source in identity["sources"]:
         attachment = source["membership"]["active_attachment"]
-        name, oid = attachment["name"], attachment["relation_oid"]
-        if re.fullmatch(r"pm_[a-z2-7]{52}", name or "") is None or type(oid) is not int or not 0 < oid < 2**32:
+        name = attachment["name"]
+        if (
+            re.fullmatch(r"pm_[a-z2-7]{52}", name or "") is None
+            or attachment.get("schema_name", "hp_snapshot_retention") != "hp_snapshot_retention"
+        ):
             raise PTG2ManifestArtifactError("code pricing membership dependency identity is invalid")
-        if name in view_oid_by_name and view_oid_by_name[name] != oid:
-            raise PTG2ManifestArtifactError("code pricing membership dependency identity collides")
-        view_oid_by_name[name] = oid
-    return view_oid_by_name
+        names.add(name)
+    return tuple(sorted(names))
 
 
-async def _storage(session, view_oid, owner, identity):
-    dependencies = (
-        await session.execute(
-            text(
-                "SELECT DISTINCT c.oid,n.oid,n.nspname,c.relname FROM pg_rewrite r JOIN pg_depend d ON d.classid='pg_rewrite'::regclass AND d.objid=r.oid AND d.refclassid='pg_class'::regclass JOIN pg_class c ON c.oid=d.refobjid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE r.ev_class=:view AND c.oid<>:view"
-            ),
-            {"view": view_oid},
-        )
-    ).all()
-    membership_oid_by_name = {
-        dependency_row[3]: int(dependency_row[0])
-        for dependency_row in dependencies
-        if dependency_row[2] == "hp_snapshot_retention"
-    }
-    storage_relations = [
-        dependency_row for dependency_row in dependencies if dependency_row[2] != "hp_snapshot_retention"
-    ]
-    if membership_oid_by_name != _membership_views(identity) or {
-        dependency_row[3] for dependency_row in storage_relations
-    } != set(SPEC.table_names):
-        raise PTG2ManifestArtifactError("code pricing attachment dependencies differ")
-    schemas = {(int(dependency_row[1]), dependency_row[2]) for dependency_row in storage_relations}
-    if len(schemas) != 1:
-        raise PTG2ManifestArtifactError("code pricing storage family differs")
-    schema_oid, schema = schemas.pop()
-    prefix = "reference_family_archive_"
-    try:
-        if not schema.startswith(prefix):
-            raise ValueError
-        dataset = UUID(schema[len(prefix) :])
-    except ValueError as error:
-        raise PTG2ManifestArtifactError("code pricing namespace differs") from error
-    await native._lock_family(session, schema, SPEC.table_names, "ACCESS SHARE", nowait=True)
-    ownership = await native.capture_model_family_stage_ownership(session, SPEC, dataset)
-    if ownership.schema_oid != schema_oid or set(ownership.relation_oids) != {
-        (dependency_row[3], int(dependency_row[0])) for dependency_row in storage_relations
-    }:
-        raise PTG2ManifestArtifactError("code pricing storage identity changed")
-    await _require_closed_local_custody(session, ownership, owner)
-    return ownership
+async def _storage(session, view, identity):
+    """Reuse the common locked named storage/dependency contract."""
+    return await attachments.attachment_storage(session, view, SPEC, membership_names=_membership_views(identity))
 
 
 _FAMILY_SQL = """SELECT DISTINCT n.nspname,c.relname FROM pg_rewrite r
@@ -186,24 +149,10 @@ async def locate(session, identity, *, allow_stale_provider=False, api_read=Fals
         raise PTG2ManifestArtifactError("capability API read mode is invalid")
     if api_read:
         return await _locate_by_name(session, identity)
-    owner = await protected_owner(session)
-    if owner is None:
+    view = "hp_snapshot_retention." + attachment_name(identity)
+    if await session.scalar(text("SELECT to_regclass(:view) IS NOT NULL"), {"view": view}) is not True:
         return None
-    attachment_record = (
-        await session.execute(
-            text(
-                "SELECT c.oid,c.relowner,c.relkind='v',c.relpersistence='p' FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='hp_snapshot_retention' AND c.relname=:name"
-            ),
-            {"name": attachment_name(identity)},
-        )
-    ).first()
-    if attachment_record is None:
-        return None
-    if attachment_record[1] != owner or attachment_record[2:] != (True, True):
-        raise PTG2ManifestArtifactError("code pricing attachment custody differs")
-    view_oid = int(attachment_record[0])
-    await _require_no_untrusted_mutation(session, [view_oid], owner)
-    ownership = await _storage(session, view_oid, owner, identity)
+    ownership = await _storage(session, view, identity)
     header = (
         (
             await session.execute(
@@ -217,8 +166,8 @@ async def locate(session, identity, *, allow_stale_provider=False, api_read=Fals
     )
     if re.fullmatch("[0-9a-f]{64}", header["content_digest"] or "") is None:
         raise PTG2ManifestArtifactError("code pricing sealed identity differs")
-    if header["identity"] != identity:
-        old, new = dict(header["identity"]), dict(identity)
+    if logical_identity(header["identity"]) != logical_identity(identity):
+        old, new = logical_identity(header["identity"]), logical_identity(identity)
         if identity["contract"] == ZIP_CONTRACT and old.get("provider_signature") != new.get("provider_signature"):
             old["scope"] = {key: scope_value for key, scope_value in old.get("scope", {}).items() if key != "geo_cells"}
             new["scope"] = {key: scope_value for key, scope_value in new["scope"].items() if key != "geo_cells"}
@@ -228,24 +177,17 @@ async def locate(session, identity, *, allow_stale_provider=False, api_read=Fals
             await source_pins(session, header["identity"])
             return None
         raise PTG2ManifestArtifactError("code pricing sealed identity differs")
-    await source_pins(session, identity)
-    return ownership, dict(header), owner, view_oid
+    await source_pins(session, header["identity"])
+    return ownership, dict(header), None, view
 
 
 async def seal(session, ownership, identity, *, reader_principals):
     """Atomically seal completed indexes/data and retain every source and membership family."""
-    owner = await native.protected_publisher_owner(session)
-    owner_name = await session.scalar(
-        text("SELECT quote_ident(rolname) FROM pg_roles WHERE oid=:owner"), {"owner": owner}
-    )
     schema = native._quoted(ownership.schema_name)
+    await native.seal_model_family_storage(session, ownership)
     for principal in reader_principals:
         await session.execute(text(f"GRANT USAGE ON SCHEMA {schema} TO {principal}"))
         await session.execute(text(f"GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {principal}"))
-    await session.execute(text(f"ALTER SCHEMA {schema} OWNER TO {owner_name}"))
-    for _name, oid in ownership.relation_oids:
-        await _seal_published_relation(session, oid, owner)
-    await native.seal_model_family_storage(session, ownership, owner)
     dependencies = [
         f"(SELECT count(*) FROM {schema}.{native._quoted(name)} WHERE false) AS own_{index}"
         for index, name in enumerate(SPEC.table_names)
@@ -261,31 +203,28 @@ async def seal(session, ownership, identity, *, reader_principals):
             f"CREATE OR REPLACE VIEW hp_snapshot_retention.{name} AS SELECT identity,content_digest,{','.join(dependencies)} FROM {schema}.plan_pricing_code_manifest WHERE singleton=1"
         )
     )
-    oid = await session.scalar(
-        text("SELECT to_regclass(:name)::oid"), {"name": "hp_snapshot_retention." + attachment_name(identity)}
+    await attachments.freeze_attachment(
+        session, "hp_snapshot_retention." + attachment_name(identity), reader_principals
     )
-    await _seal_published_relation(session, oid, owner)
-    for principal in reader_principals:
-        await session.execute(text(f"GRANT SELECT ON hp_snapshot_retention.{name} TO {principal}"))
     await source_pins(session, identity, create=True)
 
 
 def receipt(found):
-    """Expose the authenticated ready identity and captured native storage coordinates."""
-    ownership, header, owner, oid = found
+    """Expose logical identity, accounting, and portable named storage coordinates."""
+    ownership, header, _legacy_owner, _view = found
+    identity = logical_identity(header["identity"])
     return {
-        "contract": header["identity"]["contract"],
-        "projection_id": identity_digest(header["identity"]),
+        "contract": identity["contract"],
+        "projection_id": identity_digest(identity),
         "state": "ready",
-        "identity": header["identity"],
+        "identity": identity,
         "content_digest": header["content_digest"],
         "counts": header["counts"],
-        "active_attachment": {"name": attachment_name(header["identity"]), "relation_oid": oid},
+        "active_attachment": {"schema_name": "hp_snapshot_retention", "name": attachment_name(identity)},
         "storage": {
             "dataset_id": str(ownership.dataset_id),
-            "schema_oid": ownership.schema_oid,
-            "relation_oids": [list(row) for row in ownership.relation_oids],
-            "owner_oid": owner,
+            "schema_name": ownership.schema_name,
+            "relation_names": list(ownership.relation_names),
         },
     }
 
@@ -335,6 +274,19 @@ async def _unreferenced_source_schema(session, identity):
     return source_schema
 
 
+async def _retirement_storage(session, ready):
+    """Resolve the retained declared family by name before any cleanup mutation."""
+    ownership = await native.capture_model_family_stage_ownership(session, SPEC, UUID(ready["storage"]["dataset_id"]))
+    expected = ready["storage"]
+    expected_schema = expected.get("schema_name", "reference_family_archive_" + ownership.dataset_id.hex)
+    names = expected.get("relation_names")
+    if names is None:
+        names = [entry[0] for entry in expected.get("relation_oids", ())]
+    if ownership.schema_name != expected_schema or tuple(ownership.relation_names) != tuple(names):
+        raise PTG2ManifestArtifactError("code pricing retirement storage identity changed")
+    return ownership
+
+
 async def retire_unreferenced(session, ready):
     """Retire only a captured unreferenced generation; source/rollback/read pins veto it."""
     from process.ptg_parts.ptg2_lifecycle_lock import acquire_ptg2_lifecycle_lock
@@ -344,17 +296,9 @@ async def retire_unreferenced(session, ready):
         identity
     ):
         raise PTG2ManifestArtifactError("code pricing retirement identity differs")
-    owner = await native.protected_publisher_owner(session)
     await acquire_ptg2_lifecycle_lock(session)
     await lock_identity(session, identity)
-    ownership = await native.capture_model_family_stage_ownership(session, SPEC, UUID(ready["storage"]["dataset_id"]))
-    if (
-        ownership.schema_oid != ready["storage"]["schema_oid"]
-        or [list(reference_row) for reference_row in ownership.relation_oids] != ready["storage"]["relation_oids"]
-        or owner != ready["storage"]["owner_oid"]
-    ):
-        raise PTG2ManifestArtifactError("code pricing retirement storage identity changed")
-    await _require_closed_local_custody(session, ownership, owner)
+    ownership = await _retirement_storage(session, ready)
     schema = native._quoted(ownership.schema_name)
     header = (
         (
@@ -365,26 +309,24 @@ async def retire_unreferenced(session, ready):
         .mappings()
         .one()
     )
-    has_matching_seal = header["identity"] == identity and header["content_digest"] == ready["content_digest"]
+    has_matching_seal = (
+        logical_identity(header["identity"]) == logical_identity(identity)
+        and header["content_digest"] == ready["content_digest"]
+    )
     if not has_matching_seal:
         raise PTG2ManifestArtifactError("code pricing retirement sealed identity differs")
-    source_schema = await _unreferenced_source_schema(session, identity)
-    await native._lock_family(session, ownership.schema_name, SPEC.table_names, "ACCESS EXCLUSIVE", nowait=True)
+    stored_identity = header["identity"]
+    source_schema = await _unreferenced_source_schema(session, stored_identity)
+    await native._lock_family(session, ownership.schema_name, SPEC.table_names, "ACCESS SHARE", nowait=True)
+    await session.execute(text("SET LOCAL lock_timeout='1s'"))
     alias = "hp_snapshot_retention." + attachment_name(identity)
-    oid = await session.scalar(text("SELECT to_regclass(:name)::oid"), {"name": alias})
-    if oid is not None:
-        dependency = await session.scalar(
-            text(
-                "SELECT EXISTS(SELECT 1 FROM pg_rewrite r JOIN pg_depend d ON d.classid='pg_rewrite'::regclass AND d.objid=r.oid AND d.refclassid='pg_class'::regclass JOIN pg_class c ON c.oid=d.refobjid WHERE r.ev_class=:view AND c.relnamespace=:schema)"
-            ),
-            {"view": oid, "schema": ownership.schema_oid},
-        )
-        if dependency:
-            await _require_no_untrusted_mutation(session, [oid], owner)
+    if await session.scalar(text("SELECT to_regclass(:name) IS NOT NULL"), {"name": alias}) is True:
+        dependencies = (await session.execute(text(_FAMILY_SQL), {"view": alias})).all()
+        if any(namespace == ownership.schema_name for namespace, _name in dependencies):
             await session.execute(
                 text(f"DROP VIEW hp_snapshot_retention.{native._quoted(attachment_name(identity))} RESTRICT")
             )
-    for pin in _pins(identity):
+    for pin in _pins(stored_identity):
         await session.execute(
             text(
                 f"DELETE FROM {source_schema}.ptg2_snapshot_pin WHERE owner_type=:owner_type AND owner_id=:owner_id AND snapshot_id=:snapshot_id"

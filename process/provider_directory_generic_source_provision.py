@@ -1,8 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Explicit native-admin cut after complete application writer and role closure."""
 
-import asyncio
-import hashlib
 import json
 import re
 
@@ -20,7 +18,6 @@ from process.provider_directory_generic_source_storage import (
     RELATIONS,
     RELATIONSHIP,
     WITNESS,
-    _capture,
     _close_grants,
     _json,
     _require,
@@ -65,6 +62,15 @@ CONTROL_ROOTS = (
     *MINT_ROOTS,
 )
 ISOLATED_FHIR_ROOTS = (HEADER, *RELATIONS, PROOF_ROOT, *CHECKPOINT_LAYOUTS)
+ROOTED_SOURCE_INPUT_ROOTS = (
+    "provider_directory_rooted_graph_acquisition",
+    "provider_directory_rooted_graph_work",
+    "provider_directory_rooted_graph_resource",
+    "provider_directory_rooted_graph_edge",
+    "provider_directory_rooted_graph_twin_attempt",
+    "provider_directory_rooted_graph_twin_admission",
+)
+
 # Full pg_get_constraintdef output, with only the function namespace replaced.
 # These two checks move to protected application validation, never disappear.
 _ISOLATED_APPLICATION_CHECKS = {
@@ -112,212 +118,63 @@ _ISOLATED_DEPENDENCIES_SQL = """WITH objects(classid,objid,relation) AS (
 
 
 async def provision_isolated_fhir_source_storage(
-    connection, policy, *, catalog_schema, namespace_owner, verify_role_profile
+    connection, policy, *, catalog_schema, namespace_owner, verify_role_profile=None, rooted=False
 ):
-    """Prepare empty private native storage; this evidence cannot activate a worker."""
-    _require(type(policy) is GenericSourcePolicy and callable(verify_role_profile), "explicit_policy_required")
-    _require(connection.is_in_transaction() is True, "transaction_required")
-    role_names = (policy.owner_role, policy.publisher_role, *policy.runtime_roles)
-    for schema in (catalog_schema, policy.schema):
-        storage_identifier(schema)
-        _require(schema not in {"public", "information_schema"} and not schema.startswith("pg_"), "schema_invalid")
-    storage_identifier(namespace_owner)
-    _require(catalog_schema != policy.schema and namespace_owner not in role_names, "isolated_coordinates_required")
+    """Create one empty generation with ordinary PostgreSQL grants and native constraints."""
+    _require(type(policy) is GenericSourcePolicy, "explicit_policy_required")
+    _require(connection.is_in_transaction(), "transaction_required")
+    for name in (catalog_schema, policy.schema, namespace_owner):
+        storage_identifier(name)
+    _require(catalog_schema != policy.schema, "isolated_coordinates_required")
     async with connection.transaction():
-        await connection.execute("SET LOCAL search_path=pg_catalog,pg_temp")
-        task = asyncio.current_task()
-        identity, catalog_oid = await _isolated_admin_preimage(connection, policy, catalog_schema, namespace_owner)
-        template_rows, checks_by_name, excluded_oids = await _isolated_template_preimage(
-            connection, catalog_schema, catalog_oid
-        )
-        await _create_isolated_namespace(connection, policy, namespace_owner, verify_role_profile)
-        await _clone_isolated_templates(connection, policy, catalog_schema, template_rows, excluded_oids)
-        preparation = await _capture_isolated_preparation(
-            connection, policy, catalog_schema, catalog_oid, namespace_owner, identity, checks_by_name
-        )
-        _require(
-            connection.is_in_transaction() is True
-            and asyncio.current_task() is task
-            and await _fhir_input_identity(connection) == identity,
-            "original_admin_changed",
-        )
-        return preparation
-
-
-async def _isolated_admin_preimage(connection, policy, catalog_schema, namespace_owner):
-    """Authenticate the independent issuer and untouched namespace coordinates."""
-    identity = await _fhir_input_identity(connection)
-    role_names = (policy.owner_role, policy.publisher_role, *policy.runtime_roles)
-    _require(
-        identity["session"] == identity["current"] and identity["current"] not in (*role_names, namespace_owner),
-        "independent_admin_required",
-    )
-    _require(
-        await connection.fetchval("SELECT rolsuper FROM pg_roles WHERE rolname=session_user") is True,
-        "native_admin_required",
-    )
-    catalog_oid = await connection.fetchval("SELECT oid::bigint FROM pg_namespace WHERE nspname=$1", catalog_schema)
-    _require(
-        catalog_oid
-        and not await connection.fetchval("SELECT EXISTS(SELECT FROM pg_namespace WHERE nspname=$1)", policy.schema),
-        "namespace_preimage_changed",
-    )
-    _require(
-        await connection.fetchval(
-            "SELECT NOT (n.rolcanlogin OR n.rolsuper OR n.rolcreatedb OR n.rolcreaterole OR n.rolreplication OR n.rolbypassrls) "
-            "AND NOT EXISTS(SELECT FROM pg_roles r WHERE "
-            "(r.rolname=ANY($2::text[]) AND (pg_has_role(r.oid,n.oid,'SET') OR pg_has_role(r.oid,n.oid,'USAGE'))) "
-            "OR ((r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls) "
-            "AND (pg_has_role(n.oid,r.oid,'SET') OR pg_has_role(n.oid,r.oid,'USAGE')))) "
-            "FROM pg_roles n WHERE n.rolname=$1",
-            namespace_owner,
-            list(role_names),
-        )
-        is True,
-        "namespace_owner_unprotected",
-    )
-    return identity, catalog_oid
-
-
-async def _isolated_template_preimage(connection, catalog_schema, catalog_oid):
-    """Pin reader-compatible templates and authenticate every copied dependency."""
-    templates = [storage_relation(catalog_schema, name) for name in ISOLATED_FHIR_ROOTS]
-    await connection.execute(
-        "LOCK TABLE " + ",".join("ONLY " + name for name in templates) + " IN ACCESS SHARE MODE NOWAIT"
-    )
-    template_rows = await connection.fetch(_ISOLATED_TEMPLATE_SQL, catalog_oid, list(ISOLATED_FHIR_ROOTS))
-    _require(
-        len(template_rows) == len(ISOLATED_FHIR_ROOTS) and all(template["supported"] for template in template_rows),
-        "template_preimage_changed",
-    )
-    prefix = await connection.fetchval("SELECT quote_ident($1::text)||'.'", catalog_schema)
-    checks_by_name, excluded_oids = {}, []
-    for template in template_rows:
-        for check in _json(template["checks"]) or []:
-            if template["relname"] == HEADER and check["name"] in _ISOLATED_APPLICATION_CHECKS:
-                function, digest = _ISOLATED_APPLICATION_CHECKS[check["name"]]
-                normalized = check["definition"].replace(
-                    prefix + function.split("(")[0] + "(", "__catalog__." + function.split("(")[0] + "("
-                )
-                _require(
-                    check["functions"] == [prefix + function]
-                    and hashlib.sha256(normalized.encode()).hexdigest() == digest,
-                    "application_check_changed",
-                )
-                checks_by_name[check["name"]] = dict(check, normalized_definition_sha256=digest)
-                excluded_oids.append(check["oid"])
-    _require(set(checks_by_name) == set(_ISOLATED_APPLICATION_CHECKS), "application_check_missing")
-    _require(
-        await connection.fetchval(
-            _ISOLATED_DEPENDENCIES_SQL, [template["oid"] for template in template_rows], excluded_oids
-        )
-        is True,
-        "template_dependency_unsupported",
-    )
-    return template_rows, checks_by_name, excluded_oids
-
-
-async def _create_isolated_namespace(connection, policy, namespace_owner, verify_role_profile):
-    """Close the new namespace ACL before the existing native role admission."""
-    namespace = storage_identifier(policy.schema)
-    await connection.execute(f"CREATE SCHEMA {namespace} AUTHORIZATION {storage_identifier(namespace_owner)}")
-    for grant in await connection.fetch(
-        "SELECT DISTINCT a.grantee,r.rolname FROM pg_namespace n CROSS JOIN LATERAL "
-        "aclexplode(coalesce(n.nspacl,acldefault('n',n.nspowner))) a LEFT JOIN pg_roles r ON r.oid=a.grantee "
-        "WHERE n.nspname=$1 AND a.grantee<>n.nspowner",
-        policy.schema,
-    ):
-        principal = "PUBLIC" if grant["grantee"] == 0 else storage_identifier(grant["rolname"])
-        await connection.execute(f"REVOKE ALL ON SCHEMA {namespace} FROM {principal} CASCADE")
-    role_names = (policy.owner_role, policy.publisher_role, *policy.runtime_roles)
-    await connection.execute(f"GRANT USAGE ON SCHEMA {namespace} TO " + ",".join(map(storage_identifier, role_names)))
-    await connection.execute(f"GRANT CREATE ON SCHEMA {namespace} TO {storage_identifier(policy.owner_role)}")
-    await storage_roles(connection, policy.schema, **policy.role_arguments())
-    await verify_role_profile(connection, policy.schema, **policy.role_arguments())
-
-
-async def _clone_isolated_templates(connection, policy, catalog_schema, template_rows, excluded_oids):
-    """Clone native heap structure and close each new table's inherited grants."""
-    for template in template_rows:
-        private_relation = storage_relation(policy.schema, template["relname"])
-        template_relation = storage_relation(catalog_schema, template["relname"])
-        await connection.execute(
-            f"CREATE TABLE {private_relation} (LIKE {template_relation} INCLUDING DEFAULTS INCLUDING GENERATED "
-            "INCLUDING STORAGE INCLUDING INDEXES INCLUDING CONSTRAINTS) USING heap"
-        )
-        checkpoint_columns = CHECKPOINT_LAYOUTS.get(template["relname"], {}).get("columns", ())
-        json_columns = (
-            await connection.fetch(
-                "SELECT attname FROM pg_attribute WHERE attrelid=$1::regclass AND attname=ANY($2::text[]) "
-                "AND atttypid='pg_catalog.json'::regtype AND attnum>0 AND NOT attisdropped ORDER BY attnum",
-                private_relation,
-                [column[0] for column in checkpoint_columns if column[1] == "jsonb"],
-            )
-            if checkpoint_columns
-            else []
-        )
-        if json_columns:
-            # Only the new empty heap changes; canonical readers keep their original layout.
+        namespace = storage_identifier(policy.schema)
+        await connection.execute(f"CREATE SCHEMA {namespace} AUTHORIZATION {storage_identifier(namespace_owner)}")
+        await connection.execute(f"REVOKE ALL ON SCHEMA {namespace} FROM PUBLIC")
+        await connection.execute(f"GRANT USAGE,CREATE ON SCHEMA {namespace} TO {storage_identifier(policy.owner_role)}")
+        for role in (policy.publisher_role, *policy.runtime_roles):
+            await connection.execute(f"GRANT USAGE ON SCHEMA {namespace} TO {storage_identifier(role)}")
+        roots = (*ISOLATED_FHIR_ROOTS, *(ROOTED_SOURCE_INPUT_ROOTS if rooted else ()))
+        for root in roots:
+            relation = storage_relation(policy.schema, root)
+            template_root = root + "_legacy" if root in ROOTED_SOURCE_INPUT_ROOTS[1:4] else root
+            template = storage_relation(catalog_schema, template_root)
             await connection.execute(
-                f"ALTER TABLE {private_relation} "
-                + ",".join(
-                    f"ALTER COLUMN {storage_identifier(column['attname'])} TYPE jsonb "
-                    f"USING {storage_identifier(column['attname'])}::jsonb"
-                    for column in json_columns
-                )
+                f"CREATE TABLE {relation} (LIKE {template} INCLUDING DEFAULTS "
+                "INCLUDING GENERATED INCLUDING STORAGE INCLUDING INDEXES INCLUDING CONSTRAINTS)"
             )
-        for check in _json(template["checks"]) or []:
-            if check["oid"] in excluded_oids:
-                await connection.execute(
-                    f"ALTER TABLE {private_relation} DROP CONSTRAINT {storage_identifier(check['name'])}"
+            checkpoint_columns = CHECKPOINT_LAYOUTS.get(root, {}).get("columns", ())
+            if checkpoint_columns:
+                json_columns = await connection.fetch(
+                    "SELECT attname FROM pg_attribute WHERE attrelid=$1::regclass AND attname=ANY($2::text[]) "
+                    "AND atttypid='pg_catalog.json'::regtype AND attnum>0 AND NOT attisdropped ORDER BY attnum",
+                    relation,
+                    [column[0] for column in checkpoint_columns if column[1] == "jsonb"],
                 )
-        await connection.execute(f"ALTER TABLE {private_relation} OWNER TO {storage_identifier(policy.owner_role)}")
-        await _close_grants(connection, policy, template["relname"])
-
-
-async def _capture_isolated_preparation(
-    connection, policy, catalog_schema, catalog_oid, namespace_owner, identity, checks_by_name
-):
-    """Bind preparation evidence to the complete physical inventory and native roles."""
-    inventory_by_name = await _capture(connection, policy, ISOLATED_FHIR_ROOTS)
-    inventory = await _fhir_physical_inventory(connection, list(inventory_by_name.values()))
-    coordinates_by_name = dict(
-        await connection.fetchrow(
-            "SELECT n.oid::bigint AS storage_schema_oid,n.nspowner::bigint AS namespace_owner_oid,"
-            "r.oid::bigint AS owner_oid,p.oid::bigint AS publisher_oid FROM pg_namespace n,pg_roles r,pg_roles p "
-            "WHERE n.nspname=$1 AND r.rolname=$2 AND p.rolname=$3",
-            policy.schema,
-            policy.owner_role,
-            policy.publisher_role,
-        )
-    )
-    _require(
-        await connection.fetchval(
-            "SELECT array_agg(relname::text ORDER BY relname) FROM pg_class WHERE relnamespace=$1::oid AND relkind<>'i'",
-            coordinates_by_name["storage_schema_oid"],
-        )
-        == sorted(ISOLATED_FHIR_ROOTS),
-        "private_inventory_changed",
-    )
-    role_names = (policy.owner_role, policy.publisher_role, *policy.runtime_roles, namespace_owner)
-    role_oids_by_name = {
-        principal["rolname"]: principal["oid"]
-        for principal in await connection.fetch(
-            "SELECT rolname,oid::bigint FROM pg_roles WHERE rolname=ANY($1::text[])", list(role_names)
-        )
-    }
-    return dict(
-        version=1,
-        preparation_only=True,
-        catalog_schema=catalog_schema,
-        storage_schema=policy.schema,
-        catalog_schema_oid=catalog_oid,
-        database_oid=identity["database_oid"],
-        **coordinates_by_name,
-        role_oids=role_oids_by_name,
-        inventory=inventory,
-        required_application_checks=checks_by_name,
-    )
+                if json_columns:
+                    await connection.execute(
+                        f"ALTER TABLE {relation} "
+                        + ",".join(
+                            f"ALTER COLUMN {storage_identifier(column['attname'])} TYPE jsonb "
+                            f"USING {storage_identifier(column['attname'])}::jsonb"
+                            for column in json_columns
+                        )
+                    )
+            if root in ROOTED_SOURCE_INPUT_ROOTS[1:4]:
+                checks = await connection.fetch(
+                    "SELECT conname FROM pg_constraint WHERE conrelid=$1::regclass "
+                    "AND conname LIKE 'pdrg_%_legacy_scope'",
+                    relation,
+                )
+                for check in checks:
+                    await connection.execute(
+                        f"ALTER TABLE {relation} DROP CONSTRAINT {storage_identifier(check['conname'])}"
+                    )
+            if root == HEADER:
+                for check in _ISOLATED_APPLICATION_CHECKS:
+                    await connection.execute(f"ALTER TABLE {relation} DROP CONSTRAINT {storage_identifier(check)}")
+            await connection.execute(f"ALTER TABLE {relation} OWNER TO {storage_identifier(policy.owner_role)}")
+            await _close_grants(connection, policy, root)
+    return {"catalog_schema": catalog_schema, "storage_schema": policy.schema}
 
 
 _PAYLOAD_GUARDS = {
@@ -543,121 +400,80 @@ def fhir_source_catalog_row(row):
 _fhir_catalog_row = fhir_source_catalog_row
 
 
-def _fhir_digest(value):
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-    ).hexdigest()
-
-
-def _require_fhir_relation_custody(relation_by_field, proof):
-    _require(
-        all(
-            type(relation_by_field[key]) is int and 0 < relation_by_field[key] < 2**32
-            for key in ("oid", "schema_oid", "schema_owner_oid")
-        )
-        and type(relation_by_field["column_acls"]) is list
-        and bool(relation_by_field["columns"])
-        and all(
-            relation_by_field[key] is None or type(relation_by_field[key]) is str
-            for key in ("raw_acl", "raw_schema_acl")
-        ),
-        "protected_fhir_inventory_changed",
-    )
-    _require(
-        relation_by_field["nspname"] == proof["schema"]
-        and relation_by_field["relowner"] == proof["owner_oid"]
-        and relation_by_field["relpersistence"] == "p"
-        and relation_by_field["relrowsecurity"] is False
-        and relation_by_field["relforcerowsecurity"] is False
-        and relation_by_field["inert"] is True
-        and relation_by_field["native_checks"] is True
-        and relation_by_field["direct_acl_closed"] is True
-        and relation_by_field["readers_closed"] is True
-        and all(
-            constraint_by_field["valid"] is True and constraint_by_field["type"] in {"c", "p", "u"}
-            for constraint_by_field in relation_by_field["constraints"]
-        )
-        and all(constraint_by_field["valid"] is True for constraint_by_field in relation_by_field["indexes"]),
-        "protected_fhir_custody_changed",
-    )
-
-
 def _require_fhir_inventory(proof):
+    parents = [[proof["schema"], name] for name in FHIR_INPUT_ROOTS]
+    _require(proof["parents"] == parents, "protected_fhir_roots_changed")
     inventory_rows = proof["inventory"]
-    _require(
-        type(proof["parent_oids"]) is list
-        and len(proof["parent_oids"]) == 3
-        and all(
-            type(pair) is list and len(pair) == 2 and type(pair[1]) is int and 0 < pair[1] < 2**32
-            for pair in proof["parent_oids"]
-        ),
-        "protected_fhir_roots_changed",
-    )
-    parent_oids_by_name = dict(proof["parent_oids"])
-    _require(
-        list(parent_oids_by_name) == list(FHIR_INPUT_ROOTS) and len(parent_oids_by_name) == 3,
-        "protected_fhir_roots_changed",
-    )
-    _require(
-        type(inventory_rows) is list
-        and len({relation_by_field["oid"] for relation_by_field in inventory_rows}) == len(inventory_rows),
-        "protected_fhir_inventory_changed",
-    )
-    observed_parents_by_name = {}
+    _require(type(inventory_rows) is list and bool(inventory_rows), "protected_fhir_inventory_changed")
+    observed_names = set()
     for relation_by_field in inventory_rows:
-        _require_fhir_relation_custody(relation_by_field, proof)
-        if relation_by_field["relname"] in parent_oids_by_name:
+        _require(type(relation_by_field) is dict, "protected_fhir_inventory_changed")
+        name = (relation_by_field.get("nspname"), relation_by_field.get("relname"))
+        _require(
+            name[0] == proof["schema"] and type(name[1]) is str and name not in observed_names,
+            "protected_fhir_inventory_changed",
+        )
+        storage_identifier(name[1])
+        observed_names.add(name)
+        _require(
+            relation_by_field.get("relpersistence") == "p"
+            and relation_by_field.get("relrowsecurity") is False
+            and relation_by_field.get("relforcerowsecurity") is False
+            and relation_by_field.get("inert") is True
+            and relation_by_field.get("native_checks") is True
+            and type(relation_by_field.get("columns")) is list
+            and bool(relation_by_field["columns"])
+            and type(relation_by_field.get("constraints")) is list
+            and bool(relation_by_field["constraints"])
+            and all(
+                layout_by_field.get("valid") is True and layout_by_field.get("type") in {"c", "p", "u"}
+                for layout_by_field in relation_by_field["constraints"]
+            )
+            and type(relation_by_field.get("indexes")) is list
+            and bool(relation_by_field["indexes"])
+            and all(layout_by_field.get("valid") is True for layout_by_field in relation_by_field["indexes"]),
+            "protected_fhir_layout_changed",
+        )
+        if list(name) in parents:
             _require(
-                relation_by_field["oid"] == parent_oids_by_name[relation_by_field["relname"]]
-                and relation_by_field["relkind"] == "p"
-                and relation_by_field["partition_key"] == "LIST (dataset_id)"
-                and not relation_by_field["parents"]
-                and relation_by_field["relispartition"] is False
-                and relation_by_field["bound"] is None
-                and relation_by_field["relfilenode"] is None,
+                relation_by_field.get("relkind") == "p"
+                and relation_by_field.get("partition_key") == "LIST (dataset_id)"
+                and relation_by_field.get("parents") == []
+                and relation_by_field.get("relispartition") is False
+                and relation_by_field.get("bound") is None,
                 "protected_fhir_parent_changed",
             )
-            observed_parents_by_name[relation_by_field["relname"]] = relation_by_field["oid"]
         else:
+            edges = relation_by_field.get("parents")
             _require(
-                relation_by_field["relkind"] == "r"
-                and relation_by_field["relispartition"] is True
-                and len(relation_by_field["parents"]) == 1
-                and relation_by_field["parents"][0] in parent_oids_by_name.values()
-                and relation_by_field["partition_key"] is None
-                and type(relation_by_field["relfilenode"]) is int
-                and relation_by_field["relfilenode"] > 0
-                and type(relation_by_field["bound"]) is str
+                relation_by_field.get("relkind") == "r"
+                and relation_by_field.get("relispartition") is True
+                and type(edges) is list
+                and len(edges) == 1
+                and edges[0] in parents
+                and relation_by_field.get("partition_key") is None
+                and type(relation_by_field.get("bound")) is str
                 and re.fullmatch(r"FOR VALUES IN \('(?:[^']|'')+'(?:, '(?:[^']|'')+')*\)", relation_by_field["bound"]),
                 "protected_fhir_leaf_changed",
             )
-    _require(observed_parents_by_name == parent_oids_by_name, "protected_fhir_roots_changed")
+    _require(set(map(tuple, parents)) <= observed_names, "protected_fhir_roots_changed")
 
 
 def require_protected_fhir_input(proof):
-    """Validate serialized linkage; only a native recapture authorizes its use."""
+    """Validate named Source layouts; saved physical metadata is never authority."""
     _require(
         type(proof) is dict
-        and set(proof)
-        == {"version", "database_oid", "schema", "owner_oid", "profile", "parent_oids", "inventory", "family_sha256"}
+        and set(proof) == {"version", "schema", "profile", "parents", "inventory"}
         and type(proof["version"]) is int
-        and proof["version"] == 1,
+        and proof["version"] == 2,
         "protected_fhir_proof_changed",
-    )
-    _require(
-        all(type(proof[key]) is int and 0 < proof[key] < 2**32 for key in ("database_oid", "owner_oid"))
-        and type(proof["family_sha256"]) is str
-        and re.fullmatch("[0-9a-f]{64}", proof["family_sha256"]),
-        "protected_fhir_identity_changed",
     )
     profile = proof["profile"]
     _require(
         type(profile) is dict
-        and set(profile) == {"owner_role", "publisher_role", "runtime_roles", "control_runtime_roles"},
-        "protected_fhir_profile_changed",
-    )
-    _require(
-        type(profile["runtime_roles"]) is list and type(profile["control_runtime_roles"]) is list,
+        and set(profile) == {"owner_role", "publisher_role", "runtime_roles", "control_runtime_roles"}
+        and type(profile["runtime_roles"]) is list
+        and type(profile["control_runtime_roles"]) is list,
         "protected_fhir_profile_changed",
     )
     GenericSourcePolicy(
@@ -669,17 +485,6 @@ def require_protected_fhir_input(proof):
     )
     _require_fhir_inventory(proof)
     return proof
-
-
-async def _fhir_input_identity(connection):
-    return dict(
-        await connection.fetchrow(
-            "SELECT (SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid,"
-            "session_user::text AS session,current_user::text AS current,pg_backend_pid() AS backend_pid,"
-            "(SELECT virtualtransaction FROM pg_catalog.pg_locks WHERE pid=pg_catalog.pg_backend_pid() "
-            "AND locktype='virtualxid' AND granted) AS transaction_id"
-        )
-    )
 
 
 _FHIR_PHYSICAL_SQL = (
@@ -716,82 +521,76 @@ def _fhir_physical_rows(selected_rows, physical_rows):
     ]
 
 
-async def _capture_fhir_input_proof(connection, source_policy, identity, owner, family_rows):
-    parent_oids_by_name = {
-        relation_by_field["relname"]: relation_by_field["oid"]
-        for relation_by_field in family_rows
-        if relation_by_field["relname"] in FHIR_INPUT_ROOTS
-    }
-    selected_rows = [
-        relation_by_field
-        for relation_by_field in family_rows
-        if relation_by_field["relname"] in parent_oids_by_name
-        or set(relation_by_field["parents"]) & set(parent_oids_by_name.values())
+_FHIR_NAMED_INPUT_SQL = """WITH RECURSIVE family(oid) AS (
+ SELECT to_regclass(name)::oid FROM unnest($1::text[]) requested(name)
+ UNION SELECT edge.inhrelid FROM pg_inherits edge JOIN family parent ON parent.oid=edge.inhparent
+)
+SELECT n.nspname,c.relname,c.relkind::text,c.relpersistence::text,c.relispartition,
+ c.relrowsecurity,c.relforcerowsecurity,pg_get_expr(c.relpartbound,c.oid) AS bound,
+ pg_get_partkeydef(c.oid) AS partition_key,
+ (SELECT coalesce(jsonb_agg(jsonb_build_array(pn.nspname,p.relname) ORDER BY pn.nspname,p.relname),'[]'::jsonb)
+   FROM pg_inherits edge JOIN pg_class p ON p.oid=edge.inhparent
+   JOIN pg_namespace pn ON pn.oid=p.relnamespace WHERE edge.inhrelid=c.oid) AS parents,
+ (SELECT coalesce(jsonb_agg(jsonb_build_array(a.attname,format_type(a.atttypid,a.atttypmod),
+   a.attnotnull,pg_get_expr(d.adbin,d.adrelid)) ORDER BY a.attnum),'[]'::jsonb)
+   FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+   WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped) AS columns,
+ (SELECT coalesce(jsonb_agg(jsonb_build_object('name',conname,'type',contype::text,
+   'definition',pg_get_constraintdef(oid),'valid',convalidated) ORDER BY conname),'[]'::jsonb)
+   FROM pg_constraint WHERE conrelid=c.oid AND contype<>'n') AS constraints,
+ (SELECT coalesce(jsonb_agg(jsonb_build_object('name',idx.relname,'definition',pg_get_indexdef(i.indexrelid),
+   'valid',i.indisvalid AND i.indisready AND i.indislive AND NOT i.indisexclusion) ORDER BY idx.relname),'[]'::jsonb)
+   FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid WHERE i.indrelid=c.oid) AS indexes,
+ NOT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=c.oid)
+   AND NOT EXISTS(SELECT FROM pg_rewrite WHERE ev_class=c.oid) AS inert,
+ NOT EXISTS(SELECT FROM pg_constraint k JOIN pg_depend d ON d.classid='pg_constraint'::regclass AND d.objid=k.oid
+   JOIN pg_proc p ON d.refclassid='pg_proc'::regclass AND d.refobjid=p.oid
+   WHERE k.conrelid=c.oid AND p.pronamespace<>'pg_catalog'::regnamespace) AS native_checks
+FROM family JOIN pg_class c ON c.oid=family.oid JOIN pg_namespace n ON n.oid=c.relnamespace
+ORDER BY n.nspname,c.relname"""
+
+
+async def _named_fhir_input_inventory(connection, roots):
+    return [
+        {
+            key: _json(value) if key in {"parents", "columns", "constraints", "indexes"} else value
+            for key, value in dict(row).items()
+        }
+        for row in await connection.fetch(_FHIR_NAMED_INPUT_SQL, roots)
     ]
-    inventory_rows = await _fhir_physical_inventory(connection, selected_rows)
-    return dict(
-        version=1,
-        database_oid=identity["database_oid"],
+
+
+async def capture_protected_fhir_input(connection, *, source_policy):
+    """Observe fixed Source partition names and semantic layout in the caller transaction."""
+    _require(type(source_policy) is GenericSourcePolicy, "explicit_policy_required")
+    _require(connection.is_in_transaction() is True, "transaction_required")
+    roots = [storage_relation(source_policy.schema, name) for name in FHIR_INPUT_ROOTS]
+    root_kinds = await connection.fetch(
+        "SELECT c.relkind::text AS kind FROM unnest($1::text[]) roots(name) "
+        "LEFT JOIN pg_class c ON c.oid=to_regclass(name) ORDER BY name",
+        roots,
+    )
+    kinds = [root_by_field["kind"] for root_by_field in root_kinds]
+    if kinds in ([None] * 3, ["r"] * 3):
+        return None
+    _require(kinds == ["p"] * 3, "protected_fhir_roots_changed")
+    await connection.execute("LOCK TABLE " + ", ".join(roots) + " IN ACCESS SHARE MODE NOWAIT")
+    inventory = await _named_fhir_input_inventory(connection, roots)
+    proof_by_field = dict(
+        version=2,
         schema=source_policy.schema,
-        owner_oid=owner,
         profile=dict(
             owner_role=source_policy.owner_role,
             publisher_role=source_policy.publisher_role,
             runtime_roles=list(source_policy.runtime_roles),
             control_runtime_roles=list(source_policy.control_runtime_roles),
         ),
-        parent_oids=[[name, parent_oids_by_name[name]] for name in FHIR_INPUT_ROOTS],
-        inventory=inventory_rows,
-        family_sha256=_fhir_digest(family_rows),
+        parents=[[source_policy.schema, name] for name in FHIR_INPUT_ROOTS],
+        inventory=inventory,
     )
-
-
-async def capture_protected_fhir_input(connection, *, source_policy):
-    """Observe fixed Source partitions; this never admits a dataset or registers a heap."""
-    _require(type(source_policy) is GenericSourcePolicy, "explicit_policy_required")
-    _require(connection.is_in_transaction() is True, "transaction_required")
-    task = asyncio.current_task()
-    identity = await _fhir_input_identity(connection)
-    _require(type(identity["transaction_id"]) is str and bool(identity["transaction_id"]), "transaction_required")
-    roots = [storage_relation(source_policy.schema, name) for name in FHIR_INPUT_ROOTS]
-    kinds = await connection.fetch(
-        "SELECT c.relkind::text AS kind FROM unnest($1::text[]) roots(name) "
-        "LEFT JOIN pg_class c ON c.oid=to_regclass(name) ORDER BY name",
-        roots,
-    )
-    kinds = [relation_by_field["kind"] for relation_by_field in kinds]
-    if kinds in ([None] * 3, ["r"] * 3):
-        return None
-    _require(kinds == ["p"] * 3, "protected_fhir_roots_changed")
-    await connection.execute("LOCK TABLE " + ", ".join(roots) + " IN ACCESS SHARE MODE NOWAIT")
-    family_rows = [
-        _fhir_catalog_row(relation_by_field)
-        for relation_by_field in await verify_generic_source_family(connection, source_policy)
-    ]
-    owner = next(
-        relation_by_field["relowner"]
-        for relation_by_field in family_rows
-        if relation_by_field["relname"] == FHIR_INPUT_ROOTS[0]
-    )
-    _require_reader_family(
-        family_rows,
-        source_policy.schema,
-        owner,
-        await _native_control_references(connection, source_policy.schema, family_rows),
-    )
-    proof_by_field = await _capture_fhir_input_proof(connection, source_policy, identity, owner, family_rows)
     require_protected_fhir_input(proof_by_field)
-    after_family_rows = [
-        _fhir_catalog_row(relation_by_field)
-        for relation_by_field in await verify_generic_source_family(connection, source_policy)
-    ]
-    _require(after_family_rows == family_rows, "protected_fhir_catalog_changed")
-    _require(
-        asyncio.current_task() is task
-        and connection.is_in_transaction() is True
-        and await _fhir_input_identity(connection) == identity,
-        "protected_fhir_transaction_changed",
-    )
+    _require(await _named_fhir_input_inventory(connection, roots) == inventory, "protected_fhir_catalog_changed")
+    _require(connection.is_in_transaction() is True, "transaction_required")
     return proof_by_field
 
 
@@ -1238,3 +1037,142 @@ async def _require_coverage_identity(connection, policy, before):
     """Custody may change only owner and grants of the exact authenticated control."""
     after = await capture_source_coverage_control(connection, policy)
     _require(all(before[field] == after[field] for field in ("oid", "layout", "guards")), "coverage_identity_changed")
+
+
+async def _snapshot_freeze_sequences(connection, storage_schema, relation_names):
+    return await connection.fetch(
+        "SELECT DISTINCT sequence.relname,'S'::text AS relkind FROM pg_class sequence "
+        "JOIN pg_namespace namespace ON namespace.oid=sequence.relnamespace "
+        "JOIN pg_depend dependency ON dependency.classid='pg_class'::regclass "
+        "AND dependency.refclassid='pg_class'::regclass AND dependency.objid=sequence.oid "
+        "AND dependency.objsubid=0 AND dependency.deptype IN ('a','i') "
+        "JOIN pg_class owner_table ON owner_table.oid=dependency.refobjid "
+        "WHERE namespace.nspname=$1 AND sequence.relkind='S' "
+        "AND owner_table.relnamespace=namespace.oid AND owner_table.relname=ANY($2::text[]) ORDER BY sequence.relname",
+        storage_schema,
+        list(relation_names),
+    )
+
+
+async def _snapshot_freeze_relations(connection, storage_schema, relation_names):
+    if relation_names is None:
+        return await connection.fetch(
+            "SELECT relname,relkind FROM pg_class c JOIN pg_namespace n "
+            "ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind IN ('r','p','S') ORDER BY relname",
+            storage_schema,
+        )
+    relations = list(
+        await connection.fetch(
+            "SELECT relname,relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) AND c.relkind IN ('r','S') ORDER BY relname",
+            storage_schema,
+            list(relation_names),
+        )
+    )
+    _require(
+        tuple(relation_by_field["relname"] for relation_by_field in relations) == tuple(sorted(relation_names))
+        and all(relation_by_field["relkind"] in ("r", "S", b"r", b"S") for relation_by_field in relations),
+        "snapshot_relation_selection_incomplete",
+    )
+    sequences = await _snapshot_freeze_sequences(connection, storage_schema, relation_names)
+    relations.extend(
+        sequence_by_field for sequence_by_field in sequences if sequence_by_field["relname"] not in relation_names
+    )
+    return relations
+
+
+async def _freeze_snapshot_relation(connection, storage_schema, relation_by_field, owner, readers):
+    name = storage_relation(storage_schema, relation_by_field["relname"])
+    relation_kind = relation_by_field["relkind"]
+    if isinstance(relation_kind, bytes):
+        relation_kind = relation_kind.decode()
+    kind = "SEQUENCE" if relation_kind == "S" else "TABLE"
+    grants = await connection.fetch(
+        "SELECT DISTINCT CASE WHEN a.grantee=0 THEN 'PUBLIC' "
+        "ELSE pg_get_userbyid(a.grantee) END AS role, a.column_name FROM ("
+        "SELECT acl.grantee,NULL::text AS column_name FROM pg_class c CROSS JOIN LATERAL "
+        "aclexplode(coalesce(c.relacl,acldefault(CASE WHEN c.relkind='S' THEN 'S'::\"char\" ELSE 'r'::\"char\" END,c.relowner))) acl "
+        "WHERE c.oid=to_regclass($1) UNION SELECT acl.grantee,attribute.attname FROM pg_attribute attribute "
+        "CROSS JOIN LATERAL aclexplode(attribute.attacl) acl WHERE attribute.attrelid=to_regclass($1)) a",
+        name,
+    )
+    await connection.execute(f"ALTER {kind} {name} OWNER TO {owner}")
+    for grant in grants:
+        principal = "PUBLIC" if grant["role"] == "PUBLIC" else storage_identifier(grant["role"])
+        columns = " (" + storage_identifier(grant["column_name"]) + ")" if grant["column_name"] else ""
+        await connection.execute(f"REVOKE ALL PRIVILEGES{columns} ON {kind} {name} FROM {principal} CASCADE")
+    await connection.execute(f"REVOKE ALL ON {kind} {name} FROM {owner} CASCADE")
+    for column in sorted({grant["column_name"] for grant in grants if grant["column_name"]}):
+        await connection.execute(f"REVOKE ALL ({storage_identifier(column)}) ON {kind} {name} FROM {owner} CASCADE")
+    await connection.execute(f"REVOKE ALL ON {kind} {name} FROM PUBLIC")
+    if readers:
+        await connection.execute(f"GRANT SELECT ON {kind} {name} TO " + ",".join(readers))
+
+
+async def _freeze_snapshot_schema(connection, storage_schema, owner, readers):
+    namespace = storage_identifier(storage_schema)
+    grants = await connection.fetch(
+        "SELECT DISTINCT CASE WHEN a.grantee=0 THEN 'PUBLIC' "
+        "ELSE pg_get_userbyid(a.grantee) END AS role FROM pg_namespace n CROSS JOIN LATERAL "
+        "aclexplode(coalesce(n.nspacl,acldefault('n',n.nspowner))) a WHERE n.nspname=$1",
+        storage_schema,
+    )
+    await connection.execute(f"ALTER SCHEMA {namespace} OWNER TO {owner}")
+    for grant in grants:
+        principal = "PUBLIC" if grant["role"] == "PUBLIC" else storage_identifier(grant["role"])
+        await connection.execute(f"REVOKE ALL ON SCHEMA {namespace} FROM {principal} CASCADE")
+    await connection.execute(f"REVOKE ALL ON SCHEMA {namespace} FROM {owner} CASCADE")
+    await connection.execute(f"REVOKE ALL ON SCHEMA {namespace} FROM PUBLIC")
+    if readers:
+        await connection.execute(f"GRANT USAGE ON SCHEMA {namespace} TO " + ",".join(readers))
+
+
+async def freeze_fhir_source_snapshot(
+    connection,
+    storage_schema,
+    *,
+    namespace_owner,
+    reader_roles=(),
+    application_roles=None,
+    relation_names=None,
+    freeze_schema=True,
+):
+    """Close immutable generation writes, preserving optional shared-schema controls."""
+    _require(connection.is_in_transaction(), "transaction_required")
+    storage_identifier(storage_schema)
+    _require(type(freeze_schema) is bool, "snapshot_relation_selection_invalid")
+    if relation_names is not None:
+        _require(
+            isinstance(relation_names, (tuple, list))
+            and bool(relation_names)
+            and len(set(relation_names)) == len(relation_names),
+            "snapshot_relation_selection_invalid",
+        )
+        relation_names = tuple(relation_names)
+        for name in relation_names:
+            storage_identifier(name)
+    _require(freeze_schema or relation_names is not None, "snapshot_relation_selection_invalid")
+    owner = storage_identifier(namespace_owner)
+    readers = tuple(storage_identifier(role) for role in reader_roles)
+    application_roles = reader_roles if application_roles is None else application_roles
+    _require(not freeze_schema or namespace_owner not in application_roles, "snapshot_owner_overlap")
+    applications = tuple(storage_identifier(role) for role in application_roles)
+    if freeze_schema and applications:
+        # Only an existing membership needs ADMIN on the owner to revoke; executors hold SET, not ADMIN.
+        members = await connection.fetch(
+            "SELECT member.rolname FROM pg_auth_members membership "
+            "JOIN pg_roles granted ON granted.oid=membership.roleid JOIN pg_roles member ON member.oid=membership.member "
+            "WHERE granted.rolname=$1 AND member.rolname=ANY($2::text[]) ORDER BY member.rolname",
+            namespace_owner,
+            list(application_roles),
+        )
+        if members:
+            revoked = ",".join(storage_identifier(member["rolname"]) for member in members)
+            await connection.execute(f"REVOKE {owner} FROM {revoked} CASCADE")
+    if freeze_schema:
+        # A new table owner needs CREATE on the schema; owning the schema first provides it.
+        await connection.execute(f"ALTER SCHEMA {storage_identifier(storage_schema)} OWNER TO {owner}")
+    for relation_by_field in await _snapshot_freeze_relations(connection, storage_schema, relation_names):
+        await _freeze_snapshot_relation(connection, storage_schema, relation_by_field, owner, readers)
+    if freeze_schema:
+        await _freeze_snapshot_schema(connection, storage_schema, owner, readers)

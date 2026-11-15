@@ -25,12 +25,13 @@ from process.network_approved_source_bindings import (
 )
 from process.network_membership_candidate_lifecycle import _control_namespace, _locked_candidate
 from process.network_membership_copy import MAX_INPUT_BYTES, MAX_ROWS, copy_network_membership_batch
-from process.network_membership_writer_closure import _NATIVE_WRITER_PRIVILEGES_SQL, _protected_owner
 from process.reference_family_archive import (
+    TYPED_MRF_CONTRACT,
     ReferenceFamilyArchiveError,
     ReferenceFamilyPreparedSource,
     ReferenceFamilyValidationReceipt,
     _canonical_json,
+    reference_family_spec,
     reference_family_stage_schema,
     validate_reference_family_manifest,
     validate_reference_family_validation_receipt,
@@ -334,37 +335,12 @@ def _validated_native_archive(prepared, validation):
         or ownership.schema_name != reference_family_stage_schema(ownership.dataset_id)
         or validation.importer_id != manifest.importer_id
         or validation.stage_schema != ownership.schema_name
-        or validation.stage_schema_oid != ownership.schema_oid
-        or validation.relation_oids != ownership.relation_oids
+        or validation.relations != tuple((ownership.schema_name, name) for name in ownership.relation_names)
         or validation.tables != manifest.tables
         or validation.manifest_sha256 != hashlib.sha256(_canonical_json(manifest.as_dict())).hexdigest()
     ):
         raise LegacyMembershipSourceError("ACA archive scope or digest differs")
     return ownership, validation
-
-
-_CATALOG_SQL = """WITH privileges AS (WITH closure_scope AS (
- SELECT $2::oid AS schema_oid,$3::oid AS owner_oid,NULL::text[] AS relation_names,
- ARRAY(SELECT DISTINCT role.rolname::text FROM (
-   SELECT a.grantee FROM pg_namespace n CROSS JOIN LATERAL aclexplode(n.nspacl) a WHERE n.oid=$2::oid
-   UNION SELECT a.grantee FROM pg_class c CROSS JOIN LATERAL aclexplode(c.relacl) a WHERE c.relnamespace=$2::oid
-   UNION SELECT a.grantee FROM pg_class c JOIN pg_attribute att ON att.attrelid=c.oid
-     CROSS JOIN LATERAL aclexplode(att.attacl) a WHERE c.relnamespace=$2::oid
-   UNION SELECT a.grantee FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) a
-     WHERE d.defaclnamespace=$2::oid
- ) grants JOIN pg_roles role ON role.oid=grants.grantee WHERE role.oid<>$3::oid
- ORDER BY role.rolname::text LIMIT 65) || $4::text[] AS role_names
-) {privilege_sql}),inventory AS MATERIALIZED (
- SELECT * FROM pg_class WHERE relnamespace=$2::oid ORDER BY relname LIMIT 257)
-SELECT owner.*,n.oid::bigint AS schema_oid,n.nspowner=$3::oid AS owner_matches,
- (SELECT jsonb_object_agg(c.relname,c.oid::bigint) FROM inventory c
-   WHERE c.relnamespace=n.oid AND c.relkind='r')::text AS relation_oids,
- (SELECT coalesce(jsonb_object_agg(c.relname,c.oid::bigint),'{{}}'::jsonb) FROM inventory c
-   WHERE c.relnamespace=n.oid AND c.relkind='S')::text AS sequence_oids,
- NOT EXISTS(SELECT 1 FROM pg_class c WHERE c.relnamespace=n.oid AND (c.relowner<>$3::oid OR c.relpersistence<>'p' OR c.relkind NOT IN ('r','i','S')))
-   AND NOT EXISTS(SELECT 1 FROM pg_proc WHERE pronamespace=n.oid) AS relations_owned,
- privileges.closed FROM pg_namespace n JOIN pg_roles owner ON owner.oid=$3::oid CROSS JOIN privileges
- WHERE n.nspname=$1 AND NOT EXISTS(SELECT 1 FROM {namespace}.mrf_address_evidence WHERE false)"""
 
 
 async def _require_archive(connection, source_pin):
@@ -421,39 +397,17 @@ def _is_initial_batch(source):
 
 
 async def _require_native_archive(connection, prepared, validation, runtime_roles):
-    """Prove a full native archive without assigning any logical membership identity."""
+    """Read the validated named models; runtime_roles remains an opaque legacy argument."""
     ownership, validation = _validated_native_archive(prepared, validation)
-    if (
-        type(runtime_roles) is not tuple
-        or not 1 <= len(runtime_roles) <= 32
-        or any(type(role) is not str for role in runtime_roles)
-        or tuple(sorted(set(runtime_roles))) != runtime_roles
-    ):
-        raise LegacyMembershipSourceError("ACA runtime roles are invalid")
-    for role in runtime_roles:
-        _identifier(role)
-    catalog = await connection.fetchrow(
-        _CATALOG_SQL.format(namespace=_identifier(ownership.schema_name), privilege_sql=_NATIVE_WRITER_PRIVILEGES_SQL),
-        ownership.schema_name,
-        ownership.schema_oid,
-        validation.sealed_owner_oid,
-        list(runtime_roles),
-    )
-    if (
-        catalog is None
-        or not _protected_owner(catalog)
-        or not catalog["owner_matches"]
-        or catalog["schema_oid"] != ownership.schema_oid
-        or not catalog["relations_owned"]
-        or not catalog["closed"]
-        or json.loads(catalog["sequence_oids"]) != {name: oid for name, oid, _, _ in ownership.sequence_oids}
-        or json.loads(catalog["relation_oids"])
-        != (
-            dict(ownership.relation_oids)
-            | ({"mrf_canonical_address": ownership.auxiliary_oid} if ownership.auxiliary_oid is not None else {})
-        )
-    ):
-        raise LegacyMembershipSourceError("Pinned ACA archive is unavailable or writable")
+    schema = _identifier(ownership.schema_name)
+    relations = ",".join(f"{schema}.{_identifier(name)}" for name in ownership.relation_names)
+    statements = [f"LOCK TABLE {relations} IN ACCESS SHARE MODE"]
+    spec = reference_family_spec(ownership.importer_id, canonical=validation.profile_contract == TYPED_MRF_CONTRACT)
+    for model in spec.model_types:
+        columns = ",".join(_identifier(str(column.name)) for column in model.__table__.columns)
+        statements.append(f"SELECT {columns} FROM {schema}.{_identifier(model.__tablename__)} LIMIT 0")
+    # One simple-protocol round trip keeps the per-page statement count constant.
+    await connection.execute(";".join(statements))
 
 
 _ALIAS_PARTITION_SQL = """SELECT alias.source_system,alias.source_id,alias.alias_type,alias.alias_value,alias.scope_key,

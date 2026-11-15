@@ -53,7 +53,16 @@ def _gate(monkeypatch, actual):
     ):
         monkeypatch.setattr(receipt, name, AsyncMock(side_effect=[wanted, observed]))
     session = MagicMock()
-    session.execute = AsyncMock()
+    relation = MagicMock()
+    relation.mappings.return_value = relation
+    relation.one_or_none.return_value = {
+        "oid": 101,
+        "relkind": "r",
+        "relpersistence": "p",
+        "relrowsecurity": False,
+        "relforcerowsecurity": False,
+    }
+    session.execute = AsyncMock(return_value=relation)
     session.scalar = AsyncMock(side_effect=["pg_catalog", 201])
     return session, [{"table_name": "synthetic_stage", "relation_oid": 101}]
 
@@ -164,7 +173,7 @@ async def test_publisher_refuses_model_drift_before_sealing(monkeypatch):
         yield session
 
     monkeypatch.setattr(publication, "validate_entity_address_native_handoff", lambda value: value)
-    monkeypatch.setattr(publication.projection, "validate_projection_dependency_bindings", lambda *_: {})
+    monkeypatch.setattr(publication, "_named_dependencies", lambda *_: {})
     monkeypatch.setattr(
         publication, "_native", lambda: SimpleNamespace(db=SimpleNamespace(bind_existing_session=binding))
     )

@@ -14,7 +14,7 @@ from process.provider_directory_dataset_rehydrate_store import _load_pinned_reso
 from process.provider_directory_dataset_rehydrate_types import DatasetRehydrationError, ResourceContext
 from process.provider_directory_generic_source_policy import source_transaction
 from tests.test_provider_directory_dataset_rehydrate_prepare_db import _case as output_case
-from tests.test_provider_directory_dataset_rehydrate_prepare_db import fhir, preparation
+from tests.test_provider_directory_dataset_rehydrate_prepare_db import fhir, output_rows, preparation
 from tests.test_provider_directory_dataset_rehydrate_prepare_db import pytestmark as pytestmark
 
 
@@ -90,7 +90,7 @@ async def _cut_with_journal(case, prepared, *, fail=False):
             await cap.connection.execute(
                 "LOCK TABLE "
                 + ",".join(storage_relation(case.schema, name) for name in names)
-                + " IN ACCESS EXCLUSIVE MODE NOWAIT"
+                + " IN ACCESS SHARE MODE NOWAIT"
             )
             retained = await retention.retain_prepared_outputs(cap, prepared.receipts)
             context = ResourceContext(
@@ -115,14 +115,19 @@ async def test_native_final_journal_failure_rolls_back_actual_output_cut(monkeyp
         async with preparation.prepared_compatibility_outputs(
             fhir, case.pinned, case.operation, checkpoint_journal=case.journal
         ) as prepared:
+            incumbent_rows_by_target = {
+                receipt.incumbent.target: await output_rows(case, case.schema, receipt.incumbent.target)
+                for receipt in prepared.receipts
+            }
             with pytest.raises(RuntimeError, match="late final journal failure"):
                 await _cut_with_journal(case, prepared, fail=True)
             for receipt in prepared.receipts:
                 assert (
-                    await case.admin.scalar(
-                        "SELECT to_regclass(:name)::oid", name=f"{case.schema}.{receipt.incumbent.target}"
-                    )
-                    == receipt.incumbent.oid
+                    await output_rows(case, case.schema, receipt.incumbent.target)
+                    == incumbent_rows_by_target[receipt.incumbent.target]
+                )
+                assert (
+                    await case.admin.scalar(f'SELECT count(*) FROM "{case.schema}"."{receipt.successor.relation}"') == 5
                 )
             async with store.checkpoint_output_transaction(case.journal) as (_, snapshot):
                 assert snapshot.journal["active"] is not None
@@ -145,7 +150,7 @@ async def _restore_with_journal(case, prepared, retained):
             await cap.connection.execute(
                 "LOCK TABLE "
                 + ",".join(storage_relation(case.schema, name) for name in names)
-                + " IN ACCESS EXCLUSIVE MODE NOWAIT"
+                + " IN ACCESS SHARE MODE NOWAIT"
             )
             inverse = await retention.restore_retained_outputs(cap, retained)
             context = ResourceContext(
@@ -213,9 +218,10 @@ async def test_native_late_replacement_reaches_actual_retained_cut_and_refuses(m
                 old = storage_relation(case.schema, target_name)
                 await case.database.status(f"ALTER TABLE {old} RENAME TO late_incumbent")
                 await case.database.status(f'CREATE TABLE {old} (LIKE "{case.schema}".late_incumbent INCLUDING ALL)')
+                await case.database.status(f"ALTER TABLE {old} ADD COLUMN changed_layout integer")
                 await case.database.status(f'GRANT SELECT ON {old} TO "{case.reader}"')
-            substituted = await case.admin.scalar("SELECT to_regclass(:name)::oid", name=f"{case.schema}.{target_name}")
-            with pytest.raises(RuntimeError, match="native_receipt_changed|incumbent_changed"):
+            substituted = await output_rows(case, case.schema, target_name)
+            with pytest.raises(RuntimeError, match="provider_directory_output_snapshot_columns_changed"):
                 async with custody.output_snapshot_transaction(
                     fhir, operation=case.operation, targets=prepared.targets
                 ) as cap:
@@ -227,18 +233,12 @@ async def test_native_late_replacement_reaches_actual_retained_cut_and_refuses(m
                     await cap.connection.execute(
                         "LOCK TABLE "
                         + ",".join(storage_relation(case.schema, name) for name in names)
-                        + " IN ACCESS EXCLUSIVE MODE NOWAIT"
+                        + " IN ACCESS SHARE MODE NOWAIT"
                     )
                     await retention.retain_prepared_outputs(cap, prepared.receipts)
-            assert (
-                await case.admin.scalar("SELECT to_regclass(:name)::oid", name=f"{case.schema}.{target_name}")
-                == substituted
-            )
+            assert await output_rows(case, case.schema, target_name) == substituted
             for stage in prepared.stages:
-                assert (
-                    await case.admin.scalar("SELECT to_regclass(:name)::oid", name=f"{case.schema}.{stage.relation}")
-                    == stage.oid
-                )
+                assert await case.admin.scalar(f'SELECT count(*) FROM "{stage.schema}"."{stage.relation}"') == 5
 
 
 async def test_native_checkpoint_witness_cannot_cross_original_transaction(monkeypatch):

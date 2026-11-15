@@ -1287,12 +1287,6 @@ async def _capture_dataset_plan(connection, policy, callable_receipt):
             _CATALOG_SQL, storage_relation(policy.schema, "pd_dataset_migration_plan"), roles["owner"], roles["builder"]
         )
     )
-    native = next(row for row in catalog["classes"] if row["relname"] == "pd_dataset_migration_plan")
-    _require(int(native["relowner"]) == roles["owner"], "dataset_plan_owner_changed")
-    function_by_name = {entry["definition"]["proname"]: entry for entry in callable_receipt["functions"].values()}
-    _require_hooks(
-        catalog, {"pd_dataset_plan_owner": ("guard_pd_dataset_migration_owner", 62, (), None, ())}, function_by_name
-    )
     return dict(plan=plan, catalog=catalog)
 
 

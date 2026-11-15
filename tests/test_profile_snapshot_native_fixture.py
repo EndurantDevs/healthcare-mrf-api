@@ -113,12 +113,9 @@ def test_native_source_fixture_preserves_exact_entities_database_guard(name, all
 
 @pytest.mark.parametrize("reused", [False, True])
 @pytest.mark.parametrize("changed", [False, True])
-async def test_profile_observer_forwards_verified_read_origin_and_preserves_catalog_checks(
-    monkeypatch, reused, changed
-):
+async def test_profile_observer_forwards_catalog_reuse_and_preserves_catalog_checks(monkeypatch, reused, changed):
     from tests.provider_directory_geo_profile9_acceptance_support import ProfileAcceptance
 
-    origin = object() if reused else None
     result = object()
     delegate = AsyncMock(return_value=result)
     reads = SimpleNamespace(_attest=delegate)
@@ -132,12 +129,12 @@ async def test_profile_observer_forwards_verified_read_origin_and_preserves_cata
     observation._observe_reads(monkeypatch, reads, SimpleNamespace(decoded=json.loads))
     if changed:
         with pytest.raises(AssertionError):
-            await reads._attest(scope, state_by_field, reusable_origin=origin)
+            await reads._attest(scope, state_by_field, reuse_catalog=reused)
         assert observation.reads == []
     else:
-        assert await reads._attest(scope, state_by_field, reusable_origin=origin) is result
+        assert await reads._attest(scope, state_by_field, reuse_catalog=reused) is result
         assert observation.reads == [("profile_live",)]
-    delegate.assert_awaited_once_with(scope, state_by_field, reusable_origin=origin)
+    delegate.assert_awaited_once_with(scope, state_by_field, reuse_catalog=reused)
 
 
 @pytest.mark.parametrize("complete", [False, True])
@@ -164,8 +161,7 @@ async def test_detail_nppes_composition_preserves_completed_migrations_and_actua
     for name in (
         "_install_nppes_historical_storage",
         "_install_existing_npi_publication",
-        "_enroll_native_custody",
-        "_drop_nppes_component_roles",
+        "_provision_native_controls",
     ):
         monkeypatch.setattr(nppes, name, AsyncMock())
     monkeypatch.setattr(nppes, "existing_nppes_component", attest)
@@ -179,9 +175,7 @@ async def test_detail_nppes_composition_preserves_completed_migrations_and_actua
     assert nppes._install_existing_npi_publication.await_count == (0 if complete else 1)
     if not complete:
         nppes._install_existing_npi_publication.assert_awaited_once_with(component.admin_engine, "mrf")
-    assert nppes._enroll_native_custody.await_count == 1
-    assert nppes._enroll_native_custody.await_args.kwargs == {"native_inputs": True}
-    assert nppes._drop_nppes_component_roles.await_count == 1
+    nppes._provision_native_controls.assert_awaited_once_with(component, native_inputs=True)
 
 
 async def test_detail_nppes_composition_rejects_unknown_migration_profile_before_mutation():
@@ -218,14 +212,16 @@ async def test_detail_reader_fixture_does_not_add_publisher_to_closed_control_ac
 async def test_detail_incumbent_setup_uses_administration_without_rebinding_source(monkeypatch):
     from tests import provider_profile_detail_load_postgres_support as detail
 
-    session = SimpleNamespace(scalar=AsyncMock(return_value=True))
+    session = SimpleNamespace(scalar=AsyncMock(return_value=True), execute=AsyncMock())
 
     @asynccontextmanager
     async def transaction():
         yield session
 
     administrator = SimpleNamespace(transaction=transaction)
-    fixture = SimpleNamespace(engine=object(), database=object(), schema="mrf")
+    fixture = SimpleNamespace(
+        engine=SimpleNamespace(url=SimpleNamespace(username="fixture_admin")), database=object(), schema="mrf"
+    )
     source_database = fixture.database
     constructor = Mock()
 
@@ -248,7 +244,12 @@ async def test_detail_incumbent_setup_uses_administration_without_rebinding_sour
     detail._seed_enrichment.assert_awaited_once_with(session)
     detail._seed_projected_profile.assert_awaited_once_with(session, "mrf")
     assert detail._insert.await_args.args == (session, detail.models.ImportRun)
-    detail.address_generation.publish_local_entity_address_generation.assert_not_awaited()
+    detail.address_generation.publish_local_entity_address_generation.assert_awaited_once_with(
+        administrator, schema_name="mrf"
+    )
+    assert str(session.execute.await_args.args[0]) == (
+        'ALTER FUNCTION "mrf"."validate_npi_canonical_publication_receipt"() OWNER TO "fixture_admin"'
+    )
 
 
 async def test_detail_nppes_fixture_grants_only_clone_reads_and_metadata_append():
@@ -281,34 +282,69 @@ async def test_detail_nppes_fixture_grants_only_clone_reads_and_metadata_append(
     assert connection.execute.await_count == 13
 
 
-async def test_detail_receipt_validator_alignment_preserves_identity_body_and_explicit_grants():
+def _assert_detail_reader_grants(connection, schema, after_by_name, existing_names, policy):
+    statements = [str(call.args[0]) for call in connection.execute.await_args_list]
+    for qualified, available in after_by_name.items():
+        if available:
+            name = qualified.split(".")[1]
+            relation = f'"{schema}"."{name}"'
+            for role in (policy.owner_role, *policy.runtime_roles):
+                assert f'GRANT SELECT ON TABLE {relation} TO "{role}"' in statements
+            if qualified in existing_names:
+                assert not any(statement.startswith(f"ALTER TABLE {relation} ") for statement in statements)
+    assert not any('TO "synthetic_publisher"' in statement for statement in statements)
+    assert not any("ALTER FUNCTION" in statement or "session_user" in statement for statement in statements)
+
+
+async def test_detail_setup_preserves_complete_rows_and_reader_grants(monkeypatch):
     from tests import provider_profile_detail_load_postgres_support as detail
 
-    before_by_field = {
-        "oid": 42,
-        "prosrc": "BEGIN RETURN NULL; END",
-        "prosecdef": True,
-        "proconfig": ["search_path=pg_catalog"],
-        "owner": "synthetic_builder",
-        "administrator": "synthetic_administrator",
-        "explicit_grants": [[43, "EXECUTE", False]],
-    }
+    schema = "detail_fixture"
+    existing_names = {schema + ".provider_directory_source", schema + ".provider_directory_profile"}
+    before_by_name = {schema + "." + name: schema + "." + name in existing_names for name in detail.RELATIONS}
+    absent_names = {"npi_canonical_publication_receipt", "npi_canonical_publication_receipt_seal"}
+    after_by_name = {schema + "." + name: name not in absent_names for name in detail.RELATIONS}
+    inventory = AsyncMock()
+    monkeypatch.setattr(detail.snapshot, "_inventory_relation_names", inventory)
+    monkeypatch.setattr(detail, "_install_detail_migrations", AsyncMock())
+    reads = []
+    should_change_rows = False
 
-    def result(values):
-        return SimpleNamespace(mappings=lambda: SimpleNamespace(one=lambda: values))
+    async def execute(statement):
+        query = str(statement)
+        rows = []
+        if query.startswith("SELECT to_jsonb(existing_row)"):
+            reads.append(query)
+            if '"provider_directory_source"' in query:
+                rows = ['{"source_id":"synthetic-source","optional":null}'] * 2
+                if should_change_rows and len(reads) > len(existing_names):
+                    rows.pop()
+        return SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: rows))
 
     connection = SimpleNamespace(
-        execute=AsyncMock(
-            side_effect=[
-                result(before_by_field),
-                None,
-                result({**before_by_field, "owner": "synthetic_administrator"}),
-            ]
-        )
+        execute=AsyncMock(side_effect=execute), scalar=AsyncMock(return_value=True), run_sync=AsyncMock()
     )
-    await detail._align_npi_receipt_validator_owner(
-        connection, SimpleNamespace(schema="mrf", control_runtime_roles=("synthetic_builder",))
+
+    @asynccontextmanager
+    async def begin():
+        yield connection
+
+    policy = SimpleNamespace(
+        schema=schema,
+        owner_role="synthetic_owner",
+        publisher_role="synthetic_publisher",
+        runtime_roles=("synthetic_reader", "synthetic_builder"),
     )
-    assert str(connection.execute.await_args_list[1].args[0]) == (
-        'ALTER FUNCTION "mrf"."validate_npi_canonical_publication_receipt"() OWNER TO CURRENT_USER'
-    )
+    component = SimpleNamespace(policy=policy, admin_engine=SimpleNamespace(begin=begin))
+    inventory.side_effect = [before_by_name, after_by_name]
+    await detail._install_detail_tables(component, monkeypatch)
+    assert len(reads) == 2 * len(existing_names)
+    assert inventory.await_count == 2
+    assert all(call.args == (connection, schema, detail.RELATIONS) for call in inventory.await_args_list)
+    _assert_detail_reader_grants(connection, schema, after_by_name, existing_names, policy)
+
+    should_change_rows = True
+    reads.clear()
+    inventory.side_effect = [before_by_name, after_by_name]
+    with pytest.raises(AssertionError):
+        await detail._install_detail_tables(component, monkeypatch)

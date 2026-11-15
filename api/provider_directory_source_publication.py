@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 from api import provider_directory_source_worker as source
+from process.provider_directory_source_storage_binding import named_source_document
 
 ROLE = "source-publication"
 ROUTES_ENV = "HLTHPRT_PROVIDER_DIRECTORY_SOURCE_PUBLICATION_ROUTES_JSON"
@@ -61,7 +62,7 @@ async def read_completed_run(connection, run_id):
 
 
 def _completed_proof(run):
-    """The native task and its canonical handoff, never the request, grant scope."""
+    """The completed native run and logical handoff, never the request, grant scope."""
     if (
         run.get("importer") != source._IMPORTER
         or run.get("status") != "succeeded"
@@ -100,14 +101,37 @@ def _completed_proof(run):
     if type(handoffs) is not dict or len(handoffs) != 1:
         raise ValueError("fhir_source_publication_handoff_required")
     dataset_id, receipt = next(iter(handoffs.items()))
-    if type(receipt) is not dict or set(receipt) != {"document", "sha256"}:
+    document, token, producer = _handoff_receipt(receipt)
+    _require_handoff_scope(document, dataset_id, params, run["run_id"], producer=producer)
+    return attempt, token, job_identity
+
+
+def _handoff_receipt(receipt):
+    """Read current receipts and those stored before the upgrade, with the producer in either place."""
+    raw_document = receipt.get("document") if type(receipt) is dict else None
+    if type(raw_document) is not dict or type(raw_document.get("storage")) is not dict:
         raise ValueError("fhir_source_publication_handoff_invalid")
-    document = receipt["document"]
-    encoded = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
-    if len(encoded) > 262144 or hashlib.sha256(encoded).hexdigest() != receipt["sha256"]:
+    # Receipts stored before the upgrade carry the producer inside their raw storage document.
+    is_previous = "producer" in raw_document["storage"]
+    if set(receipt) != ({"document", "sha256"} if is_previous else {"document", "sha256", "producer"}):
+        raise ValueError("fhir_source_publication_handoff_invalid")
+    document = named_source_document(raw_document)
+    encoded_documents = [
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+        for value in (raw_document, document)
+    ]
+    token = receipt["sha256"]
+    if (
+        len(encoded_documents[0]) > 262144
+        or type(token) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", token) is None
+        or (
+            token not in {hashlib.sha256(encoded).hexdigest() for encoded in encoded_documents}
+            and not (is_previous and document.get("contract") == "generic-source-detached-v1")
+        )
+    ):
         raise ValueError("fhir_source_publication_handoff_changed")
-    _require_handoff_scope(document, dataset_id, params, run["run_id"])
-    return attempt, receipt["sha256"], job_identity
+    return document, token, raw_document["storage"]["producer"] if is_previous else receipt["producer"]
 
 
 def original_job_identity(run):
@@ -130,14 +154,13 @@ def original_job_identity(run):
     return canonical_by_field
 
 
-def _require_handoff_scope(document, dataset_id, params, run_id):
+def _require_handoff_scope(document, dataset_id, params, run_id, *, producer):
     from api.control_imports import ImportRun
     from process.provider_directory_generic_source_storage import validate_handoff_document
     from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding
 
     storage = document["storage"]
-    binding = FHIRSourceStorageBinding(**{name: value for name, value in storage.items() if name != "producer"})
-    producer = storage["producer"]
+    binding = FHIRSourceStorageBinding(**storage)
     validate_handoff_document(document, storage)
     identity = document["identity"]
     if (

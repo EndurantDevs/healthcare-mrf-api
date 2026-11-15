@@ -17,7 +17,6 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from api import provider_profile_snapshot as snapshot
-from api.network_read_execution import execute_network_read
 from db.connection import Database
 from process.entity_address_cutover_contract import _ServingRelationLockTimeout
 from process.network_read_identity import NetworkReadIdentityError
@@ -510,17 +509,20 @@ async def _read_npi_snapshot(fixture, *, entered=None, release=None):
     async with snapshot.provider_profile_read_snapshot(
         fixture.database, fixture.schema, include_detail=True
     ) as session:
-        oids = tuple(snapshot._SNAPSHOT.get()[f"{fixture.schema}.{name}"] for name in CANONICAL_TABLES)
+        available_relations = tuple(
+            (f"{fixture.schema}.{name}", snapshot.snapshot_relation_available(f"{fixture.schema}.{name}"))
+            for name in CANONICAL_TABLES
+        )
         counts = tuple(
             [
-                (await execute_network_read(session, text(f'SELECT count(*) FROM "{fixture.schema}".{name}'))).scalar()
+                (await session.execute(text(f'SELECT count(*) FROM "{fixture.schema}".{name}'))).scalar()
                 for name in CANONICAL_TABLES
             ]
         )
         if entered is not None:
             entered.set()
             await release.wait()
-        return oids, counts
+        return available_relations, counts
 
 
 async def _publish_reader_rotation(connection, schema, setup):
@@ -529,6 +531,24 @@ async def _publish_reader_rotation(connection, schema, setup):
         await _lock_attempt(connection, schema)
         await rotate_canonical_stage_tables(connection, schema, setup.stage_table_by_live)
         return await _finalize_publication(connection, schema, setup.chain_ref, STAGE_ROW_COUNTS)
+
+
+async def _continuous_snapshot_reads(fixture, entered, finished, observed_states):
+    """Observe complete generations while allowing only the existing bounded lock refusal."""
+    after_count = refused_count = 0
+    while after_count < 3:
+        is_after_publication = finished.is_set()
+        try:
+            observed = await _read_npi_snapshot(fixture)
+        except ServiceUnavailable as error:
+            if not isinstance(error.__cause__, NetworkReadIdentityError):
+                raise
+            refused_count += 1
+            assert refused_count <= 3
+            continue
+        observed_states.append(observed)
+        after_count += is_after_publication
+        entered.set()
 
 
 async def test_npi_rotation_completes_with_continuous_snapshot_readers(tmp_path, monkeypatch):
@@ -545,22 +565,6 @@ async def test_npi_rotation_completes_with_continuous_snapshot_readers(tmp_path,
         observed_states = []
         tasks = []
 
-        async def read():
-            after_count = refused_count = 0
-            while after_count < 3:
-                is_after_publication = finished.is_set()
-                try:
-                    observed = await _read_npi_snapshot(fixture)
-                except ServiceUnavailable as error:
-                    if not isinstance(error.__cause__, NetworkReadIdentityError):
-                        raise
-                    refused_count += 1
-                    assert refused_count <= 3
-                    continue
-                observed_states.append(observed)
-                after_count += is_after_publication
-                entered.set()
-
         try:
             reader_role = fixture.database._reader_database._reader_login[0]
             assert not await connection.fetchval(
@@ -569,13 +573,21 @@ async def test_npi_rotation_completes_with_continuous_snapshot_readers(tmp_path,
                 qualified(schema, "cms_native_input_revision"),
             )
             setup = await _prepare_rotation(connection, schema, tmp_path)
+            available_relations = tuple((f"{schema}.{name}", True) for name in CANONICAL_TABLES)
+            old_reader_state, new_reader_state = (
+                (available_relations, setup.old_state[1]),
+                (available_relations, STAGE_ROW_COUNTS),
+            )
             await grant_profile_reader(fixture.database, schema, setup.stage_table_by_live.values())
-            tasks = [asyncio.create_task(read()) for _ in range(3)]
+            tasks = [
+                asyncio.create_task(_continuous_snapshot_reads(fixture, entered, finished, observed_states))
+                for _ in range(3)
+            ]
             await entered.wait()
             receipt = await _publish_reader_rotation(connection, schema, setup)
             finished.set()
             await asyncio.wait_for(asyncio.gather(*tasks), 3)
-            assert set(observed_states) == {setup.old_state, (setup.stage_oids, STAGE_ROW_COUNTS)}
+            assert set(observed_states) == {old_reader_state, new_reader_state}
             await _assert_committed_rotation(
                 connection,
                 schema,
@@ -605,12 +617,17 @@ async def test_npi_rotation_preserves_late_readers(tmp_path, monkeypatch):
         reader = publisher = None
         try:
             setup = await _prepare_rotation(connection, schema, tmp_path)
+            available_relations = tuple((f"{schema}.{name}", True) for name in CANONICAL_TABLES)
+            old_reader_state, new_reader_state = (
+                (available_relations, setup.old_state[1]),
+                (available_relations, STAGE_ROW_COUNTS),
+            )
             await grant_profile_reader(fixture.database, schema, setup.stage_table_by_live.values())
             reader = asyncio.create_task(_read_npi_snapshot(fixture, entered=entered, release=release))
             await _wait_for_reader(reader, entered)
             publisher = asyncio.create_task(_publish_reader_rotation(connection, schema, setup))
             pending = await pending_publisher_locks(fixture, publisher)
-            assert await _read_npi_snapshot(fixture) == setup.old_state and pending
+            assert await _read_npi_snapshot(fixture) == old_reader_state and pending
             with pytest.raises(_ServingRelationLockTimeout):
                 await publisher
             await _assert_rolled_back_rotation(
@@ -621,7 +638,7 @@ async def test_npi_rotation_preserves_late_readers(tmp_path, monkeypatch):
                 setup.stage_oids,
             )
             release.set()
-            assert await reader == setup.old_state
+            assert await reader == old_reader_state
             receipt = await _publish_reader_rotation(connection, schema, setup)
             await _assert_committed_rotation(
                 connection,
@@ -631,7 +648,7 @@ async def test_npi_rotation_preserves_late_readers(tmp_path, monkeypatch):
                 tuple(setup.stage_table_by_live.values()),
                 receipt,
             )
-            assert await _read_npi_snapshot(fixture) == (setup.stage_oids, STAGE_ROW_COUNTS)
+            assert await _read_npi_snapshot(fixture) == new_reader_state
         finally:
             release.set()
             await _drain_task(reader)

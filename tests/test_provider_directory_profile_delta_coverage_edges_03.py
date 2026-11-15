@@ -151,14 +151,12 @@ async def test_compact_insert_projection_limit_edge(monkeypatch):
             }
         ),
     )
-    projection = (
-        await importer._project_provider_directory_profile_compact_batch(
-            build,
-            batch,
-            profile_count_sql=count_sql,
-            profile_sql_args_by_name={},
-            profile_params_by_name={},
-        )
+    projection = await importer._project_provider_directory_profile_compact_batch(
+        build,
+        batch,
+        profile_count_sql=count_sql,
+        profile_sql_args_by_name={},
+        profile_params_by_name={},
     )
     assert projection.projected_rows == 2
 
@@ -183,10 +181,7 @@ async def test_compact_insert_projection_limit_edge(monkeypatch):
 async def test_capacity_relation_size_edges(monkeypatch):
     """Relation sizing handles empty, missing, and invalid observations."""
 
-    assert (
-        await importer._provider_directory_profile_capacity_relation_bytes(())
-        == 0
-    )
+    assert await importer._provider_directory_profile_capacity_relation_bytes(()) == 0
     for relation_size_by_field, expected_error in (
         (None, "relation_size_missing"),
         (
@@ -207,9 +202,7 @@ async def test_capacity_relation_size_edges(monkeypatch):
             (RuntimeError, importer.ProviderDirectoryArtifactBuildStale),
             match=expected_error,
         ):
-            await importer._provider_directory_profile_capacity_relation_bytes(
-                ('"mrf"."stage"',)
-            )
+            await importer._provider_directory_profile_capacity_relation_bytes(('"mrf"."stage"',))
 
 
 @pytest.mark.asyncio
@@ -283,6 +276,7 @@ async def test_capacity_scratch_limit_edges(monkeypatch):
             "unknown",
         )
 
+
 @pytest.mark.parametrize(
     ("control", "relation", "metadata"),
     (
@@ -304,17 +298,14 @@ def test_wal_reservation_inputs_reject_empty_or_negative(
             metadata,
         )
 
+
 def test_artifact_bundle_ordering_edges():
     """Artifact bundles require one schema and unique target relations."""
 
     stage_a, stage_b = _prepared_artifact_stages()
-    assert importer._ordered_provider_directory_artifact_bundle(
-        (stage_b, stage_a)
-    ) == (stage_a, stage_b)
+    assert importer._ordered_provider_directory_artifact_bundle((stage_b, stage_a)) == (stage_a, stage_b)
     with pytest.raises(ValueError, match="schema_mismatch"):
-        importer._ordered_provider_directory_artifact_bundle(
-            (stage_a, dataclasses.replace(stage_b, schema="other"))
-        )
+        importer._ordered_provider_directory_artifact_bundle((stage_a, dataclasses.replace(stage_b, schema="other")))
     with pytest.raises(ValueError, match="target_duplicate"):
         importer._ordered_provider_directory_artifact_bundle(
             (
@@ -364,6 +355,7 @@ async def test_profile_stage_finalization_edges(monkeypatch):
     promote.assert_awaited_once_with((), profile_delta=delta)
     refresh.assert_awaited_once_with(metrics_by_name, delta)
 
+
 @pytest.mark.asyncio
 async def test_profile_artifact_presence_edges(monkeypatch):
     table_present = AsyncMock(side_effect=[False, False])
@@ -383,6 +375,7 @@ async def test_profile_artifact_presence_edges(monkeypatch):
     with pytest.raises(RuntimeError, match="pair_empty_incomplete"):
         await importer._has_provider_directory_profile_artifacts("mrf")
 
+
 @pytest.mark.asyncio
 async def test_stale_build_cleanup_marker_edges(monkeypatch):
     @contextlib.asynccontextmanager
@@ -393,17 +386,11 @@ async def test_stale_build_cleanup_marker_edges(monkeypatch):
     stale_build_id = "pdpb_" + "d" * 32
     checkpoint_by_field = {
         "build_id": stale_build_id,
-        "evidence_stage": (
-            profile.profile_evidence_stage_table_name(stale_build_id)
-        ),
+        "evidence_stage": (profile.profile_evidence_stage_table_name(stale_build_id)),
         "profile_stage": profile.profile_stage_table_name(stale_build_id),
-        "affected_npi_stage": importer._bounded_identifier(
-            f"provider_directory_profile_affected_{stale_build_id}"
-        ),
+        "affected_npi_stage": importer._bounded_identifier(f"provider_directory_profile_affected_{stale_build_id}"),
         "materialization_mode": "source_delta",
-        "last_error": (
-            "[provider_directory_failed_profile_cleanup_v1 cleaned]"
-        ),
+        "last_error": ("[provider_directory_failed_profile_cleanup_v1 cleaned]"),
     }
     monkeypatch.setattr(importer.db, "transaction", transaction)
     monkeypatch.setattr(
@@ -438,9 +425,7 @@ def _cleanup_completion_claim(checkpoint):
     body["checkpoint"]["preimage_sha256"] = cleanup.digest(
         cleanup.json_values(checkpoint), cleanup.CONTRACT + ".checkpoint"
     )
-    body["checkpoint"]["original_error_sha256"] = hashlib.sha256(
-        checkpoint["last_error"].encode()
-    ).hexdigest()
+    body["checkpoint"]["original_error_sha256"] = hashlib.sha256(checkpoint["last_error"].encode()).hexdigest()
     envelope = sign(body, key)
     claim_by_field = {
         "operation_id": body["operation_id"],
@@ -466,9 +451,7 @@ def _completed_cleanup_checkpoint():
         "build_id": build_id,
         "evidence_stage": profile.profile_evidence_stage_table_name(build_id),
         "profile_stage": profile.profile_stage_table_name(build_id),
-        "affected_npi_stage": importer._bounded_identifier(
-            f"provider_directory_profile_affected_{build_id}"
-        ),
+        "affected_npi_stage": importer._bounded_identifier(f"provider_directory_profile_affected_{build_id}"),
         "materialization_mode": "source_delta",
         "last_error": "projection failed",
         "updated_at": NOW,
@@ -499,34 +482,24 @@ def _completed_cleanup_checkpoint():
 async def test_stale_build_authenticated_cleanup_completion(monkeypatch):
     """Authenticate retained completion before accepting absent stages or refusing drift."""
     checkpoint, claim, trust, database = _completed_cleanup_checkpoint()
-    database_binding_by_field = {
-        field: database[field] for field in (
-            "database_system_identifier", "database_oid", "database_name"
-        )
-    }
+    assert database == {"schema": "mrf"}
     monkeypatch.setattr(importer.db, "all", AsyncMock(return_value=[checkpoint]))
-    monkeypatch.setattr(
-        importer.db, "first", AsyncMock(side_effect=[
-            SimpleNamespace(_mapping=claim), SimpleNamespace(_mapping=database_binding_by_field)
-        ] * 3)
-    )
+    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=SimpleNamespace(_mapping=claim)))
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=False))
     monkeypatch.setattr(cleanup, "configured_cleanup_trust", lambda: trust)
     monkeypatch.setattr(cleanup, "_now_utc", lambda: NOW + datetime.timedelta(hours=1))
     monkeypatch.setattr(importer, "_provider_directory_profile_capacity_admission", lambda: SimpleNamespace())
     relation_identity = AsyncMock(return_value=None)
     monkeypatch.setattr(importer, "_provider_directory_profile_stage_relation_identity", relation_identity)
     current_build_id = "pdpb_" + "c" * 32
-    assert await importer._reap_stale_provider_directory_profile_builds(
-        "mrf", current_build_id=current_build_id
-    ) == 0
+    assert await importer._reap_stale_provider_directory_profile_builds("mrf", current_build_id=current_build_id) == 0
     assert {invocation.args for invocation in relation_identity.await_args_list} == {
-        ("mrf", checkpoint[field])
-        for field in ("evidence_stage", "profile_stage", "affected_npi_stage")
+        ("mrf", checkpoint[field]) for field in ("evidence_stage", "profile_stage", "affected_npi_stage")
     }
 
     relation_identity.reset_mock()
-    # Keep completed-history stages absent, then test the reaper's final presence check.
-    relation_identity.side_effect = [None] * 4 + [(22, "r", "p"), None]
+    # A named stage reappearing after verified cleanup still refuses stale-build reuse.
+    relation_identity.side_effect = [None, (22, "r", "p"), None]
     with pytest.raises(RuntimeError, match="disposed_checkpoint_stage_present"):
         await importer._reap_stale_provider_directory_profile_builds("mrf", current_build_id=current_build_id)
 
@@ -535,6 +508,7 @@ async def test_stale_build_authenticated_cleanup_completion(monkeypatch):
     with pytest.raises(RuntimeError, match="completion_preimage_changed"):
         await importer._reap_stale_provider_directory_profile_builds("mrf", current_build_id=current_build_id)
     relation_identity.assert_not_awaited()
+
 
 @pytest.mark.asyncio
 async def test_bundle_profile_delta_edges(monkeypatch):

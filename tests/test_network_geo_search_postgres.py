@@ -24,9 +24,9 @@ async def test_search_keyset_reuses_direct_range_shape_after_first_batch():
     candidate_id = str(UUID(int=1))
     namespace = "network_candidate_" + UUID(candidate_id).hex
     layout = CompactNetworkLayout(
-        CompactAddressRelation(namespace, "network_slice_ref", 1),
-        CompactAddressRelation("address_source", "entity_address_unified", 2),
-        (CompactEdgeArtifact(candidate_id, namespace, 3),),
+        CompactAddressRelation(namespace, "network_slice_ref"),
+        CompactAddressRelation("address_source", "entity_address_unified"),
+        (CompactEdgeArtifact(candidate_id, namespace),),
     )
     connection = SimpleNamespace(
         fetchrow=AsyncMock(
@@ -105,20 +105,13 @@ async def search_db(compact_db):
 
 
 def _candidate(target, layout, descriptor):
-    indexes = descriptor["indexes"]
+    """Shape the published candidate row: its scope and the named search and edge inputs."""
     return {
         **{field: getattr(target, field) for field in search._SCOPE_FIELDS},
         "validation_json": {
-            "candidate_readiness": {"ref_map_oid": layout.ref_map.table_oid},
             "serving_readiness": {
                 "geo_search": descriptor,
-                "address_artifact": {"table": {"oid": layout.base.table_oid}},
                 "edge_artifacts": [asdict(artifact) for artifact in layout.artifacts],
-            },
-            "writer_closure": {
-                "relation_oids": {search.TABLE: descriptor["table_oid"]},
-                "index_oids": {index["name"]: index["index_oid"] for index in indexes},
-                "index_table_oids": {index["name"]: index["table_oid"] for index in indexes},
             },
         },
     }
@@ -144,7 +137,7 @@ async def test_bounded_search_matches_full_compact_rows_and_custom_precedence(se
     assert len(actual[0]) == len(search.SEARCH_COLUMNS) + 2
     candidate = _candidate(db.search_target, db.second_layout, descriptor)
     assert search.geo_search_receipt(candidate) == descriptor
-    assert search.geo_search_relation(candidate).table_oid == descriptor["table_oid"]
+    assert search.geo_search_relation(candidate) == CompactAddressRelation(db.search_target.schema_name, search.TABLE)
     assert await db.connection.fetchval("SHOW work_mem") == "64MB"
     assert await db.connection.fetchval("SHOW temp_file_limit") == "256MB"
 
@@ -154,15 +147,15 @@ async def test_search_rejects_changed_index_identity_and_receipt_scope(search_db
     db = search_db
     descriptor = await search.prepare_network_geo_search(db.connection, db.search_target, db.second_layout)
     candidate = _candidate(db.search_target, db.second_layout, descriptor)
-    for field in ("table_oid", "row_count", "sha256"):
+    for change in ("schema_name", "artifacts"):
         altered = copy.deepcopy(candidate)
-        altered["validation_json"]["serving_readiness"]["geo_search"][field] = "invalid"
+        if change == "schema_name":
+            altered["schema_name"] = "network_candidate_" + "0" * 32
+        else:
+            altered["validation_json"]["serving_readiness"]["edge_artifacts"] = []
         with pytest.raises(search.NetworkGeoSearchError):
-            search.geo_search_receipt(altered)
-    altered = copy.deepcopy(candidate)
-    altered["validation_json"]["writer_closure"]["index_table_oids"][search.TABLE + "_gn"] += 1
-    with pytest.raises(search.NetworkGeoSearchError):
-        search.geo_search_relation(altered)
+            search.geo_search_relation(altered)
+    relation = search._qualified(CompactAddressRelation(db.search_target.schema_name, search.TABLE))
     await db.connection.execute(f'DROP INDEX "{db.search_target.schema_name}".{search.TABLE}_gn')
     with pytest.raises(search.NetworkGeoSearchError):
         await search.verify_geo_search_indexes(db.connection, descriptor)
@@ -171,11 +164,17 @@ async def test_search_rejects_changed_index_identity_and_receipt_scope(search_db
     )
     descriptor["indexes"] = [
         {field: index[field] for field in ("name", *search._INDEX_FIELDS)}
-        for index in await search._index_records(db.connection, descriptor["table_oid"])
+        for index in await search._index_records(db.connection, relation)
     ]
-    descriptor["sha256"] = search._digest({key: value for key, value in descriptor.items() if key != "sha256"})
+    descriptor["sha256"] = search._digest({key: entry for key, entry in descriptor.items() if key != "sha256"})
     with pytest.raises(search.NetworkGeoSearchError):
         await search.verify_geo_search_indexes(db.connection, descriptor)
+    # Receipt content changes come last: a changed digest is refused only while the receipt digest is verified.
+    for field in ("table_name", "row_count", "sha256"):
+        altered = copy.deepcopy(candidate)
+        altered["validation_json"]["serving_readiness"]["geo_search"][field] = "invalid"
+        with pytest.raises(search.NetworkGeoSearchError):
+            search.geo_search_receipt(altered)
 
 
 @pytest.mark.asyncio
@@ -198,10 +197,7 @@ async def test_search_parity_failure_rolls_back_only_its_new_projection(search_d
         await db.connection.fetchval("SELECT to_regclass($1)", db.search_target.schema_name + "." + search.TABLE)
         is None
     )
-    assert (
-        await db.connection.fetchval("SELECT to_regclass($1)::oid", search._qualified(db.second_layout.base))
-        == db.second_layout.base.table_oid
-    )
+    assert await db.connection.fetchval("SELECT to_regclass($1)", search._qualified(db.second_layout.base)) is not None
 
 
 @pytest.mark.asyncio

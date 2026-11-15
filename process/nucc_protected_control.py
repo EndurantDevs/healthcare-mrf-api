@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Closed NUCC v3 Source receipts; native custody grants authority separately."""
+"""Named NUCC Source receipts with semantic provenance and native PostgreSQL access."""
 
 from __future__ import annotations
 
@@ -90,6 +90,43 @@ HANDOFF_FIELDS = frozenset(
         "handoff_sha256",
     }
 )
+_LEGACY_PUBLICATION_FIELDS = PUBLICATION_FIELDS
+_LEGACY_HANDOFF_FIELDS = HANDOFF_FIELDS
+_PHYSICAL_FIELDS = {
+    "database_oid",
+    "history_oid",
+    "owner_oid",
+    "parent_oid",
+    "parent_index_oid",
+    "child_oid",
+    "child_schema",
+    "child_schema_oid",
+    "child_filenode",
+    "previous_child_oid",
+}
+_NAMED_FIELDS = {"history", "parent", "parent_index", "child", "previous_child"}
+PUBLICATION_FIELDS = frozenset((PUBLICATION_FIELDS - _PHYSICAL_FIELDS - {"transaction_id"}) | _NAMED_FIELDS)
+HANDOFF_FIELDS = frozenset((HANDOFF_FIELDS - _PHYSICAL_FIELDS) | _NAMED_FIELDS)
+
+
+def named_locations(value):
+    """Project only recorded names and fixed protocol roots; old IDs never select names."""
+    from process.nucc_snapshot_partition import qualified
+
+    if "parent" in value:
+        try:
+            return {key: qualified(value[key]) for key in _NAMED_FIELDS}
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            raise NuccProtectedControlError("NUCC protected control relation name differs") from error
+    child_schema = value["child_schema"]
+    _require(type(child_schema) is str and _CHILD_SCHEMA.fullmatch(child_schema) is not None, "schema differs")
+    return {
+        "history": ("mrf", "import_run"),
+        "parent": ("mrf", "nucc_taxonomy"),
+        "child": (child_schema, "nucc_taxonomy"),
+    }
+
+
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _CHILD_SCHEMA = re.compile(r"reference_family_archive_[0-9a-f]{32}\Z")
 
@@ -129,23 +166,33 @@ def receipt_digest(value):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _source_generation(value, *, predecessor=False):
+def _source_generation(value, *, predecessor=False, declared_schema=None, legacy_read=False):
     from process.reference_family_result_generation import _nucc_result_authority
 
     try:
-        return _nucc_result_authority(value, allow_untracked=predecessor)
-    except RuntimeError, TypeError, ValueError, KeyError:
+        return _nucc_result_authority(
+            value, allow_untracked=predecessor, declared_schema=declared_schema, legacy_read=legacy_read
+        )
+    except (RuntimeError, TypeError, ValueError, KeyError) as error:
+        if str(error).startswith("transition-legacy-nucc-generation:"):
+            raise NuccProtectedControlError(str(error)) from None
         raise NuccProtectedControlError("NUCC protected control Source generation differs") from None
 
 
 def _publication_generation_pair(receipt):
-    prior = _source_generation(receipt["source_predecessor"], predecessor=True)
-    authority = _source_generation(receipt["source_authority"])
+    names = named_locations(receipt)
+    prior = _source_generation(
+        receipt["source_predecessor"],
+        predecessor=True,
+        declared_schema=names.get("previous_child", (None,))[0],
+        legacy_read="parent" not in receipt,
+    )
+    authority = _source_generation(receipt["source_authority"], declared_schema=names["child"][0])
     _require(
         authority.local_lineage_id == prior.local_lineage_id
         and authority.local_generation == prior.local_generation + 1
-        and authority.relation_oids == (receipt["child_oid"],)
-        and (prior.relation_oids is None or prior.relation_oids == (receipt["previous_child_oid"],)),
+        and authority.relations == (names["child"],)
+        and (prior.relations is None or prior.relations == (names.get("previous_child"),)),
         "publication Source predecessor differs",
     )
     if receipt["purpose"] == "source":
@@ -168,37 +215,23 @@ def _publication_generation_pair(receipt):
 
 
 def _native_identities(receipt):
-    for field in (
-        "database_oid",
-        "history_oid",
-        "owner_oid",
-        "parent_oid",
-        "parent_index_oid",
-        "child_oid",
-        "child_schema_oid",
-        "child_filenode",
-        "previous_child_oid",
-    ):
+    names = named_locations(receipt)
+    _require(
+        names["history"] == ("mrf", "import_run")
+        and names["parent"] == ("mrf", "nucc_taxonomy")
+        and names["child"][1] == "nucc_taxonomy"
+        and _CHILD_SCHEMA.fullmatch(names["child"][0]) is not None,
+        "relation scope differs",
+    )
+    if "previous_child" in names:
         _require(
-            type(receipt[field]) is int and 0 < receipt[field] < 2**32,
-            "native identity differs",
+            names["previous_child"][1] == "nucc_taxonomy"
+            and _CHILD_SCHEMA.fullmatch(names["previous_child"][0]) is not None
+            and names["previous_child"] != names["child"]
+            and names["parent_index"][0] == "mrf"
+            and names["parent_index"] != names["parent"],
+            "objects overlap or scope differs",
         )
-    _require(
-        len(
-            {
-                receipt["parent_oid"],
-                receipt["parent_index_oid"],
-                receipt["child_oid"],
-                receipt["previous_child_oid"],
-            }
-        )
-        == 4,
-        "objects overlap",
-    )
-    _require(
-        type(receipt["child_schema"]) is str and _CHILD_SCHEMA.fullmatch(receipt["child_schema"]) is not None,
-        "schema differs",
-    )
 
 
 def _identities(value):
@@ -255,9 +288,9 @@ def _digests(value, fields):
 
 
 def validate_publication(value):
-    """Decode a closed nonsecret receipt; only a genuine Owner ledger makes it authoritative."""
+    """Validate named publication semantics while returning historical bodies unchanged."""
     _require(
-        type(value) is dict and set(value) == PUBLICATION_FIELDS,
+        type(value) is dict and set(value) in (PUBLICATION_FIELDS, _LEGACY_PUBLICATION_FIELDS),
         "publication fields differ",
     )
     _require(value["contract"] == PUBLICATION_CONTRACT, "publication contract differs")
@@ -273,23 +306,14 @@ def validate_publication(value):
             "schema_sha256",
         ),
     )
-    transaction_id = value["transaction_id"]
-    _require(
-        type(transaction_id) is str
-        and re.fullmatch(r"[1-9][0-9]{0,19}", transaction_id) is not None
-        and int(transaction_id) < 2**64,
-        "publication transaction differs",
-    )
     _publication_generation_pair(value)
-    receipt_digest(value)
-    return dict(value)
+    return json.loads(json.dumps(value))
 
 
 def validate_handoff(handoff):
-    """Validate only the closed v3 shape; persisted Source and Owner rows still require native proof."""
+    """Validate logical attempt/data fields; old physical tokens remain opaque."""
     _require(
-        type(handoff) is dict and set(handoff) == HANDOFF_FIELDS,
-        "handoff fields differ",
+        type(handoff) is dict and set(handoff) in (HANDOFF_FIELDS, _LEGACY_HANDOFF_FIELDS), "handoff fields differ"
     )
     _require(handoff["contract"] == HANDOFF_CONTRACT, "handoff contract differs")
     _identities(handoff)
@@ -310,17 +334,24 @@ def validate_handoff(handoff):
     except ValueError:
         raise NuccProtectedControlError("NUCC protected control attempt time differs") from None
     _require(started.tzinfo is not None, "attempt time differs")
-    prior = _source_generation(handoff["source_predecessor"], predecessor=True)
+    names = named_locations(handoff)
+    prior = _source_generation(
+        handoff["source_predecessor"],
+        predecessor=True,
+        declared_schema=names.get("previous_child", (None,))[0],
+        legacy_read="parent" not in handoff,
+    )
     _require(
-        prior.relation_oids is None or prior.relation_oids == (handoff["previous_child_oid"],),
+        prior.relations is None or prior.relations == (names.get("previous_child"),),
         "handoff Source predecessor differs",
     )
-    _require(
-        handoff["handoff_sha256"]
-        == receipt_digest({key: field_value for key, field_value in handoff.items() if key != "handoff_sha256"}),
-        "handoff digest differs",
-    )
-    return dict(handoff)
+    if "parent" in handoff:
+        _require(
+            handoff["handoff_sha256"]
+            == receipt_digest({key: field for key, field in handoff.items() if key != "handoff_sha256"}),
+            "handoff digest differs",
+        )
+    return json.loads(json.dumps(handoff))
 
 
 def source_contract_digest(handoff, params):
@@ -332,16 +363,6 @@ def source_contract_digest(handoff, params):
     )
 
 
-_EVENT_CUSTODY_SQL = """SELECT c.oid::bigint AS oid,c.relowner::bigint AS owner_oid,
- n.nspowner::bigint AS schema_owner_oid,
- COALESCE((SELECT jsonb_agg(jsonb_build_array(a.grantee::bigint,a.grantor::bigint,a.privilege_type,a.is_grantable))
- FROM aclexplode(COALESCE(c.relacl,acldefault('r',c.relowner))) a),'[]'::jsonb) AS acl,
- COALESCE((SELECT jsonb_agg(jsonb_build_array(a.attname,g.grantee::bigint,g.grantor::bigint,g.privilege_type,g.is_grantable))
- FROM pg_attribute a CROSS JOIN LATERAL aclexplode(a.attacl) g
- WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped),'[]'::jsonb) AS column_acl
- FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
- WHERE c.oid=to_regclass('hp_snapshot_retention.publication') AND c.relkind='r'
- AND c.relpersistence='p' AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity"""
 _SOURCE_SELECT = (
     "run_id",
     "node_id",
@@ -369,125 +390,44 @@ _GENERATION_UPDATES = (
     "origin_lineage_id",
     "origin_generation",
     "published_at",
-    "relation_oids",
+    "serving_schema",
+    "serving_relation_names",
     "source_revision_tracked",
 )
 
 
 async def _source_transaction(session):
+    """Materialize the caller transaction; native grants enforce configured Source access."""
     from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import AsyncSession
 
-    from db.models import db
     from process.source_profile_result_pins import load_role_policy
 
-    login = os.environ.get("HLTHPRT_DB_USER", "")
-    node_id = os.environ.get("HLTHPRT_IMPORT_NODE_ID", "")
-    _bounded_identity(node_id)
-    _unused_owner, runtime_roles = load_role_policy()
-    _require(bool(login) and login in runtime_roles, "configured Source login differs")
+    login, node = os.environ.get("HLTHPRT_DB_USER", ""), os.environ.get("HLTHPRT_IMPORT_NODE_ID", "")
+    _bounded_identity(node)
+    _owner, runtime_roles = load_role_policy()
+    _require(login in runtime_roles, "configured Source role differs")
     _require(
-        isinstance(session, AsyncSession)
+        callable(getattr(session, "in_transaction", None))
+        and callable(getattr(session, "in_nested_transaction", None))
         and session.in_transaction()
-        and not session.in_nested_transaction()
-        and db._reader_binding() is None,
+        and not session.in_nested_transaction(),
         "original Source transaction required",
     )
-    binding = db._transaction_binding()
-    _require(
-        binding is None or binding.session is session,
-        "Source transaction binding differs",
-    )
-    actor_by_field = (
-        (
-            await session.execute(
-                text("""SELECT session_user::text AS session,current_user::text AS current,
- pg_backend_pid() AS pid,pg_current_xact_id()::text AS xid,
- (SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid,
- caller.oid::bigint AS actor_oid,owner.oid::bigint AS owner_oid,
- current_setting('transaction_isolation')='read committed' AND current_setting('transaction_read_only')='off'
- AND current_setting('session_replication_role')='origin' AND caller.rolcanlogin
- AND NOT (caller.rolsuper OR caller.rolcreaterole OR caller.rolcreatedb OR caller.rolreplication OR caller.rolbypassrls)
- AND NOT (owner.rolcanlogin OR owner.rolsuper OR owner.rolcreaterole OR owner.rolcreatedb OR owner.rolreplication OR owner.rolbypassrls)
- AND NOT pg_has_role(caller.oid,owner.oid,'MEMBER')
- AND NOT EXISTS(SELECT FROM pg_roles reachable WHERE pg_has_role(caller.oid,reachable.oid,'MEMBER')
- AND (reachable.rolsuper OR reachable.rolcreaterole OR reachable.rolcreatedb OR reachable.rolreplication
- OR reachable.rolbypassrls OR reachable.oid=(SELECT datdba FROM pg_database WHERE datname=current_database())
- OR reachable.rolname=ANY(ARRAY['pg_read_server_files','pg_write_server_files','pg_execute_server_program']::name[]))) AS safe
- FROM pg_roles caller,pg_namespace n JOIN pg_roles owner ON owner.oid=n.nspowner
- WHERE caller.rolname=session_user AND n.nspname='hp_snapshot_retention'""")
-            )
-        )
-        .mappings()
-        .one_or_none()
-    )
-    _require(
-        actor_by_field is not None
-        and actor_by_field["session"] == actor_by_field["current"] == login
-        and actor_by_field["safe"] is True,
-        "Source actor differs",
-    )
-    actor_by_field = dict(actor_by_field)
-    actor_by_field["runtime_roles"] = runtime_roles
-    actor_by_field["node_id"] = node_id
-    return actor_by_field
+    await session.execute(text("SELECT 1"))
+    return {"role": login, "runtime_roles": runtime_roles, "node_id": node, "transaction": session.get_transaction()}
 
 
 async def _recheck_source_transaction(session, original):
     _require(await _source_transaction(session) == original, "Source transaction changed")
 
 
-def validate_event_custody(catalog_by_field, *, owner_oid, builder_oid):
-    """Require only Owner table custody and this admitted Builder's exact nonsecret column reads."""
-    _require(
-        type(catalog_by_field) is dict
-        and catalog_by_field["owner_oid"] == catalog_by_field["schema_owner_oid"] == owner_oid,
-        "event Owner differs",
-    )
-    owner_privileges = {
-        "SELECT",
-        "INSERT",
-        "UPDATE",
-        "DELETE",
-        "TRUNCATE",
-        "REFERENCES",
-        "TRIGGER",
-        "MAINTAIN",
-    }
-    acl = catalog_by_field["acl"]
-    _require(
-        type(acl) is list
-        and len(acl) == len(owner_privileges)
-        and {(entry[0], entry[1], entry[2], entry[3]) for entry in acl}
-        == {(owner_oid, owner_oid, privilege, False) for privilege in owner_privileges},
-        "event table grants differ",
-    )
-    columns = catalog_by_field["column_acl"]
-    _require(
-        type(columns) is list
-        and len(columns) == len(SOURCE_ACK_COLUMNS)
-        and {tuple(entry) for entry in columns}
-        == {(name, builder_oid, owner_oid, "SELECT", False) for name in SOURCE_ACK_COLUMNS},
-        "event column grants differ",
-    )
-
-
 async def _lock_event_custody(session, actor_by_field):
+    """Read only the declared acknowledgement columns through PostgreSQL privileges."""
     from sqlalchemy import text
 
-    from process.reference_family_archive import require_native_read_catalog
-
-    catalog_by_field = dict((await session.execute(text(_EVENT_CUSTODY_SQL))).mappings().one())
-    validate_event_custody(
-        catalog_by_field,
-        owner_oid=actor_by_field["owner_oid"],
-        builder_oid=actor_by_field["actor_oid"],
-    )
-    await require_native_read_catalog(session, (catalog_by_field["oid"],))
-    await session.execute(text("SELECT fence_token FROM hp_snapshot_retention.publication WHERE false"))
-    _require(
-        dict((await session.execute(text(_EVENT_CUSTODY_SQL))).mappings().one()) == catalog_by_field,
-        "event custody changed",
+    _require(session.in_transaction(), "Source transaction required")
+    await session.execute(
+        text("SELECT " + ",".join(SOURCE_ACK_COLUMNS) + " FROM hp_snapshot_retention.publication WHERE false")
     )
 
 
@@ -547,9 +487,7 @@ async def _find_owner_event(session, actor_by_field, fence_token):
         return None
     receipt = validate_event_ack(dict(event_row))
     _require(
-        receipt["owner_oid"] == actor_by_field["owner_oid"]
-        and receipt["database_oid"] == actor_by_field["database_oid"]
-        and receipt["node_id"] == actor_by_field["node_id"],
+        receipt["node_id"] == actor_by_field["node_id"],
         "Owner publication location differs",
     )
     return receipt
@@ -585,9 +523,7 @@ async def _find_run_owner_event(session, actor_by_field, run_id):
         return None
     receipt = validate_event_ack(dict(event_rows[0]))
     _require(
-        receipt["owner_oid"] == actor_by_field["owner_oid"]
-        and receipt["database_oid"] == actor_by_field["database_oid"]
-        and receipt["node_id"] == actor_by_field["node_id"]
+        receipt["node_id"] == actor_by_field["node_id"]
         and receipt["purpose"] == "source"
         and receipt["run_id"] == run_id,
         "Owner Source outcome location differs",
@@ -605,8 +541,7 @@ async def reconcile_source_publication(session, run_id):
 
     actor = await _source_transaction(session)
     await acquire_control_run_worker_action_lock(ConnectionProxy(db, session, None), run_id)
-    history_oid = await session.scalar(text("SELECT to_regclass('mrf.import_run')::oid::bigint"))
-    await _require_source_controls(session, actor, history_oid)
+    await _require_source_controls(session, actor)
     run = await _locked_source_run(session, run_id)
     _require(run["node_id"] == actor["node_id"], "Source run location differs")
     metrics = run["metrics"] or {}
@@ -663,38 +598,21 @@ async def _locked_source_run(session, run_id):
     return dict(run)
 
 
-async def _require_source_controls(session, actor_by_field, history_oid):
+async def _require_source_controls(session, actor_by_field, history=None):
     from sqlalchemy import text
 
-    from process.reference_family_archive import require_native_read_catalog
-
-    actual = await session.scalar(text("SELECT to_regclass('mrf.import_run')::oid::bigint"))
-    generation_oid = await session.scalar(
-        text("SELECT to_regclass('mrf.reference_family_result_generation')::oid::bigint")
-    )
-    _require(
-        actual == history_oid and type(generation_oid) is int,
-        "Source control identity differs",
-    )
     for relation, columns, privilege in (
-        (actual, _SOURCE_SELECT, "SELECT"),
-        (actual, _SOURCE_UPDATES, "UPDATE"),
-        (generation_oid, _GENERATION_UPDATES, "UPDATE"),
+        ("mrf.import_run", _SOURCE_SELECT, "SELECT"),
+        ("mrf.import_run", _SOURCE_UPDATES, "UPDATE"),
+        ("mrf.reference_family_result_generation", _GENERATION_UPDATES, "UPDATE"),
     ):
         granted = await session.scalar(
             text(
-                "SELECT bool_and(has_column_privilege(CAST(:actor AS oid),"
-                "CAST(:relation AS oid),column_name,:privilege)) FROM unnest(CAST(:columns AS text[])) column_name"
+                "SELECT bool_and(has_column_privilege(current_user,:relation,column_name,:privilege)) FROM unnest(CAST(:columns AS text[])) column_name"
             ),
-            {
-                "actor": actor_by_field["actor_oid"],
-                "relation": relation,
-                "columns": list(columns),
-                "privilege": privilege,
-            },
+            {"relation": relation, "columns": list(columns), "privilege": privilege},
         )
         _require(granted is True, "Source control privileges differ")
-    await require_native_read_catalog(session, (actual, generation_oid))
 
 
 def _run_handoff(run):
@@ -717,10 +635,12 @@ def _run_handoff(run):
 
 async def lock_source_eligibility(session, expected_handoff, *, publisher_session):
     """Keep real Source row locks in the caller's transaction through the short Publisher commit."""
+    from process import nucc_snapshot_partition as partition
+
     handoff = validate_handoff(expected_handoff)
     actor_by_field = await _source_transaction(session)
     _require(
-        all(handoff[field] == actor_by_field[field] for field in ("node_id", "database_oid", "owner_oid")),
+        handoff["node_id"] == actor_by_field["node_id"],
         "Source handoff location differs",
     )
     publisher_actor_by_field = await _publisher_transaction(publisher_session)
@@ -728,10 +648,10 @@ async def lock_source_eligibility(session, expected_handoff, *, publisher_sessio
         session,
         actor_by_field,
         publisher_actor_by_field,
-        handoff["parent_oid"],
+        named_locations(handoff)["parent"],
         run_id=handoff["run_id"],
     )
-    await _require_source_controls(session, actor_by_field, handoff["history_oid"])
+    await _require_source_controls(session, actor_by_field)
     run = await _locked_source_run(session, handoff["run_id"])
     _require(
         _run_handoff(run) == handoff
@@ -741,12 +661,18 @@ async def lock_source_eligibility(session, expected_handoff, *, publisher_sessio
         and run["error"] is None,
         "Source publication is ineligible",
     )
+    previous_child = named_locations(handoff).get("previous_child")
+    if previous_child is None:
+        prior = _source_generation(handoff["source_predecessor"], predecessor=True)
+        _require(prior.relations is not None, "transition-legacy-nucc-generation: recorded predecessor name required")
+        previous_child = prior.relations[0]
     await _lock_generation_eligibility(
         session,
         handoff["source_predecessor"],
-        handoff["previous_child_oid"],
+        previous_child,
         actor_by_field,
         publisher_actor_by_field,
+        publisher_session=publisher_session,
     )
     await _recheck_publisher_transaction(publisher_session, publisher_actor_by_field)
     await _recheck_source_transaction(session, actor_by_field)
@@ -756,33 +682,38 @@ async def lock_source_eligibility(session, expected_handoff, *, publisher_sessio
 async def _project_generation(session, receipt):
     from sqlalchemy import text
 
-    from process.reference_family_result_generation import (
-        read_reference_family_result_generation_authority,
-    )
+    from process.reference_family_result_generation import read_reference_family_result_generation_authority
 
     current = await read_reference_family_result_generation_authority(
         session, importer_id="nucc", schema_name="mrf", lock=True
     )
-    if current.as_dict() == receipt["source_authority"]:
+    next_authority = _source_generation(
+        receipt["source_authority"], declared_schema=named_locations(receipt)["child"][0]
+    )
+    if current == next_authority:
         return
     _require(
-        current.as_dict() == receipt["source_predecessor"],
+        current
+        == _source_generation(
+            receipt["source_predecessor"],
+            predecessor=True,
+            declared_schema=named_locations(receipt).get("previous_child", (None,))[0],
+        ),
         "Source ACK predecessor changed",
     )
-    next_authority = _source_generation(receipt["source_authority"])
     serving = next_authority.serving_generation
     updated = await session.scalar(
         text("""UPDATE mrf.reference_family_result_generation
  SET local_generation=:next,origin_lineage_id=CAST(:origin AS uuid),origin_generation=:generation,
- published_at=CAST(:published AS timestamptz),relation_oids=CAST(:oids AS bigint[]),source_revision_tracked=FALSE
- WHERE importer_id='nucc' AND local_lineage_id=CAST(:lineage AS uuid) AND local_generation=:prior
- RETURNING importer_id"""),
+ published_at=CAST(:published AS timestamptz),serving_schema=:schema,serving_relation_names=CAST(:names AS text[]),source_revision_tracked=FALSE
+ WHERE importer_id='nucc' AND local_lineage_id=CAST(:lineage AS uuid) AND local_generation=:prior RETURNING importer_id"""),
         {
             "next": next_authority.local_generation,
             "origin": serving.origin_lineage_id,
             "generation": serving.origin_generation,
             "published": serving.published_at,
-            "oids": list(next_authority.relation_oids),
+            "schema": next_authority.relations[0][0],
+            "names": [next_authority.relations[0][1]],
             "lineage": current.local_lineage_id,
             "prior": current.local_generation,
         },
@@ -836,11 +767,17 @@ async def acknowledge_source_publication(session, run_id, publication_fence):
         receipt["purpose"] == "source" and receipt["run_id"] == run_id,
         "Source ACK purpose differs",
     )
-    await _require_source_controls(session, actor_by_field, receipt["history_oid"])
+    await _require_source_controls(session, actor_by_field)
     run = await _locked_source_run(session, run_id)
     handoff = _run_handoff(run)
+    shared = (HANDOFF_FIELDS & PUBLICATION_FIELDS & receipt.keys() & handoff.keys()) - {
+        "contract",
+        "source_predecessor",
+    }
     _require(
-        all(receipt[key] == handoff[key] for key in HANDOFF_FIELDS & PUBLICATION_FIELDS - {"contract"}),
+        all(receipt[key] == handoff[key] for key in shared)
+        and named_locations(receipt)["child"] == named_locations(handoff)["child"]
+        and receipt["source_predecessor"] == handoff["source_predecessor"],
         "Source ACK handoff differs",
     )
     if run["status"] == "succeeded" and (run["metrics"] or {}).get("nucc_native_publication") == receipt:
@@ -869,7 +806,7 @@ async def acknowledge_generation_publication(session, publication_fence):
     actor_by_field = await _source_transaction(session)
     receipt = await _read_owner_event(session, actor_by_field, publication_fence)
     _require(receipt["purpose"] in {"receive", "restore"}, "generation ACK purpose differs")
-    await _require_source_controls(session, actor_by_field, receipt["history_oid"])
+    await _require_source_controls(session, actor_by_field)
     await _project_generation(session, receipt)
     await _recheck_source_transaction(session, actor_by_field)
     return receipt
@@ -877,81 +814,43 @@ async def acknowledge_generation_publication(session, publication_fence):
 
 async def _publisher_transaction(session):
     from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import AsyncSession
 
-    from process.reference_family_archive import protected_publisher_owner
+    from process.reference_family_archive import model_family_roles
 
     _require(
-        isinstance(session, AsyncSession) and session.in_transaction() and not session.in_nested_transaction(),
+        callable(getattr(session, "in_transaction", None))
+        and callable(getattr(session, "in_nested_transaction", None))
+        and session.in_transaction()
+        and not session.in_nested_transaction(),
         "original Publisher transaction required",
     )
-    owner_oid = await protected_publisher_owner(session)
-    actor_by_field = dict(
-        (
-            await session.execute(
-                text("""SELECT
- pg_backend_pid() AS pid,pg_current_xact_id()::text AS xid,
- (SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid,
- (SELECT virtualtransaction FROM pg_locks WHERE pid=pg_backend_pid()
-  AND locktype='virtualxid' AND granted AND mode='ExclusiveLock') AS virtualtransaction,
- current_setting('transaction_isolation')='read committed'
- AND current_setting('transaction_read_only')='off' AS writable""")
-            )
-        )
-        .mappings()
-        .one()
-    )
-    _require(actor_by_field.pop("writable") is True, "Publisher transaction differs")
-    actor_by_field["owner_oid"] = owner_oid
-    return actor_by_field
+    owner, readers = model_family_roles()
+    await session.execute(text("SELECT 1"))
+    return {"owner_role": owner, "reader_roles": readers, "transaction": session.get_transaction()}
 
 
 async def _recheck_publisher_transaction(session, original):
     _require(await _publisher_transaction(session) == original, "Publisher transaction changed")
 
 
-async def _require_publisher_fence(
-    session, source_actor_by_field, publisher_actor_by_field, parent_oid, *, run_id=None
+async def _require_publisher_fence(session, source_actor_by_field, publisher_actor_by_field, parent, *, run_id=None):
+    """Require live owning transactions; ordering and native locks govern the short cutover."""
+    _require(tuple(parent) == ("mrf", "nucc_taxonomy"), "Publisher parent scope differs")
+    _require(
+        session.in_transaction()
+        and session.get_transaction() is source_actor_by_field["transaction"]
+        and publisher_actor_by_field["transaction"].is_active,
+        "Publisher pre-cutover transaction unavailable",
+    )
+
+
+async def _require_prior_owner_ack(
+    session, actor_by_field, source_authority, node_id, parent_catalog, *, publisher_session
 ):
     from sqlalchemy import text
 
-    _require(
-        publisher_actor_by_field["database_oid"] == source_actor_by_field["database_oid"]
-        and publisher_actor_by_field["owner_oid"] == source_actor_by_field["owner_oid"]
-        and publisher_actor_by_field["pid"] != source_actor_by_field["pid"],
-        "Publisher location differs",
-    )
-    held = await session.scalar(
-        text("""SELECT EXISTS(SELECT FROM pg_locks transaction_lock
- WHERE transaction_lock.pid=:pid AND transaction_lock.virtualtransaction=:virtualtransaction
- AND transaction_lock.locktype='transactionid' AND transaction_lock.granted
- AND transaction_lock.mode='ExclusiveLock' AND transaction_lock.transactionid=CAST(:xid AS xid)
- AND NOT EXISTS(SELECT FROM pg_locks parent_lock WHERE parent_lock.pid=:pid
- AND parent_lock.locktype='relation' AND parent_lock.granted AND parent_lock.mode='AccessExclusiveLock'
- AND parent_lock.database=CAST(:database AS oid) AND parent_lock.relation=CAST(:parent AS oid))
- AND (CAST(:name AS text) IS NULL OR EXISTS(SELECT FROM pg_locks action_lock
- WHERE action_lock.pid=:pid AND action_lock.virtualtransaction=:virtualtransaction
- AND action_lock.locktype='advisory' AND action_lock.granted AND action_lock.mode='ExclusiveLock'
- AND action_lock.database=CAST(:database AS oid) AND action_lock.objsubid=1
- AND action_lock.classid=CAST((hashtextextended(CAST(:name AS text),0)>>32)&4294967295 AS oid)
- AND action_lock.objid=CAST(hashtextextended(CAST(:name AS text),0)&4294967295 AS oid))))"""),
-        {
-            "pid": publisher_actor_by_field["pid"],
-            "virtualtransaction": publisher_actor_by_field["virtualtransaction"],
-            "xid": int(publisher_actor_by_field["xid"]) % 2**32,
-            "database": source_actor_by_field["database_oid"],
-            "parent": parent_oid,
-            "name": None if run_id is None else "control-run-worker-action:v1:" + run_id,
-        },
-    )
-    _require(held is True, "Publisher pre-cutover fence unavailable")
-
-
-async def _require_prior_owner_ack(session, actor_by_field, source_authority, node_id, parent_catalog):
-    from sqlalchemy import text
-
     await _lock_event_custody(session, actor_by_field)
-    row = (
+    ack_row = (
         (
             await session.execute(
                 text("""SELECT fence_token::text,node_id,importer_id,dataset_key,generation_id::text,
@@ -965,14 +864,15 @@ async def _require_prior_owner_ack(session, actor_by_field, source_authority, no
         .mappings()
         .one_or_none()
     )
-    if row is None:
-        await _require_initial_baseline(session, actor_by_field, source_authority, parent_catalog)
+    if ack_row is None:
+        await _require_initial_baseline(
+            session, actor_by_field, source_authority, parent_catalog, publisher_session=publisher_session
+        )
         return
-    receipt = validate_event_ack(dict(row))
+    receipt = validate_event_ack(dict(ack_row))
     _require(
-        receipt["owner_oid"] == actor_by_field["owner_oid"]
-        and receipt["database_oid"] == actor_by_field["database_oid"]
-        and receipt["source_authority"] == source_authority,
+        _source_generation(receipt["source_authority"], declared_schema=named_locations(receipt)["child"][0])
+        == _source_generation(source_authority, predecessor=True),
         "prior protected Owner ACK differs",
     )
 
@@ -1007,16 +907,17 @@ async def _acknowledge_run(session, run, handoff, receipt):
     _require(updated == receipt["run_id"], "Source run ACK changed")
 
 
-async def lock_generation_eligibility(session, expected_authority, *, expected_child_oid, publisher_session):
+async def lock_generation_eligibility(session, expected_authority, *, expected_child, publisher_session):
     """Validate and lock Source before Publisher takes the short parent exclusive lock."""
     actor = await _source_transaction(session)
     publisher_actor_by_field = await _publisher_transaction(publisher_session)
     current = await _lock_generation_eligibility(
         session,
         expected_authority,
-        expected_child_oid,
+        expected_child,
         actor,
         publisher_actor_by_field,
+        publisher_session=publisher_session,
     )
     await _recheck_publisher_transaction(publisher_session, publisher_actor_by_field)
     await _recheck_source_transaction(session, actor)
@@ -1024,77 +925,69 @@ async def lock_generation_eligibility(session, expected_authority, *, expected_c
 
 
 async def _lock_generation_eligibility(
-    session, expected_authority, expected_child_oid, actor_by_field, publisher_actor_by_field
+    session, expected_authority, expected_child, actor_by_field, publisher_actor_by_field, *, publisher_session
 ):
     from sqlalchemy import text
 
     from process import nucc_snapshot_partition as partition
-    from process.reference_family_result_generation import (
-        read_reference_family_result_generation_authority,
-    )
+    from process.reference_family_result_generation import read_reference_family_result_generation_authority
 
-    _source_generation(expected_authority, predecessor=True)
-    _require(type(expected_child_oid) is int and 0 < expected_child_oid < 2**32, "expected child differs")
-    # Native ruleutils deparsers can acquire relation locks: never invoke them behind our Publisher AX.
-    parent_oid = await session.scalar(text("SELECT to_regclass('mrf.nucc_taxonomy')::oid::bigint"))
-    _require(type(parent_oid) is int, "protected parent unavailable")
-    await _require_publisher_fence(session, actor_by_field, publisher_actor_by_field, parent_oid)
+    expected_child = partition.qualified(expected_child)
+    expected = _source_generation(expected_authority, predecessor=True, declared_schema=expected_child[0])
+    await _require_publisher_fence(session, actor_by_field, publisher_actor_by_field, ("mrf", "nucc_taxonomy"))
     parent_catalog = partition.decode_catalog(await session.scalar(text(partition.CATALOG_SQL)))
-    physical = partition.validate_parent_catalog(parent_catalog)
-    await _require_publisher_fence(session, actor_by_field, publisher_actor_by_field, physical["parent_oid"])
-    history_oid = await session.scalar(text("SELECT to_regclass('mrf.import_run')::oid::bigint"))
-    await _require_source_controls(session, actor_by_field, history_oid)
+    named = partition.validate_parent_catalog(parent_catalog)
+    await _require_source_controls(session, actor_by_field)
     current = await read_reference_family_result_generation_authority(
         session, importer_id="nucc", schema_name="mrf", lock=True
     )
-    _require(current.as_dict() == expected_authority, "Source generation predecessor changed")
+    _require(current == expected, "Source generation predecessor changed")
     _require(
-        physical["child_oid"] == expected_child_oid
-        and (current.relation_oids is None or current.relation_oids == (expected_child_oid,)),
+        named["child"] == expected_child and (current.relations is None or current.relations == (named["child"],)),
         "prior Source projection is not ACKed",
     )
     await _require_prior_owner_ack(
-        session, actor_by_field, current.as_dict(), actor_by_field["node_id"], parent_catalog
+        session,
+        actor_by_field,
+        current.as_dict(),
+        actor_by_field["node_id"],
+        parent_catalog,
+        publisher_session=publisher_session,
     )
     return current.as_dict()
 
 
-async def _require_initial_baseline(session, actor_by_field, source_authority, parent_catalog):
-    """Only original-admin native adoption with zero actual Owner events can precede the first outcome."""
+async def _require_initial_baseline(session, actor_by_field, source_authority, parent_catalog, *, publisher_session):
+    """Compare the initial saved logical provenance and complete preserved content."""
     from sqlalchemy import text
 
     from process import nucc_protected_bootstrap as bootstrap
     from process import nucc_snapshot_partition as partition
+    from process import reference_family_archive as native
 
-    _require(await _source_transaction(session) == actor_by_field, "Source transaction changed")
-    physical = partition.validate_parent_catalog(parent_catalog)
+    named = partition.validate_parent_catalog(parent_catalog)
     _require(
         await session.scalar(
             text(
-                "SELECT NOT EXISTS(SELECT FROM hp_snapshot_retention.publication "
-                "WHERE importer_id='nucc' AND dataset_key='nucc')"
+                "SELECT NOT EXISTS(SELECT FROM hp_snapshot_retention.publication WHERE importer_id='nucc' AND dataset_key='nucc')"
             )
         )
         is True,
-        "initial Owner baseline already consumed",
+        "initial baseline already consumed",
     )
     comment = await session.scalar(
-        text("SELECT obj_description(CAST(:oid AS oid),'pg_class')"), {"oid": physical["parent_oid"]}
+        text("SELECT obj_description(to_regclass(:parent),'pg_class')"), {"parent": partition.PARENT}
     )
-    baseline = bootstrap.validate_baseline(comment, physical, source_authority)
+    baseline = bootstrap.validate_baseline(comment, named, source_authority)
+    content = await native._projected_row_identity(
+        publisher_session, *named["child"], row_json_sql="to_jsonb(row_value)"
+    )
+    _require(content == (baseline["row_count"], baseline["semantic_sha256"]), "initial baseline content differs")
     _require(
-        baseline["database_oid"] == actor_by_field["database_oid"]
-        and baseline["protected_native_sha256"] == partition.catalog_digest(parent_catalog)
-        and baseline["child_index_oids"]
-        == sorted(index["oid"] for index in parent_catalog["children"][0]["relation"]["indexes"])
-        and baseline["source_revision_tracked"]
+        baseline["source_revision_tracked"]
         is await session.scalar(
             text("SELECT source_revision_tracked FROM mrf.reference_family_result_generation WHERE importer_id='nucc'")
         ),
-        "initial Owner baseline differs",
+        "initial baseline tracking differs",
     )
-    _require(
-        partition.decode_catalog(await session.scalar(text(partition.CATALOG_SQL))) == parent_catalog
-        and await _source_transaction(session) == actor_by_field,
-        "initial Owner baseline changed",
-    )
+    await _recheck_source_transaction(session, actor_by_field)

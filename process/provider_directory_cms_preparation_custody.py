@@ -958,32 +958,3 @@ async def capture_authenticated_cms_allocation_pins(
         namespaces=namespaces,
         roles={field: locked_by_kind["roles"][field] or [] for field in ("roles", "memberships")},
     ), relations
-
-
-async def compare_cms_preparation_custody(connection, *, storage_binding, policy, cms_profile):
-    """Compare a distinct CMS pin before acquisition; never authorize a finalizer.
-
-    No trusted CMS profile loader exists here. Callers must not treat a matching
-    caller-supplied profile as issuance, enrollment, or permission to write.
-    Canonical payload custody, frozen-workspace validation and safe writer
-    admission remain separate requirements; this is only the fixed CMS delta.
-    """
-    cms_profile = _profile(cms_profile, storage_binding, policy)
-    _require(connection.is_in_transaction() is True, "transaction_required")
-    actor_by_field = dict(await connection.fetchrow(_ACTOR_SQL))
-    _require(
-        actor_by_field["session"] == policy.publisher_role
-        and actor_by_field["current"] in {policy.owner_role, policy.publisher_role}
-        and actor_by_field["backend"] == connection.get_server_pid()
-        and actor_by_field["database_oid"] == storage_binding.database_oid
-        and actor_by_field["replication"] == "origin"
-        and bool(actor_by_field["transaction"]),
-        "original_publisher_required",
-    )
-    observed = await _observe(connection, storage_binding, policy)
-    _require(observed == {field: cms_profile[field] for field in _DIGEST_FIELDS}, "native_evidence_changed")
-    _require(
-        connection.is_in_transaction() is True and dict(await connection.fetchrow(_ACTOR_SQL)) == actor_by_field,
-        "original_publisher_changed",
-    )
-    return observed

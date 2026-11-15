@@ -11,6 +11,7 @@ from process import registry_source_contribution_artifacts as artifacts
 from process import registry_source_recipe_composition as composition
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
+from process.network_compact_layout import CompactAddressRelation
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.registry_source_contribution_store import (
     registry_source_contribution_receipt,
@@ -26,7 +27,6 @@ from tests.test_network_provider_only_read_postgres import provider_only_db as _
 from tests.test_network_provider_only_read_postgres import provider_only_source as provider_only_source
 from tests.test_network_provider_only_read_postgres import serving_schema as serving_schema
 from tests.test_registry_approval_store_postgres import _approve, _command
-from tests.test_registry_source_contribution_artifacts_postgres import RollbackProbe
 from tests.test_registry_source_contribution_artifacts_postgres import provider_only_db as provider_only_db
 
 pytestmark = pytest.mark.asyncio
@@ -179,62 +179,32 @@ async def test_removed_source_stage_has_no_fact_access_or_copy(provider_only_db,
         await fixture.connection.execute(f'DROP TABLE pg_temp."{stage.table_name}"')
 
 
-async def _retention_probe(context, oids):
+async def _retention_probe(context, relations):
     async with context.fixture.connection.transaction():
         await retention.require_network_compact_artifacts_unreferenced(
-            context.fixture.connection, oids, control_schema=context.fixture.control_schema
+            context.fixture.connection, relations, control_schema=context.fixture.control_schema
         )
 
 
-async def test_retention_protects_references_and_fails_closed_on_missing_anchor(provider_only_db):
+async def test_retention_protects_named_fact_references_and_frees_unreferenced(provider_only_db):
     context, fixture = provider_only_db, provider_only_db.fixture
     owner, previous = context.original, context.manifest
     current = await _compose(context, revision=previous.approved_custom_revision, source_manifest=previous)
-    descriptor = await _assert_reference(context, current, owner)
-    own_oid = await fixture.connection.fetchval(
-        "SELECT to_regclass($1)::oid::bigint", current.schema_name + ".network_source_contribution"
-    )
-    for oid in (own_oid, descriptor["fact_table_oid"]):
+    await _assert_reference(context, current, owner)
+    fact = CompactAddressRelation(owner.schema_name, "network_source_contribution")
+    for relation in (CompactAddressRelation(current.schema_name, "network_source_contribution"), fact):
         with pytest.raises(retention.NetworkCompactRetentionError, match="artifact_referenced"):
-            await _retention_probe(context, [oid])
+            await _retention_probe(context, [relation])
     await fixture.connection.execute(
         f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false WHERE candidate_id=$1',
         UUID(owner.candidate_id),
     )
     with pytest.raises(retention.NetworkCompactRetentionError, match="artifact_referenced"):
-        await _retention_probe(context, [descriptor["fact_table_oid"]])
+        await _retention_probe(context, [fact])
     unrelated = "source_unreferenced_" + uuid4().hex
-    await fixture.connection.execute(f'CREATE TEMP TABLE "{unrelated}"(id integer)')
+    await fixture.connection.execute(f'CREATE SCHEMA "{unrelated}"')
     try:
-        oid = await fixture.connection.fetchval("SELECT to_regclass($1)::oid::bigint", "pg_temp." + unrelated)
-        await _retention_probe(context, [oid])
-        with pytest.raises(RollbackProbe):
-            async with fixture.connection.transaction():
-                await fixture.connection.execute(
-                    f'DELETE FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
-                    UUID(owner.candidate_id),
-                )
-                with pytest.raises(retention.NetworkCompactRetentionError):
-                    await retention.require_network_compact_artifacts_unreferenced(
-                        fixture.connection, [oid], control_schema=fixture.control_schema
-                    )
-                raise RollbackProbe
-        await _retention_probe(context, [oid])
-        with pytest.raises(RollbackProbe):
-            async with fixture.connection.transaction():
-                retained_name = "fact_oid_probe_" + uuid4().hex
-                await fixture.connection.execute(
-                    f'ALTER TABLE "{owner.schema_name}".network_source_contribution RENAME TO "{retained_name}"'
-                )
-                await fixture.connection.execute(
-                    f'CREATE TABLE "{owner.schema_name}".network_source_contribution '
-                    f'(LIKE "{owner.schema_name}"."{retained_name}" INCLUDING ALL)'
-                )
-                with pytest.raises(retention.NetworkCompactRetentionError, match="source_anchor_missing"):
-                    await retention.require_network_compact_artifacts_unreferenced(
-                        fixture.connection, [oid], control_schema=fixture.control_schema
-                    )
-                raise RollbackProbe
-        await _retention_probe(context, [oid])
+        await fixture.connection.execute(f'CREATE TABLE "{unrelated}".network_source_contribution(id integer)')
+        await _retention_probe(context, [CompactAddressRelation(unrelated, "network_source_contribution")])
     finally:
-        await fixture.connection.execute(f'DROP TABLE pg_temp."{unrelated}"')
+        await fixture.connection.execute(f'DROP SCHEMA "{unrelated}" CASCADE')

@@ -147,35 +147,18 @@ async def test_capacity_total_wal_and_scratch_projection_edges(monkeypatch):
         "_provider_directory_profile_capacity_admission",
         lambda: admission,
     )
-    layout = SimpleNamespace(
-        relation_oid=999,
-        toastable_columns=(),
-        main_index_pages=(1,),
-        toast_index_pages=(),
-    )
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_relation_storage_fingerprint",
-        AsyncMock(return_value=layout),
-    )
+    layout = SimpleNamespace(toastable_columns=(), main_index_pages=(0,), toast_index_pages=())
+    capture = AsyncMock(return_value=layout)
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_relation_layout", capture)
     with pytest.raises(
-        importer.ProviderDirectoryArtifactBuildStale,
-        match="scratch_oid_changed",
+        importer.profile_capacity.ProviderDirectoryProfileCapacityError, match="scratch_projection_input_invalid"
     ):
         await importer._project_provider_directory_profile_scratch_window(
-            "profile_stage",
-            '"mrf"."stage"',
-            12,
-            inserted_rows=1,
-            inserted_logical_bytes=8,
-            expected_persistence="p",
+            "profile_stage", '"mrf"."stage"', 12, inserted_rows=1, inserted_logical_bytes=8, expected_persistence="p"
         )
-
-    profile_cap = importer._provider_directory_profile_capacity_relation_cap(
-        admission,
-        "profile_stage",
-    )
-    layout.relation_oid = 12
+    capture.assert_awaited_once_with(12, expected_persistence="p")
+    profile_cap = importer._provider_directory_profile_capacity_relation_cap(admission, "profile_stage")
+    layout.main_index_pages = (1,)
     monkeypatch.setattr(
         importer,
         "_provider_directory_profile_capacity_relation_bytes",
@@ -183,12 +166,7 @@ async def test_capacity_total_wal_and_scratch_projection_edges(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="scratch_growth_projected"):
         await importer._project_provider_directory_profile_scratch_window(
-            "profile_stage",
-            '"mrf"."stage"',
-            12,
-            inserted_rows=1,
-            inserted_logical_bytes=8,
-            expected_persistence="p",
+            "profile_stage", '"mrf"."stage"', 12, inserted_rows=1, inserted_logical_bytes=8, expected_persistence="p"
         )
 
 

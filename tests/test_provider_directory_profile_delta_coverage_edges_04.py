@@ -25,26 +25,34 @@ from tests.provider_directory_profile_delta_coverage_support import (
 )
 
 
-def _profile_capacity_identity_by_field(serving_state):
-    """Return a canonical database and tablespace identity mapping."""
+def _numeric_database_identity(wal_lsn="0/1"):
+    """Use actual numeric PostgreSQL assumptions and the closed logical role map."""
+    geometry = _wal_tracker_admission().geometry
+    return importer._ProviderDirectoryProfileDatabaseCapacityIdentity(
+        wal_lsn=wal_lsn,
+        relations={role: dict(entry) for role, entry in geometry.relations.items()},
+        **{
+            name: getattr(geometry, name)
+            for name in importer._ProviderDirectoryProfileDatabaseCapacityIdentity.__dataclass_fields__
+            if name.startswith("postgres_")
+        },
+    )
 
-    return {
-        "evidence_target_oid": serving_state.evidence_target_oid,
-        "evidence_schema": "mrf",
-        "evidence_relation": profile.PROFILE_EVIDENCE_TABLE,
-        "evidence_relkind": "r",
-        "evidence_relpersistence": "p",
-        "profile_target_oid": serving_state.profile_target_oid,
-        "profile_schema": "mrf",
-        "profile_relation": profile.PROFILE_TABLE,
-        "profile_relkind": "r",
-        "profile_relpersistence": "p",
-        "database_tablespace_oid": 1,
-        "evidence_tablespace_oid": 1,
-        "profile_tablespace_oid": 1,
-        "database_tablespace_name": "pg_default",
-        "temp_tablespaces": "",
-    }
+
+def _logical_capacity_layout(geometry, role):
+    """Create one measured layout within its authentic configured numeric ceilings."""
+    expected = geometry.relations[role]
+    return importer._ProviderDirectoryProfileCapacityLayout(
+        schema_name=expected["schema"],
+        relation_name=expected["name"],
+        relation_oid=12,
+        toast_oid=None,
+        main_index_oids=tuple(range(len(expected["main_index_pages"]))),
+        main_index_pages=tuple(expected["main_index_pages"]),
+        toast_index_oids=tuple(range(len(expected["toast_index_pages"]))),
+        toast_index_pages=tuple(expected["toast_index_pages"]),
+        toastable_columns=tuple("column_" + str(index) for index in range(expected["toastable_column_count"])),
+    )
 
 
 def test_artifact_config_and_scope_naming_edges(monkeypatch):
@@ -59,13 +67,9 @@ def test_artifact_config_and_scope_naming_edges(monkeypatch):
         importer._provider_directory_positive_config(env_name, 2)
 
     admission = _wal_tracker_admission()
-    token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(
-        admission
-    )
+    token = importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.set(admission)
     try:
-        assert importer._provider_directory_artifact_scope_workers() == (
-            admission.geometry.artifact_scope_worker_count
-        )
+        assert importer._provider_directory_artifact_scope_workers() == (admission.geometry.artifact_scope_worker_count)
     finally:
         importer._PROVIDER_DIRECTORY_PROFILE_CAPACITY_ADMISSION.reset(token)
 
@@ -92,15 +96,12 @@ def test_artifact_config_and_scope_naming_edges(monkeypatch):
         admission.run_id,
     ).endswith(admission.run_id.removeprefix("run_"))
 
-    assert importer._provider_directory_artifact_scope_table_prefix(
-        "short"
-    ) == "short_artifact_scope"
-    long_prefix = importer._provider_directory_artifact_scope_table_prefix(
-        "x" * 63
-    )
+    assert importer._provider_directory_artifact_scope_table_prefix("short") == "short_artifact_scope"
+    long_prefix = importer._provider_directory_artifact_scope_table_prefix("x" * 63)
     assert len(long_prefix) <= 30
     with pytest.raises(RuntimeError, match="owner_identity_invalid"):
         importer._owned_artifact_scope_name("source", run_id="invalid")
+
 
 def test_artifact_scope_projection_capacity_edges(monkeypatch):
     projection = SimpleNamespace(
@@ -156,6 +157,7 @@ def test_artifact_scope_projection_capacity_edges(monkeypatch):
         ):
             importer._assert_artifact_scope_projection(changed)
 
+
 def test_artifact_scope_owner_and_batch_coordinate_edges():
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
@@ -191,14 +193,14 @@ def test_artifact_scope_owner_and_batch_coordinate_edges():
             expected_batch=expected_batch,
         )
 
+
 def test_artifact_projection_values_and_source_batch_edges():
     assert importer._provider_directory_artifact_projection_values(
         {"projected_rows": 1, "projected_logical_bytes": 8}
     ) == (1, 8, None)
     with pytest.raises(RuntimeError, match="projection_invalid"):
-        importer._provider_directory_artifact_projection_values(
-            {"projected_rows": -1, "projected_logical_bytes": 0}
-        )
+        importer._provider_directory_artifact_projection_values({"projected_rows": -1, "projected_logical_bytes": 0})
+
 
 @pytest.mark.asyncio
 async def test_artifact_source_cursor_and_projection_edges(monkeypatch):
@@ -212,12 +214,15 @@ async def test_artifact_source_cursor_and_projection_edges(monkeypatch):
             None,
         )
     monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value="r2"))
-    assert await importer._next_artifact_resource_id(
-        "mrf",
-        "resource",
-        dataset,
-        "r1",
-    ) == "r2"
+    assert (
+        await importer._next_artifact_resource_id(
+            "mrf",
+            "resource",
+            dataset,
+            "r1",
+        )
+        == "r2"
+    )
 
     monkeypatch.setattr(
         importer.db,
@@ -238,6 +243,7 @@ async def test_artifact_source_cursor_and_projection_edges(monkeypatch):
             ["source-a"],
         )
 
+
 @pytest.mark.parametrize(
     ("database_pool_size", "reserve"),
     ((3, 3), (4, 4)),
@@ -256,6 +262,7 @@ def test_capacity_artifact_worker_pool_edges(
             database_pool_size=database_pool_size,
             pool_reserve_connections=reserve,
         )
+
 
 def test_profile_geometry_identity_edges():
     assert importer._provider_directory_profile_capacity_geometry_identity(
@@ -286,108 +293,76 @@ def test_profile_geometry_identity_edges():
         ),
     ):
         with pytest.raises(RuntimeError, match=error):
-            importer._provider_directory_profile_capacity_geometry_identity(
-                **geometry_by_field
-            )
-
-@pytest.mark.asyncio
-async def test_profile_capacity_database_identity_edges(monkeypatch):
-    """Database identity remains bound to the serving target relations."""
-
-    serving_state = _matching_delta_serving_state(_prepared_delta())
-    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
-    with pytest.raises(RuntimeError, match="database_identity_missing"):
-        await importer._profile_capacity_database_row(serving_state)
-
-    identity_by_field = _profile_capacity_identity_by_field(serving_state)
-    assert importer._profile_capacity_database_tablespace_oid(
-        identity_by_field,
-        "mrf",
-        serving_state,
-    ) == 1
-
-    changed_identity_by_field = dict(
-        identity_by_field,
-        evidence_target_oid=999,
-    )
-    with pytest.raises(
-        importer.ProviderDirectoryArtifactBuildStale,
-        match="target_identity_changed",
-    ):
-        importer._profile_capacity_database_tablespace_oid(
-            changed_identity_by_field,
-            "mrf",
-            serving_state,
-        )
-    changed_identity_by_field = dict(
-        identity_by_field,
-        evidence_tablespace_oid=2,
-    )
-    with pytest.raises(RuntimeError, match="tablespace_unsupported"):
-        importer._profile_capacity_database_tablespace_oid(
-            changed_identity_by_field,
-            "mrf",
-            serving_state,
-        )
+            importer._provider_directory_profile_capacity_geometry_identity(**geometry_by_field)
 
 
 @pytest.mark.asyncio
-async def test_profile_capacity_temp_tablespace_edges(monkeypatch):
-    """Temp tablespaces must resolve to one admitted database location."""
-
-    serving_state = _matching_delta_serving_state(_prepared_delta())
-    identity_by_field = _profile_capacity_identity_by_field(serving_state)
-    assert await importer._profile_capacity_temp_tablespace(
-        identity_by_field,
-        1,
-    ) == (1, "pg_default")
-
-    for temp_setting in ("a,b", "bad-name"):
-        with pytest.raises(RuntimeError, match="temp_tablespace_ambiguous"):
-            await importer._profile_capacity_temp_tablespace(
-                dict(identity_by_field, temp_tablespaces=temp_setting),
-                1,
-            )
+async def test_profile_capacity_named_database_settings_edges(monkeypatch):
+    """Measure serving names and numeric settings without retaining database allocation tokens."""
+    serving = _matching_delta_serving_state(_prepared_delta())
     monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
-    with pytest.raises(RuntimeError, match="temp_tablespace_missing"):
-        await importer._profile_capacity_temp_tablespace(
-            dict(identity_by_field, temp_tablespaces="fast_temp"),
-            1,
-        )
+    with pytest.raises(RuntimeError, match="database_settings_missing"):
+        await importer._profile_capacity_database_row(serving)
+    expected = _numeric_database_identity()
+    numeric_by_field = {name: getattr(expected, name) for name in expected.__dataclass_fields__ if name != "relations"}
+    importer.db.first.return_value = numeric_by_field
+    resolver = AsyncMock(return_value=12)
+    layout = _logical_capacity_layout(_wal_tracker_admission().geometry, "profile_target")
+    monkeypatch.setattr(importer, "_provider_directory_relation_oid", resolver)
+    monkeypatch.setattr(
+        importer, "_provider_directory_profile_capacity_relation_layout", AsyncMock(return_value=layout)
+    )
+    measured = await importer._provider_directory_profile_capacity_database_identity("controls", serving)
+    assert measured.wal_lsn == expected.wal_lsn
+    assert measured.relations["evidence_target"]["schema"] == serving.targets["evidence"]["schema"]
+    assert measured.relations["profile_target"]["name"] == serving.targets["profile"]["name"]
+    assert measured.relations["build_checkpoint"]["schema"] == "controls"
+    assert len(measured.relations) == resolver.await_count == 7
+    resolver.return_value = None
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="relation_missing"):
+        await importer._provider_directory_profile_capacity_database_identity("controls", serving)
 
-def test_capacity_serving_and_writable_layout_edges():
+
+@pytest.mark.asyncio
+async def test_profile_capacity_named_layout_scope_and_numeric_bounds(monkeypatch):
+    """Missing names, changed schema and unfunded index growth refuse admission."""
+    geometry = _wal_tracker_admission().geometry
+    role = "capacity_consumption"
+    layout = _logical_capacity_layout(geometry, role)
+    resolver = AsyncMock(return_value=12)
+    capture = AsyncMock(return_value=layout)
+    monkeypatch.setattr(importer, "_provider_directory_relation_oid", resolver)
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_relation_layout", capture)
+    assert await importer._profile_capacity_named_layout(geometry, role) == layout
+    importer._assert_profile_capacity_layout_bounds(dataclasses.replace(layout, relation_oid=999), geometry, role)
+    capture.return_value = dataclasses.replace(layout, schema_name="other_schema")
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="layout_scope_changed"):
+        await importer._profile_capacity_named_layout(geometry, role)
+    capture.return_value = dataclasses.replace(layout, main_index_pages=(max(layout.main_index_pages) + 1,))
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="index_bound_changed"):
+        await importer._profile_capacity_named_layout(geometry, role)
+    resolver.return_value = None
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="relation_missing"):
+        await importer._profile_capacity_named_layout(geometry, role)
+
+
+def test_capacity_serving_and_named_control_layout_edges():
+    """Serving CAS and complete control coordinates remain required independently."""
     state = _matching_delta_serving_state(_prepared_delta())
     importer._assert_profile_capacity_serving(state, state)
-    with pytest.raises(
-        importer.ProviderDirectoryArtifactBuildStale,
-        match="serving_generation_changed",
-    ):
+    with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="serving_generation_changed"):
         importer._assert_profile_capacity_serving(state, None)
+    geometry = _wal_tracker_admission().geometry
+    role = "build_checkpoint"
+    layout = _logical_capacity_layout(geometry, role)
+    importer._assert_profile_capacity_layout_bounds(layout, geometry, role)
+    for changed in (
+        dataclasses.replace(layout, relation_name="other_checkpoint"),
+        dataclasses.replace(layout, toastable_columns=()),
+    ):
+        with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="layout_scope_changed"):
+            importer._assert_profile_capacity_layout_bounds(changed, geometry, role)
 
-    layout = SimpleNamespace(effective_tablespace_oids=(1,))
-    target_layouts = SimpleNamespace(
-        evidence=layout,
-        profile=layout,
-        database_tablespace_oid=1,
-    )
-    metadata_layouts = SimpleNamespace(
-        layouts_by_name={"checkpoint": layout}
-    )
-    importer._validate_profile_capacity_writable_layouts(
-        target_layouts,
-        metadata_layouts,
-    )
-    with pytest.raises(RuntimeError, match="writable_tablespace"):
-        importer._validate_profile_capacity_writable_layouts(
-            target_layouts,
-            SimpleNamespace(
-                layouts_by_name={
-                    "checkpoint": SimpleNamespace(
-                        effective_tablespace_oids=(2,)
-                    )
-                }
-            ),
-        )
 
 def test_capacity_timeout_admission_and_wal_candidate_edges():
     admission = _wal_tracker_admission()
@@ -417,8 +392,6 @@ def test_capacity_timeout_admission_and_wal_candidate_edges():
             admission,
             {"profile_stage": profile_cap.max_wal_bytes + 1},
         )
-    admission.wal_tracker.accounted_metadata_wal_bytes = (
-        admission.geometry.metadata_wal_upper_bound_bytes
-    )
+    admission.wal_tracker.accounted_metadata_wal_bytes = admission.geometry.metadata_wal_upper_bound_bytes
     with pytest.raises(RuntimeError, match="metadata_wal_projected"):
         importer._profile_metadata_wal_candidate(admission, 1)

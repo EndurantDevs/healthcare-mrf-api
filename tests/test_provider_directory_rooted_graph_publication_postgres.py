@@ -53,12 +53,12 @@ from tests.provider_directory_rooted_graph_rotation_pg_support import (
     locked_exact_current as _locked_exact_current,
 )
 from tests.provider_directory_rooted_graph_rotation_pg_support import (
-    prove_recursive_rooted_rotation,
     prove_stale_legacy_replacement,
 )
 from tests.provider_directory_rooted_graph_rotation_pg_support import (
     publish_legacy_root as _publish_legacy_root,
 )
+from tests.provider_directory_rooted_graph_runtime_test_support import rooted_generation_fixture
 from tests.test_provider_directory_rooted_graph_acquisition_postgres import (
     LEGACY_ACQUISITION_PATH,
     LEGACY_COHORT_PATH,
@@ -97,9 +97,11 @@ async def _install_candidate_migrations(engine, set_validation, dataset_candidat
 
 @asynccontextmanager
 async def _lifecycle_scope(monkeypatch, *, request_failure_budget=True, set_validation=True, dataset_candidates=True):
+    """Use isolated rooted inputs beside the selected genuine catalog migration edition."""
     if request_failure_budget and set_validation and dataset_candidates:
         async with _current_lifecycle_scope(monkeypatch) as context:
-            yield context
+            async with rooted_generation_fixture(context, monkeypatch):
+                yield context
         return
     url = database_url()
     schema_name = f"fhir_twin_test_{uuid.uuid4().hex}"
@@ -134,7 +136,7 @@ async def _lifecycle_scope(monkeypatch, *, request_failure_budget=True, set_vali
         from tests.provider_directory_historical_publication_pg_support import historical_publication_scope
 
         with historical_publication_scope(monkeypatch):
-            yield SimpleNamespace(
+            context = SimpleNamespace(
                 database=database,
                 connection=connection,
                 engine=engine,
@@ -142,6 +144,8 @@ async def _lifecycle_scope(monkeypatch, *, request_failure_budget=True, set_vali
                 schema=schema,
                 schema_name=schema_name,
             )
+            async with rooted_generation_fixture(context, monkeypatch):
+                yield context
     finally:
         await database.disconnect()
         if connection is not None:
@@ -152,17 +156,18 @@ async def _lifecycle_scope(monkeypatch, *, request_failure_budget=True, set_vali
 
 @asynccontextmanager
 async def _current_lifecycle_scope(monkeypatch):
-    from process.provider_directory_generic_source_policy import source_transaction
     from process.uhc_flex_practitioner_registration import register_uhc_flex_practitioner_source
     from tests.provider_directory_specialized_source_postgres_support import specialized_source_scope
+    from tests.test_provider_directory_uhc_flex_practitioner_publication_postgres import administrator_database
 
     async with specialized_source_scope(monkeypatch) as context:
-        async with source_transaction(context.database):
-            await register_uhc_flex_practitioner_source(database=context.database)
-            registration = await register_provider_directory_rooted_graph_source(database=context.database)
-            assert registration.endpoint_created and registration.source_created
-            replay = await register_provider_directory_rooted_graph_source(database=context.database)
-            assert not replay.endpoint_created and not replay.source_created
+        # Registration runs as the administrator, as the operator path does; the Source owner only reads it.
+        administrator = administrator_database(context.engine)
+        await register_uhc_flex_practitioner_source(database=administrator)
+        registration = await register_provider_directory_rooted_graph_source(database=administrator)
+        assert registration.endpoint_created and registration.source_created
+        replay = await register_provider_directory_rooted_graph_source(database=administrator)
+        assert not replay.endpoint_created and not replay.source_created
         context.migration = load_migration(MIGRATION_PATH, "rooted_graph_lifecycle_migration")
         yield context
 
@@ -216,13 +221,13 @@ async def _prove_mismatch(context, current) -> None:
     assert mismatch.value.code == "mismatch"
     assert (
         await context.database.scalar(
-            f"SELECT count(*) FROM {context.schema}.provider_directory_rooted_graph_twin_attempt WHERE matched IS FALSE"
+            f'SELECT count(*) FROM "{context.rooted_input_schema}".provider_directory_rooted_graph_twin_attempt WHERE matched IS FALSE'
         )
         == 1
     )
     assert (
         await context.database.scalar(
-            f"SELECT count(*) FROM {context.schema}."
+            f'SELECT count(*) FROM "{context.rooted_input_schema}".'
             "provider_directory_rooted_graph_twin_admission WHERE "
             "publication_acquisition_id = :acquisition_id",
             acquisition_id=mismatch_candidate.acquisition_id,
@@ -308,7 +313,7 @@ async def _prove_stale_and_legacy(context, rooted_current, previous_ids) -> None
     assert stale.value.code == "stale"
     assert (
         await context.database.scalar(
-            f"SELECT count(*) FROM {context.schema}."
+            f'SELECT count(*) FROM "{context.rooted_input_schema}".'
             "provider_directory_rooted_graph_twin_admission WHERE "
             "publication_acquisition_id = :acquisition_id",
             acquisition_id=stale_candidate.acquisition_id,
@@ -317,55 +322,86 @@ async def _prove_stale_and_legacy(context, rooted_current, previous_ids) -> None
     )
 
 
+async def _admit_fixture_twins(context, current):
+    """Validate real matching acquisitions before the unsupported direct-publication attempt."""
+    baseline = _identity(current, "baseline", "1", "3")
+    candidate = _identity(current, "candidate", "2", "3")
+    baseline_summary = await _complete_success(context.database, baseline)
+    candidate_summary = await _complete_success(context.database, candidate)
+    _assert_matching_roots(baseline_summary, candidate_summary)
+    admission = await admit_provider_directory_rooted_graph_twins(
+        baseline.acquisition_id, candidate.acquisition_id, database=context.database
+    )
+    assert admission.publication_acquisition_id == candidate.acquisition_id
+    return baseline, baseline_summary, candidate
+
+
+async def _canonical_header_snapshot(context):
+    """Capture logical header data independently of the refused publication entry point."""
+    return [
+        await context.connection.fetchval(
+            f"SELECT jsonb_agg(to_jsonb(header) ORDER BY dataset_id) FROM {context.schema}.{table} header"
+        )
+        for table in (
+            "provider_directory_endpoint_dataset",
+            "provider_directory_rooted_graph_dataset",
+            "provider_directory_uhc_flex_practitioner_dataset",
+        )
+    ]
+
+
+async def _assert_direct_publication_refused(context, acquisition_id):
+    before = await _canonical_header_snapshot(context)
+    with pytest.raises(RuntimeError, match="prepared named generation through the Source operator"):
+        await publish_provider_directory_rooted_graph_dataset(acquisition_id, database=context.database, batch_size=4)
+    assert await _canonical_header_snapshot(context) == before
+    assert (
+        await context.connection.fetchval(
+            f"SELECT count(*) FROM {context.schema}.provider_directory_endpoint_dataset WHERE is_current "
+            "AND endpoint_id IN ($1,$2)",
+            exact_uhc_dataset_pair().legacy_endpoint_id,
+            exact_uhc_dataset_pair().rooted_endpoint_id,
+        )
+        == 1
+    )
+
+
 @pytest.mark.asyncio
-async def test_rooted_graph_twin_publication_generations_and_fences(
-    monkeypatch,
-) -> None:
+async def test_rooted_direct_publication_refuses_after_validated_twins(monkeypatch):
+    """Retain native acquisition validation while direct publication leaves the current pointer unchanged."""
     async with _lifecycle_scope(monkeypatch) as context:
-        legacy_current = await _publish_legacy_root(context.database)
-        baseline, baseline_summary, first = await _prove_first_generation(context, legacy_current)
-        rooted_current = await _locked_exact_current(context.database)
-        assert rooted_current is not None
-        _, _, _, second = await _publish_generation(context, rooted_current, "89", "4")
-        second_current = await _locked_exact_current(context.database)
-        assert second_current is not None
-        await _prove_stale_and_legacy(
-            context,
-            second_current,
-            {
-                legacy_current.dataset_id,
-                first.readiness.dataset_id,
-                second.readiness.dataset_id,
-            },
-        )
-        assert (
-            await context.database.scalar(
-                f"SELECT count(*) FROM {context.schema}."
-                "provider_directory_endpoint_dataset WHERE is_current IS TRUE "
-                "AND endpoint_id IN (:legacy_endpoint_id, :rooted_endpoint_id)",
-                legacy_endpoint_id=exact_uhc_dataset_pair().legacy_endpoint_id,
-                rooted_endpoint_id=exact_uhc_dataset_pair().rooted_endpoint_id,
-            )
-            == 1
-        )
+        current = await _publish_legacy_root(context.database)
+        baseline, baseline_summary, candidate = await _admit_fixture_twins(context, current)
+        await assert_missing_terminal_witnesses(context.connection, context.rooted_input_schema)
+        await _complete_error_acquisition(context.database, current)
+        await _prove_mismatch(context, current)
+        await _assert_direct_publication_refused(context, candidate.acquisition_id)
+        assert await _locked_exact_current(context.database) == current
         assert await initialize_provider_directory_rooted_graph_acquisition(baseline, database=context.database) == 0
-        replayed_summary = await seal_provider_directory_rooted_graph_acquisition(baseline, database=context.database)
-        assert replayed_summary.rooted_graph_sha256 == baseline_summary.rooted_graph_sha256
-        with pytest.raises(DBAPIError, match="downgrade_blocked"):
-            await run_migration(context.engine, context.migration, "downgrade")
+        replayed = await seal_provider_directory_rooted_graph_acquisition(baseline, database=context.database)
+        assert replayed.rooted_graph_sha256 == baseline_summary.rooted_graph_sha256
 
 
 @pytest.mark.asyncio
 async def test_official_rotation_allows_stale_legacy_replacement(
     monkeypatch,
 ) -> None:
-    async with _lifecycle_scope(monkeypatch) as context:
+    async with _current_lifecycle_scope(monkeypatch) as context:
         await prove_stale_legacy_replacement(context)
 
 
 @pytest.mark.asyncio
-async def test_recursive_rooted_lineage_revokes_and_recovers_after_rotation(
-    monkeypatch,
-) -> None:
+async def test_rooted_direct_publication_refusal_preserves_rotated_parent(monkeypatch):
+    """Reject stale native admission and unsupported direct publication without replacing the new parent."""
     async with _lifecycle_scope(monkeypatch) as context:
-        await prove_recursive_rooted_rotation(context, _publish_generation)
+        current = await _publish_legacy_root(context.database)
+        baseline, _, candidate = await _admit_fixture_twins(context, current)
+        replacement = await _publish_legacy_root(context.database, "2" * 64)
+        assert replacement.dataset_id != current.dataset_id
+        with pytest.raises(ProviderDirectoryRootedGraphTwinError) as refused:
+            await admit_provider_directory_rooted_graph_twins(
+                baseline.acquisition_id, candidate.acquisition_id, database=context.database
+            )
+        assert refused.value.code == "stale"
+        await _assert_direct_publication_refused(context, candidate.acquisition_id)
+        assert await _locked_exact_current(context.database) == replacement

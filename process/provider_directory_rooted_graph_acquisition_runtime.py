@@ -106,7 +106,7 @@ async def _locked_acquisition_status(
             )
             if locked is not True:
                 raise ProviderDirectoryRootedGraphAcquisitionError("input_drift")
-            current = await require_current_root_fence(database, proof)
+            current = await require_current_root_fence(database, proof, lock_rows=False)
         if not current_matcher(current, identity):
             raise ProviderDirectoryRootedGraphAcquisitionError("input_drift")
         acquisition_row = await database.first(
@@ -252,7 +252,8 @@ async def run_root(
     )
     started_at = dependencies.monotonic()
     try:
-        async with asyncio.timeout(float(config.root_timeout_seconds)):
+        async with asyncio.timeout(float(config.root_timeout_seconds)) as deadline:
+            runner.deadline = deadline.when()
             async with dependencies.session_scope(config.concurrency) as session:
                 await runner.drain_generic_frontier(session)
                 await runner.process_census(session)

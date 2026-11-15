@@ -776,7 +776,7 @@ async def test_representative_query_uses_trigram(catalog_database):
         binding_id,
     )
     await fixture.connection.execute(f'ANALYZE "{fixture.metadata}".registry_fhir_catalog_relationship')
-    sql, address_parameters, _ = catalog._catalog_page_statement({"schema_name": fixture.metadata}, fixture.manifest)
+    sql, address_parameters = catalog._catalog_page_statement({"schema_name": fixture.metadata}, fixture.manifest)
     for fields, index in (
         ({"plan_search": "needle plan"}, "registry_fhir_catalog_plan_trgm"),
         ({"search": "needle plan"}, "registry_fhir_catalog_plan_trgm"),
@@ -834,7 +834,7 @@ async def _prepare_metadata_pin_fixture(fixture, monkeypatch):
     from process import registry_fhir_catalog_custody as custody
 
     verifier = AsyncMock()
-    monkeypatch.setattr(custody, "verify_fhir_catalog_snapshot", verifier)
+    monkeypatch.setattr(custody, "validate_fhir_catalog_snapshot_record", verifier)
     namespace = '"' + fixture.metadata + '"'
     await fixture.connection.execute(f"""CREATE TABLE {namespace}.network_serving_control
       (id integer PRIMARY KEY,metadata_generation text,generation_id bigint);

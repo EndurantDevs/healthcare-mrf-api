@@ -28,11 +28,11 @@ async def test_explicit_retained_owner_precedes_physical_geo_dispatch(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_retained_geo_clone_uses_protected_owner_before_creation_and_seals_empty(monkeypatch):
+async def test_retained_geo_clone_is_writable_until_copy_and_validation(monkeypatch):
     from db.models import GeoZipLookup
 
     monkeypatch.setattr(geo, "is_source_geo_active", lambda _importer: False)
-    protected = AsyncMock(return_value=29)
+    protected = AsyncMock()
     monkeypatch.setattr(archive, "protected_publisher_owner", protected)
     create, capture, seal = AsyncMock(), AsyncMock(return_value="owned"), AsyncMock()
     monkeypatch.setattr(archive, "_create_model_family", create)
@@ -43,16 +43,10 @@ async def test_retained_geo_clone_uses_protected_owner_before_creation_and_seals
     session, spec = object(), SimpleNamespace(importer_id="geo", model_types=(GeoZipLookup,))
     schema = archive.reference_family_stage_schema(UUID(int=3))
     assert await geo.create_model_family_export_clone(session, spec, schema) == "owned"
-    protected.assert_awaited_once_with(session)
-    create.assert_awaited_once_with(
-        session,
-        spec,
-        schema,
-        create_indexes=False,
-        ordinary_heaps=True,
-        protected_owner_oid=29,
-    )
-    seal.assert_awaited_once_with(session, "owned", 29, require_empty=True)
+    create.assert_awaited_once_with(session, spec, schema, create_indexes=False, ordinary_heaps=True)
+    capture.assert_awaited_once_with(session, spec, UUID(int=3))
+    protected.assert_not_awaited()
+    seal.assert_not_awaited()
     writer.assert_not_awaited()
 
 
@@ -158,7 +152,7 @@ async def test_validated_guarded_geo_adoption_keeps_origin_without_installing_ho
 
 @pytest.fixture
 async def retained_geo(monkeypatch):
-    from process import provider_directory_generic_source_policy as policy
+    from process import entity_address_snapshot_receipt as rows
 
     source_hash, target_hash = next(pair for pair in geo.geo_index_schema_hashes() if pair[0] != pair[1])
     table = archive.ReferenceTableReceipt("GeoZipLookup", storage.ROOT, source_hash, 2)
@@ -177,125 +171,122 @@ async def retained_geo(monkeypatch):
         source_capture_contract=archive.IMMUTABLE_NUCC_SOURCE_CAPTURE_CONTRACT,
     )
     publisher = SimpleNamespace(policy=SimpleNamespace(schema="mrf"))
-    transaction = (21, "34", "5/6", 7)
-    identity = AsyncMock(return_value=(publisher, transaction, (11, 12)))
+    named_storage = AsyncMock(return_value=17)
     catalog = AsyncMock(return_value=(table, "a" * 64))
-    monkeypatch.setattr(storage, "_archive_writer", AsyncMock(return_value=8))
-    monkeypatch.setattr(storage, "_retained_geo_identity", identity)
+    row_content = AsyncMock(return_value=(2, "c" * 64))
+    monkeypatch.setattr(storage, "_archive_writer", AsyncMock())
+    monkeypatch.setattr(storage, "_geo_archive_publisher", AsyncMock(return_value=publisher))
+    monkeypatch.setattr(storage, "require_geo_storage", named_storage)
     monkeypatch.setattr(storage, "_retained_geo_catalog", catalog)
-    monkeypatch.setattr(policy, "bound_publisher", lambda: publisher)
-    session = object()
+    monkeypatch.setattr(rows, "_projected_row_identity", row_content)
+    session = SimpleNamespace(in_transaction=lambda: True)
     cut = await storage.capture_geo_retained_cut(
-        session, schema_name="retained_geo", expected_relation_oid=17, expected_relfilenode=19, manifest=manifest
+        session,
+        schema_name="retained_geo",
+        expected_relation_oid="old edition",
+        expected_relfilenode=None,
+        manifest=manifest,
     )
     return SimpleNamespace(
         cut=cut,
         session=session,
         publisher=publisher,
-        transaction=transaction,
         manifest=manifest,
         table=table,
         target_hash=target_hash,
-        identity=identity,
+        named_storage=named_storage,
         catalog=catalog,
+        rows=row_content,
     )
 
 
 @pytest.mark.asyncio
-async def test_retained_capture_binds_exact_catalog(retained_geo):
+async def test_retained_capture_binds_names_schema_indexes_full_content_and_origin(retained_geo):
     observed = retained_geo
-    assert observed.cut.source_generation == observed.manifest.source_serving_generation
-    assert observed.cut.index_oids == (11, 12) and observed.cut.schema_sha256 == observed.table.schema_sha256
-    assert observed.identity.await_count == 2
-    observed.catalog.return_value = (replace(observed.table, schema_sha256=observed.target_hash), "b" * 64)
-    cut = await storage.capture_geo_retained_cut(
-        observed.session,
-        schema_name="retained_geo",
-        expected_relation_oid=17,
-        expected_relfilenode=19,
-        manifest=observed.manifest,
+    cut = observed.cut
+    assert (
+        cut.source_schema,
+        cut.source_generation,
+        cut.schema_sha256,
+        cut.index_profile_sha256,
+        cut.row_count,
+        cut.row_sha256,
+    ) == (
+        "retained_geo",
+        observed.manifest.source_serving_generation,
+        observed.table.schema_sha256,
+        "a" * 64,
+        2,
+        "c" * 64,
     )
-    assert cut.schema_sha256 == observed.target_hash and cut.index_profile_sha256 == "b" * 64
+    observed.named_storage.assert_awaited_once_with(observed.session, schema_name="retained_geo", is_incumbent=True)
+    observed.rows.assert_awaited_once_with(
+        observed.session, "retained_geo", storage.ROOT, row_json_sql="pg_catalog.to_jsonb(row_value)"
+    )
+    assert not any(hasattr(cut, field) for field in ("session", "publisher", "owner_oid", "relation_oid", "index_oids"))
+    observed.catalog.return_value = (replace(observed.table, schema_sha256=observed.target_hash), "b" * 64)
+    copied = await storage.capture_geo_retained_cut(
+        observed.session, schema_name="retained_geo", manifest=observed.manifest
+    )
+    assert copied.schema_sha256 == observed.target_hash and copied.index_profile_sha256 == "b" * 64
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ("schema", "rows", "source_schema", "transaction"))
+@pytest.mark.parametrize("damage", ("schema", "rows", "source_schema", "data_count", "importer"))
 async def test_retained_capture_rejects_changed_input(retained_geo, damage):
     observed = retained_geo
+    manifest = observed.manifest
     if damage in {"schema", "rows"}:
         changed = {"schema_sha256": "f" * 64} if damage == "schema" else {"row_count": 3}
         observed.catalog.return_value = (replace(observed.table, **changed), "a" * 64)
-    if damage == "transaction":
-        observed.identity.side_effect = [
-            observed.identity.return_value,
-            (observed.publisher, (99, "34", "5/6", 7), (11, 12)),
-        ]
-    with pytest.raises(RuntimeError, match="retained_(manifest|location|transaction)_changed"):
+    if damage == "data_count":
+        observed.rows.return_value = (3, "c" * 64)
+    if damage == "importer":
+        manifest = replace(manifest, importer_id="nucc")
+    with pytest.raises((RuntimeError, archive.ReferenceFamilyArchiveError), match="retained_|manifest|table receipt"):
         await storage.capture_geo_retained_cut(
-            observed.session,
-            schema_name="mrf" if damage == "source_schema" else "retained_geo",
-            expected_relation_oid=17,
-            expected_relfilenode=19,
-            manifest=observed.manifest,
+            observed.session, schema_name="mrf" if damage == "source_schema" else "retained_geo", manifest=manifest
         )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "damage",
-    (
-        None,
-        "session",
-        "publisher",
-        "owner",
-        "backend",
-        "transaction",
-        "index_oid",
-        "schema",
-        "profile",
-        "rows",
-        "generation",
-    ),
-)
-async def test_retained_consumption_rechecks_cut(retained_geo, monkeypatch, damage):
+@pytest.mark.parametrize("damage", (None, "location", "schema", "profile", "rows", "data", "generation", "transaction"))
+async def test_retained_consumption_rechecks_names_complete_data_and_origin(retained_geo, damage):
     observed = retained_geo
-    cut, session, origin = observed.cut, observed.session, observed.manifest.source_serving_generation
-    if damage == "session":
-        session = object()
-    if damage == "publisher":
-        cut = replace(cut, publisher=object())
-    if damage == "owner":
-        monkeypatch.setattr(storage, "_archive_writer", AsyncMock(return_value=9))
-    if damage in {"backend", "transaction", "index_oid"}:
-        identity = (99, *observed.transaction[1:]) if damage == "backend" else (21, "35", "5/6", 7)
-        observed.identity.return_value = (
-            observed.publisher,
-            observed.transaction if damage == "index_oid" else identity,
-            (11, 99) if damage == "index_oid" else (11, 12),
-        )
+    session, origin = observed.session, observed.manifest.source_serving_generation
+    schema = "mrf"
+    if damage == "location":
+        schema = "other_schema"
     if damage in {"schema", "profile", "rows"}:
         changes_by_damage = {"schema": {"schema_sha256": "f" * 64}, "rows": {"row_count": 3}, "profile": {}}
         observed.catalog.return_value = (
             replace(observed.table, **changes_by_damage[damage]),
             "b" * 64 if damage == "profile" else "a" * 64,
         )
+    if damage == "data":
+        observed.rows.return_value = (2, "d" * 64)
     if damage == "generation":
         origin = replace(origin, origin_generation=4)
+    if damage == "transaction":
+        session = SimpleNamespace(in_transaction=lambda: False)
     if damage:
-        with pytest.raises(RuntimeError, match="retained_"):
-            await storage._consume_geo_retained_cut(session, "mrf", origin, cut)
+        with pytest.raises((RuntimeError, ValueError), match="retained_|transaction_required"):
+            await storage._consume_geo_retained_cut(session, schema, origin, observed.cut)
     else:
-        assert await storage._consume_geo_retained_cut(session, "mrf", origin, cut) == 17
+        # A separate connection and different catalog address still serve the copied named data.
+        session = SimpleNamespace(is_in_transaction=lambda: True)
+        observed.named_storage.return_value = 99
+        assert await storage._consume_geo_retained_cut(session, schema, origin, observed.cut) == 99
 
 
 @pytest.mark.asyncio
-async def test_retained_adoption_binds_manifest_inventory(retained_geo, monkeypatch):
+async def test_retained_adoption_binds_logical_inventory_and_ignores_old_addresses(retained_geo, monkeypatch):
     observed = retained_geo
     publish = AsyncMock(return_value="published")
     monkeypatch.setattr(storage, "publish_geo_generation", publish)
     monkeypatch.setattr(archive, "_require_published_generation_binding", Mock())
     incumbent, predecessor = SimpleNamespace(schema_name="mrf"), object()
-    for pairs in (((storage.ROOT, 99),), (("different", 17),)):
+    for pairs in ((("different", 17),), ((storage.ROOT, 17), (storage.ROOT, 18)), ()):
         with pytest.raises(RuntimeError, match="retained_manifest_changed"):
             await generation._adopt_validated_family_generation(
                 observed.session,
@@ -312,7 +303,7 @@ async def test_retained_adoption_binds_manifest_inventory(retained_geo, monkeypa
         observed.manifest,
         incumbent,
         observed.cut.source_generation,
-        ((storage.ROOT, 17),),
+        ((storage.ROOT, "opaque old edition"),),
         predecessor,
         geo_retained_cut=observed.cut,
     )
@@ -322,7 +313,7 @@ async def test_retained_adoption_binds_manifest_inventory(retained_geo, monkeypa
 @pytest.mark.asyncio
 async def test_retained_refusal_precedes_generation_write(retained_geo, monkeypatch):
     first = AsyncMock()
-    monkeypatch.setattr(storage, "_writer", AsyncMock(return_value=8))
+    monkeypatch.setattr(storage, "_writer", AsyncMock())
     monkeypatch.setattr(generation, "_first", first)
     with pytest.raises(RuntimeError, match="retained_local_publication_forbidden"):
         await storage.publish_geo_generation(
@@ -342,45 +333,6 @@ async def test_retained_refusal_precedes_generation_write(retained_geo, monkeypa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", (None, "driver", "missing", "virtual", "owner", "filenode", "lock", "readonly"))
-async def test_retained_identity_requires_physical_lock(monkeypatch, damage):
-    from process import provider_directory_generic_source_policy as policy
-    from process import provider_directory_projection_stage as projection
-
-    publisher = SimpleNamespace(connection=object())
-    monkeypatch.setattr(policy, "bound_publisher", lambda: publisher)
-    monkeypatch.setattr(
-        projection, "_copy_driver", AsyncMock(return_value=object() if damage == "driver" else publisher.connection)
-    )
-    observed_fields = [21, "34", "5/6", 7, 8, 19, True, [11, 12], True]
-    changes_by_damage = {
-        "virtual": (2, None),
-        "owner": (4, 9),
-        "filenode": (5, 20),
-        "lock": (6, False),
-        "readonly": (8, False),
-    }
-    if damage in changes_by_damage:
-        position, replacement = changes_by_damage[damage]
-        observed_fields[position] = replacement
-    session = SimpleNamespace(
-        execute=AsyncMock(
-            return_value=SimpleNamespace(one_or_none=lambda: None if damage == "missing" else observed_fields)
-        )
-    )
-    if damage:
-        with pytest.raises(RuntimeError, match="retained_(connection|identity)_changed"):
-            await storage._retained_geo_identity(session, "retained_geo", 17, 19, 8)
-    else:
-        assert await storage._retained_geo_identity(session, "retained_geo", 17, 19, 8) == (
-            publisher,
-            (21, "34", "5/6", 7),
-            (11, 12),
-        )
-        assert session.execute.await_args.args[1] == {"oid": 17, "relation": '"retained_geo"."geo_zip_lookup"'}
-
-
-@pytest.mark.asyncio
 async def test_retained_manifest_refuses_other_provenance(retained_geo, monkeypatch):
     publish = AsyncMock()
     monkeypatch.setattr(storage, "publish_geo_generation", publish)
@@ -394,7 +346,7 @@ async def test_retained_manifest_refuses_other_provenance(retained_geo, monkeypa
             changed,
             SimpleNamespace(schema_name="mrf"),
             changed.source_serving_generation,
-            ((storage.ROOT, 17),),
+            ((storage.ROOT, None),),
             object(),
             geo_retained_cut=retained_geo.cut,
         )

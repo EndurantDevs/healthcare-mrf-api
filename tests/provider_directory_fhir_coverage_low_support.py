@@ -7,11 +7,11 @@ import hashlib
 import importlib
 import io
 import urllib.error
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-
 
 importer = importlib.import_module("process.provider_directory_fhir")
 
@@ -38,7 +38,7 @@ def bulk_identity() -> importer.BulkExportCheckpointIdentity:
 @contextlib.asynccontextmanager
 async def artifact_guard(*_args, **_kwargs):
     """Yield a stable artifact-build fence without database access."""
-    yield importer.ProviderDirectoryArtifactBuildFence(target_oid=None)
+    yield importer.ProviderDirectoryArtifactBuildFence()
 
 
 class AsyncContext:
@@ -110,13 +110,9 @@ def assert_bulk_decode_edges(monkeypatch) -> None:
         "status_url_hash": "hash",
     }
     assert importer._bulk_checkpoint_status_url_error(checkpoint_by_field) == "cipher invalid"
-    monkeypatch.setattr(
-        importer, "_decrypt_bulk_capability", Mock(return_value="not json")
-    )
+    monkeypatch.setattr(importer, "_decrypt_bulk_capability", Mock(return_value="not json"))
     with pytest.raises(RuntimeError, match="manifest_checkpoint_corrupt"):
-        importer._bulk_manifest_payload_from_checkpoint(
-            {"manifest_ciphertext": "cipher"}
-        )
+        importer._bulk_manifest_payload_from_checkpoint({"manifest_ciphertext": "cipher"})
     with pytest.raises(ValueError, match="validator_checkpoint_corrupt"):
         importer._stored_bulk_output_validator(
             {
@@ -161,37 +157,23 @@ async def run_nonvalid_probe_batch(monkeypatch) -> tuple[int, int, set[str]]:
         "_probe_source",
         AsyncMock(return_value=(probe_by_field, capability_by_field)),
     )
-    monkeypatch.setattr(
-        importer, "_provider_directory_api_endpoint_row", Mock(return_value=None)
-    )
-    monkeypatch.setattr(
-        importer, "parse_capability", Mock(return_value={"source_id": "stub"})
-    )
+    monkeypatch.setattr(importer, "_provider_directory_api_endpoint_row", Mock(return_value=None))
+    monkeypatch.setattr(importer, "parse_capability", Mock(return_value={"source_id": "stub"}))
     monkeypatch.setattr(importer, "_upsert_rows", AsyncMock())
     progress = AsyncMock()
     monkeypatch.setattr(importer, "_mark_provider_directory_progress", progress)
-    outcome = await importer._run_source_probe_batch(
-        source_rows, timeout=1, concurrency=10, run_id="run-1"
-    )
+    outcome = await importer._run_source_probe_batch(source_rows, timeout=1, concurrency=10, run_id="run-1")
     assert progress.await_count < 42
     return outcome
 
 
 async def assert_address_publication_edges(monkeypatch) -> None:
     """Cover deferred address publication and failed-stage cleanup."""
-    monkeypatch.setattr(
-        importer, "_address_corroboration_network_metrics", AsyncMock(return_value={})
-    )
-    monkeypatch.setattr(
-        importer, "_provider_directory_artifact_build_guard", artifact_guard
-    )
-    monkeypatch.setattr(
-        importer, "_stage_table_name", Mock(return_value="stage_address")
-    )
+    monkeypatch.setattr(importer, "_address_corroboration_network_metrics", AsyncMock(return_value={}))
+    monkeypatch.setattr(importer, "_provider_directory_artifact_build_guard", artifact_guard)
+    monkeypatch.setattr(importer, "_stage_table_name", Mock(return_value="stage_address"))
     populate_stage = AsyncMock(return_value=False)
-    monkeypatch.setattr(
-        importer, "_populate_address_corroboration_stage", populate_stage
-    )
+    monkeypatch.setattr(importer, "_populate_address_corroboration_stage", populate_stage)
     monkeypatch.setattr(
         importer,
         "_create_provider_directory_address_corroboration_indexes",
@@ -203,29 +185,31 @@ async def assert_address_publication_edges(monkeypatch) -> None:
         AsyncMock(return_value="prepared"),
     )
     monkeypatch.setattr(importer.db, "status", AsyncMock())
-    monkeypatch.setattr(
-        importer.db,
-        "first",
-        AsyncMock(
-            return_value=SimpleNamespace(
+
+    async def metadata_row(statement, **parameters):
+        if statement == importer.address_alias_sql.active_alias_generation_sql(schema="public"):
+            assert parameters == {}
+            return SimpleNamespace(
                 schema_version=importer.address_alias_sql.ADDRESS_ALIAS_SCHEMA_VERSION,
                 active_ruleset_version=importer.address_alias_sql.ADDRESS_ALIAS_RULESET_VERSION,
                 generation=3,
             )
-        ),
-    )
-    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=3))
-    publication_outcome = (
-        await importer.publish_provider_directory_address_corroboration_table(
-            "public", defer_cutover=True
+        assert statement == (
+            'SELECT generation,updated_at FROM "public"."address_alias_artifact_state_v1" '
+            "WHERE artifact_name=:artifact_name"
         )
+        assert parameters == {"artifact_name": importer.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE}
+        return 3, datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(importer.db, "first", AsyncMock(side_effect=metadata_row))
+    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=3))
+    publication_outcome = await importer.publish_provider_directory_address_corroboration_table(
+        "public", defer_cutover=True
     )
     assert publication_outcome == "prepared"
     populate_stage.side_effect = RuntimeError("stage failed")
     cleanup = AsyncMock()
-    monkeypatch.setattr(
-        importer, "_best_effort_drop_address_corroboration_stage", cleanup
-    )
+    monkeypatch.setattr(importer, "_best_effort_drop_address_corroboration_stage", cleanup)
     with pytest.raises(RuntimeError, match="stage failed"):
         await importer.publish_provider_directory_address_corroboration_table("public")
     cleanup.assert_awaited_once()
@@ -247,25 +231,17 @@ async def assert_artifact_summary_edges(monkeypatch) -> None:
     content_proof = importer.EndpointDatasetContentProof(
         "hash", 1, {"Practitioner": "resource-hash"}, {"Practitioner": 1}
     )
-    monkeypatch.setattr(
-        importer, "_existing_artifact_dataset_source_summary", Mock(return_value=None)
-    )
+    monkeypatch.setattr(importer, "_existing_artifact_dataset_source_summary", Mock(return_value=None))
     monkeypatch.setattr(
         importer,
         "_endpoint_dataset_content_proof",
         AsyncMock(return_value=content_proof),
     )
     monkeypatch.setattr(importer, "_assert_artifact_dataset_content_proof", Mock())
-    monkeypatch.setattr(
-        importer, "_record_current_dataset_publication_proof", AsyncMock()
-    )
-    monkeypatch.setattr(
-        importer, "_endpoint_dataset_source_summary", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr(importer, "_record_current_dataset_publication_proof", AsyncMock())
+    monkeypatch.setattr(importer, "_endpoint_dataset_source_summary", AsyncMock(return_value=None))
     with pytest.raises(importer.ProviderDirectoryArtifactBuildStale):
-        await importer._refresh_current_artifact_dataset_source_summary(
-            dataset, candidate, {}, {}
-        )
+        await importer._refresh_current_artifact_dataset_source_summary(dataset, candidate, {}, {})
 
 
 async def assert_network_publication_edges(monkeypatch) -> None:
@@ -276,18 +252,14 @@ async def assert_network_publication_edges(monkeypatch) -> None:
         "_copy_existing_network_catalog": 2,
     }
     for function_name, return_value in async_return_value_by_function_name.items():
-        monkeypatch.setattr(
-            importer, function_name, AsyncMock(return_value=return_value)
-        )
+        monkeypatch.setattr(importer, function_name, AsyncMock(return_value=return_value))
     for function_name in (
         "_ensure_provider_directory_network_catalog_table",
         "_create_provider_directory_network_catalog_indexes",
         "_prepare_provider_directory_artifact_stage",
     ):
         monkeypatch.setattr(importer, function_name, AsyncMock())
-    monkeypatch.setattr(
-        importer, "_provider_directory_artifact_build_guard", artifact_guard
-    )
+    monkeypatch.setattr(importer, "_provider_directory_artifact_build_guard", artifact_guard)
     monkeypatch.setattr(
         importer,
         "_network_catalog_stage_table_name",
@@ -304,30 +276,48 @@ async def assert_network_publication_edges(monkeypatch) -> None:
 
 def assert_seed_fetch_edges(monkeypatch) -> None:
     """Cover environment seed resolution and a local HTTP error body."""
-    monkeypatch.setenv(
-        "HLTHPRT_PROVIDER_DIRECTORY_SEED_DB_URL", "https://fixture.test/seed.db"
-    )
-    monkeypatch.setattr(
-        importer, "_download_seed_db", Mock(side_effect=lambda _url, path: path)
-    )
+    monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_SEED_DB_URL", "https://fixture.test/seed.db")
+    monkeypatch.setattr(importer, "_download_seed_db", Mock(side_effect=lambda _url, path: path))
     seed_path, temporary_directory = importer._resolve_seed_db(None, None)
     try:
         assert seed_path.name == "provider_directory.db"
     finally:
         temporary_directory.cleanup()
-    http_error = urllib.error.HTTPError(
-        "https://fixture.test/fhir", 429, "limited", {}, io.BytesIO(b"{}")
+    http_error = urllib.error.HTTPError("https://fixture.test/fhir", 429, "limited", {}, io.BytesIO(b"{}"))
+    monkeypatch.setattr(importer.urllib.request, "urlopen", Mock(side_effect=http_error))
+    status_code, payload_by_field, error, _elapsed = importer._fetch_json_sync("https://fixture.test/fhir", timeout=1)
+    assert (status_code, payload_by_field, error) == (429, {}, None)
+    assert importer._read_response_body_with_deadline(io.BytesIO(b"ignored"), timeout=1, max_bytes=0) == b""
+
+
+def stub_artifact_build_guard(monkeypatch):
+    """Freeze publication metadata while mocking only native transaction boundaries."""
+    bundle = importlib.import_module("process.provider_directory_artifact_bundle_preparation")
+
+    @contextlib.asynccontextmanager
+    async def unlocked_guard(_schema, target_relation, **_kwargs):
+        publication = (True, ("0", "revision")) if "address_overlay" in target_relation else (False, None)
+        yield importer.ProviderDirectoryArtifactBuildFence((_schema, target_relation), publication)
+
+    monkeypatch.setattr(bundle, "freeze_artifact_stage", AsyncMock())
+    monkeypatch.setattr(
+        bundle,
+        "artifact_publication",
+        AsyncMock(
+            side_effect=lambda _fhir, _schema, relation, **_kwargs: (
+                (True, ("0", "revision")) if "address_overlay" in relation else (False, None)
+            )
+        ),
+    )
+    monkeypatch.setattr(importer, "_provider_directory_artifact_build_guard", unlocked_guard)
+    monkeypatch.setattr(importer, "_address_alias_generation", AsyncMock(return_value=0))
+    monkeypatch.setattr(
+        importer,
+        "_address_alias_artifact_generation",
+        AsyncMock(return_value=0),
     )
     monkeypatch.setattr(
-        importer.urllib.request, "urlopen", Mock(side_effect=http_error)
-    )
-    status_code, payload_by_field, error, _elapsed = importer._fetch_json_sync(
-        "https://fixture.test/fhir", timeout=1
-    )
-    assert (status_code, payload_by_field, error) == (429, {}, None)
-    assert (
-        importer._read_response_body_with_deadline(
-            io.BytesIO(b"ignored"), timeout=1, max_bytes=0
-        )
-        == b""
+        bundle,
+        "address_overlay_publication",
+        AsyncMock(return_value=(0, "revision")),
     )

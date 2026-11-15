@@ -139,13 +139,6 @@ async def _typed_derived_inputs(case):
         f"SELECT dataset_id,resource_id,payload_hash,payload_json FROM {resource} WHERE resource_type='InsurancePlan'"
     )
     await _write_derived_edges(case, directory, header, resource, document, schema, tables)
-    native_rows = await case.admin.fetch(
-        derived.context._INVENTORY_SQL, [native_row["relation_oid"] for native_row in case.inventory["relations"]]
-    )
-    case.inventory["relations"] = [
-        {key: field_value for key, field_value in dict(native_row).items() if key != "supported"}
-        for native_row in native_rows
-    ]
     case.handoff = FHIRSourceCandidateHandoff(derived.storage._encoded(document))
     case.input_snapshot = await input_snapshots(case)
     return case

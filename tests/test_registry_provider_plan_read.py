@@ -242,7 +242,6 @@ async def test_supplied_manifest_requires_exact_type_and_matching_query_before_d
         {"source_generations": {"custom_membership": "a" * 64, "other": "c" * 64}},
         {"approved_custom_revision": 5},
         {"manifest_sha256": "c" * 64},
-        {"address_table_oid": 124},
     ],
 )
 async def test_supplied_manifest_must_match_entire_revalidated_identity(provider_boundary, changes):

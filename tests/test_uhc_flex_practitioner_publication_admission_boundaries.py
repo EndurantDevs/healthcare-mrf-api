@@ -17,7 +17,6 @@ import pytest
 
 from process import provider_directory_generic_source_adapters as source_adapters
 from process import provider_directory_generic_source_policy as source_policy
-from process import provider_directory_source_acquisition_custody as custody
 from process import uhc_flex_official_cohort_snapshot as snapshot
 from process import uhc_flex_official_cohort_store as cohort_store
 from process import uhc_flex_practitioner_publication as publication
@@ -232,11 +231,7 @@ def fresh_publication(monkeypatch):
     )
     database = _FreshPublicationDatabase(admission, candidate, cohort)
     policy = SimpleNamespace(owner_role="owner", publisher_role="publisher", control_runtime_roles=("builder",))
-    driver = SimpleNamespace(is_in_transaction=lambda: database.binding is not None, get_server_pid=lambda: 7)
-    driver.fetchval = AsyncMock(return_value=41)
-    driver.fetchrow = AsyncMock(
-        side_effect=lambda _sql: dict(login="publisher", actor="owner", database_oid=41, backend=7, xid="23")
-    )
+    driver = SimpleNamespace(is_in_transaction=lambda: database.binding is not None)
     publisher = SimpleNamespace(connection=driver, policy=policy, transaction_isolation="repeatable read")
     directory = importlib.import_module("process.provider_directory_fhir")
     source_root = Path(__file__).resolve().parents[1]
@@ -250,11 +245,7 @@ def fresh_publication(monkeypatch):
     monkeypatch.setattr(source_adapters, "source_transaction_available", lambda: publisher if database.owner else None)
     monkeypatch.setattr(snapshot, "bound_publisher", lambda: publisher)
     monkeypatch.setattr(snapshot, "source_copy_session", lambda: database.binding.session)
-    monkeypatch.setattr(snapshot, "_copy_driver", AsyncMock(return_value=driver))
     monkeypatch.setattr(snapshot, "pinned_current_source", lambda *_args, **_kwargs: _empty_source_owner())
-    custody_by_field = {"namespace_roles": ("migration", "namespace_owner")}
-    monkeypatch.setattr(snapshot, "_custody", AsyncMock(return_value=custody_by_field))
-    monkeypatch.setattr(custody, "capture_cohort_snapshot_custody", AsyncMock(return_value=custody_by_field))
     monkeypatch.setattr(cohort_store, "_current_official_snapshot", AsyncMock(return_value=official))
     monkeypatch.setattr(cohort_store, "_stored_cohort_for_dataset", AsyncMock(return_value=cohort))
     identity = publication.build_uhc_flex_practitioner_dataset_identity(admission)
@@ -318,54 +309,17 @@ async def test_fresh_tasks_prepare_real_cohort_before_publication_and_published_
         case.database.events
         == [("source", "repeatable read"), ("source", "read committed"), ("source", "repeatable read")] * 2
     )
-    assert custody.capture_cohort_snapshot_custody.await_count == 2
     assert store._publish_candidate.await_count == (0 if published else 1)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("published", [False, True])
-@pytest.mark.parametrize(
-    "damage",
-    ["snapshot", "custody", "actor", "database", "backend", "xid", "binding", "connection", "policy", "session"],
-)
-async def test_fresh_publication_and_replay_refuse_changed_cohort_authority(
-    fresh_publication, monkeypatch, published, damage
-):
+async def test_fresh_publication_and_replay_refuse_a_changed_official_snapshot(fresh_publication, published):
     case = fresh_publication
     if published:
         store._locked_existing_dataset.return_value = {"dataset_id": case.identity.dataset_id}
-    original_capture = custody.capture_cohort_snapshot_custody
-
-    async def replace_binding(*args, **kwargs):
-        case.database.binding = SimpleNamespace(session=object())
-        return await original_capture(*args, **kwargs)
-
-    actor_by_field = dict(login="publisher", actor="owner", database_oid=41, backend=7, xid="23")
-    changed_actor_by_field = {**actor_by_field, **{damage: "changed" if damage in {"actor", "xid"} else 99}}
-    if damage in {"connection", "policy", "session"}:
-        publisher = SimpleNamespace(connection=case.driver, policy=case.publisher.policy)
-        if damage == "connection":
-            publisher.connection = object()
-        elif damage == "policy":
-            publisher.policy = SimpleNamespace(**vars(case.publisher.policy))
-        else:
-            monkeypatch.setattr(snapshot, "source_copy_session", lambda: object())
-        monkeypatch.setattr(
-            snapshot, "source_transaction_available", lambda: publisher if case.database.owner else None
-        )
-    if damage == "snapshot":
-        official = cohort_store._current_official_snapshot.return_value
-        cohort_store._current_official_snapshot.side_effect = [official] * 2 + [object()]
-    if damage == "custody":
-        custody.capture_cohort_snapshot_custody.return_value = {"namespace_roles": ("foreign", "namespace_owner")}
-    if damage == "binding":
-        monkeypatch.setattr(custody, "capture_cohort_snapshot_custody", replace_binding)
-    if damage in {"actor", "database", "backend", "xid"}:
-        if damage == "database":
-            changed_actor_by_field = {**actor_by_field, "database_oid": 99}
-        case.driver.fetchrow.side_effect = (
-            [actor_by_field, changed_actor_by_field] if damage == "xid" else [changed_actor_by_field]
-        )
+    official = cohort_store._current_official_snapshot.return_value
+    cohort_store._current_official_snapshot.side_effect = [official] * 2 + [object()]
 
     async def publish():
         try:

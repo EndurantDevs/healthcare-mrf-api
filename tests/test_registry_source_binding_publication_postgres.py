@@ -3,7 +3,7 @@
 
 import hashlib
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from uuid import UUID
 
 import pytest
@@ -21,6 +21,7 @@ from tests.test_network_fhir_source_witness_publication_postgres import (
     _consume_expected_success,
     _consumer,
     _exact_request_arguments,
+    _initial_sources,
     _manifest,
     _publication_case,
     _publish_once,
@@ -151,7 +152,7 @@ async def test_source_approval_leaves_serving_pinned_then_one_final_batch_publis
             original_rows = await _assert_serving_parity(context, pinned, reader)
             final_queue = await _queue_source_binding_component(context, first.generation_id)
             async with _consumer(worker) as (arguments, _calls):
-                arguments["initial_address_sources"] = None
+                arguments["initial_address_sources"] = replace(_initial_sources(context), initial_source_recipes=())
                 final = await _consume_expected_success(
                     context, _exact_request_arguments(arguments, final_queue), final_queue
                 )
@@ -183,7 +184,7 @@ async def test_source_batch_consumer_publishes_once_and_preserves_pinned_source(
             queued = await _queue_source_binding_component(context, first.generation_id)
             assert await _head(worker) == first.generation_id
             async with _consumer(worker) as (arguments, calls):
-                arguments["initial_address_sources"] = None
+                arguments["initial_address_sources"] = replace(_initial_sources(context), initial_source_recipes=())
                 completed = await _consume_expected_success(
                     context, _exact_request_arguments(arguments, queued), queued
                 )

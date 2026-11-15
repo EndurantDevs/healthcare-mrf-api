@@ -7,7 +7,7 @@ from __future__ import annotations
 import importlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 from sqlalchemy import text
@@ -57,6 +57,7 @@ SET_CONTRACT = "entity_address_snapshot_destination.postgres.v2"
 BASE_VERSION_REMAP_CONTRACT = "entity_address_base_version_remap.postgres.v1"
 SET_BASE_VERSION_REMAP_CONTRACT = "entity_address_base_version_remap.postgres.v2"
 GEO_PREPARATION_CONTRACT = "entity_address_geo_assurance_preparation.postgres.v1"
+GEO_NAMED_PREPARATION_CONTRACT = "entity_address_geo_assurance_preparation.postgres.v2"
 _LOCAL_GEO_DEPENDENCIES = (
     "npi_address",
     "mrf_address",
@@ -106,10 +107,11 @@ class EntityAddressBaseVersionRemapEvidence:
 class EntityAddressGeoAssurancePreparation:
     """Destination-local identity of one fully projected stage candidate."""
 
-    stage_table_oid: int
+    stage_table_oid: object = field(compare=False)
     projected_rows: int
-    relation_signature: tuple[tuple[str, int, int], ...]
-    publisher_selected_inputs_sha256: str | None = None
+    relation_signature: geo_projection.ProjectionRelationSignature
+    publisher_selected_inputs_sha256: str | None = field(default=None, compare=False)
+    stage_relation: tuple[str, str] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """Return the bounded local geo-assurance receipt."""
@@ -120,10 +122,17 @@ class EntityAddressGeoAssurancePreparation:
             "stage_table_oid": self.stage_table_oid,
             "projected_rows": self.projected_rows,
             "relation_signature": {
-                name: [relation_oid, relation_filenode]
-                for name, relation_oid, relation_filenode in self.relation_signature
+                name: [first_component, second_component]
+                for name, first_component, second_component in self.relation_signature
             },
         }
+        if self.stage_relation is not None:
+            receipt_by_field["contract"] = GEO_NAMED_PREPARATION_CONTRACT
+            del receipt_by_field["stage_table_oid"]
+            receipt_by_field["stage_relation"] = {
+                "schema_name": self.stage_relation[0],
+                "relation_name": self.stage_relation[1],
+            }
         if self.publisher_selected_inputs_sha256 is not None:
             receipt_by_field["publisher_selected_inputs_sha256"] = self.publisher_selected_inputs_sha256
         return receipt_by_field
@@ -334,43 +343,46 @@ def _geo_signature(
     value: object,
     *,
     db_schema: str,
-) -> tuple[tuple[str, int, int], ...]:
-    """Validate one local dependency signature without assigning portability."""
+) -> geo_projection.ProjectionRelationSignature:
+    """Decode declared QNames and retain opaque legacy metadata without assigning freshness."""
+    try:
+        return geo_projection.projection_relation_signature_tuple(db_schema, value)
+    except ValueError as error:
+        raise EntityAddressSnapshotDestinationError(
+            "entity-address geo-assurance dependency signature is invalid"
+        ) from error
 
-    expected_names = {
-        *(f"{db_schema}.{name}" for name in _LOCAL_GEO_DEPENDENCIES),
-        *_SHARED_GEO_DEPENDENCIES,
+
+def _geo_binding_names(db_schema, bindings):
+    """Validate declared names while leaving saved compatibility tokens uninterpreted."""
+    if bindings is None:
+        return None
+    validator = (
+        geo_projection.validate_projection_dependency_qnames
+        if geo_projection._is_named_binding_family(bindings)
+        else geo_projection.validate_projection_dependency_bindings
+    )
+    validated = validator(db_schema, bindings)
+    return {
+        name: {field: binding[field] for field in ("schema_name", "table_name")} for name, binding in validated.items()
     }
-    if not isinstance(value, Mapping) or set(value) != expected_names:
-        raise EntityAddressSnapshotDestinationError("entity-address geo-assurance dependency signature is invalid")
-    signature_entries = []
-    for relation_name, identity in value.items():
-        if (
-            not isinstance(identity, (list, tuple))
-            or len(identity) != 2
-            or any(type(number) is not int or number <= 0 for number in identity)
-        ):
-            raise EntityAddressSnapshotDestinationError("entity-address geo-assurance dependency signature is invalid")
-        signature_entries.append((str(relation_name), identity[0], identity[1]))
-    return tuple(sorted(signature_entries))
 
 
 async def _capture_geo_preparation(
     session: Any,
     *,
     db_schema: str,
-    stage_table_oid: int,
+    stage_table_oid=None,
     projected_rows: int,
     dependency_bindings=None,
     publisher_selected_inputs_sha256=None,
+    stage_relation_name=None,
 ) -> EntityAddressGeoAssurancePreparation:
-    """Capture the candidate only when it matches the current local dependencies."""
-
-    state_table = geo_projection.GEO_ASSURANCE_STATE_TABLE
+    """Bind current logical input declarations and accounting to the validated named stage."""
     signature_sql = geo_projection.projection_relation_signature_sql(
         db_schema, **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings})
     )
-    bindings_match_sql = (
+    match_sql = (
         "TRUE"
         if dependency_bindings is None
         else geo_projection.projection_dependency_bindings_match_sql(db_schema, dependency_bindings)
@@ -379,10 +391,9 @@ async def _capture_geo_preparation(
         (
             await session.execute(
                 text(
-                    "SELECT candidate_geo_assurance_version, candidate_table_oid::bigint, "
-                    "candidate_relation_signature, candidate_projected_rows, candidate_dependency_bindings, "
-                    f"{signature_sql} AS current_signature, {bindings_match_sql} AS bindings_match "
-                    f'FROM "{db_schema}"."{state_table}" WHERE singleton IS TRUE'
+                    "SELECT candidate_geo_assurance_version,candidate_relation_signature,candidate_projected_rows,candidate_dependency_bindings, "
+                    f"{signature_sql} AS current_signature, {match_sql} AS bindings_match "
+                    f'FROM "{db_schema}"."{geo_projection.GEO_ASSURANCE_STATE_TABLE}" WHERE singleton IS TRUE'
                 )
             )
         )
@@ -392,21 +403,29 @@ async def _capture_geo_preparation(
     if (
         state is None
         or state["candidate_geo_assurance_version"] != geo_projection.GEO_ASSURANCE_VERSION
-        or state["candidate_table_oid"] != stage_table_oid
         or state["candidate_projected_rows"] != projected_rows
-        or state["candidate_relation_signature"] != state["current_signature"]
-        or state.get("candidate_dependency_bindings") != dependency_bindings
         or state["bindings_match"] is not True
     ):
         raise EntityAddressSnapshotDestinationError("entity-address geo-assurance candidate is stale")
+    signature = geo_projection.projection_named_relation_signature(
+        db_schema, state["candidate_relation_signature"], dependency_bindings
+    )
+    current = geo_projection.projection_named_relation_signature(
+        db_schema, state["current_signature"], dependency_bindings
+    )
+    supplied_bindings = _geo_binding_names(db_schema, dependency_bindings)
+    saved_bindings = _geo_binding_names(db_schema, state.get("candidate_dependency_bindings"))
+    if signature != current or saved_bindings != supplied_bindings:
+        raise EntityAddressSnapshotDestinationError("entity-address geo-assurance candidate is stale")
+    if type(stage_relation_name) is not str:
+        raise EntityAddressSnapshotDestinationError("entity-address geo-assurance stage name is required")
+    stage_name = geo_projection._sql_identifier(stage_relation_name, field_name="address stage")
     return EntityAddressGeoAssurancePreparation(
-        stage_table_oid=stage_table_oid,
+        stage_table_oid=None,
         projected_rows=projected_rows,
-        relation_signature=_geo_signature(
-            state["candidate_relation_signature"],
-            db_schema=db_schema,
-        ),
+        relation_signature=signature,
         publisher_selected_inputs_sha256=publisher_selected_inputs_sha256,
+        stage_relation=(db_schema, stage_name),
     )
 
 
@@ -416,7 +435,6 @@ async def _prepare_moved_destination(
     db_schema: str,
     import_date: str,
     stage_names: Mapping[str, str],
-    stage_oids: tuple[tuple[str, int], ...],
     source_serving_generation: EntityAddressServingGeneration | None,
     dependency_bindings=None,
 ) -> tuple[
@@ -427,7 +445,6 @@ async def _prepare_moved_destination(
     """Project real local geo assurance and run native stage validation."""
 
     main_stage = stage_names[entity_address_unified.EntityAddressUnified.__tablename__]
-    stage_oid = dict(stage_oids)[main_stage]
     stage_rows = int(await session.scalar(text(f'SELECT COUNT(*) FROM "{db_schema}"."{main_stage}"')) or 0)
     geo_context_map: dict[str, Any] = {}
     projected_rows = await entity_address_unified._materialize_geo_assurance(
@@ -445,12 +462,13 @@ async def _prepare_moved_destination(
         preserve_unversioned_base_rows=True,
         source_serving_generation=source_serving_generation,
     )
+    prepared.context.update(geo_context_map)
     if dependency_bindings is not None:
         prepared.context["dependency_bindings"] = dependency_bindings
     geo_preparation = await _capture_geo_preparation(
         session,
         db_schema=db_schema,
-        stage_table_oid=stage_oid,
+        stage_relation_name=prepared.stage_cls.__tablename__,
         projected_rows=projected_rows,
         **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings}),
     )
@@ -514,24 +532,24 @@ async def _move_remapped_destination(
     normalized_schema: str,
     stage_names: Mapping[str, str],
     preserve_private_stage: bool = False,
-) -> tuple[tuple[str, int], ...]:
+) -> tuple[tuple[str, str], ...]:
     """Move the validated remapped family into its native stage names."""
 
     await restore._reset_restored_evidence_sequence(session, validated_owner)
-    stage_oids = await restore._move_owned_relations(
+    stage_relations = await restore._move_owned_relations(
         session,
         owner=validated_owner,
         db_schema=normalized_schema,
         stage_names=stage_names,
     )
-    await restore._verify_moved_stage_oids(
+    await restore._verify_moved_stage_relations(
         session,
         db_schema=normalized_schema,
-        stage_oids=stage_oids,
+        stage_relations=stage_relations,
     )
     if not preserve_private_stage:
         await restore._drop_empty_owned_schema(session, validated_owner)
-    return stage_oids
+    return stage_relations
 
 
 async def prepare_entity_address_archive_destination(
@@ -549,13 +567,18 @@ async def prepare_entity_address_archive_destination(
 
     ``source_serving_generation`` is the source capture's portable origin
     tuple. ``None`` explicitly selects generation-less manual compatibility.
-    ``dependency_bindings`` is trusted local held-relation authority, never
-    peer metadata. Its exact physical identity is checked under locks and
-    retained alongside the canonical-key signature through publication.
+    ``dependency_bindings`` declares trusted local input names, never peer
+    metadata. Native locks and access preserve the selected inputs through
+    validation and publication; logical signatures remain portable.
     """
     _require_caller_transaction(session)
     if dependency_bindings is not None:
-        dependency_bindings = geo_projection.validate_projection_dependency_bindings(db_schema, dependency_bindings)
+        validator = (
+            geo_projection.validate_projection_dependency_qnames
+            if geo_projection._is_named_binding_family(dependency_bindings)
+            else geo_projection.validate_projection_dependency_bindings
+        )
+        dependency_bindings = validator(db_schema, dependency_bindings)
     async with db.bind_existing_session(session):
         return await _prepare_bound_destination(
             session,
@@ -607,7 +630,7 @@ async def _prepare_bound_destination(session, destination_payload, *, preserve_p
         destination_alias=destination_alias,
         pre_remap_receipt=source_receipt,
     )
-    stage_oids = await _move_remapped_destination(
+    stage_relations = await _move_remapped_destination(
         session,
         validated_owner=validated_owner,
         normalized_schema=normalized_schema,
@@ -619,7 +642,6 @@ async def _prepare_bound_destination(session, destination_payload, *, preserve_p
         db_schema=normalized_schema,
         import_date=normalized_date,
         stage_names=stage_names,
-        stage_oids=stage_oids,
         source_serving_generation=validated_source_generation,
         dependency_bindings=destination_payload.get("dependency_bindings"),
     )
@@ -627,7 +649,7 @@ async def _prepare_bound_destination(session, destination_payload, *, preserve_p
         restored=_prepared_restore_receipt(
             validated_owner=validated_owner,
             normalized_date=normalized_date,
-            stage_oids=stage_oids,
+            stage_relations=stage_relations,
             post_remap_receipt=post_remap_receipt,
             stage_integrity=stage_integrity,
             prepared=prepared,
@@ -649,7 +671,7 @@ def _prepared_restore_receipt(
     *,
     validated_owner: EntityAddressArchiveStageOwnership,
     normalized_date: str,
-    stage_oids: tuple[tuple[str, int], ...],
+    stage_relations: tuple[tuple[str, str], ...],
     post_remap_receipt: EntityAddressArchiveReceipt,
     stage_integrity: EntityAddressStageIntegrityReceipt,
     prepared: adoption.PreparedEntityAddressSnapshotAdoption,
@@ -660,7 +682,7 @@ def _prepared_restore_receipt(
         ownership=validated_owner,
         db_schema=prepared.db_schema,
         import_date=normalized_date,
-        stage_relation_oids=stage_oids,
+        stage_relations=stage_relations,
         semantic_receipt=post_remap_receipt,
         stage_integrity=stage_integrity,
         prepared=prepared,
@@ -743,27 +765,17 @@ def _validated_remap_evidence(
     )
 
 
-def _validated_geo_preparation(
-    geo_value: object,
-    *,
-    db_schema: str,
-) -> EntityAddressGeoAssurancePreparation:
-    """Validate persisted destination-local geo candidate evidence."""
-
-    fields = {
-        "contract",
-        "geo_assurance_version",
-        "stage_table_oid",
-        "projected_rows",
-        "relation_signature",
-    }
+def _validated_geo_preparation(geo_value: object, *, db_schema: str) -> EntityAddressGeoAssurancePreparation:
+    """Preserve raw legacy metadata or validate the complete named stage receipt."""
+    fields = {"contract", "geo_assurance_version", "projected_rows", "relation_signature"}
+    named = isinstance(geo_value, Mapping) and geo_value.get("contract") == GEO_NAMED_PREPARATION_CONTRACT
+    fields.add("stage_relation" if named else "stage_table_oid")
     if (
         not isinstance(geo_value, Mapping)
         or set(geo_value) not in (fields, fields | {"publisher_selected_inputs_sha256"})
-        or geo_value["contract"] != GEO_PREPARATION_CONTRACT
+        or geo_value["contract"] not in (GEO_PREPARATION_CONTRACT, GEO_NAMED_PREPARATION_CONTRACT)
+        or type(geo_value["geo_assurance_version"]) is not int
         or geo_value["geo_assurance_version"] != geo_projection.GEO_ASSURANCE_VERSION
-        or type(geo_value["stage_table_oid"]) is not int
-        or geo_value["stage_table_oid"] <= 0
         or type(geo_value["projected_rows"]) is not int
         or geo_value["projected_rows"] < 0
     ):
@@ -775,14 +787,42 @@ def _validated_geo_preparation(
         or any(character not in "0123456789abcdef" for character in selected_digest)
     ):
         raise EntityAddressSnapshotDestinationError("entity-address selected input digest is invalid")
+    stage_relation = None
+    if named:
+        relation = geo_value["stage_relation"]
+        if (
+            not isinstance(relation, Mapping)
+            or set(relation) != {"schema_name", "relation_name"}
+            or relation["schema_name"] != db_schema
+            or type(relation["relation_name"]) is not str
+        ):
+            raise EntityAddressSnapshotDestinationError("entity-address geo-assurance stage name is invalid")
+        try:
+            stage_relation = (
+                db_schema,
+                geo_projection._sql_identifier(relation["relation_name"], field_name="address stage"),
+            )
+        except ValueError as error:
+            raise EntityAddressSnapshotDestinationError(
+                "entity-address geo-assurance preparation receipt is invalid"
+            ) from error
+    try:
+        signature = geo_projection.projection_relation_signature_tuple(
+            db_schema, geo_value["relation_signature"], allow_opaque_legacy=not named
+        )
+    except ValueError as error:
+        raise EntityAddressSnapshotDestinationError(
+            "entity-address geo-assurance preparation receipt is invalid"
+        ) from error
+    relation_entries = tuple(entry for entry in signature if entry[0] != f"{db_schema}.npi_result_generation")
+    if named and not all(type(first) is str and type(second) is str for _, first, second in relation_entries):
+        raise EntityAddressSnapshotDestinationError("entity-address geo-assurance named signature is invalid")
     return EntityAddressGeoAssurancePreparation(
-        stage_table_oid=geo_value["stage_table_oid"],
+        stage_table_oid=None if named else geo_value["stage_table_oid"],
         projected_rows=geo_value["projected_rows"],
-        relation_signature=_geo_signature(
-            geo_value["relation_signature"],
-            db_schema=db_schema,
-        ),
+        relation_signature=signature,
         publisher_selected_inputs_sha256=selected_digest,
+        stage_relation=stage_relation,
     )
 
 
@@ -907,25 +947,6 @@ def _require_destination_contracts(contract, source_receipt, source_alias, desti
         require_matching_entity_address_alias_semantics(source_alias, destination_alias)
 
 
-def _prepared_main_stage_oid(
-    stored: Mapping[str, Any],
-    *,
-    prepared: adoption.PreparedEntityAddressSnapshotAdoption,
-) -> int:
-    """Return the stored OID for the native prepared main stage."""
-
-    try:
-        stage_oid_entries = stored["restored"]["stage_relation_oids"]
-        relation_oid = next(
-            entry["oid"] for entry in stage_oid_entries if entry["table_name"] == prepared.stage_cls.__tablename__
-        )
-    except (KeyError, StopIteration, TypeError) as error:
-        raise EntityAddressSnapshotDestinationError("entity-address destination stage identity is invalid") from error
-    if type(relation_oid) is not int or relation_oid <= 0:
-        raise EntityAddressSnapshotDestinationError("entity-address destination stage identity is invalid")
-    return relation_oid
-
-
 async def _require_prepared_base_versions(
     session: Any,
     *,
@@ -982,6 +1003,23 @@ async def _activate_bound_destination(
     return await adoption.adopt_prepared_entity_address_snapshot(prepared, callbacks=callbacks)
 
 
+def _logical_geo_preparation(expected_geo, *, prepared, dependency_bindings):
+    """Compare the stage's declared name and semantic inputs without interpreting old metadata tokens."""
+    expected_stage = (prepared.db_schema, prepared.stage_cls.__tablename__)
+    if expected_geo.stage_relation is not None and expected_geo.stage_relation != expected_stage:
+        raise EntityAddressSnapshotDestinationError("entity-address geo-assurance stage name differs")
+    return replace(
+        expected_geo,
+        stage_table_oid=None,
+        stage_relation=expected_stage,
+        relation_signature=geo_projection.projection_named_relation_signature(
+            prepared.db_schema,
+            {name: [first, second] for name, first, second in expected_geo.relation_signature},
+            dependency_bindings,
+        ),
+    )
+
+
 async def _validated_bound_destination(session, *, stored):
     """Perform every content-dependent destination check without publishing."""
 
@@ -1012,15 +1050,11 @@ async def _validated_bound_destination(session, *, stored):
         stored["geo_assurance"],
         db_schema=prepared.db_schema,
     )
-    if expected_geo.stage_table_oid != _prepared_main_stage_oid(
-        stored,
-        prepared=prepared,
-    ):
-        raise EntityAddressSnapshotDestinationError("entity-address geo-assurance stage identity differs")
+    expected_geo = _logical_geo_preparation(expected_geo, prepared=prepared, dependency_bindings=dependency_bindings)
     actual_geo = await _capture_geo_preparation(
         session,
         db_schema=prepared.db_schema,
-        stage_table_oid=expected_geo.stage_table_oid,
+        stage_relation_name=prepared.stage_cls.__tablename__,
         projected_rows=expected_geo.projected_rows,
         dependency_bindings=dependency_bindings,
     )

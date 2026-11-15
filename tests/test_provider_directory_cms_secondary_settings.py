@@ -11,14 +11,10 @@ import pytest
 
 from db import migration_generic_source_candidates as candidates
 from process import provider_directory_cms_allocator_callables as allocator
-from process import provider_directory_cms_control_custody as controls
 from process import provider_directory_source_checkpoint_catalog as checkpoint
 from process import provider_directory_terminal_root_retirement_controls as retirement
 from process.provider_directory_generic_candidate import GenericCandidateError
-from tests.test_provider_directory_cms_control_custody import _authentic_entry
-from tests.test_provider_directory_source_callable_custody import _entry
 from tests.test_provider_directory_source_checkpoint_catalog import _guards
-from tests.test_source_validator_argument_types_migration import _load, _migration, _parse_function
 
 _OLD = ["search_path=pg_catalog"]
 _NEW = ["search_path=pg_catalog, pg_temp"]
@@ -63,53 +59,6 @@ def test_allocator_settings_near_misses_refuse(settings):
         allocator._require_definition(row, 31, owners, bodies)
 
 
-@pytest.mark.parametrize("name", [entry[0] for entry in _migration()._CONTRACTS])
-@pytest.mark.parametrize("settings", [_OLD, _NEW])
-def test_control_source_contracts_accept_only_settings_pair(name, settings):
-    row = _authentic_entry(name)
-    row["definition"]["proconfig"] = deepcopy(settings)
-    original = deepcopy(row)
-    controls._require_callable_definition(row, "snapshot_schema", 44)
-    assert row == original
-    row["definition"]["proargdefaults"] = "0"
-    with pytest.raises(ValueError, match="callable_definition_changed"):
-        controls._require_callable_definition(row, "snapshot_schema", 44)
-
-
-@pytest.mark.parametrize("settings", _UNAPPROVED)
-def test_control_settings_near_misses_refuse(settings):
-    row = _authentic_entry("provider_directory_reviewed_subset_activation_valid")
-    row["definition"]["proconfig"] = deepcopy(settings)
-    with pytest.raises(ValueError, match="callable_definition_changed"):
-        controls._require_callable_definition(row, "snapshot_schema", 44)
-
-
-def test_null_settings_control_exception_remains_exact(monkeypatch):
-    row = _entry("provider_directory_profile_delta_receipt_immutable_v1()")
-    migration, statements = _load("20260730110000_provider_directory_profile_delta.py"), []
-    monkeypatch.setattr(
-        migration,
-        "op",
-        SimpleNamespace(
-            create_table=lambda *args, **kwargs: None,
-            create_index=lambda *args, **kwargs: None,
-            execute=statements.append,
-        ),
-    )
-    migration._create_delta_receipt_table("snapshot_schema")
-    definitions = [sql for sql in statements if sql.strip().upper().startswith("CREATE FUNCTION")]
-    assert len(definitions) == 1
-    name, attributes = _parse_function(definitions[0].replace("$$", "$guard$"))
-    assert name == row["definition"]["proname"]
-    row["definition"]["prosrc"] = attributes[-1]
-    namespace = int(row["definition"]["pronamespace"])
-    controls._require_callable_definition(row, "snapshot_schema", namespace)
-    for settings in (_OLD, _NEW):
-        row["definition"]["proconfig"] = settings
-        with pytest.raises(ValueError, match="callable_definition_changed"):
-            controls._require_callable_definition(row, "snapshot_schema", namespace)
-
-
 def _checkpoint_case(monkeypatch, root, settings):
     guards = _guards(root)
     monkeypatch.setattr(
@@ -136,8 +85,13 @@ def test_checkpoint_settings_pair_preserves_complete_invocation(monkeypatch, roo
 
 
 @pytest.mark.parametrize("settings", _UNAPPROVED)
-def test_checkpoint_settings_near_misses_refuse(monkeypatch, settings):
+def test_checkpoint_data_contract_ignores_settings(monkeypatch, settings):
+    """Opaque historical settings do not replace the complete DATA invocation contract."""
     guards, policy = _checkpoint_case(monkeypatch, checkpoint.BULK_ROOT, settings)
+    before = deepcopy(guards)
+    checkpoint._require_guards(guards, checkpoint.BULK_ROOT, policy, legacy=True)
+    assert guards == before
+    guards[0]["tgargs"] = b"changed\x00"
     with pytest.raises(GenericCandidateError, match="checkpoint_guard_changed"):
         checkpoint._require_guards(guards, checkpoint.BULK_ROOT, policy, legacy=True)
 

@@ -58,51 +58,63 @@ def _control_artifact_projection():
     )
 
 
-def _control_layout(
-    relation_oid: int,
-    exact_fingerprint: str,
-    structural_fingerprint: str,
-    index_oid: int,
-    toastable_column: str,
-):
-    """Return one relation storage layout for control-plan metadata."""
-    return importer._ProviderDirectoryProfileRelationStorageLayout(
-        exact_fingerprint=exact_fingerprint,
-        structural_fingerprint=structural_fingerprint,
-        relation_oid=relation_oid,
+def _control_layout(relation_name, native_handle, toastable_column):
+    """Return a named numeric layout with transient catalog handles only."""
+    return importer._ProviderDirectoryProfileCapacityLayout(
+        schema_name="mrf",
+        relation_name=relation_name,
+        relation_oid=native_handle,
         toast_oid=None,
-        main_index_oids=(index_oid,),
+        main_index_oids=(native_handle + 100,),
         main_index_pages=(1,),
         toast_index_oids=(),
         toast_index_pages=(),
         toastable_columns=(toastable_column,),
-        effective_tablespace_oids=(1663,),
     )
 
 
-def _control_layout_by_oid() -> dict[int, object]:
-    """Return every admission-control storage layout."""
+def _control_layout_by_name():
+    """Measure the finite admission-control names independently of their handles."""
     return {
-        11: _control_layout(11, "1" * 64, "a" * 64, 101, "payload"),
-        12: _control_layout(12, "2" * 64, "b" * 64, 102, "progress"),
-        13: _control_layout(13, "3" * 64, "c" * 64, 103, "canonical_lease_json"),
-        14: _control_layout(14, "4" * 64, "d" * 64, 104, "source_vector_json"),
-        15: _control_layout(15, "5" * 64, "e" * 64, 105, "receipt_json"),
+        name: _control_layout(name, handle, column)
+        for handle, (name, column) in enumerate(
+            (
+                ("provider_directory_profile_build_checkpoint", "payload"),
+                ("import_run", "progress"),
+                ("provider_directory_profile_capacity_lease_consumption", "canonical_lease_json"),
+                ("provider_directory_profile_serving_generation", "source_vector_json"),
+                ("provider_directory_profile_capacity_preflight_receipt", "receipt_json"),
+            ),
+            11,
+        )
     }
+
+
+def _install_control_layouts(monkeypatch):
+    """Keep real QName selection and control planning while replacing catalog I/O."""
+    layouts_by_name = _control_layout_by_name()
+    layouts_by_handle = {layout.relation_oid: layout for layout in layouts_by_name.values()}
+
+    async def resolve(schema, name):
+        assert schema == "mrf"
+        return layouts_by_name[name].relation_oid
+
+    async def measure(native_handle, **options):
+        assert options.get("expected_persistence") == "p"
+        return layouts_by_handle[native_handle]
+
+    monkeypatch.setattr(importer, "_schema", lambda: "mrf")
+    monkeypatch.setattr(importer, "_provider_directory_relation_oid", AsyncMock(side_effect=resolve))
+    monkeypatch.setattr(
+        importer, "_provider_directory_profile_capacity_relation_layout", AsyncMock(side_effect=measure)
+    )
+    return layouts_by_name
 
 
 def _control_plan_context():
     """Return database, batch, lineage, and dataset-fence plan inputs."""
     database_identity = SimpleNamespace(
-        build_checkpoint_oid=11,
-        import_run_oid=12,
-        capacity_consumption_oid=13,
-        serving_generation_oid=14,
-        build_checkpoint_storage_fingerprint="1" * 64,
-        import_run_storage_fingerprint="2" * 64,
-        capacity_consumption_storage_fingerprint="3" * 64,
-        serving_generation_storage_fingerprint="4" * 64,
-        tablespace_oid=1663,
+        relations={role: {**entry, "schema": "mrf"} for role, entry in _geometry_payload()["relations"].items()},
         postgres_default_toast_compression="pglz",
     )
     batch_plan = SimpleNamespace(
@@ -134,17 +146,7 @@ async def test_control_plan_excludes_signed_terminal_zero_probe(
 ):
     """Exclude the terminal zero probe from signed DML batch counts."""
     artifact_projection = _control_artifact_projection()
-    layout_by_oid = _control_layout_by_oid()
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_relation_storage_fingerprint",
-        AsyncMock(side_effect=lambda relation_oid, **_: layout_by_oid[relation_oid]),
-    )
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_relation_oid",
-        AsyncMock(return_value=15),
-    )
+    _install_control_layouts(monkeypatch)
     toast_counter = AsyncMock(return_value=0)
     monkeypatch.setattr(
         importer,

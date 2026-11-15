@@ -22,12 +22,12 @@ from process.provider_directory_profile_capacity_preflight_contract import (
 CMS_ADMISSION_REQUEST_CONTRACT = "provider-directory-cms-nonprofile-admission-request.v1"
 CMS_LIMITS_CONTRACT = "provider-directory-cms-nonprofile-limits.v1"
 CMS_GEOMETRY_CONTRACT = "provider-directory-cms-nonprofile-capacity.v1"
-CMS_PREFLIGHT_REQUEST_CONTRACT = "healthporta.provider-directory-profile-capacity-preflight-request.v4"
-CMS_PREFLIGHT_CONTRACT = "healthporta.provider-directory-profile-capacity-preflight.v4"
-CMS_PROJECTION_REQUEST_CONTRACT = "healthporta.provider-directory-profile-capacity-authority-projection-request.v2"
-CMS_PROJECTION_CONTRACT = "healthporta.provider-directory-profile-capacity-authority-projection.v2"
-CMS_CONTROL_REQUEST_CONTRACT = "healthporta.provider-directory-profile-capacity-control-plane-preflight-request.v2"
-CMS_CONTROL_CONTRACT = "healthporta.provider-directory-profile-capacity-control-plane-preflight.v2"
+CMS_PREFLIGHT_REQUEST_CONTRACT = "healthporta.provider-directory-profile-capacity-preflight-request.v8"
+CMS_PREFLIGHT_CONTRACT = "healthporta.provider-directory-profile-capacity-preflight.v8"
+CMS_PROJECTION_REQUEST_CONTRACT = "healthporta.provider-directory-profile-capacity-authority-projection-request.v6"
+CMS_PROJECTION_CONTRACT = "healthporta.provider-directory-profile-capacity-authority-projection.v6"
+CMS_CONTROL_REQUEST_CONTRACT = "healthporta.provider-directory-profile-capacity-control-plane-preflight-request.v6"
+CMS_CONTROL_CONTRACT = "healthporta.provider-directory-profile-capacity-control-plane-preflight.v6"
 CMS_ADMISSION_FIELD = "cms_nonprofile_admission"
 CMS_LIMIT_FIELDS = frozenset(
     {
@@ -69,7 +69,7 @@ _RETENTION_SOURCE_PIN_FIELDS = frozenset(
         "dataset_id",
         "dataset_sha256",
         "release_id",
-        "resource_table_oid",
+        "resource_relation",
         "alias_scope",
         "as_of",
     }
@@ -262,7 +262,7 @@ def read_capacity_preflight_receipt(receipt_row: Mapping[str, Any], lease: Any) 
     signed_receipt = lease.signing_preflight_guard["healthcare_receipt"]
     is_cms = signed_receipt["contract_id"] == CMS_PREFLIGHT_CONTRACT
     is_initial = signed_receipt["contract_id"] == initial.RECEIPT_CONTRACT
-    fields = _HEALTHCARE_RECEIPT_FIELDS | {"database_binding"} if is_cms else _HEALTHCARE_RECEIPT_FIELDS
+    fields = _HEALTHCARE_RECEIPT_FIELDS
     if is_initial:
         fields = fields | {"profile_materialization"}
     raw_receipt = receipt_row.get("receipt_json")
@@ -429,9 +429,6 @@ def verified_cms_paired_profile_lease(request: Any, *, trust: Any, now: datetime
         trust=trust,
         now=now,
         expected_capacity_geometry_hash=envelope["lease"]["capacity_geometry_hash"],
-        expected_database_system_identifier=trust.database_system_identifier,
-        expected_database_oid=trust.database_oid,
-        expected_database_name=trust.database_name,
     )
     if verified.signing_preflight_guard["healthcare_request"]["profile_execution"] != request.execution_payload:
         _invalid("paired_profile_execution_changed")
@@ -473,32 +470,6 @@ def validated_cms_capacity_geometry(raw: Any):
             "provider_directory_cms_capacity_geometry_invalid"
         ) from error
     return plan
-
-
-def validated_cms_database_binding(raw: Any) -> dict[str, Any]:
-    """Validate the authenticated database and effective data tablespace pins."""
-    from process.provider_directory_profile_capacity_attestation_contract import (
-        _database_name_value,
-        _database_system_identifier,
-        _integer,
-        _opaque_id,
-    )
-
-    fields = frozenset(
-        {"database_system_identifier", "database_oid", "database_name", "tablespace_oid", "tablespace_name"}
-    )
-    binding_by_field = dict(_exact_mapping(raw, fields, reason="cms_database_binding_fields_invalid"))
-    try:
-        _database_system_identifier(binding_by_field["database_system_identifier"])
-        _database_name_value(binding_by_field["database_name"], field="database_name")
-        _opaque_id(binding_by_field["tablespace_name"], field="tablespace_name", maximum_length=63)
-        for name in ("database_oid", "tablespace_oid"):
-            _integer(binding_by_field[name], field=name, minimum=1, maximum=2**32 - 1)
-    except ValueError as error:
-        raise ProviderDirectoryProfileCapacityPreflightError(
-            "provider_directory_cms_capacity_database_binding_invalid"
-        ) from error
-    return binding_by_field
 
 
 def assert_cms_geometry_matches_request(plan: Any, request: Any) -> None:

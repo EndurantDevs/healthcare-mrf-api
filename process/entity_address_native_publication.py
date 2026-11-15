@@ -23,10 +23,12 @@ from process import entity_address_result_generation as generation
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import suppress_control_run_heartbeat_persistence
 
-HANDOFF_CONTRACT = "entity-address-native-handoff.v1"
-PUBLICATION_CONTRACT = "entity-address-native-publication.v1"
+LEGACY_HANDOFF_CONTRACT = "entity-address-native-handoff.v1"
+HANDOFF_CONTRACT = "entity-address-native-handoff.v2"
+LEGACY_PUBLICATION_CONTRACT = "entity-address-native-publication.v1"
+PUBLICATION_CONTRACT = "entity-address-native-publication.v2"
 ABANDONMENT_CONTRACT = "entity-address-unpublished-abandonment.v1"
-CLEANUP_CONTRACT = "entity-address-native-candidate-cleanup.v1"
+CLEANUP_CONTRACT = "entity-address-native-candidate-cleanup.v2"
 HANDOFF_PHASE = "entity-address stages awaiting publication"
 PUBLICATION_PHASE = "entity-address-unified published"
 MAX_RECEIPT_BYTES = 131_072
@@ -120,7 +122,7 @@ def _stage_names(schema, import_date):
 
 
 def validate_entity_address_native_handoff(handoff):
-    """Decode only the fixed seven-table handoff; it is not content authority."""
+    """Validate logical attempt/data commitments while preserving retained raw editions."""
     fields = {
         "contract",
         "run_id",
@@ -128,8 +130,6 @@ def validate_entity_address_native_handoff(handoff):
         "attempt_started_at",
         "schema_name",
         "import_date",
-        "database_oid",
-        "import_run_oid",
         "stage_relations",
         "incumbent",
         "alias_generation",
@@ -139,10 +139,58 @@ def validate_entity_address_native_handoff(handoff):
         "indexes",
         "handoff_sha256",
     }
+    legacy = isinstance(handoff, dict) and handoff.get("contract") == LEGACY_HANDOFF_CONTRACT
+    fields |= {"database_oid", "import_run_oid"} if legacy else {"stage_integrity"}
+    contracts = (LEGACY_HANDOFF_CONTRACT, HANDOFF_CONTRACT)
     _require(
-        type(handoff) is dict and set(handoff) == fields and handoff["contract"] == HANDOFF_CONTRACT, "handoff differs"
+        type(handoff) is dict and set(handoff) == fields and handoff["contract"] in contracts,
+        "handoff differs",
     )
     handoff = json.loads(_json(handoff))
+    names = _stage_names(handoff["schema_name"], handoff["import_date"])
+    _validate_handoff_attempt(handoff)
+    _require(type(handoff["row_count"]) is int and 0 < handoff["row_count"] < 2**63, "row count differs")
+    _require(type(handoff["alias_generation"]) is int and handoff["alias_generation"] >= 0, "alias differs")
+    _named_dependencies(handoff["schema_name"], handoff["dependency_bindings"])
+    _validate_handoff_relations(handoff["stage_relations"], names, legacy=legacy)
+    _require(type(handoff["indexes"]) is list and 0 < len(handoff["indexes"]) <= 256, "indexes differ")
+    _validate_indexes(handoff["indexes"], handoff["stage_relations"], legacy=legacy)
+    _validate_authority(handoff["incumbent"])
+    if not legacy:
+        _validate_named_handoff_data(handoff, names)
+    _require(
+        type(handoff["source_contract_sha256"]) is str
+        and re.fullmatch(r"[0-9a-f]{64}", handoff["source_contract_sha256"]) is not None,
+        "source contract differs",
+    )
+    _require(
+        _digest({key: field_value for key, field_value in handoff.items() if key != "handoff_sha256"})
+        == handoff["handoff_sha256"],
+        "handoff digest differs",
+    )
+    return handoff
+
+
+def _validate_named_handoff_data(handoff, names):
+    """Require closed named inputs and the full-content receipt for every fresh handoff."""
+    _require(
+        all(set(binding) == {"schema_name", "table_name"} for binding in handoff["dependency_bindings"].values()),
+        "named dependencies differ",
+    )
+    from process import entity_address_snapshot_receipt as receipt
+
+    integrity = receipt.validate_entity_address_stage_integrity_receipt(
+        handoff["stage_integrity"], stage_table_names=names
+    )
+    _require(
+        integrity.contract == receipt.LEGACY_STAGE_INTEGRITY_CONTRACT
+        and integrity.tables[0].row_count == handoff["row_count"],
+        "stage content differs",
+    )
+
+
+def _validate_handoff_attempt(handoff):
+    """Bind the imported stage suffix to the existing controlled attempt."""
     _attempt(
         {
             "control_run_id": handoff["run_id"],
@@ -152,83 +200,66 @@ def validate_entity_address_native_handoff(handoff):
             },
         }
     )
-    names = _stage_names(handoff["schema_name"], handoff["import_date"])
     _require(handoff["import_date"] == _attempt_suffix(handoff["attempt_id"]), "stage attempt differs")
-    _require(type(handoff["row_count"]) is int and 0 < handoff["row_count"] < 2**63, "row count differs")
-    _require(type(handoff["alias_generation"]) is int and handoff["alias_generation"] >= 0, "alias differs")
-    _require(
-        all(type(handoff[key]) is int and 0 < handoff[key] < 2**32 for key in ("database_oid", "import_run_oid")),
-        "database differs",
-    )
-    projection.validate_projection_dependency_bindings(handoff["schema_name"], handoff["dependency_bindings"])
-    _validate_handoff_relations(handoff["stage_relations"], names)
-    _require(type(handoff["indexes"]) is list and 0 < len(handoff["indexes"]) <= 256, "indexes differ")
-    _validate_indexes(handoff["indexes"], handoff["stage_relations"])
-    _validate_authority(handoff["incumbent"])
-    _require(
-        type(handoff["source_contract_sha256"]) is str
-        and re.fullmatch(r"[0-9a-f]{64}", handoff["source_contract_sha256"]) is not None,
-        "source contract differs",
-    )
-    _require(
-        _digest({key: field for key, field in handoff.items() if key != "handoff_sha256"}) == handoff["handoff_sha256"],
-        "handoff digest differs",
-    )
-    return handoff
 
 
-def _validate_handoff_relations(relations, names):
+def _validate_handoff_relations(relations, names, *, legacy=False):
     _require(type(relations) is list and len(relations) == 7, "family differs")
     _require(all(type(entry) is dict for entry in relations), "family differs")
     _require([entry.get("table_name") for entry in relations] == list(names), "family differs")
+    fields = {"table_name", "stage_name"} | ({"relation_oid", "relfilenode"} if legacy else set())
     for entry in relations:
-        _require(set(entry) == {"table_name", "stage_name", "relation_oid", "relfilenode"}, "stage fields differ")
+        _require(set(entry) == fields, "stage fields differ")
         _require(entry["stage_name"] == names[entry["table_name"]], "stage name differs")
-        _require(
-            all(type(entry[key]) is int and 0 < entry[key] < 2**32 for key in ("relation_oid", "relfilenode")),
-            "stage identity differs",
-        )
-    _require(len({entry["relation_oid"] for entry in relations}) == 7, "stage identity repeats")
 
 
-def _validate_indexes(indexes, relations):
-    oids = {entry["relation_oid"] for entry in relations}
+def _validate_indexes(indexes, relations, *, legacy=False):
+    fields = {"relation_oid", "index_oid", "relfilenode", "definition"} if legacy else {"table_name", "definition"}
     for row in indexes:
+        _require(type(row) is dict and set(row) == fields, "index fields differ")
+        _require(type(row["definition"]) is str and 0 < len(row["definition"]) <= 8192, "index definition differs")
+    if not legacy:
         _require(
-            type(row) is dict and set(row) == {"relation_oid", "index_oid", "relfilenode", "definition"},
-            "index fields differ",
+            {row["table_name"] for row in indexes} == {row["table_name"] for row in relations}, "index family differs"
         )
-        _require(
-            all(type(row[key]) is int and 0 < row[key] < 2**32 for key in ("relation_oid", "index_oid", "relfilenode")),
-            "index identity differs",
-        )
-        _require(
-            row["relation_oid"] in oids and type(row["definition"]) is str and 0 < len(row["definition"]) <= 8192,
-            "index definition differs",
-        )
-    _require(
-        len({row["index_oid"] for row in indexes}) == len(indexes) and {row["relation_oid"] for row in indexes} == oids,
-        "index family differs",
-    )
+        _require(len({_json(row) for row in indexes}) == len(indexes), "index repeats")
 
 
 def _validate_authority(value):
-    _require(
-        type(value) is dict
-        and set(value) == {"local_lineage_id", "local_generation", "serving_generation", "relation_oids"},
-        "native authority differs",
-    )
+    fields = {"local_lineage_id", "local_generation", "serving_generation"}
+    _require(type(value) is dict and set(value) in (fields, fields | {"relation_oids"}), "native authority differs")
     _require(
         str(UUID(value["local_lineage_id"])) == value["local_lineage_id"]
         and type(value["local_generation"]) is int
         and 0 <= value["local_generation"] < 2**63,
         "native lineage differs",
     )
-    if value["serving_generation"] is None:
-        _require(value["relation_oids"] is None, "native authority is partial")
-    else:
+    if value["serving_generation"] is not None:
         generation.validate_entity_address_serving_generation(value["serving_generation"])
-        generation._relation_oids(value["relation_oids"])
+
+
+def _logical_authority(value):
+    """Project portable generation fields without interpreting legacy physical tokens."""
+    _validate_authority(value)
+    return {key: value[key] for key in ("local_lineage_id", "local_generation", "serving_generation")}
+
+
+def _named_dependencies(schema, bindings):
+    """Keep the existing closed selected-name contract across retained wire editions."""
+    _require(
+        isinstance(bindings, dict)
+        and all(
+            isinstance(value, dict)
+            and set(value)
+            in ({"schema_name", "table_name"}, {"schema_name", "table_name", "relation_oid", "relfilenode"})
+            for value in bindings.values()
+        ),
+        "dependencies differ",
+    )
+    return projection.validate_projection_dependency_qnames(
+        schema,
+        {key: {field: value.get(field) for field in ("schema_name", "table_name")} for key, value in bindings.items()},
+    )
 
 
 def validate_entity_address_native_publication(receipt):
@@ -246,7 +277,7 @@ def validate_entity_address_native_publication(receipt):
             "alias",
             "result_generation",
         }
-        and receipt["contract"] == PUBLICATION_CONTRACT,
+        and receipt["contract"] in {PUBLICATION_CONTRACT, LEGACY_PUBLICATION_CONTRACT},
         "receipt differs",
     )
     receipt = json.loads(_json(receipt))
@@ -259,8 +290,7 @@ def validate_entity_address_native_publication(receipt):
         and authority["local_lineage_id"] == handoff["incumbent"]["local_lineage_id"]
         and authority["local_generation"] == handoff["incumbent"]["local_generation"] + 1
         and origin["origin_lineage_id"] == authority["local_lineage_id"]
-        and origin["origin_generation"] == authority["local_generation"]
-        and authority["relation_oids"] == [entry["relation_oid"] for entry in handoff["stage_relations"]],
+        and origin["origin_generation"] == authority["local_generation"],
         "published authority differs",
     )
     _require(
@@ -276,75 +306,103 @@ def validate_entity_address_native_publication(receipt):
     )
     _validate_publication_inventory(receipt["inventory"], handoff)
     _validate_catalog(receipt["validation"]["catalog"], handoff)
-    _require(
-        type(receipt["alias"]) is dict
-        and set(receipt["alias"]) == {"generation", "catalog_sha256"}
-        and receipt["alias"]["generation"] == handoff["alias_generation"]
-        and type(receipt["alias"]["catalog_sha256"]) is str
-        and re.fullmatch(r"[0-9a-f]{64}", receipt["alias"]["catalog_sha256"]) is not None,
-        "alias receipt differs",
-    )
+    _validate_alias_receipt(receipt, handoff)
     return receipt
 
 
-def _validate_catalog(catalog, handoff):
+def _validate_alias_receipt(receipt, handoff):
+    """Validate portable alias counters and retain the old raw digest edition."""
+    alias = receipt["alias"]
+    is_legacy = receipt["contract"] == LEGACY_PUBLICATION_CONTRACT
     _require(
-        set(catalog) == {"shapes", "indexes", "columns", "constraints"}
-        and all(type(rows) is list and 0 < len(rows) <= 8192 for rows in catalog.values()),
+        type(alias) is dict
+        and set(alias) == ({"generation", "catalog_sha256"} if is_legacy else {"generation", "state"})
+        and alias["generation"] == handoff["alias_generation"],
+        "alias receipt differs",
+    )
+    if is_legacy:
+        _require(
+            type(alias["catalog_sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", alias["catalog_sha256"]) is not None,
+            "alias receipt differs",
+        )
+    else:
+        _require(
+            isinstance(alias["state"], dict)
+            and set(alias["state"]) == {"schema_version", "active_ruleset_version", "generation"}
+            and all(type(value) is int and value >= 0 for value in alias["state"].values())
+            and alias["state"]["schema_version"] > 0
+            and alias["state"]["active_ruleset_version"] > 0
+            and alias["state"]["generation"] == alias["generation"],
+            "alias state differs",
+        )
+
+
+def _validate_catalog(catalog, handoff):
+    if set(catalog) != {"tables"}:
+        _require(
+            set(catalog) == {"shapes", "indexes", "columns", "constraints"}
+            and all(type(catalog_rows) is list and 0 < len(catalog_rows) <= 8192 for catalog_rows in catalog.values()),
+            "catalog receipt differs",
+        )
+        _require(
+            len(catalog["shapes"]) == 7
+            and all(type(catalog_entry) is list and len(catalog_entry) == 3 for catalog_entry in catalog["shapes"])
+            and [catalog_entry[0] for catalog_entry in catalog["shapes"]] == list(generation.RELATION_NAMES),
+            "catalog shapes differ",
+        )
+        _require(
+            all(
+                isinstance(catalog_entry, dict) and catalog_entry.get("kind") != "f"
+                for catalog_entry in catalog["constraints"]
+            ),
+            "catalog relationship differs",
+        )
+        return
+    _require(
+        type(catalog) is dict and set(catalog) == {"tables"} and type(catalog["tables"]) is list,
         "catalog receipt differs",
     )
-    expected_relations = [(entry["table_name"], entry["relation_oid"]) for entry in handoff["stage_relations"]]
+    tables = catalog["tables"]
     _require(
-        len(catalog["shapes"]) == 7
-        and all(type(row) is list and len(row) == 3 for row in catalog["shapes"])
-        and [(row[0], row[1]) for row in catalog["shapes"]] == expected_relations
-        and all(type(row[2]) is str and re.fullmatch(r"[0-9a-f]{64}", row[2]) for row in catalog["shapes"]),
-        "catalog shapes differ",
-    )
-    oids = {oid for _name, oid in expected_relations}
-    for kind in ("indexes", "columns", "constraints"):
-        _require(
-            all(type(row) is dict for row in catalog[kind])
-            and {row.get("relation_oid") for row in catalog[kind]} == oids,
-            "catalog family differs",
+        len(tables) == 7
+        and all(
+            type(catalog_entry) is dict and set(catalog_entry) == {"table_name", "columns", "constraints", "indexes"}
+            for catalog_entry in tables
         )
-    _require(all(row.get("kind") != "f" for row in catalog["constraints"]), "catalog relationship differs")
+        and [catalog_entry["table_name"] for catalog_entry in tables] == list(generation.RELATION_NAMES),
+        "catalog family differs",
+    )
+    for catalog_entry in tables:
+        _require(
+            all(
+                type(catalog_entry[key]) is list and bool(catalog_entry[key])
+                for key in ("columns", "constraints", "indexes")
+            ),
+            "catalog shape differs",
+        )
 
 
 def _validate_publication_inventory(inventory, handoff):
+    legacy = isinstance(inventory, dict) and "database_oid" in inventory
     _require(
         type(inventory) is dict
-        and set(inventory) == {"database_oid", "relations"}
-        and inventory["database_oid"] == handoff["database_oid"]
+        and set(inventory) == ({"database_oid", "relations"} if legacy else {"relations"})
         and type(inventory["relations"]) is list
         and len(inventory["relations"]) == 7,
         "inventory differs",
     )
     relations_by_name = {entry["relation_name"]: entry for entry in inventory["relations"]}
     _require(set(relations_by_name) == set(generation.RELATION_NAMES), "inventory family differs")
-    for stage in handoff["stage_relations"]:
-        entry = relations_by_name[stage["table_name"]]
-        _require(
-            set(entry)
-            == {
-                "schema_name",
-                "schema_oid",
-                "schema_owner_oid",
-                "relation_name",
-                "relation_oid",
-                "relfilenode",
-                "owner_oid",
-            }
-            and entry["schema_name"] == handoff["schema_name"]
-            and entry["relation_oid"] == stage["relation_oid"]
-            and entry["relfilenode"] == stage["relfilenode"]
-            and all(
-                type(entry[key]) is int and 0 < entry[key] < 2**32
-                for key in ("schema_oid", "schema_owner_oid", "owner_oid")
-            ),
-            "physical inventory differs",
-        )
-    _require(len({entry["owner_oid"] for entry in relations_by_name.values()}) == 1, "inventory owner differs")
+    fields = {"schema_name", "relation_name"} | (
+        {"schema_oid", "schema_owner_oid", "relation_oid", "relfilenode", "owner_oid"} if legacy else set()
+    )
+    _require(
+        all(
+            set(entry) == fields and entry["schema_name"] == handoff["schema_name"]
+            for entry in relations_by_name.values()
+        ),
+        "named inventory differs",
+    )
 
 
 async def _locked_run(session, handoff, status, *, lock=True):
@@ -394,33 +452,15 @@ def _source_contract(handoff, params):
 
 
 async def _dependency_bindings(session, schema, bindings_by_name):
+    """Pin the same closed selected dependency names without collecting physical tokens."""
     if bindings_by_name is None:
-        bindings_by_name = {}
-        for namespace, table in projection._PROJECTION_DEPENDENCIES:
-            namespace = namespace or schema
-            row = (
-                (
-                    await session.execute(
-                        text(
-                            "SELECT oid::bigint AS relation_oid,pg_relation_filenode(oid)::bigint AS relfilenode "
-                            "FROM pg_class WHERE oid=to_regclass(:name)"
-                        ),
-                        {"name": f'"{namespace}"."{table}"'},
-                    )
-                )
-                .mappings()
-                .one()
-            )
-            bindings_by_name[f"{namespace}.{table}"] = {"schema_name": namespace, "table_name": table, **dict(row)}
-    bindings_by_name = projection.validate_projection_dependency_bindings(schema, bindings_by_name)
-    await session.execute(text(projection.projection_dependency_lock_sql(schema, dependency_bindings=bindings_by_name)))
-    _require(
-        await session.scalar(
-            text("SELECT " + projection.projection_dependency_bindings_match_sql(schema, bindings_by_name))
-        ),
-        "dependencies changed",
-    )
-    return bindings_by_name
+        bindings_by_name = {
+            f"{namespace or schema}.{table}": {"schema_name": namespace or schema, "table_name": table}
+            for namespace, table in projection._PROJECTION_DEPENDENCIES
+        }
+    selected_by_name = _named_dependencies(schema, bindings_by_name)
+    await session.execute(text(projection.projection_named_dependency_lock_sql(schema, selected_by_name)))
+    return selected_by_name
 
 
 async def _stage_inventory(session, schema, names):
@@ -428,14 +468,13 @@ async def _stage_inventory(session, schema, names):
         (
             await session.execute(
                 text(
-                    "SELECT c.relname,c.oid::bigint,pg_relation_filenode(c.oid)::bigint AS relfilenode "
-                    "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
                     "WHERE n.nspname=:schema AND c.relname=ANY(:names) AND c.relkind='r' AND c.relpersistence='p' "
                     "AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity AND NOT c.relispartition "
                     "AND NOT EXISTS(SELECT 1 FROM pg_trigger t WHERE t.tgrelid=c.oid) "
                     "AND NOT EXISTS(SELECT 1 FROM pg_rewrite r WHERE r.ev_class=c.oid) "
                     "AND NOT EXISTS(SELECT 1 FROM pg_inherits i WHERE i.inhrelid=c.oid OR i.inhparent=c.oid) "
-                    "AND NOT EXISTS(SELECT 1 FROM pg_constraint k WHERE k.conrelid=c.oid AND k.contype='f')"
+                    "AND NOT EXISTS(SELECT 1 FROM pg_constraint k WHERE k.conrelid=c.oid AND k.contype='f') "
                     "AND NOT EXISTS(SELECT 1 FROM pg_depend d JOIN pg_class seq ON seq.oid=d.objid AND seq.relkind='S' "
                     "WHERE d.refobjid=c.oid AND d.classid='pg_class'::regclass AND d.deptype IN ('a','i'))"
                 ),
@@ -445,17 +484,23 @@ async def _stage_inventory(session, schema, names):
         .mappings()
         .all()
     )
-    by_name = {relation["relname"]: relation for relation in relation_rows}
-    _require(set(by_name) == set(names.values()), "stage catalog differs")
-    return [
-        {
-            "table_name": name,
-            "stage_name": stage,
-            "relation_oid": by_name[stage]["oid"],
-            "relfilenode": by_name[stage]["relfilenode"],
-        }
-        for name, stage in names.items()
-    ]
+    _require({row["relname"] for row in relation_rows} == set(names.values()), "stage catalog differs")
+    return [{"table_name": name, "stage_name": stage} for name, stage in names.items()]
+
+
+async def _stage_integrity(session, schema, names):
+    """Reuse bounded full-row family accounting at the durable named handoff."""
+    from process import entity_address_snapshot_receipt as receipt
+
+    return (
+        await receipt.capture_entity_address_stage_integrity_receipt(
+            session,
+            schema_name=schema,
+            stage_table_names=names,
+            contract=receipt.LEGACY_STAGE_INTEGRITY_CONTRACT,
+            read_only=True,
+        )
+    ).as_dict()
 
 
 async def _require_model_catalog(session, schema, relations):
@@ -477,7 +522,8 @@ async def _require_model_catalog(session, schema, relations):
                     text("SELECT to_regclass(:relation)::oid"), {"relation": f'pg_temp."{temporary.name}"'}
                 )
                 expected = await _model_catalog_shape(session, receipt, expected_oid, "pg_temp")
-                actual = await _model_catalog_shape(session, receipt, relation["relation_oid"], schema)
+                actual_oid = await receipt._relation_oid(session, schema, relation.get("stage_name", name))
+                actual = await _model_catalog_shape(session, receipt, actual_oid, schema)
                 _require(actual[0] == expected[0] and actual[1] == expected[1], "model constraints differ")
                 _require(not (Counter(expected[2]) - Counter(actual[2])), "model indexes differ")
             except BaseException as failure:
@@ -561,26 +607,26 @@ def _catalog_column_names(numbers, names_by_number):
     return [names_by_number.get(int(number), 0) for number in positions]
 
 
-async def _index_inventory(session, relations):
+async def _index_inventory(session, relations, *, schema):
+    names_by_stage = {entry["stage_name"]: entry["table_name"] for entry in relations}
     async with _catalog_search_path(session):
         rows = (
             (
                 await session.execute(
                     text(
-                        "SELECT i.indrelid::bigint AS relation_oid,i.indexrelid::bigint AS index_oid,"
-                        "pg_relation_filenode(i.indexrelid)::bigint AS relfilenode,pg_get_indexdef(i.indexrelid) AS definition "
-                        "FROM pg_index i WHERE i.indrelid=ANY(:oids) AND i.indisvalid AND i.indisready AND i.indislive ORDER BY i.indexrelid"
+                        "SELECT c.relname,pg_get_indexdef(i.indexrelid) AS definition FROM pg_index i "
+                        "JOIN pg_class c ON c.oid=i.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace "
+                        "WHERE n.nspname=:schema AND c.relname=ANY(:names) AND i.indisvalid AND i.indisready AND i.indislive "
+                        "ORDER BY c.relname,definition"
                     ),
-                    {"oids": [entry["relation_oid"] for entry in relations]},
+                    {"schema": schema, "names": list(names_by_stage)},
                 )
             )
             .mappings()
             .all()
         )
-    _require(
-        {row["relation_oid"] for row in rows} == {entry["relation_oid"] for entry in relations}, "indexes incomplete"
-    )
-    return [dict(row) for row in rows]
+    _require({row["relname"] for row in rows} == set(names_by_stage), "indexes incomplete")
+    return [{"table_name": names_by_stage[row["relname"]], "definition": row["definition"]} for row in rows]
 
 
 @asynccontextmanager
@@ -606,76 +652,18 @@ async def _catalog_evidence(session, handoff):
 
 
 async def _capture_catalog_evidence(session, handoff):
-    """Fingerprint bounded catalog metadata only, with stable logical table names."""
-    shapes = await _catalog_shapes(session, handoff)
-    index_rows = (
-        (
-            await session.execute(
-                text(
-                    "SELECT i.indexrelid::bigint AS index_oid,i.indrelid::bigint AS relation_oid,c.relowner::bigint AS owner_oid,"
-                    "pg_relation_filenode(c.oid)::bigint AS relfilenode,am.amname AS method,i.indisunique,i.indisprimary,"
-                    "i.indnkeyatts,i.indnatts,i.indkey::text,i.indclass::text,i.indcollation::text,i.indoption::text,"
-                    "pg_get_expr(i.indexprs,i.indrelid) AS expression,pg_get_expr(i.indpred,i.indrelid) AS predicate,"
-                    "i.indisvalid,i.indisready,i.indislive FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid "
-                    "JOIN pg_am am ON am.oid=c.relam WHERE i.indrelid=ANY(:oids) ORDER BY i.indexrelid"
-                ),
-                {"oids": [entry["relation_oid"] for entry in handoff["stage_relations"]]},
-            )
-        )
-        .mappings()
-        .all()
-    )
-    oid_params_dict = {"oids": [entry["relation_oid"] for entry in handoff["stage_relations"]]}
-    columns = (
-        (
-            await session.execute(
-                text(
-                    "SELECT a.attrelid::bigint AS relation_oid,a.attnum,a.attname,a.atttypid::bigint AS type_oid,"
-                    "a.atttypmod AS type_modifier,a.attnotnull AS not_null,a.attidentity::text AS identity,"
-                    "a.attgenerated::text AS generated,pg_get_expr(d.adbin,d.adrelid) AS default_expression "
-                    "FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum "
-                    "WHERE a.attrelid=ANY(:oids) AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attrelid,a.attnum"
-                ),
-                oid_params_dict,
-            )
-        )
-        .mappings()
-        .all()
-    )
-    constraints = (
-        (
-            await session.execute(
-                text(
-                    "SELECT conrelid::bigint AS relation_oid,contype::text AS kind,conkey::text AS columns,"
-                    "convalidated AS validated,condeferrable AS deferrable,condeferred AS deferred,"
-                    "pg_get_constraintdef(oid) AS definition FROM pg_constraint WHERE conrelid=ANY(:oids) AND contype<>'n' "
-                    "ORDER BY conrelid,contype,conkey,definition"
-                ),
-                oid_params_dict,
-            )
-        )
-        .mappings()
-        .all()
-    )
-    return {
-        "shapes": shapes,
-        "indexes": [dict(index) for index in index_rows],
-        "columns": [dict(column) for column in columns],
-        "constraints": [dict(constraint) for constraint in constraints],
-    }
-
-
-async def _catalog_shapes(session, handoff):
+    """Record only portable column, constraint and index model shapes by declared name."""
     from process import entity_address_snapshot_receipt as receipt
 
-    names_by_stage = {entry["stage_name"]: entry["table_name"] for entry in handoff["stage_relations"]}
-    shapes = []
+    tables = []
+    schema = handoff["schema_name"]
     for entry in handoff["stage_relations"]:
-        shape = await receipt._schema_identity(
-            session, entry["relation_oid"], handoff["schema_name"], entry["table_name"], names_by_stage=names_by_stage
+        relation = await receipt._relation_oid(session, schema, entry["stage_name"])
+        columns, constraints, indexes = await _model_catalog_shape(session, receipt, relation, schema)
+        tables.append(
+            {"table_name": entry["table_name"], "columns": columns, "constraints": constraints, "indexes": indexes}
         )
-        shapes.append([entry["table_name"], entry["relation_oid"], shape])
-    return shapes
+    return {"tables": tables}
 
 
 async def _complete_indexes(schema, import_date):
@@ -710,35 +698,19 @@ async def _capture_handoff(session, ctx, handoff):
     handoff["stage_relations"] = await _stage_inventory(session, schema, names)
     await _require_stage_execution_catalog(session, handoff)
     await _require_model_catalog(session, schema, handoff["stage_relations"])
-    handoff["indexes"] = await _index_inventory(session, handoff["stage_relations"])
+    handoff["indexes"] = await _index_inventory(session, handoff["stage_relations"], schema=schema)
+    handoff["stage_integrity"] = await _stage_integrity(session, schema, names)
     _require(await native._address_alias_generation(schema) == handoff["alias_generation"], "alias changed")
-    handoff["incumbent"] = (
-        await generation.read_entity_address_result_generation_authority(session, schema_name=schema)
-    ).as_dict()
-    identities = (
-        await session.execute(
-            text(
-                "SELECT (SELECT oid::bigint FROM pg_database WHERE datname=current_database()),to_regclass(:history)::oid::bigint"
-            ),
-            {"history": f'"{schema}".import_run'},
-        )
-    ).one()
-    handoff.update(
-        database_oid=identities[0],
-        import_run_oid=identities[1],
-        source_contract_sha256=_source_contract(handoff, run["params"] or {}),
+    handoff["incumbent"] = _logical_authority(
+        (await generation.read_entity_address_result_generation_authority(session, schema_name=schema)).as_dict()
     )
+    handoff["source_contract_sha256"] = _source_contract(handoff, run["params"] or {})
     handoff["handoff_sha256"] = _digest(handoff)
     return validate_entity_address_native_handoff(handoff)
 
 
 async def _write_handoff(session, handoff):
     schema = handoff["schema_name"]
-    marker = _json({key: handoff[key] for key in ("contract", "run_id", "attempt_id", "handoff_sha256")}).replace(
-        "'", "''"
-    )
-    for entry in handoff["stage_relations"]:
-        await session.execute(text(f'COMMENT ON TABLE "{schema}"."{entry["stage_name"]}" IS \'{marker}\''))
     changed = await session.scalar(
         text(
             f"UPDATE \"{schema}\".import_run SET status='finalizing',phase_detail=CAST(:phase AS text),"
@@ -822,32 +794,58 @@ async def _require_handoff_stage(session, handoff):
             + " IN ACCESS EXCLUSIVE MODE NOWAIT"
         )
     )
-    _require(await _stage_inventory(session, schema, names) == handoff["stage_relations"], "stage changed")
-    _require(await _index_inventory(session, handoff["stage_relations"]) == handoff["indexes"], "indexes changed")
-    await _require_stage_execution_catalog(session, handoff)
-    marker = _json({key: handoff[key] for key in ("contract", "run_id", "attempt_id", "handoff_sha256")})
-    for entry in handoff["stage_relations"]:
+    wanted_relations = [
+        {key: entry[key] for key in ("table_name", "stage_name")} for entry in handoff["stage_relations"]
+    ]
+    _require(await _stage_inventory(session, schema, names) == wanted_relations, "stage changed")
+    indexes = await _index_inventory(session, wanted_relations, schema=schema)
+    if handoff["contract"] == LEGACY_HANDOFF_CONTRACT:
         _require(
-            await session.scalar(
-                text("SELECT obj_description(CAST(:oid AS oid),'pg_class')"), {"oid": entry["relation_oid"]}
-            )
-            == marker,
-            "stage marker changed",
+            sorted(row["definition"] for row in indexes) == sorted(row["definition"] for row in handoff["indexes"]),
+            "indexes changed",
         )
+    else:
+        _require(indexes == handoff["indexes"], "indexes changed")
+        _require(await _stage_integrity(session, schema, names) == handoff["stage_integrity"], "stage content changed")
+    await _require_stage_execution_catalog(session, handoff)
 
 
 async def _require_stage_execution_catalog(
+    session, handoff, *, allowed_type_oids=(), allowed_extensions=("postgis", "intarray", "btree_gin", "btree_gist")
+):
+    """Apply the ordinary native layout gate to the handoff's closed selected stage names."""
+    await _require_named_execution_catalog(
+        session,
+        tuple((handoff["schema_name"], entry["stage_name"]) for entry in handoff["stage_relations"]),
+        allowed_type_oids=allowed_type_oids,
+        allowed_extensions=allowed_extensions,
+    )
+
+
+async def _require_named_execution_catalog(
     session,
-    handoff,
+    relations,
     *,
     allowed_type_oids=(),
     allowed_extensions=("postgis", "intarray", "btree_gin", "btree_gist"),
 ):
     """Reject builder-installed executable code before publisher-side set queries."""
+    from db.plan_release_storage import storage_identifier
+
+    _require(
+        isinstance(relations, tuple)
+        and 0 < len(relations) <= 256
+        and all(isinstance(pair, tuple) and len(pair) == 2 for pair in relations)
+        and len(set(relations)) == len(relations),
+        "candidate relation names differ",
+    )
+    for schema, name in relations:
+        storage_identifier(schema)
+        storage_identifier(name)
     safe = await session.scalar(
         text(
             "SELECT NOT EXISTS(SELECT 1 FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid "
-            "JOIN pg_am am ON am.oid=idx.relam WHERE i.indrelid=ANY(:oids) AND ("
+            "JOIN pg_am am ON am.oid=idx.relam WHERE i.indrelid IN (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN unnest(CAST(:schemas AS text[]),CAST(:names AS text[])) AS selected(schema_name,relation_name) ON (n.nspname,c.relname)=(selected.schema_name,selected.relation_name)) AND ("
             "NOT i.indisvalid OR NOT i.indisready OR NOT i.indislive OR am.amname NOT IN ('btree','gin','gist') "
             "OR EXISTS(SELECT 1 FROM pg_opclass op WHERE op.oid=ANY(i.indclass) "
             "AND op.opcnamespace<>'pg_catalog'::regnamespace AND NOT EXISTS(SELECT 1 FROM pg_depend ext "
@@ -862,7 +860,7 @@ async def _require_stage_execution_catalog(
             "WHERE ext.classid=d.refclassid AND ext.objid=d.refobjid AND ext.refclassid='pg_extension'::regclass "
             "AND ext.deptype='e' AND e.extname=ANY(CAST(:allowed_extensions AS text[])))))) "
             "AND NOT EXISTS(SELECT 1 FROM pg_attribute a JOIN pg_type ty ON ty.oid=a.atttypid "
-            "WHERE a.attrelid=ANY(:oids) AND a.attnum>0 AND NOT a.attisdropped "
+            "WHERE a.attrelid IN (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace JOIN unnest(CAST(:schemas AS text[]),CAST(:names AS text[])) AS selected(schema_name,relation_name) ON (n.nspname,c.relname)=(selected.schema_name,selected.relation_name)) AND a.attnum>0 AND NOT a.attisdropped "
             "AND (a.attgenerated NOT IN ('','s') OR (ty.typnamespace<>'pg_catalog'::regnamespace "
             "AND NOT (ty.oid=ANY(CAST(:allowed_type_oids AS oid[]))) AND NOT EXISTS(SELECT 1 FROM pg_depend ext "
             "JOIN pg_extension e ON e.oid=ext.refobjid WHERE ext.classid='pg_type'::regclass AND ext.objid=ty.oid "
@@ -870,7 +868,8 @@ async def _require_stage_execution_catalog(
             "AND ty.typname IN ('geometry','geography')))))"
         ),
         {
-            "oids": [entry["relation_oid"] for entry in handoff["stage_relations"]],
+            "schemas": [schema for schema, _name in relations],
+            "names": [name for _schema, name in relations],
             "allowed_type_oids": list(allowed_type_oids),
             "allowed_extensions": list(allowed_extensions),
         },
@@ -887,38 +886,14 @@ async def _require_native_attempt(session, handoff):
     _require(
         _source_contract(handoff, run["params"] or {}) == handoff["source_contract_sha256"], "source contract changed"
     )
-    actual = (
-        await session.execute(
-            text(
-                "SELECT (SELECT oid::bigint FROM pg_database WHERE datname=current_database()),to_regclass(:history)::oid::bigint"
-            ),
-            {"history": f'"{handoff["schema_name"]}".import_run'},
-        )
-    ).one()
-    _require(tuple(actual) == (handoff["database_oid"], handoff["import_run_oid"]), "native database changed")
 
 
-async def _receipt_inventory(session, handoff, owner_oid):
-    relations = []
-    schema = handoff["schema_name"]
-    namespace = (
-        await session.execute(text("SELECT oid,nspowner FROM pg_namespace WHERE nspname=:schema"), {"schema": schema})
-    ).one()
-    for entry in handoff["stage_relations"]:
-        relations.append(
-            {
-                "schema_name": schema,
-                "schema_oid": namespace[0],
-                "schema_owner_oid": namespace[1],
-                "relation_name": entry["table_name"],
-                "relation_oid": entry["relation_oid"],
-                "relfilenode": entry["relfilenode"],
-                "owner_oid": owner_oid,
-            }
-        )
+async def _receipt_inventory(session, handoff):
+    """Name the complete published family; PostgreSQL controls its actual access."""
     return {
-        "database_oid": handoff["database_oid"],
-        "relations": sorted(relations, key=lambda row: row["relation_oid"]),
+        "relations": [
+            {"schema_name": handoff["schema_name"], "relation_name": name} for name in generation.RELATION_NAMES
+        ]
     }
 
 
@@ -960,8 +935,8 @@ async def complete_entity_address_unified_handoff(session, handoff, *, dependenc
     handoff = validate_entity_address_native_handoff(handoff)
     _require(session.in_transaction() and callable(publication_continuation), "requires a trusted transaction")
     _require(
-        projection.validate_projection_dependency_bindings(handoff["schema_name"], dependency_bindings)
-        == handoff["dependency_bindings"],
+        _named_dependencies(handoff["schema_name"], dependency_bindings)
+        == _named_dependencies(handoff["schema_name"], handoff["dependency_bindings"]),
         "dependency selection changed",
     )
     native = _native()
@@ -990,35 +965,46 @@ async def complete_entity_address_unified_handoff(session, handoff, *, dependenc
             "integrity": prepared.publish_validation,
             "catalog": await _catalog_evidence(session, handoff),
         }
-        owner_oid = prepared.context["protected_owner_oid"]
         receipt_by_field = {
             "contract": PUBLICATION_CONTRACT,
             "handoff": handoff,
             "validation": validation_by_field,
             "validation_sha256": _digest(validation_by_field),
             "source_contract_sha256": handoff["source_contract_sha256"],
-            "inventory": await _receipt_inventory(session, handoff, owner_oid),
+            "inventory": await _receipt_inventory(session, handoff),
             "alias": {
                 "generation": handoff["alias_generation"],
-                "catalog_sha256": await protected._require_alias_authority(session, handoff["schema_name"], owner_oid),
+                "state": await _native_alias_state(session, handoff["schema_name"]),
             },
         }
         return await _publish_prepared(session, handoff, prepared, receipt_by_field, publication_continuation)
 
 
+async def _native_alias_state(session, schema):
+    """Name the existing validated native alias-state tuple for the durable receipt."""
+    from process.entity_address_snapshot_preparation import _require_alias_authority
+
+    return dict(
+        zip(
+            ("schema_version", "active_ruleset_version", "generation"),
+            await _require_alias_authority(session, schema),
+            strict=True,
+        )
+    )
+
+
 async def _publish_prepared(session, handoff, prepared, receipt, continuation):
     native = _native()
-    transaction_id = await session.scalar(text("SELECT pg_current_xact_id()::text"))
     cutover_calls = []
 
     async def cutover():
         """Consume the one local cutover capability inside the caller transaction."""
         _require(not cutover_calls, "cutover already called")
-        cutover_calls.append(transaction_id)
+        cutover_calls.append(True)
         current = await generation.read_entity_address_result_generation_authority(
             session, schema_name=handoff["schema_name"]
         )
-        _require(current.as_dict() == handoff["incumbent"], "incumbent changed")
+        _require(_logical_authority(current.as_dict()) == _logical_authority(handoff["incumbent"]), "incumbent changed")
         await _require_native_attempt(session, handoff)
         callbacks = native.ordinary_address_receipt_callbacks(native.db, handoff["schema_name"], native._sql_literal)
         await native._run_entity_address_cutover(
@@ -1031,16 +1017,14 @@ async def _publish_prepared(session, handoff, prepared, receipt, continuation):
             callbacks=callbacks,
             require_caller_owned_transaction=True,
         )
-        receipt["result_generation"] = prepared.context["result_generation"]
+        receipt["result_generation"] = _logical_authority(prepared.context["result_generation"])
         validate_entity_address_native_publication(receipt)
         await _complete_control(session, handoff, receipt)
         return json.loads(_json(receipt))
 
     publication_result = await continuation(session, json.loads(_json(receipt)), cutover)
     _require(
-        cutover_calls
-        and session.in_transaction()
-        and await session.scalar(text("SELECT pg_current_xact_id()::text")) == transaction_id,
+        cutover_calls and session.in_transaction(),
         "publication transaction changed",
     )
     _require(await read_entity_address_native_publication(session, handoff) == receipt, "publication outcome changed")
@@ -1081,25 +1065,25 @@ async def read_entity_address_native_publication(session, handoff):
 
 
 def _validate_abandoned_handoff(handoff, abandonment):
-    """Authenticate the existing bounded abandonment receipt without inventing native custody."""
+    """Retain the original receipt while checking logical cancellation/candidate bindings."""
     abandonment = json.loads(_json(abandonment))
+    fields = {
+        "contract",
+        "preparation_id",
+        "admission_sha256",
+        "generation_id",
+        "publication_fence",
+        "reason",
+        "stage_disposition",
+        "physical_cleanup_completed",
+        "same_run_readmission",
+        "observed_run",
+        "released_pins",
+    }
+    candidate_field = "candidate" if "candidate" in abandonment else "candidate_custody"
     _require(
-        set(abandonment)
-        == {
-            "contract",
-            "preparation_id",
-            "admission_sha256",
-            "generation_id",
-            "publication_fence",
-            "reason",
-            "stage_disposition",
-            "physical_cleanup_completed",
-            "same_run_readmission",
-            "observed_run",
-            "candidate_custody",
-            "released_pins",
-        }
-        and abandonment["contract"] == ABANDONMENT_CONTRACT
+        set(abandonment) == fields | {candidate_field}
+        and abandonment["contract"] in {ABANDONMENT_CONTRACT, "entity-address-unpublished-abandonment.v2"}
         and abandonment["stage_disposition"] == "retained-unpublished"
         and abandonment["physical_cleanup_completed"] is False
         and abandonment["same_run_readmission"] == "requires-exact-candidate-cleanup-and-ledger-retirement"
@@ -1109,28 +1093,42 @@ def _validate_abandoned_handoff(handoff, abandonment):
     for key in ("preparation_id", "generation_id", "publication_fence"):
         _require(str(UUID(abandonment[key])) == abandonment[key], "abandonment identity differs")
     _require(re.fullmatch(r"[0-9a-f]{64}", abandonment["admission_sha256"]) is not None, "admission digest differs")
-    custody_by_field = {
-        key: handoff[key]
-        for key in (
-            "database_oid",
-            "import_run_oid",
-            "schema_name",
-            "attempt_id",
-            "attempt_started_at",
-            "handoff_sha256",
-            "source_contract_sha256",
-            "stage_relations",
-            "indexes",
-        )
+    candidate_fields = {
+        "schema_name",
+        "attempt_id",
+        "attempt_started_at",
+        "handoff_sha256",
+        "source_contract_sha256",
+        "stage_relations",
+        "indexes",
     }
-    builder_oid = abandonment["candidate_custody"].get("builder_oid")
-    _require(type(builder_oid) is int and 0 < builder_oid < 2**32, "abandoned builder differs")
+    if candidate_field == "candidate_custody":
+        candidate_fields |= {"builder_oid", "database_oid", "import_run_oid"}
     _require(
-        abandonment["candidate_custody"] == {"builder_oid": builder_oid, **custody_by_field},
-        "abandoned custody differs",
+        isinstance(abandonment[candidate_field], dict) and set(abandonment[candidate_field]) == candidate_fields,
+        "candidate fields differ",
+    )
+    _require(
+        _logical_candidate(abandonment[candidate_field]) == _logical_candidate(handoff), "abandoned candidate differs"
     )
     _require_abandoned_run_shape(handoff, abandonment["observed_run"])
     return abandonment
+
+
+def _logical_candidate(value):
+    """Read retained candidate names and logical attempt bindings, never old owner tokens."""
+    fields = ("schema_name", "attempt_id", "attempt_started_at", "handoff_sha256", "source_contract_sha256")
+    _require(
+        isinstance(value, dict) and all(field in value for field in (*fields, "stage_relations", "indexes")),
+        "candidate fields differ",
+    )
+    return {
+        **{field: value[field] for field in fields},
+        "stage_relations": [
+            {key: row[key] for key in ("table_name", "stage_name")} for row in value["stage_relations"]
+        ],
+        "indexes": sorted(row["definition"] for row in value["indexes"]),
+    }
 
 
 def _require_abandoned_run_shape(handoff, observed):
@@ -1182,22 +1180,13 @@ async def _require_cleanup_run(session, handoff, abandonment):
     )
     current = validate_entity_address_native_handoff(metrics.get("address_handoff"))
     _require(
-        all(current[key] == handoff[key] for key in ("run_id", "schema_name", "database_oid", "import_run_oid"))
+        all(current[key] == handoff[key] for key in ("run_id", "schema_name"))
         and current["handoff_sha256"] == abandonment["observed_run"]["handoff_sha256"]
         and {key: (run["progress"] or {}).get(key) for key in ("attempt_id", "attempt_started_at")}
         == abandonment["observed_run"]["progress"],
         "cleanup attempt changed",
     )
     _require_cleanup_terminal(run, handoff, current, abandonment)
-    actual = (
-        await session.execute(
-            text(
-                "SELECT (SELECT oid::bigint FROM pg_database WHERE datname=current_database()),to_regclass(:history)::oid::bigint"
-            ),
-            {"history": f'"{schema}".import_run'},
-        )
-    ).one()
-    _require(tuple(actual) == (handoff["database_oid"], handoff["import_run_oid"]), "cleanup database changed")
 
 
 def _require_cleanup_terminal(run, handoff, current, abandonment):
@@ -1230,83 +1219,38 @@ def _require_cleanup_terminal(run, handoff, current, abandonment):
     _require(is_canceled or is_fenced, "cancellation is not authenticated")
 
 
-async def _require_cleanup_owners(session, handoff, runtime_owner_oids, protected_owner_oid):
-    _require(
-        type(runtime_owner_oids) is tuple
-        and 0 < len(runtime_owner_oids) <= 64
-        and all(type(oid) is int and 0 < oid < 2**32 and oid != protected_owner_oid for oid in runtime_owner_oids),
-        "cleanup runtime authority differs",
-    )
-    safe = await session.scalar(
-        text(
-            "SELECT count(DISTINCT relation.relowner)=1 AND count(*)=:count AND bool_and("
-            "relation.relowner=ANY(:runtime_owners) AND NOT owner.rolsuper AND NOT owner.rolcreaterole "
-            "AND NOT owner.rolcreatedb AND NOT owner.rolreplication AND NOT owner.rolbypassrls "
-            "AND NOT pg_has_role(owner.oid,CAST(:protected_owner AS oid),'USAGE') "
-            "AND pg_has_role(session_user,owner.oid,'USAGE')) "
-            "FROM pg_class relation JOIN pg_roles owner ON owner.oid=relation.relowner WHERE relation.oid=ANY(:oids)"
-        ),
-        {
-            "oids": [entry["relation_oid"] for entry in handoff["stage_relations"]]
-            + [entry["index_oid"] for entry in handoff["indexes"]],
-            "runtime_owners": list(runtime_owner_oids),
-            "protected_owner": protected_owner_oid,
-            "count": 7 + len(handoff["indexes"]),
-        },
-    )
-    _require(safe is True, "cleanup owner changed")
-
-
 async def _require_cleanup_nonserving(session, handoff):
+    """Pin current serving data while refusing any declared canonical cleanup target."""
     schema = handoff["schema_name"]
     names = (*generation.RELATION_NAMES, generation.TABLE_NAME)
     await session.execute(
-        text("LOCK TABLE " + ",".join(f'"{schema}"."{name}"' for name in sorted(names)) + " IN SHARE MODE NOWAIT")
-    )
-    safe = await session.scalar(
         text(
-            f'SELECT NOT EXISTS(SELECT 1 FROM "{schema}"."{generation.TABLE_NAME}" WHERE relation_oids OPERATOR(pg_catalog.&&) CAST(:oids AS bigint[])) '
-            "AND NOT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-            "WHERE n.nspname=:schema AND c.relname=ANY(:names) AND c.oid=ANY(:oids))"
-        ),
-        {
-            "schema": schema,
-            "names": list(generation.RELATION_NAMES),
-            "oids": [entry["relation_oid"] for entry in handoff["stage_relations"]],
-        },
+            "LOCK TABLE " + ",".join(f'"{schema}"."{name}"' for name in sorted(names)) + " IN ACCESS SHARE MODE NOWAIT"
+        )
     )
-    _require(safe is True, "candidate is serving")
+    candidates = {entry["stage_name"] for entry in handoff["stage_relations"]}
+    _require(not candidates.intersection(names), "candidate is serving")
+    await generation.read_entity_address_result_generation_authority(session, schema_name=schema)
 
 
 async def cleanup_entity_address_native_handoff(
-    session, handoff, *, abandonment, runtime_owner_oids, assert_unreferenced
+    session, handoff, *, abandonment, assert_unreferenced, runtime_owner_oids=None
 ):
-    """Remove only abandoned exact native7 custody; caller owns ledger retirement and COMMIT."""
+    """Remove only the closed abandoned candidate names under native PostgreSQL access."""
     handoff = validate_entity_address_native_handoff(handoff)
     abandonment = _validate_abandoned_handoff(handoff, abandonment)
     _require(session.in_transaction() and callable(assert_unreferenced), "cleanup requires a trusted transaction")
-    _require(runtime_owner_oids == (abandonment["candidate_custody"]["builder_oid"],), "cleanup builder differs")
     async with _catalog_search_path(session):
-        return await _cleanup_bound_native_candidate(
-            session, handoff, abandonment, runtime_owner_oids, assert_unreferenced
-        )
+        return await _cleanup_bound_native_candidate(session, handoff, abandonment, assert_unreferenced)
 
 
-async def _cleanup_bound_native_candidate(session, handoff, abandonment, runtime_owner_oids, assert_unreferenced):
-    from process import entity_address_snapshot_preparation as protected
-
-    transaction_id = await session.scalar(text("SELECT pg_current_xact_id()::text"))
-    protected_owner_oid = await protected._publisher_authority(session)
+async def _cleanup_bound_native_candidate(session, handoff, abandonment, assert_unreferenced):
     await _require_cleanup_run(session, handoff, abandonment)
     _require(await assert_unreferenced(session, handoff, abandonment) is True, "candidate remains referenced")
     await _require_cleanup_nonserving(session, handoff)
     await _require_handoff_stage(session, handoff)
-    await _require_cleanup_owners(session, handoff, runtime_owner_oids, protected_owner_oid)
     _require(await assert_unreferenced(session, handoff, abandonment) is True, "candidate remains referenced")
-    _require(
-        session.in_transaction() and await session.scalar(text("SELECT pg_current_xact_id()::text")) == transaction_id,
-        "cleanup transaction changed",
-    )
+    _require(session.in_transaction(), "cleanup requires a transaction")
     relations = ",".join(f'"{handoff["schema_name"]}"."{entry["stage_name"]}"' for entry in handoff["stage_relations"])
     await session.execute(text("DROP TABLE " + relations + " RESTRICT"))
     return {
@@ -1314,8 +1258,10 @@ async def _cleanup_bound_native_candidate(session, handoff, abandonment, runtime
         "preparation_id": abandonment["preparation_id"],
         "abandonment_sha256": _digest(abandonment),
         "handoff_sha256": handoff["handoff_sha256"],
-        "database_oid": handoff["database_oid"],
-        "stage_relations": handoff["stage_relations"],
+        "schema_name": handoff["schema_name"],
+        "stage_relations": [
+            {key: entry[key] for key in ("table_name", "stage_name")} for entry in handoff["stage_relations"]
+        ],
         "stage_disposition": "removed-unpublished",
         "physical_cleanup_completed": True,
     }

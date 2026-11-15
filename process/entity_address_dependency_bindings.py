@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Local held dependency locks, projection state, and closed physical relocation."""
+"""Named dependency selection, native reader locks, and logical projection state."""
 
 import json
 from collections.abc import Mapping
@@ -17,12 +17,9 @@ PUBLISHER_SELECTED_INPUTS_CONTRACT = "entity-address-publisher-selected-inputs.v
 
 @dataclass(frozen=True)
 class _HeldPublicationDependencies:
-    database: object
     schema: str
     session: object
-    transaction: object
-    backend_id: int
-    relations_by_name: dict
+    relation_names: tuple
 
 
 _HELD_PUBLICATION_DEPENDENCIES = ContextVar("held_address_publication_dependencies", default=None)
@@ -36,11 +33,27 @@ def validate_publisher_selected_inputs(schema_name, value):
         or value["contract"] != PUBLISHER_SELECTED_INPUTS_CONTRACT
     ):
         raise ValueError("entity-address publisher selected inputs are invalid")
+    validator = (
+        projection.validate_projection_dependency_qnames
+        if projection._is_named_binding_family(value["dependency_bindings"])
+        else projection.validate_projection_dependency_bindings
+    )
     return {
         "contract": PUBLISHER_SELECTED_INPUTS_CONTRACT,
-        "dependency_bindings": projection.validate_projection_dependency_bindings(
-            schema_name, value["dependency_bindings"]
-        ),
+        "dependency_bindings": validator(schema_name, value["dependency_bindings"]),
+    }
+
+
+def publisher_selected_input_names(schema_name, value):
+    """Project a validated local selection to portable names without rewriting retained input metadata."""
+    selected = validate_publisher_selected_inputs(schema_name, value)
+    bindings_by_name = {
+        name: {field: binding[field] for field in ("schema_name", "table_name")}
+        for name, binding in selected["dependency_bindings"].items()
+    }
+    return {
+        "contract": PUBLISHER_SELECTED_INPUTS_CONTRACT,
+        "dependency_bindings": projection.validate_projection_dependency_qnames(schema_name, bindings_by_name),
     }
 
 
@@ -56,7 +69,7 @@ async def lock_publisher_selected_inputs(session, schema_name, value):
         text("SELECT " + projection.projection_dependency_bindings_match_sql(schema_name, bindings))
     ):
         raise RuntimeError("entity-address publisher selected inputs changed")
-    return selected
+    return publisher_selected_input_names(schema_name, selected)
 
 
 def validate_schema_name(schema: str) -> str:
@@ -83,16 +96,23 @@ def record_geo_assurance_candidate_sql(
     state_table = projection.GEO_ASSURANCE_STATE_TABLE
     stage_relation = f"{db_schema}.{stage_table}"
     signature_sql = projection.projection_relation_signature_sql(
-        db_schema, **({} if dependency_bindings is None else {"dependency_bindings": dependency_bindings})
+        db_schema,
+        **(
+            {}
+            if dependency_bindings is None or require_canonical_publication
+            else {"dependency_bindings": dependency_bindings}
+        ),
     )
+    selected_by_name = None
+    if dependency_bindings is not None and not require_canonical_publication:
+        selected_by_name = {
+            name: {field: entry[field] for field in ("schema_name", "table_name")}
+            for name, entry in dependency_bindings.items()
+        }
     bindings_sql = (
         "NULL"
-        if dependency_bindings is None or require_canonical_publication
-        else "'"
-        + json.dumps(
-            projection.validate_projection_dependency_bindings(db_schema, dependency_bindings), sort_keys=True
-        ).replace("'", "''")
-        + "'::jsonb"
+        if selected_by_name is None
+        else "'" + json.dumps(selected_by_name, sort_keys=True).replace("'", "''") + "'::jsonb"
     )
     return f"""
     INSERT INTO {db_schema}.{state_table} (
@@ -106,7 +126,7 @@ def record_geo_assurance_candidate_sql(
     SELECT
         true,
         {projection.GEO_ASSURANCE_VERSION},
-        to_regclass('{stage_relation}')::oid,
+        NULL,
         {signature_sql},
         {bindings_sql},
         {int(projected_rows)}::bigint
@@ -117,20 +137,22 @@ def record_geo_assurance_candidate_sql(
         candidate_relation_signature = EXCLUDED.candidate_relation_signature,
         candidate_dependency_bindings = EXCLUDED.candidate_dependency_bindings,
         candidate_projected_rows = EXCLUDED.candidate_projected_rows
-    RETURNING candidate_table_oid::bigint;
+    RETURNING candidate_geo_assurance_version;
     """
 
 
-def activate_geo_assurance_candidate_sql(db_schema: str) -> str:
+def activate_geo_assurance_candidate_sql(db_schema: str, *, dependency_bindings=None) -> str:
     """Activate only the recorded candidate heap with its still-valid dependency map."""
     db_schema = validate_schema_name(db_schema)
     state_table = projection.GEO_ASSURANCE_STATE_TABLE
-    live_relation = f"{db_schema}.{EntityAddressUnified.__main_table__}"
     signature, bindings_match = projection.projection_stored_bindings_sql(db_schema, "candidate_dependency_bindings")
+    generation_matches = projection.projection_npi_generation_match_sql(
+        db_schema, "candidate", dependency_bindings=dependency_bindings
+    )
     return f"""
     UPDATE {db_schema}.{state_table}
        SET active_geo_assurance_version = candidate_geo_assurance_version,
-           active_table_oid = candidate_table_oid,
+           active_table_oid = NULL,
            active_relation_signature = candidate_relation_signature,
            active_dependency_bindings = candidate_dependency_bindings,
            candidate_geo_assurance_version = NULL,
@@ -140,10 +162,12 @@ def activate_geo_assurance_candidate_sql(db_schema: str) -> str:
            candidate_projected_rows = NULL
      WHERE singleton IS TRUE
        AND candidate_geo_assurance_version = {projection.GEO_ASSURANCE_VERSION}
-       AND candidate_table_oid = to_regclass('{live_relation}')::oid
        AND {bindings_match}
-       AND candidate_relation_signature = ({signature})
-    RETURNING active_table_oid::bigint;
+       AND candidate_relation_signature - '{db_schema}.npi_result_generation' = ({signature})
+       AND {generation_matches}
+       AND EXISTS(SELECT 1 FROM pg_class live WHERE live.oid=to_regclass('{db_schema}.entity_address_unified')
+           AND live.relkind='r' AND live.relpersistence='p' AND NOT live.relrowsecurity AND NOT live.relforcerowsecurity)
+    RETURNING active_geo_assurance_version;
     """
 
 
@@ -200,21 +224,8 @@ async def selected_publication_dependencies(database, schema_name, *, control_co
         for namespace, table in projection._PROJECTION_DEPENDENCIES:
             canonical = f"{namespace or schema}.{table}"
             physical_schema = by_name[table]["schema_name"] if table in by_name else namespace or schema
-            relation = (
-                (
-                    await session.execute(
-                        text("""SELECT oid::bigint AS relation_oid,
-                pg_relation_filenode(oid)::bigint AS relfilenode FROM pg_class WHERE oid=to_regclass(:name)"""),
-                        {"name": f'"{physical_schema}"."{table}"'},
-                    )
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if relation is None:
-                raise RuntimeError("entity-address publication dependency is missing")
-            bindings_by_name[canonical] = {"schema_name": physical_schema, "table_name": table, **dict(relation)}
-        bindings = projection.validate_projection_dependency_bindings(schema, bindings_by_name)
+            bindings_by_name[canonical] = {"schema_name": physical_schema, "table_name": table}
+        bindings = projection.validate_projection_dependency_qnames(schema, bindings_by_name)
         await session.execute(text(projection.projection_dependency_lock_sql(schema, dependency_bindings=bindings)))
         if not await session.scalar(
             text("SELECT " + projection.projection_dependency_bindings_match_sql(schema, bindings))
@@ -234,21 +245,14 @@ async def _hold_publication_dependencies(database, schema, session, captured_rel
             "THEN set_config('transaction_timeout', '0', true) END"
         )
     )
-    relations_by_name = {}
+    relation_names = set()
     for relation in [*captured_relations_by_name.values(), *bindings.values()]:
         namespace = projection._sql_identifier(relation["schema_name"], field_name="dependency schema")
         name = projection._sql_identifier(
             relation.get("table_name", relation.get("relation_name")), field_name="dependency table"
         )
-        relations_by_name[f'"{namespace}"."{name}"'] = (relation["relation_oid"], relation["relfilenode"])
-    held = _HeldPublicationDependencies(
-        database,
-        schema,
-        session,
-        session.get_transaction(),
-        await session.scalar(text("SELECT pg_backend_pid()")),
-        relations_by_name,
-    )
+        relation_names.add(f'"{namespace}"."{name}"')
+    held = _HeldPublicationDependencies(schema, session, tuple(sorted(relation_names)))
     token = _HELD_PUBLICATION_DEPENDENCIES.set(held)
     try:
         yield
@@ -257,36 +261,18 @@ async def _hold_publication_dependencies(database, schema, session, captured_rel
 
 
 async def lock_selected_publication_dependencies(database, schema_name):
-    """Overlap the build's physical locks with cutover before checking its original owner."""
+    """Acquire the selected logical input names on the native cutover transaction."""
     held = _HELD_PUBLICATION_DEPENDENCIES.get()
     if held is None:
         return
     binding = database._transaction_binding()
-    if held.database is not database or held.schema != schema_name or binding is None:
-        raise RuntimeError("entity-address publication dependency transaction changed")
+    if held.schema != schema_name or binding is None:
+        raise RuntimeError("entity-address publication dependency scope changed")
     session = binding.session
-    names = sorted(held.relations_by_name)
+    # Overlap the preparation's read locks before its context releases them.
     await session.execute(
-        text("LOCK TABLE " + ", ".join("ONLY " + name for name in names) + " IN ACCESS SHARE MODE NOWAIT")
+        text("LOCK TABLE " + ", ".join("ONLY " + name for name in held.relation_names) + " IN ACCESS SHARE MODE NOWAIT")
     )
-    observed = (
-        await session.execute(
-            text(
-                "SELECT name, to_regclass(name)::oid::bigint, "
-                "pg_relation_filenode(to_regclass(name))::bigint "
-                "FROM unnest(CAST(:names AS text[])) AS name"
-            ),
-            {"names": names},
-        )
-    ).all()
-    if {name: (oid, filenode) for name, oid, filenode in observed} != held.relations_by_name:
-        raise RuntimeError("entity-address publication dependency changed")
-    if (
-        held.session.get_transaction() is not held.transaction
-        or not held.session.in_transaction()
-        or await held.session.scalar(text("SELECT pg_backend_pid()")) != held.backend_id
-    ):
-        raise RuntimeError("entity-address publication dependency lock owner changed")
 
 
 async def read_active_bindings(session, schema_name):
@@ -298,34 +284,19 @@ async def read_active_bindings(session, schema_name):
             "WHERE singleton IS TRUE"
         )
     )
-    return None if bindings is None else projection.validate_projection_dependency_bindings(schema, bindings)
+    if bindings is None:
+        return None
+    validator = (
+        projection.validate_projection_dependency_qnames
+        if projection._is_named_binding_family(bindings)
+        else projection.validate_projection_dependency_bindings
+    )
+    return validator(schema, bindings)
 
 
 async def lock_active_dependencies(session, schema_name, *, receiving=False):
     """Call after the alias/publication fence; lock the actual six input heaps."""
     bindings = await read_active_bindings(session, schema_name)
-    if receiving and bindings is not None:
-        # A grouped receive may already have relocated its predecessor heaps.
-        # Lock those exact old OIDs, but never rewrite or export their evidence.
-        for binding in bindings.values():
-            relation_identity = (
-                (
-                    await session.execute(
-                        text(
-                            "SELECT n.nspname AS schema_name,c.relname AS table_name FROM pg_class c "
-                            "JOIN pg_namespace n ON n.oid=c.relnamespace "
-                            "WHERE c.oid=:oid AND pg_relation_filenode(c.oid)=:filenode"
-                        ),
-                        {"oid": binding["relation_oid"], "filenode": binding["relfilenode"]},
-                    )
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if relation_identity is None:
-                raise RuntimeError("entity-address active dependency binding changed")
-            binding.update(dict(relation_identity))
-        bindings = projection.validate_projection_dependency_bindings(schema_name, bindings)
     await session.execute(text(projection.projection_dependency_lock_sql(schema_name, dependency_bindings=bindings)))
     if bindings is not None and not await session.scalar(
         text("SELECT " + projection.projection_dependency_bindings_match_sql(schema_name, bindings))
@@ -335,35 +306,32 @@ async def lock_active_dependencies(session, schema_name, *, receiving=False):
 
 
 async def resolve_prepared_bindings(session, schema_name, bindings):
-    """Accept only the original held name or its same-OID canonical relocation."""
+    """Use declared names; copied snapshots never relocate by numeric tokens."""
     if bindings is None:
         return None
-    resolved = projection.validate_projection_dependency_bindings(schema_name, bindings)
-    for name, binding in resolved.items():
-        relation_identity = (
-            (
-                await session.execute(
-                    text(
-                        "SELECT namespace.nspname AS schema_name,relation.relname AS table_name "
-                        "FROM pg_catalog.pg_class relation JOIN pg_catalog.pg_namespace namespace "
-                        "ON namespace.oid=relation.relnamespace WHERE relation.oid=:oid "
-                        "AND pg_relation_filenode(relation.oid)=:filenode"
-                    ),
-                    {"oid": binding["relation_oid"], "filenode": binding["relfilenode"]},
-                )
-            )
-            .mappings()
-            .one_or_none()
-        )
-        if relation_identity is None or (relation_identity["schema_name"], relation_identity["table_name"]) not in {
-            (binding["schema_name"], binding["table_name"]),
-            tuple(name.split(".", 1)),
-        }:
-            raise RuntimeError("entity-address prepared dependency binding changed")
-        binding.update(dict(relation_identity))
+    validator = (
+        projection.validate_projection_dependency_qnames
+        if projection._is_named_binding_family(bindings)
+        else projection.validate_projection_dependency_bindings
+    )
+    resolved = validator(schema_name, bindings)
     await session.execute(text(projection.projection_dependency_lock_sql(schema_name, dependency_bindings=resolved)))
     if not await session.scalar(
         text("SELECT " + projection.projection_dependency_bindings_match_sql(schema_name, resolved))
     ):
         raise RuntimeError("entity-address prepared dependency binding changed")
     return resolved
+
+
+async def activate_geo_assurance_candidate(database, schema_name):
+    """Publish only the candidate whose locked named inputs still match its generation."""
+    from process.entity_address_preparation_admission import read_scalar
+
+    schema_name = validate_schema_name(schema_name)
+    bindings = await read_scalar(
+        database,
+        f"SELECT candidate_dependency_bindings FROM {schema_name}.{projection.GEO_ASSURANCE_STATE_TABLE} "
+        "WHERE singleton IS TRUE",
+    )
+    statement = activate_geo_assurance_candidate_sql(schema_name, dependency_bindings=bindings)
+    return await read_scalar(database, statement)

@@ -93,9 +93,6 @@ async def _verified_capture_limits(fhir, execution, plan):
         trust=trust,
         now=now,
         expected_capacity_geometry_hash=plan.capacity_geometry_hash,
-        expected_database_system_identifier=trust.database_system_identifier,
-        expected_database_oid=trust.database_oid,
-        expected_database_name=trust.database_name,
     )
     request = validated_capacity_preflight_request(lease.signing_preflight_guard["healthcare_request"])
     profile = verified_cms_paired_profile_lease(request, trust=trust, now=now)

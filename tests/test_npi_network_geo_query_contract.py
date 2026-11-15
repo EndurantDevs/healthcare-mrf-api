@@ -12,15 +12,18 @@ from sanic.exceptions import InvalidUsage
 from api import provider_list_sql
 from api.endpoint import npi as npi_module
 from api.network_address_scope import network_address_read_scope
+from process.network_compact_layout import CompactAddressRelation
+from process.network_published_api_pin import _decode_published_pin
 from process.network_serving_read import PinnedNetworkServingManifest
-from tests.network_read_execution_support import with_read_identity_receipts
+from tests.network_read_execution_support import with_read_session
 from tests.npi_location_hydration_support import unified_location_mapping
+from tests.test_network_published_api_pin import published_entry as published_entry
 from tests.test_npi_facility_providers_api import FakeSession, _facility_query_results
 
 
 def _guarded_query_session(query):
     """Buffer semantic SQL rows while retaining the original transaction guard."""
-    session = with_read_identity_receipts(SimpleNamespace())
+    session = with_read_session(SimpleNamespace())
 
     async def execute(statement, parameters):
         rows = await query(statement, **parameters)
@@ -36,9 +39,9 @@ def _guarded_query_session(query):
 async def test_general_geo_page_and_count_bind_retained_offices(monkeypatch, entity_type_code, empty_result):
     """Pin page and count SQL before spatial and entity predicates."""
     candidate_id = uuid4()
-    manifest = PinnedNetworkServingManifest(
-        12, str(candidate_id), "network_candidate_" + candidate_id.hex, 1, {}, 0, "c" * 64, 1
-    )
+    schema_name = "network_candidate_" + candidate_id.hex
+    address_relation = CompactAddressRelation(schema_name, "entity_address_unified")
+    manifest = PinnedNetworkServingManifest(12, str(candidate_id), schema_name, 1, {}, 0, "c" * 64, address_relation)
     statements = []
     location_by_field = {
         **unified_location_mapping(),
@@ -68,8 +71,8 @@ async def test_general_geo_page_and_count_bind_retained_offices(monkeypatch, ent
         return [] if empty_result or len(statements) > 1 else [SimpleNamespace(_mapping=location_by_field)]
 
     session = _guarded_query_session(query)
-    proxy = Mock(wraps=provider_list_sql.NetworkReadConnectionProxy)
-    monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", proxy)
+    proxy = Mock(wraps=provider_list_sql.ConnectionProxy)
+    monkeypatch.setattr(provider_list_sql, "ConnectionProxy", proxy)
     monkeypatch.setattr(npi_module, "db", SimpleNamespace(acquire=Mock(side_effect=AssertionError("unpinned query"))))
     monkeypatch.setattr(npi_module, "_plan_release_npi_scope", AsyncMock(return_value=(None, {})))
     request = SimpleNamespace(
@@ -139,9 +142,9 @@ async def test_facility_relationships_preserve_legacy_request(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("count_rows,expected", [([], 0), ([(7,)], 7)])
-async def test_canonical_geo_count_handles_empty_and_positional_results(monkeypatch, count_rows, expected):
-    from tests.test_network_read_execution import _manifest
-
+async def test_canonical_geo_count_handles_empty_and_positional_results(
+    monkeypatch, published_entry, count_rows, expected
+):
     statements = []
 
     async def query(statement, **parameters):
@@ -161,7 +164,8 @@ async def test_canonical_geo_count_handles_empty_and_positional_results(monkeypa
         ctx=SimpleNamespace(sa_session=session),
         app=SimpleNamespace(),
     )
-    with network_address_read_scope(_manifest(), (42,)):
+    manifest, _approved, _relation = _decode_published_pin(published_entry, "registry_control")
+    with network_address_read_scope(manifest, (42,)):
         assert json.loads((await npi_module.get_near_npi(request)).body) == {"rows": expected}
     assert len(statements) == 1
     metadata.assert_not_awaited()
@@ -172,9 +176,7 @@ async def test_canonical_geo_count_handles_empty_and_positional_results(monkeypa
     "malformed",
     [SimpleNamespace(_mapping={"address_key": "a" * 64}), SimpleNamespace(_mapping={"npi": 1000000004}), (1,)],
 )
-async def test_canonical_geo_never_invents_provider_or_office_identity(monkeypatch, malformed):
-    from tests.test_network_read_execution import _manifest
-
+async def test_canonical_geo_never_invents_provider_or_office_identity(monkeypatch, published_entry, malformed):
     async def query(statement, **parameters):
         assert parameters["_canonical_network_ids"] == [42]
         if "COUNT(DISTINCT" in str(statement):
@@ -189,17 +191,16 @@ async def test_canonical_geo_never_invents_provider_or_office_identity(monkeypat
         ctx=SimpleNamespace(sa_session=session),
         app=SimpleNamespace(),
     )
-    with network_address_read_scope(_manifest(), (42,)):
+    manifest, _approved, _relation = _decode_published_pin(published_entry, "registry_control")
+    with network_address_read_scope(manifest, (42,)):
         document = json.loads((await npi_module.get_near_npi(request)).body)
     assert document["items"] == [] and document["has_more"] is False
 
 
 @pytest.mark.asyncio
-async def test_geo_cursor_from_another_pinned_network_generation_refuses_before_read(monkeypatch):
-    from tests.test_network_read_execution import _manifest
-
-    original = _manifest()
-    successor = _manifest()
+async def test_geo_cursor_from_another_pinned_network_generation_refuses_before_read(monkeypatch, published_entry):
+    original, _approved, _relation = _decode_published_pin(published_entry, "registry_control")
+    successor, _approved, _relation = _decode_published_pin(published_entry, "registry_control")
     object.__setattr__(successor, "generation_id", 2)
     object.__setattr__(successor, "manifest_sha256", "b" * 64)
     arguments_by_name = {"lat": "41", "long": "-87", "limit": "1"}

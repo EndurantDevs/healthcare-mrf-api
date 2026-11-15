@@ -371,6 +371,7 @@ def _checkpoint_metadata_values(fhir, build, batch_plan, has_existing_artifacts)
         "dataset_ids": build.dataset_ids,
         "evidence_stage": build.evidence_stage,
         "profile_stage": build.profile_stage,
+        "targets_json": fhir._stable_identity_json(fhir._profile_build_target_coordinates(build)),
         "current_source_vector_hash": build.current_source_vector_hash,
         "desired_source_vector_hash": build.desired_source_vector_hash,
         "current_source_context_vector_hash": build.current_source_context_vector_hash,
@@ -454,56 +455,9 @@ async def _create_checkpoint_stages(fhir, build):
         )
 
 
-async def _checkpoint_stage_oids(fhir, build):
-    return {
-        "evidence_stage_oid": await fhir._require_provider_directory_profile_stage_oid(
-            build.schema,
-            build.evidence_stage,
-        ),
-        "profile_stage_oid": await fhir._require_provider_directory_profile_stage_oid(
-            build.schema,
-            build.profile_stage,
-        ),
-        "affected_npi_stage_oid": (
-            await fhir._require_provider_directory_profile_stage_oid(
-                build.schema,
-                build.affected_npi_stage,
-            )
-            if build.affected_npi_stage is not None
-            else None
-        ),
-    }
-
-
-async def _checkpoint_stage_fingerprints(fhir, build, stage_oids_by_name):
-    return {
-        "evidence_stage_storage_fingerprint": (
-            await fhir._provider_directory_profile_stage_storage_fingerprint(
-                build.schema,
-                build.evidence_stage,
-                expected_oid=stage_oids_by_name["evidence_stage_oid"],
-                lock_relation=True,
-            )
-        ),
-        "profile_stage_storage_fingerprint": (
-            await fhir._provider_directory_profile_stage_storage_fingerprint(
-                build.schema,
-                build.profile_stage,
-                expected_oid=stage_oids_by_name["profile_stage_oid"],
-                lock_relation=True,
-            )
-        ),
-        "affected_npi_stage_storage_fingerprint": (
-            await fhir._provider_directory_profile_stage_storage_fingerprint(
-                build.schema,
-                build.affected_npi_stage,
-                expected_oid=stage_oids_by_name["affected_npi_stage_oid"],
-                lock_relation=True,
-            )
-            if build.affected_npi_stage is not None and stage_oids_by_name["affected_npi_stage_oid"] is not None
-            else None
-        ),
-    }
+async def _validate_checkpoint_stages(fhir, build):
+    for stage_table, _field_name in fhir._profile_reinitialize_stage_fields(build):
+        await fhir._provider_directory_profile_stage_layout(build.schema, stage_table, lock_relation=True)
 
 
 _CHECKPOINT_INSERT_SQL = """
@@ -514,17 +468,12 @@ _CHECKPOINT_INSERT_SQL = """
                     capacity_geometry_status, capacity_geometry_hash,
                     capacity_geometry_json,
                     source_ids, retained_source_ids, dataset_ids,
-                    evidence_stage, profile_stage, evidence_stage_oid,
-                    profile_stage_oid,
-                    evidence_stage_storage_fingerprint,
-                    profile_stage_storage_fingerprint,
-                    affected_npi_stage_storage_fingerprint,
-                    evidence_target_oid, profile_target_oid,
+                    evidence_stage, profile_stage, targets_json,
                     current_source_vector_hash, desired_source_vector_hash,
                     current_source_context_vector_hash,
                     desired_source_context_vector_hash,
                     refresh_source_ids, removed_source_ids,
-                    affected_npi_stage, affected_npi_stage_oid,
+                    affected_npi_stage,
                     has_existing_artifacts, evidence_next_batch,
                     evidence_total_batches, profile_next_batch,
                     profile_total_batches, created_at, updated_at
@@ -538,18 +487,14 @@ _CHECKPOINT_INSERT_SQL = """
                     CAST(:source_ids AS jsonb),
                     CAST(:retained_source_ids AS jsonb),
                     CAST(:dataset_ids AS jsonb), :evidence_stage,
-                    :profile_stage, :evidence_stage_oid, :profile_stage_oid,
-                    :evidence_stage_storage_fingerprint,
-                    :profile_stage_storage_fingerprint,
-                    :affected_npi_stage_storage_fingerprint,
-                    :evidence_target_oid, :profile_target_oid,
+                    :profile_stage, CAST(:targets_json AS jsonb),
                     :current_source_vector_hash,
                     :desired_source_vector_hash,
                     :current_source_context_vector_hash,
                     :desired_source_context_vector_hash,
                     CAST(:refresh_source_ids AS jsonb),
                     CAST(:removed_source_ids AS jsonb),
-                    :affected_npi_stage, :affected_npi_stage_oid,
+                    :affected_npi_stage,
                     :has_existing_artifacts, 0,
                     :evidence_total_batches, 0, :profile_total_batches,
                     now(), now()
@@ -569,16 +514,12 @@ _CHECKPOINT_CLAIM_SQL = """
                    :capacity_geometry_hash
                AND capacity_geometry_json::jsonb IS NOT DISTINCT FROM
                    CAST(:capacity_geometry_json AS jsonb)
-               AND to_regclass(:evidence_stage_relation)::oid::bigint
-                   = evidence_stage_oid
-               AND to_regclass(:profile_stage_relation)::oid::bigint
-                   = profile_stage_oid
-               AND (
-                    materialization_mode <> 'source_delta'
-                    OR to_regclass(
-                        :affected_npi_stage_relation
-                    )::oid::bigint = affected_npi_stage_oid
-               );
+               AND resume_lineage_hash = :resume_lineage_hash
+               AND executable_plan_hash = :executable_plan_hash
+               AND evidence_stage = :evidence_stage
+               AND profile_stage = :profile_stage
+               AND affected_npi_stage IS NOT DISTINCT FROM :affected_npi_stage
+               AND targets_json::jsonb = CAST(:targets_json AS jsonb);
             """
 
 
@@ -589,8 +530,7 @@ def _checkpoint_insert_values(fhir, build, metadata_by_field, evidence_fence, pr
     insert_by_field["refresh_source_ids"] = fhir.json.dumps(
         list(build.source_ids) if build.materialization_mode == "source_delta" else []
     )
-    insert_by_field["evidence_target_oid"] = evidence_fence.target_oid
-    insert_by_field["profile_target_oid"] = profile_fence.target_oid
+    insert_by_field["targets_json"] = fhir._stable_identity_json(fhir._profile_build_target_coordinates(build))
     return insert_by_field
 
 
@@ -612,15 +552,12 @@ async def _initialize_checkpoint(
         build_id=fhir._provider_directory_profile_build_id(build),
     )
     await _create_checkpoint_stages(fhir, build)
-    stage_oids_by_name = await _checkpoint_stage_oids(fhir, build)
-    fingerprints_by_name = await _checkpoint_stage_fingerprints(fhir, build, stage_oids_by_name)
+    await _validate_checkpoint_stages(fhir, build)
     if metadata_by_field is None:
         metadata_by_field = _checkpoint_metadata_values(fhir, build, batch_plan, has_existing_artifacts)
     await fhir.db.status(
         _CHECKPOINT_INSERT_SQL.format(checkpoint_ref=checkpoint_ref),
         **_checkpoint_insert_values(fhir, build, metadata_by_field, evidence_fence, profile_fence),
-        **stage_oids_by_name,
-        **fingerprints_by_name,
     )
     return fhir._ProviderDirectoryProfileBuildCheckpointState(
         evidence_next_batch=0,

@@ -17,44 +17,28 @@ from process.provider_directory_profile_capacity_preflight_contract import (
     utc_second_text,
 )
 
-
 CAPACITY_SIGNING_PREFLIGHT_GUARD_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-capacity-signing-preflight-guard.v1"
+    "healthporta.provider-directory-profile-capacity-signing-preflight-guard.v2"
 )
-CAPACITY_SIGNING_PREFLIGHT_GUARD_DIGEST_DOMAIN = (
-    CAPACITY_SIGNING_PREFLIGHT_GUARD_CONTRACT_ID
-)
+CAPACITY_SIGNING_PREFLIGHT_GUARD_DIGEST_DOMAIN = CAPACITY_SIGNING_PREFLIGHT_GUARD_CONTRACT_ID
 CONTROL_PLANE_PREFLIGHT_REQUEST_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-capacity-control-plane-"
-    "preflight-request.v1"
+    "healthporta.provider-directory-profile-capacity-control-plane-preflight-request.v4"
 )
-CONTROL_PLANE_PREFLIGHT_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-capacity-control-plane-preflight.v1"
-)
-CONTROL_PLANE_SIGNING_INTENT_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-capacity-signing-intent.v1"
-)
+CONTROL_PLANE_PREFLIGHT_CONTRACT_ID = "healthporta.provider-directory-profile-capacity-control-plane-preflight.v4"
+CONTROL_PLANE_SIGNING_INTENT_CONTRACT_ID = "healthporta.provider-directory-profile-capacity-signing-intent.v1"
 CONTROL_PLANE_REQUEST_DIGEST_DOMAIN = (
-    "healthporta.provider-directory-profile-capacity-control-plane-"
-    "preflight-request-digest.v1"
+    "healthporta.provider-directory-profile-capacity-control-plane-preflight-request-digest.v2"
 )
 CONTROL_PLANE_STORAGE_OBSERVATION_DIGEST_DOMAIN = (
-    "healthporta.provider-directory-profile-capacity-storage-observation-digest.v1"
+    "healthporta.provider-directory-profile-capacity-storage-observation-digest.v2"
 )
-CONTROL_PLANE_QUIESCENCE_CONTRACT_ID = (
-    "healthporta.provider-directory-profile-capacity-control-plane-quiescence.v1"
-)
+CONTROL_PLANE_QUIESCENCE_CONTRACT_ID = "healthporta.provider-directory-profile-capacity-control-plane-quiescence.v1"
 CONTROL_PLANE_QUIESCENCE_DIGEST_DOMAIN = (
-    "healthporta.provider-directory-profile-capacity-control-plane-"
-    "quiescence-digest.v1"
+    "healthporta.provider-directory-profile-capacity-control-plane-quiescence-digest.v1"
 )
 
-CAPACITY_BUNDLE_VALIDATION_PATH = (
-    "/v1/provider-directory/profile-capacity-bundle-validation"
-)
-CONTROL_PLANE_PREFLIGHT_PATH = (
-    "/v1/provider-directory/profile-capacity-signing-preflight"
-)
+CAPACITY_BUNDLE_VALIDATION_PATH = "/v1/provider-directory/profile-capacity-bundle-validation"
+CONTROL_PLANE_PREFLIGHT_PATH = "/v1/provider-directory/profile-capacity-signing-preflight"
 HEALTHCARE_PREFLIGHT_PATH = "/control/provider-directory/profile-capacity-preflight"
 
 CONTROL_PLANE_PREFLIGHT_PATH_FIELD = "control_plane_preflight_path"
@@ -97,17 +81,12 @@ _STORAGE_OBSERVATION_FIELDS = frozenset(
         "issued_at",
         "expires_at",
         "max_build_deadline",
-        "temp_tablespace",
-        "volumes",
+        "storage_classes",
     }
-)
-_TEMP_TABLESPACE_FIELDS = frozenset(
-    {"tablespace_name", "tablespace_oid", "volume_digest"}
 )
 _VOLUME_FIELDS = frozenset(
     {
-        "volume_class",
-        "volume_digest",
+        "storage_class",
         "available_bytes",
         "available_after_all_reservations_bytes",
     }
@@ -201,9 +180,7 @@ class ProfileCapacitySigningGuardError(ValueError):
 
 
 def _fail(reason: str) -> NoReturn:
-    raise ProfileCapacitySigningGuardError(
-        "provider_directory_profile_capacity_signing_guard_" + reason
-    )
+    raise ProfileCapacitySigningGuardError("provider_directory_profile_capacity_signing_guard_" + reason)
 
 
 def _exact(value: Any, fields: frozenset[str], reason: str) -> dict[str, Any]:
@@ -225,11 +202,7 @@ def _integer(
     minimum: int = 0,
     maximum: int = _MAX_SIGNED_BIGINT,
 ) -> int:
-    if (
-        not isinstance(value, int)
-        or isinstance(value, bool)
-        or not minimum <= value <= maximum
-    ):
+    if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
         _fail(reason)
     return value
 
@@ -238,9 +211,7 @@ def _timestamp(value: Any, reason: str) -> datetime.datetime:
     if not isinstance(value, str):
         _fail(reason)
     try:
-        parsed_at = datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=datetime.timezone.utc
-        )
+        parsed_at = datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
     except ValueError:
         _fail(reason)
     if utc_second_text(parsed_at) != value:
@@ -251,5 +222,5 @@ def _timestamp(value: Any, reason: str) -> datetime.datetime:
 def _plain_json(value: Any, reason: str) -> Any:
     try:
         return json.loads(canonical_preflight_json(value))
-    except (ProviderDirectoryProfileCapacityPreflightError, ValueError):
+    except ProviderDirectoryProfileCapacityPreflightError, ValueError:
         _fail(reason)

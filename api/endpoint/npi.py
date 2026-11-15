@@ -49,7 +49,7 @@ from api.network_address_scope import (
     scoped_address_statement,
     scoped_geo_search_relation_sql,
 )
-from api.network_read_execution import direct_heap_relation_sql, execute_network_read, has_network_read_inventory
+from api.network_read_execution import qualified_relation_sql
 from api.npi_detail_cache_identity import (
     NpiDetailCacheIdentity as _NpiDetailCacheIdentity,
 )
@@ -136,6 +136,8 @@ from api.provider_profile import (
     fetch_provider_profile_projection,
 )
 from api.provider_profile_snapshot import (
+    PROFILE_CANONICAL_TARGETS_SQL,
+    profile_serving_targets_sql,
     provider_directory_read_snapshot,
     provider_directory_snapshot_read,
     provider_geo_read_snapshot,
@@ -346,18 +348,17 @@ PROVIDER_DIRECTORY_PROFILE_SERVING_QUERY_TEMPLATE = """
     WITH serving_generation AS MATERIALIZED (
         SELECT singleton_key, generation_id, published_at, profile_as_of,
                status, operation, control_generation,
-               profile_target_oid, evidence_target_oid
+               {serving_targets_select}
           FROM {serving_generation_ref}
          WHERE singleton_key = 'global'
     )
     SELECT profile.npi, profile.profile_json,
            profile.generation_id AS materialization_generation_id,
            profile.published_at AS materialized_at,
-           profile.tableoid::bigint AS materialization_profile_target_oid,
+           CAST(:profile_table_ref AS text) AS materialization_profile_relation,
            serving_generation.singleton_key AS serving_generation_key,
            serving_generation.control_generation AS serving_control_generation,
-           serving_generation.profile_target_oid AS serving_profile_target_oid,
-           serving_generation.evidence_target_oid AS serving_evidence_target_oid,
+           serving_generation.targets_json AS serving_targets,
            COALESCE(
                serving_generation.generation_id,
                profile.generation_id
@@ -376,12 +377,7 @@ PROVIDER_DIRECTORY_PROFILE_SERVING_QUERY_TEMPLATE = """
        AND serving_generation.generation_id IS NOT NULL
        AND serving_generation.published_at IS NOT NULL
        AND serving_generation.profile_as_of IS NOT NULL
-       AND serving_generation.profile_target_oid =
-           to_regclass(:profile_table_ref)::oid::bigint
-       AND serving_generation.evidence_target_oid =
-           to_regclass(:evidence_table_ref)::oid::bigint
-       AND profile.tableoid::bigint =
-           serving_generation.profile_target_oid
+       AND serving_generation.targets_json::jsonb = {canonical_targets_sql}
      WHERE profile.npi = ANY(CAST(:npis AS bigint[]))
        AND (
            NOT EXISTS (SELECT 1 FROM serving_generation)
@@ -785,7 +781,7 @@ async def _get_taxonomy_codes_for_classification(classification: str, *, session
 
     query = select(NUCCTaxonomy.code).where(NUCCTaxonomy.classification == classification)
     if session is not None:
-        rows = await execute_network_read(session, query)
+        rows = await session.execute(query)
         values = [row[0] for row in rows if row and row[0]]
     else:
         async with db.acquire() as conn:
@@ -804,8 +800,7 @@ async def _classification_npi_rows(query, taxonomy_codes, session):
     """Read taxonomy-matched NPI rows through either supported DB seam."""
 
     if session is not None:
-        query_result = await execute_network_read(
-            session,
+        query_result = await session.execute(
             query,
             {"taxonomy_codes": taxonomy_codes},
         )
@@ -3359,7 +3354,7 @@ def _has_provider_directory_plan_scalars(
 async def _disable_provider_directory_evidence_jit(session: Any) -> None:
     if getattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, False):
         return
-    await execute_network_read(session, text("SET LOCAL jit = off"))
+    await session.execute(text("SET LOCAL jit = off"))
     setattr(session, _PROVIDER_DIRECTORY_ROLE_JIT_DISABLED_ATTR, True)
 
 
@@ -4395,10 +4390,9 @@ async def _attach_mrf_source_details(
 
 
 async def _execute_stmt(stmt: Any, *, session: Any = None, params: Optional[dict[str, Any]] = None):
-    from api.network_read_execution import execute_network_read, has_network_read_guard
 
     stmt, params = scoped_address_statement(stmt), scoped_address_parameters(params or {})
-    if session is None and not has_network_read_guard(stmt):
+    if session is None and current_network_address_scope() is None:
         return await _npi_count_read(lambda: db.execute(stmt, **(params or {})))
     if session is None:
         from db.connection import current_session
@@ -4407,7 +4401,7 @@ async def _execute_stmt(stmt: Any, *, session: Any = None, params: Optional[dict
             session = current_session()
         except RuntimeError as error:
             raise sanic.exceptions.ServiceUnavailable("Canonical network Reader is unavailable.") from error
-    return await _npi_count_read(lambda: execute_network_read(session, stmt, params))
+    return await _npi_count_read(lambda: session.execute(stmt, params))
 
 
 def _normalize_provider_enrichment_show_mode(raw_value: Any) -> str:
@@ -4740,7 +4734,7 @@ async def _fast_has_insurance_count(city: Optional[str], state: Optional[str], *
             count = int(await _provider_list_count(conn, stmt, {}, session, deadline=deadline))
     else:
         async with db.session() as count_session:
-            count_result = await execute_network_read(count_session, stmt)
+            count_result = await count_session.execute(stmt)
             count = int(count_result.scalar() or 0)
     if publication_identity is None:
         return count
@@ -5132,7 +5126,7 @@ async def _is_table_available(table_name: str, *, session: Any = None) -> bool:
     cache_key = _schema_cache_key(table_name)
     if (is_available := snapshot_relation_available(cache_key)) is not None:
         return is_available
-    has_guarded_read = has_network_read_inventory(session)
+    has_guarded_read = getattr(session, "info", {}).get("api_reader_verified") is True
     cached = None if has_guarded_read else _cache_get(_TABLE_EXISTS_CACHE, cache_key)
     if cached is not None:
         return bool(cached)
@@ -5154,7 +5148,7 @@ async def _is_table_available(table_name: str, *, session: Any = None) -> bool:
 
 
 async def _resolve_npi_filter_capabilities(*, session: Any = None) -> dict[str, bool]:
-    has_guarded_read = has_network_read_inventory(session)
+    has_guarded_read = getattr(session, "info", {}).get("api_reader_verified") is True
     cached = None if has_guarded_read else _filter_cache_get()
     if cached is not None:
         return cached
@@ -5205,7 +5199,7 @@ async def _table_columns(table_name: str, *, session: Any = None) -> set[str]:
     if table_name == EntityAddressUnified.__tablename__ and current_network_address_scope() is not None:
         return _model_table_columns(EntityAddressUnified)
     cache_key = _schema_cache_key(table_name)
-    has_guarded_read = has_network_read_inventory(session)
+    has_guarded_read = getattr(session, "info", {}).get("api_reader_verified") is True
     cached_columns = None if has_guarded_read else _cache_get(_TABLE_COLUMNS_CACHE, cache_key)
     if cached_columns is not None:
         return set(cached_columns)
@@ -5342,12 +5336,9 @@ def _provider_directory_profile_serving_identity(
         return (
             f"singleton:{generation_id}:{published_at}:{profile_as_of}:"
             f"{mapping.get('serving_control_generation')}:"
-            f"{mapping.get('serving_profile_target_oid')}:"
-            f"{mapping.get('serving_evidence_target_oid')}"
+            f"{json.dumps(mapping.get('serving_targets'), sort_keys=True, separators=(',', ':'))}"
         )
-    return (
-        f"fallback:{generation_id}:{published_at}:{profile_as_of}:{mapping.get('materialization_profile_target_oid')}"
-    )
+    return f"fallback:{generation_id}:{published_at}:{profile_as_of}:{mapping.get('materialization_profile_relation')}"
 
 
 def _provider_directory_profiles_by_npi(
@@ -5393,10 +5384,13 @@ async def _fetch_provider_directory_profile_map(
     ):
         return {}
     evidence_select = ", profile.evidence_json" if include_evidence else ""
+    serving_targets_select = await profile_serving_targets_sql(_execute_stmt, serving_generation_ref, session=session)
     profile_query = PROVIDER_DIRECTORY_PROFILE_SERVING_QUERY_TEMPLATE.format(
         serving_generation_ref=serving_generation_ref,
         profile_table_ref=table_ref,
         evidence_select=evidence_select,
+        serving_targets_select=serving_targets_select,
+        canonical_targets_sql=PROFILE_CANONICAL_TARGETS_SQL,
     )
     profile_query_result = await _execute_stmt(
         text(profile_query),
@@ -6128,13 +6122,13 @@ async def _resolve_filter_year(
     year_queries: list[str] = []
     if include_procedures and await _is_table_available("pricing_provider_procedure", session=session):
         relation = "mrf.pricing_provider_procedure"
-        if has_network_read_inventory(session):
-            relation = direct_heap_relation_sql(session, "mrf", "pricing_provider_procedure")
+        if getattr(session, "info", {}).get("api_reader_verified") is True:
+            relation = qualified_relation_sql("mrf", "pricing_provider_procedure")
         year_queries.append(f"SELECT MAX(year)::INTEGER AS y FROM {relation}")
     if include_medications and await _is_table_available("pricing_provider_prescription", session=session):
         relation = "mrf.pricing_provider_prescription"
-        if has_network_read_inventory(session):
-            relation = direct_heap_relation_sql(session, "mrf", "pricing_provider_prescription")
+        if getattr(session, "info", {}).get("api_reader_verified") is True:
+            relation = qualified_relation_sql("mrf", "pricing_provider_prescription")
         year_queries.append(f"SELECT MAX(year)::INTEGER AS y FROM {relation}")
     if not year_queries:
         return None, "none"
@@ -10140,23 +10134,19 @@ async def get_facility_connected_providers(request):
 
     if request_session is not None:
         session = request_session
-        total_result = await execute_network_read(session, total_sql, query_parameter_map)
-        facility_result = await execute_network_read(session, facilities_sql, query_parameter_map)
-        providers_result = await execute_network_read(session, providers_sql, execute_parameter_map)
+        total_result = await session.execute(total_sql, query_parameter_map)
+        facility_result = await session.execute(facilities_sql, query_parameter_map)
+        providers_result = await session.execute(providers_sql, execute_parameter_map)
         specialty_result = (
-            await execute_network_read(session, specialty_sql, execute_parameter_map)
-            if include_specialty_stats
-            else None
+            await session.execute(specialty_sql, execute_parameter_map) if include_specialty_stats else None
         )
     else:
         async with db.session() as session:
-            total_result = await execute_network_read(session, total_sql, query_parameter_map)
-            facility_result = await execute_network_read(session, facilities_sql, query_parameter_map)
-            providers_result = await execute_network_read(session, providers_sql, execute_parameter_map)
+            total_result = await session.execute(total_sql, query_parameter_map)
+            facility_result = await session.execute(facilities_sql, query_parameter_map)
+            providers_result = await session.execute(providers_sql, execute_parameter_map)
             specialty_result = (
-                await execute_network_read(session, specialty_sql, execute_parameter_map)
-                if include_specialty_stats
-                else None
+                await session.execute(specialty_sql, execute_parameter_map) if include_specialty_stats else None
             )
 
     total_row = total_result.first()
@@ -10558,8 +10548,8 @@ async def get_near_npi(
             dynamic_code_parameters_by_name[param] = int(code)
             array_clause = f"a.procedures_array @> ARRAY[:{param}]::INTEGER[]"
             claims_pp_relation = "mrf.pricing_provider_procedure"
-            if has_network_read_inventory(request_session):
-                claims_pp_relation = direct_heap_relation_sql(request_session, "mrf", "pricing_provider_procedure")
+            if getattr(request_session, "info", {}).get("api_reader_verified") is True:
+                claims_pp_relation = qualified_relation_sql("mrf", "pricing_provider_procedure")
             exists_clause = (
                 "EXISTS ("
                 f"SELECT 1 FROM {claims_pp_relation} AS pp "
@@ -10579,8 +10569,8 @@ async def get_near_npi(
             dynamic_code_parameters_by_name[param] = int(code)
             array_clause = f"a.medications_array @> ARRAY[:{param}]::INTEGER[]"
             claims_pr_relation = "mrf.pricing_provider_prescription"
-            if has_network_read_inventory(request_session):
-                claims_pr_relation = direct_heap_relation_sql(request_session, "mrf", "pricing_provider_prescription")
+            if getattr(request_session, "info", {}).get("api_reader_verified") is True:
+                claims_pr_relation = qualified_relation_sql("mrf", "pricing_provider_prescription")
             exists_clause = (
                 "EXISTS ("
                 f"SELECT 1 FROM {claims_pr_relation} AS pr "
@@ -12835,7 +12825,7 @@ async def _build_npi_identity_details_map(
         .order_by(npi_data_table.c.npi)
     )
     if session is not None:
-        query_result = await execute_network_read(session, query._stmt)
+        query_result = await session.execute(query._stmt)
         detail_rows = query_result.all()
     else:
         detail_rows = await query.all()
@@ -13461,7 +13451,7 @@ async def _fetch_location_status_by_record_id(
         async with (
             provider_directory_read_snapshot(db, session, reuse=use_passed_session) as status_session,
             provider_read_savepoint(status_session)
-            if use_passed_session or has_network_read_inventory(status_session)
+            if use_passed_session or (getattr(status_session, "info", {}).get("api_reader_verified") is True)
             else contextlib.nullcontext(),
         ):
             editions = await _named_directory_editions(status_session, _runtime_db_schema())

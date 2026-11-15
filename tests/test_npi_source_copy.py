@@ -191,7 +191,7 @@ def _case(monkeypatch, *, postgis=False):
 
     session = SimpleNamespace(execute=execute, scalar=AsyncMock(return_value=False), in_transaction=lambda: True)
     monkeypatch.setattr(archive, "capture_npi_stage_ownership", AsyncMock(return_value=ownership))
-    monkeypatch.setattr(archive, "verify_npi_stage_ownership", AsyncMock())
+    monkeypatch.setattr(archive, "verify_npi_stage_ownership", AsyncMock(return_value=ownership))
     monkeypatch.setattr(archive, "_source_family_sequences", AsyncMock(return_value=ownership.sequence_oids))
     monkeypatch.setattr(archive, "_verify_stage_sequence_owners", AsyncMock())
     monkeypatch.setattr(archive, "_advance_and_verify_stage_sequences", AsyncMock())
@@ -422,7 +422,7 @@ async def test_protected_export_requires_actual_custody_before_dump(monkeypatch)
 
     monkeypatch.setattr(archive, "_bounded_catalog_work", catalog)
     monkeypatch.setattr(archive, "_lock_family", AsyncMock())
-    monkeypatch.setattr(archive, "verify_npi_stage_ownership", AsyncMock())
+    monkeypatch.setattr(archive, "verify_npi_stage_ownership", AsyncMock(return_value=ownership))
     monkeypatch.setattr(archive, "_validate_stage_manifest", AsyncMock())
     dump = AsyncMock()
     with pytest.raises(RuntimeError, match="custody changed"):

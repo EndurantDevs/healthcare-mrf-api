@@ -283,7 +283,10 @@ async def _current_common_doctors_database(monkeypatch, *, before_provision=None
 @asynccontextmanager
 async def _legacy_scalar_doctors_database(monkeypatch):
     """Preserve legacy scalar receipt coverage; this does not prove the composite SOURCE producer."""
-    async with receipt_fixture._database(monkeypatch, install_receipt=False) as (engine, schema):
+    async with receipt_fixture._database(monkeypatch, install_receipt=False, install_source_guard=False) as (
+        engine,
+        schema,
+    ):
         database = Database(engine=engine, session_factory=async_sessionmaker(engine, expire_on_commit=False))
         for module in (
             native,
@@ -294,6 +297,8 @@ async def _legacy_scalar_doctors_database(monkeypatch):
         monkeypatch.setattr(native, "ensure_database", AsyncMock())
         monkeypatch.setattr(native, "_prepare_cms_doctors_sources", AsyncMock(side_effect=lambda *_args: {"rows": 1}))
         async with database.transaction() as session:
+            # Historical receipt functions predate the named generation columns installed below.
+            await (await session.connection()).run_sync(lambda sync: receipt_fixture._apply(sync, "20260929040000"))
             for model in preparation._models():
                 monkeypatch.setattr(model.__table__, "schema", schema)
                 await session.execute(text(f'DROP TABLE "{schema}"."{model.__tablename__}"'))
@@ -304,6 +309,9 @@ async def _legacy_scalar_doctors_database(monkeypatch):
             connection = await session.connection()
             await connection.run_sync(lambda sync: receipt_fixture._apply(sync, "20260930100000"))
             await connection.run_sync(lambda sync: receipt_fixture._apply(sync, "20260930130000"))
+            repair = receipt_fixture._migration("20261019130000")._repair_sql(schema)
+            await connection.run_sync(lambda sync: sync.exec_driver_sql(repair))
+            await receipt_fixture._install_named_serving_fixture(connection)
         async with profile_reader(database, schema, monkeypatch):
             reader = database._reader_database._reader_login[0]
             async with doctors_component_source(engine, schema, monkeypatch, reader=reader) as component:

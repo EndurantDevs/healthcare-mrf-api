@@ -27,42 +27,20 @@ def _require(condition, code):
         raise ValueError("cms_snapshot_seal_" + code)
 
 
-async def _original_admin(connection, source_binding, inputs, retained, owner_role, migration_role, *, isolations):
-    actor_by_field = dict(await connection.fetchrow(workspace.context._ORIGIN_SQL))
-    excluded_roles = {owner_role, migration_role}
-    for policy in (inputs["source_policy"], retained["prepared_policy"]):
-        excluded_roles.update((policy["owner_role"], policy["publisher_role"], *policy["runtime_roles"]))
-    _require(
-        actor_by_field["session"] == actor_by_field["current"]
-        and actor_by_field["current"] not in excluded_roles
-        and await connection.fetchval("SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname=session_user") is True
-        and actor_by_field["backend"] == connection.get_server_pid()
-        and actor_by_field["database_oid"] == source_binding.database_oid
-        and actor_by_field["isolation"] in isolations
-        and actor_by_field["readonly"] == "off"
-        and actor_by_field["replication_role"] == "origin"
-        and bool(actor_by_field["transaction"]),
-        "independent_original_admin_required",
-    )
-    return actor_by_field
-
-
 async def _admin(connection, source_binding, inputs, retained, owner_role, migration_role):
-    return await _original_admin(
-        connection, source_binding, inputs, retained, owner_role, migration_role, isolations=("read committed",)
-    )
-
-
-async def _reader_admin(connection, source_binding, inputs, retained, owner_role, migration_role):
-    return await _original_admin(
-        connection,
-        source_binding,
-        inputs,
-        retained,
-        owner_role,
-        migration_role,
-        isolations=("read committed", "repeatable read"),
-    )
+    """Require the native transaction modes; configured SQL grants govern access."""
+    applications = {
+        role
+        for policy in (inputs["source_policy"], retained["prepared_policy"])
+        for role in (
+            policy["owner_role"],
+            policy["publisher_role"],
+            *policy["runtime_roles"],
+            *policy["control_runtime_roles"],
+        )
+    }
+    _require(owner_role not in applications and owner_role != migration_role, "destination_role_invalid")
+    return await workspace.context._origin(connection, source_binding, workspace._policy(retained["prepared_policy"]))
 
 
 async def _close(connection, policy, retained, owner_role):
@@ -84,7 +62,7 @@ async def _close(connection, policy, retained, owner_role):
 
 
 async def seal_prepared_cms_payload_snapshots(
-    connection, *, source_binding, prepared_inputs, handoff, expected_workspace, owner_role, owner_oid, migration_role
+    connection, *, source_binding, prepared_inputs, handoff, expected_workspace, owner_role, migration_role
 ):
     """Close exact private outputs under the caller's CMS-specific admin authority.
 
@@ -95,7 +73,6 @@ async def seal_prepared_cms_payload_snapshots(
     """
     storage_identifier(owner_role)
     storage_identifier(migration_role)
-    _require(type(owner_oid) is int and 0 < owner_oid < 2**32, "owner_required")
     _require(connection.is_in_transaction() and not connection.is_closed(), "transaction_required")
     _require(await connection.fetchval("SHOW search_path") in {"pg_catalog", "pg_catalog, pg_temp"}, "search_path")
     inputs = workspace._copy(prepared_inputs)
@@ -108,7 +85,6 @@ async def seal_prepared_cms_payload_snapshots(
         await connection.execute(
             "LOCK TABLE " + ",".join("ONLY " + name for name in relations) + " IN ACCESS EXCLUSIVE MODE NOWAIT"
         )
-        await custody._principals(connection, source_binding, retained, owner_role, owner_oid, migration_role)
         original = await workspace.storage._capture(connection, policy, names)
         _require(
             all(
@@ -118,11 +94,15 @@ async def seal_prepared_cms_payload_snapshots(
             "layout_changed",
         )
         _require(
-            await connection.fetchval(_DEPENDENCIES_SQL, [original[name]["oid"] for name in names]) is True,
+            await connection.fetchval(
+                _DEPENDENCIES_SQL.replace("$1::oid[]", "ARRAY(SELECT to_regclass(name) FROM unnest($1::text[]) name)"),
+                relations,
+            )
+            is True,
             "unsupported_dependency",
         )
         await _close(connection, policy, retained, owner_role)
-        evidence = await custody._observe(connection, source_binding, retained, owner_role, owner_oid, migration_role)
+        evidence = await custody._observe(connection, source_binding, retained, owner_role, migration_role)
         _require(
             await _admin(connection, source_binding, inputs, retained, owner_role, migration_role) == actor,
             "transaction_changed",

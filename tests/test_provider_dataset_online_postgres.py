@@ -14,9 +14,10 @@ from sqlalchemy.util.concurrency import await_only
 
 from db import migration_provider_dataset_online as online
 from db.migration_provider_directory_dataset_candidates import TABLES
+from process.provider_directory_generic_source_policy import is_source_storage_required
 from process.provider_directory_rooted_graph_result_store import complete_provider_directory_rooted_graph_result
-from tests import test_provider_directory_uhc_flex_practitioner_publication_postgres as publication_fixture
 from tests import test_provider_dataset_candidates_postgres as candidate_fixture
+from tests import test_provider_directory_uhc_flex_practitioner_publication_postgres as publication_fixture
 from tests.formulary_fhir_twin_admission_pg_support import run_migration
 from tests.provider_directory_uhc_flex_npi_cohort_pg_support import insert_valid_cohort, seed_official_dataset
 from tests.test_provider_dataset_candidates_postgres import _candidate_migration
@@ -436,7 +437,7 @@ async def test_empty_history_accepts_first_provider_publication(monkeypatch, int
             identity, claim, query_result = await _claim(context)
             await complete_provider_directory_rooted_graph_result(claim, query_result, database=context.database)
             assert await connection.fetchval(
-                f"SELECT count(*) FROM {schema}.provider_directory_rooted_graph_resource WHERE acquisition_id=$1",
+                f'SELECT count(*) FROM "{context.rooted_input_schema}".provider_directory_rooted_graph_resource WHERE acquisition_id=$1',
                 identity.acquisition_id,
             ) == len(query_result.resources)
             assert not await connection.fetchval(

@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -32,6 +32,7 @@ from process import (
 from process import provider_directory_rooted_graph_store as graph_store
 from process import provider_directory_rooted_graph_twin_store as twin_store
 from process.provider_directory_rooted_graph_result_contract import _sha256_text
+from tests import test_provider_directory_rooted_graph_twin_store_boundaries as twin_store_boundaries
 from tests.provider_directory_rooted_graph_publication_test_support import (
     exact_current,
     sealed_roots,
@@ -57,6 +58,9 @@ from tests.test_provider_directory_rooted_graph_twin_store_boundaries import (
     _root_row,
     _ScriptedDatabase,
 )
+
+# Bind the shared autouse fixture into this module so pytest applies it here too.
+_configured_rooted_preflight = twin_store_boundaries._configured_rooted_preflight
 
 
 def test_registration_scalar_and_decoder_edges_fail_closed(monkeypatch) -> None:
@@ -102,17 +106,13 @@ async def test_registration_endpoint_and_source_rows_reject_absence_and_drift() 
 
     malformed_database = _RegistrationDatabase()
     await registration._has_created_endpoint(malformed_database, expected_identity)
-    malformed_database.endpoints[expected_identity.endpoint_id][
-        "canonical_api_base"
-    ] = "not-a-url"
+    malformed_database.endpoints[expected_identity.endpoint_id]["canonical_api_base"] = "not-a-url"
     with pytest.raises(registration.ProviderDirectoryRootedGraphRegistrationError):
         await registration._validate_endpoint(malformed_database, expected_identity)
 
     metadata_database = _RegistrationDatabase()
     await registration._has_created_endpoint(metadata_database, expected_identity)
-    metadata_database.endpoints[expected_identity.endpoint_id]["metadata_json"][
-        "manual_only"
-    ] = False
+    metadata_database.endpoints[expected_identity.endpoint_id]["metadata_json"]["manual_only"] = False
     with pytest.raises(registration.ProviderDirectoryRootedGraphRegistrationError):
         await registration._validate_endpoint(metadata_database, expected_identity)
 
@@ -141,10 +141,7 @@ def test_scope_identity_rejects_bounds_shape_and_disappearing_keys() -> None:
         graph_identity._validated_scope_by_field({})
 
     scope = _scope()
-    value_by_field = {
-        field_name: getattr(scope, field_name)
-        for field_name in graph_identity._SCOPE_FIELD_NAMES
-    }
+    value_by_field = {field_name: getattr(scope, field_name) for field_name in graph_identity._SCOPE_FIELD_NAMES}
 
     class _DisappearingField(dict[str, object]):
         def __getitem__(self, key: str) -> object:
@@ -330,11 +327,9 @@ async def test_existing_census_work_is_claimed_without_duplicate_insert(
     async def claimed_row(*_arguments, **_keywords):
         return {"claim": "synthetic"}
 
-    set_action = AsyncMock()
     insert_work = AsyncMock()
     monkeypatch.setattr(graph_store, "_root_closure_fields", closure_fields)
     monkeypatch.setattr(graph_store, "_claim_work_row", claimed_row)
-    monkeypatch.setattr(graph_store, "set_store_action", set_action)
     monkeypatch.setattr(graph_store, "insert_work_spec", insert_work)
 
     claimed, references = await graph_store._admit_and_claim_census(
@@ -406,9 +401,7 @@ def test_materialization_preserves_source_identity_for_set_proof(monkeypatch) ->
         "payload_sha256": "c" * 64,
     }
 
-    resource, evidence = materialization._materialized_graph_pair(
-        field_by_name, identity, "synthetic-publication-run"
-    )
+    resource, evidence = materialization._materialized_graph_pair(field_by_name, identity, "synthetic-publication-run")
     assert resource["resource_type"] == "Location"
     assert evidence["resource_type"] == "Organization"
     assert evidence["resource_id"] == field_by_name["resource_id"]
@@ -455,7 +448,7 @@ async def test_missing_terminalization_rejects_a_lost_lease() -> None:
             missing_response_sha256=_sha256_text(response_text),
             missing_response_bytes=len(response_text.encode("utf-8")),
             missing_response_json_text=response_text,
-            database=_Database(status_counts=(0,)),
+            database=_Database(first_rows=({}, {}, None)),
         )
 
     assert caught.value.code == "lease_lost"

@@ -264,16 +264,23 @@ def test_receipt_json_preserves_canonical_data_and_refuses_duplicate_recipe_iden
 
 
 @pytest.mark.parametrize(
-    "anchor",
+    "changes",
     [
-        {"fact_candidate_id": "invalid", "fact_table_oid": 123, "fact_seal_sha256": "a" * 64},
-        {"fact_candidate_id": str(uuid4()), "fact_table_oid": True, "fact_seal_sha256": "a" * 64},
-        {"fact_candidate_id": str(uuid4()), "fact_table_oid": 123, "fact_seal_sha256": "A" * 64},
-        {"fact_candidate_id": str(uuid4()), "fact_table_oid": None, "fact_seal_sha256": "a" * 64},
+        {"fact_candidate_id": "invalid"},
+        {"fact_table_name": "other_facts"},
+        {"fact_generation_id": "A" * 64},
+        {"fact_schema_name": None},
     ],
 )
-def test_anchored_receipt_refuses_partial_or_invalid_physical_identity(anchor):
-    descriptor_by_name = {**_descriptor(_recipe()), **anchor}
+def test_anchored_receipt_refuses_partial_or_invalid_named_generation(changes):
+    descriptor_by_name = {
+        **_descriptor(_recipe()),
+        "fact_candidate_id": str(uuid4()),
+        "fact_schema_name": "original_facts",
+        "fact_table_name": contributions.CONTRIBUTION_TABLE,
+        "fact_generation_id": "a" * 64,
+        **changes,
+    }
     receipt_by_name = {
         "component": contributions.SUMMARY_KEY,
         "revision": 2,

@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Pure retained-owner wiring checks; mocked native custody provides no physical proof."""
+"""Retained source metadata, logical generations and complete inventory checks."""
 
 import copy
 import json
@@ -10,7 +10,6 @@ from uuid import uuid4
 
 import pytest
 
-from db.registry_source_inventory_schema import INVENTORY_TABLE
 from process import registry_source_contribution_artifacts as artifacts
 from process import registry_source_contribution_store as contributions
 from process import registry_source_inventory_store as inventory_store
@@ -18,14 +17,14 @@ from process.registry_source_inventory_contract import make_source_inventory_ent
 from process.registry_source_inventory_reference import INVENTORY_DIGEST_KEY, SourceInventoryReference
 from process.registry_source_inventory_summaries import contribution_summary_v3
 from process.registry_source_recipe_store import RECIPE_DIGEST_KEY, canonical_registry_source_recipes
+from tests.registry_source_recipe_support import _example
 from tests.test_registry_source_contributions import _descriptor
-from tests.test_registry_source_recipe_store_postgres import _example
 
 CONTROL = "synthetic_control"
 
 
 def _owner(count, *, legacy=False, anchored=False):
-    """Build exact source ownership metadata without supplying native authority."""
+    """Build complete source metadata with named fact-generation references."""
     recipes = tuple(
         sorted(
             (_example(index) for index in range(count)), key=lambda recipe: canonical_registry_source_recipes((recipe,))
@@ -34,7 +33,14 @@ def _owner(count, *, legacy=False, anchored=False):
     source_descriptors = tuple(contributions.locally_owned_source_descriptor(_descriptor(recipe)) for recipe in recipes)
     if anchored:
         source_descriptors = tuple(
-            {**source_descriptor, **asdict(artifacts.SourceFactArtifactReference(str(uuid4()), 71, "d" * 64))}
+            {
+                **source_descriptor,
+                **asdict(
+                    artifacts.SourceFactArtifactReference(
+                        str(uuid4()), "original_facts", contributions.CONTRIBUTION_TABLE, "d" * 64
+                    )
+                ),
+            }
             for source_descriptor in source_descriptors
         )
     entries = tuple(
@@ -46,6 +52,9 @@ def _owner(count, *, legacy=False, anchored=False):
         reference.root, sorted(source_descriptors, key=lambda source_descriptor: source_descriptor["recipe_sha256"])
     )
     identity = str(uuid4())
+    generations_by_name = {INVENTORY_DIGEST_KEY: reference.root.entries_sha256}
+    if recipes:
+        generations_by_name[RECIPE_DIGEST_KEY] = reference.root.recipes_sha256
     candidate_by_field = {
         "dataset_id": str(uuid4()),
         "schema_id": str(uuid4()),
@@ -54,10 +63,7 @@ def _owner(count, *, legacy=False, anchored=False):
         "schema_name": "network_candidate_" + identity.replace("-", ""),
         "state": "published",
         "source_recipes_json": reference.as_dict(),
-        "source_generations": {
-            RECIPE_DIGEST_KEY: reference.root.recipes_sha256,
-            INVENTORY_DIGEST_KEY: reference.root.entries_sha256,
-        },
+        "source_generations": generations_by_name,
     }
     if legacy:
         candidate_by_field["source_recipes_json"] = json.loads(canonical_registry_source_recipes(recipes))
@@ -69,13 +75,9 @@ def _owner(count, *, legacy=False, anchored=False):
             summary_by_field, inventory_root=None if legacy else reference.root
         )
     )
-    custody_by_field = {
-        "seal_sha256": "a" * 64,
-        "receipt": {"closure": {"relation_oids": {contributions.CONTRIBUTION_TABLE: 42, INVENTORY_TABLE: 43}}},
-    }
     return SimpleNamespace(
         candidate=candidate_by_field,
-        custody=custody_by_field,
+        generation_id="a" * 64,
         reference=reference,
         entries=entries,
         sources=source_descriptors,
@@ -98,29 +100,36 @@ def _connection(owner):
 def _native_spies(monkeypatch, owner):
     events = []
 
-    async def custody(connection, target, *, control_schema, required):
-        assert required is True and control_schema == CONTROL
-        assert all(
-            getattr(target, field) == owner.candidate[field] for field in owner.candidate if field in asdict(target)
-        )
-        events.append("custody")
-        return owner.custody
+    async def metadata(connection, candidate, control_schema):
+        assert candidate == owner.candidate and control_schema == CONTROL
+        events.append("published-metadata")
+        return {
+            "candidate_id": candidate["candidate_id"],
+            "generation_id": owner.generation_id,
+            "validation": None,
+            "semantic_validation": None,
+        }
 
-    async def inventory(connection, target, candidate, *, expected_table_oid, control_schema):
-        assert events[-1] == "custody"
-        assert candidate == owner.candidate and expected_table_oid == 43 and control_schema == CONTROL
+    async def inventory(connection, target, candidate, *, control_schema):
+        assert events[-1] == "published-metadata"
+        assert candidate == owner.candidate and control_schema == CONTROL
         assert all(getattr(target, field) == candidate[field] for field in candidate if field in asdict(target))
         events.append("inventory")
         return owner.reference, owner.entries
 
-    native_custody, native_inventory = AsyncMock(side_effect=custody), AsyncMock(side_effect=inventory)
-    monkeypatch.setattr(artifacts, "verify_network_candidate_custody", native_custody)
-    monkeypatch.setattr(inventory_store, "_load_locked_source_inventory", native_inventory)
-    return events, native_custody, native_inventory
+    metadata_read, inventory_read = AsyncMock(side_effect=metadata), AsyncMock(side_effect=inventory)
+    monkeypatch.setattr(artifacts, "load_published_artifact_validation", metadata_read)
+    monkeypatch.setattr(inventory_store, "load_source_inventory", inventory_read)
+    return events, metadata_read, inventory_read
 
 
 def _selected(owner, sources=None):
-    reference = artifacts.SourceFactArtifactReference(owner.candidate["candidate_id"], 42, owner.custody["seal_sha256"])
+    reference = artifacts.SourceFactArtifactReference(
+        owner.candidate["candidate_id"],
+        owner.candidate["schema_name"],
+        contributions.CONTRIBUTION_TABLE,
+        owner.generation_id,
+    )
     return tuple({**source, **asdict(reference)} for source in (owner.sources if sources is None else sources))
 
 
@@ -132,7 +141,7 @@ async def test_full_inventory_is_loaded_once_per_authenticated_owner(monkeypatch
     selected = _selected(owner, owner.sources[:3])
     resolved = await artifacts.authenticate_anchored_source_fact_metadata(connection, selected, control_schema=CONTROL)
     assert set(resolved) == {source["recipe_sha256"] for source in selected}
-    assert events == ["custody", "inventory"]
+    assert events == ["published-metadata", "inventory"]
     custody.assert_awaited_once()
     inventory.assert_awaited_once()
     assert all(
@@ -172,27 +181,14 @@ async def test_retained_full_inventory_acquires_local_original_anchors(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_inventory_header_never_bypasses_required_custody(monkeypatch):
+async def test_inventory_header_requires_published_logical_generation(monkeypatch):
     owner = _owner(1)
     connection = _connection(owner)
     _, custody, inventory = _native_spies(monkeypatch, owner)
-    custody.side_effect = ValueError("synthetic custody refusal")
-    with pytest.raises(ValueError, match="custody refusal"):
+    custody.side_effect = ValueError("synthetic generation refusal")
+    with pytest.raises(ValueError, match="generation refusal"):
         await artifacts.retained_source_fact_descriptors(
             connection, owner.candidate["candidate_id"], control_schema=CONTROL
-        )
-    inventory.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("oid", [None, True, 0, 2**32])
-async def test_inventory_oid_must_come_from_verified_custody(monkeypatch, oid):
-    owner = _owner(1)
-    owner.custody["receipt"]["closure"]["relation_oids"][INVENTORY_TABLE] = oid
-    _, _, inventory = _native_spies(monkeypatch, owner)
-    with pytest.raises(contributions.RegistrySourceContributionError, match="inventory_changed"):
-        await artifacts.retained_source_fact_descriptors(
-            _connection(owner), owner.candidate["candidate_id"], control_schema=CONTROL
         )
     inventory.assert_not_awaited()
 
@@ -227,16 +223,16 @@ async def test_inventory_sources_must_match_complete_registered_summary(monkeypa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["chain", "capture", "fact_hash", "fact_rows", "seal", "oid", "schema"])
-async def test_inventory_owner_reuse_preserves_physical_and_source_identity(monkeypatch, damage):
+@pytest.mark.parametrize("damage", ["chain", "capture", "fact_hash", "fact_rows", "generation", "relation", "schema"])
+async def test_inventory_reuse_preserves_named_generation_and_source_content(monkeypatch, damage):
     owner = _owner(1, anchored=damage == "chain")
     selected_sources = list(_selected(owner))
     field, value = {
         "capture": ("capture_sha256", "f" * 64),
         "fact_hash": ("fact_sha256", "f" * 64),
         "fact_rows": ("fact_rows", 2),
-        "seal": ("fact_seal_sha256", "f" * 64),
-        "oid": ("fact_table_oid", 99),
+        "generation": ("fact_generation_id", "f" * 64),
+        "relation": ("fact_schema_name", "other_facts"),
     }.get(damage, (None, None))
     if field is not None:
         selected_sources[0][field] = value

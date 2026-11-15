@@ -35,6 +35,47 @@ def operation():
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admission", ["present", "missing", "changed"])
+async def test_admission_uses_configured_named_input_table(monkeypatch, admission):
+    from process import provider_directory_rooted_graph_source_runtime as source_runtime
+
+    root = "provider_directory_rooted_graph_twin_admission"
+    coordinates = Mock(return_value=("candidate_generation", root))
+    monkeypatch.setattr(
+        source_runtime, "current_rooted_graph_runtime", lambda: SimpleNamespace(relation_coordinates=coordinates)
+    )
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "catalog")
+    monkeypatch.setenv("DB_SCHEMA", "catalog")
+    selected_operation = operation()
+    row_by_field = {
+        "acquisition_operation_key": selected_operation["operation_key"],
+        **{name: selected_operation[name] for name in worker._ROOT_FIELDS},
+    }
+    if admission == "changed":
+        row_by_field["root_dataset_hash"] = "changed"
+    database = SimpleNamespace(first=AsyncMock(return_value=None if admission == "missing" else row_by_field))
+    directory = SimpleNamespace(db=database)
+
+    @asynccontextmanager
+    async def transaction(selected_database):
+        assert selected_database is database
+        yield
+
+    acquire = AsyncMock()
+    monkeypatch.setattr(worker, "source_transaction", transaction)
+    monkeypatch.setattr(worker, "_acquire_pinned_root", acquire)
+    if admission == "changed":
+        with pytest.raises(ValueError, match="admission_changed"):
+            await worker._ensure_admission(directory, selected_operation)
+    else:
+        await worker._ensure_admission(directory, selected_operation)
+    coordinates.assert_called_once_with("catalog", root, root)
+    assert 'FROM "candidate_generation"."' + root + '"' in database.first.await_args.args[0]
+    assert database.first.await_args.kwargs == {"selector": selected_operation["publication_acquisition_id"]}
+    assert acquire.await_count == int(admission == "missing")
+
+
 def task():
     return {
         **worker.ACQUISITION_FLAGS,
@@ -179,6 +220,7 @@ async def test_acquires_then_prepares_genuine_rooted_handoff(runtime):
         runtime.acquire.await_args.kwargs["expected_publication_acquisition_id"]
         == operation()["publication_acquisition_id"]
     )
+    assert runtime.acquire.await_args.kwargs["controls"].concurrency == 8
     runtime.publish.assert_awaited_once_with(operation()["publication_acquisition_id"], database=runtime.directory.db)
 
 
@@ -352,9 +394,9 @@ async def test_rooted_task_requires_v2_runtime_before_sql_or_http(runtime, monke
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("issued", [False, True])
-async def test_native_transactions_reuse_existing_source_custody(monkeypatch, issued):
-    from process import provider_directory_generic_source_policy as policy
+@pytest.mark.parametrize("has_runtime", [False, True])
+async def test_native_transactions_require_configured_generation(monkeypatch, has_runtime):
+    from process import provider_directory_rooted_graph_source_runtime as source_runtime
     from process.provider_directory_rooted_graph_store_support import rooted_graph_transaction
 
     opened_contexts = []
@@ -368,14 +410,22 @@ async def test_native_transactions_reuse_existing_source_custody(monkeypatch, is
     async def publisher(actual):
         assert actual is database
         opened_contexts.append("publisher")
-        yield "publisher-session"
+        yield SimpleNamespace(session="publisher-session")
 
     database = SimpleNamespace(transaction=ordinary)
-    monkeypatch.setattr(policy, "is_source_storage_required", lambda: issued)
-    monkeypatch.setattr(policy, "source_transaction", publisher)
-    async with rooted_graph_transaction(database) as session:
-        assert session == ("publisher-session" if issued else "ordinary-session")
-    assert opened_contexts == (["publisher"] if issued else ["ordinary"])
+    monkeypatch.setattr(
+        source_runtime,
+        "current_rooted_graph_runtime",
+        lambda database: SimpleNamespace(transaction=publisher) if has_runtime else None,
+    )
+    if has_runtime:
+        async with rooted_graph_transaction(database) as session:
+            assert session == "publisher-session"
+    else:
+        with pytest.raises(RuntimeError, match="configured isolated generation"):
+            async with rooted_graph_transaction(database):
+                pytest.fail("Unconfigured writes must not open a transaction")
+    assert opened_contexts == (["publisher"] if has_runtime else [])
 
 
 @pytest.mark.asyncio

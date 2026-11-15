@@ -4,7 +4,6 @@
 import hashlib
 import json
 import re
-from uuid import UUID
 
 MAX_V3_RECEIPT_BYTES = 128 * 1024
 SUMMARY_KEY = "registry_initial_source_offices"
@@ -35,8 +34,9 @@ _DERIVATION_FIELDS = {
 }
 _ARTIFACT_FIELDS = {
     "fact_candidate_id",
-    "fact_table_oid",
-    "fact_seal_sha256",
+    "fact_schema_name",
+    "fact_table_name",
+    "fact_generation_id",
     "capture_sha256",
     "transform_version",
     "fact_sha256",
@@ -60,20 +60,25 @@ def _counter(counter):
 
 
 def _artifact(document):
-    if type(document) is not dict or set(document) != _ARTIFACT_FIELDS:
-        raise ValueError("registry_source_office_v3_invalid")
-    identity = UUID(document["fact_candidate_id"]) if type(document["fact_candidate_id"]) is str else None
-    if (
-        identity is None
-        or not identity.int
-        or str(identity) != document["fact_candidate_id"]
-        or type(document["fact_table_oid"]) is not int
-        or not 0 < document["fact_table_oid"] < 2**32
-        or document["transform_version"]
-        not in {"fhir-source-facts-v1", "generic-fhir-source-facts-v1", "fhir-uhc-plan-tier-facts-v1"}
+    from process.registry_source_contribution_store import (
+        FACT_ANCHOR_FIELDS,
+        LEGACY_FACT_ANCHOR_FIELDS,
+        _validate_fact_anchor,
+    )
+
+    if type(document) is not dict or set(document) not in (
+        _ARTIFACT_FIELDS,
+        _ARTIFACT_FIELDS - FACT_ANCHOR_FIELDS | LEGACY_FACT_ANCHOR_FIELDS,
     ):
         raise ValueError("registry_source_office_v3_invalid")
-    for name in ("fact_seal_sha256", "capture_sha256", "fact_sha256"):
+    _validate_fact_anchor(document)
+    if document["fact_candidate_id"] is None or document["transform_version"] not in {
+        "fhir-source-facts-v1",
+        "generic-fhir-source-facts-v1",
+        "fhir-uhc-plan-tier-facts-v1",
+    }:
+        raise ValueError("registry_source_office_v3_invalid")
+    for name in ("capture_sha256", "fact_sha256"):
         _sha(document[name])
     _counter(document["fact_rows"])
 

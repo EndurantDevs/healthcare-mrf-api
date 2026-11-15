@@ -479,6 +479,7 @@ def _replacement_recovery_for_address(directory, fence, bundle, address):
 async def publish_prepared_replacement(directory, fence, bundle, address):
     """Apply the real prepared overlay and Address result before the one owner commits."""
     from process.entity_address_candidate_preparation import (
+        bind_published_overlay,
         publish_prepared_entity_address_generation,
     )
     from process.entity_address_serving_receipt import ordinary_address_receipt_callbacks
@@ -506,10 +507,12 @@ async def publish_prepared_replacement(directory, fence, bundle, address):
                 tuple(bundle.stages),
                 cutover_timeout=context["serving_recovery_wall"],
                 extra_live_relations=tuple(address.relation_names),
+                read_only=True,
             )
         finally:
             _TERMINAL.reset(token)
         document = await recovery.finish_overlay(directory, selected)
+        await bind_published_overlay(address, bundle.stages)
         callbacks = ordinary_address_receipt_callbacks(directory.db, directory._schema(), _sql_literal)
         async with recovery.coupled_address_scope(directory, selected, address, document):
             await publish_prepared_entity_address_generation(address, callbacks=callbacks)
@@ -552,8 +555,7 @@ async def replay_published_replacement(directory, metrics):
 
 async def _catalog(directory, name):
     return await directory.db.first(
-        "SELECT c.oid::bigint,c.relowner::bigint,c.relkind::text,c.relpersistence::text "
-        "FROM pg_class c WHERE c.oid=to_regclass(:relation)",
+        "SELECT c.relkind::text,c.relpersistence::text FROM pg_class c WHERE c.oid=to_regclass(:relation)",
         relation=directory._unscoped_qt(directory._schema(), name),
     )
 
@@ -633,9 +635,9 @@ async def _prepare_model(directory, admission, model, name, created_by_relation)
         await directory._create_provider_directory_artifact_scope_layout(
             model, schema, name, status_executor=directory.db.status
         )
-        native_identity_values = tuple(await _catalog(directory, name))
-        created_by_relation[name] = native_identity_values
-        require_output(native_identity_values[2:] == ("r", "u"), "rest_artifact_stage_changed")
+        layout_values = tuple(await _catalog(directory, name))
+        created_by_relation[name] = layout_values
+        require_output(layout_values == ("r", "u"), "rest_artifact_stage_changed")
         if model is directory.ProviderDirectorySource:
             statement = directory._provider_directory_artifact_source_select_sql(model, schema)
             params_by_name = {"source_ids": [dataset.source_id]}
@@ -704,7 +706,7 @@ async def _prepare(directory, admission, relation_by_table, created_by_relation)
 
 
 async def prepared_npi_backfill(directory, db_schema, *, run_id, source_ids, seen_table):
-    """Read genuine prepared repairs only after reattesting the complete private family."""
+    """Read prepared repairs only after checking the selected named scratch family."""
     admission = current(directory)
     if admission is None:
         return None
@@ -716,23 +718,23 @@ async def prepared_npi_backfill(directory, db_schema, *, run_id, source_ids, see
         "rest_artifact_npi_selector_changed",
     )
     overrides = directory._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()
-    for root, (name, *identity) in admission.prepared["relations"].items():
+    for root, (name, *layout) in admission.prepared["relations"].items():
         require_output(
-            overrides.get(root) == name and tuple(await _catalog(directory, name) or ()) == tuple(identity),
+            overrides.get(root) == name and tuple(await _catalog(directory, name) or ()) == tuple(layout),
             "rest_artifact_stage_changed",
         )
     return dict(admission.prepared["metrics"]["resource_id_npis_backfilled"])
 
 
 async def _cleanup(directory, created_by_relation):
-    """Drop only this invocation's unchanged native relations."""
+    """Drop this invocation's declared scratch names with native dependency protection."""
     for name, expected in reversed(tuple(created_by_relation.items())):
         async with directory.db.transaction():
             observed = await _catalog(directory, name)
             if observed is None:
                 continue
-            require_output(tuple(observed) == expected, "rest_artifact_cleanup_custody_changed")
-            await directory.db.status(f"DROP TABLE {directory._unscoped_qt(directory._schema(), name)}")
+            require_output(tuple(observed) == expected, "rest_artifact_cleanup_layout_changed")
+            await directory.db.status(f"DROP TABLE {directory._unscoped_qt(directory._schema(), name)} RESTRICT")
 
 
 async def _drain_cleanup(directory, created_by_relation):
@@ -816,13 +818,29 @@ def _publication_admission(directory, fence, request, resource_types):
 
 
 @asynccontextmanager
+async def _resource_input_scope(directory, admission):
+    """Resolve the ordinary published dataset once for every preparation read."""
+    if admission.factory is not None:
+        yield
+        return
+    from process.provider_directory_source_storage_binding import dataset_source_relations
+
+    root = directory.ProviderDirectoryDatasetResource.__tablename__
+    relations_by_root = await dataset_source_relations(
+        directory.db, directory._schema(), admission.fence.datasets[0].dataset_id, (root,)
+    )
+    relation = relations_by_root[root]
+    with directory._provider_directory_artifact_relation_scope({root: (relation["schema"], relation["name"])}):
+        yield
+
+
+@asynccontextmanager
 async def publication_scope(directory, fence, request, resource_types):
     """Prepare the existing recipe and always drain its exact native scratch tables."""
     admission = _publication_admission(directory, fence, request, resource_types)
     if admission is None:
         yield
         return
-    factory = admission.factory
     relation_by_table = {
         model.__tablename__: "pdra_" + uuid4().hex
         for model in (directory.ProviderDirectorySource, *directory.RESOURCE_MODELS)
@@ -830,17 +848,11 @@ async def publication_scope(directory, fence, request, resource_types):
     created_by_relation = {}
     async with inputs.profile_source_input_scope(directory, fence, fence):
         try:
-            actor = await directory.db.first("SELECT session_user::text,current_user::text")
-            require_output(
-                tuple(actor)
-                == ((factory.policy.control_runtime_roles[0],) * 2 if factory is not None else (actor[0],) * 2),
-                "rest_artifact_ordinary_actor_required",
-            )
-            projection = await _prepare(directory, admission, relation_by_table, created_by_relation)
-            oid_by_table = {root: created_by_relation[name][0] for root, name in relation_by_table.items()}
+            async with _resource_input_scope(directory, admission):
+                projection = await _prepare(directory, admission, relation_by_table, created_by_relation)
             token = _ACTIVE.set(admission)
             try:
-                with directory._artifact_scope_tokens(fence, fence, relation_by_table, oid_by_table):
+                with directory._artifact_scope_tokens(fence, fence, relation_by_table):
                     directory._record_artifact_scope_metrics(request.metrics, projection, [])
                     yield
                     current(directory)
@@ -959,7 +971,7 @@ async def lock_address_source_fence(directory, database, schema, context):
 async def terminal_fence(directory):
     """Authenticate Source before commit; keep ordinary-owned locks until settlement."""
     admission = current(directory)
-    if admission is None or admission.factory is None:
+    if admission is None or admission.factory is None and admission.replacement_scope is not None:
         yield
         return
     require_output(_TERMINAL.get() is None, "rest_artifact_terminal_nested")
@@ -968,7 +980,23 @@ async def terminal_fence(directory):
     await directory.db.status(
         f"SET LOCAL statement_timeout='{directory.PROVIDER_DIRECTORY_ARTIFACT_FENCE_STATEMENT_TIMEOUT}'"
     )
+    if admission.factory is None and any(
+        directory.is_uhc_flex_profile_source(dataset.source_id) for dataset in admission.fence.datasets
+    ):
+        await directory.lock_uhc_flex_profile_publication(directory.db)
     await _lock_ordinary_controls(directory, admission.fence, directory.db)
+    if admission.factory is None:
+        await _verify_header(directory, admission.fence, directory.db, for_update=False)
+        await replacement.verify_locked(directory, admission.fence, directory.db)
+        token = _TERMINAL.set((admission, session))
+        try:
+            yield
+            current(directory)
+            require_output(_publication_session(directory.db) is session, "rest_artifact_transaction_changed")
+            await _verify_header(directory, admission.fence, directory.db, for_update=False)
+        finally:
+            _TERMINAL.reset(token)
+        return
     async with admission.factory.artifact_fence(directory.db) as executor:
         await executor.status(f"SET LOCAL lock_timeout='{directory.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_LOCK_TIMEOUT}'")
         await executor.status(

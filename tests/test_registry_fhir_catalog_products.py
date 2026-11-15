@@ -86,7 +86,7 @@ def _binding_document(descriptor, index, plan):
 class ClosedInputs:
     def __init__(self):
         self.recipe = recipe_fixture()
-        self.descriptor = _descriptor(self.recipe, None, 104, None)
+        self.descriptor = _descriptor(self.recipe, None, None)
         self.generation = fhir_catalog_source_generation(self.descriptor)
         self.sources = [self._source(self.descriptor)]
         self.selectors = [
@@ -271,7 +271,7 @@ async def test_approved_product_missing_or_ambiguous_source_refuses_without_emis
             connection.sources = []
         case "ambiguous":
             connection.sources.append(
-                connection._source(_descriptor(connection.recipe, None, 104, "https://example.test/fhir"))
+                connection._source(_descriptor(connection.recipe, None, "https://example.test/fhir"))
             )
             connection.sources.sort(key=lambda source: source["generation"])
         case "generation":

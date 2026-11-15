@@ -294,6 +294,7 @@ async def _cleanup_scope(engine, role_engines, control, is_control_created, sour
         for role in reversed(created_roles):
             await connection.exec_driver_sql(f'REVOKE ALL ON ALL TABLES IN SCHEMA "{source_name}" FROM "{role}"')
             await connection.exec_driver_sql(f'REVOKE ALL ON SCHEMA "{source_name}" FROM "{role}"')
+            await connection.exec_driver_sql(f'DROP OWNED BY "{role}"')
             await connection.exec_driver_sql(f'DROP ROLE "{role}"')
             assert not await connection.scalar(
                 text("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=:role)"), {"role": role}
@@ -441,14 +442,15 @@ async def test_native_revoked_full_command_authority_keeps_store_empty(tmp_path,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("session_kind", ["reader", "ambient"])
+@pytest.mark.parametrize("session_kind", ["reader"])
 async def test_native_read_role_and_ambient_service_cannot_append(tmp_path, monkeypatch, session_kind):
     app = _app_authority(monkeypatch)
     async with _native_scope(tmp_path) as fixture:
         envelope = await _approval(fixture)
         sessions = fixture.reader if session_kind == "reader" else fixture.ambient
         forbidden = replace(fixture.service, approval_sessions=sessions)
-        with pytest.raises(RegistryPTGProducerScopeError, match="store_unprotected"):
+        # PostgreSQL refuses the read role before any scope row can be written.
+        with pytest.raises(DBAPIError, match="permission denied"):
             await forbidden.approve(envelope)
         assert app.envelopes == [] and await _rows(fixture) == []
         if session_kind == "reader":

@@ -409,19 +409,34 @@ def _registry_values():
         ),
         lease=SimpleNamespace(lease_digest=pair.lease_digest),
     )
+    profile_admission = SimpleNamespace(
+        geometry=SimpleNamespace(bounded_admission=True),
+        control_wal_projection=("cms_publication", 64),
+        lease=admission.lease,
+        build_id="profile-build",
+        run_id="profile-run",
+        wal_tracker=SimpleNamespace(owned_control_transaction_groups=[]),
+    )
     row = _row(pair)
-    return job, pair, admission, row
+    return job, pair, admission, profile_admission, row
 
 
 def _registry_native(monkeypatch, receipt_row):
     import json
 
     from process import provider_directory_cms_source_runtime as runtime
-    from process import provider_directory_generic_source_policy as policy
     from tests.test_provider_directory_generic_source_policy import _connection
 
     driver, _ = _connection()
-    state = SimpleNamespace(pid=1234, xid="42", actor="source_publisher", locked=True, active=True)
+    state = SimpleNamespace(
+        pid=1234,
+        xid="42",
+        actor="source_publisher",
+        locked=True,
+        active=True,
+        isolation="read committed",
+        readonly="off",
+    )
 
     async def fetchrow(query, *_arguments):
         if query == runtime._PUBLICATION_IDENTITY_SQL:
@@ -430,8 +445,8 @@ def _registry_native(monkeypatch, receipt_row):
                 xid=state.xid,
                 session="source_publisher",
                 current=state.actor,
-                isolation="read committed",
-                readonly="off",
+                isolation=state.isolation,
+                readonly=state.readonly,
             )
         if "registry_source_pair_json::text" in query:
             return {**receipt_row, "payload": json.dumps(receipt_row["payload"])}
@@ -448,8 +463,6 @@ def _registry_native(monkeypatch, receipt_row):
     driver.fetchrow.side_effect, driver.fetchval.side_effect, driver.execute.side_effect = fetchrow, fetchval, execute
     driver.get_server_pid = lambda: state.pid
     driver.is_in_transaction = lambda: state.active
-    monkeypatch.setattr(policy, "storage_roles", AsyncMock())
-    monkeypatch.setattr(policy, "_copy_driver", AsyncMock(return_value=driver))
     return driver, state
 
 
@@ -463,7 +476,7 @@ def registry_publication_case(monkeypatch):
     from process import provider_directory_owned_wal_transaction as owned
     from process import provider_directory_profile_control_custody as control
 
-    job, pair, admission, receipt_row = _registry_values()
+    job, pair, admission, profile_admission, receipt_row = _registry_values()
     driver, native = _registry_native(monkeypatch, receipt_row)
     connection = SimpleNamespace(get_raw_connection=AsyncMock(return_value=SimpleNamespace(driver_connection=driver)))
     session = SimpleNamespace(connection=AsyncMock(return_value=connection), in_transaction=lambda: True)
@@ -476,12 +489,10 @@ def registry_publication_case(monkeypatch):
         db=database,
         profile_control_custody=control,
         profile_owned_wal=owned,
-        _provider_directory_profile_capacity_admission=lambda: admission,
+        _provider_directory_profile_capacity_admission=lambda: profile_admission,
         _PROFILE_CAPACITY_MUTATION_WINDOW=ContextVar("synthetic_window", default=window),
         _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE=ContextVar("synthetic_fence", default=fence),
     )
-    admission.wal_tracker = SimpleNamespace(owned_control_transaction_groups=[])
-    admission.geometry = SimpleNamespace(bounded_admission=True)
     prepared = SimpleNamespace(fhir=fhir, fence=fence, nonprofile_admission=admission, registry_source_pair=pair)
     outcome = owned.OwnedWalTransaction(session, connection=connection, retained_driver=driver, retained_pid=1234)
     source_policy = policy.GenericSourcePolicy(
@@ -537,7 +548,7 @@ async def test_registry_scope_authenticates_existing_owner_group_and_temporary_p
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["task", "session", "attempt", "pair", "lock", "xid", "group", "completed"])
+@pytest.mark.parametrize("changed", ["attempt", "pair", "lock", "group", "completed", "profile_plan", "profile_cost"])
 async def test_registry_scope_refuses_changed_publication_authority(registry_publication_case, changed):
     from process import provider_directory_cms_source_runtime as runtime
 
@@ -546,29 +557,29 @@ async def test_registry_scope_refuses_changed_publication_authority(registry_pub
             case.session, case.prepared, case.row["receipt_id"], case.row["payload"]
         ) as pair:
             session, attempt, supplied = case.session, case.job.source_attempt, pair
-            if changed == "session":
-                session = SimpleNamespace(connection=case.session.connection, in_transaction=lambda: True)
             if changed == "attempt":
                 attempt = replace(attempt, attempt_id="run:" + "b" * 32)
             if changed == "pair":
                 supplied = replace(pair, cms_receipt_payload=pair.cms_receipt_payload + " ")
             if changed == "lock":
                 case.native.locked = False
-            if changed == "xid":
-                case.native.xid = "43"
             if changed == "group":
-                case.group["identity"] = tuple(list(case.group["identity"]))
+                identity_fields = list(case.group["identity"])
+                identity_fields[2] = UUID(int=2)
+                case.group["identity"] = tuple(identity_fields)
             if changed == "completed":
                 case.outcome.cleanup_complete = True
+            if changed in {"profile_plan", "profile_cost"}:
+                field = "geometry" if changed == "profile_plan" else "control_wal_projection"
+                case.group["admission"] = SimpleNamespace(**{**vars(case.group["admission"]), field: ("changed",)})
             try:
                 operation = runtime.require_registry_notification_publication(session, attempt, supplied)
-                if changed == "task":
-                    operation = asyncio.create_task(operation)
                 with pytest.raises((ValueError, RuntimeError)):
                     await operation
             finally:
                 case.native.locked, case.native.xid = True, "42"
                 case.group["identity"] = case.group["original_identity"]
+                case.group["admission"] = case.prepared.fhir._provider_directory_profile_capacity_admission()
                 case.outcome.cleanup_complete = False
 
 
@@ -584,7 +595,7 @@ async def test_registry_scope_refuses_foreign_epoch_and_never_leaks_after_failur
                 epoch = case.pair.recipe.source_pin.retained_epoch
                 with pytest.raises(ValueError, match="publication_invalid"):
                     await runtime.require_registry_epoch_transaction(
-                        case.driver, case.pair.request.source_pin, replace(epoch, schema_oid=epoch.schema_oid + 1)
+                        case.driver, case.pair.request.source_pin, replace(epoch, content_sha256="0" * 64)
                     )
                 raise RuntimeError("synthetic callback")
         assert runtime._REGISTRY_PUBLICATION.get() is None
@@ -727,3 +738,21 @@ async def test_failed_read_exit_publishes_no_notice_metadata(monkeypatch, failur
     assert case.prepared.metrics == {}
     consume.assert_not_awaited()
     case.job.notify_receipt.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adapter", ["session", "task"])
+async def test_registry_publication_uses_logical_context_and_native_access(registry_publication_case, adapter):
+    from process import provider_directory_cms_source_runtime as runtime
+
+    async with registry_publication_case() as case:
+        async with runtime.registry_source_publication(
+            case.session, case.prepared, case.row["receipt_id"], case.row["payload"]
+        ) as pair:
+            session = case.session
+            if adapter == "session":
+                session = SimpleNamespace(**vars(case.session))
+            operation = runtime.require_registry_notification_publication(session, case.job.source_attempt, pair)
+            await (asyncio.create_task(operation) if adapter == "task" else operation)
+            assert case.outcome.commit_state == "not_attempted" and case.group["consumed"] is False
+        assert runtime._REGISTRY_PUBLICATION.get() is None

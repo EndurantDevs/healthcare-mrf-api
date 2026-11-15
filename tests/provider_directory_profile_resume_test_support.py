@@ -14,7 +14,6 @@ import pytest
 from db.connection import Database
 from process import provider_directory_profile as profile
 
-
 importer = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -86,7 +85,7 @@ async def create_resume_context(
         database=database,
         schema=schema,
         build=replace(build, batch_plan=batch_plan),
-        fence=importer.ProviderDirectoryArtifactBuildFence(target_oid=None),
+        fence=importer.ProviderDirectoryArtifactBuildFence(),
         original_status=database.status,
         progress_events=progress_events,
         expected_evidence_total=len(batch_plan.evidence_batches),
@@ -100,8 +99,7 @@ async def create_resume_context(
 def _is_evidence_insert(context: SimpleNamespace, raw_sql: Any) -> bool:
     sql = str(raw_sql)
     return (
-        f'INSERT INTO "{context.schema}"."{context.build.evidence_stage}"'
-        in sql
+        f'INSERT INTO "{context.schema}"."{context.build.evidence_stage}"' in sql
         and "ON CONFLICT (evidence_key) DO NOTHING" in sql
     )
 
@@ -109,8 +107,7 @@ def _is_evidence_insert(context: SimpleNamespace, raw_sql: Any) -> bool:
 def _is_profile_insert(context: SimpleNamespace, raw_sql: Any) -> bool:
     sql = str(raw_sql)
     return (
-        f'INSERT INTO "{context.schema}"."{context.build.profile_stage}"'
-        in sql
+        f'INSERT INTO "{context.schema}"."{context.build.profile_stage}"' in sql
         and "ON CONFLICT (npi) DO NOTHING" in sql
     )
 
@@ -120,8 +117,7 @@ async def _checkpoint(
     selected_columns: str,
 ):
     return await context.database.first(
-        f"SELECT {selected_columns} FROM {context.checkpoint_ref} "
-        "WHERE build_id = :build_id;",
+        f"SELECT {selected_columns} FROM {context.checkpoint_ref} WHERE build_id = :build_id;",
         build_id=context.build.build_id,
     )
 
@@ -135,8 +131,7 @@ def _progress_for(
     return [
         progress
         for progress_run_id, progress in context.progress_events
-        if progress_run_id == run_id
-        and (phase is None or progress["phase"] == phase)
+        if progress_run_id == run_id and (phase is None or progress["phase"] == phase)
     ]
 
 
@@ -149,17 +144,11 @@ def _assert_first_interruption(
     assert checkpoint.evidence_next_batch == 0
     assert checkpoint.profile_next_batch == 0
     first_progress = _progress_for(context, "profile-run-first")
-    assert [
-        (progress["done"], progress["total"])
-        for progress in first_progress
-    ] == [(0, context.expected_evidence_total)]
-    assert {progress["phase"] for progress in first_progress} == {
-        importer._PROFILE_EVIDENCE_PROGRESS_PHASE
-    }
-    assert {
-        progress["details"]["_progress_unit"]
-        for progress in first_progress
-    } == {"batches"}
+    assert [(progress["done"], progress["total"]) for progress in first_progress] == [
+        (0, context.expected_evidence_total)
+    ]
+    assert {progress["phase"] for progress in first_progress} == {importer._PROFILE_EVIDENCE_PROGRESS_PHASE}
+    assert {progress["details"]["_progress_unit"] for progress in first_progress} == {"batches"}
 
 
 async def interrupt_first_evidence_batch(
@@ -175,9 +164,7 @@ async def interrupt_first_evidence_batch(
             statement_starts.append(None)
         return await context.original_status(sql, **params)
 
-    context.monkeypatch.setattr(
-        context.database, "status", interrupting_status
-    )
+    context.monkeypatch.setattr(context.database, "status", interrupting_status)
     with pytest.raises(RuntimeError, match="forced resumable interruption"):
         await importer._build_provider_directory_profile_stages(
             context.build,
@@ -185,14 +172,11 @@ async def interrupt_first_evidence_batch(
             context.fence,
             has_existing_artifacts=False,
         )
-    checkpoint = await _checkpoint(
-        context, "state, evidence_next_batch, profile_next_batch"
-    )
+    checkpoint = await _checkpoint(context, "state, evidence_next_batch, profile_next_batch")
     _assert_first_interruption(context, checkpoint)
     return int(
         await context.database.scalar(
-            f"SELECT count(*) FROM "
-            f"{profile.qualified_table(context.schema, context.build.evidence_stage)};"
+            f"SELECT count(*) FROM {profile.qualified_table(context.schema, context.build.evidence_stage)};"
         )
         or 0
     )
@@ -205,10 +189,7 @@ def _assert_compact_interruption(
 ) -> None:
     assert checkpoint is not None
     assert checkpoint.state == "failed"
-    assert (
-        checkpoint.evidence_next_batch
-        == checkpoint.evidence_total_batches
-    )
+    assert checkpoint.evidence_next_batch == checkpoint.evidence_total_batches
     assert checkpoint.profile_next_batch == 0
     assert len(evidence_statements) == checkpoint.evidence_total_batches
     evidence_progress = _progress_for(
@@ -216,18 +197,13 @@ def _assert_compact_interruption(
         "profile-run-retry",
         phase=importer._PROFILE_EVIDENCE_PROGRESS_PHASE,
     )
-    assert [progress["done"] for progress in evidence_progress] == list(
-        range(context.expected_evidence_total + 1)
-    )
+    assert [progress["done"] for progress in evidence_progress] == list(range(context.expected_evidence_total + 1))
     profile_progress = _progress_for(
         context,
         "profile-run-retry",
         phase=importer._PROFILE_COMPACT_PROGRESS_PHASE,
     )
-    assert [
-        (progress["done"], progress["total"])
-        for progress in profile_progress
-    ] == [(0, 400)]
+    assert [(progress["done"], progress["total"]) for progress in profile_progress] == [(0, 400)]
 
 
 async def interrupt_first_compact_batch(
@@ -244,9 +220,7 @@ async def interrupt_first_compact_batch(
         return await context.original_status(sql, **params)
 
     context.monkeypatch.setattr(context.database, "status", tracking_status)
-    resumed_build = replace(
-        context.build, owner_run_id="profile-run-retry"
-    )
+    resumed_build = replace(context.build, owner_run_id="profile-run-retry")
     with pytest.raises(RuntimeError, match="forced compact interruption"):
         await importer._build_provider_directory_profile_stages(
             resumed_build,
@@ -256,8 +230,7 @@ async def interrupt_first_compact_batch(
         )
     checkpoint = await _checkpoint(
         context,
-        "state, evidence_next_batch, evidence_total_batches, "
-        "profile_next_batch",
+        "state, evidence_next_batch, evidence_total_batches, profile_next_batch",
     )
     _assert_compact_interruption(context, checkpoint, evidence_statements)
     return resumed_build
@@ -284,10 +257,7 @@ async def _stage_oids(context: SimpleNamespace) -> tuple[int, int]:
 def _assert_boundary_checkpoint(checkpoint) -> None:
     assert checkpoint is not None
     assert checkpoint.state == "building_profile"
-    assert (
-        checkpoint.evidence_next_batch
-        == checkpoint.evidence_total_batches
-    )
+    assert checkpoint.evidence_next_batch == checkpoint.evidence_total_batches
     assert checkpoint.profile_next_batch == 0
 
 
@@ -326,17 +296,14 @@ async def interrupt_at_phase_boundary(
         context.monkeypatch.setattr(importer, name, replacement)
     with pytest.raises(RuntimeError, match="hard stop before next compact batch"):
         await importer._build_provider_directory_profile_stages(
-            replace(
-                resumed_build, owner_run_id="profile-run-boundary-stop"
-            ),
+            replace(resumed_build, owner_run_id="profile-run-boundary-stop"),
             context.fence,
             context.fence,
             has_existing_artifacts=False,
         )
     checkpoint = await _checkpoint(
         context,
-        "state, evidence_next_batch, evidence_total_batches, "
-        "profile_next_batch",
+        "state, evidence_next_batch, evidence_total_batches, profile_next_batch",
     )
     assert evidence_reopen_attempts == []
     _assert_boundary_checkpoint(checkpoint)

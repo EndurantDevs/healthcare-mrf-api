@@ -36,7 +36,6 @@ _GUARD_BODIES = {
     ),
     "advance_reference_source_generation()": ("bc43708d0f74a9085b2a4ecfd2333ddec9eb4596f6cb1cb26fe56d3271db65a7", True),
     "guard_pd_dataset_bulk_parent_delete()": ("855e7bda72ceca29b68c5edab8cd198d35c1cdeaaed423ec68920ee03ed2c582", True),
-    "guard_pd_dataset_migration_owner()": ("1961869026eea7109133e616c27af2d5017db3288646dfc331d9d948d640c2d8", False),
     "guard_pd_dataset_parent_key_update()": ("44c354bc8249e3ea1a28d31e05b2c960c467330bf95bc57325803e5ef4d2a324", True),
     "guard_pd_uhc_flex_candidate_insert()": ("72cc81c5ada8179ec25112abd7bac489e25cf38a2429456f191508ea6cc5bd39", False),
     "guard_pd_uhc_flex_practitioner_acquisition()": (
@@ -804,9 +803,13 @@ def _is_approved_body(definition, schema, digest):
     if is_approved_successor(definition["proname"], schema, definition["prosrc"], digest):
         return True
     if definition["proname"] == _CMS_SEAL_GUARD and digest == ORIGINAL_SHA256:
+        from db.migration_cms_noncurrent_seal import lifecycle_guard_bodies
         from db.migration_fhir_source_rollback import rollback_guard_bodies
 
-        return definition["prosrc"] in rollback_guard_bodies(schema)[1:]
+        return (
+            definition["prosrc"] == lifecycle_guard_bodies(schema)[1]
+            or definition["prosrc"] in rollback_guard_bodies(schema)[1:]
+        )
     from db import migration_cms_snapshot_allocator as allocator
 
     if definition["proname"] == "prepare_pd_generic_dataset_storage" and digest == allocator.ORIGINAL_ALLOCATOR_SHA256:

@@ -20,7 +20,6 @@ from process.registry_approval_store import (
 )
 from process.registry_approved_company_read import MAX_APPROVED_COMPANY_PAGE_SIZE, read_registry_approved_companies
 from process.registry_company_approval_fence import (
-    _source_engine,
     registry_company_approval_transaction,
     require_registry_company_approval_fence,
 )
@@ -38,7 +37,6 @@ from process.registry_membership_refresh_queue import (
 )
 from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
 from process.registry_ptg_scope_engine import RegistryPTGScopeEngineService
-from process.registry_publication_ptg_runtime import _IDENTITY_SQL
 from process.registry_publication_queue import (
     RegistryReactivationCommand,
     _reactivation_actor,
@@ -378,30 +376,22 @@ async def _checked_preview(driver, command, actor, expected_head, office_authori
     return await preview_registry_approval(driver, command, actor, office_authority=office_authority)
 
 
-async def _configured_preview(request, service, command, actor, expected_head, *, summary_only=False):
-    """Own one genuine fenced source session; never accept a request-supplied authority."""
+async def _configured_preview(request, service, command, actor, expected_head, *, summary_only=False, resolve=None):
+    """Own one genuine fenced source session; never accept a request-supplied authority.
+
+    ``resolve(driver)`` selects the command and expected head on this same session.
+    """
     control_schema = _namespace(None)[1:-1]
     if (
         type(service) is not RegistryPTGScopeEngineService
         or (service.store.control_schema or control_schema) != control_schema
     ):
         raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")
-    async with request.ctx.sa_session.begin():
-        driver = await _driver(request.ctx.sa_session)
-        expected_by_name = dict(await driver.fetchrow(_IDENTITY_SQL.replace(":schema", "$1"), control_schema))
-    engine = _source_engine(service.reader_sessions)
     async with registry_company_approval_transaction(service.reader_sessions, control_schema=control_schema) as session:
         await require_registry_company_approval_fence(session, control_schema)
         driver = await _driver(session)
-        actual_by_name = dict(await driver.fetchrow(_IDENTITY_SQL.replace(":schema", "$1"), control_schema))
-        if actual_by_name["current_role"] != engine.url.username:
-            raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")
-        original_roles = [
-            identity.pop("session_role") == identity.pop("current_role")
-            for identity in (expected_by_name, actual_by_name)
-        ]
-        if expected_by_name != actual_by_name or actual_by_name["control_oid"] is None or not all(original_roles):
-            raise RegistryImportedSelectionUnavailable("registry_imported_selection_unavailable")
+        if resolve is not None:
+            command, expected_head = await resolve(driver)
         authority = (session, service.store, RegistryPTGGraphReadBudget(16 * 1024 * 1024))
         if summary_only:
             return await _checked_preview(driver, command, actor, expected_head, authority, summary_only=True)
@@ -467,16 +457,19 @@ async def _source_batch_selection(request, document, actor, offset):
 async def _source_batch_preview(request, document, actor):
     from process.registry_source_binding_publication import resolve_source_batch
 
-    async with request.ctx.sa_session.begin():
-        await request.ctx.sa_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-        compact, command = await resolve_source_batch(
-            await _driver(request.ctx.sa_session), document, actor, allow_unbound=True
-        )
+    compacts = []
+
+    async def resolve(driver):
+        """Resolve the selection on the session that previews it, so both read one registry."""
+        compact, command = await resolve_source_batch(driver, document, actor, allow_unbound=True)
+        compacts.append(compact)
+        return command, compact["expected_serving_generation"]
+
     service = getattr(request.app.ctx, "registry_ptg_scope_engine", None)
     if service is not None:
         try:
             preview_by_field = await _configured_preview(
-                request, service, command, actor, compact["expected_serving_generation"], summary_only=True
+                request, service, None, actor, None, summary_only=True, resolve=resolve
             )
         except RegistryRecordConflict:
             raise
@@ -485,13 +478,10 @@ async def _source_batch_preview(request, document, actor):
     else:
         async with request.ctx.sa_session.begin():
             await request.ctx.sa_session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-            preview_by_field = await _checked_preview(
-                await _driver(request.ctx.sa_session),
-                command,
-                actor,
-                compact["expected_serving_generation"],
-                summary_only=True,
-            )
+            driver = await _driver(request.ctx.sa_session)
+            command, expected_head = await resolve(driver)
+            preview_by_field = await _checked_preview(driver, command, actor, expected_head, summary_only=True)
+    compact = compacts[0]
     preview_by_field.update(
         operation=compact["operation"],
         selection_count=compact["selection_count"],

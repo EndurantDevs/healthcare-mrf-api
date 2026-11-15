@@ -125,10 +125,8 @@ async def test_delta_replay_dataset_and_metrics_edges(monkeypatch):
         metrics_by_name,
         delta,
     )
-    assert (
-        metrics_by_name["selected_evidence_rows"]
-        == delta.expected_evidence_rows
-    )
+    assert metrics_by_name["selected_evidence_rows"] == delta.expected_evidence_rows
+
 
 @pytest.mark.asyncio
 async def test_delta_stage_content_checks_each_failure(monkeypatch):
@@ -160,6 +158,7 @@ async def test_delta_stage_content_checks_each_failure(monkeypatch):
         )
     await importer._assert_profile_delta_stage(delta)
 
+
 @pytest.mark.parametrize(
     ("raw_value", "error"),
     (
@@ -186,6 +185,7 @@ def test_source_context_vector_rejects_noncanonical_input(raw_value, error):
     with pytest.raises(RuntimeError, match=error):
         importer._profile_context_vector_from_json(raw_value)
 
+
 def test_source_context_vector_accepts_json_and_sorts():
     raw_value = json.dumps(
         [
@@ -197,6 +197,7 @@ def test_source_context_vector_accepts_json_and_sorts():
         ("source-a", "a" * 64),
         ("source-b", "b" * 64),
     )
+
 
 @pytest.mark.parametrize(
     "raw_value",
@@ -215,6 +216,7 @@ def test_source_vector_rejects_noncanonical_input(raw_value):
     with pytest.raises(RuntimeError, match="source_vector_invalid"):
         importer._profile_source_vector_from_json(raw_value)
 
+
 def test_source_vector_accepts_json_and_sorts():
     assert importer._profile_source_vector_from_json(
         json.dumps(
@@ -227,6 +229,7 @@ def test_source_vector_accepts_json_and_sorts():
         ("source-a", "dataset-a"),
         ("source-b", "dataset-b"),
     )
+
 
 @pytest.mark.parametrize(
     ("field_name", "replacement"),
@@ -244,8 +247,8 @@ def test_source_vector_accepts_json_and_sorts():
         ("control_generation", 0),
         ("authority_revision", 0),
         ("profile_schema_version", 0),
-        ("evidence_target_oid", 0),
-        ("profile_target_oid", 0),
+        ("targets_json", {"evidence": {"schema": "mrf", "name": ""}, "profile": {"schema": "mrf", "name": "profile"}}),
+        ("targets_json", {"evidence": {"schema": "mrf", "name": "same"}, "profile": {"schema": "mrf", "name": "same"}}),
         ("evidence_rows", -1),
         ("profile_rows", -1),
         ("cutover_forecast_hash", "invalid"),
@@ -263,12 +266,12 @@ def test_serving_state_rejects_each_lineage_drift(
     ):
         importer._profile_serving_state_from_row(serving_row)
 
+
 def test_serving_state_decodes_canonical_row():
-    serving_state = importer._profile_serving_state_from_row(
-        _valid_serving_row()
-    )
+    serving_state = importer._profile_serving_state_from_row(_valid_serving_row())
     assert serving_state.status == "published"
     assert serving_state.capacity_geometry_status == "legacy_unavailable"
+
 
 @pytest.mark.parametrize(
     ("selected", "retained", "datasets", "error"),
@@ -293,43 +296,32 @@ def test_profile_batch_scope_rejects_ambiguous_identity(
             datasets,
         )
 
+
 def test_profile_batch_option_edges():
     """Batch options and NPI ranges reject unbounded geometry."""
 
     with pytest.raises(ValueError, match="materialization mode"):
         importer._validate_profile_batch_plan_options(
-            importer._ProviderDirectoryProfileBatchPlanOptions(
-                materialization_mode="unsupported"
-            )
+            importer._ProviderDirectoryProfileBatchPlanOptions(materialization_mode="unsupported")
         )
     with pytest.raises(ValueError, match="requires source"):
         importer._validate_profile_batch_plan_options(
-            importer._ProviderDirectoryProfileBatchPlanOptions(
-                materialization_mode="source_delta"
-            )
+            importer._ProviderDirectoryProfileBatchPlanOptions(materialization_mode="source_delta")
         )
     for field_name in ("evidence_window_size", "compact_window_size"):
-        options = importer._ProviderDirectoryProfileBatchPlanOptions(
-            **{field_name: 0}
-        )
+        options = importer._ProviderDirectoryProfileBatchPlanOptions(**{field_name: 0})
         with pytest.raises(ValueError, match="outside"):
             importer._profile_batch_window_sizes(options)
 
     assert importer._provider_directory_profile_max_wave_width(()) == 0
-    assert importer._provider_directory_profile_max_wave_width(
-        ((0, 1), (1, 3))
-    ) == 2
+    assert importer._provider_directory_profile_max_wave_width(((0, 1), (1, 3))) == 2
     assert importer._profile_batch_detail_by_name(None) == {}
-    assert importer._provider_directory_profile_npi_ranges(
-        profile.PROFILE_NPI_BATCH_SIZE
-    )[0] == (
+    assert importer._provider_directory_profile_npi_ranges(profile.PROFILE_NPI_BATCH_SIZE)[0] == (
         profile.NPI_MIN,
         profile.NPI_MIN + profile.PROFILE_NPI_BATCH_SIZE,
     )
     with pytest.raises(ValueError, match="bounded minimum"):
-        importer._provider_directory_profile_npi_ranges(
-            profile.PROFILE_NPI_BATCH_SIZE - 1
-        )
+        importer._provider_directory_profile_npi_ranges(profile.PROFILE_NPI_BATCH_SIZE - 1)
     with pytest.raises(ValueError, match="must be positive"):
         importer._provider_directory_profile_npi_ranges(0)
 
@@ -372,6 +364,7 @@ def test_profile_batch_delta_plan_edges():
     assert not plan.include_copy_batch
     assert max(end - start for start, end in plan.evidence_waves) <= 2
     assert max(end - start for start, end in plan.compact_waves) <= 2
+
 
 @pytest.mark.asyncio
 async def test_projection_helpers_reject_missing_and_invalid_rows(monkeypatch):

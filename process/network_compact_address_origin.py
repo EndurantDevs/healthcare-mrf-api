@@ -1,12 +1,29 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Resolve current addresses or an exact independently sealed retained origin."""
+"""Resolve current addresses or a named retained logical Source edition."""
 
-from process.network_address_artifact import capture_network_address_artifact
+from process.network_address_artifact import (
+    _descriptor,
+    address_artifact_data,
+    capture_network_address_artifact,
+    verify_network_address_artifact,
+)
 from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_compact_layout import CompactAddressRelation
 from process.network_compact_readiness import _require, is_compact_candidate
 from process.network_membership_validation import _json_object
 from process.registry_retained_generation import resolve_registry_retained_generation
+
+
+def _saved_address_artifact(candidate):
+    report = _json_object(candidate["validation_json"])
+    if report is None:
+        return None
+    _require(type(report) is dict)
+    readiness = report.get("serving_readiness")
+    if readiness is None:
+        return None
+    _require(type(readiness) is dict)
+    return readiness.get("address_artifact")
 
 
 async def _is_legacy_bootstrap_origin(connection, candidate, address_source, control_schema):
@@ -31,58 +48,51 @@ async def _is_legacy_bootstrap_origin(connection, candidate, address_source, con
     if manifest.compact_layout is not None:
         return False
     _require(PinnedAddressSource(**_json_object(rows[0]["validation_json"])["address_source"]) == address_source)
-    # The legacy head locates the original bootstrap; fresh native capture authorizes its reuse.
     return True
 
 
-async def _retained_origin(connection, candidate, address_source, roles, control_schema):
+async def _retained_origin(connection, candidate, address_source, control_schema):
     if await _is_legacy_bootstrap_origin(connection, candidate, address_source, control_schema):
         return None
     retained = await resolve_registry_retained_generation(connection, candidate, control_schema=control_schema)
     if retained is None:
         return None
-    manifest, retained_candidate_by_field = retained
-    report = _json_object(retained_candidate_by_field["validation_json"])
-    descriptor = report.get("serving_readiness", {}).get("address_artifact")
+    manifest, previous = retained
+    report = _json_object(previous["validation_json"])
+    descriptor = _saved_address_artifact(previous)
     if type(descriptor) is not dict or descriptor.get("generation_id") != address_source.generation_id:
         return None
-    _require(
-        report["address_source"]
-        == {
-            "schema_name": address_source.schema_name,
-            "table_name": address_source.table_name,
-            "generation_id": address_source.generation_id,
-        }
-        and descriptor["runtime_roles"] == list(roles)
-        and manifest.compact_layout is not None
-    )
-    return descriptor, manifest.compact_layout.base
+    _require(PinnedAddressSource(**report["address_source"]) == address_source and manifest.compact_layout is not None)
+    descriptor = _descriptor(descriptor)
+    base = await verify_network_address_artifact(connection, descriptor)
+    _require(descriptor["revision"] == 1 or manifest.compact_layout.base == base)
+    return descriptor, base
 
 
-async def resolve_compact_address_origin(connection, candidate, source, *, runtime_roles, control_schema):
-    """A manifest digest locates evidence; only native custody authorizes reuse."""
+async def resolve_compact_address_origin(connection, candidate, source, *, runtime_roles=(), control_schema):
+    """Keep the candidate's address generation and its named publication locator bound."""
     _require(type(source) is PinnedAddressSource and source.table_name == "entity_address_unified")
-    generations = _json_object(candidate["source_generations"])
-    _require(generations.get("unified_address") == source.generation_id)
-    retained = await _retained_origin(connection, candidate, source, runtime_roles, control_schema)
+    _require(_json_object(candidate["source_generations"]).get("unified_address") == source.generation_id)
+    retained = await _retained_origin(connection, candidate, source, control_schema)
     if retained is not None:
         return retained
     from process import network_indexed_address_artifact as indexed
 
     if indexed.is_indexed_address_source(source):
-        descriptor = await indexed.capture_indexed_address_artifact(
-            connection, source, runtime_roles=runtime_roles, control_schema=control_schema
-        )
+        descriptor = await indexed.capture_indexed_address_artifact(connection, source, control_schema=control_schema)
         previous = await resolve_registry_retained_generation(connection, candidate, control_schema=control_schema)
         if previous is not None:
             previous_manifest, previous_candidate = previous
-            previous_artifact = (
-                _json_object(previous_candidate["validation_json"]).get("serving_readiness", {}).get("address_artifact")
-            )
-            _require(previous_manifest.compact_layout is not None and type(previous_artifact) is dict)
-            if previous_artifact.get("contract") == indexed.CONTRACT:
-                previous_artifact = previous_artifact["origin_artifact"]
-            _require(descriptor["origin_artifact"] == previous_artifact)
-        return descriptor, CompactAddressRelation(source.schema_name, source.table_name, descriptor["table"]["oid"])
-    descriptor = await capture_network_address_artifact(connection, source, runtime_roles=runtime_roles)
-    return descriptor, CompactAddressRelation(source.schema_name, source.table_name, descriptor["table"]["oid"])
+            prior = _saved_address_artifact(previous_candidate)
+            _require(previous_manifest.compact_layout is not None and type(prior) is dict)
+            if prior.get("contract") == indexed.CONTRACT:
+                prior = prior["origin_artifact"]
+            _require(address_artifact_data(descriptor["origin_artifact"]) == address_artifact_data(prior))
+        base = CompactAddressRelation(source.schema_name, source.table_name)
+    else:
+        descriptor = await capture_network_address_artifact(connection, source)
+        base = await verify_network_address_artifact(connection, descriptor)
+    stored = _saved_address_artifact(candidate)
+    if stored is not None and address_artifact_data(stored) == address_artifact_data(descriptor):
+        descriptor = _descriptor(stored)
+    return descriptor, base

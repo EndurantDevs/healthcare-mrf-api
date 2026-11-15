@@ -27,7 +27,7 @@ class CompactCompositionAddressSource:
 async def prepare_compact_composition_source(
     connection, address_sources, approved, writer_roles, recipes, request, *, verified_stage=None
 ):
-    """Native capture or a previous seal authenticates the external address origin."""
+    """Resolve the named address edition and its optional retained publication origin."""
     roles = tuple(sorted(set(writer_roles["loader_roles"] + writer_roles["reader_roles"])))
     source_manifest = request.source_manifest
     generations_by_source = {"unified_address": address_sources.base_source.generation_id}
@@ -35,7 +35,7 @@ async def prepare_compact_composition_source(
         generations_by_source["retained_network_source"] = source_manifest.manifest_sha256
     descriptor, physical = await resolve_compact_address_origin(
         connection,
-        {"source_generations": generations_by_source},
+        {"source_generations": generations_by_source, "validation_json": {}},
         address_sources.base_source,
         runtime_roles=roles,
         control_schema=request.control_schema,
@@ -45,7 +45,7 @@ async def prepare_compact_composition_source(
         source_manifest.manifest_sha256
         if source_manifest is not None
         and source_manifest.compact_layout is not None
-        and source_manifest.compact_layout.base.table_oid == physical.table_oid
+        and source_manifest.compact_layout.base == physical
         and source_manifest.source_generations.get("unified_address") == address_sources.base_source.generation_id
         else None
     )
@@ -78,7 +78,7 @@ async def _verify_witness_stage(connection, address_source, roles, approved, req
         return
     if request.revision != 5 or not stage.inventory or stage.office_policy_context is None:
         raise ValueError("registry_verified_office_context_changed")
-    context, _ = await _policy_context(connection, address_source, roles, approved, request.control_schema)
+    context = await _policy_context(connection, address_source, roles, approved, request.control_schema)
     if context != stage.office_policy_context or context["origin_manifest_sha256"] is not None:
         raise ValueError("registry_verified_office_context_changed")
     await verified_retained_offices(connection, stage.office_matches, address_source, roles, request.control_schema)

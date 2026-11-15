@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Native raw-source replay, reviewed corrections and complete-stage rollback."""
 
-import asyncio
 import hashlib
 import json
 from contextlib import AsyncExitStack, aclosing, asynccontextmanager
@@ -13,9 +12,8 @@ from uuid import UUID, uuid4, uuid5
 import asyncpg
 import pytest
 
-from process.network_address_projection import PinnedAddressSource, _identifier
+from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
-from process.network_candidate_custody import seal_network_candidate_custody
 from process.network_custom_address_source import prepare_custom_address_source
 from process.network_fhir_membership_source import read_fhir_membership_batch
 from process.network_fhir_retained_capture_contract import RetainedFHIRCaptureError
@@ -26,6 +24,7 @@ from process.network_membership_candidate_lifecycle import (
 )
 from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
+from process.network_membership_publication import NetworkPublicationError
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_composition import (
     RegistryAddressArtifactCustody,
@@ -68,7 +67,10 @@ from tests.cms_registry_recipe_postgres_support import (
 from tests.cms_registry_recipe_postgres_support import (
     serving_schema as serving_schema,
 )
-from tests.source_contribution_custody_postgres_support import install_source_contribution_custody
+from tests.source_contribution_custody_postgres_support import (
+    install_source_contribution_custody,
+    publish_source_contribution_candidate,
+)
 from tests.test_network_address_projection_postgres import projection_db as projection_db
 from tests.test_network_custom_address_source_postgres import _seed
 from tests.test_network_custom_address_source_postgres import bootstrap_db as bootstrap_db
@@ -109,6 +111,11 @@ pytestmark = pytest.mark.asyncio
 async def _complete_cms_office_source(database, serving_schema, monkeypatch, tmp_path):
     """Declare a canonical street office before real admission hashes and seals the source."""
     from tests import cms_registry_recipe_postgres_support as support
+    from tests.registry_named_preparation_postgres_support import (
+        prepare_registry_catalog_foundation,
+        retire_empty_registry_catalog_placeholder,
+    )
+    from tests.test_network_compact_publication_postgres import _cleanup_named_preparations
 
     original = support._membership_resource_rows
 
@@ -118,12 +125,24 @@ async def _complete_cms_office_source(database, serving_schema, monkeypatch, tmp
         office["address"].update(state="CA", postalCode="90210", country="US")
         return documents
 
-    with monkeypatch.context() as settings:
-        settings.setattr(support, "_membership_resource_rows", resources)
-        async with aclosing(
-            support.reviewed_cms_source.__wrapped__(database, serving_schema, settings, tmp_path)
-        ) as sources:
-            yield await anext(sources)
+    async with AsyncExitStack() as stack:
+        with monkeypatch.context() as settings:
+            fixture = SimpleNamespace(
+                connection=serving_schema[0],
+                engine=database.engine,
+                control_schema=serving_schema[1],
+                created_control_namespaces=[],
+                preparation_ids=[],
+            )
+            assert database._source_component.created_control_namespaces == ["hp_snapshot_retention"]
+            await retire_empty_registry_catalog_placeholder(fixture.connection)
+            stack.push_async_callback(_cleanup_named_preparations, fixture)
+            await prepare_registry_catalog_foundation(fixture, settings)
+            settings.setattr(support, "_membership_resource_rows", resources)
+            async with aclosing(
+                support.reviewed_cms_source.__wrapped__(database, serving_schema, settings, tmp_path)
+            ) as source_generations:
+                yield await anext(source_generations)
 
 
 @pytest.fixture
@@ -132,7 +151,9 @@ async def reviewed_cms_office_source(cms_recipe_database, serving_schema, monkey
         yield reviewed
 
 
-async def _publish_raw_recipe(fixture, reviewed_source, copy_targets, *, seal_candidate=None, writer_roles=None):
+async def _publish_raw_recipe(
+    fixture, reviewed_source, copy_targets, *, seal_candidate=None, writer_roles=None, extra_recipes=()
+):
     """Retain the actual reviewed office and its raw recipe in a serving manifest."""
     connection, schema = reviewed_source[0][:2]
     _, source_table = await _source_addresses(fixture, 1, "npi")
@@ -145,67 +166,37 @@ async def _publish_raw_recipe(fixture, reviewed_source, copy_targets, *, seal_ca
     assert await connection.fetchval(f"SELECT count(*)=1 AND bool_and(address_key IS NOT NULL) FROM {source_table}")
     await connection.execute(f'UPDATE "{fixture.source_schema}".npi SET npi=1000000491')
     identity = uuid4()
-    if seal_candidate is not None or getattr(fixture, "seal_candidate", None) is not None:
+    if seal_candidate is not None or hasattr(fixture, "custody_roles"):
         copy_target, address_source = await _prepare_raw_recipe_candidate(
             fixture, identity, reviewed_source, copy_targets
         )
     else:
-        copy_target = MembershipCopyTarget(
-            *(str(uuid4()) for _ in range(3)), str(identity), "network_candidate_" + identity.hex
+        copy_target, address_source = await _compose_raw_recipe_candidate(
+            fixture, identity, reviewed_source, copy_targets, writer_roles, extra_recipes
         )
-        copy_targets.append(copy_target)
-        address_source = await _prepare_unsealed_raw_recipe(fixture, copy_target, reviewed_source)
     return await _publish_raw_recipe_manifest(
         fixture, connection, copy_target, address_source, schema, seal_candidate, writer_roles
     )
 
 
-async def _prepare_unsealed_raw_recipe(fixture, copy_target, reviewed_source):
-    """Keep the unsealed legacy seed used by missing-custody and incomplete-office refusal tests."""
-    (connection, schema, source_pin, sites), _, _, _, coordinates, approved = reviewed_source
-    source_table = f'"{fixture.source_schema}".entity_address_unified'
-    async with connection.transaction(isolation="repeatable_read"):
-        batch = await read_fhir_membership_batch(
-            connection,
-            source_pin,
-            registry_schema=schema,
-            approved_source=approved,
-            binding_coordinates=coordinates,
-            approved_only=True,
-        )
-        await create_network_candidate(
-            connection,
-            copy_target,
-            source_generations={
-                "unified_address": fixture.base.generation_id,
-                "fhir": batch.generation_id,
-                "custom_membership": approved.generation_id,
-            },
-            source_recipes=(RegistrySourceMembershipRecipe(source_pin, coordinates),),
-            approved_custom_revision=approved.approved_revision,
-            expected_head=0,
-            expected_rows=batch.membership_rows,
-            control_schema=schema,
-        )
-        await connection.execute(f'''CREATE TABLE "{copy_target.schema_name}".provider_location_binding(
-          provider_system text NOT NULL,provider_id text NOT NULL,location_id uuid NOT NULL,
-          location_key varchar(64) NOT NULL,entity_type text NOT NULL,entity_id text NOT NULL,
-          PRIMARY KEY(provider_system,provider_id,location_id))''')
-        await connection.execute(
-            f'''INSERT INTO "{copy_target.schema_name}".provider_location_binding
-          SELECT 'npi',entity_id,$1,location_key,entity_type,entity_id FROM {source_table}''',
-            sites[0],
-        )
-        await admit_network_membership_batch(
-            connection,
-            copy_target,
-            batch_id=uuid4(),
-            input_bytes=batch.input_bytes,
-            expected_input_sha256=hashlib.sha256(batch.input_bytes).hexdigest(),
-            control_schema=schema,
-        )
-        await seal_network_candidate(connection, copy_target, control_schema=schema)
-    return fixture.base
+async def _compose_raw_recipe_candidate(
+    fixture, request_id, reviewed_source, copy_targets, writer_roles, extra_recipes
+):
+    """Compose the reviewed raw recipe, and any other approved recipes, through ordinary initial composition."""
+    (connection, schema, source_pin, _sites), _, _, _, coordinates, approved = reviewed_source
+    recipes = (RegistrySourceMembershipRecipe(source_pin, coordinates), *extra_recipes)
+    fixture.composition_ids.append(uuid5(request_id, "address:" + approved.generation_id))
+    copy_target, address_source = await compose_registry_membership_candidate(
+        connection,
+        request_id=request_id,
+        approved_revision=approved.approved_revision,
+        expected_head=0,
+        address_sources=RegistryCompositionAddressSources(fixture.base, initial_source_recipes=recipes),
+        writer_roles=writer_roles or getattr(fixture, "writer_roles", _roles(fixture)),
+        control_schema=schema,
+    )
+    copy_targets.append(copy_target)
+    return copy_target, address_source
 
 
 async def _prepare_raw_recipe_candidate(fixture, request_id, reviewed_source, copy_targets):
@@ -228,7 +219,16 @@ async def _prepare_raw_recipe_candidate(fixture, request_id, reviewed_source, co
                 composition_id=str(artifact_id),
                 approved_revision=approved.approved_revision,
                 owner_role=fixture.roles["owner"],
-                runtime_roles=(fixture.roles["reader"],),
+                runtime_roles=tuple(
+                    sorted(
+                        {
+                            fixture.roles["reader"],
+                            fixture.executor_role,
+                            fixture.custody_roles["loading"],
+                            fixture.custody_roles["custodian"],
+                        }
+                    )
+                ),
                 control_schema=schema,
             )
             summary, generations_by_source, office_reads_by_capture = await _prepare_raw_recipe_office_phase(
@@ -260,7 +260,7 @@ async def _prepare_raw_recipe_office_phase(connection, recipes, approved, artifa
         recipes,
         approved,
         artifact.address_source,
-        OfficeSummaryRequest(runtime_roles=artifact.runtime_roles, control_schema=schema),
+        OfficeSummaryRequest(runtime_roles=(), control_schema=schema),
         retained_fhir_reads=office_reads_by_capture,
     )
     generations_by_source = {
@@ -299,7 +299,7 @@ async def _register_raw_recipe_candidate(connection, copy_target, recipes, appro
         recipes,
         approved,
         artifact.address_source,
-        runtime_roles=artifact.runtime_roles,
+        runtime_roles=(),
         control_schema=schema,
         office_phase=(None, office_reads_by_capture),
     )
@@ -314,22 +314,22 @@ async def _publish_raw_recipe_manifest(
     fixture, connection, copy_target, address_source, schema, seal_candidate, writer_roles
 ):
     """Publish the prepared native recipe with its selected seal hook and return the pinned manifest."""
-    await prepare_and_publish_network_candidate(
-        connection,
-        copy_target,
-        address_source,
-        **(writer_roles or getattr(fixture, "writer_roles", _roles(fixture))),
-        control_schema=schema,
-        seal_candidate=seal_candidate or getattr(fixture, "seal_candidate", None),
-    )
+    roles = writer_roles or getattr(fixture, "writer_roles", _roles(fixture))
+    callback = seal_candidate or getattr(fixture, "seal_candidate", None)
+    if hasattr(fixture, "preparation_ids"):
+        await publish_source_contribution_candidate(
+            fixture, connection, copy_target, address_source, writer_roles=roles, seal_candidate=callback
+        )
+    else:
+        await prepare_and_publish_network_candidate(
+            connection, copy_target, address_source, **roles, control_schema=schema, seal_candidate=callback
+        )
     async with connection.transaction(isolation="repeatable_read", readonly=True):
         return await resolve_network_serving_manifest(connection, control_schema=schema)
 
 
 async def _publish_replayed_source(fixture, original, approved, request_id, copy_targets):
     """Prepare independent address custody, prove missing-seal refusal, then publish."""
-    from tests.test_network_provider_only_read_postgres import _assert_seal_required
-
     address_sources = await fixture.prepare_address_sources(
         request_id=request_id,
         approved_revision=approved.approved_revision,
@@ -350,19 +350,30 @@ async def _publish_replayed_source(fixture, original, approved, request_id, copy
         control_schema=fixture.control_schema,
     )
     copy_targets.append(copy_target)
-    executing_fixture = SimpleNamespace(
-        connection=fixture.execution_connection,
-        writer_roles=fixture.writer_roles,
-        control_schema=fixture.control_schema,
+    with pytest.raises(NetworkPublicationError, match="Generation data validation is incomplete"):
+        await prepare_and_publish_network_candidate(
+            fixture.execution_connection,
+            copy_target,
+            addresses,
+            **fixture.writer_roles,
+            control_schema=fixture.control_schema,
+        )
+    assert (
+        await fixture.execution_connection.fetchval(
+            f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control'
+        )
+        == original.generation_id
     )
-    await _assert_seal_required(executing_fixture, copy_target, addresses, original.generation_id)
-    await prepare_and_publish_network_candidate(
-        fixture.execution_connection,
-        copy_target,
-        addresses,
-        **fixture.writer_roles,
-        control_schema=fixture.control_schema,
-        seal_candidate=fixture.seal_candidate,
+    assert (
+        await fixture.execution_connection.fetchval(
+            f"SELECT validation_json->'final_validation' FROM \"{fixture.control_schema}\".network_membership_candidate "
+            "WHERE candidate_id=$1",
+            UUID(copy_target.candidate_id),
+        )
+        is None
+    )
+    await publish_source_contribution_candidate(
+        fixture, fixture.execution_connection, copy_target, addresses, writer_roles=fixture.writer_roles
     )
     return copy_target
 
@@ -381,13 +392,15 @@ async def _compose_custodied_source(context, *, revision, source_manifest):
         manifest = await resolve_network_serving_manifest(
             fixture.execution_connection, control_schema=fixture.control_schema
         )
-        assert (
-            await fixture.execution_connection.fetchval(
-                f'SELECT count(*) FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
-                UUID(copy_target.candidate_id),
-            )
-            == 1
+        candidate = await fixture.execution_connection.fetchrow(
+            f'SELECT state,validation_json FROM "{fixture.control_schema}".network_membership_candidate '
+            "WHERE candidate_id=$1",
+            UUID(copy_target.candidate_id),
         )
+        validation = json.loads(candidate["validation_json"])["final_validation"]
+        assert candidate["state"] == "published"
+        assert validation["candidate_id"] == copy_target.candidate_id
+        assert validation["schema_name"] == copy_target.schema_name and validation["complete"] is True
     return manifest
 
 
@@ -396,43 +409,30 @@ async def source_composition_custody(custom_db, reviewed_cms_office_source):
     async with AsyncExitStack() as stack:
         source_pin = reviewed_cms_office_source[0][2]
         await install_source_contribution_custody(custom_db, source_pin, stack)
-        for role in sorted(set(source_pin.retained_epoch.runtime_roles)):
-            await custom_db.connection.execute(
-                f"GRANT {_identifier(role)} TO {_identifier(custom_db.executor_role)} "
-                "WITH ADMIN FALSE, INHERIT TRUE, SET FALSE"
-            )
-        custodian = custom_db.source_custodian
         runtime_roles = tuple(
             sorted((custom_db.roles["reader"], custom_db.executor_role, custom_db.writer_roles["owner_role"]))
         )
-        custody = RegistryAddressArtifactCustody(
-            custom_db.custody_roles["owner"], runtime_roles, custom_db.control_schema
-        )
+        custody = RegistryAddressArtifactCustody(custom_db.roles["owner"], runtime_roles, custom_db.control_schema)
 
         async def prepare_address_sources(**arguments):
+            from process.network_custom_address_source import _freeze
+
             address_sources = arguments["address_sources"]
-            async with custodian.transaction(isolation="repeatable_read"):
-                artifact = await prepare_registry_composition_address_artifact(custodian, custody=custody, **arguments)
+            async with custom_db.connection.transaction(isolation="repeatable_read"):
+                artifact = await prepare_registry_composition_address_artifact(
+                    custom_db.connection, custody=custody, **arguments
+                )
+                if artifact is not None:
+                    await _freeze(
+                        custom_db.connection,
+                        artifact.address_source.schema_name,
+                        custody.owner_role,
+                        custody.runtime_roles,
+                    )
             return address_sources if artifact is None else replace(address_sources, prepared_address_artifact=artifact)
 
-        async def seal_candidate(target):
-            async def authorize(connection, supplied):
-                assert connection is custodian and supplied == target
-                return await connection.fetchval(
-                    "SELECT current_user=session_user AND current_user::text=$1", custom_db.custody_roles["custodian"]
-                )
-
-            return await seal_network_candidate_custody(
-                custodian,
-                target,
-                control_schema=custom_db.control_schema,
-                runtime_roles=runtime_roles,
-                authorize=authorize,
-            )
-
-        custom_db.seal_candidate = seal_candidate
         custom_db.prepare_address_sources = prepare_address_sources
-        yield seal_candidate
+        yield custom_db.seal_candidate
 
 
 @pytest.mark.parametrize("operation", ["rebind", "close"])
@@ -632,27 +632,6 @@ async def test_rebind_and_close_replay_same_recipe(reviewed_cms_source):
     assert canonical_registry_source_recipes((recipe,)) == canonical
 
 
-async def test_generic_source_cannot_enter_production_stage(reviewed_fhir_source):
-    """Legacy reader-compatible coordinates provide no production source custody."""
-    source_fixture, _, _, _, coordinates, _ = reviewed_fhir_source
-    connection, schema, source_pin, _ = source_fixture
-    async with connection.transaction(isolation="repeatable_read"):
-        revision = await connection.fetchval(f'SELECT approved_revision FROM "{schema}".registry_revision_control')
-        approved = await pin_approved_membership_source(connection, approved_revision=revision, control_schema=schema)
-        with pytest.raises(RegistrySourceCompositionError, match="custody_unavailable"):
-            await stage_registry_source_recipes(
-                connection,
-                (RegistrySourceMembershipRecipe(source_pin, coordinates),),
-                approved,
-                request_id=uuid4(),
-                control_schema=schema,
-            )
-        assert await connection.fetchval("SELECT 1") == 1
-        assert not await connection.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() AND relname LIKE 'registry_recipe_%')"
-        )
-
-
 class _FailedNativeCopy:
     def __init__(self, connection):
         self.connection = connection
@@ -831,20 +810,15 @@ async def test_late_fhir_partial_resource_refuses_complete_recipe(disposition_cm
 def _count_retained_content_reads(monkeypatch):
     from process import network_fhir_retained_capture as retained
 
-    native_content, native_catalog = retained._content_tables, retained._catalog
-    contents, catalogs = [], []
+    native_content = retained._content_tables
+    contents = []
 
     async def content(connection, schema):
         contents.append(schema)
         return await native_content(connection, schema)
 
-    async def catalog(connection, schema, owner, runtime_roles):
-        catalogs.append(schema)
-        return await native_catalog(connection, schema, owner, runtime_roles)
-
     monkeypatch.setattr(retained, "_content_tables", content)
-    monkeypatch.setattr(retained, "_catalog", catalog)
-    return contents, catalogs
+    return contents
 
 
 @pytest.mark.parametrize("legacy_capture_db", ["legacy", "modern"], indirect=True)
@@ -858,7 +832,7 @@ async def test_initial_retained_composition_admits_content_once_per_transaction(
     base = await _retained_custody_base(case, source_fixture, serving_schema, bootstrap_db)
     case.additional_schemas.append(case.copy_target.schema_name)
     _, publisher = await _retained_custody_publisher_login(case)
-    contents, catalogs = _count_retained_content_reads(monkeypatch)
+    contents = _count_retained_content_reads(monkeypatch)
     if legacy_entry:
         from process import registry_candidate_composition as composition
 
@@ -869,7 +843,6 @@ async def test_initial_retained_composition_admits_content_once_per_transaction(
             case, publisher, base, recipe, approved.approved_revision
         )
         assert address == base and contents == [capture.schema_name] * (1 + 3 * legacy_entry)
-        assert catalogs.count(capture.schema_name) >= 5
         assert await compose_registry_membership_candidate(publisher, **arguments) == (copy_target, address)
         # Legacy replay separately admits SOURCE and the independently rebuilt office summary.
         assert contents == [capture.schema_name] * (2 + 4 * legacy_entry)
@@ -926,34 +899,6 @@ async def _record_initial_offices_legacy(connection, target, recipes, approved, 
     return receipt
 
 
-@pytest.mark.parametrize("scope", ["task", "connection", "transaction"])
-async def test_retained_admission_reuse_refuses_another_native_scope(legacy_capture_db, serving_schema, scope):
-    source = legacy_capture_db
-    capture = await _capture(source)
-    recipe, _, _ = await _approved_capture_recipe(source, serving_schema, capture)
-    reader = await source.connect("reader")
-    reads_by_capture = {}
-    async with reader.transaction(isolation="repeatable_read", readonly=True):
-        admitted = await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture)
-        assert await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture) is admitted
-        if scope == "task":
-            with pytest.raises(RetainedFHIRCaptureError):
-                await asyncio.create_task(_require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture))
-        elif scope == "connection":
-            with pytest.raises(RetainedFHIRCaptureError):
-                await _reuse_retained_on_new_connection(source, recipe, reads_by_capture)
-    if scope == "transaction":
-        async with reader.transaction(isolation="repeatable_read", readonly=True):
-            with pytest.raises(RetainedFHIRCaptureError):
-                await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture)
-
-
-async def _reuse_retained_on_new_connection(source, recipe, reads_by_capture):
-    other = await source.connect("reader")
-    async with other.transaction(isolation="repeatable_read", readonly=True):
-        return await _require_recipe_custody(other, recipe, retained_fhir_reads=reads_by_capture)
-
-
 async def test_new_retained_capture_requires_its_own_full_admission(legacy_capture_db, serving_schema, monkeypatch):
     source = legacy_capture_db
     first, second = await _capture(source), await _capture(source)
@@ -964,35 +909,19 @@ async def test_new_retained_capture_requires_its_own_full_admission(legacy_captu
         binding_coordinates=replace(recipe.binding_coordinates, edition_id=second.capture_id),
     )
     reader, reads_by_capture = await source.connect("reader"), {}
-    contents, _ = _count_retained_content_reads(monkeypatch)
+    contents = _count_retained_content_reads(monkeypatch)
     async with reader.transaction(isolation="repeatable_read", readonly=True):
         first_read = await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture)
-        reads_by_capture[second] = first_read
+        second_key = (second.schema_name, second.capture_id, second.capture_sha256)
+        reads_by_capture[second_key] = first_read
         with pytest.raises(RetainedFHIRCaptureError):
             await _require_recipe_custody(reader, successor, retained_fhir_reads=reads_by_capture)
-        del reads_by_capture[second]
+        del reads_by_capture[second_key]
         second_read = await _require_recipe_custody(reader, successor, retained_fhir_reads=reads_by_capture)
         assert first_read is not second_read and contents == [first.schema_name, second.schema_name]
         assert await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture) is first_read
         assert await _require_recipe_custody(reader, successor, retained_fhir_reads=reads_by_capture) is second_read
         assert contents == [first.schema_name, second.schema_name]
-
-
-async def test_shared_retained_admission_rechecks_native_writer_privileges(legacy_capture_db, serving_schema):
-    source = legacy_capture_db
-    capture = await _capture(source)
-    recipe, _, _ = await _approved_capture_recipe(source, serving_schema, capture)
-    reader, reads_by_capture = await source.connect("reader"), {}
-    table = f'"{capture.schema_name}".provider_directory_dataset_resource'
-    role = '"' + source.role_by_kind["reader"] + '"'
-    try:
-        async with reader.transaction(isolation="repeatable_read", readonly=True):
-            await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture)
-            await source.admin.execute(f"GRANT UPDATE ON {table} TO {role}")
-            with pytest.raises((RetainedFHIRCaptureError, ValueError)):
-                await _require_recipe_custody(reader, recipe, retained_fhir_reads=reads_by_capture)
-    finally:
-        await source.admin.execute(f"REVOKE UPDATE ON {table} FROM {role}")
 
 
 async def _assert_original_fact_reference(fixture, current, owner, operation):

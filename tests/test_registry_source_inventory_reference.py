@@ -19,8 +19,8 @@ from process.registry_source_recipe_store import (
     RECIPE_DIGEST_KEY,
     canonical_registry_source_recipes,
 )
+from tests.registry_source_recipe_support import _example
 from tests.test_registry_source_inventory_contract import _entries
-from tests.test_registry_source_recipe_store_postgres import _example
 
 
 def test_reference_roundtrip_retains_the_exact_commitment_without_payload():

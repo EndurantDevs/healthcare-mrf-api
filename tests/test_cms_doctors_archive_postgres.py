@@ -104,6 +104,14 @@ async def _create_source(session, schema, *, has_adrs_index=True):
         await session.execute(text(f"SELECT * FROM {ledger} WHERE importer_id <> 'cms-doctors' ORDER BY importer_id"))
     ).all()
     assert before == after
+    await _migration(session, _CMS_REVISION, "downgrade")
+    await _migration(session, _CMS_REVISION, "upgrade")
+    await _migration(session, _GROUP_REVISION, "upgrade")
+    if has_adrs_index:
+        await session.execute(
+            text(f'CREATE INDEX cms_doctor_group_site_idx_adrs ON "{schema}".cms_doctor_group_site (adrs_id)')
+        )
+    await install_source_generation_guards(await session.connection(), schema)
     authority = await generation.read_reference_family_result_generation_authority(
         session,
         importer_id="cms-doctors",
@@ -114,14 +122,6 @@ async def _create_source(session, schema, *, has_adrs_index=True):
         await generation.capture_reference_family_serving_generation(
             session, importer_id="cms-doctors", schema_name=schema
         )
-    await _migration(session, _CMS_REVISION, "downgrade")
-    await _migration(session, _CMS_REVISION, "upgrade")
-    await _migration(session, _GROUP_REVISION, "upgrade")
-    if has_adrs_index:
-        await session.execute(
-            text(f'CREATE INDEX cms_doctor_group_site_idx_adrs ON "{schema}".cms_doctor_group_site (adrs_id)')
-        )
-    await install_source_generation_guards(await session.connection(), schema)
     await session.execute(
         text(
             f"INSERT INTO \"{schema}\".doctor_clinician_address (npi, address_checksum, city) VALUES (1000000004, 1, 'Example')"
@@ -249,8 +249,6 @@ async def _restore_retained_archive(sessions, prepared, path, custody, component
     async with component.database.transaction() as session:
         await archive.complete_reference_family_restore(session, restored)
         await archive.validate_reference_family_stage(session, ownership=restored, manifest=prepared.manifest.as_dict())
-        owner_oid = await archive.model_family_publisher_owner(session, "cms-doctors")
-        await _seal_restored_family(session, restored, owner_oid)
     return restored
 
 
@@ -324,16 +322,13 @@ async def _assert_restored_activation(session, ownership, manifest):
     """Exercise both cutover paths without retaining their disposable predecessors."""
     schema = os.environ["HLTHPRT_DB_SCHEMA"]
     incumbent = await archive.capture_reference_family_incumbent(session, importer_id="cms-doctors", schema_name=schema)
-    owner_oid = await archive.model_family_publisher_owner(session, "cms-doctors")
     package_id = hashlib.sha256(archive._canonical_json(manifest.as_dict())).hexdigest()
-    await _seal_restored_family(session, ownership, owner_oid)
     validation = await archive.prepare_reference_family_activation(
         session,
         ownership=ownership,
         manifest=manifest,
         package_id=package_id,
         profile_contract=archive.CONTRACT,
-        sealed_owner_oid=owner_oid,
     )
     assert validation.manifest_sha256 == package_id
     assert validation.tables[2].schema_sha256 == await archive.catalog_identity._schema_identity(
@@ -342,8 +337,6 @@ async def _assert_restored_activation(session, ownership, manifest):
     cutover = archive.ReferenceFamilyCutoverAuthority(
         package_id,
         archive.CONTRACT,
-        owner_oid,
-        owner_oid,
         "manual",
         manifest.source_serving_generation.as_dict(),
     )
@@ -373,12 +366,6 @@ async def _assert_restored_activation(session, ownership, manifest):
             )
         finally:
             await savepoint.rollback()
-
-
-async def _seal_restored_family(session, ownership, owner_oid):
-    owner = await session.scalar(text("SELECT pg_get_userbyid(:oid)"), {"oid": owner_oid})
-    await session.execute(text(f'ALTER SCHEMA "{ownership.schema_name}" OWNER TO ' + archive._quoted(owner)))
-    await archive.seal_model_family_storage(session, ownership, owner_oid)
 
 
 @pytest.mark.asyncio
@@ -470,6 +457,16 @@ async def test_group_migration_advances_existing_two_relation_generation(monkeyp
                 )
             )
             await _migration(session, _GROUP_REVISION, "upgrade")
+            assert await session.scalar(
+                text(
+                    "SELECT cardinality(relation_oids)=3 AND relation_oids[3]=to_regclass(:group_site)::oid::bigint "
+                    f"FROM \"{schema}\".reference_family_result_generation WHERE importer_id='cms-doctors'"
+                ),
+                {"group_site": f'"{schema}".cms_doctor_group_site'},
+            )
+            with pytest.raises(RuntimeError, match="evidence prevents downgrade"):
+                await _migration(session, _GROUP_REVISION, "downgrade")
+            await install_source_generation_guards(await session.connection(), schema)
             authority = await generation.read_reference_family_result_generation_authority(
                 session,
                 importer_id="cms-doctors",
@@ -478,12 +475,7 @@ async def test_group_migration_advances_existing_two_relation_generation(monkeyp
             assert authority.local_generation == 2
             assert authority.serving_generation.origin_generation == 2
             assert authority.serving_generation.origin_lineage_id == authority.local_lineage_id
-            assert len(authority.relation_oids) == 3
-            assert authority.relation_oids[2] == await session.scalar(
-                text(f"SELECT '\"{schema}\".cms_doctor_group_site'::regclass::oid::bigint")
-            )
-            with pytest.raises(RuntimeError, match="evidence prevents downgrade"):
-                await _migration(session, _GROUP_REVISION, "downgrade")
+            assert authority.relations == generation.declared_reference_family_relations("cms-doctors", schema)
     finally:
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
@@ -577,18 +569,15 @@ async def _assert_legacy_tampering(session, ownership, manifest, schema):
 
 async def _prepare_legacy_cutover(session, ownership, manifest, schema, authority):
     """Bind all three stage receipts to the original manifest and reject automatic activation."""
-    owner_oid = await archive.model_family_publisher_owner(session, "cms-doctors")
     package_id = hashlib.sha256(json.dumps(manifest.as_dict(), indent=2).encode()).hexdigest()
-    await _seal_restored_family(session, ownership, owner_oid)
     validation = await archive.prepare_reference_family_activation(
         session,
         ownership=ownership,
         manifest=manifest,
         package_id=package_id,
         profile_contract=archive.CONTRACT,
-        sealed_owner_oid=owner_oid,
     )
-    assert len(validation.tables) == len(validation.relation_oids) == 3
+    assert len(validation.tables) == len(validation.relations) == 3
     assert validation.tables[:2] == manifest.tables
     assert validation.tables[2].row_count == 0
     assert validation.manifest_sha256 == hashlib.sha256(archive._canonical_json(manifest.as_dict())).hexdigest()
@@ -596,8 +585,6 @@ async def _prepare_legacy_cutover(session, ownership, manifest, schema, authorit
     cutover = archive.ReferenceFamilyCutoverAuthority(
         package_id,
         archive.CONTRACT,
-        owner_oid,
-        owner_oid,
         "automatic",
         authority.serving_generation.as_dict(),
     )
@@ -654,7 +641,7 @@ async def _assert_legacy_activation(session, activation_receipt, schema, stage_s
         importer_id="cms-doctors",
         schema_name=schema,
     )
-    assert adopted.serving_generation is None and adopted.relation_oids is None
+    assert adopted.serving_generation is None and adopted.relations is None
     assert await session.scalar(text("SELECT to_regnamespace(:schema)"), {"schema": stage_schema}) is None
 
 
@@ -790,7 +777,6 @@ async def _prepare_readable_archive(fixture, dataset_id, custody, tmp_path):
             importer_id="cms-doctors",
             schema_name=fixture.schema,
         )
-        owner_oid = await archive.model_family_publisher_owner(session, "cms-doctors")
         package_id = hashlib.sha256(archive._canonical_json(prepared.manifest.as_dict())).hexdigest()
         validation = await archive.prepare_reference_family_activation(
             session,
@@ -798,7 +784,6 @@ async def _prepare_readable_archive(fixture, dataset_id, custody, tmp_path):
             manifest=prepared.manifest,
             package_id=package_id,
             profile_contract=archive.CONTRACT,
-            sealed_owner_oid=owner_oid,
         )
     return {
         "ownership": restored,
@@ -808,8 +793,6 @@ async def _prepare_readable_archive(fixture, dataset_id, custody, tmp_path):
         "cutover": archive.ReferenceFamilyCutoverAuthority(
             package_id,
             archive.CONTRACT,
-            owner_oid,
-            owner_oid,
             "manual",
             prepared.manifest.source_serving_generation.as_dict(),
         ),
@@ -874,6 +857,22 @@ async def _activate_readable_archive(fixture, activation_by_field, is_validated)
         )
 
 
+async def _live_relation_oids(fixture, receipt):
+    """Observe the heaps now serving by name, as the test's own catalog reference."""
+    async with fixture.engine.connect() as connection:
+        return tuple(
+            [
+                (
+                    name,
+                    await connection.scalar(
+                        text("SELECT to_regclass(:name)::oid::bigint"), {"name": f'"{fixture.schema}".{name}'}
+                    ),
+                )
+                for name, _ in receipt.relation_oids
+            ]
+        )
+
+
 async def test_validated_archive_completes_with_continuous_snapshot_readers(monkeypatch, tmp_path):
     """Prepared metadata-only adoption drains real readers without changing caller ownership."""
     schema, dataset_id = "cms_reader_" + uuid4().hex, uuid4()
@@ -915,12 +914,10 @@ async def test_validated_archive_completes_with_continuous_snapshot_readers(monk
         await asyncio.wait_for(asyncio.gather(*tasks), 3)
         adopted = await doctors_snapshot(fixture)
         assert adopted[0] == incumbent[0]
-        assert adopted[1].relation_oids == tuple(oid for _, oid in receipt.relation_oids)
+        assert adopted[1].relations == generation.declared_reference_family_relations("cms-doctors", schema)
+        assert await _live_relation_oids(fixture, receipt) == receipt.relation_oids
         assert adopted[1].serving_generation == incumbent[1].serving_generation
-        assert {observed[1].relation_oids for observed in observed_snapshots} == {
-            incumbent[1].relation_oids,
-            adopted[1].relation_oids,
-        }
+        assert set(observed_snapshots) == {incumbent, adopted}
     finally:
         for task in tasks:
             task.cancel()
@@ -967,7 +964,9 @@ async def test_archive_activation_preserves_late_readers(monkeypatch, is_validat
         markers, adopted = await doctors_snapshot(fixture)
         assert markers == incumbent[0] and adopted.local_generation == incumbent[1].local_generation
         assert adopted.serving_generation == (incumbent[1].serving_generation if is_validated else None)
-        assert adopted.relation_oids == (tuple(oid for _, oid in receipt.relation_oids) if is_validated else None)
+        declared = generation.declared_reference_family_relations("cms-doctors", schema)
+        assert adopted.relations == (declared if is_validated else None)
+        assert await _live_relation_oids(fixture, receipt) == receipt.relation_oids
         assert tuple(sorted(receipt.relation_oids)) == activation_by_field["ownership"].relation_oids
     finally:
         release.set()

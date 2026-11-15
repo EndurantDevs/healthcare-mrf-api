@@ -36,6 +36,7 @@ def _directory(monkeypatch, buckets=(0, 399)):
         RESOURCE_TYPES_BY_MODEL=fhir.RESOURCE_TYPES_BY_MODEL,
         _qt=fhir._qt,
         _unscoped_qt=fhir._unscoped_qt,
+        _provider_directory_profile_target_coordinates=fhir._provider_directory_profile_target_coordinates,
         _provider_directory_artifact_resource_select_sql=fhir._provider_directory_artifact_resource_select_sql,
         _artifact_scope_resource_datasets=fhir._artifact_scope_resource_datasets,
         _provider_directory_artifact_source_select_sql=fhir._provider_directory_artifact_source_select_sql,
@@ -131,12 +132,17 @@ async def test_empty_resource_families_use_native_composite_types_without_payloa
 @pytest.mark.asyncio
 async def test_incumbent_census_locks_exact_pair_and_includes_all_npis(monkeypatch):
     directory, fence, materialization, _events = _directory(monkeypatch, (2,))
-    materialization.serving_state = SimpleNamespace(evidence_target_oid=11, profile_target_oid=12)
-    directory._qt = lambda schema, name: f'"{schema}"."pinned_{name}"'
-    expected_refs = [
-        directory._qt("synthetic", name) for name in (profile.PROFILE_EVIDENCE_TABLE, profile.PROFILE_TABLE)
-    ]
-    directory.db.all.side_effect = [list(zip(expected_refs, (11, 12), strict=True)), [(399,)], [(2,)]]
+    materialization.serving_state = SimpleNamespace(
+        targets=directory._provider_directory_profile_target_coordinates("synthetic")
+    )
+    targets_by_role = {
+        role: {**entry, "name": "pinned_" + entry["name"]}
+        for role, entry in materialization.serving_state.targets.items()
+    }
+    materialization.serving_state = SimpleNamespace(targets=targets_by_role)
+    directory._provider_directory_profile_target_coordinates = lambda _schema: targets_by_role
+    expected_refs = [directory._unscoped_qt(entry["schema"], entry["name"]) for entry in targets_by_role.values()]
+    directory.db.all.side_effect = [[(reference, "r", "p") for reference in expected_refs], [(399,)], [(2,)]]
     assert await inventory.compact_ranges(
         directory, "synthetic", fence, materialization, has_existing_artifacts=True
     ) == (inventory._range(2), inventory._range(399))
@@ -149,10 +155,12 @@ async def test_incumbent_census_locks_exact_pair_and_includes_all_npis(monkeypat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("observed", [[], [("wrong", 11), ("wrong", 12)]])
+@pytest.mark.parametrize("observed", [[], [("wrong", "r", "p"), ("wrong", "r", "p")]])
 async def test_missing_or_replaced_incumbent_refuses_before_census(monkeypatch, observed):
     directory, fence, materialization, events = _directory(monkeypatch)
-    materialization.serving_state = SimpleNamespace(evidence_target_oid=11, profile_target_oid=12)
+    materialization.serving_state = SimpleNamespace(
+        targets=directory._provider_directory_profile_target_coordinates("synthetic")
+    )
     directory.db.all.return_value = observed
     with pytest.raises(RuntimeError, match="compact_inventory_changed"):
         await inventory.compact_ranges(directory, "synthetic", fence, materialization, has_existing_artifacts=True)

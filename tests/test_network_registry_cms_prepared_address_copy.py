@@ -23,10 +23,10 @@ def _prepared(rows=4):
 class BoundsConnection:
     """Return native aggregate metadata and retain the queries for range assertions."""
 
-    def __init__(self, keys, *, row_bytes=10, oid=42):
+    def __init__(self, keys, *, row_bytes=10, present=True):
         self.keys = keys
         self.row_bytes = row_bytes
-        self.oid = oid
+        self.present = present
         self.bounds = []
 
     async def fetchrow(self, query, *arguments):
@@ -43,7 +43,7 @@ class BoundsConnection:
     async def fetchval(self, query, source):
         assert "relkind='r'" in query and "relpersistence='p'" in query
         assert source == '"sample"."stage"'
-        return self.oid
+        return self.present
 
 
 def test_exact_native_model_keys_and_compound_range():
@@ -92,9 +92,9 @@ async def test_invalid_byte_limit_precedes_any_schema_work(monkeypatch, byte_lim
 async def test_missing_or_changed_native_key_is_refused(indexed):
     connection = SimpleNamespace(fetchval=AsyncMock(return_value=indexed))
     with pytest.raises(ValueError, match="copy_key_invalid"):
-        await clone._require_prepared_copy_key(connection, '"sample"."stage"', 42, ("location_key",))
-    query, oid, source, keys = connection.fetchval.call_args.args
-    assert (oid, source, keys) == (42, '"sample"."stage"', ["location_key"])
+        await clone._require_prepared_copy_key(connection, '"sample"."stage"', ("location_key",))
+    query, source, keys = connection.fetchval.call_args.args
+    assert (source, keys) == ('"sample"."stage"', ["location_key"])
     assert all(term in query for term in ("indimmediate", "indislive", "opcdefault", "indcollation", "attnotnull"))
 
 
@@ -119,7 +119,7 @@ async def test_wide_or_actual_spool_overflow_halves_without_omitting_rows(monkey
 
     monkeypatch.setattr(clone, "_copy_native_batch", copy)
     await clone._copy_prepared_rows(
-        connection, prepared, "retained", ("entity_address_plan_bridge", "stage", 42), 5, (4, 130)
+        connection, prepared, "retained", ("entity_address_plan_bridge", "stage"), 5, (4, 130)
     )
     assert imports == keys
     assert attempted == ([4, 2, 2, 1] if overflow else [2, 2, 1])
@@ -136,19 +136,19 @@ async def test_one_overwide_row_is_refused_before_admission(monkeypatch, overflo
     monkeypatch.setattr(clone, "_copy_native_batch", copy)
     with pytest.raises(ValueError, match="copy_row_too_large"):
         await clone._copy_prepared_rows(
-            connection, prepared, "retained", ("entity_address_unified", "stage", 42), 1, (1, 130)
+            connection, prepared, "retained", ("entity_address_unified", "stage"), 1, (1, 130)
         )
     assert copy.await_count == int(overflow)
     prepared.nonprofile_admission.assert_ready.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["oid", "before", "after"])
-async def test_batch_oid_refusal_and_admission_cancellation_propagate(monkeypatch, failure):
+@pytest.mark.parametrize("failure", ["missing", "before", "after"])
+async def test_batch_missing_relation_refusal_and_admission_cancellation_propagate(monkeypatch, failure):
     prepared = _prepared()
-    connection = BoundsConnection([("a",)], oid=43 if failure == "oid" else 42)
+    connection = BoundsConnection([("a",)], present=failure != "missing")
     phases = []
-    if failure != "oid":
+    if failure != "missing":
         prepared.nonprofile_admission.assert_ready.side_effect = (
             asyncio.CancelledError if failure == "before" else [None, asyncio.CancelledError]
         )
@@ -159,9 +159,9 @@ async def test_batch_oid_refusal_and_admission_cancellation_propagate(monkeypatc
         await import_admission("after_import")
 
     monkeypatch.setattr(clone, "_copy_native_batch", copy)
-    with pytest.raises(ValueError if failure == "oid" else asyncio.CancelledError):
+    with pytest.raises(ValueError if failure == "missing" else asyncio.CancelledError):
         await clone._copy_prepared_rows(
-            connection, prepared, "retained", ("entity_address_unified", "stage", 42), 1, (1, 130)
+            connection, prepared, "retained", ("entity_address_unified", "stage"), 1, (1, 130)
         )
     assert phases == (["copied"] if failure == "after" else [])
 
@@ -173,7 +173,7 @@ async def test_native_row_accounting_must_reach_exact_receipt(monkeypatch):
     monkeypatch.setattr(clone, "_copy_native_batch", copy)
     with pytest.raises(ValueError, match="copy_accounting_invalid"):
         await clone._copy_prepared_rows(
-            connection, _prepared(), "retained", ("entity_address_unified", "stage", 42), 2, (1, 130)
+            connection, _prepared(), "retained", ("entity_address_unified", "stage"), 2, (1, 130)
         )
     assert copy.await_count == 1
 

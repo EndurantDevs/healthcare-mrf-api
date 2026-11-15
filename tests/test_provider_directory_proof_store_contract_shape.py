@@ -15,7 +15,6 @@ import pytest
 from process import provider_directory_generic_source_policy as source_policy
 from process import provider_directory_proof_store as proof_store
 from process import provider_directory_source_proof_control as proof_control
-from process.plan_release_storage_catalog import CATALOG_SQL
 from process.provider_directory_proof_store import (
     PROVIDER_DIRECTORY_CONTENT_PROOF_CONTRACT_ID,
     PROVIDER_DIRECTORY_SEMANTIC_CONTENT_PROOF_CONTRACT_ID,
@@ -90,18 +89,6 @@ def _proof_control_catalog():
         for name, definition in proof_control._CHECKS.items()
     )
     catalog_by_field = dict(
-        oid=31,
-        relname=root,
-        nspname="mrf",
-        relowner=1,
-        relkind="r",
-        relpersistence="p",
-        parents=[],
-        relrowsecurity=False,
-        relforcerowsecurity=False,
-        native_checks=True,
-        direct_acl_closed=True,
-        readers_closed=True,
         columns=[
             [name, kind, True, "now()" if name == "created_at" else None] for name, kind in proof_control._COLUMNS
         ],
@@ -147,13 +134,13 @@ def _source_proof_parent(connection):
         metadata=copy.deepcopy(parent_by_field["publication_metadata_json"]),
     )
     for table in parent_by_field["candidate_storage_json"]["tables"].values():
-        table["owner"] = 1
+        table["schema"] = "mrf"
     connection.parent = parent_by_field
 
 
 @asynccontextmanager
 async def _source_proof_memory(monkeypatch, connection):
-    """Declare unit catalog/parent facts while retaining every real Source and proof guard."""
+    """Model named layout and native batch IO while retaining real parent/data checks."""
     _source_proof_parent(connection)
     async with (
         synthetic_source_database(monkeypatch, connection) as database,
@@ -161,26 +148,52 @@ async def _source_proof_memory(monkeypatch, connection):
     ):
         native = source_policy.bound_publisher().connection
         catalog_by_field, hooks = _proof_control_catalog()
-        role_fetch = native.fetch
+        execute_control = native.execute.side_effect
+        relation = '"mrf"."' + proof_control.PROOF_ROOT + '"'
 
         async def fetch(query, *arguments):
-            if query == CATALOG_SQL:
-                assert arguments == (['"mrf"."' + proof_control.PROOF_ROOT + '"'], 1, [3])
-                return [catalog_by_field]
-            if query.startswith("SELECT t.tgtype"):
-                assert arguments == (31, '"mrf"."provider_directory_endpoint_dataset"')
-                return hooks
-            return await role_fetch(query, *arguments)
+            assert query.startswith("SELECT t.tgtype")
+            assert arguments == (relation, '"mrf"."provider_directory_endpoint_dataset"')
+            return hooks
 
-        async def parent(query, *arguments):
+        async def fetchrow(query, *arguments):
+            if query == proof_control._PROOF_LAYOUT_SQL:
+                assert arguments == (relation,)
+                return copy.deepcopy(catalog_by_field)
             if "candidate_storage_json FROM" in query:
                 assert arguments == (DATASET_ID,)
                 return copy.deepcopy(connection.parent)
-            assert query == "SELECT session_user::text AS session,current_user::text AS current"
-            return native.fetchrow.return_value
+            assert "payload_bytes" in query and relation in query
+            assert len(arguments) == 2 and arguments[0] == DATASET_ID
+            return await connection.first(query, dataset_id=arguments[0], shard_id=arguments[1])
+
+        async def execute(query, *arguments):
+            if query.lstrip().startswith("INSERT INTO"):
+                fields = (
+                    "dataset_id",
+                    "shard_id",
+                    "endpoint_id",
+                    "acquisition_root_run_id",
+                    "source_ids_json",
+                    "resource_count",
+                    "resource_counts_json",
+                    "first_identity_json",
+                    "last_identity_json",
+                    "input_sha256",
+                    "artifact_sha256",
+                    "artifact_byte_count",
+                    "payload_bytes",
+                )
+                assert relation in query
+                return await connection.status(query, **dict(zip(fields, arguments, strict=True)))
+            if query == f"SELECT dataset_id FROM {relation} LIMIT 0":
+                assert not arguments
+                return None
+            return await execute_control(query, *arguments)
 
         monkeypatch.setattr(native, "fetch", fetch)
-        native.fetchrow.side_effect = parent
+        native.fetchrow.side_effect = fetchrow
+        native.execute.side_effect = execute
         yield database
 
 

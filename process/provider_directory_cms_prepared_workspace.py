@@ -20,7 +20,6 @@ from sqlalchemy.schema import CreateColumn
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_cms_prepared_context as context
 from process import provider_directory_generic_source_storage as storage
-from process.plan_release_storage_custody import storage_roles
 from process.provider_directory_cms_canonical_layout import _LAYOUTS
 from process.provider_directory_cms_identity_candidate import (
     _SECONDARY,
@@ -119,12 +118,14 @@ def _binding(source_binding, prepared_inputs, handoff, preparation_id, admission
     _require(type(admission_sha256) is str and re.fullmatch(r"[0-9a-f]{64}", admission_sha256), "admission_invalid")
     _require(prepared_inputs["source_storage"] == asdict(source_binding), "source_binding_changed")
     document = handoff.document
-    expected_storage_by_field = {**asdict(source_binding), "producer": document["storage"].get("producer")}
-    storage.validate_handoff_document(document, expected_storage_by_field)
+    storage.validate_handoff_document(document, asdict(source_binding))
     _require(document["contract"] == storage.CMS_ISOLATED_CONTRACT, "cms_handoff_required")
-    declared_by_oid = {item["oid"]: item["name"] for item in document["tables"].values()}
+    declared_names = {(item["schema"], item["name"]) for item in document["tables"].values()}
     frozen = prepared_inputs["frozen_inventory"]["relations"]
-    _require({row["relation_oid"]: row["relation_name"] for row in frozen} == declared_by_oid, "frozen_handoff_changed")
+    _require(
+        {(row["schema_name"], row["relation_name"]) for row in frozen} == declared_names,
+        "frozen_handoff_changed",
+    )
     return _copy(
         {
             "contract": CONTRACT,
@@ -132,7 +133,6 @@ def _binding(source_binding, prepared_inputs, handoff, preparation_id, admission
             "admission_sha256": admission_sha256,
             "handoff_sha256": handoff.document_sha256,
             "source_storage": asdict(source_binding),
-            "producer": document["storage"]["producer"],
             "identity": document["identity"],
             "prepared_policy": prepared_inputs["prepared_policy"],
         }
@@ -228,18 +228,18 @@ class CMSPreparedWorkspace:
         return {**_copy(self._binding), "tables": self.receipts, "indexed": self._indexed}
 
     async def verify_current(self):
-        """Repeat original owner-session and exact private object checks before IO."""
+        """Recheck the caller transaction and complete named private outputs before IO."""
         _require(self._active, "scope_ended")
         _require(asdict(self.source_binding) == self._inputs["source_storage"], "source_binding_changed")
         await context._physical(self.database, self.session, self.connection, self._task, self._transaction)
-        actor_by_field = dict(await self.connection.fetchrow(context._ORIGIN_SQL))
-        _require(actor_by_field == self._inputs["origin"], "original_publisher_changed")
         if self._payload_postimages is not None:
             from process.provider_directory_cms_snapshot_readback import verify_sealed_cms_workspace
 
             _require(self._readonly and self._indexed, "readonly_workspace")
             await verify_sealed_cms_workspace(self, **self._payload_postimages)
             return self.receipts
+        actor_by_field = await context._origin(self.connection, self.source_binding, self.policy)
+        _require(actor_by_field == self._inputs["origin"], "original_publisher_changed")
         names = _names(self._binding)
         observed = await storage._capture(self.connection, self.policy, list(names.values()))
         _require({root: observed[name] for root, name in names.items()} == self._receipts, "output_changed")
@@ -312,26 +312,7 @@ class CMSPreparedWorkspace:
 
 
 async def _allocate_private_outputs(connection, policy, names, source_policy, expected_by_field, dataset_id):
-    """Check roles and allocate only the fresh private outputs in the caller savepoint."""
-    owner, _ = await storage_roles(connection, policy.schema, **policy.role_arguments())
-    _require(owner == expected_by_field["native_coordinates"]["prepared_owner_oid"], "prepared_owner_changed")
-    _require(
-        await connection.fetchval(
-            "SELECT pg_has_role(current_user,$1::oid,'USAGE')",
-            owner,
-        ),
-        "prepared_owner_inheritance_required",
-    )
-    ordinary_roles = [source_policy.owner_role, source_policy.publisher_role, *source_policy.runtime_roles]
-    _require(
-        await connection.fetchval(
-            "SELECT NOT EXISTS(SELECT FROM pg_roles WHERE rolname=ANY($1::text[]) "
-            "AND (pg_has_role(oid,$2::oid,'SET') OR pg_has_role(oid,$2::oid,'USAGE')))",
-            ordinary_roles,
-            owner,
-        ),
-        "source_reaches_prepared_owner",
-    )
+    """Allocate fresh named outputs; PostgreSQL enforces the configured role's access."""
     _require(
         await connection.fetchval(
             "SELECT NOT EXISTS(SELECT FROM unnest($1::text[]) name WHERE to_regclass(name) IS NOT NULL)",
@@ -362,6 +343,7 @@ async def _allocate_private_outputs(connection, policy, names, source_policy, ex
             f"CREATE TABLE {storage_relation(policy.schema, name)} ({','.join(definition)})"
             + storage.PRIVATE_HEAP_OPTIONS
         )
+        await storage._close_grants(connection, policy, name)
     observed = await storage._capture(connection, policy, list(names.values()))
     await connection.execute("RESET ROLE")
     return observed
@@ -445,19 +427,17 @@ def _retained_workspace(source_binding, expected, handoff, expected_workspace):
         receipt = receipts[root]
         _require(
             type(receipt) is dict
-            and set(receipt) == {"name", "oid", "owner", "layout_sha256"}
+            and set(receipt) == {"schema", "name"}
             and receipt["name"] == name
-            and type(receipt["oid"]) is int
-            and 0 < receipt["oid"] < 2**32
-            and receipt["owner"] == expected["native_coordinates"]["prepared_owner_oid"]
-            and type(receipt["layout_sha256"]) is str
-            and re.fullmatch(r"[0-9a-f]{64}", receipt["layout_sha256"]),
+            and receipt["schema"] == source_binding.storage_schema,
             "retained_outputs_changed",
         )
-    frozen_oids = {receipt_by_field["relation_oid"] for receipt_by_field in expected["frozen_inventory"]["relations"]}
+    frozen_names = {
+        (receipt["schema_name"], receipt["relation_name"]) for receipt in expected["frozen_inventory"]["relations"]
+    }
+    output_names = {(receipt["schema"], receipt["name"]) for receipt in receipts.values()}
     _require(
-        len({receipt_by_field["oid"] for receipt_by_field in receipts.values()}) == len(OUTPUT_ROOTS)
-        and not frozen_oids & {receipt_by_field["oid"] for receipt_by_field in receipts.values()},
+        len(output_names) == len(OUTPUT_ROOTS) and not frozen_names & output_names,
         "input_output_alias",
     )
     return retained, binding, receipts

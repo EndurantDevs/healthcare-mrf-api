@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Closed Source witness declarations; native export and capture custody confer authority."""
+"""Logical Source provenance and bounded content declarations."""
 
 import json
 from dataclasses import asdict, dataclass, is_dataclass
@@ -39,7 +39,8 @@ HASH_CONTRACTS = {
     ADMITTED_UHC_PROFILE: "transport_neutral_v2",
     SEMANTIC_PROFILE: "semantic_content_v4",
 }
-CAPTURE_CONTRACT = "registry-source-fhir-witness-capture-v1"
+LEGACY_CAPTURE_CONTRACT = "registry-source-fhir-witness-capture-v1"
+CAPTURE_CONTRACT = "registry-source-fhir-capture-v2"
 PRODUCER = "registry-source-fhir-witness-v1"
 SCHEMA_PREFIX = "registry_fhir_witness_"
 COMMENT_PREFIX = "registry-source-fhir-witness-v1:"
@@ -54,21 +55,6 @@ def require(condition):
     """Keep refusal independent of source payloads and coordinates."""
     if not condition:
         raise SourceWitnessContractError("source_fhir_witness_contract_invalid")
-
-
-def _oid(value):
-    require(type(value) is int and 0 < value < 2**32)
-
-
-def _system_identifier(value):
-    require(
-        type(value) is str
-        and value.isascii()
-        and 0 < len(value) <= 20
-        and value.isdecimal()
-        and str(int(value)) == value
-        and 0 < int(value) < 2**64
-    )
 
 
 def _pairs(value):
@@ -104,7 +90,7 @@ def canonical_timestamp(value):
 
 @dataclass(frozen=True)
 class SourceWitnessOrigin:
-    """The exact 25-field Source declaration, without any Reader authority fields."""
+    """Logical source, named relations and complete content observations."""
 
     schema_name: str
     source_id: str
@@ -112,9 +98,8 @@ class SourceWitnessOrigin:
     dataset_id: str
     dataset_sha256: str
     root_run_id: str
-    header_oid: int
-    resource_parent_oid: int
-    resource_leaf_oid: int
+    header_relation: dict
+    resource_relation: dict
     metadata_bytes: int
     metadata_text_sha256: str
     summary_sha256: str
@@ -128,28 +113,26 @@ class SourceWitnessOrigin:
     unresolved_plan_network_count: int
     source_uri: str
     source_aliases: tuple[str, ...]
-    native_catalog_sha256: str
-    database_oid: int
-    database_system_identifier: str
 
     def __post_init__(self):
         _identifier(self.schema_name)
         for name, bound in (("source_id", 64), ("endpoint_id", 64), ("dataset_id", 96), ("root_run_id", 64)):
             text(getattr(self, name), bound)
-        for name in ("header_oid", "resource_parent_oid", "resource_leaf_oid", "database_oid"):
-            _oid(getattr(self, name))
+        for relation in (self.header_relation, self.resource_relation):
+            require(type(relation) is dict and set(relation) == {"schema", "name"})
+            _identifier(relation["schema"])
+            _identifier(relation["name"])
+        require(self.resource_relation["schema"] == self.schema_name)
         for name in (
             "dataset_sha256",
             "metadata_text_sha256",
             "summary_sha256",
-            "native_catalog_sha256",
         ):
             require(is_sha256(getattr(self, name)))
         require(
             type(self.metadata_bytes) is int
             and 0 < self.metadata_bytes <= source_metadata_max_bytes(self.admission_profile)
         )
-        _system_identifier(self.database_system_identifier)
         require(
             type(self.source_aliases) is tuple
             and 0 < len(self.source_aliases) <= 1000
@@ -237,17 +220,38 @@ def _origin_families(origin):
         require(all(type(count) is int and count >= 0 for _, count in pairs))
 
 
+def _named_source_origin_fields(origin_by_field, origin_type):
+    """Project the supported historical wire layout onto strict named provenance fields."""
+    expected_fields = set(origin_type.__dataclass_fields__)
+    legacy_physical_fields = {
+        "header_oid",
+        "resource_parent_oid",
+        "resource_leaf_oid",
+        "native_catalog_sha256",
+        "database_oid",
+        "database_system_identifier",
+    }
+    legacy_fields = expected_fields - {"header_relation", "resource_relation"} | legacy_physical_fields
+    if set(origin_by_field) == legacy_fields:
+        schema = origin_by_field["schema_name"]
+        origin_by_field = {key: field for key, field in origin_by_field.items() if key not in legacy_physical_fields}
+        origin_by_field.update(
+            header_relation={"schema": schema, "name": "provider_directory_endpoint_dataset"},
+            resource_relation={"schema": schema, "name": "provider_directory_dataset_resource"},
+        )
+    require(set(origin_by_field) == expected_fields)
+    return dict(origin_by_field)
+
+
 def source_origin(value):
-    """Decode a declaration only; the original Source factory authenticates it."""
+    """Decode named source provenance and validate its logical content fields."""
     if type(value) in {SourceWitnessOrigin, SourceWitnessCompletionOrigin}:
         value.__post_init__()
         return value
-    if is_dataclass(value) and not isinstance(value, type):
-        value = asdict(value)
-    require(type(value) is dict)
-    origin_type = SourceWitnessCompletionOrigin if "completion_sha256" in value else SourceWitnessOrigin
-    require(set(value) == set(origin_type.__dataclass_fields__))
-    origin_by_field = dict(value)
+    origin_document = asdict(value) if is_dataclass(value) and not isinstance(value, type) else value
+    require(type(origin_document) is dict)
+    origin_type = SourceWitnessCompletionOrigin if "completion_sha256" in origin_document else SourceWitnessOrigin
+    origin_by_field = _named_source_origin_fields(origin_document, origin_type)
     for name in ("resource_counts", "resource_hashes", "descriptor_counts"):
         if name != "descriptor_counts" or origin_by_field[name] is not None:
             origin_by_field[name] = _pairs(origin_by_field[name])
@@ -257,56 +261,21 @@ def source_origin(value):
 
 
 @dataclass(frozen=True)
-class SourceWitnessDatabaseIdentity:
-    """Source database identity, distinct from the Core target's native OIDs."""
-
-    database_name: str
-    database_oid: int
-    system_identifier: str
-    postmaster_started: str
-    recovering: bool
-
-    def __post_init__(self):
-        text(self.database_name, 63)
-        _oid(self.database_oid)
-        _system_identifier(self.system_identifier)
-        require(type(self.postmaster_started) is str)
-        canonical_timestamp(self.postmaster_started)
-        require(self.recovering is False)
-
-
-def database_identity(value):
-    """Freeze the actual five-field export, normalizing an aware timestamp to UTC."""
-    if type(value) is SourceWitnessDatabaseIdentity:
-        value.__post_init__()
-        return value
-    require(type(value) is dict and set(value) == set(SourceWitnessDatabaseIdentity.__dataclass_fields__))
-    identity_by_field = dict(value)
-    identity_by_field["postmaster_started"] = canonical_timestamp(identity_by_field["postmaster_started"])
-    return SourceWitnessDatabaseIdentity(**identity_by_field)
-
-
-@dataclass(frozen=True)
 class SourceWitnessCapture:
-    """Registry capture receipt; serialized fields alone confer no native read capability."""
+    """Named Source capture with logical provenance and complete content accounting."""
 
     origin: SourceWitnessOrigin
-    source_database: SourceWitnessDatabaseIdentity
     capture_id: str
     schema_name: str
-    schema_oid: int
-    relation_oids: tuple[tuple[str, int], ...]
-    owner_role: str
-    runtime_roles: tuple[str, ...]
+    tables: dict
     observed_at: str
-    catalog_sha256: str
     content_sha256: str
     capture_sha256: str
     contract: str = CAPTURE_CONTRACT
 
     @property
     def release_id(self):
-        """Name only this registry capture, never an original Source release."""
+        """Select this logical registry operation independently of Source's run."""
         return "registry-source-witness:" + self.capture_id
 
     def as_dict(self):
@@ -352,7 +321,7 @@ def source_witness_membership_date(capture, expected_anchor):
 
 
 def capture_digest(capture):
-    """Bind all explicit provenance and custody fields except the digest itself."""
+    """Bind the named edition and its data fields."""
     require(type(capture) is SourceWitnessCapture)
     document = capture.as_dict()
     document.pop("capture_sha256")
@@ -360,66 +329,53 @@ def capture_digest(capture):
 
 
 def _decode_capture(document):
-    require(set(document) == set(SourceWitnessCapture.__dataclass_fields__))
     capture_by_field = dict(document)
+    fields = set(SourceWitnessCapture.__dataclass_fields__)
+    legacy_fields = {
+        "origin",
+        "source_database",
+        "capture_id",
+        "schema_name",
+        "schema_oid",
+        "relation_oids",
+        "owner_role",
+        "runtime_roles",
+        "observed_at",
+        "catalog_sha256",
+        "content_sha256",
+        "capture_sha256",
+        "contract",
+    }
+    if set(document) == legacy_fields and document["contract"] == LEGACY_CAPTURE_CONTRACT:
+        capture_by_field = {key: document[key] for key in fields - {"tables"}}
+        capture_by_field["tables"] = {name: {"schema": document["schema_name"], "name": name} for name in TABLES}
+    require(set(capture_by_field) == fields)
     origin = capture_by_field["origin"]
-    source_database = capture_by_field["source_database"]
-    require(type(origin) is dict and type(source_database) is dict)
-    require(type(origin.get("source_aliases")) is list)
-    for name in ("resource_counts", "resource_hashes", "descriptor_counts"):
-        if name == "descriptor_counts" and origin.get(name) is None:
-            continue
-        require(type(origin.get(name)) is list and all(type(pair) is list for pair in origin[name]))
-    require(type(source_database.get("postmaster_started")) is str)
+    require(type(origin) is dict)
+    for field in ("resource_counts", "resource_hashes", "descriptor_counts"):
+        if origin.get(field) is not None:
+            require(type(origin[field]) is list and all(type(pair) is list for pair in origin[field]))
     capture_by_field["origin"] = source_origin(origin)
-    capture_by_field["source_database"] = database_identity(source_database)
-    require(type(capture_by_field["relation_oids"]) is list and type(capture_by_field["runtime_roles"]) is list)
-    require(all(type(pair) is list for pair in capture_by_field["relation_oids"]))
-    capture_by_field["relation_oids"] = _pairs(capture_by_field["relation_oids"])
-    capture_by_field["runtime_roles"] = tuple(capture_by_field["runtime_roles"])
     return SourceWitnessCapture(**capture_by_field)
 
 
 def validate_capture(capture):
-    """Reject mixed provenance and malformed capture declarations before native reads."""
+    """Validate logical scope and content declarations before named reads."""
     if type(capture) is dict:
         capture = _decode_capture(capture)
-    require(
-        type(capture) is SourceWitnessCapture and type(capture.contract) is str and capture.contract == CAPTURE_CONTRACT
-    )
-    require(
-        type(capture.origin) in {SourceWitnessOrigin, SourceWitnessCompletionOrigin}
-        and type(capture.source_database) is SourceWitnessDatabaseIdentity
-    )
+    require(type(capture) is SourceWitnessCapture and capture.contract in {CAPTURE_CONTRACT, LEGACY_CAPTURE_CONTRACT})
     source_origin(capture.origin)
-    database_identity(capture.source_database)
-    require(
-        (capture.origin.database_oid, capture.origin.database_system_identifier)
-        == (capture.source_database.database_oid, capture.source_database.system_identifier)
-    )
     require(
         type(capture.capture_id) is str
         and str(UUID(capture.capture_id)) == capture.capture_id
         and UUID(capture.capture_id).int
     )
-    require(type(capture.schema_name) is str and capture.schema_name == SCHEMA_PREFIX + UUID(capture.capture_id).hex)
-    _oid(capture.schema_oid)
-    _identifier(capture.owner_role)
-    require(type(capture.runtime_roles) is tuple and 0 < len(capture.runtime_roles) <= 32)
-    require(
-        all(type(role) is str for role in capture.runtime_roles)
-        and tuple(sorted(set(capture.runtime_roles))) == capture.runtime_roles
-        and capture.owner_role not in capture.runtime_roles
-    )
-    for role in capture.runtime_roles:
-        _identifier(role)
+    require(capture.schema_name == SCHEMA_PREFIX + UUID(capture.capture_id).hex)
+    require(capture.tables == {name: {"schema": capture.schema_name, "name": name} for name in TABLES})
     require(type(capture.observed_at) is str)
     canonical_timestamp(capture.observed_at)
-    require(type(capture.relation_oids) is tuple and _pairs(capture.relation_oids) == capture.relation_oids)
-    require(tuple(name for name, _ in capture.relation_oids) == tuple(sorted(TABLES)))
-    for _, oid in capture.relation_oids:
-        _oid(oid)
-    require(len({oid for _, oid in capture.relation_oids}) == len(TABLES))
-    require(all(is_sha256(getattr(capture, name)) for name in ("catalog_sha256", "content_sha256", "capture_sha256")))
-    require(len(canonical(capture.as_dict()).encode()) <= 65536 and capture.capture_sha256 == capture_digest(capture))
+    require(all(is_sha256(getattr(capture, name)) for name in ("content_sha256", "capture_sha256")))
+    require(len(canonical(capture.as_dict()).encode()) <= 65536)
+    if capture.contract == CAPTURE_CONTRACT:
+        require(capture.capture_sha256 == capture_digest(capture))
     return capture

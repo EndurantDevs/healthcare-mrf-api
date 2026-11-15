@@ -101,8 +101,8 @@ async def test_direct_generic_capture_reauthenticates_terminal_metadata():
 
 
 @pytest.mark.asyncio
-async def test_manual_claims_activation_retains_generic_oid_cutover_without_generation_triggers(monkeypatch):
-    """Existing stage/owner/OID fences remain; the retained caller records actual publication."""
+async def test_manual_claims_activation_retains_named_cutover_without_generation_triggers(monkeypatch):
+    """Stage and incumbent locks remain; the retained caller records actual publication."""
     spec = archive.reference_family_spec("claims-pricing")
     pairs = tuple(sorted((name, index) for index, name in enumerate(spec.table_names, 101)))
     ownership = archive.ReferenceFamilyStageOwnership(spec.importer_id, UUID(int=1), "example", 50, pairs)
@@ -118,16 +118,15 @@ async def test_manual_claims_activation_retains_generic_oid_cutover_without_gene
     validation = SimpleNamespace(tables=())
     monkeypatch.setattr(archive, "validate_reference_family_manifest", lambda _: manifest)
     monkeypatch.setattr(archive, "validate_reference_family_validation_receipt", lambda _: validation)
-    binding, lock, owner = Mock(), AsyncMock(), AsyncMock()
+    binding, lock = Mock(), AsyncMock(return_value=ownership)
     monkeypatch.setattr(archive, "_require_validated_cutover_binding", binding)
     monkeypatch.setattr(archive, "_lock_and_verify_activation", lock)
-    monkeypatch.setattr(archive, "_verify_stage_owner", owner)
     monkeypatch.setattr(archive, "_apply_validated_contribution", AsyncMock())
     rotate = AsyncMock(return_value=(None, list(pairs), None))
     monkeypatch.setattr(archive, "_complete_validated_stage_activation", rotate)
     generation = AsyncMock()
     monkeypatch.setattr(archive, "publish_adopted_reference_family_generation", generation)
-    cutover = archive.ReferenceFamilyCutoverAuthority("b" * 64, archive.CONTRACT, 70, 70, "manual")
+    cutover = archive.ReferenceFamilyCutoverAuthority("b" * 64, archive.CONTRACT, "manual")
     receipt = await archive.activate_validated_reference_family_stage(
         _session(None),
         ownership=ownership,
@@ -138,7 +137,7 @@ async def test_manual_claims_activation_retains_generic_oid_cutover_without_gene
     )
     binding.assert_called_once()
     lock.assert_awaited_once()
-    owner.assert_awaited_once_with(lock.await_args.args[0], ownership, 70)
+    assert lock.await_args.kwargs["stage_read_only"] is False
     rotate.assert_awaited_once()
     assert receipt.relation_oids == pairs
     generation.assert_not_awaited()

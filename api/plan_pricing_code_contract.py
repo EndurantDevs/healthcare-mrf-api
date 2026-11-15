@@ -8,7 +8,7 @@ from uuid import UUID
 
 from api.plan_pricing_projection_contract import HEX_DIGEST, canonical_json, projection_code_identity
 from api.plan_release_serving import PlanReleaseServingSelection
-from api.ptg_membership_contract import digest
+from api.ptg_membership_contract import digest, logical_receipt, logical_source_identity
 from db.models.plan_pricing_code_projection import (
     PlanPricingCodeAggregatePack,
     PlanPricingCodeManifest,
@@ -185,9 +185,25 @@ def capability_identity(selection, code_identity, signature, sources, *, scope=N
     if scope is not None:
         validate_scope(scope)
         identity_by_field.update(contract=ZIP_CONTRACT, build_revision=ZIP_BUILD_REVISION, scope=scope)
+    identity_by_field = logical_identity(identity_by_field)
     if len(canonical_json(identity_by_field).encode("ascii")) > 512 * 1024:
         raise ValueError("code projection identity exceeds its metadata bound")
     return identity_by_field
+
+
+def logical_identity(identity):
+    """Compare named membership coordinates while retaining raw stored headers separately."""
+    return {
+        **identity,
+        "sources": [
+            {
+                **source,
+                "source_identity": logical_source_identity(source["source_identity"]),
+                "membership": logical_receipt(source["membership"]),
+            }
+            for source in identity["sources"]
+        ],
+    }
 
 
 def identity_digest(identity):
@@ -208,6 +224,7 @@ def source_coverage(
         for code_row in code_rows
     ):
         raise ValueError("code projection physical occurrence count differs")
+    membership = logical_receipt(membership)
     return {
         "binding_ordinal": binding_ordinal,
         "materialized_binding_ordinal": binding_ordinal

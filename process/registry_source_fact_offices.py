@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Derive current office pairs only from independently sealed original SOURCE facts."""
+"""Derive current office pairs from complete original source facts and approved mappings."""
 
 import hashlib
 import json
@@ -192,7 +192,7 @@ def _location_query(source):
 
 
 async def _verify_source_page(connection, recipe, context):
-    """Full source admission precedes this call; every page retains fresh native custody."""
+    """Require the selected local source data before mapping each complete bounded page."""
     source_pin = recipe.source_pin
     if source_pin.source_witness_capture is not None:
         from process.network_fhir_source_witness_capture import SourceWitnessRead
@@ -201,7 +201,7 @@ async def _verify_source_page(connection, recipe, context):
         if type(context.retained_read) is not SourceWitnessRead:
             raise ValueError("registry_fact_office_read_unavailable")
         require_capture_anchor(source_pin.source_witness_capture, source_pin.source_witness_anchor)
-        await context.retained_read.verify(connection, source_pin.source_witness_capture)
+        context.retained_read.require_ready(source_pin.source_witness_capture)
     elif source_pin.retained_capture is not None:
         from process.network_fhir_membership_source import RetainedFHIRSuccessorReads
         from process.network_fhir_retained_capture import RetainedFHIRRead
@@ -210,12 +210,12 @@ async def _verify_source_page(connection, recipe, context):
         if source_pin.retained_successor is None:
             if type(reads) is not RetainedFHIRRead:
                 raise ValueError("registry_fact_office_read_unavailable")
-            await reads.verify(connection, source_pin.retained_capture)
+            reads.require_ready(source_pin.retained_capture)
         else:
             if type(reads) is not RetainedFHIRSuccessorReads:
                 raise ValueError("registry_fact_office_read_unavailable")
-            await reads.original.verify(connection, source_pin.retained_capture)
-            await reads.physical.verify(connection, source_pin.retained_successor.retained_capture)
+            reads.original.require_ready(source_pin.retained_capture)
+            reads.physical.require_ready(source_pin.retained_successor.retained_capture)
     else:
         from process.network_fhir_source_epoch import require_retained_cms_fhir_source_epoch
 
@@ -249,11 +249,11 @@ async def _match_pair_page(connection, recipe, encoded, context):
         address_relation=origin.relation_sql,
         address_arguments=origin.arguments,
     )
-    return offices, bindings, origin.address_identity
+    return offices, bindings, origin.address_scope
 
 
 async def capture_fact_office_pages(connection, recipe, artifact, context):
-    """Reauthenticate original facts, remap every pair and prove selected native Location rows."""
+    """Recheck original fact contents and map every selected native Location pair."""
     if type(context) is not FactOfficeContext or type(artifact) is not ResolvedSourceFactArtifact:
         raise ValueError("registry_fact_office_scope_invalid")
     recipe_sha256, capture_sha256 = recipe_contribution_identity(recipe)
@@ -280,7 +280,7 @@ async def capture_fact_office_pages(connection, recipe, artifact, context):
         origin_manifest_sha256=context.origin_manifest_sha256,
         first_parameter=3,
     )
-    digest = hashlib.sha256((_sha({"address_identity": origin.address_identity}) + "\n").encode())
+    digest = hashlib.sha256((_sha({"address_source": origin.address_scope}) + "\n").encode())
     office_rows, page_count = 0, 0
     async with _pair_cursor(connection, recipe, artifact, context) as cursor:
         while True:
@@ -288,10 +288,10 @@ async def capture_fact_office_pages(connection, recipe, artifact, context):
             if not pairs:
                 break
             encoded = _pair_documents(pairs)
-            offices, bindings, address_identity = await _match_pair_page(connection, recipe, encoded, context)
+            offices, bindings, address_scope = await _match_pair_page(connection, recipe, encoded, context)
             if context.page_sink is not None:
                 await context.page_sink(bindings)
-            page_hash = _sha({"pairs": json.loads(encoded), "offices": offices, "address_identity": address_identity})
+            page_hash = _sha({"pairs": json.loads(encoded), "offices": offices, "address_source": address_scope})
             digest.update((page_hash + "\n").encode())
             office_rows += len(bindings)
             page_count += 1

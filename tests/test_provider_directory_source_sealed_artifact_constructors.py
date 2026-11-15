@@ -1,14 +1,12 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """SOURCE selection never asks for legacy payload-function authority."""
 
-import asyncio
 import importlib
 from types import SimpleNamespace
 
 import pytest
 
 from process import provider_directory_generic_source_policy as policy
-from process.provider_directory_generic_candidate import GenericCandidateError
 
 fhir = importlib.import_module("process.provider_directory_fhir")
 LEGACY_HASH = "provider_directory_subset_payload_sha256"
@@ -104,21 +102,8 @@ async def test_source_projection_drops_legacy_receipt_authority_but_keeps_seal_c
 
 @pytest.mark.asyncio
 async def test_same_task_physical_binding_selects_source_without_a_factory(monkeypatch):
-    publisher = SimpleNamespace(task=asyncio.current_task(), factory=None, storage_binding=None)
+    publisher = SimpleNamespace(factory=None, storage_binding=None)
     monkeypatch.setattr(policy, "_PUBLISHER", policy.ContextVar("source_test_publisher", default=publisher))
     monkeypatch.setattr(policy, "_FACTORY", policy.ContextVar("source_test_factory", default=None))
     assert policy.is_source_storage_required() is True
     assert LEGACY_HASH not in fhir._artifact_fence_dataset_rows_sql(for_update=True)
-
-
-@pytest.mark.asyncio
-async def test_inherited_physical_publisher_refuses_even_with_a_factory(monkeypatch):
-    publisher = SimpleNamespace(task=asyncio.current_task())
-    monkeypatch.setattr(policy, "_PUBLISHER", policy.ContextVar("source_test_publisher", default=publisher))
-    monkeypatch.setattr(policy, "_FACTORY", policy.ContextVar("source_test_factory", default=object()))
-
-    async def child():
-        with pytest.raises(GenericCandidateError, match="publisher_connection_required"):
-            fhir._artifact_fence_dataset_rows_sql(for_update=True)
-
-    await asyncio.create_task(child())

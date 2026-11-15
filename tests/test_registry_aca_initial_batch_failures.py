@@ -14,7 +14,7 @@ from process import network_legacy_membership_source as legacy
 from process import registry_aca_source_recipe as producer
 from process import registry_source_recipe_store as codec
 from tests import test_registry_aca_source_recipe as fixtures
-from tests.test_registry_source_recipe_store_postgres import _example
+from tests.registry_source_recipe_support import _example
 
 
 def _metadata():

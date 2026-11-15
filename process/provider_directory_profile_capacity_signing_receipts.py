@@ -7,8 +7,8 @@ from __future__ import annotations
 import datetime
 from collections.abc import Mapping, Sequence
 from typing import Any
-from process import provider_directory_profile_initial_contract as initial
 
+from process import provider_directory_profile_initial_contract as initial
 from process.provider_directory_cms_capacity_contract import (
     CMS_ADMISSION_FIELD,
     CMS_CONTROL_CONTRACT,
@@ -17,9 +17,7 @@ from process.provider_directory_cms_capacity_contract import (
     CMS_PREFLIGHT_REQUEST_CONTRACT,
     assert_cms_geometry_matches_request,
     validated_cms_capacity_geometry,
-    validated_cms_database_binding,
 )
-
 from process.provider_directory_profile_capacity_preflight_contract import (
     CAPACITY_CONTROL_PLANE_RECEIPT_SHA256_FIELD,
     CAPACITY_PREFLIGHT_CONTRACT_ID,
@@ -32,6 +30,15 @@ from process.provider_directory_profile_capacity_preflight_contract import (
     utc_second_text,
 )
 from process.provider_directory_profile_capacity_signing_guard_contract import (
+    _CONTROL_PLANE_QUIESCENCE_FIELDS,
+    _CONTROL_PLANE_RECEIPT_FIELDS,
+    _CONTROL_PLANE_REQUEST_FIELDS,
+    _HEALTHCARE_QUIESCENCE_FIELDS,
+    _HEALTHCARE_RECEIPT_FIELDS,
+    _HELD_FOLLOWUP_FIELDS,
+    _SIGNING_INTENT_FIELDS,
+    _STORAGE_OBSERVATION_FIELDS,
+    _VOLUME_FIELDS,
     CONTROL_PLANE_PREFLIGHT_CONTRACT_ID,
     CONTROL_PLANE_PREFLIGHT_REQUEST_CONTRACT_ID,
     CONTROL_PLANE_QUIESCENCE_CONTRACT_ID,
@@ -39,18 +46,6 @@ from process.provider_directory_profile_capacity_signing_guard_contract import (
     CONTROL_PLANE_REQUEST_DIGEST_DOMAIN,
     CONTROL_PLANE_SIGNING_INTENT_CONTRACT_ID,
     CONTROL_PLANE_STORAGE_OBSERVATION_DIGEST_DOMAIN,
-    _HEALTHCARE_QUIESCENCE_FIELDS,
-    _HEALTHCARE_RECEIPT_FIELDS,
-    _HELD_FOLLOWUP_FIELDS,
-    _CONTROL_PLANE_QUIESCENCE_FIELDS,
-    _CONTROL_PLANE_RECEIPT_FIELDS,
-    _CONTROL_PLANE_REQUEST_FIELDS,
-    _MAX_OID,
-    _OPAQUE_TEXT,
-    _SIGNING_INTENT_FIELDS,
-    _STORAGE_OBSERVATION_FIELDS,
-    _TEMP_TABLESPACE_FIELDS,
-    _VOLUME_FIELDS,
     _exact,
     _fail,
     _hex,
@@ -62,9 +57,7 @@ from process.provider_directory_profile_capacity_signing_guard_contract import (
 def _validated_storage_observation(raw: Any) -> dict[str, Any]:
     """Validate one closed external storage observation and lease interval."""
 
-    observation = _exact(
-        raw, _STORAGE_OBSERVATION_FIELDS, "storage_observation_invalid"
-    )
+    observation = _exact(raw, _STORAGE_OBSERVATION_FIELDS, "storage_observation_invalid")
     storage_time_by_name = {
         field: _timestamp(observation[field], f"storage_{field}_invalid")
         for field in ("observed_at", "issued_at", "expires_at", "max_build_deadline")
@@ -76,26 +69,7 @@ def _validated_storage_observation(raw: Any) -> dict[str, Any]:
         <= storage_time_by_name["expires_at"]
     ):
         _fail("storage_interval_invalid")
-    tablespace = _exact(
-        observation["temp_tablespace"],
-        _TEMP_TABLESPACE_FIELDS,
-        "temp_tablespace_invalid",
-    )
-    name = tablespace.get("tablespace_name")
-    if (
-        not isinstance(name, str)
-        or len(name) > 63
-        or _OPAQUE_TEXT.fullmatch(name) is None
-    ):
-        _fail("temp_tablespace_invalid")
-    _integer(
-        tablespace.get("tablespace_oid"),
-        "temp_tablespace_invalid",
-        minimum=1,
-        maximum=_MAX_OID,
-    )
-    _hex(tablespace.get("volume_digest"), "temp_tablespace_invalid")
-    _assert_storage_volumes(observation.get("volumes"))
+    _assert_storage_volumes(observation.get("storage_classes"))
     return observation
 
 
@@ -106,13 +80,10 @@ def _assert_storage_volumes(raw_volumes: object) -> None:
         or len(raw_volumes) != 3
     ):
         _fail("volumes_invalid")
-    for expected_class, raw_volume in zip(
-        ("data", "temp", "wal"), raw_volumes, strict=True
-    ):
+    for expected_class, raw_volume in zip(("data", "temp", "wal"), raw_volumes, strict=True):
         volume = _exact(raw_volume, _VOLUME_FIELDS, "volume_invalid")
-        if volume.get("volume_class") != expected_class:
+        if volume.get("storage_class") != expected_class:
             _fail("volume_order_invalid")
-        _hex(volume.get("volume_digest"), "volume_digest_invalid")
         available = _integer(volume.get("available_bytes"), "volume_bytes_invalid")
         remaining = _integer(
             volume.get("available_after_all_reservations_bytes"),
@@ -145,8 +116,11 @@ def _validated_control_plane_request(
         != (
             CMS_CONTROL_REQUEST_CONTRACT
             if admission is not None
-            else (initial.CONTROL_REQUEST_CONTRACT if initial.is_initial_request(healthcare_request)
-                  else CONTROL_PLANE_PREFLIGHT_REQUEST_CONTRACT_ID)
+            else (
+                initial.CONTROL_REQUEST_CONTRACT
+                if initial.is_initial_request(healthcare_request)
+                else CONTROL_PLANE_PREFLIGHT_REQUEST_CONTRACT_ID
+            )
         )
         or intent.get("contract_id") != CONTROL_PLANE_SIGNING_INTENT_CONTRACT_ID
     ):
@@ -154,8 +128,7 @@ def _validated_control_plane_request(
     _hex(intent.get("request_nonce"), "request_nonce_invalid")
     if (
         request.get("profile_execution") != healthcare_request.execution_payload
-        or request.get("provider_directory_profile_capacity_limits")
-        != healthcare_request.limits_payload
+        or request.get("provider_directory_profile_capacity_limits") != healthcare_request.limits_payload
         or request.get(CMS_ADMISSION_FIELD) != admission
         or request.get("profile_materialization") != healthcare_request.request_payload.get("profile_materialization")
     ):
@@ -177,9 +150,7 @@ def _validated_held_followup(
         "held_followup_generation_invalid",
         minimum=1,
     )
-    applied = _integer(
-        followup.get("applied_generation"), "held_followup_generation_invalid"
-    )
+    applied = _integer(followup.get("applied_generation"), "held_followup_generation_invalid")
     _integer(
         followup.get("authority_epoch"),
         "held_followup_authority_invalid",
@@ -214,33 +185,30 @@ def _expected_control_plane_receipt_fields(
     receipt_contract = (
         CMS_CONTROL_CONTRACT
         if healthcare_request.cms_nonprofile_admission is not None
-        else (initial.CONTROL_RECEIPT_CONTRACT if initial.is_initial_request(healthcare_request)
-              else CONTROL_PLANE_PREFLIGHT_CONTRACT_ID)
+        else (
+            initial.CONTROL_RECEIPT_CONTRACT
+            if initial.is_initial_request(healthcare_request)
+            else CONTROL_PLANE_PREFLIGHT_CONTRACT_ID
+        )
     )
     return {
         "contract_id": receipt_contract,
-        **({"profile_materialization": initial.MATERIALIZATION} if initial.is_initial_request(healthcare_request) else {}),
-        "request_contract_id": request["contract_id"],
-        "request_sha256": preflight_domain_sha256(
-            CONTROL_PLANE_REQUEST_DIGEST_DOMAIN, request
+        **(
+            {"profile_materialization": initial.MATERIALIZATION}
+            if initial.is_initial_request(healthcare_request)
+            else {}
         ),
+        "request_contract_id": request["contract_id"],
+        "request_sha256": preflight_domain_sha256(CONTROL_PLANE_REQUEST_DIGEST_DOMAIN, request),
         "request_nonce": request["signing_intent"]["request_nonce"],
         "issued_at": storage["issued_at"],
         "expires_at": storage["expires_at"],
         "max_build_deadline": storage["max_build_deadline"],
-        "profile_execution_identity": profile_execution_identity_payload(
-            healthcare_request
-        ),
+        "profile_execution_identity": profile_execution_identity_payload(healthcare_request),
         "capacity_limits_sha256": healthcare_request.limits_sha256,
-        "storage_observation_sha256": preflight_domain_sha256(
-            CONTROL_PLANE_STORAGE_OBSERVATION_DIGEST_DOMAIN, storage
-        ),
-        "quiescence_sha256": preflight_domain_sha256(
-            CONTROL_PLANE_QUIESCENCE_DIGEST_DOMAIN, quiescence
-        ),
-        "receipt_sha256": preflight_domain_sha256(
-            receipt_contract, receipt_digest_by_field
-        ),
+        "storage_observation_sha256": preflight_domain_sha256(CONTROL_PLANE_STORAGE_OBSERVATION_DIGEST_DOMAIN, storage),
+        "quiescence_sha256": preflight_domain_sha256(CONTROL_PLANE_QUIESCENCE_DIGEST_DOMAIN, quiescence),
+        "receipt_sha256": preflight_domain_sha256(receipt_contract, receipt_digest_by_field),
     }
 
 
@@ -252,14 +220,12 @@ def _validated_control_plane_receipt(
 ) -> dict[str, Any]:
     """Validate one control_plane receipt and its held follow-up proof."""
 
-    fields = _CONTROL_PLANE_RECEIPT_FIELDS | ({"profile_materialization"} if initial.is_initial_request(healthcare_request) else set())
+    fields = _CONTROL_PLANE_RECEIPT_FIELDS | (
+        {"profile_materialization"} if initial.is_initial_request(healthcare_request) else set()
+    )
     receipt_by_field = _exact(raw, fields, "control_plane_receipt_invalid")
-    expires_at = _timestamp(
-        receipt_by_field.get("expires_at"), "control_plane_expiry_invalid"
-    )
-    followup = _validated_held_followup(
-        receipt_by_field.get("held_followup"), healthcare_request, expires_at
-    )
+    expires_at = _timestamp(receipt_by_field.get("expires_at"), "control_plane_expiry_invalid")
+    followup = _validated_held_followup(receipt_by_field.get("held_followup"), healthcare_request, expires_at)
     quiescence = _exact(
         receipt_by_field.get("quiescence"),
         _CONTROL_PLANE_QUIESCENCE_FIELDS,
@@ -267,8 +233,7 @@ def _validated_control_plane_receipt(
     )
     if (
         quiescence.get("contract_id") != CONTROL_PLANE_QUIESCENCE_CONTRACT_ID
-        or quiescence.get("followup_preimage_sha256")
-        != followup["followup_preimage_sha256"]
+        or quiescence.get("followup_preimage_sha256") != followup["followup_preimage_sha256"]
         or quiescence.get("active_profile_run_count") != 0
         or quiescence.get("active_held_dispatch_count") != 0
     ):
@@ -277,8 +242,7 @@ def _validated_control_plane_receipt(
         receipt_by_field, request, storage, healthcare_request, quiescence
     )
     if any(
-        receipt_by_field.get(field_name) != expected_value
-        for field_name, expected_value in expected_by_field.items()
+        receipt_by_field.get(field_name) != expected_value for field_name, expected_value in expected_by_field.items()
     ):
         _fail("control_plane_receipt_binding_invalid")
     return receipt_by_field
@@ -299,33 +263,35 @@ def _expected_healthcare_receipt_fields(
     receipt_contract = (
         CMS_PREFLIGHT_CONTRACT
         if healthcare_request.cms_nonprofile_admission is not None
-        else (initial.RECEIPT_CONTRACT if initial.is_initial_request(healthcare_request) else CAPACITY_PREFLIGHT_CONTRACT_ID)
+        else (
+            initial.RECEIPT_CONTRACT
+            if initial.is_initial_request(healthcare_request)
+            else CAPACITY_PREFLIGHT_CONTRACT_ID
+        )
     )
     return {
         "contract_id": receipt_contract,
-        **({"profile_materialization": initial.MATERIALIZATION} if initial.is_initial_request(healthcare_request) else {}),
+        **(
+            {"profile_materialization": initial.MATERIALIZATION}
+            if initial.is_initial_request(healthcare_request)
+            else {}
+        ),
         "request_contract_id": healthcare_request.request_payload["contract_id"],
         "request_sha256": healthcare_request.request_sha256,
         "request_nonce": healthcare_request.request_nonce,
-        CAPACITY_CONTROL_PLANE_RECEIPT_SHA256_FIELD: control_plane_receipt[
-            "receipt_sha256"
-        ],
+        CAPACITY_CONTROL_PLANE_RECEIPT_SHA256_FIELD: control_plane_receipt["receipt_sha256"],
         "expires_at": utc_second_text(healthcare_request.expires_at),
-        "profile_execution_identity": profile_execution_identity_payload(
-            healthcare_request
-        ),
+        "profile_execution_identity": profile_execution_identity_payload(healthcare_request),
         "capacity_limits": healthcare_request.limits_payload,
         "capacity_limits_sha256": healthcare_request.limits_sha256,
         "serving_generation_preflight_sha256": preflight_domain_sha256(
-            initial.TARGET_CONTRACT if initial.initial_profile_for_request(healthcare_request) else CAPACITY_SERVING_PREFLIGHT_DIGEST_DOMAIN,
-            dict(serving)
+            initial.TARGET_CONTRACT
+            if initial.initial_profile_for_request(healthcare_request)
+            else CAPACITY_SERVING_PREFLIGHT_DIGEST_DOMAIN,
+            dict(serving),
         ),
-        "quiescence_sha256": preflight_domain_sha256(
-            CAPACITY_QUIESCENCE_DIGEST_DOMAIN, quiescence
-        ),
-        "receipt_sha256": preflight_domain_sha256(
-            receipt_contract, receipt_digest_by_field
-        ),
+        "quiescence_sha256": preflight_domain_sha256(CAPACITY_QUIESCENCE_DIGEST_DOMAIN, quiescence),
+        "receipt_sha256": preflight_domain_sha256(receipt_contract, receipt_digest_by_field),
     }
 
 
@@ -336,11 +302,7 @@ def _validated_healthcare_receipt(
 ) -> dict[str, Any]:
     """Validate one durable healthcare receipt and every embedded digest."""
 
-    fields = (
-        _HEALTHCARE_RECEIPT_FIELDS | {"database_binding"}
-        if healthcare_request.cms_nonprofile_admission is not None
-        else _HEALTHCARE_RECEIPT_FIELDS
-    )
+    fields = _HEALTHCARE_RECEIPT_FIELDS
     if initial.is_initial_request(healthcare_request):
         fields = fields | {"profile_materialization"}
     receipt_by_field = _exact(raw, fields, "healthcare_receipt_invalid")
@@ -352,22 +314,18 @@ def _validated_healthcare_receipt(
     count_fields = (
         "active_profile_run_count",
         "claimed_profile_checkpoint_count",
-        "unexpired_capacity_consumption_count",
         "outstanding_preflight_receipt_count",
     )
     if quiescence.get("contract_id") != CAPACITY_QUIESCENCE_CONTRACT_ID or any(
         quiescence.get(field) != 0 for field in count_fields
     ):
         _fail("healthcare_quiescence_invalid")
+    _integer(quiescence.get("unexpired_capacity_consumption_count"), "healthcare_quiescence_invalid")
     serving = receipt_by_field.get("serving_generation_preflight")
     if not isinstance(serving, Mapping):
         _fail("healthcare_serving_preflight_invalid")
-    issued_at = _timestamp(
-        receipt_by_field.get("issued_at"), "healthcare_issued_at_invalid"
-    )
-    expires_at = _timestamp(
-        receipt_by_field.get("expires_at"), "healthcare_expires_at_invalid"
-    )
+    issued_at = _timestamp(receipt_by_field.get("issued_at"), "healthcare_issued_at_invalid")
+    expires_at = _timestamp(receipt_by_field.get("expires_at"), "healthcare_expires_at_invalid")
     expected_by_field = _expected_healthcare_receipt_fields(
         receipt_by_field,
         healthcare_request,
@@ -376,8 +334,7 @@ def _validated_healthcare_receipt(
         quiescence,
     )
     if not issued_at < expires_at or any(
-        receipt_by_field.get(field_name) != expected_value
-        for field_name, expected_value in expected_by_field.items()
+        receipt_by_field.get(field_name) != expected_value for field_name, expected_value in expected_by_field.items()
     ):
         _fail("healthcare_receipt_binding_invalid")
     _hex(
@@ -398,32 +355,45 @@ def _assert_capacity_receipt_geometry(receipt: Mapping[str, Any], request: Any) 
             snapshot = initial.validated_target_state(receipt["serving_generation_preflight"])
         except ValueError:
             _fail("initial_geometry_invalid")
-        if (not isinstance(geometry, initial.InitialCapacityGeometry)
+        if (
+            not isinstance(geometry, initial.InitialCapacityGeometry)
             or geometry.initial_target_state_sha256 != initial.target_state_sha256(snapshot)
             or receipt["capacity_geometry_hash"] != capacity.capacity_geometry_hash(geometry)
             or geometry.profile_as_of != request.execution.attestation.desired_profile_as_of
-            or receipt["required_reservation_bytes_by_storage_class"] != geometry.reservation_bytes_by_storage_class):
+            or geometry.selection_proof_id != request.execution.attestation.proof_id
+            or geometry.profile_input_digest != request.execution.attestation.profile_input_digest
+            or receipt["required_reservation_bytes_by_storage_class"] != geometry.reservation_bytes_by_storage_class
+        ):
             _fail("initial_geometry_binding_invalid")
         return
     if request.cms_nonprofile_admission is None:
-        geometry = receipt["capacity_geometry"]
-        if isinstance(geometry, Mapping) and (
-            geometry.get("contract_id") == "provider-directory-cms-nonprofile-capacity.v1"
-            or "admission_purpose" in geometry
+        from process import provider_directory_profile_capacity as capacity
+
+        try:
+            geometry = capacity.validated_capacity_geometry(receipt["capacity_geometry"])
+        except ValueError:
+            _fail("profile_geometry_invalid")
+        if (
+            receipt["capacity_geometry_hash"] != capacity.capacity_geometry_hash(geometry)
+            or receipt["required_reservation_bytes_by_storage_class"] != geometry.reservation_bytes_by_storage_class
+            or geometry.selection_proof_id != request.execution.attestation.proof_id
+            or geometry.profile_input_digest != request.execution.attestation.profile_input_digest
+            or (
+                request.execution.attestation.desired_profile_as_of is not None
+                and geometry.profile_as_of != request.execution.attestation.desired_profile_as_of
+            )
         ):
-            _fail("cms_geometry_requires_cms_request")
+            _fail("profile_geometry_binding_invalid")
         return
     try:
         plan = validated_cms_capacity_geometry(receipt["capacity_geometry"])
-        validated_cms_database_binding(receipt["database_binding"])
         assert_cms_geometry_matches_request(plan, request)
     except ValueError:
         _fail("cms_geometry_invalid")
     projection = receipt["artifact_scope_projection"]
     if not isinstance(projection, Mapping) or (
         receipt["capacity_geometry_hash"] != plan.capacity_geometry_hash
-        or receipt["required_reservation_bytes_by_storage_class"]
-        != dict(plan.reservation_bytes)
+        or receipt["required_reservation_bytes_by_storage_class"] != dict(plan.reservation_bytes)
         or projection.get("projection_hash") != plan.artifact_scope_projection_hash
     ):
         _fail("cms_geometry_binding_invalid")

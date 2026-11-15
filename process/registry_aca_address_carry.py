@@ -6,7 +6,6 @@ import json
 from dataclasses import dataclass
 from uuid import UUID
 
-from process.network_address_artifact import _locked_table
 from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_compact_layout import CompactAddressRelation
 from process.network_initial_source_office_bindings import _canonical_bindings, _canonical_source, _office_records
@@ -206,9 +205,6 @@ async def _bindings(connection, target_schema, encoded, *, writing):
 async def _copy_existing_offices(connection, batch, target_schema, existing_source):
     """Keep selected native base rows, including enrichment, before constructing missing carriers."""
     if type(existing_source) is not CompactAddressRelation or not connection.is_in_transaction():
-        raise ValueError("registry_aca_address_carry_existing_source_invalid")
-    physical = await _locked_table(connection, existing_source.schema_name, existing_source.table_oid)
-    if CompactAddressRelation(physical["schema_name"], physical["relname"], physical["oid"]) != existing_source:
         raise ValueError("registry_aca_address_carry_existing_source_invalid")
     source_relation = _identifier(existing_source.schema_name) + "." + _identifier(existing_source.table_name)
     target_relation = _identifier(target_schema) + ".entity_address_unified"

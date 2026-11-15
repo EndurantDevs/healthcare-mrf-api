@@ -37,7 +37,6 @@ async def test_reject_retires_candidates_only_for_membership_publication(monkeyp
     async def retire(_pool, _config, request_id):
         retired_ids.append(request_id)
 
-    monkeypatch.setattr(consumer, "_verify_lifecycle", _finished)
     monkeypatch.setattr(consumer, "finish_registry_publication_request", _finished)
     monkeypatch.setattr(consumer, "_retire_rejected_candidates", retire)
     request_id = uuid4()

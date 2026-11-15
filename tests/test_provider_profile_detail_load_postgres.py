@@ -16,7 +16,7 @@ from sqlalchemy import event, text
 
 from api import provider_profile_snapshot as snapshot
 from tests import provider_profile_detail_load_postgres_support as detail_support
-from tests.cms_doctors_preparation_postgres_support import authority, native, stage_oids
+from tests.cms_doctors_preparation_postgres_support import authority, native
 from tests.cms_doctors_preparation_postgres_support import doctors_source_template as doctors_source_template
 from tests.provider_profile_detail_load_postgres_support import NPI, detail_database, npi_api
 
@@ -62,7 +62,7 @@ class _Measurements:
 
     def install(self, monkeypatch):
         read_snapshot = npi_api.provider_profile_read_snapshot
-        inventory_relations = snapshot._inventory_serving_relations
+        inventory_relations = snapshot._inventory_relation_names
         prelock = native._lock_cms_doctors_publication
         apply_stage = native._apply_cms_doctors_stage
 
@@ -87,7 +87,10 @@ class _Measurements:
             result = await inventory_relations(*args, **kwargs)
             sample_by_field = self.request.get()
             if sample_by_field is not None:
-                assert len(result) == 59 and all(result.values())
+                schema = args[1]
+                assert set(result) == {f"{schema}.{name}" for name in detail_support.RELATIONS}
+                assert len(result) == 60 and all(result.values())
+                sample_by_field["inventory_calls"] = sample_by_field.get("inventory_calls", 0) + 1
                 sample_by_field["relations"] = len(result)
                 sample_by_field["inventory_ms"] = round((perf_counter() - started) * 1000, 3)
             return result
@@ -112,7 +115,7 @@ class _Measurements:
             return result
 
         monkeypatch.setattr(npi_api, "provider_profile_read_snapshot", measured_snapshot)
-        monkeypatch.setattr(snapshot, "_inventory_serving_relations", measured_inventory)
+        monkeypatch.setattr(snapshot, "_inventory_relation_names", measured_inventory)
         monkeypatch.setattr(native, "_lock_cms_doctors_publication", measured_prelock)
         monkeypatch.setattr(native, "_apply_cms_doctors_stage", measured_apply)
 
@@ -182,21 +185,6 @@ async def test_enrollment_fixture_preserves_existing_source_schema(failure):
     connection.execute.assert_not_awaited()
 
 
-@pytest.mark.parametrize("missing", ["migration_role", "namespace_owner_role"])
-async def test_detail_nppes_reuse_refuses_missing_enrollment(missing):
-    """Incomplete caller enrollment cannot expose NPPES authority or open a transaction."""
-    from tests import nppes_candidate_postgres_support as nppes
-
-    role_by_attribute = {"migration_role": "fixture_migrator", "namespace_owner_role": "fixture_namespace"}
-    role_by_attribute.pop(missing)
-    component = SimpleNamespace(factory=SimpleNamespace(**role_by_attribute))
-    assert nppes._COMPONENT.get() is None
-    with pytest.raises(RuntimeError, match="caller_owned_nppes_enrollment_required"):
-        async with nppes.existing_nppes_component(component):
-            pytest.fail("incomplete enrollment cannot expose a component")
-    assert nppes._COMPONENT.get() is None
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cache_enabled", [False, True], ids=["full-loaders", "warm-cache"])
 async def test_full_detail_reads_during_native_doctors_publication(monkeypatch, tmp_path, cache_enabled):
@@ -212,7 +200,6 @@ async def test_full_detail_reads_during_native_doctors_publication(monkeypatch, 
         publication_by_field = {}
         finished = asyncio.Event()
         before = await authority(fixture)
-        stages = await stage_oids(fixture, fixture.stage)
         try:
             expected = await measurements.read("setup", "before")
             _assert_detail(expected)
@@ -245,7 +232,7 @@ async def test_full_detail_reads_during_native_doctors_publication(monkeypatch, 
             await asyncio.wait_for(asyncio.gather(publisher, *workers), timeout=10)
             after = await authority(fixture)
             publication_by_field["observed_authority"] = asdict(after)
-            _assert_publication(measurements, publication_by_field, before, after, stages)
+            _assert_publication(measurements, publication_by_field, before, after, fixture.schema)
         finally:
             for task in [publisher, *workers]:
                 if task is not None and not task.done():
@@ -261,7 +248,7 @@ def _write_receipt(tmp_path, fixture, measurements, before, publication_by_field
         "cache_enabled": cache_enabled,
         "reader_count": 3,
         "cadence": "continuous; no sleeps or quiet windows",
-        "relation_count": 59,
+        "relation_count": 60,
         "before_authority": asdict(before),
         "npi_identity": fixture.npi_identity,
         "publication": publication_by_field,
@@ -283,16 +270,18 @@ def _write_receipt(tmp_path, fixture, measurements, before, publication_by_field
     (tmp_path / "detail-load.json").write_text(json.dumps(receipt_by_field, default=str, indent=2) + "\n")
 
 
-def _assert_publication(measurements, publication_by_field, before, after, stages):
-    """Require a committed new native OID family and coherent successful reads on both sides."""
+def _assert_publication(measurements, publication_by_field, before, after, schema):
+    """Require a committed named family and coherent successful reads on both sides."""
     assert all(
-        not sample_by_field.get("error") and sample_by_field.get("relations") == 59
+        not sample_by_field.get("error")
+        and sample_by_field.get("relations") == 60
+        and sample_by_field.get("inventory_calls") == 1
         for sample_by_field in measurements.requests
     )
     assert "error" not in publication_by_field, publication_by_field
     assert after.local_generation == before.local_generation + 1
-    oid_by_target = {target_name: oid for target_name, _stage, oid in stages}
-    assert after.relation_oids == tuple(oid_by_target[name] for name in snapshot._DOCTORS_TABLES)
+    assert after.relations == tuple((schema, name) for name in snapshot._DOCTORS_TABLES)
+    assert publication_by_field["committed_authority"] == asdict(after)
     assert {sample_by_field["generation"] for sample_by_field in measurements.requests} == {
         before.local_generation,
         after.local_generation,

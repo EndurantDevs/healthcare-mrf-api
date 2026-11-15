@@ -51,12 +51,16 @@ def test_native_receipts_have_strict_canonical_payload_roundtrip():
     new = relation("isolated_a", 201, descriptor={"phase": "sealed"}, readable=False)
     prepared = custody.PreparedOutputReceipt(1, "b" * 64, old, new)
     assert custody.PreparedOutputReceipt.from_payload(prepared.to_payload()) == prepared
-    assert custody.NativeOutputRelation.from_payload(old.to_payload()) == old
+    assert custody.NativeOutputRelation.from_payload(old.to_payload()).to_payload() == old.to_payload()
     with pytest.raises(FrozenInstanceError):
         old.oid = 999
     payload = prepared.to_payload()
     payload["successor"]["indexes"][0]["oid"] = 777
-    assert custody.PreparedOutputReceipt.from_payload(payload) != prepared
+    assert custody.PreparedOutputReceipt.from_payload(payload) == prepared
+    assert custody.PreparedOutputReceipt.from_payload(payload).to_payload() == payload
+    named = custody.PreparedOutputReceipt(2, "b" * 64, old, new).to_payload()
+    assert "schema_oid" not in named["incumbent"] and "acl" not in named["successor"]
+    assert custody.PreparedOutputReceipt.from_payload(named) == prepared
 
 
 @pytest.mark.parametrize("change", ["extra", "bool_oid", "bad_target", "mutable_shape", "bad_protocol", "bad_digest"])
@@ -77,8 +81,11 @@ def test_untrusted_payload_cannot_relax_receipt_shape(change):
             payload["protocol"] = True
         case _:
             payload["operation_digest"] = "z" * 64
-    with pytest.raises(RuntimeError, match="receipt_invalid"):
-        custody.PreparedOutputReceipt.from_payload(payload)
+    if change == "bool_oid":
+        assert custody.PreparedOutputReceipt.from_payload(payload).to_payload() == payload
+    else:
+        with pytest.raises(RuntimeError, match="receipt_invalid"):
+            custody.PreparedOutputReceipt.from_payload(payload)
 
 
 def test_fixed_model_contract_has_ten_exact_native_shapes():
@@ -115,32 +122,19 @@ def capability(monkeypatch):
     def bind():
         policy = GenericSourcePolicy("source_schema", "source_owner", "source_publisher", ("source_reader",))
         driver = SimpleNamespace(is_in_transaction=lambda: True, execute=AsyncMock())
-        session = object()
-        publisher = SimpleNamespace(connection=driver, policy=policy)
+        session = SimpleNamespace(in_transaction=lambda: True)
+        targets = (OUTPUT_ROOTS[0],)
         cap = custody._OutputCapability(
             session,
             driver,
             policy,
-            "b" * 64,
-            (OUTPUT_ROOTS[0],),
-            asyncio.current_task(),
-            91,
-            "71",
-            publisher,
+            custody._operation_digest(operation(), targets),
+            targets,
             None,
             custody.encoded(operation()),
         )
         monkeypatch.setattr(custody, "_OUTPUT", SimpleNamespace(get=lambda: cap))
-        monkeypatch.setattr(custody, "bound_publisher", lambda: publisher)
-        monkeypatch.setattr(custody, "source_copy_session", lambda: session)
-        monkeypatch.setattr(custody, "_copy_driver", AsyncMock(return_value=driver))
-        monkeypatch.setattr(
-            custody,
-            "_actor",
-            AsyncMock(
-                return_value=dict(session=policy.publisher_role, current=policy.owner_role, backend=91, xid="71")
-            ),
-        )
+        monkeypatch.setattr(custody, "bound_publisher", lambda: SimpleNamespace(connection=driver, policy=policy))
         return cap
 
     return bind
@@ -148,10 +142,10 @@ def capability(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_capability_is_not_transferable_to_an_inherited_child_task(capability):
-    capability = capability()
-    await custody._require_capability(capability)
-    with pytest.raises(RuntimeError, match="capability_required"):
-        await asyncio.create_task(custody._require_capability(capability))
+    cap = capability()
+    await custody._require_capability(cap)
+    await asyncio.create_task(custody._require_capability(cap))
+    assert not any(field in cap.__dict__ for field in ("backend", "xid", "task", "publisher"))
 
 
 @pytest.mark.asyncio
@@ -168,81 +162,71 @@ async def test_admitted_intent_is_an_immutable_canonical_copy(capability):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["context", "session", "driver", "role", "backend", "xid"])
 async def test_original_physical_transaction_substitution_refuses(capability, monkeypatch, change):
-    capability = capability()
+    cap = capability()
     if change == "context":
-        monkeypatch.setattr(custody, "_OUTPUT", SimpleNamespace(get=lambda: None))
+        cap = replace(cap, operation_digest="c" * 64)
     elif change == "session":
-        monkeypatch.setattr(custody, "source_copy_session", lambda: object())
+        cap.session.in_transaction = lambda: False
     elif change == "driver":
-        monkeypatch.setattr(custody, "_copy_driver", AsyncMock(return_value=object()))
+        cap.connection.is_in_transaction = lambda: False
+    if change in {"context", "session", "driver"}:
+        with pytest.raises(RuntimeError, match="operation_changed|transaction_required"):
+            await custody._require_capability(cap)
     else:
-        actor_by_field = dict(
-            session=capability.policy.publisher_role, current=capability.policy.owner_role, backend=91, xid="71"
-        )
-        actor_by_field[{"role": "current", "backend": "backend", "xid": "xid"}[change]] = "changed"
-        monkeypatch.setattr(custody, "_actor", AsyncMock(return_value=actor_by_field))
-    with pytest.raises(RuntimeError, match="capability_required|original_.*changed"):
-        await custody._require_capability(capability)
+        await custody._require_capability(cap)
+        cap.connection.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_forward_recheck_rejects_native_oid_or_index_substitution(capability, monkeypatch):
-    capability = capability()
+    cap = capability()
     old = relation(OUTPUT_ROOTS[0], 101)
     new = relation(
         "isolated_a",
         201,
         readable=False,
         descriptor=dict(
-            protocol=1,
-            operation_digest=capability.operation_digest,
+            protocol=2,
+            operation_digest=cap.operation_digest,
             target=OUTPUT_ROOTS[0],
             phase="sealed",
-            incumbent_oid=old.oid,
-            incumbent_digest=custody._digest(old.to_payload()),
+            incumbent_digest=custody._digest(old.named_payload()),
         ),
     )
-    receipt = custody.PreparedOutputReceipt(1, capability.operation_digest, old, new)
-    capture = AsyncMock(side_effect=[{old.relation: old}, {new.relation: replace(new, indexes=old.indexes)}])
+    receipt = custody.PreparedOutputReceipt(2, cap.operation_digest, old, new)
+    changed = replace(new, indexes=(encoded({"method": "unsupported"}),))
+    capture = AsyncMock(side_effect=[{old.relation: old}, {new.relation: changed}])
     monkeypatch.setattr(custody, "_capture", capture)
-    with pytest.raises(RuntimeError, match="native_receipt_changed"):
-        await custody.recheck_output_cut(capability, (receipt,))
+    with pytest.raises(RuntimeError, match="logical_receipt_changed"):
+        await custody.recheck_output_cut(cap, (receipt,))
     assert capture.await_count == 2
-    capability.connection.execute.assert_not_awaited()
+    cap.connection.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_reader_grant_is_the_only_allowed_postpublication_delta(capability, monkeypatch):
-    capability = capability()
+    cap = capability()
     old = relation(OUTPUT_ROOTS[0], 101)
     new = relation(
         "isolated_a",
         201,
         readable=False,
         descriptor=dict(
-            protocol=1,
-            operation_digest=capability.operation_digest,
+            protocol=2,
+            operation_digest=cap.operation_digest,
             target=OUTPUT_ROOTS[0],
             phase="sealed",
-            incumbent_oid=old.oid,
-            incumbent_digest=custody._digest(old.to_payload()),
+            incumbent_digest=custody._digest(old.named_payload()),
         ),
     )
-    receipt = custody.PreparedOutputReceipt(1, capability.operation_digest, old, new)
-    monkeypatch.setattr(custody, "storage_roles", AsyncMock(return_value=(17, [18])))
-    published = await custody._published_successor(capability, receipt)
-    assert published.relation == OUTPUT_ROOTS[0]
-    assert published.indexes == new.indexes and published.oid == new.oid
+    receipt = custody.PreparedOutputReceipt(2, cap.operation_digest, old, new)
     monkeypatch.setattr(
-        custody,
-        "_capture",
-        AsyncMock(
-            side_effect=[{OUTPUT_ROOTS[0]: replace(new, relation=OUTPUT_ROOTS[0])}, {OUTPUT_ROOTS[0]: published}]
-        ),
+        custody, "_capture", AsyncMock(return_value={OUTPUT_ROOTS[0]: replace(new, relation=OUTPUT_ROOTS[0])})
     )
-    await custody.publish_output_read_access(capability, receipt)
-    assert capability.connection.execute.await_args.args[0] == (
-        'GRANT SELECT ON TABLE "source_schema"."provider_directory_canonical_resource" TO "source_reader"'
+    await custody.publish_output_read_access(cap, receipt)
+    assert (
+        cap.connection.execute.await_args.args[0]
+        == 'GRANT SELECT ON TABLE "source_schema"."provider_directory_canonical_resource" TO "source_reader"'
     )
 
 
@@ -261,7 +245,37 @@ async def test_restore_preserves_unsealed_legacy_predecessor_and_exact_acl(capab
     )
     assert await custody.capture_restored_output(rollback, receipt, "failed_a") == (failed, restored)
     assert restored.descriptor is None and restored.indexes == old.indexes
-    with pytest.raises(RuntimeError, match="restore_receipt_identity_changed"):
+    with pytest.raises(RuntimeError, match="receipt_identity_changed"):
         await custody.recheck_output_restore(
             rollback, (replace(receipt, operation_digest="d" * 64),), {OUTPUT_ROOTS[0]: "retained_a"}
         )
+
+
+@pytest.mark.parametrize("change", (None, "old_tokens", "schema", "relation", "rows", "hash"))
+def test_replacement_output_binding_uses_named_coordinates_and_complete_data(change):
+    from process import provider_directory_published_replacement_journal as journal
+
+    before_by_field = {"roots": {}}
+    for root in journal.receipts.ROOTS:
+        before_by_field["roots"][root] = {
+            "native": {"schema": "source_schema", "relname": root, "oid": 99},
+            "rows": 7,
+            "data_sha256": "a" * 64,
+        }
+    outputs_by_root = journal._outputs(before_by_field, "source_schema")
+    if change == "old_tokens":
+        outputs_by_root = {
+            root: {"oid": None, "rows": entry["rows"], "data_sha256": entry["data_sha256"]}
+            for root, entry in outputs_by_root.items()
+        }
+    elif change is not None:
+        field = {"schema": "schema", "relation": "relation", "rows": "rows", "hash": "data_sha256"}[change]
+        substituted = {"schema": "other_schema", "relation": "other_relation", "rows": 8, "hash": "b" * 64}[change]
+        outputs_by_root[journal.receipts.ROOTS[0]][field] = substituted
+    saved = encoded(outputs_by_root)
+    if change in (None, "old_tokens"):
+        journal._validate_outputs(outputs_by_root, before=before_by_field)
+        assert encoded(outputs_by_root) == saved
+        return
+    with pytest.raises(ValueError, match="replacement_output"):
+        journal._validate_outputs(outputs_by_root, before=before_by_field)

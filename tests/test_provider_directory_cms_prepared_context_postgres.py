@@ -44,6 +44,9 @@ async def _create_input_relations(native, role_by_kind):
         await native.execute(
             f'ALTER TABLE private_source.frozen_input_{ordinal} OWNER TO "{role_by_kind["prepared_owner"]}"'
         )
+        await native.execute(
+            f'GRANT SELECT ON private_source.frozen_input_{ordinal} TO "{role_by_kind["prepared_publisher"]}"'
+        )
     await native.execute("CREATE TABLE accepted_catalog.transaction_probe(id integer)")
     await native.execute(
         f'GRANT SELECT,INSERT ON accepted_catalog.transaction_probe TO "{role_by_kind["prepared_publisher"]}"'
@@ -52,28 +55,9 @@ async def _create_input_relations(native, role_by_kind):
 
 async def _input_case(native, url, database_name, role_by_kind, password):
     """Return unchanged fixture fields from genuine native coordinates."""
-    coordinate_by_field = dict(
-        await native.fetchrow(
-            "SELECT (SELECT oid::bigint FROM pg_database WHERE datname=current_database()) AS database_oid,"
-            "'accepted_catalog'::regnamespace::oid::bigint AS catalog_schema_oid,"
-            "'private_source'::regnamespace::oid::bigint AS storage_schema_oid,"
-            "(SELECT oid::bigint FROM pg_roles WHERE rolname=$1) AS owner_oid,"
-            "(SELECT oid::bigint FROM pg_roles WHERE rolname=$2) AS namespace_owner_oid",
-            role_by_kind["source_owner"],
-            role_by_kind["namespace"],
-        )
-    )
-    storage = FHIRSourceStorageBinding(
-        "accepted_catalog", "private_source", **coordinate_by_field, enrollment_sha256="a" * 64
-    )
+    storage = FHIRSourceStorageBinding("accepted_catalog", "private_source")
     relations = [
-        dict(native_row)
-        for native_row in await native.fetch(
-            "SELECT c.oid::bigint AS relation_oid,c.relfilenode::bigint AS relfilenode,c.relowner::bigint AS owner_oid,"
-            "n.oid::bigint AS schema_oid,n.nspowner::bigint AS schema_owner_oid,n.nspname AS schema_name,"
-            "c.relname AS relation_name FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-            "WHERE n.nspname='private_source' AND c.relkind='r' ORDER BY c.oid"
-        )
+        dict(schema_name="private_source", relation_name="frozen_input_" + str(ordinal)) for ordinal in range(8)
     ]
     assert len(relations) == 8
     database = Database()
@@ -94,12 +78,12 @@ async def _input_case(native, url, database_name, role_by_kind, password):
             role_by_kind["prepared_publisher"],
             (role_by_kind["reader"],),
         ),
-        inventory={"database_oid": storage.database_oid, "relations": relations},
+        inventory={"relations": relations},
     )
 
 
-@pytest_asyncio.fixture
-async def native_case():
+@asynccontextmanager
+async def native_input_resources():
     """Yield isolated native inputs and retire only registered random resources."""
     dsn = os.getenv("HLTHPRT_CMS_CUSTODY_TEST_DSN")
     if not dsn:
@@ -126,7 +110,13 @@ async def native_case():
             url.set(database=database_name).render_as_string(hide_password=False), command_timeout=10
         )
         await _create_input_relations(native, role_by_kind)
-        yield await _input_case(native, url, database_name, role_by_kind, password)
+        yield SimpleNamespace(
+            admin=native,
+            url=url.set(database=database_name),
+            database_name=database_name,
+            roles=role_by_kind,
+            password=password,
+        )
     finally:
         try:
             if native is not None:
@@ -145,6 +135,15 @@ async def native_case():
         finally:
             await admin.close()
             assert admin.is_closed()
+
+
+@pytest_asyncio.fixture
+async def native_case():
+    """Preserve the legacy CMS observation fixture on the shared native resources."""
+    async with native_input_resources() as resources:
+        yield await _input_case(
+            resources.admin, resources.url, resources.database_name, resources.roles, resources.password
+        )
 
 
 @asynccontextmanager
@@ -179,41 +178,36 @@ def observe(case, session, driver):
     )
 
 
-async def test_native_prepared_publisher_keeps_source_owner_coordinates_separate(native_case):
+async def test_native_prepared_publisher_reads_complete_named_inputs(native_case):
     case = native_case
-    source_owner = case.storage.owner_oid
     async with publisher(case) as (session, driver), observe(case, session, driver) as evidence:
-        assert evidence["source_storage"]["owner_oid"] == source_owner
-        assert evidence["native_coordinates"]["prepared_owner_oid"] != source_owner
-        assert all(row["owner_oid"] != source_owner for row in evidence["frozen_inventory"]["relations"])
-    assert case.storage.owner_oid == source_owner
+        assert evidence["source_storage"] == {"catalog_schema": "accepted_catalog", "storage_schema": "private_source"}
+        assert evidence["frozen_inventory"] == case.inventory
+        assert all(set(relation) == {"schema_name", "relation_name"} for relation in case.inventory["relations"])
+        assert len(evidence["native_coordinates"]["relations"]) == 8
+        assert session.in_transaction()
 
 
-async def test_native_source_publisher_is_not_a_prepared_publisher(native_case):
+async def test_native_source_publisher_cannot_read_prepared_inputs(native_case):
     case = native_case
-    with pytest.raises(ValueError, match="original_publisher_required"):
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
         async with publisher(case, source=True) as (session, driver), observe(case, session, driver):
-            pytest.fail("Source publisher entered the prepared observation")
+            pytest.fail("Source publisher read private prepared inputs")
 
 
-async def test_native_unmaterialized_session_is_not_a_physical_transaction(native_case):
+async def test_native_input_reads_materialize_the_caller_transaction(native_case):
     case = native_case
-    with pytest.raises(ValueError, match="physical_connection_changed"):
-        async with publisher(case, materialize=False) as (session, driver), observe(case, session, driver):
-            pytest.fail("virtual SQLAlchemy transaction was accepted as native")
+    async with publisher(case, materialize=False) as (session, driver), observe(case, session, driver):
+        assert session.in_transaction() and driver.is_in_transaction()
 
 
-@pytest.mark.parametrize("change", ["owner", "relfilenode"])
-async def test_native_concurrent_physical_change_is_observed_at_exit(native_case, change):
+@pytest.mark.parametrize("table", ["frozen_input_0", "frozen_input_7"])
+async def test_native_missing_input_access_refuses_before_body(native_case, table):
     case = native_case
-    with pytest.raises(ValueError, match="frozen_inventory_changed"):
+    await case.admin.execute(f'REVOKE SELECT ON private_source.{table} FROM "{case.roles["prepared_publisher"]}"')
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
         async with publisher(case) as (session, driver), observe(case, session, driver):
-            if change == "owner":
-                await case.admin.execute(
-                    f'ALTER TABLE private_source.frozen_input_0 OWNER TO "{case.roles["source_owner"]}"'
-                )
-            else:
-                await case.admin.execute("TRUNCATE TABLE private_source.frozen_input_0")
+            pytest.fail("unreadable input reached the body")
 
 
 async def test_native_inherited_task_cannot_borrow_prepared_session(native_case):

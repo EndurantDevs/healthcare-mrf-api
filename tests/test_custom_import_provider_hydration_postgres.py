@@ -979,7 +979,7 @@ async def _native_scope_case(monkeypatch, *, is_geo, signed=False):
         if signed:
             await grant_signed_reader_tables(case, "npi", "npi_address", "npi_taxonomy", "nucc_taxonomy")
         list_fixture._configure_postgres_provider_list(monkeypatch)
-        monkeypatch.setattr(provider_list_sql, "NetworkReadConnectionProxy", _ScopedNativeProxy)
+        monkeypatch.setattr(provider_list_sql, "ConnectionProxy", _ScopedNativeProxy)
         yield case, target
 
 

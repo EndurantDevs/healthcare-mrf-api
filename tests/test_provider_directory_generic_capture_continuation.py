@@ -185,25 +185,52 @@ async def test_none_preserves_ordinary_publication_without_capture(case):
     case.capture.assert_not_awaited()
 
 
-async def test_continuation_is_frozen_and_rejects_same_pool_or_arbitrary_factory(case):
+async def test_continuation_is_frozen_and_requires_session_factories(case):
     with pytest.raises(FrozenInstanceError):
         case.continuation.target = None
-    with pytest.raises(RuntimeError, match="factories_invalid"):
-        GenericSourceCaptureContinuation(
-            case.continuation.reader_factory,
-            case.continuation.reader_factory,
-            case.continuation.target,
-        )
     with pytest.raises(ValueError, match="unavailable"):
         GenericSourceCaptureContinuation(lambda: object(), case.continuation.writer_factory, case.continuation.target)
 
 
-async def test_reconfigured_factory_is_refused_before_native_io(case):
-    case.continuation.writer_factory.configure(bind=case.continuation.reader_factory.kw["bind"])
-    with artifacts.source_publication_request(
-        case.directory,
-        [{"source_id": case.candidate.source_ids[0]}],
-        True,
-    ):
-        with pytest.raises(RuntimeError, match="capture_factories_changed"):
-            await _CAPTURE(case.continuation, case.directory, case.candidate, artifacts._SOURCE_ONLY.get())
+@pytest.mark.parametrize("head_schema", ["payload_example", "catalog_example"])
+async def test_named_capture_head_uses_catalog_lookup_and_exact_declared_payload(monkeypatch, head_schema):
+    from process import provider_directory_generic_capture_continuation as continuation
+
+    candidate = SimpleNamespace(endpoint_id="endpoint", dataset_id="dataset", acquisition_root_run_id="root")
+    selected = (None, None, None, None, "source", None, SimpleNamespace(schema="payload_example"))
+    head = SimpleNamespace(
+        schema_name=head_schema, source_id="source", endpoint_id="endpoint", dataset_id="dataset", root_run_id="root"
+    )
+    observe = AsyncMock(return_value=head)
+    monkeypatch.setattr(continuation, "read_current_generic_fhir_head", observe)
+    if head_schema == "payload_example":
+        assert await continuation._capture_source_head(object(), "catalog_example", candidate, selected) is head
+    else:
+        with pytest.raises(RuntimeError, match="capture_head_changed"):
+            await continuation._capture_source_head(object(), "catalog_example", candidate, selected)
+    assert observe.await_args.kwargs == {
+        "schema_name": "catalog_example",
+        "source_id": "source",
+        "endpoint_id": "endpoint",
+    }
+
+
+async def test_named_continuation_routes_both_observation_and_capture_through_declared_catalog(case, monkeypatch):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from process import provider_directory_generic_capture_continuation as continuation
+
+    case.factory.storage_binding = SimpleNamespace(catalog_schema="catalog_example")
+    head, captured = object(), object()
+    observe = AsyncMock(return_value=head)
+    capture = AsyncMock(return_value=captured)
+    monkeypatch.setattr(AsyncSession, "execute", AsyncMock())
+    monkeypatch.setattr(continuation, "native_driver", AsyncMock(side_effect=[object(), object()]))
+    monkeypatch.setattr(continuation, "_capture_source_head", observe)
+    monkeypatch.setattr(continuation, "capture_committed_generic_fhir_source", capture)
+    with artifacts.source_publication_request(case.directory, [{"source_id": case.candidate.source_ids[0]}], True):
+        selected = artifacts._SOURCE_ONLY.get()
+        assert await _CAPTURE(case.continuation, case.directory, case.candidate, selected) is captured
+    assert observe.await_args.args[1] == "catalog_example"
+    assert capture.await_args.kwargs["schema_name"] == "catalog_example"
+    assert capture.await_args.kwargs["source_policy"] is case.factory.policy

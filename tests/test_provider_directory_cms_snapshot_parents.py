@@ -3,6 +3,7 @@
 
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -57,7 +58,7 @@ def test_invalid_preparation_or_family_cannot_name_a_future_parent(preparation, 
 
 
 def _readback_binding():
-    return FHIRSourceStorageBinding("catalog", "private_source", 1, 2, 3, 4, 6, "a" * 64)
+    return FHIRSourceStorageBinding("catalog", "private_source")
 
 
 def _parent_inventory(binding, preparation):
@@ -70,7 +71,7 @@ def _parent_inventory(binding, preparation):
                 "oid": oid,
                 "nspname": binding.catalog_schema,
                 "relname": name,
-                "relowner": binding.namespace_owner_oid,
+                "relowner": 6,
                 "relkind": "p",
                 "relpersistence": "p",
                 "native": {
@@ -139,6 +140,7 @@ def _readback_connection(case):
         fetchrow=fetchrow,
         fetch=fetch,
         fetchval=fetchval,
+        execute=AsyncMock(),
     )
 
 
@@ -196,8 +198,11 @@ async def test_readback_returns_exact_inventory_and_calls_fixed_layout_verifiers
     case = readback_case
     case.environment["search_path"] = search_path
     result = await parents.read_cms_snapshot_parents(case.connection, case.binding, case.preparation)
-    assert result == dict(zip(parents.workspace.storage.RELATIONS[-2:], case.inventory, strict=True))
-    assert case.reads == 2 and len(case.layout_calls) == 6
+    assert result == {
+        root: {"schema": "catalog", "name": entry["relname"]}
+        for root, entry in zip(parents.workspace.storage.RELATIONS[-2:], case.inventory, strict=True)
+    }
+    assert case.reads == 1 and len(case.layout_calls) == 6
     for root, entry in result.items():
         calls = [args for _method, args in case.layout_calls if root in args]
         assert len(calls) == 3
@@ -205,7 +210,7 @@ async def test_readback_returns_exact_inventory_and_calls_fixed_layout_verifiers
             args[1] for method, args in case.layout_calls if method == "_require_constraints" and args[3] == root
         )
         assert all(kind != "f" for _name, kind, _definition, _columns in constraints)
-        assert any(name == entry["relname"] + "_pkey" for name, *_rest in constraints)
+        assert any(name == entry["name"] + "_pkey" for name, *_rest in constraints)
 
 
 @pytest.mark.asyncio
@@ -234,9 +239,6 @@ async def test_readback_requires_open_explicit_transaction_before_catalog_io(rea
     [
         ("version", 170000),
         ("search_path", "public,pg_catalog"),
-        ("database_oid", 7),
-        ("schema_oid", 7),
-        ("namespace_owner_oid", 7),
     ],
 )
 async def test_readback_rejects_wrong_environment_or_coordinates(readback_case, field, value):
@@ -248,7 +250,7 @@ async def test_readback_rejects_wrong_environment_or_coordinates(readback_case, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", ["foreign", "dependencies", "partitions", "drift"])
+@pytest.mark.parametrize("field", ["foreign", "dependencies", "partitions"])
 async def test_readback_rejects_foreign_edges_dependencies_defaults_and_drift(readback_case, field):
     case = readback_case
     setattr(case, field, field == "drift")
@@ -257,11 +259,11 @@ async def test_readback_rejects_foreign_edges_dependencies_defaults_and_drift(re
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", ["owner_protected", "acl_closed", "no_policies", "default_storage"])
-async def test_readback_requires_real_owner_and_native_acl_storage_checks(readback_case, field):
+@pytest.mark.parametrize("field", ["no_policies", "default_storage"])
+async def test_readback_requires_supported_native_storage(readback_case, field):
     case = readback_case
     case.extras[100][field] = False
-    with pytest.raises(ValueError, match="parent_custody_changed"):
+    with pytest.raises(ValueError, match="parent_storage_changed"):
         await parents.read_cms_snapshot_parents(case.connection, case.binding, case.preparation)
 
 
@@ -286,22 +288,10 @@ async def test_readback_rejects_nonfixed_native_parent_flags(readback_case, fiel
 
 
 @pytest.mark.asyncio
-async def test_readback_requires_exact_protected_parent_owner(readback_case):
-    case = readback_case
-    case.inventory[0]["relowner"] = case.binding.owner_oid
-    with pytest.raises(ValueError, match="parent_changed"):
-        await parents.read_cms_snapshot_parents(case.connection, case.binding, case.preparation)
-
-
-@pytest.mark.asyncio
-async def test_readback_refuses_descendants_and_index_owner_drift(readback_case):
+async def test_readback_refuses_descendants(readback_case):
     case = readback_case
     case.inventory.append(deepcopy(case.inventory[0]))
     with pytest.raises(ValueError, match="descendants_changed"):
-        await parents.read_cms_snapshot_parents(case.connection, case.binding, case.preparation)
-    case.inventory.pop()
-    case.inventory[0]["native"]["indexes"][0]["class"][1] += 1
-    with pytest.raises(ValueError, match="index_custody_changed"):
         await parents.read_cms_snapshot_parents(case.connection, case.binding, case.preparation)
 
 
@@ -318,7 +308,7 @@ async def test_readback_propagates_fixed_layout_refusal(readback_case, monkeypat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("drift", [None, "index", "grant", "child", "owner"])
+@pytest.mark.parametrize("drift", [None, "index", "column", "child"])
 async def test_native_prep_derived_parent_readback(native_case, drift):
     """Native coordinates/layout only; the fixture issues no Source/profile or creation authority."""
     case, preparation = native_case, str(uuid4())
@@ -337,15 +327,14 @@ async def test_native_prep_derived_parent_readback(native_case, drift):
             )
         observed = await parents.read_cms_snapshot_parents(case.admin, case.storage, preparation)
         assert observed == await parents.read_cms_snapshot_parents(case.admin, case.storage, preparation)
-        assert {entry["relname"] for entry in observed.values()} == set(names_by_root.values())
+        assert {entry["name"] for entry in observed.values()} == set(names_by_root.values())
         if drift is None:
             return
         relation = '"' + case.storage.catalog_schema + '"."' + next(iter(names_by_root.values())) + '"'
         statements_by_drift = {
             "index": f"CREATE INDEX unexpected_parent_idx ON {relation}(dataset_id)",
-            "grant": f'GRANT SELECT ON {relation} TO "{case.roles["source_publisher"]}"',
+            "column": f"ALTER TABLE {relation} ADD COLUMN unsupported integer",
             "child": f"CREATE TABLE \"{case.storage.catalog_schema}\".unexpected_child PARTITION OF {relation} FOR VALUES IN ('other')",
-            "owner": f'ALTER TABLE {relation} OWNER TO "{case.roles["source_publisher"]}"',
         }
         await case.admin.execute(statements_by_drift[drift])
         with pytest.raises(ValueError):

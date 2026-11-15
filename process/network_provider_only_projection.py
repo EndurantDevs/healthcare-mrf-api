@@ -34,13 +34,16 @@ from process.registry_source_contribution_artifacts import (
     verify_anchored_source_fact_contents,
 )
 from process.registry_source_contribution_store import (
+    ALL_FACT_ANCHOR_FIELDS,
     CONTRIBUTION_TABLE,
     FACT_ANCHOR_FIELDS,
+    LEGACY_FACT_ANCHOR_FIELDS,
     copy_fhir_fact_page,
     copy_fhir_source_witness_page_v2,
     create_contribution_stage,
     create_witness_mapping_workspace,
     decode_fhir_source_witness_page_v2,
+    locally_owned_source_descriptor,
     map_fhir_facts,
     map_fhir_source_witnesses_v2,
     recipe_contribution_identity,
@@ -112,7 +115,7 @@ def _native_descriptor(descriptor):
         and descriptor["descriptor_version"] == 2
     ):
         native = validate_source_witness_descriptor_v2(descriptor)
-        return {**native, **dict.fromkeys(FACT_ANCHOR_FIELDS)}
+        return locally_owned_source_descriptor(native)
     return _validated_descriptor(descriptor)
 
 
@@ -492,7 +495,10 @@ def _staged_sources(recipes, stage):
     descriptors_by_identity, recipes_by_identity, recipe_ids = {}, {}, set()
     for descriptor in stage.contribution_receipts:
         native = _native_descriptor(descriptor)
-        _require(FACT_ANCHOR_FIELDS <= descriptor.keys() and native["recipe_sha256"] not in descriptors_by_identity)
+        _require(
+            set(descriptor) & ALL_FACT_ANCHOR_FIELDS in (FACT_ANCHOR_FIELDS, LEGACY_FACT_ANCHOR_FIELDS)
+            and native["recipe_sha256"] not in descriptors_by_identity
+        )
         source_fact_artifact_reference(descriptor)
         descriptors_by_identity[native["recipe_sha256"]] = dict(descriptor)
     for count, recipe in enumerate(recipes, 1):
@@ -589,7 +595,7 @@ async def _verify_staged_provider_only_projection(
 async def _append_typed_staged_sources(connection, expected, recipes, stage, approved, control_schema):
     """Use verified typed cells and retain unchanged legacy child fact projections."""
     matches = stage.office_matches
-    await matches.verify(connection, matches.address_source, matches.runtime_roles, approved, control_schema)
+    matches.require_ready(matches.address_source, approved)
     for mapping in matches.mappings:
         await connection.execute(
             f"INSERT INTO {expected}({COLUMNS}) SELECT {COLUMNS} FROM "

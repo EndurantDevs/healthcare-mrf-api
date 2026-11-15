@@ -61,6 +61,7 @@ class RegistryPTGSourceConsumerConfig:
     operation_seconds: int = 300
     composition_runtime: RegistryPublicationPTGRuntime | None = field(default=None, repr=False)
     seal_candidate: Callable[[MembershipCopyTarget], Awaitable[None]] | None = field(default=None, repr=False)
+    preparation_roles: dict | None = field(default=None, repr=False)
     prepare_address_sources: Callable[..., Awaitable[RegistryCompositionAddressSources]] | None = field(
         default=None, repr=False
     )
@@ -413,7 +414,9 @@ async def _attempt(connection, pool, store, reader_role, identity, event, recipe
         )
         if config.seal_candidate is None:
             await connection.execute(*checkpoint)
-        await publish_network_candidate(connection, copy_target, control_schema=config.control_schema)
+        await publish_network_candidate(
+            connection, copy_target, control_schema=config.control_schema, preparation_roles=config.preparation_roles
+        )
     return {"state": "completed"}
 
 

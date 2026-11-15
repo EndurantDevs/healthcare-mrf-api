@@ -12,7 +12,6 @@ from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
-from api import network_read_execution
 from api import provider_profile_snapshot as snapshot
 from api.endpoint import npi
 from db.connection import current_session
@@ -118,9 +117,7 @@ async def test_cutover_lock_timeout_releases_snapshot(monkeypatch):
             await writer.execute(text(f'LOCK TABLE "{schema}".cms_doctor_education IN ACCESS EXCLUSIVE MODE'))
             with pytest.raises(ServiceUnavailable) as caught:
                 async with snapshot.provider_profile_read_snapshot(database, schema) as session:
-                    await snapshot.execute_network_read(
-                        session, text(f'SELECT medical_school FROM "{schema}".cms_doctor_education')
-                    )
+                    await session.execute(text(f'SELECT medical_school FROM "{schema}".cms_doctor_education'))
                     pytest.fail("A contended family cannot be read")
             assert "cms_doctor_education" not in str(caught.value)
             assert database._transaction_binding() is None and snapshot._SNAPSHOT.get() is None
@@ -128,14 +125,29 @@ async def test_cutover_lock_timeout_releases_snapshot(monkeypatch):
             assert await database.scalar("SELECT 1") == 1
 
 
-async def test_drifted_native_family_cannot_enter_read_scope(monkeypatch):
+async def test_cutover_after_setup_cannot_replace_names_before_first_loader_read(monkeypatch):
+    """Setup pins qualified names and the logical generation; a cutover waits for the loader reads."""
     async with snapshot_database(monkeypatch) as (database, schema):
-        await database.status(f'ALTER TABLE "{schema}".cms_doctor_education RENAME TO abandoned_education')
-        await database.status(f'CREATE TABLE "{schema}".cms_doctor_education (marker text)')
-        await grant_profile_reader(database, schema, ("cms_doctor_education",))
-        with pytest.raises(ServiceUnavailable):
-            async with snapshot.provider_profile_read_snapshot(database, schema):
-                pytest.fail("A drifted native receipt cannot be read")
+        writer_started = asyncio.Event()
+        publication = None
+        try:
+            async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=True) as session:
+                generation = session.info["provider_profile_native_authorities"]["cms-doctors"].local_generation
+                publication = asyncio.create_task(publish_family(database, schema, writer_started))
+                await asyncio.wait_for(writer_started.wait(), 3)
+                await asyncio.sleep(0.3)
+                assert not publication.done()
+                marker = await session.scalar(text(f'SELECT medical_school FROM "{schema}".cms_doctor_education'))
+                assert marker == "old"
+            await asyncio.wait_for(publication, 3)
+        finally:
+            if publication is not None:
+                publication.cancel()
+                await asyncio.gather(publication, return_exceptions=True)
+        async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=True) as session:
+            authority = session.info["provider_profile_native_authorities"]["cms-doctors"]
+            assert authority.local_generation == generation + 1
+            assert await session.scalar(text(f'SELECT medical_school FROM "{schema}".cms_doctor_education')) == "new"
 
 
 async def test_lock_conflict_retries_a_fresh_snapshot_after_real_publication(monkeypatch):
@@ -143,7 +155,7 @@ async def test_lock_conflict_retries_a_fresh_snapshot_after_real_publication(mon
     async with snapshot_database(monkeypatch) as (database, schema):
         entered, release = asyncio.Event(), asyncio.Event()
         sessions = []
-        read_authorities = snapshot._read_native_authorities
+        pin_relations = snapshot.lock_reader_relations
 
         async def publish():
             async with database.session_factory() as writer:
@@ -157,18 +169,27 @@ async def test_lock_conflict_retries_a_fresh_snapshot_after_real_publication(mon
 
         publication = asyncio.create_task(publish())
 
-        async def authority(session, schema_name, relation_oids, **options):
+        async def pin(session, relation_names):
             sessions.append(session)
             try:
-                return await read_authorities(session, schema_name, relation_oids, **options)
-            except snapshot._ReadSQLFailure as error:
-                original = snapshot._read_sql_failure_cause(error, session)
-                assert original is not None and snapshot.postgres_sqlstate(original) == "55P03" and len(sessions) == 1
+                return await pin_relations(session, relation_names)
+            except DBAPIError as error:
+                assert snapshot.postgres_sqlstate(error) == "55P03" and len(sessions) == 1
+                # The failed setup still holds earlier locks; publication proceeds once its transaction ends.
                 release.set()
-                await asyncio.wait_for(publication, 3)
                 raise
 
-        monkeypatch.setattr(snapshot, "_read_native_authorities", authority)
+        connect_reader = database._connect_reader
+
+        async def connect_after_publication():
+            if sessions:
+                # The Reader takes its snapshot at its first statement, so the retry connects only after the
+                # publication released by the first attempt commits; an older snapshot is refused and retried.
+                await asyncio.wait_for(publication, 3)
+            return await connect_reader()
+
+        monkeypatch.setattr(snapshot, "lock_reader_relations", pin)
+        monkeypatch.setattr(database, "_connect_reader", connect_after_publication)
         try:
             await asyncio.wait_for(entered.wait(), 3)
             async with snapshot.provider_profile_read_snapshot(database, schema):
@@ -184,24 +205,39 @@ async def test_lock_conflict_retries_a_fresh_snapshot_after_real_publication(mon
 
 
 async def test_rename_setup_retries_only_a_fresh_owned_snapshot(monkeypatch):
+    """A newly present name during genuine publication requires a fresh complete observation."""
+    from sqlalchemy import MetaData
+
+    from db.models import AddressAliasStateV1
+
     async with snapshot_database(monkeypatch) as (database, schema):
-        read_oids = snapshot._snapshot_relation_oids
-        observed_snapshots = []
+        lock_relations = snapshot.lock_reader_relations
         sessions = []
 
-        async def rotate_after_inventory(session, schema_name, table_names):
-            relation_oids = await read_oids(session, schema_name, table_names)
-            observed_snapshots.append(relation_oids)
+        async def rotate_during_lock(session, relation_names):
+            selected_names = tuple(relation_names)
             sessions.append(session)
-            if len(observed_snapshots) == 1:
-                await publish_family(database, schema)
-            return relation_oids
+            if len(sessions) != 1:
+                return await lock_relations(session, selected_names)
+            first_name = (schema, "address_alias_state_v1")
+            assert selected_names[0] == first_name
+            first_lock_by_name = await lock_relations(session, (first_name,))
+            assert first_lock_by_name[f"{schema}.address_alias_state_v1"] is None
+            await publish_family(database, schema)
+            alias_state = AddressAliasStateV1.__table__.to_metadata(MetaData(), schema=schema)
+            async with database.engine.begin() as connection:
+                await connection.run_sync(alias_state.create)
+            await grant_profile_reader(database, schema, ("address_alias_state_v1",))
+            remaining_locks = await lock_relations(session, selected_names[1:])
+            return {**first_lock_by_name, **remaining_locks}
 
-        monkeypatch.setattr(snapshot, "_snapshot_relation_oids", rotate_after_inventory)
-        async with snapshot.provider_profile_read_snapshot(database, schema):
+        monkeypatch.setattr(snapshot, "lock_reader_relations", rotate_during_lock)
+        async with snapshot.provider_profile_read_snapshot(database, schema) as session:
             assert await database.scalar(f'SELECT medical_school FROM "{schema}".cms_doctor_education') == "new"
+            assert await database.scalar(f'SELECT marker FROM "{schema}".provider_directory_profile') == "new"
+            assert session.info["provider_profile_native_authorities"]["cms-doctors"].local_generation == 2
         assert len(sessions) == 2 and sessions[0] is not sessions[1]
-        assert observed_snapshots[0] != observed_snapshots[1]
+        assert all(not session.in_transaction() for session in sessions)
         assert database._transaction_binding() is None and snapshot._SNAPSHOT.get() is None
 
 
@@ -265,12 +301,12 @@ async def test_optional_status_failure_rolls_back_only_its_savepoint(monkeypatch
     async with snapshot_database(monkeypatch, populated=False) as (database, schema):
         async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=True) as session:
             transaction = session.get_transaction()
-            driver, pid = await snapshot._original_read_driver(session)
-            read_snapshot = await driver.fetchval("SELECT pg_catalog.pg_current_snapshot()::text")
-            inventories = network_read_execution._NAME_INVENTORIES.get()
-            assert inventories and database.has_reader_session() and current_session() is session
-            assert await driver.fetchval(
-                "SELECT current_user=session_user AND current_user::text=$1", database._reader_database._reader_login[0]
+            pid = await session.scalar(text("SELECT pg_backend_pid()"))
+            read_snapshot = await session.scalar(text("SELECT pg_catalog.pg_current_snapshot()::text"))
+            assert database.has_reader_session() and current_session() is session
+            assert await session.scalar(
+                text("SELECT current_user=session_user AND current_user::text=:login"),
+                {"login": database._reader_database._reader_login[0]},
             )
 
             lookup = npi._fetch_location_status_by_record_id(
@@ -289,10 +325,9 @@ async def test_optional_status_failure_rolls_back_only_its_savepoint(monkeypatch
             assert database.has_reader_session() and current_session() is session
             assert session.get_transaction() is transaction and transaction.is_active
             assert session.get_nested_transaction() is None
-            assert await snapshot._original_read_driver(session) == (driver, pid)
-            assert network_read_execution._NAME_INVENTORIES.get() is inventories
-            assert await driver.fetchval("SELECT pg_catalog.pg_current_snapshot()::text") == read_snapshot
-            assert (await snapshot.execute_network_read(session, "SELECT 1")).scalar_one() == 1
+            assert await session.scalar(text("SELECT pg_backend_pid()")) == pid
+            assert await session.scalar(text("SELECT pg_catalog.pg_current_snapshot()::text")) == read_snapshot
+            assert (await session.execute(text("SELECT 1"))).scalar_one() == 1
 
 
 def _detail_loaders(database, schema):
@@ -423,7 +458,7 @@ async def test_directory_partition_snapshot_reads_native_models(monkeypatch, pop
         await create_directory_partitions(database, schema, populated=populated, partition_kind=partition_kind)
         async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=True) as session:
             for name in sorted(snapshot._DIRECTORY_PARTITION_ROOTS):
-                result = await snapshot.execute_network_read(session, text(f'SELECT count(*) FROM "{schema}"."{name}"'))
+                result = await session.execute(text(f'SELECT count(*) FROM "{schema}"."{name}"'))
                 assert result.scalar() == int(populated)
                 assert snapshot.snapshot_relation_available(f"{schema}.{name}") is True
             assert await session.scalar(text("SHOW transaction_read_only")) == "on"
@@ -462,15 +497,39 @@ async def test_directory_partition_snapshot_blocks_leaf_detach(monkeypatch):
         root = f'"{schema}".provider_directory_dataset_resource'
         detach = text(f'ALTER TABLE {root} DETACH PARTITION "{schema}".provider_directory_dataset_resource_leaf')
         async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=True) as session:
-            assert (await snapshot.execute_network_read(session, text(f"SELECT count(*) FROM {root}"))).scalar() == 1
+            assert (await session.execute(text(f"SELECT count(*) FROM {root}"))).scalar() == 1
             with pytest.raises(DBAPIError) as caught:
                 async with database.engine.begin() as writer:
                     await writer.execute(text("SET LOCAL lock_timeout='50ms'"))
                     await writer.execute(detach)
             assert snapshot.postgres_sqlstate(caught.value) == "55P03"
-            assert (await snapshot.execute_network_read(session, text(f"SELECT count(*) FROM {root}"))).scalar() == 1
+            assert (await session.execute(text(f"SELECT count(*) FROM {root}"))).scalar() == 1
         async with database.engine.begin() as writer:
             await writer.execute(text("SET LOCAL lock_timeout='250ms'"))
             await writer.execute(detach)
         async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=True) as session:
-            assert (await snapshot.execute_network_read(session, text(f"SELECT count(*) FROM {root}"))).scalar() == 0
+            assert (await session.execute(text(f"SELECT count(*) FROM {root}"))).scalar() == 0
+
+
+async def test_profile_reader_grants_cover_common_geo_metadata_without_write_permissions(monkeypatch):
+    from tests.provider_profile_snapshot_postgres_support import READ_TABLES
+    from tests.ptg2_serving_address_evidence_postgres_support import _create_geo_assurance_state_table
+
+    async with snapshot_database(monkeypatch, populated=False) as (database, schema):
+        await _create_geo_assurance_state_table(database, schema)
+        await grant_profile_reader(database, schema, READ_TABLES)
+        qualified = f'"{schema}"."entity_address_geo_assurance_state"'
+        async with snapshot.provider_profile_read_snapshot(database, schema) as session:
+            assert snapshot.snapshot_relation_available(f"{schema}.entity_address_geo_assurance_state") is True
+            assert await session.scalar(text(f"SELECT count(*) FROM {qualified}")) == 1
+            assert await session.scalar(text("SHOW transaction_read_only")) == "on"
+            assert await session.scalar(text("SHOW transaction_isolation")) == "repeatable read"
+            for privilege in ("INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"):
+                assert (
+                    await session.scalar(
+                        text("SELECT has_table_privilege(current_user,:relation,:privilege)"),
+                        {"relation": qualified, "privilege": privilege},
+                    )
+                    is False
+                )
+        assert not session.in_transaction() and snapshot._SNAPSHOT.get() is None

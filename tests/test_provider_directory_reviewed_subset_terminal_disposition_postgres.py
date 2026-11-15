@@ -354,7 +354,7 @@ async def test_terminal_disposition_lifecycle_tamper_idempotence_and_fence(
     monkeypatch,
 ):
     """Exercise swapped-marker rejection, sealing, replay, and handoff."""
-    scenario = await create_committed_subset_schema(monkeypatch)
+    scenario = await create_committed_subset_schema(monkeypatch, owned_database=True)
     migration = _load_migration()
     scope_binding_migration = _load_scope_binding_migration()
     writer_scope = AsyncExitStack()
@@ -414,7 +414,7 @@ async def test_terminal_disposition_lifecycle_tamper_idempotence_and_fence(
 @pytest.mark.asyncio
 async def test_expired_cursor_v1_remains_valid_and_downgradable(monkeypatch):
     """Keep the predecessor v1 seal valid before and after clean downgrade."""
-    scenario = await create_committed_subset_schema(monkeypatch)
+    scenario = await create_committed_subset_schema(monkeypatch, owned_database=True)
     migration = _load_migration()
     scope_binding_migration = _load_scope_binding_migration()
     writer_scope = AsyncExitStack()

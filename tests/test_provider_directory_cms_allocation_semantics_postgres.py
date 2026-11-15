@@ -331,6 +331,19 @@ async def _settings(connection):
     )
 
 
+async def _read_lock_names(connection, schema):
+    """Observe native locks only in the test; names are the production interface."""
+    return set(
+        await connection.fetchval(
+            "SELECT COALESCE(array_agg(c.relname ORDER BY c.relname),ARRAY[]::name[]) "
+            "FROM pg_locks l JOIN pg_class c ON c.oid=l.relation JOIN pg_namespace n ON n.oid=c.relnamespace "
+            "WHERE l.pid=pg_backend_pid() AND l.granted AND l.mode='AccessShareLock' "
+            "AND c.relkind IN ('r','p') AND n.nspname=$1",
+            schema,
+        )
+    )
+
+
 async def _pin_inputs(catalog, publisher, dataset):
     from process.provider_directory_cms_prepared_allocation import _inventory
 
@@ -349,13 +362,14 @@ async def test_actual_parent_read_pin_preserves_scope_caps_and_disjoint_allocati
         await _insert(catalog, "synthetic-pin-first")
         await _insert(catalog, "synthetic-pin-second")
         observed_settings = []
-        original_locks = pin._locks
+        original_settings = pin._bounded_settings
 
-        async def observe_locks(connection, schema):
+        async def observe_settings(connection):
+            original = await original_settings(connection)
             observed_settings.append(await _settings(connection))
-            return await original_locks(connection, schema)
+            return original
 
-        monkeypatch.setattr(pin, "_locks", observe_locks)
+        monkeypatch.setattr(pin, "_bounded_settings", observe_settings)
         async with publisher.transaction():
             await publisher.execute("SET LOCAL plan_cache_mode=force_generic_plan")
             workspace, inventory = await _pin_inputs(catalog, publisher, "synthetic-pin-first")
@@ -367,16 +381,16 @@ async def test_actual_parent_read_pin_preserves_scope_caps_and_disjoint_allocati
                     assert await _settings(publisher) == settings
             await _insert(catalog, "synthetic-pin-third")
             await pin.pin_cms_allocation_targets(workspace, inventory)
-            expected_oids = {entry["oid"] for entry in inventory}
-            assert await original_locks(publisher, catalog.schema_name) == expected_oids
+            expected_names = {entry["name"] for entry in inventory}
+            assert await _read_lock_names(publisher, catalog.schema_name) == expected_names
             assert observed_settings and all(setting["statement_timeout"] == "1s" for setting in observed_settings)
             assert {setting["lock_timeout"] for setting in observed_settings} == {"250ms", "50ms"}
-            selected = next(entry for entry in inventory if entry["relname"] not in TABLES[:4])
+            selected = next(entry for entry in inventory if entry["name"] not in TABLES[:4])
             with pytest.raises(asyncpg.LockNotAvailableError):
                 async with catalog.connection.transaction():
                     await catalog.connection.execute(
                         "LOCK TABLE ONLY "
-                        + storage_relation(catalog.schema_name, selected["relname"])
+                        + storage_relation(catalog.schema_name, selected["name"])
                         + " IN ACCESS EXCLUSIVE MODE NOWAIT"
                     )
             assert await publisher.fetchval("SELECT session_user=current_user") is True
@@ -394,13 +408,13 @@ async def test_actual_pin_scope_failure_rolls_back_only_inner_locks_and_settings
             await publisher.fetchval(f"SELECT count(*) FROM {catalog.schema}.provider_directory_endpoint_dataset")
             await publisher.execute("SET LOCAL statement_timeout='0';SET LOCAL lock_timeout='0'")
             outer_locks, original_settings = (
-                await pin._locks(publisher, catalog.schema_name),
+                await _read_lock_names(publisher, catalog.schema_name),
                 await _settings(publisher),
             )
             workspace, inventory = await _pin_inputs(catalog, publisher, "synthetic-pin-expected")
             workspace.identity["dataset_id"] = "synthetic-pin-wrong"
             with pytest.raises(ValueError, match="scope_changed"):
                 await pin.pin_cms_allocation_targets(workspace, inventory)
-            assert await pin._locks(publisher, catalog.schema_name) == outer_locks
+            assert await _read_lock_names(publisher, catalog.schema_name) == outer_locks
             assert await _settings(publisher) == original_settings
             assert await publisher.fetchval("SELECT 1") == 1

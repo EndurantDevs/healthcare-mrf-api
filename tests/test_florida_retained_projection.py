@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from process import entity_address_snapshot_preparation as preparation
 from process import florida_projection_archive as archive
+from process import florida_projection_named_source as named
 
 
 def _rows(values):
@@ -114,71 +114,49 @@ async def test_retained_authority_refuses_missing_mixed_or_replaced_heaps(monkey
 
 
 @pytest.mark.parametrize("bootstrap", [False, True])
-async def test_publication_preserves_read_access_before_atomic_alias_cutover(monkeypatch, bootstrap):
-    expected_by_name = {"current_run_id": None if bootstrap else "a" * 32, "current_relation_oid": 20}
-    seal_by_name = {"table_name": "candidate", "relation_oid": 30}
-    session = SimpleNamespace(scalar=AsyncMock(side_effect=[40, False, False]), execute=AsyncMock())
-    monkeypatch.setattr(archive.native, "protected_publisher_owner", AsyncMock(return_value=40))
-    monkeypatch.setattr(archive, "_publication_lock", AsyncMock())
-    monkeypatch.setattr(archive, "publication_pointer", AsyncMock(return_value=expected_by_name))
-    monkeypatch.setattr(archive.native, "_lock_family", AsyncMock())
-    monkeypatch.setattr(archive.native, "_relation_oid", AsyncMock(side_effect=[30, None, 50]))
+async def test_retained_publication_reuses_named_atomic_cutover_without_rewriting_legacy_inputs(monkeypatch, bootstrap):
+    from copy import deepcopy
 
-    async def preserve(*_args):
-        session.execute.assert_not_awaited()
-
-    access = AsyncMock(side_effect=preserve)
-    monkeypatch.setattr(archive, "_preserve_retained_read_access", access)
-    sealed = AsyncMock()
-    monkeypatch.setattr(preparation, "_seal_published_relation", sealed)
-    assert await archive.publish_retained_projection(
-        session, "fixture", seal_by_name, expected_by_name, "b" * 32, 40
-    ) == {
-        "run_id": "b" * 32,
-        "relation_oid": 30,
-    }
-    access.assert_awaited_once_with(session, "fixture", "candidate", 20, 40)
-    sealed.assert_awaited_once_with(session, 50, 40)
-    statements = [str(call.args[0]) for call in session.execute.await_args_list]
-    first = (
-        'DROP TABLE "fixture"."provider_profile_projection" RESTRICT'
-        if bootstrap
-        else ('ALTER TABLE "fixture"."provider_profile_projection" RENAME TO "provider_profile_projection_retained_20"')
-    )
-    assert statements[:2] == [first, 'ALTER TABLE "fixture"."candidate" RENAME TO "provider_profile_projection"']
-    assert session.execute.await_args.args[1] == {
-        "source": archive.FL_MQA_SOURCE_KEY,
-        "run": "b" * 32,
-        "previous": expected_by_name["current_run_id"],
-    }
-
-
-@pytest.mark.parametrize("fault", ["publisher", "predecessor", "candidate", "owner", "dependent", "alias", "bootstrap"])
-async def test_publication_refuses_drift_before_any_table_mutation(monkeypatch, fault):
-    expected_by_name = {"current_run_id": None if fault == "bootstrap" else "a" * 32, "current_relation_oid": 20}
-    session = SimpleNamespace(
-        scalar=AsyncMock(side_effect=[41 if fault == "owner" else 40, fault == "dependent", fault == "bootstrap"]),
-        execute=AsyncMock(),
-    )
-    monkeypatch.setattr(
-        archive.native, "protected_publisher_owner", AsyncMock(return_value=41 if fault == "publisher" else 40)
-    )
-    monkeypatch.setattr(archive, "_publication_lock", AsyncMock())
-    monkeypatch.setattr(
-        archive, "publication_pointer", AsyncMock(return_value={} if fault == "predecessor" else expected_by_name)
-    )
-    monkeypatch.setattr(archive.native, "_lock_family", AsyncMock())
-    monkeypatch.setattr(
-        archive.native,
-        "_relation_oid",
-        AsyncMock(side_effect=[31 if fault == "candidate" else 30, 21 if fault == "alias" else None]),
-    )
-    monkeypatch.setattr(archive, "_preserve_retained_read_access", AsyncMock())
-    monkeypatch.setattr(preparation, "_seal_published_relation", AsyncMock())
-    with pytest.raises(archive.FloridaProjectionArchiveError):
+    expected_by_field = {"current_run_id": None if bootstrap else "a" * 32, "current_relation_oid": 20}
+    seal_by_field = {"table_name": "candidate", "relation_oid": 30, "owner_oid": 40}
+    original = deepcopy((seal_by_field, expected_by_field))
+    session = object()
+    result_by_field = {"run_id": "b" * 32, "relation": {"schema": "fixture", "table_name": archive.PROJECTION}}
+    publish = AsyncMock(return_value=result_by_field)
+    monkeypatch.setattr(named, "publish_named_source_projection", publish)
+    assert (
         await archive.publish_retained_projection(
-            session, "fixture", {"table_name": "candidate", "relation_oid": 30}, expected_by_name, "b" * 32, 40
+            session, "fixture", seal_by_field, expected_by_field, "b" * 32, object()
         )
+        == result_by_field
+    )
+    publish.assert_awaited_once_with(
+        session, "fixture", {"schema": "fixture", "table_name": "candidate"}, expected_by_field, "b" * 32
+    )
+    assert (seal_by_field, expected_by_field) == original
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        archive.FloridaProjectionArchiveError("Florida retained predecessor changed"),
+        PermissionError("native publication denied"),
+    ],
+)
+async def test_retained_publication_preserves_named_cas_and_native_permission_failures(monkeypatch, failure):
+    publish = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(named, "publish_named_source_projection", publish)
+    session = SimpleNamespace(execute=AsyncMock())
+    with pytest.raises(type(failure), match=str(failure)) as caught:
+        await archive.publish_retained_projection(
+            session,
+            "fixture",
+            {"table_name": "candidate", "relation_oid": 30},
+            {"current_run_id": "a" * 32, "current_relation_oid": 20},
+            "b" * 32,
+            40,
+        )
+    assert caught.value is failure
     session.execute.assert_not_awaited()
 
 
@@ -232,31 +210,15 @@ async def test_retained_access_uses_observed_owner_and_actual_read_grants(monkey
     apply.assert_awaited_once_with(session, "fixture", "candidate", grants, 20, 40)
 
 
-@pytest.mark.parametrize("replaced", [False, True])
-async def test_capture_seals_the_same_heap_before_reapplying_read_access(monkeypatch, replaced):
-    events = []
+@pytest.mark.parametrize("old_token", [20, 21])
+async def test_retained_capture_uses_named_freeze_and_preserves_opaque_old_metadata(monkeypatch, old_token):
+    serving_by_field = {"table_name": archive.PROJECTION, "relation_oid": old_token}
+    freeze = AsyncMock(return_value={"schema": "fixture", "table_name": archive.PROJECTION})
+    monkeypatch.setattr(named, "freeze_existing_source_projection", freeze)
     session = object()
-    monkeypatch.setattr(archive.native, "_lock_family", AsyncMock())
-    monkeypatch.setattr(archive.native, "_relation_oid", AsyncMock(return_value=21 if replaced else 20))
-    monkeypatch.setattr(archive, "_live_projection_security", AsyncMock(return_value={"relowner": 10}))
-    grants = [{"grantee": 30, "rolname": "reader", "is_grantable": False}]
-    monkeypatch.setattr(archive, "_retained_read_grants", AsyncMock(return_value=grants))
-
-    async def seal(*_args):
-        events.append("seal")
-
-    async def grant(*_args):
-        events.append("grant")
-
-    monkeypatch.setattr(preparation, "_seal_published_relation", seal)
-    apply = AsyncMock(side_effect=grant)
-    monkeypatch.setattr(archive, "_apply_retained_read_grants", apply)
-    serving_by_name = {"table_name": archive.PROJECTION, "relation_oid": 20}
-    if replaced:
-        with pytest.raises(archive.FloridaProjectionArchiveError, match="serving heap changed"):
-            await archive.seal_retained_projection(session, "fixture", serving_by_name, 40)
-        assert events == []
-    else:
-        await archive.seal_retained_projection(session, "fixture", serving_by_name, 40)
-        assert events == ["seal", "grant"]
-        apply.assert_awaited_once_with(session, "fixture", archive.PROJECTION, grants, 10, 40)
+    assert await archive.seal_retained_projection(session, "fixture", serving_by_field, object()) == {
+        "schema": "fixture",
+        "table_name": archive.PROJECTION,
+    }
+    freeze.assert_awaited_once_with(session, "fixture", archive.PROJECTION)
+    assert serving_by_field == {"table_name": archive.PROJECTION, "relation_oid": old_token}

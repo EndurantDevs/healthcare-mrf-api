@@ -97,8 +97,15 @@ def _create_profile_table(connection, schema):
         _migration("20260730110000")._create_delta_receipt_table(schema)
 
 
+async def _install_named_serving_fixture(connection, *, native_revision_installed=False):
+    for prefix in ("20261016030000", "20261114180000", "20260930120000", "20261019130000", "20261114190000"):
+        if native_revision_installed and prefix == "20260930120000":
+            continue
+        await connection.run_sync(lambda sync: _apply(sync, prefix))
+
+
 @asynccontextmanager
-async def _database(monkeypatch, *, install_receipt=True, install_source_guard=True):
+async def _database(monkeypatch, *, install_receipt=True, install_source_guard=True, named=True):
     """Confine real guard SQL to a UUID schema in the existing UUID-owned database guard."""
     schema = "cms_receipt_" + uuid4().hex
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
@@ -110,13 +117,18 @@ async def _database(monkeypatch, *, install_receipt=True, install_source_guard=T
             await _create_scalar_tables(connection, schema)
             await connection.run_sync(lambda sync: _create_profile_table(sync, schema))
             await _create_native_tables(connection, schema)
-            if install_source_guard:
+            if install_receipt and (install_source_guard or named):
+                # Keep the migration order: the receipt functions predate the named generation columns.
+                await connection.run_sync(lambda sync: _apply(sync, "20260929040000"))
+            elif install_source_guard:
                 await install_source_generation_guards(connection, schema)
             if install_receipt:
                 await connection.run_sync(lambda sync: _apply(sync, "20260930100000"))
                 await connection.run_sync(
                     lambda sync: sync.exec_driver_sql(_migration("20261019130000")._repair_sql(schema))
                 )
+                if named:
+                    await _install_named_serving_fixture(connection)
         yield engine, schema
     finally:
         async with engine.begin() as connection:
@@ -176,7 +188,7 @@ async def _ledger_row(connection, schema, importer):
 
 @pytest.mark.asyncio
 async def test_source_guard_migration_flushes_legacy_mrf_and_keeps_cms_deferred(monkeypatch):
-    async with _database(monkeypatch, install_source_guard=False) as (engine, schema):
+    async with _database(monkeypatch, install_source_guard=False, named=False) as (engine, schema):
         initial = await _publish_initial(engine, schema)
         async with engine.begin() as connection:
             before_by_field = await _seed_legacy_mrf(connection, schema)
@@ -200,7 +212,7 @@ async def test_source_guard_migration_flushes_legacy_mrf_and_keeps_cms_deferred(
 
 @pytest.mark.asyncio
 async def test_source_guard_migration_rejects_queued_invalid_cms_and_rolls_back(monkeypatch):
-    async with _database(monkeypatch, install_source_guard=False) as (engine, schema):
+    async with _database(monkeypatch, install_source_guard=False, named=False) as (engine, schema):
         initial = await _publish_initial(engine, schema)
         async with engine.begin() as connection:
             before_by_field = await _seed_legacy_mrf(connection, schema)
@@ -302,11 +314,21 @@ async def _advance_native(connection, schema, *, doctors=False):
     names = list(
         _migration("20260930100000")._DOCTOR_RELATIONS if doctors else _migration("20260930100000")._ADDRESS_RELATIONS
     )
+    named = doctors and await connection.scalar(
+        text(
+            "SELECT EXISTS(SELECT FROM information_schema.columns WHERE table_schema=:schema AND table_name='reference_family_result_generation' AND column_name='serving_schema')"
+        ),
+        dict(schema=schema),
+    )
+    target = (
+        "serving_schema=:schema,serving_relation_names=CAST(:names AS text[])"
+        if named
+        else "relation_oids=ARRAY(SELECT to_regclass(:schema||'.'||name)::oid::bigint FROM unnest(CAST(:names AS text[])) name)"
+    )
     await connection.execute(
         text(f"""UPDATE {schema}.{table} SET local_generation=local_generation+1,
         origin_lineage_id=local_lineage_id,origin_generation=local_generation+1,published_at=clock_timestamp(),
-        relation_oids=ARRAY(SELECT to_regclass(:schema||'.'||name)::oid::bigint FROM unnest(CAST(:names AS text[])) name)
-        WHERE {predicate}"""),
+        {target} WHERE {predicate}"""),
         {"schema": schema, "names": names},
     )
 
@@ -331,29 +353,44 @@ async def _publish_initial(engine, schema):
         await _advance_native(connection, schema, doctors=True)
         await _advance_native(connection, schema)
         payload = await _payload(connection, schema)
-        receipt_id = await receipts.append_serving_receipt(connection, schema, payload)
+        receipt_id = await _append_fixture_receipt(connection, schema, payload)
         assert not await receipts.verify_historical_receipt(connection, schema, receipt_id, payload)
     return {"receipt_id": receipt_id, "payload": payload}
 
 
+async def _append_fixture_receipt(connection, schema, payload):
+    if "overlay" in payload:
+        return await receipts.append_serving_receipt(connection, schema, payload)
+    # Frozen migration cases exercise their original database guard, not current writer compatibility.
+    return await connection.scalar(
+        text(f"""INSERT INTO {schema}.provider_directory_cms_serving_receipt(receipt_id,payload)
+        SELECT encode(sha256(convert_to(p::text,'UTF8')),'hex'),p FROM (SELECT CAST(:payload AS jsonb) p) document
+        RETURNING receipt_id"""),
+        dict(payload=json.dumps(payload)),
+    )
+
+
 async def _install_archive(engine, schema):
-    """Use the real mutation ledger and ALWAYS triggers around a minimal canonical heap."""
+    """Use the actual named ledger and existing ALWAYS statement guard on a canonical heap."""
     async with engine.begin() as connection:
-        await connection.run_sync(lambda sync: _apply(sync, "20260930120000"))
+        if not await connection.scalar(text(f"SELECT to_regclass('{schema}.cms_native_input_revision') IS NOT NULL")):
+            await connection.run_sync(lambda sync: _apply(sync, "20260930120000"))
+            from tests.cms_named_revision_postgres_support import upgrade_named_native_counter
+
+            await upgrade_named_native_counter(connection, schema)
         await connection.execute(
             text(f"CREATE TABLE {schema}.address_archive_v2 (address_key int PRIMARY KEY, marker text)")
         )
-        oid = await connection.scalar(text(f"SELECT to_regclass('{schema}.address_archive_v2')::oid::bigint"))
-        await native_inputs._register_relation(connection, schema, schema, "address_archive_v2", oid)
-        await _upgrade_archive_counter(connection, schema)
-    return {
-        "target_oid": oid,
-        "from_revision": 0,
-        "to_revision": 2,
-        "native_input_hash": "a" * 64,
-        "delta_rows": 1,
-        "delta_sha256": "b" * 64,
-    }
+        await native_inputs._register_relation(connection, schema, schema, "address_archive_v2")
+    return dict(
+        target_schema=schema,
+        target_table="address_archive_v2",
+        from_revision=0,
+        to_revision=2,
+        native_input_hash="a" * 64,
+        delta_rows=1,
+        delta_sha256="b" * 64,
+    )
 
 
 async def _counter_migration_snapshot(connection, schema):
@@ -402,7 +439,7 @@ async def _merge_archive(connection, schema):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("publication_case", ["current", "prior", "missing", "oid", "revision"])
+@pytest.mark.parametrize("publication_case", ["current", "prior", "missing", "name", "revision"])
 async def test_new_archive_receipt_requires_the_owner_transaction(monkeypatch, publication_case):
     async with _database(monkeypatch) as (engine, schema):
         initial = await _publish_initial(engine, schema)
@@ -410,8 +447,8 @@ async def test_new_archive_receipt_requires_the_owner_transaction(monkeypatch, p
         if publication_case == "prior":
             async with engine.begin() as connection:
                 await _merge_archive(connection, schema)
-        if publication_case == "oid":
-            proof["target_oid"] += 1
+        if publication_case == "name":
+            proof["target_schema"] = "other_schema"
         if publication_case == "revision":
             proof.update(from_revision=2, to_revision=4)
 
@@ -582,7 +619,7 @@ def _tamper(payload, kind):
         payload["expected_incumbent"] = {**_PIN, "dataset_hash": "d" * 64}
         return
     if kind == "overlay":
-        payload["overlay_oid"] += 1
+        payload["overlay"] = {**payload["overlay"], "relation_name": "other_overlay"}
         return
     target_by_kind = {
         "coverage": ("cms", "release_id", "d" * 64),
@@ -629,8 +666,7 @@ async def test_generation_zero_doctors_and_changed_dependency_snapshot_fail_clos
         initial = await _publish_initial(engine, schema)
         async with engine.begin() as connection:
             expected_by_field = {
-                key: initial["payload"][key]
-                for key in ("profile", "address", "doctors", "alias_generation", "overlay_oid")
+                key: initial["payload"][key] for key in ("profile", "address", "doctors", "alias_generation", "overlay")
             }
             await receipts.assert_native_dependencies(connection, schema, expected_by_field)
             expected_by_field["alias_generation"] += 1
@@ -749,8 +785,8 @@ async def test_initial_source_alias_cannot_adopt_current_dataset_without_receipt
 
 
 @pytest.mark.asyncio
-async def test_serving_receipt_rejects_replaced_overlay_relation(monkeypatch):
-    """Stable ledger scalars cannot conceal a replaced physical overlay from an accepted read."""
+async def test_serving_receipt_accepts_identical_overlay_copy_under_its_declared_name(monkeypatch):
+    """An identical published copy keeps its QName and immutable logical generation."""
     async with _database(monkeypatch) as (engine, schema):
         initial = await _publish_initial(engine, schema)
         async with engine.begin() as connection:
@@ -759,6 +795,11 @@ async def test_serving_receipt_rejects_replaced_overlay_relation(monkeypatch):
                 text(f"ALTER TABLE {schema}.provider_directory_address_overlay RENAME TO old_overlay")
             )
             await connection.execute(
-                text(f"CREATE TABLE {schema}.provider_directory_address_overlay (synthetic_id int)")
+                text(
+                    f"CREATE TABLE {schema}.provider_directory_address_overlay (LIKE {schema}.old_overlay INCLUDING ALL)"
+                )
             )
-            assert await receipts.read_serving_receipt(connection, schema) is None
+            await connection.execute(
+                text(f"INSERT INTO {schema}.provider_directory_address_overlay SELECT * FROM {schema}.old_overlay")
+            )
+            assert await receipts.read_serving_receipt(connection, schema) == initial

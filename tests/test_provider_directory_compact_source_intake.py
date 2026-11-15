@@ -50,19 +50,27 @@ async def test_compact_prepare_resumes_only_its_persisted_explicit_format(harnes
         assert binding["contract"] == storage.NAMED_COMPACT_CONTRACT
         assert binding["payload_format"] == compact.FORMAT
         assert set(binding["tables"]) == set(storage._COMPACT_SUFFIXES)
-        assert all(set(table) == {"name"} for table in binding["tables"].values())
+        assert all(
+            set(table) == {"schema", "name"} and table["schema"] == binding["storage"]["storage_schema"]
+            for table in binding["tables"].values()
+        )
         before = data_sql(harness)
         assert await prepare(harness, database) == binding
         assert await prepare(harness, database, payload_format=compact.FORMAT) == binding
-        assert data_sql(harness) == before
+        replay_statements = data_sql(harness)
+        assert replay_statements[: len(before)] == before
+        expected_reads = [
+            f'SELECT 1 FROM "{table["schema"]}"."{table["name"]}" LIMIT 0' for table in binding["tables"].values()
+        ]
+        assert sorted(replay_statements[len(before) :]) == sorted(expected_reads * 2)
         with pytest.raises(ValueError, match="payload_format_changed"):
             await prepare(harness, database, payload_format="different")
         with pytest.raises(ValueError, match="original_storage_publisher_required"):
             await completion.prepare_generic_source_handoff(None, binding)
-        assert harness.header["candidate_storage_json"] == binding and data_sql(harness) == before
+        assert harness.header["candidate_storage_json"] == binding and data_sql(harness) == replay_statements
     capture.assert_not_awaited()
     assert any(statement.startswith("CREATE VIEW") for statement in harness.sql)
-    assert set(binding["storage"]) == {"catalog_schema", "storage_schema", "producer"}
+    assert set(binding["storage"]) == {"catalog_schema", "storage_schema"}
 
 
 @pytest.mark.asyncio
@@ -113,7 +121,7 @@ async def test_compact_binding_and_witnesses_are_closed_before_copy(harness, mon
         assert all(
             statement.startswith("SELECT pg_advisory_xact_lock") for statement in data_sql(harness)[len(writes) :]
         )
-        for damage in ("payload_format", "physical", "extra", "missing"):
+        for damage in ("payload_format", "physical", "extra", "missing", "wrong-schema", "unknown-field"):
             malformed = damaged_binding(binding, damage)
             with pytest.raises(ValueError):
                 storage._validate_binding(malformed, binding["identity"], phases=("loading",))
@@ -124,11 +132,15 @@ def damaged_binding(binding, damage):
     malformed = deepcopy(binding)
     if damage == "payload_format":
         malformed["payload_format"] = "different"
-    elif damage == "physical":
+    if damage == "physical":
         malformed["tables"]["resource_aliases"]["oid"] = 1
-    elif damage == "extra":
+    if damage == "extra":
         malformed["tables"]["unexpected"] = {"name": "extra"}
-    else:
+    if damage == "wrong-schema":
+        malformed["tables"]["resource_aliases"]["schema"] = "other_schema"
+    if damage == "unknown-field":
+        malformed["tables"]["resource_aliases"]["unexpected"] = "value"
+    if damage == "missing":
         malformed["tables"].pop("resource_body_blocks")
     return malformed
 

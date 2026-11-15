@@ -46,18 +46,24 @@ async def test_profile_preflight_empty_window_edges(monkeypatch):
         "_provider_directory_profile_capacity_admission",
         lambda: None,
     )
-    assert await importer._preflight_profile_evidence_window_capacity(
-        build,
-        [],
-        {},
-    ) == {}
-    assert await importer._preflight_profile_compact_window_capacity(
-        build,
-        [],
-        profile_count_sql=Mock(),
-        profile_sql_args_by_name={},
-        profile_params_by_name={},
-    ) == {}
+    assert (
+        await importer._preflight_profile_evidence_window_capacity(
+            build,
+            [],
+            {},
+        )
+        == {}
+    )
+    assert (
+        await importer._preflight_profile_compact_window_capacity(
+            build,
+            [],
+            profile_count_sql=Mock(),
+            profile_sql_args_by_name={},
+            profile_params_by_name={},
+        )
+        == {}
+    )
 
 
 @pytest.mark.asyncio
@@ -75,9 +81,7 @@ async def test_profile_preflight_evidence_window_edges(monkeypatch):
             [
                 (
                     0,
-                    importer._ProviderDirectoryProfileEvidenceBatch(
-                        kind="copy"
-                    ),
+                    importer._ProviderDirectoryProfileEvidenceBatch(kind="copy"),
                 )
             ],
             {},
@@ -101,9 +105,7 @@ async def test_profile_preflight_evidence_window_edges(monkeypatch):
             [
                 (
                     0,
-                    importer._ProviderDirectoryProfileEvidenceBatch(
-                        kind="fact"
-                    ),
+                    importer._ProviderDirectoryProfileEvidenceBatch(kind="fact"),
                 )
             ],
             {},
@@ -166,10 +168,13 @@ def test_replay_timestamp_edges():
         30,
         tzinfo=datetime.timezone.utc,
     )
-    assert importer._provider_directory_profile_replay_timestamp(
-        aware,
-        "created_at",
-    ) == aware
+    assert (
+        importer._provider_directory_profile_replay_timestamp(
+            aware,
+            "created_at",
+        )
+        == aware
+    )
 
 
 def test_replay_count_edges():
@@ -192,16 +197,19 @@ def test_replay_count_edges():
                 "profile_deleted": 0,
             }
         )
-    assert importer._provider_directory_profile_replay_counts(
-        {
-            "evidence_rows": 1,
-            "profile_rows": 1,
-            "evidence_inserted": 1,
-            "evidence_deleted": 0,
-            "profile_inserted": 1,
-            "profile_deleted": 0,
-        }
-    )["profile_rows"] == 1
+    assert (
+        importer._provider_directory_profile_replay_counts(
+            {
+                "evidence_rows": 1,
+                "profile_rows": 1,
+                "evidence_inserted": 1,
+                "evidence_deleted": 0,
+                "profile_inserted": 1,
+                "profile_deleted": 0,
+            }
+        )["profile_rows"]
+        == 1
+    )
 
 
 def test_replay_geometry_edges():
@@ -257,10 +265,13 @@ async def test_replay_consumption_lookup_edges(monkeypatch):
     ):
         await importer._replay_current_consumption("consumption", run_id)
     monkeypatch.setattr(importer.db, "all", AsyncMock(return_value=[]))
-    assert await importer._replay_current_consumption(
-        "consumption",
-        run_id,
-    ) is None
+    assert (
+        await importer._replay_current_consumption(
+            "consumption",
+            run_id,
+        )
+        is None
+    )
 
     with pytest.raises(
         importer.ProviderDirectoryArtifactBuildStale,
@@ -299,6 +310,7 @@ async def test_replay_owner_edges(monkeypatch):
         )
     await importer._assert_replay_owner("mrf", run_id, run_id)
 
+
 @pytest.mark.asyncio
 async def test_replay_receipt_resolution_edges(monkeypatch):
     execution = _execution()
@@ -307,11 +319,14 @@ async def test_replay_receipt_resolution_edges(monkeypatch):
         "_provider_directory_profile_committed_receipt",
         AsyncMock(return_value=None),
     )
-    assert await importer._replay_exact_receipt(
-        "mrf",
-        execution,
-        None,
-    ) is None
+    assert (
+        await importer._replay_exact_receipt(
+            "mrf",
+            execution,
+            None,
+        )
+        is None
+    )
 
     current_consumption_by_field = {"build_id": "build-a"}
     monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=None))
@@ -346,6 +361,7 @@ async def test_replay_receipt_resolution_edges(monkeypatch):
             {},
         )
 
+
 def test_profile_delta_serving_state_edges():
     delta = _prepared_delta()
     serving = _matching_delta_serving_state(delta)
@@ -357,8 +373,8 @@ def test_profile_delta_serving_state_edges():
         ("source_context_vector_hash", "changed"),
         ("profile_as_of", "2026-07-29"),
         ("capacity_geometry_status", "verified"),
-        ("evidence_target_oid", 999),
-        ("profile_target_oid", 999),
+        ("targets", {**serving.targets, "evidence": {"schema": "mrf", "name": "other"}}),
+        ("targets", {**serving.targets, "profile": {"schema": "other", "name": "profile"}}),
         ("evidence_rows", 999),
         ("profile_rows", 999),
     ):
@@ -381,6 +397,7 @@ def test_profile_delta_serving_state_edges():
         receipt,
         None,
     )
+
 
 @pytest.mark.asyncio
 async def test_profile_delta_locked_state_and_apply_edges(monkeypatch):

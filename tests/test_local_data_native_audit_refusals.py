@@ -187,7 +187,7 @@ def _query_observation(observed, statement, parameters=None):
                     "kind": "relation",
                     "oid": oid,
                     "name": name,
-                    "owner": observed.physical.owner_oid,
+                    "owner": 102,
                     "definition": "r:p:1:0",
                 }
                 for name, oid in observed.ownership.relation_oids
@@ -390,7 +390,7 @@ async def test_native_audit_compares_separately_authenticated_sample_to_locked_i
     "failure",
     [
         "reference family stage ownership is invalid",
-        "reference family stage ownership differs",
+        "reference family stage declaration differs",
         "index creation failed",
     ],
 )

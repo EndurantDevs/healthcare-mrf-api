@@ -76,7 +76,7 @@ def _predicate_controls(metadata):
 
 def _read_only_predicate_query():
     """Evaluate the actual production predicate over typed, synthetic catalog rows."""
-    query = capture._NATIVE_CONSTRAINT_TRIGGERS_SQL
+    query = capture._NATIVE_CONSTRAINT_TRIGGERS_SQL.replace("$2::text[]", "$3::text[]")
     for table, alias in (
         ("pg_trigger", "t"),
         ("pg_class", "c"),
@@ -95,9 +95,12 @@ def _read_only_predicate_query():
     )
 
 
-async def verify_native_unique_trigger_predicate(connection, schema_oid):
+async def verify_native_unique_trigger_predicate(connection, schema_name):
     """Attest the real native trigger and refuse forged metadata without catalog writes."""
-    await capture._require_native_constraint_triggers(connection, schema_oid)
+    from process.network_cms_registry_address_equivalence import receipt
+
+    selected_names = tuple(model.__tablename__ for model in receipt._models())
+    await capture._require_native_constraint_triggers(connection, schema_name, selected_names)
     # Canonical vector text preserves the bounds of empty native catalog vectors.
     raw = await connection.fetchval(
         "SELECT jsonb_build_object('t',to_jsonb(t)||jsonb_build_object('tgattr',t.tgattr::text),"
@@ -106,14 +109,17 @@ async def verify_native_unique_trigger_predicate(connection, schema_oid):
         "FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid "
         "JOIN pg_constraint k ON k.oid=t.tgconstraint JOIN pg_index i ON i.indexrelid=k.conindid "
         "JOIN pg_class idx ON idx.oid=i.indexrelid JOIN pg_proc p ON p.oid=t.tgfoid "
-        "WHERE c.relnamespace=$1::oid AND k.contype='u' AND k.condeferrable AND k.condeferred",
-        schema_oid,
+        "WHERE c.relnamespace=to_regnamespace($1::text) AND k.contype='u' AND k.condeferrable AND k.condeferred",
+        schema_name,
     )
     assert raw is not None
     controls = _predicate_controls(json.loads(raw))
-    control_results = await connection.fetch(_read_only_predicate_query(), schema_oid, json.dumps(controls))
+    control_results = await connection.fetch(
+        _read_only_predicate_query(), schema_name, json.dumps(controls), list(selected_names)
+    )
     expected_by_case = {
-        entry["case"]: entry["case"] in {"native", "primary", "initially_immediate"} for entry in controls
+        entry["case"]: entry["case"] in {"native", "primary", "initially_immediate", "index_owner"}
+        for entry in controls
     }
     actual_by_case = {control_result["name"]: control_result["admitted"] for control_result in control_results}
     assert len(control_results) == len(expected_by_case)
@@ -126,8 +132,8 @@ async def verify_native_unique_trigger_predicate(connection, schema_oid):
             json.dumps(
                 {
                     "native": True,
-                    "compatible_controls": 3,
-                    "forged_refused": len(control_results) - 3,
+                    "compatible_controls": 4,
+                    "forged_refused": len(control_results) - 4,
                     "read_only": True,
                 }
             )

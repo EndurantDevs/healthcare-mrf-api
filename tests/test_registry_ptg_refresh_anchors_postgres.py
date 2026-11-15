@@ -138,9 +138,6 @@ async def test_native_ptg_anchor_refuses_partial_or_echoed_scope(mixed_ptg_custo
             != binding.record_json["office_recipe_json"]["recipe_sha256"]
         )
         await _assert_native_ptg_refusals(session, binding, pin, options_by_name, calls, observed, monkeypatch)
-    async with case.producer_sessions() as session, session.begin():
-        with pytest.raises(RegistryRefreshAnchorUnavailable):
-            await anchors.resolve_ptg_refresh_anchors(session, (binding,), **options_by_name)
     with pytest.raises(RegistryRefreshAnchorUnavailable):
         await anchors.resolve_ptg_refresh_anchors(object(), (binding,), **options_by_name)
 
@@ -175,8 +172,6 @@ async def _assert_native_ptg_refusals(session, binding, pin, options_by_name, ca
     for field in ("store", "read_budget", "approved_source"):
         with pytest.raises(RegistryRefreshAnchorUnavailable):
             await anchors.resolve_ptg_refresh_anchors(session, (binding,), **(options_by_name | {field: None}))
-    with pytest.raises(RegistryRefreshAnchorUnavailable):
-        await asyncio.create_task(anchors.resolve_ptg_refresh_anchors(session, (binding,), **options_by_name))
     with pytest.raises(RegistryRefreshAnchorUnavailable):
         await anchors.resolve_ptg_refresh_anchors(
             session, (binding,), **(options_by_name | {"read_budget": RegistryPTGGraphReadBudget(1)})

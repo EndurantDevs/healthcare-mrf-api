@@ -103,14 +103,7 @@ async def is_native_handoff_required(session, schema):
     """An installed protected family must not return to an ordinary pointer writer."""
     native._require_transaction(session)
     return (
-        await session.scalar(
-            text(
-                "SELECT c.relowner=n.nspowner OR NOT pg_has_role(current_user,c.relowner,'USAGE') "
-                "FROM pg_class c JOIN pg_namespace n ON n.nspname='hp_snapshot_retention' "
-                "WHERE c.oid=to_regclass(:relation)"
-            ),
-            {"relation": _table(schema, pins.TABLE)},
-        )
+        await session.scalar(text("SELECT to_regclass('hp_snapshot_retention.reference_preparation') IS NOT NULL"))
         is True
     )
 
@@ -118,7 +111,7 @@ async def is_native_handoff_required(session, schema):
 async def require_ordinary_publication_authority(session, schema):
     """Keep uncoordinated writers out once the shared family has protected custody."""
     if await is_native_handoff_required(session, schema):
-        await native.protected_publisher_owner(session)
+        native.model_family_roles()
 
 
 def _native_source_contract(handoff, params, manifest):
@@ -139,25 +132,40 @@ def native_pointer_identity(pointer):
     return {key: value for key, value in (pointer or {}).items() if key != "published_at"}
 
 
+def _pointer_equal(observed, expected):
+    if expected is not None and ("current_relation_oid" in expected or "previous_relation_oid" in expected):
+        return all((observed or {}).get(key) == expected.get(key) for key in ("current_run_id", "previous_run_id"))
+    return native_pointer_identity(observed) == expected
+
+
 def _validate_native_pointer(pointer, importer):
     fields = {"current_run_id", "previous_run_id"}
     if importer == PROJECTION_IMPORTER:
-        fields.update(("current_relation_oid", "previous_relation_oid"))
+        allowed = (
+            fields | {"current_relation", "previous_relation"},
+            fields | {"current_relation_oid", "previous_relation_oid"},
+        )
+    else:
+        allowed = (fields,)
     _require(
-        isinstance(pointer, dict) and (not pointer or set(pointer) == fields), "source native predecessor shape differs"
+        isinstance(pointer, dict) and (not pointer or set(pointer) in allowed),
+        "source native predecessor shape differs",
     )
-    for key, value in pointer.items():
-        if key.endswith("_run_id"):
+    for key in fields:
+        value = pointer.get(key)
+        _require(
+            value is None or isinstance(value, str) and bool(_RUN.fullmatch(value)),
+            "source native predecessor run differs",
+        )
+    if "current_relation" in pointer:
+        for key in ("current_relation", "previous_relation"):
+            value = pointer[key]
             _require(
-                value is None or isinstance(value, str) and bool(_RUN.fullmatch(value)),
-                "source native predecessor run differs",
+                value is None or isinstance(value, dict) and set(value) == {"schema", "table_name"},
+                "source native predecessor names differ",
             )
-        else:
-            _require(value is None or type(value) is int and 0 < value < 2**32, "source native predecessor OID differs")
-            _require(
-                pointer[key.replace("relation_oid", "run_id")] is None or value is not None,
-                "source native predecessor OID is missing",
-            )
+            if value is not None:
+                _table(value["schema"], value["table_name"])
 
 
 def _validate_native_projection(handoff):
@@ -166,15 +174,20 @@ def _validate_native_projection(handoff):
         return
     projection = handoff["projection"]
     _require(
-        isinstance(projection, dict) and set(projection) == {"relation_oid", "owner_oid", "table_name", "row_count"},
+        isinstance(projection, dict)
+        and set(projection)
+        in ({"schema", "table_name", "row_count"}, {"relation_oid", "owner_oid", "table_name", "row_count"}),
         "source native projection shape differs",
     )
     _require(
         projection["table_name"] == "provider_profile_projection_" + handoff["source_run_id"][:16]
-        and all(type(projection[key]) is int and 0 < projection[key] < 2**32 for key in ("relation_oid", "owner_oid"))
         and type(projection["row_count"]) is int
         and projection["row_count"] > 0,
-        "source native projection identity differs",
+        "source native projection scope differs",
+    )
+    _require(
+        projection.get("schema", handoff["schema_name"]) == handoff["schema_name"],
+        "source native projection schema differs",
     )
 
 
@@ -198,7 +211,10 @@ def validate_native_handoff(handoff):
         "projection",
         "handoff_sha256",
     }
-    _require(isinstance(handoff, dict) and set(handoff) == fields, "source native handoff shape differs")
+    _require(
+        isinstance(handoff, dict) and set(handoff) in (fields, fields - {"database_oid", "import_run_oid"}),
+        "source native handoff shape differs",
+    )
     _require(handoff["contract"] == NATIVE_HANDOFF_CONTRACT, "source native handoff contract differs")
     source_spec(handoff["importer_id"])
     native._schema_name(handoff["schema_name"])
@@ -209,7 +225,6 @@ def validate_native_handoff(handoff):
         )
         and isinstance(handoff["source_run_id"], str)
         and bool(_RUN.fullmatch(handoff["source_run_id"]))
-        and all(type(handoff[key]) is int and 0 < handoff[key] < 2**32 for key in ("database_oid", "import_run_oid"))
         and all(
             isinstance(handoff[key], str) and bool(_HEX.fullmatch(handoff[key]))
             for key in ("source_contract_sha256", "source_manifest_sha256", "handoff_sha256")
@@ -289,6 +304,11 @@ async def _native_source_run(session, handoff):
 async def record_native_handoff(session, ctx, *, importer_id, schema, source_run_id, metrics, projection=None):
     """CAS a genuine ordinary attempt into durable Publisher-owned finalization."""
     context = (ctx or {}).get("context") or {}
+    projection_by_field = projection
+    if projection_by_field is not None:
+        projection_by_field = {**projection_by_field, "schema": schema}
+        for field in ("relation_oid", "owner_oid"):
+            projection_by_field.pop(field, None)
     handoff_by_field = {
         "contract": NATIVE_HANDOFF_CONTRACT,
         "importer_id": importer_id,
@@ -311,10 +331,8 @@ async def record_native_handoff(session, ctx, *, importer_id, schema, source_run
     handoff_by_field.update(
         node_id=run["node_id"],
         metrics=dict(metrics),
-        projection=projection,
+        projection=projection_by_field,
         expected=native_pointer_identity(await _pointer(session, schema, importer_id)),
-        database_oid=await session.scalar(text("SELECT oid::bigint FROM pg_database WHERE datname=current_database()")),
-        import_run_oid=await native._relation_oid(session, schema, "import_run"),
         source_manifest_sha256=_digest(source_run["source_manifest"]),
         source_contract_sha256=_native_source_contract(handoff_by_field, run["params"], source_run["source_manifest"]),
     )
@@ -348,10 +366,7 @@ async def require_native_handoff(session, value):
         and (run["metrics"] or {}).get("source_profile_handoff") == handoff
         and _digest(source["source_manifest"]) == handoff["source_manifest_sha256"]
         and _native_source_contract(handoff, run["params"], source["source_manifest"])
-        == handoff["source_contract_sha256"]
-        and await session.scalar(text("SELECT oid::bigint FROM pg_database WHERE datname=current_database()"))
-        == handoff["database_oid"]
-        and await native._relation_oid(session, handoff["schema_name"], "import_run") == handoff["import_run_oid"],
+        == handoff["source_contract_sha256"],
         "source native handoff binding differs",
     )
     return handoff
@@ -430,13 +445,6 @@ def _native_completion(importer_id):
 async def _finish_native_source(session, handoff):
     """Provisional source completion remains invisible until the Publisher's outer COMMIT."""
     run_by_field = dict(await _native_source_run(session, handoff))
-    from process.entity_address_snapshot_preparation import _seal_published_relation
-
-    await _seal_published_relation(
-        session,
-        await native._relation_oid(session, handoff["schema_name"], "provider_profile_source_publication"),
-        await native.protected_publisher_owner(session),
-    )
     if handoff["importer_id"] != PROJECTION_IMPORTER:
         completion = _native_completion(handoff["importer_id"])
         _require(run_by_field["source_manifest"]["max_providers"] is None, "source native bounded publication differs")
@@ -448,19 +456,17 @@ async def _finish_native_source(session, handoff):
 
 async def _finish_native_projection(session, handoff):
     """Validate the existing sealed heap and finish its real producer before source capture."""
-    from process import florida_projection_archive as projection
-    from process.entity_address_snapshot_preparation import _seal_published_relation
+    from process import florida_projection_named_source as projection
 
     seal = handoff["projection"]
     await native._lock_family(session, handoff["schema_name"], (seal["table_name"],), "SHARE", nowait=True)
+    await projection.named_projection_seal(session, handoff["schema_name"], seal["table_name"])
     _require(
-        await projection._projection_candidate_seal(
-            session, handoff["schema_name"], seal["table_name"], seal["owner_oid"]
-        )
-        == {key: seal[key] for key in ("relation_oid", "owner_oid", "table_name")},
-        "source native projection changed",
+        await session.scalar(text(f"SELECT count(*) FROM {_table(handoff['schema_name'], seal['table_name'])}"))
+        == seal["row_count"],
+        "source native projection row count differs",
     )
-    await _seal_published_relation(session, seal["relation_oid"], await native.protected_publisher_owner(session))
+    await projection.freeze_named_projection(session, handoff["schema_name"], seal["table_name"])
     result_by_field = {
         **handoff["metrics"],
         "published_providers": seal["row_count"],
@@ -481,7 +487,7 @@ async def _finish_native_projection(session, handoff):
     candidate = await _run(session, handoff["schema_name"], handoff["source_run_id"])
     previous_id = handoff["expected"]["current_run_id"]
     previous = await _run(session, handoff["schema_name"], previous_id) if previous_id else None
-    result_by_field["publication"].update(projection.native_publication_policy(candidate, previous))
+    result_by_field["publication"].update(projection.legacy.native_publication_policy(candidate, previous))
     await session.execute(
         text(
             f"UPDATE {_table(handoff['schema_name'], TABLES[0])} SET metrics=CAST(:metrics AS json) WHERE run_id=:run"
@@ -498,7 +504,7 @@ async def _finish_native_projection(session, handoff):
     }
 
 
-async def _capture_native_source(session, handoff, dataset_id, source_copy, owner_oid):
+async def _capture_native_source(session, handoff, dataset_id, source_copy, owner_role):
     """Capture ordinary canonical rows with the shared model COPY/index/set lifecycle."""
     importer, schema = handoff["importer_id"], handoff["schema_name"]
     runs = await _lineage(session, importer, schema, handoff["source_run_id"])
@@ -527,12 +533,7 @@ async def _capture_native_source(session, handoff, dataset_id, source_copy, owne
         deadline=asyncio.get_running_loop().time() + source_copy.timeout,
     )
     await complete_restore(session, ownership)
-    quoted_owner = await session.scalar(
-        text("SELECT quote_ident(rolname) FROM pg_roles WHERE oid=:oid"), {"oid": owner_oid}
-    )
-    _require(isinstance(quoted_owner, str), "source native owner differs")
-    await session.execute(text(f"ALTER SCHEMA {native._quoted(ownership.schema_name)} OWNER TO {quoted_owner}"))
-    await native.seal_model_family_storage(session, ownership, owner_oid)
+    await native.seal_model_family_storage(session, ownership)
     manifest = await describe_result(
         session, importer_id=importer, schema=ownership.schema_name, run_id=handoff["source_run_id"], contract=CONTRACT
     )
@@ -553,7 +554,7 @@ async def _capture_native_source(session, handoff, dataset_id, source_copy, owne
     return prepared
 
 
-async def _prepare_witnessed_source(session, handoff, dataset_id, source_copy, owner_oid):
+async def _prepare_witnessed_source(session, handoff, dataset_id, source_copy, owner_role):
     """Turn a genuine local producer envelope into the existing immutable model family."""
     from process import new_york_profile_store as producer
 
@@ -583,12 +584,7 @@ async def _prepare_witnessed_source(session, handoff, dataset_id, source_copy, o
         source_copy=native.ReferenceFamilySourceCopy(source_copy.copy_rows, remaining, source_copy.timeout),
         deadline=deadline,
     )
-    owner_name = await session.scalar(
-        text("SELECT quote_ident(rolname) FROM pg_roles WHERE oid=:oid"), {"oid": owner_oid}
-    )
-    _require(isinstance(owner_name, str), "source native owner differs")
-    await session.execute(text(f"ALTER SCHEMA {native._quoted(ownership.schema_name)} OWNER TO {owner_name}"))
-    await native.seal_model_family_storage(session, ownership, owner_oid)
+    await native.seal_model_family_storage(session, ownership)
     await validate_stage(session, ownership, manifest)
     await _validate_publication_sets(session, prepared, publication)
     await _attach_publication(session, prepared, publication, handoff["schema_name"])
@@ -615,7 +611,7 @@ async def _require_local_source_envelope(session, handoff):
                 {**handoff, "relation": _table(schema, name)},
             )
             is True,
-            "source native envelope physical owner differs",
+            "source native envelope is not parent-local",
         )
     _require(
         not await session.scalar(
@@ -721,10 +717,10 @@ async def complete_native_handoff(session, handoff, *, dataset_id, source_copy, 
     _require(isinstance(source_copy, native.ReferenceFamilySourceCopy), "source native COPY capability is required")
     handoff = await require_native_handoff(session, handoff)
     schema, importer = handoff["schema_name"], handoff["importer_id"]
-    owner_oid = await native.protected_publisher_owner(session)
+    owner_role = native.model_family_roles()[0]
     await _source_lock(session, schema, importer)
     _require(
-        native_pointer_identity(await _pointer(session, schema, importer)) == handoff["expected"],
+        _pointer_equal(await _pointer(session, schema, importer), handoff["expected"]),
         "source native predecessor changed",
     )
     await native._lock_family(session, schema, TABLES, "SHARE")
@@ -732,19 +728,18 @@ async def complete_native_handoff(session, handoff, *, dataset_id, source_copy, 
     publication = None
     if handoff["importer_id"] == "new-york-nypp-profile" and "bundle" in handoff["metrics"]:
         prepared, source_result, publication = await _prepare_witnessed_source(
-            session, handoff, dataset_id, source_copy, owner_oid
+            session, handoff, dataset_id, source_copy, owner_role
         )
         progress = _native_completion(importer)._terminal_progress(source_result)
     else:
         source_result, progress = await _finish_native_source(session, handoff)
-        prepared = await _capture_native_source(session, handoff, dataset_id, source_copy, owner_oid)
+        prepared = await _capture_native_source(session, handoff, dataset_id, source_copy, owner_role)
     receipt_by_field = {
         "contract": NATIVE_PUBLICATION_CONTRACT,
         "handoff": handoff,
         "pin_id": str(dataset_id),
         "ownership": ownership_dict(prepared.ownership),
         "result": prepared.manifest,
-        "sealed_owner_oid": owner_oid,
         "source_result": source_result,
         "terminal_progress": progress,
         **({"publication": publication, "destination_schema": schema} if publication is not None else {}),
@@ -752,7 +747,7 @@ async def complete_native_handoff(session, handoff, *, dataset_id, source_copy, 
     }
     receipt_by_field["validation_sha256"] = _digest(receipt_by_field)
     await _record_native_custody(session, handoff, receipt_by_field)
-    transaction_id = await session.scalar(text("SELECT pg_current_xact_id()::text"))
+    transaction = getattr(session, "get_transaction", lambda: session)()
     completed_ids = []
 
     async def cutover():
@@ -760,10 +755,10 @@ async def complete_native_handoff(session, handoff, *, dataset_id, source_copy, 
         _require(
             not completed_ids
             and session.in_transaction()
-            and await session.scalar(text("SELECT pg_current_xact_id()::text")) == transaction_id,
+            and getattr(session, "get_transaction", lambda: session)() is transaction,
             "source native publication transaction changed",
         )
-        completed_ids.append(transaction_id)
+        completed_ids.append(True)
         return await _publish_native_serving(session, prepared, receipt_by_field)
 
     publication = await publication_continuation(session, receipt_by_field, cutover)
@@ -774,12 +769,12 @@ async def complete_native_handoff(session, handoff, *, dataset_id, source_copy, 
 async def _publish_native_serving(session, prepared, receipt):
     """Change the genuine serving pointer and exact managed attempt in the owning transaction."""
     handoff = receipt["handoff"]
-    schema, owner_oid = handoff["schema_name"], receipt["sealed_owner_oid"]
+    schema = handoff["schema_name"]
     if handoff["importer_id"] == PROJECTION_IMPORTER:
-        from process.florida_projection_archive import publish_retained_projection
+        from process.florida_projection_named_source import publish_named_source_projection
 
-        await publish_retained_projection(
-            session, schema, handoff["projection"], handoff["expected"], handoff["source_run_id"], owner_oid
+        await publish_named_source_projection(
+            session, schema, handoff["projection"], handoff["expected"], handoff["source_run_id"]
         )
     elif "publication" in receipt:
         await _publish_result_pointer(
@@ -787,7 +782,6 @@ async def _publish_native_serving(session, prepared, receipt):
             prepared,
             {
                 "destination_schema": schema,
-                "sealed_owner_oid": owner_oid,
                 "expected_current_run_id": handoff["expected"].get("current_run_id"),
             },
             retained_serving=True,
@@ -799,8 +793,7 @@ async def _publish_native_serving(session, prepared, receipt):
 async def _native_receipt_witnesses(session, schema, run_ids):
     """Bind the complete captured source graph to physical parents in this transaction."""
     return {
-        "publisher_transaction_id": await session.scalar(text("SELECT pg_current_xact_id()::text")),
-        "parents": [[name, await native._relation_oid(session, schema, name)] for name in TABLES],
+        "parents": [[name, _reference(schema, name)] for name in TABLES],
         "ancestor_relations": [[run_id, await _ancestor_relations(session, schema, run_id)] for run_id in run_ids],
     }
 
@@ -829,15 +822,18 @@ def validate_native_capture(capture):
     _require(
         isinstance(capture, dict)
         and set(capture)
-        == {
-            "contract",
-            "importer_id",
-            "schema_name",
-            "source_run_id",
-            "expected",
-            "database_oid",
-            "source_manifest_sha256",
-        }
+        in (
+            {"contract", "importer_id", "schema_name", "source_run_id", "expected", "source_manifest_sha256"},
+            {
+                "contract",
+                "importer_id",
+                "schema_name",
+                "source_run_id",
+                "expected",
+                "source_manifest_sha256",
+                "database_oid",
+            },
+        )
         and capture["contract"] == NATIVE_CAPTURE_CONTRACT,
         "source native capture shape differs",
     )
@@ -849,8 +845,6 @@ def validate_native_capture(capture):
         and bool(_RUN.fullmatch(capture["source_run_id"]))
         and isinstance(capture["expected"], dict)
         and capture["expected"].get("current_run_id") == capture["source_run_id"]
-        and type(capture["database_oid"]) is int
-        and 0 < capture["database_oid"] < 2**32
         and isinstance(capture["source_manifest_sha256"], str)
         and bool(_HEX.fullmatch(capture["source_manifest_sha256"])),
         "source native capture identity differs",
@@ -865,46 +859,45 @@ async def capture_native_incumbent(session, capture, *, dataset_id, source_copy,
     schema, importer = capture["schema_name"], capture["importer_id"]
     _require(isinstance(dataset_id, UUID) and callable(publication_continuation), "source capture continuation differs")
     _require(isinstance(source_copy, native.ReferenceFamilySourceCopy), "source capture COPY capability is required")
-    owner_oid = await native.protected_publisher_owner(session)
+    owner_role = native.model_family_roles()[0]
     await _source_lock(session, schema, importer)
     await native._lock_family(session, schema, source_spec(importer).table_names, "SHARE", nowait=True)
     await require_pin_guards(session, schema)
-    _require(
-        native_pointer_identity(await _pointer(session, schema, importer)) == capture["expected"],
-        "source capture predecessor changed",
-    )
-    source_run = await _require_captured_source(session, capture)
+    pointer = native_pointer_identity(await _pointer(session, schema, importer))
+    _require(_pointer_equal(pointer, capture["expected"]), "source capture predecessor changed")
+    capture_by_field = {key: field_value for key, field_value in capture.items() if key != "database_oid"}
+    capture_by_field = {**capture_by_field, "expected": pointer}
+    source_run = await _require_captured_source(session, capture_by_field)
     serving_by_field = None
     if importer == PROJECTION_IMPORTER:
-        from process.florida_projection_archive import PROJECTION
+        from process.florida_projection_named_source import named_source_projection
 
-        serving_by_field = {"table_name": PROJECTION, "relation_oid": capture["expected"]["current_relation_oid"]}
+        serving_by_field = await named_source_projection(session, schema, capture_by_field["source_run_id"])
     prepared = await _capture_native_source(
-        session, {**capture, "projection": serving_by_field}, dataset_id, source_copy, owner_oid
+        session, {**capture_by_field, "projection": serving_by_field}, dataset_id, source_copy, owner_role
     )
     receipt_by_field = {
         "contract": NATIVE_CAPTURE_CONTRACT,
-        "capture": capture,
+        "capture": {key: field_value for key, field_value in capture_by_field.items() if key != "database_oid"},
         "pin_id": str(dataset_id),
         "ownership": ownership_dict(prepared.ownership),
         "result": prepared.manifest,
         "serving": serving_by_field,
-        "sealed_owner_oid": owner_oid,
         "source_contract_sha256": _digest(
-            {"capture": capture, "source_manifest": source_run["source_manifest"], "result": prepared.manifest}
+            {"capture": capture_by_field, "source_manifest": source_run["source_manifest"], "result": prepared.manifest}
         ),
         **await _native_receipt_witnesses(session, schema, prepared.manifest["run_ids"]),
     }
     receipt_by_field["validation_sha256"] = _digest(receipt_by_field)
     completed_ids = []
+    transaction = getattr(session, "get_transaction", lambda: session)()
 
     async def seal():
         """Fence the actual live heap and pointer before its first retained registration."""
         _require(
             not completed_ids
             and session.in_transaction()
-            and await session.scalar(text("SELECT pg_current_xact_id()::text"))
-            == receipt_by_field["publisher_transaction_id"],
+            and getattr(session, "get_transaction", lambda: session)() is transaction,
             "source capture transaction changed",
         )
         completed_ids.append(str(dataset_id))
@@ -920,9 +913,7 @@ async def _require_captured_source(session, capture):
     source_run = await _run(session, capture["schema_name"], capture["source_run_id"])
     _validate_run(capture["importer_id"], source_run)
     _require(
-        _digest(source_run["source_manifest"]) == capture["source_manifest_sha256"]
-        and await session.scalar(text("SELECT oid::bigint FROM pg_database WHERE datname=current_database()"))
-        == capture["database_oid"],
+        _digest(source_run["source_manifest"]) == capture["source_manifest_sha256"],
         "source capture producer changed",
     )
     return source_run
@@ -930,23 +921,16 @@ async def _require_captured_source(session, capture):
 
 async def _seal_captured_incumbent(session, receipt):
     """Keep serving identity and existing reads while closing ordinary publication bypasses."""
-    from process.entity_address_snapshot_preparation import _seal_published_relation
-
     capture = receipt["capture"]
     schema, importer = capture["schema_name"], capture["importer_id"]
     _require(
-        native_pointer_identity(await _pointer(session, schema, importer)) == capture["expected"],
+        _pointer_equal(await _pointer(session, schema, importer), capture["expected"]),
         "source capture predecessor changed",
     )
     if importer == PROJECTION_IMPORTER:
-        from process.florida_projection_archive import seal_retained_projection
+        from process.florida_projection_named_source import freeze_existing_source_projection
 
-        await seal_retained_projection(session, schema, receipt["serving"], receipt["sealed_owner_oid"])
-    await _seal_published_relation(
-        session,
-        await native._relation_oid(session, schema, "provider_profile_source_publication"),
-        receipt["sealed_owner_oid"],
-    )
+        await freeze_existing_source_projection(session, schema, receipt["serving"]["table_name"])
     await _record_native_custody(session, capture, receipt)
 
 
@@ -1018,7 +1002,7 @@ async def require_native_maintenance(session, run):
     )
     await _source_lock(session, schema, importer)
     await _require_native_maintenance_source(session, run, receipt)
-    await _require_native_maintenance_authority(session, schema, receipt["sealed_owner_oid"])
+    await _require_native_maintenance_authority(session, schema, receipt.get("sealed_owner_oid"))
     group = (
         (
             await session.execute(
@@ -1033,18 +1017,9 @@ async def require_native_maintenance(session, run):
     await _require_maintenance_storage(session, schema, receipt)
     await require_pin_guards(session, schema)
     if importer == PROJECTION_IMPORTER:
-        from process.florida_projection_archive import _retained_run_projection_oid
+        from process.florida_projection_named_source import named_source_projection
 
-        pointer = await _pointer(session, schema, importer)
-        oid = await _retained_run_projection_oid(
-            session, schema, handoff["source_run_id"], serving=pointer["current_run_id"] == handoff["source_run_id"]
-        )
-        _require(
-            oid == handoff["projection"]["relation_oid"]
-            and await session.scalar(text("SELECT relowner FROM pg_class WHERE oid=:oid"), {"oid": oid})
-            == receipt["sealed_owner_oid"],
-            "source native maintenance serving heap differs",
-        )
+        await named_source_projection(session, schema, handoff["source_run_id"])
     return receipt
 
 
@@ -1052,8 +1027,11 @@ async def _require_maintenance_storage(session, schema, receipt):
     """Authenticate either unattached capture custody or exact Publisher-created model leaves."""
     ownership = _publication_ownership(receipt)
     await verify_ownership(session, ownership)
-    await native._verify_stage_owner(session, ownership, receipt["sealed_owner_oid"])
-    await _require_stage_topology(session, ownership, receipt.get("publication"))
+    await _require_stage_topology(
+        session,
+        ownership,
+        _named_publication(receipt["publication"], ownership, schema) if "publication" in receipt else None,
+    )
     if "publication" in receipt:
         await _require_publication_parents(session, schema, receipt["publication"])
 
@@ -1076,23 +1054,15 @@ async def _require_native_maintenance_source(session, run, receipt):
         and _native_source_contract(handoff, run["params"], source["source_manifest"])
         == handoff["source_contract_sha256"]
         and source["metrics"]
-        == {key: value for key, value in receipt["source_result"].items() if key not in {"run_id", "previous_run_id"}}
-        and await session.scalar(text("SELECT oid::bigint FROM pg_database WHERE datname=current_database()"))
-        == handoff["database_oid"]
-        and await native._relation_oid(session, schema, "import_run") == handoff["import_run_oid"]
-        and await session.scalar(text("SELECT nspowner FROM pg_namespace WHERE nspname='hp_snapshot_retention'"))
-        == receipt["sealed_owner_oid"]
-        and await session.scalar(
-            text("SELECT relowner FROM pg_class WHERE oid=to_regclass(:relation)"),
-            {"relation": _table(schema, pins.TABLE)},
-        )
-        == receipt["sealed_owner_oid"],
+        == {key: value for key, value in receipt["source_result"].items() if key not in {"run_id", "previous_run_id"}},
         "source native maintenance producer differs",
     )
     _require(
-        receipt["parents"] == [[name, await native._relation_oid(session, schema, name)] for name in TABLES]
-        and receipt["ancestor_relations"]
-        == [[run_id, await _ancestor_relations(session, schema, run_id)] for run_id in receipt["result"]["run_ids"]],
+        all(
+            pair == [name, _reference(schema, name)] if isinstance(pair[1], dict) else pair[0] == name
+            for pair, name in zip(receipt["parents"], TABLES, strict=True)
+        )
+        and [entry[0] for entry in receipt["ancestor_relations"]] == receipt["result"]["run_ids"],
         "source native maintenance physical source differs",
     )
 
@@ -1119,12 +1089,6 @@ async def _require_native_abandonment(session, handoff):
         and all((run["progress"] or {}).get(key) == handoff[key] for key in ("attempt_id", "attempt_started_at")),
         "source native abandonment attempt differs",
     )
-    _require(
-        await session.scalar(text("SELECT oid::bigint FROM pg_database WHERE datname=current_database()"))
-        == handoff["database_oid"]
-        and await native._relation_oid(session, schema, "import_run") == handoff["import_run_oid"],
-        "source native abandonment location differs",
-    )
     await _source_lock(session, schema, importer)
     source_run = await _run(session, schema, handoff["source_run_id"])
     _require(
@@ -1142,35 +1106,35 @@ async def _require_native_abandonment(session, handoff):
     return run
 
 
-async def _drop_native_projection_candidate(session, schema, seal, owner_oid):
-    """Drop only the authenticated never-published OID, or prove that exact OID is absent."""
-    oid = await native._relation_oid(session, schema, seal["table_name"])
-    if oid is not None:
-        await native._lock_family(session, schema, (seal["table_name"],), "ACCESS EXCLUSIVE", nowait=True)
-        _require(
-            await native._relation_oid(session, schema, seal["table_name"]) == oid == seal["relation_oid"]
-            and await session.scalar(text("SELECT relowner FROM pg_class WHERE oid=:oid"), {"oid": oid})
-            in (seal["owner_oid"], owner_oid),
-            "source native abandonment ownership changed",
-        )
-        await session.execute(text(f"DROP TABLE {_table(schema, seal['table_name'])} RESTRICT"))
-    else:
-        _require(
-            not await session.scalar(
-                text("SELECT EXISTS(SELECT 1 FROM pg_class WHERE oid=:oid)"), {"oid": seal["relation_oid"]}
-            ),
-            "source native candidate moved",
-        )
+async def _drop_native_projection_candidate(session, schema, seal, *, source_run_id):
+    name = seal["table_name"]
+    _table(schema, name)
+    if await native._relation_oid(session, schema, name) is None:
+        return
+    await native._lock_family(session, schema, (name,), "ACCESS EXCLUSIVE", nowait=True)
+    from process.florida_projection_named_source import named_projection_seal
+
+    await named_projection_seal(session, schema, name)
+    _require(
+        await session.scalar(
+            text(f"SELECT NOT EXISTS(SELECT FROM {_table(schema, name)} WHERE generation_id<>:run)"),
+            {"run": source_run_id},
+        ),
+        "source native candidate data scope differs",
+    )
+    await session.execute(text(f"DROP TABLE {_table(schema, name)} RESTRICT"))
 
 
 async def abandon_native_handoff(session, handoff):
     """Only a genuine terminal/cancellation fence releases the never-published candidate."""
     handoff = validate_native_handoff(handoff)
-    owner_oid = await native.protected_publisher_owner(session)
+    native.model_family_roles()
     run = await _require_native_abandonment(session, handoff)
     schema, importer = handoff["schema_name"], handoff["importer_id"]
     if importer == PROJECTION_IMPORTER:
-        await _drop_native_projection_candidate(session, schema, handoff["projection"], owner_oid)
+        await _drop_native_projection_candidate(
+            session, schema, handoff["projection"], source_run_id=handoff["source_run_id"]
+        )
     await session.execute(
         text(
             f"UPDATE {_table(schema, TABLES[0])} SET status='failed',finished_at=COALESCE(finished_at,clock_timestamp()),"
@@ -1219,11 +1183,9 @@ def _table(schema, name):
 class StageOwnership:
     importer_id: str
     dataset_id: UUID
-    schema_oid: int
-    relation_oids: tuple[tuple[str, int], ...]
+    relation_names: tuple[str, ...]
 
-    sequence_oids = ()
-    auxiliary_oid = None
+    sequence_names = ()
 
     @property
     def schema_name(self):
@@ -1251,9 +1213,9 @@ async def _source_lock(session, schema, importer_id):
 
 async def _pointer(session, schema, importer_id):
     if importer_id == PROJECTION_IMPORTER:
-        from process.florida_projection_archive import publication_pointer
+        from process.florida_projection_named_source import named_publication_pointer
 
-        return await publication_pointer(session, schema)
+        return await named_publication_pointer(session, schema)
     return (
         (
             await session.execute(
@@ -1270,28 +1232,45 @@ async def _pointer(session, schema, importer_id):
 
 
 async def capture_ownership(session, importer_id, dataset_id):
-    """Read exact local relation OIDs and reject extra stage objects."""
+    """Read the closed named model family and reject unrelated stage objects."""
     native._require_transaction(session)
     source_spec(importer_id)
     schema = stage_schema(dataset_id)
-    schema_oid = await native._schema_oid(session, schema)
-    relations = await native._namespace_relations(session, schema_oid)
-    table_names = {row["relname"] for row in relations if row["relkind"] == "r"}
+    relation_rows = (
+        (
+            await session.execute(
+                text(
+                    "SELECT c.relname,c.relkind::text,c.relpersistence::text,c.relispartition,c.relrowsecurity,c.relforcerowsecurity, "
+                    "i.relname AS index_table FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "LEFT JOIN pg_index x ON x.indexrelid=c.oid LEFT JOIN pg_class i ON i.oid=x.indrelid WHERE n.nspname=:schema"
+                ),
+                {"schema": schema},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    table_names = {relation_row["relname"] for relation_row in relation_rows if relation_row["relkind"] == "r"}
     _require(
         table_names
         in (set(source_spec(importer_id).table_names), set(source_spec(importer_id, publication=True).table_names)),
         "stage table set differs",
     )
-    pairs = tuple([(name, await native._relation_oid(session, schema, name)) for name in sorted(table_names)])
-    _require(all(type(oid) is int and oid > 0 for _, oid in pairs), "stage relation is missing")
-    oids = {oid for _, oid in pairs}
-    for row in relations:
-        _require(
-            (row["relkind"] == "r" and row["oid"] in oids)
-            or (row["relkind"] == "i" and row["index_table_oid"] in oids),
-            "stage contains an unowned relation",
-        )
-    return StageOwnership(importer_id, dataset_id, schema_oid, pairs)
+    _require(
+        all(
+            relation_row["relkind"] == "r"
+            and relation_row["relpersistence"] == "p"
+            and not relation_row["relispartition"]
+            and not relation_row["relrowsecurity"]
+            and not relation_row["relforcerowsecurity"]
+            and relation_row["relname"] in table_names
+            or relation_row["relkind"] == "i"
+            and relation_row["index_table"] in table_names
+            for relation_row in relation_rows
+        ),
+        "stage contains an unrelated relation",
+    )
+    return StageOwnership(importer_id, dataset_id, tuple(sorted(table_names)))
 
 
 async def verify_ownership(session, ownership):
@@ -1746,7 +1725,8 @@ async def validate_stage(session, ownership, manifest):
     manifest = validate_manifest(manifest)
     _require(manifest["importer_id"] == ownership.importer_id, "stage source differs")
     spec = source_spec(ownership.importer_id)
-    await native._lock_family(session, ownership.schema_name, spec.table_names, "SHARE")
+    # Validation reads under ACCESS SHARE, which a frozen stage owner can still take.
+    await native._lock_family(session, ownership.schema_name, spec.table_names, "ACCESS SHARE")
     await verify_ownership(session, ownership)
     for model in spec.model_types:
         name = model.__tablename__
@@ -1809,14 +1789,131 @@ async def _are_source_model_rows_equal(session, importer, model, left, right, ru
 
 
 def ownership_dict(ownership):
-    """Bind the local stage, never a peer's control-run authority."""
+    """Describe a portable named family; PostgreSQL supplies its access control."""
     return {
         "importer_id": ownership.importer_id,
         "dataset_id": str(ownership.dataset_id),
         "schema_name": ownership.schema_name,
-        "schema_oid": ownership.schema_oid,
-        "relation_oids": [list(pair) for pair in ownership.relation_oids],
+        "relations": [{"table_name": name} for name in ownership.relation_names],
     }
+
+
+def ownership_value(ownership_payload):
+    """Accept saved logical names; obsolete physical tokens are never authoritative."""
+    named_fields = {"importer_id", "dataset_id", "schema_name", "relations"}
+    legacy_fields = {"importer_id", "dataset_id", "schema_name", "schema_oid", "relation_oids"}
+    _require(
+        isinstance(ownership_payload, Mapping) and set(ownership_payload) in (named_fields, legacy_fields),
+        "stage ownership is invalid",
+    )
+    try:
+        entries = (
+            ownership_payload["relations"]
+            if set(ownership_payload) == named_fields
+            else ownership_payload["relation_oids"]
+        )
+        _require(isinstance(entries, (list, tuple)), "stage tables differ")
+        if set(ownership_payload) == named_fields:
+            _require(
+                all(isinstance(entry, Mapping) and set(entry) == {"table_name"} for entry in entries),
+                "stage tables differ",
+            )
+            names = tuple(entry["table_name"] for entry in entries)
+        else:
+            _require(
+                all(isinstance(entry, (list, tuple)) and len(entry) == 2 for entry in entries), "stage tables differ"
+            )
+            names = tuple(entry[0] for entry in entries)
+        _require(all(isinstance(name, str) for name in names), "stage tables differ")
+        ownership = StageOwnership(ownership_payload["importer_id"], UUID(ownership_payload["dataset_id"]), names)
+        families = (source_spec(ownership.importer_id), source_spec(ownership.importer_id, publication=True))
+        _require(
+            ownership_payload["schema_name"] == ownership.schema_name
+            and names in tuple(tuple(sorted(spec.table_names)) for spec in families),
+            "stage ownership differs",
+        )
+        return ownership
+    except (KeyError, TypeError, ValueError, AttributeError) as error:
+        raise SourceProfileArchiveError("stage ownership is invalid") from error
+
+
+def _reference(schema, name):
+    _table(schema, name)
+    return {"schema": schema, "name": name}
+
+
+def _named_publication(publication, ownership, destination_schema):
+    """Project saved logical table mappings without translating database IDs."""
+    publication_by_field = dict(publication)
+    parents = []
+    for name, reference in publication_by_field["parents"]:
+        _require(isinstance(reference, dict) or type(reference) is int, "attachment parent mapping differs")
+        declared = reference if isinstance(reference, dict) else _reference(destination_schema, name)
+        _require(declared == _reference(destination_schema, name), "attachment parent names differ")
+        parents.append([name, declared])
+    child_entries = []
+    for name, child, reference in publication_by_field["children"]:
+        _require(isinstance(reference, dict) or type(reference) is int, "attachment child mapping differs")
+        declared = reference if isinstance(reference, dict) else _reference(ownership.schema_name, child)
+        _require(declared == _reference(ownership.schema_name, child), "attachment child names differ")
+        child_entries.append([name, child, declared])
+    publication_by_field["parents"], publication_by_field["children"] = parents, child_entries
+    return publication_by_field
+
+
+def _receipt_destination(receipt):
+    """Use the schema saved by this publication edition, never a physical location token."""
+    destination = receipt.get("destination_schema") or (receipt.get("handoff") or receipt.get("capture") or {}).get(
+        "schema_name"
+    )
+    _require(isinstance(destination, str), "source publication schema is unavailable")
+    _table(destination, TABLES[0])
+    return destination
+
+
+def logical_validation(receipt_payload):
+    """Compare logical receipt fields while keeping saved physical tokens opaque."""
+    _require(
+        isinstance(receipt_payload, Mapping) and isinstance(receipt_payload.get("ownership"), Mapping),
+        "source validation is invalid",
+    )
+    is_legacy = "schema_oid" in receipt_payload["ownership"]
+    if not is_legacy:
+        _require(
+            receipt_payload.get("validation_sha256")
+            == _digest(
+                {key: field_value for key, field_value in receipt_payload.items() if key != "validation_sha256"}
+            ),
+            "source validation digest differs",
+        )
+    receipt_by_field = {
+        key: field_value
+        for key, field_value in receipt_payload.items()
+        if key not in {"validation_sha256", "sealed_owner_oid", "publisher_transaction_id"}
+    }
+    ownership = ownership_value(receipt_by_field["ownership"])
+    receipt_by_field["ownership"] = ownership_dict(ownership)
+    if "publication" in receipt_by_field:
+        publication = _named_publication(
+            receipt_by_field["publication"],
+            ownership,
+            _receipt_destination(receipt_by_field),
+        )
+        publication["ancestor_relations"] = [
+            [run_id, [[name, reference] if isinstance(reference, dict) else [name] for name, reference in pairs]]
+            for run_id, pairs in publication["ancestor_relations"]
+        ]
+        receipt_by_field["publication"] = publication
+    if "projection" in receipt_by_field and receipt_by_field["projection"] is not None:
+        from process.florida_projection_named_source import validate_named_cutover
+
+        receipt_by_field["projection"] = validate_named_cutover(
+            receipt_by_field["projection"],
+            receipt_by_field["expected_current_run_id"],
+            UUID(receipt_by_field["pin_id"]),
+            schema=receipt_by_field["destination_schema"],
+        )
+    return receipt_by_field
 
 
 def _validation(
@@ -1831,11 +1928,7 @@ def _validation(
     projection=None,
 ):
     _require(
-        isinstance(pin_id, UUID)
-        and isinstance(package_id, str)
-        and bool(_HEX.fullmatch(package_id))
-        and type(sealed_owner_oid) is int
-        and sealed_owner_oid > 0,
+        isinstance(pin_id, UUID) and isinstance(package_id, str) and bool(_HEX.fullmatch(package_id)),
         "adoption authority is invalid",
     )
     _table(destination_schema, TABLES[0])
@@ -1850,19 +1943,22 @@ def _validation(
         "package_id": package_id,
         "result_sha256": _digest(validate_manifest(prepared.manifest)),
         "ownership": ownership_dict(prepared.ownership),
-        "sealed_owner_oid": sealed_owner_oid,
         "destination_schema": destination_schema,
         "expected_current_run_id": expected_current_run_id,
         "pin_id": str(pin_id),
     }
     if prepared.manifest["contract"] == CONTRACT:
-        receipt_by_field["publication"] = _validate_publication(publication, prepared)
+        receipt_by_field["publication"] = _validate_publication(
+            _named_publication(publication, prepared.ownership, destination_schema), prepared
+        )
     else:
         _require(publication is None, "legacy publication differs")
     if prepared.manifest["importer_id"] == PROJECTION_IMPORTER:
-        from process.florida_projection_archive import validate_native_cutover
+        from process.florida_projection_named_source import validate_named_cutover
 
-        receipt_by_field["projection"] = validate_native_cutover(projection, expected_current_run_id, pin_id)
+        receipt_by_field["projection"] = validate_named_cutover(
+            projection, expected_current_run_id, pin_id, schema=destination_schema
+        )
     else:
         _require(projection is None, "source pointer cannot carry a projection")
     return {**receipt_by_field, "validation_sha256": _digest(receipt_by_field)}
@@ -1888,12 +1984,14 @@ def _validate_publication(publication, prepared):
         and publication["contract"] == ATTACHMENT_CONTRACT,
         "attachment run subset differs",
     )
-    oid_by_name = dict(prepared.ownership.relation_oids)
+    references_by_name = {
+        name: _reference(prepared.ownership.schema_name, name) for name in prepared.ownership.relation_names
+    }
     expected_child_relations = [
-        [name, child, oid_by_name.get(child)] for name, child in zip(TABLES, PUBLICATION_TABLES, strict=True)
+        [name, child, references_by_name.get(child)] for name, child in zip(TABLES, PUBLICATION_TABLES, strict=True)
     ]
     _require(
-        set(oid_by_name) == set(source_spec(prepared.manifest["importer_id"], publication=True).table_names)
+        set(references_by_name) == set(source_spec(prepared.manifest["importer_id"], publication=True).table_names)
         and publication["children"] == expected_child_relations
         and _valid_relation_pairs(publication["parents"]),
         "attachment relations differ",
@@ -1919,8 +2017,12 @@ def _valid_relation_pairs(pairs):
             isinstance(pair, list)
             and len(pair) == 2
             and pair[0] == name
-            and type(pair[1]) is int
-            and 0 < pair[1] < 2**32
+            and (
+                isinstance(pair[1], dict)
+                and set(pair[1]) == {"schema", "name"}
+                and all(isinstance(value, str) and native._IDENTIFIER.fullmatch(value) for value in pair[1].values())
+                or type(pair[1]) is int
+            )
             for pair, name in zip(pairs, TABLES, strict=True)
         )
     )
@@ -1956,35 +2058,34 @@ async def prepare_activation(
     *,
     prepared,
     package_id,
-    sealed_owner_oid,
     destination_schema,
     expected_current_run_id,
     pin_id,
     publication_request=None,
+    roles=None,
 ):
     """Seal only the isolated v2 stage; retain the original v1 preparation semantics."""
     manifest = validate_manifest(prepared.manifest)
     projection = _publication_copy_request(manifest, publication_request)
     await _admission(session, manifest, destination_schema, expected_current_run_id, projection=projection)
     await session.execute(text("SET LOCAL statement_timeout='1800s'"))
-    await native._verify_stage_owner(session, prepared.ownership, sealed_owner_oid)
     await validate_stage(session, prepared.ownership, manifest)
     await require_pin_guards(session, destination_schema)
     if manifest["contract"] == CONTRACT:
         publication, projection = await _prepare_adoption_storage(
-            session, prepared, destination_schema, sealed_owner_oid, pin_id, publication_request
+            session, prepared, destination_schema, pin_id, publication_request, roles=roles
         )
         return _validation(
             prepared,
             package_id,
-            sealed_owner_oid,
+            None,
             destination_schema,
             expected_current_run_id,
             pin_id,
             publication=publication,
             projection=projection,
         )
-    receipt = _validation(prepared, package_id, sealed_owner_oid, destination_schema, expected_current_run_id, pin_id)
+    receipt = _validation(prepared, package_id, None, destination_schema, expected_current_run_id, pin_id)
     await _adopt_and_pin(session, prepared, destination_schema, pin_id, receipt)
     return receipt
 
@@ -2005,25 +2106,26 @@ def _publication_copy_request(manifest, request):
     return None
 
 
-async def _prepare_adoption_storage(session, prepared, schema, owner_oid, pin_id, publication_request):
+async def _prepare_adoption_storage(session, prepared, schema, pin_id, publication_request, *, roles=None):
     """Prepare evidence and any projection under one aggregate native COPY budget."""
     source_copy = publication_request["source_copy"]
     deadline = asyncio.get_running_loop().time() + source_copy.timeout
     publication, remaining = await _prepare_publication(
         session, prepared, schema, source_copy=source_copy, deadline=deadline
     )
+    await native.seal_model_family_storage(session, prepared.ownership, roles=roles)
     projection = None
     if prepared.manifest["importer_id"] == PROJECTION_IMPORTER:
-        from process.florida_projection_archive import prepare_native_cutover
+        from process.florida_projection_named_source import prepare_named_cutover
 
         _require(remaining > 0, "publication COPY byte cap exceeded")
         projection_copy = native.ReferenceFamilySourceCopy(source_copy.copy_rows, remaining, source_copy.timeout)
-        projection = await prepare_native_cutover(
+        projection = await prepare_named_cutover(
             session,
             prepared=prepared,
             schema=schema,
             expected=publication_request["expected"],
-            owner_oid=owner_oid,
+            roles=roles,
             cutover_id=pin_id,
             source_copy=projection_copy,
             deadline=deadline,
@@ -2033,9 +2135,11 @@ async def _prepare_adoption_storage(session, prepared, schema, owner_oid, pin_id
 
 async def _prepare_publication(session, prepared, destination_schema, *, source_copy, deadline):
     """Load only novel runs into model heaps, finish all indexes, then check indexed sets."""
-    oid_by_name = dict(prepared.ownership.relation_oids)
+    references_by_name = {
+        name: _reference(prepared.ownership.schema_name, name) for name in prepared.ownership.relation_names
+    }
     _require(
-        set(oid_by_name) == set(source_spec(prepared.manifest["importer_id"], publication=True).table_names),
+        set(references_by_name) == set(source_spec(prepared.manifest["importer_id"], publication=True).table_names),
         "attachment heaps are unavailable",
     )
     await _require_stage_topology(session, prepared.ownership)
@@ -2056,8 +2160,10 @@ async def _prepare_publication(session, prepared, destination_schema, *, source_
         "contract": ATTACHMENT_CONTRACT,
         "created_run_ids": created_run_ids,
         "reused_run_ids": reused_run_ids,
-        "parents": [[name, await native._relation_oid(session, destination_schema, name)] for name in TABLES],
-        "children": [[name, child, oid_by_name[child]] for name, child in zip(TABLES, PUBLICATION_TABLES, strict=True)],
+        "parents": [[name, _reference(destination_schema, name)] for name in TABLES],
+        "children": [
+            [name, child, references_by_name[child]] for name, child in zip(TABLES, PUBLICATION_TABLES, strict=True)
+        ],
         "ancestor_relations": [
             [run_id, await _ancestor_relations(session, destination_schema, run_id)] for run_id in reused_run_ids
         ],
@@ -2068,7 +2174,6 @@ async def _prepare_publication(session, prepared, destination_schema, *, source_
 
 async def _load_publication_models(session, prepared, created_run_ids, source_copy, deadline):
     """Populate inert evidence children through the selected closed source-profile contract."""
-    oid_by_name = dict(prepared.ownership.relation_oids)
     _require(
         isinstance(source_copy, native.ReferenceFamilySourceCopy),
         "publication COPY capability is required",
@@ -2083,9 +2188,9 @@ async def _load_publication_models(session, prepared, created_run_ids, source_co
         _require(
             await session.scalar(
                 text(
-                    "SELECT NOT EXISTS(SELECT 1 FROM pg_index WHERE indrelid=:oid) AND NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=:oid AND contype<>'n')"
+                    "SELECT NOT EXISTS(SELECT 1 FROM pg_index WHERE indrelid=to_regclass(:relation)) AND NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=to_regclass(:relation) AND contype<>'n')"
                 ),
-                {"oid": oid_by_name[child]},
+                {"relation": _table(prepared.ownership.schema_name, child)},
             ),
             "attachment heap is not inert",
         )
@@ -2102,12 +2207,13 @@ async def _load_publication_models(session, prepared, created_run_ids, source_co
 
 
 async def _ancestor_relations(session, destination_schema, run_id):
-    """Bind an ancestor's physical family, including empty payload members, not only its parent names."""
+    """Locate the complete named family and compare aggregate run placement."""
     relation = (
         (
             await session.execute(
                 text(
-                    f"SELECT c.oid,c.relname,n.nspname FROM {_table(destination_schema, TABLES[0])} r JOIN pg_class c ON c.oid=r.tableoid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE r.run_id=:run"
+                    f"SELECT DISTINCT c.relname,n.nspname FROM {_table(destination_schema, TABLES[0])} r "
+                    "JOIN pg_class c ON c.oid=r.tableoid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE r.run_id=:run"
                 ),
                 {"run": run_id},
             )
@@ -2118,22 +2224,19 @@ async def _ancestor_relations(session, destination_schema, run_id):
     is_parent_local = relation["nspname"] == destination_schema and relation["relname"] == TABLES[0]
     _require(
         is_parent_local or _STAGE.fullmatch(relation["nspname"]) and relation["relname"] == PUBLICATION_TABLES[0],
-        "ancestor physical owner differs",
+        "ancestor family differs",
     )
-    names = TABLES if is_parent_local else PUBLICATION_TABLES
     pairs = []
-    for name, physical_name in zip(TABLES, names, strict=True):
-        oid = await native._relation_oid(session, relation["nspname"], physical_name)
-        _require(
-            await session.scalar(
-                text(
-                    f"SELECT NOT EXISTS(SELECT 1 FROM {_table(destination_schema, name)} WHERE run_id=:run AND tableoid<>:oid)"
-                ),
-                {"run": run_id, "oid": oid},
-            ),
-            "ancestor physical rows differ",
+    for name, stored_name in zip(TABLES, TABLES if is_parent_local else PUBLICATION_TABLES, strict=True):
+        total = await session.scalar(
+            text(f"SELECT count(*) FROM {_table(destination_schema, name)} WHERE run_id=:run"), {"run": run_id}
         )
-        pairs.append([name, oid])
+        stored = await session.scalar(
+            text(f"SELECT count(*) FROM ONLY {_table(relation['nspname'], stored_name)} WHERE run_id=:run"),
+            {"run": run_id},
+        )
+        _require(total == stored, "ancestor run placement differs")
+        pairs.append([name, _reference(relation["nspname"], stored_name)])
     return pairs
 
 
@@ -2142,7 +2245,7 @@ async def _validate_publication_sets(session, prepared, publication):
     _validate_publication(publication, prepared)
     for model, child in zip(MODELS, PUBLICATION_TABLES, strict=True):
         name = model.__tablename__
-        child_oid = dict(prepared.ownership.relation_oids)[child]
+        child_oid = await native._relation_oid(session, prepared.ownership.schema_name, child)
         observed = await native.catalog_identity._schema_identity(
             session, child_oid, prepared.ownership.schema_name, name, names_by_stage={child: name}
         )
@@ -2173,13 +2276,14 @@ async def _validate_publication_sets(session, prepared, publication):
 async def _require_publication_preimage(session, prepared, publication, destination_schema):
     """Recheck the exact ancestor and canonical catalog preimage before attaching under its write fence."""
     _validate_publication(publication, prepared)
-    parents = [[name, await native._relation_oid(session, destination_schema, name)] for name in TABLES]
+    parents = [[name, _reference(destination_schema, name)] for name in TABLES]
     _require(parents == publication["parents"], "attachment parent catalog changed")
     for run_id in publication["created_run_ids"]:
         _require(await _run(session, destination_schema, run_id) is None, "attachment run appeared locally")
     for run_id, pairs in publication["ancestor_relations"]:
         _require(
-            await _ancestor_relations(session, destination_schema, run_id) == pairs,
+            all(type(reference) is int for _name, reference in pairs)
+            or await _ancestor_relations(session, destination_schema, run_id) == pairs,
             "attachment ancestor catalog changed",
         )
     if publication["reused_run_ids"]:
@@ -2210,7 +2314,8 @@ async def _attach_publication(session, prepared, publication, destination_schema
                 "attachment key overlaps existing rows",
             )
     connection = await session.connection()
-    for name, child, oid in publication["children"]:
+    for name, child, reference in publication["children"]:
+        oid = await native._relation_oid(session, reference["schema"], reference["name"])
         _require(
             not await session.scalar(
                 text("SELECT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=:oid OR inhparent=:oid)"), {"oid": oid}
@@ -2224,19 +2329,35 @@ async def _attach_publication(session, prepared, publication, destination_schema
 
 
 async def _require_stage_topology(session, ownership, publication=None):
-    """Only exact recorded leaf attachments may touch an owned archive namespace."""
+    """Require only the declared native inheritance edges of this named stage."""
+    if publication is not None:
+        parent_schemas = {reference["schema"] for _, reference in publication["parents"] if isinstance(reference, dict)}
+        _require(len(parent_schemas) == 1, "attachment parent names are unavailable")
+        publication = _named_publication(publication, ownership, parent_schemas.pop())
     expected = (
         []
         if publication is None
-        else sorted((child[2], dict(publication["parents"])[child[0]]) for child in publication["children"])
+        else sorted(
+            (
+                child[2]["schema"],
+                child[2]["name"],
+                dict(publication["parents"])[child[0]]["schema"],
+                dict(publication["parents"])[child[0]]["name"],
+            )
+            for child in publication["children"]
+        )
     )
-    rows = await session.execute(
+    edge_rows = await session.execute(
         text(
-            "SELECT inhrelid,inhparent FROM pg_inherits WHERE inhrelid=ANY(CAST(:oids AS oid[])) OR inhparent=ANY(CAST(:oids AS oid[])) ORDER BY inhrelid,inhparent"
+            "SELECT cn.nspname,c.relname,pn.nspname,p.relname FROM pg_inherits h "
+            "JOIN pg_class c ON c.oid=h.inhrelid JOIN pg_namespace cn ON cn.oid=c.relnamespace "
+            "JOIN pg_class p ON p.oid=h.inhparent JOIN pg_namespace pn ON pn.oid=p.relnamespace "
+            "WHERE cn.nspname=:schema AND c.relname=ANY(CAST(:names AS text[])) "
+            "OR pn.nspname=:schema AND p.relname=ANY(CAST(:names AS text[])) ORDER BY 1,2,3,4"
         ),
-        {"oids": [oid for _, oid in ownership.relation_oids]},
+        {"schema": ownership.schema_name, "names": list(ownership.relation_names)},
     )
-    _require([tuple(row) for row in rows] == expected, "attachment topology differs")
+    _require([tuple(edge_row) for edge_row in edge_rows] == expected, "attachment topology differs")
 
 
 async def _adopt_and_pin(session, prepared, destination_schema, pin_id, receipt):
@@ -2290,7 +2411,7 @@ async def _adopt_rows(session, prepared, destination_schema):
             _require(existing == incoming, "local ancestor content differs")
     for model in MODELS:
         name = model.__tablename__
-        source_oid = dict(prepared.ownership.relation_oids)[name]
+        source_oid = await native._relation_oid(session, prepared.ownership.schema_name, name)
         destination_oid = await native._relation_oid(session, destination_schema, name)
         source_schema_sha = await native._family_schema_identity(
             session, manifest["importer_id"], source_oid, prepared.ownership.schema_name, name
@@ -2413,7 +2534,7 @@ def _validate_adoption_pins(group, manifest, receipt):
         run_ids == manifest["run_ids"]
         and all(
             row["purpose"] == "adoption"
-            and row["authority_json"].get("validation") == receipt
+            and logical_validation(row["authority_json"].get("validation")) == logical_validation(receipt)
             and type(row["authority_json"].get("created_here")) is bool
             for row in group
         ),
@@ -2429,7 +2550,7 @@ async def activate_validated_result(
     expected_current_run_id,
     validation,
     package_id,
-    sealed_owner_oid,
+    sealed_owner_oid=None,
     pin_id,
 ):
     """Publish v2 indexed relations, pins and pointer in one native transaction."""
@@ -2444,7 +2565,7 @@ async def activate_validated_result(
         publication=validation.get("publication"),
         projection=validation.get("projection"),
     )
-    _require(validation == expected, "adoption validation changed")
+    _require(logical_validation(validation) == logical_validation(expected), "adoption validation changed")
     await _adopt_validated_result(session, prepared, expected)
     await _publish_result_pointer(session, prepared, expected)
     return _activation_result(manifest, expected)
@@ -2455,16 +2576,19 @@ async def activate_retained_result(session, *, prepared, validation, publication
     expected = _validation(
         prepared,
         validation["package_id"],
-        validation["sealed_owner_oid"],
+        validation.get("sealed_owner_oid"),
         validation["destination_schema"],
         validation["expected_current_run_id"],
         UUID(validation["pin_id"]),
         publication=validation.get("publication"),
         projection=validation.get("projection"),
     )
-    _require(validation == expected and callable(publication_continuation), "source retained validation differs")
+    _require(
+        logical_validation(validation) == logical_validation(expected) and callable(publication_continuation),
+        "source retained validation differs",
+    )
     await _adopt_validated_result(session, prepared, expected)
-    transaction_id = await session.scalar(text("SELECT pg_current_xact_id()::text"))
+    transaction = getattr(session, "get_transaction", lambda: session)()
     published_ids = []
 
     async def publish():
@@ -2472,10 +2596,10 @@ async def activate_retained_result(session, *, prepared, validation, publication
         _require(
             not published_ids
             and session.in_transaction()
-            and await session.scalar(text("SELECT pg_current_xact_id()::text")) == transaction_id,
+            and getattr(session, "get_transaction", lambda: session)() is transaction,
             "source installed publication transaction changed",
         )
-        published_ids.append(transaction_id)
+        published_ids.append(True)
         await _publish_result_pointer(session, prepared, expected, retained_serving=True)
 
     await publication_continuation(session, publish)
@@ -2486,20 +2610,20 @@ async def activate_retained_result(session, *, prepared, validation, publication
 async def _adopt_validated_result(session, prepared, expected):
     """Keep the original adoption, ownership, pin and complete producer checks shared."""
     manifest = prepared.manifest
-    destination_schema, sealed_owner_oid = expected["destination_schema"], expected["sealed_owner_oid"]
+    destination_schema = expected["destination_schema"]
     expected_current_run_id, pin_id = expected["expected_current_run_id"], UUID(expected["pin_id"])
     await _admission(
         session, manifest, destination_schema, expected_current_run_id, projection=expected.get("projection")
     )
+    # The frozen stage owner keeps SELECT; the bounded native attachment takes its own DDL locks.
     await native._lock_family(
         session,
         prepared.ownership.schema_name,
-        tuple(name for name, _ in prepared.ownership.relation_oids),
-        "SHARE",
+        prepared.ownership.relation_names,
+        "ACCESS SHARE",
         nowait=True,
     )
     await verify_ownership(session, prepared.ownership)
-    await native._verify_stage_owner(session, prepared.ownership, sealed_owner_oid)
     await require_pin_guards(session, destination_schema)
     if manifest["contract"] == CONTRACT:
         await _adopt_and_pin(session, prepared, destination_schema, pin_id, expected)
@@ -2523,36 +2647,19 @@ async def _publish_result_pointer(session, prepared, validation, *, retained_ser
     """Switch only the source's serving pointer or exact prepared projection in the owning transaction."""
     manifest = prepared.manifest
     destination_schema = validation["destination_schema"]
-    if retained_serving:
-        from process.entity_address_snapshot_preparation import _seal_published_relation
-
-        await _seal_published_relation(
-            session,
-            await native._relation_oid(session, destination_schema, "provider_profile_source_publication"),
-            validation["sealed_owner_oid"],
-        )
     if manifest["importer_id"] == PROJECTION_IMPORTER:
         from process import florida_projection_archive as florida
+        from process import florida_projection_named_source as named_projection
 
         await florida.require_native_publication_order(
             session, prepared, destination_schema, validation["projection"]["expected"]
         )
-        if retained_serving:
-            await florida.publish_retained_projection(
-                session,
-                destination_schema,
-                validation["projection"]["cutover"],
-                validation["projection"]["expected"],
-                manifest["run_id"],
-                validation["sealed_owner_oid"],
-            )
-            return
-        await florida._cutover_prepared_projection(
+        await named_projection.publish_named_source_projection(
             session,
             destination_schema,
-            manifest["run_id"],
-            UUID(validation["pin_id"]),
             validation["projection"]["cutover"],
+            validation["projection"]["expected"],
+            manifest["run_id"],
         )
     else:
         await session.execute(
@@ -2577,7 +2684,7 @@ async def activate_result(
     destination_schema,
     expected_current_run_id,
     package_id,
-    sealed_owner_oid,
+    sealed_owner_oid=None,
     pin_id,
     publication_request=None,
 ):
@@ -2590,7 +2697,8 @@ async def activate_result(
         sealed_owner_oid=sealed_owner_oid,
         pin_id=pin_id,
     )
-    validation = await prepare_activation(session, **activation_by_field, publication_request=publication_request)
+    preparation_by_field = {key: value for key, value in activation_by_field.items() if key != "sealed_owner_oid"}
+    validation = await prepare_activation(session, **preparation_by_field, publication_request=publication_request)
     return await activate_validated_result(session, validation=validation, **activation_by_field)
 
 
@@ -2649,15 +2757,16 @@ async def rollback_validated_result(
     if manifest["contract"] == CONTRACT:
         ownership = _publication_ownership(receipt)
         await verify_ownership(session, ownership)
-        await native._verify_stage_owner(session, ownership, receipt["sealed_owner_oid"])
         await _require_publication_parents(session, schema, receipt["publication"])
-        await _require_stage_topology(session, ownership, receipt["publication"])
+        await _require_stage_topology(session, ownership, _named_publication(receipt["publication"], ownership, schema))
     if importer_id == PROJECTION_IMPORTER:
-        from process import florida_projection_archive as florida
-
         prepared = PreparedResult(manifest, ownership)
         await validate_stage(session, ownership, manifest)
-        await florida.rollback_native_projection(session, prepared, schema, pointer, receipt["projection"])
+        from process import florida_projection_named_source as named_projection
+
+        await named_projection.rollback_named_source_projection(
+            session, prepared, schema, pointer, receipt["projection"]
+        )
     else:
         await _restore_pointer(session, schema, importer_id, expected_current_run_id, expected_previous_run_id)
     return {
@@ -2680,7 +2789,7 @@ async def rollback_retained_result(
     serving_relation_oid=None,
 ):
     """Restore exact native/installed custody without inventing installation or heap identity."""
-    await native.protected_publisher_owner(session)
+    native.model_family_roles()
     manifest = validate_manifest(manifest)
     importer_id, expected_previous_run_id = manifest["importer_id"], manifest["run_id"]
     await _source_lock(session, schema, importer_id)
@@ -2708,12 +2817,15 @@ async def rollback_retained_result(
         _validate_adoption_pins(await _pin_group(session, schema, pin_id), manifest, receipt)
     ownership = _publication_ownership(receipt)
     await verify_ownership(session, ownership)
-    await native._verify_stage_owner(session, ownership, receipt["sealed_owner_oid"])
-    await _require_stage_topology(session, ownership, receipt.get("publication"))
+    await _require_stage_topology(
+        session,
+        ownership,
+        _named_publication(receipt["publication"], ownership, schema) if "publication" in receipt else None,
+    )
     if "publication" in receipt:
         await _require_publication_parents(session, schema, receipt["publication"])
     if importer_id == PROJECTION_IMPORTER:
-        await _restore_retained_projection(session, schema, receipt, pointer, serving_relation_oid)
+        await _restore_retained_projection(session, schema, receipt, pointer, serving_relation_oid, manifest=manifest)
     else:
         await _restore_pointer(session, schema, importer_id, expected_current_run_id, expected_previous_run_id)
     return {
@@ -2723,32 +2835,14 @@ async def rollback_retained_result(
     }
 
 
-async def _restore_retained_projection(session, schema, receipt, pointer, serving_relation_oid):
-    """Restore only the original serving OID authenticated by its origin's local receipt."""
-    from process.florida_projection_archive import publish_retained_projection, retained_projection_name
+async def _restore_retained_projection(
+    session, schema, receipt, pointer, legacy_serving_relation=None, *, manifest=None
+):
+    from process.florida_projection_named_source import rollback_named_source_projection
 
-    if receipt["contract"] == NATIVE_CAPTURE_CONTRACT:
-        expected_oid = receipt["serving"]["relation_oid"]
-    elif receipt["contract"] == NATIVE_PUBLICATION_CONTRACT:
-        expected_oid = receipt["handoff"]["projection"]["relation_oid"]
-    else:
-        expected_oid = receipt["projection"]["cutover"]["relation_oid"]
-    _require(
-        serving_relation_oid == expected_oid == pointer["previous_relation_oid"],
-        "source retained rollback serving OID differs",
-    )
-    await publish_retained_projection(
-        session,
-        schema,
-        {
-            "relation_oid": expected_oid,
-            "owner_oid": receipt["sealed_owner_oid"],
-            "table_name": retained_projection_name(expected_oid),
-        },
-        pointer,
-        pointer["previous_run_id"],
-        receipt["sealed_owner_oid"],
-    )
+    prepared = PreparedResult(manifest or receipt["result"], _publication_ownership(receipt))
+    await validate_stage(session, prepared.ownership, prepared.manifest)
+    await rollback_named_source_projection(session, prepared, schema, pointer, receipt.get("projection"))
 
 
 async def _validated_rollback_seal(session, schema, pin_id, manifest, package_id):
@@ -2794,12 +2888,24 @@ async def release_source_pin(session, *, schema, importer_id, run_id, pin_id):
     run_ids = _validate_pin_group(group, importer_id, run_id)
     for selected_id in sorted(run_ids):
         await pins.lock_run(session, schema, selected_id)
-    publication = group[0]["authority_json"].get("validation", {}).get("publication")
+    receipt = group[0]["authority_json"].get("validation", {})
+    publication = receipt.get("publication")
     if publication is not None:
+        ownership = _publication_ownership(receipt)
+        publication = _named_publication(publication, ownership, _receipt_destination(receipt))
+        child_names = [child[1] for child in publication["children"]]
+        _require(
+            set(child_names) == set(PUBLICATION_TABLES) and len(child_names) == len(PUBLICATION_TABLES),
+            "attachment child names differ",
+        )
         _require(
             not await session.scalar(
-                text("SELECT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid=ANY(CAST(:oids AS oid[])))"),
-                {"oids": [child[2] for child in publication["children"]]},
+                text(
+                    "SELECT EXISTS(SELECT FROM pg_inherits h JOIN pg_class c ON c.oid=h.inhrelid "
+                    "JOIN pg_namespace n ON n.oid=c.relnamespace "
+                    "WHERE n.nspname=:schema AND c.relname=ANY(CAST(:names AS text[])))"
+                ),
+                {"schema": ownership.schema_name, "names": child_names},
             ),
             "attached source seal is retained",
         )
@@ -2842,15 +2948,15 @@ async def cleanup_adoption(session, *, schema, importer_id, run_id, pin_id):
 async def _detach_publication(session, destination_schema, receipt):
     """Detach the exact leaf family before dropping its durable owning seal."""
     ownership = _publication_ownership(receipt)
-    _require(receipt["destination_schema"] == destination_schema, "attachment ownership changed")
-    publication = receipt["publication"]
+    _require(_receipt_destination(receipt) == destination_schema, "attachment ownership changed")
+    publication = _named_publication(receipt["publication"], ownership, destination_schema)
     await native._lock_family(session, destination_schema, TABLES, "SHARE ROW EXCLUSIVE", nowait=True)
     await native._lock_family(session, ownership.schema_name, PUBLICATION_TABLES, "ACCESS EXCLUSIVE", nowait=True)
     await verify_ownership(session, ownership)
     await _require_publication_parents(session, destination_schema, publication)
     await _require_stage_topology(session, ownership, publication)
     connection = await session.connection()
-    for name, child, _oid in publication["children"]:
+    for name, child, _reference_value in publication["children"]:
         await connection.exec_driver_sql(
             f"ALTER TABLE {_table(ownership.schema_name, child)} NO INHERIT {_table(destination_schema, name)}"
         )
@@ -2858,25 +2964,29 @@ async def _detach_publication(session, destination_schema, receipt):
 
 
 def _publication_ownership(receipt):
-    """Reconstruct only the stage identity already bound by the local seal."""
-    ownership_by_field = receipt["ownership"]
-    ownership = StageOwnership(
-        ownership_by_field["importer_id"],
-        UUID(ownership_by_field["dataset_id"]),
-        ownership_by_field["schema_oid"],
-        tuple(tuple(pair) for pair in ownership_by_field["relation_oids"]),
-    )
-    _require(ownership_dict(ownership) == ownership_by_field, "attachment ownership changed")
-    return ownership
+    """Load the saved declaration without database-local identity checks."""
+    return ownership_value(receipt["ownership"])
 
 
-async def _require_publication_parents(session, destination_schema, publication):
-    """Bind the destination namespace to the exact recorded canonical parent OIDs."""
+async def _require_publication_parents(session, destination_schema, publication_by_field):
+    publication_by_field = {
+        **publication_by_field,
+        "parents": [
+            [name, _reference(destination_schema, name) if type(reference) is int else reference]
+            for name, reference in publication_by_field["parents"]
+        ],
+    }
     _require(
-        [[name, await native._relation_oid(session, destination_schema, name)] for name in TABLES]
-        == publication["parents"],
-        "attachment parent catalog changed",
+        [[name, _reference(destination_schema, name)] for name in TABLES] == publication_by_field["parents"],
+        "attachment parent names differ",
     )
+    # A cached probe plan skips the schema USAGE check, so ask PostgreSQL for it directly.
+    _require(
+        await session.scalar(text("SELECT has_schema_privilege(:schema,'USAGE')"), {"schema": destination_schema}),
+        "attachment parents are not readable",
+    )
+    for name in TABLES:
+        await session.execute(text(f"SELECT * FROM {_table(destination_schema, name)} LIMIT 0"))
 
 
 async def _adoption_referenced(session, schema, run_ids, pin_id):
@@ -2898,41 +3008,46 @@ async def _adoption_referenced(session, schema, run_ids, pin_id):
 async def cleanup_stage(session, ownership, *, publication=None, destination_schema=None):
     """Drop only the exact unattached family after its owning seals are released."""
     native._require_transaction(session)
-    names = tuple(name for name, _ in ownership.relation_oids)
-    await native._lock_family(session, ownership.schema_name, names, "ACCESS EXCLUSIVE", nowait=True)
-    await verify_ownership(session, ownership)
-    await _require_stage_topology(session, ownership)
-    if set(names) == set(source_spec(ownership.importer_id, publication=True).table_names):
-        populated = any(
-            [
-                await session.scalar(text(f"SELECT EXISTS(SELECT 1 FROM {_table(ownership.schema_name, name)})"))
-                for name in PUBLICATION_TABLES
-            ]
-        )
-        if populated:
-            _require(
-                isinstance(publication, Mapping) and isinstance(destination_schema, str),
-                "detached publication cleanup authority is required",
+    async with session.begin_nested():
+        async with native._bounded_capture(session):
+            names = ownership.relation_names
+            await native._lock_family(session, ownership.schema_name, names, "ACCESS SHARE", nowait=True)
+            await verify_ownership(session, ownership)
+            await _require_stage_topology(session, ownership)
+            if set(names) == set(source_spec(ownership.importer_id, publication=True).table_names):
+                populated = any(
+                    [
+                        await session.scalar(
+                            text(f"SELECT EXISTS(SELECT 1 FROM {_table(ownership.schema_name, name)})")
+                        )
+                        for name in PUBLICATION_TABLES
+                    ]
+                )
+                if populated:
+                    _require(
+                        isinstance(publication, Mapping) and isinstance(destination_schema, str),
+                        "detached publication cleanup authority is required",
+                    )
+                    publication = _named_publication(publication, ownership, destination_schema)
+                    await _require_publication_parents(session, destination_schema, publication)
+                    _require(
+                        publication["children"]
+                        == [
+                            [name, child, _reference(ownership.schema_name, child)]
+                            for name, child in zip(TABLES, PUBLICATION_TABLES, strict=True)
+                        ],
+                        "detached publication ownership changed",
+                    )
+                    _require(
+                        not await session.scalar(
+                            text(
+                                f"SELECT EXISTS(SELECT 1 FROM {_table(destination_schema, pins.TABLE)} WHERE purpose='adoption' AND authority_json->'validation'->'ownership'->>'dataset_id'=:dataset)"
+                            ),
+                            {"dataset": str(ownership.dataset_id)},
+                        ),
+                        "publication owning seals remain",
+                    )
+            await session.execute(
+                text("DROP TABLE " + ", ".join(_table(ownership.schema_name, name) for name in names) + " RESTRICT")
             )
-            await _require_publication_parents(session, destination_schema, publication)
-            _require(
-                publication["children"]
-                == [
-                    [name, child, dict(ownership.relation_oids)[child]]
-                    for name, child in zip(TABLES, PUBLICATION_TABLES, strict=True)
-                ],
-                "detached publication ownership changed",
-            )
-            _require(
-                not await session.scalar(
-                    text(
-                        f"SELECT EXISTS(SELECT 1 FROM {_table(destination_schema, pins.TABLE)} WHERE purpose='adoption' AND authority_json->'validation'->'ownership'->>'dataset_id'=:dataset)"
-                    ),
-                    {"dataset": str(ownership.dataset_id)},
-                ),
-                "publication owning seals remain",
-            )
-    await session.execute(
-        text("DROP TABLE " + ", ".join(_table(ownership.schema_name, name) for name in names) + " RESTRICT")
-    )
-    await session.execute(text(f"DROP SCHEMA {native._quoted(ownership.schema_name)} RESTRICT"))
+            await session.execute(text(f"DROP SCHEMA {native._quoted(ownership.schema_name)} RESTRICT"))

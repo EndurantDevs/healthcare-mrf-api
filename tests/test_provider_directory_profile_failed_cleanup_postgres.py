@@ -64,6 +64,12 @@ async def _seed(database):
         serving_ref=fhir._provider_directory_profile_serving_generation_ref(schema),
         old_generation="pdprofile_" + "6" * 32,
     )
+    await _install_initial_publication(database)
+    await _install_logical_cleanup_schema(database)
+    from tests.test_provider_directory_import_run_guards import _install_guard_family
+
+    async with database.engine.begin() as connection:
+        await connection.run_sync(lambda sync: _install_guard_family(sync, schema))
     await _insert_delta_serving_generation(database, scenario, lineage, oids_by_field)
     # Explicit unadmitted fixture geometry: only its runtime and writable cleanup
     # checkpoint layout are observed here; this does not exercise Profile admission.
@@ -73,54 +79,50 @@ async def _seed(database):
 
 
 async def _fresh_fixture_authorization(database, *, published_run_id=None):
-    """Fixture authority signs real layouts/DB identity/free space, without Linux runtime admission."""
-    from uuid import uuid4
-
+    """Sign real named/numeric observations; this does not prove runtime capacity admission."""
     report = await cleanup.inspect_failed_profile_cleanup(
         fhir, build_id=BUILD, owner_run_id=OWNER, published_run_id=published_run_id
     )
     now = datetime.now(timezone.utc)
     envelope, trust, key = authorization_fixture(now)
     body = envelope["authorization"]
-    body["checkpoint"], body["stages"], body["limits"] = report["checkpoint"], report["stages"], report["limits"]
+    body["checkpoint"], body["stages"], body["limits"], body["database"] = (
+        report["checkpoint"],
+        report["stages"],
+        report["limits"],
+        report["database"],
+    )
     if report.get("variant") == "initial_full_swap":
         body.update(
             contract_id=cleanup.INITIAL_CONTRACT,
-            **{field: report[field] for field in ("variant", "physical", "initial")},
+            **{field: report[field] for field in ("variant", "capacity", "initial")},
         )
     elif "variant" in report:
         body.update(
             contract_id=cleanup.LEGACY_CONTRACT,
-            **{field: report[field] for field in ("variant", "physical", "publication")},
+            **{field: report[field] for field in ("variant", "capacity", "publication")},
         )
     for field in ("authorization_id", "operation_id", "reservation_id", "nonce"):
         body[field] = uuid4().hex
-    volume_digest, free = await _server_volume_observation(database)
-    for volume in body["volumes"]:
-        volume.update(
-            volume_digest=volume_digest,
-            reserved_bytes=body["limits"][volume["volume_class"] + "_bytes"],
-            available_bytes=free,
-            available_after_all_reservations_bytes=free
-            - sum(body["limits"][field] for field in ("data_bytes", "temp_bytes", "wal_bytes")),
-        )
-    tablespace = await database.first(
-        "SELECT oid::bigint,spcname FROM pg_tablespace WHERE oid=(SELECT dattablespace FROM pg_database WHERE datname=current_database())"
-    )
-    for entry in body["database"]["tablespaces"]:
-        entry.update(tablespace_oid=tablespace[0], tablespace_name=tablespace[1], volume_digest=volume_digest)
-    body["database"].update(report["database"])
-    for field in ("database_system_identifier", "database_oid", "database_name"):
-        setattr(trust, field, body["database"][field])
-    trust.tablespaces = tuple(body["database"]["tablespaces"])
-    trust.volumes = tuple(
-        {field: entry[field] for field in ("volume_class", "volume_digest")} for entry in body["volumes"]
-    )
+    free = await _server_storage_available(database)
     prior = await database.all(
-        "SELECT reservation_id FROM mrf.provider_directory_profile_failed_cleanup_claim WHERE expires_at>clock_timestamp()"
+        "SELECT reservation_id,authorization_json FROM mrf.provider_directory_profile_failed_cleanup_claim WHERE expires_at>clock_timestamp()"
     )
+    outstanding_by_class = {role: 0 for role in ("data", "temp", "wal")}
+    for claim_row in prior:
+        prior_body = cleanup.json.loads(claim_row[1])
+        for role in outstanding_by_class:
+            outstanding_by_class[role] += prior_body["limits"][role + "_bytes"]
+    for entry in body["storage_classes"]:
+        role = entry["storage_class"]
+        reserved = body["limits"][role + "_bytes"]
+        entry.update(
+            reserved_bytes=reserved,
+            available_bytes=free,
+            available_after_all_reservations_bytes=free - reserved - outstanding_by_class[role],
+        )
     body["observations"]["accounted_reservation_ids"] = sorted(
-        [database_record[0] for database_record in prior] + [body["reservation_id"]]
+        [claim_row[0] for claim_row in prior] + [body["reservation_id"]]
     )
     return sign(body, key), trust
 
@@ -129,8 +131,7 @@ async def _prepare_disposal_case(database, monkeypatch, case, names, envelope):
     if case == "owner":
         await database.status("UPDATE mrf.import_run SET finished_at=NULL WHERE run_id=:owner", owner=OWNER)
     if case == "oid":
-        await database.status(f'DROP TABLE "mrf"."{names[0]}"')
-        await database.status(profile.profile_evidence_table_sql("mrf", names[0], logged=True))
+        await database.status(f'ALTER TABLE "mrf"."{names[0]}" RENAME TO "cleanup_displaced_evidence"')
     if case == "preimage":
         await database.status("UPDATE mrf.provider_directory_profile_build_checkpoint SET last_error='changed'")
     if case == "serving":
@@ -138,7 +139,7 @@ async def _prepare_disposal_case(database, monkeypatch, case, names, envelope):
     if case == "budget":
         # Valid signature with a deliberately insufficient separate ceiling.
         envelope["authorization"]["limits"]["wal_bytes"] = 1
-        envelope["authorization"]["volumes"][2]["reserved_bytes"] = 1
+        envelope["authorization"]["storage_classes"][2]["reserved_bytes"] = 1
         _original, _trust, key = authorization_fixture()
         envelope = sign(envelope["authorization"], key)
     if case == "claim_lost_ack":
@@ -244,13 +245,13 @@ async def test_failed_profile_cleanup_one_use(monkeypatch, case):
             profile_params="{}",
             current_run_id=None,
             observed_at=datetime.now(timezone.utc),
-            request_sha256="0" * 64,
+            verified_receipts="[]",
         )
         assert counts._mapping["unexpired_capacity_consumption_count"] == 1
         from process.provider_directory_capacity_reservation_snapshot import capacity_reservation_snapshot
 
         observed_snapshot = await capacity_reservation_snapshot(fhir)
-        assert observed_snapshot["contract_id"].endswith(".v2")
+        assert observed_snapshot["contract_id"] == "provider-directory-healthcare-capacity-reservation-snapshot.v3"
         assert len(observed_snapshot["failed_profile_cleanup_claims"]) == 1
         assert observed_snapshot["failed_profile_cleanup_claims"][0]["envelope"] == envelope
         await database.status(profile.profile_evidence_table_sql("mrf", names[0], logged=True))
@@ -263,10 +264,10 @@ async def _seed_legacy(database):
     await database.status(f'DROP TABLE "mrf"."{names[2]}"')
     await database.status("""UPDATE mrf.provider_directory_profile_build_checkpoint SET
         materialization_mode='full_swap',capacity_geometry_status='legacy_unavailable',capacity_geometry_hash=NULL,
-        capacity_geometry_json=NULL,executable_plan_hash=NULL,affected_npi_stage=NULL,affected_npi_stage_oid=NULL,
+        capacity_geometry_json=NULL,executable_plan_hash=NULL,affected_npi_stage=NULL,
         current_source_vector_hash=NULL,desired_source_vector_hash=NULL,
         current_source_context_vector_hash=NULL,desired_source_context_vector_hash=NULL,
-        evidence_stage_storage_fingerprint=NULL,profile_stage_storage_fingerprint=NULL,affected_npi_stage_storage_fingerprint=NULL""")
+        targets_json=targets_json""")
     await database.status("UPDATE mrf.import_run SET params='{}',status='canceled' WHERE run_id=:owner", owner=OWNER)
     await database.status("DELETE FROM mrf.provider_directory_profile_serving_generation")
     published = "run_" + "b" * 32
@@ -358,16 +359,18 @@ async def test_legacy_failed_profile_cleanup(monkeypatch, case):
                 params=cleanup.canonical({"changed": True}),
             )
         if case == "stage_changed":
-            await database.status(f'ALTER TABLE "mrf"."{names[0]}" ADD COLUMN changed text')
+            await database.status(
+                "UPDATE mrf.provider_directory_profile_build_checkpoint SET evidence_stage='changed_stage'"
+            )
         if case == "metadata_missing":
             await database.status(
                 "ALTER TABLE mrf.provider_directory_cms_serving_receipt RENAME TO hidden_fixture_receipt"
             )
         if case == "target_alias":
             # Re-sign exact aliasing manifest; closed validation refuses before any claim.
-            envelope["authorization"]["stages"][0]["oid"] = envelope["authorization"]["publication"]["targets"][0][
-                "oid"
-            ]
+            envelope["authorization"]["stages"][0].update(
+                {name: envelope["authorization"]["publication"]["targets"][0][name] for name in ("schema", "name")}
+            )
             _unused, _trust, key = authorization_fixture()
             envelope = sign(envelope["authorization"], key)
         if case != "success":
@@ -400,10 +403,10 @@ async def test_cleanup_catalog_payload_projection(monkeypatch, case, record_prop
                 await _fresh_fixture_authorization(database, published_run_id=published)
         else:
             envelope, trust = await _fresh_fixture_authorization(database, published_run_id=published)
-            dependencies = envelope["authorization"]["physical"]["stage_dependencies"]
+            dependencies = envelope["authorization"]["capacity"]["stage_dependencies"]
             if case == "signed_payload_changed":
                 await database.status(f"""COMMENT ON TABLE "mrf"."{names[0]}" IS 'changed catalog payload'""")
-                with pytest.raises(RuntimeError, match="physical_preimage_changed"):
+                with pytest.raises(RuntimeError, match="capacity_preimage_changed"):
                     await cleanup.execute_failed_profile_cleanup(
                         fhir,
                         envelope,
@@ -446,93 +449,58 @@ async def test_cleanup_catalog_fence_refuses_contention_before_claim(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_cleanup_catalog_role_refuses_without_privilege_elevation(monkeypatch):
+async def test_cleanup_catalog_lock_uses_native_permissions_without_elevation(monkeypatch):
     from sqlalchemy import text as sql_text
 
     async with admission_database(monkeypatch) as database:
         names = await _seed(database)
         async with database.transaction() as session:
             await session.execute(sql_text("SET LOCAL ROLE pg_monitor"))
-            assert await database.scalar("SELECT rolsuper FROM pg_roles WHERE rolname=current_user") is False
-            for locking in (False, True):
-                with pytest.raises(RuntimeError, match="catalog_role_unsupported"):
-                    await cleanup._require_drop_catalog_role(fhir, locking=locking)
+            async with session.begin_nested() as nested:
+                with pytest.raises(Exception, match="permission denied|must be owner"):
+                    await cleanup._lock_drop_catalogs(fhir)
+                await nested.rollback()
         assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_profile_failed_cleanup_claim") == 0
-        assert all([await fhir._provider_directory_profile_stage_relation_identity("mrf", name) for name in names])
+        assert all(
+            [await database.scalar("SELECT to_regclass(:name) IS NOT NULL", name="mrf." + name) for name in names]
+        )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["default", "check", "index_expression", "foreign_key", "shadow_default"])
-async def test_cleanup_metadata_refuses_executable_catalog_before_claim(monkeypatch, case):
-    from sqlalchemy import text as sql_text
-
+@pytest.mark.parametrize("dependent_stage", [0, 1])
+async def test_cleanup_native_restrict_preserves_data_checkpoint_and_spent_claim(monkeypatch, dependent_stage):
+    """A dependent view refuses DROP; a prior DROP rolls back and spent funding remains."""
     async with admission_database(monkeypatch) as database:
         names = await _seed(database)
-        envelope, trust = await _fresh_fixture_authorization(database)
-        before_by_field = dict(
+        checkpoint_before_by_field = dict(
             (await database.first("SELECT * FROM mrf.provider_directory_profile_build_checkpoint"))._mapping
         )
-        await database.status("CREATE TABLE mrf.unmodeled_cleanup_write (observed_at timestamptz)")
-        await database.status("""CREATE FUNCTION mrf.clock_timestamp() RETURNS timestamptz LANGUAGE plpgsql AS $$
-            BEGIN INSERT INTO mrf.unmodeled_cleanup_write VALUES (pg_catalog.clock_timestamp());
-            RETURN pg_catalog.clock_timestamp(); END; $$""")
-        if case in {"default", "shadow_default"}:
-            await database.status(
-                "ALTER TABLE mrf.provider_directory_profile_failed_cleanup_claim "
-                "ALTER COLUMN claimed_at SET DEFAULT mrf.clock_timestamp()"
-            )
-        if case == "check":
-            await database.status(
-                "ALTER TABLE mrf.provider_directory_profile_build_checkpoint "
-                "ADD CHECK (mrf.clock_timestamp() IS NOT NULL)"
-            )
-            # Adding a CHECK validates existing rows; cleanup must add no further writes.
-            await database.status("TRUNCATE mrf.unmodeled_cleanup_write")
-        if case == "index_expression":
-            await database.status(
-                "CREATE INDEX unmodeled_cleanup_expression ON "
-                "mrf.provider_directory_profile_failed_cleanup_claim ((lower(operation_id)))"
-            )
-        if case == "foreign_key":
-            await database.status(
-                "ALTER TABLE mrf.provider_directory_profile_failed_cleanup_claim "
-                "ADD FOREIGN KEY (owner_run_id) REFERENCES mrf.import_run(run_id)"
-            )
-        if case == "shadow_default":
-            async with database.transaction() as session:
-                await session.execute(sql_text("SET LOCAL search_path=mrf,pg_catalog"))
-                with pytest.raises(RuntimeError, match="metadata_executable_dependency_unsupported"):
-                    await cleanup._metadata_layouts(
-                        fhir,
-                        "mrf",
-                        locked=False,
-                        tablespace_oid=envelope["authorization"]["database"]["tablespaces"][0]["tablespace_oid"],
-                    )
-        with pytest.raises(RuntimeError, match="metadata_catalog_unsupported"):
-            await _fresh_fixture_authorization(database)
-        with pytest.raises(RuntimeError, match="metadata_catalog_unsupported"):
+        await database.status(
+            f'CREATE VIEW mrf.retained_cleanup_reader AS SELECT * FROM "mrf"."{names[dependent_stage]}"'
+        )
+        envelope, trust = await _fresh_fixture_authorization(database)
+        with pytest.raises(Exception, match="depend|dependent"):
             await cleanup.execute_failed_profile_cleanup(
                 fhir, envelope, cleanup_trust=trust, executor_identity=envelope["authorization"]["executor_identity"]
             )
-        assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_profile_failed_cleanup_claim") == 0
-        assert await database.scalar("SELECT count(*) FROM mrf.unmodeled_cleanup_write") == 0
+        assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_profile_failed_cleanup_claim") == 1
         assert (
             dict((await database.first("SELECT * FROM mrf.provider_directory_profile_build_checkpoint"))._mapping)
-            == before_by_field
+            == checkpoint_before_by_field
         )
-        assert all([await fhir._provider_directory_profile_stage_relation_identity("mrf", name) for name in names])
+        assert all(
+            [await database.scalar("SELECT to_regclass(:name) IS NOT NULL", name="mrf." + name) for name in names]
+        )
+        assert await database.scalar("SELECT count(*) FROM mrf.retained_cleanup_reader") == 0
+        with pytest.raises(RuntimeError, match="completion_missing"):
+            await cleanup.execute_failed_profile_cleanup(
+                fhir, envelope, cleanup_trust=trust, executor_identity=envelope["authorization"]["executor_identity"]
+            )
 
 
-async def _server_volume_observation(database):
-    """Observe real data/WAL storage on the server, including separated CI filesystems."""
+async def _server_storage_available(database):
+    """Take the minimum genuine free-byte observation without filesystem identity."""
     directory = await database.scalar("SHOW data_directory")
-    assert await database.scalar("SHOW temp_tablespaces") == ""
-    assert (
-        await database.scalar(
-            "SELECT pg_tablespace_location(dattablespace) FROM pg_database WHERE datname=current_database()"
-        )
-        == ""
-    )
     command = "LC_ALL=C df -Pk " + shlex.quote(directory) + " " + shlex.quote(directory + "/pg_wal")
     async with database.transaction():
         await database.status("CREATE TEMP TABLE cleanup_fixture_storage (line text) ON COMMIT DROP")
@@ -540,10 +508,38 @@ async def _server_volume_observation(database):
         rows = await database.all("SELECT line FROM cleanup_fixture_storage WHERE line NOT LIKE 'Filesystem%'")
     observations = [row[0].split(maxsplit=5) for row in rows]
     assert len(observations) == 2 and all(len(row) == 6 for row in observations)
-    identities = {(row[0], row[5]) for row in observations}
-    assert len(identities) == 1, "fixture requires colocated default data/temp/WAL storage"
-    filesystem, mount = identities.pop()
-    return cleanup.digest({"filesystem": filesystem, "mount": mount}), min(int(row[3]) * 1024 for row in observations)
+    return min(int(row[3]) * 1024 for row in observations)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("object_kind", ["claim_index", "checkpoint_index"])
+async def test_cleanup_metadata_refuses_unfunded_numeric_growth(monkeypatch, object_kind):
+    async with admission_database(monkeypatch) as database:
+        names = await _seed(database)
+        envelope, trust = await _fresh_fixture_authorization(database)
+        checkpoint_before_by_field = dict(
+            (await database.first("SELECT * FROM mrf.provider_directory_profile_build_checkpoint"))._mapping
+        )
+        if object_kind == "claim_index":
+            await database.status(
+                "CREATE INDEX cleanup_extra_claim_index ON mrf.provider_directory_profile_failed_cleanup_claim (claimed_at)"
+            )
+        else:
+            await database.status(
+                "CREATE INDEX cleanup_extra_numeric_index ON mrf.provider_directory_profile_build_checkpoint (updated_at)"
+            )
+        with pytest.raises(RuntimeError, match="budget_exceeded"):
+            await cleanup.execute_failed_profile_cleanup(
+                fhir, envelope, cleanup_trust=trust, executor_identity=envelope["authorization"]["executor_identity"]
+            )
+        assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_profile_failed_cleanup_claim") == 0
+        assert (
+            dict((await database.first("SELECT * FROM mrf.provider_directory_profile_build_checkpoint"))._mapping)
+            == checkpoint_before_by_field
+        )
+        assert all(
+            [await database.scalar("SELECT to_regclass(:name) IS NOT NULL", name="mrf." + name) for name in names]
+        )
 
 
 @asynccontextmanager
@@ -574,50 +570,6 @@ async def _server_tablespace(database, name, metadata_ref):
         await admin.close()
 
 
-def _cleanup_tablespace_identity():
-    """Return exact synthetic resource coordinates before creating either resource."""
-    return "hc_cleanup_test_" + uuid4().hex
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("object_kind", ["claim_heap", "checkpoint_index"])
-async def test_cleanup_metadata_refuses_unfunded_tablespace(monkeypatch, object_kind):
-    async with admission_database(monkeypatch) as database:
-        names = await _seed(database)
-        envelope, trust = await _fresh_fixture_authorization(database)
-        before_by_field = dict(
-            (await database.first("SELECT * FROM mrf.provider_directory_profile_build_checkpoint"))._mapping
-        )
-        name = _cleanup_tablespace_identity()
-        metadata_ref = (
-            "TABLE mrf.provider_directory_profile_failed_cleanup_claim"
-            if object_kind == "claim_heap"
-            else "INDEX mrf.pd_profile_build_checkpoint_state_idx"
-        )
-        async with _server_tablespace(database, name, metadata_ref):
-            for action in (
-                _fresh_fixture_authorization(database),
-                cleanup.execute_failed_profile_cleanup(
-                    fhir,
-                    envelope,
-                    cleanup_trust=trust,
-                    executor_identity=envelope["authorization"]["executor_identity"],
-                ),
-            ):
-                with pytest.raises(RuntimeError, match="metadata_tablespace_unsupported"):
-                    await action
-            assert (
-                await database.scalar("SELECT count(*) FROM mrf.provider_directory_profile_failed_cleanup_claim") == 0
-            )
-            assert (
-                dict((await database.first("SELECT * FROM mrf.provider_directory_profile_build_checkpoint"))._mapping)
-                == before_by_field
-            )
-            assert all(
-                [await fhir._provider_directory_profile_stage_relation_identity("mrf", stage) for stage in names]
-            )
-
-
 async def _install_initial_publication(database):
     """Apply the real sibling migration after the actual cleanup dependency slice."""
     import importlib.util
@@ -628,11 +580,32 @@ async def _install_initial_publication(database):
     from tests.cms_npd_admission_postgres_support import MIGRATION_PREFIXES
 
     assert MIGRATION_PREFIXES[-4:] == ("20260930120000", "20260930130000", "20260930140000", "20261001100000")
+    if await database.scalar("SELECT to_regclass('mrf.provider_directory_profile_initial_receipt') IS NOT NULL"):
+        return
     path = Path(__file__).resolve().parents[1] / "alembic/versions/20261001110000_profile_initial_publication.py"
     spec = importlib.util.spec_from_file_location("cleanup_initial_publication_fixture", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     assert module.down_revision == "20261001100000_profile_failed_cleanup_claim"
+
+    def install(connection):
+        with Operations.context(MigrationContext.configure(connection)):
+            module.upgrade()
+
+    async with database.engine.begin() as connection:
+        await connection.run_sync(install)
+
+
+async def _install_logical_cleanup_schema(database):
+    import importlib.util
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    path = Path(__file__).resolve().parents[1] / "alembic/versions/20261116090000_profile_capacity_logical_names.py"
+    spec = importlib.util.spec_from_file_location("cleanup_logical_names_fixture", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
 
     def install(connection):
         with Operations.context(MigrationContext.configure(connection)):
@@ -669,11 +642,10 @@ async def test_cleanup_after_initial_migration(monkeypatch, record_property):
         )
 
 
-async def _seed_failed_checkpoint(database, lineage, names, oids_by_field, geometry, fingerprints):
-    """Insert the unchanged terminal owner and retained failed checkpoint fixture."""
+async def _seed_failed_checkpoint(database, lineage, names, _oids_by_field, geometry, _fingerprints):
+    """Insert terminal logical owner/source coordinates and the failed data checkpoint."""
     await database.status(
-        "INSERT INTO mrf.import_run(run_id,engine,importer,status,params,finished_at) "
-        "VALUES (:owner,'synthetic','provider-directory-fhir','failed',CAST(:params AS json),now())",
+        "INSERT INTO mrf.import_run(run_id,engine,importer,status,params,finished_at) VALUES (:owner,'synthetic','provider-directory-fhir','failed',CAST(:params AS json),now())",
         owner=OWNER,
         params=cleanup.canonical(
             {
@@ -687,16 +659,8 @@ async def _seed_failed_checkpoint(database, lineage, names, oids_by_field, geome
     )
     await database.status(
         """INSERT INTO mrf.provider_directory_profile_build_checkpoint
-        (build_id,strategy_version,schema_version,resume_lineage_hash,owner_run_id,state,profile_as_of,source_ids,retained_source_ids,
-         dataset_ids,evidence_stage,profile_stage,affected_npi_stage,evidence_stage_oid,profile_stage_oid,affected_npi_stage_oid,
-         evidence_target_oid,profile_target_oid,has_existing_artifacts,evidence_total_batches,profile_total_batches,
-         materialization_mode,refresh_source_ids,removed_source_ids,current_source_vector_hash,desired_source_vector_hash,
-         current_source_context_vector_hash,desired_source_context_vector_hash,capacity_geometry_status,capacity_geometry_hash,
-         capacity_geometry_json,executable_plan_hash,evidence_stage_storage_fingerprint,profile_stage_storage_fingerprint,
-         affected_npi_stage_storage_fingerprint,last_error)
-        VALUES (:build,:strategy,1,:lineage,:owner,'failed','2026-07-30','["source-a"]','["source-b"]','["dataset-a-new"]',
-         :evidence,:profile,:affected,:eoid,:poid,:aoid,:etarget,:ptarget,true,1,1,'source_delta','["source-a"]','[]',
-         :current,:desired,:current_context,:desired_context,'verified',:geometry_hash,CAST(:geometry AS jsonb),:plan,:efp,:pfp,:afp,:error)""",
+        (build_id,strategy_version,schema_version,resume_lineage_hash,owner_run_id,state,profile_as_of,source_ids,retained_source_ids,dataset_ids,evidence_stage,profile_stage,affected_npi_stage,targets_json,has_existing_artifacts,evidence_total_batches,profile_total_batches,materialization_mode,refresh_source_ids,removed_source_ids,current_source_vector_hash,desired_source_vector_hash,current_source_context_vector_hash,desired_source_context_vector_hash,capacity_geometry_status,capacity_geometry_hash,capacity_geometry_json,executable_plan_hash,last_error)
+        VALUES (:build,:strategy,1,:lineage,:owner,'failed','2026-07-30','["source-a"]','["source-b"]','["dataset-a-new"]',:evidence,:profile,:affected,CAST(:targets AS jsonb),true,1,1,'source_delta','["source-a"]','[]',:current,:desired,:current_context,:desired_context,'verified',:geometry_hash,CAST(:geometry AS jsonb),:plan,:error)""",
         build=BUILD,
         strategy=profile.PROFILE_BUILD_STRATEGY_VERSION,
         lineage=lineage.resume_hash,
@@ -704,11 +668,12 @@ async def _seed_failed_checkpoint(database, lineage, names, oids_by_field, geome
         evidence=names[0],
         profile=names[1],
         affected=names[2],
-        eoid=oids_by_field["evidence_stage"],
-        poid=oids_by_field["profile_stage"],
-        aoid=oids_by_field["affected_npi_stage"],
-        etarget=oids_by_field["evidence_target"],
-        ptarget=oids_by_field["profile_target"],
+        targets=cleanup.canonical(
+            {
+                role: {key: geometry.relations[role + "_target"][key] for key in ("schema", "name")}
+                for role in ("evidence", "profile")
+            }
+        ),
         current=lineage.from_vector_hash,
         desired=lineage.to_vector_hash,
         current_context=lineage.from_context_vector_hash,
@@ -716,18 +681,15 @@ async def _seed_failed_checkpoint(database, lineage, names, oids_by_field, geome
         geometry_hash=capacity.capacity_geometry_hash(geometry),
         geometry=capacity.canonical_capacity_geometry_json(geometry),
         plan=lineage.plan_hash,
-        efp=fingerprints[0],
-        pfp=fingerprints[1],
-        afp=fingerprints[2],
         error="complete synthetic failed-stage error\nretained original details",
     )
 
 
-async def _seed_geometry_and_layouts(schema, lineage, oids_by_field, names):
-    """Observe native cleanup layouts and attach the original unadmitted fixture geometry."""
+async def _seed_geometry_and_layouts(schema, lineage, _oids_by_field, _names):
+    """Measure current numeric layouts without claiming original build admission."""
     serving = await fhir._provider_directory_profile_serving_state(schema)
-    physical = await cleanup._physical_identity(fhir, schema, serving)
-    geometry_payload = _geometry_payload(
+    observed = await cleanup._capacity_identity(fhir, schema, serving)
+    geometry_by_field = _geometry_payload(
         selection_proof_id=lineage.proof_id,
         profile_schema_version=1,
         profile_strategy_version=profile.PROFILE_BUILD_STRATEGY_VERSION,
@@ -736,32 +698,19 @@ async def _seed_geometry_and_layouts(schema, lineage, oids_by_field, names):
         desired_source_vector_hash=lineage.to_vector_hash,
         current_context_vector_hash=lineage.from_context_vector_hash,
         desired_context_vector_hash=lineage.to_context_vector_hash,
-        evidence_target_oid=oids_by_field["evidence_target"],
-        profile_target_oid=oids_by_field["profile_target"],
+        relations=observed.relations,
+        physical_projection_contract_id=capacity.BOUNDED_ADMISSION_CONTRACT_ID,
+        artifact_scope_batch_size=1,
     )
-    geometry_payload.update(
-        {key: field_value for key, field_value in vars(physical).items() if key in geometry_payload}
-    )
-    metadata_oids = await fhir._profile_capacity_metadata_oids(schema)
-    geometry_payload.update({name + "_oid": oid for name, oid in metadata_oids.items()})
-    geometry_payload.update(
-        physical_projection_contract_id=capacity.BOUNDED_ADMISSION_CONTRACT_ID, artifact_scope_batch_size=1
-    )
-    geometry = capacity.validated_capacity_geometry(geometry_payload)
-    fingerprints = [
-        await fhir._provider_directory_profile_stage_storage_fingerprint(
-            schema, name, expected_oid=oids_by_field[role], lock_relation=False
-        )
-        for name, role in zip(names, ("evidence_stage", "profile_stage", "affected_npi_stage"), strict=True)
-    ]
-    return geometry, fingerprints
+    geometry_by_field.update(fhir._geometry_postgres_values(observed))
+    return capacity.validated_capacity_geometry(geometry_by_field), []
 
 
 async def _assert_failed_disposal_case(database, case, names, envelope, trust, identity, before_by_field):
     """Assert the exact refusal, retained stages and spent-claim behavior for a failed cleanup."""
     expected = {
         "owner": "owner_not_failed_terminal",
-        "oid": "stage_identity_changed",
+        "oid": "stage_missing",
         "preimage": "checkpoint_preimage_changed",
         "serving": "build_is_serving",
         "budget": "budget_exceeded",
@@ -799,10 +748,7 @@ async def _assert_legacy_disposal_success(database, envelope, trust, before_by_f
     assert {
         name: field_value for name, field_value in before_by_field.items() if name not in {"last_error", "updated_at"}
     } == {name: field_value for name, field_value in after_by_field.items() if name not in {"last_error", "updated_at"}}
-    assert (
-        after_by_field["capacity_geometry_json"] is None
-        and after_by_field["evidence_stage_storage_fingerprint"] is None
-    )
+    assert after_by_field["capacity_geometry_json"] is None
     assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_profile_serving_generation") == 0
     assert all(
         [
@@ -857,7 +803,7 @@ def _legacy_refusal_reason(case):
     """Preserve the exact expected failure for each malformed legacy authority case."""
     return {
         "published_changed": "publication_preimage_changed",
-        "stage_changed": "stage_manifest_changed",
+        "stage_changed": "checkpoint_preimage_changed",
         "metadata_missing": "installed_publication_metadata_missing",
         "target_alias": "stage_is_serving",
     }[case]
@@ -877,9 +823,7 @@ async def _seed_initial_cleanup(database, *, legacy):
     async with database.transaction():
         initial_targets = await initial.capture_targets(fhir, "mrf")
         receipt = await initial.receipt_layout(fhir, "mrf")
-        checkpoint_layout = (await cleanup._metadata_layouts(fhir, "mrf", locked=False, tablespace_oid=1663))[
-            "checkpoint"
-        ]
+        checkpoint_layout = (await cleanup._metadata_layouts(fhir, "mrf", locked=False))["checkpoint"]
     checkpoint_row = await database.first(
         "SELECT capacity_geometry_json FROM mrf.provider_directory_profile_build_checkpoint"
     )
@@ -890,9 +834,6 @@ async def _seed_initial_cleanup(database, *, legacy):
         current_source_vector_hash=None,
         current_context_vector_hash=None,
         initial_target_state_sha256=contract.target_state_sha256(initial_targets.payload),
-        initial_receipt_oid=receipt.relation_oid,
-        initial_receipt_storage_fingerprint=receipt.exact_fingerprint,
-        build_checkpoint_storage_fingerprint=checkpoint_layout.exact_fingerprint,
     )
     geometry_by_field.update(
         {
@@ -901,11 +842,16 @@ async def _seed_initial_cleanup(database, *, legacy):
             if "_target_" in name and name in geometry_by_field
         }
     )
+    geometry_by_field["relations"]["initial_receipt"] = cleanup._layout_coordinates(receipt)
+    geometry_by_field["relations"]["build_checkpoint"] = {
+        key: cleanup._layout_coordinates(checkpoint_layout)[key]
+        for key in ("schema", "name", "main_index_pages", "toast_index_pages", "toastable_column_count")
+    }
     geometry_by_field = capacity.validated_capacity_geometry(geometry_by_field)
     await database.status(
         """UPDATE mrf.provider_directory_profile_build_checkpoint SET
-        materialization_mode='full_swap',affected_npi_stage=NULL,affected_npi_stage_oid=NULL,
-        affected_npi_stage_storage_fingerprint=NULL,current_source_vector_hash=NULL,current_source_context_vector_hash=NULL,
+        materialization_mode='full_swap',affected_npi_stage=NULL,
+        current_source_vector_hash=NULL,current_source_context_vector_hash=NULL,
         capacity_geometry_hash=:hash,capacity_geometry_json=CAST(:geometry AS jsonb)""",
         hash=capacity.capacity_geometry_hash(geometry_by_field),
         geometry=capacity.canonical_capacity_geometry_json(geometry_by_field),
@@ -991,18 +937,20 @@ async def test_initial_cleanup_refuses_drift_and_never_resumes_spent_disposal(
                 "UPDATE mrf.provider_directory_profile_build_checkpoint SET capacity_geometry_hash=:hash", hash="0" * 64
             )
         if change == "target":
-            await database.status("ALTER TABLE mrf.provider_directory_profile ADD COLUMN unexpected integer")
+            await database.status(
+                "INSERT INTO mrf.provider_directory_profile SELECT 1234567890,'{}','{}',ARRAY['other-source'],ARRAY['other-endpoint'],ARRAY['other-dataset'],1,1,1,'other-generation',now()"
+            )
         if change == "receipt_layout":
             await database.status(
-                "ALTER TABLE mrf.provider_directory_profile_initial_receipt ADD COLUMN unexpected integer"
+                "ALTER TABLE mrf.provider_directory_profile_initial_receipt RENAME TO unavailable_initial_receipt"
             )
         if change in {"receipt_binding", "target_alias"}:
             if change == "receipt_binding":
-                envelope["authorization"]["initial"]["initial_receipt_storage_fingerprint"] = "0" * 64
+                envelope["authorization"]["initial"]["receipt"]["name"] = "other_receipt"
             else:
-                envelope["authorization"]["stages"][0]["oid"] = envelope["authorization"]["initial"]["target_state"][
-                    "evidence_target_oid"
-                ]
+                envelope["authorization"]["stages"][0].update(
+                    envelope["authorization"]["initial"]["target_state"]["targets"]["evidence"]
+                )
             envelope = sign(envelope["authorization"], authorization_fixture()[2])
         if change == "rollback":
             envelope = await _prepare_disposal_case(database, monkeypatch, change, names, envelope)
@@ -1017,28 +965,32 @@ async def test_initial_cleanup_refuses_drift_and_never_resumes_spent_disposal(
             [await fhir._provider_directory_profile_stage_relation_identity("mrf", name) is not None for name in names]
         )
         if change == "rollback":
-            from tests.test_provider_directory_profile_failed_cleanup import (
-                historical_trust_document,
-                install_historical_trust,
+            await _assert_spent_initial_cannot_resume(
+                monkeypatch, cleanup_history_directory, database, names, envelope, trust
             )
 
-            # Even an authentic archived signer cannot resume an incomplete spent permit.
-            with monkeypatch.context() as settings:
-                install_historical_trust(settings, cleanup_history_directory, [historical_trust_document(trust)])
-                trust.keys = ()
-                with pytest.raises(RuntimeError, match="completion_missing"):
-                    await cleanup.execute_failed_profile_cleanup(
-                        fhir,
-                        envelope,
-                        cleanup_trust=trust,
-                        executor_identity=envelope["authorization"]["executor_identity"],
-                    )
-            assert all(
-                [
-                    await fhir._provider_directory_profile_stage_relation_identity("mrf", name) is not None
-                    for name in names
-                ]
+
+async def _assert_spent_initial_cannot_resume(monkeypatch, directory, database, names, envelope, trust):
+    """An authentic retained signer cannot reuse incomplete spent disposal authority."""
+    from tests.test_provider_directory_profile_failed_cleanup import (
+        historical_trust_document,
+        install_historical_trust,
+    )
+
+    # Even an authentic archived signer cannot resume an incomplete spent permit.
+    with monkeypatch.context() as settings:
+        install_historical_trust(settings, directory, [historical_trust_document(trust)])
+        trust.keys = ()
+        with pytest.raises(RuntimeError, match="completion_missing"):
+            await cleanup.execute_failed_profile_cleanup(
+                fhir,
+                envelope,
+                cleanup_trust=trust,
+                executor_identity=envelope["authorization"]["executor_identity"],
             )
+    assert all(
+        [await fhir._provider_directory_profile_stage_relation_identity("mrf", name) is not None for name in names]
+    )
 
 
 @pytest.mark.asyncio
@@ -1153,7 +1105,7 @@ def _rotated_cleanup_trust(trust, rotation, claimed):
             trust.keys[0].retired_at = claimed + timedelta(minutes=1)
             trust.keys[0].verify_until = claimed + timedelta(minutes=16)
         case "volumes":
-            trust.volumes = tuple(dict(volume_by_field, volume_digest="0" * 64) for volume_by_field in trust.volumes)
+            trust.environment_id = "other-environment"
     return trust
 
 
@@ -1180,3 +1132,29 @@ async def _native_cleanup_operator(monkeypatch, directory, envelope, mode):
         finally:
             fhir.db.connect.assert_awaited_once()
             fhir.db.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_native_serial_cost_refused_before_claim(monkeypatch):
+    """Automatic sequence catalog work is outside the supported bounded DROP shape."""
+    async with admission_database(monkeypatch) as database:
+        names = await _seed(database)
+        envelope, trust = await _fresh_fixture_authorization(database)
+        checkpoint_before_by_field = dict(
+            (await database.first("SELECT * FROM mrf.provider_directory_profile_build_checkpoint"))._mapping
+        )
+        await database.status(
+            f'ALTER TABLE "mrf"."{names[0]}" ADD COLUMN extra_serial bigint GENERATED ALWAYS AS IDENTITY'
+        )
+        with pytest.raises(RuntimeError, match="drop_catalog_shape_unsupported"):
+            await cleanup.execute_failed_profile_cleanup(
+                fhir, envelope, cleanup_trust=trust, executor_identity=envelope["authorization"]["executor_identity"]
+            )
+        assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_profile_failed_cleanup_claim") == 0
+        assert (
+            dict((await database.first("SELECT * FROM mrf.provider_directory_profile_build_checkpoint"))._mapping)
+            == checkpoint_before_by_field
+        )
+        assert all(
+            [await database.scalar("SELECT to_regclass(:name) IS NOT NULL", name="mrf." + name) for name in names]
+        )

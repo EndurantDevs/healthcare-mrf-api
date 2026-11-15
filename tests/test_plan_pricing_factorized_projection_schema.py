@@ -106,15 +106,52 @@ def test_factorized_downgrade_refuses_immutable_v3_candidates(monkeypatch) -> No
 
 def _assert_current_registry_head(script):
     """Keep the complete catalog refresh and inventory revision chain explicit."""
-    assert script.get_heads() == ["20261114020000_custom_import_snapshot_metadata"]
+    assert script.get_heads() == ["20261116090000_profile_capacity_logical_names"]
+    assert (
+        script.get_revision("20261116090000_profile_capacity_logical_names").down_revision
+        == "20261115120000_named_output_recovery_document"
+    )
+    assert (
+        script.get_revision("20261115120000_named_output_recovery_document").down_revision
+        == "20261115110000_network_retained_read_grant_ledger"
+    )
+    assert (
+        script.get_revision("20261115110000_network_retained_read_grant_ledger").down_revision
+        == "20261115100000_prescription_rollup_named_fingerprint"
+    )
+    assert (
+        script.get_revision("20261115100000_prescription_rollup_named_fingerprint").down_revision
+        == "20261114190000_cms_native_input_named_revision"
+    )
+    assert (
+        script.get_revision("20261114190000_cms_native_input_named_revision").down_revision
+        == "20261114180000_reference_family_named_generation"
+    )
+    assert (
+        script.get_revision("20261114180000_reference_family_named_generation").down_revision
+        == "20261114170000_source_profile_named_attachment"
+    )
+    assert (
+        script.get_revision("20261114170000_source_profile_named_attachment").down_revision
+        == "20261114160000_npi_named_generation"
+    )
+    assert (
+        script.get_revision("20261114160000_npi_named_generation").down_revision
+        == "20261114130000_named_preparation_catalog"
+    )
+    assert (
+        script.get_revision("20261114130000_named_preparation_catalog").down_revision
+        == "20261114020000_custom_import_snapshot_metadata"
+    )
     assert script.get_revision("20261114020000_custom_import_snapshot_metadata").down_revision == (
         "20261114010000_custom_import_snapshot_names"
     )
     assert script.get_revision("20261114010000_custom_import_snapshot_names").down_revision == (
         "20261115010000_ms_drg_companion_tables"
     )
-    assert script.get_revision("20261115010000_ms_drg_companion_tables").down_revision == (
-        "20261113010000_address_canonical_space_normalization"
+    assert (
+        script.get_revision("20261115010000_ms_drg_companion_tables").down_revision
+        == "20261113010000_address_canonical_space_normalization"
     )
     assert script.get_revision("20261113010000_address_canonical_space_normalization").down_revision == (
         "20261111010000_code_sets_publication_idempotency"

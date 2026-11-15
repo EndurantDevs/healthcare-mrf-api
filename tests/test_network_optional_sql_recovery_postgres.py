@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Genuine column-Reader failure/recovery mechanisms, separate from Source authority."""
+"""Native optional savepoint recovery preserves named reads and their pinned data."""
 
 import json
 import os
@@ -8,13 +8,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 
-from api.network_read_execution import direct_heap_relation_sql, execute_network_read, install_network_read_inventory
-from api.provider_profile_snapshot import provider_optional_read
+from api.network_read_execution import qualified_relation_sql
+from api.provider_profile_snapshot import provider_optional_read, provider_read_savepoint
 from process.entity_address_cutover_contract import postgres_sqlstate
 from tests.cms_npd_admission_postgres_support import _owned_database
 from tests.test_network_direct_heap_reads_postgres import _column_reader_case
@@ -35,18 +34,10 @@ async def _native_case(monkeypatch):
         }.items():
             monkeypatch.setenv("HLTHPRT_DB_" + field, value)
         async with _column_reader_case(monkeypatch) as held:
-            case, _admin, session, _table, _parent, _child, oid = held
+            _case, _admin, session, _table, _parent, _child = held
             driver = (await (await session.connection()).get_raw_connection()).driver_connection
             version = int(await driver.fetchval("SHOW server_version_num"))
             assert 180000 <= version < 190000
-            assert await driver.fetchval("SELECT current_user=session_user AND current_user::text=$1", case.reader)
-            assert await driver.fetchval("SELECT NOT has_table_privilege(current_user,$1::oid,'SELECT')", oid)
-            assert await driver.fetchval("SELECT has_column_privilege(current_user,$1::oid,'id','SELECT')", oid)
-            assert not await driver.fetchval(
-                "SELECT EXISTS(SELECT FROM pg_catalog.pg_locks WHERE pid=pg_backend_pid() AND relation=$1::oid AND granted)",
-                oid,
-            )
-            await install_network_read_inventory(session, (), absent_names=((case.schema, "missing_optional_probe"),))
             yield held, driver, version
 
 
@@ -56,42 +47,39 @@ def _write_evidence(case, evidence_by_field):
 
 
 @pytest.mark.asyncio
-async def test_native_drop_after_metadata_before_first_payload_is_private_503(monkeypatch):
-    evidence_by_field = {"source_authority": False, "mechanism": "drop-before-first-payload"}
+async def test_native_missing_relation_preserves_mandatory_error(monkeypatch):
+    evidence_by_field = {"mechanism": "mandatory-error-after-relation-drop"}
     try:
-        with pytest.raises(ServiceUnavailable) as caught:
-            async with _native_case(monkeypatch) as (held, driver, version):
-                case, admin, session, _table, parent, _child, oid = held
-                evidence_by_field.update(
-                    server_version_num=version, reader_pid=driver.get_server_pid(), original_oid=oid
-                )
-                relation = direct_heap_relation_sql(session, case.schema, "direct_heap_probe")
-                await admin.execute("SET lock_timeout='250ms'")
-                await admin.execute("SET statement_timeout='2s'")
-                await admin.execute(f"DROP TABLE {parent}")
-                assert await admin.fetchval("SELECT pg_catalog.to_regclass($1)::oid", parent) is None
-                evidence_by_field["exact_parent_removed_without_payload_lock"] = True
-                await execute_network_read(session, f"SELECT p.id FROM {relation} p")
-        assert caught.value.headers["Cache-Control"] == "private, no-store"
-        assert isinstance(caught.value.__cause__, DBAPIError)
-        assert postgres_sqlstate(caught.value.__cause__) == "42P01"
-        evidence_by_field.update(
-            private_no_store_503=True, original_sqlstate="42P01", exact_fixture_and_database_cleanup=True
-        )
+        async with _native_case(monkeypatch) as (held, _driver, version):
+            case, admin, session, _table, parent, _child = held
+            relation = "ONLY " + qualified_relation_sql(case.schema, "direct_heap_probe")
+            await admin.execute("SET lock_timeout='250ms'")
+            await admin.execute("SET statement_timeout='2s'")
+            await admin.execute(f"DROP TABLE {parent}")
+            assert await admin.fetchval("SELECT pg_catalog.to_regclass($1) IS NULL", parent)
+            with pytest.raises(DBAPIError) as caught:
+                async with provider_read_savepoint(session):
+                    await session.execute(text(f"SELECT p.id FROM {relation} p"))
+            assert postgres_sqlstate(caught.value) == "42P01"
+            assert session.get_transaction().is_active
+            assert (await session.execute(text("SELECT 1"))).scalar_one() == 1
+            evidence_by_field.update(server_version_num=version, original_sqlstate="42P01", later_transaction_read=1)
+        evidence_by_field["exact_fixture_and_database_cleanup"] = True
     finally:
         _write_evidence("drop", evidence_by_field)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["statement", "timeout"])
-async def test_native_owned_rollback_revalidates_before_optional_fallback_and_later_read(monkeypatch, failure):
-    evidence_by_field = {"source_authority": False, "mechanism": "owned-rollback-before-fallback", "failure": failure}
+async def test_native_optional_rollback_preserves_pinned_rows(monkeypatch, failure):
+    evidence_by_field = {"mechanism": "savepoint-before-fallback", "failure": failure}
     try:
         async with _native_case(monkeypatch) as (held, driver, version):
-            case, _admin, session, _table, _parent, _child, _oid = held
-            original_transaction, pid = session.get_transaction(), driver.get_server_pid()
-            snapshot = await driver.fetchval("SELECT pg_catalog.pg_current_snapshot()::text")
-            relation = direct_heap_relation_sql(session, case.schema, "direct_heap_probe")
+            case, admin, session, _table, parent, _child = held
+            relation = "ONLY " + qualified_relation_sql(case.schema, "direct_heap_probe")
+            assert (await session.execute(text(f"SELECT id FROM {relation} ORDER BY id"))).scalars().all() == [1]
+            await admin.execute(f"INSERT INTO {parent}(id,private_payload) VALUES(2,'later')")
+            assert await admin.fetchval(f"SELECT count(*) FROM {parent}") == 2
             if failure == "timeout":
                 await session.execute(text("SET LOCAL statement_timeout='100ms'"))
                 query = f"SELECT p.id FROM {relation} p CROSS JOIN pg_catalog.pg_sleep(1)"
@@ -100,22 +88,18 @@ async def test_native_owned_rollback_revalidates_before_optional_fallback_and_la
             failures = []
             logger = SimpleNamespace(debug=lambda _message, error: failures.append(error))
             async with provider_optional_read(session, logger):
-                await execute_network_read(session, query)
+                await session.execute(text(query))
             assert len(failures) == 1 and isinstance(failures[0], DBAPIError)
             expected_state = "57014" if failure == "timeout" else "22012"
             assert postgres_sqlstate(failures[0]) == expected_state
-            assert session.get_transaction() is original_transaction and original_transaction.is_active
-            actual_driver = (await (await session.connection()).get_raw_connection()).driver_connection
-            assert actual_driver is driver and driver.get_server_pid() == pid and driver.is_in_transaction()
-            assert await driver.fetchval("SELECT pg_catalog.pg_current_snapshot()::text") == snapshot
-            assert (await execute_network_read(session, f"SELECT p.id FROM {relation} p")).scalars().all() == [1]
+            assert session.get_transaction().is_active
+            assert (await session.execute(text(f"SELECT p.id FROM {relation} p ORDER BY p.id"))).scalars().all() == [1]
             evidence_by_field.update(
                 server_version_num=version,
-                reader_pid=pid,
                 original_sqlstate=expected_state,
-                optional_fallback_after_revalidation=True,
-                original_root_driver_pid_and_snapshot=True,
-                later_guarded_rows=[1],
+                optional_fallback_after_savepoint=True,
+                later_pinned_rows=[1],
+                concurrent_committed_rows=2,
             )
         evidence_by_field["exact_fixture_and_database_cleanup"] = True
     finally:

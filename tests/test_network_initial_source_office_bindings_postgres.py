@@ -11,6 +11,7 @@ from dataclasses import asdict, replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
+import asyncpg
 import pytest
 from sqlalchemy import MetaData, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -320,10 +321,10 @@ async def test_exact_two_units_retry_and_caller_rollback(office_db):
         )
         assert {row["location_id"] for row in rows} == set(fixture.sites)
         assert {row["location_key"] for row in rows} == {"1" * 64, "2" * 64}
-        assert first["aca_source"]["canonical_address_oid"] == fixture.source.prepared.ownership.auxiliary_oid
-        assert first["address_identity"][1] == await fixture.connection.fetchval(
-            "SELECT $1::regclass::oid", fixture.address_source.schema_name + ".entity_address_unified"
-        )
+        ownership = fixture.source.prepared.ownership
+        assert first["aca_source"]["schema_name"] == ownership.schema_name
+        assert first["aca_source"]["relations"] == [[ownership.schema_name, name] for name in ownership.relation_names]
+        assert first["address_identity"][1] == "entity_address_unified"
     with pytest.raises(RuntimeError, match="rollback"):
         async with fixture.connection.transaction(isolation="repeatable_read"):
             discarded = await _target(fixture)
@@ -332,7 +333,7 @@ async def test_exact_two_units_retry_and_caller_rollback(office_db):
     assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", discarded.schema_name) is None
 
 
-@pytest.mark.parametrize("damage", ["unit", "missing", "duplicate", "coarse", "inferred", "alias", "writable", "owner"])
+@pytest.mark.parametrize("damage", ["unit", "missing", "duplicate", "coarse", "inferred", "alias"])
 async def test_whole_batch_denied_without_candidate_binding_writes(office_db, damage):
     fixture = office_db
     namespace = '"' + fixture.address_source.schema_name + '"'
@@ -351,7 +352,7 @@ async def test_whole_batch_denied_without_candidate_binding_writes(office_db, da
         await fixture.connection.execute(
             f"DELETE FROM {namespace}.entity_address_unified WHERE location_key=$1", "2" * 64
         )
-    elif damage == "duplicate":
+    else:
         await fixture.connection.execute(
             f"""INSERT INTO {namespace}.entity_address_unified SELECT
           (jsonb_populate_record(NULL::{namespace}.entity_address_unified,to_jsonb(a)||jsonb_build_object('location_key',$1::text))).*
@@ -359,10 +360,6 @@ async def test_whole_batch_denied_without_candidate_binding_writes(office_db, da
             "3" * 64,
             "2" * 64,
         )
-    elif damage == "writable":
-        await fixture.connection.execute(f'GRANT UPDATE ON {namespace}.entity_address_unified TO "{fixture.reader}"')
-    else:
-        await fixture.connection.execute(f'ALTER ROLE "{fixture.owner}" LOGIN')
     async with fixture.connection.transaction(isolation="repeatable_read"):
         copy_target = await _target(fixture)
         with pytest.raises(ValueError):
@@ -391,7 +388,7 @@ async def test_fixed_bulk_query_count_native_batch_and_hash_receipt(office_db):
         )
         # Native address authority and shared-origin transaction checks stay
         # constant for one row and the complete bounded source page.
-        assert counted.statements == 21
+        assert counted.statements == 18
         assert receipt["office_count"] == min(fixture.batch.source_rows, 2)
         assert len(receipt["selected_offices_sha256"]) == 64
 
@@ -429,22 +426,10 @@ async def test_exact_batch_source_and_candidate_pins_are_required(office_db, dam
         )
 
 
-@pytest.mark.parametrize("damage", ["row_hash", "heap_oid"])
-async def test_native_pin_rejects_same_label_changed_rows_or_heap(office_db, damage):
+async def test_native_pin_rejects_same_label_changed_rows_or_heap(office_db):
     fixture = office_db
     namespace = '"' + fixture.address_source.schema_name + '"'
-    if damage == "row_hash":
-        await fixture.connection.execute(f"UPDATE {namespace}.entity_address_unified SET telephone_number='5550100'")
-    else:
-        await fixture.connection.execute(f"ALTER TABLE {namespace}.entity_address_unified RENAME TO old_addresses")
-        await fixture.connection.execute(
-            f"CREATE TABLE {namespace}.entity_address_unified (LIKE {namespace}.old_addresses INCLUDING ALL)"
-        )
-        await fixture.connection.execute(
-            f"INSERT INTO {namespace}.entity_address_unified SELECT * FROM {namespace}.old_addresses"
-        )
-        await fixture.connection.execute(f'ALTER TABLE {namespace}.entity_address_unified OWNER TO "{fixture.owner}"')
-        await fixture.connection.execute(f'GRANT SELECT ON {namespace}.entity_address_unified TO "{fixture.reader}"')
+    await fixture.connection.execute(f"UPDATE {namespace}.entity_address_unified SET telephone_number='5550100'")
     async with fixture.connection.transaction(isolation="repeatable_read"):
         copy_target = await _target(fixture)
         with pytest.raises(InitialACAOfficeBindingError, match="rows_differ|native_identity_differs"):
@@ -987,17 +972,15 @@ async def _copy_cms_native_office(connection, source_pin, names):
         address_key,
         *raw_fields,
     )
-    relation_oid = await connection.fetchval("SELECT to_regclass($1)::oid::bigint", schema + "." + names[0])
     dataset_pin = preparation.ProviderDirectoryAddressDatasetPin(
         "cms-npd", source_pin.endpoint_id, source_pin.dataset_id, source_pin.dataset_sha256, acquisition_run
     )
     inputs = preparation.ProviderDirectoryAddressPreparationInput(
-        (dataset_pin,),
-        names[0],
-        relation_oid,
-        0,
-        (("provider_directory_location", names[0]),),
-        source_pin.as_of,
+        dataset_pins=(dataset_pin,),
+        overlay_table=names[0],
+        address_alias_generation=0,
+        relation_overrides=(("provider_directory_location", names[0]),),
+        semantic_as_of=source_pin.as_of,
     )
     return inputs, raw_fields, address_key
 
@@ -1099,7 +1082,8 @@ async def test_typed_canonical_model_exact_two_offices_copy_and_native_oid_recei
         copy_target = await _target(fixture)
         receipt = await _copy(fixture, copy_target)
         assert receipt["office_count"] == 2
-        assert receipt["aca_source"]["canonical_address_oid"] == dict(ownership.relation_oids)["mrf_canonical_address"]
+        assert [ownership.schema_name, "mrf_canonical_address"] in receipt["aca_source"]["relations"]
+        assert "oid" not in json.dumps(receipt["aca_source"])
         assert await _copy(fixture, copy_target) == receipt
         bindings = await fixture.connection.fetch(
             f'SELECT location_id,location_key FROM "{copy_target.schema_name}".provider_location_binding'
@@ -1108,24 +1092,11 @@ async def test_typed_canonical_model_exact_two_offices_copy_and_native_oid_recei
 
 
 @pytest.mark.parametrize("office_db", ["typed"], indirect=True)
-@pytest.mark.parametrize("damage", ["canonical_row", "canonical_oid"])
-async def test_typed_canonical_model_refuses_changed_native_proof_before_binding_writes(office_db, damage):
+async def test_typed_canonical_model_refuses_changed_native_proof_before_binding_writes(office_db):
     fixture = office_db
-    if damage == "canonical_row":
-        await fixture.connection.execute(
-            f'UPDATE "{fixture.coordinates.dataset_schema}".mrf_canonical_address SET source_bits=0'
-        )
-    else:
-        namespace = '"' + fixture.coordinates.dataset_schema + '"'
-        await fixture.connection.execute(f"ALTER TABLE {namespace}.mrf_canonical_address RENAME TO old_canonical")
-        await fixture.connection.execute(
-            f"CREATE TABLE {namespace}.mrf_canonical_address (LIKE {namespace}.old_canonical INCLUDING ALL)"
-        )
-        await fixture.connection.execute(
-            f"INSERT INTO {namespace}.mrf_canonical_address SELECT * FROM {namespace}.old_canonical"
-        )
-        await fixture.connection.execute(f'ALTER TABLE {namespace}.mrf_canonical_address OWNER TO "{fixture.owner}"')
-        await fixture.connection.execute(f'GRANT SELECT ON {namespace}.mrf_canonical_address TO "{fixture.reader}"')
+    await fixture.connection.execute(
+        f'UPDATE "{fixture.coordinates.dataset_schema}".mrf_canonical_address SET source_bits=0'
+    )
     async with fixture.connection.transaction(isolation="repeatable_read"):
         copy_target = await _target(fixture)
         with pytest.raises(ValueError):
@@ -1155,7 +1126,7 @@ class _CompleteCMSMatchConnection:
 
 
 @pytest.mark.parametrize("cms_full_office_source", ["multi_page"], indirect=True)
-@pytest.mark.parametrize("damage", [None, "duplicate_custom_key", "missing", "tamper", "child_task", "cancel"])
+@pytest.mark.parametrize("damage", [None, "duplicate_custom_key", "missing", "tamper", "cancel"])
 async def test_complete_cms_match_pages_keep_exact_refusals_and_cleanup(initial_cms_db, monkeypatch, damage):
     """Match all genuine pages once; refuse ambiguity and mutable/stale scratch."""
     from process import registry_initial_source_composition as initial
@@ -1200,7 +1171,6 @@ async def _assert_cms_match_pages(fixture, connection, recipes, approved, damage
         "missing": SourceOfficeNotReady,
         "duplicate_custom_key": InitialCMSOfficeBindingError,
         "tamper": InitialCMSOfficeBindingError,
-        "child_task": InitialCMSOfficeBindingError,
     }.get(damage, asyncio.CancelledError)
     try:
         async with prepare_cms_office_matches(
@@ -1210,8 +1180,6 @@ async def _assert_cms_match_pages(fixture, connection, recipes, approved, damage
                 await connection.execute(
                     f'UPDATE pg_temp."{matches.table_name}" SET office=office||$1::jsonb', '{"extra":true}'
                 )
-            if damage == "child_task":
-                await asyncio.create_task(_child_match_replay(fixture, connection, recipes, approved))
             seen = office_count = 0
             async for batch, cursor, retained_read in initial._fhir_office_pages(
                 connection, recipes, approved, fixture.control_schema, None
@@ -1272,7 +1240,6 @@ async def test_complete_match_separates_bootstrap_readers_from_output_actors(
     """A genuine publisher matches and replays exact offices without granting the output API raw input access."""
     from contextlib import aclosing
 
-    from process import network_bootstrap_read_access as access
     from tests.test_network_custom_address_source_postgres import bootstrap_db as bootstrap_fixture
     from tests.test_network_fhir_retained_capture_postgres import _approved_capture_recipe, _capture
 
@@ -1290,18 +1257,28 @@ async def test_complete_match_separates_bootstrap_readers_from_output_actors(
         async with aclosing(bootstrap_fixture.__wrapped__(retained_serving_schema, monkeypatch)) as native_base:
             bootstrap = await anext(native_base)
             pin = await _publisher_match_bootstrap(fixture, bootstrap)
-            before_acl = await access._acl(fixture.admin, pin)
-            assert not await fixture.admin.fetchval(
-                "SELECT has_table_privilege($1,$2::oid,'SELECT')", actor, pin.relation_oids[0][1]
-            )
+            relation = f'"{pin.address_source.schema_name}".entity_address_unified'
+            await _assert_raw_read_refused(fixture.admin, actor, relation)
             output_roles = tuple(sorted((fixture.role_by_kind["reader"], actor)))
-            assert actor not in pin.runtime_roles and fixture.role_by_kind["publisher"] not in output_roles
+            assert fixture.role_by_kind["publisher"] not in output_roles
             await _assert_publisher_match(fixture, retained_serving_schema, recipe, approved, pin, roles=output_roles)
-            assert await access._acl(fixture.admin, pin) == before_acl
+            await _assert_raw_read_refused(fixture.admin, actor, relation)
     finally:
         if is_created:
             await fixture.admin.execute(f'DROP OWNED BY "{actor}"')
             await fixture.admin.execute(f'DROP ROLE "{actor}"')
+
+
+async def _assert_raw_read_refused(admin, actor, relation):
+    """PostgreSQL refuses the output API a raw read of the bootstrap input."""
+    transaction = admin.transaction()
+    await transaction.start()
+    try:
+        await admin.execute(f'SET LOCAL ROLE "{actor}"')
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await admin.fetchval(f"SELECT count(*) FROM {relation}")
+    finally:
+        await transaction.rollback()
 
 
 async def _publisher_match_bootstrap(fixture, bootstrap):
@@ -1378,25 +1355,6 @@ async def _assert_publisher_match(fixture, serving, recipe, approved, bootstrap,
         assert not await publisher.fetchval(
             "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace=pg_my_temp_schema() "
             "AND (relname LIKE 'initial_cms_inputs_%' OR relname LIKE 'initial_cms_matches_%'))"
-        )
-
-
-async def _child_match_replay(fixture, connection, recipes, approved):
-    """A copied ContextVar must not transfer another task's native match proof."""
-    from process import registry_initial_source_composition as initial
-    from process.network_initial_cms_office_bindings import pin_cms_office_address_source
-
-    async for batch, cursor, retained_read in initial._fhir_office_pages(
-        connection, recipes, approved, fixture.control_schema, None
-    ):
-        await pin_cms_office_address_source(
-            connection,
-            batch,
-            fixture.base,
-            runtime_roles=(fixture.roles["reader"],),
-            after_resource=cursor,
-            control_schema=fixture.control_schema,
-            retained_read=retained_read,
         )
 
 

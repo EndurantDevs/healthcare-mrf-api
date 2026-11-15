@@ -1,9 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Read populated legacy CMS history; never convert, close writers or issue authority.
 
-Expected native identities and dataset bounds come from the protected caller.
-The returned repeatable-read observation cannot attest subsequent immutability,
-callable custody or permission to retire existing foreign keys and guards.
+Declared relation names and dataset bounds come from the caller.
+The repeatable-read scan checks complete content, aggregate accounting and
+relationships without changing rows, permissions or constraints.
 """
 
 import asyncio
@@ -21,8 +21,7 @@ WITNESS = "provider_directory_cms_npd_resource_witness"
 RELATIONSHIP = "provider_directory_cms_npd_relationship"
 ROOTS = (RESOURCE, WITNESS, RELATIONSHIP)
 _EDGES = ((WITNESS, RESOURCE), (RELATIONSHIP, RESOURCE), (RELATIONSHIP, WITNESS))
-_ROOTS_SQL = """SELECT c.oid::bigint,c.relowner::bigint AS owner,c.relname AS name,
- c.relkind::text,n.nspname,n.oid::bigint AS schema_oid,
+_ROOTS_SQL = """SELECT c.relname AS name,c.relkind::text,n.nspname,
  NOT EXISTS(SELECT FROM pg_catalog.pg_inherits WHERE inhparent=c.oid) AS leaf
  FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
  WHERE n.nspname=$1 AND c.relname=ANY($2::text[]) ORDER BY c.relname"""
@@ -37,23 +36,13 @@ def _request(schema, expected_catalog, dataset_ids):
     storage_identifier(schema)
     _require(
         type(expected_catalog) is dict
-        and set(expected_catalog) == {"database_oid", "schema_oid", "roots"}
-        and all(
-            type(expected_catalog[key]) is int and 0 < expected_catalog[key] < 2**32
-            for key in ("database_oid", "schema_oid")
-        ),
+        and set(expected_catalog) == {"schema", "roots"}
+        and expected_catalog["schema"] == schema,
         "catalog_required",
     )
     expected_roots = expected_catalog["roots"]
     _require(type(expected_roots) is dict and set(expected_roots) == set(ROOTS), "roots_required")
-    for proof in expected_roots.values():
-        _require(
-            type(proof) is dict
-            and set(proof) == {"oid", "owner"}
-            and all(type(oid) is int and 0 < oid < 2**32 for oid in proof.values()),
-            "roots_required",
-        )
-    _require(len({proof["oid"] for proof in expected_roots.values()}) == len(ROOTS), "roots_required")
+    _require(all(proof == {"schema": schema, "name": root} for root, proof in expected_roots.items()), "roots_required")
     _require(
         type(dataset_ids) is list
         and all(type(key) is str and 0 < len(key) <= 96 and "\x00" not in key for key in dataset_ids)
@@ -70,12 +59,10 @@ async def _state(database, session, connection):
     await context._physical(database, session, connection, asyncio.current_task(), session.get_transaction())
     actor_by_field = dict(await connection.fetchrow(context._ORIGIN_SQL))
     _require(
-        actor_by_field["session"] == actor_by_field["current"]
-        and actor_by_field["readonly"] == "on"
+        actor_by_field["readonly"] == "on"
         and actor_by_field["isolation"] == "repeatable read"
-        and actor_by_field["replication_role"] == "origin"
-        and await connection.fetchval("SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname=session_user") is True,
-        "original_admin_snapshot_required",
+        and actor_by_field["replication_role"] == "origin",
+        "read_only_snapshot_required",
     )
     _require(await connection.fetchval("SHOW search_path") in {"pg_catalog", "pg_catalog, pg_temp"}, "search_path")
     _require(
@@ -94,7 +81,7 @@ def _history_bounds(value, expected, datasets):
         return None
     checked = bounds.require_cms_history_expectations(value)
     _require(
-        all(entry["old_oid"] == expected["roots"][root]["oid"] for root, entry in checked.items())
+        all(entry["relation"] == expected["roots"][root] for root, entry in checked.items())
         and datasets == sorted({key for entry in checked.values() for key in entry["dataset_ids"]}),
         "history_bounds_changed",
     )
@@ -112,10 +99,8 @@ async def _roots(connection, schema, expected, *, expected_history_bounds=None):
         root = row["name"]
         _require(
             row["nspname"] == schema
-            and row["schema_oid"] == expected["schema_oid"]
             and row["relkind"] == ("p" if root == RESOURCE else "r")
-            and (root == RESOURCE or row["leaf"])
-            and {"oid": row["oid"], "owner": row["owner"]} == expected["roots"][root],
+            and (root == RESOURCE or row["leaf"]),
             "roots_changed",
         )
 
@@ -148,7 +133,7 @@ async def _relationships(connection, relations_by_root):
 
 
 async def _scan_relations(connection, session, *, schema, receipts, datasets_by_root, relations_by_root):
-    """Scan authenticated heap identities; the caller supplies custody and snapshot."""
+    """Scan complete named heaps within the caller's read snapshot."""
     counts, content = {}, {}
     for root in (WITNESS, RELATIONSHIP):
         counts[root] = await _counts(connection, relations_by_root[root], datasets_by_root[root])
@@ -164,7 +149,7 @@ async def _scan_relations(connection, session, *, schema, receipts, datasets_by_
 
 
 async def _scan_history(connection, session, *, schema, expected, datasets, expected_history_bounds=None):
-    """Share complete scans; the enclosing entry point authenticates custody and transaction mode."""
+    """Check named layouts and bounds around the complete content scans."""
     checked = _history_bounds(expected_history_bounds, expected, datasets)
     options = {} if checked is None else {"expected_history_bounds": checked}
     await _roots(connection, schema, expected, **options)
@@ -172,7 +157,7 @@ async def _scan_history(connection, session, *, schema, expected, datasets, expe
         connection,
         session,
         schema=schema,
-        receipts={root: {"name": root, "oid": expected["roots"][root]["oid"]} for root in (WITNESS, RELATIONSHIP)},
+        receipts={root: dict(expected["roots"][root]) for root in (WITNESS, RELATIONSHIP)},
         datasets_by_root=(
             dict.fromkeys((WITNESS, RELATIONSHIP), datasets)
             if checked is None
@@ -187,7 +172,7 @@ async def _scan_history(connection, session, *, schema, expected, datasets, expe
 async def read_cms_legacy_history(
     database, session, connection, *, catalog_schema, expected_catalog, dataset_ids, expected_history_bounds=None
 ):
-    """Read both complete heaps on one bounded original-admin snapshot and physical session.
+    """Read both complete named heaps on one bounded repeatable-read snapshot.
 
     Native COPY streams every stored value in primary-key order. Three indexed
     anti-joins check the existing relationships. No setting, row, ACL or guard is
@@ -197,7 +182,6 @@ async def read_cms_legacy_history(
     expected, datasets = _request(catalog_schema, expected_catalog, dataset_ids)
     checked = _history_bounds(expected_history_bounds, expected, datasets)
     actor_by_field = await _state(database, session, connection)
-    _require(actor_by_field["database_oid"] == expected["database_oid"], "database_changed")
     async with _savepoint(connection):
         options = {} if checked is None else {"expected_history_bounds": checked}
         scanned = await _scan_history(

@@ -45,7 +45,12 @@ def _descriptor(recipe, *, anchored=False):
         provider_only_rows=1,
     )
     if anchored:
-        descriptor.update(fact_candidate_id=str(uuid4()), fact_table_oid=123, fact_seal_sha256="a" * 64)
+        descriptor.update(
+            fact_candidate_id=str(uuid4()),
+            fact_schema_name="synthetic_original_facts",
+            fact_table_name="network_source_contribution",
+            fact_generation_id="a" * 64,
+        )
     return facts.validate_source_witness_descriptor_v2(descriptor)
 
 

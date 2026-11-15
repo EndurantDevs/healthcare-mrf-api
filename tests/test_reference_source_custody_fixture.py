@@ -45,8 +45,8 @@ def test_native_fixture_clone_and_export_calls_keep_custody(module_name, expecte
 
 
 @pytest.mark.asyncio
-async def test_readable_archive_uses_retained_owner_for_activation(monkeypatch, tmp_path):
-    """Reader cutover must validate the closed owner, not the bootstrap session's identity."""
+async def test_readable_archive_validates_named_content_for_activation(monkeypatch, tmp_path):
+    """Reader cutover uses complete named content without physical-owner validation."""
     from tests import test_cms_doctors_archive_postgres as fixture
 
     ownership = _ownership()
@@ -93,13 +93,13 @@ async def test_readable_archive_uses_retained_owner_for_activation(monkeypatch, 
     activation_by_field = await fixture._prepare_readable_archive(observed, ownership.dataset_id, custody, tmp_path)
     custody.retain.assert_awaited_once_with(session, prepared)
     custody.verify.assert_awaited_once_with(session, prepared)
-    owner.assert_awaited_once_with(session, "cms-doctors")
-    assert validate.call_args.kwargs["sealed_owner_oid"] == 712
-    assert (
-        activation_by_field["cutover"].sealed_owner_oid
-        == activation_by_field["cutover"].expected_stage_owner_oid
-        == 712
-    )
+    owner.assert_not_awaited()
+    assert validate.call_args.args == (session,)
+    assert validate.call_args.kwargs["ownership"] is ownership
+    assert validate.call_args.kwargs["manifest"] is prepared.manifest
+    assert validate.call_args.kwargs["profile_contract"] == archive.CONTRACT
+    assert set(validate.call_args.kwargs) == {"ownership", "manifest", "package_id", "profile_contract"}
+    assert activation_by_field["cutover"].authority == "manual"
 
 
 @pytest.mark.asyncio
@@ -274,9 +274,9 @@ def _ownership():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("observations", [(False,), (True, True), (True, False, True)])
+@pytest.mark.parametrize("observations", [(True,), (False, True)])
 async def test_precreation_refuses_foreign_nonempty_or_indexed_heap(monkeypatch, observations):
-    """Ownership, emptiness and deferred indexes are all required before custody binds."""
+    """Nonempty heaps and premature indexes are refused before bounded COPY."""
     monkeypatch.setattr(archive, "verify_reference_family_stage_ownership", AsyncMock())
     session = SimpleNamespace(in_transaction=lambda: True, scalar=AsyncMock(side_effect=observations))
     custody = ReferenceSourceCustody("synthetic_owner", ())
@@ -286,36 +286,42 @@ async def test_precreation_refuses_foreign_nonempty_or_indexed_heap(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_retention_requires_same_live_transaction_and_original_oids():
-    """Neither reopening a transaction nor replacing an empty heap authenticates its handoff."""
+async def test_retention_preserves_logical_declaration_without_physical_identity():
+    """A copied named declaration remains valid; a different table declaration does not."""
     ownership = _ownership()
-    transaction = SimpleNamespace(is_active=True)
     custody = ReferenceSourceCustody("synthetic_owner", ())
-    custody.precreated[ownership.dataset_id] = (transaction, ownership)
-    session = SimpleNamespace(get_transaction=lambda: SimpleNamespace(is_active=True))
-    with pytest.raises(AssertionError):
-        await custody.retain(session, SimpleNamespace(ownership=ownership))
-    session.get_transaction = lambda: transaction
+    custody.precreated[ownership.dataset_id] = (None, ownership)
+    custody._receipt = AsyncMock(return_value=("complete-content",))
+    session = SimpleNamespace(in_transaction=lambda: True)
     foreign = archive.ReferenceFamilyStageOwnership(
         ownership.importer_id,
         ownership.dataset_id,
         ownership.schema_name,
-        ownership.schema_oid,
-        (("pricing_places_zcta", 14),),
+        90,
+        (("different_table", 91),),
     )
     with pytest.raises(AssertionError):
         await custody.retain(session, SimpleNamespace(ownership=foreign))
     assert custody.closed == {}
+    copied = archive.ReferenceFamilyStageOwnership(
+        ownership.importer_id,
+        ownership.dataset_id,
+        ownership.schema_name,
+        90,
+        (("pricing_places_zcta", 91),),
+    )
+    await custody.retain(session, SimpleNamespace(ownership=copied))
+    assert custody.closed == {ownership.dataset_id: ("complete-content",)}
 
 
 @pytest.mark.asyncio
-async def test_reopened_source_refuses_catalog_drift(monkeypatch):
-    """An authentic ownership token does not authorize a changed closed catalog."""
+async def test_reopened_source_refuses_complete_content_drift(monkeypatch):
+    """A same-name snapshot must retain its complete rows and column declarations."""
     monkeypatch.setattr(archive, "verify_reference_family_stage_ownership", AsyncMock())
     ownership = _ownership()
     custody = ReferenceSourceCustody("synthetic_owner", ())
-    custody.closed[ownership.dataset_id] = ("original-native-catalog",)
-    custody._receipt = AsyncMock(return_value=("changed-native-catalog",))
+    custody.closed[ownership.dataset_id] = ("original-complete-content",)
+    custody._receipt = AsyncMock(return_value=("changed-complete-content",))
     with pytest.raises(AssertionError):
         await custody.verify(object(), SimpleNamespace(ownership=ownership))
 

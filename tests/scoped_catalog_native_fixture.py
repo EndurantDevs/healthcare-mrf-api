@@ -114,9 +114,8 @@ async def catalog_actors(engine, owned_schemas):
 
 
 async def seal_catalog(resources, schema, models, generation_table):
-    """Transfer a registered fixture family, then run the actual publisher custody guard."""
-    importer = {codes.TABLE: "code-sets", drg.TABLE: "ms-drg"}.get(generation_table)
-    if importer is None:
+    """Protect the declared family as the catalog publisher does: owner-owned, readers SELECT only."""
+    if generation_table not in (codes.TABLE, drg.TABLE):
         raise ValueError("unsupported scoped catalog generation table")
     owner = resources.roles["owner"]
     builder = resources.roles["builder"]
@@ -130,15 +129,6 @@ async def seal_catalog(resources, schema, models, generation_table):
             await connection.execute(text(f'ALTER TABLE "{schema}"."{name}" OWNER TO "{owner}"'))
             await connection.execute(text(f'REVOKE ALL ON "{schema}"."{name}" FROM PUBLIC,"{builder}","{publisher}"'))
             await connection.execute(text(f'GRANT SELECT ON "{schema}"."{name}" TO "{builder}"'))
-    async with resources.publisher.begin() as session:
-        ownership = SimpleNamespace(
-            importer_id=importer,
-            schema_name=schema,
-            schema_oid=await native._schema_oid(session, schema),
-            relation_oids=tuple([(name, await native._relation_oid(session, schema, name)) for name in names]),
-            sequence_oids=(),
-        )
-        await native.seal_model_family_storage(session, ownership, await native.protected_publisher_owner(session))
     async with resources.builder.begin() as session:
         for name in names:
             assert await session.scalar(

@@ -5,8 +5,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import Any, Awaitable
 
 from process.provider_directory_rooted_graph_acquisition_contract import (
@@ -30,14 +30,11 @@ from process.provider_directory_rooted_graph_store_contract import (
 )
 
 
-class _LeaseHeartbeatError(RuntimeError):
-    pass
-
-
 @dataclass(slots=True)
 class _ClaimState:
     materialized: bool = False
     released: bool = False
+    terminal_failure: bool = False
 
 
 async def drain_operation(
@@ -66,7 +63,7 @@ async def drain_operation(
 async def _cancel_and_drain(task: asyncio.Task[Any]) -> None:
     if not task.done():
         task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+    await drain_operation(asyncio.gather(task, return_exceptions=True), preserve_cancellation=False)
 
 
 class _RootRunner:
@@ -85,13 +82,14 @@ class _RootRunner:
         self.dependencies = dependencies
         self.database = database
         self._claim_lock = asyncio.Lock()
+        self._work_changed = asyncio.Event()
+        self._active_work = 0
         self._no_delayed_retries = asyncio.Event()
         self._no_delayed_retries.set()
         self._delayed_retry_count = 0
+        self.deadline: float | None = None
 
-    def _require_work_claim(
-        self, claim: object
-    ) -> ProviderDirectoryRootedGraphWorkClaim:
+    def _require_work_claim(self, claim: object) -> ProviderDirectoryRootedGraphWorkClaim:
         if (
             type(claim) is not ProviderDirectoryRootedGraphWorkClaim
             or claim.acquisition_id != self.identity.acquisition_id
@@ -106,6 +104,7 @@ class _RootRunner:
         while True:
             await self._no_delayed_retries.wait()
             claim = None
+            is_counted = False
             try:
                 async with self._claim_lock:
                     if not self._no_delayed_retries.is_set():
@@ -115,11 +114,32 @@ class _RootRunner:
                         lease_seconds=self.config.lease_seconds,
                         database=self.database,
                     )
-                return None if claim is None else self._require_work_claim(claim)
-            except asyncio.CancelledError:
+                    if claim is None and self._active_work == 0:
+                        return None
+                    if claim is not None:
+                        claim = self._require_work_claim(claim)
+                        self._active_work += 1
+                        is_counted = True
+                    else:
+                        self._work_changed.clear()
                 if claim is not None:
-                    await self.release_unmaterialized(self._require_work_claim(claim))
+                    return claim
+                await self._work_changed.wait()
+            except asyncio.CancelledError:
+                try:
+                    if claim is not None:
+                        await self.release_unmaterialized(self._require_work_claim(claim))
+                finally:
+                    if is_counted:
+                        await drain_operation(self._finish_work(), preserve_cancellation=False)
                 raise
+
+    async def _finish_work(self) -> None:
+        async with self._claim_lock:
+            self._active_work -= 1
+            if self._active_work < 0:
+                raise ProviderDirectoryRootedGraphAcquisitionError("state")
+            self._work_changed.set()
 
     def _finish_delayed_retry(self) -> None:
         self._delayed_retry_count -= 1
@@ -221,43 +241,20 @@ class _RootRunner:
             PROVIDER_DIRECTORY_ROOTED_GRAPH_MAX_RETRY_AFTER_SECONDS,
         )
 
-    async def _fetch_with_heartbeat(
+    async def _fetch(
         self,
         session: Any,
         claim: ProviderDirectoryRootedGraphWorkClaim,
     ) -> ProviderDirectoryRootedGraphHTTPResult:
-        fetch_task = asyncio.create_task(
-            self.dependencies.fetch(
-                session,
-                self.snapshot.api_base,
-                claim,
-                bounds=self.config.http_bounds(),
-            )
+        fetch_result = await self.dependencies.fetch(
+            session,
+            self.snapshot.api_base,
+            claim,
+            bounds=self.config.http_bounds(),
         )
-        try:
-            while True:
-                done_tasks, _pending_tasks = await asyncio.wait(
-                    {fetch_task},
-                    timeout=float(self.config.heartbeat_seconds),
-                )
-                if done_tasks:
-                    fetch_result = fetch_task.result()
-                    if type(fetch_result) is not ProviderDirectoryRootedGraphHTTPResult:
-                        raise ProviderDirectoryRootedGraphAcquisitionError("state")
-                    return fetch_result
-                try:
-                    await self.dependencies.heartbeat(
-                        claim,
-                        lease_seconds=self.config.lease_seconds,
-                        database=self.database,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    raise _LeaseHeartbeatError from None
-        finally:
-            if not fetch_task.done():
-                await _cancel_and_drain(fetch_task)
+        if type(fetch_result) is not ProviderDirectoryRootedGraphHTTPResult:
+            raise ProviderDirectoryRootedGraphAcquisitionError("state")
+        return fetch_result
 
     async def _terminalize(
         self,
@@ -267,8 +264,9 @@ class _RootRunner:
         async def _materialize() -> None:
             """Mark the lease durable only after the terminal write returns."""
 
-            await operation
-            state.materialized = True
+            async with asyncio.timeout_at(self.deadline):
+                await operation
+                state.materialized = True
 
         await drain_operation(_materialize(), preserve_cancellation=True)
 
@@ -277,7 +275,10 @@ class _RootRunner:
         claim: ProviderDirectoryRootedGraphWorkClaim,
         error_code: str,
         state: _ClaimState,
+        *,
+        terminal_failure: bool = True,
     ) -> None:
+        state.terminal_failure = terminal_failure
         await self._terminalize(
             self.dependencies.complete_error(
                 claim,
@@ -294,26 +295,22 @@ class _RootRunner:
         state: _ClaimState,
     ) -> ProviderDirectoryRootedGraphHTTPResult | tuple[str, float] | None:
         try:
-            return await self._fetch_with_heartbeat(session, claim)
+            return await self._fetch(session, claim)
         except ProviderDirectoryRootedGraphHTTPError as error:
             if error.retryable and claim.attempt < self.config.max_attempts:
                 await self.release_for_retry(claim, state)
                 return claim.query_id, self.retry_delay(error, claim.attempt)
             if error.code == "transport_timeout":
-                await self._complete_error(claim, "transport_timeout", state)
+                await self._complete_error(claim, "transport_timeout", state, terminal_failure=False)
                 return None
             terminal_code = "retry_exhausted" if error.retryable else error.code
             await self._complete_error(claim, terminal_code, state)
             raise ProviderDirectoryRootedGraphAcquisitionError("root_unsealable")
-        except _LeaseHeartbeatError:
-            raise ProviderDirectoryRootedGraphAcquisitionError("state") from None
-        except (asyncio.CancelledError, ProviderDirectoryRootedGraphAcquisitionError):
+        except asyncio.CancelledError, ProviderDirectoryRootedGraphAcquisitionError:
             raise
         except Exception:
             await self._complete_error(claim, "transport_failure", state)
-            raise ProviderDirectoryRootedGraphAcquisitionError(
-                "root_unsealable"
-            ) from None
+            raise ProviderDirectoryRootedGraphAcquisitionError("root_unsealable") from None
 
     async def _complete_response(
         self,
@@ -336,18 +333,20 @@ class _RootRunner:
             )
             return
         try:
-            query_result = build_provider_directory_rooted_graph_query_result(
-                claim,
-                response.resources,
-                advertised_total=response.advertised_total,
-                terminal_page_count=response.terminal_page_count,
-                reachable_network_references=root_network_references,
+            query_result = await drain_operation(
+                asyncio.to_thread(
+                    build_provider_directory_rooted_graph_query_result,
+                    claim,
+                    response.resources,
+                    advertised_total=response.advertised_total,
+                    terminal_page_count=response.terminal_page_count,
+                    reachable_network_references=root_network_references,
+                ),
+                preserve_cancellation=True,
             )
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             await self._complete_error(claim, "response_invalid", state)
-            raise ProviderDirectoryRootedGraphAcquisitionError(
-                "root_unsealable"
-            ) from None
+            raise ProviderDirectoryRootedGraphAcquisitionError("root_unsealable") from None
         await self._terminalize(
             self.dependencies.complete_result(
                 claim,
@@ -366,51 +365,69 @@ class _RootRunner:
     ) -> tuple[str, float] | None:
         """Fetch and atomically terminalize one claim, or request a retry."""
 
+        if self.deadline is None:
+            self.deadline = asyncio.get_running_loop().time() + float(self.config.root_timeout_seconds)
         state = _ClaimState()
+        operation = asyncio.create_task(self._process_claim(session, claim, state, root_network_references))
         try:
-            if claim.attempt > self.config.max_attempts:
-                await self._complete_error(claim, "retry_exhausted", state)
-                raise ProviderDirectoryRootedGraphAcquisitionError("root_unsealable")
-            fetch_outcome = await self._fetch_or_retry(session, claim, state)
-            if fetch_outcome is None:
-                return None
-            if type(fetch_outcome) is tuple:
-                return fetch_outcome
-            await self._complete_response(
-                claim,
-                fetch_outcome,
-                state,
-                root_network_references,
-            )
-            return None
+            while True:
+                done, _pending = await asyncio.wait({operation}, timeout=float(self.config.heartbeat_seconds))
+                if done:
+                    return operation.result()
+                try:
+                    await self.dependencies.heartbeat(
+                        claim, lease_seconds=self.config.lease_seconds, database=self.database
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return await self._drain_failed_heartbeat(operation, state)
         finally:
+            await _cancel_and_drain(operation)
             if not state.materialized and not state.released:
                 await self.release_unmaterialized(claim)
+
+    async def _drain_failed_heartbeat(self, operation, state):
+        if operation.done():
+            return operation.result()
+        await _cancel_and_drain(operation)
+        if not state.materialized:
+            raise ProviderDirectoryRootedGraphAcquisitionError("state") from None
+        if state.terminal_failure:
+            raise ProviderDirectoryRootedGraphAcquisitionError("root_unsealable") from None
+        return None
+
+    async def _process_claim(self, session, claim, state, root_network_references):
+        if claim.attempt > self.config.max_attempts:
+            await self._complete_error(claim, "retry_exhausted", state)
+            raise ProviderDirectoryRootedGraphAcquisitionError("root_unsealable")
+        fetch_outcome = await self._fetch_or_retry(session, claim, state)
+        if fetch_outcome is None or type(fetch_outcome) is tuple:
+            return fetch_outcome
+        await self._complete_response(claim, fetch_outcome, state, root_network_references)
+        return None
 
     async def worker(self, session: Any) -> None:
         """Drain generic claims, including delayed exact-query retries."""
 
-        retry_request: tuple[str, float] | None = None
         while True:
-            if retry_request is None:
-                claim = await self.claim()
-            else:
-                query_id, delay_seconds = retry_request
-                claim = await self.claim_retry(query_id, delay_seconds)
-                retry_request = None
-                if claim is None:
-                    continue
+            claim = await self.claim()
             if claim is None:
                 return
-            retry_request = await self.process_claim(session, claim)
+            try:
+                while claim is not None:
+                    retry_request = await self.process_claim(session, claim)
+                    if retry_request is None:
+                        break
+                    query_id, delay_seconds = retry_request
+                    claim = await self.claim_retry(query_id, delay_seconds)
+            finally:
+                await drain_operation(self._finish_work(), preserve_cancellation=False)
 
     async def drain_generic_frontier(self, session: Any) -> None:
         """Drain a delayed-retry-aware generic fixed point."""
 
-        worker_tasks = [
-            asyncio.create_task(self.worker(session))
-            for _worker_index in range(self.config.concurrency)
-        ]
+        worker_tasks = [asyncio.create_task(self.worker(session)) for _worker_index in range(self.config.concurrency)]
         try:
             await asyncio.gather(*worker_tasks)
         except BaseException:
@@ -468,10 +485,7 @@ class _RootRunner:
                 replayed_claim = await self._claim_census()
             finally:
                 self._finish_delayed_retry()
-            if (
-                replayed_claim is None
-                or replayed_claim.root_network_references != expected_references
-            ):
+            if replayed_claim is None or replayed_claim.root_network_references != expected_references:
                 if replayed_claim is not None:
                     await self.release_unmaterialized(replayed_claim.work_claim)
                 raise ProviderDirectoryRootedGraphAcquisitionError("state")

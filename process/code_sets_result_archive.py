@@ -542,7 +542,9 @@ async def verify_stage(session, stage: CodeSetsStage, *, predecessor_oid: int | 
     _transaction(session)
     if not isinstance(stage, CodeSetsStage) or stage.schema_name != stage_schema(stage.dataset_id):
         raise CodeSetsArchiveError("code-set stage identity is invalid")
-    await session.execute(text(f"LOCK TABLE {_schema(stage.schema_name)}.{CodeCatalog.__tablename__} IN SHARE MODE"))
+    await session.execute(
+        text(f"LOCK TABLE {_schema(stage.schema_name)}.{CodeCatalog.__tablename__} IN ACCESS SHARE MODE")
+    )
     await _verify_clone(session, stage.schema_name, stage.schema_oid, stage.catalog_oid, predecessor_oid)
     if (await scope_receipt(session, stage.schema_name, stage=True))[:2] != (stage.row_count, stage.row_sha256):
         raise CodeSetsArchiveError("code-set stage content changed")
@@ -601,7 +603,9 @@ async def _has_collision(
     )
 
 
-async def _publish_source_slice(session, destination, candidate, candidate_table, *, origin, expected, source_copy):
+async def _publish_source_slice(
+    session, destination, candidate, candidate_table, *, origin, expected, source_copy, publication_policy=None
+):
     """Replace an authenticated source contribution through complete-family composition."""
     from process import scoped_catalog_publication as publication
 
@@ -609,7 +613,13 @@ async def _publish_source_slice(session, destination, candidate, candidate_table
         session, "code-sets", destination, candidate, (candidate_table,), source_copy
     )
     composed = await publication.compose_catalog_family(
-        session, destination, "code-sets", incoming, publication.contributions("code-sets"), source_copy
+        session,
+        destination,
+        "code-sets",
+        incoming,
+        publication.contributions("code-sets"),
+        source_copy,
+        publication_policy=publication_policy,
     )
     if not _same_generation(composed.generations["code-sets"], expected):
         raise CodeSetsArchiveError("code-set publication generation changed")
@@ -739,7 +749,7 @@ async def validate_prepared_stage(
     stage = await _named_stage(session, stage)
     predecessor_oid = await native._relation_oid(session, stage.schema_name, PREDECESSOR_TABLE)
     _transaction(session)
-    await session.execute(text(f"LOCK TABLE {_schema(destination)}.{CodeCatalog.__tablename__} IN SHARE MODE"))
+    await session.execute(text(f"LOCK TABLE {_schema(destination)}.{CodeCatalog.__tablename__} IN ACCESS SHARE MODE"))
     prior = await read_generation(session, destination)
     count, digest, oid = await _slice_identity(session, destination, complete=prior.origin_generation is not None)
     if prior.origin_generation is None:
@@ -759,7 +769,7 @@ async def validate_prepared_stage(
 
 
 async def activate_stage(
-    session, *, destination: str, prepared: CodeSetsPreparedStage, source_copy=None
+    session, *, destination: str, prepared: CodeSetsPreparedStage, source_copy=None, publication_policy=None
 ) -> CodeSetsActivation:
     """CAS just the source rows against a frozen, same-inventory predecessor."""
     _transaction(session)
@@ -799,6 +809,7 @@ async def activate_stage(
         origin=stage.source_generation,
         expected=prior,
         source_copy=source_copy,
+        publication_policy=publication_policy,
     )
     return CodeSetsActivation(
         stage.dataset_id,
@@ -815,7 +826,7 @@ async def activate_stage(
 
 
 async def rollback_activation(
-    session, *, destination: str, activation: CodeSetsActivation, source_copy=None
+    session, *, destination: str, activation: CodeSetsActivation, source_copy=None, publication_policy=None
 ) -> CodeSetsGeneration:
     """Restore only the retained predecessor if the candidate is still current."""
     _transaction(session)
@@ -833,7 +844,7 @@ async def rollback_activation(
     if (await scope_receipt(session, destination))[:2] != (current.row_count, current.row_sha256):
         raise CodeSetsArchiveError("code-set rollback source rows changed")
     await session.execute(
-        text(f"LOCK TABLE {_schema(activation.predecessor_schema)}.{PREDECESSOR_TABLE} IN SHARE MODE")
+        text(f"LOCK TABLE {_schema(activation.predecessor_schema)}.{PREDECESSOR_TABLE} IN ACCESS SHARE MODE")
     )
     await _verify_clone(
         session,
@@ -862,6 +873,7 @@ async def rollback_activation(
         origin=activation.previous,
         expected=current,
         source_copy=source_copy,
+        publication_policy=publication_policy,
     )
     from process.scoped_catalog_retention import cleanup_retained_catalog
 

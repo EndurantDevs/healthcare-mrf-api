@@ -93,6 +93,7 @@ from process import provider_directory_capped_partition as capped_partition
 from process import provider_directory_christus as christus
 from process import provider_directory_cms_desired_fence as cms_desired_fence
 from process import provider_directory_fhir_response as fhir_response
+from process import provider_directory_generic_source_adapters as source_adapters
 from process import provider_directory_leaf_census as leaf_census
 from process import provider_directory_molina as molina
 from process import provider_directory_mvp as mvp
@@ -1042,13 +1043,11 @@ _PROVIDER_DIRECTORY_CREDENTIALS_FILE_OVERRIDE: contextvars.ContextVar[str | None
     "provider_directory_credentials_file_override",
     default=None,
 )
-_PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
-    "provider_directory_artifact_relation_overrides",
-    default={},
-)
-_PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS: contextvars.ContextVar[dict[str, int]] = contextvars.ContextVar(
-    "provider_directory_artifact_owned_relation_oids",
-    default={},
+_PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES: contextvars.ContextVar[dict[str, str | tuple[str, str]]] = (
+    contextvars.ContextVar(
+        "provider_directory_artifact_relation_overrides",
+        default={},
+    )
 )
 _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
     "provider_directory_artifact_dataset_fence",
@@ -2908,7 +2907,24 @@ def _qt(schema: str, table: str) -> str:
     from process.provider_directory_source_storage_binding import source_relation_coordinates
 
     scoped_table = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(table, table)
+    if not isinstance(scoped_table, str):
+        return source_adapters.named_artifact_input_relation(sys.modules[__name__], table, scoped_table)
     return _unscoped_qt(*source_relation_coordinates(schema, table, scoped_table))
+
+
+def _provider_directory_profile_target_coordinates(schema: str) -> dict[str, dict[str, str]]:
+    """Resolve the existing logical Profile targets through normal source routing."""
+    from process.provider_directory_source_storage_binding import source_relation_coordinates
+
+    targets_by_role = {}
+    overrides = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get()
+    for role, table in (
+        ("evidence", profile_artifact.PROFILE_EVIDENCE_TABLE),
+        ("profile", profile_artifact.PROFILE_TABLE),
+    ):
+        target_schema, name = source_relation_coordinates(schema, table, overrides.get(table, table))
+        targets_by_role[role] = {"schema": target_schema, "name": name}
+    return targets_by_role
 
 
 def _provider_directory_index_elements_sql(model: Any, index: dict[str, Any]) -> str:
@@ -7990,12 +8006,13 @@ class ProviderDirectoryArtifactBuildStale(RuntimeError):
 
 @dataclass(frozen=True)
 class ProviderDirectoryArtifactBuildFence:
-    """Identity of the live relation from which an artifact stage was built."""
+    """Qualified target and logical publication from which a stage was built."""
 
-    target_oid: int | None
+    target_name: tuple[str, str] | None = None
+    target_publication: tuple = (False, None)
     alias_generation: int | None = None
     dependency_relation: str | None = None
-    dependency_relation_oid: int | None = None
+    dependency_publication: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -8021,13 +8038,9 @@ class ProviderDirectoryPreparedProfileDelta:
     resume_lineage_hash: str
     owner_run_id: str | None
     evidence_stage: str
-    evidence_stage_oid: int
     profile_stage: str
-    profile_stage_oid: int
     affected_npi_stage: str
-    affected_npi_stage_oid: int
-    evidence_target_oid: int
-    profile_target_oid: int
+    targets: dict[str, dict[str, str]]
     from_generation_id: str
     generation_id: str
     operation: str
@@ -8059,12 +8072,13 @@ class ProviderDirectoryPreparedProfileDelta:
     from_profile_as_of: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class ProviderDirectoryArtifactPromotionIdentity:
-    """Relation identity needed to resolve an ambiguous cutover timeout."""
+    """Attempt-local revisions observed before swaps and before COMMIT acknowledgement."""
 
     stage: ProviderDirectoryPreparedArtifactStage
-    stage_oid: int
+    publication_before: tuple[Any, ...] | None = None
+    publication_revision: tuple[str, str] | None = None
 
 
 @dataclass
@@ -8162,7 +8176,7 @@ class ProviderDirectoryArtifactBundle:
 
 @contextlib.contextmanager
 def _provider_directory_artifact_relation_scope(
-    relation_overrides: dict[str, str],
+    relation_overrides: dict[str, str | tuple[str, str]],
 ) -> Iterator[None]:
     """Temporarily route artifact dependencies to prepared stage relations."""
     merged_overrides_by_relation = dict(_PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get())
@@ -8274,7 +8288,13 @@ async def _provider_directory_artifact_build_guard(
         from process.provider_directory_cms_preparation import active_nonprofile_sql_transaction
 
         async with active_nonprofile_sql_transaction(sys.modules[__name__]):
-            target_oid = await _provider_directory_relation_oid(schema, target_relation)
+            from process.provider_directory_artifact_bundle_preparation import artifact_publication
+
+            publication = (
+                (False, None)
+                if target_relation == "provider_directory_artifact_scope"
+                else await artifact_publication(sys.modules[__name__], schema, target_relation)
+            )
         from process.provider_directory_profile_control_maintenance import control_maintenance_fence
 
         maintenance = (
@@ -8283,7 +8303,7 @@ async def _provider_directory_artifact_build_guard(
             else contextlib.nullcontext()
         )
         async with maintenance:
-            yield ProviderDirectoryArtifactBuildFence(target_oid=target_oid)
+            yield ProviderDirectoryArtifactBuildFence((schema, target_relation), publication)
     finally:
         await _release_provider_directory_artifact_build_lock(
             connection, build_lock_key, maintenance_admission=maintenance_admission
@@ -8310,62 +8330,75 @@ async def _provider_directory_relation_oid(schema: str, relation: str) -> int | 
 async def _capture_provider_directory_artifact_promotion_identities(
     stages: tuple[ProviderDirectoryPreparedArtifactStage, ...],
 ) -> tuple[ProviderDirectoryArtifactPromotionIdentity, ...]:
-    """Capture exact stage OIDs before entering the bounded cutover."""
+    """Allocate expectations; only the owning writer may bind a post-publication revision."""
+    return tuple(ProviderDirectoryArtifactPromotionIdentity(stage) for stage in stages)
 
-    identities: list[ProviderDirectoryArtifactPromotionIdentity] = []
-    for stage in stages:
-        stage_oid = await _provider_directory_relation_oid(
-            stage.schema,
-            stage.stage_table,
-        )
-        if stage_oid is None:
-            return ()
-        identities.append(
-            ProviderDirectoryArtifactPromotionIdentity(
-                stage=stage,
-                stage_oid=stage_oid,
+
+async def _observe_provider_directory_artifact_promotion_revisions(identities, *, before=False):
+    """Observe revisions under the original writer's locks, never after acknowledgement loss."""
+    from process.provider_directory_artifact_bundle_preparation import artifact_publication
+
+    for identity in identities:
+        if not before and identity.publication_before is None:
+            continue
+        try:
+            publication = await artifact_publication(
+                sys.modules[__name__], identity.stage.schema, identity.stage.target_relation
             )
-        )
-    return tuple(identities)
+        except ProviderDirectoryArtifactBuildStale:
+            continue  # Unversioned targets cannot resolve an uncertain commit.
+        if before:
+            identity.publication_before = publication
+            identity.publication_revision = None
+        elif publication[0] and publication[1] is not None and publication[1] != identity.publication_before[1]:
+            identity.publication_revision = publication[1]
+
+
+@contextlib.asynccontextmanager
+async def _provider_directory_artifact_promotion_readback():
+    """Own a fresh bounded observation, never a caller's uncommitted or pinned snapshot."""
+    if db._transaction_binding() is not None or db._reader_binding() is not None:
+        yield False
+        return
+    async with asyncio.timeout(10), db.transaction():
+        await db.status("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        await db.status("SET LOCAL statement_timeout='8s'")
+        await db.status("SET LOCAL lock_timeout='100ms'")
+        yield True
 
 
 async def _is_provider_directory_artifact_promotion_committed(
     identities: tuple[ProviderDirectoryArtifactPromotionIdentity, ...],
     dataset_fence: ProviderDirectoryArtifactDatasetFence | None = None,
 ) -> bool:
-    """Confirm exact relation identities and the matching dataset pointers."""
+    """Confirm writer-observed revisions and named pointers in a fresh committed snapshot."""
+    if not identities or any(identity.publication_revision is None for identity in identities):
+        return False
+    async with _provider_directory_artifact_promotion_readback() as can_observe:
+        return can_observe and await _match_provider_directory_artifact_promotion(identities, dataset_fence)
 
-    if not identities:
+
+async def _match_provider_directory_artifact_promotion(identities, dataset_fence):
+    """Match all components inside the caller-owned coherent readback scope."""
+    from process.provider_directory_artifact_bundle_preparation import artifact_publication
+
+    if not identities or any(identity.publication_revision is None for identity in identities):
         return False
     for identity in identities:
         stage = identity.stage
-        target_oid = await _provider_directory_relation_oid(
-            stage.schema,
-            stage.target_relation,
+        await _lock_provider_directory_artifact_live_tables(stage.schema, (stage.target_relation,), read_only=True)
+        publication = await artifact_publication(sys.modules[__name__], stage.schema, stage.target_relation)
+        stages_absent = await db.scalar(
+            "SELECT to_regclass(:stage) IS NULL AND to_regclass(:old) IS NULL",
+            stage=_qt(stage.schema, stage.stage_table),
+            old=_qt(stage.schema, f"{stage.target_relation}_old"),
         )
-        stage_oid = await _provider_directory_relation_oid(
-            stage.schema,
-            stage.stage_table,
+        persistence = await _provider_directory_relation_attribute(
+            stage.schema, stage.target_relation, "relpersistence"
         )
-        old_oid = await _provider_directory_relation_oid(
-            stage.schema,
-            f"{stage.target_relation}_old",
-        )
-        target_persistence = await _provider_directory_relation_attribute(
-            stage.schema,
-            stage.target_relation,
-            "relpersistence",
-        )
-        if (
-            target_oid != identity.stage_oid
-            or stage_oid is not None
-            or old_oid is not None
-            or target_persistence != "p"
-        ):
+        if publication != (True, identity.publication_revision) or not stages_absent or persistence != "p":
             return False
-    if dataset_fence is None:
-        return True
-    return await _is_provider_directory_dataset_cutover_committed(dataset_fence)
+    return dataset_fence is None or await _is_provider_directory_dataset_cutover_committed(dataset_fence)
 
 
 async def _is_provider_directory_dataset_cutover_committed(
@@ -8519,19 +8552,24 @@ def _is_provider_directory_artifact_cutover_retryable(exc: Exception) -> bool:
 async def _lock_provider_directory_artifact_tables(
     schema: str,
     relations: tuple[str, ...],
+    *,
+    read_only: bool = False,
 ) -> None:
     for relation in relations:
         if await _provider_directory_relation_attribute(schema, relation, "relkind") in {"r", "p"}:
-            await db.status(f"LOCK TABLE {_qt(schema, relation)} IN ACCESS EXCLUSIVE MODE NOWAIT;")
+            mode = "ACCESS SHARE" if read_only else "ACCESS EXCLUSIVE"
+            await db.status(f"LOCK TABLE {_qt(schema, relation)} IN {mode} MODE NOWAIT;")
 
 
 async def _prepare_provider_directory_artifact_stage(schema: str, stage_table: str) -> None:
+    from process.provider_directory_artifact_bundle_preparation import freeze_artifact_stage
     from process.provider_directory_cms_preparation import active_nonprofile_sql_transaction, check_stage_logging
 
     await check_stage_logging(sys.modules[__name__], schema, stage_table)
     async with active_nonprofile_sql_transaction(sys.modules[__name__]):
         await db.status(f"ALTER TABLE {_qt(schema, stage_table)} SET LOGGED;")
         await _assert_provider_directory_logged_relation(schema, stage_table)
+        await freeze_artifact_stage(sys.modules[__name__], schema, stage_table)
 
 
 async def _acquire_provider_directory_artifact_cutover_lock(
@@ -8557,35 +8595,10 @@ async def _acquire_provider_directory_artifact_target_lock(
         raise ProviderDirectoryArtifactCutoverConflict(target_relation)
 
 
-async def _assert_provider_directory_artifact_build_fence(
-    stage: ProviderDirectoryPreparedArtifactStage,
-) -> None:
-    if stage.build_fence is None:
-        return
-    current_target_oid = await _provider_directory_relation_oid(
-        stage.schema,
-        stage.target_relation,
-    )
-    if current_target_oid != stage.build_fence.target_oid:
-        raise ProviderDirectoryArtifactBuildStale(stage.target_relation)
-    if stage.build_fence.alias_generation is not None:
-        current_alias_generation = await _address_alias_generation(stage.schema)
-        if current_alias_generation != stage.build_fence.alias_generation:
-            raise ProviderDirectoryArtifactBuildStale(f"{stage.target_relation}:address_alias_generation")
-    if stage.build_fence.dependency_relation is not None:
-        current_dependency_oid = await _provider_directory_relation_oid(
-            stage.schema,
-            stage.build_fence.dependency_relation,
-        )
-        if current_dependency_oid != stage.build_fence.dependency_relation_oid:
-            raise ProviderDirectoryArtifactBuildStale(f"{stage.target_relation}:dependency_relation")
-        if stage.build_fence.dependency_relation == PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
-            overlay_generation = await _address_alias_artifact_generation(
-                stage.schema,
-                PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-            )
-            if overlay_generation != stage.build_fence.alias_generation:
-                raise ProviderDirectoryArtifactBuildStale(f"{stage.target_relation}:address_overlay_generation")
+async def _assert_provider_directory_artifact_build_fence(stage: ProviderDirectoryPreparedArtifactStage) -> None:
+    from process.provider_directory_artifact_bundle_preparation import assert_artifact_build_fence
+
+    await assert_artifact_build_fence(sys.modules[__name__], stage)
 
 
 def _provider_directory_prepared_stage_relations(
@@ -8968,6 +8981,7 @@ async def _promote_provider_directory_artifact_stage_transaction(
     rename_stage_indexes: Callable[[str, str], Awaitable[None]],
     build_fence: ProviderDirectoryArtifactBuildFence | None,
     cutover_timeout: asyncio.Timeout | None = None,
+    promotion_identities: tuple[ProviderDirectoryArtifactPromotionIdentity, ...] = (),
 ) -> None:
     """Run only the bounded metadata swap inside one database transaction."""
     prepared_stage = ProviderDirectoryPreparedArtifactStage(
@@ -8997,29 +9011,22 @@ async def _promote_provider_directory_artifact_stage_transaction(
             schema,
             _provider_directory_prepared_stage_relations(prepared_stage),
         )
+        await _observe_provider_directory_artifact_promotion_revisions(promotion_identities, before=True)
         await _install_provider_directory_prepared_stage(prepared_stage)
         await _finish_provider_directory_prepared_stage(prepared_stage)
         await _record_address_alias_artifact_generation(prepared_stage)
         if active_fence is not None:
             await _promote_provider_directory_artifact_datasets(active_fence)
+        await _observe_provider_directory_artifact_promotion_revisions(promotion_identities)
 
 
 def _provider_directory_profile_delta_stage_identities(
     profile_delta: ProviderDirectoryPreparedProfileDelta,
-) -> tuple[tuple[str, int], ...]:
+) -> tuple[tuple[str, str], ...]:
     return (
-        (
-            profile_delta.evidence_stage,
-            profile_delta.evidence_stage_oid,
-        ),
-        (
-            profile_delta.profile_stage,
-            profile_delta.profile_stage_oid,
-        ),
-        (
-            profile_delta.affected_npi_stage,
-            profile_delta.affected_npi_stage_oid,
-        ),
+        (profile_delta.schema, profile_delta.evidence_stage),
+        (profile_delta.schema, profile_delta.profile_stage),
+        (profile_delta.schema, profile_delta.affected_npi_stage),
     )
 
 
@@ -9038,21 +9045,11 @@ async def _assert_provider_directory_profile_delta_identity(
 async def _validate_profile_delta_relations(
     profile_delta: ProviderDirectoryPreparedProfileDelta,
 ) -> None:
-    """Require every serving and scratch relation to keep its frozen OID."""
-    if await _provider_directory_profile_stage_relation_identity(
-        profile_delta.schema,
-        profile_artifact.PROFILE_EVIDENCE_TABLE,
-    ) != (profile_delta.evidence_target_oid, "r", "p") or await _provider_directory_profile_stage_relation_identity(
-        profile_delta.schema,
-        profile_artifact.PROFILE_TABLE,
-    ) != (profile_delta.profile_target_oid, "r", "p"):
-        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_delta_target_changed")
-    for stage_table, expected_oid in _provider_directory_profile_delta_stage_identities(profile_delta):
-        if await _provider_directory_profile_stage_relation_identity(
-            profile_delta.schema,
-            stage_table,
-        ) != (expected_oid, "r", "p"):
-            raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_delta_stage_changed:" + stage_table)
+    """Validate the named target/stage shapes before the atomic cutover."""
+    for target in profile_delta.targets.values():
+        await _assert_provider_directory_logged_relation(target["schema"], target["name"])
+    for stage_schema, stage_table in _provider_directory_profile_delta_stage_identities(profile_delta):
+        await _assert_provider_directory_logged_relation(stage_schema, stage_table)
 
 
 async def _lock_profile_delta_checkpoint(
@@ -9131,18 +9128,9 @@ def _validate_profile_delta_checkpoint_completion(
     profile_delta: ProviderDirectoryPreparedProfileDelta,
     checkpoint: Mapping[str, Any],
 ) -> None:
-    """Verify checkpoint OIDs, source sets, and terminal batch coordinates."""
-    for field_name, expected_value in {
-        "evidence_stage_oid": profile_delta.evidence_stage_oid,
-        "profile_stage_oid": profile_delta.profile_stage_oid,
-        "affected_npi_stage_oid": profile_delta.affected_npi_stage_oid,
-        "evidence_target_oid": profile_delta.evidence_target_oid,
-        "profile_target_oid": profile_delta.profile_target_oid,
-    }.items():
-        if int(checkpoint.get(field_name) or 0) != expected_value:
-            raise ProviderDirectoryArtifactBuildStale(
-                "provider_directory_profile_delta_checkpoint_changed:" + field_name
-            )
+    """Verify logical targets, source sets, and terminal batch coordinates."""
+    if _json_object(checkpoint.get("targets_json")) != profile_delta.targets:
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_delta_checkpoint_changed:targets")
     if (
         _provider_directory_profile_checkpoint_array(checkpoint.get("refresh_source_ids"))
         != profile_delta.refresh_source_ids
@@ -9179,8 +9167,7 @@ def _profile_delta_receipt_values(
         "selection_proof_id": profile_delta.selection_proof_id,
         "control_generation": profile_delta.control_generation,
         "authority_revision": profile_delta.authority_revision,
-        "evidence_target_oid": profile_delta.evidence_target_oid,
-        "profile_target_oid": profile_delta.profile_target_oid,
+        "targets_json": _stable_identity_json(profile_delta.targets),
     }
 
 
@@ -9243,6 +9230,8 @@ def _is_profile_delta_receipt_matching(
     """Return whether a receipt exactly matches one prepared delta."""
     for field_name, expected_value in _provider_directory_profile_delta_receipt_static_values(profile_delta).items():
         actual_value = receipt.get(field_name)
+        if field_name == "targets_json":
+            actual_value = _stable_identity_json(_json_object(actual_value))
         if isinstance(expected_value, int):
             try:
                 actual_value = int(actual_value)
@@ -9360,19 +9349,12 @@ def _profile_cutover_hashes(
 
 def _profile_cutover_hash_domain(payload: Mapping[str, Any], kind: str) -> str:
     contract = payload.get("contract_id")
-    expected_v2 = (
-        profile_capacity.BOUNDED_CUTOVER_FORECAST_CONTRACT_ID
-        if kind == "forecast"
-        else profile_capacity.BOUNDED_CUTOVER_ACTUAL_CONTRACT_ID
-    )
-    expected_v1 = (
-        profile_capacity.CUTOVER_FORECAST_CONTRACT_ID
-        if kind == "forecast"
-        else profile_capacity.CUTOVER_ACTUAL_CONTRACT_ID
-    )
-    if contract not in {expected_v1, expected_v2}:
+    version_by_contract = {
+        f"healthporta.provider-directory-profile-cutover-{kind}.v{version}": version for version in (1, 2, 3, 4)
+    }
+    if kind not in {"forecast", "actual"} or contract not in version_by_contract:
         raise RuntimeError("provider_directory_profile_cutover_contract_invalid")
-    return f"provider-directory-profile-cutover-{kind}-hash-v{2 if contract == expected_v2 else 1}"
+    return f"provider-directory-profile-cutover-{kind}-hash-v{version_by_contract[contract]}"
 
 
 def _profile_cutover_actual_scalars(
@@ -9478,8 +9460,7 @@ def _profile_delta_serving_values(
         "capacity_geometry_status": profile_delta.capacity_geometry_status,
         "capacity_geometry_hash": profile_delta.capacity_geometry_hash,
         "capacity_geometry_json": profile_delta.capacity_geometry_json,
-        "evidence_target_oid": profile_delta.evidence_target_oid,
-        "profile_target_oid": profile_delta.profile_target_oid,
+        "targets": copy.deepcopy(profile_delta.targets),
         "evidence_rows": int(receipt["evidence_rows"]),
         "profile_rows": int(receipt["profile_rows"]),
         "profile_as_of": profile_delta.profile_as_of,
@@ -9541,8 +9522,10 @@ async def _is_provider_directory_profile_delta_committed(
             receipt,
             cutover_identity,
         )
-        and evidence_target_identity == (profile_delta.evidence_target_oid, "r", "p")
-        and profile_target_identity == (profile_delta.profile_target_oid, "r", "p")
+        and evidence_target_identity is not None
+        and evidence_target_identity[1:] == ("r", "p")
+        and profile_target_identity is not None
+        and profile_target_identity[1:] == ("r", "p")
     )
 
 
@@ -9910,18 +9893,16 @@ def _checked_serialized_metadata_payload_bytes(payload: Mapping[str, Any], *, fi
 
 
 def _provider_directory_profile_cutover_layout_payload(
-    layout: _ProviderDirectoryProfileRelationStorageLayout,
+    layout: _ProviderDirectoryProfileCapacityLayout,
     *,
     inserted_toast_chunks: int | None = None,
     deleted_toast_chunks: int,
 ) -> dict[str, Any]:
-    """Serialize every formula input needed for deterministic replay."""
-
+    """Serialize logical coordinates and every numeric replay formula input."""
     payload: dict[str, Any] = {
-        "exact_fingerprint": layout.exact_fingerprint,
-        "main_index_oids": layout.main_index_oids,
+        "schema": layout.schema_name,
+        "name": layout.relation_name,
         "main_index_pages": layout.main_index_pages,
-        "toast_index_oids": layout.toast_index_oids,
         "toast_index_pages": layout.toast_index_pages,
         "deleted_toast_chunks": deleted_toast_chunks,
     }
@@ -9973,80 +9954,33 @@ async def _validate_profile_cutover_database(
     serving_state: _ProviderDirectoryProfileServingState,
     admission: _ProviderDirectoryProfileCapacityAdmission,
 ) -> None:
-    """Require the admitted PostgreSQL identity to remain exact."""
-    observed_identity = await _provider_directory_profile_capacity_database_identity(
-        profile_delta.schema,
-        serving_state,
-    )
-    if (
-        replace(
-            observed_identity,
-            wal_lsn=admission.database_identity.wal_lsn,
-        )
-        != admission.database_identity
-    ):
-        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_database_identity_changed")
+    """Preserve admitted logical scope and PostgreSQL numeric assumptions."""
+    await _admission_database_guard(admission.admitted_identity, admission.database_identity)
 
 
 async def _profile_cutover_layout_pair(
     admission: _ProviderDirectoryProfileCapacityAdmission,
     relation_name: str,
-    target_oid: int,
-    stage_oid: int,
-) -> tuple[
-    _ProviderDirectoryProfileRelationStorageLayout,
-    _ProviderDirectoryProfileRelationStorageLayout,
-]:
-    """Load and verify one target/stage structural layout pair."""
-    target_layout = await _provider_directory_profile_relation_storage_fingerprint(
-        target_oid,
-        expected_persistence="p",
-    )
-    stage_layout = await _provider_directory_profile_relation_storage_fingerprint(
-        stage_oid,
-        expected_persistence="p",
-    )
-    expected_fingerprint = getattr(
-        admission.geometry,
-        relation_name + "_storage_fingerprint",
-    )
-    if (
-        target_layout.exact_fingerprint != expected_fingerprint
-        or target_layout.structural_fingerprint != stage_layout.structural_fingerprint
-        or target_layout.toastable_columns != stage_layout.toastable_columns
-    ):
+    schema: str,
+    stage_table: str,
+) -> tuple[_ProviderDirectoryProfileCapacityLayout, _ProviderDirectoryProfileCapacityLayout]:
+    """Measure the named target and stage within the admitted numeric bounds."""
+    target = await _profile_capacity_named_layout(admission.geometry, relation_name)
+    stage = await _provider_directory_profile_stage_layout(schema, stage_table, lock_relation=False)
+    if target.toastable_columns != stage.toastable_columns:
         raise ProviderDirectoryArtifactBuildStale(
-            "provider_directory_profile_capacity_stage_layout_changed:" + relation_name
+            "provider_directory_profile_capacity_stage_shape_changed:" + relation_name
         )
-    return target_layout, stage_layout
+    return target, stage
 
 
 async def _profile_cutover_target_layouts(
     profile_delta: ProviderDirectoryPreparedProfileDelta,
     admission: _ProviderDirectoryProfileCapacityAdmission,
-) -> dict[
-    str,
-    tuple[
-        _ProviderDirectoryProfileRelationStorageLayout,
-        _ProviderDirectoryProfileRelationStorageLayout,
-    ],
-]:
-    """Load evidence then profile target/stage layout pairs."""
-    evidence_layouts = await _profile_cutover_layout_pair(
-        admission,
-        "evidence_target",
-        profile_delta.evidence_target_oid,
-        profile_delta.evidence_stage_oid,
-    )
-    profile_layouts = await _profile_cutover_layout_pair(
-        admission,
-        "profile_target",
-        profile_delta.profile_target_oid,
-        profile_delta.profile_stage_oid,
-    )
+) -> dict[str, tuple[_ProviderDirectoryProfileCapacityLayout, _ProviderDirectoryProfileCapacityLayout]]:
     return {
-        "evidence_target": evidence_layouts,
-        "profile_target": profile_layouts,
+        role + "_target": await _profile_cutover_layout_pair(admission, role + "_target", profile_delta.schema, stage)
+        for role, stage in (("evidence", profile_delta.evidence_stage), ("profile", profile_delta.profile_stage))
     }
 
 
@@ -10179,41 +10113,11 @@ async def _profile_target_cutover_input(
 
 async def _profile_cutover_metadata_layouts(
     geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
-) -> dict[str, _ProviderDirectoryProfileRelationStorageLayout]:
-    """Load and verify checkpoint, serving, and receipt layouts."""
-    layouts_by_name = {}
-    for relation_name, relation_oid, immutable_error in (
-        ("build_checkpoint", geometry.build_checkpoint_oid, None),
-        ("serving_generation", geometry.serving_generation_oid, None),
-        (
-            "delta_receipt",
-            geometry.delta_receipt_oid,
-            "provider_directory_profile_delta_receipt_immutable",
-        ),
-    ):
-        layouts_by_name[relation_name] = await _provider_directory_profile_relation_storage_fingerprint(
-            relation_oid,
-            expected_persistence="p",
-            **(
-                {
-                    "expected_user_trigger_count": 2,
-                    "expected_immutable_trigger_error": immutable_error,
-                }
-                if immutable_error is not None
-                else {}
-            ),
-        )
-    expected_by_name = {
-        "build_checkpoint": geometry.build_checkpoint_storage_fingerprint,
-        "serving_generation": (geometry.serving_generation_storage_fingerprint),
-        "delta_receipt": geometry.delta_receipt_storage_fingerprint,
+) -> dict[str, _ProviderDirectoryProfileCapacityLayout]:
+    return {
+        role: await _profile_capacity_named_layout(geometry, role)
+        for role in ("build_checkpoint", "serving_generation", "delta_receipt")
     }
-    if any(
-        layouts_by_name[name].exact_fingerprint != expected_fingerprint
-        for name, expected_fingerprint in expected_by_name.items()
-    ):
-        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_metadata_layout_changed")
-    return layouts_by_name
 
 
 async def _profile_cutover_metadata_toast_counts(
@@ -10885,8 +10789,7 @@ def _validate_profile_delta_serving_state(
         or serving_state.capacity_geometry_status != profile_delta.from_capacity_geometry_status
         or serving_state.capacity_geometry_hash != profile_delta.from_capacity_geometry_hash
         or serving_state.capacity_geometry_json != profile_delta.from_capacity_geometry_json
-        or serving_state.evidence_target_oid != profile_delta.evidence_target_oid
-        or serving_state.profile_target_oid != profile_delta.profile_target_oid
+        or serving_state.targets != profile_delta.targets
         or serving_state.evidence_rows != profile_delta.expected_evidence_rows
         or serving_state.profile_rows != profile_delta.expected_profile_rows
     ):
@@ -11221,8 +11124,7 @@ UPDATE {serving_ref}
    AND capacity_geometry_json::jsonb IS NOT DISTINCT FROM
        CAST(:from_capacity_geometry_json AS jsonb)
    AND profile_as_of = :from_profile_as_of
-   AND evidence_target_oid = :evidence_target_oid
-   AND profile_target_oid = :profile_target_oid
+   AND targets_json::jsonb = CAST(:targets_json AS jsonb)
    AND evidence_rows = :expected_evidence_rows
    AND profile_rows = :expected_profile_rows;
 """
@@ -11266,8 +11168,7 @@ def _profile_delta_serving_update_values(
         "from_capacity_geometry_json": (profile_delta.from_capacity_geometry_json),
         "profile_as_of": profile_delta.profile_as_of,
         "from_profile_as_of": profile_delta.from_profile_as_of or profile_delta.profile_as_of,
-        "evidence_target_oid": profile_delta.evidence_target_oid,
-        "profile_target_oid": profile_delta.profile_target_oid,
+        "targets_json": _stable_identity_json(profile_delta.targets),
         "expected_evidence_rows": profile_delta.expected_evidence_rows,
         "expected_profile_rows": profile_delta.expected_profile_rows,
     }
@@ -11309,7 +11210,7 @@ INSERT INTO {receipt_ref} (
     profile_as_of,
     selection_proof_id,
     control_generation, authority_revision,
-    evidence_target_oid, profile_target_oid,
+    targets_json,
     evidence_rows, profile_rows,
     evidence_inserted, evidence_deleted,
     profile_inserted, profile_deleted,
@@ -11338,7 +11239,7 @@ INSERT INTO {receipt_ref} (
     :profile_as_of,
     :selection_proof_id,
     :control_generation, :authority_revision,
-    :evidence_target_oid, :profile_target_oid,
+    :targets_json,
     :evidence_rows, :profile_rows,
     :evidence_inserted, :evidence_deleted,
     :profile_inserted, :profile_deleted,
@@ -11790,10 +11691,12 @@ async def _apply_locked_provider_directory_artifact_bundle(
     profile_delta: ProviderDirectoryPreparedProfileDelta | None,
     active_fence: ProviderDirectoryArtifactDatasetFence | None,
     cutover_timeout: asyncio.Timeout | None = None,
-    before_swaps=None,
-    extra_live_relations=(),
+    publication=None,
 ):
     """Apply only the already locked and validated atomic publication bundle."""
+    from process.provider_directory_artifact_bundle_preparation import ArtifactBundlePublication
+
+    publication = publication or ArtifactBundlePublication()
     await _verify_active_profile_selection_at_cutover()
     if (
         profile_delta is not None
@@ -11815,9 +11718,7 @@ async def _apply_locked_provider_directory_artifact_bundle(
     if profile_delta is not None:
         await _assert_provider_directory_profile_delta_identity(profile_delta)
     live_names = {stage.target_relation for stage in ordered_stages}
-    await _lock_provider_directory_artifact_tables(
-        schema, tuple(name for name in relation_names if name not in live_names)
-    )
+    await publication.lock_candidates(sys.modules[__name__], schema, relation_names, live_names)
     applied_rows = None
     if profile_delta is not None:
         applied_rows = await _apply_provider_directory_profile_delta_rows(
@@ -11826,9 +11727,12 @@ async def _apply_locked_provider_directory_artifact_bundle(
         )
     initial_cutover = await profile_initial.prepare_cutover(sys.modules[__name__], ordered_stages, active_fence)
     await profile_initial.arm_cutover(sys.modules[__name__], initial_cutover, cutover_timeout, active_fence)
-    await _lock_provider_directory_artifact_live_tables(schema, live_names.union(extra_live_relations))
-    if before_swaps is not None:
-        await before_swaps()
+    await _lock_provider_directory_artifact_live_tables(
+        schema, live_names.union(publication.extra_live_relations), **publication.lock_options
+    )
+    await _observe_provider_directory_artifact_promotion_revisions(publication.promotion_identities, before=True)
+    if publication.before_swaps is not None:
+        await publication.before_swaps()
     initial_cutover = await _swap_profile_artifact_bundle(ordered_stages, initial_cutover)
     if active_fence is not None:
         await _promote_provider_directory_artifact_datasets(active_fence)
@@ -11836,6 +11740,11 @@ async def _apply_locked_provider_directory_artifact_bundle(
         await profile_initial.finish_cutover(sys.modules[__name__], initial_cutover, active_fence)
     if profile_delta is None:
         return
+    return await _finish_provider_directory_artifact_delta_cutover(profile_delta, applied_rows)
+
+
+async def _finish_provider_directory_artifact_delta_cutover(profile_delta, applied_rows):
+    """Complete delta accounting and cleanup before binding publication's committed-state expectation."""
     capacity_forecast = await _finish_provider_directory_profile_delta(profile_delta, applied_rows)
     await _finalize_provider_directory_profile_delta_scratch(profile_delta)
     if capacity_forecast is not None:
@@ -11843,7 +11752,7 @@ async def _apply_locked_provider_directory_artifact_bundle(
     return capacity_forecast
 
 
-async def _lock_provider_directory_artifact_live_tables(schema, relation_names):
+async def _lock_provider_directory_artifact_live_tables(schema, relation_names, *, read_only=False):
     from process.entity_address_cutover_contract import lock_live_serving_relations
     from process.provider_directory_projection_stage import _copy_driver
 
@@ -11857,7 +11766,7 @@ async def _lock_provider_directory_artifact_live_tables(schema, relation_names):
     if binding is not None and binding.borrowed:
         # Cancel the raw wait without discarding the caller's SQLAlchemy connection.
         execute = (await _copy_driver(binding.session)).execute
-    await lock_live_serving_relations(execute, schema, installed_names)
+    await lock_live_serving_relations(execute, schema, installed_names, **({"read_only": True} if read_only else {}))
 
 
 async def _apply_prepared_artifact_bundle_in_transaction(
@@ -11865,15 +11774,13 @@ async def _apply_prepared_artifact_bundle_in_transaction(
     *,
     profile_delta: ProviderDirectoryPreparedProfileDelta | None = None,
     cutover_timeout: asyncio.Timeout | None = None,
+    promotion_identities: tuple[ProviderDirectoryArtifactPromotionIdentity, ...] = (),
 ) -> _ProviderDirectoryProfileCutoverCapacityForecast | None:
     """Apply prepared relations without committing the owner's publication."""
-    from process.provider_directory_artifact_bundle_preparation import apply_prepared_artifact_bundle
+    from process.provider_directory_artifact_bundle_preparation import ArtifactBundlePublication
 
-    return await apply_prepared_artifact_bundle(
-        sys.modules[__name__],
-        stages,
-        profile_delta=profile_delta,
-        cutover_timeout=cutover_timeout,
+    return await ArtifactBundlePublication(promotion_identities=promotion_identities).apply(
+        sys.modules[__name__], stages, profile_delta=profile_delta, cutover_timeout=cutover_timeout
     )
 
 
@@ -11882,6 +11789,7 @@ async def _promote_provider_directory_artifact_bundle_transaction(
     *,
     profile_delta: ProviderDirectoryPreparedProfileDelta | None = None,
     cutover_timeout: asyncio.Timeout | None = None,
+    promotion_identities: tuple[ProviderDirectoryArtifactPromotionIdentity, ...] = (),
 ) -> None:
     """Publish relation swaps and an optional source delta atomically."""
     from process.provider_directory_profile_serving_receipt import ordinary_profile_receipt_continuity
@@ -11901,12 +11809,14 @@ async def _promote_provider_directory_artifact_bundle_transaction(
                 stages,
                 profile_delta=profile_delta,
                 cutover_timeout=cutover_timeout,
+                **({"promotion_identities": promotion_identities} if promotion_identities else {}),
             )
         if profile_initial.build_from_stages(sys.modules[__name__], stages) is not None:
             await db.status("SET CONSTRAINTS ALL IMMEDIATE")
             await _profile_capacity_remaining_ms(_provider_directory_profile_capacity_admission())
         if capacity_forecast is not None:
             await _validate_profile_delta_total_wal(_provider_directory_profile_capacity_admission(), capacity_forecast)
+        await _observe_provider_directory_artifact_promotion_revisions(promotion_identities)
 
 
 async def _is_artifact_bundle_promotion_committed(
@@ -11917,22 +11827,27 @@ async def _is_artifact_bundle_promotion_committed(
 ) -> bool:
     """Verify all atomic cutover components after acknowledgement loss."""
     try:
-        relation_swap_committed = not stages or await _is_provider_directory_artifact_promotion_committed(
-            promotion_identities,
-            dataset_fence,
-        )
-        delta_committed = profile_delta is None or await _is_provider_directory_profile_delta_committed(profile_delta)
-        dataset_committed = dataset_fence is None or await _is_provider_directory_dataset_cutover_committed(
-            dataset_fence
-        )
+        async with _provider_directory_artifact_promotion_readback() as can_observe:
+            if not can_observe:
+                return False
+            relation_swap_committed = not stages or await _match_provider_directory_artifact_promotion(
+                promotion_identities,
+                dataset_fence,
+            )
+            delta_committed = profile_delta is None or await _is_provider_directory_profile_delta_committed(
+                profile_delta
+            )
+            dataset_committed = dataset_fence is None or await _is_provider_directory_dataset_cutover_committed(
+                dataset_fence
+            )
+            initial_committed = await profile_initial.is_committed(sys.modules[__name__], stages)
+            return relation_swap_committed and delta_committed and dataset_committed and initial_committed
     except Exception:
         LOGGER.warning(
             "Provider Directory artifact cutover acknowledgement was lost and committed-state verification also failed",
             exc_info=True,
         )
         return False
-    initial_committed = await profile_initial.is_committed(sys.modules[__name__], stages)
-    return relation_swap_committed and delta_committed and dataset_committed and initial_committed
 
 
 async def _resolve_initial_cutover_cancellation(stages, dataset_fence, promotion_identities):
@@ -11988,6 +11903,7 @@ async def _promote_provider_directory_artifact_bundle(
                 stages,
                 profile_delta=profile_delta,
                 cutover_timeout=None if profile_delta is not None else cutover_timeout,
+                promotion_identities=promotion_identities,
             )
     except asyncio.CancelledError:
         await _resolve_initial_cutover_cancellation(stages, dataset_fence, promotion_identities)
@@ -12006,7 +11922,7 @@ async def _promote_provider_directory_artifact_bundle(
             LOGGER.warning(
                 "Provider Directory artifact cutover acknowledgement "
                 "was lost after commit (%s); verified promoted targets "
-                "by immutable identity: %s",
+                "by exact logical revision: %s",
                 type(promotion_error).__name__,
                 ",".join(stage.target_relation for stage in stages),
             )
@@ -12097,6 +12013,7 @@ async def _promote_provider_directory_artifact_stage(
                 rename_stage_indexes,
                 build_fence,
                 cutover_timeout,
+                promotion_identities=promotion_identities,
             )
     except TimeoutError:
         if await _is_provider_directory_artifact_promotion_committed(
@@ -12105,7 +12022,7 @@ async def _promote_provider_directory_artifact_stage(
         ):
             LOGGER.warning(
                 "Provider Directory artifact cutover timed out after commit; "
-                "verified promoted target by relation identity: %s",
+                "verified promoted target by exact logical revision: %s",
                 target_relation,
             )
             return
@@ -12288,41 +12205,12 @@ async def _best_effort_drop_address_corroboration_stage(stage_ref: str) -> None:
 
 
 async def _capture_address_corroboration_fence(
-    schema: str,
-    relation: str,
-    source_ids: list[str],
-    build_fence: ProviderDirectoryArtifactBuildFence,
+    schema: str, relation: str, source_ids: list[str], build_fence: ProviderDirectoryArtifactBuildFence
 ) -> ProviderDirectoryArtifactBuildFence:
-    """Capture alias generation and overlay identity for corroboration build."""
-    alias_generation = await _address_alias_generation(schema)
-    artifact_generation = await _address_alias_artifact_generation(schema, relation)
-    if artifact_generation != alias_generation and source_ids:
-        raise RuntimeError(
-            "address alias generation changed; a full Provider Directory address corroboration rebuild is required"
-        )
-    dependency_relation = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(
-        PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-        PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-    )
-    dependency_relation_oid = await _provider_directory_relation_oid(
-        schema,
-        dependency_relation,
-    )
-    if dependency_relation_oid is None:
-        raise RuntimeError("Provider Directory address overlay dependency is missing")
-    if dependency_relation == PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
-        overlay_generation = await _address_alias_artifact_generation(
-            schema,
-            PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE,
-        )
-        if overlay_generation != alias_generation:
-            raise RuntimeError("Provider Directory address overlay uses a stale address alias generation")
-    return replace(
-        build_fence,
-        alias_generation=alias_generation,
-        dependency_relation=dependency_relation,
-        dependency_relation_oid=dependency_relation_oid,
-    )
+    """Capture the selected logical overlay publication for corroboration."""
+    from process.provider_directory_artifact_bundle_preparation import capture_address_corroboration_fence
+
+    return await capture_address_corroboration_fence(sys.modules[__name__], schema, relation, source_ids, build_fence)
 
 
 async def _build_address_corroboration_stage(
@@ -18978,25 +18866,23 @@ async def _build_artifact_scope_pk(
     )
 
 
-async def _artifact_scope_recovery_heap_fingerprint(schema, relation_name, relation_oid, model):
+async def _artifact_scope_recovery_heap_fingerprint(schema, relation_name, model):
     """Remove only independently verified index phases from native heap comparison."""
     return await profile_artifact_layout._artifact_scope_recovery_heap_fingerprint(
-        sys.modules[__name__], schema, relation_name, relation_oid, model
+        sys.modules[__name__], schema, relation_name, model
     )
 
 
-async def _artifact_scope_recovery_index_phase(schema, relation_name, relation_oid, model, indexes, constraints):
+async def _artifact_scope_recovery_index_phase(schema, relation_name, model, indexes, constraints):
     """Allow only the exact heap, PK-build, is_attached-PK and optional bucket prefix."""
     return await profile_artifact_layout._artifact_scope_recovery_index_phase(
-        sys.modules[__name__], schema, relation_name, relation_oid, model, indexes, constraints
+        sys.modules[__name__], schema, relation_name, model, indexes, constraints
     )
 
 
-def _assert_artifact_scope_native_not_null(model, relation_oid, constraints):
+def _assert_artifact_scope_native_not_null(model, constraints):
     """Retain native NOT NULL enforcement while comparing permitted index phases."""
-    return profile_artifact_layout._assert_artifact_scope_native_not_null(
-        sys.modules[__name__], model, relation_oid, constraints
-    )
+    return profile_artifact_layout._assert_artifact_scope_native_not_null(sys.modules[__name__], model, constraints)
 
 
 def _artifact_scope_recovery_pk_shape(index_map, model, is_attached):
@@ -20140,7 +20026,7 @@ async def _verify_provider_directory_artifact_dataset_fence(
 
 
 async def _lock_source_publication_controls() -> None:
-    """Freeze the full alias scope only during the short original SOURCE cut."""
+    """Hold metadata names while the cut takes its endpoint, alias and dataset row fences."""
     from process.provider_directory_generic_source_policy import require_source_publication_transaction
 
     publisher = await require_source_publication_transaction(db)
@@ -20148,8 +20034,8 @@ async def _lock_source_publication_controls() -> None:
         raise RuntimeError("provider_directory_source_publication_schema_changed")
     endpoint_ref = _unscoped_qt(_schema(), ProviderDirectoryAPIEndpoint.__tablename__)
     source_ref = _unscoped_qt(_schema(), ProviderDirectorySource.__tablename__)
-    await db.status(f"LOCK TABLE {endpoint_ref} IN SHARE MODE NOWAIT;")
-    await db.status(f"LOCK TABLE {source_ref} IN SHARE ROW EXCLUSIVE MODE NOWAIT;")
+    await db.status(f"LOCK TABLE {endpoint_ref} IN ACCESS SHARE MODE NOWAIT;")
+    await db.status(f"LOCK TABLE {source_ref} IN ACCESS SHARE MODE NOWAIT;")
 
 
 async def _lock_and_verify_artifact_dataset_fence(
@@ -21225,17 +21111,14 @@ def _artifact_scope_tokens(
     fence: ProviderDirectoryArtifactDatasetFence,
     resource_fence: ProviderDirectoryArtifactDatasetFence,
     relation_overrides: Mapping[str, str],
-    relation_oids: Mapping[str, int],
 ) -> Iterator[None]:
     """Install and restore artifact-scope context variables together."""
     relation_token = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(dict(relation_overrides))
-    oid_token = _PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.set(dict(relation_oids))
     fence_token = _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.set(fence)
     resource_scope_token = _PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS.set(tuple(resource_fence.source_ids))
     try:
         yield
     finally:
-        _PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.reset(oid_token)
         _PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS.reset(resource_scope_token)
         _PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.reset(fence_token)
         _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(relation_token)
@@ -21263,7 +21146,6 @@ async def _yield_artifact_dataset_scope(
             fence,
             resource_fence,
             relation_overrides,
-            {base_name: identities[relation_name][0] for base_name, relation_name in relation_overrides.items()},
         ):
             from process.provider_directory_profile_scope_reads import prepared_scope
 
@@ -21272,7 +21154,6 @@ async def _yield_artifact_dataset_scope(
                     sys.modules[__name__],
                     projection,
                     relation_overrides,
-                    {base: identities[name][0] for base, name in relation_overrides.items()},
                     fence,
                     resource_fence,
                 )
@@ -21416,12 +21297,10 @@ async def _artifact_scope_scratch_projection(
     )
     if relation_oid <= 0:
         raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_scratch_oid_changed")
-    layout = await _provider_directory_profile_relation_storage_fingerprint(
+    layout = await _provider_directory_profile_capacity_relation_layout(
         relation_oid,
         expected_persistence="u",
     )
-    if layout.effective_tablespace_oids != (admission.geometry.tablespace_oid,):
-        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_scratch_tablespace_changed")
     scratch_projection = profile_capacity.project_profile_scratch_capacity(
         admission.geometry,
         profile_capacity.ProviderDirectoryProfileScratchInput(
@@ -21721,8 +21600,8 @@ async def _artifact_scope_recovery_coordinates(
 async def _artifact_scope_relation_identities(
     schema: str,
     relation_names: Iterable[str],
-) -> dict[str, tuple[int, str, str]]:
-    """Return exact table OID, kind, and persistence for named scratch."""
+) -> dict[str, tuple[str, str, str]]:
+    """Return declared names, native kind and persistence for scratch relations."""
 
     names = sorted(set(relation_names))
     if not names:
@@ -21730,7 +21609,6 @@ async def _artifact_scope_relation_identities(
     identity_rows = await db.all(
         """
         SELECT relation.relname::text AS relation_name,
-               relation.oid::bigint AS relation_oid,
                relation.relkind::text AS relkind,
                relation.relpersistence::text AS relpersistence
           FROM pg_class AS relation
@@ -21745,7 +21623,7 @@ async def _artifact_scope_relation_identities(
     )
     return {
         str(row_map["relation_name"]): (
-            int(row_map["relation_oid"]),
+            str(row_map["relation_name"]),
             str(row_map["relkind"]),
             str(row_map["relpersistence"]),
         )
@@ -21755,7 +21633,7 @@ async def _artifact_scope_relation_identities(
 
 async def _owned_unlogged_location_artifact_scope(
     schema: str,
-) -> tuple[str, int] | None:
+) -> str | None:
     """Return the exact current-run private Location scope, if any."""
     from process.provider_directory_cms_preparation import _ACTIVE as nonprofile_admission
 
@@ -21763,51 +21641,42 @@ async def _owned_unlogged_location_artifact_scope(
         return None
 
     relation_name = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(ProviderDirectoryLocation.__tablename__)
-    expected_oid = _PROVIDER_DIRECTORY_ARTIFACT_OWNED_RELATION_OIDS.get().get(ProviderDirectoryLocation.__tablename__)
-    if not relation_name or expected_oid is None or _provider_directory_profile_capacity_admission() is not None:
+    if not relation_name or _provider_directory_profile_capacity_admission() is not None:
         return None
     identity = (await _artifact_scope_relation_identities(schema, [relation_name])).get(relation_name)
-    if identity != (expected_oid, "r", "u"):
+    if identity != (relation_name, "r", "u"):
         raise ProviderDirectoryArtifactBuildStale("provider_directory_location_address_scope_invalid")
-    return relation_name, expected_oid
+    return relation_name
 
 
 async def _assert_artifact_scope_recovery_unreferenced(
     schema: str,
-    relation_oids: list[int],
+    relation_names: list[str],
     admission: _ProviderDirectoryProfileCapacityAdmission,
 ) -> None:
-    """Refuse scratch that is protected by serving or checkpoint identity."""
+    """Refuse current targets and any scratch retained by logical control records."""
 
     geometry = admission.geometry
-    protected_oids = {
-        geometry.evidence_target_oid,
-        geometry.profile_target_oid,
-        geometry.build_checkpoint_oid,
-        geometry.serving_generation_oid,
-        geometry.delta_receipt_oid,
-        geometry.import_run_oid,
-        geometry.capacity_consumption_oid,
-    }
-    if protected_oids.intersection(relation_oids):
-        raise ProviderDirectoryArtifactBuildStale("provider_directory_artifact_scope_protected_oid")
+    protected_names = {(coordinate["schema"], coordinate["name"]) for coordinate in geometry.relations.values()}
+    if protected_names.intersection((schema, name) for name in relation_names):
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_artifact_scope_protected_relation")
     if await _is_artifact_scope_recovery_referenced(
         schema,
-        relation_oids,
+        relation_names,
     ):
         raise ProviderDirectoryArtifactBuildStale("provider_directory_artifact_scope_referenced")
 
 
-async def _is_artifact_scope_recovery_referenced(schema: str, relation_oids: list[int]) -> bool:
-    """Return whether serving or checkpoint state retains any scratch OID."""
+async def _is_artifact_scope_recovery_referenced(schema: str, relation_names: list[str]) -> bool:
+    """Return whether serving or checkpoint state retains a scratch QName."""
     return await profile_artifact_layout._is_artifact_scope_recovery_referenced(
-        sys.modules[__name__], schema, relation_oids
+        sys.modules[__name__], schema, relation_names
     )
 
 
 def _assert_artifact_scope_recovery_identity(
     expected_names: Iterable[str],
-    observed: Mapping[str, tuple[int, str, str]],
+    observed: Mapping[str, tuple[str, str, str]],
 ) -> None:
     """Require every recovery relation to remain one unlogged heap."""
 
@@ -21835,7 +21704,7 @@ async def _create_recovery_artifact_scope_layouts(
 async def _assert_artifact_scope_recovery_layouts(
     schema: str,
     coordinates: tuple[_ArtifactScopeRecoveryCoordinate, ...],
-    prior_identities: Mapping[str, tuple[int, str, str]],
+    prior_identities: Mapping[str, tuple[str, str, str]],
     admission: _ProviderDirectoryProfileCapacityAdmission,
 ) -> None:
     """Authenticate exact old index phases before comparing fresh heap layouts."""
@@ -21873,7 +21742,7 @@ async def _replace_terminal_artifact_scope(
     plan: _ArtifactScopeMaterializationPlan,
     coordinates: tuple[_ArtifactScopeRecoveryCoordinate, ...],
     prior_names: tuple[str, ...],
-    initial_identities: Mapping[str, tuple[int, str, str]],
+    initial_identities: Mapping[str, tuple[str, str, str]],
     admission: _ProviderDirectoryProfileCapacityAdmission,
 ) -> None:
     """Replace locked prior scratch with current layouts in one transaction."""
@@ -22261,7 +22130,6 @@ class _LocationKeyBuild:
     schema: str
     native_module: Any
     old_table: str
-    old_oid: int
     stage_table: str
     replacement_table: str
     select_sql: str
@@ -22272,7 +22140,7 @@ class _LocationKeyBuild:
 def _new_location_key_build(
     schema: str,
     native_module: Any,
-    owned_scope: tuple[str, int],
+    owned_scope: str,
     *,
     restore_state_from_zip: bool,
     run_id: str | None,
@@ -22287,13 +22155,12 @@ def _new_location_key_build(
         params_by_name["run_id"] = run_id
     if source_ids:
         params_by_name["source_ids"] = list(source_ids)
-    old_table, old_oid = owned_scope
+    old_table = owned_scope
     auxiliary_token = _stage_table_name()
     return _LocationKeyBuild(
         schema,
         native_module,
         old_table,
-        old_oid,
         _bounded_identifier(auxiliary_token + "_location_address"),
         _bounded_identifier(auxiliary_token + "_location_replacement"),
         _location_key_fast_batch_sql(
@@ -22484,10 +22351,10 @@ async def _populate_location_replacement(build: _LocationKeyBuild) -> None:
 
 
 async def _assert_location_scope(build: _LocationKeyBuild) -> None:
-    """Require the original private Location heap identity."""
+    """Require the declared private Location unlogged heap."""
 
     identity = (await _artifact_scope_relation_identities(build.schema, [build.old_table])).get(build.old_table)
-    if identity != (build.old_oid, "r", "u"):
+    if identity != (build.old_table, "r", "u"):
         raise ProviderDirectoryArtifactBuildStale("provider_directory_location_address_scope_changed")
 
 
@@ -22533,7 +22400,7 @@ async def _replace_location_scope(
 async def _publish_location_keys_fast(
     schema: str,
     native_module: Any,
-    owned_scope: tuple[str, int],
+    owned_scope: str,
     *,
     restore_state_from_zip: bool,
     run_id: str | None,
@@ -24807,8 +24674,7 @@ class _ProviderDirectoryProfileServingState:
     source_context_vector: tuple[tuple[str, str], ...]
     source_context_vector_hash: str
     executable_plan_hash: str
-    evidence_target_oid: int
-    profile_target_oid: int
+    targets: dict[str, dict[str, str]]
     evidence_rows: int
     profile_rows: int
     profile_as_of: str
@@ -24979,16 +24845,10 @@ class _ProviderDirectoryProfileMaterializationIdentity:
 
 @dataclass(frozen=True)
 class _ProviderDirectoryProfileDatabaseCapacityIdentity:
-    """PostgreSQL identity observed before any Profile scratch mutation."""
+    """Numeric PostgreSQL assumptions and configured logical relations."""
 
-    database_system_identifier: str
-    database_oid: int
-    database_name: str
-    tablespace_oid: int
-    tablespace_name: str
-    temp_tablespace_oid: int
-    temp_tablespace_name: str
     wal_lsn: str
+    relations: dict[str, dict[str, Any]]
     postgres_server_version_num: int
     postgres_block_size_bytes: int
     postgres_wal_block_size_bytes: int
@@ -25001,18 +24861,6 @@ class _ProviderDirectoryProfileDatabaseCapacityIdentity:
     postgres_default_toast_compression: str
     postgres_checkpoint_timeout_seconds: int
     postgres_max_wal_size_bytes: int
-    evidence_target_storage_fingerprint: str
-    profile_target_storage_fingerprint: str
-    build_checkpoint_oid: int
-    serving_generation_oid: int
-    delta_receipt_oid: int
-    import_run_oid: int
-    capacity_consumption_oid: int
-    build_checkpoint_storage_fingerprint: str
-    serving_generation_storage_fingerprint: str
-    delta_receipt_storage_fingerprint: str
-    import_run_storage_fingerprint: str
-    capacity_consumption_storage_fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -25029,6 +24877,21 @@ class _ProviderDirectoryProfileRelationStorageLayout:
     toast_index_pages: tuple[int, ...]
     toastable_columns: tuple[str, ...]
     effective_tablespace_oids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _ProviderDirectoryProfileCapacityLayout:
+    """Logical names and transient numeric layout measurements."""
+
+    schema_name: str
+    relation_name: str
+    relation_oid: int
+    toast_oid: int | None
+    main_index_oids: tuple[int, ...]
+    main_index_pages: tuple[int, ...]
+    toast_index_oids: tuple[int, ...]
+    toast_index_pages: tuple[int, ...]
+    toastable_columns: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -25123,9 +24986,20 @@ def _provider_directory_profile_capacity_geometry_identity(
             raise RuntimeError("provider_directory_profile_capacity_geometry_json_invalid") from exc
     if not isinstance(geometry_json, Mapping):
         raise RuntimeError("provider_directory_profile_capacity_geometry_json_invalid")
-    geometry = profile_capacity.validated_capacity_geometry(dict(geometry_json))
-    canonical_json = profile_capacity.canonical_capacity_geometry_json(geometry)
-    computed_hash = profile_capacity.capacity_geometry_hash(geometry)
+    if geometry_json.get("contract_id") in {
+        "healthporta.provider-directory-profile-capacity-geometry.v5",
+        "healthporta.provider-directory-profile-initial-capacity-geometry.v1",
+    }:
+        from process.provider_directory_profile_capacity_geometry import _legacy_geometry_hash
+
+        computed_hash = _legacy_geometry_hash(geometry_json)
+        canonical_json = json.dumps(
+            geometry_json, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+        )
+    else:
+        geometry = profile_capacity.validated_capacity_geometry(dict(geometry_json))
+        canonical_json = profile_capacity.canonical_capacity_geometry_json(geometry)
+        computed_hash = profile_capacity.capacity_geometry_hash(geometry)
     if normalized_hash != computed_hash:
         raise RuntimeError("provider_directory_profile_capacity_geometry_hash_invalid")
     return "verified", computed_hash, canonical_json
@@ -25453,7 +25327,6 @@ def _assert_profile_capacity_receipt_trigger_shape(
     has_invalid_trigger = (
         {int(trigger["tgtype"]) for trigger in triggers} != {10, 19, 34}
         or any(trigger.get("trigger_enabled") != "A" for trigger in triggers)
-        or len({int(trigger["trigger_function_oid"]) for trigger in triggers}) != 2
         or observed_trigger_sources != {expected_update_source, expected_delete_source}
     )
     if has_invalid_trigger:
@@ -25488,7 +25361,6 @@ def _assert_profile_capacity_trigger_shape(
         or not expected_immutable_trigger_error
         or {int(trigger["tgtype"]) for trigger in triggers} != {26, 34}
         or any(trigger.get("trigger_enabled") != "A" for trigger in triggers)
-        or len({int(trigger["trigger_function_oid"]) for trigger in triggers}) != 1
         or observed_trigger_sources != {expected_trigger_source}
     )
     if has_invalid_trigger:
@@ -25745,38 +25617,154 @@ async def _provider_directory_profile_relation_storage_fingerprint(
     )
 
 
+_PROFILE_CAPACITY_NUMERIC_RELATION_SQL = """SELECT c.oid::bigint AS relation_oid, n.nspname AS schema_name,
+                  c.relname AS relation_name, NULLIF(c.reltoastrelid,0)::bigint AS toast_oid,
+                  c.relkind::text AS relkind, c.relpersistence::text AS relpersistence,
+                  am.amname AS table_am, c.relreplident::text AS relreplident,
+                  c.relrowsecurity,c.relforcerowsecurity,c.relispartition,
+                  t.relkind::text AS toast_relkind,t.relpersistence::text AS toast_relpersistence,
+                  tam.amname AS toast_am,
+                  (SELECT count(*) FROM pg_trigger g WHERE g.tgrelid=c.oid AND NOT g.tgisinternal) AS user_trigger_count,
+                  (SELECT count(*) FROM pg_rewrite r WHERE r.ev_class=c.oid) AS rule_count,
+                  (SELECT count(*) FROM pg_inherits i WHERE i.inhrelid=c.oid OR i.inhparent=c.oid) AS inheritance_count
+             FROM pg_class AS c JOIN pg_namespace AS n ON n.oid=c.relnamespace
+             JOIN pg_am AS am ON am.oid=c.relam LEFT JOIN pg_class t ON t.oid=c.reltoastrelid
+             LEFT JOIN pg_am tam ON tam.oid=t.relam WHERE c.oid=CAST(:relation_oid AS oid)"""
+
+
+def _profile_capacity_native_guard_policy(
+    role, expected_user_trigger_count, expected_immutable_trigger_error, expected_single_use_receipt
+):
+    """Resolve the existing native controls without treating unknown triggers as safe."""
+    inferred_policy_by_role = {
+        ProviderDirectoryProfileDeltaReceipt.__tablename__: (
+            2,
+            "provider_directory_profile_delta_receipt_immutable",
+            False,
+        ),
+        ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__: (
+            2,
+            "provider_directory_profile_capacity_consumption_immutable",
+            False,
+        ),
+        ProviderDirectoryProfileCapacityPreflightReceipt.__tablename__: (3, None, True),
+        profile_initial_contract.RECEIPT_TABLE: (3, None, False),
+        "provider_directory_cms_serving_receipt": (2, None, False),
+    }
+    if expected_user_trigger_count == 0 and role in inferred_policy_by_role:
+        expected_user_trigger_count, inferred_error, inferred_single_use = inferred_policy_by_role[role]
+        expected_immutable_trigger_error = inferred_error or expected_immutable_trigger_error
+        expected_single_use_receipt = expected_single_use_receipt or inferred_single_use
+    if (
+        expected_single_use_receipt
+        and expected_user_trigger_count != 3
+        or expected_immutable_trigger_error is not None
+        and expected_user_trigger_count != 2
+    ):
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_trigger_expectations_invalid")
+    return expected_user_trigger_count, expected_immutable_trigger_error, expected_single_use_receipt
+
+
+async def _provider_directory_profile_capacity_relation_layout(
+    relation_oid: int,
+    *,
+    expected_persistence: str,
+    expected_user_trigger_count: int = 0,
+    expected_immutable_trigger_error: str | None = None,
+    expected_single_use_receipt: bool = False,
+    database=None,
+) -> _ProviderDirectoryProfileCapacityLayout:
+    """Validate native semantics and measure numeric layout without a custody digest."""
+    database = db if database is None else database
+    relation_row = await database.first(_PROFILE_CAPACITY_NUMERIC_RELATION_SQL, relation_oid=relation_oid)
+    if relation_row is None:
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_storage_shape_missing")
+    relation_by_field = dict(_pagination_checkpoint_row_mapping(relation_row))
+    role = relation_by_field["relation_name"]
+    expected_user_trigger_count, expected_immutable_trigger_error, expected_single_use_receipt = (
+        _profile_capacity_native_guard_policy(
+            role, expected_user_trigger_count, expected_immutable_trigger_error, expected_single_use_receipt
+        )
+    )
+    relation_by_field, toast_oid = await _validate_profile_capacity_relation_row(
+        relation_row, expected_persistence, expected_user_trigger_count, database=database
+    )
+    relations = [observed_oid for observed_oid in (relation_oid, toast_oid) if observed_oid is not None]
+    attributes, indexes, constraints, triggers = await _profile_capacity_relation_catalog(relations, database=database)
+    _profile_capacity_structural_indexes(indexes, relation_oid)
+    if any(entry.get("convalidated") is not True for entry in constraints):
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_constraint_unvalidated")
+    await _assert_profile_capacity_native_guards(
+        database,
+        relation_by_field,
+        attributes,
+        indexes,
+        constraints,
+        triggers,
+        (expected_user_trigger_count, expected_immutable_trigger_error, expected_single_use_receipt),
+    )
+    return _profile_capacity_measured_layout(relation_by_field, toast_oid, attributes, indexes)
+
+
+def _profile_capacity_measured_layout(relation, toast_oid, attributes, indexes):
+    """Return only names and numeric native layout inputs for bounded projections."""
+    relation_oid = int(relation["relation_oid"])
+    main, toast = _profile_capacity_index_groups(indexes, relation_oid, toast_oid)
+    return _ProviderDirectoryProfileCapacityLayout(
+        schema_name=relation["schema_name"],
+        relation_name=relation["relation_name"],
+        relation_oid=relation_oid,
+        toast_oid=toast_oid,
+        main_index_oids=tuple(int(item["index_oid"]) for item in main),
+        main_index_pages=tuple(
+            max(1, math.ceil(int(item["main_bytes"]) / profile_capacity.POSTGRES_BLOCK_SIZE_BYTES)) for item in main
+        ),
+        toast_index_oids=tuple(int(item["index_oid"]) for item in toast),
+        toast_index_pages=tuple(
+            max(1, math.ceil(int(item["main_bytes"]) / profile_capacity.POSTGRES_BLOCK_SIZE_BYTES)) for item in toast
+        ),
+        toastable_columns=tuple(
+            str(item["attname"])
+            for item in attributes
+            if int(item["relation_oid"]) == relation_oid
+            and item.get("attstorage") != "p"
+            and int(item.get("typlen") or 0) == -1
+        ),
+    )
+
+
+async def _assert_profile_capacity_native_guards(
+    database, relation, attributes, indexes, constraints, triggers, expectations
+):
+    """Reuse native guard semantics; never retain their catalog identity as authority."""
+    role = relation["relation_name"]
+    if role == profile_initial_contract.RECEIPT_TABLE:
+        from process.provider_directory_profile_initial_guards import (
+            assert_initial_receipt_catalog,
+            assert_initial_receipt_guards,
+        )
+
+        await assert_initial_receipt_guards(database, relation, triggers)
+        assert_initial_receipt_catalog(relation["relation_oid"], attributes, indexes, constraints)
+    elif role == ProviderDirectoryProfileServingGeneration.__tablename__:
+        from process.provider_directory_cms_receipt_guard import assert_profile_receipt_guards
+
+        if relation["user_trigger_count"]:
+            await assert_profile_receipt_guards(database, relation, triggers)
+    elif role == "provider_directory_cms_serving_receipt":
+        from process.provider_directory_cms_receipt_guard import assert_common_receipt_guards
+
+        await assert_common_receipt_guards(database, relation, triggers)
+    elif role == ImportRun.__tablename__ and triggers:
+        from process.provider_directory_import_run_guards import assert_import_run_guards
+
+        await assert_import_run_guards(database, relation, triggers)
+    else:
+        _assert_profile_capacity_trigger_shape(triggers, *expectations)
+
+
 _PROFILE_CAPACITY_DATABASE_IDENTITY_SQL = """
-        SELECT control.system_identifier::text
-                   AS database_system_identifier,
-               database_row.oid::bigint AS database_oid,
-               database_row.datname::text AS database_name,
-               database_row.dattablespace::bigint
-                   AS database_tablespace_oid,
-               database_tablespace.spcname::text
-                   AS database_tablespace_name,
-               evidence_relation.oid::bigint AS evidence_target_oid,
-               evidence_namespace.nspname::text AS evidence_schema,
-               evidence_relation.relname::text AS evidence_relation,
-               evidence_relation.relkind::text AS evidence_relkind,
-               evidence_relation.relpersistence::text
-                   AS evidence_relpersistence,
-               COALESCE(
-                   NULLIF(evidence_relation.reltablespace, 0),
-                   database_row.dattablespace
-               )::bigint AS evidence_tablespace_oid,
-               profile_relation.oid::bigint AS profile_target_oid,
-               profile_namespace.nspname::text AS profile_schema,
-               profile_relation.relname::text AS profile_relation,
-               profile_relation.relkind::text AS profile_relkind,
-               profile_relation.relpersistence::text
-                   AS profile_relpersistence,
-               COALESCE(
-                   NULLIF(profile_relation.reltablespace, 0),
-                   database_row.dattablespace
-               )::bigint AS profile_tablespace_oid,
-               current_setting('temp_tablespaces')::text
-                   AS temp_tablespaces,
-               current_setting('server_version_num')::integer
+SELECT current_setting('server_version_num')::integer
                    AS postgres_server_version_num,
                pg_size_bytes(current_setting('block_size'))::bigint
                    AS postgres_block_size_bytes,
@@ -25803,377 +25791,52 @@ _PROFILE_CAPACITY_DATABASE_IDENTITY_SQL = """
                )::bigint AS postgres_checkpoint_timeout_seconds,
                pg_size_bytes(current_setting('max_wal_size'))::bigint
                    AS postgres_max_wal_size_bytes,
-               pg_current_wal_insert_lsn()::text AS wal_lsn
-          FROM pg_database AS database_row
-          CROSS JOIN pg_control_system() AS control
-          JOIN pg_tablespace AS database_tablespace
-            ON database_tablespace.oid = database_row.dattablespace
-          JOIN pg_class AS evidence_relation
-            ON evidence_relation.oid = CAST(
-                :evidence_target_oid AS oid
-            )
-          JOIN pg_namespace AS evidence_namespace
-            ON evidence_namespace.oid = evidence_relation.relnamespace
-          JOIN pg_class AS profile_relation
-            ON profile_relation.oid = CAST(:profile_target_oid AS oid)
-          JOIN pg_namespace AS profile_namespace
-            ON profile_namespace.oid = profile_relation.relnamespace
-         WHERE database_row.datname = current_database();
-        """
-
-_PROFILE_CAPACITY_METADATA_IDENTITY_SQL = """
-        SELECT CAST(:checkpoint_ref AS regclass)::oid::bigint
-                   AS build_checkpoint_oid,
-               CAST(:serving_ref AS regclass)::oid::bigint
-                   AS serving_generation_oid,
-               CAST(:receipt_ref AS regclass)::oid::bigint
-                   AS delta_receipt_oid,
-               CAST(:import_run_ref AS regclass)::oid::bigint
-                   AS import_run_oid,
-               CAST(:capacity_consumption_ref AS regclass)::oid::bigint
-                   AS capacity_consumption_oid;
-        """
-
-
-@dataclass(frozen=True)
-class _ProfileCapacityTargetLayouts:
-    database_tablespace_oid: int
-    temp_tablespace_oid: int
-    temp_tablespace_name: str
-    evidence: _ProviderDirectoryProfileRelationStorageLayout
-    profile: _ProviderDirectoryProfileRelationStorageLayout
-
-
-@dataclass(frozen=True)
-class _ProfileCapacityMetadataLayouts:
-    oids_by_name: dict[str, int]
-    layouts_by_name: dict[
-        str,
-        _ProviderDirectoryProfileRelationStorageLayout,
-    ]
+               pg_current_wal_insert_lsn()::text AS wal_lsn;
+"""
 
 
 async def _profile_capacity_database_row(
     serving_state: _ProviderDirectoryProfileServingState,
 ) -> Mapping[str, Any]:
-    """Load exact PostgreSQL, target, and tablespace identity."""
-    identity_row = await db.first(
-        _PROFILE_CAPACITY_DATABASE_IDENTITY_SQL,
-        evidence_target_oid=serving_state.evidence_target_oid,
-        profile_target_oid=serving_state.profile_target_oid,
-    )
-    if identity_row is None:
-        raise RuntimeError("provider_directory_profile_capacity_database_identity_missing")
-    return _pagination_checkpoint_row_mapping(identity_row)
-
-
-def _profile_capacity_database_tablespace_oid(
-    identity_map: Mapping[str, Any],
-    schema: str,
-    serving_state: _ProviderDirectoryProfileServingState,
-) -> int:
-    """Validate serving targets and return their shared tablespace OID."""
-    expected_target_identity = (
-        (
-            serving_state.evidence_target_oid,
-            schema,
-            profile_artifact.PROFILE_EVIDENCE_TABLE,
-            "r",
-            "p",
-        ),
-        (
-            serving_state.profile_target_oid,
-            schema,
-            profile_artifact.PROFILE_TABLE,
-            "r",
-            "p",
-        ),
-    )
-    observed_target_identity = (
-        (
-            int(identity_map["evidence_target_oid"]),
-            str(identity_map["evidence_schema"]),
-            str(identity_map["evidence_relation"]),
-            str(identity_map["evidence_relkind"]),
-            str(identity_map["evidence_relpersistence"]),
-        ),
-        (
-            int(identity_map["profile_target_oid"]),
-            str(identity_map["profile_schema"]),
-            str(identity_map["profile_relation"]),
-            str(identity_map["profile_relkind"]),
-            str(identity_map["profile_relpersistence"]),
-        ),
-    )
-    if observed_target_identity != expected_target_identity:
-        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_target_identity_changed")
-    database_tablespace_oid = int(identity_map["database_tablespace_oid"])
-    if {
-        int(identity_map["evidence_tablespace_oid"]),
-        int(identity_map["profile_tablespace_oid"]),
-    } != {database_tablespace_oid}:
-        raise RuntimeError("provider_directory_profile_capacity_target_tablespace_unsupported")
-    return database_tablespace_oid
-
-
-async def _profile_capacity_temp_tablespace(
-    identity_map: Mapping[str, Any],
-    database_tablespace_oid: int,
-) -> tuple[int, str]:
-    """Resolve one unambiguous effective temp tablespace."""
-    temp_setting = str(identity_map.get("temp_tablespaces") or "").strip()
-    if not temp_setting:
-        return (
-            database_tablespace_oid,
-            str(identity_map["database_tablespace_name"]),
-        )
-    if (
-        "," in temp_setting
-        or re.fullmatch(
-            r"[A-Za-z_][A-Za-z0-9_$]*",
-            temp_setting,
-        )
-        is None
-    ):
-        raise RuntimeError("provider_directory_profile_capacity_temp_tablespace_ambiguous")
-    temp_row = await db.first(
-        """
-        SELECT oid::bigint AS tablespace_oid,
-               spcname::text AS tablespace_name
-          FROM pg_tablespace
-         WHERE spcname = :tablespace_name;
-        """,
-        tablespace_name=temp_setting,
-    )
-    if temp_row is None:
-        raise RuntimeError("provider_directory_profile_capacity_temp_tablespace_missing")
-    temp_map = _pagination_checkpoint_row_mapping(temp_row)
-    return int(temp_map["tablespace_oid"]), str(temp_map["tablespace_name"])
-
-
-async def _profile_capacity_target_layouts(
-    identity_map: Mapping[str, Any],
-    schema: str,
-    serving_state: _ProviderDirectoryProfileServingState,
-) -> _ProfileCapacityTargetLayouts:
-    """Resolve serving layouts and their effective temp tablespace."""
-    database_tablespace_oid = _profile_capacity_database_tablespace_oid(
-        identity_map,
-        schema,
-        serving_state,
-    )
-    temp_tablespace_oid, temp_tablespace_name = await _profile_capacity_temp_tablespace(
-        identity_map,
-        database_tablespace_oid,
-    )
-    return _ProfileCapacityTargetLayouts(
-        database_tablespace_oid=database_tablespace_oid,
-        temp_tablespace_oid=temp_tablespace_oid,
-        temp_tablespace_name=temp_tablespace_name,
-        evidence=(
-            await _provider_directory_profile_relation_storage_fingerprint(
-                serving_state.evidence_target_oid,
-                expected_persistence="p",
-            )
-        ),
-        profile=(
-            await _provider_directory_profile_relation_storage_fingerprint(
-                serving_state.profile_target_oid,
-                expected_persistence="p",
-            )
-        ),
-    )
-
-
-async def _profile_capacity_metadata_oids(
-    schema: str,
-) -> dict[str, int]:
-    """Resolve exact OIDs for every persistent control relation."""
-    identity_row = await db.first(
-        _PROFILE_CAPACITY_METADATA_IDENTITY_SQL,
-        checkpoint_ref=_provider_directory_profile_checkpoint_ref(schema),
-        serving_ref=(_provider_directory_profile_serving_generation_ref(schema)),
-        receipt_ref=_provider_directory_profile_delta_receipt_ref(schema),
-        import_run_ref=_unscoped_qt(schema, ImportRun.__tablename__),
-        capacity_consumption_ref=_unscoped_qt(
-            schema,
-            ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__,
-        ),
-    )
-    if identity_row is None:
-        raise RuntimeError("provider_directory_profile_capacity_metadata_identity_missing")
-    identity_map = _pagination_checkpoint_row_mapping(identity_row)
-    return {
-        field_name.removesuffix("_oid"): int(identity_map[field_name])
-        for field_name in (
-            "build_checkpoint_oid",
-            "serving_generation_oid",
-            "delta_receipt_oid",
-            "import_run_oid",
-            "capacity_consumption_oid",
-        )
-    }
-
-
-async def _profile_capacity_metadata_layouts(
-    schema: str,
-) -> _ProfileCapacityMetadataLayouts:
-    """Resolve OIDs and exact layouts for persistent control relations."""
-    oids_by_name = await _profile_capacity_metadata_oids(schema)
-    layouts_by_name = {}
-    for relation_name, immutable_error in (
-        ("build_checkpoint", None),
-        ("serving_generation", None),
-        (
-            "delta_receipt",
-            "provider_directory_profile_delta_receipt_immutable",
-        ),
-        ("import_run", None),
-        (
-            "capacity_consumption",
-            "provider_directory_profile_capacity_consumption_immutable",
-        ),
-    ):
-        layouts_by_name[relation_name] = await _provider_directory_profile_relation_storage_fingerprint(
-            oids_by_name[relation_name],
-            expected_persistence="p",
-            **(
-                {
-                    "expected_user_trigger_count": 2,
-                    "expected_immutable_trigger_error": immutable_error,
-                }
-                if immutable_error is not None
-                else {}
-            ),
-        )
-    return _ProfileCapacityMetadataLayouts(
-        oids_by_name=oids_by_name,
-        layouts_by_name=layouts_by_name,
-    )
-
-
-def _validate_profile_capacity_writable_layouts(
-    target_layouts: _ProfileCapacityTargetLayouts,
-    metadata_layouts: _ProfileCapacityMetadataLayouts,
-) -> None:
-    """Require every writable relation to share the database tablespace."""
-    writable_layouts = (
-        target_layouts.evidence,
-        target_layouts.profile,
-        *metadata_layouts.layouts_by_name.values(),
-    )
-    if any(
-        layout.effective_tablespace_oids != (target_layouts.database_tablespace_oid,) for layout in writable_layouts
-    ):
-        raise RuntimeError("provider_directory_profile_capacity_writable_tablespace_unsupported")
-
-
-def _profile_capacity_postgres_values(
-    identity_map: Mapping[str, Any],
-    target_layouts: _ProfileCapacityTargetLayouts,
-) -> dict[str, Any]:
-    """Return normalized PostgreSQL and tablespace identity values."""
-    converters_by_name = {
-        "database_system_identifier": str,
-        "database_oid": int,
-        "database_name": str,
-        "wal_lsn": str,
-        "postgres_server_version_num": int,
-        "postgres_block_size_bytes": int,
-        "postgres_wal_block_size_bytes": int,
-        "postgres_wal_segment_size_bytes": int,
-        "postgres_full_page_writes": bool,
-        "postgres_wal_compression": str,
-        "postgres_wal_level": str,
-        "postgres_wal_log_hints": bool,
-        "postgres_data_checksums": bool,
-        "postgres_default_toast_compression": str,
-        "postgres_checkpoint_timeout_seconds": int,
-        "postgres_max_wal_size_bytes": int,
-    }
-    values_by_name = {
-        field_name: converter(identity_map[field_name]) for field_name, converter in converters_by_name.items()
-    }
-    values_by_name.update(
-        {
-            "tablespace_oid": target_layouts.database_tablespace_oid,
-            "tablespace_name": str(identity_map["database_tablespace_name"]),
-            "temp_tablespace_oid": target_layouts.temp_tablespace_oid,
-            "temp_tablespace_name": target_layouts.temp_tablespace_name,
-        }
-    )
-    return values_by_name
-
-
-def _profile_capacity_layout_values(
-    target_layouts: _ProfileCapacityTargetLayouts,
-    metadata_layouts: _ProfileCapacityMetadataLayouts,
-) -> dict[str, Any]:
-    """Return target and control OIDs plus exact storage fingerprints."""
-    values_by_name = {
-        "evidence_target_storage_fingerprint": (target_layouts.evidence.exact_fingerprint),
-        "profile_target_storage_fingerprint": (target_layouts.profile.exact_fingerprint),
-    }
-    for relation_name, relation_oid in metadata_layouts.oids_by_name.items():
-        values_by_name[f"{relation_name}_oid"] = relation_oid
-        values_by_name[f"{relation_name}_storage_fingerprint"] = metadata_layouts.layouts_by_name[
-            relation_name
-        ].exact_fingerprint
-    return values_by_name
+    """Read numeric PostgreSQL settings used by conservative capacity math."""
+    row = await db.first(_PROFILE_CAPACITY_DATABASE_IDENTITY_SQL)
+    if row is None:
+        raise RuntimeError("provider_directory_profile_capacity_database_settings_missing")
+    return _pagination_checkpoint_row_mapping(row)
 
 
 async def _provider_directory_profile_capacity_database_identity(
     schema: str,
     serving_state: _ProviderDirectoryProfileServingState,
 ) -> _ProviderDirectoryProfileDatabaseCapacityIdentity:
-    """Resolve exact PostgreSQL and effective tablespace identity."""
-    identity_map = await _profile_capacity_database_row(serving_state)
-    target_layouts = await _profile_capacity_target_layouts(
-        identity_map,
-        schema,
-        serving_state,
-    )
-    metadata_layouts = await _profile_capacity_metadata_layouts(schema)
-    _validate_profile_capacity_writable_layouts(
-        target_layouts,
-        metadata_layouts,
-    )
-    return _ProviderDirectoryProfileDatabaseCapacityIdentity(
-        **_profile_capacity_postgres_values(identity_map, target_layouts),
-        **_profile_capacity_layout_values(target_layouts, metadata_layouts),
-    )
-
-
-def _assert_provider_directory_profile_capacity_tablespaces(
-    lease: VerifiedDatabaseCapacityLease,
-    database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
-) -> None:
-    tablespace_by_usage = {tablespace.usage: tablespace for tablespace in lease.tablespaces}
-    if set(tablespace_by_usage) != {"data", "temp"}:
-        raise ProviderDirectoryCapacityLeaseError(
-            "invalid_fields",
-            "tablespaces",
-        )
-    expected_by_usage = {
-        "data": (
-            database_identity.tablespace_oid,
-            database_identity.tablespace_name,
-        ),
-        "temp": (
-            database_identity.temp_tablespace_oid,
-            database_identity.temp_tablespace_name,
-        ),
+    """Measure configured logical targets and numeric PostgreSQL capacity."""
+    numeric_by_field = dict(await _profile_capacity_database_row(serving_state))
+    relations_by_role = {}
+    table_by_role = {
+        "evidence_target": profile_artifact.PROFILE_EVIDENCE_TABLE,
+        "profile_target": profile_artifact.PROFILE_TABLE,
+        "build_checkpoint": ProviderDirectoryProfileBuildCheckpoint.__tablename__,
+        "serving_generation": ProviderDirectoryProfileServingGeneration.__tablename__,
+        "delta_receipt": ProviderDirectoryProfileDeltaReceipt.__tablename__,
+        "import_run": ImportRun.__tablename__,
+        "capacity_consumption": ProviderDirectoryProfileCapacityLeaseConsumption.__tablename__,
     }
-    for usage, expected_identity_by_name in expected_by_usage.items():
-        signed_tablespace = tablespace_by_usage[usage]
-        if (
-            signed_tablespace.tablespace_oid,
-            signed_tablespace.tablespace_name,
-        ) != expected_identity_by_name:
-            raise ProviderDirectoryCapacityLeaseError(
-                "pin_mismatch",
-                usage + "_tablespace",
-            )
+    for role, name in table_by_role.items():
+        coordinate_by_field = {"schema": schema, "name": name}
+        if role.endswith("_target"):
+            targets_by_role = getattr(serving_state, "targets", {})
+            coordinate_by_field = dict(targets_by_role.get(role.removesuffix("_target"), coordinate_by_field))
+        oid = await _provider_directory_relation_oid(coordinate_by_field["schema"], coordinate_by_field["name"])
+        if oid is None:
+            raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_relation_missing")
+        layout = await _provider_directory_profile_capacity_relation_layout(oid, expected_persistence="p")
+        relations_by_role[role] = {
+            **coordinate_by_field,
+            "main_index_pages": list(_profile_capacity_index_page_union_bound(layout.main_index_pages)),
+            "toast_index_pages": list(_profile_capacity_index_page_union_bound(layout.toast_index_pages)),
+            "toastable_column_count": len(layout.toastable_columns),
+        }
+    return _ProviderDirectoryProfileDatabaseCapacityIdentity(**numeric_by_field, relations=relations_by_role)
 
 
 def _assert_profile_capacity_serving(
@@ -26209,11 +25872,6 @@ def _provider_directory_profile_capacity_consumption_identity(
                 "attestor_id",
                 "attestor_release_digest",
                 "public_key_fingerprint",
-                "database_system_identifier",
-                "database_oid",
-                "database_name",
-                "tablespace_identity_hash",
-                "volume_identity_hash",
                 "canonical_lease_json",
                 "signature",
                 "observed_at",
@@ -26294,9 +25952,7 @@ async def _consume_provider_directory_profile_capacity_lease(
                source_context_vector_hash, run_id, build_id,
                profile_as_of, contract_id, key_id, environment_id,
                attestor_id, attestor_release_digest,
-               public_key_fingerprint, database_system_identifier,
-               database_oid, database_name, tablespace_identity_hash,
-               volume_identity_hash, canonical_lease_json, signature,
+               public_key_fingerprint, canonical_lease_json, signature,
                observed_at, issued_at, accepted_at, expires_at,
                max_build_deadline, recorded_at
           FROM {consumption_ref}
@@ -26377,50 +26033,57 @@ def _provider_directory_profile_control_metadata_input(
     )
 
 
+def _assert_profile_capacity_layout_bounds(layout, geometry, role):
+    expected = geometry.relations[role]
+    if (layout.schema_name, layout.relation_name) != (expected["schema"], expected["name"]) or len(
+        layout.toastable_columns
+    ) != expected["toastable_column_count"]:
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_layout_scope_changed:" + role)
+    for actual, limit in (
+        (layout.main_index_pages, expected["main_index_pages"]),
+        (layout.toast_index_pages, expected["toast_index_pages"]),
+    ):
+        if len(actual) != len(limit) or any(
+            pages > maximum
+            for pages, maximum in zip(sorted(actual, reverse=True), sorted(limit, reverse=True), strict=True)
+        ):
+            raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_index_bound_changed:" + role)
+
+
+async def _profile_capacity_named_layout(geometry, role):
+    coordinate = geometry.relations[role]
+    oid = await _provider_directory_relation_oid(coordinate["schema"], coordinate["name"])
+    if oid is None:
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_relation_missing:" + role)
+    layout = await _provider_directory_profile_capacity_relation_layout(oid, expected_persistence="p")
+    _assert_profile_capacity_layout_bounds(layout, geometry, role)
+    return layout
+
+
 async def _profile_primary_control_layouts(
     database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
 ) -> tuple[_ProviderDirectoryProfileRelationStorageLayout, ...]:
-    """Load the four control layouts bound by the database identity."""
-
-    checkpoint_layout = await _provider_directory_profile_relation_storage_fingerprint(
-        database_identity.build_checkpoint_oid,
-        expected_persistence="p",
-    )
-    import_run_layout = await _provider_directory_profile_relation_storage_fingerprint(
-        database_identity.import_run_oid,
-        expected_persistence="p",
-    )
-    capacity_consumption_layout = await _provider_directory_profile_relation_storage_fingerprint(
-        database_identity.capacity_consumption_oid,
-        expected_persistence="p",
-        expected_user_trigger_count=2,
-        expected_immutable_trigger_error=("provider_directory_profile_capacity_consumption_immutable"),
-    )
-    serving_generation_layout = await _provider_directory_profile_relation_storage_fingerprint(
-        database_identity.serving_generation_oid,
-        expected_persistence="p",
-    )
-    return (
-        checkpoint_layout,
-        import_run_layout,
-        capacity_consumption_layout,
-        serving_generation_layout,
-    )
+    """Measure the named control relations used by admission accounting."""
+    layouts = []
+    for role in ("build_checkpoint", "import_run", "capacity_consumption", "serving_generation"):
+        entry = database_identity.relations[role]
+        oid = await _provider_directory_relation_oid(entry["schema"], entry["name"])
+        if oid is None:
+            raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_control_relation_missing")
+        layouts.append(await _provider_directory_profile_capacity_relation_layout(oid, expected_persistence="p"))
+    return tuple(layouts)
 
 
 def _assert_profile_control_layout_identities(
     database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
     layouts: tuple[_ProviderDirectoryProfileRelationStorageLayout, ...],
 ) -> None:
-    observed_identities = tuple(layout.exact_fingerprint for layout in layouts)
-    expected_identities = (
-        database_identity.build_checkpoint_storage_fingerprint,
-        database_identity.import_run_storage_fingerprint,
-        database_identity.capacity_consumption_storage_fingerprint,
-        database_identity.serving_generation_storage_fingerprint,
+    expected_coordinates = tuple(
+        (database_identity.relations[role]["schema"], database_identity.relations[role]["name"])
+        for role in ("build_checkpoint", "import_run", "capacity_consumption", "serving_generation")
     )
-    if observed_identities != expected_identities:
-        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_control_metadata_layout_changed")
+    if tuple((layout.schema_name, layout.relation_name) for layout in layouts) != expected_coordinates:
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_control_relation_changed")
 
 
 async def _profile_control_layouts(
@@ -26440,16 +26103,12 @@ async def _profile_control_layouts(
     )
     if preflight_receipt_oid is None:
         raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_preflight_relation_missing")
-    preflight_receipt_layout = await _provider_directory_profile_relation_storage_fingerprint(
+    preflight_receipt_layout = await _provider_directory_profile_capacity_relation_layout(
         preflight_receipt_oid,
         expected_persistence="p",
         expected_user_trigger_count=3,
         expected_single_use_receipt=True,
     )
-    if preflight_receipt_layout.effective_tablespace_oids != (
-        database_identity.tablespace_oid,
-    ) or serving_generation_layout.effective_tablespace_oids != (database_identity.tablespace_oid,):
-        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_preflight_layout_unbudgeted")
     _assert_profile_control_layout_identities(
         database_identity,
         (
@@ -26823,56 +26482,20 @@ def _geometry_selection_values(
 def _geometry_postgres_values(
     database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
 ) -> dict[str, Any]:
-    """Return PostgreSQL runtime identity fields for geometry binding."""
-    postgres_fields = (
-        "database_system_identifier",
-        "database_oid",
-        "database_name",
-        "tablespace_oid",
-        "tablespace_name",
-        "postgres_server_version_num",
-        "postgres_block_size_bytes",
-        "postgres_wal_block_size_bytes",
-        "postgres_wal_segment_size_bytes",
-        "postgres_full_page_writes",
-        "postgres_wal_compression",
-        "postgres_wal_level",
-        "postgres_wal_log_hints",
-        "postgres_data_checksums",
-        "postgres_default_toast_compression",
-        "postgres_checkpoint_timeout_seconds",
-        "postgres_max_wal_size_bytes",
-    )
-    return {field_name: getattr(database_identity, field_name) for field_name in postgres_fields}
+    """Return the PostgreSQL numeric assumptions used by the projections."""
+    return {
+        field.name: getattr(database_identity, field.name)
+        for field in type(database_identity).__dataclass_fields__.values()
+        if field.name.startswith("postgres_")
+    }
 
 
 def _geometry_relation_values(
     identity: _ProviderDirectoryProfileIdentityInputs,
     database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
 ) -> dict[str, Any]:
-    """Return serving and metadata relation identities for geometry binding."""
-    relation_fields = (
-        "evidence_target_storage_fingerprint",
-        "profile_target_storage_fingerprint",
-        "build_checkpoint_oid",
-        "serving_generation_oid",
-        "delta_receipt_oid",
-        "import_run_oid",
-        "capacity_consumption_oid",
-        "build_checkpoint_storage_fingerprint",
-        "serving_generation_storage_fingerprint",
-        "delta_receipt_storage_fingerprint",
-        "import_run_storage_fingerprint",
-        "capacity_consumption_storage_fingerprint",
-    )
-    values_by_name = {field_name: getattr(database_identity, field_name) for field_name in relation_fields}
-    values_by_name.update(
-        {
-            "evidence_target_oid": (profile_initial.targets(identity).evidence_target_oid),
-            "profile_target_oid": profile_initial.targets(identity).profile_target_oid,
-        }
-    )
-    return values_by_name
+    """Return the named target/control relations with numeric layout bounds."""
+    return {"relations": copy.deepcopy(database_identity.relations)}
 
 
 def _geometry_execution_values(
@@ -26933,10 +26556,16 @@ def _profile_admission_geometry(
         seed_geometry,
         workload.control_wal_plan_input,
     )
+    from process.provider_directory_profile_capacity_control_budget import control_relation_index_page_bounds
+
+    relations_by_role = copy.deepcopy(geometry_inputs.relations)
+    for role, bounds in control_relation_index_page_bounds(seed_geometry, workload.control_wal_plan_input).items():
+        relations_by_role[role].update(bounds)
     geometry = profile_capacity_runtime.build_capacity_geometry(
         workload.limits,
         replace(
             geometry_inputs,
+            relations=relations_by_role,
             control_wal_upper_bound_bytes=(seed_projection.total_control_wal_bytes),
             control_metadata_data_upper_bound_bytes=(seed_projection.total_control_metadata_data_bytes),
         ),
@@ -26973,24 +26602,16 @@ def _verified_admission_lease(
     database_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
     geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
 ) -> VerifiedDatabaseCapacityLease:
-    """Verify the signed lease and its required storage reservation."""
-    geometry_hash = profile_capacity.capacity_geometry_hash(geometry)
+    """Verify current source/key authority and the complete numeric reservation."""
     lease = verify_database_capacity_lease(
         execution.capacity_attestation,
         trust=profile_capacity_runtime.configured_capacity_lease_trust(),
-        now=datetime.datetime.now(datetime.timezone.utc),
-        expected_capacity_geometry_hash=geometry_hash,
-        expected_database_system_identifier=(database_identity.database_system_identifier),
-        expected_database_oid=database_identity.database_oid,
-        expected_database_name=database_identity.database_name,
-    )
-    _assert_provider_directory_profile_capacity_tablespaces(
-        lease,
-        database_identity,
+        now=datetime.datetime.now(datetime.UTC),
+        expected_capacity_geometry_hash=profile_capacity.capacity_geometry_hash(geometry),
     )
     assert_database_capacity_lease_reservation(
         lease,
-        required_bytes_by_storage_class=(geometry.reservation_bytes_by_storage_class),
+        required_bytes_by_storage_class=geometry.reservation_bytes_by_storage_class,
         minimum_remaining_bytes=geometry.minimum_remaining_bytes,
         required_build_seconds=geometry.max_build_seconds,
     )
@@ -27019,20 +26640,17 @@ async def _admission_database_guard(
     identity: _ProviderDirectoryProfileIdentityInputs,
     expected_identity: _ProviderDirectoryProfileDatabaseCapacityIdentity,
 ) -> _ProviderDirectoryProfileDatabaseCapacityIdentity:
-    """Recheck database identity inside the serialized admission fence."""
-    observed_identity = await _provider_directory_profile_capacity_database_identity(
-        _schema(),
-        profile_initial.targets(identity),
+    """Recheck named scope and numeric assumptions inside the admission fence."""
+    observed = await _provider_directory_profile_capacity_database_identity(
+        _schema(), profile_initial.targets(identity)
     )
-    if (
-        replace(
-            observed_identity,
-            wal_lsn=expected_identity.wal_lsn,
-        )
-        != expected_identity
-    ):
-        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_database_identity_changed")
-    return observed_identity
+    expected_by_role = {role: (entry["schema"], entry["name"]) for role, entry in expected_identity.relations.items()}
+    observed_by_role = {role: (entry["schema"], entry["name"]) for role, entry in observed.relations.items()}
+    if expected_by_role != observed_by_role or _geometry_postgres_values(
+        expected_identity
+    ) != _geometry_postgres_values(observed):
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_scope_or_settings_changed")
+    return observed
 
 
 async def _assert_admission_run_toast(
@@ -27042,8 +26660,10 @@ async def _assert_admission_run_toast(
     control_wal_plan_input: profile_capacity.ProfileControlWalPlanInput,
 ) -> None:
     """Verify the locked import-run update remains within its toast bound."""
-    import_run_layout = await _provider_directory_profile_relation_storage_fingerprint(
-        database_identity.import_run_oid,
+    import_run_layout = await _provider_directory_profile_capacity_relation_layout(
+        await _provider_directory_relation_oid(
+            database_identity.relations["import_run"]["schema"], database_identity.relations["import_run"]["name"]
+        ),
         expected_persistence="p",
     )
     toast_columns_sql = ", ".join(_q(name) for name in import_run_layout.toastable_columns)
@@ -27281,6 +26901,7 @@ async def _assert_profile_capacity_receipt_state(
         observed_at=observed_at,
         request_sha256=str(receipt_by_field["request_sha256"]),
         current_run_id=run_id,
+        verified_receipts=(receipt_by_field,),
     )
     if (
         receipt_by_field.get("quiescence") != quiescence_by_field
@@ -27451,12 +27072,9 @@ async def _consume_admission_transaction_rows(run_id, execution, identity, lease
     if identity.initial_targets is not None:
         observed_targets = await profile_initial.capture_targets(sys.modules[__name__], _schema())
         receipt_layout = await profile_initial.receipt_layout(sys.modules[__name__], _schema())
-        if (
-            observed_targets != identity.initial_targets
-            or receipt_layout.relation_oid != geometry.initial_receipt_oid
-            or receipt_layout.exact_fingerprint != geometry.initial_receipt_storage_fingerprint
-        ):
+        if observed_targets != identity.initial_targets:
             raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_initial_target_changed")
+        _assert_profile_capacity_layout_bounds(receipt_layout, geometry, "initial_receipt")
     else:
         observed_serving_state = await _locked_profile_admission_serving_state(lease)
         _assert_provider_directory_profile_capacity_serving_state(identity.serving_state, observed_serving_state)
@@ -27625,8 +27243,7 @@ def _profile_capacity_preflight_serving_payload(
         "executable_plan_hash": state.executable_plan_hash,
         "capacity_geometry_status": state.capacity_geometry_status,
         "capacity_geometry_hash": state.capacity_geometry_hash,
-        "evidence_target_oid": state.evidence_target_oid,
-        "profile_target_oid": state.profile_target_oid,
+        "targets": copy.deepcopy(state.targets),
         "evidence_rows": state.evidence_rows,
         "profile_rows": state.profile_rows,
         "profile_as_of": state.profile_as_of,
@@ -27679,32 +27296,19 @@ def _profile_capacity_preflight_receipt_ref(schema: str) -> str:
     )
 
 
-async def _profile_capacity_preflight_receipt_layout(
-    schema: str,
-) -> dict[str, Any]:
-    """Bind the durable replay ledger relation used by admission."""
-
-    relation_oid = await _provider_directory_relation_oid(
-        schema,
-        ProviderDirectoryProfileCapacityPreflightReceipt.__tablename__,
-    )
-    if relation_oid is None:
+async def _profile_capacity_preflight_receipt_layout(schema: str) -> dict[str, Any]:
+    """Measure the named single-use ledger without catalog identity authority."""
+    oid = await _provider_directory_relation_oid(schema, ProviderDirectoryProfileCapacityPreflightReceipt.__tablename__)
+    if oid is None:
         raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_preflight_relation_missing")
-    layout = await _provider_directory_profile_relation_storage_fingerprint(
-        relation_oid,
-        expected_persistence="p",
-        expected_user_trigger_count=3,
-        expected_single_use_receipt=True,
-    )
+    layout = await _provider_directory_profile_capacity_relation_layout(oid, expected_persistence="p")
     return {
-        "contract_id": ("healthporta.provider-directory-profile-capacity-preflight-storage.v1"),
-        "relation_oid": layout.relation_oid,
-        "exact_fingerprint": layout.exact_fingerprint,
-        "structural_fingerprint": layout.structural_fingerprint,
+        "contract_id": "healthporta.provider-directory-profile-capacity-preflight-storage.v2",
+        "schema": schema,
+        "name": ProviderDirectoryProfileCapacityPreflightReceipt.__tablename__,
         "main_index_pages": list(_profile_capacity_index_page_union_bound(layout.main_index_pages)),
         "toast_index_pages": list(_profile_capacity_index_page_union_bound(layout.toast_index_pages)),
         "toastable_column_count": len(layout.toastable_columns),
-        "effective_tablespace_oids": list(layout.effective_tablespace_oids),
     }
 
 
@@ -27809,9 +27413,61 @@ def _profile_capacity_quiescence_sql(schema: str) -> str:
                      FROM {_profile_capacity_preflight_receipt_ref(schema)}
                     WHERE consumed_at IS NULL
                       AND expires_at > CAST(:observed_at AS timestamptz)
-                      AND request_sha256 <> :request_sha256
+                      AND NOT EXISTS (
+                          SELECT 1 FROM jsonb_array_elements(CAST(:verified_receipts AS jsonb)) AS exempt(body)
+                           WHERE exempt.body ->> 'request_sha256' = request_sha256
+                             AND exempt.body ->> 'receipt_sha256' = receipt_sha256
+                             AND exempt.body = receipt_json::jsonb
+                      )
                ) AS outstanding_preflight_receipt_count;
     """
+
+
+def _validated_quiescence_receipts(receipts):
+    if not isinstance(receipts, tuple) or len(receipts) > 2:
+        raise RuntimeError("provider_directory_profile_capacity_quiescence_exemptions_invalid")
+    receipt_by_sha256 = {}
+    for receipt in receipts:
+        if (
+            not isinstance(receipt, Mapping)
+            or receipt.get("contract_id")
+            not in {
+                CAPACITY_PREFLIGHT_CONTRACT_ID,
+                profile_initial_contract.RECEIPT_CONTRACT,
+                "healthporta.provider-directory-profile-capacity-preflight.v8",
+            }
+            or any(
+                not isinstance(receipt.get(name), str) or re.fullmatch(r"[0-9a-f]{64}", receipt[name]) is None
+                for name in ("request_sha256", "receipt_sha256")
+            )
+            or receipt["receipt_sha256"]
+            != preflight_domain_sha256(
+                receipt["contract_id"], {name: value for name, value in receipt.items() if name != "receipt_sha256"}
+            )
+        ):
+            raise RuntimeError("provider_directory_profile_capacity_quiescence_exemptions_invalid")
+        key = receipt["receipt_sha256"]
+        if key in receipt_by_sha256 and receipt_by_sha256[key] != receipt:
+            raise RuntimeError("provider_directory_profile_capacity_quiescence_exemptions_conflict")
+        receipt_by_sha256[key] = dict(receipt)
+    return list(receipt_by_sha256.values())
+
+
+def _profile_capacity_existing_receipt_exemption(existing, request):
+    if existing is None:
+        return ()
+    receipt = _json_object(existing.get("receipt_json"))
+    if (
+        existing.get("consumed_at") is not None
+        or existing.get("request_sha256") != request.request_sha256
+        or existing.get("request_nonce") != request.request_nonce
+        or existing.get("receipt_sha256") != receipt.get("receipt_sha256")
+        or receipt.get("request_sha256") != request.request_sha256
+        or receipt.get("request_nonce") != request.request_nonce
+    ):
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_preflight_replay_changed")
+    _validated_quiescence_receipts((receipt,))
+    return (receipt,)
 
 
 async def _profile_capacity_quiescence(
@@ -27820,8 +27476,9 @@ async def _profile_capacity_quiescence(
     observed_at: datetime.datetime,
     request_sha256: str,
     current_run_id: str | None = None,
+    verified_receipts: tuple[Mapping[str, Any], ...] = (),
 ) -> tuple[dict[str, Any], str]:
-    """Prove no competing Profile run, claim, lease, or signing receipt."""
+    """Exclude active writers/permits and observe separately accounted lease ceilings."""
 
     counts_row = await db.first(
         _profile_capacity_quiescence_sql(schema),
@@ -27837,7 +27494,7 @@ async def _profile_capacity_quiescence(
         ),
         current_run_id=current_run_id,
         observed_at=observed_at,
-        request_sha256=request_sha256,
+        verified_receipts=_stable_identity_json(_validated_quiescence_receipts(verified_receipts)),
     )
     if counts_row is None:
         raise RuntimeError("provider_directory_profile_capacity_preflight_quiescence_missing")
@@ -27848,8 +27505,13 @@ async def _profile_capacity_quiescence(
         "unexpired_capacity_consumption_count",
         "outstanding_preflight_receipt_count",
     )
-    count_by_field = {field_name: int(counts_map.get(field_name) or 0) for field_name in count_fields}
-    if any(count_by_field.values()):
+    count_by_field = {field_name: counts_map.get(field_name) for field_name in count_fields}
+    if any(
+        type(count_value) is not int or not 0 <= count_value <= profile_capacity._MAX_SIGNED_BIGINT
+        for count_value in count_by_field.values()
+    ):
+        raise RuntimeError("provider_directory_profile_capacity_preflight_quiescence_counts_invalid")
+    if any(count_by_field[name] for name in count_fields if name != "unexpired_capacity_consumption_count"):
         raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_capacity_preflight_not_quiescent")
     quiescence_by_field = {
         "contract_id": CAPACITY_QUIESCENCE_CONTRACT_ID,
@@ -28170,6 +27832,7 @@ async def _profile_capacity_receipt_context(
         schema,
         observed_at=observed_at,
         request_sha256=request.request_sha256,
+        verified_receipts=_profile_capacity_existing_receipt_exemption(existing_receipt_by_field, request),
     )
     issued_at = _profile_capacity_receipt_issued_at(existing_receipt_by_field, observed_at)
     assert_preflight_expiry(request, issued_at=issued_at)
@@ -28202,6 +27865,7 @@ async def _profile_capacity_preflight_snapshot(
         schema,
         observed_at=initial_clock,
         request_sha256=request.request_sha256,
+        verified_receipts=_profile_capacity_existing_receipt_exemption(existing, request),
     )
     serving = await _profile_capacity_preflight_serving(schema)
     workload, geometry_state = await _profile_capacity_preflight_geometry(request, source_ids, serving)
@@ -29142,10 +28806,19 @@ def _provider_directory_profile_replay_timestamp(
     return candidate.astimezone(datetime.timezone.utc)
 
 
+def _profile_receipt_targets(receipt: Mapping[str, Any]) -> dict[str, dict[str, str]]:
+    from process.provider_directory_profile_capacity_geometry_contract import validated_capacity_targets
+
+    return validated_capacity_targets(_json_object(receipt.get("targets_json")))
+
+
 def _provider_directory_profile_replay_geometry(
     receipt: Mapping[str, Any],
     execution: ProviderDirectoryProfileExecution,
+    *,
+    relations: Mapping[str, Any] | None = None,
 ) -> profile_capacity.ProviderDirectoryProfileCapacityGeometry:
+    """Bind current or authenticated retained geometry to the committed receipt."""
     geometry_identity = _provider_directory_profile_capacity_geometry_identity(
         status=receipt.get("capacity_geometry_status"),
         geometry_hash=receipt.get("capacity_geometry_hash"),
@@ -29153,7 +28826,11 @@ def _provider_directory_profile_replay_geometry(
     )
     if geometry_identity[0] != "verified" or geometry_identity[2] is None:
         raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_replay_geometry_unverified")
-    geometry = profile_capacity.validated_capacity_geometry(json.loads(geometry_identity[2]))
+    raw_geometry = json.loads(geometry_identity[2])
+    if raw_geometry.get("contract_id") == "healthporta.provider-directory-profile-capacity-geometry.v5":
+        geometry = _profile_legacy_replay_geometry(raw_geometry, geometry_identity[1], receipt, execution, relations)
+    else:
+        geometry = profile_capacity.validated_capacity_geometry(raw_geometry)
     expected_identity_by_name = {
         "selection_proof_id": execution.attestation.proof_id,
         "profile_input_digest": execution.attestation.profile_input_digest,
@@ -29165,17 +28842,49 @@ def _provider_directory_profile_replay_geometry(
         "desired_source_vector_hash": receipt.get("to_source_vector_hash"),
         "current_context_vector_hash": receipt.get("from_source_context_vector_hash"),
         "desired_context_vector_hash": receipt.get("to_source_context_vector_hash"),
-        "evidence_target_oid": int(receipt.get("evidence_target_oid") or 0),
-        "profile_target_oid": int(receipt.get("profile_target_oid") or 0),
+        "targets": _profile_receipt_targets(receipt),
     }
-    observed_identity_by_name = {field_name: getattr(geometry, field_name) for field_name in expected_identity_by_name}
+    observed_identity_by_name = {
+        field_name: (
+            {
+                role: {key: geometry.relations[role + "_target"][key] for key in ("schema", "name")}
+                for role in ("evidence", "profile")
+            }
+            if field_name == "targets"
+            else getattr(geometry, field_name)
+        )
+        for field_name in expected_identity_by_name
+    }
     if (
         observed_identity_by_name != expected_identity_by_name
         or geometry.materialization_mode != "source_delta"
-        or geometry.sql_contract_digest != _provider_directory_profile_sql_contract_digest()
+        or (
+            geometry.legacy_payload is None
+            and geometry.sql_contract_digest != _provider_directory_profile_sql_contract_digest()
+        )
     ):
         raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_replay_geometry_changed")
     return geometry
+
+
+def _profile_legacy_replay_geometry(raw_geometry, geometry_hash, receipt, execution, relations):
+    from process.provider_directory_profile_capacity_geometry import project_legacy_capacity_geometry
+
+    if relations is None:
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_legacy_semantic_evidence_required")
+    retained_by_field = {
+        "selection_proof_id": execution.attestation.proof_id,
+        "profile_input_digest": execution.attestation.profile_input_digest,
+        "executable_plan_hash": receipt.get("executable_plan_hash"),
+        "profile_as_of": receipt.get("profile_as_of"),
+        "source_vector_hash": receipt.get("to_source_vector_hash"),
+        "source_context_vector_hash": receipt.get("to_source_context_vector_hash"),
+        "evidence_rows": receipt.get("evidence_rows"),
+        "profile_rows": receipt.get("profile_rows"),
+    }
+    return project_legacy_capacity_geometry(
+        raw_geometry, geometry_hash, relations=relations, retained_evidence=retained_by_field
+    )
 
 
 def _profile_replay_lease_binding(
@@ -29213,26 +28922,35 @@ def _verified_provider_directory_profile_replay_lease(
             "lease": json.loads(canonical_lease_json),
             "signature": consumption["signature"],
         }
-        lease = verify_database_capacity_lease(
-            capacity_attestation_by_field,
-            trust=profile_capacity_runtime.configured_capacity_lease_trust(),
-            now=accepted_at,
-            expected_capacity_geometry_hash=(profile_capacity.capacity_geometry_hash(geometry)),
-            expected_database_system_identifier=(geometry.database_system_identifier),
-            expected_database_oid=geometry.database_oid,
-            expected_database_name=geometry.database_name,
-        )
-        expected_consumption = capacity_lease_consumption_values(
-            lease,
-            _profile_replay_lease_binding(consumption, receipt),
-            accepted_at=accepted_at,
-        )
-        assert_database_capacity_lease_reservation(
-            lease,
-            required_bytes_by_storage_class=(geometry.reservation_bytes_by_storage_class),
-            minimum_remaining_bytes=geometry.minimum_remaining_bytes,
-            required_build_seconds=geometry.max_build_seconds,
-        )
+        trust = profile_capacity_runtime.configured_capacity_lease_trust()
+        binding = _profile_replay_lease_binding(consumption, receipt)
+        if geometry.legacy_payload is not None:
+            from process.provider_directory_profile_capacity_attestation import authenticate_historical_capacity_lease
+            from process.provider_directory_profile_capacity_consumption import retained_capacity_consumption_values
+            from process.provider_directory_profile_capacity_signing_guard import validated_historical_replay_guard
+
+            lease = authenticate_historical_capacity_lease(capacity_attestation_by_field, trust=trust, now=accepted_at)
+            validated_historical_replay_guard(lease, geometry)
+            if lease.capacity_geometry_hash != profile_capacity.capacity_geometry_hash(geometry) or any(
+                lease.reservation_bytes_by_storage_class[name] < required
+                for name, required in geometry.reservation_bytes_by_storage_class.items()
+            ):
+                raise RuntimeError("provider_directory_profile_legacy_reservation_too_small")
+            expected_consumption = retained_capacity_consumption_values(lease, binding, accepted_at=accepted_at)
+        else:
+            lease = verify_database_capacity_lease(
+                capacity_attestation_by_field,
+                trust=trust,
+                now=accepted_at,
+                expected_capacity_geometry_hash=profile_capacity.capacity_geometry_hash(geometry),
+            )
+            expected_consumption = capacity_lease_consumption_values(lease, binding, accepted_at=accepted_at)
+            assert_database_capacity_lease_reservation(
+                lease,
+                required_bytes_by_storage_class=geometry.reservation_bytes_by_storage_class,
+                minimum_remaining_bytes=geometry.minimum_remaining_bytes,
+                required_build_seconds=geometry.max_build_seconds,
+            )
     except (KeyError, TypeError, ValueError, RuntimeError) as exc:
         raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_replay_capacity_invalid") from exc
     if _provider_directory_profile_capacity_consumption_identity(
@@ -29265,11 +28983,19 @@ def _assert_provider_directory_profile_replay_receipt(
         "selection_proof_id": execution.attestation.proof_id,
         "control_generation": execution.generation,
         "authority_revision": execution.attestation.authority_revision,
-        "evidence_target_oid": geometry.evidence_target_oid,
-        "profile_target_oid": geometry.profile_target_oid,
+        "targets": {
+            role: {name: geometry.relations[role + "_target"][name] for name in ("schema", "name")}
+            for role in ("evidence", "profile")
+        },
     }
     observed_by_field = {
-        field_name: (int(receipt.get(field_name) or 0) if isinstance(expected_value, int) else receipt.get(field_name))
+        field_name: (
+            _profile_receipt_targets(receipt)
+            if field_name == "targets"
+            else int(receipt.get(field_name) or 0)
+            if isinstance(expected_value, int)
+            else receipt.get(field_name)
+        )
         for field_name, expected_value in expected_by_field.items()
     }
     if observed_by_field != expected_by_field:
@@ -29361,8 +29087,7 @@ def _profile_replay_serving_values(
         "executable_plan_hash": receipt.get("executable_plan_hash"),
         "capacity_geometry_status": "verified",
         "capacity_geometry_hash": receipt.get("capacity_geometry_hash"),
-        "evidence_target_oid": int(receipt.get("evidence_target_oid") or 0),
-        "profile_target_oid": int(receipt.get("profile_target_oid") or 0),
+        "targets": _profile_receipt_targets(receipt),
         "evidence_rows": int(receipt.get("evidence_rows") or 0),
         "profile_rows": int(receipt.get("profile_rows") or 0),
         "profile_as_of": receipt.get("profile_as_of"),
@@ -29628,15 +29353,14 @@ def _replay_capacity_artifacts(
     consumption: Mapping[str, Any],
     receipt: Mapping[str, Any],
     execution: ProviderDirectoryProfileExecution,
+    *,
+    relations: Mapping[str, Any] | None = None,
 ) -> tuple[
     profile_capacity.ProviderDirectoryProfileCapacityGeometry,
     VerifiedDatabaseCapacityLease,
 ]:
     """Verify the immutable receipt geometry and its consumed lease."""
-    geometry = _provider_directory_profile_replay_geometry(
-        receipt,
-        execution,
-    )
+    geometry = _provider_directory_profile_replay_geometry(receipt, execution, relations=relations)
     _assert_provider_directory_profile_replay_receipt(
         consumption,
         receipt,
@@ -29682,46 +29406,17 @@ async def _assert_replay_database(
     geometry: profile_capacity.ProviderDirectoryProfileCapacityGeometry,
     lease: VerifiedDatabaseCapacityLease,
 ) -> None:
-    """Verify the replay still targets the database signed by its lease."""
+    """Verify retained replay still addresses the authorized logical targets."""
     database_identity = await _provider_directory_profile_capacity_database_identity(
         schema,
         serving,
     )
-    geometry_fields = (
-        "database_system_identifier",
-        "database_oid",
-        "database_name",
-        "tablespace_oid",
-        "tablespace_name",
-        "postgres_server_version_num",
-        "postgres_block_size_bytes",
-        "postgres_wal_block_size_bytes",
-        "postgres_wal_segment_size_bytes",
-        "postgres_full_page_writes",
-        "postgres_wal_compression",
-        "postgres_wal_level",
-        "postgres_wal_log_hints",
-        "postgres_data_checksums",
-        "postgres_default_toast_compression",
-        "postgres_checkpoint_timeout_seconds",
-        "postgres_max_wal_size_bytes",
-        "evidence_target_storage_fingerprint",
-        "profile_target_storage_fingerprint",
-        "build_checkpoint_oid",
-        "serving_generation_oid",
-        "delta_receipt_oid",
-        "build_checkpoint_storage_fingerprint",
-        "serving_generation_storage_fingerprint",
-        "delta_receipt_storage_fingerprint",
-    )
-    expected_by_field = {field_name: getattr(geometry, field_name) for field_name in geometry_fields}
-    observed_by_field = {field_name: getattr(database_identity, field_name) for field_name in expected_by_field}
-    if observed_by_field != expected_by_field:
-        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_replay_database_changed")
-    _assert_provider_directory_profile_capacity_tablespaces(
-        lease,
-        database_identity,
-    )
+    for role, retained in geometry.relations.items():
+        if role not in database_identity.relations:
+            continue
+        current = database_identity.relations[role]
+        if any(current[name] != retained[name] for name in ("schema", "name")):
+            raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_replay_target_changed")
 
 
 def _assert_replay_timeline(
@@ -29771,12 +29466,9 @@ async def _committed_replay_result(
         receipt.get("build_id"),
     )
     await _assert_replay_owner(schema, receipt_run_id, run_id)
-    geometry, lease = _replay_capacity_artifacts(
-        consumption,
-        receipt,
-        execution,
-    )
     serving = await _replay_serving_state(schema, execution, receipt)
+    database = await _provider_directory_profile_capacity_database_identity(schema, serving)
+    geometry, lease = _replay_capacity_artifacts(consumption, receipt, execution, relations=database.relations)
     await _assert_replay_database(schema, serving, geometry, lease)
     _assert_replay_timeline(consumption, receipt, lease)
     if not await _is_provider_directory_dataset_cutover_committed(fence):
@@ -29848,8 +29540,10 @@ def _expected_profile_capacity_identity(
         "desired_source_vector_hash": (geometry.desired_source_vector_hash),
         "current_context_vector_hash": (geometry.current_context_vector_hash),
         "desired_context_vector_hash": (geometry.desired_context_vector_hash),
-        "evidence_target_oid": geometry.evidence_target_oid,
-        "profile_target_oid": geometry.profile_target_oid,
+        "targets": {
+            role: {name: geometry.relations[role + "_target"][name] for name in ("schema", "name")}
+            for role in ("evidence", "profile")
+        },
         "evidence_wave_count": geometry.evidence_wave_count,
         "compact_wave_count": geometry.compact_wave_count,
         "evidence_worker_count": geometry.evidence_worker_count,
@@ -29877,8 +29571,7 @@ def _observed_profile_capacity_identity(
         "desired_source_vector_hash": build.desired_source_vector_hash,
         "current_context_vector_hash": (build.current_source_context_vector_hash),
         "desired_context_vector_hash": (build.desired_source_context_vector_hash),
-        "evidence_target_oid": evidence_build_fence.target_oid,
-        "profile_target_oid": profile_build_fence.target_oid,
+        "targets": _profile_build_target_coordinates(build),
         "evidence_wave_count": (len(batch_plan.evidence_waves) if batch_plan is not None else -1),
         "compact_wave_count": (len(batch_plan.compact_waves) if batch_plan is not None else -1),
         "evidence_worker_count": (
@@ -30678,60 +30371,21 @@ def _provider_directory_profile_checkpoint_oid(raw_value: Any) -> int | None:
     return raw_value if raw_value > 0 else None
 
 
-def _is_profile_target_oid_matching(
-    raw_value: Any,
-    expected_oid: int | None,
-) -> bool:
-    if expected_oid is None:
-        return raw_value is None
-    return _provider_directory_profile_checkpoint_oid(raw_value) == expected_oid
-
-
 async def _is_profile_stage_pair_matching(
     schema: str,
     checkpoint_map: dict[str, Any],
     evidence_stage: str,
     profile_stage: str,
 ) -> bool:
-    for stage_table, oid_field, fingerprint_field in (
-        (
-            evidence_stage,
-            "evidence_stage_oid",
-            "evidence_stage_storage_fingerprint",
-        ),
-        (
-            profile_stage,
-            "profile_stage_oid",
-            "profile_stage_storage_fingerprint",
-        ),
+    for stage_table, field_name in (
+        (evidence_stage, "evidence_stage"),
+        (profile_stage, "profile_stage"),
     ):
-        expected_oid = _provider_directory_profile_checkpoint_oid(checkpoint_map.get(oid_field))
-        expected_fingerprint = _clean_text(checkpoint_map.get(fingerprint_field))
-        if (
-            expected_oid is None
-            or expected_fingerprint is None
-            or re.fullmatch(
-                r"[0-9a-f]{64}",
-                expected_fingerprint,
-            )
-            is None
-        ):
+        if _clean_text(checkpoint_map.get(field_name)) != stage_table:
             return False
         try:
-            observed_fingerprint = await _provider_directory_profile_stage_storage_fingerprint(
-                schema,
-                stage_table,
-                expected_oid=expected_oid,
-                lock_relation=False,
-            )
+            await _provider_directory_profile_stage_layout(schema, stage_table, lock_relation=False)
         except ProviderDirectoryArtifactBuildStale:
-            return False
-        if observed_fingerprint != expected_fingerprint:
-            return False
-        if await _provider_directory_profile_stage_relation_identity(
-            schema,
-            stage_table,
-        ) != (expected_oid, "r", "p"):
             return False
     return True
 
@@ -30740,48 +30394,21 @@ async def _is_profile_build_stage_set_matching(
     build: _ProviderDirectoryProfileBuild,
     checkpoint_map: dict[str, Any],
 ) -> bool:
-    """Verify every deterministic logged stage in the active build."""
+    """Verify the deterministic logged stages in the active build."""
     if not await _is_profile_stage_pair_matching(
-        build.schema,
-        checkpoint_map,
-        build.evidence_stage,
-        build.profile_stage,
+        build.schema, checkpoint_map, build.evidence_stage, build.profile_stage
     ):
         return False
     if build.materialization_mode != "source_delta":
-        return (
-            build.affected_npi_stage is None
-            and checkpoint_map.get("affected_npi_stage") is None
-            and checkpoint_map.get("affected_npi_stage_oid") is None
-        )
-    expected_stage = build.affected_npi_stage
-    expected_oid = _provider_directory_profile_checkpoint_oid(checkpoint_map.get("affected_npi_stage_oid"))
-    expected_fingerprint = _clean_text(checkpoint_map.get("affected_npi_stage_storage_fingerprint"))
-    if not (
-        expected_stage
-        and _clean_text(checkpoint_map.get("affected_npi_stage")) == expected_stage
-        and expected_oid is not None
-        and expected_fingerprint is not None
-        and re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint) is not None
-    ):
+        return build.affected_npi_stage is None and checkpoint_map.get("affected_npi_stage") is None
+    stage = build.affected_npi_stage
+    if not stage or _clean_text(checkpoint_map.get("affected_npi_stage")) != stage:
         return False
     try:
-        observed_fingerprint = await _provider_directory_profile_stage_storage_fingerprint(
-            build.schema,
-            expected_stage,
-            expected_oid=expected_oid,
-            lock_relation=False,
-        )
+        await _provider_directory_profile_stage_layout(build.schema, stage, lock_relation=False)
     except ProviderDirectoryArtifactBuildStale:
         return False
-    return bool(
-        observed_fingerprint == expected_fingerprint
-        and await _provider_directory_profile_stage_relation_identity(
-            build.schema,
-            expected_stage,
-        )
-        == (expected_oid, "r", "p")
-    )
+    return True
 
 
 async def _profile_build_resume_as_of(
@@ -31139,14 +30766,7 @@ def _is_checkpoint_core_lineage_matching(
         and _provider_directory_profile_checkpoint_array(checkpoint_map.get("dataset_ids")) == build.dataset_ids
         and _clean_text(checkpoint_map.get("evidence_stage")) == build.evidence_stage
         and _clean_text(checkpoint_map.get("profile_stage")) == build.profile_stage
-        and _is_profile_target_oid_matching(
-            checkpoint_map.get("evidence_target_oid"),
-            evidence_build_fence.target_oid,
-        )
-        and _is_profile_target_oid_matching(
-            checkpoint_map.get("profile_target_oid"),
-            profile_build_fence.target_oid,
-        )
+        and _json_object(checkpoint_map.get("targets_json")) == _profile_build_target_coordinates(build)
     )
 
 
@@ -31212,8 +30832,10 @@ def _validate_profile_build_admission(
     identity: _ProviderDirectoryProfileIdentityInputs,
     evidence_build_fence: ProviderDirectoryArtifactBuildFence,
     profile_build_fence: ProviderDirectoryArtifactBuildFence,
+    *,
+    schema: str,
 ) -> None:
-    """Require the resolved build identity to match admission and targets."""
+    """Require the resolved build identity to match admission and named targets."""
     capacity_admission = _provider_directory_profile_capacity_admission()
     if capacity_admission is not None and (
         capacity_admission.admitted_identity is None or identity != capacity_admission.admitted_identity
@@ -31221,8 +30843,7 @@ def _validate_profile_build_admission(
         raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_admitted_identity_changed")
     if identity.materialization_mode == "source_delta" and (
         identity.serving_state is None
-        or identity.serving_state.evidence_target_oid != evidence_build_fence.target_oid
-        or identity.serving_state.profile_target_oid != profile_build_fence.target_oid
+        or identity.serving_state.targets != _provider_directory_profile_target_coordinates(schema)
     ):
         raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_serving_target_changed")
 
@@ -31366,6 +30987,7 @@ async def _resolve_provider_directory_profile_build(
         identity,
         evidence_build_fence,
         profile_build_fence,
+        schema=schema,
     )
     coordinates = _profile_build_coordinates(identity)
     checkpoint_map = await _profile_build_checkpoint_map(
@@ -31656,8 +31278,6 @@ def _profile_serving_numeric_values(
             "profile_schema_version",
             "evidence_rows",
             "profile_rows",
-            "evidence_target_oid",
-            "profile_target_oid",
         )
     }
 
@@ -31666,13 +31286,11 @@ def _is_profile_serving_numeric_valid(
     numeric_values: Mapping[str, int],
     cutover_forecast_hash: str | None,
 ) -> bool:
-    """Return whether counts, OIDs, revisions, and cutover hash are valid."""
+    """Return whether counts, revisions, and cutover hash are valid."""
     return not (
         numeric_values["control_generation"] < 1
         or numeric_values["authority_revision"] < 1
         or numeric_values["profile_schema_version"] < 1
-        or numeric_values["evidence_target_oid"] < 1
-        or numeric_values["profile_target_oid"] < 1
         or numeric_values["evidence_rows"] < 0
         or numeric_values["profile_rows"] < 0
         or (cutover_forecast_hash is not None and re.fullmatch(r"[0-9a-f]{64}", cutover_forecast_hash) is None)
@@ -31705,10 +31323,17 @@ def _profile_serving_state_from_row(
         geometry_hash=serving_map.get("capacity_geometry_hash"),
         geometry_json=serving_map.get("capacity_geometry_json"),
     )
+    from process.provider_directory_profile_capacity_geometry_contract import validated_capacity_targets
+
+    try:
+        targets_by_role = validated_capacity_targets(_json_object(serving_map.get("targets_json")))
+    except profile_capacity.ProviderDirectoryProfileCapacityError as exc:
+        raise RuntimeError("provider_directory_profile_serving_generation_invalid") from exc
     return _ProviderDirectoryProfileServingState(
         **text_values,
         **vectors,
         **numeric_values,
+        targets=targets_by_role,
         published_at=str(published_at),
         capacity_geometry_status=capacity_geometry_identity[0],
         capacity_geometry_hash=capacity_geometry_identity[1],
@@ -31826,8 +31451,7 @@ def _provider_directory_profile_adoption_result(
 class _ProfileAdoptionTargets:
     profile_ref: str
     evidence_ref: str
-    profile_target_oid: int
-    evidence_target_oid: int
+    targets: dict[str, dict[str, str]]
     generation_id: str
 
 
@@ -31838,8 +31462,7 @@ class _ProfileAdoptionCandidate:
     source_vector: tuple[tuple[str, str], ...]
     source_context_vector: tuple[tuple[str, str], ...]
     profile_as_of: str
-    profile_target_oid: int
-    evidence_target_oid: int
+    targets: dict[str, dict[str, str]]
     profile_rows: int
     evidence_rows: int
     published_at: Any
@@ -31851,33 +31474,12 @@ async def _locked_profile_adoption_target_oids(
     profile_ref: str,
     evidence_ref: str,
 ) -> tuple[int, int]:
-    """Lock the target pair and return unchanged relation identities."""
-    initial_oids = (
-        await _provider_directory_relation_oid(
-            schema,
-            profile_artifact.PROFILE_TABLE,
-        ),
-        await _provider_directory_relation_oid(
-            schema,
-            profile_artifact.PROFILE_EVIDENCE_TABLE,
-        ),
-    )
-    if None in initial_oids:
-        raise RuntimeError("provider_directory_profile_serving_adoption_target_missing")
+    """Lock named targets, returning transient numeric measurement operands."""
     await db.status(f"LOCK TABLE {profile_ref}, {evidence_ref} IN ACCESS SHARE MODE NOWAIT;")
-    locked_oids = (
-        await _provider_directory_relation_oid(
-            schema,
-            profile_artifact.PROFILE_TABLE,
-        ),
-        await _provider_directory_relation_oid(
-            schema,
-            profile_artifact.PROFILE_EVIDENCE_TABLE,
-        ),
+    return (
+        await _require_provider_directory_profile_stage_oid(schema, profile_artifact.PROFILE_TABLE),
+        await _require_provider_directory_profile_stage_oid(schema, profile_artifact.PROFILE_EVIDENCE_TABLE),
     )
-    if locked_oids != initial_oids:
-        raise RuntimeError("provider_directory_profile_serving_adoption_target_changed")
-    return int(initial_oids[0]), int(initial_oids[1])
 
 
 async def _profile_adoption_target_presence(
@@ -31918,7 +31520,7 @@ async def _profile_adoption_targets(
         schema,
         profile_artifact.PROFILE_EVIDENCE_TABLE,
     )
-    profile_target_oid, evidence_target_oid = await _locked_profile_adoption_target_oids(
+    await _locked_profile_adoption_target_oids(
         schema,
         profile_ref,
         evidence_ref,
@@ -31939,8 +31541,7 @@ async def _profile_adoption_targets(
     return _ProfileAdoptionTargets(
         profile_ref=profile_ref,
         evidence_ref=evidence_ref,
-        profile_target_oid=profile_target_oid,
-        evidence_target_oid=evidence_target_oid,
+        targets=_provider_directory_profile_target_coordinates(schema),
         generation_id=generation_id,
     )
 
@@ -32076,8 +31677,7 @@ def _profile_adoption_candidate(
         source_vector=source_vector,
         source_context_vector=source_context_vector,
         profile_as_of=profile_as_of,
-        profile_target_oid=adoption_targets.profile_target_oid,
-        evidence_target_oid=adoption_targets.evidence_target_oid,
+        targets=copy.deepcopy(adoption_targets.targets),
         profile_rows=row_counts[0],
         evidence_rows=row_counts[1],
         published_at=result_map["finished_at"],
@@ -32111,8 +31711,7 @@ def _profile_adoption_candidate_serving_state(
         capacity_geometry_hash=None,
         capacity_geometry_json=None,
         cutover_forecast_hash=None,
-        evidence_target_oid=candidate.evidence_target_oid,
-        profile_target_oid=candidate.profile_target_oid,
+        targets=copy.deepcopy(candidate.targets),
         evidence_rows=candidate.evidence_rows,
         profile_rows=candidate.profile_rows,
         profile_as_of=candidate.profile_as_of,
@@ -32159,7 +31758,7 @@ _INSERT_PROFILE_ADOPTION_SQL = """
             source_context_vector_json, executable_plan_hash,
             capacity_geometry_status, capacity_geometry_hash,
             capacity_geometry_json,
-            evidence_target_oid, profile_target_oid,
+            targets_json,
             evidence_rows, profile_rows, profile_as_of, published_at,
             created_at, updated_at
         ) VALUES (
@@ -32172,7 +31771,7 @@ _INSERT_PROFILE_ADOPTION_SQL = """
             CAST(:source_context_vector_json AS jsonb),
             :executable_plan_hash,
             'legacy_unavailable', NULL, NULL,
-            :evidence_target_oid, :profile_target_oid,
+            CAST(:targets_json AS jsonb),
             :evidence_rows, :profile_rows, :profile_as_of, :published_at,
             now(), now()
         )
@@ -32207,8 +31806,7 @@ async def _insert_profile_adoption(
             _provider_directory_profile_source_context_vector_json(candidate.source_context_vector)
         ),
         executable_plan_hash=candidate.executable_plan_hash,
-        evidence_target_oid=candidate.evidence_target_oid,
-        profile_target_oid=candidate.profile_target_oid,
+        targets_json=_stable_identity_json(candidate.targets),
         evidence_rows=candidate.evidence_rows,
         profile_rows=candidate.profile_rows,
         profile_as_of=candidate.profile_as_of,
@@ -32238,8 +31836,7 @@ def _validate_profile_adoption_serving(
         or serving_state.capacity_geometry_status != "legacy_unavailable"
         or serving_state.capacity_geometry_hash is not None
         or serving_state.capacity_geometry_json is not None
-        or serving_state.evidence_target_oid != candidate.evidence_target_oid
-        or serving_state.profile_target_oid != candidate.profile_target_oid
+        or serving_state.targets != candidate.targets
         or serving_state.evidence_rows != candidate.evidence_rows
         or serving_state.profile_rows != candidate.profile_rows
         or serving_state.profile_as_of != candidate.profile_as_of
@@ -32307,14 +31904,8 @@ async def _assert_provider_directory_profile_checkpoint_ready(
         _clean_text(checkpoint_map.get("resume_lineage_hash")) == build.resume_lineage_hash
         and _clean_text(checkpoint_map.get("evidence_stage")) == build.evidence_stage
         and _clean_text(checkpoint_map.get("profile_stage")) == build.profile_stage
-        and _is_profile_target_oid_matching(
-            checkpoint_map.get("evidence_target_oid"),
-            evidence_build_fence.target_oid,
-        )
-        and _is_profile_target_oid_matching(
-            checkpoint_map.get("profile_target_oid"),
-            profile_build_fence.target_oid,
-        )
+        and _json_object(checkpoint_map.get("targets_json")) == _profile_build_target_coordinates(build)
+        and _is_checkpoint_source_lineage_matching(checkpoint_map, build)
         and checkpoint_state.state == "ready"
         and checkpoint_state.evidence_next_batch == checkpoint_state.evidence_total_batches
         and checkpoint_state.profile_next_batch == checkpoint_state.profile_total_batches
@@ -32432,12 +32023,7 @@ async def _validate_profile_checkpoint_layout(
     build_id: str,
 ) -> None:
     """Require checkpoint layout and replaceable TOAST to match admission."""
-    checkpoint_layout = await _provider_directory_profile_relation_storage_fingerprint(
-        admission.geometry.build_checkpoint_oid,
-        expected_persistence="p",
-    )
-    if checkpoint_layout.exact_fingerprint != (admission.geometry.build_checkpoint_storage_fingerprint):
-        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_checkpoint_layout_changed")
+    checkpoint_layout = await _profile_capacity_named_layout(admission.geometry, "build_checkpoint")
     deleted_toast_chunks = await _provider_directory_profile_toast_chunk_count(
         source_sql=(f"SELECT * FROM {checkpoint_ref} WHERE build_id = :build_id"),
         relation_oid=checkpoint_layout.relation_oid,
@@ -32493,32 +32079,30 @@ async def _claim_profile_checkpoint_rows(
 _claim_provider_directory_profile_build_checkpoint_rows = _claim_profile_checkpoint_rows
 
 
+def _profile_build_target_coordinates(build: _ProviderDirectoryProfileBuild) -> dict[str, dict[str, str]]:
+    if build.serving_state is not None:
+        return copy.deepcopy(build.serving_state.targets)
+    return _provider_directory_profile_target_coordinates(build.schema)
+
+
 def _profile_checkpoint_relation_params(
     build: _ProviderDirectoryProfileBuild,
 ) -> dict[str, Any]:
-    """Return exact owner, geometry, and relation identities for checkpoint CAS."""
+    """Return immutable build lineage and named targets for checkpoint CAS."""
+    if build.batch_plan is None:
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_checkpoint_plan_missing")
     return {
         "build_id": _provider_directory_profile_build_id(build),
         "owner_run_id": build.owner_run_id,
         "capacity_geometry_status": build.capacity_geometry_status,
         "capacity_geometry_hash": build.capacity_geometry_hash,
         "capacity_geometry_json": build.capacity_geometry_json,
-        "evidence_stage_relation": _provider_directory_profile_build_ref(
-            build,
-            build.evidence_stage,
-        ),
-        "profile_stage_relation": _provider_directory_profile_build_ref(
-            build,
-            build.profile_stage,
-        ),
-        "affected_npi_stage_relation": (
-            _provider_directory_profile_build_ref(
-                build,
-                build.affected_npi_stage,
-            )
-            if build.affected_npi_stage is not None
-            else None
-        ),
+        "resume_lineage_hash": build.resume_lineage_hash,
+        "executable_plan_hash": build.batch_plan.fingerprint,
+        "evidence_stage": build.evidence_stage,
+        "profile_stage": build.profile_stage,
+        "affected_npi_stage": build.affected_npi_stage,
+        "targets_json": _stable_identity_json(_profile_build_target_coordinates(build)),
     }
 
 
@@ -32560,16 +32144,12 @@ async def _advance_provider_directory_profile_build_checkpoint(
                CAST(:capacity_geometry_json AS jsonb)
            AND {next_column} = :expected_batch
            AND {total_column} = :total_batches
-           AND to_regclass(:evidence_stage_relation)::oid::bigint
-               = evidence_stage_oid
-           AND to_regclass(:profile_stage_relation)::oid::bigint
-               = profile_stage_oid
-           AND (
-                materialization_mode <> 'source_delta'
-                OR to_regclass(
-                    :affected_npi_stage_relation
-                )::oid::bigint = affected_npi_stage_oid
-           );
+           AND resume_lineage_hash = :resume_lineage_hash
+           AND executable_plan_hash = :executable_plan_hash
+           AND evidence_stage = :evidence_stage
+           AND profile_stage = :profile_stage
+           AND affected_npi_stage IS NOT DISTINCT FROM :affected_npi_stage
+           AND targets_json::jsonb = CAST(:targets_json AS jsonb);
         """,
         next_batch=expected_batch + 1,
         state=state,
@@ -32616,16 +32196,12 @@ async def _mark_profile_build_checkpoint_state(
                :capacity_geometry_hash
            AND capacity_geometry_json::jsonb IS NOT DISTINCT FROM
                CAST(:capacity_geometry_json AS jsonb)
-           AND to_regclass(:evidence_stage_relation)::oid::bigint
-               = evidence_stage_oid
-           AND to_regclass(:profile_stage_relation)::oid::bigint
-               = profile_stage_oid
-           AND (
-                materialization_mode <> 'source_delta'
-                OR to_regclass(
-                    :affected_npi_stage_relation
-                )::oid::bigint = affected_npi_stage_oid
-           );
+           AND resume_lineage_hash = :resume_lineage_hash
+           AND executable_plan_hash = :executable_plan_hash
+           AND evidence_stage = :evidence_stage
+           AND profile_stage = :profile_stage
+           AND affected_npi_stage IS NOT DISTINCT FROM :affected_npi_stage
+           AND targets_json::jsonb = CAST(:targets_json AS jsonb);
         """,
         state=state,
         **_profile_checkpoint_relation_params(build),
@@ -32748,93 +32324,67 @@ async def _require_provider_directory_profile_stage_oid(
     return identity[0]
 
 
-async def _provider_directory_profile_stage_storage_fingerprint(
+async def _provider_directory_profile_stage_layout(
     schema: str,
     stage_table: str,
     *,
-    expected_oid: int,
     lock_relation: bool,
-) -> str:
-    """Return one exact logged-stage layout, optionally DDL-fenced."""
-
-    identity = await _provider_directory_profile_stage_relation_identity(
-        schema,
-        stage_table,
-    )
-    if identity != (expected_oid, "r", "p"):
-        raise ProviderDirectoryArtifactBuildStale(
-            "provider_directory_profile_stage_storage_identity_changed:" + stage_table
-        )
+) -> _ProviderDirectoryProfileCapacityLayout:
+    """Measure a named logged stage under the payload DDL lock when needed."""
     if lock_relation:
         await db.status(f"LOCK TABLE {_unscoped_qt(schema, stage_table)} IN ACCESS SHARE MODE;")
-        if (
-            await _provider_directory_profile_stage_relation_identity(
-                schema,
-                stage_table,
-            )
-            != identity
-        ):
-            raise ProviderDirectoryArtifactBuildStale(
-                "provider_directory_profile_stage_storage_identity_changed:" + stage_table
-            )
-    layout = await _provider_directory_profile_relation_storage_fingerprint(
-        expected_oid,
-        expected_persistence="p",
-    )
-    return layout.exact_fingerprint
+    identity = await _provider_directory_profile_stage_relation_identity(schema, stage_table)
+    if identity is None or identity[1:] != ("r", "p"):
+        raise ProviderDirectoryArtifactBuildStale(
+            "provider_directory_profile_stage_storage_shape_invalid:" + stage_table
+        )
+    return await _provider_directory_profile_capacity_relation_layout(identity[0], expected_persistence="p")
 
 
 async def _assert_profile_stage_storage(
     build: _ProviderDirectoryProfileBuild,
     *,
     stage_table: str,
-    oid_field: str,
-    fingerprint_field: str,
+    stage_field: str,
 ) -> None:
-    """Lock and verify one persisted stage layout before payload DML."""
-
+    """Keep payload writes inside the named stage and immutable checkpoint."""
+    expected_by_field = dict(_profile_reinitialize_stage_fields(build))
+    if expected_by_field.get(stage_table) != stage_field:
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_stage_storage_scope_invalid")
     checkpoint_row = await db.first(
-        f"SELECT {oid_field}, {fingerprint_field} "
-        f"FROM {_provider_directory_profile_checkpoint_ref(build.schema)} "
-        "WHERE build_id = :build_id "
-        "AND owner_run_id IS NOT DISTINCT FROM :owner_run_id "
-        "FOR SHARE;",
+        f"SELECT * FROM {_provider_directory_profile_checkpoint_ref(build.schema)} "
+        "WHERE build_id = :build_id AND owner_run_id IS NOT DISTINCT FROM :owner_run_id FOR SHARE;",
         build_id=_provider_directory_profile_build_id(build),
         owner_run_id=build.owner_run_id,
     )
     if checkpoint_row is None:
         raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_stage_storage_checkpoint_missing")
-    checkpoint_map = _pagination_checkpoint_row_mapping(checkpoint_row)
-    expected_oid = _provider_directory_profile_checkpoint_oid(checkpoint_map.get(oid_field))
-    expected_fingerprint = _clean_text(checkpoint_map.get(fingerprint_field))
+    checkpoint = _pagination_checkpoint_row_mapping(checkpoint_row)
+    if type(checkpoint.get("has_existing_artifacts")) is not bool:
+        raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_stage_storage_checkpoint_invalid")
+    plan = _provider_directory_profile_build_plan(build, has_existing_artifacts=checkpoint["has_existing_artifacts"])
     if (
-        expected_oid is None
-        or expected_fingerprint is None
-        or re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint) is None
+        _clean_text(checkpoint.get(stage_field)) != stage_table
+        or _clean_text(checkpoint.get("resume_lineage_hash")) != build.resume_lineage_hash
+        or _clean_text(checkpoint.get("executable_plan_hash")) != plan.fingerprint
+        or not _is_checkpoint_source_lineage_matching(checkpoint, build)
+        or not _is_profile_checkpoint_geometry_matching(checkpoint, build=build)
+        or _json_object(checkpoint.get("targets_json")) != _profile_build_target_coordinates(build)
     ):
         raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_stage_storage_checkpoint_invalid")
-    observed_fingerprint = await _provider_directory_profile_stage_storage_fingerprint(
-        build.schema,
-        stage_table,
-        expected_oid=expected_oid,
-        lock_relation=True,
-    )
-    if observed_fingerprint != expected_fingerprint:
-        raise ProviderDirectoryArtifactBuildStale(
-            "provider_directory_profile_stage_storage_layout_changed:" + stage_table
-        )
+    await _provider_directory_profile_stage_layout(build.schema, stage_table, lock_relation=True)
 
 
 def _profile_reinitialize_stage_fields(
     build: _ProviderDirectoryProfileBuild,
 ) -> list[tuple[str, str]]:
-    """Return every stage and checkpoint OID field owned by one build."""
+    """Return the deterministic stage names owned by one checkpoint."""
     stage_fields = [
-        (build.profile_stage, "profile_stage_oid"),
-        (build.evidence_stage, "evidence_stage_oid"),
+        (build.profile_stage, "profile_stage"),
+        (build.evidence_stage, "evidence_stage"),
     ]
     if build.affected_npi_stage is not None:
-        stage_fields.append((build.affected_npi_stage, "affected_npi_stage_oid"))
+        stage_fields.append((build.affected_npi_stage, "affected_npi_stage"))
     return stage_fields
 
 
@@ -32842,27 +32392,18 @@ async def _is_reinit_stage_locked(
     build: _ProviderDirectoryProfileBuild,
     checkpoint_map: Mapping[str, Any],
     stage_table: str,
-    oid_field: str,
+    stage_field: str,
 ) -> bool:
-    """Lock one stage only when its exact checkpoint identity still matches."""
-    identity = await _provider_directory_profile_stage_relation_identity(
-        build.schema,
-        stage_table,
-    )
+    """Lock only a logged stage named by the checkpoint being replaced."""
+    identity = await _provider_directory_profile_stage_relation_identity(build.schema, stage_table)
     if identity is None:
         return False
     if not checkpoint_map:
         raise RuntimeError("provider_directory_profile_unowned_stage_exists:" + stage_table)
-    expected_oid = _provider_directory_profile_checkpoint_oid(checkpoint_map.get(oid_field))
-    if identity != (expected_oid, "r", "p"):
-        raise RuntimeError("provider_directory_profile_reinitialize_stage_oid_mismatch:" + stage_table)
+    if _clean_text(checkpoint_map.get(stage_field)) != stage_table or identity[1:] != ("r", "p"):
+        raise RuntimeError("provider_directory_profile_reinitialize_stage_scope_mismatch:" + stage_table)
     await db.status(f"LOCK TABLE {_unscoped_qt(build.schema, stage_table)} IN ACCESS EXCLUSIVE MODE;")
-    observed_identity = await _provider_directory_profile_stage_relation_identity(
-        build.schema,
-        stage_table,
-    )
-    if observed_identity != identity:
-        raise RuntimeError("provider_directory_profile_reinitialize_stage_identity_changed:" + stage_table)
+    await _provider_directory_profile_stage_layout(build.schema, stage_table, lock_relation=False)
     return True
 
 
@@ -32870,7 +32411,7 @@ async def _drop_profile_stages_for_reinitialize(
     build: _ProviderDirectoryProfileBuild,
     checkpoint_map: dict[str, Any],
 ) -> None:
-    """Drop only stage OIDs owned by the checkpoint being reinitialized."""
+    """Drop only deterministic stages owned by the checkpoint being reinitialized."""
     if checkpoint_map and (
         _clean_text(checkpoint_map.get("evidence_stage")) != build.evidence_stage
         or _clean_text(checkpoint_map.get("profile_stage")) != build.profile_stage
@@ -32879,16 +32420,16 @@ async def _drop_profile_stages_for_reinitialize(
         raise RuntimeError("provider_directory_profile_reinitialize_stage_name_mismatch")
     locked_stages = [
         stage_table
-        for stage_table, oid_field in _profile_reinitialize_stage_fields(build)
+        for stage_table, stage_field in _profile_reinitialize_stage_fields(build)
         if await _is_reinit_stage_locked(
             build,
             checkpoint_map,
             stage_table,
-            oid_field,
+            stage_field,
         )
     ]
     for stage_table in locked_stages:
-        await db.status(f"DROP TABLE {_unscoped_qt(build.schema, stage_table)};")
+        await db.status(f"DROP TABLE {_unscoped_qt(build.schema, stage_table)} RESTRICT;")
 
 
 def _validated_profile_checkpoint_stage_names(
@@ -32991,61 +32532,33 @@ async def _reap_stale_provider_directory_profile_builds(
                 if not any(present_stages):
                     continue
                 raise RuntimeError("provider_directory_profile_disposed_checkpoint_stage_present")
-            stage_oid_by_name = {
-                evidence_stage: _provider_directory_profile_checkpoint_oid(checkpoint_map.get("evidence_stage_oid")),
-                profile_stage: _provider_directory_profile_checkpoint_oid(checkpoint_map.get("profile_stage_oid")),
-            }
-            if affected_npi_stage is not None:
-                stage_oid_by_name[affected_npi_stage] = _provider_directory_profile_checkpoint_oid(
-                    checkpoint_map.get("affected_npi_stage_oid")
-                )
-            if any(stage_oid is None for stage_oid in stage_oid_by_name.values()):
-                raise RuntimeError("provider_directory_profile_stale_checkpoint_oid_invalid")
+            await _assert_profile_capacity_build_unconsumed(stale_build_id)
             locked_stages: list[str] = []
             for stage_table in stage_tables:
-                initial_identity = await _provider_directory_profile_stage_relation_identity(
-                    schema,
-                    stage_table,
-                )
-                if initial_identity is None:
+                identity = await _provider_directory_profile_stage_relation_identity(schema, stage_table)
+                if identity is None:
                     continue
-                expected_identity_by_name = (
-                    stage_oid_by_name[stage_table],
-                    "r",
-                    "p",
-                )
-                if initial_identity != expected_identity_by_name:
-                    raise RuntimeError("provider_directory_profile_stale_stage_oid_mismatch")
+                if identity[1:] != ("r", "p"):
+                    raise RuntimeError("provider_directory_profile_stale_stage_shape_invalid")
                 await db.status(f"LOCK TABLE {_unscoped_qt(schema, stage_table)} IN ACCESS EXCLUSIVE MODE;")
-                locked_identity = await _provider_directory_profile_stage_relation_identity(
-                    schema,
-                    stage_table,
-                )
-                if locked_identity != initial_identity:
-                    raise RuntimeError("provider_directory_profile_stale_stage_identity_changed")
+                await _provider_directory_profile_stage_layout(schema, stage_table, lock_relation=False)
                 locked_stages.append(stage_table)
             for stage_table in locked_stages:
-                await db.status(f"DROP TABLE {_unscoped_qt(schema, stage_table)};")
+                await db.status(f"DROP TABLE {_unscoped_qt(schema, stage_table)} RESTRICT;")
             deleted_count = await db.status(
                 f"DELETE FROM {checkpoint_ref} "
                 "WHERE build_id = :build_id "
                 "AND evidence_stage = :evidence_stage "
                 "AND profile_stage = :profile_stage "
-                "AND evidence_stage_oid = :evidence_stage_oid "
-                "AND profile_stage_oid = :profile_stage_oid "
-                "AND affected_npi_stage IS NOT DISTINCT FROM "
-                ":affected_npi_stage "
-                "AND affected_npi_stage_oid IS NOT DISTINCT FROM "
-                ":affected_npi_stage_oid;",
+                "AND affected_npi_stage IS NOT DISTINCT FROM :affected_npi_stage "
+                "AND resume_lineage_hash = :resume_lineage_hash "
+                "AND owner_run_id IS NOT DISTINCT FROM :owner_run_id;",
                 build_id=stale_build_id,
                 evidence_stage=evidence_stage,
                 profile_stage=profile_stage,
-                evidence_stage_oid=stage_oid_by_name[evidence_stage],
-                profile_stage_oid=stage_oid_by_name[profile_stage],
                 affected_npi_stage=affected_npi_stage,
-                affected_npi_stage_oid=(
-                    stage_oid_by_name.get(affected_npi_stage) if affected_npi_stage is not None else None
-                ),
+                resume_lineage_hash=checkpoint_map["resume_lineage_hash"],
+                owner_run_id=checkpoint_map.get("owner_run_id"),
             )
             if _coerce_rowcount(deleted_count) != 1:
                 raise RuntimeError("provider_directory_profile_stale_checkpoint_delete_lost")
@@ -33165,10 +32678,6 @@ _PROFILE_BUCKET_INDEX_IDENTITY_SQL = """
                    ),
                    ''
                ) AS index_predicate,
-               COALESCE(
-                   NULLIF(index_relation.reltablespace, 0),
-                   database_row.dattablespace
-               )::bigint AS effective_tablespace_oid,
                pg_relation_size(index_relation.oid)::bigint
                    AS index_bytes
           FROM pg_class AS table_relation
@@ -33179,8 +32688,6 @@ _PROFILE_BUCKET_INDEX_IDENTITY_SQL = """
           JOIN pg_class AS index_relation
             ON index_relation.oid = index_row.indexrelid
           JOIN pg_am AS index_am ON index_am.oid = index_relation.relam
-          JOIN pg_database AS database_row
-            ON database_row.datname = current_database()
          WHERE table_namespace.nspname = :schema_name
            AND table_relation.relname = :table_name
            AND index_relation.relname = :index_name;
@@ -33242,18 +32749,6 @@ def _validate_profile_bucket_index_shape(
     observed_shape_by_name = {field_name: index_map.get(field_name) for field_name in expected_shape_by_name}
     if observed_shape_by_name != expected_shape_by_name:
         raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_bucket_index_changed:" + relation_name)
-
-
-def _validate_profile_bucket_index_tablespace(
-    index_map: Mapping[str, Any],
-    relation_name: str,
-) -> None:
-    """Require an admitted bucket index to remain on its signed tablespace."""
-    admission = _provider_directory_profile_capacity_admission()
-    if admission is not None and int(index_map["effective_tablespace_oid"]) != admission.geometry.tablespace_oid:
-        raise ProviderDirectoryArtifactBuildStale(
-            "provider_directory_profile_bucket_index_tablespace_changed:" + relation_name
-        )
 
 
 async def _profile_bucket_index_metrics(
@@ -33318,7 +32813,6 @@ async def _assert_provider_directory_profile_bucket_index(
         relation_name,
     )
     _validate_profile_bucket_index_shape(index_map, relation_name)
-    _validate_profile_bucket_index_tablespace(index_map, relation_name)
     return await _profile_bucket_index_metrics(
         index_map,
         relation_name,
@@ -33371,8 +32865,7 @@ async def _assert_evidence_batch_storage(
     await _assert_provider_directory_profile_stage_storage_identity(
         build,
         stage_table=build.evidence_stage,
-        oid_field="evidence_stage_oid",
-        fingerprint_field="evidence_stage_storage_fingerprint",
+        stage_field="evidence_stage",
     )
     if batch.role_bucket_count <= 1:
         return
@@ -34128,18 +33621,12 @@ async def _finish_profile_evidence_window(
 
 def _profile_evidence_transaction_capture(measurement: BackendWalDiagnosticResult) -> dict[str, Any]:
     """Keep owned record totals distinct from the shared physical LSN span."""
-    identity = measurement.final.identity
     return {
         "units": "native_record_bytes",
         "wal_record_bytes": str(measurement.wal_bytes_delta),
         "wal_records": measurement.wal_records_delta,
         "wal_fpi": measurement.wal_fpi_delta,
         "global_physical_lsn_span": measurement.global_insert_lsn_span,
-        "database_name": identity.database_name,
-        "database_oid": identity.database_oid,
-        "system_identifier": identity.system_identifier,
-        "backend_pid": identity.pid,
-        "backend_start": identity.backend_start.isoformat(),
     }
 
 
@@ -34193,7 +33680,6 @@ def _profile_owned_transaction_capture(
         and outcome.cleanup_complete
         and committed
         and isinstance(measurement, BackendWalDiagnosticResult)
-        and measurement.baseline.identity == measurement.final.identity
     )
     status = "accounting_incomplete" if outcome is None else outcome.status
     if committed and not measured:
@@ -34807,8 +34293,7 @@ async def _execute_affected_npi_insert(
             await _assert_provider_directory_profile_stage_storage_identity(
                 build,
                 stage_table=affected_stage,
-                oid_field="affected_npi_stage_oid",
-                fingerprint_field=("affected_npi_stage_storage_fingerprint"),
+                stage_field="affected_npi_stage",
             )
             projection_row = await db.first(
                 projection_sql,
@@ -35288,8 +34773,7 @@ async def _execute_profile_compact_checked_statement(
         await _assert_provider_directory_profile_stage_storage_identity(
             build,
             stage_table=build.profile_stage,
-            oid_field="profile_stage_oid",
-            fingerprint_field="profile_stage_storage_fingerprint",
+            stage_field="profile_stage",
         )
         affected_rows = await _execute_provider_directory_profile_compact_statement(
             build, batch, **statement_args_by_name
@@ -35967,20 +35451,16 @@ def _prepared_profile_delta_relation_values(
     checkpoint: Mapping[str, Any],
     serving: _ProviderDirectoryProfileServingState,
 ) -> dict[str, Any]:
-    """Return scratch and serving relation identities for a delta."""
+    """Return scratch names and serving target coordinates for a delta."""
     return {
         "schema": build.schema,
         "build_id": _provider_directory_profile_build_id(build),
         "resume_lineage_hash": build.resume_lineage_hash,
         "owner_run_id": build.owner_run_id,
         "evidence_stage": build.evidence_stage,
-        "evidence_stage_oid": int(checkpoint["evidence_stage_oid"]),
         "profile_stage": build.profile_stage,
-        "profile_stage_oid": int(checkpoint["profile_stage_oid"]),
         "affected_npi_stage": build.affected_npi_stage,
-        "affected_npi_stage_oid": int(checkpoint["affected_npi_stage_oid"]),
-        "evidence_target_oid": serving.evidence_target_oid,
-        "profile_target_oid": serving.profile_target_oid,
+        "targets": copy.deepcopy(serving.targets),
     }
 
 
@@ -36318,20 +35798,11 @@ async def _has_provider_directory_profile_artifacts(schema: str) -> bool:
         serving_state = await _provider_directory_profile_serving_state(schema)
         if serving_state is None:
             return False
-        evidence_target_oid = await _provider_directory_relation_oid(
-            schema,
-            profile_artifact.PROFILE_EVIDENCE_TABLE,
-        )
-        profile_target_oid = await _provider_directory_relation_oid(
-            schema,
-            profile_artifact.PROFILE_TABLE,
-        )
         if (
             (serving_state.status, serving_state.operation) in {("published", "publish"), ("purged", "purge")}
             and serving_state.evidence_rows == 0
             and serving_state.profile_rows == 0
-            and serving_state.evidence_target_oid == evidence_target_oid
-            and serving_state.profile_target_oid == profile_target_oid
+            and serving_state.targets == _provider_directory_profile_target_coordinates(schema)
         ):
             return True
         raise RuntimeError("provider_directory_profile_empty_serving_generation_invalid")
@@ -57566,12 +57037,7 @@ async def _is_admitted_profile_progress_written(
     ):
         import_run_ref = _unscoped_qt(_schema(), ImportRun.__tablename__)
         await db.status(f"LOCK TABLE {import_run_ref} IN ACCESS SHARE MODE;")
-        import_run_layout = await _provider_directory_profile_relation_storage_fingerprint(
-            admission.geometry.import_run_oid,
-            expected_persistence="p",
-        )
-        if import_run_layout.exact_fingerprint != admission.geometry.import_run_storage_fingerprint:
-            raise ProviderDirectoryArtifactBuildStale("provider_directory_profile_import_run_layout_changed")
+        await _profile_capacity_named_layout(admission.geometry, "import_run")
         return await mark_control_run(
             run_id,
             status="running",
@@ -60070,19 +59536,7 @@ async def _lock_endpoint_dataset_candidate_admission(
     connection: Any,
     endpoint_id: str,
 ) -> None:
-    await connection.first(
-        "SELECT pg_advisory_xact_lock(hashtextextended(:endpoint_id, 0));",
-        endpoint_id=endpoint_id,
-    )
-    await connection.first(
-        f"""
-        SELECT endpoint_id
-          FROM {_qt(_schema(), ProviderDirectoryAPIEndpoint.__tablename__)}
-         WHERE endpoint_id = :endpoint_id
-         FOR UPDATE;
-        """,
-        endpoint_id=endpoint_id,
-    )
+    await source_adapters.lock_endpoint_dataset_candidate_admission(sys.modules[__name__], connection, endpoint_id)
 
 
 async def _reset_new_endpoint_candidate(
@@ -64876,33 +64330,9 @@ async def _locked_endpoint_dataset_candidate_record(
     connection: Any,
     candidate: EndpointDatasetCandidate,
 ) -> dict[str, Any]:
-    """Lock the endpoint and return its mutable candidate row."""
+    """Serialize within the configured storage scope and return the mutable candidate row."""
 
-    endpoint_ref = _qt(_schema(), ProviderDirectoryAPIEndpoint.__tablename__)
-    dataset_ref = _qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)
-    endpoint_record = await connection.first(
-        f"SELECT endpoint_id FROM {endpoint_ref} WHERE endpoint_id = :endpoint_id FOR UPDATE;",
-        endpoint_id=candidate.endpoint_id,
-    )
-    if endpoint_record is None:
-        raise RuntimeError("provider_directory_api_endpoint_missing_during_validation")
-    candidate_record = await connection.first(
-        f"""
-        SELECT dataset_id, acquisition_root_run_id, is_current, status,
-               previous_dataset_id, completion_proof_required_version,
-               completion_proof_json, completion_proof_sha256,
-               publication_metadata_json
-          FROM {dataset_ref}
-         WHERE dataset_id = :dataset_id
-           AND endpoint_id = :endpoint_id
-         FOR UPDATE;
-        """,
-        dataset_id=candidate.dataset_id,
-        endpoint_id=candidate.endpoint_id,
-    )
-    if candidate_record is None:
-        raise RuntimeError("provider_directory_endpoint_dataset_candidate_missing")
-    return _pagination_checkpoint_row_mapping(candidate_record)
+    return await source_adapters.locked_endpoint_dataset_candidate_record(sys.modules[__name__], connection, candidate)
 
 
 def _assert_locked_candidate_identity(
@@ -65073,27 +64503,9 @@ async def _lock_validated_candidate_sources(
     connection: Any,
     candidate: EndpointDatasetCandidate,
 ) -> None:
-    """Serialize candidate admission with source-scoped artifact cutover."""
+    """Validate the declared source set and retain legacy artifact-cutover fencing."""
 
-    source_ref = _qt(_schema(), ProviderDirectorySource.__tablename__)
-    expected_source_ids = tuple(sorted(set(candidate.source_ids)))
-    source_rows = await connection.all(
-        f"""
-        SELECT source.source_id
-          FROM {source_ref} AS source
-         WHERE source.source_id = ANY(CAST(:source_ids AS varchar[]))
-         ORDER BY source.source_id
-         FOR NO KEY UPDATE OF source;
-        """,
-        source_ids=list(expected_source_ids),
-    )
-    locked_source_ids = tuple(
-        source_id
-        for source_row in source_rows
-        if (source_id := _clean_text(_pagination_checkpoint_row_mapping(source_row).get("source_id")))
-    )
-    if locked_source_ids != expected_source_ids:
-        raise RuntimeError("provider_directory_endpoint_dataset_source_changed")
+    await source_adapters.lock_validated_candidate_sources(sys.modules[__name__], connection, candidate)
 
 
 async def _store_validated_endpoint_dataset(
@@ -70429,23 +69841,23 @@ async def _address_alias_artifact_generation(
 async def _record_address_alias_artifact_generation(
     stage: ProviderDirectoryPreparedArtifactStage,
 ) -> None:
-    """Record an alias-aware artifact cutover in the surrounding transaction."""
-    if stage.build_fence is None or stage.build_fence.alias_generation is None:
+    """Advance ordinary publication revision inside its existing atomic cutover."""
+    if stage.target_relation in {profile_artifact.PROFILE_TABLE, profile_artifact.PROFILE_EVIDENCE_TABLE}:
         return
     await db.status(
         f"""
-        INSERT INTO {_qt(stage.schema, address_alias_sql.ADDRESS_ALIAS_ARTIFACT_STATE_TABLE)} (
+        INSERT INTO {_qt(stage.schema, address_alias_sql.ADDRESS_ALIAS_ARTIFACT_STATE_TABLE)} AS prior (
             artifact_name,
             generation,
             updated_at
         )
-        VALUES (:artifact_name, :generation, now())
+        VALUES (:artifact_name, :generation, clock_timestamp())
         ON CONFLICT (artifact_name) DO UPDATE
         SET generation = EXCLUDED.generation,
-            updated_at = EXCLUDED.updated_at;
+            updated_at = GREATEST(EXCLUDED.updated_at, prior.updated_at + interval '1 microsecond');
         """,
         artifact_name=stage.target_relation,
-        generation=stage.build_fence.alias_generation,
+        generation=(stage.build_fence.alias_generation or 0) if stage.build_fence is not None else 0,
     )
 
 

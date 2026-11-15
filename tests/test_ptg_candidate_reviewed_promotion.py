@@ -21,11 +21,6 @@ def test_promote_ptg2_source_snapshot_threads_reviewed_hold_digest(monkeypatch):
         "activate_ptg2_source_candidate",
         publish,
     )
-    monkeypatch.setattr(
-        source_snapshot_control,
-        "_clear_ptg2_snapshot_cache",
-        lambda: None,
-    )
 
     promotion_by_field = asyncio.run(
         source_snapshot_control.promote_ptg2_source_snapshot(
@@ -38,12 +33,8 @@ def test_promote_ptg2_source_snapshot_threads_reviewed_hold_digest(monkeypatch):
     )
 
     assert promotion_by_field == {"status": "promoted"}
-    assert publish.await_args.kwargs[
-        "expected_audit_only_attestation_digest"
-    ] == bytes.fromhex(approval_digest)
-    assert publish.await_args.kwargs["rollback_owner_id"] == (
-        "activation-operation"
-    )
+    assert publish.await_args.kwargs["expected_audit_only_attestation_digest"] == bytes.fromhex(approval_digest)
+    assert publish.await_args.kwargs["rollback_owner_id"] == ("activation-operation")
 
 
 def test_promote_ptg2_source_snapshot_rejects_malformed_hold_digest(monkeypatch):

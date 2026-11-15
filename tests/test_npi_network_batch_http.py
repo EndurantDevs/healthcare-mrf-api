@@ -14,7 +14,7 @@ from api import network_address_scope
 from api.endpoint import npi
 from process import network_serving_read
 from process.network_compact_layout import CompactAddressRelation
-from tests.network_read_execution_support import mock_approved_control_metadata, with_read_identity_receipts
+from tests.network_read_execution_support import mock_approved_control_metadata, with_read_session
 from tests.npi_location_hydration_support import unified_location_mapping
 
 
@@ -25,7 +25,7 @@ def _install_catalog_snapshot(monkeypatch, session, driver, resolve):
     async def snapshot(actual, generation_id=None, control_schema=None):
         assert actual is session and generation_id == 12
         pinned = await resolve(driver, generation_id=generation_id, control_schema=control_schema, api_read=True)
-        yield pinned, CompactAddressRelation("registry_control", "registry_approved_record", 99)
+        yield pinned, CompactAddressRelation("registry_control", "registry_approved_record")
 
     monkeypatch.setattr("api.network_serving_api_read.api_catalog_read_snapshot", snapshot)
 
@@ -51,15 +51,42 @@ def _batch_http_app(session):
     return app
 
 
+def _install_batch_details(monkeypatch, member, nonmember, retained_by_field, outside_by_field):
+    """Keep live overlays distinct from the retained office supplied to the route."""
+    overlay = AsyncMock(return_value={member: [outside_by_field]})
+    hydration = AsyncMock(return_value={member: [deepcopy(retained_by_field)]})
+    monkeypatch.setattr(
+        npi,
+        "_build_npi_identity_details_map",
+        AsyncMock(return_value={member: {"npi": member}, nonmember: {"npi": nonmember}}),
+    )
+    monkeypatch.setattr(
+        npi, "_fetch_npi_location_candidates_map", AsyncMock(return_value={member: [retained_by_field]})
+    )
+    monkeypatch.setattr(npi, "_fetch_provider_directory_address_overlay_map", overlay)
+    monkeypatch.setattr(npi, "_fetch_npi_address_rows_map", hydration)
+    monkeypatch.setattr(npi, "_apply_location_statuses", AsyncMock())
+    monkeypatch.setattr(npi, "_fetch_other_names_map", AsyncMock(return_value={}))
+    monkeypatch.setattr(npi, "_fetch_provider_enrichment_summary_map", AsyncMock(return_value={}))
+    return overlay, hydration
+
+
 @pytest.fixture
 def native_network_batch(monkeypatch):
     """Pin real HTTP scope/auth around synthetic retained and live office reads."""
     member, nonmember = 1234567890, 1098765432
     candidate_id = uuid4()
     manifest = network_serving_read.PinnedNetworkServingManifest(
-        12, str(candidate_id), "network_candidate_" + candidate_id.hex, 1, {}, 0, "c" * 64, 1
+        12,
+        str(candidate_id),
+        "network_candidate_" + candidate_id.hex,
+        1,
+        {},
+        0,
+        "c" * 64,
+        CompactAddressRelation("network_candidate_" + candidate_id.hex, "entity_address_unified"),
     )
-    session = with_read_identity_receipts(SimpleNamespace(execute=AsyncMock()))
+    session = with_read_session(SimpleNamespace(execute=AsyncMock()))
 
     _install_existing_snapshot(monkeypatch, session)
     driver = session.connection.return_value.get_raw_connection.return_value.driver_connection
@@ -79,21 +106,7 @@ def native_network_batch(monkeypatch):
         "source_count": 9,
         "_base_row_identities": [],
     }
-    overlay = AsyncMock(return_value={member: [outside_by_field]})
-    hydration = AsyncMock(return_value={member: [deepcopy(retained_by_field)]})
-    monkeypatch.setattr(
-        npi,
-        "_build_npi_identity_details_map",
-        AsyncMock(return_value={member: {"npi": member}, nonmember: {"npi": nonmember}}),
-    )
-    monkeypatch.setattr(
-        npi, "_fetch_npi_location_candidates_map", AsyncMock(return_value={member: [retained_by_field]})
-    )
-    monkeypatch.setattr(npi, "_fetch_provider_directory_address_overlay_map", overlay)
-    monkeypatch.setattr(npi, "_fetch_npi_address_rows_map", hydration)
-    monkeypatch.setattr(npi, "_apply_location_statuses", AsyncMock())
-    monkeypatch.setattr(npi, "_fetch_other_names_map", AsyncMock(return_value={}))
-    monkeypatch.setattr(npi, "_fetch_provider_enrichment_summary_map", AsyncMock(return_value={}))
+    overlay, hydration = _install_batch_details(monkeypatch, member, nonmember, retained_by_field, outside_by_field)
     app = _batch_http_app(session)
     return SimpleNamespace(
         app=app,

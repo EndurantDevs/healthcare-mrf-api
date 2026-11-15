@@ -61,6 +61,7 @@ async def test_no_jobs_cannot_enter_publication_or_cleanup(publication_case):
 @pytest.mark.asyncio
 async def test_dependency_binding_drift_refuses_before_stage_reads(publication_case, monkeypatch):
     monkeypatch.setattr(candidate, "geo_dependency_options", lambda: {"dependency_bindings": {"generation": 1}})
+    monkeypatch.setattr(address.prepared_doctors, "_named_prepared_geo_bindings", lambda *_: None)
     monkeypatch.setattr(address.geo_projection, "validate_projection_dependency_bindings", lambda *_: {"generation": 2})
     with pytest.raises(RuntimeError, match="desired dependency bindings differ"):
         await address.publish_entity_address_unified_generation(
@@ -121,10 +122,10 @@ async def test_stage_cleanup_visits_only_explicit_nonempty_artifacts(monkeypatch
 async def test_row_scratch_cleanup_cannot_drop_an_unowned_name(monkeypatch):
     drop = AsyncMock()
     monkeypatch.setattr(rows.admission, "drop_stage", drop)
-    monkeypatch.setattr(rows.ordinary_preparation, "current", lambda: SimpleNamespace(owned_oids={"owned": 101}))
+    monkeypatch.setattr(rows.ordinary_preparation, "current", lambda: SimpleNamespace(owned_relations={"owned"}))
     token = rows.admission._ADMISSION.set(None)
     try:
-        await rows._drop_scratch(SimpleNamespace(), "sample", ("owned", "foreign"), {"foreign": 202})
+        await rows._drop_scratch(SimpleNamespace(), "sample", ("owned", "foreign"), {"foreign"})
     finally:
         rows.admission._ADMISSION.reset(token)
     drop.assert_awaited_once_with("sample", "owned")
@@ -331,8 +332,10 @@ async def test_geo_projection_refusal_propagates_into_the_transaction_context(mo
     monkeypatch.setattr(address.geo_projection, "projection_state_available_sql", lambda *_: "projection_available")
     monkeypatch.setattr(address, "_materialize_geo_assurance_sql", lambda *_args, **_kw: "PROJECT STAGE")
     monkeypatch.setattr(address, "_validate_geo_assurance_projection", AsyncMock(return_value=0))
-    monkeypatch.setattr(address, "_geo_assurance_candidate_receipt_sql", lambda *_args, **_kw: "READ STAGE OID")
-    reads = [False] if changed_binding else [True, None]
+    monkeypatch.setattr(
+        address.prepared_doctors, "_geo_assurance_candidate_receipt_sql", lambda *_args, **_kw: "READ STAGE VERSION"
+    )
+    reads = [False] if changed_binding else [None]
     monkeypatch.setattr(address.preparation_admission, "read_scalar", AsyncMock(side_effect=reads))
     message = "dependency binding changed" if changed_binding else "stage disappeared before receipt"
     with pytest.raises(RuntimeError, match=message):

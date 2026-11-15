@@ -1,10 +1,9 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Native custody checks for explicitly authorized terminal-owner cleanup.
+"""Retire exact named captures after explicit terminal-attempt authorization.
 
-Callers must authenticate the terminal run/attempt and stopped worker, and hold
-the shared capture lock before opening this transaction. Neither an expired
-lease nor a capture UUID authorizes deletion. This module establishes physical
-custody only; it does not infer execution ownership from an untagged v1 stamp.
+Callers authenticate the terminal run/attempt and stopped worker and hold the
+shared capture lock. Native permissions, complete logical scope and restrictive
+DDL govern cleanup; a capture UUID alone does not authorize deletion.
 """
 
 import json
@@ -35,6 +34,7 @@ from process.network_cms_registry_source_pair import (
 )
 from process.network_custom_address_source import _require_transaction
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+from process.network_fhir_source_epoch import _TABLES as _EPOCH_TABLES
 from process.network_registry_cms_prepared_pair import (
     _PREPARED_COMMENT,
     _PREPARED_COMMENT_V2,
@@ -79,38 +79,40 @@ def _closed(document, model):
 
 
 def _request(document):
+    from process.registry_source_recipe_store import _decode_fhir_pin
+
     request_by_field = dict(_closed(document, RegistryCMSRetentionRequest))
-    pin_document = request_by_field.pop("source_pin")
-    pin_fields = {entry.name for entry in fields(PinnedFHIRMembershipSource)} - {
+    pin_by_field = request_by_field.pop("source_pin")
+    nullable_fields = {"retained_epoch", "source_witness_capture", "source_witness_anchor"}
+    expanded_fields = {entry.name for entry in fields(PinnedFHIRMembershipSource)} - {
         "retained_successor",
         "retained_capture",
+        "logical_edition_id",
     }
-    if type(pin_document) is not dict or set(pin_document) != pin_fields:
-        _invalid()
-    pin_by_field = dict(pin_document)
-    if type(pin_by_field["custody_runtime_roles"]) is not list or pin_by_field["retained_epoch"] is not None:
-        _invalid()
-    pin_by_field["custody_runtime_roles"] = tuple(pin_by_field["custody_runtime_roles"])
+    if type(pin_by_field) is dict and set(pin_by_field) == expanded_fields:
+        if any(pin_by_field[field] is not None for field in nullable_fields):
+            _invalid()
+        pin_by_field = {key: value for key, value in pin_by_field.items() if key not in nullable_fields}
+    pin = _decode_fhir_pin(pin_by_field)
     coordinates = _closed(request_by_field.pop("binding_coordinates"), RegistryNetworkSourceCoordinates)
-    return RegistryCMSRetentionRequest(
-        PinnedFHIRMembershipSource(**pin_by_field), RegistryNetworkSourceCoordinates(**coordinates), **request_by_field
-    )
+    return RegistryCMSRetentionRequest(pin, RegistryNetworkSourceCoordinates(**coordinates), **request_by_field)
 
 
 def _stages(entries):
+    """Decode named stages while preserving old opaque third tokens unchanged."""
     if type(entries) is not list or len(entries) != len(RELATION_NAMES):
         _invalid()
-    for entry in entries:
-        if type(entry) is not list or len(entry) != 3 or type(entry[2]) is not int or not 0 < entry[2] < 2**32:
-            _invalid()
-        _identifier(entry[0])
-        _identifier(entry[1])
+    widths = {len(entry) for entry in entries if type(entry) is list}
+    if len(widths) != 1 or widths.pop() not in {2, 3} or any(type(entry) is not list for entry in entries):
+        _invalid()
+    for logical, name, *_legacy in entries:
+        _identifier(logical)
+        _identifier(name)
     stages = tuple(tuple(entry) for entry in entries)
     if (
-        stages != tuple(sorted(stages))
+        tuple(entry[:2] for entry in stages) != tuple(sorted(entry[:2] for entry in stages))
         or {entry[0] for entry in stages} != set(RELATION_NAMES)
         or len({entry[1] for entry in stages}) != len(stages)
-        or len({entry[2] for entry in stages}) != len(stages)
     ):
         _invalid()
     return stages
@@ -126,8 +128,6 @@ def _require_pair_scope(pair):
         or replace(pair.recipe.source_pin, retained_epoch=None) != pair.request.source_pin
         or pair.recipe.binding_coordinates != pair.request.binding_coordinates
         or pair.address_ownership.dataset_id != epoch.epoch_id
-        or not 0 < pair.address_ownership.schema_oid < 2**32
-        or (pair.owner_role, pair.runtime_roles) != (epoch.owner_role, epoch.runtime_roles)
         or pair.request.expected_admission_sha256 != epoch.admission_sha256
         or pair.request.expected_metadata_sha256 != epoch.metadata_sha256
     ):
@@ -140,9 +140,7 @@ def _require_pair_scope(pair):
     ):
         if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             _invalid()
-    oids = [oid for _name, oid in epoch.relation_oids + pair.address_ownership.relation_oids]
-    oids += [entry[2] for entry in pair.address_stages]
-    if any(type(oid) is not int or not 0 < oid < 2**32 for oid in oids) or len(oids) != len(set(oids)):
+    if not set(RELATION_NAMES) <= set(pair.address_ownership.relation_names):
         _invalid()
 
 
@@ -209,7 +207,7 @@ async def _require_native_custody(session, pair):
 
 
 async def probe_registry_cms_source_capture(session, *, capture_id, owner_role, runtime_roles):
-    """Return absent, prepared or finalized custody on the caller's fresh snapshot."""
+    """Return absent, prepared or finalized named captures on the caller's snapshot."""
     if type(capture_id) is not UUID or not capture_id.int:
         _invalid()
     if (
@@ -224,20 +222,17 @@ async def probe_registry_cms_source_capture(session, *, capture_id, owner_role, 
     connection = await _caller_connection(session)
     schemas = ("entity_address_archive_" + capture_id.hex, "registry_cms_epoch_" + capture_id.hex)
     schema_records = await connection.fetch(
-        """SELECT n.nspname, n.oid::bigint, r.rolname,
+        """SELECT n.nspname,
           CASE WHEN octet_length(obj_description(n.oid,'pg_namespace')) <= $2
           THEN obj_description(n.oid,'pg_namespace') END AS comment
-          FROM pg_namespace n JOIN pg_roles r ON r.oid=n.nspowner
+          FROM pg_namespace n
           WHERE n.nspname=ANY($1::text[]) ORDER BY n.nspname""",
         list(schemas),
         MAX_DOCUMENT_BYTES + len(_PREPARED_COMMENT),
     )
     if not schema_records:
         return None
-    if len(schema_records) != 2 or any(
-        schema_record["rolname"] != owner_role or type(schema_record["comment"]) is not str
-        for schema_record in schema_records
-    ):
+    if len(schema_records) != 2 or any(type(schema_record["comment"]) is not str for schema_record in schema_records):
         _invalid()
     comment = next(
         schema_record["comment"] for schema_record in schema_records if schema_record["nspname"] == schemas[0]
@@ -272,7 +267,7 @@ async def cleanup_prepared_registry_cms_source_pair(session, prepared_pair):
 
     The caller must prove the authenticated owner/attempt terminal and its worker
     stopped, then hold the shared capture lock through this transaction. Native
-    custody is necessary but does not replace those checks. Finalized pairs are
+    access does not replace those checks. Finalized pairs are
     preserved. Return the closed status: removed, absent or finalized.
     """
     if type(prepared_pair) is not PreparedRegistryCMSSourcePair:
@@ -295,18 +290,19 @@ async def cleanup_prepared_registry_cms_source_pair(session, prepared_pair):
     async with connection.transaction():
         tables = [
             _identifier(schema) + "." + _identifier(name)
-            for schema, relations in (
-                (prepared_pair.address_ownership.schema_name, prepared_pair.address_ownership.relation_oids),
-                (epoch.schema_name, epoch.relation_oids),
+            for schema, names in (
+                (
+                    prepared_pair.address_ownership.schema_name,
+                    prepared_pair.address_ownership.relation_names,
+                ),
+                (epoch.schema_name, _EPOCH_TABLES),
             )
-            for name, _oid in relations
+            for name in names
         ]
         await connection.execute("LOCK TABLE " + ",".join(sorted(tables)) + " IN ACCESS EXCLUSIVE MODE NOWAIT")
         await _require_prepared_pair(session, prepared_pair)
         await cleanup_entity_address_archive_stage(session, owner=prepared_pair.address_ownership)
-        raw_tables = ",".join(
-            _identifier(epoch.schema_name) + "." + _identifier(name) for name, _oid in epoch.relation_oids
-        )
+        raw_tables = ",".join(_identifier(epoch.schema_name) + "." + _identifier(name) for name in _EPOCH_TABLES)
         await connection.execute("DROP TABLE " + raw_tables + " RESTRICT")
         await connection.execute("DROP SCHEMA " + _identifier(epoch.schema_name) + " RESTRICT")
     return "removed"

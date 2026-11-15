@@ -40,26 +40,13 @@ def test_runtime_source_commit_reader_is_exactly_bounded(
     assert read_descriptor.call_count == 2
 
 
-def test_runtime_source_commit_rejects_file_identity_drift():
-    expected = SimpleNamespace(
-        st_dev=1,
-        st_ino=2,
-        st_mode=0o100444,
-        st_nlink=1,
-        st_uid=0,
-        st_gid=0,
-        st_size=runtime._BUILD_IDENTITY_SIZE,
-        st_mtime_ns=3,
-        st_ctime_ns=4,
-    )
-    observed = SimpleNamespace(**vars(expected))
-    observed.st_ino += 1
-
-    with pytest.raises(
-        runtime.ProviderDirectoryProfileRuntimeObservationError,
-        match="healthcare_source_commit_invalid",
-    ):
-        runtime._require_same_build_identity_file(expected, observed)
+def test_runtime_source_commit_opens_only_the_declared_content_path(monkeypatch, tmp_path):
+    path = tmp_path / "source-commit"
+    path.write_bytes(b"b" * 40 + b"\n")
+    monkeypatch.setattr(runtime, "PROFILE_RUNTIME_SOURCE_COMMIT_FILE", path)
+    assert runtime.build_baked_healthcare_source_commit() == "b" * 40
+    path.write_bytes(b"c" * 40 + b"\n")
+    assert runtime.build_baked_healthcare_source_commit() == "c" * 40
 
 
 def test_capacity_lease_runtime_match_requires_closed_inputs():
@@ -70,13 +57,9 @@ def test_capacity_lease_runtime_match_requires_closed_inputs():
         runtime.ProviderDirectoryProfileRuntimeObservationError,
         match="capacity_lease_invalid",
     ):
-        runtime.assert_capacity_lease_matches_runtime_observation(
-            object(), observation
-        )
+        runtime.assert_capacity_lease_matches_runtime_observation(object(), observation)
     with pytest.raises(
         runtime.ProviderDirectoryProfileRuntimeObservationError,
         match="fields_invalid",
     ):
-        runtime.assert_capacity_lease_matches_runtime_observation(
-            verified_lease, {}
-        )
+        runtime.assert_capacity_lease_matches_runtime_observation(verified_lease, {})

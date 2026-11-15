@@ -85,12 +85,18 @@ async def test_digest_preserves_query_failure(failure, restore_failure, qualifie
 @pytest.mark.parametrize("qualified", [False, True])
 async def test_digest_retains_native_index_refusals(damage, qualified):
     connection = _IndexConnection("pg_catalog")
+    baseline = await _index_digest(connection, "synthetic_candidate", _PLAN, qualified_definitions=qualified)
     if damage == "missing":
         connection.records.clear()
     else:
         connection.records[0][damage] = False if damage.startswith("indis") else 0
-    with pytest.raises(NetworkServingIndexesError, match="missing or invalid"):
-        await _index_digest(connection, "synthetic_candidate", _PLAN, qualified_definitions=qualified)
+    if damage in {"index_oid", "indrelid"}:
+        assert (
+            await _index_digest(connection, "synthetic_candidate", _PLAN, qualified_definitions=qualified) == baseline
+        )
+    else:
+        with pytest.raises(NetworkServingIndexesError, match="missing or invalid"):
+            await _index_digest(connection, "synthetic_candidate", _PLAN, qualified_definitions=qualified)
     assert connection.path == "pg_catalog"
 
 

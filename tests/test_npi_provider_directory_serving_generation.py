@@ -41,6 +41,13 @@ def _evidence_dict():
     }
 
 
+def _targets():
+    return {
+        role: {"schema": "mrf", "name": "provider_directory_profile" + suffix}
+        for role, suffix in (("profile", ""), ("evidence", "_evidence"))
+    }
+
+
 def _global_serving_generation_result():
     return _Result(
         rows=[
@@ -48,23 +55,14 @@ def _global_serving_generation_result():
                 "npi": 1588616783,
                 "profile_json": json.dumps(_profile_dict()),
                 "evidence_json": _evidence_dict(),
-                "materialization_generation_id": (
-                    "pdprofile_11111111111111111111111111111111"
-                ),
-                "materialized_at": datetime(
-                    2026, 7, 13, 20, 0, 0, 123456
-                ),
-                "materialization_profile_target_oid": 101,
+                "materialization_generation_id": ("pdprofile_11111111111111111111111111111111"),
+                "materialized_at": datetime(2026, 7, 13, 20, 0, 0, 123456),
+                "materialization_profile_relation": "mrf.provider_directory_profile",
                 "serving_generation_key": "global",
                 "serving_control_generation": 6,
-                "serving_profile_target_oid": 101,
-                "serving_evidence_target_oid": 102,
-                "generation_id": (
-                    "pdprofile_22222222222222222222222222222222"
-                ),
-                "published_at": datetime(
-                    2026, 7, 30, 15, 0, 0, 654321
-                ),
+                "serving_targets": _targets(),
+                "generation_id": ("pdprofile_22222222222222222222222222222222"),
+                "published_at": datetime(2026, 7, 30, 15, 0, 0, 654321),
                 "profile_as_of": "2026-07-29",
             }
         ]
@@ -77,64 +75,41 @@ def _materialization_fallback_result():
             {
                 "npi": 1588616783,
                 "profile_json": json.dumps(_profile_dict()),
-                "materialization_generation_id": (
-                    "pdprofile_11111111111111111111111111111111"
-                ),
-                "materialized_at": datetime(
-                    2026, 7, 13, 20, 0, 0, 123456
-                ),
-                "materialization_profile_target_oid": 101,
+                "materialization_generation_id": ("pdprofile_11111111111111111111111111111111"),
+                "materialized_at": datetime(2026, 7, 13, 20, 0, 0, 123456),
+                "materialization_profile_relation": "mrf.provider_directory_profile",
                 "serving_generation_key": None,
-                "generation_id": (
-                    "pdprofile_11111111111111111111111111111111"
-                ),
-                "published_at": datetime(
-                    2026, 7, 13, 20, 0, 0, 123456
-                ),
+                "generation_id": ("pdprofile_11111111111111111111111111111111"),
+                "published_at": datetime(2026, 7, 13, 20, 0, 0, 123456),
                 "profile_as_of": None,
             }
         ]
     )
 
 
-def _profile_fetch_side_effect(query_result):
+def _profile_fetch_side_effect(query_result, *, fields=("targets_json",)):
     return [
         _Result(scalar_value="mrf.provider_directory_profile"),
-        _Result(
-            scalar_value=(
-                "mrf.provider_directory_profile_serving_generation"
-            )
-        ),
+        _Result(scalar_value=("mrf.provider_directory_profile_serving_generation")),
+        _Result(),
+        _Result(rows=[(field,) for field in fields]),
         query_result,
     ]
 
 
 def _assert_global_profile_payload(profiles_by_npi):
     profile_by_kind = profiles_by_npi[1588616783]
-    assert profile_by_kind["profile"]["generation_id"] == (
-        "pdprofile_22222222222222222222222222222222"
-    )
-    assert profile_by_kind["profile"]["facts"]["age"]["items"][0]["value"][
-        "years"
-    ] == 56
-    assert profile_by_kind["evidence"]["facts"]["age"]["items"][0]["evidence"][
-        0
-    ]["source_id"] == "s1"
-    assert profile_by_kind["profile"]["published_at"] == (
-        "2026-07-30T15:00:00.654321Z"
-    )
-    assert profile_by_kind["evidence"]["published_at"] == (
-        "2026-07-30T15:00:00.654321Z"
-    )
+    assert profile_by_kind["profile"]["generation_id"] == ("pdprofile_22222222222222222222222222222222")
+    assert profile_by_kind["profile"]["facts"]["age"]["items"][0]["value"]["years"] == 56
+    assert profile_by_kind["evidence"]["facts"]["age"]["items"][0]["evidence"][0]["source_id"] == "s1"
+    assert profile_by_kind["profile"]["published_at"] == ("2026-07-30T15:00:00.654321Z")
+    assert profile_by_kind["evidence"]["published_at"] == ("2026-07-30T15:00:00.654321Z")
     assert profile_by_kind["profile"]["profile_as_of"] == "2026-07-29"
     assert profile_by_kind["evidence"]["profile_as_of"] == "2026-07-29"
     assert "materialization_generation_id" not in profile_by_kind["profile"]
-    assert profile_by_kind["_serving_identity"].startswith(
-        "singleton:pdprofile_22222222222222222222222222222222:"
-    )
-    assert ":2026-07-29:6:101:102" in profile_by_kind[
-        "_serving_identity"
-    ]
+    assert profile_by_kind["_serving_identity"].startswith("singleton:pdprofile_22222222222222222222222222222222:")
+    assert ":2026-07-29:6:" in profile_by_kind["_serving_identity"]
+    assert json.dumps(_targets(), sort_keys=True, separators=(",", ":")) in profile_by_kind["_serving_identity"]
 
 
 def _assert_global_profile_query(profile_query):
@@ -143,8 +118,9 @@ def _assert_global_profile_query(profile_query):
     assert "WITH serving_generation AS MATERIALIZED" in query_text
     assert "LEFT JOIN serving_generation" in query_text
     assert "NOT EXISTS (SELECT 1 FROM serving_generation)" in query_text
-    assert "profile.tableoid::bigint =" in query_text
-    assert "to_regclass(:evidence_table_ref)::oid::bigint" in query_text
+    assert "serving_generation.targets_json::jsonb = jsonb_build_object(" in query_text
+    assert "parse_ident(:evidence_table_ref)" in query_text
+    assert "tableoid" not in query_text and "target_oid" not in query_text
     assert "serving_generation.profile_as_of IS NOT NULL" in query_text
     assert "WHERE profile.npi = ANY(CAST(:npis AS bigint[]))" in query_text
     assert profile_query.kwargs["params"] == {
@@ -159,11 +135,7 @@ async def test_profile_fetch_overlays_global_generation_and_keeps_lineage(
     monkeypatch,
 ):
     """Overlay global identity without replacing row materialization lineage."""
-    execute = AsyncMock(
-        side_effect=_profile_fetch_side_effect(
-            _global_serving_generation_result()
-        )
-    )
+    execute = AsyncMock(side_effect=_profile_fetch_side_effect(_global_serving_generation_result()))
     monkeypatch.setattr(npi_module, "_execute_stmt", execute)
     monkeypatch.setattr(
         npi_module,
@@ -177,7 +149,7 @@ async def test_profile_fetch_overlays_global_generation_and_keeps_lineage(
     )
 
     _assert_global_profile_payload(profiles_by_npi)
-    _assert_global_profile_query(execute.await_args_list[2])
+    _assert_global_profile_query(execute.await_args_list[4])
 
 
 @pytest.mark.asyncio
@@ -185,11 +157,7 @@ async def test_profile_fetch_falls_back_before_first_generation_adoption(
     monkeypatch,
 ):
     """Keep the published row visible only while the singleton has no row."""
-    execute = AsyncMock(
-        side_effect=_profile_fetch_side_effect(
-            _materialization_fallback_result()
-        )
-    )
+    execute = AsyncMock(side_effect=_profile_fetch_side_effect(_materialization_fallback_result()))
     monkeypatch.setattr(npi_module, "_execute_stmt", execute)
     monkeypatch.setattr(
         npi_module,
@@ -197,20 +165,16 @@ async def test_profile_fetch_falls_back_before_first_generation_adoption(
         set(),
     )
 
-    profiles_by_npi = await npi_module._fetch_provider_directory_profile_map(
-        [1588616783]
-    )
+    profiles_by_npi = await npi_module._fetch_provider_directory_profile_map([1588616783])
 
     profile = profiles_by_npi[1588616783]["profile"]
-    assert profile["generation_id"] == (
-        "pdprofile_11111111111111111111111111111111"
-    )
+    assert profile["generation_id"] == ("pdprofile_11111111111111111111111111111111")
     assert profile["published_at"] == "2026-07-13T20:00:00.123456Z"
     assert profile["profile_as_of"] is None
     assert profiles_by_npi[1588616783]["_serving_identity"].startswith(
         "fallback:pdprofile_11111111111111111111111111111111:"
     )
-    query_text = str(execute.await_args_list[2].args[0])
+    query_text = str(execute.await_args_list[4].args[0])
     assert "NOT EXISTS (SELECT 1 FROM serving_generation)" in query_text
 
 
@@ -218,10 +182,8 @@ async def test_profile_fetch_falls_back_before_first_generation_adoption(
 async def test_profile_fetch_rejects_present_mismatched_generation(
     monkeypatch,
 ):
-    """A singleton row that misses any publication/OID guard is not fallback."""
-    execute = AsyncMock(
-        side_effect=_profile_fetch_side_effect(_Result(rows=[]))
-    )
+    """A singleton row that misses any publication or QName guard is not fallback."""
+    execute = AsyncMock(side_effect=_profile_fetch_side_effect(_Result(rows=[])))
     monkeypatch.setattr(npi_module, "_execute_stmt", execute)
     monkeypatch.setattr(
         npi_module,
@@ -229,30 +191,20 @@ async def test_profile_fetch_rejects_present_mismatched_generation(
         set(),
     )
 
-    assert await npi_module._fetch_provider_directory_profile_map(
-        [1588616783]
-    ) == {}
-    query_text = str(execute.await_args_list[2].args[0])
-    assert "serving_generation.profile_target_oid =" in query_text
-    assert "serving_generation.evidence_target_oid =" in query_text
+    assert await npi_module._fetch_provider_directory_profile_map([1588616783]) == {}
+    query_text = str(execute.await_args_list[4].args[0])
+    assert "serving_generation.targets_json::jsonb =" in query_text
+    assert "parse_ident(:profile_table_ref)" in query_text
     assert "OR serving_generation.singleton_key = 'global'" in query_text
 
 
 def test_profile_as_of_serializer_accepts_only_exact_calendar_dates():
-    assert npi_module._serialize_provider_directory_profile_as_of(
-        date(2026, 7, 29)
-    ) == "2026-07-29"
-    assert npi_module._serialize_provider_directory_profile_as_of(
-        "2026-07-29"
-    ) == "2026-07-29"
+    assert npi_module._serialize_provider_directory_profile_as_of(date(2026, 7, 29)) == "2026-07-29"
+    assert npi_module._serialize_provider_directory_profile_as_of("2026-07-29") == "2026-07-29"
     with pytest.raises(ValueError, match="ISO calendar date"):
-        npi_module._serialize_provider_directory_profile_as_of(
-            "2026-02-30"
-        )
+        npi_module._serialize_provider_directory_profile_as_of("2026-02-30")
     with pytest.raises(TypeError, match="without a time"):
-        npi_module._serialize_provider_directory_profile_as_of(
-            datetime(2026, 7, 29, 12, 0)
-        )
+        npi_module._serialize_provider_directory_profile_as_of(datetime(2026, 7, 29, 12, 0))
 
 
 def test_profile_serving_identity_tracks_profile_as_of():
@@ -261,8 +213,7 @@ def test_profile_serving_identity_tracks_profile_as_of():
         "generation_id": "pdprofile_" + ("2" * 32),
         "published_at": "2026-07-30T15:00:00Z",
         "serving_control_generation": 6,
-        "serving_profile_target_oid": 101,
-        "serving_evidence_target_oid": 102,
+        "serving_targets": _targets(),
     }
 
     first_identity = npi_module._provider_directory_profile_serving_identity(
@@ -273,3 +224,67 @@ def test_profile_serving_identity_tracks_profile_as_of():
     )
 
     assert first_identity != second_identity
+
+
+def test_profile_serving_identity_preserves_copied_names_and_invalidates_changed_names():
+    row = _global_serving_generation_result().rows[0]
+    expected = npi_module._provider_directory_profile_serving_identity(row)
+    copied_by_field = {**row, "serving_profile_target_oid": "opaque-old", "serving_evidence_target_oid": None}
+    assert npi_module._provider_directory_profile_serving_identity(copied_by_field) == expected
+    crossed_by_field = {
+        **row,
+        "serving_targets": {**_targets(), "profile": {"schema": "other", "name": "provider_directory_profile"}},
+    }
+    assert npi_module._provider_directory_profile_serving_identity(crossed_by_field) != expected
+    fallback = _materialization_fallback_result().rows[0]
+    assert npi_module._provider_directory_profile_serving_identity(fallback) != (
+        npi_module._provider_directory_profile_serving_identity(
+            {**fallback, "materialization_profile_relation": "other.profile"}
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_profile_fetch_preserves_legacy_global_generation_and_canonical_names(monkeypatch):
+    """Old metadata identifies the fixed pinned names without reading legacy tokens."""
+    execute = AsyncMock(
+        side_effect=_profile_fetch_side_effect(
+            _global_serving_generation_result(), fields=("profile_target_oid", "evidence_target_oid")
+        )
+    )
+    monkeypatch.setattr(npi_module, "_execute_stmt", execute)
+    monkeypatch.setattr(npi_module, "_PROVIDER_DIRECTORY_PROFILE_TABLES_SEEN", set())
+    _assert_global_profile_payload(
+        await npi_module._fetch_provider_directory_profile_map([1588616783], include_evidence=True)
+    )
+    assert (
+        str(execute.await_args_list[2].args[0])
+        == "SELECT generation_id FROM mrf.provider_directory_profile_serving_generation WHERE FALSE"
+    )
+    assert execute.await_args_list[3].kwargs["params"] == {
+        "table_ref": "mrf.provider_directory_profile_serving_generation"
+    }
+    query = str(execute.await_args_list[4].args[0])
+    assert "AS targets_json" in query and "parse_ident(:evidence_table_ref)" in query
+    assert "target_oid" not in query and "tableoid" not in query
+
+
+@pytest.mark.parametrize(
+    "fields",
+    (
+        (),
+        ("profile_target_oid",),
+        ("evidence_target_oid",),
+        ("targets_json", "profile_target_oid"),
+        ("targets_json", "profile_target_oid", "evidence_target_oid"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_profile_fetch_refuses_incomplete_or_mixed_metadata_editions(monkeypatch, fields):
+    """A missing named field cannot silently select a damaged historical edition."""
+    execute = AsyncMock(side_effect=_profile_fetch_side_effect(_Result(), fields=fields))
+    monkeypatch.setattr(npi_module, "_execute_stmt", execute)
+    monkeypatch.setattr(npi_module, "_PROVIDER_DIRECTORY_PROFILE_TABLES_SEEN", set())
+    with pytest.raises(RuntimeError, match="provider_directory_profile_serving_metadata_invalid"):
+        await npi_module._fetch_provider_directory_profile_map([1588616783])
+    assert execute.await_count == 4

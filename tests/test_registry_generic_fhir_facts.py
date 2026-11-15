@@ -64,10 +64,7 @@ def test_generic_flat_codec_physical_accessors_and_transform_are_distinct():
     recipe = _recipe(source)
     assert fhir.fhir_physical_source(source) is source
     assert source.read_schema_name == source.retained_capture.schema_name
-    assert (
-        source.read_resource_table_oid
-        == dict(source.retained_capture.relation_oids)["provider_directory_dataset_resource"]
-    )
+    assert source.read_resource_relation == source.retained_capture.tables["provider_directory_dataset_resource"]
     assert "retained_successor" not in source.coordinates
     wire = canonical_registry_source_recipes((recipe,))
     assert decode_registry_source_recipes(wire) == (recipe,)
@@ -194,7 +191,7 @@ async def test_provider_scope_selection_keeps_cms_alias_and_original_generic_cap
     monkeypatch.setattr(readers, "verify_registry_source_recipes", lambda _: (recipe,))
     from process.network_compact_layout import CompactAddressRelation
 
-    relation = CompactAddressRelation("control_example", "registry_approved_record", 101)
+    relation = CompactAddressRelation("control_example", "registry_approved_record")
     approval_pin = AsyncMock(return_value=(approved, relation))
     mapping_pin = AsyncMock()
     monkeypatch.setattr(readers, "pin_api_retained_approved_membership_source", approval_pin)
@@ -203,7 +200,9 @@ async def test_provider_scope_selection_keeps_cms_alias_and_original_generic_cap
     connection = SimpleNamespace(get_server_pid=lambda: 99)
     _, selected, arguments = await readers._source_bindings(connection, current, "control_example", candidate={})
     approval_pin.assert_awaited_once_with(connection, current, control_schema="control_example")
-    assert mapping_pin.await_args.kwargs["read_identity"] == (relation, 99)
+    mapping_pin.assert_awaited_once_with(
+        connection, approved, recipe.binding_coordinates, control_schema="control_example"
+    )
     expected_key = "capture_sha256" if generic else "alias_scope"
     expected_value = source_pin.retained_capture.capture_sha256 if generic else source_pin.alias_scope
     assert arguments[-1] == expected_value

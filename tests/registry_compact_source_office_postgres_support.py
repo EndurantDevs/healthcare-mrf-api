@@ -1,19 +1,19 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Native EAU authority containing accepted synthetic CMS offices before sealing."""
+"""Native named EUA publication containing accepted synthetic CMS offices."""
 
 import json
 from contextlib import AsyncExitStack, aclosing, asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import asyncpg
-from sqlalchemy import MetaData, text
+from sqlalchemy import MetaData
 
 from db.models import EntityAddressUnified
-from process import entity_address_alias_guard as aliases
 from process import network_address_artifact as artifact
 from process.network_address_projection import PinnedAddressSource
+from tests.cms_registry_recipe_postgres_support import retained_fixture_roles
 from tests.source_contribution_custody_postgres_support import install_source_contribution_custody
 from tests.test_address_numeric_grid_alias_runtime_db import _create_alias_probe_schema
 from tests.test_network_initial_source_office_bindings_postgres import initial_cms_db
@@ -21,12 +21,6 @@ from tests.test_network_initial_source_office_bindings_postgres import initial_c
 
 async def _cleanup_native(fixture, schema, roles_by_kind, created_namespaces, created_roles):
     await fixture.connection.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-    if created_namespaces[0]:
-        owner = await fixture.connection.fetchval(
-            "SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='hp_snapshot_retention'"
-        )
-        assert owner == roles_by_kind["owner"]
-        await fixture.connection.execute("DROP SCHEMA hp_snapshot_retention")
     for role in reversed(created_roles):
         if await fixture.connection.fetchval("SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", role):
             await fixture.connection.execute(f'DROP OWNED BY "{role}"')
@@ -34,22 +28,6 @@ async def _cleanup_native(fixture, schema, roles_by_kind, created_namespaces, cr
     assert not await fixture.connection.fetchval(
         "SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=ANY($1::text[]))", created_roles
     )
-
-
-async def _native_owner(fixture, roles_by_kind, created_namespaces, created_roles):
-    """Preserve an installed native retention owner; record only newly created roles."""
-    retained_owner = await fixture.connection.fetchval(
-        "SELECT r.rolname FROM pg_namespace n JOIN pg_roles r ON r.oid=n.nspowner WHERE n.nspname='hp_snapshot_retention'"
-    )
-    if retained_owner is None:
-        await fixture.connection.execute(f'CREATE ROLE "{roles_by_kind["owner"]}" NOLOGIN')
-        created_roles.append(roles_by_kind["owner"])
-        await fixture.connection.execute(
-            f'CREATE SCHEMA hp_snapshot_retention AUTHORIZATION "{roles_by_kind["owner"]}"'
-        )
-        created_namespaces[0] = True
-    else:
-        roles_by_kind["owner"] = retained_owner
 
 
 async def _prepare_search_indexes(connection, schema):
@@ -62,9 +40,13 @@ async def _prepare_search_indexes(connection, schema):
 
 
 async def _native_storage(fixture, schema, roles_by_kind, created_namespaces, created_roles, office_setup=None):
-    """Capture synthetic retained address authority only after its search profile exists."""
+    """Prepare complete synthetic address data and its named logical publication."""
     assert await fixture.connection.fetchval("SELECT to_regnamespace($1)", schema) is None
-    await _native_owner(fixture, roles_by_kind, created_namespaces, created_roles)
+    if not await fixture.connection.fetchval(
+        "SELECT EXISTS(SELECT FROM pg_roles WHERE rolname=$1)", roles_by_kind["owner"]
+    ):
+        created_roles.append(roles_by_kind["owner"])
+        await fixture.connection.execute(f'CREATE ROLE "{roles_by_kind["owner"]}" NOLOGIN')
     await _create_alias_probe_schema(fixture.connection, schema, "source_office_" + uuid4().hex)
     await fixture.connection.execute(f'DROP TABLE "{schema}".entity_address_unified')
     async with fixture.engine.begin() as setup:
@@ -93,14 +75,11 @@ async def _native_storage(fixture, schema, roles_by_kind, created_namespaces, cr
     if office_setup is not None:
         await office_setup(fixture.connection, schema)
     await _prepare_search_indexes(fixture.connection, schema)
-    for statement in aliases.generation_guard_statements(schema):
-        await fixture.connection.execute(statement)
-    for name in aliases.GUARDS:
-        await fixture.connection.execute(f'ALTER FUNCTION "{schema}"."{name}"() OWNER TO "{roles_by_kind["owner"]}"')
     for name in artifact.generation.RELATION_NAMES[1:]:
         await fixture.connection.execute(f'CREATE TABLE "{schema}"."{name}" (id integer PRIMARY KEY)')
+    # The legacy physical column stays unclaimed; address readers use the logical edition.
     await fixture.connection.execute(
-        f'CREATE TABLE "{schema}".entity_address_result_generation(singleton boolean PRIMARY KEY CHECK(singleton),local_lineage_id uuid NOT NULL,local_generation bigint NOT NULL,origin_lineage_id uuid NOT NULL,origin_generation bigint NOT NULL,published_at timestamptz NOT NULL,relation_oids bigint[] NOT NULL)'
+        f'CREATE TABLE "{schema}".entity_address_result_generation(singleton boolean PRIMARY KEY CHECK(singleton),local_lineage_id uuid NOT NULL,local_generation bigint NOT NULL,origin_lineage_id uuid NOT NULL,origin_generation bigint NOT NULL,published_at timestamptz NOT NULL,relation_oids bigint[])'
     )
     await fixture.connection.execute(f'ALTER SCHEMA "{schema}" OWNER TO "{roles_by_kind["owner"]}"')
     for name in (
@@ -110,16 +89,12 @@ async def _native_storage(fixture, schema, roles_by_kind, created_namespaces, cr
         "address_alias_v1",
     ):
         await fixture.connection.execute(f'ALTER TABLE "{schema}"."{name}" OWNER TO "{roles_by_kind["owner"]}"')
-    oids = [
-        await fixture.connection.fetchval("SELECT to_regclass($1)::oid::bigint", f'"{schema}"."{name}"')
-        for name in artifact.generation.RELATION_NAMES
-    ]
     lineage = uuid4()
     await fixture.connection.execute(
         f'INSERT INTO "{schema}".entity_address_result_generation VALUES(true,$1,1,$1,1,$2,$3)',
         lineage,
         datetime(2026, 1, 1, tzinfo=UTC),
-        oids,
+        None,
     )
 
 
@@ -138,7 +113,7 @@ async def compact_cms_offices(custom, reviewed_source, monkeypatch, *, office_se
         stack.push_async_callback(_cleanup_native, fixture, schema, roles_by_kind, created_namespaces, created_roles)
         await _native_storage(fixture, schema, roles_by_kind, created_namespaces, created_roles, office_setup)
         await install_source_contribution_custody(fixture, reviewed_source[0][2], stack)
-        for role in reviewed_source[0][2].retained_epoch.runtime_roles:
+        for role in retained_fixture_roles(reviewed_source[0][2])[1:]:
             await fixture.connection.execute(
                 f'GRANT "{role}" TO "{fixture.executor_role}" WITH ADMIN FALSE, INHERIT TRUE, SET FALSE'
             )
@@ -157,12 +132,8 @@ async def compact_cms_offices(custom, reviewed_source, monkeypatch, *, office_se
         )
         stack.push_async_callback(publisher.close)
         async with publisher.transaction(isolation="repeatable_read", readonly=True):
-            authority = await artifact.generation.read_entity_address_result_generation_authority(
-                artifact._CatalogSession(publisher), schema_name=schema
-            )
-            address_source = PinnedAddressSource(
-                schema, "entity_address_unified", artifact._digest(artifact._authority_document(authority))
-            )
+            authority, _legacy_key = await artifact._current_authority(publisher, schema)
+            address_source = PinnedAddressSource(schema, "entity_address_unified", artifact._digest(authority))
             descriptor = await artifact.capture_network_address_artifact(
                 publisher, address_source, runtime_roles=runtime_roles
             )

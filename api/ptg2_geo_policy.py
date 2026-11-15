@@ -4,12 +4,99 @@
 from __future__ import annotations
 
 import re
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Any, Mapping
 
+from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 
 from api.ptg2_address_policy import postal_box_address_sql
-from api.ptg2_geo_projection import projected_boolean_sql, projection_dependency_relation_sql
+from api.ptg2_geo_projection import (
+    _PROJECTION_DEPENDENCIES,
+    GEO_ASSURANCE_STATE_TABLE,
+    projected_boolean_sql,
+    projection_dependency_relation_sql,
+    projection_named_dependency_lock_sql,
+    retained_tiger_children_sql,
+    validate_projection_dependency_qnames,
+)
+
+_REFERENCE_READ = ContextVar("provider_geo_reference_read", default=None)
+
+
+async def _read_reference_bindings(session, schema_name):
+    """Select local active TIGER names while keeping mutable evidence current."""
+    state = f'"{schema_name}"."{GEO_ASSURANCE_STATE_TABLE}"'
+    bindings = None
+    if await session.scalar(text("SELECT to_regclass(:state) IS NOT NULL"), {"state": state}):
+        await session.execute(text(f"LOCK TABLE {state} IN ACCESS SHARE MODE"))
+        bindings = await session.scalar(text(f"SELECT active_dependency_bindings FROM {state} WHERE singleton IS TRUE"))
+    if bindings is None:
+        if await session.scalar(text("SELECT " + retained_tiger_children_sql())):
+            raise ValueError("geo reference selection is unavailable")
+        return None
+    if not isinstance(bindings, Mapping) or any(
+        not isinstance(binding_entry, Mapping)
+        or set(binding_entry)
+        not in ({"schema_name", "table_name"}, {"schema_name", "table_name", "relation_oid", "relfilenode"})
+        for binding_entry in bindings.values()
+    ):
+        raise ValueError("geo reference selection is invalid")
+    names = validate_projection_dependency_qnames(
+        schema_name,
+        {
+            key: {field: binding_entry[field] for field in ("schema_name", "table_name")}
+            for key, binding_entry in bindings.items()
+        },
+    )
+    selected_by_name = {
+        f"{schema or schema_name}.{name}": {"schema_name": schema or schema_name, "table_name": name}
+        for schema, name in _PROJECTION_DEPENDENCIES
+    }
+    tiger_schema = names["tiger.zip_state"]["schema_name"]
+    if not (tiger_schema == "tiger" or re.fullmatch(r"reference_family_archive_[0-9a-f]{32}", tiger_schema)):
+        raise ValueError("geo reference selection is invalid")
+    if tiger_schema == "tiger" and await session.scalar(text("SELECT " + retained_tiger_children_sql())):
+        raise ValueError("geo reference selection is unavailable")
+    for name in ("zip_state", "zcta5"):
+        if names["tiger." + name] != {"schema_name": tiger_schema, "table_name": name}:
+            raise ValueError("geo reference selection is invalid")
+        selected_by_name["tiger." + name] = names["tiger." + name]
+    await session.execute(text(projection_named_dependency_lock_sql(schema_name, selected_by_name)))
+    return selected_by_name
+
+
+@asynccontextmanager
+async def provider_address_geo_references(session, *, schema_name, request_args=None):
+    """Keep selected reference names inside the caller's existing read snapshot."""
+    if request_args is not None and not any(
+        request_args.get(name) not in (None, "", "null") for name in ("zip5", "zip", "lat", "long")
+    ):
+        yield None
+        return
+    schema_name = _validated_sql_identifier(schema_name, field_name="address schema")
+    try:
+        bindings = await _read_reference_bindings(session, schema_name)
+    except ValueError as error:
+        raise ServiceUnavailable("Provider data is temporarily unavailable.") from error
+    token = _REFERENCE_READ.set((schema_name, bindings))
+    try:
+        yield bindings
+    finally:
+        _REFERENCE_READ.reset(token)
+
+
+def _reference_bindings(schema_name):
+    selected = _REFERENCE_READ.get()
+    return selected[1] if selected is not None and selected[0] == schema_name else None
+
+
+def _reference_relation(schema_name, name):
+    bindings = _reference_bindings(schema_name)
+    relation = projection_dependency_relation_sql(schema_name, "tiger." + name, dependency_bindings=bindings)
+    return "ONLY " + relation if bindings is not None else relation
+
 
 _PROVIDER_ADDRESS_GEO_CAPABILITY_SQL = """
     SELECT
@@ -152,7 +239,7 @@ def _canonical_zip_state_sql(
         )
         OR EXISTS (
             SELECT 1
-              FROM tiger.zip_state AS address_zip_state
+              FROM {_reference_relation(schema_name, "zip_state")} AS address_zip_state
              WHERE address_zip_state.zip = {canonical_zip}
                AND UPPER(BTRIM(COALESCE(address_zip_state.stusps, ''))) = {canonical_state}
                AND {displayed_state} = UPPER(BTRIM(COALESCE(address_zip_state.stusps, '')))
@@ -177,6 +264,7 @@ def provider_address_identity_reference_joins_sql(
     displayed_state = f"UPPER(BTRIM(COALESCE({alias}.state_name, '')))"
     canonical_state = f"UPPER(BTRIM(COALESCE({alias}.state_code, '')))"
     canonical_zip = f"BTRIM(COALESCE({alias}.zip5, ''))"
+    dependency_bindings = dependency_bindings if dependency_bindings is not None else _reference_bindings(schema_name)
     geo_relation = projection_dependency_relation_sql(
         schema_name, f"{schema_name}.geo_zip_lookup", dependency_bindings=dependency_bindings
     )
@@ -259,7 +347,7 @@ def provider_address_point_coherence_sql(
         if zcta_alias
         else f"""EXISTS (
             SELECT 1
-              FROM tiger.zcta5 AS address_zcta
+              FROM {_reference_relation(schema_name or "mrf", "zcta5")} AS address_zcta
              WHERE address_zcta.zcta5ce = BTRIM({alias}.zip5)
                AND public.ST_Covers(
                     address_zcta.the_geom,
@@ -284,6 +372,8 @@ def provider_address_point_coherence_sql(
         return legacy_sql
     if schema_name is None:
         raise ValueError("schema_name is required when using geo projection")
+    if _reference_bindings(schema_name) is not None:
+        return legacy_sql
     return projected_boolean_sql(
         alias,
         "geo_point_coherent",
@@ -303,6 +393,7 @@ def provider_address_point_reference_join_sql(
 
     alias = _validated_sql_identifier(alias, field_name="address alias")
     zcta_alias = _validated_sql_identifier(zcta_alias, field_name="reference alias")
+    dependency_bindings = dependency_bindings if dependency_bindings is not None else _reference_bindings(schema_name)
     relation = projection_dependency_relation_sql(schema_name, "tiger.zcta5", dependency_bindings=dependency_bindings)
     return f"JOIN {relation} AS {zcta_alias} ON {zcta_alias}.zcta5ce = BTRIM({alias}.zip5)"
 
@@ -361,6 +452,9 @@ async def is_provider_address_geo_capability_available(
             reference_schema,
             field_name="spatial reference schema",
         )
+        bindings = _reference_bindings(schema_name)
+        if bindings is not None:
+            reference_schema = bindings["tiger.zip_state"]["schema_name"]
     except ValueError:
         return False
     execute = getattr(session, "execute", None)
@@ -392,4 +486,5 @@ __all__ = [
     "provider_address_location_filter_sql",
     "provider_address_point_coherence_sql",
     "provider_address_point_reference_join_sql",
+    "provider_address_geo_references",
 ]

@@ -8,6 +8,7 @@ from uuid import uuid4
 import asyncpg
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from process import reference_family_archive as archive
@@ -144,13 +145,13 @@ async def _provision_tiger_roots(url, sessions, roles):
 
 
 async def _initial_tiger_child_activation(sessions, roles):
-    """Reject unprovisioned ownership, then attach the actual protected source clone."""
+    """PostgreSQL refuses activation before ownership is provisioned, then the protected clone attaches."""
     admin_sessions, publisher_sessions, _reader_sessions = sessions
     owner, _publisher, reader = roles
     first, validation, owner_oid = await _captured_stage(admin_sessions, publisher_sessions, owner, zip_code="00001")
-    cutover = archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, owner_oid, owner_oid, "manual")
+    cutover = archive.ReferenceFamilyCutoverAuthority("a" * 64, archive.CONTRACT, "manual")
     async with publisher_sessions.begin() as session:
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="ownership"):
+        with pytest.raises(DBAPIError, match="permission denied"):
             await inherited.activate_tiger_snapshot_children(
                 session,
                 ownership=first.ownership,
@@ -209,7 +210,9 @@ async def _prepare_replacement_tiger_leaf(sessions, first, receipt, owner, owner
     async with publisher_sessions.begin() as session:
         await inherited.exchange_tiger_snapshot_children(
             session,
-            incoming_pairs=first.ownership.relation_oids,
+            incoming_pairs=tuple(
+                (first.ownership.schema_name, name) for name, _old_token in first.ownership.relation_oids
+            ),
             expected_children=(),
             owner_oid=owner_oid,
             expected_parent_inventory=receipt["parent_inventory"],
@@ -229,26 +232,36 @@ async def _exchange_tiger_leaves_and_rollback(
                 manifest=second.manifest,
                 validation_receipt=second_validation,
                 cutover=cutover,
-                expected_children=first.ownership.relation_oids,
+                expected_children=tuple(
+                    (first.ownership.schema_name, name) for name, _old_token in first.ownership.relation_oids
+                ),
                 expected_parent_inventory=receipt["parent_inventory"],
             )
             raise RuntimeError("synthetic late failure")
     async with publisher_sessions.begin() as session:
-        assert await inherited.current_tiger_snapshot_children(session) == first.ownership.relation_oids
+        assert await inherited.current_tiger_snapshot_children(session) == tuple(
+            (first.ownership.schema_name, name) for name, _old_token in first.ownership.relation_oids
+        )
         await inherited.activate_tiger_snapshot_children(
             session,
             ownership=second.ownership,
             manifest=second.manifest,
             validation_receipt=second_validation,
             cutover=cutover,
-            expected_children=first.ownership.relation_oids,
+            expected_children=tuple(
+                (first.ownership.schema_name, name) for name, _old_token in first.ownership.relation_oids
+            ),
             expected_parent_inventory=receipt["parent_inventory"],
         )
     async with publisher_sessions.begin() as session:
         await inherited.exchange_tiger_snapshot_children(
             session,
-            incoming_pairs=first.ownership.relation_oids,
-            expected_children=second.ownership.relation_oids,
+            incoming_pairs=tuple(
+                (first.ownership.schema_name, name) for name, _old_token in first.ownership.relation_oids
+            ),
+            expected_children=tuple(
+                (second.ownership.schema_name, name) for name, _old_token in second.ownership.relation_oids
+            ),
             owner_oid=owner_oid,
             expected_parent_inventory=receipt["parent_inventory"],
         )
@@ -266,14 +279,10 @@ async def _assert_tiger_database_backup(url, sessions, receipt, owner_oid, tmp_p
     async with reader_sessions.begin() as session:
         assert await session.scalar(text("SELECT zip FROM tiger.zip_state")) == "00001"
         assert await session.scalar(text("SELECT ST_SRID(the_geom) FROM tiger.zcta5")) == 4269
-    async with publisher_sessions.begin() as session:
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="ownership"):
-            await inherited.capture_tiger_snapshot_parents(
-                session,
-                owner_oid=owner_oid,
-                expected_children=await inherited.current_tiger_snapshot_children(session),
-                expected_parent_inventory=receipt["parent_inventory"],
-            )
+    async with reader_sessions.begin() as session:
+        observed = await inherited.require_tiger_snapshot_parents(session)
+        assert inherited.parent_names(observed) == inherited.parent_names(receipt["parent_inventory"])
+        assert len(await inherited.current_tiger_snapshot_children(session)) == 2
 
 
 @pytest.mark.asyncio

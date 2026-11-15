@@ -57,6 +57,7 @@ def stage_schema(dataset_id: UUID) -> str:
 def source_manifest(generation: dict) -> dict:
     """Project a published generation into the portable source manifest."""
     receipt = generation["receipt"]
+    require(receipt["contract"] == GENERATION_CONTRACT, "MS-DRG source receipt contract differs")
     return {
         "contract": CONTRACT,
         "origin_lineage_id": str(generation["origin_lineage_id"]),
@@ -364,7 +365,7 @@ async def verify_stage(session, stage: dict, manifest: dict, *, receiving: bool)
         text(
             "LOCK TABLE "
             + ",".join(f"{_quoted(stage['schema_name'])}.{_quoted(name)}" for name in TABLES)
-            + " IN SHARE MODE"
+            + " IN ACCESS SHARE MODE"
         )
     )
     await _strict_stage(session, stage, manifest, receiving=receiving)
@@ -504,7 +505,11 @@ async def validate_prepared_stage(session, destination: str, stage: dict, manife
     stage = await _named_stage(session, stage, receiving=True)
     require(session.in_transaction(), "MS-DRG validation transaction is required")
     await session.execute(
-        text("LOCK TABLE " + ",".join(f"{_quoted(destination)}.{_quoted(name)}" for name in TABLES) + " IN SHARE MODE")
+        text(
+            "LOCK TABLE "
+            + ",".join(f"{_quoted(destination)}.{_quoted(name)}" for name in TABLES)
+            + " IN ACCESS SHARE MODE"
+        )
     )
     previous, before = await _current(session, destination)
     await verify_stage(session, stage, manifest, receiving=True)
@@ -529,7 +534,9 @@ async def _has_foreign_key_collision(session, destination: str, stage: dict, nam
     return False
 
 
-async def _publish_source_slices(session, destination, stage, names, *, previous, manifest, source_copy):
+async def _publish_source_slices(
+    session, destination, stage, names, *, previous, manifest, source_copy, publication_policy=None
+):
     """Compose frozen source slices while retaining every other producer's current rows."""
     from process import scoped_catalog_publication as publication
 
@@ -537,7 +544,13 @@ async def _publish_source_slices(session, destination, stage, names, *, previous
         session, "ms-drg", destination, stage["schema_name"], names, source_copy
     )
     composed = await publication.compose_catalog_family(
-        session, destination, "ms-drg", incoming, publication.contributions("ms-drg"), source_copy
+        session,
+        destination,
+        "ms-drg",
+        incoming,
+        publication.contributions("ms-drg"),
+        source_copy,
+        publication_policy=publication_policy,
     )
     require(_has_same_generation(composed.generations["ms-drg"], previous), "MS-DRG publication generation changed")
 
@@ -597,7 +610,7 @@ async def _write_generation(
 
 
 async def activate_stage(
-    session, destination: str, stage: dict, manifest: dict, prepared: dict, *, source_copy=None
+    session, destination: str, stage: dict, manifest: dict, prepared: dict, *, source_copy=None, publication_policy=None
 ) -> dict:
     """CAS all owned slices and source origin in one destination transaction."""
     stage = await _named_stage(session, stage, receiving=True)
@@ -623,6 +636,7 @@ async def activate_stage(
         previous=previous,
         manifest=manifest,
         source_copy=source_copy,
+        publication_policy=publication_policy,
     )
     return {
         "previous": previous,
@@ -634,7 +648,9 @@ async def activate_stage(
     }
 
 
-async def rollback_activation(session, destination: str, activation: dict, *, source_copy=None) -> dict:
+async def rollback_activation(
+    session, destination: str, activation: dict, *, source_copy=None, publication_policy=None
+) -> dict:
     """Restore only this installation's frozen predecessor under an exact CAS."""
     require(session.in_transaction(), "MS-DRG rollback transaction is required")
     _require_copy(source_copy)
@@ -669,6 +685,7 @@ async def rollback_activation(session, destination: str, activation: dict, *, so
         previous=current,
         manifest=prior_manifest,
         source_copy=source_copy,
+        publication_policy=publication_policy,
     )
     from process.scoped_catalog_retention import cleanup_retained_catalog
 

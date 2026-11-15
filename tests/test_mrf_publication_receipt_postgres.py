@@ -3,7 +3,7 @@
 
 import asyncio
 import os
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -1075,12 +1075,15 @@ async def _assert_batch_fixture_rows(fixture, recipes):
     assert sorted(observed_counts) == [("source-first", 1, 2, 1), ("source-second", 2, 2, 2), ("source-third", 1, 1, 1)]
 
 
-async def _assert_batch_tamper_refusal(fixture, prepared, recipes):
+async def _assert_batch_named_read_contract(fixture, prepared, recipes):
+    """Keep recipe metadata and named reads checked without treating grants as authority."""
     from process.network_legacy_membership_source import _require_archive
 
     for damage in ("stamp", "role", "oid"):
         transaction = fixture.connection.transaction()
         await transaction.start()
+        error_type = {"stamp": ValueError, "oid": asyncpg.UndefinedTableError}.get(damage)
+        read_expectation = pytest.raises(error_type) if error_type else nullcontext()
         try:
             schema = prepared.ownership.schema_name
             statement = {
@@ -1089,8 +1092,7 @@ async def _assert_batch_tamper_refusal(fixture, prepared, recipes):
                 "oid": f'ALTER TABLE "{schema}".mrf_address_evidence RENAME TO changed_evidence',
             }[damage]
             await fixture.connection.execute(statement)
-            expected = asyncpg.UndefinedTableError if damage == "oid" else ValueError
-            with pytest.raises(expected):
+            with read_expectation:
                 await _require_archive(fixture.connection, recipes[0].source_pin)
         finally:
             await transaction.rollback()
@@ -1123,7 +1125,7 @@ async def test_native_initial_batch_one_clone_exact_scopes_and_complete_raw_acco
                 await producer.require_registry_aca_source_batch(session, prepared, runtime_roles=(fixture.reader,))
                 == recipes
             )
-        await _assert_batch_tamper_refusal(fixture, prepared, recipes)
+        await _assert_batch_named_read_contract(fixture, prepared, recipes)
 
 
 @pytest.mark.parametrize("failure", ["cas", "cancel"])
@@ -1559,8 +1561,12 @@ async def _assert_verified_batch_drift(fixture, prepared, recipes, damage, produ
                     "oid": f'ALTER TABLE "{schema}".mrf_address_evidence RENAME TO changed_evidence',
                 }[damage]
             )
-        with pytest.raises(asyncpg.UndefinedTableError if damage == "oid" else ValueError):
-            await producer.require_registry_aca_batch_read(fixture.connection, source_pin, verified)
+        if damage == "privilege":
+            # Another role's grant does not alter this transaction's native read access.
+            assert await producer.require_registry_aca_batch_read(fixture.connection, source_pin, verified) is None
+        else:
+            with pytest.raises(asyncpg.UndefinedTableError if damage == "oid" else ValueError):
+                await producer.require_registry_aca_batch_read(fixture.connection, source_pin, verified)
     finally:
         await transaction.rollback()
     async with fixture.source_sessions.begin() as session:

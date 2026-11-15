@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Public inventory operations refuse changed candidate and physical metadata."""
+"""Named inventory operations preserve complete scope, bounded rows and atomic writes."""
 
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -107,8 +107,8 @@ async def test_inventory_write_refuses_unregistered_foreign_or_closed_candidate_
 @pytest.mark.asyncio
 async def test_existing_inventory_view_cannot_be_reused_as_its_original_heap():
     target = _target()
-    connection = _connection(rows=[_candidate(target), _CatalogRow(oid=61, relkind="v", relpersistence="p")])
-    with pytest.raises(RegistrySourceInventoryError, match="physical_identity_invalid"):
+    connection = _connection(rows=[_candidate(target), _CatalogRow(relkind="v", relpersistence="p")])
+    with pytest.raises(RegistrySourceInventoryError, match="relation_invalid"):
         await _write(connection, target)
     connection.execute.assert_not_awaited()
     connection.copy_records_to_table.assert_not_awaited()
@@ -116,29 +116,42 @@ async def test_existing_inventory_view_cannot_be_reused_as_its_original_heap():
 
 
 @pytest.mark.asyncio
-async def test_existing_inventory_oid_is_rechecked_after_exclusive_lock_before_writes():
+async def test_existing_inventory_replay_locks_and_verifies_full_content_root(monkeypatch):
     target = _target()
-    connection = _connection(rows=[_candidate(target), _CatalogRow(oid=61, relkind="r", relpersistence="p")])
-    connection.fetchval.return_value = 62
-    with pytest.raises(RegistrySourceInventoryError, match="physical_identity_invalid"):
-        await _write(connection, target)
+    connection = _connection(rows=[_candidate(target), _CatalogRow(relkind="r", relpersistence="p")])
+    folded = AsyncMock(return_value=source_inventory_root(()))
+    monkeypatch.setattr(store, "_fold_inventory", folded)
+    receipt = await _write(connection, target)
+    assert (receipt.schema_name, receipt.table_name, receipt.root) == (
+        target.schema_name,
+        store.INVENTORY_TABLE,
+        source_inventory_root(()),
+    )
     assert connection.execute.await_count == 1
     assert connection.execute.await_args.args[0].startswith("LOCK TABLE ONLY ")
+    folded.assert_awaited_once_with(
+        connection, store._relation(target), receipt.root, 100, store.MAX_INVENTORY_PAGE_BYTES
+    )
     connection.copy_records_to_table.assert_not_awaited()
-    assert connection.events == ["begin", "rollback"]
+    connection.fetchval.assert_not_awaited()
+    assert connection.events == ["begin", "commit"]
 
 
 @pytest.mark.asyncio
-async def test_raw_inventory_read_requires_its_actual_granted_relation_lock():
+async def test_raw_inventory_page_uses_qualified_name_without_catalog_locks(monkeypatch):
     target = _target()
     scope_by_field = {
         field: getattr(target, field)
         for field in ("dataset_id", "schema_id", "producer_id", "candidate_id", "schema_name")
     }
-    connection = _connection(rows=[("repeatable read", "on"), scope_by_field, (61, "r", "p"), (61, False)])
-    with pytest.raises(RegistrySourceInventoryError, match="physical_identity_invalid"):
-        await store.read_source_inventory_page(
-            connection, target, expected_table_oid=61, control_schema="registry_example"
-        )
-    connection.fetch.assert_not_awaited()
-    assert connection.execute.await_count == 1
+    connection = _connection(rows=[("repeatable read", "on"), scope_by_field])
+    page = object()
+    read = AsyncMock(return_value=page)
+    monkeypatch.setattr(store, "_read_page", read)
+    assert await store.read_source_inventory_page(connection, target, control_schema="registry_example") is page
+    read.assert_awaited_once_with(connection, store._relation(target), 0, 100, store.MAX_INVENTORY_PAGE_BYTES)
+    connection.execute.assert_not_awaited()
+    connection.fetchval.assert_not_awaited()
+    assert all(
+        "pg_locks" not in call.args[0] and "::oid" not in call.args[0] for call in connection.fetchrow.await_args_list
+    )

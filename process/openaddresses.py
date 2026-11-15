@@ -30,7 +30,10 @@ from process.ext import address_canon
 from process.ext.address_fast import canonicalize_batch as canonicalize_address_batch
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info, push_objects
 from process.live_progress import enqueue_live_progress
-from process.provider_directory_cms_native_inputs import prepare_local_native_input_publication
+from process.provider_directory_cms_native_inputs import (
+    finish_local_native_input_publication,
+    prepare_local_native_input_publication,
+)
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
 
@@ -3240,7 +3243,7 @@ async def publish_openaddresses_generation(ctx):  # pragma: no cover
         marker_comment = _published_recovery_marker_comment(import_date, stage_oid)
 
         async with db.transaction() as session:
-            await prepare_local_native_input_publication(
+            native_input_publication = await prepare_local_native_input_publication(
                 session,
                 ledger_schema=schema,
                 relations=((live_table, stage_table),),
@@ -3250,6 +3253,7 @@ async def publish_openaddresses_generation(ctx):  # pragma: no cover
                 f"ALTER TABLE IF EXISTS {_qtable(schema, live_table)} RENAME TO {_quote_ident(archived_table)};"
             )
             await db.status(f"ALTER TABLE {_qtable(schema, stage_table)} RENAME TO {_quote_ident(live_table)};")
+            await finish_local_native_input_publication(session, prepared=native_input_publication)
             await db.status(
                 f"ALTER TABLE {_qtable(schema, recovery_table)} RENAME TO {_quote_ident(published_recovery_table)};"
             )

@@ -3,16 +3,16 @@
 
 import copy
 import json
-from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 
 from process import registry_fhir_catalog_grant as grants
 from process import registry_fhir_catalog_retained as retained
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
+from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_fhir_catalog_extraction import extract_fhir_catalog_batch
 from process.registry_fhir_catalog_projection import SourceCatalogContext
@@ -73,7 +73,7 @@ def manifest_fixture(recipe):
         {RECIPE_DIGEST_KEY: registry_source_recipes_sha256(canonical_registry_source_recipes((recipe,)))},
         6,
         "a" * 64,
-        90,
+        CompactAddressRelation("serving_example", "entity_address_unified"),
     )
 
 
@@ -101,7 +101,7 @@ async def test_retained_descriptor_preserves_origin_and_capture_edition_without_
         "edition_id": recipe.source_pin.retained_capture.capture_id,
     }
     assert descriptor["native_read_profile"]["schema_name"] == recipe.source_pin.read_schema_name
-    assert descriptor["resource_table_oid"] == recipe.source_pin.read_resource_table_oid
+    assert descriptor["tables"]["resource"] == recipe.source_pin.read_resource_relation
     assert descriptor["source_uri"] is None
     assert len(fhir_catalog_source_generation(descriptor)) == 64
     context = SourceCatalogContext(
@@ -138,7 +138,9 @@ async def test_retained_generation_excludes_only_manifest_locator(monkeypatch):
     native = published_descriptor()
     native_generation = fhir_catalog_source_generation(native)
     native["source_uri"] = "https://other.test/fhir/"
-    assert fhir_catalog_source_generation(native) != native_generation
+    with pytest.raises(ValueError, match="observation_invalid"):
+        fhir_catalog_source_generation(native)
+    assert len(native_generation) == 64
 
 
 def test_missing_uri_is_only_accepted_for_retained_descriptors():
@@ -148,7 +150,7 @@ def test_missing_uri_is_only_accepted_for_retained_descriptors():
         validate_fhir_catalog_source_descriptor(descriptor)
 
 
-@pytest.mark.parametrize("field", ["coordinates", "capture_sha256", "resource_table_oid", "retained_manifest"])
+@pytest.mark.parametrize("field", ["coordinates", "capture_sha256", "tables", "retained_manifest"])
 async def test_retained_descriptor_rejects_mixed_provenance(monkeypatch, field):
     disposition, _, _ = await descriptor_fixture(monkeypatch)
     descriptor = copy.deepcopy(disposition.descriptor)
@@ -156,8 +158,8 @@ async def test_retained_descriptor_rejects_mixed_provenance(monkeypatch, field):
         descriptor[field]["edition_id"] = "another-edition"
     elif field == "retained_manifest":
         descriptor[field]["unknown"] = True
-    elif field == "resource_table_oid":
-        descriptor[field] += 1
+    elif field == "tables":
+        descriptor[field]["resource"]["name"] = "another_resource"
     else:
         descriptor[field] = "f" * 64
     with pytest.raises(ValueError):
@@ -207,22 +209,17 @@ async def test_published_manifest_and_recipe_are_rechecked(monkeypatch):
 async def test_explicit_capture_is_available_without_directory_publication(monkeypatch):
     recipe = recipe_fixture()
     connection = SimpleNamespace(fetchval=AsyncMock(return_value=104))
-    verifier = AsyncMock(return_value=recipe.source_pin.retained_capture)
-    monkeypatch.setattr(retained, "require_retained_fhir_capture", verifier)
     (source,) = await retained.resolve_granted_fhir_catalog_sources(connection, (recipe,))
     assert source.descriptor["retained_manifest"] is None
     assert retained.retained_fhir_catalog_recipe(source.descriptor) == recipe
     assert await retained.require_retained_fhir_catalog_sources(
         connection, (source.descriptor,), control_schema="control_example"
     )
-    assert verifier.await_count == 2
-    assert all(call.kwargs == {"verify_content": False} for call in verifier.await_args_list)
 
 
 async def test_explicit_capture_grant_is_exact_and_published_recipe_flag_cannot_substitute(custody, monkeypatch):
     recipe = recipe_fixture()
     connection = SimpleNamespace(fetchval=AsyncMock(return_value=104))
-    monkeypatch.setattr(retained, "require_retained_fhir_capture", AsyncMock())
     (source,) = await retained.resolve_granted_fhir_catalog_sources(connection, (recipe,))
     verifier = AsyncMock(return_value=True)
     monkeypatch.setattr(grants, "require_retained_fhir_catalog_sources", verifier)
@@ -308,38 +305,6 @@ async def test_retained_bootstrap_requires_policy_and_published_recipe_not_prior
         verifier.assert_not_awaited()
 
 
-async def test_retained_grant_keeps_capture_pin_through_publication(custody, monkeypatch):
-    disposition, _, _ = await descriptor_fixture(monkeypatch)
-    grant = standing_grant(retained_source_recipes=True)
-    selected = snapshot(grant, (disposition.descriptor,), status="last_good")
-    writer = catalog_connection(selected, disposition.descriptor)
-    reader = Mock(execute=AsyncMock())
-    reader.is_in_transaction.return_value = False
-    transaction = Mock()
-    transaction.start = AsyncMock(side_effect=lambda: reader.is_in_transaction.configure_mock(return_value=True))
-    transaction.rollback = AsyncMock(side_effect=lambda: reader.is_in_transaction.configure_mock(return_value=False))
-    reader.transaction.return_value = transaction
-
-    @asynccontextmanager
-    async def acquire():
-        yield reader
-
-    retained_read = SimpleNamespace(capture=object(), verify=AsyncMock())
-    monkeypatch.setattr(grants, "_reader_identity", AsyncMock())
-    monkeypatch.setattr(grants, "require_retained_fhir_catalog_sources", AsyncMock(return_value=True))
-    pinner = AsyncMock(return_value=retained_read)
-    monkeypatch.setattr(grants, "pin_retained_fhir_catalog_source", pinner)
-    runtime = grants.build_fhir_catalog_publication_runtime(grant, SimpleNamespace(acquire=acquire))
-    async with runtime.source_fence(snapshot=selected, connection=writer):
-        await runtime.authorize_metadata(command=command(grant, selected), snapshot=selected, connection=writer)
-        assert await runtime.verify_sources(snapshot=selected, connection=writer)
-        assert reader.is_in_transaction()
-    pinner.assert_awaited_once_with(reader, disposition.descriptor)
-    retained_read.verify.assert_awaited_once_with(reader, retained_read.capture)
-    assert not reader.is_in_transaction()
-    reader.execute.assert_awaited_once_with("SET LOCAL search_path = pg_catalog, pg_temp, public")
-
-
 async def test_retained_capture_cannot_claim_current_source_freshness(custody, monkeypatch):
     disposition, _, _ = await descriptor_fixture(monkeypatch)
     grant = standing_grant(retained_source_recipes=True)
@@ -348,3 +313,44 @@ async def test_retained_capture_cannot_claim_current_source_freshness(custody, m
     runtime = grants.build_fhir_catalog_publication_runtime(grant, None)
     with pytest.raises(grants.FHIRCatalogGrantError, match="retained_freshness_invalid"):
         await runtime.authorize_metadata(command=command(grant, selected), snapshot=selected, connection=writer)
+
+
+@pytest.mark.parametrize("normalized", [False, True])
+async def test_persisted_legacy_catalog_generation_survives_named_projection(monkeypatch, normalized):
+    if normalized:
+        disposition, _, _ = await descriptor_fixture(monkeypatch)
+        descriptor = disposition.descriptor
+    else:
+        descriptor = published_descriptor()
+    legacy_by_field = {key: field_value for key, field_value in descriptor.items() if key != "tables"}
+    legacy_by_field.update(
+        resource_table_oid=101,
+        resource_leaf_oids=[102],
+        header_table_oid=103,
+        database_oid=104,
+        native_catalog_sha256="obsolete",
+    )
+    legacy_by_field["native_read_profile"] = {
+        **legacy_by_field["native_read_profile"],
+        "owner_role": "previous_owner",
+        "runtime_roles": ["previous_reader"],
+    }
+    generation = "9" * 64
+    source_id = descriptor["coordinates"]["source_id"]
+    connection = SimpleNamespace(
+        fetch=AsyncMock(
+            side_effect=[
+                [{"source_generation": generation, "source_id": source_id, "document": json.dumps(legacy_by_field)}],
+                [],
+            ]
+        )
+    )
+    descriptors_by_generation = await grants.load_fhir_catalog_source_descriptors(
+        connection, {"schema_name": "catalog_snapshot"}, [{"source_generation": generation, "source_id": source_id}]
+    )
+    assert set(descriptors_by_generation) == {generation}
+    assert descriptors_by_generation[generation]["tables"]["resource"]["name"] == "provider_directory_dataset_resource"
+    assert (
+        validate_fhir_catalog_source_descriptor(descriptors_by_generation[generation])
+        == descriptors_by_generation[generation]
+    )

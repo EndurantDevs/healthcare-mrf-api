@@ -6,6 +6,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import asyncpg
 import pytest
 
 from process import registry_ptg_office_selection as offices
@@ -30,10 +31,15 @@ class _OfficeReader:
     async def fetchval(self, statement, *arguments):
         """Refuse unrecognized SQL instead of granting arbitrary catalog queries."""
         self.calls.append((statement, arguments))
-        if statement == "SHOW transaction_isolation":
-            return self.isolation
-        assert "pg_namespace" in statement
-        return next(self.permission_results)
+        assert statement == "SHOW transaction_isolation"
+        return self.isolation
+
+    async def execute(self, statement, *arguments):
+        """Model PostgreSQL's own privilege check on each office table probe."""
+        self.calls.append((statement, arguments))
+        assert "registry_ptg_office_" in statement and statement.endswith("LIMIT 0")
+        if not next(self.permission_results):
+            raise asyncpg.InsufficientPrivilegeError("permission denied for table")
 
     async def fetch(self, statement, *arguments):
         """Return only one explicitly supplied approval/hold response page."""
@@ -57,7 +63,12 @@ async def test_office_authority_refuses_before_reading_any_receipt(failure):
         reader.permission_results = iter((False,))
     elif failure == "hold_acl":
         reader.permission_results = iter((True, False))
-    with pytest.raises(ValueError, match="store_unprotected|transaction_required"):
+    expected = (
+        pytest.raises(asyncpg.InsufficientPrivilegeError)
+        if failure.endswith("_acl")
+        else pytest.raises(ValueError, match="store_unprotected|transaction_required")
+    )
+    with expected:
         await offices._read_references(reader, namespace, [binding_by_field], store)
     assert all("WITH ORDINALITY" not in statement for statement, _ in reader.calls)
     if failure == "namespace":

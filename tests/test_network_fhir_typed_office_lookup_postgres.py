@@ -40,7 +40,7 @@ async def _fixture(connection):
     mappings = []
     for sites in ((1, 2), (3, 4)):
         names = await mapping.create_typed_mapping_tables(connection)
-        selected = mapping.TypedGraphMapping(None, names, {}, {})
+        selected = mapping.TypedGraphMapping(None, names, {})
         for site in sites:
             key_index = int(site == 4)
             await connection.execute(
@@ -265,7 +265,15 @@ async def test_precreated_mapping_companions_work_in_read_only_snapshot(serving_
     assert set(names) == {"provider_only", "offices", "memberships", "bindings"}
     async with connection.transaction(isolation="repeatable_read", readonly=True):
         selected = await mapping._mapping_workspace(connection, None, names)
-        assert len(selected.oids) == 6
+        expected_name_by_kind = {
+            **names,
+            "office_keys": names["offices"] + "_keys",
+            "office_matches": names["offices"] + "_matches",
+        }
+        assert selected.table_names == expected_name_by_kind
+        assert {kind: selected.relation(kind) for kind in expected_name_by_kind} == {
+            kind: 'pg_temp."' + name + '"' for kind, name in expected_name_by_kind.items()
+        }
         await connection.execute(
             "INSERT INTO " + selected.relation("offices") + " SELECT * FROM " + mappings[0].relation("offices")
         )

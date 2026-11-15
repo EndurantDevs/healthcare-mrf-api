@@ -33,6 +33,7 @@ from process.provider_directory_source_checkpoint_control import source_checkpoi
 from process.provider_directory_source_control_privileges import METADATA_FUNCTIONS
 from tests.provider_directory_dataset_rehydrate_checkpoint_support import _guard, _layout
 from tests.provider_directory_source_postgres_support import native_source_component
+from tests.provider_directory_subset_completion_pg_concurrency import drop_owned_database
 from tests.provider_directory_subset_completion_pg_setup import (
     insert_subset_candidate,
     insert_valid_subset_resources,
@@ -656,5 +657,9 @@ async def close_abandonment_scenario(scenario, *resources) -> None:
             await resource.close()
     with suppress(Exception):
         await scenario.connection.execute("ROLLBACK")
-    await scenario.connection.execute(f"DROP SCHEMA IF EXISTS {scenario.quoted_schema} CASCADE")
-    await scenario.connection.close()
+    try:
+        await scenario.connection.execute(f"DROP SCHEMA IF EXISTS {scenario.quoted_schema} CASCADE")
+        await scenario.connection.close()
+    finally:
+        if scenario.owned_database is not None:
+            await drop_owned_database(scenario.owned_database)

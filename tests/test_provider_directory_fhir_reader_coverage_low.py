@@ -186,7 +186,7 @@ async def test_address_artifact_small_helpers(monkeypatch):
     prepare = AsyncMock()
     monkeypatch.setattr(fhir, "_prepare_provider_directory_artifact_stage", prepare)
     metrics, stage = await fhir._prepared_address_corroboration_result(
-        "mrf", "stage", {"rows": 1}, fhir.ProviderDirectoryArtifactBuildFence(None)
+        "mrf", "stage", {"rows": 1}, fhir.ProviderDirectoryArtifactBuildFence()
     )
     assert metrics == {"rows": 1}
     assert stage.stage_table == "stage"

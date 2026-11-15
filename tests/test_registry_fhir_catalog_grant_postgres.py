@@ -10,14 +10,11 @@ from uuid import uuid4
 import asyncpg
 import pytest
 
-from db.registry_fhir_catalog import table_sql
 from process import registry_fhir_catalog_grant as grants
-from process.registry_fhir_catalog_source_fence import require_fhir_catalog_source_publication_fence
-from process.registry_fhir_catalog_validation import canonical_json, metadata_generation
+from process.registry_fhir_catalog_validation import metadata_generation
 from tests.test_registry_fhir_catalog_custody_postgres import expected_snapshot, freeze_metadata
 from tests.test_registry_fhir_catalog_custody_postgres import metadata_custody as metadata_custody
-from tests.test_registry_fhir_catalog_grant import command, snapshot
-from tests.test_registry_fhir_catalog_sources import descriptor
+from tests.test_registry_fhir_catalog_grant import command, descriptor, snapshot
 
 
 @pytest.fixture
@@ -34,15 +31,20 @@ async def grant_reader(metadata_custody, monkeypatch, request):
     await fixture.connection.execute(f'ALTER TABLE {namespace}.source_state OWNER TO "{fixture.roles["owner"]}"')
     await fixture.connection.execute(f'GRANT USAGE ON SCHEMA {namespace} TO "{fixture.roles["reader"]}"')
     await fixture.connection.execute(f'GRANT SELECT ON {namespace}.source_state TO "{fixture.roles["reader"]}"')
-    profile = grants.FHIRCatalogSourceReadProfile(source_schema, fixture.roles["owner"], (fixture.roles["reader"],))
+    await fixture.connection.execute(f'GRANT USAGE ON SCHEMA {namespace} TO "{fixture.roles["publisher"]}"')
+    await fixture.connection.execute(
+        f'GRANT UPDATE(head) ON {namespace}.source_state TO "{fixture.roles["publisher"]}"'
+    )
+    profile = grants.FHIRCatalogSourceReadProfile(source_schema)
     grant = grants.FHIRCatalogStandingGrant("synthetic-native-policy", 1, fixture.control_schema, (profile,))
     source_descriptor = copy.deepcopy(descriptor())
     source_descriptor["endpoint_id"] = "grant-endpoint-" + uuid4().hex
     source_descriptor["coordinates"]["dataset_schema"] = source_schema
     source_descriptor["native_read_profile"] = profile.document()
-    source_descriptor["database_oid"] = await fixture.connection.fetchval(
-        "SELECT oid::bigint FROM pg_database WHERE datname=current_database()"
-    )
+    source_descriptor["tables"] = {
+        "header": {"schema": source_schema, "name": "provider_directory_endpoint_dataset"},
+        "resource": {"schema": source_schema, "name": "dataset_resources"},
+    }
     selected = snapshot(grant, (source_descriptor,))
     selected["schema_name"] = fixture.target.schema_name
     # Compact metadata custody and Source whole-family validation each have independent native coverage.
@@ -80,7 +82,6 @@ async def _current_head(fixture, reader, descriptors, *, lock):
     assert lock is True and descriptors == (fixture.source_descriptor,)
     assert await reader.fetchval("SHOW transaction_isolation") == "repeatable read"
     assert await reader.fetchval("SHOW transaction_read_only") == "on"
-    await require_fhir_catalog_source_publication_fence(reader, descriptors)
     return await reader.fetchval(f'SELECT head FROM "{fixture.source_schema}".source_state')
 
 
@@ -167,23 +168,15 @@ async def test_reader_snapshot_and_native_locks_close_after_cancellation(grant_r
 
 
 @pytest.mark.asyncio
-async def test_inherited_reader_accepts_select_and_rejects_owner_path(grant_reader):
+async def test_inherited_reader_selects_without_write_access(grant_reader):
     fixture = grant_reader
     await fixture.native.connection.execute(
         f'GRANT "{fixture.native.roles["reader"]}" TO "{fixture.native.roles["loader"]}"'
     )
-    await grants._reader_identity(fixture.native.loader, fixture.native.connection, (fixture.source_descriptor,))
-    changed_descriptor_by_field = {
-        **fixture.source_descriptor,
-        "database_oid": fixture.source_descriptor["database_oid"] + 1,
-    }
-    with pytest.raises(grants.FHIRCatalogGrantError, match="database_changed"):
-        await grants._reader_identity(fixture.native.loader, fixture.native.connection, (changed_descriptor_by_field,))
-    await fixture.native.connection.execute(
-        f'GRANT "{fixture.native.roles["owner"]}" TO "{fixture.native.roles["reader"]}" WITH INHERIT FALSE,SET TRUE'
-    )
-    with pytest.raises(grants.FHIRCatalogGrantError, match="reader_role_unsafe"):
-        await grants._reader_identity(fixture.native.reader, fixture.native.connection, (fixture.source_descriptor,))
+    for reader in (fixture.native.loader, fixture.native.reader):
+        assert await reader.fetchval(f'SELECT head FROM "{fixture.source_schema}".source_state') == "old"
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await reader.execute(f"UPDATE \"{fixture.source_schema}\".source_state SET head='unapproved'")
 
 
 @pytest.mark.asyncio
@@ -193,21 +186,6 @@ async def test_real_closed_empty_snapshot_authority_and_no_source_reader_require
     prepared_by_field = {**expected_snapshot(fixture), "standing_grant_sha256": grant.sha256}
     prepared_by_field["metadata_generation"] = metadata_generation(prepared_by_field)
     sealed = await freeze_metadata(fixture, snapshot=prepared_by_field)
-    namespace = '"' + fixture.control_schema + '"'
-    for statement in table_sql(namespace, "registry_fhir_catalog_snapshot"):
-        await fixture.connection.execute(statement)
-    fields = tuple(field for field in sealed if field != "published_at")
-    values = tuple(canonical_json(sealed[field]) if field.endswith("_json") else sealed[field] for field in fields)
-    await fixture.connection.execute(
-        f"INSERT INTO {namespace}.registry_fhir_catalog_snapshot ("
-        + ",".join(fields)
-        + ") VALUES("
-        + ",".join(
-            f"${index + 1}" + ("::jsonb" if field.endswith("_json") else "") for index, field in enumerate(fields)
-        )
-        + ")",
-        *values,
-    )
     runtime = grants.build_fhir_catalog_publication_runtime(grant, None)
     async with runtime.source_fence(snapshot=sealed, connection=fixture.connection):
         async with fixture.connection.transaction(readonly=True):

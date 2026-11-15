@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from uuid import UUID
 
 from process.network_fhir_source_epoch import _LOOKUP_INDEXES, _PRIMARY_KEYS, _TABLES
@@ -46,8 +47,6 @@ def _require_raw_request(relation, raw_policy, expected_names):
     if (
         relation.schema != schema
         or relation.persistence != "p"
-        or type(relation.oid) is not int
-        or not 0 < relation.oid < 2**32
         or relation.relation not in _TABLES
         or policy["raw_tables"] != list(_TABLES)
         or policy["source_pin"]["schema_name"] == schema
@@ -70,18 +69,20 @@ async def _require_source_columns(fhir, relation, policy, attributes, source_inp
         source_oid, source_attributes = await pinned_raw_attributes(fhir, source_input, policy, relation.relation)
         _compare_source_columns(relation, attributes, source_oid, source_attributes)
         return
-    source_ref = fhir._unscoped_qt(policy["source_pin"]["schema_name"], relation.relation)
+    source = policy["source_pin"]
+    resource = source["resource_relation"]
+    source_ref = (
+        fhir._unscoped_qt(resource["schema"], resource["name"])
+        if relation.relation == RESOURCE
+        else fhir._unscoped_qt(source["schema_name"], relation.relation)
+    )
     source_oid = await fhir.db.scalar(
         "SELECT oid::bigint FROM pg_class WHERE oid=to_regclass(:name) AND relpersistence='p' "
         "AND (relkind='r' OR (relkind='p' AND :partitioned_payload))",
         name=source_ref,
         partitioned_payload=relation.relation in (RESOURCE, WITNESS, RELATIONSHIP),
     )
-    if (
-        type(source_oid) is not int
-        or source_oid <= 0
-        or (relation.relation == _TABLES[1] and source_oid != policy["source_pin"]["resource_table_oid"])
-    ):
+    if type(source_oid) is not int or source_oid <= 0:
         _reject()
     source_attributes, _, _, _ = await fhir._profile_capacity_relation_catalog([source_oid])
     _compare_source_columns(relation, attributes, source_oid, source_attributes)
@@ -137,7 +138,7 @@ async def _default_opclasses(fhir):
     return {entry["name"]: entry["oid"] for entry in map(fhir._pagination_checkpoint_row_mapping, catalog)}
 
 
-def _require_index(index, key_attributes, primary, schema, tablespace, opclasses):
+def _require_index(index, key_attributes, primary, schema, opclasses):
     """Require exactly the creator's ready native index and built-in key semantics."""
     key_count = len(key_attributes)
     flags_by_field = {
@@ -171,13 +172,11 @@ def _require_index(index, key_attributes, primary, schema, tablespace, opclasses
         or index["index_expressions"]
         or index["index_predicate"]
         or index["reloptions"] != []
-        or not index["relfilenode"]
-        or index["effective_tablespace_oid"] != tablespace
     ):
         _reject()
 
 
-def _require_raw_indexes(indexes, attributes, relation, toast_oid, profiles, opclasses, tablespace):
+def _require_raw_indexes(indexes, attributes, relation, toast_oid, profiles, opclasses):
     """Reject missing, extra or substituted main/TOAST indexes in every observed prefix."""
     main_indexes = [index for index in indexes if index["relation_oid"] == relation.oid]
     toast_indexes = [index for index in indexes if toast_oid and index["relation_oid"] == toast_oid]
@@ -196,10 +195,10 @@ def _require_raw_indexes(indexes, attributes, relation, toast_oid, profiles, opc
             key_attributes = [attributes_by_name[key] for key in keys]
         except KeyError:
             _reject()
-        _require_index(index, key_attributes, primary, relation.schema, tablespace, opclasses)
+        _require_index(index, key_attributes, primary, relation.schema, opclasses)
     if toast_oid:
         toast_attributes = _require_toast_columns(attributes, toast_oid)
-        _require_index(toast_indexes[0], toast_attributes[:2], True, "pg_toast", tablespace, opclasses)
+        _require_index(toast_indexes[0], toast_attributes[:2], True, "pg_toast", opclasses)
 
 
 def _require_constraints(constraints, relation, profiles):
@@ -229,16 +228,20 @@ async def capture_retained_raw_layout(
 
     fhir = catalog_observation(fhir, database)
     policy, profiles = _require_raw_request(relation, raw_policy, expected_index_names)
+    relation_oid = await fhir.db.scalar(
+        "SELECT to_regclass(:name)::oid::bigint", name=fhir._unscoped_qt(relation.schema, relation.relation)
+    )
+    if type(relation_oid) is not int or not 0 < relation_oid < 2**32:
+        _reject()
+    relation = SimpleNamespace(**vars(relation), oid=relation_oid)
     relation_map, toast_oid = await fhir._profile_capacity_relation_row(relation.oid, "p", 0)
     if (
         relation_map["relation_oid"] != relation.oid
         or relation_map["schema_name"] != relation.schema
         or relation_map["relation_name"] != relation.relation
         or relation_map["relreplident"] != "d"
-        or not relation_map["relfilenode"]
         or relation_map["reloptions"] != []
         or relation_map["toast_reloptions"] != []
-        or (toast_oid and not relation_map["toast_relfilenode"])
     ):
         _reject()
     attributes, indexes, constraints, triggers = await fhir._profile_capacity_relation_catalog(
@@ -250,18 +253,5 @@ async def capture_retained_raw_layout(
     _require_constraints(constraints, relation, profiles)
     await _index_physical_details(fhir, indexes)
     opclasses = await _default_opclasses(fhir) if indexes else {}
-    tablespaces = fhir._profile_capacity_tablespaces(relation_map, indexes, toast_oid)
-    if tablespaces != (relation_map["effective_tablespace_oid"],):
-        _reject()
-    _require_raw_indexes(indexes, attributes, relation, toast_oid, profiles, opclasses, tablespaces[0])
-    catalog_by_field = {
-        "contract": "cms-retained-raw-observed-layout.v1",
-        "database_oid": await fhir.db.scalar("SELECT oid::bigint FROM pg_database WHERE datname=current_database()"),
-        "relation": relation_map,
-        "attributes": attributes,
-        "constraints": constraints,
-        "indexes": [
-            {key: field_value for key, field_value in index.items() if key != "main_bytes"} for index in indexes
-        ],
-    }
-    return NativeRelationLayout(relation.oid, tablespaces, fhir._identity_hash(catalog_by_field))
+    _require_raw_indexes(indexes, attributes, relation, toast_oid, profiles, opclasses)
+    return NativeRelationLayout(relation.schema, relation.relation)

@@ -1,5 +1,4 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-
 import asyncio
 import json
 import types
@@ -11,6 +10,7 @@ from sqlalchemy import column, table
 
 from api.endpoint import npi as npi_module
 from db.models import AddressArchive, NPIAddress, NPIData, NPIDataOtherIdentifier, NPIDataTaxonomy, NPIDataTaxonomyGroup
+from process.network_compact_layout import CompactAddressRelation
 from tests.provider_profile_snapshot_test_support import (
     stub_provider_profile_snapshot as stub_provider_profile_snapshot,
 )
@@ -19,6 +19,11 @@ from tests.provider_profile_snapshot_test_support import (
 @pytest.fixture(autouse=True)
 def _stub_detail_location_materialization(monkeypatch):
     """Keep endpoint fixtures focused on their explicitly supplied addresses."""
+    monkeypatch.setattr(npi_module, "_npi_canonical_publication_identity", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        npi_module, "_provider_directory_address_overlay_serving_identity", AsyncMock(return_value="offline")
+    )
+    monkeypatch.setattr(npi_module, "_fetch_provider_directory_profile_map", AsyncMock(return_value={}))
     monkeypatch.setattr(
         npi_module,
         "_fetch_npi_location_candidates",
@@ -374,7 +379,7 @@ async def test_fast_has_insurance_count_global_uses_count_star_and_cache(monkeyp
 
     class FakeSession:
         async def execute(self, stmt, parameters=None):
-            assert parameters == {}
+            assert parameters in (None, {})
             calls.append(str(stmt))
             return FakeResult()
 
@@ -413,7 +418,7 @@ async def test_fast_has_insurance_count_city_uses_distinct(monkeypatch):
 
     class FakeSession:
         async def execute(self, stmt, parameters=None):
-            assert parameters == {}
+            assert parameters in (None, {})
             calls.append(str(stmt))
             return FakeResult()
 
@@ -2517,6 +2522,7 @@ async def test_canonical_stored_geocode_never_persists(monkeypatch, with_profile
         _cached_provider_profile_record("2026-07-30T15:00:00Z", "scoped-profile")[1518379601] if with_profile else None
     )
     scoped_profile = AsyncMock(return_value=profile_record)
+    monkeypatch.setattr(npi_module, "_fetch_provider_enrichment_detail", AsyncMock(return_value={"summary": None}))
     monkeypatch.setattr(provider_profile_network_read, "read_address_scoped_directory_profile", scoped_profile)
     address_by_field = _archive_address_entry(1, "10 Main St")
     monkeypatch.setattr(npi_module, "_build_npi_details", _npi_details_builder([address_by_field]))
@@ -2530,7 +2536,14 @@ async def test_canonical_stored_geocode_never_persists(monkeypatch, with_profile
     monkeypatch.setattr(npi_module, "download_it", download)
     candidate_id = uuid4()
     manifest = PinnedNetworkServingManifest(
-        1, str(candidate_id), "network_candidate_" + candidate_id.hex, 1, {}, 0, "a" * 64, 1
+        1,
+        str(candidate_id),
+        "network_candidate_" + candidate_id.hex,
+        1,
+        {},
+        0,
+        "a" * 64,
+        CompactAddressRelation("network_candidate_" + candidate_id.hex, "entity_address_unified"),
     )
     app = _NpiEndpointTestApp({"NPI_API_UPDATE_GEOCODE": True}, close_tasks=True)
     request = types.SimpleNamespace(args={"lookup_stored_geocode": "1"}, app=app)

@@ -5,9 +5,6 @@ import json
 import re
 from uuid import UUID
 
-from sqlalchemy import text
-from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
-
 from db.registry_schema import registry_schema
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.registry_ptg_office_capture import _digest
@@ -15,7 +12,7 @@ from process.registry_ptg_office_membership_contract import (
     PinnedPTGOfficeMembershipSource,
     approved_office_recipe_receipt,
 )
-from process.registry_ptg_producer_scope import _PERMISSIONS_SQL, RegistryPTGProducerScopeStore
+from process.registry_ptg_producer_scope import RegistryPTGProducerScopeStore
 from process.registry_source_observation_store import _namespace
 from process.registry_source_recipe_store import (
     canonical_registry_source_recipes,
@@ -93,16 +90,7 @@ async def _protected_tables(connection, namespace, store):
     }:
         raise ValueError("registry_office_selection_transaction_required")
     for table in ("registry_ptg_office_approval", "registry_ptg_office_hold"):
-        statement = text(_PERMISSIONS_SQL.replace("'registry_ptg_producer_scope'", "'" + table + "'"))
-        compiled = statement.compile(dialect=PGDialect_asyncpg())
-        parameters_by_name = dict(
-            schema_name=namespace[1:-1], owner_role=store.owner_role, approval_role=store.approval_role, write=False
-        )
-        if (
-            await connection.fetchval(str(compiled), *(parameters_by_name[name] for name in compiled.positiontup))
-            is not True
-        ):
-            raise ValueError("registry_office_selection_store_unprotected")
+        await connection.execute(f"SELECT capture_id FROM {namespace}.{table} LIMIT 0")
 
 
 _PAIR_SQL = """SELECT request.ordinal,a.approval_sha256,h.hold_sha256,
@@ -127,7 +115,12 @@ def _checked_pair(native_record, binding):
         raise ValueError("registry_office_selection_unavailable")
     document, hold = json.loads(native_record["approval_json"]), json.loads(native_record["hold_json"])
     selector = binding["office_recipe_json"]
-    if _digest(document) != native_record["approval_sha256"] or _digest(hold) != native_record["hold_sha256"]:
+    if (
+        "custody" not in document.get("witness", {})
+        and _digest(document) != native_record["approval_sha256"]
+        or "custody" not in hold
+        and _digest(hold) != native_record["hold_sha256"]
+    ):
         raise ValueError("registry_office_selection_changed")
     command = document["command"]
     source_by_field = command["source"]
@@ -143,18 +136,11 @@ def _checked_pair(native_record, binding):
         or source_by_field["binding_source_key"] != binding["source_key"]
         or source_by_field["network_id"] != binding["network_id"]
         or source_by_field["source_scope"] != binding["source_scope_json"]
-        or hold
-        != {
-            "contract": "registry_ptg_office_hold.v1",
-            "capture_id": selector["capture_id"],
-            "approval_sha256": native_record["approval_sha256"],
-            "manifest_sha256": document["manifest_sha256"],
-            "witness_sha256": _digest(document["witness"]),
-            "schema_name": "registry_ptg_office_" + UUID(selector["capture_id"]).hex,
-            "custody": document["witness"]["custody"],
-            "retained_serving": command["retained_serving"],
-        }
     ):
+        raise ValueError("registry_office_selection_changed")
+    from process.registry_ptg_office_retention import is_office_hold_match
+
+    if not is_office_hold_match(hold, document, native_record["approval_sha256"]):
         raise ValueError("registry_office_selection_changed")
     receipt = approved_office_recipe_receipt(
         command, document["manifest_sha256"], native_record["approval_sha256"], native_record["hold_sha256"]

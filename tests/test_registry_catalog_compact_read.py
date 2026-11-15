@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Compact catalog SQL/guard wiring; native office and custom-row parity remain separate proof."""
+"""Compact catalog SQL keeps named layouts, bounded decoders and native access refusals."""
 
 import asyncio
 import re
@@ -10,11 +10,10 @@ from uuid import UUID
 import asyncpg
 import pytest
 
-from api.network_compact_address import compact_address_native_sql, compact_address_read_relations
+from api.network_compact_address import compact_address_native_sql
 from process import registry_fhir_catalog_read as fhir
 from process import registry_network_catalog_read as catalog
 from process.network_compact_layout import CompactAddressRelation, CompactEdgeArtifact, CompactNetworkLayout
-from process.network_read_identity import NetworkReadIdentityError
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 from tests.test_registry_fhir_catalog_read import COMPANY, GROUP
@@ -27,32 +26,21 @@ from tests.test_registry_network_catalog_read import (
     source_coordinates,
 )
 
-SURFACES = ("list", "detail", "legacy", "legacy-batch")
-_PID = 77
+SURFACES = ("fhir-list", "fhir-detail", "list", "detail", "legacy", "legacy-batch")
 
 
 def _compact(manifest):
     artifacts = tuple(
-        CompactEdgeArtifact(str(UUID(int=index)), "network_candidate_" + UUID(int=index).hex, 300 + index)
-        for index in (2, 3)
+        CompactEdgeArtifact(str(UUID(int=index)), "network_candidate_" + UUID(int=index).hex) for index in (2, 3)
     )
     layout = CompactNetworkLayout(
-        CompactAddressRelation(manifest.schema_name, "network_slice_ref", 103),
-        CompactAddressRelation("synthetic_base", "entity_address_unified", 201),
+        CompactAddressRelation(manifest.schema_name, "network_slice_ref"),
+        CompactAddressRelation("synthetic_base", "entity_address_unified"),
         artifacts,
-        CompactAddressRelation("synthetic_custom", "entity_address_unified", 202),
-    )
-    pins = tuple(
-        CompactAddressRelation(manifest.schema_name, name, oid)
-        for name, oid in (
-            ("network_membership", 101),
-            ("provider_location_binding", 102),
-            ("network_source_contribution", 999),
-        )
+        CompactAddressRelation("synthetic_custom", "entity_address_unified"),
     )
     object.__setattr__(manifest, "_compact_layout", layout)
-    object.__setattr__(manifest, "_candidate_relation_pins", pins)
-    object.__setattr__(manifest, "_custody_seal_sha256", "c" * 64)
+    object.__setattr__(manifest, "address_relation", manifest.compact_layout.base)
     return manifest
 
 
@@ -61,7 +49,14 @@ def _boundary(request, surface, *, empty=False):
         connection, original, snapshot = request.getfixturevalue("page_boundary")
         manifest = _compact(
             PinnedNetworkServingManifest(
-                9, str(UUID(int=1)), original.schema_name, 1, {}, 4, original.manifest_sha256, 123
+                9,
+                str(UUID(int=1)),
+                original.schema_name,
+                1,
+                {},
+                4,
+                original.manifest_sha256,
+                CompactAddressRelation(original.schema_name, "entity_address_unified"),
             )
         )
         fhir.read_published_api_pin.return_value = (manifest, None, None)
@@ -106,34 +101,22 @@ def _guarded_page(monkeypatch, connection, manifest, *, failure=None):
 
     class Receipt(dict):
         def __getitem__(self, key):
-            assert failure is None and events[-1] == "verify"
+            assert failure is None and events[-1] == "query"
             return super().__getitem__(key)
 
     async def fetchrow(sql, *parameters):
-        entry = await original(sql, *parameters)
         if " AS rows_json" in sql:
-            assert events == ["pid"]
+            assert events == []
+            assert manifest.schema_name in sql and "network_membership" in sql
             events.append("query")
-            return Receipt(entry)
-        return entry
+            if failure is not None:
+                raise failure
+            return Receipt(await original(sql, *parameters))
+        return await original(sql, *parameters)
 
-    async def verify(actual, relations, *, expected_backend_pid):
-        assert actual is connection and expected_backend_pid == _PID
-        assert events == ["pid", "query"]
-        assert relations == manifest.candidate_relation_pins[:2] + compact_address_read_relations(
-            manifest.compact_layout
-        )
-        events.append("verify")
-        if failure is not None:
-            raise failure
-
-    monkeypatch.setattr(
-        connection, "get_server_pid", Mock(side_effect=lambda: events.append("pid") or _PID), raising=False
-    )
-    monkeypatch.setattr(connection, "fetchrow", AsyncMock(side_effect=fetchrow))
-    guard = AsyncMock(side_effect=verify)
-    monkeypatch.setattr(catalog, "verify_consumed_network_relations", guard)
-    return events, guard
+    query = AsyncMock(side_effect=fetchrow)
+    monkeypatch.setattr(connection, "fetchrow", query)
+    return events, query
 
 
 def _directory_shape(sql, manifest):
@@ -161,13 +144,14 @@ def _directory_shape(sql, manifest):
 def test_shared_relation_reuses_typed_layout_and_exact_consumed_pins(batch_boundary, first):
     _, manifest, _ = batch_boundary
     _compact(manifest)
-    sql, parameters, relations = catalog.catalog_directory_relation(manifest, first_parameter=first)
+    sql, parameters = catalog.catalog_directory_relation(manifest, first_parameter=first)
     expected = compact_address_native_sql(manifest.compact_layout, first_parameter=first, visible_membership_sql="TRUE")
     assert (sql, parameters) == expected
     assert parameters == tuple(artifact.candidate_id for artifact in manifest.compact_layout.artifacts)
     assert {int(number) for number in re.findall(r"\$(\d+)", sql)} == {first, first + 1}
-    assert relations == manifest.candidate_relation_pins[:2] + compact_address_read_relations(manifest.compact_layout)
-    assert {pin.table_oid for pin in relations} == {101, 102, 103, 201, 202, 302, 303}
+    assert all(
+        relation.schema_name in sql for relation in (manifest.compact_layout.base, manifest.compact_layout.custom)
+    )
     assert "ANY(" not in sql and " OR (TRUE)" in sql
     assert sql.count("edge.location_key=office.location_key") == 2
     assert "custom.location_key=base.location_key" in sql
@@ -178,9 +162,9 @@ def test_fhir_statement_appends_artifacts_after_its_nineteen_existing_binds(page
     _, _, snapshot = page_boundary
     _, manifest, _ = batch_boundary
     _compact(manifest)
-    sql, parameters, relations = fhir._catalog_page_statement(snapshot, manifest)
-    addresses, expected, pins = catalog.catalog_directory_relation(manifest, first_parameter=20)
-    assert parameters == expected and relations == pins
+    sql, parameters = fhir._catalog_page_statement(snapshot, manifest)
+    addresses, expected = catalog.catalog_directory_relation(manifest, first_parameter=20)
+    assert parameters == expected
     assert "JOIN " + addresses + " address" in sql
     assert "$20" in sql and "$21" in sql
     _directory_shape(sql, manifest)
@@ -252,30 +236,33 @@ async def test_fhir_filters_and_exclusions_keep_their_original_positions(request
     "damage", ["missing_membership", "missing_binding", "duplicate", "schema", "table", "type", "list", "layout"]
 )
 def test_compact_relation_refuses_missing_or_untyped_native_inputs(batch_boundary, damage):
+    """Typed named layout construction rejects missing, unsafe or duplicated relations."""
     _, manifest, _ = batch_boundary
     _compact(manifest)
-    pins = manifest.candidate_relation_pins
-    if damage.startswith("missing"):
-        removed_name = "network_membership" if damage == "missing_membership" else "provider_location_binding"
-        pins = tuple(pin for pin in pins if pin.table_name != removed_name)
-    if damage == "duplicate":
-        pins += (pins[0],)
-    if damage in {"schema", "table"}:
-        changed = replace(
-            pins[0], **({"schema_name": "other_candidate"} if damage == "schema" else {"table_name": "other_table"})
-        )
-        pins = (changed, *pins[1:])
-    if damage == "type":
-        pins += (object(),)
-    if damage == "list":
-        pins = list(pins)
+    layout = manifest.compact_layout
     if damage == "layout":
         object.__setattr__(manifest, "_compact_layout", object())
-    object.__setattr__(manifest, "_candidate_relation_pins", pins)
+        with pytest.raises(ValueError):
+            catalog.catalog_directory_relation(manifest, first_parameter=11)
+        with pytest.raises(ValueError):
+            fhir._catalog_page_statement({"schema_name": "sample_metadata"}, manifest)
+        return
     with pytest.raises(ValueError):
-        catalog.catalog_directory_relation(manifest, first_parameter=11)
-    with pytest.raises(ValueError):
-        fhir._catalog_page_statement({"schema_name": "sample_metadata"}, manifest)
+        match damage:
+            case "missing_membership":
+                replace(layout, ref_map=None)
+            case "missing_binding":
+                replace(layout, base=None)
+            case "duplicate":
+                replace(layout, artifacts=(*layout.artifacts, layout.artifacts[0]))
+            case "schema":
+                CompactAddressRelation("invalid.schema", "network_slice_ref")
+            case "table":
+                replace(layout, ref_map=CompactAddressRelation(manifest.schema_name, "other_table"))
+            case "type":
+                replace(layout, base=object())
+            case "list":
+                replace(layout, artifacts=list(layout.artifacts))
 
 
 @pytest.mark.parametrize("surface", SURFACES)
@@ -289,16 +276,15 @@ async def test_public_pages_postverify_before_exposure_even_when_empty(request, 
     else:
         result = await _read(surface, connection)
         assert len(result["items"]) == int(not empty)
-    assert events == ["pid", "query", "verify"]
-    guard.assert_awaited_once()
-    connection.get_server_pid.assert_called_once()
+    assert events == ["query"]
+    assert sum(" AS rows_json" in call.args[0] for call in guard.await_args_list) == 1
 
 
 @pytest.mark.parametrize("surface", SURFACES)
 @pytest.mark.parametrize("cancelled", [False, True])
 async def test_identity_refusal_is_wrapped_and_cancellation_is_preserved(request, monkeypatch, surface, cancelled):
     connection, manifest = _boundary(request, surface, empty=True)
-    failure = asyncio.CancelledError() if cancelled else NetworkReadIdentityError("synthetic identity mismatch")
+    failure = asyncio.CancelledError() if cancelled else asyncpg.InsufficientPrivilegeError("named relation denied")
     events, guard = _guarded_page(monkeypatch, connection, manifest, failure=failure)
     expected = asyncio.CancelledError if cancelled else catalog.RegistryNetworkCatalogError
     with pytest.raises(expected) as error:
@@ -307,8 +293,8 @@ async def test_identity_refusal_is_wrapped_and_cancellation_is_preserved(request
         assert error.value is failure
     else:
         assert error.value.__cause__ is failure
-    assert events == ["pid", "query", "verify"]
-    guard.assert_awaited_once()
+    assert events == ["query"]
+    assert sum(" AS rows_json" in call.args[0] for call in guard.await_args_list) == 1
 
 
 def test_flat_and_unattached_statements_keep_empty_extra_binds_and_relations(batch_boundary, page_boundary):
@@ -317,12 +303,11 @@ def test_flat_and_unattached_statements_keep_empty_extra_binds_and_relations(bat
     assert catalog.catalog_directory_relation(manifest, first_parameter=11) == (
         '"candidate_sample".entity_address_unified',
         (),
-        (),
     )
-    attached, parameters, relations = fhir._catalog_page_statement(snapshot, manifest)
-    assert parameters == relations == () and '"candidate_sample".entity_address_unified' in attached
-    unattached, parameters, relations = fhir._catalog_page_statement(snapshot, None)
-    assert parameters == relations == () and "'directory_available',false" in unattached
+    attached, parameters = fhir._catalog_page_statement(snapshot, manifest)
+    assert parameters == () and '"candidate_sample".entity_address_unified' in attached
+    unattached, parameters = fhir._catalog_page_statement(snapshot, None)
+    assert parameters == () and "'directory_available',false" in unattached
     assert "network_membership" not in unattached and "entity_address_unified" not in unattached
 
 
@@ -335,8 +320,6 @@ async def test_public_flat_and_unattached_reads_add_no_pid_or_compact_check(requ
             connection.fetchrow.return_value = {"total": 0, "rows_json": "[]"}
     else:
         connection, _, _ = request.getfixturevalue("batch_boundary")
-    guard = AsyncMock(side_effect=AssertionError("flat read selected compact guard"))
-    monkeypatch.setattr(catalog, "verify_consumed_network_relations", guard)
     monkeypatch.setattr(
         connection, "get_server_pid", Mock(side_effect=AssertionError("flat read selected PID")), raising=False
     )
@@ -348,7 +331,6 @@ async def test_public_flat_and_unattached_reads_add_no_pid_or_compact_check(requ
     else:
         result = await _read(surface, connection)
         assert result["items"][0]["network_id"] == 7
-    guard.assert_not_awaited()
     connection.get_server_pid.assert_not_called()
 
 
@@ -358,9 +340,6 @@ async def test_fhir_named_query_preserves_native_refusals_and_cancellation(reque
     connection, _ = _boundary(request, surface, empty=True)
     failure = asyncio.CancelledError() if cancelled else asyncpg.InsufficientPrivilegeError("denied")
     connection.fetchrow.side_effect = failure
-    guard = AsyncMock(side_effect=AssertionError("named publication compared historical object IDs"))
-    monkeypatch.setattr(catalog, "verify_consumed_network_relations", guard)
     with pytest.raises(asyncio.CancelledError if cancelled else catalog.RegistryNetworkCatalogError) as error:
         await _read(surface, connection)
     assert error.value is failure if cancelled else error.value.__cause__ is failure
-    guard.assert_not_awaited()

@@ -174,20 +174,17 @@ def _final_control_index_page_bounds(
     )
 
 
-def _control_metadata_projection_per_operation(
+def _final_control_metadata_mutation(
     geometry: ProviderDirectoryProfileCapacityGeometry,
     mutation: ProviderDirectoryProfileMetadataMutationInput,
     *,
     sequence_operation_count: int,
-) -> tuple[int, int]:
-    """Use final projected B-tree depth for repeated data and WAL bounds."""
-
-    if sequence_operation_count < 1:
-        return 0, 0
+) -> ProviderDirectoryProfileMetadataMutationInput:
+    """Use the already funded final B-tree sizes for one mutation sequence."""
     inserted_toast_chunks = (
         mutation.payload_upper_bytes + geometry.postgres_toast_max_chunk_size_bytes - 1
     ) // geometry.postgres_toast_max_chunk_size_bytes
-    conservative_mutation = dataclasses.replace(
+    return dataclasses.replace(
         mutation,
         main_index_pages=_final_control_index_page_bounds(
             mutation.main_index_pages,
@@ -201,9 +198,20 @@ def _control_metadata_projection_per_operation(
             ),
         ),
     )
+
+
+def _control_metadata_projection_per_operation(
+    geometry: ProviderDirectoryProfileCapacityGeometry,
+    mutation: ProviderDirectoryProfileMetadataMutationInput,
+    *,
+    sequence_operation_count: int,
+) -> tuple[int, int]:
+    """Use final projected B-tree depth for repeated data and WAL bounds."""
+    if sequence_operation_count < 1:
+        return 0, 0
     return _metadata_mutation_projection(
         geometry,
-        conservative_mutation,
+        _final_control_metadata_mutation(geometry, mutation, sequence_operation_count=sequence_operation_count),
     )
 
 
@@ -419,15 +427,8 @@ def _row_lock_control_operation(
     )
 
 
-def _control_metadata_mutation_bounds(
-    geometry: ProviderDirectoryProfileCapacityGeometry,
-    plan_input: ProfileControlWalPlanInput,
-) -> tuple[
-    tuple[int, int],
-    tuple[int, int],
-    tuple[int, int],
-    tuple[int, int],
-]:
+def _control_metadata_sequence_counts(plan_input: ProfileControlWalPlanInput) -> tuple[int, int, int]:
+    """Share the exact existing checkpoint, progress and admission mutation counts."""
     checkpoint_sequence_count = _checked_add(
         CONTROL_WAL_CHECKPOINT_INITIAL_INSERT_COUNT,
         plan_input.evidence_batch_count,
@@ -442,6 +443,50 @@ def _control_metadata_mutation_bounds(
         plan_input.evidence_batch_count,
         plan_input.compact_batch_count,
         CONTROL_WAL_IMPORT_RUN_PHASE_START_UPDATE_COUNT,
+    )
+    return checkpoint_sequence_count, import_run_sequence_count, 3
+
+
+def control_relation_index_page_bounds(geometry, plan_input):
+    """Declare only final role sizes covered by the original measured control plan."""
+    checkpoint_count, import_count, consumption_count = _control_metadata_sequence_counts(plan_input)
+    mutations_by_role = {
+        "build_checkpoint": (
+            checkpoint_count,
+            (plan_input.build_checkpoint_insert, plan_input.build_checkpoint_update),
+        ),
+        "import_run": (import_count, (plan_input.import_run_update,)),
+        "capacity_consumption": (consumption_count, (plan_input.capacity_consumption_insert,)),
+    }
+    bounds_by_role = {}
+    for role, (count, mutations) in mutations_by_role.items():
+        relation = geometry.relations[role]
+        role_mutation = dataclasses.replace(
+            mutations[0],
+            main_index_pages=tuple(relation["main_index_pages"]),
+            toast_index_pages=tuple(relation["toast_index_pages"]),
+        )
+        projected = _final_control_metadata_mutation(geometry, role_mutation, sequence_operation_count=count)
+        for mutation in mutations:
+            funded = _final_control_metadata_mutation(geometry, mutation, sequence_operation_count=count)
+            for field in ("main_index_pages", "toast_index_pages"):
+                pages = sorted(getattr(projected, field), reverse=True)
+                limits = sorted(getattr(funded, field), reverse=True)
+                if len(pages) > len(limits) or any(page > limit for page, limit in zip(pages, limits)):
+                    raise _error("control_relation_index_projection_unfunded:" + role)
+        bounds_by_role[role] = {
+            "main_index_pages": list(projected.main_index_pages),
+            "toast_index_pages": list(projected.toast_index_pages),
+        }
+    return bounds_by_role
+
+
+def _control_metadata_mutation_bounds(
+    geometry: ProviderDirectoryProfileCapacityGeometry,
+    plan_input: ProfileControlWalPlanInput,
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]]:
+    checkpoint_sequence_count, import_run_sequence_count, consumption_sequence_count = (
+        _control_metadata_sequence_counts(plan_input)
     )
     checkpoint_insert = _control_metadata_projection_per_operation(
         geometry,
@@ -461,7 +506,7 @@ def _control_metadata_mutation_bounds(
     capacity_consumption_insert = _control_metadata_projection_per_operation(
         geometry,
         plan_input.capacity_consumption_insert,
-        sequence_operation_count=3,
+        sequence_operation_count=consumption_sequence_count,
     )
     return (
         checkpoint_insert,

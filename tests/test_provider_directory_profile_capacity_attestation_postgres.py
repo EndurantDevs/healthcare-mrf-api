@@ -11,30 +11,39 @@ import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy.exc import DBAPIError, OperationalError
-from sqlalchemy.schema import MetaData
+from sqlalchemy.schema import MetaData, Table
 
 from db.connection import Database
 from db.models.system import ProviderDirectoryProfileCapacityLeaseConsumption
 from process import provider_directory_profile_capacity_attestation as lease
+from process.provider_directory_profile_capacity_attestation_contract import (
+    CAPACITY_TABLESPACE_IDENTITY_DOMAIN,
+    CAPACITY_VOLUME_IDENTITY_DOMAIN,
+    _domain_hash,
+)
+from process.provider_directory_profile_capacity_consumption import retained_capacity_consumption_values
+from tests.provider_directory_profile_capacity_v2_migration_support import (
+    capacity_constraint_definition,
+)
+from tests.provider_directory_profile_capacity_v2_migration_support import (
+    load_capacity_v2_migration as _load_capacity_v2_migration,
+)
 from tests.test_provider_directory_profile_capacity_attestation import (
     VALIDATION_TIME,
+    _historical_envelope,
+    _trust,
     _verify,
 )
 from tests.test_provider_directory_profile_capacity_attestation_schema import (
-    _OperationsRecorder,
     _load_migration,
+    _OperationsRecorder,
 )
-from tests.provider_directory_profile_capacity_v2_migration_support import (
-    capacity_constraint_definition,
-    load_capacity_v2_migration as _load_capacity_v2_migration,
-)
+
 
 async def _require_disposable_database(database: Database) -> None:
     try:
-        database_name = str(
-            await database.scalar("SELECT current_database();") or ""
-        )
-    except (OSError, OperationalError):
+        database_name = str(await database.scalar("SELECT current_database();") or "")
+    except OSError, OperationalError:
         pytest.skip("capacity ledger tests need disposable PostgreSQL")
     is_schema_test_enabled = os.getenv(
         "HLTHPRT_PROVIDER_DIRECTORY_PROFILE_ALLOW_SCHEMA_TESTS",
@@ -44,8 +53,8 @@ async def _require_disposable_database(database: Database) -> None:
         pytest.skip("capacity ledger tests need a test database")
 
 
-def _consumption_values() -> dict[str, object]:
-    binding = lease.CapacityLeaseConsumptionBinding(
+def _consumption_binding():
+    return lease.CapacityLeaseConsumptionBinding(
         run_id="run_" + "6" * 32,
         build_id="pdpb_" + "7" * 32,
         executable_plan_hash="88" * 32,
@@ -54,9 +63,12 @@ def _consumption_values() -> dict[str, object]:
         source_context_vector_hash="bb" * 32,
         profile_as_of="2026-07-30",
     )
+
+
+def _consumption_values() -> dict[str, object]:
     return lease.capacity_lease_consumption_values(
         _verify(),
-        binding,
+        _consumption_binding(),
         accepted_at=VALIDATION_TIME,
     )
 
@@ -80,13 +92,8 @@ async def _assert_ledger_refuses_reuse_and_mutation(
     duplicate_reservation_by_field["attestation_id"] = "cd" * 32
     duplicate_reservation_by_field["lease_digest"] = "dc" * 32
     with pytest.raises(DBAPIError):
-        await database.insert(ledger_table).values(
-            **duplicate_reservation_by_field
-        ).status()
-    table_ref = (
-        f'"{schema}".'
-        '"provider_directory_profile_capacity_lease_consumption"'
-    )
+        await database.insert(ledger_table).values(**duplicate_reservation_by_field).status()
+    table_ref = f'"{schema}"."provider_directory_profile_capacity_lease_consumption"'
     for mutation_statement in (
         f"UPDATE {table_ref} SET database_oid = database_oid;",
         f"DELETE FROM {table_ref};",
@@ -94,9 +101,7 @@ async def _assert_ledger_refuses_reuse_and_mutation(
     ):
         with pytest.raises(DBAPIError):
             await database.status(mutation_statement)
-    assert await database.scalar(
-        f"SELECT count(*) FROM {table_ref};"
-    ) == 1
+    assert await database.scalar(f"SELECT count(*) FROM {table_ref};") == 1
 
 
 @pytest.mark.asyncio
@@ -109,19 +114,12 @@ async def test_capacity_consumption_is_one_time_and_immutable_in_postgres():
         await _require_disposable_database(database)
         await database.status(f'CREATE SCHEMA "{schema}";')
         is_schema_created = True
-        ledger_table = (
-            ProviderDirectoryProfileCapacityLeaseConsumption.__table__
-            .to_metadata(MetaData(), schema=schema)
-        )
+        ledger_table = ProviderDirectoryProfileCapacityLeaseConsumption.__table__.to_metadata(MetaData(), schema=schema)
         await database.create_table(ledger_table)
         await _install_immutable_guards(database, schema)
 
         consumption_by_field = _consumption_values()
-        assert (
-            await database.insert(ledger_table)
-            .values(**consumption_by_field)
-            .status()
-        ) == 1
+        assert (await database.insert(ledger_table).values(**consumption_by_field).status()) == 1
         await _assert_ledger_refuses_reuse_and_mutation(
             database,
             schema,
@@ -130,9 +128,7 @@ async def test_capacity_consumption_is_one_time_and_immutable_in_postgres():
         )
     finally:
         if is_schema_created:
-            await database.status(
-                f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;'
-            )
+            await database.status(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
         await database.disconnect()
 
 
@@ -142,10 +138,9 @@ async def _apply_profile_delta_migration(
     action: str,
 ) -> None:
     """Run one Alembic migration action on the async database engine."""
+
     def run_action(sync_connection) -> None:
-        migration.op = Operations(
-            MigrationContext.configure(sync_connection)
-        )
+        migration.op = Operations(MigrationContext.configure(sync_connection))
         getattr(migration, action)()
 
     assert database.engine is not None
@@ -158,8 +153,9 @@ async def _assert_profile_delta_upgrade_schema(
     schema: str,
 ) -> None:
     """Prove forecast columns, always-enabled guards, and receipt identity."""
-    assert await database.scalar(
-        """
+    assert (
+        await database.scalar(
+            """
         SELECT count(*)
           FROM information_schema.columns
          WHERE table_schema = :schema
@@ -167,10 +163,13 @@ async def _assert_profile_delta_upgrade_schema(
                'provider_directory_profile_build_checkpoint'
            AND column_name LIKE 'cutover_forecast_%';
         """,
-        schema=schema,
-    ) == 3
-    assert await database.scalar(
-        """
+            schema=schema,
+        )
+        == 3
+    )
+    assert (
+        await database.scalar(
+            """
         SELECT count(*) = 4 AND bool_and(trigger_row.tgenabled = 'A')
           FROM pg_trigger AS trigger_row
           JOIN pg_class AS relation ON relation.oid = trigger_row.tgrelid
@@ -179,10 +178,13 @@ async def _assert_profile_delta_upgrade_schema(
          WHERE namespace.nspname = :schema
            AND NOT trigger_row.tgisinternal;
         """,
-        schema=schema,
-    ) is True
-    assert await database.scalar(
-        """
+            schema=schema,
+        )
+        is True
+    )
+    assert (
+        await database.scalar(
+            """
         SELECT count(*) = 1
           FROM pg_constraint AS constraint_row
           JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
@@ -194,8 +196,10 @@ async def _assert_profile_delta_upgrade_schema(
            AND constraint_row.conname =
                'pd_profile_delta_receipt_control_proof_key';
         """,
-        schema=schema,
-    ) is True
+            schema=schema,
+        )
+        is True
+    )
 
 
 async def _assert_checkpoint_geometry_guards(
@@ -203,9 +207,7 @@ async def _assert_checkpoint_geometry_guards(
     checkpoint_ref: str,
 ) -> None:
     """Reject incomplete geometry and forecast triples on checkpoints."""
-    await database.status(
-        f"INSERT INTO {checkpoint_ref} (build_id) VALUES ('checkpoint');"
-    )
+    await database.status(f"INSERT INTO {checkpoint_ref} (build_id) VALUES ('checkpoint');")
     with pytest.raises(DBAPIError):
         await database.status(
             f"""
@@ -331,25 +333,37 @@ async def _assert_profile_delta_downgrade(
         """,
         schema=schema,
     ) == ["build_id"]
-    assert await database.scalar(
-        "SELECT to_regclass(:relation) IS NULL;",
-        relation=(
-            f'"{schema}".'
-            '"provider_directory_profile_delta_receipt"'
-        ),
-    ) is True
+    assert (
+        await database.scalar(
+            "SELECT to_regclass(:relation) IS NULL;",
+            relation=(f'"{schema}"."provider_directory_profile_delta_receipt"'),
+        )
+        is True
+    )
 
 
-def _historical_v1_consumption_values() -> dict[str, object]:
-    values = _consumption_values()
-    values["contract_id"] = (
-        "provider-directory-database-capacity-lease-v1"
+def _historical_consumption_values():
+    """Keep original signed history and opaque old columns for frozen migration DDL."""
+    envelope = _historical_envelope()
+    authenticated = lease.authenticate_historical_capacity_lease(envelope, trust=_trust(), now=VALIDATION_TIME)
+    values = retained_capacity_consumption_values(authenticated, _consumption_binding(), accepted_at=VALIDATION_TIME)
+    original = envelope["lease"]
+    values.update({name: original[name] for name in ("database_system_identifier", "database_oid", "database_name")})
+    values.update(
+        tablespace_identity_hash=_domain_hash(CAPACITY_TABLESPACE_IDENTITY_DOMAIN, original["tablespaces"]),
+        volume_identity_hash=_domain_hash(CAPACITY_VOLUME_IDENTITY_DOMAIN, original["volumes"]),
     )
     return values
 
 
+def _historical_v1_consumption_values() -> dict[str, object]:
+    values = _historical_consumption_values()
+    values["contract_id"] = "provider-directory-database-capacity-lease-v1"
+    return values
+
+
 def _second_v2_consumption_values() -> dict[str, object]:
-    values = _consumption_values()
+    values = _historical_consumption_values()
     values.update(
         {
             "attestation_id": "cd" * 32,
@@ -369,9 +383,7 @@ async def _install_v1_capacity_ledger(
     monkeypatch: pytest.MonkeyPatch,
 ):
     await database.status(
-        f'CREATE TABLE "{schema}".'
-        'provider_directory_profile_build_checkpoint ('
-        'build_id varchar(64) PRIMARY KEY);'
+        f'CREATE TABLE "{schema}".provider_directory_profile_build_checkpoint (build_id varchar(64) PRIMARY KEY);'
     )
     monkeypatch.setenv("DB_SCHEMA", schema)
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
@@ -380,13 +392,13 @@ async def _install_v1_capacity_ledger(
         _load_migration(),
         "upgrade",
     )
-    ledger_table = (
-        ProviderDirectoryProfileCapacityLeaseConsumption.__table__
-        .to_metadata(MetaData(), schema=schema)
-    )
-    await database.insert(ledger_table).values(
-        **_historical_v1_consumption_values()
-    ).status()
+    async with database.engine.connect() as connection:
+        ledger_table = await connection.run_sync(
+            lambda sync: Table(
+                "provider_directory_profile_capacity_lease_consumption", MetaData(), schema=schema, autoload_with=sync
+            )
+        )
+    await database.insert(ledger_table).values(**_historical_v1_consumption_values()).status()
     return ledger_table
 
 
@@ -407,25 +419,28 @@ async def test_capacity_v2_migration_preserves_v1_history_and_downgrades(
             schema,
             monkeypatch,
         )
+        original_values_by_field = dict((await database.first(ledger_table.select()))._mapping)
         migration = _load_capacity_v2_migration()
         await _apply_profile_delta_migration(database, migration, "upgrade")
         definition = await capacity_constraint_definition(database, schema)
         assert "capacity-lease-v1" in definition
         assert "capacity-lease-v2" in definition
-        assert await database.scalar(
-            f'SELECT count(*) FROM "{schema}".'
-            'provider_directory_profile_capacity_lease_consumption '
-            "WHERE contract_id LIKE '%-v1';"
-        ) == 1
+        assert (
+            await database.scalar(
+                f'SELECT count(*) FROM "{schema}".'
+                "provider_directory_profile_capacity_lease_consumption "
+                "WHERE contract_id LIKE '%-v1';"
+            )
+            == 1
+        )
 
         await _apply_profile_delta_migration(database, migration, "downgrade")
         definition = await capacity_constraint_definition(database, schema)
         assert "capacity-lease-v1" in definition
         assert "capacity-lease-v2" not in definition
+        assert dict((await database.first(ledger_table.select()))._mapping) == original_values_by_field
         await _apply_profile_delta_migration(database, migration, "upgrade")
-        await database.insert(ledger_table).values(
-            **_second_v2_consumption_values()
-        ).status()
+        await database.insert(ledger_table).values(**_second_v2_consumption_values()).status()
         with pytest.raises(DBAPIError, match="v2_history_exists"):
             await _apply_profile_delta_migration(
                 database,
@@ -438,9 +453,7 @@ async def test_capacity_v2_migration_preserves_v1_history_and_downgrades(
         )
     finally:
         if is_schema_created:
-            await database.status(
-                f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;'
-            )
+            await database.status(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
         await database.disconnect()
 
 
@@ -458,19 +471,14 @@ async def test_profile_delta_migration_upgrades_and_downgrades_postgres(
         await database.status(f'CREATE SCHEMA "{schema}";')
         is_schema_created = True
         await database.status(
-            f'CREATE TABLE "{schema}".'
-            'provider_directory_profile_build_checkpoint ('
-            'build_id varchar(64) PRIMARY KEY);'
+            f'CREATE TABLE "{schema}".provider_directory_profile_build_checkpoint (build_id varchar(64) PRIMARY KEY);'
         )
         monkeypatch.setenv("DB_SCHEMA", schema)
         monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
         migration = _load_migration()
         await _apply_profile_delta_migration(database, migration, "upgrade")
         await _assert_profile_delta_upgrade_schema(database, schema)
-        checkpoint_ref = (
-            f'"{schema}".'
-            '"provider_directory_profile_build_checkpoint"'
-        )
+        checkpoint_ref = f'"{schema}"."provider_directory_profile_build_checkpoint"'
         await _assert_checkpoint_geometry_guards(database, checkpoint_ref)
         await _assert_serving_geometry_guard(
             database,
@@ -484,7 +492,5 @@ async def test_profile_delta_migration_upgrades_and_downgrades_postgres(
         await _assert_profile_delta_downgrade(database, schema)
     finally:
         if is_schema_created:
-            await database.status(
-                f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;'
-            )
+            await database.status(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
         await database.disconnect()

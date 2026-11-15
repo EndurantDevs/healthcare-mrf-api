@@ -32,19 +32,34 @@ async def _bound(_session):
     ],
 )
 async def test_ordinary_or_assumed_caller_cannot_supply_its_own_authentication(row):
+    session = _session(row)
+    session.in_transaction = lambda: False
     authenticate = AsyncMock()
-    with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="publisher is unavailable"):
+    with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="caller transaction"):
         await preparation.validate_entity_address_archive_preparation(
-            _session(row),
-            stored={},
-            preparation={},
-            authenticate_preparation=authenticate,
+            session, stored={}, preparation={}, authenticate_preparation=authenticate
         )
     authenticate.assert_not_awaited()
 
 
-def _proof():
-    return {"inventory_sha256": "a" * 64, "frozen_owner_oid": 31, "builder_oid": 32}
+def _proof(owner=None):
+    from tests.test_entity_address_preparation_catalog import _inventory
+
+    proof_by_field = _inventory()[1]
+    if owner is not None:
+        inventory_by_field = {
+            "schema_name": owner.schema_name,
+            "relations": [{"table_name": name} for name in owner.relation_names],
+            "sequences": [
+                {
+                    "sequence_name": preparation._EVIDENCE_SEQUENCE,
+                    "owner_table": "entity_address_evidence",
+                    "owner_column": "evidence_id",
+                }
+            ],
+        }
+        proof_by_field.update(inventory=inventory_by_field, inventory_sha256=preparation._digest(inventory_by_field))
+    return proof_by_field
 
 
 def _selected():
@@ -70,13 +85,13 @@ def test_selected_input_seal_rejects_changed_map_or_missing_independent_evidence
     preparation._require_selected_inputs_seal(prepared_by_field, seal_by_field)
     match change:
         case "map_oid":
-            selected["dependency_bindings"]["mrf.npi_address"]["relation_oid"] += 100
+            selected["dependency_bindings"]["mrf.npi_address"]["table_name"] += "_changed"
         case "map_filenode":
-            selected["dependency_bindings"]["mrf.npi_address"]["relfilenode"] += 100
+            selected["dependency_bindings"]["mrf.npi_address"]["schema_name"] += "_changed"
         case "map_missing":
             selected["dependency_bindings"].pop("tiger.zcta5")
         case "context_map":
-            prepared_by_field["restored"]["context"]["dependency_bindings"]["tiger.zcta5"]["relation_oid"] += 100
+            prepared_by_field["restored"]["context"]["dependency_bindings"]["tiger.zcta5"]["table_name"] += "_changed"
         case "digest":
             seal_by_field["publisher_selected_inputs_sha256"] = "f" * 64
         case "geo_digest":
@@ -93,14 +108,15 @@ async def test_selected_heap_lock_checks_native_identities_before_projection(mat
     session.scalar.return_value = matches
     if matches:
         selected = await dependencies.lock_publisher_selected_inputs(session, "mrf", _selected())
-        assert selected == _selected()
+        assert selected == dependencies.publisher_selected_input_names("mrf", _selected())
     else:
         with pytest.raises(RuntimeError, match="changed"):
             await dependencies.lock_publisher_selected_inputs(session, "mrf", _selected())
     sql = str(session.execute.await_args.args[0])
     assert sql.endswith(" NOWAIT") and sql.count("ONLY") == 6
     for entry in _example_bindings().values():
-        assert str(entry["relation_oid"]) in str(session.scalar.await_args.args[0])
+        relation = f'"{entry["schema_name"]}"."{entry["table_name"]}"'
+        assert relation in str(session.scalar.await_args.args[0])
 
 
 @pytest.mark.parametrize("changed", [False, True])
@@ -113,7 +129,7 @@ def test_selected_context_rehydration_is_closed_and_keeps_the_original_map(chang
         "publisher_selected_inputs": _selected(),
     }
     if changed:
-        context_by_field["dependency_bindings"]["mrf.npi_address"]["relation_oid"] += 100
+        context_by_field["dependency_bindings"]["mrf.npi_address"]["table_name"] += "_changed"
         with pytest.raises(preparation.destination.restore.EntityAddressSnapshotRestoreError):
             preparation.destination.restore._rehydrated_context(context_by_field, db_schema="mrf")
     else:
@@ -143,25 +159,58 @@ def test_v2_loaded_custody_requires_exact_original_eight_oid_inventory(mutation)
     inventory_by_field = {
         "schema_name": owner.schema_name,
         "schema_oid": owner.schema_oid,
-        "relations": [{"table_name": name, "relation_oid": oid} for name, oid in owner.relation_oids],
+        "relations": [{"table_name": name} for name in owner.relation_names],
+        "sequences": [
+            {
+                "sequence_name": preparation._EVIDENCE_SEQUENCE,
+                "owner_table": "entity_address_evidence",
+                "owner_column": "evidence_id",
+            }
+        ],
     }
     proof_by_field = {
         **_proof(),
-        "state": "frozen",
+        "state": "handed_off",
         "inventory": inventory_by_field,
         "inventory_sha256": preparation._digest(inventory_by_field),
     }
     preparation._require_loaded_inventory(proof_by_field, owner, 31)
     if mutation == "builder_owner":
-        proof_by_field["builder_oid"] = 31
+        proof_by_field["state"] = "loading"
     elif mutation == "schema_oid":
-        inventory_by_field["schema_oid"] += 1
+        inventory_by_field["schema_name"] = "different"
     elif mutation == "missing_auxiliary":
         inventory_by_field["relations"].pop()
     else:
         proof_by_field["inventory_sha256"] = "b" * 64
     with pytest.raises(preparation.EntityAddressSnapshotDestinationError):
         preparation._require_loaded_inventory(proof_by_field, owner, 31)
+
+
+async def test_loaded_preparation_refuses_frozen_input_before_candidate_writes(monkeypatch):
+    """A frozen candidate cannot reenter the mutable producer transform phase."""
+    from tests.test_address_native_transition_refusals import _loaded_inputs
+
+    owner, semantic, aliases, destination_options = _loaded_inputs()
+    session = _session()
+    authenticate = AsyncMock(return_value={**_proof(owner), "state": "frozen"})
+    catalogue = AsyncMock()
+    transforms = AsyncMock()
+    monkeypatch.setattr(preparation, "_protected_catalog", catalogue)
+    monkeypatch.setattr(preparation, "_prepare_loaded_sets", transforms)
+    with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="handed-off operation differs"):
+        await preparation.prepare_loaded_entity_address_archive_destination(
+            session,
+            owner=owner,
+            semantic_receipt=semantic,
+            source_alias_receipt=aliases,
+            destination=destination_options,
+            authenticate_preparation=authenticate,
+        )
+    authenticate.assert_awaited_once_with(session)
+    catalogue.assert_not_awaited()
+    transforms.assert_not_awaited()
+    session.execute.assert_not_awaited()
 
 
 @pytest.mark.parametrize("selected", [None, _selected()])
@@ -180,7 +229,9 @@ async def test_v2_loaded_candidate_completes_all_indexes_before_any_set_validati
 
     monkeypatch.setattr(native, "_remap_base_versions", AsyncMock(return_value=(object(), semantic)))
     monkeypatch.setattr(native.restore, "_reset_restored_evidence_sequence", AsyncMock())
-    monkeypatch.setattr(native.restore, "_move_owned_relations", AsyncMock(return_value=(("main_stage", 7),)))
+    stage_names = native.restore._stage_plan(db_schema="example", import_date="20261005")[2]
+    stage_relations = tuple(sorted(("example", name) for name in stage_names.values()))
+    monkeypatch.setattr(native.restore, "_move_owned_relations", AsyncMock(return_value=stage_relations))
     monkeypatch.setattr(native.restore, "_return_owned_relations", AsyncMock())
     bindings = None if selected is None else selected["dependency_bindings"]
     monkeypatch.setattr(preparation, "_project_loaded_geo", AsyncMock(return_value=(geo, bindings)))
@@ -196,15 +247,16 @@ async def test_v2_loaded_candidate_completes_all_indexes_before_any_set_validati
 
     async def validated(*args, **kwargs):
         events.append("native_set")
-        return SimpleNamespace(context={})
+        return SimpleNamespace(context={}, stage_cls=SimpleNamespace(__tablename__="entity_address_unified_stage"))
 
     monkeypatch.setattr(native.adoption, "prepare_completed_entity_address_snapshot_adoption", validated)
     monkeypatch.setattr(native, "capture_entity_address_stage_integrity_receipt", AsyncMock())
     monkeypatch.setattr(native, "_prepared_restore_receipt", Mock(return_value=object()))
     destination_options_by_field = {"db_schema": "example", "import_date": "20261005"}
     original = deepcopy(destination_options_by_field)
+    session = object()
     await preparation._prepare_loaded_sets(
-        object(),
+        session,
         owner,
         semantic,
         source_alias,
@@ -213,6 +265,7 @@ async def test_v2_loaded_candidate_completes_all_indexes_before_any_set_validati
         selected,
     )
     assert events == ["indexes", "accounting", "alias_set", "native_set"]
+    native.restore._reset_restored_evidence_sequence.assert_awaited_once_with(session, owner)
     assert destination_options_by_field == original
     projected_options = preparation._project_loaded_geo.await_args.args[2]
     assert projected_options.get("dependency_bindings") == bindings
@@ -225,7 +278,8 @@ def test_v2_input_marker_is_closed_and_unchanged(mutation):
     from tests.test_entity_address_archive_ownership_guards import _set_owner
     from tests.test_entity_address_archive_receipt_guards import _set_receipt
 
-    owner, proof = _set_owner(), _proof()
+    owner = _set_owner()
+    proof = _proof(owner)
     semantic = preparation.destination.validate_entity_address_archive_receipt(_set_receipt())
     source_alias = preparation.alias.validate_entity_address_alias_semantic_receipt(
         {
@@ -242,12 +296,13 @@ def test_v2_input_marker_is_closed_and_unchanged(mutation):
     )
     stored_by_field = {"contract": semantic.contract, **marker_by_field}
     prepared_by_field = {
+        "restored": {"db_schema": "example"},
         "source_semantic_receipt": semantic.as_dict(),
         "source_alias_receipt": source_alias.as_dict(),
         "destination_alias_receipt": source_alias.as_dict(),
     }
     seal_by_field = {
-        **_seal(prepared_by_field, proof),
+        **_seal(prepared_by_field, proof, owner),
         "contract": preparation.SET_CONTRACT,
         "input_sha256": preparation._digest(marker_by_field),
     }
@@ -263,19 +318,25 @@ def test_v2_input_marker_is_closed_and_unchanged(mutation):
 
 
 def _stored():
-    return {"restored": {"db_schema": "example"}, "destination_alias_receipt": {"local_generation": 7}}
+    from tests.test_entity_address_preparation_catalog import _inventory
 
-
-def _seal(stored, proof):
+    owner, _ = _inventory()
     return {
-        "contract": preparation.CONTRACT,
+        "restored": {"db_schema": "example", "ownership": owner.as_dict()},
+        "destination_alias_receipt": {"local_generation": 7},
+    }
+
+
+def _seal(stored, proof, owner=None):
+    from tests.test_entity_address_preparation_catalog import _inventory
+
+    if owner is None:
+        owner, _ = _inventory()
+    return {
+        "contract": preparation.NAMED_CONTRACT,
         "stored_sha256": preparation._digest(stored),
-        "inventory_sha256": proof["inventory_sha256"],
-        "protected_owner_oid": proof["frozen_owner_oid"],
-        "builder_oid": proof["builder_oid"],
-        "catalog_sha256": "b" * 64,
+        "inventory": preparation._logical_inventory(proof["inventory"], owner),
         "alias": stored["destination_alias_receipt"],
-        "alias_catalog_sha256": "c" * 64,
     }
 
 
@@ -288,14 +349,17 @@ def _install_native_boundaries(monkeypatch):
 
 
 async def test_deferred_validation_scans_then_returns_the_same_private_candidate(monkeypatch):
-    stored, proof, owner = _stored(), _proof(), object()
+    from tests.test_entity_address_preparation_catalog import _inventory
+
+    stored, proof = _stored(), _proof()
+    owner, _ = _inventory()
     _install_native_boundaries(monkeypatch)
     authenticate = AsyncMock(return_value=(proof, owner))
     monkeypatch.setattr(preparation, "_authenticated_preparation", authenticate)
     scan = AsyncMock()
     return_private = AsyncMock()
     publish = AsyncMock(side_effect=AssertionError("deferred validation must not publish"))
-    monkeypatch.setattr(preparation.destination, "_validated_bound_destination", scan)
+    monkeypatch.setattr(preparation, "_validate_private_candidate_contents", scan)
     monkeypatch.setattr(preparation.destination.restore, "_return_owned_relations", return_private)
     monkeypatch.setattr(preparation.destination.adoption, "adopt_prepared_entity_address_snapshot", publish)
     session, callback = object(), object()
@@ -308,23 +372,33 @@ async def test_deferred_validation_scans_then_returns_the_same_private_candidate
     )
 
     authenticate.assert_awaited_once_with(session, stored, proof, None, callback)
-    scan.assert_awaited_once_with(session, stored=stored)
-    return_private.assert_awaited_once_with(session, owner=owner, db_schema="example", stage_names={})
+    scan.assert_awaited_once_with(session, stored, owner)
+    return_private.assert_not_awaited()
+    preparation._protected_catalog.assert_awaited_once_with(session, proof, owner, read_only=True)
     assert seal == _seal(stored, proof)
     publish.assert_not_awaited()
 
 
 def _install_activation(monkeypatch):
     _install_native_boundaries(monkeypatch)
-    stored, proof, owner = _stored(), _proof(), object()
+    from tests.test_entity_address_preparation_catalog import _inventory
+
+    stored, proof = _stored(), _proof()
+    owner, _ = _inventory()
     monkeypatch.setattr(preparation, "_authenticated_preparation", AsyncMock(return_value=(proof, owner)))
     receive = AsyncMock()
     monkeypatch.setattr(preparation.serving, "require_entity_address_receive_incumbent", receive)
     monkeypatch.setattr(preparation, "_require_alias_fence", AsyncMock())
     monkeypatch.setattr(preparation, "_lock_publication_state", AsyncMock())
-    prepared = SimpleNamespace(context={})
+    prepared = SimpleNamespace(context={}, db_schema="example", stage_cls=SimpleNamespace(__tablename__="stage"))
     monkeypatch.setattr(preparation, "_prepared_adoption", Mock(return_value=prepared))
-    geo = SimpleNamespace(stage_table_oid=17, projected_rows=4)
+    signature_entries = tuple(
+        (name.replace("mrf.", "example.", 1), entry["schema_name"], entry["table_name"])
+        for name, entry in sorted(_example_bindings().items())
+    )
+    geo = preparation.destination.EntityAddressGeoAssurancePreparation(
+        None, 4, signature_entries, stage_relation=("example", "stage")
+    )
     stored["geo_assurance"] = {}
     monkeypatch.setattr(preparation.destination, "_validated_geo_preparation", Mock(return_value=geo))
     monkeypatch.setattr(preparation.destination, "_capture_geo_preparation", AsyncMock(return_value=geo))
@@ -357,7 +431,10 @@ async def test_sealed_cutover_uses_complete_receive_fence_and_never_rescans(monk
     receive.assert_awaited_once_with(session, schema_name="example", expected=expected)
     handback.assert_awaited_once()
     publish.assert_awaited_once_with(prepared, callbacks=callbacks)
-    assert result == {"rows": 4}
+    assert result["rows"] == 4
+    assert result["publication"]["contract"] == "entity-address-table-publication.v3"
+    assert result["publication"]["alias_authority"] is None
+    assert len(result["publication"]["relations"]) == 7
 
 
 @pytest.mark.parametrize("changed", ["stored", "inventory", "owner", "catalog", "incumbent", "geo", "alias"])
@@ -367,11 +444,13 @@ async def test_changed_authority_cannot_reach_ownership_handback_or_publication(
     if changed == "stored":
         stored["substituted"] = True
     if changed == "inventory":
-        proof["inventory_sha256"] = "d" * 64
+        proof["inventory"]["relations"].pop()
     if changed == "owner":
-        proof["builder_oid"] += 1
+        proof["inventory"]["schema_name"] = "different"
     if changed == "catalog":
-        preparation._protected_catalog.return_value = "e" * 64
+        preparation._protected_catalog.side_effect = preparation.EntityAddressSnapshotDestinationError(
+            "candidate layout changed"
+        )
     if changed == "incumbent":
         receive.side_effect = preparation.EntityAddressSnapshotDestinationError("incumbent changed")
     if changed == "geo":
@@ -411,17 +490,21 @@ async def test_late_native_failure_propagates_to_the_callers_transaction(monkeyp
 async def test_private_return_preserves_seven_oids_and_the_evidence_sequence(monkeypatch):
     restore = preparation.destination.restore
     names = sorted(model.__tablename__ for model in restore._models())
-    owner = SimpleNamespace(
-        schema_name="private_archive", relation_oids=tuple((name, i + 100) for i, name in enumerate(names))
-    )
+    owner = SimpleNamespace(schema_name="private_archive", relation_names=tuple(names))
     stage_name_by_table = {name: name + "_candidate" for name in names}
     monkeypatch.setattr(restore, "_require_empty_owned_schema", AsyncMock())
-    monkeypatch.setattr(restore, "_verify_moved_stage_oids", AsyncMock())
+    monkeypatch.setattr(restore, "_verify_moved_stage_relations", AsyncMock())
     monkeypatch.setattr(restore, "verify_entity_address_archive_stage_ownership", AsyncMock())
-    evidence_oid = dict(owner.relation_oids)["entity_address_evidence"]
+    handles_by_stage = {stage: index for index, stage in enumerate(stage_name_by_table.values(), 1)}
+    monkeypatch.setattr(
+        restore,
+        "_local_relation_handle",
+        AsyncMock(side_effect=lambda _session, _schema, table: handles_by_stage[table]),
+    )
+    evidence_handle = handles_by_stage["entity_address_evidence_candidate"]
 
-    async def sequences(_session, oid):
-        return ("entity_address_evidence_candidate_evidence_id_seq",) if oid == evidence_oid else ()
+    async def sequences(_session, handle):
+        return ("entity_address_evidence_candidate_evidence_id_seq",) if handle == evidence_handle else ()
 
     monkeypatch.setattr(restore, "_owned_sequence_names", sequences)
     session = _session()
@@ -476,7 +559,10 @@ async def test_invalid_source_generation_precedes_alias_reads_and_candidate_chan
 @pytest.mark.parametrize("changed", ["generation", "content"])
 async def test_stale_or_altered_provisional_alias_receipt_cannot_be_sealed(monkeypatch, changed):
     _install_native_boundaries(monkeypatch)
-    stored, proof, owner = _stored(), _proof(), object()
+    from tests.test_entity_address_preparation_catalog import _inventory
+
+    stored, proof = _stored(), _proof()
+    owner, _ = _inventory()
     monkeypatch.setattr(preparation, "_authenticated_preparation", AsyncMock(return_value=(proof, owner)))
     expected = preparation.alias.EntityAddressAliasSemanticReceipt(2, 1, 7, 2, "a" * 64)
     current = preparation.alias.EntityAddressAliasSemanticReceipt(
@@ -500,25 +586,102 @@ async def test_stale_or_altered_provisional_alias_receipt_cannot_be_sealed(monke
             preparation=proof,
             authenticate_preparation=object(),
         )
-    assert "provisional" not in binding.await_args.kwargs
+    assert binding.await_args.kwargs["provisional"] is True
     scan.assert_not_awaited()
 
 
 async def test_ordinary_owned_alias_surface_is_not_a_publisher_prerequisite(monkeypatch):
     session = _session()
-    session.execute.return_value.mappings.return_value.all.return_value = [
-        {"relname": name, "relowner": 32} for name in ("address_alias_state_v1", "address_alias_v1")
-    ]
-    monkeypatch.setattr(preparation, "_publisher_authority", AsyncMock(return_value=31))
-    with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="relation authority is unavailable"):
-        await preparation.require_entity_address_archive_publisher(session, db_schema="example")
+    read = AsyncMock(return_value=(2, 1, 7))
+    monkeypatch.setattr(preparation.alias, "_alias_state", read)
+    await preparation.require_entity_address_archive_publisher(session, db_schema="example")
+    read.assert_awaited_once_with(session, "example")
+    session.execute.assert_not_awaited()
 
 
 @pytest.mark.parametrize("sequence", [False, True])
-async def test_effective_ordinary_mutation_is_not_accepted_for_frozen_objects(sequence):
+async def test_effective_ordinary_mutation_is_not_accepted_for_frozen_objects(monkeypatch, sequence):
     session = _session()
-    session.scalar.return_value = True
-    with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="ordinary mutation is available"):
-        await preparation._require_no_untrusted_mutation(session, [17], 31, sequence=sequence)
-    statement = str(session.scalar.await_args.args[0])
-    assert "has_sequence_privilege" in statement if sequence else "has_any_column_privilege" in statement
+    failure = PermissionError("native access denied")
+    monkeypatch.setattr(preparation.alias, "_alias_state", AsyncMock(side_effect=failure))
+    with pytest.raises(PermissionError, match="native access denied"):
+        await preparation.require_entity_address_archive_publisher(session, db_schema="example")
+    session.execute.assert_not_awaited()
+
+
+async def test_loaded_contents_use_complete_existing_codec_and_restore_settings(monkeypatch):
+    """Read all eight candidate relations without leaking normalized session settings."""
+    from process import entity_address_snapshot_receipt as receipts
+    from tests.test_entity_address_archive_ownership_guards import _set_owner
+
+    owner = _set_owner()
+    rollback = AsyncMock()
+
+    @asynccontextmanager
+    async def settings():
+        yield SimpleNamespace(rollback=rollback)
+
+    session = SimpleNamespace(begin_nested=settings)
+    normalize = AsyncMock()
+    rows = AsyncMock(return_value=(1, "a" * 64))
+    monkeypatch.setattr(receipts, "_normalize_receipt_session", normalize)
+    monkeypatch.setattr(receipts, "_row_identity", rows)
+    contents = await preparation._loaded_candidate_contents(session, owner)
+    assert contents == [{"relation_name": name, "rows": 1, "sha256": "a" * 64} for name in owner.relation_names]
+    assert [call.args for call in rows.await_args_list] == [
+        (session, owner.schema_name, name) for name in owner.relation_names
+    ]
+    normalize.assert_awaited_once_with(session, owner.schema_name)
+    rollback.assert_awaited_once_with()
+
+
+@pytest.mark.parametrize("damage", ["missing", "extra", "reordered", "duplicate", "boolean_rows", "bad_digest"])
+def test_loaded_contents_require_complete_typed_commitments(damage):
+    """Shape or type drift cannot substitute a counts-only or incomplete commitment."""
+    from tests.test_entity_address_archive_ownership_guards import _set_owner
+
+    owner = _set_owner()
+    contents = [{"relation_name": name, "rows": 1, "sha256": "a" * 64} for name in owner.relation_names]
+    assert preparation._validated_loaded_contents(contents, owner) == contents
+    match damage:
+        case "missing":
+            contents.pop()
+        case "extra":
+            contents[0]["other"] = "unrecognized"
+        case "reordered":
+            contents.reverse()
+        case "duplicate":
+            contents[-1]["relation_name"] = contents[0]["relation_name"]
+        case "boolean_rows":
+            contents[0]["rows"] = True
+        case "bad_digest":
+            contents[0]["sha256"] = "a" * 63
+    with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="frozen candidate contents differ"):
+        preparation._validated_loaded_contents(contents, owner)
+
+
+def test_typed_named_validation_requires_contents_and_preserves_legacy_raw():
+    """New typed validation cannot borrow a hashless historical envelope."""
+    prepared_by_field = {"contract": preparation.destination.SET_CONTRACT}
+    validation_by_field = {
+        "contract": preparation.NAMED_CONTRACT,
+        "prepared": prepared_by_field,
+        "input_sha256": "a" * 64,
+        "stored_sha256": "b" * 64,
+        "inventory": {},
+        "alias": {},
+    }
+    with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match="validation differs"):
+        preparation._validated_set_prepared(validation_by_field)
+    legacy_by_field = {name: value for name, value in validation_by_field.items() if name != "inventory"}
+    legacy_by_field.update(
+        contract=preparation.SET_CONTRACT,
+        inventory_sha256="c" * 64,
+        protected_owner_oid="opaque former owner",
+        builder_oid="opaque former builder",
+        catalog_sha256="d" * 64,
+        alias_catalog_sha256="e" * 64,
+    )
+    raw = deepcopy(legacy_by_field)
+    assert preparation._validated_set_prepared(legacy_by_field) == prepared_by_field
+    assert legacy_by_field == raw and "contents" not in legacy_by_field

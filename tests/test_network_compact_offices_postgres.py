@@ -40,7 +40,7 @@ async def compact_office_db(slice_db):
         "SELECT to_regclass($1)::oid::bigint", namespace + ".entity_address_unified"
     )
     fixture.offices = CompactOfficeSources(
-        fixture.source, CompactAddressRelation(fixture.target.schema_name, "entity_address_unified", oid)
+        fixture.source, CompactAddressRelation(fixture.target.schema_name, "entity_address_unified")
     )
     yield fixture
 
@@ -77,14 +77,12 @@ async def test_historical_custom_is_excluded_even_without_replacement(compact_of
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["oid", "namespace", "shape", "origin", "collision"])
+@pytest.mark.parametrize("damage", ["namespace", "shape", "origin", "collision"])
 async def test_changed_custom_identity_or_public_collision_refuses_complete_match(compact_office_db, damage):
     fixture = compact_office_db
     custom = fixture.offices.custom
     table = '"' + fixture.target.schema_name + '".entity_address_unified'
-    if damage == "oid":
-        custom = replace(custom, table_oid=custom.table_oid + 1)
-    elif damage == "namespace":
+    if damage == "namespace":
         custom = replace(custom, schema_name=fixture.source_schema)
     elif damage == "shape":
         await fixture.connection.execute(f"ALTER TABLE {table} ADD COLUMN unexpected text")

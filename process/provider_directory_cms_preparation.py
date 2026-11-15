@@ -103,11 +103,10 @@ class NonprofileAdmissionPlan:
 
 @dataclass(frozen=True)
 class OwnedRelation:
-    """Physical relation identity measured before logging or publication."""
+    """Named relation storage measured before logging or publication."""
 
     schema: str
     relation: str
-    oid: int
     total_bytes: int
     persistence: str
 
@@ -118,18 +117,16 @@ class RetainedRawRelation:
 
     schema: str
     relation: str
-    oid: int
     policy_json: str
     index_names: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class RetainedNativeRelation:
-    """Bind an original retained clone to signed custody and immutable native source evidence."""
+    """Bind an original retained clone to signed policy and immutable semantic source layout."""
 
     schema: str
     relation: str
-    oid: int
     policy_json: str
     source_layout: RetainedNativeSourceLayout
     phase: str = "finished"
@@ -183,7 +180,7 @@ class NonprofileAdmission:
     lease: VerifiedDatabaseCapacityLease
     plan: NonprofileAdmissionPlan
     check_phase: Callable[[NonprofileAdmissionCheck], Awaitable[NonprofileAdmissionReceipt]]
-    _relations: dict[tuple[str, str], int] = field(default_factory=dict, init=False)
+    _relations: set[tuple[str, str]] = field(default_factory=set, init=False)
     _logged_relations: set[tuple[str, str]] = field(default_factory=set, init=False)
     _external_relations: set[tuple[str, str]] = field(default_factory=set, init=False)
     _raw_relations: dict[tuple[str, str], RetainedRawRelation] = field(default_factory=dict, init=False)
@@ -204,12 +201,12 @@ class NonprofileAdmission:
     _inventory_task: asyncio.Task | None = field(default=None, init=False, repr=False, compare=False)
 
     def inventory_transition(self):
-        """Serialize short physical inventory transitions with their exact catalog checks."""
+        """Serialize short named inventory transitions with numeric catalog checks."""
         return inventory_transition(self)
 
-    def _record_external_identity(self, schema, name, oid):
-        """Retain the captured identity through uncertain DDL commit acknowledgement."""
-        record_external_identity(self, schema, name, oid)
+    def _record_external_identity(self, schema, name):
+        """Retain the created name through uncertain DDL commit acknowledgement."""
+        record_external_identity(self, schema, name)
 
     def _assert_lease(self) -> None:
         """Require signature-bound geometry and existing storage reservation checks."""
@@ -282,7 +279,7 @@ class NonprofileAdmission:
         self._started = True
 
     async def measure(self, fhir: Any, schema: str, names: tuple[str, ...] = ()) -> tuple[OwnedRelation, ...]:
-        """Measure exact owned names, rejecting OID replacement or disappearance."""
+        """Measure every admitted name, rejecting disappearance or unsupported storage."""
         async with self.inventory_transition():
             from process.provider_directory_cms_nonprofile_observation import active_observations
 
@@ -307,27 +304,25 @@ class NonprofileAdmission:
         self._logged_relations.add((schema, name))
 
     async def register_address_stages(
-        self, fhir: Any, schema: str, stages: tuple[tuple[str, str, int], ...], *, input_hash: str
+        self, fhir: Any, schema: str, stages: tuple[tuple[str, str], ...], *, input_hash: str
     ) -> None:
-        """Account captured native OIDs before logging without taking cleanup ownership."""
+        """Account captured native stage names before logging without taking cleanup ownership."""
         async with self.inventory_transition():
             if (
                 input_hash != self.plan.native_address_input_hash
                 or not input_hash
                 or (
-                    tuple(sorted(target_relation for target_relation, _name, _oid in stages))
+                    tuple(sorted(target_relation for target_relation, _name in stages))
                     != self.plan.native_address_targets
-                    or len({name for _target, name, _oid in stages}) != len(stages)
+                    or len({name for _target, name in stages}) != len(stages)
                 )
             ):
                 raise RuntimeError("provider_directory_nonprofile_address_scope_changed")
-            for _target, name, oid in stages:
-                if type(oid) is not int or oid <= 0 or self._relations.get((schema, name), oid) != oid:
-                    raise RuntimeError("provider_directory_nonprofile_address_identity_invalid")
-                self._relations[(schema, name)] = oid
+            for _target, name in stages:
+                self._relations.add((schema, name))
                 self._external_relations.add((schema, name))
             relations = await self.measure(fhir, schema)
-            stage_names = {name for _target, name, _oid in stages}
+            stage_names = {name for _target, name in stages}
             logging_relations = tuple(
                 (relation.schema, relation.relation)
                 for relation in relations
@@ -342,7 +337,7 @@ class NonprofileAdmission:
                 "pre_logging" if logging_relations else "readiness", relations, logging_relations=logging_relations
             )
 
-    def _record_raw_relation(self, schema: str, name: str, oid: int, raw_relation: RetainedRawRelation | None) -> None:
+    def _record_raw_relation(self, schema: str, name: str, raw_relation: RetainedRawRelation | None) -> None:
         """Keep signed raw annotations separate from ordinary native ownership records."""
         if raw_relation is None:
             if (schema, name) in self._raw_relations:
@@ -351,11 +346,10 @@ class NonprofileAdmission:
         if type(raw_relation) is not RetainedRawRelation or (
             raw_relation.schema,
             raw_relation.relation,
-            raw_relation.oid,
-        ) != (schema, name, oid):
+        ) != (schema, name):
             raise RuntimeError("provider_directory_nonprofile_raw_identity_invalid")
         previous = self._raw_relations.get((schema, name))
-        if previous is not None and (previous.oid != oid or previous.policy_json != raw_relation.policy_json):
+        if previous is not None and (previous.policy_json != raw_relation.policy_json):
             raise RuntimeError("provider_directory_nonprofile_raw_identity_invalid")
         self._raw_relations[(schema, name)] = raw_relation
 
@@ -364,21 +358,18 @@ class NonprofileAdmission:
         fhir: Any,
         schema: str,
         name: str,
-        oid: int,
         *,
         raw_relation: RetainedRawRelation | None = None,
         native_relation: RetainedNativeRelation | None = None,
     ) -> None:
-        """Capture a native CREATE's original OID while native cleanup retains ownership."""
+        """Account a native CREATE's name while native cleanup retains ownership."""
         async with self.inventory_transition():
-            if type(oid) is not int or oid <= 0 or self._relations.get((schema, name), oid) != oid:
-                raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
-            await self._record_native_relation(fhir, schema, name, oid, native_relation, raw_relation)
-            self._record_external_identity(schema, name, oid)
-            self._record_raw_relation(schema, name, oid, raw_relation)
+            await self._record_native_relation(fhir, schema, name, native_relation, raw_relation)
+            self._record_external_identity(schema, name)
+            self._record_raw_relation(schema, name, raw_relation)
             await self._check("readiness", await self.measure(fhir, schema))
 
-    async def _record_native_relation(self, fhir, schema, name, oid, native_relation, raw_relation):
+    async def _record_native_relation(self, fhir, schema, name, native_relation, raw_relation):
         """Enroll strict source evidence once; later checks never consult a renamed source heap."""
         from process.provider_directory_cms_native_layout import _retained_source_model
 
@@ -392,7 +383,7 @@ class NonprofileAdmission:
         policy = retained_raw_policy(self.lease)
         if (
             type(native_relation) is not RetainedNativeRelation
-            or (native_relation.schema, native_relation.relation, native_relation.oid) != (schema, name, oid)
+            or (native_relation.schema, native_relation.relation) != (schema, name)
             or raw_relation is not None
             or coordinate in self._raw_relations
             or native_relation.policy_json != json.dumps(policy, sort_keys=True, separators=(",", ":"))
@@ -404,11 +395,7 @@ class NonprofileAdmission:
             raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
         source_layout = native_relation.source_layout
         model = _retained_source_model(source_layout, self.plan.native_address_targets)
-        if (
-            model.__tablename__ != name
-            or source_layout.database_oid != self.lease.database_oid
-            or source_layout.oid == oid
-        ):
+        if model.__tablename__ != name or (source_layout.schema, source_layout.relation) == coordinate:
             raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
         if previous is not None:
             if previous != native_relation:
@@ -427,8 +414,11 @@ class NonprofileAdmission:
         source_coordinate = (source_layout.schema, source_layout.relation)
         if (
             source_coordinate not in self._external_relations
-            or self._relations.get(source_coordinate) != source_layout.oid
-            or any(entry.source_layout.oid == source_layout.oid for entry in self._native_relations.values())
+            or source_coordinate not in self._relations
+            or any(
+                (entry.source_layout.schema, entry.source_layout.relation) == source_coordinate
+                for entry in self._native_relations.values()
+            )
         ):
             raise RuntimeError("provider_directory_nonprofile_native_identity_invalid")
         await self._require_legacy_native_source(fhir, source_layout, source_coordinate)
@@ -476,7 +466,6 @@ class NonprofileAdmission:
         fhir: Any,
         schema: str,
         name: str,
-        oid: int,
         *,
         raw_relation: RetainedRawRelation | None = None,
         native_relation: RetainedNativeRelation | None = None,
@@ -484,33 +473,33 @@ class NonprofileAdmission:
     ) -> None:
         """Recheck fresh aggregate availability before growth, without inventing its bound."""
         async with self.inventory_transition():
-            if (schema, name) not in self._external_relations or self._relations.get((schema, name)) != oid:
+            if (schema, name) not in self._external_relations or (schema, name) not in self._relations:
                 raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
-            await self._record_native_relation(fhir, schema, name, oid, native_relation, raw_relation)
-            self._record_raw_relation(schema, name, oid, raw_relation)
+            await self._record_native_relation(fhir, schema, name, native_relation, raw_relation)
+            self._record_raw_relation(schema, name, raw_relation)
             if require_ready:
                 await self.assert_ready(fhir, schema)
             else:
                 await self._check("readiness", await self.measure(fhir, schema))
 
-    async def retire_external_relation(self, fhir: Any, schema: str, name: str, oid: int) -> None:
-        """Retire only an exact externally owned OID after native verified removal."""
+    async def retire_external_relation(self, fhir: Any, schema: str, name: str) -> None:
+        """Retire an admitted external name only after native removal."""
         async with self.inventory_transition():
-            if (schema, name) not in self._external_relations or self._relations.get((schema, name)) != oid:
+            if (schema, name) not in self._external_relations or (schema, name) not in self._relations:
                 raise RuntimeError("provider_directory_nonprofile_external_identity_invalid")
             actual_oid = await fhir.db.scalar(
                 "SELECT to_regclass(:relation_ref)::oid::bigint;", relation_ref=fhir._unscoped_qt(schema, name)
             )
             if actual_oid is not None:
                 raise RuntimeError("provider_directory_nonprofile_relation_changed")
-            del self._relations[(schema, name)]
+            self._relations.remove((schema, name))
             self._external_relations.remove((schema, name))
             self._raw_relations.pop((schema, name), None)
             self._native_relations.pop((schema, name), None)
             self._logged_relations.discard((schema, name))
 
-    async def rename_external_relation(self, fhir: Any, schema: str, old_name: str, new_name: str, oid: int) -> None:
-        """Follow a verified rename of the original OID, never a replacement identity."""
+    async def rename_external_relation(self, fhir: Any, schema: str, old_name: str, new_name: str) -> None:
+        """Follow a native rename using only its old and new qualified names."""
         async with self.inventory_transition():
             if (schema, old_name) in self._raw_relations or (schema, old_name) in self._native_relations:
                 raise RuntimeError("provider_directory_nonprofile_raw_identity_invalid")
@@ -519,18 +508,18 @@ class NonprofileAdmission:
             actual_oid = await fhir.db.scalar(
                 "SELECT to_regclass(:relation_ref)::oid::bigint;", relation_ref=fhir._unscoped_qt(schema, new_name)
             )
-            if actual_oid != oid:
+            if actual_oid is None:
                 raise RuntimeError("provider_directory_nonprofile_relation_changed")
             is_logged = (schema, old_name) in self._logged_relations
-            await self.retire_external_relation(fhir, schema, old_name, oid)
-            self._relations[(schema, new_name)] = oid
+            await self.retire_external_relation(fhir, schema, old_name)
+            self._relations.add((schema, new_name))
             self._external_relations.add((schema, new_name))
             if is_logged:
                 self._logged_relations.add((schema, new_name))
             await self._check("readiness", await self.measure(fhir, schema))
 
     async def assert_ready(self, fhir: Any, schema: str, *, cutover: bool = False) -> None:
-        """Revalidate physical identities, reservations and runtime at cutover."""
+        """Revalidate named layouts, reservations and runtime at cutover."""
         if cutover:
             self._require_finished_native_relations()
         relations = await self.measure(fhir, schema)
@@ -669,28 +658,19 @@ async def is_stage_cleanup_handled(fhir: Any, stage: Any) -> bool:
 
 
 async def _drop_owned_relation(fhir: Any, admission: NonprofileAdmission, schema: str, name: str) -> None:
-    """Lock and recheck ownership before dropping any exact relation name."""
-    expected_oid = admission._relations.get((schema, name))
+    """Lock and natively drop only the admitted qualified name."""
+    if (schema, name) not in admission._relations:
+        raise RuntimeError("provider_directory_nonprofile_relation_changed")
     relation_ref = fhir._unscoped_qt(schema, name)
     async with fhir.db.transaction():
-        actual_oid = await fhir.db.scalar("SELECT to_regclass(:relation_ref)::oid::bigint;", relation_ref=relation_ref)
-        if actual_oid is None:
-            return
-        if not expected_oid or actual_oid != expected_oid:
-            if (schema, name) not in admission.cleanup_preserved:
-                admission.cleanup_preserved.append((schema, name))
+        if not await fhir.db.scalar("SELECT to_regclass(:relation_ref) IS NOT NULL", relation_ref=relation_ref):
             return
         await fhir.db.status(f"LOCK TABLE {relation_ref} IN ACCESS EXCLUSIVE MODE NOWAIT;")
-        actual_oid = await fhir.db.scalar("SELECT to_regclass(:relation_ref)::oid::bigint;", relation_ref=relation_ref)
-        if actual_oid != expected_oid:
-            if (schema, name) not in admission.cleanup_preserved:
-                admission.cleanup_preserved.append((schema, name))
-            return
-        await fhir.db.status(f"DROP TABLE {relation_ref};")
+        await fhir.db.status(f"DROP TABLE {relation_ref} RESTRICT;")
 
 
 async def _drain_owned_cleanup(fhir: Any, admission: NonprofileAdmission, schema: str, names: list[str]) -> None:
-    """Finish identity-checked scratch cleanup before propagating cancellation."""
+    """Finish named scratch cleanup before propagating cancellation."""
 
     async def cleanup():
         """Drop only captured owned scratch identities."""
@@ -790,8 +770,7 @@ async def _full_scope(fhir: Any, fence: Any, types: frozenset[str], projection: 
             await _index_owned_layout(fhir, admission, schema, plan.model_by_table_name[base_name], name)
         await admission.measure(fhir, schema, tuple(plan.relation_by_table.values()))
         await admission.assert_ready(fhir, schema)
-        oid_by_base = {base: admission._relations[(schema, name)] for base, name in plan.relation_by_table.items()}
-        with fhir._artifact_scope_tokens(fence, fence, plan.relation_by_table, oid_by_base):
+        with fhir._artifact_scope_tokens(fence, fence, plan.relation_by_table):
             yield dict(plan.relation_by_table)
     except BaseException as error:
         try:
@@ -1092,10 +1071,10 @@ def _manifest_required_indexes(fhir, target, name):
     return [profile.profile_index_name(name, suffix) for suffix in suffixes]
 
 
-def _manifest_relation(relations, schema, name, *, target, role, required_indexes=(), primary_key=False, oid=None):
-    """Bind a prepared role to its original owned heap, never a name-only discovery."""
+def _manifest_relation(relations, schema, name, *, target, role, required_indexes=(), primary_key=False):
+    """Bind a prepared role to its admitted schema-qualified name."""
     relation = relations.get((schema, name))
-    if relation is None or (oid is not None and relation["oid"] != oid) or "role" in relation:
+    if relation is None or "role" in relation:
         raise RuntimeError("provider_directory_prepared_manifest_ownership_changed")
     relation.update(
         target=target, role=role, required_indexes=sorted(required_indexes), primary_key_required=primary_key
@@ -1110,7 +1089,7 @@ async def _manifest_profile_relations(prepared, relations, run_id):
         if delta.owner_run_id != run_id or delta.selection_proof_id != prepared.execution.attestation.proof_id:
             raise RuntimeError("provider_directory_prepared_manifest_profile_changed")
         stages = [
-            (getattr(delta, field), getattr(delta, field + "_oid"), target_relation)
+            (getattr(delta, field), target_relation)
             for field, target_relation in (
                 ("evidence_stage", fhir.profile_artifact.PROFILE_EVIDENCE_TABLE),
                 ("profile_stage", fhir.profile_artifact.PROFILE_TABLE),
@@ -1126,20 +1105,12 @@ async def _manifest_profile_relations(prepared, relations, run_id):
             or build.selection_proof_id != prepared.execution.attestation.proof_id
         ):
             raise RuntimeError("provider_directory_prepared_manifest_profile_changed")
-        # Preparation already verified the ready checkpoint; the immutable initial
-        # receipt will bind these observed replacement OIDs after the guarded swap.
         schema = build.schema
-        identities = await fhir._artifact_scope_relation_identities(
-            schema, [stage.stage_table for stage in bundle.stages]
-        )
-        stages = [
-            (stage.stage_table, identities.get(stage.stage_table, (None,))[0], stage.target_relation)
-            for stage in bundle.stages
-        ]
-    for name, oid, target_relation in stages:
-        if type(oid) is not int or oid <= 0 or (schema, name) in relations:
+        stages = [(stage.stage_table, stage.target_relation) for stage in bundle.stages]
+    for name, target_relation in stages:
+        if (schema, name) in relations:
             raise RuntimeError("provider_directory_prepared_manifest_ownership_changed")
-        relations[(schema, name)] = {"schema": schema, "relation": name, "oid": oid}
+        relations[(schema, name)] = {"schema": schema, "relation": name}
         required = _manifest_required_indexes(fhir, target_relation, name) if target_relation is not None else ()
         _manifest_relation(
             relations, schema, name, target=target_relation, role="profile", required_indexes=required, primary_key=True
@@ -1171,11 +1142,10 @@ def _manifest_resource_scope_relations(prepared, relations, inventory):
             name,
             target=root,
             role="resource_scope",
-            required_indexes=[index_name for index_name, _oid in indexes["indexes"]],
+            required_indexes=indexes["indexes"],
             primary_key=bool(model.__table__.primary_key.columns),
-            oid=indexes["oid"],
         )
-        relations[(indexes["schema"], name)]["prepared_index_identities"] = indexes["indexes"]
+        relations[(indexes["schema"], name)]["prepared_index_names"] = tuple(indexes["indexes"])
 
 
 async def _prepared_manifest_relations(prepared, run_id, *, scratch_indexes=None):
@@ -1198,11 +1168,11 @@ async def _prepared_manifest_relations(prepared, run_id, *, scratch_indexes=None
     address = prepared.address
     native = importlib.import_module("process.entity_address_unified")
     by_stage = {swap.stage_cls.__tablename__: swap.stage_cls for swap in address.swaps}
-    if {target_relation for target_relation, _name, _oid in address.stage_oids} != set(
+    if {target_relation for target_relation, _name in address.stage_relations} != set(
         admission.plan.native_address_targets
     ):
         raise RuntimeError("provider_directory_prepared_manifest_native_changed")
-    for target_relation, name, oid in address.stage_oids:
+    for target_relation, name in address.stage_relations:
         required_indexes = [
             native._stage_index_name(name, index.get("name", "_".join(index["index_elements"])))
             for index in by_stage[name].__my_additional_indexes__
@@ -1214,7 +1184,6 @@ async def _prepared_manifest_relations(prepared, run_id, *, scratch_indexes=None
             target=target_relation,
             role="native_stage",
             required_indexes=required_indexes,
-            oid=oid,
         )
     await _manifest_profile_relations(prepared, relation_by_coordinate, run_id)
     for relation in relation_by_coordinate.values():
@@ -1225,49 +1194,81 @@ async def _prepared_manifest_relations(prepared, run_id, *, scratch_indexes=None
 
 async def _prepared_manifest_catalog(fhir, relations):
     """Read bounded metadata only, refusing missing heaps or unfinished required indexes."""
-    if not 1 <= len(relations) <= 64 or len({relation["oid"] for relation in relations}) != len(relations):
+    if not 1 <= len(relations) <= 64 or len({(entry["schema"], entry["relation"]) for entry in relations}) != len(
+        relations
+    ):
         raise RuntimeError("provider_directory_prepared_manifest_inventory_invalid")
+    oid_by_coordinate = {}
     for schema in sorted({relation["schema"] for relation in relations}):
-        selected_relations = [relation for relation in relations if relation["schema"] == schema]
+        selected_relations = [entry for entry in relations if entry["schema"] == schema]
         identities = await fhir._artifact_scope_relation_identities(
-            schema, [relation["relation"] for relation in selected_relations]
+            schema, [entry["relation"] for entry in selected_relations]
         )
         for relation in selected_relations:
-            identity = identities.get(relation["relation"])
-            if identity is None or identity[:2] != (relation["oid"], "r") or identity[2] not in {"u", "p"}:
+            observed = identities.get(relation["relation"])
+            if observed is None or observed[1] != "r" or observed[2] not in {"u", "p"}:
                 raise RuntimeError("provider_directory_prepared_manifest_ownership_changed")
-            if relation.get("role") in {"profile", "serving_stage", "native_stage"} and identity[2] != "p":
+            if relation.get("role") in {"profile", "serving_stage", "native_stage"} and observed[2] != "p":
                 raise RuntimeError("provider_directory_prepared_manifest_stage_not_logged")
-            relation["persistence"] = identity[2]
+            relation["persistence"] = observed[2]
+            native_oid = await fhir.db.scalar(
+                "SELECT to_regclass(:relation_ref)::oid::bigint",
+                relation_ref=fhir._unscoped_qt(schema, relation["relation"]),
+            )
+            if type(native_oid) is not int or native_oid <= 0:
+                raise RuntimeError("provider_directory_prepared_manifest_ownership_changed")
+            oid_by_coordinate[(schema, relation["relation"])] = native_oid
     attributes, indexes, _constraints, _triggers = await fhir._profile_capacity_relation_catalog(
-        [relation["oid"] for relation in relations]
+        list(oid_by_coordinate.values())
     )
     for relation in relations:
+        relation_oid = oid_by_coordinate[(relation["schema"], relation["relation"])]
         relation["columns"] = [
-            {"number": catalog_row["attnum"], "name": catalog_row["attname"]}
-            for catalog_row in attributes
-            if catalog_row["relation_oid"] == relation["oid"]
+            {"number": entry["attnum"], "name": entry["attname"]}
+            for entry in attributes
+            if entry["relation_oid"] == relation_oid
         ]
-        relation["indexes"] = [catalog_row for catalog_row in indexes if catalog_row["relation_oid"] == relation["oid"]]
-        expected_indexes = relation.get("prepared_index_identities")
-        if expected_indexes is not None and tuple(
-            sorted((index["index_name"], index["index_oid"]) for index in relation["indexes"])
-        ) != tuple(expected_indexes):
-            raise RuntimeError("provider_directory_prepared_manifest_index_identity_changed")
-        required_indexes = set(relation.get("required_indexes", ()))
-        if (
-            not relation["columns"]
-            or not required_indexes <= {catalog_row["index_name"] for catalog_row in relation["indexes"]}
-            or (
-                relation.get("primary_key_required")
-                and not any(catalog_row["indisprimary"] for catalog_row in relation["indexes"])
+        observed_indexes = [entry for entry in indexes if entry["relation_oid"] == relation_oid]
+        relation["indexes"] = _prepared_manifest_indexes(relation, observed_indexes)
+
+
+def _prepared_manifest_indexes(relation, observed_indexes):
+    """Require complete ready named indexes and emit portable index semantics."""
+    expected_names = relation.pop("prepared_index_names", None)
+    if expected_names is not None and tuple(sorted(entry["index_name"] for entry in observed_indexes)) != tuple(
+        sorted(expected_names)
+    ):
+        raise RuntimeError("provider_directory_prepared_manifest_index_identity_changed")
+    if (
+        not relation["columns"]
+        or not set(relation.get("required_indexes", ())) <= {entry["index_name"] for entry in observed_indexes}
+        or (relation.get("primary_key_required") and not any(entry["indisprimary"] for entry in observed_indexes))
+        or any(
+            not all(entry[field] is True for field in ("indisvalid", "indisready", "indislive"))
+            for entry in observed_indexes
+        )
+    ):
+        raise RuntimeError("provider_directory_prepared_manifest_indexes_incomplete")
+    return [
+        {
+            name: entry[name]
+            for name in (
+                "index_name",
+                "index_am",
+                "indisprimary",
+                "indisunique",
+                "indisvalid",
+                "indisready",
+                "indislive",
+                "indnkeyatts",
+                "indnatts",
+                "indkey",
+                "index_expressions",
+                "index_predicate",
             )
-            or any(
-                not all(catalog_row[field] is True for field in ("indisvalid", "indisready", "indislive"))
-                for catalog_row in relation["indexes"]
-            )
-        ):
-            raise RuntimeError("provider_directory_prepared_manifest_indexes_incomplete")
+        }
+        for entry in observed_indexes
+    ]
 
 
 async def _emit_prepared_manifest(prepared, run_id, control_run_id):
@@ -1297,9 +1298,6 @@ async def _emit_prepared_manifest(prepared, run_id, control_run_id):
         "lease_digest": admission.lease.lease_digest,
         "reservation_id": admission.lease.reservation_id,
         "paired_profile_lease_digest": admission.plan.paired_profile_lease_digest,
-        "database_system_identifier": admission.lease.database_system_identifier,
-        "database_oid": admission.lease.database_oid,
-        "database_name": admission.lease.database_name,
         "relations": relations,
     }
     encoded = json.dumps(manifest_by_field, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)

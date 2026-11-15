@@ -11,10 +11,11 @@ import asyncpg
 import pytest
 
 import process.network_membership_pipeline as pipeline
+import process.network_membership_validation as validation
 from db.models import EntityAddressUnified
 from process.network_membership_publication import NetworkPublicationError
-from process.network_membership_writer_closure import verify_network_candidate_writer_closure
 from process.network_serving_read import NetworkServingReadUnavailable, resolve_network_serving_manifest
+from tests.registry_named_preparation_postgres_support import freeze_and_validate_network_candidate
 from tests.test_network_address_projection_postgres import projection_db
 from tests.test_network_membership_publication_postgres import (
     _candidate_writer_roles,
@@ -50,6 +51,14 @@ def _arguments(fixture):
 
 async def _run(fixture, connection=None, **changes):
     connection = connection or fixture.connection
+    seal_candidate = fixture.seal_candidate
+    if connection is not fixture.connection:
+        # A competing publisher validates on its own connection, outside the first publisher's transaction.
+        scope = SimpleNamespace(connection=connection, control_schema=fixture.control_schema, engine=fixture.engine)
+
+        async def seal_candidate(copy_target):
+            return await freeze_and_validate_network_candidate(scope, copy_target, fixture.preparation_roles)
+
     await connection.execute(f'SET ROLE "{fixture.writer_roles["publisher"]}"')
     try:
         return await pipeline.prepare_and_publish_network_candidate(
@@ -57,6 +66,7 @@ async def _run(fixture, connection=None, **changes):
             changes.get("copy_target", fixture.copy_target),
             changes.get("source", fixture.address_source),
             **_arguments(fixture),
+            seal_candidate=seal_candidate,
         )
     finally:
         await connection.execute("RESET ROLE")
@@ -102,10 +112,11 @@ async def test_preparation_keeps_serving_head_available_for_final_authorization(
 async def test_actual_full_pipeline_closes_before_validation(pipeline_db, monkeypatch):
     fixture = pipeline_db
     source_before, raw_before = await _source_snapshot(fixture), await _raw_snapshot(fixture)
-    raw_closures = []
-    original_validate = pipeline.validate_network_membership_candidate
+    closed_candidates = []
+    original_final = validation.validate_network_candidate_final
 
-    async def verify_closed_before_validation(connection, copy_target, source, **kwargs):
+    async def verify_closed_before_final_validation(connection, copy_target, *args, **kwargs):
+        # The administrator freeze runs first, so the loader can no longer write when final validation starts.
         await fixture.observer.execute(f'SET ROLE "{fixture.writer_roles["loader"]}"')
         try:
             with pytest.raises(asyncpg.InsufficientPrivilegeError):
@@ -114,19 +125,16 @@ async def test_actual_full_pipeline_closes_before_validation(pipeline_db, monkey
                 )
         finally:
             await fixture.observer.execute("RESET ROLE")
-        report = await original_validate(connection, copy_target, source, **kwargs)
-        assert set(report["writer_closure"]["relation_oids"]) == {"network_membership", "provider_location_binding"}
-        raw_closures.append(report["writer_closure"])
-        return report
+        closed_candidates.append(copy_target.candidate_id)
+        return await original_final(connection, copy_target, *args, **kwargs)
 
-    monkeypatch.setattr(pipeline, "validate_network_membership_candidate", verify_closed_before_validation)
+    monkeypatch.setattr(validation, "validate_network_candidate_final", verify_closed_before_final_validation)
     manifest = await _run(fixture)
+    assert closed_candidates == [fixture.copy_target.candidate_id]
     state = await _snapshot(fixture)
     report = json.loads(state["validation_json"])
     assert state["state"] == "published" and state["generation_id"] == manifest["generation_id"]
     assert report["serving_readiness"]["index_definition_sha256"] != "b" * 64
-    assert report["writer_closure"]["relation_oids"].items() >= raw_closures[0]["relation_oids"].items()
-    assert "entity_address_unified" in report["writer_closure"]["relation_oids"]
     assert await _source_snapshot(fixture) == source_before and await _raw_snapshot(fixture) == raw_before
     source_columns = await fixture.connection.fetch(
         "SELECT attname FROM pg_attribute WHERE attrelid=to_regclass($1) AND attnum>0 AND NOT attisdropped",
@@ -200,21 +208,8 @@ async def test_preparation_failure_retains_closed_raw_candidate(pipeline_db, mon
     with pytest.raises(RuntimeError, match="preparation phase"):
         await _run(fixture)
     state = await _snapshot(fixture)
-    closure = json.loads(state["validation_json"])["writer_closure"]
     assert state["state"] == "sealed" and state["generation_id"] is None and state["manifests"] == 0
-    assert set(closure["relation_oids"]) == {"network_membership", "provider_location_binding"}
     assert await _raw_snapshot(fixture) == raw_before and await _source_snapshot(fixture) == source_before
-    await fixture.connection.execute(f'SET ROLE "{fixture.writer_roles["publisher"]}"')
-    try:
-        async with fixture.connection.transaction():
-            assert (
-                await verify_network_candidate_writer_closure(
-                    fixture.connection, fixture.copy_target, **_arguments(fixture)
-                )
-                == closure
-            )
-    finally:
-        await fixture.connection.execute("RESET ROLE")
     monkeypatch.setattr(pipeline, phase, original_stage)
     assert (await _run(fixture))["eligible"] is True
 
@@ -233,7 +228,7 @@ async def test_final_failure_retains_closed_ready_candidate(pipeline_db, monkeyp
     state = await _snapshot(fixture)
     report = json.loads(state["validation_json"])
     assert state["state"] == "ready" and state["generation_id"] is None and state["manifests"] == 0
-    assert len(report["writer_closure"]["relation_oids"]) == 3 and report["serving_readiness"]["ready"] is True
+    assert report["serving_readiness"]["ready"] is True
     reserved = (await _sequence_state(fixture))["last_value"]
     monkeypatch.setattr(pipeline, "publish_network_candidate", original_publish)
     manifest = await _run(fixture)
@@ -259,7 +254,7 @@ async def test_approval_updates_are_not_locked_during_preparation(pipeline_db, m
         await _run(fixture)
     state = await _snapshot(fixture)
     assert state["approved_revision"] == 1 and state["state"] == "ready" and state["generation_id"] is None
-    assert state["manifests"] == 0 and len(json.loads(state["validation_json"])["writer_closure"]["relation_oids"]) == 3
+    assert state["manifests"] == 0
 
 
 async def _raw_successor(fixture):
@@ -318,4 +313,3 @@ async def test_scope_source_and_phase_transaction_boundaries(pipeline_db):
         await _run(fixture, source=replace(fixture.address_source, generation_id="different-edition"))
     state = await _snapshot(fixture)
     assert state["state"] == "sealed" and state["generation_id"] is None
-    assert json.loads(state["validation_json"])["writer_closure"]["component"] == "network_candidate_writer_closure"

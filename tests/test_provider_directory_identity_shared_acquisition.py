@@ -300,7 +300,7 @@ async def test_address_overlay_build_defers_and_cleans_failed_stage(monkeypatch)
         ["source-a"],
         None,
         '"mrf"."provider_directory_address_overlay"',
-        fhir.ProviderDirectoryArtifactBuildFence(target_oid=1),
+        fhir.ProviderDirectoryArtifactBuildFence(target_publication=(True, ("synthetic-1", "revision-1"))),
         True,
     )
     assert stage_result == prepared
@@ -315,7 +315,7 @@ async def test_address_overlay_build_defers_and_cleans_failed_stage(monkeypatch)
             ["source-a"],
             None,
             '"mrf"."provider_directory_address_overlay"',
-            fhir.ProviderDirectoryArtifactBuildFence(target_oid=1),
+            fhir.ProviderDirectoryArtifactBuildFence(target_publication=(True, ("synthetic-1", "revision-1"))),
             False,
         )
     drop.assert_awaited_once()

@@ -105,6 +105,14 @@ async def _published_cms_pin(monkeypatch, directory, database):
     return candidate, release, digest
 
 
+_RETAINED_FIXTURE_ROLES = {}
+
+
+def retained_fixture_roles(source_pin):
+    """Return only the explicit roles provisioned by this fixture, never snapshot metadata."""
+    return _RETAINED_FIXTURE_ROLES[source_pin.retained_epoch.epoch_id]
+
+
 async def _closed_cms_pin(connection, candidate, release, digest, role_names):
     """Capture and recheck the actual sealed source owner, native guards and ACLs."""
     source_pin = PinnedFHIRMembershipSource(
@@ -136,6 +144,7 @@ async def _closed_cms_pin(connection, candidate, release, digest, role_names):
             expected_metadata_sha256=hashes["publication_metadata_sha256"],
         )
         source_pin = replace(source_pin, retained_epoch=epoch)
+    _RETAINED_FIXTURE_ROLES[epoch.epoch_id] = role_names
     return source_pin
 
 
@@ -210,6 +219,7 @@ async def reviewed_cms_source(cms_recipe_database, serving_schema, monkeypatch, 
     connection, schema, engine = serving_schema
     candidate, release, digest = await _published_cms_pin(monkeypatch, tmp_path, cms_recipe_database)
     role_names = tuple("recipe_custody_" + uuid4().hex for _ in range(3))
+    source_pin = None
     try:
         source_pin = await _closed_cms_pin(connection, candidate, release, digest, role_names)
         coordinates = await _cms_binding_scope(connection, source_pin)
@@ -219,4 +229,6 @@ async def reviewed_cms_source(cms_recipe_database, serving_schema, monkeypatch, 
         sites = await _cms_site_ids(connection, source_pin)
         yield (connection, schema, source_pin, sites), actor, networks, binding_fields, coordinates, approved
     finally:
+        if source_pin is not None:
+            _RETAINED_FIXTURE_ROLES.pop(source_pin.retained_epoch.epoch_id, None)
         await _remove_custody_roles(connection, role_names)
