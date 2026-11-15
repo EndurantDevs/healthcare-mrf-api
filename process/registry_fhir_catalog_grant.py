@@ -988,8 +988,6 @@ async def verify_current_fhir_catalog_source_companies(source_export, connection
         async with open_source_owned_catalog_export(source_export, profile, connection) as export:
             for entry in entries:
                 descriptor = descriptors[entry["source_generation"]]
-                if "native_read_profile" in export and not is_named_fhir_catalog_descriptor(descriptor):
-                    _fail("source_not_admitted")
                 if (
                     not is_named_fhir_catalog_descriptor(descriptor)
                     and "database_identity" in export
@@ -1042,8 +1040,6 @@ async def _replay_source_owned_observations(source_export, connection, snapshot,
         profile = source_profile(json.loads(profile_key))
         async with open_source_owned_catalog_export(source_export, profile, connection) as export:
             for generation, descriptor in selected:
-                if "native_read_profile" in export and not is_named_fhir_catalog_descriptor(descriptor):
-                    _fail("source_not_admitted")
                 if (
                     not is_named_fhir_catalog_descriptor(descriptor)
                     and "database_identity" in export

@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""A count-only upgrade preserves retained identities and commits with its page."""
+"""Retained page counts preserve issued cursors and historical transition evidence."""
 
 import copy
 import hashlib
@@ -30,6 +30,20 @@ def _state():
         resumed=True,
         completeness={adapter.SORTED_LAST_ID_KEY: BOUNDARY},
     )
+
+
+def _historical_completeness():
+    """Represent a committed upgrade issued by an earlier worker."""
+    return {
+        adapter.SORTED_LAST_ID_KEY: "role-001499",
+        adapter.PAGE_COUNT_TRANSITION_KEY: {
+            "from": 500,
+            "to": 1000,
+            "issued_offset": 500,
+            "issued_cursor_sha256": hashlib.sha256(SAVED.encode()).hexdigest(),
+            "sorted_last_id": BOUNDARY,
+        },
+    }
 
 
 def _context():
@@ -64,20 +78,25 @@ def _checkpoint():
 
 
 @pytest.mark.parametrize("count_field", ["_count=500", "%5Fcount=%35%30%30"])
-def test_resize_changes_only_count_and_does_not_mutate_retained_state(count_field):
+@pytest.mark.parametrize("cap", [500, 1000])
+def test_retained_page_preserves_exact_issued_count_and_state(count_field, cap):
     state = replace(_state(), next_url=SAVED.replace("_count=500", count_field))
     original = copy.deepcopy(state)
-    boundary, request, proof = adapter.prepare_acquisition(START, RESOURCE, 1000, state)
+    boundary, request, proof = adapter.prepare_acquisition(START, RESOURCE, cap, state)
     assert state == original and boundary == BOUNDARY
-    assert request == state.next_url.replace(count_field, count_field.split("=", 1)[0] + "=1000")
-    assert proof[adapter.SORTED_LAST_ID_KEY] == BOUNDARY
-    assert proof[adapter.PAGE_COUNT_TRANSITION_KEY] == {
-        "from": 500,
-        "to": 1000,
-        "issued_offset": 500,
-        "issued_cursor_sha256": hashlib.sha256(state.next_url.encode()).hexdigest(),
-        "sorted_last_id": BOUNDARY,
-    }
+    assert request == state.next_url and proof == state.completeness
+    assert adapter.PAGE_COUNT_TRANSITION_KEY not in proof
+
+
+def test_fresh_starts_and_other_resource_hashes_keep_their_existing_count():
+    source = _source()
+    preferred = importer._source_full_refresh_page_count(source, 100, 0, 0)
+    assert preferred == 1000
+    for resource in adapter.RESOURCES:
+        expected = f"{adapter.API_BASE}/{resource}?_count=1000&_sort=_id"
+        start = importer._resource_start_url(source, resource, page_count=preferred)
+        assert start == expected
+        assert adapter.checkpoint_start_hash(resource, start, {}, {}) == hashlib.sha256(expected.encode()).hexdigest()
 
 
 def test_native_larger_page_checkpoint_preserves_cursor_without_a_transition():
@@ -98,7 +117,7 @@ def test_native_larger_page_checkpoint_preserves_cursor_without_a_transition():
 
 
 @pytest.mark.parametrize("changed", ["_offset=000501", "_sort=name", "_count=2000", "network=example"])
-def test_resize_refuses_changed_position_or_scope(changed):
+def test_retained_cursor_refuses_changed_position_or_scope(changed):
     replacement_by_value = {
         "_offset=000501": "_offset=000500",
         "_sort=name": "_sort=%5Fid",
@@ -113,7 +132,7 @@ def test_resize_refuses_changed_position_or_scope(changed):
         adapter.prepare_resume(START, saved, RESOURCE, 1000, 500, _state().completeness)
 
 
-def test_resize_refuses_missing_boundary_wrong_host_and_wrong_resource():
+def test_retained_cursor_refuses_missing_boundary_wrong_host_and_wrong_resource():
     for saved, resource, proof in (
         (SAVED, RESOURCE, {}),
         (SAVED.replace("https://", "https://other.example/"), RESOURCE, _state().completeness),
@@ -124,9 +143,8 @@ def test_resize_refuses_missing_boundary_wrong_host_and_wrong_resource():
 
 
 def test_transition_survives_resume_and_refuses_tampering():
-    _, _, proof = adapter.prepare_acquisition(START, RESOURCE, 1000, _state())
     following = START + "&_offset=1500"
-    committed_by_field = {**proof, adapter.SORTED_LAST_ID_KEY: "role-001499"}
+    committed_by_field = _historical_completeness()
     assert adapter.prepare_resume(START, following, RESOURCE, 1000, 1500, committed_by_field) == (
         following,
         committed_by_field,
@@ -162,8 +180,7 @@ async def test_completed_legacy_checkpoint_reuses_actual_loader_without_download
     checkpoint_by_field = _checkpoint()
     completeness_by_field = _state().completeness
     if upgraded:
-        _, _, completeness_by_field = adapter.prepare_acquisition(START, RESOURCE, 1000, _state())
-        completeness_by_field[adapter.SORTED_LAST_ID_KEY] = "role-001499"
+        completeness_by_field = _historical_completeness()
         checkpoint_by_field.update(rows_processed=1500, pages_processed=2)
     checkpoint_by_field.update(state="complete", next_url=None, completeness_json=json.dumps(completeness_by_field))
     if not adopt_owner:
@@ -223,8 +240,8 @@ async def test_legacy_hash_exception_does_not_relax_other_checkpoints(monkeypatc
     adopt.assert_not_awaited()
 
 
-def _page(*, terminal=False, invalid=False):
-    ids = [f"role-{number:06}" for number in range(500, 1500)]
+def _page(*, terminal=False, invalid=False, start=500, count=500):
+    ids = [f"role-{number:06}" for number in range(start, start + count)]
     if invalid:
         ids[0] = BOUNDARY
     payload = {
@@ -233,15 +250,20 @@ def _page(*, terminal=False, invalid=False):
         "entry": [{"resource": {"resourceType": RESOURCE, "id": resource_id}} for resource_id in ids],
     }
     if not terminal:
-        payload["link"] = [{"relation": "next", "url": START + "&_offset=1500"}]
+        following = adapter.start_url(RESOURCE, count) + f"&_offset={start + count}"
+        payload["link"] = [{"relation": "next", "url": following}]
     return payload
 
 
-def _patch_fetch(monkeypatch, responses):
+def _patch_fetch(monkeypatch, responses, *, resume=None):
     fetch = AsyncMock(side_effect=responses)
     save, reset = AsyncMock(), AsyncMock()
     monkeypatch.setattr(importer, "_fetch_source_json", fetch)
-    monkeypatch.setattr(importer, "_load_or_initialize_pagination_checkpoint", AsyncMock(return_value=_state()))
+    monkeypatch.setattr(
+        importer,
+        "_load_or_initialize_pagination_checkpoint",
+        AsyncMock(return_value=_state() if resume is None else resume),
+    )
     monkeypatch.setattr(importer, "_save_pagination_checkpoint", save)
     monkeypatch.setattr(importer, "_reset_pagination_checkpoint", reset)
     monkeypatch.setattr(importer, "source_checkpoint_transaction", lambda *_args, **_kwargs: nullcontext())
@@ -266,7 +288,7 @@ async def _read(writer, *, batch_size=5000, source=None):
 
 
 @pytest.mark.asyncio
-async def test_retained_metadata_cap_reaches_the_count_transition(monkeypatch):
+async def test_retained_metadata_cap_keeps_the_issued_page_count(monkeypatch):
     source = _source()
     source["metadata_json"]["provider_directory_resource_page_count_caps"][RESOURCE] = 500
     original = copy.deepcopy(source)
@@ -275,9 +297,9 @@ async def test_retained_metadata_cap_reaches_the_count_transition(monkeypatch):
     fetch, save, reset = _patch_fetch(monkeypatch, [(200, _page(terminal=True), None, 1)])
     writer = AsyncMock(side_effect=lambda _model, rows: len(rows))
     result = await _read(writer, source=source)
-    assert result.complete and result.rows_fetched == 1500 and result.rows_written == 1000
-    assert fetch.await_args.args[1] == SAVED.replace("_count=500", "_count=1000")
-    assert save.await_args.kwargs["completeness"][adapter.PAGE_COUNT_TRANSITION_KEY]["issued_offset"] == 500
+    assert result.complete and result.rows_fetched == 1000 and result.rows_written == 500
+    assert fetch.await_args.args[1] == SAVED
+    assert save.await_args.kwargs["completeness"] == {adapter.SORTED_LAST_ID_KEY: "role-000999"}
     assert source == original
     reset.assert_not_awaited()
 
@@ -296,24 +318,91 @@ def test_legacy_cap_upgrade_preserves_explicit_lower_limits_and_other_sources(pa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal", [False, True])
-async def test_resized_page_commits_proof_and_issued_cursor_with_rows(monkeypatch, terminal):
+async def test_retained_page_commits_issued_cursor_and_boundary_with_rows(monkeypatch, terminal):
     fetch, save, reset = _patch_fetch(monkeypatch, [(200, _page(terminal=terminal), None, 1), (401, None, None, 1)])
     writer = AsyncMock(side_effect=lambda _model, rows: len(rows))
     result = await _read(writer)
-    assert result.rows_fetched == 1500 and result.pages_fetched == 2 and result.rows_written == 1000
+    assert result.rows_fetched == 1000 and result.pages_fetched == 2 and result.rows_written == 500
     assert result.complete is terminal
-    assert fetch.await_args_list[0].args[1] == SAVED.replace("_count=500", "_count=1000")
+    assert fetch.await_args_list[0].args[1] == SAVED
     assert save.await_count == 1 and writer.await_count == 1
     saved = save.await_args.kwargs
-    assert saved["next_url"] == (None if terminal else START + "&_offset=1500")
-    assert saved["completeness"][adapter.SORTED_LAST_ID_KEY] == "role-001499"
-    assert saved["completeness"][adapter.PAGE_COUNT_TRANSITION_KEY]["issued_offset"] == 500
+    assert saved["next_url"] == (None if terminal else LEGACY_START + "&_offset=1000")
+    assert saved["completeness"] == {adapter.SORTED_LAST_ID_KEY: "role-000999"}
     reset.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("batch_size", [750, 1000, 5000])
-async def test_resized_page_writes_only_inside_its_checkpoint_transaction(monkeypatch, batch_size):
+@pytest.mark.parametrize("historical_transition", [False, True])
+async def test_larger_count_checkpoint_loads_and_resumes_without_downgrade(monkeypatch, historical_transition):
+    rows_processed = 1500 if historical_transition else 2000
+    completeness = _historical_completeness() if historical_transition else {adapter.SORTED_LAST_ID_KEY: "role-001999"}
+    state = replace(
+        _state(),
+        next_url=START + f"&_offset={rows_processed}",
+        rows_processed=rows_processed,
+        pages_processed=2,
+        completeness=completeness,
+    )
+    checkpoint = _checkpoint()
+    checkpoint.update(
+        rows_processed=rows_processed,
+        pages_processed=2,
+        next_url=state.next_url,
+        completeness_json=json.dumps(completeness),
+        start_url_hash=hashlib.sha256((LEGACY_START if historical_transition else START).encode()).hexdigest(),
+    )
+    original = copy.deepcopy(checkpoint)
+    load = importer._load_or_initialize_pagination_checkpoint
+    fetch, save, reset = _patch_fetch(
+        monkeypatch, [(200, _page(start=rows_processed, count=1000, terminal=True), None, 1)]
+    )
+    adopt = AsyncMock(return_value=state)
+    monkeypatch.setattr(importer, "_load_or_initialize_pagination_checkpoint", load)
+    monkeypatch.setattr(importer, "_fetch_pagination_checkpoint", AsyncMock(return_value=checkpoint))
+    monkeypatch.setattr(importer, "_adopt_pagination_checkpoint_owner", adopt)
+    writer = AsyncMock(side_effect=lambda _model, batch: len(batch))
+    fetch_result = await _read(writer)
+    assert fetch_result.complete and fetch_result.rows_fetched == rows_processed + 1000
+    assert fetch_result.rows_written == 1000
+    assert fetch.await_args.args[1] == state.next_url
+    assert checkpoint == original and adopt.await_args.args[-1] == original["start_url_hash"]
+    saved = save.await_args.kwargs["completeness"]
+    assert saved[adapter.SORTED_LAST_ID_KEY] == f"role-{rows_processed + 999:06}"
+    assert saved.get(adapter.PAGE_COUNT_TRANSITION_KEY) == completeness.get(adapter.PAGE_COUNT_TRANSITION_KEY)
+    reset.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retained_500_count_survives_a_second_retry_without_restarting(monkeypatch):
+    fetch, save, reset = _patch_fetch(monkeypatch, [(200, _page(), None, 1), (401, None, None, 1)])
+    writer = AsyncMock(side_effect=lambda _model, batch: len(batch))
+    first = await _read(writer)
+    assert not first.complete and first.rows_fetched == 1000 and first.rows_written == 500
+    saved = save.await_args.kwargs
+    assert fetch.await_args_list[0].args[1] == SAVED
+    assert saved["next_url"] == LEGACY_START + "&_offset=1000"
+    assert saved["completeness"] == {adapter.SORTED_LAST_ID_KEY: "role-000999"}
+    reset.assert_not_awaited()
+    resumed = replace(
+        _state(),
+        next_url=saved["next_url"],
+        rows_processed=saved["rows_processed"],
+        pages_processed=saved["pages_processed"],
+        completeness=saved["completeness"],
+    )
+    fetch, save, reset = _patch_fetch(monkeypatch, [(200, _page(start=1000, terminal=True), None, 1)], resume=resumed)
+    second = await _read(writer)
+    assert second.complete and second.rows_fetched == 1500 and second.rows_written == 500
+    assert fetch.await_args.args[1] == resumed.next_url
+    assert save.await_args.kwargs["completeness"] == {adapter.SORTED_LAST_ID_KEY: "role-001499"}
+    assert save.await_args.args[0] == _context()
+    reset.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch_size", [250, 500, 5000])
+async def test_retained_page_writes_only_inside_its_checkpoint_transaction(monkeypatch, batch_size):
     _, save, reset = _patch_fetch(monkeypatch, [(200, _page(terminal=True), None, 1)])
     active_transactions = []
 
@@ -344,7 +433,7 @@ async def test_resized_page_writes_only_inside_its_checkpoint_transaction(monkey
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["http", "invalid_ids", "writer", "checkpoint"])
-async def test_failed_resize_never_resets_the_retained_checkpoint(monkeypatch, failure):
+async def test_failed_retained_page_never_resets_the_checkpoint(monkeypatch, failure):
     response = (500, None, None, 1) if failure == "http" else (200, _page(invalid=failure == "invalid_ids"), None, 1)
     _, save, reset = _patch_fetch(monkeypatch, [response])
     writer = AsyncMock(

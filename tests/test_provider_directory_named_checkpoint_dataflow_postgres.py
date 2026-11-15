@@ -2,6 +2,7 @@
 """Named COPY and checkpoint writes share the existing native transaction."""
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from importlib import import_module
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ import pytest
 from sqlalchemy import MetaData, text
 from sqlalchemy.dialects.postgresql import dialect
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.schema import CreateTable
 
 from db.connection import Database
@@ -25,6 +26,7 @@ from process.provider_directory_source_checkpoint_control import (
     source_checkpoint_transaction,
 )
 from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
+from tests.cms_npd_admission_postgres_support import _database_url, _owned_database
 from tests.test_provider_directory_isolated_source_provision import native_bootstrap as native_bootstrap
 
 
@@ -179,3 +181,77 @@ async def test_named_copy_and_checkpoint_commit_or_roll_back_together(native_boo
         assert source._OWNER.get() is None and source._PUBLISHER.get() is None
     finally:
         await engine.dispose()
+
+
+def _catalog_projection(database, state, stage, payload):
+    async def read(*_args, **_kwargs):
+        assert not state.cancelled or state.first_response_finished
+        session = database._transaction_binding().session
+        state.reads.append(stage)
+        if stage == state.failed_stage and not state.cancelled:
+            try:
+                await session.execute(text("SELECT pg_sleep(30)"))
+            except asyncio.CancelledError:
+                state.cancelled = True
+                raise
+        assert (await session.execute(text("SELECT 1"))).scalar_one() == 1
+        return payload
+
+    return read
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_stage", ("selection", "outcomes", "cms"))
+async def test_catalog_optional_timeout_rolls_back_before_fallback(monkeypatch, failed_stage):
+    from api import control
+    from api import provider_directory_control_catalog as catalog
+
+    static_map = {"catalog_digest": "a" * 64, "items": []}
+    state = SimpleNamespace(failed_stage=failed_stage, cancelled=False, first_response_finished=False, reads=[])
+    async with _owned_database(_database_url().set(database="postgres")) as (url, _admin):
+        database = Database()
+        engine = create_async_engine(url)
+        database.engine = engine
+        database.session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+        def static_catalog():
+            if state.cancelled and not state.first_response_finished:
+                assert database._transaction_binding() is None
+            return static_map
+
+        monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-control-token")
+        monkeypatch.setattr(control, "db", database)
+        monkeypatch.setattr(control, "provider_directory_source_catalog", static_catalog)
+        monkeypatch.setattr(catalog, "provider_directory_source_catalog", static_catalog)
+        for name, stage, projection_value in (
+            ("current_profile_selection_request", "selection", {"selected": True}),
+            ("enrich_provider_directory_source_catalog", "outcomes", {**static_map, "outcomes": True}),
+            ("cms_serving_candidate", "cms", {"candidate": True}),
+        ):
+            monkeypatch.setattr(catalog, name, _catalog_projection(database, state, stage, projection_value))
+        for setting in (
+            "_SELECTION_PROJECTION_TIMEOUT_SECONDS",
+            "_OUTCOME_ENRICHMENT_TIMEOUT_SECONDS",
+            "_CMS_CANDIDATE_TIMEOUT_SECONDS",
+        ):
+            monkeypatch.setattr(catalog, setting, 0.1)
+        request = SimpleNamespace(headers={"Authorization": "Bearer synthetic-control-token"})
+        try:
+            catalog_response = await control.control_provider_directory_sources(request)
+            assert json.loads(catalog_response.body) == static_map and state.cancelled
+            assert (
+                state.reads
+                == ["selection", "outcomes", "cms"][: ["selection", "outcomes", "cms"].index(failed_stage) + 1]
+            )
+            assert database._transaction_binding() is None
+            state.first_response_finished = True
+            catalog_response = await control.control_provider_directory_sources(request)
+            assert json.loads(catalog_response.body) == {
+                **static_map,
+                "outcomes": True,
+                "profile_selection_request": {"selected": True},
+                "cms_serving_candidate": {"candidate": True},
+            }
+            assert database._transaction_binding() is None
+        finally:
+            await engine.dispose()

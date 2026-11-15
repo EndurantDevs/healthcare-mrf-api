@@ -4839,7 +4839,7 @@ async def test_control_provider_directory_sources_endpoint(monkeypatch):
     response = await control.control_provider_directory_sources(authed_request())
 
     assert json.loads(response.body) == enriched_catalog_map
-    catalog_reader.assert_awaited_once_with(editions=())
+    catalog_reader.assert_awaited_once_with(editions=(), allow_optional_fallback=False)
     assert str(session.execute.await_args.args[0]) == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
 
 

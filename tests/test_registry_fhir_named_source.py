@@ -98,14 +98,9 @@ async def test_grant_export_variant_matches_descriptor_before_callbacks(monkeypa
         case.export.pop("database_identity")
         case.export["native_read_profile"] = read_profile().document()
         case.connection.fetchrow.side_effect = AssertionError("profile-scoped export must not read physical identity")
-    if variant == "legacy_profile":
-        with pytest.raises(grants.FHIRCatalogGrantError, match="source_not_admitted"):
-            await _verify_export_consumer(case, consumer)
-        case.export["replay"].assert_not_awaited()
-        case.export["source_companies"].assert_not_awaited()
-    else:
-        await _verify_export_consumer(case, consumer)
-        case.export[consumer if consumer == "replay" else "source_companies"].assert_awaited_once()
+    # A profile-scoped export re-observes saved legacy descriptors semantically, so they stay refreshable.
+    await _verify_export_consumer(case, consumer)
+    case.export[consumer if consumer == "replay" else "source_companies"].assert_awaited_once()
     case.export["inventory"].assert_not_called()
     case.export["legacy_bindings"].assert_not_called()
     case.pool.acquire.assert_not_called()
