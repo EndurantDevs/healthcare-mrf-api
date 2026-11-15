@@ -50,7 +50,10 @@ async def _verify(fixture, connection, descriptor):
 
 
 @pytest.mark.parametrize("bootstrap_access_fixture", ["constant", "serial"], indirect=True)
-async def test_genuine_bootstrap_artifact_reuses_closed_content_for_worker(bootstrap_access_fixture, monkeypatch):
+# Release validation registers this file's test names; keep this one unchanged.
+async def test_genuine_bootstrap_artifact_reuses_closed_content_for_worker_and_api(
+    bootstrap_access_fixture, monkeypatch
+):
     fixture, receipt = bootstrap_access_fixture, bootstrap_access_fixture.receipt
     await _change_bootstrap_access(fixture)
 
