@@ -2,6 +2,7 @@
 """Complete-key semantics, exact raw replay and bounded asynchronous output."""
 
 import hashlib
+import json
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
@@ -819,3 +820,74 @@ async def test_recheck_samples_large_heaps_in_random_order():
     assert seen == rows + rows
     assert "TABLESAMPLE SYSTEM" in statements[0] and "ORDER BY random()" in statements[0]
     assert f"LIMIT {completion._RECHECK_ROWS}" in statements[0] and "TABLESAMPLE" not in statements[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("witness_mode", ["present", "empty", "orphan"])
+async def test_python_reduction_keeps_release_bound_witnesses_and_refuses_orphans(witness_mode):
+    resources = [_resource("same"), _resource("same", values=("latest",))]
+    witnesses = [] if witness_mode == "empty" else [_witness(), _witness()]
+
+    def cursor(query, *arguments, prefetch):
+        return _stream(witnesses if '"input_witness"' in query else resources)
+
+    connection = SimpleNamespace(
+        cursor=cursor,
+        execute=AsyncMock(),
+        copy_records_to_table=AsyncMock(side_effect=lambda _name, **options: f"COPY {len(options['records'])}"),
+    )
+    directory = SimpleNamespace(
+        is_semantic_resource_hash_contract=lambda _contract: False,
+        resource_payload_sha256_for_contract=lambda payload, _contract, **_options: hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode()
+        ).hexdigest(),
+    )
+    binding_by_field = {
+        "tables": {"resource_input": {"name": "input_rows"}, "witness_input": {"name": "input_witness"}},
+        "resets": {},
+    }
+    arguments = (
+        connection,
+        SimpleNamespace(schema="candidate"),
+        binding_by_field,
+        SimpleNamespace(dataset_id="dataset", resource_hash_contract="synthetic"),
+        directory,
+        {completion.storage.RESOURCE: {"name": "resources"}, completion.storage.WITNESS: {"name": "witnesses"}},
+        "a" * 64 if witness_mode == "present" else None,
+    )
+    if witness_mode == "orphan":
+        with pytest.raises(GenericCandidateError, match="unexpected_witness"):
+            await completion._reduce_payloads_python(*arguments)
+    else:
+        await completion._reduce_payloads_python(*arguments)
+    copied = connection.copy_records_to_table.await_args_list
+    assert copied[0].args == ("resources",)
+    assert json.loads(copied[0].kwargs["records"][0][completion.RESOURCE_COLUMNS.index("payload_json")]) == {
+        "values": ["latest"]
+    }
+    if witness_mode == "present":
+        assert len(copied) == 2 and copied[1].args == ("witnesses",)
+        assert len(copied[1].kwargs["records"]) == 1
+        assert copied[1].kwargs["records"][0][completion.WITNESS_COLUMNS.index("release_id")] == "a" * 64
+    else:
+        assert len(copied) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("in_transaction", [False, True])
+async def test_named_source_rows_preserve_query_parameters_and_require_atomic_read(monkeypatch, in_transaction):
+    from process import network_cms_registry_address_capture as capture
+
+    rows = [{"dataset_id": "dataset", "resource_count": 2}]
+    session = SimpleNamespace(execute=AsyncMock(return_value=rows))
+    monkeypatch.setattr(capture, "NativeReceiptSession", lambda _connection: session)
+    reader = completion._FrozenSourceRows(SimpleNamespace(is_in_transaction=lambda: in_transaction))
+    query = "SELECT * FROM candidate.header WHERE dataset_id=:dataset_id"
+    if in_transaction:
+        assert await reader.all(query, dataset_id="dataset") is rows
+        statement, parameters = session.execute.await_args.args
+        assert str(statement) == query and parameters == {"dataset_id": "dataset"}
+    else:
+        with pytest.raises(GenericCandidateError, match="transaction_required"):
+            await reader.all(query, dataset_id="dataset")
+        session.execute.assert_not_awaited()

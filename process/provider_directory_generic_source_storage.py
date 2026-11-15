@@ -19,6 +19,8 @@ from importlib import import_module
 from uuid import uuid4
 
 from db.plan_release_storage import storage_identifier, storage_relation
+from process import provider_directory_compact_payload as compact_payload
+from process import provider_directory_compact_source_storage as compact_storage
 from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
 from process.plan_release_storage_catalog import CATALOG_SQL
 from process.plan_release_storage_provision import _GRANTEES_SQL
@@ -65,8 +67,11 @@ AUXILIARY_ROOTS = (*CMS_IDENTITY_ROOTS, CMS_RESOURCE_IDENTITY_ROOT)
 CONTRACT = "generic-source-candidate-v2"
 ISOLATED_CONTRACT = "generic-source-detached-v1"
 NAMED_ISOLATED_CONTRACT = "generic-source-detached-by-name-v1"
+NAMED_COMPACT_CONTRACT = "generic-source-detached-by-name-compact-v1"
+NAMED_CONTRACTS = (NAMED_ISOLATED_CONTRACT, NAMED_COMPACT_CONTRACT)
 CMS_ISOLATED_CONTRACT = "generic-source-cms-detached-v1"
-ISOLATED_CONTRACTS = (ISOLATED_CONTRACT, NAMED_ISOLATED_CONTRACT, CMS_ISOLATED_CONTRACT)
+ISOLATED_CONTRACTS = (ISOLATED_CONTRACT, NAMED_ISOLATED_CONTRACT, NAMED_COMPACT_CONTRACT, CMS_ISOLATED_CONTRACT)
+_COMPACT_SUFFIXES = compact_storage.TABLE_SUFFIXES
 # Autovacuum on a private heap competes with the bulk load and reduce for I/O; statistics come from
 # explicit ANALYZE and attached heaps get the default back right before they join their root.
 PRIVATE_HEAP_OPTIONS = " WITH (autovacuum_enabled = false)"
@@ -157,6 +162,15 @@ def _validate_binding_shape(binding_by_field, identity, *, phases):
     """Share the document checks across loading and protected snapshot readers."""
     is_isolated = type(binding_by_field) is dict and binding_by_field.get("contract") in ISOLATED_CONTRACTS
     keys = _BINDING_KEYS | {"storage", "admission"} if is_isolated else _BINDING_KEYS
+    if type(binding_by_field) is dict and "payload_conversion" in binding_by_field:
+        keys |= {"payload_conversion"}
+    if type(binding_by_field) is dict and binding_by_field.get("contract") == NAMED_COMPACT_CONTRACT:
+        keys |= {"payload_format"}
+        _require(
+            binding_by_field.get("payload_format") == compact_payload.FORMAT
+            and binding_by_field.get("phase") in {"loading", "prepared", "ready_for_freeze", "disposed"},
+            "compact_phase_or_format_changed",
+        )
     _require(
         type(binding_by_field) is dict
         and set(binding_by_field) == keys
@@ -187,6 +201,10 @@ def _validate_binding_shape(binding_by_field, identity, *, phases):
         ),
         "binding_changed",
     )
+    if "payload_conversion" in binding_by_field:
+        from process.provider_directory_compact_source_migration import validate_conversion
+
+        validate_conversion(binding_by_field)
 
 
 def _validate_binding_storage(binding_by_field, *, is_isolated):
@@ -201,9 +219,11 @@ def _validate_binding_storage(binding_by_field, *, is_isolated):
 
 def _validate_isolated_binding_storage(binding, expected_storage):
     metadata = binding["identity"]["metadata"]
-    if binding["contract"] == NAMED_ISOLATED_CONTRACT:
+    if binding["contract"] in {NAMED_ISOLATED_CONTRACT, NAMED_COMPACT_CONTRACT}:
         _validate_named_storage(expected_storage)
         _require_named_source_identity(binding["identity"])
+    if binding["contract"] == NAMED_COMPACT_CONTRACT:
+        compact_storage.require_source_identity(binding["identity"])
     _require(binding["storage"] == expected_storage, "storage_binding_changed")
     _require(binding["phase"] != "published" and binding["auxiliary"] is None, "isolated_kind_unsupported")
     if binding["contract"] == CMS_ISOLATED_CONTRACT:
@@ -284,6 +304,9 @@ def validate_handoff_document(document, expected_storage):
 def _validate_binding_tables(binding_by_field, identity):
     """Require the complete phase-specific native inventory, without aliases."""
     _require(type(binding_by_field["tables"]) is dict, "tables_changed")
+    if binding_by_field["contract"] == NAMED_COMPACT_CONTRACT:
+        compact_storage.validate_tables(binding_by_field)
+        return
     expected = (
         set()
         if binding_by_field["phase"] in {"published", "disposed", "ready_for_freeze"}
@@ -471,27 +494,36 @@ def is_cms_identity(identity):
     )
 
 
-async def _locked(connection, policy, identity, *, phases=("loading",), lock="UPDATE"):
+async def _locked(connection, policy, identity, *, phases=("loading",), lock="UPDATE", allow_conversion=False):
     _require(lock in {"UPDATE", "KEY SHARE", "NO KEY UPDATE"}, "header_lock_invalid")
-    row = await connection.fetchrow(
+    header = await connection.fetchrow(
         f"SELECT endpoint_id,acquisition_root_run_id,status,is_current,publication_metadata_json,"
         f"candidate_storage_json FROM {storage_relation(policy.schema, HEADER)} WHERE dataset_id=$1 FOR {lock}",
         identity["dataset_id"],
     )
-    _require(row is not None, "header_missing")
-    metadata = _json(row["publication_metadata_json"])
+    _require(header is not None, "header_missing")
+    metadata = _json(header["publication_metadata_json"])
     _require(
-        row["endpoint_id"] == identity["endpoint_id"]
-        and row["acquisition_root_run_id"] == identity["acquisition_root_run_id"]
+        header["endpoint_id"] == identity["endpoint_id"]
+        and header["acquisition_root_run_id"] == identity["acquisition_root_run_id"]
         and type(metadata) is dict
-        and all(metadata.get(key) == value for key, value in identity["metadata"].items()),
+        and all(metadata.get(key) == field_value for key, field_value in identity["metadata"].items()),
         "acquisition_changed",
     )
     if "published" not in phases and "ready_for_freeze" not in phases:
-        _require(row["status"] == "acquiring" and row["is_current"] is False, "header_sealed")
-    binding_by_field = _json(row["candidate_storage_json"])
+        _require(header["status"] == "acquiring" and header["is_current"] is False, "header_sealed")
+    binding_by_field = _json(header["candidate_storage_json"])
     if binding_by_field is not None:
+        _require(
+            binding_by_field.get("contract") != NAMED_COMPACT_CONTRACT
+            or bool(set(phases) & {"loading", "prepared", "ready_for_freeze", "disposed"}),
+            "compact_completion_unavailable",
+        )
         _validate_binding(binding_by_field, identity, phases=phases)
+        _require(
+            allow_conversion or binding_by_field.get("payload_conversion", {}).get("state") != "copying",
+            "payload_conversion_incomplete",
+        )
         from process.provider_directory_generic_source_policy import current_source_storage_binding
 
         _require(
@@ -640,7 +672,7 @@ def _require_input_sequence(row, policy, owner):
 
 
 async def _verify_tables(connection, policy, binding_by_field):
-    if binding_by_field["contract"] == NAMED_ISOLATED_CONTRACT:
+    if binding_by_field["contract"] in {NAMED_ISOLATED_CONTRACT, NAMED_COMPACT_CONTRACT}:
         return
     proofs = binding_by_field["tables"]
     # Published attached children retain SELECT only; loading/prepared heaps are private.
@@ -687,7 +719,7 @@ async def _verify_tables_recently(connection, policy, binding_by_field):
     catalog capture behind it is bounded, because the private heaps are reachable
     solely through this owner's own transactions.
     """
-    if binding_by_field["contract"] == NAMED_ISOLATED_CONTRACT:
+    if binding_by_field["contract"] in {NAMED_ISOLATED_CONTRACT, NAMED_COMPACT_CONTRACT}:
         return
     key = _encoded(
         {
@@ -736,14 +768,22 @@ async def _create_source_input_heaps(connection, policy, identity, *, by_name):
     return {key: captured[name] for key, name in names_by_kind.items()}
 
 
-async def prepare_generic_source_candidate(database, directory, candidate):
+async def prepare_generic_source_candidate(database, directory, candidate, *, payload_format=None):
     """Initialize two unindexed private input heaps, or authenticate exact resume."""
     identity = candidate_identity(directory, candidate)
+    _require(payload_format in (None, compact_payload.FORMAT), "payload_format_changed")
     async with source_owner_transaction(database) as publisher:
         connection, policy = publisher.connection, publisher.policy
         isolated = _require_candidate_storage(publisher, directory, identity)
-        binding_by_field = await _locked(connection, policy, identity)
+        if payload_format is not None:
+            _require(isinstance(isolated, NamedFHIRSourceStorage), "compact_named_source_required")
+            compact_storage.require_source_identity(identity)
+        binding_by_field = await _locked(connection, policy, identity, allow_conversion=True)
         if binding_by_field is not None:
+            _require(
+                payload_format is None or binding_by_field.get("payload_format") == payload_format,
+                "payload_format_changed",
+            )
             await _verify_tables(connection, policy, binding_by_field)
             return binding_by_field
         old_payload = await connection.fetchval(
@@ -752,7 +792,11 @@ async def prepare_generic_source_candidate(database, directory, candidate):
         )
         _require(old_payload is False and not candidate.reused_from_checkpoint, "legacy_acquisition_rerun_required")
         by_name = isinstance(isolated, NamedFHIRSourceStorage)
-        tables_by_kind = await _create_source_input_heaps(connection, policy, identity, by_name=by_name)
+        tables_by_kind = (
+            await compact_storage.create_inputs(connection, policy)
+            if payload_format is not None
+            else await _create_source_input_heaps(connection, policy, identity, by_name=by_name)
+        )
         binding_by_field = dict(
             contract=CONTRACT,
             identity=identity,
@@ -776,6 +820,8 @@ async def prepare_generic_source_candidate(database, directory, candidate):
                 admission=None,
             )
         if by_name:
+            if payload_format is not None:
+                binding_by_field.update(contract=NAMED_COMPACT_CONTRACT, payload_format=payload_format)
             _validate_binding(binding_by_field, identity, phases=("loading",))
         await _store(connection, policy, identity, None, binding_by_field)
         return binding_by_field
@@ -978,7 +1024,7 @@ async def _locked_transition_candidate(
     candidate_by_field = _json(header["candidate_storage_json"])
     stored_identity = candidate_by_field.get("identity") if type(candidate_by_field) is dict else None
     _validate_binding_shape(candidate_by_field, stored_identity, phases=("loading",))
-    if not by_name or candidate_by_field["contract"] == NAMED_ISOLATED_CONTRACT:
+    if not by_name or candidate_by_field["contract"] in NAMED_CONTRACTS:
         _validate_binding_tables(candidate_by_field, stored_identity)
     is_empty_vsp_failure = _is_empty_vsp_checkpoint_failure(
         header, candidate_by_field, identity_by_field, expected_counts, new_storage
@@ -995,8 +1041,7 @@ async def _locked_transition_candidate(
         _require(type(candidate_storage_by_field) is dict, "transition_candidate_changed")
         candidate_storage_by_field = {key: candidate_storage_by_field.get(key) for key in old_storage}
     _require(
-        candidate_by_field["contract"]
-        in ((ISOLATED_CONTRACT, NAMED_ISOLATED_CONTRACT) if by_name else (ISOLATED_CONTRACT,))
+        candidate_by_field["contract"] in ((ISOLATED_CONTRACT, *NAMED_CONTRACTS) if by_name else (ISOLATED_CONTRACT,))
         and (not has_changed_header_owner or is_empty_vsp_failure)
         and candidate_by_field["admission"] is None
         and candidate_by_field["auxiliary"] is None
@@ -1452,6 +1497,10 @@ async def _verify_transition_inputs(
     is_empty_vsp_failure=False,
 ):
     """Compare completed or resumable checkpoints with every active detached input row."""
+    if candidate_by_field["contract"] == NAMED_COMPACT_CONTRACT:
+        from process.provider_directory_compact_source_completion import validate_storage
+
+        await validate_storage(connection, policy, candidate_by_field)
     await _verify_transition_checkpoints(
         connection,
         policy,
@@ -1464,8 +1513,13 @@ async def _verify_transition_inputs(
     )
     dataset_id = identity_by_field["dataset_id"]
     resource_relation = storage_relation(policy.schema, candidate_by_field["tables"]["resource_input"]["name"])
+    has_retired_observations = (
+        candidate_by_field["contract"] == NAMED_COMPACT_CONTRACT or "payload_conversion" in candidate_by_field
+    )
     input_rows = await connection.fetch(
         "SELECT dataset_id,resource_type,count(*) AS total,"
+        "count(*) FILTER (WHERE batch_ordinal<=0 OR batch_ordinal>$3::bigint "
+        "OR row_ordinal<0 OR row_ordinal>=4096) AS invalid,"
         "count(*) FILTER (WHERE batch_ordinal > greatest($1::bigint,"
         "coalesce(($2::jsonb->>resource_type)::bigint,0)) AND batch_ordinal <= $3::bigint) AS active "
         "FROM " + resource_relation + " GROUP BY dataset_id,resource_type",
@@ -1473,21 +1527,37 @@ async def _verify_transition_inputs(
         _encoded(candidate_by_field["resets"]),
         candidate_by_field["ordinal"],
     )
+    _require_transition_census(input_rows, dataset_id, expected_counts, has_retired_observations)
+    await _verify_transition_witness(connection, policy, candidate_by_field, dataset_id, is_empty_vsp_failure)
+
+
+def _require_transition_census(input_rows, dataset_id, expected_counts, has_retired_observations):
+    """Match active checkpoint counts while retaining exactly reset-excluded observations."""
     input_counts_by_type = {input_record["resource_type"]: input_record["total"] for input_record in input_rows}
     _require(
         len(input_counts_by_type) == len(input_rows)
         and all(
             input_record["dataset_id"] == dataset_id
             and input_record["resource_type"] in expected_counts
-            and input_record["total"] == input_record["active"] == expected_counts[input_record["resource_type"]]
+            and input_record["active"] == expected_counts[input_record["resource_type"]]
+            and (
+                input_record["invalid"] == 0 and input_record["total"] >= input_record["active"]
+                if has_retired_observations
+                else input_record["total"] == input_record["active"]
+            )
             for input_record in input_rows
         )
         and all(
-            input_counts_by_type.get(resource_type, 0) == count for resource_type, count in expected_counts.items()
+            any(
+                observation["resource_type"] == resource_type and observation["active"] == count
+                for observation in input_rows
+            )
+            or count == 0
+            and resource_type not in input_counts_by_type
+            for resource_type, count in expected_counts.items()
         ),
         "transition_input_changed",
     )
-    await _verify_transition_witness(connection, policy, candidate_by_field, dataset_id, is_empty_vsp_failure)
 
 
 async def has_empty_isolated_vsp_storage(directory, candidate, header):
@@ -1664,7 +1734,11 @@ def _transition_result(
     successor_by_field = {**candidate_by_field, "storage": new_storage}
     if is_named_storage:
         successor_by_field.update(
-            contract=NAMED_ISOLATED_CONTRACT,
+            contract=(
+                NAMED_COMPACT_CONTRACT
+                if candidate_by_field["contract"] == NAMED_COMPACT_CONTRACT
+                else NAMED_ISOLATED_CONTRACT
+            ),
             tables={kind: {"name": table["name"]} for kind, table in candidate_by_field["tables"].items()},
         )
         receipt_by_field = {
@@ -1775,31 +1849,56 @@ async def append_generic_source_batch(database, directory, candidate, resources,
         previous = await _locked(connection, policy, identity, lock="KEY SHARE")
         _require(previous is not None, "preparation_required")
         await _verify_tables_recently(connection, policy, previous)
+        is_compact = previous["contract"] == NAMED_COMPACT_CONTRACT
+        if is_compact:
+            _require(not witnesses, "compact_witness_unsupported")
+            previous = await _locked(connection, policy, identity, lock="NO KEY UPDATE")
+        sequence_root = "resource_aliases" if is_compact else "resource_input"
         ordinal = await connection.fetchval(
             "SELECT nextval(pg_get_serial_sequence($1,'batch_ordinal'))",
-            storage_relation(policy.schema, previous["tables"]["resource_input"]["name"]),
+            storage_relation(policy.schema, previous["tables"][sequence_root]["name"]),
         )
         _require(type(ordinal) is int and previous["ordinal"] < ordinal < 2**63 - 1, "ordinal_exhausted")
-        resources = await staged_role_rows(
-            connection, policy.schema, previous["tables"]["resource_input"]["name"], previous, resources
-        )
-        for key, columns, batch_rows in (
-            ("resource_input", RESOURCE_COLUMNS, resources),
-            ("witness_input", WITNESS_COLUMNS, witnesses),
-        ):
-            if batch_rows:
-                await _copy(
-                    connection,
-                    policy,
-                    previous["tables"][key]["name"],
-                    (*columns, "batch_ordinal", "row_ordinal"),
-                    _records(batch_rows, columns, ordinal),
-                )
+        if is_compact:
+            await _append_compact_resources(connection, policy, previous, resources, ordinal)
+        else:
+            resources = await staged_role_rows(
+                connection, policy.schema, previous["tables"]["resource_input"]["name"], previous, resources
+            )
+            for key, columns, batch_rows in (
+                ("resource_input", RESOURCE_COLUMNS, resources),
+                ("witness_input", WITNESS_COLUMNS, witnesses),
+            ):
+                if batch_rows:
+                    await _copy(
+                        connection,
+                        policy,
+                        previous["tables"][key]["name"],
+                        (*columns, "batch_ordinal", "row_ordinal"),
+                        _records(batch_rows, columns, ordinal),
+                    )
         current = await _locked(connection, policy, identity, lock="NO KEY UPDATE")
         _require(current is not None and current["tables"] == previous["tables"], "storage_binding_changed")
         binding_by_field = {**current, "ordinal": max(current["ordinal"], ordinal)}
         await _store(connection, policy, identity, current, binding_by_field)
     return len(resources)
+
+
+async def _append_compact_resources(connection, policy, binding, resources, ordinal):
+    """Reuse the shared COPY cancellation cleanup and original owner savepoint."""
+    try:
+        await compact_payload.append_compact_payload_batch(
+            connection,
+            compact_storage.payload_tables(policy, binding["tables"]),
+            resources,
+            dataset_id=binding["identity"]["dataset_id"],
+            batch_ordinal=ordinal,
+            format_id=binding["payload_format"],
+        )
+    except asyncio.CancelledError, TimeoutError:
+        await close_interrupted_copy(connection)
+        await invalidate_copy_owner(source_copy_session(), connection)
+        raise
 
 
 async def reset_generic_source_family(database, directory, candidate, resource_type=None):
@@ -1871,6 +1970,7 @@ async def discard_generic_source_inputs(database, directory, candidate, release)
         await _verify_tables(connection, policy, binding_by_field)
         auxiliary = binding_by_field["auxiliary"]
         receipts = list(binding_by_field["tables"].values())
+        receipts = await _discard_payload_views(connection, policy, binding_by_field, receipts)
         if auxiliary is not None:
             receipts.extend(auxiliary["tables"].values())
         for table in receipts:
@@ -1885,7 +1985,23 @@ async def discard_generic_source_inputs(database, directory, candidate, release)
             }
         )
         disposed_by_field = {**binding_by_field, "phase": "disposed", "tables": {}, "auxiliary": disposed_auxiliary}
+        disposed_by_field.pop("payload_conversion", None)
         await _store(connection, policy, binding_by_field["identity"], binding_by_field, disposed_by_field)
+
+
+async def _discard_payload_views(connection, policy, binding_by_field, receipts):
+    """Dispose only the candidate's views and its retained alternate conversion inventory."""
+    if binding_by_field["contract"] == NAMED_COMPACT_CONTRACT:
+        for root in ("resource_input", RESOURCE):
+            view = binding_by_field["tables"].get(root)
+            if view is not None:
+                await connection.execute(f"DROP VIEW {storage_relation(policy.schema, view['name'])}")
+                receipts = [table for table in receipts if table != view]
+    if "payload_conversion" in binding_by_field:
+        from process.provider_directory_compact_source_migration import discard_conversion_tables
+
+        await discard_conversion_tables(connection, policy, binding_by_field)
+    return receipts
 
 
 @asynccontextmanager

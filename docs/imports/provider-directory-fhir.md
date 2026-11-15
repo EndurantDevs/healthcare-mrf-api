@@ -1834,6 +1834,28 @@ retries. Each cycle keeps the same
 URL and honors `Retry-After` and the resource deadline. Exhausted scans retain
 their checkpoints and remain incomplete and non-current.
 
+Named isolated candidates for this source use compact payload blocks while
+preserving the original resource columns, observation order, IDs, hashes and
+references. Ordered HealthcareService references use UUID arrays only when every
+reference has the exact supported form; other references retain their full text.
+Missing, null and empty fields remain distinct.
+
+Before acquisition resumes, an existing plain candidate converts through bounded
+COPY segments under the existing source transaction. Each segment reconstructs
+and compares its original rows before committing conversion progress. Interrupted
+conversion resumes from that progress, with the old input heaps retained until
+validated publication handoff. Handoff removes those exact superseded inputs and
+their conversion metadata in one transaction; a failed handoff restores both.
+Conversion does not change pagination checkpoints,
+resource reset boundaries or allocation sequence gaps. It switches the candidate
+to compact storage only after complete structural and row-count validation.
+
+Publication moves the closed compact relations into the immutable edition and
+uses the existing atomic pointer switch and rollback. Bounded readers reconstruct
+the original resource shape; unknown formats and missing backing rows fail closed.
+Storage reduction does not establish faster processing or a capacity guarantee;
+measure acquisition, validation, publication and readers on the intended dataset.
+
 Configure an exact `api_bases` or `sources` credential rule using the existing
 secret-mounted JSON format below. Anthem uses OAuth2 `client_credentials` with
 Basic client authentication at

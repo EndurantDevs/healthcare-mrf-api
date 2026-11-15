@@ -38,6 +38,18 @@ def test_complete_key_reduction_preserves_semantic_union_replay_and_order():
     assert rows[0]["payload_json"] == {"values": ["one"]}
 
 
+def test_empty_resource_and_witness_inputs_produce_no_observations():
+    assert _reduce(iter(())) == []
+    assert list(candidate.reduce_sorted_witnesses(iter(()), "dataset", "a" * 64)) == []
+
+
+@pytest.mark.parametrize("value", [float("nan"), object()])
+def test_witness_canonicalization_refuses_non_json_payloads(value):
+    row_by_field = {**_witness(), "raw_payload_json": {"invalid": value}}
+    with pytest.raises(candidate.GenericCandidateError, match="witness_payload_invalid"):
+        list(candidate.reduce_sorted_witnesses([row_by_field], "dataset", "a" * 64))
+
+
 def test_one_identity_is_complete_before_it_is_emitted():
     visited_names = []
 

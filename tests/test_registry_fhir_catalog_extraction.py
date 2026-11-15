@@ -17,6 +17,14 @@ from process.registry_fhir_catalog_extraction import (
 )
 
 
+@pytest.fixture(autouse=True)
+def legacy_storage_layout(monkeypatch):
+    """These protocol mocks describe the existing ordinary resource heap."""
+    from process import provider_directory_compact_edition
+
+    monkeypatch.setattr(provider_directory_compact_edition, "compact_edition_tables", AsyncMock(return_value=None))
+
+
 def row(resource_type, resource_id, payload, *, raw=False):
     return {
         "resource_type": resource_type,

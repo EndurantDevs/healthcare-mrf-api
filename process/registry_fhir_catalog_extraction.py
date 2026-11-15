@@ -672,11 +672,26 @@ async def iter_fhir_catalog_raw_pages(
     resources = await fhir_catalog_resource_relation(
         connection, schema_name=schema_name, dataset_id=dataset_id, source_read=source_read
     )
+    from process.provider_directory_compact_edition import compact_catalog_page, compact_edition_tables
+
+    compact_tables = await compact_edition_tables(connection, schema_name) if source_read is None else None
     cursor = after_resource or ("", "")
     query = _PAGE_SQL.format(resources=resources)
     while True:
         await verify_fhir_catalog_source_read(connection, source_read, schema_name=schema_name, dataset_id=dataset_id)
-        source_records = await connection.fetch(query, dataset_id, resource_types, *cursor, page_rows, page_bytes)
+        source_records = (
+            await connection.fetch(query, dataset_id, resource_types, *cursor, page_rows, page_bytes)
+            if compact_tables is None
+            else await compact_catalog_page(
+                connection,
+                compact_tables,
+                dataset_id,
+                resource_types=resource_types,
+                after=cursor,
+                page_rows=page_rows,
+                page_bytes=page_bytes,
+            )
+        )
         if not source_records:
             return
         _check_fhir_catalog_page_bounds(source_records, page_bytes)
