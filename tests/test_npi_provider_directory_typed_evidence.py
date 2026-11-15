@@ -10,10 +10,15 @@ def _typed_role_fhir_metadata() -> dict[str, object]:
         "versionId": "7",
         "source": "https://user:secret@example.test/fhir?_token=secret",
         "profile": profiles,
-        "security": [{
-            "system": "https://example.test/security", "code": "restricted",
-            "display": "x" * 4096, "ignored": "not exposed",
-        }] * 40,
+        "security": [
+            {
+                "system": "https://example.test/security",
+                "code": "restricted",
+                "display": "x" * 4096,
+                "ignored": "not exposed",
+            }
+        ]
+        * 40,
         "tag": [{"code": "directory", "userSelected": True}],
         "ignored": "not exposed",
     }
@@ -128,8 +133,8 @@ def test_role_evidence_sql_projects_typed_details_without_catalog_refs():
         "role.telehealth AS role_telehealth",
         "current_endpoints AS NOT MATERIALIZED",
         "current_healthcare_services AS NOT MATERIALIZED",
-        "JOIN current_endpoints AS endpoint",
-        "JOIN current_healthcare_services AS service",
+        "SELECT * FROM current_endpoints AS endpoint",
+        "SELECT * FROM current_healthcare_services AS service",
         "AS role_endpoints",
         "AS role_healthcare_services",
         "LIMIT 32",
@@ -146,9 +151,7 @@ def test_role_evidence_sql_projects_typed_details_without_catalog_refs():
 
 def test_legacy_insurance_plan_ctes_start_from_incomplete_requested_sources():
     role_sql = npi_module._provider_directory_role_evidence_sql("mrf", has_catalog=True)
-    affiliation_sql = npi_module._provider_directory_affiliation_evidence_sql(
-        "mrf", has_catalog=True
-    )
+    affiliation_sql = npi_module._provider_directory_affiliation_evidence_sql("mrf", has_catalog=True)
 
     for sql, source_cte, scope_name in (
         (role_sql, "roles", "legacy_role_insurance_plans"),
@@ -179,9 +182,9 @@ def test_affiliation_evidence_maps_typed_plan_details():
     plan_evidence_map["affiliation_id"] = "affiliation-100"
     plan_evidence_map.pop("role_id")
 
-    affiliation_evidence = npi_module._map_provider_directory_affiliation_evidence(
-        [plan_evidence_map]
-    )[("pdfhir_aetna", "affiliation-100")]
+    affiliation_evidence = npi_module._map_provider_directory_affiliation_evidence([plan_evidence_map])[
+        ("pdfhir_aetna", "affiliation-100")
+    ]
 
     plan_detail = affiliation_evidence["insurance_plans"][0]
     assert plan_detail["name"] == "Example Choice"
@@ -191,9 +194,9 @@ def test_affiliation_evidence_maps_typed_plan_details():
 
 def test_role_evidence_mapper_emits_availability_and_name_only_plan_details():
     """Keep typed FHIR role and plan fields compatible with the evidence surface."""
-    role_evidence = npi_module._map_provider_directory_role_evidence(
-        _typed_evidence_rows()
-    )[("pdfhir_aetna", "role-100")]
+    role_evidence = npi_module._map_provider_directory_role_evidence(_typed_evidence_rows())[
+        ("pdfhir_aetna", "role-100")
+    ]
     role_detail = role_evidence["practitioner_role"]
     plan_detail = role_evidence["insurance_plans"][0]
 
@@ -234,9 +237,7 @@ def test_role_evidence_mapper_emits_availability_and_name_only_plan_details():
     assert role_detail["fhir_provenance"]["meta"]["source"] == "https://example.test/fhir"
     assert len(role_detail["fhir_provenance"]["meta"]["security"]) == 32
     assert len(role_detail["fhir_provenance"]["meta"]["security"][0]["display"]) == 2048
-    assert role_detail["fhir_provenance"]["meta"]["tags"] == [
-        {"code": "directory", "user_selected": True}
-    ]
+    assert role_detail["fhir_provenance"]["meta"]["tags"] == [{"code": "directory", "user_selected": True}]
     assert plan_detail["identifier"] is None
     assert plan_detail["name"] == "Example Choice"
     assert len(plan_detail["plan_backbones"]) == 2
@@ -250,38 +251,30 @@ def test_source_details_remove_url_userinfo_before_response_projection():
             {
                 "source_id": "pdfhir_aetna",
                 "endpoint_id": "endpoint-aetna",
-                "canonical_api_base": (
-                    "https://user:secret@example.test/fhir?_token=secret"
-                ),
+                "canonical_api_base": ("https://user:secret@example.test/fhir?_token=secret"),
                 "org_name": "Example Health",
                 "plan_name": None,
             }
         ]
     )
 
-    assert source_details["pdfhir_aetna"]["canonical_api_base"] == (
-        "https://example.test/fhir"
-    )
+    assert source_details["pdfhir_aetna"]["canonical_api_base"] == ("https://example.test/fhir")
 
 
 def test_malformed_canonical_api_base_with_userinfo_fails_closed():
     malformed_api_base = "https://user:secret@[invalid/fhir"
 
-    assert npi_module._normalized_provider_directory_api_base(
-        malformed_api_base
-    ) == ""
-    assert npi_module._normalized_provider_directory_api_base("relative/fhir") == (
-        "relative/fhir"
-    )
+    assert npi_module._normalized_provider_directory_api_base(malformed_api_base) == ""
+    assert npi_module._normalized_provider_directory_api_base("relative/fhir") == ("relative/fhir")
 
 
 def test_role_acceptance_aliases_only_fill_from_the_same_source_value():
     legacy_role = _typed_role_evidence_map()
     legacy_role.pop("role_new_patient_acceptance")
 
-    detail = npi_module._map_provider_directory_role_evidence([legacy_role])[
-        ("pdfhir_aetna", "role-100")
-    ]["practitioner_role"]
+    detail = npi_module._map_provider_directory_role_evidence([legacy_role])[("pdfhir_aetna", "role-100")][
+        "practitioner_role"
+    ]
 
     assert detail["accepting_patients"] == {"code": "accepting"}
     assert detail["new_patient_acceptance"] == {"code": "accepting"}
@@ -318,9 +311,7 @@ def test_endpoint_evidence_keeps_role_details_keyed_to_the_address_role():
     )[0]
 
     assert evidence["practitioner_role_ids"] == ["role-a"]
-    assert evidence["practitioner_roles"] == [
-        role_evidence_map[(source_id, "role-a")]["practitioner_role"]
-    ]
+    assert evidence["practitioner_roles"] == [role_evidence_map[(source_id, "role-a")]["practitioner_role"]]
 
 
 def test_endpoint_evidence_deduplicates_same_plan_across_role_provenance():
@@ -334,9 +325,7 @@ def test_endpoint_evidence_deduplicates_same_plan_across_role_provenance():
         (
             ("source-a", "role-a"),
             {
-                "insurance_plans": [
-                    {**plan_map, "provenance": "network-derived"}
-                ],
+                "insurance_plans": [{**plan_map, "provenance": "network-derived"}],
                 "networks": [],
             },
         ),
@@ -346,8 +335,6 @@ def test_endpoint_evidence_deduplicates_same_plan_across_role_provenance():
         ),
     ]
 
-    plans, _networks, _metadata, _evidence = (
-        npi_module._merge_provider_directory_role_evidence(role_evidence_list)
-    )
+    plans, _networks, _metadata, _evidence = npi_module._merge_provider_directory_role_evidence(role_evidence_list)
 
     assert plans == [plan_map]

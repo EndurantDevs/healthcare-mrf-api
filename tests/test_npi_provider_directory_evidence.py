@@ -159,6 +159,21 @@ def test_role_evidence_sql_uses_indexed_catalog_lookup_and_active_resources():
     assert "BOOL_OR(role_network.plan_provenance = 'network-derived')" in sql
 
 
+@pytest.mark.parametrize(
+    ("alias", "relation"), [("endpoint", "current_endpoints"), ("service", "current_healthcare_services")]
+)
+def test_role_reference_details_use_one_keyed_lookup_per_reference(alias, relation):
+    # A merge join here walked every HealthcareService of the dataset per role (seconds to minutes per request).
+    sql = " ".join(npi_module._provider_directory_role_evidence_sql("mrf", has_catalog=True).split())
+
+    assert f"JOIN {relation} AS {alias}" not in sql
+    assert (
+        f"CROSS JOIN LATERAL (SELECT * FROM {relation} AS {alias} WHERE {alias}.dataset_id = role.dataset_id "
+        f"AND {alias}.source_id = role.source_id AND {alias}.resource_id = "
+    ) in sql
+    assert f"OFFSET 0) AS {alias} ORDER BY {alias}.resource_id LIMIT 32" in sql
+
+
 def test_role_plan_cap_prioritizes_direct_plans_and_reports_both_bounds():
     sql = npi_module._provider_directory_role_evidence_sql("mrf", has_catalog=True)
     cap = npi_module.MAX_PROVIDER_DIRECTORY_PLANS_PER_ROLE
