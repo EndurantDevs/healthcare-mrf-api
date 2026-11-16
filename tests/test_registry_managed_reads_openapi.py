@@ -62,6 +62,7 @@ def test_detail_query_matches_closed_parser_fields(schemas):
         "address_grouping",
         "address_limit",
         "address_offset",
+        "min_address_sources",
     }
     assert query["properties"]["include"]["uniqueItems"] is True
     assert query["properties"]["address_limit"]["default"] == "5"

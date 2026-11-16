@@ -15,7 +15,7 @@ from api.provider_service_source_policy import admitted_plan_release_bindings
 GROUP_PLAN_NATIVE_FIELDS = frozenset(
     "plan_release_id plan_id market_type source_key cursor limit enrich count specialty classification "
     "taxonomy_codes provider_sex_code include_subspecialties primary_only city state zip5 "
-    "zip_radius_miles include_mail_addresses".split()
+    "zip_radius_miles include_mail_addresses min_address_sources".split()
 )
 
 

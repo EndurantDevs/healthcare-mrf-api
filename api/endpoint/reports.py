@@ -15,6 +15,7 @@ from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage, NotFound
 from sqlalchemy import text
 
+from api.address_source_filter import address_source_filter_sql, parse_min_address_sources
 from api.endpoint.pagination import parse_pagination
 from api.network_address_scope import (
     _request_selector,
@@ -48,6 +49,7 @@ MANAGED_REPORT_FIELDS = {
     "pharmacy-state-stats": frozenset(),
     "pharmacy-context": frozenset("npi as_of include_staffing".split()),
 }
+MANAGED_REPORT_FIELDS = {kind: fields | {"min_address_sources"} for kind, fields in MANAGED_REPORT_FIELDS.items()}
 
 
 def _report_args(request, native_args):
@@ -186,6 +188,7 @@ class _MarketSummaryQuery:
     zip_code: str | None = None
     chain: str | None = None
     market_id: str | None = None
+    min_address_sources: int = 0
 
 
 _MARKET_INTEGER_METRICS = (
@@ -249,6 +252,15 @@ def _pharmacy_address_table_sql(source: str | None = None) -> str:
 
 def _is_pharmacy_address_unified(address_table_sql: str) -> bool:
     return address_table_sql.endswith(".entity_address_unified") or is_scoped_address_relation(address_table_sql)
+
+
+def _source_filtered_report_addresses(address_table_sql, minimum):
+    if not minimum:
+        return address_table_sql
+    predicate = address_source_filter_sql(
+        "source_address", minimum, has_source_count=_is_pharmacy_address_unified(address_table_sql)
+    )
+    return f"(SELECT * FROM {address_table_sql} source_address WHERE {predicate})"
 
 
 def _pharmacy_address_zip5_expr(alias: str, address_table_sql: str) -> str:
@@ -621,10 +633,12 @@ def _build_chain_summary_sql(
     has_staffing_helper: bool,
     include_states: bool,
     address_table_sql: str | None = None,
+    min_address_sources: int = 0,
 ) -> tuple[str, dict[str, Any]]:
     """Build chain summary SQL."""
     address_table_sql = address_table_sql or _pharmacy_address_table_sql()
     address_order_expr = _pharmacy_address_order_expr("a", address_table_sql)
+    address_table_sql = _source_filtered_report_addresses(address_table_sql, min_address_sources)
     should_match_all_names = _is_match_all_name_filters(names)
     if should_match_all_names:
         name_clause = ""
@@ -634,6 +648,8 @@ def _build_chain_summary_sql(
     if not name_clause and not should_match_all_names:
         raise InvalidUsage("At least one name_like value is required")
     parameter_map["include_states"] = include_states
+    if min_address_sources:
+        parameter_map["min_address_sources"] = min_address_sources
     schema = "mrf"
     staffing_table = _qualified_table_name(NPIPhoneStaffing.__table__)
     if has_staffing_helper:
@@ -793,9 +809,12 @@ async def _query_chain_summary(
     *,
     names: list[str],
     include_states: bool = True,
+    min_address_sources: int = 0,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], bool]:
-    has_staffing_helper = current_network_address_scope() is None and await _is_table_available(
-        session, NPIPhoneStaffing.__table__
+    has_staffing_helper = (
+        not min_address_sources
+        and current_network_address_scope() is None
+        and await _is_table_available(session, NPIPhoneStaffing.__table__)
     )
     address_table_sql = await _resolve_pharmacy_address_table_sql(session)
     sql, params = _build_chain_summary_sql(
@@ -803,6 +822,7 @@ async def _query_chain_summary(
         has_staffing_helper=has_staffing_helper,
         include_states=include_states,
         address_table_sql=address_table_sql,
+        **({"min_address_sources": min_address_sources} if min_address_sources else {}),
     )
     result = await session.execute(text(sql), scoped_address_parameters(params))
     row = result.mappings().first() or {}
@@ -880,10 +900,12 @@ def _build_pharmacy_state_stats_sql(
     *,
     has_staffing_helper: bool,
     address_table_sql: str | None = None,
+    min_address_sources: int = 0,
 ) -> str:
     """Build pharmacy state stats SQL."""
     address_table_sql = address_table_sql or _pharmacy_address_table_sql()
     address_order_expr = _pharmacy_address_order_expr("a", address_table_sql)
+    address_table_sql = _source_filtered_report_addresses(address_table_sql, min_address_sources)
     schema = "mrf"
     staffing_table = _qualified_table_name(NPIPhoneStaffing.__table__)
     if has_staffing_helper:
@@ -1076,33 +1098,39 @@ def _pharmacy_state_stats_methodology(*, staffing_helper_available: bool) -> dic
     }
 
 
-async def _query_pharmacy_state_stats(session) -> tuple[list[dict[str, Any]], bool]:
-    has_staffing_helper = current_network_address_scope() is None and await _is_table_available(
-        session, NPIPhoneStaffing.__table__
+async def _query_pharmacy_state_stats(session, *, min_address_sources=0) -> tuple[list[dict[str, Any]], bool]:
+    has_staffing_helper = (
+        not min_address_sources
+        and current_network_address_scope() is None
+        and await _is_table_available(session, NPIPhoneStaffing.__table__)
     )
     address_table_sql = await _resolve_pharmacy_address_table_sql(session)
-    sql = _build_pharmacy_state_stats_sql(
+    statement_sql = _build_pharmacy_state_stats_sql(
         has_staffing_helper=has_staffing_helper,
         address_table_sql=address_table_sql,
+        **({"min_address_sources": min_address_sources} if min_address_sources else {}),
     )
-    result = (
-        await session.execute(text(sql), scoped_address_parameters({}))
-        if current_network_address_scope() is not None
-        else await session.execute(text(sql))
+    state_result = (
+        await session.execute(
+            text(statement_sql),
+            scoped_address_parameters({"min_address_sources": min_address_sources} if min_address_sources else {}),
+        )
+        if current_network_address_scope() is not None or min_address_sources
+        else await session.execute(text(statement_sql))
     )
-    rows = []
-    for row in result.mappings().all():
-        rows.append(
+    state_rows = []
+    for state_record in state_result.mappings().all():
+        state_rows.append(
             {
-                "state": str(row.get("state") or "").upper(),
-                "nppes_pharmacies": _coerce_int(row.get("nppes_pharmacies")),
-                "nppes_pharmacists": _coerce_int(row.get("nppes_pharmacists")),
-                "active_pharmacists": _coerce_int(row.get("active_pharmacists")),
-                "active_pharmacies": _coerce_int(row.get("active_pharmacies")),
-                "aca_pharmacies": _coerce_int(row.get("aca_pharmacies")),
+                "state": str(state_record.get("state") or "").upper(),
+                "nppes_pharmacies": _coerce_int(state_record.get("nppes_pharmacies")),
+                "nppes_pharmacists": _coerce_int(state_record.get("nppes_pharmacists")),
+                "active_pharmacists": _coerce_int(state_record.get("active_pharmacists")),
+                "active_pharmacies": _coerce_int(state_record.get("active_pharmacies")),
+                "aca_pharmacies": _coerce_int(state_record.get("aca_pharmacies")),
             }
         )
-    return _canonicalize_pharmacy_state_stats_rows(rows), has_staffing_helper
+    return _canonicalize_pharmacy_state_stats_rows(state_rows), has_staffing_helper
 
 
 def _build_pharmacy_state_stats_payload(
@@ -1132,11 +1160,15 @@ def _build_market_sql(
     zip_code: str | None,
     chain: str | None,
     address_table_sql: str | None = None,
+    min_address_sources: int = 0,
 ) -> tuple[str, str, dict[str, Any]]:
     """Build market SQL."""
     address_table_sql = address_table_sql or _pharmacy_address_table_sql()
     address_zip5_expr = _pharmacy_address_zip5_expr("a", address_table_sql)
+    address_table_sql = _source_filtered_report_addresses(address_table_sql, min_address_sources)
     parameter_map: dict[str, Any] = {}
+    if min_address_sources:
+        parameter_map["min_address_sources"] = min_address_sources
     base_filters: list[str] = [
         _report_address_type_clause("a"),
         "a.taxonomy_array && pc.codes",
@@ -1649,6 +1681,7 @@ async def _build_market_summary_query_sql(session, query: _MarketSummaryQuery):
         zip_code=query.zip_code,
         chain=query.chain,
         address_table_sql=address_table_sql,
+        **({"min_address_sources": query.min_address_sources} if query.min_address_sources else {}),
     )
     parameter_map = dict(parameter_map)
     parameter_map.update(
@@ -1725,7 +1758,9 @@ async def _query_market_summaries(
     return total, [_normalize_market_summary(market_row, query) for market_row in market_rows]
 
 
-async def _fetch_pharmacy_context(session, *, npi: int, as_of: datetime.date) -> dict[str, Any] | None:
+async def _fetch_pharmacy_context(
+    session, *, npi: int, as_of: datetime.date, min_address_sources=0
+) -> dict[str, Any] | None:
     """Fetch pharmacy context."""
     has_partd = await _is_table_available(session, PartDPharmacyActivity.__table__)
     has_license = await _is_table_available(session, PharmacyLicenseRecord.__table__)
@@ -1869,7 +1904,7 @@ SELECT
     {partd_fields},
     {license_fields},
     {other_id_fields}
-FROM {address_table} a
+FROM {_source_filtered_report_addresses(address_table, min_address_sources)} a
 JOIN mrf.npi n ON n.npi = a.npi
 LEFT JOIN mrf.geo_zip_lookup g ON g.zip_code = {address_zip5_expr}
 {partd_join}
@@ -1883,7 +1918,17 @@ WHERE {_report_address_type_clause("a")}
 LIMIT 1;
 """
     pharmacy_row = (
-        (await session.execute(text(sql), scoped_address_parameters({"npi": npi, "as_of": as_of}))).mappings().first()
+        (
+            await session.execute(
+                text(sql),
+                scoped_address_parameters(
+                    {"npi": npi, "as_of": as_of}
+                    | ({"min_address_sources": min_address_sources} if min_address_sources else {})
+                ),
+            )
+        )
+        .mappings()
+        .first()
     )
     if not pharmacy_row:
         return None
@@ -1958,6 +2003,7 @@ def _market_list_request(args):
         county=(str(county).strip() if county else None),
         zip_code=zip_code,
         chain=chain,
+        min_address_sources=parse_min_address_sources(args),
     )
     response_filter_by_field = {
         "state": state.upper() if state else None,
@@ -2021,6 +2067,7 @@ async def get_pharmacy_market_by_id(request, market_id, *, native_args=None):
             limit=1,
             offset=0,
             market_id=market_id,
+            min_address_sources=parse_min_address_sources(args),
         ),
     )
     if total <= 0 or not market_items:
@@ -2095,6 +2142,7 @@ async def list_pharmacy_access_rankings(request, *, native_args=None):
         county=(str(county).strip() if county else None),
         zip_code=zip_code,
         chain=chain,
+        min_address_sources=parse_min_address_sources(args),
     )
     total, market_items = await _query_market_summaries(session, query)
     return _access_ranking_response(
@@ -2145,6 +2193,7 @@ async def get_pharmacy_chain_summary(request, *, native_args=None):
         session,
         names=names,
         include_states=include_states,
+        **({"min_address_sources": parse_min_address_sources(args)} if "min_address_sources" in args else {}),
     )
     return response.json(
         {
@@ -2185,9 +2234,11 @@ async def get_pharmacy_chain_summary(request, *, native_args=None):
 @blueprint.get("/pharmacies/state-stats", name="pharmacy_state_stats")
 async def get_pharmacy_state_stats(request, *, native_args=None):
     """Return state-level pharmacy access summary metrics."""
-    _report_args(request, native_args)
+    args = _report_args(request, native_args)
     session = _get_session(request)
-    states, staffing_helper_available = await _query_pharmacy_state_stats(session)
+    states, staffing_helper_available = await _query_pharmacy_state_stats(
+        session, **({"min_address_sources": parse_min_address_sources(args)} if "min_address_sources" in args else {})
+    )
     return response.json(
         _build_pharmacy_state_stats_payload(
             states,
@@ -2205,7 +2256,13 @@ async def get_pharmacy_market_context(request, npi, *, native_args=None):
     as_of = _parse_date_param(args.get("as_of"), "as_of") or datetime.date.today()
     include_staffing = _is_boolean_parameter_enabled(args.get("include_staffing"), default=False)
 
-    pharmacy = await _fetch_pharmacy_context(session, npi=parsed_npi, as_of=as_of)
+    min_address_sources = parse_min_address_sources(args)
+    pharmacy = await _fetch_pharmacy_context(
+        session,
+        npi=parsed_npi,
+        as_of=as_of,
+        **({"min_address_sources": min_address_sources} if min_address_sources else {}),
+    )
     if not pharmacy:
         raise NotFound("Pharmacy not found for supplied NPI")
 
@@ -2233,6 +2290,7 @@ async def get_pharmacy_market_context(request, npi, *, native_args=None):
             city=(str(pharmacy.get("city") or "").strip().upper() or None),
             county=(str(pharmacy.get("county") or "").strip() or None),
             zip_code=(str(pharmacy.get("zip_code") or "").strip() or None),
+            min_address_sources=min_address_sources,
         ),
     )
     market = market_items[0] if total > 0 and market_items else None

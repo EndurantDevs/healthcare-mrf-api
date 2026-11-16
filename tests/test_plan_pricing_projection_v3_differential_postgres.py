@@ -23,6 +23,7 @@ from api import ptg2_serving as serving
 from api.plan_pricing_aggregate_pack import AggregateZipRecord
 from api.plan_pricing_projection_contract import table
 from api.plan_pricing_projection_v3_types import _BuildState
+from tests.address_source_prepared_postgres_support import check_threshold_specific_prepared_candidates
 from tests.test_plan_pricing_projection_postgres import (
     POSTGRES_DSN_ENV,
     TEST_DATABASE_PATTERN,
@@ -867,6 +868,12 @@ async def test_native_em_attribution_named_publication_replay_and_bigint_bounds(
 
 @pytest.mark.asyncio
 async def test_native_managed_em_read_retained_offices_and_attribution(migrated_v3_database, monkeypatch):
+    """Native office thresholds precede ranking, totals and pages; omitted and zero agree."""
     from tests.managed_em_read_postgres_support import test_managed_em_native_read
 
     await test_managed_em_native_read(migrated_v3_database, monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_threshold_specific_prepared_candidates_keep_rows_and_selective_index(migrated_v3_database):
+    await check_threshold_specific_prepared_candidates(migrated_v3_database)

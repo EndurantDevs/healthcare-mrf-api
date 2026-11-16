@@ -89,6 +89,7 @@ def test_init_api_registers_group(monkeypatch):
         (init_api.__globals__["_capacity_process_request_guard"], "request"),
         (init_api.__globals__["require_internal_plan_release_read"], "request"),
         (init_api.__globals__["add_runtime_identity_headers"], "response"),
+        (init_api.__globals__["acknowledge_address_source_filter"], "response"),
         (private_catalog_response, "response"),
     ]
     assert hasattr(app.registered, "blueprints")

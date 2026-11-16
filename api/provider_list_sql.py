@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy import BigInteger, bindparam, column, func, literal_column, select, table, text
 from sqlalchemy.dialects.postgresql import ARRAY
 
+from api.address_source_filter import address_source_filter_sql
 from api.custom_import_provider_sql import ProviderImportQuery, merge_native_params
 from api.network_address_scope import (
     current_network_address_scope,
@@ -188,18 +189,31 @@ def _address_phone_candidates_cte(
     *,
     is_bounded: bool = True,
     editions=(),
+    min_address_sources: int = 0,
 ) -> str | None:
     """Return indexed phone candidates, including current directory evidence."""
 
     if not _is_unified_address_table(address_table_sql) or is_scoped_address_relation(address_table_sql):
         return None
     direct_phone = _address_phone_digits_filter("phone_address", address_table_sql)
+    if min_address_sources:
+        direct_phone += " AND " + address_source_filter_sql("phone_address", min_address_sources)
     service_types = ", ".join(f"'{location_type}'" for location_type in GEO_SERVICE_LOCATION_TYPES)
     phone_candidate_rows_cte = _PHONE_CANDIDATE_ROWS_CTE.format(
         address_table_sql=address_table_sql,
         service_types=service_types,
         direct_phone=direct_phone,
     )
+    if min_address_sources:
+        phone_candidate_rows_cte = phone_candidate_rows_cte.replace(
+            "AND dataset_resource.resource_id = overlay.resource_id",
+            "AND dataset_resource.resource_id = overlay.resource_id "
+            f"AND EXISTS (SELECT 1 FROM {address_table_sql} qualifying_address "
+            f"WHERE qualifying_address.type IN ({service_types}) "
+            "AND COALESCE(qualifying_address.npi, qualifying_address.inferred_npi) = overlay.npi "
+            "AND qualifying_address.address_key = overlay.address_key "
+            f"AND {address_source_filter_sql('qualifying_address', min_address_sources)})",
+        )
     candidate_limit_clause = "LIMIT :candidate_limit" if is_bounded else ""
     return named_source_data_sql(
         ",\n".join(
@@ -212,6 +226,34 @@ def _address_phone_candidates_cte(
         "mrf",
         editions,
     )
+
+
+def _address_phone_candidates_lateral_from(address_table_sql: str, alias: str, min_address_sources: int = 0) -> str:
+    exact_phone = _address_phone_digits_filter("candidate_address", address_table_sql)
+    service_location = _provider_list_address_type_clause(
+        "candidate_address",
+        address_table_sql,
+        include_service_locations=True,
+    )
+    source_filter = (
+        f" AND {address_source_filter_sql('candidate_address', min_address_sources)}" if min_address_sources else ""
+    )
+    return f"""
+          FROM phone_candidates AS phone_match
+     LEFT JOIN phone_provider_directory_evidence AS phone_evidence
+            ON phone_evidence.provider_npi = phone_match.provider_npi
+         CROSS JOIN LATERAL (
+               SELECT candidate_address.*
+                 FROM {address_table_sql} AS candidate_address
+                WHERE candidate_address.address_key = phone_match.address_key
+                  AND COALESCE(candidate_address.npi, candidate_address.inferred_npi) = phone_match.provider_npi
+                  AND {service_location}{source_filter}
+             ORDER BY ({exact_phone}) DESC,
+                      candidate_address.source_count DESC NULLS LAST,
+                      candidate_address.location_key
+                LIMIT 1 OFFSET 0
+         ) AS {alias}
+    """
 
 
 def _address_phone_candidates_join(

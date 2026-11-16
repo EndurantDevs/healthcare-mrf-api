@@ -13,6 +13,7 @@ from typing import Any, Mapping
 from sanic.exceptions import InvalidUsage
 from sqlalchemy import text
 
+from api.address_source_filter import parse_min_address_sources
 from api.billing_search_cursor import (
     BILLING_SEARCH_CURSOR_MAX_TTL_SECONDS,
     BillingSearchCursorError,
@@ -25,7 +26,7 @@ from api.billing_search_cursor_keys import (
     load_billing_search_cursor_keyring,
 )
 from api.billing_search_transport_contract import BILLING_SEARCH_TRANSPORT_PATH
-from api.network_address_scope import current_network_address_scope
+from api.network_address_scope import current_network_address_scope, scoped_address_parameters
 from api.plan_pricing_projection_contract import (
     PROJECTION_CONTRACT,
     PlanPricingProjectionUnavailable,
@@ -116,6 +117,7 @@ def _request_fingerprint(
         {
             "code": code,
             "code_system": code_system,
+            **({"min_address_sources": parse_min_address_sources(args)} if parse_min_address_sources(args) else {}),
             "include_code_details": _is_request_flag_enabled(args.get("include_code_details"), default=False),
             "include_debug": _is_request_flag_enabled(args.get("include_debug"), default=False),
             "include_details": _is_request_flag_enabled(args.get("include_details"), default=False),
@@ -254,6 +256,7 @@ async def _read_state_npis(
     limit: int,
     *,
     binding_ordinals=None,
+    min_address_sources=0,
 ) -> tuple[tuple[int, ...], dict[int, Any], bool]:
     parameters_by_name = {
         "after_npi": after_npi,
@@ -263,19 +266,26 @@ async def _read_state_npis(
     }
     if binding_ordinals is not None:
         parameters_by_name["admitted_binding_ordinals"] = list(binding_ordinals)
+    if min_address_sources:
+        parameters_by_name.update(scoped_address_parameters({"min_address_sources": min_address_sources}))
     state_result = await session.execute(
-        text(_provider_page_sql(binding_ordinals)),
+        text(
+            _provider_page_sql(binding_ordinals, min_address_sources)
+            if min_address_sources
+            else _provider_page_sql(binding_ordinals)
+        ),
         parameters_by_name,
     )
     state_rows = [row_mapping(state_row) for state_row in state_result.mappings().all()]
     has_more = len(state_rows) > limit
     selected_rows = state_rows[:limit]
     selected_npis = tuple(int(state_row["npi"]) for state_row in selected_rows)
-    return (
-        selected_npis,
-        {int(state_row["npi"]): state_row.get("provider_fragment") for state_row in selected_rows},
-        has_more,
-    )
+    fragments_by_npi = {int(state_row["npi"]): state_row.get("provider_fragment") for state_row in selected_rows}
+    if min_address_sources and selected_rows:
+        from api.plan_pricing_state_scan_sources import qualifying_state_fragments
+
+        fragments_by_npi = await qualifying_state_fragments(session, selected_rows, state, min_address_sources)
+    return selected_npis, fragments_by_npi, has_more
 
 
 async def _read_projected_occurrences(
@@ -559,6 +569,7 @@ async def search_plan_pricing_state_scan(
         if capability is not None:
             with code_projection_scope(capability):
                 return await search_plan_pricing_state_scan(session, capability.selection(selection), args, pagination)
+    minimum_sources = parse_min_address_sources(args)
     code_system, code, state, cursor = _validate_search_request(selection, args, pagination)
     requested_limit = int(pagination.limit)
     cursor_context = _search_cursor_context(
@@ -571,7 +582,7 @@ async def search_plan_pricing_state_scan(
         cursor,
     )
     contributing_bindings = None
-    options_by_name = {}
+    options_by_name = {"min_address_sources": minimum_sources} if minimum_sources else {}
     if current_network_address_scope() is not None:
         contributing_bindings = await admitted_plan_release_bindings(session, selection)
         selection = await prepare_plan_release_bindings(session, selection, contributing_bindings)

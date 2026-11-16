@@ -58,7 +58,7 @@ def _parse_batch_request(body):
     native_batch = document.get("native_batch")
     if (
         type(native_batch) is not dict
-        or set(native_batch) != _BATCH_KEYS
+        or not _BATCH_KEYS <= set(native_batch) <= _BATCH_KEYS | {"min_address_sources"}
         or type(native_batch.get("address_limit")) is not int
     ):
         raise CustomImportReadRequestError("native batch is invalid")

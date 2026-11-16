@@ -194,3 +194,44 @@ async def test_custom_geo_uses_local_lookup(monkeypatch):
     assert reply.status == 200 and body["total_count"] == 3 and len(body["items"]) == 2
     assert body["_custom_import_next_anchor"] == ["1000000003", geo._THIRD_ADDRESS_KEY]
     geo._assert_native_geo_scope(session.calls[0][0])
+
+
+@pytest.mark.parametrize(
+    "columns",
+    [(), ("location_key", "location_key"), ("missing_column",), ["source_count"], "source_count", (None,), ([],)],
+)
+def test_native_projection_rejects_invalid_columns(columns):
+    with pytest.raises(ValueError, match="projection"):
+        compact.compact_address_native_sql(_layout(), first_parameter=1, columns=columns)
+
+
+@pytest.mark.parametrize("lookup_mode", [False, True])
+def test_native_projection_preserves_hidden_columns(lookup_mode):
+    layout = _layout()
+    query, arguments = compact.compact_address_native_sql(
+        layout, first_parameter=3, visible_membership_sql="TRUE", columns=("source_count",)
+    )
+    assert query.startswith('(SELECT "source_count" FROM (')
+    assert 'office."row_origin"' in query and "visible_office WHERE row_origin" in query
+    assert "AS canonical_network_ids" not in query and "network_office_edge" not in query
+    assert arguments == ()
+    selected, arguments = compact.compact_address_native_sql(
+        layout, first_parameter=3, network_ids=(7, 42), location_lookup=lookup_mode, columns=("source_count",)
+    )
+    assert selected.startswith('(SELECT "source_count" FROM (')
+    assert 'office."location_key"' in selected
+    assert ("bucket_members OFFSET 0" in selected) is lookup_mode
+    assert (" WHERE EXISTS (" in selected) is (not lookup_mode)
+    assert set(map(int, re.findall(r"\$(\d+)", selected))) == set(range(3, 3 + len(arguments)))
+    assert all(candidate in arguments for candidate in compact.compact_address_parameters(layout).values())
+    assert [7, 42] in arguments
+
+
+def test_native_projection_retains_requested_membership_arrays():
+    query, arguments = compact.compact_address_native_sql(
+        _layout(), first_parameter=1, visible_membership_sql="TRUE", columns=("canonical_network_ids",)
+    )
+    assert query.startswith('(SELECT "canonical_network_ids" FROM (')
+    assert 'office."location_key"' in query and 'office."row_origin"' in query
+    assert "ARRAY(SELECT DISTINCT membership.network_id" in query
+    assert arguments == tuple(compact.compact_address_parameters(_layout()).values())

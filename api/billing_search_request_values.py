@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from api.address_source_filter import parse_min_address_sources
 from api.billing_search_cursor import (
     BILLING_SEARCH_CURSOR_MAX_CHARACTERS,
     BILLING_SEARCH_CURSOR_PREFIX,
@@ -50,6 +51,7 @@ _ALLOWED_PARAMETERS = frozenset(
         "limit",
         "long",
         "modifiers",
+        "min_address_sources",
         "npi",
         "place_of_service",
         "plan_release_id",
@@ -364,6 +366,7 @@ def _optional_filter_fields(values_by_name: Mapping[str, Any]) -> dict[str, Any]
         "modifiers": modifiers,
         "place_of_service": place_of_service,
         "include_evidence": _include_evidence(values_by_name),
+        "min_address_sources": parse_min_address_sources(values_by_name),
         "limit": _page_limit(values_by_name),
         "cursor": _optional_cursor(values_by_name),
     }

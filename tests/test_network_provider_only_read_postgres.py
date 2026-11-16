@@ -6,13 +6,15 @@ import json
 from contextlib import AsyncExitStack
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID, uuid4, uuid5
 
 import asyncpg
 import pytest
 
 from api import network_provider_only_read as readers
-from api.network_address_scope import network_address_read_scope
+from api import network_provider_read as office_readers
+from api.network_address_scope import NetworkAddressReadScope, network_address_read_scope
 from api.network_provider_read import (
     NetworkProviderReadError,
     NetworkProviderReadUnavailable,
@@ -31,6 +33,8 @@ from tests.cms_registry_recipe_postgres_support import cms_recipe_template as cm
 from tests.cms_registry_recipe_postgres_support import serving_schema as serving_schema
 from tests.source_contribution_custody_postgres_support import install_source_contribution_custody
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
+from tests.test_network_provider_membership_page_postgres import _office
+from tests.test_network_provider_membership_page_postgres import membership_page_db as membership_page_db
 from tests.test_registry_approval_store_postgres import _approve, _command
 from tests.test_registry_candidate_composition_postgres import _remove_candidates
 from tests.test_registry_source_recipe_composition_postgres import (
@@ -397,3 +401,107 @@ async def test_provider_only_decoder_rejects_shape_and_evidence_corruption(monke
     monkeypatch.setattr(readers.json, "loads", forbidden_decode)
     with pytest.raises(ValueError):
         readers._result(receipt_by_name | {"result": "x" * (readers.MAX_RESPONSE_BYTES + 1)}, scope, 50, 0)
+
+
+async def _source_counts(case):
+    await case.connection.execute(f"UPDATE {case.namespace}.base_address SET source_count=2")
+    await case.connection.execute(f"UPDATE {case.namespace}.custom_address SET source_count=3")
+    await case.connection.execute(
+        f"UPDATE {case.namespace}.base_address SET source_count=CASE location_key "
+        "WHEN $1 THEN 3 WHEN $2 THEN 4 ELSE 2147483647 END WHERE location_key=ANY($3::text[])",
+        f"{101:064x}",
+        f"{102:064x}",
+        [f"{101:064x}", f"{102:064x}", f"{103:064x}", f"{106:064x}"],
+    )
+
+
+async def _canonical_page(monkeypatch, case, fast, networks, minimum, *, limit=2, offset=0):
+    object.__setattr__(case.manifest, "_supports_membership_pages", fast)
+    monkeypatch.setattr(office_readers, "resolve_network_serving_manifest", AsyncMock(return_value=case.manifest))
+    async with case.connection.transaction(isolation="repeatable_read", readonly=True):
+        return await office_readers.read_network_provider_page(
+            case.connection,
+            NetworkAddressReadScope(case.manifest, networks, None),
+            limit=limit,
+            offset=offset,
+            office_filters=office_readers.NetworkOfficeSelection(min_address_sources=minimum),
+        )
+
+
+def _expected_offices(networks, minimum):
+    samples = [
+        ("provider_directory", "provider-a", 100, 2, {42: 200, 88: 300}),
+        ("provider_directory", "provider-a", 101, 3, {88: 101}),
+        ("npi", "1000000491", 102, 4, {42: 102}),
+        ("manual", str(UUID(int=20)), 103, 3, {42: 103}),
+        ("provider_directory", "Z-provider", 104, 2, {88: 104}),
+        ("provider_directory", "é-provider", 105, 2, {88: 105}),
+    ]
+    offices_by_identity = {}
+    for system, identity, office, count, aliases in samples:
+        selected_aliases = [alias for network, alias in aliases.items() if network in networks]
+        if selected_aliases and count >= minimum:
+            offices_by_identity.setdefault((system, identity), {})[f"{office:064x}"] = str(
+                UUID(int=min(selected_aliases))
+            )
+    return offices_by_identity
+
+
+@pytest.mark.parametrize("fast", [False, True])
+async def test_native_threshold_pages_match_the_synthetic_office_oracle(monkeypatch, membership_page_db, fast):
+    case = membership_page_db
+    await _source_counts(case)
+    for networks in ((42,), (88,), (42, 88), (99,)):
+        for minimum in (0, 3, 4, 2147483647):
+            expected = _expected_offices(networks, minimum)
+            identities = sorted(expected, key=lambda identity: tuple(part.encode() for part in identity))
+            for limit, offset in ((1, 0), (2, 1), (2, 100)):
+                result = await _canonical_page(monkeypatch, case, fast, networks, minimum, limit=limit, offset=offset)
+                assert result["total_count"] == len(identities)
+                assert result["has_more"] is (len(identities) > offset + limit)
+                assert [
+                    (provider["provider_system"], provider["provider_id"]) for provider in result["providers"]
+                ] == identities[offset : offset + limit]
+                for provider in result["providers"]:
+                    identity = provider["provider_system"], provider["provider_id"]
+                    assert {
+                        office["location_key"]: office["location_id"] for office in provider["locations"]
+                    } == expected[identity]
+                    assert provider["display_name"] != "Overridden"
+
+
+@pytest.mark.parametrize("fast", [False, True])
+@pytest.mark.parametrize("damage", ["duplicate", "name", "locations", "bytes", "edge"])
+async def test_native_threshold_pages_reject_invalid_selected_output(monkeypatch, membership_page_db, fast, damage):
+    case = membership_page_db
+    await _source_counts(case)
+    if damage == "edge":
+        await case.connection.execute(
+            f"DELETE FROM {case.namespace}.network_office_edge WHERE location_key=$1", f"{101:064x}"
+        )
+    if damage == "duplicate":
+        await case.connection.execute(
+            f"ALTER TABLE {case.namespace}.custom_address DROP CONSTRAINT custom_address_pkey"
+        )
+        for _ in range(2):
+            await case.connection.execute(
+                f"INSERT INTO {case.namespace}.custom_address SELECT * FROM {case.namespace}.base_address WHERE location_key=$1",
+                f"{101:064x}",
+            )
+    elif damage == "name":
+        await _office(case, 107, "provider-a", (88,))
+        await case.connection.execute(
+            f"UPDATE {case.namespace}.base_address SET source_count=3,entity_name='Different name' WHERE location_key=$1",
+            f"{107:064x}",
+        )
+    elif damage == "locations":
+        for number in range(1000, 1101):
+            await _office(case, number, "provider-a", (88,))
+        await case.connection.execute(
+            f"UPDATE {case.namespace}.base_address SET source_count=3 WHERE location_key>=$1", f"{1000:064x}"
+        )
+    elif damage == "bytes":
+        monkeypatch.setattr(office_readers, "MAX_RESPONSE_BYTES", 1024)
+
+    with pytest.raises(office_readers.NetworkProviderReadUnavailable):
+        await _canonical_page(monkeypatch, case, fast, (42, 88), 3, limit=50)

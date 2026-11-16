@@ -37,6 +37,7 @@ from sqlalchemy import (
     text,
 )
 
+from api.address_source_filter import address_source_filter_sql, parse_min_address_sources
 from api.billing_search_access_contract import BILLING_SEARCH_CACHE_CONTROL
 from api.billing_search_cursor import (
     BillingSearchCursorError,
@@ -89,6 +90,15 @@ from api.plan_release_serving_resolution import (
     resolve_plan_release_guard_selection,
 )
 from api.pricing_provider_scope import _is_bounded_provider_expansion, _raise_broad_group_plan_provider_expansion
+from api.pricing_response_aliases import (
+    _add_legacy_provider_totals,
+    _add_legacy_service_fields,
+    _coalesce_value,
+    _drop_legacy_service_fields,
+    _normalize_prescription_payload,
+    _normalize_prescription_provider_aggregate,
+    _normalize_service_totals,
+)
 from api.provider_demographic_filters import (
     normalize_provider_sex_code,
     provider_sex_exists_sql,
@@ -653,78 +663,6 @@ def _row_to_dict(row):
     return dict(row)
 
 
-def _coalesce_value(*values: Any) -> Any:
-    for value in values:
-        if value is not None:
-            return value
-    return None
-
-
-def _normalize_service_totals(service_payload_by_field: dict[str, Any]) -> None:
-    service_payload_by_field["total_services"] = _coalesce_value(
-        service_payload_by_field.get("total_services"),
-        service_payload_by_field.get("total_claims"),
-    )
-    service_payload_by_field["total_beneficiary_day_services"] = _coalesce_value(
-        service_payload_by_field.get("total_beneficiary_day_services"),
-        service_payload_by_field.get("total_30day_fills"),
-    )
-    service_payload_by_field["total_beneficiaries"] = _coalesce_value(
-        service_payload_by_field.get("total_beneficiaries"),
-        service_payload_by_field.get("total_benes"),
-    )
-    service_payload_by_field["total_submitted_charges"] = _coalesce_value(
-        service_payload_by_field.get("total_submitted_charges"),
-        service_payload_by_field.get("total_day_supply"),
-    )
-    service_payload_by_field["total_allowed_amount"] = _coalesce_value(
-        service_payload_by_field.get("total_allowed_amount"),
-        service_payload_by_field.get("total_drug_cost"),
-    )
-    service_payload_by_field["ge65_total_services"] = _coalesce_value(
-        service_payload_by_field.get("ge65_total_services"),
-        service_payload_by_field.get("ge65_total_claims"),
-    )
-    service_payload_by_field["ge65_total_beneficiaries"] = _coalesce_value(
-        service_payload_by_field.get("ge65_total_beneficiaries"),
-        service_payload_by_field.get("ge65_total_benes"),
-    )
-    service_payload_by_field["ge65_total_allowed_amount"] = _coalesce_value(
-        service_payload_by_field.get("ge65_total_allowed_amount"),
-        service_payload_by_field.get("ge65_total_drug_cost"),
-    )
-
-
-def _add_legacy_service_fields(service_payload_by_field: dict[str, Any]) -> None:
-    service_payload_by_field["generic_name"] = service_payload_by_field.get("service_description")
-    service_payload_by_field["brand_name"] = service_payload_by_field.get("reported_code")
-    service_payload_by_field["total_claims"] = service_payload_by_field.get("total_services")
-    service_payload_by_field["total_30day_fills"] = service_payload_by_field.get("total_beneficiary_day_services")
-    service_payload_by_field["total_day_supply"] = service_payload_by_field.get("total_submitted_charges")
-    service_payload_by_field["total_benes"] = service_payload_by_field.get("total_beneficiaries")
-    service_payload_by_field["total_drug_cost"] = service_payload_by_field.get("total_allowed_amount")
-    service_payload_by_field["ge65_total_claims"] = service_payload_by_field.get("ge65_total_services")
-    service_payload_by_field["ge65_total_benes"] = service_payload_by_field.get("ge65_total_beneficiaries")
-    service_payload_by_field["ge65_total_drug_cost"] = service_payload_by_field.get("ge65_total_allowed_amount")
-
-
-def _drop_legacy_service_fields(service_payload_by_field: dict[str, Any]) -> None:
-    for field_name in (
-        "generic_name",
-        "brand_name",
-        "total_claims",
-        "total_30day_fills",
-        "total_day_supply",
-        "total_drug_cost",
-        "total_benes",
-        "ge65_total_claims",
-        "ge65_total_benes",
-        "ge65_total_drug_cost",
-        "legacy_field_aliases",
-    ):
-        service_payload_by_field.pop(field_name, None)
-
-
 def _normalize_service_payload(service_payload_by_field: dict[str, Any]) -> dict[str, Any]:
     """Expose service-native aliases while retaining optional legacy fields."""
 
@@ -820,20 +758,6 @@ def _normalize_provider_payload(
     return provider_payload_by_field
 
 
-def _add_legacy_provider_totals(provider_payload_by_field: dict[str, Any]) -> None:
-    """Populate the legacy provider-total aliases from canonical values."""
-
-    legacy_field_by_canonical_field = {
-        "total_claims": "total_services",
-        "total_30day_fills": "total_reported_service_codes",
-        "total_day_supply": "total_submitted_charges",
-        "total_benes": "total_beneficiaries",
-        "total_drug_cost": "total_allowed_amount",
-    }
-    for legacy_field, canonical_field in legacy_field_by_canonical_field.items():
-        provider_payload_by_field[legacy_field] = provider_payload_by_field.get(canonical_field)
-
-
 def _normalize_provider_service_aggregate(service_summary_map: dict[str, Any], include_legacy: bool) -> dict[str, Any]:
     """Normalize provider service totals and derive comparable averages."""
 
@@ -893,26 +817,6 @@ def _normalize_provider_service_aggregate(service_summary_map: dict[str, Any], i
         ):
             service_summary_map.pop(key, None)
     return service_summary_map
-
-
-def _normalize_prescription_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    payload["prescription_code_system"] = payload.get("rx_code_system")
-    payload["prescription_code"] = payload.get("rx_code")
-    payload["prescription_name"] = payload.get("rx_name") or payload.get("generic_name") or payload.get("brand_name")
-    payload["total_prescriptions"] = payload.get("total_claims")
-    payload["total_beneficiaries"] = payload.get("total_benes")
-    payload["total_allowed_amount"] = payload.get("total_drug_cost")
-    payload["ge65_total_prescriptions"] = payload.get("ge65_total_claims")
-    payload["ge65_total_beneficiaries"] = payload.get("ge65_total_benes")
-    payload["ge65_total_allowed_amount"] = payload.get("ge65_total_drug_cost")
-    return payload
-
-
-def _normalize_prescription_provider_aggregate(payload: dict[str, Any]) -> dict[str, Any]:
-    payload["total_prescriptions"] = payload.get("total_claims")
-    payload["total_beneficiaries"] = payload.get("total_benes")
-    payload["total_allowed_amount"] = payload.get("total_drug_cost")
-    return payload
 
 
 def _parse_int(raw: Any, param: str, minimum: int | None = None) -> int | None:
@@ -5962,7 +5866,7 @@ async def _allowed_amount_address_table(
 
     if current_network_address_scope() is not None:
         return allowed_address_relation(PTG2_SCHEMA)
-    if not _has_allowed_amount_address_filter(args):
+    if not _has_allowed_amount_address_filter(args) and not parse_min_address_sources(args):
         return None
     has_geo_filter = any(args.get(parameter_name) not in (None, "", "null") for parameter_name in ("lat", "long"))
     has_zip_filter = bool(_normalize_zip5(args.get("zip5") or args.get("zip")))
@@ -6123,6 +6027,12 @@ def _allowed_amount_location_join_sql(
     )
 
 
+def _allowed_amount_office_npi_sql(args, uses_unified_addresses):
+    if uses_unified_addresses and parse_min_address_sources(args) and not _has_allowed_amount_address_filter(args):
+        return "COALESCE(addr.npi, addr.inferred_npi)"
+    return "addr.npi"
+
+
 def _allowed_amount_location_sql(
     args: Mapping[str, Any],
     *,
@@ -6133,13 +6043,14 @@ def _allowed_amount_location_sql(
     """Build one indexed per-NPI address lookup and its required-match clause."""
 
     if not address_table:
-        return "", _ALLOWED_AMOUNT_EMPTY_LOCATION_SELECT_SQL, ""
+        required_sql = "AND FALSE" if parse_min_address_sources(args) else ""
+        return "", _ALLOWED_AMOUNT_EMPTY_LOCATION_SELECT_SQL, required_sql
     uses_unified_addresses = office_inputs is not None or _is_unified_address_table(address_table)
     parameter_map["allowed_address_types"] = (
         ["practice", "primary", "secondary", "site"] if uses_unified_addresses else ["primary", "secondary"]
     )
     address_predicates = [
-        "addr.npi = provider_rollup.npi",
+        f"{_allowed_amount_office_npi_sql(args, uses_unified_addresses)} = provider_rollup.npi",
         "addr.type = ANY(CAST(:allowed_address_types AS varchar[]))",
     ]
     if uses_unified_addresses and _has_allowed_amount_address_filter(args):
@@ -6149,10 +6060,11 @@ def _allowed_amount_location_sql(
             address_predicates.append(allowed_geo_evidence(office_inputs, PTG2_SCHEMA))
         else:
             address_predicates.append(_ptg2_geo_assured_address_sql("addr"))
-    _append_allowed_amount_text_location_filters(
+    minimum_sources = _append_allowed_amount_text_location_filters(
         args,
         parameter_map,
         address_predicates,
+        uses_unified_addresses=uses_unified_addresses,
     )
     distance_sql, spatial_predicates = _allowed_amount_spatial_filter_sql(
         args,
@@ -6175,7 +6087,7 @@ def _allowed_amount_location_sql(
     )
     required_sql = (
         "AND allowed_location.npi IS NOT NULL"
-        if office_inputs is not None or _has_allowed_amount_address_filter(args)
+        if office_inputs is not None or _has_allowed_amount_address_filter(args) or minimum_sources
         else ""
     )
     return join_sql, _ALLOWED_AMOUNT_LOCATION_SELECT_SQL, required_sql
@@ -6185,7 +6097,15 @@ def _append_allowed_amount_text_location_filters(
     args: Mapping[str, Any],
     parameter_map: dict[str, Any],
     address_predicates: list[str],
-) -> None:
+    *,
+    uses_unified_addresses=False,
+) -> int:
+    minimum_sources = parse_min_address_sources(args)
+    if minimum_sources:
+        address_predicates.append(
+            address_source_filter_sql("addr", minimum_sources, has_source_count=uses_unified_addresses)
+        )
+        parameter_map["min_address_sources"] = minimum_sources
     state_code = str(args.get("state") or "").strip().upper()
     city_name = str(args.get("city") or "").strip().upper()
     if state_code:
@@ -6194,6 +6114,7 @@ def _append_allowed_amount_text_location_filters(
     if city_name:
         parameter_map["allowed_city"] = city_name
         address_predicates.append("UPPER(COALESCE(addr.city_name, '')) = :allowed_city")
+    return minimum_sources
 
 
 def _allowed_amount_provider_sex_filter_sql(
@@ -7606,6 +7527,8 @@ def _annotate_ptg2_result_state(
 async def group_plan_providers(request, *, native_args=None):
     """Enumerate distinct plan providers across admitted sources, keyset-paginated by NPI."""
     args = group_plan_arguments(request, native_args)
+    args.get("min_address_sources")
+    minimum_sources = parse_min_address_sources(args)
     session = _get_session(request)
     managed_addresses = group_plan_address_source(PRICING_SCHEMA)
     # Keep the release parameter visible to the OpenAPI scanner.
@@ -7808,7 +7731,7 @@ async def group_plan_providers(request, *, native_args=None):
         schema=PRICING_SCHEMA,
     )
     provider_sex_where = f"\n               AND {provider_sex_predicate}" if provider_sex_predicate else ""
-    has_location_filter = bool(city or state or zip5)
+    has_location_filter = bool(city or state or zip5 or minimum_sources)
     address_table = f"{PRICING_SCHEMA}.npi_address"
     uses_unified_addresses = False
     supports_array_coverage = False
@@ -7852,6 +7775,11 @@ async def group_plan_providers(request, *, native_args=None):
         else:
             location_zips = [zip5]
     location_clauses: list[str] = ["addr.npi = gm.npi"]
+    if minimum_sources:
+        location_clauses.append(
+            address_source_filter_sql("addr", minimum_sources, has_source_count=uses_unified_addresses)
+        )
+        query_params_by_name["min_address_sources"] = minimum_sources
     if not include_mail_addresses:
         location_clauses.append(f"addr.type IN ({_group_plan_provider_address_type_sql(address_types)})")
     if city:
@@ -7973,6 +7901,11 @@ async def group_plan_providers(request, *, native_args=None):
         if managed_addresses is not None:
             address_parameters_by_name.update(policy_parameters)
         address_clauses = ["addr.npi = ANY(:npis)"]
+        if minimum_sources:
+            address_clauses.append(
+                address_source_filter_sql("addr", minimum_sources, has_source_count=uses_unified_addresses)
+            )
+            address_parameters_by_name["min_address_sources"] = minimum_sources
         if not include_mail_addresses:
             address_clauses.append(f"addr.type IN ({_group_plan_provider_address_type_sql(address_types)})")
         if city:
@@ -8202,6 +8135,8 @@ async def pricing_statistics(request):
 
 async def _pricing_provider_list_where(session, args, year, list_values_by_name):
     filters = [provider_table.c.year == year]
+    if parse_min_address_sources(args):
+        filters.append(literal(False))
     if list_values_by_name["npi"] is not None:
         filters.append(provider_table.c.npi == list_values_by_name["npi"])
     if list_values_by_name["state"]:
@@ -8353,6 +8288,8 @@ async def list_pricing_providers(request):
     """List providers matching pricing filters and pagination parameters."""
     session = _get_session(request)
     args = request.args
+    args.get("min_address_sources")
+    parse_min_address_sources(args)
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
     list_values_by_name = {
         "npi": _parse_int(args.get("npi") or None, "npi", minimum=1),
@@ -8407,6 +8344,8 @@ async def get_pricing_provider(request, npi: str):
     """Return one provider's pricing summary, service count, and location count."""
     session = _get_session(request)
     args = request.args
+    args.get("min_address_sources")
+    minimum_sources = parse_min_address_sources(args)
 
     provider_npi = _parse_int(npi, "npi", minimum=1)
     year = _parse_int(args.get("year"), "year", minimum=2013)
@@ -8430,12 +8369,22 @@ async def get_pricing_provider(request, npi: str):
     location_count_result = await session.execute(
         select(func.count(func.distinct(location_table.c.location_key)))
         .select_from(location_table)
-        .where(and_(location_table.c.npi == provider_npi, location_table.c.year == year)),
+        .where(
+            and_(
+                location_table.c.npi == provider_npi,
+                location_table.c.year == year,
+                *([literal(False)] if minimum_sources else []),
+            )
+        ),
     )
     provider_payload = _normalize_provider_payload(
         _row_to_dict(provider_row),
         include_legacy=include_legacy_fields,
     )
+    if minimum_sources:
+        for field in ("city", "state", "zip5", "country"):
+            provider_payload.pop(field, None)
+        provider_payload["locations"] = []
     provider_payload["year_used"] = year
     provider_payload["year_source"] = year_source
     add_provider_service_summary(provider_payload, service_count_result.scalar(), location_count_result.scalar())
@@ -8831,6 +8780,8 @@ async def list_provider_procedures(request, npi: str):
     """List procedure pricing records reported for a provider."""
     session = _get_session(request)
     args = request.args
+    args.get("min_address_sources")
+    parse_min_address_sources(args)
 
     provider_npi = _parse_int(npi, "npi", minimum=1)
     if provider_npi is None:
@@ -8864,6 +8815,7 @@ async def list_provider_procedures(request, npi: str):
             raise InvalidUsage(str(exc)) from exc
     if plan_id or plan_external_id or source_key or snapshot_id or plan_release_id:
         ptg_args_by_name = {
+            **({"min_address_sources": parse_min_address_sources(args)} if "min_address_sources" in args else {}),
             "plan_id": plan_id or None,
             "plan_external_id": plan_external_id or None,
             "plan_release_id": plan_release_id or None,
@@ -9600,6 +9552,8 @@ async def _query_provider_procedure_location_page(
     filters: list[Any],
     include_legacy_fields: bool,
 ) -> dict[str, Any]:
+    if parse_min_address_sources(args):
+        filters = [*filters, literal(False)]
     where_clause = and_(*filters)
     total = int(
         (await session.execute(select(func.count()).select_from(location_table).where(where_clause))).scalar() or 0
@@ -9666,6 +9620,7 @@ async def _provider_procedure_locations(
     """Build the provider procedure location list response for a service code."""
     session = _get_session(request)
     args = request.args
+    parse_min_address_sources(args)
     provider_npi = _parse_int(npi, "npi", minimum=1)
     if provider_npi is None:
         raise InvalidUsage("Path parameter 'npi' must be provided")
@@ -9721,6 +9676,7 @@ async def _provider_procedure_locations(
 )
 async def list_provider_procedure_locations(request, npi: str, procedure_code: str):
     """List locations where a provider reports the requested internal procedure."""
+    request.args.get("min_address_sources")
     return await _provider_procedure_locations(
         request,
         npi,
@@ -9734,6 +9690,7 @@ async def list_provider_procedure_locations(request, npi: str, procedure_code: s
 )
 async def list_physician_service_locations(request, npi: str, code_system: str, code: str):
     """List physician service locations after resolving the supplied code system."""
+    request.args.get("min_address_sources")
     return await _provider_procedure_locations(
         request,
         npi,
@@ -9749,6 +9706,8 @@ async def _procedure_provider_list_where(session, args, year, internal_codes, li
         provider_table.c.year == year,
         provider_table.c.npi == provider_procedure_table.c.npi,
     ]
+    if parse_min_address_sources(args):
+        filters.append(literal(False))
     if list_values_by_name["state"]:
         filters.append(func.upper(provider_table.c.state) == list_values_by_name["state"])
     if list_values_by_name["city"]:
@@ -9890,6 +9849,8 @@ async def list_procedure_providers(request, code_system: str, code: str):
     """List providers with claims history for the requested procedure or service code."""
     session = _get_session(request)
     args = request.args
+    args.get("min_address_sources")
+    parse_min_address_sources(args)
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
     list_values_by_name = {
         "min_claims": _parse_float(args.get("min_claims"), "min_claims", minimum=0),
@@ -11581,7 +11542,9 @@ async def audit_ptg2_source_witness_batch(request):
 async def list_providers_by_procedure(request, *, native_args=None, import_context=None):
     """List providers with pricing records matching a procedure or service code."""
     args = request.args
+    args.get("min_address_sources")
     args = provider_service_native_args(args, native_args, import_context)
+    minimum_sources = parse_min_address_sources(args)
     canonical_network_clause = _canonical_network_procedure_clause(
         args,
         import_context,
@@ -11893,6 +11856,7 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
         if _request_value_or_none(args.get("order")) is None:
             ptg_order = "asc"
         ptg_args_by_name = {
+            **({"min_address_sources": parse_min_address_sources(args)} if "min_address_sources" in args else {}),
             "plan_id": plan_id or None,
             "plan_external_id": plan_external_id or None,
             "plan_release_id": plan_release_id or None,
@@ -12162,6 +12126,7 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
             zip_radius=zip_radius_miles,
             coordinates=(latitude, longitude, coordinate_radius_miles),
             zip_anchor=anchor,
+            min_address_sources=minimum_sources,
         )
         canonical_network_clause = _canonical_network_procedure_clause(
             args, import_context, provider_procedure_table.c.npi, location_filter=canonical_location_filter
@@ -12202,6 +12167,8 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
     ]
     if canonical_network_clause is not None:
         filters.append(canonical_network_clause)
+    elif minimum_sources:
+        filters.append(literal(False))
     if npi is not None:
         filters.append(provider_procedure_table.c.npi == npi)
     if canonical_network_clause is None and state:
@@ -12283,6 +12250,7 @@ async def list_providers_by_procedure(request, *, native_args=None, import_conte
     if (
         import_context is None
         and canonical_network_clause is None
+        and not minimum_sources
         and len(internal_codes) == 1
         and not query_text
         and not state
@@ -12434,6 +12402,8 @@ async def list_providers_by_prescription(request):
     """List providers with prescription records matching a medication code."""
     session = _get_session(request)
     args = request.args
+    args.get("min_address_sources")
+    minimum_sources = parse_min_address_sources(args)
 
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
     year = _parse_int(args.get("year"), "year", minimum=2013)
@@ -12484,6 +12454,8 @@ async def list_providers_by_prescription(request):
         provider_prescription_table.c.year == year,
         provider_prescription_table.c.rx_code_system == INTERNAL_RX_CODE_SYSTEM,
     ]
+    if minimum_sources:
+        filters.append(literal(False))
     if state:
         filters.append(func.upper(provider_prescription_table.c.state) == state)
     if city:
@@ -12696,7 +12668,9 @@ async def _provider_prescription_list_where(session, args, provider_npi, year, l
     return and_(*filters), code_context
 
 
-async def _provider_prescription_list_page(session, pagination, where_clause, order_by, order):
+async def _provider_prescription_list_page(
+    session, pagination, where_clause, order_by, order, *, min_address_sources=0
+):
     count_result = await session.execute(
         select(func.count()).select_from(provider_prescription_table).where(where_clause)
     )
@@ -12720,7 +12694,8 @@ async def _provider_prescription_list_page(session, pagination, where_clause, or
     )
     query_result = await session.execute(query)
     prescription_items = [
-        _normalize_prescription_payload(_row_to_dict(prescription_record)) for prescription_record in query_result
+        _normalize_prescription_payload(_row_to_dict(prescription_record), min_address_sources)
+        for prescription_record in query_result
     ]
     if prescription_items:
         try:
@@ -12785,6 +12760,8 @@ async def list_provider_prescriptions(request, npi: str):
     """List a provider's prescription utilization records with optional filters."""
     session = _get_session(request)
     args = request.args
+    args.get("min_address_sources")
+    minimum_sources = parse_min_address_sources(args)
     provider_npi = _parse_int(npi, "npi", minimum=1)
     if provider_npi is None:
         raise InvalidUsage("Path parameter 'npi' must be provided")
@@ -12808,7 +12785,14 @@ async def list_provider_prescriptions(request, npi: str):
     where_clause, code_context = await _provider_prescription_list_where(
         session, args, provider_npi, year, list_values_by_name
     )
-    page = await _provider_prescription_list_page(session, pagination, where_clause, order_by, order)
+    page = await _provider_prescription_list_page(
+        session,
+        pagination,
+        where_clause,
+        order_by,
+        order,
+        **({"min_address_sources": minimum_sources} if minimum_sources else {}),
+    )
     return response.json(
         _provider_prescription_list_document(
             page,
@@ -12827,6 +12811,8 @@ async def _provider_prescription_detail(request, npi: str, rx_code_system: str, 
 
     session = _get_session(request)
     args = request.args
+    args.get("min_address_sources")
+    minimum_sources = parse_min_address_sources(args)
 
     provider_npi = _parse_int(npi, "npi", minimum=1)
     year = _parse_int(args.get("year"), "year", minimum=2013)
@@ -12861,7 +12847,7 @@ async def _provider_prescription_detail(request, npi: str, rx_code_system: str, 
     if prescription_row is None:
         raise sanic.exceptions.NotFound("Provider prescription not found")
 
-    prescription_payload = _normalize_prescription_payload(_row_to_dict(prescription_row))
+    prescription_payload = _normalize_prescription_payload(_row_to_dict(prescription_row), minimum_sources)
     try:
         external_codes_by_internal = await _resolve_external_rx_codes_for_internal(
             session,
@@ -12886,6 +12872,7 @@ async def _provider_prescription_detail(request, npi: str, rx_code_system: str, 
 )
 async def get_provider_prescription(request, npi: str, rx_code_system: str, rx_code: str):
     """Return provider-level prescription utilization for a resolved prescription code."""
+    request.args.get("min_address_sources")
     return await _provider_prescription_detail(request, npi, rx_code_system, rx_code)
 
 
@@ -12895,6 +12882,7 @@ async def get_provider_prescription(request, npi: str, rx_code_system: str, rx_c
 )
 async def get_physician_prescription(request, npi: str, rx_code_system: str, rx_code: str):
     """Return physician prescription utilization after resolving the supplied code system."""
+    request.args.get("min_address_sources")
     return await _provider_prescription_detail(request, npi, rx_code_system, rx_code)
 
 
@@ -13104,6 +13092,8 @@ async def list_prescription_providers(request, rx_code_system: str, rx_code: str
     """List providers with prescription records matching a code and optional filters."""
     session = _get_session(request)
     args = request.args
+    args.get("min_address_sources")
+    parse_min_address_sources(args)
     provider_request = _PrescriptionProviderRequest(
         pagination=parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT),
         requested_year=_parse_int(args.get("year"), "year", minimum=2013),
@@ -13126,6 +13116,8 @@ async def list_prescription_providers(request, rx_code_system: str, rx_code: str
         default_system=rx_code_system,
     )
     where_clause = _prescription_provider_where_clause(internal_rx_codes, year, provider_request.filters)
+    if parse_min_address_sources(args):
+        where_clause = and_(where_clause, literal(False))
     grouped_subquery = _prescription_provider_grouped_query(where_clause)
     total = await _prescription_provider_total(session, grouped_subquery)
     order = _normalize_order(args.get("order"))

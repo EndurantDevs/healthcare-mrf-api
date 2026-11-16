@@ -16,6 +16,7 @@ from api.ptg2_billing_search_service import search_exact_billing_provider_page
 
 BILLING_SEARCH_NATIVE_FIELDS = frozenset(
     {
+        "min_address_sources",
         "billing_entity_ref",
         "plan_release_id",
         "code",

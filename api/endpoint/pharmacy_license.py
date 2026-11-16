@@ -7,12 +7,18 @@ from typing import Any
 
 from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage, NotFound
-from sqlalchemy import func, select, text
+from sqlalchemy import false, func, select, text
 
-from db.models import (PharmacyLicenseImportRun, PharmacyLicenseRecord,
-                       PharmacyLicenseRecordHistory,
-                       PharmacyLicenseSnapshot,
-                       PharmacyLicenseStateCoverage)
+from api.address_source_filter import address_source_filter, parse_min_address_sources
+from api.network_address_scope import current_network_address_scope
+from db.models import (
+    EntityAddressUnified,
+    PharmacyLicenseImportRun,
+    PharmacyLicenseRecord,
+    PharmacyLicenseRecordHistory,
+    PharmacyLicenseSnapshot,
+    PharmacyLicenseStateCoverage,
+)
 
 blueprint = Blueprint("pharmacy_license", url_prefix="/pharmacy-license", version=1)
 
@@ -70,6 +76,37 @@ async def _is_table_available(session, table_name: str, schema: str = "mrf") -> 
     )
     value = result.scalar()
     return bool(value)
+
+
+async def _license_address_source_filter(session, license_table, minimum):
+    """Corroborate the same office, never another address attached to its NPI."""
+    scope = current_network_address_scope()
+    if scope is None and not await _is_table_available(session, EntityAddressUnified.__tablename__):
+        return false()
+    address = scope.address_relation if scope is not None else EntityAddressUnified.__table__
+    clauses = [
+        func.coalesce(address.c.npi, address.c.inferred_npi) == license_table.c.npi,
+        address_source_filter(address, minimum),
+    ]
+    for address_field, license_field in (
+        ("first_line", "address_line1"),
+        ("second_line", "address_line2"),
+        ("city_name", "city"),
+        ("state_name", "state"),
+    ):
+        address_column = (
+            func.coalesce(func.nullif(address.c.state_code, ""), address.c.state_name)
+            if address_field == "state_name"
+            else address.c[address_field]
+        )
+        address_value = func.lower(func.btrim(func.coalesce(address_column, "")))
+        license_value = func.lower(func.btrim(func.coalesce(license_table.c[license_field], "")))
+        clauses.append(address_value == license_value)
+        if address_field != "second_line":
+            clauses.append(license_value != "")
+    zip5 = func.substr(func.regexp_replace(func.coalesce(license_table.c.zip_code, ""), "[^0-9]", "", "g"), 1, 5)
+    clauses.extend((func.length(zip5) == 5, address.c.zip5 == zip5))
+    return select(1).select_from(address).where(*clauses).exists()
 
 
 @blueprint.get("/import/status")
@@ -189,6 +226,7 @@ async def get_pharmacy_license_by_npi(request, npi):
     """Return current and historical pharmacy licenses for an NPI."""
     session = _get_session(request)
     parsed_npi = _parse_npi(npi)
+    min_address_sources = parse_min_address_sources(request.args)
     as_of = _parse_date_param(request.args.get("as_of"), "as_of") or datetime.date.today()
     include_history = _is_boolean_parameter_enabled(request.args.get("include_history"), default=True)
     history_limit = _parse_int_param(request.args.get("history_limit"), "history_limit") or 50
@@ -216,6 +254,13 @@ async def get_pharmacy_license_by_npi(request, npi):
         await session.execute(
             select(table)
             .where(table.c.npi == parsed_npi)
+            .where(
+                *(
+                    [await _license_address_source_filter(session, table, min_address_sources)]
+                    if min_address_sources
+                    else []
+                )
+            )
             .order_by(table.c.state_code.asc(), table.c.license_number.asc())
         )
     ).all()
@@ -229,8 +274,9 @@ async def get_pharmacy_license_by_npi(request, npi):
     for license_row in license_rows:
         mapping = license_row._mapping
         exp_date = mapping.get("license_expiration_date")
-        status = str(mapping.get("license_status") or "unknown").lower()
-        is_active = status == "active" and (exp_date is None or exp_date >= as_of)
+        is_active = str(mapping.get("license_status") or "unknown").lower() == "active" and (
+            exp_date is None or exp_date >= as_of
+        )
         if is_active:
             active_states.add(str(mapping.get("state_code") or "").upper())
             active_license_count += 1
@@ -249,7 +295,7 @@ async def get_pharmacy_license_by_npi(request, npi):
                 "source_url": mapping.get("source_url"),
                 "license_number": mapping.get("license_number"),
                 "license_type": mapping.get("license_type"),
-                "license_status": status,
+                "license_status": str(mapping.get("license_status") or "unknown").lower(),
                 "source_status_raw": mapping.get("source_status_raw"),
                 "license_issue_date": mapping.get("license_issue_date").isoformat()
                 if mapping.get("license_issue_date")

@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import text
 
 from api import plan_pricing_projection_contract as projection_contract
+from api import pricing_address_source_filter as source_filter
 from api import ptg2_serving as serving
 from tests.ptg2_factorized_card_support import provider_cell_row
 from tests.test_plan_pricing_projection_v3_differential_postgres import (
@@ -40,14 +41,10 @@ async def _insert_memberships(connection, schema, projection_id):
             )"""
         ),
         [
-            {"projection_id": projection_id, "binding_ordinal": 0,
-             "provider_set_key": 10, "npi": 101},
-            {"projection_id": projection_id, "binding_ordinal": 0,
-             "provider_set_key": 10, "npi": 102},
-            {"projection_id": projection_id, "binding_ordinal": 1,
-             "provider_set_key": 20, "npi": 101},
-            {"projection_id": projection_id, "binding_ordinal": 2,
-             "provider_set_key": 30, "npi": 103},
+            {"projection_id": projection_id, "binding_ordinal": 0, "provider_set_key": 10, "npi": 101},
+            {"projection_id": projection_id, "binding_ordinal": 0, "provider_set_key": 10, "npi": 102},
+            {"projection_id": projection_id, "binding_ordinal": 1, "provider_set_key": 20, "npi": 101},
+            {"projection_id": projection_id, "binding_ordinal": 2, "provider_set_key": 30, "npi": 103},
         ],
     )
 
@@ -66,18 +63,10 @@ async def _insert_provider_cells(connection, schema, projection_id):
             )"""
         ),
         [
-            _stored_cell_by_field(
-                projection_id, 101, "10001", "207X00000X"
-            ),
-            _stored_cell_by_field(
-                projection_id, 101, "10002", "207X00000X"
-            ),
-            _stored_cell_by_field(
-                projection_id, 102, "10001", "207X00000X"
-            ),
-            _stored_cell_by_field(
-                projection_id, 103, "10001", "208D00000X"
-            ),
+            _stored_cell_by_field(projection_id, 101, "10001", "207X00000X"),
+            _stored_cell_by_field(projection_id, 101, "10002", "207X00000X"),
+            _stored_cell_by_field(projection_id, 102, "10001", "207X00000X"),
+            _stored_cell_by_field(projection_id, 103, "10001", "208D00000X"),
         ],
     )
 
@@ -99,18 +88,39 @@ async def _insert_rate_profiles(connection, schema, projection_id):
             )"""
         ),
         [
-            {"projection_id": projection_id, "binding_ordinal": 0,
-             "provider_set_key": 10, "membership_count": 2,
-             "minimum_rate": 10, "maximum_rate": 20, "rate_count": 3,
-             "rates": [10, 20], "multiplicities": [2, 1]},
-            {"projection_id": projection_id, "binding_ordinal": 1,
-             "provider_set_key": 20, "membership_count": 1,
-             "minimum_rate": 100, "maximum_rate": 100, "rate_count": 3,
-             "rates": [100], "multiplicities": [3]},
-            {"projection_id": projection_id, "binding_ordinal": 2,
-             "provider_set_key": 30, "membership_count": 1,
-             "minimum_rate": 5, "maximum_rate": 5, "rate_count": 1,
-             "rates": [5], "multiplicities": [1]},
+            {
+                "projection_id": projection_id,
+                "binding_ordinal": 0,
+                "provider_set_key": 10,
+                "membership_count": 2,
+                "minimum_rate": 10,
+                "maximum_rate": 20,
+                "rate_count": 3,
+                "rates": [10, 20],
+                "multiplicities": [2, 1],
+            },
+            {
+                "projection_id": projection_id,
+                "binding_ordinal": 1,
+                "provider_set_key": 20,
+                "membership_count": 1,
+                "minimum_rate": 100,
+                "maximum_rate": 100,
+                "rate_count": 3,
+                "rates": [100],
+                "multiplicities": [3],
+            },
+            {
+                "projection_id": projection_id,
+                "binding_ordinal": 2,
+                "provider_set_key": 30,
+                "membership_count": 1,
+                "minimum_rate": 5,
+                "maximum_rate": 5,
+                "rate_count": 1,
+                "rates": [5],
+                "multiplicities": [1],
+            },
         ],
     )
 
@@ -134,9 +144,7 @@ async def test_factorized_card_queries_merge_bindings_from_frozen_rows(
     database = migrated_v3_database
     projection_id = "d" * 64
     async with database.engine.begin() as connection:
-        await _insert_factorized_card_fixture(
-            connection, database.schema, projection_id
-        )
+        await _insert_factorized_card_fixture(connection, database.schema, projection_id)
         with monkeypatch.context() as scoped:
             scoped.setattr(projection_contract, "SCHEMA", database.schema)
             candidate_selection = await serving._factorized_card_candidates(
@@ -163,10 +171,64 @@ async def test_factorized_card_queries_merge_bindings_from_frozen_rows(
     }
     assert candidate_selection.total_lower_bound == 2
     assert candidate_selection.total_is_exact is True
-    assert [
-        provider_card_by_field["npi"]
-        for provider_card_by_field in card_items
-    ] == [101, 102]
+    assert [provider_card_by_field["npi"] for provider_card_by_field in card_items] == [101, 102]
     assert card_items[0]["zip5"] == "10002"
     assert card_items[0]["maximum_negotiated_rate"] == 100
     assert card_items[0]["rate_count"] == 6
+
+
+@pytest.mark.asyncio
+async def test_source_threshold_keeps_alternate_offices_and_filters_before_card_paging(
+    monkeypatch, migrated_v3_database
+):
+    database = migrated_v3_database
+    projection_id = "e" * 64
+    async with database.engine.begin() as connection:
+        await _insert_factorized_card_fixture(connection, database.schema, projection_id)
+        await connection.execute(
+            text(f'''CREATE TABLE "{database.schema}".entity_address_unified (
+            npi bigint, location_key text, zip5 text, postal_code text, type text, source_count integer,
+            city_name text DEFAULT 'Example City', state_name text DEFAULT 'IL', state_code text DEFAULT 'IL'
+        )''')
+        )
+        await connection.execute(
+            text(f'''INSERT INTO "{database.schema}".entity_address_unified (npi, location_key, zip5, postal_code, type, source_count) VALUES
+            (101,'first-low','10002','10002','practice',1),
+            (101,'alternate-high','10002','10002','practice',3),
+            (102,'local-low','10001','10001','practice',1),
+            (102,'other-office','90001','90001','practice',5),
+            (103,'wrong-specialty','10001','10001','practice',3)
+        ''')
+        )
+        monkeypatch.setattr(projection_contract, "SCHEMA", database.schema)
+        monkeypatch.setattr(source_filter, "SCHEMA", database.schema)
+        args_by_name = {"code_system": "CPT", "code": "27447", "min_address_sources": "3"}
+        selected = await serving._factorized_card_candidates(
+            connection,
+            projection_id,
+            ("CPT", "27447"),
+            ["10002", "10001"],
+            args_by_name,
+            1,
+        )
+        assert selected.minimum_rate_by_npi == {101: Decimal("10")}
+        assert selected.total_lower_bound == 1 and selected.total_is_exact
+        cards = await serving._factorized_card_complete_selected_npis(
+            connection,
+            projection_id,
+            ("CPT", "27447"),
+            ["10002", "10001"],
+            args_by_name,
+            (101,),
+            selected.minimum_rate_by_npi,
+        )
+        assert len(cards) == 1 and cards[0]["zip5"] == "10002"
+        empty = await serving._factorized_card_candidates(
+            connection,
+            projection_id,
+            ("CPT", "27447"),
+            ["10002", "10001"],
+            args_by_name | {"min_address_sources": "4"},
+            1,
+        )
+        assert empty.minimum_rate_by_npi == {} and empty.total_lower_bound == 0

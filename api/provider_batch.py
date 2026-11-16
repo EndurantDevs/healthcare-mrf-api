@@ -13,6 +13,7 @@ from sanic.exceptions import InvalidUsage
 from sanic.request.parameters import RequestParameters
 from sqlalchemy import String, column, select, values
 
+from api.address_source_filter import filter_address_source_rows, parse_min_address_sources
 from api.endpoint import npi
 from api.endpoint.pagination import parse_pagination
 from api.provider_profile_snapshot import provider_directory_snapshot_read
@@ -23,7 +24,15 @@ _SHAPE_KEYS = {"extra_info", "address_grouping", "view", "debug", "show"}
 _CONTROL_KEYS = (
     _PAGE_KEYS
     | _SHAPE_KEYS
-    | {"order_by", "include_total", "include_sources", "include_evidence", "primary_only", "year"}
+    | {
+        "order_by",
+        "include_total",
+        "include_sources",
+        "include_evidence",
+        "primary_only",
+        "year",
+        "min_address_sources",
+    }
 )
 
 
@@ -31,6 +40,148 @@ _CONTROL_KEYS = (
 class _NativeBatchState:
     details: dict
     addresses: dict
+    address_members: frozenset = frozenset()
+
+
+async def rank_batch_addresses(
+    npis: Sequence[int],
+    session: Any,
+    use_request_session: bool = False,
+    fail_closed: bool = False,
+    min_address_sources: int = 0,
+    source_members: set[int] | None = None,
+    address_key: str | None = None,
+    address_site_key: str | None = None,
+) -> dict[int, list[dict[str, Any]]]:
+    """Fetch and rank summary address candidates with fixed-count reads."""
+    base_addresses_by_npi = await npi._fetch_npi_location_candidates_map(npis, session=session)
+    if min_address_sources:
+        base_addresses_by_npi = _select_batch_address_rows(
+            base_addresses_by_npi, address_key, address_site_key, public_only=True
+        )
+    base_addresses_by_npi = npi.filter_address_source_rows(
+        base_addresses_by_npi, min_address_sources, member_npis=source_members
+    )
+    overlay_addresses_by_npi = (
+        {}
+        if npi.current_network_address_scope() is not None or min_address_sources
+        else await npi._fetch_provider_directory_address_overlay_map(npis, session=session)
+    )
+    await npi._apply_location_statuses(
+        [address for provider_npi in npis for address in base_addresses_by_npi.get(provider_npi, [])],
+        session=session,
+        use_request_session=use_request_session,
+        fail_closed=fail_closed,
+    )
+    ranked_addresses_by_npi: dict[int, list[dict[str, Any]]] = {}
+    for provider_npi in npis:
+        addresses = [
+            address
+            for address in list(base_addresses_by_npi.get(provider_npi, []))
+            + (
+                list(overlay_addresses_by_npi.get(provider_npi, []))
+                if npi.current_network_address_scope() is None
+                else []
+            )
+            if npi._is_public_street_level_address(address)
+        ]
+        ranked_addresses = npi._rank_provider_locations(npi._dedupe_addresses_by_key(addresses))
+        ranked_addresses_by_npi[provider_npi] = ranked_addresses
+    return ranked_addresses_by_npi
+
+
+async def hydrate_batch_addresses(
+    npis: Sequence[int],
+    ranked_addresses_by_npi: Mapping[int, Sequence[Mapping[str, Any]]],
+    address_limit: int,
+    address_offset: int,
+    include_sources: bool,
+    include_evidence: bool,
+    session: Any,
+) -> dict[int, list[dict[str, Any]]]:
+    """Hydrate only each provider's selected address page."""
+    selected_offset = address_offset if address_limit else 0
+    selected_end = address_offset + address_limit if address_limit else None
+    selected_addresses_by_npi = {
+        provider_npi: list(ranked_addresses_by_npi[provider_npi])[selected_offset:selected_end] for provider_npi in npis
+    }
+    selected_identity_list = sorted(
+        {
+            identity
+            for provider_npi in npis
+            for identity in npi._selected_base_identity_list(selected_addresses_by_npi[provider_npi])
+        }
+    )
+    hydrated_by_npi: dict[int, list[dict[str, Any]]] = {}
+    if selected_identity_list:
+        hydrated_by_npi = await npi._fetch_npi_address_rows_map(
+            npis,
+            include_sources=include_sources,
+            include_evidence=include_evidence,
+            address_row_identities=selected_identity_list,
+            session=session,
+        )
+    for provider_npi in npis:
+        selected_addresses_by_npi[provider_npi] = npi._merge_hydrated_location_candidates(
+            selected_addresses_by_npi[provider_npi], hydrated_by_npi.get(provider_npi, [])
+        )
+    selected_addresses = [address for provider_npi in npis for address in selected_addresses_by_npi[provider_npi]]
+    if selected_addresses and (include_sources or include_evidence):
+        await npi._attach_selected_address_source_details(
+            selected_addresses, include_sources=include_sources, include_role_evidence=include_evidence, session=session
+        )
+    return selected_addresses_by_npi
+
+
+def batch_provider_result(
+    provider_npi: int,
+    provider_detail_map: Mapping[str, Any] | None,
+    ranked_addresses: Sequence[Mapping[str, Any]],
+    selected_addresses: Sequence[Mapping[str, Any]],
+    other_names: Sequence[Mapping[str, Any]],
+    enrichment: Mapping[str, Any] | None,
+    batch_params: Mapping[str, Any],
+    authorized_without_addresses: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    """Format one success or not-found entry without extra reads."""
+    address_total = len(ranked_addresses)
+    scope = npi.current_network_address_scope()
+    if (
+        address_total == 0
+        and (not authorized_without_addresses)
+        and (provider_detail_map is None or (scope is not None and scope.network_ids is not None))
+    ):
+        return (
+            {"npi": provider_npi, "status": 404, "error": {"code": "not_found", "detail": "provider was not found"}},
+            False,
+        )
+    public_provider_map = dict(provider_detail_map or {"npi": provider_npi})
+    finalized_addresses = [
+        npi._finalize_public_provider_address(
+            dict(address),
+            include_sources=bool(batch_params["include_sources"]),
+            include_evidence=bool(batch_params["include_evidence"]),
+        )
+        for address in selected_addresses
+    ]
+    address_limit = int(batch_params["address_limit"]) or None
+    address_offset = int(batch_params["address_offset"]) if address_limit is not None else 0
+    public_provider_map["address_list"] = finalized_addresses
+    public_provider_map["address_pagination"] = {
+        "limit": address_limit,
+        "offset": address_offset,
+        "returned": len(finalized_addresses),
+        "total": address_total,
+        "has_more": address_limit is not None and address_offset + len(finalized_addresses) < address_total,
+    }
+    public_provider_map["other_name_list"] = list(other_names)
+    public_provider_map["do_business_as"] = npi._npi_batch_dba_names(public_provider_map, other_names)
+    public_provider_map["provider_enrichment"] = {
+        "summary": npi._public_provider_enrichment_summary(enrichment),
+        "ffs_visibility": npi._provider_enrichment_visibility(enrichment, include_chain=False),
+    }
+    npi._redact_internal_address_fields(public_provider_map)
+    return ({"npi": provider_npi, "status": 200, "provider": public_provider_map}, True)
 
 
 def parse_native_batch_query(document):
@@ -64,6 +215,11 @@ def parse_native_batch_query(document):
 
 def _batch_shape_params(batch_params, native_args):
     options_by_field = dict(batch_params)
+    if "min_address_sources" in native_args:
+        minimum = parse_min_address_sources(native_args)
+        if "min_address_sources" in batch_params and minimum != batch_params["min_address_sources"]:
+            raise InvalidUsage("native batch address source options must agree")
+        options_by_field["min_address_sources"] = minimum
     npi._normalize_exact_npi(native_args.get("npi"))
     if npi._is_truthy_arg(native_args.get("debug"), default=False):
         options_by_field.update(include_sources=True, include_evidence=True)
@@ -82,14 +238,21 @@ async def read_native_batch(
     """Match every requested identity before paging successful native providers."""
 
     params = _batch_shape_params(batch_params, native_args)
+    if "min_address_sources" in params and "min_address_sources" not in native_args:
+        native_args = RequestParameters({**native_args, "min_address_sources": [str(params["min_address_sources"])]})
     state = await _prepare_native_batch(params["npis"], native_args, session, import_context=import_context)
     state = _filter_batch_address_state(state, native_args)
+    requires_selected_address = bool(
+        params.get("min_address_sources") and (native_args.get("address_key") or native_args.get("address_site_key"))
+    )
     found_npis = [
         identity
         for identity in params["npis"]
         if state.addresses[identity]
+        or identity in state.address_members
         or (
-            (npi.current_network_address_scope() is None or npi.current_network_address_scope().network_ids is None)
+            not requires_selected_address
+            and (npi.current_network_address_scope() is None or npi.current_network_address_scope().network_ids is None)
             and state.details.get(identity) is not None
         )
     ]
@@ -121,9 +284,14 @@ async def read_native_batch(
     if not effective_order and not (set(native_args) & _PAGE_KEYS):
         by_npi = {provider_item["npi"]: provider_item for provider_item in provider_items}
         provider_items = [by_npi[identity] for identity in params["npis"]]
+    return _native_batch_page_result(provider_items, params["npis"], eligible_npis, missing_npis, pagination, selected)
+
+
+def _native_batch_page_result(provider_items, npis, eligible_npis, missing_npis, pagination, selected):
+    """Shape exact batch pagination after eligibility and address hydration finish."""
     return {
         "items": provider_items,
-        "requested": len(params["npis"]),
+        "requested": len(npis),
         "found": len(eligible_npis),
         "not_found": len(missing_npis),
         "pagination": {
@@ -139,17 +307,36 @@ async def read_native_batch(
 async def _prepare_native_batch(npis, native_args, session, *, import_context=None):
     details = await npi._build_npi_identity_details_map(npis, session=session)
     has_import_context = import_context is not None
+    minimum = parse_min_address_sources(native_args)
+    member_npis = set()
     if not npi._is_truthy_arg(native_args.get("extra_info"), default=False):
         return _NativeBatchState(
             details,
             await npi._rank_npi_batch_addresses(
-                npis, session=session, use_request_session=session is not None, fail_closed=has_import_context
+                npis,
+                session=session,
+                use_request_session=session is not None,
+                fail_closed=has_import_context,
+                **(
+                    {
+                        "min_address_sources": minimum,
+                        "source_members": member_npis,
+                        "address_key": native_args.get("address_key"),
+                        "address_site_key": native_args.get("address_site_key"),
+                    }
+                    if minimum
+                    else {}
+                ),
             ),
+            frozenset(member_npis),
         )
     base = await npi._fetch_npi_location_candidates_map(npis, session=session)
+    if minimum:
+        base = _select_batch_address_rows(base, native_args.get("address_key"), native_args.get("address_site_key"))
+    base = filter_address_source_rows(base, minimum, member_npis=member_npis if minimum else None)
     overlays = (
         {}
-        if npi.current_network_address_scope() is not None
+        if npi.current_network_address_scope() is not None or minimum
         else await npi._fetch_provider_directory_address_overlay_map(npis, session=session)
     )
     await npi._apply_location_statuses(
@@ -164,24 +351,53 @@ async def _prepare_native_batch(npis, native_args, session, *, import_context=No
         )
         for identity in npis
     }
-    return _NativeBatchState(details, addresses_by_npi)
+    return _NativeBatchState(details, addresses_by_npi, frozenset(member_npis))
 
 
-def _filter_batch_address_state(state, native_args):
-    address_key = native_args.get("address_key")
-    site_key = native_args.get("address_site_key")
-    if not address_key and not site_key:
-        return state
-    addresses_by_npi = {
+def _select_batch_address_rows(addresses_by_npi, address_key=None, site_key=None, *, public_only=False):
+    return {
         identity: [
             address
             for address in addresses
             if (not address_key or str(address.get("address_key") or "").lower() == address_key)
             and (not site_key or npi._is_address_site_key_match(address, site_key))
+            and (not public_only or npi._is_public_street_level_address(address))
         ]
-        for identity, addresses in state.addresses.items()
+        for identity, addresses in addresses_by_npi.items()
     }
-    return _NativeBatchState(state.details, addresses_by_npi)
+
+
+def _filter_batch_address_state(state, native_args):
+    address_key = native_args.get("address_key")
+    site_key = native_args.get("address_site_key")
+    minimum = parse_min_address_sources(native_args)
+    if not address_key and not site_key and not minimum:
+        return state
+    selected = _select_batch_address_rows(
+        state.addresses,
+        address_key,
+        site_key,
+        public_only=minimum and not npi._is_truthy_arg(native_args.get("extra_info"), default=False),
+    )
+    members = state.address_members or (
+        frozenset(identity for identity, addresses in selected.items() if addresses)
+        if minimum
+        else state.address_members
+    )
+    return _NativeBatchState(state.details, filter_address_source_rows(selected, minimum), members)
+
+
+def _batch_eligibility_args(native_args, requested_count):
+    """Search the full finite batch before applying caller pagination."""
+    args = RequestParameters(
+        {
+            name: list(field_values)
+            for name, field_values in native_args.items()
+            if name not in _SHAPE_KEYS | _PAGE_KEYS | {"include_sources", "include_evidence"}
+        }
+    )
+    args.update(page=["1"], limit=[str(requested_count)], start=["0"], view=["card"])
+    return args
 
 
 async def _batch_eligible_npis(
@@ -195,20 +411,17 @@ async def _batch_eligible_npis(
     witness_rows=None,
     native_scope_preparer=None,
 ):
+    """Apply remaining provider filters and reject incomplete batch eligibility totals."""
     exact_npi = npi._normalize_exact_npi(native_args.get("npi"))
     if exact_npi is not None:
         found_npis = [identity for identity in found_npis if identity == exact_npi]
     if not found_npis:
         return []
-    if set(native_args) - _CONTROL_KEYS - {"npi"}:
-        args = RequestParameters(
-            {
-                name: list(field_values)
-                for name, field_values in native_args.items()
-                if name not in _SHAPE_KEYS | _PAGE_KEYS | {"include_sources", "include_evidence"}
-            }
-        )
-        args.update(page=["1"], limit=[str(len(requested))], start=["0"], view=["card"])
+    local_keys = _CONTROL_KEYS | (
+        {"address_key", "address_site_key"} if parse_min_address_sources(native_args) else set()
+    )
+    if set(native_args) - local_keys - {"npi"}:
+        args = _batch_eligibility_args(native_args, len(requested))
         reply = await npi.list_providers(
             request,
             native_args=args,
@@ -309,6 +522,7 @@ async def _hydrate_native_batch(npis, state, params, native_args, session, *, wi
             names.get(identity, ()),
             enrichment.get(identity),
             params,
+            **({"authorized_without_addresses": True} if identity in state.address_members else {}),
         )
         if not was_found:
             raise CustomImportReadUnavailableError("native batch provider is unavailable")
@@ -381,11 +595,32 @@ def _apply_premise_groups(provider, groups, hydrated, params):
     )
 
 
+def normalize_batch_npis(raw_npis: Any) -> list[int]:
+    """Validate and normalize the ordered NPI list."""
+    if not isinstance(raw_npis, list) or not 1 <= len(raw_npis) <= npi.NPI_BATCH_MAX_SIZE:
+        raise InvalidUsage(f"npis must contain between 1 and {npi.NPI_BATCH_MAX_SIZE} values")
+    normalized_npis: list[int] = []
+    for raw_npi in raw_npis:
+        if isinstance(raw_npi, bool):
+            npi_text = ""
+        elif isinstance(raw_npi, (str, int)):
+            npi_text = str(raw_npi).strip()
+        else:
+            npi_text = ""
+        if len(npi_text) != 10 or not npi_text.isascii() or (not npi_text.isdigit()):
+            raise InvalidUsage("each npi must be a 10-digit numeric value")
+        normalized_npis.append(int(npi_text))
+    if len(set(normalized_npis)) != len(normalized_npis):
+        raise InvalidUsage("npis must be unique")
+    return normalized_npis
+
+
 def normalize_native_batch_request(raw_body: Any) -> dict[str, Any]:
     """Validate the bounded, shared-option provider batch contract."""
     if not isinstance(raw_body, Mapping):
         raise InvalidUsage("request body must be a JSON object")
     allowed_fields = {
+        "min_address_sources",
         "npis",
         "address_limit",
         "address_offset",
@@ -399,6 +634,15 @@ def normalize_native_batch_request(raw_body: Any) -> dict[str, Any]:
     if isinstance(address_limit, str) and address_limit.strip().lower() == "all":
         address_limit = 0
     return {
+        **(
+            {
+                "min_address_sources": npi._bounded_npi_batch_integer(
+                    raw_body, "min_address_sources", default=0, minimum=0, maximum=2147483647
+                )
+            }
+            if "min_address_sources" in raw_body
+            else {}
+        ),
         "npis": npi._normalize_npi_batch_npis(raw_body.get("npis")),
         "address_limit": npi._bounded_npi_batch_integer(
             {"address_limit": address_limit},
@@ -425,9 +669,14 @@ async def build_native_batch_payload(
 ) -> dict[str, Any]:
     """Assemble ordered provider summaries with set-based database reads."""
     npis = list(batch_params["npis"])
+    minimum = batch_params.get("min_address_sources", 0)
+    member_npis = set()
     detail_by_npi = await npi._build_npi_identity_details_map(npis, session=session)
     ranked_addresses_by_npi = await npi._rank_npi_batch_addresses(
-        npis, session=session, use_request_session=session is not None
+        npis,
+        session=session,
+        use_request_session=session is not None,
+        **({"min_address_sources": minimum, "source_members": member_npis} if minimum else {}),
     )
     selected_addresses_by_npi = await npi._hydrate_npi_batch_addresses(
         npis,
@@ -451,10 +700,13 @@ async def build_native_batch_payload(
             other_names_by_npi.get(identity, []),
             enrichment_by_npi.get(identity),
             batch_params,
+            **({"authorized_without_addresses": True} if minimum and identity in member_npis else {}),
         )
         response_items.append(provider_result_map)
         found_count += int(was_found)
     await _project_batch_provider_metadata(response_items, batch_params, session)
+    if minimum:
+        response_items = npi._without_uncounted_postal_addresses(response_items)
     return {
         "items": response_items,
         "requested": len(npis),

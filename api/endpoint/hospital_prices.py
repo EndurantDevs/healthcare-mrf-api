@@ -10,20 +10,22 @@ from typing import Any
 
 import orjson
 from sanic import Blueprint, response
+from sanic.exceptions import InvalidUsage
 
-from api.hospital_price_serving import HOSPITAL_PRICE_CACHE_CONTROL
-from api.hospital_price_serving import MAX_HOSPITAL_PRICE_PUBLIC_BYTES
-from api.hospital_price_serving import HospitalPriceCursorStaleError
-from api.hospital_price_serving import HospitalPriceInvalidRequestError
-from api.hospital_price_serving import HospitalPriceNotFoundError
-from api.hospital_price_serving import HospitalPriceServingUnavailableError
-from api.hospital_price_serving import read_hospital_price_page
-from api.hospital_price_serving import validate_hospital_price_query
-from api.hospital_price_request import validate_hospital_price_plan
-from api.hospital_price_status import list_hospital_price_status_page
+from api.address_source_filter import parse_min_address_sources
 from api.hospital_price_payer_plans import read_hospital_payer_plan_page
-from api.hospital_price_request import validate_hospital_payer_plan_query
-
+from api.hospital_price_request import validate_hospital_payer_plan_query, validate_hospital_price_plan
+from api.hospital_price_serving import (
+    HOSPITAL_PRICE_CACHE_CONTROL,
+    MAX_HOSPITAL_PRICE_PUBLIC_BYTES,
+    HospitalPriceCursorStaleError,
+    HospitalPriceInvalidRequestError,
+    HospitalPriceNotFoundError,
+    HospitalPriceServingUnavailableError,
+    read_hospital_price_page,
+    validate_hospital_price_query,
+)
+from api.hospital_price_status import list_hospital_price_status_page
 
 blueprint = Blueprint(
     "hospital_prices",
@@ -34,7 +36,7 @@ logger = logging.getLogger(__name__)
 _QUERY_FIELDS = frozenset(
     {"code_type", "code", "payer_name", "plan_name", "plan_missing", "version_id", "cursor", "limit"}
 )
-_FACILITY_QUERY_FIELDS = frozenset({"q", "published", "cursor", "limit", "include_metadata"})
+_FACILITY_QUERY_FIELDS = frozenset({"q", "published", "cursor", "limit", "include_metadata", "min_address_sources"})
 _PAYER_PLAN_QUERY_FIELDS = frozenset({"version_id", "cursor", "limit"})
 _FACILITY_CURSOR_PATTERN = re.compile(r"hospital-[0-9]{6}\Z")
 _FACILITY_LIMIT_PATTERN = re.compile(r"[1-9][0-9]{0,2}\Z")
@@ -54,9 +56,7 @@ _ERROR_BY_STATUS = {
 def _get_session(request: Any) -> Any:
     session = getattr(getattr(request, "ctx", None), "sa_session", None)
     if session is None:
-        raise HospitalPriceServingUnavailableError(
-            "SQLAlchemy session is unavailable"
-        )
+        raise HospitalPriceServingUnavailableError("SQLAlchemy session is unavailable")
     return session
 
 
@@ -69,22 +69,15 @@ def _query_values(
         return {}
     try:
         supplied_fields = set(args.keys())
-    except (AttributeError, TypeError):
-        raise HospitalPriceInvalidRequestError(
-            "hospital price query is invalid"
-        ) from None
+    except AttributeError, TypeError:
+        raise HospitalPriceInvalidRequestError("hospital price query is invalid") from None
     if not supplied_fields.issubset(allowed_fields):
         raise HospitalPriceInvalidRequestError("hospital price query is invalid")
     values_by_field: dict[str, str] = {}
     for field_name in sorted(supplied_fields):
-        raw_values = (
-            list(args.getlist(field_name))
-            if hasattr(args, "getlist") else [args.get(field_name)]
-        )
+        raw_values = list(args.getlist(field_name)) if hasattr(args, "getlist") else [args.get(field_name)]
         if len(raw_values) != 1 or type(raw_values[0]) is not str:
-            raise HospitalPriceInvalidRequestError(
-                "hospital price query is invalid"
-            )
+            raise HospitalPriceInvalidRequestError("hospital price query is invalid")
         values_by_field[field_name] = raw_values[0]
     return values_by_field
 
@@ -93,9 +86,7 @@ def _facility_search_query(values_by_field: dict[str, str]) -> dict[str, object]
     if values_by_field.get("include_metadata") not in {None, "true", "false"}:
         raise HospitalPriceInvalidRequestError("hospital facility metadata selector is invalid")
     query = values_by_field.get("q")
-    if query is not None and (
-        not query or query != query.strip() or len(query) > 256
-    ):
+    if query is not None and (not query or query != query.strip() or len(query) > 256):
         raise HospitalPriceInvalidRequestError("hospital facility query is invalid")
     published_text = values_by_field.get("published")
     if published_text not in {None, "true", "false"}:
@@ -114,13 +105,7 @@ def _facility_search_query(values_by_field: dict[str, str]) -> dict[str, object]
         raise HospitalPriceInvalidRequestError("hospital facility limit is invalid")
     search_by_field = {
         "query": query,
-        "status": (
-            "succeeded"
-            if published_text == "true"
-            else "unpublished"
-            if published_text == "false"
-            else None
-        ),
+        "status": ("succeeded" if published_text == "true" else "unpublished" if published_text == "false" else None),
         "cursor": cursor,
         "limit": limit,
     }
@@ -158,9 +143,7 @@ def _public_facility_item(status_item: dict[str, Any]) -> dict[str, object]:
 def _json_response(payload: dict[str, object], *, status: int):
     encoded = orjson.dumps(payload)
     if status < 400 and len(encoded) > MAX_HOSPITAL_PRICE_PUBLIC_BYTES:
-        raise HospitalPriceServingUnavailableError(
-            "hospital price response exceeds its bound"
-        )
+        raise HospitalPriceServingUnavailableError("hospital price response exceeds its bound")
     return response.raw(
         encoded,
         status=status,
@@ -178,7 +161,7 @@ def _error_response(status: int):
 
 
 def _failure_response(failure: Exception):
-    if isinstance(failure, HospitalPriceInvalidRequestError):
+    if isinstance(failure, (HospitalPriceInvalidRequestError, InvalidUsage)):
         return _error_response(400)
     if isinstance(failure, HospitalPriceNotFoundError):
         return _error_response(404)
@@ -196,16 +179,18 @@ async def search_hospital_price_facilities(request: Any):
     """Return source-hidden canonical facility identities for price discovery."""
 
     try:
-        search_by_field = _facility_search_query(
-            _query_values(request, _FACILITY_QUERY_FIELDS)
-        )
+        values = _query_values(request, _FACILITY_QUERY_FIELDS)
+        min_address_sources = parse_min_address_sources(values)
+        values.pop("min_address_sources", None)
+        search_by_field = _facility_search_query(values)
+        # Source metadata has no canonical office correspondence or stored count.
+        if min_address_sources:
+            return _json_response({"items": [], "next_cursor": None}, status=200)
         search_by_field["identity_query_only"] = True
         status_page = await list_hospital_price_status_page(**search_by_field)
         return _json_response(
             {
-                "items": [
-                    _public_facility_item(item) for item in status_page["items"]
-                ],
+                "items": [_public_facility_item(item) for item in status_page["items"]],
                 "next_cursor": status_page["next_cursor"],
             },
             status=200,
@@ -246,11 +231,7 @@ async def get_hospital_payer_plans(request: Any, hospital_id: str):
     """Discover observed exact payer/plan pairs in one published version."""
 
     try:
-        query = validate_hospital_payer_plan_query(
-            hospital_id, **_query_values(request, _PAYER_PLAN_QUERY_FIELDS)
-        )
-        return _json_response(
-            await read_hospital_payer_plan_page(_get_session(request), query), status=200
-        )
+        query = validate_hospital_payer_plan_query(hospital_id, **_query_values(request, _PAYER_PLAN_QUERY_FIELDS))
+        return _json_response(await read_hospital_payer_plan_page(_get_session(request), query), status=200)
     except Exception as failure:
         return _failure_response(failure)

@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+from api.address_source_filter import parse_min_address_sources
 from api.plan_pricing_projection_contract import table
 
 
-def state_scan_provider_page_sql(binding_ordinals=None) -> str:
+def state_scan_provider_page_sql(binding_ordinals=None, minimum_sources=0) -> str:
     """Return the bounded provider-state witness keyset query."""
 
+    minimum_sources = parse_min_address_sources({"min_address_sources": minimum_sources})
     admission = ""
     relation = table("plan_pricing_provider_state")
     if binding_ordinals is not None:
@@ -19,12 +21,20 @@ def state_scan_provider_page_sql(binding_ordinals=None) -> str:
                AND permitted.npi = provider_state.npi
                AND permitted.binding_ordinal = ANY(CAST(:admitted_binding_ordinals AS integer[]))
         )"""
+    source_count_sql = ""
+    if minimum_sources:
+        from api.plan_pricing_state_scan_sources import state_source_count_sql
+
+        if binding_ordinals is None:
+            relation += " provider_state"
+        source_count_sql = state_source_count_sql(minimum_sources)
     return f"""
         SELECT npi, provider_fragment
           FROM {relation}
          WHERE projection_id = :projection_id
            AND state = :state AND npi > :after_npi
            {admission}
+           {source_count_sql}
          ORDER BY npi
          LIMIT :npi_sentinel_limit
     """

@@ -55,3 +55,32 @@ def _npi_detail_taxonomy_aggregate(
         .group_by(taxonomy_table.c.npi)
         .subquery(alias)
     )
+
+
+def detail_address_subquery(
+    address_model: Any,
+    address_table: Any,
+    address_columns: Sequence[Any],
+    address_filters: Sequence[Any],
+    address_limit: int | None,
+) -> Any:
+    """Build the bounded detail address relation using the endpoint query hooks."""
+    from api.endpoint import npi
+
+    npi_address_rows = npi.select(*address_columns).where(*address_filters).offset(0).subquery("npi_address_rows")
+    address_subquery_base = (
+        npi.select(*npi_address_rows.c)
+        .where(npi._provider_detail_address_type_clause(address_model, npi_address_rows))
+        # Deterministic order keeps bounded identity hydration stable.
+        .order_by(
+            npi_address_rows.c.type,
+            npi_address_rows.c.first_line,
+            npi_address_rows.c.city_name,
+        )
+    )
+    if address_limit is not None:
+        address_subquery_base = address_subquery_base.limit(address_limit)
+    try:
+        return address_subquery_base.alias("address_list")
+    except NameError:
+        return address_subquery_base

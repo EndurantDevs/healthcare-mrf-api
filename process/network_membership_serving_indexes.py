@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import re
 from uuid import UUID
 
 from db.registry_schema import registry_schema
@@ -148,7 +149,27 @@ async def _build_serving_indexes(connection, schema_name, index_plan):
         await connection.execute(statement)
 
 
-async def _serving_index_records(connection, schema_name, *, qualified_definitions=False):
+_INDEX_SHAPE_SQL = """, jsonb_build_object(
+    'method',(SELECT amname FROM pg_am WHERE oid=index_relation.relam),
+    'unique',index_record.indisunique,
+    'keys',ARRAY(SELECT pg_get_indexdef(index_record.indexrelid,position,true)
+        FROM generate_series(1,index_record.indnkeyatts) position),
+    'include',ARRAY(SELECT pg_get_indexdef(index_record.indexrelid,position,true)
+        FROM generate_series(index_record.indnkeyatts+1,index_record.indnatts) position),
+    'opclasses',(SELECT jsonb_agg(jsonb_build_object(
+        'name',namespace.nspname||'.'||operator_class.opcname,'default',operator_class.opcdefault)
+        ORDER BY key.position)
+        FROM unnest(index_record.indclass) WITH ORDINALITY key(class_oid,position)
+        JOIN pg_opclass operator_class ON operator_class.oid=key.class_oid
+        JOIN pg_namespace namespace ON namespace.oid=operator_class.opcnamespace),
+    'options',index_record.indoption::smallint[],
+    'default_collations',NOT EXISTS(SELECT 1 FROM unnest(index_record.indcollation) collation_oid
+        WHERE collation_oid<>0 AND collation_oid<>'pg_catalog."default"'::regcollation),
+    'predicate',pg_get_expr(index_record.indpred,index_record.indrelid)
+) AS index_shape"""
+
+
+async def _serving_index_records(connection, schema_name, *, qualified_definitions=False, include_structure=False):
     """Deparse the same complete index catalog independently of caller lookup settings."""
     previous_path = await connection.fetchval("SELECT current_setting('search_path')")
     await connection.execute(
@@ -161,6 +182,9 @@ async def _serving_index_records(connection, schema_name, *, qualified_definitio
             """
             SELECT index_relation.relname,index_record.indisvalid,index_record.indisready,index_record.indislive,
                 pg_get_indexdef(index_relation.oid) AS index_definition
+            """
+            + (_INDEX_SHAPE_SQL if include_structure else "")
+            + """
             FROM pg_class projected JOIN pg_namespace namespace ON namespace.oid=projected.relnamespace
             JOIN pg_index index_record ON index_record.indrelid=projected.oid
             JOIN pg_class index_relation ON index_relation.oid=index_record.indexrelid
@@ -178,14 +202,82 @@ async def _serving_index_records(connection, schema_name, *, qualified_definitio
     return index_records
 
 
-async def _index_digest(connection, schema_name, index_plan, *, qualified_definitions=False):
-    index_records = await _serving_index_records(connection, schema_name, qualified_definitions=qualified_definitions)
+_OPTIONAL_SOURCE_COUNT_INDEX = "entity_address_unified_idx_source_count"
+
+
+def _is_index_expression_equal(actual, expected):
+    """Use the existing native deparser normalization without changing literal values."""
+    from process.network_geo_search import _normalized_index_definition
+
+    actual, expected = actual or "", expected or ""
+    expected = re.sub(r"\btype IN \(([^()]+)\)", r"type = ANY (ARRAY[\1])", expected)
+    return re.findall(r"'(?:''|[^'])*'", actual) == re.findall(r"'(?:''|[^'])*'", expected) and (
+        _normalized_index_definition(actual).lower() == _normalized_index_definition(expected).lower()
+    )
+
+
+def _is_index_key_equal(actual, opclass, expected):
+    explicit_class = re.fullmatch(r"(.+) (public\.[A-Za-z0-9_]+_ops)", expected)
+    expression = explicit_class[1] if explicit_class else expected
+    return _is_index_expression_equal(actual, expression) and (
+        opclass["name"] == explicit_class[2] if explicit_class else opclass["default"] is True
+    )
+
+
+def _is_serving_index_valid(shape, recipe):
+    keys = recipe["index_elements"]
+    return (
+        shape["method"] == recipe.get("using", "btree")
+        and shape["unique"] is bool(recipe.get("unique", False))
+        and len(shape["keys"]) == len(shape["opclasses"]) == len(keys)
+        and shape["options"] == [0] * len(keys)
+        and shape["default_collations"] is True
+        and shape["include"] == list(recipe.get("include", ()))
+        and _is_index_expression_equal(shape["predicate"], recipe.get("where"))
+        and all(
+            _is_index_key_equal(actual, opclass, expected)
+            for actual, opclass, expected in zip(shape["keys"], shape["opclasses"], keys, strict=True)
+        )
+    )
+
+
+def _require_serving_definitions(index_records, index_plan):
+    """Validate current required recipes independently of names or settings on other indexes."""
+    from db.models import EntityAddressUnified
+
+    recipes_by_name = {
+        "entity_address_unified_idx_" + recipe["name"]: recipe
+        for recipe in EntityAddressUnified.__my_additional_indexes__
+    }
+    required_names = {name for name, _ in index_plan} - {_OPTIONAL_SOURCE_COUNT_INDEX}
+    for index_record in index_records:
+        if index_record["relname"] in required_names:
+            shape = _json_object(index_record["index_shape"])
+            if not _is_serving_index_valid(shape, recipes_by_name[index_record["relname"]]):
+                raise NetworkServingIndexesError("Native serving index differs from its required recipe")
+
+
+async def _index_digest(
+    connection, schema_name, index_plan, *, qualified_definitions=False, validate_definitions=False
+):
+    index_records = await _serving_index_records(
+        connection,
+        schema_name,
+        qualified_definitions=qualified_definitions,
+        **({"include_structure": True} if validate_definitions else {}),
+    )
+    # Older published profiles remain readable while this optional index is built.
+    index_records = [record for record in index_records if record["relname"] != _OPTIONAL_SOURCE_COUNT_INDEX]
     actual_by_name = {record["relname"]: record for record in index_records}
-    if not all(index_name in actual_by_name for index_name, _ in index_plan) or any(
+    if not all(
+        index_name in actual_by_name for index_name, _ in index_plan if index_name != _OPTIONAL_SOURCE_COUNT_INDEX
+    ) or any(
         not all(record[field] is True for field in ("indisvalid", "indisready", "indislive"))
         for record in index_records
     ):
         raise NetworkServingIndexesError("Native serving indexes are missing or invalid on the exact candidate table")
+    if validate_definitions:
+        _require_serving_definitions(index_records, index_plan)
     definitions = sorted(record["index_definition"] for record in index_records)
     return hashlib.sha256(
         json.dumps(definitions, separators=(",", ":"), ensure_ascii=False).encode("utf-8")

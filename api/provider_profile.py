@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import re
 from typing import Any, Iterable, Mapping
 
@@ -19,11 +20,6 @@ from api.provider_profile_cms import (
     fetch_cms_education_projection,
     merge_cms_education_projection,
 )
-from api.provider_profile_states import (
-    canonicalize_exact_category,
-    fetch_additional_state_profile_projections,
-    merge_state_profile_projection,
-)
 from api.provider_profile_composer_parts import (
     PROFILE_COMPOSER_VERSION,
     _append_fhir_sources,
@@ -34,11 +30,16 @@ from api.provider_profile_composer_parts import (
     _merge_fhir_profile_facts,
     _paginate_profile_category,
 )
-from db.models import ProviderProfileProjection, db
 from api.provider_profile_public_facts import (
     _professional_summary,
     _public_fhir_fact,
 )
+from api.provider_profile_states import (
+    canonicalize_exact_category,
+    fetch_additional_state_profile_projections,
+    merge_state_profile_projection,
+)
+from db.models import ProviderProfileProjection, db
 from process.florida_mqa_profile import PROFILE_SCHEMA_VERSION
 
 
@@ -127,6 +128,88 @@ def compose_provider_profile(
     return profile
 
 
+def compose_source_filtered_profile(npi, min_address_sources, **profile_options_by_name):
+    """Remove uncounted postal facts before the existing profile pagination."""
+    state_projection = profile_options_by_name.get("state_projection")
+    if state_projection is not None:
+        state_projection = _without_uncounted_postal_addresses(state_projection)
+        locations = (state_projection.get("profile") or {}).get("categories", {}).get("locations")
+        if locations is not None:
+            locations["items"] = []
+            locations["availability"] = "unavailable"
+        profile_options_by_name["state_projection"] = state_projection
+    fhir_profile = profile_options_by_name.get("fhir_profile")
+    if fhir_profile is not None:
+        profile_options_by_name["fhir_profile"] = _without_uncounted_postal_addresses(fhir_profile)
+    profile = compose_provider_profile(npi, **profile_options_by_name)
+    if profile is not None:
+        profile["generation_id"] = hashlib.sha256(
+            f"{profile['generation_id']}:min_address_sources:{min_address_sources}".encode()
+        ).hexdigest()
+    return profile
+
+
+def _without_uncounted_postal_addresses(profile_value, *, preserve_office_postal=False):
+    """Keep unrelated profile facts while excluding unsupported postal contacts."""
+    if isinstance(profile_value, list):
+        return [
+            _without_uncounted_postal_addresses(field_value, preserve_office_postal=preserve_office_postal)
+            for field_value in profile_value
+        ]
+    if not isinstance(profile_value, Mapping):
+        return profile_value
+    street_fields = {
+        "address_line_1",
+        "address_line_2",
+        "address_line_3",
+        "first_line",
+        "second_line",
+    }
+    has_unknown_postal = not preserve_office_postal and bool(street_fields.intersection(profile_value))
+    postal_fields = street_fields | {
+        "city",
+        "city_name",
+        "state",
+        "state_name",
+        "state_code",
+        "zip_code",
+        "zip5",
+        "postal_code",
+        "country",
+        "country_code",
+        "county",
+        "formatted_address",
+        "lat",
+        "long",
+    }
+    return {
+        key: _source_filtered_postal_field(key, field_value)
+        for key, field_value in profile_value.items()
+        if key not in {"practice_location", "practice_locations", "mailing_address"}
+        and not (key == "address" and isinstance(field_value, (Mapping, list)))
+        and not (has_unknown_postal and key in postal_fields)
+    }
+
+
+def _source_filtered_postal_field(key, value):
+    """Preserve qualified office fields while filtering their nested metadata."""
+    if key == "address_list":
+        return _without_uncounted_postal_addresses(value, preserve_office_postal=True)
+    if key == "address_groups" and isinstance(value, list):
+        return [
+            {
+                field: _without_uncounted_postal_addresses(item, preserve_office_postal=field == "members")
+                for field, item in group.items()
+            }
+            if isinstance(group, Mapping)
+            else _without_uncounted_postal_addresses(group)
+            for group in value
+        ]
+    if key in {"ffs_practice_cities", "ffs_practice_states", "ffs_practice_zip_codes"}:
+        return []
+    return _without_uncounted_postal_addresses(value)
+
+
 def _returned_profile_items(
     provider_profile: Mapping[str, Any] | None,
 ) -> list[Mapping[str, Any]]:
@@ -141,9 +224,7 @@ def _returned_profile_items(
         if not isinstance(group, Mapping):
             continue
         returned_items.extend(
-            profile_item
-            for profile_item in group.get("items", [])
-            if isinstance(profile_item, Mapping)
+            profile_item for profile_item in group.get("items", []) if isinstance(profile_item, Mapping)
         )
     return returned_items
 
@@ -179,8 +260,7 @@ def _projection_evidence_payload(
         source_payload["records"] = [
             source_record
             for source_record in source_payload.get("records", [])
-            if isinstance(source_record, Mapping)
-            and str(source_record.get("source_record_id")) in returned_record_ids
+            if isinstance(source_record, Mapping) and str(source_record.get("source_record_id")) in returned_record_ids
         ]
     return source_payload
 
@@ -191,14 +271,10 @@ def _returned_fhir_fact_keys(
     """Return canonical FHIR fact keys represented by visible profile items."""
     returned_fhir_keys = set()
     for profile_item in returned_items:
-        has_fhir_source = "provider_directory_fhir" in profile_item.get(
-            "source_kinds", []
-        )
+        has_fhir_source = "provider_directory_fhir" in profile_item.get("source_kinds", [])
         if has_fhir_source or not profile_item.get("source_record_id"):
             fact_type = str(profile_item.get("type") or "")
-            returned_fhir_keys.add(
-                (fact_type, evidence_value_key(fact_type, profile_item.get("value")))
-            )
+            returned_fhir_keys.add((fact_type, evidence_value_key(fact_type, profile_item.get("value"))))
     return returned_fhir_keys
 
 

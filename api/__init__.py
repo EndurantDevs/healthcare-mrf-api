@@ -4,6 +4,7 @@ from sanic import response
 from sanic.blueprints import Blueprint
 from sanic.exceptions import SanicException
 
+from api.address_source_filter import acknowledge_address_source_filter
 from api.control import blueprint as control_blueprint
 from api.control import control_error
 from api.control_admission_batch import blueprint as admission_batch_blueprint
@@ -92,6 +93,7 @@ def init_api(api):
     api.register_middleware(_capacity_process_request_guard, "request")
     api.register_middleware(require_internal_plan_release_read, "request")
     api.register_middleware(add_runtime_identity_headers, "response")
+    api.register_middleware(acknowledge_address_source_filter, "response")
     register_network_catalog_private_responses(api)
     register_rejection_private_responses(api)
     api.blueprint(control_blueprint)

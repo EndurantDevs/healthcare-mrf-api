@@ -8,11 +8,14 @@ from typing import Any, Mapping
 
 from sqlalchemy import text
 
+from api.address_source_filter import parse_min_address_sources
+from api.network_address_scope import scoped_address_parameters
 from api.plan_pricing_projection_contract import SCHEMA, PlanPricingProjectionUnavailable
 from api.plan_release_serving import (
     PlanReleaseServingSelection,
     annotate_plan_release_response,
 )
+from api.pricing_address_source_filter import qualifying_location_sql
 from api.ptg2_response import _coerce_numeric_rate, _is_request_flag_enabled
 
 PROJECTION_CONTRACT = "plan_pricing_em_distance_v1"
@@ -404,11 +407,20 @@ async def _progressive_page_rows(
 ) -> tuple[list[Mapping[str, Any]], bool, bool, int] | None:
     """Read only enough nearest locations to prove the requested page."""
     _validate_page_parameters(extra_parameters)
+    minimum_sources = parse_min_address_sources(args)
+    statement_sql = _PAGE_SQL if page_sql is None else page_sql
+    if minimum_sources and page_sql is None:
+        statement_sql = statement_sql.replace(
+            "AND (rate.code_mask & CAST(:code_bit AS smallint)) <> 0",
+            "AND "
+            + qualifying_location_sql("location", minimum_sources)
+            + " AND (rate.code_mask & CAST(:code_bit AS smallint)) <> 0",
+        )
     zip5, latitude, longitude = location
     candidate_limit = max(_INITIAL_LOCATION_WINDOW, (int(pagination.offset) + int(pagination.limit) + 1) * 4)
     while True:
         page_result = await session.execute(
-            text(_PAGE_SQL if page_sql is None else page_sql),
+            text(statement_sql),
             {
                 "serving_revision_id": selection.serving_revision_id,
                 "binding_set_digest": selection.binding_set_digest,
@@ -422,6 +434,7 @@ async def _progressive_page_rows(
                 "page_limit": int(pagination.limit) + 1,
                 "offset": int(pagination.offset),
                 **(extra_parameters or {}),
+                **(scoped_address_parameters({"min_address_sources": minimum_sources}) if minimum_sources else {}),
             },
         )
         page_rows_by_field = page_result.mappings().all()

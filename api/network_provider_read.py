@@ -10,17 +10,36 @@ from uuid import UUID
 
 import asyncpg
 
+from api.address_source_filter import address_source_filter_sql
 from api.network_address_scope import NetworkAddressReadScope
 from process.network_address_projection import _identifier
 from process.network_serving_read import (
     NetworkServingReadUnavailable,
     PinnedNetworkServingManifest,
+    parse_canonical_network_ids,
     resolve_network_serving_manifest,
 )
 from process.provider_directory_projection_fhir_values import is_valid_npi
 
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_LOCATIONS = 100
+_PAGE_ADDRESS_COLUMNS = (
+    "location_key",
+    "entity_type",
+    "entity_id",
+    "source_count",
+    "entity_name",
+    "npi",
+    "first_line",
+    "second_line",
+    "city_name",
+    "state_name",
+    "postal_code",
+    "country_code",
+    "lat",
+    "long",
+)
+_QUALIFYING_ADDRESS_COLUMNS = ("location_key", "entity_type", "entity_id", "source_count")
 _DISPLAY_LIMITS = {
     "first_line": 512,
     "second_line": 512,
@@ -74,7 +93,7 @@ SELECT integrity.valid AND bounds.valid AS valid,bounds.bounded AND octet_length
 _PROVIDERS_SQL = (
     """WITH selected_addresses AS NOT MATERIALIZED (
   SELECT location_key,entity_type,entity_id,entity_name,npi,first_line,second_line,city_name,state_name,
-    postal_code,country_code,lat,long FROM {addresses}
+    postal_code,country_code,lat,long,source_count FROM {addresses}
   WHERE {address_membership}
 ), selected_memberships AS MATERIALIZED (
   SELECT DISTINCT provider_system,provider_id,location_id FROM ONLY {namespace}.network_membership
@@ -83,7 +102,7 @@ _PROVIDERS_SQL = (
 ), selected AS MATERIALIZED (
   SELECT member.*,binding.location_key,address.location_key AS matched_key,address.entity_name,address.npi,
     address.first_line,address.second_line,address.city_name,address.state_name,address.postal_code,
-    address.country_code,address.lat,address.long
+    address.country_code,address.lat,address.long,address.source_count
   FROM selected_memberships member LEFT JOIN ONLY {namespace}.provider_location_binding binding
     ON (binding.provider_system,binding.provider_id,binding.location_id)
       =(member.provider_system,member.provider_id,member.location_id)
@@ -129,11 +148,14 @@ _PROVIDERS_SQL = (
     + _PROVIDER_RESULT_SQL
 )
 
-_MEMBERSHIP_PROVIDERS_SQL = (
-    """WITH identities AS MATERIALIZED (
+_MEMBERSHIP_IDENTITIES_SQL = """WITH identities AS MATERIALIZED (
   SELECT DISTINCT provider_system,provider_id FROM ONLY {namespace}.network_membership
   WHERE network_id=ANY($1::text::integer[])
-), page_identities AS MATERIALIZED (
+), """
+
+_MEMBERSHIP_PROVIDERS_SQL = (
+    _MEMBERSHIP_IDENTITIES_SQL
+    + """page_identities AS MATERIALIZED (
   SELECT * FROM identities ORDER BY provider_system COLLATE "C",provider_id COLLATE "C" LIMIT $4 OFFSET $5
 ), selected_memberships AS MATERIALIZED (
   SELECT DISTINCT member.provider_system,member.provider_id,member.location_id
@@ -165,6 +187,41 @@ _MEMBERSHIP_PROVIDERS_SQL = (
   FROM offices GROUP BY provider_system,provider_id
 ), """
     + _PROVIDER_RESULT_SQL
+)
+
+# Keep the entity match residual so join planning can use location-key cardinality.
+_SOURCE_MEMBERSHIP_IDENTITIES_SQL = """WITH page_addresses AS NOT MATERIALIZED (
+  SELECT * FROM {addresses}
+), qualifying_addresses AS MATERIALIZED (
+  SELECT address.location_key,address.entity_type,address.entity_id
+  FROM {qualifying_addresses} address WHERE {source_predicate}
+), identities AS MATERIALIZED (
+  SELECT DISTINCT binding.provider_system,binding.provider_id
+  FROM qualifying_addresses address JOIN ONLY {namespace}.provider_location_binding binding
+    ON binding.location_key=address.location_key
+      AND CASE WHEN binding.entity_type=address.entity_type THEN binding.entity_id=address.entity_id ELSE FALSE END
+  WHERE EXISTS(SELECT 1 FROM ONLY {namespace}.network_membership member
+    WHERE (member.provider_system,member.provider_id,member.location_id)
+      =(binding.provider_system,binding.provider_id,binding.location_id)
+      AND member.network_id=ANY({selected_network_ids}))
+), """
+
+_SOURCE_MEMBERSHIP_PROVIDERS_SQL = (
+    _MEMBERSHIP_PROVIDERS_SQL.replace(_MEMBERSHIP_IDENTITIES_SQL, _SOURCE_MEMBERSHIP_IDENTITIES_SQL, 1)
+    .replace(
+        "FROM page_identities page JOIN ONLY {namespace}.network_membership member USING(provider_system,provider_id)\n"
+        "  WHERE member.network_id=ANY($1::text::integer[])",
+        """FROM page_identities page JOIN ONLY {namespace}.network_membership member USING(provider_system,provider_id)
+  JOIN ONLY {namespace}.provider_location_binding qualifying_binding
+    ON (qualifying_binding.provider_system,qualifying_binding.provider_id,qualifying_binding.location_id)
+      =(member.provider_system,member.provider_id,member.location_id)
+  JOIN qualifying_addresses qualified_address
+    ON (qualified_address.location_key,qualified_address.entity_type,qualified_address.entity_id)
+      =(qualifying_binding.location_key,qualifying_binding.entity_type,qualifying_binding.entity_id)
+  WHERE member.network_id=ANY($1::text::integer[])""",
+        1,
+    )
+    .replace("FROM {addresses} address", "FROM page_addresses address", 1)
 )
 
 
@@ -256,14 +313,17 @@ class NetworkOfficeSelection:
     lat: float | None = None
     long: float | None = None
     radius_miles: float | None = None
+    min_address_sources: int = 0
 
     def arguments(self):
         """Validate typed callers before converting UUID and spatial SQL parameters."""
-        return office_selection(self.location_id, self.lat, self.long, self.radius_miles)
+        return office_selection(self.location_id, self.lat, self.long, self.radius_miles, self.min_address_sources)
 
 
-def office_selection(location_id=None, lat=None, long=None, radius_miles=None):
+def office_selection(location_id=None, lat=None, long=None, radius_miles=None, min_address_sources=0):
     """Validate exact office and bounded spatial selectors before any database read."""
+    if type(min_address_sources) is not int or not 0 <= min_address_sources <= 2147483647:
+        raise NetworkProviderReadError("Office source threshold is invalid")
     if location_id is not None:
         try:
             if type(location_id) is not str or str(UUID(location_id)) != location_id or UUID(location_id).int == 0:
@@ -289,16 +349,18 @@ def _office_arguments(office_filters):
     return office_filters.arguments()
 
 
-async def _read(connection, scope, selector, limit, offset, control_schema, office_filters):
-    _arguments(scope, limit, offset)
-    if not connection.is_in_transaction():
+async def _require_provider_read_transaction(connection):
+    if not connection.is_in_transaction() or await connection.fetchval(
+        "SELECT current_setting('transaction_isolation')"
+    ) not in ("repeatable read", "serializable"):
         raise NetworkProviderReadError("Canonical providers require a caller-owned repeatable transaction")
+
+
+async def _read(connection, scope, selector, limit, offset, control_schema, office_filters, *, min_address_sources=0):
+    """Read one exact provider page before shaping its bounded public response."""
+    _arguments(scope, limit, offset)
     try:
-        if await connection.fetchval("SELECT current_setting('transaction_isolation')") not in (
-            "repeatable read",
-            "serializable",
-        ):
-            raise NetworkProviderReadError("Canonical providers require a caller-owned repeatable transaction")
+        await _require_provider_read_transaction(connection)
         from process.network_published_api_pin import active_published_api_pin
 
         current = active_published_api_pin(connection, scope.manifest, control_schema=control_schema)
@@ -308,21 +370,11 @@ async def _read(connection, scope, selector, limit, offset, control_schema, offi
             )
         if current != scope.manifest:
             raise NetworkProviderReadUnavailable("Canonical provider generation differs from the pinned scope")
-        membership_page = (
-            current.supports_membership_pages
-            and selector == (None, None)
-            and all(filter_value is None for filter_value in office_filters)
+        query, address_arguments = _provider_query(
+            current, scope.network_ids, selector, office_filters, min_address_sources
         )
-        addresses, address_arguments = _provider_addresses(current, scope.network_ids, membership_page=membership_page)
         receipt = await connection.fetchrow(
-            (_MEMBERSHIP_PROVIDERS_SQL if membership_page else _PROVIDERS_SQL).format(
-                namespace=_identifier(current.schema_name),
-                addresses=addresses,
-                # The full compact address query already applies its pinned edges.
-                address_membership="TRUE"
-                if current.compact_layout is not None
-                else "canonical_network_ids && $1::text::integer[]",
-            ),
+            query,
             "{" + ",".join(str(network_id) for network_id in scope.network_ids) + "}",
             *selector,
             limit,
@@ -346,13 +398,84 @@ async def _read(connection, scope, selector, limit, offset, control_schema, offi
         raise NetworkProviderReadUnavailable("Canonical providers are unavailable") from None
 
 
-def _provider_addresses(manifest, network_ids, *, membership_page=False):
+def _provider_query(manifest, network_ids, selector, office_filters, minimum):
+    """Compile independently bound discovery and page projections under the published capability."""
+    membership_page = (
+        manifest.supports_membership_pages
+        and selector == (None, None)
+        and all(filter_value is None for filter_value in office_filters)
+    )
+    if minimum and membership_page:
+        if type(network_ids) is not tuple or any(type(network_id) is not int for network_id in network_ids):
+            raise NetworkProviderReadError("Canonical provider selection is invalid")
+        selected_network_ids = parse_canonical_network_ids(",".join(str(network_id) for network_id in network_ids))
+        if selected_network_ids != network_ids:
+            raise NetworkProviderReadError("Canonical provider selection is invalid")
+    addresses, arguments = _provider_addresses(
+        manifest,
+        network_ids,
+        membership_page=membership_page,
+        columns=_PAGE_ADDRESS_COLUMNS if minimum and membership_page else None,
+    )
+    query = _MEMBERSHIP_PROVIDERS_SQL if membership_page else _PROVIDERS_SQL
+    sql_fields_by_name = {"namespace": _identifier(manifest.schema_name), "addresses": addresses}
+    if minimum and membership_page:
+        qualifying, qualification_arguments = _provider_addresses(
+            manifest,
+            None,
+            first_parameter=13 + len(arguments),
+            visible_membership_sql="TRUE",
+            columns=_QUALIFYING_ADDRESS_COLUMNS,
+        )
+        sql_fields_by_name.update(
+            qualifying_addresses=qualifying,
+            source_predicate=address_source_filter_sql("address", minimum),
+            selected_network_ids="ARRAY[" + ",".join(map(str, selected_network_ids)) + "]::integer[]",
+        )
+        arguments += qualification_arguments
+        query = _SOURCE_MEMBERSHIP_PROVIDERS_SQL
+    elif minimum:
+        query = _source_filtered_provider_sql(query, minimum, selector != (None, None))
+    sql_fields_by_name["address_membership"] = (
+        "TRUE" if manifest.compact_layout is not None else "canonical_network_ids && $1::text::integer[]"
+    )
+    return query.format(**sql_fields_by_name), arguments
+
+
+def _source_filtered_provider_sql(query, minimum, detail):
+    """Keep integrity and authorized detail identity independent of address eligibility."""
+    if detail:
+        predicate = address_source_filter_sql("eligible", minimum)
+        query = query.replace("* FROM eligible\n", f"* FROM eligible WHERE {predicate}\n", 1)
+        query = query.replace(
+            "count(*) AS location_count,count(DISTINCT entity_name)<=1 AND count(DISTINCT npi)<=1 AS consistent\n"
+            "  FROM offices GROUP BY provider_system,provider_id",
+            "(SELECT count(*) FROM offices office WHERE office.provider_system=eligible.provider_system "
+            "AND office.provider_id=eligible.provider_id) AS location_count,"
+            "count(DISTINCT entity_name)<=1 AND count(DISTINCT npi)<=1 AS consistent\n"
+            "  FROM eligible GROUP BY provider_system,provider_id",
+            1,
+        )
+    else:
+        predicate = address_source_filter_sql("selected", minimum)
+        query = query.replace("WHERE ($9::uuid", f"WHERE {predicate} AND ($9::uuid", 1)
+    return query
+
+
+def _provider_addresses(
+    manifest, network_ids, *, membership_page=False, first_parameter=13, visible_membership_sql=None, columns=None
+):
     if manifest.compact_layout is None:
         return "ONLY " + _identifier(manifest.schema_name) + ".entity_address_unified", ()
     from api.network_compact_address import compact_address_native_sql
 
     return compact_address_native_sql(
-        manifest.compact_layout, first_parameter=13, network_ids=network_ids, location_lookup=membership_page
+        manifest.compact_layout,
+        first_parameter=first_parameter,
+        network_ids=network_ids,
+        visible_membership_sql=visible_membership_sql,
+        location_lookup=membership_page,
+        columns=columns,
     )
 
 
@@ -373,7 +496,16 @@ async def read_network_provider_page(
     offices are never silently truncated, inferred, enriched or merged by NPI.
     """
     filters = _office_arguments(office_filters)
-    return await _read(connection, scope, (None, None), limit, offset, control_schema, filters)
+    return await _read(
+        connection,
+        scope,
+        (None, None),
+        limit,
+        offset,
+        control_schema,
+        filters,
+        min_address_sources=office_filters.min_address_sources if office_filters is not None else 0,
+    )
 
 
 async def read_network_provider_detail(
@@ -385,10 +517,19 @@ async def read_network_provider_detail(
     control_schema=None,
     office_filters=None,
 ) -> dict:
-    """Read one exact identity, rejecting identities without a selected office."""
+    """Retain an authorized identity when its offices fail the optional source minimum."""
     _selector(provider_system, provider_id)
     filters = _office_arguments(office_filters)
-    result = await _read(connection, scope, (provider_system, provider_id), 1, 0, control_schema, filters)
+    result = await _read(
+        connection,
+        scope,
+        (provider_system, provider_id),
+        1,
+        0,
+        control_schema,
+        filters,
+        min_address_sources=office_filters.min_address_sources if office_filters is not None else 0,
+    )
     if not result["providers"]:
         raise NetworkProviderNotFound("Provider has no office in this canonical network")
     return {"generation_id": result["generation_id"], "provider": result["providers"][0]}

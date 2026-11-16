@@ -11,6 +11,8 @@ from typing import Any, Iterable, Mapping
 from sqlalchemy import text
 
 from api import ptg2_geo_projection as geo_projection
+from api.address_source_filter import address_source_filter_sql, parse_min_address_sources
+from api.network_address_scope import scoped_address_parameters, scoped_address_relation_sql
 from api.plan_pricing_projection_contract import (
     SCHEMA,
     ZIP5,
@@ -212,12 +214,15 @@ def _binding_code_query(
     )
 
 
-def _assured_addresses_sql(serving: Any, *, candidate_inputs=None) -> str:
+def _assured_addresses_sql(serving: Any, *, candidate_inputs=None, min_address_sources=0) -> str:
+    min_address_sources = parse_min_address_sources({"min_address_sources": min_address_sources})
     address_relation = table("entity_address_unified")
     evidence_level_sql = serving._ptg2_geo_evidence_level_sql("addr")
     if candidate_inputs is not None:
         address_relation = candidate_inputs.relation("entity_address_unified")
         evidence_level_sql = geo_projection.evidence_level_from_source_id_sql("addr.geo_evidence_source_id")
+    if min_address_sources and candidate_inputs is None:
+        address_relation = scoped_address_relation_sql(f"{SCHEMA}.entity_address_unified", location_lookup=True)
     assurance_sql = f"({evidence_level_sql}) IS NOT NULL"
     return f"""
         WITH source_npis AS MATERIALIZED (
@@ -239,6 +244,7 @@ def _assured_addresses_sql(serving: Any, *, candidate_inputs=None) -> str:
               JOIN source_npis ON source_npis.npi = addr.npi
              WHERE addr.type IN ('practice', 'primary', 'secondary', 'site')
                AND {assurance_sql}
+               {f"AND {address_source_filter_sql('addr', min_address_sources)}" if min_address_sources else ""}
                AND COALESCE(
                        addr.zip5, LEFT(COALESCE(addr.postal_code, ''), 5)
                    ) ~ '^[0-9]{{5}}$'
@@ -396,12 +402,12 @@ def _provider_selection_sql(serving: Any, *, candidate_inputs=None) -> str:
     """
 
 
-def _provider_rows_sql(*, candidate_inputs=None) -> str:
+def _provider_rows_sql(*, candidate_inputs=None, min_address_sources=0) -> str:
     from api import ptg2_serving as serving
 
     return "".join(
         (
-            _assured_addresses_sql(serving, candidate_inputs=candidate_inputs),
+            _assured_addresses_sql(serving, candidate_inputs=candidate_inputs, min_address_sources=min_address_sources),
             _ranked_addresses_sql(serving),
             _provider_selection_sql(serving, candidate_inputs=candidate_inputs),
         )
@@ -460,12 +466,15 @@ async def projection_provider_rows_for_npis(
     npis: Iterable[int],
     *,
     candidate_inputs=None,
+    min_address_sources=0,
 ) -> dict[int, tuple[dict[str, Any], ...]]:
     """Freeze one assured service-location card per NPI and ZIP cell."""
 
     normalized_npis = sorted({int(npi) for npi in npis if int(npi) > 0})
     provider_rows_by_npi: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    provider_statement = text(_provider_rows_sql(candidate_inputs=candidate_inputs))
+    provider_statement = text(
+        _provider_rows_sql(candidate_inputs=candidate_inputs, min_address_sources=min_address_sources)
+    )
     for start in range(0, len(normalized_npis), PROVIDER_BATCH_SIZE):
         npi_batch = normalized_npis[start : start + PROVIDER_BATCH_SIZE]
         provider_result = await session.execute(
@@ -473,6 +482,11 @@ async def projection_provider_rows_for_npis(
             {
                 "npis": npi_batch,
                 "provider_row_limit": MAX_PROVIDER_ROWS_PER_BATCH + 1,
+                **(
+                    scoped_address_parameters({"min_address_sources": min_address_sources})
+                    if min_address_sources
+                    else {}
+                ),
             },
         )
         provider_rows = list(provider_result)

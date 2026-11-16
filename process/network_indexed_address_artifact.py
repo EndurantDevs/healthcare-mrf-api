@@ -99,6 +99,13 @@ def _descriptor(binding_by_field):
     return json.loads(artifact._json(binding_by_field))
 
 
+def address_dependency_data(binding):
+    """Compare logical source data independently of optional index diagnostics."""
+    return {
+        key: value for key, value in artifact.address_artifact_data(binding).items() if key != "index_definition_sha256"
+    }
+
+
 async def _index_readiness(connection, source, *, api_read=False):
     from process.entity_address_unified import _required_geo_taxonomy_stage_index_sql
     from process.network_membership_candidate_indexes import _catalog_readiness
@@ -112,7 +119,11 @@ async def _index_readiness(connection, source, *, api_read=False):
         "indexed_geo_profile_invalid",
     )
     return await _index_digest(
-        connection, source.schema_name, _serving_plan(source.schema_name), qualified_definitions=True
+        connection,
+        source.schema_name,
+        _serving_plan(source.schema_name),
+        qualified_definitions=True,
+        validate_definitions=True,
     )
 
 
@@ -160,12 +171,7 @@ async def verify_indexed_address_artifact(connection, descriptor, *, runtime_rol
     await bootstrap.verify_bootstrap_address_artifact(connection, descriptor["origin_artifact"], api_read=api_read)
     relation = CompactAddressRelation(**descriptor["table"])
     source = PinnedAddressSource(relation.schema_name, relation.table_name, descriptor["generation_id"])
-    index_digest = await _index_readiness(connection, source, api_read=api_read)
-    if descriptor["index_definition_sha256"] != index_digest:
-        from process.network_membership_serving_indexes import _index_digest, _serving_plan
-
-        legacy_digest = await _index_digest(connection, source.schema_name, _serving_plan(source.schema_name))
-        artifact._require(descriptor["index_definition_sha256"] == legacy_digest, "indexed_artifact_changed")
+    await _index_readiness(connection, source, api_read=api_read)
     return relation
 
 
@@ -225,6 +231,10 @@ async def prove_new_indexed_address_dependency(connection, candidate, descriptor
     if previous is not None:
         manifest, retained = previous
         prior = _json_object(retained["validation_json"]).get("serving_readiness", {}).get("address_artifact")
-        if manifest.compact_layout is not None and prior == descriptor:
+        if (
+            manifest.compact_layout is not None
+            and prior is not None
+            and address_dependency_data(prior) == address_dependency_data(descriptor)
+        ):
             return
     await prove_indexed_address_equivalence(connection, descriptor)

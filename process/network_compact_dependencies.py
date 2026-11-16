@@ -61,15 +61,17 @@ async def verify_compact_dependencies(connection, candidate, *, control_schema, 
 
 async def capture_compact_dependencies(connection, candidate, *, control_schema):
     """Resolve current or retained address data within the candidate's logical scope."""
-    from process.network_address_artifact import address_artifact_data
     from process.network_compact_address_origin import resolve_compact_address_origin
+    from process.network_indexed_address_artifact import address_dependency_data
 
     report = _json_object(candidate["validation_json"])
     address_source = PinnedAddressSource(**report["address_source"])
     captured, base = await resolve_compact_address_origin(
         connection, candidate, address_source, control_schema=control_schema
     )
-    _require(address_artifact_data(captured) == address_artifact_data(report["serving_readiness"]["address_artifact"]))
+    _require(
+        address_dependency_data(captured) == address_dependency_data(report["serving_readiness"]["address_artifact"])
+    )
     return await _verified_layout(connection, candidate, base, control_schema)
 
 

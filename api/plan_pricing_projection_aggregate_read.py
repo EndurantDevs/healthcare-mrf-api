@@ -14,6 +14,8 @@ from sqlalchemy import Integer, bindparam, text
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.exc import DBAPIError
 
+from api.address_source_filter import parse_min_address_sources
+from api.network_address_scope import scoped_address_parameters
 from api.plan_pricing_aggregate_pack import (
     MAX_AGGREGATE_PACK_RECORDS,
     AggregateCodeIdentity,
@@ -31,6 +33,7 @@ from api.plan_pricing_projection_contract import (
 )
 from api.plan_pricing_projection_materialize import rate_fragment
 from api.plan_pricing_projection_v3_aggregate import _aggregate_zip_records
+from api.pricing_address_source_filter import qualifying_cell_sql
 
 MAX_AGGREGATE_REQUEST_PREFIXES = 16
 MAX_AGGREGATE_REQUEST_STORED_BYTES = 9 * 1024 * 1024
@@ -123,7 +126,14 @@ async def read_aggregate_pack_page(
     """Read one exact page while retaining only requested decoded cells."""
 
     if binding_ordinals is not None:
-        page_records = await _partial_aggregate_records(session, request, geo_cells, binding_ordinals)
+        minimum_sources = parse_min_address_sources(args)
+        page_records = await _partial_aggregate_records(
+            session,
+            request,
+            geo_cells,
+            binding_ordinals,
+            **({"minimum_sources": minimum_sources} if minimum_sources else {}),
+        )
         return _aggregate_page(page_records, args, pagination)
     zip_prefixes = sorted({geo_cell[:2] for geo_cell in geo_cells})
     if len(zip_prefixes) > MAX_AGGREGATE_REQUEST_PREFIXES:
@@ -199,6 +209,7 @@ WITH profile_window AS MATERIALIZED (
      WHERE profile_admission.profile_count <= :profile_limit
        AND member.binding_ordinal = ANY(CAST(:binding_ordinals AS integer[]))
        AND provider.geo_cell = ANY(CAST(:geo_cells AS varchar[]))
+       {source_count_sql}
      ORDER BY member.binding_ordinal, member.provider_set_key, member.npi, provider.geo_cell
      LIMIT :membership_probe_limit
 ), member_admission AS MATERIALIZED (
@@ -292,7 +303,7 @@ SELECT metadata.*, result_admission.result_byte_count, aggregates.*
 """
 
 
-def _partial_aggregate_query(binding_ordinals: tuple[int, ...]) -> Any:
+def _partial_aggregate_query(binding_ordinals: tuple[int, ...], minimum_sources: int = 0) -> Any:
     """Bind original contributor ordinals before either native work probe."""
 
     if (
@@ -307,6 +318,7 @@ def _partial_aggregate_query(binding_ordinals: tuple[int, ...]) -> Any:
             profile_table=table("plan_pricing_rate_profile"),
             membership_table=table("plan_pricing_provider_membership"),
             provider_table=table("plan_pricing_provider_cell"),
+            source_count_sql="AND " + qualifying_cell_sql("provider", minimum_sources) if minimum_sources else "",
         )
     ).bindparams(bindparam("binding_ordinals", list(binding_ordinals), type_=ARRAY(Integer)))
 
@@ -375,11 +387,11 @@ def _partial_aggregate_rows(aggregate_result: Any, geo_cells: frozenset[str]) ->
 
 
 async def _partial_aggregate_records(
-    session: Any, request: Any, geo_cells: list[str], binding_ordinals: tuple[int, ...]
+    session: Any, request: Any, geo_cells: list[str], binding_ordinals: tuple[int, ...], *, minimum_sources: int = 0
 ) -> list[AggregateZipRecord]:
     """Compute one exact bounded attributed aggregate in the supplied Reader."""
 
-    statement = _partial_aggregate_query(binding_ordinals)
+    statement = _partial_aggregate_query(binding_ordinals, minimum_sources)
     if len(geo_cells) > MAX_AGGREGATE_REQUEST_PREFIXES * MAX_AGGREGATE_PACK_RECORDS or any(
         type(cell) is not str or re.fullmatch(r"[0-9]{5}", cell, flags=re.ASCII) is None for cell in geo_cells
     ):
@@ -409,6 +421,7 @@ async def _partial_aggregate_records(
                 "rate_value_limit": _MAX_PARTIAL_RATE_VALUES,
                 "result_probe_limit": len(set(geo_cells)) + 1,
                 "result_byte_limit": MAX_AGGREGATE_REQUEST_STORED_BYTES,
+                **(scoped_address_parameters({"min_address_sources": minimum_sources}) if minimum_sources else {}),
             },
         )
     except DBAPIError:
