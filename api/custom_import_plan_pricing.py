@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 
 from api import custom_import_plan_sql as plan_sql
 from api import custom_import_plan_staging as plan_staging
+from api.address_source_filter import parse_min_address_sources
 from api.custom_import_provider_service_sql import ProviderServiceImportQuery
 from api.custom_import_provider_sql import compile_npi_entity_relation
 from api.plan_pricing_projection_contract import (
@@ -66,7 +67,9 @@ async def _native_scopes(session, selection, args, serving):
             raise PlanPricingProjectionUnavailable("the selected release has no validated serving tables")
         binding_args = binding_query_args(args, binding)
         location_context = None
-        if serving._has_location_filter(dict(binding_args), include_npi=False):
+        if serving._has_location_filter(dict(binding_args), include_npi=False) or parse_min_address_sources(
+            binding_args
+        ):
             # Offset disables KNN prefixes and keeps exact taxonomy admission.
             location_context = await serving._membership_location_query(
                 session, serving_tables, dict(binding_args), candidate_npis=None, limit=1, offset=1
@@ -247,6 +250,11 @@ async def _providers_for_scope(session, scope, npis, serving):
         plan_id=scope.binding.plan_id,
         snapshot_id=scope.binding.snapshot_id,
         source_key=scope.binding.source_key,
+        **(
+            {"min_address_sources": parse_min_address_sources(scope.args)}
+            if parse_min_address_sources(scope.args)
+            else {}
+        ),
     )
     if providers_by_npi is None:
         raise PlanPricingProjectionUnavailable("native provider completion is unavailable")
@@ -264,7 +272,14 @@ async def _providers_for_scope(session, scope, npis, serving):
             raise PTG2ManifestArtifactError("imported plan page lost a selected native address witness")
         providers_by_npi = {
             npi: serving._graph_provider_data(
-                locations_by_npi[npi], providers_by_npi.get(npi), "entity_address_unified"
+                locations_by_npi[npi],
+                providers_by_npi.get(npi),
+                "entity_address_unified",
+                **(
+                    {"min_address_sources": parse_min_address_sources(scope.args)}
+                    if parse_min_address_sources(scope.args)
+                    else {}
+                ),
             )
             for npi in npis
         }

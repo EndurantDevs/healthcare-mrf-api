@@ -105,6 +105,9 @@ async def test_manual_office_publication_removal_and_pinned_old_reader(compact_p
     assert pin.compact_layout.custom != pin.compact_layout.base
     await _assert_manual_provider_reads(fixture, pin, network, seed)
     await _assert_readonly_replay(fixture, first, publication)
+    from tests.network_address_index_additions_postgres_support import check_optional_custom_address_count_index
+
+    await check_optional_custom_address_count_index(fixture, first, publication, network, office_rows)
     corrected = await _draft(
         approval,
         replace(

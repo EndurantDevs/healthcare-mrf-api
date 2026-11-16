@@ -121,10 +121,7 @@ class BillingAddressProvenance:
     source_urls: tuple[str, ...]
 
     def __repr__(self) -> str:
-        return (
-            "<billing-address-provenance "
-            f"source_id={self.source_id} source=<redacted>>"
-        )
+        return f"<billing-address-provenance source_id={self.source_id} source=<redacted>>"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -155,11 +152,7 @@ class BillingProviderAddress:
         )
 
     def __repr__(self) -> str:
-        return (
-            "<billing-provider-address "
-            f"npi={self.npi} distance_miles={self.distance_miles} "
-            "address=<redacted>>"
-        )
+        return f"<billing-provider-address npi={self.npi} distance_miles={self.distance_miles} address=<redacted>>"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -176,11 +169,7 @@ class BillingProviderGeoWitness:
         return (*self.address.stable_geo_key, *self.provider_rate.stable_rate_key)
 
     def __repr__(self) -> str:
-        return (
-            "<billing-provider-geo-witness "
-            f"npi={self.provider_rate.npi} "
-            "rate=<redacted> address=<redacted>>"
-        )
+        return f"<billing-provider-geo-witness npi={self.provider_rate.npi} rate=<redacted> address=<redacted>>"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -264,9 +253,7 @@ def validated_rate_witnesses(
         ) from exc
     sort_keys = tuple(billing_rate_occurrence_sort_key(witness) for witness in witnesses)
     if sort_keys != tuple(sorted(sort_keys)) or len(sort_keys) != len(set(sort_keys)):
-        raise PTG2ManifestArtifactError(
-            "PTG2 exact billing rate witnesses are not canonical and unique"
-        )
+        raise PTG2ManifestArtifactError("PTG2 exact billing rate witnesses are not canonical and unique")
     return witnesses
 
 
@@ -281,9 +268,7 @@ def require_valid_provider_rate_witness(
         validated_rate_occurrence_witness(witness.rate_occurrence)
         validated_provider_npi(witness.npi)
     except (PTG2ManifestArtifactError, ValueError) as exc:
-        raise PTG2ManifestArtifactError(
-            "PTG2 exact billing provider/rate scope is invalid"
-        ) from exc
+        raise PTG2ManifestArtifactError("PTG2 exact billing provider/rate scope is invalid") from exc
     return witness
 
 
@@ -304,9 +289,7 @@ def require_valid_provider_address(
         ):
             raise ValueError("invalid provider address distance")
     except ValueError as exc:
-        raise PTG2ManifestArtifactError(
-            "PTG2 exact billing provider address scope is invalid"
-        ) from exc
+        raise PTG2ManifestArtifactError("PTG2 exact billing provider address scope is invalid") from exc
     return address
 
 
@@ -324,9 +307,7 @@ def validated_provider_rate_witnesses(
         require_valid_provider_rate_witness(witness)
     sort_keys = tuple((witness.npi, *witness.stable_rate_key) for witness in witnesses)
     if sort_keys != tuple(sorted(sort_keys)) or len(sort_keys) != len(set(sort_keys)):
-        raise PTG2ManifestArtifactError(
-            "PTG2 exact billing provider/rate scope is inconsistent"
-        )
+        raise PTG2ManifestArtifactError("PTG2 exact billing provider/rate scope is inconsistent")
     return witnesses
 
 
@@ -344,14 +325,16 @@ def finite_coordinate(value: object, *, category: str) -> float:
 def validated_geo_args(geo_args: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize one exact-ZIP or bounded coordinate GEO selector."""
 
+    from api.address_source_filter import parse_min_address_sources
+
+    minimum = parse_min_address_sources(geo_args)
+
     zip5_value = geo_args.get("zip5")
     legacy_zip = geo_args.get("zip")
     if zip5_value is not None and legacy_zip is not None and zip5_value != legacy_zip:
         raise ValueError("zip and zip5 must identify the same exact ZIP")
     zip5 = zip5_value if zip5_value is not None else legacy_zip
-    if zip5 is not None and (
-        type(zip5) is not str or ZIP5_PATTERN.fullmatch(zip5) is None
-    ):
+    if zip5 is not None and (type(zip5) is not str or ZIP5_PATTERN.fullmatch(zip5) is None):
         raise ValueError("zip5 must contain exactly five ASCII digits")
     latitude_value = geo_args.get("lat")
     longitude_value = geo_args.get("long")
@@ -361,6 +344,8 @@ def validated_geo_args(geo_args: Mapping[str, Any]) -> dict[str, Any]:
         "mode": ptg2_serving.PTG2_MODE_EXACT_SOURCE,
         "include_evidence": True,
     }
+    if minimum:
+        geo_parameters_by_name["min_address_sources"] = minimum
     if zip5 is not None:
         geo_parameters_by_name["zip5"] = zip5
     if latitude_value is not None:
@@ -395,15 +380,11 @@ def decoded_address_payload(value: object) -> dict[str, Any]:
         try:
             payload = json.loads(value)
         except (TypeError, ValueError) as exc:
-            raise PTG2ManifestArtifactError(
-                "PTG2 exact billing provider address payload is malformed"
-            ) from exc
+            raise PTG2ManifestArtifactError("PTG2 exact billing provider address payload is malformed") from exc
     else:
         payload = None
     if not isinstance(payload, dict):
-        raise PTG2ManifestArtifactError(
-            "PTG2 exact billing provider address payload is malformed"
-        )
+        raise PTG2ManifestArtifactError("PTG2 exact billing provider address payload is malformed")
     return payload
 
 

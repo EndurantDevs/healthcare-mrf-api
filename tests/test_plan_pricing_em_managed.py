@@ -170,6 +170,26 @@ async def _search(held):
     return await distance.search_plan_pricing_em_distance(held.session, held.selection, held.args, held.pagination)
 
 
+@pytest.mark.parametrize("minimum", [0, 3, 2147483647])
+def test_managed_page_exposes_the_threshold_before_candidate_limit(held, minimum):
+    sql = managed._page_sql(held.inputs, '"held_rates"."rate"', minimum)
+    assert ":min_address_sources" not in sql
+    if minimum:
+        assert sql.index(f"addr.source_count >= {minimum}") < sql.index("LIMIT :candidate_limit")
+    else:
+        assert "source_count >=" not in sql
+
+
+async def test_managed_read_compiles_threshold_while_preserving_request_metadata(held):
+    held.args["min_address_sources"] = "3"
+    response = await _search(held)
+    assert len(response["items"]) == 2
+    sql, parameters_by_name = held.windows[0]
+    assert "addr.source_count >= 3" in sql and ":min_address_sources" not in sql
+    assert parameters_by_name["min_address_sources"] == 3
+    held.driver.fetchrow.assert_awaited_once()
+
+
 @pytest.mark.parametrize("admitted_indices", [(0, 1, 2), (1, 2), ()])
 async def test_full_selection_is_admitted_before_any_provider_query(held, admitted_indices):
     held.admitted = tuple(held.bindings[index] for index in admitted_indices)

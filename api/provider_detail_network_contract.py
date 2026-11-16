@@ -13,7 +13,14 @@ if TYPE_CHECKING:
 
 _BOOLEAN_FIELDS = ("include_sources", "include_evidence", "debug", "extra_info")
 _UUID_FIELDS = ("address_key", "address_site_key")
-_NATIVE_FIELDS = {*_BOOLEAN_FIELDS, *_UUID_FIELDS, "address_grouping", "address_limit", "address_offset"}
+_NATIVE_FIELDS = {
+    *_BOOLEAN_FIELDS,
+    *_UUID_FIELDS,
+    "address_grouping",
+    "address_limit",
+    "address_offset",
+    "min_address_sources",
+}
 _FIELDS = {"npi", "include", "selector", "network_generation", *_NATIVE_FIELDS}
 
 
@@ -39,6 +46,8 @@ def _decimal(value, maximum, *, minimum=0):
 
 def _native_args(document):
     args_by_name = {name: document[name] for name in _NATIVE_FIELDS if name in document}
+    if "min_address_sources" in args_by_name:
+        _decimal(args_by_name["min_address_sources"], 2147483647)
     for name in _BOOLEAN_FIELDS:
         if name in args_by_name and (
             type(args_by_name[name]) is not str or args_by_name[name] not in {"true", "false"}

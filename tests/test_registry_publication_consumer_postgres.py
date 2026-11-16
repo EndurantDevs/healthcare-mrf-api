@@ -914,6 +914,15 @@ async def test_rejected_request_retirement_keeps_served_sealed_referenced_and_fo
         assert await _candidate_outcome(fixture, candidates_by_name[name]) == expected, name
 
 
+async def _wait_for_lease_extension(connection, query, request_id, previous_expiry):
+    async with asyncio.timeout(5):
+        while True:
+            renewed_expiry = await connection.fetchval(query, request_id)
+            if renewed_expiry > previous_expiry:
+                return renewed_expiry
+            await asyncio.sleep(0.01)
+
+
 @pytest.mark.parametrize("fault", ["lease", "expiry", "cancel", "renew"])
 async def test_independent_heartbeat_or_cancel_fences_execution(worker_permissions, monkeypatch, fault):
     fixture = worker_permissions
@@ -928,36 +937,41 @@ async def test_independent_heartbeat_or_cancel_fences_execution(worker_permissio
     async with _consumer(fixture, authority_hook=wait_for_revocation) as (arguments, _):
         queued = await _enqueue_ordinary(fixture)
         pending = asyncio.create_task(consume_registry_publication_once(**arguments))
-        await asyncio.wait_for(entered.wait(), 5)
-        if fault == "cancel":
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            if fault == "cancel":
+                pending.cancel()
+            if fault == "lease":
+                await fixture.fixture.connection.execute(
+                    f'UPDATE "{fixture.fixture.control_schema}".registry_publication_request '
+                    "SET lease_id=$1 WHERE request_id=$2",
+                    uuid4(),
+                    UUID(queued["request_id"]),
+                )
+            if fault == "expiry":
+                await fixture.fixture.connection.execute(
+                    f'UPDATE "{fixture.fixture.control_schema}".registry_publication_request '
+                    "SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE request_id=$1",
+                    UUID(queued["request_id"]),
+                )
+            if fault == "renew":
+                query = f'SELECT lease_expires_at FROM "{fixture.fixture.control_schema}".registry_publication_request WHERE request_id=$1'
+                previous_expiry = await fixture.fixture.connection.fetchval(query, UUID(queued["request_id"]))
+                renewed_expiry = await _wait_for_lease_extension(
+                    fixture.fixture.connection, query, UUID(queued["request_id"]), previous_expiry
+                )
+                assert renewed_expiry > previous_expiry
+                hold.set()
+                assert (await asyncio.wait_for(pending, 15))["state"] == "completed"
+                assert await _head(fixture) is not None
+                return
+            with pytest.raises(asyncio.CancelledError if fault == "cancel" else ValueError):
+                await asyncio.wait_for(pending, 5)
+            assert await _head(fixture) is None
+            assert (await _status(fixture, queued))["state"] == "running"
+        finally:
             pending.cancel()
-        if fault == "lease":
-            await fixture.fixture.connection.execute(
-                f'UPDATE "{fixture.fixture.control_schema}".registry_publication_request '
-                "SET lease_id=$1 WHERE request_id=$2",
-                uuid4(),
-                UUID(queued["request_id"]),
-            )
-        if fault == "expiry":
-            await fixture.fixture.connection.execute(
-                f'UPDATE "{fixture.fixture.control_schema}".registry_publication_request '
-                "SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE request_id=$1",
-                UUID(queued["request_id"]),
-            )
-        if fault == "renew":
-            query = f'SELECT lease_expires_at FROM "{fixture.fixture.control_schema}".registry_publication_request WHERE request_id=$1'
-            previous_expiry = await fixture.fixture.connection.fetchval(query, UUID(queued["request_id"]))
-            await asyncio.sleep(0.15)
-            renewed_expiry = await fixture.fixture.connection.fetchval(query, UUID(queued["request_id"]))
-            assert renewed_expiry > previous_expiry
-            hold.set()
-            assert (await asyncio.wait_for(pending, 15))["state"] == "completed"
-            assert await _head(fixture) is not None
-            return
-        with pytest.raises(asyncio.CancelledError if fault == "cancel" else ValueError):
-            await asyncio.wait_for(pending, 5)
-        assert await _head(fixture) is None
-        assert (await _status(fixture, queued))["state"] == "running"
+            await asyncio.gather(pending, return_exceptions=True)
 
 
 def _pause_heartbeat_renewal(monkeypatch):

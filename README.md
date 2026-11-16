@@ -208,6 +208,7 @@ Per-import documentation:
 - [Provider Directory endpoint support matrix](./docs/imports/provider-directory-endpoint-support.md)
 - [Part D formulary and pharmacy network import](./docs/imports/partd-formulary-network.md)
 - [Pharmacy license import](./docs/imports/pharmacy-license.md)
+- [Minimum address-source filtering](./docs/address-source-filter.md)
 
 ## Local Development
 

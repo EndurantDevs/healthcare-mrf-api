@@ -484,6 +484,7 @@ def test_protected_profile_uses_closed_normalized_strings_and_separate_generatio
         "limit",
         "offset",
         "generation_id",
+        "min_address_sources",
     }
     assert all(field["type"] == "string" for field in query["properties"].values())
     assert query["properties"]["generation_id"]["pattern"] == "^[0-9a-f]{64}$"

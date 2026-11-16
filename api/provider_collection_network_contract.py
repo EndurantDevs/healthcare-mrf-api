@@ -20,7 +20,7 @@ _FIELDS = {"kind", "native_query", "native_batch", "selector", "network_generati
 _SERVICE_NATIVE_FIELDS = frozenset(
     "billing_code_modifier city classification code code_system cursor expand_codes include_allowed_amounts "
     "include_code_details include_debug include_details include_evidence include_legacy_fields include_providers "
-    "include_sources include_subspecialties include_unverified_addresses lat limit long min_claims min_total_cost "
+    "include_sources include_subspecialties include_unverified_addresses lat limit long min_address_sources min_claims min_total_cost "
     "mode modifier modifiers negotiated_rate negotiated_rate_tolerance npi offset order order_by page place_of_service "
     "plan_release_id pos primary_only provider_sex_code q radius radius_miles rate rate_tolerance service_code specialty "
     "state taxonomy_classification taxonomy_code taxonomy_codes taxonomy_section taxonomy_specialization view year "
@@ -43,10 +43,12 @@ class ProviderCollectionNativeBatch:
     address_offset: int
     include_sources: bool
     include_evidence: bool
+    min_address_sources: int | None = None
 
     def document(self):
         """Restore the bounded native batch wire without exposing mutable DTO state."""
         return {
+            **({"min_address_sources": self.min_address_sources} if self.min_address_sources is not None else {}),
             "npis": list(self.npis),
             "address_limit": self.address_limit,
             "address_offset": self.address_offset,
@@ -176,6 +178,7 @@ def _native_batch(document):
         params_by_name["address_offset"],
         params_by_name["include_sources"],
         params_by_name["include_evidence"],
+        params_by_name.get("min_address_sources"),
     )
 
 

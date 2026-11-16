@@ -11,7 +11,17 @@ from sanic.exceptions import InvalidUsage
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.provider_directory_profile import is_valid_npi
 
-_FIELDS = {"npi", "include_evidence", "include_sensitive", "categories", "category", "limit", "offset", "generation_id"}
+_FIELDS = {
+    "npi",
+    "include_evidence",
+    "include_sensitive",
+    "categories",
+    "category",
+    "limit",
+    "offset",
+    "generation_id",
+    "min_address_sources",
+}
 
 
 def parse_managed_profile_query(document):

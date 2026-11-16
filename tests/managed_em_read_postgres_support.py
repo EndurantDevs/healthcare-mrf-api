@@ -89,7 +89,7 @@ async def _seed_dependencies(connection, inputs):
     )
 
 
-def _office(npi, name, latitude, *, origin="base", state="IL", evidence=True):
+def _office(npi, name, latitude, *, origin="base", state="IL", evidence=True, source_count=0):
     return {
         "entity_type": "npi",
         "entity_id": str(npi),
@@ -112,6 +112,7 @@ def _office(npi, name, latitude, *, origin="base", state="IL", evidence=True):
         "long": Decimal("-87.65"),
         "address_source_mask": 1,
         "canonical_network_ids": [7],
+        "source_count": source_count,
         "evidence": evidence,
     }
 
@@ -120,12 +121,13 @@ async def _seed_offices(connection, address_schema, inputs):
     offices = [
         _office(101, "DENIED SOURCE", 41.9001),
         _office(102, "DENIED OFFICE A", 41.9002, origin="network_custom"),
-        _office(102, "ALLOWED OFFICE B", 41.91),
-        _office(103, "OVERLAP PUBLIC", 41.92),
+        _office(102, "ALLOWED OFFICE B", 41.91, source_count=1),
+        _office(102, "QUALIFIED OFFICE C", 41.925, source_count=3),
+        _office(103, "OVERLAP PUBLIC", 41.92, source_count=4),
         _office(104, "INVALID IDENTITY", 41.9003, state="NY"),
         _office(105, "NO EVIDENCE", 41.9004, evidence=False),
         _office(106, "OUTSIDE ZIP POLYGON", 42.0),
-        _office(107, "COPIED PUBLIC", 41.91),
+        _office(107, "COPIED PUBLIC", 41.91, source_count=3),
     ]
     offices.extend(_office(201, "DENSE OFFICE", 41.93 + index / 10_000_000) for index in range(8200))
     names = tuple(name for name in offices[0] if name != "evidence")
@@ -208,7 +210,7 @@ async def _prepare(connection, fixture, owner, reader):
     await connection.execute(
         f'GRANT USAGE ON SCHEMA "{fixture.schema}" TO "{reader}"; GRANT SELECT ON "{fixture.schema}".registry_approved_record TO "{reader}"'
     )
-    # Custody also resolves installed Tiger parent names when inputs are private copies.
+    # Named inputs also resolve installed Tiger parent names when inputs are private copies.
     if await connection.fetchval("SELECT to_regnamespace('tiger') IS NOT NULL"):
         await connection.execute(f'GRANT USAGE ON SCHEMA tiger TO "{reader}"')
     proof = await provider_inputs.prepare_em_provider_inputs(connection, inputs, runtime_roles=(reader,))
@@ -235,10 +237,12 @@ async def _prepare(connection, fixture, owner, reader):
     )
 
 
-async def _read_page(session, held, ordinals, *, limit=2, offset=0):
+async def _read_page(session, held, ordinals, *, limit=2, offset=0, minimum_sources=None):
     parameters = address_scope.scoped_address_parameters({"allowed_binding_ordinals": list(ordinals), "code_index": 3})
     pagination = SimpleNamespace(limit=limit, offset=offset, page=1)
     args_by_name = {"code": "99213", "view": "card", "order_by": "distance", "zip5": "60611", "zip_radius_miles": "25"}
+    if minimum_sources is not None:
+        args_by_name["min_address_sources"] = minimum_sources
     window = await distance._progressive_page_rows(
         session,
         held.selection,
@@ -246,7 +250,7 @@ async def _read_page(session, held, ordinals, *, limit=2, offset=0):
         pagination,
         ("60611", None, None),
         3,
-        page_sql=managed._page_sql(held.inputs, held.rates.rates_relation),
+        page_sql=managed._page_sql(held.inputs, held.rates.rates_relation, minimum_sources or 0),
         extra_parameters=parameters,
     )
     rows, exact, boundary, total = window
@@ -302,8 +306,44 @@ async def _assert_pages(session, held):
             == 3
         )
 
+    await _assert_source_thresholds(session, held)
 
-async def _assert_prelimit(session, held):
+
+async def _assert_source_thresholds(session, held):
+    baseline = await _read_page(session, held, (17, 29))
+    assert await _read_page(session, held, (17, 29), minimum_sources=0) == baseline
+    assert [(card["npi"], card["city"]) for card in baseline[0]] == [
+        (102, "ALLOWED OFFICE B"),
+        (107, "COPIED PUBLIC"),
+        (103, "OVERLAP PUBLIC"),
+    ]
+    cards, exact, boundary, total = await _read_page(session, held, (17, 29), minimum_sources=3)
+    assert [(card["npi"], card["city"]) for card in cards] == [
+        (107, "COPIED PUBLIC"),
+        (103, "OVERLAP PUBLIC"),
+        (102, "QUALIFIED OFFICE C"),
+    ]
+    assert (exact, boundary, total) == (True, True, 3)
+    assert cards[-1]["distance_miles"] > baseline[0][0]["distance_miles"]
+    baseline_by_npi = {card["npi"]: card for card in baseline[0]}
+    for card in cards:
+        assert {key: card_value for key, card_value in card.items() if key not in {"city", "distance_miles"}} == {
+            key: card_value
+            for key, card_value in baseline_by_npi[card["npi"]].items()
+            if key not in {"city", "distance_miles"}
+        }
+    assert await _read_page(session, held, (17, 29), minimum_sources=3, limit=1, offset=2) == (
+        [cards[-1]],
+        True,
+        False,
+        3,
+    )
+    assert await _read_page(session, held, (17, 29), minimum_sources=4) == ([baseline_by_npi[103]], True, False, 1)
+    assert await _read_page(session, held, (17, 29), minimum_sources=2147483647) == ([], True, False, 0)
+    await _assert_prelimit(session, held, minimum_sources=3)
+
+
+async def _assert_prelimit(session, held, *, minimum_sources=0):
     parameters = address_scope.scoped_address_parameters(
         {
             "allowed_binding_ordinals": [17, 29],
@@ -315,11 +355,15 @@ async def _assert_prelimit(session, held):
             "candidate_limit": 1,
             "page_limit": 2,
             "offset": 0,
+            **({"min_address_sources": minimum_sources} if minimum_sources else {}),
         }
     )
-    result = await session.execute(text(managed._page_sql(held.inputs, held.rates.rates_relation)), parameters)
+    result = await session.execute(
+        text(managed._page_sql(held.inputs, held.rates.rates_relation, minimum_sources)), parameters
+    )
     rows = result.mappings().all()
-    assert len(rows) == 1 and rows[0]["npi"] == 102 and rows[0]["city"] == "ALLOWED OFFICE B"
+    expected = (107, "COPIED PUBLIC") if minimum_sources else (102, "ALLOWED OFFICE B")
+    assert len(rows) == 1 and (rows[0]["npi"], rows[0]["city"]) == expected
     assert rows[0]["candidate_count"] == rows[0]["unique_count"] == 1
 
 
@@ -411,7 +455,7 @@ async def _bind_native_pricing_read(session, held, control_schema, reader):
 
 
 async def test_managed_em_native_read(migrated_v3_database, monkeypatch):
-    """Execute the unchanged managed SQL under real protected custody and Reader RR."""
+    """Execute managed SQL with named-input validation and Reader RR."""
     fixture = migrated_v3_database
     connection = await asyncpg.connect(os.environ[POSTGRES_DSN_ENV])
     owner, reader = "em_owner_" + uuid4().hex, "em_reader_" + uuid4().hex
@@ -448,10 +492,10 @@ async def test_managed_em_native_read(migrated_v3_database, monkeypatch):
                         "plan": plan,
                         "ordinary_reader": True,
                         "repeatable_read": True,
-                        "provider_custody_real": True,
+                        "provider_inputs_validated": True,
                         "attribution_publication_real": True,
                         "rates_rows": held.rates.row_count,
-                        "offices": 8208,
+                        "offices": 8209,
                         "native_window_observations": held.windows,
                         "oversized_completion_bytes": held.completion_bytes,
                         "full_manifest_resolution": False,

@@ -55,6 +55,9 @@ class _QueryParamCollector(ast.NodeVisitor):
                     and isinstance(node.args[1].value, str)
                 ):
                     self.params.add(node.args[1].value)
+        if isinstance(func, ast.Name) and func.id == "parse_min_address_sources":
+            if node.args and self._is_request_args_resolution(node.args[0]):
+                self.params.add("min_address_sources")
         if isinstance(func, ast.Name) and func.id == "parse_pagination":
             if node.args and self._is_request_args_resolution(node.args[0]):
                 self.params.update({"limit", "page"})

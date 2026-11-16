@@ -24,6 +24,8 @@ from api.network_provider_read import (
     _selector as validate_provider_identity,
 )
 from api.network_serving_read_context import bind_network_request_reader, network_serving_read_context
+from db.registry_schema import registry_schema
+from process import registry_effective_network_catalog as catalog
 from process.network_serving_read import (
     NetworkServingReadUnavailable,
     parse_canonical_network_ids,
@@ -61,6 +63,7 @@ def _parameters(request, *, is_detail):
         "long",
         "radius_miles",
         "membership_level",
+        "min_address_sources",
     }
     if not is_detail:
         allowed_names.update(("limit", "offset"))
@@ -74,9 +77,10 @@ def _parameters(request, *, is_detail):
     ):
         raise ValueError("network_provider_request_invalid")
     membership_level = query_by_name.get("membership_level", ["office"])[0]
+    min_address_sources = _decimal(query_by_name.get("min_address_sources", ["0"])[0], 0, 2147483647)
     if membership_level not in {"office", "provider"} or (
         membership_level == "provider"
-        and (is_detail or set(query_by_name) & {"location_id", "lat", "long", "radius_miles"})
+        and (is_detail or min_address_sources or set(query_by_name) & {"location_id", "lat", "long", "radius_miles"})
     ):
         raise ValueError("network_provider_request_invalid")
     network_ids = parse_canonical_network_ids(query_by_name["network_ids"][0])
@@ -95,6 +99,8 @@ def _parameters(request, *, is_detail):
     }
     if "location_id" in query_by_name:
         office_filters_by_name["location_id"] = query_by_name["location_id"][0]
+    if min_address_sources:
+        office_filters_by_name["min_address_sources"] = min_address_sources
     office_selection(**office_filters_by_name)
     return {
         "network_ids": network_ids,
@@ -147,11 +153,16 @@ async def _provider_response(request, *, provider_system=None, provider_id=None)
             manifest = await resolve_network_serving_manifest(
                 driver, generation_id=parameters_by_name["generation_id"], api_read=True
             )
-            with network_address_read_scope(
-                manifest,
-                parameters_by_name["network_ids"],
-                access_scope_sha256=parameters_by_name["access_scope_sha256"],
-            ) as scope:
+            catalog_records_sql = await catalog.effective_catalog_sql(driver, manifest, registry_schema())
+            catalog_networks_sql = await catalog.effective_catalog_networks_sql(driver, manifest, registry_schema())
+            with (
+                catalog.effective_catalog_read_scope(catalog_records_sql, catalog_networks_sql),
+                network_address_read_scope(
+                    manifest,
+                    parameters_by_name["network_ids"],
+                    access_scope_sha256=parameters_by_name["access_scope_sha256"],
+                ) as scope,
+            ):
                 if is_detail:
                     provider_document = await read_network_provider_detail(
                         driver,
@@ -169,7 +180,13 @@ async def _provider_response(request, *, provider_system=None, provider_id=None)
         return _error(400)
     except NetworkProviderNotFound:
         return _error(404, manifest.generation_id)
-    except NetworkProviderReadUnavailable, NetworkServingReadUnavailable, asyncpg.PostgresError, SQLAlchemyError:
+    except (
+        NetworkProviderReadUnavailable,
+        NetworkServingReadUnavailable,
+        asyncpg.PostgresError,
+        SQLAlchemyError,
+        ValueError,
+    ):
         return _error(503)
 
 

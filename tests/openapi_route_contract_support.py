@@ -212,6 +212,23 @@ ROUTE_QUERY_PARAM_ADDITIONS = {
         "zip",
     },
 }
+for _address_route in (
+    "/npi/match-candidates",
+    "/npi/id/{npi}",
+    "/npi/id/{npi}/profile",
+    "/registry/serving/providers",
+    "/registry/serving/providers/{provider_system}/{provider_id}",
+    "/pharmacy-license/pharmacies/{npi}",
+    "/hospital-prices/facilities",
+    "/reports/pharmacies/markets",
+    "/reports/pharmacies/markets/{market_id}",
+    "/reports/pharmacies/rankings/access",
+    "/reports/pharmacies/chains/summary",
+    "/reports/pharmacies/state-stats",
+    "/reports/pharmacies/{npi}/market-context",
+):
+    ROUTE_QUERY_PARAM_ADDITIONS.setdefault(("get", _address_route), set()).add("min_address_sources")
+
 ROUTE_QUERY_PARAM_REMOVALS = {
     # Billing search and state cursors are canonical-path-only at runtime.
     ("get", "/pricing/providers/by-procedure"): {

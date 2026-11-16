@@ -3,15 +3,18 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import nullcontext
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Mapping
 
 import orjson
 from sqlalchemy import Integer, bindparam, text
 from sqlalchemy.dialects.postgresql import ARRAY
 
-from api.network_address_scope import current_network_address_scope
+from api.address_source_filter import parse_min_address_sources
+from api.network_address_scope import current_network_address_scope, scoped_address_parameters
 from api.plan_pricing_projection_aggregate_read import read_aggregate_pack_page
 from api.plan_pricing_projection_contract import (
     COST_ORDER_FIELDS,
@@ -27,10 +30,12 @@ from api.plan_pricing_projection_contract import (
     projection_code_identity,
     table,
 )
+from api.plan_pricing_projection_materialize import rate_fragment
 from api.plan_release_serving import (
     PlanReleaseServingSelection,
     annotate_plan_release_response,
 )
+from api.pricing_address_source_filter import qualifying_cell_sql, qualifying_compact_offices
 from api.provider_service_source_policy import admitted_plan_release_bindings
 from api.ptg2_response import _is_request_flag_enabled
 
@@ -300,7 +305,7 @@ def _validated_projection_request(
     )
 
 
-def _page_sql(result_type: str, order_direction: str) -> str:
+def _page_sql(result_type: str, order_direction: str, minimum_sources: int = 0) -> str:
     table_name = "plan_pricing_card" if result_type == "provider_cards" else "plan_pricing_cell_aggregate"
     order_sql = (
         f"projected.minimum_negotiated_rate {order_direction}, projected.npi"
@@ -326,6 +331,7 @@ def _page_sql(result_type: str, order_direction: str) -> str:
               JOIN {table(table_name)} item ON item.geo_cell = cells.geo_cell
              WHERE item.projection_id = :projection_id
                AND item.code_system = :code_system AND item.code = :code
+               {"AND " + qualifying_cell_sql("item", minimum_sources) if minimum_sources else ""}
         ), projected AS MATERIALIZED (
             SELECT matched.* FROM {projected_source_sql}
         ), page AS MATERIALIZED (
@@ -359,24 +365,33 @@ async def _read_page(
             pagination,
             **({"binding_ordinals": binding_ordinals} if binding_ordinals is not None else {}),
         )
+    minimum_sources = parse_min_address_sources(args)
     order_direction = "DESC" if str(args.get("order") or "asc").strip().lower() == "desc" else "ASC"
     projected_result = await session.execute(
-        text(_page_sql(request.result_type, order_direction)),
-        {
-            "geo_cells": geo_cells,
-            "projection_id": request.projection_id,
-            "code_system": request.code_system,
-            "code": request.code,
-            "limit": int(pagination.limit),
-            "offset": int(pagination.offset),
-        },
+        text(_page_sql(request.result_type, order_direction, minimum_sources)),
+        scoped_address_parameters(
+            {
+                **({"min_address_sources": minimum_sources} if minimum_sources else {}),
+                "geo_cells": geo_cells,
+                "projection_id": request.projection_id,
+                "code_system": request.code_system,
+                "code": request.code,
+                "limit": int(pagination.limit),
+                "offset": int(pagination.offset),
+            }
+        ),
     )
     projected_rows = projected_result.all()
     total = int(projected_rows[0][1]) if projected_rows else 0
-    projected_items = [
-        orjson.Fragment(bytes(projected_row[0])) for projected_row in projected_rows if projected_row[0] is not None
-    ]
-    return projected_items, total
+    fragments = [bytes(projected_row[0]) for projected_row in projected_rows if projected_row[0] is not None]
+    if minimum_sources and request.result_type == "provider_cards":
+        cards = await qualifying_compact_offices(
+            session,
+            [json.loads(fragment, parse_float=Decimal, parse_int=Decimal) for fragment in fragments],
+            minimum_sources,
+        )
+        fragments = [orjson.dumps(card, default=rate_fragment) for card in cards]
+    return [orjson.Fragment(fragment) for fragment in fragments], total
 
 
 def _page_response(
@@ -409,6 +424,47 @@ def _page_response(
     }
 
 
+async def _read_source_filtered_page(
+    session,
+    request,
+    selected_geo_cells,
+    args,
+    pagination,
+    selection,
+    contributing_bindings,
+    binding_ordinals,
+):
+    """Keep aggregate rates exact after filtering the complete office population."""
+    if parse_min_address_sources(args) and request.result_type == "rate_aggregates":
+        if request.contract == LEGACY_PROJECTION_CONTRACT:
+            from api.plan_pricing_legacy_source_aggregates import read_legacy_source_aggregate_page
+
+            projected_items, total = await read_legacy_source_aggregate_page(
+                session,
+                request,
+                selected_geo_cells,
+                args,
+                pagination,
+                selection,
+                contributing_bindings,
+            )
+            return projected_items, total
+        binding_ordinals = tuple(
+            binding.binding_ordinal
+            for binding in (
+                contributing_bindings if contributing_bindings is not None else selection.in_network_bindings
+            )
+        )
+    return await _read_page(
+        session,
+        request,
+        selected_geo_cells,
+        args,
+        pagination,
+        **({"binding_ordinals": binding_ordinals} if binding_ordinals is not None else {}),
+    )
+
+
 async def _projection_page_response(session, request, args, pagination, contributing_bindings, selection):
     """Keep attributed reads and full-pack fallback within the same policy decision."""
     capability = current_code_projection()
@@ -437,16 +493,22 @@ async def _projection_page_response(session, request, args, pagination, contribu
         if contributing_bindings is None or contributing_bindings == selection.in_network_bindings
         else tuple(binding.binding_ordinal for binding in contributing_bindings)
     )
-    if binding_ordinals is not None and request.contract == LEGACY_PROJECTION_CONTRACT:
+    if (
+        binding_ordinals is not None
+        and request.contract == LEGACY_PROJECTION_CONTRACT
+        and (request.result_type != "rate_aggregates" or not parse_min_address_sources(args))
+    ):
         return None
     try:
-        projected_items, total = await _read_page(
+        projected_items, total = await _read_source_filtered_page(
             session,
             request,
             selected_geo_cells,
             args,
             pagination,
-            **({"binding_ordinals": binding_ordinals} if binding_ordinals is not None else {}),
+            selection,
+            contributing_bindings,
+            binding_ordinals,
         )
     except PlanPricingProjectionUnsupported:
         if contributing_bindings is None and request.result_type == "rate_aggregates" and args.get("view") is None:

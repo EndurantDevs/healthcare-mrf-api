@@ -9,6 +9,7 @@ from urllib.parse import parse_qs
 from sanic.exceptions import InvalidUsage, ServiceUnavailable
 from sqlalchemy import Float, String, and_, case, cast, column, func, literal, or_, select, table
 
+from api.address_source_filter import address_source_filter, parse_min_address_sources
 from api.custom_import_provider_service_sql import ProviderServiceImportQuery
 from api.network_address_scope import current_network_address_scope, scoped_address_parameters
 from api.provider_geo_sql import canonical_zip_anchor_statement
@@ -19,7 +20,8 @@ def _canonical_network_procedure_clause(
 ):
     """Restrict claims providers to the pinned network before count and pagination."""
     network_scope = current_network_address_scope()
-    if network_scope is None or network_scope.network_ids is None:
+    minimum_sources = parse_min_address_sources(args)
+    if network_scope is None or (network_scope.network_ids is None and not minimum_sources):
         return None
     raw_args = parse_qs(query_string or "", keep_blank_values=True)
     unsupported_fields = (
@@ -50,6 +52,7 @@ def _canonical_network_procedure_clause(
         .where(
             func.coalesce(addresses.c.npi, addresses.c.inferred_npi) == provider_npi,
             location_filter if location_filter is not None else literal(True),
+            address_source_filter(addresses, minimum_sources),
         )
         .exists()
         .params(**scoped_address_parameters({}))
@@ -94,10 +97,12 @@ async def _canonical_procedure_zip_anchor(session, zip5):
     return latitude, longitude
 
 
-def _canonical_procedure_location_filter(*, state, city, zip5, zip_radius, coordinates, zip_anchor=None):
+def _canonical_procedure_location_filter(
+    *, state, city, zip5, zip_radius, coordinates, zip_anchor=None, min_address_sources=0
+):
     """Apply every locator to one actual selected office, never claims geography."""
     addresses = current_network_address_scope().address_relation
-    terms = []
+    terms = [address_source_filter(addresses, min_address_sources)] if min_address_sources else []
     if state:
         terms.append(
             func.upper(func.coalesce(func.nullif(addresses.c.state_code, ""), addresses.c.state_name)) == state

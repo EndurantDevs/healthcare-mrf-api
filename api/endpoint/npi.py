@@ -31,6 +31,12 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import literal_column, text, tuple_
 
 from api import provider_detail_network_metadata
+from api.address_source_filter import (
+    address_source_filter,
+    address_source_filter_sql,
+    filter_address_source_rows,
+    parse_min_address_sources,
+)
 from api.code_systems import EXTERNAL_PROCEDURE_CODE_SYSTEMS, INTERNAL_PROCEDURE_CODE_SYSTEM, INTERNAL_RX_CODE_SYSTEM
 from api.custom_import_provider_sql import ProviderImportQuery
 from api.endpoint.pagination import parse_pagination
@@ -106,6 +112,7 @@ from api.provider_list_sql import (
     _address_npi_filter,
     _address_phone_candidates_cte,
     _address_phone_candidates_join,
+    _address_phone_candidates_lateral_from,
     _address_phone_digits_filter,
     _address_site_key_filter,
     _address_zip5_filter,
@@ -131,8 +138,10 @@ from api.provider_list_sql import (
     _sql_with_prefix_ctes,
 )
 from api.provider_profile import (
+    _without_uncounted_postal_addresses,
     compose_provider_profile,
     compose_provider_profile_evidence,
+    compose_source_filtered_profile,
     fetch_provider_profile_projection,
 )
 from api.provider_profile_snapshot import (
@@ -286,6 +295,7 @@ PUBLIC_ADDRESS_SOURCE_DEBUG_COLUMNS = {
     "address_sources",
 }
 MATCH_CANDIDATE_QUERY_PARAMS = {
+    "min_address_sources",
     "address_site_key",
     "address_key",
     "lat",
@@ -5494,31 +5504,6 @@ def _is_unified_address_serving_requested() -> bool:
     )
 
 
-def _address_phone_candidates_lateral_from(address_table_sql: str, alias: str) -> str:
-    exact_phone = _address_phone_digits_filter("candidate_address", address_table_sql)
-    service_location = _provider_list_address_type_clause(
-        "candidate_address",
-        address_table_sql,
-        include_service_locations=True,
-    )
-    return f"""
-          FROM phone_candidates AS phone_match
-     LEFT JOIN phone_provider_directory_evidence AS phone_evidence
-            ON phone_evidence.provider_npi = phone_match.provider_npi
-         CROSS JOIN LATERAL (
-               SELECT candidate_address.*
-                 FROM {address_table_sql} AS candidate_address
-                WHERE candidate_address.address_key = phone_match.address_key
-                  AND COALESCE(candidate_address.npi, candidate_address.inferred_npi) = phone_match.provider_npi
-                  AND {service_location}
-             ORDER BY ({exact_phone}) DESC,
-                      candidate_address.source_count DESC NULLS LAST,
-                      candidate_address.location_key
-                LIMIT 1 OFFSET 0
-         ) AS {alias}
-    """
-
-
 def _public_address_column_keys() -> set[str]:
     return _model_table_columns(NPIAddress) - PUBLIC_ADDRESS_EXCLUDED_COLUMNS
 
@@ -6700,6 +6685,7 @@ async def _normalize_match_candidate_params(request, *, request_session=None) ->
         "include_evidence": include_evidence,
         "debug": is_debug_requested,
         "limit": limit,
+        "min_address_sources": parse_min_address_sources(args),
     }
 
 
@@ -6805,6 +6791,12 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str, editi
         ),
         f"{columns['provider_npi']} IS NOT NULL",
     ]
+    minimum = params.get("min_address_sources", 0)
+    if minimum:
+        address_predicates.append(
+            address_source_filter_sql("a", minimum, has_source_count=_is_unified_address_table(address_table_sql))
+        )
+        bound_parameter_map["min_address_sources"] = minimum
     address_site_locator = None
     if params.get("address_site_key"):
         bound_parameter_map["address_site_key"] = params["address_site_key"]
@@ -6838,7 +6830,9 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str, editi
         and _is_unified_address_table(address_table_sql)
         and not is_scoped_address_relation(address_table_sql)
     ):
-        phone_candidates_cte = _address_phone_candidates_cte(address_table_sql, editions=editions)
+        phone_candidates_cte = _address_phone_candidates_cte(
+            address_table_sql, editions=editions, min_address_sources=minimum
+        )
         bound_parameter_map["candidate_limit"] = min(
             max(int(params["limit"]) * 8, 20),
             _MATCH_CANDIDATES_MAX_INTERNAL_ROWS,
@@ -6846,6 +6840,7 @@ def _match_candidate_query(params: dict[str, Any], address_table_sql: str, editi
         address_from_sql = _address_phone_candidates_lateral_from(
             address_table_sql,
             "a",
+            minimum,
         )
         phone_provider_directory_match = "phone_match.provider_directory_matched"
         phone_source_record_ids = "COALESCE(phone_evidence.source_record_ids, ARRAY[]::varchar[])"
@@ -7510,6 +7505,8 @@ def _match_candidate_output(
     enrichment: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Build one redacted, scored provider candidate response object."""
+    if params.get("min_address_sources"):
+        enrichment = _without_uncounted_postal_addresses(enrichment)
     public_provider_map = dict(provider_row)
     _redact_internal_address_fields(public_provider_map)
     taxonomy_list = _json_array_value(provider_row.get("taxonomy_list"))
@@ -7928,6 +7925,8 @@ async def list_providers(
     native_npis = None if native_npis is None else tuple(_normalize_npi_batch_npis(list(native_npis)))
     args = request.args if native_args is None else native_args
     is_count_only = str(args.get("count_only", "0")).strip() == "1"
+    minimum = parse_min_address_sources(args)
+    request.args.get("min_address_sources")
     include_chain_enrichment = _include_chain_provider_enrichment(args.get("show"))
     response_format = args.get("format") or args.get("response_format")
     response_format = str(response_format).strip().lower() if response_format else None
@@ -8243,30 +8242,36 @@ async def list_providers(
         "pricing_provider_prescription_available": capability_by_name["pricing_provider_prescription_available"],
     }
 
-    simple_filter_present = current_network_address_scope() is not None or any(
-        filters_by_name.get(field)
-        for field in (
-            "classification",
-            "specialization",
-            "section",
-            "display_name",
-            "first_name",
-            "last_name",
-            "organization_name",
-            "npi",
-            "phone_digits",
-            "address_key",
-            PUBLIC_ADDRESS_SITE_KEY,
-            "zip_code",
-            "entity_type_code",
-            "provider_sex_code",
-            "plan_network",
-            "names_like",
-            "codes",
-            "response_format",
-            "procedure_internal_codes",
-            "medication_internal_codes",
-            "plan_release_id",
+    if minimum:
+        filters_by_name["min_address_sources"] = minimum
+    simple_filter_present = (
+        bool(minimum)
+        or current_network_address_scope() is not None
+        or any(
+            filters_by_name.get(field)
+            for field in (
+                "classification",
+                "specialization",
+                "section",
+                "display_name",
+                "first_name",
+                "last_name",
+                "organization_name",
+                "npi",
+                "phone_digits",
+                "address_key",
+                PUBLIC_ADDRESS_SITE_KEY,
+                "zip_code",
+                "entity_type_code",
+                "provider_sex_code",
+                "plan_network",
+                "names_like",
+                "codes",
+                "response_format",
+                "procedure_internal_codes",
+                "medication_internal_codes",
+                "plan_release_id",
+            )
         )
     )
     broad_name_total_deferred = (
@@ -8472,6 +8477,8 @@ async def list_providers(
                 include_service_locations=include_service_locations,
             )
         ]
+        if minimum:
+            address_clauses.append(address_source_filter_sql("c", minimum, has_source_count=include_service_locations))
         if (import_context is not None or native_npis is not None) and (
             procedure_filter_unresolved or medication_filter_unresolved
         ):
@@ -8493,6 +8500,7 @@ async def list_providers(
         if phone_digits:
             phone_candidates_cte = _address_phone_candidates_cte(
                 address_table_sql,
+                min_address_sources=minimum,
                 is_bounded=import_context is None and native_npis is None,
                 editions=editions,
             )
@@ -8635,6 +8643,7 @@ async def list_providers(
             )
 
         query_parameters_by_name = {
+            **({"min_address_sources": minimum} if minimum else {}),
             "classification": classification,
             "section": section,
             "display_name": display_name,
@@ -8688,7 +8697,7 @@ async def list_providers(
         return {count_record[0]: count_record[1] for count_record in formatted_count_records}
 
     async def get_classification_count_map(filters_by_name) -> dict:
-        """Return provider counts grouped by NUCC classification."""
+        """Return eligible provider counts grouped by taxonomy or classification."""
         classification = filters_by_name.get("classification")
         specialization = filters_by_name.get("specialization")
         section = filters_by_name.get("section")
@@ -8744,6 +8753,12 @@ async def list_providers(
                 include_service_locations=include_service_locations,
             )
         ]
+        if minimum:
+            address_clauses.append(address_source_filter_sql("c", minimum, has_source_count=include_service_locations))
+        if (import_context is not None or native_npis is not None) and (
+            procedure_filter_unresolved or medication_filter_unresolved
+        ):
+            address_clauses.append("1=0")
         phone_candidates_cte = None
         phone_candidates_join = ""
         if plan_network_ids:
@@ -8757,7 +8772,12 @@ async def list_providers(
         if zip_code:
             address_clauses.append(_address_zip5_filter("c", address_table_sql))
         if phone_digits:
-            phone_candidates_cte = _address_phone_candidates_cte(address_table_sql, editions=editions)
+            phone_candidates_cte = _address_phone_candidates_cte(
+                address_table_sql,
+                editions=editions,
+                min_address_sources=minimum,
+                is_bounded=import_context is None and native_npis is None,
+            )
             if phone_candidates_cte:
                 phone_candidates_join = _address_phone_candidates_join("c")
             else:
@@ -8779,6 +8799,12 @@ async def list_providers(
                 ")"
             )
         dynamic_code_parameters = _append_array_filters(address_clauses, filters_by_name)
+        import_relation_cte = _provider_import_relation_cte(import_context)
+        import_membership_clause = _provider_import_membership_clause(
+            import_context, provider_npi_sql, native_npis=native_npis
+        )
+        if import_membership_clause is not None:
+            address_clauses.append(import_membership_clause)
         if npi_where:
             address_clauses.append(
                 f"EXISTS (SELECT 1 FROM mrf.npi AS b WHERE b.npi = {provider_npi_sql} AND {npi_where})"
@@ -8802,24 +8828,28 @@ async def list_providers(
                 f"AND ({taxonomy_conditions})"
             )
             taxonomy_int_code_sql = "primary_nucc.int_code"
-        query = text(
+        taxonomy_group = "q.int_code" if response_format == "full_taxonomy" else "q.classification"
+        query = _provider_list_statement(
             f"""
-            {_sql_with_prefix_ctes(phone_candidates_cte)}filtered_taxonomy AS (
+            {_sql_with_prefix_ctes(phone_candidates_cte, import_relation_cte)}filtered_taxonomy AS (
                 SELECT DISTINCT {provider_npi_sql} AS npi, {taxonomy_int_code_sql} AS int_code
                   FROM {address_table_sql} AS c
                   {phone_candidates_join}
                   {taxonomy_row_source}
                  WHERE {" AND ".join(address_clauses)}
             )
-            SELECT q.classification AS key,
+            SELECT {taxonomy_group} AS key,
                    COUNT(DISTINCT ft.npi) AS value
               FROM filtered_taxonomy AS ft
               JOIN {taxonomy_subquery}
                 ON ft.int_code = q.int_code
-             GROUP BY q.classification
-            """
+             GROUP BY {taxonomy_group}
+            """,
+            import_context,
+            native_npis=native_npis,
         )
         query_parameters_by_name = {
+            **({"min_address_sources": minimum} if minimum else {}),
             "classification": classification,
             "section": section,
             "display_name": display_name,
@@ -8843,13 +8873,15 @@ async def list_providers(
         query_parameters_by_name.update(dynamic_code_parameters)
         query_parameters_by_name.update(npi_params)
         query_parameters_by_name.update(plan_scope_parameters)
-        if phone_candidates_cte:
+        if phone_candidates_cte and import_context is None and native_npis is None:
             query_parameters_by_name["candidate_limit"] = _provider_list_phone_candidate_limit(
                 limit,
                 count_query=True,
             )
-        query_parameters_by_name = _provider_list_parameters(query_parameters_by_name, import_context)
-        async with _provider_list_connection(db, import_context, request_session) as conn:
+        query_parameters_by_name = _provider_list_parameters(
+            query_parameters_by_name, import_context, native_npis=native_npis
+        )
+        async with _provider_list_connection(db, import_context, request_session, native_npis=native_npis) as conn:
             classification_count_records = await _npi_count_read(lambda: conn.all(query, **query_parameters_by_name))
         return {
             count_record[0]: count_record[1]
@@ -8883,7 +8915,7 @@ async def list_providers(
         if is_count_only:
             if has_insurance and not simple_filter_present:
                 return await _fast_has_insurance_count(city, state, **count_options)
-            if response_format == "all":
+            if response_format == "all" or (minimum and response_format in {"full_taxonomy", "classification"}):
                 return await get_classification_count_map(filters_by_name)
             if response_format in {"full_taxonomy", "classification"}:
                 return await get_formatted_count(response_format)
@@ -9014,6 +9046,8 @@ async def list_providers(
                 include_service_locations=include_service_locations,
             )
         ]
+        if minimum:
+            address_clauses.append(address_source_filter_sql("c", minimum, has_source_count=include_service_locations))
         if (page_import_context is not None or native_npis is not None) and (
             procedure_filter_unresolved or medication_filter_unresolved
         ):
@@ -9062,6 +9096,7 @@ async def list_providers(
         if phone_digits:
             phone_candidates_cte = _address_phone_candidates_cte(
                 address_table_sql,
+                min_address_sources=minimum,
                 is_bounded=page_import_context is None and native_npis is None,
                 editions=editions,
             )
@@ -9338,6 +9373,7 @@ async def list_providers(
         providers_by_npi = {}
         provider_total: Optional[int] = None
         query_parameters_by_name = {
+            **({"min_address_sources": minimum} if minimum else {}),
             "start": start,
             "limit": limit,
             "classification": classification,
@@ -9717,6 +9753,7 @@ async def list_providers(
 
     use_sitemap_fast_path = (
         import_context is None
+        and not minimum
         and native_npis is None
         and current_network_address_scope() is None
         and view_mode == "sitemap"
@@ -9809,7 +9846,9 @@ async def list_providers(
                 continue
             summary = summary_map.get(int(npi_value))
             if summary:
-                provider_result["provider_enrichment_summary"] = summary
+                provider_result["provider_enrichment_summary"] = (
+                    _without_uncounted_postal_addresses(summary) if minimum else summary
+                )
     if view_mode != "card":
         result_rows = await _project_provider_network_metadata(
             result_rows, session=request_session, include_sources=include_sources, include_evidence=include_evidence
@@ -10276,6 +10315,8 @@ async def get_near_npi(
     if native_scope_preparer is not None and import_context is None:
         raise sanic.exceptions.InvalidUsage("custom-import geo scope is invalid")
     args = request.args if native_args is None else native_args
+    minimum = parse_min_address_sources(args)
+    request.args.get("min_address_sources")
     request_session = _request_session(request)
     if import_context is not None and request_session is None:
         raise RuntimeError("custom-import geo query requires a request session")
@@ -10514,6 +10555,15 @@ async def get_near_npi(
 
         providers_by_identity: OrderedDict[tuple[int, str], dict[str, Any]] = OrderedDict()
         extra_filters: list[str] = []
+        if minimum:
+            # Keep the published KNN projection; its location key indexes the stored count.
+            extra_filters.append(
+                f"EXISTS (SELECT 1 FROM {address_table_sql} source_address "
+                "WHERE source_address.location_key = a.location_key "
+                f"AND {address_source_filter_sql('source_address', minimum)})"
+                if _is_unified_address_table(address_table_sql)
+                else "FALSE"
+            )
         if state_filter is not None:
             extra_filters.append("a.state_name = :state")
         if unresolved_code_filter:
@@ -10613,6 +10663,7 @@ async def get_near_npi(
             extra_clause = "\n          AND " + "\n          AND ".join(extra_filters)
 
         query_parameters_by_name: dict[str, Any] = {
+            **({"min_address_sources": minimum} if minimum else {}),
             "in_long": in_long,
             "in_lat": in_lat,
             "classification": classification,
@@ -10936,6 +10987,7 @@ class _ProviderProfileQuery:
     page_limit: int
     page_offset: int
     requested_categories: tuple[str, ...]
+    min_address_sources: int = 0
 
 
 class _ProviderProfileQueryError(ValueError):
@@ -11055,6 +11107,7 @@ def _provider_profile_query_from_args(
         raw_categories,
     )
     return _ProviderProfileQuery(
+        min_address_sources=parse_min_address_sources(request_args),
         include_evidence=_is_truthy_arg(
             request_args.get("include_evidence"),
             default=False,
@@ -11092,7 +11145,8 @@ def _compose_requested_provider_profile(
     fhir_record_by_key: Mapping[str, Any] | None,
     query: _ProviderProfileQuery,
 ) -> dict[str, Any] | None:
-    profile_by_key = compose_provider_profile(
+    profile_composer = compose_source_filtered_profile if query.min_address_sources else compose_provider_profile
+    profile_by_key = profile_composer(
         normalized_npi,
         state_projection=state_projection,
         fhir_profile=(fhir_record_by_key.get("profile") if fhir_record_by_key else None),
@@ -11101,6 +11155,7 @@ def _compose_requested_provider_profile(
         page_category=query.page_category,
         page_limit=query.page_limit,
         page_offset=query.page_offset,
+        **({"min_address_sources": query.min_address_sources} if query.min_address_sources else {}),
     )
     if profile_by_key is None:
         return None
@@ -11153,6 +11208,8 @@ def _provider_profile_response_by_key(
     )
     if evidence_by_key is None:
         return response_by_key
+    if query.min_address_sources:
+        evidence_by_key = _without_uncounted_postal_addresses(evidence_by_key)
     if "profile_as_of" in profile_by_key:
         evidence_by_key = dict(evidence_by_key)
         evidence_by_key["profile_as_of"] = profile_by_key["profile_as_of"]
@@ -11177,6 +11234,8 @@ async def get_provider_profile(request, npi):
         "limit": request.args.get("limit"),
         "offset": request.args.get("offset"),
     }
+    if "min_address_sources" in request.args:
+        query_args_by_name["min_address_sources"] = parse_min_address_sources(request.args)
     try:
         query = _provider_profile_query_from_args(query_args_by_name)
     except _ProviderProfileQueryError as exc:
@@ -11268,23 +11327,10 @@ async def get_plans_by_npi(_request, npi):
 
 
 def _normalize_npi_batch_npis(raw_npis: Any) -> list[int]:
-    """Validate and normalize the ordered NPI list."""
-    if not isinstance(raw_npis, list) or not 1 <= len(raw_npis) <= NPI_BATCH_MAX_SIZE:
-        raise sanic.exceptions.InvalidUsage(f"npis must contain between 1 and {NPI_BATCH_MAX_SIZE} values")
-    normalized_npis: list[int] = []
-    for raw_npi in raw_npis:
-        if isinstance(raw_npi, bool):
-            npi_text = ""
-        elif isinstance(raw_npi, (str, int)):
-            npi_text = str(raw_npi).strip()
-        else:
-            npi_text = ""
-        if len(npi_text) != 10 or not npi_text.isascii() or not npi_text.isdigit():
-            raise sanic.exceptions.InvalidUsage("each npi must be a 10-digit numeric value")
-        normalized_npis.append(int(npi_text))
-    if len(set(normalized_npis)) != len(normalized_npis):
-        raise sanic.exceptions.InvalidUsage("npis must be unique")
-    return normalized_npis
+    """Validate the shared native batch identity list."""
+    from api.provider_batch import normalize_batch_npis
+
+    return normalize_batch_npis(raw_npis)
 
 
 def _bounded_npi_batch_integer(
@@ -11323,35 +11369,12 @@ async def _rank_npi_batch_addresses(
     npis: Sequence[int],
     *,
     session: Any,
-    use_request_session: bool = False,
-    fail_closed: bool = False,
+    **options: Any,
 ) -> dict[int, list[dict[str, Any]]]:
-    """Fetch and rank summary address candidates with fixed-count reads."""
-    base_addresses_by_npi = await _fetch_npi_location_candidates_map(npis, session=session)
-    overlay_addresses_by_npi = (
-        {}
-        if current_network_address_scope() is not None
-        else await _fetch_provider_directory_address_overlay_map(npis, session=session)
-    )
-    await _apply_location_statuses(
-        [address for npi in npis for address in base_addresses_by_npi.get(npi, [])],
-        session=session,
-        use_request_session=use_request_session,
-        fail_closed=fail_closed,
-    )
-    ranked_addresses_by_npi: dict[int, list[dict[str, Any]]] = {}
-    for npi in npis:
-        addresses = [
-            address
-            for address in (
-                list(base_addresses_by_npi.get(npi, []))
-                + (list(overlay_addresses_by_npi.get(npi, [])) if current_network_address_scope() is None else [])
-            )
-            if _is_public_street_level_address(address)
-        ]
-        ranked_addresses = _rank_provider_locations(_dedupe_addresses_by_key(addresses))
-        ranked_addresses_by_npi[npi] = ranked_addresses
-    return ranked_addresses_by_npi
+    """Use shared batch logic while retaining the endpoint compatibility boundary."""
+    from api.provider_batch import rank_batch_addresses
+
+    return await rank_batch_addresses(npis, session, **options)
 
 
 async def _hydrate_npi_batch_addresses(
@@ -11364,37 +11387,12 @@ async def _hydrate_npi_batch_addresses(
     include_evidence: bool,
     session: Any,
 ) -> dict[int, list[dict[str, Any]]]:
-    """Hydrate only each provider's selected address page."""
-    selected_offset = address_offset if address_limit else 0
-    selected_end = address_offset + address_limit if address_limit else None
-    selected_addresses_by_npi = {npi: list(ranked_addresses_by_npi[npi])[selected_offset:selected_end] for npi in npis}
+    """Use shared batch logic while retaining the endpoint compatibility boundary."""
+    from api.provider_batch import hydrate_batch_addresses
 
-    selected_identity_list = sorted(
-        {identity for npi in npis for identity in _selected_base_identity_list(selected_addresses_by_npi[npi])}
+    return await hydrate_batch_addresses(
+        npis, ranked_addresses_by_npi, address_limit, address_offset, include_sources, include_evidence, session
     )
-    hydrated_by_npi: dict[int, list[dict[str, Any]]] = {}
-    if selected_identity_list:
-        hydrated_by_npi = await _fetch_npi_address_rows_map(
-            npis,
-            include_sources=include_sources,
-            include_evidence=include_evidence,
-            address_row_identities=selected_identity_list,
-            session=session,
-        )
-    for npi in npis:
-        selected_addresses_by_npi[npi] = _merge_hydrated_location_candidates(
-            selected_addresses_by_npi[npi],
-            hydrated_by_npi.get(npi, []),
-        )
-    selected_addresses = [address for npi in npis for address in selected_addresses_by_npi[npi]]
-    if selected_addresses and (include_sources or include_evidence):
-        await _attach_selected_address_source_details(
-            selected_addresses,
-            include_sources=include_sources,
-            include_role_evidence=include_evidence,
-            session=session,
-        )
-    return selected_addresses_by_npi
 
 
 def _npi_batch_dba_names(
@@ -11415,55 +11413,22 @@ def _npi_batch_provider_result(
     other_names: Sequence[Mapping[str, Any]],
     enrichment: Mapping[str, Any] | None,
     batch_params: Mapping[str, Any],
+    *,
+    authorized_without_addresses: bool = False,
 ) -> tuple[dict[str, Any], bool]:
-    """Format one success or not-found entry without extra reads."""
-    address_total = len(ranked_addresses)
-    scope = current_network_address_scope()
-    if address_total == 0 and (provider_detail_map is None or (scope is not None and scope.network_ids is not None)):
-        return (
-            {
-                "npi": npi,
-                "status": 404,
-                "error": {
-                    "code": "not_found",
-                    "detail": "provider was not found",
-                },
-            },
-            False,
-        )
-    public_provider_map = dict(provider_detail_map or {"npi": npi})
-    finalized_addresses = [
-        _finalize_public_provider_address(
-            dict(address),
-            include_sources=bool(batch_params["include_sources"]),
-            include_evidence=bool(batch_params["include_evidence"]),
-        )
-        for address in selected_addresses
-    ]
-    address_limit = int(batch_params["address_limit"]) or None
-    address_offset = int(batch_params["address_offset"]) if address_limit is not None else 0
-    public_provider_map["address_list"] = finalized_addresses
-    public_provider_map["address_pagination"] = {
-        "limit": address_limit,
-        "offset": address_offset,
-        "returned": len(finalized_addresses),
-        "total": address_total,
-        "has_more": address_limit is not None and address_offset + len(finalized_addresses) < address_total,
-    }
-    public_provider_map["other_name_list"] = list(other_names)
-    public_provider_map["do_business_as"] = _npi_batch_dba_names(
-        public_provider_map,
+    """Use shared batch logic while retaining the endpoint compatibility boundary."""
+    from api.provider_batch import batch_provider_result
+
+    return batch_provider_result(
+        npi,
+        provider_detail_map,
+        ranked_addresses,
+        selected_addresses,
         other_names,
+        enrichment,
+        batch_params,
+        authorized_without_addresses,
     )
-    public_provider_map["provider_enrichment"] = {
-        "summary": _public_provider_enrichment_summary(enrichment),
-        "ffs_visibility": _provider_enrichment_visibility(
-            enrichment,
-            include_chain=False,
-        ),
-    }
-    _redact_internal_address_fields(public_provider_map)
-    return {"npi": npi, "status": 200, "provider": public_provider_map}, True
 
 
 async def _build_npi_batch_payload(batch_params: Mapping[str, Any], *, session: Any = None) -> dict[str, Any]:
@@ -11491,6 +11456,8 @@ async def get_npi(request, npi):
 async def read_npi_detail(request, npi, *, native_args=None):
     """Assemble provider detail on the real request with optional normalized arguments."""
     args = request.args if native_args is None else native_args
+    minimum = parse_min_address_sources(args)
+    request.args.get("min_address_sources")
     network_scope = current_network_address_scope()
     should_force_address_update = _is_truthy_arg(args.get("force_address_update"), default=False)
     include_sources = _is_truthy_arg(args.get("include_sources"), default=False)
@@ -12119,6 +12086,8 @@ async def read_npi_detail(request, npi, *, native_args=None):
                 address_grouping=address_grouping,
             )
         )
+        if minimum:
+            cache_key += f":min_address_sources={minimum}"
         if is_response_cache_enabled:
             cached_body = _npi_detail_response_cache_get(cache_key)
             if cached_body is not None:
@@ -12150,7 +12119,7 @@ async def read_npi_detail(request, npi, *, native_args=None):
 
         overlay_addresses = (
             []
-            if network_scope is not None
+            if network_scope is not None or minimum
             else await _fetch_provider_directory_address_overlay(
                 npi,
                 address_key=address_key,
@@ -12165,11 +12134,18 @@ async def read_npi_detail(request, npi, *, native_args=None):
                 address_key=address_key,
                 address_site_key=address_site_key,
                 session=request_session,
+                **({"min_address_sources": minimum} if minimum else {}),
             )
         )
         # A compatibility builder may retain direct rows despite its empty address
         # window. Keep that evidence without replacing the complete candidate set.
         base_candidates.extend(initial_base_addresses)
+        if minimum:
+            base_candidates = [
+                address
+                for address in base_candidates
+                if type(address.get("source_count")) is int and address["source_count"] >= minimum
+            ]
         await _apply_location_statuses(
             base_candidates,
             session=request_session,
@@ -12191,8 +12167,29 @@ async def read_npi_detail(request, npi, *, native_args=None):
         if not include_extra_info:
             addresses = [address for address in addresses if _is_public_street_level_address(address)]
         addresses = _rank_provider_locations(_dedupe_addresses_by_key(addresses))
-        if not addresses and (
-            network_scope and network_scope.network_ids is not None or not (has_provider_detail or profile_record)
+        has_authorized_address = False
+        if (
+            minimum
+            and not addresses
+            and (
+                network_scope is not None
+                and network_scope.network_ids is not None
+                or not (has_provider_detail or profile_record)
+            )
+        ):
+            has_authorized_address = any(
+                include_extra_info or _is_public_street_level_address(address)
+                for address in await _fetch_npi_location_candidates(
+                    npi,
+                    address_key=address_key,
+                    address_site_key=address_site_key,
+                    session=request_session,
+                )
+            )
+        if (
+            not addresses
+            and (network_scope and network_scope.network_ids is not None or not (has_provider_detail or profile_record))
+            and not has_authorized_address
         ):
             raise sanic.exceptions.NotFound
         address_total = len(addresses)
@@ -12362,6 +12359,8 @@ async def read_npi_detail(request, npi, *, native_args=None):
         if include_evidence and profile_record.get("evidence") is not None:
             provider_detail_by_field["provider_directory_profile_evidence"] = profile_record["evidence"]
 
+    if minimum:
+        provider_detail_by_field = _without_uncounted_postal_addresses(provider_detail_by_field)
     _redact_internal_address_fields(provider_detail_by_field)
     response_body = json.dumps(
         provider_detail_by_field,
@@ -12435,6 +12434,7 @@ async def _fetch_npi_location_candidates_map(
     address_key: str | None = None,
     address_site_key: str | None = None,
     session: Any = None,
+    min_address_sources: int = 0,
 ) -> dict[int, list[dict[str, Any]]]:
     """Read ranking fields for many providers in one address query."""
     unique_npis = sorted({int(npi) for npi in npis})
@@ -12454,6 +12454,8 @@ async def _fetch_npi_location_candidates_map(
         if column_name in existing_columns
     ]
     filters = _npi_batch_address_filters(address_model, address_table, unique_npis)
+    if min_address_sources:
+        filters.append(address_source_filter(address_table, min_address_sources))
     if address_key is not None:
         filters.append(address_table.c.address_key == address_key)
     if address_site_key is not None:
@@ -12475,6 +12477,7 @@ async def _fetch_npi_location_candidates(
     address_key: str | None = None,
     address_site_key: str | None = None,
     session: Any = None,
+    min_address_sources: int = 0,
 ) -> list[dict[str, Any]]:
     """Read only the fields needed to rank one provider's locations."""
     return (
@@ -12483,6 +12486,7 @@ async def _fetch_npi_location_candidates(
             address_key=address_key,
             address_site_key=address_site_key,
             session=session,
+            **({"min_address_sources": min_address_sources} if min_address_sources else {}),
         )
     ).get(int(npi), [])
 
@@ -12933,23 +12937,10 @@ def _npi_detail_address_subquery(
     address_filters: Sequence[Any],
     address_limit: int | None,
 ) -> Any:
-    npi_address_rows = select(*address_columns).where(*address_filters).offset(0).subquery("npi_address_rows")
-    address_subquery_base = (
-        select(*npi_address_rows.c)
-        .where(_provider_detail_address_type_clause(address_model, npi_address_rows))
-        # Deterministic order keeps bounded identity hydration stable.
-        .order_by(
-            npi_address_rows.c.type,
-            npi_address_rows.c.first_line,
-            npi_address_rows.c.city_name,
-        )
-    )
-    if address_limit is not None:
-        address_subquery_base = address_subquery_base.limit(address_limit)
-    try:
-        return address_subquery_base.alias("address_list")
-    except NameError:
-        return address_subquery_base
+    """Use the detail SQL builder while retaining the endpoint query boundary."""
+    from api.provider_detail_sql import detail_address_subquery
+
+    return detail_address_subquery(address_model, address_table, address_columns, address_filters, address_limit)
 
 
 async def _count_npi_detail_addresses(

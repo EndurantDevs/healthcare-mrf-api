@@ -5,7 +5,6 @@ from pathlib import Path
 
 import yaml
 
-
 OPENAPI_PATH = Path("doc/openapi.yaml")
 
 
@@ -19,10 +18,9 @@ def test_hospital_facility_search_publishes_source_hidden_contract():
         "cursor",
         "limit",
         "include_metadata",
+        "min_address_sources",
     }
-    response_schema = operation["responses"]["200"]["content"][
-        "application/json"
-    ]["schema"]
+    response_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
     item = response_schema["properties"]["items"]["items"]
     assert set(item["required"]) == {
         "hospital_id",
@@ -38,9 +36,9 @@ def test_hospital_facility_search_publishes_source_hidden_contract():
 
 def test_hospital_price_response_publishes_nested_contract():
     document = yaml.safe_load(OPENAPI_PATH.read_text())
-    response_schema = document["paths"][
-        "/hospital-prices/facilities/{hospital_id}/prices"
-    ]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    response_schema = document["paths"]["/hospital-prices/facilities/{hospital_id}/prices"]["get"]["responses"]["200"][
+        "content"
+    ]["application/json"]["schema"]
     properties = response_schema["properties"]
 
     assert set(response_schema["required"]) >= {
@@ -80,9 +78,7 @@ def test_hospital_price_response_publishes_nested_contract():
     }
     item_properties = item_schema["properties"]
     assert set(item_properties) >= {"service", "charge", "negotiated_prices"}
-    assert "negotiated_rate_term" in item_properties["negotiated_prices"][
-        "items"
-    ]["properties"]
+    assert "negotiated_rate_term" in item_properties["negotiated_prices"]["items"]["properties"]
     service_schema = item_properties["service"]
     assert set(service_schema["required"]) >= {"codes"}
     assert "codes" in service_schema["properties"]
@@ -96,7 +92,10 @@ def test_payer_plan_discovery_contract_preserves_missing_plans():
     document = yaml.safe_load(OPENAPI_PATH.read_text())
     operation = document["paths"]["/hospital-prices/facilities/{hospital_id}/payer-plans"]["get"]
     assert {parameter["name"] for parameter in operation["parameters"]} == {
-        "hospital_id", "version_id", "cursor", "limit",
+        "hospital_id",
+        "version_id",
+        "cursor",
+        "limit",
     }
     schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
     assert set(schema["required"]) == {"hospital_id", "version", "pagination", "items"}

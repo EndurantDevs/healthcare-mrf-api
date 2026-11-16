@@ -4,6 +4,7 @@ import shutil
 import socket
 import subprocess
 import time
+from contextlib import ExitStack
 from http.client import HTTPConnection
 from itertools import product
 from pathlib import Path
@@ -20,10 +21,34 @@ REJECTION_PATH = "/control/v1/custom-import/rejection-page"
 PRIVATE_PATHS = (EVIDENCE_PATH, STOP_REQUEST_PATH, STOP_FINALIZE_PATH, ADMISSION_PATH, SOURCE_PATH, REJECTION_PATH)
 
 
-def _unused_port():
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
+def _unused_ports(count):
+    with ExitStack() as stack:
+        listeners = [stack.enter_context(socket.socket()) for _ in range(count)]
+        for listener in listeners:
+            listener.bind(("127.0.0.1", 0))
+        return tuple(listener.getsockname()[1] for listener in listeners)
+
+
+def test_listener_ports_are_reserved_together(monkeypatch):
+    active_ports = set()
+
+    class Listener:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            active_ports.remove(self.port)
+
+        def bind(self, _address):
+            self.port = next(port for port in range(31000, 31010) if port not in active_ports)
+            active_ports.add(self.port)
+
+        def getsockname(self):
+            return "127.0.0.1", self.port
+
+    monkeypatch.setattr(socket, "socket", Listener)
+    assert _unused_ports(4) == (31000, 31001, 31002, 31003)
+    assert not active_ports
 
 
 def _request(port, path, *, no_store=False, host=None):
@@ -42,14 +67,14 @@ def _request(port, path, *, no_store=False, host=None):
         connection.close()
 
 
-def _configuration(tmp_path, public_port, upstream_port, *, external_port=None):
+def _configuration(tmp_path, public_port, upstream_port, *, external_port):
     configuration = (ROOT / "service/nginx.conf").read_text()
     for original, replacement in (
         ("user nobody nogroup;", ""),
         ("pid /run/nginx.pid;", f"pid {tmp_path}/nginx.pid;"),
         ("include /etc/nginx/mime.types;", "types {}"),
         ("listen       8080 default;", f"listen 127.0.0.1:{public_port} default;"),
-        ("listen       8082;", f"listen 127.0.0.1:{external_port or _unused_port()};"),
+        ("listen       8082;", f"listen 127.0.0.1:{external_port};"),
         ("8080 internal;", f"{public_port} internal;"),
         ("http://127.0.0.1:8081", f"http://127.0.0.1:{upstream_port}"),
         ("/etc/nginx/private/*.conf", f"{tmp_path}/private/*.conf"),
@@ -115,10 +140,7 @@ def test_evidence_is_private_and_other_routes_still_proxy(tmp_path, private_enab
     nginx = shutil.which("nginx")
     if nginx is None:
         pytest.skip("native Nginx is required for the routing check")
-    public_port = _unused_port()
-    external_port = _unused_port()
-    upstream_port = _unused_port()
-    private_port = _unused_port()
+    public_port, external_port, upstream_port, private_port = _unused_ports(4)
     private_directory = tmp_path / "private"
     if private_enabled:
         private_directory.mkdir()
@@ -176,9 +198,7 @@ def test_listener_overwrites_forged_read_boundary_and_keeps_native_paths(tmp_pat
     nginx = shutil.which("nginx")
     if nginx is None:
         pytest.skip("native Nginx is required for the routing check")
-    internal_port = _unused_port()
-    external_port = _unused_port()
-    upstream_port = _unused_port()
+    internal_port, external_port, upstream_port = _unused_ports(3)
     config_path = tmp_path / "nginx.conf"
     config_path.write_text(
         _configuration(

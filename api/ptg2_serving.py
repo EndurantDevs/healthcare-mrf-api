@@ -31,6 +31,7 @@ from sanic.exceptions import ServiceUnavailable
 from sqlalchemy import text
 
 from api import ptg2_geo_projection as geo_projection
+from api.address_source_filter import address_source_filter_sql, parse_min_address_sources
 from api.code_systems import (
     EQUIVALENT_PROCEDURE_CODE_SYSTEMS,
     canonical_catalog_code,
@@ -38,7 +39,7 @@ from api.code_systems import (
     catalog_code_system_lookup_values,
 )
 from api.endpoint.pagination import PaginationParams
-from api.network_address_scope import current_network_address_scope
+from api.network_address_scope import current_network_address_scope, scoped_address_parameters
 from api.network_read_execution import qualified_relation_sql
 from api.plan_pricing_em_distance import search_plan_pricing_em_distance
 from api.plan_pricing_projection import (
@@ -82,6 +83,11 @@ from api.plan_release_serving import (
     has_conflicting_release_selectors,
     prepare_plan_release_bindings,
     resolve_plan_release_serving,
+)
+from api.pricing_address_source_filter import (
+    normalize_address_source_order,
+    qualifying_cell_sql,
+    qualifying_compact_offices,
 )
 from api.provider_demographic_filters import provider_sex_exists_sql
 from api.provider_profile_snapshot import provider_read_savepoint
@@ -166,6 +172,14 @@ from api.ptg2_online_work import PTG2OnlineWorkBudgetExceeded
 from api.ptg2_price_hydration_cache import (
     PRICE_HYDRATION_CACHE,
     PriceHydrationLayout,
+)
+from api.ptg2_provider_enrichment_sql import (
+    _PROVIDER_ENRICHMENT_ADDRESS_COLUMNS,
+    _PROVIDER_ENRICHMENT_FALLBACK_JOIN_SQL,
+    _PROVIDER_ENRICHMENT_SQL,
+    _fallback_address_column_sql,
+    _provider_enrichment_fallback_cte_sql,
+    _unified_provider_selected_address_join_sql,
 )
 from api.ptg2_rate_option_refs import (
     encode_rate_option_ref,
@@ -8075,199 +8089,36 @@ async def _taxonomy_rows_for_npis(
     return taxonomy_by_npi
 
 
-_PROVIDER_ENRICHMENT_SQL = """
-    WITH source_npis AS MATERIALIZED (
-        SELECT UNNEST(CAST(:npis AS bigint[])) AS npi
-    )
-    {fallback_cte}
-    SELECT
-        source_npis.npi,
-        selected_addr.location_hash,
-        selected_addr.state_name AS state,
-        selected_addr.city_name AS city,
-        LEFT(COALESCE(selected_addr.postal_code, ''), 5) AS zip5,
-        selected_addr.location_source,
-        selected_addr.location_source AS location_confidence_code,
-        jsonb_build_object(
-            'npi', source_npis.npi, 'type', selected_addr.type,
-            'checksum', selected_addr.checksum,
-            'first_line', selected_addr.first_line,
-            'second_line', selected_addr.second_line,
-            'city_name', selected_addr.city_name,
-            'state_name', selected_addr.state_name,
-            'city', selected_addr.city_name,
-            'state', selected_addr.state_name,
-            'postal_code', selected_addr.postal_code,
-            'country_code', selected_addr.country_code,
-            'telephone_number', selected_addr.telephone_number,
-            'fax_number', selected_addr.fax_number,
-            'phone_number', selected_addr.phone_number,
-            'phone_extension', selected_addr.phone_extension,
-            'fax_number_digits', selected_addr.fax_number_digits,
-            'fax_extension', selected_addr.fax_extension,
-            'address_key', selected_addr.address_key,
-            'address_site_key', selected_addr.address_site_key,
-            'lat', selected_addr.lat, 'long', selected_addr.long
-        )::text AS address_payload,
-        selected_addr.telephone_number,
-        selected_addr.fax_number,
-        selected_addr.phone_number,
-        selected_addr.phone_extension,
-        selected_addr.fax_number_digits,
-        selected_addr.fax_extension,
-        COALESCE(tax.taxonomy_codes, ARRAY[]::varchar[]) AS taxonomy_codes,
-        COALESCE(tax.specialties, ARRAY[]::varchar[]) AS specialties,
-        COALESCE(tax.classifications, ARRAY[]::varchar[]) AS classifications,
-        COALESCE(tax.specializations, ARRAY[]::varchar[]) AS specializations,
-        tax.primary_specialty, tax.primary_specialization,
-        n.provider_sex_code, {provider_name_sql} AS provider_name
-    FROM source_npis
-    LEFT JOIN {npi_data_table} n ON n.npi = source_npis.npi
-    LEFT JOIN LATERAL (
-        SELECT addr.*, {postal_box_rank_sql} AS display_rank
-          FROM {npi_address_table} addr
-         WHERE addr.npi = source_npis.npi
-         ORDER BY {postal_box_rank_sql},
-                  (addr.type = 'primary') DESC, addr.type, addr.checksum
-         LIMIT 1
-    ) addr ON TRUE
-    {fallback_join}
-    {selected_address_join}
-    {taxonomy_lateral_sql}
-    ORDER BY provider_name, source_npis.npi
-"""
-
-
-_PROVIDER_ENRICHMENT_ADDRESS_COLUMNS = (
-    "type",
-    "checksum",
-    "first_line",
-    "second_line",
-    "city_name",
-    "state_name",
-    "postal_code",
-    "country_code",
-    "telephone_number",
-    "fax_number",
-    "phone_number",
-    "phone_extension",
-    "fax_number_digits",
-    "fax_extension",
-    "lat",
-    "long",
-)
-_PROVIDER_ENRICHMENT_FALLBACK_JOIN_SQL = """
-    LEFT JOIN fallback_addresses na
-      ON na.npi = source_npis.npi
-     AND (
-         addr.npi IS NULL
-         OR addr.display_rank = 2
-         OR (addr.display_rank = 1 AND na.display_rank = 0)
-     )"""
-
-
 def _direct_provider_selected_address_join_sql(
     npi_address_table: str,
 ) -> str:
     """Select every legacy address-owned field from one row."""
 
     selected_column_sql = ",\n               ".join(f"addr.{column}" for column in _PROVIDER_ENRICHMENT_ADDRESS_COLUMNS)
+    uses_unified_addresses = _is_unified_address_table(npi_address_table)
+    site_key = "addr.premise_key::text" if uses_unified_addresses else "NULL::text"
+    source = "entity_address_unified" if uses_unified_addresses else "npi_address"
+    if uses_unified_addresses:
+        selected_column_sql += ", addr.source_count, addr.address_sources"
     return f"""
     LEFT JOIN LATERAL (
         SELECT {selected_column_sql},
                addr.address_key::text AS address_key,
-               NULL::text AS address_site_key,
+               {site_key} AS address_site_key,
                {_ptg2_address_location_hash_sql("addr", npi_address_table)}
                    AS location_hash,
-               'npi_address'::varchar AS location_source
-    ) selected_addr ON TRUE"""
-
-
-def _fallback_address_column_sql(
-    column: str,
-    fallback_columns: set[str],
-    sql_type: str = "varchar",
-) -> str:
-    """Select an available legacy column or a typed null."""
-
-    if column in fallback_columns:
-        return f"na.{column}"
-    return f"NULL::{sql_type} AS {column}"
-
-
-def _provider_enrichment_fallback_cte_sql(
-    fallback_columns: set[str],
-) -> str:
-    """Build the source-NPI-bounded best legacy address CTE."""
-
-    fallback_column_sql = partial(
-        _fallback_address_column_sql,
-        fallback_columns=fallback_columns,
-    )
-    return f"""
-    , fallback_addresses AS MATERIALIZED (
-        SELECT DISTINCT ON (na.npi)
-               na.npi, na.type, na.checksum, na.address_key,
-               na.first_line, na.second_line, na.city_name,
-               na.state_name, na.postal_code, na.country_code,
-               {fallback_column_sql("telephone_number")},
-               {fallback_column_sql("fax_number")},
-               {fallback_column_sql("phone_number")},
-               {fallback_column_sql("phone_extension")},
-               {fallback_column_sql("fax_number_digits")},
-               {fallback_column_sql("fax_extension")},
-               na.lat, na.long,
-               {address_display_rank_sql("na")} AS display_rank
-          FROM {PTG2_SCHEMA}.npi_address na
-          JOIN source_npis source_filter ON source_filter.npi = na.npi
-         WHERE {address_display_rank_sql("na")} < 2
-         ORDER BY na.npi,
-                  {address_display_rank_sql("na")},
-                  CASE na.type WHEN 'primary' THEN 0
-                       WHEN 'practice' THEN 1
-                       WHEN 'secondary' THEN 2 ELSE 3 END,
-                  na.checksum
-    )"""
-
-
-def _unified_provider_selected_address_join_sql() -> str:
-    """Switch all address-owned fields together using one fallback marker."""
-
-    selected_column_sql = ",\n               ".join(
-        f"CASE WHEN na.npi IS NOT NULL THEN na.{column} ELSE addr.{column} END AS {column}"
-        for column in _PROVIDER_ENRICHMENT_ADDRESS_COLUMNS
-    )
-    return f"""
-    LEFT JOIN LATERAL (
-        SELECT {selected_column_sql},
-               CASE WHEN na.npi IS NOT NULL
-                    THEN na.address_key::text
-                    ELSE addr.address_key::text END AS address_key,
-               CASE WHEN na.npi IS NOT NULL
-                    THEN NULL::text
-                    ELSE addr.premise_key::text END AS address_site_key,
-               CASE WHEN na.npi IS NOT NULL
-                    THEN CONCAT(
-                        'npi_address:', na.npi, ':',
-                        na.type, ':', na.checksum
-                    )
-                    ELSE CONCAT(
-                        'entity_address_unified:', addr.location_key
-                    ) END AS location_hash,
-               CASE WHEN na.npi IS NOT NULL
-                    THEN 'npi_address'::varchar
-                    ELSE 'entity_address_unified'::varchar
-                END AS location_source
+               '{source}'::varchar AS location_source
     ) selected_addr ON TRUE"""
 
 
 async def _provider_enrichment_address_sql(
     session,
     npi_address_table: str,
+    min_address_sources=0,
 ) -> tuple[str, str, str]:
     """Build one atomic address selection and its bounded legacy fallback."""
 
-    if not _is_unified_address_table(npi_address_table):
+    if min_address_sources or not _is_unified_address_table(npi_address_table):
         return "", "", _direct_provider_selected_address_join_sql(npi_address_table)
     fallback_columns = set(await _ptg2_table_columns(session, f"{PTG2_SCHEMA}.npi_address"))
     return (
@@ -8281,11 +8132,14 @@ async def _provider_enrichment_statement(
     session,
     npi_data_table: str,
     npi_address_table: str,
+    min_address_sources=0,
 ):
     """Build the bounded provider enrichment statement."""
 
     fallback_cte, fallback_join, selected_address_join = await _provider_enrichment_address_sql(
-        session, npi_address_table
+        session,
+        npi_address_table,
+        **({"min_address_sources": min_address_sources} if min_address_sources else {}),
     )
     return text(
         _PROVIDER_ENRICHMENT_SQL.format(
@@ -8297,6 +8151,19 @@ async def _provider_enrichment_statement(
             npi_address_table=npi_address_table,
             postal_box_rank_sql=address_display_rank_sql("addr"),
             taxonomy_lateral_sql=_provider_taxonomy_summary_lateral_sql("source_npis.npi"),
+            address_source_count_pair_sql=(
+                "'source_count', selected_addr.source_count, 'address_sources', selected_addr.address_sources,"
+                if min_address_sources and _is_unified_address_table(npi_address_table)
+                else ""
+            ),
+            address_source_count_sql=(
+                "AND "
+                + address_source_filter_sql(
+                    "addr", min_address_sources, has_source_count=_is_unified_address_table(npi_address_table)
+                )
+                if min_address_sources
+                else ""
+            ),
         )
     )
 
@@ -8309,6 +8176,7 @@ async def _enriched_provider_rows_for_npis(
     plan_id: str | None = None,
     snapshot_id: str | None = None,
     source_key: str | None = None,
+    min_address_sources=0,
 ) -> list[dict[str, Any]] | None:
     """Enrich NPIs with provider, taxonomy, and address serving data."""
 
@@ -8318,7 +8186,7 @@ async def _enriched_provider_rows_for_npis(
     npi_data_table = f"{PTG2_SCHEMA}.npi"
     npi_address_table = await _ptg2_address_serving_table(
         session,
-        _PTG2_LEGACY_ADDRESS_COLUMNS,
+        _PTG2_UNIFIED_ADDRESS_COLUMNS if min_address_sources else _PTG2_LEGACY_ADDRESS_COLUMNS,
         require_legacy_available=True,
     )
     if not await _is_relation_available(session, npi_data_table) or not npi_address_table:
@@ -8340,13 +8208,17 @@ async def _enriched_provider_rows_for_npis(
         session,
         npi_data_table,
         npi_address_table,
+        **({"min_address_sources": min_address_sources} if min_address_sources else {}),
     )
     # PostgreSQL can grossly overestimate the unified-address lateral fanout
     # and spend hundreds of milliseconds compiling JIT code for this tiny,
     # bounded provider page. Keep imports independently tunable and disable JIT
     # for the remainder of this request transaction (`SET LOCAL` scope).
     await session.execute(text("SET LOCAL jit = off"))
-    enrichment_query = await session.execute(enrich_stmt, {"npis": npis})
+    enrichment_query = await session.execute(
+        enrich_stmt,
+        {"npis": npis, **({"min_address_sources": min_address_sources} if min_address_sources else {})},
+    )
     enriched_provider_rows = [_row_mapping(provider_record) for provider_record in enrichment_query]
     return await _overlay_provider_directory_corroboration(
         session,
@@ -9945,7 +9817,11 @@ async def _membership_address_table_for_request(
         request_arg_map.get(parameter_name) not in (None, "", "null")
         for parameter_name in ("state", "city", "zip5", "zip", "lat", "long")
     )
+    minimum_sources = parse_min_address_sources(request_arg_map)
+    has_address_filter = has_address_filter or minimum_sources > 0
     required_columns = _PTG2_UNIFIED_ADDRESS_COLUMNS if has_address_filter else _PTG2_LEGACY_ADDRESS_COLUMNS
+    if minimum_sources:
+        required_columns = {*required_columns, "source_count"}
     address_table = await _ptg2_address_serving_table(
         session,
         required_columns,
@@ -10123,6 +9999,14 @@ def _membership_location_filter_plan(
             include_taxonomy_filters,
         )
     )
+    minimum_sources = parse_min_address_sources(args)
+    if minimum_sources:
+        source_predicate = address_source_filter_sql("addr", minimum_sources, has_source_count=uses_unified_addresses)
+        parameter_map["min_address_sources"] = minimum_sources
+        if filter_sql_parts is not None:
+            filter_sql_parts = (f"({filter_sql_parts[0]}) AND ({source_predicate})", filter_sql_parts[1])
+        if knn_order_sql is not None:
+            knn_prefilter_sql = f"({knn_prefilter_sql}) AND ({source_predicate})"
     return filter_sql_parts, knn_prefilter_sql, taxonomy_index_sql
 
 
@@ -11653,8 +11537,10 @@ def _graph_provider_data(
     location_data: dict[str, Any],
     enriched_data: dict[str, Any] | None,
     location_source: str,
+    *,
+    min_address_sources=0,
 ) -> dict[str, Any]:
-    """Overlay the matched location without erasing richer contact values."""
+    """Keep a filtered office atomic; preserve richer contacts for ordinary reads."""
     npi = int(location_data["npi"])
     provider_data_map = dict(enriched_data or {"npi": npi, "provider_name": "TiC provider"})
     location_fields = ("distance_miles", "location_hash")
@@ -11668,8 +11554,10 @@ def _graph_provider_data(
                 "address_payload": json.dumps({}),
             }
         )
-    elif _has_street_address_payload(location_data.get("address_payload")) or not _has_street_address_payload(
-        provider_data_map.get("address_payload")
+    elif (
+        min_address_sources
+        or _has_street_address_payload(location_data.get("address_payload"))
+        or not _has_street_address_payload(provider_data_map.get("address_payload"))
     ):
         location_fields += ("state", "city", "zip5", "address_payload")
     provider_data_map.update({field: location_data.get(field) for field in location_fields})
@@ -11680,7 +11568,7 @@ def _graph_provider_data(
             {
                 field: location_data.get(field)
                 for field in _PTG_LOCATION_CONTACT_FIELDS
-                if location_data.get(field) is not None
+                if min_address_sources or location_data.get(field) is not None
             }
         )
     provider_data_map["location_source"] = location_source
@@ -11705,6 +11593,8 @@ def _graph_providers_by_set(
     provider_data_by_npi: dict[int, dict[str, Any]],
     provider_set_ids_by_key: Mapping[int, str],
     location_source: str,
+    *,
+    min_address_sources=0,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]]:
     """Project matched dense provider-set keys onto response IDs."""
     provider_set_ids: set[str] = set()
@@ -11712,7 +11602,12 @@ def _graph_providers_by_set(
     seen_npis_by_set: dict[str, set[int]] = defaultdict(set)
     for location_data in candidates.location_rows:
         npi = int(location_data["npi"])
-        provider_data = _graph_provider_data(location_data, provider_data_by_npi.get(npi), location_source)
+        provider_data = _graph_provider_data(
+            location_data,
+            provider_data_by_npi.get(npi),
+            location_source,
+            **({"min_address_sources": min_address_sources} if min_address_sources else {}),
+        )
         for provider_set_key in candidates.provider_set_keys_by_npi.get(npi, ()):
             provider_set_id = provider_set_ids_by_key.get(int(provider_set_key))
             if provider_set_id is None:
@@ -11734,6 +11629,7 @@ async def _project_graph_candidates(
     snapshot_id: str | None,
     source_key: str | None,
     include_provider_rows: bool = True,
+    min_address_sources=0,
 ) -> tuple[set[str], dict[str, list[dict[str, Any]]]] | None:
     """Enrich candidate NPIs and map dense provider-set keys to IDs."""
     provider_set_keys = tuple(
@@ -11762,6 +11658,7 @@ async def _project_graph_candidates(
         plan_id=plan_id,
         snapshot_id=snapshot_id,
         source_key=source_key or serving_tables.source_key,
+        **({"min_address_sources": min_address_sources} if min_address_sources else {}),
     )
     provider_data_by_npi = {int(provider_data["npi"]): provider_data for provider_data in enriched_provider_rows or []}
     address_table = await _ptg2_address_serving_table(
@@ -11775,6 +11672,7 @@ async def _project_graph_candidates(
         provider_data_by_npi,
         provider_set_ids_by_key,
         location_source,
+        **({"min_address_sources": min_address_sources} if min_address_sources else {}),
     )
 
 
@@ -12289,6 +12187,15 @@ async def _local_inferred_distance_graph_candidates(
         )
 
 
+def _uses_source_npi_threshold(args):
+    """Keep positive exact-NPI filtering within its explicitly selected source snapshot."""
+    return bool(
+        parse_min_address_sources(args)
+        and _normalize_npi(args.get("npi")) is not None
+        and (str(args.get("snapshot_id") or "").strip() or str(args.get("source_key") or "").strip())
+    )
+
+
 async def _request_rate_provider_set_keys(
     session,
     serving_tables: PTG2ServingTables,
@@ -12296,8 +12203,22 @@ async def _request_rate_provider_set_keys(
     request_options: Mapping[str, Any],
     provider_set_keys: set[int] | None,
 ) -> frozenset[int]:
-    """Read the exact code-bearing provider sets for the broad graph path."""
+    """Read exact code-bearing sets inside the selected plan or exact source scope."""
 
+    scoped_set_keys = tuple(sorted(provider_set_keys)) if provider_set_keys is not None else None
+    if not request_options["plan_id"] and scoped_set_keys is not None and _uses_source_npi_threshold(args):
+        from api.ptg2_code_scope import load_sealed_code_rows
+
+        code_rows = await load_sealed_code_rows(session, serving_tables, args)
+        return frozenset(
+            await _scoped_rate_provider_set_keys(
+                session,
+                serving_tables,
+                code_rows,
+                provider_set_keys=scoped_set_keys,
+                scan_budget=None,
+            )
+        )
     return frozenset(
         await _shared_rate_provider_set_keys(
             session,
@@ -12306,7 +12227,7 @@ async def _request_rate_provider_set_keys(
             plan_market_type=(args.get("plan_market_type") or args.get("market_type") or ""),
             reported_code=request_options["requested_code"],
             code_system=request_options.get("requested_system"),
-            provider_set_keys=(tuple(sorted(provider_set_keys)) if provider_set_keys is not None else None),
+            provider_set_keys=scoped_set_keys,
         )
     )
 
@@ -12434,7 +12355,7 @@ async def _graph_location_matches(
         if requested_system
         else str(args.get("code") or args.get("reported_code") or "").strip()
     )
-    if not plan_id or not requested_code:
+    if not requested_code or (not plan_id and not _uses_source_npi_threshold(args)):
         return None
     candidates = await _graph_candidates_for_request(
         session,
@@ -12471,6 +12392,7 @@ async def _graph_location_matches(
         snapshot_id=snapshot_id,
         source_key=source_key,
         include_provider_rows=not require_provider_set_coverage,
+        **({"min_address_sources": parse_min_address_sources(args)} if parse_min_address_sources(args) else {}),
     )
 
 
@@ -12571,6 +12493,7 @@ async def _provider_rows_for_sets(
         plan_id=str(args.get("plan_id") or args.get("plan_external_id") or "").strip() or None,
         snapshot_id=str(args.get("snapshot_id") or "").strip() or None,
         source_key=serving_tables.source_key or str(args.get("source_key") or "").strip() or None,
+        **({"min_address_sources": parse_min_address_sources(args)} if parse_min_address_sources(args) else {}),
     )
     if provider_rows is None:
         return None
@@ -13822,6 +13745,7 @@ async def _selected_provider_rows_by_set(
         plan_id=str(args.get("plan_id") or args.get("plan_external_id") or "").strip() or None,
         snapshot_id=snapshot_id,
         source_key=serving_tables.source_key or str(args.get("source_key") or "").strip() or None,
+        **({"min_address_sources": parse_min_address_sources(args)} if parse_min_address_sources(args) else {}),
     )
     if provider_rows is None:
         return None
@@ -13837,6 +13761,7 @@ async def _selected_provider_rows_by_set(
                 dict(matched_location_rows_by_npi[npi]),
                 provider_by_npi.get(npi),
                 "entity_address_unified",
+                **({"min_address_sources": parse_min_address_sources(args)} if parse_min_address_sources(args) else {}),
             )
             for npi in npis
         }
@@ -17318,9 +17243,12 @@ async def _strict_cost_provider_expansion_selection(
         request.target_count,
         request.descending,
     )
-    is_geo_filter_requested = _has_location_filter(
-        dict(args),
-        include_npi=False,
+    is_geo_filter_requested = (
+        _has_location_filter(
+            dict(args),
+            include_npi=False,
+        )
+        or parse_min_address_sources(args) > 0
     )
     cache_key = (
         None
@@ -17914,8 +17842,10 @@ async def _search_manifest_serving_table(
     direct_npi_filter_requested = bool(
         requested_npi is not None and not has_geographic_filter and not is_provider_filter_requested
     )
+    minimum_sources = parse_min_address_sources(args)
+    direct_npi_filter_requested = direct_npi_filter_requested and not minimum_sources
     location_filter_requested = bool(
-        has_geographic_filter or (requested_npi is not None and not direct_npi_filter_requested)
+        has_geographic_filter or minimum_sources or (requested_npi is not None and not direct_npi_filter_requested)
     )
     price_filter_requested = any(
         args.get(field)
@@ -17930,6 +17860,7 @@ async def _search_manifest_serving_table(
             "negotiated_rate",
         )
     )
+    args = normalize_address_source_order(args)
     requested_order = str(args.get("order_by") or "").strip().lower()
     requested_direction = str(args.get("order") or "asc").strip().lower()
     distance_order_fields = {"", "distance", "distance_miles"}
@@ -17971,6 +17902,12 @@ async def _search_manifest_serving_table(
         and effective_provider_order in _PTG2_COST_ORDER_FIELDS
         and (
             not location_filter_requested
+            or (
+                minimum_sources
+                and not has_geographic_filter
+                and bool(getattr(serving_tables, "uses_v4_graph", False))
+                and serving_tables.provider_graph_v4_inferred_taxonomy_candidates is not None
+            )
             or (
                 requested_npi is None
                 and bool(getattr(serving_tables, "uses_v4_graph", False))
@@ -19220,6 +19157,11 @@ async def _provider_procedure_item_context(
         plan_id=search.requested_plan or None,
         snapshot_id=request.snapshot_id,
         source_key=request.args.get("source_key") or None,
+        **(
+            {"min_address_sources": parse_min_address_sources(request.args)}
+            if parse_min_address_sources(request.args)
+            else {}
+        ),
     )
     return _ProviderProcedureItemContext(
         source_provenance_by_key=source_provenance_by_key,
@@ -20151,23 +20093,22 @@ def _factorized_card_frozen_taxonomy(
     *,
     provider_alias: str = "provider",
 ) -> tuple[str, dict[str, Any]]:
-    """Bind the projection-build taxonomy rule to frozen provider cells."""
+    """Bind stored taxonomy and exact address eligibility before card selection."""
 
+    minimum_sources = parse_min_address_sources(args)
+    parameters = {"min_address_sources": minimum_sources} if minimum_sources else {}
+    clauses = [qualifying_cell_sql(provider_alias, minimum_sources)] if minimum_sources else []
     rule = _inferred_provider_taxonomy_rule(dict(args))
-    if rule is None:
-        return "", {}
-    taxonomy_codes = sorted(
-        {str(taxonomy_code).strip().upper() for taxonomy_code in rule.taxonomy_codes if str(taxonomy_code).strip()}
-    )
-    return (
-        f"AND {provider_alias}.entity_type_code = 1 "
-        "AND EXISTS ("
-        f"SELECT 1 FROM unnest({provider_alias}.taxonomy_codes) "
-        "AS stored_taxonomy(taxonomy_code) "
-        "WHERE UPPER(BTRIM(stored_taxonomy.taxonomy_code)) = ANY("
-        "CAST(:taxonomy_codes AS varchar[])))",
-        {"taxonomy_codes": taxonomy_codes},
-    )
+    if rule is not None:
+        parameters["taxonomy_codes"] = sorted(
+            {str(code).strip().upper() for code in rule.taxonomy_codes if str(code).strip()}
+        )
+        clauses.append(
+            f"{provider_alias}.entity_type_code = 1 AND EXISTS ("
+            f"SELECT 1 FROM unnest({provider_alias}.taxonomy_codes) AS stored_taxonomy(taxonomy_code) "
+            "WHERE UPPER(BTRIM(stored_taxonomy.taxonomy_code)) = ANY(CAST(:taxonomy_codes AS varchar[])))"
+        )
+    return ("AND " + " AND ".join(clauses) if clauses else ""), parameters
 
 
 def _factorized_card_provider_fragment(
@@ -20344,7 +20285,7 @@ async def _factorized_card_candidates(
             "membership_limit": _FACTORIZED_CARD_MEMBERSHIP_LIMIT,
             "boundary_offset": max(int(target_count), 1) - 1,
             "candidate_probe_limit": candidate_limit + 1,
-            **taxonomy_parameters,
+            **scoped_address_parameters(taxonomy_parameters),
         },
     )
     return _factorized_card_candidate_selection(
@@ -20505,14 +20446,15 @@ async def _factorized_card_complete_selected_npis(
             "provider_set_limit": _FACTORIZED_CARD_PROVIDER_SET_LIMIT,
             "provider_set_probe_limit": (_FACTORIZED_CARD_PROVIDER_SET_LIMIT + 1),
             "rate_value_limit": _FACTORIZED_CARD_RATE_VALUE_LIMIT,
-            **taxonomy_parameters,
+            **scoped_address_parameters(taxonomy_parameters),
         },
     )
-    return _factorized_card_completion_items(
+    cards = _factorized_card_completion_items(
         completion_result.mappings().all(),
         selected_npis,
         expected_minimum_by_npi,
     )
+    return await qualifying_compact_offices(session, cards, parse_min_address_sources(args))
 
 
 def _factorized_card_projection_id(
@@ -20652,6 +20594,7 @@ async def _search_multi_ptg2_snapshots(
     contributing_bindings: tuple[PlanReleaseSnapshotBinding, ...] | None = None,
 ) -> dict[str, Any] | None:
     """Union attributable network rows into one globally ordered plan page."""
+    args = normalize_address_source_order(args)
     # Pull enough from each network to fill the requested page after the merge:
     # the global window [offset, offset+limit) could be satisfied entirely by a
     # single network, so fetch (offset+limit) rows from each, merge, then slice.
@@ -20998,6 +20941,7 @@ async def search_current_ptg2_index(
 ) -> dict[str, Any] | None:
     """Resolve current plan snapshots and execute a single or multi-network query."""
 
+    args = normalize_address_source_order(args)
     has_release_route, selected_release = await _plan_release_route_selection(
         session,
         args,

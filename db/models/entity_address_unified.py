@@ -38,6 +38,7 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "service_address_key_npi",
     "service_premise_key_npi",
     "address_sources",
+    "source_count",
     # The phone fallback filters "address_key = ANY(..) OR premise_key = ANY(..)";
     # without a premise_key index the OR scans the serving table.
     "premise_key",
@@ -143,6 +144,7 @@ class EntityAddressUnified(Base, JSONOutputMixin):
             "where": "type IN ('primary', 'secondary', 'practice', 'site') AND premise_key IS NOT NULL",
         },
         {"index_elements": ("address_sources",), "using": "gin", "name": "address_sources"},
+        {"index_elements": ("source_count",), "name": "source_count"},
         {"index_elements": ("row_origin",), "name": "row_origin"},
         {"index_elements": ("address_precision",), "name": "address_precision"},
         {"index_elements": ("archive_identity_version",), "name": "archive_identity_version"},

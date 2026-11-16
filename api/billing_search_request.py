@@ -35,6 +35,7 @@ class BillingSearchRequest:
         "__limit",
         "__longitude",
         "__modifiers",
+        "__min_address_sources",
         "__place_of_service",
         "__plan_release_id",
         "__provider_npi",
@@ -83,26 +84,29 @@ class BillingSearchRequest:
     radius_miles = property(lambda self: self.__radius_miles)
     provider_npi = property(lambda self: self.__provider_npi)
     modifiers = property(lambda self: self.__modifiers)
+    min_address_sources = property(lambda self: self.__min_address_sources)
     place_of_service = property(lambda self: self.__place_of_service)
     include_evidence = property(lambda self: self.__include_evidence)
     limit = property(lambda self: self.__limit)
     cursor = property(lambda self: self.__cursor)
     query_pairs = property(lambda self: self.__query_pairs)
-    request_fingerprint_sha256 = property(
-        lambda self: self.__request_fingerprint_sha256
-    )
+    request_fingerprint_sha256 = property(lambda self: self.__request_fingerprint_sha256)
 
     @property
     def geo_args(self) -> dict[str, Any]:
         """Return the validated provider-address GEO selector."""
 
         if self.__zip5 is not None:
-            return {"zip5": self.__zip5}
-        return {
-            "lat": self.__latitude,
-            "long": self.__longitude,
-            "radius_miles": self.__radius_miles,
-        }
+            selector_by_name = {"zip5": self.__zip5}
+        else:
+            selector_by_name = {
+                "lat": self.__latitude,
+                "long": self.__longitude,
+                "radius_miles": self.__radius_miles,
+            }
+        if self.__min_address_sources:
+            selector_by_name["min_address_sources"] = self.__min_address_sources
+        return selector_by_name
 
     @property
     def price_filter_args(self) -> dict[str, Any]:
@@ -143,17 +147,12 @@ def _validated_request_or_none(request: object) -> BillingSearchRequest | None:
     try:
         if type(request) is not BillingSearchRequest:
             return None
-        request_fields_by_name = normalized_billing_search_request_fields(
-            dict(request.query_pairs)
-        )
+        request_fields_by_name = normalized_billing_search_request_fields(dict(request.query_pairs))
         if request_fields_by_name is None:
             return None
         for field_name, expected_value in request_fields_by_name.items():
             actual_value = getattr(request, field_name)
-            if (
-                type(actual_value) is not type(expected_value)
-                or actual_value != expected_value
-            ):
+            if type(actual_value) is not type(expected_value) or actual_value != expected_value:
                 return None
         supplied_state_sha256 = request._BillingSearchRequest__state_sha256
         if type(supplied_state_sha256) is not str or not hmac.compare_digest(
@@ -183,9 +182,7 @@ def parse_billing_search_request(
     request_fields_by_name = normalized_billing_search_request_fields(parameters)
     if request_fields_by_name is None:
         raise request_failure()
-    return validate_billing_search_request(
-        _new_billing_search_request(request_fields_by_name)
-    )
+    return validate_billing_search_request(_new_billing_search_request(request_fields_by_name))
 
 
 __all__ = [

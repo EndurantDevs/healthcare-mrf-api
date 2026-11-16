@@ -3,6 +3,7 @@
 
 from api import ptg2_geo_policy as geo_policy
 from api import ptg2_geo_projection as geo_projection
+from api.address_source_filter import address_source_filter_sql, parse_min_address_sources
 from api.network_address_scope import (
     current_network_address_scope,
     scoped_address_parameters,
@@ -33,6 +34,7 @@ WITH center AS MATERIALIZED (
    ({geography} <-> center.point)/1609.344 AS distance_miles
   FROM {address} addr
   WHERE addr.npi IS NOT NULL AND addr.type IN ('primary','secondary','practice','site')
+   {source_count_sql}
    AND coalesce(addr.address_precision,'')<>'city_zip'
    AND btrim(coalesce(addr.address_precision,'')) NOT IN ('','city_zip')
    AND addr.lat IS NOT NULL AND addr.long IS NOT NULL
@@ -60,10 +62,11 @@ SELECT page.*,counts.candidate_count,counts.unique_count,true AS projection_read
 """
 
 
-def _page_sql(inputs, rates_relation):
+def _page_sql(inputs, rates_relation, minimum_sources=0):
     """Filter admitted source ordinals and held office assurance before KNN limiting."""
     from process.network_em_provider_inputs import em_provider_geo_reads_sql
 
+    minimum_sources = parse_min_address_sources({"min_address_sources": minimum_sources})
     scope = current_network_address_scope()
     if scope is None:
         raise PlanPricingProjectionUnavailable("managed E&M requires a retained network scope")
@@ -95,6 +98,7 @@ def _page_sql(inputs, rates_relation):
         identity=identity,
         point=point,
         evidence=em_provider_geo_reads_sql(evidence, inputs, SCHEMA),
+        source_count_sql=f"AND {address_source_filter_sql('addr', minimum_sources)}" if minimum_sources else "",
     )
 
 
@@ -174,7 +178,7 @@ async def search_managed_em_distance(session, selection, args, pagination, zip5,
             pagination,
             (zip5, latitude, longitude),
             code_index,
-            page_sql=_page_sql(inputs, artifact.rates_relation),
+            page_sql=_page_sql(inputs, artifact.rates_relation, parse_min_address_sources(args)),
             extra_parameters=scoped_address_parameters(
                 {"allowed_binding_ordinals": list(ordinals), "code_index": code_index}
             ),

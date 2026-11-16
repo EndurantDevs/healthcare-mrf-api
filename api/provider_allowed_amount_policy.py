@@ -277,7 +277,7 @@ def allowed_location_join_sql(
     return f"""
     LEFT JOIN LATERAL (
         SELECT
-            addr.npi,
+            provider_rollup.npi AS npi,
             addr.state_name AS state,
             addr.city_name AS city,
             {zip5_sql} AS zip5,

@@ -546,7 +546,7 @@ async def test_indexed_reader_digest_is_independent_of_public_schema_visibility(
         assert await _index_digest(fixture.reader, fixture.schema, plan) != reader[2]
 
 
-async def test_changed_index_definition_refuses_retained_data(indexed_db):
+async def test_optional_index_settings_preserve_retained_data(indexed_db):
     fixture = indexed_db
     target = await _adopt(fixture)
     await _seal(fixture, target)
@@ -555,7 +555,35 @@ async def test_changed_index_definition_refuses_retained_data(indexed_db):
     index = f'"{fixture.legacy.schema_name}".entity_address_unified_idx_geo_idx'
     await fixture.connection.execute("ALTER INDEX " + index + " SET (fillfactor=80)")
     async with fixture.execution_connection.transaction(isolation="repeatable_read", readonly=True):
-        with pytest.raises(NetworkAddressArtifactError, match="indexed_artifact_changed"):
+        relation = await verify_network_address_artifact(fixture.execution_connection, descriptor)
+        assert relation == CompactAddressRelation(**descriptor["table"])
+
+
+@pytest.mark.parametrize(
+    "suffix,definition",
+    [
+        ("npi", "USING btree (inferred_npi)"),
+        ("coalesced_npi", "USING btree (COALESCE(inferred_npi,npi))"),
+        ("primary_npi", "USING btree (npi) WHERE type='secondary'"),
+        (
+            "service_plans_network_array",
+            "USING gin (plans_network_array pg_catalog.array_ops) WHERE type IN ('primary','secondary','practice','site')",
+        ),
+    ],
+)
+async def test_indexed_lookup_requires_current_recipe(indexed_db, suffix, definition):
+    from process.network_membership_serving_indexes import NetworkServingIndexesError
+
+    fixture = indexed_db
+    target = await _adopt(fixture)
+    descriptor = await _address_descriptor(fixture, target)
+    schema = fixture.indexed_source.schema_name
+    name = "entity_address_unified_idx_" + suffix
+    await fixture.connection.execute(f'DROP INDEX "{schema}"."{name}"')
+    await fixture.connection.execute(f'CREATE INDEX "{name}" ON "{schema}".entity_address_unified {definition}')
+
+    async with fixture.execution_connection.transaction(isolation="repeatable_read", readonly=True):
+        with pytest.raises(NetworkServingIndexesError, match="required recipe"):
             await verify_network_address_artifact(fixture.execution_connection, descriptor)
 
 
@@ -873,3 +901,34 @@ async def test_published_reader_cannot_enable_row_level_filtering(indexed_api_db
             native = (await connection.get_raw_connection()).driver_connection
             await native.execute(f"ALTER TABLE {table} {change}")
     assert await _api_rows(held, None) == expected
+
+
+async def test_optional_index_preserves_publication_and_retained_reads(indexed_db):
+    from tests.network_address_index_additions_postgres_support import (
+        check_optional_index_publication_reads,
+    )
+
+    await check_optional_index_publication_reads(indexed_db)
+
+
+@pytest.mark.parametrize("suffix", ["geo_taxonomy", "coalesced_npi"])
+async def test_required_native_index_cannot_be_removed(indexed_db, suffix):
+    from tests.network_address_index_additions_postgres_support import check_required_index_removal
+
+    await check_required_index_removal(indexed_db, suffix)
+
+
+async def test_indexed_dependency_survives_cross_database_copy_without_metadata_changes(indexed_db, record_property):
+    from tests.network_address_index_additions_postgres_support import (
+        check_named_indexed_database_copy,
+    )
+
+    await check_named_indexed_database_copy(indexed_db, record_property)
+
+
+async def test_optional_count_index_concurrent_build_preserves_reads(indexed_db):
+    from tests.network_address_index_additions_postgres_support import (
+        check_concurrent_count_index_reads,
+    )
+
+    await check_concurrent_count_index_reads(indexed_db)

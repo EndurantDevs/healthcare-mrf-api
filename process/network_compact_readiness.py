@@ -121,6 +121,8 @@ def compact_readiness(candidate, report, scope):
 
 async def compact_index_digest(connection, schema_name, *, candidate=None):
     """Bind every native candidate index and require the two compact lookup paths."""
+    from process.network_membership_serving_indexes import _OPTIONAL_SOURCE_COUNT_INDEX
+
     _identifier(schema_name)
     statement = index_catalog_statement(
         """SELECT c.relname AS table_name,ic.relname AS index_name,i.indisvalid,i.indisready,i.indislive,
@@ -137,6 +139,12 @@ async def compact_index_digest(connection, schema_name, *, candidate=None):
     )
     indexes = await connection.fetchval(statement, schema_name)
     indexes = json.loads(indexes) if isinstance(indexes, str) else indexes
+    indexes = [
+        index_record
+        for index_record in indexes
+        if (index_record["table_name"], index_record["index_name"])
+        != ("entity_address_unified", _OPTIONAL_SOURCE_COUNT_INDEX)
+    ]
     _require(
         indexes
         and all(

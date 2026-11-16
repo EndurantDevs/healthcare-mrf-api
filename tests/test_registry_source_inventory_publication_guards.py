@@ -187,6 +187,7 @@ def _index_rows():
     return [
         dict(
             table_name=table,
+            index_name=f"{table}_{'_'.join(columns)}_idx",
             columns=columns,
             indisprimary=primary,
             indisunique=unique,

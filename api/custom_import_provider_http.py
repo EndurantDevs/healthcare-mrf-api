@@ -54,7 +54,7 @@ _PROVIDER_QUERY_FIELDS = frozenset(
     "zip_code postal_code city state classification specialization section display_name codes primary_only "
     "entity_type_code provider_sex_code plan_network has_insurance plan_release_id procedure_codes "
     "procedure_code_system medication_codes medication_code_system year page page_size limit start offset "
-    "order_by include_total include_sources include_evidence debug show view".split()
+    "order_by include_total include_sources include_evidence debug show view min_address_sources".split()
 )
 
 
