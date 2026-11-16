@@ -20,6 +20,7 @@ OUTPUT_ROOTS = (
     "provider_directory_source_resource",
 )
 
+# pg_constraint has no conindid index and FKs elsewhere share the index, so scope constraint_oid by conrelid.
 OUTPUT_CATALOG_SQL = """
 SELECT n.oid::bigint AS schema_oid,c.oid::bigint,c.relname,c.relowner::bigint,
  jsonb_build_object('kind',c.relkind,'persistence',c.relpersistence,'partition',c.relispartition,
@@ -56,7 +57,7 @@ SELECT n.oid::bigint AS schema_oid,c.oid::bigint,c.relname,c.relowner::bigint,
  WHERE (x.num<>0 AND a.attnum IS NULL) OR x.flags<>0
  OR x.collation_oid<>COALESCE(a.attcollation,0)
  OR NOT op.opcdefault OR op.opcnamespace<>'pg_catalog'::regnamespace),
- 'constraint_oid',(SELECT k.oid::bigint FROM pg_constraint k WHERE k.conindid=i.indexrelid))
+ 'constraint_oid',(SELECT k.oid::bigint FROM pg_constraint k WHERE k.conindid=i.indexrelid AND k.conrelid=c.oid))
  ORDER BY i.indexrelid),'[]'::jsonb)
  FROM pg_index i JOIN pg_class idx ON idx.oid=i.indexrelid JOIN pg_am am ON am.oid=idx.relam
  WHERE i.indrelid=c.oid) AS indexes,
