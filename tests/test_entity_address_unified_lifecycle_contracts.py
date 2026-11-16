@@ -38,6 +38,10 @@ def _configure_database_harness(monkeypatch, sql_events):
             return 2
         return 1
 
+    async def first(statement, **_params):
+        sql_events.append(str(statement))
+        return (12, 0, 0) if "formatted_address_source=" in str(statement) else None
+
     async def is_table_present(_schema, table_name):
         return not table_name.endswith("_missing")
 
@@ -52,6 +56,7 @@ def _configure_database_harness(monkeypatch, sql_events):
     monkeypatch.setattr(entity_address.db, "status", record_status)
     monkeypatch.setattr(entity_address.db, "create_table", record_create_table)
     monkeypatch.setattr(entity_address.db, "scalar", scalar)
+    monkeypatch.setattr(entity_address.db, "first", first)
     monkeypatch.setattr(entity_address, "_run_sql_phase", run_sql_phase)
     # Lifecycle effects stay in the SQL log; native COPY has separate connected coverage.
     monkeypatch.setattr(entity_address.prepared_rows.rows, "native_preparation_module", lambda: None)
@@ -206,6 +211,41 @@ async def test_materialization_lifecycle_keeps_publish_separate_and_records_revi
 
 
 @pytest.mark.asyncio
+async def test_reused_raw_stage_prepares_cache_before_alias_validation_without_reloading(monkeypatch):
+    """Retained rows need their distinct cache before alias checks and aggregation."""
+    sql_events, progress, _flags, runtime_options = _configure_materialization_harness(monkeypatch)
+    runtime_options["reuse_raw_stage"] = True
+    raw_table = entity_address._raw_stage_table_name(_StageClass.__tablename__)
+    events = []
+
+    async def prepare(sql, schema, table):
+        assert (sql, schema, table) == (entity_address, "mrf", raw_table)
+        events.append("cache")
+
+    async def validate(schema, table, **options):
+        assert (schema, table) == ("mrf", raw_table)
+        assert events == ["cache"]
+        events.append("aliases")
+
+    prepare_cache = AsyncMock(side_effect=prepare)
+    validate_aliases = AsyncMock(side_effect=validate)
+    load_source = AsyncMock()
+    monkeypatch.setattr(entity_address.address_batches, "prepare_raw", prepare_cache)
+    monkeypatch.setattr(entity_address, "_validate_raw_alias_integrity", validate_aliases)
+    monkeypatch.setattr(entity_address, "_run_prepared_source_phase", load_source)
+    import_context_by_key = {"import_date": "20260724", "context": {"control_run_id": "retained-raw"}}
+    await entity_address.process_data(import_context_by_key, {"publish": False, "limit_per_source": 0})
+    prepare_cache.assert_awaited_once()
+    validate_aliases.assert_awaited_once()
+    load_source.assert_not_called()
+    assert import_context_by_key["context"]["raw_stage_reused"] is True
+    assert import_context_by_key["context"]["raw_stage_reused_rows"] == 1
+    assert import_context_by_key["context"]["staged_rows"] == 12 and events == ["cache", "aliases"]
+    assert any(event["phase"] == "entity-address-unified reusing raw stage" for event in progress)
+    assert not any(f"CREATE UNLOGGED TABLE mrf.{raw_table}" in statement for statement in sql_events)
+
+
+@pytest.mark.asyncio
 async def test_materialization_rejects_dependent_views_before_stage_mutation(
     monkeypatch,
 ):
@@ -283,6 +323,22 @@ async def test_reused_stage_reconciles_current_model_columns(monkeypatch):
     assert import_context_by_key["context"]["stage_reused"] is True
     assert not any(f"DROP TABLE IF EXISTS mrf.{_StageClass.__tablename__};" == statement for statement in sql_events)
     assert "CREATE_STAGE" not in sql_events
+
+
+@pytest.mark.asyncio
+async def test_reused_stage_rejects_pending_labels_before_materialization(monkeypatch):
+    """A failed aggregate cannot be published by bypassing its completion phase."""
+    sql_events, _, flags, _ = _configure_materialization_harness(monkeypatch)
+    flags["HLTHPRT_ENTITY_ADDRESS_UNIFIED_REUSE_STAGE"] = True
+    reader = AsyncMock(return_value=(12, 0, 1))
+    monkeypatch.setattr(entity_address.db, "first", reader)
+    context_by_field = {"import_date": "20260724", "context": {}}
+    with pytest.raises(RuntimeError, match="pending aggregate labels"):
+        await entity_address.process_data(context_by_field, {"publish": False, "limit_per_source": 0})
+    assert not context_by_field["context"].get("stage_reused")
+    assert not context_by_field["context"].get("run")
+    assert "CREATE_STAGE" not in sql_events and not any("TRUNCATE" in statement for statement in sql_events)
+    assert reader.await_count == 1 and "count(*) FILTER" in reader.await_args.args[0]
 
 
 @pytest.mark.asyncio

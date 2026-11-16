@@ -3929,7 +3929,8 @@ def test_entity_address_unified_clear_invalid_coordinates_sql_nulls_bad_pairs():
 def test_entity_address_unified_clears_invalid_coordinates_before_validation():
     source = inspect.getsource(entity_address_unified.shutdown)
 
-    assert source.index("_clear_invalid_coordinates_sql") < source.index("_validate_publish_integrity")
+    assert source.index("_clear_invalid_coordinates_sql") < source.index("_run_publish_validation")
+    assert "_validate_publish_integrity" in inspect.getsource(entity_address_unified._run_publish_validation)
     assert "invalid_coordinate_clear_rows" in source
 
 
@@ -3941,7 +3942,7 @@ def test_provider_directory_partial_keeps_scope_for_all_post_build_mutations():
     same_provider_backfill = source.index("_backfill_same_provider_address_fields_sql")
     invalid_coordinate_clear = source.index("_clear_invalid_coordinates_sql")
     scope_drop = source.index("dropping Provider Directory post-build scope")
-    validation = source.index("_validate_publish_integrity")
+    validation = source.index("_run_publish_validation")
 
     assert same_key_backfill < inherited_backfill < same_provider_backfill
     assert same_provider_backfill < invalid_coordinate_clear < scope_drop < validation

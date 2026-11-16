@@ -127,6 +127,7 @@ mod python_api {
     include!("python_custom_import_graph_projection.rs");
     include!("python_registry.rs");
     include!("python_entity_address_rows.rs");
+    include!("python_address_batch.rs");
     include!("python_retained_fhir_capture.rs");
     include!("python_catalog_observation.rs");
 
@@ -692,6 +693,7 @@ mod python_api {
         m.add_function(wrap_pyfunction!(encode_fhir_network_identity_batch, m)?)?;
         m.add_function(wrap_pyfunction!(validate_network_catalog_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canonicalize_batch, m)?)?;
+        m.add_function(wrap_pyfunction!(prepare_address_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canonicalize_location_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canonicalize_contact_batch, m)?)?;
         m.add_function(wrap_pyfunction!(prepare_entity_address_rows, m)?)?;

@@ -1,18 +1,16 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 
+import importlib
 import json
 import os
-import importlib
 from pathlib import Path
 
 import pytest
 
-from db.models import EntityAddressUnified
-from db.models import db
+from db.models import EntityAddressUnified, db
 from process.ext import address_canon
-from process.ext.utils import make_class
 from process.ext.address_canon import migrate_legacy_archive_to_v2, resolve_into_archive, stamp_address_keys
-
+from process.ext.utils import make_class
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 entity_address_unified = importlib.import_module("process.entity_address_unified")
@@ -60,9 +58,7 @@ async def _archive_v2_rows(schema):
 
 def _resolve_stats_projection(stats):
     reason_counts_by_name = {
-        key: value
-        for key, value in stats.reason_buckets.items()
-        if not key.startswith("canonical_materializer_")
+        key: value for key, value in stats.reason_buckets.items() if not key.startswith("canonical_materializer_")
     }
     return {
         "staged": stats.staged,
@@ -172,15 +168,11 @@ async def test_address_sql_is_parallel_safe():
         ],
     )
     function_flags_by_name = {
-        source_row.proname: (source_row.provolatile, source_row.proparallel)
-        for source_row in source_rows
+        source_row.proname: (source_row.provolatile, source_row.proparallel) for source_row in source_rows
     }
 
     assert function_flags_by_name
-    assert all(
-        canonical_value == ("i", "s")
-        for canonical_value in function_flags_by_name.values()
-    )
+    assert all(canonical_value == ("i", "s") for canonical_value in function_flags_by_name.values())
     assert await db.scalar(f"SELECT {schema}.addr_state_code_v1('Puerto Rico');") == "PR"
     assert await db.scalar(f"SELECT {schema}.addr_state_code_v1('Armed Forces Pacific');") == "AP"
     assert await db.scalar(f"SELECT {schema}.addr_state_code_v1('calif');") is None
@@ -212,36 +204,24 @@ async def test_address_sql_pub28_street_normalization():
     assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('200 Saint Clair Ave', '');") == await db.scalar(
         f"SELECT {schema}.addr_street_norm_v1('200 St Clair Ave', '');"
     )
-    assert await db.scalar(
-        f"SELECT {schema}.addr_street_norm_v1('123 Main St Ste 200', 'Apt 5');"
-    ) == "123mainstste200"
-    assert await db.scalar(
-        f"SELECT {schema}.addr_street_norm_v1('123 Main St Ste 200', 'Suite');"
-    ) == "123mainstste200suite"
+    assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('123 Main St Ste 200', 'Apt 5');") == "123mainstste200"
+    assert (
+        await db.scalar(f"SELECT {schema}.addr_street_norm_v1('123 Main St Ste 200', 'Suite');")
+        == "123mainstste200suite"
+    )
     assert await db.scalar(
         f"SELECT {schema}.addr_street_norm_v1('123 Main St Ste 200', 'West Wing');"
     ) == await db.scalar(f"SELECT {schema}.addr_street_norm_v1('123 Main St Ste 200 West Wing', '');")
-    assert await db.scalar(
-        f"SELECT {schema}.addr_street_norm_v1('123 Main St Suite 100', 'Suite 100');"
-    ) == "123mainst"
-    assert await db.scalar(
-        f"SELECT {schema}.addr_unit_norm_v1('123 Main St Suite 100', 'Suite 100');"
-    ) == "ste100"
-    assert await db.scalar(
-        f"SELECT {schema}.addr_repeated_bare_line2_unit_v1('2227 HALTOM RD STE F', 'F');"
-    ) == "stef"
-    assert await db.scalar(
-        f"SELECT {schema}.addr_street_norm_v1('2227 HALTOM RD STE F', 'F');"
-    ) == "2227haltomrd"
-    assert await db.scalar(
-        f"SELECT {schema}.addr_unit_norm_v1('2227 HALTOM RD STE F', 'F');"
-    ) == "stef"
-    assert await db.scalar(
-        f"SELECT {schema}.addr_unit_norm_v1('209 S HOUSTON AVE DEPT', 'DEPARTMENT');"
-    ) == ""
-    assert await db.scalar(
-        f"SELECT {schema}.addr_street_norm_v1('209 S HOUSTON AVE DEPT', 'DEPARTMENT');"
-    ) == "209shoustonavedeptdepartment"
+    assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('123 Main St Suite 100', 'Suite 100');") == "123mainst"
+    assert await db.scalar(f"SELECT {schema}.addr_unit_norm_v1('123 Main St Suite 100', 'Suite 100');") == "ste100"
+    assert await db.scalar(f"SELECT {schema}.addr_repeated_bare_line2_unit_v1('2227 HALTOM RD STE F', 'F');") == "stef"
+    assert await db.scalar(f"SELECT {schema}.addr_street_norm_v1('2227 HALTOM RD STE F', 'F');") == "2227haltomrd"
+    assert await db.scalar(f"SELECT {schema}.addr_unit_norm_v1('2227 HALTOM RD STE F', 'F');") == "stef"
+    assert await db.scalar(f"SELECT {schema}.addr_unit_norm_v1('209 S HOUSTON AVE DEPT', 'DEPARTMENT');") == ""
+    assert (
+        await db.scalar(f"SELECT {schema}.addr_street_norm_v1('209 S HOUSTON AVE DEPT', 'DEPARTMENT');")
+        == "209shoustonavedeptdepartment"
+    )
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -284,9 +264,12 @@ async def test_address_sql_duplicate_unit_identity():
         );
         """
     )
-    assert await db.scalar(
-        f"SELECT {schema}.addr_identity_key_v1('123 Main St 1st Fl', '1st Floor', 'Austin', 'TX', '78701', 'US');"
-    ) == "v2|123mainst|fl1||TX|78701|US|street"
+    assert (
+        await db.scalar(
+            f"SELECT {schema}.addr_identity_key_v1('123 Main St 1st Fl', '1st Floor', 'Austin', 'TX', '78701', 'US');"
+        )
+        == "v2|123mainst|fl1||TX|78701|US|street"
+    )
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -316,12 +299,14 @@ async def test_address_sql_building_unit_identity():
         );
         """
     )
-    assert await db.scalar(
-        f"SELECT {schema}.addr_street_norm_v1('7281 E EARLL DR STE 1 BLDG A', 'Ste 1 Bldg A');"
-    ) == "7281eearlldrste1"
-    assert await db.scalar(
-        f"SELECT {schema}.addr_unit_norm_v1('7281 E EARLL DR STE 1 BLDG A', 'Ste 1 Bldg A');"
-    ) == "bldga"
+    assert (
+        await db.scalar(f"SELECT {schema}.addr_street_norm_v1('7281 E EARLL DR STE 1 BLDG A', 'Ste 1 Bldg A');")
+        == "7281eearlldrste1"
+    )
+    assert (
+        await db.scalar(f"SELECT {schema}.addr_unit_norm_v1('7281 E EARLL DR STE 1 BLDG A', 'Ste 1 Bldg A');")
+        == "bldga"
+    )
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -351,12 +336,13 @@ async def test_address_sql_office_unit_identity():
         );
         """
     )
-    assert await db.scalar(
-        f"SELECT {schema}.addr_street_norm_v1('1623 3rd Ave Ste 201 Ofc 5', 'Ste 201 Ofc 5');"
-    ) == "16233aveste201"
-    assert await db.scalar(
-        f"SELECT {schema}.addr_unit_norm_v1('1623 3rd Ave Ste 201 Ofc 5', 'Ste 201 Ofc 5');"
-    ) == "ofc5"
+    assert (
+        await db.scalar(f"SELECT {schema}.addr_street_norm_v1('1623 3rd Ave Ste 201 Ofc 5', 'Ste 201 Ofc 5');")
+        == "16233aveste201"
+    )
+    assert (
+        await db.scalar(f"SELECT {schema}.addr_unit_norm_v1('1623 3rd Ave Ste 201 Ofc 5', 'Ste 201 Ofc 5');") == "ofc5"
+    )
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -380,9 +366,7 @@ async def test_address_sql_unit_token_normalization():
         == "ste100"
     )
     assert (
-        await db.scalar(
-            f"SELECT {schema}.addr_street_norm_v1('27 Dr Mellichamp Dr' || chr(160) || 'Ste 100', '');"
-        )
+        await db.scalar(f"SELECT {schema}.addr_street_norm_v1('27 Dr Mellichamp Dr' || chr(160) || 'Ste 100', '');")
         == "27drmellichampdr"
     )
 
@@ -436,9 +420,12 @@ async def test_address_sql_identity_edge_cases():
         )
         == "3e3ea29f-8c26-17ba-dcc8-74424e66fd32"
     )
-    assert await db.scalar(
-        f"SELECT {schema}.addr_identity_key_v1('1 Burrard Street', '', 'Vancouver', 'British Columbia', 'V6B 2W9', 'canada');"
-    ) is None
+    assert (
+        await db.scalar(
+            f"SELECT {schema}.addr_identity_key_v1('1 Burrard Street', '', 'Vancouver', 'British Columbia', 'V6B 2W9', 'canada');"
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -490,18 +477,9 @@ async def _prepare_stamp_resolve_fixture(schema, stage_table):
 
 
 async def _assert_initial_archive_resolution(schema, stage_table, stamped, stats):
-    archive_rows = int(
-        await db.scalar(f"SELECT count(*) FROM {schema}.address_archive_v2;") or 0
-    )
-    stage_keys = int(
-        await db.scalar(
-            f"SELECT count(DISTINCT address_key) FROM {schema}.{stage_table};"
-        )
-        or 0
-    )
-    source_bits = await db.all(
-        f"SELECT DISTINCT source_bits FROM {schema}.address_archive_v2 ORDER BY source_bits;"
-    )
+    archive_rows = int(await db.scalar(f"SELECT count(*) FROM {schema}.address_archive_v2;") or 0)
+    stage_keys = int(await db.scalar(f"SELECT count(DISTINCT address_key) FROM {schema}.{stage_table};") or 0)
+    source_bits = await db.all(f"SELECT DISTINCT source_bits FROM {schema}.address_archive_v2 ORDER BY source_bits;")
     assert (stamped, stage_keys, archive_rows) == (3, 2, 2)
     assert (stats.staged, stats.distinct_keys, stats.inserted) == (3, 2, 2)
     assert stats.null_key_rows == stats.eligible_null_key_rows == 0
@@ -512,11 +490,7 @@ async def _assert_initial_archive_resolution(schema, stage_table, stamped, stats
     assert stats.reason_buckets["unit_conflicts"] == 1
     assert [source_row[0] for source_row in source_bits] == [2]
     premise_keys = int(
-        await db.scalar(
-            f"SELECT count(*) FROM {schema}.address_archive_v2 "
-            "WHERE premise_key IS NOT NULL;"
-        )
-        or 0
+        await db.scalar(f"SELECT count(*) FROM {schema}.address_archive_v2 WHERE premise_key IS NOT NULL;") or 0
     )
     assert premise_keys == 2
 
@@ -558,9 +532,7 @@ async def _assert_existing_archive_rows_skip_formatting(
                 schema=schema,
             )
     finally:
-        await db.status(
-            f"DROP FUNCTION {schema}.{guard_function}(text, text, text, text, text, text);"
-        )
+        await db.status(f"DROP FUNCTION {schema}.{guard_function}(text, text, text, text, text, text);")
     assert stats.inserted == stats.provenance_updates == 0
 
 
@@ -569,31 +541,19 @@ async def _assert_archive_resolution_reruns(schema, stage_table, progress_events
         **_canonical_stage_field_map(),
         "country": "'US'",
     }
-    same_source_stats = await resolve_into_archive(
-        stage_table, field_map, source_bit=2, priority=1, schema=schema
-    )
+    same_source_stats = await resolve_into_archive(stage_table, field_map, source_bit=2, priority=1, schema=schema)
     assert same_source_stats.inserted == same_source_stats.provenance_updates == 0
     assert same_source_stats.gate_sample_rows == []
-    rerun_stats = await resolve_into_archive(
-        stage_table, field_map, source_bit=4, priority=0, schema=schema
-    )
+    rerun_stats = await resolve_into_archive(stage_table, field_map, source_bit=4, priority=0, schema=schema)
     source_bits_after = await db.all(
         f"SELECT DISTINCT source_bits FROM {schema}.address_archive_v2 ORDER BY source_bits;"
     )
-    display_priority = int(
-        await db.scalar(
-            f"SELECT min(display_priority) FROM {schema}.address_archive_v2;"
-        )
-    )
+    display_priority = int(await db.scalar(f"SELECT min(display_priority) FROM {schema}.address_archive_v2;"))
     assert rerun_stats.inserted == 0
     assert rerun_stats.provenance_updates == 2
     assert len(rerun_stats.gate_sample_rows) == 2
-    assert {
-        gate_sample["source_bits"] for gate_sample in rerun_stats.gate_sample_rows
-    } == {6}
-    assert {
-        gate_sample["unit_norm"] for gate_sample in rerun_stats.gate_sample_rows
-    } == {
+    assert {gate_sample["source_bits"] for gate_sample in rerun_stats.gate_sample_rows} == {6}
+    assert {gate_sample["unit_norm"] for gate_sample in rerun_stats.gate_sample_rows} == {
         "ste200",
         "ste310",
     }
@@ -602,9 +562,7 @@ async def _assert_archive_resolution_reruns(schema, stage_table, progress_events
     phases = {event.get("phase") for event in progress_events}
     assert {"address key stamping", "address archive resolve"} <= phases
     assert any(
-        event.get("source") == "address-canonical"
-        and event.get("unit") == "shard"
-        and event.get("total") == 2
+        event.get("source") == "address-canonical" and event.get("unit") == "shard" and event.get("total") == 2
         for event in progress_events
     )
     messages = {event.get("message") for event in progress_events}
@@ -841,25 +799,18 @@ async def _assert_legacy_archive_output(schema: str) -> None:
         """
     )
     assert winner is not None
-    assert winner.formatted_address == (
-        "123 Main Street, Suite 200, Miami, Florida 33156-2814"
-    )
+    assert winner.formatted_address == ("123 Main Street, Suite 200, Miami, Florida 33156-2814")
     assert int(winner.formatted_address_version) == 2
     assert winner.formatted_address_source == "canonical_v2"
     assert str(winner.place_id) == "place-new"
     assert int(winner.source_bits) & 1 == 1
     assert int(winner.display_priority) == 0
-    map_rows = await db.all(
-        f"SELECT checksum FROM {schema}.address_checksum_map ORDER BY checksum;"
-    )
+    map_rows = await db.all(f"SELECT checksum FROM {schema}.address_checksum_map ORDER BY checksum;")
     collision_rows = await db.all(
         f"SELECT checksum, count(*) AS n FROM {schema}.address_checksum_collision GROUP BY checksum;"
     )
     assert [int(source_row.checksum) for source_row in map_rows] == [10, 11]
-    assert [
-        (int(source_row.checksum), int(source_row.n))
-        for source_row in collision_rows
-    ] == [(20, 2)]
+    assert [(int(source_row.checksum), int(source_row.n)) for source_row in collision_rows] == [(20, 2)]
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -1309,6 +1260,42 @@ async def test_resolve_aborts_same_batch_identity_collision(monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("update_existing", [False, True])
+async def test_native_stamp_matches_sql_with_duplicates_and_nulls(monkeypatch, update_existing):
+    from tests.address_batch_postgres_support import assert_stamp_parity
+
+    await assert_stamp_parity(monkeypatch, update_existing)
+
+
+@pytest.mark.asyncio
+async def test_native_stamp_cancellation_preserves_outer_transaction(monkeypatch):
+    from tests.address_batch_postgres_support import assert_stamp_cancellation
+
+    await assert_stamp_cancellation(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_native_distinct_inputs_preserve_null_and_fallback(monkeypatch):
+    from tests.address_batch_postgres_support import assert_distinct_native_nulls
+
+    await assert_distinct_native_nulls(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_native_committed_stage_supports_parallel_readers_and_cancellation(monkeypatch):
+    from tests.address_batch_postgres_support import assert_committed_parallel_visibility
+
+    await assert_committed_parallel_visibility(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_native_unsupported_column_case_uses_sql_fallback(monkeypatch):
+    from tests.address_batch_postgres_support import assert_unsupported_case_fallback
+
+    await assert_unsupported_case_fallback(monkeypatch)
+
+
 async def _prepare_facility_anchor_geocode_fixture(schema, stage_table):
     await db.status(f"DROP TABLE IF EXISTS {schema}.{stage_table};")
     await db.status(
@@ -1379,15 +1366,8 @@ async def _assert_facility_anchor_geocode(schema, stage_table, address_key):
     assert source_row.geo_source == "manual"
     assert source_row.geocode_source == "facility_anchor"
     assert source_row.geocode_quality == "facility_anchor"
-    await db.status(
-        f"UPDATE {schema}.{stage_table} SET latitude = 31.0, longitude = -98.0;"
-    )
-    assert (
-        await facility_anchors._refresh_archive_geocodes_from_facility_anchors(
-            stage_table, schema
-        )
-        == 0
-    )
+    await db.status(f"UPDATE {schema}.{stage_table} SET latitude = 31.0, longitude = -98.0;")
+    assert await facility_anchors._refresh_archive_geocodes_from_facility_anchors(stage_table, schema) == 0
     unchanged = await db.first(
         f"""
         SELECT lat, long
@@ -1504,9 +1484,7 @@ async def test_entity_address_unified_rebuild_includes_mrf_source_with_address_k
     assert source_row["type"] == "practice"
     assert source_row["first_line"] == "10 Market Street"
     assert source_row["city_name"] == "Boston"
-    assert source_row["formatted_address"] == (
-        "10 Market Street, Suite 5, Boston, MA 02108"
-    )
+    assert source_row["formatted_address"] == ("10 Market Street, Suite 5, Boston, MA 02108")
     assert source_row["formatted_address_version"] == 2
     assert source_row["formatted_address_source"] == "canonical_v2"
     assert source_row["address_key"] == str(
@@ -1598,8 +1576,7 @@ async def test_address_canonical_helpers_honor_cancel_before_writes():
     with pytest.raises(RuntimeError, match="cancel requested"):
         await stamp_address_keys(stage_table, field_map, schema=schema, cancel_check=cancel_check)
     keyed_rows = int(
-        await db.scalar(f"SELECT count(*) FROM {schema}.{stage_table} WHERE address_key IS NOT NULL;")
-        or 0
+        await db.scalar(f"SELECT count(*) FROM {schema}.{stage_table} WHERE address_key IS NOT NULL;") or 0
     )
     assert keyed_rows == 0
     await stamp_address_keys(stage_table, field_map, schema=schema)
@@ -1614,3 +1591,245 @@ async def test_address_canonical_helpers_honor_cancel_before_writes():
         )
     archive_rows = int(await db.scalar(f"SELECT count(*) FROM {schema}.address_archive_v2;") or 0)
     assert archive_rows == 0
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_archive_refresh_uses_current_tuple_after_row_lock(monkeypatch):
+    from tests.address_batch_postgres_support import assert_archive_refresh_current_tuple
+
+    await assert_archive_refresh_current_tuple(monkeypatch)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("mode,mixed", [("raw", False), ("direct", False), ("direct", True)])
+async def test_entity_shared_batch_builders_match_sql(monkeypatch, mode, mixed):
+    """Keep ordinary raw/direct parity in the connected canonical CI selection."""
+    from tests.entity_address_batch_postgres_support import compare_builders
+
+    await compare_builders(monkeypatch, mode, mixed=mixed)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_entity_shared_batch_physical_desired_groups(monkeypatch):
+    """Cover real desired pins, group matching, cache extension and evidence parity."""
+    from tests.entity_address_batch_group_support import assert_partial_groups
+
+    await assert_partial_groups(monkeypatch)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("locale,qualified", [("en", True), ("tr", False)])
+async def test_entity_shared_batch_actual_collation(monkeypatch, locale, qualified):
+    """Activate qualified ICU ASCII rows while retaining locale and Unicode SQL."""
+    from tests.entity_address_batch_group_support import assert_source_case_parity
+
+    await assert_source_case_parity(monkeypatch, locale, qualified)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("split", ["false", "true"])
+async def test_entity_shared_batch_inline_evidence(monkeypatch, split):
+    """Exercise raw evidence hashing and both final array aggregation paths."""
+    from tests.entity_address_batch_postgres_support import compare_builders
+
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_SPLIT_ARRAY_AGGREGATES", split)
+    await compare_builders(monkeypatch, "raw_inline", mixed=True)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("failure", ["cancel", "collision"])
+async def test_entity_shared_batch_partial_failure_cleanup(monkeypatch, failure):
+    """Preserve existing relations and clean committed partial inputs on failure."""
+    from tests.entity_address_batch_group_support import assert_partial_failure_cleanup
+
+    await assert_partial_failure_cleanup(monkeypatch, failure)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("has_missing_tuple", [False, True])
+async def test_entity_shared_batch_raw_collation_reuse(monkeypatch, has_missing_tuple):
+    """Never reuse a previous cache across incompatible raw case behavior."""
+    from tests.entity_address_batch_group_support import assert_cached_raw_collation
+
+    await assert_cached_raw_collation(monkeypatch, has_missing_tuple)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_entity_shared_batch_ordinary_owner_activation(monkeypatch):
+    """Prove the actual ordinary owner activates and retires its native cache."""
+    from tests.entity_address_batch_postgres_support import assert_ordinary_cache_activation
+
+    await assert_ordinary_cache_activation(monkeypatch)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("failure", ["alias", "direct"])
+async def test_entity_shared_batch_failure_preserves_candidate(monkeypatch, failure):
+    """Keep alias refusal and direct consumer rollback in required connected CI."""
+    from tests.entity_address_batch_postgres_support import assert_alias_failure_cleanup, assert_direct_failure_rollback
+
+    await (assert_alias_failure_cleanup if failure == "alias" else assert_direct_failure_rollback)(monkeypatch)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("native", [False, True])
+async def test_entity_shared_batch_alias_candidates(monkeypatch, native):
+    """Preserve alias candidate sets, violations and bounded SQL fallback calls."""
+    from tests.entity_address_batch_alias_support import assert_alias_candidate_equivalence
+
+    await assert_alias_candidate_equivalence(monkeypatch, native=native)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_entity_shared_batch_archive_key_reuse(monkeypatch):
+    """Keep accepted native keys out of SQL enrichment and alias fallback arms."""
+    from tests.entity_address_batch_alias_support import assert_native_archive_keys_skip_sql
+
+    await assert_native_archive_keys_skip_sql(monkeypatch)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize(
+    "inline,split,composed",
+    [
+        (False, "false", True),
+        (False, "true", True),
+        (True, "false", True),
+        (True, "true", True),
+        (False, "false", False),
+        (True, "true", False),
+    ],
+)
+async def test_entity_shared_batch_final_aggregate_labels(monkeypatch, inline, split, composed):
+    """Render composed tuples once across final shards without changing output."""
+    from tests.entity_address_aggregation_batch_support import assert_composed_labels_once
+
+    await assert_composed_labels_once(monkeypatch, inline=inline, split=split, composed=composed)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("failure", ["update", "cache", "accounting"])
+async def test_entity_shared_batch_final_aggregate_cleanup(monkeypatch, failure):
+    """Keep interrupted pending candidates unpublished and retire their caches."""
+    from tests.entity_address_aggregation_batch_support import assert_aggregate_failure_cleanup
+
+    await assert_aggregate_failure_cleanup(monkeypatch, failure)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_entity_shared_batch_bound_aggregate_fallback(monkeypatch):
+    """Preserve caller-owned execution without committed native preparation."""
+    from tests.entity_address_aggregation_batch_support import assert_bound_aggregation_fallback
+
+    await assert_bound_aggregation_fallback(monkeypatch)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_entity_shared_batch_accepted_null_label(monkeypatch):
+    """Keep accepted NULL labels complete during counted INSERT and stage reuse."""
+    from tests.entity_address_aggregation_batch_support import assert_native_null_label_is_complete
+
+    await assert_native_null_label_is_complete(monkeypatch)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("packet", [None, (16,), (16, 17)])
+async def test_entity_shared_batch_invalid_insert_accounting(monkeypatch, packet):
+    """Roll back the actual INSERT when its result packet cannot be accepted."""
+    from tests.entity_address_aggregation_batch_support import assert_invalid_insert_packet_rolls_back
+
+    await assert_invalid_insert_packet_rolls_back(monkeypatch, packet)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_entity_shared_batch_pending_native_fallback(monkeypatch):
+    """Complete final labels exactly when native preparation declines."""
+    from tests.entity_address_aggregation_batch_support import assert_pending_preparation_fallback
+
+    await assert_pending_preparation_fallback(monkeypatch)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("failure", [False, True, "cache", "update"])
+async def test_entity_shared_batch_direct_composed_labels(monkeypatch, failure):
+    """Complete direct composed tuples in the original TEMP transaction."""
+    from tests.entity_address_aggregation_batch_support import assert_direct_composed_labels
+
+    await assert_direct_composed_labels(monkeypatch, failure)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("failure", ["consumer", "caller"])
+async def test_entity_shared_batch_projection_readers_drain(monkeypatch, failure):
+    """Keep SQL-only projection cleanup behind all source reader finalization."""
+    from tests.entity_address_batch_group_support import assert_projection_reader_drain
+
+    await assert_projection_reader_drain(monkeypatch, failure)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_entity_shared_batch_run_named_scratch(monkeypatch):
+    """Keep live inputs and both caches in the existing run-reaper naming family."""
+    from tests.entity_address_batch_group_support import assert_run_named_entity_scratch
+
+    await assert_run_named_entity_scratch(monkeypatch)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_entity_shared_batch_counted_shard_failure_drains(monkeypatch):
+    """Drain active counted INSERTs before rollback and exact cache cleanup."""
+    from tests.entity_address_aggregation_batch_support import assert_counted_shard_failure_drains
+
+    await assert_counted_shard_failure_drains(monkeypatch)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize(
+    "packet,error",
+    [
+        ((2, 1), None),
+        ((0, 0), None),
+        (None, "accounting is unavailable"),
+        ((2,), "accounting is unavailable"),
+        ((True, 0), "accounting is unavailable"),
+        ((2, 1.0), "accounting is unavailable"),
+        ((-1, 0), "accounting differs"),
+        ((2, -1), "accounting differs"),
+        ((2, 3), "accounting differs"),
+    ],
+)
+async def test_entity_shared_batch_counted_packet_protocol(packet, error, bound):
+    """Reject malformed counts before commit and never report failed work as done."""
+    from tests.entity_address_aggregation_batch_support import assert_counted_packet_protocol
+
+    await assert_counted_packet_protocol(packet, error, bound)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize(
+    "packet,error",
+    [
+        ((0, 0, 0), None),
+        ((2, 0, 0), None),
+        (None, "accounting is unavailable"),
+        ((2, 0), "accounting is unavailable"),
+        ((2, 1, 0), "address alias generation changed"),
+        ((2, 0, 1), "pending aggregate labels"),
+        ((2, 1, 1), "pending aggregate labels"),
+    ],
+)
+async def test_entity_shared_batch_reuse_packet_protocol(packet, error):
+    """Reject interrupted and stale stage reuse before the publication path resumes."""
+    from tests.entity_address_aggregation_batch_support import assert_reuse_packet_protocol
+
+    await assert_reuse_packet_protocol(packet, error)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("active,admitted", [(False, False), (True, True), (True, False)])
+async def test_entity_shared_batch_direct_completion_protocol(monkeypatch, active, admitted):
+    """Keep admission fallback and skip final-cache work when every row is cached."""
+    from tests.entity_address_aggregation_batch_support import assert_direct_completion_protocol
+
+    await assert_direct_completion_protocol(monkeypatch, active=active, admitted=admitted)

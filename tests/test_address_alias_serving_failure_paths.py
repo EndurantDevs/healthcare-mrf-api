@@ -5,8 +5,8 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 import importlib
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -182,9 +182,7 @@ async def test_unified_raw_stage_rejects_alias_integrity_violation(monkeypatch):
             is_address_canon_available=True,
             context=context_by_field,
         )
-    assert context_by_field["phase_timings"][
-        "entity-address-unified validating aliases"
-    ]["count"] == 1
+    assert context_by_field["phase_timings"]["entity-address-unified validating aliases"]["count"] == 1
 
 
 def _assert_alias_integrity_progress(progress_events):
@@ -196,14 +194,9 @@ def _assert_alias_integrity_progress(progress_events):
         (3, 4, 75.0),
         (4, 4, 100.0),
     ]
-    assert [
-        (event["done"], event["total"], event["stage_pct"])
-        for event in progress_events
-    ] == expected_progress
+    assert [(event["done"], event["total"], event["stage_pct"]) for event in progress_events] == expected_progress
     assert all("pct" not in event for event in progress_events)
-    assert {event["stage_id"] for event in progress_events} == {
-        "entity-address-unified-alias-integrity"
-    }
+    assert {event["stage_id"] for event in progress_events} == {"entity-address-unified-alias-integrity"}
     assert progress_events[1]["elapsed_seconds"] >= 0
     assert progress_events[1]["eta_seconds"] >= 0
     assert progress_events[-1]["eta_seconds"] == 0
@@ -240,17 +233,13 @@ async def test_unified_raw_alias_integrity_shards_are_bounded_and_deterministic(
 
     async def first_result(_statement):
         concurrency_by_field["active"] += 1
-        concurrency_by_field["max"] = max(
-            concurrency_by_field["max"], concurrency_by_field["active"]
-        )
+        concurrency_by_field["max"] = max(concurrency_by_field["max"], concurrency_by_field["active"])
         await asyncio.sleep(0.001)
         concurrency_by_field["active"] -= 1
         return next(violations)
 
     first = AsyncMock(side_effect=first_result)
-    progress_events, progress_started, release_progress, capture_progress = (
-        _blocking_progress_capture(final_only=True)
-    )
+    progress_events, progress_started, release_progress, capture_progress = _blocking_progress_capture(final_only=True)
     monkeypatch.setattr(entity_address_unified.db, "first", first)
     monkeypatch.setattr(entity_address_unified, "write_live_progress", capture_progress)
 
@@ -275,10 +264,7 @@ async def test_unified_raw_alias_integrity_shards_are_bounded_and_deterministic(
     assert "raw.checksum >= -4 AND raw.checksum < -2" in statements[0]
     assert "raw.checksum >= 2 AND raw.checksum < 4" in statements[-1]
     assert all("mrf.addr_key_v1(raw.first_line" in statement for statement in statements)
-    assert all(
-        "active.source_address_key IN" in statement
-        for statement in statements
-    )
+    assert all("active.source_address_key = candidate.address_key" in statement for statement in statements)
     assert concurrency_by_field["max"] == 2
     _assert_alias_integrity_progress(progress_events)
 
@@ -286,9 +272,7 @@ async def test_unified_raw_alias_integrity_shards_are_bounded_and_deterministic(
 @pytest.mark.asyncio
 async def test_unified_raw_alias_integrity_drains_shards_before_database_error(monkeypatch):
     completed_statements = []
-    progress_events, progress_started, release_progress, capture_progress = (
-        _blocking_progress_capture(final_only=False)
-    )
+    progress_events, progress_started, release_progress, capture_progress = _blocking_progress_capture(final_only=False)
 
     async def first_result(statement):
         if "raw.checksum >= -4 AND raw.checksum < -2" in statement:
@@ -390,9 +374,7 @@ async def test_corroboration_fence_rejects_scoped_stale_generation(monkeypatch):
             "mrf",
             "provider_directory_address_corroboration",
             ["synthetic-source"],
-            provider_directory_fhir.ProviderDirectoryArtifactBuildFence(
-                target_oid=None
-            ),
+            provider_directory_fhir.ProviderDirectoryArtifactBuildFence(target_oid=None),
         )
 
 
@@ -419,9 +401,7 @@ async def test_corroboration_fence_requires_overlay_dependency(monkeypatch):
             "mrf",
             "provider_directory_address_corroboration",
             [],
-            provider_directory_fhir.ProviderDirectoryArtifactBuildFence(
-                target_oid=None
-            ),
+            provider_directory_fhir.ProviderDirectoryArtifactBuildFence(target_oid=None),
         )
 
 
@@ -444,27 +424,20 @@ async def test_corroboration_fence_accepts_fenced_overlay_override(monkeypatch):
         AsyncMock(return_value=17),
     )
     relation_override_by_target = {
-        provider_directory_fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE:
-            "provider_directory_address_overlay_stage"
+        provider_directory_fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE: "provider_directory_address_overlay_stage"
     }
-    override_token = (
-        provider_directory_fhir._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
-            relation_override_by_target
-        )
+    override_token = provider_directory_fhir._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
+        relation_override_by_target
     )
     try:
         fence = await provider_directory_fhir._capture_address_corroboration_fence(
             "mrf",
             "provider_directory_address_corroboration",
             [],
-            provider_directory_fhir.ProviderDirectoryArtifactBuildFence(
-                target_oid=5
-            ),
+            provider_directory_fhir.ProviderDirectoryArtifactBuildFence(target_oid=5),
         )
     finally:
-        provider_directory_fhir._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(
-            override_token
-        )
+        provider_directory_fhir._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(override_token)
 
     assert fence.alias_generation == 1
     assert fence.dependency_relation == "provider_directory_address_overlay_stage"

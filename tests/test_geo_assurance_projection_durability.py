@@ -7,7 +7,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -30,7 +30,7 @@ from tests.test_geo_assurance_projection import (
 )
 
 
-def _assert_projection_receipt_order(events, projection_context_by_field, expected_force, progress):
+def _assert_projection_receipt_order(events, projection_context_by_field, expected_force, progress, projected_rows):
     """Keep lock ordering, complete work and row accounting assertions together."""
     settings_at = next(i for i, sql in enumerate(events) if "SET LOCAL lock_timeout" in sql)
     lock_at = next(i for i, sql in enumerate(events) if sql.startswith("LOCK TABLE"))
@@ -42,12 +42,17 @@ def _assert_projection_receipt_order(events, projection_context_by_field, expect
     forced = projection_context_by_field["geo_assurance_forced_full_projection"]
     assert forced is expected_force
     assert projection_context_by_field["invalid_geo_assurance_rows"] == 0
-    assert [call.kwargs["done"] for call in progress.call_args_list] == [0, 7]
+    assert [call.kwargs["done"] for call in progress.call_args_list] == [0, 1]
+    assert all(call.kwargs["total"] == 1 and call.kwargs["unit"] == "operations" for call in progress.call_args_list)
+    assert (
+        projection_context_by_field["phase_timings"]["entity-address-unified projecting geo assurance"]["rows"]
+        == projected_rows
+    )
     assert "row(s)" not in progress.call_args_list[0].kwargs["message"]
-    assert "7 row(s)" in progress.call_args_list[1].kwargs["message"]
+    assert f"{projected_rows} row(s)" in progress.call_args_list[1].kwargs["message"]
 
 
-def _receipt_database(current_projection_available, events):
+def _receipt_database(current_projection_available, events, projected_rows):
     """Keep transaction custody observable in the provider projection fixture."""
 
     class FakeDB:
@@ -67,7 +72,7 @@ def _receipt_database(current_projection_available, events):
         async def status(self, statement):
             assert self._transaction_binding() is not None
             events.append(str(statement))
-            return 7 if "UPDATE fixture.stage AS target" in str(statement) else 0
+            return projected_rows if "UPDATE fixture.stage AS target" in str(statement) else 0
 
         async def scalar(self, statement):
             assert self._transaction_binding() is not None
@@ -85,6 +90,7 @@ def _receipt_database(current_projection_available, events):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("projected_rows", (0, 2, 7))
 @pytest.mark.parametrize(
     ("current_projection_available", "expected_force"),
     ((True, False), (False, True)),
@@ -93,19 +99,20 @@ async def test_projection_receipt_locks_sources_and_forces_stale_reimports(
     monkeypatch,
     current_projection_available,
     expected_force,
+    projected_rows,
 ):
     """Require locking before projection and full work for stale imports."""
     events: list[str] = []
 
-    database = _receipt_database(current_projection_available, events)
+    database = _receipt_database(current_projection_available, events, projected_rows)
     monkeypatch.setattr(entity_address_unified, "db", database)
     monkeypatch.setattr(
         entity_address_unified,
         "_entity_address_sql_settings",
         lambda: [("lock_timeout", "1s")],
     )
-    progress = Mock()
-    monkeypatch.setattr(entity_address_unified, "enqueue_live_progress", progress)
+    progress = AsyncMock()
+    monkeypatch.setattr(entity_address_unified, "_emit_phase_progress", progress)
     projection_context_by_field: dict = {}
     assert (
         await entity_address_unified._materialize_geo_assurance(
@@ -116,10 +123,10 @@ async def test_projection_receipt_locks_sources_and_forces_stale_reimports(
             run_id="run-1",
             stage_rows=7,
         )
-        == 7
+        == projected_rows
     )
     assert database._transaction_binding() is None
-    _assert_projection_receipt_order(events, projection_context_by_field, expected_force, progress)
+    _assert_projection_receipt_order(events, projection_context_by_field, expected_force, progress, projected_rows)
 
 
 @pytest.mark.asyncio
@@ -371,6 +378,8 @@ def _patch_failed_projection(monkeypatch, database, schema: str) -> None:
 async def test_projection_validation_failure_rolls_back_cells_and_state(monkeypatch):
     """Require cell and receipt rollback when projection validation fails."""
 
+    progress = AsyncMock()
+    monkeypatch.setattr(entity_address_unified, "_emit_phase_progress", progress)
     async with _temporary_schema() as (database, schema):
         await database.status(
             f"INSERT INTO {schema}.entity_address_unified "
@@ -399,6 +408,8 @@ async def test_projection_validation_failure_rolls_back_cells_and_state(monkeypa
             await database.scalar(f"SELECT candidate_projected_rows FROM {schema}.entity_address_geo_assurance_state")
             == 99
         )
+        assert progress.await_count == 1
+        assert progress.call_args.kwargs["done"] == 0 and progress.call_args.kwargs["total"] == 1
 
 
 async def _hold_projection_receipt_lock(
@@ -460,3 +471,28 @@ async def test_projection_receipt_lock_blocks_source_swap_and_stale_activation()
             if not swap_task.done():
                 swap_task.cancel()
             await publisher.disconnect()
+
+
+async def test_late_publication_progress_reaches_guarded_run_row(monkeypatch):
+    from tests.entity_address_progress_support import assert_late_progress_persists
+
+    await assert_late_progress_persists(monkeypatch, entity_address_unified)
+
+
+async def test_parallel_stage_index_progress_reports_measured_counts(monkeypatch):
+    from tests.entity_address_progress_support import assert_index_progress_counts
+
+    await assert_index_progress_counts(monkeypatch, entity_address_unified)
+
+
+async def test_failed_late_publication_work_never_reports_completion(monkeypatch):
+    from tests.entity_address_progress_support import assert_failed_phase_stays_incomplete
+
+    await assert_failed_phase_stays_incomplete(monkeypatch, entity_address_unified)
+
+
+@pytest.mark.parametrize("is_failed", (False, True))
+async def test_snapshot_publication_progress_tracks_operation_completion(monkeypatch, is_failed):
+    from tests.entity_address_progress_support import assert_snapshot_publication_progress
+
+    await assert_snapshot_publication_progress(monkeypatch, entity_address_unified, is_failed=is_failed)

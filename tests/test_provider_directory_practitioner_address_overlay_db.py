@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import asyncio
 import importlib
 import importlib.util
 import json
 import os
-from pathlib import Path
 import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pytest
 from sqlalchemy.exc import OperationalError
@@ -20,10 +21,7 @@ unified = importlib.import_module("process.entity_address_unified")
 
 
 CANONICAL_MIGRATION_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "alembic"
-    / "versions"
-    / "20260611100000_address_canonical_foundation.py"
+    Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20260611100000_address_canonical_foundation.py"
 )
 PRACTITIONER_FIXTURE_ROWS = (
     (
@@ -121,8 +119,7 @@ def _require_disposable_database() -> None:
     database = os.getenv("HLTHPRT_DB_DATABASE", "")
     if "test" not in database.rsplit("/", 1)[-1].lower():
         pytest.skip(
-            "Practitioner address overlay DB test requires HLTHPRT_DB_DATABASE "
-            "to name a disposable test database"
+            "Practitioner address overlay DB test requires HLTHPRT_DB_DATABASE to name a disposable test database"
         )
 
 
@@ -141,9 +138,7 @@ async def _temporary_schema(monkeypatch):
         except Exception as exc:
             pytest.skip(f"PostgreSQL test connection is unavailable: {exc}")
         if "test" not in actual_database.lower():
-            pytest.skip(
-                "Practitioner address overlay DB test connected to a non-disposable database"
-            )
+            pytest.skip("Practitioner address overlay DB test connected to a non-disposable database")
         await database.status(f'CREATE SCHEMA "{schema}";')
         is_schema_created = True
         monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
@@ -215,8 +210,7 @@ def _assert_practitioner_overlay_row(
 ) -> None:
     """Assert the normalized practitioner overlay fixture."""
     assert overlay_stage_mapping["source_record_id"] == (
-        "provider_directory_fhir:practitioner_address:"
-        "source-target:practitioner-good:1"
+        "provider_directory_fhir:practitioner_address:source-target:practitioner-good:1"
     )
     assert overlay_stage_mapping["source_id"] == "source-target"
     assert overlay_stage_mapping["last_seen_run_id"] == "run-current"
@@ -232,6 +226,13 @@ def _assert_practitioner_overlay_row(
     assert overlay_stage_mapping["fax_number_digits"] == "3125550199"
 
 
+async def _assert_absent_fixture_table(database, schema, table):
+    """Prove the component query cannot rely on an unrelated input family."""
+    assert (
+        await database.scalar("SELECT to_regclass(:relation_name) IS NULL;", relation_name=f"{schema}.{table}") is True
+    )
+
+
 @pytest.mark.asyncio
 async def test_practitioner_address_overlay_executes_scoped_sql_in_isolated_schema(
     monkeypatch,
@@ -243,14 +244,8 @@ async def test_practitioner_address_overlay_executes_scoped_sql_in_isolated_sche
         await _create_fixture_tables(database, schema, stage_table)
         await _insert_practitioner_rows(database, schema)
 
-        assert await database.scalar(
-            "SELECT to_regclass(:relation_name) IS NULL;",
-            relation_name=f"{schema}.provider_directory_location",
-        ) is True
-        assert await database.scalar(
-            "SELECT to_regclass(:relation_name) IS NULL;",
-            relation_name=f"{schema}.provider_directory_practitioner_role",
-        ) is True
+        await _assert_absent_fixture_table(database, schema, "provider_directory_location")
+        await _assert_absent_fixture_table(database, schema, "provider_directory_practitioner_role")
 
         sql = importer._address_overlay_component_insert_sql(
             schema,
@@ -343,29 +338,47 @@ async def _seed_cms_dataset_scope_tables(database: Database, schema_name: str) -
         ("cms_new_resources", "run-new", "20 New Road"),
     ):
         addresses = [
-            {"line": [first_line], "city": "Austin", "state": "TX",
-             "postal_code": "78701", "use": "work", "type": "physical"},
-            {"line": ["PO Box 15"], "city": "Austin", "state": "TX",
-             "postal_code": "78701", "use": "billing", "type": "postal"},
+            {
+                "line": [first_line],
+                "city": "Austin",
+                "state": "TX",
+                "postal_code": "78701",
+                "use": "work",
+                "type": "physical",
+            },
+            {
+                "line": ["PO Box 15"],
+                "city": "Austin",
+                "state": "TX",
+                "postal_code": "78701",
+                "use": "billing",
+                "type": "postal",
+            },
         ]
         await database.status(
             f'INSERT INTO "{schema_name}"."{scoped_relation}" '
-            '(source_id, resource_id, npi, active, telecom, addresses, last_seen_run_id) '
+            "(source_id, resource_id, npi, active, telecom, addresses, last_seen_run_id) "
             "VALUES ('cms-npd', 'practitioner-1', 1234567890, true, '[]'::jsonb, "
-            'CAST(:addresses AS jsonb), :run_id)',
-            addresses=json.dumps(addresses), run_id=run_id,
+            "CAST(:addresses AS jsonb), :run_id)",
+            addresses=json.dumps(addresses),
+            run_id=run_id,
         )
 
 
 async def _insert_selected_cms_address(
-    database: Database, schema_name: str, scoped_relation: str, overlay_relation: str,
+    database: Database,
+    schema_name: str,
+    scoped_relation: str,
+    overlay_relation: str,
 ) -> int:
     token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
         {"provider_directory_practitioner": scoped_relation}
     )
     try:
         sql = importer._address_overlay_component_insert_sql(
-            schema_name, overlay_relation, component="practitioner_address",
+            schema_name,
+            overlay_relation,
+            component="practitioner_address",
             source_ids=["cms-npd"],
         )
         return await database.status(sql, source_ids=["cms-npd"])
@@ -375,22 +388,20 @@ async def _insert_selected_cms_address(
 
 async def _seed_current_cms_dataset(database: Database, schema_name: str) -> None:
     await database.status(
-        f'CREATE TABLE "{schema_name}"."provider_directory_source" '
-        '(source_id varchar PRIMARY KEY, endpoint_id varchar)'
+        f'CREATE TABLE "{schema_name}"."provider_directory_source" (source_id varchar PRIMARY KEY, endpoint_id varchar)'
     )
     await database.status(
         f'CREATE TABLE "{schema_name}"."provider_directory_endpoint_dataset" '
-        '(dataset_id varchar PRIMARY KEY, endpoint_id varchar, is_current boolean, '
-        'acquisition_root_run_id varchar, import_run_id varchar, status varchar, '
-        'published_at timestamp, superseded_at timestamp)'
+        "(dataset_id varchar PRIMARY KEY, endpoint_id varchar, is_current boolean, "
+        "acquisition_root_run_id varchar, import_run_id varchar, status varchar, "
+        "published_at timestamp, superseded_at timestamp)"
     )
     await database.status(
         f'CREATE TABLE "{schema_name}"."provider_directory_dataset_resource" '
-        '(dataset_id varchar, resource_type varchar, resource_id varchar)'
+        "(dataset_id varchar, resource_type varchar, resource_id varchar)"
     )
     await database.status(
-        f'INSERT INTO "{schema_name}"."provider_directory_source" '
-        "VALUES ('cms-npd', 'cms-endpoint')"
+        f"INSERT INTO \"{schema_name}\".\"provider_directory_source\" VALUES ('cms-npd', 'cms-endpoint')"
     )
     await database.status(
         f'INSERT INTO "{schema_name}"."provider_directory_endpoint_dataset" '
@@ -405,7 +416,10 @@ async def _seed_current_cms_dataset(database: Database, schema_name: str) -> Non
 
 async def _cms_partial_first_lines(database: Database, schema_name: str) -> list[str]:
     partial_sql = unified._provider_directory_partial_overlay_source_select(
-        f'"{schema_name}"', {}, source_ids=["cms-npd"], run_id="run-new",
+        f'"{schema_name}"',
+        {},
+        source_ids=["cms-npd"],
+        run_id="run-new",
     )
     selected_rows = await database.all(f"SELECT first_line FROM ({partial_sql}) AS selected")
     return [selected_row[0] for selected_row in selected_rows]
@@ -429,24 +443,25 @@ async def test_cms_physical_address_overlay_replaces_only_its_selected_generatio
             f"'other-1', 1234567891, \"{schema_name}\".addr_key_v1("
             "'30 Other Road', NULL, 'Austin', 'TX', '78701', 'US'), 'street')"
         )
-        assert await _insert_selected_cms_address(
-            database, schema_name, "cms_old_resources", "provider_directory_address_overlay"
-        ) == 1
-        assert await database.scalar(
-            f"SELECT count(*) FROM {published_overlay} WHERE source_id='cms-npd'"
-        ) == 1
-        new_overlay_stage = f'"{schema_name}"."cms_new_stage"'
-        assert await importer._copy_existing_address_overlay(
-            new_overlay_stage, published_overlay, overlay_columns, ["cms-npd"]
-        ) == 1
-        assert await _insert_selected_cms_address(
-            database, schema_name, "cms_new_resources", "cms_new_stage"
-        ) == 1
-        overlay_rows = await database.all(
-            f"SELECT source_id, first_line FROM {new_overlay_stage} ORDER BY source_id"
+        assert (
+            await _insert_selected_cms_address(
+                database, schema_name, "cms_old_resources", "provider_directory_address_overlay"
+            )
+            == 1
         )
+        assert await database.scalar(f"SELECT count(*) FROM {published_overlay} WHERE source_id='cms-npd'") == 1
+        new_overlay_stage = f'"{schema_name}"."cms_new_stage"'
+        assert (
+            await importer._copy_existing_address_overlay(
+                new_overlay_stage, published_overlay, overlay_columns, ["cms-npd"]
+            )
+            == 1
+        )
+        assert await _insert_selected_cms_address(database, schema_name, "cms_new_resources", "cms_new_stage") == 1
+        overlay_rows = await database.all(f"SELECT source_id, first_line FROM {new_overlay_stage} ORDER BY source_id")
         assert [(overlay_row[0], overlay_row[1]) for overlay_row in overlay_rows] == [
-            ("cms-npd", "20 New Road"), ("other-source", None)
+            ("cms-npd", "20 New Road"),
+            ("other-source", None),
         ]
         await _seed_current_cms_dataset(database, schema_name)
         assert await _cms_partial_first_lines(database, schema_name) == []
@@ -456,18 +471,17 @@ async def test_cms_physical_address_overlay_replaces_only_its_selected_generatio
             f"SELECT {overlay_columns} FROM {new_overlay_stage} WHERE source_id='cms-npd'"
         )
         assert await _cms_partial_first_lines(database, schema_name) == ["20 New Road"]
-        await database.status(
-            f'DELETE FROM "{schema_name}"."provider_directory_dataset_resource"'
-        )
+        await database.status(f'DELETE FROM "{schema_name}"."provider_directory_dataset_resource"')
         assert await _cms_partial_first_lines(database, schema_name) == []
         await database.status(importer.provider_directory_address_overlay_table_sql(schema_name, "cms_empty_stage"))
         empty_overlay_stage = f'"{schema_name}"."cms_empty_stage"'
-        assert await importer._copy_existing_address_overlay(
-            empty_overlay_stage, published_overlay, overlay_columns, ["cms-npd"]
-        ) == 1
-        assert await _insert_selected_cms_address(
-            database, schema_name, "cms_empty_resources", "cms_empty_stage"
-        ) == 0
+        assert (
+            await importer._copy_existing_address_overlay(
+                empty_overlay_stage, published_overlay, overlay_columns, ["cms-npd"]
+            )
+            == 1
+        )
+        assert await _insert_selected_cms_address(database, schema_name, "cms_empty_resources", "cms_empty_stage") == 0
         assert await database.scalar(f"SELECT count(*) FROM {empty_overlay_stage}") == 1
 
 
@@ -482,81 +496,93 @@ async def test_cms_organization_overlay_excludes_postal_address(monkeypatch):
             "source_id varchar, resource_id varchar, npi bigint, active boolean, "
             "address_json jsonb, telecom jsonb, last_seen_run_id varchar, updated_at timestamp)"
         )
-        await database.status(
-            importer.provider_directory_address_overlay_table_sql(schema_name, "cms_org_stage")
-        )
+        await database.status(importer.provider_directory_address_overlay_table_sql(schema_name, "cms_org_stage"))
         addresses = [
-            {"line": ["10 Care Lane"], "city": "Austin", "state": "TX",
-             "postalCode": "78701", "use": "work", "type": "physical"},
-            {"line": ["PO Box 20"], "city": "Austin", "state": "TX",
-             "postalCode": "78701", "use": "billing", "type": "postal"},
+            {
+                "line": ["10 Care Lane"],
+                "city": "Austin",
+                "state": "TX",
+                "postalCode": "78701",
+                "use": "work",
+                "type": "physical",
+            },
+            {
+                "line": ["PO Box 20"],
+                "city": "Austin",
+                "state": "TX",
+                "postalCode": "78701",
+                "use": "billing",
+                "type": "postal",
+            },
         ]
         await database.status(
             f'INSERT INTO "{schema_name}"."provider_directory_organization" '
-            '(source_id, resource_id, npi, active, address_json, telecom, last_seen_run_id) '
+            "(source_id, resource_id, npi, active, address_json, telecom, last_seen_run_id) "
             "VALUES ('cms-npd', 'organization-1', 1234567890, true, "
             "CAST(:addresses AS jsonb), '[]'::jsonb, 'run-current')",
             addresses=json.dumps(addresses),
         )
         inserted = await database.status(
             importer._address_overlay_component_insert_sql(
-                schema_name, "cms_org_stage", component="organization_address",
+                schema_name,
+                "cms_org_stage",
+                component="organization_address",
                 source_ids=["cms-npd"],
             ),
             source_ids=["cms-npd"],
         )
         assert inserted == 1
-        assert await database.scalar(
-            f'SELECT first_line FROM "{schema_name}"."cms_org_stage"'
-        ) == "10 Care Lane"
+        assert await database.scalar(f'SELECT first_line FROM "{schema_name}"."cms_org_stage"') == "10 Care Lane"
 
 
 async def _seed_cms_role_location_rows(database: Database, schema_name: str) -> None:
     await database.status(
         f'CREATE TABLE "{schema_name}"."provider_directory_practitioner_role" ('
-        'source_id varchar, resource_id varchar, npi bigint, active boolean, '
-        'practitioner_ref varchar, location_refs jsonb, healthcare_service_refs jsonb, '
-        'telecom jsonb, last_seen_run_id varchar, updated_at timestamp)'
+        "source_id varchar, resource_id varchar, npi bigint, active boolean, "
+        "practitioner_ref varchar, location_refs jsonb, healthcare_service_refs jsonb, "
+        "telecom jsonb, last_seen_run_id varchar, updated_at timestamp)"
     )
     await database.status(
         f'CREATE TABLE "{schema_name}"."provider_directory_healthcare_service" ('
-        'source_id varchar, resource_id varchar, location_refs jsonb)'
+        "source_id varchar, resource_id varchar, location_refs jsonb)"
     )
     await database.status(
         f'CREATE TABLE "{schema_name}"."provider_directory_location" ('
-        'source_id varchar, resource_id varchar, mode varchar, status varchar, '
-        'addresses jsonb, address_key varchar, first_line varchar, second_line varchar, '
-        'city_name varchar, state_name varchar, state_code varchar, postal_code varchar, '
-        'country_code varchar, telephone_number varchar, fax_number varchar, '
-        'phone_number varchar, fax_number_digits varchar, latitude varchar, '
-        'longitude varchar, updated_at timestamp)'
+        "source_id varchar, resource_id varchar, mode varchar, status varchar, "
+        "addresses jsonb, address_key varchar, first_line varchar, second_line varchar, "
+        "city_name varchar, state_name varchar, state_code varchar, postal_code varchar, "
+        "country_code varchar, telephone_number varchar, fax_number varchar, "
+        "phone_number varchar, fax_number_digits varchar, latitude varchar, "
+        "longitude varchar, updated_at timestamp)"
     )
     await database.status(
         f'INSERT INTO "{schema_name}"."provider_directory_practitioner" '
-        '(source_id, resource_id, npi, active, telecom) '
+        "(source_id, resource_id, npi, active, telecom) "
         "VALUES ('cms-npd', 'practitioner-1', 1234567890, true, '[]'::jsonb)"
     )
     await database.status(
         f'INSERT INTO "{schema_name}"."provider_directory_practitioner_role" '
-        '(source_id, resource_id, practitioner_ref, location_refs, '
-        'healthcare_service_refs, telecom, last_seen_run_id) '
+        "(source_id, resource_id, practitioner_ref, location_refs, "
+        "healthcare_service_refs, telecom, last_seen_run_id) "
         "VALUES ('cms-npd', 'role-1', 'Practitioner/practitioner-1', "
-        "'[\"Location/kind\",\"Location/postal\",\"Location/physical\"]'::jsonb, "
+        '\'["Location/kind","Location/postal","Location/physical"]\'::jsonb, '
         "'[]'::jsonb, '[]'::jsonb, 'run-current')"
     )
     for resource_id, mode, use, address_type in (
-        ('kind', 'kind', 'work', 'physical'),
-        ('postal', 'instance', 'billing', 'postal'),
-        ('physical', 'instance', 'work', 'physical'),
+        ("kind", "kind", "work", "physical"),
+        ("postal", "instance", "billing", "postal"),
+        ("physical", "instance", "work", "physical"),
     ):
         await database.status(
             f'INSERT INTO "{schema_name}"."provider_directory_location" '
-            '(source_id, resource_id, mode, addresses, first_line, city_name, '
-            'state_name, postal_code) VALUES '
+            "(source_id, resource_id, mode, addresses, first_line, city_name, "
+            "state_name, postal_code) VALUES "
             "('cms-npd', :resource_id, :mode, CAST(:addresses AS jsonb), "
             ":first_line, 'Austin', 'TX', '78701')",
-            resource_id=resource_id, mode=mode, first_line=f'{resource_id} Road',
-            addresses=json.dumps([{'use': use, 'type': address_type}]),
+            resource_id=resource_id,
+            mode=mode,
+            first_line=f"{resource_id} Road",
+            addresses=json.dumps([{"use": use, "type": address_type}]),
         )
 
 
@@ -566,19 +592,19 @@ async def test_cms_role_overlay_ignores_abstract_and_postal_locations(monkeypatc
 
     async with _temporary_schema(monkeypatch) as (database, schema_name):
         await _install_canonical_functions(database, schema_name)
-        await _create_fixture_tables(database, schema_name, 'cms_role_stage')
+        await _create_fixture_tables(database, schema_name, "cms_role_stage")
         await _seed_cms_role_location_rows(database, schema_name)
         inserted = await database.status(
             importer._address_overlay_component_insert_sql(
-                schema_name, 'cms_role_stage', component='practitioner_role',
-                source_ids=['cms-npd'],
+                schema_name,
+                "cms_role_stage",
+                component="practitioner_role",
+                source_ids=["cms-npd"],
             ),
-            source_ids=['cms-npd'],
+            source_ids=["cms-npd"],
         )
         assert inserted == 1
-        assert await database.scalar(
-            f'SELECT first_line FROM "{schema_name}"."cms_role_stage"'
-        ) == 'physical Road'
+        assert await database.scalar(f'SELECT first_line FROM "{schema_name}"."cms_role_stage"') == "physical Road"
 
 
 @pytest.mark.asyncio
@@ -613,6 +639,198 @@ async def test_cms_role_overlay_rejects_nonlocal_or_wrong_kind_references(monkey
 
 
 @pytest.mark.asyncio
+async def test_native_overlay_labels_match_without_rewriting(monkeypatch):
+    from tests import provider_directory_address_batch_support as support
+
+    async with support.overlay_fixture(monkeypatch) as (database, schema):
+        await support.insert_practitioner_labels(database, schema, "sql_labels")
+        await importer._backfill_address_overlay_stage_formatted_addresses(schema, f'"{schema}".sql_labels')
+        async with support.batch.scope(importer, schema, "run-control", ["source-target"], ("practitioner_address",)):
+            assert support.batch.current() is not None
+            await support.insert_practitioner_labels(database, schema, "native_labels")
+            assert (
+                await importer._backfill_address_overlay_stage_formatted_addresses(
+                    schema, f'"{schema}".native_labels', source_ids=["source-target"]
+                )
+                == 0
+            )
+        assert await support.label_rows(database, schema, "native_labels") == await support.label_rows(
+            database, schema, "sql_labels"
+        )
+        assert await support.remaining_batch_tables(database, schema) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("move_address", [False, True])
+async def test_native_overlay_repairs_changed_and_unsupported_labels(monkeypatch, move_address):
+    from tests import provider_directory_address_batch_support as support
+
+    async with support.overlay_fixture(monkeypatch) as (database, schema):
+        await support.insert_practitioner_labels(database, schema, "sql_labels")
+        async with support.batch.scope(importer, schema, "run-control", ["source-target"], ("practitioner_address",)):
+            await support.insert_practitioner_labels(database, schema, "native_labels")
+            await database.status(
+                f"UPDATE \"{schema}\".native_labels SET formatted_address='stale', "
+                "formatted_address_version=0,formatted_address_source='old'"
+            )
+            if move_address:
+                for table in ("sql_labels", "native_labels"):
+                    await database.status(
+                        f"UPDATE \"{schema}\".{table} SET first_line='300 New Street' "
+                        "WHERE resource_id='practitioner-good'"
+                    )
+            expected = await database.scalar(f'SELECT count(*) FROM "{schema}".native_labels')
+            assert expected > 0
+            assert (
+                await importer._backfill_address_overlay_stage_formatted_addresses(
+                    schema, f'"{schema}".native_labels', source_ids=["source-target"]
+                )
+                == expected
+            )
+        await importer._backfill_address_overlay_stage_formatted_addresses(schema, f'"{schema}".sql_labels')
+        assert await support.label_rows(database, schema, "native_labels") == await support.label_rows(
+            database, schema, "sql_labels"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RuntimeError, asyncio.CancelledError])
+async def test_native_overlay_failure_preserves_serving_rows(monkeypatch, error):
+    from tests import provider_directory_address_batch_support as support
+
+    async with support.overlay_fixture(monkeypatch) as (database, schema):
+        with pytest.raises(error):
+            async with support.batch.scope(
+                importer, schema, "run-control", ["source-target"], ("practitioner_address",)
+            ):
+                await support.insert_practitioner_labels(database, schema, "native_labels")
+                raise error()
+        assert await support.label_rows(database, schema, "sql_labels") == []
+        assert await support.remaining_batch_tables(database, schema) == 0
+
+
+@pytest.mark.asyncio
+async def test_native_overlay_ignores_excluded_invalid_json(monkeypatch):
+    from tests import provider_directory_address_batch_support as support
+
+    async with support.overlay_fixture(monkeypatch) as (database, schema):
+        await database.status(
+            f'UPDATE "{schema}".provider_directory_practitioner SET addresses=\'{{"not":"an array"}}\'::jsonb '
+            "WHERE resource_id IN ('practitioner-invalid-npi','practitioner-inactive','practitioner-old-run')"
+        )
+        await support.insert_practitioner_labels(database, schema, "sql_labels", run_id="run-current")
+        await importer._backfill_address_overlay_stage_formatted_addresses(schema, f'"{schema}".sql_labels')
+        async with support.batch.scope(importer, schema, "run-current", ["source-target"], ("practitioner_address",)):
+            await support.insert_practitioner_labels(database, schema, "native_labels", run_id="run-current")
+        assert await support.label_rows(database, schema, "native_labels") == await support.label_rows(
+            database, schema, "sql_labels"
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_overlay_keeps_progress_writes_independent(monkeypatch):
+    from tests import provider_directory_address_batch_support as support
+
+    async with support.overlay_fixture(monkeypatch) as (database, schema):
+        await database.status(f'CREATE TABLE "{schema}".control_progress(id int PRIMARY KEY,message text)')
+        await database.status(f"INSERT INTO \"{schema}\".control_progress VALUES(1,'queued')")
+        observer = Database()
+        await observer.connect()
+        try:
+            async with support.batch.scope(
+                importer, schema, "run-control", ["source-target"], ("practitioner_address",)
+            ):
+                assert support.batch.current() is not None
+                await database.status(f"UPDATE \"{schema}\".control_progress SET message='publishing' WHERE id=1")
+                assert (
+                    await observer.scalar(f'SELECT message FROM "{schema}".control_progress WHERE id=1') == "publishing"
+                )
+                async with observer.transaction():
+                    await observer.status("SET LOCAL lock_timeout='100ms'")
+                    assert (
+                        await observer.status(
+                            f"UPDATE \"{schema}\".control_progress SET message='heartbeat' WHERE id=1"
+                        )
+                        == 1
+                    )
+        finally:
+            await observer.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("move_location", [False, True])
+async def test_native_location_fields_match_current_sql(monkeypatch, move_location):
+    from tests import provider_directory_address_batch_support as support
+    from tests.test_provider_directory_address_overlay_keys_db import _publish_sql_keyed_rows
+
+    async with support.location_overlay_fixture(monkeypatch) as (database, schema, components):
+        stage_pages = importer.overlay_keys._stage_location_key_pages
+
+        async def prepare_then_move(*arguments):
+            count = await stage_pages(*arguments)
+            if move_location:
+                await database.status(
+                    f"UPDATE \"{schema}\".provider_directory_location SET first_line='200 Oak Street' "
+                    "WHERE resource_id='physical'"
+                )
+            return count
+
+        monkeypatch.setattr(importer.overlay_keys, "_stage_location_key_pages", prepare_then_move)
+        with importer.overlay_keys.build_scope("run-control", None):
+            async with support.batch.scope(importer, schema, None, ["cms-npd"], components):
+                await importer.overlay_keys.insert_components(
+                    importer, schema, "batch_stage", None, ["cms-npd"], {"source_ids": ["cms-npd"]}, components
+                )
+                assert (
+                    await importer._backfill_address_overlay_stage_formatted_addresses(
+                        schema, f'"{schema}".batch_stage', source_ids=["cms-npd"]
+                    )
+                    == 0
+                )
+        await _publish_sql_keyed_rows(database, schema, "sql_current", components, {"source_ids": ["cms-npd"]})
+        await importer._backfill_address_overlay_stage_formatted_addresses(schema, f'"{schema}".sql_current')
+        assert await support.label_rows(database, schema, "batch_stage") == await support.label_rows(
+            database, schema, "sql_current"
+        )
+        assert await support.remaining_batch_tables(database, schema) == 0
+
+
+@pytest.mark.asyncio
+async def test_native_overlay_respects_unsupported_case_fallback(monkeypatch):
+    from tests import provider_directory_address_batch_support as support
+    from tests.test_provider_directory_address_overlay_keys_db import _publish_sql_keyed_rows
+
+    async with support.location_overlay_fixture(monkeypatch) as (database, schema, components):
+        collation = await database.scalar(
+            "SELECT collname FROM pg_collation WHERE collname IN ('tr-x-icu','tr-TR-x-icu') LIMIT 1"
+        )
+        if collation is None:
+            pytest.skip("Turkish ICU collation is unavailable")
+        await database.status(
+            f'ALTER TABLE "{schema}".provider_directory_location ALTER city_name TYPE varchar '
+            f"COLLATE {importer._q(collation)}"
+        )
+        await database.status(f"UPDATE \"{schema}\".provider_directory_location SET city_name='IZMIR'")
+        messages = []
+
+        async def record_step(*, message):
+            messages.append(message)
+
+        with importer.overlay_keys.build_scope("run-control", record_step):
+            async with support.batch.scope(importer, schema, None, ["cms-npd"], components):
+                assert support.batch.current() is None
+                await importer.overlay_keys.insert_components(
+                    importer, schema, "batch_stage", None, ["cms-npd"], {"source_ids": ["cms-npd"]}, components
+                )
+        assert "keyed locations rows=0" in messages[0]
+        await _publish_sql_keyed_rows(database, schema, "sql_current", components, {"source_ids": ["cms-npd"]})
+        assert await support.label_rows(database, schema, "batch_stage") == await support.label_rows(
+            database, schema, "sql_current"
+        )
+        assert await support.remaining_batch_tables(database, schema) == 0
+
+
+@pytest.mark.asyncio
 async def test_cms_affiliation_overlay_rejects_nonlocal_or_wrong_kind_references(monkeypatch):
     async with _temporary_schema(monkeypatch) as (database, schema_name):
         await _install_canonical_functions(database, schema_name)
@@ -636,7 +854,7 @@ async def test_cms_affiliation_overlay_rejects_nonlocal_or_wrong_kind_references
         await database.status(
             f'INSERT INTO "{schema_name}"."provider_directory_organization_affiliation" '
             "VALUES ('cms-npd', 'aff-1', true, 'Organization/org-1', NULL, "
-            "'[\"Location/kind\",\"Location/postal\",\"Location/physical\"]'::jsonb, "
+            '\'["Location/kind","Location/postal","Location/physical"]\'::jsonb, '
             "'[]'::jsonb, '[]'::jsonb, 'run-current', now())"
         )
         await database.status(
@@ -647,9 +865,9 @@ async def test_cms_affiliation_overlay_rejects_nonlocal_or_wrong_kind_references
             schema_name, "cms_affiliation_stage", component="organization_affiliation", source_ids=["cms-npd"]
         )
         assert await database.status(insert_sql, source_ids=["cms-npd"]) == 1
-        assert await database.scalar(
-            f'SELECT first_line FROM "{schema_name}"."cms_affiliation_stage"'
-        ) == "physical Road"
+        assert (
+            await database.scalar(f'SELECT first_line FROM "{schema_name}"."cms_affiliation_stage"') == "physical Road"
+        )
         await database.status(f'DELETE FROM "{schema_name}"."cms_affiliation_stage"')
         for organization_ref, location_refs, service_refs in (
             ("https://other.invalid/Organization/org-1", ["Location/physical"], []),
@@ -668,3 +886,110 @@ async def test_cms_affiliation_overlay_rejects_nonlocal_or_wrong_kind_references
                 service_refs=json.dumps(service_refs),
             )
             assert await database.status(insert_sql, source_ids=["cms-npd"]) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("desired", [False, True])
+async def test_entity_partial_projection_matches_current_or_desired_pins(monkeypatch, desired):
+    from tests.entity_address_partial_projection_support import assert_projection_parity
+
+    await assert_projection_parity(monkeypatch, desired)
+
+
+@pytest.mark.asyncio
+async def test_entity_partial_projection_keeps_cached_membership_guard(monkeypatch):
+    from tests.test_entity_address_partial_projection import test_projection_keeps_membership_guard_on_cached_reads
+
+    await test_projection_keeps_membership_guard_on_cached_reads(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_entity_partial_projection_preserves_preexisting_context(monkeypatch):
+    from tests.test_entity_address_partial_projection import (
+        test_projection_context_failure_preserves_preexisting_relation,
+    )
+
+    await test_projection_context_failure_preserves_preexisting_relation(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_entity_partial_projection_cancellation_cleans_exact_sidecars(monkeypatch):
+    from tests.test_entity_address_partial_projection import (
+        test_partial_projection_rolls_back_create_and_cleans_cancelled_consumer,
+    )
+
+    await test_partial_projection_rolls_back_create_and_cleans_cancelled_consumer(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_entity_partial_projection_uses_indexed_scope_and_prunes_history(monkeypatch):
+    from tests.entity_address_partial_projection_support import assert_projection_plan
+
+    await assert_projection_plan(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_entity_partial_projection_requires_existing_npi_index(monkeypatch):
+    from tests.test_entity_address_partial_projection import (
+        test_partial_projection_without_npi_index_keeps_original_sql,
+    )
+
+    await test_partial_projection_without_npi_index_keeps_original_sql(monkeypatch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commit_number", [1, 2])
+async def test_entity_partial_projection_handles_commit_cancellation(monkeypatch, commit_number):
+    from tests.test_entity_address_partial_projection import (
+        test_partial_projection_commit_cancellation_retires_created_tables,
+    )
+
+    await test_partial_projection_commit_cancellation_retires_created_tables(monkeypatch, commit_number)
+
+
+@pytest.mark.asyncio
+async def test_entity_orphan_cleanup_preserves_active_and_published_tables(monkeypatch):
+    async with _temporary_schema(monkeypatch) as (database, schema):
+        monkeypatch.setattr(importer, "db", database)
+        await database.status(
+            f'CREATE TABLE "{schema}".import_run(run_id text,importer text,status text, '
+            "created_at timestamp,finished_at timestamp)"
+        )
+        await database.status(
+            f'INSERT INTO "{schema}".import_run VALUES '
+            "('terminal','entity-address-unified','failed',now()-interval '8 hours',now()-interval '7 hours'),"
+            "('active','provider-directory-fhir','running',now()-interval '8 hours',NULL),"
+            "('recent','entity-address-unified','succeeded',now()-interval '8 hours',now()),"
+            "('current','provider-directory-fhir','failed',now()-interval '8 hours',now()-interval '7 hours'),"
+            "('other','other-import','failed',now()-interval '8 hours',now()-interval '7 hours')"
+        )
+        stages_by_run = {
+            run: importer._address_overlay_stage_table_name(run)
+            for run in ("terminal", "active", "recent", "current", "unknown", "other")
+        }
+        preserved_tables = [name for run, name in stages_by_run.items() if run != "terminal"] + [
+            "provider_directory_address_overlay",
+            "entity_address_unified",
+        ]
+        for name in [stages_by_run["terminal"], *preserved_tables]:
+            await database.status(f'CREATE TABLE "{schema}"."{name}"(marker int)')
+            await database.status(f'INSERT INTO "{schema}"."{name}" VALUES(7)')
+        counts = await importer._cleanup_orphan_address_overlay_stages(
+            schema, current_stage_table=stages_by_run["current"]
+        )
+        assert counts["removed"] == 1
+        assert counts["active_stage_retained"] == counts["recent_stage_retained"] == 1
+        assert counts["unowned_stage_retained"] == 2
+        assert counts["current_stage_retained"] == 1
+        assert await database.scalar("SELECT to_regclass(:name) IS NULL", name=f"{schema}.{stages_by_run['terminal']}")
+        for name in preserved_tables:
+            assert await database.scalar(f'SELECT marker FROM "{schema}"."{name}"') == 7
+
+
+@pytest.mark.asyncio
+async def test_entity_partial_projection_preserves_control_named_collision(monkeypatch):
+    from tests.test_entity_address_partial_projection import (
+        test_control_named_projection_collision_preserves_existing_table,
+    )
+
+    await test_control_named_projection_collision_preserves_existing_table(monkeypatch)

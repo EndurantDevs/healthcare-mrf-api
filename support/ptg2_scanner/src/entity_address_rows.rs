@@ -128,6 +128,93 @@ struct PreparedFields {
     contact_safe: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct AddressGroupFields {
+    pub street_key: String,
+    pub line1_norm: Option<String>,
+    pub line2_norm: Option<String>,
+    pub city_norm: Option<String>,
+    pub state_code: Option<String>,
+    pub zip5: Option<String>,
+    pub country_norm: Option<String>,
+    pub keyable: bool,
+}
+
+pub(crate) fn prepare_address_group_fields(fields: [Option<&str>; 6]) -> AddressGroupFields {
+    let [first, second, city, state, postal, country] = fields;
+    let zip5 = digits(postal, 5);
+    AddressGroupFields {
+        street_key: street_soft_norm(first),
+        line1_norm: alnum_norm(first),
+        line2_norm: alnum_norm(second),
+        city_norm: alnum_norm(city),
+        state_code: upper_norm(state),
+        keyable: source_keyable(fields, zip5.as_deref()),
+        zip5,
+        country_norm: upper_norm(country),
+    }
+}
+
+fn source_keyable(fields: [Option<&str>; 6], zip5: Option<&str>) -> bool {
+    let state = fields[3];
+    trim_text(state).is_some()
+        && !matches!(
+            letters_upper(state).as_str(),
+            "NULL" | "NONE" | "NA" | "NAN" | "UN" | "UNKNOWN" | "UNSPECIFIED" | "XX" | "ZZ"
+        )
+        && zip5.is_some_and(|zip| !matches!(zip, "00000" | "99999"))
+        && matches!(
+            letters_upper(fields[5]).as_str(),
+            "" | "US" | "USA" | "UNITEDSTATES" | "UNITEDSTATESOFAMERICA"
+        )
+        && (source_text_present(fields[0]) || source_text_present(fields[2]))
+}
+
+fn source_text_present(value: Option<&str>) -> bool {
+    // SQL permits a nonempty raw value even when punctuation leaves its token empty.
+    trim_text(value).is_some()
+        && !matches!(
+            alnum_norm(value).as_deref(),
+            Some("null" | "none" | "na" | "nan" | "unknown" | "unspecified")
+        )
+}
+
+fn letters_upper(value: Option<&str>) -> String {
+    value
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphabetic)
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect()
+}
+
+fn street_soft_norm(value: Option<&str>) -> String {
+    let mut normalized = String::new();
+    // SQL word boundaries include underscores before its final non-alphanumeric removal.
+    for word in value
+        .unwrap_or_default()
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+    {
+        let word = word.to_ascii_lowercase();
+        let word = match word.as_str() {
+            "west" => "w",
+            "east" => "e",
+            "north" => "n",
+            "south" => "s",
+            "street" => "st",
+            "avenue" => "ave",
+            "road" => "rd",
+            "boulevard" => "blvd",
+            "drive" => "dr",
+            "lane" => "ln",
+            "highway" => "hwy",
+            _ => &word,
+        };
+        normalized.extend(word.chars().filter(char::is_ascii_alphanumeric));
+    }
+    normalized
+}
+
 fn prepare_fields(fields: [Option<&str>; 13]) -> PreparedFields {
     let case_safe = [4, 5, 6, 7, 9]
         .iter()

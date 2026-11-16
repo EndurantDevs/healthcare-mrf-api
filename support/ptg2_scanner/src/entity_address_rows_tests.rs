@@ -1,5 +1,202 @@
 use super::*;
 
+#[test]
+fn soft_street_keys_match_whole_word_sql_substitutions() {
+    for (raw, expected) in [
+        (None, ""),
+        (Some(" ! \t "), ""),
+        (
+            Some("WEST east North south STREET avenue road boulevard drive lane highway"),
+            "wensstaverdblvddrlnhwy",
+        ),
+        (
+            Some("West WEST Westward 1West _west west_ west_street"),
+            "wwwestward1westwestwestweststreet",
+        ),
+        (Some("Street/street.street-street's"), "ststststs"),
+        (
+            Some("west\u{a0}street\u{2000}avenue\u{202f}road"),
+            "wstaverd",
+        ),
+        (
+            Some("streetstreet ST_strEEt 9road road9"),
+            "streetstreetststreet9roadroad9",
+        ),
+    ] {
+        assert_eq!(street_soft_norm(raw), expected, "{raw:?}");
+    }
+}
+
+#[test]
+fn grouping_fields_preserve_raw_sql_whitespace_and_null_rules() {
+    let fields = [
+        Some(" 10 WEST\u{a0}STREET "),
+        Some(" Apt_2 \t"),
+        Some(" O'Fallon "),
+        Some(" \tnew york\u{a0} "),
+        Some(" 12-X3 "),
+        Some(" \u{a0}u.s.\t "),
+    ];
+    assert_eq!(
+        prepare_address_group_fields(fields),
+        AddressGroupFields {
+            street_key: "10wst".to_owned(),
+            line1_norm: Some("10weststreet".to_owned()),
+            line2_norm: Some("apt2".to_owned()),
+            city_norm: Some("ofallon".to_owned()),
+            state_code: Some("\tNEW YORK\u{a0}".to_owned()),
+            zip5: Some("123".to_owned()),
+            country_norm: Some("\u{a0}U.S.\t".to_owned()),
+            keyable: true,
+        }
+    );
+    let empty = prepare_address_group_fields([None; 6]);
+    assert_eq!(empty, prepare_address_group_fields([Some(""); 6]));
+    assert_eq!(empty.street_key, "");
+    assert!(empty.line1_norm.is_none() && empty.line2_norm.is_none() && empty.city_norm.is_none());
+    assert!(empty.state_code.is_none() && empty.zip5.is_none() && empty.country_norm.is_none());
+    assert!(!empty.keyable);
+    assert_eq!(prepare_address_group_fields([Some(" "); 6]), empty);
+    assert_eq!(
+        prepare_address_group_fields([Some("123456789"); 6])
+            .zip5
+            .as_deref(),
+        Some("12345")
+    );
+}
+
+#[test]
+fn keyable_predicate_preserves_text_state_and_zip_sentinels() {
+    let base = [
+        Some("1 Main Street"),
+        None,
+        None,
+        Some("NY"),
+        Some("10001"),
+        Some("US"),
+    ];
+    for value in [
+        None,
+        Some(""),
+        Some(" "),
+        Some("NULL"),
+        Some("NoNe"),
+        Some("n-a"),
+        Some("n_a_n"),
+        Some("Unknown"),
+        Some("Unspecified"),
+    ] {
+        let mut fields = base;
+        fields[0] = value;
+        assert!(
+            !prepare_address_group_fields(fields).keyable,
+            "text {value:?}"
+        );
+        fields[2] = Some("!");
+        assert!(
+            prepare_address_group_fields(fields).keyable,
+            "city {value:?}"
+        );
+    }
+    for value in [
+        None,
+        Some(""),
+        Some(" "),
+        Some("NULL"),
+        Some("none"),
+        Some("n-a"),
+        Some("nan"),
+        Some("un"),
+        Some("unknown"),
+        Some("unspecified"),
+        Some("xx"),
+        Some("z.z"),
+    ] {
+        let mut fields = base;
+        fields[3] = value;
+        assert!(
+            !prepare_address_group_fields(fields).keyable,
+            "state {value:?}"
+        );
+    }
+    for value in [
+        None,
+        Some(""),
+        Some("ZIP"),
+        Some("00000"),
+        Some("99999"),
+        Some("00000-1234"),
+        Some("99999-1234"),
+    ] {
+        let mut fields = base;
+        fields[4] = value;
+        assert!(
+            !prepare_address_group_fields(fields).keyable,
+            "ZIP {value:?}"
+        );
+    }
+}
+
+#[test]
+fn keyable_predicate_preserves_raw_punctuation_whitespace_and_country_rules() {
+    let base = [Some("!"), None, None, Some("!?"), Some("1"), None];
+    for country in [
+        None,
+        Some(""),
+        Some(" "),
+        Some("123"),
+        Some("!?"),
+        Some("u.s."),
+        Some("U_s_A"),
+        Some("United States"),
+        Some("United States of America"),
+    ] {
+        let mut fields = base;
+        fields[5] = country;
+        assert!(
+            prepare_address_group_fields(fields).keyable,
+            "country {country:?}"
+        );
+    }
+    for country in [Some("GB"), Some("NULL"), Some("unknown"), Some("USX")] {
+        let mut fields = base;
+        fields[5] = country;
+        assert!(
+            !prepare_address_group_fields(fields).keyable,
+            "country {country:?}"
+        );
+    }
+    for text in ["\t", "\u{a0}", "_", "UN", "XX", "0"] {
+        let mut fields = base;
+        fields[0] = Some(text);
+        fields[3] = Some(text);
+        assert_eq!(
+            prepare_address_group_fields(fields).keyable,
+            !matches!(text, "UN" | "XX"),
+            "{text:?}"
+        );
+    }
+    for postal in ["0000", "00001", "9999", "123456", "00-001"] {
+        let mut fields = base;
+        fields[4] = Some(postal);
+        assert!(
+            prepare_address_group_fields(fields).keyable,
+            "ZIP {postal:?}"
+        );
+    }
+    assert!(
+        !prepare_address_group_fields([
+            None,
+            Some("1 Main Street"),
+            None,
+            Some("NY"),
+            Some("10001"),
+            None
+        ])
+        .keyable
+    );
+}
+
 fn input(rows: &[(i64, [Option<&str>; 13])]) -> Vec<u8> {
     let mut output = COPY_HEADER.to_vec();
     for (ordinal, fields) in rows {

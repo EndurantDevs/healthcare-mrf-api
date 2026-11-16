@@ -468,6 +468,26 @@ def enqueue_live_progress(**payload: Any) -> None:
         return
 
 
+async def write_phase_progress(run_id: str, phase: str, *, unit: str, done: int, total: int, message: str) -> None:
+    """Publish ordered phase counters without implying overall completion."""
+    if not run_id:
+        return
+    bind_status_event_loop()
+    await asyncio.to_thread(
+        write_live_progress,
+        run_id=run_id,
+        status="running",
+        phase=phase,
+        basis="phase",
+        phase_pct=(100 * done / total if total else 0),
+        unit=unit,
+        done=done,
+        total=total,
+        message=message,
+        source="import-phase-progress",
+    )
+
+
 def read_live_progress(run_id: str) -> dict[str, Any] | None:
     """Return fresh persisted progress, excluding missing or stale payloads."""
 
@@ -550,6 +570,17 @@ def _redis() -> redis.Redis:
 
 
 def _normalize_progress_fields(merged: dict[str, Any], *, succeeded: bool) -> None:
+    if merged.get("basis") == "phase" and not succeeded:
+        for field in (
+            "pct",
+            "stage_pct",
+            "pct_lower_bound",
+            "stage_pct_lower_bound",
+            "eta_seconds",
+            "estimated_finish_at",
+        ):
+            merged.pop(field, None)
+        return
     pct = _coerce_float(merged.get("pct"))
     done = _coerce_float(merged.get("done"))
     total = _coerce_float(merged.get("total"))
@@ -582,7 +613,12 @@ def _merge_previous_progress(
     _preserve_progress_for_heartbeat(merged, previous, now=now)
     if _is_incoming_progress_older(incoming_by_field, previous):
         _preserve_progress_snapshot(merged, previous)
+    is_next_stage = (_coerce_int(incoming_by_field.get("stage_ordinal")) or 0) > (
+        _coerce_int(previous.get("stage_ordinal")) or 0
+    )
     for key in _CARRY_FORWARD_FIELDS:
+        if is_next_stage and previous.get("basis") == "phase" and key in {"basis", "phase_pct"}:
+            continue
         if merged.get(key) is None and previous.get(key) is not None:
             merged[key] = previous[key]
     _carry_forward_run_metadata(merged, previous)
@@ -672,6 +708,22 @@ def _is_incoming_progress_older(
         and incoming_progress_seq != previous_progress_seq
     ):
         return incoming_progress_seq < previous_progress_seq
+    if (incoming.get("basis") == "phase" or previous.get("basis") == "phase") and str(
+        incoming.get("status") or ""
+    ).lower() in {"succeeded", "failed", "canceled", "cancelled", "dead_letter"}:
+        return False
+    if incoming.get("basis") == "phase":
+        if incoming.get("phase") != previous.get("phase"):
+            return False
+        incoming_phase_pct = _coerce_float(incoming.get("phase_pct"))
+        previous_phase_pct = _coerce_float(previous.get("phase_pct"))
+        return bool(
+            incoming_phase_pct is not None
+            and previous_phase_pct is not None
+            and incoming_phase_pct < previous_phase_pct
+        )
+    if previous.get("basis") == "phase" and incoming.get("source") != _HEARTBEAT_SOURCE:
+        return True
     incoming_pct = _coerce_float(incoming.get("pct"))
     previous_pct = _coerce_float(previous.get("pct"))
     if incoming_pct is not None and previous_pct is not None and incoming_pct < previous_pct:
@@ -790,6 +842,10 @@ def _preserve_progress_for_heartbeat(
 
 
 def _normalize_estimate_fields(merged: dict[str, Any], *, now: dt.datetime, terminal: bool) -> None:
+    if merged.get("basis") == "phase":
+        merged.pop("eta_seconds", None)
+        merged.pop("estimated_finish_at", None)
+        return
     eta_seconds = _coerce_float(merged.get("eta_seconds"))
     if eta_seconds is None and not terminal:
         done = _coerce_float(merged.get("done"))

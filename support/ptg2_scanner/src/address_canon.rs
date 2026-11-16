@@ -8,6 +8,9 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::OnceLock;
 
+#[path = "address_format.rs"]
+pub mod display;
+
 const PUB28_SOURCE: &str = include_str!("../../../process/ext/address_pub28.py");
 pub const ADDRESS_IDENTITY_VERSION: u8 = 2;
 pub const ADDRESS_IDENTITY_PREFIX: &str = "v2";
@@ -217,11 +220,13 @@ impl<'a> PyLiteralParser<'a> {
     }
 
     fn parse_string(&mut self) -> String {
-        self.expect('\'');
+        let quote = self.peek().expect("Python string literal is missing");
+        assert!(matches!(quote, '\'' | '"'), "Python string quote differs");
+        self.pos += 1;
         let mut out = String::new();
         while let Some(ch) = self.peek() {
             self.pos += ch.len_utf8();
-            if ch == '\'' {
+            if ch == quote {
                 return out;
             }
             if ch == '\\' {

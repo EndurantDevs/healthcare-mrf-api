@@ -1092,7 +1092,22 @@ async def _stamp_address_key_shard(
     field_map: Mapping[str, str],
     shards: int,
     update_existing: bool,
+    cancel_check: Callable[[], Awaitable[None]] | None = None,
 ) -> int:
+    from process.ext.address_batch_stamp import stamp_address_key_shard
+
+    native_rowcount = await stamp_address_key_shard(
+        db,
+        shard,
+        schema=schema,
+        staging_table=staging_table,
+        field_map=field_map,
+        shards=shards,
+        update_existing=update_existing,
+        cancel_check=cancel_check,
+    )
+    if native_rowcount is not None:
+        return native_rowcount
     first, second, city, state, zip_code, country = _address_sql(schema, field_map)
     source_filters = []
     if not update_existing:
@@ -1239,6 +1254,7 @@ async def stamp_address_keys(
                 field_map=field_map,
                 shards=shards,
                 update_existing=update_existing,
+                cancel_check=cancel_check,
             )
             await _record_stamp_progress(progress_lock, progress_by_metric, rowcount, shards)
             await asyncio.sleep(0)
