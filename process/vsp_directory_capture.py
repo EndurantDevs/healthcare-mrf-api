@@ -154,7 +154,6 @@ class VSPCapture:
         previous = self.offices.get(oid)
         if previous is not None:
             require(office_position(previous) == position, "vsp_office_position_changed")
-            require(profile_url(previous) == profile_url(office), "vsp_office_profile_changed")
         else:
             require(len(self.offices) < 200000, "vsp_office_budget_exhausted")
         summaries_by_doctor = {public_id(x.get("pid")): x for x in (previous or {}).get("providerSummaries", [])}
@@ -169,7 +168,8 @@ class VSPCapture:
                 self.identities[did] = {"summary": summary, "request_key": request_id}
             if did not in summaries_by_doctor or has_valid_npi:
                 summaries_by_doctor[did] = summary
-        self.offices[oid] = {**office, "providerSummaries": list(summaries_by_doctor.values())}
+        # Keep the first office observation paired with its exact dated profile.
+        self.offices[oid] = {**(previous or office), "providerSummaries": list(summaries_by_doctor.values())}
         self.account_bytes("office:" + oid, self.offices[oid])
         self.memberships[network].add(oid)
 
