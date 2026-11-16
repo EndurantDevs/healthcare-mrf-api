@@ -338,7 +338,8 @@ async def test_fixed_sql_count_and_one_copy_for_one_and_thousand(network_batch_d
         statements.clear()
         first = await _apply(session, resources[:1])
         first_count = len(statements)
-        assert first_count == 11
+        assert first_count == 12
+        assert sum(sql.startswith("ANALYZE insurance_network_stage_") for sql in statements) == 1
         statements.clear()
         second = await _apply(session, resources)
         assert len(statements) == first_count

@@ -32,6 +32,8 @@ async def record_prepared_network_batch(workspace, *, resource_type, resources):
         names = batch.network_batch_relations(
             connection, workspace.policy.schema, workspace.catalog_schema, workspace.receipts
         )
+        for key in ("entity_binding", "entity_evidence"):
+            await workspace.connection.execute(f"ANALYZE {names[key]}")
         batch_receipt = await batch.write_network_batch_native(
             connection,
             workspace.session,

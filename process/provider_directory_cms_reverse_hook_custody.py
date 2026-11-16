@@ -45,6 +45,32 @@ def _deadline(deadline):
     )
 
 
+def _metadata_deadline(deadline, commit_clock=None):
+    if commit_clock is None:
+        _deadline(deadline)
+        return deadline
+    _require(
+        type(deadline) in {int, float}
+        and math.isfinite(deadline)
+        and 0 < deadline - asyncio.get_running_loop().time() <= 15,
+        "deadline_required",
+    )
+    _require(
+        type(commit_clock) is asyncio.Timeout
+        and getattr(commit_clock, "_task", None) is asyncio.current_task()
+        and not commit_clock.expired(),
+        "deadline_required",
+    )
+    current = commit_clock.when()
+    _require(type(current) in {int, float} and math.isfinite(current) and current <= deadline, "deadline_required")
+    _require(0 < current - asyncio.get_running_loop().time(), "deadline_required")
+    try:
+        commit_clock.reschedule(current)
+    except RuntimeError as error:
+        raise ValueError("cms_reverse_hook_deadline_required") from error
+    return current
+
+
 def _routine_oids(inventory):
     selected, retirement = set(), None
     for routine in inventory["routines"]:
@@ -165,13 +191,27 @@ def _require_hooks(hooks, expected, run_oid, retirement_oid):
     _require(expected.keys() <= seen and run_names == _RUN_HOOKS.keys(), "bindings_missing")
 
 
-async def _original(connection, task, actor_by_field, deadline):
-    _deadline(deadline)
+async def _original(connection, task, actor_by_field, deadline, *, commit_clock=None):
+    _metadata_deadline(deadline, commit_clock)
     _require(asyncio.current_task() is task, "original_task_required")
     _require(connection.is_in_transaction() is True and connection.is_closed() is False, "transaction_required")
     _require(connection.get_server_pid() == actor_by_field["backend"], "physical_connection_changed")
     await custody._require_allocation_resolution(connection)
     _require(dict(await connection.fetchrow(custody._ALLOCATION_ACTOR_SQL)) == actor_by_field, "original_admin_changed")
+
+
+def _require_actor(actor_by_field, connection, binding, excluded_roles):
+    _require(
+        actor_by_field["administrator"] is True
+        and actor_by_field["session"] == actor_by_field["current"]
+        and actor_by_field["current"] not in excluded_roles
+        and actor_by_field["backend"] == connection.get_server_pid()
+        and actor_by_field["database_oid"] == binding.database_oid
+        and actor_by_field["transaction"]
+        and actor_by_field["replication"] == "origin"
+        and actor_by_field["readonly"] == "off",
+        "original_admin_required",
+    )
 
 
 async def _bindings(connection, function_oids, catalog_oids):
@@ -227,14 +267,14 @@ async def _catalog_locks(connection):
 async def cms_reverse_hook_custody(
     connection, *, inventory, storage_binding, policy, cms_profile, source_document, deadline, history_bounds=None
 ):
-    """Yield a same-task recheck; caller retains one <=3s clock through commit.
+    """Yield a same-task recheck under the caller's retained clock through commit.
 
-    Existing routine/role catalog locks are reacquired before pg_trigger. The
-    operator must call the recheck before commit and validate its intentional
-    owner/body/ACL/Source/profile postimage separately. No old digest is reloaded
-    after intentional changes. Exit only invalidates this local callback.
+    Numeric-only scopes remain <=3s. Administrative metadata may use its entered
+    <=15s caller clock, shortened before heap exclusivity. Intentional postimages
+    remain separately verified; exit only invalidates this local callback.
     """
-    _deadline(deadline)
+    commit_clock = deadline if type(deadline) is asyncio.Timeout else None
+    deadline = _metadata_deadline(commit_clock.when() if commit_clock is not None else deadline, commit_clock)
     inventory, cms_profile, source_document, history_bounds = deepcopy(
         (inventory, cms_profile, source_document, history_bounds)
     )
@@ -243,40 +283,32 @@ async def cms_reverse_hook_custody(
     function_oids, run_oid, retirement_oid, excluded_roles = _inputs(
         projected, storage_binding, policy, cms_profile, source_document
     )
-    _deadline(deadline)
+    _metadata_deadline(deadline, commit_clock)
     task, has_scope = asyncio.current_task(), True
     try:
-        async with asyncio.timeout_at(deadline):
+        async with asyncio.timeout_at(deadline) as custody_clock:
             _require(connection.is_in_transaction() is True and connection.is_closed() is False, "transaction_required")
             await custody._require_allocation_resolution(connection)
             actor_by_field = dict(await connection.fetchrow(custody._ALLOCATION_ACTOR_SQL))
-            _require(
-                actor_by_field["administrator"] is True
-                and actor_by_field["session"] == actor_by_field["current"]
-                and actor_by_field["current"] not in excluded_roles
-                and actor_by_field["backend"] == connection.get_server_pid()
-                and actor_by_field["database_oid"] == storage_binding.database_oid
-                and actor_by_field["transaction"]
-                and actor_by_field["replication"] == "origin"
-                and actor_by_field["readonly"] == "off",
-                "original_admin_required",
-            )
+            _require_actor(actor_by_field, connection, storage_binding, excluded_roles)
             catalog_oids = await _catalog_locks(connection)
             before = await _bindings(connection, function_oids, catalog_oids)
             dynamic_relations = await _dynamic_relations(connection, inventory, storage_binding, policy, cms_profile)
             expected = _expected_hooks(inventory, function_oids, dynamic_relations)
             _require_hooks(before["bindings"], expected, run_oid, retirement_oid)
-            await _original(connection, task, actor_by_field, deadline)
+            await _original(connection, task, actor_by_field, deadline, commit_clock=commit_clock)
 
             async def recheck():
                 """Check the same native hook scope before the caller commits."""
                 _require(has_scope, "inactive_context")
-                async with asyncio.timeout_at(deadline):
-                    await _original(connection, task, actor_by_field, deadline)
+                current_deadline = _metadata_deadline(custody_clock.when(), commit_clock)
+                custody_clock.reschedule(current_deadline)
+                async with asyncio.timeout_at(current_deadline):
+                    await _original(connection, task, actor_by_field, current_deadline, commit_clock=commit_clock)
                     current = await _bindings(connection, function_oids, catalog_oids)
                     _require(current == before, "bindings_changed")
                     await _history_projection(connection, inventory, storage_binding, history_bounds)
-                    await _original(connection, task, actor_by_field, deadline)
+                    await _original(connection, task, actor_by_field, current_deadline, commit_clock=commit_clock)
 
             yield recheck
     finally:

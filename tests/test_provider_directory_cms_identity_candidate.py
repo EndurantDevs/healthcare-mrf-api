@@ -345,9 +345,12 @@ async def test_network_sql_targets_only_bound_private_stages_at_constant_stateme
             },
         )
     assert receipt["plan_link_count"] == count
-    assert len(sql_statements) == 9
+    assert len(sql_statements) == 10
     copy.assert_awaited_once()
     assert copy.await_args.args[1:3] == (session, publisher.connection)
+    assert [statement for statement in sql_statements if statement.startswith("ANALYZE ")] == [
+        f"ANALYZE {copy.await_args.args[3]} (resource_id)"
+    ]
     writes = [statement for statement in sql_statements if "INSERT INTO" in statement]
     assert len(writes) == 2
     assert all(

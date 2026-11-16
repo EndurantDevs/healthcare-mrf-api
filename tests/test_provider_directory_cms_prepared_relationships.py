@@ -72,6 +72,9 @@ def _graph_callbacks(connection, state, expected):
     """Retain portal paging, exact family projection and failure side effects."""
 
     async def execute(sql, *args):
+        if str(sql) == 'ANALYZE "private_source"."private_0"':
+            state.analyzed = str(sql)
+            return "ANALYZE"
         if str(sql).startswith("DECLARE"):
             params = args[0] if args else {}
             portal = str(sql).split()[1]
@@ -166,6 +169,7 @@ def graph(case, monkeypatch):
 async def test_projects_all_families_in_bounded_streams_then_checks_exact_indexed_projection(graph):
     current = graph.workspace
     projected = await prepared.project_prepared_cms_relationships(current, graph.handoff)
+    assert graph.analyzed == 'ANALYZE "private_source"."private_0"'
     assert projected["relationship_count"] == 24 and set(projected["family_counts"].values()) == {3}
     assert current.copy_rows.await_count == 16 and all(
         len(call.args[2]) <= 2 for call in current.copy_rows.await_args_list

@@ -24,7 +24,7 @@ def prepared(monkeypatch):
     workspace._indexed = False
     workspace._receipts = {root: {"name": "private_map_" + str(i)} for i, root in enumerate(CMS_IDENTITY_TABLES)}
     connection = SimpleNamespace(dialect=postgresql.dialect())
-    workspace.connection = object()
+    workspace.connection = SimpleNamespace(execute=AsyncMock())
     workspace.session = SimpleNamespace(connection=AsyncMock(return_value=connection))
     workspace.verify_current = AsyncMock()
     events = []
@@ -86,6 +86,9 @@ async def test_prepared_network_uses_private_targets_and_original_session(prepar
         for key in ("entity_binding", "entity_evidence", "network_binding", "plan_evidence")
     )
     assert prepared.workspace.verify_current.await_count == 3
+    assert [call.args[0] for call in driver.execute.await_args_list] == [
+        "ANALYZE " + names[key] for key in ("entity_binding", "entity_evidence")
+    ]
     assert prepared.events == ["entered", "released"]
 
 
@@ -121,4 +124,15 @@ async def test_partial_prepared_network_write_failure_propagates_through_rollbac
     with pytest.raises(ValueError) as rejected:
         await network.record_prepared_network_batch(prepared.workspace, resource_type="InsurancePlan", resources=[{}])
     assert rejected.value is error
+    assert prepared.events == ["entered", "rolled_back"]
+
+
+@pytest.mark.parametrize("failure_at", [1, 2])
+async def test_private_statistics_failure_rolls_back_before_network_writes(prepared, failure_at):
+    error = RuntimeError("statistics failed")
+    prepared.workspace.connection.execute.side_effect = [None] * (failure_at - 1) + [error]
+    with pytest.raises(RuntimeError) as rejected:
+        await network.record_prepared_network_batch(prepared.workspace, resource_type="InsurancePlan", resources=[{}])
+    assert rejected.value is error
+    prepared.writer.assert_not_awaited()
     assert prepared.events == ["entered", "rolled_back"]

@@ -239,6 +239,7 @@ async def write_network_batch_native(connection, session, driver, names, encoded
         )
     )
     await copy_network_stage_native(connection, session, driver, names["stage"], encoded)
+    await connection.execute(text(f"ANALYZE {names['stage']} (resource_id)"))
     await connection.execute(text(_TARGETS_SQL.format(**names)), parameters)
     error = await connection.scalar(text(_VALIDATE_SQL.format(**names)), parameters)
     if error is not None:

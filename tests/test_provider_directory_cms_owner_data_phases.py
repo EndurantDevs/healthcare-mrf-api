@@ -175,6 +175,24 @@ async def test_reader_view_follows_native_owner_proof(phase_case):
     assert case.current.await_count == case.connection.fetchval.await_count == 1
 
 
+async def test_owner_metadata_phase_retains_actual_caller_clock(phase_case):
+    case = phase_case
+    async with asyncio.timeout(15) as commit_clock:
+        actual = await execution.mutate_cms_common_owner_permissions(
+            case.connection,
+            inventory=case.inventory,
+            storage_binding=case.storage,
+            policy=case.policy,
+            cms_profile=case.profile,
+            source_document=case.source,
+            deadline=commit_clock.when(),
+            commit_clock=commit_clock,
+        )
+        assert case.mutating.await_args.kwargs["commit_clock"] is commit_clock
+        assert case.mutating.await_args.args[-1] == commit_clock.when()
+        assert actual["reader_view"] == dict(routines=case.after["routines"], roles=case.after["roles"])
+
+
 @pytest.mark.parametrize("fault", ["routine", "role", "cancelled"])
 async def test_failed_owner_proof_returns_no_reader_view(phase_case, fault):
     case = phase_case

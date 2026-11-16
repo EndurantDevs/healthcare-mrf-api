@@ -207,6 +207,7 @@ def _require_family(before, after, original, observed, plan):
 async def _mutate_owner(connection, inventory, binding, policy, profile, plan, deadline, *, commit_clock=None):
     from process.provider_directory_cms_owner_role_rights import expected_cms_owner_roles
 
+    reverse._metadata_deadline(deadline, commit_clock)
     await custody._lock_allocation_inventory(connection, _relations(inventory))
     before = await profiles._collect_profile(connection, binding, policy, profile)
     _require(postimages._same(before, inventory), "preimage_changed")
@@ -218,9 +219,10 @@ async def _mutate_owner(connection, inventory, binding, policy, profile, plan, d
         connection, before, plan, role_names_by_oid
     )
     resources = sorted(storage_relation(row["nspname"], row["relname"]) for row in plan["relations"])
-    reverse._deadline(deadline)
+    reverse._metadata_deadline(deadline, commit_clock)
     if commit_clock is not None:
         commit_clock.reschedule(min(commit_clock.when(), asyncio.get_running_loop().time() + 3))
+        deadline = commit_clock.when()
     await connection.execute(
         "LOCK TABLE " + ",".join("ONLY " + resource for resource in resources) + " IN ACCESS EXCLUSIVE MODE NOWAIT"
     )
@@ -258,7 +260,8 @@ async def cms_common_owner_custody(
     This yields no authority or handle. All successful DB-backed exit checks
     precede the caller's outer commit; exceptional exit leaves rollback to it.
     """
-    reverse._deadline(deadline)
+    commit_clock = deadline if type(deadline) is asyncio.Timeout else None
+    deadline = reverse._metadata_deadline(commit_clock.when() if commit_clock is not None else deadline, commit_clock)
     async with (
         asyncio.timeout_at(deadline),
         reverse.cms_reverse_hook_custody(
@@ -268,7 +271,7 @@ async def cms_common_owner_custody(
             policy=policy,
             cms_profile=cms_profile,
             source_document=source_document,
-            deadline=deadline,
+            deadline=commit_clock if commit_clock is not None else deadline,
             **({"history_bounds": history_bounds} if history_bounds is not None else {}),
         ) as recheck,
     ):
@@ -276,6 +279,7 @@ async def cms_common_owner_custody(
         _require(database is not None and database["oid"] == storage_binding.database_oid, "database_changed")
         _require(await connection.fetchval(_DDL_HOOKS_SQL) is True, "ddl_hooks_enabled")
         yield
+        reverse._metadata_deadline(deadline, commit_clock)
         _require(await connection.fetchrow(_DATABASE_SQL, storage_binding.database_oid) == database, "database_changed")
         await recheck()
 
@@ -350,7 +354,7 @@ async def mutate_cms_common_owner_permissions(
     The caller retains cms_common_owner_custody through terminal verification.
     Reader restoration is permitted only after this routine/role proof returns.
     """
-    reverse._deadline(deadline)
+    deadline = reverse._metadata_deadline(deadline, commit_clock)
     inventory, cms_profile, source_document = deepcopy((inventory, cms_profile, source_document))
     plan = permissions.plan_cms_common_owner_permissions(
         inventory,
