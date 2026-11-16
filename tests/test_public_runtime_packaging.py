@@ -171,6 +171,13 @@ def test_native_builder_copies_network_census_before_compilation():
     assert builder.index(copy) < builder.index("maturin build")
 
 
+def test_native_builder_copies_display_tables_before_compilation():
+    builder = (ROOT / "Dockerfile").read_text().split("\nFROM ")[1]
+    copy = "COPY process/ext/address_format_constants.py /build/process/ext/address_format_constants.py"
+    assert builder.index(copy) < builder.index("cargo build")
+    assert builder.index(copy) < builder.index("maturin build")
+
+
 def test_local_example_has_neutral_database_and_no_shared_operator_token():
     value_by_name = dict(
         line.split("=", 1)

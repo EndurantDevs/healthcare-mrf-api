@@ -84,6 +84,7 @@ from db.models import (
     db,
 )
 from db.plan_release_storage import storage_relation
+from process import provider_directory_address_batch as overlay_batch
 from process import provider_directory_address_overlay_keys as overlay_keys
 from process import provider_directory_anthem as anthem
 from process import provider_directory_bcbs_minnesota as bcbs_minnesota
@@ -71307,15 +71308,8 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                 key_parts.state_name,
                 key_parts.postal_code,
                 key_parts.country_code,
-                {qschema}.addr_key_v1(
-                    key_parts.first_line,
-                    key_parts.second_line,
-                    key_parts.city_name,
-                    key_parts.state_name,
-                    key_parts.postal_code,
-                    key_parts.country_code
-                ) AS address_key,
-                {qschema}.addr_state_code_v1(key_parts.state_name)::varchar AS state_code
+                {batch_address_key} AS address_key,
+                {batch_state_code} AS state_code
               FROM (
                     SELECT DISTINCT
                         address_lookup_key,
@@ -71327,6 +71321,8 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                         country_code
                       FROM raw_org_addresses
               ) AS key_parts
+              LEFT JOIN {address_fields_table} AS batch_fields
+                ON batch_fields.lookup_key=key_parts.address_lookup_key
         )
         SELECT
             raw.source_record_id,
@@ -71425,15 +71421,8 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
         ), practitioner_address_keys AS MATERIALIZED (
             SELECT
                 key_parts.address_lookup_key,
-                {qschema}.addr_key_v1(
-                    key_parts.first_line,
-                    key_parts.second_line,
-                    key_parts.city_name,
-                    key_parts.state_name,
-                    key_parts.postal_code,
-                    key_parts.country_code
-                ) AS address_key,
-                {qschema}.addr_state_code_v1(key_parts.state_name)::varchar AS state_code
+                {batch_address_key} AS address_key,
+                {batch_state_code} AS state_code
               FROM (
                     SELECT DISTINCT
                         address_lookup_key,
@@ -71445,6 +71434,8 @@ ADDRESS_OVERLAY_COMPONENT_INSERT_TEMPLATES = {
                         country_code
                       FROM raw_practitioner_addresses
               ) AS key_parts
+              LEFT JOIN {address_fields_table} AS batch_fields
+                ON batch_fields.lookup_key=key_parts.address_lookup_key
         )
         SELECT
             raw.source_record_id,
@@ -71876,6 +71867,7 @@ def _address_overlay_sql_context(schema: str, stage_table: str | None, run_id: s
         "practitioner_table": _qt(schema, "provider_directory_practitioner"),
         "location_table": _qt(schema, "provider_directory_location"),
         "location_key_table": overlay_keys.EMPTY_LOCATION_KEYS_SQL,
+        **overlay_batch.key_fields_context(_q(schema)),
         **overlay_keys.NO_ROW_VERSION_MATCH_SQL_BY_NAME,
         "healthcare_service_table": _qt(schema, "provider_directory_healthcare_service"),
         "practitioner_role_table": _qt(schema, "provider_directory_practitioner_role"),
@@ -71908,7 +71900,7 @@ def _address_overlay_component_insert_sql(
         source_ids=source_ids,
     )
     select_sql = address_overlay_component_select_sql(template, context)
-    return f"INSERT INTO {context['stage_ref']} ({context['columns']}) {select_sql};"
+    return overlay_batch.component_insert_sql(sys.modules[__name__], context, select_sql)
 
 
 PROVIDER_DIRECTORY_ADDRESS_OVERLAY_REQUIRED_TABLES = (
@@ -71985,53 +71977,9 @@ async def _populate_address_overlay_stage(
     components: tuple[str, ...] | list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a complete replacement overlay stage and return publication metrics."""
-    target_ref = _qt(schema, PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
-    columns = ", ".join(_provider_directory_address_overlay_columns())
-    selected_components = _clean_address_overlay_components(components)
-    refresh_resource_types = (
-        None
-        if set(selected_components) == set(ADDRESS_OVERLAY_COMPONENTS)
-        else [ADDRESS_OVERLAY_COMPONENT_RESOURCE_TYPES[component] for component in selected_components]
+    return await overlay_batch.populate(
+        sys.modules[__name__], schema, stage_table, stage_ref, run_id, source_ids, query_param_dict, components
     )
-    copied_existing = await _copy_existing_address_overlay(
-        stage_ref,
-        target_ref,
-        columns,
-        source_ids,
-        refresh_resource_types=refresh_resource_types,
-    )
-    inserted_by_component, duration_seconds_by_component = await _insert_address_overlay_components(
-        schema,
-        stage_table,
-        run_id,
-        source_ids,
-        query_param_dict,
-        selected_components,
-    )
-    inserted = sum(inserted_by_component.values())
-    countries_normalized = await _normalize_address_overlay_stage_countries(stage_ref)
-    alias_metrics = await _materialize_address_overlay_aliases(schema, stage_ref)
-    archive_metrics = await _hydrate_address_overlay_stage_from_archive(schema, stage_ref, source_ids=source_ids)
-    duplicates_removed = await _dedupe_address_overlay_stage(
-        stage_ref,
-        source_ids=source_ids,
-        resource_types=refresh_resource_types,
-    )
-    stage_rows = int(await db.scalar(f"SELECT COUNT(*) FROM {stage_ref};") or 0)
-    await _create_address_overlay_stage_indexes(schema, stage_table)
-    await db.status(f"ANALYZE {stage_ref};")
-    return {
-        "copied_existing": copied_existing,
-        "inserted": inserted,
-        "inserted_by_component": inserted_by_component,
-        "component_seconds": duration_seconds_by_component,
-        "components": selected_components,
-        "countries_normalized": countries_normalized,
-        **alias_metrics,
-        **archive_metrics,
-        "duplicates_removed": duplicates_removed,
-        "stage_rows": stage_rows,
-    }
 
 
 async def _normalize_address_overlay_stage_countries(stage_ref: str) -> int:
@@ -72266,6 +72214,11 @@ async def _backfill_address_overlay_stage_formatted_addresses(
     """Render scoped staged labels from each row's structured components."""
     renderer = f"{_q(schema)}.{ADDRESS_FORMAT_FUNCTION}"
     cleaned_source_ids = _clean_source_id_list(source_ids)
+    native_updated = await overlay_batch.backfill_formatted(
+        sys.modules[__name__], schema, stage_ref, cleaned_source_ids
+    )
+    if native_updated is not None:
+        return native_updated
     source_scope = (
         "AND stage_row.source_id = ANY(CAST(:formatted_source_ids AS varchar[]))" if cleaned_source_ids else ""
     )
@@ -72456,7 +72409,7 @@ async def _address_overlay_stage_owners(
                    AND finished_at <= now() - make_interval(secs => :minimum_age_seconds)
                        AS cleanup_eligible
               FROM {_qt(schema, "import_run")}
-             WHERE importer = 'provider-directory-fhir'
+             WHERE importer IN ('provider-directory-fhir', 'entity-address-unified')
              ORDER BY created_at DESC
              LIMIT :owner_history_limit;
             """,

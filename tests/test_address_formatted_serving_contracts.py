@@ -20,9 +20,7 @@ FORMATTED_COLUMNS = {
 
 def test_overlay_schema_separates_source_and_archive_columns():
     storage_columns = set(directory._provider_directory_address_overlay_columns())
-    source_columns = set(
-        directory._provider_directory_address_overlay_source_columns()
-    )
+    source_columns = set(directory._provider_directory_address_overlay_source_columns())
     table_sql = directory.provider_directory_address_overlay_table_sql("mrf")
     alter_sql = directory.address_overlay_formatted_address_columns_sql("mrf")
 
@@ -97,10 +95,7 @@ async def test_overlay_stage_rendering_scopes_selected_sources(monkeypatch):
     )
 
     assert changed_rows == 1
-    assert (
-        "stage_row.source_id = ANY(CAST(:formatted_source_ids AS varchar[]))"
-        in status.await_args.args[0]
-    )
+    assert "stage_row.source_id = ANY(CAST(:formatted_source_ids AS varchar[]))" in status.await_args.args[0]
     assert status.await_args.kwargs == {"formatted_source_ids": ["source-a"]}
 
 
@@ -113,6 +108,7 @@ def _record_overlay_event(events, name, value):
 
 
 def _stub_overlay_population_dependencies(monkeypatch, events):
+    monkeypatch.setattr(directory.overlay_keys, "_native_location_batch", lambda _directory: None)
     monkeypatch.setattr(
         directory,
         "_copy_existing_address_overlay",
@@ -141,9 +137,7 @@ def _stub_overlay_population_dependencies(monkeypatch, events):
         monkeypatch.setattr(
             directory,
             function_name,
-            AsyncMock(
-                side_effect=_record_overlay_event(events, event_name, changed_rows)
-            ),
+            AsyncMock(side_effect=_record_overlay_event(events, event_name, changed_rows)),
         )
     monkeypatch.setattr(
         directory,
@@ -216,21 +210,15 @@ def test_unified_aggregation_renders_selected_components_locally():
 
 
 def test_unified_generation_receipt_fences_formatted_address_version():
-    expected_version = (
-        f"address_archive_v2:v2+fmt-v{unified.ADDRESS_FORMAT_VERSION}"
-    )
+    expected_version = f"address_archive_v2:v2+fmt-v{unified.ADDRESS_FORMAT_VERSION}"
 
     assert unified.BASE_ADDRESS_VERSION == expected_version
-    assert unified.ALIAS_BASE_ADDRESS_VERSION_PREFIX == (
-        f"{expected_version}+alias-v1:g"
-    )
+    assert unified.ALIAS_BASE_ADDRESS_VERSION_PREFIX == (f"{expected_version}+alias-v1:g")
 
 
 def test_overlay_source_and_api_select_only_persisted_label():
     overlay_source_sql = unified._PROVIDER_DIRECTORY_PARTIAL_OVERLAY_SOURCE_TEMPLATE
-    serving_sql = npi._provider_directory_overlay_query_sql(
-        {"lat", "long", "formatted_address"}
-    )
+    serving_sql = npi._provider_directory_overlay_query_sql({"lat", "long", "formatted_address"})
 
     assert "overlay.formatted_address::varchar AS formatted_address" in overlay_source_sql
     assert "MAX(NULLIF(BTRIM(formatted_address), ''))::varchar" in serving_sql
@@ -255,9 +243,7 @@ def test_public_address_finalizer_rejects_an_external_sibling_unit_label():
             "state_name": "TN",
             "postal_code": "37218",
             "country_code": "US",
-            "formatted_address": (
-                "4007 CLARKSVILLE PIKE, 101, NASHVILLE, TN 37218"
-            ),
+            "formatted_address": ("4007 CLARKSVILLE PIKE, 101, NASHVILLE, TN 37218"),
             "formatted_address_version": None,
             "formatted_address_source": None,
         },
@@ -265,9 +251,7 @@ def test_public_address_finalizer_rejects_an_external_sibling_unit_label():
         include_evidence=False,
     )
 
-    assert public_address["formatted_address"] == (
-        "4007 Clarksville Pike, Suite 301, Nashville, TN 37218"
-    )
+    assert public_address["formatted_address"] == ("4007 Clarksville Pike, Suite 301, Nashville, TN 37218")
     assert "101" not in public_address["formatted_address"]
     assert "United States" not in public_address["formatted_address"]
     assert public_address["formatted_address_version"] == 2
@@ -291,9 +275,7 @@ def test_public_address_finalizer_suppresses_conflicting_site_keys():
         suppress_conflicting_site_key=True,
     )
 
-    assert public_address["formatted_address"] == (
-        "100 Main Street, City, MO 64055"
-    )
+    assert public_address["formatted_address"] == ("100 Main Street, City, MO 64055")
     assert "premise_key" not in public_address
     assert "address_site_key" not in public_address
 
@@ -315,7 +297,5 @@ def test_shared_public_redaction_renders_every_nested_address_locally():
 
     npi._redact_internal_address_fields(payload)
 
-    assert payload["address_list"][0]["formatted_address"] == (
-        "3800 South Whitney Avenue, Independence, MO 64055"
-    )
+    assert payload["address_list"][0]["formatted_address"] == ("3800 South Whitney Avenue, Independence, MO 64055")
     assert payload["address_list"][1]["formatted_address"] is None

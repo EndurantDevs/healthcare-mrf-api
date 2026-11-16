@@ -1,0 +1,717 @@
+[
+  {
+    "input": [
+      "100 Main St, Suite 200",
+      "Suite 200",
+      "Springfield",
+      "IL",
+      "62704",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite 200, Springfield, IL 62704"
+  },
+  {
+    "input": [
+      "100 Main St, Suite 200",
+      "Suite 201",
+      "Springfield",
+      "IL",
+      "62704",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite 200, Suite 201, Springfield, IL 62704"
+  },
+  {
+    "input": [
+      "200 S EXAMPLE AVE",
+      "SUITE 301",
+      "EXAMPLE CITY",
+      "MO",
+      "64055",
+      null
+    ],
+    "formatted_address": "200 South Example Avenue, Suite 301, Example City, MO 64055"
+  },
+  {
+    "input": [
+      "300 Example Pike Suite 301",
+      "Ste 301",
+      "EXAMPLE CITY",
+      "TN",
+      "37000",
+      "US"
+    ],
+    "formatted_address": "300 Example Pike, Suite 301, Example City, TN 37000"
+  },
+  {
+    "input": [
+      "123 NE 1ST ST NW",
+      null,
+      "O'FALLON",
+      "MO",
+      "63366",
+      "USA"
+    ],
+    "formatted_address": "123 NE 1st Street NW, O'Fallon, MO 63366"
+  },
+  {
+    "input": [
+      "P.O. BOX 42",
+      null,
+      "ST LOUIS",
+      "MO",
+      "63101",
+      "U.S."
+    ],
+    "formatted_address": "PO Box 42, St Louis, MO 63101"
+  },
+  {
+    "input": [
+      "SUITE 301",
+      null,
+      "NASHVILLE",
+      "TN",
+      "37218",
+      "US"
+    ],
+    "formatted_address": "Suite 301, Nashville, TN 37218"
+  },
+  {
+    "input": [
+      "123 UNIT RD",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "123 Unit Road, City, MO 64055"
+  },
+  {
+    "input": [
+      "1 BUILDING WAY",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "1 Building Way, City, MO 64055"
+  },
+  {
+    "input": [
+      "123 STE GENEVIEVE DR",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "123 Ste Genevieve Drive, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST 2ND FLOOR",
+      "FLOOR 2",
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Floor 2, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST floor A",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Floor A, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST STE. 301",
+      "STE 301",
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite 301, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST STE#301",
+      "SUITE #301",
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite 301, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST APT 2ND",
+      null,
+      "EXAMPLE",
+      "NY",
+      "10001",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Apartment 2nd, Example, NY 10001"
+  },
+  {
+    "input": [
+      "100 MAIN ST STE MCDONALD",
+      null,
+      "EXAMPLE",
+      "NY",
+      "10001",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite Mcdonald, Example, NY 10001"
+  },
+  {
+    "input": [
+      "100 CALLE EJEMPLO",
+      null,
+      "EXAMPLE",
+      "PR",
+      "00901",
+      "US"
+    ],
+    "formatted_address": "100 Calle Ejemplo, Example, PR 00901"
+  },
+  {
+    "input": [
+      "123 STEWART",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "123 Stewart, City, MO 64055"
+  },
+  {
+    "input": [
+      "STEWART A",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "Stewart A, City, MO 64055"
+  },
+  {
+    "input": [
+      "COMMANDING OFFICER",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "Commanding Officer, City, MO 64055"
+  },
+  {
+    "input": [
+      "123 OCEAN FRONT",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "123 Ocean Front, City, MO 64055"
+  },
+  {
+    "input": [
+      "GME OFFICE",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "Gme Office, City, MO 64055"
+  },
+  {
+    "input": [
+      "MEDICAL OFFICE BUILDING",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "Medical Office Building, City, MO 64055"
+  },
+  {
+    "input": [
+      "UNIVERSITY DEPARTMENT PEDIATRICS",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "University Department Pediatrics, City, MO 64055"
+  },
+  {
+    "input": [
+      "EMERGENCY ROOM PHYSICIANS",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "Emergency Room Physicians, City, MO 64055"
+  },
+  {
+    "input": [
+      "POST OFFICE BOX",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "PO Box, City, MO 64055"
+  },
+  {
+    "input": [
+      "ST OFFICE",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "St Office, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST SUITE E",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite E, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST STE301",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite 301, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST #LA",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite La, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST BLDG A STE 2",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Building A, Suite 2, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST APT 2 OFFICE",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Apartment 2, Office, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST",
+      "BLDG A STE 2",
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Building A, Suite 2, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST STE-301",
+      "STE 301",
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite 301, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST STE/301-A",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite 301-A, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 S. MAIN ST",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 South Main Street, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST N.",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street North, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 N.E. MAIN ST",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 NE Main Street, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 N E MAIN ST",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 NE Main Street, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST N.W.",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street NW, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST",
+      null,
+      "FT. WORTH,",
+      "TX,",
+      "76102,",
+      "US,"
+    ],
+    "formatted_address": "100 Main Street, Fort Worth, TX 76102"
+  },
+  {
+    "input": [
+      "100 S MAIN ST.",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 South Main Street, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST,",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, City, MO 64055"
+  },
+  {
+    "input": [
+      "POST OFFICE BOX. 42",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "PO Box 42, City, MO 64055"
+  },
+  {
+    "input": [
+      "P.O. BOX#42",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "PO Box 42, City, MO 64055"
+  },
+  {
+    "input": [
+      "P.O. BOX #42",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "PO Box 42, City, MO 64055"
+  },
+  {
+    "input": [
+      "RR 2 BOX #42",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "RR 2 Box 42, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST OFC",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Office, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST OFFICE",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Office, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST OFFICE 200",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Office 200, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST N, OFFICE",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street North, Office, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST DEPT 2",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Department 2, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST SPC 4",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Space 4, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST PH",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Penthouse, City, MO 64055"
+  },
+  {
+    "input": [
+      "1 BUILDING-WAY",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "1 Building-Way, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 BUILDING-WAY STE-2",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Building-Way, Suite 2, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST STE A B",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite A B, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST STE A-B",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite A-B, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST STE AB-301",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite AB-301, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST STE ABC-1D",
+      null,
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite ABC-1D, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST STE 1",
+      "100 Main Street Suite 1",
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite 1, City, MO 64055"
+  },
+  {
+    "input": [
+      "100 MAIN ST STE 301",
+      "301",
+      "CITY",
+      "MO",
+      "64055",
+      "US"
+    ],
+    "formatted_address": "100 Main Street, Suite 301, City, MO 64055"
+  },
+  {
+    "input": [
+      "STRASSE STE-301",
+      null,
+      "BERLIN",
+      null,
+      "10115",
+      "DE"
+    ],
+    "formatted_address": "Strasse Ste-301, Berlin, 10115, DE"
+  },
+  {
+    "input": [
+      null,
+      null,
+      "Example City",
+      null,
+      "12345-6789",
+      null
+    ],
+    "formatted_address": "Example City, 12345-6789"
+  },
+  {
+    "input": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      "GB"
+    ],
+    "formatted_address": "GB"
+  }
+]

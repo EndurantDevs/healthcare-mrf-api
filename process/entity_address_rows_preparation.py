@@ -10,6 +10,8 @@ from contextlib import asynccontextmanager
 from uuid import uuid4
 
 from db.plan_release_storage import storage_relation
+from process import entity_address_aggregation_batch as aggregation
+from process import entity_address_batch as address_batches
 from process import entity_address_ordinary_preparation as ordinary_preparation
 from process import entity_address_preparation_admission as admission
 from process import entity_address_rows_native as rows
@@ -116,16 +118,39 @@ async def _scratch_tables(sql, schema, source_select, include_base_address_versi
 
 
 async def _candidate_metadata(driver, schema, name):
-    return await driver.fetch(
-        "SELECT a.attname, CASE WHEN c.collnamespace='pg_catalog'::regnamespace AND "
-        "((c.collname IN ('C','POSIX') AND c.collprovider='c' AND c.collversion IS NULL) OR "
-        "(c.collname='default' AND d.datlocprovider='c' AND d.datcollate IN ('C','POSIX') "
-        "AND d.datctype IN ('C','POSIX'))) THEN TRUE ELSE FALSE END AS is_case_qualified "
-        "FROM pg_attribute a LEFT JOIN pg_collation c ON c.oid=a.attcollation "
-        "CROSS JOIN pg_database d WHERE a.attrelid=to_regclass($1) AND a.attnum>0 "
-        "AND NOT a.attisdropped AND d.datname=current_database() ORDER BY a.attnum",
+    """Qualify actual column behavior while per-row guards retain Unicode SQL."""
+    metadata = await driver.fetch(
+        "SELECT attname,attcollation<>0 AS is_collatable FROM pg_attribute "
+        "WHERE attrelid=to_regclass($1) AND attnum>0 AND NOT attisdropped ORDER BY attnum",
         f"{schema}.{name}",
     )
+    fields = [entry["attname"] for entry in metadata if entry["is_collatable"]]
+    probes = []
+    for field in fields:
+        column = '"' + field.replace('"', '""') + '"'
+        prefix = f"left(COALESCE(b.{column}::text,''),0)"
+        probes.append(
+            f"convert_to(lower({prefix}||$1),'UTF8')=convert_to($2,'UTF8') AND "
+            f"convert_to(upper({prefix}||$2),'UTF8')=convert_to($1,'UTF8') AND "
+            f"convert_to(regexp_replace(lower({prefix}||$3),'[^a-z0-9]','','g'),'UTF8')=convert_to($4,'UTF8') AND "
+            f"convert_to(regexp_replace({prefix}||$3,'[^0-9]','','g'),'UTF8')=convert_to('0123456789','UTF8')"
+        )
+    qualified = (
+        await driver.fetchrow(
+            f"SELECT {','.join(probes)} FROM {storage_relation(schema, name)} b LIMIT 1",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "abcdefghijklmnopqrstuvwxyz",
+            "".join(chr(code_point) for code_point in range(1, 128)),
+            "0123456789abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+        )
+        if probes
+        else None
+    )
+    qualified_by_field = dict(zip(fields, qualified or [True] * len(fields), strict=True))
+    return [
+        dict(attname=entry["attname"], is_case_qualified=qualified_by_field.get(entry["attname"], False))
+        for entry in metadata
+    ]
 
 
 def _source_projection(sql, metadata, candidate, prepared):
@@ -272,13 +297,20 @@ async def run_prepared_source(sql, schema, source_select, consume, *, include_ba
 
 
 async def run_prepared_source_phase(
-    sql, db_schema, source_select, build_sql, phase_options, *, include_base_address_version=True
+    sql, db_schema, source_select, build_sql, phase_options, *, include_base_address_version=True, stage_table=None
 ):
     """Share bounded source preparation across raw loading and direct materialization."""
 
     async def consume(select_sql, *, native_prepared):
         """Keep source progress and the final insert on the original admitted backend."""
-        return await sql._run_sql_phase(build_sql(select_sql, native_prepared=native_prepared), **phase_options)
+        async with address_batches.prepared_source(
+            sql, db_schema, select_sql, enabled=native_prepared and not include_base_address_version
+        ):
+            if native_prepared and not include_base_address_version and stage_table is not None:
+                return await aggregation.materialize_direct(
+                    sql, db_schema, stage_table, select_sql, build_sql, phase_options
+                )
+            return await sql._run_sql_phase(build_sql(select_sql, native_prepared=native_prepared), **phase_options)
 
     return await run_prepared_source(
         sql,

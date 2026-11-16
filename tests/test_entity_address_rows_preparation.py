@@ -4,7 +4,7 @@ import asyncio
 import threading
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -27,6 +27,105 @@ def test_copy_export_refuses_overflow_without_retaining_partial_chunk(monkeypatc
     with pytest.raises(RuntimeError, match="measured byte budget"):
         buffer.write(b"i")
     assert buffer.getvalue() == b"abcdefgh"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "native,include_version,stage",
+    [(True, False, "direct"), (True, False, None), (True, True, "raw"), (False, False, "direct")],
+)
+async def test_prepared_phase_routes_only_complete_direct_inputs_to_aggregation(
+    monkeypatch, native, include_version, stage
+):
+    """Raw, fallback and unstaged callers retain ordinary SQL execution."""
+    events = []
+    phase_options_by_name = {"context": {}, "phase": "preparing source"}
+    sql = SimpleNamespace(_run_sql_phase=AsyncMock(return_value="sql result"))
+
+    async def prepared(sql_arg, schema, source, consume, *, include_base_address_version):
+        assert (sql_arg, schema, source, include_base_address_version) == (
+            sql,
+            "data",
+            "SELECT original",
+            include_version,
+        )
+        return await consume("SELECT prepared", native_prepared=native)
+
+    @asynccontextmanager
+    async def cached(sql_arg, schema, source, *, enabled):
+        assert (sql_arg, schema, source) == (sql, "data", "SELECT prepared")
+        events.append(("cache", enabled))
+        try:
+            yield
+        finally:
+            events.append("retired")
+
+    build = Mock(return_value="INSERT prepared")
+    materialize = AsyncMock(return_value="direct result")
+    monkeypatch.setattr(preparation, "run_prepared_source", prepared)
+    monkeypatch.setattr(preparation.address_batches, "prepared_source", cached)
+    monkeypatch.setattr(preparation.aggregation, "materialize_direct", materialize)
+    phase_outcome = await preparation.run_prepared_source_phase(
+        sql,
+        "data",
+        "SELECT original",
+        build,
+        phase_options_by_name,
+        include_base_address_version=include_version,
+        stage_table=stage,
+    )
+    direct = native and not include_version and stage is not None
+    assert events == [("cache", native and not include_version), "retired"]
+    if direct:
+        assert phase_outcome == "direct result"
+        materialize.assert_awaited_once_with(sql, "data", stage, "SELECT prepared", build, phase_options_by_name)
+        build.assert_not_called()
+        sql._run_sql_phase.assert_not_called()
+    else:
+        assert phase_outcome == "sql result"
+        materialize.assert_not_called()
+        build.assert_called_once_with("SELECT prepared", native_prepared=native)
+        sql._run_sql_phase.assert_awaited_once_with("INSERT prepared", **phase_options_by_name)
+
+
+@pytest.mark.asyncio
+async def test_direct_prepared_failure_retires_its_label_cache(monkeypatch):
+    """A failed direct materialization must leave no source cache active."""
+    events = []
+
+    async def prepared(sql, schema, source, consume, **options):
+        return await consume(source, native_prepared=True)
+
+    @asynccontextmanager
+    async def cached(database, schema, name, source, **options):
+        assert schema == "data" and options == {"temporary": True}
+        assert "FROM (SELECT prepared) b" in source
+        events.append("created")
+        try:
+            yield '"pg_temp"."labels"'
+        finally:
+            events.append("retired")
+
+    async def fail(*args):
+        assert preparation.address_batches._TABLE.get() == '"pg_temp"."labels"'
+        raise RuntimeError("direct insert failed")
+
+    monkeypatch.setattr(preparation, "run_prepared_source", prepared)
+    monkeypatch.setattr(preparation.address_batches, "_can_stage", lambda: True)
+    monkeypatch.setattr(preparation.address_batches.stage, "staged_address_fields", cached)
+    monkeypatch.setattr(preparation.aggregation, "materialize_direct", fail)
+    with pytest.raises(RuntimeError, match="direct insert failed"):
+        await preparation.run_prepared_source_phase(
+            SimpleNamespace(db=object()),
+            "data",
+            "SELECT prepared",
+            Mock(),
+            {},
+            include_base_address_version=False,
+            stage_table="direct",
+        )
+    assert events == ["created", "retired"]
+    assert preparation.address_batches._TABLE.get() is None
 
 
 @pytest.mark.parametrize("include_version", [False, True])
@@ -368,6 +467,35 @@ async def test_connected_builders_preserve_alias_origin_arrays_and_contacts(monk
             for result_row in actual_rows
         ) == (2 if mode == "raw" else 1)
         await assert_no_row_scratch(database, schema)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode,mixed", [("raw", False), ("direct", False), ("direct", True)])
+async def test_distinct_address_batches_preserve_complete_materialization(monkeypatch, mode, mixed):
+    from tests.entity_address_batch_postgres_support import compare_builders
+
+    await compare_builders(monkeypatch, mode, mixed=mixed)
+
+
+@pytest.mark.asyncio
+async def test_native_identity_alias_failure_retires_distinct_cache(monkeypatch):
+    from tests.entity_address_batch_postgres_support import assert_alias_failure_cleanup
+
+    await assert_alias_failure_cleanup(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_direct_label_cache_failure_rolls_back_complete_candidate(monkeypatch):
+    from tests.entity_address_batch_postgres_support import assert_direct_failure_rollback
+
+    await assert_direct_failure_rollback(monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_owner_activates_and_retires_native_address_cache(monkeypatch):
+    from tests.entity_address_batch_postgres_support import assert_ordinary_cache_activation
+
+    await assert_ordinary_cache_activation(monkeypatch)
 
 
 @pytest.mark.asyncio

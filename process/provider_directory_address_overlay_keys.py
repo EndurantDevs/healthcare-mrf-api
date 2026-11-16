@@ -87,6 +87,9 @@ def location_key_page_sql(context: dict[str, str], is_source_scoped: bool) -> st
            AND {_has_portable_text_sql("loc.first_line")}
            AND {_has_portable_text_sql("loc.second_line")}
            AND {_has_portable_text_sql("loc.city_name")}
+           AND {_has_portable_text_sql("COALESCE(NULLIF(loc.state_name, ''), loc.state_code)")}
+           AND {_has_portable_text_sql("loc.postal_code")}
+           AND {_has_portable_text_sql(context["location_country_expr"])}
            {source_scope}
          ORDER BY loc.source_id, loc.resource_id
          LIMIT :page_rows;
@@ -101,6 +104,11 @@ async def _stage_location_key_pages(
     canonicalize: Any,
 ) -> int:
     """Key every scoped Location without a stamped key, one native batch per page."""
+    from process import provider_directory_address_batch
+
+    prepared = await provider_directory_address_batch.stage_location_keys(fhir, schema, key_table, source_ids)
+    if prepared is not None:
+        return prepared
     page_sql = location_key_page_sql(fhir._address_overlay_sql_context(schema, None, None), bool(source_ids))
     scope_params_by_name = {"source_ids": source_ids} if source_ids else {}
     # The caller's executor reads and writes, so an open transaction still sees its own key table.

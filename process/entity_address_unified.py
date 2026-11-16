@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
@@ -36,7 +37,10 @@ from db.models import (
     db,
 )
 from db.models.entity_address_unified import ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES
+from process import entity_address_aggregation_batch as aggregate_batches
+from process import entity_address_batch as address_batches
 from process import entity_address_candidate_preparation as candidate_preparation
+from process import entity_address_partial_projection as partial_projection
 from process import entity_address_preparation_admission as preparation_admission
 from process import entity_address_result_generation as result_generation
 from process import entity_address_rows_native as row_preparation
@@ -86,6 +90,7 @@ from process.ext.address_format import (
 )
 from process.ext.utils import ensure_database, make_class, my_init_db, print_time_info
 from process.live_progress import enqueue_live_progress, write_live_progress
+from process.live_progress import write_phase_progress as _emit_phase_progress
 from process.provider_directory_generic_source_artifacts import lock_address_source_fence
 from process.redis_config import build_redis_settings
 from process.serialization import deserialize_job, serialize_job
@@ -661,6 +666,20 @@ async def _status_with_entity_address_tuning(statement: str) -> int | None:
     return await preparation_admission.tuned_status(statement)
 
 
+async def _emit_sql_progress(context: dict, **payload) -> None:
+    if context.get("finalizing_phase_progress"):
+        await _emit_phase_progress(
+            payload["run_id"],
+            payload["phase"],
+            unit="operations",
+            done=int(payload["done"] or 0),
+            total=int(payload["total"] or 1),
+            message=payload["message"],
+        )
+    else:
+        enqueue_live_progress(**payload)
+
+
 async def _run_sql_phase(
     statement: str,
     *,
@@ -676,45 +695,34 @@ async def _run_sql_phase(
     emit_done: bool = False,
 ) -> int | None:
     started = time.monotonic()
+    progress_by_field = dict(
+        run_id=run_id,
+        importer="entity-address-unified",
+        status="running",
+        phase=phase,
+        unit=unit,
+        done=done,
+        total=total,
+        pct=pct,
+        message=message or phase,
+        source="entity-address-unified-sql-progress",
+    )
     if run_id and emit_start:
-        enqueue_live_progress(
-            run_id=run_id,
-            importer="entity-address-unified",
-            status="running",
-            phase=phase,
-            unit=unit,
-            done=done,
-            total=total,
-            pct=pct,
-            message=message or phase,
-            source="entity-address-unified-sql-progress",
-        )
+        await _emit_sql_progress(context, **progress_by_field)
     rowcount = await _status_with_entity_address_tuning(statement)
     elapsed = time.monotonic() - started
     _record_phase_timing(context, phase, elapsed, rowcount)
     if run_id and emit_done:
-        complete_message = message or phase
-        if rowcount is not None and rowcount >= 0:
-            complete_message = f"{complete_message}: {rowcount:,} row(s), {_format_seconds(elapsed)}"
-        else:
-            complete_message = f"{complete_message}: {_format_seconds(elapsed)}"
-        enqueue_live_progress(
-            run_id=run_id,
-            importer="entity-address-unified",
-            status="running",
-            phase=phase,
-            unit=unit,
-            done=done,
-            total=total,
-            pct=pct,
-            message=complete_message,
-            source="entity-address-unified-sql-progress",
-        )
+        count_message = f"{rowcount:,} row(s), " if rowcount is not None and rowcount >= 0 else ""
+        progress_by_field["message"] = f"{message or phase}: {count_message}{_format_seconds(elapsed)}"
+        if context.get("finalizing_phase_progress"):
+            progress_by_field["done"] = total or 1
+        await _emit_sql_progress(context, **progress_by_field)
     return rowcount
 
 
 async def _run_prepared_source_phase(
-    db_schema, source_select, build_sql, phase_options, *, include_base_address_version=True
+    db_schema, source_select, build_sql, phase_options, *, include_base_address_version=True, stage_table=None
 ):
     """Share the preparation transaction and progress adapter across both SQL builders."""
     return await prepared_rows.run_prepared_source_phase(
@@ -724,6 +732,7 @@ async def _run_prepared_source_phase(
         build_sql,
         phase_options,
         include_base_address_version=include_base_address_version,
+        **({} if stage_table is None else {"stage_table": stage_table}),
     )
 
 
@@ -1201,21 +1210,51 @@ def _is_postgis_unavailable_error(exc: Exception) -> bool:
     return mentions_postgis and (sqlstate in {"42704", "42883"} or explicitly_missing)
 
 
+@dataclass
+class _StageIndexProgress:
+    run_id: str
+    total: int
+    lock: asyncio.Lock
+    completed: int = 0
+
+
+async def _report_stage_index_progress(
+    progress: _StageIndexProgress | None, index_name: str, *, completed: bool
+) -> None:
+    if progress is None:
+        return
+    async with progress.lock:
+        progress.completed += int(completed)
+        await _emit_phase_progress(
+            progress.run_id,
+            "entity-address-unified indexing stage",
+            unit="indexes",
+            done=progress.completed,
+            total=progress.total,
+            message=f"{'finished' if completed else 'building'} {index_name}; "
+            f"{progress.completed}/{progress.total} indexes finished",
+        )
+
+
 async def _build_stage_index(
     index_name: str,
     statement: str,
     phase_context: dict,
     postgis_skipped_indexes: list[str],
+    progress: _StageIndexProgress | None = None,
 ) -> None:
     """Build one stage index while retaining timing and PostGIS fallback."""
 
+    await _report_stage_index_progress(progress, index_name, completed=False)
     started_at = time.time()
+    is_completed = False
     try:
         await _run_sql_phase(
             statement,
             context=phase_context,
             phase="entity-address-unified indexing stage",
         )
+        is_completed = True
     except Exception as exc:
         if candidate_preparation.current() is None and _is_postgis_unavailable_error(exc):
             logger.warning(
@@ -1224,6 +1263,7 @@ async def _build_stage_index(
                 exc,
             )
             postgis_skipped_indexes.append(index_name)
+            is_completed = True
             return
         raise
     finally:
@@ -1237,6 +1277,8 @@ async def _build_stage_index(
                 "finished_at": round(finished_at, 6),
             }
         )
+        if is_completed:
+            await _report_stage_index_progress(progress, index_name, completed=True)
 
 
 async def _build_guarded_stage_index(
@@ -1244,6 +1286,7 @@ async def _build_guarded_stage_index(
     phase_context: dict,
     postgis_skipped_indexes: list[str],
     semaphore: asyncio.Semaphore,
+    progress: _StageIndexProgress | None = None,
 ) -> None:
     """Build one stage index inside the configured concurrency bound."""
 
@@ -1252,6 +1295,7 @@ async def _build_guarded_stage_index(
             *index_statement,
             phase_context,
             postgis_skipped_indexes,
+            progress,
         )
 
 
@@ -1263,6 +1307,12 @@ async def _run_stage_index_statements(
 ) -> None:
     """Run stage-index statements with the original ordering and failures."""
 
+    run_id = str(phase_context.get("control_run_id") or "")
+    progress = (
+        _StageIndexProgress(run_id, len(statements), asyncio.Lock())
+        if run_id and phase_context.get("finalizing_phase_progress")
+        else None
+    )
     if index_concurrency <= 1 or len(statements) == 1:
         for index_name, statement in statements:
             await _build_stage_index(
@@ -1270,6 +1320,7 @@ async def _run_stage_index_statements(
                 statement,
                 phase_context,
                 postgis_skipped_indexes,
+                progress,
             )
         return
     semaphore = asyncio.Semaphore(index_concurrency)
@@ -1280,6 +1331,7 @@ async def _run_stage_index_statements(
                 phase_context,
                 postgis_skipped_indexes,
                 semaphore,
+                progress,
             )
             for index_name, statement in statements
         ),
@@ -4068,6 +4120,16 @@ def _provider_directory_partial_overlay_source_select(
 ) -> str:
     """Project only current, dataset-member Provider Directory overlay rows."""
 
+    cached = partial_projection.cached_overlay_source(
+        importlib.import_module(__name__),
+        db_schema,
+        available,
+        source_ids=source_ids,
+        run_id=run_id,
+        affected_group_table=affected_group_table,
+    )
+    if cached is not None:
+        return cached
     npi_join, primary_npi_address_join, array_expressions = _partial_overlay_npi_context_sql(db_schema, available)
     entity_name = _npi_entity_name_expr("n") if npi_join else "NULL::varchar"
     entity_subtype = _npi_entity_subtype_expr("n") if npi_join else "NULL::varchar"
@@ -4157,21 +4219,7 @@ def _string_array_literal(values: list[str]) -> str:
 
 
 def _entity_address_evidence_group_match_sql(group_alias: str, row_alias: str) -> str:
-    return (
-        f"{group_alias}.entity_type = {row_alias}.entity_type\n"
-        f"       AND {group_alias}.entity_id = {row_alias}.entity_id\n"
-        f"       AND (\n"
-        f"            ({group_alias}.address_key IS NOT NULL AND {row_alias}.address_key IS NOT NULL "
-        f"AND {group_alias}.address_key = {row_alias}.address_key)\n"
-        f"            OR (\n"
-        f"                {group_alias}.street_key IS NOT DISTINCT FROM {_street_soft_norm_expr(f'{row_alias}.first_line')}\n"
-        f"            AND {group_alias}.city_key IS NOT DISTINCT FROM {_alnum_norm_expr(f'{row_alias}.city_name')}\n"
-        f"            AND {group_alias}.state_key IS NOT DISTINCT FROM {_state_norm_expr(f'{row_alias}.state_name')}\n"
-        f"            AND {group_alias}.zip_key IS NOT DISTINCT FROM {_zip5_norm_expr(f'{row_alias}.postal_code')}\n"
-        f"            AND {group_alias}.country_key IS NOT DISTINCT FROM {_state_norm_expr(f'{row_alias}.country_code')}\n"
-        f"            )\n"
-        f"       )"
-    )
+    return address_batches.group_match_sql(importlib.import_module(__name__), group_alias, row_alias)
 
 
 def _entity_address_row_npi_expr(row_alias: str) -> str:
@@ -4194,7 +4242,8 @@ def _affected_live_location_table(stage_table: str) -> str:
 
 def _is_provider_directory_source_select(db_schema: str, source_select: str) -> bool:
     return (
-        f"FROM {db_schema}.provider_directory_practitioner_role AS role" in source_select
+        partial_projection.is_cached_source_sql(source_select)
+        or f"FROM {db_schema}.provider_directory_practitioner_role AS role" in source_select
         or f"FROM {db_schema}.provider_directory_organization_affiliation AS affiliation" in source_select
         or f"FROM {db_schema}.provider_directory_organization AS organization" in source_select
         or f"FROM {db_schema}.{candidate_preparation.table_name('provider_directory_address_overlay')} AS overlay"
@@ -4203,82 +4252,13 @@ def _is_provider_directory_source_select(db_schema: str, source_select: str) -> 
 
 
 def _provider_directory_current_group_select_sql(source_select: str) -> str:
-    return f"""
-    SELECT DISTINCT
-        src.entity_type::varchar AS entity_type,
-        src.entity_id::varchar AS entity_id,
-        CASE
-            WHEN src.entity_type = 'npi' AND src.entity_id ~ '^[0-9]+$'
-                THEN src.entity_id::bigint
-            ELSE NULL::bigint
-        END AS entity_npi,
-        src.address_key::uuid AS address_key,
-        {_street_soft_norm_expr("src.first_line")}::varchar AS street_key,
-        {_alnum_norm_expr("src.city_name")}::varchar AS city_key,
-        {_state_norm_expr("src.state_name")}::varchar AS state_key,
-        {_zip5_norm_expr("src.postal_code")}::varchar AS zip_key,
-        {_state_norm_expr("src.country_code")}::varchar AS country_key
-      FROM (
-            {source_select.strip()}
-      ) AS src
-     WHERE src.entity_type IS NOT NULL
-       AND src.entity_id IS NOT NULL
-       AND (
-            src.address_key IS NOT NULL
-         OR NULLIF(TRIM(src.first_line), '') IS NOT NULL
-         OR NULLIF(TRIM(src.city_name), '') IS NOT NULL
-       )
-    """
+    return address_batches.current_group_select_sql(importlib.import_module(__name__), source_select)
 
 
-def _prepare_partial_affected_groups_sql(
-    db_schema: str,
-    group_table: str,
-    source_selects: list[str],
-    *,
-    source_ids: list[str] | tuple[str, ...] | None = None,
-) -> str:
-    provider_selects = [
-        source_select
-        for source_select in source_selects
-        if _is_provider_directory_source_select(db_schema, source_select)
-    ]
-    if not provider_selects:
-        raise RuntimeError(
-            "entity-address-unified provider-directory-partial refresh requires "
-            "available Provider Directory source tables."
-        )
-    current_groups_sql = "\nUNION\n".join(
-        _provider_directory_current_group_select_sql(source_select) for source_select in provider_selects
+def _prepare_partial_affected_groups_sql(db_schema, group_table, source_selects, *, source_ids=None):
+    return address_batches.prepare_partial_groups_sql(
+        importlib.import_module(__name__), db_schema, group_table, source_selects, source_ids=source_ids
     )
-    live_source_filter = _provider_directory_live_source_filter_sql(
-        db_schema,
-        "live",
-        source_ids=source_ids,
-    )
-    return f"""
-    CREATE UNLOGGED TABLE {db_schema}.{group_table} AS
-    SELECT DISTINCT
-        live.entity_type::varchar AS entity_type,
-        live.entity_id::varchar AS entity_id,
-        CASE
-            WHEN live.entity_type = 'npi' AND live.entity_id ~ '^[0-9]+$'
-                THEN live.entity_id::bigint
-            ELSE NULL::bigint
-        END AS entity_npi,
-        live.address_key::uuid AS address_key,
-        {_street_soft_norm_expr("live.first_line")}::varchar AS street_key,
-        {_alnum_norm_expr("live.city_name")}::varchar AS city_key,
-        {_state_norm_expr("live.state_name")}::varchar AS state_key,
-        {_zip5_norm_expr("live.postal_code")}::varchar AS zip_key,
-        {_state_norm_expr("live.country_code")}::varchar AS country_key
-      FROM {db_schema}.{EntityAddressUnified.__main_table__} AS live
-     WHERE live.address_sources @> ARRAY['provider_directory_fhir']::varchar[]
-       AND live.location_key IS NOT NULL
-       {live_source_filter}
-    UNION
-    {current_groups_sql};
-    """
 
 
 def _index_affected_groups_sql(db_schema: str, group_table: str) -> str:
@@ -4927,75 +4907,7 @@ async def _assert_provider_directory_overlay_alias_fence(
         raise RuntimeError("Provider Directory address overlay changed during entity-address-unified build")
 
 
-_RAW_ALIAS_INTEGRITY_SQL = """
-    WITH raw_candidates AS (
-        SELECT DISTINCT
-            raw.address_key,
-            raw.address_source,
-            raw.first_line,
-            raw.second_line,
-            raw.city_name,
-            raw.state_name,
-            raw.postal_code,
-            raw.country_code
-        FROM {db_schema}.{raw_table} AS raw
-        {checksum_where}
-    ), matching AS (
-        SELECT
-            active.source_address_key,
-            active.target_address_key,
-            active.source_identity_key,
-            active.target_identity_key AS recorded_target_identity_key,
-            {db_schema}.addr_identity_key_v1(
-                raw.first_line,
-                raw.second_line,
-                raw.city_name,
-                raw.state_name,
-                raw.postal_code,
-                raw.country_code
-            ) AS current_source_identity_key,
-            target.identity_key AS current_target_identity_key,
-            target.address_key AS current_target_address_key
-        FROM raw_candidates AS raw
-        JOIN {db_schema}.{alias_table} AS active
-          ON active.source_address_key IN (
-                raw.address_key,
-                {computed_address_key}
-             )
-         AND active.revoked_at IS NULL
-        LEFT JOIN {db_schema}.{archive_relation} AS target
-          ON target.address_key = active.target_address_key
-         AND target.merged_into IS NULL
-    ), violations AS (
-        SELECT
-            CASE
-                WHEN source_identity_key IS DISTINCT FROM current_source_identity_key
-                    THEN 'source_identity_mismatch'
-                WHEN current_target_address_key IS NULL
-                    THEN 'missing_or_merged_target'
-                WHEN recorded_target_identity_key IS DISTINCT FROM current_target_identity_key
-                    THEN 'target_identity_mismatch'
-                ELSE NULL
-            END AS violation_kind,
-            source_address_key,
-            target_address_key
-        FROM matching
-        UNION ALL
-        SELECT
-            'multi_hop_alias',
-            matching.source_address_key,
-            matching.target_address_key
-        FROM matching
-        JOIN {db_schema}.{alias_table} AS downstream
-          ON downstream.source_address_key = matching.target_address_key
-         AND downstream.revoked_at IS NULL
-    )
-    SELECT *
-    FROM violations
-    WHERE violation_kind IS NOT NULL
-    ORDER BY violation_kind, source_address_key
-    LIMIT 1;
-"""
+_RAW_ALIAS_INTEGRITY_SQL = address_batches.ALIAS_INTEGRITY_SQL
 
 
 @dataclass
@@ -5057,6 +4969,7 @@ async def _raw_alias_integrity_violation_for_range(
     checksum_range: tuple[int | None, int | None],
     semaphore: asyncio.Semaphore,
     progress: _AliasIntegrityProgress,
+    is_address_canon_available: bool = True,
 ):
     """Return one range's first alias violation and report its completion."""
     checksum_min, checksum_max = checksum_range
@@ -5071,8 +4984,12 @@ async def _raw_alias_integrity_violation_for_range(
                 raw_table=raw_table,
                 alias_table=address_alias_sql.ADDRESS_ALIAS_TABLE,
                 archive_relation=candidate_preparation.table_name("address_archive_v2"),
-                computed_address_key=computed_address_key,
+                computed_address_key=address_batches.key_sql(
+                    computed_address_key, "raw.address_source", is_address_canon_available
+                ),
                 checksum_where=checksum_where,
+                source_identity_key=address_batches.identity_sql(db_schema, "raw"),
+                batch_join=address_batches.join_sql("raw"),
             ),
         )
     await _report_raw_alias_integrity_progress(progress, is_completed=True)
@@ -5138,7 +5055,7 @@ async def _validate_raw_alias_integrity(
     )
     await _report_raw_alias_integrity_progress(progress, is_completed=False)
     semaphore = asyncio.Semaphore(max(1, min(int(concurrency), len(shard_ranges))))
-    shard_outcomes = await preparation_admission.gather(
+    shard_outcomes = await address_batches.gather(
         *(
             _raw_alias_integrity_violation_for_range(
                 db_schema,
@@ -5147,6 +5064,7 @@ async def _validate_raw_alias_integrity(
                 checksum_range,
                 semaphore,
                 progress,
+                is_address_canon_available=is_address_canon_available,
             )
             for checksum_range in shard_ranges
         ),
@@ -5203,11 +5121,8 @@ def _available_archive_enrichment_sql(
         "HLTHPRT_ENTITY_ADDRESS_UNIFIED_TRUST_SOURCE_ADDRESS_KEY",
         DEFAULT_TRUST_SOURCE_ADDRESS_KEY,
     )
-    source_identity_key = (
-        f"{db_schema}.addr_identity_key_v1("
-        "r.first_line, r.second_line, r.city_name, r.state_name, "
-        "r.postal_code, r.country_code)"
-    )
+    source_identity_key = address_batches.identity_sql(db_schema, "r")
+    computed_address_key = address_batches.key_sql(computed_address_key, "r.address_source", is_address_canon_available)
     candidate_values = (
         f"(r.address_key, 0), ({computed_address_key}, 1)"
         if should_trust_source_key
@@ -5280,13 +5195,12 @@ def _enriched_raw_cte_sql(
             r.country_code,
             r.address_key AS source_address_key,
             {archive_fields},
-            NULLIF(LEFT(REGEXP_REPLACE(COALESCE(r.postal_code, ''), '[^0-9]', '', 'g'), 5), '')::varchar AS source_zip5,
-            NULLIF(upper(left(BTRIM(COALESCE(r.state_name, '')), 2)), '')::varchar AS source_state_code,
-            NULLIF(regexp_replace(lower(COALESCE(r.city_name, '')), '[^a-z0-9]', '', 'g'), '')::varchar AS source_city_norm,
+            {address_batches.raw_normalized_sql(importlib.import_module(__name__))},
             {_source_id_expr("r.address_source")}::smallint AS source_id,
             {_source_mask_expr("r.address_source")}::bigint AS source_mask,
             {_address_role_id_expr("r.type")}::smallint AS address_role_id
           FROM {db_schema}.{raw_table} r
+          {address_batches.join_sql("r")}
           {archive_join}
          {checksum_where}
     ),"""
@@ -5299,6 +5213,7 @@ def _enriched_raw_keyed_cte_sql(*, archive_available: bool) -> str:
     keyed AS (
         SELECT
             row_id,
+            native_fields,
             entity_type,
             entity_id,
             first_line,
@@ -5741,30 +5656,23 @@ async def _validate_geo_assurance_projection(
     return invalid_rows
 
 
-def _emit_geo_assurance_progress(
+async def _emit_geo_assurance_progress(
     run_id: str,
     stage_rows: int,
     *,
     projected_rows: int = 0,
     elapsed: float | None = None,
 ) -> None:
-    if not run_id:
-        return
-    phase = "entity-address-unified projecting geo assurance"
-    message = "projecting durable provider geo assurance"
+    message = f"projecting durable provider geo assurance for {stage_rows:,} staged rows"
     if elapsed is not None:
         message = f"{message}: {projected_rows:,} row(s), {_format_seconds(elapsed)}"
-    enqueue_live_progress(
-        run_id=run_id,
-        importer="entity-address-unified",
-        status="running",
-        phase=phase,
-        unit="rows",
-        done=projected_rows,
-        total=stage_rows,
-        pct=97,
+    await _emit_phase_progress(
+        run_id,
+        "entity-address-unified projecting geo assurance",
+        unit="operations",
+        done=int(elapsed is not None),
+        total=1,
         message=message,
-        source="entity-address-unified-sql-progress",
     )
 
 
@@ -5779,7 +5687,7 @@ async def _materialize_geo_assurance(
     dependency_bindings=None,
     record_candidate: bool = True,
 ) -> int:
-    _emit_geo_assurance_progress(run_id, stage_rows)
+    await _emit_geo_assurance_progress(run_id, stage_rows)
     started = time.monotonic()
     projected_rows, invalid_rows, candidate_table_oid, effective_force = await _project_geo_assurance_transaction(
         db_schema,
@@ -5798,7 +5706,7 @@ async def _materialize_geo_assurance(
     context["geo_assurance_candidate_table_oid"] = candidate_table_oid
     context["geo_assurance_forced_full_projection"] = effective_force
     context["invalid_geo_assurance_rows"] = invalid_rows
-    _emit_geo_assurance_progress(
+    await _emit_geo_assurance_progress(
         run_id,
         stage_rows,
         projected_rows=projected_rows,
@@ -6291,6 +6199,37 @@ async def _is_location_primary_key_validated(db_schema: str, table_name: str) ->
             """,
         )
     )
+
+
+@asynccontextmanager
+async def _snapshot_publication_progress(context: dict, run_id: str):
+    phase = "entity-address-unified preparing snapshot publication"
+    await _emit_phase_progress(
+        run_id, phase, unit="operations", done=0, total=1, message="validating finalized snapshot for publication"
+    )
+    started = time.monotonic()
+    yield
+    _record_phase_timing(context, phase, time.monotonic() - started, context.get("staged_rows"))
+    await _emit_phase_progress(
+        run_id, phase, unit="operations", done=1, total=1, message="snapshot publication preparation complete"
+    )
+
+
+async def _run_publish_validation(
+    db_schema, stage_table, support_classes, context, run_id, *, phase="entity-address-unified validating publication"
+):
+    await _emit_phase_progress(
+        run_id, phase, unit="operations", done=0, total=1, message="validating finalized publication"
+    )
+    started = time.monotonic()
+    result = await _validate_publish_integrity(
+        db_schema, stage_table, support_classes, test_mode=bool(context.get("test_mode"))
+    )
+    _record_phase_timing(context, phase, time.monotonic() - started, context.get("staged_rows"))
+    await _emit_phase_progress(
+        run_id, phase, unit="operations", done=1, total=1, message="publication validation complete"
+    )
+    return result
 
 
 async def _validate_publish_integrity(
@@ -7191,48 +7130,9 @@ def _raw_materialize_select_assurance_sql(array_selects: str) -> str:
         {array_selects},"""
 
 
-def _raw_materialize_select_address_sql(db_schema: str, array_join: str) -> str:
-    """Build address fields and the final raw aggregation join."""
-
-    return f"""
-        base_address_version,
-        checksum,
-        type,
-        taxonomy_array,
-        plans_network_array,
-        procedures_array,
-        medications_array,
-        first_line,
-        second_line,
-        city_name,
-        state_name,
-        postal_code,
-        country_code,
-        telephone_number,
-        fax_number,
-        phone_number,
-        phone_extension,
-        fax_number_digits,
-        fax_extension,
-        {db_schema}.{ADDRESS_FORMAT_FUNCTION}(
-            first_line,
-            second_line,
-            city_name,
-            state_name,
-            postal_code,
-            country_code
-        ) AS formatted_address,
-        {ADDRESS_FORMAT_VERSION}::smallint AS formatted_address_version,
-        '{ADDRESS_FORMAT_SOURCE}'::varchar AS formatted_address_source,
-        lat,
-        long,
-        date_added,
-        place_id,
-        address_key,
-        updated_at,
-        updated_at AS last_seen_at
-      FROM aggregated{array_join};
-    """
+def _raw_materialize_select_address_sql(db_schema, array_join, *, defer_labels=False):
+    """Build the final projection with the ordinary distinct address cache."""
+    return address_batches.raw_materialize_select_address_sql(db_schema, array_join, defer_labels=defer_labels)
 
 
 def _materialize_from_raw_sql(
@@ -7244,49 +7144,22 @@ def _materialize_from_raw_sql(
     checksum_remainder: int | None = None,
     is_address_canon_available: bool = True,
     inline_source_evidence: bool = False,
+    defer_labels: bool = False,
 ) -> str:
     """Build SQL that deduplicates raw evidence into unified locations."""
-
-    dedupe_key_expr = _dedupe_key_expr(is_address_canon_available)
-    shard_filter = _raw_materialize_shard_filter_sql(
-        dedupe_key_expr,
-        checksum_modulo,
-        checksum_remainder,
-        inline_source_evidence=inline_source_evidence,
-    )
-    array_fragments = _raw_array_aggregation_sql(
+    return aggregate_batches.materialize_sql(
+        importlib.import_module(__name__),
         db_schema,
+        stage_table,
         raw_table,
-        dedupe_key_expr,
-        shard_filter,
-        should_split=_is_env_enabled(
-            "HLTHPRT_ENTITY_ADDRESS_UNIFIED_SPLIT_ARRAY_AGGREGATES",
-            DEFAULT_SPLIT_ARRAY_AGGREGATES,
+        dict(
+            checksum_modulo=checksum_modulo,
+            checksum_remainder=checksum_remainder,
+            is_address_canon_available=is_address_canon_available,
+            inline_source_evidence=inline_source_evidence,
+            defer_labels=defer_labels,
         ),
     )
-    raw_array_joins, aggregated_array_columns, array_cte, array_join, array_selects = array_fragments
-    sql = "".join(
-        (
-            _raw_materialize_insert_header_sql(db_schema, stage_table),
-            _raw_materialize_insert_tail_sql(),
-            _raw_materialize_aggregate_identity_sql(),
-            _raw_materialize_aggregate_address_sql(
-                db_schema,
-                raw_table,
-                dedupe_key_expr,
-                _source_record_ids_select_sql(),
-                aggregated_array_columns,
-                raw_array_joins,
-                shard_filter,
-                array_cte,
-            ),
-            _raw_materialize_select_assurance_sql(array_selects),
-            _raw_materialize_select_address_sql(db_schema, array_join),
-        )
-    )
-    if inline_source_evidence:
-        return _inline_source_evidence_sql(sql)
-    return sql
 
 
 def _direct_materialize_location_key_sql(*, native_prepared: bool = False) -> str:
@@ -7456,60 +7329,9 @@ def _direct_materialize_aggregated_cte_sql(
     )"""
 
 
-def _direct_materialize_select_sql(db_schema: str) -> str:
-    """Build the final direct materialization projection."""
-
-    return f"""
-    SELECT
-        entity_type,
-        entity_id,
-        npi,
-        inferred_npi,
-        inference_confidence,
-        inference_method,
-        entity_name,
-        entity_subtype,
-        location_key,
-        COALESCE(CARDINALITY(address_sources), 0)::int AS source_count,
-        (COALESCE(CARDINALITY(address_sources), 0) > 1) AS multi_source_confirmed,
-        COALESCE(address_sources, ARRAY[]::varchar[]) AS address_sources,
-        COALESCE(source_record_ids, ARRAY[]::varchar[]) AS source_record_ids,
-        checksum,
-        type,
-        taxonomy_array,
-        plans_network_array,
-        procedures_array,
-        medications_array,
-        first_line,
-        second_line,
-        city_name,
-        state_name,
-        postal_code,
-        country_code,
-        telephone_number,
-        fax_number,
-        phone_number,
-        phone_extension,
-        fax_number_digits,
-        fax_extension,
-        {db_schema}.{ADDRESS_FORMAT_FUNCTION}(
-            first_line,
-            second_line,
-            city_name,
-            state_name,
-            postal_code,
-            country_code
-        ) AS formatted_address,
-        {ADDRESS_FORMAT_VERSION}::smallint AS formatted_address_version,
-        '{ADDRESS_FORMAT_SOURCE}'::varchar AS formatted_address_source,
-        lat,
-        long,
-        date_added,
-        place_id,
-        address_key,
-        updated_at
-      FROM aggregated;
-    """
+def _direct_materialize_select_sql(db_schema, *, defer_labels=False):
+    """Build the final projection with the ordinary distinct address cache."""
+    return address_batches.direct_materialize_select_sql(db_schema, defer_labels=defer_labels)
 
 
 def _materialize_sql(
@@ -7519,6 +7341,7 @@ def _materialize_sql(
     *,
     is_address_canon_available: bool = True,
     native_prepared: bool = False,
+    defer_labels: bool = False,
 ) -> str:
     """Build direct source-to-stage materialization SQL."""
 
@@ -7532,7 +7355,7 @@ def _materialize_sql(
                 _dedupe_key_expr(is_address_canon_available),
                 _source_record_ids_select_sql(),
             ),
-            _direct_materialize_select_sql(db_schema),
+            _direct_materialize_select_sql(db_schema, defer_labels=defer_labels),
         )
     )
 
@@ -7559,33 +7382,12 @@ def _alias_col(alias: str, column: str) -> str:
 
 
 def _evidence_group_key_exprs(alias: str) -> dict[str, str]:
-    address_key = _alias_col(alias, "address_key")
-    return {
-        "street": (
-            f"CASE WHEN {address_key} IS NULL THEN {_street_soft_norm_expr(_alias_col(alias, 'first_line'))} END"
-        ),
-        "city": (
-            f"CASE WHEN {address_key} IS NULL THEN "
-            f"COALESCE(NULLIF({_alias_col(alias, 'city_norm')}, ''), "
-            f"{_alnum_norm_expr(_alias_col(alias, 'city_name'))}) END"
-        ),
-        "state": (
-            f"CASE WHEN {address_key} IS NULL THEN "
-            f"COALESCE(NULLIF({_alias_col(alias, 'state_code')}, ''), "
-            f"{_state_norm_expr(_alias_col(alias, 'state_name'))}) END"
-        ),
-        "zip": (
-            f"CASE WHEN {address_key} IS NULL THEN "
-            f"COALESCE(NULLIF({_alias_col(alias, 'zip5')}, ''), "
-            f"{_zip5_norm_expr(_alias_col(alias, 'postal_code'))}) END"
-        ),
-        "country": (f"CASE WHEN {address_key} IS NULL THEN {_state_norm_expr(_alias_col(alias, 'country_code'))} END"),
-    }
+    return address_batches.evidence_keys(importlib.import_module(__name__), alias)
 
 
 def _evidence_group_hash_expr_for_alias(alias: str, evidence_shards: int) -> str:
     shards = max(int(evidence_shards), 1)
-    keys = _evidence_group_key_exprs(alias)
+    keys = address_batches.evidence_keys(importlib.import_module(__name__), alias, payload_alias=alias)
     return f"""
         (((hashtext(CONCAT_WS(
             '|',
@@ -7619,6 +7421,7 @@ def _inline_source_evidence_sql(sql: str) -> str:
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT src.src ORDER BY src.src), NULL)::varchar[] AS evidence_sources,
             ARRAY_REMOVE(ARRAY_AGG(DISTINCT rid.rid ORDER BY rid.rid), NULL)::varchar[] AS evidence_record_ids
           FROM aggregated AS agg
+          {address_batches.join_sql("agg")}
           LEFT JOIN LATERAL unnest(COALESCE(agg.address_sources, ARRAY[]::varchar[])) AS src(src) ON TRUE
           LEFT JOIN LATERAL unnest(COALESCE(agg.source_record_ids, ARRAY[]::varchar[])) AS rid(rid) ON TRUE
          GROUP BY 1,2,3,4,5,6,7,8
@@ -7639,7 +7442,7 @@ def _inline_source_evidence_sql(sql: str) -> str:
         "        COALESCE(e.evidence_record_ids, source_record_ids, ARRAY[]::varchar[]) AS source_record_ids,",
     )
     joined_keys = _evidence_group_key_exprs("aggregated")
-    join_sql = f"""FROM aggregated
+    join_sql = f"""FROM aggregated{address_batches.join_sql("aggregated")}
       LEFT JOIN evidence e
         ON e.e_entity_type = aggregated.entity_type
        AND e.e_entity_id = aggregated.entity_id
@@ -7651,7 +7454,8 @@ def _inline_source_evidence_sql(sql: str) -> str:
        AND e.e_country_key IS NOT DISTINCT FROM ({joined_keys["country"]})::varchar"""
     final_from = "\n      FROM aggregated"
     final_idx = sql.rindex(final_from)
-    return sql[:final_idx] + "\n      " + join_sql + sql[final_idx + len(final_from) :]
+    suffix = sql[final_idx + len(final_from) :].replace(address_batches.join_sql("aggregated"), "", 1)
+    return sql[:final_idx] + "\n      " + join_sql + suffix
 
 
 def _prepare_multi_source_evidence_table_sql(
@@ -7728,6 +7532,7 @@ _LOAD_MULTI_SOURCE_EVIDENCE_SQL = """
             COALESCE(t.address_sources, ARRAY[]::varchar[])::varchar[] AS address_sources,
             COALESCE(t.source_record_ids, ARRAY[]::varchar[])::varchar[] AS source_record_ids
           FROM {db_schema}.{stage_table} AS t
+          {batch_join}
          WHERE t.location_key IS NOT NULL
            {affected_filter}
     )
@@ -7777,16 +7582,17 @@ def _load_multi_source_evidence_base_sql(
         stage_table=stage_table,
         evidence_table=evidence_table,
         group_hash_expr=_evidence_group_hash_expr(evidence_shards),
+        batch_join=address_batches.join_sql("t"),
         affected_filter=_multi_source_affected_filter(
             db_schema,
             affected_group_table,
             affected_scope,
         ),
-        street_norm=_street_soft_norm_expr("t.first_line"),
-        city_norm=_alnum_norm_expr("t.city_name"),
-        state_norm=_state_norm_expr("t.state_name"),
-        zip_norm=_zip5_norm_expr("t.postal_code"),
-        country_norm=_state_norm_expr("t.country_code"),
+        street_norm=address_batches.group_keys(importlib.import_module(__name__), "t")["street"],
+        city_norm=address_batches.group_keys(importlib.import_module(__name__), "t")["city"],
+        state_norm=address_batches.group_keys(importlib.import_module(__name__), "t")["state"],
+        zip_norm=address_batches.group_keys(importlib.import_module(__name__), "t")["zip"],
+        country_norm=address_batches.group_keys(importlib.import_module(__name__), "t")["country"],
     )
 
 
@@ -9645,7 +9451,7 @@ async def _run_support_stage_batch(
             await _run_support_stage_item(progress, index, stage_statement)
         return
     semaphore = asyncio.Semaphore(progress.concurrency)
-    results = await preparation_admission.gather(
+    results = await address_batches.gather(
         *(_guarded_support_stage_item(semaphore, progress, index, stage_statement) for index, stage_statement in batch),
         return_exceptions=True,
     )
@@ -11598,6 +11404,7 @@ def _inference_sql(
     """
 
 
+@address_batches.scope
 async def process_entity_address_unified_data(ctx, task=None):
     """Materialize and optionally publish the unified entity-address dataset."""
     task = task or {}
@@ -11692,7 +11499,6 @@ async def process_entity_address_unified_data(ctx, task=None):
                 db_schema,
                 stage_table,
             )
-            context["stage_reused"] = True
         else:
             await preparation_admission.create_stage_table(db_schema, stage_cls, unlogged=should_use_unlogged_stage)
             await preparation_admission.stage_status(_disable_autovacuum_sql(db_schema, stage_table))
@@ -11772,11 +11578,13 @@ async def process_entity_address_unified_data(ctx, task=None):
     alias_base_address_version = f"{ALIAS_BASE_ADDRESS_VERSION_PREFIX}{alias_generation}"
     context["address_alias_generation"] = alias_generation
     context["base_address_version"] = alias_base_address_version
-    if (is_partial_provider_directory_refresh or should_reuse_stage) and await _has_table(
-        db_schema,
-        stage_table if should_reuse_stage else EntityAddressUnified.__tablename__,
-    ):
-        version_table = stage_table if should_reuse_stage else EntityAddressUnified.__tablename__
+    if should_reuse_stage:
+        context["reused_stage_rows"] = await aggregate_batches.checked_reused_stage_rows(
+            importlib.import_module(__name__), db_schema, stage_table, alias_base_address_version
+        )
+        context["stage_reused"] = True
+    if is_partial_provider_directory_refresh and await _has_table(db_schema, EntityAddressUnified.__tablename__):
+        version_table = EntityAddressUnified.__tablename__
         stale_versions = int(
             await preparation_admission.read_scalar(
                 db,
@@ -11929,6 +11737,24 @@ async def process_entity_address_unified_data(ctx, task=None):
                 "entity-address-unified provider-directory-partial refresh requested, but the live "
                 "entity_address_unified table does not exist; run refresh_mode=full first."
             )
+        await address_batches.prepare_partial(
+            importlib.import_module(__name__),
+            db_schema,
+            stage_table,
+            available_relation_map,
+            source_ids=provider_directory_source_ids,
+            run_id=provider_directory_run_id,
+        )
+        source_selects = _current_provider_directory_source_selects(
+            db_schema,
+            available_relation_map,
+            base_source_selects,
+            source_ids=provider_directory_source_ids,
+            run_id=provider_directory_run_id,
+            test_limit_per_source=test_limit_per_source,
+            has_compatibility_data=has_compatibility_data,
+            partial_refresh=True,
+        )
         affected_group_table = _partial_affected_group_table(stage_table)
         context["partial_provider_directory_affected_group_table"] = affected_group_table
         context["partial_affected_group_table"] = affected_group_table
@@ -11980,6 +11806,9 @@ async def process_entity_address_unified_data(ctx, task=None):
             or 0
         )
         context["partial_provider_directory_affected_groups"] = affected_group_rows
+        await partial_projection.prepare_load(
+            importlib.import_module(__name__), db_schema, available_relation_map, affected_group_table
+        )
         source_selects = _provider_directory_partial_replacement_source_selects(
             db_schema,
             available_relation_map,
@@ -12261,11 +12090,12 @@ async def process_entity_address_unified_data(ctx, task=None):
                         )
 
             if source_concurrency > 1 and len(source_selects) > 1:
-                await preparation_admission.gather(*(_load_source(select_sql) for select_sql in source_selects))
+                await address_batches.gather(*(_load_source(select_sql) for select_sql in source_selects))
             else:
                 for select_sql in source_selects:
                     await _load_source(select_sql)
 
+            await address_batches.prepare_raw(importlib.import_module(__name__), db_schema, raw_table)
             if enrich_shards > 1:
                 await _run_sql_phase(
                     f"CREATE INDEX IF NOT EXISTS {_stage_index_name(raw_table, 'checksum')} "
@@ -12347,7 +12177,7 @@ async def process_entity_address_unified_data(ctx, task=None):
                                 message=f"enriched {enrich_progress_map['enriched_shards']}/{enrich_shards} raw shards",
                             )
 
-                await preparation_admission.gather(*(_enrich_shard(low, high) for low, high in checksum_ranges))
+                await address_batches.gather(*(_enrich_shard(low, high) for low, high in checksum_ranges))
             else:
                 await _run_sql_phase(
                     _enrich_raw_stage_sql(
@@ -12369,6 +12199,8 @@ async def process_entity_address_unified_data(ctx, task=None):
                     emit_start=True,
                     emit_done=True,
                 )
+        if should_reuse_raw_stage:
+            await address_batches.prepare_raw(importlib.import_module(__name__), db_schema, raw_table)
         alias_integrity_checksum_ranges = await _raw_alias_integrity_checksum_ranges(
             db_schema,
             raw_table,
@@ -12449,81 +12281,26 @@ async def process_entity_address_unified_data(ctx, task=None):
                 total=aggregate_shards,
                 message=f"aggregating {aggregate_shards} shards",
             )
-        aggregate_progress_lock = asyncio.Lock()
-        aggregate_progress_map = {"aggregated_shards": 0}
-
-        async def _aggregate_shard(remainder: int) -> None:
-            # Progress is held in aggregate_progress_map to avoid nonlocal state.
-            await _run_sql_phase(
-                _materialize_from_raw_sql(
-                    db_schema,
-                    stage_table,
-                    raw_table,
-                    checksum_modulo=aggregate_shards,
-                    checksum_remainder=remainder,
-                    is_address_canon_available=is_address_canon_available,
-                    inline_source_evidence=include_inline_source_evidence,
-                ),
-                context=context,
-                run_id=run_id,
-                phase="entity-address-unified aggregating",
-                unit="shards",
-                done=aggregate_progress_map["aggregated_shards"],
-                total=aggregate_shards,
-                message=f"aggregating shard {remainder + 1}/{aggregate_shards}",
-                emit_start=True,
-            )
-            if run_id:
-                async with aggregate_progress_lock:
-                    aggregate_progress_map["aggregated_shards"] += 1
-                    enqueue_live_progress(
-                        run_id=run_id,
-                        importer="entity-address-unified",
-                        status="running",
-                        phase="entity-address-unified aggregating",
-                        unit="shards",
-                        done=aggregate_progress_map["aggregated_shards"],
-                        total=aggregate_shards,
-                        message=f"aggregated {aggregate_progress_map['aggregated_shards']}/{aggregate_shards} shards",
-                    )
-
-        if aggregate_shards > 1:
-            agg_sem = asyncio.Semaphore(aggregate_concurrency)
-
-            async def _guarded_aggregate(remainder: int) -> None:
-                async with agg_sem:
-                    await _aggregate_shard(remainder)
-
-            await preparation_admission.gather(*(_guarded_aggregate(i) for i in range(aggregate_shards)))
-        else:
-            await _run_sql_phase(
-                _materialize_from_raw_sql(
-                    db_schema,
-                    stage_table,
-                    raw_table,
-                    is_address_canon_available=is_address_canon_available,
-                    inline_source_evidence=include_inline_source_evidence,
-                ),
-                context=context,
-                run_id=run_id,
-                phase="entity-address-unified aggregating",
-                unit="run",
-                done=0,
-                total=1,
-                message="aggregating raw stage",
-                emit_start=True,
-                emit_done=True,
-            )
+        await aggregate_batches.materialize(
+            importlib.import_module(__name__),
+            db_schema,
+            stage_table,
+            raw_table,
+            dict(
+                aggregate_shards=aggregate_shards,
+                aggregate_concurrency=aggregate_concurrency,
+                is_address_canon_available=is_address_canon_available,
+                inline_source_evidence=include_inline_source_evidence,
+            ),
+            dict(context=context, run_id=run_id),
+        )
 
     elif should_use_chunked_load:
         raw_table = _raw_stage_table_name(stage_table)
-        context["stage_reused"] = True
         if not await _has_table(db_schema, raw_table):
             raw_table = None
         if run_id:
-            stage_rows = int(
-                await preparation_admission.read_scalar(db, f"SELECT COUNT(*) FROM {db_schema}.{stage_table};") or 0
-            )
+            stage_rows = context["reused_stage_rows"]
             enqueue_live_progress(
                 run_id=run_id,
                 importer="entity-address-unified",
@@ -12570,6 +12347,7 @@ async def process_entity_address_unified_data(ctx, task=None):
                 emit_done=True,
             ),
             include_base_address_version=False,
+            stage_table=stage_table,
         )
         await preparation_admission.stage_status(
             f"""
@@ -12803,7 +12581,7 @@ async def process_entity_address_unified_data(ctx, task=None):
                 async with evidence_build_sem:
                     await _build_evidence_shard(remainder)
 
-            await preparation_admission.gather(*(_guarded_build_evidence_shard(i) for i in range(evidence_shards)))
+            await address_batches.gather(*(_guarded_build_evidence_shard(i) for i in range(evidence_shards)))
         else:
             await _build_evidence_shard(0)
         await _run_sql_phase(
@@ -12883,7 +12661,7 @@ async def process_entity_address_unified_data(ctx, task=None):
                 async with evidence_sem:
                     await _apply_evidence_shard(remainder)
 
-            await preparation_admission.gather(*(_guarded_evidence_shard(i) for i in range(evidence_shards)))
+            await address_batches.gather(*(_guarded_evidence_shard(i) for i in range(evidence_shards)))
         else:
             await _apply_evidence_shard(0)
         await preparation_admission.drop_stage(db_schema, evidence_table)
@@ -13354,6 +13132,7 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
         test_mode=bool(context.get("test_mode")),
         min_rows_required=min_rows_required,
     )
+    context.update(finalizing_phase_progress=True, control_run_id=run_id)
     defer_publish_validation = (
         not prepare_only
         and serving_only_refresh
@@ -13456,6 +13235,14 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
         **geo_dependency_options_dict,
         **({"record_candidate": False} if protected_publication else {}),
     )
+    await _emit_phase_progress(
+        run_id,
+        "entity-address-unified durability",
+        unit="operations",
+        done=0,
+        total=1,
+        message="making finalized geo assurance durable",
+    )
     compaction_started = time.monotonic()
     context["geo_assurance_compaction"] = await _compact_geo_assurance_stage(
         db_schema,
@@ -13467,18 +13254,14 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
         time.monotonic() - compaction_started,
         stage_rows,
     )
-    if run_id:
-        enqueue_live_progress(
-            run_id=run_id,
-            importer="entity-address-unified",
-            status="running",
-            phase="entity-address-unified indexing",
-            unit="run",
-            done=0,
-            total=1,
-            pct=98,
-            message="building indexes on finalized geo assurance",
-        )
+    await _emit_phase_progress(
+        run_id,
+        "entity-address-unified durability",
+        unit="operations",
+        done=1,
+        total=1,
+        message=f"durability complete: {context['geo_assurance_compaction']}",
+    )
     await _create_stage_indexes(stage_cls, db_schema, context=context)
     context["stage_indexes_prepared"] = True
     if coordinate_scope_table:
@@ -13502,13 +13285,13 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             "status": "pending",
         }
     else:
-        publish_validation = await _validate_publish_integrity(
+        context["publish_validation"] = await _run_publish_validation(
             db_schema,
             stage_cls.__tablename__,
             support_stage_class_map,
-            test_mode=bool(context.get("test_mode")),
+            context,
+            run_id,
         )
-        context["publish_validation"] = publish_validation
 
     if partial_support_patch and (not affected_group_table or not await _has_table(db_schema, affected_group_table)):
         raise RuntimeError(
@@ -13521,26 +13304,27 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
     current_alias_generation = await _address_alias_generation(db_schema)
     if current_alias_generation != int(context.get("address_alias_generation") or 0):
         raise RuntimeError("address alias generation changed during entity-address-unified build")
-    if prepare_only:
-        return await candidate_preparation.prepare_finalized_generation(
-            db_schema, stage_cls, support_stage_class_map, context=context
+    async with _snapshot_publication_progress(context, run_id):
+        if prepare_only:
+            return await candidate_preparation.prepare_finalized_generation(
+                db_schema, stage_cls, support_stage_class_map, context=context
+            )
+        if protected_publication:
+            return await native_publication.handoff_entity_address_generation(
+                ctx,
+                schema_name=db_schema,
+                import_date=import_date,
+                dependency_bindings=geo_dependency_options_dict.get("dependency_bindings"),
+                row_count=stage_rows,
+            )
+        await _publish_staged_entity_address_tables(
+            db_schema,
+            stage_cls,
+            support_stage_class_map,
+            partial_support_patch=partial_support_patch,
+            affected_group_table=affected_group_table,
+            context=context,
         )
-    if protected_publication:
-        return await native_publication.handoff_entity_address_generation(
-            ctx,
-            schema_name=db_schema,
-            import_date=import_date,
-            dependency_bindings=geo_dependency_options_dict.get("dependency_bindings"),
-            row_count=stage_rows,
-        )
-    await _publish_staged_entity_address_tables(
-        db_schema,
-        stage_cls,
-        support_stage_class_map,
-        partial_support_patch=partial_support_patch,
-        affected_group_table=affected_group_table,
-        context=context,
-    )
 
     if partial_support_patch:
         await _drop_stage_artifacts(
@@ -13630,32 +13414,29 @@ async def publish_entity_address_unified_generation(ctx, *, prepare_only: bool =
             phase_detail="entity-address-unified published; post-publish validation pending",
             progress_message="published; validating",
             progress={
-                "unit": "rows",
-                "done": published_rows,
-                "total": published_rows,
-                "pct": 99,
+                "unit": "operations",
+                "done": 0,
+                "total": 1,
+                "basis": "phase",
+                "phase_pct": 0,
                 "message": "published; validating",
                 "phase": "entity-address-unified post-publish validation",
             },
             metrics=_published_metrics(),
         )
         try:
-            started = time.monotonic()
-            publish_validation = await _validate_publish_integrity(
+            publish_validation = await _run_publish_validation(
                 db_schema,
                 EntityAddressUnified.__main_table__,
                 {},
-                test_mode=bool(context.get("test_mode")),
+                context,
+                run_id,
+                phase="entity-address-unified post-publish validation",
             )
             publish_validation["deferred"] = True
             publish_validation["status"] = "complete"
             context["publish_validation"] = publish_validation
-            _record_phase_timing(
-                context,
-                "entity-address-unified post-publish validation",
-                time.monotonic() - started,
-                None,
-            )
+
         except Exception as exc:
             context["publish_validation"] = {
                 "deferred": True,
