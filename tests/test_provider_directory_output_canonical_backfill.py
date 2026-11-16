@@ -112,8 +112,8 @@ async def test_dispatch_preserves_request_and_stable_summary(monkeypatch, capsys
 
 def test_control_catalog_scopes_index_constraint_without_omitting_other_native_metadata():
     added = "WHERE k.conindid=i.indexrelid AND k.conrelid=c.oid)"
-    assert repair.CONTROL_CATALOG_SQL.count(added) == 1
-    assert repair.CONTROL_CATALOG_SQL.replace(added, "WHERE k.conindid=i.indexrelid)") == repair.OUTPUT_CATALOG_SQL
+    assert repair.OUTPUT_CATALOG_SQL.count(added) == 1
+    assert repair.CONTROL_CATALOG_SQL == repair.OUTPUT_CATALOG_SQL
 
 
 @pytest.mark.asyncio
