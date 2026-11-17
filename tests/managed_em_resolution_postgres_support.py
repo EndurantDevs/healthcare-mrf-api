@@ -14,9 +14,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from api.network_read_execution import _installed_read_inventory, execute_network_read
 from api.plan_pricing_projection_contract import PlanPricingProjectionUnavailable
+from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import pin_approved_membership_source
 from process.network_em_provider_inputs import resolve_em_provider_inputs, resolve_em_provider_inputs_in_session
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
+from process.network_serving_reactivation import (
+    NetworkServingReactivationError,
+    reactivate_network_serving_generation,
+)
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
@@ -61,9 +66,8 @@ async def _publish_fixture(fixture, schema, copy_targets, created_schema_oids_by
         control_schema=fixture.control_schema,
     )
     copy_targets.append(candidate)
-    await prepare_and_publish_network_candidate(
-        connection, candidate, addresses, **_roles(fixture), control_schema=fixture.control_schema
-    )
+    await _assert_unreadable_input_keeps_head(fixture, inputs, candidate, addresses)
+    await _publish_while_input_is_held(fixture, inputs, candidate, addresses)
     await connection.execute(f'GRANT USAGE ON SCHEMA "{fixture.control_schema}" TO "{fixture.roles["reader"]}"')
     for table in (
         "network_serving_manifest",
@@ -72,7 +76,97 @@ async def _publish_fixture(fixture, schema, copy_targets, created_schema_oids_by
         "network_candidate_custody",
     ):
         await connection.execute(f'GRANT SELECT ON "{fixture.control_schema}"."{table}" TO "{fixture.roles["reader"]}"')
+    await _assert_concurrent_removal_keeps_head(fixture, inputs, approved, copy_targets)
     return inputs, candidate
+
+
+async def _assert_unreadable_input_keeps_head(fixture, inputs, candidate, addresses):
+    """An input that no longer resolves, or lacks a read column, refuses publication and leaves the head unset."""
+    connection, owner, npi = fixture.connection, fixture.roles["owner"], inputs.relation("npi")
+    schema, table = npi.split(".")
+    for change, restore in (
+        (f"ALTER TABLE {npi} RENAME TO missing_input", f"ALTER TABLE {schema}.missing_input RENAME TO {table}"),
+        (
+            f"ALTER TABLE {npi} RENAME COLUMN entity_type_code TO entity_type",
+            f"ALTER TABLE {npi} RENAME COLUMN entity_type TO entity_type_code",
+        ),
+    ):
+        await connection.execute(f'SET ROLE "{owner}"; {change}; RESET ROLE')
+        try:
+            with pytest.raises(ValueError, match="^Managed provider input custody is unavailable$") as refused:
+                await prepare_and_publish_network_candidate(
+                    connection, candidate, addresses, **_roles(fixture), control_schema=fixture.control_schema
+                )
+            assert refused.value.__cause__.__cause__ is None
+            head = f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control WHERE id=1'
+            assert not await connection.fetchval(head)
+        finally:
+            await connection.execute(f'SET ROLE "{owner}"; {restore}; RESET ROLE')
+
+
+async def _publish_while_input_is_held(fixture, inputs, candidate, addresses):
+    """The head switch reads no input row and takes no input lock, so another session may hold an input exclusively."""
+    connection, owner, npi = fixture.connection, fixture.roles["owner"], inputs.relation("npi")
+    holder = await asyncpg.connect(
+        os.environ["NETWORK_REGISTRY_TEST_DSN"].replace("postgresql+asyncpg://", "postgresql://")
+    )
+    try:
+        async with holder.transaction():
+            await holder.execute(f'SET LOCAL ROLE "{owner}"; LOCK TABLE {npi} IN ACCESS EXCLUSIVE MODE')
+            await connection.execute("SET lock_timeout = '10s'")
+            await prepare_and_publish_network_candidate(
+                connection, candidate, addresses, **_roles(fixture), control_schema=fixture.control_schema
+            )
+    finally:
+        await connection.execute("RESET lock_timeout")
+        await holder.close()
+
+
+async def _assert_concurrent_removal_keeps_head(fixture, inputs, approved, copy_targets):
+    """Reactivation keeps the head when another session removes an input after its snapshot began."""
+    connection, owner, npi = fixture.connection, fixture.roles["owner"], inputs.relation("npi")
+    schema, table = npi.split(".")
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        first = await resolve_network_serving_manifest(connection, control_schema=fixture.control_schema)
+    request = uuid4()
+    fixture.composition_ids.append(uuid5(request, "address:" + approved.generation_id))
+    retained = PinnedAddressSource(first.schema_name, "entity_address_unified", first.manifest_sha256)
+    successor, addresses = await compose_registry_membership_candidate(
+        connection,
+        request_id=request,
+        approved_revision=approved.approved_revision,
+        expected_head=first.generation_id,
+        source_manifest=first,
+        address_sources=RegistryCompositionAddressSources(retained, em_provider_inputs=inputs),
+        writer_roles=_roles(fixture),
+        control_schema=fixture.control_schema,
+    )
+    copy_targets.append(successor)
+    published = await prepare_and_publish_network_candidate(
+        connection, successor, addresses, **_roles(fixture), control_schema=fixture.control_schema
+    )
+    arguments_by_name = dict(
+        generation_id=first.generation_id,
+        expected_head=published["generation_id"],
+        expected_approved_revision=approved.approved_revision,
+        control_schema=fixture.control_schema,
+    )
+    head = f'SELECT generation_id FROM "{fixture.control_schema}".network_serving_control WHERE id=1'
+    other = await asyncpg.connect(
+        os.environ["NETWORK_REGISTRY_TEST_DSN"].replace("postgresql+asyncpg://", "postgresql://")
+    )
+    try:
+        async with connection.transaction(isolation="repeatable_read"):
+            assert await connection.fetchval(head) == published["generation_id"]
+            await other.execute(f'SET ROLE "{owner}"; ALTER TABLE {npi} RENAME TO removed_input; RESET ROLE')
+            with pytest.raises(NetworkServingReactivationError, match="network_reactivation_controls_unavailable"):
+                await reactivate_network_serving_generation(connection, **arguments_by_name)
+            assert await connection.fetchval(head) == published["generation_id"]
+        await other.execute(f'SET ROLE "{owner}"; ALTER TABLE {schema}.removed_input RENAME TO {table}; RESET ROLE')
+        async with connection.transaction(isolation="repeatable_read"):
+            assert (await reactivate_network_serving_generation(connection, **arguments_by_name)).changed
+    finally:
+        await other.close()
 
 
 async def _api_inputs(reader_engine, manifest, control_schema, *settings):

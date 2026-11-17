@@ -224,11 +224,14 @@ _CATALOG_SQL = """SELECT requested.role,namespace.oid::bigint AS schema_oid,
  LEFT JOIN pg_class held ON held.relnamespace=namespace.oid AND held.relname=requested.table_name
  LEFT JOIN pg_roles owner ON owner.oid=held.relowner ORDER BY requested.role COLLATE "C"
 """.format(**_INHERITANCE)
+# pg_identify_object reads the current catalog, so a table dropped or renamed after the snapshot began is refused.
 _API_HEAPS_SQL = """SELECT requested.role,held.oid::bigint AS relation_oid,
  pg_relation_filenode(held.oid)::bigint AS relfilenode
  FROM jsonb_to_recordset($1::jsonb) requested(role text,schema_name text,table_name text,columns jsonb)
  JOIN pg_catalog.pg_namespace namespace ON namespace.nspname=requested.schema_name
  JOIN pg_catalog.pg_class held ON held.relnamespace=namespace.oid AND held.relname=requested.table_name
+ JOIN pg_catalog.pg_identify_object('pg_catalog.pg_class'::regclass,held.oid,0) named
+  ON named.schema=quote_ident(requested.schema_name) AND named.name=quote_ident(requested.table_name)
  WHERE held.relkind='r' AND held.relpersistence='p'
  AND held.relam=(SELECT oid FROM pg_catalog.pg_am WHERE amname='heap')
  AND NOT (held.relrowsecurity OR held.relforcerowsecurity OR held.relispartition)
@@ -251,15 +254,20 @@ def _rotating_names():
     return live_names | swapped_names | {("tiger", "zcta5"), ("tiger", "zip_state")}
 
 
-async def _locked_plain_heaps(connection, relations):
-    """Share-lock tables by name; return their current rows if none filters rows and each has its read columns."""
-    locked = ",".join(f"{_identifier(held['schema_name'])}.{_identifier(held['table_name'])}" for held in relations)
-    # The share lock lasts until the read ends, so row level security cannot be enabled meanwhile.
-    await connection.execute(f"LOCK TABLE {locked} IN ACCESS SHARE MODE")
+async def _plain_heaps(connection, relations):
+    """Return the tables that carry these names now, if none filters rows and each has its read columns."""
     held_rows = await connection.fetch(_API_HEAPS_SQL, json.dumps(relations))
     if [held["role"] for held in held_rows] != [held["role"] for held in relations]:
         _fail()
     return held_rows
+
+
+async def _locked_plain_heaps(connection, relations):
+    """Share-lock tables by name before the same check, for a caller that goes on to read their rows."""
+    locked = ",".join(f"{_identifier(held['schema_name'])}.{_identifier(held['table_name'])}" for held in relations)
+    # The share lock lasts until the read ends, so row level security cannot be enabled meanwhile.
+    await connection.execute(f"LOCK TABLE {locked} IN ACCESS SHARE MODE")
+    return await _plain_heaps(connection, relations)
 
 
 def _shape(role, catalog_row):
@@ -428,6 +436,26 @@ async def record_em_provider_inputs(connection, copy_target, receipt, control_sc
     return receipt
 
 
+def _named_relations(inputs):
+    """Refuse inputs recorded under live names; pair every other input's name with its read columns."""
+    if any((relation.schema_name, relation.table_name) in _rotating_names() for relation in inputs.relations):
+        _fail()
+    return [{**asdict(relation), "columns": _required_columns(relation.role)} for relation in inputs.relations]
+
+
+async def require_readable_em_provider_inputs(connection, candidate):
+    """Require a candidate's declared inputs to resolve by name before the head moves to it; nothing is locked."""
+    from process.network_membership_validation import _em_provider_receipt
+
+    receipt = _em_provider_receipt(candidate)
+    if receipt is None:
+        return
+    try:
+        await _plain_heaps(connection, _named_relations(_receipt(receipt)))
+    except asyncpg.PostgresError as error:
+        raise ValueError("Managed provider input custody is unavailable") from error
+
+
 async def _resolve_em_provider_inputs_api(connection, manifest, control_schema=None):
     """Decode the published recipe and return its nine inputs as the tables their names resolve to now."""
     from process.network_candidate_custody import read_network_control_relation_pins
@@ -464,10 +492,7 @@ async def _resolve_em_provider_inputs_api(connection, manifest, control_schema=N
         inputs = _receipt(receipt)
         if manifest.source_generations.get("em_provider_inputs") != receipt["receipt_sha256"]:
             _fail()
-        if any((relation.schema_name, relation.table_name) in _rotating_names() for relation in inputs.relations):
-            _fail()
-        relations = [{**asdict(relation), "columns": _required_columns(relation.role)} for relation in inputs.relations]
-        held_rows = await _locked_plain_heaps(connection, relations)
+        held_rows = await _locked_plain_heaps(connection, _named_relations(inputs))
         return EMProviderInputs(
             tuple(
                 replace(relation, relation_oid=held["relation_oid"], relfilenode=held["relfilenode"])
@@ -550,22 +575,3 @@ async def resolve_em_provider_inputs_in_session(session, manifest, control_schem
         return inputs
     except Exception:
         raise PlanPricingProjectionUnavailable("Managed provider inputs are unavailable") from None
-
-
-async def verify_candidate_em_provider_inputs(connection, candidate, *, runtime_roles):
-    """Verify a declared candidate recipe before any publication or retained replay."""
-    from process.network_membership_validation import _em_provider_receipt
-
-    receipt = _em_provider_receipt(candidate)
-    if receipt is None:
-        return None
-    _runtime_roles(runtime_roles)
-    if list(runtime_roles) != receipt["runtime_roles"]:
-        _fail()
-    try:
-        current = await prepare_em_provider_inputs(connection, _receipt(receipt), runtime_roles=runtime_roles)
-    except asyncpg.PostgresError as error:
-        raise ValueError("Managed provider input custody is unavailable") from error
-    if current != receipt:
-        _fail()
-    return receipt

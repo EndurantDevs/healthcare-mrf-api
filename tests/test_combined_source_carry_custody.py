@@ -238,12 +238,11 @@ async def test_compact_final_proof_keeps_carry_scope_through_last_proof_and_retu
     monkeypatch.setattr(sampled, "inherit_preserved_sampling", recorder("sampling"))
     monkeypatch.setattr(final, "verify_registry_source_retention_rows", recorder("retention"))
     monkeypatch.setattr(publication, "_publication_readiness", lambda _candidate: (None, None, None, {}))
-    monkeypatch.setattr(publication, "_verify_provider_custody", recorder("provider"))
     monkeypatch.setattr(source, "verify_independent_source_contributions", recorder("current"))
     monkeypatch.setattr(readiness, "is_compact_candidate", lambda _candidate: True)
     monkeypatch.setattr(compact, "verify_compact_final_proof", recorder("compact"))
     await final._final_proof(object(), _target(), candidate_by_field, "controls", inventory_entries=entries)
-    assert events == ["enter", "sampling", "retention", "current", "compact", "provider", "cleanup"]
+    assert events == ["enter", "sampling", "retention", "current", "compact", "cleanup"]
 
 
 @pytest.mark.parametrize("carried", [0, 3])

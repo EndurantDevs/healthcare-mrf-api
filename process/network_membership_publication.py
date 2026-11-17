@@ -244,13 +244,6 @@ async def _insert_manifest(connection, namespace, candidate, readiness):
     return _retained_manifest(manifest, readiness, replayed=False)
 
 
-async def _verify_provider_custody(connection, candidate, closure):
-    from process.network_em_provider_inputs import verify_candidate_em_provider_inputs
-
-    runtime_roles = tuple(sorted(set(closure["loader_roles"] + closure["reader_roles"])))
-    return await verify_candidate_em_provider_inputs(connection, candidate, runtime_roles=runtime_roles)
-
-
 async def _candidate_custody(connection, candidate, control_schema, *, allow_unsealed=False):
     from process.registry_source_inventory_reference import source_inventory_heaps
 
@@ -284,7 +277,6 @@ async def _publish_candidate(connection, copy_target, namespace, source_rollback
     readiness = _publication_readiness(candidate)
     closure = readiness[3]
     custody = await _require_publication_custody(connection, copy_target, candidate, namespace, closure)
-    await _verify_provider_custody(connection, candidate, closure)
     manifest = await connection.fetchrow(
         f"SELECT * FROM {namespace}.network_serving_manifest WHERE candidate_id=$1", UUID(copy_target.candidate_id)
     )
@@ -324,11 +316,13 @@ async def _publish_candidate(connection, copy_target, namespace, source_rollback
     )
     if predecessor is not None and custody is None:
         raise NetworkPublicationError("FHIR serving preservation requires independent candidate custody")
+    from process.network_em_provider_inputs import require_readable_em_provider_inputs
     from process.network_membership_serving_indexes import verify_network_search_indexes
 
     await verify_network_search_indexes(
         connection, candidate, compact_layout=custody.get("compact_layout") if custody is not None else None
     )
+    await require_readable_em_provider_inputs(connection, candidate)
     return await _insert_manifest(connection, namespace, candidate, readiness)
 
 

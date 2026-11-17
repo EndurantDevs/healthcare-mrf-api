@@ -486,19 +486,17 @@ class _CustodyTimeoutConnection:
 async def test_provider_custody_timeout_retains_lease_and_resumes_exact_request(worker_permissions, monkeypatch):
     fixture = worker_permissions
     namespace = f'"{fixture.fixture.control_schema}"'
-    original = provider_inputs.verify_candidate_em_provider_inputs
+    original = composition.prepare_em_provider_inputs
     observations = []
 
-    async def timeout(connection, candidate, *, runtime_roles):
-        return await original(
-            _CustodyTimeoutConnection(connection, observations), candidate, runtime_roles=runtime_roles
-        )
+    async def timeout(connection, inputs, *, runtime_roles):
+        return await original(_CustodyTimeoutConnection(connection, observations), inputs, runtime_roles=runtime_roles)
 
     async with _worker_provider_inputs(fixture) as inputs, _consumer(fixture) as (arguments, calls):
         arguments["initial_address_sources"] = replace(arguments["initial_address_sources"], em_provider_inputs=inputs)
         queued = await _enqueue_ordinary(fixture)
         request_id = UUID(queued["request_id"])
-        monkeypatch.setattr(provider_inputs, "verify_candidate_em_provider_inputs", timeout)
+        monkeypatch.setattr(composition, "prepare_em_provider_inputs", timeout)
         with pytest.raises(RuntimeError, match="registry_publication_consumer_unavailable"):
             await consume_registry_publication_once(**arguments)
         pending = await _status(fixture, queued)
@@ -509,11 +507,9 @@ async def test_provider_custody_timeout_retains_lease_and_resumes_exact_request(
             request_id,
         )
         assert retained["lease_id"] is not None
-        candidate = await fixture.fixture.connection.fetchrow(
-            f"SELECT state,validation_json FROM {namespace}.network_membership_candidate"
-        )
-        assert candidate["state"] == "ready" and "em_provider_inputs" in json.loads(candidate["validation_json"])
-        monkeypatch.setattr(provider_inputs, "verify_candidate_em_provider_inputs", original)
+        # The receipt is captured once, at composition, before the candidate exists.
+        assert not await fixture.fixture.connection.fetch(f"SELECT FROM {namespace}.network_membership_candidate")
+        monkeypatch.setattr(composition, "prepare_em_provider_inputs", original)
         await fixture.fixture.connection.execute(
             f"UPDATE {namespace}.registry_publication_request SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE request_id=$1",
             request_id,
@@ -528,6 +524,10 @@ async def test_provider_custody_timeout_retains_lease_and_resumes_exact_request(
             request_id,
         )
         assert dict(resumed) == {key: retained[key] for key in ("request_sha256", "command_json")}
+        candidate = await fixture.fixture.connection.fetchrow(
+            f"SELECT state,validation_json FROM {namespace}.network_membership_candidate"
+        )
+        assert candidate["state"] == "published" and "em_provider_inputs" in json.loads(candidate["validation_json"])
         assert await consume_registry_publication_once(**arguments) is None
 
 
