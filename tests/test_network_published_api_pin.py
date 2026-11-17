@@ -200,6 +200,93 @@ def test_historical_physical_fields_do_not_change_named_layout(published_entry):
     assert "oid" not in json.dumps(asdict(expected))
 
 
+@pytest.mark.parametrize("compact", [False, True])
+def test_published_read_does_not_replay_new_writer_receipt_validation(published_entry, monkeypatch, compact):
+    from process import network_membership_publication as publication
+
+    candidate = _candidate(published_entry)
+    candidate["validation_json"]["final_validation"] = {"complete": True}
+    if not compact:
+        candidate["validation_json"]["serving_readiness"]["component"] = "unified_address_serving"
+    _store(published_entry, candidate)
+    before_by_field = dict(published_entry)
+
+    def upgraded_writer_scope(*_args):
+        raise ValueError("Historical source receipt has a different encoding")
+
+    monkeypatch.setattr(publication, "_scope_report", upgraded_writer_scope)
+    manifest = published._decode_published_pin(published_entry, "example_control")[0]
+    assert manifest.generation_id == 7
+    assert manifest.manifest_sha256 == json.loads(before_by_field["manifest_json"])["manifest_sha256"]
+    assert published_entry == before_by_field
+    with pytest.raises(published.NetworkServingReadUnavailable, match="digest differs"):
+        published._pinned_manifest(published_entry)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("field", ["validation_revision", "dataset_id"])
+def test_published_read_refuses_equally_incomplete_readiness_scopes(published_entry, compact, field):
+    candidate = _candidate(published_entry)
+    if not compact:
+        candidate["validation_json"]["serving_readiness"]["component"] = "unified_address_serving"
+    candidate["validation_json"]["final_validation"] = {"complete": True}
+    _store(published_entry, candidate)
+    candidate = _candidate(published_entry)
+    for name in ("candidate_readiness", "serving_readiness"):
+        del candidate["validation_json"][name]["scope"][field]
+    published_entry["candidate_json"] = json.dumps(candidate)
+    with pytest.raises(published.NetworkServingReadUnavailable):
+        published._decode_published_pin(published_entry, "example_control")
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_published_read_rejects_changed_logical_manifest_digest(published_entry, compact):
+    candidate = _candidate(published_entry)
+    if not compact:
+        candidate["validation_json"]["serving_readiness"]["component"] = "unified_address_serving"
+    candidate["validation_json"]["final_validation"] = {"complete": True}
+    _store(published_entry, candidate)
+    manifest = json.loads(published_entry["manifest_json"])
+    manifest["manifest_sha256"] = "0" * 64
+    published_entry["manifest_json"] = json.dumps(manifest)
+    with pytest.raises(published.NetworkServingReadUnavailable, match="digest differs"):
+        published._decode_published_pin(published_entry, "example_control")
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize(
+    "damage",
+    ["validation", "indexes", "serving", "serving_scope", "candidate_scope", "accounting", "digest"],
+)
+def test_published_read_still_requires_matching_logical_readiness(published_entry, compact, damage):
+    candidate = _candidate(published_entry)
+    if not compact:
+        candidate["validation_json"]["serving_readiness"]["component"] = "unified_address_serving"
+    _store(published_entry, candidate)
+    candidate = _candidate(published_entry)
+    report = candidate["validation_json"]
+    match damage:
+        case "validation":
+            report["valid"] = False
+        case "indexes":
+            candidate["index_ready"] = False
+        case "serving":
+            report["serving_readiness"]["ready"] = False
+        case "serving_scope":
+            report["serving_readiness"]["scope"]["schema_name"] = "another_snapshot"
+        case "candidate_scope":
+            report["candidate_readiness"]["scope"]["approved_custom_revision"] += 1
+        case "accounting":
+            report["membership_rows"] += 1
+        case "digest":
+            manifest = json.loads(published_entry["manifest_json"])
+            manifest["manifest_sha256"] = "invalid"
+            published_entry["manifest_json"] = json.dumps(manifest)
+    published_entry["candidate_json"] = json.dumps(candidate)
+    with pytest.raises(published.NetworkServingReadUnavailable):
+        published._decode_published_pin(published_entry, "example_control")
+
+
 @pytest.mark.parametrize("damage", ["schema", "candidate", "source_generation", "revision"])
 def test_changed_logical_generation_refuses(published_entry, damage):
     candidate = _candidate(published_entry)

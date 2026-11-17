@@ -159,7 +159,7 @@ def _decode_published_pin(entry, schema, *, approved=True, retained_base_name=No
         raise NetworkServingReadUnavailable("Published network generation is unavailable")
     candidate = _object(entry["candidate_json"])
     manifest = _pinned_manifest(
-        entry, layout=published_network_layout(candidate, retained_base_name=retained_base_name)
+        entry, layout=published_network_layout(candidate, retained_base_name=retained_base_name), api_read=True
     )
     if not approved:
         return manifest, None, None

@@ -123,7 +123,55 @@ async def _read_manifest(connection, namespace, generation_id, *, include_inelig
     )
 
 
-def _pinned_manifest(entry, *, layout=None):
+def _manifest_readiness(candidate, manifest, *, api_read):
+    from process.network_membership_publication import (
+        _complete_accounting,
+        _publication_readiness,
+        _publication_snapshot_tables,
+        _retained_manifest,
+    )
+
+    if not api_read:
+        return _retained_manifest(manifest, _publication_readiness(candidate), replayed=True)
+    # Published receipts retain their original format; only writers revalidate them for publication.
+    from process.network_compact_readiness import compact_readiness, is_compact_candidate
+    from process.network_membership_candidate_indexes import _ready_replay
+    from process.network_membership_validation import _candidate_identity_scope, _validated_replay
+
+    report = _object(candidate["validation_json"])
+    serving = _object(report["serving_readiness"])
+    scope = _object(serving["scope"])
+    address = PinnedAddressSource(**report["address_source"])
+    identity_scope = _candidate_identity_scope(candidate, address)
+    _validated_replay(candidate, identity_scope)
+    _validated_replay(candidate, scope)
+    _complete_accounting(report)
+    if (
+        not identity_scope.keys() <= scope.keys()
+        or address.schema_name == candidate["schema_name"]
+        or scope["source_generations"].get("unified_address") != address.generation_id
+    ):
+        raise NetworkServingReadUnavailable("Published network readiness differs")
+    if is_compact_candidate(candidate):
+        canonical, serving = compact_readiness(candidate, report, scope)
+    else:
+        canonical = _ready_replay(candidate, report, scope)
+        if (
+            serving.get("component") != "unified_address_serving"
+            or type(serving.get("readiness_revision")) is not int
+            or serving["readiness_revision"] != 1
+            or serving.get("ready") is not True
+            or serving.get("index_profile") != "serving"
+            or type(serving.get("index_definition_sha256")) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", serving["index_definition_sha256"]) is None
+        ):
+            raise NetworkServingReadUnavailable("Published network readiness differs")
+    return _retained_manifest(
+        manifest, (scope, canonical, serving, _publication_snapshot_tables(candidate, report)), replayed=True
+    )
+
+
+def _pinned_manifest(entry, *, layout=None, api_read=False):
     """Keep the selected logical generation and its immutable routing names."""
     if entry is None:
         raise NetworkServingReadUnavailable("Published network generation is unavailable")
@@ -142,11 +190,8 @@ def _pinned_manifest(entry, *, layout=None):
         or manifest["approved_custom_revision"] < 0
     ):
         raise NetworkServingReadUnavailable("Published network generation metadata differs")
-    from process.network_membership_publication import _publication_readiness, _retained_manifest
-
     try:
-        # The retained digest binds the manifest to its validated readiness content.
-        _retained_manifest(manifest, _publication_readiness(candidate), replayed=True)
+        _manifest_readiness(candidate, manifest, api_read=api_read)
     except (KeyError, TypeError, ValueError) as error:
         raise NetworkServingReadUnavailable("Published network manifest digest differs") from error
     if layout is not None and type(layout) is not CompactNetworkLayout:
