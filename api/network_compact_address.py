@@ -95,7 +95,11 @@ def _address_query(layout, network_ids, visible_membership_sql, location_lookup)
     query = f"SELECT {output_columns} FROM ({base}) office"
     if network_ids is not None:
         selected = _membership_arms(layout, selected=True, location_lookup=location_lookup)
-        return query + (f" WHERE office.location_key IN ({selected})" if selected else " WHERE FALSE")
+        # Avoid a national office scan when the selected memberships are empty.
+        membership_prefix = f"EXISTS ({selected}) AND " if not location_lookup else ""
+        return query + (
+            f" WHERE {membership_prefix}office.location_key IN ({selected})" if selected else " WHERE FALSE"
+        )
     visibility = "row_origin IN ('base','ptg_overlay')"
     if visible_membership_sql is not None:
         visibility += " OR (" + visible_membership_sql + ")"
