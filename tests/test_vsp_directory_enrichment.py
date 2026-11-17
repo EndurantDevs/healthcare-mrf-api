@@ -97,9 +97,9 @@ async def test_identity_cache_precedes_detail_lookup_and_restart_never_refetches
     store = VSPCaptureStore(tmp_path, "synthetic-repair")
     first_http = HTTP(repair=True)
     run = VSPCapture(store, first_http, noop, noop)
-    run.remember(office(52, FIRST), "Signature", "a" * 64)
+    run.remember_search(office(52, FIRST), "Signature", "a" * 64)
     if shared_identity:
-        run.remember(office(53, SECOND), "Signature", "b" * 64)
+        run.remember_search(office(53, SECOND), "Signature", "b" * 64)
     await enrich_capture(run)
     assert {row["npi"] for row in run.offices["52"]["providerSummaries"]} == {FIRST["npi"], SECOND["npi"]}
     assert first_http.requests == 2
@@ -107,9 +107,9 @@ async def test_identity_cache_precedes_detail_lookup_and_restart_never_refetches
     assert len(run.identity_reuses) == int(shared_identity)
     resumed_http = HTTP(repair=False)
     resumed = VSPCapture(store, resumed_http, noop, noop)
-    resumed.remember(office(52, FIRST), "Signature", "a" * 64)
+    resumed.remember_search(office(52, FIRST), "Signature", "a" * 64)
     if shared_identity:
-        resumed.remember(office(53, SECOND), "Signature", "b" * 64)
+        resumed.remember_search(office(53, SECOND), "Signature", "b" * 64)
     await enrich_capture(resumed)
     assert resumed_http.requests == 0 and resumed.cache_hits == 2
     assert resumed.memberships == run.memberships
@@ -120,10 +120,40 @@ async def test_exact_office_without_missing_doctor_refuses_completion(tmp_path):
     run = VSPCapture(
         VSPCaptureStore(tmp_path, "synthetic-unresolved"), HTTP(repair=False, missing_doctor_codes=["2000"]), noop, noop
     )
-    run.remember(office(52, FIRST), "Signature", "a" * 64)
+    run.remember_search(office(52, FIRST), "Signature", "a" * 64)
     with pytest.raises(VSPDirectoryError, match="^vsp_doctor_identity_unresolved$"):
         await enrich_capture(run)
     assert run.http.requests == 2 and run.store.load_checkpoint("complete") is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_publisher_npi_retains_source_identity_after_bounded_repair_and_replay(tmp_path):
+    class InvalidNPIHTTP(HTTP):
+        async def request(self, method, url, request_body=None):
+            value, _, metadata = await super().request(method, url, request_body)
+            if url.startswith(SEARCH_URL):
+                value["providerSummaries"][1]["npi"] = "1234567890"
+            raw = canonical_json(value).encode()
+            return value, raw, {**metadata, "sha256": hashlib.sha256(raw).hexdigest(), "byte_count": len(raw)}
+
+    store = VSPCaptureStore(tmp_path, "synthetic-invalid-npi")
+    memberships = dict.fromkeys(("Signature", "Choice", "Advantage"), 1)
+    for expected_requests in (4, 0):
+        run = VSPCapture(store, InvalidNPIHTTP(repair=True), noop, noop)
+        run.remember_search(office(52, FIRST, {"pid": 3, "npi": "1234567890"}), "Signature", "a" * 64)
+        await enrich_capture(run)
+        assert run.http.requests == expected_requests
+        if expected_requests:
+            assert store.load_checkpoint("complete") is None
+            continue
+        completed = await write_normalized_capture(run, memberships, memberships)
+        assert completed.resource_counts["Practitioner"] == completed.resource_counts["PractitionerRole"] == 2
+        assert completed.proof["network_npis"] == dict.fromkeys(memberships, 1)
+        assert completed.proof["profiles_without_npi"] == 1
+        resources = list(completed.iter_resources())
+        practitioner = next(row for row in resources if row["id"] == "vsp-doctor-3")
+        assert practitioner["identifier"] == [{"system": "urn:vsp:doctor-id", "value": "3"}]
+        assert run.offices["52"]["providerSummaries"][1]["npi"] == "1234567890"
 
 
 @pytest.mark.asyncio
@@ -131,9 +161,34 @@ async def test_repair_uses_missing_doctors_network_instead_of_office_discovery_s
     run = VSPCapture(
         VSPCaptureStore(tmp_path, "synthetic-mixed"), HTTP(repair=True, missing_doctor_codes=["2000"]), noop, noop
     )
-    run.remember(office(52, FIRST), "Signature", "a" * 64)
+    run.remember_search(office(52, FIRST), "Signature", "a" * 64)
     await enrich_capture(run)
     assert run.http.calls[-1] == SEARCH_URL + "/52?networkNames=Choice" and run.http.requests == 2
+
+
+@pytest.mark.asyncio
+async def test_later_office_repair_replaces_earlier_source_identity_before_final_normalization(tmp_path):
+    class LaterIdentityHTTP(HTTP):
+        async def request(self, method, url, request_body=None):
+            value, _, metadata = await super().request(method, url, request_body)
+            if url.startswith(SEARCH_URL):
+                oid = int(urlsplit(url).path.rsplit("/", 1)[1])
+                value = office(oid, FIRST, {"pid": 3, "npi": "1234567890"}) if oid == 52 else office(oid, SECOND)
+            raw = canonical_json(value).encode()
+            return value, raw, {**metadata, "sha256": hashlib.sha256(raw).hexdigest(), "byte_count": len(raw)}
+
+    run = VSPCapture(VSPCaptureStore(tmp_path, "synthetic-late-npi"), LaterIdentityHTTP(repair=True), noop, noop)
+    run.remember_search(office(52, FIRST, {"pid": 3, "npi": "1234567890"}), "Signature", "a" * 64)
+    run.remember_search(office(53, {"pid": 3, "npi": "1234567890"}), "Signature", "b" * 64)
+    await enrich_capture(run)
+    assert run.offices["52"]["providerSummaries"][1]["npi"] == "1234567890"
+    counts = dict.fromkeys(run.memberships, 2)
+    completed = await write_normalized_capture(run, counts, counts)
+    assert run.http.requests == 6
+    assert completed.proof["profiles_without_npi"] == 0
+    assert completed.proof["network_npis"] == dict.fromkeys(counts, 2)
+    assert completed.resource_counts["Practitioner"] == 2 and completed.resource_counts["PractitionerRole"] == 3
+    assert not any(row["id"].startswith("vsp-doctor-") for row in completed.iter_resources())
 
 
 @pytest.mark.asyncio
@@ -141,7 +196,7 @@ async def test_unselected_doctor_does_not_trigger_an_identity_request_or_a_membe
     run = VSPCapture(
         VSPCaptureStore(tmp_path, "outside-network"), HTTP(repair=False, missing_doctor_codes=["other"]), noop, noop
     )
-    run.remember(office(52, FIRST), "Signature", "a" * 64)
+    run.remember_search(office(52, FIRST), "Signature", "a" * 64)
     await enrich_capture(run)
     counts = dict.fromkeys(run.memberships, 1)
     completed = await write_normalized_capture(run, counts, counts)
@@ -165,9 +220,9 @@ async def test_later_partial_office_keeps_proven_identity_and_reuses_profile(tmp
     run = VSPCapture(
         VSPCaptureStore(tmp_path, "partial-office"), HTTP(repair=False, missing_doctor_codes=["other"]), noop, noop
     )
-    run.remember(office(52, FIRST), "Signature", "a" * 64)
+    run.remember_search(office(52, FIRST), "Signature", "a" * 64)
     await enrich_capture(run)
-    run.remember(office(52, {"pid": 2, "npi": None}), "Choice", "b" * 64)
+    run.remember_search(office(52, {"pid": 2, "npi": None}), "Choice", "b" * 64)
     await enrich_capture(run)
     assert run.http.requests == 1 and run.offices["52"]["providerSummaries"] == [FIRST]
     assert run.identities["2"]["request_key"] == "a" * 64
@@ -177,8 +232,8 @@ async def test_later_partial_office_keeps_proven_identity_and_reuses_profile(tmp
 @pytest.mark.asyncio
 async def test_unconfirmed_office_network_stops_before_fetching_other_profiles(tmp_path, monkeypatch):
     run = VSPCapture(VSPCaptureStore(tmp_path, "synthetic-unconfirmed"), HTTP(repair=False), noop, noop)
-    run.remember(office(52, FIRST), "Signature", "a" * 64)
-    run.remember(office(53, SECOND), "Signature", "b" * 64)
+    run.remember_search(office(52, FIRST), "Signature", "a" * 64)
+    run.remember_search(office(53, SECOND), "Signature", "b" * 64)
     fetch = AsyncMock(return_value=([], {}))
     monkeypatch.setattr(run, "fetch", fetch)
     with pytest.raises(VSPDirectoryError, match="^vsp_profile_membership_census_unresolved$"):
@@ -189,7 +244,7 @@ async def test_unconfirmed_office_network_stops_before_fetching_other_profiles(t
 async def _completed_fixture(tmp_path):
     store = VSPCaptureStore(tmp_path, "synthetic-completed")
     run = VSPCapture(store, HTTP(repair=True), noop, noop)
-    run.remember(office(52, FIRST), "Signature", "a" * 64)
+    run.remember_search(office(52, FIRST), "Signature", "a" * 64)
     await enrich_capture(run)
     census_by_network = {"Signature": 1, "Choice": 1, "Advantage": 1}
     completed = await write_normalized_capture(run, census_by_network, census_by_network)

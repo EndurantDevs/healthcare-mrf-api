@@ -114,13 +114,48 @@ def test_outside_profiles_keep_unknown_codes_without_membership():
     assert resources.other_network_ids == ("Choice", "other")
 
 
+def test_printable_padding_is_normalized_without_changing_source_profiles():
+    profile_by_field = {
+        **profile(2, " 2000 ", " OTHER "),
+        "providerNetworks": [{"networkId": "2000"}, {"networkId": "OTHER"}],
+    }
+    resources = normalize_vsp_office(office({"pid": 2, "npi": "1234567893"}), profiles=[profile_by_field])
+    assert resources[-1]["extension"][0]["valueReference"]["reference"] == "Organization/vsp-network-2000"
+    assert resources.other_network_ids == ("OTHER",)
+    assert profile_by_field["networkIds"] == [" 2000 ", " OTHER "]
+
+
+@pytest.mark.parametrize("code", ["", "   ", "\t2000", "2000\n", "OTHER\x00", 2000])
+def test_network_padding_does_not_accept_empty_control_or_nontext_codes(code):
+    with pytest.raises(VSPDirectoryNormalizationError, match="^vsp_directory_invalid_network_ids$"):
+        normalize_vsp_office(office({"pid": 2}), profiles=[profile(2, code)])
+
+
+def test_padding_does_not_hide_conflicting_network_fields():
+    profile_by_field = {**profile(2, " OTHER "), "providerNetworks": [{"networkId": "DIFFERENT"}]}
+    with pytest.raises(VSPDirectoryNormalizationError, match="^vsp_directory_conflicting_network_ids$"):
+        normalize_vsp_office(office({"pid": 2}), profiles=[profile_by_field])
+
+
+@pytest.mark.parametrize("location_type,codes,expected", [("Affiliate", ["2000"], "2000"), ("VSP", ["OTHER"], None)])
+def test_search_evidence_does_not_override_canonical_or_nonaffiliate_profiles(location_type, codes, expected):
+    office_by_field = {**office({"pid": 2, "npi": "1234567893"}), "locationType": location_type}
+    resources = normalize_vsp_office(
+        office_by_field, profiles=[profile(2, *codes)], search_memberships={"Signature": {"2"}}
+    )
+    assert [
+        row["valueReference"]["reference"]
+        for resource in resources
+        if resource["resourceType"] == "PractitionerRole"
+        for row in resource["extension"]
+    ] == ([] if expected is None else ["Organization/vsp-network-" + expected])
+
+
 @pytest.mark.parametrize(
     ("summaries", "profiles", "reason"),
     [
         ([], [profile(2, "2000")], "unresolved_doctor"),
         ([{"pid": 2, "npi": "1234567893"}], [], "unresolved_doctor"),
-        ([{"pid": 2}], [profile(2, "2000")], "invalid_npi"),
-        ([{"pid": 2, "npi": "1234567890"}], [profile(2, "2000")], "invalid_npi"),
         ([{"pid": 2, "npi": 1234567893}], [profile(2, "2000")], "invalid_npi"),
         ([{"pid": 2, "npi": "1234567893"}], [{**profile(2, "2000"), "npi": "1999999992"}], "conflicting_npi"),
         (
@@ -144,6 +179,20 @@ def test_outside_profiles_keep_unknown_codes_without_membership():
 def test_unproven_membership_refuses_the_whole_office(summaries, profiles, reason):
     with pytest.raises(VSPDirectoryNormalizationError, match=f"^vsp_directory_{reason}$"):
         normalize_vsp_office(office(*summaries), profiles=profiles)
+
+
+@pytest.mark.parametrize("npi", [None, "", "1234567890", "not-an-npi"])
+def test_source_doctor_identity_preserves_membership_without_an_invalid_npi(npi):
+    summary_by_field = {"pid": 2, "npi": npi, "first": "Alex", "last": "Example"}
+    resources = normalize_vsp_office(office(summary_by_field), profiles=[profile(2, "2000")])
+    _, practitioner, role = resources
+    assert practitioner["id"] == "vsp-doctor-2"
+    assert practitioner["identifier"] == [{"system": "urn:vsp:doctor-id", "value": "2"}]
+    assert parse_fhir_resource("example", practitioner)[1]["npi"] is None
+    membership = parse_fhir_resource("example", role)[1]
+    assert membership["practitioner_ref"] == "Practitioner/vsp-doctor-2"
+    assert membership["network_refs"] == ["Organization/vsp-network-2000"]
+    assert summary_by_field["npi"] == npi
 
 
 @pytest.mark.parametrize("coordinate", [float("nan"), float("inf"), -90.1, True, "40.75", None])

@@ -7,7 +7,7 @@ import hashlib
 import math
 from dataclasses import dataclass
 
-from process.vsp_directory_contract import NETWORKS, canonical_json, require
+from process.vsp_directory_contract import NETWORKS, canonical_json, office_position, require
 
 EARTH_MILES = 3958.7613
 
@@ -122,4 +122,16 @@ def census_request(network):
         "includePremierFields": False,
         "offset": "1",
         "limit": "1",
+    }
+
+
+def office_search_request(office, network):
+    """Search one network around the publisher's exact office coordinates."""
+    latitude, longitude = office_position(office)
+    return {
+        **census_request(network),
+        "latitude": str(latitude),
+        "longitude": str(longitude),
+        "radius": "0.05",
+        "limit": "50",
     }

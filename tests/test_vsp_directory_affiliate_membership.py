@@ -1,0 +1,248 @@
+# Licensed under the HealthPorta Non-Commercial License (see LICENSE).
+"""Affiliate memberships require retained office-scoped search doctor evidence."""
+
+from copy import deepcopy
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+
+from process import vsp_directory_capture as acquisition
+from process.vsp_directory_contract import NETWORKS, PROFILE_MEMBERSHIP_UNRESOLVED, SEARCH_URL, VSPDirectoryError
+from process.vsp_directory_enrichment import enrich_capture, write_normalized_capture
+from process.vsp_directory_geometry import office_search_request
+from process.vsp_directory_normalization import VSPDirectoryNormalizationError
+from process.vsp_directory_store import VSPCaptureStore
+from tests.test_vsp_directory_capture import HTTP, TILE, noop
+from tests.test_vsp_directory_enrichment import FIRST, SECOND, office
+from tests.test_vsp_directory_normalization import profile
+
+
+def affiliate(identifier, *summaries):
+    office_by_field = {**office(identifier, *summaries), "locationType": "Affiliate"}
+    office_by_field["addr"]["latitude"] += identifier / 1000
+    return office_by_field
+
+
+class AffiliateSource:
+    def __init__(self, *, scopes=None, summaries=None, offices=(52,)):
+        self.offices = {oid: affiliate(oid) for oid in offices}
+        self.scopes = scopes if scopes is not None else {(52, name): (2, 3) for name in NETWORKS.values()}
+        self.summaries = summaries or {2: FIRST, 3: SECOND}
+        self.profiles = {
+            oid: [
+                {
+                    **profile(did, "BRANCH ", "OPTION"),
+                    "providerNetworks": [{"networkId": "BRANCH"}, {"networkId": "OPTION"}],
+                }
+                for did in (2, 3, 4)
+            ]
+            for oid in offices
+        }
+        self.capped = set()
+        self.capped_present = False
+        self.repair = None
+        self.census_extra = 0
+
+    def response(self, method, url, payload):
+        if method == "GET":
+            if url.startswith(SEARCH_URL):
+                assert self.repair is not None
+                return self.repair
+            oid = int(parse_qs(urlsplit(url).query)["officepublicid"][0])
+            return self.profiles[oid]
+        assert method == "POST" and url == SEARCH_URL and len(payload["networkNames"]) == 1
+        network = payload["networkNames"][0]
+        if payload["limit"] == "1":
+            count = sum(bool(self.scopes.get((oid, network))) for oid in self.offices)
+            return {"totalCounts": count + (self.census_extra if network == "Signature" else 0)}
+        is_targeted = payload["radius"] == "0.05"
+        selected_offices = [
+            oid
+            for oid, row in self.offices.items()
+            if not is_targeted or str(row["addr"]["latitude"]) == payload["latitude"]
+        ]
+        rows = [
+            affiliate(oid, *(self.summaries[did] for did in self.scopes[oid, network]))
+            for oid in selected_offices
+            if (oid, network) in self.scopes
+        ]
+        if is_targeted and (selected_offices[0], network) in self.capped:
+            rows = (rows[:1] if self.capped_present else []) + [office(100 + index) for index in range(50)]
+            return {"totalCounts": 51, "locations": rows[:50]}
+        return {"totalCounts": len(rows), "locations": rows}
+
+
+def capture(tmp_path, source):
+    store = VSPCaptureStore(tmp_path, "synthetic-affiliate")
+    return acquisition.VSPCapture(store, HTTP(source), noop, noop)
+
+
+def roles(resources):
+    return {
+        row["id"]: {item["valueReference"]["reference"].rsplit("-", 1)[1] for item in row["extension"]}
+        for row in resources
+        if row["resourceType"] == "PractitionerRole"
+    }
+
+
+@pytest.fixture(autouse=True)
+def one_world_tile(monkeypatch):
+    monkeypatch.setattr(acquisition, "world_tiles", lambda: (TILE,))
+
+
+@pytest.mark.asyncio
+async def test_affiliate_capture_uses_only_search_doctors_and_retained_targeted_scopes(tmp_path):
+    source = AffiliateSource()
+    original_profiles = deepcopy(source.profiles)
+    run = capture(tmp_path, source)
+    await run.discover("Signature", 1)
+    await enrich_capture(run)
+    assert run.http.requests == 4
+    assert run.search_memberships == {"52": {name: {"2", "3"} for name in NETWORKS.values()}}
+    assert run.profiles["52"] == original_profiles[52] == source.profiles[52]
+    assert "search:52" in run._sizes
+    census_by_network = dict.fromkeys(NETWORKS.values(), 1)
+    completed = await write_normalized_capture(run, census_by_network, census_by_network)
+    assert list(roles(completed.iter_resources()).values()) == [{"1000", "2000", "4000"}] * 2
+    assert completed.proof["outside_profile_count"] == 1
+    assert completed.manifest["other_network_ids"] == {"BRANCH": 1, "OPTION": 1}
+    resumed = capture(tmp_path, source)
+    await resumed.discover("Signature", 1)
+    await enrich_capture(resumed)
+    assert resumed.http.requests == 0 and resumed.cache_hits == 4
+    assert resumed.search_memberships == run.search_memberships
+    # The production transport restores the retained campaign's request count.
+    resumed.http.requests = run.http.requests
+    replay = await write_normalized_capture(resumed, census_by_network, census_by_network)
+    assert list(replay.iter_resources()) == list(completed.iter_resources())
+
+
+@pytest.mark.asyncio
+async def test_affiliate_scopes_close_all_networks_without_extra_world_searches(tmp_path):
+    run = capture(tmp_path, AffiliateSource())
+    completed = await run.run()
+    spatial_queries = [body for method, _, body in run.http.calls if method == "POST" and body["limit"] == "50"]
+    assert len(spatial_queries) == 3
+    assert {body["networkNames"][0] for body in spatial_queries} == set(NETWORKS.values())
+    assert spatial_queries[0]["radius"] != "0.05"
+    assert [body["radius"] for body in spatial_queries[1:]] == ["0.05", "0.05"]
+    assert completed.proof["publisher_locations"] == dict.fromkeys(NETWORKS.values(), 1)
+    assert completed.proof["network_npis"] == dict.fromkeys(NETWORKS.values(), 2)
+
+
+@pytest.mark.asyncio
+async def test_each_network_uses_its_incoming_summaries_before_office_merge(tmp_path):
+    source = AffiliateSource(scopes={(52, "Signature"): (2, 3), (52, "Choice"): (3,)})
+    run = capture(tmp_path, source)
+    await run.discover("Signature", 1)
+    await enrich_capture(run)
+    assert run.search_memberships == {"52": {"Signature": {"2", "3"}, "Choice": {"3"}, "Advantage": set()}}
+    census_by_network = {"Signature": 1, "Choice": 1, "Advantage": 0}
+    completed = await write_normalized_capture(run, census_by_network, census_by_network)
+    assert roles(completed.iter_resources()) == {
+        "vsp-role-2-52-1234567893": {"1000"},
+        "vsp-role-3-52-1999999992": {"1000", "2000"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_identity_repair_never_expands_affiliate_membership(tmp_path):
+    source = AffiliateSource(scopes={(52, "Signature"): (2,)}, summaries={2: {"pid": 2, "npi": None}})
+    source.repair = affiliate(52, FIRST, SECOND)
+    run = capture(tmp_path, source)
+    await run.discover("Signature", 1)
+    await enrich_capture(run)
+    assert run.search_memberships == {"52": {"Signature": {"2"}, "Choice": set(), "Advantage": set()}}
+    assert {row["pid"] for row in run.offices["52"]["providerSummaries"]} == {2, 3}
+    assert run.http.calls[-1][0:2] == ("GET", SEARCH_URL + "/52?networkNames=Signature")
+    census_by_network = {"Signature": 1, "Choice": 0, "Advantage": 0}
+    completed = await write_normalized_capture(run, census_by_network, census_by_network)
+    assert list(roles(completed.iter_resources()).values()) == [{"1000"}]
+    assert completed.proof["outside_profile_count"] == 2
+    requests = run.http.requests
+    await enrich_capture(run)
+    assert run.http.requests == requests
+
+
+@pytest.mark.asyncio
+async def test_affiliate_without_search_doctor_ids_remains_unresolved(tmp_path):
+    source = AffiliateSource(scopes={(52, "Signature"): ()})
+    run = capture(tmp_path, source)
+    await run.discover("Signature", 1)
+    with pytest.raises(VSPDirectoryError, match="^" + PROFILE_MEMBERSHIP_UNRESOLVED + "$"):
+        await enrich_capture(run)
+    assert run.store.load_checkpoint("complete") is None
+    assert not any(run.search_memberships["52"].values())
+
+
+@pytest.mark.asyncio
+async def test_shared_doctor_identity_never_crosses_office_network_scopes(tmp_path):
+    source = AffiliateSource(scopes={(52, "Signature"): (2,), (53, "Choice"): (2,)}, offices=(52, 53))
+    run = capture(tmp_path, source)
+    run.remember_search(affiliate(52, FIRST), "Signature", "a" * 64)
+    run.remember_search(affiliate(53, {"pid": 2, "npi": None}), "Choice", "b" * 64)
+    await enrich_capture(run)
+    assert run.memberships == {"Signature": {"52"}, "Choice": {"53"}, "Advantage": set()}
+    assert len(run.identity_reuses) == 1
+    assert all(method != "GET" or not url.startswith(SEARCH_URL) for method, url, _ in run.http.calls)
+    census_by_network = {"Signature": 1, "Choice": 1, "Advantage": 0}
+    completed = await write_normalized_capture(run, census_by_network, census_by_network)
+    assert roles(completed.iter_resources()) == {
+        "vsp-role-2-52-1234567893": {"1000"},
+        "vsp-role-2-53-1234567893": {"2000"},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_present", [False, True])
+async def test_capped_targeted_search_proves_presence_only(tmp_path, target_present):
+    source = AffiliateSource()
+    source.capped.add((52, "Advantage"))
+    source.capped_present = target_present
+    run = capture(tmp_path, source)
+    await run.discover("Signature", 1)
+    if target_present:
+        await enrich_capture(run)
+        assert run.memberships["Advantage"] == {"52"}
+    else:
+        with pytest.raises(VSPDirectoryError, match="^" + PROFILE_MEMBERSHIP_UNRESOLVED + "$"):
+            await enrich_capture(run)
+        assert "Advantage" not in run.search_memberships["52"]
+        assert run.store.load_checkpoint("complete") is None
+    assert set(run.offices) == {"52"}
+
+
+@pytest.mark.asyncio
+async def test_affiliate_fix_keeps_global_office_deficit_closed(tmp_path):
+    source = AffiliateSource()
+    source.census_extra = 1
+    run = capture(tmp_path, source)
+    with pytest.raises(VSPDirectoryError, match="^vsp_office_census_unresolved$"):
+        await run.run()
+    assert run.memberships == {name: {"52"} for name in NETWORKS.values()}
+    assert run.unresolved == [] and run.store.load_checkpoint("complete") is None
+
+
+@pytest.mark.asyncio
+async def test_search_doctor_without_office_profile_still_refuses_output(tmp_path):
+    source = AffiliateSource()
+    source.profiles[52] = source.profiles[52][:1]
+    run = capture(tmp_path, source)
+    await run.discover("Signature", 1)
+    with pytest.raises(VSPDirectoryNormalizationError, match="^vsp_directory_unresolved_doctor$"):
+        await enrich_capture(run)
+
+
+def test_search_memberships_share_the_existing_source_index_budget(tmp_path):
+    run = capture(tmp_path, AffiliateSource())
+    run._total_bytes = 512 * 1024 * 1024
+    with pytest.raises(VSPDirectoryError, match="^vsp_source_index_byte_budget_exhausted$"):
+        run.remember_search_scope("52", "Signature", {"2"})
+
+
+def test_targeted_search_preserves_source_position_at_coordinate_boundaries():
+    row = affiliate(52)
+    row["addr"].update(latitude=90.0, longitude=-180.0)
+    payload = office_search_request(row, "Choice")
+    assert (payload["latitude"], payload["longitude"], payload["radius"]) == ("90.0", "-180.0", "0.05")
+    assert payload["networkNames"] == ["Choice"] and payload["locationType"] == ["VSP", "Affiliate"]

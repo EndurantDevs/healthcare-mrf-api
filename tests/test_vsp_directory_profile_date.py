@@ -112,7 +112,7 @@ async def test_mixed_date_office_uses_first_profile_through_repair_and_restart(
 def test_later_dated_office_still_validates_links_location_and_npi(defect, code):
     first = Source().offices["101"]
     run = acquisition.VSPCapture(Store(), None, noop, noop)
-    run.remember(first, "Signature", "a" * 64)
+    run.remember_search(first, "Signature", "a" * 64)
     later = deepcopy(first)
     later["locationDrProfileLink"]["href"] = later["locationDrProfileLink"]["href"].replace("2035-01-01", "2035-01-02")
     if defect == "office":
@@ -128,4 +128,4 @@ def test_later_dated_office_still_validates_links_location_and_npi(defect, code)
     else:
         later["providerSummaries"][0]["npi"] = "1999999992"
     with pytest.raises(VSPDirectoryError, match="^" + code + "$"):
-        run.remember(later, "Choice", "b" * 64)
+        run.remember_search(later, "Choice", "b" * 64)
