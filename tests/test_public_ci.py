@@ -457,9 +457,8 @@ def test_public_test_matrices_preserve_independent_database_shards():
     for job_id, rows in MATRIX_ROWS_BY_JOB.items():
         job = jobs[job_id]
         if job_id == "address-canonical-db-tests":
-            # Database lanes are capped and listed longest-first; the pinned rows stay order-free.
-            assert set(job["strategy"]) == {"max-parallel", "fail-fast", "matrix"}
-            assert job["strategy"]["max-parallel"] == 48
+            # Database lanes are uncapped and listed longest-first; the pinned rows stay order-free.
+            assert set(job["strategy"]) == {"fail-fast", "matrix"}
             assert job["strategy"]["fail-fast"] is False
             assert job["timeout-minutes"] == "${{ matrix.shard == 'cms-successor' && 30 || 20 }}"
             setup = next(step for step in job["steps"] if step.get("uses") == LOCAL_SETUP_ACTION)
