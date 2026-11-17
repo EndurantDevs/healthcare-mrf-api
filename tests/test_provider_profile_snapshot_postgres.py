@@ -87,6 +87,21 @@ async def test_snapshot_pins_rows_when_independent_updates_commit(monkeypatch):
         assert snapshot._SNAPSHOT.get() is None and not session.in_transaction()
 
 
+async def test_detail_snapshot_does_not_require_endpoint_headers(monkeypatch):
+    async with snapshot_database(monkeypatch) as (database, schema):
+        endpoint = f'"{schema}".provider_directory_endpoint'
+        async with database.engine.begin() as connection:
+            await connection.execute(text(f"CREATE TABLE {endpoint} (header jsonb)"))
+
+        async with snapshot.provider_profile_read_snapshot(database, schema, include_detail=True) as session:
+            assert await session.scalar(text(f'SELECT marker FROM "{schema}".provider_directory_profile')) == "old"
+
+        with pytest.raises(DBAPIError) as forbidden:
+            async with database.reader_session() as session:
+                await session.execute(text(f"SELECT header FROM {endpoint}"))
+        assert snapshot.postgres_sqlstate(forbidden.value) == "42501"
+
+
 async def test_cancelled_read_releases_all_relation_locks(monkeypatch):
     async with snapshot_database(monkeypatch) as (database, schema):
         await create_directory_partitions(database, schema)

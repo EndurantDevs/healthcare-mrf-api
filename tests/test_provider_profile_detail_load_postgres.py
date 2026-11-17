@@ -89,7 +89,7 @@ class _Measurements:
             if sample_by_field is not None:
                 schema = args[1]
                 assert set(result) == {f"{schema}.{name}" for name in detail_support.RELATIONS}
-                assert len(result) == 60 and all(result.values())
+                assert len(result) == detail_support.DETAIL_RELATION_COUNT and all(result.values())
                 sample_by_field["inventory_calls"] = sample_by_field.get("inventory_calls", 0) + 1
                 sample_by_field["relations"] = len(result)
                 sample_by_field["inventory_ms"] = round((perf_counter() - started) * 1000, 3)
@@ -248,7 +248,7 @@ def _write_receipt(tmp_path, fixture, measurements, before, publication_by_field
         "cache_enabled": cache_enabled,
         "reader_count": 3,
         "cadence": "continuous; no sleeps or quiet windows",
-        "relation_count": 60,
+        "relation_count": detail_support.DETAIL_RELATION_COUNT,
         "before_authority": asdict(before),
         "npi_identity": fixture.npi_identity,
         "publication": publication_by_field,
@@ -274,7 +274,7 @@ def _assert_publication(measurements, publication_by_field, before, after, schem
     """Require a committed named family and coherent successful reads on both sides."""
     assert all(
         not sample_by_field.get("error")
-        and sample_by_field.get("relations") == 60
+        and sample_by_field.get("relations") == detail_support.DETAIL_RELATION_COUNT
         and sample_by_field.get("inventory_calls") == 1
         for sample_by_field in measurements.requests
     )

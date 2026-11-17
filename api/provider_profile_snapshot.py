@@ -67,7 +67,6 @@ _DIRECTORY_TABLES = (
     "provider_directory_address_overlay",
     "provider_directory_source",
     "provider_directory_endpoint_dataset",
-    "provider_directory_endpoint",
     "provider_directory_dataset_resource",
     "provider_directory_practitioner",
     "provider_directory_practitioner_role",
