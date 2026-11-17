@@ -10,14 +10,17 @@ import ssl
 import time
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlsplit
 
 import aiohttp
 
 from process.vsp_directory_contract import (
     MAX_RESPONSE_BYTES,
     MIN_REQUEST_INTERVAL,
+    PROFILE_PATH,
     VSPDirectoryError,
     canonical_json,
+    is_missing_profile_response,
     request_key,
     require,
     validated_url,
@@ -165,9 +168,11 @@ class VSPHTTP:
             require(str(response.url) == url, "vsp_response_url_changed")
             if response.status in {408, 423, 425, 429, 500, 502, 503, 504}:
                 return None, retry_delay(response.headers.get("Retry-After"))
-            require(response.status == 200, "vsp_http_terminal_status")
+            has_missing_profile = response.status == 404 and method == "GET" and urlsplit(url).path == PROFILE_PATH
+            require(response.status == 200 or has_missing_profile, "vsp_http_terminal_status")
             raw = await self._body(response)
             decoded = strict_json(raw)
+            require(not has_missing_profile or is_missing_profile_response(decoded), "vsp_http_terminal_status")
             require(not isinstance(decoded, dict) or not decoded.get("errors"), "vsp_search_source_error")
             return (
                 decoded,
@@ -180,6 +185,7 @@ class VSPHTTP:
                     "observed_at": datetime.now(UTC).isoformat(),
                     "sha256": hashlib.sha256(raw).hexdigest(),
                     "byte_count": len(raw),
+                    "http_status": response.status,
                     "proxy_id": selection.proxy_id if selection is not None else None,
                     "policy_revision": getattr(self.binding, "policy_revision", None),
                     "pool_revision": getattr(self.binding, "pool_revision", None),

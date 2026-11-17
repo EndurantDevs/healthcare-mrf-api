@@ -586,3 +586,22 @@ def test_changed_source_identity_is_rejected_before_using_transport(source_recor
     source_record["canonical_api_base"] = "https://directory.example.test/fhir"
     with pytest.raises(VSPDirectoryError, match="^vsp_source_identity_changed$"):
         directory._resource_import_group_key(source_record)
+
+
+@pytest.mark.parametrize("retail_companies", [0, 2])
+def test_retail_capture_counts_require_matching_optional_graph(completed_capture, retail_companies):
+    from process import vsp_directory_integration as adapter
+
+    counts = completed_capture.resource_counts
+    counts.update(Location=2, Organization=4 + retail_companies, OrganizationAffiliation=1 + retail_companies)
+    completed_capture.proof.update(resource_counts=counts.copy(), retail_locations=1)
+    if retail_companies:
+        completed_capture.proof["retail_company_organizations"] = retail_companies
+    assert adapter._capture_counts(completed_capture) == counts
+    assert adapter._resource_key({"resourceType": "OrganizationAffiliation", "id": "vsp-site-network-52"}) == (
+        "OrganizationAffiliation",
+        "vsp-site-network-52",
+    )
+    completed_capture.proof["retail_locations"] = 0
+    with pytest.raises(VSPDirectoryError, match="^vsp_capture_proof_invalid$"):
+        adapter._capture_counts(completed_capture)
