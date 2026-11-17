@@ -155,8 +155,6 @@ async def test_provider_directory_persistence_helpers_cover_empty_edges(monkeypa
     )
 
     monkeypatch.setattr(fhir, "_endpoint_dataset_resource_rows", lambda *_a, **_k: [])
-    monkeypatch.setattr(fhir, "_canonical_resource_rows", lambda *_a, **_k: [])
-    monkeypatch.setattr(fhir, "_source_resource_edge_rows", lambda *_a, **_k: [])
 
     upsert = AsyncMock()
     monkeypatch.setattr(fhir, "_upsert_rows", upsert)

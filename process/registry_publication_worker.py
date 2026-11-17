@@ -825,21 +825,3 @@ def _worker_database_urls(configured_by_name, consumer):
     ):
         _invalid()
     return lifecycle, execution
-
-
-async def _registered_address_sources(custodian, request_scope, address_sources, schema):
-    from process.registry_composition_resume import resolve_registered_compact_format
-
-    request_id, approved_revision, expected_head = request_scope
-    registered_compact = await resolve_registered_compact_format(
-        custodian,
-        UUID(str(request_id)),
-        approved_revision,
-        expected_head,
-        control_schema=schema,
-    )
-    if registered_compact is True and not address_sources.compact:
-        raise ValueError("registry_composition_registered_compact_format_required")
-    if registered_compact is False and address_sources.compact:
-        address_sources = replace(address_sources, compact=False)
-    return address_sources

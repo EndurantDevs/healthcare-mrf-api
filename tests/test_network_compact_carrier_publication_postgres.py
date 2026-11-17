@@ -15,6 +15,8 @@ from process.network_address_projection import PinnedAddressSource
 from process.network_compact_layout import CompactAddressRelation
 from process.network_compact_retention import (
     NetworkCompactRetentionError,
+    _candidate_dependencies,
+    _carrier_origin_dependencies,
     require_network_compact_artifacts_unreferenced,
 )
 from process.network_custom_address_source import NetworkCustomAddressSourceError
@@ -421,8 +423,9 @@ async def _assert_native_projection(fixture, copy_target, retained_source, offic
     assert len(carrier["origin_references"]) == 1
 
 
-async def _assert_historical_carrier_retained(fixture, manifest):
+async def _assert_historical_carrier_retained(fixture, current, retained_source):
     assert not fixture.connection.is_in_transaction()
+    manifest = retained_source.manifest
     relations = [
         CompactAddressRelation(manifest.schema_name, name)
         for name in ("entity_address_unified", "provider_location_binding")
@@ -434,11 +437,30 @@ async def _assert_historical_carrier_retained(fixture, manifest):
             f'UPDATE "{fixture.control_schema}".network_serving_manifest SET eligible=false WHERE generation_id=$1',
             manifest.generation_id,
         )
+        candidate = await fixture.connection.fetchrow(
+            f'SELECT * FROM "{fixture.control_schema}".network_membership_candidate WHERE candidate_id=$1',
+            UUID(current.candidate_id),
+        )
+        dependencies = await _candidate_dependencies(fixture.connection, dict(candidate), fixture.control_schema)
+        assert (manifest.address_relation.schema_name, manifest.address_relation.table_name) in dependencies
         for relation in relations:
             with pytest.raises(NetworkCompactRetentionError, match="network_compact_retention_artifact_referenced"):
                 await require_network_compact_artifacts_unreferenced(
                     fixture.connection, (relation,), control_schema=fixture.control_schema
                 )
+        source_relation = (fixture.source.schema_name, fixture.source.table_name)
+        predecessor = retained_source.predecessor
+        for origin, expected in (
+            (predecessor, {source_relation}),
+            (current, {source_relation, (current.schema_name, "entity_address_unified")}),
+        ):
+            carriers = SimpleNamespace(origin_references=((origin.generation_id, origin.manifest_sha256, 1, "a" * 64),))
+            assert await _carrier_origin_dependencies(fixture.connection, carriers, fixture.control_schema) == expected
+        mismatched = SimpleNamespace(
+            origin_references=((current.generation_id, predecessor.manifest_sha256, 1, "a" * 64),)
+        )
+        with pytest.raises(NetworkCompactRetentionError, match="network_compact_retention_origin_changed"):
+            await _carrier_origin_dependencies(fixture.connection, mismatched, fixture.control_schema)
     finally:
         await transaction.rollback()
 
@@ -461,7 +483,7 @@ async def test_carrier_publication_manual_precedence_tamper_refusals_and_pinned_
             await _publish_with_refusals(fixture, first, reviewed.selected)
             first_pin, offices = await _read(fixture)
             await _assert_native_projection(fixture, first, retained_source, offices)
-            await _assert_historical_carrier_retained(fixture, retained_source.manifest)
+            await _assert_historical_carrier_retained(fixture, first_pin, retained_source)
             async with _reader(fixture) as (reader, native):
                 pinned = await resolve_network_serving_manifest(native, control_schema=fixture.control_schema)
                 assert await _scoped_rows(reader, pinned, (42,)) == offices

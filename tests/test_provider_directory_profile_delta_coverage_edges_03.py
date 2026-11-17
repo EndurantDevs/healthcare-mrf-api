@@ -511,6 +511,40 @@ async def test_stale_build_authenticated_cleanup_completion(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("has_leftover_stage", [False, True], ids=["already-disposed", "leftover-stage"])
+async def test_stale_build_reaper_keeps_disposed_checkpoint_without_writes(monkeypatch, has_leftover_stage):
+    """A completed cleanup is idempotent only when all named stages are gone."""
+    checkpoint, _, _, _ = _completed_cleanup_checkpoint()
+
+    @contextlib.asynccontextmanager
+    async def transaction():
+        yield
+
+    status = AsyncMock()
+    relation_identity = AsyncMock(side_effect=[None, None, (22, "r", "p") if has_leftover_stage else None])
+    monkeypatch.setattr(importer.db, "transaction", transaction)
+    monkeypatch.setattr(importer.db, "all", AsyncMock(return_value=[checkpoint]))
+    monkeypatch.setattr(importer.db, "first", AsyncMock(return_value=checkpoint))
+    monkeypatch.setattr(importer.db, "status", status)
+    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_admission", lambda: None)
+    monkeypatch.setattr(importer, "_provider_directory_profile_stage_relation_identity", relation_identity)
+    current_build_id = "pdpb_" + "c" * 32
+
+    if has_leftover_stage:
+        with pytest.raises(RuntimeError, match="disposed_checkpoint_stage_present"):
+            await importer._reap_stale_provider_directory_profile_builds("mrf", current_build_id=current_build_id)
+    else:
+        assert (
+            await importer._reap_stale_provider_directory_profile_builds("mrf", current_build_id=current_build_id) == 0
+        )
+
+    assert [invocation.args[1] for invocation in relation_identity.await_args_list] == [
+        checkpoint[field] for field in ("profile_stage", "evidence_stage", "affected_npi_stage")
+    ]
+    status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_bundle_profile_delta_edges(monkeypatch):
     delta = _prepared_delta()
     bundle = importer.ProviderDirectoryArtifactBundle()

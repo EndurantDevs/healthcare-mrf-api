@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from process import native_copy_cleanup as copy_cleanup
 from process import uhc_flex_official_cohort_snapshot as snapshot
 from process import uhc_flex_official_cohort_store as store
 from process.uhc_flex_official_cohort_contract import UHCFlexOfficialCohortError, build_uhc_flex_official_cohort
@@ -122,8 +123,8 @@ async def test_cancel_drains_copy_owner_and_closes_source_cursor(monkeypatch):
     close, invalidate = AsyncMock(), AsyncMock()
     owner = object()
     monkeypatch.setattr(snapshot, "source_copy_session", lambda: owner)
-    monkeypatch.setattr(snapshot, "close_interrupted_copy", close)
-    monkeypatch.setattr(snapshot, "invalidate_copy_owner", invalidate)
+    monkeypatch.setattr(copy_cleanup, "close_interrupted_copy", close)
+    monkeypatch.setattr(copy_cleanup, "invalidate_copy_owner", invalidate)
     with pytest.raises(asyncio.CancelledError):
         await snapshot._copy_members(
             driver, SimpleNamespace(schema="sample"), "private_child", pin, object(), cohort(), "SELECT npi"

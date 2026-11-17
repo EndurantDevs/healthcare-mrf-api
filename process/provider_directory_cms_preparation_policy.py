@@ -14,8 +14,6 @@ from process import provider_directory_cms_preparation_custody as custody
 from process.provider_directory_generic_source_provision import _completed_legacy_dataset_plan
 from process.provider_directory_source_acquisition_custody import _require_dataset_relationships
 
-CONTRACT = "cms-preparation-custody-evidence-v2"
-DEPENDENCY_CONTRACT = "cms-preparation-custody-evidence-v3"
 PLAN = "pd_dataset_migration_plan"
 ROOTS = (*custody.CANONICAL_ROOTS, *TABLES[4:], PLAN)
 _HISTORY_SQL = """SELECT c.oid::bigint,n.nspname,c.relname,c.relkind::text,c.relispartition,
@@ -35,23 +33,6 @@ _HISTORY_SQL = """SELECT c.oid::bigint,n.nspname,c.relname,c.relkind::text,c.rel
 def _require(condition, code):
     if not condition:
         raise ValueError("cms_preparation_policy_" + code)
-
-
-def _profile(profile, storage_binding, policy):
-    """Preserve the v1 fields and require an explicit exact retained-OID set."""
-    _require(type(profile) is dict and profile.get("contract") in {CONTRACT, DEPENDENCY_CONTRACT}, "profile_required")
-    _require("fixed_descendant_oids" in profile, "retained_descendants_required")
-    retained = profile["fixed_descendant_oids"]
-    _require(
-        type(retained) is list
-        and all(type(oid) is int and 0 < oid < 2**32 for oid in retained)
-        and retained == sorted(set(retained)),
-        "retained_descendants_required",
-    )
-    legacy_by_field = {key: value for key, value in profile.items() if key != "fixed_descendant_oids"}
-    legacy_by_field["contract"] = custody.CONTRACT
-    validated = custody._profile(legacy_by_field, storage_binding, policy)
-    return {**validated, "contract": profile["contract"], "fixed_descendant_oids": list(retained)}
 
 
 async def _histories(connection, schema, plan, roots_by_name):
@@ -235,21 +216,3 @@ async def _collect(connection, storage_binding, policy, retained_oids):
 async def _observe(connection, storage_binding, policy, retained_oids):
     """Observe stable evidence, pinning existing objects without fencing writers."""
     return custody._evidence_digests(await _collect(connection, storage_binding, policy, retained_oids))
-
-
-async def _collect_profile(connection, storage_binding, policy, cms_profile):
-    """Select the explicitly protected version without reinterpreting existing inventories."""
-    profile = _profile(cms_profile, storage_binding, policy)
-    if profile["contract"] == CONTRACT:
-        return await _collect(connection, storage_binding, policy, profile["fixed_descendant_oids"])
-    from process import provider_directory_cms_dependency_policy as dependencies
-
-    return await dependencies._collect(connection, storage_binding, policy, profile["fixed_descendant_oids"])
-
-
-async def _observe_profile(connection, storage_binding, policy, cms_profile):
-    """Keep the v2 observation path exact; v3 hashes its complete dependency inventory."""
-    profile = _profile(cms_profile, storage_binding, policy)
-    if profile["contract"] == CONTRACT:
-        return await _observe(connection, storage_binding, policy, profile["fixed_descendant_oids"])
-    return custody._evidence_digests(await _collect_profile(connection, storage_binding, policy, profile))

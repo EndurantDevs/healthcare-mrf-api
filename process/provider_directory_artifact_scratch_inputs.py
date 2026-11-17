@@ -598,11 +598,10 @@ async def _copy_source_rows(directory, publisher, name, rows):
             )
             require_output(status == f"COPY {len(batch)}", "scratch_source_copy_incomplete")
             copied += len(batch)
-    except asyncio.CancelledError, TimeoutError:
-        from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
+    except (asyncio.CancelledError, TimeoutError) as interruption:
+        from process.native_copy_cleanup import cleanup_interrupted_copy
 
-        await close_interrupted_copy(publisher.connection)
-        await invalidate_copy_owner(source_copy_session(), publisher.connection)
+        await cleanup_interrupted_copy(source_copy_session(), publisher.connection, interruption)
         raise
     return copied
 

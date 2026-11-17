@@ -10,7 +10,7 @@ from weakref import WeakKeyDictionary
 from sqlalchemy import text
 
 from db.plan_release_storage import storage_identifier, storage_relation
-from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
+from process.native_copy_cleanup import cleanup_interrupted_copy
 from process.provider_directory_dataset_rehydrate_pin import pinned_current_source
 from process.provider_directory_dataset_rehydrate_scope import _load_dataset_scope
 from process.provider_directory_dataset_rehydrate_types import RehydrationRequest, RehydrationRuntime
@@ -83,9 +83,8 @@ async def _copy_members(connection, policy, name, pin, directory, cohort, projec
                 status = await connection.copy_records_to_table(
                     name, schema_name=policy.schema, columns=("cohort_id", "npi"), records=records
                 )
-            except asyncio.CancelledError, TimeoutError:
-                await close_interrupted_copy(connection)
-                await invalidate_copy_owner(source_copy_session(), connection)
+            except (asyncio.CancelledError, TimeoutError) as interruption:
+                await cleanup_interrupted_copy(source_copy_session(), connection, interruption)
                 raise
             _require(status == f"COPY {len(records)}")
             copied += len(records)

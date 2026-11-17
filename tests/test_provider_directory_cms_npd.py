@@ -12,6 +12,7 @@ import time
 from compression import zstd
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager, nullcontext
+from dataclasses import replace
 from functools import partial
 from itertools import count
 from pathlib import Path
@@ -2424,3 +2425,154 @@ async def test_executor_drain_defers_repeated_cancellation_until_workers_finish(
         if drain is not None:
             await asyncio.gather(drain, return_exceptions=True)
         executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _retained_registry_candidate():
+    return fhir.EndpointDatasetCandidate(
+        endpoint_id="synthetic-endpoint",
+        dataset_id="synthetic-dataset",
+        acquisition_root_run_id="synthetic-root",
+        source_ids=(cms.SOURCE_ID,),
+        selected_resources=tuple(sorted(cms.RESOURCE_TYPES)),
+        import_run_id="synthetic-retry",
+        previous_dataset_id=None,
+        source_release=cms.release_identity(_receipt()),
+        semantic_projection_as_of="2026-09-24",
+        already_validated=True,
+    )
+
+
+@pytest.fixture
+def cms_registry_replay(monkeypatch):
+    from process.provider_directory_admission_seal import ADMISSION_KIND_GENERIC, parse_source_admission_receipt
+
+    candidate = _retained_registry_candidate()
+    declaration = cms.fhir_network_binding_metadata(
+        source_id=cms.SOURCE_ID,
+        dataset_schema="synthetic",
+        dataset_id=candidate.dataset_id,
+        producer_id=cms.ADAPTER_CONTRACT,
+        alias_scope=cms.SOURCE_ID,
+    )
+    proof_by_field = {
+        "dataset_hash": "a" * 64,
+        "resource_count": len(candidate.selected_resources),
+        "resource_hashes": {kind: "b" * 64 for kind in candidate.selected_resources},
+        "resource_counts": dict.fromkeys(candidate.selected_resources, 1),
+    }
+    seal = parse_source_admission_receipt(
+        {"network_bindings": declaration, "semantic_projection_as_of": candidate.semantic_projection_as_of},
+        admission_kind=ADMISSION_KIND_GENERIC,
+        proof_sha256="c" * 64,
+        resource_counts=proof_by_field["resource_counts"],
+        proof_summary=proof_by_field,
+    )
+    header_by_field = {
+        "endpoint_id": candidate.endpoint_id,
+        "evidence_run_id": candidate.acquisition_root_run_id,
+        "status": fhir.ENDPOINT_DATASET_VALIDATED,
+        "content_proof_admission_sha256": seal.proof_sha256,
+        "publication_metadata_sha256": seal.metadata_sha256,
+    }
+    driver = SimpleNamespace(fetchrow=AsyncMock(return_value=header_by_field))
+    connection = SimpleNamespace(status=AsyncMock(), raw_connection=SimpleNamespace(driver_connection=driver))
+    directory = SimpleNamespace(
+        db=SimpleNamespace(acquire=lambda: nullcontext(connection), scalar=AsyncMock(return_value=123)),
+        _schema=lambda: "synthetic",
+        _qt=fhir._qt,
+        ENDPOINT_DATASET_VALIDATED=fhir.ENDPOINT_DATASET_VALIDATED,
+        ENDPOINT_DATASET_PUBLISHED=fhir.ENDPOINT_DATASET_PUBLISHED,
+        ENDPOINT_DATASET_SUPERSEDED=fhir.ENDPOINT_DATASET_SUPERSEDED,
+        _endpoint_dataset_admission_handoff=fhir._endpoint_dataset_admission_handoff,
+        _endpoint_dataset_content_proof=AsyncMock(return_value=fhir.EndpointDatasetContentProof(**proof_by_field)),
+        _finalize_endpoint_dataset_candidate=AsyncMock(),
+    )
+    read_seal = AsyncMock(return_value=seal)
+    monkeypatch.setattr(
+        importlib.import_module("process.provider_directory_admission_backfill"), "_validated_row_seal", read_seal
+    )
+    return SimpleNamespace(
+        candidate=candidate,
+        directory=directory,
+        header_by_field=header_by_field,
+        connection=connection,
+        read_seal=read_seal,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [None, "wrong-root", "changed-proof", "changed-metadata"])
+async def test_retained_cms_registry_replay_checks_exact_completed_candidate(cms_registry_replay, fault):
+    case = cms_registry_replay
+    candidate, directory = case.candidate, case.directory
+    if fault == "wrong-root":
+        case.header_by_field["evidence_run_id"] = "other-root"
+    elif fault == "changed-proof":
+        observed = directory._endpoint_dataset_content_proof
+        observed.return_value = replace(observed.return_value, dataset_hash="d" * 64)
+    elif fault == "changed-metadata":
+        case.header_by_field["publication_metadata_sha256"] = "d" * 64
+
+    if fault is None:
+        finalization = await cms._validate_candidate(directory, candidate, {}, {})
+        descriptor = await cms._registry_source_admission(directory, candidate, finalization)
+        assert descriptor["dataset_sha256"] == finalization["dataset_hash"]
+        assert descriptor["network_bindings"]["dataset_id"] == candidate.dataset_id
+        assert descriptor["release_id"] == candidate.source_release["vector_sha256"]
+        assert descriptor["expected_admission_sha256"] == case.header_by_field["content_proof_admission_sha256"]
+        assert descriptor["expected_metadata_sha256"] == case.header_by_field["publication_metadata_sha256"]
+    else:
+        with pytest.raises(RuntimeError, match="provider_directory_admission_replay_changed"):
+            await cms._validate_candidate(directory, candidate, {}, {})
+    directory._finalize_endpoint_dataset_candidate.assert_not_awaited()
+    case.connection.status.assert_awaited_once_with("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
+    if fault == "wrong-root":
+        case.read_seal.assert_not_awaited()
+        directory._endpoint_dataset_content_proof.assert_not_awaited()
+    else:
+        directory._endpoint_dataset_content_proof.assert_awaited_once_with(
+            case.connection,
+            candidate.dataset_id,
+            candidate.selected_resources,
+            verify_payload_hashes=True,
+            resource_hash_contract=candidate.resource_hash_contract,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["network_bindings", "semantic_projection_as_of"])
+async def test_cms_registry_handoff_rejects_rebound_scope(cms_registry_replay, field):
+    case = cms_registry_replay
+    finalization = await cms._validate_candidate(case.directory, case.candidate, {}, {})
+    receipt = finalization["admission_receipt"]
+    receipt[field] = {**receipt[field], "dataset_id": "other-dataset"} if field == "network_bindings" else "2026-09-25"
+    with pytest.raises(RuntimeError, match="cms_npd_registry_admission_changed"):
+        await cms._registry_source_admission(case.directory, case.candidate, finalization)
+    case.directory.db.scalar.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("validated", "published"), [(True, False), (False, True)])
+async def test_named_cms_completed_candidate_recovers_handoff_without_restaging(monkeypatch, validated, published):
+    from process import provider_directory_generic_source_completion as completion
+    from process import provider_directory_generic_source_policy as policy
+    from tests.test_provider_directory_generic_source_policy import _named_factory
+
+    candidate = SimpleNamespace(
+        dataset_id="synthetic-dataset", already_validated=validated, already_published=published
+    )
+    handoff_by_field = {"document": {"dataset_id": candidate.dataset_id}, "sha256": "a" * 64}
+
+    async def recover(_directory, expected_candidate, handoffs):
+        assert expected_candidate is candidate
+        handoffs[candidate.dataset_id] = handoff_by_field
+
+    recorder = AsyncMock(side_effect=recover)
+    source_reader = AsyncMock()
+    monkeypatch.setattr(completion, "record_candidate_handoff", recorder)
+    monkeypatch.setattr(cms, "_stream_file", source_reader)
+    async with policy.bind_generic_source_transaction_factory(_named_factory()):
+        result = await cms._stage_and_validate_candidate(object(), None, candidate, {}, {}, {}, {})
+    assert result == {"validated": True, "source_candidate_handoff": handoff_by_field}
+    recorder.assert_awaited_once()
+    source_reader.assert_not_awaited()

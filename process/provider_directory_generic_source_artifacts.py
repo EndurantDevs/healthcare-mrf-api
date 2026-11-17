@@ -593,7 +593,7 @@ async def _copy(
     kind=None,
 ):
     """Bound both read transport and native COPY on the ordinary stage owner."""
-    from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
+    from process.native_copy_cleanup import cleanup_interrupted_copy
 
     driver = await _copy_driver(session)
     columns = tuple(str(column.name) for column in model.__table__.columns)
@@ -620,9 +620,8 @@ async def _copy(
                 )
                 require_output(copy_status == f"COPY {len(batch)}", "rest_artifact_copy_incomplete")
                 total += len(batch)
-    except asyncio.CancelledError, TimeoutError:
-        await close_interrupted_copy(driver)
-        await invalidate_copy_owner(session, driver)
+    except (asyncio.CancelledError, TimeoutError) as interruption:
+        await cleanup_interrupted_copy(session, driver, interruption)
         raise
     return total
 

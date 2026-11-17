@@ -19,7 +19,6 @@ from process import network_approved_membership_source as approved_source
 from process import network_custom_address_source as custom_addresses
 from process import network_em_provider_inputs as provider_inputs
 from process import network_fhir_membership_source as fhir_sources
-from process import network_fhir_source_custody as fhir_custody
 from process import network_fhir_source_epoch as fhir_epochs
 from process import network_membership_candidate_lifecycle as lifecycle
 from process import network_serving_read as serving_read
@@ -785,7 +784,7 @@ def _cms_storage_failure_pin(*, is_epoch):
 
 
 @pytest.mark.parametrize("is_database_failure", [True, False])
-@pytest.mark.parametrize("stage", ["address", "custody", "epoch", "recipe_flat", "recipe_epoch", "fhir_epoch"])
+@pytest.mark.parametrize("stage", ["address", "epoch", "recipe_flat", "recipe_epoch", "fhir_epoch"])
 async def test_reachable_preparation_storage_cause_remains_distinct(stage, is_database_failure):
     failure = (
         asyncpg.CannotConnectNowError("temporary database outage")
@@ -802,10 +801,6 @@ async def test_reachable_preparation_storage_cause_remains_distinct(stage, is_da
             approved_revision=1,
             owner_role="protected_owner",
             runtime_roles=("runtime_reader",),
-        )
-    elif stage == "custody":
-        operation = fhir_custody.capture_retained_cms_fhir_source_custody(
-            connection, membership_pin, owner_role="protected_owner", runtime_roles=("runtime_reader",)
         )
     elif stage == "epoch":
         operation = fhir_epochs.require_retained_cms_fhir_source_epoch(
@@ -1419,7 +1414,7 @@ async def test_retained_recipe_database_failure_resumes_exact_request(retained_r
         await _resume_source_failure(fixture, arguments, queued, head, revision_query, committed_revision)
 
 
-@pytest.mark.parametrize("stage", ["custody", "epoch", "recipe_flat", "recipe_epoch", "fhir_epoch"])
+@pytest.mark.parametrize("stage", ["epoch", "recipe_flat", "recipe_epoch", "fhir_epoch"])
 @pytest.mark.parametrize(
     "failure",
     [
@@ -1431,11 +1426,7 @@ async def test_retained_recipe_database_failure_resumes_exact_request(retained_r
 async def test_closed_storage_cause_remains_retryable(stage, failure):
     connection = _StorageFailureConnection(failure)
     pin = _cms_storage_failure_pin(is_epoch=stage in {"epoch", "recipe_epoch", "fhir_epoch"})
-    if stage == "custody":
-        operation = fhir_custody.capture_retained_cms_fhir_source_custody(
-            connection, pin, owner_role="protected_owner", runtime_roles=("runtime_reader",)
-        )
-    elif stage == "epoch":
+    if stage == "epoch":
         operation = fhir_epochs.require_retained_cms_fhir_source_epoch(connection, pin, pin.retained_epoch)
     elif stage.startswith("recipe_"):
         operation = source_recipes._require_recipe_custody(connection, SimpleNamespace(source_pin=pin))

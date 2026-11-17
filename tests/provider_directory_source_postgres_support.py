@@ -424,47 +424,6 @@ class NativeSourceFactory:
                 setattr(self, attribute, None)
         self._publication_sessions = None
 
-    async def source_callable_capability(self, connection, policy):
-        from process.provider_directory_source_callable_custody import attest_source_callable_capability
-
-        self._require_current_policy()
-        assert policy is self.policy
-        return await attest_source_callable_capability(
-            connection, policy, migration_role=self.migration_role, namespace_owner_role=self.namespace_owner_role
-        )
-
-    async def cohort_snapshot_custody(self, connection, policy, *, cohort_id=None):
-        from process.provider_directory_source_cohort_custody import capture_cohort_snapshot_custody
-
-        self._require_current_policy()
-        publisher = source.bound_publisher()
-        assert publisher.connection is connection and publisher.policy is policy is self.policy
-        receipt = await capture_cohort_snapshot_custody(
-            connection,
-            policy,
-            migration_role=self.migration_role,
-            namespace_owner_role=self.namespace_owner_role,
-            cohort_id=cohort_id,
-        )
-        self._require_current_policy()
-        assert source.bound_publisher() is publisher
-        return receipt
-
-    async def observe_source_callable_capability(self, connection, policy):
-        from process import provider_directory_source_observation as observation
-        from process.provider_directory_source_callable_custody import attest_source_callable_capability
-
-        self._require_current_policy()
-        issued = observation.current_observation(importlib.import_module("process.provider_directory_fhir"))
-        assert issued is not None and issued.factory is self and issued.policy is policy is self.policy
-        assert issued.connection is connection
-        capability = await attest_source_callable_capability(
-            connection, policy, migration_role=self.migration_role, namespace_owner_role=self.namespace_owner_role
-        )
-        self._require_current_policy()
-        assert observation.current_observation(issued.directory) is issued
-        return capability
-
     @asynccontextmanager
     async def transaction(self, database, *, isolation):
         assert database is self.database and isolation in {"read committed", "repeatable read", "serializable"}

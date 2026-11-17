@@ -194,7 +194,7 @@ def _case(monkeypatch, *, postgis=False):
     monkeypatch.setattr(archive, "verify_npi_stage_ownership", AsyncMock(return_value=ownership))
     monkeypatch.setattr(archive, "_source_family_sequences", AsyncMock(return_value=ownership.sequence_oids))
     monkeypatch.setattr(archive, "_verify_stage_sequence_owners", AsyncMock())
-    monkeypatch.setattr(archive, "_advance_and_verify_stage_sequences", AsyncMock())
+    monkeypatch.setattr(archive, "_verify_stage_sequences", AsyncMock())
     monkeypatch.setattr(archive, "_has_postgis", AsyncMock(return_value=postgis))
     monkeypatch.setattr(archive, "_require_source_column_shape", AsyncMock())
     monkeypatch.setattr(archive, "canonical_schema_identity", AsyncMock(return_value="a" * 64))
@@ -280,7 +280,7 @@ async def test_all_heaps_are_sealed_before_copy_then_indexes_and_sets(monkeypatc
     )
     assert not any("INSERT INTO" in event or "INCLUDING ALL" in event or "FOREIGN KEY" in event for event in events)
     assert any("ST_MakePoint" in event for event in events) is postgis
-    archive._advance_and_verify_stage_sequences.assert_awaited_once_with(session, ownership)
+    archive._verify_stage_sequences.assert_awaited_once_with(session, ownership, align=True)
     assert archive.native_archive._is_model_table_equal.await_count == 7
     assert archive._require_source_column_shape.await_count == 6
     assert (
@@ -308,7 +308,7 @@ async def test_invalid_copy_accounting_never_builds_indexes(monkeypatch, copied)
             deadline=asyncio.get_running_loop().time() + 30,
         )
     assert not any(event.startswith(("CREATE INDEX", "CREATE UNIQUE INDEX")) or " ADD " in event for event in events)
-    archive._advance_and_verify_stage_sequences.assert_not_awaited()
+    archive._verify_stage_sequences.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -362,7 +362,7 @@ async def test_failed_clone_never_mints_prepared_authority(monkeypatch, failure)
     if failure == "index":
         monkeypatch.setattr(archive, "complete_npi_restore", AsyncMock(side_effect=RuntimeError("rejected")))
     if failure == "sequence":
-        archive._advance_and_verify_stage_sequences.side_effect = RuntimeError("rejected")
+        archive._verify_stage_sequences.side_effect = RuntimeError("rejected")
     if failure == "equality":
         archive.native_archive._is_model_table_equal.return_value = False
     if failure == "columns":

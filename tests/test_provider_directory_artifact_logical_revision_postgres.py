@@ -148,6 +148,46 @@ async def test_same_name_same_alias_republication_rejects_stale_fence(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["alias", "published_overlay", "scratch_overlay"])
+async def test_corroboration_refuses_changed_overlay_inputs_and_keeps_serving(monkeypatch, change):
+    async with _artifact_case(monkeypatch) as case:
+        database, schema = case.database, case.schema
+        target_relation = fhir.PROVIDER_DIRECTORY_ADDRESS_CORROBORATION_VIEW
+        stage = await _create_target(case, target_relation, 0)
+        overlay = fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE
+        dependency = "prepared_overlay" if change == "scratch_overlay" else overlay
+        await database.status(f'CREATE TABLE "{schema}"."{dependency}" (marker text)')
+        if change != "scratch_overlay":
+            async with database.transaction():
+                await fhir._record_address_alias_artifact_generation(await _stage(case, overlay, 0))
+        token = fhir._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set({overlay: dependency})
+        try:
+            build_fence = await artifacts.capture_address_corroboration_fence(
+                fhir, schema, target_relation, ["source_example"], stage.build_fence
+            )
+        finally:
+            fhir._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(token)
+        stage = replace(stage, build_fence=build_fence)
+        async with database.transaction():
+            await artifacts.assert_artifact_build_fence(fhir, stage)
+        if change == "alias":
+            await database.status(f'UPDATE "{schema}".address_alias_state_v1 SET generation=1')
+            expected = "address_alias_generation"
+        elif change == "published_overlay":
+            async with database.transaction():
+                await fhir._record_address_alias_artifact_generation(await _stage(case, overlay, 0))
+            expected = "dependency_relation"
+        else:
+            await database.status(f'DROP TABLE "{schema}"."{dependency}" RESTRICT')
+            expected = "dependency_relation"
+        with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match=expected):
+            async with database.transaction():
+                await artifacts.assert_artifact_build_fence(fhir, stage)
+        assert await database.scalar(f'SELECT marker FROM "{schema}"."{target_relation}"') == "original"
+        assert await database.scalar(f'SELECT marker FROM "{schema}".candidate') == "replacement"
+
+
+@pytest.mark.asyncio
 async def test_rollback_restores_publication_revision_and_prior_fence(monkeypatch):
     async with _artifact_case(monkeypatch) as case:
         stage = await _create_target(case, fhir.PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE, 0)

@@ -10,6 +10,16 @@ def current_rooted_graph_runtime(database=None):
     return getattr(source._FACTORY.get(), "rooted_graph_runtime", None)
 
 
+def require_rooted_graph_runtime(database):
+    """Require isolated storage before a rooted operation can use its database."""
+    runtime = current_rooted_graph_runtime(database)
+    if runtime is None:
+        raise RuntimeError(
+            "Rooted writes require a configured isolated generation prepared through the Source operator"
+        )
+    return runtime
+
+
 def rooted_graph_relation_coordinates(schema, root, scoped_name):
     """Use canonical inputs and only the adapter's private candidate overrides."""
     runtime = current_rooted_graph_runtime()

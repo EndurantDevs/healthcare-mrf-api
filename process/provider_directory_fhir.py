@@ -12657,25 +12657,6 @@ def provider_directory_location_address_key_sql(
     )
 
 
-def _location_worker_clauses(source_alias: str) -> tuple[str, str]:
-    """Return inclusive-start and exclusive-end worker bounds."""
-
-    return (
-        f"""(
-            CAST(:worker_start_source_id AS varchar) IS NULL
-            OR ({source_alias}.source_id, {source_alias}.resource_id) >=
-               (CAST(:worker_start_source_id AS varchar),
-                CAST(:worker_start_resource_id AS varchar))
-        )""",
-        f"""(
-            CAST(:worker_end_source_id AS varchar) IS NULL
-            OR ({source_alias}.source_id, {source_alias}.resource_id) <
-               (CAST(:worker_end_source_id AS varchar),
-                CAST(:worker_end_resource_id AS varchar))
-        )""",
-    )
-
-
 def _location_seen_clause(
     schema: str,
     seen_table: str,
@@ -12701,9 +12682,8 @@ def _location_scope_clauses(
     run_id: str | None,
     source_ids: list[str] | tuple[str, ...] | None,
     seen_table: str | None,
-    worker_range: bool,
 ) -> list[str]:
-    """Return run, source, worker, and keyset predicates."""
+    """Return run, source, and keyset predicates."""
 
     clauses: list[str] = []
     if run_id is not None and not seen_table:
@@ -12712,8 +12692,6 @@ def _location_scope_clauses(
         clauses.append(f"{source_alias}.source_id = ANY(CAST(:source_ids AS varchar[]))")
     if seen_table:
         clauses.append(_location_seen_clause(schema, seen_table, run_id, source_alias))
-    if worker_range:
-        clauses.extend(_location_worker_clauses(source_alias))
     clauses.append(
         f"""(
             CAST(:after_source_id AS varchar) IS NULL
@@ -12785,7 +12763,6 @@ def _location_key_batch_ctes(
     run_id: str | None,
     source_ids: list[str] | tuple[str, ...] | None,
     seen_table: str | None,
-    worker_range: bool = False,
 ) -> str:
     """Build the shared resolved keyset CTEs for SQL and native stamping."""
 
@@ -12802,7 +12779,7 @@ def _location_key_batch_ctes(
             f"loc_src.country_code IS DISTINCT FROM {normalized_country_sql})",
         )
     )
-    scope = _location_scope_clauses(schema, "loc_src", run_id, source_ids, seen_table, worker_range)
+    scope = _location_scope_clauses(schema, "loc_src", run_id, source_ids, seen_table)
     where_sql = " AND ".join([f"({' OR '.join(needs_work_clauses)})", *scope])
     return _location_candidates_cte(
         schema,
@@ -12918,57 +12895,6 @@ def provider_directory_address_key_batch_sql(
 
 
 provider_directory_location_address_key_batch_sql = provider_directory_address_key_batch_sql
-
-
-def _location_fast_fields_sql() -> str:
-    """Return SQL-resolved fields consumed by native Location canon."""
-
-    return r"""
-        source_id, resource_id, first_line, second_line,
-        resolved_city, resolved_state, postal_code,
-        COALESCE(NULLIF(normalized_country, ''), 'US')::varchar AS effective_country,
-        source_zip5 AS computed_zip5,
-        CASE
-            WHEN NULLIF(BTRIM(COALESCE(city_name::varchar, '')), '') IS NULL
-             AND zip_restored_city IS NOT NULL
-                THEN zip_restored_city::varchar
-            ELSE NULL::varchar
-        END AS restored_city_name,
-        (
-            raw_state ~ '^[0-9]{1,2}$'
-            OR (
-                NULLIF(BTRIM(COALESCE(raw_state::varchar, '')), '') IS NULL
-                AND zip_restored_state IS NOT NULL
-            )
-        ) AS restore_state_name,
-        normalized_country,
-        address_key AS old_address_key, zip5 AS old_zip5,
-        city_name AS old_city_name, state_name AS old_state_name,
-        state_code AS old_state_code, city_norm AS old_city_norm,
-        country_code AS old_country_code
-    """
-
-
-def _location_key_fast_batch_sql(
-    db_schema: str | None = None,
-    *,
-    restore_state_from_zip: bool = True,
-    run_id: str | None = None,
-    source_ids: list[str] | tuple[str, ...] | None = None,
-    seen_table: str | None = None,
-) -> str:
-    """Select one resolved Location batch for native address canonicalization."""
-
-    schema = db_schema or _schema()
-    resolved_ctes = _location_key_batch_ctes(
-        schema,
-        restore_state_from_zip=restore_state_from_zip,
-        run_id=run_id,
-        source_ids=source_ids,
-        seen_table=seen_table,
-        worker_range=True,
-    )
-    return resolved_ctes + "\nSELECT " + _location_fast_fields_sql() + " FROM resolved ORDER BY source_id, resource_id;"
 
 
 async def _has_address_canon_functions(db_schema: str) -> bool:
@@ -21631,24 +21557,6 @@ async def _artifact_scope_relation_identities(
     }
 
 
-async def _owned_unlogged_location_artifact_scope(
-    schema: str,
-) -> str | None:
-    """Return the exact current-run private Location scope, if any."""
-    from process.provider_directory_cms_preparation import _ACTIVE as nonprofile_admission
-
-    if nonprofile_admission.get() is not None:
-        return None
-
-    relation_name = _PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get().get(ProviderDirectoryLocation.__tablename__)
-    if not relation_name or _provider_directory_profile_capacity_admission() is not None:
-        return None
-    identity = (await _artifact_scope_relation_identities(schema, [relation_name])).get(relation_name)
-    if identity != (relation_name, "r", "u"):
-        raise ProviderDirectoryArtifactBuildStale("provider_directory_location_address_scope_invalid")
-    return relation_name
-
-
 async def _assert_artifact_scope_recovery_unreferenced(
     schema: str,
     relation_names: list[str],
@@ -21966,59 +21874,6 @@ async def _drop_artifact_scope_tables(
                 raise
 
 
-_LOCATION_ADDRESS_KEY_FAST_STAGE_COLUMNS = (
-    "source_id",
-    "resource_id",
-    "computed_address_key",
-    "computed_zip5",
-    "computed_state_code",
-    "computed_city_norm",
-    "restored_city_name",
-    "restored_state_name",
-    "normalized_country",
-    "eligible_change",
-)
-
-
-async def _location_key_worker_ranges(
-    schema: str,
-    table_name: str,
-    worker_count: int,
-) -> list[
-    tuple[
-        tuple[str, str] | None,
-        tuple[str, str] | None,
-    ]
-]:
-    """Split the private Location PK into contiguous worker ranges."""
-
-    table_ref = _unscoped_qt(schema, table_name)
-    row_count = int(await db.scalar(f"SELECT count(*) FROM {table_ref};") or 0)
-    bounded_workers = min(max(worker_count, 1), max(row_count, 1))
-    boundaries: list[tuple[str, str]] = []
-    for worker_index in range(1, bounded_workers):
-        boundary_row = await db.first(
-            f"""
-            SELECT source_id::varchar AS source_id,
-                   resource_id::varchar AS resource_id
-              FROM {table_ref}
-             ORDER BY source_id, resource_id
-             OFFSET CAST(:row_offset AS bigint)
-             LIMIT 1;
-            """,
-            row_offset=row_count * worker_index // bounded_workers,
-        )
-        boundary = _pagination_checkpoint_row_mapping(boundary_row)
-        source_id = _clean_text(boundary.get("source_id"))
-        resource_id = _clean_text(boundary.get("resource_id"))
-        if source_id is None or resource_id is None:
-            raise ProviderDirectoryArtifactBuildStale("provider_directory_location_address_worker_boundary_missing")
-        boundaries.append((source_id, resource_id))
-    starts = [None, *boundaries]
-    ends = [*boundaries, None]
-    return list(zip(starts, ends, strict=True))
-
-
 def _sql_coalesce(new_value: Any, old_value: Any) -> Any:
     """Return the Python equivalent of SQL COALESCE for one value."""
 
@@ -22105,97 +21960,6 @@ def _build_location_key_record(
     ), has_change
 
 
-def _location_key_copy_records(
-    location_rows: list[Any],
-    canonical_rows: list[Any],
-) -> tuple[list[tuple[Any, ...]], int]:
-    """Build one stable native COPY batch and count exact changed rows."""
-
-    if len(canonical_rows) != len(location_rows):
-        raise RuntimeError("provider_directory_location_address_native_count_mismatch")
-    record_pairs = [
-        _build_location_key_record(location_row, canonical_values)
-        for location_row, canonical_values in zip(location_rows, canonical_rows, strict=True)
-    ]
-    return (
-        [record for record, _has_change in record_pairs],
-        sum(has_change for _record, has_change in record_pairs),
-    )
-
-
-@dataclass(frozen=True)
-class _LocationKeyBuild:
-    """Bound one native Location scratch replacement."""
-
-    schema: str
-    native_module: Any
-    old_table: str
-    stage_table: str
-    replacement_table: str
-    select_sql: str
-    params_by_name: Mapping[str, Any]
-    batch_size: int
-
-
-def _new_location_key_build(
-    schema: str,
-    native_module: Any,
-    owned_scope: str,
-    *,
-    restore_state_from_zip: bool,
-    run_id: str | None,
-    source_ids: list[str] | tuple[str, ...] | None,
-    seen_table: str | None,
-    batch_size: int,
-) -> _LocationKeyBuild:
-    """Create one immutable native Location build context."""
-
-    params_by_name: dict[str, Any] = {}
-    if run_id is not None:
-        params_by_name["run_id"] = run_id
-    if source_ids:
-        params_by_name["source_ids"] = list(source_ids)
-    old_table = owned_scope
-    auxiliary_token = _stage_table_name()
-    return _LocationKeyBuild(
-        schema,
-        native_module,
-        old_table,
-        _bounded_identifier(auxiliary_token + "_location_address"),
-        _bounded_identifier(auxiliary_token + "_location_replacement"),
-        _location_key_fast_batch_sql(
-            schema,
-            restore_state_from_zip=restore_state_from_zip,
-            run_id=run_id,
-            source_ids=source_ids,
-            seen_table=seen_table,
-        ),
-        params_by_name,
-        batch_size,
-    )
-
-
-async def _create_location_key_stage(build: _LocationKeyBuild) -> None:
-    """Create the compact unlogged Location sidecar."""
-
-    await db.status(
-        f"""
-        CREATE UNLOGGED TABLE {_unscoped_qt(build.schema, build.stage_table)} (
-            source_id varchar(64) NOT NULL,
-            resource_id varchar(256) NOT NULL,
-            computed_address_key text,
-            computed_zip5 varchar(5),
-            computed_state_code varchar(2),
-            computed_city_norm text,
-            restored_city_name text,
-            restored_state_name text,
-            normalized_country text,
-            eligible_change boolean NOT NULL
-        );
-        """
-    )
-
-
 def _location_key_inputs(location_rows: list[Any]) -> list[tuple[Any, ...]]:
     """Project SQL-resolved rows into the compact native input."""
 
@@ -22214,300 +21978,6 @@ def _location_key_inputs(location_rows: list[Any]) -> list[tuple[Any, ...]]:
         for location_row in location_rows
         for row_by_field in [location_row._mapping if hasattr(location_row, "_mapping") else dict(location_row)]
     ]
-
-
-def _location_key_query_params(
-    build: _LocationKeyBuild,
-    worker_range: tuple[tuple[str, str] | None, tuple[str, str] | None],
-    cursor: tuple[str | None, str | None],
-) -> dict[str, Any]:
-    """Return one worker's range and keyset parameters."""
-
-    worker_start, worker_end = worker_range
-    return {
-        **build.params_by_name,
-        "worker_start_source_id": worker_start[0] if worker_start else None,
-        "worker_start_resource_id": worker_start[1] if worker_start else None,
-        "worker_end_source_id": worker_end[0] if worker_end else None,
-        "worker_end_resource_id": worker_end[1] if worker_end else None,
-        "after_source_id": cursor[0],
-        "after_resource_id": cursor[1],
-        "batch_size": build.batch_size,
-    }
-
-
-async def _copy_location_key_batch(
-    build: _LocationKeyBuild,
-    copy_method: Any,
-    location_rows: list[Any],
-) -> tuple[int, int]:
-    """Canonicalize and COPY one resolved Location batch."""
-
-    canonical_rows = await asyncio.to_thread(
-        build.native_module.canonicalize_location_batch,
-        _location_key_inputs(location_rows),
-    )
-    copy_records, changed_count = _location_key_copy_records(location_rows, list(canonical_rows))
-    copy_status = await copy_method(
-        build.stage_table,
-        schema_name=build.schema,
-        columns=_LOCATION_ADDRESS_KEY_FAST_STAGE_COLUMNS,
-        records=copy_records,
-    )
-    if copy_status != f"COPY {len(copy_records)}":
-        raise RuntimeError("provider_directory_location_address_copy_count_mismatch")
-    return len(copy_records), changed_count
-
-
-def _next_location_key_cursor(
-    location_rows: list[Any],
-    cursor: tuple[str | None, str | None],
-) -> tuple[str, str]:
-    """Advance one Location worker's strict keyset cursor."""
-
-    last_location = location_rows[-1]
-    last_by_field = last_location._mapping if hasattr(last_location, "_mapping") else dict(last_location)
-    next_cursor = (
-        _clean_text(last_by_field.get("source_id")),
-        _clean_text(last_by_field.get("resource_id")),
-    )
-    if None in next_cursor or next_cursor == cursor:
-        raise RuntimeError("provider_directory_location_address_native_cursor_invalid")
-    return cast(tuple[str, str], next_cursor)
-
-
-async def _stage_location_key_range(
-    build: _LocationKeyBuild,
-    worker_range: tuple[tuple[str, str] | None, tuple[str, str] | None],
-) -> tuple[int, int]:
-    """Stage one contiguous Location key range."""
-
-    cursor: tuple[str | None, str | None] = (None, None)
-    candidate_count = 0
-    changed_count = 0
-    async with db.acquire() as connection:
-        driver = getattr(
-            connection.raw_connection,
-            "driver_connection",
-            connection.raw_connection,
-        )
-        copy_method = getattr(driver, "copy_records_to_table", None)
-        if copy_method is None:
-            raise RuntimeError("provider_directory_location_address_copy_unavailable")
-        while True:
-            location_rows = list(
-                await connection.all(
-                    build.select_sql,
-                    **_location_key_query_params(build, worker_range, cursor),
-                )
-            )
-            if not location_rows:
-                return candidate_count, changed_count
-            batch_candidates, batch_changes = await _copy_location_key_batch(build, copy_method, location_rows)
-            candidate_count += batch_candidates
-            changed_count += batch_changes
-            cursor = _next_location_key_cursor(location_rows, cursor)
-
-
-def _location_replacement_column_sql(column_name: str) -> str:
-    """Return one replacement projection with exact SQL update semantics."""
-
-    keyed_by_column = {
-        "address_key": "keyed.computed_address_key",
-        "zip5": "COALESCE(keyed.computed_zip5, loc.zip5)",
-        "city_name": "COALESCE(keyed.restored_city_name, loc.city_name)",
-        "state_name": "COALESCE(keyed.restored_state_name, loc.state_name)",
-        "state_code": "COALESCE(keyed.computed_state_code, loc.state_code)",
-        "city_norm": "COALESCE(keyed.computed_city_norm, loc.city_norm)",
-        "country_code": "COALESCE(keyed.normalized_country, loc.country_code)",
-        "updated_at": "now()",
-    }
-    if column_name not in keyed_by_column:
-        return f"loc.{_q(column_name)}"
-    return f"CASE WHEN keyed.eligible_change IS TRUE THEN {keyed_by_column[column_name]} ELSE loc.{_q(column_name)} END"
-
-
-async def _populate_location_replacement(build: _LocationKeyBuild) -> None:
-    """Populate and index the full private Location replacement."""
-
-    await db.status(
-        f"CREATE UNIQUE INDEX {_q(_bounded_identifier(build.stage_table + '_pk'))} "
-        f"ON {_unscoped_qt(build.schema, build.stage_table)} (source_id, resource_id);"
-    )
-    await db.status(
-        _provider_directory_artifact_scope_table_sql(ProviderDirectoryLocation, build.schema, build.replacement_table)
-    )
-    column_names = [column.name for column in ProviderDirectoryLocation.__table__.columns]
-    await db.status(
-        f"INSERT INTO {_unscoped_qt(build.schema, build.replacement_table)} "
-        f"({', '.join(_q(name) for name in column_names)}) SELECT "
-        f"{', '.join(_location_replacement_column_sql(name) for name in column_names)} "
-        f"FROM {_unscoped_qt(build.schema, build.old_table)} AS loc "
-        f"LEFT JOIN {_unscoped_qt(build.schema, build.stage_table)} AS keyed "
-        "USING (source_id, resource_id);"
-    )
-    await _build_artifact_scope_pk(ProviderDirectoryLocation, build.schema, build.replacement_table)
-    await db.status(f"ANALYZE {_unscoped_qt(build.schema, build.replacement_table)};")
-
-
-async def _assert_location_scope(build: _LocationKeyBuild) -> None:
-    """Require the declared private Location unlogged heap."""
-
-    identity = (await _artifact_scope_relation_identities(build.schema, [build.old_table])).get(build.old_table)
-    if identity != (build.old_table, "r", "u"):
-        raise ProviderDirectoryArtifactBuildStale("provider_directory_location_address_scope_changed")
-
-
-async def _cutover_location_replacement(
-    build: _LocationKeyBuild,
-    original_count: int,
-) -> None:
-    """Validate and atomically install the private replacement."""
-
-    replacement_count = int(
-        await db.scalar(f"SELECT count(*) FROM {_unscoped_qt(build.schema, build.replacement_table)};") or 0
-    )
-    if replacement_count != original_count:
-        raise RuntimeError("provider_directory_location_address_replacement_count_mismatch")
-    await db.status(f"LOCK TABLE {_unscoped_qt(build.schema, build.old_table)} IN ACCESS EXCLUSIVE MODE;")
-    await _assert_location_scope(build)
-    await db.status(f"DROP TABLE {_unscoped_qt(build.schema, build.old_table)};")
-    await db.status(
-        f"ALTER TABLE {_unscoped_qt(build.schema, build.replacement_table)} RENAME TO {_q(build.old_table)};"
-    )
-
-
-async def _replace_location_scope(
-    build: _LocationKeyBuild,
-    candidate_count: int,
-) -> None:
-    """Replace the exact private Location scope in one transaction."""
-
-    async with _provider_directory_profile_capacity_transaction():
-        await _assert_location_scope(build)
-        original_count = int(
-            await db.scalar(f"SELECT count(*) FROM {_unscoped_qt(build.schema, build.old_table)};") or 0
-        )
-        staged_count = int(
-            await db.scalar(f"SELECT count(*) FROM {_unscoped_qt(build.schema, build.stage_table)};") or 0
-        )
-        if staged_count != candidate_count:
-            raise RuntimeError("provider_directory_location_address_sidecar_count_mismatch")
-        await _populate_location_replacement(build)
-        await _cutover_location_replacement(build, original_count)
-
-
-async def _publish_location_keys_fast(
-    schema: str,
-    native_module: Any,
-    owned_scope: str,
-    *,
-    restore_state_from_zip: bool,
-    run_id: str | None,
-    source_ids: list[str] | tuple[str, ...] | None,
-    seen_table: str | None,
-    batch_size: int,
-) -> int:
-    """Build one native-keyed sidecar and replace private Location scratch."""
-
-    build = _new_location_key_build(
-        schema,
-        native_module,
-        owned_scope,
-        restore_state_from_zip=restore_state_from_zip,
-        run_id=run_id,
-        source_ids=source_ids,
-        seen_table=seen_table,
-        batch_size=batch_size,
-    )
-    worker_ranges = await _location_key_worker_ranges(
-        build.schema,
-        build.old_table,
-        _provider_directory_artifact_scope_workers(),
-    )
-    try:
-        await _create_location_key_stage(build)
-        worker_counts = await _gather_provider_directory_profile_tasks(
-            [asyncio.create_task(_stage_location_key_range(build, worker_range)) for worker_range in worker_ranges]
-        )
-        candidate_count = sum(counts[0] for counts in worker_counts)
-        changed_count = sum(counts[1] for counts in worker_counts)
-        if candidate_count:
-            await _replace_location_scope(build, candidate_count)
-        return changed_count
-    finally:
-        await _drain_artifact_scope_cleanup(
-            build.schema,
-            [build.stage_table, build.replacement_table],
-        )
-
-
-async def _location_key_sql_batch(
-    sql: str,
-    params_by_name: Mapping[str, Any],
-    cursor: tuple[str | None, str | None],
-    batch_size: int,
-) -> dict[str, Any]:
-    """Execute one established SQL Location-key batch."""
-
-    from process.provider_directory_cms_preparation import active_nonprofile_sql_transaction
-
-    async with active_nonprofile_sql_transaction(sys.modules[__name__]):
-        batch_row = await db.first(
-            sql,
-            **params_by_name,
-            after_source_id=cursor[0],
-            after_resource_id=cursor[1],
-            batch_size=batch_size,
-        )
-    return dict(batch_row._mapping) if hasattr(batch_row, "_mapping") else dict(batch_row or {})
-
-
-async def _publish_location_keys_sql(
-    schema: str,
-    *,
-    restore_state_from_zip: bool,
-    run_id: str | None,
-    source_ids: list[str] | tuple[str, ...] | None,
-    seen_table: str | None,
-    batch_size: int,
-) -> int:
-    """Run the established fail-closed SQL keyset implementation."""
-
-    params_by_name: dict[str, Any] = {}
-    if run_id is not None:
-        params_by_name["run_id"] = run_id
-    if source_ids:
-        params_by_name["source_ids"] = list(source_ids)
-    total_updated = 0
-    after_source_id: str | None = None
-    after_resource_id: str | None = None
-    sql = provider_directory_location_address_key_batch_sql(
-        schema,
-        restore_state_from_zip=restore_state_from_zip,
-        run_id=run_id,
-        source_ids=source_ids,
-        seen_table=seen_table,
-    )
-    while True:
-        result_by_field = await _location_key_sql_batch(
-            sql,
-            params_by_name,
-            (after_source_id, after_resource_id),
-            batch_size,
-        )
-        candidate_rows = int(result_by_field.get("candidate_rows") or 0)
-        updated_rows = int(result_by_field.get("updated_rows") or 0)
-        total_updated += updated_rows
-        next_source_id = _clean_text(result_by_field.get("last_source_id"))
-        next_resource_id = _clean_text(result_by_field.get("last_resource_id"))
-        if candidate_rows <= 0 or not next_source_id or not next_resource_id:
-            break
-        if next_source_id == after_source_id and next_resource_id == after_resource_id:
-            break
-        after_source_id = next_source_id
-        after_resource_id = next_resource_id
-    return total_updated
 
 
 async def publish_provider_directory_location_address_keys(
@@ -37013,10 +36483,8 @@ async def _ensure_provider_directory_tables() -> None:
     if await require_generic_source_layout(sys.modules[__name__]) is not None:
         return
     schema = _schema()
-    if not await _is_table_present(schema, SOURCE_MODELS[0].__tablename__):
-        if not getattr(SOURCE_MODELS[0], "__runtime_schema_sync__", True):
-            raise RuntimeError("provider_directory_cms_control_administrator_cut_required")
-        await db.status(f"CREATE SCHEMA IF NOT EXISTS {_q(schema)};")
+    if not await _is_table_present(schema, ProviderDirectoryAPIEndpoint.__tablename__):
+        raise RuntimeError("provider_directory_cms_control_administrator_cut_required")
     for model in (*SOURCE_MODELS, *CANONICAL_RESOURCE_MODELS):
         if model.__table__.info.get("managed_immutable_storage"):
             if not await _is_table_present(schema, model.__tablename__):
@@ -37091,18 +36559,8 @@ async def _ensure_provider_directory_source_column_types(schema: str) -> None:
             schema_name=schema,
         )
     ).lower()
-    if not getattr(ProviderDirectorySource, "__runtime_schema_sync__", True):
-        if current_data_type != "text":
-            raise RuntimeError("provider_directory_cms_control_administrator_cut_required")
-        return
-    if not current_data_type or current_data_type == "text":
-        return
-    await db.status(
-        f"""
-        ALTER TABLE IF EXISTS {_qt(schema, "provider_directory_source")}
-            ALTER COLUMN data_quality_checked TYPE text;
-        """
-    )
+    if current_data_type != "text":
+        raise RuntimeError("provider_directory_cms_control_administrator_cut_required")
 
 
 async def _ensure_provider_directory_model_columns(model: Any, schema: str) -> None:
@@ -37267,19 +36725,6 @@ def _bound_upsert_session() -> Any | None:
     """Return the task-local transaction session when one is active."""
     transaction_binding = db._transaction_binding()
     return transaction_binding.session if transaction_binding is not None else None
-
-
-def _endpoint_dataset_resource_parent_ids(
-    resource_rows: Iterable[dict[str, Any]],
-) -> list[str]:
-    """Return exact sorted parents, rejecting an unscoped child mutation."""
-    dataset_ids: set[str] = set()
-    for resource_row in resource_rows:
-        dataset_id = _clean_text(resource_row.get("dataset_id"))
-        if not dataset_id:
-            raise RuntimeError("provider_directory_endpoint_dataset_resource_parent_id_missing")
-        dataset_ids.add(dataset_id)
-    return sorted(dataset_ids)
 
 
 def _normalized_endpoint_dataset_ids(
@@ -37996,125 +37441,6 @@ def _effective_update_sql(table, column: str, *, target_prefix: str, incoming_pr
     return f"{incoming_prefix}.{_q(column)}"
 
 
-def _resource_identity_pairs(
-    resource_rows: list[dict[str, Any]],
-) -> list[tuple[str, str]]:
-    seen_pairs_by_key: dict[tuple[str, str], tuple[str, str]] = {}
-    for resource_row in resource_rows:
-        source_id = _clean_text(resource_row.get("source_id"))
-        resource_id = _clean_text(resource_row.get("resource_id"))
-        if source_id and resource_id:
-            seen_pairs_by_key[(source_id, resource_id)] = (source_id, resource_id)
-    return list(seen_pairs_by_key.values())
-
-
-async def _mark_resource_rows_seen(
-    model,
-    resource_rows: list[dict[str, Any]],
-    run_id: str | None,
-    *,
-    seen_table: str | None = None,
-) -> int:
-    """Record the unique source/resource identities observed in this run."""
-    resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
-    if not run_id or not resource_type or not resource_rows:
-        return 0
-    seen_pairs = _resource_identity_pairs(resource_rows)
-    if not seen_pairs:
-        return 0
-    if _is_copy_upsert_enabled() and len(seen_pairs) >= _copy_upsert_min_rows():
-        try:
-            return await _copy_mark_resource_rows_seen(
-                resource_type,
-                seen_pairs,
-                run_id,
-                seen_table=seen_table,
-            )
-        except Exception as exc:  # pragma: no cover - exercised on driver-specific fallback paths
-            print(f"Provider Directory COPY seen fallback for {resource_type}: {_short_error(exc)}")
-    max_rows = _max_rows_per_statement(4)
-    total = 0
-    seen_ref = _qt(_schema(), seen_table or PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
-    conflict_sql = "" if seen_table else "ON CONFLICT (run_id, resource_type, source_id, resource_id) DO NOTHING"
-    for offset in range(0, len(seen_pairs), max_rows):
-        batch = seen_pairs[offset : offset + max_rows]
-        query_params_by_name: dict[str, Any] = {
-            "run_id": run_id,
-            "resource_type": resource_type,
-        }
-        value_rows_statements: list[str] = []
-        for idx, (source_id, resource_id) in enumerate(batch):
-            query_params_by_name[f"source_id_{idx}"] = source_id
-            query_params_by_name[f"resource_id_{idx}"] = resource_id
-            value_rows_statements.append(f"(:run_id, :resource_type, :source_id_{idx}, :resource_id_{idx})")
-        await db.status(
-            f"""
-            INSERT INTO {seen_ref} (run_id, resource_type, source_id, resource_id)
-            VALUES {", ".join(value_rows_statements)}
-            {conflict_sql};
-            """,
-            **query_params_by_name,
-        )
-        total += len(batch)
-    return total
-
-
-async def _copy_mark_resource_rows_seen(
-    resource_type: str,
-    source_resource_pairs: list[tuple[str, str]],
-    run_id: str,
-    *,
-    seen_table: str | None = None,
-) -> int:
-    schema = _schema()
-    if seen_table:
-        columns = ["run_id", "resource_type", "source_id", "resource_id"]
-        copy_records = [
-            (run_id, resource_type, source_id, resource_id) for source_id, resource_id in source_resource_pairs
-        ]
-        async with db.acquire() as conn:
-            raw_conn = conn.raw_connection
-            driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
-            copy_method = getattr(driver_conn, "copy_records_to_table", None)
-            if copy_method is None:
-                raise NotImplementedError("active database driver lacks copy_records_to_table")
-            await copy_method(
-                seen_table,
-                schema_name=schema,
-                columns=columns,
-                records=copy_records,
-            )
-        return len(source_resource_pairs)
-
-    seen_ref = _qt(schema, PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE)
-    stage_table = _stage_table_name()
-    columns = ["run_id", "resource_type", "source_id", "resource_id"]
-    copy_records = [(run_id, resource_type, source_id, resource_id) for source_id, resource_id in source_resource_pairs]
-    async with db.acquire() as conn:
-        await conn.status(
-            f"""
-            CREATE TEMP TABLE {_q(stage_table)}
-            (LIKE {seen_ref} INCLUDING DEFAULTS) ON COMMIT DROP;
-            """
-        )
-        raw_conn = conn.raw_connection
-        driver_conn = getattr(raw_conn, "driver_connection", raw_conn)
-        copy_method = getattr(driver_conn, "copy_records_to_table", None)
-        if copy_method is None:
-            raise NotImplementedError("active database driver lacks copy_records_to_table")
-        await copy_method(stage_table, columns=columns, records=copy_records)
-        quoted_columns = ", ".join(_q(column) for column in columns)
-        await conn.status(
-            f"""
-            INSERT INTO {seen_ref} ({quoted_columns})
-            SELECT DISTINCT {quoted_columns}
-            FROM {_q(stage_table)}
-            ON CONFLICT (run_id, resource_type, source_id, resource_id) DO NOTHING;
-            """
-        )
-    return len(source_resource_pairs)
-
-
 async def _clear_resource_rows_seen(run_id: str | None) -> int:
     """Retire legacy seen rows; detached snapshots never write that shared ledger."""
     if not run_id:
@@ -38430,37 +37756,6 @@ def materialize_provider_directory_dataset_fhir_resource(
     return retained_rows[0]
 
 
-def _source_resource_edge_rows(
-    model,
-    resource_rows: list[dict[str, Any]],
-    *,
-    canonical_api_base: str | None,
-    source_ids: list[str],
-    run_id: str | None,
-) -> list[dict[str, Any]]:
-    resource_type = RESOURCE_TYPES_BY_MODEL.get(model)
-    api_base = _canonical_base(canonical_api_base)
-    if not resource_type or not api_base or not source_ids:
-        return []
-    resource_ids = {
-        resource_id for resource_row in resource_rows if (resource_id := _clean_text(resource_row.get("resource_id")))
-    }
-    observed_at = _now()
-    return [
-        {
-            "source_id": source_id,
-            "canonical_api_base": api_base,
-            "resource_type": resource_type,
-            "resource_id": resource_id,
-            "last_seen_run_id": run_id,
-            "observed_at": observed_at,
-            "updated_at": observed_at,
-        }
-        for source_id in source_ids
-        for resource_id in sorted(resource_ids)
-    ]
-
-
 def _upsert_changed_row_predicate(table, statement, columns: list[str], primary_keys: list[str]):
     payload_columns = [
         column
@@ -38764,28 +38059,10 @@ async def _upsert_normalized_rows(
     """Apply one normalized upsert inside its already selected boundary."""
     if model.__table__.info.get("managed_immutable_storage"):
         raise RuntimeError("provider_directory_generic_source_isolated_copy_required")
-    is_dataset_resource = model is ProviderDirectoryDatasetResource
     transaction_session = _bound_upsert_session()
-    if is_dataset_resource and transaction_session is None:
-        raise RuntimeError("provider_directory_endpoint_dataset_resource_transaction_missing")
-    if is_dataset_resource:
-        await _lock_mutable_endpoint_dataset_resource_parents(
-            db,
-            _endpoint_dataset_resource_parent_ids(normalized_rows),
-        )
     transaction_options = _transaction_session_options(transaction_session)
     if _is_copy_upsert_enabled() and len(normalized_rows) >= _copy_upsert_min_rows():
         try:
-            if is_dataset_resource:
-                async with db.transaction():
-                    return await _copy_upsert_rows(
-                        model,
-                        normalized_rows,
-                        columns,
-                        primary_keys,
-                        skip_unchanged=skip_unchanged,
-                        **transaction_options,
-                    )
             return await _copy_upsert_rows(
                 model,
                 normalized_rows,
@@ -55770,47 +55047,6 @@ async def _update_source_resource_import_metadata(
         )
 
 
-async def _upsert_canonical_resource_edges(
-    model: type,
-    resource_rows: list[dict[str, Any]],
-    *,
-    canonical_api_base: str,
-    source_ids: list[str],
-    run_id: str | None,
-    track_seen: bool,
-    store_payload: bool,
-    resource_hash_contract: str = DEFAULT_RESOURCE_HASH_CONTRACT,
-) -> None:
-    """Persist canonical resources and their source edges."""
-    canonical_rows = _canonical_resource_rows(
-        model,
-        resource_rows,
-        canonical_api_base=canonical_api_base,
-        run_id=run_id,
-        store_payload=store_payload,
-        resource_hash_contract=resource_hash_contract,
-    )
-    if canonical_rows:
-        await _upsert_rows(
-            ProviderDirectoryCanonicalResource,
-            canonical_rows,
-            skip_unchanged=track_seen and bool(run_id),
-        )
-    edge_rows = _source_resource_edge_rows(
-        model,
-        resource_rows,
-        canonical_api_base=canonical_api_base,
-        source_ids=source_ids,
-        run_id=run_id,
-    )
-    if edge_rows:
-        await _upsert_rows(
-            ProviderDirectorySourceResource,
-            edge_rows,
-            skip_unchanged=track_seen and bool(run_id),
-        )
-
-
 def _resource_rows_with_location_contacts(
     model: type,
     resource_rows: list[dict[str, Any]],
@@ -55896,31 +55132,6 @@ async def _persist_endpoint_dataset_rows(
         return prepared_rows
 
 
-async def _lock_endpoint_dataset_proof_parent(
-    database_executor: Any,
-    dataset_id: str,
-) -> dict[str, Any]:
-    """Share-lock one mutable parent against validation/publication."""
-
-    parent_row = await database_executor.first(
-        f"""
-        SELECT dataset_id, status, is_current, publication_metadata_json
-          FROM {_qt(_schema(), ProviderDirectoryEndpointDataset.__tablename__)}
-         WHERE dataset_id = :dataset_id
-         FOR SHARE;
-        """,
-        dataset_id=dataset_id,
-    )
-    parent_by_field = _pagination_checkpoint_row_mapping(parent_row)
-    if (
-        _clean_text(parent_by_field.get("dataset_id")) != dataset_id
-        or _clean_text(parent_by_field.get("status")) != ENDPOINT_DATASET_ACQUIRING
-        or parent_by_field.get("is_current") is not False
-    ):
-        raise RuntimeError("provider_directory_endpoint_dataset_proof_parent_not_mutable")
-    return parent_by_field
-
-
 def _validated_endpoint_dataset_resource_scope(
     raw_scope: Any,
 ) -> tuple[str, ...]:
@@ -55996,13 +55207,6 @@ async def _lock_endpoint_dataset_resource_family(database_executor: Any, dataset
     from process.provider_directory_generic_source_adapters import require_source_transaction
 
     require_source_transaction()
-
-
-async def _existing_endpoint_dataset_resources(
-    database_executor: Any, dataset_id: str, resource_type: str, resource_ids: list[str]
-) -> dict[str, dict[str, Any]]:
-    """No resource-row authority or enrichment is permitted during COPY intake."""
-    raise RuntimeError("provider_directory_generic_source_complete_key_reduction_required")
 
 
 def _validated_semantic_dataset_payload(
@@ -56082,40 +55286,6 @@ def _endpoint_dataset_batch_identity(
     )
 
 
-async def _lock_endpoint_dataset_batch_identity(
-    database_executor: Any,
-    batch_identity: _EndpointDatasetBatchIdentity,
-    resource_hash_contract: str,
-    semantic_projection_as_of: str | None,
-) -> None:
-    """Fence a mutable batch to the parent's contract, date, and scope."""
-
-    parent_by_field = await _lock_endpoint_dataset_proof_parent(
-        database_executor,
-        batch_identity.dataset_id,
-    )
-    persisted_hash_contract = _dataset_resource_hash_contract(parent_by_field)
-    if persisted_hash_contract != resource_hash_contract:
-        raise RuntimeError("provider_directory_endpoint_dataset_hash_contract_changed")
-    proof_resource_scope = _endpoint_dataset_parent_proof_resource_scope(
-        parent_by_field,
-        persisted_hash_contract,
-    )
-    if proof_resource_scope is not None and batch_identity.resource_type not in proof_resource_scope:
-        raise RuntimeError("provider_directory_endpoint_dataset_resource_scope_changed")
-    persisted_projection_as_of = _dataset_semantic_projection_as_of(
-        parent_by_field,
-        resource_hash_contract,
-    )
-    if persisted_projection_as_of != semantic_projection_as_of:
-        raise RuntimeError("provider_directory_endpoint_dataset_projection_date_changed")
-    await _lock_endpoint_dataset_resource_family(
-        database_executor,
-        batch_identity.dataset_id,
-        batch_identity.resource_type,
-    )
-
-
 def _incoming_semantic_dataset_rows_by_id(
     incoming_dataset_rows: list[dict[str, Any]],
     resource_type: str,
@@ -56147,60 +55317,6 @@ def _incoming_semantic_dataset_rows_by_id(
     return incoming_by_id
 
 
-async def _merged_semantic_dataset_rows(
-    database_executor: Any,
-    batch_identity: _EndpointDatasetBatchIdentity,
-    incoming_by_id: dict[str, dict[str, Any]],
-    resource_hash_contract: str,
-    semantic_projection_as_of: str | None,
-) -> list[dict[str, Any]]:
-    """Merge valid v3 observations with each locked retained identity."""
-
-    existing_resource_by_id = await _existing_endpoint_dataset_resources(
-        database_executor,
-        batch_identity.dataset_id,
-        batch_identity.resource_type,
-        sorted(incoming_by_id),
-    )
-    accumulated_rows: list[dict[str, Any]] = []
-    for resource_id in sorted(incoming_by_id):
-        incoming_dataset_row = incoming_by_id[resource_id]
-        accumulated_row_by_field = dict(incoming_dataset_row)
-        existing_resource = existing_resource_by_id.get(resource_id)
-        if existing_resource is not None:
-            existing_payload = _validated_semantic_dataset_payload(
-                existing_resource,
-                batch_identity.resource_type,
-                resource_hash_contract,
-            )
-            if batch_identity.resource_type == "Practitioner":
-                _assert_practitioner_semantic_projection_as_of(
-                    ProviderDirectoryPractitioner,
-                    [existing_payload],
-                    resource_hash_contract,
-                    semantic_projection_as_of,
-                )
-            incoming_payload = _validated_semantic_dataset_payload(
-                incoming_dataset_row,
-                batch_identity.resource_type,
-                resource_hash_contract,
-            )
-            merged_payload = _merged_semantic_dataset_payload(
-                batch_identity.resource_type,
-                existing_payload,
-                incoming_payload,
-                resource_hash_contract,
-            )
-            accumulated_row_by_field["payload_json"] = merged_payload
-            accumulated_row_by_field["payload_hash"] = resource_payload_sha256_for_contract(
-                merged_payload,
-                resource_hash_contract,
-                resource_type=batch_identity.resource_type,
-            )
-        accumulated_rows.append(accumulated_row_by_field)
-    return accumulated_rows
-
-
 async def _accumulated_endpoint_dataset_rows(
     database_executor: Any,
     incoming_dataset_rows: list[dict[str, Any]],
@@ -56223,39 +55339,6 @@ async def _accumulated_endpoint_dataset_rows(
             incoming_dataset_rows, identity.resource_type, resource_hash_contract, semantic_projection_as_of
         )
     return incoming_dataset_rows
-
-
-def _materialized_resource_rows_from_dataset_rows(
-    resource_rows: list[dict[str, Any]],
-    dataset_rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Reattach run/source fields to accumulated dataset payloads."""
-
-    observation_by_resource_id = {
-        _clean_text(resource_row.get("resource_id")): resource_row
-        for resource_row in resource_rows
-        if _clean_text(resource_row.get("resource_id"))
-    }
-    materialized_rows: list[dict[str, Any]] = []
-    for dataset_row_by_field in dataset_rows:
-        resource_id = _clean_text(dataset_row_by_field.get("resource_id"))
-        observation_by_field = observation_by_resource_id.get(resource_id)
-        dataset_payload_by_field = dataset_row_by_field.get("payload_json")
-        if observation_by_field is None or not isinstance(
-            dataset_payload_by_field,
-            dict,
-        ):
-            raise RuntimeError("provider_directory_semantic_union_materialization_invalid")
-        materialized_rows.append(
-            {
-                **dataset_payload_by_field,
-                "source_id": observation_by_field.get("source_id"),
-                "last_seen_run_id": observation_by_field.get("last_seen_run_id"),
-                "observed_at": observation_by_field.get("observed_at"),
-                "updated_at": observation_by_field.get("updated_at"),
-            }
-        )
-    return materialized_rows
 
 
 async def _upsert_deferred_resource_rows(

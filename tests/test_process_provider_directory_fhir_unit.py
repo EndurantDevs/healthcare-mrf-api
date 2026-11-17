@@ -5705,39 +5705,6 @@ def test_address_key_batch_sql_scopes_to_seen_stage():
     assert "LIMIT CAST(:batch_size AS integer)" in sql
 
 
-def test_location_address_key_fast_batch_sql_resolves_before_native_canon():
-    token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
-        {"provider_directory_location": "provider_directory_location_artifact_scope_test"}
-    )
-    try:
-        sql = importer._location_key_fast_batch_sql(
-            "mrf",
-            run_id="run_1",
-            source_ids=["source_a"],
-            seen_table="provider_directory_import_seen_stage_test",
-        )
-    finally:
-        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(token)
-
-    assert 'FROM "mrf"."provider_directory_location_artifact_scope_test" AS loc_src' in sql
-    assert 'LEFT JOIN "mrf"."geo_zip_lookup" AS geo' in sql
-    assert 'FROM "mrf"."provider_directory_import_seen_stage_test" AS seen' in sql
-    assert "WHEN '42' THEN 'PA'" in sql
-    assert "'840'" in sql
-    assert '"mrf".addr_zip5_norm_v1' in sql
-    assert '"mrf".addr_state_code_v1' not in sql
-    assert '"mrf".addr_city_norm_v1' not in sql
-    assert "hashtextextended" not in sql
-    assert ":worker_start_source_id" in sql
-    assert ":worker_start_resource_id" in sql
-    assert ":worker_end_source_id" in sql
-    assert ":worker_end_resource_id" in sql
-    assert "effective_country" in sql
-    assert "resolved_state" in sql
-    assert "resolved_city" in sql
-    assert "addr_key_v1(" not in sql
-
-
 def _native_location_address_row(**overrides):
     values_by_field = {
         "source_id": "source_a",
@@ -5768,36 +5735,8 @@ def _native_location_address_row(**overrides):
 
 
 @pytest.mark.asyncio
-async def test_location_address_fast_worker_ranges_use_contiguous_pk_boundaries(monkeypatch):
-    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=9))
-    monkeypatch.setattr(
-        importer.db,
-        "first",
-        AsyncMock(
-            side_effect=[
-                SimpleNamespace(_mapping={"source_id": "source-b", "resource_id": "loc-3"}),
-                SimpleNamespace(_mapping={"source_id": "source-c", "resource_id": "loc-6"}),
-            ]
-        ),
-    )
-
-    ranges = await importer._location_key_worker_ranges(
-        "mrf",
-        "provider_directory_location_artifact_scope_test",
-        3,
-    )
-
-    assert ranges == [
-        (None, ("source-b", "loc-3")),
-        (("source-b", "loc-3"), ("source-c", "loc-6")),
-        (("source-c", "loc-6"), None),
-    ]
-    assert [call.kwargs["row_offset"] for call in importer.db.first.await_args_list] == [3, 6]
-
-
-@pytest.mark.asyncio
 async def test_location_scope_identity_guards(monkeypatch):
-    """Require complete and exact ownership before native Location work."""
+    """Clean up an incomplete scope before yielding it to native Location work."""
 
     identities = AsyncMock(return_value={})
     cleanup = AsyncMock()
@@ -5817,26 +5756,6 @@ async def test_location_scope_identity_guards(monkeypatch):
             pytest.fail("incomplete artifact scope unexpectedly yielded")
     cleanup.assert_awaited_once_with("mrf", ["location_scope"])
 
-    relation_token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
-        {"provider_directory_location": "location_scope"}
-    )
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_capacity_admission",
-        lambda: None,
-    )
-    try:
-        identities.return_value = {"location_scope": ("location_scope", "r", "u")}
-        assert await importer._owned_unlogged_location_artifact_scope("mrf") == "location_scope"
-        identities.return_value = {"location_scope": ("location_scope", "r", "p")}
-        with pytest.raises(
-            importer.ProviderDirectoryArtifactBuildStale,
-            match="location_address_scope_invalid",
-        ):
-            await importer._owned_unlogged_location_artifact_scope("mrf")
-    finally:
-        importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.reset(relation_token)
-
 
 def test_location_key_helper_guards():
     """Cover compact native result and cursor contract failures."""
@@ -5846,90 +5765,6 @@ def test_location_key_helper_guards():
         "state_code": "TX",
         "city_norm": "austin",
     }
-    with pytest.raises(RuntimeError, match="native_count_mismatch"):
-        importer._location_key_copy_records([], [("key", "TX", "austin")])
-    with pytest.raises(RuntimeError, match="native_cursor_invalid"):
-        importer._next_location_key_cursor(
-            [_native_location_address_row()],
-            ("source_a", "loc-1"),
-        )
-
-
-@pytest.mark.asyncio
-async def test_location_key_stage_guards(monkeypatch):
-    """Reject invalid range boundaries, COPY counts, and drivers."""
-
-    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=2))
-    monkeypatch.setattr(
-        importer.db,
-        "first",
-        AsyncMock(return_value=SimpleNamespace(_mapping={"source_id": None, "resource_id": "loc-1"})),
-    )
-    with pytest.raises(
-        importer.ProviderDirectoryArtifactBuildStale,
-        match="worker_boundary_missing",
-    ):
-        await importer._location_key_worker_ranges("mrf", "location_scope", 2)
-
-    build = SimpleNamespace(
-        schema="mrf",
-        stage_table="location_sidecar",
-        native_module=SimpleNamespace(canonicalize_location_batch=lambda _rows: [("key", "TX", "austin")]),
-    )
-    with pytest.raises(RuntimeError, match="copy_count_mismatch"):
-        await importer._copy_location_key_batch(
-            build,
-            AsyncMock(return_value="COPY 0"),
-            [_native_location_address_row()],
-        )
-
-    @contextlib.asynccontextmanager
-    async def acquire():
-        yield SimpleNamespace(raw_connection=SimpleNamespace(driver_connection=SimpleNamespace()))
-
-    monkeypatch.setattr(importer.db, "acquire", acquire)
-    with pytest.raises(RuntimeError, match="copy_unavailable"):
-        await importer._stage_location_key_range(build, (None, None))
-
-
-@pytest.mark.asyncio
-async def test_location_key_replacement_guards(monkeypatch):
-    """Reject stale, truncated, and incomplete Location replacements."""
-
-    build = SimpleNamespace(
-        schema="mrf",
-        old_table="location_scope",
-        stage_table="location_sidecar",
-        replacement_table="location_replacement",
-    )
-    monkeypatch.setattr(
-        importer,
-        "_artifact_scope_relation_identities",
-        AsyncMock(return_value={"location_scope": ("location_scope", "r", "p")}),
-    )
-    with pytest.raises(
-        importer.ProviderDirectoryArtifactBuildStale,
-        match="location_address_scope_changed",
-    ):
-        await importer._assert_location_scope(build)
-
-    monkeypatch.setattr(importer.db, "scalar", AsyncMock(return_value=1))
-    with pytest.raises(RuntimeError, match="replacement_count_mismatch"):
-        await importer._cutover_location_replacement(build, 2)
-
-    @contextlib.asynccontextmanager
-    async def transaction():
-        yield
-
-    monkeypatch.setattr(
-        importer,
-        "_provider_directory_profile_capacity_transaction",
-        transaction,
-    )
-    monkeypatch.setattr(importer, "_assert_location_scope", AsyncMock())
-    monkeypatch.setattr(importer.db, "scalar", AsyncMock(side_effect=[2, 1]))
-    with pytest.raises(RuntimeError, match="sidecar_count_mismatch"):
-        await importer._replace_location_scope(build, 2)
 
 
 def test_location_address_fast_change_matches_sql_null_and_empty_semantics():
@@ -5987,82 +5822,6 @@ def test_location_address_fast_change_matches_sql_null_and_empty_semantics():
     )
 
 
-def _install_native_location_test(monkeypatch, worker_connection, status, scalar, canonicalizer):
-    """Install the minimal native Location publication test boundary."""
-
-    @contextlib.asynccontextmanager
-    async def acquire():
-        yield worker_connection
-
-    @contextlib.asynccontextmanager
-    async def transaction():
-        yield
-
-    monkeypatch.setattr(importer, "_has_address_canon_functions", AsyncMock(return_value=True))
-    monkeypatch.setattr(importer, "_is_table_present", AsyncMock(return_value=True))
-    monkeypatch.setattr(
-        importer.address_fast, "_fast_module", lambda: SimpleNamespace(canonicalize_location_batch=canonicalizer)
-    )
-    monkeypatch.setattr(importer, "_provider_directory_artifact_scope_workers", lambda: 1)
-    monkeypatch.setattr(importer, "_location_key_worker_ranges", AsyncMock(return_value=[(None, None)]))
-    monkeypatch.setattr(
-        importer,
-        "_owned_unlogged_location_artifact_scope",
-        AsyncMock(return_value="provider_directory_location_artifact_scope_test"),
-    )
-    monkeypatch.setattr(importer, "_provider_directory_profile_capacity_transaction", transaction)
-    monkeypatch.setattr(
-        importer,
-        "_artifact_scope_relation_identities",
-        AsyncMock(
-            return_value={
-                "provider_directory_location_artifact_scope_test": (
-                    "provider_directory_location_artifact_scope_test",
-                    "r",
-                    "u",
-                )
-            }
-        ),
-    )
-    monkeypatch.setattr(importer.db, "acquire", acquire)
-    monkeypatch.setattr(importer.db, "status", status)
-    monkeypatch.setattr(importer.db, "scalar", scalar)
-    monkeypatch.setattr(importer.db, "first", AsyncMock())
-    monkeypatch.setattr(importer, "_stage_table_name", lambda: "pd_stage_native_test")
-
-
-def _assert_native_location_replacement(copy_records, worker_connection, status):
-    """Require exact sidecar COPY and private-scope replacement statements."""
-
-    assert worker_connection.all.await_args_list[0].kwargs["batch_size"] == 250000
-    copy_records.assert_awaited_once_with(
-        "pd_stage_native_test_location_address",
-        schema_name="mrf",
-        columns=importer._LOCATION_ADDRESS_KEY_FAST_STAGE_COLUMNS,
-        records=[
-            (
-                "source_a",
-                "loc-1",
-                "11111111-1111-1111-1111-111111111111",
-                "78701",
-                "TX",
-                "austin",
-                None,
-                None,
-                "US",
-                True,
-            )
-        ],
-    )
-    statements = [call.args[0] for call in status.await_args_list]
-    insert_sql = next(sql for sql in statements if sql.lstrip().startswith("INSERT INTO"))
-    assert 'LEFT JOIN "mrf"."pd_stage_native_test_location_address"' in insert_sql
-    assert "keyed.eligible_change IS TRUE" in insert_sql
-    assert 'ANALYZE "mrf"."pd_stage_native_test_location_replacement";' in statements
-    assert 'DROP TABLE "mrf"."provider_directory_location_artifact_scope_test";' in statements
-    assert any('RENAME TO "provider_directory_location_artifact_scope_test"' in sql for sql in statements)
-
-
 @pytest.mark.asyncio
 async def test_location_address_keys_native_sidecar_replaces_complete_private_scope(monkeypatch):
     token = importer._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.set(
@@ -6087,7 +5846,6 @@ async def test_location_address_keys_native_failure_does_not_fallback_to_sql(mon
     fallback = AsyncMock()
     monkeypatch.setattr(repair.address_fast, "_fast_module", lambda: None)
     monkeypatch.setattr(importer.db, "first", fallback)
-    monkeypatch.setattr(importer, "_publish_location_keys_sql", fallback)
     with pytest.raises(RuntimeError, match="address_native_required"):
         await importer.publish_provider_directory_location_address_keys("mrf", batch_size=1)
     fallback.assert_not_awaited()
@@ -6101,14 +5859,11 @@ def test_location_address_keys_native_accepts_spaced_foreign_country():
         )
     ]
 
-    records, changed = importer._location_key_copy_records(
-        rows,
-        [(None, None, "london")],
-    )
+    record, changed = importer._build_location_key_record(rows[0], (None, None, "london"))
 
-    assert changed == 0
-    assert records[0][2] is None
-    assert records[0][8] == "UNITED KINGDOM"
+    assert changed is False
+    assert record[2] is None
+    assert record[8] == "UNITED KINGDOM"
 
 
 @pytest.mark.asyncio
@@ -7034,9 +6789,8 @@ async def _test_transaction():
 @pytest.mark.asyncio
 async def test_upsert_resource_rows_tracks_seen_and_skips_unchanged(monkeypatch, unit_source_factory):
     captured = _capture_unit_source_rows(monkeypatch)
-    seen, live = AsyncMock(), AsyncMock()
+    live = AsyncMock()
     proof = AsyncMock()
-    monkeypatch.setattr(importer, "_mark_resource_rows_seen", seen)
     monkeypatch.setattr(importer, "_upsert_rows", live)
     monkeypatch.setattr(importer, "persist_dataset_proof_shard", proof)
     incoming_rows = [{"source_id": "source_a", "resource_id": "loc-1"}]
@@ -7065,7 +6819,6 @@ async def test_upsert_resource_rows_tracks_seen_and_skips_unchanged(monkeypatch,
         dataset_id="dataset_1",
         expected_resource_hash_contract=importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
     )
-    seen.assert_not_awaited()
     live.assert_not_awaited()
 
 
@@ -7163,10 +6916,8 @@ def _canonical_edge_resource_rows():
 @pytest.mark.asyncio
 async def test_upsert_resource_rows_writes_canonical_resource_and_source_edges(monkeypatch, unit_source_factory):
     captured = _capture_unit_source_rows(monkeypatch)
-    seen, live, canonical, proof = AsyncMock(), AsyncMock(), AsyncMock(), AsyncMock()
-    monkeypatch.setattr(importer, "_mark_resource_rows_seen", seen)
+    live, proof = AsyncMock(), AsyncMock()
     monkeypatch.setattr(importer, "_upsert_rows", live)
-    monkeypatch.setattr(importer, "_upsert_canonical_resource_edges", canonical)
     monkeypatch.setattr(importer, "persist_dataset_proof_shard", proof)
     observed_rows = _canonical_edge_resource_rows()
     assert len(observed_rows) == 2 and {stored_resource["source_id"] for stored_resource in observed_rows} == {
@@ -7199,9 +6950,7 @@ async def test_upsert_resource_rows_writes_canonical_resource_and_source_edges(m
         dataset_id="dataset_1",
         expected_resource_hash_contract=importer.TRANSPORT_NEUTRAL_RESOURCE_HASH_CONTRACT,
     )
-    seen.assert_not_awaited()
     live.assert_not_awaited()
-    canonical.assert_not_awaited()
 
 
 def _capture_dataset_backed_writes(monkeypatch):
@@ -7226,9 +6975,8 @@ def _capture_dataset_backed_writes(monkeypatch):
 @pytest.mark.asyncio
 async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(monkeypatch, unit_source_factory):
     captured = _capture_unit_source_rows(monkeypatch)
-    live, canonical, proof = AsyncMock(), AsyncMock(), AsyncMock()
+    live, proof = AsyncMock(), AsyncMock()
     monkeypatch.setattr(importer, "_upsert_rows", live)
-    monkeypatch.setattr(importer, "_upsert_canonical_resource_edges", canonical)
     monkeypatch.setattr(importer, "persist_dataset_proof_shard", proof)
     resource_rows = [
         {
@@ -7266,7 +7014,6 @@ async def test_dataset_backed_upsert_stores_payload_only_in_endpoint_dataset(mon
         expected_resource_hash_contract=importer.DEFAULT_RESOURCE_HASH_CONTRACT,
     )
     live.assert_not_awaited()
-    canonical.assert_not_awaited()
 
 
 def _datasetless_upsert_fixture(monkeypatch):
@@ -7394,9 +7141,8 @@ async def test_v3_materializes_the_accumulated_payload_for_every_model(monkeypat
     incoming_rows.append({**accumulated_payload_by_field, "source_id": "source_a"})
     captured = _capture_unit_source_rows(monkeypatch)
     proof = AsyncMock()
-    canonical_upsert, typed_upsert = AsyncMock(), AsyncMock()
+    typed_upsert = AsyncMock()
     monkeypatch.setattr(importer, "persist_dataset_proof_shard", proof)
-    monkeypatch.setattr(importer, "_upsert_canonical_resource_edges", canonical_upsert)
     monkeypatch.setattr(importer, "_upsert_rows", typed_upsert)
     assert (
         await importer._upsert_resource_rows(
@@ -7437,7 +7183,6 @@ async def test_v3_materializes_the_accumulated_payload_for_every_model(monkeypat
         dataset_id="dataset_1",
         expected_resource_hash_contract="semantic_content_v3",
     )
-    canonical_upsert.assert_not_awaited()
     typed_upsert.assert_not_awaited()
 
 
@@ -7721,7 +7466,6 @@ async def test_alohr_alias_group_uses_compatibility_owner(monkeypatch, unit_sour
     assert capture.rows_by_model.get(ProviderDirectoryPractitioner, []) == []
     assert capture.rows_by_model.get(ProviderDirectorySourceResource, []) == []
     assert len(isolated) == len(isolated[0][0]) == 1
-    assert capture.seen_source_ids == []
     assert capture.stale_source_ids == ["source_00"]
 
 
@@ -11163,7 +10907,6 @@ def _shared_alias_sources(
 class _AliasImportCapture:
     def __init__(self):
         self.rows_by_model: dict[type, list[dict[str, Any]]] = {}
-        self.seen_source_ids: list[str] = []
         self.stale_source_ids: list[str] = []
         self.metadata_source_ids: list[str] = []
         self.fetch_sources: list[dict[str, Any]] = []
@@ -11189,10 +10932,6 @@ class _AliasImportCapture:
             False,
             False,
         )
-
-    async def mark_seen(self, _model, resource_rows, _run_id, **_kwargs):
-        self.seen_source_ids.extend(row["source_id"] for row in resource_rows)
-        return len(resource_rows)
 
     async def delete_stale(self, _model, source_id, _run_id, **_kwargs):
         self.stale_source_ids.append(source_id)
@@ -11239,7 +10978,6 @@ class _AliasImportCapture:
             AsyncMock(),
         )
         monkeypatch.setattr(importer, "_fetch_resource_rows", self.fetch)
-        monkeypatch.setattr(importer, "_mark_resource_rows_seen", self.mark_seen)
         monkeypatch.setattr(importer, "_delete_stale_resource_rows", self.delete_stale)
         monkeypatch.setattr(importer, "_prepare_endpoint_dataset_candidate", self.prepare_candidate)
         monkeypatch.setattr(importer, "_finalize_endpoint_dataset_candidate", self.finalize_candidate)
@@ -11282,7 +11020,6 @@ async def test_alias_group_writes_one_compatibility_copy(monkeypatch, unit_sourc
     assert isolated[0][0][0]["resource_id"] == "prac-1"
     assert capture.rows_by_model.get(ProviderDirectoryPractitioner, []) == []
     assert capture.rows_by_model.get(ProviderDirectorySourceResource, []) == []
-    assert capture.seen_source_ids == []
     assert capture.stale_source_ids == ["source_00"]
     assert sorted(capture.metadata_source_ids) == sorted(source_record["source_id"] for source_record in source_rows)
     assert fetch_stats_by_resource["Practitioner"]["rows_fetched"] == 1
@@ -15290,9 +15027,6 @@ async def test_import_resources_does_not_stale_cleanup_suspicious_zero_role_afte
         deleted_models.append(model)
         return 0
 
-    async def fake_mark_seen(*_args, **_kwargs):
-        return None
-
     monkeypatch.setenv("HLTHPRT_PROVIDER_DIRECTORY_SEEN_STAGE", "0")
     monkeypatch.setattr(importer, "_update_source_resource_import_metadata", fake_update_metadata)
     monkeypatch.setattr(
@@ -15302,7 +15036,6 @@ async def test_import_resources_does_not_stale_cleanup_suspicious_zero_role_afte
     )
     monkeypatch.setattr(importer, "_upsert_resource_rows", fake_upsert)
     monkeypatch.setattr(importer, "_delete_stale_resource_rows", fake_delete_stale)
-    monkeypatch.setattr(importer, "_mark_resource_rows_seen", fake_mark_seen)
 
     counts = await importer._import_resources(
         [{"source_id": "source_a", "api_base": "https://example.test/fhir"}],
@@ -17177,54 +16910,6 @@ async def test_copy_upsert_rows_uses_temp_copy_and_changed_predicate(monkeypatch
     assert "last_seen_run_id" not in where_sql
     assert "observed_at" not in where_sql
     assert "updated_at" not in where_sql
-
-
-@pytest.mark.asyncio
-async def test_copy_mark_resource_rows_seen_uses_distinct_stage_merge(monkeypatch):
-    conn = _FakeAcquireConnection()
-    monkeypatch.setattr(importer.db, "acquire", lambda: _FakeAcquire(conn))
-    monkeypatch.setattr(importer, "_stage_table_name", lambda: "pd_seen_test")
-
-    written = await importer._copy_mark_resource_rows_seen(
-        "Location",
-        [("source_a", "loc-1"), ("source_a", "loc-1"), ("source_a", "loc-2")],
-        "run_1",
-    )
-
-    assert written == 3
-    assert conn.driver.calls[0]["table"] == "pd_seen_test"
-    assert conn.driver.calls[0]["columns"] == ["run_id", "resource_type", "source_id", "resource_id"]
-    assert conn.driver.calls[0]["records"][0] == ("run_1", "Location", "source_a", "loc-1")
-    assert 'CREATE TEMP TABLE "pd_seen_test"' in conn.statements[0]
-    assert "SELECT DISTINCT" in conn.statements[1]
-    assert "ON CONFLICT (run_id, resource_type, source_id, resource_id) DO NOTHING" in conn.statements[1]
-
-
-@pytest.mark.asyncio
-async def test_copy_mark_rows_seen_appends_without_indexed_merge(monkeypatch):
-    conn = _FakeAcquireConnection()
-    monkeypatch.setattr(importer.db, "acquire", lambda: _FakeAcquire(conn))
-
-    written = await importer._copy_mark_resource_rows_seen(
-        "Location",
-        [("source_a", "loc-1"), ("source_a", "loc-2")],
-        "run_1",
-        seen_table="provider_directory_import_seen_stage_test",
-    )
-
-    assert written == 2
-    assert conn.driver.calls == [
-        {
-            "table": "provider_directory_import_seen_stage_test",
-            "schema_name": "mrf",
-            "columns": ["run_id", "resource_type", "source_id", "resource_id"],
-            "records": [
-                ("run_1", "Location", "source_a", "loc-1"),
-                ("run_1", "Location", "source_a", "loc-2"),
-            ],
-        }
-    ]
-    assert conn.statements == []
 
 
 @pytest.mark.asyncio
@@ -27530,9 +27215,6 @@ class _SourceIsolationState:
             self.lifecycle_events.append("source_good_persisted")
         return len(rows)
 
-    async def mark_resource_rows_seen(self, *_args, **_kwargs):
-        return None
-
     async def delete_stale_resource_rows(self, _model, source_id, _run_id, **_kwargs):
         assert source_id == "source_good"
         self.lifecycle_events.append("source_good_cleaned")
@@ -27557,7 +27239,6 @@ async def test_import_resources_finishes_healthy_source_before_aggregate_failure
     monkeypatch.setattr(importer, "_assert_resource_acquisition_allowed", isolation_state.assert_acquisition_allowed)
     monkeypatch.setattr(importer, "_fetch_resource_rows", isolation_state.fetch_resource_rows)
     monkeypatch.setattr(importer, "_upsert_resource_rows", isolation_state.upsert_rows)
-    monkeypatch.setattr(importer, "_mark_resource_rows_seen", isolation_state.mark_resource_rows_seen)
     monkeypatch.setattr(importer, "_delete_stale_resource_rows", isolation_state.delete_stale_resource_rows)
     monkeypatch.setattr(importer, "_update_source_resource_import_metadata", isolation_state.update_source_metadata)
 
@@ -33581,24 +33262,6 @@ async def test_reverse_lookup_checkpoint_cleanup_and_partition_flush(monkeypatch
     )
     assert state.pending_partition_checkpoint_rows == []
     upsert.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_mark_seen_rows_handles_empty_and_copy_paths(monkeypatch):
-    model = importer.ProviderDirectoryOrganization
-    assert await importer._mark_resource_rows_seen(model, [], "run") == 0
-    assert await importer._mark_resource_rows_seen(model, [{}], "run") == 0
-    copy_seen = AsyncMock(return_value=1)
-    monkeypatch.setattr(importer, "_copy_mark_resource_rows_seen", copy_seen)
-    monkeypatch.setattr(importer, "_is_copy_upsert_enabled", lambda: True)
-    monkeypatch.setattr(importer, "_copy_upsert_min_rows", lambda: 1)
-    result = await importer._mark_resource_rows_seen(
-        model,
-        [{}, {"source_id": "source-a", "resource_id": "org-1"}],
-        "run",
-    )
-    assert result == 1
-    copy_seen.assert_awaited_once()
 
 
 @pytest.mark.asyncio

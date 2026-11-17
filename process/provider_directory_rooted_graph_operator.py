@@ -83,50 +83,26 @@ async def register_rooted_graph_source_operation(
 
 
 async def _select_exact_current_root(database: Any) -> Any:
-    from process.provider_directory_rooted_graph_source_runtime import current_rooted_graph_runtime
-
-    if current_rooted_graph_runtime(database) is not None:
-        from process.provider_directory_dataset_scoped_publication_contract import (
-            EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
-        )
-        from process.provider_directory_rooted_graph_current_preflight import (
-            prepare_current_root,
-            require_current_root_fence,
-        )
-
-        proof = await prepare_current_root(database)
-        async with rooted_graph_transaction(database):
-            await database.status("SET LOCAL lock_timeout='1500ms'")
-            locked = await database.scalar(
-                "SELECT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtextextended(:identity,0))",
-                identity=EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
-            )
-            if locked is not True:
-                raise ProviderDirectoryRootedGraphOperatorError("state")
-            return await require_current_root_fence(database, proof, lock_rows=False)
-    from process.provider_directory_dataset_scoped_publication import (
-        exact_uhc_dataset_pair,
-        lock_exact_current_dataset,
-    )
     from process.provider_directory_dataset_scoped_publication_contract import (
         EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
-        ExactCurrentDataset,
     )
+    from process.provider_directory_rooted_graph_current_preflight import (
+        prepare_current_root,
+        require_current_root_fence,
+    )
+    from process.provider_directory_rooted_graph_source_runtime import require_rooted_graph_runtime
 
+    require_rooted_graph_runtime(database)
+    proof = await prepare_current_root(database)
     async with rooted_graph_transaction(database):
-        await database.scalar(
-            "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:lock_identity, 0));",
-            lock_identity=EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
+        await database.status("SET LOCAL lock_timeout='1500ms'")
+        locked = await database.scalar(
+            "SELECT pg_catalog.pg_try_advisory_xact_lock(pg_catalog.hashtextextended(:identity,0))",
+            identity=EXACT_DATASET_PUBLICATION_LOCK_IDENTITY,
         )
-        current = await lock_exact_current_dataset(
-            database,
-            pair=exact_uhc_dataset_pair(),
-        )
-    if current is None:
-        raise ProviderDirectoryRootedGraphOperatorError("missing")
-    if type(current) is not ExactCurrentDataset:
-        raise ProviderDirectoryRootedGraphOperatorError("evidence")
-    return current
+        if locked is not True:
+            raise ProviderDirectoryRootedGraphOperatorError("state")
+        return await require_current_root_fence(database, proof, lock_rows=False)
 
 
 def _root_receipt_payload(receipt: Any) -> dict[str, Any]:

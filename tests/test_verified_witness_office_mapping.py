@@ -280,6 +280,146 @@ async def test_shared_page_renders_the_retained_source_sql_before_location_read(
     assert connection.execute.await_count == 1
 
 
+@pytest.mark.parametrize(
+    "damage,error",
+    [
+        ("encoded_count", "initial_retained_mapping_accounting_invalid"),
+        ("replayed_key", "initial_cms_office_page_accounting_invalid"),
+        ("page_budget", "initial_cms_office_page_accounting_invalid"),
+    ],
+)
+async def test_member_page_refuses_invalid_accounting_before_stage_writes(monkeypatch, damage, error):
+    members = [_member()]
+    selected_bytes = b"[]" if damage == "encoded_count" else json.dumps(members).encode()
+    page_key = "previous" if damage == "replayed_key" else "next"
+    if damage == "page_budget":
+        monkeypatch.setattr(legacy, "MAX_INPUT_BYTES", 512)
+    connection = SimpleNamespace(execute=AsyncMock(), copy_records_to_table=AsyncMock(), fetchrow=AsyncMock())
+    proofs_by_page = {"previous": (1, "a" * 64)}
+
+    with pytest.raises(legacy.InitialCMSOfficeBindingError, match=error):
+        await legacy._stage_verified_member_page(
+            connection,
+            _source().recipe.source_pin,
+            members,
+            selected_bytes,
+            page_key,
+            "inputs",
+            "members",
+            proofs_by_page,
+        )
+
+    connection.execute.assert_not_awaited()
+    connection.copy_records_to_table.assert_not_awaited()
+    connection.fetchrow.assert_not_awaited()
+    assert proofs_by_page == {"previous": (1, "a" * 64)}
+
+
+@pytest.mark.parametrize("partial_table", ["members", "inputs"])
+async def test_partial_copy_leaves_previous_page_proof_intact(monkeypatch, partial_table):
+    member = _member()
+    members = [member, {**member, "location_id": str(UUID(int=2))}]
+    offices = [
+        {"source_address": ["1 Example Street", None, "Albany", "NY", "12207", "US"]},
+        {"source_address": ["2 Example Street", None, "Albany", "NY", "12207", "US"]},
+    ]
+    canonicalize = AsyncMock(return_value=json.dumps([{"address_key": str(UUID(int=index))} for index in (3, 4)]))
+    monkeypatch.setattr(legacy, "_canonicalize", canonicalize)
+    copy_statuses = ["COPY 1"] if partial_table == "members" else ["COPY 2", "COPY 1"]
+    connection = SimpleNamespace(
+        execute=AsyncMock(),
+        copy_records_to_table=AsyncMock(side_effect=copy_statuses),
+        fetchrow=AsyncMock(return_value={"offices_json": json.dumps(offices)}),
+    )
+    proofs_by_page = {"previous": (1, "a" * 64)}
+
+    with pytest.raises(legacy.InitialCMSOfficeBindingError, match="initial_retained_mapping_accounting_invalid"):
+        await legacy._stage_verified_member_page(
+            connection,
+            _source().recipe.source_pin,
+            members,
+            json.dumps(members).encode(),
+            "next",
+            "inputs",
+            "members",
+            proofs_by_page,
+        )
+
+    copy_calls = connection.copy_records_to_table.await_args_list
+    expected_tables = ["members"] if partial_table == "members" else ["members", "inputs"]
+    assert [call.args[0] for call in copy_calls] == expected_tables
+    assert all(len(call.kwargs["records"]) == 2 for call in copy_calls)
+    assert connection.fetchrow.await_count == canonicalize.await_count == len(expected_tables) - 1
+    assert proofs_by_page == {"previous": (1, "a" * 64)}
+
+
+@pytest.mark.parametrize(
+    "exceeds_bound,error",
+    [
+        (True, "initial_cms_office_canonical_bound_exceeded"),
+        (False, "initial_retained_mapping_accounting_invalid"),
+    ],
+)
+async def test_member_page_refuses_overflow_or_incomplete_canonical_batch(monkeypatch, exceeds_bound, error):
+    canonicalize = AsyncMock(return_value="[]")
+    monkeypatch.setattr(legacy, "_canonicalize", canonicalize)
+    address = ["1 Example Street", None, "Albany", "NY", "12207", "US"]
+    office_json = None if exceeds_bound else json.dumps([{"source_address": address}])
+    connection = SimpleNamespace(
+        execute=AsyncMock(),
+        copy_records_to_table=AsyncMock(return_value="COPY 1"),
+        fetchrow=AsyncMock(return_value={"offices_json": office_json}),
+    )
+    members = [_member()]
+    proofs_by_page = {"previous": (1, "a" * 64)}
+
+    with pytest.raises(legacy.InitialCMSOfficeBindingError, match=error):
+        await legacy._stage_verified_member_page(
+            connection,
+            _source().recipe.source_pin,
+            members,
+            json.dumps(members).encode(),
+            "next",
+            "inputs",
+            "members",
+            proofs_by_page,
+        )
+
+    connection.copy_records_to_table.assert_awaited_once()
+    assert connection.copy_records_to_table.await_args.args[0] == "members"
+    if exceeds_bound:
+        canonicalize.assert_not_awaited()
+    else:
+        canonicalize.assert_awaited_once_with([tuple(address)])
+    assert proofs_by_page == {"previous": (1, "a" * 64)}
+
+
+@pytest.mark.parametrize(
+    "exceeds_bound,error",
+    [
+        (True, "initial_cms_office_canonical_bound_exceeded"),
+        (False, "initial_retained_mapping_accounting_invalid"),
+    ],
+)
+async def test_office_finish_refuses_incomplete_page_before_pruning(monkeypatch, exceeds_bound, error):
+    monkeypatch.setattr(legacy, "_verified_office_match_keys", AsyncMock(return_value="winners"))
+    monkeypatch.setattr(legacy, "_canonicalize", AsyncMock(return_value="[]"))
+    prune = AsyncMock()
+    monkeypatch.setattr(legacy, "_prune_verified_offices", prune)
+    address = PinnedAddressSource("named_addresses", "entity_address_unified", "address-edition")
+    matched_address = ["1 Example Street", None, "Albany", "NY", "12207", "US"]
+    office_json = None if exceeds_bound else json.dumps([{"address": matched_address}])
+    connection = SimpleNamespace(execute=AsyncMock(), fetchrow=AsyncMock(return_value={"offices_json": office_json}))
+    proofs_by_page = {"page": (0, None)}
+
+    with pytest.raises(legacy.InitialCMSOfficeBindingError, match=error):
+        await legacy._finish_verified_office_matches(connection, "inputs", "matches", address, proofs_by_page)
+
+    assert proofs_by_page == {"page": (0, None)}
+    prune.assert_not_awaited()
+    assert all(not call.args[0].startswith("DELETE FROM") for call in connection.execute.await_args_list)
+
+
 async def test_member_prune_materializes_only_page_identity_before_exact_uuid_comparison():
     connection = SimpleNamespace(execute=AsyncMock())
     assert mapping._prune_unmatched_members is legacy._prune_unmatched_members

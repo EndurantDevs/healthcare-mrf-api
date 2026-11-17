@@ -213,34 +213,6 @@ async def source_publication_sessions():
     return await _publication_factory().publication_session_factory()
 
 
-async def source_callable_capability(connection, policy):
-    """Authenticate existing privileged callables through the enrolled factory."""
-    publisher = bound_publisher()
-    factory = _FACTORY.get()
-    _require(
-        publisher.connection is connection
-        and publisher.policy is policy
-        and factory is not None
-        and publisher.factory is factory
-        and getattr(factory, "policy", None) is policy,
-        "callable_original_publisher_required",
-    )
-    capture = getattr(factory, "source_callable_capability", None)
-    _require(callable(capture), "callable_factory_required")
-    capability = await capture(connection, policy)
-    _require(
-        bound_publisher() is publisher and _FACTORY.get() is factory and getattr(factory, "policy", None) is policy,
-        "callable_publisher_changed",
-    )
-    _require(
-        type(capability) is tuple
-        and all(type(oid) is int and 0 < oid < 2**32 for oid in capability)
-        and len(set(capability)) == len(capability),
-        "callable_capability_changed",
-    )
-    return capability
-
-
 @asynccontextmanager
 async def original_source_publication(database, session):
     """Authenticate the already-open original final owner, preserving its outcome."""

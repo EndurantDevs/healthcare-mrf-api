@@ -10,7 +10,7 @@ from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_cms_identity_candidate as entities
 from process import provider_directory_cms_prepared_identity_validation as validation
 from process import provider_directory_resource_identity_candidate as resources
-from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
+from process.native_copy_cleanup import cleanup_interrupted_copy
 from process.provider_directory_generic_candidate import COPY_MAX_BYTES
 from process.provider_directory_generic_source_policy import _savepoint
 
@@ -44,9 +44,8 @@ async def _mint_commitments(workspace, *, expected):
 
         try:
             status = await workspace.connection.copy_from_query(query, output=_consume, format="binary")
-        except BaseException:
-            await close_interrupted_copy(workspace.connection)
-            await invalidate_copy_owner(workspace.session, workspace.connection)
+        except BaseException as interruption:
+            await cleanup_interrupted_copy(workspace.session, workspace.connection, interruption)
             raise
         if type(status) is not str or re.fullmatch(r"COPY [0-9]+", status) is None:
             raise ValueError("cms_prepared_identity_publication_mint_copy_incomplete")

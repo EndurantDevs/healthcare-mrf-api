@@ -19,6 +19,7 @@ from process.provider_directory_cms_preparation import (
     RetainedNativeRelation,
 )
 from tests.provider_directory_cms_capacity_test_support import signed_cms_plan
+from tests.test_network_registry_cms_prepared_address_pin import _issued
 from tests.test_provider_directory_cms_capacity_contract import _retention_policy
 from tests.test_provider_directory_cms_nonprofile_capacity import _producer
 
@@ -513,3 +514,43 @@ async def test_native_registration_rejects_unadmitted_or_conflicting_source(monk
         await admission.register_external_relation(
             producer.fhir, relation.schema, relation.relation, native_relation=annotation
         )
+
+
+def _retained_phase_annotation(monkeypatch, relation, source_layout, phase):
+    pin, progress_by_field = _issued(monkeypatch, source_layouts=((relation.relation, source_layout),))
+    annotation = RetainedNativeRelation(relation.schema, relation.relation, "{}", source_layout, phase, pin)
+    progress_by_field["relations"][(relation.schema, relation.relation)] = annotation
+    return annotation
+
+
+@pytest.mark.asyncio
+async def test_retained_loading_accepts_only_its_named_index_free_heap(monkeypatch):
+    fhir, source_layout, relation, _original, clone_catalog = await _source_and_clone(monkeypatch)
+    annotation = _retained_phase_annotation(monkeypatch, relation, source_layout, "loading")
+    original_indexes = clone_catalog["indexes"]
+    clone_catalog["indexes"] = [index for index in original_indexes if index["index_schema"] == "pg_toast"]
+    clone_catalog["constraints"] = []
+    targets = ("entity_address_unified",)
+    captured = await layout.capture_retained_native_phase(fhir, relation, annotation, targets)
+    assert (captured.schema_name, captured.relation_name) == (relation.schema, relation.relation)
+
+    clone_catalog["indexes"] = original_indexes
+    with pytest.raises(RuntimeError, match="storage_shape_unsupported"):
+        await layout.capture_retained_native_phase(fhir, relation, annotation, targets)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["missing_pin", "other_schema", "unlogged", "wrong_recipe"])
+async def test_retained_loading_rejects_an_unrelated_or_unsupported_heap(monkeypatch, mismatch):
+    fhir, source_layout, relation, _original, _clone = await _source_and_clone(monkeypatch)
+    if mismatch == "wrong_recipe":
+        source_layout = replace(source_layout, catalog_json='{"contract":"unknown"}')
+    annotation = _retained_phase_annotation(monkeypatch, relation, source_layout, "loading")
+    if mismatch == "missing_pin":
+        annotation = replace(annotation, source_input=None)
+    elif mismatch == "other_schema":
+        relation = replace(relation, schema="another_archive")
+    elif mismatch == "unlogged":
+        relation = replace(relation, persistence="u")
+    with pytest.raises(RuntimeError, match="storage_shape_unsupported"):
+        await layout.capture_retained_native_phase(fhir, relation, annotation, ("entity_address_unified",))

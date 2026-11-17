@@ -914,5 +914,38 @@ async def test_unpublished_and_changed_pin_refuse(catalog_database, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_explicit_directory_generation_uses_its_retained_catalog(catalog_database, monkeypatch):
+    fixture = catalog_database
+    _verifier, namespace = await _prepare_metadata_pin_fixture(fixture, monkeypatch)
+    await fixture.connection.execute(
+        f"UPDATE {namespace}.registry_fhir_catalog_snapshot SET published_at=clock_timestamp();"
+        f"CREATE TABLE {namespace}.network_serving_manifest(generation_id bigint PRIMARY KEY,source_generations jsonb)"
+    )
+    await fixture.connection.execute(
+        f"INSERT INTO {namespace}.network_serving_manifest VALUES "
+        "(10,jsonb_build_object('fhir_catalog',$1::text)),(11,jsonb_build_object('fhir_catalog',$2::text))",
+        GENERATION,
+        "b" * 64,
+    )
+    monkeypatch.setattr(catalog, "_metadata_pin", fixture.original_metadata_pin)
+    original = await _read(fixture, control_schema=fixture.metadata)
+    successor = SimpleNamespace(
+        **vars(fixture.manifest)
+        | {"generation_id": 10, "approved_custom_revision": 6, "source_generations": {"fhir_catalog": GENERATION}}
+    )
+    pin = AsyncMock(return_value=(successor, None, None))
+    monkeypatch.setattr(catalog, "read_published_api_pin", pin)
+
+    query = catalog.FHIRCatalogQuery(generation_id=10, metadata_generation=GENERATION)
+    page = await _read(fixture, query, control_schema=fixture.metadata)
+    assert page["metadata_generation"] == original["metadata_generation"] == GENERATION
+    assert page["generation"] == "10" and original["generation"] == "9"
+    assert page["items"] == original["items"]
+    with pytest.raises(catalog.RegistryNetworkCatalogError, match="source_changed"):
+        await _read(fixture, replace(query, generation_id=11), control_schema=fixture.metadata)
+    pin.assert_awaited_once_with(fixture.connection, 10, fixture.metadata)
+
+
+@pytest.mark.asyncio
 async def test_copied_catalog_preserves_named_api_reader(indexed_api_db, monkeypatch):
     await assert_copied_fhir_view(indexed_api_db, monkeypatch)

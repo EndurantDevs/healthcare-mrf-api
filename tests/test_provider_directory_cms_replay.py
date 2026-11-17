@@ -185,3 +185,42 @@ async def test_purge_without_original_delta_cannot_report_historical_completion(
     )
     execution = SimpleNamespace(attestation=SimpleNamespace(operation="purge"))
     assert await replay._replay(stub, execution, "run_" + "1" * 32, {}) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_state", ["uncommitted", "missing_common", "missing_publication_xid"])
+async def test_initial_replay_requires_its_committed_common_receipt(monkeypatch, initial_state):
+    """An initial result can be replayed only with the common receipt from its publication."""
+    execution, _delta_by_field, _receipt = _named_result()
+    execution.capacity_attestation = {
+        "lease": {
+            "signing_preflight_guard": {
+                "healthcare_request": {
+                    "contract_id": replay.initial_contract.REQUEST_CONTRACT,
+                    "profile_materialization": replay.initial_contract.MATERIALIZATION,
+                }
+            }
+        }
+    }
+    profile_by_field = {
+        "generation_id": "pdprofile_" + "1" * 32,
+        "committed_replay": {"build_id": "initial_build"},
+    }
+    committed = AsyncMock(return_value=None if initial_state == "uncommitted" else profile_by_field)
+    scalar = AsyncMock(return_value=None if initial_state == "missing_publication_xid" else "10")
+    lookup = AsyncMock(return_value=object() if initial_state == "missing_publication_xid" else None)
+    monkeypatch.setattr(replay.initial, "committed_replay", committed)
+    monkeypatch.setattr(fhir.db, "scalar", scalar)
+    monkeypatch.setattr(replay, "_historical_common", lookup)
+    run_id = "run_" + "1" * 32
+    if initial_state == "uncommitted":
+        assert await replay._replay(fhir, execution, run_id, {}) is None
+        scalar.assert_not_awaited()
+        lookup.assert_not_awaited()
+    else:
+        with pytest.raises(fhir.ProviderDirectoryArtifactBuildStale, match="common_receipt_missing"):
+            await replay._replay(fhir, execution, run_id, {})
+        assert scalar.await_args.kwargs == {"build": "initial_build"}
+        lookup.assert_awaited_once_with(
+            fhir, fhir._schema(), profile_by_field["generation_id"], publication_xid=scalar.return_value
+        )

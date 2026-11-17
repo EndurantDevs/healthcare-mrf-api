@@ -12,6 +12,7 @@ from process.registry_approval_store import RegistryApprovalConflict
 from process.registry_publication_queue import (
     RegistryReactivationCommand,
     _initial_inventory_result,
+    _source_rollback_publication_result,
     claim_registry_publication_request,
     enqueue_registry_publication,
     enqueue_registry_reactivation,
@@ -353,6 +354,37 @@ async def test_source_publication_command_is_exact_and_bound_to_review(change):
     }
     with pytest.raises(ValueError, match="source_rollback_publication_command_invalid"):
         validated_registry_source_rollback_publication_command({**command_by_name, **changes_by_case[change]})
+
+
+@pytest.mark.parametrize("change", ["shape", "candidate", "manifest", "generation", "preview"])
+async def test_completed_source_rollback_result_matches_the_reviewed_preview(change):
+    """The completed result cannot refer to a different review or reuse the incumbent generation."""
+    expected_by_field = {
+        "preview_request_id": str(uuid4()),
+        "candidate_sha256": "a" * 64,
+        "expected_serving_generation": 41,
+        "expected_approved_revision": 12,
+    }
+    result_by_field = {
+        "operation": "publish_source_rollback",
+        "preview_request_id": expected_by_field["preview_request_id"],
+        "candidate_id": str(uuid4()),
+        "candidate_sha256": expected_by_field["candidate_sha256"],
+        "previous_generation_id": expected_by_field["expected_serving_generation"],
+        "generation_id": 42,
+        "approved_custom_revision": expected_by_field["expected_approved_revision"],
+        "manifest_sha256": "b" * 64,
+    }
+    _source_rollback_publication_result(result_by_field, expected_by_field, "completed")
+    by_change = {
+        "shape": {"unexpected": None},
+        "candidate": {"candidate_id": str(UUID(int=0))},
+        "manifest": {"manifest_sha256": "invalid"},
+        "generation": {"generation_id": result_by_field["previous_generation_id"]},
+        "preview": {"preview_request_id": str(uuid4())},
+    }
+    with pytest.raises(ValueError, match="source_rollback_publication_result_invalid"):
+        _source_rollback_publication_result({**result_by_field, **by_change[change]}, expected_by_field, "completed")
 
 
 async def _insert_claim_partition_row(connection, schema, ordinal, state, command):

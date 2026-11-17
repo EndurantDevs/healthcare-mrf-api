@@ -1539,6 +1539,7 @@ async def _prepare_data_only_cutover(
     restored_npi: int,
     runtime,
 ):
+    """Align restored data before freeze, then validate as the read-only owner."""
     stage_schema = archive.npi_stage_schema(restore_dataset_id)
     async with sessions() as session, session.begin():
         restored_ownership = await archive.precreate_npi_restore(session, dataset_id=restore_dataset_id, canonical=True)
@@ -1566,12 +1567,19 @@ async def _prepare_data_only_cutover(
     await _assert_frozen_paired_stage_rejects_write(runtime.builders, restored_source)
     await _assert_frozen_paired_stage_rejects_write(runtime.readers, restored_source)
     async with sessions() as session, session.begin():
+        sequence_query = text(f"SELECT last_value::bigint, is_called FROM {sequence_relation}")
+        assert tuple((await session.execute(sequence_query)).one()) == (1, False)
         await archive.complete_npi_restore(session, restored_ownership)
-        initial_state = await session.execute(text(f"SELECT last_value::bigint, is_called FROM {sequence_relation}"))
-        assert tuple(initial_state.one()) == (1, False)
-        await archive.validate_npi_stage(session, ownership=restored_ownership, manifest=manifest)
+        assert tuple((await session.execute(sequence_query)).one()) == (restored_npi, True)
+        await archive.freeze_npi_stage(
+            session, ownership=restored_ownership, owner_role=runtime.owner, reader_roles=(runtime.reader,)
+        )
         incumbent = await archive.capture_npi_incumbent(session, schema_name=destination_schema, canonical=True)
         owner_oid = await session.scalar(text("SELECT CAST(:owner AS regrole)::oid"), {"owner": runtime.owner})
+        await session.execute(text(f'SET LOCAL ROLE "{runtime.owner}"'))
+        assert not await session.scalar(
+            text("SELECT has_sequence_privilege(:sequence, 'UPDATE')"), {"sequence": sequence_relation}
+        )
         validation = await archive.prepare_npi_activation(
             session,
             ownership=restored_ownership,
@@ -1579,8 +1587,6 @@ async def _prepare_data_only_cutover(
             package_id="b" * 64,
             sealed_owner_oid=owner_oid,
         )
-        aligned_state = await session.execute(text(f"SELECT last_value::bigint, is_called FROM {sequence_relation}"))
-        assert tuple(aligned_state.one()) == (restored_npi, True)
     return restored_ownership, incumbent, owner_oid, validation
 
 
@@ -1593,11 +1599,6 @@ async def _activate_and_assert_restored_sequence(
     validation,
     owner_oid: int,
 ):
-    sequence_name = ownership.sequence_oids[0][0]
-    sequence_relation = f'"{ownership.schema_name}"."{sequence_name}"'
-    async with sessions() as session, session.begin():
-        await session.execute(text(f"SELECT pg_catalog.setval('{sequence_relation}'::regclass,1,false)"))
-
     async def record_activation(active_session, _receipt) -> None:
         await active_session.execute(text(f'INSERT INTO "{incumbent.schema_name}".activation_log VALUES (1)'))
 
@@ -1612,23 +1613,29 @@ async def _activate_and_assert_restored_sequence(
             manifest=manifest,
             incumbent=incumbent,
             validation_receipt=validation,
-            cutover=archive.NpiCutoverAuthority("b" * 64, "manual"),
+            cutover=archive.NpiCutoverAuthority("b" * 64, "manual", stage_read_only=True),
             on_activated=record_activation,
         )
-    async with sessions() as session:
+    async with sessions() as session, session.begin():
         assert await session.scalar(text(f'SELECT count(*) FROM "{incumbent.schema_name}".activation_log')) == 1
         highest_npi = await session.scalar(text(f'SELECT max(npi) FROM "{incumbent.schema_name}".npi'))
-        next_npi = await session.scalar(
-            text("SELECT nextval(pg_get_serial_sequence(:table_name,'npi'))"),
-            {"table_name": f"{incumbent.schema_name}.npi"},
+        sequence_name = ownership.sequence_oids[0][0]
+        state = await session.execute(
+            text(f'SELECT last_value::bigint, is_called FROM "{incumbent.schema_name}"."{sequence_name}"')
         )
-    assert next_npi == highest_npi + 1
+        assert tuple(state.one()) == (highest_npi, True)
+        with pytest.raises(DBAPIError, match="permission denied for sequence"):
+            async with session.begin_nested():
+                await session.scalar(
+                    text("SELECT nextval(pg_get_serial_sequence(:table_name,'npi'))"),
+                    {"table_name": f"{incumbent.schema_name}.npi"},
+                )
     return receipt
 
 
 @pytest.mark.asyncio
 async def test_data_only_restore_advances_owned_sequence_before_activation(tmp_path: Path, native_runtime) -> None:
-    """Restore only table data, activate it, and allocate beyond the restored NPI."""
+    """Restore data and activate with the owned sequence aligned and read-only."""
 
     engine, sessions = native_runtime.administrator, native_runtime.sessions
     source_dataset_id = uuid4()

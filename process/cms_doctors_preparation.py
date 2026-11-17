@@ -313,11 +313,6 @@ async def apply_prepared_cms_doctors_generation(prepared):
 
 async def _apply_prepared_family(prepared, native, session):
     """Keep all native postconditions inside the same rollback boundary as the cut."""
-    stage_cls = native.make_class(native.DoctorClinicianAddress, prepared.import_date)
-    await native._lock_cms_doctors_publication(
-        session, stage_cls, prepared.schema, prepared.import_date, stage_read_only=True
-    )
-    await archive._verify_incumbent(session, prepared.incumbent)
     authority = await generation.read_reference_family_result_generation_authority(
         session,
         importer_id=_IMPORTER,
@@ -326,6 +321,11 @@ async def _apply_prepared_family(prepared, native, session):
     )
     if authority != prepared.incumbent_authority:
         raise RuntimeError("cms_doctors_incumbent_authority_changed")
+    stage_cls = native.make_class(native.DoctorClinicianAddress, prepared.import_date)
+    await native._lock_cms_doctors_publication(
+        session, stage_cls, prepared.schema, prepared.import_date, stage_read_only=True
+    )
+    await archive._verify_incumbent(session, prepared.incumbent)
     for model, (_target, stage) in zip(_models(), prepared_stage_relations(prepared), strict=True):
         await _assert_stage(session, prepared.schema, stage, logged=True)
         await _assert_stage_indexes(session, prepared.schema, native.make_class(model, prepared.import_date))

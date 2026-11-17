@@ -43,8 +43,6 @@ async def test_isolated_source_sink_preserves_deduplicated_count_without_live_si
     persist = AsyncMock(return_value=[{"resource_id": "location_a"}])
     live = AsyncMock(side_effect=AssertionError("live compatibility writer reached"))
     monkeypatch.setattr(fhir, "_persist_endpoint_dataset_rows", persist)
-    monkeypatch.setattr(fhir, "_upsert_canonical_resource_edges", live)
-    monkeypatch.setattr(fhir, "_mark_resource_rows_seen", live)
     monkeypatch.setattr(fhir, "_upsert_rows", live)
     identity = SimpleNamespace(
         dataset_id="dataset_a", resource_hash_contract="contract_a", semantic_projection_as_of=None

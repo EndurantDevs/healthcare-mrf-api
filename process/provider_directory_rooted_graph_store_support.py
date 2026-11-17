@@ -36,13 +36,9 @@ _SCHEMA_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 @asynccontextmanager
 async def rooted_graph_transaction(database, *, renewal=False):
     """Keep issued worker writes on its physical publisher and retain manual custody."""
-    from process.provider_directory_rooted_graph_source_runtime import current_rooted_graph_runtime
+    from process.provider_directory_rooted_graph_source_runtime import require_rooted_graph_runtime
 
-    runtime = current_rooted_graph_runtime(database)
-    if runtime is None:
-        raise RuntimeError(
-            "Rooted writes require a configured isolated generation prepared through the Source operator"
-        )
+    runtime = require_rooted_graph_runtime(database)
     async with runtime.transaction(database, **({"renewal": True} if renewal else {})) as transaction:
         yield transaction.session
 

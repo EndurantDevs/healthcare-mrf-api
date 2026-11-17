@@ -9,7 +9,7 @@ from copy import deepcopy
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import cms_npd_source
 from process import provider_directory_generic_source_storage as storage
-from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
+from process.native_copy_cleanup import cleanup_interrupted_copy
 from process.provider_directory_cms_prepared_derived import (
     copy_prepared_cms_derived,
     copy_prepared_cms_input_payloads,
@@ -58,9 +58,8 @@ async def _copy_native_content(connection, session, *, schema, receipt):
         status = await connection.copy_from_query(
             f"SELECT * FROM ONLY {relation} ORDER BY {order}", output=_hash_chunk, format="binary"
         )
-    except BaseException:
-        await close_interrupted_copy(connection)
-        await invalidate_copy_owner(session, connection)
+    except BaseException as interruption:
+        await cleanup_interrupted_copy(session, connection, interruption)
         raise
     if type(status) is not str or re.fullmatch(r"COPY [0-9]+", status) is None:
         raise ValueError("cms_prepared_outputs_frozen_copy_incomplete")

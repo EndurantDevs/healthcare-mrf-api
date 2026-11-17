@@ -314,23 +314,31 @@ async def test_materialization_finishes_all_indexes_then_analyzes_and_validates(
 
 
 @pytest.mark.asyncio
-async def test_failed_index_build_cleans_without_validating_or_exposing(synthetic_admission, monkeypatch):
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_failed_index_build_cleans_without_validating_or_exposing(
+    synthetic_admission, monkeypatch, cleanup_fails
+):
     plan = fhir._artifact_scope_materialization_plan("run_" + "a" * 32)
     failure = OSError("synthetic index build failed")
+    cleanup_error = RuntimeError("synthetic scratch cleanup failed") if cleanup_fails else None
     monkeypatch.setattr(fhir, "_artifact_scope_materialization_plan", lambda _run: plan)
     monkeypatch.setattr(fhir, "_recover_provider_directory_artifact_scope", AsyncMock())
     monkeypatch.setattr(fhir, "_materialize_artifact_scope_payload", AsyncMock())
     monkeypatch.setattr(fhir, "_finish_artifact_scope_indexes", AsyncMock(side_effect=failure))
-    cleanup, validate, expose = AsyncMock(), AsyncMock(), AsyncMock()
-    monkeypatch.setattr(fhir, "_cleanup_failed_artifact_scope", cleanup)
+    cleanup, validate, expose = AsyncMock(side_effect=cleanup_error), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(fhir, "_drain_artifact_scope_cleanup", cleanup)
     monkeypatch.setattr(copy_scope, "validate_snapshot", validate)
     monkeypatch.setattr(fhir, "_complete_profile_capacity_relation_class", expose)
-    with pytest.raises(OSError) as caught:
+    with pytest.raises(ExceptionGroup if cleanup_fails else OSError) as caught:
         await fhir._materialize_artifact_scope_tables(
             "synthetic", "run_" + "a" * 32, object(), frozenset(), projection=synthetic_admission
         )
-    assert caught.value is failure
-    cleanup.assert_awaited_once_with("synthetic", plan.created_tables, failure)
+    if cleanup_fails:
+        assert caught.value.exceptions == (failure, cleanup_error)
+        assert caught.value.__cause__ is failure
+    else:
+        assert caught.value is failure
+    cleanup.assert_awaited_once_with("synthetic", plan.created_tables)
     validate.assert_not_awaited()
     expose.assert_not_awaited()
 
@@ -387,15 +395,36 @@ async def test_late_npi_guard_runs_inside_completed_read(monkeypatch, has_candid
     assert events == ["issued_read", *(["indexed_npi_check"] * (1 if has_candidate else 2)), "read_finished"]
 
 
+def _artifact_scope_values():
+    return (
+        fhir._PROVIDER_DIRECTORY_ARTIFACT_RELATION_OVERRIDES.get(),
+        fhir._PROVIDER_DIRECTORY_ARTIFACT_DATASET_FENCE.get(),
+        fhir._PROVIDER_DIRECTORY_ARTIFACT_RESOURCE_SCOPE_SOURCE_IDS.get(),
+    )
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("body_fails", [False, True])
-async def test_prepared_family_drains_before_original_scratch_cleanup(synthetic_admission, monkeypatch, body_fails):
+@pytest.mark.parametrize(
+    "body_type, cleanup_type, propagated_type",
+    [
+        (None, None, None),
+        (ValueError, None, ValueError),
+        (ValueError, OSError, ExceptionGroup),
+        (asyncio.CancelledError, asyncio.CancelledError, asyncio.CancelledError),
+        (asyncio.CancelledError, OSError, BaseExceptionGroup),
+    ],
+)
+async def test_prepared_family_drains_before_original_scratch_cleanup(
+    synthetic_admission, monkeypatch, body_type, cleanup_type, propagated_type
+):
     from process import provider_directory_profile_scope_reads as reads
 
     events = []
     fence, resource = object(), SimpleNamespace(source_ids=("synthetic_source",))
     relation_by_root = {"synthetic_root": "synthetic_complete"}
-    failure = ValueError("synthetic read body failed")
+    body_error = body_type("synthetic read body failed") if body_type else None
+    cleanup_error = cleanup_type("synthetic scratch cleanup failed") if cleanup_type else None
+    original_scope = _artifact_scope_values()
 
     @asynccontextmanager
     async def prepared(directory, projection, relations, full_fence, resource_fence):
@@ -410,11 +439,14 @@ async def test_prepared_family_drains_before_original_scratch_cleanup(synthetic_
 
     async def cleanup(schema, tables):
         assert schema == "synthetic" and tables == ["synthetic_complete"]
+        assert _artifact_scope_values() == original_scope
         events.append("original_cleanup")
+        if cleanup_error is not None:
+            raise cleanup_error
 
     monkeypatch.setattr(reads, "prepared_scope", prepared)
     monkeypatch.setattr(
-        fhir, "_artifact_scope_relation_identities", AsyncMock(return_value={"synthetic_complete": (17, "r", "u")})
+        fhir, "_artifact_scope_relation_identities", AsyncMock(return_value={"synthetic_complete": object()})
     )
     monkeypatch.setattr(fhir, "_drain_artifact_scope_cleanup", cleanup)
 
@@ -424,13 +456,17 @@ async def test_prepared_family_drains_before_original_scratch_cleanup(synthetic_
         ) as selected:
             assert selected is fence
             events.append("reader_body")
-            if body_fails:
-                raise failure
+            if body_error is not None:
+                raise body_error
 
-    if body_fails:
-        with pytest.raises(ValueError) as caught:
+    if propagated_type is not None:
+        with pytest.raises(propagated_type) as caught:
             await run()
-        assert caught.value is failure
+        if isinstance(caught.value, BaseExceptionGroup):
+            assert caught.value.exceptions == (body_error, cleanup_error)
+            assert caught.value.__cause__ is body_error
+        else:
+            assert caught.value is body_error
     else:
         await run()
     assert events == ["family_verified", "reader_body", "children_drained", "original_cleanup"]

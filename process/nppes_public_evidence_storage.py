@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_generic_source_policy as source_policy
-from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
+from process.native_copy_cleanup import cleanup_interrupted_copy
 from process.nppes_isolated_catalog import _FIXED_CATALOG_SQL as CATALOG_SQL
 from process.nppes_public_evidence_prepared_chunks import chunk_payloads
 from process.nppes_public_evidence_rows import (
@@ -791,9 +791,8 @@ async def append_nppes_evidence_batch(database, candidate, buffers, *, cancel_ch
                     status = await connection.copy_records_to_table(
                         tables[root], schema_name=policy.schema, columns=ROOTS[root][1], records=prepared_records
                     )
-                except asyncio.CancelledError, TimeoutError:
-                    await close_interrupted_copy(connection)
-                    await invalidate_copy_owner(source_policy.source_copy_session(), connection)
+                except (asyncio.CancelledError, TimeoutError) as interruption:
+                    await cleanup_interrupted_copy(source_policy.source_copy_session(), connection, interruption)
                     raise
                 _require(status == f"COPY {len(prepared_records)}")
         await _invoke(cancel_check)

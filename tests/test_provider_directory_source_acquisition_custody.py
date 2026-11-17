@@ -143,245 +143,6 @@ def _plans():
     return plans_by_root, native_by_root
 
 
-@pytest.mark.parametrize("field", ["acquisition_oid", "work_oid", "resource_oid", "parent_oid", "work_parent_oid"])
-def test_practitioner_plan_requires_each_original_or_current_oid(field):
-    plans, roots = _plans()
-    custody._require_migration_plans(plans, roots)
-    custody._require_practitioner_migration_plan(plans[custody.METADATA_ROOTS[0]], roots)
-    plans[custody.METADATA_ROOTS[0]][0][field] += 1
-    with pytest.raises(ValueError, match="practitioner_migration_changed"):
-        custody._require_migration_plans(plans, roots)
-    with pytest.raises(ValueError, match="practitioner_migration_changed"):
-        custody._require_practitioner_migration_plan(plans[custody.METADATA_ROOTS[0]], roots)
-
-
-@pytest.mark.parametrize("plan", custody.METADATA_ROOTS)
-def test_migration_metadata_requires_the_exact_completed_singleton(plan):
-    plans, roots = _plans()
-    plans[plan].append(deepcopy(plans[plan][0]))
-    with pytest.raises(ValueError, match="migration_"):
-        custody._require_migration_plans(plans, roots)
-
-
-def _plan_capture():
-    plans, roots = _plans()
-    for history in custody.HISTORY_ROOTS:
-        roots[history].update(partition_bound=None, parent_oid=None)
-
-    async def fetch(query):
-        root = next(root for root in custody.METADATA_ROOTS if root in query)
-        return [{"body": json.dumps(plan)} for plan in plans[root]]
-
-    connection = SimpleNamespace(fetch=AsyncMock(side_effect=fetch), fetchval=AsyncMock(return_value=True))
-    arguments = (
-        connection,
-        SimpleNamespace(schema="snapshot_schema"),
-        roots,
-        {root: roots[root]["oid"] for root in custody.BULK_ROOTS},
-        {root: {} for root in custody.BULK_ROOTS},
-    )
-    return arguments, plans
-
-
-@pytest.mark.asyncio
-async def test_capture_casts_only_practitioner_oids():
-    arguments, plans = _plan_capture()
-    assert await custody._capture_history_plans(*arguments) == plans
-    queries = [call.args[0] for call in arguments[0].fetch.await_args_list]
-    practitioner, rooted = queries
-    assert practitioner.startswith("SELECT to_jsonb(r) || jsonb_build_object(")
-    for field in ("acquisition_oid", "work_oid", "resource_oid", "parent_oid", "work_parent_oid"):
-        assert practitioner.count("'" + field + "',r." + field + "::bigint") == 1
-    assert practitioner.count("::bigint") == 5
-    assert rooted == 'SELECT to_jsonb(r) AS body FROM "snapshot_schema"."pdrg_storage_migration" r'
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["extra", "changed_oid", "incomplete"])
-async def test_capture_keeps_strict_plan_refusals(change):
-    arguments, plans = _plan_capture()
-    practitioner = plans[custody.METADATA_ROOTS[0]][0]
-    if change == "extra":
-        practitioner["unexpected"] = True
-    elif change == "changed_oid":
-        practitioner["parent_oid"] += 1
-    else:
-        practitioner["work_parent_oid"] = None
-    with pytest.raises(ValueError, match="practitioner_migration_changed"):
-        await custody._capture_history_plans(*arguments)
-
-
-@pytest.mark.parametrize("field", ["acquisition_oid", "work_oid", "resource_oid", "parent_oid", "work_parent_oid"])
-def test_plan_gate_requires_native_integers(field):
-    plans, roots = _plans()
-    practitioner = plans[custody.METADATA_ROOTS[0]][0]
-    practitioner[field] = str(practitioner[field])
-    with pytest.raises(ValueError, match="practitioner_migration_changed"):
-        custody._require_migration_plans(plans, roots)
-
-
-def _native_member(root, acquisition, oid=500):
-    return dict(
-        root=root,
-        name=custody._candidate_name(root, acquisition),
-        oid=oid,
-        acquisition_id=acquisition,
-        parent_oid=None,
-        bounds=None,
-        phase="loading",
-        kind="r",
-        persistence="p",
-    )
-
-
-def _members(root, acquisition, roots):
-    group = custody.BULK_ROOTS[:2] if root in custody.BULK_ROOTS[:2] else custody.BULK_ROOTS[2:]
-    members = [_native_member(parent, acquisition, oid=500 + position) for position, parent in enumerate(group)]
-    for member in members:
-        member.update(parent_oid=roots[member["root"]]["oid"], bounds=[acquisition], phase="attached")
-    return members
-
-
-@pytest.mark.parametrize("root", custody.BULK_ROOTS)
-def test_private_candidate_name_binds_exact_protocol_identity(root):
-    _, roots = _plans()
-    acquisition = ("pdufpa_" if root in custody.BULK_ROOTS[:2] else "pdrga_") + "1" * 48
-    members = _members(root, acquisition, roots)
-    member = next(member for member in members if member["root"] == root)
-    acquisitions_by_root = {parent: {acquisition: "building"} for parent in custody.BULK_ROOTS}
-    custody._require_family_members(roots, members, acquisitions_by_root)
-    member["name"] = custody._candidate_name(root, acquisition[:-1] + "2")
-    with pytest.raises(ValueError, match="family_member_changed"):
-        custody._require_family_members(roots, members, acquisitions_by_root)
-
-
-@pytest.mark.parametrize(
-    "field,value,code",
-    [
-        ("oid", 100, "family_parent_changed"),
-        ("parent_oid", 999, "family_parent_changed"),
-        ("bounds", ["other"], "family_phase_changed"),
-        ("kind", "f", "family_member_changed"),
-        ("persistence", "t", "family_member_changed"),
-    ],
-)
-def test_candidate_substitution_never_becomes_family_membership(field, value, code):
-    _, roots = _plans()
-    root = custody.BULK_ROOTS[0]
-    acquisition = "pdufpa_" + "1" * 48
-    member = _native_member(root, acquisition)
-    member[field] = value
-    with pytest.raises(ValueError, match=code):
-        custody._require_family_members(roots, [member], {root: {acquisition: "building"}})
-
-
-def test_duplicate_candidate_scope_or_oid_is_rejected():
-    _, roots = _plans()
-    root, acquisition = custody.BULK_ROOTS[0], "pdufpa_" + "1" * 48
-    first = _native_member(root, acquisition)
-    second = _native_member(root, acquisition, oid=501)
-    with pytest.raises(ValueError, match="family_scope_reused"):
-        custody._require_family_members(roots, [first, second], {root: {acquisition: "building"}})
-
-
-def test_loading_work_and_attached_rooted_group_have_distinct_protocol_shapes():
-    _, roots = _plans()
-    acquisition = "pdufpa_" + "1" * 48
-    work = _native_member(custody.BULK_ROOTS[0], acquisition)
-    custody._require_family_members(roots, [work], {custody.BULK_ROOTS[0]: {acquisition: "building"}})
-    work["phase"] = "attached"
-    with pytest.raises(ValueError, match="family_phase_changed"):
-        custody._require_family_members(roots, [work], {custody.BULK_ROOTS[0]: {acquisition: "building"}})
-    acquisition = "pdrga_" + "1" * 48
-    members = _members(custody.BULK_ROOTS[2], acquisition, roots)
-    acquisitions_by_root = {parent: {acquisition: "building"} for parent in custody.BULK_ROOTS[2:]}
-    with pytest.raises(ValueError, match="family_group_incomplete"):
-        custody._require_family_members(roots, members[:-1], acquisitions_by_root)
-
-
-def _foreign_graph():
-    contracts = custody._foreign_contracts()
-    native_by_root = {}
-    for contract in contracts.values():
-        for field, names in (("child", contract["columns"]), ("parent", contract["parent_columns"])):
-            native = native_by_root.setdefault(
-                contract[field], dict(oid=100 + len(native_by_root), owner=17, columns=[])
-            )
-            native["columns"].extend(name for name in names if name not in native["columns"])
-    edges = []
-    for name, contract in contracts.items():
-        child, parent = native_by_root[contract["child"]], native_by_root[contract["parent"]]
-        edges.append(
-            dict(
-                child=[child["oid"], "snapshot_schema", contract["child"], 17],
-                parent=[parent["oid"], "snapshot_schema", contract["parent"], 17],
-                constraint=dict(
-                    conname=name,
-                    conrelid=str(child["oid"]),
-                    confrelid=str(parent["oid"]),
-                    conkey=[child["columns"].index(column) + 1 for column in contract["columns"]],
-                    confkey=[parent["columns"].index(column) + 1 for column in contract["parent_columns"]],
-                    confmatchtype="s",
-                    confupdtype="a",
-                    confdeltype="a",
-                    condeferrable=contract["deferred"],
-                    condeferred=contract["initially_deferred"],
-                    convalidated=True,
-                    conenforced=True,
-                    conparentid="0",
-                ),
-            )
-        )
-    return native_by_root, edges
-
-
-def test_control_fk_graph_preserves_api_and_native_keys_without_bulk_ri():
-    roots, edges = _foreign_graph()
-    custody._require_foreign_graph(edges, roots, "snapshot_schema", owner=17, builder=18)
-    assert "provider_directory_api_endpoint" in roots
-    assert not any(edge["child"][2] in custody.BULK_ROOTS for edge in edges)
-    assert len(edges) == len(custody._foreign_contracts())
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("confkey", [999]),
-        ("confdeltype", "c"),
-        ("convalidated", False),
-        ("conenforced", False),
-        ("conparentid", "41"),
-        ("condeferrable", "false"),
-    ],
-)
-def test_foreign_contract_drift_refuses_before_adoption(field, value):
-    roots, edges = _foreign_graph()
-    edges[0]["constraint"][field] = value
-    with pytest.raises(ValueError, match="foreign_contract_changed"):
-        custody._require_foreign_graph(edges, roots, "snapshot_schema", owner=17, builder=18)
-
-
-def test_unknown_incoming_fk_cannot_become_a_protected_owner_allowlist():
-    roots, edges = _foreign_graph()
-    unknown = deepcopy(edges[0])
-    unknown["constraint"]["conname"] = "unrelated_incoming_constraint"
-    unknown["child"] = [999, "snapshot_schema", "unrelated_table", 17]
-    with pytest.raises(ValueError, match="foreign_scope_changed"):
-        custody._require_foreign_graph([*edges, unknown], roots, "snapshot_schema", owner=17, builder=18)
-
-
-def test_known_external_parent_must_already_have_protected_custody():
-    roots, edges = _foreign_graph()
-    external = "provider_directory_endpoint_dataset"
-    roots[external]["owner"] = 18
-    for edge in edges:
-        for field in ("child", "parent"):
-            if edge[field][2] == external:
-                edge[field][3] = 18
-    with pytest.raises(ValueError, match="foreign_identity_changed"):
-        custody._require_foreign_graph(edges, roots, "snapshot_schema", owner=17, builder=18, legacy=True)
-
-
 @pytest.mark.parametrize("root", custody.ACQUISITION_ROOTS)
 def test_expected_expression_table_has_no_native_defaults_hooks_or_data(root):
     model = custody._models()[root]
@@ -413,24 +174,6 @@ def test_native_history_scope_requires_complete_exact_safe_bound(values):
     custody._require_acquisition_scope(_normalized_expression("CHECK (" + expression + ")"), values)
     with pytest.raises(ValueError, match="scope_expression_changed"):
         custody._require_acquisition_scope("checktrue", values)
-
-
-def test_equal_check_text_cannot_mask_a_substituted_function_oid():
-    root = custody.ACQUISITION_ROOTS[2]
-    entry_by_field = dict(
-        name=root,
-        root=root,
-        catalog=dict(constraints=[dict(oid="41", conname="fixed", contype="c", constraint_definition="CHECK (true)")]),
-        dependencies=[dict(object_kind="pg_constraint", objid=41, refclassid=1255, refobjid=51)],
-    )
-    expected_by_root = {
-        root: {"fixed": "check(true)"},
-        "_dependencies": {root: [dict(conname="fixed", refclassid=1255, refobjid=51)]},
-    }
-    custody._require_relation_checks(entry_by_field, expected_by_root)
-    entry_by_field["dependencies"][0]["refobjid"] = 52
-    with pytest.raises(ValueError, match="check_dependency_changed"):
-        custody._require_relation_checks(entry_by_field, expected_by_root)
 
 
 _PRAC_WORK = "pd_uhc_flex_practitioner_work_guard"
@@ -717,34 +460,6 @@ def test_metadata_hooks_keep_exact_fences(root, name, function, arguments):
     assert custody._root_hook_contracts()[custody.METADATA_ROOTS[root]] == {name: (function, 62, arguments, None, ())}
 
 
-@pytest.mark.asyncio
-async def test_loading_work_captures_no_hooks(monkeypatch):
-    root, name = custody.BULK_ROOTS[0], "pd_uhc_flex_pw_" + "1" * 40
-    native_by_field = dict(relname=name, oid="71", relowner="17", relispartition=False)
-    catalog_by_field = dict(classes=[native_by_field], triggers=None, attributes=[])
-    connection = SimpleNamespace(
-        fetchval=AsyncMock(return_value=json.dumps(catalog_by_field)),
-        fetch=AsyncMock(return_value=_columns(custody._models()[root])),
-    )
-    for function in ("_require_catalog_shape", "_require_defaults", "_require_relation_access"):
-        monkeypatch.setattr(custody, function, lambda *args, **kwargs: None)
-    monkeypatch.setattr(custody, "_require_family_indexes", AsyncMock())
-    monkeypatch.setattr(custody, "_capture_expression_type", AsyncMock(return_value=([], {})))
-    captured = await custody._capture_family_relation(
-        connection,
-        SimpleNamespace(schema="snapshot_schema"),
-        name,
-        root,
-        dict(roles=dict(owner=17, builder=18), functions={}),
-        legacy=True,
-        member=dict(phase="loading"),
-    )
-    assert captured["loading"] is True and captured["catalog"]["triggers"] is None
-    custody._require_family_indexes.assert_awaited_once()
-    assert custody._require_family_indexes.await_args.args[-1] is True
-    assert connection.fetch.await_count == 1
-
-
 @pytest.mark.parametrize(
     "field,changed_field",
     [
@@ -779,60 +494,9 @@ def test_unexpected_hook_names_still_refuse(change):
         custody._require_hooks(catalog, contracts, functions)
 
 
-def _joint_adoption_family(monkeypatch, parent="provider_directory_source", schema="snapshot_schema"):
-    from process import provider_directory_source_cohort_custody as cohort
-
-    monkeypatch.setattr(cohort, "require_cohort_adoption_delta", lambda *_args: None)
-    root = "provider_directory_rooted_graph_acquisition"
-    before_by_field = dict(
-        schema="snapshot_schema",
-        roots={root: {"owner": 17}},
-        members=[],
-        relations={},
-        cohort={"relations": {}},
-        foreign=[
-            dict(
-                child=[101, "snapshot_schema", root, 17],
-                parent=[102, schema, parent, 17],
-                constraint={"oid": "103", "conname": "reference_fkey"},
-            )
-        ],
-    )
-    after_by_field = deepcopy(before_by_field)
-    after_by_field["roots"][root]["owner"] = 23
-    after_by_field["foreign"][0]["child"][3] = after_by_field["foreign"][0]["parent"][3] = 23
-    return before_by_field, after_by_field
-
-
-@pytest.mark.parametrize("parent", ["provider_directory_source", "provider_directory_api_endpoint"])
-def test_joint_cut_preserves_control_parent_identity_with_new_owner(monkeypatch, parent):
-    before, after = _joint_adoption_family(monkeypatch, parent)
-    custody.require_source_acquisition_delta(before, after, {"owner": 23}, {})
-
-
-@pytest.mark.parametrize(
-    "change", ["foreign_schema", "unrelated_parent", "parent_oid", "child_oid", "constraint", "wrong_owner"]
-)
-def test_joint_cut_refuses_unrelated_foreign_parent_changes(monkeypatch, change):
-    parent = "unrelated_parent" if change == "unrelated_parent" else "provider_directory_source"
-    schema = "other_schema" if change == "foreign_schema" else "snapshot_schema"
-    before, after = _joint_adoption_family(monkeypatch, parent, schema)
-    edge = after["foreign"][0]
-    if change in {"parent_oid", "child_oid"}:
-        edge[change.removesuffix("_oid")][0] = 999
-    elif change == "constraint":
-        edge["constraint"]["conname"] = "other_fkey"
-    elif change == "wrong_owner":
-        edge["parent"][3] = 29
-    with pytest.raises(ValueError, match="adoption_family_changed"):
-        custody.require_source_acquisition_delta(before, after, {"owner": 23}, {})
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("crossed_schema", [False, True])
-async def test_dataset_plan_preserves_relationships_without_owner_hook(monkeypatch, crossed_schema):
+@pytest.mark.parametrize("damage", [None, "schema", "missing", "duplicate"])
+def test_dataset_plan_requires_complete_logical_relationships(damage):
     from db.migration_provider_dataset_online import _expected_bulk_relationships
-    from process import provider_directory_generic_source_provision as provision
 
     plan_by_field = {
         "relationships": [
@@ -849,25 +513,14 @@ async def test_dataset_plan_preserves_relationships_without_owner_hook(monkeypat
             )
         ]
     }
-    if crossed_schema:
+    if damage == "schema":
         plan_by_field["relationships"][0]["target_schema"] = "unselected_schema"
-    monkeypatch.setattr(provision, "_completed_legacy_dataset_plan", AsyncMock(return_value=plan_by_field))
-    catalog_by_field = {
-        "classes": [{"relname": "pd_dataset_migration_plan", "relowner": {"copied": "opaque"}}],
-        "triggers": None,
-    }
-    connection = SimpleNamespace(fetchval=AsyncMock(return_value=catalog_by_field))
-    if crossed_schema:
+    elif damage == "missing":
+        plan_by_field["relationships"].pop()
+    elif damage == "duplicate":
+        plan_by_field["relationships"].append(dict(plan_by_field["relationships"][0]))
+    if damage:
         with pytest.raises(ValueError, match="dataset_relationships_changed"):
-            await custody._capture_dataset_plan(
-                connection,
-                SimpleNamespace(schema="snapshot_schema"),
-                {"roles": {"owner": 17, "builder": 18}, "functions": {}},
-            )
-        connection.fetchval.assert_not_awaited()
+            custody._require_dataset_relationships(plan_by_field, "snapshot_schema")
     else:
-        assert await custody._capture_dataset_plan(
-            connection,
-            SimpleNamespace(schema="snapshot_schema"),
-            {"roles": {"owner": 17, "builder": 18}, "functions": {}},
-        ) == {"plan": plan_by_field, "catalog": catalog_by_field}
+        custody._require_dataset_relationships(plan_by_field, "snapshot_schema")

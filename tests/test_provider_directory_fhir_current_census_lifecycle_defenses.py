@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import importlib
 import ssl
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -14,6 +14,7 @@ import pytest
 
 from process.provider_directory_fhir_census_binding import (
     CurrentVersionCensusContract,
+    current_version_census_count_url,
 )
 from process.provider_directory_fhir_census_contract import (
     CURRENT_VERSION_CENSUS_CONTRACT_FIELD,
@@ -24,7 +25,6 @@ from process.provider_directory_fhir_census_execution import (
     current_version_census_checkpoint_proof,
     current_version_census_initial_proof,
 )
-
 
 importer = importlib.import_module("process.provider_directory_fhir")
 BASE = "https://directory.example.test/fhir"
@@ -75,10 +75,7 @@ def _start_url() -> str:
 
 
 def _cursor_url(offset: int, *, origin: str = BASE) -> str:
-    return (
-        f"{origin}?_getpages=opaque&_getpagesoffset={offset}"
-        "&_count=250&_pretty=true"
-    )
+    return f"{origin}?_getpages=opaque&_getpagesoffset={offset}&_count=250&_pretty=true"
 
 
 def _count_bundle(total: int) -> dict[str, object]:
@@ -98,9 +95,7 @@ def _resource_bundle(
         "entry": [
             {
                 "fullUrl": (
-                    f"{BASE}/Organization/{resource_id}"
-                    if resource_id is not None
-                    else f"{BASE}/Organization"
+                    f"{BASE}/Organization/{resource_id}" if resource_id is not None else f"{BASE}/Organization"
                 ),
                 "resource": {
                     "resourceType": "Organization",
@@ -166,7 +161,9 @@ async def _run_acquisition(
     spies: _AcquisitionSpies,
     *,
     cancel_ctx: dict[str, object] | None = None,
+    checkpoint: importer.PaginationCheckpointContext | None = None,
 ) -> importer.ResourceFetchResult | None:
+    checkpoint = checkpoint or _checkpoint_context()
     return await importer._fetch_resource_rows(
         _source_record(),
         "Organization",
@@ -174,12 +171,12 @@ async def _run_acquisition(
         page_limit=0,
         page_count=250,
         timeout=3,
-        run_id="run-1",
+        run_id=checkpoint.owner_run_id,
         row_batch_handler=spies.row_write,
         row_batch_size=100,
         retain_rows=False,
         cancel_ctx=cancel_ctx,
-        pagination_checkpoint=_checkpoint_context(),
+        pagination_checkpoint=checkpoint,
     )
 
 
@@ -256,6 +253,47 @@ async def test_hostile_identity_bound_resume_is_rejected_before_io(monkeypatch):
         spies.row_write,
     ):
         operation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_expired_census_resume_waits_for_a_new_precount(monkeypatch):
+    """A retry must acquire a valid pre-count before restarting page traversal."""
+    cursor = _cursor_url(250)
+    checkpoint = replace(_checkpoint_context(), owner_run_id="run-2", retry_of_run_id="run-1", lineage_verified=True)
+    resume_state = replace(
+        _pristine_resume(),
+        next_url=cursor,
+        pages_processed=1,
+        rows_processed=1,
+        resumed=True,
+        completeness=current_version_census_checkpoint_proof(
+            current_version_census_initial_proof(_contract(), "Organization", 500, expected_page_count=250),
+            pages_processed=1,
+            rows_processed=1,
+            page_entry_count=1,
+            expected_page_count=250,
+        ),
+    )
+    spies = _install_acquisition_spies(monkeypatch, resume_state, ((410, None, None, 1), (503, None, None, 1)))
+    reset = AsyncMock()
+    monkeypatch.setattr(importer, "_reset_pagination_checkpoint", reset)
+
+    fetch_result = await _run_acquisition(spies, checkpoint=checkpoint)
+
+    assert fetch_result is not None
+    assert fetch_result.error == f"{importer.CURRENT_VERSION_CENSUS_RETRYABLE_ERROR}:pre_census_http_503"
+    assert fetch_result.complete is False and fetch_result.next_url_remaining
+    assert fetch_result.retry_not_before is not None
+    assert (fetch_result.pages_fetched, fetch_result.rows_fetched, fetch_result.rows_written) == (0, 0, 0)
+    assert [request.args[1] for request in spies.fetch.await_args_list] == [
+        cursor,
+        current_version_census_count_url(_start_url()),
+    ]
+    reset.assert_awaited_once()
+    assert reset.await_args.args[:3] == (checkpoint, "Organization", _start_url())
+    spies.row_write.assert_not_awaited()
+    spies.checkpoint_write.assert_not_awaited()
+    spies.proof_write.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -421,9 +459,7 @@ def test_exact_metadata_candidates_ignore_untrusted_declared_origins():
     source_record["metadata_json"].update(
         {
             "metadata_url": "https://untrusted.example.test/metadata",
-            "provider_directory_confirmed_metadata_url": (
-                "https://alternate.example.test/metadata"
-            ),
+            "provider_directory_confirmed_metadata_url": ("https://alternate.example.test/metadata"),
         }
     )
     source_record["endpoint_organization"] = "https://endpoint.example.test/Organization"

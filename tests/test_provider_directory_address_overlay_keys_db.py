@@ -12,25 +12,15 @@ from tests.test_provider_directory_practitioner_address_overlay_db import (
     _create_fixture_tables,
     _install_canonical_functions,
     _seed_cms_role_location_rows,
-    _temporary_schema,
 )
 
 importer = importlib.import_module("process.provider_directory_fhir")
 overlay_keys = importlib.import_module("process.provider_directory_address_overlay_keys")
-address_canon = importlib.import_module("process.ext.address_canon")
 
 PUBLISHED_ROWS_SQL = (
     "SELECT source_record_id, address_key::text, first_line, city_name, state_code, postal_code "
     'FROM "{schema}"."{stage}" ORDER BY source_record_id'
 )
-
-
-def _python_location_batch(addresses):
-    """Stand in for the native batch with the parity-tested Python key."""
-    return [
-        (str(address_key) if (address_key := address_canon.address_key_v1(*address)) else None, None, None)
-        for address in addresses
-    ]
 
 
 async def _seed_affiliation(database, schema_name):
@@ -104,61 +94,34 @@ async def _seed_sql_keyed_stage(database, schema_name, components, scope_by_name
         )
 
 
-def _recorded_batch_key_tables(monkeypatch, database):
-    """Batch-key on this database in two-row pages and record each key table's owner."""
-    native_batch = overlay_keys._native_location_batch(importer)
-    key_tables = []
-    stage_table_name = importer._address_overlay_stage_table_name
-
-    def owned_key_table(run_id):
-        key_tables.append((run_id, stage_table_name(run_id)))
-        return key_tables[-1][1]
-
-    monkeypatch.setattr(importer, "_address_overlay_stage_table_name", owned_key_table)
-    monkeypatch.setattr(importer, "db", database)
-    monkeypatch.setattr(overlay_keys, "_native_location_batch", lambda _fhir: native_batch or _python_location_batch)
-    monkeypatch.setattr(overlay_keys, "LOCATION_KEY_PAGE_ROWS", 2)
-    return key_tables
-
-
 @pytest.mark.asyncio
 async def test_batch_keyed_locations_publish_the_same_overlay_rows(monkeypatch):
-    """Keying Locations once in batches must not change one published row."""
+    """Compare scoped keys and scratch cleanup through the prepared native batch."""
+    from tests import provider_directory_address_batch_support as support
 
-    async with _temporary_schema(monkeypatch) as (database, schema_name):
-        components = ("practitioner_role", "organization_affiliation")
+    async with support.location_overlay_fixture(monkeypatch) as (database, schema_name, components):
         scope_by_name = {"source_ids": ["cms-npd"]}
-        await _seed_sql_keyed_stage(database, schema_name, components, scope_by_name)
-        key_tables = _recorded_batch_key_tables(monkeypatch, database)
-        step_messages = []
+        stage_table_name = importer._address_overlay_stage_table_name
+        owner_runs = []
 
-        async def record_step(*, message):
-            step_messages.append(message)
+        def remember_stage_owner(run_id):
+            owner_runs.append(run_id)
+            return stage_table_name(run_id)
 
-        with overlay_keys.build_scope("run-control", record_step):
-            inserted_by_component, _seconds = await overlay_keys.insert_components(
-                importer, schema_name, "batch_stage", None, ["cms-npd"], scope_by_name, components
-            )
+        monkeypatch.setattr(importer, "_address_overlay_stage_table_name", remember_stage_owner)
+        with overlay_keys.build_scope("run-control", None):
+            async with support.batch.scope(importer, schema_name, None, ["cms-npd"], components):
+                inserted_by_component, _seconds = await overlay_keys.insert_components(
+                    importer, schema_name, "batch_stage", None, ["cms-npd"], scope_by_name, components
+                )
 
         assert inserted_by_component == {"practitioner_role": 4, "organization_affiliation": 4}
-        # The double-spaced Location is batch keyed now that SQL normalizes spacing too; the Unicode-space
-        # and control-character Locations stay out of the batch and publish through the SQL key.
-        assert "keyed locations rows=4" in step_messages[0]
-        # The control run owns the key table although the build's query scope has no run id.
-        assert key_tables[0][0] == "run-control"
-        assert (
-            key_tables[0][1].rsplit("_", 1)[-1].startswith(importer._address_overlay_stage_owner_token("run-control"))
-        )
+        assert owner_runs[:2] == ["run-control", "run-control"]
         batch_rows = await database.all(PUBLISHED_ROWS_SQL.format(schema=schema_name, stage="batch_stage"))
         sql_rows = await database.all(PUBLISHED_ROWS_SQL.format(schema=schema_name, stage="sql_stage"))
         assert list(map(tuple, batch_rows)) == list(map(tuple, sql_rows))
         assert len(batch_rows) == 8 and all(published[1] for published in batch_rows)
-        leftover_tables = await database.scalar(
-            "SELECT count(*) FROM pg_tables WHERE schemaname = :schema_name AND tablename LIKE :stage_pattern",
-            schema_name=schema_name,
-            stage_pattern="provider_directory_address_overlay_stage%",
-        )
-        assert leftover_tables == 0
+        assert await support.remaining_batch_tables(database, schema_name) == 0
 
 
 @pytest.mark.asyncio
@@ -206,39 +169,3 @@ async def _publish_sql_keyed_rows(database, schema_name, stage_name, components,
             **scope_by_name,
         )
     return list(map(tuple, await database.all(PUBLISHED_ROWS_SQL.format(schema=schema_name, stage=stage_name))))
-
-
-@pytest.mark.asyncio
-async def test_location_changed_after_key_staging_keeps_the_sql_key(monkeypatch):
-    """A Location updated between key staging and the inserts must not reuse its staged key."""
-
-    async with _temporary_schema(monkeypatch) as (database, schema_name):
-        components = ("practitioner_role", "organization_affiliation")
-        scope_by_name = {"source_ids": ["cms-npd"]}
-        await _seed_sql_keyed_stage(database, schema_name, components, scope_by_name)
-        _recorded_batch_key_tables(monkeypatch, database)
-        stage_pages = overlay_keys._stage_location_key_pages
-
-        async def stage_then_move_location(*arguments):
-            keyed_count = await stage_pages(*arguments)
-            await database.status(
-                f'UPDATE "{schema_name}"."provider_directory_location" '
-                "SET first_line = '200 Oak Street' WHERE resource_id = 'physical'"
-            )
-            return keyed_count
-
-        monkeypatch.setattr(overlay_keys, "_stage_location_key_pages", stage_then_move_location)
-        with overlay_keys.build_scope("run-control", None):
-            await overlay_keys.insert_components(
-                importer, schema_name, "batch_stage", None, ["cms-npd"], scope_by_name, components
-            )
-
-        batch_rows = list(
-            map(tuple, await database.all(PUBLISHED_ROWS_SQL.format(schema=schema_name, stage="batch_stage")))
-        )
-        moved_rows = await _publish_sql_keyed_rows(database, schema_name, "sql_after_move", components, scope_by_name)
-        before_rows = list(
-            map(tuple, await database.all(PUBLISHED_ROWS_SQL.format(schema=schema_name, stage="sql_stage")))
-        )
-        assert batch_rows == moved_rows
-        assert batch_rows != before_rows

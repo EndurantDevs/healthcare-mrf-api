@@ -32,6 +32,7 @@ from process.registry_candidate_composition import (
     compose_registry_membership_candidate,
 )
 from process.registry_company_approval_fence import _fence_key
+from process.registry_named_preparation_records import PREPARATION, digest
 from process.registry_publication_queue import (
     RegistryReactivationCommand,
     claim_registry_publication_request,
@@ -1472,6 +1473,37 @@ async def test_source_publication_refuses_changed_review_pins_and_closure(source
     )
 
 
+async def test_source_publication_rejects_stale_named_validation_and_preserves_generation(source_publication):
+    history, _command, _actor, _queued, lease, preview = source_publication
+    fixture = history.fixture
+    connection, schema = fixture.connection, fixture.control_schema
+    candidate_id = UUID(preview["candidate_id"])
+    preparation_sql = f"SELECT state,claim_attempt,validation FROM {PREPARATION} WHERE preparation_id=$1"
+    prepared = await connection.fetchrow(preparation_sql, candidate_id)
+    assert prepared["state"] == "validated"
+    prior_rows = await _rollback_members(connection, history.second)
+    stale = json.loads(prepared["validation"])
+    stale["evidence"]["data"]["validation_sha256"] = "0" * 64
+    await connection.execute(
+        f"UPDATE {PREPARATION} SET validation=$2,validation_sha256=$3 WHERE preparation_id=$1",
+        candidate_id,
+        json.dumps(stale),
+        digest(stale),
+    )
+
+    with pytest.raises(ValueError, match="^Stored network data validation changed$"):
+        await _complete_source_publication(source_publication, _reactivation_authority([]))
+
+    current = await connection.fetchrow(preparation_sql, candidate_id)
+    assert (current["state"], current["claim_attempt"]) == ("validated", prepared["claim_attempt"])
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        assert await resolve_network_serving_manifest(connection, control_schema=schema) == history.second
+        assert await _rollback_members(connection, history.second) == prior_rows
+    status = await read_registry_publication_request(connection, lease["request_id"], control_schema=schema)
+    assert status["state"] == "running" and status["result"] is None
+    assert await connection.fetchval(f'SELECT count(*) FROM "{schema}".network_serving_manifest') == 2
+
+
 async def test_source_publication_competing_native_head_preserves_reviewed_ready_candidate(source_publication):
     history, _command, _actor, _queued, _lease, preview = source_publication
     fixture = history.fixture
@@ -1910,6 +1942,10 @@ async def test_source_preview_retained_legacy_result_and_closed_diff_validation(
     }
     execution._source_rollback_result(legacy_by_name, command, "completed")
     invalid_receipts = [
+        {"source_selection": {"mapped_rows": 1}},
+        {"source_selection": {"mapped_rows": True, "omitted_rows": 0}},
+        {"source_selection": {"mapped_rows": 2**53 - 1, "omitted_rows": 1}},
+        {"unresolved_rows": 1},
         {"diff_version": True},
         {"diff_version": 2},
         {"changes": True},

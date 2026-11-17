@@ -79,7 +79,7 @@ from process.mrf_address_publication import (
     validate_canonical_closure,
 )
 from process.mrf_publication_receipt import require_completed_publication
-from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner, native_model_copy_driver
+from process.native_copy_cleanup import cleanup_interrupted_copy, native_model_copy_driver
 from process.nucc_retention_read_view import require_nucc_unretained_rotation as require_nucc_unretained_rotation
 from process.provider_quality_parts.table_helpers import _index_name_for_table
 from process.reference_family_composition import (
@@ -1230,24 +1230,6 @@ def _validation_digest(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(b"reference-family-validation/v1\0" + _canonical_json(dict(payload))).hexdigest()
 
 
-def _validation_inventory(value: Mapping[str, Any], spec: ReferenceFamilySpec) -> tuple[tuple[str, int], ...]:
-    relation_values = value["relation_oids"]
-    if not isinstance(relation_values, list) or len(relation_values) != len(spec.table_names):
-        raise ReferenceFamilyArchiveError("reference family validation inventory is invalid")
-    relation_oids: list[tuple[str, int]] = []
-    for relation_value, expected_name in zip(relation_values, sorted(spec.table_names), strict=True):
-        if (
-            not isinstance(relation_value, list)
-            or len(relation_value) != 2
-            or relation_value[0] != expected_name
-            or type(relation_value[1]) is not int
-            or relation_value[1] <= 0
-        ):
-            raise ReferenceFamilyArchiveError("reference family validation inventory is invalid")
-        relation_oids.append((relation_value[0], relation_value[1]))
-    return tuple(relation_oids)
-
-
 def _validation_tables(value: Mapping[str, Any], spec: ReferenceFamilySpec) -> tuple[ReferenceTableReceipt, ...]:
     raw_tables = value["tables"]
     if not isinstance(raw_tables, list) or len(raw_tables) != len(spec.model_types):
@@ -1686,11 +1668,9 @@ async def native_copy_projection(session, query, *args, schema_name, table_name,
     ):
         raise ReferenceFamilyArchiveError("native model projection COPY bounds differ")
     driver = await _native_model_copy_driver(session, ("copy_from_query", "copy_to_table"))
-    try:
-        return await _copy_native_projection(driver, query, schema_name, table_name, columns, max_bytes, timeout, *args)
-    except asyncio.CancelledError, TimeoutError:
-        await invalidate_copy_owner(session, driver)
-        raise
+    return await _copy_native_projection(
+        (session, driver), query, schema_name, table_name, columns, max_bytes, timeout, *args
+    )
 
 
 async def _native_model_copy_driver(session, methods):
@@ -1726,8 +1706,9 @@ async def _capture_native_projection(driver, query, spool, max_bytes, deadline, 
     return status, accounting_by_field["copied_bytes"]
 
 
-async def _copy_native_projection(driver, query, schema_name, table_name, columns, max_bytes, timeout, *query_args):
+async def _copy_native_projection(transport, query, schema_name, table_name, columns, max_bytes, timeout, *query_args):
     """Keep sequential COPY OUT/IN inside one native deadline and caller-owned transaction."""
+    copy_owner, driver = transport
     with TemporaryFile(mode="w+b") as spool:
         try:
             async with asyncio.timeout(timeout) as deadline:
@@ -1745,8 +1726,8 @@ async def _copy_native_projection(driver, query, schema_name, table_name, column
                 )
                 if not isinstance(captured, str) or not re.fullmatch(r"COPY [0-9]+", captured) or captured != restored:
                     raise ReferenceFamilyArchiveError("native model projection COPY count differs")
-        except asyncio.CancelledError, TimeoutError:
-            await close_interrupted_copy(driver)
+        except (asyncio.CancelledError, TimeoutError) as interruption:
+            await cleanup_interrupted_copy(copy_owner, driver, interruption)
             raise
     return copied_bytes
 
@@ -2941,12 +2922,6 @@ async def _require_nucc_native_location(session, handoff, run):
         or _nucc_source_contract(handoff, run["params"]) != handoff["source_contract_sha256"]
     ):
         raise ReferenceFamilyArchiveError("NUCC native source or location differs")
-
-
-async def _nucc_native_publisher_owner(session):
-    """Return the existing configured administrative role name; native DDL enforces access."""
-    _require_transaction(session)
-    return model_family_roles()[0]
 
 
 async def protected_publisher_owner(session):

@@ -249,3 +249,57 @@ async def test_constructed_policy_cannot_authorize_source_custody():
         )
     connection.fetch.assert_not_awaited()
     connection.fetchrow.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observation", ["copied", "missing-header", "empty-binding", "wrong-release", "missing-child"])
+async def test_retained_fhir_source_binds_published_partition_names(monkeypatch, observation):
+    from process import network_fhir_source_custody as custody
+    from tests.test_registry_generic_accepted_capture import _published_binding
+
+    binding = _published_binding()
+    binding["auxiliary"] = {"phase": "published", "tables": {}, "sealed_sha256": "a" * 64}
+    release = "e" * 64
+    identity = binding["identity"]
+    identity["metadata"].update(source_ids=["cms-npd"], source_release={"vector_sha256": release})
+    header_by_field = {
+        "endpoint_id": identity["endpoint_id"],
+        "acquisition_root_run_id": identity["acquisition_root_run_id"],
+        "candidate_storage_json": binding,
+    }
+    source_pin = SimpleNamespace(
+        schema_name="source_example",
+        dataset_id=identity["dataset_id"],
+        endpoint_id=identity["endpoint_id"],
+        dataset_sha256="f" * 64,
+        release_id=release,
+    )
+    family_rows = []
+    for index, (root, table) in enumerate(binding["tables"].items(), 1):
+        family_rows.extend(
+            [{"relname": root, "oid": 4000 + index}, {"relname": table["name"], "parents": [4000 + index]}]
+        )
+    if observation == "missing-child":
+        family_rows.pop()
+    elif observation == "wrong-release":
+        source_pin.release_id = "0" * 64
+    elif observation == "empty-binding":
+        header_by_field["candidate_storage_json"] = {}
+    connection = SimpleNamespace(
+        fetchrow=AsyncMock(return_value=None if observation == "missing-header" else header_by_field)
+    )
+    monkeypatch.setattr(custody, "_generic_custody_family", AsyncMock(return_value=family_rows))
+    if observation == "copied":
+        selected = await custody._generic_partitioned_custody(
+            connection, source_pin, "source_owner", ("source_reader",)
+        )
+        assert selected["binding"] == binding and selected["family"] == family_rows
+        assert 'FROM "source_example"."provider_directory_endpoint_dataset"' in connection.fetchrow.call_args.args[0]
+        assert connection.fetchrow.call_args.args[1:] == (
+            source_pin.dataset_id,
+            source_pin.endpoint_id,
+            source_pin.dataset_sha256,
+        )
+    else:
+        with pytest.raises(custody.FHIRSourceCustodyError, match="^fhir_source_custody_unavailable$"):
+            await custody._generic_partitioned_custody(connection, source_pin, "source_owner", ("source_reader",))

@@ -18,7 +18,7 @@ import math
 import re
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
@@ -26,6 +26,7 @@ from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.schema import CreateIndex, CreateTable, MetaData
 
 from db import models
@@ -257,6 +258,7 @@ class NpiCutoverAuthority:
 
     package_id: str
     authority: str
+    stage_read_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -377,11 +379,17 @@ async def _bounded_catalog_work(session: Any):
     previous_statement = await _timeout_value(session, "statement_timeout")
     await _set_local_timeout(session, "lock_timeout", _LOCK_TIMEOUT)
     await _set_local_timeout(session, "statement_timeout", _CAPTURE_TIMEOUT)
+    should_restore_timeouts = True
     try:
         yield
+    except DBAPIError, asyncio.CancelledError:
+        # Transaction rollback restores SET LOCAL even when PostgreSQL rejects a command.
+        should_restore_timeouts = False
+        raise
     finally:
-        await _set_local_timeout(session, "lock_timeout", previous_lock)
-        await _set_local_timeout(session, "statement_timeout", previous_statement)
+        if should_restore_timeouts:
+            await _set_local_timeout(session, "lock_timeout", previous_lock)
+            await _set_local_timeout(session, "statement_timeout", previous_statement)
 
 
 async def _lock_family(
@@ -676,39 +684,6 @@ async def _lock_npi_canonical_source(session, schema, canonical_source_fence):
     await require_canonical_source_model(session, schema, lambda s, n: f"{_quoted(s)}.{_quoted(n)}")
 
 
-async def _bind_independent_stage_sequences(
-    session: Any,
-    *,
-    source_schema: str,
-    stage_schema: str,
-) -> None:
-    """Replace copied source defaults with stage-owned sequence dependencies."""
-
-    source_sequences = await _source_family_sequences(session, source_schema)
-    stage_oid = await _schema_oid(session, stage_schema)
-    stage_sequences_by_owner = {
-        (owner_table, owner_column): (sequence_name, sequence_oid)
-        for sequence_name, sequence_oid, owner_table, owner_column in await _owned_sequences(session, stage_oid)
-    }
-    for source_sequence_name, _source_sequence_oid, owner_table, owner_column in source_sequences:
-        stage_sequence_name = await _ensure_stage_owned_sequence(
-            session,
-            stage_schema=stage_schema,
-            source_sequence_name=source_sequence_name,
-            owner_table=owner_table,
-            owner_column=owner_column,
-            stage_sequences_by_owner=stage_sequences_by_owner,
-        )
-        await _advance_stage_sequence(
-            session,
-            stage_schema=stage_schema,
-            sequence_name=stage_sequence_name,
-            owner_table=owner_table,
-            owner_column=owner_column,
-        )
-    await _verify_stage_sequence_owners(session, stage_oid, source_sequences)
-
-
 async def _source_family_sequences(
     session: Any,
     source_schema: str,
@@ -759,9 +734,7 @@ async def _advance_stage_sequence(
 ) -> int | None:
     """Set one stage-owned sequence to its copied table's maximum value."""
 
-    maximum = await session.scalar(
-        text(f"SELECT max({_quoted(owner_column)})::bigint FROM {_quoted(stage_schema)}.{_quoted(owner_table)}")
-    )
+    maximum = await _stage_sequence_maximum(session, stage_schema, owner_table, owner_column)
     if maximum is not None:
         stage_sequence = f"{_quoted(stage_schema)}.{_quoted(sequence_name)}"
         await session.execute(
@@ -772,40 +745,37 @@ async def _advance_stage_sequence(
     return None
 
 
-async def _advance_and_verify_stage_sequences(
+async def _stage_sequence_maximum(session: Any, schema: str, table: str, column: str) -> int | None:
+    return await session.scalar(text(f"SELECT max({_quoted(column)})::bigint FROM {_quoted(schema)}.{_quoted(table)}"))
+
+
+async def _verify_stage_sequences(
     session: Any,
     ownership: NpiStageOwnership,
+    *,
+    align: bool = False,
 ) -> None:
-    """Align every exact owned sequence with its restored owner column."""
+    """Check sequence state, aligning it only while the builder can write."""
 
     observed_sequences = await _owned_sequences(session, ownership.schema_oid)
     if observed_sequences != ownership.sequence_oids:
         raise NpiResultArchiveError("NPI archive stage sequence ownership differs")
     for sequence_name, sequence_oid, owner_table, owner_column in observed_sequences:
-        maximum = await _advance_stage_sequence(
-            session,
-            stage_schema=ownership.schema_name,
-            sequence_name=sequence_name,
-            owner_table=owner_table,
-            owner_column=owner_column,
-        )
+        maximum = await _stage_sequence_maximum(session, ownership.schema_name, owner_table, owner_column)
         stage_sequence = f"{_quoted(ownership.schema_name)}.{_quoted(sequence_name)}"
+        expected_value, is_expected_called = maximum, maximum is not None
         if maximum is None:
-            minimum = await session.scalar(
+            expected_value = await session.scalar(
                 text("SELECT seqmin::bigint FROM pg_catalog.pg_sequence WHERE seqrelid=:sequence_oid"),
                 {"sequence_oid": sequence_oid},
             )
-            if type(minimum) is not int:
+            if type(expected_value) is not int:
                 raise NpiResultArchiveError("NPI archive stage sequence state is unavailable")
+        if align:
             await session.execute(
-                text(f"SELECT pg_catalog.setval('{stage_sequence}'::regclass,:minimum,false)"),
-                {"minimum": minimum},
+                text(f"SELECT pg_catalog.setval('{stage_sequence}'::regclass,:value,:called)"),
+                {"value": expected_value, "called": is_expected_called},
             )
-            expected_value = minimum
-            is_expected_called = False
-        else:
-            expected_value = maximum
-            is_expected_called = True
         state = (await session.execute(text(f"SELECT last_value::bigint, is_called FROM {stage_sequence}"))).one()
         if state != (expected_value, is_expected_called):
             raise NpiResultArchiveError("NPI archive stage sequence state differs")
@@ -887,7 +857,6 @@ async def _copy_source_family(session, capture, ownership, source_copy, deadline
             session, source_copy, query, stage_schema, model.__tablename__, columns, remaining_bytes, deadline
         )
     await complete_npi_restore(session, ownership)
-    await _advance_and_verify_stage_sequences(session, ownership)
     for model in npi_archive_models(canonical=capture.canonical):
         if model.__tablename__ == CANONICAL_TABLE:
             source_oid = await _relation_oid(session, capture.schema_name, "address_archive_v2")
@@ -1239,8 +1208,8 @@ async def cleanup_npi_stage(session: Any, ownership: NpiStageOwnership) -> None:
     )
     if not exists:
         return
-    async with _bounded_catalog_work(session):
-        async with session.begin_nested():
+    async with session.begin_nested():
+        async with _bounded_catalog_work(session):
             await _lock_family(
                 session,
                 ownership.schema_name,
@@ -1587,6 +1556,7 @@ async def complete_npi_restore(session: Any, ownership: NpiStageOwnership, *, np
         )
         if orphan is not False:
             raise NpiResultArchiveError("NPI restored child relationship differs")
+    await _verify_stage_sequences(session, ownership, align=True)
 
 
 async def validate_npi_stage(
@@ -1703,7 +1673,7 @@ async def prepare_npi_activation(
     if _SHA256.fullmatch(str(package_id)) is None:
         raise NpiResultArchiveError("NPI validation package identity is invalid")
     ownership = await verify_npi_stage_ownership(session, ownership)
-    await _advance_and_verify_stage_sequences(session, ownership)
+    await _verify_stage_sequences(session, ownership)
     tables = await _validate_stage_manifest(
         session,
         ownership,
@@ -1747,17 +1717,20 @@ async def _lock_and_verify_activation(
     session: Any,
     ownership: NpiStageOwnership,
     incumbent: NpiIncumbent,
+    *,
+    stage_read_only: bool = False,
 ) -> NpiStageOwnership:
+    lock_mode = "ACCESS SHARE" if stage_read_only else "ACCESS EXCLUSIVE"
     async with _bounded_catalog_work(session):
         await _lock_family(
             session,
             ownership.schema_name,
-            "ACCESS EXCLUSIVE",
+            lock_mode,
             names=npi_archive_names(canonical=_has_canonical(ownership)),
         )
         present_names = tuple(name for name, present in incumbent.relations if present)
         if present_names:
-            await _lock_family(session, incumbent.schema_name, "ACCESS EXCLUSIVE", names=present_names)
+            await _lock_family(session, incumbent.schema_name, lock_mode, names=present_names)
         ownership = await verify_npi_stage_ownership(session, ownership)
         if (
             tuple(
@@ -1896,16 +1869,19 @@ async def _activate_npi_relations(
     incumbent: NpiIncumbent,
     manifest: NpiResultManifest,
     validation: NpiValidationReceipt,
+    stage_read_only: bool = False,
 ) -> NpiActivationReceipt:
     await _preserve_npi_input_reads(session, ownership, incumbent)
-    await _remove_npi_clone_freeze(session, ownership)
-    await install_npi_stage_mutation_guards(
-        session,
-        schema_name=ownership.schema_name,
-        stage_tables=RELATION_NAMES,
-        function_schema_name=incumbent.schema_name,
-    )
-    predecessor_schema = await _rotate_relations(session, ownership, incumbent)
+    if not stage_read_only:
+        await _remove_npi_clone_freeze(session, ownership)
+        await install_npi_stage_mutation_guards(
+            session,
+            schema_name=ownership.schema_name,
+            stage_tables=RELATION_NAMES,
+            function_schema_name=incumbent.schema_name,
+        )
+    async with _bounded_catalog_work(session) if stage_read_only else nullcontext():
+        predecessor_schema = await _rotate_relations(session, ownership, incumbent)
     live_pairs = await _relation_pairs(
         session, incumbent.schema_name, npi_archive_names(canonical=_has_canonical(ownership))
     )
@@ -1975,8 +1951,10 @@ async def activate_validated_npi_stage(
         canonical=validated_manifest.contract in MODEL_CONTRACTS
     ):
         raise NpiResultArchiveError("NPI incumbent activation inventory differs")
-    ownership = await _lock_and_verify_activation(session, ownership, incumbent)
-    await _advance_and_verify_stage_sequences(session, ownership)
+    ownership = await _lock_and_verify_activation(
+        session, ownership, incumbent, stage_read_only=cutover.stage_read_only
+    )
+    await _verify_stage_sequences(session, ownership)
     current_authority = await read_npi_result_generation_authority(
         session,
         schema_name=incumbent.schema_name,
@@ -1996,6 +1974,7 @@ async def activate_validated_npi_stage(
         incumbent=incumbent,
         manifest=validated_manifest,
         validation=validation,
+        stage_read_only=cutover.stage_read_only,
     )
     await on_activated(session, receipt)
     return receipt

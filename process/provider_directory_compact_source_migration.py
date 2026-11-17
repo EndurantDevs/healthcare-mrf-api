@@ -16,7 +16,7 @@ from process import provider_directory_compact_source_storage as layout
 from process import provider_directory_generic_candidate as candidate_rows
 from process import provider_directory_generic_source_policy as policy_scope
 from process import provider_directory_generic_source_storage as storage
-from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
+from process.native_copy_cleanup import cleanup_interrupted_copy
 from process.provider_directory_source_storage_binding import NamedFHIRSourceStorage
 
 LOGGER = logging.getLogger(__name__)
@@ -318,9 +318,8 @@ async def _copy_segment(connection, policy, binding, keys):
             batch_ordinal=keys[0]["batch_ordinal"],
             row_start=keys[0]["row_ordinal"],
         )
-    except asyncio.CancelledError, TimeoutError:
-        await close_interrupted_copy(connection)
-        await invalidate_copy_owner(policy_scope.source_copy_session(), connection)
+    except (asyncio.CancelledError, TimeoutError) as interruption:
+        await cleanup_interrupted_copy(policy_scope.source_copy_session(), connection, interruption)
         raise
     await _verify_segment(connection, tables, binding, keys, observations)
     current_binding_by_field = {

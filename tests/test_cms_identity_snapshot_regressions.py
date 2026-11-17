@@ -761,12 +761,11 @@ async def test_doctors_apply_refuses_stale_authority_or_already_consumed_prepara
     with pytest.raises(RuntimeError, match=f"^{error}$"):
         await preparation.apply_prepared_cms_doctors_generation(prepared)
     apply.assert_not_awaited()
+    lock.assert_not_awaited()
     assert prepared.native_receipt is None and prepared.metrics == {} and prepared.context == {}
     if committed:
-        lock.assert_not_awaited()
         read.assert_not_awaited()
     else:
-        lock.assert_awaited_once_with(session, stage_cls, "mrf", "20260730", stage_read_only=True)
         read.assert_awaited_once_with(session, importer_id="cms-doctors", schema_name="mrf", lock=True)
 
 

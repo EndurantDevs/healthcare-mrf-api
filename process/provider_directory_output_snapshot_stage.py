@@ -216,11 +216,10 @@ async def copy_output_rows(directory, capability, stage, rows):
             )
             require_output(status == f"COPY {len(batch)}", "copy_incomplete")
             copied += len(batch)
-    except asyncio.CancelledError, TimeoutError:
-        from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
+    except (asyncio.CancelledError, TimeoutError) as interruption:
+        from process.native_copy_cleanup import cleanup_interrupted_copy
 
-        await close_interrupted_copy(capability.connection)
-        await invalidate_copy_owner(capability.session, capability.connection)
+        await cleanup_interrupted_copy(capability.session, capability.connection, interruption)
         raise
     return copied
 

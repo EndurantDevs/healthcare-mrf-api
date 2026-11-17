@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from db.plan_release_storage import storage_identifier, storage_relation
-from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
+from process.native_copy_cleanup import cleanup_interrupted_copy
 from process.provider_directory_generic_candidate import COPY_MAX_BYTES, COPY_MAX_ROWS, GenericCandidateError
 from process.provider_directory_generic_source_policy import bound_publisher, source_copy_session
 
@@ -339,9 +339,8 @@ async def copy_identity_rows_native(connection, session, schema, name, columns, 
 async def _copy_batch(connection, session, schema, name, columns, records):
     try:
         status = await connection.copy_records_to_table(name, schema_name=schema, columns=columns, records=records)
-    except asyncio.CancelledError, TimeoutError:
-        await close_interrupted_copy(connection)
-        await invalidate_copy_owner(session, connection)
+    except (asyncio.CancelledError, TimeoutError) as interruption:
+        await cleanup_interrupted_copy(session, connection, interruption)
         raise
     _require(status == f"COPY {len(records)}", "copy_incomplete")
     return len(records)

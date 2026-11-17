@@ -223,7 +223,6 @@ async def test_nucc_stage_cleanup_fences_active_runs_and_late_references(
         )
     )
     monkeypatch.setattr(archive, "_require_nucc_native_location", AsyncMock())
-    monkeypatch.setattr(archive, "_nucc_native_publisher_owner", AsyncMock(return_value=50))
     monkeypatch.setattr(archive, "_nucc_native_stage", AsyncMock(return_value=stage_by_field["stage"]))
     monkeypatch.setattr(archive, "_require_nucc_cleanup_custody", AsyncMock())
     check_handoff = AsyncMock()
