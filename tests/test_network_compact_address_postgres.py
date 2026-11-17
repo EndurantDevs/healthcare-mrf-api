@@ -94,6 +94,25 @@ async def test_shared_generations_keep_exact_offices(compact_db):
 
 
 @pytest.mark.asyncio
+async def test_empty_membership_page_does_not_scan_offices(compact_db):
+    db, layout = compact_db, compact_db.second_layout
+    relation = compact_address_relation_sql(layout, network_ids=(88,))
+    parameters = compact_address_parameters(layout) | {"_canonical_network_ids": [88]}
+    statement = text(f"EXPLAIN (ANALYZE, FORMAT JSON) SELECT npi FROM {relation} offices ORDER BY npi LIMIT 3")
+    async with db.engine.connect() as connection:
+        plan = (await connection.execute(statement, parameters)).scalar_one()
+    nodes = []
+    pending_nodes = [plan[0]["Plan"]]
+    while pending_nodes:
+        node = pending_nodes.pop()
+        nodes.append(node)
+        pending_nodes.extend(node.get("Plans", []))
+    assert any("One-Time Filter" in node for node in nodes)
+    offices = [node for node in nodes if node.get("Relation Name") == layout.base.table_name]
+    assert offices and all(node["Actual Loops"] == 0 for node in offices)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("component", ["base", "custom", "ref_map", "edge"])
 async def test_compact_raw_and_typed_reads_exclude_attached_child_rows(compact_db, component):
     db, layout = compact_db, compact_db.second_layout
@@ -165,12 +184,12 @@ async def test_columns_parameters_and_physical_fanout(compact_db):
     assert ":_canonical_network_ids" in raw
     selected = _membership_arms(layout, selected=True)
     assert "office." not in selected and "SELECT edge.location_key" in selected
-    assert "WHERE office.location_key IN (" + selected + ")" in raw
+    assert f"WHERE EXISTS ({selected}) AND office.location_key IN ({selected})" in raw
     assert "edge.location_key=office.location_key" in _membership_arms(layout, selected=False)
     for index, artifact in enumerate(layout.artifacts):
         assert artifact.candidate_id not in raw
         assert f":_compact_artifact_{index}" in raw
-        assert raw.count(f'"{artifact.schema_name}".network_office_edge') == 2
+        assert raw.count(f'"{artifact.schema_name}".network_office_edge') == 3
     assert set(compact_address_parameters(layout).values()) == {artifact.candidate_id for artifact in layout.artifacts}
     async with compact_db.engine.connect() as connection:
         await connection.execute(text("SET LOCAL enable_seqscan=off"))
@@ -192,7 +211,7 @@ async def test_selected_semijoin_preserves_correlated_reference_rows(compact_db)
                 "AND ref.network_id=ANY", "AND edge.location_key=office.location_key AND ref.network_id=ANY"
             )
             reference = current.replace(
-                "WHERE office.location_key IN (" + selected + ")",
+                f"WHERE EXISTS ({selected}) AND office.location_key IN ({selected})",
                 "WHERE EXISTS(SELECT 1 FROM (" + original + ") selected_membership)",
             )
             assert reference != current

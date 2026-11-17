@@ -3,7 +3,7 @@
 
 import json
 import re
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 import pytest
@@ -59,7 +59,7 @@ def test_lookup_preserves_ordinary_query():
     ordinary = compact.compact_address_relation_sql(layout, network_ids=(7, 42))
     lookup = compact.compact_address_relation_sql(layout, network_ids=(7, 42), location_lookup=True)
     separator = " WHERE office.location_key IN ("
-    assert ordinary.split(separator)[0] == lookup.split(separator)[0]
+    assert ordinary.split(" WHERE EXISTS (")[0] == lookup.split(separator)[0]
     assert "office." not in compact._membership_arms(layout, selected=True)
     assert "bucket_members" not in ordinary
     selected = compact._membership_arms(layout, selected=True, location_lookup=True)
@@ -79,6 +79,18 @@ def test_lookup_preserves_ordinary_query():
         )
 
 
+def test_global_selection_checks_memberships_once_before_scanning_offices():
+    layout = _layout()
+    selected = compact._membership_arms(layout, selected=True)
+    ordinary = compact.compact_address_relation_sql(layout, network_ids=(42,))
+    assert f" WHERE EXISTS ({selected}) AND office.location_key IN ({selected})" in ordinary
+    lookup = compact.compact_address_relation_sql(layout, network_ids=(42,), location_lookup=True)
+    assert f"EXISTS ({selected})" not in lookup
+    assert compact.compact_address_relation_sql(replace(layout, artifacts=()), network_ids=(42,)).endswith(
+        " WHERE FALSE)"
+    )
+
+
 @pytest.mark.parametrize("lookup", [None, 0, 1, "true", (), {}])
 def test_lookup_rejects_untyped_switch(lookup):
     for builder, options in (
@@ -92,7 +104,8 @@ def test_lookup_rejects_untyped_switch(lookup):
         scoped_address_relation_sql("mrf.entity_address_unified", location_lookup=lookup)
 
 
-def test_lookup_preserves_binds_columns_and_named_query_scope():
+@pytest.mark.parametrize("lookup_mode", [False, True])
+def test_lookup_preserves_binds_columns_and_named_query_scope(lookup_mode):
     layout = _layout()
     with network_address_read_scope(_lookup_manifest(layout), (7, 42)) as scope:
         cache_key = scoped_address_cache_key("same-query")
@@ -104,10 +117,10 @@ def test_lookup_preserves_binds_columns_and_named_query_scope():
             assert is_scoped_address_relation(relation) and provider_list_sql._is_unified_address_table(relation)
             assert nearby_row_tiebreaker(relation) == "a.location_key ASC"
         assert not is_scoped_address_relation(lookup + " ")
-        typed = compact.compact_address_selectable(layout, network_ids=(7, 42), location_lookup=True)
+        typed = compact.compact_address_selectable(layout, network_ids=(7, 42), location_lookup=lookup_mode)
         compiled = typed.element.compile(dialect=PGDialect_asyncpg())
         native, arguments = compact.compact_address_native_sql(
-            layout, network_ids=(7, 42), location_lookup=True, first_parameter=3
+            layout, network_ids=(7, 42), location_lookup=lookup_mode, first_parameter=3
         )
         assert arguments == tuple(compiled.params[name] for name in compiled.positiontup)
         assert "$1" not in native and "$2" not in native and "$3" in native
