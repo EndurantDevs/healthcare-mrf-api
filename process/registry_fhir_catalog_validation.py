@@ -143,15 +143,44 @@ def snapshot_inputs(snapshot):
     as_of = inputs_by_field["as_of"]
     if type(as_of) is not str or date.fromisoformat(as_of).isoformat() != as_of:
         _invalid("inputs_invalid")
+    accounting = snapshot.get("accounting_json") or {}
+    accounting = json.loads(accounting) if type(accounting) is str else accounting
+    native_inputs = snapshot.get("imported_source_inventory", accounting.get("imported_source_inventory"))
+    if native_inputs is not None:
+        if (
+            type(native_inputs) is not dict
+            or set(native_inputs) != {"contract", "token", "native_sources"}
+            or native_inputs["contract"] != "registry-imported-catalog-inputs-v1"
+            or type(native_inputs["native_sources"]) is not list
+            or len(native_inputs["native_sources"]) > 1000
+        ):
+            _invalid("inputs_invalid")
+        _digest(native_inputs["token"])
+        inputs_by_field["imported_source_inventory"] = native_inputs
     return inputs_by_field
 
 
 def metadata_generation(snapshot):
     """Hash semantic pins independently of the metadata candidate location."""
-    return hashlib.sha256(canonical_json(snapshot_inputs(snapshot)).encode()).hexdigest()
+    inputs = snapshot_inputs(snapshot)
+    native_inputs = inputs.get("imported_source_inventory")
+    if native_inputs is not None:
+        # Membership points back to this cohort; association fields cannot also define its content hash.
+        inputs.update(network_generation=None, manifest_sha256=None)
+    return hashlib.sha256(canonical_json(inputs).encode()).hexdigest()
 
 
 def _source_descriptor(document):
+    """Dispatch only explicit native descriptors; historical FHIR records keep their existing validator."""
+    from process.registry_native_network_catalog import is_native_catalog_source, validate_native_catalog_descriptor
+
+    if is_native_catalog_source(document):
+        return validate_native_catalog_descriptor(document)["coordinates"]
+    return _fhir_source_descriptor(document)
+
+
+def _fhir_source_descriptor(document):
+    """Validate the supported historical or named FHIR source data shape."""
     required_fields = {
         "coordinates",
         "profile",
@@ -438,12 +467,16 @@ _SET_SQL = """WITH observation_counts AS (
  SELECT * FROM jsonb_to_recordset($3::jsonb) AS selected(source_generation text,source_id text,status text)
 ), source_bindings AS (
  SELECT b.*,s.source_generation AS matched_generation,s.descriptor_json,s.accepted_at,v.status AS source_status,
+   coalesce(s.descriptor_json->>'contract'='registry-native-network-source-v1',false) AS is_native,
    b.document_json->'source_scope' ? 'insurance_plan_id' AS is_product,
    coalesce(b.document_json->'source_scope'->>'kind'='uhc_plan_tier_v1',false) AS is_tier,
    count(s.source_generation) OVER(PARTITION BY b.binding_id) AS source_matches
  FROM {namespace}.registry_fhir_catalog_binding b
  LEFT JOIN {namespace}.registry_fhir_catalog_source s
    ON b.document_json->>'evidence_id'=s.source_generation||':Organization/'||(b.document_json->>'source_key')
+   OR (s.descriptor_json->>'contract'='registry-native-network-source-v1'
+     AND b.document_json->>'producer_id'='registry-native-network-source-v1'
+     AND b.document_json->'source_scope'->>'source_generation'=s.source_generation)
    OR (b.document_json->'source_scope'->>'kind'='uhc_plan_tier_v1' AND s.profile='published_normalized'
      AND b.document_json->'source_scope'->>'source_generation'=s.source_generation)
    OR (b.document_json->'source_scope' ? 'insurance_plan_id'
@@ -468,7 +501,7 @@ OR EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_relationship r
    OR (r.source_id='registry-manual' AND NOT EXISTS(SELECT FROM {control}.registry_approved_record a
      WHERE a.approved_revision=$2 AND a.record_kind='company_links' AND a.record_key=r.company_id::text
        AND a.record_json->'archived'='false'::jsonb AND a.record_json->'network_ids' @> jsonb_build_array(r.network_id)))
-   OR (r.source_id<>'registry-manual' AND NOT b.is_tier AND NOT EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_observation o
+   OR (r.source_id<>'registry-manual' AND NOT b.is_tier AND NOT b.is_native AND NOT EXISTS(SELECT FROM {namespace}.registry_fhir_catalog_observation o
      WHERE o.source_generation=r.source_generation AND o.observation_kind='edge'
        AND ((NOT b.is_product AND o.document_json->>'network_resource_id'=b.document_json->>'source_key')
          OR (b.is_product AND o.resource_type='InsurancePlan'
@@ -499,11 +532,11 @@ OR EXISTS(SELECT FROM source_bindings b
  WHERE n.network_id IS NULL OR b.metadata_generation<>$1 OR b.matched_generation IS NULL
    OR b.source_matches<>1
    OR b.source_id IS DISTINCT FROM b.descriptor_json->'coordinates'->>'source_id'
-   OR (NOT b.is_product AND NOT b.is_tier AND (b.document_json->'source_scope'->>'organization_id') IS DISTINCT FROM (b.document_json->>'source_key'))
+   OR (NOT b.is_product AND NOT b.is_tier AND NOT b.is_native AND (b.document_json->'source_scope'->>'organization_id') IS DISTINCT FROM (b.document_json->>'source_key'))
    OR (b.document_json->>'producer_id'='registry-fhir-catalog-v1' AND (
      b.document_json->'source_scope'->>'source_generation' IS DISTINCT FROM b.matched_generation
      OR coalesce(b.descriptor_json->>'profile','') NOT IN ('published_normalized','legacy_published_normalized')))
-   OR (NOT b.is_product AND NOT b.is_tier AND (b.document_json->>'evidence_sha256') IS DISTINCT FROM (o.document_json->>'source_hash'))
+   OR (NOT b.is_product AND NOT b.is_tier AND NOT b.is_native AND (b.document_json->>'evidence_sha256') IS DISTINCT FROM (o.document_json->>'source_hash'))
    OR (b.is_product AND (product.record_key IS NULL
      OR product.record_json->'archived' IS DISTINCT FROM 'false'::jsonb
      OR product.record_json->>'network_id' IS DISTINCT FROM b.network_id::text
@@ -585,6 +618,7 @@ _ORGANIZATION_PROOF_SQL = """WITH page AS MATERIALIZED (
  LEFT JOIN {control}.registry_approved_record g ON g.approved_revision=$1
    AND g.record_kind='group' AND g.record_key=r.group_id::text
  WHERE r.metadata_generation=$6 AND r.source_id<>'registry-manual'
+   AND s.descriptor_json->>'contract' IS DISTINCT FROM 'registry-native-network-source-v1'
    AND (r.company_id IS NOT NULL OR r.group_id IS NOT NULL)
    AND (r.network_id,r.relationship_id)>($2,$3)
  ORDER BY r.network_id,r.relationship_id LIMIT $4
@@ -790,10 +824,17 @@ def verify_fhir_catalog_validation(snapshot, validation):
     if type(validation) is not dict or set(validation) != {"metadata_generation", "inputs", "tables", "content_sha256"}:
         _invalid("validation_invalid")
     generation = metadata_generation(snapshot)
+    expected_by_field = snapshot_inputs(snapshot)
+    retained_by_field = validation["inputs"]
+    if type(retained_by_field) is not dict:
+        _invalid("inputs_changed")
+    if "imported_source_inventory" in expected_by_field:
+        expected_by_field = {**expected_by_field, "network_generation": None, "manifest_sha256": None}
+        retained_by_field = {**retained_by_field, "network_generation": None, "manifest_sha256": None}
     if (
         snapshot["metadata_generation"] != generation
         or validation["metadata_generation"] != generation
-        or validation["inputs"] != snapshot_inputs(snapshot)
+        or retained_by_field != expected_by_field
     ):
         _invalid("inputs_changed")
     tables = validation["tables"]
@@ -812,5 +853,8 @@ def verify_fhir_catalog_validation(snapshot, validation):
     accounting = snapshot.get("accounting_json")
     if type(accounting) is str:
         accounting = json.loads(accounting)
-    if accounting is not None and accounting != tables:
+    expected_accounting_by_key = dict(tables)
+    if "imported_source_inventory" in expected_by_field:
+        expected_accounting_by_key["imported_source_inventory"] = expected_by_field["imported_source_inventory"]
+    if accounting is not None and accounting != expected_accounting_by_key:
         _invalid("inputs_changed")

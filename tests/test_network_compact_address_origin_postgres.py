@@ -686,8 +686,8 @@ async def indexed_api_db(indexed_db, monkeypatch):
     password = fixture.reader_engine.url.password
     settings_by_name = {
         "DRIVER": "asyncpg",
-        "HOST": url.host,
-        "PORT": str(url.port),
+        "HOST": url.host or url.query.get("host", "127.0.0.1"),
+        "PORT": str(url.port or url.query.get("port", 5432)),
         "DATABASE": url.database,
         "READER_USER": role,
         "READER_PASSWORD": password,

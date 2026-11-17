@@ -121,6 +121,10 @@ _profile = parse_fhir_catalog_source_profile
 
 def validate_fhir_catalog_source_descriptor(descriptor):
     """Validate logical source coordinates, named inputs and content observation evidence."""
+    from process.registry_native_network_catalog import is_native_catalog_source, validate_native_catalog_descriptor
+
+    if is_native_catalog_source(descriptor):
+        return validate_native_catalog_descriptor(descriptor)
     if type(descriptor) is dict and descriptor.get("profile") == "retained_normalized":
         from process.registry_fhir_catalog_retained import validate_retained_fhir_catalog_descriptor
 

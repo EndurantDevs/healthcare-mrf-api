@@ -170,7 +170,8 @@ def _typed_mapping_documents(recipe, mapped):
             "descriptor_version": 4,
             "recipe_sha256": recipe_sha256,
             "capture_sha256": recipe.source_pin.generation_id,
-            **{key: metadata[key] for key in ("catalog_generation", "mapping_sha256", "counters")},
+            "catalog_generation": recipe.source_pin.catalog_generation,
+            **{key: metadata[key] for key in ("mapping_sha256", "counters")},
         }
     )
     derivation = validate_typed_derivation(
@@ -196,31 +197,43 @@ def _typed_mapping_documents(recipe, mapped):
     return contribution, derivation
 
 
+async def _read_mapping_recipe(
+    connection, recipe, approved, read_context, source_reader, retained_proofs, control_schema
+):
+    recipe_sha256 = hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest()
+    if retained_proofs and await _has_retained_sample_coverage(
+        connection,
+        recipe,
+        approved,
+        control_schema,
+        retained_proofs.get(recipe_sha256),
+        catalog_bindings=read_context.source_witness_runtime.catalog_bindings,
+    ):
+        from process.registry_source_recipe_composition import load_typed_source_read
+        from process.registry_typed_retained_source import RetainedTypedGraphRead
+
+        loaded = await load_typed_source_read(
+            connection, recipe, approved, control_schema, read_context.source_witness_runtime
+        )
+        read = RetainedTypedGraphRead(loaded, retained_proofs[recipe_sha256])
+        read.require_ready()
+        sampling = getattr(read_context.source_witness_runtime, "semantic_validation", None)
+        if sampling is not None:
+            await sampling.record_retained(read.proof, connection)
+    else:
+        read = await source_reader(connection, recipe, approved, control_schema, read_context.source_witness_runtime)
+    return read
+
+
 async def _map_typed_recipes(
     connection, recipes, approved, table, read_context, source_reader, retained_proofs, control_schema
 ):
     address_source, roles = read_context.verified_office_inputs
     inputs, contributions, derivations, generations = [], [], [], []
     for recipe in recipes:
-        recipe_sha256 = hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest()
-        if retained_proofs and await _has_retained_sample_coverage(
-            connection, recipe, approved, control_schema, retained_proofs.get(recipe_sha256)
-        ):
-            from process.registry_source_recipe_composition import load_typed_source_read
-            from process.registry_typed_retained_source import RetainedTypedGraphRead
-
-            loaded = await load_typed_source_read(
-                connection, recipe, approved, control_schema, read_context.source_witness_runtime
-            )
-            read = RetainedTypedGraphRead(loaded, retained_proofs[recipe_sha256])
-            read.require_ready()
-            sampling = getattr(read_context.source_witness_runtime, "semantic_validation", None)
-            if sampling is not None:
-                await sampling.record_retained(read.proof, connection)
-        else:
-            read = await source_reader(
-                connection, recipe, approved, control_schema, read_context.source_witness_runtime
-            )
+        read = await _read_mapping_recipe(
+            connection, recipe, approved, read_context, source_reader, retained_proofs, control_schema
+        )
         inputs.append(
             (
                 read,
@@ -229,6 +242,7 @@ async def _map_typed_recipes(
                     binding_coordinates=recipe.binding_coordinates,
                     catalog_descriptor=recipe.source_pin.catalog_descriptor,
                     catalog_generation=recipe.source_pin.catalog_generation,
+                    catalog_bindings=read_context.source_witness_runtime.catalog_bindings,
                 ),
                 None,
             )
@@ -256,29 +270,36 @@ async def _map_typed_recipes(
     return mappings, contributions, derivations, generations
 
 
-async def _has_retained_sample_coverage(connection, recipe, approved, control_schema, proof):
+async def _has_retained_sample_coverage(connection, recipe, approved, control_schema, proof, *, catalog_bindings=None):
     """A widened approval requires fresh samples for previously uncovered Source networks."""
     if proof is None:
         return False
     if proof.semantic_receipt is None:
         return True
-    from process.network_approved_source_bindings import (
-        APPROVED_NETWORK_BINDINGS_SQL,
-        require_approved_network_source_bindings,
-    )
-    from process.network_fhir_typed_mapping import _approved_graph_keys
-    from process.network_membership_candidate_lifecycle import _control_namespace
+    from process.network_fhir_typed_mapping import _approved_graph_keys, typed_graph_bindings
 
-    await require_approved_network_source_bindings(
-        connection, approved, recipe.binding_coordinates, control_schema=control_schema
+    approval = TypedGraphApproval(
+        approved,
+        recipe.binding_coordinates,
+        recipe.source_pin.catalog_descriptor,
+        catalog_bindings=catalog_bindings,
+        catalog_generation=recipe.source_pin.catalog_generation,
     )
-    bindings = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema))
+    bindings = await typed_graph_bindings(connection, approval, control_schema=control_schema)
     arguments = (
         approved.approved_revision,
         *recipe.binding_coordinates.sql_parameters,
         recipe.source_pin.catalog_generation,
     )
-    current_keys = await _approved_graph_keys(connection, bindings, arguments)
+    from process.network_fhir_typed_contract import PLAN_TIER_CONTRACT
+
+    current_keys = await _approved_graph_keys(
+        connection,
+        bindings,
+        arguments,
+        allow_empty=catalog_bindings is not None,
+        plan_tiers=recipe.source_pin.capture["graph"]["contract"] == PLAN_TIER_CONTRACT,
+    )
     sampled_keys = {network["network_source_key"] for network in proof.semantic_receipt["networks"]}
     return set(current_keys) <= sampled_keys
 

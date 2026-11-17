@@ -265,6 +265,7 @@ async def test_copied_legacy_typed_reference_keeps_catalog_generation_without_da
 async def test_legacy_typed_mapping_uses_original_client_catalog_scope(monkeypatch, approved_generation_matches):
     from unittest.mock import AsyncMock
 
+    from process import network_approved_source_bindings
     from process import network_fhir_typed_mapping as mapping
     from process.registry_source_recipe_store import decode_registry_source_recipes
 
@@ -283,12 +284,12 @@ async def test_legacy_typed_mapping_uses_original_client_catalog_scope(monkeypat
             actual_arguments.append(arguments)
             expected = generation if approved_generation_matches else "e" * 64
             return arguments[-1] == expected
-        assert "array_agg(record_json->>'source_key')" in query
+        assert "array_agg(record_json->>'source_key' ORDER BY record_json->>'source_key')" in query
         return ["network-one"]
 
     connection = SimpleNamespace(fetchval=AsyncMock(side_effect=read_bindings))
     verify = AsyncMock()
-    monkeypatch.setattr(mapping, "require_approved_network_source_bindings", verify)
+    monkeypatch.setattr(network_approved_source_bindings, "require_approved_network_source_bindings", verify)
     monkeypatch.setattr(mapping, "_mapping_workspace", AsyncMock(return_value=object()))
     offices = AsyncMock()
     monkeypatch.setattr(mapping, "_office_inputs", offices)

@@ -28,6 +28,10 @@ async def _fixture(connection):
         location_key text PRIMARY KEY,entity_type text,entity_id text,npi bigint,address_key uuid,
         type text,address_precision text,inferred_npi bigint,
         first_line text,second_line text,city_name text,state_name text,postal_code text,country_code text)""")
+    await connection.execute(
+        "CREATE INDEX lookup_addresses_service_key_npi ON lookup_addresses(address_key,npi) "
+        "WHERE type IN ('primary','secondary','practice','site') AND address_key IS NOT NULL"
+    )
     for index, address in enumerate((_ADDRESS, _ADDRESS, _ADDRESS, _ADDRESS, _TAIL_ADDRESS)):
         await connection.execute(
             "INSERT INTO lookup_addresses VALUES($1,'npi',$2,$3,$4,'practice','street',NULL,$5,$6,$7,$8,$9,$10)",
@@ -69,13 +73,14 @@ async def _lookup_rows(connection):
 
 class ObservedConnection:
     def __init__(self, connection, *, cancel_page=None):
-        self.connection, self.cancel_page, self.pages = connection, cancel_page, []
+        self.connection, self.cancel_page, self.pages, self.statements = connection, cancel_page, [], []
 
     def __getattr__(self, name):
         return getattr(self.connection, name)
 
     async def fetchrow(self, query, *arguments):
         if "AS scanned" in query:
+            self.statements.append((query, arguments))
             if len(self.pages) == self.cancel_page:
                 raise asyncio.CancelledError()
             row = await self.connection.fetchrow(query, *arguments)
@@ -84,9 +89,9 @@ class ObservedConnection:
         return await self.connection.fetchrow(query, *arguments)
 
 
-async def test_shared_lookup_keeps_missing_offices_and_empty_page_tail(serving_schema, monkeypatch):
+async def test_shared_lookup_pages_requested_keys_and_keeps_missing_offices(serving_schema, monkeypatch):
     connection, _, _ = serving_schema
-    monkeypatch.setattr(lookup, "_ADDRESS_PAGE_ROWS", 2)
+    monkeypatch.setattr(lookup, "_REQUEST_PAGE_ROWS", 2)
     async with connection.transaction():
         address, mappings = await _fixture(connection)
         observed = ObservedConnection(connection)
@@ -96,7 +101,7 @@ async def test_shared_lookup_keeps_missing_offices_and_empty_page_tail(serving_s
             assert await connection.fetchval("SELECT count(*) FROM " + matches) == 2
             for selected in mappings:
                 await mapping._match_offices(connection, selected, address, matches)
-        assert observed.pages == [2, 2, 1, 0]
+        assert observed.pages == [2, 1, 0]
         actual_offices = [
             tuple(row)
             for selected in mappings
@@ -232,14 +237,14 @@ async def test_office_acceptance_keeps_full_identity_and_native_result_shape_che
 
 async def test_cancelled_partial_scan_rolls_back_lookup_tables(serving_schema, monkeypatch):
     connection, _, _ = serving_schema
-    monkeypatch.setattr(lookup, "_ADDRESS_PAGE_ROWS", 2)
+    monkeypatch.setattr(lookup, "_REQUEST_PAGE_ROWS", 2)
     async with connection.transaction():
         address, mappings = await _fixture(connection)
         observed = ObservedConnection(connection, cancel_page=2)
         with pytest.raises(asyncio.CancelledError):
             async with lookup.typed_office_lookup(observed, [row.table_names["offices"] for row in mappings], address):
                 pytest.fail("cancelled scan cannot expose a partial lookup")
-        assert observed.pages == [2, 2] and await _lookup_rows(connection) == 0
+        assert observed.pages == [2, 1] and await _lookup_rows(connection) == 0
         assert await connection.fetchval("SELECT count(*) FROM lookup_addresses") == 5
 
 

@@ -494,20 +494,31 @@ class _ProjectionReplay:
             ):
                 _fail()
 
-    async def run(self):
+    async def replay_projection(self):
         """Replay production ordering and remove only this verification's temporary heaps."""
         from process.registry_fhir_catalog_registry_reader import catalog_projection_generations
 
         await self.inputs()
+        from process.registry_native_network_catalog import is_native_catalog_source
+
+        native_generations = {
+            generation
+            for generation, source_record in self.sources.items()
+            if is_native_catalog_source(source_record["descriptor"])
+        }
         active = await catalog_projection_generations(
             self.registry_reader,
             self.snapshot,
             grant=self.grant,
-            descriptors={generation: source["descriptor"] for generation, source in self.sources.items()},
+            descriptors={generation: source_record["descriptor"] for generation, source_record in self.sources.items()},
         )
         await self.create()
+        await self.retire_native()
         await self.manual()
         for generation in active:
+            if generation in native_generations:
+                await self.native(generation, "current")
+                continue
             await self.networks(generation)
             status = (
                 "last_good" if self.sources[generation]["descriptor"]["profile"] == "retained_normalized" else "current"
@@ -515,12 +526,69 @@ class _ProjectionReplay:
             await self.relationships(generation, status)
             await self.plan_tiers(generation)
         for generation in sorted(self.sources.keys() - set(active)):
+            if generation in native_generations:
+                await self.native(generation, "last_good")
+                continue
             await self.relationships(generation, "last_good")
             await self.plan_tiers(generation, carried=True)
         await self.products(active)
         await self.compare(active)
-        for target in reversed(tuple(self.targets.values())):
-            await self.connection.execute("DROP TABLE " + target)
+        for table_relation in reversed(tuple(self.targets.values())):
+            await self.connection.execute("DROP TABLE " + table_relation)
+
+    async def retire_native(self):
+        """Mirror retirement only for native identities with a complete accepted replacement."""
+        from types import SimpleNamespace
+
+        from process.registry_imported_catalog_preparation import (
+            replaced_native_generations,
+            retire_native_catalog_rows,
+        )
+
+        selected_generations = {
+            entry["source_generation"] for entry in self.snapshot["source_vector_json"] if entry["status"] == "current"
+        }
+        accepted_sources = tuple(
+            SimpleNamespace(descriptor=self.sources[generation]["descriptor"]) for generation in selected_generations
+        )
+        generations = await replaced_native_generations(self.connection, self.prior, accepted_sources)
+        await retire_native_catalog_rows(
+            self.connection,
+            self.targets,
+            generations,
+            control_schema=self.grant.control_schema,
+            approved_revision=self.snapshot["metadata_approved_revision"],
+        )
+
+    async def native(self, generation, status):
+        """Replay native metadata independently using the same enduring logical identity allocation."""
+        from process.registry_imported_catalog_preparation import native_manual_network_ids
+        from process.registry_native_network_catalog import native_catalog_rows, native_network_ids
+
+        source = self.sources[generation]
+        networks = await native_network_ids(
+            self.registry_reader, source["descriptor"], control_schema=self.grant.control_schema
+        )
+        manual_network_ids = await native_manual_network_ids(
+            self.registry_reader, self.snapshot, networks, self.grant.control_schema
+        )
+        projection = native_catalog_rows(
+            source["descriptor"],
+            generation=generation,
+            accepted_at=source["accepted_at"],
+            metadata_generation=self.snapshot["metadata_generation"],
+            networks=networks,
+            status=status,
+            manual_network_ids=manual_network_ids,
+        )
+        for kind, rows in (
+            ("network", projection.network_rows),
+            ("binding", projection.binding_rows),
+            ("relationship", projection.relationship_rows),
+        ):
+            if kind == "network" and status == "last_good":
+                continue
+            await self.write(kind, rows)
 
 
 async def require_fhir_catalog_registry_reader(connection, reader, snapshot, grant):
@@ -559,4 +627,4 @@ async def validate_observed_projection(connection, snapshot, *, standing_grant, 
     replay = _ProjectionReplay(connection, snapshot, standing_grant, prior_snapshot, registry_reader)
     # A failed replay rolls back all task-owned temporary objects and leaves the sealed-input candidate untouched.
     async with connection.transaction():
-        await replay.run()
+        await replay.replay_projection()

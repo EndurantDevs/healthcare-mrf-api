@@ -63,7 +63,8 @@ _UPDATE = {
     "registry_publication_request": tuple(sorted(LIFECYCLE_COLUMNS)),
     "registry_revision_control": ("draft_revision", "approved_revision"),
     "network_membership_candidate": ("accepted_rows", "state", "validation_json", "index_ready"),
-    "network_serving_control": ("generation_id",),
+    "network_serving_control": ("generation_id", "metadata_generation"),
+    "registry_fhir_catalog_snapshot": ("network_generation", "manifest_sha256", "published_at"),
 }
 _SEQUENCE = "network_serving_manifest_generation_id_seq"
 

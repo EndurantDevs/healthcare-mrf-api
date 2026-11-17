@@ -16,6 +16,7 @@ from api.provider_profile_snapshot import provider_profile_read_snapshot
 from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
 from process.registry_catalog_policy import RegistryOrganizationVisibility
+from process.registry_effective_network_catalog import effective_catalog_networks_sql
 from process.registry_network_catalog_read import (
     RegistryNetworkCatalogError,
     RegistryNetworkCatalogLegacyBatchSelector,
@@ -77,11 +78,14 @@ async def _selected_networks(driver, selector, manifest, exclusions, control_sch
     if selector is None:
         return None
     if type(selector) is tuple:
+        networks = await effective_catalog_networks_sql(driver, manifest, control_schema)
         count = await driver.fetchval(
-            _SELECTED_SQL.format(control=_identifier(control_schema)),
+            _SELECTED_SQL.format(control=_identifier(control_schema))
+            if networks is None
+            else f"SELECT count(*) FROM {networks} policy WHERE approved_revision=$1 AND network_id=ANY($2::integer[]) AND NOT archived AND NOT network_id=ANY($3::integer[])",
             manifest.approved_custom_revision,
-            [str(network_id) for network_id in selector],
-            [str(network_id) for network_id in exclusions],
+            [str(network_id) for network_id in selector] if networks is None else list(selector),
+            [str(network_id) for network_id in exclusions] if networks is None else list(exclusions),
         )
         if type(count) is not int or count != len(selector):
             raise RegistryNetworkCatalogError("registry_network_catalog_detail_denied")

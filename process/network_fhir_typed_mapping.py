@@ -9,13 +9,10 @@ from datetime import date
 from uuid import UUID, uuid4
 
 from process.network_address_projection import _identifier
-from process.network_approved_source_bindings import (
-    APPROVED_NETWORK_BINDINGS_SQL,
-    require_approved_network_source_bindings,
-)
+from process.network_approved_source_bindings import APPROVED_NETWORK_BINDINGS_SQL
 from process.network_fhir_source_witness_contract import digest, source_origin
-from process.network_fhir_typed_contract import ADDRESS_FIELDS, POLICY, require
-from process.network_fhir_typed_sql import PROVIDER_ONLY_SQL
+from process.network_fhir_typed_contract import ADDRESS_FIELDS, PLAN_TIER_CONTRACT, POLICY, require
+from process.network_fhir_typed_sql import PLAN_TIER_PROVIDER_ONLY_SQL, PROVIDER_ONLY_SQL
 from process.network_membership_candidate_lifecycle import _control_namespace
 from process.registry_fhir_catalog_sources import (
     fhir_catalog_source_generation,
@@ -280,17 +277,32 @@ async def _mapping_workspace(connection, stage, table_names):
     return mapping
 
 
-async def _approved_graph_keys(connection, bindings, arguments):
+async def _approved_graph_keys(connection, bindings, arguments, *, allow_empty=False, plan_tiers=False):
+    tier_condition = ""
+    if plan_tiers:
+        from process.network_fhir_plan_tier_graph import validate_plan_tier_graph_bindings
+
+        await validate_plan_tier_graph_bindings(connection, bindings, arguments)
+        tier_condition = (
+            " OR (record_json->'source_scope_json'->>'kind'='uhc_plan_tier_v1' "
+            "AND record_json->'source_scope_json'->>'source_generation'=$8::text)"
+        )
     valid = await connection.fetchval(
         "WITH "
         + bindings
-        + " SELECT count(*)>0 AND bool_and(record_json->'source_scope_json'=jsonb_build_object('organization_id',record_json->>'source_key','source_generation',$8::text)) FROM approved_network_bindings",
+        + (" SELECT " if allow_empty else " SELECT count(*)>0 AND ")
+        + "coalesce(bool_and(coalesce(record_json->'source_scope_json'=jsonb_build_object('organization_id',record_json->>'source_key','source_generation',$8::text)"
+        + tier_condition
+        + ",false)),true) FROM approved_network_bindings",
         *arguments,
     )
     require(valid is True, "approved_catalog_scope")
     approved_keys = await connection.fetchval(
-        "WITH " + bindings + " SELECT array_agg(record_json->>'source_key') FROM approved_network_bindings",
-        *arguments[:7],
+        "WITH "
+        + bindings
+        + " SELECT coalesce(array_agg(record_json->>'source_key' ORDER BY record_json->>'source_key'),ARRAY[]::text[]) "
+        "FROM approved_network_bindings WHERE $8::text IS NOT NULL",
+        *arguments,
     )
     return approved_keys
 
@@ -359,7 +371,9 @@ async def _map_pair_pages(connection, stage, mapping, bindings, arguments):
 
 async def _map_provider_rows(connection, stage, mapping, bindings, arguments):
     origin = source_origin(stage.document["origin"])
-    provider_sql = PROVIDER_ONLY_SQL.replace("{cells}", stage.relation("cells"))
+    provider_sql = (
+        PLAN_TIER_PROVIDER_ONLY_SQL if stage.document["contract"] == PLAN_TIER_CONTRACT else PROVIDER_ONLY_SQL
+    ).replace("{cells}", stage.relation("cells"))
     # Shift Source query parameters after the closed approved coordinates and generation.
     provider_sql = re.sub(r"\$(\d+)", lambda match: "$" + str(int(match[1]) + 8), provider_sql)
     for resource_type in ("OrganizationAffiliation", "PractitionerRole"):
@@ -417,6 +431,28 @@ class TypedGraphApproval:
     binding_coordinates: object
     catalog_descriptor: dict
     catalog_generation: str | None = None
+    catalog_bindings: object = None
+
+
+async def typed_graph_bindings(connection, approval, *, control_schema):
+    """Select explicit imported authority, preserving the legacy manual approval path."""
+    if approval.catalog_bindings is None:
+        from process import network_approved_source_bindings
+
+        await network_approved_source_bindings.require_approved_network_source_bindings(
+            connection, approval.approved_source, approval.binding_coordinates, control_schema=control_schema
+        )
+        return APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema))
+    from process.registry_imported_catalog_bindings import published_fhir_catalog_bindings_sql
+
+    return await published_fhir_catalog_bindings_sql(
+        connection,
+        approval.catalog_bindings,
+        approval.approved_source,
+        approval.binding_coordinates,
+        approval.catalog_descriptor,
+        control_schema=control_schema,
+    )
 
 
 async def prepare_typed_graph_mapping(
@@ -445,27 +481,29 @@ async def _prepare_mapping_offices(connection, stage, approval, table_names, con
     binding_coordinates, catalog_descriptor = approval.binding_coordinates, approval.catalog_descriptor
     stage.require_ready()
     generation = require_catalog_graph_scope(stage, binding_coordinates, catalog_descriptor)
-    if approval.catalog_generation is not None:
+    if approval.catalog_generation is not None and approval.catalog_bindings is None:
         require(
             type(approval.catalog_generation) is str and re.fullmatch(r"[0-9a-f]{64}", approval.catalog_generation),
             "catalog_generation",
         )
         generation = approval.catalog_generation
-    await require_approved_network_source_bindings(
-        connection, approved_source, binding_coordinates, control_schema=control_schema
-    )
+    bindings = await typed_graph_bindings(connection, approval, control_schema=control_schema)
     mapping = await _mapping_workspace(connection, stage, table_names)
-    bindings = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema))
     arguments = (approved_source.approved_revision, *binding_coordinates.sql_parameters, generation)
-    approved_keys = await _approved_graph_keys(connection, bindings, arguments)
+    approved_keys = await _approved_graph_keys(
+        connection,
+        bindings,
+        arguments,
+        allow_empty=approval.catalog_bindings is not None,
+        plan_tiers=stage.document["contract"] == PLAN_TIER_CONTRACT,
+    )
     await _office_inputs(connection, stage, mapping, approved_keys)
-    return mapping, approval, generation, arguments
+    return mapping, approval, generation, arguments, bindings
 
 
 async def _finish_mapping(connection, prepared, address_source, matches, control_schema):
-    mapping, approval, generation, arguments = prepared
+    mapping, approval, generation, arguments, bindings = prepared
     stage, approved_source = mapping.source_stage, approval.approved_source
-    bindings = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema))
     await _match_offices(connection, mapping, address_source, matches)
     totals = await _map_pair_rows(connection, stage, mapping, bindings, arguments)
     await _map_provider_rows(connection, stage, mapping, bindings, arguments)
@@ -495,7 +533,7 @@ async def map_typed_graph_batch(connection, inputs, *, address_source, runtime_r
             await _prepare_mapping_offices(connection, stage, approval, names, control_schema)
             for stage, approval, names in inputs
         ]
-        office_names = [mapping.table_names["offices"] for mapping, _, _, _ in prepared_mappings]
+        office_names = [selected[0].table_names["offices"] for selected in prepared_mappings]
         async with typed_office_lookup(connection, office_names, address_source) as matches:
             mappings = [
                 await _finish_mapping(connection, selected, address_source, matches, control_schema)

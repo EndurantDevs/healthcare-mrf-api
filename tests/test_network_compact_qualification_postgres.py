@@ -26,6 +26,7 @@ from process.network_membership_copy import MembershipCopyTarget
 from process.network_membership_publication import NetworkPublicationError
 from process.network_serving_read import resolve_network_serving_manifest
 from tests import test_network_compact_publication_postgres as publication
+from tests.effective_catalog_support import effective_catalog_db as effective_catalog_db
 from tests.test_api_database_jit import (
     test_native_api_jit_covers_pool_growth_transaction_end_and_reconnect as test_native_api_jit_covers_pool_growth_transaction_end_and_reconnect,
 )
@@ -43,7 +44,10 @@ from tests.test_network_geo_search_postgres import (
     test_old_incompatible_profile_has_no_search_receipt_or_heap as test_old_incompatible_profile_has_no_search_receipt_or_heap,
 )
 from tests.test_network_geo_search_postgres import (
-    test_search_later_batch_has_index_range_under_generic_plan as test_search_later_batch_has_index_range_under_generic_plan,
+    test_search_generic_plan_uses_edge_range_and_exact_address_lookup as test_search_generic_plan_uses_edge_range_and_exact_address_lookup,
+)
+from tests.test_network_geo_search_postgres import (
+    test_search_keyset_reuses_direct_range_shape_after_first_batch as test_search_keyset_reuses_direct_range_shape_after_first_batch,
 )
 from tests.test_network_geo_search_postgres import (
     test_search_parity_failure_rolls_back_only_its_new_projection as test_search_parity_failure_rolls_back_only_its_new_projection,
@@ -64,6 +68,17 @@ from tests.test_network_index_catalog_postgres import (
     test_legacy_catalog_keeps_its_original_deparse_context as test_legacy_catalog_keeps_its_original_deparse_context,
 )
 from tests.test_network_membership_slices_postgres import slice_db as slice_db
+from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
+from tests.test_registry_aca_company_catalog_postgres import (
+    test_aca_company_network_search_and_exclusions_work_without_approved_company as test_aca_company_network_search_and_exclusions_work_without_approved_company,
+)
+from tests.test_registry_aca_company_catalog_postgres import (
+    test_hios_source_period_ignores_pending_draft_corrections as test_hios_source_period_ignores_pending_draft_corrections,
+)
+from tests.test_registry_native_network_catalog_postgres import storage_database as storage_database
+from tests.test_registry_native_network_catalog_postgres import (
+    test_native_family_catalogue_uses_real_candidates_and_rejects_tampered_projection as test_native_family_catalogue_uses_real_candidates_and_rejects_tampered_projection,
+)
 
 
 async def _publish_ready(fixture, target):

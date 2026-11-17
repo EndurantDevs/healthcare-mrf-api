@@ -748,10 +748,15 @@ def _bind_prepared_generations(
     inventory=None,
     *,
     retention=None,
+    catalog_generation=None,
 ):
     """Bind current custom and prepared dependency proofs before deriving candidate identity."""
     if source_stage is None and inventory is not None:
         raise RegistryCompositionError("registry_composition_source_stage_required")
+    if catalog_generation is not None:
+        from process.registry_imported_catalog_bindings import PublishedFHIRCatalogBindingScope
+
+        generations_by_source["fhir_catalog"] = PublishedFHIRCatalogBindingScope(catalog_generation).metadata_generation
     if retention is not None:
         generations_by_source[RETENTION_KEY] = registry_source_retention_sha256(retention)
     generations_by_source.update(
@@ -1186,7 +1191,13 @@ async def _compose_fenced_candidate(
 async def _drop_composition_stages(connection, prepared, original_error):
     source_stage, command_stage = prepared[3:5]
     cleanup_error = None
+    from process.registry_native_provider_source import drop_native_provider_stages
     from process.registry_typed_source_stage import drop_typed_source_stage, is_typed_source_stage
+
+    try:
+        await drop_native_provider_stages(connection, source_stage)
+    except BaseException as error:
+        cleanup_error = error
 
     if is_typed_source_stage(source_stage):
         try:
@@ -1605,6 +1616,9 @@ async def _register_prepared_candidate(
         inputs.provider_receipt,
         source_stage,
         inventory,
+        catalog_generation=None
+        if inputs.source_witness_runtime is None or inputs.source_witness_runtime.catalog_bindings is None
+        else inputs.source_witness_runtime.catalog_bindings.metadata_generation,
     )
     _bind_source_operation(generations_by_source, inputs.source_operation)
     copy_target = _target(

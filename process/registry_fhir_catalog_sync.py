@@ -5,7 +5,7 @@ import hashlib
 import json
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from time import perf_counter
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
@@ -85,6 +85,7 @@ from process.registry_fhir_catalog_store import (
     create_fhir_catalog_candidate,
     create_fhir_catalog_indexes,
     discard_fhir_catalog_candidate,
+    has_catalog_snapshot_validation,
     named_catalog_preparation_roles,
     replace_fhir_catalog_relationships,
     write_fhir_catalog_rows,
@@ -343,6 +344,22 @@ async def _preparation_catalog_sources(config, loader, manifest, previous, accep
     return accepted
 
 
+async def _admit_native_catalog_sources(loader, accepted):
+    from process.registry_imported_catalog_preparation import (
+        current_catalog_inventory,
+        native_catalog_sources,
+        require_preparation_fhir_inventory,
+    )
+
+    imported_inventory = current_catalog_inventory()
+    if imported_inventory is not None:
+        require_preparation_fhir_inventory(imported_inventory, accepted)
+        accepted.extend(
+            native_catalog_sources(imported_inventory, await loader.fetchval("SELECT transaction_timestamp()"))
+        )
+    return imported_inventory
+
+
 async def _stage_catalog_candidate(
     config, loader, source_reads, sealer_pool, staged, dispositions, *, source_export=None, source_companies_only=False
 ):
@@ -352,8 +369,9 @@ async def _stage_catalog_candidate(
     accepted = await _preparation_catalog_sources(
         config, loader, manifest, previous, accepted, source_companies_only=source_companies_only
     )
-    _validate_catalog_sources(accepted, previous)
     labels = await _collect_catalog_source_companies(source_reads, accepted, previous, required=source_companies_only)
+    imported_inventory = await _admit_native_catalog_sources(loader, accepted)
+    _validate_catalog_sources(accepted, previous)
     input_options = {"source_companies": labels} if labels else {}
     if source_companies_only:
         input_options["source_companies_only"] = True
@@ -370,7 +388,7 @@ async def _stage_catalog_candidate(
     }
     if previous and snapshot["metadata_generation"] == previous["metadata_generation"]:
         return None, previous, accounting_by_phase, None
-    if manifest is not None:
+    if manifest is not None and imported_inventory is None:
         await require_fhir_catalog_membership_reuse(
             loader, manifest, snapshot, control_schema=config.grant.control_schema
         )
@@ -412,7 +430,7 @@ def _reused_catalog_preparation_target(retained, snapshot, previous, staged, acc
             resumed_snapshot_as_of=retained["as_of"].isoformat(),
         )
     preparation = catalog_snapshot_preparation(retained)
-    if preparation is not None and not retained["accounting_json"]:
+    if preparation is not None and not has_catalog_snapshot_validation(retained):
         current_previous = None if previous is None else previous["metadata_generation"]
         if preparation["previous_metadata_generation"] != current_previous:
             raise ValueError("registry_fhir_catalog_preparation_head_changed")
@@ -708,14 +726,14 @@ async def _reusable_catalog_snapshot(loader, grant, generation, *, expected_snap
                 if metadata_generation(pending) != pending["metadata_generation"]:
                     raise ValueError("registry_fhir_catalog_preparation_inputs_changed")
                 retained = pending
-    if retained is not None and (retained["accounting_json"] or catalog_snapshot_preparation(retained) is None):
+    if retained is not None and (
+        has_catalog_snapshot_validation(retained) or catalog_snapshot_preparation(retained) is None
+    ):
         await validate_fhir_catalog_snapshot_record(loader, retained)
     return retained
 
 
-async def _catalog_snapshot_inputs(
-    loader, grant, head, manifest, previous, accepted, *, source_companies=None, source_companies_only=False
-):
+async def _catalog_source_vector(loader, previous, accepted, source_companies, source_companies_only):
     vector_by_generation = (
         {entry["source_generation"]: {**entry, "status": "last_good"} for entry in previous["source_vector_json"]}
         if previous
@@ -732,6 +750,10 @@ async def _catalog_snapshot_inputs(
             ),
         )
     }
+    from process.registry_imported_catalog_preparation import replaced_native_generations
+
+    for generation in await replaced_native_generations(loader, previous, accepted):
+        vector_by_generation.pop(generation, None)
     for generation, disposition in current_by_generation.items():
         prior = vector_by_generation.get(generation, {})
         vector_by_generation[generation] = {
@@ -748,9 +770,20 @@ async def _catalog_snapshot_inputs(
                 vector_by_generation[generation]["extraction_transform"] = prior["extraction_transform"]
         elif supports_plan_tiers(disposition.descriptor):
             vector_by_generation[generation]["extraction_transform"] = PROJECTOR_VERSION
-    mapping_revision, mapping = await select_fhir_catalog_mapping(
-        loader, head["approved_revision"], manifest, control_schema=grant.control_schema
+    return vector_by_generation, current_by_generation
+
+
+async def _catalog_snapshot_inputs(
+    loader, grant, head, manifest, previous, accepted, *, source_companies=None, source_companies_only=False
+):
+    """Compute the semantic source and mapping cohort independently of candidate storage."""
+    vector_by_generation, current_by_generation = await _catalog_source_vector(
+        loader, previous, accepted, source_companies, source_companies_only
     )
+    from process.registry_imported_catalog_preparation import current_catalog_inventory, imported_catalog_accounting
+
+    inventory = current_catalog_inventory()
+    mapping_revision, mapping = await _catalog_mapping_inputs(loader, grant, head, manifest, inventory)
     inputs_by_field = {
         "network_generation": manifest.generation_id if manifest is not None else None,
         "manifest_sha256": manifest.manifest_sha256 if manifest is not None else None,
@@ -762,12 +795,30 @@ async def _catalog_snapshot_inputs(
             vector_by_generation.values(), key=lambda entry: (entry["source_id"], entry["source_generation"])
         ),
         "projector_version": previous["projector_version"] if source_companies_only else PROJECTOR_VERSION,
-        "as_of": datetime.now(timezone.utc).date(),
+        "as_of": datetime.now(timezone.utc).date()
+        if inventory is None
+        else date.fromisoformat(inventory.document["effective_date"]),
     }
     inputs_by_field["metadata_generation"] = metadata_generation(inputs_by_field)
+    if inventory is not None:
+        inputs_by_field["accounting_json"] = imported_catalog_accounting(inventory)
+        inputs_by_field["metadata_generation"] = metadata_generation(inputs_by_field)
     if source_companies_only:
         require_fhir_catalog_company_refresh_inputs(inputs_by_field, previous)
     return inputs_by_field, current_by_generation
+
+
+async def _catalog_mapping_inputs(loader, grant, head, manifest, imported_inventory):
+    """A coupled rebuild consumes the latest manual pin; metadata-only reconciliation preserves old membership."""
+    if imported_inventory is None:
+        return await select_fhir_catalog_mapping(
+            loader, head["approved_revision"], manifest, control_schema=grant.control_schema
+        )
+    from process.registry_fhir_catalog_fingerprints import approved_fhir_catalog_fingerprints
+
+    revision = head["approved_revision"]
+    fingerprints = await approved_fhir_catalog_fingerprints(loader, (revision,), control_schema=grant.control_schema)
+    return revision, fingerprints[revision]
 
 
 async def _build_catalog_candidate(
@@ -794,6 +845,11 @@ async def _build_source_catalog_candidate(
         accounting_by_phase["retained"] = await copy_fhir_catalog_snapshot(
             loader, previous, copy_target, snapshot["metadata_generation"], **options_by_name
         )
+    from process.registry_imported_catalog_preparation import retire_candidate_native_sources
+
+    await retire_candidate_native_sources(
+        loader, copy_target, snapshot, previous, current_by_generation, config.grant.control_schema
+    )
     accounting_by_phase["manual"] = await project_manual_fhir_catalog(loader, copy_target, snapshot, **options_by_name)
     with extraction_transform(snapshot["projector_version"]):
         accounting_by_phase["sources"] = await _project_catalog_sources(
@@ -899,6 +955,22 @@ async def _project_current_sources(
     )
 
 
+async def _project_native_catalog_source(config, loader, copy_target, disposition, snapshot):
+    from process.registry_imported_catalog_preparation import stage_native_catalog_source
+    from process.registry_native_network_catalog import is_native_catalog_source
+
+    if not is_native_catalog_source(disposition.descriptor):
+        return None
+    return await stage_native_catalog_source(
+        loader,
+        copy_target,
+        disposition,
+        snapshot,
+        loader_role=config.loader_role,
+        control_schema=config.grant.control_schema,
+    )
+
+
 async def _project_catalog_sources(
     config, loader, source_reads, copy_target, snapshot, previous, current_by_generation, *, source_companies_only=False
 ):
@@ -911,6 +983,10 @@ async def _project_catalog_sources(
     cached_generations = {entry["source_generation"] for entry in previous["source_vector_json"]} if previous else set()
     projection_receipts = []
     for generation, disposition in current_by_generation.items():
+        native_projection = await _project_native_catalog_source(config, loader, copy_target, disposition, snapshot)
+        if native_projection is not None:
+            projection_receipts.append(native_projection)
+            continue
         export = _source_catalog_export(disposition.descriptor, exports_by_profile)
         if export is None and source_connection is None:
             raise ValueError("registry_fhir_catalog_source_reader_required")
@@ -1059,7 +1135,10 @@ async def _seal_catalog_snapshot(
                     **({"source_companies_only": True} if source_companies_only else {}),
                 ),
             )
-            snapshot.update(custody_json={**receipt, "preparation": preparation}, accounting_json=receipt["tables"])
+            snapshot.update(
+                custody_json={**receipt, "preparation": preparation},
+                accounting_json={**snapshot.get("accounting_json", {}), **receipt["tables"]},
+            )
     except ValueError as refusal:
         await _abandon_refused_catalog_candidate(config, snapshot, sealer_pool, refusal)
         raise
@@ -1716,6 +1795,11 @@ async def refresh_carried_fhir_catalog_relationships(
         if source_record is None:
             return relationships
         descriptor = json.loads(source_record["descriptor"])
+        from process.registry_native_network_catalog import is_native_catalog_source
+
+        if is_native_catalog_source(descriptor):
+            after = source_record["source_generation"]
+            continue
         disposition = FHIRCatalogSourceDisposition(
             descriptor["endpoint_id"],
             descriptor["coordinates"]["dataset_id"],

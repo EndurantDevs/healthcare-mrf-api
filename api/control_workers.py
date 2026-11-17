@@ -849,6 +849,10 @@ def _launcher_mode() -> str:
 
 def _configured_worker_job_image(spec: WorkerSpec, launch_request: dict[str, Any] | None = None) -> str:
     """Select optional worker images while preserving the shared fallback."""
+    from api.network_import_worker_image import configured_network_import_image
+
+    if network_image := configured_network_import_image(spec, launch_request):
+        return network_image
     generic_image = os.getenv("HLTHPRT_WORKER_JOB_IMAGE", "").strip()
     if (
         type(launch_request) is _AdmittedWorkerRequest

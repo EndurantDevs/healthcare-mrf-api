@@ -33,6 +33,7 @@ from process.reference_family_archive import (
     validate_reference_family_manifest,
     validate_reference_family_validation_receipt,
 )
+from process.registry_native_provider_source import PinnedNativeProviderMembershipSource
 from process.registry_ptg_office_membership_contract import PinnedPTGOfficeMembershipSource
 
 MAX_SOURCE_RECIPES = 100
@@ -54,6 +55,7 @@ class RegistrySourceMembershipRecipe:
         | PinnedACAMembershipSource
         | PinnedPTGOfficeMembershipSource
         | PinnedTypedFHIRMembershipSource
+        | PinnedNativeProviderMembershipSource
     )
     binding_coordinates: RegistryNetworkSourceCoordinates
     selection_policy: str = SELECTION_POLICY
@@ -73,6 +75,11 @@ def _validate_recipe_scope(recipe):
     if type(source_pin) is PinnedTypedFHIRMembershipSource:
         source_pin.__post_init__()
         if asdict(coordinates) != source_pin.catalog_descriptor["coordinates"]:
+            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+        return
+    if type(source_pin) is PinnedNativeProviderMembershipSource:
+        source_pin.__post_init__()
+        if coordinates != source_pin.coordinates:
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
         return
     if type(source_pin) is PinnedFHIRMembershipSource:
@@ -223,12 +230,17 @@ def _decode_recipe(document):
         source_pin = _decode_fhir_pin(document["source_pin"])
     elif document["source_kind"] == "aca":
         source_pin = _decode_aca_pin(document["source_pin"])
-    elif document["source_kind"] == "ptg":
-        pin_by_field = dict(_closed_document(document["source_pin"], PinnedPTGOfficeMembershipSource))
+    elif document["source_kind"] in {"ptg", "native_provider"}:
+        model = (
+            PinnedPTGOfficeMembershipSource
+            if document["source_kind"] == "ptg"
+            else PinnedNativeProviderMembershipSource
+        )
+        pin_by_field = dict(_closed_document(document["source_pin"], model))
         pin_by_field["coordinates"] = RegistryNetworkSourceCoordinates(
             **_closed_document(pin_by_field["coordinates"], RegistryNetworkSourceCoordinates)
         )
-        source_pin = PinnedPTGOfficeMembershipSource(**pin_by_field)
+        source_pin = model(**pin_by_field)
     else:
         raise RegistrySourceRecipeError("registry_source_recipes_invalid")
     coordinates = RegistryNetworkSourceCoordinates(
@@ -338,6 +350,8 @@ def _recipe_document(recipe):
     _validate_recipe_scope(recipe)
     if type(recipe.source_pin) is PinnedTypedFHIRMembershipSource:
         source_kind, source_by_field = "fhir_typed", asdict(recipe.source_pin)
+    elif type(recipe.source_pin) is PinnedNativeProviderMembershipSource:
+        source_kind, source_by_field = "native_provider", asdict(recipe.source_pin)
     elif type(recipe.source_pin) is PinnedFHIRMembershipSource:
         source_kind, source_by_field = "fhir", recipe.source_pin.coordinates
     elif type(recipe.source_pin) is PinnedPTGOfficeMembershipSource:

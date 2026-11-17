@@ -28,6 +28,7 @@ from process.network_legacy_membership_source import (
 )
 from process.network_serving_read import PinnedNetworkServingManifest
 from process.registry_candidate_composition import _retained_memberships
+from process.registry_effective_network_catalog import apply_effective_catalog_sql, effective_catalog_sql
 from process.registry_network_catalog_read import (
     _PINNED_READ,
     MAX_RESPONSE_BYTES,
@@ -284,6 +285,15 @@ def _provider_plan_rows(summary):
     )
 
 
+async def _provider_plan_documents(connection, manifest, control_schema, source_queries, sql_args):
+    catalog_records = await effective_catalog_sql(connection, manifest, control_schema)
+    statement = _READ_SQL.format(control=_identifier(control_schema), sources=" UNION ALL ".join(source_queries))
+    summary = await connection.fetchrow(
+        apply_effective_catalog_sql(statement, catalog_records, control_schema), *sql_args
+    )
+    return _provider_plan_rows(summary)
+
+
 async def read_registry_provider_plans(
     connection, query, *, excluded_network_ids, control_schema=None, manifest=None, network_ids=None
 ):
@@ -293,7 +303,6 @@ async def read_registry_provider_plans(
     exclusions = _exclusions(excluded_network_ids)
     network_ids = _provider_plan_network_ids(network_ids)
     control_schema = control_schema if control_schema is not None else registry_schema()
-    control = _identifier(control_schema)
     try:
         manifest = await _pin_provider_plans(connection, query, manifest, control_schema)
         identity = _identifier(str(NPIData.__table__.schema)) + "." + _identifier(str(NPIData.__table__.name))
@@ -324,12 +333,11 @@ async def read_registry_provider_plans(
                         recipe, approved, control_schema, candidate, sql_args, retained_relation, retained_predicate
                     )
                 )
-        npi_rows = []
-        if source_queries:
-            summary = await connection.fetchrow(
-                _READ_SQL.format(control=control, sources=" UNION ALL ".join(source_queries)), *sql_args
-            )
-            npi_rows = _provider_plan_rows(summary)
+        npi_rows = (
+            await _provider_plan_documents(connection, manifest, control_schema, source_queries, sql_args)
+            if source_queries
+            else []
+        )
         return {
             "generation": str(manifest.generation_id),
             "approved_custom_revision": str(manifest.approved_custom_revision),

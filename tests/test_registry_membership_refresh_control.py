@@ -69,8 +69,7 @@ def test_registry_worker_schema_and_existing_single_job_lane_agree():
     item = next(entry for entry in control_imports.importer_registry() if entry["name"] == IMPORTER)
     assert item["queue"] == "arq:PTGCandidateAudit" and item["function"] == "control_single_job_start"
     assert item["schedulable"] and item["cancelable"]
-    assert {entry["name"] for entry in item["params_schema"]} == set(params())
-    assert all(entry["required"] for entry in item["params_schema"])
+    assert item["params_schema"] == []
     spec = control_workers._BY_IMPORTER_ROLE[(IMPORTER, "start")]
     assert spec.worker_class == "process.PTGCandidateAudit"
     assert control_workers._worker_command("python", spec)[-2:] == ["worker-once", "process.PTGCandidateAudit"]
@@ -100,7 +99,9 @@ async def test_bad_params_fail_before_database_or_queue_and_replay_is_exact(monk
     monkeypatch.setattr(control_imports, "create_pool", queue)
     with pytest.raises(ValueError):
         await control_imports.create_import_run({"importer": IMPORTER, "params": {**params(), "credentials": "no"}})
-    rejected = await control_imports._enqueue_import_start({"importer": IMPORTER, "run_id": "run-a", "params": {}})
+    rejected = await control_imports._enqueue_import_start(
+        {"importer": IMPORTER, "run_id": "run-a", "params": {"source_id": "unexpected"}}
+    )
     assert rejected["status"] == "failed"
     database.execute.assert_not_called()
     queue.assert_not_awaited()
@@ -192,7 +193,9 @@ async def test_fixed_bootstrap_installs_strong_runtime_and_exact_claim_flags(mon
         config = worker.parse_registry_publication_worker_config(json.dumps(configuration()))
         async with AsyncExitStack() as cleanup:
             configured = await worker._membership_refresh_config(config, cleanup, UUID(REQUEST_ID))
-            module.membership_refresh_worker_runtime.assert_awaited_once_with(config, cleanup)
+            module.membership_refresh_worker_runtime.assert_awaited_once_with(
+                config, cleanup, request_id=UUID(REQUEST_ID)
+            )
         assert configured.consumer.only_request_id == UUID(REQUEST_ID)
         assert configured.consumer.membership_refresh_only is True
         assert configured.consumer.membership_refresh_runtime is runtime

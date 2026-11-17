@@ -13,14 +13,22 @@ from uuid import UUID
 
 import asyncpg
 from sanic.exceptions import Forbidden, InvalidUsage, SanicException, ServiceUnavailable
-from sqlalchemy import MetaData, String, all_, bindparam, cast, func, or_, select, text
-from sqlalchemy.dialects.postgresql import ARRAY, INTEGER
+from sqlalchemy import BigInteger, Boolean, MetaData, String, all_, bindparam, cast, func, or_, select, text
+from sqlalchemy.dialects.postgresql import ARRAY, INTEGER, JSONB
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.sql import visitors
 from sqlalchemy.sql.elements import TextClause
 
 from db.models import EntityAddressUnified
 from process.registry_catalog_policy import RegistryOrganizationVisibility
+from process.registry_effective_network_catalog import (
+    apply_effective_catalog_sql,
+    current_catalog_networks_sql,
+    current_catalog_records_sql,
+    effective_catalog_networks_sql,
+    effective_catalog_read_scope,
+    effective_catalog_sql,
+)
 
 _SCOPE = ContextVar("canonical_network_address_scope", default=None)
 
@@ -46,17 +54,52 @@ def current_network_address_scope():
     return _SCOPE.get()
 
 
-def _approved_network_clause(network_id, scope):
-    """Use active approved identity at the exact pinned revision, without listing IDs."""
+def _policy_record_table(alias):
+    """Build the same policy columns from the request's native or legacy read relation."""
     from db.models.registry_approval import RegistryApprovedRecord
     from db.registry_schema import registry_schema
 
-    network = RegistryApprovedRecord.__table__.to_metadata(MetaData(), schema=registry_schema()).alias("policy_network")
-    identity = cast(network_id, String)
+    records = current_catalog_records_sql()
+    if records is None:
+        return RegistryApprovedRecord.__table__.to_metadata(MetaData(), schema=registry_schema()).alias(alias)
     return (
+        text("SELECT approved_revision,record_kind,record_key,record_json FROM " + records + " effective")
+        .columns(approved_revision=BigInteger, record_kind=String, record_key=String, record_json=JSONB)
+        .subquery(alias)
+    )
+
+
+def _policy_relation_sql():
+    from db.registry_schema import registry_schema
+
+    return current_catalog_records_sql() or 'ONLY "' + registry_schema() + '".registry_approved_record'
+
+
+def _approved_network_clause(network_id, scope):
+    """Use active effective identity at the pinned revision, without listing IDs."""
+    if current_catalog_networks_sql() is not None:
+        network = (
+            text("SELECT * FROM " + current_catalog_networks_sql() + " policy")
+            .columns(network_id=INTEGER, archived=Boolean, approved_revision=BigInteger)
+            .subquery("policy_network")
+        )
+        return (
+            select(1)
+            .select_from(network)
+            .where(
+                network.c.network_id == network_id,
+                network.c.archived.is_(False),
+                network.c.approved_revision == scope.manifest.approved_custom_revision,
+                network_id
+                != all_(bindparam("_network_excluded_ids", list(scope.excluded_network_ids), type_=ARRAY(INTEGER))),
+            )
+            .exists()
+        )
+    network = _policy_record_table("policy_network")
+    identity = cast(network_id, String)
+    statement = (
         select(1)
         .select_from(network)
-        .with_hint(network, "ONLY", "postgresql")
         .where(
             network.c.approved_revision == scope.manifest.approved_custom_revision,
             network.c.record_kind == "network",
@@ -67,17 +110,23 @@ def _approved_network_clause(network_id, scope):
             network_id
             != all_(bindparam("_network_excluded_ids", list(scope.excluded_network_ids), type_=ARRAY(INTEGER))),
         )
-        .exists()
     )
+    if current_catalog_records_sql() is None:
+        statement = statement.with_hint(network, "ONLY", "postgresql")
+    return statement.exists()
 
 
 def _visible_membership_predicate():
     """Require an active approved canonical membership permitted by this policy."""
-    from db.registry_schema import registry_schema
-
+    if current_catalog_networks_sql() is not None:
+        return f"""EXISTS(SELECT FROM unnest(canonical_network_ids) AS policy_ids(network_id)
+          JOIN LATERAL (SELECT archived,approved_revision FROM {current_catalog_networks_sql()} selected
+            WHERE selected.network_id=policy_ids.network_id OFFSET 0) policy_network ON true
+          WHERE policy_network.approved_revision=:_network_approved_revision AND NOT policy_network.archived
+            AND NOT policy_ids.network_id=ANY(CAST(:_network_excluded_ids AS integer[])))"""
     return f"""EXISTS (
       SELECT 1 FROM unnest(canonical_network_ids) AS policy_ids(network_id)
-      JOIN ONLY "{registry_schema()}".registry_approved_record policy_network
+      JOIN {_policy_relation_sql()} policy_network
         ON policy_network.record_key=policy_ids.network_id::text
       WHERE policy_network.approved_revision=:_network_approved_revision
         AND policy_network.record_kind='network'
@@ -109,8 +158,6 @@ def scoped_address_aca_insurance_predicate():
     scope = current_network_address_scope()
     if scope is None or scope.legacy_checksums is not None:
         return "NOT (plans_network_array @@ '0'::query_int)"
-    from db.registry_schema import registry_schema
-
     permitted = (
         "policy_ids.network_id=ANY(CAST(:_canonical_network_ids AS INTEGER[]))"
         if scope.network_ids is not None
@@ -119,9 +166,9 @@ def scoped_address_aca_insurance_predicate():
     revision = scope.manifest.approved_custom_revision
     return f"""EXISTS (
       SELECT 1 FROM unnest(canonical_network_ids) AS policy_ids(network_id)
-      JOIN ONLY "{registry_schema()}".registry_approved_record policy_network
+      JOIN {_policy_relation_sql()} policy_network
         ON policy_network.record_key=policy_ids.network_id::text
-      JOIN ONLY "{registry_schema()}".registry_approved_record aca_binding
+      JOIN {_policy_relation_sql()} aca_binding
         ON aca_binding.record_json->>'network_id'=policy_ids.network_id::text
       WHERE policy_network.approved_revision={revision}
         AND policy_network.record_kind='network'
@@ -144,15 +191,10 @@ def scoped_address_aca_insurance_predicate():
 
 def scoped_aca_plan_clause(*, plan_id, year, issuer_id, state, checksum_network):
     """Match complete approved ACA plan coordinates in the pinned revision."""
-    from db.models.registry_approval import RegistryApprovedRecord
-    from db.registry_schema import registry_schema
-
     scope = current_network_address_scope()
     if scope is None:
         raise ValueError("network_address_scope_required")
-    binding = RegistryApprovedRecord.__table__.to_metadata(MetaData(), schema=registry_schema()).alias(
-        "approved_aca_binding"
-    )
+    binding = _policy_record_table("approved_aca_binding")
     binding_record_json = binding.c.record_json
     source_scope = binding_record_json["source_scope_json"]
     network_id = binding_record_json["network_id"].astext.cast(INTEGER)
@@ -286,6 +328,8 @@ def network_address_read_scope(
     _validate_network_scope_inputs(
         manifest, network_ids, access_scope_sha256, excluded_network_ids, organization_policy
     )
+    if manifest.source_generations.get("fhir_catalog") is not None and current_catalog_records_sql() is None:
+        raise ValueError("network_effective_catalog_scope_required")
     if legacy_checksums is not None and (
         network_ids is None
         or type(legacy_checksums) is not tuple
@@ -361,7 +405,12 @@ async def _bound_address_read_session_scope(
         raise ServiceUnavailable(
             "Canonical network data is unavailable.", headers={"Cache-Control": "private, no-store"}
         )
-    with network_address_read_scope(manifest, network_ids, **scope_options) as scope:
+    catalog_records = await effective_catalog_sql(driver, manifest, approved_relation.schema_name)
+    networks = await effective_catalog_networks_sql(driver, manifest, approved_relation.schema_name)
+    with (
+        effective_catalog_read_scope(catalog_records, networks),
+        network_address_read_scope(manifest, network_ids, **scope_options) as scope,
+    ):
         if scope.legacy_checksums is not None:
             await _require_legacy_mapping(driver, approved_relation, manifest, network_ids, scope.legacy_checksums)
         if session.get_transaction() is not transaction:
@@ -382,7 +431,11 @@ async def _require_legacy_mapping(driver, approved_relation, manifest, network_i
 
     try:
         mapping = await driver.fetchrow(
-            _LEGACY_BATCH_SQL.format(control="ONLY " + _identifier(approved_relation.schema_name)),
+            apply_effective_catalog_sql(
+                _LEGACY_BATCH_SQL.format(control="ONLY " + _identifier(approved_relation.schema_name)),
+                current_catalog_records_sql(),
+                approved_relation.schema_name,
+            ),
             manifest.approved_custom_revision,
             tuple(map(str, legacy_checksums)),
             "checksum_network",

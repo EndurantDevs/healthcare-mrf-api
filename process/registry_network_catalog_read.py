@@ -25,6 +25,7 @@ from process.network_fhir_retained_capture_contract import PRODUCER as RETAINED_
 from process.network_fhir_retained_capture_contract import is_sha256
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_catalog_policy import RegistryOrganizationVisibility
+from process.registry_effective_network_catalog import apply_effective_catalog_sql, effective_catalog_sql
 from process.registry_fhir_plan_tier import (
     KIND as PLAN_TIER_KIND,
 )
@@ -144,10 +145,34 @@ def _legacy_fhir_scope(scope):
     _text(scope["alias_scope"], 512)
 
 
+def _native_provider_scope(system, scope):
+    if not is_sha256(scope.get("source_generation")):
+        raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+    if system == "aca":
+        if set(scope) != {"issuer_id", "plan_id", "plan_year", "state", "checksum_network", "source_generation"}:
+            raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+        _text(scope["issuer_id"], 128)
+        _text(scope["plan_id"], 256)
+        _text(scope["state"], 2)
+        _integer(scope["plan_year"], 2100, minimum=2010)
+        _integer(scope["checksum_network"], 2147483647, minimum=-2147483648)
+        return scope
+    if system == "ptg" and set(scope) == {"kind", "source_generation", "source_key", "snapshot_id", "snapshot_key"}:
+        if scope["kind"] != "imported_provider_set_v1":
+            raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+        _text(scope["source_key"], 96)
+        _text(scope["snapshot_id"], 96)
+        _integer(scope["snapshot_key"], 9223372036854775807, minimum=0)
+        return scope
+    raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+
+
 def _source_scope(system, scope, *, producer_id=None):
     """Validate the closed scope for its exact source system and producer."""
     if type(scope) is not dict:
         raise RegistryNetworkCatalogError("registry_network_catalog_document_invalid")
+    if producer_id == "registry-native-network-source-v1":
+        return _native_provider_scope(system, scope)
     if system == "fhir" and scope.get("kind") == PLAN_TIER_KIND:
         return _typed_plan_tier_scope(scope, producer_id)
     if system == "fhir" and producer_id == "registry-fhir-catalog-v1":
@@ -626,10 +651,23 @@ def catalog_network_document(document):
 _network_document = catalog_network_document
 
 
-async def _page(connection, manifest, query, exclusions, control_schema, network_ids=None, organization_policy=None):
+async def _page_entry(
+    connection, manifest, query, exclusions, control_schema, network_ids=None, organization_policy=None
+):
+    """Prepare one bounded page using the effective native or legacy catalogue."""
     if organization_policy is not None and type(organization_policy) is not RegistryOrganizationVisibility:
         raise RegistryNetworkCatalogError("registry_network_catalog_policy_invalid")
     sql = _BASE_SQL if organization_policy is None else _ORGANIZATION_SQL
+    catalog_records = await effective_catalog_sql(connection, manifest, control_schema)
+    if catalog_records is not None:
+        sql = sql.replace(
+            "FROM declared_assertions GROUP BY network_id",
+            """FROM (
+          SELECT network_id,benefit_code FROM declared_assertions UNION
+          SELECT network_id,jsonb_array_elements_text(CASE WHEN jsonb_typeof(record_json->'benefit_codes')='array'
+            THEN record_json->'benefit_codes' ELSE '[]'::jsonb END) FROM visible
+        ) assertions GROUP BY network_id""",
+        )
     parameters = (
         manifest.approved_custom_revision,
         exclusions,
@@ -646,11 +684,20 @@ async def _page(connection, manifest, query, exclusions, control_schema, network
         parameters += (organization_policy.excluded_company_ids, organization_policy.excluded_group_ids)
     addresses, address_parameters = catalog_directory_relation(manifest, first_parameter=len(parameters) + 1)
     entry = await connection.fetchrow(
-        sql.format(
-            control=_identifier(control_schema), candidate=_identifier(manifest.schema_name), addresses=addresses
+        apply_effective_catalog_sql(
+            sql.format(
+                control=_identifier(control_schema), candidate=_identifier(manifest.schema_name), addresses=addresses
+            ),
+            catalog_records,
+            control_schema,
         ),
         *(parameters + address_parameters),
     )
+    return entry
+
+
+async def _page(connection, manifest, query, exclusions, control_schema, network_ids=None, organization_policy=None):
+    entry = await _page_entry(connection, manifest, query, exclusions, control_schema, network_ids, organization_policy)
     if entry is None or entry["bounded"] is not True:
         raise RegistryNetworkCatalogError("registry_network_catalog_response_bounds")
     documents = _closed_json(entry["rows_json"].encode(), MAX_RESPONSE_BYTES)
@@ -764,8 +811,9 @@ async def resolve_registry_network_catalog_legacy(
     control = _identifier(control_schema)
     try:
         manifest = await _catalog_manifest(connection, generation_id, control_schema, manifest)
+        catalog_records = await effective_catalog_sql(connection, manifest, control_schema)
         match = await connection.fetchrow(
-            _LEGACY_SCOPE_SQL.format(control=control),
+            apply_effective_catalog_sql(_LEGACY_SCOPE_SQL.format(control=control), catalog_records, control_schema),
             manifest.approved_custom_revision,
             selector.source.sql_parameters,
             selector.source_scope_json.decode("utf-8"),
@@ -832,8 +880,9 @@ async def _resolve_legacy_batch(
     control = _identifier(control_schema)
     try:
         manifest = await _catalog_manifest(connection, generation_id, control_schema, manifest)
+        catalog_records = await effective_catalog_sql(connection, manifest, control_schema)
         matches = await connection.fetchrow(
-            _LEGACY_BATCH_SQL.format(control=control),
+            apply_effective_catalog_sql(_LEGACY_BATCH_SQL.format(control=control), catalog_records, control_schema),
             manifest.approved_custom_revision,
             selector.values,
             selector.namespace,
@@ -995,11 +1044,16 @@ def _autocomplete_document(document):
 
 
 async def _autocomplete_page(connection, manifest, query, exclusions, control_schema, states):
+    catalog_records = await effective_catalog_sql(connection, manifest, control_schema)
     entry = await connection.fetchrow(
-        _AUTOCOMPLETE_SQL.format(
-            control=_identifier(control_schema),
-            plans=_autocomplete_table(Plan),
-            tiers=_autocomplete_table(PlanNetworkTierRaw),
+        apply_effective_catalog_sql(
+            _AUTOCOMPLETE_SQL.format(
+                control=_identifier(control_schema),
+                plans=_autocomplete_table(Plan),
+                tiers=_autocomplete_table(PlanNetworkTierRaw),
+            ),
+            catalog_records,
+            control_schema,
         ),
         manifest.approved_custom_revision,
         exclusions,

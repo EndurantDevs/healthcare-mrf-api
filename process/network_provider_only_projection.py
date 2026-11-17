@@ -9,6 +9,7 @@ the returned receipt to that closure, and pin the approved revision before reads
 import hashlib
 import re
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from uuid import UUID, uuid4
 
 from process.network_address_projection import _identifier
@@ -186,6 +187,9 @@ async def prepare_provider_only_projection(connection, copy_target, recipes, sta
         await _append_typed_staged_sources(
             connection, _relation(copy_target.schema_name), recipes, stage, approved, control_schema
         )
+        await _append_native_staged_sources(
+            connection, _relation(copy_target.schema_name), recipes, stage, approved, control_schema
+        )
         return
     recipes_by_identity, descriptors_by_identity = _staged_sources(recipes, stage)
     await _candidate(connection, copy_target, approved, control_schema, preparing=True)
@@ -198,6 +202,9 @@ async def prepare_provider_only_projection(connection, copy_target, recipes, sta
         stage,
         approved,
         control_schema,
+    )
+    await _append_native_staged_sources(
+        connection, _relation(copy_target.schema_name), recipes, stage, approved, control_schema
     )
 
 
@@ -580,16 +587,100 @@ async def _verify_staged_provider_only_projection(
             identity = await _append_typed_staged_sources(
                 connection, expected, recipes, stage, approved, control_schema
             )
-            return await _expected_receipt(
-                connection, copy_target, expected, len(stage.contribution_receipts), identity
+            await _append_native_staged_sources(
+                connection, expected, recipes, stage, approved, control_schema, verify_source=True
             )
+            source_count, identity = _provider_source_commitment(stage)
+            return await _expected_receipt(connection, copy_target, expected, source_count, identity)
     recipes_by_identity, descriptors_by_identity = _staged_sources(recipes, stage)
     await _candidate(connection, copy_target, approved, control_schema, preparing=False)
     async with _expected_evidence(connection) as (_name, expected):
         identity_sha256 = await _append_staged_sources(
             connection, expected, recipes_by_identity, descriptors_by_identity, stage, approved, control_schema
         )
-        return await _expected_receipt(connection, copy_target, expected, len(recipes_by_identity), identity_sha256)
+        await _append_native_staged_sources(
+            connection, expected, recipes, stage, approved, control_schema, verify_source=True
+        )
+        source_count, identity_sha256 = _provider_source_commitment(stage)
+        return await _expected_receipt(connection, copy_target, expected, source_count, identity_sha256)
+
+
+def _provider_source_commitment(stage):
+    identities = [entry["recipe_sha256"] for entry in stage.contribution_receipts]
+    identities.extend(entry.recipe_sha256 for entry in getattr(stage, "native_provider_stages", ()))
+    _require(len(identities) == len(set(identities)))
+    return len(identities), hashlib.sha256("".join(sorted(identities)).encode("ascii")).hexdigest()
+
+
+async def _native_projection_inputs(connection, recipes, native_stages, control_schema, should_verify):
+    from process.registry_native_provider_source import (
+        NativeProviderStage,
+        PinnedNativeProviderMembershipSource,
+        load_retained_native_provider_captures,
+    )
+
+    recipes_by_identity = {
+        hashlib.sha256(canonical_registry_source_recipes((recipe,)).encode()).hexdigest(): recipe
+        for recipe in recipes
+        if type(recipe.source_pin) is PinnedNativeProviderMembershipSource
+    }
+    _require(type(native_stages) is tuple and len(native_stages) == len(recipes_by_identity))
+    _require(all(type(native) is NativeProviderStage for native in native_stages))
+    _require({native.recipe_sha256 for native in native_stages} == set(recipes_by_identity))
+    predecessor = native_stages[0].source_manifest
+    _require(all(native.source_manifest == predecessor for native in native_stages))
+    retained_captures = (
+        await load_retained_native_provider_captures(connection, predecessor, control_schema) if should_verify else None
+    )
+    return recipes_by_identity, predecessor, retained_captures
+
+
+async def _append_native_staged_sources(
+    connection, destination, recipes, stage, approved, control_schema, *, verify_source=False
+):
+    native_stages = getattr(stage, "native_provider_stages", ())
+    if not native_stages:
+        return
+    from process.registry_native_provider_source import rebuild_native_provider_stage
+
+    recipes_by_identity, predecessor, retained_captures = await _native_projection_inputs(
+        connection, recipes, native_stages, control_schema, verify_source
+    )
+    for native in native_stages:
+        recipe = recipes_by_identity[native.recipe_sha256]
+        _require(
+            native.capture_sha256 == recipe.source_pin.generation_id
+            and native.catalog_generation == recipe.source_pin.catalog_generation
+        )
+        rebuilt = (
+            await rebuild_native_provider_stage(
+                connection,
+                recipe,
+                approved,
+                catalog_scope=native.catalog_scope,
+                control_schema=control_schema,
+                verify_source=True,
+                source_manifest=predecessor,
+                retained_captures=retained_captures,
+            )
+            if verify_source
+            else native
+        )
+        relation = rebuilt.provider_only_table
+        _require(
+            type(relation) is str
+            and re.fullmatch(r'pg_temp\."native_provider_mapped_[0-9a-f]{32}"', relation) is not None
+        )
+        if verify_source:
+            _require(rebuilt.provider_only_table != native.provider_only_table)
+        try:
+            _require(replace(rebuilt, provider_only_table=native.provider_only_table) == native)
+            await connection.execute(
+                f"INSERT INTO {destination}({COLUMNS}) SELECT {COLUMNS} FROM {relation} ON CONFLICT DO NOTHING"
+            )
+        finally:
+            if verify_source:
+                await drain_operation(connection.execute(f"DROP TABLE {relation}"), preserve_cancellation=True)
 
 
 async def _append_typed_staged_sources(connection, expected, recipes, stage, approved, control_schema):
@@ -615,7 +706,30 @@ async def _append_typed_staged_sources(connection, expected, recipes, stage, app
     return hashlib.sha256("".join(identities).encode("ascii")).hexdigest()
 
 
-def provider_only_page_sql(schema_name, *, control_schema=None):
+def _provider_only_binding_scope(include_imported):
+    organization = "binding.record_json->'source_scope_json'->>'organization_id'=binding.record_json->>'source_key'"
+    if include_imported:
+        organization += " OR binding.record_json->'source_scope_json'->>'kind'='uhc_plan_tier_v1'"
+    fhir_scope = (
+        """binding.record_json->'source_scope_json'->>source.fhir_scope_key=source.fhir_scope_value
+      AND (source.fhir_scope_key='alias_scope' OR source.fhir_scope_key IN ('capture_sha256','source_generation')
+        AND ("""
+        + organization
+        + "))"
+    )
+    if not include_imported:
+        return "source.source_system='fhir'", fhir_scope
+    return (
+        "source.source_system IN ('fhir','aca','ptg')",
+        """(
+      source.source_system<>'fhir' AND source.fhir_scope_key IS NULL AND source.fhir_scope_value IS NULL
+      OR source.source_system='fhir' AND ("""
+        + fhir_scope
+        + "))",
+    )
+
+
+def provider_only_page_sql(schema_name, *, control_schema=None, catalog_records=None):
     """Constant-shape SQL after independent closure; arguments are revision, networks,
     limit, offset, maximum evidence, maximum bytes and pinned generation.
 
@@ -625,6 +739,7 @@ def provider_only_page_sql(schema_name, *, control_schema=None):
     from api.network_provider_only_read import _PAGE_SQL
 
     namespace, inventory = _control_namespace(control_schema), _identifier(schema_name) + "." + INVENTORY_TABLE
+    source_predicate, scope_predicate = _provider_only_binding_scope(catalog_records is not None)
     # Share the existing response, ordering and byte/evidence bounds exactly.
     suffix = "), identities AS MATERIALIZED (" + _PAGE_SQL.split("), identities AS MATERIALIZED (", 1)[1]
     prefix = f"""WITH selected_bindings AS MATERIALIZED (
@@ -634,16 +749,14 @@ def provider_only_page_sql(schema_name, *, control_schema=None):
           AND binding.record_json->>'network_id' ~ '^[1-9][0-9]{{0,9}}$'
         THEN CASE WHEN (binding.record_json->>'network_id')::numeric<=2147483647
           THEN (binding.record_json->>'network_id')::integer END END AS network_id) parsed
-      JOIN ONLY {inventory} source ON source.source_system='fhir'
+      JOIN ONLY {inventory} source ON {source_predicate}
         AND binding.record_json->>'source_system'=source.source_system
         AND binding.record_json->>'source_id'=source.source_id
         AND binding.record_json->>'dataset_schema'=source.dataset_schema
         AND binding.record_json->>'dataset_id'=source.dataset_id
         AND binding.record_json->>'producer_id'=source.producer_id
         AND binding.record_json->>'edition_id'=source.edition_id
-        AND binding.record_json->'source_scope_json'->>source.fhir_scope_key=source.fhir_scope_value
-        AND (source.fhir_scope_key='alias_scope' OR source.fhir_scope_key IN ('capture_sha256','source_generation')
-          AND binding.record_json->'source_scope_json'->>'organization_id'=binding.record_json->>'source_key')
+        AND {scope_predicate}
       JOIN ONLY {namespace}.registry_approved_record network ON network.approved_revision=$1
         AND network.record_kind='network' AND network.record_key=parsed.network_id::text
         AND network.record_json->'archived'='false'::jsonb
@@ -656,4 +769,10 @@ def provider_only_page_sql(schema_name, *, control_schema=None):
       WHERE network_id=ANY($2::integer[]) AND EXISTS(
         SELECT 1 FROM selected_bindings approved WHERE approved.network_id=evidence.network_id)
     """
-    return prefix + suffix.format(first=2, limit=3, offset=4, maximum_evidence=5, maximum_bytes=6, generation=7)
+    from process.registry_effective_network_catalog import apply_effective_catalog_sql
+
+    return apply_effective_catalog_sql(
+        prefix + suffix.format(first=2, limit=3, offset=4, maximum_evidence=5, maximum_bytes=6, generation=7),
+        catalog_records,
+        namespace[1:-1],
+    )

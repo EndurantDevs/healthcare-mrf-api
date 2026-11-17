@@ -45,14 +45,15 @@ async def test_search_keyset_reuses_direct_range_shape_after_first_batch():
     )
     first, second, final = connection.fetchrow.await_args_list
     assert "WHERE $1::text IS NULL" in first.args[0]
-    assert "WHERE a.location_key>$1::text" in second.args[0]
+    assert "WHERE edge.location_key>$1::text" in second.args[0]
+    assert "a.location_key=selected.location_key" in second.args[0]
     assert "IS NULL OR" not in second.args[0] and second.args[0] == final.args[0]
     assert first.args[1:] == (None, UUID(candidate_id))
     assert second.args[1:] == ("office-a", UUID(candidate_id))
 
 
 @pytest.mark.asyncio
-async def test_search_later_batch_has_index_range_under_generic_plan(search_db):
+async def test_search_generic_plan_uses_edge_range_and_exact_address_lookup(search_db):
     db, layout = search_db, search_db.second_layout
     base = search._qualified(layout.base)
     fields = ",".join(
@@ -64,18 +65,37 @@ async def test_search_later_batch_has_index_range_under_generic_plan(search_db):
         f"CROSS JOIN (SELECT * FROM ONLY {base} ORDER BY location_key LIMIT 1) a"
     )
     await db.connection.execute(f"ANALYZE {base}")
+    artifact = layout.artifacts[0]
+    edge = '"' + artifact.schema_name + '".network_office_edge'
+    await db.connection.execute(
+        f"INSERT INTO {edge} SELECT slice_id,'seek-'||lpad(sequence::text,5,'0') "
+        f"FROM (SELECT slice_id FROM {edge} ORDER BY slice_id LIMIT 1) selected "
+        "CROSS JOIN generate_series(1,6000) sequence"
+    )
+    await db.connection.execute(f"ANALYZE {edge}")
     await db.connection.execute("SET LOCAL plan_cache_mode='force_generic_plan'")
     ctes = search._batch_ctes(layout, layout.base, is_base=True, has_after=True)
     kinds = ",".join(("text", *("uuid" for _ in layout.artifacts)))
     await db.connection.execute(f"PREPARE search_keyset({kinds}) AS WITH {ctes} SELECT location_key FROM source_page")
-    values = ",".join(("'seek-04000'", *("'" + artifact.candidate_id + "'" for artifact in layout.artifacts)))
-    explained = json.loads(await db.connection.fetchval(f"EXPLAIN(FORMAT JSON) EXECUTE search_keyset({values})"))
+    prepared_arguments = ",".join(
+        ("'seek-04000'", *("'" + artifact.candidate_id + "'" for artifact in layout.artifacts))
+    )
+    explained = json.loads(
+        await db.connection.fetchval(
+            f"EXPLAIN(ANALYZE,BUFFERS,FORMAT JSON) EXECUTE search_keyset({prepared_arguments})"
+        )
+    )
     pending_nodes, index_conditions = [explained[0]["Plan"]], []
     while pending_nodes:
         plan_node = pending_nodes.pop()
         index_conditions.append(plan_node.get("Index Cond", ""))
         pending_nodes.extend(plan_node.get("Plans", ()))
-    assert any("location_key" in condition and "> $1" in condition for condition in index_conditions)
+    assert any("location_key" in condition and "> $1" in condition for condition in index_conditions), json.dumps(
+        explained
+    )
+    assert any(
+        "location_key" in condition and "selected.location_key" in condition for condition in index_conditions
+    ), json.dumps(explained)
     await db.connection.execute("DEALLOCATE search_keyset")
 
 
