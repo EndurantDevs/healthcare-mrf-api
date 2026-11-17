@@ -39,6 +39,7 @@ npi_api = importlib.import_module("api.endpoint.npi")
 fhir = importlib.import_module("process.provider_directory_fhir")
 NPI = 1000000004
 STAMP = datetime(2026, 1, 1)
+DETAIL_RELATION_COUNT = 59
 RELATIONS = tuple(
     dict.fromkeys(
         (
@@ -60,7 +61,10 @@ async def _install_detail_tables(component, monkeypatch):
             "npi_canonical_publication_receipt",
             "npi_canonical_publication_receipt_seal",
         }
-        wanted = (set(RELATIONS) | {"provider_directory_api_endpoint", "import_run"}) - later_names
+        # Source still owns the typed Endpoint table outside the Reader grant set.
+        wanted = (
+            set(RELATIONS) | {"provider_directory_api_endpoint", "provider_directory_endpoint", "import_run"}
+        ) - later_names
         tables_by_name = {table.name: table for table in models.db.metadata.tables.values() if table.name in wanted}
         metadata = MetaData(schema=schema)
         for table in tables_by_name.values():
@@ -76,7 +80,7 @@ async def _install_detail_tables(component, monkeypatch):
         await _install_detail_migrations(connection)
         await _grant_nppes_fixture_inputs(connection, component.policy)
         after_by_name = await snapshot._inventory_relation_names(connection, schema, RELATIONS)
-        assert len(after_by_name) == 60
+        assert len(after_by_name) == DETAIL_RELATION_COUNT
         assert all(
             available
             for name, available in after_by_name.items()
@@ -456,7 +460,7 @@ async def _detail_source_fixture(monkeypatch):
             monkeypatch.setattr(fhir, "db", component.database)
             async with component.admin_engine.begin() as connection:
                 after_by_name = await snapshot._inventory_relation_names(connection, component.policy.schema, RELATIONS)
-                assert len(after_by_name) == 60 and all(after_by_name.values())
+                assert len(after_by_name) == DETAIL_RELATION_COUNT and all(after_by_name.values())
                 await _grant_detail_reads(connection, component, after_by_name, after_by_name)
             yield SimpleNamespace(
                 engine=component.admin_engine,
@@ -470,7 +474,7 @@ async def _detail_source_fixture(monkeypatch):
 @asynccontextmanager
 async def detail_database(monkeypatch, tmp_path):
     """Install all detail families and seal the genuine NPI receipt on populated tables."""
-    assert len(RELATIONS) == 60
+    assert len(RELATIONS) == DETAIL_RELATION_COUNT
 
     async with (
         _detail_source_fixture(monkeypatch) as fixture,
@@ -498,7 +502,7 @@ async def detail_database(monkeypatch, tmp_path):
             await raw.close()
         async with fixture.database.transaction() as session:
             availability = await snapshot._inventory_relation_names(session, fixture.schema, RELATIONS)
-            assert len(availability) == 60 and all(availability.values())
+            assert len(availability) == DETAIL_RELATION_COUNT and all(availability.values())
             fixture.npi_identity = await npi_api._npi_canonical_publication_identity(session=session)
             # Ordinary native writes have no portable response-cache invalidation contract.
             assert fixture.npi_identity is None
