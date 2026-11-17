@@ -15,7 +15,7 @@ async def _sealed_snapshot(connection, copy_target, control_schema):
     control = await custody._control(connection, control_schema)
     candidate = await custody._candidate(connection, copy_target, control_schema)
     seal = await custody._seal(connection, copy_target, control_schema)
-    verified = await custody._verify(connection, copy_target, control_schema, control, candidate, seal)
+    verified = await custody._verify(connection, copy_target, candidate, seal)
     return control, candidate, seal, verified
 
 
@@ -23,10 +23,10 @@ async def read_sealed_source_inventory_for_maintenance(connection, copy_target, 
     """Fold immutable metadata under maintenance locks in a fresh RC transaction.
 
     Cleanup checks run before and after their exact exclusive target locks, so
-    they must not reuse an older repeatable-read snapshot. Full native custody
-    verifies and locks the independently sealed heaps before this fold. A second
-    full verification checks fresh control, seal and normalized candidate evidence;
-    publication and its matching checkpoint may advance without changing that evidence.
+    they must not reuse an older repeatable-read snapshot. The stored seal is
+    decoded and the sealed heaps are share-locked before this fold. A second read
+    checks that control, seal and the inventory reference are unchanged;
+    publication and its matching checkpoint may advance meanwhile.
     The caller keeps the transaction and all locks until its cleanup decision ends.
     This grants neither Source admission nor API read authority.
     """

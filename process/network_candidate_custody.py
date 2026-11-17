@@ -343,11 +343,12 @@ async def _seal(connection, target, schema):
 
 
 async def _heap_guards(connection, catalog):
+    # pg_class comes from the read snapshot, which can predate the lock; row_security_active sees the current state.
     _require(
         await connection.fetchval(
             """SELECT count(*)=cardinality($1::oid[]) AND bool_and(
           c.relam=(SELECT oid FROM pg_am WHERE amname='heap') AND NOT c.relrowsecurity
-          AND NOT c.relforcerowsecurity AND NOT c.relispartition
+          AND NOT c.relforcerowsecurity AND NOT c.relispartition AND NOT pg_catalog.row_security_active(c.oid)
           AND NOT EXISTS(SELECT FROM pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)
           AND NOT EXISTS(SELECT FROM pg_trigger WHERE tgrelid=c.oid AND NOT tgisinternal)
           AND NOT EXISTS(SELECT FROM pg_rewrite WHERE ev_class=c.oid))
@@ -664,8 +665,8 @@ async def _candidate_index_digest(connection, candidate):
     return await _index_digest(connection, candidate["schema_name"], _serving_plan(candidate["schema_name"]))
 
 
-async def _verify(connection, copy_target, schema, control, candidate, seal, *, operator=False):
-    """Verify sealed metadata and hold shared locks on the candidate's objects."""
+async def _verify(connection, copy_target, candidate, seal, *, operator=False):
+    """Decode the stored seal and hold shared locks on the candidate's plain, unfiltered heaps."""
     _require(candidate["state"] in ("ready", "published") and seal is not None)
     receipt = _sealed_receipt(seal)
     from process.network_compact_readiness import is_compact_candidate
@@ -675,65 +676,30 @@ async def _verify(connection, copy_target, schema, control, candidate, seal, *, 
         from process.network_sampled_custody import validate_sampled_custody
 
         validate_sampled_custody(receipt["semantic_validation"], candidate_id=copy_target.candidate_id)
-    control_identity_by_name = _control_identity(control, receipt["revision"])
-    _require(
-        receipt["control"] == control_identity_by_name
-        and receipt["candidate_sha256"] == _digest(_evidence(candidate, revision=receipt["revision"]))
-    )
-    runtime_roles = receipt["runtime_roles"]
-    _require(
-        type(runtime_roles) is list and 0 < len(runtime_roles) <= 128 and runtime_roles == sorted(set(runtime_roles))
-    )
-    for role in runtime_roles:
-        _identifier(role)
-    closure = receipt["closure"]
-    _require(
-        type(closure) is dict
-        and type(closure.get("reader_roles")) is list
-        and closure.get("loader_roles") == []
-        and closure.get("owner_role") == control["rolname"]
-    )
-    _require(set(closure["reader_roles"]) <= set(runtime_roles))
-    roles = _final_roles(control["rolname"], tuple(closure["reader_roles"]))
-    _require(closure["owner_role"] == control["rolname"] and closure["loader_roles"] == [])
-    catalog = await _lock_objects(connection, copy_target, candidate, exclusive=False, assume_owner=operator)
-    _require(_receipt(copy_target, roles, catalog) == closure)
-    await _check_closed(connection, roles, catalog)
-    await _census_closed(connection, control, catalog, runtime_roles)
-    await _address_runtime_closure(connection, candidate, runtime_roles)
-    _require(await _candidate_index_digest(connection, candidate) == receipt["index_definition_sha256"])
+    await _lock_objects(connection, copy_target, candidate, exclusive=False, assume_owner=operator)
     return {"seal_sha256": seal["seal_sha256"], "receipt": receipt}
 
 
 async def verify_network_candidate_custody(connection, copy_target, *, control_schema, required=True):
-    """Verify a retained seal and hold same-object AccessShare locks in caller RR RO/RW.
+    """Decode a retained seal and hold same-object AccessShare locks in caller RR RO/RW.
 
-    No candidate fact rows are read. Missing legacy seals refuse; callers retain
-    their explicit legacy full-validation path. This grants no publication authority.
+    No candidate fact rows are read and no owner, grant, role or object id is compared.
+    Missing legacy seals refuse; callers retain their explicit legacy full-validation
+    path. This grants no publication authority.
     """
     _require(connection.is_in_transaction())
     _require(type(required) is bool)
     _require(type(copy_target) is MembershipCopyTarget)
-    _identifier(control_schema)
-    if not required:
-        exists = await connection.fetchval(
-            "SELECT to_regclass($1)::oid", f"{_identifier(control_schema)}.network_candidate_custody"
-        )
-        if exists is None:
-            return None
-        seal = await _seal(connection, copy_target, control_schema)
-        if seal is None:
-            return None
-    else:
-        control = await _control(connection, control_schema)
-        seal = await _seal(connection, copy_target, control_schema)
-    if not required:
-        control = await _control(connection, control_schema)
+    exists = await connection.fetchval(
+        "SELECT to_regclass($1)::oid", f"{_identifier(control_schema)}.network_candidate_custody"
+    )
+    seal = None if exists is None else await _seal(connection, copy_target, control_schema)
+    if seal is None:
+        _require(not required)
+        return None
     candidate = await _candidate(connection, copy_target, control_schema)
     _require(await connection.fetchval("SHOW transaction_isolation") in ("repeatable read", "serializable"))
-    result = await _verify(connection, copy_target, control_schema, control, candidate, seal)
-    _require(await _control(connection, control_schema) == control)
-    return result
+    return await _verify(connection, copy_target, candidate, seal)
 
 
 @dataclass(frozen=True)
@@ -812,15 +778,7 @@ async def _store_candidate_seal(
                     f"GRANT SELECT ON {_identifier(control_schema)}.network_candidate_custody TO {_identifier(role)}"
                 )
         stored = await _seal(connection, copy_target, control_schema)
-    return await _verify(
-        connection,
-        copy_target,
-        control_schema,
-        control,
-        candidate,
-        stored,
-        operator=True,
-    )
+    return await _verify(connection, copy_target, candidate, stored, operator=True)
 
 
 def _validated_seal_options(options):
@@ -976,9 +934,7 @@ async def _seal_or_verify_candidate(
     async with _control_owner(connection, control["rolname"]):
         existing = await _seal(connection, copy_target, control_schema)
     if existing is not None:
-        sealed_result = await _verify(
-            connection, copy_target, control_schema, control, candidate, existing, operator=True
-        )
+        sealed_result = await _verify(connection, copy_target, candidate, existing, operator=True)
         if sealed_result["receipt"]["revision"] == 5:
             source_runtime = seal_options.get("source_witness_runtime")
             sampling = None if source_runtime is None else source_runtime.semantic_validation

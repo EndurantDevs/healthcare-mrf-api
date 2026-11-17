@@ -1655,7 +1655,11 @@ async def test_native_legacy_http_other_refusals_keep_existing_boundary(legacy_c
         assert reply.headers["X-Network-Access-Scope"] == document["access_scope_sha256"]
 
 
-from process.network_candidate_custody import seal_network_candidate_custody, verify_network_candidate_custody
+from process.network_candidate_custody import (
+    NetworkCandidateCustodyError,
+    seal_network_candidate_custody,
+    verify_network_candidate_custody,
+)
 from process.network_membership_pipeline import prepare_network_candidate
 from process.network_membership_writer_closure import _acl_rows, _catalog, _default_acl_rows
 
@@ -1990,6 +1994,39 @@ async def _assert_custody_reader_locks(fixture, copy_target, receipt):
         await fixture.reader.execute("RESET ROLE")
 
 
+async def _assert_seal_read_guards(fixture, copy_target, receipt):
+    """The seal read refuses a changed receipt or a row-filtered heap and accepts re-created tables."""
+    admin, ledger = fixture.connection, f'"{fixture.control_schema}".network_candidate_custody'
+    table = f'"{copy_target.schema_name}".network_membership'
+
+    async def read(connection):
+        return await verify_network_candidate_custody(connection, copy_target, control_schema=fixture.control_schema)
+
+    stored = f"UPDATE {ledger} SET seal_sha256=$2 WHERE candidate_id=$1"
+    await admin.execute(stored, UUID(copy_target.candidate_id), "0" * 64)
+    async with _reader(fixture) as connection:
+        with pytest.raises(NetworkCandidateCustodyError):
+            await read(connection)
+    await admin.execute(stored, UUID(copy_target.candidate_id), receipt["seal_sha256"])
+    async with _reader(fixture) as connection:
+        # Row security enabled after the reader's snapshot is invisible in its pg_class and must still refuse.
+        await connection.fetchval("SELECT 1")
+        await admin.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+        with pytest.raises(NetworkCandidateCustodyError):
+            await read(connection)
+    await admin.execute(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY")
+    await admin.execute(
+        f"CREATE TABLE {table}_copy (LIKE {table} INCLUDING ALL);"
+        f"INSERT INTO {table}_copy SELECT * FROM {table}; DROP TABLE {table};"
+        f"ALTER TABLE {table}_copy RENAME TO network_membership;"
+        f'GRANT SELECT ON {table} TO "{fixture.roles["reader"]}"'
+    )
+    async with _reader(fixture) as connection:
+        assert await read(connection) == receipt
+        sealed_oid = receipt["receipt"]["closure"]["relation_oids"]["network_membership"]
+        assert await connection.fetchval("SELECT to_regclass($1)::oid::bigint", table) != sealed_oid
+
+
 async def test_independent_candidate_custody_preserves_logical_proof_and_reader_locks(catalog_db):
     """Native seal foundation; legacy directory-loss behavior remains separately tested."""
 
@@ -2036,6 +2073,7 @@ async def test_independent_candidate_custody_preserves_logical_proof_and_reader_
     async with fixture.connection.transaction(isolation="repeatable_read"):
         await publish_network_candidate(fixture.connection, copy_target, control_schema=fixture.control_schema)
     await _assert_custody_reader_locks(fixture, copy_target, receipt)
+    await _assert_seal_read_guards(fixture, copy_target, receipt)
 
 
 async def _assert_custody_control_owner(admin, namespace, control_schema):

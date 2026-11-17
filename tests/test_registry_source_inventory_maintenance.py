@@ -97,7 +97,7 @@ async def test_maintenance_snapshot_uses_full_real_custody_verifier(monkeypatch)
         seal,
         verified_by_field,
     )
-    verify.assert_awaited_once_with(connection, target, "control", control, candidate_by_field, seal)
+    verify.assert_awaited_once_with(connection, target, candidate_by_field, seal)
 
 
 @pytest.mark.parametrize("stage", ["first_custody", "fold", "second_custody"])
