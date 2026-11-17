@@ -4,6 +4,7 @@
 from collections import Counter
 
 from process.provider_directory_projection_fhir_values import is_valid_npi
+from process.vsp_directory_contract import NETWORKS
 
 _NETWORK_NAMES = {"1000": "VSP Signature", "2000": "VSP Choice", "4000": "VSP Advantage"}
 _PLAN_NET = "http://hl7.org/fhir/us/davinci-pdex-plan-net/StructureDefinition/"
@@ -64,9 +65,9 @@ def _network_ids(values):
     if not isinstance(values, list):
         raise VSPDirectoryNormalizationError("vsp_directory_invalid_network_ids")
     for code in values:
-        if not isinstance(code, str) or not 0 < len(code) <= 64 or not code.isprintable() or code.strip() != code:
+        if not isinstance(code, str) or not 0 < len(code) <= 64 or not code.isprintable() or not code.strip():
             raise VSPDirectoryNormalizationError("vsp_directory_invalid_network_ids")
-    return set(values)
+    return {code.strip() for code in values}
 
 
 def _profile_networks(profile):
@@ -78,6 +79,24 @@ def _profile_networks(profile):
         if _network_ids([entry.get("networkId") for entry in entries]) != codes:
             raise VSPDirectoryNormalizationError("vsp_directory_conflicting_network_ids")
     return codes
+
+
+def _selected_networks(office, networks_by_doctor, search_memberships):
+    selected_by_doctor = {}
+    for doctor_id, codes in networks_by_doctor.items():
+        members = codes & _NETWORK_NAMES.keys()
+        if not members and office.get("locationType") == "Affiliate":
+            members = {code for code, name in NETWORKS.items() if str(doctor_id) in search_memberships.get(name, ())}
+        if members:
+            selected_by_doctor[doctor_id] = members
+    return selected_by_doctor
+
+
+def vsp_profile_memberships(office, profiles, search_memberships):
+    """Resolve canonical profiles or exact affiliate office/search doctor joins."""
+    doctors = _by_doctor(profiles, "doctorPublicId")
+    networks_by_doctor = {doctor_id: _profile_networks(profile) for doctor_id, profile in doctors.items()}
+    return _selected_networks(office, networks_by_doctor, search_memberships)
 
 
 def _text(record, field):
@@ -134,8 +153,9 @@ def _location(office, office_id):
 def _practitioner(summary, profile, npi, doctor_id):
     payload = {
         "resourceType": "Practitioner",
-        "id": f"vsp-npi-{npi}",
-        "identifier": [{"system": _NPI_SYSTEM, "value": npi}, {"system": "urn:vsp:doctor-id", "value": str(doctor_id)}],
+        "id": f"vsp-npi-{npi}" if npi else f"vsp-doctor-{doctor_id}",
+        "identifier": ([{"system": _NPI_SYSTEM, "value": npi}] if npi else [])
+        + [{"system": "urn:vsp:doctor-id", "value": str(doctor_id)}],
     }
     name_map = {}
     if family := _text(profile, "lastName") or _text(summary, "last"):
@@ -150,14 +170,16 @@ def _practitioner(summary, profile, npi, doctor_id):
 
 def _selected_resources(doctor_id, office_id, summary, profile, networks, npi_counts):
     npi = summary.get("npi")
-    if not isinstance(npi, str) or len(npi) != 10 or not is_valid_npi(npi):
+    if npi is not None and not isinstance(npi, str):
         raise VSPDirectoryNormalizationError("vsp_directory_invalid_npi")
-    if npi_counts[npi] != 1 or profile.get("npi") not in (None, npi):
+    npi = npi if npi and len(npi) == 10 and is_valid_npi(npi) else None
+    if (npi is not None and npi_counts[npi] != 1) or profile.get("npi") not in (None, npi):
         raise VSPDirectoryNormalizationError("vsp_directory_conflicting_npi")
-    return _practitioner(summary, profile, npi, doctor_id), {
+    practitioner = _practitioner(summary, profile, npi, doctor_id)
+    return practitioner, {
         "resourceType": "PractitionerRole",
-        "id": f"vsp-role-{doctor_id}-{office_id}-{npi}",
-        "practitioner": {"reference": f"Practitioner/vsp-npi-{npi}"},
+        "id": f"vsp-role-{doctor_id}-{office_id}" + (f"-{npi}" if npi else ""),
+        "practitioner": {"reference": "Practitioner/" + practitioner["id"]},
         "location": [{"reference": f"Location/vsp-office-{office_id}"}],
         "extension": [
             {
@@ -169,17 +191,13 @@ def _selected_resources(doctor_id, office_id, summary, profile, networks, npi_co
     }
 
 
-def normalize_vsp_office(office: dict, *, profiles: list[dict]) -> VSPOfficeResources:
+def normalize_vsp_office(office: dict, *, profiles: list[dict], search_memberships=None) -> VSPOfficeResources:
     """Join summaries to this office's profiles by public doctor ID, never by name."""
     office_id = _public_id(office, "pid")
     summaries = _by_doctor(office.get("providerSummaries"), "pid")
     doctors = _by_doctor(profiles, "doctorPublicId")
     networks_by_doctor = {doctor_id: _profile_networks(profile) for doctor_id, profile in doctors.items()}
-    selected_by_doctor = {
-        doctor_id: members
-        for doctor_id, codes in networks_by_doctor.items()
-        if (members := codes & _NETWORK_NAMES.keys())
-    }
+    selected_by_doctor = _selected_networks(office, networks_by_doctor, search_memberships or {})
     if summaries.keys() - doctors.keys() or selected_by_doctor.keys() - summaries.keys():
         raise VSPDirectoryNormalizationError("vsp_directory_unresolved_doctor")
     resources = VSPOfficeResources(

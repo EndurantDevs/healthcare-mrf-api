@@ -9,7 +9,9 @@ from collections import Counter
 from process.provider_directory_projection_fhir_values import is_valid_npi
 from process.vsp_directory_contract import (
     ADAPTER_ID,
+    MAX_LOCATIONS,
     NETWORKS,
+    PROFILE_MEMBERSHIP_UNRESOLVED,
     RESOURCE_TYPES,
     SEARCH_URL,
     SOURCE_ID,
@@ -17,8 +19,14 @@ from process.vsp_directory_contract import (
     profile_url,
     public_id,
     require,
+    search_result,
 )
-from process.vsp_directory_normalization import normalize_vsp_office, vsp_network_organizations
+from process.vsp_directory_geometry import office_search_request
+from process.vsp_directory_normalization import (
+    normalize_vsp_office,
+    vsp_network_organizations,
+    vsp_profile_memberships,
+)
 from process.vsp_directory_store import _atomic
 
 
@@ -35,12 +43,12 @@ def _profiles(value):
     return value
 
 
-def _missing(capture, office, profiles):
+def _missing(capture, office, profiles, memberships):
     summaries_by_doctor = {public_id(x.get("pid")): x for x in office["providerSummaries"]}
     missing_ids = []
     for profile in profiles:
         did = public_id(profile["doctorPublicId"])
-        if not set(profile["networkIds"]) & NETWORKS.keys():
+        if profile["doctorPublicId"] not in memberships:
             continue
         summary = summaries_by_doctor.get(did)
         if summary is None or not is_valid_npi(summary.get("npi")):
@@ -48,32 +56,54 @@ def _missing(capture, office, profiles):
             if identity is None:
                 missing_ids.append(did)
             else:
-                # Identity is global; only this office's profile grants membership.
+                # Global identities never grant membership at another office.
                 summaries_by_doctor[did] = identity["summary"]
                 capture.identity_reuses.add((public_id(office["pid"]), did, identity["request_key"]))
     office["providerSummaries"] = list(summaries_by_doctor.values())
     return missing_ids
 
 
-async def _repair_office(capture, office, profiles, missing_ids):
+async def _repair_office(capture, office, profiles, memberships, missing_ids):
     oid, attempted_names = public_id(office["pid"]), set()
     while missing_ids:
         eligible_counts = Counter(
             NETWORKS[code]
             for profile in profiles
             if public_id(profile["doctorPublicId"]) in missing_ids
-            for code in set(profile["networkIds"]) & NETWORKS.keys()
+            for code in memberships[profile["doctorPublicId"]]
             if NETWORKS[code] not in attempted_names
         )
-        require(bool(eligible_counts), "vsp_doctor_identity_unresolved")
+        if not eligible_counts:
+            # A publisher doctor ID remains usable when every exact office lookup lacks an NPI.
+            summary_ids = {public_id(row["pid"]) for row in office["providerSummaries"]}
+            require(set(missing_ids) <= summary_ids, "vsp_doctor_identity_unresolved")
+            break
         network = min(eligible_counts, key=lambda name: (-eligible_counts[name], name))
         attempted_names.add(network)
         value, receipt = await capture.fetch("GET", SEARCH_URL + "/" + oid + "?networkNames=" + network)
         require(type(value) is dict and public_id(value.get("pid")) == oid, "vsp_office_response_mismatch")
-        capture.remember(value, network, receipt["request_key"])
+        capture.remember(value, receipt["request_key"])
         office = capture.offices[oid]
-        missing_ids = _missing(capture, office, profiles)
+        missing_ids = _missing(capture, office, profiles, memberships)
     return office
+
+
+async def _affiliate_searches(capture, office, profiles):
+    if office.get("locationType") != "Affiliate" or len(vsp_profile_memberships(office, profiles, {})) == len(profiles):
+        return office
+    oid = public_id(office["pid"])
+    for network in sorted(NETWORKS.values()):
+        if network in capture.search_memberships.get(oid, {}):
+            continue
+        value, receipt = await capture.fetch("POST", SEARCH_URL, office_search_request(office, network))
+        total, offices = search_result(value)
+        matching_offices = [row for row in offices if public_id(row["pid"]) == oid]
+        if matching_offices:
+            capture.remember_search(matching_offices[0], network, receipt["request_key"])
+        else:
+            require(total < MAX_LOCATIONS, PROFILE_MEMBERSHIP_UNRESOLVED)
+            capture.remember_search_scope(oid, network, ())
+    return capture.offices[oid]
 
 
 async def enrich_capture(capture):
@@ -81,23 +111,26 @@ async def enrich_capture(capture):
     for oid in sorted(capture.offices):
         office = capture.offices[oid]
         if oid not in capture.profiles:
-            value, _ = await capture.fetch("GET", profile_url(office))
-            profiles = _profiles(value)
+            profile_response, _ = await capture.fetch("GET", profile_url(office))
+            profiles = _profiles(profile_response)
             capture.account_bytes("profile:" + oid, profiles)
             capture.profiles[oid] = profiles
         profiles = capture.profiles[oid]
-        declared_names = {NETWORKS[code] for profile in profiles for code in profile["networkIds"] if code in NETWORKS}
+        office = await _affiliate_searches(capture, office, profiles)
+        search_memberships = capture.search_memberships.get(oid, {})
+        memberships = vsp_profile_memberships(office, profiles, search_memberships)
+        declared_names = {NETWORKS[code] for codes in memberships.values() for code in codes}
         require(
             all(oid not in capture.memberships[name] or name in declared_names for name in NETWORKS.values()),
-            "vsp_profile_membership_census_unresolved",
+            PROFILE_MEMBERSHIP_UNRESOLVED,
         )
-        missing_ids = _missing(capture, office, profiles)
+        missing_ids = _missing(capture, office, profiles, memberships)
         if missing_ids:
-            office = await _repair_office(capture, office, profiles, missing_ids)
+            office = await _repair_office(capture, office, profiles, memberships, missing_ids)
         # The normalizer also validates conflicting IDs, profiles and source NPI checksums.
-        normalize_vsp_office(office, profiles=profiles)
-        for profile in profiles:
-            for code in set(profile["networkIds"]) & NETWORKS.keys():
+        normalize_vsp_office(office, profiles=profiles, search_memberships=search_memberships)
+        for codes in memberships.values():
+            for code in codes:
                 capture.memberships[NETWORKS[code]].add(oid)
         capture.store.checkpoint(
             "enrichment", {"office_count": len(capture.offices), "profile_count": len(capture.profiles)}
@@ -130,7 +163,15 @@ async def _normalize_offices(capture):
     accounting, other_codes = Counter(), Counter()
     for oid, office in sorted(capture.offices.items()):
         await capture.cancel_check()
-        normalized = normalize_vsp_office(office, profiles=capture.profiles[oid])
+        _missing(
+            capture,
+            office,
+            capture.profiles[oid],
+            vsp_profile_memberships(office, capture.profiles[oid], capture.search_memberships.get(oid, {})),
+        )
+        normalized = normalize_vsp_office(
+            office, profiles=capture.profiles[oid], search_memberships=capture.search_memberships.get(oid, {})
+        )
         accounting.update(
             {
                 "outside_profile_count": normalized.outside_profile_count,
@@ -140,14 +181,19 @@ async def _normalize_offices(capture):
         other_codes.update(normalized.other_network_ids)
         for resource in normalized:
             byte_count = _add_resource(resources_by_type, resource, byte_count)
-            if resource["resourceType"] == "PractitionerRole":
-                for extension in resource["extension"]:
-                    name = NETWORKS[extension["valueReference"]["reference"].rsplit("-", 1)[1]]
-                    offices_by_network[name].add(oid)
-                    npis_by_network[name].add(resource["practitioner"]["reference"])
+            if resource["resourceType"] == "Practitioner" and resource["id"].startswith("vsp-doctor-"):
+                accounting["profiles_without_npi"] += 1
+            if resource["resourceType"] != "PractitionerRole":
+                continue
+            practitioner = resource["practitioner"]["reference"]
+            for extension in resource["extension"]:
+                name = NETWORKS[extension["valueReference"]["reference"].rsplit("-", 1)[1]]
+                offices_by_network[name].add(oid)
+                if practitioner.startswith("Practitioner/vsp-npi-"):
+                    npis_by_network[name].add(practitioner)
     require(
         all(offices_by_network[name] == capture.memberships[name] for name in NETWORKS.values()),
-        "vsp_profile_membership_census_unresolved",
+        PROFILE_MEMBERSHIP_UNRESOLVED,
     )
     return resources_by_type, npis_by_network, accounting, other_codes
 
@@ -206,6 +252,7 @@ async def write_normalized_capture(capture, start, end):
         "observation_start": min(x["observed_at"] for x in receipts),
         "observation_end": max(x["observed_at"] for x in receipts),
         "outside_profile_count": accounting["outside_profile_count"],
+        "profiles_without_npi": accounting["profiles_without_npi"],
         "other_network_id_count": len(other_codes),
     }
     manifest_by_field["proof"] = proof_by_field

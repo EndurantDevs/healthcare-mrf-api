@@ -16,6 +16,8 @@ SEARCH_URL = API_BASE + "fadbusiness-api/publiclocationsummarybusextensions"
 PROFILE_PATH = "/provider-web/publicdoctorprofile"
 OFFICE_DOCTORS_INVALID = "vsp_office_doctors_invalid"
 SEARCH_RESPONSE_INVALID = "vsp_search_response_invalid"
+PROFILE_MEMBERSHIP_UNRESOLVED = "vsp_profile_membership_census_unresolved"
+OFFICE_CENSUS_UNRESOLVED = "vsp_office_census_unresolved"
 ADAPTER_ID = "vsp-directory-json-v1"
 TRANSPORT = "official_directory_json"
 RESOURCE_TYPES = (
@@ -153,7 +155,7 @@ def search_result(payload):
         profile_url(office)
         summaries = office.get("providerSummaries", [])
         require(type(summaries) is list, OFFICE_DOCTORS_INVALID)
-        # Search can omit summaries; the linked profile still determines membership.
+        # Canonical profiles can establish membership when summaries are absent.
         validated_offices.append(
             office if "providerSummaries" in office else {**office, "providerSummaries": summaries}
         )

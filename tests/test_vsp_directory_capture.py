@@ -96,7 +96,7 @@ class Source:
             assert payload == TILE.request(name)
             return {
                 "totalCounts": self.counts[name],
-                "locations": [self.offices[oid] for oid in sorted(self.network_offices[name])],
+                "locations": [self.offices[oid] for oid in sorted(self.network_offices[name])[:50]],
             }
         assert method == "GET" and url.startswith(API_BASE + "provider-web/publicdoctorprofile?")
         oid = parse_qs(urlsplit(url).query)["officepublicid"][0]
@@ -174,6 +174,31 @@ async def test_largest_network_reuses_shared_profiles_and_skips_subset_discovery
 
 
 @pytest.mark.asyncio
+async def test_later_network_recovers_a_saturated_office_for_an_earlier_network(small_domain, tmp_path):
+    source = Source(saturated=True)
+    source.offices["151"] = office(151)
+    source.network_offices["Signature"].add("151")
+    source.network_offices["Choice"] = set(source.offices) - {"101"}
+    source.counts["Choice"] = 50
+    store = VSPCaptureStore(tmp_path, "synthetic-overlapping-networks")
+    run, transport = capture(source, store)
+
+    completed = await run.run()
+
+    tile_requests = [payload for method, _, payload in transport.calls if method == "POST" and payload["limit"] != "1"]
+    assert tile_requests == [TILE.request("Signature"), TILE.request("Choice")]
+    assert run.memberships == source.network_offices
+    assert len(run.offices) == len(run.profiles) == 51
+    assert len(run.unresolved) == 1 and run.unresolved[0]["network"] == "Signature"
+    assert Counter(method for method, _, _ in transport.calls) == {"POST": 8, "GET": 51}
+    assert source.observations == {name: 2 for name in NETWORKS.values()}
+    assert completed.proof["publisher_locations"] == {"Signature": 51, "Choice": 50, "Advantage": 1}
+    assert completed.proof["saturated_leaves_closed_by_global_census"] == 1
+    assert completed.resource_counts["Location"] == completed.resource_counts["PractitionerRole"] == 51
+    assert store.load_checkpoint("complete") == completed.manifest
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("shared_identity", [True, False])
 async def test_omitted_search_summaries_preserve_linked_doctors(small_domain, writer, shared_identity):
     source = Source()
@@ -241,12 +266,16 @@ async def test_changed_fresh_closing_census_cannot_publish(small_domain, writer)
 
 @pytest.mark.asyncio
 async def test_unknown_office_in_saturated_leaf_remains_incomplete(small_domain, writer):
-    run, transport = capture(Source(saturated=True), Store())
+    source = Source(saturated=True)
+    run, transport = capture(source, Store())
     with pytest.raises(VSPDirectoryError, match="^vsp_office_census_unresolved$"):
         await run.run()
     assert len(run.offices) == 50 and len(run.unresolved) == 1 and writer == []
     assert run.unresolved[0]["count"] == 51
-    assert transport.requests <= 54  # No subdivision can separate these identical coordinates.
+    tile_requests = [payload for method, _, payload in transport.calls if method == "POST" and payload["limit"] != "1"]
+    assert tile_requests == [TILE.request("Signature")]
+    assert Counter(method for method, _, _ in transport.calls) == {"POST": 7, "GET": 50}
+    assert source.observations == {name: 2 for name in NETWORKS.values()}
 
 
 @pytest.mark.asyncio

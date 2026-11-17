@@ -434,7 +434,15 @@ async def test_vsp_retry_converts_empty_legacy_intake_to_names(case, vsp_retry_c
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", [storage.OFFICE_DOCTORS_INVALID, storage.SEARCH_RESPONSE_INVALID])
+@pytest.mark.parametrize(
+    "error",
+    [
+        storage.OFFICE_DOCTORS_INVALID,
+        storage.SEARCH_RESPONSE_INVALID,
+        storage.PROFILE_MEMBERSHIP_UNRESOLVED,
+        storage.OFFICE_CENSUS_UNRESOLVED,
+    ],
+)
 async def test_named_vsp_successor_retains_an_empty_failed_retry(case, vsp_retry_candidate, error):
     _retain_original_root(case, "failed")
     case.runs[0].update(source_ids=[SOURCE_ID], error_message=storage.OFFICE_DOCTORS_INVALID)
@@ -457,6 +465,55 @@ async def test_named_vsp_successor_retains_an_empty_failed_retry(case, vsp_retry
     assert case.header["status"] == "failed"
     assert case.header["candidate_storage_json"]["storage"] == case.new
     assert (await _transition(case, counts))["already_applied"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [storage.PROFILE_MEMBERSHIP_UNRESOLVED, storage.OFFICE_CENSUS_UNRESOLVED])
+@pytest.mark.parametrize(
+    ("drift", "error"),
+    [
+        (None, None),
+        ("checkpoint", "transition_checkpoint_changed"),
+        ("input", "transition_input_changed"),
+        ("run_error", "transition_run_changed"),
+        ("header_error", "transition_candidate_changed"),
+        ("legacy", "transition_checkpoint_changed"),
+    ],
+)
+async def test_named_vsp_capture_failure_retains_an_empty_root(case, vsp_retry_candidate, failure, drift, error):
+    _retain_original_root(case, "failed")
+    case.runs[0].update(source_ids=[SOURCE_ID], error_message=failure)
+    case.header.update(status="failed", resource_count=0)
+    case.header["publication_metadata_json"]["error"] = failure
+    if drift != "input":
+        case.input_rows.clear()
+    if drift != "legacy":
+        fields = ("catalog_schema", "storage_schema", "producer")
+        case.old, case.new = ({key: stored[key] for key in fields} for stored in (case.old, case.new))
+        candidate = case.header["candidate_storage_json"]
+        candidate.update(
+            contract=storage.NAMED_ISOLATED_CONTRACT,
+            storage=case.old,
+            tables={kind: {"name": table["name"]} for kind, table in candidate["tables"].items()},
+        )
+    if drift == "checkpoint":
+        case.checkpoints.append({"resource_type": "Organization"})
+    if drift == "run_error":
+        case.runs[0]["error_message"] = "unrelated failure"
+    if drift == "header_error":
+        case.header["publication_metadata_json"]["error"] = "unrelated failure"
+    counts = dict.fromkeys(RESOURCE_TYPES, 0)
+    if error:
+        with pytest.raises(GenericCandidateError, match=f"^provider_directory_generic_source_{error}$"):
+            await _transition(case, counts, stopped_run_id=ROOT)
+        assert not case.writes
+        return
+    receipt = await _transition(case, counts, stopped_run_id=ROOT)
+    assert receipt["rows"] == 0 and receipt["lineage_run_ids"] == [ROOT]
+    assert case.header["status"] == "failed"
+    assert case.header["candidate_storage_json"]["storage"] == case.new
+    assert (await _transition(case, counts, stopped_run_id=ROOT))["already_applied"] is True
+    assert len(case.writes) == 1
 
 
 @pytest.mark.asyncio

@@ -37,10 +37,22 @@ from process.provider_directory_source_storage_binding import (
     require_storage_schema,
     storage_document,
 )
-from process.vsp_directory_contract import OFFICE_DOCTORS_INVALID, SEARCH_RESPONSE_INVALID
+from process.vsp_directory_contract import (
+    OFFICE_CENSUS_UNRESOLVED,
+    OFFICE_DOCTORS_INVALID,
+    PROFILE_MEMBERSHIP_UNRESOLVED,
+    SEARCH_RESPONSE_INVALID,
+)
 from process.vsp_directory_contract import RESOURCE_TYPES as VSP_RESOURCE_TYPES
 from process.vsp_directory_contract import SOURCE_ID as VSP_SOURCE_ID
 from process.vsp_directory_store import is_artifact_root_failure
+
+_RETAINED_VSP_CAPTURE_ERRORS = (
+    OFFICE_DOCTORS_INVALID,
+    SEARCH_RESPONSE_INVALID,
+    PROFILE_MEMBERSHIP_UNRESOLVED,
+    OFFICE_CENSUS_UNRESOLVED,
+)
 
 HEADER = "provider_directory_endpoint_dataset"
 RESOURCE = "provider_directory_dataset_resource"
@@ -956,7 +968,7 @@ def _is_empty_vsp_checkpoint_failure(header, candidate_by_field, identity_by_fie
                 and (
                     failure_metadata.get("error") == OFFICE_DOCTORS_INVALID
                     or candidate_by_field["contract"] == NAMED_ISOLATED_CONTRACT
-                    and failure_metadata.get("error") == SEARCH_RESPONSE_INVALID
+                    and failure_metadata.get("error") in _RETAINED_VSP_CAPTURE_ERRORS
                 )
                 and candidate_by_field["relationship_sha256"] is None
             )
@@ -1059,7 +1071,7 @@ async def _locked_transition_candidate(
             not by_name
             or is_named_fhir
             or is_empty_vsp_failure
-            and metadata.get("error") in (OFFICE_DOCTORS_INVALID, SEARCH_RESPONSE_INVALID)
+            and metadata.get("error") in _RETAINED_VSP_CAPTURE_ERRORS
         ),
         "transition_candidate_changed",
     )
@@ -1087,10 +1099,7 @@ async def _verify_transition_run(
     root_run_id = identity_by_field["acquisition_root_run_id"]
     failed_run_id = identity_by_field["failed_run_id"]
     is_vsp_artifact_failure = is_empty_vsp_failure and not has_changed_header_owner and failed_run_id != root_run_id
-    is_retained_vsp_failure = is_empty_vsp_failure and expected_failure_error in (
-        OFFICE_DOCTORS_INVALID,
-        SEARCH_RESPONSE_INVALID,
-    )
+    is_retained_vsp_failure = is_empty_vsp_failure and expected_failure_error in _RETAINED_VSP_CAPTURE_ERRORS
     failure_field = (
         ",error::jsonb->>'message' AS error_message"
         if has_changed_header_owner or is_vsp_artifact_failure or is_retained_vsp_failure
@@ -1722,7 +1731,7 @@ async def transition_isolated_loading_candidate_storage(
         successor_by_field,
         candidate_by_field,
         previous_status,
-        is_empty_vsp_failure and failure_error not in (OFFICE_DOCTORS_INVALID, SEARCH_RESPONSE_INVALID),
+        is_empty_vsp_failure and failure_error not in _RETAINED_VSP_CAPTURE_ERRORS,
     )
     return {**receipt_by_field, "already_applied": False}
 

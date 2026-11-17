@@ -16,6 +16,7 @@ from process.vsp_directory_contract import (
     ENDPOINT_SCOPE,
     MAX_LOCATIONS,
     NETWORKS,
+    OFFICE_CENSUS_UNRESOLVED,
     RESOURCE_TYPES,
     SEARCH_URL,
     SOURCE_ID,
@@ -102,6 +103,7 @@ class VSPCapture:
         self.store, self.http = store, http
         self.progress_callback, self.cancel_check = progress_callback, cancel_check
         self.offices, self.identities, self.profiles = {}, {}, {}
+        self.search_memberships = {}
         self.memberships = {name: set() for name in NETWORKS.values()}
         self.partitions, self.unresolved = [], []
         self.cache_hits = 0
@@ -140,7 +142,7 @@ class VSPCapture:
         await self.progress("acquisition")
         return field_value, metadata
 
-    def remember(self, office, network, request_id):
+    def remember(self, office, request_id):
         """Preserve distinct offices and NPI identities without cross-office memberships."""
         oid = public_id(office.get("pid"))
         position = office_position(office)
@@ -171,6 +173,21 @@ class VSPCapture:
         # Keep the first office observation paired with its exact dated profile.
         self.offices[oid] = {**(previous or office), "providerSummaries": list(summaries_by_doctor.values())}
         self.account_bytes("office:" + oid, self.offices[oid])
+
+    def remember_search_scope(self, oid, network, doctor_ids):
+        """Retain same-office doctor membership from a single-network search."""
+        require(network in NETWORKS.values(), "vsp_network_invalid")
+        scopes = self.search_memberships.setdefault(oid, {})
+        scopes.setdefault(network, set()).update(doctor_ids)
+        self.account_bytes("search:" + oid, {name: sorted(ids) for name, ids in scopes.items()})
+
+    def remember_search(self, office, network, request_id):
+        """Use validated POST summaries before merging any office identities."""
+        self.remember(office, request_id)
+        oid = public_id(office["pid"])
+        doctor_ids = {public_id(summary["pid"]) for summary in office["providerSummaries"]}
+        if doctor_ids:
+            self.remember_search_scope(oid, network, doctor_ids)
         self.memberships[network].add(oid)
 
     async def census(self, *, fresh=False):
@@ -196,7 +213,7 @@ class VSPCapture:
             field_value, receipt = await self.fetch("POST", SEARCH_URL, tile.request(network))
             total, offices = search_result(field_value)
             for office in offices:
-                self.remember(office, network, receipt["request_key"])
+                self.remember_search(office, network, receipt["request_key"])
             require(len(self.memberships[network]) <= expected, "vsp_census_changed_during_capture")
             if len(self.memberships[network]) == expected:
                 self.partitions.append(
@@ -242,10 +259,10 @@ class VSPCapture:
             if len(self.memberships[name]) != start[name]:
                 await self.discover(name, start[name])
                 await enrich_capture(self)
-            require(len(self.memberships[name]) == start[name], "vsp_office_census_unresolved")
+            require(len(self.memberships[name]) <= start[name], OFFICE_CENSUS_UNRESOLVED)
         end = await self.census(fresh=True)
         require(start == end, "vsp_census_changed_during_capture")
-        require(all(len(self.memberships[name]) == end[name] for name in end), "vsp_office_census_unresolved")
+        require(all(len(self.memberships[name]) == end[name] for name in end), OFFICE_CENSUS_UNRESOLVED)
         # Even a saturated spatial leaf is closed only by the independent global census.
         return await write_normalized_capture(self, start, end)
 
