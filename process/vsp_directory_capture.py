@@ -13,6 +13,7 @@ import aiohttp
 from process.provider_directory_projection_fhir_values import is_valid_npi
 from process.vsp_directory_contract import (
     ADAPTER_ID,
+    CENSUS_OFFICE_DRIFT_LIMIT,
     ENDPOINT_SCOPE,
     MAX_LOCATIONS,
     NETWORKS,
@@ -26,12 +27,33 @@ from process.vsp_directory_contract import (
     public_id,
     require,
     search_result,
+    validate_census_memberships,
 )
 from process.vsp_directory_enrichment import enrich_capture, write_normalized_capture
-from process.vsp_directory_geometry import census_request, world_tiles
+from process.vsp_directory_geometry import census_request, distance_miles, world_tiles
 from process.vsp_directory_http import VSPHTTP, strict_json
 from process.vsp_directory_normalization import company_summary_name, is_company_summary
 from process.vsp_directory_store import VSPCaptureStore, configured_root
+
+_OFFICE_POSITION_TOLERANCE_MILES = 1.0 / 1609.344
+
+
+def _same_office_position(previous, office, position):
+    prior = office_position(previous)
+    if prior == position:
+        return True
+    if (0.0, 0.0) in (prior, position):
+        return False
+    original_address, incoming_address = previous["addr"], office["addr"]
+    return (
+        previous.get("locationType") == office.get("locationType")
+        and all(original_address.get(key) for key in ("street1", "city", "stateCode", "zipCode"))
+        and all(
+            original_address.get(key) == incoming_address.get(key)
+            for key in ("street1", "street2", "city", "stateCode", "zipCode", "countryCode")
+        )
+        and distance_miles(*prior, *position) <= _OFFICE_POSITION_TOLERANCE_MILES
+    )
 
 
 @dataclass(frozen=True)
@@ -144,7 +166,7 @@ class VSPCapture:
         await self.progress("acquisition")
         return field_value, metadata
 
-    def remember(self, office, request_id):
+    def remember(self, office, request_id, *, new_doctor_ids=None):
         """Preserve distinct offices and NPI identities without cross-office memberships."""
         oid = public_id(office.get("pid"))
         position = office_position(office)
@@ -157,13 +179,15 @@ class VSPCapture:
         )
         previous = self.offices.get(oid)
         if previous is not None:
-            require(office_position(previous) == position, "vsp_office_position_changed")
+            require(_same_office_position(previous, office, position), "vsp_office_position_changed")
         else:
             require(len(self.offices) < 200000, "vsp_office_budget_exhausted")
         summaries_by_doctor = {public_id(x.get("pid")): x for x in (previous or {}).get("providerSummaries", [])}
         for summary in office["providerSummaries"]:
             require(type(summary) is dict, "vsp_office_doctors_invalid")
             did = public_id(summary.get("pid"))
+            if new_doctor_ids is not None and did not in new_doctor_ids and did not in summaries_by_doctor:
+                continue
             npi = summary.get("npi")
             has_valid_npi = type(npi) is str and is_valid_npi(npi)
             if has_valid_npi:
@@ -204,19 +228,23 @@ class VSPCapture:
         self.site_memberships[network].add(oid)
         self.account_bytes("site:" + oid, sorted(name for name, sites in self.site_memberships.items() if oid in sites))
 
+    @staticmethod
+    def _census_count(response):
+        require(
+            type(response) is dict
+            and not response.get("errors")
+            and type(response.get("totalCounts")) is int
+            and response["totalCounts"] > 0,
+            "vsp_census_invalid",
+        )
+        return response["totalCounts"]
+
     async def census(self, *, fresh=False):
         """Independent single-network counts avoid the publisher's first-network-only trap."""
         counts_by_network = {}
         for name in sorted(NETWORKS.values()):
-            field_value, _ = await self.fetch("POST", SEARCH_URL, census_request(name), fresh=fresh)
-            require(
-                type(field_value) is dict
-                and not field_value.get("errors")
-                and type(field_value.get("totalCounts")) is int
-                and field_value["totalCounts"] > 0,
-                "vsp_census_invalid",
-            )
-            counts_by_network[name] = field_value["totalCounts"]
+            response, _ = await self.fetch("POST", SEARCH_URL, census_request(name), fresh=fresh)
+            counts_by_network[name] = self._census_count(response)
         return counts_by_network
 
     async def discover(self, network, expected):
@@ -228,15 +256,16 @@ class VSPCapture:
             total, offices = search_result(field_value)
             for office in offices:
                 self.remember_search(office, network, receipt["request_key"])
-            require(len(self.memberships[network]) <= expected, "vsp_census_changed_during_capture")
-            if len(self.memberships[network]) == expected:
+            observed = len(self.memberships[network])
+            require(observed <= expected + CENSUS_OFFICE_DRIFT_LIMIT, "vsp_census_changed_during_capture")
+            if observed >= expected:
                 self.partitions.append(
                     {
                         "network": network,
                         "tile": tile.key,
                         "count": total,
                         "request_key": receipt["request_key"],
-                        "closed_by_global_census": True,
+                        "closed_by_global_census": observed == expected,
                     }
                 )
                 break
@@ -267,18 +296,29 @@ class VSPCapture:
             await self.progress("discovery", network=network, pending_tiles=len(pending_tiles))
 
     async def run(self):
-        """Reuse the largest network, then acquire only genuinely missing other scopes."""
-        start = await self.census()
-        for name in sorted(start, key=lambda item: (-start[item], item)):
-            if len(self.memberships[name]) != start[name]:
-                await self.discover(name, start[name])
+        """Refresh one network at a time, sharing office profiles across networks."""
+        start, refreshed = {}, {}
+        for name in NETWORKS.values():
+            request = census_request(name)
+            retained = self.store.lookup("POST", SEARCH_URL, request)
+            response, _ = await self.fetch("POST", SEARCH_URL, request, fresh=True)
+            refreshed[name] = self._census_count(response)
+            start[name] = self._census_count(retained[0]) if retained is not None else refreshed[name]
+            require(
+                abs(start[name] - refreshed[name]) <= CENSUS_OFFICE_DRIFT_LIMIT,
+                "vsp_census_changed_during_capture",
+            )
+            if len(self.memberships[name]) not in {start[name], refreshed[name]}:
+                await self.discover(name, refreshed[name])
                 await enrich_capture(self)
-            require(len(self.memberships[name]) <= start[name], OFFICE_CENSUS_UNRESOLVED)
+            require(
+                len(self.memberships[name]) <= refreshed[name] + CENSUS_OFFICE_DRIFT_LIMIT, OFFICE_CENSUS_UNRESOLVED
+            )
         end = await self.census(fresh=True)
-        require(start == end, "vsp_census_changed_during_capture")
-        require(all(len(self.memberships[name]) == end[name] for name in end), OFFICE_CENSUS_UNRESOLVED)
+        observed_by_network = {name: len(self.memberships[name]) for name in NETWORKS.values()}
+        validate_census_memberships(start, refreshed, end, observed_by_network)
         # Even a saturated spatial leaf is closed only by the independent global census.
-        return await write_normalized_capture(self, start, end)
+        return await write_normalized_capture(self, start, end, refreshed=refreshed)
 
 
 async def _noop(*_args):

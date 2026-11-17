@@ -340,6 +340,30 @@ def multi_company_office_fixture():
     return site, profiles
 
 
+def test_summary_only_companies_preserve_distinct_organization_npis():
+    site, _profiles = multi_company_office_fixture()
+    resources = normalize_vsp_office(
+        site, profiles=[], retail_networks={"Signature"}, search_memberships={"Signature": {"2", "9", "10"}}
+    )
+    by_id = {resource["id"]: resource for resource in resources}
+    assert by_id["vsp-site-company-52-9"]["identifier"][1]["value"] == "1999999992"
+    assert by_id["vsp-site-company-52-10"]["identifier"][1]["value"] == "1000000004"
+    assert len([resource for resource in resources if resource["resourceType"] == "Practitioner"]) == 1
+
+
+def test_summary_only_company_rejects_a_conflicting_retained_npi():
+    site, _profiles = multi_company_office_fixture()
+    retained_summary_by_field = {**site["providerSummaries"][0], "npi": "1000000004"}
+    with pytest.raises(VSPDirectoryNormalizationError, match="^vsp_directory_unresolved_doctor$"):
+        normalize_vsp_office(
+            site,
+            profiles=[],
+            retail_networks={"Signature"},
+            search_memberships={"Signature": {"2", "9", "10"}},
+            company_summaries_by_doctor={9: retained_summary_by_field},
+        )
+
+
 def test_distinct_company_npis_share_a_site_without_inheriting_network_membership():
     site, profiles = multi_company_office_fixture()
     resources = normalize_vsp_office(site, profiles=profiles, retail_networks={"Signature"})

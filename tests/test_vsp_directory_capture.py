@@ -75,14 +75,14 @@ class Store:
 class Source:
     """Three nested networks, with one shared doctor at distinct offices."""
 
-    def __init__(self, *, saturated=False, changed=False, fail_profile=None):
+    def __init__(self, *, saturated=False, closing_drift=0, fail_profile=None):
         identifiers = range(101, 151) if saturated else range(101, 104)
         self.offices = {str(identifier): office(identifier) for identifier in identifiers}
         self.network_offices = {"Signature": set(self.offices), "Choice": {"101", "102"}, "Advantage": {"101"}}
         self.counts = {name: len(ids) for name, ids in self.network_offices.items()}
         if saturated:
             self.counts["Signature"] += 1
-        self.changed, self.fail_profile = changed, fail_profile
+        self.closing_drift, self.fail_profile = closing_drift, fail_profile
         self.observations = Counter()
 
     def response(self, method, url, payload):
@@ -91,8 +91,8 @@ class Source:
             name = payload["networkNames"][0]
             if payload["limit"] == "1":
                 self.observations[name] += 1
-                changed = self.changed and name == "Choice" and self.observations[name] > 1
-                return {"totalCounts": self.counts[name] + int(changed), "locations": []}
+                drift = self.closing_drift if name == "Choice" and self.observations[name] > 1 else 0
+                return {"totalCounts": self.counts[name] + drift, "locations": []}
             assert payload == TILE.request(name)
             return {
                 "totalCounts": self.counts[name],
@@ -145,8 +145,13 @@ def small_domain(monkeypatch):
 def writer(monkeypatch):
     completed_captures = []
 
-    async def write(capture, start, end):
-        result_by_field = {"start": start, "end": end, "memberships": deepcopy(capture.memberships)}
+    async def write(capture, start, end, *, refreshed):
+        result_by_field = {
+            "start": start,
+            "refreshed": refreshed,
+            "end": end,
+            "memberships": deepcopy(capture.memberships),
+        }
         completed_captures.append(result_by_field)
         return result_by_field
 
@@ -168,6 +173,9 @@ async def test_largest_network_reuses_shared_profiles_and_skips_subset_discovery
     assert tile_requests == [TILE.request("Signature")]
     assert transport.requests == 10  # Three opening counts, one tile, three profiles, three closing counts.
     assert Counter(method for method, _, _ in transport.calls) == {"POST": 7, "GET": 3}
+    assert transport.calls[0][2] == acquisition.census_request("Signature")
+    assert transport.calls[5][2] == acquisition.census_request("Choice")
+    assert transport.calls[6][2] == acquisition.census_request("Advantage")
     assert {name: len(ids) for name, ids in result["memberships"].items()} == source.counts
     assert source.observations == {name: 2 for name in NETWORKS.values()}
     assert len(store.receipts) == 10 and len(store.cache) == 7 and writer == [result]
@@ -247,21 +255,53 @@ async def test_restart_replays_exact_successes_and_fetches_only_missing_profiles
     first, attempted = capture(source, store)
     with pytest.raises(VSPDirectoryError, match="^synthetic_partial_failure$"):
         await first.run()
-    assert attempted.requests == 6 and len(store.receipts) == 5 and writer == []
+    assert attempted.requests == 4 and len(store.receipts) == 3 and writer == []
     resumed, remaining = capture(source, store)
     await resumed.run()
-    assert remaining.requests == 5 and resumed.cache_hits == 5
-    assert Counter(method for method, _, _ in remaining.calls) == {"POST": 3, "GET": 2}
+    assert remaining.requests == 8 and resumed.cache_hits == 2
+    assert Counter(method for method, _, _ in remaining.calls) == {"POST": 6, "GET": 2}
     assert all(payload["limit"] == "1" for method, _, payload in remaining.calls if method == "POST")
-    assert len(store.receipts) == 10 and len(writer) == 1
+    assert len(store.receipts) == 11 and len(writer) == 1
 
 
 @pytest.mark.asyncio
 async def test_changed_fresh_closing_census_cannot_publish(small_domain, writer):
-    run, transport = capture(Source(changed=True), Store())
+    run, transport = capture(Source(closing_drift=11), Store())
     with pytest.raises(VSPDirectoryError, match="^vsp_census_changed_during_capture$"):
         await run.run()
     assert transport.requests == 10 and writer == []
+
+
+@pytest.mark.asyncio
+async def test_bounded_census_drift_preserves_the_published_office_counts(small_domain, tmp_path):
+    store = VSPCaptureStore(tmp_path, "synthetic-drift")
+    run, transport = capture(Source(closing_drift=10), store)
+    completed = await run.run()
+    assert transport.requests == 10
+    assert completed.manifest["publisher_census_start"]["Choice"] == 2
+    assert completed.manifest["publisher_census_at_network_start"]["Choice"] == 2
+    assert completed.manifest["publisher_census_end"]["Choice"] == 12
+    assert completed.proof["publisher_locations"]["Choice"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", [10, 11])
+async def test_retained_count_refresh_checks_drift_before_discovery(small_domain, writer, drift):
+    store, source = Store(), Source()
+    source.counts["Signature"] += drift
+    _, raw, metadata = await HTTP(source).request("POST", SEARCH_URL, acquisition.census_request("Signature"))
+    store.retain(raw, metadata)
+    source.counts["Signature"] -= drift
+    run, transport = capture(source, store)
+    if drift > 10:
+        with pytest.raises(VSPDirectoryError, match="^vsp_census_changed_during_capture$"):
+            await run.run()
+        assert transport.requests == 1 and writer == []
+    else:
+        result = await run.run()
+        assert result["start"]["Signature"] == 13
+        assert result["refreshed"]["Signature"] == result["end"]["Signature"] == 3
+        assert len(result["memberships"]["Signature"]) == 3
 
 
 @pytest.mark.asyncio
@@ -352,11 +392,11 @@ async def test_probe_and_capture_share_retained_response_and_respect_origin_paus
     assert 1190 < wait.await_args_list[0].args[0] <= 1200
     assert len(sessions) == 2
     assert len(list(completed.iter_resources())) == 10
-    assert completed.proof["http_attempts"] == offline_http.requests == 10
-    assert offline_http.source.observations == dict.fromkeys(NETWORKS.values(), 2)
+    assert completed.proof["http_attempts"] == offline_http.requests == 11
+    assert offline_http.source.observations == {"Signature": 3, "Choice": 2, "Advantage": 2}
     reopened = await acquisition.capture_vsp_directory(**retry_arguments_by_name)
     assert reopened.proof == completed.proof
-    assert len(sessions) == 2 and offline_http.requests == 10
+    assert len(sessions) == 2 and offline_http.requests == 11
 
 
 @pytest.mark.asyncio

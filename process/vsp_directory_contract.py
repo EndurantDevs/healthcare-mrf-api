@@ -29,6 +29,7 @@ RESOURCE_TYPES = (
     "PractitionerRole",
 )
 NETWORKS = {"1000": "Signature", "2000": "Choice", "4000": "Advantage"}
+CENSUS_OFFICE_DRIFT_LIMIT = 10
 MAX_LOCATIONS = 50
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MIN_REQUEST_INTERVAL = 1.0
@@ -61,6 +62,28 @@ def require(condition, code):
     """Reject invalid source evidence before it can enter a candidate dataset."""
     if not condition:
         raise VSPDirectoryError(code)
+
+
+def validate_census_memberships(opening, refreshed, closing, observed):
+    """Require each captured office count to match an independent census."""
+    names = set(NETWORKS.values())
+    require(
+        all(
+            counts.keys() == names and all(type(count) is int and count > 0 for count in counts.values())
+            for counts in (opening, refreshed, closing)
+        ),
+        "vsp_census_invalid",
+    )
+    counts_by_network = {name: {opening[name], refreshed[name], closing[name]} for name in names}
+    require(
+        all(max(counts) - min(counts) <= CENSUS_OFFICE_DRIFT_LIMIT for counts in counts_by_network.values()),
+        "vsp_census_changed_during_capture",
+    )
+    require(
+        observed.keys() == names
+        and all(type(observed[name]) is int and observed[name] in counts_by_network[name] for name in names),
+        OFFICE_CENSUS_UNRESOLVED,
+    )
 
 
 def is_missing_profile_response(value):
