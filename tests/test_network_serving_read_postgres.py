@@ -151,6 +151,30 @@ async def test_readonly_reader_resolves_and_native_permissions_deny_writes(read_
         assert caught.value.orig.sqlstate == "42501"
 
 
+async def test_published_api_read_keeps_historical_receipts_without_revalidating_writers(
+    read_component_db, monkeypatch
+):
+    from process import network_membership_publication as publication
+
+    fixture = read_component_db
+    before = await _control_rows(fixture)
+
+    def upgraded_writer_scope(*_args):
+        raise ValueError("Historical source receipt has a different encoding")
+
+    monkeypatch.setattr(publication, "_scope_report", upgraded_writer_scope)
+    async with _reader(fixture) as (_, connection):
+        for generation in (None, fixture.read_manifest["generation_id"]):
+            pin = await resolve_network_serving_manifest(
+                connection, generation_id=generation, control_schema=fixture.control_schema, api_read=True
+            )
+            assert pin.manifest_sha256 == fixture.read_manifest["manifest_sha256"]
+            assert await connection.fetchval(f'SELECT count(*) FROM "{pin.schema_name}".network_membership') == 2
+    with pytest.raises(NetworkServingReadUnavailable, match="digest differs"):
+        await _resolve(fixture)
+    assert await _control_rows(fixture) == before
+
+
 @pytest.mark.parametrize("damage", ["source", "custom", "schema_revision", "retired", "candidate_state"])
 @pytest.mark.parametrize("api_read", [False, True])
 async def test_changed_manifest_scope_or_eligibility_is_unavailable(read_component_db, damage, api_read):
