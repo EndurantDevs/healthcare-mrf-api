@@ -21,6 +21,10 @@ from process.vsp_directory_contract import API_BASE, SEARCH_URL, VSPDirectoryErr
 PROFILE_URL = API_BASE + "provider-web/publicdoctorprofile?officepublicid=101&asofdate=2035-01-01"
 PAYLOAD = {"networkNames": ["Choice"], "offset": "1", "limit": "50"}
 BODY = b'{"totalCounts":0,"locations":[]}'
+MISSING_PROFILE = {
+    "error": "WebApplicationException",
+    "description": "caller=null No records with the given Office public Id. (ErrorId:00000000-0000-4000-8000-000000000001)",
+}
 
 
 class Clock:
@@ -111,6 +115,45 @@ async def test_concurrent_search_and_profile_share_proxy_and_pacing():
         assert options["headers"]["Accept-Encoding"] == "identity"
     assert search[2]["sha256"] == hashlib.sha256(BODY).hexdigest()
     assert search[2]["request_key"] == request_key("POST", SEARCH_URL, PAYLOAD)
+
+
+@pytest.mark.asyncio
+async def test_missing_detail_preserves_actual_404_bytes_and_replay(tmp_path):
+    from process.vsp_directory_enrichment import _profiles
+
+    raw = json.dumps(MISSING_PROFILE).encode()
+    transport, session, _, _, _ = client([Response(raw, status=404, url=PROFILE_URL)])
+    value, observed, metadata = await transport.request("GET", PROFILE_URL)
+    assert observed == raw and value == MISSING_PROFILE and metadata["http_status"] == 404
+    store = retained.VSPCaptureStore(tmp_path, "synthetic-missing-detail")
+    store.retain(observed, metadata)
+    cached, provenance = store.lookup("GET", PROFILE_URL)
+    assert cached == MISSING_PROFILE and provenance["http_status"] == 404
+    assert _profiles(cached, http_status=404) == [] and len(session.calls) == 1
+    with pytest.raises(VSPDirectoryError, match="^vsp_profile_response_invalid$"):
+        _profiles(cached)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "url", "body"),
+    [
+        (404, PROFILE_URL, {"error": "not found"}),
+        (
+            404,
+            PROFILE_URL,
+            {**MISSING_PROFILE, "description": MISSING_PROFILE["description"].replace("000000000001", "invalid")},
+        ),
+        (404, PROFILE_URL, {**MISSING_PROFILE, "unexpected": True}),
+        (403, PROFILE_URL, MISSING_PROFILE),
+        (404, SEARCH_URL + "/101", MISSING_PROFILE),
+    ],
+)
+async def test_other_http_failures_are_not_missing_profiles(status, url, body):
+    transport, session, _, _, _ = client([Response(json.dumps(body).encode(), status=status, url=url)])
+    with pytest.raises(VSPDirectoryError, match="^vsp_http_terminal_status$"):
+        await transport.request("GET", url)
+    assert len(session.calls) == 1
 
 
 @pytest.mark.asyncio

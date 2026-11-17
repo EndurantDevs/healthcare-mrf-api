@@ -63,6 +63,22 @@ def require(condition, code):
         raise VSPDirectoryError(code)
 
 
+def is_missing_profile_response(value):
+    """Recognize the publisher's explicit absence of an office detail record."""
+    return (
+        type(value) is dict
+        and set(value) == {"error", "description"}
+        and value["error"] == "WebApplicationException"
+        and type(value["description"]) is str
+        and re.fullmatch(
+            r"caller=null No records with the given Office public Id\. "
+            r"\(ErrorId:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\)",
+            value["description"],
+        )
+        is not None
+    )
+
+
 def public_id(value):
     """Keep the publisher's numeric identifiers exact across JSON representations."""
     require(type(value) in (int, str), "vsp_public_id_invalid")
@@ -99,7 +115,10 @@ def validated_url(url, *, method):
         require(observed_on.isoformat() == query["asofdate"][0], "vsp_profile_url_invalid")
     elif method == "GET" and parsed.path.startswith(search_path + "/"):
         public_id(parsed.path[len(search_path) + 1 :])
-        require(set(parse_qs(parsed.query)) <= {"networkNames", "productNetworkIDs"}, "vsp_office_url_invalid")
+        require(
+            set(parse_qs(parsed.query)) <= {"networkNames", "productNetworkIDs", "productNetworkIds", "displayCd"},
+            "vsp_office_url_invalid",
+        )
     else:
         raise VSPDirectoryError("vsp_request_url_invalid")
     return url

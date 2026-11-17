@@ -30,6 +30,7 @@ from process.vsp_directory_contract import (
 from process.vsp_directory_enrichment import enrich_capture, write_normalized_capture
 from process.vsp_directory_geometry import census_request, world_tiles
 from process.vsp_directory_http import VSPHTTP, strict_json
+from process.vsp_directory_normalization import company_summary_name, is_company_summary
 from process.vsp_directory_store import VSPCaptureStore, configured_root
 
 
@@ -48,7 +49,7 @@ class CompletedVSPCapture:
 
     @property
     def resource_counts(self):
-        """Include the two normalized result families whose actual output is zero."""
+        """Include every normalized result family, including empty ones."""
         return self.proof["resource_counts"]
 
     def iter_resources(self):
@@ -104,6 +105,7 @@ class VSPCapture:
         self.progress_callback, self.cancel_check = progress_callback, cancel_check
         self.offices, self.identities, self.profiles = {}, {}, {}
         self.search_memberships = {}
+        self.site_memberships = {name: set() for name in NETWORKS.values()}
         self.memberships = {name: set() for name in NETWORKS.values()}
         self.partitions, self.unresolved = [], []
         self.cache_hits = 0
@@ -166,8 +168,18 @@ class VSPCapture:
             has_valid_npi = type(npi) is str and is_valid_npi(npi)
             if has_valid_npi:
                 prior = self.identities.get(did)
-                require(prior is None or prior["summary"]["npi"] == npi, "vsp_doctor_identity_changed")
-                self.identities[did] = {"summary": summary, "request_key": request_id}
+                resource_type = "Organization" if is_company_summary(office, summary) else "Practitioner"
+                require(
+                    prior is None
+                    or prior["summary"]["npi"] == npi
+                    and prior.get("resource_type", "Practitioner") == resource_type
+                    and (
+                        resource_type != "Organization"
+                        or company_summary_name(prior["summary"]) == company_summary_name(summary)
+                    ),
+                    "vsp_doctor_identity_changed",
+                )
+                self.identities[did] = {"summary": summary, "request_key": request_id, "resource_type": resource_type}
             if did not in summaries_by_doctor or has_valid_npi:
                 summaries_by_doctor[did] = summary
         # Keep the first office observation paired with its exact dated profile.
@@ -189,6 +201,8 @@ class VSPCapture:
         if doctor_ids:
             self.remember_search_scope(oid, network, doctor_ids)
         self.memberships[network].add(oid)
+        self.site_memberships[network].add(oid)
+        self.account_bytes("site:" + oid, sorted(name for name, sites in self.site_memberships.items() if oid in sites))
 
     async def census(self, *, fresh=False):
         """Independent single-network counts avoid the publisher's first-network-only trap."""

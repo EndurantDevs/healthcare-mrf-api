@@ -42,6 +42,7 @@ class AffiliateSource:
         self.capped_present = False
         self.repair = None
         self.census_extra = 0
+        self.location_type = "Affiliate"
 
     def response(self, method, url, payload):
         if method == "GET":
@@ -66,6 +67,8 @@ class AffiliateSource:
             for oid in selected_offices
             if (oid, network) in self.scopes
         ]
+        for row in rows:
+            row["locationType"] = self.location_type
         if is_targeted and (selected_offices[0], network) in self.capped:
             rows = (rows[:1] if self.capped_present else []) + [office(100 + index) for index in range(50)]
             return {"totalCounts": 51, "locations": rows[:50]}
@@ -227,10 +230,59 @@ async def test_affiliate_fix_keeps_global_office_deficit_closed(tmp_path):
 async def test_search_doctor_without_office_profile_still_refuses_output(tmp_path):
     source = AffiliateSource()
     source.profiles[52] = source.profiles[52][:1]
+    source.summaries[3] = {"pid": 3}
     run = capture(tmp_path, source)
     await run.discover("Signature", 1)
     with pytest.raises(VSPDirectoryNormalizationError, match="^vsp_directory_unresolved_doctor$"):
         await enrich_capture(run)
+
+
+@pytest.mark.asyncio
+async def test_summary_only_vsp_doctors_replay_scopes_without_origin(tmp_path):
+    source = AffiliateSource(scopes={(52, "Signature"): (2, 3), (52, "Choice"): (2,), (52, "Advantage"): (2,)})
+    source.location_type = "VSP"
+    source.profiles[52] = []
+    for expected in (4, 0):
+        run = capture(tmp_path, source)
+        await run.discover("Signature", 1)
+        await enrich_capture(run)
+        assert run.http.requests == expected
+        if expected:
+            continue
+        census_by_network = {name: len(ids) for name, ids in run.memberships.items()}
+        completed = await write_normalized_capture(run, census_by_network, census_by_network)
+        assert completed.resource_counts["Practitioner"] == completed.resource_counts["PractitionerRole"] == 2
+        assert roles(list(completed.iter_resources())) == {
+            "vsp-role-2-52-1234567893": {"1000", "2000", "4000"},
+            "vsp-role-3-52-1999999992": {"1000"},
+        }
+
+
+@pytest.mark.asyncio
+async def test_missing_profile_record_uses_verified_summaries_and_replays(tmp_path):
+    from tests.test_vsp_directory_http_store import MISSING_PROFILE
+
+    source = AffiliateSource()
+    source.location_type = "VSP"
+    source.profiles[52] = MISSING_PROFILE
+
+    class MissingProfileHTTP(HTTP):
+        async def request(self, method, url, body=None):
+            value, raw, metadata = await super().request(method, url, body)
+            if method == "GET":
+                metadata["http_status"] = 404
+            return value, raw, metadata
+
+    store = VSPCaptureStore(tmp_path, "synthetic-missing-profile-office")
+    for expected in (4, 0):
+        run = acquisition.VSPCapture(store, MissingProfileHTTP(source), noop, noop)
+        await run.discover("Signature", 1)
+        await enrich_capture(run)
+        assert run.http.requests == expected and run.profiles == {"52": []}
+        if not expected:
+            counts_by_network = {name: len(ids) for name, ids in run.memberships.items()}
+            completed = await write_normalized_capture(run, counts_by_network, counts_by_network)
+            assert completed.resource_counts["Practitioner"] == completed.resource_counts["PractitionerRole"] == 2
 
 
 def test_search_memberships_share_the_existing_source_index_budget(tmp_path):

@@ -45,6 +45,16 @@ def test_linked_requests_cannot_escape_source_or_change_identity(url):
     assert validated_url(SEARCH_URL, method="POST") == SEARCH_URL
 
 
+@pytest.mark.parametrize(
+    "query", ["networkNames=Choice", "productNetworkIDs=2000", "displayCd=R&productNetworkIds=2000"]
+)
+def test_same_office_detail_links_preserve_supported_query_keys(query):
+    url = SEARCH_URL + "/52?" + query
+    assert validated_url(url, method="GET") == url
+    with pytest.raises(VSPDirectoryError, match="^vsp_office_url_invalid$"):
+        validated_url(url + "&unrelated=1", method="GET")
+
+
 def test_world_tiles_cover_boundaries_and_spherical_query_circles():
     tiles = world_tiles()
     assert len(tiles) == 36 and len({tile.key for tile in tiles}) == 36

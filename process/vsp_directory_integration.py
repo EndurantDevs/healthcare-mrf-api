@@ -21,7 +21,8 @@ from process.vsp_directory_contract import (
 from process.vsp_directory_store import is_artifact_root_failure
 
 ENTRY_ID = "vsp-provider-directory"
-_EMITTED_TYPES = frozenset({"Location", "Organization", "Practitioner", "PractitionerRole"})
+_REQUIRED_TYPES = frozenset({"Location", "Organization", "Practitioner", "PractitionerRole"})
+_EMITTED_TYPES = _REQUIRED_TYPES | {"OrganizationAffiliation"}
 _SOURCE_QUERIES = {
     "vsp",
     "vsp vision care",
@@ -208,13 +209,20 @@ def _is_digest(value):
 
 def _capture_counts(capture):
     counts, proof = capture.resource_counts, capture.proof
+    retail_locations = proof.get("retail_locations", 0) if type(proof) is dict else None
+    retail_companies = proof.get("retail_company_organizations", 0) if type(proof) is dict else None
     require(
         type(counts) is dict
         and set(counts) == set(RESOURCE_TYPES)
         and all(type(count) is int and count >= 0 for count in counts.values())
-        and all(counts[family] > 0 for family in _EMITTED_TYPES)
-        and counts["Organization"] == len(NETWORKS)
-        and counts["InsurancePlan"] == counts["OrganizationAffiliation"] == 0
+        and all(counts[family] > 0 for family in _REQUIRED_TYPES)
+        and type(retail_locations) is int
+        and 0 <= retail_locations <= counts["Location"]
+        and type(retail_companies) is int
+        and (retail_companies == 0 or retail_companies >= 2 and retail_locations > 0)
+        and counts["Organization"] == len(NETWORKS) + retail_locations + retail_companies
+        and counts["OrganizationAffiliation"] == retail_locations + retail_companies
+        and counts["InsurancePlan"] == 0
         and type(proof) is dict
         and proof.get("normalized_output_only") is True
         and proof.get("adapter_id") == ADAPTER_ID
