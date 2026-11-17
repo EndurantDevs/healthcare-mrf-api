@@ -541,7 +541,6 @@ def test_repository_huge_file_inventory_matches_current_product_tree():
     }
 
     assert huge_paths == {
-        "api/control_imports.py",
         "api/endpoint/npi.py",
         "api/endpoint/pricing.py",
         "api/ptg2_db_sidecars.py",

@@ -63,8 +63,6 @@ async def install_source_witness_runtime(config, resources, *, membership_refres
     existing = address_sources.source_witness_runtime if address_sources is not None else None
     if settings is None and existing is None:
         return config
-    if membership_refresh_request_id is not None:
-        raise ValueError("registry_source_witness_refresh_unsupported")
     if address_sources is None or not address_sources.compact:
         raise ValueError("registry_source_witness_worker_config_invalid")
     if settings is None:

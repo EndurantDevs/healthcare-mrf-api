@@ -4,11 +4,12 @@
 import asyncio
 import json
 import re
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import date, datetime
 from uuid import UUID, uuid4
 
 from process.network_address_projection import _identifier
+from process.network_fhir_plan_tier_graph import PLAN_EVIDENCE_DDL
 from process.network_fhir_retained_capture_contract import registry_location_id
 from process.network_fhir_source_witness_contract import (
     COMPLETION_CONTRACT,
@@ -23,6 +24,7 @@ from process.network_fhir_typed_contract import (
     CELL_COLUMNS,
     KINDS,
     PAIR_COLUMNS,
+    PLAN_TIER_CONTRACT,
     TypedFHIRGraphStage,
     graph_document,
     policy_date,
@@ -36,6 +38,9 @@ from process.network_fhir_typed_sql import (
     CHECKER_PAIR_SQL,
     PAIR_DDL,
     PAIR_SQL,
+    PLAN_TIER_CHECKER_PAIR_SQL,
+    PLAN_TIER_PAIR_SQL,
+    PLAN_TIER_PROJECT_SQL,
     PROJECT_SQL,
 )
 from process.provider_directory_projection_fhir_values import is_valid_npi
@@ -49,7 +54,13 @@ _RESOURCE_FIELDS = {
     "payload_json",
     "acquired_resource_sha256",
 }
-_DDL = {"cells": CELL_DDL, "addresses": ADDRESS_DDL, "pairs": PAIR_DDL, "checks": CHECKER_DDL}
+_DDL = {
+    "cells": CELL_DDL,
+    "addresses": ADDRESS_DDL,
+    "pairs": PAIR_DDL,
+    "checks": CHECKER_DDL,
+    "plans": PLAN_EVIDENCE_DDL,
+}
 _ID = re.compile(r"[A-Za-z0-9.-]{1,64}")
 _DATE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2}))?"
@@ -60,7 +71,11 @@ async def bind_typed_graph_stage(connection, *, schema_name, table_names, docume
     """Bind the qualified graph names used by the caller's transaction."""
     require(connection.is_in_transaction(), "transaction_required")
     _identifier(schema_name)
-    require(type(table_names) is dict and set(table_names) in ({"cells", "addresses", "pairs"}, set(_DDL)), "tables")
+    require(
+        type(table_names) is dict
+        and set(table_names) in ({"cells", "addresses", "pairs"}, {"cells", "addresses", "pairs", "checks"}, set(_DDL)),
+        "tables",
+    )
     for name in table_names.values():
         _identifier(name)
     return TypedFHIRGraphStage(
@@ -76,14 +91,15 @@ def _raw_key(prefix=""):
 
 
 @asynccontextmanager
-async def _workspace(connection):
+async def _workspace(connection, *, plan_tiers=False):
     """A savepoint owns every temporary object; any incomplete pass restarts from zero."""
     require(connection.is_in_transaction(), "transaction_required")
-    names_by_kind = {kind: "fhir_typed_" + kind + "_" + uuid4().hex for kind in _DDL}
+    definitions_by_kind = {kind: definition for kind, definition in _DDL.items() if plan_tiers or kind != "plans"}
+    names_by_kind = {kind: "fhir_typed_" + kind + "_" + uuid4().hex for kind in definitions_by_kind}
     stage, transaction = None, connection.transaction()
     await drain_operation(transaction.start(), preserve_cancellation=True)
     try:
-        for kind, definition in _DDL.items():
+        for kind, definition in definitions_by_kind.items():
             await connection.execute(
                 "CREATE TEMP TABLE " + _identifier(names_by_kind[kind]) + "(" + definition + ") ON COMMIT DROP"
             )
@@ -150,11 +166,13 @@ def _page_rows(page, origin, counts, after):
     return wire_rows, after
 
 
-async def _project_page(connection, stage, rows):
+async def _project_page(connection, stage, rows, *, plan_tiers=False):
     if not rows:
         return
     inserted = await connection.execute(
-        PROJECT_SQL.format(cells=stage.relation("cells")), json.dumps(rows, separators=(",", ":")), list(KINDS)
+        (PLAN_TIER_PROJECT_SQL if plan_tiers else PROJECT_SQL).format(cells=stage.relation("cells")),
+        json.dumps(rows, separators=(",", ":")),
+        list(KINDS),
     )
     require(inserted == "INSERT 0 " + str(len(rows)), "projected_shape")
 
@@ -204,7 +222,20 @@ def _is_period_allowed(start, end, as_of):
     )
 
 
-def _raw_projection(resource_row, base, as_of):
+def _network_reference_targets(references, base, plan_tiers):
+    return [
+        reference_target
+        for reference in references
+        if (
+            reference_target := reference
+            if plan_tiers and re.fullmatch(r"UHCPlanTier/[0-9a-f]{64}", reference)
+            else _target(reference, "Organization", base)
+        )
+        is not None
+    ]
+
+
+def _raw_projection(resource_row, base, as_of, *, plan_tiers=False):
     """Independent raw parser: no producer cells, overlay NPI or Source record-id cache is consulted."""
     raw_payload = json.loads(resource_row["payload_json"])
     require(type(raw_payload) is dict, "raw_payload")
@@ -227,6 +258,10 @@ def _raw_projection(resource_row, base, as_of):
             raw_payload, "practitioner_ref" if kind == "PractitionerRole" else "participating_organization_ref"
         )
         networks, locations = _refs(raw_payload, "network_refs"), _refs(raw_payload, "location_refs")
+        if plan_tiers:
+            from process.network_fhir_plan_tier_graph import semantic_network_references
+
+            networks = semantic_network_references(raw_payload, resource_row["plan_network_refs"])
         start, end = _text(raw_payload, "period_start"), _text(raw_payload, "period_end")
     if kind == "Location":
         status = _text(raw_payload, "status")
@@ -252,7 +287,7 @@ def _raw_projection(resource_row, base, as_of):
         resource_row["resource_id"],
         subject_kind,
         _target(subject, subject_kind, base),
-        [reference_target for ref in networks if (reference_target := _target(ref, "Organization", base)) is not None],
+        _network_reference_targets(networks, base, plan_tiers),
         [reference_target for ref in locations if (reference_target := _target(ref, "Location", base)) is not None],
         active is not False and status != "inactive" and (not is_role or _is_period_allowed(start, end, as_of)),
         npi is not None and is_valid_npi(npi) and re.fullmatch(r"[12][0-9]{9}", npi) is not None,
@@ -260,8 +295,8 @@ def _raw_projection(resource_row, base, as_of):
     return cells, checks
 
 
-async def _check_page(connection, stage, rows, base, as_of):
-    projected_rows = [_raw_projection(row, base, as_of) for row in rows]
+async def _check_page(connection, stage, rows, base, as_of, *, plan_tiers=False):
+    projected_rows = [_raw_projection(row, base, as_of, plan_tiers=plan_tiers) for row in rows]
     if projected_rows:
         for table, records in (
             ("cells", [item[0] for item in projected_rows]),
@@ -274,7 +309,7 @@ async def _check_page(connection, stage, rows, base, as_of):
             require(copied == "COPY " + str(len(rows)), "copy_count")
 
 
-async def _consume(source_export, connection, stage, profile, reviewed, *, checker, as_of):
+async def _consume(source_export, connection, stage, profile, reviewed, *, checker, as_of, plan_tiers=False):
     origin = source_origin(reviewed)
     counts, after = dict.fromkeys(dict(origin.resource_counts), 0), None
     selection = (
@@ -282,7 +317,14 @@ async def _consume(source_export, connection, stage, profile, reviewed, *, check
         if checker
         else {key: getattr(reviewed, key) for key in ("source_id", "endpoint_id", "dataset_id")}
     )
-    async with source_export(source_profile=profile, **selection) as export:
+    from process.network_fhir_plan_tier_graph import plan_tier_source_projection
+
+    async with (
+        plan_tier_source_projection(connection, table_name=stage.names.get("plans"))
+        if plan_tiers
+        else nullcontext(None) as plan_projection,
+        source_export(source_profile=profile, **selection) as export,
+    ):
         require(type(export) is dict and set(export) == {"contract", "origin", "resources"}, "source_export")
         contract = COMPLETION_CONTRACT if type(origin) is SourceWitnessCompletionOrigin else CONTRACT
         require(export["contract"] == contract and source_origin(export["origin"]) == origin, "source_origin")
@@ -291,11 +333,20 @@ async def _consume(source_export, connection, stage, profile, reviewed, *, check
         try:
             async for page in iterator:
                 stage.require_ready(complete=False)
-                rows, after = _page_rows(page, origin, counts, after)
+                source_rows, after = _page_rows(page, origin, counts, after)
+                if plan_projection is not None:
+                    source_rows = await plan_projection.prepare(page, source_rows)
                 if checker:
-                    await _check_page(connection, stage, rows, origin.source_uri.rstrip("/"), as_of)
+                    await _check_page(
+                        connection,
+                        stage,
+                        source_rows,
+                        origin.source_uri.rstrip("/"),
+                        as_of,
+                        **({"plan_tiers": True} if plan_tiers else {}),
+                    )
                 else:
-                    await _project_page(connection, stage, rows)
+                    await _project_page(connection, stage, source_rows, **({"plan_tiers": True} if plan_tiers else {}))
         finally:
             await drain_operation(iterator.aclose(), preserve_cancellation=True)
         require(counts == dict(origin.resource_counts), "source_counts")
@@ -398,8 +449,12 @@ async def _canonicalize(connection, stage):
         require(copied == "COPY " + str(len(address_records)), "canonical_copy")
 
 
-async def _pairs(connection, stage, origin, as_of, *, checker=False):
-    query = CHECKER_PAIR_SQL if checker else PAIR_SQL
+async def _pairs(connection, stage, origin, as_of, *, checker=False, plan_tiers=False):
+    query = (
+        (PLAN_TIER_CHECKER_PAIR_SQL if checker else PLAN_TIER_PAIR_SQL)
+        if plan_tiers
+        else (CHECKER_PAIR_SQL if checker else PAIR_SQL)
+    )
     arguments = () if checker else (origin.source_uri.rstrip("/"), as_of)
     for name in ("cells", "addresses", "checks"):
         if "{" + name + "}" in query:
@@ -451,6 +506,7 @@ async def _same_rows(connection, left, right, columns, keys):
 
 
 async def _verify_in_replay(source_export, connection, stage, replay, source_profile, reviewed_origin, as_of):
+    has_plan_tiers = stage.document["contract"] == PLAN_TIER_CONTRACT
     total = await _consume(
         source_export,
         connection,
@@ -459,6 +515,7 @@ async def _verify_in_replay(source_export, connection, stage, replay, source_pro
         reviewed_origin,
         checker=True,
         as_of=as_of,
+        plan_tiers=has_plan_tiers,
     )
     await _same_rows(
         connection, stage.relation("cells"), replay.relation("cells"), CELL_COLUMNS, ("resource_type", "resource_id")
@@ -471,7 +528,14 @@ async def _verify_in_replay(source_export, connection, stage, replay, source_pro
         ("raw_key", *ADDRESS_FIELDS, "address_key", "canonical_identity"),
         ("raw_key",),
     )
-    await _pairs(connection, replay, source_origin(reviewed_origin), as_of, checker=True)
+    await _pairs(
+        connection,
+        replay,
+        source_origin(reviewed_origin),
+        as_of,
+        checker=True,
+        **({"plan_tiers": True} if has_plan_tiers else {}),
+    )
     await _same_rows(
         connection,
         stage.relation("pairs"),
@@ -497,12 +561,15 @@ async def verify_typed_source_graph(
     if replay_stage is not None:
         replay_stage.require_ready(complete=False)
         require(replay_stage.schema_name == "pg_temp" and "checks" in replay_stage.names, "replay_workspace")
+        require(
+            document["contract"] != PLAN_TIER_CONTRACT or "plans" in replay_stage.names, "plan_tier_replay_workspace"
+        )
         await _empty_tables(connection, replay_stage)
         total = await _verify_in_replay(
             source_export, connection, stage, replay_stage, source_profile, reviewed_origin, as_of
         )
     else:
-        async with _workspace(connection) as replay:
+        async with _workspace(connection, plan_tiers=document["contract"] == PLAN_TIER_CONTRACT) as replay:
             total = await _verify_in_replay(
                 source_export, connection, stage, replay, source_profile, reviewed_origin, as_of
             )
@@ -540,7 +607,10 @@ async def produce_typed_source_graph(
     source_export, connection, stage, *, source_profile, reviewed_origin, membership_as_of
 ):
     """Populate isolated graph tables and record complete content accounting."""
+    from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+
     origin, as_of = source_origin(reviewed_origin), policy_date(membership_as_of)
+    has_plan_tiers = origin.source_id == UHC_PROVIDER_FILE_SOURCE_ID
     require(source_profile.catalog_schema == origin.header_relation["schema"], "source_profile")
     stage.require_ready(complete=False)
     await _empty_tables(connection, stage)
@@ -552,11 +622,12 @@ async def produce_typed_source_graph(
         reviewed_origin,
         checker=False,
         as_of=as_of,
+        plan_tiers=has_plan_tiers,
     )
     await _canonicalize(connection, stage)
-    await _pairs(connection, stage, origin, as_of)
+    await _pairs(connection, stage, origin, as_of, **({"plan_tiers": True} if has_plan_tiers else {}))
     counts = await _counts(connection, stage, total)
-    stage.document = graph_document(reviewed_origin, membership_as_of, counts)
+    stage.document = graph_document(reviewed_origin, membership_as_of, counts, plan_tiers=has_plan_tiers)
     return stage.document
 
 

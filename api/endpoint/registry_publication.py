@@ -627,6 +627,8 @@ async def queue_membership_refresh(request):
     """Queue exact service membership work without approving or editing manual records."""
     require_registry_auth(request)
     try:
+        from process.registry_imported_membership_refresh import RegistryImportedMembershipAdmission
+
         if not request.body or len(request.body) > REFRESH_MAX_BYTES or request.query_string or request.args:
             raise ValueError("registry_membership_refresh_body_invalid")
         envelope_by_field = validated_membership_refresh_envelope(
@@ -635,7 +637,7 @@ async def queue_membership_refresh(request):
         authorize = getattr(request.app.ctx, "registry_membership_refresh_authority", None)
         profile = getattr(request.app.ctx, "registry_membership_refresh_address_profile", None)
         if (
-            type(authorize) is not RegistryMembershipRefreshAuthorityClient
+            type(authorize) not in (RegistryMembershipRefreshAuthorityClient, RegistryImportedMembershipAdmission)
             or authorize.is_enabled is not True
             or type(profile) is not RegistryMembershipRefreshAddressProfile
         ):

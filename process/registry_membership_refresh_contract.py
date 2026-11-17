@@ -74,7 +74,11 @@ def validated_membership_refresh_command(command_by_field):
         != command_by_field["accepted_source_vector_sha256"]
     ):
         raise ValueError("registry_membership_refresh_source_digest_invalid")
-    validated_enrollment(command_by_field["enrolled_scopes"])
+    from process.registry_imported_membership_refresh import imported_catalog_generation
+
+    imported = imported_catalog_generation(command_by_field)
+    if imported is None:
+        validated_enrollment(command_by_field["enrolled_scopes"])
     _text(command_by_field["reason"], 512, "reason")
     _text(command_by_field["idempotency_key"], 128, "idempotency_key")
     encoded_document(command_by_field)

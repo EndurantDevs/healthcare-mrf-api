@@ -11,6 +11,8 @@ from process.network_fhir_source_witness_contract import source_origin
 POLICY = "fhir-direct-network-office-v3"
 DERIVATION_VERSION = 3
 CONTRACT = "registry-fhir-typed-graph-v3"
+PLAN_TIER_CONTRACT = "registry-fhir-typed-graph-v4"
+PLAN_TIER_NETWORK_POLICY = "uhc-plan-tier-network-v1"
 KINDS = ("Location", "Organization", "OrganizationAffiliation", "Practitioner", "PractitionerRole")
 ADDRESS_FIELDS = ("first_line", "second_line", "city_name", "state_name", "postal_code", "country_code")
 CELL_COLUMNS = (
@@ -64,7 +66,7 @@ def policy_date(value):
     return parsed
 
 
-def graph_document(origin, membership_as_of, counts):
+def graph_document(origin, membership_as_of, counts, *, plan_tiers=False):
     """Describe the logical Source edition and the complete graph accounting."""
     policy_date(membership_as_of)
     require(
@@ -72,19 +74,25 @@ def graph_document(origin, membership_as_of, counts):
         and set(counts) == {"source_rows", "projected_rows", "pair_rows", "reference_rows", "provider_only_roles"}
     )
     require(all(type(value) is int and 0 <= value < 2**63 for value in counts.values()))
+    if plan_tiers:
+        from process.uhc_provider_file_source_identity import UHC_PROVIDER_FILE_SOURCE_ID
+
+        require(source_origin(origin).source_id == UHC_PROVIDER_FILE_SOURCE_ID, "plan_tier_source")
     return {
-        "contract": CONTRACT,
-        "derivation_version": DERIVATION_VERSION,
+        "contract": PLAN_TIER_CONTRACT if plan_tiers else CONTRACT,
+        "derivation_version": 4 if plan_tiers else DERIVATION_VERSION,
         "office_policy": POLICY,
         "canonicalizer_version": 2,
         "membership_as_of": membership_as_of,
         "origin": json.loads(json.dumps(asdict(source_origin(origin)))),
         "counts": dict(counts),
+        **({"network_policy": PLAN_TIER_NETWORK_POLICY} if plan_tiers else {}),
     }
 
 
 def validate_graph_document(document):
     """Validate graph data and project historical documents to named Source scope."""
+    has_plan_tiers = type(document) is dict and document.get("contract") == PLAN_TIER_CONTRACT
     fields = {
         "contract",
         "derivation_version",
@@ -93,9 +101,11 @@ def validate_graph_document(document):
         "membership_as_of",
         "origin",
         "counts",
-    }
+    } | ({"network_policy"} if has_plan_tiers else set())
     require(type(document) is dict and set(document) in (fields, fields | {"database_identity"}))
-    rebuilt = graph_document(document["origin"], document["membership_as_of"], document["counts"])
+    rebuilt = graph_document(
+        document["origin"], document["membership_as_of"], document["counts"], plan_tiers=has_plan_tiers
+    )
     require(
         all(document[field] == rebuilt[field] for field in fields - {"origin"})
         and type(document["derivation_version"]) is int

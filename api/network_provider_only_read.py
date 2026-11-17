@@ -224,8 +224,12 @@ async def _page_query(connection, current, control_schema):
     verify_registry_source_contributions(candidate)
     approved, approved_relation = await _approved_mapping(connection, current, control_schema)
     from process.network_provider_only_projection import provider_only_page_sql
+    from process.registry_effective_network_catalog import effective_catalog_sql
 
-    return provider_only_page_sql(current.schema_name, control_schema=control_schema), [approved.approved_revision]
+    records = await effective_catalog_sql(connection, current, _control_namespace(control_schema)[1:-1])
+    return provider_only_page_sql(current.schema_name, control_schema=control_schema, catalog_records=records), [
+        approved.approved_revision
+    ]
 
 
 def _provider(provider, network_ids):

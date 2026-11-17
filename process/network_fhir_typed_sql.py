@@ -50,36 +50,60 @@ def _selected_json(fields):
     return "jsonb_build_object(" + ",".join("'" + key + "',raw->'" + key + "'" for key in fields) + ")"
 
 
-PROJECT_SQL = (
-    """WITH raw_page AS MATERIALIZED (
- SELECT resource_type,resource_id,payload_hash,payload_json::jsonb raw,site_id
- FROM jsonb_to_recordset($1::jsonb) r(resource_type text,resource_id text,payload_hash text,payload_json text,site_id uuid)
+def _project_sql(plan_tiers=False):
+    extra_field = ",plan_network_refs jsonb" if plan_tiers else ""
+    carried_field = ",plan_network_refs" if plan_tiers else ""
+    role_fields = _ROLE_FIELDS + (("network_key_id",) if plan_tiers else ())
+    extra_references = (
+        "||ARRAY(SELECT ref FROM jsonb_array_elements_text(coalesce(plan_network_refs,'[]'::jsonb)) ref "
+        "WHERE NOT coalesce(nullif(p->'network_refs','null'::jsonb),'[]'::jsonb) ? ref) "
+        "||CASE WHEN p->>'network_key_id' IS NULL THEN ARRAY[]::text[] "
+        "ELSE ARRAY['UHCPlanTier/'||(p->>'network_key_id')] END"
+        if plan_tiers
+        else ""
+    )
+    return (
+        """WITH raw_page AS MATERIALIZED (
+ SELECT resource_type,resource_id,payload_hash,payload_json::jsonb raw,site_id"""
+        + carried_field
+        + """
+ FROM jsonb_to_recordset($1::jsonb) r(resource_type text,resource_id text,payload_hash text,payload_json text,site_id uuid"""
+        + extra_field
+        + """)
  WHERE resource_type=ANY($2::text[])
 ) , parsed AS MATERIALIZED (
- SELECT resource_type,resource_id,payload_hash,site_id,CASE
+ SELECT resource_type,resource_id,payload_hash,site_id"""
+        + carried_field
+        + """,CASE
  WHEN resource_type IN ('Organization','Practitioner') THEN """
-    + _selected_json(("npi", "active"))
-    + """
+        + _selected_json(("npi", "active"))
+        + """
  WHEN resource_type='Location' THEN """
-    + _selected_json(("status", *ADDRESS_FIELDS))
-    + """
+        + _selected_json(("status", *ADDRESS_FIELDS))
+        + """
  ELSE """
-    + _selected_json(_ROLE_FIELDS)
-    + """ END p FROM raw_page
+        + _selected_json(role_fields)
+        + """ END p FROM raw_page
 ) INSERT INTO {cells}("""
-    + ",".join(CELL_COLUMNS)
-    + """ )
+        + ",".join(CELL_COLUMNS)
+        + """ )
 SELECT resource_type,resource_id,payload_hash,p->>'npi',(p->>'active')::boolean,
 CASE WHEN resource_type='PractitionerRole' THEN p->>'practitioner_ref'
  WHEN resource_type='OrganizationAffiliation' THEN p->>'participating_organization_ref' END,
-ARRAY(SELECT jsonb_array_elements_text(coalesce(nullif(p->'network_refs','null'::jsonb),'[]'::jsonb))),
+ARRAY(SELECT jsonb_array_elements_text(coalesce(nullif(p->'network_refs','null'::jsonb),'[]'::jsonb)))"""
+        + extra_references
+        + """,
 ARRAY(SELECT jsonb_array_elements_text(coalesce(nullif(p->'location_refs','null'::jsonb),'[]'::jsonb))),
 p->>'period_start',p->>'period_end',p->>'status',"""
-    + ",".join("p->>'" + key + "'" for key in ADDRESS_FIELDS)
-    + """,site_id
+        + ",".join("p->>'" + key + "'" for key in ADDRESS_FIELDS)
+        + """,site_id
 FROM parsed WHERE """
-    + _SHAPE
-)
+        + _SHAPE
+    )
+
+
+PROJECT_SQL = _project_sql()
+PLAN_TIER_PROJECT_SQL = _project_sql(True)
 
 DATE_PATTERN = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2}))?$"
 
@@ -239,4 +263,32 @@ AND """
     + _NPI
     + " AND "
     + _ROLE_SCOPE
+)
+
+
+def _plan_tier_networks(query):
+    if query.count(_NETWORK_LOOKUP) != 1:
+        raise ValueError("registry_fhir_typed_network_template_invalid")
+    extended = _NETWORK_LOOKUP.replace(
+        " OFFSET 0) net ON true",
+        " UNION ALL SELECT raw.ref WHERE raw.ref ~ '^UHCPlanTier/[0-9a-f]{64}$' OFFSET 0) net ON true",
+    )
+    return query.replace(_NETWORK_LOOKUP, extended)
+
+
+PLAN_TIER_PAIR_SQL = _plan_tier_networks(PAIR_SQL)
+PLAN_TIER_PROVIDER_ONLY_SQL = _plan_tier_networks(PROVIDER_ONLY_SQL)
+
+_CHECKER_NETWORK = """JOIN LATERAL (SELECT * FROM {cells} net WHERE net.resource_type='Organization' AND net.resource_id=ni.id OFFSET 0) net ON true
+JOIN LATERAL (SELECT * FROM {checks} nx WHERE (nx.resource_type,nx.resource_id)=(net.resource_type,net.resource_id) OFFSET 0) nx ON true"""
+_CHECKER_PLAN_TIER_NETWORK = """JOIN LATERAL (
+ SELECT ni.id AS resource_id WHERE ni.id ~ '^UHCPlanTier/[0-9a-f]{64}$'
+ UNION ALL SELECT net.resource_id FROM {cells} net JOIN {checks} nx
+ ON (nx.resource_type,nx.resource_id)=(net.resource_type,net.resource_id)
+ WHERE net.resource_type='Organization' AND net.resource_id=ni.id AND nx.eligible OFFSET 0
+) net ON true"""
+if CHECKER_PAIR_SQL.count(_CHECKER_NETWORK) != 1 or CHECKER_PAIR_SQL.count("AND nx.eligible") != 1:
+    raise ValueError("registry_fhir_typed_network_template_invalid")
+PLAN_TIER_CHECKER_PAIR_SQL = CHECKER_PAIR_SQL.replace(_CHECKER_NETWORK, _CHECKER_PLAN_TIER_NETWORK).replace(
+    "AND nx.eligible", ""
 )

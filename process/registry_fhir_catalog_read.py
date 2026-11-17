@@ -351,22 +351,36 @@ async def _metadata_pin(connection, query, namespace):
         f"(SELECT metadata_generation FROM {namespace}.network_serving_control WHERE id=1)) AND published_at IS NOT NULL",
         query.metadata_generation,
     )
-    if snapshot is None or query.generation_id is not None and snapshot["network_generation"] != query.generation_id:
+    if snapshot is None:
         _invalid("source_changed")
+    if query.generation_id is not None and snapshot["network_generation"] != query.generation_id:
+        relation = namespace + ".network_serving_manifest"
+        if await connection.fetchval("SELECT to_regclass($1)", relation) is None:
+            _invalid("source_changed")
+        retained = await connection.fetchval(
+            f"SELECT source_generations->>'fhir_catalog' FROM {relation} WHERE generation_id=$1",
+            query.generation_id,
+        )
+        if retained != snapshot["metadata_generation"]:
+            _invalid("source_changed")
     _digest(snapshot["metadata_generation"])
     catalog_integer(snapshot["metadata_approved_revision"], 9223372036854775807, minimum=0)
     storage_identifier(snapshot["schema_name"])
     await validate_fhir_catalog_snapshot_record(connection, snapshot)
+    if query.generation_id is not None and snapshot["network_generation"] != query.generation_id:
+        return {**dict(snapshot), "_directory_generation": query.generation_id}
     return snapshot
 
 
 async def _directory_manifest(connection, query, snapshot, control_schema):
-    generation = snapshot["network_generation"]
+    generation = query.generation_id if query.generation_id is not None else snapshot["network_generation"]
     digest = snapshot["manifest_sha256"]
     if (
         (generation is None) != (digest is None)
+        or (snapshot["network_generation"] is None) != (digest is None)
         or query.generation_id is not None
-        and query.generation_id != generation
+        and query.generation_id != snapshot["network_generation"]
+        and snapshot.get("_directory_generation") != query.generation_id
     ):
         _invalid("source_changed")
     if (
@@ -383,7 +397,16 @@ async def _directory_manifest(connection, query, snapshot, control_schema):
     catalog_integer(generation, 9223372036854775807)
     _digest(digest)
     manifest, _, _ = await read_published_api_pin(connection, generation, control_schema)
-    if manifest.manifest_sha256 != digest:
+    native_generation = getattr(manifest, "source_generations", {}).get("fhir_catalog")
+    if manifest.generation_id != generation:
+        _invalid("source_changed")
+    if native_generation is not None:
+        if (
+            native_generation != snapshot["metadata_generation"]
+            or manifest.approved_custom_revision < snapshot["metadata_approved_revision"]
+        ):
+            _invalid("source_changed")
+    elif snapshot["network_generation"] != generation or manifest.manifest_sha256 != digest:
         _invalid("source_changed")
     return manifest
 

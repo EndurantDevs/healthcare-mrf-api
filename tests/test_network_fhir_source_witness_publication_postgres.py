@@ -77,7 +77,7 @@ async def _consumer(worker, **options_by_name):
 
 
 @asynccontextmanager
-async def _single_worker_install(monkeypatch, worker):
+async def _single_worker_install(monkeypatch, worker, *, require_permission_reuse=True):
     from tests import test_registry_publication_consumer_postgres as consumer_fixture
 
     original_install = consumer_fixture._install
@@ -102,7 +102,9 @@ async def _single_worker_install(monkeypatch, worker):
     with monkeypatch.context() as patch:
         patch.setattr(consumer_fixture, "_install", install_once)
         yield counts
-    assert counts.installations == 1 and counts.reads > 1
+    assert counts.installations == 1
+    if require_permission_reuse:
+        assert counts.reads > 1
 
 
 async def _remove_address_inputs(connection, schemas):
@@ -240,7 +242,7 @@ async def _source_capture_for_workers(
 
 
 @asynccontextmanager
-async def _publication_case(monkeypatch, *, legacy=False, named=True):
+async def _publication_case(monkeypatch, *, legacy=False, named=True, require_permission_reuse=True):
     from tests import test_registry_publication_consumer_postgres as consumer_fixture
 
     async with source_witness_case(monkeypatch, legacy=legacy, named=named) as case, AsyncExitStack() as stack:
@@ -254,7 +256,9 @@ async def _publication_case(monkeypatch, *, legacy=False, named=True):
             await fixture.connection.execute('CREATE EXTENSION IF NOT EXISTS "' + extension + '"')
         worker = await stack.enter_async_context(_worker_roles(fixture, SimpleNamespace(actor=_actor())))
         worker.named_preparation = True
-        installation = await stack.enter_async_context(_single_worker_install(monkeypatch, worker))
+        installation = await stack.enter_async_context(
+            _single_worker_install(monkeypatch, worker, require_permission_reuse=require_permission_reuse)
+        )
         operator = SimpleNamespace(connection=case.fixture.admin, owner_role=case.fixture.role_by_kind["owner"])
         await _registry_read_bootstrap(case, serving)
         candidate_roles, source_roles, address_reader_roles = _actor_censuses(

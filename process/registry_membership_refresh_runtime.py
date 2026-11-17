@@ -24,6 +24,12 @@ from process.registry_aca_source_notifications import RegistryACASourceNotificat
 from process.registry_candidate_composition import RegistryCompositionAddressSources
 from process.registry_cms_source_notifications import RegistryCMSSourceNotificationReader
 from process.registry_company_approval_fence import registry_company_approval_transaction
+from process.registry_imported_membership_refresh import (
+    RegistryImportedMembershipAdmission,
+    imported_catalog_generation,
+    imported_catalog_inputs,
+    require_imported_catalog_inputs,
+)
 from process.registry_membership_refresh_authority import RegistryMembershipRefreshAuthorityClient
 from process.registry_membership_refresh_contract import (
     SERVICE_ACTOR,
@@ -57,8 +63,6 @@ _MAX_CONFIG_BYTES = 32768
 _ENROLLMENT_PATH = "/internal/v1/registry/membership-refresh/enrollments"
 _REQUIRED = {
     "enabled",
-    "app_origin",
-    "service_token",
     "control_schema",
     "fence_dsn",
     "source_reader_dsn",
@@ -163,8 +167,8 @@ def _profiles(configured, reader_role):
 
 @dataclass(frozen=True, repr=False)
 class _Settings:
-    app_origin: str
-    service_token: str
+    app_origin: str | None
+    service_token: str | None
     control_schema: str
     fence_url: object
     source_reader_url: object
@@ -176,6 +180,33 @@ class _Settings:
     aca_source_schema: str
     aca_head_fence_url: object | None = None
     generic_head_fence_url: object | None = None
+    inventory_sources: object | None = None
+
+
+def _runtime_urls(configured):
+    """Validate the configured readers and their optional independent source fences."""
+    urls = tuple(_native_url(configured[name]) for name in ("fence_dsn", "source_reader_dsn", "address_reader_dsn"))
+    aca = configured["source_profiles"].get("aca", {}) if type(configured["source_profiles"]) is dict else {}
+    head_url = _native_url(aca["head_fence_dsn"]) if type(aca) is dict and "head_fence_dsn" in aca else None
+    generic = configured["source_profiles"].get("generic", {}) if type(configured["source_profiles"]) is dict else {}
+    generic_url = (
+        _native_url(generic["head_fence_dsn"]) if type(generic) is dict and "head_fence_dsn" in generic else None
+    )
+    for selected_head_url in (head_url, generic_url):
+        if selected_head_url is not None and _target(selected_head_url) != _target(urls[0]):
+            raise _unavailable()
+    if len({_target(url) for url in urls}) != 1:
+        raise _unavailable()
+    return urls, head_url, generic_url
+
+
+def _inventory_configuration(configured):
+    """Preserve legacy settings while parsing an optional server-owned native inventory."""
+    from process.registry_imported_source_inventory import parse_imported_source_inventory_config
+
+    if "inventory_sources" not in configured:
+        return None
+    return parse_imported_source_inventory_config(configured["inventory_sources"])
 
 
 def _settings(configured):
@@ -187,30 +218,27 @@ def _settings(configured):
             configured = json.loads(configured, object_pairs_hook=_unique_object, parse_constant=_reject_number)
         if type(configured) is not dict or configured.get("enabled") is not True:
             raise _unavailable()
-        if not _REQUIRED <= set(configured) or set(configured) - _REQUIRED - {"sql_limits", "read_budget"}:
+        if not _REQUIRED <= set(configured) or set(configured) - _REQUIRED - {
+            "sql_limits",
+            "read_budget",
+            "app_origin",
+            "service_token",
+            "inventory_sources",
+        }:
+            raise _unavailable()
+        if ("app_origin" in configured) != ("service_token" in configured):
             raise _unavailable()
         if len(encoded_document(configured)) > _MAX_CONFIG_BYTES:
             raise _unavailable()
         _identifier(configured["control_schema"])
-        urls = tuple(_native_url(configured[name]) for name in ("fence_dsn", "source_reader_dsn", "address_reader_dsn"))
-        aca = configured["source_profiles"].get("aca", {}) if type(configured["source_profiles"]) is dict else {}
-        head_url = _native_url(aca["head_fence_dsn"]) if type(aca) is dict and "head_fence_dsn" in aca else None
-        generic = (
-            configured["source_profiles"].get("generic", {}) if type(configured["source_profiles"]) is dict else {}
-        )
-        generic_url = (
-            _native_url(generic["head_fence_dsn"]) if type(generic) is dict and "head_fence_dsn" in generic else None
-        )
-        for selected_head_url in (head_url, generic_url):
-            if selected_head_url is not None and _target(selected_head_url) != _target(urls[0]):
-                raise _unavailable()
-        if len({_target(url) for url in urls}) != 1:
-            raise _unavailable()
+        urls, head_url, generic_url = _runtime_urls(configured)
         profile = RegistryMembershipRefreshAddressProfile(
             configured["address_schema"], _roles(configured["runtime_roles"])
         )
-        token = configured["service_token"]
-        if type(token) is not str or not 0 < len(token) <= 4096 or re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token) is None:
+        token = configured.get("service_token")
+        if "service_token" in configured and (
+            type(token) is not str or not 0 < len(token) <= 4096 or re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token) is None
+        ):
             raise _unavailable()
         budget = configured.get("read_budget", dict(zip(_BUDGET_FIELDS, _BUDGET_MAXIMUM, strict=True)))
         _object(budget, set(_BUDGET_FIELDS))
@@ -221,7 +249,7 @@ def _settings(configured):
             raise _unavailable()
         sql_limits = RegistryPublicationSQLLimits(**configured["sql_limits"]) if "sql_limits" in configured else None
         return _Settings(
-            _origin(configured["app_origin"]),
+            _origin(configured["app_origin"]) if "app_origin" in configured else None,
             token,
             configured["control_schema"],
             *urls,
@@ -232,6 +260,7 @@ def _settings(configured):
             configured["source_profiles"].get("aca", {}).get("source_schema", "mrf"),
             head_url,
             generic_url,
+            _inventory_configuration(configured),
         )
     except ValueError, TypeError, KeyError, AttributeError, UnicodeError, RecursionError, ArgumentError:
         raise _unavailable() from None
@@ -475,8 +504,87 @@ async def _approved(driver, schema, revision):
 class _SourceResolver:
     """Bind full native source fences to one fixed address profile and execution role."""
 
-    def __init__(self, resources):
+    def __init__(self, resources, *, source_runtime=None, capture_sessions=None):
         self.resources = resources
+        self.source_runtime, self.capture_sessions = source_runtime, capture_sessions
+        self.prepared_command = None
+        self.prepared_recipes = ()
+        self.created_schemas = ()
+
+    async def prepare_sources(self, connection, record):
+        """Prepare only this admitted request once; retain its owned candidate schemas for cleanup."""
+        from process.registry_imported_source_preparation import prepare_imported_source_recipes
+        from process.registry_membership_refresh_queue import validated_membership_refresh_request_record
+
+        envelope = validated_membership_refresh_request_record(record)
+        command = envelope["command"]
+        digest = membership_refresh_command_sha256(command)
+        if self.prepared_command is not None:
+            if self.prepared_command != digest:
+                raise _unavailable()
+            return
+        if self.source_runtime is None or self.capture_sessions is None:
+            raise _unavailable()
+        await require_imported_catalog_inputs(connection, command, self.resources.settings.control_schema)
+        async with self.capture_sessions() as session, session.begin():
+            prepared = await prepare_imported_source_recipes(
+                await _driver(session),
+                request_id=record["request_id"],
+                envelope=envelope,
+                source_runtime=self.source_runtime,
+                control_schema=self.resources.settings.control_schema,
+            )
+        self.prepared_recipes = prepared.recipes
+        self.created_schemas = prepared.created_schemas
+        self.prepared_command = digest
+
+    async def discard_sources(self, connection, record):
+        """Release request-local state; committed Source captures remain reusable retained inputs."""
+        self.prepared_recipes = ()
+        self.created_schemas = ()
+        self.prepared_command = None
+
+    @asynccontextmanager
+    async def _pin_imported_sources(self, connection, envelope, source_manifest):
+        from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+        from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
+        from process.registry_imported_source_inventory import (
+            current_imported_source_inventory,
+            retained_unavailable_fhir_recipes,
+        )
+        from process.registry_native_provider_source import PinnedNativeProviderMembershipSource
+        from process.registry_source_recipe_store import resolve_retained_registry_source_recipes
+
+        command = envelope["command"]
+        if self.prepared_command != membership_refresh_command_sha256(command):
+            raise _unavailable()
+        inventory = await current_imported_source_inventory()
+        await require_imported_catalog_inputs(
+            connection, command, self.resources.settings.control_schema, inventory=inventory
+        )
+        recipes = self.prepared_recipes
+        native_current_ids = {native_source["source_id"] for native_source in inventory.native_sources}
+        if source_manifest is not None:
+            retained = await resolve_retained_registry_source_recipes(
+                connection, source_manifest, control_schema=self.resources.settings.control_schema
+            )
+            recipes = (
+                tuple(
+                    recipe
+                    for recipe in retained
+                    if type(recipe.source_pin) not in (PinnedFHIRMembershipSource, PinnedTypedFHIRMembershipSource)
+                    and not (
+                        type(recipe.source_pin) is PinnedNativeProviderMembershipSource
+                        and recipe.source_pin.source_id in native_current_ids
+                    )
+                )
+                + retained_unavailable_fhir_recipes(retained, inventory)
+                + recipes
+            )
+        async with self.resources.address() as (_address_driver, pin, descriptor):
+            if descriptor["descriptor_sha256"] != command["address_artifact_sha256"]:
+                raise _unavailable()
+            yield self._composition(pin, recipes, source_manifest, self.source_runtime)
 
     @asynccontextmanager
     async def pin_sources(self, connection, envelope, source_manifest):
@@ -484,6 +592,10 @@ class _SourceResolver:
         from process.registry_membership_refresh_sources import pin_registry_membership_refresh_sources
 
         envelope = frozen_membership_refresh_envelope(envelope)
+        if imported_catalog_generation(envelope["command"]) is not None:
+            async with self._pin_imported_sources(connection, envelope, source_manifest) as composition_sources:
+                yield composition_sources
+            return
         resources = self.resources
         command = envelope["command"]
         async with registry_company_approval_transaction(
@@ -508,7 +620,7 @@ class _SourceResolver:
         async with self.pin_sources(connection, envelope, source_manifest) as sources:
             return sources
 
-    def _composition(self, address_pin, recipes, source_manifest):
+    def _composition(self, address_pin, recipes, source_manifest, source_runtime=None):
         from process.registry_ptg_graph_reader import RegistryPTGGraphReadBudget
 
         arguments_by_phase = {
@@ -519,6 +631,7 @@ class _SourceResolver:
             office_scope_store=self.resources.readers.ptg_store,
             office_read_budget=RegistryPTGGraphReadBudget(*self.resources.settings.read_budget),
             compact=True,
+            source_witness_runtime=source_runtime,
             **arguments_by_phase,
         )
 
@@ -528,7 +641,7 @@ class RegistryMembershipRefreshInputsService:
     """Scheduling observations retain one exact readiness hint, never rows or permission."""
 
     resources: _Resources
-    authorize: RegistryMembershipRefreshAuthorityClient
+    authorize: RegistryMembershipRefreshAuthorityClient | RegistryImportedMembershipAdmission
     _readiness_key: str | None = field(default=None, init=False, repr=False)
     _is_ready: bool = field(default=False, init=False, repr=False)
 
@@ -536,17 +649,70 @@ class RegistryMembershipRefreshInputsService:
         """Return one complete bounded native observation; failures produce no partial vector."""
         try:
             async with asyncio.timeout(25):
-                scopes = await _enrollments(self.authorize)
+                is_native_import = type(self.authorize) is RegistryImportedMembershipAdmission
+                scopes = [] if is_native_import else await _enrollments(self.authorize)
                 async with registry_company_approval_transaction(
                     self.resources.fence_sessions, control_schema=self.resources.settings.control_schema
                 ) as session:
-                    return await self._observe(session, scopes)
+                    return (
+                        await self._observe_imported(session)
+                        if is_native_import
+                        else await self._observe(session, scopes)
+                    )
         except asyncio.CancelledError, PermissionError:
             self._readiness_key = None
             raise
         except Exception:
             self._readiness_key = None
             raise _unavailable() from None
+
+    async def _observe_imported(self, session):
+        schema = self.resources.settings.control_schema
+        driver = await _driver(session)
+        head = await _heads(driver, schema)
+        _, accepted, _descriptors = await imported_catalog_inputs(driver, schema)
+        async with self.resources.address() as (_address_driver, pin, descriptor):
+            address_generation = pin.generation_id
+            address_artifact_sha256 = descriptor["descriptor_sha256"]
+        digest = _semantic_digest(accepted, head["approved_revision"], address_generation, address_artifact_sha256, [])
+        manifest = await _manifest(driver, schema, head)
+        published = await _published_request(driver, schema, manifest)
+        recovery = await _recovery(driver, schema, digest)
+        document_by_field = {
+            "accepted_sources": accepted,
+            "approved_revision": head["approved_revision"],
+            "address_generation": address_generation,
+            "address_artifact_sha256": address_artifact_sha256,
+            "ready_address_generation": address_generation if accepted else None,
+            "expected_serving_generation": head["generation_id"],
+            "expected_serving_manifest_sha256": head["manifest_sha256"],
+            "enrolled_scopes": [],
+            "published_inputs_digest": None if published is None else published[0],
+            "refresh_request": None,
+        }
+        if recovery is not None:
+            request, command = recovery
+            recovered = _semantic_digest(
+                command["accepted_sources"],
+                command["expected_approved_revision"],
+                address_generation,
+                command["address_artifact_sha256"],
+                command["enrolled_scopes"],
+            )
+            if recovered != digest or imported_catalog_generation(command) is None:
+                raise _unavailable()
+            document_by_field.update(
+                expected_serving_generation=command["expected_serving_generation"],
+                expected_serving_manifest_sha256=command["expected_serving_manifest_sha256"],
+                refresh_request={
+                    "request_id": str(request["request_id"]),
+                    "state": request["state"],
+                    "command_sha256": membership_refresh_command_sha256(command),
+                    "inputs_digest": digest,
+                },
+            )
+        encoded_document(document_by_field)
+        return document_by_field
 
     async def _selected_sources(self, session, scopes, approved, manifest):
         from process.registry_membership_refresh_sources import observe_registry_membership_refresh_sources
@@ -748,7 +914,17 @@ def _head_fence_sessions(settings, cleanup, url):
     return None if url is None else _worker_sessions(settings, cleanup, url)
 
 
-async def _build_native_bundle(settings, cleanup):
+async def _refresh_authority(settings, cleanup):
+    """Choose native admission or the configured legacy authority without changing its lifetime."""
+    if settings.app_origin is None:
+        return RegistryImportedMembershipAdmission()
+    return await cleanup.enter_async_context(
+        RegistryMembershipRefreshAuthorityClient(settings.app_origin, settings.service_token, enabled=True)
+    )
+
+
+async def _build_native_bundle(settings, cleanup, *, source_runtime=None, capture_sessions=None):
+    """Build fixed native readers and one matching publication runtime in the caller's lifetime."""
     from process.registry_membership_refresh_source_fence import RegistryMembershipRefreshHeadFences
     from process.registry_membership_refresh_sources import RegistryMembershipRefreshSourceReaders
 
@@ -771,12 +947,16 @@ async def _build_native_bundle(settings, cleanup):
         head_fences=RegistryMembershipRefreshHeadFences(head_sessions, generic_head_sessions),
     )
     resources = _Resources(settings, *factories, readers)
-    authority = await cleanup.enter_async_context(
-        RegistryMembershipRefreshAuthorityClient(settings.app_origin, settings.service_token, enabled=True)
-    )
-    resolver = _SourceResolver(resources)
+    authority = await _refresh_authority(settings, cleanup)
+    resolver = _SourceResolver(resources, source_runtime=source_runtime, capture_sessions=capture_sessions)
     runtime = RegistryMembershipRefreshRuntime(
-        authority, settings.address_profile, resolver.resolve_sources, resolver.pin_sources
+        authority,
+        settings.address_profile,
+        resolver.resolve_sources,
+        resolver.pin_sources,
+        prepare_sources=resolver.prepare_sources if settings.app_origin is None else None,
+        discard_sources=resolver.discard_sources if settings.app_origin is None else None,
+        source_witness_runtime=source_runtime,
     )
     anchors = RegistryRefreshAnchorService(
         factories[0],
@@ -823,7 +1003,47 @@ async def build_registry_membership_refresh_runtime(configured, cleanup):
         raise _unavailable() from None
 
 
-async def membership_refresh_worker_runtime(worker_config, cleanup):
+async def _imported_worker_sources(settings, worker_config, cleanup, request_id):
+    """Bind native source preparation to the exact admitted publication request."""
+    if settings.app_origin is not None:
+        return None, None
+    from process.registry_imported_catalog_bindings import PublishedFHIRCatalogBindingScope
+    from process.registry_membership_refresh_queue import validated_membership_refresh_request_record
+
+    configured = worker_config.initial_address_sources
+    source_runtime = configured.source_witness_runtime if configured is not None else None
+    if source_runtime is None or worker_config.custody_url is None or request_id is None:
+        raise _unavailable()
+    sessions = _worker_sessions(worker_config, cleanup, worker_config.lifecycle_url)
+    async with sessions() as session, session.begin():
+        await session.execute(text("SET TRANSACTION READ ONLY"))
+        driver = await _driver(session)
+        request_record = await driver.fetchrow(
+            f"SELECT * FROM {_namespace(settings.control_schema)}.registry_publication_request WHERE request_id=$1",
+            request_id,
+        )
+        if request_record is None:
+            raise _unavailable()
+        envelope = validated_membership_refresh_request_record(request_record)
+        from process.registry_imported_catalog_preparation import resolve_imported_catalog_preparation
+
+        catalog = await resolve_imported_catalog_preparation(
+            driver,
+            imported_catalog_generation(envelope["command"]),
+            envelope["command"]["expected_approved_revision"],
+            control_schema=settings.control_schema,
+        )
+    source_runtime = replace(
+        source_runtime,
+        catalog_bindings=PublishedFHIRCatalogBindingScope(catalog.metadata_generation, catalog.inventory_token),
+        semantic_policy=None,
+        semantic_validation=None,
+    )
+    captures = _worker_sessions(worker_config, cleanup, worker_config.custody_url)
+    return source_runtime, captures
+
+
+async def membership_refresh_worker_runtime(worker_config, cleanup, *, request_id=None):
     """Use the fixed environment profile, exact composition census and bounded worker limits."""
     from db.registry_schema import registry_schema
     from process.registry_publication_worker import RegistryPublicationWorkerConfig
@@ -848,7 +1068,13 @@ async def membership_refresh_worker_runtime(worker_config, cleanup):
                 if getattr(settings.sql_limits, name) > getattr(limits, name):
                     raise _unavailable()
             limits = settings.sql_limits
-        bundle = await _build_native_bundle(replace(settings, sql_limits=limits), cleanup)
+        source_runtime, captures = await _imported_worker_sources(settings, worker_config, cleanup, request_id)
+        bundle = await _build_native_bundle(
+            replace(settings, sql_limits=limits),
+            cleanup,
+            source_runtime=source_runtime,
+            capture_sessions=captures,
+        )
         return bundle.runtime
     except asyncio.CancelledError:
         raise

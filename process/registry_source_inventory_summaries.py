@@ -263,7 +263,11 @@ class OfficeSummaryAccumulator:
         self._root = _root(root)
         self._approved_revision, self._approved_generation = approved.approved_revision, approved.generation_id
         self._address_generation, self._origin = address_source.generation_id, origin_manifest_sha256
-        self._fold = _SummaryFold(self._root.derivation_count, validate_derivation, ("office_rows", "page_count"))
+        from process.registry_native_provider_office_derivation import validate_raw_or_native_office_derivation
+
+        self._fold = _SummaryFold(
+            self._root.derivation_count, validate_raw_or_native_office_derivation, ("office_rows", "page_count")
+        )
 
     def accept(self, derivation):
         """Validate one next derivation; page boundaries never enter either hash or totals."""
@@ -532,6 +536,10 @@ class WitnessOfficeSummaryAccumulator:
             raise RegistrySourceInventoryError("registry_source_inventory_summary_invalid") from None
 
     def _validate(self, document):
+        if type(document) is dict and document.get("derivation_version") == 4:
+            from process.registry_native_provider_office_derivation import validate_native_provider_office_derivation
+
+            return validate_native_provider_office_derivation(document)
         if type(document) is dict and "derivation_version" in document:
             checked = validate_verified_office_derivation_v2(document)
             _require({field: checked[field] for field in self._context} == self._context)
@@ -543,7 +551,7 @@ class WitnessOfficeSummaryAccumulator:
     def accept(self, derivation):
         """Commit one next derivation; a mismatched context poisons the fold."""
         self._fold.accept(derivation)
-        self._verified_count += "derivation_version" in derivation
+        self._verified_count += derivation.get("derivation_version") == 2
 
     def _summary(self, count, correspondence_sha256, totals_by_name):
         return validate_office_summary_v5(

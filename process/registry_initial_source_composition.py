@@ -98,6 +98,8 @@ class OfficeSummaryRequest:
 
 def validate_initial_source_recipes(recipes, *, inventory=False) -> tuple:
     """Require bounded canonical source recipes with complete logical data scope."""
+    from process.registry_native_provider_source import PinnedNativeProviderMembershipSource
+
     try:
         if type(recipes) is not tuple:
             raise ValueError
@@ -109,12 +111,16 @@ def validate_initial_source_recipes(recipes, *, inventory=False) -> tuple:
             recipes = decode_registry_source_recipes(canonical_registry_source_recipes(recipes))
         for recipe in recipes:
             source_pin = recipe.source_pin
-            if type(source_pin) is PinnedTypedFHIRMembershipSource and not inventory:
+            if (
+                type(source_pin) in (PinnedTypedFHIRMembershipSource, PinnedNativeProviderMembershipSource)
+                and not inventory
+            ):
                 raise ValueError
             if type(source_pin) in {
                 PinnedACAMembershipSource,
                 PinnedPTGOfficeMembershipSource,
                 PinnedTypedFHIRMembershipSource,
+                PinnedNativeProviderMembershipSource,
             }:
                 continue
             if type(source_pin) is PinnedFHIRMembershipSource and (
@@ -397,9 +403,9 @@ async def _inventory_office_summary(
 ):
     """Derive each SOURCE recipe once, emitting metadata or folding a known complete root."""
     from process.network_initial_cms_office_bindings import _copy_source_office_records
+    from process.registry_native_provider_office_derivation import validate_raw_or_native_office_derivation
     from process.registry_source_fact_offices import FactOfficeContext, capture_fact_office_pages
     from process.registry_source_inventory_summaries import OfficeSummaryAccumulator
-    from process.registry_source_office_summary_v3 import validate_derivation
 
     async def receive(bindings):
         """Use the current native matches for both producer and custodian destinations."""
@@ -419,7 +425,10 @@ async def _inventory_office_summary(
     )
     for recipe in ordered:
         identity = registry_source_recipes_sha256(canonical_registry_source_recipes((recipe,)))
-        if identity in phase.artifacts:
+        native_derivation = _native_office_derivation(recipe)
+        if native_derivation is not None:
+            derivation = native_derivation
+        elif identity in phase.artifacts:
             context = FactOfficeContext(
                 approved,
                 address_source,
@@ -433,7 +442,7 @@ async def _inventory_office_summary(
             derivation = await _raw_office_derivation(
                 connection, recipe, approved, address_source, runtime_roles, control_schema, phase
             )
-        derivation = validate_derivation(derivation)
+        derivation = validate_raw_or_native_office_derivation(derivation)
         if derivation["recipe_sha256"] != identity:
             raise RegistryInitialSourceError("registry_initial_source_office_recipes_invalid")
         if accumulator is not None:
@@ -441,6 +450,17 @@ async def _inventory_office_summary(
         else:
             _emit_office_derivation(phase.context.derivation_sink, derivation)
     return None if accumulator is None else accumulator.finish()
+
+
+def _native_office_derivation(recipe):
+    from process.registry_native_provider_office_derivation import native_provider_office_derivation
+    from process.registry_native_provider_source import PinnedNativeProviderMembershipSource
+
+    return (
+        native_provider_office_derivation(recipe)
+        if type(recipe.source_pin) is PinnedNativeProviderMembershipSource
+        else None
+    )
 
 
 def _emit_office_derivation(sink, derivation):
@@ -1056,6 +1076,7 @@ async def verified_retained_source_office_summary(
 
 def _witness_office_receipt(candidate, recipes, approved, address_source, stage):
     from process.network_initial_cms_office_bindings import _OfficeMatches
+    from process.registry_native_provider_source import PinnedNativeProviderMembershipSource
     from process.registry_source_contribution_store import verify_registry_source_contributions
     from process.registry_source_inventory_preparation import SourceInventoryPreparation
     from process.registry_source_inventory_reference import verify_source_recipe_metadata
@@ -1076,7 +1097,8 @@ def _witness_office_receipt(candidate, recipes, approved, address_source, stage)
         or type(stage.office_matches) is not _OfficeMatches
         or not recipes
         or not all(
-            type(recipe.source_pin) is PinnedFHIRMembershipSource
+            type(recipe.source_pin) is PinnedNativeProviderMembershipSource
+            or type(recipe.source_pin) is PinnedFHIRMembershipSource
             and fhir_normalized_capture(recipe.source_pin) is not None
             for recipe in recipes
         )

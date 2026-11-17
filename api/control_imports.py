@@ -756,19 +756,7 @@ def _control_param_schema(
         return []
 
     if importer == "registry-publication-worker":
-        return [
-            {
-                "name": name,
-                "opts": [],
-                "required": True,
-                "multiple": False,
-                "is_flag": False,
-                "type": "text",
-                "default": None,
-                "help": "Exact durable membership refresh request identity.",
-            }
-            for name in ("request_id", "operation")
-        ]
+        return []
     if importer == "registry-source-check":
         return [
             {

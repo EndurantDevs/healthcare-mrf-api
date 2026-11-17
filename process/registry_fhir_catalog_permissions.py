@@ -9,7 +9,7 @@ from process.registry_publication_permissions import INSERT_COLUMNS, LIFECYCLE_C
 _UPDATES = {
     "registry_publication_request": tuple(sorted(LIFECYCLE_COLUMNS)),
     "network_serving_control": ("metadata_generation",),
-    "registry_fhir_catalog_snapshot": ("published_at",),
+    "registry_fhir_catalog_snapshot": ("network_generation", "manifest_sha256", "published_at"),
     "registry_revision_control": ("id",),
 }
 _PREPARATION_READS = frozenset(

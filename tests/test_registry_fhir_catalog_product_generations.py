@@ -211,7 +211,7 @@ async def test_replay_resolves_active_generations_once_and_passes_them_to_produc
     monkeypatch.setattr(registry_reads, "catalog_projection_generations", resolver)
     for method in ("inputs", "create", "manual", "networks", "relationships", "products", "compare"):
         monkeypatch.setattr(replay, method, AsyncMock())
-    await replay.run()
+    await replay.replay_projection()
     resolver.assert_awaited_once_with(
         replay.registry_reader,
         replay.snapshot,

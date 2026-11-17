@@ -14,6 +14,7 @@ from process.network_fhir_membership_source import (
     fhir_source_witness_binding_v2,
 )
 from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
+from process.registry_native_provider_office_derivation import validate_native_provider_office_derivation
 from process.registry_source_contribution_store import (
     FACT_ANCHOR_FIELDS,
     _canonical,
@@ -111,7 +112,22 @@ def _check_fhir_descriptor(recipe, descriptor):
         raise RegistrySourceInventoryError("registry_source_inventory_preparation_invalid")
 
 
+def _is_native_derivation(recipe, descriptor, derivation):
+    from process.registry_native_provider_office_derivation import native_provider_office_derivation
+    from process.registry_native_provider_source import PinnedNativeProviderMembershipSource
+
+    if type(recipe.source_pin) is PinnedNativeProviderMembershipSource:
+        if descriptor is not None or derivation != native_provider_office_derivation(recipe):
+            raise RegistrySourceInventoryError("registry_source_inventory_preparation_invalid")
+        return True
+    if derivation.get("derivation_version") == 4:
+        raise RegistrySourceInventoryError("registry_source_inventory_preparation_invalid")
+    return False
+
+
 def _check_derivation(recipe, descriptor, derivation):
+    if _is_native_derivation(recipe, descriptor, derivation):
+        return
     if type(recipe.source_pin) is PinnedTypedFHIRMembershipSource:
         if (
             derivation.get("derivation_version") != 3
@@ -248,7 +264,9 @@ class SourceInventoryPreparation:
             recipe, current = self._recipes_by_sha[identity], self._entries_by_sha[identity]
             descriptor = json.loads(current.contribution_json) if current.contribution_json is not None else None
             derivation = (
-                validate_typed_derivation(document)
+                validate_native_provider_office_derivation(document)
+                if document.get("derivation_version") == 4
+                else validate_typed_derivation(document)
                 if document.get("derivation_version") == 3
                 else validate_verified_office_derivation_v2(document)
                 if "derivation_version" in document

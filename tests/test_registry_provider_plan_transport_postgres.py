@@ -2,6 +2,7 @@
 """Protected provider-plan HTTP reads through ordinary native reader sessions."""
 
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -48,7 +49,7 @@ _AUTH = {"Authorization": "Bearer synthetic-provider-plan-control"}
 async def transport_db(provider_plans_db, monkeypatch):
     """Authenticate directly as the disposable Reader; retain real endpoint ownership."""
     fixture, source_pin, networks, copy_target = provider_plans_db
-    starts, snapshots, requests = [], [], []
+    starts, snapshots, requests, request_sessions = [], [], [], []
     monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-provider-plan-control")
     monkeypatch.setenv("HLTHPRT_NETWORK_REGISTRY_SCHEMA", fixture.control_schema)
     monkeypatch.setenv("HLTHPRT_DB_READER_POOL_MIN_SIZE", "1")
@@ -56,6 +57,15 @@ async def transport_db(provider_plans_db, monkeypatch):
     async with _request_reader_database(fixture.engine, fixture.connection, fixture.roles["reader"], monkeypatch):
         await db.connect()
         reader = await db._connect_reader()
+        original_reader_session = db.reader_session
+
+        @asynccontextmanager
+        async def observe_reader_session(*args, **kwargs):
+            async with original_reader_session(*args, **kwargs) as session:
+                request_sessions.append(session)
+                yield session
+
+        monkeypatch.setattr(db, "reader_session", observe_reader_session)
 
         @event.listens_for(reader.engine.sync_engine, "begin")
         def record_begin(connection):
@@ -89,6 +99,7 @@ async def transport_db(provider_plans_db, monkeypatch):
             starts=starts,
             snapshots=snapshots,
             requests=requests,
+            request_sessions=request_sessions,
         )
 
 
@@ -99,7 +110,8 @@ async def _post(context, document, *, headers=None):
     )
     assert reply.headers["Cache-Control"] == "private, no-store"
     assert all(method == "POST" and path == _PATH for method, path, session in context.requests)
-    assert all(not session.in_transaction() for method, path, session in context.requests)
+    assert all(session is None or not session.in_transaction() for method, path, session in context.requests)
+    assert all(not session.in_transaction() for session in context.request_sessions)
     return reply, len(context.starts) - before
 
 

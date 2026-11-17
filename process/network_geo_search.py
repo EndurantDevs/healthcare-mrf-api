@@ -195,12 +195,13 @@ async def _has_compatible_sources(connection, layout):
 
 
 def _batch_ctes(layout, source_relation, *, is_base, has_after=False):
+    """Keep ordered edge pages and exact address probes behind native subquery boundaries."""
     columns = ",".join("a." + compact_identifier(name) for name in SEARCH_COLUMNS)
     override = ""
     if is_base:
         override = " WHERE a.row_origin<>'network_custom'"
         if layout.custom is not None:
-            override += f" AND NOT EXISTS(SELECT FROM ONLY {_qualified(layout.custom)} custom WHERE custom.location_key=a.location_key)"
+            override += f" AND NOT EXISTS(SELECT FROM ONLY {_qualified(layout.custom)} custom WHERE custom.location_key=a.location_key OFFSET 0)"
     memberships = []
     for index, artifact in enumerate(layout.artifacts, 2):
         edge = compact_identifier(artifact.schema_name) + ".network_office_edge"
@@ -213,10 +214,23 @@ def _batch_ctes(layout, source_relation, *, is_base, has_after=False):
     membership_sql = (
         " UNION ALL ".join(memberships) or "SELECT NULL::text AS location_key,NULL::integer AS network_id WHERE FALSE"
     )
-    keyset_predicate = "a.location_key>$1::text" if has_after else "$1::text IS NULL"
-    return f"""source_page AS MATERIALIZED (
-      SELECT {columns} FROM ONLY {_qualified(source_relation)} a WHERE {keyset_predicate}
-      ORDER BY a.location_key LIMIT {_BATCH_ROWS}
+    keyset_predicate = "edge.location_key>$1::text" if has_after else "$1::text IS NULL"
+    key_pages = []
+    for index, artifact in enumerate(layout.artifacts, 2):
+        edge = compact_identifier(artifact.schema_name) + ".network_office_edge"
+        key_pages.append(f"""(SELECT edge.location_key FROM ONLY {edge} edge
+          WHERE {keyset_predicate} AND EXISTS(SELECT FROM ONLY {_qualified(layout.ref_map)} ref
+            WHERE ref.slice_id=edge.slice_id AND ref.artifact_candidate_id=${index}::uuid
+              AND ref.office_bucket=(get_byte(sha256(convert_to(edge.location_key,'UTF8')),0)&63) OFFSET 0)
+          GROUP BY edge.location_key ORDER BY edge.location_key LIMIT {_BATCH_ROWS})""")
+    key_sql = " UNION ALL ".join(key_pages) or "SELECT NULL::text AS location_key WHERE $1::text IS NULL AND FALSE"
+    return f"""key_page AS MATERIALIZED (
+      SELECT location_key FROM ({key_sql}) selected_keys
+      GROUP BY location_key ORDER BY location_key LIMIT {_BATCH_ROWS}
+    ), source_page AS MATERIALIZED (
+      SELECT {columns} FROM key_page selected
+      JOIN LATERAL (SELECT * FROM ONLY {_qualified(source_relation)} a
+        WHERE a.location_key=selected.location_key OFFSET 0) a ON TRUE
     ), effective AS MATERIALIZED (SELECT {columns} FROM source_page a{override}),
     memberships AS ({membership_sql}), network_arrays AS (
       SELECT location_key,array_agg(DISTINCT network_id ORDER BY network_id) AS canonical_network_ids
@@ -228,19 +242,19 @@ def _batch_ctes(layout, source_relation, *, is_base, has_after=False):
 
 
 async def _source_pass(connection, target_table, layout, source, *, is_base, verify):
-    """Keep both generation and exact comparison bounded to one physical key page."""
+    """Keep generation and exact comparison bounded to selected edge-location pages."""
     columns = ",".join(compact_identifier(name) for name in _COLUMNS)
     if verify:
         tail = f""", actual AS MATERIALIZED (
           SELECT p.* FROM ONLY {target_table} p JOIN effective e USING(location_key)
-        ) SELECT (SELECT max(location_key) FROM source_page) AS last_key,
+        ) SELECT (SELECT max(location_key) FROM key_page) AS last_key,
           (SELECT count(*) FROM expected) AS row_count,
           EXISTS((SELECT {columns} FROM expected EXCEPT SELECT {columns} FROM actual)
             UNION ALL (SELECT {columns} FROM actual EXCEPT SELECT {columns} FROM expected)) AS differs"""
     else:
         tail = f""", inserted AS (INSERT INTO {target_table} ({columns}) SELECT {columns} FROM expected
           RETURNING location_key)
-        SELECT (SELECT max(location_key) FROM source_page) AS last_key,
+        SELECT (SELECT max(location_key) FROM key_page) AS last_key,
           (SELECT count(*) FROM inserted) AS row_count,FALSE AS differs"""
     statements = tuple(
         "WITH " + _batch_ctes(layout, source, is_base=is_base, has_after=has_after) + tail

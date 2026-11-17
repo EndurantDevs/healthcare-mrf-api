@@ -49,8 +49,6 @@ MAX_CONFIG_BYTES = 16 * 1024
 _REQUIRED = {
     "lifecycle_dsn",
     "execution_dsn",
-    "app_origin",
-    "service_token",
     "consumer",
 }
 _ROLES = {
@@ -72,8 +70,8 @@ class _PTGWorkerConfig:
 class RegistryPublicationWorkerConfig:
     lifecycle_url: object = field(repr=False)
     execution_url: object = field(repr=False)
-    app_origin: str = field(repr=False)
-    service_token: str = field(repr=False)
+    app_origin: str | None = field(repr=False)
+    service_token: str | None = field(repr=False)
     consumer: RegistryPublicationConsumerConfig
     initial_address_sources: RegistryCompositionAddressSources | None = None
     ptg: _PTGWorkerConfig | None = field(default=None, repr=False)
@@ -265,6 +263,20 @@ def _sql_limits(configured):
     return RegistryPublicationSQLLimits(**configured)
 
 
+def _worker_authority(configured):
+    """Require paired legacy credentials or the closed native Source configuration."""
+    if ("app_origin" in configured) != ("service_token" in configured):
+        _invalid()
+    token = configured.get("service_token")
+    if "service_token" in configured and (
+        type(token) is not str or not 0 < len(token) <= 4096 or re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token) is None
+    ):
+        _invalid()
+    if token is None and not {"source_witness", "initial_address_sources"} <= configured.keys():
+        _invalid()
+    return (_origin(configured["app_origin"]) if "app_origin" in configured else None), token
+
+
 def parse_registry_publication_worker_config(encoded):
     """Reject malformed or ambiguous configuration before opening any resource."""
     try:
@@ -288,18 +300,18 @@ def parse_registry_publication_worker_config(encoded):
                 "custody_dsn",
                 "source_witness",
                 "preparation_roles",
+                "app_origin",
+                "service_token",
             }
         ):
             _invalid()
         consumer = _consumer_config(configured_by_name["consumer"])
         lifecycle, execution = _worker_database_urls(configured_by_name, consumer)
-        token = configured_by_name["service_token"]
-        if type(token) is not str or not 0 < len(token) <= 4096 or re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token) is None:
-            _invalid()
+        app_origin, token = _worker_authority(configured_by_name)
         return RegistryPublicationWorkerConfig(
             lifecycle,
             execution,
-            _origin(configured_by_name["app_origin"]),
+            app_origin,
             token,
             consumer,
             _initial_sources(configured_by_name.get("initial_address_sources")),
@@ -494,11 +506,10 @@ def _preparation_role_profile(config):
     return profile
 
 
-async def _configured_worker_runtime(config, stack):
+async def _configured_worker_runtime(config, stack, *, freeze_preparation=None):
     """Install the existing named preparation lifecycle on bounded application connections."""
     from process.network_membership_publication import (
         named_network_preparation_roles,
-        validate_named_network_preparation,
     )
 
     consumer = _ptg_runtime(config, stack)
@@ -513,24 +524,49 @@ async def _configured_worker_runtime(config, stack):
     async def seal_candidate(copy_target, *, pre_enrolled_only=False):
         """Checkpoint, validate and resume one candidate through the shared administrator handoff."""
         async with preparation_pool.acquire() as connection:
-            return await validate_named_network_preparation(
-                connection,
-                copy_target,
-                control_schema=consumer.control_schema,
-                roles=roles,
-                source_witness_runtime=source_runtime,
-                validation_snapshot=(
-                    consumer.composition_runtime.validation_snapshot
-                    if consumer.composition_runtime is not None
-                    else None
-                ),
-            )
+            options_by_name = {
+                "control_schema": consumer.control_schema,
+                "roles": roles,
+                "source_witness_runtime": source_runtime,
+                "validation_snapshot": consumer.composition_runtime.validation_snapshot
+                if consumer.composition_runtime is not None
+                else None,
+            }
+            return await _seal_import_network_candidate(connection, copy_target, options_by_name, freeze_preparation)
 
     return replace(consumer, seal_candidate=seal_candidate, preparation_roles=roles)
 
 
+async def _seal_import_network_candidate(connection, copy_target, options_by_name, freeze_preparation):
+    from process.network_membership_publication import (
+        NetworkPreparationPending,
+        load_named_network_preparation,
+        validate_named_network_preparation,
+    )
+    from process.registry_network_import_runtime import freeze_network_import_preparation
+
+    try:
+        return await validate_named_network_preparation(connection, copy_target, **options_by_name)
+    except NetworkPreparationPending as pending:
+        if freeze_preparation is None:
+            raise
+        if pending.candidate_id != copy_target.candidate_id:
+            raise ValueError("registry_imported_freeze_candidate_changed") from None
+    async with connection.transaction(readonly=True):
+        handoff = await load_named_network_preparation(
+            connection, copy_target.candidate_id, control_schema=options_by_name["control_schema"]
+        )
+    await freeze_network_import_preparation(freeze_preparation, handoff, options_by_name["roles"])
+    try:
+        return await validate_named_network_preparation(connection, copy_target, **options_by_name)
+    except NetworkPreparationPending:
+        raise ValueError("registry_imported_freeze_incomplete") from None
+
+
 def validate_membership_refresh_worker_params(params):
     """Admit one exact request selector; neither the operation label nor UUID grants authority."""
+    if type(params) is dict and not params:
+        return None
     if (
         type(params) is not dict
         or set(params) != {"request_id", "operation"}
@@ -561,7 +597,7 @@ async def _membership_refresh_config(config, cleanup, request_id):
 
     if type(request_id) is not UUID or not request_id.int:
         raise ValueError("registry_membership_refresh_worker_params_invalid")
-    runtime = await membership_refresh_worker_runtime(config, cleanup)
+    runtime = await membership_refresh_worker_runtime(config, cleanup, request_id=request_id)
     if type(runtime) is not RegistryMembershipRefreshRuntime:
         raise RegistryMembershipRefreshUnavailable("registry_membership_refresh_runtime_unavailable")
     consumer = replace(
@@ -570,7 +606,10 @@ async def _membership_refresh_config(config, cleanup, request_id):
         membership_refresh_only=True,
         membership_refresh_runtime=runtime,
     )
-    return replace(config, consumer=consumer)
+    address_sources = config.initial_address_sources
+    if runtime.source_witness_runtime is not None:
+        address_sources = replace(address_sources, source_witness_runtime=runtime.source_witness_runtime)
+    return replace(config, consumer=consumer, initial_address_sources=address_sources)
 
 
 async def _require_membership_refresh_request(connection, consumer, request_id):
@@ -601,15 +640,23 @@ async def control_start(ctx, task):
 
     if (
         type(task) is not dict
-        or set(task) != {"run_id", "request_id", "operation"}
+        or set(task) not in ({"run_id"}, {"run_id", "request_id", "operation"})
         or type(task["run_id"]) is not str
         or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}", task["run_id"]) is None
     ):
         raise ValueError("registry_membership_refresh_worker_params_invalid")
-    request_id = validate_membership_refresh_worker_params({name: task[name] for name in ("request_id", "operation")})
+    request_id = validate_membership_refresh_worker_params(
+        {name: field_value for name, field_value in task.items() if name != "run_id"}
+    )
     config = parse_registry_publication_worker_config(os.environ.get(CONFIG_ENV))
     await raise_if_cancelled(ctx, task)
-    work = asyncio.create_task(run_registry_publication_worker(config, membership_refresh_request_id=request_id))
+    if request_id is None:
+        from process.registry_network_import import run_latest_network_import
+
+        operation = run_latest_network_import(config, task["run_id"])
+    else:
+        operation = run_registry_publication_worker(config, membership_refresh_request_id=request_id)
+    work = asyncio.create_task(operation)
     watcher = asyncio.create_task(_watch_control_cancel(ctx, task))
     try:
         await asyncio.wait((work, watcher), return_when=asyncio.FIRST_COMPLETED)
@@ -627,15 +674,19 @@ async def control_start(ctx, task):
         await asyncio.gather(work, watcher, return_exceptions=True)
 
 
-async def run_registry_publication_worker(config, *, membership_refresh_request_id=None):
+async def run_registry_publication_worker(config, *, membership_refresh_request_id=None, freeze_preparation=None):
     """Own both bounded pools and authority client through success, failure or cancellation."""
-    if type(config) is not RegistryPublicationWorkerConfig:
+    if type(config) is not RegistryPublicationWorkerConfig or (
+        freeze_preparation is not None and (not callable(freeze_preparation) or membership_refresh_request_id is None)
+    ):
         _invalid()
     async with AsyncExitStack() as stack:
         config = await install_source_witness_runtime(
             config, stack, membership_refresh_request_id=membership_refresh_request_id
         )
         if membership_refresh_request_id is None:
+            if config.app_origin is None:
+                _invalid()
             authorize = await stack.enter_async_context(
                 RegistryPublicationAuthorityClient(config.app_origin, config.service_token)
             )
@@ -657,7 +708,10 @@ async def run_registry_publication_worker(config, *, membership_refresh_request_
         )
         stack.push_async_callback(_close_pool, execution)
         execution = _BoundedPool(execution, config.sql_limits.connect_timeout_seconds)
-        consumer = await _configured_worker_runtime(config, stack)
+        if freeze_preparation is None:
+            consumer = await _configured_worker_runtime(config, stack)
+        else:
+            consumer = await _configured_worker_runtime(config, stack, freeze_preparation=freeze_preparation)
         if consumer.composition_runtime is not None:
             await consumer.composition_runtime.qualify()
         async with asyncio.timeout(config.operation_seconds):
@@ -743,7 +797,7 @@ class _WorkerCommand(click.Command):
 @click.command(
     name="registry-publication-worker",
     cls=_WorkerCommand,
-    help="Consume one durable publication request and exit.",
+    help="Rebuild network search from current retained imports.",
 )
 def registry_publication_worker_command():
     """Run the environment-configured worker once through the existing process group."""

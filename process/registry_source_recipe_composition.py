@@ -88,6 +88,7 @@ class RegistrySourceRecipeStage:
     unresolved_raw_source_rows: int = 0
     selected_stage: object = None
     preservation: object = None
+    native_provider_stages: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -114,8 +115,15 @@ class SourceWitnessRuntime:
     semantic_validation: object = None
     semantic_policy: object = None
     census_outsiders: tuple[str, ...] = ()
+    catalog_bindings: object = None
 
     def __post_init__(self):
+        if self.catalog_bindings is not None:
+            from process.registry_imported_catalog_bindings import PublishedFHIRCatalogBindingScope
+
+            if type(self.catalog_bindings) is not PublishedFHIRCatalogBindingScope:
+                raise RegistrySourceCompositionError("registry_source_imported_catalog_scope_invalid")
+            self.catalog_bindings.__post_init__()
         if not callable(self.source_export):
             raise RegistrySourceCompositionError("registry_source_witness_runtime_invalid")
         validate_source_witness_configuration(self.source_profiles, self.capture_owner_role, self.runtime_roles)
@@ -314,7 +322,19 @@ async def _typed_source_read_scope(connection, recipe, approved, control_schema,
         if retained_approval
         else require_approved_network_source_bindings
     )
-    await require_bindings(connection, approved, recipe.binding_coordinates, control_schema=control_schema)
+    if runtime.catalog_bindings is None:
+        await require_bindings(connection, approved, recipe.binding_coordinates, control_schema=control_schema)
+    else:
+        from process.registry_imported_catalog_bindings import published_fhir_catalog_bindings_sql
+
+        await published_fhir_catalog_bindings_sql(
+            connection,
+            runtime.catalog_bindings,
+            approved,
+            recipe.binding_coordinates,
+            pin.catalog_descriptor,
+            control_schema=control_schema,
+        )
     return pin, profiles[0], origin
 
 
@@ -326,6 +346,33 @@ async def load_typed_source_read(connection, recipe, approved, control_schema, r
         connection, recipe, approved, control_schema, runtime, retained_approval
     )
     return await load_typed_graph_capture(connection, pin.capture, expected_anchor=pin.anchor)
+
+
+async def _sampled_source_keys(connection, recipe, approved, control_schema, runtime):
+    """Resolve exact catalogue keys for the existing sampled raw-Source comparison."""
+    pin = recipe.source_pin
+    from process.network_fhir_typed_mapping import TypedGraphApproval, _approved_graph_keys, typed_graph_bindings
+
+    bindings = await typed_graph_bindings(
+        connection,
+        TypedGraphApproval(
+            approved,
+            recipe.binding_coordinates,
+            pin.catalog_descriptor,
+            catalog_generation=pin.catalog_generation,
+            catalog_bindings=runtime.catalog_bindings,
+        ),
+        control_schema=control_schema,
+    )
+    arguments = (approved.approved_revision, *recipe.binding_coordinates.sql_parameters, pin.catalog_generation)
+    keys = await _approved_graph_keys(
+        connection,
+        bindings,
+        arguments,
+        allow_empty=runtime.catalog_bindings is not None,
+        plan_tiers=pin.capture["graph"]["contract"] == "registry-fhir-typed-graph-v4",
+    )
+    return keys
 
 
 async def require_typed_source_read(
@@ -348,14 +395,9 @@ async def require_typed_source_read(
         else FHIRSourceMembershipInput
     )
     if runtime.semantic_validation is not None:
-        from process.network_approved_source_bindings import APPROVED_NETWORK_BINDINGS_SQL
         from process.network_fhir_sampled_validation import SampledCaptureScope, verify_sampled_typed_capture
-        from process.network_fhir_typed_mapping import _approved_graph_keys
-        from process.network_membership_candidate_lifecycle import _control_namespace
 
-        bindings = APPROVED_NETWORK_BINDINGS_SQL.format(namespace=_control_namespace(control_schema))
-        arguments = (approved.approved_revision, *recipe.binding_coordinates.sql_parameters, pin.catalog_generation)
-        keys = await _approved_graph_keys(connection, bindings, arguments)
+        keys = await _sampled_source_keys(connection, recipe, approved, control_schema, runtime)
         sampled = await verify_sampled_typed_capture(
             runtime.source_export,
             connection,
@@ -757,6 +799,7 @@ async def stage_verified_registry_source_recipes(
         control_schema=control_schema,
         read_context=read_context,
         typed_stage_reader=stage_verified_typed_source_recipes,
+        verify_native_sources=True,
         **contribution_options,
     )
 
@@ -843,6 +886,54 @@ async def _stage_legacy_source_snapshot(
     )
 
 
+async def _stage_native_provider_recipes(
+    connection, recipes, approved, stage_scope, read_context, contribution_options, verify_native_sources
+):
+    """Stage ordinary source facts first, then append provider-only native facts."""
+    typed_stage_reader, request_id, control_schema = stage_scope
+    from process.registry_native_provider_source import (
+        PinnedNativeProviderMembershipSource,
+        append_native_provider_stages,
+    )
+
+    native_recipes = tuple(
+        recipe for recipe in recipes if type(recipe.source_pin) is PinnedNativeProviderMembershipSource
+    )
+    if native_recipes:
+        ordinary_recipes = tuple(
+            recipe for recipe in recipes if type(recipe.source_pin) is not PinnedNativeProviderMembershipSource
+        )
+        base = await _stage_registry_source_recipes(
+            connection,
+            ordinary_recipes,
+            approved,
+            typed_stage_reader=typed_stage_reader,
+            request_id=request_id,
+            control_schema=control_schema,
+            read_context=read_context if ordinary_recipes else replace(read_context, verified_office_inputs=None),
+            verify_native_sources=verify_native_sources,
+            **(contribution_options if ordinary_recipes else {"contribution_revision": 2, "inventory": True}),
+        )
+        return await append_native_provider_stages(
+            connection,
+            recipes,
+            approved,
+            base,
+            read_context=read_context,
+            control_schema=control_schema,
+            verify_source=verify_native_sources,
+        )
+    return None
+
+
+def _native_verification_option(options):
+    """Select only the internal independent-Source check, rejecting nonboolean overrides."""
+    should_verify = options.pop("verify_native_sources", False)
+    if type(should_verify) is not bool:
+        raise RegistrySourceCompositionError("registry_source_composition_scope_invalid")
+    return should_verify
+
+
 async def _stage_registry_source_recipes(
     connection,
     recipes,
@@ -860,8 +951,20 @@ async def _stage_registry_source_recipes(
     Invalid selected evidence rejects the complete stage, including prior pages.
     Legacy verified offices retain their mapping proof without fact receipts.
     """
+    verify_native_sources = _native_verification_option(contribution_options)
     contribution_revision, inventory = _source_stage_options(contribution_options)
     read_context = SourceRecipeReadContext() if read_context is None else read_context
+    native_stage = await _stage_native_provider_recipes(
+        connection,
+        recipes,
+        approved,
+        (typed_stage_reader, request_id, control_schema),
+        read_context,
+        contribution_options,
+        verify_native_sources,
+    )
+    if native_stage is not None:
+        return native_stage
     if any(type(recipe.source_pin) is PinnedTypedFHIRMembershipSource for recipe in recipes):
         if not inventory or read_context.verified_office_inputs is None:
             raise RegistrySourceCompositionError("registry_source_typed_inventory_scope_invalid")

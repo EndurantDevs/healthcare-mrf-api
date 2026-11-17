@@ -82,7 +82,11 @@ def _derivation(value, recipe_sha256):
     if value is None:
         return None
     document = _document(value, MAX_V3_RECEIPT_BYTES)
-    if document.get("derivation_version") == 3:
+    if document.get("derivation_version") == 4:
+        from process.registry_native_provider_office_derivation import validate_native_provider_office_derivation
+
+        derivation = validate_native_provider_office_derivation(document)
+    elif document.get("derivation_version") == 3:
         from process.registry_typed_source_metadata import validate_typed_derivation
 
         derivation = validate_typed_derivation(document)

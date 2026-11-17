@@ -346,7 +346,9 @@ async def test_noncallable_installed_factory_never_opens_worker_pools(monkeypatc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("installed", (False, True))
-async def test_source_successor_refresh_is_refused_before_factory_or_pool(monkeypatch, installed):
+async def test_refresh_still_requires_configured_native_admission_before_worker_pools(monkeypatch, installed):
+    from process.registry_membership_refresh_contract import RegistryMembershipRefreshUnavailable
+
     events = []
     exported, factory = _factory(monkeypatch, events)
     config = _config()
@@ -354,10 +356,10 @@ async def test_source_successor_refresh_is_refused_before_factory_or_pool(monkey
         config = replace(config, source_witness=None, initial_address_sources=_sources(_runtime()))
     pool = AsyncMock(side_effect=AssertionError("refresh must not open a worker pool"))
     monkeypatch.setattr(worker.asyncpg, "create_pool", pool)
-    with pytest.raises(ValueError, match="registry_source_witness_refresh_unsupported"):
+    with pytest.raises(RegistryMembershipRefreshUnavailable, match="registry_membership_refresh_runtime_unavailable"):
         await worker.run_registry_publication_worker(config, membership_refresh_request_id=UUID(int=1))
-    assert events == []
-    factory.assert_not_called()
+    assert events == ([] if installed else ["source open", "source close"])
+    assert factory.call_count == (0 if installed else 1)
     exported.assert_not_called()
     pool.assert_not_awaited()
 

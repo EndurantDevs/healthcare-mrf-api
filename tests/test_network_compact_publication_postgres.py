@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 import asyncpg
 import pytest
 from sqlalchemy import select, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -115,7 +116,7 @@ async def _named_compact_runtime(fixture, stack, monkeypatch):
     )
     settings = SimpleNamespace(
         consumer=consumer,
-        execution_url=fixture.execution_url,
+        execution_url=_native_execution_url(fixture.execution_url),
         sql_limits=fixture.sql_limits,
         ptg=None,
         preparation_roles={
@@ -127,6 +128,14 @@ async def _named_compact_runtime(fixture, stack, monkeypatch):
     configured = await _configured_worker_runtime(settings, stack)
     fixture.preparation_roles = configured.preparation_roles
     fixture.seal_candidate = administrative_freeze_callback(fixture, configured)
+
+
+def _native_execution_url(value):
+    """Promote native socket coordinates into the URL fields read by the runtime."""
+    url = make_url(value) if isinstance(value, str) else value
+    return url.set(
+        host=url.host or url.query.get("host"), port=url.port or int(url.query.get("port", 5432))
+    ).difference_update_query(("host", "port"))
 
 
 @pytest.fixture

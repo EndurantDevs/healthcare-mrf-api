@@ -15,8 +15,8 @@ async def configured_catalog_reader(monkeypatch, dsn, role, password):
     with monkeypatch.context() as settings:
         for key, value in {
             "DRIVER": "asyncpg",
-            "HOST": url.host,
-            "PORT": url.port or 5432,
+            "HOST": url.host or url.query.get("host", "127.0.0.1"),
+            "PORT": url.port or url.query.get("port", 5432),
             "DATABASE_OVERRIDE": url.database,
             "READER_USER": role,
             "READER_PASSWORD": password,

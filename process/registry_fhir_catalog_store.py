@@ -16,7 +16,7 @@ from process.registry_fhir_catalog_custody import (
     validate_fhir_catalog_snapshot_record,
 )
 from process.registry_fhir_catalog_projection import BINDING_COLUMNS, NETWORK_COLUMNS, RELATIONSHIP_COLUMNS
-from process.registry_fhir_catalog_validation import canonical_json
+from process.registry_fhir_catalog_validation import canonical_json, snapshot_inputs
 
 TABLE_COLUMNS = {
     "registry_fhir_catalog_source": (
@@ -132,6 +132,18 @@ def catalog_snapshot_preparation(snapshot):
     return preparation
 
 
+def has_catalog_snapshot_validation(snapshot):
+    """Distinguish complete table validation from logical inputs retained during loading."""
+    record_by_field = snapshot.get("custody_json")
+    if type(record_by_field) is str:
+        record_by_field = json.loads(record_by_field)
+    if type(record_by_field) is not dict:
+        return False
+    if "preparation" in record_by_field:
+        catalog_snapshot_preparation(snapshot)
+    return "tables" in record_by_field
+
+
 def named_catalog_preparation(snapshot, control_schema):
     """Produce the stable common handoff from an actual persisted catalog checkpoint."""
     preparation = catalog_snapshot_preparation(snapshot)
@@ -180,7 +192,13 @@ async def checkpoint_fhir_catalog_snapshot(connection, target, snapshot, previou
         "previous_metadata_generation": None if previous is None else previous["metadata_generation"],
         "accounting": json.loads(canonical_json(accounting)),
     }
-    snapshot.update(custody_json={"preparation": preparation_by_field}, accounting_json={})
+    inputs_by_field = snapshot_inputs(snapshot)
+    logical_accounting_by_key = (
+        {"imported_source_inventory": inputs_by_field["imported_source_inventory"]}
+        if "imported_source_inventory" in inputs_by_field
+        else {}
+    )
+    snapshot.update(custody_json={"preparation": preparation_by_field}, accounting_json=logical_accounting_by_key)
     named_catalog_preparation(snapshot, control_schema)
     columns = tuple(column for column in SNAPSHOT_COLUMNS if column != "published_at")
     json_columns = {"custody_json", "accounting_json", "source_vector_json"}

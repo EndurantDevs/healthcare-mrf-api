@@ -66,8 +66,8 @@ async def _request_reader_database(source_engine, owner, reader, monkeypatch):
     )
     await db.disconnect()
     for field, setting in {
-        "HOST": url.host,
-        "PORT": url.port or 5432,
+        "HOST": url.host or url.query.get("host", "127.0.0.1"),
+        "PORT": url.port or int(url.query.get("port", 5432)),
         "DATABASE": url.database,
         "DATABASE_OVERRIDE": url.database,
         "USER": url.username,

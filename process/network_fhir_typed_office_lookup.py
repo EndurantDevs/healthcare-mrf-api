@@ -7,7 +7,7 @@ from uuid import UUID
 from process.network_address_projection import _identifier
 from process.network_fhir_typed_contract import require
 
-_ADDRESS_PAGE_ROWS = 50000
+_REQUEST_PAGE_ROWS = 5000
 
 
 def office_lookup_names(office_name):
@@ -49,35 +49,38 @@ async def _requested_keys(connection, offices, requested):
 
 
 async def _address_matches(connection, address, requested, matches):
-    """Advance over raw primary-key pages even when a complete page has no requested office."""
-    if not await connection.fetchval(f"SELECT EXISTS(SELECT FROM {requested})"):
-        return
-    after = None
+    """Probe only requested NPI/address pairs, retaining all candidates for ambiguity checks."""
+    after = "", UUID(int=0)
     while True:
-        lower, arguments = ("TRUE", ()) if after is None else ("location_key>$1::text", (after,))
         page = await connection.fetchrow(
             f"""WITH page AS MATERIALIZED (
-                SELECT location_key,entity_type,entity_id,npi,address_key,type,address_precision,inferred_npi
-                FROM {address} WHERE {lower} ORDER BY location_key LIMIT {_ADDRESS_PAGE_ROWS}
+                SELECT provider_id,address_key FROM {requested}
+                WHERE (provider_id,address_key)>($1::text,$2::uuid)
+                ORDER BY provider_id,address_key LIMIT {_REQUEST_PAGE_ROWS}
             ), inserted AS (
                 INSERT INTO {matches}
-                SELECT requested.provider_id,page.address_key,page.location_key FROM page
-                JOIN LATERAL (SELECT provider_id FROM {requested} requested
-                    WHERE requested.provider_id=page.entity_id AND requested.address_key=page.address_key
-                    OFFSET 0) requested ON true
-                WHERE page.entity_type='npi' AND page.npi=requested.provider_id::bigint
-                    AND page.type='practice' AND page.address_precision='street' AND page.inferred_npi IS NULL
+                SELECT page.provider_id,page.address_key,a.location_key FROM page
+                JOIN LATERAL (SELECT location_key FROM {address} a
+                    WHERE a.address_key=page.address_key AND a.npi=page.provider_id::bigint
+                        AND a.entity_type='npi' AND a.entity_id=page.provider_id
+                        AND a.type='practice' AND a.address_precision='street' AND a.inferred_npi IS NULL
+                    OFFSET 0) a ON true
                 RETURNING 1
             ) SELECT (SELECT count(*) FROM page) AS scanned,
-                (SELECT max(location_key) FROM page) AS last_key,(SELECT count(*) FROM inserted) AS matched""",
-            *arguments,
+                (SELECT provider_id FROM page ORDER BY provider_id DESC,address_key DESC LIMIT 1) AS last_provider,
+                (SELECT address_key FROM page ORDER BY provider_id DESC,address_key DESC LIMIT 1) AS last_address,
+                (SELECT count(*) FROM inserted) AS matched""",
+            *after,
         )
-        require(0 <= page["matched"] <= page["scanned"] <= _ADDRESS_PAGE_ROWS, "office_lookup_counts")
+        require(0 <= page["scanned"] <= _REQUEST_PAGE_ROWS and page["matched"] >= 0, "office_lookup_counts")
         if not page["scanned"]:
-            require(page["last_key"] is None, "office_lookup_cursor")
+            require(page["last_provider"] is None and page["last_address"] is None, "office_lookup_cursor")
             return
-        require(type(page["last_key"]) is str and page["last_key"] != after, "office_lookup_cursor")
-        after = page["last_key"]
+        following = page["last_provider"], page["last_address"]
+        require(
+            type(following[0]) is str and isinstance(following[1], UUID) and following > after, "office_lookup_cursor"
+        )
+        after = following
 
 
 @asynccontextmanager

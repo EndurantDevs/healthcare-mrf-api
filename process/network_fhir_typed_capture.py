@@ -97,6 +97,19 @@ def _typed_capture_document(capture_by_field):
     return capture_by_field
 
 
+def _require_membership_date(capture, origin):
+    """Accept a pinned import date without changing legacy or explicit Source date checks."""
+    membership_date = capture["graph"]["membership_as_of"]
+    observed_date = datetime.fromisoformat(capture["observed_at"]).date().isoformat()
+    expected_date = origin.semantic_projection_as_of or observed_date
+    if origin.semantic_projection_as_of is None and membership_date < observed_date:
+        from process.registry_imported_source_reuse import has_imported_capture_policy_date
+
+        require(has_imported_capture_policy_date(capture), "membership_date")
+    else:
+        require(membership_date == expected_date, "membership_date")
+
+
 def validate_typed_capture(document):
     """Validate named relations, source scope and complete graph accounting."""
     capture_by_field = _typed_capture_document(document)
@@ -137,14 +150,7 @@ def validate_typed_capture(document):
         "capture_counts",
     )
     origin = source_origin(capture_by_field["graph"]["origin"])
-    require(
-        capture_by_field["graph"]["membership_as_of"]
-        == (
-            origin.semantic_projection_as_of
-            or datetime.fromisoformat(capture_by_field["observed_at"]).date().isoformat()
-        ),
-        "membership_date",
-    )
+    _require_membership_date(capture_by_field, origin)
     require(
         type(capture_by_field["capture_sha256"]) is str
         and re.fullmatch(r"[0-9a-f]{64}", capture_by_field["capture_sha256"]),

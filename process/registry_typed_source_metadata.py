@@ -158,6 +158,8 @@ def _office_context(document):
 
 def _legacy_fields(version, offices):
     if offices:
+        if version == 4:
+            return ("office_rows", "page_count", "matched_offices", "missing_offices")
         if version == 1:
             return ("office_rows", "page_count")
         if version == 2:
@@ -179,6 +181,10 @@ def _legacy_fields(version, offices):
 def _child(document, offices):
     if offices:
         version = document.get("derivation_version", 1)
+        if version == 4:
+            from process.registry_native_provider_office_derivation import validate_native_provider_office_derivation
+
+            return validate_native_provider_office_derivation(document), 4
         if version == 3:
             return validate_typed_derivation(document), None
         from process.registry_source_office_summary_v3 import validate_derivation
@@ -258,7 +264,7 @@ def typed_office_summary(root, derivations):
 
 def _validate_legacy_summary(document, expected, offices):
     legacy = document["legacy"]
-    if type(legacy) is not list or len(legacy) > (2 if offices else 3):
+    if type(legacy) is not list or len(legacy) > 3:
         raise ValueError("registry_typed_metadata_invalid")
     versions, count = [], document["typed_source_count"]
     for child in legacy:
@@ -272,6 +278,8 @@ def _validate_legacy_summary(document, expected, offices):
             raise ValueError("registry_typed_metadata_invalid")
         for counter_value in child["counters"].values():
             _counter(counter_value)
+        if offices and child["version"] == 4 and any(child["counters"].values()):
+            raise ValueError("registry_typed_metadata_invalid")
         versions.append(child["version"])
         count += child["source_count"]
     if versions != sorted(set(versions)) or count != expected:

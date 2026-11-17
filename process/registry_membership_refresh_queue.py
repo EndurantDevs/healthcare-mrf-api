@@ -9,6 +9,11 @@ from process import network_address_artifact as address
 from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_approval_store import RegistryApprovalConflict
+from process.registry_imported_membership_refresh import (
+    RegistryImportedMembershipAdmission,
+    imported_catalog_generation,
+    require_imported_catalog_inputs,
+)
 from process.registry_membership_refresh_authority import RegistryMembershipRefreshAuthorityClient
 from process.registry_membership_refresh_contract import (
     RegistryMembershipRefreshUnavailable,
@@ -96,7 +101,7 @@ async def enqueue_registry_membership_refresh(
     if not connection.is_in_transaction():
         raise ValueError("registry_queue_requires_caller_transaction")
     if (
-        type(authorize) is not RegistryMembershipRefreshAuthorityClient
+        type(authorize) not in (RegistryMembershipRefreshAuthorityClient, RegistryImportedMembershipAdmission)
         or authorize.is_enabled is not True
         or type(address_profile) is not RegistryMembershipRefreshAddressProfile
     ):
@@ -114,6 +119,8 @@ async def enqueue_registry_membership_refresh(
         if replay is not None:
             return replay
         current = await _current_heads(connection, command_by_field, namespace)
+        if type(authorize) is RegistryImportedMembershipAdmission:
+            await require_imported_catalog_inputs(connection, command_by_field, control_schema)
         await _require_address(connection, command_by_field, current, address_profile, control_schema)
         inserted = await connection.fetchrow(
             f"INSERT INTO {namespace}.registry_publication_request "
@@ -179,7 +186,7 @@ def validated_membership_refresh_request_status(request_record):
 
 
 def _validated_completion(receipt, command):
-    if type(receipt) is not dict or set(receipt) != {
+    fields = {
         "operation",
         "previous_generation_id",
         "generation_id",
@@ -187,9 +194,11 @@ def _validated_completion(receipt, command):
         "manifest_sha256",
         "approved_revision",
         "command_sha256",
-        "policy_revision",
         "orphan_bindings",
-    }:
+    }
+    if imported_catalog_generation(command) is None:
+        fields.add("policy_revision")
+    if type(receipt) is not dict or set(receipt) != fields:
         raise ValueError("registry_membership_refresh_result_invalid")
     try:
         identity = UUID(receipt["candidate_id"])
@@ -199,11 +208,14 @@ def _validated_completion(receipt, command):
             "previous_generation_id",
             "generation_id",
             "approved_revision",
-            "policy_revision",
             "orphan_bindings",
         ):
             if type(receipt[field]) is not int or not 0 <= receipt[field] < 2**63:
                 raise ValueError
+        if "policy_revision" in receipt and (
+            type(receipt["policy_revision"]) is not int or not 0 <= receipt["policy_revision"] < 2**63
+        ):
+            raise ValueError
         _hash(receipt["manifest_sha256"])
         if (
             receipt["operation"] != "refresh_memberships"

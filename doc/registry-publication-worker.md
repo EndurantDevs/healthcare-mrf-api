@@ -1,5 +1,8 @@
 # Run-once publication worker
 
+For the ordinary dashboard/API action, see [Rebuild network search](network-search-rebuild.md).
+The empty-parameter action selects current retained inputs inside its admitted worker.
+
 Run the command in the normal application image:
 
 ```sh
@@ -14,7 +17,9 @@ The operator provides one JSON object through `HLTHPRT_REGISTRY_PUBLICATION_WORK
 The UTF-8 value is limited to 16 KiB. Duplicate keys at any level, unknown fields,
 invalid types and unsupported connection options refuse before any connection or
 HTTP client is opened. The required top-level fields are `lifecycle_dsn`,
-`execution_dsn`, `app_origin`, `service_token`, and `consumer`.
+`execution_dsn`, and `consumer`. The legacy authority configuration uses the paired
+`app_origin` and `service_token` fields. Native network imports omit both and
+require `source_witness` plus compact `initial_address_sources` instead.
 `initial_address_sources` is optional and may be null. The optional `ptg` object
 configures genuine retained-office composition. The optional `operation_seconds`
 field is an integer from 1 through 86400, defaulting to 3600. Booleans and other
