@@ -63,20 +63,18 @@ async def test_first_publication_does_not_invent_reader_grants(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["stage_visible", "incumbent_grant", "stage_grant", "oid", "actor"])
+@pytest.mark.parametrize("damage", ["incumbent_grant", "stage_grant", "named_layout", "actor"])
 async def test_ordinary_replay_refuses_privacy_or_drift(monkeypatch, damage):
     incumbent = catalog._RelationAccess("ordinary_owner", (_grant("reader"),))
     private = catalog._RelationAccess("ordinary_owner", ())
     before = _capture(incumbent=incumbent, successor=private)
     after = (*before[:5], incumbent)
     match damage:
-        case "stage_visible":
-            before = (*before[:5], incumbent)
         case "incumbent_grant":
             after = (*after[:4], private, after[5])
         case "stage_grant":
             after = (*after[:5], catalog._RelationAccess("ordinary_owner", (_grant("other"),)))
-        case "oid":
+        case "named_layout":
             after = (*after[:3], "other-relations", *after[4:])
         case "actor":
             after = (*after[:2], "other-transaction", *after[3:])
@@ -115,7 +113,7 @@ def _relations():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("damage", [None, "owner", "rls", "kind", "stage_missing", "missing_lock"])
-async def test_ordinary_capture_requires_owner_plain_heaps_and_native_locks(monkeypatch, damage):
+async def test_ordinary_capture_requires_plain_named_heaps_and_native_locks(monkeypatch, damage):
     from process import provider_directory_serving_recovery_receipts as receipts
 
     rows = deepcopy(_relations())
@@ -132,9 +130,9 @@ async def test_ordinary_capture_requires_owner_plain_heaps_and_native_locks(monk
     )
     monkeypatch.setattr(receipts, "ordinary", AsyncMock(return_value=(object(), driver, {})))
     monkeypatch.setattr(
-        access, "_relation_access", AsyncMock(return_value=catalog._RelationAccess("ordinary_owner", ()))
+        access, "_ordinary_select_access", AsyncMock(return_value=catalog._RelationAccess("ordinary_owner", ()))
     )
-    if damage is not None:
+    if damage not in {None, "owner"}:
         with pytest.raises(RuntimeError, match="ordinary_address_read_access_"):
             await access._ordinary_access(object(), "sample", "live", "stage")
     else:
@@ -143,62 +141,41 @@ async def test_ordinary_capture_requires_owner_plain_heaps_and_native_locks(monk
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("damage", [None, "no_owner_usage", "different_owners", "unsupported_isolation"])
-async def test_ordinary_capture_requires_effective_native_rights_to_one_shared_owner(monkeypatch, damage):
-    """Inherited ownership is native authority; table grants and mixed owners cannot replace it."""
+@pytest.mark.parametrize("different_owners", [False, True])
+async def test_ordinary_capture_uses_native_locks_without_membership_or_owner_admission(monkeypatch, different_owners):
     from process import provider_directory_serving_recovery_receipts as receipts
 
     relations = _relations()
     for relation in relations:
         relation["owned"] = False
-    if damage == "different_owners":
+    if different_owners:
         relations[0]["relowner"] = 2
-    driver = SimpleNamespace(
-        fetch=AsyncMock(return_value=relations),
-        fetchval=AsyncMock(side_effect=[damage not in {"no_owner_usage", "unsupported_isolation"}, 2]),
-    )
+    driver = SimpleNamespace(fetch=AsyncMock(return_value=relations), fetchval=AsyncMock(return_value=2))
     monkeypatch.setattr(receipts, "ordinary", AsyncMock(return_value=(object(), driver, {"owner": 3})))
-    monkeypatch.setattr(
-        access, "_relation_access", AsyncMock(return_value=catalog._RelationAccess("ordinary_owner", ()))
-    )
-    if damage:
-        with pytest.raises(RuntimeError, match="ordinary_address_read_access_owner_changed"):
-            await access._ordinary_access(object(), "sample", "live", "stage")
-    else:
-        await access._ordinary_access(object(), "sample", "live", "stage", exclusive=True)
-    calls = driver.fetchval.await_args_list
-    if damage == "different_owners":
-        assert calls == []
-    else:
-        assert calls[0].args == (access._INHERITED_OWNER_USAGE_SQL, 1)
-        assert "current_setting('transaction_isolation')='read committed'" in calls[0].args[0]
-        assert "UNION" in calls[0].args[0] and "WHERE membership.inherit_option" in calls[0].args[0]
-        assert len(calls) == (1 if damage else 2)
+    monkeypatch.setattr(access, "_ordinary_select_access", AsyncMock(return_value=catalog._RelationAccess("", ())))
+    await access._ordinary_access(object(), "sample", "live", "stage", exclusive=True)
+    assert driver.fetchval.await_count == 1
+    assert "pg_locks" in driver.fetchval.await_args.args[0]
 
 
 @pytest.mark.asyncio
-async def test_ordinary_read_recheck_refuses_revoked_native_owner_rights(monkeypatch):
-    """The final native permission check cannot reuse authority captured before revocation."""
+async def test_ordinary_recheck_ignores_owner_allocation_and_grantor_observations(monkeypatch):
     from process import provider_directory_serving_recovery_receipts as receipts
 
     rows = _relations()
-    for row in rows:
-        row["owned"] = False
     session, database = object(), object()
     driver = SimpleNamespace(
-        fetch=AsyncMock(return_value=rows),
-        fetchval=AsyncMock(side_effect=[True, 2, True, 2, False]),
-        execute=AsyncMock(),
+        fetch=AsyncMock(return_value=rows), fetchval=AsyncMock(return_value=2), execute=AsyncMock()
     )
-    monkeypatch.setattr(receipts, "ordinary", AsyncMock(return_value=(session, driver, {"owner": 3})))
-    monkeypatch.setattr(
-        access, "_relation_access", AsyncMock(return_value=catalog._RelationAccess("ordinary_owner", ()))
-    )
+    ordinary = AsyncMock(return_value=(session, driver, {"owner": 3, "backend": 1, "xid": "same"}))
+    monkeypatch.setattr(receipts, "ordinary", ordinary)
+    monkeypatch.setattr(access, "_ordinary_select_access", AsyncMock(return_value=catalog._RelationAccess("", ())))
     proofs = await access.prepare_ordinary_read_access(database, "sample", (_swap(),))
-    with pytest.raises(RuntimeError, match="ordinary_address_read_access_owner_changed"):
-        await access.recheck_ordinary_read_access(database, proofs)
-    assert driver.execute.await_count == 0
-    assert driver.fetchval.await_count == 5
+    for row in rows:
+        row.update(relowner=999, owned=False, oid=row["oid"] + 1000)
+    ordinary.return_value = (session, driver, {"owner": 999, "backend": 1, "xid": "same"})
+    await access.recheck_ordinary_read_access(database, proofs)
+    assert driver.execute.await_count == 0 and driver.fetchval.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -327,3 +304,20 @@ async def test_marked_overlay_copies_reads_before_hashing_successor(monkeypatch)
     await recovery.begin_overlay(directory, selection_by_field)
     assert events == ["hash " + root for root in recovery.receipts.ROOTS] + ["copy reads", "hash incoming"]
     assert selection_by_field["read_access"] is not None
+
+
+@pytest.mark.asyncio
+async def test_preexisting_stage_reads_keep_stronger_native_grant_options(monkeypatch):
+    incumbent = catalog._RelationAccess("prior", (_grant("reader", grantable=True),))
+    successor = catalog._RelationAccess("different", (_grant("reader"), _grant("existing")))
+    expected = catalog._RelationAccess("different", (_grant("reader", grantable=True), _grant("existing")))
+    before = _capture(incumbent=incumbent, successor=successor)
+    after = (*before[:5], expected)
+    monkeypatch.setattr(access, "_ordinary_access", AsyncMock(side_effect=[before, after, after]))
+    proofs = await access.prepare_ordinary_read_access(object(), "sample", (_swap(),))
+    await access.recheck_ordinary_read_access(object(), proofs)
+    assert len(proofs) == 1
+    assert any(
+        str(call.args[0]) == 'GRANT SELECT ON TABLE "sample"."stage" TO "reader" WITH GRANT OPTION'
+        for call in before[1].execute.await_args_list
+    )

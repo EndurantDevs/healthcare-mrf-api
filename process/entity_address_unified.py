@@ -2163,6 +2163,7 @@ async def _run_entity_address_cutover(
     if require_caller_owned_transaction:
         require_caller_owned_cutover_transaction(db)
     async with serving_recovery.address_transaction(db, lock_timeout, _sql_literal, context):
+        context["retained_relations"] = []
         await lock_selected_publication_dependencies(db, db_schema)
         directory = importlib.import_module("process.provider_directory_fhir")
         await lock_address_source_fence(directory, db, db_schema, context)
@@ -2176,21 +2177,16 @@ async def _run_entity_address_cutover(
         await _acquire_cutover_locks(db_schema, relation_names, required_names)
         from process import entity_address_snapshot_adoption as adoption
 
+        serving_generation = await adoption._prepare_protected_ordinary_rotation(
+            db_schema, swaps, bool(patch_statements), context
+        )
         await adoption._require_protected_cutover(db_schema, swaps, context)
         await _assert_cutover_has_no_dependent_views(db_schema, [swap.live_cls.__main_table__ for swap in swaps])
         if callbacks is not None and callbacks.before_cutover is not None:
             await callbacks.before_cutover()
         await serving_recovery.before_address(db, db_schema, swaps, context)
-        await adoption._publish_result_swaps(db_schema, swaps, context)
-        for label, statement in patch_statements:
-            started = time.monotonic()
-            rowcount = await db.status(statement)
-            _record_phase_timing(
-                context,
-                f"entity-address-unified patching support {label}",
-                time.monotonic() - started,
-                _coerce_rowcount(rowcount),
-            )
+        await adoption._publish_result_swaps(db_schema, swaps, context, serving_generation=serving_generation)
+        await adoption._patch_address_support(patch_statements, context)
         active_table_oid = await preparation_admission.read_scalar(db, _activate_geo_assurance_candidate_sql(db_schema))
         if active_table_oid is None:
             raise RuntimeError("geo assurance candidate does not match the published table and sources")
@@ -2245,9 +2241,6 @@ async def _publish_staged_entity_address_tables(
         phase="entity-address-unified analyzing staged main table",
     )
     context.update(stage_persistence="p", result_generation_mode="ordinary")
-    from process.entity_address_snapshot_adoption import _prepare_protected_ordinary_rotation
-
-    await _prepare_protected_ordinary_rotation(db_schema, stage_cls, partial_support_patch, context)
     callbacks = ordinary_address_receipt_callbacks(db, db_schema, _sql_literal)
     max_attempts, base_backoff_ms, max_backoff_ms = _cutover_retry_settings()
     for attempt in range(1, max_attempts + 1):

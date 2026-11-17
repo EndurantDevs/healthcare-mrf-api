@@ -211,7 +211,7 @@ async def _admitted_reader(fixture):
     assert not any("binding_matches AS MATERIALIZED" in query.query for query in queries)
     candidate_queries = _candidate_lookup_queries(queries, held.fixture.control_schema)
     assert len(candidate_queries) == 1
-    assert candidate_queries[0].args == (admission.manifest.generation_id,)
+    assert candidate_queries[0].args == (admission.manifest.generation_id, None)
     assert candidate_queries[0].exception is None
     assert not any("validation_json::text AS validation_json" in query.query for query in queries)
     assert not any("network_candidate_custody" in query.query for query in queries)

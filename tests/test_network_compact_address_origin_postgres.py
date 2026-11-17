@@ -43,7 +43,7 @@ from process.registry_publication_consumer import _publication_address_sources
 from process.registry_retained_generation import RegistryRetainedGenerationError
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
 from tests.registry_candidate_custody_postgres_support import install_candidate_custody
-from tests.test_network_address_artifact_postgres import _rotate
+from tests.test_network_address_artifact_postgres import _retained_name, _rotate
 from tests.test_network_address_artifact_postgres import address_db as address_db
 from tests.test_network_compact_publication_postgres import _bind_offices, _candidate, _prepare, _publish, _read, _seal
 from tests.test_network_compact_publication_postgres import compact_publication_db as compact_publication_db
@@ -129,7 +129,7 @@ async def test_rotated_aca_successor_preserves_selected_office_and_pinned_reads(
         current, actual_rows = await _read(fixture, network_ids=(network_id,))
         assert actual_rows == original_rows
         assert current.compact_layout.base == previous.compact_layout.base
-        assert current.compact_layout.base.table_name.endswith("_retained_" + format(previous.address_table_oid, "x"))
+        assert current.compact_layout.base.table_name == _retained_name(fixture.address)
         assert (await _read(fixture, previous.generation_id, network_ids=(network_id,)))[1] == original_rows
         report = json.loads(
             await fixture.connection.fetchval(
@@ -169,7 +169,7 @@ async def test_new_generation_reuses_authenticated_retained_heap_after_rotation(
     await _publish(fixture, second)
     current, actual = await _read(fixture)
     assert actual == office_rows and current.address_table_oid == previous.address_table_oid
-    assert current.compact_layout.base.table_name.endswith("_retained_" + format(previous.address_table_oid, "x"))
+    assert current.compact_layout.base.table_name == _retained_name(fixture.address)
     assert current.compact_layout.base.table_oid != await fixture.connection.fetchval(
         "SELECT to_regclass($1)::oid::bigint", fixture.source.schema_name + ".entity_address_unified"
     )
@@ -867,7 +867,8 @@ async def _api_rows(held, generation_id):
         async with api_catalog_read_snapshot(session, generation_id) as (manifest, approved_relation):
             assert len(held.requests) == before + 1
             driver, parameters, entry = held.requests[-1]
-            assert parameters == (generation_id,)
+            # This indexed descriptor has no ordinary portable-origin name to add.
+            assert parameters == (generation_id, None)
             assert manifest._api_approved_relation == approved_relation
             assert approved_relation.table_oid == entry["approved_oid"]
             assert not {"families_json", "control_consumed", "indexed_actor_safety_json"}.intersection(entry)
@@ -958,17 +959,19 @@ async def test_published_request_reports_native_access_and_missing_table_errors(
         role = fixture.roles["reader"]
         change, restore = f'REVOKE SELECT ON {table} FROM "{role}"', f'GRANT SELECT ON {table} TO "{role}"'
         expected = "42501"
+        error_type = asyncpg.InsufficientPrivilegeError
     else:
         artifact = held.current.compact_layout.artifacts[0]
         namespace = '"' + artifact.schema_name + '"'
         change = f"ALTER TABLE {namespace}.network_office_edge RENAME TO missing_edge_fixture"
         restore = f"ALTER TABLE {namespace}.missing_edge_fixture RENAME TO network_office_edge"
         expected = "42P01"
+        error_type = ServiceUnavailable
     await fixture.connection.execute(change)
     try:
-        with pytest.raises(ServiceUnavailable) as error:
+        with pytest.raises(error_type) as error:
             await _api_rows(held, None)
-        assert postgres_sqlstate(error.value.original) == expected
+        assert postgres_sqlstate(getattr(error.value, "original", error.value)) == expected
     finally:
         await fixture.connection.execute(restore)
     assert (await _api_rows(held, None))[0] == held.current

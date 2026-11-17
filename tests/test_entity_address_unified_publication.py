@@ -26,7 +26,19 @@ class _GenerationAuthority:
 
 @pytest.fixture(autouse=True)
 def _stub_generation_publication(monkeypatch):
+    from process import entity_address_snapshot_adoption as adoption
     from process import provider_directory_artifact_read_access as read_access
+
+    ordinary_rotation = adoption._prepare_protected_ordinary_rotation
+    monkeypatch.setattr(adoption, "_prepare_protected_ordinary_rotation", AsyncMock(return_value=None))
+
+    async def rotate(schema, live, stage, *, serving_generation, transfer_ownership):
+        assert serving_generation is None
+        assert transfer_ownership is False
+        await entity_address_unified._swap_stage_table(schema, live, stage)
+
+    # Native permission and retained-name behavior have independent PostgreSQL cases.
+    monkeypatch.setattr(adoption, "_swap_sealed_stage_table", rotate)
 
     # These SQL recorders have no native actor; separate tests verify ACL custody.
     monkeypatch.setattr(
@@ -46,6 +58,7 @@ def _stub_generation_publication(monkeypatch):
         "publish_local_entity_address_generation",
         AsyncMock(side_effect=publish),
     )
+    return ordinary_rotation
 
 
 class _LiveTable:
@@ -94,7 +107,7 @@ class _RecordingDB:
         self.events.append(statement)
         if "SELECT c.relowner FROM pg_class" in statement and "hp_snapshot_retention" in statement:
             return None
-        if "SELECT EXISTS(SELECT 1 FROM pg_class" in statement and "hp_snapshot_retention" in statement:
+        if "SELECT EXISTS(SELECT FROM pg_catalog.pg_class" in statement and "hp_snapshot_retention" in statement:
             return False
         if "to_regclass(:relation) IS NOT NULL" in statement:
             return False
@@ -198,7 +211,9 @@ async def test_entity_address_cutover_uses_one_fail_fast_transaction(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_partial_evidence_patch_is_bound_to_main_generation_swap(monkeypatch):
+async def test_partial_evidence_patch_refuses_before_any_swap_or_patch(monkeypatch, _stub_generation_publication):
+    from process import entity_address_snapshot_adoption as adoption
+
     recording_db = _RecordingDB(
         existing_names={
             "entity_address_unified",
@@ -209,6 +224,18 @@ async def test_partial_evidence_patch_is_bound_to_main_generation_swap(monkeypat
         }
     )
     monkeypatch.setattr(entity_address_unified, "db", recording_db)
+
+    async def require_ordinary(*args):
+        with monkeypatch.context() as binding:
+            binding.setattr(
+                recording_db, "_transaction_binding", lambda: SimpleNamespace(session=object()), raising=False
+            )
+            return await _stub_generation_publication(*args)
+
+    monkeypatch.setattr(adoption, "_prepare_protected_ordinary_rotation", require_ordinary)
+    monkeypatch.setattr(adoption, "_retained_serving_generation", AsyncMock(return_value={"logical": "generation"}))
+    rotate = AsyncMock()
+    monkeypatch.setattr(adoption, "_swap_sealed_stage_table", rotate)
     monkeypatch.setattr(
         entity_address_unified,
         "_partial_support_patch_sql",
@@ -218,27 +245,21 @@ async def test_partial_evidence_patch_is_bound_to_main_generation_swap(monkeypat
         ],
     )
 
-    await entity_address_unified._publish_staged_entity_address_tables(
-        "mrf",
-        _StageTable,
-        {_SupportLiveTable: _SupportStageTable},
-        partial_support_patch=True,
-        affected_group_table="affected_groups",
-        context={},
+    with pytest.raises(RuntimeError, match="full isolated replacement"):
+        await entity_address_unified._publish_staged_entity_address_tables(
+            "mrf",
+            _StageTable,
+            {_SupportLiveTable: _SupportStageTable},
+            partial_support_patch=True,
+            affected_group_table="affected_groups",
+            context={},
+        )
+    rotate.assert_not_awaited()
+    assert recording_db.transaction_events == ["BEGIN", "ROLLBACK"]
+    assert not any(
+        "RENAME TO" in statement or statement.startswith(("DROP ", "INSERT ", "DELETE "))
+        for statement in recording_db.events
     )
-
-    main_swap_at = recording_db.events.index(
-        "ALTER TABLE mrf.entity_address_unified_stage RENAME TO entity_address_unified;"
-    )
-    delete_at = recording_db.events.index("DELETE FROM mrf.entity_address_evidence;")
-    insert_at = recording_db.events.index("INSERT INTO mrf.entity_address_evidence SELECT 1;")
-    activation_at = next(
-        index
-        for index, statement in enumerate(recording_db.events)
-        if "entity_address_geo_assurance_state" in statement
-    )
-    assert recording_db.transaction_events == ["BEGIN", "COMMIT"]
-    assert main_swap_at < delete_at < insert_at < activation_at
 
 
 @pytest.mark.asyncio

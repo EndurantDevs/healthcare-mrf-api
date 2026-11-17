@@ -170,11 +170,36 @@ def validate_entity_address_native_handoff(handoff):
         and re.fullmatch(r"[0-9a-f]{64}", handoff["source_contract_sha256"]) is not None,
         "source contract differs",
     )
-    _require(
-        _digest({key: field for key, field in handoff.items() if key != "handoff_sha256"}) == handoff["handoff_sha256"],
-        "handoff digest differs",
-    )
     return handoff
+
+
+def _logical_handoff(handoff):
+    """Compare attempt/source data without accepting legacy physical observations."""
+    return {
+        key: value
+        for key, value in handoff.items()
+        if key not in {"database_oid", "import_run_oid", "stage_relations", "indexes", "handoff_sha256"}
+    } | {
+        "incumbent": {key: value for key, value in handoff["incumbent"].items() if key != "relation_oids"},
+        "stage_relations": [
+            {key: value for key, value in item.items() if key in {"table_name", "stage_name"}}
+            for item in handoff["stage_relations"]
+        ],
+        "dependency_bindings": {
+            name: {key: value for key, value in entry.items() if key in {"schema_name", "table_name"}}
+            for name, entry in handoff["dependency_bindings"].items()
+        },
+    }
+
+
+def _logical_abandonment(value):
+    """Keep leases, cancellation and source identity separate from old custody metadata."""
+    _require(type(value) is dict and type(value.get("observed_run")) is dict, "abandonment changed")
+    ignored_fields = {"admission_sha256", "candidate_custody"}
+    observed_by_field = {key: field for key, field in value["observed_run"].items() if key != "handoff_sha256"}
+    return {key: field for key, field in value.items() if key not in ignored_fields | {"observed_run"}} | {
+        "observed_run": observed_by_field
+    }
 
 
 def _validate_handoff_relations(relations, names):
@@ -224,11 +249,9 @@ def _validate_authority(value):
         and 0 <= value["local_generation"] < 2**63,
         "native lineage differs",
     )
-    if value["serving_generation"] is None:
-        _require(value["relation_oids"] is None, "native authority is partial")
-    else:
+    if value["serving_generation"] is not None:
         generation.validate_entity_address_serving_generation(value["serving_generation"])
-        generation._relation_oids(value["relation_oids"])
+    return {**value, "relation_oids": None}
 
 
 def validate_entity_address_native_publication(receipt):
@@ -259,8 +282,7 @@ def validate_entity_address_native_publication(receipt):
         and authority["local_lineage_id"] == handoff["incumbent"]["local_lineage_id"]
         and authority["local_generation"] == handoff["incumbent"]["local_generation"] + 1
         and origin["origin_lineage_id"] == authority["local_lineage_id"]
-        and origin["origin_generation"] == authority["local_generation"]
-        and authority["relation_oids"] == [entry["relation_oid"] for entry in handoff["stage_relations"]],
+        and origin["origin_generation"] == authority["local_generation"],
         "published authority differs",
     )
     _require(
@@ -270,7 +292,6 @@ def validate_entity_address_native_publication(receipt):
         and receipt["validation"]["rows"] == handoff["row_count"]
         and type(receipt["validation"]["integrity"]) is dict
         and type(receipt["validation"]["catalog"]) is dict
-        and _digest(receipt["validation"]) == receipt["validation_sha256"]
         and receipt["source_contract_sha256"] == handoff["source_contract_sha256"],
         "validation receipt differs",
     )
@@ -278,10 +299,8 @@ def validate_entity_address_native_publication(receipt):
     _validate_catalog(receipt["validation"]["catalog"], handoff)
     _require(
         type(receipt["alias"]) is dict
-        and set(receipt["alias"]) == {"generation", "catalog_sha256"}
-        and receipt["alias"]["generation"] == handoff["alias_generation"]
-        and type(receipt["alias"]["catalog_sha256"]) is str
-        and re.fullmatch(r"[0-9a-f]{64}", receipt["alias"]["catalog_sha256"]) is not None,
+        and {"generation"} <= set(receipt["alias"]) <= {"generation", "catalog_sha256"}
+        and receipt["alias"]["generation"] == handoff["alias_generation"],
         "alias receipt differs",
     )
     return receipt
@@ -293,19 +312,18 @@ def _validate_catalog(catalog, handoff):
         and all(type(rows) is list and 0 < len(rows) <= 8192 for rows in catalog.values()),
         "catalog receipt differs",
     )
-    expected_relations = [(entry["table_name"], entry["relation_oid"]) for entry in handoff["stage_relations"]]
+    names = [entry["table_name"] for entry in handoff["stage_relations"]]
     _require(
         len(catalog["shapes"]) == 7
         and all(type(row) is list and len(row) == 3 for row in catalog["shapes"])
-        and [(row[0], row[1]) for row in catalog["shapes"]] == expected_relations
-        and all(type(row[2]) is str and re.fullmatch(r"[0-9a-f]{64}", row[2]) for row in catalog["shapes"]),
+        and [row[0] for row in catalog["shapes"]] == names,
         "catalog shapes differ",
     )
-    oids = {oid for _name, oid in expected_relations}
+    by_observation = {str(row[1]): row[0] for row in catalog["shapes"]}
     for kind in ("indexes", "columns", "constraints"):
         _require(
             all(type(row) is dict for row in catalog[kind])
-            and {row.get("relation_oid") for row in catalog[kind]} == oids,
+            and {by_observation.get(str(row.get("relation_oid"))) for row in catalog[kind]} == set(names),
             "catalog family differs",
         )
     _require(all(row.get("kind") != "f" for row in catalog["constraints"]), "catalog relationship differs")
@@ -314,37 +332,22 @@ def _validate_catalog(catalog, handoff):
 def _validate_publication_inventory(inventory, handoff):
     _require(
         type(inventory) is dict
-        and set(inventory) == {"database_oid", "relations"}
-        and inventory["database_oid"] == handoff["database_oid"]
+        and {"relations"} <= set(inventory) <= {"database_oid", "relations"}
         and type(inventory["relations"]) is list
         and len(inventory["relations"]) == 7,
         "inventory differs",
     )
-    relations_by_name = {entry["relation_name"]: entry for entry in inventory["relations"]}
-    _require(set(relations_by_name) == set(generation.RELATION_NAMES), "inventory family differs")
-    for stage in handoff["stage_relations"]:
-        entry = relations_by_name[stage["table_name"]]
-        _require(
-            set(entry)
-            == {
-                "schema_name",
-                "schema_oid",
-                "schema_owner_oid",
-                "relation_name",
-                "relation_oid",
-                "relfilenode",
-                "owner_oid",
-            }
-            and entry["schema_name"] == handoff["schema_name"]
-            and entry["relation_oid"] == stage["relation_oid"]
-            and entry["relfilenode"] == stage["relfilenode"]
-            and all(
-                type(entry[key]) is int and 0 < entry[key] < 2**32
-                for key in ("schema_oid", "schema_owner_oid", "owner_oid")
-            ),
-            "physical inventory differs",
-        )
-    _require(len({entry["owner_oid"] for entry in relations_by_name.values()}) == 1, "inventory owner differs")
+    required_fields = {"schema_name", "relation_name"}
+    legacy_fields = required_fields | {"schema_oid", "schema_owner_oid", "relation_oid", "relfilenode", "owner_oid"}
+    _require(
+        all(type(entry) is dict and required_fields <= set(entry) <= legacy_fields for entry in inventory["relations"]),
+        "inventory fields differ",
+    )
+    _require(
+        {entry["relation_name"] for entry in inventory["relations"]} == set(generation.RELATION_NAMES)
+        and all(entry["schema_name"] == handoff["schema_name"] for entry in inventory["relations"]),
+        "inventory family differs",
+    )
 
 
 async def _locked_run(session, handoff, status, *, lock=True):
@@ -383,44 +386,71 @@ async def controlled_dependency_node(session, schema_name, ctx):
     return node_id
 
 
-def _source_contract(handoff, params):
+def _source_contract(handoff, params, *, legacy_observations=False):
+    bindings_by_name = handoff["dependency_bindings"]
+    if not legacy_observations:
+        bindings_by_name = {
+            name: {key: entry[key] for key in ("schema_name", "table_name")} for name, entry in bindings_by_name.items()
+        }
     return _digest(
         {
             "importer_id": "entity-address-unified",
             "params": params,
-            **{key: handoff[key] for key in ("schema_name", "import_date", "alias_generation", "dependency_bindings")},
+            **{key: handoff[key] for key in ("schema_name", "import_date", "alias_generation")},
+            "dependency_bindings": bindings_by_name,
         }
     )
 
 
+def _is_source_contract_unchanged(handoff, params, original):
+    """Fence parameters using the recorded input, never current physical identities.
+
+    Older handoffs hashed their original catalog observations too. Decode that
+    original digest for compatibility, while comparing only logical bindings to
+    the requested handoff. New handoffs hash schema-qualified source names.
+    """
+    return _logical_handoff(original) == _logical_handoff(handoff) and original["source_contract_sha256"] in {
+        _source_contract(original, params),
+        _source_contract(original, params, legacy_observations=True),
+    }
+
+
 async def _dependency_bindings(session, schema, bindings_by_name):
     if bindings_by_name is None:
-        bindings_by_name = {}
-        for namespace, table in projection._PROJECTION_DEPENDENCIES:
-            namespace = namespace or schema
-            row = (
-                (
-                    await session.execute(
-                        text(
-                            "SELECT oid::bigint AS relation_oid,pg_relation_filenode(oid)::bigint AS relfilenode "
-                            "FROM pg_class WHERE oid=to_regclass(:name)"
-                        ),
-                        {"name": f'"{namespace}"."{table}"'},
-                    )
+        selected_relations = [
+            (f"{namespace or schema}.{table}", namespace or schema, table)
+            for namespace, table in projection._PROJECTION_DEPENDENCIES
+        ]
+    else:
+        declared = projection.validate_projection_dependency_bindings(schema, bindings_by_name)
+        selected_relations = [(name, entry["schema_name"], entry["table_name"]) for name, entry in declared.items()]
+    current_bindings_by_name = {}
+    for name, namespace, table in selected_relations:
+        relation_by_field = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT oid::bigint AS relation_oid,pg_relation_filenode(oid)::bigint AS relfilenode "
+                        "FROM pg_class WHERE oid=to_regclass(:name)"
+                    ),
+                    {"name": f'"{namespace}"."{table}"'},
                 )
-                .mappings()
-                .one()
             )
-            bindings_by_name[f"{namespace}.{table}"] = {"schema_name": namespace, "table_name": table, **dict(row)}
-    bindings_by_name = projection.validate_projection_dependency_bindings(schema, bindings_by_name)
-    await session.execute(text(projection.projection_dependency_lock_sql(schema, dependency_bindings=bindings_by_name)))
+            .mappings()
+            .one()
+        )
+        current_bindings_by_name[name] = {"schema_name": namespace, "table_name": table, **dict(relation_by_field)}
+    current_bindings_by_name = projection.validate_projection_dependency_bindings(schema, current_bindings_by_name)
+    await session.execute(
+        text(projection.projection_dependency_lock_sql(schema, dependency_bindings=current_bindings_by_name))
+    )
     _require(
         await session.scalar(
-            text("SELECT " + projection.projection_dependency_bindings_match_sql(schema, bindings_by_name))
+            text("SELECT " + projection.projection_dependency_bindings_match_sql(schema, current_bindings_by_name))
         ),
-        "dependencies changed",
+        "dependencies changed while locking",
     )
-    return bindings_by_name
+    return current_bindings_by_name
 
 
 async def _stage_inventory(session, schema, names):
@@ -822,18 +852,24 @@ async def _require_handoff_stage(session, handoff):
             + " IN ACCESS EXCLUSIVE MODE NOWAIT"
         )
     )
-    _require(await _stage_inventory(session, schema, names) == handoff["stage_relations"], "stage changed")
-    _require(await _index_inventory(session, handoff["stage_relations"]) == handoff["indexes"], "indexes changed")
-    await _require_stage_execution_catalog(session, handoff)
-    marker = _json({key: handoff[key] for key in ("contract", "run_id", "attempt_id", "handoff_sha256")})
-    for entry in handoff["stage_relations"]:
-        _require(
-            await session.scalar(
-                text("SELECT obj_description(CAST(:oid AS oid),'pg_class')"), {"oid": entry["relation_oid"]}
-            )
-            == marker,
-            "stage marker changed",
+    relations = await _stage_inventory(session, schema, names)
+    current_handoff_by_field = {**handoff, "stage_relations": relations}
+    await _require_stage_execution_catalog(session, current_handoff_by_field)
+    marker_by_field = {key: handoff[key] for key in ("contract", "run_id", "attempt_id")}
+    for entry in relations:
+        observed = await session.scalar(
+            text("SELECT obj_description(to_regclass(:relation),'pg_class')"),
+            {"relation": f'"{schema}"."{entry["stage_name"]}"'},
         )
+        try:
+            observed = json.loads(observed)
+        except ValueError, TypeError:
+            observed = None
+        _require(
+            type(observed) is dict and all(observed.get(key) == value for key, value in marker_by_field.items()),
+            "stage attempt marker changed",
+        )
+    return current_handoff_by_field
 
 
 async def _require_stage_execution_catalog(
@@ -880,45 +916,20 @@ async def _require_stage_execution_catalog(
 
 async def _require_native_attempt(session, handoff):
     run = await _locked_run(session, handoff, "finalizing")
+    original = validate_entity_address_native_handoff((run["metrics"] or {}).get("address_handoff"))
     _require(
-        run["phase_detail"] == HANDOFF_PHASE and (run["metrics"] or {}).get("address_handoff") == handoff,
+        run["phase_detail"] == HANDOFF_PHASE and _logical_handoff(original) == _logical_handoff(handoff),
         "handoff changed",
     )
-    _require(
-        _source_contract(handoff, run["params"] or {}) == handoff["source_contract_sha256"], "source contract changed"
-    )
-    actual = (
-        await session.execute(
-            text(
-                "SELECT (SELECT oid::bigint FROM pg_database WHERE datname=current_database()),to_regclass(:history)::oid::bigint"
-            ),
-            {"history": f'"{handoff["schema_name"]}".import_run'},
-        )
-    ).one()
-    _require(tuple(actual) == (handoff["database_oid"], handoff["import_run_oid"]), "native database changed")
+    _require(_is_source_contract_unchanged(handoff, run["params"] or {}, original), "source contract changed")
 
 
-async def _receipt_inventory(session, handoff, owner_oid):
-    relations = []
-    schema = handoff["schema_name"]
-    namespace = (
-        await session.execute(text("SELECT oid,nspowner FROM pg_namespace WHERE nspname=:schema"), {"schema": schema})
-    ).one()
-    for entry in handoff["stage_relations"]:
-        relations.append(
-            {
-                "schema_name": schema,
-                "schema_oid": namespace[0],
-                "schema_owner_oid": namespace[1],
-                "relation_name": entry["table_name"],
-                "relation_oid": entry["relation_oid"],
-                "relfilenode": entry["relfilenode"],
-                "owner_oid": owner_oid,
-            }
-        )
+async def _receipt_inventory(session, handoff):
     return {
-        "database_oid": handoff["database_oid"],
-        "relations": sorted(relations, key=lambda row: row["relation_oid"]),
+        "relations": [
+            {"schema_name": handoff["schema_name"], "relation_name": entry["table_name"]}
+            for entry in handoff["stage_relations"]
+        ]
     }
 
 
@@ -933,7 +944,7 @@ async def _complete_control(session, handoff, receipt):
             "'total',CAST(:rows AS bigint),'unit','rows','phase',CAST(:phase AS text),'message','succeeded'))::json "
             "WHERE run_id=:run_id AND importer='entity-address-unified' AND status='finalizing' AND phase_detail=:handoff_phase "
             "AND progress->>'attempt_id'=:attempt_id AND progress->>'attempt_started_at'=:attempt_started_at "
-            "AND metrics::jsonb->'address_handoff'=CAST(:handoff AS jsonb) AND finished_at IS NULL "
+            "AND metrics::jsonb->'address_handoff'->>'source_contract_sha256'=:source_contract_sha256 AND finished_at IS NULL "
             "AND (error IS NULL OR error::jsonb='null'::jsonb) RETURNING run_id"
         ),
         {
@@ -955,22 +966,27 @@ async def complete_entity_address_unified_handoff(session, handoff, *, dependenc
     supplied cutover exactly once and must not commit or change transactions.
     """
     from process import entity_address_snapshot_adoption as adoption
-    from process import entity_address_snapshot_preparation as protected
+    from process import entity_address_snapshot_alias as alias
 
     handoff = validate_entity_address_native_handoff(handoff)
     _require(session.in_transaction() and callable(publication_continuation), "requires a trusted transaction")
     _require(
-        projection.validate_projection_dependency_bindings(handoff["schema_name"], dependency_bindings)
-        == handoff["dependency_bindings"],
+        {
+            (binding["schema_name"], binding["table_name"])
+            for binding in projection.validate_projection_dependency_bindings(
+                handoff["schema_name"], dependency_bindings
+            ).values()
+        }
+        == {(binding["schema_name"], binding["table_name"]) for binding in handoff["dependency_bindings"].values()},
         "dependency selection changed",
     )
     native = _native()
     async with native.db.bind_existing_session(session):
         await _require_native_attempt(session, handoff)
-        await protected.alias._lock_alias_relations(session, handoff["schema_name"])
-        await _require_handoff_stage(session, handoff)
-        await _require_model_catalog(session, handoff["schema_name"], handoff["stage_relations"])
-        await _dependency_bindings(session, handoff["schema_name"], dependency_bindings)
+        await alias._lock_alias_relations(session, handoff["schema_name"])
+        current = await _require_handoff_stage(session, handoff)
+        await _require_model_catalog(session, handoff["schema_name"], current["stage_relations"])
+        current_bindings = await _dependency_bindings(session, handoff["schema_name"], dependency_bindings)
         _require(
             await native._address_alias_generation(handoff["schema_name"]) == handoff["alias_generation"],
             "alias changed",
@@ -979,7 +995,7 @@ async def complete_entity_address_unified_handoff(session, handoff, *, dependenc
             session,
             db_schema=handoff["schema_name"],
             import_date=handoff["import_date"],
-            dependency_bindings=dependency_bindings,
+            dependency_bindings=current_bindings,
         )
         row_count = await session.scalar(
             text(f'SELECT count(*) FROM "{handoff["schema_name"]}"."{prepared.stage_cls.__tablename__}"')
@@ -988,19 +1004,17 @@ async def complete_entity_address_unified_handoff(session, handoff, *, dependenc
         validation_by_field = {
             "rows": row_count,
             "integrity": prepared.publish_validation,
-            "catalog": await _catalog_evidence(session, handoff),
+            "catalog": await _catalog_evidence(session, current),
         }
-        owner_oid = prepared.context["protected_owner_oid"]
         receipt_by_field = {
             "contract": PUBLICATION_CONTRACT,
             "handoff": handoff,
             "validation": validation_by_field,
             "validation_sha256": _digest(validation_by_field),
             "source_contract_sha256": handoff["source_contract_sha256"],
-            "inventory": await _receipt_inventory(session, handoff, owner_oid),
+            "inventory": await _receipt_inventory(session, handoff),
             "alias": {
                 "generation": handoff["alias_generation"],
-                "catalog_sha256": await protected._require_alias_authority(session, handoff["schema_name"], owner_oid),
             },
         }
         return await _publish_prepared(session, handoff, prepared, receipt_by_field, publication_continuation)
@@ -1018,7 +1032,11 @@ async def _publish_prepared(session, handoff, prepared, receipt, continuation):
         current = await generation.read_entity_address_result_generation_authority(
             session, schema_name=handoff["schema_name"]
         )
-        _require(current.as_dict() == handoff["incumbent"], "incumbent changed")
+        _require(
+            {key: value for key, value in current.as_dict().items() if key != "relation_oids"}
+            == {key: value for key, value in handoff["incumbent"].items() if key != "relation_oids"},
+            "incumbent changed",
+        )
         await _require_native_attempt(session, handoff)
         callbacks = native.ordinary_address_receipt_callbacks(native.db, handoff["schema_name"], native._sql_literal)
         await native._run_entity_address_cutover(
@@ -1068,15 +1086,15 @@ async def read_entity_address_native_publication(session, handoff):
     if run_record is None:
         return None
     receipt = (run_record["metrics"] or {}).get("address_native_publication")
+    original = validate_entity_address_native_handoff((run_record["metrics"] or {}).get("address_handoff"))
     _require(
         run_record["finished_at"] is not None
         and run_record["phase_detail"] == PUBLICATION_PHASE
-        and (run_record["metrics"] or {}).get("address_handoff") == handoff
-        and _source_contract(handoff, run_record["params"] or {}) == handoff["source_contract_sha256"],
+        and _is_source_contract_unchanged(handoff, run_record["params"] or {}, original),
         "recorded outcome changed",
     )
     receipt = validate_entity_address_native_publication(receipt)
-    _require(receipt["handoff"] == handoff, "recorded receipt changed")
+    _require(_logical_handoff(receipt["handoff"]) == _logical_handoff(handoff), "recorded receipt changed")
     return receipt
 
 
@@ -1109,25 +1127,24 @@ def _validate_abandoned_handoff(handoff, abandonment):
     for key in ("preparation_id", "generation_id", "publication_fence"):
         _require(str(UUID(abandonment[key])) == abandonment[key], "abandonment identity differs")
     _require(re.fullmatch(r"[0-9a-f]{64}", abandonment["admission_sha256"]) is not None, "admission digest differs")
-    custody_by_field = {
-        key: handoff[key]
-        for key in (
-            "database_oid",
-            "import_run_oid",
-            "schema_name",
-            "attempt_id",
-            "attempt_started_at",
-            "handoff_sha256",
-            "source_contract_sha256",
-            "stage_relations",
-            "indexes",
-        )
-    }
-    builder_oid = abandonment["candidate_custody"].get("builder_oid")
-    _require(type(builder_oid) is int and 0 < builder_oid < 2**32, "abandoned builder differs")
+    custody = abandonment["candidate_custody"]
+    _require(type(custody) is dict, "abandoned candidate differs")
     _require(
-        abandonment["candidate_custody"] == {"builder_oid": builder_oid, **custody_by_field},
-        "abandoned custody differs",
+        all(
+            custody.get(key) == handoff[key]
+            for key in ("schema_name", "attempt_id", "attempt_started_at", "source_contract_sha256")
+        ),
+        "abandoned candidate differs",
+    )
+    names = _stage_names(handoff["schema_name"], handoff["import_date"])
+    _require(
+        type(custody.get("stage_relations")) is list
+        and [
+            (relation_entry.get("table_name"), relation_entry.get("stage_name"))
+            for relation_entry in custody["stage_relations"]
+        ]
+        == list(names.items()),
+        "abandoned stage names differ",
     )
     _require_abandoned_run_shape(handoff, abandonment["observed_run"])
     return abandonment
@@ -1173,31 +1190,24 @@ async def _require_cleanup_run(session, handoff, abandonment):
     params = run["params"] or {}
     _require(type(params) is dict and not params.get("test") and not params.get("test_mode"), "cleanup source differs")
     metrics = run["metrics"] or {}
-    _require(
-        metrics.get("address_native_publication") is None
-        and (metrics.get("address_native_abandonments") or {}).get(abandonment["preparation_id"]) == abandonment
-        and (metrics.get("address_native_candidate_cleanups") or {}).get(abandonment["preparation_id"]) is None
-        and _source_contract(handoff, run["params"] or {}) == handoff["source_contract_sha256"],
-        "cleanup receipt changed",
-    )
     current = validate_entity_address_native_handoff(metrics.get("address_handoff"))
     _require(
-        all(current[key] == handoff[key] for key in ("run_id", "schema_name", "database_oid", "import_run_oid"))
-        and current["handoff_sha256"] == abandonment["observed_run"]["handoff_sha256"]
+        metrics.get("address_native_publication") is None
+        and _logical_abandonment((metrics.get("address_native_abandonments") or {}).get(abandonment["preparation_id"]))
+        == _logical_abandonment(abandonment)
+        and (metrics.get("address_native_candidate_cleanups") or {}).get(abandonment["preparation_id"]) is None
+        and _is_source_contract_unchanged(
+            handoff, run["params"] or {}, current if current["attempt_id"] == handoff["attempt_id"] else handoff
+        ),
+        "cleanup receipt changed",
+    )
+    _require(
+        all(current[key] == handoff[key] for key in ("run_id", "schema_name"))
         and {key: (run["progress"] or {}).get(key) for key in ("attempt_id", "attempt_started_at")}
         == abandonment["observed_run"]["progress"],
         "cleanup attempt changed",
     )
     _require_cleanup_terminal(run, handoff, current, abandonment)
-    actual = (
-        await session.execute(
-            text(
-                "SELECT (SELECT oid::bigint FROM pg_database WHERE datname=current_database()),to_regclass(:history)::oid::bigint"
-            ),
-            {"history": f'"{schema}".import_run'},
-        )
-    ).one()
-    _require(tuple(actual) == (handoff["database_oid"], handoff["import_run_oid"]), "cleanup database changed")
 
 
 def _require_cleanup_terminal(run, handoff, current, abandonment):
@@ -1215,11 +1225,11 @@ def _require_cleanup_terminal(run, handoff, current, abandonment):
             and run["phase_detail"] == HANDOFF_PHASE
             and run["finished_at"] is None
             and run["error"] is None
-            and _source_contract(current, run["params"] or {}) == current["source_contract_sha256"],
+            and _is_source_contract_unchanged(current, run["params"] or {}, current),
             "replacement is not authenticated",
         )
         return
-    _require(current == handoff, "cleanup handoff changed")
+    _require(_logical_handoff(current) == _logical_handoff(handoff), "cleanup handoff changed")
     is_canceled = run["status"] in {"canceled", "cancelled"} and run["finished_at"] is not None
     is_fenced = (
         run["status"] == "canceling"
@@ -1230,52 +1240,25 @@ def _require_cleanup_terminal(run, handoff, current, abandonment):
     _require(is_canceled or is_fenced, "cancellation is not authenticated")
 
 
-async def _require_cleanup_owners(session, handoff, runtime_owner_oids, protected_owner_oid):
-    _require(
-        type(runtime_owner_oids) is tuple
-        and 0 < len(runtime_owner_oids) <= 64
-        and all(type(oid) is int and 0 < oid < 2**32 and oid != protected_owner_oid for oid in runtime_owner_oids),
-        "cleanup runtime authority differs",
-    )
-    safe = await session.scalar(
-        text(
-            "SELECT count(DISTINCT relation.relowner)=1 AND count(*)=:count AND bool_and("
-            "relation.relowner=ANY(:runtime_owners) AND NOT owner.rolsuper AND NOT owner.rolcreaterole "
-            "AND NOT owner.rolcreatedb AND NOT owner.rolreplication AND NOT owner.rolbypassrls "
-            "AND NOT pg_has_role(owner.oid,CAST(:protected_owner AS oid),'USAGE') "
-            "AND pg_has_role(session_user,owner.oid,'USAGE')) "
-            "FROM pg_class relation JOIN pg_roles owner ON owner.oid=relation.relowner WHERE relation.oid=ANY(:oids)"
-        ),
-        {
-            "oids": [entry["relation_oid"] for entry in handoff["stage_relations"]]
-            + [entry["index_oid"] for entry in handoff["indexes"]],
-            "runtime_owners": list(runtime_owner_oids),
-            "protected_owner": protected_owner_oid,
-            "count": 7 + len(handoff["indexes"]),
-        },
-    )
-    _require(safe is True, "cleanup owner changed")
-
-
 async def _require_cleanup_nonserving(session, handoff):
+    from process.network_cms_registry_address_capture import native_driver
+    from process.network_compact_retention import require_named_address_artifacts_unreferenced
+
     schema = handoff["schema_name"]
-    names = (*generation.RELATION_NAMES, generation.TABLE_NAME)
-    await session.execute(
-        text("LOCK TABLE " + ",".join(f'"{schema}"."{name}"' for name in sorted(names)) + " IN SHARE MODE NOWAIT")
-    )
+    names = _stage_names(schema, handoff["import_date"])
+    _require(not set(names.values()).intersection(generation.RELATION_NAMES), "candidate is serving")
+    driver = getattr(session, "native_connection", None)
+    if driver is None:
+        driver = await native_driver(session)
+    await require_named_address_artifacts_unreferenced(driver, [(schema, name) for name in names.values()])
     safe = await session.scalar(
         text(
-            f'SELECT NOT EXISTS(SELECT 1 FROM "{schema}"."{generation.TABLE_NAME}" WHERE relation_oids OPERATOR(pg_catalog.&&) CAST(:oids AS bigint[])) '
-            "AND NOT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
-            "WHERE n.nspname=:schema AND c.relname=ANY(:names) AND c.oid=ANY(:oids))"
+            "SELECT NOT EXISTS(SELECT FROM pg_inherits WHERE inhrelid IN "
+            "(SELECT to_regclass(name) FROM unnest(CAST(:names AS text[])) named(name)))"
         ),
-        {
-            "schema": schema,
-            "names": list(generation.RELATION_NAMES),
-            "oids": [entry["relation_oid"] for entry in handoff["stage_relations"]],
-        },
+        {"names": [f'"{schema}"."{name}"' for name in names.values()]},
     )
-    _require(safe is True, "candidate is serving")
+    _require(safe is True, "candidate is attached to serving storage")
 
 
 async def cleanup_entity_address_native_handoff(
@@ -1285,7 +1268,6 @@ async def cleanup_entity_address_native_handoff(
     handoff = validate_entity_address_native_handoff(handoff)
     abandonment = _validate_abandoned_handoff(handoff, abandonment)
     _require(session.in_transaction() and callable(assert_unreferenced), "cleanup requires a trusted transaction")
-    _require(runtime_owner_oids == (abandonment["candidate_custody"]["builder_oid"],), "cleanup builder differs")
     async with _catalog_search_path(session):
         return await _cleanup_bound_native_candidate(
             session, handoff, abandonment, runtime_owner_oids, assert_unreferenced
@@ -1293,21 +1275,21 @@ async def cleanup_entity_address_native_handoff(
 
 
 async def _cleanup_bound_native_candidate(session, handoff, abandonment, runtime_owner_oids, assert_unreferenced):
-    from process import entity_address_snapshot_preparation as protected
-
     transaction_id = await session.scalar(text("SELECT pg_current_xact_id()::text"))
-    protected_owner_oid = await protected._publisher_authority(session)
     await _require_cleanup_run(session, handoff, abandonment)
     _require(await assert_unreferenced(session, handoff, abandonment) is True, "candidate remains referenced")
     await _require_cleanup_nonserving(session, handoff)
-    await _require_handoff_stage(session, handoff)
-    await _require_cleanup_owners(session, handoff, runtime_owner_oids, protected_owner_oid)
+    current = await _require_handoff_stage(session, handoff)
+    await _require_model_catalog(session, handoff["schema_name"], current["stage_relations"])
     _require(await assert_unreferenced(session, handoff, abandonment) is True, "candidate remains referenced")
     _require(
         session.in_transaction() and await session.scalar(text("SELECT pg_current_xact_id()::text")) == transaction_id,
         "cleanup transaction changed",
     )
-    relations = ",".join(f'"{handoff["schema_name"]}"."{entry["stage_name"]}"' for entry in handoff["stage_relations"])
+    relations = ",".join(
+        f'"{handoff["schema_name"]}"."{name}"'
+        for name in _stage_names(handoff["schema_name"], handoff["import_date"]).values()
+    )
     await session.execute(text("DROP TABLE " + relations + " RESTRICT"))
     return {
         "contract": CLEANUP_CONTRACT,

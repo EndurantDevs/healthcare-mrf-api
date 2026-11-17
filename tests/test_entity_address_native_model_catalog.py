@@ -170,7 +170,7 @@ async def test_publisher_refuses_model_drift_before_sealing(monkeypatch):
     )
     monkeypatch.setattr(publication, "_require_native_attempt", AsyncMock())
     monkeypatch.setattr(protected.alias, "_lock_alias_relations", AsyncMock())
-    stage = AsyncMock()
+    stage = AsyncMock(return_value=handoff_by_field)
     monkeypatch.setattr(publication, "_require_handoff_stage", stage)
     gate = AsyncMock(side_effect=RuntimeError("model indexes differ"))
     monkeypatch.setattr(publication, "_require_model_catalog", gate)

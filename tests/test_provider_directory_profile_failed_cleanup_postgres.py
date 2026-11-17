@@ -5,7 +5,7 @@ import os
 import re
 import shlex
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -24,6 +24,14 @@ from tests.test_provider_directory_profile_failed_cleanup import cleanup_history
 
 BUILD = "pdpb_" + "5" * 32
 OWNER = "run_" + "a" * 32
+
+
+@pytest.fixture(autouse=True)
+def cleanup_fixture_clock(monkeypatch):
+    """Control synthetic permit time; native observations, SQL and limits remain real."""
+    clock = SimpleNamespace(now=datetime.now(timezone.utc))
+    monkeypatch.setattr(cleanup, "_now_utc", lambda: clock.now)
+    return clock
 
 
 async def _seed(database):
@@ -79,7 +87,7 @@ async def _fresh_fixture_authorization(database, *, published_run_id=None):
     report = await cleanup.inspect_failed_profile_cleanup(
         fhir, build_id=BUILD, owner_run_id=OWNER, published_run_id=published_run_id
     )
-    now = datetime.now(timezone.utc)
+    now = cleanup._now_utc()
     envelope, trust, key = authorization_fixture(now)
     body = envelope["authorization"]
     body["checkpoint"], body["stages"], body["limits"] = report["checkpoint"], report["stages"], report["limits"]
@@ -640,6 +648,49 @@ async def _install_initial_publication(database):
 
     async with database.engine.begin() as connection:
         await connection.run_sync(install)
+
+
+@pytest.mark.asyncio
+async def test_fixture_time_ignores_wall_clock(monkeypatch, cleanup_fixture_clock):
+    """Native inspection and signing share scenario time despite elapsed wall time."""
+    async with admission_database(monkeypatch) as database:
+        _names, published = await _seed_legacy(database)
+        monkeypatch.setitem(
+            _fresh_fixture_authorization.__globals__,
+            "datetime",
+            SimpleNamespace(now=lambda _zone: cleanup_fixture_clock.now + timedelta(seconds=6)),
+        )
+        envelope, trust = await _fresh_fixture_authorization(database, published_run_id=published)
+        body = envelope["authorization"]
+        assert body["issued_at"] == body["physical"]["observed_at"] == cleanup_fixture_clock.now.isoformat()
+        receipt = await cleanup.execute_failed_profile_cleanup(
+            fhir, envelope, cleanup_trust=trust, executor_identity=body["executor_identity"]
+        )
+        assert receipt == await cleanup.reconcile_failed_profile_cleanup(fhir, envelope, cleanup_trust=trust)
+        assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_profile_failed_cleanup_claim") == 1
+
+
+@pytest.mark.asyncio
+async def test_fixture_clock_refuses_stale_observations(monkeypatch, cleanup_fixture_clock):
+    """Advancing scenario time never refreshes an already captured observation."""
+    async with admission_database(monkeypatch) as database:
+        names, published = await _seed_legacy(database)
+        envelope, trust = await _fresh_fixture_authorization(database, published_run_id=published)
+        before = await database.scalar(
+            "SELECT row_to_json(c)::text FROM mrf.provider_directory_profile_build_checkpoint c"
+        )
+        cleanup_fixture_clock.now += timedelta(seconds=6)
+        with pytest.raises(RuntimeError, match="failed_profile_cleanup_physical_observation_stale$"):
+            await cleanup.execute_failed_profile_cleanup(
+                fhir, envelope, cleanup_trust=trust, executor_identity=envelope["authorization"]["executor_identity"]
+            )
+        assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_profile_failed_cleanup_claim") == 0
+        assert before == await database.scalar(
+            "SELECT row_to_json(c)::text FROM mrf.provider_directory_profile_build_checkpoint c"
+        )
+        assert all(
+            [await fhir._provider_directory_profile_stage_relation_identity("mrf", name) is not None for name in names]
+        )
 
 
 @pytest.mark.asyncio

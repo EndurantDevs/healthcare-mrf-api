@@ -11,6 +11,7 @@ from sqlalchemy.exc import DBAPIError
 from db.connection import Database
 from process import entity_address_serving_receipt as continuity
 from process import provider_directory_cms_serving_receipt as receipts
+from process.entity_address_retained_names import retained_address_name
 from tests.test_provider_directory_cms_serving_receipt_postgres import _database, _publish_initial
 
 native = importlib.import_module("process.entity_address_unified")
@@ -96,7 +97,14 @@ async def test_ordinary_swap_advances_address_and_common_receipt_in_one_transact
             ):
                 assert current["payload"][key] == initial["payload"][key]
             assert await connection.scalar(text(f"SELECT synthetic_id FROM {schema}.entity_address_unified")) == 2
-            assert await connection.scalar(text(f"SELECT synthetic_id FROM {schema}.entity_address_unified_old")) == 1
+            retained = retained_address_name(
+                "entity_address_unified",
+                {
+                    field: initial["payload"]["address"][field]
+                    for field in ("origin_lineage_id", "origin_generation", "published_at")
+                },
+            )
+            assert await connection.scalar(text(f'SELECT synthetic_id FROM {schema}."{retained}"')) == 1
             assert await receipts.verify_historical_receipt(
                 connection, schema, initial["receipt_id"], initial["payload"]
             )

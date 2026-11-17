@@ -9,13 +9,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
 
+import asyncpg
 import pytest
 
 from process import network_custom_address_source as custom
 from process import network_legacy_membership_source as legacy
 from process import registry_aca_address_carry as carry
 from process import registry_source_recipe_composition as composition
-from process.network_address_artifact import NetworkAddressArtifactError
 from process.network_address_projection import PinnedAddressSource
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_compact_layout import CompactAddressRelation
@@ -252,30 +252,27 @@ async def test_new_rows_are_setwise_and_existing_offices_are_never_overwritten(m
     assert checked.await_args.kwargs == {"writing": False}
 
 
-def _existing_address_connection(table_name, table_oid=123):
-    physical_by_field = {"schema_name": "base_fixture", "relname": table_name, "oid": table_oid}
+def _existing_address_connection():
     return SimpleNamespace(
         is_in_transaction=lambda: True,
-        fetchrow=AsyncMock(side_effect=[physical_by_field, physical_by_field, {"bounded": True, "copied_rows": 1}]),
-        fetchval=AsyncMock(return_value=table_oid),
+        fetchrow=AsyncMock(return_value={"bounded": True, "copied_rows": 1}),
+        fetchval=AsyncMock(),
         execute=AsyncMock(),
     )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("retained", [False, True])
-async def test_existing_office_copy_locks_exact_native_origin(recipe, retained):
+@pytest.mark.parametrize("historical_oid", [123, 999])
+async def test_existing_office_copy_locks_qualified_origin(recipe, retained, historical_oid):
     table_name = "entity_address_unified_retained_7b" if retained else "entity_address_unified"
-    connection = _existing_address_connection(table_name)
-    origin = CompactAddressRelation("base_fixture", table_name, 123)
+    connection = _existing_address_connection()
+    origin = CompactAddressRelation("base_fixture", table_name, historical_oid)
     await carry._copy_existing_offices(connection, _batch(recipe), "target_fixture", origin)
-    assert connection.execute.await_args.args == (
-        f'LOCK TABLE ONLY "base_fixture"."{table_name}" IN ACCESS SHARE MODE NOWAIT',
+    connection.execute.assert_awaited_once_with(
+        f'LOCK TABLE ONLY "base_fixture"."{table_name}" IN ACCESS SHARE MODE NOWAIT'
     )
-    assert connection.fetchval.await_args.args == (
-        "SELECT to_regclass($1)::oid::bigint",
-        f'"base_fixture"."{table_name}"',
-    )
+    connection.fetchval.assert_not_awaited()
     query = connection.fetchrow.await_args.args[0]
     assert f'FROM "base_fixture"."{table_name}" address' in query
     assert "ON CONFLICT(location_key) DO NOTHING" in query
@@ -283,39 +280,28 @@ async def test_existing_office_copy_locks_exact_native_origin(recipe, retained):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["logical_pin", "transaction", "name", "oid", "renamed", "bounds"])
-async def test_existing_office_copy_refuses_unverified_or_changed_origin(recipe, fault):
+@pytest.mark.parametrize("fault", ["logical_pin", "transaction", "missing", "denied", "bounds"])
+async def test_existing_office_copy_refuses_invalid_scope(recipe, fault):
     origin = CompactAddressRelation("base_fixture", "entity_address_unified_retained_7b", 123)
-    connection = _existing_address_connection(origin.table_name)
+    connection = _existing_address_connection()
     match fault:
         case "logical_pin":
             origin = PinnedAddressSource(origin.schema_name, origin.table_name, "same-label")
         case "transaction":
             connection.is_in_transaction = lambda: False
-        case "name":
-            connection = _existing_address_connection("entity_address_unified_retained_7c")
-        case "oid":
-            connection.fetchval.return_value = 124
-        case "renamed":
-            origin = CompactAddressRelation(origin.schema_name, "entity_address_unified", origin.table_oid)
+        case "missing":
+            connection.execute.side_effect = asyncpg.UndefinedTableError("missing source")
+        case "denied":
+            connection.execute.side_effect = asyncpg.InsufficientPrivilegeError("denied source")
         case "bounds":
-            physical_by_field = {
-                "schema_name": origin.schema_name,
-                "relname": origin.table_name,
-                "oid": origin.table_oid,
-            }
-            connection.fetchrow.side_effect = [
-                physical_by_field,
-                physical_by_field,
-                {"bounded": False, "copied_rows": 0},
-            ]
-    with pytest.raises((ValueError, NetworkAddressArtifactError)):
+            connection.fetchrow.return_value = {"bounded": False, "copied_rows": 0}
+    with pytest.raises((ValueError, asyncpg.UndefinedTableError, asyncpg.InsufficientPrivilegeError)):
         await carry._copy_existing_offices(connection, _batch(recipe), "target_fixture", origin)
     if fault in {"logical_pin", "transaction"}:
         connection.fetchrow.assert_not_awaited()
         connection.execute.assert_not_awaited()
     else:
-        assert connection.fetchrow.await_count <= (3 if fault == "bounds" else 2)
+        assert connection.fetchrow.await_count == int(fault == "bounds")
 
 
 @pytest.mark.asyncio

@@ -4,9 +4,12 @@
 import hashlib
 import json
 
+from sqlalchemy import text
+
 from process import entity_address_native_publication as publication
 from process import entity_address_result_generation as generation
 from process import entity_address_snapshot_preparation as protected
+from process.entity_address_retained_names import has_matching_live_address_generation, retained_address_name
 from process.mrf_address_publication import require_native_read_catalog_subjects
 from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_cms_registry_address_capture import NativeReceiptSession, _NativeMappings
@@ -397,11 +400,11 @@ async def _captured_descriptor(connection, session, physical, authority_oid, ori
 
 
 async def verify_network_address_artifact(connection, descriptor, *, runtime_roles):
-    """Verify only a descriptor extracted from an independently sealed candidate.
+    """Verify a descriptor from the caller's authenticated selected published candidate.
 
-    The caller must authenticate candidate custody before calling this function.
-    A descriptor's self-digest checks formatting; external JSON grants no authority.
-    Current singleton/alias generations may advance after that independent seal.
+    The self-digest checks formatting; untrusted external JSON grants no authority.
+    Named relations, schema, logical origin and native permissions govern reads.
+    Retained generations may outlive the current serving singleton.
     """
     from process import network_bootstrap_address_artifact as bootstrap
     from process import network_indexed_address_artifact as indexed
@@ -411,30 +414,186 @@ async def verify_network_address_artifact(connection, descriptor, *, runtime_rol
         return await bootstrap.verify_bootstrap_address_artifact(connection, descriptor, runtime_roles=runtime_roles)
     if descriptor["contract"] == indexed.CONTRACT:
         return await indexed.verify_indexed_address_artifact(connection, descriptor, runtime_roles=runtime_roles)
-    runtime_roles = _roles(runtime_roles)
+    _roles(runtime_roles)
     _require(connection.is_in_transaction(), "transaction_required")
-    _require(descriptor["runtime_roles"] == list(runtime_roles), "roles_changed")
-    _require(descriptor["database"] == await _database(connection), "database_changed")
-    physical = await _locked_table(connection, descriptor["namespace"]["name"], descriptor["table"]["oid"])
-    _require(
-        physical["schema_oid"] == descriptor["namespace"]["oid"]
-        and physical["schema_owner_oid"] == descriptor["namespace"]["owner_oid"]
-        and physical["relfilenode"] == descriptor["table"]["relfilenode"],
-        "physical_identity_changed",
-    )
+    physical = await _locked_named_address(connection, descriptor)
     authority_name = f'{_identifier(physical["schema_name"])}."{_AUTHORITY}"'
     await connection.execute(f"LOCK TABLE ONLY {authority_name} IN ACCESS SHARE MODE NOWAIT")
     session = _CatalogSession(connection)
-    owner_oid = await _custody(connection, session, physical, descriptor["authority_table_oid"], runtime_roles)
-    _require(owner_oid == descriptor["protected_owner_oid"], "protected_owner_changed")
+    authority_oid = await connection.fetchval("SELECT to_regclass($1)::oid", authority_name)
+    authority = await _physical(connection, authority_oid)
+    await _require_named_address_shapes(session, descriptor, physical, authority)
+    return CompactAddressRelation(physical["schema_name"], physical["relname"], physical["oid"])
+
+
+async def _locked_named_address(connection, descriptor):
+    """Use native name resolution and locks; old IDs supply only a legacy spelling."""
+    origin_by_field = {
+        field: descriptor["authority"][field] for field in ("origin_lineage_id", "origin_generation", "published_at")
+    }
+    names = (
+        retained_address_name(_TABLE, origin_by_field),
+        f"{_TABLE}_retained_{descriptor['table']['oid']:x}",
+        _TABLE,
+    )
+    schema = descriptor["namespace"]["name"]
+    selected = await _existing_address_name(connection, schema, names)
+    await connection.execute(
+        f"LOCK TABLE ONLY {_identifier(schema)}.{_identifier(selected)} IN ACCESS SHARE MODE NOWAIT"
+    )
+    # A publisher may have won before the first lock; retain its original rows by their new name.
+    resolved = await _existing_address_name(connection, schema, names)
+    if resolved != selected:
+        await connection.execute(
+            f"LOCK TABLE ONLY {_identifier(schema)}.{_identifier(resolved)} IN ACCESS SHARE MODE NOWAIT"
+        )
+    if resolved == _TABLE:
+        _require(
+            await has_matching_live_address_generation(connection, schema, resolved, origin_by_field),
+            "source_generation_changed",
+        )
+    oid = await connection.fetchval("SELECT to_regclass($1)::oid", _identifier(schema) + "." + _identifier(resolved))
+    physical = await _physical(connection, oid)
+    _require(physical is not None, "table_absent")
+    return {**physical, "schema_name": schema, "relname": resolved}
+
+
+async def _existing_address_name(connection, schema, names):
+    for name in names:
+        if await connection.fetchval(
+            "SELECT to_regclass($1) IS NOT NULL", _identifier(schema) + "." + _identifier(name)
+        ):
+            return name
+    raise NetworkAddressArtifactError("network_address_artifact_table_absent")
+
+
+async def _require_named_address_shapes(session, descriptor, physical, authority):
+    """Reuse the receipt's semantic schema hashes without its physical catalog inventory."""
+    from process import entity_address_snapshot_receipt as receipt
+
+    async with publication._catalog_search_path(session):
+        for label, logical, relation in (("address", _TABLE, physical), ("authority", _AUTHORITY, authority)):
+            _require(
+                relation is not None
+                and relation["relkind"] == "r"
+                and relation["relpersistence"] == "p"
+                and not any(
+                    relation[key]
+                    for key in ("relrowsecurity", "relforcerowsecurity", "relispartition", "rules", "inherited")
+                ),
+                "structural_catalog_changed",
+            )
+            expected = descriptor["catalog"][label]["shapes"]
+            _require(len(expected) == 1 and expected[0][0] == logical, "structural_catalog_changed")
+            actual = await receipt._schema_identity(
+                session,
+                relation["oid"],
+                physical["schema_name"],
+                logical,
+                names_by_stage={relation["relname"]: logical},
+            )
+            if actual != expected[0][2]:
+                actual = await _copied_address_shape(session, descriptor["catalog"][label], relation, logical)
+            _require(actual == expected[0][2], "structural_catalog_changed")
+
+
+def _legacy_address_positions(columns, recorded_columns):
+    """Translate only the old hash's positional encoding through exact column names."""
+    _require(type(recorded_columns) is list and bool(recorded_columns), "structural_catalog_changed")
     _require(
-        await _catalog(session, physical, await _physical(connection, descriptor["authority_table_oid"]))
-        == descriptor["catalog"],
+        all(
+            type(column) is dict and type(column.get("attname")) is str and "attnum" in column
+            for column in recorded_columns
+        ),
         "structural_catalog_changed",
     )
+    recorded_by_name = {column["attname"]: column["attnum"] for column in recorded_columns}
+    observed_by_name = {column["attname"]: column["attnum"] for column in columns}
     _require(
-        await protected._require_alias_authority(session, physical["schema_name"], owner_oid)
-        == descriptor["alias_catalog_sha256"],
-        "alias_catalog_changed",
+        len(recorded_by_name) == len(recorded_columns) == len(columns) == len(observed_by_name)
+        and recorded_by_name.keys() == observed_by_name.keys(),
+        "structural_catalog_changed",
     )
-    return CompactAddressRelation(physical["schema_name"], physical["relname"], physical["oid"])
+    for positions in (tuple(recorded_by_name.values()), tuple(observed_by_name.values())):
+        _require(
+            all(type(number) is int and number > 0 for number in positions) and len(set(positions)) == len(positions),
+            "structural_catalog_changed",
+        )
+    _require(
+        sorted(recorded_by_name, key=recorded_by_name.get) == sorted(observed_by_name, key=observed_by_name.get),
+        "structural_catalog_changed",
+    )
+    return {0: 0, **{observed_by_name[name]: number for name, number in recorded_by_name.items()}}
+
+
+async def _copied_address_shape(session, recorded_catalog, relation, logical):
+    """Check unchanged legacy metadata after copies compact dropped-column slots."""
+    from process import entity_address_snapshot_receipt as receipt
+    from process.network_cms_registry_address_equivalence import _numbers
+
+    _require(
+        type(recorded_catalog.get("columns")) is list and bool(recorded_catalog["columns"]),
+        "structural_catalog_changed",
+    )
+    columns = await receipt._catalog_columns(session, relation["oid"])
+    constraints = await receipt._catalog_constraints(session, relation["oid"], relation["schema_name"])
+    indexes = await receipt._catalog_indexes(session, relation["oid"])
+    legacy_by_position = _legacy_address_positions(columns, recorded_catalog.get("columns"))
+    for column in columns:
+        column["attnum"] = legacy_by_position[column["attnum"]]
+    for constraint in constraints:
+        _require(
+            constraint["referenced_table"] is None and constraint["referenced_columns"] is None,
+            "structural_catalog_changed",
+        )
+        _require(
+            all(
+                int(number) in legacy_by_position
+                for number in (constraint["key_columns"] or "").strip("{}").split(",")
+                if number
+            ),
+            "structural_catalog_changed",
+        )
+        constraint["key_columns"] = _numbers(constraint["key_columns"], legacy_by_position, array=True)
+    for index in indexes:
+        _require(
+            all(int(number) in legacy_by_position for number in index["keys"].split()), "structural_catalog_changed"
+        )
+        index["keys"] = _numbers(index["keys"], legacy_by_position)
+        for attribute in index["key_attributes"]:
+            _require(attribute["attribute_number"] in legacy_by_position, "structural_catalog_changed")
+            attribute["attribute_number"] = legacy_by_position[attribute["attribute_number"]]
+    columns.sort(key=lambda column: column["attnum"])
+    constraints.sort(key=lambda row: (str(row["contype"]), row["key_columns"] is None, row["key_columns"] or ""))
+    names_by_stage = {relation["relname"]: logical}
+    columns, constraints, indexes = (
+        receipt._normalized_catalog_names(entries, names_by_stage) for entries in (columns, constraints, indexes)
+    )
+    indexes.sort(key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":"), default=receipt._json_scalar))
+    receipt._reject_schema_qualified_expressions(relation["schema_name"], columns, constraints, indexes)
+    schema_by_field = {"table_name": logical, "columns": columns, "constraints": constraints, "indexes": indexes}
+    digest = receipt._canonical_digest(schema_by_field)
+    if digest == recorded_catalog["shapes"][0][2]:
+        return digest
+    # Old hashes retain their capture locale's constraint order. Keep C-compatible
+    # matches, then try the native order; other source locales still fail closed.
+    schema_by_field["constraints"] = await _native_constraint_order(session, constraints)
+    return receipt._canonical_digest(schema_by_field)
+
+
+async def _native_constraint_order(session, constraints):
+    """Restore the receipt query's native ordering without changing any schema field."""
+    from process import entity_address_snapshot_receipt as receipt
+
+    positions = (
+        await session.execute(
+            text(
+                "SELECT ordinal FROM pg_catalog.jsonb_array_elements(CAST(:constraints AS jsonb)) "
+                "WITH ORDINALITY AS entries(value,ordinal) "
+                "ORDER BY CAST(value->>'contype' AS pg_catalog.\"char\"), "
+                "value->>'key_columns',value->>'referenced_columns',value->>'referenced_table',ordinal"
+            ),
+            {"constraints": json.dumps(constraints, default=receipt._json_scalar)},
+        )
+    ).mappings()
+    return [constraints[position["ordinal"] - 1] for position in positions]

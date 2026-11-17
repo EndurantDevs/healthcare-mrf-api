@@ -27835,10 +27835,14 @@ async def test_import_resources_owner_cancel_stops_sibling_promptly(monkeypatch)
     sibling_started = asyncio.Event()
     sibling_cancelled = asyncio.Event()
     wait_forever = asyncio.Event()
+    owner_ready = asyncio.Event()
+    request_cancel = asyncio.Event()
 
     async def fake_fetch_resource_rows(source, _resource_type, **_kwargs):
         if source["source_id"] == "source_cancelled":
             await sibling_started.wait()
+            owner_ready.set()
+            await request_cancel.wait()
             raise importer.ImportCancelledError("owner cancelled run_1")
         sibling_started.set()
         try:
@@ -27850,11 +27854,16 @@ async def test_import_resources_owner_cancel_stops_sibling_promptly(monkeypatch)
     monkeypatch.setattr(importer, "_fetch_resource_rows", fake_fetch_resource_rows)
     monkeypatch.setattr(importer, "_upsert_rows", AsyncMock(return_value=0))
 
-    with pytest.raises(importer.ImportCancelledError, match="owner cancelled run_1"):
-        await asyncio.wait_for(
-            _import_location_source_groups(["source_cancelled", "source_sibling"]),
-            timeout=1,
-        )
+    import_task = asyncio.create_task(_import_location_source_groups(["source_cancelled", "source_sibling"]))
+    try:
+        # Bound cancellation after both workers are ready, separately from startup.
+        await asyncio.wait_for(owner_ready.wait(), timeout=10)
+        request_cancel.set()
+        with pytest.raises(importer.ImportCancelledError, match="owner cancelled run_1"):
+            await asyncio.wait_for(import_task, timeout=1)
+    finally:
+        import_task.cancel()
+        await asyncio.gather(import_task, return_exceptions=True)
 
     assert sibling_cancelled.is_set()
 

@@ -162,7 +162,7 @@ def test_handoff_decoder_requires_exact_attempt_and_complete_seven_table_identit
         handoff_by_field["handoff_sha256"] = publication._digest(
             {key: field_value for key, field_value in handoff_by_field.items() if key != "handoff_sha256"}
         )
-    if change:
+    if change not in {None, "digest"}:
         with pytest.raises(RuntimeError, match="address native publication"):
             publication.validate_entity_address_native_handoff(handoff_by_field)
     else:
@@ -187,7 +187,7 @@ def test_handoff_decoder_requires_exact_attempt_and_complete_seven_table_identit
         "alias",
     ],
 )
-def test_publication_decoder_keeps_generation_accounting_and_physical_catalog_bound(change):
+def test_publication_decoder_keeps_named_generation_and_data_bounds(change):
     receipt = _publication_receipt(_handoff())
     mutations_by_name = {
         "counter": lambda: receipt["result_generation"].update(local_generation=2),
@@ -206,10 +206,22 @@ def test_publication_decoder_keeps_generation_accounting_and_physical_catalog_bo
     if change:
         mutations_by_name[change]()
         receipt["validation_sha256"] = publication._digest(receipt["validation"])
+    if change not in {None, "oid_order", "inventory_file", "inventory_owner"}:
         with pytest.raises(RuntimeError, match="address native publication"):
             publication.validate_entity_address_native_publication(receipt)
     else:
         assert publication.validate_entity_address_native_publication(receipt) == receipt
+
+
+@pytest.mark.parametrize("published", [False, True])
+@pytest.mark.parametrize("observations", [None, ["copied"], {"legacy": "ignored"}])
+def test_native_authority_normalizes_legacy_observations_without_changing_source(published, observations):
+    handoff = _handoff()
+    authority = _publication_receipt(handoff)["result_generation"] if published else handoff["incumbent"]
+    authority["relation_oids"] = observations
+    before = deepcopy(authority)
+    assert publication._validate_authority(authority) == {**before, "relation_oids": None}
+    assert authority == before
 
 
 def _clone_session(events, equality_probes, failure):
@@ -413,10 +425,8 @@ def _cleanup_scalar(query, handoff_by_field, transactions, failure):
         return "synthetic"
     if "pg_current_xact_id" in query:
         return next(transactions)
-    if "relation_oids OPERATOR" in query:
-        return failure != "serving"
-    if "SELECT count(DISTINCT relation.relowner)" in query:
-        return failure != "owner"
+    if "FROM pg_inherits WHERE inhrelid" in query:
+        return failure != "attached"
     if "pg_index i JOIN pg_class idx" in query:
         return failure != "executable"
     if "obj_description" in query:
@@ -457,7 +467,10 @@ def _cleanup_session(handoff_by_field, run_by_field, failure, queries):
         return _cleanup_scalar(query, handoff_by_field, transactions, failure)
 
     return SimpleNamespace(
-        in_transaction=lambda: True, execute=AsyncMock(side_effect=execute), scalar=AsyncMock(side_effect=scalar)
+        in_transaction=lambda: True,
+        execute=AsyncMock(side_effect=execute),
+        scalar=AsyncMock(side_effect=scalar),
+        native_connection=object(),
     )
 
 
@@ -476,16 +489,31 @@ def _cleanup_session(handoff_by_field, run_by_field, failure, queries):
         "executable",
         "owner",
         "serving",
+        "attached",
+        "model",
         "late_reference",
         "transaction",
     ],
 )
-async def test_native_cleanup_rechecks_catalog_and_reference_guards_before_drop(failure):
+async def test_native_cleanup_rechecks_catalog_and_reference_guards_before_drop(monkeypatch, failure):
     handoff_by_field, queries = _handoff(), []
     abandonment = _abandonment(handoff_by_field)
+    from process import network_compact_retention as retention
+
+    async def references(_driver, names):
+        assert names == [("mrf", item["stage_name"]) for item in handoff_by_field["stage_relations"]]
+        if failure == "serving":
+            raise RuntimeError("address native publication candidate is referenced")
+
+    monkeypatch.setattr(retention, "require_named_address_artifacts_unreferenced", references)
+    model = AsyncMock(
+        side_effect=RuntimeError("address native publication model differs") if failure == "model" else None
+    )
+    monkeypatch.setattr(publication, "_require_model_catalog", model)
     session = _cleanup_session(handoff_by_field, _cleanup_run(handoff_by_field, abandonment, failure), failure, queries)
     unreferenced = AsyncMock(side_effect=[True, failure != "late_reference"])
-    if failure:
+    is_refused = failure not in {None, "database", "heap", "index", "owner"}
+    if is_refused:
         with pytest.raises(RuntimeError, match="address native publication"):
             await publication.cleanup_entity_address_native_handoff(
                 session,
@@ -507,7 +535,7 @@ async def test_native_cleanup_rechecks_catalog_and_reference_guards_before_drop(
     drops = [query for query in queries if query.startswith("DROP")]
     assert drops == (
         []
-        if failure
+        if is_refused
         else [
             "DROP TABLE "
             + ",".join(
@@ -789,7 +817,12 @@ async def test_dependency_binding_locks_then_rechecks_exact_physical_inputs(supp
         if query.startswith("LOCK TABLE"):
             return _result()
         assert "FROM pg_class WHERE oid=to_regclass(:name)" in query
-        assert args[0]["name"].startswith(('"mrf".', '"tiger".'))
+        selected = (
+            {(binding["schema_name"], binding["table_name"]) for binding in bindings_by_name.values()}
+            if supplied
+            else {(namespace or "mrf", table) for namespace, table in publication.projection._PROJECTION_DEPENDENCIES}
+        )
+        assert args[0]["name"] in {f'"{namespace}"."{table}"' for namespace, table in selected}
         return _result([{"relation_oid": len(queries), "relfilenode": 100 + len(queries)}])
 
     session = SimpleNamespace(execute=AsyncMock(side_effect=execute), scalar=AsyncMock(return_value=not changed))
@@ -800,7 +833,10 @@ async def test_dependency_binding_locks_then_rechecks_exact_physical_inputs(supp
         observed_by_name = await publication._dependency_bindings(session, "mrf", bindings_by_name)
         assert set(observed_by_name) == set(_example_bindings())
         if supplied:
-            assert observed_by_name == bindings_by_name
+            assert {
+                key: (binding["schema_name"], binding["table_name"]) for key, binding in observed_by_name.items()
+            } == {key: (binding["schema_name"], binding["table_name"]) for key, binding in bindings_by_name.items()}
+            assert observed_by_name != bindings_by_name
         else:
             for index, (namespace, table) in enumerate(publication.projection._PROJECTION_DEPENDENCIES, 1):
                 namespace = namespace or "mrf"
@@ -860,7 +896,7 @@ def _finalizing_run(handoff_by_field):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [None, "missing", "test", "finished", "phase", "handoff", "params", "database"])
-async def test_native_attempt_requires_finalizing_source_and_database_identity(failure):
+async def test_native_attempt_requires_finalizing_source_and_named_input(failure):
     handoff_by_field = _handoff()
     run_by_field = _finalizing_run(handoff_by_field)
     mutations_by_name = {
@@ -880,13 +916,39 @@ async def test_native_attempt_requires_finalizing_source_and_database_identity(f
             ]
         )
     )
-    if failure:
+    if failure not in {None, "database"}:
         with pytest.raises(RuntimeError, match="address native publication"):
             await publication._require_native_attempt(session, handoff_by_field)
     else:
         await publication._require_native_attempt(session, handoff_by_field)
     assert "FOR UPDATE" in str(session.execute.await_args_list[0].args[0])
-    assert session.execute.await_count == (2 if failure in {None, "database"} else 1)
+    assert session.execute.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("change", ["physical", "params", "dependency"])
+async def test_source_content_fence_ignores_copied_observations_but_keeps_original_input(legacy, change):
+    original = _handoff()
+    original["source_contract_sha256"] = publication._source_contract(original, {}, legacy_observations=legacy)
+    supplied = deepcopy(original)
+    for entry in supplied["dependency_bindings"].values():
+        entry["relation_oid"] += 5000
+        entry["relfilenode"] += 6000
+    supplied.update(database_oid=7000, import_run_oid=8000, handoff_sha256="unused-observation")
+    run = _finalizing_run(original)
+    if change == "params":
+        run["params"]["original_source_limit"] = 2
+    elif change == "dependency":
+        next(iter(supplied["dependency_bindings"].values()))["schema_name"] = "other_input"
+    session = SimpleNamespace(execute=AsyncMock(return_value=_result([run])))
+    if change == "physical":
+        await publication._require_native_attempt(session, supplied)
+        assert publication._source_contract(original, {}) == publication._source_contract(supplied, {})
+    else:
+        with pytest.raises(RuntimeError, match="handoff changed|source contract changed"):
+            await publication._require_native_attempt(session, supplied)
+    assert session.execute.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -917,7 +979,7 @@ async def test_durable_outcome_requires_exact_receipt_and_successful_source_atte
         mutations_by_name[failure]()
     session = SimpleNamespace(execute=AsyncMock(return_value=_result([] if failure == "missing" else [run_by_field])))
     if failure not in {None, "missing"}:
-        with pytest.raises(RuntimeError, match="recorded"):
+        with pytest.raises(RuntimeError, match="recorded|handoff differs"):
             await publication.read_entity_address_native_publication(session, handoff_by_field)
     else:
         assert await publication.read_entity_address_native_publication(session, handoff_by_field) == (
@@ -963,8 +1025,8 @@ def test_retirement_owner_rejects_substituted_publication(fault):
     mutations_by_name = {
         "fields": lambda: proof.update(foreign=True),
         "contract": lambda: proof.update(contract="unsupported"),
-        "inventory": lambda: proof["relations"][0].update(relation_oid=999),
-        "alias": lambda: proof["alias_authority"].update(schema_oid=999),
+        "inventory": lambda: proof["relations"][0].update(table_name="unrelated"),
+        "alias": lambda: proof["alias_authority"].update(schema_name="unrelated"),
     }
     if fault in mutations_by_name:
         mutations_by_name[fault]()
@@ -1011,7 +1073,6 @@ def _retired_catalog(owner, proof):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("relowner", 99),
         ("relkind", "v"),
         ("relpersistence", "u"),
         ("relrowsecurity", True),
@@ -1019,7 +1080,6 @@ def _retired_catalog(owner, proof):
         ("inherited", True),
         ("nspname", "foreign"),
         ("relname", "entity_address_unified"),
-        ("oid", 99),
         (None, None),
     ],
 )
@@ -1031,16 +1091,23 @@ def test_retired_catalog_rejects_serving_or_foreign_heap(field, value):
     else:
         rows[0][field] = value
     with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="catalog differs|serving or substituted"):
-        ownership._require_retained_catalog(rows, 52, owner, "mrf", proof["relations"])
+        ownership._require_retained_catalog(rows, _retired_names(owner, proof))
+
+
+def _retired_names(owner, proof):
+    return ownership._publication_retained_names("mrf", proof["relations"], proof) + [
+        (owner.schema_name, preparation.alias.AUTHORITY_TABLE)
+    ]
 
 
 def test_retired_catalog_accepts_only_exact_retained_names():
     owner, proof = _retirement_proof()
     rows = _retired_catalog(owner, proof)
-    ownership._require_retained_catalog(rows, 52, owner, "mrf", proof["relations"])
+    rows[0].update(oid=999, relowner=999)
+    ownership._require_retained_catalog(rows, _retired_names(owner, proof))
     rows[-1]["nspname"] = "mrf"
-    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="serving or substituted"):
-        ownership._require_retained_catalog(rows, 52, owner, "mrf", proof["relations"])
+    with pytest.raises(ownership.EntityAddressArchiveOwnershipError, match="catalog differs"):
+        ownership._require_retained_catalog(rows, _retired_names(owner, proof))
 
 
 def _retirement_session(owner, rows, queries, fault):
@@ -1051,7 +1118,7 @@ def _retirement_session(owner, rows, queries, fault):
         queries.append(query)
         if query.startswith("SELECT owner.oid AS owner_oid"):
             return _guard_result([{"owner_oid": 52, "owner_safe": True, "caller_safe": True}])
-        if query.startswith("SELECT c.oid,n.nspname"):
+        if query.startswith("SELECT requested.schema_name AS nspname"):
             catalog_observations.append(query)
             return _guard_result(rows if len(catalog_observations) == 1 or fault != "catalog" else [])
         if query.startswith("SELECT relation.oid"):
@@ -1071,18 +1138,18 @@ def _retirement_session(owner, rows, queries, fault):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["early_pin", "late_pin", "catalog", "namespace", "table_drop", "schema_drop"])
+@pytest.mark.parametrize("fault", ["early_pin", "late_pin", "catalog", "table_drop", "schema_drop"])
 async def test_retirement_failure_preserves_exact_cleanup_fences(fault, monkeypatch):
     from process import network_cms_registry_address_capture as capture
     from process import network_compact_retention as retention
 
     monkeypatch.setattr(capture, "native_driver", AsyncMock(return_value=object()))
-    monkeypatch.setattr(retention, "require_network_compact_artifacts_unreferenced", AsyncMock(return_value=True))
+    monkeypatch.setattr(retention, "require_named_address_artifacts_unreferenced", AsyncMock(return_value=True))
     owner, proof = _retirement_proof()
     queries = []
     session = _retirement_session(owner, _retired_catalog(owner, proof), queries, fault)
     unreferenced = AsyncMock(side_effect=[fault != "early_pin", fault != "late_pin"])
-    with pytest.raises(RuntimeError, match="referenced|catalog changed|namespace changed|drop failed"):
+    with pytest.raises(RuntimeError, match="referenced|catalog differs|drop failed"):
         await ownership.cleanup_entity_address_archive_publication(
             session, owner=owner, publication=proof, assert_unreferenced=unreferenced
         )
@@ -1105,29 +1172,81 @@ async def test_retirement_requires_a_reference_probe():
         await ownership.cleanup_entity_address_archive_publication(
             session, owner=owner, publication=proof, assert_unreferenced=None
         )
-    assert len(queries) == 1 and queries[0].startswith("SELECT owner.oid AS owner_oid")
+    assert queries == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", ["inventory", "oid", "legacy"])
-async def test_protected_cutover_refuses_inventory_and_oid_drift(monkeypatch, fault):
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "observations",
+        "inventory",
+        "null_inventory",
+        "list_inventory",
+        "wrong_inventory",
+        "extra_inventory",
+        "layout",
+        "generation",
+        "legacy",
+        "locations",
+    ],
+)
+async def test_protected_cutover_uses_named_layout_and_preserves_original_refusals(monkeypatch, fault):
     stage = SimpleNamespace(__tablename__="entity_address_unified_synthetic")
     swap = SimpleNamespace(stage_cls=stage, live_cls=SimpleNamespace(__main_table__="entity_address_unified"))
-    context_by_field = {
-        "snapshot_contract": source.CONTRACT,
-        "protected_stage_oids": {stage.__tablename__: 41},
+    context_by_field = {"snapshot_contract": source.CONTRACT}
+    inventory_by_fault = {
+        "observations": {stage.__tablename__: "unused old observation"},
+        "inventory": {},
+        "null_inventory": None,
+        "list_inventory": [],
+        "wrong_inventory": {"other": 42},
+        "extra_inventory": {stage.__tablename__: 42, "other": 43},
     }
-    if fault == "inventory":
-        context_by_field["protected_stage_oids"] = {}
-    if fault == "legacy":
+    if fault in inventory_by_fault:
+        context_by_field["protected_stage_oids"] = inventory_by_fault[fault]
+    elif fault in {"legacy", "locations"}:
         context_by_field.clear()
-    scalar = AsyncMock(return_value=True if fault == "legacy" else 99)
+    elif fault == "generation":
+        context_by_field.update(result_generation_mode="adoption", source_serving_generation={"original": "generation"})
+    scalar = AsyncMock(
+        side_effect=[True, fault != "locations", True] if fault in {"legacy", "locations"} else None,
+        return_value=0 if fault == "layout" else 1,
+    )
     monkeypatch.setattr(adoption.entity_address_unified.db, "scalar", scalar)
+    original_error = RuntimeError("original retained generation refusal")
+    adoption_guard = AsyncMock(side_effect=original_error)
+    monkeypatch.setattr(adoption, "_require_adoptable_generation", adoption_guard)
     before = deepcopy(context_by_field)
-    with pytest.raises(RuntimeError, match="inventory differs|OID differs|legacy address rotation"):
+    if fault not in {None, "observations"}:
+        with pytest.raises(
+            RuntimeError,
+            match="inventory differs|layout differs|legacy address rotation|"
+            "location catalog is missing|original retained generation",
+        ) as raised:
+            await adoption._require_protected_cutover("mrf", [swap], context_by_field)
+        assert context_by_field == before
+        if fault == "generation":
+            assert raised.value is original_error
+            adoption_guard.assert_awaited_once_with("mrf", [swap], {"original": "generation"})
+    else:
         await adoption._require_protected_cutover("mrf", [swap], context_by_field)
-    assert context_by_field == before
-    assert scalar.await_count == int(fault != "inventory")
+        assert context_by_field == before | {"retained_relations": []}
+    assert scalar.await_count == (
+        {
+            "inventory": 0,
+            "null_inventory": 0,
+            "list_inventory": 0,
+            "wrong_inventory": 0,
+            "extra_inventory": 0,
+            "legacy": 3,
+            "locations": 2,
+        }.get(fault, 1)
+    )
+    if fault in {None, "observations", "layout", "generation"}:
+        assert scalar.await_args.kwargs["names"] == [stage.__tablename__]
+        assert "relowner" not in scalar.await_args.args[0] and "::oid" not in scalar.await_args.args[0]
 
 
 @asynccontextmanager
@@ -1140,23 +1259,48 @@ async def _observed_transaction(session, events):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("partial", [False, True])
-async def test_protected_reimport_requires_full_publisher_custody(monkeypatch, partial):
-    events, context = [], {"retained": "unchanged"}
-    session = SimpleNamespace(
-        in_transaction=lambda: True,
-        execute=AsyncMock(return_value=_guard_result([{"owner_oid": 52, "owner_safe": True, "caller_safe": False}])),
-    )
+@pytest.mark.parametrize(
+    "mode", ["ordinary", "partial", "generationless", "generationless_partial", "marked", "controlled"]
+)
+async def test_ordinary_rotation_uses_locked_scope_without_seven_stage_preparation(monkeypatch, mode):
+    from process import network_compact_retention as retention
+    from process.provider_directory_serving_recovery import GENERATION_PARAM
+
+    context_by_field = {"retained": "unchanged"}
+    if mode == "marked":
+        context_by_field[GENERATION_PARAM] = "existing recovery"
+    if mode == "controlled":
+        context_by_field["snapshot_contract"] = source.CONTRACT
+    before = deepcopy(context_by_field)
+    session = SimpleNamespace(native_connection=object())
     database = adoption.entity_address_unified.db
-    monkeypatch.setattr(database, "scalar", AsyncMock(return_value=52))
-    monkeypatch.setattr(database, "transaction", lambda: _observed_transaction(session, events))
-    stage = SimpleNamespace(__tablename__="entity_address_unified_synthetic")
-    reason = "full isolated replacement" if partial else "publisher is unavailable"
-    with pytest.raises(RuntimeError, match=reason):
-        await adoption._prepare_protected_ordinary_rotation("mrf", stage, partial, context)
-    assert context == {"retained": "unchanged"}
-    assert events == ([] if partial else ["entered", "exited"])
-    assert session.execute.await_count == int(not partial)
+    classifier = AsyncMock(side_effect=AssertionError("owner classification must not run"))
+    monkeypatch.setattr(database, "scalar", classifier)
+    monkeypatch.setattr(database, "_transaction_binding", lambda: SimpleNamespace(session=session))
+    generation = None if mode.startswith("generationless") else {"logical": "generation"}
+    capture = AsyncMock(return_value=generation)
+    monkeypatch.setattr(adoption, "_retained_serving_generation", capture)
+    references = AsyncMock()
+    monkeypatch.setattr(retention, "require_named_address_artifacts_unreferenced", references)
+    prepare = AsyncMock(side_effect=AssertionError("ordinary scope must not request seven stages"))
+    monkeypatch.setattr(adoption, "prepare_entity_address_publisher_reimport", prepare)
+    swaps = [SimpleNamespace(live_cls=SimpleNamespace(__main_table__="entity_address_unified"))]
+    if mode in {"partial", "generationless_partial"}:
+        with pytest.raises(RuntimeError, match="full isolated replacement"):
+            await adoption._prepare_protected_ordinary_rotation("mrf", swaps, True, context_by_field)
+    else:
+        assert await adoption._prepare_protected_ordinary_rotation("mrf", swaps, False, context_by_field) == generation
+    if mode in {"generationless", "marked"}:
+        references.assert_awaited_once_with(
+            session.native_connection,
+            [("mrf", "entity_address_unified"), ("mrf", "entity_address_unified_old")],
+        )
+    else:
+        references.assert_not_awaited()
+    capture.assert_awaited_once_with(session, "mrf")
+    prepare.assert_not_awaited()
+    assert context_by_field == before
+    classifier.assert_not_awaited()
 
 
 def _sealed_guard_session(queries):
@@ -1180,13 +1324,19 @@ def _sealed_guard_session(queries):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["transaction", "stage", "collision", "rename"])
 async def test_sealed_rotation_failure_never_overwrites_predecessor(monkeypatch, fault):
+    from process import entity_address_publication_permissions as permissions
+
+    monkeypatch.setattr(permissions, "retention_role", AsyncMock(return_value='"synthetic_retention"'))
+    monkeypatch.setattr(permissions, "preserve_reader_access", AsyncMock())
+    monkeypatch.setattr(permissions, "seal_relation", AsyncMock())
     queries = []
     session = _sealed_guard_session(queries)
     database = adoption.entity_address_unified.db
     binding = None if fault == "transaction" else SimpleNamespace(session=session)
+    monkeypatch.setattr(adoption, "_retained_serving_generation", AsyncMock(return_value=None))
     monkeypatch.setattr(database, "_transaction_binding", lambda: binding)
-    values = [None if fault == "rename" else 41, None if fault == "stage" else 42, 99]
-    scalar = AsyncMock(side_effect=values)
+    scalar_values = [None if fault == "rename" else 41, None if fault == "stage" else 42, 99]
+    scalar = AsyncMock(side_effect=scalar_values)
     status = AsyncMock(side_effect=RuntimeError("synthetic rename failed"))
     monkeypatch.setattr(database, "scalar", scalar)
     monkeypatch.setattr(database, "status", status)

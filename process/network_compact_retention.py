@@ -2,11 +2,13 @@
 """Keep physical dependencies retained by independently sealed compact candidates."""
 
 import json
+import re
 from collections.abc import Mapping
 from uuid import UUID
 
 from db.registry_schema import registry_schema
 from process import network_candidate_custody as custody
+from process.entity_address_retained_names import retained_address_name
 from process.network_address_artifact import _descriptor
 from process.network_address_projection import PinnedAddressSource, _identifier
 from process.network_bootstrap_address_artifact import CONTRACT as BOOTSTRAP_ARTIFACT_CONTRACT
@@ -21,6 +23,145 @@ _JSON_FIELDS = ("source_generations", "source_recipes_json", "validation_json")
 
 class NetworkCompactRetentionError(RuntimeError):
     """Compact dependency authority is present, inconsistent or still referenced."""
+
+
+async def require_named_address_artifacts_unreferenced(connection, relations, *, control_schema=None):
+    """Keep named address generations referenced by prepared or published networks."""
+    requested_names = set(relations)
+    _require(connection.is_in_transaction() and bool(requested_names), "transaction_required")
+    for schema, name in requested_names:
+        _identifier(schema)
+        _identifier(name)
+    namespace = _identifier(registry_schema() if control_schema is None else control_schema)
+    tables = [namespace + "." + _identifier(name) for name in _TABLES[:2]]
+    present_tables = [await connection.fetchval("SELECT to_regclass($1) IS NOT NULL", name) for name in tables]
+    if not any(present_tables):
+        return
+    _require(all(present_tables), "controls_incomplete")
+    _require(await connection.fetchval("SHOW transaction_isolation") == "read committed", "fresh_snapshot_required")
+    await connection.execute("LOCK TABLE " + ",".join(tables) + " IN ACCESS SHARE MODE NOWAIT")
+    ledger = namespace + ".network_candidate_custody"
+    retained = (
+        f" OR EXISTS(SELECT FROM {ledger} retained WHERE retained.candidate_id=c.candidate_id)"
+        if await connection.fetchval("SELECT to_regclass($1) IS NOT NULL", ledger)
+        else ""
+    )
+    after = None
+    while True:
+        reference_rows = await connection.fetch(
+            f"SELECT c.candidate_id,c.state,CASE WHEN octet_length(c.validation_json::text)<=$3 "
+            f"THEN c.validation_json::text END AS validation FROM {tables[0]} c "
+            f"WHERE (c.validation_json ? 'address_source' OR c.state IN ('ready','published') "
+            f"OR EXISTS(SELECT FROM {tables[1]} m WHERE m.candidate_id=c.candidate_id){retained}) "
+            "AND ($1::uuid IS NULL OR c.candidate_id>$1) "
+            "AND (c.validation_json->'address_source'->>'schema_name'=ANY($2::text[]) "
+            "OR jsonb_typeof(c.validation_json->'address_source'->'schema_name') IS DISTINCT FROM 'string') "
+            "ORDER BY c.candidate_id LIMIT 16",
+            after,
+            sorted({schema for schema, _ in requested_names}),
+            custody.MAX_RECEIPT_BYTES,
+        )
+        if not reference_rows:
+            return
+        for reference_row in reference_rows:
+            report = _json_object(reference_row["validation"])
+            _require(type(report) is dict, "address_reference_invalid")
+            references = _named_address_references(report, candidate_state=reference_row["state"])
+            _require(not requested_names.intersection(references), "artifact_referenced")
+        after = reference_rows[-1]["candidate_id"]
+
+
+def _named_address_references(report, *, candidate_state=None):
+    """Recognize the named dependencies of either supported publication layout."""
+    try:
+        address_source = PinnedAddressSource(**report["address_source"])
+        if candidate_state in ("validated", "ready") and "serving_readiness" not in report:
+            return _intermediate_address_references(report, address_source, candidate_state)
+        serving = report["serving_readiness"]
+        _require(type(serving) is dict, "address_reference_invalid")
+        if serving.get("component") == "unified_address_serving":
+            _require_noncompact_address_reference(report, serving, address_source)
+            return {(address_source.schema_name, address_source.table_name)}
+        _require(
+            serving.get("component") == COMPONENT and address_source.table_name == "entity_address_unified",
+            "address_reference_invalid",
+        )
+        artifact = _descriptor(serving["address_artifact"])
+        _require(
+            artifact["namespace"]["name"] == address_source.schema_name
+            and artifact["generation_id"] == address_source.generation_id,
+            "address_reference_invalid",
+        )
+        names = {address_source.table_name, f"{address_source.table_name}_retained_{artifact['table']['oid']:x}"}
+        if artifact["contract"] == "network_address_artifact.postgres.v1":
+            origin_by_field = {
+                field: artifact["authority"][field]
+                for field in ("origin_lineage_id", "origin_generation", "published_at")
+            }
+            names.add(retained_address_name(address_source.table_name, origin_by_field))
+        return {(address_source.schema_name, name) for name in names}
+    except KeyError, TypeError, ValueError:
+        raise NetworkCompactRetentionError("network_compact_retention_address_reference_invalid") from None
+
+
+def _intermediate_address_references(report, source, state):
+    """Keep the pinned input while canonical preparation has not issued serving readiness."""
+    _require(
+        report.get("valid") is True
+        and type(report.get("validation_revision")) is int
+        and report["validation_revision"] == 1
+        and type(report.get("source_generations")) is dict
+        and report["source_generations"].get("unified_address") == source.generation_id,
+        "address_reference_invalid",
+    )
+    canonical = report.get("candidate_readiness")
+    if state == "ready":
+        scope = canonical.get("scope") if type(canonical) is dict else None
+        _require(
+            type(canonical) is dict
+            and canonical.get("component") == "canonical_address_projection"
+            and canonical.get("ready") is True
+            and type(canonical.get("readiness_revision")) is int
+            and canonical["readiness_revision"] == 1
+            and type(scope) is dict
+            and scope.get("address_source") == report["address_source"]
+            and scope.get("source_generations") == report["source_generations"],
+            "address_reference_invalid",
+        )
+    return {(source.schema_name, source.table_name)}
+
+
+def _require_noncompact_address_reference(report, serving, address_source):
+    """A full copied projection retains its exact source, without a compact artifact."""
+    canonical = report.get("candidate_readiness")
+    scope = serving.get("scope")
+    _require(
+        type(canonical) is dict
+        and canonical.get("component") == "canonical_address_projection"
+        and type(scope) is dict
+        and canonical.get("scope") == scope
+        and scope.get("address_source") == report["address_source"]
+        and type(scope.get("source_generations")) is dict
+        and scope["source_generations"].get("unified_address") == address_source.generation_id
+        and report.get("source_generations") == scope["source_generations"]
+        and type(report.get("validation_revision")) is int
+        and report["validation_revision"] == 1
+        and report.get("valid") is True
+        and serving.get("index_profile") == "serving"
+        and type(serving.get("index_definition_sha256")) is str
+        and re.fullmatch(r"[0-9a-f]{64}", serving["index_definition_sha256"]) is not None
+        and "address_artifact" not in serving,
+        "address_reference_invalid",
+    )
+    _require(
+        all(
+            type(readiness.get("readiness_revision")) is int
+            and readiness["readiness_revision"] == 1
+            and readiness.get("ready") is True
+            for readiness in (canonical, serving)
+        ),
+        "address_reference_invalid",
+    )
 
 
 def _require(condition, reason):

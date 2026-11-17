@@ -11,6 +11,7 @@ import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import MetaData, text
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from db.connection import Database, db
@@ -330,10 +331,25 @@ async def _activate(resources, stored, proof, incumbent, events, *, fail_after_p
     return publication_validation
 
 
+async def _guard_owner_change_is_not_admission(resources, proof, statement):
+    """Change only the function owner, validate its semantics, then restore the fixture."""
+    async with resources.publisher.transaction() as session:
+        savepoint = await session.begin_nested()
+        try:
+            await session.execute(text(statement))
+            assert await session.scalar(
+                text("SELECT pg_get_userbyid(proowner)=:owner FROM pg_proc WHERE oid=to_regprocedure(:function)"),
+                {"owner": resources.roles["writer"], "function": f'"{_SCHEMA}".cms_serving_address_transition()'},
+            )
+            await preparation._lock_publication_state(session, _SCHEMA, proof["frozen_owner_oid"])
+        finally:
+            await savepoint.rollback()
+
+
 async def _guard_refusals(resources, proof):
     schema = f'"{_SCHEMA}"'
     cases = (
-        (f'ALTER FUNCTION {schema}.cms_serving_address_transition() OWNER TO "{resources.roles["writer"]}"', "guards"),
+        (f'ALTER FUNCTION {schema}.cms_serving_address_transition() OWNER TO "{resources.roles["writer"]}"', None),
         (
             f"CREATE OR REPLACE FUNCTION {schema}.cms_serving_no_truncate() RETURNS trigger LANGUAGE plpgsql "
             "SET search_path=pg_catalog AS $$ BEGIN RETURN NULL; END $$",
@@ -350,6 +366,9 @@ async def _guard_refusals(resources, proof):
         ),
     )
     for statement, message in cases:
+        if message is None:
+            await _guard_owner_change_is_not_admission(resources, proof, statement)
+            continue
         with pytest.raises(preparation.EntityAddressSnapshotDestinationError, match=message):
             async with resources.publisher.transaction() as session:
                 await session.execute(text(statement))
@@ -438,7 +457,28 @@ async def migrated_head_sealed_activation(monkeypatch):
                 table,
             )
             assert (catalog["oid"], catalog["relowner"]) == (oid, proof["builder_oid"])
+            await _require_published_writes_refused(resources, table)
         authority = await resources.admin.fetchrow(f'SELECT * FROM "{_SCHEMA}".entity_address_result_generation')
         assert authority["local_generation"] == 0
         assert authority["origin_generation"] == 27
         assert str(authority["origin_lineage_id"]) == fixture._source_serving_generation()["origin_lineage_id"]
+
+
+async def _require_published_writes_refused(resources, table):
+    """The ordinary owner keeps future DDL authority but has no published row writes."""
+    relation = f'"{_SCHEMA}"."{table}"'
+    column = await resources.admin.fetchval(
+        "SELECT quote_ident(attname) FROM pg_attribute WHERE attrelid=to_regclass($1) AND attnum>0 "
+        "AND NOT attisdropped ORDER BY attnum LIMIT 1",
+        relation,
+    )
+    for statement in (
+        f"INSERT INTO {relation} SELECT * FROM {relation} WHERE false",
+        f"UPDATE {relation} SET {column}={column} WHERE false",
+        f"DELETE FROM {relation} WHERE false",
+        f"TRUNCATE {relation}",
+    ):
+        async with db.session_factory() as session, session.begin():
+            with pytest.raises(ProgrammingError) as denied:
+                await session.execute(text(statement))
+            assert denied.value.orig.sqlstate == "42501"

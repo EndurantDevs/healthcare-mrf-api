@@ -7,14 +7,6 @@ from dataclasses import dataclass
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.code_catalog_snapshot import _relation_access
 
-_INHERITED_OWNER_USAGE_SQL = """WITH RECURSIVE inherited(oid) AS (
- SELECT current_user::regrole::oid UNION
- SELECT membership.roleid FROM pg_catalog.pg_auth_members membership
- JOIN inherited ON membership.member=inherited.oid WHERE membership.inherit_option)
- SELECT current_setting('transaction_isolation')='read committed'
- AND pg_catalog.pg_has_role(current_user,$1::oid,'USAGE')
- AND EXISTS(SELECT FROM inherited WHERE oid=$1::oid)"""
-
 
 async def preserve_artifact_read_access(capability, stages):
     """Replay only existing SELECT under the genuine owner's complete native locks."""
@@ -81,8 +73,8 @@ class _OrdinaryReadAccess:
 
 
 async def _ordinary_access(database, schema, live_table, stage_table, *, exclusive=False):
-    """Capture plain same-owner heaps only under the caller's native publication locks."""
-    from process.native_publication_read_access import _RELATIONS_SQL
+    """Capture finite SELECT scope under the caller's native publication locks."""
+    from process.native_publication_read_access import _RELATIONS_SQL, _named_layout
     from process.provider_directory_output_snapshot_catalog import encoded
     from process.provider_directory_serving_recovery_receipts import ordinary
 
@@ -95,19 +87,16 @@ async def _ordinary_access(database, schema, live_table, stage_table, *, exclusi
     by_name = {entry["name"]: entry for entry in relations}
     if len(relations) != 2 or set(by_name) != {live_table, stage_table} or by_name[stage_table]["oid"] is None:
         raise RuntimeError("ordinary_address_read_access_relations_changed")
-    owner = by_name[stage_table]["relowner"]
     for entry in relations:
         if entry["oid"] is not None and (
-            entry["relowner"] != owner
-            or entry["relkind"] != "r"
+            entry["relkind"] != "r"
             or entry["relpersistence"] != "p"
             or entry["relrowsecurity"]
             or entry["relforcerowsecurity"]
+            or entry.get("relispartition", False)
+            or entry.get("inherited", False)
         ):
-            raise RuntimeError("ordinary_address_read_access_owner_changed")
-    if any(entry["oid"] is not None and not entry["owned"] for entry in relations):
-        if await driver.fetchval(_INHERITED_OWNER_USAGE_SQL, owner) is not True:
-            raise RuntimeError("ordinary_address_read_access_owner_changed")
+            raise RuntimeError("ordinary_address_read_access_unsupported_relation")
     oids = [entry["oid"] for entry in relations if entry["oid"] is not None]
     modes = ["AccessExclusiveLock"] if exclusive else ["ShareLock", "AccessExclusiveLock"]
     count = await driver.fetchval(
@@ -118,9 +107,43 @@ async def _ordinary_access(database, schema, live_table, stage_table, *, exclusi
     )
     if count != len(oids):
         raise RuntimeError("ordinary_address_read_access_locks_required")
-    incumbent = await _relation_access(session, by_name[live_table]["oid"]) if by_name[live_table]["oid"] else None
-    successor = await _relation_access(session, by_name[stage_table]["oid"])
-    return session, driver, encoded(actor), encoded(relations), incumbent, successor
+    incumbent = (
+        await _ordinary_select_access(driver, by_name[live_table]["oid"]) if by_name[live_table]["oid"] else None
+    )
+    successor = await _ordinary_select_access(driver, by_name[stage_table]["oid"])
+    transaction_by_field = {key: actor_field for key, actor_field in actor.items() if key in {"backend", "xid"}}
+    return session, driver, encoded(transaction_by_field), encoded(_named_layout(relations)), incumbent, successor
+
+
+async def _ordinary_select_access(driver, relation_oid):
+    from process.code_catalog_snapshot import _AccessGrant, _RelationAccess
+    from process.native_publication_read_access import _READS_SQL
+
+    grants = []
+    for entry in await driver.fetch(_READS_SQL, relation_oid):
+        if entry["privilege_type"] != "SELECT":
+            continue
+        principal = None if entry["grantee"] == 0 else entry["rolname"]
+        if principal is not None:
+            storage_identifier(principal)
+        elif entry["grantee"] != 0:
+            raise RuntimeError("ordinary_address_read_access_grant_changed")
+        column = entry["column_name"]
+        if column is not None:
+            storage_identifier(column)
+        grants.append(_AccessGrant(column, principal, "SELECT", bool(entry["is_grantable"]), ""))
+    return _RelationAccess("", tuple(grants))
+
+
+def _select_scope(*accesses):
+    """Keep named reads and their grant options, without owner or grantor admission."""
+    grants_by_principal = {}
+    for access in accesses:
+        for grant in () if access is None else access.grants:
+            if grant.privilege_type == "SELECT":
+                key = grant.column_name, grant.grantee_name
+                grants_by_principal[key] = grants_by_principal.get(key, False) or grant.is_grantable
+    return frozenset((*key, grantable) for key, grantable in grants_by_principal.items())
 
 
 async def prepare_ordinary_read_access(database, schema, swaps):
@@ -145,25 +168,14 @@ async def _prepare_read_relations(database, schema, relation_pairs):
     proofs = []
     for live, stage in relation_pairs:
         session, driver, actor, relations, incumbent, successor = await _ordinary_access(database, schema, live, stage)
-        if any(grant.grantee_name != successor.owner_name for grant in successor.grants):
-            raise RuntimeError("ordinary_address_read_access_stage_not_private")
         if incumbent is not None:
             await _replay_select(driver, schema, stage, incumbent)
         after = await _ordinary_access(database, schema, live, stage)
-        expected_grants = (
-            set(successor.grants)
-            | {
-                grant
-                for grant in incumbent.grants
-                if grant.privilege_type == "SELECT" and grant.grantee_name != incumbent.owner_name
-            }
-            if incumbent is not None
-            else set(successor.grants)
-        )
+        expected_grants = _select_scope(successor, incumbent)
         if (
             after[:4] != (session, driver, actor, relations)
-            or after[4] != incumbent
-            or set(after[5].grants) != expected_grants
+            or _select_scope(after[4]) != _select_scope(incumbent)
+            or _select_scope(after[5]) != expected_grants
         ):
             raise RuntimeError("ordinary_address_read_access_grants_changed")
         proofs.append(
@@ -175,7 +187,7 @@ async def _prepare_read_relations(database, schema, relation_pairs):
 
 
 async def recheck_ordinary_read_access(database, proofs):
-    """Check exact reads and physical writer again under final AccessExclusive locks."""
+    """Check selected reads and original transaction again under final native locks."""
     for proof in proofs:
         if type(proof) is not _OrdinaryReadAccess or proof.task is not asyncio.current_task():
             raise RuntimeError("ordinary_address_read_access_writer_changed")
@@ -186,7 +198,7 @@ async def recheck_ordinary_read_access(database, proofs):
             session is not proof.session
             or actor != proof.actor_json
             or relations != proof.relations_json
-            or incumbent != proof.incumbent
-            or successor != proof.successor
+            or _select_scope(incumbent) != _select_scope(proof.incumbent)
+            or _select_scope(successor) != _select_scope(proof.successor)
         ):
             raise RuntimeError("ordinary_address_read_access_grants_changed")

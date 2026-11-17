@@ -96,7 +96,7 @@ async def _verified_layout(connection, candidate, base, control_schema):
         closure["relation_oids"].get("network_slice_ref") == canonical["ref_map_oid"]
         and closure["relation_oids"].get("network_office_edge") == canonical["edge_heap_oid"]
     )
-    _require(base.table_oid == serving["address_artifact"]["table"]["oid"])
+    _require(base.schema_name == report["address_source"]["schema_name"])
     artifacts = []
     for expected in serving["edge_artifacts"]:
         _require(

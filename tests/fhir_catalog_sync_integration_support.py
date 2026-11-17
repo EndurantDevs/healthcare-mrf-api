@@ -38,6 +38,7 @@ from process.registry_fhir_catalog_worker import RegistryFHIRCatalogSyncConfig
 from process.registry_publication_consumer import RegistryPublicationConsumerConfig
 from tests import cms_npd_admission_postgres_support as imported
 from tests import cms_registry_complete_publication_postgres_support as native
+from tests.fhir_catalog_source_control_read_support import _grant_source_retention_control_reads
 from tests.test_network_cms_registry_complete_publication_postgres import (
     SUCCESSOR_LEASE_SECONDS,
     _paired_native_execution,
@@ -376,6 +377,7 @@ async def _grant_metadata_source_reads(case, roles_by_kind):
         case.worker.roles_by_kind["api"],
     ):
         await connection.execute(f'GRANT "{case.fixture.roles["reader"]}" TO "{role}" WITH INHERIT TRUE, SET FALSE')
+    await _grant_source_retention_control_reads(case)
 
 
 async def _configure_metadata_runtime(case, roles_by_kind):

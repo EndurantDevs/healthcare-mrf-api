@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Native copied metadata and attached directory reads through the public API contract."""
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -182,4 +183,98 @@ async def assert_copied_fhir_view(held, monkeypatch):
             assert json.loads(raw) == snapshot["custody_json"]
             await _native_refusals(held, metadata, snapshot)
             assert await _response(held) == before
+        assert await _response(held) == before
+
+
+@asynccontextmanager
+async def _address_rotation(held):
+    connection, base = held.fixture.connection, held.retained.compact_layout.base
+    live = f'"{base.schema_name}"."{base.table_name}"'
+    retained_name = f"{base.table_name}_retained_{base.table_oid:x}"
+    retained = f'"{base.schema_name}"."{retained_name}"'
+    state = SimpleNamespace(attempted=False, rotated=False, task=None, started=asyncio.Event())
+
+    async def rotate():
+        state.attempted = True
+        async with connection.transaction():
+            await connection.execute("SET LOCAL lock_timeout='5s'")
+            state.started.set()
+            await connection.execute(
+                f'ALTER TABLE {live} RENAME TO "{retained_name}"; '
+                f"CREATE TABLE {live} (LIKE {retained}); "
+                f'GRANT SELECT ON {live} TO "{held.fixture.roles["reader"]}"'
+            )
+        state.rotated = True
+
+    try:
+        yield rotate, state
+    finally:
+        if state.task is not None:
+            if not state.task.done():
+                state.task.cancel()
+            await asyncio.gather(state.task, return_exceptions=True)
+        if state.rotated:
+            async with connection.transaction():
+                await connection.execute(
+                    f'DROP TABLE IF EXISTS {live}; ALTER TABLE {retained} RENAME TO "{base.table_name}"'
+                )
+
+
+async def _is_rotation_waiting(connection, writer, state):
+    await state.started.wait()
+    while not state.task.done():
+        if await connection.fetchval(
+            "SELECT EXISTS(SELECT FROM pg_locks WHERE pid=$1 AND NOT granted)", writer.get_server_pid()
+        ):
+            return True
+        await asyncio.sleep(0)
+    return False
+
+
+async def assert_fhir_address_rotation(held, monkeypatch, timing):
+    """Interleave native rotation with the genuine Reader's metadata and page queries."""
+    from process import registry_fhir_catalog_read as catalog
+    from process.network_published_api_pin import published_api_pin_statement
+
+    monkeypatch.setenv("HLTHPRT_CONTROL_API_TOKEN", "synthetic-catalog-control-token")
+    monkeypatch.setattr(reader_context, "db", held.database)
+    async with asynccontextmanager(metadata_custody.__wrapped__)() as metadata:
+        snapshot = await _publish_metadata(held, metadata)
+        before = await _response(held)
+        assert before[0] == 200 and before[1]["items"][0]["directory_available"] is True
+        async with _address_rotation(held) as (rotate, state):
+            original_pin, original_fetchrow = catalog.read_published_api_pin, asyncpg.Connection.fetchrow
+            metadata_sql = published_api_pin_statement(held.fixture.control_schema)
+
+            async def before_pin(*args, **kwargs):
+                if not state.attempted:
+                    await rotate()
+                return await original_pin(*args, **kwargs)
+
+            async def after_selection(connection, statement, *args, **kwargs):
+                entry = await original_fetchrow(connection, statement, *args, **kwargs)
+                if statement == metadata_sql and not state.attempted:
+                    state.task = asyncio.create_task(rotate())
+                    assert await asyncio.wait_for(_is_rotation_waiting(connection, held.fixture.connection, state), 5)
+                    assert not state.task.done()
+                return entry
+
+            with monkeypatch.context() as patch:
+                if timing == "before_lock":
+                    patch.setattr(catalog, "read_published_api_pin", before_pin)
+                else:
+                    patch.setattr(asyncpg.Connection, "fetchrow", after_selection)
+                assert await _response(held) == before
+            assert state.attempted
+            if state.task is not None:
+                await asyncio.wait_for(state.task, 5)
+            assert state.rotated and await _response(held) == before
+            base = held.retained.compact_layout.base
+            live = f'"{base.schema_name}"."{base.table_name}"'
+            await held.fixture.connection.execute(f'REVOKE SELECT ON {live} FROM "{held.fixture.roles["reader"]}"')
+            assert await _response(held) == before
+            await held.fixture.connection.execute(f"DROP TABLE {live}")
+            assert await _response(held) == before
+            assert before[1]["generation"] == str(snapshot["network_generation"])
+            assert snapshot["network_generation"] != held.current.generation_id
         assert await _response(held) == before

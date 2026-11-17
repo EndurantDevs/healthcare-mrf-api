@@ -548,7 +548,14 @@ def _address_retry_case(monkeypatch, phase, error, marked):
     monkeypatch.setattr(address, "_cutover_retry_settings", lambda: (3, 0, 0))
     monkeypatch.setattr(address, "ordinary_address_receipt_callbacks", lambda *args: None)
     monkeypatch.setattr(address, "_assert_provider_directory_overlay_alias_fence", AsyncMock())
-    monkeypatch.setattr(adoption, "_prepare_protected_ordinary_rotation", AsyncMock())
+    monkeypatch.setattr(adoption, "_prepare_protected_ordinary_rotation", AsyncMock(return_value=None))
+
+    async def rotate(schema, live, stage, *, serving_generation, transfer_ownership):
+        assert serving_generation is None
+        assert transfer_ownership is False
+        await address._swap_stage_table(schema, live, stage)
+
+    monkeypatch.setattr(adoption, "_swap_sealed_stage_table", rotate)
     monkeypatch.setattr(adoption, "_require_protected_cutover", AsyncMock())
     monkeypatch.setattr(
         address.result_generation, "publish_cutover_entity_address_generation", AsyncMock(return_value=None)
@@ -911,9 +918,6 @@ async def _source_address_outcome(operation, damage, error):
         with pytest.raises(type(error)) as caught:
             await operation
         assert caught.value is error
-    elif damage == "grantor":
-        with pytest.raises(RuntimeError, match="publication_read_access_grant_changed"):
-            await operation
     elif damage == "xid_after_grant":
         from process.provider_directory_generic_candidate import GenericCandidateError
 
@@ -940,7 +944,7 @@ async def test_source_address_uses_native_acl_and_lock_guards(owner_body, damage
     error = LockNotAvailableError("synthetic lock refusal") if damage == "lock" else asyncio.CancelledError("cancelled")
     async with owner_body() as body:
         original_execute = body.connection.execute.side_effect
-        body.connection.fetch = AsyncMock(side_effect=[relations, relations, [grant_by_field]])
+        body.connection.fetch = AsyncMock(side_effect=[relations, relations, [grant_by_field], [grant_by_field]])
 
         body.connection.execute.side_effect = _source_address_native_execute(body, damage, error)
         body.connection.execute.reset_mock()
@@ -952,7 +956,7 @@ async def test_source_address_uses_native_acl_and_lock_guards(owner_body, damage
             grants = [statement for statement in statements if statement.startswith("GRANT")]
             assert grants == (
                 []
-                if damage in {"lock", "grantor"}
+                if damage == "lock"
                 else ['GRANT SELECT ON TABLE "source_schema"."entity_address_unified_stage" TO "source_reader"']
             )
         finally:

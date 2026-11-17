@@ -115,7 +115,7 @@ async def _prepare_replacement(resources, *, populated):
         )
 
 
-async def _swap_replacement(resources, monkeypatch):
+async def _swap_replacement(resources, monkeypatch, *, legacy_names=False):
     """Use the real protected swap; only replacement content setup differs from native._rotate."""
     monkeypatch.setattr(adoption.entity_address_unified, "db", native._NativeDB(resources.publisher))
     async with resources.publisher.transaction():
@@ -124,6 +124,7 @@ async def _swap_replacement(resources, monkeypatch):
             SimpleNamespace(__main_table__="entity_address_unified"),
             SimpleNamespace(__tablename__="entity_address_unified_next", __my_additional_indexes__=[]),
             resources.descriptor["protected_owner_oid"],
+            **({"serving_generation": None} if legacy_names else {}),
         )
         oid = await resources.publisher.fetchval(
             "SELECT to_regclass($1::text)::oid::bigint", f'"{resources.schema}".entity_address_unified'
