@@ -17,6 +17,7 @@ from process.vsp_directory_contract import (
     SOURCE_ID,
     canonical_json,
     is_missing_profile_response,
+    office_position,
     profile_url,
     public_id,
     require,
@@ -74,8 +75,18 @@ def _missing(capture, office, profiles, memberships):
     return missing_ids
 
 
+def _is_empty_office_lookup(value):
+    return (
+        type(value) is dict
+        and value == {"pid": 0, "distance": 0}
+        and type(value["pid"]) is int
+        and type(value["distance"]) in (int, float)
+    )
+
+
 async def _repair_office(capture, office, profiles, memberships, missing_ids):
     oid, attempted_names = public_id(office["pid"]), set()
+    profile_doctor_ids = {public_id(profile["doctorPublicId"]) for profile in profiles}
     while missing_ids:
         eligible_counts = Counter(
             NETWORKS[code]
@@ -90,19 +101,30 @@ async def _repair_office(capture, office, profiles, memberships, missing_ids):
         network = min(eligible_counts, key=lambda name: (-eligible_counts[name], name))
         attempted_names.add(network)
         value, receipt = await capture.fetch("GET", SEARCH_URL + "/" + oid + "?networkNames=" + network)
-        if (
-            type(value) is dict
-            and value == {"pid": 0, "distance": 0}
-            and type(value["pid"]) is int
-            and type(value["distance"]) in (int, float)
-        ):
+        if _is_empty_office_lookup(value):
             # An empty identity lookup does not contradict canonical profile membership.
             continue
         require(type(value) is dict and public_id(value.get("pid")) == oid, "vsp_office_response_mismatch")
-        capture.remember(value, receipt["request_key"])
+        # The lookup can include doctors outside this office's verified roster.
+        capture.remember(value, receipt["request_key"], new_doctor_ids=profile_doctor_ids)
         office = capture.offices[oid]
         missing_ids = _missing(capture, office, profiles, memberships)
     return office
+
+
+async def _search_office_scope(capture, office, network):
+    """Use the network-filtered office endpoint when coordinates are unavailable."""
+    if office_position(office) == (0.0, 0.0):
+        office_id = public_id(office["pid"])
+        value, receipt = await capture.fetch("GET", SEARCH_URL + "/" + office_id + "?networkNames=" + network)
+        if _is_empty_office_lookup(value):
+            return 0, [], receipt
+        require(type(value) is dict and public_id(value.get("pid")) == office_id, PROFILE_MEMBERSHIP_UNRESOLVED)
+        total, offices = search_result({"totalCounts": 1, "locations": [value]})
+        return total, offices, receipt
+    response, receipt = await capture.fetch("POST", SEARCH_URL, office_search_request(office, network))
+    total, offices = search_result(response)
+    return total, offices, receipt
 
 
 async def _affiliate_searches(capture, office, profiles):
@@ -125,8 +147,7 @@ async def _affiliate_searches(capture, office, profiles):
     for network in sorted(NETWORKS.values()):
         if network in capture.search_memberships.get(oid, {}):
             continue
-        search_response, receipt = await capture.fetch("POST", SEARCH_URL, office_search_request(office, network))
-        total, offices = search_result(search_response)
+        total, offices, receipt = await _search_office_scope(capture, office, network)
         matching_offices = [source_record for source_record in offices if public_id(source_record["pid"]) == oid]
         if matching_offices:
             require(not has_retail or is_retail_location(matching_offices[0], profiles), PROFILE_MEMBERSHIP_UNRESOLVED)
@@ -302,13 +323,14 @@ def _write_outputs(store, resources_by_type):
     return outputs, counts
 
 
-def _capture_manifest(capture, outputs, receipts, start, end, accounting, other_codes):
+def _capture_manifest(capture, outputs, receipts, start, refreshed, end, accounting, other_codes):
     return {
         "adapter_id": ADAPTER_ID,
         "source_id": SOURCE_ID,
         "capture_id": capture.store.capture_id,
         "outputs": outputs,
         "publisher_census_start": start,
+        "publisher_census_at_network_start": refreshed,
         "publisher_census_end": end,
         "partition_sha256": hashlib.sha256(canonical_json(capture.partitions).encode()).hexdigest(),
         "request_receipts_sha256": hashlib.sha256(canonical_json(receipts).encode()).hexdigest(),
@@ -318,17 +340,19 @@ def _capture_manifest(capture, outputs, receipts, start, end, accounting, other_
     }
 
 
-async def write_normalized_capture(capture, start, end):
+async def write_normalized_capture(capture, start, end, *, refreshed=None):
     """Close verified, sorted output and retain compact proof plus raw-query receipts."""
     resources_by_type, npis_by_network, accounting, other_codes = await _normalize_offices(capture)
     outputs, counts = _write_outputs(capture.store, resources_by_type)
     receipts = list(capture.store.requests())
-    manifest_by_field = _capture_manifest(capture, outputs, receipts, start, end, accounting, other_codes)
+    manifest_by_field = _capture_manifest(
+        capture, outputs, receipts, start, start if refreshed is None else refreshed, end, accounting, other_codes
+    )
     proof_by_field = {
         "adapter_id": ADAPTER_ID,
         "normalized_output_only": True,
         "resource_counts": counts,
-        "publisher_locations": end,
+        "publisher_locations": {name: len(capture.memberships[name]) for name in NETWORKS.values()},
         "network_npis": {name: len(npis) for name, npis in npis_by_network.items()},
         "retained_response_count": len(receipts),
         "http_attempts": capture.http.requests,

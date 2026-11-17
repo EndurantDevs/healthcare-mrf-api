@@ -101,7 +101,7 @@ def vsp_profile_memberships(office, profiles, search_memberships):
         office, {did: codes for did, codes in networks_by_doctor.items() if did not in retail_ids}, search_memberships
     )
     summaries = _by_doctor(office.get("providerSummaries"), "pid")
-    for doctor_id in summaries.keys() - doctors.keys():
+    for doctor_id in summaries.keys() - doctors.keys() - retail_ids:
         if is_company_summary(office, summaries[doctor_id]):
             raise VSPDirectoryNormalizationError("vsp_directory_unresolved_doctor")
         npi = summaries[doctor_id].get("npi")
@@ -154,11 +154,11 @@ def _location(office, office_id):
         "id": f"vsp-office-{office_id}",
         "identifier": [{"system": "urn:vsp:office-id", "value": str(office_id)}],
         "address": {"line": lines, **address_map},
-        "position": {
-            "latitude": _coordinate(address, "latitude", 90),
-            "longitude": _coordinate(address, "longitude", 180),
-        },
     }
+    latitude = _coordinate(address, "latitude", 90)
+    longitude = _coordinate(address, "longitude", 180)
+    if latitude != 0 or longitude != 0:
+        location_map["position"] = {"latitude": latitude, "longitude": longitude}
     if name := _text(office, "name"):
         location_map["name"] = name
     if phone := _text(office, "phone"):
@@ -251,6 +251,15 @@ def retail_profile_ids(office, profiles):
     if not _company_office(office):
         return set()
     summaries = _by_doctor(office.get("providerSummaries"), "pid")
+    if not profiles:
+        return {
+            doctor_id
+            for doctor_id, summary in summaries.items()
+            if is_company_summary(office, summary)
+            and isinstance(npi := summary.get("npi"), str)
+            and len(npi) == 10
+            and is_valid_npi(npi)
+        }
     retail_ids = set()
     for profile in profiles:
         if _text(profile, "doctorDegreeCode") != "NA":
@@ -280,6 +289,17 @@ def retail_company_npis(office, profiles, company_summaries_by_doctor=None):
     company_summaries_by_doctor = company_summaries_by_doctor or {}
     if not company_summaries_by_doctor.keys() <= retail_ids:
         raise VSPDirectoryNormalizationError("vsp_directory_unresolved_doctor")
+    if not profiles:
+        for doctor_id, retained in company_summaries_by_doctor.items():
+            local = summaries[doctor_id]
+            if (
+                _public_id(retained, "pid") != doctor_id
+                or not is_company_summary(office, retained)
+                or company_summary_name(retained) != company_summary_name(local)
+                or retained.get("npi") != local["npi"]
+            ):
+                raise VSPDirectoryNormalizationError("vsp_directory_unresolved_doctor")
+        return {doctor_id: summaries[doctor_id]["npi"] for doctor_id in retail_ids}
     npis_by_doctor = {}
     for profile in profiles:
         did = profile["doctorPublicId"]
@@ -298,21 +318,26 @@ def retail_company_npis(office, profiles, company_summaries_by_doctor=None):
     return npis_by_doctor
 
 
-def _retail_company_resources(office_id, profiles, npis_by_doctor):
+def _retail_company_resources(office, office_id, profiles, npis_by_doctor):
     """Keep distinct company identities linked to their shared source site."""
-    for profile in profiles:
-        did = profile["doctorPublicId"]
-        if did not in npis_by_doctor:
-            continue
+    profiles_by_doctor = _by_doctor(profiles, "doctorPublicId")
+    summaries_by_doctor = _by_doctor(office.get("providerSummaries"), "pid")
+    for did, npi in sorted(npis_by_doctor.items()):
+        if did in profiles_by_doctor:
+            company = profiles_by_doctor[did]
+            first, last = _text(company, "firstName"), _text(company, "lastName")
+        else:
+            company = summaries_by_doctor[did]
+            first, last = _text(company, "first"), _text(company, "last")
         organization_id = f"vsp-site-company-{office_id}-{did}"
         yield {
             "resourceType": "Organization",
             "id": organization_id,
             "identifier": [
                 {"system": "urn:vsp:doctor-id", "value": str(did)},
-                {"system": _NPI_SYSTEM, "value": npis_by_doctor[did]},
+                {"system": _NPI_SYSTEM, "value": npi},
             ],
-            "name": " ".join(filter(None, (_text(profile, "firstName"), _text(profile, "lastName")))),
+            "name": " ".join(filter(None, (first, last))),
         }
         yield {
             "resourceType": "OrganizationAffiliation",
@@ -362,7 +387,7 @@ def _retail_resources(office, office_id, profiles, network_names, npis_by_doctor
         )
     )
     if len(company_npis) > 1:
-        resources.extend(_retail_company_resources(office_id, profiles, npis_by_doctor))
+        resources.extend(_retail_company_resources(office, office_id, profiles, npis_by_doctor))
     return resources
 
 
@@ -381,7 +406,9 @@ def normalize_vsp_office(
     networks_by_doctor = {doctor_id: _profile_networks(profile) for doctor_id, profile in doctors.items()}
     retail_ids = retail_profile_ids(office, profiles)
     selected_by_doctor = vsp_profile_memberships(office, profiles, search_memberships or {})
-    if summaries.keys() - doctors.keys() - selected_by_doctor.keys() or bool(retail_ids) != bool(retail_networks):
+    if summaries.keys() - doctors.keys() - selected_by_doctor.keys() - retail_ids or bool(retail_ids) != bool(
+        retail_networks
+    ):
         raise VSPDirectoryNormalizationError("vsp_directory_unresolved_doctor")
     resources = VSPOfficeResources(
         outside_profile_count=len(doctors.keys() - selected_by_doctor.keys()),
@@ -395,7 +422,7 @@ def normalize_vsp_office(
             _retail_resources(
                 office,
                 office_id,
-                [doctors[did] for did in sorted(retail_ids)],
+                [doctors[did] for did in sorted(retail_ids) if did in doctors],
                 set(retail_networks),
                 retail_company_npis(office, profiles, company_summaries_by_doctor),
             )

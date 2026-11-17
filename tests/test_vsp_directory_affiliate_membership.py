@@ -14,7 +14,7 @@ from process.vsp_directory_normalization import VSPDirectoryNormalizationError
 from process.vsp_directory_store import VSPCaptureStore
 from tests.test_vsp_directory_capture import HTTP, TILE, noop
 from tests.test_vsp_directory_enrichment import FIRST, SECOND, office
-from tests.test_vsp_directory_normalization import profile
+from tests.test_vsp_directory_normalization import profile, retail_office_and_profile
 
 
 def affiliate(identifier, *summaries):
@@ -94,6 +94,72 @@ def one_world_tile(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("summary_only", [False, True])
+async def test_unlocated_affiliate_uses_exact_network_scope_and_keeps_its_address(tmp_path, summary_only):
+    publisher = AffiliateSource()
+    source_office = affiliate(52, FIRST, SECOND)
+    source_office["addr"].update(latitude=0.0, longitude=0.0)
+    company_summaries = []
+    if summary_only:
+        source_office.update(name="Example Optical", serviceTypeCd="EC", parentCompanyCd="EXAMPLE", droStoreNumber="1")
+        company_summaries.append({"pid": 9, "degree": "NA", "first": "Example", "last": "Optical", "npi": "1000000004"})
+        source_office["providerSummaries"].extend(company_summaries)
+        publisher.profiles[52] = []
+    advantage_office_by_field = {**source_office, "providerSummaries": [FIRST, *company_summaries]}
+    original_response = publisher.response
+
+    def response(method, url, payload):
+        assert method == "GET"
+        if url == SEARCH_URL + "/52?networkNames=Advantage":
+            return advantage_office_by_field
+        if url == SEARCH_URL + "/52?networkNames=Choice":
+            return {"pid": 0, "distance": 0}
+        return original_response(method, url, payload)
+
+    publisher.response = response
+    run = capture(tmp_path, publisher)
+    run.remember_search(source_office, "Signature", "a" * 64)
+    await enrich_capture(run)
+    assert run.http.requests == 3
+    company_ids = {"9"} if summary_only else set()
+    assert run.search_memberships["52"] == {
+        "Signature": {"2", "3"} | company_ids,
+        "Advantage": {"2"} | company_ids,
+        "Choice": set(),
+    }
+    counts_by_network = {name: len(ids) for name, ids in run.memberships.items()}
+    completed = await write_normalized_capture(run, counts_by_network, counts_by_network)
+    resources = list(completed.iter_resources())
+    locations = [resource for resource in resources if resource["resourceType"] == "Location"]
+    (location,) = locations
+    assert "position" not in location
+    assert location["address"]["postalCode"] == source_office["addr"]["zipCode"]
+    assert sorted(roles(resources).values(), key=len) == [{"1000"}, {"1000", "4000"}]
+    if summary_only:
+        site = next(resource for resource in resources if resource["id"] == "vsp-site-org-52")
+        assert {"system": "http://hl7.org/fhir/sid/us-npi", "value": "1000000004"} in site["identifier"]
+        assert all(resource["id"] != "vsp-doctor-9" for resource in resources)
+
+
+@pytest.mark.asyncio
+async def test_unlocated_store_lookup_can_omit_doctor_summaries(tmp_path):
+    source = AffiliateSource()
+    site, company = retail_office_and_profile()
+    site["addr"].update(latitude=0.0, longitude=0.0)
+    site["locationDrProfileLink"] = source.offices[52]["locationDrProfileLink"]
+    source.profiles[52] = [company]
+    source.repair = {key: value for key, value in site.items() if key != "providerSummaries"}
+    run = capture(tmp_path, source)
+    run.remember_search(site, "Signature", "a" * 64)
+    await enrich_capture(run)
+    assert run.http.requests == 4
+    assert run.site_memberships == {name: {"52"} for name in NETWORKS.values()}
+    assert run.offices["52"]["providerSummaries"] == []
+    saved, _ = run.store.lookup("GET", SEARCH_URL + "/52?networkNames=Advantage")
+    assert "providerSummaries" not in saved
+
+
+@pytest.mark.asyncio
 async def test_affiliate_capture_uses_only_search_doctors_and_retained_targeted_scopes(tmp_path):
     source = AffiliateSource()
     original_profiles = deepcopy(source.profiles)
@@ -151,12 +217,15 @@ async def test_each_network_uses_its_incoming_summaries_before_office_merge(tmp_
 @pytest.mark.asyncio
 async def test_get_identity_repair_never_expands_affiliate_membership(tmp_path):
     source = AffiliateSource(scopes={(52, "Signature"): (2,)}, summaries={2: {"pid": 2, "npi": None}})
-    source.repair = affiliate(52, FIRST, SECOND)
+    unscoped_summary_by_field = {"pid": 5, "npi": "1000000004"}
+    source.repair = affiliate(52, FIRST, SECOND, unscoped_summary_by_field)
     run = capture(tmp_path, source)
     await run.discover("Signature", 1)
     await enrich_capture(run)
     assert run.search_memberships == {"52": {"Signature": {"2"}, "Choice": set(), "Advantage": set()}}
     assert {row["pid"] for row in run.offices["52"]["providerSummaries"]} == {2, 3}
+    saved, _ = run.store.lookup("GET", SEARCH_URL + "/52?networkNames=Signature")
+    assert saved["providerSummaries"][-1] == unscoped_summary_by_field
     assert run.http.calls[-1][0:2] == ("GET", SEARCH_URL + "/52?networkNames=Signature")
     census_by_network = {"Signature": 1, "Choice": 0, "Advantage": 0}
     completed = await write_normalized_capture(run, census_by_network, census_by_network)

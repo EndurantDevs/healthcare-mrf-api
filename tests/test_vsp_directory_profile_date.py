@@ -78,13 +78,15 @@ async def test_mixed_date_office_uses_first_profile_through_repair_and_restart(
         await acquisition.capture_vsp_directory(**capture_by_argument)
     store = VSPCaptureStore(tmp_path, capture_by_argument["root_run_id"], require_retained=True)
     receipts = list(store.requests())
-    assert len(receipts) == 7 and store.load_checkpoint("complete") is None
+    assert len(receipts) == 5 and store.load_checkpoint("complete") is None
     assert {receipt["url"] for receipt in receipts if receipt["method"] == "GET"} == {first_url, repair_url}
     boundary = len(http.calls)
 
     completed = await acquisition.capture_vsp_directory(**capture_by_argument, require_retained=True)
     assert http.calls[boundary:] == [
+        ("POST", SEARCH_URL, census_request("Signature")),
         *(("GET", publisher.offices[office_id]["locationDrProfileLink"]["href"], None) for office_id in ("102", "103")),
+        *(("POST", SEARCH_URL, census_request(name)) for name in ("Choice", "Advantage")),
         *(("POST", SEARCH_URL, census_request(name)) for name in sorted(publisher.counts)),
     ]
     resources = list(completed.iter_resources())
@@ -93,11 +95,30 @@ async def test_mixed_date_office_uses_first_profile_through_repair_and_restart(
     assert any(resource["id"] == "vsp-role-3-101-1999999992" for resource in resources)
     assert completed.proof["publisher_locations"] == publisher.counts
     assert completed.proof["network_npis"] == {"Signature": 2, "Choice": 2, "Advantage": 1}
-    assert completed.proof["retained_response_count"] == 12
+    assert completed.proof["retained_response_count"] == 13
 
     monkeypatch.setattr(acquisition.aiohttp, "ClientSession", lambda **_: pytest.fail("completed replay opened HTTP"))
     reopened = await acquisition.capture_vsp_directory(**capture_by_argument, require_retained=True)
     assert list(reopened.iter_resources()) == resources and reopened.proof == completed.proof
+
+
+@pytest.mark.parametrize("different_address", [False, True])
+def test_office_coordinate_rounding_requires_the_same_address(different_address):
+    first = Source().offices["101"]
+    run = acquisition.VSPCapture(Store(), None, noop, noop)
+    run.remember_search(first, "Signature", "a" * 64)
+    later = deepcopy(first)
+    later["addr"]["longitude"] += 0.000007
+    later["locationDrProfileLink"]["href"] = later["locationDrProfileLink"]["href"].replace("2035-01-01", "2035-01-02")
+    if different_address:
+        later["addr"]["zipCode"] = "10002"
+        with pytest.raises(VSPDirectoryError, match="^vsp_office_position_changed$"):
+            run.remember_search(later, "Choice", "b" * 64)
+    else:
+        run.remember_search(later, "Choice", "b" * 64)
+        assert run.offices["101"]["addr"] == first["addr"]
+        assert run.offices["101"]["locationDrProfileLink"] == first["locationDrProfileLink"]
+        assert run.memberships["Choice"] == {"101"}
 
 
 @pytest.mark.parametrize(
