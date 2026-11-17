@@ -10,10 +10,6 @@ ARG PTG2_SCANNER_RUSTFLAGS_AMD64="-C target-cpu=x86-64-v3"
 WORKDIR /build
 COPY requirements.txt requirements-runtime.in requirements-runtime.lock requirements-build.txt requirements-build.lock /build/
 COPY scripts/python_locks.py /build/scripts/python_locks.py
-COPY support/ptg2_scanner/ /build/support/ptg2_scanner/
-COPY process/ext/address_pub28.py /build/process/ext/address_pub28.py
-COPY process/ext/address_format_constants.py /build/process/ext/address_format_constants.py
-COPY specs/uhc_provider_file_census_v1.json /build/specs/uhc_provider_file_census_v1.json
 RUN uv venv --python 3.14.7 /build/venv \
     && /build/venv/bin/python /build/scripts/python_locks.py check --root /build \
     && uv pip install \
@@ -24,6 +20,32 @@ RUN uv venv --python 3.14.7 /build/venv \
         --require-hashes \
         -r /build/requirements-build.lock \
     && uv pip check --python /build/venv/bin/python
+COPY support/ptg2_scanner/Cargo.toml support/ptg2_scanner/Cargo.lock support/ptg2_scanner/pyproject.toml /build/support/ptg2_scanner/
+# Pre-compile Cargo and PyO3 third-party dependencies before copying crate and Python
+# sources so code edits reuse the compiled dependency layer cleanly.
+RUN mkdir -p /build/support/ptg2_scanner/src \
+    && printf 'pub fn _dependency_cache_stub() {}\n' > /build/support/ptg2_scanner/src/lib.rs \
+    && if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
+        RUSTFLAGS="${PTG2_SCANNER_RUSTFLAGS_AMD64}" cargo build --release --locked --lib --manifest-path /build/support/ptg2_scanner/Cargo.toml; \
+    else \
+        cargo build --release --locked --lib --manifest-path /build/support/ptg2_scanner/Cargo.toml; \
+    fi \
+    && cd /build/support/ptg2_scanner \
+    && if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
+        RUSTFLAGS="${PTG2_SCANNER_RUSTFLAGS_AMD64}" /build/venv/bin/python -m maturin build --release --locked --features python-extension --out /tmp/dummy-wheels; \
+    else \
+        /build/venv/bin/python -m maturin build --release --locked --features python-extension --out /tmp/dummy-wheels; \
+    fi \
+    && rm -rf \
+        /build/support/ptg2_scanner/src \
+        /tmp/dummy-wheels \
+        /build/support/ptg2_scanner/target/release/.fingerprint/ptg2_scanner-* \
+        /build/support/ptg2_scanner/target/release/deps/*ptg2_scanner* \
+        /build/support/ptg2_scanner/target/release/deps/*ptg2_address_canon*
+COPY support/ptg2_scanner/ /build/support/ptg2_scanner/
+COPY process/ext/address_pub28.py /build/process/ext/address_pub28.py
+COPY process/ext/address_format_constants.py /build/process/ext/address_format_constants.py
+COPY specs/uhc_provider_file_census_v1.json /build/specs/uhc_provider_file_census_v1.json
 RUN if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
         RUSTFLAGS="${PTG2_SCANNER_RUSTFLAGS_AMD64}" cargo build --release --bins --manifest-path /build/support/ptg2_scanner/Cargo.toml; \
     else \
@@ -71,7 +93,6 @@ RUN apt-get update \
 ARG HLTHPRT_LOG_CFG=./logging.yaml
 ARG HLTHPRT_RELEASE="dev"
 ARG HLTHPRT_ENVIRONMENT=test
-ARG HLTHPRT_SOURCE_COMMIT
 ARG DRUG_SOURCE_COMMIT
 ARG DRUG_SOURCE_TREE
 ARG DRUG_SOURCE_BASE
@@ -94,16 +115,6 @@ ARG HLTHPRT_DB_USER=mrf_api
 ARG HLTHPRT_REDIS_ADDRESS=redis://localhost:6379
 
 ARG HLTHPRT_SAVE_PER_PACK=100
-
-RUN test "${#HLTHPRT_SOURCE_COMMIT}" -eq 40 \
-    && printf '%s' "${HLTHPRT_SOURCE_COMMIT}" \
-        | grep -Eq '^[0-9a-f]{40}$' \
-    && test "${HLTHPRT_SOURCE_COMMIT}" != "0000000000000000000000000000000000000000" \
-    && install -d -o root -g root -m 0555 /opt/healthporta/build-identity \
-    && printf '%s\n' "${HLTHPRT_SOURCE_COMMIT}" \
-        > /opt/healthporta/build-identity/healthcare-source-commit \
-    && chown root:root /opt/healthporta/build-identity/healthcare-source-commit \
-    && chmod 0444 /opt/healthporta/build-identity/healthcare-source-commit
 
 ENV HLTHPRT_LOG_CFG=${HLTHPRT_LOG_CFG}
 ENV HLTHPRT_RELEASE=${HLTHPRT_RELEASE}
@@ -172,6 +183,17 @@ RUN uv pip install --python /opt/venv/bin/python --no-cache --no-build --no-deps
 COPY custom_import_cli.py /opt/custom_import_cli.py
 COPY custom_import_snowflake_operator.py /opt/custom_import_snowflake_operator.py
 COPY logging.yaml main.py alembic.ini /opt/
+
+ARG HLTHPRT_SOURCE_COMMIT
+RUN test "${#HLTHPRT_SOURCE_COMMIT}" -eq 40 \
+    && printf '%s' "${HLTHPRT_SOURCE_COMMIT}" \
+        | grep -Eq '^[0-9a-f]{40}$' \
+    && test "${HLTHPRT_SOURCE_COMMIT}" != "0000000000000000000000000000000000000000" \
+    && install -d -o root -g root -m 0555 /opt/healthporta/build-identity \
+    && printf '%s\n' "${HLTHPRT_SOURCE_COMMIT}" \
+        > /opt/healthporta/build-identity/healthcare-source-commit \
+    && chown root:root /opt/healthporta/build-identity/healthcare-source-commit \
+    && chmod 0444 /opt/healthporta/build-identity/healthcare-source-commit
 
 USER nobody:nogroup
 
