@@ -733,7 +733,6 @@ jobs:
       artifact_profile_publication: ${{ steps.coverage-output.outputs.artifact_profile_publication }}
       artifact_cms_successor: ${{ steps.coverage-output.outputs.artifact_cms_successor }}
     strategy:
-      max-parallel: 48
       fail-fast: false
       matrix:
         include:
