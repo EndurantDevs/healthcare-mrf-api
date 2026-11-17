@@ -11,6 +11,23 @@ from tests import test_tiger_captured_epoch_postgres as capture_fixture
 from tests import test_tiger_snapshot_inheritance_postgres as inheritance_fixture
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    (
+        "postgresql+asyncpg://synthetic@127.0.0.1:5432/postgres",
+        "postgresql+asyncpg://synthetic@remote.example:5432/disposable_test",
+    ),
+)
+async def test_inheritance_explicit_override_refuses_unowned_database(monkeypatch, url):
+    connect = AsyncMock()
+    monkeypatch.setattr(inheritance_fixture.asyncpg, "connect", connect)
+    with pytest.raises(AssertionError):
+        async with inheritance_fixture._owned_database(source_url=make_url(url)):
+            raise AssertionError("unsafe override entered")
+    connect.assert_not_awaited()
+
+
 def _mock_owned_resources(monkeypatch, module, failure):
     state = SimpleNamespace(events=[], created_roles=[], dropped_roles=[], connections=[], engines=[], is_created=False)
 

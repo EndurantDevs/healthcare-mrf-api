@@ -19,8 +19,13 @@ from tests.test_tiger_result_archive_postgres import _command, _database_url
 
 
 @asynccontextmanager
-async def _owned_database():
-    source_url = _database_url()
+async def _owned_database(*, source_url=None):
+    if source_url is None:
+        source_url = _database_url()
+    else:
+        assert (
+            source_url.host in {"localhost", "127.0.0.1", "postgres"} and "test" in (source_url.database or "").lower()
+        )
     suffix = uuid4().hex
     database = "tiger_inheritance_test_" + suffix
     owner = "tiger_owner_" + suffix

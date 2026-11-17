@@ -164,6 +164,11 @@ async def _scope(session, value):
 async def _protected_relation(session, qualified, *, expected_owner=None, catalog=False):
     """Require immutable ordinary-reader access, not a writable look-alike catalog."""
     await session.execute(text(f"LOCK TABLE ONLY {qualified} IN ACCESS SHARE MODE NOWAIT"))
+    return await read_protected_tiger_relation(session, qualified, expected_owner=expected_owner, catalog=catalog)
+
+
+async def read_protected_tiger_relation(session, qualified, *, expected_owner=None, catalog=False):
+    """Check existing protected storage after the caller has pinned its read."""
     relation = (
         (
             await session.execute(

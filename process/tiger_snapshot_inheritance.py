@@ -30,7 +30,7 @@ def _require(value, message):
         raise archive.ReferenceFamilyArchiveError("TIGER inheritance " + message)
 
 
-async def current_tiger_snapshot_children(session):
+async def current_tiger_snapshot_children(session, *, allow_ordinary_inheritance=False):
     """Resolve only two single-parent leaves; never flatten an unknown live graph."""
     rows = (
         await session.execute(
@@ -47,6 +47,10 @@ async def current_tiger_snapshot_children(session):
     ).all()
     if not rows:
         return ()
+    if allow_ordinary_inheritance and not any(
+        catalog_row[2].startswith("reference_family_archive_") for catalog_row in rows
+    ):
+        return None
     _require(len(rows) == 2 and tuple(catalog_row[0] for catalog_row in rows) == TABLES, "child graph differs")
     _require(
         all(catalog_row[3] for catalog_row in rows) and len({catalog_row[2] for catalog_row in rows}) == 1,

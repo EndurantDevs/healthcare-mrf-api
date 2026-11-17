@@ -6173,6 +6173,8 @@ paths:
           description: |
             When true or omitted, returns best-known PTG provider addresses
             when available. Set false to suppress unverified address fields.
+            Full-view ascending distance searches with false use numeric
+            offsets on every page to preserve post-suppression ordering.
             The release-bound state scan applies the same default to its frozen,
             source-assured address witness; this does not imply that an inferred
             provider address is bound to the priced plan or network.
@@ -6206,6 +6208,8 @@ paths:
             are evidence, not negotiated rates.
             The release-bound state scan has no allowed-amount fallback and
             requires this parameter to be supplied explicitly as false.
+            Full-view ascending distance continuation also requires explicit
+            `include_allowed_amounts=false` on the first and subsequent pages.
         - name: include_details
           in: query
           schema: { type: boolean }
@@ -6255,6 +6259,12 @@ paths:
             processing returns 400. Malformed cursor syntax in the billing
             branch fails closed as the same generic 404 used for other
             inaccessible billing inputs.
+            Full-view ascending distance searches with provider expansion,
+            enabled `include_unverified_addresses` (the default), and explicit
+            `include_allowed_amounts=false` may also return this cursor.
+            Start at `offset=0`, then replay the same query fields and
+            page size using `pagination.next_cursor` as `cursor` without a
+            nonzero offset. Changed or expired input generations return 409.
         - name: offset
           in: query
           schema: { type: integer, minimum: 0, default: 0 }
@@ -6262,6 +6272,10 @@ paths:
             Zero-based provider-row offset for deterministic paging. A state
             scan starts at zero and continues with its opaque cursor; nonzero
             offsets are rejected for that lane.
+            Full-view distance continuation starts at zero and uses its
+            returned cursor with the same page size for subsequent pages.
+            Requests with `include_unverified_addresses=false` keep numeric
+            offsets throughout the traversal.
       responses:
         '200':
           description: Paginated provider matches by procedure

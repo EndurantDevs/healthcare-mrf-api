@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import re
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Mapping
 
 import orjson
 
@@ -15,6 +15,37 @@ from api.code_systems import canonical_catalog_code, normalize_code_system
 NUMERIC_PATTERN = re.compile(r"^-?\d+(\.\d+)?$")
 ORJSON_INTEGER_MIN = -(1 << 63)
 ORJSON_INTEGER_MAX = (1 << 64) - 1
+
+
+def _request_value_or_none(value: Any) -> Any:
+    """Preserve explicit numeric zero while normalizing request null sentinels."""
+
+    return None if value in (None, "", "null") else value
+
+
+def _manifest_response_row_order(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        int(row.get("price_key") if row.get("price_key") is not None else 2**32),
+        int(row.get("_ptg_provider_set_key") if row.get("_ptg_provider_set_key") is not None else 2**31),
+        int(row.get("source_key") or 0),
+        int(row.get("provider_count") or 0),
+        int(row.get("code_key") or 0),
+        str(row.get("reported_code") or ""),
+        str(row.get("serving_content_hash_128") or ""),
+        str(row.get("plan_id") or ""),
+        str(row.get("plan_market_type") or ""),
+    )
+
+
+def _manifest_response_row_order_for_direction(
+    row: Mapping[str, Any],
+    *,
+    descending: bool,
+) -> tuple[Any, ...]:
+    order = _manifest_response_row_order(row)
+    if not descending:
+        return order
+    return (-int(order[0]), *order[1:])
 
 
 class _ExactNumericText(str):
@@ -40,9 +71,7 @@ PTG2_ITEM_SOURCE_DETAIL_FIELDS = {
     "source_procedure_name",
     "source_procedure_description",
 }
-PTG2_ITEM_SOURCE_FIELDS = (
-    PTG2_ITEM_SOURCE_SUMMARY_FIELDS | PTG2_ITEM_SOURCE_DETAIL_FIELDS
-)
+PTG2_ITEM_SOURCE_FIELDS = PTG2_ITEM_SOURCE_SUMMARY_FIELDS | PTG2_ITEM_SOURCE_DETAIL_FIELDS
 PTG2_ITEM_DIAGNOSTIC_FIELDS = {
     "billing_code",
     "billing_code_type",
@@ -73,6 +102,8 @@ PTG2_QUERY_DIAGNOSTIC_FIELDS = {
     "route_item_table",
     "snapshot_id",
 }
+
+
 def _is_request_flag_enabled(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -95,7 +126,7 @@ def _optional_float(value: Any) -> float | None:
         return None
     try:
         return float(str(value).strip())
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -104,20 +135,16 @@ def _optional_decimal(value: Any) -> Decimal | None:
         return None
     try:
         return Decimal(str(value).strip())
-    except (InvalidOperation, TypeError, ValueError):
+    except InvalidOperation, TypeError, ValueError:
         return None
 
 
 def _include_ptg2_details(args: dict[str, Any]) -> bool:
-    return _is_request_flag_enabled(
-        args.get("include_details")
-    ) or _is_request_flag_enabled(args.get("include_debug"))
+    return _is_request_flag_enabled(args.get("include_details")) or _is_request_flag_enabled(args.get("include_debug"))
 
 
 def _include_ptg2_sources(args: dict[str, Any]) -> bool:
-    return _include_ptg2_details(args) or _is_request_flag_enabled(
-        args.get("include_sources")
-    )
+    return _include_ptg2_details(args) or _is_request_flag_enabled(args.get("include_sources"))
 
 
 def _shape_ptg2_response(payload: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
@@ -277,14 +304,22 @@ def _normalize_string_list(value: Any) -> list[str]:
 
 def _canonical_price_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized_price_by_field = dict(row)
-    normalized_price_by_field["negotiated_rate"] = _coerce_numeric_rate(normalized_price_by_field.get("negotiated_rate"))
+    normalized_price_by_field["negotiated_rate"] = _coerce_numeric_rate(
+        normalized_price_by_field.get("negotiated_rate")
+    )
     if "service_code" in normalized_price_by_field:
         normalized_price_by_field["service_code"] = sorted(
-            {_canonical_catalog_code("POS", code) for code in _normalize_string_list(normalized_price_by_field.get("service_code"))}
+            {
+                _canonical_catalog_code("POS", code)
+                for code in _normalize_string_list(normalized_price_by_field.get("service_code"))
+            }
         )
     if "billing_code_modifier" in normalized_price_by_field:
         normalized_price_by_field["billing_code_modifier"] = sorted(
-            {modifier.upper() for modifier in _normalize_string_list(normalized_price_by_field.get("billing_code_modifier"))}
+            {
+                modifier.upper()
+                for modifier in _normalize_string_list(normalized_price_by_field.get("billing_code_modifier"))
+            }
         )
     return normalized_price_by_field
 
@@ -335,8 +370,12 @@ def _price_component(modifiers: list[str]) -> str:
 def _summarize_normalized_price_payload(normalized_prices: list[dict[str, Any]]) -> list[dict[str, Any]]:
     summaries_by_group: dict[tuple[Any, ...], dict[str, Any]] = {}
     for price in normalized_prices:
-        modifiers = sorted({modifier.upper() for modifier in _normalize_string_list(price.get("billing_code_modifier"))})
-        service_codes = sorted({_canonical_catalog_code("POS", code) for code in _normalize_string_list(price.get("service_code"))})
+        modifiers = sorted(
+            {modifier.upper() for modifier in _normalize_string_list(price.get("billing_code_modifier"))}
+        )
+        service_codes = sorted(
+            {_canonical_catalog_code("POS", code) for code in _normalize_string_list(price.get("service_code"))}
+        )
         rate = _coerce_numeric_rate(price.get("negotiated_rate"))
         key = (
             _price_component(modifiers),
@@ -386,3 +425,53 @@ def _price_response_fields(prices: Any) -> dict[str, list[dict[str, Any]]]:
         "tic_prices": normalized,
         "price_summary": _summarize_normalized_price_payload(normalized),
     }
+
+
+def _annotate_ptg2_query_payload(
+    ptg2_payload: object,
+    *,
+    plan_id_type: str,
+    year: int | None,
+    has_plan_scope: bool,
+) -> None:
+    if not isinstance(ptg2_payload, dict):
+        return
+    query_payload = ptg2_payload.setdefault("query", {})
+    if not isinstance(query_payload, dict):
+        return
+    if plan_id_type:
+        query_payload.setdefault("plan_id_type", plan_id_type)
+    if year is None or not has_plan_scope:
+        return
+    ignored_params = query_payload.setdefault("ignored_params", [])
+    if isinstance(ignored_params, list) and "year" not in ignored_params:
+        ignored_params.append("year")
+    query_payload.setdefault(
+        "year_semantics",
+        "ignored_for_plan_scoped_ptg_rates",
+    )
+
+
+def _has_ptg2_location_filter(args: object) -> bool:
+    getter = getattr(args, "get", None)
+    if not callable(getter):
+        return False
+    return bool(
+        getter("state")
+        or getter("city")
+        or getter("zip5")
+        or getter("zip")
+        or getter("lat") is not None
+        or getter("long") is not None
+        or getter("radius") is not None
+        or getter("radius_miles") is not None
+        or getter("npi") is not None
+    )
+
+
+def _ptg2_empty_result_state(status: str, *, has_location_filter: bool) -> str:
+    if status == "no_route":
+        return "no_snapshot_for_plan"
+    if has_location_filter:
+        return "no_match_in_radius"
+    return "no_matching_rates"

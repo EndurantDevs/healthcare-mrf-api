@@ -83,7 +83,7 @@ async def test_combined_distance_pages_preserve_ties_sources_rates_and_scores(mo
 
     monkeypatch.setattr(serving, "_read_multi_ptg2_snapshots", read_networks)
     networks = [(f"source-{index}", f"snapshot-{index}") for index in range(4)]
-    args_by_name = {"lat": 40, "long": -80, "order_by": "distance", "order": "asc"}
+    args_by_name = {"lat": 40, "long": -80, "order_by": "distance", "order": "asc", "include_sources": True}
     collected_rows = []
     page_index = 0
     while True:
@@ -148,17 +148,12 @@ def _tied_network_responses(network_rows, args_by_name, selected, pagination):
         local = serving._sort_ptg2_manifest_provider_items(
             list(reversed(provider_rows)), args_by_name, location_filter_requested=True
         )
-        # The strict source response strips its private price/rank coordinates before union.
-        public_rows = [
-            {key: field_value for key, field_value in provider_row.items() if key != "_ptg_price_key"}
-            for provider_row in local[: pagination.limit]
-        ]
         responses.append(
             (
                 source,
                 snapshot,
                 {
-                    "items": public_rows,
+                    "items": local[: pagination.limit],
                     "pagination": {"total": len(provider_rows), "total_is_exact": True},
                     "query": {"code": "99213"},
                 },
@@ -205,7 +200,7 @@ def _assert_tied_rows(network_rows, collected_rows):
 @pytest.mark.parametrize("page_sizes", [(50,), (25,), (12,), (50, 12, 25)])
 async def test_distance_pages_preserve_address_source_and_code_ties(monkeypatch, page_sizes):
     network_rows = _tied_network_rows()
-    args_by_name = {"lat": 40, "long": -80, "order_by": "distance", "order": "asc"}
+    args_by_name = {"lat": 40, "long": -80, "order_by": "distance", "order": "asc", "include_sources": True}
     networks = [(f"source-{network}", f"snapshot-{network}") for network in range(4)]
 
     async def read_networks(_session, selected, _args, pagination, _selection):

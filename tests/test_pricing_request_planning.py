@@ -58,13 +58,14 @@ async def test_owned_interactive_reader_disables_jit_before_resolution(monkeypat
     resolver, search = _install_search(monkeypatch)
     original_specialty = pricing._resolve_ptg_specialty_or_raise
 
-    async def specialty(session, args):
+    async def specialty(session, args, *, defer_unresolved=False):
+        assert defer_unresolved is False
         tuner.assert_awaited_once()
         assert tuner.await_args.args[0] is session
         assert str(tuner.await_args.args[1]) == (
             "SELECT set_config('jit', 'off', true), set_config('plan_cache_mode', 'force_custom_plan', true)"
         )
-        return await original_specialty(session, args)
+        return await original_specialty(session, args, defer_unresolved=defer_unresolved)
 
     monkeypatch.setattr(pricing, "_resolve_ptg_specialty_or_raise", specialty)
     guard = AsyncMock(side_effect=AssertionError("bounded full search does not need a guard-only release read"))
