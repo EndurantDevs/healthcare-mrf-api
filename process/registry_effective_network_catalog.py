@@ -181,11 +181,12 @@ def _source_organization_ctes(catalog, revision):
     ), organization_records AS MATERIALIZED (
       SELECT * FROM manual WHERE record_kind IN ('company','group')
       UNION ALL
-      SELECT {revision}::bigint,'company',n.company_id,1::bigint,0::bigint,n.company
+      SELECT {revision}::bigint,'company',n.company_id,1::bigint,0::bigint,n.company||jsonb_build_object('revision',1)
       FROM native_company_metadata n WHERE NOT EXISTS(SELECT FROM manual m
         WHERE m.record_kind='company' AND m.record_key=n.company_id)
       UNION ALL
-      SELECT {revision}::bigint,'group',n.company_group->>'group_id',1::bigint,0::bigint,n.company_group
+      SELECT {revision}::bigint,'group',n.company_group->>'group_id',1::bigint,0::bigint,
+        n.company_group||jsonb_build_object('revision',1)
       FROM native_group_metadata n WHERE jsonb_typeof(n.company_group)='object'
         AND NOT EXISTS(SELECT FROM manual m WHERE m.record_kind='group'
           AND m.record_key=n.company_group->>'group_id')

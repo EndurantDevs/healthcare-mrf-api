@@ -7,6 +7,7 @@ from uuid import UUID
 import pytest
 
 from api.provider_detail_network_read import _selected_networks
+from process import registry_network_catalog_read as catalog
 from process.network_fhir_source_witness_contract import digest
 from process.registry_aca_company_catalog import enrich_aca_company_sources
 from process.registry_catalog_policy import RegistryOrganizationVisibility
@@ -17,6 +18,10 @@ from process.registry_native_network_catalog import (
     native_network_definitions,
 )
 from process.registry_network_catalog_read import RegistryNetworkCatalogQuery, _page
+from process.registry_serving_organization_read import (
+    RegistryOrganizationCatalogQuery,
+    read_registry_serving_organizations,
+)
 from tests.effective_catalog_support import GENERATION, manual_record
 from tests.effective_catalog_support import effective_catalog_db as effective_catalog_db
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
@@ -142,3 +147,44 @@ async def test_aca_company_network_search_and_exclusions_work_without_approved_c
         fixture.control,
     )
     assert renamed["items"][0]["companies"][0]["display_name"] == "Approved company name"
+
+
+@pytest.mark.parametrize(("kind", "label"), [("company", "Source legal company"), ("group", "Source reported group")])
+async def test_source_organizations_are_visible_in_pinned_list_and_detail(
+    serving_schema, effective_catalog_db, monkeypatch, kind, label
+):
+    connection, schema, _engine = serving_schema
+    aca_source, company_id, group_id = await source_company(connection, schema)
+    fixture = effective_catalog_db
+    await seed_projection(fixture, aca_source)
+    record_id = str(company_id if kind == "company" else group_id)
+
+    async def pin_fixture(*_arguments):
+        return fixture.manifest
+
+    monkeypatch.setattr(catalog, "_pin", pin_fixture)
+    async with catalog.registry_catalog_read_snapshot(fixture.connection, 9, fixture.control) as manifest:
+        read_options_by_name = {"manifest": manifest, "control_schema": fixture.control}
+        default_policy = RegistryOrganizationVisibility()
+        listed = await read_registry_serving_organizations(
+            fixture.connection,
+            RegistryOrganizationCatalogQuery(kind),
+            organization_policy=default_policy,
+            **read_options_by_name,
+        )
+        detail = RegistryOrganizationCatalogQuery(kind, (record_id,), generation_id=9, limit=1)
+        selected = await read_registry_serving_organizations(
+            fixture.connection, detail, organization_policy=default_policy, **read_options_by_name
+        )
+        hidden = await read_registry_serving_organizations(
+            fixture.connection,
+            detail,
+            organization_policy=RegistryOrganizationVisibility(**{f"excluded_{kind}_ids": (record_id,)}),
+            **read_options_by_name,
+        )
+    assert listed["total"] == selected["total"] == 1
+    assert listed["items"] == selected["items"]
+    assert selected["items"][0][f"{kind}_id"] == record_id
+    assert selected["items"][0]["display_name"] == label
+    assert selected["items"][0]["revision"] == 1
+    assert hidden["total"] == 0
