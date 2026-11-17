@@ -95,33 +95,26 @@ def test_prepared_stage_names_require_complete_declared_model_family(fault):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("read_only", [False, True])
-async def test_publication_read_locks_frozen_heaps_and_preserves_mutable_stage_lock(monkeypatch, read_only):
-    """Inspection keeps read rights; native DDL closes cutover locks in the reader's order."""
-    names = tuple(model.__main_table__ for model in preparation._models())
-    existing = (*names, *(name + "_old" for name in names))
-    session = SimpleNamespace(
-        execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: existing)))
-    )
+async def test_publication_locks_stages_with_candidate_permissions(monkeypatch, read_only):
+    """Frozen candidates can be held with their read permissions."""
+    session = object()
     stage = native.make_class(native.DoctorClinicianAddress, "synthetic")
     locks = AsyncMock()
     monkeypatch.setattr(native, "_lock_family", locks)
     await native._lock_cms_doctors_publication(session, stage, "mrf", "synthetic", stage_read_only=read_only)
     stages = tuple(sorted(native.make_class(model, "synthetic").__tablename__ for model in preparation._models()))
-    assert locks.await_args_list[0].args == (
+    locks.assert_awaited_once_with(
         session,
         "mrf",
         stages,
         "ACCESS SHARE" if read_only else "ACCESS EXCLUSIVE",
+        nowait=True,
     )
-    assert locks.await_args_list[1].args == (session, "mrf", tuple(sorted(existing)), "ACCESS SHARE")
-    assert all(call.kwargs == {"nowait": True} for call in locks.await_args_list)
 
 
 @pytest.mark.asyncio
 async def test_publication_rejects_nonboolean_frozen_stage_flag(monkeypatch):
-    session = SimpleNamespace(
-        execute=AsyncMock(return_value=SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [])))
-    )
+    session = object()
     locks = AsyncMock()
     monkeypatch.setattr(native, "_lock_family", locks)
     with pytest.raises(RuntimeError, match="lock_scope_invalid"):

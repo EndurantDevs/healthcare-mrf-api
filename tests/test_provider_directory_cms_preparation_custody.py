@@ -13,8 +13,6 @@ from process import provider_directory_cms_preparation_custody as custody
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
 from process.provider_directory_source_storage_binding import FHIRSourceStorageBinding
 
-_NATIVE_OBSERVE = custody._observe
-
 
 @pytest.fixture
 def evidence(monkeypatch):
@@ -34,8 +32,6 @@ def evidence(monkeypatch):
         fetchrow=AsyncMock(side_effect=lambda *args: actor_by_field.copy()),
     )
     observed_by_field = {field: str(index) * 64 for index, field in enumerate(custody._DIGEST_FIELDS, 1)}
-    observe = AsyncMock(return_value=observed_by_field)
-    monkeypatch.setattr(custody, "_observe", observe)
     profile_by_field = dict(
         contract=custody.CONTRACT,
         source_ids=["cms-npd"],
@@ -49,7 +45,6 @@ def evidence(monkeypatch):
         actor=actor_by_field,
         connection=connection,
         observed=observed_by_field,
-        observe=observe,
         profile=profile_by_field,
     )
 
@@ -64,7 +59,6 @@ async def test_common_enrollment_or_handoff_is_refused_before_any_sql(evidence, 
     with pytest.raises(ValueError, match="cms_profile_required"):
         await _compare(evidence, profile)
     evidence.connection.fetchrow.assert_not_awaited()
-    evidence.observe.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -89,7 +83,6 @@ async def test_closed_cms_scope_refuses_before_any_sql(evidence, change):
     with pytest.raises(ValueError, match="cms_preparation_custody_"):
         await _compare(evidence, profile)
     evidence.connection.fetchrow.assert_not_awaited()
-    evidence.observe.assert_not_awaited()
 
 
 def _callees(signatures):

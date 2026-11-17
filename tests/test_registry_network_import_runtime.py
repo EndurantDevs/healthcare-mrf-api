@@ -25,28 +25,28 @@ async def test_failed_publication_keeps_completed_source_captures_for_other_requ
     connection.execute.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("fails", [False, True])
-async def test_source_factory_lifetime_drains_after_import_success_or_failure(monkeypatch, fails):
+@pytest.fixture
+def configured_source_runtime(monkeypatch):
     from process import registry_fhir_catalog_worker as catalog_worker
     from process import registry_publication_worker as worker
+    from process.registry_fhir_catalog_sources import parse_fhir_catalog_source_profile
+    from process.registry_imported_source_inventory import ImportedSourceInventoryConfig
+    from tests.test_registry_typed_source_recipe import _recipe
 
     events = []
+    capability_by_name = {"catalog_export": lambda: None, "freeze_preparation": AsyncMock()}
 
     @asynccontextmanager
     async def factory_runtime():
         events.append("open")
         try:
-            yield {"catalog_export": lambda: None, "freeze_preparation": AsyncMock()}
+            yield capability_by_name
         finally:
             events.append("close")
 
     source_module = ModuleType("directory_catalog_runtime")
     source_module.network_import_source_runtime = factory_runtime
     monkeypatch.setitem(sys.modules, "directory_catalog_runtime", source_module)
-    from process.registry_fhir_catalog_sources import parse_fhir_catalog_source_profile
-    from process.registry_imported_source_inventory import ImportedSourceInventoryConfig
-    from tests.test_registry_typed_source_recipe import _recipe
 
     profile = parse_fhir_catalog_source_profile(_recipe().source_pin.catalog_descriptor["native_read_profile"])
     settings = SimpleNamespace(
@@ -59,14 +59,46 @@ async def test_source_factory_lifetime_drains_after_import_success_or_failure(mo
     monkeypatch.setattr(worker, "_worker_sessions", lambda *args: lambda: None)
     catalog = SimpleNamespace(source_endpoint_ids=None, consumer=SimpleNamespace(control_schema="registry"))
     monkeypatch.setattr(catalog_worker, "parse_fhir_catalog_sync_config", lambda *args, **kwargs: catalog)
+    return SimpleNamespace(events=events, capability_by_name=capability_by_name, settings=settings, catalog=catalog)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True])
+async def test_source_factory_lifetime_drains_after_import_success_or_failure(configured_source_runtime, fails):
+    case = configured_source_runtime
     try:
         async with AsyncExitStack() as cleanup:
             async with bootstrap.native_network_import_runtime(object(), cleanup) as (prepared, source_runtime):
-                assert prepared is catalog and source_runtime.config is settings.inventory_sources
-                assert source_runtime.inventory.control_schema == settings.control_schema
-                assert events == ["open"]
+                assert prepared is case.catalog and source_runtime.config is case.settings.inventory_sources
+                assert source_runtime.inventory.control_schema == case.settings.control_schema
+                assert case.events == ["open"]
                 if fails:
                     raise RuntimeError("synthetic_import_failure")
     except RuntimeError as error:
         assert fails and str(error) == "synthetic_import_failure"
-    assert events == ["open", "close"]
+    assert case.events == ["open", "close"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault,error,events",
+    [
+        ("inventory", "native_inventory_required", []),
+        ("publisher", "freeze_capability_invalid", ["open", "close"]),
+        ("partial-catalog", "catalog_configuration_invalid", ["open", "close"]),
+    ],
+)
+async def test_invalid_native_import_drains_open_factory(configured_source_runtime, fault, error, events):
+    case = configured_source_runtime
+    if fault == "inventory":
+        case.settings.inventory_sources = None
+    elif fault == "publisher":
+        del case.capability_by_name["freeze_preparation"]
+    else:
+        case.catalog.source_endpoint_ids = ("selected-source",)
+
+    with pytest.raises(ValueError, match=error):
+        async with AsyncExitStack() as cleanup:
+            async with bootstrap.native_network_import_runtime(object(), cleanup):
+                pytest.fail("invalid configuration entered source runtime")
+    assert case.events == events

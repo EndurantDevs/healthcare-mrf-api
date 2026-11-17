@@ -7,6 +7,7 @@ import os
 import re
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -1751,6 +1752,96 @@ async def test_native_nucc_generic_receive_retires_known_guard_and_cleans_retain
         await _nucc_assert_retired_cleanup(resources, retained)
 
 
+async def _prepare_nucc_handoff_attempt(session, predecessor):
+    """Create and validate one bounded candidate on the actual controlled attempt."""
+    from db.models import ImportRun
+    from process.ext.utils import make_class
+    from tests.test_nucc_protected_flow_postgres import _records
+
+    run_id = "taxonomy_" + uuid4().hex
+    ctx_by_field = {
+        "control_run_id": run_id,
+        "context": {
+            "_control_attempt_id": run_id + ":" + uuid4().hex,
+            "_control_attempt_started_at": datetime.now(UTC).isoformat(),
+            "nucc_native_predecessor": predecessor.as_dict(),
+        },
+    }
+    run, attempt, started, suffix = result_generation._nucc_attempt(ctx_by_field)
+    await session.execute(
+        ImportRun.__table__.insert().values(
+            run_id=run,
+            engine="healthcare-mrf-api",
+            node_id="taxonomy-test",
+            importer="nucc",
+            status="running",
+            params={},
+            progress={"attempt_id": attempt, "attempt_started_at": started},
+            metrics={"retained_metric": 1},
+        )
+    )
+    stage = await result_generation._precreate_nucc_attempt(
+        session, "mrf", run, attempt, started, suffix, incumbent=predecessor.as_dict()
+    )
+    ctx_by_field["import_date"] = suffix
+    ctx_by_field["context"]["nucc_native_stage"] = stage
+    model = make_class(archive.models.NUCCTaxonomy, suffix)
+    columns = tuple(archive.models.NUCCTaxonomy.__table__.columns.keys())
+    candidate_rows = [dict(zip(columns, taxonomy_values, strict=True)) for taxonomy_values in _records(1)]
+    assert await archive.copy_nucc_native_batch(session, stage, model, candidate_rows) == 1
+    ready = await archive.prepare_nucc_native_publication_stage(
+        session, stage_model=model, schema_name="mrf", native_stage=stage
+    )
+    return ctx_by_field, model, ready
+
+
+@pytest.mark.asyncio
+async def test_native_nucc_handoff_rejects_stale_predecessor_and_records_exact_attempt(monkeypatch):
+    """A rejected handoff leaves the isolated candidate and running attempt reusable."""
+    from db.models import ImportRun
+    from tests.test_nucc_plain_publication_postgres import _bootstrap_plain, _install_existing_counter
+    from tests.test_nucc_protected_flow_postgres import _native_candidates
+
+    monkeypatch.setenv("HLTHPRT_ALIAS_GUARD_TEST_DSN", _database_url())
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
+    monkeypatch.delenv("DB_SCHEMA", raising=False)
+    async with _native_candidates(monkeypatch) as resources:
+        await resources.admin.execute("DROP SCHEMA hp_snapshot_retention")
+        await resources.admin.execute(f'CREATE SCHEMA mrf AUTHORIZATION "{resources.roles["owner"]}"')
+        await resources.admin.execute(
+            f'GRANT USAGE ON SCHEMA mrf TO "{resources.roles["publisher"]}","{resources.roles["writer"]}"'
+        )
+        await _install_existing_counter(resources)
+        await _bootstrap_plain(resources)
+        async with resources.publisher.transaction() as session:
+            predecessor = await result_generation.read_reference_family_result_generation_authority(
+                session, importer_id="nucc", schema_name="mrf"
+            )
+            ctx, model, ready = await _prepare_nucc_handoff_attempt(session, predecessor)
+            saved_predecessor = ctx["context"]["nucc_native_predecessor"]
+            ctx["context"]["nucc_native_predecessor"] = replace(
+                predecessor, local_generation=0, serving_generation=None, relations=None
+            ).as_dict()
+            with pytest.raises(archive.ReferenceFamilyArchiveError, match="^NUCC native predecessor changed$"):
+                await archive.record_nucc_native_handoff(
+                    session, ctx, schema_name="mrf", stage_model=model, ready=ready
+                )
+            row_query = select(ImportRun.status, ImportRun.metrics).where(ImportRun.run_id == ctx["control_run_id"])
+            status, metrics = (await session.execute(row_query)).one()
+            assert status == "running" and "nucc_handoff" not in metrics
+            ctx["context"]["nucc_native_predecessor"] = saved_predecessor
+            handoff = await archive.record_nucc_native_handoff(
+                session, ctx, schema_name="mrf", stage_model=model, ready=ready
+            )
+            assert handoff["row_count"] == 1 and handoff["incumbent"] == predecessor.as_dict()
+
+        async with resources.publisher.transaction() as session:
+            assert await archive.read_nucc_native_handoff(session, handoff) == handoff
+            status, metrics = (await session.execute(row_query)).one()
+            assert status == "finalizing" and metrics["retained_metric"] == 1
+            assert metrics["nucc_handoff"] == handoff
+
+
 @pytest.mark.asyncio
 async def test_ordinary_nucc_rotation_check_passes_after_the_named_preparation_upgrade():
     """The upgrade adds the retention namespace alone; the next ordinary NUCC import must still rotate."""
@@ -1941,4 +2032,89 @@ async def test_catalog_foreign_key_triggers_pass_tiger_preflight_user_triggers_r
     finally:
         async with engine.begin() as connection:
             await connection.execute(text("DROP SCHEMA IF EXISTS hp_snapshot_retention CASCADE"))
+        await engine.dispose()
+
+
+async def _restore_dictionary_family(session, importer_id, system):
+    ownership = await archive.precreate_reference_family_restore(session, importer_id=importer_id, dataset_id=uuid4())
+    schema = f'"{ownership.schema_name}"'
+    prefix = "drug_claims" if importer_id == "drug-claims" else "claims"
+    catalog, crosswalk = f"{schema}.{prefix}_code_catalog", f"{schema}.{prefix}_code_crosswalk"
+    parameters_by_field = {"system": system, "code": "synthetic-code", "source": "cms_physician_provider_service"}
+    await session.execute(
+        text(f"INSERT INTO {catalog} (code_system, code, source) VALUES (:system, :code, :source)"), parameters_by_field
+    )
+    await session.execute(
+        text(f"""
+            INSERT INTO {crosswalk} (from_system, from_code, to_system, to_code, match_type, confidence, source)
+            VALUES (:system, :code, :system, :code, 'exact', 1, :source)
+        """),
+        parameters_by_field,
+    )
+    if importer_id == "drug-claims":
+        await _restore_dictionary_effect_rows(session, schema, parameters_by_field)
+    receive_spec = archive.reference_family_receive_spec(importer_id)
+    await archive.complete_model_family_stage(session, receive_spec, ownership)
+    manifest = await archive._family_manifest(
+        session,
+        spec=archive.reference_family_spec(importer_id),
+        schema_name=ownership.schema_name,
+        source_metadata={"release": "synthetic"},
+    )
+    return ownership, manifest, crosswalk
+
+
+async def _restore_dictionary_effect_rows(session, schema, parameters_by_field):
+    await session.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+    await session.execute(
+        text(f"INSERT INTO {schema}.pricing_prescription (rx_code_system, rx_code) VALUES (:system, :code)"),
+        parameters_by_field,
+    )
+    await session.execute(
+        text(f"""
+            INSERT INTO {schema}.drug_claims_catalog_effect
+                (code_system, code, after_image, destination_schema, destination_name)
+            SELECT code_system, code, to_jsonb(catalog), 'mrf', 'code_catalog'
+            FROM {schema}.drug_claims_code_catalog catalog
+        """)
+    )
+    await session.execute(
+        text(f"""
+            INSERT INTO {schema}.drug_claims_crosswalk_effect
+                (from_system, from_code, to_system, to_code, after_image, destination_schema, destination_name)
+            SELECT from_system, from_code, to_system, to_code, to_jsonb(edge), 'mrf', 'code_crosswalk'
+            FROM {schema}.drug_claims_code_crosswalk edge
+        """)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("importer_id", "system", "bad_effect"),
+    [("claims-pricing", "CPT", False), ("drug-claims", "HP_RX_CODE", False), ("drug-claims", "HP_RX_CODE", True)],
+)
+async def test_restored_reference_dictionary_requires_closed_endpoints_and_destination(importer_id, system, bad_effect):
+    """A shape- and count-matching archive still needs native relationship and effect validation."""
+    engine = create_async_engine(_database_url())
+    try:
+        async with AsyncSession(engine) as session:
+            await session.begin()
+            ownership, manifest, crosswalk = await _restore_dictionary_family(session, importer_id, system)
+            tables = await archive.validate_reference_family_stage(session, ownership=ownership, manifest=manifest)
+            assert (
+                tuple(table.table_name for table in tables)
+                == archive.reference_family_receive_spec(importer_id).table_names
+            )
+            if bad_effect:
+                await session.execute(
+                    text(f"""UPDATE "{ownership.schema_name}".drug_claims_catalog_effect
+                        SET destination_name = 'other_table'""")
+                )
+                error = "effect closure differs"
+            else:
+                await session.execute(text(f"UPDATE {crosswalk} SET to_code = 'missing-code'"))
+                error = "crosswalk endpoint is missing"
+            with pytest.raises(archive.ReferenceFamilyArchiveError, match=error):
+                await archive.validate_reference_family_stage(session, ownership=ownership, manifest=manifest)
+    finally:
         await engine.dispose()

@@ -1,7 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Ordinary run admission owns a stable retained-publication attempt."""
 
-from contextlib import asynccontextmanager
+import json
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -198,3 +199,320 @@ async def test_terminal_request_replay_never_starts_another_preparation(monkeypa
     build.assert_not_awaited()
     factory.assert_not_called()
     prepare.assert_not_awaited()
+
+
+@pytest.fixture
+def observed_source_inventory(monkeypatch):
+    from process import registry_imported_membership_refresh as admission
+    from process import registry_imported_source_inventory as inventory
+    from tests.test_registry_imported_source_inventory import native_aca_source, native_ptg_source
+
+    complete = inventory.ImportedSourceInventory(
+        json.dumps(
+            {
+                "contract": "registry-imported-catalog-inputs-v1",
+                "fhir_semantics": [],
+                "fhir_descriptors": [],
+                "native_sources": [native_aca_source(), native_ptg_source()],
+                "unavailable": [],
+                "effective_date": "2026-01-01",
+                "search_policy": "native-network-search-v1",
+                "catalog_projector_version": inventory.PROJECTOR_VERSION,
+            }
+        )
+    )
+    observe = AsyncMock(return_value=complete)
+    monkeypatch.setattr(inventory, "current_imported_source_inventory", observe)
+    monkeypatch.setattr(admission, "current_imported_source_inventory", observe)
+    return complete
+
+
+def _queued_refresh_record(observed, run_id):
+    from uuid import uuid4
+
+    from process.registry_publication_queue import publication_request_metadata
+
+    envelope = importer.latest_network_refresh_envelope(observed, run_id)
+    command_by_field = dict(envelope["command"])
+    key = command_by_field.pop("idempotency_key")
+    return {
+        **publication_request_metadata(command_by_field, envelope["actor"], None, key),
+        "request_id": uuid4(),
+        "idempotency_key": key,
+        "session_token_sha256": None,
+    }
+
+
+@pytest.fixture
+def native_import_admission(monkeypatch):
+    from db.models import db
+    from process import registry_membership_refresh_queue as queue
+    from process import registry_membership_refresh_runtime as runtime
+    from process.registry_imported_membership_refresh import RegistryImportedMembershipAdmission
+
+    settings = SimpleNamespace(app_origin=None, control_schema="registry")
+    config = SimpleNamespace(consumer=SimpleNamespace(control_schema=settings.control_schema))
+    observed = observation() | {"address_generation": "a" * 64}
+    observed["published_inputs_digest"] = runtime._semantic_digest(
+        observed["accepted_sources"],
+        observed["approved_revision"],
+        observed["address_generation"],
+        observed["address_artifact_sha256"],
+        [],
+    )
+    bundle = SimpleNamespace(
+        runtime=SimpleNamespace(
+            authorize=RegistryImportedMembershipAdmission(),
+            address_profile=queue.RegistryMembershipRefreshAddressProfile("addresses", ("reader",)),
+        ),
+        inputs_service=AsyncMock(return_value=observed),
+    )
+    connection = SimpleNamespace(
+        fetchrow=AsyncMock(return_value=None), transaction=Mock(side_effect=lambda **_options: nullcontext())
+    )
+    build, enqueue = AsyncMock(return_value=bundle), AsyncMock()
+    monkeypatch.setattr(db, "acquire_driver", lambda: nullcontext(connection))
+    monkeypatch.setattr(runtime, "_settings", lambda raw: settings)
+    monkeypatch.setattr(runtime, "_build_native_bundle", build)
+    monkeypatch.setattr(queue, "enqueue_registry_membership_refresh", enqueue)
+    return SimpleNamespace(
+        config=config, connection=connection, observed=observed, bundle=bundle, build=build, enqueue=enqueue
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_admission_reuses_current_generation(native_import_admission):
+    case = native_import_admission
+    async with AsyncExitStack() as cleanup:
+        assert await importer.admit_latest_network_import(case.config, cleanup, "run-one") == (
+            None,
+            {
+                "state": "unchanged",
+                "generation_id": case.observed["expected_serving_generation"],
+                "manifest_sha256": case.observed["expected_serving_manifest_sha256"],
+            },
+        )
+    case.connection.transaction.assert_called_once_with(isolation="repeatable_read")
+    case.bundle.inputs_service.assert_awaited_once()
+    case.enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_admission_refuses_legacy_authority(native_import_admission):
+    from tests.test_registry_membership_refresh_authority import client
+
+    case = native_import_admission
+    async with client(lambda _request: pytest.fail("ordinary admission contacted legacy authority")) as authority:
+        case.bundle.runtime.authorize = authority
+        async with AsyncExitStack() as cleanup:
+            with pytest.raises(ValueError, match="native_network_import_required"):
+                await importer.admit_latest_network_import(case.config, cleanup, "run-one")
+    case.bundle.inputs_service.assert_not_awaited()
+    case.enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_admission_resumes_exact_queued_request(native_import_admission):
+    case = native_import_admission
+    case.observed.update(address_generation="b" * 64, address_artifact_sha256="c" * 64)
+    stored = _queued_refresh_record(case.observed, "run-one") | {"state": "running", "result_json": None}
+    case.enqueue.return_value = {"request_id": str(stored["request_id"])}
+
+    async with AsyncExitStack() as cleanup:
+        first = await importer.admit_latest_network_import(case.config, cleanup, "run-one")
+        case.connection.fetchrow.return_value = stored
+        case.bundle.inputs_service.side_effect = AssertionError("a queued replay must use its saved source inputs")
+        assert await importer.admit_latest_network_import(case.config, cleanup, "run-one") == first
+
+    assert first == (stored["request_id"], None)
+    assert [invocation.args[1:] for invocation in case.connection.fetchrow.await_args_list] == [
+        (stored["actor_key"], stored["idempotency_key"]),
+        (stored["actor_key"], stored["idempotency_key"]),
+    ]
+    case.build.assert_awaited_once()
+    case.bundle.inputs_service.assert_awaited_once()
+    case.enqueue.assert_awaited_once_with(
+        case.connection,
+        importer.latest_network_refresh_envelope(case.observed, "run-one"),
+        authorize=case.bundle.runtime.authorize,
+        address_profile=case.bundle.runtime.address_profile,
+        control_schema=case.config.consumer.control_schema,
+    )
+
+
+@pytest.fixture
+def capture_preparation(monkeypatch):
+    from process import registry_imported_source_preparation as preparation
+    from process import registry_membership_refresh_runtime as runtime
+    from process.registry_imported_source_reuse import ImportedSourcePreparation
+
+    stage = SimpleNamespace(active=False, fail_commit=False)
+    connection = object()
+
+    @asynccontextmanager
+    async def transaction():
+        stage.active = True
+        try:
+            yield
+            if stage.fail_commit:
+                raise RuntimeError("synthetic_capture_commit_failed")
+        finally:
+            stage.active = False
+
+    async def prepare(driver, **inputs):
+        assert driver is connection and stage.active
+        assert inputs["source_runtime"] is resolver.source_runtime and inputs["control_schema"] == "registry"
+        return prepared_sources
+
+    session = SimpleNamespace(begin=transaction)
+    sessions = Mock(side_effect=lambda: nullcontext(session))
+    resources = SimpleNamespace(settings=SimpleNamespace(control_schema="registry"))
+    resolver = runtime._SourceResolver(resources, source_runtime=object(), capture_sessions=sessions)
+    prepared_sources = ImportedSourcePreparation((object(), object()), ("new_candidate",), ("retained_candidate",))
+    dispatch = AsyncMock(side_effect=prepare)
+    monkeypatch.setattr(preparation, "prepare_imported_source_recipes", dispatch)
+    monkeypatch.setattr(runtime, "_driver", AsyncMock(return_value=connection))
+    return SimpleNamespace(
+        resolver=resolver, stage=stage, dispatch=dispatch, sessions=sessions, prepared_sources=prepared_sources
+    )
+
+
+async def _observed_refresh(inventory, connection):
+    from process.registry_imported_membership_refresh import imported_catalog_inputs
+
+    _, sources, _ = await imported_catalog_inputs(connection, "registry", inventory=inventory)
+    return {**observation(), "accepted_sources": sources}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_commit", [False, True])
+async def test_refresh_prepares_exact_sources_once_after_capture_commit(
+    observed_source_inventory, capture_preparation, fail_commit
+):
+    case, connection = capture_preparation, object()
+    observed = await _observed_refresh(observed_source_inventory, connection)
+    request = _queued_refresh_record(observed, "first-run")
+    if fail_commit:
+        case.stage.fail_commit = True
+        with pytest.raises(RuntimeError, match="capture_commit_failed"):
+            await case.resolver.prepare_sources(connection, request)
+        assert case.resolver.prepared_command is None
+        assert case.resolver.prepared_recipes == case.resolver.created_schemas == ()
+        case.stage.fail_commit = False
+        case.dispatch.reset_mock()
+    await case.resolver.prepare_sources(connection, request)
+    await case.resolver.prepare_sources(connection, request)
+    assert case.resolver.prepared_recipes == case.prepared_sources.recipes
+    assert case.resolver.created_schemas == ("new_candidate",)
+    assert case.dispatch.await_args.kwargs["request_id"] == request["request_id"]
+    assert case.dispatch.await_args.kwargs["envelope"]["command"]["accepted_sources"] == observed["accepted_sources"]
+    from process.registry_membership_refresh_contract import RegistryMembershipRefreshUnavailable
+
+    with pytest.raises(RegistryMembershipRefreshUnavailable):
+        await case.resolver.prepare_sources(connection, _queued_refresh_record(observed, "other-run"))
+    case.dispatch.assert_awaited_once()
+    assert not case.stage.active
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incomplete", ["missing-source", "missing-capture"])
+async def test_membership_refresh_rejects_incomplete_inputs_before_native_capture(
+    observed_source_inventory, capture_preparation, incomplete
+):
+    from process.registry_approval_store import RegistryApprovalConflict
+    from process.registry_membership_refresh_contract import RegistryMembershipRefreshUnavailable
+
+    case, connection = capture_preparation, object()
+    observed = await _observed_refresh(observed_source_inventory, connection)
+    if incomplete == "missing-source":
+        observed["accepted_sources"].pop()
+        error = RegistryApprovalConflict
+    else:
+        case.resolver.capture_sessions = None
+        error = RegistryMembershipRefreshUnavailable
+    with pytest.raises(error):
+        await case.resolver.prepare_sources(connection, _queued_refresh_record(observed, "incomplete-run"))
+    assert case.resolver.prepared_command is None
+    case.sessions.assert_not_called()
+    case.dispatch.assert_not_awaited()
+
+
+@pytest.fixture
+def catalog_loader_lifetime(monkeypatch):
+    from sqlalchemy.engine import make_url
+
+    from process import registry_network_import_runtime as runtime
+
+    loader = SimpleNamespace(fetchval=AsyncMock(return_value=True), execute=AsyncMock())
+    sealer = object()
+    pools_by_role = {"loader": SimpleNamespace(acquire=lambda: nullcontext(loader)), "sealer": sealer}
+    lifecycle_events = []
+
+    @asynccontextmanager
+    async def pool(url, *, min_size, max_size):
+        username = make_url(url).username
+        assert min_size == 1 and max_size == (2 if username == "sealer" else 1)
+        lifecycle_events.append(("open", username))
+        try:
+            yield pools_by_role[username]
+        finally:
+            lifecycle_events.append(("close", username))
+
+    catalog = SimpleNamespace(
+        source_url=None,
+        loader_url=make_url("postgresql://loader@db.example/catalog"),
+        sealer_url=make_url("postgresql://sealer@db.example/catalog"),
+        consumer=SimpleNamespace(control_schema="registry"),
+    )
+    monkeypatch.setattr(runtime.asyncpg, "create_pool", pool)
+    return SimpleNamespace(catalog=catalog, loader=loader, sealer=sealer, lifecycle_events=lifecycle_events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["reuse", "changed-inventory", "busy"])
+async def test_coupled_catalog_reuse_requires_current_inputs_and_releases_loader(
+    monkeypatch, observed_source_inventory, catalog_loader_lifetime, mode
+):
+    from process import registry_fhir_catalog_sync as catalog_sync
+    from process import registry_imported_catalog_preparation as preparation
+    from process import registry_network_import_runtime as runtime
+
+    case = catalog_loader_lifetime
+    case.loader.fetchval.return_value = mode != "busy"
+    source_runtime = SimpleNamespace(catalog_export=Mock(), freeze_preparation=AsyncMock())
+    prior_snapshot_by_field = {
+        "schema_name": "retained_catalog",
+        "metadata_generation": "e" * 64,
+        "accounting_json": {
+            preparation.INPUT_KEY: {"token": observed_source_inventory.token if mode == "reuse" else "f" * 64}
+        },
+    }
+
+    async def prepare(config, connection, source_pool, sealer_pool, *, source_export):
+        assert (config, connection, source_pool, sealer_pool) == (case.catalog, case.loader, None, case.sealer)
+        assert source_export is source_runtime.catalog_export
+        assert preparation.current_catalog_inventory() is observed_source_inventory
+        return None, prior_snapshot_by_field, {"preparation_state": "validated"}
+
+    prepare_catalog = AsyncMock(side_effect=prepare)
+    monkeypatch.setattr(catalog_sync, "prepare_fhir_catalog_snapshot", prepare_catalog)
+    async with AsyncExitStack() as cleanup:
+        failure = {"busy": "catalog_sync_already_running", "changed-inventory": "catalog_preparation_changed"}.get(mode)
+        if failure:
+            with pytest.raises(ValueError, match=failure):
+                await runtime.prepare_network_import_catalog(case.catalog, source_runtime, cleanup)
+        else:
+            prepared_catalog = await runtime.prepare_network_import_catalog(case.catalog, source_runtime, cleanup)
+            assert prepared_catalog.snapshot is prior_snapshot_by_field
+            assert prepared_catalog.inventory_token == observed_source_inventory.token
+    assert case.lifecycle_events == [("open", "loader"), ("open", "sealer"), ("close", "sealer"), ("close", "loader")]
+    assert preparation.current_catalog_inventory() is None
+    source_runtime.freeze_preparation.assert_not_awaited()
+    if mode == "busy":
+        prepare_catalog.assert_not_awaited()
+        case.loader.execute.assert_not_awaited()
+    else:
+        prepare_catalog.assert_awaited_once()
+        case.loader.execute.assert_awaited_once_with(
+            "SELECT pg_advisory_unlock(hashtextextended($1,0))", "registry-fhir-catalog:registry"
+        )

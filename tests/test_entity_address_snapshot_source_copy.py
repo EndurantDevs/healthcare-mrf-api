@@ -373,7 +373,7 @@ async def test_interrupted_native_copy_drains_cancel_before_transport_fallback(c
         terminate=lambda: events.append("fallback terminate"),
     )
     with pytest.raises(asyncio.CancelledError, match="original cancel"):
-        await source.family_archive._copy_native_projection(driver, "SELECT 1", "owned", "rows", ("id",), 10, 1)
+        await source.family_archive._copy_native_projection((None, driver), "SELECT 1", "owned", "rows", ("id",), 10, 1)
     assert events == (["cancel acknowledged"] if close_error is None else ["cancel acknowledged", "fallback terminate"])
     driver.copy_to_table.assert_not_awaited()
 
@@ -392,7 +392,7 @@ async def test_repeated_cancellation_does_not_abandon_native_cancel_handshake():
 
     driver = SimpleNamespace(copy_from_query=copy, close=close, terminate=Mock())
     task = asyncio.create_task(
-        source.family_archive._copy_native_projection(driver, "SELECT 1", "owned", "rows", ("id",), 10, 30)
+        source.family_archive._copy_native_projection((None, driver), "SELECT 1", "owned", "rows", ("id",), 10, 30)
     )
     await copying.wait()
     task.cancel()

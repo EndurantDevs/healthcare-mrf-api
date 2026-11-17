@@ -13,6 +13,12 @@ from process import registry_network_catalog_read as catalog
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
 from process.network_compact_layout import CompactAddressRelation
 from process.network_serving_read import PinnedNetworkServingManifest
+from process.registry_native_network_catalog import (
+    native_catalog_descriptor,
+    native_catalog_rows,
+    native_network_definitions,
+)
+from tests.test_registry_imported_source_inventory import native_aca_source, native_ptg_source
 
 
 def network_document(network_id=7):
@@ -456,6 +462,105 @@ def test_retained_capture_scope_never_satisfies_a_legacy_uuid_selector():
         ).value
         == identifier
     )
+
+
+def native_binding_document(descriptor):
+    projection = native_catalog_rows(
+        descriptor,
+        generation="d" * 64,
+        accepted_at="2026-01-01T00:00:00Z",
+        metadata_generation="a" * 64,
+        networks={key: 7 for key in native_network_definitions(descriptor)},
+        status="last_good",
+    )
+    (binding_row,) = projection.binding_rows
+    binding = json.loads(binding_row[-1])
+    for field in ("metadata_sha256", "accepted_at", "status"):
+        del binding[field]
+    return binding
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_factory,source_key,expected_scope",
+    [
+        pytest.param(
+            native_aca_source,
+            "ACAPlan/10001NY0000001/23",
+            {
+                "issuer_id": "10001",
+                "plan_id": "10001NY0000001",
+                "plan_year": 2027,
+                "state": "NY",
+                "checksum_network": 23,
+            },
+            id="aca-plan",
+        ),
+        pytest.param(
+            native_ptg_source,
+            "PTGProviderSet/source-graph",
+            {
+                "kind": "imported_provider_set_v1",
+                "source_key": "source-graph",
+                "snapshot_id": "snapshot-one",
+                "snapshot_key": 31,
+            },
+            id="ptg-provider-set",
+        ),
+    ],
+)
+async def test_native_catalog_preserves_pinned_source(batch_boundary, source_factory, source_key, expected_scope):
+    connection, manifest, revisions = batch_boundary
+    descriptor = native_catalog_descriptor(source_factory())
+    coordinates = RegistryNetworkSourceCoordinates(**descriptor["coordinates"])
+    binding = native_binding_document(descriptor)
+    document = network_document() | {"source_bindings": [binding]}
+    connection.page["rows_json"] = json.dumps([document])
+
+    page = await catalog.read_registry_network_catalog(
+        connection,
+        catalog.RegistryNetworkCatalogQuery(source=coordinates, generation_id=manifest.generation_id),
+        excluded_network_ids=(),
+        control_schema="sample_control",
+    )
+
+    assert page["items"] == (document,) and page["generation"] == "9" and revisions == [4]
+    assert binding["source_key"] == source_key
+    assert binding["source_scope"] == expected_scope | {"source_generation": "d" * 64}
+    assert connection.calls[-1][1][4] == coordinates.sql_parameters
+
+
+@pytest.mark.parametrize(
+    "source_factory,field,replacement",
+    [
+        pytest.param(native_aca_source, "source_generation", None, id="missing-generation"),
+        pytest.param(native_aca_source, "plan_id", None, id="missing-aca-plan"),
+        pytest.param(native_ptg_source, "snapshot_id", None, id="missing-ptg-snapshot"),
+        pytest.param(native_ptg_source, "kind", "plan_tier_v1", id="wrong-ptg-kind"),
+    ],
+)
+def test_native_catalog_refuses_malformed_scope(source_factory, field, replacement):
+    binding = native_binding_document(native_catalog_descriptor(source_factory()))
+    if replacement is None:
+        del binding["source_scope"][field]
+    else:
+        binding["source_scope"][field] = replacement
+    document = network_document() | {"source_bindings": [binding]}
+    with pytest.raises(catalog.RegistryNetworkCatalogError, match="document_invalid"):
+        catalog.catalog_network_document(document)
+
+
+@pytest.mark.parametrize("changes", [{"aliases": "Sample Alias"}, {"directory_available": 1}, {"source_bindings": {}}])
+def test_catalog_refuses_malformed_network_fields(changes):
+    with pytest.raises(catalog.RegistryNetworkCatalogError, match="document_invalid"):
+        catalog.catalog_network_document(network_document() | changes)
+
+
+def test_catalog_refuses_duplicate_native_bindings():
+    binding = native_binding_document(native_catalog_descriptor(native_aca_source()))
+    document = network_document() | {"source_bindings": [binding, binding | {"revision": 2}]}
+    with pytest.raises(catalog.RegistryNetworkCatalogError, match="document_invalid"):
+        catalog.catalog_network_document(document)
 
 
 @pytest.mark.asyncio

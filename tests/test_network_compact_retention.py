@@ -133,6 +133,20 @@ async def test_physical_ids_cannot_name_retirement_targets():
     connection.execute.assert_not_awaited()
 
 
+def test_retirement_extracts_shared_schema_and_nested_table_coordinates():
+    descriptor_by_field = {
+        "schema_name": "retained_sources",
+        "tables": {
+            "resource": "directory_resource",
+            "header": {"schema": "retained_catalog", "name": "directory_header"},
+        },
+    }
+    assert retention._named_relations(descriptor_by_field) == {
+        ("retained_sources", "directory_resource"),
+        ("retained_catalog", "directory_header"),
+    }
+
+
 async def test_declared_unwritten_fact_inventory_is_not_an_empty_dependency_set():
     from process.registry_source_contribution_store import RegistrySourceContributionError
     from process.registry_source_inventory_contract import make_source_inventory_entry, source_inventory_root

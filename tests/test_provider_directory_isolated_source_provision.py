@@ -154,18 +154,6 @@ async def _canonical_state(connection):
     )
 
 
-async def _assert_copied_native_layouts(connection, schema):
-    from process.provider_directory_source_storage_binding import _PRIVATE_LAYOUT_SQL, _isolated_layout_shape
-
-    rows = await connection.fetch(_PRIVATE_LAYOUT_SQL, ["catalog", schema], list(provision.ISOLATED_FHIR_ROOTS))
-    layouts_by_key = {(row["nspname"], row["relname"]): row for row in rows}
-    for root in provision.ISOLATED_FHIR_ROOTS:
-        assert _isolated_layout_shape(layouts_by_key[schema, root], template=False) == _isolated_layout_shape(
-            layouts_by_key["catalog", root],
-            template=True,
-        )
-
-
 async def test_private_storage_grants_are_enforced_by_native_sql(native_bootstrap):
     case = native_bootstrap
     async with case.connection.transaction():
@@ -378,7 +366,7 @@ async def test_native_bootstrap_preserves_guards_reads_and_fk_free_storage(nativ
         async with connection.transaction():
             receipt = await _provision(case)
             assert receipt == {"catalog_schema": "catalog", "storage_schema": case.policy.schema}
-            await _assert_copied_native_layouts(connection, case.policy.schema)
+            await _assert_migrated_isolated_data(connection, case.policy)
             locks = await connection.fetch(
                 "SELECT c.relname,l.mode FROM pg_locks l JOIN pg_class c ON c.oid=l.relation "
                 "WHERE l.pid=pg_backend_pid() AND c.relnamespace='catalog'::regnamespace"
@@ -579,6 +567,13 @@ async def _verify_native_catalog_custody(monkeypatch):
             await _close_native_role_fixture(driver, created_role_names)
 
 
+async def _assert_native_check_rejects_empty_item(connection, copied):
+    """Preserve the copied CHECK constraint's rejection and savepoint cleanup."""
+    with pytest.raises(asyncpg.CheckViolationError):
+        async with connection.transaction():
+            await connection.execute(f"INSERT INTO {copied}(dataset_id,item,value) VALUES('selected','',2)")
+
+
 @pytest.mark.parametrize("kind", ["check", "default", "index", "sequence", "same_named_check"])
 async def test_private_copy_preserves_native_template_dependencies(native_bootstrap, kind):
     case, connection = native_bootstrap, native_bootstrap.connection
@@ -594,7 +589,7 @@ async def test_private_copy_preserves_native_template_dependencies(native_bootst
     before = await _canonical_state(connection)
     async with connection.transaction():
         await _provision(case)
-        await _assert_copied_native_layouts(connection, case.policy.schema)
+        await _assert_migrated_isolated_data(connection, case.policy)
         assert await _canonical_state(connection) == before
         copied = storage_relation(case.policy.schema, provision.RELATIONS[1])
         await connection.execute(f"INSERT INTO {copied}(dataset_id,item,value) VALUES('selected','UPPER',1)")
@@ -605,15 +600,20 @@ async def test_private_copy_preserves_native_template_dependencies(native_bootst
             "upper",
         )
         if kind in {"check", "same_named_check"}:
-            with pytest.raises(asyncpg.CheckViolationError):
-                async with connection.transaction():
-                    await connection.execute(f"INSERT INTO {copied}(dataset_id,item,value) VALUES('selected','',2)")
-        elif kind == "default":
+            await _assert_native_check_rejects_empty_item(connection, copied)
+        if kind == "default":
             await connection.execute(f"INSERT INTO {copied}(dataset_id,value) VALUES('default',2)")
             assert await connection.fetchval(f"SELECT item FROM {copied} WHERE dataset_id='default'") == "value"
-        elif kind == "sequence":
+        if kind == "sequence":
             await connection.execute(f"INSERT INTO {copied}(dataset_id,item) VALUES('sequence','next')")
             assert await connection.fetchval(f"SELECT value FROM {copied} WHERE dataset_id='sequence'") == 1
+        if kind == "index":
+            assert await connection.fetchval(
+                "SELECT EXISTS(SELECT FROM pg_indexes WHERE schemaname=$1 AND tablename=$2 "
+                "AND indexdef LIKE '%catalog.extra(item)%')",
+                case.policy.schema,
+                provision.RELATIONS[1],
+            )
         assert await connection.fetchval(f"SELECT count(*) FROM {relation}") == 0
 
 

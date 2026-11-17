@@ -149,7 +149,7 @@ async def test_projection_drains_spool_failure_then_closes_without_loading(monke
 
     driver = SimpleNamespace(copy_from_query=capture, copy_to_table=AsyncMock(), terminate=Mock())
     with pytest.raises(OSError) as caught:
-        await archive._copy_native_projection(driver, "SELECT 1", "candidate", "rows", ("value",), 20, 30)
+        await archive._copy_native_projection((None, driver), "SELECT 1", "candidate", "rows", ("value",), 20, 30)
     assert caught.value is failure and drained_chunks == [b"first", b"second", b"last"]
     spool.write.assert_called_once_with(b"first")
     spool.__exit__.assert_called_once()

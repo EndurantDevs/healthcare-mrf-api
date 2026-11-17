@@ -13,7 +13,7 @@ from db.models import GeoZipLookup
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import reference_family_result_generation as generation
 from process.geo_source_storage import ROOT, publish_geo_generation, replay_geo_reads, require, require_geo_storage
-from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
+from process.native_copy_cleanup import cleanup_interrupted_copy
 from process.provider_directory_generic_source_policy import bound_publisher, source_transaction
 from process.provider_directory_generic_source_storage import _close_grants
 
@@ -54,9 +54,8 @@ async def _copy(session, name, columns, records, deadline):
                 records=records,
                 timeout=remaining,
             )
-    except asyncio.CancelledError, TimeoutError:
-        await close_interrupted_copy(driver)
-        await invalidate_copy_owner(session, driver)
+    except (asyncio.CancelledError, TimeoutError) as interruption:
+        await cleanup_interrupted_copy(session, driver, interruption)
         raise
     require(result == f"COPY {len(records)}", "copy_count_changed")
 

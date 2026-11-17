@@ -4,7 +4,7 @@
 import hashlib
 import json
 import struct
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -23,6 +23,7 @@ from process.provider_directory_source_summary import (
     build_source_summary,
 )
 from tests.test_network_fhir_source_witness_contract import legacy_origin_fields, origin_fields
+from tests.uhc_final_publication_test_support import final_publication_fixture
 
 
 def _publication_header(origin, summary):
@@ -53,11 +54,9 @@ def _publication_header(origin, summary):
     }
 
 
-def _original_publication(proof_key=None):
-    """Pair original bytes with a header and rollback-only binary COPY reader."""
-    fields = legacy_origin_fields()
+def _fhir_summary(fields):
     resource_count_by_type = dict(fields["resource_counts"])
-    summary = build_source_summary(
+    return build_source_summary(
         binding=ProviderDirectorySourceSummaryBinding(
             fields["dataset_id"], fields["endpoint_id"], fields["root_run_id"], fields["dataset_sha256"]
         ),
@@ -65,10 +64,25 @@ def _original_publication(proof_key=None):
         selected_resources=sorted(resource_count_by_type),
         count_by_resource=resource_count_by_type,
         hash_by_resource=dict(fields["resource_hashes"]),
-        count_by_field={**dict.fromkeys(SOURCE_SUMMARY_OUTCOME_COUNT_FIELDS, 0), "organization_resources": 1},
+        count_by_field={
+            **dict.fromkeys(SOURCE_SUMMARY_OUTCOME_COUNT_FIELDS, 0),
+            "individual_practitioners": resource_count_by_type.get("Practitioner", 0),
+            "organization_resources": resource_count_by_type.get("Organization", 0),
+            "practitioner_role_resources": resource_count_by_type.get("PractitionerRole", 0),
+        },
         count_by_category={"unknown_field_counts": {}, "intentional_drop_counts": {}},
         identity_by_field={"semantic_contract_id": SOURCE_SUMMARY_FHIR_SEMANTIC_CONTRACT_ID},
     )
+
+
+def _binary_copy(encoded):
+    return b"PGCOPY\n\xff\r\n\x00" + struct.pack("!iihi", 0, 0, 1, len(encoded)) + encoded + struct.pack("!h", -1)
+
+
+def _original_publication(proof_key=None):
+    """Pair original bytes with a header and rollback-only binary COPY reader."""
+    fields = legacy_origin_fields()
+    summary = _fhir_summary(fields)
     metadata = {"source_ids": [fields["source_id"]], "source_summary_v1": summary}
     if proof_key is not None:
         metadata[proof_key] = {"contract_id": "unexpected-proof"}
@@ -86,9 +100,7 @@ def _original_publication(proof_key=None):
         assert dataset_id == origin.dataset_id and options == {"format": "binary"}
         assert query.startswith("SELECT publication_metadata_json::text")
         assert f'FROM "{origin.header_relation["schema"]}"."{origin.header_relation["name"]}"' in query
-        await output(
-            b"PGCOPY\n\xff\r\n\x00" + struct.pack("!iihi", 0, 0, 1, len(encoded)) + encoded + struct.pack("!h", -1)
-        )
+        await output(_binary_copy(encoded))
         return "COPY 1"
 
     reader = SimpleNamespace(transaction=lambda: SimpleNamespace(start=start, rollback=rollback), copy_from_query=copy)
@@ -208,12 +220,19 @@ def _historical_copy(tmp_path, shard_count, damage):
         resource_hashes=(("Location", proof["resource_hashes"]["Location"]),),
         descriptor_counts=(("Location", 2),),
     )
-    origin = source_origin(fields)
+    summary = _fhir_summary(fields)
+    metadata["source_summary_v1"] = summary
     encoded = json.dumps(metadata).encode()
-    path = tmp_path / "publication.copy"
-    path.write_bytes(
-        b"PGCOPY\n\xff\r\n\x00" + struct.pack("!iihi", 0, 0, 1, len(encoded)) + encoded + struct.pack("!h", -1)
+    origin = source_origin(
+        fields
+        | {
+            "summary_sha256": summary["summary_sha256"],
+            "metadata_bytes": len(encoded),
+            "metadata_text_sha256": hashlib.sha256(encoded).hexdigest(),
+        }
     )
+    path = tmp_path / "publication.copy"
+    path.write_bytes(_binary_copy(encoded))
     expected = admission._AdmissionCopyExpectation(
         origin.dataset_id, origin.endpoint_id, origin.root_run_id, origin.dataset_sha256, 1
     )
@@ -231,6 +250,63 @@ def test_historical_profile_accepts_only_its_original_refusal_and_rechecks_linea
         else:
             with pytest.raises(contract.SourceWitnessContractError, match="source_fhir_witness_contract_invalid"):
                 publication._historical_proof(stream, expected, origin)
+
+
+def test_historical_publication_compares_original_descriptor_totals(tmp_path):
+    path, _, origin = _historical_copy(tmp_path, 2, "known_refusal")
+    with publication._metadata_stream(path) as stream:
+        incorrect_origin = replace(origin, descriptor_counts=(("Location", 3),))
+        with pytest.raises(contract.SourceWitnessContractError, match="source_fhir_witness_contract_invalid"):
+            publication._validate_metadata(stream, incorrect_origin, {})
+    with publication._metadata_stream(path) as stream:
+        publication._validate_metadata(stream, origin, {})
+
+
+def test_uhc_publication_reconciles_all_canonical_shard_counts(tmp_path):
+    state, _ = final_publication_fixture()
+    metadata = state["publication_metadata_json"]
+    metadata["resource_hash_contract"] = "transport_neutral_v2"
+    proof = metadata["uhc_canonical_content_proof_v1"]
+    assert len(proof["shards"]) > 1
+    encoded = json.dumps(metadata).encode()
+    path = tmp_path / "publication.copy"
+    path.write_bytes(_binary_copy(encoded))
+    counts = tuple(sorted(proof["resource_counts"].items()))
+    fields = origin_fields() | {
+        "source_id": state["source_id"],
+        "source_aliases": (state["source_id"],),
+        "dataset_id": state["dataset_id"],
+        "endpoint_id": state["endpoint_id"],
+        "root_run_id": state["acquisition_root_run_id"],
+        "dataset_sha256": state["dataset_hash"],
+        "metadata_bytes": len(encoded),
+        "metadata_text_sha256": hashlib.sha256(encoded).hexdigest(),
+        "summary_sha256": metadata["source_summary_v1"]["summary_sha256"],
+        "proof_sha256": proof["proof_sha256"],
+        "resource_counts": counts,
+        "descriptor_counts": counts,
+        "resource_hashes": tuple(sorted(proof["resource_hashes"].items())),
+        "admission_profile": contract.ADMITTED_UHC_PROFILE,
+        "semantic_projection_as_of": None,
+    }
+    expected = admission._AdmissionCopyExpectation(
+        state["dataset_id"],
+        state["endpoint_id"],
+        state["acquisition_root_run_id"],
+        state["dataset_hash"],
+        state["resource_count"],
+    )
+    with publication._metadata_stream(path) as stream:
+        receipt = admission._validate_finished_stream(stream, expected)
+        origin = source_origin(fields | {"admission_metadata_sha256": receipt.metadata_sha256})
+        header_by_field = {
+            "admitted_summary": json.dumps(receipt.metadata_summary),
+            "content_proof_admission_version": receipt.admission_version,
+            "content_proof_admission_kind": receipt.admission_kind,
+            "content_proof_admission_sha256": receipt.proof_sha256,
+            "content_proof_resource_types": list(receipt.resource_types),
+        }
+        publication._validate_metadata(stream, origin, header_by_field)
 
 
 @pytest.mark.parametrize("unresolved", [1, False])

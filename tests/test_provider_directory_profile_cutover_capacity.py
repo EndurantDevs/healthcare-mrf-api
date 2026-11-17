@@ -6,20 +6,22 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+from contextlib import nullcontext
 
 import pytest
 
 from process import provider_directory_profile_capacity as capacity
-from tests.test_provider_directory_profile_capacity import _geometry_payload
+from process.provider_directory_profile_capacity_geometry import project_legacy_capacity_geometry
+from tests.test_provider_directory_profile_capacity import _geometry_payload, _legacy_geometry_projection_inputs
 from tests.test_provider_directory_profile_capacity_projection import _projection_geometry
 
 
-def _cutover_target_projection(geometry):
-    """Project one evidence insert and one no-op profile target."""
+def _cutover_target_projection(geometry, *, evidence_inserted=1):
+    """Project optional evidence inserts and a no-op profile target."""
     target_inputs = (
         capacity.ProviderDirectoryProfileTargetDeltaInput(
             relation_name="evidence_target",
-            inserted_rows=1,
+            inserted_rows=evidence_inserted,
             inserted_toast_chunks=0,
             deleted_rows=0,
             deleted_logical_bytes=0,
@@ -99,7 +101,7 @@ def _cutover_forecast_by_field(
     """Return the complete signed cutover forecast fixture."""
     layout_by_name = _cutover_layout_by_name(geometry)
     return {
-        "contract_id": capacity.CUTOVER_FORECAST_CONTRACT_ID,
+        "contract_id": geometry.cutover_forecast_contract_id,
         "build_id": "pdpb_" + "a" * 32,
         "run_id": "run_" + "b" * 32,
         "capacity_geometry_hash": capacity.capacity_geometry_hash(geometry),
@@ -144,10 +146,10 @@ def _cutover_actual_by_field(
     }
 
 
-def _cutover_evidence_fixture():
+def _cutover_evidence_fixture(geometry=None, *, evidence_inserted=1):
     """Return geometry plus matching cutover forecast and observations."""
-    geometry = _projection_geometry()
-    target_projection = _cutover_target_projection(geometry)
+    geometry = geometry if geometry is not None else _projection_geometry()
+    target_projection = _cutover_target_projection(geometry, evidence_inserted=evidence_inserted)
     metadata_projection = _cutover_metadata_projection(geometry)
     forecast_hash = "f" * 64
     forecast_by_field = _cutover_forecast_by_field(
@@ -159,6 +161,7 @@ def _cutover_evidence_fixture():
         metadata_projection,
         forecast_hash,
     )
+    actual_by_field["contract_id"] = geometry.cutover_actual_contract_id
     return geometry, forecast_by_field, actual_by_field, forecast_hash
 
 
@@ -258,6 +261,47 @@ def test_current_cutover_replay_refuses_wrong_target_or_invalid_numeric_layout(c
             run_id=forecast["run_id"],
             forecast_hash=forecast_hash,
             evidence_inserted=1,
+            evidence_deleted=0,
+            profile_inserted=0,
+            profile_deleted=0,
+        )
+
+
+@pytest.mark.parametrize("missing_toast_pages", [False, True], ids=["complete-layout", "truncated-layout"])
+def test_retained_cutover_replays_complete_index_page_accounting(missing_toast_pages):
+    retained_geometry_by_field, geometry_hash, evidence = _legacy_geometry_projection_inputs()
+    geometry = project_legacy_capacity_geometry(
+        retained_geometry_by_field,
+        geometry_hash,
+        relations=_geometry_payload()["relations"],
+        retained_evidence=evidence,
+    )
+    _, forecast, actual, forecast_hash = _cutover_evidence_fixture(geometry, evidence_inserted=0)
+    for role in ("evidence_target", "profile_target", "build_checkpoint", "serving_generation", "delta_receipt"):
+        layout = forecast[role + "_layout"]
+        del layout["schema"], layout["name"]
+        layout.update(
+            exact_fingerprint=retained_geometry_by_field[role + "_storage_fingerprint"],
+            main_index_oids=[10],
+            toast_index_oids=[11],
+        )
+    if missing_toast_pages:
+        forecast["build_checkpoint_layout"]["toast_index_pages"] = []
+
+    expected = (
+        pytest.raises(capacity.ProviderDirectoryProfileCapacityError, match="cutover_layout_history_invalid")
+        if missing_toast_pages
+        else nullcontext()
+    )
+    with expected:
+        capacity.validate_profile_delta_cutover_evidence(
+            geometry,
+            forecast,
+            actual,
+            build_id=forecast["build_id"],
+            run_id=forecast["run_id"],
+            forecast_hash=forecast_hash,
+            evidence_inserted=0,
             evidence_deleted=0,
             profile_inserted=0,
             profile_deleted=0,

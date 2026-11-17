@@ -4,13 +4,6 @@
 from sqlalchemy.dialects import postgresql
 
 from db.plan_release_storage import storage_relation
-from process.provider_directory_cms_control_privileges import (
-    ADDRESS_GENERATION_UPDATE,
-    GEO_STATE_UPDATE,
-    PROFILE_DELTA_INSERT,
-    PROFILE_GENERATION_UPDATE,
-    PROFILE_INITIAL_INSERT,
-)
 
 CONTROL_ROOTS = (
     "provider_directory_source",
@@ -157,63 +150,7 @@ async def require_cms_control_model_layout(database, model, schema):
     _require_model_indexes(model, [dict(row._mapping if hasattr(row, "_mapping") else row) for row in indexes])
 
 
-def _writer_rights(root, columns):
-    """Fixed existing writers, not a role inferred from a newly observed ACL."""
-    all_columns = tuple(columns)
-    if root in CONTROL_ROOTS[:2]:
-        return {"SELECT", "MAINTAIN", *(("DELETE",) if root == CONTROL_ROOTS[0] else ())}, {
-            "INSERT": all_columns,
-            "UPDATE": all_columns,
-        }
-    if root == CONTROL_ROOTS[2]:
-        return {"SELECT", "MAINTAIN"}, {"INSERT": all_columns, "UPDATE": PROFILE_GENERATION_UPDATE}
-    if root == CONTROL_ROOTS[3]:
-        return {"SELECT", "MAINTAIN"}, {"INSERT": PROFILE_INITIAL_INSERT}
-    if root == CONTROL_ROOTS[4]:
-        return {"SELECT"}, {"INSERT": PROFILE_DELTA_INSERT, "UPDATE": ("build_id",)}
-    if root == CONTROL_ROOTS[5]:
-        updates = (
-            "owner_run_id",
-            "state",
-            "last_error",
-            "updated_at",
-            "evidence_next_batch",
-            "profile_next_batch",
-            "completed_at",
-            "cutover_forecast_status",
-            "cutover_forecast_hash",
-            "cutover_forecast_json",
-        )
-        return {"SELECT", "DELETE", "MAINTAIN"}, {"INSERT": all_columns, "UPDATE": updates}
-    if root == CONTROL_ROOTS[6]:
-        return {"SELECT"}, {"UPDATE": ADDRESS_GENERATION_UPDATE}
-    if root == CONTROL_ROOTS[7]:
-        return {"SELECT"}, {"INSERT": ("singleton", *GEO_STATE_UPDATE[4:]), "UPDATE": GEO_STATE_UPDATE}
-    if root == CONTROL_ROOTS[8]:
-        return {"SELECT"}, {"INSERT": all_columns, "UPDATE": ("generation", "updated_at")}
-    _require(root == CONTROL_ROOTS[9], "writer_scope_changed")
-    return {"SELECT", "MAINTAIN"}, {"UPDATE": (*ADDRESS_GENERATION_UPDATE, "source_revision_tracked")}
-
-
 # Exact post-repair source graph, plus two unchanged historical control callables.
-
-
-def _require_native_indexes(catalog):
-    _require(
-        all(
-            entry["native"]
-            and entry["method"] == "btree"
-            and all(entry[name] for name in ("indisvalid", "indisready", "indislive", "indimmediate"))
-            and not any(
-                entry[name] for name in ("indisexclusion", "indisclustered", "indisreplident", "indnullsnotdistinct")
-            )
-            and entry["indnatts"] == entry["indnkeyatts"]
-            and entry["indoption"] == [0] * entry["indnatts"]
-            and entry["index_expressions"] == entry["index_predicate"] == ""
-            for entry in catalog["indexes"] or ()
-        ),
-        "native_index_changed",
-    )
 
 
 async def _require_native_foreign_functions(connection, hook_oids):

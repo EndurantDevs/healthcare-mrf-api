@@ -12,16 +12,19 @@ import asyncpg
 import pytest
 
 from process import registry_imported_catalog_bindings as bindings
+from process import registry_imported_source_inventory as inventory
 from process import registry_native_provider_source as providers
 from process.network_approved_membership_source import ApprovedMembershipSource
 from process.network_fhir_source_witness_contract import digest
 from process.registry_imported_catalog_preparation import stage_native_catalog_source
+from process.registry_imported_source_preparation import _prepare_native_recipes
 from process.registry_native_network_catalog import native_catalog_descriptor
 from tests.test_registry_fhir_catalog_grant import standing_grant
 from tests.test_registry_fhir_catalog_store_postgres import storage_database as storage_database
 from tests.test_registry_fhir_catalog_store_postgres import target
 from tests.test_registry_fhir_catalog_validation import snapshot
-from tests.test_registry_imported_source_inventory import native_aca_source
+from tests.test_registry_imported_source_inventory import inventory_case as inventory_case
+from tests.test_registry_imported_source_inventory import native_aca_source, observe
 from tests.test_registry_native_network_catalog_postgres import native_control
 
 
@@ -154,6 +157,34 @@ async def test_native_codec_and_committed_recovery_keep_exact_capture(native_pro
             case.writer, case.descriptor, owner_role=case.fixture.loader, runtime_roles=()
         )
         assert not created and recovered == case.recipe
+
+
+@pytest.mark.asyncio
+async def test_imported_native_preparation_reuses_the_exact_completed_capture(
+    native_provider_case, inventory_case, monkeypatch
+):
+    case = native_provider_case
+    observed = (await observe(inventory_case)).document
+    observed["native_sources"] = [case.descriptor["input"]]
+    selected_inventory = inventory.ImportedSourceInventory(json.dumps(observed))
+    scope = bindings.PublishedFHIRCatalogBindingScope(
+        case.selected["metadata_generation"], prepared_inventory_token=selected_inventory.token
+    )
+    runtime = SimpleNamespace(catalog_bindings=scope, capture_owner_role=case.fixture.loader, runtime_roles=())
+    monkeypatch.setattr(inventory, "current_imported_source_inventory", AsyncMock(return_value=selected_inventory))
+
+    async with case.writer.transaction():
+        assert await _prepare_native_recipes(case.writer, runtime, selected_inventory.token, (case.recipe,)) == (
+            (case.recipe, False),
+        )
+        assert await _prepare_native_recipes(case.writer, runtime, selected_inventory.token, ()) == (
+            (case.recipe, False),
+        )
+        with pytest.raises(ValueError, match="catalog_changed"):
+            await _prepare_native_recipes(case.writer, runtime, "f" * 64, (case.recipe,))
+        with pytest.raises(ValueError, match="predecessor_ambiguous"):
+            await _prepare_native_recipes(case.writer, runtime, selected_inventory.token, (case.recipe, case.recipe))
+        await providers.require_native_provider_capture(case.writer, case.recipe.source_pin)
 
 
 @pytest.mark.asyncio

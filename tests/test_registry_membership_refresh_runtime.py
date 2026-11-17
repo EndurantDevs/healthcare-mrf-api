@@ -3,7 +3,7 @@
 
 import asyncio
 import json
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -13,10 +13,14 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from process import registry_imported_catalog_preparation
 from process import registry_membership_refresh_runtime as runtime
+from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
+from process.registry_imported_catalog_bindings import PublishedFHIRCatalogBindingScope
 from process.registry_membership_refresh_authority import RegistryMembershipRefreshAuthorityClient
 from process.registry_membership_refresh_contract import RegistryMembershipRefreshUnavailable
 from process.registry_refresh_anchor_contract import encoded_document
+from process.registry_source_recipe_composition import SourceWitnessRuntime
 
 
 def configuration():
@@ -657,6 +661,84 @@ async def test_configured_bundle_failure_propagates_without_identity_fallback(mo
         with pytest.raises(expected):
             await runtime.build_registry_membership_refresh_runtime(configuration(), cleanup)
     allocate.assert_awaited_once()
+
+
+def _imported_worker_request():
+    """Build the persisted request with the queue's normal encoding."""
+    from process.registry_membership_refresh_contract import SERVICE_ACTOR
+    from process.registry_membership_refresh_queue import _request_metadata
+    from tests.test_registry_imported_membership_refresh import imported_command
+
+    command = imported_command()
+    request_key = command.pop("idempotency_key")
+    request_by_field = {
+        **_request_metadata(command, dict(SERVICE_ACTOR), None, request_key),
+        "idempotency_key": request_key,
+        "session_token_sha256": None,
+    }
+    return command["expected_approved_revision"], request_by_field
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admitted", [False, True])
+async def test_imported_worker_opens_capture_only_after_reading_its_admitted_catalog(monkeypatch, admitted):
+    """Resolve the admitted catalogue in a read-only session before allocating capture access."""
+    expected_revision, request_by_field = _imported_worker_request()
+    request_id = uuid4()
+    source_runtime = SourceWitnessRuntime(
+        lambda **_kwargs: nullcontext(),
+        (FHIRCatalogSourceReadProfile("directory", "directory"),),
+        "candidate_owner",
+        ("network_reader",),
+    )
+    config = SimpleNamespace(
+        initial_address_sources=SimpleNamespace(source_witness_runtime=source_runtime),
+        lifecycle_url=object(),
+        custody_url=object(),
+    )
+    settings = SimpleNamespace(app_origin=None, control_schema="registry")
+    driver = SimpleNamespace(fetchrow=AsyncMock(return_value=request_by_field if admitted else None))
+    session = SimpleNamespace(begin=nullcontext, execute=AsyncMock())
+    monkeypatch.setattr(runtime, "_driver", AsyncMock(return_value=driver))
+
+    async def resolve(connection, generation, approval, *, control_schema):
+        assert connection is driver and control_schema == "registry"
+        assert generation == "d" * 64 and approval == expected_revision
+        assert str(session.execute.await_args.args[0]) == "SET TRANSACTION READ ONLY"
+        return SimpleNamespace(metadata_generation=generation, inventory_token="f" * 64)
+
+    monkeypatch.setattr(registry_imported_catalog_preparation, "resolve_imported_catalog_preparation", resolve)
+    capture_sessions = object()
+    allocated_urls = []
+    lifecycle_closed = asyncio.Event()
+
+    @asynccontextmanager
+    async def lifecycle_session():
+        try:
+            yield session
+        finally:
+            lifecycle_closed.set()
+
+    def worker_sessions(_config, _cleanup, url):
+        allocated_urls.append(url)
+        if url is config.lifecycle_url:
+            return lifecycle_session
+        assert lifecycle_closed.is_set()
+        return capture_sessions
+
+    monkeypatch.setattr(runtime, "_worker_sessions", worker_sessions)
+    async with AsyncExitStack() as cleanup:
+        if admitted:
+            installed, captures = await runtime._imported_worker_sources(settings, config, cleanup, request_id)
+            assert captures is capture_sessions
+            assert installed.source_export is source_runtime.source_export
+            assert installed.catalog_bindings == PublishedFHIRCatalogBindingScope("d" * 64, "f" * 64)
+            assert allocated_urls == [config.lifecycle_url, config.custody_url]
+        else:
+            with pytest.raises(RegistryMembershipRefreshUnavailable):
+                await runtime._imported_worker_sources(settings, config, cleanup, request_id)
+            assert allocated_urls == [config.lifecycle_url]
+    assert driver.fetchrow.await_args.args[1:] == (request_id,)
 
 
 @pytest.mark.asyncio

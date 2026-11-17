@@ -11,6 +11,7 @@ import pytest
 
 from process import geo_source_snapshot as snapshot
 from process import geo_source_storage as storage
+from process import native_copy_cleanup as copy_cleanup
 from process import reference_family_archive as archive
 from process import reference_family_result_generation as generation
 from process import reference_source_generation as source
@@ -96,8 +97,8 @@ async def test_interrupted_copy_drains_and_invalidates_original_owner(monkeypatc
     publisher = SimpleNamespace(connection=driver, policy=SimpleNamespace(schema="mrf"))
     monkeypatch.setattr(snapshot, "bound_publisher", lambda: publisher)
     drain, invalidate = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(snapshot, "close_interrupted_copy", drain)
-    monkeypatch.setattr(snapshot, "invalidate_copy_owner", invalidate)
+    monkeypatch.setattr(copy_cleanup, "close_interrupted_copy", drain)
+    monkeypatch.setattr(copy_cleanup, "invalidate_copy_owner", invalidate)
     session = object()
     with pytest.raises(asyncio.CancelledError):
         await snapshot._copy(session, "private", ("zip_code",), [("10001",)], time.monotonic() + 1)

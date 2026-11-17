@@ -14,7 +14,7 @@ from process import provider_directory_generic_candidate as candidate_rows
 from process import provider_directory_generic_source_completion as completion
 from process import provider_directory_generic_source_policy as policy_scope
 from process import provider_directory_generic_source_storage as storage
-from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
+from process.native_copy_cleanup import cleanup_interrupted_copy
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -157,9 +157,8 @@ async def _write_overrides(connection, policy, binding, resource_rows, *, sessio
     matched = await _reusable_aliases(connection, policy, binding, resource_rows)
     try:
         await compact._copy(connection, tables, "aliases", (*compact._ALIAS_COLUMNS, "npi_text"), matched)
-    except asyncio.CancelledError, TimeoutError:
-        await close_interrupted_copy(connection)
-        await invalidate_copy_owner(session, connection)
+    except (asyncio.CancelledError, TimeoutError) as interruption:
+        await cleanup_interrupted_copy(session, connection, interruption)
         raise
     reused_keys = {(resource[3], resource[4]) for resource in matched}
     resource_rows = [

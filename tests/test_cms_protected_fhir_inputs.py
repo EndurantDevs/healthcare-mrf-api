@@ -389,7 +389,7 @@ def _physical(proof):
 @pytest.mark.asyncio
 async def test_worker_requires_original_task_driver_and_factory(catalog):
     source_policy = _policy()
-    factory = SimpleNamespace(policy=source_policy, source_callable_capability=AsyncMock(return_value=(700,)))
+    factory = SimpleNamespace(policy=source_policy)
     publisher = policy_module._Publisher(catalog, source_policy, asyncio.current_task(), "repeatable read", factory)
     publisher_token = policy_module._PUBLISHER.set(publisher)
     factory_token = policy_module._FACTORY.set(factory)

@@ -27,101 +27,43 @@ async def _callable_binding(factory, connection):
             yield
 
 
-@pytest.mark.asyncio
-async def test_callable_capability_preserves_the_original_native_oid_tuple():
-    factory, (connection, _) = _identity_factory(), _connection()
-    capability = (101, 2**32 - 1)
-    factory.source_callable_capability = AsyncMock(return_value=capability)
-    async with _callable_binding(factory, connection):
-        assert await policy.source_callable_capability(connection, factory.policy) is capability
-    factory.source_callable_capability.assert_awaited_once_with(connection, factory.policy)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["missing_factory", "wrong_factory", "connection", "policy", "factory_policy"])
-async def test_callable_capability_refuses_substituted_original_authority(changed):
-    factory, (connection, _) = _identity_factory(), _connection()
-    capture = factory.source_callable_capability = AsyncMock(return_value=(101,))
-    original_policy = factory.policy
-    async with _callable_binding(factory, connection):
-        token = None
-        supplied_connection, supplied_policy = connection, original_policy
-        if changed in {"missing_factory", "wrong_factory"}:
-            substitute = (
-                None
-                if changed == "missing_factory"
-                else SimpleNamespace(policy=original_policy, source_callable_capability=capture)
+def _synthetic_catalog_roles():
+    """Closed catalog answers for unit orchestration, never native role proof."""
+    rows = []
+    for oid, name in enumerate(("source_owner", "source_publisher", "source_reader"), 1):
+        rows.append(
+            dict(
+                oid=oid,
+                rolname=name,
+                rolcanlogin=name != "source_owner",
+                elevated=False,
+                rolsuper=False,
+                rolcreatedb=False,
+                rolcreaterole=False,
+                rolreplication=False,
+                rolbypassrls=False,
+                owner_set=name != "source_reader",
+                publisher_set=name == "source_publisher",
+                namespace_usage=True,
+                namespace_create=name != "source_reader",
+                namespace_owner_reachable=name != "source_reader",
+                namespace_owner_protected=True,
             )
-            token = policy._FACTORY.set(substitute)
-        elif changed == "connection":
-            supplied_connection = object()
-        elif changed == "policy":
-            supplied_policy = _policy()
-        else:
-            factory.policy = _policy()
-        try:
-            with pytest.raises(GenericCandidateError, match="callable_original_publisher_required"):
-                await policy.source_callable_capability(supplied_connection, supplied_policy)
-        finally:
-            factory.policy = original_policy
-            if token is not None:
-                policy._FACTORY.reset(token)
-    capture.assert_not_awaited()
+        )
+    return rows
 
 
-@pytest.mark.asyncio
-async def test_callable_capability_cannot_adopt_a_factory_after_publisher_binding():
-    factory, (connection, _) = _identity_factory(), _connection()
-    capture = factory.source_callable_capability = AsyncMock(return_value=(101,))
-    async with policy.bind_generic_source_publisher(
-        connection, factory.policy, verify_role_profile=AsyncMock(), transaction_isolation="repeatable read"
+def _declare_unit_candidate(candidate, identity, coordinates):
+    """Fill missing unit declarations; never normalize contradictory source facts."""
+    for field, declared in (
+        ("source_ids", ("cms-npd",)),
+        ("source_release", identity),
+        ("network_bindings", coordinates),
     ):
-        token = policy._FACTORY.set(factory)
-        try:
-            with pytest.raises(GenericCandidateError, match="callable_original_publisher_required"):
-                await policy.source_callable_capability(connection, factory.policy)
-        finally:
-            policy._FACTORY.reset(token)
-    capture.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("capability", [None, [101], (True,), (0,), (-1,), (2**32,), ("101",), (101, 101)])
-async def test_callable_capability_rejects_malformed_or_non_native_oid_results(capability):
-    factory, (connection, _) = _identity_factory(), _connection()
-    factory.source_callable_capability = AsyncMock(return_value=capability)
-    async with _callable_binding(factory, connection):
-        with pytest.raises(GenericCandidateError, match="callable_capability_changed"):
-            await policy.source_callable_capability(connection, factory.policy)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["factory", "publisher", "policy"])
-async def test_callable_capability_rechecks_original_context_after_await(changed):
-    factory, (connection, _) = _identity_factory(), _connection()
-    original_policy = factory.policy
-    tokens = []
-
-    async def capture(connection, supplied_policy):
-        if changed == "factory":
-            tokens.append((policy._FACTORY, policy._FACTORY.set(_identity_factory())))
-        elif changed == "publisher":
-            replacement = SimpleNamespace(**vars(policy.bound_publisher()))
-            tokens.append((policy._PUBLISHER, policy._PUBLISHER.set(replacement)))
+        if hasattr(candidate, field):
+            assert getattr(candidate, field) == declared
         else:
-            factory.policy = _policy()
-        await asyncio.sleep(0)
-        return (101,)
-
-    factory.source_callable_capability = capture
-    async with _callable_binding(factory, connection):
-        try:
-            with pytest.raises(GenericCandidateError, match="callable_publisher_changed"):
-                await policy.source_callable_capability(connection, original_policy)
-        finally:
-            factory.policy = original_policy
-            for variable, token in reversed(tokens):
-                variable.reset(token)
+            setattr(candidate, field, declared)
 
 
 def _policy():
@@ -548,7 +490,6 @@ async def test_named_layout_preserves_access_failure_without_capture_or_fallback
     factory = _named_factory()
     connection, _ = _connection()
     connection.execute.side_effect = failure
-    factory.source_callable_capability = AsyncMock(side_effect=AssertionError("catalog capture reached"))
     async with _callable_binding(factory, connection):
         with pytest.raises(type(failure)) as raised:
             await policy._bind_isolated_storage(policy.bound_publisher())
@@ -556,7 +497,6 @@ async def test_named_layout_preserves_access_failure_without_capture_or_fallback
     connection.execute.assert_awaited_once()
     connection.fetchrow.assert_not_awaited()
     connection.fetchval.assert_not_awaited()
-    factory.source_callable_capability.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -584,7 +524,6 @@ async def test_named_layout_refuses_changed_declared_storage_before_sql(changed)
 async def test_named_batch_and_completion_use_declared_transactions_without_capture(monkeypatch, is_batch_loading):
     database, factory, opened = _factory_case(monkeypatch)
     factory.storage_binding = isolated.FHIRSourceStorageBinding("catalog_schema", "source_schema")
-    capture = factory.source_callable_capability = AsyncMock(side_effect=AssertionError("catalog capture reached"))
     async with policy.bind_generic_source_transaction_factory(factory):
         async with policy.source_transaction(database, isolation="repeatable read", is_batch_loading=is_batch_loading):
             publisher = policy.bound_publisher()
@@ -592,7 +531,6 @@ async def test_named_batch_and_completion_use_declared_transactions_without_capt
             assert policy.source_copy_session() is opened[-1][0]
             publisher.connection.fetchrow.assert_not_awaited()
             publisher.connection.fetchval.assert_not_awaited()
-    capture.assert_not_awaited()
     assert [isolation for _, isolation in opened] == ["repeatable read"]
     assert policy._PUBLISHER.get() is policy._OWNER.get() is policy._FACTORY.get() is None
 
@@ -644,6 +582,106 @@ async def test_named_startup_rechecks_catalog_scope_without_legacy_ddl(monkeypat
     legacy_probe.assert_not_awaited()
     assert connection.execute.await_count == (0 if changed else 1)
     assert all("LIMIT 0" in call.args[0] for call in connection.execute.await_args_list)
+
+
+def _legacy_preflight_catalog(monkeypatch, directory, schema, state):
+    from tests.test_provider_directory_cms_control_custody import _columns, _indexes
+
+    models_by_name = {
+        model.__tablename__: model for model in (*directory.SOURCE_MODELS, *directory.CANONICAL_RESOURCE_MODELS)
+    }
+    capability = directory.ProviderDirectoryCapability
+    reverse = directory.ProviderDirectoryReverseLookupCheckpoint
+    missing = {
+        "repair": {capability.__tablename__, directory.PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE},
+        "missing_resource": {directory.ProviderDirectoryInsurancePlan.__tablename__},
+        "missing_proof": {directory.PROVIDER_DIRECTORY_PROOF_SHARD_TABLE},
+    }.get(state, set())
+    missing_names = {f"{schema}.{name}" for name in missing}
+    installed = (reverse,) if state == "repair" else (capability, reverse)
+    runtime_indexes = [index["name"] for model in installed for index in model.__my_additional_indexes__]
+
+    async def scalar(sql, *, schema_name=None, qualified_name=None):
+        if qualified_name is not None:
+            return qualified_name not in missing_names
+        assert schema_name == schema and "data_quality_checked" in sql
+        return "text"
+
+    async def catalog(sql, *, relation=None, table_name=None, **parameters):
+        if table_name is not None:
+            return [{"column_name": column.name} for column in models_by_name[table_name].__table__.columns]
+        if relation is None:
+            assert "pg_indexes" in sql and parameters["schema_name"] == schema
+            return [{"indexname": name} for name in runtime_indexes]
+        relation_schema, table = relation.split(".")
+        assert relation_schema == f'"{schema}"'
+        model = models_by_name[table.strip('"')]
+        if "AS required" in sql:
+            return _columns(model)
+        if state == "missing_control_index" and model is directory.ProviderDirectorySource:
+            return []
+        return _indexes(model)
+
+    monkeypatch.setattr(directory.db, "scalar", AsyncMock(side_effect=scalar))
+    monkeypatch.setattr(directory.db, "all", AsyncMock(side_effect=catalog))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["ready", "repair", "missing_resource", "missing_control_index", "missing_proof"])
+async def test_legacy_source_preflight_repairs_only_runtime_tables(monkeypatch, state):
+    from importlib import import_module
+
+    from asyncpg import UndefinedTableError
+
+    from process.provider_directory_generic_source_storage import RELATIONS
+
+    directory = import_module("process.provider_directory_fhir")
+    factory = _identity_factory()
+    schema = factory.policy.schema
+    connection, _ = _connection()
+    connection.fetchval.side_effect = [len(RELATIONS), True, False]
+
+    async def execute(sql):
+        if directory.PROVIDER_DIRECTORY_PROOF_SHARD_TABLE in sql:
+            assert state == "missing_proof"
+            raise UndefinedTableError("missing proof relation")
+
+    connection.execute.side_effect = execute
+    _legacy_preflight_catalog(monkeypatch, directory, schema, state)
+    monkeypatch.setattr(directory, "_schema", lambda: schema)
+    monkeypatch.setattr(directory.db, "_transaction_binding", lambda: SimpleNamespace(session=object()))
+    status = AsyncMock()
+    create = AsyncMock()
+    monkeypatch.setattr(directory.db, "status", status)
+    monkeypatch.setattr(directory.db, "create_table", create)
+
+    context_by_field = {"context": {}}
+    async with _callable_binding(factory, connection):
+        if state in {"missing_resource", "missing_control_index"}:
+            with pytest.raises(RuntimeError, match="administrator_cut_required"):
+                await directory._prepare_provider_directory_job_tables(context_by_field, None)
+        elif state == "missing_proof":
+            with pytest.raises(UndefinedTableError, match="missing proof relation"):
+                await directory._prepare_provider_directory_job_tables(context_by_field, None)
+        else:
+            await directory._prepare_provider_directory_job_tables(context_by_field, None)
+
+    assert context_by_field["context"].get("provider_directory_tables_ready", False) is (state in {"ready", "repair"})
+    if state == "repair":
+        create.assert_awaited_once_with(directory.ProviderDirectoryCapability.__table__, checkfirst=True)
+        ddl_statements = [call.args[0].strip() for call in status.await_args_list]
+        assert ddl_statements[:2] == [
+            f"CREATE INDEX IF NOT EXISTS provider_directory_capability_{name}_idx "
+            f'ON "{schema}"."provider_directory_capability" ({column});'
+            for name, column in (("status", "probe_status"), ("fhir_version", "fhir_version"))
+        ]
+        assert len(ddl_statements) == 3
+        assert ddl_statements[2].startswith(
+            f'CREATE UNLOGGED TABLE IF NOT EXISTS "{schema}"."{directory.PROVIDER_DIRECTORY_IMPORT_SEEN_TABLE}"'
+        )
+    else:
+        create.assert_not_awaited()
+        status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1076,32 +1114,6 @@ async def _exercise_publisher_body(connection, session, database, failure):
             assert policy.source_copy_session() is session
 
 
-def _synthetic_catalog_roles():
-    """Closed catalog answers for unit orchestration, never native role proof."""
-    rows = []
-    for oid, name in enumerate(("source_owner", "source_publisher", "source_reader"), 1):
-        rows.append(
-            dict(
-                oid=oid,
-                rolname=name,
-                rolcanlogin=name != "source_owner",
-                elevated=False,
-                rolsuper=False,
-                rolcreatedb=False,
-                rolcreaterole=False,
-                rolreplication=False,
-                rolbypassrls=False,
-                owner_set=name != "source_reader",
-                publisher_set=name == "source_publisher",
-                namespace_usage=True,
-                namespace_create=name != "source_reader",
-                namespace_owner_reachable=name != "source_reader",
-                namespace_owner_protected=True,
-            )
-        )
-    return rows
-
-
 @asynccontextmanager
 async def synthetic_source_publisher(
     monkeypatch, database, *, isolation="repeatable read", schema="source_schema", binding=None
@@ -1307,19 +1319,6 @@ def _changed_workflow_identity(monkeypatch, workflow, change):
     else:
         workflow.directory.db = object()
     return candidate
-
-
-def _declare_unit_candidate(candidate, identity, coordinates):
-    """Fill missing unit declarations; never normalize contradictory source facts."""
-    for field, declared in (
-        ("source_ids", ("cms-npd",)),
-        ("source_release", identity),
-        ("network_bindings", coordinates),
-    ):
-        if hasattr(candidate, field):
-            assert getattr(candidate, field) == declared
-        else:
-            setattr(candidate, field, declared)
 
 
 @pytest.mark.asyncio

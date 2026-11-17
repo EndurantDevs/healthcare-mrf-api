@@ -620,3 +620,33 @@ async def test_root_native_copy_precedes_stage_indexes(monkeypatch):
         monkeypatch.setattr(context.database, "status", observe_index)
         await initialize_provider_directory_rooted_graph_acquisition(identity, database=context.database)
         assert observed_phases == ["copy", "index"]
+
+
+@pytest.mark.asyncio
+async def test_named_rooted_validation_hashes_select_one_of_two_acquisitions(monkeypatch):
+    """Validate sealed content hashes without including another acquisition's work."""
+    from db.plan_release_storage import storage_relation
+    from process.provider_directory_rooted_graph_store_support import ACQUISITION_TABLE
+
+    async with _lifecycle_scope(monkeypatch) as context:
+        current = await _publish_legacy_root(context.database)
+        identity = _identity(current, "baseline", "2", "3")
+        sealed = await _complete_success(context.database, identity)
+        other = _identity(current, "candidate", "4", "5")
+        assert await initialize_provider_directory_rooted_graph_acquisition(other, database=context.database) == 1
+        schema = context.rooted_input_schema
+        fields = ("terminal_set_sha256", "resource_set_sha256", "edge_set_sha256", "rooted_graph_sha256")
+        expressions = [
+            bulk.acquisition_hash_expression(
+                schema,
+                "provider_directory_rooted_graph_" + field.removeprefix("rooted_graph_"),
+                "selected.acquisition_id",
+            )
+            for field in fields
+        ]
+        table = storage_relation(schema, ACQUISITION_TABLE)
+        observed = await context.connection.fetchrow(
+            "SELECT " + ", ".join(expressions) + f" FROM {table} selected WHERE selected.acquisition_id=$1",
+            identity.acquisition_id,
+        )
+        assert tuple(observed) == tuple(getattr(sealed, field) for field in fields)

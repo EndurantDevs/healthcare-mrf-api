@@ -14,6 +14,7 @@ from process import provider_directory_generic_source_storage as storage
 from process import provider_directory_rooted_graph_current_preflight as preflight
 from process import provider_directory_rooted_graph_publication_candidate as candidate
 from process import provider_directory_source_storage_binding as binding
+from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
 from process.provider_directory_rooted_graph_header_checks import _header_expression
 from process.provider_directory_rooted_graph_input_fence import root_input_fence_sql
@@ -422,3 +423,110 @@ def test_admin_upgrade_retires_truncated_historical_trigger_names():
     assert all(
         len(statement.split('"', 2)[1]) <= 63 for statement in statements if statement.startswith("DROP TRIGGER")
     )
+
+
+@pytest.mark.parametrize("variant", ["rooted_combined", "uhc_flex_practitioner"])
+def test_retained_predecessor_keeps_logical_data_and_preserves_stored_bytes(named_handoff, variant):
+    named_handoff["identity"]["root_dataset_variant"] = variant
+    previous_id = "predecessor_dataset"
+    recorded_hash, validated_hash = "e" * 64, "f" * 64
+    named_handoff["predecessor_proof"] = {
+        "dataset_hash": validated_hash,
+        "resource_count": 2,
+        "snapshot": {
+            "header": {
+                "dataset_id": previous_id,
+                "dataset_hash": recorded_hash,
+                "resource_count": 2,
+                "status": "published",
+                "is_current": True,
+            },
+            "parent": {
+                "dataset_id": previous_id,
+                "dataset_hash": recorded_hash,
+                "resource_count": 2,
+                "published_at": "2026-01-01T00:00:00Z",
+                "candidate_storage_json": {"phase": "loading"},
+            },
+        },
+        "input_fence": {"roots": {}, "catalog": {}},
+    }
+    stored = candidate.candidate_json(named_handoff)
+    handoff = binding.FHIRSourceCandidateHandoff(stored)
+    projected = handoff.document
+    expected_by_field = {
+        "dataset_id": previous_id,
+        "dataset_hash": validated_hash if variant == "rooted_combined" else recorded_hash,
+        "resource_count": 2,
+    }
+    assert projected["predecessor_proof"]["input_fence"] == {
+        "dataset_id": previous_id,
+        "variant": variant,
+        "header": expected_by_field,
+        "parent": expected_by_field,
+    }
+    assert projected["predecessor_proof"]["dataset_hash"] == validated_hash
+    assert candidate.validate_rooted_handoff_document(projected, named_handoff["storage"]) == projected
+    assert handoff.document_json == stored == candidate.candidate_json(named_handoff)
+
+
+def test_current_predecessor_fence_round_trips_without_changing_logical_values(named_handoff):
+    previous_by_field = {"dataset_id": "previous_dataset", "dataset_hash": "e" * 64, "resource_count": 2}
+    fence_by_field = {
+        "dataset_id": "previous_dataset",
+        "variant": "rooted_combined",
+        "header": previous_by_field,
+        "parent": previous_by_field,
+    }
+    named_handoff["predecessor_proof"] = {
+        "snapshot": {"header": previous_by_field, "parent": previous_by_field},
+        "input_fence": fence_by_field,
+        "dataset_hash": "e" * 64,
+        "resource_count": 2,
+    }
+    stored = candidate.candidate_json(named_handoff)
+    handoff = binding.FHIRSourceCandidateHandoff(stored)
+    assert handoff.document["predecessor_proof"]["input_fence"] == fence_by_field
+    assert handoff.document_json == stored
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["first", "fetchrow"])
+async def test_dataset_resolver_uses_only_explicit_catalog_fallbacks(named_handoff, transport):
+    dataset_id = named_handoff["identity"]["dataset_id"]
+    document = candidate.candidate_json(named_handoff)
+    record = {"candidate_storage_json": document} if transport == "first" else (document,)
+    read = AsyncMock(return_value=record)
+    database = SimpleNamespace(**{transport: read})
+    relations = await binding.dataset_source_relations(
+        database,
+        "catalog_schema",
+        dataset_id,
+        (storage.RESOURCE, "provider_directory_source"),
+        canonical_roots=("provider_directory_source",),
+    )
+    assert relations == {
+        storage.RESOURCE: named_handoff["tables"][storage.RESOURCE],
+        "provider_directory_source": {"schema": "catalog_schema", "name": "provider_directory_source"},
+    }
+    assert read.await_count == 1
+    if transport == "first":
+        assert read.await_args.kwargs == {"dataset_id": dataset_id}
+    else:
+        assert read.await_args.args[1] == dataset_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change,code", [("dataset", "dataset_changed"), ("schema", "schema_changed")])
+async def test_catalog_fallback_does_not_hide_changed_candidate_scope(named_handoff, change, code):
+    dataset_id = named_handoff["identity"]["dataset_id"]
+    if change == "dataset":
+        named_handoff["identity"]["dataset_id"] = "different_dataset"
+    else:
+        named_handoff["tables"][storage.RESOURCE]["schema"] = "different_snapshot"
+    database = SimpleNamespace(first=AsyncMock(return_value={"candidate_storage_json": named_handoff}))
+    with pytest.raises(GenericCandidateError, match=code):
+        await binding.dataset_source_relations(
+            database, "catalog_schema", dataset_id, (storage.RESOURCE,), canonical_roots=(storage.RESOURCE,)
+        )
+    assert database.first.await_count == 1

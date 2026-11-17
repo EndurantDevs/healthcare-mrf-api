@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -13,8 +12,6 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
 from process.ext import address_fast
 
-LOCATION_KEY_PAGE_ROWS = 50_000
-LOCATION_KEY_COLUMNS = ("source_id", "resource_id", "address_key", "row_version")
 LOCATION_KEYED_COMPONENTS = frozenset({"practitioner_role", "organization_affiliation"})
 # Without native keys the component templates join this empty relation and keep their SQL expression.
 EMPTY_LOCATION_KEYS_SQL = (
@@ -64,87 +61,6 @@ def _native_location_batch(fhir: Any) -> Any | None:
     return canonicalize if inspect.isbuiltin(canonicalize) else None
 
 
-def _has_portable_text_sql(text_sql: str) -> str:
-    """Match NULL or ASCII text whose only control characters are the ASCII spaces."""
-    return f"COALESCE({text_sql} ~ '^[\\x09-\\x0d\\x20-\\x7e]*$', TRUE)"
-
-
-def location_key_page_sql(context: dict[str, str], is_source_scoped: bool) -> str:
-    """Select one keyset page of the exact inputs the overlay passes to addr_key_v1."""
-    source_scope = "AND loc.source_id = ANY(CAST(:source_ids AS varchar[]))" if is_source_scoped else ""
-    return f"""
-        SELECT loc.source_id, loc.resource_id, loc.first_line, loc.second_line, loc.city_name,
-               COALESCE(NULLIF(loc.state_name, ''), loc.state_code) AS state_name,
-               loc.postal_code, {context["location_country_expr"]} AS country_code,
-               loc.xmin::text AS row_version
-          FROM {context["location_table"]} AS loc
-         WHERE (loc.source_id, loc.resource_id)
-               > (CAST(:after_source_id AS varchar), CAST(:after_resource_id AS varchar))
-           AND (loc.address_key ~* '{context["uuid_re"]}') IS NOT TRUE
-           -- Only ASCII text is batch keyed: native lowercasing maps some letters to ASCII (U+212A
-           -- KELVIN SIGN to 'k') that a C-locale lower() leaves alone, and parsers may split other
-           -- control characters differently. The SQL function keys everything else.
-           AND {_has_portable_text_sql("loc.first_line")}
-           AND {_has_portable_text_sql("loc.second_line")}
-           AND {_has_portable_text_sql("loc.city_name")}
-           AND {_has_portable_text_sql("COALESCE(NULLIF(loc.state_name, ''), loc.state_code)")}
-           AND {_has_portable_text_sql("loc.postal_code")}
-           AND {_has_portable_text_sql(context["location_country_expr"])}
-           {source_scope}
-         ORDER BY loc.source_id, loc.resource_id
-         LIMIT :page_rows;
-    """
-
-
-async def _stage_location_key_pages(
-    fhir: Any,
-    schema: str,
-    key_table: str,
-    source_ids: list[str],
-    canonicalize: Any,
-) -> int:
-    """Key every scoped Location without a stamped key, one native batch per page."""
-    from process import provider_directory_address_batch
-
-    prepared = await provider_directory_address_batch.stage_location_keys(fhir, schema, key_table, source_ids)
-    if prepared is not None:
-        return prepared
-    page_sql = location_key_page_sql(fhir._address_overlay_sql_context(schema, None, None), bool(source_ids))
-    scope_params_by_name = {"source_ids": source_ids} if source_ids else {}
-    # The caller's executor reads and writes, so an open transaction still sees its own key table.
-    insert_sql = (
-        f"INSERT INTO {fhir._unscoped_qt(schema, key_table)} ({', '.join(LOCATION_KEY_COLUMNS)}) "
-        "SELECT * FROM unnest(CAST(:key_source_ids AS varchar[]), CAST(:key_resource_ids AS varchar[]), "
-        "CAST(:address_keys AS text[]), CAST(:row_versions AS text[]));"
-    )
-    keyed_count = 0
-    cursor = ("", "")
-    while True:
-        locations = list(
-            await fhir.db.all(
-                page_sql,
-                **scope_params_by_name,
-                after_source_id=cursor[0],
-                after_resource_id=cursor[1],
-                page_rows=LOCATION_KEY_PAGE_ROWS,
-            )
-        )
-        if not locations:
-            return keyed_count
-        canonical_keys = await asyncio.to_thread(canonicalize, [tuple(location[2:8]) for location in locations])
-        if len(canonical_keys) != len(locations):
-            raise RuntimeError("provider_directory_address_overlay_native_key_count_mismatch")
-        await fhir.db.status(
-            insert_sql,
-            key_source_ids=[location[0] for location in locations],
-            key_resource_ids=[location[1] for location in locations],
-            address_keys=[canonical[0] for canonical in canonical_keys],
-            row_versions=[location[8] for location in locations],
-        )
-        keyed_count += len(locations)
-        cursor = (locations[-1][0], locations[-1][1])
-
-
 @asynccontextmanager
 async def staged_location_keys(
     fhir: Any,
@@ -154,8 +70,10 @@ async def staged_location_keys(
     components: tuple[str, ...],
 ) -> AsyncIterator[str | None]:
     """Yield a filled key sidecar, or None when the SQL expression must key Locations."""
-    canonicalize = _native_location_batch(fhir) if LOCATION_KEYED_COMPONENTS.intersection(components) else None
-    if canonicalize is None:
+    from process import provider_directory_address_batch
+
+    relation = provider_directory_address_batch.current()
+    if relation is None or not LOCATION_KEYED_COMPONENTS.intersection(components):
         yield None
         return
     # A stage-style name owned by the control run lets the orphan-stage cleanup reap it after a hard crash,
@@ -169,7 +87,9 @@ async def staged_location_keys(
         "(source_id varchar NOT NULL, resource_id varchar NOT NULL, address_key text, row_version text NOT NULL);"
     )
     try:
-        keyed_count = await _stage_location_key_pages(fhir, schema, key_table, source_ids, canonicalize)
+        keyed_count = await provider_directory_address_batch.stage_location_keys(
+            fhir, schema, key_table, source_ids, relation
+        )
         # The affiliation insert probes one Location at a time inside a lateral subquery.
         await fhir.db.status(
             f"CREATE INDEX {fhir._q(fhir._bounded_identifier(key_table + '_key_idx'))} "

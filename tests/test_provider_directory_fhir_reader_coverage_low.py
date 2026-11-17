@@ -239,7 +239,6 @@ def test_canonical_row_builder_empty_boundaries():
         )
         == []
     )
-    assert fhir._source_resource_edge_rows(object, [], canonical_api_base=None, source_ids=[], run_id=None) == []
 
 
 @pytest.mark.asyncio
@@ -279,15 +278,31 @@ async def test_upsert_value_and_copy_boundaries(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_seen_copy_and_contact_backfill_boundaries(monkeypatch):
-    connection = SimpleNamespace(
-        status=AsyncMock(),
-        raw_connection=SimpleNamespace(driver_connection=SimpleNamespace()),
-    )
-    monkeypatch.setattr(fhir.db, "acquire", lambda: _async_context(connection))
-    with pytest.raises(NotImplementedError, match="copy_records_to_table"):
-        await fhir._copy_mark_resource_rows_seen("Practitioner", [("s", "r")], "run")
+async def test_metadata_values_batches_keep_the_caller_transaction(monkeypatch):
+    """Splitting a bounded control write keeps every row in its original transaction."""
+    table = Table("reader_metadata", MetaData(), Column("id", String, primary_key=True), Column("label", String))
+    model = SimpleNamespace(__table__=table)
+    session = SimpleNamespace(execute=AsyncMock())
+    acquire_session = Mock(side_effect=AssertionError("opened an independent write session"))
+    monkeypatch.setattr(fhir.db, "session", acquire_session)
+    monkeypatch.setattr(fhir, "_max_rows_per_statement", lambda _columns: 2)
+    rows = [{"id": identifier, "label": identifier.upper()} for identifier in ("one", "two", "three")]
 
+    written = await fhir._upsert_rows_values(
+        model, rows, ["id", "label"], ["id"], skip_unchanged=True, transaction_session=session
+    )
+
+    assert written == len(rows) and session.execute.await_count == 2
+    statements = [execution.args[0].compile() for execution in session.execute.await_args_list]
+    assert [
+        [value for name, value in statement.params.items() if name.startswith("id_")] for statement in statements
+    ] == [["one", "two"], ["three"]]
+    assert all("IS DISTINCT FROM" in str(statement) for statement in statements)
+    acquire_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_seen_copy_and_contact_backfill_boundaries(monkeypatch):
     monkeypatch.setattr(fhir.db, "status", AsyncMock(return_value=2))
     assert await fhir._clear_resource_rows_seen("run") == 2
     contact = importlib.import_module("process.provider_directory_output_contact_backfill")

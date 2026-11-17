@@ -388,18 +388,6 @@ async def capture_generic_source_global_roots(publisher, roots):
     return {root: _layout_proof(selected_by_root[root]) for root in roots}
 
 
-def fhir_source_catalog_row(row):
-    """Decode serialized native catalog fields while retaining all other row values."""
-    catalog_by_field = dict(row)
-    for key in ("columns", "constraints", "indexes", "column_acls"):
-        if key in catalog_by_field and isinstance(catalog_by_field[key], str):
-            catalog_by_field[key] = json.loads(catalog_by_field[key])
-    return catalog_by_field
-
-
-_fhir_catalog_row = fhir_source_catalog_row
-
-
 def _require_fhir_inventory(proof):
     parents = [[proof["schema"], name] for name in FHIR_INPUT_ROOTS]
     _require(proof["parents"] == parents, "protected_fhir_roots_changed")
@@ -485,40 +473,6 @@ def require_protected_fhir_input(proof):
     )
     _require_fhir_inventory(proof)
     return proof
-
-
-_FHIR_PHYSICAL_SQL = (
-    "SELECT c.oid::bigint,pg_relation_filenode(c.oid)::bigint AS relfilenode,"
-    "n.oid::bigint AS schema_oid,n.nspowner::bigint AS schema_owner_oid,"
-    "c.relacl::text AS raw_acl,n.nspacl::text AS raw_schema_acl,"
-    "(SELECT coalesce(jsonb_agg(jsonb_build_array(attnum,attacl::text) ORDER BY attnum),'[]'::jsonb) "
-    "FROM pg_attribute WHERE attrelid=c.oid AND attnum>0 AND NOT attisdropped AND attacl IS NOT NULL) AS column_acls "
-    "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=ANY($1::oid[]) ORDER BY c.oid"
-)
-
-
-async def _fhir_physical_inventory(connection, selected_rows):
-    physical_rows = await connection.fetch(
-        _FHIR_PHYSICAL_SQL,
-        [relation_by_field["oid"] for relation_by_field in selected_rows],
-    )
-    return _fhir_physical_rows(selected_rows, physical_rows)
-
-
-def _fhir_physical_rows(selected_rows, physical_rows):
-    """Attach physical coordinates only after exact native identity agreement."""
-    by_oid = {relation_by_field["oid"]: _fhir_catalog_row(relation_by_field) for relation_by_field in physical_rows}
-    _require(
-        set(by_oid) == {relation_by_field["oid"] for relation_by_field in selected_rows},
-        "protected_fhir_inventory_changed",
-    )
-    return [
-        dict(
-            relation_by_field,
-            **{key: field_value for key, field_value in by_oid[relation_by_field["oid"]].items() if key != "oid"},
-        )
-        for relation_by_field in selected_rows
-    ]
 
 
 _FHIR_NAMED_INPUT_SQL = """WITH RECURSIVE family(oid) AS (

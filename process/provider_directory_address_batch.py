@@ -9,7 +9,6 @@ from process.ext import address_batch_stage as batches
 from process.ext.address_format import ADDRESS_FORMAT_SOURCE, ADDRESS_FORMAT_VERSION
 
 _ACTIVE = ContextVar("provider_directory_address_batch", default=None)
-_SQL_ONLY = ContextVar("provider_directory_address_sql_only", default=False)
 
 
 def current():
@@ -80,11 +79,9 @@ async def scope(fhir, schema, run_id, source_ids, components):
         committed=True,
     ) as relation:
         token = _ACTIVE.set(relation)
-        sql_token = _SQL_ONLY.set(relation is None)
         try:
             yield
         finally:
-            _SQL_ONLY.reset(sql_token)
             _ACTIVE.reset(token)
 
 
@@ -124,11 +121,8 @@ def component_insert_sql(fhir, context, select_sql):
     )
 
 
-async def stage_location_keys(fhir, schema, key_table, source_ids):
+async def stage_location_keys(fhir, schema, key_table, source_ids, relation):
     """Reuse prepared keys under the existing Location row-version guard."""
-    relation = current()
-    if relation is None:
-        return 0 if _SQL_ONLY.get() else None
     context = fhir._address_overlay_sql_context(schema, None, None)
     country = context["location_country_expr"]
     fields = [

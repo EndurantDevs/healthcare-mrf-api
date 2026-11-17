@@ -919,23 +919,20 @@ async def test_initial_cms_fault_is_atomic_and_exact_retry(initial_cms_db, monke
         await _remove_candidates(fixture, copy_targets, arguments["request_id"])
 
 
-async def _create_cms_native_office_tables(connection, schema, names):
-    """Register absent exact names within the source fixture's owned transaction."""
-    for name in names:
-        assert await connection.fetchval("SELECT to_regclass($1)", schema + "." + name) is None
+async def _create_cms_native_office_table(connection, schema, location_table):
+    """Create a location fixture within the test's owned transaction."""
+    assert await connection.fetchval("SELECT to_regclass($1)", schema + "." + location_table) is None
     await connection.execute(
-        f'CREATE TABLE "{schema}"."{names[0]}" (source_id text,resource_id text,last_seen_run_id text,address_key text,first_line text,second_line text,city_name text,state_name text,postal_code text,country_code text)'
-    )
-    await connection.execute(
-        f'CREATE TABLE "{schema}"."{names[1]}" (source_id text,resource_id text,computed_address_key text,computed_zip5 text,computed_state_code text,computed_city_norm text,restored_city_name text,restored_state_name text,normalized_country text,eligible_change bool)'
+        f'CREATE TABLE "{schema}"."{location_table}" (source_id text,resource_id text,last_seen_run_id text,address_key text,first_line text,second_line text,city_name text,state_name text,postal_code text,country_code text)'
     )
 
 
-async def _copy_cms_native_office(connection, source_pin, names):
+async def _copy_cms_native_office(connection, source_pin, location_table):
     """Copy one admitted synthetic office through the production native codec."""
     import ptg2_address_canon
 
     from process import entity_address_candidate_preparation as preparation
+    from process import provider_directory_output_address_key_backfill as address_keys
 
     fhir = importlib.import_module("process.provider_directory_fhir")
     schema = source_pin.schema_name
@@ -955,31 +952,23 @@ async def _copy_cms_native_office(connection, source_pin, names):
         effective_country=office_by_field["country_code"],
         computed_zip5="90210",
     )
-    copied, _ = await fhir._copy_location_key_batch(
-        SimpleNamespace(native_module=ptg2_address_canon, stage_table=names[1], schema=schema),
-        connection.copy_records_to_table,
-        [location_by_field],
-    )
-    assert copied == 1
-    address_key = await connection.fetchval(f'SELECT computed_address_key FROM "{schema}"."{names[1]}"')
+    (canonical,) = await address_keys._canonical_page(fhir, ptg2_address_canon, [location_by_field], 1)
+    location_key, _ = fhir._build_location_key_record(location_by_field, canonical)
+    address_key = location_key[2]
     raw_fields = tuple(office_by_field[name] for name in _CMS_NATIVE_ADDRESS_FIELDS)
     assert address_key == ptg2_address_canon.canonicalize_batch([raw_fields])[0]["address_key"]
-    await connection.execute(
-        f'INSERT INTO "{schema}"."{names[0]}" VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
-        "cms-npd",
-        "site-1",
-        acquisition_run,
-        address_key,
-        *raw_fields,
+    copied = await connection.copy_records_to_table(
+        location_table, schema_name=schema, records=[("cms-npd", "site-1", acquisition_run, address_key, *raw_fields)]
     )
+    assert copied == "COPY 1"
     dataset_pin = preparation.ProviderDirectoryAddressDatasetPin(
         "cms-npd", source_pin.endpoint_id, source_pin.dataset_id, source_pin.dataset_sha256, acquisition_run
     )
     inputs = preparation.ProviderDirectoryAddressPreparationInput(
         dataset_pins=(dataset_pin,),
-        overlay_table=names[0],
+        overlay_table=location_table,
         address_alias_generation=0,
-        relation_overrides=(("provider_directory_location", names[0]),),
+        relation_overrides=(("provider_directory_location", location_table),),
         semantic_as_of=source_pin.as_of,
     )
     return inputs, raw_fields, address_key
@@ -999,10 +988,10 @@ async def test_admitted_cms_typed_office_native_source_sql(initial_cms_db):
     native = importlib.import_module("process.entity_address_unified")
     connection, _, source_pin, _ = initial_cms_db.reviewed_cms[0]
     schema = source_pin.schema_name
-    names = ["typed_location_" + uuid4().hex, "typed_key_" + uuid4().hex]
+    location_table = "typed_location_" + uuid4().hex
     async with connection.transaction(isolation="repeatable_read"):
-        await _create_cms_native_office_tables(connection, schema, names)
-        inputs, raw_fields, address_key = await _copy_cms_native_office(connection, source_pin, names)
+        await _create_cms_native_office_table(connection, schema, location_table)
+        inputs, raw_fields, address_key = await _copy_cms_native_office(connection, source_pin, location_table)
         available_by_name = dict.fromkeys(
             (*native.PROVIDER_DIRECTORY_DATASET_FENCE_TABLES, *CMS_OFFICE_READ_TABLES, "provider_directory_location"),
             True,
@@ -1023,16 +1012,14 @@ async def test_admitted_cms_typed_office_native_source_sql(initial_cms_db):
                 + " FROM (SELECT $1::varchar[] AS source_record_ids,ARRAY['provider_directory_fhir']::varchar[] AS address_sources) compacted",
                 [source_record_id],
             ) == [source_record_id]
-            await connection.execute(f"""UPDATE \"{schema}\".\"{names[0]}\" SET second_line='wrong suite'""")
+            await connection.execute(f"""UPDATE \"{schema}\".\"{location_table}\" SET second_line='wrong suite'""")
             with pytest.raises(Exception, match="cms_typed_office_correspondence_unavailable"):
                 async with connection.transaction():
                     await connection.fetch(statement)
         finally:
             preparation._PREPARATION.reset(token)
-            for name in reversed(names):
-                await connection.execute(f'DROP TABLE "{schema}"."{name}"')
-        for name in names:
-            assert await connection.fetchval("SELECT to_regclass($1)", schema + "." + name) is None
+            await connection.execute(f'DROP TABLE "{schema}"."{location_table}"')
+        assert await connection.fetchval("SELECT to_regclass($1)", schema + "." + location_table) is None
 
 
 async def test_complete_raw_fact_office_pages_use_exact_evidence_and_replay_cursor(office_db):

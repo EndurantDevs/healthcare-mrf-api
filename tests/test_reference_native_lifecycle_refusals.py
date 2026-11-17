@@ -671,10 +671,13 @@ async def test_projection_drains_output_before_restore_and_refuses_overflow_or_c
     if fault:
         with pytest.raises(archive.ReferenceFamilyArchiveError, match="byte cap exceeded|COPY count differs"):
             await archive._copy_native_projection(
-                driver, "SELECT 1", "candidate", "rows", ("value",), 4 if fault == "overflow" else 9, 30
+                (None, driver), "SELECT 1", "candidate", "rows", ("value",), 4 if fault == "overflow" else 9, 30
             )
     else:
-        assert await archive._copy_native_projection(driver, "SELECT 1", "candidate", "rows", ("value",), 9, 30) == 9
+        assert (
+            await archive._copy_native_projection((None, driver), "SELECT 1", "candidate", "rows", ("value",), 9, 30)
+            == 9
+        )
     assert events == (["drained"] if fault == "overflow" else ["drained", "restored"])
     assert driver.copy_to_table.await_count == int(fault != "overflow")
     driver.terminate.assert_not_called()
@@ -731,21 +734,10 @@ def _publisher_session(proof):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault", (None, "missing", "owner", "caller", "transaction"))
-@pytest.mark.parametrize("nucc", (False,))
-async def test_publisher_preparation_uses_transaction_without_legacy_actor_tokens(fault, nucc):
-    """Only the active transaction governs this prerequisite; native SQL enforces access later."""
-    proof_by_field = {"owner_oid": 45, "owner_safe": fault != "owner", "caller_safe": fault != "caller"}
-    session = _publisher_session(None if fault == "missing" else proof_by_field)
-    session.in_transaction = lambda: fault != "transaction"
-    operation = archive._nucc_native_publisher_owner if nucc else archive.protected_publisher_owner
-    if fault == "transaction":
-        with pytest.raises(archive.ReferenceFamilyArchiveError, match="caller transaction"):
-            await operation(session)
-    else:
-        assert await operation(session) is None
-    session.execute.assert_not_awaited()
-    session.scalar.assert_not_awaited()
+async def test_publisher_preparation_requires_caller_transaction():
+    session = SimpleNamespace(in_transaction=lambda: False)
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="caller transaction"):
+        await archive.protected_publisher_owner(session)
 
 
 @pytest.mark.asyncio

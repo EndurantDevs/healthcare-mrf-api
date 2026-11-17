@@ -538,6 +538,132 @@ async def test_second_pool_startup_failure_closes_first_and_authority(monkeypatc
     assert events == ["authority open", "lifecycle open", "lifecycle close", "authority close"]
 
 
+@pytest.fixture
+def named_worker_config():
+    from tests.test_registry_source_witness_runtime import _document
+
+    configured = _document()
+    del configured["app_origin"], configured["service_token"]
+    return _runtime_configuration(configured)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "request_id,unscoped_freeze,error",
+    [
+        (UUID(int=0), False, "worker_params_invalid"),
+        (UUID(_ID), False, "runtime_unavailable"),
+        (None, False, "worker_config_invalid"),
+        (None, True, "worker_config_invalid"),
+    ],
+)
+async def test_worker_refuses_unusable_named_configuration(
+    monkeypatch, named_worker_config, request_id, unscoped_freeze, error
+):
+    from process import registry_membership_refresh_runtime as runtime
+    from process.registry_membership_refresh_contract import RegistryMembershipRefreshUnavailable
+    from tests.test_registry_source_witness_runtime import _factory
+
+    events, _ = resources(monkeypatch)
+    exported, _ = _factory(monkeypatch, events)
+    load_runtime = AsyncMock(return_value=None)
+    monkeypatch.setattr(runtime, "membership_refresh_worker_runtime", load_runtime)
+    with pytest.raises((ValueError, RegistryMembershipRefreshUnavailable), match=error):
+        await worker.run_registry_publication_worker(
+            named_worker_config,
+            membership_refresh_request_id=request_id,
+            freeze_preparation=AsyncMock() if unscoped_freeze else None,
+        )
+    assert events == ([] if unscoped_freeze else ["source open", "source close"])
+    assert load_runtime.await_count == (1 if request_id == UUID(_ID) else 0)
+    exported.assert_not_called()
+
+
+@pytest.fixture
+def queued_named_worker(monkeypatch):
+    from process import registry_membership_refresh_runtime as runtime
+    from process.registry_imported_catalog_bindings import PublishedFHIRCatalogBindingScope
+    from process.registry_imported_membership_refresh import RegistryImportedMembershipAdmission
+    from process.registry_membership_refresh_execution import RegistryMembershipRefreshRuntime
+    from process.registry_membership_refresh_queue import RegistryMembershipRefreshAddressProfile
+    from tests.test_registry_network_import import _queued_refresh_record, observation
+    from tests.test_registry_source_witness_runtime import _factory
+
+    events, options = resources(monkeypatch)
+    exported, _ = _factory(monkeypatch, events)
+    observed = observation()
+    request_record = _queued_refresh_record(observed, "run-one") | {"state": "running", "result_json": None}
+    connection = SimpleNamespace(fetchrow=AsyncMock(return_value=request_record))
+    scope = PublishedFHIRCatalogBindingScope("a" * 64, observed["accepted_sources"][0]["capture_generation"])
+
+    @asynccontextmanager
+    async def acquire(pool, *, timeout):
+        assert pool.name == "lifecycle" and timeout == 5
+        yield connection
+
+    async def build_runtime(config, _stack, *, request_id):
+        installed = config.initial_address_sources.source_witness_runtime
+        assert request_id == request_record["request_id"] and installed.source_export is exported
+        return RegistryMembershipRefreshRuntime(
+            RegistryImportedMembershipAdmission(),
+            RegistryMembershipRefreshAddressProfile("address_source", config.consumer.reader_roles),
+            AsyncMock(),
+            AsyncMock(),
+            source_witness_runtime=replace(installed, catalog_bindings=scope),
+        )
+
+    monkeypatch.setattr(Pool, "acquire", acquire)
+    monkeypatch.setattr(runtime, "membership_refresh_worker_runtime", build_runtime)
+    return SimpleNamespace(
+        events=events, options=options, connection=connection, record=request_record, scope=scope, export=exported
+    )
+
+
+@pytest.mark.asyncio
+async def test_named_worker_recovers_exact_queued_request(monkeypatch, named_worker_config, queued_named_worker):
+    case = queued_named_worker
+    request_id = case.record["request_id"]
+    freeze_preparation = AsyncMock()
+    configure = AsyncMock(wraps=worker._configured_worker_runtime)
+    summary_by_field = {"request_id": str(request_id), "state": "completed"}
+    consume = AsyncMock(side_effect=[OSError("worker interrupted"), {**summary_by_field, "result": {}}])
+    monkeypatch.setattr(worker, "consume_registry_publication_once", consume)
+    monkeypatch.setattr(worker, "_configured_worker_runtime", configure)
+
+    async def start():
+        return await worker.run_registry_publication_worker(
+            named_worker_config, membership_refresh_request_id=request_id, freeze_preparation=freeze_preparation
+        )
+
+    expected_events = [
+        "source open",
+        "lifecycle open",
+        "execution open",
+        "preparation open",
+        "preparation close",
+        "execution close",
+        "lifecycle close",
+        "source close",
+    ]
+    with pytest.raises(OSError, match="worker interrupted"):
+        await start()
+    assert case.events == expected_events
+    case.options.clear()
+    assert await start() == summary_by_field
+    assert case.events == expected_events * 2
+    assert case.connection.fetchrow.await_count == configure.await_count == consume.await_count == 2
+    assert all(call.args[1:] == (request_id,) for call in case.connection.fetchrow.await_args_list)
+    assert all(call.kwargs["freeze_preparation"] is freeze_preparation for call in configure.await_args_list)
+    for call in consume.await_args_list:
+        selected = call.kwargs["config"]
+        source_runtime = call.kwargs["initial_address_sources"].source_witness_runtime
+        assert selected.only_request_id == request_id and selected.membership_refresh_only is True
+        assert source_runtime.catalog_bindings == case.scope and source_runtime.source_export is case.export
+        assert call.kwargs["authorize"] is selected.membership_refresh_runtime.authorize
+    assert named_worker_config.consumer.only_request_id is None
+    assert named_worker_config.initial_address_sources.source_witness_runtime is None
+
+
 @pytest.mark.asyncio
 async def test_runner_uses_real_authority_transport_without_returning_private_receipt(monkeypatch):
     events, _ = resources(monkeypatch)
@@ -1243,60 +1369,165 @@ def test_publication_custody_callback_is_runtime_only():
         replace(cfg, seal_candidate={})
 
 
+@pytest.fixture
+def rollback_preview_result():
+    return {
+        "operation": "prepare_source_rollback",
+        "candidate_id": _ID,
+        "source_generation_id": 3,
+        "expected_serving_generation": 4,
+        "approved_custom_revision": 2,
+        "candidate_sha256": "c" * 64,
+        "additions": 0,
+        "removals": 0,
+        "unresolved_rows": 0,
+        "source_selection": {"mapped_rows": 0, "omitted_rows": 0},
+    }
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed_seal", [False, True])
-async def test_source_rollback_preview_finishes_in_repeatable_read_and_refuses_changed_seal(monkeypatch, changed_seal):
-    from process import network_candidate_custody
+@pytest.mark.parametrize(
+    "change, error_code, manifest_reads",
+    [
+        (None, None, 2),
+        ("request", "registry_queue_request_changed", 0),
+        ("revision", "registry_source_rollback_revision_conflict", 0),
+        ("retained", "registry_source_rollback_manifest_changed", 1),
+        ("serving", "registry_source_rollback_manifest_changed", 2),
+        ("candidate", "registry_source_rollback_candidate_changed", 2),
+    ],
+)
+async def test_source_rollback_preview_refuses_changes_under_request_lock(
+    monkeypatch, rollback_preview_result, change, error_code, manifest_reads
+):
+    """Bind preview completion to the request lease, current controls and reviewed data."""
     from process import registry_publication_execution as execution
 
     connection = _CandidateSealConnection()
+    lease = UUID(int=2)
     request_by_name = {"request_id": UUID(_ID), "request_sha256": "a" * 64}
-    command = SimpleNamespace(expected_approved_revision=2, expected_serving_generation=1)
-    copy_target = object()
-    source_config, current = SimpleNamespace(generation_id=3), SimpleNamespace(generation_id=4)
-    result_by_name = {"candidate_sha256": "c" * 64}
-    monkeypatch.setattr(execution, "_request", AsyncMock(return_value=request_by_name))
-    monkeypatch.setattr(execution, "_fresh_retained_operation_authority", AsyncMock(return_value=command))
-    monkeypatch.setattr(execution, "_lock_publication_controls", AsyncMock(return_value=(2, 1)))
+    locked = {**request_by_name, "request_sha256": "b" * 64} if change == "request" else request_by_name
+    command = SimpleNamespace(target_generation=3, expected_approved_revision=2, expected_serving_generation=4)
+    retained = SimpleNamespace(generation_id=3, schema_name="retained_snapshot")
+    serving = SimpleNamespace(generation_id=4, schema_name="serving_snapshot")
+    request = AsyncMock(return_value=locked)
+    authority = AsyncMock(return_value=command)
+    controls = AsyncMock(return_value=(3, 4) if change == "revision" else (2, 4))
+    manifests = AsyncMock(
+        side_effect=[
+            SimpleNamespace(generation_id=3, schema_name="another_snapshot") if change == "retained" else retained,
+            SimpleNamespace(generation_id=4, schema_name="another_snapshot") if change == "serving" else serving,
+        ]
+    )
+    verifier = AsyncMock(return_value=({}, ("d" if change == "candidate" else "c") * 64))
 
-    async def retained(connection, *, generation_id, control_schema):
-        return {3: source_config, 4: current}[generation_id]
-
-    monkeypatch.setattr(execution, "_source_rollback_manifest", retained)
-    refusal = network_candidate_custody.NetworkCandidateCustodyError("changed_seal")
-
-    async def verify(connection, supplied, actual_command, roles, schema):
-        assert supplied is copy_target and actual_command is command and schema == "control"
+    async def complete(*_args, **_kwargs):
         assert connection.active and connection.active_options.get("isolation") == "repeatable_read"
-        if changed_seal:
-            raise refusal
-        return {}, "c" * 64
+        assert authority.await_count == 2
 
-    verifier = AsyncMock(side_effect=verify)
+    finish = AsyncMock(side_effect=complete)
+    monkeypatch.setattr(execution, "_request", request)
+    monkeypatch.setattr(execution, "_fresh_retained_operation_authority", authority)
+    monkeypatch.setattr(execution, "_lock_publication_controls", controls)
+    monkeypatch.setattr(execution, "_source_rollback_manifest", manifests)
     monkeypatch.setattr(execution, "_verified_source_rollback_candidate", verifier)
-    monkeypatch.setattr(execution, "_source_rollback_result", lambda *args: None)
-    finish = AsyncMock()
     monkeypatch.setattr(execution, "finish_registry_publication_request", finish)
     operation = execution._finish_source_rollback_preview(
         connection,
         request_by_name,
-        UUID(int=2),
-        copy_target,
-        (source_config, current, result_by_name),
+        lease,
+        SimpleNamespace(candidate_id=_ID),
+        (retained, serving, rollback_preview_result),
         authorize=object(),
         writer_roles={},
         control_schema="control",
     )
-    if changed_seal:
-        with pytest.raises(network_candidate_custody.NetworkCandidateCustodyError) as error:
+    if error_code:
+        expected_error = execution.RegistryApprovalConflict if change in {"request", "revision"} else ValueError
+        with pytest.raises(expected_error, match=f"^{error_code}$"):
             await operation
-        assert error.value is refusal
         finish.assert_not_awaited()
     else:
-        assert await operation is result_by_name
-        finish.assert_awaited_once()
-    verifier.assert_awaited_once()
+        assert await operation is rollback_preview_result
+        finish.assert_awaited_once_with(
+            connection, UUID(_ID), lease, state="completed", result=rollback_preview_result, control_schema="control"
+        )
+    request.assert_awaited_once_with(connection, UUID(_ID), lease, '"control"', lock=True)
+    assert manifests.await_count == manifest_reads
+    assert verifier.await_count == int(change in {None, "candidate"})
     assert connection.transaction_options == [{"isolation": "repeatable_read"}]
+    assert not connection.active
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change, is_compact_upgrade, error_code",
+    [
+        (None, False, None),
+        ("missing_metadata", False, None),
+        ("missing_metadata", True, "registry_publication_compact_bootstrap_required"),
+        (None, True, "registry_publication_compact_bootstrap_required"),
+        ("address", False, "registry_source_rollback_address_changed"),
+        ("manifest", False, "registry_source_rollback_manifest_changed"),
+    ],
+)
+async def test_source_rollback_recovers_only_the_retained_address_inputs(
+    monkeypatch, change, is_compact_upgrade, error_code
+):
+    from process import registry_publication_execution as execution
+    from process.network_address_projection import PinnedAddressSource
+    from tests.test_registry_ptg_address_carry import _artifact, _mint
+
+    npi = PinnedAddressSource("npi_fixture", "npi", "retained_edition")
+    receipt = _mint(replace(_artifact(), npi_source=npi))
+    address_pin = receipt.address_source
+    if change == "address":
+        address_pin = replace(address_pin, generation_id="a" * 64)
+    pin = SimpleNamespace(
+        schema_name="retained_snapshot",
+        manifest_sha256="b" * 64,
+        generation_id=3,
+        candidate_id=_ID,
+        compact_layout=None,
+    )
+    candidate_by_name = {"validation_json": {"address_source": asdict(address_pin)}}
+    connection = _CandidateSealConnection()
+    connection.fetchrow = AsyncMock(return_value=candidate_by_name)
+    connection.fetchval = AsyncMock(
+        return_value=None if change == "missing_metadata" else json.dumps(receipt.as_dict())
+    )
+    observed = SimpleNamespace(**{**vars(pin), "manifest_sha256": "c" * 64}) if change == "manifest" else pin
+    monkeypatch.setattr(execution, "_source_rollback_manifest", AsyncMock(return_value=observed))
+    monkeypatch.setattr(execution, "_publication_readiness", lambda candidate: None)
+
+    async def verify_snapshot(actual, captured):
+        assert actual.active_options == {"isolation": "repeatable_read", "readonly": True}
+        assert captured == receipt
+
+    verifier = AsyncMock(side_effect=verify_snapshot)
+    monkeypatch.setattr(execution, "verify_retained_custom_address_source", verifier)
+    operation = execution._source_rollback_address_sources(
+        connection, pin, "control", compact_upgrade=is_compact_upgrade
+    )
+    if error_code:
+        with pytest.raises(ValueError, match=f"^{error_code}$"):
+            await operation
+        verifier.assert_not_awaited()
+    else:
+        retained_inputs = await operation
+        assert retained_inputs.base_source == PinnedAddressSource(
+            pin.schema_name, "entity_address_unified", pin.manifest_sha256
+        )
+        assert retained_inputs.npi_source == (None if change == "missing_metadata" else npi)
+        assert retained_inputs.compact is False
+        assert verifier.await_count == int(change != "missing_metadata")
+    if change == "manifest":
+        connection.fetchrow.assert_not_awaited()
+        connection.fetchval.assert_not_awaited()
+    else:
+        assert connection.fetchrow.await_args.args[1] == UUID(_ID)
+        assert connection.fetchval.await_args.args[1] == address_pin.schema_name
+    assert connection.transaction_options == [{"isolation": "repeatable_read", "readonly": True}]
     assert not connection.active
 
 

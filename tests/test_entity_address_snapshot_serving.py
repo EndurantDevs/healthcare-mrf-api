@@ -179,6 +179,52 @@ async def test_generation_state_preserves_logical_origin_without_physical_compar
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("defect", ["schema", "missing_relation", "geo_shape", "geo_version"])
+async def test_named_capture_refuses_wrong_serving_layout(monkeypatch, defect):
+    _install_observation_results(monkeypatch, "mrf")
+    observed = await serving.capture_entity_address_observed_serving(_session(), schema_name="mrf")
+    capture = observed.as_dict()
+    if defect == "schema":
+        capture["source_schema"] = "other_snapshot"
+    elif defect == "missing_relation":
+        capture["relations"].pop()
+    elif defect == "geo_shape":
+        del capture["geo_assurance"]["active_relation_signature"]
+    else:
+        capture["geo_assurance"]["version"] += 1
+
+    with pytest.raises(ValueError, match="entity-address observed serving"):
+        serving.validate_entity_address_observed_serving_capture(capture, schema_name="mrf")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("generation_row", "message"),
+    [
+        (None, "generation is unavailable"),
+        ({"local_generation": 2**63}, "generation is unavailable"),
+        (
+            {
+                "local_lineage_id": "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+                "local_generation": 1,
+                "origin_lineage_id": "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+                "origin_generation": None,
+                "published_at": None,
+            },
+            "generation is incomplete",
+        ),
+    ],
+)
+async def test_observer_refuses_incomplete_logical_generation(generation_row, message):
+    rows = SimpleNamespace(one_or_none=lambda: generation_row)
+    session = _session()
+    session.execute.return_value = SimpleNamespace(mappings=lambda: rows)
+
+    with pytest.raises(RuntimeError, match=message):
+        await serving._result_generation_state(session, schema_name="mrf")
+
+
 def test_logical_capture_ignores_old_tokens_and_preserves_raw_metadata():
     """Copied old captures compare by logical state while their original bytes remain unchanged."""
     legacy = serving.EntityAddressObservedServingCapture(

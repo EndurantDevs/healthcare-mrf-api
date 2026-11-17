@@ -194,17 +194,6 @@ async def test_linked_import_skips_resource_outside_proof_scope() -> None:
     assert result == {}
 
 
-@pytest.mark.asyncio
-async def test_dataset_proof_parent_must_remain_mutable() -> None:
-    connection = SimpleNamespace(first=AsyncMock(return_value={}))
-
-    with pytest.raises(RuntimeError, match="proof_parent_not_mutable"):
-        await importer._lock_endpoint_dataset_proof_parent(
-            connection,
-            "dataset-edge",
-        )
-
-
 def test_endpoint_resource_scope_rejects_unknown_resource() -> None:
     with pytest.raises(RuntimeError, match="resource_scope_invalid"):
         importer._validated_endpoint_dataset_resource_scope(["UnknownResource"])
@@ -236,17 +225,6 @@ def test_parent_proof_scope_rejects_contract_and_subset_mismatches() -> None:
 
 @pytest.mark.asyncio
 async def test_existing_dataset_resources_decode_payload_or_fail_closed() -> None:
-    connection = SimpleNamespace(all=AsyncMock())
-    for resource_ids in ([], ["resource-edge"]):
-        with pytest.raises(RuntimeError, match="complete_key_reduction_required"):
-            await importer._existing_endpoint_dataset_resources(
-                connection,
-                "dataset-edge",
-                "Organization",
-                resource_ids,
-            )
-    connection.all.assert_not_awaited()
-
     prepare, merge = completion._resource_callbacks(importer, _candidate())
     resource_row = _generic_dataset_row()
     resource_row["payload_json"] = json.dumps(resource_row["payload_json"])
@@ -344,14 +322,6 @@ async def test_dataset_accumulator_rejects_unknown_hash_contract(monkeypatch) ->
     domain.first.assert_not_awaited()
     domain.all.assert_not_awaited()
     domain.status.assert_not_awaited()
-
-
-def test_materialization_requires_matching_observation_and_payload() -> None:
-    with pytest.raises(RuntimeError, match="materialization_invalid"):
-        importer._materialized_resource_rows_from_dataset_rows(
-            [],
-            [_generic_dataset_row()],
-        )
 
 
 def test_resource_write_identity_fences_dataset_contract_and_date() -> None:

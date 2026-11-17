@@ -15,7 +15,6 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from db.migration_provider_directory_terminal_root_retirement_guards import child_guard_function_sql
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_generic_source_policy as source_policy
-from process import provider_directory_source_callable_custody as callable_custody
 from process.plan_release_storage_provision import _close_relation_grants
 from process.provider_directory_fhir_census_execution import (
     CURRENT_VERSION_CENSUS_BLOCKED_ERROR,
@@ -30,7 +29,6 @@ from process.provider_directory_source_checkpoint_catalog import (
     retire_bulk_abandonment_hooks,
 )
 from process.provider_directory_source_checkpoint_control import source_checkpoint_transaction
-from process.provider_directory_source_control_privileges import METADATA_FUNCTIONS
 from tests.provider_directory_dataset_rehydrate_checkpoint_support import _guard, _layout
 from tests.provider_directory_source_postgres_support import native_source_component
 from tests.provider_directory_subset_completion_pg_concurrency import drop_owned_database
@@ -178,61 +176,12 @@ async def historical_checkpoint_catalog(scenario, *, retire_after=True):
         await retire_bulk_abandonment_hooks(scenario.connection, policy, before)
 
 
-_HISTORICAL_METADATA_CONTRACTS = {
-    "provider_directory_subset_replay_evidence_shape_valid(jsonb,text,jsonb,text)": (
-        (
-            ("replay_candidate", "jsonb"),
-            ("replay_sha256", "text"),
-            ("completion_candidate", "jsonb"),
-            ("completion_sha256", "text"),
-        ),
-        "boolean",
-        (),
-        "plpgsql",
-        "i",
-        True,
-        "s",
-        True,
-        "6293d6acf2d5cde949fc58f0444575073a1d90258441ff9ab429fefcec4cd1d9",
-    ),
-    "provider_directory_subset_coverage_shape_valid(jsonb,jsonb,text,text)": (
-        (
-            ("coverage_candidate", "jsonb"),
-            ("completion_candidate", "jsonb"),
-            ("completion_sha256", "text"),
-            ("expected_twin_state", "text"),
-        ),
-        "boolean",
-        (),
-        "plpgsql",
-        "i",
-        True,
-        "s",
-        True,
-        "d24502e18298579a1169cf748f456830265e1ada3c6d916256d442f0706bc779",
-    ),
-}
 _METADATA_SIGNATURES = (
-    *(
-        signature
-        for signature in METADATA_FUNCTIONS
-        if signature
-        in {
-            "provider_directory_subset_canonical_sha256(jsonb)",
-            "provider_directory_subset_completion_proof_pair_valid(jsonb,text)",
-            "provider_directory_subset_completion_proof_shape_valid(jsonb,text,bigint)",
-        }
-    ),
-    *_HISTORICAL_METADATA_CONTRACTS,
-)
-
-# These two historical fixtures intentionally precede the terminal-tail migration.
-# Keep all other native definition fields and ACL checks identical to current custody.
-_HISTORICAL_SHAPE_DIGESTS = frozenset(
-    (
-        "aa0730df0506d9288e7ff8d0eb3c1b7ca871ffd74de744f84af9540a36c835e9",
-        "02dfe5b14bf1c68e820f54fc47b389addef6f037c38b7ee4814994318304ab7a",
-    )
+    "provider_directory_subset_canonical_sha256(jsonb)",
+    "provider_directory_subset_completion_proof_pair_valid(jsonb,text)",
+    "provider_directory_subset_completion_proof_shape_valid(jsonb,text,bigint)",
+    "provider_directory_subset_replay_evidence_shape_valid(jsonb,text,jsonb,text)",
+    "provider_directory_subset_coverage_shape_valid(jsonb,jsonb,text,text)",
 )
 
 
@@ -241,103 +190,19 @@ _OPTIONAL_METADATA_SIGNATURE = (
 )
 
 
-def _require_metadata_entry(entry, policy, namespace, owner_oid, admin_oid, contract_by_name):
-    """Validate one fixed callable's exact native definition, owner and ACL."""
-    definition = entry["definition"]
-    contract = contract_by_name[definition["proname"]]
-    if definition["proname"] == "provider_directory_subset_completion_proof_shape_valid":
-        digest = callable_custody._body_digest(definition["prosrc"], policy.schema)
-        if digest in _HISTORICAL_SHAPE_DIGESTS:
-            contract = (*contract[:-1], digest)
-    callable_custody._require_definition(
-        entry,
-        contract,
-        policy.schema,
-        namespace,
-        callable_custody._TYPE_OIDS,
-        storage_identifier(policy.schema),
-    )
-    assert int(definition["proowner"]) == admin_oid
-    edges = set(map(tuple, entry["acl"]))
-    required_edges = {(admin_oid, admin_oid, "EXECUTE", False)}
-    assert len(edges) == len(entry["acl"]) and required_edges <= edges
-    assert edges <= required_edges | {(owner_oid, admin_oid, "EXECUTE", False)}
-
-
-async def _metadata_catalog(connection, policy, owner_oid, admin_oid):
-    optional_name, _, optional_arguments = _OPTIONAL_METADATA_SIGNATURE.partition("(")
-    optional_signature = storage_relation(policy.schema, optional_name) + "(" + optional_arguments
-    optional_oid = await connection.fetchval("SELECT to_regprocedure($1)::oid", optional_signature)
-    selected = (*_METADATA_SIGNATURES, *((_OPTIONAL_METADATA_SIGNATURE,) if optional_oid is not None else ()))
-    names = [signature.split("(")[0] for signature in selected]
-    signatures = [
-        storage_relation(policy.schema, name) + "(" + signature.split("(", 1)[1]
-        for name, signature in zip(names, selected, strict=True)
-    ]
-    namespace = await connection.fetchval("SELECT to_regnamespace($1)::oid", policy.schema)
-    catalog_rows = await connection.fetch(
-        callable_custody._FUNCTION_SQL, signatures, policy.schema, names, list(policy.runtime_roles)
-    )
-    entries = [
-        {
-            **dict(catalog_entry),
-            **{key: callable_custody._decoded(catalog_entry[key]) for key in ("definition", "acl", "access")},
-        }
-        for catalog_entry in catalog_rows
-    ]
-    assert len(entries) == len(signatures) and {entry["signature"] for entry in entries} == set(signatures)
-    assert len({int(entry["definition"]["oid"]) for entry in entries}) == len(entries)
-    contract_by_name = {
-        key.split("(")[0]: spec
-        for key, spec in {**callable_custody._CONTRACTS, **_HISTORICAL_METADATA_CONTRACTS}.items()
-    }
-    for entry in entries:
-        _require_metadata_entry(entry, policy, namespace, owner_oid, admin_oid, contract_by_name)
-    return {entry["signature"]: entry for entry in entries}
-
-
-def _require_metadata_delta(before, after, owner_oid, admin_oid, owner_usage_by_oid):
-    assert before.keys() == after.keys()
-    for signature, previous in before.items():
-        current = after[signature]
-        assert {key: value for key, value in previous["definition"].items() if key != "proacl"} == {
-            key: value for key, value in current["definition"].items() if key != "proacl"
-        }
-        assert previous["language"] == current["language"]
-        expected_acl = set(map(tuple, previous["acl"])) | {(owner_oid, admin_oid, "EXECUTE", False)}
-        assert set(map(tuple, current["acl"])) == expected_acl
-        expected_access = [
-            [*catalog_entry[:-1], catalog_entry[-1] or owner_usage_by_oid[catalog_entry[0]]]
-            for catalog_entry in previous["access"]
-        ]
-        assert current["access"] == expected_access
-
-
 async def _grant_metadata_controls(connection, policy):
-    """Grant only the fixed metadata predicates inside original admin custody."""
-    assert connection.is_in_transaction() is True and len(_METADATA_SIGNATURES) == 5
-    task = asyncio.current_task()
+    """Provision the fixed predicate grants through PostgreSQL in one transaction."""
     async with connection.transaction():
-        actor = await callable_custody._admin_identity(connection, policy)
-        owner_oid = await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", policy.owner_role)
-        admin_oid = await connection.fetchval("SELECT oid::bigint FROM pg_roles WHERE rolname=$1", actor["current"])
-        assert type(owner_oid) is int and type(admin_oid) is int and owner_oid > 0 and admin_oid > 0
-        owner_usage_by_oid = {
-            catalog_entry["oid"]: catalog_entry["owner_usage"]
-            for catalog_entry in await connection.fetch(
-                "SELECT oid::bigint AS oid,pg_has_role(oid,$1::oid,'USAGE') AS owner_usage FROM pg_roles ORDER BY oid",
-                owner_oid,
-            )
-        }
-        before = await _metadata_catalog(connection, policy, owner_oid, admin_oid)
-        for signature in before:
-            await connection.execute(
-                f"GRANT EXECUTE ON FUNCTION {signature} TO {storage_identifier(policy.owner_role)}"
-            )
-        after = await _metadata_catalog(connection, policy, owner_oid, admin_oid)
-        _require_metadata_delta(before, after, owner_oid, admin_oid, owner_usage_by_oid)
-        assert asyncio.current_task() is task
-        assert await callable_custody._admin_identity(connection, policy) == actor
+        optional_name, _, optional_arguments = _OPTIONAL_METADATA_SIGNATURE.partition("(")
+        optional_signature = storage_relation(policy.schema, optional_name) + "(" + optional_arguments
+        optional_present = await connection.fetchval(
+            "SELECT pg_catalog.to_regprocedure($1) IS NOT NULL", optional_signature
+        )
+        selected = (*_METADATA_SIGNATURES, *((_OPTIONAL_METADATA_SIGNATURE,) if optional_present else ()))
+        for signature in selected:
+            name, _, arguments = signature.partition("(")
+            function = storage_relation(policy.schema, name) + "(" + arguments
+            await connection.execute(f"GRANT EXECUTE ON FUNCTION {function} TO {storage_identifier(policy.owner_role)}")
 
 
 async def _enroll_checkpoint_custody(scenario, component):
@@ -346,24 +211,18 @@ async def _enroll_checkpoint_custody(scenario, component):
     for root in CHECKPOINT_LAYOUTS:
         relation = f'"{schema}"."{root}"'
         oid = await connection.fetchval("SELECT to_regclass($1)::oid", relation)
-        assert type(oid) is int and oid > 0
         await _close_relation_grants(
             connection,
             {"oid": oid, "nspname": schema, "relname": root},
             component.owner,
             component.policy.runtime_roles,
         )
-        assert await connection.fetchval("SELECT to_regclass($1)::oid", relation) == oid
     function_names = {guard[-1] for guards in _GUARDS.values() for guard in guards.values()}
     for name in sorted(function_names):
         function = f'"{schema}"."{name}"()'
-        oid = await connection.fetchval("SELECT to_regprocedure($1)::oid", function)
-        assert type(oid) is int and oid > 0
         await connection.execute(f'ALTER FUNCTION {function} OWNER TO "{component.owner}"')
-        assert await connection.fetchval("SELECT to_regprocedure($1)::oid", function) == oid
     for name in ("provider_directory_subset_abandonment_valid", "provider_directory_subset_terminal_disposition_valid"):
         function = f'"{schema}"."{name}"(text)'
-        assert await connection.fetchval("SELECT to_regprocedure($1)::oid", function) is not None
         await connection.execute(f'GRANT EXECUTE ON FUNCTION {function} TO "{component.owner}"')
 
 

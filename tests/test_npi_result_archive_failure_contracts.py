@@ -13,6 +13,7 @@ from unittest.mock import ANY, AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.exc import DBAPIError
 
 from process import npi_result_archive as archive
 from process import npi_result_generation as generation
@@ -300,6 +301,22 @@ async def test_canonical_source_checks_share_bounded_timeouts_and_restore_them(m
 
 
 @pytest.mark.asyncio
+async def test_catalog_timeout_cleanup_preserves_native_error():
+    failure = DBAPIError("LOCK TABLE", {}, RuntimeError("native lock denied"))
+    session = SimpleNamespace(
+        scalar=AsyncMock(side_effect=["1500ms", "60s"]),
+        execute=AsyncMock(side_effect=[None, None, failure]),
+    )
+
+    with pytest.raises(DBAPIError) as caught:
+        async with archive._bounded_catalog_work(session):
+            await session.execute(archive.text("LOCK TABLE"))
+
+    assert caught.value is failure
+    assert session.execute.await_count == 3
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["incomplete-family", "incomplete-generation", "drifted", "snapshot"])
 async def test_source_capture_rejects_incoherent_family_authority(monkeypatch, failure: str) -> None:
     @asynccontextmanager
@@ -536,7 +553,7 @@ async def test_matching_incumbent_inventory_reaches_activation_lock_boundary(mon
             cutover=archive.NpiCutoverAuthority("c" * 64, "manual"),
             on_activated=callback,
         )
-    lock.assert_awaited_once_with(session, ownership, incumbent)
+    lock.assert_awaited_once_with(session, ownership, incumbent, stage_read_only=False)
     callback.assert_not_awaited()
 
 
@@ -660,7 +677,7 @@ async def test_sequence_copy_preserves_existing_owner_and_rejects_drift(monkeypa
     ownership = _ownership()
     monkeypatch.setattr(archive, "_owned_sequences", AsyncMock(return_value=()))
     with pytest.raises(archive.NpiResultArchiveError, match="sequence ownership differs"):
-        await archive._advance_and_verify_stage_sequences(session, ownership)
+        await archive._verify_stage_sequences(session, ownership)
     with pytest.raises(archive.NpiResultArchiveError, match="sequence ownership differs"):
         await archive._verify_stage_sequence_owners(
             session,
@@ -670,19 +687,21 @@ async def test_sequence_copy_preserves_existing_owner_and_rejects_drift(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_sequence_state_rejects_missing_minimum_and_post_setval_drift(monkeypatch) -> None:
+async def test_read_only_sequence_validation_rejects_unavailable_or_changed_state(monkeypatch) -> None:
     ownership = _ownership()
     session = SimpleNamespace(scalar=AsyncMock(return_value=None), execute=AsyncMock())
     monkeypatch.setattr(archive, "_owned_sequences", AsyncMock(return_value=ownership.sequence_oids))
-    monkeypatch.setattr(archive, "_advance_stage_sequence", AsyncMock(return_value=None))
+    monkeypatch.setattr(archive, "_stage_sequence_maximum", AsyncMock(return_value=None))
     with pytest.raises(archive.NpiResultArchiveError, match="state is unavailable"):
-        await archive._advance_and_verify_stage_sequences(session, ownership)
+        await archive._verify_stage_sequences(session, ownership)
 
     session.scalar.return_value = 1
     state = SimpleNamespace(one=lambda: (2, False))
     session.execute.return_value = state
     with pytest.raises(archive.NpiResultArchiveError, match="state differs"):
-        await archive._advance_and_verify_stage_sequences(session, ownership)
+        await archive._verify_stage_sequences(session, ownership)
+    assert session.execute.await_count == 1
+    assert "SELECT last_value" in str(session.execute.await_args.args[0])
 
 
 @pytest.mark.asyncio
@@ -706,6 +725,47 @@ async def test_clone_and_schema_identity_reject_invalid_catalog_tokens() -> None
     precreated.assert_not_awaited()
     with pytest.raises(archive.NpiResultArchiveError, match="owned schema is unavailable"):
         await archive._schema_oid(session, "stage")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("deadline_offset", "canonical", "stage_kind", "error_type", "reason"),
+    [
+        (None, True, "current", archive.NpiResultArchiveError, "deadline is unavailable"),
+        (-1, True, "current", TimeoutError, "deadline expired"),
+        (30, False, "current", archive.NpiResultArchiveError, "requires the canonical model contract"),
+        (30, True, "foreign", archive.NpiResultArchiveError, "clone scope differs"),
+        (30, True, "noncanonical", archive.NpiResultArchiveError, "clone scope differs"),
+    ],
+)
+async def test_npi_clone_rejects_invalid_preparation_before_target_io(
+    deadline_offset, canonical, stage_kind, error_type, reason
+):
+    capture = archive.NpiSourceCapture(
+        {}, "a" * 64, "legacy-manual", None, None, "mrf", "00000001-00000001-1", canonical=canonical
+    )
+    dataset_id = uuid4()
+    stage = archive.npi_stage_schema(dataset_id)
+    if stage_kind == "foreign":
+        stage = "other_" + dataset_id.hex
+    elif stage_kind == "noncanonical":
+        stage = stage.removesuffix(dataset_id.hex) + str(dataset_id)
+
+    deadline = None if deadline_offset is None else asyncio.get_running_loop().time() + deadline_offset
+    session = SimpleNamespace(execute=AsyncMock())
+    copy_rows, precreated = AsyncMock(), AsyncMock()
+    with pytest.raises(error_type, match=reason):
+        await archive._clone_source(
+            session,
+            capture,
+            stage,
+            source_copy=archive.native_archive.ReferenceFamilySourceCopy(copy_rows, 4096, 30),
+            on_precreated=precreated,
+            deadline=deadline,
+        )
+    session.execute.assert_not_awaited()
+    copy_rows.assert_not_awaited()
+    precreated.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1304,7 +1364,7 @@ async def test_received_npi_replays_six_reads_before_any_activation_mutation(mon
     monkeypatch.setattr(archive, "_remove_npi_clone_freeze", mutation)
     for name in (
         "_lock_and_verify_activation",
-        "_advance_and_verify_stage_sequences",
+        "_verify_stage_sequences",
         "read_npi_result_generation_authority",
     ):
         monkeypatch.setattr(

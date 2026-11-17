@@ -54,16 +54,16 @@ async def sample_reader():
 
 @asynccontextmanager
 async def _stage(connection, *, schema="pg_temp", missing_index=False):
-    names_by_kind = {kind: "sample_" + kind + "_" + uuid4().hex for kind in typed._DDL}
+    names_by_kind = {kind: "sample_" + kind + "_" + uuid4().hex for kind in typed._DDL if kind != "plans"}
     relations_by_kind = {kind: _identifier(schema) + "." + _identifier(name) for kind, name in names_by_kind.items()}
     created_relations = []
     try:
-        for kind, definition in typed._DDL.items():
+        for kind in names_by_kind:
             await connection.execute(
                 ("CREATE TEMP TABLE " if schema == "pg_temp" else "CREATE TABLE ")
                 + relations_by_kind[kind]
                 + "("
-                + definition
+                + typed._DDL[kind]
                 + ")"
             )
             created_relations.append(relations_by_kind[kind])

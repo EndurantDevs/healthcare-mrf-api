@@ -3,11 +3,13 @@
 
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
 
+from process import entity_address_snapshot_receipt as address_receipts
 from process import network_cms_registry_source_pair as retained
 from process import network_registry_cms_prepared_pair as prepared
 from process.entity_address_snapshot_ownership import validate_entity_address_archive_stage_ownership
@@ -234,6 +236,50 @@ def test_named_witness_pair_roundtrip_uses_complete_qualified_names():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("drift", [None, "layout", "rows", "publication"])
+async def test_named_pair_replay_revalidates_saved_content(monkeypatch, drift):
+    pair = _retained_pair()
+    ownership = pair.address_ownership
+    comment = retained._pair_comment(pair) + retained._json(pair.as_dict())
+    session = SimpleNamespace(scalar=AsyncMock(return_value=comment))
+    driver = SimpleNamespace(fetchval=AsyncMock(return_value=comment))
+    first_table, *other_tables = pair.address_receipt.tables
+    observed_receipt = pair.address_receipt
+    catalog = pair.address_catalog_sha256
+    proof = pair.proof
+    if drift == "layout":
+        catalog = "0" * 64
+    if drift == "rows":
+        table_with_extra_row = replace(first_table, row_count=first_table.row_count + 1)
+        observed_receipt = replace(observed_receipt, tables=(table_with_extra_row, *other_tables))
+    if drift == "publication":
+        proof = replace(proof, serving_receipt_id="0" * 64)
+
+    epoch = AsyncMock()
+    address_layout = AsyncMock(return_value=(observed_receipt, catalog))
+    monkeypatch.setattr(retained, "_normalize_receipt_session", AsyncMock())
+    monkeypatch.setattr(retained, "native_driver", AsyncMock(return_value=driver))
+    monkeypatch.setattr(retained, "require_retained_cms_fhir_source_epoch", epoch)
+    monkeypatch.setattr(retained, "address_clone_identity", address_layout)
+
+    replay = retained._retained_pair(session, proof, ownership.schema_name, pair.owner_role, pair.runtime_roles)
+    if drift is None:
+        assert await replay == pair
+    else:
+        with pytest.raises(ValueError, match="^registry_cms_source_pair_invalid$"):
+            await replay
+    if drift == "publication":
+        address_layout.assert_not_awaited()
+    else:
+        address_layout.assert_awaited_once_with(
+            session, ownership, pair.owner_role, pair.runtime_roles, verify_content=True
+        )
+        epoch.assert_awaited_once_with(
+            driver, pair.proof.source_pin, pair.recipe.source_pin.retained_epoch, verify_content=True
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("drift", [None, "rows", "layout"])
 async def test_legacy_pair_uses_semantic_receipt_after_catalog_renumbering(monkeypatch, drift):
     pair = replace(_witness_pair(), witness_json=None)
@@ -259,3 +305,36 @@ async def test_legacy_pair_uses_semantic_receipt_after_catalog_renumbering(monke
         read_only=True,
     )
     assert retained._json(pair.as_dict()) == original_wire
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [False, True])
+async def test_legacy_pair_metadata_validates_layout_by_name_without_scanning_rows(monkeypatch, changed):
+    pair = replace(_witness_pair(), witness_json=None)
+    schema = pair.address_ownership.schema_name
+    tables = pair.address_receipt.tables
+    shape_by_table = {table.table_name: table.schema_sha256 for table in tables}
+    if changed:
+        shape_by_table[tables[-1].table_name] = "0" * 64
+
+    observed_names = []
+
+    async def find_relation(_session, _schema, _table):
+        return object()
+
+    async def layout(_session, _local_handle, observed_schema, table_name):
+        observed_names.append((observed_schema, table_name))
+        return shape_by_table[table_name]
+
+    capture_content = AsyncMock()
+    monkeypatch.setattr(address_receipts, "_relation_oid", find_relation)
+    monkeypatch.setattr(address_receipts, "_schema_identity", layout)
+    monkeypatch.setattr(retained, "capture_entity_address_archive_receipt", capture_content)
+    check = retained._require_address_pair_layout(object(), pair, "f" * 64, verify_content=False)
+    if changed:
+        with pytest.raises(ValueError, match="^registry_cms_source_pair_legacy_semantic_layout_changed$"):
+            await check
+    else:
+        await check
+    assert observed_names == [(schema, table.table_name) for table in tables]
+    capture_content.assert_not_awaited()

@@ -493,29 +493,13 @@ async def _publish_cms_doctors_stage(stage_cls, db_schema: str, import_date: str
 
 
 async def _lock_cms_doctors_publication(session, stage_cls, db_schema, import_date, *, stage_read_only=False):
-    """Read-lock frozen heaps; ordered native rename statements acquire cutover write locks."""
+    """Protect candidate heaps before the ordered native cutover."""
     models = (DoctorClinicianAddress, CMSDoctorEducation, CMSDoctorGroupSite)
-    optional_names = tuple(name for model in models for name in (model.__main_table__, model.__main_table__ + "_old"))
-    existing_names = (
-        (
-            await session.execute(
-                db.text(
-                    "SELECT name FROM unnest(CAST(:names AS text[])) AS relations(name) "
-                    "WHERE to_regclass(format('%I.%I',CAST(:schema AS text),name)) IS NOT NULL"
-                ),
-                {"schema": db_schema, "names": list(optional_names)},
-            )
-        )
-        .scalars()
-        .all()
-    )
     stages = (stage_cls.__tablename__, *(make_class(model, import_date).__tablename__ for model in models[1:]))
     if type(stage_read_only) is not bool:
         raise RuntimeError("cms_doctors_prepared_lock_scope_invalid")
     stage_mode = "ACCESS SHARE" if stage_read_only else "ACCESS EXCLUSIVE"
     await _lock_family(session, db_schema, tuple(sorted(stages)), stage_mode, nowait=True)
-    if existing_names:
-        await _lock_family(session, db_schema, tuple(sorted(existing_names)), "ACCESS SHARE", nowait=True)
 
 
 async def _apply_cms_doctors_stage(stage_cls, db_schema: str, import_date: str, *, identity_ctx=None):
@@ -536,6 +520,7 @@ async def _apply_locked_cms_doctors_stage(stage_cls, db_schema: str, import_date
         raise RuntimeError("cms_doctors_publication_requires_transaction")
     async with source_owner_transaction(db):
         session = db._transaction_binding().session
+        # The generation row serializes publishers before rename locks the serving tables.
         incumbent = await capture_doctors_predecessor(session, db_schema)
         await seal_doctors_stages(db, db_schema, import_date)
         await publish_doctors_identities(db, identity_ctx or {})

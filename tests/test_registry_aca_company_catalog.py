@@ -15,6 +15,7 @@ from process.registry_native_network_catalog import (
     native_catalog_descriptor,
     native_catalog_rows,
     native_network_definitions,
+    validate_native_catalog_descriptor,
 )
 from process.registry_native_provider_source import native_provider_source_data
 from tests.test_registry_imported_source_inventory import native_aca_source, native_ptg_source
@@ -113,6 +114,44 @@ async def test_company_metadata_changes_identity_but_reuses_provider_capture(mon
     assert relationship["resolution_reason"] == "aca_issuer_reporting_period_2024"
     assert relationship["group"]["relationship_kind"] == "reported_affiliation"
     assert relationship["group"]["valid_from"] is relationship["group"]["valid_to"] is None
+
+
+@pytest.mark.parametrize(
+    "source_factory,changes,error",
+    [
+        pytest.param(native_aca_source, {"network_tier": " "}, "aca_invalid", id="unidentified-aca-tier"),
+        pytest.param(native_ptg_source, {"source_key": "unrelated-graph"}, "ptg_invalid", id="other-ptg-source"),
+        pytest.param(
+            native_ptg_source, {"network_names": [{"name": "Network"}]}, "ptg_invalid", id="invalid-ptg-label"
+        ),
+    ],
+)
+def test_native_catalog_refuses_malformed_definitions(source_factory, changes, error):
+    source = source_factory()
+    source["definitions"][0].update(changes)
+    with pytest.raises(ValueError, match=f"registry_native_catalog_{error}"):
+        native_catalog_descriptor(source)
+
+
+def test_native_catalog_refuses_conflicting_tier_checksums():
+    source = native_aca_source()
+    (first_plan,) = source["definitions"]
+    source["definitions"].append(first_plan | {"plan_id": "10001NY0000002", "checksum_network": 24})
+    with pytest.raises(ValueError, match="registry_native_catalog_aca_ambiguous"):
+        native_catalog_descriptor(source)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param({"complete": False}, id="incomplete"),
+        pytest.param({"input": native_ptg_source() | {"edition_id": "snapshot-two"}}, id="different-edition"),
+    ],
+)
+def test_native_catalog_refuses_unusable_descriptor(changes):
+    descriptor = native_catalog_descriptor(native_ptg_source())
+    with pytest.raises(ValueError, match="registry_native_catalog_source_invalid"):
+        validate_native_catalog_descriptor(descriptor | changes)
 
 
 @pytest.mark.asyncio

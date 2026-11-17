@@ -19,7 +19,7 @@ from uuid import uuid4
 from db.plan_release_storage import storage_identifier, storage_relation
 from process import provider_directory_compact_payload as compact_payload
 from process import provider_directory_compact_source_storage as compact_storage
-from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
+from process.native_copy_cleanup import cleanup_interrupted_copy
 from process.plan_release_storage_provision import _GRANTEES_SQL
 from process.provider_directory_generic_candidate import (
     RESOURCE_COLUMNS,
@@ -1722,9 +1722,8 @@ async def _copy(connection, policy, table, columns, records):
             status = await connection.copy_records_to_table(
                 table, schema_name=policy.schema, columns=columns, records=batch
             )
-        except asyncio.CancelledError, TimeoutError:
-            await close_interrupted_copy(connection)
-            await invalidate_copy_owner(source_copy_session(), connection)
+        except (asyncio.CancelledError, TimeoutError) as interruption:
+            await cleanup_interrupted_copy(source_copy_session(), connection, interruption)
             raise
         _require(status == f"COPY {len(batch)}", "copy_incomplete")
         count += len(batch)
@@ -1809,9 +1808,8 @@ async def _append_compact_resources(connection, policy, binding, resources, ordi
             batch_ordinal=ordinal,
             format_id=binding["payload_format"],
         )
-    except asyncio.CancelledError, TimeoutError:
-        await close_interrupted_copy(connection)
-        await invalidate_copy_owner(source_copy_session(), connection)
+    except (asyncio.CancelledError, TimeoutError) as interruption:
+        await cleanup_interrupted_copy(source_copy_session(), connection, interruption)
         raise
 
 

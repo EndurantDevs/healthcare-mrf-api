@@ -11,7 +11,6 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from tests.provider_directory_fhir_coverage_low_support import (
-    AsyncContext,
     GuardConnection,
     GuardEngine,
     artifact_dataset,
@@ -216,14 +215,6 @@ async def test_resource_npi_empty_scope_and_missing_copy(monkeypatch):
         "Organization": 1,
     }
     staged.assert_awaited_once_with(importer, "public", run_id=None, source_ids=None, seen_table=None)
-
-    raw_connection = SimpleNamespace()
-    connection = SimpleNamespace(raw_connection=raw_connection)
-    monkeypatch.setattr(importer.db, "acquire", Mock(return_value=AsyncContext(connection)))
-    with pytest.raises(NotImplementedError, match="copy_records_to_table"):
-        await importer._copy_mark_resource_rows_seen(
-            "Practitioner", [("source-1", "resource-1")], "run-1", seen_table="seen"
-        )
 
 
 @pytest.mark.asyncio

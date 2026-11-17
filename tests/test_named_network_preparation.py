@@ -173,6 +173,48 @@ async def test_ready_handoff_keeps_other_retained_named_inputs_outside_the_gener
     connection.fetch.assert_awaited_once()
 
 
+@pytest.mark.parametrize("state", [None, "building"])
+async def test_unready_generation_cannot_claim_named_preparation(state):
+    connection, composition = _composition_connection()
+    if state is None:
+        connection.fetchrow.return_value = None
+    else:
+        connection.fetchrow.return_value["state"] = state
+
+    with pytest.raises(publication.NetworkPublicationError, match="Ready network preparation is required"):
+        await publication.admit_network_preparation(
+            connection, TARGET.candidate_id, control_schema=composition.control_schema, roles=ROLES
+        )
+
+    connection.fetch.assert_not_awaited()
+    connection.fetchval.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("defect", "message"),
+    [
+        ("shared_schema", "Generation storage must be isolated"),
+        ("missing_address", "Ready generation lacks named address scope"),
+        ("missing_binding", "Ready generation storage is incomplete"),
+    ],
+)
+async def test_ready_generation_refuses_invalid_own_storage(defect, message):
+    connection, composition = _composition_connection()
+    if defect == "shared_schema":
+        connection.fetchrow.return_value["schema_name"] = composition.control_schema
+    elif defect == "missing_address":
+        del connection.fetchrow.return_value["validation_json"]["address_source"]
+    else:
+        connection.fetch.side_effect = [[{"relname": "network_membership"}]]
+
+    with pytest.raises(publication.NetworkPublicationError, match=message):
+        await publication.load_named_network_preparation(
+            connection, TARGET.candidate_id, control_schema=composition.control_schema
+        )
+
+    connection.fetchval.assert_not_awaited()
+
+
 class Connection:
     def __init__(self):
         self.active = False
@@ -291,6 +333,36 @@ async def test_final_data_scan_precedes_short_claim_and_report_update(monkeypatc
         store.validate_named.assert_not_awaited()
         connection.execute.assert_not_awaited()
     assert not connection.active
+
+
+@pytest.mark.parametrize("loss", ["claim", "ready_state"])
+async def test_completed_scan_cannot_retain_changed_preparation(monkeypatch, loss):
+    store = SimpleNamespace(yield_named_claim=AsyncMock(), validate_named=AsyncMock())
+    first_claim = object()
+    next_claim = None if loss == "claim" else object()
+    admission = AsyncMock(
+        side_effect=[(store, {"state": "frozen"}, first_claim), (store, {"state": "frozen"}, next_claim)]
+    )
+    monkeypatch.setattr(publication, "admit_network_preparation", admission)
+    scan = AsyncMock(return_value=completed_validation())
+    monkeypatch.setattr(validation, "validate_network_candidate_final", scan)
+    connection = Connection()
+    connection.execute.return_value = "UPDATE 0"
+    message = "Frozen network preparation is required" if loss == "claim" else "Ready network preparation changed"
+
+    with pytest.raises(publication.NetworkPublicationError, match=message):
+        await publication.validate_named_network_preparation(connection, TARGET, control_schema="registry", roles=ROLES)
+
+    scan.assert_awaited_once()
+    store.yield_named_claim.assert_awaited_once_with(first_claim)
+    assert connection.phases == [{}, {"isolation": "repeatable_read"}, {}] and not connection.active
+    if loss == "claim":
+        store.validate_named.assert_not_awaited()
+        connection.execute.assert_not_awaited()
+    else:
+        store.validate_named.assert_awaited_once()
+        assert store.validate_named.await_args.args[0] is next_claim
+        assert "state='ready'" in connection.execute.await_args.args[0]
 
 
 @pytest.mark.parametrize("changed", [False, True])

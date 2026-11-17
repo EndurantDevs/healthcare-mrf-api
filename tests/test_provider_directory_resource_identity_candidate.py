@@ -11,6 +11,7 @@ from uuid import UUID
 import asyncpg
 import pytest
 
+from process import native_copy_cleanup as copy_cleanup
 from process import provider_directory_cms_identity_candidate as common
 from process import provider_directory_generic_source_storage as storage
 from process import provider_directory_resource_identity_candidate as candidate
@@ -325,8 +326,8 @@ async def test_interrupted_copy_closes_exact_driver(scope, monkeypatch, failure_
     publisher.connection.copy_records_to_table = AsyncMock(side_effect=failure_type())
     close_copy = AsyncMock()
     invalidate_owner = AsyncMock()
-    monkeypatch.setattr(common, "close_interrupted_copy", close_copy)
-    monkeypatch.setattr(common, "invalidate_copy_owner", invalidate_owner)
+    monkeypatch.setattr(copy_cleanup, "close_interrupted_copy", close_copy)
+    monkeypatch.setattr(copy_cleanup, "invalidate_copy_owner", invalidate_owner)
     async with candidate.bind_resource_identity_candidate(publisher, identity, receipt):
         with pytest.raises(failure_type):
             await bind_resource_identity_batch(

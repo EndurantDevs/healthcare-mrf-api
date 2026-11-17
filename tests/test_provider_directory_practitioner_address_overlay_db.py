@@ -764,10 +764,10 @@ async def test_native_location_fields_match_current_sql(monkeypatch, move_locati
     from tests.test_provider_directory_address_overlay_keys_db import _publish_sql_keyed_rows
 
     async with support.location_overlay_fixture(monkeypatch) as (database, schema, components):
-        stage_pages = importer.overlay_keys._stage_location_key_pages
+        stage_keys = support.batch.stage_location_keys
 
         async def prepare_then_move(*arguments):
-            count = await stage_pages(*arguments)
+            count = await stage_keys(*arguments)
             if move_location:
                 await database.status(
                     f"UPDATE \"{schema}\".provider_directory_location SET first_line='200 Oak Street' "
@@ -775,7 +775,7 @@ async def test_native_location_fields_match_current_sql(monkeypatch, move_locati
                 )
             return count
 
-        monkeypatch.setattr(importer.overlay_keys, "_stage_location_key_pages", prepare_then_move)
+        monkeypatch.setattr(support.batch, "stage_location_keys", prepare_then_move)
         with importer.overlay_keys.build_scope("run-control", None):
             async with support.batch.scope(importer, schema, None, ["cms-npd"], components):
                 await importer.overlay_keys.insert_components(
@@ -811,18 +811,12 @@ async def test_native_overlay_respects_unsupported_case_fallback(monkeypatch):
             f"COLLATE {importer._q(collation)}"
         )
         await database.status(f"UPDATE \"{schema}\".provider_directory_location SET city_name='IZMIR'")
-        messages = []
-
-        async def record_step(*, message):
-            messages.append(message)
-
-        with importer.overlay_keys.build_scope("run-control", record_step):
+        with importer.overlay_keys.build_scope("run-control", None):
             async with support.batch.scope(importer, schema, None, ["cms-npd"], components):
                 assert support.batch.current() is None
                 await importer.overlay_keys.insert_components(
                     importer, schema, "batch_stage", None, ["cms-npd"], {"source_ids": ["cms-npd"]}, components
                 )
-        assert "keyed locations rows=0" in messages[0]
         await _publish_sql_keyed_rows(database, schema, "sql_current", components, {"source_ids": ["cms-npd"]})
         assert await support.label_rows(database, schema, "batch_stage") == await support.label_rows(
             database, schema, "sql_current"

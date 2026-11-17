@@ -269,11 +269,10 @@ async def _copy_pages(fhir, request, pages, outcome, origin, columns):
             command = await driver.copy_records_to_table(
                 request.relation, schema_name=publisher.policy.schema, columns=columns, records=records
             )
-        except asyncio.CancelledError, TimeoutError:
-            from process.native_copy_cleanup import close_interrupted_copy, invalidate_copy_owner
+        except (asyncio.CancelledError, TimeoutError) as interruption:
+            from process.native_copy_cleanup import cleanup_interrupted_copy
 
-            await close_interrupted_copy(driver)
-            await invalidate_copy_owner(outcome.session, driver)
+            await cleanup_interrupted_copy(outcome.session, driver, interruption)
             raise
         _require(command == "COPY " + str(len(records)))
         copied += len(records)

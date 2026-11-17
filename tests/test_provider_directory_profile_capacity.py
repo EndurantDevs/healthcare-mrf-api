@@ -547,6 +547,27 @@ def test_retained_geometry_projection_preserves_original_bytes_and_uses_named_ta
     assert capacity.capacity_geometry_payload(projected) == original == payload
     assert capacity.capacity_geometry_hash(projected) == expected_hash
     assert projected.reservation_bytes_by_storage_class == {"data": 33657888, "temp": 2048, "wal": 67361209}
+    assert capacity.revalidate_capacity_geometry(projected) == projected
+
+
+@pytest.mark.parametrize("change", ["historical_budget", "executable_budget"])
+def test_revalidation_rejects_changes_to_retained_capacity_budgets(change):
+    from process.provider_directory_profile_capacity_geometry import project_legacy_capacity_geometry
+
+    payload, expected_hash, evidence = _legacy_geometry_projection_inputs()
+    geometry = project_legacy_capacity_geometry(
+        payload, expected_hash, relations=_geometry_payload()["relations"], retained_evidence=evidence
+    )
+    if change == "historical_budget":
+        changed_retained_by_field = {**payload, "max_evidence_rows": payload["max_evidence_rows"] + 1}
+        geometry = dataclasses.replace(geometry, legacy_payload=changed_retained_by_field)
+        reason = "legacy_geometry_changed"
+    else:
+        geometry = dataclasses.replace(geometry, max_evidence_rows=geometry.max_evidence_rows + 1)
+        reason = "legacy_geometry_projection_changed"
+
+    with pytest.raises(capacity.ProviderDirectoryProfileCapacityError, match=reason):
+        capacity.revalidate_capacity_geometry(geometry)
 
 
 @pytest.mark.parametrize("change", ["missing", "source", "raw_bytes"])

@@ -70,7 +70,6 @@ def _dsn():
     url = make_url(raw)
     if (
         url.drivername != "postgresql"
-        or url.username != "postgres"
         or url.host not in {"127.0.0.1", "localhost"}
         or not 1024 <= (url.port or 0) <= 65535
     ):

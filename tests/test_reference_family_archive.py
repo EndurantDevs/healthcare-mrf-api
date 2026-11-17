@@ -654,6 +654,25 @@ def test_validation_receipt_rejects_invalid_identifiers(field, value):
         archive.validate_reference_family_validation_receipt(receipt)
 
 
+def test_historical_validation_receipt_round_trips_named_stage_binding():
+    receipt = _validation_receipt()
+    receipt.pop("relations")
+    receipt.update(
+        stage_schema_oid=31,
+        relation_oids=[["pricing_places_zcta", 42]],
+        sealed_owner_oid=53,
+    )
+    receipt["validation_sha256"] = archive._validation_digest(
+        {key: value for key, value in receipt.items() if key != "validation_sha256"}
+    )
+
+    recovered = archive.validate_reference_family_validation_receipt(receipt)
+    assert recovered.relations == ((receipt["stage_schema"], "pricing_places_zcta"),)
+    assert recovered.tables == _manifest().tables
+    assert recovered.as_dict() == receipt
+    assert archive.validate_reference_family_validation_receipt(recovered) == recovered
+
+
 @pytest.mark.parametrize(
     "relations",
     [

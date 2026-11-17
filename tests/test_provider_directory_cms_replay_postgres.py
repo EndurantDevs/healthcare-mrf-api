@@ -276,16 +276,33 @@ async def test_composite_replay_rejects_incomplete_or_unbound_evidence(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_historical_purge_requires_original_delta_and_common_proof(monkeypatch):
-    """Replay an exact signed empty-vector purge without relying on the current native pointer."""
+@pytest.mark.parametrize("retained_receipt", ["purge", "predecessor", "none"])
+async def test_historical_purge_requires_original_delta_and_common_proof(monkeypatch, retained_receipt):
+    """A CMS predecessor requires proof of the purge, even after removing the live pointer."""
     async with _delta_database(monkeypatch) as (database, schema):
         execution, scenario, payload_by_field = await _setup(database, schema, monkeypatch, purge=True)
-        receipt_id = await _insert_common(database, schema, payload_by_field)
         await database.status(f'DELETE FROM "{schema}".provider_directory_profile_serving_generation')
-        result = await _run(execution, scenario)
-        assert result["cms_serving"]["receipt_id"] == receipt_id
-        assert result["artifact_dataset_ids"] == []
-        assert result["profile_selection_result"]["operation"] == "purge"
+        if retained_receipt == "purge":
+            receipt_id = await _insert_common(database, schema, payload_by_field)
+            result = await _run(execution, scenario)
+            assert result["cms_serving"]["receipt_id"] == receipt_id
+            assert result["artifact_dataset_ids"] == []
+            assert result["profile_selection_result"]["operation"] == "purge"
+        elif retained_receipt == "predecessor":
+            previous_generation = await database.scalar(
+                f'SELECT from_generation_id FROM "{schema}".provider_directory_profile_delta_receipt'
+            )
+            payload_by_field["profile"].update(
+                generation_id=previous_generation,
+                operation="publish",
+                status="published",
+            )
+            payload_by_field["desired_datasets"] = [payload_by_field["expected_incumbent"]]
+            await _insert_common(database, schema, payload_by_field)
+            with pytest.raises(importer.ProviderDirectoryArtifactBuildStale, match="common_receipt_missing"):
+                await _run(execution, scenario)
+        else:
+            assert await _run(execution, scenario) is None
 
 
 async def _pending_common(database, schema, payload_by_field, ready, release):

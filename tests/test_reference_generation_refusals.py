@@ -188,6 +188,10 @@ async def test_stage_reservation_never_overwrites_an_operation_or_loses_attempt_
         (("extra",), True),
         (("schema_name",), " mrf "),
         (("node_id",), ""),
+        (("node_id",), 123),
+        (("node_id",), " padded "),
+        (("node_id",), "x" * 129),
+        (("source_contract_sha256",), None),
         (("import_date",), "other"),
         (("stage", "table_name"), "nucc_taxonomy_other"),
         (("stage", "indexes"), ["premature"]),
@@ -200,6 +204,13 @@ def test_named_stage_metadata_requires_closed_scope_and_exact_attempt(path, valu
     target[path[-1]] = value
     _resign_stage(stage)
     with pytest.raises(archive.ReferenceFamilyArchiveError):
+        generation._nucc_precreated_stage_value(stage)
+
+
+def test_named_stage_receipt_rejects_oversized_metadata_before_parsing():
+    stage = _nucc_stage_receipt()
+    stage["node_id"] = "x" * 131073
+    with pytest.raises(archive.ReferenceFamilyArchiveError, match="metadata exceeds its bound"):
         generation._nucc_precreated_stage_value(stage)
 
 

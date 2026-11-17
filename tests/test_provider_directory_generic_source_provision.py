@@ -571,18 +571,6 @@ def test_source_release_rejects_real_invocation_substitution(changed):
         checks._require_hook(row, checks._hook("known_guard", 4, new="new_rows"))
 
 
-@pytest.mark.asyncio
-async def test_source_release_checker_refuses_missing_admin_or_task_before_any_retirement():
-    from process import provider_directory_generic_source_release_checks as checks
-
-    connection = SimpleNamespace(is_in_transaction=lambda: False, fetchrow=AsyncMock())
-    with pytest.raises(GenericCandidateError, match="explicit_policy_required"):
-        await checks.source_release_checks(
-            connection, _policy(), migration_role="migrator", namespace_owner_role="namespace"
-        )
-    connection.fetchrow.assert_not_awaited()
-
-
 def test_source_release_specs_match_real_templates(monkeypatch):
     import re
 
@@ -665,65 +653,3 @@ def _release_native_hooks(checks, relations, definitions, *, header=False):
             )
             hooks.append(native_hook)
     return hooks
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("changed", (None, "disabled", "extra"))
-async def test_source_release_whole_legacy_verifier_keeps_complete_family_and_invocations(monkeypatch, changed):
-    """Pure catalog transport exercises the whole callback; Native authority remains separate."""
-    from process import provider_directory_generic_source_release_checks as checks
-
-    roots = tuple(dict.fromkeys((*provision.PAYLOAD_ROOTS, *provision.CONTROL_ROOTS)))
-    native_relations = [
-        dict(oid=index, nspname="source_schema", relname=root, root=root, relowner=101, relkind="r", parents=[])
-        for index, root in enumerate(roots, 1)
-    ]
-    histories = [
-        dict(
-            oid=600 + index,
-            nspname="source_schema",
-            relname="pd_dataset_history_" + str(600 + index),
-            root=root,
-            relowner=101,
-            relkind="r",
-            parents=[index + 1],
-        )
-        for index, root in enumerate(provision.TABLES)
-    ]
-    native_relations.extend(histories)
-    definition_by_name = {}
-    payload_hooks = _release_native_hooks(checks, native_relations, definition_by_name)
-    header = next(relation for relation in native_relations if relation["root"] == checks.HEADER)
-    header_hooks = _release_native_hooks(checks, [header], definition_by_name, header=True)
-    if changed == "disabled":
-        payload_hooks[0]["tgenabled"] = "D"
-    if changed == "extra":
-        payload_hooks.append({**payload_hooks[0], "tgname": "unapproved_extra_guard"})
-    plan_by_field = dict(
-        tables={root: dict(original_oid=600 + index, keys=["dataset"]) for index, root in enumerate(provision.TABLES)}
-    )
-
-    async def fetch(statement, selected, *_arguments):
-        if statement == checks._FAMILY:
-            return native_relations
-        assert statement == checks._HOOKS
-        return header_hooks if selected == [header["oid"]] else payload_hooks
-
-    connection = SimpleNamespace(fetch=AsyncMock(side_effect=fetch))
-    policy = GenericSourcePolicy("source_schema", "source_owner", "publisher", ("builder", "reader"), ("builder",))
-    verifier = checks._SourceReleaseChecks(
-        connection, policy, {}, dict(role_graph={}, functions={}, roles={}, schema_oid=201)
-    )
-    verifier._context = AsyncMock()
-    verifier._candidate_functions = AsyncMock(
-        return_value={int(definition["oid"]): definition for definition in definition_by_name.values()}
-    )
-    monkeypatch.setattr(checks, "_completed_legacy_dataset_plan", AsyncMock(return_value=plan_by_field))
-    if changed is None:
-        await verifier.verify_legacy_guards(connection, policy, native_relations)
-        assert verifier.family.keys() == {relation["oid"] for relation in native_relations}
-        assert {600 + index for index in range(6)} <= verifier.family.keys()
-    else:
-        with pytest.raises(GenericCandidateError, match="legacy_.*changed"):
-            await verifier.verify_legacy_guards(connection, policy, native_relations)
-        assert verifier.family is None

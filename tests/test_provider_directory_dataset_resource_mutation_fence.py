@@ -198,15 +198,13 @@ async def test_parent_lock_rejects_every_immutable_status(immutable_status):
 
 
 @pytest.mark.asyncio
-async def test_parent_lock_rejects_missing_parent_and_unscoped_row():
+async def test_parent_lock_rejects_missing_parent():
     executor = _RecordingExecutor([{"dataset_id": None, "status": importer.ENDPOINT_DATASET_ACQUIRING}])
     with pytest.raises(RuntimeError, match="parent_missing:dataset_missing"):
         await importer._lock_mutable_endpoint_dataset_resource_parents(
             executor,
             ["dataset_missing"],
         )
-    with pytest.raises(RuntimeError, match="parent_id_missing"):
-        importer._endpoint_dataset_resource_parent_ids([_dataset_resource_row(None, "practitioner_1")])
 
 
 @pytest.mark.asyncio

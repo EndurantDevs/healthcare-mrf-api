@@ -47,3 +47,14 @@ async def invalidate_copy_owner(session, driver):
     invalidate = getattr(session, "invalidate", None) if session is not driver else None
     if callable(invalidate):
         await drain_operation(invalidate(), preserve_cancellation=False)
+
+
+async def cleanup_interrupted_copy(session, driver, interruption):
+    """Attempt both cleanup steps while retaining the original COPY failure."""
+    try:
+        try:
+            await close_interrupted_copy(driver)
+        finally:
+            await invalidate_copy_owner(session, driver)
+    except BaseException as cleanup_error:
+        raise interruption from cleanup_error

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from process import native_copy_cleanup as copy_cleanup
 from process import provider_directory_generic_source_storage as storage
 from process.provider_directory_generic_candidate import GenericCandidateError
 from process.provider_directory_generic_source_policy import GenericSourcePolicy
@@ -29,29 +30,13 @@ async def test_interrupted_candidate_copy_closes_transport_and_invalidates_its_o
         assert actual_owner is owner and actual_connection is connection
         events.append("invalidate")
 
-    monkeypatch.setattr(storage, "close_interrupted_copy", close)
-    monkeypatch.setattr(storage, "invalidate_copy_owner", invalidate)
+    monkeypatch.setattr(copy_cleanup, "close_interrupted_copy", close)
+    monkeypatch.setattr(copy_cleanup, "invalidate_copy_owner", invalidate)
     monkeypatch.setattr(storage, "source_copy_session", lambda: owner)
     with pytest.raises(failure):
         await storage._copy(connection, SimpleNamespace(schema="source"), "input_rows", ("id",), [(1,)])
     assert events == ["close", "invalidate"]
     connection.copy_records_to_table.assert_awaited_once()
-
-
-@pytest.mark.parametrize("root", [storage.HEADER, "provider_directory_pagination_checkpoint"])
-def test_legacy_constraint_trigger_is_omitted_only_from_template_shape(root):
-    from process.provider_directory_source_storage_binding import _isolated_layout_shape
-
-    plain_by_field = dict(relname=root, columns=[], constraints=[], indexes=[])
-    guarded_by_field = dict(
-        plain_by_field, constraints=[["legacy_guard", "t", "TRIGGER DEFERRABLE INITIALLY DEFERRED", True]]
-    )
-    assert _isolated_layout_shape(guarded_by_field, template=True) == _isolated_layout_shape(
-        plain_by_field, template=False
-    )
-    assert _isolated_layout_shape(guarded_by_field, template=False) != _isolated_layout_shape(
-        plain_by_field, template=False
-    )
 
 
 def _case():
@@ -523,8 +508,8 @@ async def test_witness_failure_rolls_back_resources_and_header_ordinal(harness):
 async def test_interrupted_copy_is_closed_and_retires_its_owner(harness, monkeypatch):
     original = deepcopy(harness.header)
     close, invalidate = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(storage, "close_interrupted_copy", close)
-    monkeypatch.setattr(storage, "invalidate_copy_owner", invalidate)
+    monkeypatch.setattr(copy_cleanup, "close_interrupted_copy", close)
+    monkeypatch.setattr(copy_cleanup, "invalidate_copy_owner", invalidate)
     monkeypatch.setattr(storage, "source_copy_session", lambda: "copy-session")
     harness.connection.copy_records_to_table.side_effect = TimeoutError("copy timed out")
     with pytest.raises(TimeoutError, match="copy timed out"):

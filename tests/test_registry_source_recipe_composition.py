@@ -1,6 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Retained-page replay refuses incomplete, drifting and nonprogressing inputs."""
 
+from hashlib import sha256
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -192,3 +193,56 @@ async def test_retained_fast_path_refuses_custom_or_unverified_sources_before_sq
             connection, recipes, SimpleNamespace(total_rows=rows), "raw_stage", "registry", {}, (object(), ())
         )
     connection.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "second_page,cursor,error,copies",
+    [
+        (_page(generation_id="edition-two"), ("role", "two"), "generation_changed", 1),
+        (_page(), ("role", "one"), "cursor_invalid", 2),
+        (_empty_page(membership_rows=1), None, "accounting_invalid", 2),
+        (_page(accepted_source_rows=0), ("role", "two"), "accounting_invalid", 2),
+    ],
+)
+async def test_ordinary_source_staging_refuses_mixed_or_incomplete_pages(
+    monkeypatch, second_page, cursor, error, copies
+):
+    from tests.registry_source_recipe_support import _example
+
+    recipe = _example()
+    connection = object()
+    read_context = SimpleNamespace(office_authority=None, aca_reads_by_oid=None, retained_fhir_reads={})
+    first_cursor = ("role", "one")
+    read_page = AsyncMock(side_effect=[(_page(), first_cursor, 1000), (second_page, cursor, 1000)])
+    copy_page = AsyncMock()
+    monkeypatch.setattr(composition, "_require_recipe_custody", AsyncMock())
+    monkeypatch.setattr(composition, "_read_recipe_page", read_page)
+    monkeypatch.setattr(composition, "_copy_recipe_page", copy_page)
+    with pytest.raises(composition.RegistrySourceCompositionError, match=error):
+        await composition._stage_recipe(connection, recipe, object(), "raw_stage", "registry", read_context)
+    assert [call.args[3] for call in read_page.await_args_list] == [None, first_cursor]
+    assert copy_page.await_count == copies
+
+
+@pytest.mark.parametrize("failure", ["codec-count", "short-copy", "trailing-bytes"])
+async def test_ordinary_source_copy_requires_full_binary_accounting(monkeypatch, failure):
+    input_bytes, binary_bytes = b"staged membership", b"binary membership"
+    page = _page(input_bytes=input_bytes, input_sha256=sha256(input_bytes).hexdigest())
+    monkeypatch.setattr(composition, "_encode", lambda _: (binary_bytes, 0 if failure == "codec-count" else 1))
+
+    async def receive_copy(table, *, source, **options_by_field):
+        assert table == "raw_stage" and options_by_field == {
+            "schema_name": "pg_temp",
+            "columns": composition.COPY_COLUMNS,
+            "format": "binary",
+        }
+        if failure == "trailing-bytes":
+            assert source.read(1) == binary_bytes[:1]
+        else:
+            assert source.read() == binary_bytes
+        return "COPY 0" if failure == "short-copy" else "COPY 1"
+
+    connection = SimpleNamespace(copy_to_table=AsyncMock(side_effect=receive_copy))
+    with pytest.raises(composition.RegistrySourceCompositionError, match="accounting_invalid"):
+        await composition._copy_recipe_page(connection, page, "raw_stage")
+    assert connection.copy_to_table.await_count == int(failure != "codec-count")

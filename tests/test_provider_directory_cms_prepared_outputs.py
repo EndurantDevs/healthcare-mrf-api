@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from process import native_copy_cleanup as copy_cleanup
 from process import provider_directory_cms_prepared_outputs as outputs
 
 
@@ -63,8 +64,8 @@ async def test_missing_native_primary_key_refuses_before_streaming():
 @pytest.mark.parametrize("failure", [RuntimeError("stream interrupted"), asyncio.CancelledError(), TimeoutError()])
 async def test_interrupted_stream_cannot_return_partial_commitment(failure, monkeypatch):
     close, invalidate = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(outputs, "close_interrupted_copy", close)
-    monkeypatch.setattr(outputs, "invalidate_copy_owner", invalidate)
+    monkeypatch.setattr(copy_cleanup, "close_interrupted_copy", close)
+    monkeypatch.setattr(copy_cleanup, "invalidate_copy_owner", invalidate)
     with pytest.raises(type(failure)):
         await outputs._copy_frozen_content(*frozen_stream([b"partial"], failure=failure))
     close.assert_awaited_once()
@@ -74,8 +75,8 @@ async def test_interrupted_stream_cannot_return_partial_commitment(failure, monk
 async def test_native_chunk_limit_refuses_before_hashing(monkeypatch):
     monkeypatch.setattr(outputs, "COPY_MAX_BYTES", 4)
     close, invalidate = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(outputs, "close_interrupted_copy", close)
-    monkeypatch.setattr(outputs, "invalidate_copy_owner", invalidate)
+    monkeypatch.setattr(copy_cleanup, "close_interrupted_copy", close)
+    monkeypatch.setattr(copy_cleanup, "invalidate_copy_owner", invalidate)
     with pytest.raises(ValueError, match="frozen_chunk_unbounded"):
         await outputs._copy_frozen_content(*frozen_stream([b"too large"]))
     close.assert_awaited_once()

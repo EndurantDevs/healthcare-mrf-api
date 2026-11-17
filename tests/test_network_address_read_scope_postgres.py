@@ -5,13 +5,13 @@ import asyncio
 import json
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
 from sanic import response
 from sanic.compat import Header
-from sanic.exceptions import InvalidUsage, NotFound
+from sanic.exceptions import InvalidUsage, NotFound, ServiceUnavailable
 from sqlalchemy import MetaData, event, func, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -22,6 +22,7 @@ from api.network_address_scope import (
     canonical_network_read,
     current_network_address_scope,
     network_address_read_scope,
+    network_address_read_session_scope,
     scoped_address_cache_key,
     scoped_address_parameters,
     scoped_address_relation_sql,
@@ -379,9 +380,12 @@ def _request_snapshot_app(monkeypatch, observations, entered):
         before = await _network_request_snapshot(session)
         addresses = await npi._fetch_npi_location_candidates_map([1000000004, 1000000491], session=session)
         assert await _network_request_snapshot(session) == before == observations[-1]
-        if request.args.get("ending") == "error":
+        ending = request.args.get("ending")
+        if ending == "error":
             raise NotFound("Synthetic missing provider.")
-        if request.args.get("ending") == "cancel":
+        if ending == "database-error":
+            await session.execute(text("SELECT 1 / 0"))
+        if ending == "cancel":
             entered.set()
             await asyncio.Event().wait()
         return response.json({"locations": [row["location_key"] for rows in addresses.values() for row in rows]})
@@ -429,7 +433,7 @@ async def test_http_network_snapshot_uses_real_request_lifecycle(
                 ["SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"] if middleware_enabled else []
             )
             await _assert_request_snapshot_closed(context, request)
-        for ending, status in (("success", 200), ("error", 404)):
+        for ending, status in (("success", 200), ("error", 404), ("database-error", 503)):
             resolved_before = len(observations)
             request, reply = await app.asgi_client.get(path + "&ending=" + ending, headers=headers_by_name)
             assert reply.status == status, reply.text
@@ -442,7 +446,11 @@ async def test_http_network_snapshot_uses_real_request_lifecycle(
             )
             if ending == "success":
                 assert reply.json == {"locations": ["a" * 64]} and current_generation > 0
+            elif ending == "database-error":
+                assert reply.headers["Cache-Control"] == "private, no-store"
+                assert "division by zero" not in reply.text and "a" * 64 not in reply.text
             await _assert_request_snapshot_closed(context, request)
+        resolved_before = len(observations)
         task = asyncio.create_task(app.asgi_client.get(path + "&ending=cancel", headers=headers_by_name))
         try:
             await asyncio.wait_for(entered.wait(), timeout=10)
@@ -453,7 +461,7 @@ async def test_http_network_snapshot_uses_real_request_lifecycle(
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        assert len(observations) == 3
+        assert len(observations) == resolved_before + 1
         await _assert_request_snapshot_closed(context, app.asgi_client.last_request)
     finally:
         event.remove(Engine, "before_cursor_execute", record)
@@ -951,6 +959,61 @@ def _default_policy_manifest():
         "c" * 64,
         CompactAddressRelation("network_candidate_00000000000000000000000000000001", "entity_address_unified"),
     )
+
+
+@pytest.mark.parametrize(
+    "problem",
+    ["unpinned", "foreign-schema", "invalid-visibility", "invalid-revision", "ambiguous-selection", "invalid-digest"],
+)
+def test_address_read_refuses_ambiguous_scope_before_installing_context(problem):
+    manifest = _default_policy_manifest()
+    manifests_by_problem = {
+        "unpinned": SimpleNamespace(**vars(manifest)),
+        "foreign-schema": replace(manifest, schema_name="other_edition"),
+        "invalid-revision": replace(manifest, approved_custom_revision=True),
+    }
+    options_by_problem = {
+        "invalid-visibility": {"organization_policy": {}},
+        "ambiguous-selection": {"excluded_network_ids": ()},
+        "invalid-digest": {"access_scope_sha256": "unverified"},
+        "invalid-revision": {"excluded_network_ids": (), "access_scope_sha256": "a" * 64},
+    }
+    expected = "network_access_scope_invalid" if problem == "invalid-digest" else "network_address_scope_invalid"
+    with pytest.raises(ValueError, match=f"^{expected}$"):
+        with network_address_read_scope(
+            manifests_by_problem.get(problem, manifest),
+            None if problem == "invalid-revision" else (42,),
+            **options_by_problem.get(problem, {}),
+        ):
+            pytest.fail("Invalid selector installed an address scope")
+    assert current_network_address_scope() is None
+
+
+@pytest.mark.parametrize("changes_at", ["pin", "buffer"])
+async def test_address_read_requires_the_same_transaction_through_buffering(monkeypatch, changes_at):
+    from api import network_read_execution
+    from process import network_approved_membership_source
+
+    manifest = _default_policy_manifest()
+    transaction = object()
+    session = SimpleNamespace(get_transaction=Mock(return_value=transaction))
+    driver = object()
+
+    async def pin(pinned_driver, pinned_manifest):
+        assert pinned_driver is driver and pinned_manifest is manifest
+        if changes_at == "pin":
+            session.get_transaction.return_value = None
+        return None, CompactAddressRelation("registry", "registry_approved_record")
+
+    monkeypatch.setattr(network_read_execution, "_read_driver", AsyncMock(return_value=driver))
+    monkeypatch.setattr(network_approved_membership_source, "pin_api_retained_approved_membership_source", pin)
+    with pytest.raises(ServiceUnavailable) as failure:
+        async with network_address_read_session_scope(session, manifest, (42,)) as scope:
+            assert changes_at == "buffer"
+            assert scope.manifest is manifest and current_network_address_scope() is scope
+            session.get_transaction.return_value = object()
+    assert failure.value.headers["Cache-Control"] == "private, no-store"
+    assert current_network_address_scope() is None
 
 
 def test_default_scope_requires_closed_policy_and_keeps_nested_selected_identity():

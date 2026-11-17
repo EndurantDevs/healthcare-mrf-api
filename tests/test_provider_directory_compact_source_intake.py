@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from process import native_copy_cleanup as copy_cleanup
 from process import provider_directory_compact_payload as compact
 from process import provider_directory_generic_source_storage as storage
 from tests.test_provider_directory_generic_source_policy import _named_factory
@@ -150,9 +151,11 @@ def damaged_binding(binding, damage):
 async def test_compact_copy_uses_existing_cancel_cleanup(monkeypatch, failure):
     events = []
     monkeypatch.setattr(compact, "append_compact_payload_batch", AsyncMock(side_effect=failure))
-    monkeypatch.setattr(storage, "close_interrupted_copy", AsyncMock(side_effect=lambda _c: events.append("close")))
     monkeypatch.setattr(
-        storage, "invalidate_copy_owner", AsyncMock(side_effect=lambda *_args: events.append("invalidate"))
+        copy_cleanup, "close_interrupted_copy", AsyncMock(side_effect=lambda _c: events.append("close"))
+    )
+    monkeypatch.setattr(
+        copy_cleanup, "invalidate_copy_owner", AsyncMock(side_effect=lambda *_args: events.append("invalidate"))
     )
     monkeypatch.setattr(storage, "source_copy_session", lambda: object())
     from types import SimpleNamespace

@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 
+from process import native_copy_cleanup as copy_cleanup
 from process import provider_directory_cms_identity_candidate as candidate
 from process import provider_directory_generic_source_storage as storage
 from process.provider_directory_entity_identity import bind_entity_batch
@@ -258,8 +259,8 @@ async def test_copy_cancellation_drains_original_transport_and_invalidates_origi
     publisher, session, _, _ = scope
     publisher.connection.copy_records_to_table = AsyncMock(side_effect=asyncio.CancelledError)
     close, invalidate = AsyncMock(), AsyncMock()
-    monkeypatch.setattr(candidate, "close_interrupted_copy", close)
-    monkeypatch.setattr(candidate, "invalidate_copy_owner", invalidate)
+    monkeypatch.setattr(copy_cleanup, "close_interrupted_copy", close)
+    monkeypatch.setattr(copy_cleanup, "invalidate_copy_owner", invalidate)
     with pytest.raises(asyncio.CancelledError):
         await candidate.copy_identity_rows(publisher, "private_heap", ("value",), [("x",)])
     close.assert_awaited_once_with(publisher.connection)
