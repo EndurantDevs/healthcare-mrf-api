@@ -24,6 +24,27 @@ _CURSOR_NPI_PARAMETER = "__custom_import_geo_cursor_npi"
 _CURSOR_ADDRESS_KEY_PARAMETER = "__custom_import_geo_cursor_address_key"
 
 
+def nearby_extra_clauses(
+    filters: Sequence[str], plan_member_sql: str | None, plan_filter_position: int
+) -> tuple[str, str | None]:
+    """Compose the common predicates and the legacy first-page plan probe."""
+
+    separator = "\n          AND "
+    if plan_member_sql is None:
+        return (separator + separator.join(filters) if filters else ""), None
+
+    before, after = filters[:plan_filter_position], filters[plan_filter_position:]
+    membership = f"a.npi IN ({plan_member_sql})"
+    # OFFSET prevents flattening the probe into a join before distance ordering.
+    legacy_membership = (
+        f"EXISTS (SELECT 1 FROM ({plan_member_sql}) AS plan_members WHERE plan_members.npi = a.npi OFFSET 0)"
+    )
+    return (
+        separator + separator.join((*before, membership, *after)),
+        separator + separator.join((*before, legacy_membership, *after)),
+    )
+
+
 def normalize_state_filter(raw_value: Any) -> str | None:
     """Normalize the optional state constraint shared by provider location queries."""
     if raw_value in (None, "", "null"):
@@ -469,6 +490,7 @@ def build_native_nearby_sql(
     *,
     cursor_clause: str = "",
     use_search_page: bool = False,
+    legacy_initial_extra_clause: str | None = None,
 ) -> str:
     """Keep initial KNN reads bounded and paginate canonical address identities."""
 
@@ -502,7 +524,7 @@ SELECT hydrated_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display
         taxonomy_where=taxonomy_where,
         geo_precision_clause=nearby.geo_precision_clause,
         geo_type_clause=nearby.geo_type_clause,
-        extra_clause=nearby.extra_clause,
+        extra_clause=nearby.extra_clause if legacy_initial_extra_clause is None else legacy_initial_extra_clause,
         ilike_clause=nearby.ilike_clause,
         cursor_clause=cursor_clause,
         row_tiebreaker=nearby_row_tiebreaker(nearby.address_table_sql),
@@ -781,5 +803,6 @@ __all__ = (
     "build_native_nearby_count_sql",
     "build_native_nearby_sql",
     "nearby_batch_identities",
+    "nearby_extra_clauses",
     "nearby_row_tiebreaker",
 )

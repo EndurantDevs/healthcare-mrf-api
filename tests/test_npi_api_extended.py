@@ -3234,6 +3234,7 @@ async def test_get_near_npi_filters_primary_taxonomy_and_entity_before_limit(
 @pytest.mark.asyncio
 async def test_get_near_npi_applies_plan_scope_to_results_and_count(monkeypatch):
     sql_calls = []
+    plan_scope_sql = "SELECT npi FROM mrf.ptg2_v3_npi_scope WHERE snapshot_key = ANY(:plan_scope_snapshot_keys_0)"
 
     class RecordingConnection:
         async def all(self, sql, **params):
@@ -3249,10 +3250,7 @@ async def test_get_near_npi_applies_plan_scope_to_results_and_count(monkeypatch)
 
     async def fake_plan_scope(_session, raw_plan_release_id):
         assert raw_plan_release_id == "hprelease_" + "0" * 26
-        return (
-            "SELECT npi FROM mrf.ptg2_v3_npi_scope WHERE snapshot_key = ANY(:plan_scope_snapshot_keys_0)",
-            {"plan_scope_snapshot_keys_0": [17]},
-        )
+        return plan_scope_sql, {"plan_scope_snapshot_keys_0": [17]}
 
     monkeypatch.setattr(npi_module, "db", FakeDB())
     monkeypatch.setattr(npi_module, "_plan_release_npi_scope", fake_plan_scope)
@@ -3270,11 +3268,13 @@ async def test_get_near_npi_applies_plan_scope_to_results_and_count(monkeypatch)
         )
     )
 
-    scoped_sql = "a.npi IN (SELECT npi FROM mrf.ptg2_v3_npi_scope"
     result_sql = next(sql for sql, _params in sql_calls if "LIMIT :limit" in sql)
     count_sql = next(sql for sql, _params in sql_calls if "COUNT(DISTINCT" in sql)
-    assert scoped_sql in result_sql
-    assert scoped_sql in count_sql
+    assert (
+        f"EXISTS (SELECT 1 FROM ({plan_scope_sql}) AS plan_members WHERE plan_members.npi = a.npi OFFSET 0)"
+        in result_sql
+    )
+    assert f"a.npi IN ({plan_scope_sql})" in count_sql
     assert all(params["plan_scope_snapshot_keys_0"] == [17] for _sql, params in sql_calls)
 
 
