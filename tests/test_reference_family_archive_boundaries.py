@@ -35,7 +35,8 @@ async def test_source_lock_preserves_other_families_and_label_select_only_reader
 @pytest.mark.parametrize("state", ["valid", "incomplete", "drifted", "locked"])
 async def test_label_source_reader_keeps_snapshot_and_generation_fences(monkeypatch, state):
     @asynccontextmanager
-    async def bounded(_session):
+    async def bounded(_session, *, lock_before_snapshot=False):
+        assert not lock_before_snapshot
         yield
 
     async def execute(statement):
@@ -166,7 +167,8 @@ def test_canonical_auxiliary_receipt_is_mandatory_and_closed(auxiliary):
 @pytest.mark.parametrize("state", ["untracked", "incomplete", "drifted", "invalid-snapshot"])
 async def test_capture_rejects_incomplete_or_drifted_source_generation(monkeypatch, state):
     @asynccontextmanager
-    async def bounded(_session):
+    async def bounded(_session, *, lock_before_snapshot=False):
+        assert not lock_before_snapshot
         yield
 
     session = SimpleNamespace(
@@ -584,7 +586,8 @@ def test_captured_origin_versions_cannot_relabel_snapshot_or_writer_fenced_evide
 @pytest.mark.asyncio
 async def test_populated_legacy_family_with_generation_zero_row_captures_without_generation(monkeypatch):
     @asynccontextmanager
-    async def bounded(_session):
+    async def bounded(_session, *, lock_before_snapshot=False):
+        assert not lock_before_snapshot
         yield
 
     session = SimpleNamespace(

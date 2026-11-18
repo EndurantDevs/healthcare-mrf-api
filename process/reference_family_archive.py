@@ -814,21 +814,20 @@ async def _set_local_timeout(session: Any, setting: str, value: str) -> None:
 
 
 @asynccontextmanager
-async def _bounded_capture(session: Any):
-    """Bound lock/capture work, then restore caller settings before cloning."""
+async def _bounded_capture(session: Any, *, lock_before_snapshot: bool = False):
+    """Bind capture timeouts while preserving the caller's snapshot order."""
 
     previous_lock = await _timeout_value(session, "lock_timeout")
     previous_statement = await _timeout_value(session, "statement_timeout")
-    await _set_local_timeout(session, "lock_timeout", _LOCK_TIMEOUT)
-    await _set_local_timeout(session, "statement_timeout", _CAPTURE_TIMEOUT)
-    try:
-        yield
-    except BaseException:
-        # A failed caller transaction expires SET LOCAL; more SQL would mask the original error.
-        raise
+    if lock_before_snapshot:
+        await session.execute(text(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT}'"))
+        await session.execute(text(f"SET LOCAL statement_timeout = '{_CAPTURE_TIMEOUT}'"))
     else:
-        await _set_local_timeout(session, "lock_timeout", previous_lock)
-        await _set_local_timeout(session, "statement_timeout", previous_statement)
+        await _set_local_timeout(session, "lock_timeout", _LOCK_TIMEOUT)
+        await _set_local_timeout(session, "statement_timeout", _CAPTURE_TIMEOUT)
+    yield
+    await _set_local_timeout(session, "lock_timeout", previous_lock)
+    await _set_local_timeout(session, "statement_timeout", previous_statement)
 
 
 async def _lock_family(
@@ -1387,7 +1386,7 @@ async def _capture_reference_family_source(
     if importer_id == "mrf" and STAGE_TABLE in spec.table_names:
         await _lock_source_family(session, spec, schema, canonical_source_fence)
         await _require_canonical_source_catalog(session, spec, schema)
-    async with _bounded_capture(session):
+    async with _bounded_capture(session, lock_before_snapshot=spec.importer_id == "facility-anchors"):
         await _lock_source_family(session, spec, schema, canonical_source_fence)
         publication = None
         if importer_id == "mrf":
@@ -3597,7 +3596,7 @@ async def _capture_source_dependencies(
             if importer_id == "mrf"
             else reference_family_spec(importer_id)
         )
-        async with _bounded_capture(source_session):
+        async with _bounded_capture(source_session, lock_before_snapshot=importer_id == "facility-anchors"):
             await _lock_source_family(source_session, spec, _schema_name(schema_name), canonical_source_fence)
             if source_metadata_factory is not None:
                 effective_source_metadata = await source_metadata_factory(source_session)
@@ -4957,9 +4956,9 @@ async def _require_automatic_cutover_generation(
     elif spec.importer_id == "cms-doctors":
         await require_doctors_storage(session, schema_name=expected_incumbent.schema_name, legacy=True)
     elif spec.importer_id != "label":
-        from process.reference_source_generation import require_reference_revision_tracking
+        from process.reference_family_result_generation import require_reference_family_source_consistency
 
-        await require_reference_revision_tracking(
+        await require_reference_family_source_consistency(
             session, importer_id=spec.importer_id, schema_name=expected_incumbent.schema_name
         )
     try:

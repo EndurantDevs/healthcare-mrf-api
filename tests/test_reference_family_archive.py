@@ -437,17 +437,25 @@ async def test_capture_rejects_absent_provenance_before_database_access():
 
 
 @pytest.mark.asyncio
-async def test_bounded_capture_does_not_mask_the_original_failure():
+@pytest.mark.parametrize("lock_before_snapshot", (False, True))
+async def test_bounded_capture_does_not_mask_the_original_failure(lock_before_snapshot):
     session = SimpleNamespace(
         scalar=AsyncMock(side_effect=["0", "0"]),
         execute=AsyncMock(),
     )
 
     with pytest.raises(RuntimeError, match="original failure"):
-        async with archive._bounded_capture(session):
+        async with archive._bounded_capture(session, lock_before_snapshot=lock_before_snapshot):
             raise RuntimeError("original failure")
 
-    assert session.execute.await_count == 2
+    calls = [str(call.args[0]) for call in session.execute.await_args_list]
+    if lock_before_snapshot:
+        assert calls == [
+            f"SET LOCAL lock_timeout = '{archive._LOCK_TIMEOUT}'",
+            f"SET LOCAL statement_timeout = '{archive._CAPTURE_TIMEOUT}'",
+        ]
+    else:
+        assert calls == ["SELECT pg_catalog.set_config(:setting, :value, true)"] * 2
 
 
 @pytest.mark.asyncio
@@ -835,7 +843,8 @@ async def test_prepare_metadata_factory_guards(monkeypatch, has_metadata):
         yield session
 
     @asynccontextmanager
-    async def bounded(_session):
+    async def bounded(_session, *, lock_before_snapshot=False):
+        assert not lock_before_snapshot
         yield
 
     monkeypatch.setattr(archive, "_bounded_capture", bounded)

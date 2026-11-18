@@ -66,6 +66,7 @@ RELATION_NAMES_BY_IMPORTER = {
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _MAX_GENERATION = (1 << 63) - 1
 _MAX_OID = (1 << 32) - 1
+_FROZEN_FACILITY_PUBLICATION = "reference-family.facility-anchors.read-only.v1"
 
 
 @dataclass(frozen=True)
@@ -387,7 +388,7 @@ async def capture_reference_family_serving_generation(
     importer_id: str,
     schema_name: str,
 ) -> ReferenceFamilyServingGeneration:
-    """Bind the serving generation to the exact canonical OIDs in this transaction."""
+    """Read the generation for the declared qualified relations in the caller transaction."""
 
     authority = await read_reference_family_result_generation_authority(
         database, importer_id=importer_id, schema_name=schema_name
@@ -398,9 +399,7 @@ async def capture_reference_family_serving_generation(
         if authority.serving_generation is None or authority.relations != (relation,):
             raise RuntimeError("NUCC serving generation is unavailable or its selected child changed")
         return authority.serving_generation
-    current_oids = await current_reference_family_relation_oids(
-        database, importer_id=importer_id, schema_name=schema_name
-    )
+    await current_reference_family_relation_oids(database, importer_id=importer_id, schema_name=schema_name)
     if authority.serving_generation is None or authority.relations != declared_reference_family_relations(
         importer_id, schema_name
     ):
@@ -414,10 +413,41 @@ async def capture_reference_family_serving_generation(
 
         await require_doctors_storage(database, schema_name=schema_name, legacy=True)
     elif importer_id != "label":
-        from process.reference_source_generation import require_reference_revision_tracking
-
-        await require_reference_revision_tracking(database, importer_id=importer_id, schema_name=schema_name)
+        await require_reference_family_source_consistency(database, importer_id=importer_id, schema_name=schema_name)
     return authority.serving_generation
+
+
+async def require_reference_family_source_consistency(database, *, importer_id, schema_name):
+    """Require declared read-only Facility storage or the mutable revision guard."""
+    if importer_id == "facility-anchors":
+        schema = _quoted(_schema_name(schema_name))
+        row = await _first(
+            database,
+            text(
+                "SELECT NOT source_revision_tracked AND obj_description(to_regclass(:relation),'pg_class')=:kind AS frozen "
+                f"FROM {schema}.{_quoted(TABLE_NAME)} WHERE importer_id='facility-anchors'"
+            ),
+            relation=f'{schema}."facility_anchor"',
+            kind=_FROZEN_FACILITY_PUBLICATION,
+        )
+        if row is not None and _row_mapping(row)["frozen"] is True:
+            return
+    from process.reference_source_generation import require_reference_revision_tracking
+
+    await require_reference_revision_tracking(database, importer_id=importer_id, schema_name=schema_name)
+
+
+async def _declare_facility_publication_kind(session, schema_name, *, frozen):
+    """Record the serving storage kind on the relation that moves during rollback."""
+    relation = f'{_quoted(_schema_name(schema_name))}."facility_anchor"'
+    if not frozen:
+        existing_kind = await session.scalar(
+            text("SELECT obj_description(to_regclass(:relation),'pg_class')"), {"relation": relation}
+        )
+        if existing_kind != _FROZEN_FACILITY_PUBLICATION:
+            return
+    comment = f"'{_FROZEN_FACILITY_PUBLICATION}'" if frozen else "NULL"
+    await session.execute(text(f"COMMENT ON TABLE {relation} IS {comment}"))
 
 
 async def publish_local_reference_family_generation(
@@ -1354,7 +1384,13 @@ async def _activate_verified_reference_family(
             **({"roles": cutover.roles} if spec.importer_id == "nucc" else {}),
         )
         published_authority = await native._adopt_validated_family_generation(
-            session, validated_manifest, expected_incumbent, incoming_generation, live_pairs, immutable_predecessor
+            session,
+            validated_manifest,
+            expected_incumbent,
+            incoming_generation,
+            live_pairs,
+            immutable_predecessor,
+            frozen=cutover.stage_read_only,
         )
     return native.ReferenceFamilyActivationReceipt(
         spec.importer_id,
@@ -1401,9 +1437,9 @@ async def _read_immutable_activation_predecessor(session, manifest, incumbent):
 
 
 async def _adopt_validated_family_generation(
-    session, manifest, incumbent, incoming_generation, live_pairs, predecessor, *, geo_retained_cut=None
+    session, manifest, incumbent, incoming_generation, live_pairs, predecessor, *, geo_retained_cut=None, frozen=False
 ):
-    """Select immutable NUCC only from the already validated exact capture contract."""
+    """Preserve the validated source origin on the destination's declared serving names."""
     from process import reference_family_archive as native
 
     if geo_retained_cut is not None:
@@ -1450,15 +1486,15 @@ async def _adopt_validated_family_generation(
             source_revision_tracked=(
                 incoming_generation is not None
                 and manifest.source_capture_contract == native.GUARDED_SOURCE_CAPTURE_CONTRACT
+                and not (frozen and manifest.importer_id == "facility-anchors")
             ),
         )
+    reference_spec = native.reference_family_spec(manifest.importer_id)
     native._require_published_generation_binding(
-        native.reference_family_spec(manifest.importer_id),
-        live_pairs,
-        incoming_generation,
-        published_authority,
-        schema_name=incumbent.schema_name,
+        reference_spec, live_pairs, incoming_generation, published_authority, schema_name=incumbent.schema_name
     )
+    if manifest.importer_id == "facility-anchors":
+        await _declare_facility_publication_kind(session, incumbent.schema_name, frozen=frozen)
     return published_authority
 
 
