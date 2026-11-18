@@ -1224,6 +1224,51 @@ async def test_organization_zip_page_registry_lookup(monkeypatch, extra_args, in
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changes", "local_lookup"),
+    [
+        ({}, True),
+        ({"view": "card"}, True),
+        ({"entity_type_code": "1"}, False),
+        ({"state": ""}, False),
+        ({"order_by": "relevance"}, False),
+        ({"codes": "207Q00000X"}, False),
+        ({"min_address_sources": "2"}, False),
+    ],
+)
+async def test_named_organization_zip_page_uses_same_office_filters(monkeypatch, changes, local_lookup):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
+    query_by_name = {
+        "q": "clinic",
+        "entity_type_code": "2",
+        "zip_code": "12345",
+        "city": "Example",
+        "state": "NY",
+        "include_total": "1",
+        "start": "5",
+        "limit": "6",
+        **changes,
+    }
+    await get_all(types.SimpleNamespace(args=query_by_name))
+    page, params = next(call for call in conn.sql_calls if "page_npis AS" in call[0])
+    assert ("zip_npis AS MATERIALIZED" in page) is local_lookup
+    assert all("zip_npis AS MATERIALIZED" not in sql for sql, _ in conn.sql_calls if "COUNT(DISTINCT" in sql)
+    if local_lookup:
+        office_filters = re.findall(r"WHERE (c\.type IN [^\n]+)", page)
+        assert len(office_filters) == 3 and len(set(office_filters)) == 1
+        assert all(
+            fragment in office_filters[0] for fragment in ("city_name = :city", "state_name = :state", ":zip_code")
+        )
+        assert "COALESCE(c.npi, c.inferred_npi) AS npi" in page
+        assert (
+            "LIKE :name_like_0" in page and "b.entity_type_code = :entity_type_code AND b.npi = z.npi OFFSET 0" in page
+        )
+        assert (params["name_like_0"], params["start"], params["limit"]) == ("%clinic%", 5, 6)
+
+
+@pytest.mark.asyncio
 async def test_get_all_zip_phone_and_name_filters_are_applied(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))

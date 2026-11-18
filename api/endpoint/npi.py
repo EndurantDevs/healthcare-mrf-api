@@ -9192,21 +9192,21 @@ async def list_providers(
             if order_by == "relevance":
                 name_expression = NAME_LIKE_TEMPLATE.format(alias="b.")
                 filtered_npi_projection += f", similarity({name_expression}, :relevance_q) AS relevance_score"
-            direct_name_taxonomy = bool(taxonomy_code_placeholders)
-            if not direct_name_taxonomy and not use_bounded_broad_name_page:
+            if not taxonomy_code_placeholders and not use_bounded_broad_name_page:
                 filtered_npi_cte = _provider_registry_page_cte(
                     filtered_npi_projection,
                     npi_where,
                     npi_params,
                     filters_by_name,
-                    ordinary_unified_search=is_ordinary_provider_query and is_unified_search,
+                    address_clauses,
+                    zip_table=address_table_sql if is_ordinary_provider_query and is_unified_search else None,
                     has_additional_constraints=bool(plan_member_sql or dynamic_code_parameters),
                 )
             if use_taxonomy_filter:
                 taxonomy_matched_npi_cte = _provider_taxonomy_matched_npi_cte(
                     taxonomy_filter,
                     code_placeholders=taxonomy_code_placeholders,
-                    npi_where=npi_where if direct_name_taxonomy else "",
+                    npi_where=npi_where if taxonomy_code_placeholders else "",
                     npi_projection=filtered_npi_projection,
                     primary_only=primary_only,
                     is_projection_enabled=ENABLE_NPI_SEARCH_TAXONOMY_PROJECTION,
