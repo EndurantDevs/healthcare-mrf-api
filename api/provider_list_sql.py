@@ -292,6 +292,49 @@ def _sql_with_ctes(*ctes: str | None) -> str:
     return f"WITH {joined_ctes}\n" if available_ctes else ""
 
 
+def _provider_registry_page_cte(
+    projection: str,
+    where: str,
+    parameters: Mapping[str, object],
+    filters: Mapping[str, object],
+    *,
+    ordinary_unified_search: bool,
+    has_additional_constraints: bool,
+) -> str:
+    """Allow ZIP-matched offices to probe the registry for unadorned organization pages."""
+    narrow_zip_search = (
+        ordinary_unified_search
+        and bool(filters.get("zip_code"))
+        and parameters == {"entity_type_code": 2}
+        and not has_additional_constraints
+        and not any(
+            filters.get(key)
+            for key in (
+                "classification",
+                "specialization",
+                "section",
+                "display_name",
+                "codes",
+                "min_address_sources",
+                "plan_network",
+                "has_insurance",
+                "phone_digits",
+                "address_key",
+                "address_site_key",
+                "npi",
+            )
+        )
+    )
+    materialization = "NOT MATERIALIZED" if narrow_zip_search else "MATERIALIZED"
+    return f"""
+        filtered_npi AS {materialization} (
+            SELECT {projection}
+              FROM mrf.npi AS b
+             WHERE {where}
+        )
+"""
+
+
 def _address_npi_filter(alias: str, address_table_sql: str) -> str:
     if _is_unified_address_table(address_table_sql):
         return f"COALESCE({alias}.npi, {alias}.inferred_npi) = :npi_filter"

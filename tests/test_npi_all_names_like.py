@@ -1200,6 +1200,30 @@ async def test_get_all_unified_network_filter_matches_serving_index(monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra_args", "inline_registry"),
+    [
+        ({"zip_code": "12345", "city": "Example", "state": "NY"}, True),
+        ({"zip_code": "12345", "entity_type_code": "1"}, False),
+        ({"city": "Example", "state": "NY"}, False),
+        ({"zip_code": "12345", "q": "clinic"}, False),
+    ],
+)
+async def test_organization_zip_page_registry_lookup(monkeypatch, extra_args, inline_registry):
+    conn = RecordingConnection()
+    monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
+    await get_all(types.SimpleNamespace(args={"entity_type_code": "2", "include_total": "1", **extra_args}))
+
+    page = next(sql for sql, _ in conn.sql_calls if "page_npis AS" in sql)
+    assert ("filtered_npi AS NOT MATERIALIZED" in page) is inline_registry
+    assert ("filtered_npi AS MATERIALIZED" in page) is not inline_registry
+    assert "b.entity_type_code = :entity_type_code" in page
+    count = next(sql for sql, _ in conn.sql_calls if "COUNT(DISTINCT" in sql)
+    assert "filtered_npi AS NOT MATERIALIZED" not in count
+
+
+@pytest.mark.asyncio
 async def test_get_all_zip_phone_and_name_filters_are_applied(monkeypatch):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
