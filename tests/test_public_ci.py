@@ -22,7 +22,24 @@ PYTHON_DEPENDENCY_JOBS = {
     "fhir-catalog-integration",
 }
 LOCAL_SETUP_ACTION = "./ci/scripts/healthcare/setup"
-COMMON_TEST_JOBS = {"python-tests", "capacity-evidence"}
+COMMON_TEST_JOBS = {
+    "python-tests",
+    "capacity-evidence",
+    "api-contract",
+    "rust-scanner",
+    "worker-queue-smoke",
+    "address-canonical-db-tests",
+    "fhir-catalog-integration",
+}
+EXPECTED_BROKER_SCOPES = {
+    "python-tests": '"same-tree-healthcare-python-main-${{ matrix.shard }}"',
+    "capacity-evidence": "same-tree-healthcare-capacity",
+    "api-contract": "same-tree-healthcare-api-contract",
+    "rust-scanner": "same-tree-healthcare-rust-scanner",
+    "worker-queue-smoke": "same-tree-healthcare-worker-queue",
+    "address-canonical-db-tests": '"same-tree-healthcare-postgres-${{ matrix.shard }}"',
+    "fhir-catalog-integration": "same-tree-healthcare-postgres-fhir-catalog-integration",
+}
 JOB_LABELS = {
     "smoke": "portable import checks",
     "public-hygiene": "Repository checks",
@@ -308,9 +325,10 @@ def test_qualified_stages_use_local_setup_and_scoped_common_test_evidence():
         assert broker["name"] == "Prepare read-only common-test evidence"
         assert broker["working-directory"] == "${{ github.workspace }}"
         assert broker["env"] == {"GH_TOKEN": "${{ github.token }}"}
+        expected_scope = EXPECTED_BROKER_SCOPES[job_id]
         assert broker["run"] == (
             'python3 "$CI_ROOT/scripts/common_test_broker.py" --source-root "$SOURCE_ROOT" '
-            '--source-repository "$SOURCE_REPOSITORY" --step "$COMMON_TEST_STEP" '
+            f'--source-repository "$SOURCE_REPOSITORY" --step "$COMMON_TEST_STEP" --scope {expected_scope} '
             '--directory "$RUNNER_TEMP/common-test-evidence"'
         )
         assert job["env"]["COMMON_TEST_STEP"] == "Run complete validation stage"
@@ -319,7 +337,7 @@ def test_qualified_stages_use_local_setup_and_scoped_common_test_evidence():
         assert "GH_TOKEN" not in job.get("env", {})
         assert "GH_TOKEN" not in stage.get("env", {})
     assert broker_jobs == COMMON_TEST_JOBS
-    assert not any(
+    assert any(
         step.get("name") == "Upload verified common-test measurements"
         for step in workflow["jobs"]["address-canonical-db-tests"]["steps"]
     )

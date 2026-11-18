@@ -412,6 +412,31 @@ def test_shard_provenance_may_carry_a_common_test_execution_reference(tmp_path: 
             artifacts.verify_shard_artifacts(tmp_path, artifact_directory, kind, BASE_SHA, HEAD_SHA)
 
 
+def test_report_provenance_may_carry_a_common_test_execution_reference(tmp_path: Path) -> None:
+    """A recorded or reused report names its execution; the controller authenticates that reference."""
+
+    baseline_path = tmp_path / artifacts.BASELINE_NAME
+    baseline_path.write_text(json.dumps(_artifact_baseline()), encoding="utf-8")
+    artifact_directory = tmp_path / "rust"
+    artifact_directory.mkdir()
+    report_path = artifact_directory / "test-coverage-rust.json"
+    report_path.write_text("{}", encoding="utf-8")
+    provenance_path = artifact_directory / artifacts.report_provenance_name("rust")
+    provenance = artifacts._report_provenance(tmp_path, "rust", report_path, BASE_SHA, HEAD_SHA)
+    provenance["common_test_execution"] = {"executed": False, "fingerprint": "f" * 64}
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+    assert artifacts.verify_report_artifact(tmp_path, artifact_directory, "rust", BASE_SHA, HEAD_SHA) == report_path
+
+    for changed in (
+        {**provenance, "common_test_execution": ["not", "an", "object"]},
+        {**provenance, "report_sha256": "0" * 64},
+        {**provenance, "unreviewed": True},
+    ):
+        provenance_path.write_text(json.dumps(changed), encoding="utf-8")
+        with pytest.raises(artifacts.CoverageForecastError, match="exact CI input|must be an object"):
+            artifacts.verify_report_artifact(tmp_path, artifact_directory, "rust", BASE_SHA, HEAD_SHA)
+
+
 def test_rust_artifact_inventory_rejects_a_mixed_report_set(tmp_path: Path) -> None:
     """Rust diagnostics cannot consume an unrelated downloaded artifact."""
 
