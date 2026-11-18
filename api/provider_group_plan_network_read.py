@@ -68,3 +68,58 @@ def group_plan_address_source(schema):
         raise ServiceUnavailable("Managed group directory offices are unavailable.") from error
     # Coverage arrays belong to this heap; a current plan bridge is a different snapshot.
     return (relation, True, True, False), parameters
+
+
+def group_plan_member_queries(
+    tables_by_snapshot, params, candidate_cte, *, exact_zip_count, local_candidates, filter_sql
+):
+    """Build a member page and the optional ZIP-local count from validated read inputs."""
+    page_join_sql = "JOIN local_provider_npis local ON local.npi = gm.npi" if local_candidates else ""
+    page_filter_sql = "" if local_candidates else filter_sql
+    bounded_member_streams = []
+    for stream_index, (snapshot_key, table) in enumerate(sorted(tables_by_snapshot.items())):
+        stream_key_parameter = f"page_snapshot_key_{stream_index}"
+        params[stream_key_parameter] = snapshot_key
+        if exact_zip_count:
+            bounded_member_streams.append(
+                f"SELECT 1 FROM {table} gm WHERE gm.snapshot_key = :{stream_key_parameter} AND gm.npi = local.npi"
+            )
+            continue
+        bounded_member_streams.append(
+            f"""(
+                SELECT DISTINCT gm.npi
+                  FROM {table} gm
+                  {page_join_sql}
+                 WHERE gm.snapshot_key = :{stream_key_parameter}
+                   AND gm.npi BETWEEN :npi_min AND :npi_max
+                   AND gm.npi > :cursor_npi{page_filter_sql}
+                 ORDER BY gm.npi
+                 LIMIT :limit
+            )"""
+        )
+    member_union = " UNION ALL ".join(bounded_member_streams)
+    if exact_zip_count:
+        # Probe only the selected table and key pairs, stopping at the first match for each local NPI.
+        zip_members_sql = f"""
+          FROM local_provider_npis local
+          CROSS JOIN LATERAL (
+              {member_union}
+               LIMIT 1
+          ) member
+         WHERE local.npi BETWEEN :npi_min AND :npi_max
+        """
+        page_sql = f"""
+            {candidate_cte}SELECT local.npi {zip_members_sql}
+               AND local.npi > :cursor_npi
+             ORDER BY local.npi
+             LIMIT :limit
+            """
+        return page_sql, f"{candidate_cte}SELECT COUNT(*) {zip_members_sql}"
+
+    page_sql = f"""
+        {candidate_cte}SELECT DISTINCT bounded_group_member.npi
+          FROM ({member_union}) AS bounded_group_member
+         ORDER BY bounded_group_member.npi
+         LIMIT :limit
+        """
+    return page_sql, None

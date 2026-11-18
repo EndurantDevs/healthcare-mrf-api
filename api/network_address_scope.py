@@ -44,6 +44,13 @@ class NetworkAddressReadScope:
     organization_policy: RegistryOrganizationVisibility | None = None
     legacy_checksums: tuple[int, ...] | None = None
 
+    @property
+    def is_compact_network_selection(self) -> bool:
+        """Whether the address relation filters compact office edges by canonical network ID."""
+        return (
+            self.network_ids is not None and self.legacy_checksums is None and self.manifest.compact_layout is not None
+        )
+
 
 class _LegacyNetworkScopeMismatch(Forbidden):
     """The signed legacy subset differs from its authenticated canonical identities."""
