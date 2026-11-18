@@ -324,6 +324,18 @@ async def test_legacy_history_binding(monkeypatch, case):
         assert await database.scalar("SELECT count(*) FROM mrf.provider_directory_profile_failed_cleanup_claim") == 0
 
 
+async def _remove_fixture_publication_metadata(database, monkeypatch):
+    await database.status("ALTER TABLE mrf.provider_directory_cms_serving_receipt RENAME TO hidden_fixture_receipt")
+    lock_catalogs = cleanup._lock_drop_catalogs
+
+    async def wait_for_fixture_catalog(fhir_module):
+        # Drain catalog maintenance within the disposal transaction's lock budget.
+        await database.status("LOCK TABLE pg_catalog.pg_depend IN SHARE MODE")
+        await lock_catalogs(fhir_module)
+
+    monkeypatch.setattr(cleanup, "_lock_drop_catalogs", wait_for_fixture_catalog)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case", ["success", "target_alias", "published_changed", "stage_changed", "partial", "metadata_missing", "payload"]
@@ -363,9 +375,7 @@ async def test_legacy_failed_profile_cleanup(monkeypatch, case):
                 "UPDATE mrf.provider_directory_profile_build_checkpoint SET evidence_stage='changed_stage'"
             )
         if case == "metadata_missing":
-            await database.status(
-                "ALTER TABLE mrf.provider_directory_cms_serving_receipt RENAME TO hidden_fixture_receipt"
-            )
+            await _remove_fixture_publication_metadata(database, monkeypatch)
         if case == "target_alias":
             # Re-sign exact aliasing manifest; closed validation refuses before any claim.
             envelope["authorization"]["stages"][0].update(
