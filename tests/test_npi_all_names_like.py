@@ -13,6 +13,7 @@ import sanic.exceptions
 from api import provider_profile_snapshot, provider_search_sql
 from api.endpoint import npi as npi_module
 from api.endpoint.npi import get_all
+from api.network_address_scope import NetworkAddressReadScope
 
 
 class RecordingConnection:
@@ -167,23 +168,40 @@ async def test_get_all_zip_code_only_filters_keep_direct_taxonomy_matching(monke
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "extra_args, selected",
-    [({"q": "example"}, False), ({"q": "example", "order_by": "relevance"}, False), ({}, True)],
+    "location, extra_args, scope_kind, computed_order",
+    [
+        ({"zip_code": "12345"}, {"q": "example"}, None, False),
+        ({"zip_code": "12345"}, {"q": "example", "order_by": "relevance"}, None, False),
+        ({"zip_code": "12345"}, {}, "compact", True),
+        ({"state": "TX"}, {}, "compact", True),
+        ({"city": "Chicago", "state": "IL"}, {}, "compact", True),
+        ({"state": "TX"}, {}, None, False),
+        ({"state": "TX"}, {}, "unselected", False),
+        ({"state": "TX"}, {}, "legacy", False),
+        ({"state": "TX"}, {}, "heap", False),
+        ({}, {}, "compact", False),
+    ],
 )
-async def test_get_all_zip_ordering_preserves_name_and_selected_paths(monkeypatch, extra_args, selected):
+async def test_get_all_taxonomy_page_ordering(monkeypatch, location, extra_args, scope_kind, computed_order):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
-    if selected:
-        monkeypatch.setattr(npi_module, "current_network_address_scope", lambda: object())
+    if scope_kind is not None:
+        scope = NetworkAddressReadScope(
+            manifest=types.SimpleNamespace(compact_layout=None if scope_kind == "heap" else object()),
+            network_ids=None if scope_kind == "unselected" else (1, 2),
+            address_relation=object(),
+            legacy_checksums=(123,) if scope_kind == "legacy" else None,
+        )
+        monkeypatch.setattr(npi_module, "current_network_address_scope", lambda: scope)
     await get_all(
         types.SimpleNamespace(
-            args={"classification": "Family Medicine", "zip_code": "12345", "include_total": "0", **extra_args}
+            args={"classification": "Family Medicine", "include_total": "0", **location, **extra_args}
         )
     )
     page = next(sql for sql, _params in conn.sql_calls if "page_npis AS" in sql)
-    assert "ORDER BY npi + 0" not in page
-    if selected:
+    assert ("ORDER BY npi + 0" in page) is computed_order
+    if scope_kind is not None:
         assert "EXISTS (SELECT 1 FROM mrf.nucc_taxonomy" not in page
 
 
@@ -720,16 +738,20 @@ async def test_get_all_rejects_invalid_primary_only():
 
 
 @pytest.mark.asyncio
-async def test_get_all_applies_plan_scope_to_page_and_count(monkeypatch):
+@pytest.mark.parametrize("zip_code", [None, "84001"])
+async def test_get_all_applies_plan_scope_to_page_and_count(monkeypatch, zip_code):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
+    snapshot_keys_by_name = {"plan_scope_snapshot_keys_0": [17], "plan_scope_snapshot_keys_1": [23, 29]}
     monkeypatch.setattr(
         npi_module,
         "_plan_release_npi_scope",
         AsyncMock(
             return_value=(
-                "SELECT npi FROM mrf.ptg2_v3_npi_scope WHERE snapshot_key = ANY(:plan_scope_snapshot_keys_0)",
-                {"plan_scope_snapshot_keys_0": [17]},
+                "SELECT npi FROM mrf.ptg2_v3_npi_scope WHERE snapshot_key = ANY(:plan_scope_snapshot_keys_0)"
+                " UNION ALL SELECT npi FROM mrf.ptg2_v4_npi_scope WHERE snapshot_key = ANY(:plan_scope_snapshot_keys_1)",
+                snapshot_keys_by_name,
             )
         ),
     )
@@ -741,6 +763,7 @@ async def test_get_all_applies_plan_scope_to_page_and_count(monkeypatch):
                 "include_total": "true",
                 "limit": "10",
                 "start": "0",
+                **({"zip_code": zip_code, "city": "Example City", "state": "UT"} if zip_code else {}),
             }
         )
     )
@@ -750,7 +773,20 @@ async def test_get_all_applies_plan_scope_to_page_and_count(monkeypatch):
     count_sql = next(sql for sql, _params in conn.sql_calls if "SELECT COUNT(DISTINCT" in sql)
     assert scoped_sql in page_sql
     assert scoped_sql in count_sql
-    assert all(params["plan_scope_snapshot_keys_0"] == [17] for _sql, params in conn.sql_calls)
+    assert all(
+        params[key] == snapshot_keys
+        for _sql, params in conn.sql_calls
+        for key, snapshot_keys in snapshot_keys_by_name.items()
+    )
+    assert ("location_npis AS MATERIALIZED" in page_sql) is (zip_code is not None)
+    assert "location_npis AS MATERIALIZED" not in count_sql
+    if zip_code:
+        location_sql, membership_sql = page_sql.split("SELECT npi FROM location_npis", 1)
+        assert scoped_sql not in location_sql
+        assert "city_name = :city" in location_sql and "state_name = :state" in location_sql
+        assert "COALESCE(c.zip5" in location_sql
+        assert membership_sql.index(scoped_sql) < membership_sql.index("LIMIT :limit")
+        assert membership_sql.count(scoped_sql) == 2
 
 
 @pytest.mark.asyncio
@@ -1073,6 +1109,7 @@ async def test_get_all_name_taxonomy_relevance_keeps_candidate_score(monkeypatch
                 "q": "clinic",
                 "codes": "207Q00000X",
                 "order_by": "relevance",
+                "view": "card",
                 "include_total": "false",
                 "limit": "10",
             }
@@ -1857,7 +1894,8 @@ async def test_get_all_punctuation_only_name_filters_fail_closed(
 
 
 @pytest.mark.asyncio
-async def test_get_all_relevance_order_is_additive_and_stably_tied_by_npi(monkeypatch):
+@pytest.mark.parametrize("view", ["", "card"])
+async def test_get_all_relevance_order_is_additive_and_stably_tied_by_npi(monkeypatch, view):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
 
@@ -1866,6 +1904,7 @@ async def test_get_all_relevance_order_is_additive_and_stably_tied_by_npi(monkey
             args={
                 "q": "Smith, Adam",
                 "order_by": "relevance",
+                "view": view,
                 "include_total": "false",
                 "limit": "10",
             }
@@ -1875,6 +1914,12 @@ async def test_get_all_relevance_order_is_additive_and_stably_tied_by_npi(monkey
     page_sql = next(sql_text for sql_text, _params in conn.sql_calls if "page_npis AS" in sql_text)
     assert "similarity(" in page_sql
     assert "ORDER BY relevance_score DESC, npi ASC" in page_sql
+    assert "COUNT(*) OVER () AS provider_address_total" in page_sql
+    assert ("MAX(fn.relevance_score)" in page_sql) is (view == "")
+    if view == "card":
+        assert re.search(r"FROM filtered_npi AS fn\s+WHERE EXISTS", page_sql)
+        assert "c.npi = fn.npi AND c.type" in page_sql
+        assert "FROM filtered_npi as fn" not in page_sql
     page_params = next(params for sql_text, params in conn.sql_calls if "page_npis AS" in sql_text)
     assert page_params["relevance_q"] == "smith adam"
 
@@ -2315,7 +2360,8 @@ async def test_npi_all_returns_three_ranked_locations_with_honest_total(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_npi_all_card_view_returns_only_compact_typeahead_fields(monkeypatch):
+@pytest.mark.parametrize("order_by", ["npi", "relevance"])
+async def test_npi_all_card_view_returns_only_compact_typeahead_fields(monkeypatch, order_by):
     location_maps = _ranked_location_maps()[:1]
     location_maps[0].update(
         {
@@ -2341,6 +2387,7 @@ async def test_npi_all_card_view_returns_only_compact_typeahead_fields(monkeypat
             args={
                 "q": "sample",
                 "view": "card",
+                "order_by": order_by,
                 "limit": "10",
                 "include_total": "0",
             }

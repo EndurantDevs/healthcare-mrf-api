@@ -594,7 +594,7 @@ async def test_local_group_candidates_keep_taxonomy_and_sex(monkeypatch):
     assert "cand_provider_specialty_nt.healthcare_provider_taxonomy_code IN" in str(page_sql)
     assert "group_candidate_sex_npi.provider_sex_code" in str(page_sql)
     assert parameters["group_candidate_sex_provider_sex_code"] == "F"
-    assert "local_specialty_npis" in str(count_sql)
+    assert "local_provider_npis" in str(count_sql)
     assert "COUNT(DISTINCT gm.npi)" in str(count_sql)
     assert "cursor_npi" not in str(count_sql)
     assert parameters["cand_array_taxonomy_code_0"] == "207Q00000X"

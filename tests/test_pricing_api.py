@@ -933,8 +933,8 @@ async def test_group_plan_providers_drives_from_local_specialty_candidates(monke
     assert response_payload["ok"] is True
     provider_sql = str(request.ctx.sa_session.executions[0][0][0])
     params = request.ctx.sa_session.executions[0][0][1]
-    assert "WITH local_specialty_npis AS MATERIALIZED" in provider_sql
-    assert "JOIN local_specialty_npis lsn ON lsn.npi = gm.npi" in provider_sql
+    assert "WITH local_provider_npis AS MATERIALIZED" in provider_sql
+    assert "JOIN local_provider_npis local ON local.npi = gm.npi" in provider_sql
     assert "= ANY(:location_zips)" in provider_sql
     # index-compatible taxonomy predicate: raw column, uppercased params
     assert "UPPER(COALESCE(cand_provider_specialty_nt.healthcare_provider_taxonomy_code" not in provider_sql
@@ -1388,6 +1388,64 @@ async def test_group_plan_providers_splits_multi_network_postal_scans(monkeypatc
     } == {41, 42}
     assert member_query_params["limit"] == 10
     assert member_query_params["location_zips"] == ["60601", "60602"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("zip5", "total"), [("60601", 2), ("60602", 0)])
+async def test_group_plan_exact_zip_total_counts_local_members_without_paging(monkeypatch, zip5, total):
+    monkeypatch.setattr(
+        pricing_module,
+        "current_network_snapshots_for_plan",
+        AsyncMock(return_value=[("ptg_ndc", "ptg2:test:ndc"), ("ptg_c2", "ptg2:test:c2")]),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "snapshot_serving_tables",
+        AsyncMock(
+            side_effect=[strict_snapshot_tables("ptg2:test:ndc"), strict_snapshot_tables("ptg2:test:c2", v4=True)]
+        ),
+    )
+    monkeypatch.setattr(
+        pricing_module,
+        "_group_plan_provider_address_source",
+        AsyncMock(return_value=("mrf.entity_address_unified", True, True, True)),
+    )
+    request = make_request(
+        [FakeResult(rows=[]), FakeResult(scalar=total)],
+        args={
+            "plan_id": "TESTPLAN001",
+            "zip5": zip5,
+            "zip_radius_miles": "0",
+            "count": "true",
+            "cursor": "1999999999",
+            "limit": "1",
+        },
+    )
+
+    document = json.loads((await group_plan_providers(request)).body)
+
+    assert document["providers"]["count"] == 0
+    assert document["providers"]["total"] == document["providers"]["total_distinct"] == total
+    assert document["location_filter"]["count_exact"] is True
+    executions = request.ctx.sa_session.executions
+    assert len(executions) == 2
+    page_sql = str(executions[0][0][0])
+    count_statement, params = executions[1][0]
+    count_sql = str(count_statement)
+    assert "SELECT local.npi" in page_sql and "CROSS JOIN LATERAL" in page_sql
+    assert "local.npi > :cursor_npi" in page_sql and "LIMIT :limit" in page_sql
+    assert "WITH local_provider_npis AS MATERIALIZED" in count_sql
+    assert "SELECT DISTINCT addr.npi" in count_sql
+    assert "CROSS JOIN LATERAL" in count_sql and "AND gm.npi = local.npi" in count_sql
+    assert "COALESCE(addr.zip5, LEFT(COALESCE(addr.postal_code, ''), 5)) = ANY(:location_zips)" in count_sql
+    assert params["location_zips"] == [zip5]
+    assert "LIMIT 1" in count_sql and ":limit" not in count_sql
+    assert ":cursor_npi" not in count_sql
+    for sql in (page_sql, count_sql):
+        assert "FROM mrf.ptg2_v3_npi_scope gm WHERE gm.snapshot_key = :page_snapshot_key_0" in sql
+        assert "FROM mrf.ptg2_v4_npi_scope gm WHERE gm.snapshot_key = :page_snapshot_key_1" in sql
+        assert ":snapshot_keys" not in sql
+    assert (params["page_snapshot_key_0"], params["page_snapshot_key_1"]) == (41, 42)
 
 
 @pytest.mark.asyncio

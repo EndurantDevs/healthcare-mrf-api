@@ -168,6 +168,9 @@ from api.provider_search_sql import (
     plan_release_npi_scope as _plan_release_npi_scope,
 )
 from api.provider_search_sql import (
+    provider_page_npis_sql as _page_npis_sql,
+)
+from api.provider_search_sql import (
     provider_taxonomy_code_parameters as _provider_taxonomy_code_parameters,
 )
 from api.provider_search_sql import (
@@ -175,6 +178,9 @@ from api.provider_search_sql import (
 )
 from api.provider_search_sql import (
     provider_taxonomy_matched_npi_cte as _provider_taxonomy_matched_npi_cte,
+)
+from api.provider_search_sql import (
+    relevance_page_sql as _relevance_page_sql,
 )
 from api.provider_search_sql import (
     taxonomy_classification_subquery as _taxonomy_classification_subquery,
@@ -7931,12 +7937,14 @@ async def list_providers(
     response_format = args.get("format") or args.get("response_format")
     response_format = str(response_format).strip().lower() if response_format else None
     request_session = session if session is not None else _request_session(request)
+    network_scope = current_network_address_scope()
+    compact_network_scope = network_scope is not None and network_scope.is_compact_network_selection
     is_ordinary_provider_query = (
         native_args is None
         and import_context is None
         and native_npis is None
         and native_scope_preparer is None
-        and current_network_address_scope() is None
+        and network_scope is None
     )
     legacy_name_like = _extract_name_filters(request, args=args)
     # Explicit access for route collectors / OpenAPI parity.
@@ -9181,6 +9189,7 @@ async def list_providers(
         use_bounded_broad_name_page = (
             page_import_context is None and native_npis is None and broad_name_total_deferred and order_by == "npi"
         )
+        use_name_relevance_exists = is_ordinary_provider_query and broad_name_total_deferred and view_mode == "card"
         if npi_where:
             filtered_npi_projection = "b.npi"
             if order_by == "relevance":
@@ -9240,7 +9249,7 @@ async def list_providers(
                 f"    {phone_candidates_join}"
             )
         elif npi_where:
-            if use_bounded_broad_name_page:
+            if use_bounded_broad_name_page or (order_by == "relevance" and use_name_relevance_exists):
                 address_source = f"{address_table_sql} as c"
             else:
                 address_source = (
@@ -9254,16 +9263,18 @@ async def list_providers(
             address_source = f"{address_table_sql} as c\n    {phone_candidates_join}"
         address_order = _primary_address_order_clause("c", address_table_sql)
         use_computed_page_order = bool(plan_network_ids) or (
-            is_ordinary_provider_query and zip_code and use_taxonomy_filter and not npi_where and order_by == "npi"
+            use_taxonomy_filter
+            and not npi_where
+            and order_by == "npi"
+            and (
+                (is_ordinary_provider_query and zip_code)
+                or (compact_network_scope and page_import_context is None and (zip_code or city or state))
+            )
         )
         if order_by == "relevance":
-            eligible_npis_sql = f"""
-            SELECT {provider_npi_sql} AS npi,
-                   MAX(fn.relevance_score) AS relevance_score
-              FROM {address_source}
-             WHERE {" and ".join(eligible_address_clauses)}
-             GROUP BY {provider_npi_sql}
-            """
+            eligible_npis_sql = _relevance_page_sql(
+                address_source, provider_npi_sql, eligible_address_clauses, name_only=use_name_relevance_exists
+            )
             page_order_sql = "ORDER BY relevance_score DESC, npi ASC"
             sub_s_relevance_projection = ", pn.relevance_score AS _search_relevance"
             result_order_sql = "ORDER BY sub_s._search_relevance DESC, sub_s.npi_code ASC"
@@ -9273,11 +9284,8 @@ async def list_providers(
             sub_s_relevance_projection = ""
             result_order_sql = "ORDER BY sub_s.npi_code ASC"
         else:
-            eligible_npis_sql = f"""
-            SELECT DISTINCT {provider_npi_sql} AS npi
-              FROM {address_source}
-             WHERE {" and ".join(eligible_address_clauses)}
-            """
+            zip_plan_sql = plan_member_sql if is_ordinary_provider_query and is_unified_search and zip_code else None
+            eligible_npis_sql = _page_npis_sql(address_source, provider_npi_sql, eligible_address_clauses, zip_plan_sql)
             page_order_sql = "ORDER BY npi + 0" if use_computed_page_order else "ORDER BY npi"
             sub_s_relevance_projection = ""
             result_order_sql = "ORDER BY sub_s.npi_code ASC"
@@ -9287,24 +9295,15 @@ async def list_providers(
             eligible_npis_sql = f"SELECT * FROM {_NATIVE_PROVIDER_RELATION}"
             page_import_context = await native_scope_preparer(_provider_native_entity_scope())
             import_relation_cte = _provider_import_relation_cte(page_import_context)
-        if inline_name_taxonomy_total:
-            page_npis_sql = f"""
-            SELECT eligible_npi.*,
-                   COUNT(*) OVER () AS provider_total
-              FROM ({eligible_npis_sql}) AS eligible_npi
-             {page_order_sql}
-             LIMIT :limit OFFSET :start
-            """
-            sub_s_total_projection = ", pn.provider_total AS _provider_total"
-            sub_s_page_position_projection = ""
-        else:
-            page_npis_sql = f"""
-            {f"SELECT * FROM ({eligible_npis_sql}) AS eligible_npi" if use_computed_page_order else eligible_npis_sql}
-            {page_order_sql}
-            LIMIT :limit OFFSET :start
-            """
-            sub_s_total_projection = ""
-            sub_s_page_position_projection = ""
+        page_npis_sql = eligible_npis_sql
+        if inline_name_taxonomy_total or use_computed_page_order:
+            page_projection = (
+                "eligible_npi.*, COUNT(*) OVER () AS provider_total" if inline_name_taxonomy_total else "*"
+            )
+            page_npis_sql = f"SELECT {page_projection} FROM ({eligible_npis_sql}) AS eligible_npi"
+        page_npis_sql += f"\n{page_order_sql}\nLIMIT :limit OFFSET :start"
+        sub_s_total_projection = ", pn.provider_total AS _provider_total" if inline_name_taxonomy_total else ""
+        sub_s_page_position_projection = ""
         imported_count_ctes = None
         final_projection = "sub_s.*"
         final_source = "sub_s"

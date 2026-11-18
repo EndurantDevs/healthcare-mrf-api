@@ -106,6 +106,7 @@ from api.provider_demographic_filters import (
 from api.provider_group_plan_network_read import (
     group_plan_address_source,
     group_plan_arguments,
+    group_plan_member_queries,
     group_plan_release_bindings,
 )
 from api.provider_quality_values import (
@@ -7802,8 +7803,19 @@ async def group_plan_providers(request, *, native_args=None):
     location_where = f"\n               AND {location_predicate}" if location_predicate else ""
     # Drive sparse specialty/ZIP searches from local candidates to avoid a full member walk.
     use_local_candidates = bool(specialty_filter.is_active and location_zips)
+    is_count_requested = (args.get("count") or "").strip().lower() in ("1", "true", "yes")
+    # The service-address ZIP index bounds the legacy exact-ZIP count.
+    use_exact_zip_count = (
+        is_count_requested
+        and zip5 is not None
+        and zip_radius_miles == 0
+        and uses_unified_addresses
+        and managed_addresses is None
+        and not include_mail_addresses
+        and not use_local_candidates
+    )
     candidate_cte = ""
-    if use_local_candidates:
+    if use_local_candidates or use_exact_zip_count:
         candidate_taxonomy_predicate = provider_specialty_taxonomy_exists_sql(
             "addr.npi",
             query_params_by_name,
@@ -7835,55 +7847,40 @@ async def group_plan_providers(request, *, native_args=None):
         if candidate_provider_sex_predicate:
             candidate_clauses.append(candidate_provider_sex_predicate)
         candidate_where = "\n                      AND ".join(candidate_clauses)
-        candidate_cte = f"""WITH local_specialty_npis AS MATERIALIZED (
+        candidate_cte = f"""WITH local_provider_npis AS MATERIALIZED (
                 SELECT DISTINCT addr.npi
                   FROM {address_table} addr
                  WHERE {candidate_where}
             )
             """
-    if use_local_candidates:
-        page_join_sql = "JOIN local_specialty_npis lsn ON lsn.npi = gm.npi"
-        page_filter_sql = ""
-    else:
-        page_join_sql = ""
-        page_filter_sql = taxonomy_where + provider_sex_where + location_where
-    bounded_member_streams = []
-    for stream_index, (stream_snapshot_key, stream_table) in enumerate(sorted(npi_scope_table_by_snapshot_key.items())):
-        stream_key_parameter = f"page_snapshot_key_{stream_index}"
-        query_params_by_name[stream_key_parameter] = stream_snapshot_key
-        bounded_member_streams.append(
-            f"""(
-                SELECT DISTINCT gm.npi
-                  FROM {stream_table} gm
-                  {page_join_sql}
-                 WHERE gm.snapshot_key = :{stream_key_parameter}
-                   AND gm.npi BETWEEN :npi_min AND :npi_max
-                   AND gm.npi > :cursor_npi{page_filter_sql}
-                 ORDER BY gm.npi
-                 LIMIT :limit
-            )"""
-        )
-    provider_sql = f"""
-        {candidate_cte}SELECT DISTINCT bounded_group_member.npi
-          FROM ({" UNION ALL ".join(bounded_member_streams)}) AS bounded_group_member
-         ORDER BY bounded_group_member.npi
-         LIMIT :limit
-        """
+    provider_sql, exact_zip_count_sql = group_plan_member_queries(
+        npi_scope_table_by_snapshot_key,
+        query_params_by_name,
+        candidate_cte,
+        exact_zip_count=use_exact_zip_count,
+        local_candidates=use_local_candidates,
+        filter_sql=taxonomy_where + provider_sex_where + location_where,
+    )
     provider_rows = (await session.execute(text(provider_sql), query_params_by_name)).fetchall()
     provider_npis = [int(provider_record.npi) for provider_record in provider_rows if provider_record.npi is not None]
     total_distinct = None
-    is_count_requested = (args.get("count") or "").strip().lower() in ("1", "true", "yes")
     should_skip_exact_count = bool(
-        has_location_filter and uses_unified_addresses and not use_local_candidates and managed_addresses is None
+        has_location_filter
+        and uses_unified_addresses
+        and not use_local_candidates
+        and not use_exact_zip_count
+        and managed_addresses is None
     )
     if is_count_requested and not should_skip_exact_count:
         if use_local_candidates:
             count_sql = f"""
                 {candidate_cte}SELECT COUNT(DISTINCT gm.npi)
                   FROM {group_member_table} gm
-                  JOIN local_specialty_npis lsn ON lsn.npi = gm.npi
+                  JOIN local_provider_npis local ON local.npi = gm.npi
                  WHERE gm.npi BETWEEN :npi_min AND :npi_max
                 """
+        elif exact_zip_count_sql is not None:
+            count_sql = exact_zip_count_sql
         else:
             count_sql = f"""
                 SELECT COUNT(DISTINCT gm.npi)

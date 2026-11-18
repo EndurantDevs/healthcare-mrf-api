@@ -61,8 +61,58 @@ def broad_name_page_sql(
            SELECT 1
              FROM {address_table_sql} AS c
             WHERE {provider_npi_sql} = b.npi
-              AND {' and '.join(address_clauses)}
+              AND {" and ".join(address_clauses)}
        )
+    """
+
+
+def relevance_page_sql(
+    address_source: str,
+    provider_npi_sql: str,
+    address_clauses: Sequence[str],
+    *,
+    name_only: bool,
+) -> str:
+    """Keep one score per eligible provider before relevance sorting."""
+    address_filter = " and ".join(address_clauses)
+    if name_only:
+        return f"""
+        SELECT fn.npi, fn.relevance_score
+          FROM filtered_npi AS fn
+         WHERE EXISTS (
+             SELECT 1
+               FROM {address_source}
+              WHERE {provider_npi_sql} = fn.npi AND {address_filter}
+         )
+        """
+    return f"""
+    SELECT {provider_npi_sql} AS npi,
+           MAX(fn.relevance_score) AS relevance_score
+      FROM {address_source}
+     WHERE {address_filter}
+     GROUP BY {provider_npi_sql}
+    """
+
+
+def provider_page_npis_sql(
+    address_source: str,
+    provider_npi_sql: str,
+    address_clauses: Sequence[str],
+    zip_plan_scope: str | None,
+) -> str:
+    """Apply ZIP eligibility before probing a plan's nationwide membership."""
+    plan_predicate = f"{provider_npi_sql} IN ({zip_plan_scope})" if zip_plan_scope is not None else None
+    address_npis = f"""
+    SELECT DISTINCT {provider_npi_sql} AS npi
+      FROM {address_source}
+     WHERE {" and ".join(clause for clause in address_clauses if clause != plan_predicate)}
+    """
+    if zip_plan_scope is None:
+        return address_npis
+    return f"""
+    WITH location_npis AS MATERIALIZED ({address_npis})
+    SELECT npi FROM location_npis
+    WHERE npi IN ({zip_plan_scope})
     """
 
 
