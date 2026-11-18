@@ -3274,7 +3274,7 @@ async def test_get_near_npi_applies_plan_scope_to_results_and_count(monkeypatch)
         f"EXISTS (SELECT 1 FROM ({plan_scope_sql}) AS plan_members WHERE plan_members.npi = a.npi OFFSET 0)"
         in result_sql
     )
-    assert f"a.npi IN ({plan_scope_sql})" in count_sql
+    assert count_sql.startswith("WITH local_rows AS MATERIALIZED") and f"WHERE npi IN ({plan_scope_sql})" in count_sql
     assert all(params["plan_scope_snapshot_keys_0"] == [17] for _sql, params in sql_calls)
 
 

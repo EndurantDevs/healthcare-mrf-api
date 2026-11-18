@@ -147,7 +147,7 @@ def test_native_search_preserves_knn_page_and_filters_counts_and_cursors(monkeyp
         assert continued.index(cursor_clause) < continued.index("LIMIT :limit")
 
 
-def test_plan_membership_probe_is_limited_to_the_legacy_first_page():
+def test_plan_geo_membership_keeps_legacy_page_and_count_strategies_separate():
     member_sql, parameters = plan_scope_query({"mrf.scope_v3": {3}, "mrf.scope_v4": {7}})
     state = "a.state_name = :state"
     entity_type = "d.entity_type_code = :entity_type_code"
@@ -171,6 +171,14 @@ def test_plan_membership_probe_is_limited_to_the_legacy_first_page():
     assert build_native_nearby_sql(fallback, cursor_clause=cursor, **page_options_by_name) == build_native_nearby_sql(
         fallback, cursor_clause=cursor
     )
+    legacy_plan = member_sql, [state, entity_type]
+    count = build_native_nearby_count_sql(fallback, legacy_plan=legacy_plan)
+    spatial, membership = count.split("\nSELECT COUNT(DISTINCT (npi, address_key)) AS total_count")
+    assert "WITH local_rows AS MATERIALIZED" in spatial and "JOIN mrf.npi AS d ON d.npi = a.npi" in spatial
+    assert spatial.index(state) < spatial.index(entity_type) and member_sql not in spatial
+    assert f"FROM local_rows\n WHERE npi IN ({member_sql})" in membership
+    assert "OFFSET 0" not in count and "LIMIT :limit" not in count
+    assert build_native_nearby_count_sql(nearby, legacy_plan=legacy_plan) == build_native_nearby_count_sql(nearby)
     imported = build_imported_geo_statements(_context(), replace(_imported_geo_query(), nearby=fallback))
     for statement in (build_native_nearby_count_sql(fallback), str(imported.count), str(imported.page)):
         assert common in statement and probe not in statement

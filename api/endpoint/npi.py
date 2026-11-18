@@ -10778,11 +10778,11 @@ async def get_near_npi(
 
         async def fetch_exact_total() -> int:
             """Count exact provider-address matches without the page limit."""
-
             if imported_statements is not None:
                 statement, parameters_by_name = imported_statements.count, imported_statements.parameters
             else:
-                statement = text(build_native_nearby_count_sql(nearby_query))
+                legacy_plan = (plan_member_sql, extra_filters) if plan_member_sql and plan_scope_parameters else None
+                statement = text(build_native_nearby_count_sql(nearby_query, legacy_plan=legacy_plan))
                 parameters_by_name = query_parameters_by_name
             async with _provider_list_connection(db, import_context, request_session) as conn:
                 count_records = await conn.all(statement, **parameters_by_name)
