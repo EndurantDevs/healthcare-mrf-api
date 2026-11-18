@@ -134,6 +134,7 @@ from api.provider_list_sql import (
     _provider_list_statement,
     _provider_list_total_statement,
     _provider_native_entity_scope,
+    _provider_registry_page_cte,
     _sql_with_ctes,
     _sql_with_prefix_ctes,
 )
@@ -9046,16 +9047,11 @@ async def list_providers(
             entity_type_code,
         )
         taxonomy_clauses = []
-        include_service_locations = _is_unified_address_table(address_table_sql)
         address_clauses = [
-            _provider_list_address_type_clause(
-                "c",
-                address_table_sql,
-                include_service_locations=include_service_locations,
-            )
+            _provider_list_address_type_clause("c", address_table_sql, include_service_locations=is_unified_search)
         ]
         if minimum:
-            address_clauses.append(address_source_filter_sql("c", minimum, has_source_count=include_service_locations))
+            address_clauses.append(address_source_filter_sql("c", minimum, has_source_count=is_unified_search))
         if (page_import_context is not None or native_npis is not None) and (
             procedure_filter_unresolved or medication_filter_unresolved
         ):
@@ -9197,13 +9193,14 @@ async def list_providers(
                 filtered_npi_projection += f", similarity({name_expression}, :relevance_q) AS relevance_score"
             direct_name_taxonomy = bool(taxonomy_code_placeholders)
             if not direct_name_taxonomy and not use_bounded_broad_name_page:
-                filtered_npi_cte = f"""
-        filtered_npi AS MATERIALIZED (
-            SELECT {filtered_npi_projection}
-              FROM mrf.npi AS b
-             WHERE {npi_where}
-        )
-"""
+                filtered_npi_cte = _provider_registry_page_cte(
+                    filtered_npi_projection,
+                    npi_where,
+                    npi_params,
+                    filters_by_name,
+                    ordinary_unified_search=is_ordinary_provider_query and is_unified_search,
+                    has_additional_constraints=bool(plan_member_sql or dynamic_code_parameters),
+                )
             if use_taxonomy_filter:
                 taxonomy_matched_npi_cte = _provider_taxonomy_matched_npi_cte(
                     taxonomy_filter,
