@@ -7,13 +7,32 @@ import pytest
 
 from process.vsp_directory_contract import (
     API_BASE,
+    NETWORKS,
     SEARCH_URL,
     VSPDirectoryError,
     office_position,
     search_result,
+    validate_census_memberships,
     validated_url,
 )
 from process.vsp_directory_geometry import GeoTile, census_request, distance_miles, world_tiles
+
+
+def test_census_requires_scope_evidence_for_a_bounded_surplus():
+    census_by_network = dict.fromkeys(NETWORKS.values(), 20)
+    observed_by_network = {**census_by_network, "Signature": 23}
+    validate_census_memberships(
+        census_by_network, census_by_network, census_by_network, observed_by_network, scoped_additions={"Signature": 3}
+    )
+    for count, confirmed in ((23, 0), (24, 3), (31, 11), (19, 0)):
+        with pytest.raises(VSPDirectoryError, match="vsp_office_census_unresolved"):
+            validate_census_memberships(
+                census_by_network,
+                census_by_network,
+                census_by_network,
+                {**census_by_network, "Signature": count},
+                scoped_additions={"Signature": confirmed},
+            )
 
 
 def test_source_error_inside_success_response_is_never_empty_completion():

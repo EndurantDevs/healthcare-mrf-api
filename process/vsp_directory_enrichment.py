@@ -151,7 +151,9 @@ async def _affiliate_searches(capture, office, profiles):
         matching_offices = [source_record for source_record in offices if public_id(source_record["pid"]) == oid]
         if matching_offices:
             require(not has_retail or is_retail_location(matching_offices[0], profiles), PROFILE_MEMBERSHIP_UNRESOLVED)
-            capture.remember_search(matching_offices[0], network, receipt["request_key"])
+            capture.remember_search(
+                matching_offices[0], network, receipt["request_key"], scope_method=receipt["method"]
+            )
         else:
             require(total < MAX_LOCATIONS, PROFILE_MEMBERSHIP_UNRESOLVED)
             capture.remember_search_scope(oid, network, ())
@@ -208,7 +210,7 @@ async def enrich_capture(capture):
         memberships = vsp_profile_memberships(office, profiles, search_memberships)
         declared_names = {NETWORKS[code] for codes in memberships.values() for code in codes} | retail_networks
         require(
-            all(oid not in capture.memberships[name] or name in declared_names for name in NETWORKS.values()),
+            all(oid not in capture.site_memberships[name] or name in declared_names for name in NETWORKS.values()),
             PROFILE_MEMBERSHIP_UNRESOLVED,
         )
         missing_ids = _missing(capture, office, profiles, memberships)
@@ -229,6 +231,25 @@ async def enrich_capture(capture):
             "enrichment", {"office_count": len(capture.offices), "profile_count": len(capture.profiles)}
         )
         await capture.progress("enrichment")
+
+
+async def verify_profile_site_memberships(capture, additions_at_discovery_by_network):
+    """Verify profile-only sites and count geographic matches after each network's baseline."""
+    for name, sites in capture.site_memberships.items():
+        for oid in sorted(capture.memberships[name] - sites):
+            if name in capture.search_memberships.get(oid, {}):
+                continue
+            office = capture.offices[oid]
+            total, offices, receipt = await _search_office_scope(capture, office, name)
+            match = next((row for row in offices if public_id(row["pid"]) == oid), None)
+            if match is None:
+                require(total < MAX_LOCATIONS, PROFILE_MEMBERSHIP_UNRESOLVED)
+            else:
+                capture.remember_search(match, name, receipt["request_key"], scope_method=receipt["method"])
+        capture.memberships[name] = set(sites)
+    return {
+        name: len(ids - additions_at_discovery_by_network[name]) for name, ids in capture.geographic_additions.items()
+    }
 
 
 def _add_resource(resources_by_type, resource, byte_count):
@@ -257,18 +278,21 @@ async def _normalize_offices(capture):
     for oid, office in sorted(capture.offices.items()):
         await capture.cancel_check()
         retail_networks, company_summaries_by_doctor = _retail_evidence(capture, oid, office, capture.profiles[oid])
+        eligible_codes = {code for code, name in NETWORKS.items() if oid in capture.memberships[name]}
+        search_memberships = capture.search_memberships.get(oid, {})
         _missing(
             capture,
             office,
             capture.profiles[oid],
-            vsp_profile_memberships(office, capture.profiles[oid], capture.search_memberships.get(oid, {})),
+            vsp_profile_memberships(office, capture.profiles[oid], search_memberships, eligible_codes=eligible_codes),
         )
         normalized = normalize_vsp_office(
             office,
             profiles=capture.profiles[oid],
-            search_memberships=capture.search_memberships.get(oid, {}),
+            search_memberships=search_memberships,
             retail_networks=retail_networks,
             company_summaries_by_doctor=company_summaries_by_doctor,
+            eligible_codes=eligible_codes,
         )
         accounting.update(
             {
@@ -340,7 +364,7 @@ def _capture_manifest(capture, outputs, receipts, start, refreshed, end, account
     }
 
 
-async def write_normalized_capture(capture, start, end, *, refreshed=None):
+async def write_normalized_capture(capture, start, end, *, refreshed=None, scoped_additions=None):
     """Close verified, sorted output and retain compact proof plus raw-query receipts."""
     resources_by_type, npis_by_network, accounting, other_codes = await _normalize_offices(capture)
     outputs, counts = _write_outputs(capture.store, resources_by_type)
@@ -367,6 +391,10 @@ async def write_normalized_capture(capture, start, end, *, refreshed=None):
     }
     if accounting["retail_company_organizations"]:
         proof_by_field["retail_company_organizations"] = accounting["retail_company_organizations"]
+    if scoped_additions and any(scoped_additions.values()):
+        proof_by_field["geographically_verified_additions"] = scoped_additions
+    if capture.census_shortfalls_by_network:
+        proof_by_field["closed_geographic_census_shortfalls"] = capture.census_shortfalls_by_network
     manifest_by_field["proof"] = proof_by_field
     proof_by_field["capture_sha256"] = hashlib.sha256(canonical_json(manifest_by_field).encode()).hexdigest()
     capture.store.checkpoint("complete", manifest_by_field)

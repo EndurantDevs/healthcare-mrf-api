@@ -26,7 +26,7 @@ from process.vsp_directory_contract import (
     canonical_json,
     request_key,
 )
-from process.vsp_directory_geometry import GeoTile
+from process.vsp_directory_geometry import GeoTile, office_search_request
 from process.vsp_directory_store import VSPCaptureStore
 
 TILE = GeoTile(0, 10, 0, 10)
@@ -93,6 +93,14 @@ class Source:
                 self.observations[name] += 1
                 drift = self.closing_drift if name == "Choice" and self.observations[name] > 1 else 0
                 return {"totalCounts": self.counts[name] + drift, "locations": []}
+            if payload["radius"] == "0.05":
+                position = (float(payload["latitude"]), float(payload["longitude"]))
+                matching_offices = [
+                    self.offices[oid]
+                    for oid in sorted(self.network_offices[name])
+                    if acquisition.office_position(self.offices[oid]) == position
+                ]
+                return {"totalCounts": len(matching_offices), "locations": matching_offices[:50]}
             assert payload == TILE.request(name)
             return {
                 "totalCounts": self.counts[name],
@@ -145,7 +153,7 @@ def small_domain(monkeypatch):
 def writer(monkeypatch):
     completed_captures = []
 
-    async def write(capture, start, end, *, refreshed):
+    async def write(capture, start, end, *, refreshed, scoped_additions):
         result_by_field = {
             "start": start,
             "refreshed": refreshed,
@@ -165,27 +173,32 @@ def capture(source, store):
 
 
 @pytest.mark.asyncio
-async def test_largest_network_reuses_shared_profiles_and_skips_subset_discovery(small_domain, writer):
+async def test_shared_profiles_are_reused_while_network_sites_are_verified(small_domain, writer):
     source, store = Source(), Store()
     run, transport = capture(source, store)
     result = await run.run()
     tile_requests = [payload for method, _, payload in transport.calls if method == "POST" and payload["limit"] != "1"]
-    assert tile_requests == [TILE.request("Signature")]
-    assert transport.requests == 10  # Three opening counts, one tile, three profiles, three closing counts.
-    assert Counter(method for method, _, _ in transport.calls) == {"POST": 7, "GET": 3}
+    assert tile_requests == [TILE.request(name) for name in NETWORKS.values()]
+    assert transport.requests == 12
+    assert Counter(method for method, _, _ in transport.calls) == {"POST": 9, "GET": 3}
     assert transport.calls[0][2] == acquisition.census_request("Signature")
     assert transport.calls[5][2] == acquisition.census_request("Choice")
-    assert transport.calls[6][2] == acquisition.census_request("Advantage")
+    assert transport.calls[7][2] == acquisition.census_request("Advantage")
     assert {name: len(ids) for name, ids in result["memberships"].items()} == source.counts
     assert source.observations == {name: 2 for name in NETWORKS.values()}
-    assert len(store.receipts) == 10 and len(store.cache) == 7 and writer == [result]
+    assert len(store.receipts) == 12 and len(store.cache) == 9 and writer == [result]
 
 
 @pytest.mark.asyncio
-async def test_later_network_recovers_a_saturated_office_for_an_earlier_network(small_domain, tmp_path):
+@pytest.mark.parametrize("signature_census", [50, 51])
+async def test_later_network_recovers_a_saturated_office_for_an_earlier_network(
+    small_domain, tmp_path, signature_census
+):
     source = Source(saturated=True)
     source.offices["151"] = office(151)
+    source.offices["151"]["addr"]["latitude"] = 6.0
     source.network_offices["Signature"].add("151")
+    source.counts["Signature"] = signature_census
     source.network_offices["Choice"] = set(source.offices) - {"101"}
     source.counts["Choice"] = 50
     store = VSPCaptureStore(tmp_path, "synthetic-overlapping-networks")
@@ -194,16 +207,43 @@ async def test_later_network_recovers_a_saturated_office_for_an_earlier_network(
     completed = await run.run()
 
     tile_requests = [payload for method, _, payload in transport.calls if method == "POST" and payload["limit"] != "1"]
-    assert tile_requests == [TILE.request("Signature"), TILE.request("Choice")]
+    assert tile_requests == [TILE.request(name) for name in NETWORKS.values()] + [
+        office_search_request(source.offices["151"], "Signature")
+    ]
     assert run.memberships == source.network_offices
     assert len(run.offices) == len(run.profiles) == 51
-    assert len(run.unresolved) == 1 and run.unresolved[0]["network"] == "Signature"
-    assert Counter(method for method, _, _ in transport.calls) == {"POST": 8, "GET": 51}
+    assert [leaf["network"] for leaf in run.unresolved] == (["Signature"] if signature_census == 51 else [])
+    assert Counter(method for method, _, _ in transport.calls) == {"POST": 10, "GET": 51}
     assert source.observations == {name: 2 for name in NETWORKS.values()}
     assert completed.proof["publisher_locations"] == {"Signature": 51, "Choice": 50, "Advantage": 1}
-    assert completed.proof["saturated_leaves_closed_by_global_census"] == 1
+    assert completed.proof["geographically_verified_additions"] == {"Signature": 1, "Choice": 0, "Advantage": 0}
+    assert completed.proof["saturated_leaves_closed_by_global_census"] == int(signature_census == 51)
     assert completed.resource_counts["Location"] == completed.resource_counts["PractitionerRole"] == 51
     assert store.load_checkpoint("complete") == completed.manifest
+
+
+@pytest.mark.asyncio
+async def test_profile_only_scope_is_excluded_when_geographic_search_returns_another_office(small_domain, tmp_path):
+    source = Source()
+    original_response = source.response
+    link = source.offices["102"]["locationDrProfileLink"]["href"]
+    advantage = next(code for code, name in NETWORKS.items() if name == "Advantage")
+
+    def response(method, url, payload):
+        value = original_response(method, url, payload)
+        if method == "GET" and url == link:
+            value[0]["networkIds"].append(advantage)
+            value[0]["providerNetworks"].append({"networkId": advantage})
+        return value
+
+    source.response = response
+    run, transport = capture(source, VSPCaptureStore(tmp_path, "synthetic-profile-only"))
+    completed = await run.run()
+    assert completed.proof["publisher_locations"] == source.counts
+    assert run.memberships["Advantage"] == {"101"}
+    assert run.memberships["Choice"] == {"101", "102"}
+    assert transport.calls.count(("POST", SEARCH_URL, office_search_request(source.offices["102"], "Advantage"))) == 1
+    assert sum(method == "GET" for method, _, _ in transport.calls) == 3
 
 
 @pytest.mark.asyncio
@@ -229,7 +269,7 @@ async def test_omitted_search_summaries_preserve_linked_doctors(small_domain, wr
     result = await run.run()
     assert run.offices["101"]["providerSummaries"] == summaries
     assert all("101" in ids for ids in result["memberships"].values())
-    assert transport.requests == (10 if shared_identity else 11)
+    assert transport.requests == (12 if shared_identity else 13)
     assert "providerSummaries" not in source.offices["101"]
 
 
@@ -245,8 +285,8 @@ async def test_global_census_closure_skips_remaining_world_tiles(monkeypatch, wr
     monkeypatch.setattr(acquisition, "world_tiles", lambda: (TILE, GeoTile(20, 30, 20, 30)))
     run, transport = capture(Source(), Store())
     await run.run()
-    assert transport.requests == 10 and len(run.partitions) == 1
-    assert run.partitions[0]["closed_by_global_census"] is True
+    assert transport.requests == 12 and len(run.partitions) == 3
+    assert all(partition["closed_by_global_census"] for partition in run.partitions)
 
 
 @pytest.mark.asyncio
@@ -258,10 +298,13 @@ async def test_restart_replays_exact_successes_and_fetches_only_missing_profiles
     assert attempted.requests == 4 and len(store.receipts) == 3 and writer == []
     resumed, remaining = capture(source, store)
     await resumed.run()
-    assert remaining.requests == 8 and resumed.cache_hits == 2
-    assert Counter(method for method, _, _ in remaining.calls) == {"POST": 6, "GET": 2}
-    assert all(payload["limit"] == "1" for method, _, payload in remaining.calls if method == "POST")
-    assert len(store.receipts) == 11 and len(writer) == 1
+    assert remaining.requests == 10 and resumed.cache_hits == 2
+    assert Counter(method for method, _, _ in remaining.calls) == {"POST": 8, "GET": 2}
+    assert [payload for method, _, payload in remaining.calls if method == "POST" and payload["limit"] != "1"] == [
+        TILE.request("Choice"),
+        TILE.request("Advantage"),
+    ]
+    assert len(store.receipts) == 13 and len(writer) == 1
 
 
 @pytest.mark.asyncio
@@ -269,7 +312,7 @@ async def test_changed_fresh_closing_census_cannot_publish(small_domain, writer)
     run, transport = capture(Source(closing_drift=11), Store())
     with pytest.raises(VSPDirectoryError, match="^vsp_census_changed_during_capture$"):
         await run.run()
-    assert transport.requests == 10 and writer == []
+    assert transport.requests == 12 and writer == []
 
 
 @pytest.mark.asyncio
@@ -277,7 +320,7 @@ async def test_bounded_census_drift_preserves_the_published_office_counts(small_
     store = VSPCaptureStore(tmp_path, "synthetic-drift")
     run, transport = capture(Source(closing_drift=10), store)
     completed = await run.run()
-    assert transport.requests == 10
+    assert transport.requests == 12
     assert completed.manifest["publisher_census_start"]["Choice"] == 2
     assert completed.manifest["publisher_census_at_network_start"]["Choice"] == 2
     assert completed.manifest["publisher_census_end"]["Choice"] == 12
@@ -313,8 +356,8 @@ async def test_unknown_office_in_saturated_leaf_remains_incomplete(small_domain,
     assert len(run.offices) == 50 and len(run.unresolved) == 1 and writer == []
     assert run.unresolved[0]["count"] == 51
     tile_requests = [payload for method, _, payload in transport.calls if method == "POST" and payload["limit"] != "1"]
-    assert tile_requests == [TILE.request("Signature")]
-    assert Counter(method for method, _, _ in transport.calls) == {"POST": 7, "GET": 50}
+    assert tile_requests == [TILE.request(name) for name in NETWORKS.values()]
+    assert Counter(method for method, _, _ in transport.calls) == {"POST": 9, "GET": 50}
     assert source.observations == {name: 2 for name in NETWORKS.values()}
 
 
@@ -324,7 +367,7 @@ async def test_real_writer_round_trip_preserves_network_and_resource_counts(smal
     run, transport = capture(Source(), store)
     completed = await run.run()
     resources = list(completed.iter_resources())
-    assert transport.requests == 10
+    assert transport.requests == 12
     assert Counter(item["resourceType"] for item in resources) == {
         "Organization": 3,
         "Location": 3,
@@ -341,7 +384,7 @@ async def test_real_writer_round_trip_preserves_network_and_resource_counts(smal
     }
     assert completed.proof["publisher_locations"] == {"Signature": 3, "Choice": 2, "Advantage": 1}
     assert completed.proof["network_npis"] == {name: 1 for name in NETWORKS.values()}
-    assert completed.proof["retained_response_count"] == completed.proof["http_attempts"] == 10
+    assert completed.proof["retained_response_count"] == completed.proof["http_attempts"] == 12
     assert store.load_checkpoint("complete") == completed.manifest
 
 
@@ -392,11 +435,11 @@ async def test_probe_and_capture_share_retained_response_and_respect_origin_paus
     assert 1190 < wait.await_args_list[0].args[0] <= 1200
     assert len(sessions) == 2
     assert len(list(completed.iter_resources())) == 10
-    assert completed.proof["http_attempts"] == offline_http.requests == 11
+    assert completed.proof["http_attempts"] == offline_http.requests == 13
     assert offline_http.source.observations == {"Signature": 3, "Choice": 2, "Advantage": 2}
     reopened = await acquisition.capture_vsp_directory(**retry_arguments_by_name)
     assert reopened.proof == completed.proof
-    assert len(sessions) == 2 and offline_http.requests == 11
+    assert len(sessions) == 2 and offline_http.requests == 13
 
 
 @pytest.mark.asyncio
@@ -466,9 +509,9 @@ async def test_artifact_permission_failure_can_capture_once_after_repair(
     assert not list(root.glob("*/identity.json")) and not offline_http.calls
     completed = await acquisition.capture_vsp_directory(**capture_by_argument)
     assert len(list(completed.iter_resources())) == 10
-    assert completed.proof["http_attempts"] == offline_http.requests == 10
+    assert completed.proof["http_attempts"] == offline_http.requests == 12
     reopened = await acquisition.capture_vsp_directory(**capture_by_argument, require_retained=True)
-    assert reopened.proof == completed.proof and offline_http.requests == 10
+    assert reopened.proof == completed.proof and offline_http.requests == 12
 
 
 @pytest.mark.asyncio

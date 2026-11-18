@@ -92,7 +92,7 @@ def _selected_networks(office, networks_by_doctor, search_memberships):
     return selected_by_doctor
 
 
-def vsp_profile_memberships(office, profiles, search_memberships):
+def vsp_profile_memberships(office, profiles, search_memberships, *, eligible_codes=None):
     """Resolve profiles and NPI-backed summaries using exact office/search joins."""
     doctors = _by_doctor(profiles, "doctorPublicId")
     networks_by_doctor = {doctor_id: _profile_networks(profile) for doctor_id, profile in doctors.items()}
@@ -112,6 +112,10 @@ def vsp_profile_memberships(office, profiles, search_memberships):
             selected_by_doctor[doctor_id] = codes
     if any(is_company_summary(office, summaries.get(did, {})) for did in selected_by_doctor):
         raise VSPDirectoryNormalizationError("vsp_directory_unresolved_doctor")
+    if eligible_codes is not None:
+        selected_by_doctor = {
+            did: matched for did, codes in selected_by_doctor.items() if (matched := codes & eligible_codes)
+        }
     return selected_by_doctor
 
 
@@ -398,6 +402,7 @@ def normalize_vsp_office(
     search_memberships=None,
     retail_networks=None,
     company_summaries_by_doctor=None,
+    eligible_codes=None,
 ) -> VSPOfficeResources:
     """Join summaries to this office's profiles by public doctor ID, never by name."""
     office_id = _public_id(office, "pid")
@@ -405,7 +410,9 @@ def normalize_vsp_office(
     doctors = _by_doctor(profiles, "doctorPublicId")
     networks_by_doctor = {doctor_id: _profile_networks(profile) for doctor_id, profile in doctors.items()}
     retail_ids = retail_profile_ids(office, profiles)
-    selected_by_doctor = vsp_profile_memberships(office, profiles, search_memberships or {})
+    selected_by_doctor = vsp_profile_memberships(
+        office, profiles, search_memberships or {}, eligible_codes=eligible_codes
+    )
     if summaries.keys() - doctors.keys() - selected_by_doctor.keys() - retail_ids or bool(retail_ids) != bool(
         retail_networks
     ):
