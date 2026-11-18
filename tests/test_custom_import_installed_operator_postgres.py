@@ -119,6 +119,14 @@ async def test_fixture_ddl_lifecycle_exclusion():
         await engine.dispose()
 
 
+def _compile_installed_process(installed: Path) -> None:
+    """Compile installed process sources beside the tree without altering caller pycache_prefix."""
+    # Default bytecode destinations stay beside sources in this owned tree.
+    with patch.object(sys, "pycache_prefix", None), warnings.catch_warnings(action="error"):
+        assert compileall.compile_dir(installed / "process", quiet=1, workers=1, limit_sl_dest=installed)
+    assert any((installed / "process").rglob("__pycache__"))
+
+
 @pytest.fixture(scope="module")
 def installed_application(tmp_path_factory):
     if not os.getenv(POSTGRES_DSN_ENV):
@@ -150,10 +158,7 @@ def installed_application(tmp_path_factory):
         for name in ("custom_import_cli.py", "custom_import_snowflake_operator.py"):
             assert (installed / name).read_bytes() == (_ROOT / name).read_bytes()
         assert not (installed / "tests").exists()
-        # Default bytecode destinations stay beside sources in this owned tree.
-        with patch.object(sys, "pycache_prefix", None), warnings.catch_warnings(action="error"):
-            assert compileall.compile_dir(installed / "process", quiet=1, workers=1, limit_sl_dest=installed)
-        assert any((installed / "process").rglob("__pycache__"))
+        _compile_installed_process(installed)
         yield installed, outside
     finally:
         shutil.rmtree(temporary)
@@ -578,3 +583,25 @@ async def test_installed_resume_denials_do_not_mutate_retained_state(installed_a
             error="failed",
         )
         assert await _retained_state(case, execution_id) == before
+
+
+async def test_installed_process_compile_preserves_pycache_prefix(tmp_path):
+    """Compiling an owned installation tree must write local __pycache__ and preserve wrapper prefix."""
+    direct = tmp_path / "ambient"
+    (direct / "process").mkdir(parents=True)
+    (direct / "process" / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
+    ambient_prefix = sys.pycache_prefix
+    _compile_installed_process(direct)
+    assert sys.pycache_prefix == ambient_prefix
+    assert any((direct / "process").rglob("sample.*.pyc"))
+
+    isolated = tmp_path / "wrapped"
+    (isolated / "process").mkdir(parents=True)
+    (isolated / "process" / "sample.py").write_text("VALUE = 2\n", encoding="utf-8")
+    wrapper_prefix = tmp_path / "wrapper-pycache"
+    wrapper_prefix.mkdir()
+    with patch.object(sys, "pycache_prefix", str(wrapper_prefix)):
+        _compile_installed_process(isolated)
+        assert sys.pycache_prefix == str(wrapper_prefix)
+    assert list(wrapper_prefix.iterdir()) == []
+    assert any((isolated / "process").rglob("sample.*.pyc"))
