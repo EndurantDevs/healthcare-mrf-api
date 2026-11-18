@@ -455,8 +455,7 @@ SELECT sub_s.*, taxonomy.*, nucc.display_name AS taxonomy_display
 """
 
 
-_NATIVE_NEARBY_COUNT_SQL_TEMPLATE = """
-SELECT COUNT(DISTINCT (a.npi, a.address_key)) AS total_count
+_NATIVE_NEARBY_COUNT_SOURCE_TEMPLATE = """
   FROM {address_table_sql} AS a
   JOIN mrf.npi AS d ON d.npi = a.npi
  WHERE ST_DWithin(
@@ -481,8 +480,7 @@ SELECT COUNT(DISTINCT (a.npi, a.address_key)) AS total_count
    {geo_precision_clause}
    {geo_type_clause}
    {bbox_clause}
-   {extra_clause}{ilike_clause};
-"""
+   {extra_clause}{ilike_clause}"""
 
 
 def build_native_nearby_sql(
@@ -540,6 +538,7 @@ def build_native_nearby_count_sql(
     nearby: NearbySqlQuery,
     *,
     bbox_clause: str = "",
+    legacy_plan: tuple[str, Sequence[str]] | None = None,
 ) -> str:
     """Build the exact native nearby count query from normalized fragments."""
 
@@ -555,16 +554,26 @@ def build_native_nearby_count_sql(
   FROM {nearby.search_table_sql} AS a{_search_npi_source(nearby)[1]}
  WHERE {_search_geo_predicates(nearby, taxonomy_where)}
    {bbox_clause};"""
-    taxonomy_where = _taxonomy_filter_where(nearby)
-    return _NATIVE_NEARBY_COUNT_SQL_TEMPLATE.format(
-        taxonomy_where=taxonomy_where,
+    plan_member_sql, filters = legacy_plan or (None, ())
+    extra_clause = nearby.extra_clause if plan_member_sql is None else nearby_extra_clauses(filters, None, 0)[0]
+    source_sql = _NATIVE_NEARBY_COUNT_SOURCE_TEMPLATE.format(
+        taxonomy_where=_taxonomy_filter_where(nearby),
         geo_precision_clause=nearby.geo_precision_clause,
         geo_type_clause=nearby.geo_type_clause,
         bbox_clause=bbox_clause,
-        extra_clause=nearby.extra_clause,
+        extra_clause=extra_clause,
         ilike_clause=nearby.ilike_clause,
         address_table_sql=nearby.address_table_sql,
     )
+    if plan_member_sql is None:
+        return f"\nSELECT COUNT(DISTINCT (a.npi, a.address_key)) AS total_count{source_sql};\n"
+    # Evaluate the spatial and office predicates before matching the plan's members.
+    return f"""WITH local_rows AS MATERIALIZED (
+    SELECT a.npi, a.address_key{source_sql}
+)
+SELECT COUNT(DISTINCT (npi, address_key)) AS total_count
+  FROM local_rows
+ WHERE npi IN ({plan_member_sql});"""
 
 
 _LIVE_NPI_SOURCE = ("d.npi", "\n      JOIN mrf.npi AS d ON d.npi = a.npi")

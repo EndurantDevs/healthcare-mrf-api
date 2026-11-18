@@ -16,6 +16,8 @@ from tests.test_npi_api_extended import _build_near_row, _set_near_address_colum
 
 
 def _install_near_connection(monkeypatch, check, state):
+    state.count_statements = []
+
     class Connection:
         async def all(self, statement, **_parameters):
             sql = str(statement)
@@ -26,6 +28,7 @@ def _install_near_connection(monkeypatch, check, state):
             state.query_parameters.append(_parameters)
             if "COUNT(DISTINCT" in sql:
                 check("count")
+                state.count_statements.append(sql)
                 return [(state.total_count,)]
             check("page")
             return state.provider_rows
@@ -133,7 +136,7 @@ def near_snapshot(monkeypatch):
     return state
 
 
-async def test_near_plan_route_uses_probe_only_for_legacy_initial_page(near_snapshot, monkeypatch):
+async def test_near_plan_route_materializes_legacy_count_candidates(near_snapshot, monkeypatch):
     membership = "SELECT npi FROM mrf.fixture_plan_members WHERE snapshot_key = ANY(:scope_snapshots)"
     monkeypatch.setattr(npi, "_plan_release_npi_scope", AsyncMock(return_value=(membership, {"scope_snapshots": [4]})))
     monkeypatch.setattr(npi, "request_geo_search", AsyncMock(return_value=None))
@@ -164,15 +167,37 @@ async def test_near_plan_route_uses_probe_only_for_legacy_initial_page(near_snap
     first = json.loads((await npi.get_near_npi(request)).body)
     assert first["items"][0]["npi"] == 1000000004 and first["total_count"] == 2
     (initial,) = page_statements
-    assert f"FROM ({membership}) AS plan_members WHERE plan_members.npi = a.npi OFFSET 0" in initial
-    assert all(parameters["scope_snapshots"] == [4] for parameters in near_snapshot.query_parameters)
-
+    probe = f"FROM ({membership}) AS plan_members WHERE plan_members.npi = a.npi OFFSET 0"
+    assert probe in initial
+    (first_count,) = near_snapshot.count_statements
+    assert first_count.startswith("WITH local_rows AS MATERIALIZED")
+    assert f"WHERE npi IN ({membership})" in first_count and "LIMIT :limit" not in first_count
     request.args["cursor"] = first["next_cursor"]
     near_snapshot.provider_rows = near_snapshot.provider_rows[1:]
     following = json.loads((await npi.get_near_npi(request)).body)
     assert following["items"][0]["npi"] == 1000000012 and following["has_more"] is False
+    assert following["total_count"] == 2 and near_snapshot.count_statements == [first_count, first_count]
     assert any("page_geo AS MATERIALIZED" in query for query in page_statements[1:])
     assert all(f"a.npi IN ({membership})" in query and "OFFSET 0" not in query for query in page_statements[1:])
+
+    request.args.pop("cursor")
+    request.args["count_only"] = "1"
+    page_count = len(page_statements)
+    assert json.loads((await npi.get_near_npi(request)).body) == {"rows": 2}
+    assert len(page_statements) == page_count and near_snapshot.count_statements == [first_count] * 3
+    assert all(parameters["scope_snapshots"] == [4] for parameters in near_snapshot.query_parameters)
+
+
+@pytest.mark.parametrize("membership", [None, "SELECT NULL::BIGINT AS npi WHERE FALSE"])
+async def test_near_count_does_not_materialize_unscoped_or_empty_plans(near_snapshot, monkeypatch, membership):
+    monkeypatch.setattr(npi, "_plan_release_npi_scope", AsyncMock(return_value=(membership, {})))
+    monkeypatch.setattr(npi, "request_geo_search", AsyncMock(return_value=None))
+    near_snapshot.total_count = 0
+    request = SimpleNamespace(args={"lat": "41", "long": "-87", "count_only": "1"}, app=SimpleNamespace())
+    assert json.loads((await npi.get_near_npi(request)).body) == {"rows": 0}
+    (statement,) = near_snapshot.count_statements
+    assert "COUNT(DISTINCT (a.npi, a.address_key))" in statement and "MATERIALIZED" not in statement
+    assert ("WHERE FALSE" in statement) is (membership is not None)
 
 
 @pytest.mark.parametrize("view", ("", "card"))

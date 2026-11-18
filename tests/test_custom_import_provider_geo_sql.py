@@ -22,6 +22,7 @@ from api import provider_geo_sql as geo_sql
 from api import provider_list_sql as provider_list_sql
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
 from api.endpoint import npi as npi_module
+from api.provider_search_sql import plan_scope_query
 from db.connection import ConnectionProxy
 from process.custom_import.read_core import PreparedNpiEntityRelation, ReadOrderTerm
 from tests.custom_import_postgres_support import transaction_session
@@ -587,6 +588,28 @@ async def test_postgres_native_geo_count_keeps_exact_radius_boundaries(
         )
         reply = await npi_module.get_near_npi(request)
         assert json.loads(reply.body) == {"rows": expected}
+
+
+@pytest.mark.asyncio
+async def test_postgres_legacy_plan_geo_count_keeps_distinct_provider_addresses():
+    address_table_sql = "mrf.entity_address_unified"
+    async with transaction_session() as session:
+        await session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+        await _seed_geo_tables(session, address_table_sql=address_table_sql)
+        await session.execute(text("CREATE TABLE mrf.fixture_plan_members (snapshot_key bigint, npi bigint)"))
+        await session.execute(
+            text(
+                "INSERT INTO mrf.fixture_plan_members VALUES (1,1000000003),(1,1000000004),(2,1000000004),"
+                "(2,1000000005),(3,1000000001),(2,NULL)"
+            )
+        )
+        member_sql, scope_parameters = plan_scope_query({"mrf.fixture_plan_members": {1, 2}})
+        common, _ = geo_sql.nearby_extra_clauses([], member_sql, 0)
+        nearby = replace(_imported_geo_query(address_table_sql=address_table_sql).nearby, extra_clause=common)
+        parameters_by_name = {"in_long": 0.0, "in_lat": 0.0, "radius": 10.0, **scope_parameters}
+        reference = await session.scalar(text(geo_sql.build_native_nearby_count_sql(nearby)), parameters_by_name)
+        candidate = geo_sql.build_native_nearby_count_sql(nearby, legacy_plan=(member_sql, []))
+        assert await session.scalar(text(candidate), parameters_by_name) == reference == 4
 
 
 def _postgres_request(session, *, cursor_anchor=None):
