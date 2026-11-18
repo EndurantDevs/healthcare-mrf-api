@@ -8,7 +8,7 @@ import contextlib
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from typing import Any
 
@@ -292,40 +292,62 @@ def _sql_with_ctes(*ctes: str | None) -> str:
     return f"WITH {joined_ctes}\n" if available_ctes else ""
 
 
+_OTHER_ZIP_PAGE_FILTERS = (
+    "classification",
+    "specialization",
+    "section",
+    "display_name",
+    "codes",
+    "min_address_sources",
+    "plan_network",
+    "has_insurance",
+    "phone_digits",
+    "address_key",
+    "address_site_key",
+    "npi",
+)
+
+
 def _provider_registry_page_cte(
     projection: str,
     where: str,
     parameters: Mapping[str, object],
     filters: Mapping[str, object],
+    address_clauses: Sequence[str],
     *,
-    ordinary_unified_search: bool,
+    zip_table: str | None,
     has_additional_constraints: bool,
 ) -> str:
-    """Allow ZIP-matched offices to probe the registry for unadorned organization pages."""
+    """Limit ordinary ZIP organization registry lookups to eligible offices."""
     narrow_zip_search = (
-        ordinary_unified_search
+        zip_table is not None
         and bool(filters.get("zip_code"))
-        and parameters == {"entity_type_code": 2}
+        and parameters.get("entity_type_code") == 2
         and not has_additional_constraints
-        and not any(
-            filters.get(key)
-            for key in (
-                "classification",
-                "specialization",
-                "section",
-                "display_name",
-                "codes",
-                "min_address_sources",
-                "plan_network",
-                "has_insurance",
-                "phone_digits",
-                "address_key",
-                "address_site_key",
-                "npi",
-            )
-        )
+        and not any(filters.get(key) for key in _OTHER_ZIP_PAGE_FILTERS)
     )
-    materialization = "NOT MATERIALIZED" if narrow_zip_search else "MATERIALIZED"
+    if (
+        narrow_zip_search
+        and parameters.keys() == {"entity_type_code", "name_like_0"}
+        and projection == "b.npi"
+        and filters.get("city")
+        and filters.get("state")
+    ):
+        # A correlated lookup keeps broad names from driving a nationwide office search.
+        return f"""
+        zip_npis AS MATERIALIZED (
+            SELECT DISTINCT COALESCE(c.npi, c.inferred_npi) AS npi
+              FROM {zip_table} AS c
+             WHERE {" and ".join(address_clauses)}
+        ), filtered_npi AS MATERIALIZED (
+            SELECT admitted.npi
+              FROM zip_npis z CROSS JOIN LATERAL (
+                  SELECT b.npi FROM mrf.npi AS b
+                   WHERE {where} AND b.npi = z.npi OFFSET 0
+              ) admitted
+        )
+        """
+    materialization = "NOT MATERIALIZED" if narrow_zip_search and len(parameters) == 1 else "MATERIALIZED"
     return f"""
         filtered_npi AS {materialization} (
             SELECT {projection}

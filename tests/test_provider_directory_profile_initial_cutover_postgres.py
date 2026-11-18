@@ -644,10 +644,23 @@ async def _ordinary_initial_reader_fence(monkeypatch, ordinary, task_by_field, r
             wait_seconds.append(asyncio.get_running_loop().time() - begin)
             raise
 
+    promote = fhir._promote_provider_directory_artifact_bundle
+    failures = []
+
+    async def observed_promotion(*args, **kwargs):
+        try:
+            return await promote(*args, **kwargs)
+        except Exception as error:
+            assert fhir._is_provider_directory_artifact_cutover_retryable(error)
+            failures.append(type(error).__name__)
+            raise
+
     with monkeypatch.context() as observer:
+        observer.setattr(fhir, "_promote_provider_directory_artifact_bundle", observed_promotion)
         observer.setattr(cutover, "lock_live_serving_relations", observed_lock)
         reads = await _hold_initial_reader_through_cutover(ordinary, task_by_field, run_id, started)
-    assert len(wait_seconds) == fhir.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS
+    assert len(failures) == fhir.PROVIDER_DIRECTORY_ARTIFACT_CUTOVER_ATTEMPTS
+    assert wait_seconds
     assert all(0.08 <= seconds < 0.5 for seconds in wait_seconds)
     record_property("native_live_reader_lock_seconds", wait_seconds)
     record_property("native_reader_observations_during_build", reads)
