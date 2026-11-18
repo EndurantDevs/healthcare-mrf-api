@@ -73,16 +73,23 @@ def relevance_page_sql(
     *,
     name_only: bool,
 ) -> str:
-    """Keep one score per eligible provider before relevance sorting."""
+    """Return one score per eligible provider."""
     address_filter = " and ".join(address_clauses)
     if name_only:
+        # Keep the sort ahead of correlated address probes so the page can stop early.
         return f"""
         SELECT fn.npi, fn.relevance_score
-          FROM filtered_npi AS fn
+          FROM (
+              SELECT ranked.npi, ranked.relevance_score
+                FROM filtered_npi AS ranked
+               ORDER BY ranked.relevance_score DESC, ranked.npi ASC
+              OFFSET 0
+          ) AS fn
          WHERE EXISTS (
              SELECT 1
                FROM {address_source}
               WHERE {provider_npi_sql} = fn.npi AND {address_filter}
+             OFFSET 0
          )
         """
     return f"""

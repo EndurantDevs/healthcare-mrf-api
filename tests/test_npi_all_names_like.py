@@ -1963,10 +1963,21 @@ async def test_get_all_punctuation_only_name_filters_fail_closed(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("view", ["", "card"])
-async def test_get_all_relevance_order_is_additive_and_stably_tied_by_npi(monkeypatch, view):
+@pytest.mark.parametrize(
+    ("view", "state", "limit", "start", "ranked_first"),
+    [
+        pytest.param("", None, 10, 0, False, id="full-view"),
+        pytest.param("card", None, 5, 0, True, id="first-card-page"),
+        pytest.param("card", None, 50, 50, True, id="second-card-page"),
+        pytest.param("card", "IL", 10, 0, False, id="filtered-card"),
+    ],
+)
+async def test_get_all_relevance_order_is_additive_and_stably_tied_by_npi(
+    monkeypatch, view, state, limit, start, ranked_first
+):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
+    monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
 
     await get_all(
         types.SimpleNamespace(
@@ -1975,22 +1986,32 @@ async def test_get_all_relevance_order_is_additive_and_stably_tied_by_npi(monkey
                 "order_by": "relevance",
                 "view": view,
                 "include_total": "false",
-                "limit": "10",
+                "limit": str(limit),
+                "start": str(start),
+                "state": state,
             }
         )
     )
 
-    page_sql = next(sql_text for sql_text, _params in conn.sql_calls if "page_npis AS" in sql_text)
-    assert "similarity(" in page_sql
-    assert "ORDER BY relevance_score DESC, npi ASC" in page_sql
-    assert "COUNT(*) OVER () AS provider_address_total" in page_sql
-    assert ("MAX(fn.relevance_score)" in page_sql) is (view == "")
-    if view == "card":
-        assert re.search(r"FROM filtered_npi AS fn\s+WHERE EXISTS", page_sql)
-        assert "c.npi = fn.npi AND c.type" in page_sql
-        assert "FROM filtered_npi as fn" not in page_sql
-    page_params = next(params for sql_text, params in conn.sql_calls if "page_npis AS" in sql_text)
+    page_sql, page_params = next(
+        (sql_text, params) for sql_text, params in conn.sql_calls if "page_npis AS" in sql_text
+    )
+    assert "similarity(" in page_sql and ", :relevance_q) AS relevance_score" in page_sql
+    assert re.search(r"ORDER BY relevance_score DESC, npi ASC\s+LIMIT :limit OFFSET :start", page_sql)
+    assert "ORDER BY sub_s._search_relevance DESC, sub_s.npi_code ASC" in page_sql
+    assert "JOIN LATERAL (" in page_sql and "COUNT(*) OVER () AS provider_address_total" in page_sql
+    assert ("MAX(fn.relevance_score)" in page_sql) is not ranked_first
+    if ranked_first:
+        assert re.search(
+            r"FROM filtered_npi AS ranked\s+ORDER BY ranked.relevance_score DESC, ranked.npi ASC"
+            r"\s+OFFSET 0\s+\) AS fn\s+WHERE EXISTS",
+            page_sql,
+        )
+        assert re.search(r"COALESCE\(c.npi, c.inferred_npi\) = fn.npi AND c.type[^\n]+\s+OFFSET 0", page_sql)
+    else:
+        assert "FROM filtered_npi AS ranked" not in page_sql
     assert page_params["relevance_q"] == "smith adam"
+    assert (page_params["limit"], page_params["start"]) == (limit, start)
 
 
 def test_names_like_filter_clause_can_enable_trgm_fuzzy(monkeypatch):
