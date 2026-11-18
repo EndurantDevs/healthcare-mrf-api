@@ -8,6 +8,7 @@ import importlib.util
 import os
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import asyncpg
@@ -325,6 +326,42 @@ async def _assert_adoption_rollback(engine, schema, incumbent_authority, source_
         ) == incumbent_authority.serving_generation
 
 
+async def _assert_facility_successor(engine, schema, authority):
+    """A frozen Facility generation can be captured and replaced in lineage order."""
+    from process import reference_family_archive as archive
+
+    spec = archive.reference_family_spec("facility-anchors")
+    source_generation = authority.serving_generation.as_dict()
+    async with engine.begin() as connection:
+        incumbent = await archive.capture_reference_family_incumbent(
+            connection, importer_id=spec.importer_id, schema_name=schema
+        )
+        manifest = SimpleNamespace(
+            importer_id=spec.importer_id, source_capture_contract=archive.GUARDED_SOURCE_CAPTURE_CONTRACT
+        )
+        await generation._adopt_validated_family_generation(
+            connection, manifest, incumbent, source_generation, incumbent.relation_oids, None, frozen=True
+        )
+        assert (
+            await generation.capture_reference_family_serving_generation(
+                connection, importer_id=spec.importer_id, schema_name=schema
+            )
+            == authority.serving_generation
+        )
+        successor = source_generation | {"origin_generation": source_generation["origin_generation"] + 1}
+        await archive._require_automatic_cutover_generation(connection, spec, incumbent, successor)
+        for invalid_source in (source_generation, successor | {"origin_lineage_id": str(uuid4())}):
+            with pytest.raises(archive.ReferenceFamilyArchiveError, match="stale or unrelated"):
+                await archive._require_automatic_cutover_generation(connection, spec, incumbent, invalid_source)
+        await connection.execute(text(f'COMMENT ON TABLE "{schema}".facility_anchor IS NULL'))
+        with pytest.raises(RuntimeError, match="revision tracking is unavailable"):
+            await generation.capture_reference_family_serving_generation(
+                connection, importer_id=spec.importer_id, schema_name=schema
+            )
+        with pytest.raises(RuntimeError, match="revision tracking is unavailable"):
+            await archive._require_automatic_cutover_generation(connection, spec, incumbent, successor)
+
+
 @pytest.mark.asyncio
 async def test_closed_family_generation_publication_adoption_and_rollback(monkeypatch):
     """Bind every family to exact OIDs and keep adoption transaction-local."""
@@ -353,6 +390,7 @@ async def test_closed_family_generation_publication_adoption_and_rollback(monkey
             await install_named_generation(connection, schema)
 
         authority_by_importer = await _publish_initial_generations(engine, schema)
+        await _assert_facility_successor(engine, schema, authority_by_importer["facility-anchors"])
         incumbent_authority = authority_by_importer["places-zcta"]
         source_generation_by_field = {
             "origin_lineage_id": incumbent_authority.local_lineage_id,

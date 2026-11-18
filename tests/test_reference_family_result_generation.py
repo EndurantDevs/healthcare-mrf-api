@@ -366,20 +366,27 @@ async def test_label_adoption_preserves_native_generation_authority(monkeypatch)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tracked", [False, True])
-async def test_adoption_installs_mutation_guards_only_for_tracked_sources(monkeypatch, tracked):
-    """Frozen received inputs keep their names and generation without requiring mutable-table DDL."""
+@pytest.mark.parametrize(
+    "importer_id,read_only,tracked",
+    [("facility-anchors", True, False), ("facility-anchors", False, True), ("places-zcta", True, True)],
+)
+async def test_guarded_capture_adoption_respects_facility_destination(monkeypatch, importer_id, read_only, tracked):
+    """Keep received Facility file provenance while preserving existing tracked adoption."""
+    from process import reference_family_archive as native
+
     database = object()
     original = generation.ReferenceFamilyResultGenerationAuthority(
-        "places-zcta", "c8f27af1-56ba-4cda-82d8-0fc67650918f", 7, None, None
+        importer_id, "c8f27af1-56ba-4cda-82d8-0fc67650918f", 7, None, None
     )
+    source_generation = _serving("edfc559e-0067-43ed-b7fa-983fdb7077fe", 9)
+    names = generation.RELATION_NAMES_BY_IMPORTER[importer_id]
     fields_by_name = {
-        **_serving("edfc559e-0067-43ed-b7fa-983fdb7077fe", 9),
+        **source_generation,
         "serving_schema": "mrf",
-        "serving_relation_names": ["pricing_places_zcta"],
+        "serving_relation_names": names,
     }
     updated_by_field = {
-        "importer_id": "places-zcta",
+        "importer_id": importer_id,
         "local_lineage_id": original.local_lineage_id,
         "local_generation": original.local_generation,
         **fields_by_name,
@@ -389,22 +396,113 @@ async def test_adoption_installs_mutation_guards_only_for_tracked_sources(monkey
     monkeypatch.setattr(
         generation, "read_reference_family_result_generation_authority", AsyncMock(return_value=original)
     )
-    monkeypatch.setattr(generation, "_adopted_generation_fields", AsyncMock(return_value=fields_by_name))
+    build_fields = AsyncMock(return_value=fields_by_name)
+    monkeypatch.setattr(generation, "_adopted_generation_fields", build_fields)
     update = AsyncMock(return_value=updated_by_field)
     monkeypatch.setattr(generation, "_first", update)
-    adopted = await generation.publish_adopted_reference_family_generation(
+    declare_kind = AsyncMock()
+    monkeypatch.setattr(generation, "_declare_facility_publication_kind", declare_kind)
+    adopted = await generation._adopt_validated_family_generation(
         database,
-        importer_id="places-zcta",
-        schema_name="mrf",
-        source_generation=fields_by_name,
-        source_revision_tracked=tracked,
+        SimpleNamespace(importer_id=importer_id, source_capture_contract=native.GUARDED_SOURCE_CAPTURE_CONTRACT),
+        SimpleNamespace(schema_name="mrf"),
+        source_generation,
+        tuple((name, number) for number, name in enumerate(names, start=100)),
+        None,
+        frozen=read_only,
     )
-    assert adopted.relations == (("mrf", "pricing_places_zcta"),)
+    assert adopted.relations == tuple(("mrf", name) for name in names)
     assert adopted.local_generation == original.local_generation
-    assert update.await_args.kwargs["source_revision_tracked"] is tracked
+    build_fields.assert_awaited_once_with(database, importer_id, "mrf", source_generation)
+    assert update.await_args.kwargs == {
+        "importer_id": importer_id,
+        "source_revision_tracked": tracked,
+        **fields_by_name,
+    }
     assert install.await_count == int(tracked)
     if tracked:
-        install.assert_awaited_once_with(database, importer_id="places-zcta", schema_name="mrf")
+        install.assert_awaited_once_with(database, importer_id=importer_id, schema_name="mrf")
+    if importer_id == "facility-anchors":
+        declare_kind.assert_awaited_once_with(database, "mrf", frozen=read_only)
+    else:
+        declare_kind.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("frozen", "previous_kind", "expected_comment"),
+    [
+        (True, None, "'reference-family.facility-anchors.read-only.v1'"),
+        (False, "reference-family.facility-anchors.read-only.v1", "NULL"),
+        (False, None, None),
+        (False, "Facility data notes", None),
+    ],
+)
+async def test_facility_publication_updates_only_the_storage_kind_comment(frozen, previous_kind, expected_comment):
+    """Keep unrelated comments when mutable Facility storage replaces a publication."""
+    session = SimpleNamespace(scalar=AsyncMock(return_value=previous_kind), execute=AsyncMock())
+
+    await generation._declare_facility_publication_kind(session, "directory_fixture", frozen=frozen)
+
+    relation = '"directory_fixture"."facility_anchor"'
+    if frozen:
+        session.scalar.assert_not_awaited()
+    else:
+        session.scalar.assert_awaited_once()
+        statement, parameters = session.scalar.await_args.args
+        assert str(statement) == "SELECT obj_description(to_regclass(:relation),'pg_class')"
+        assert parameters == {"relation": relation}
+    if expected_comment is None:
+        session.execute.assert_not_awaited()
+    else:
+        session.execute.assert_awaited_once()
+        assert str(session.execute.await_args.args[0]) == f"COMMENT ON TABLE {relation} IS {expected_comment}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frozen,tracked", [(True, False), (False, True), (False, False)])
+async def test_facility_capture_requires_named_freeze_or_existing_revision_guards(monkeypatch, frozen, tracked):
+    importer_id = "facility-anchors"
+    schema = "mrf"
+    database = object()
+    origin = generation.validate_reference_family_serving_generation(
+        _serving("edfc559e-0067-43ed-b7fa-983fdb7077fe", 9)
+    )
+    authority = generation.ReferenceFamilyResultGenerationAuthority(
+        importer_id,
+        "c8f27af1-56ba-4cda-82d8-0fc67650918f",
+        7,
+        origin,
+        generation.declared_reference_family_relations(importer_id, schema),
+    )
+    monkeypatch.setattr(
+        generation, "read_reference_family_result_generation_authority", AsyncMock(return_value=authority)
+    )
+    monkeypatch.setattr(generation, "current_reference_family_relation_oids", AsyncMock(return_value=(100, 101)))
+    kind = AsyncMock(return_value={"frozen": frozen})
+    monkeypatch.setattr(generation, "_first", kind)
+    tracking = AsyncMock(
+        side_effect=None if tracked else RuntimeError("reference source revision tracking is unavailable")
+    )
+    monkeypatch.setattr("process.reference_source_generation.require_reference_revision_tracking", tracking)
+    if frozen or tracked:
+        assert (
+            await generation.capture_reference_family_serving_generation(
+                database, importer_id=importer_id, schema_name=schema
+            )
+            is origin
+        )
+    else:
+        with pytest.raises(RuntimeError, match="revision tracking is unavailable"):
+            await generation.capture_reference_family_serving_generation(
+                database, importer_id=importer_id, schema_name=schema
+            )
+    assert kind.await_args.kwargs["relation"] == '"mrf"."facility_anchor"'
+    assert kind.await_args.kwargs["kind"] == generation._FROZEN_FACILITY_PUBLICATION
+    if frozen:
+        tracking.assert_not_awaited()
+    else:
+        tracking.assert_awaited_once_with(database, importer_id=importer_id, schema_name=schema)
 
 
 @pytest.mark.parametrize(
