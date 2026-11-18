@@ -293,4 +293,4 @@ def test_taxonomy_filter_is_an_init_plan_not_a_join():
     assert "CROSS JOIN" not in sql
     taxonomy_codes = "(SELECT ARRAY_AGG(int_code) FROM mrf.nucc_taxonomy WHERE classification = :classification)"
     assert f"a.taxonomy_array && {taxonomy_codes}" in sql
-    assert "IN (SELECT code FROM mrf.nucc_taxonomy WHERE classification = :classification)" in sql
+    assert "= ANY (ARRAY(SELECT code FROM mrf.nucc_taxonomy WHERE classification = :classification))" in sql
