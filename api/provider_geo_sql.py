@@ -282,7 +282,7 @@ def _taxonomy_filter_where(nearby: NearbySqlQuery, *, on_search: bool = False) -
             "SELECT 1 FROM mrf.npi_taxonomy AS provider_taxonomy "
             "WHERE provider_taxonomy.npi = a.npi "
             "AND provider_taxonomy.healthcare_provider_taxonomy_code "
-            f"IN (SELECT code FROM mrf.nucc_taxonomy WHERE {nearby.taxonomy_conditions}) "
+            f"= ANY (ARRAY(SELECT code FROM mrf.nucc_taxonomy WHERE {nearby.taxonomy_conditions})) "
             "AND UPPER(COALESCE("
             "provider_taxonomy.healthcare_provider_primary_taxonomy_switch, '')) = 'Y')"
         )
