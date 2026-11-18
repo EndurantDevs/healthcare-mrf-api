@@ -984,6 +984,30 @@ async def test_lost_root_acknowledgement_resumes_from_committed_native_receipts(
     assert len(db.calls) == 2 and not db.reads and not db.heartbeat.called
 
 
+async def test_root_statement_timeout_rolls_back_then_splits_the_same_batch(monkeypatch):
+    request = _request(page_row_limit=32)
+    registry = _registry(request.definition)
+    families = [family_input(request, root_id, count=0) for root_id in range(1, 44)]
+    db = CallerDatabase(monkeypatch, request, families)
+    original = RuntimeError("statement timeout")
+    original.sqlstate = "57014"
+    original.diag = SimpleNamespace(message_primary="canceling statement due to statement timeout")
+    error = DBAPIError(None, None, original)
+    source_call = db.call
+
+    async def timed_call(session, name, arguments):
+        result = await source_call(session, name, arguments)
+        db.fail_before_commit = error if len(arguments[4][1]) > 22 else None
+        return result
+
+    monkeypatch.setattr(graph, "_source_call", timed_call)
+    await sets.consume_family_page(None, request, registry, tuple(item for item, _children in families))
+    assert [len(arguments[4][1]) for _name, arguments in db.calls] == [43, 21, 22]
+    assert len(db.progress) == 43 and all(row.complete for row in db.progress.values())
+    db.heartbeat.assert_awaited_once_with(None, request)
+    assert not db.read_open and not db.write_open
+
+
 async def test_root_physical_byte_envelope_splits_with_logical_spans_intact(monkeypatch):
     request = _request(page_row_limit=32)
     registry = _registry(request.definition)

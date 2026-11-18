@@ -248,6 +248,7 @@ async def _start_roots(session_factory, request, registry, inputs):
             except (CandidateRunnerError, DBAPIError) as error:
                 if len(chunk) < 2 or not graph._is_child_page_bound_error(error):
                     raise
+                await graph._heartbeat(session_factory, request)
                 midpoint = len(chunk) // 2
                 pending.extendleft(
                     reversed(
