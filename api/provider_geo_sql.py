@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 from uuid import UUID
@@ -26,8 +26,8 @@ _CURSOR_ADDRESS_KEY_PARAMETER = "__custom_import_geo_cursor_address_key"
 
 def nearby_extra_clauses(
     filters: Sequence[str], plan_member_sql: str | None, plan_filter_position: int
-) -> tuple[str, str | None]:
-    """Compose the common predicates and the legacy first-page plan probe."""
+) -> tuple[str, tuple[str, str] | None]:
+    """Compose common predicates and the legacy page and cursor plan filters."""
 
     separator = "\n          AND "
     if plan_member_sql is None:
@@ -41,7 +41,10 @@ def nearby_extra_clauses(
     )
     return (
         separator + separator.join((*before, membership, *after)),
-        separator + separator.join((*before, legacy_membership, *after)),
+        (
+            separator + separator.join((*before, legacy_membership, *after)),
+            separator + separator.join((*before, f"({membership}) IS TRUE", *after)),
+        ),
     )
 
 
@@ -488,14 +491,18 @@ def build_native_nearby_sql(
     *,
     cursor_clause: str = "",
     use_search_page: bool = False,
-    legacy_initial_extra_clause: str | None = None,
+    legacy_page_clauses: tuple[str, str] | None = None,
 ) -> str:
     """Keep initial KNN reads bounded and paginate canonical address identities."""
 
     if nearby.search_table_sql and use_search_page and not cursor_clause:
         return _native_search_page(nearby)
+    legacy_initial_clause, legacy_cursor_clause = legacy_page_clauses or (None, None)
     if cursor_clause:
         # shortcut: dedupe eligible aliases first; add indexed identity selection if deep pages dominate latency.
+        if not nearby.search_table_sql and legacy_cursor_clause is not None:
+            # Keep plan membership as a boolean filter during native address deduplication.
+            nearby = replace(nearby, extra_clause=legacy_cursor_clause)
         return f"""WITH {_native_eligible_geo_cte(nearby)},
 page_geo AS MATERIALIZED (
     SELECT a.*,
@@ -522,7 +529,7 @@ SELECT hydrated_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display
         taxonomy_where=taxonomy_where,
         geo_precision_clause=nearby.geo_precision_clause,
         geo_type_clause=nearby.geo_type_clause,
-        extra_clause=nearby.extra_clause if legacy_initial_extra_clause is None else legacy_initial_extra_clause,
+        extra_clause=nearby.extra_clause if legacy_initial_clause is None else legacy_initial_clause,
         ilike_clause=nearby.ilike_clause,
         cursor_clause=cursor_clause,
         row_tiebreaker=nearby_row_tiebreaker(nearby.address_table_sql),

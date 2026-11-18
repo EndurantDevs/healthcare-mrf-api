@@ -151,15 +151,15 @@ def test_plan_geo_membership_keeps_legacy_page_and_count_strategies_separate():
     member_sql, parameters = plan_scope_query({"mrf.scope_v3": {3}, "mrf.scope_v4": {7}})
     state = "a.state_name = :state"
     entity_type = "d.entity_type_code = :entity_type_code"
-    common, legacy = nearby_extra_clauses([state, entity_type], member_sql, 1)
+    common, legacy_page_clauses = nearby_extra_clauses([state, entity_type], member_sql, 1)
     assert parameters == {"plan_scope_snapshot_keys_0": [3], "plan_scope_snapshot_keys_1": [7]}
     assert " UNION ALL " in member_sql
     assert common == f"\n          AND {state}\n          AND a.npi IN ({member_sql})\n          AND {entity_type}"
-    assert legacy is not None
+    assert legacy_page_clauses is not None
     probe = f"EXISTS (SELECT 1 FROM ({member_sql}) AS plan_members WHERE plan_members.npi = a.npi OFFSET 0)"
     nearby = replace(_imported_geo_query().nearby, extra_clause=common, search_table_sql="fixture.geo_search")
     fallback = replace(nearby, search_table_sql=None)
-    page_options_by_name = {"legacy_initial_extra_clause": legacy}
+    page_options_by_name = {"legacy_page_clauses": legacy_page_clauses}
 
     page = build_native_nearby_sql(fallback, use_search_page=True, **page_options_by_name)
     assert "WITH sub_s AS" in page and page.index(state) < page.index(probe) < page.index(entity_type)
@@ -168,8 +168,12 @@ def test_plan_geo_membership_keeps_legacy_page_and_count_strategies_separate():
         nearby, use_search_page=True
     )
     cursor = "\n AND a.cursor_distance_meters > :cursor"
-    assert build_native_nearby_sql(fallback, cursor_clause=cursor, **page_options_by_name) == build_native_nearby_sql(
-        fallback, cursor_clause=cursor
+    continued = build_native_nearby_sql(fallback, cursor_clause=cursor, **page_options_by_name)
+    assert continued == build_native_nearby_sql(fallback, cursor_clause=cursor).replace(
+        f"a.npi IN ({member_sql})", f"(a.npi IN ({member_sql})) IS TRUE"
+    )
+    assert build_native_nearby_sql(nearby, cursor_clause=cursor, **page_options_by_name) == build_native_nearby_sql(
+        nearby, cursor_clause=cursor
     )
     legacy_plan = member_sql, [state, entity_type]
     count = build_native_nearby_count_sql(fallback, legacy_plan=legacy_plan)
@@ -188,11 +192,11 @@ def test_nearby_extra_clauses_keep_unscoped_and_empty_membership():
     assert nearby_extra_clauses([], None, 0) == ("", None)
     assert nearby_extra_clauses(["a.state_name = :state"], None, 1) == ("\n          AND a.state_name = :state", None)
     denied = "SELECT NULL::BIGINT AS npi WHERE FALSE"
-    common, legacy = nearby_extra_clauses([], denied, 0)
+    common, legacy_page_clauses = nearby_extra_clauses([], denied, 0)
     assert common == f"\n          AND a.npi IN ({denied})"
-    assert (
-        legacy
-        == f"\n          AND EXISTS (SELECT 1 FROM ({denied}) AS plan_members WHERE plan_members.npi = a.npi OFFSET 0)"
+    assert legacy_page_clauses == (
+        f"\n          AND EXISTS (SELECT 1 FROM ({denied}) AS plan_members WHERE plan_members.npi = a.npi OFFSET 0)",
+        f"\n          AND (a.npi IN ({denied})) IS TRUE",
     )
 
 

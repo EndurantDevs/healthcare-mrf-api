@@ -591,7 +591,7 @@ async def test_postgres_native_geo_count_keeps_exact_radius_boundaries(
 
 
 @pytest.mark.asyncio
-async def test_postgres_legacy_plan_geo_count_keeps_distinct_provider_addresses():
+async def test_postgres_legacy_plan_geo_count_and_cursor_keep_distinct_provider_addresses():
     address_table_sql = "mrf.entity_address_unified"
     async with transaction_session() as session:
         await session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
@@ -604,12 +604,29 @@ async def test_postgres_legacy_plan_geo_count_keeps_distinct_provider_addresses(
             )
         )
         member_sql, scope_parameters = plan_scope_query({"mrf.fixture_plan_members": {1, 2}})
-        common, _ = geo_sql.nearby_extra_clauses([], member_sql, 0)
+        common, legacy_page_clauses = geo_sql.nearby_extra_clauses([], member_sql, 0)
         nearby = replace(_imported_geo_query(address_table_sql=address_table_sql).nearby, extra_clause=common)
         parameters_by_name = {"in_long": 0.0, "in_lat": 0.0, "radius": 10.0, **scope_parameters}
-        reference = await session.scalar(text(geo_sql.build_native_nearby_count_sql(nearby)), parameters_by_name)
-        candidate = geo_sql.build_native_nearby_count_sql(nearby, legacy_plan=(member_sql, []))
-        assert await session.scalar(text(candidate), parameters_by_name) == reference == 4
+        reference_count = await session.scalar(text(geo_sql.build_native_nearby_count_sql(nearby)), parameters_by_name)
+        candidate_count_sql = geo_sql.build_native_nearby_count_sql(nearby, legacy_plan=(member_sql, []))
+        assert await session.scalar(text(candidate_count_sql), parameters_by_name) == reference_count == 4
+
+        cursor, cursor_parameters = npi_module._nearby_cursor_filter((0.0, 1000000003, _THIRD_ADDRESS_KEY))
+        page_parameters_by_name = {**parameters_by_name, **cursor_parameters, "limit": 50}
+        reference_page = geo_sql.build_native_nearby_sql(nearby, cursor_clause=cursor)
+        candidate_page = geo_sql.build_native_nearby_sql(
+            nearby, cursor_clause=cursor, legacy_page_clauses=legacy_page_clauses
+        )
+        reference_rows = (await session.execute(text(reference_page), page_parameters_by_name)).all()
+        candidate_rows = (await session.execute(text(candidate_page), page_parameters_by_name)).all()
+        assert sorted(map(repr, candidate_rows)) == sorted(map(repr, reference_rows))
+        assert list(
+            dict.fromkeys((provider_row.npi_code, str(provider_row.address_key)) for provider_row in candidate_rows)
+        ) == [
+            (1000000003, _FIFTH_ADDRESS_KEY),
+            (1000000004, _FOURTH_ADDRESS_KEY),
+            (1000000005, _FIFTH_ADDRESS_KEY),
+        ]
 
 
 def _postgres_request(session, *, cursor_anchor=None):
