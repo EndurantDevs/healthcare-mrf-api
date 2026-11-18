@@ -524,6 +524,7 @@ def test_publisher_requires_every_matrix_result_and_all_immutable_artifacts():
         "measurement",
         "source-validation",
         "dev-image-publication",
+        "container-package",
     }
     download = next(
         step for step in publisher["steps"] if step.get("name") == "Download immutable measurement artifacts"
@@ -544,7 +545,7 @@ def test_publisher_requires_every_matrix_result_and_all_immutable_artifacts():
     assert len(set(identities)) == 70
     assert download["with"]["digest-mismatch"] == "error"
     assert download["with"]["merge-multiple"] is False
-    assert jobs["source-validation"]["needs"] == ["measurement"]
+    assert jobs["source-validation"]["needs"] == ["measurement", "container-package"]
     assert jobs["dev-image-publication"]["needs"] == [
         "smoke",
         "source-validation",
