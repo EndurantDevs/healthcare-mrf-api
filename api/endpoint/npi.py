@@ -99,6 +99,7 @@ from api.provider_geo_sql import (
     canonical_zip_anchor_statement,
     native_geo_entity_scope,
     nearby_batch_identities,
+    nearby_extra_clauses,
 )
 from api.provider_geo_sql import (
     normalize_state_filter as _normalize_state_filter,
@@ -10570,8 +10571,7 @@ async def get_near_npi(
             extra_filters.append("a.plans_network_array && (:plan_network_array)")
         if entity_type_code is not None:
             extra_filters.append("d.entity_type_code = :entity_type_code")
-        if plan_member_sql is not None:
-            extra_filters.append(f"a.npi IN ({plan_member_sql})")
+        plan_filter_position = len(extra_filters)
         if provider_sex_code is not None:
             extra_filters.append(
                 "EXISTS ("
@@ -10654,9 +10654,7 @@ async def get_near_npi(
             ilike_clause = f"\n            AND {_name_like_clause('d', 'q')}"
 
         taxonomy_conditions = " AND ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
-        extra_clause = ""
-        if extra_filters:
-            extra_clause = "\n          AND " + "\n          AND ".join(extra_filters)
+        extra_clause, legacy_extra_clause = nearby_extra_clauses(extra_filters, plan_member_sql, plan_filter_position)
 
         query_parameters_by_name: dict[str, Any] = {
             **({"min_address_sources": minimum} if minimum else {}),
@@ -10757,6 +10755,7 @@ async def get_near_npi(
                         nearby_query if use_search_page else replace(nearby_query, search_table_sql=None),
                         cursor_clause=cursor_clause,
                         use_search_page=use_search_page,
+                        legacy_initial_extra_clause=legacy_extra_clause,
                     )
                     batch_rows = await conn.all(
                         text(nearby_sql),

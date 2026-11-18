@@ -133,6 +133,48 @@ def near_snapshot(monkeypatch):
     return state
 
 
+async def test_near_plan_route_uses_probe_only_for_legacy_initial_page(near_snapshot, monkeypatch):
+    membership = "SELECT npi FROM mrf.fixture_plan_members WHERE snapshot_key = ANY(:scope_snapshots)"
+    monkeypatch.setattr(npi, "_plan_release_npi_scope", AsyncMock(return_value=(membership, {"scope_snapshots": [4]})))
+    monkeypatch.setattr(npi, "request_geo_search", AsyncMock(return_value=None))
+    page_statements = []
+    build = npi.build_native_nearby_sql
+
+    def record_page(*args, **kwargs):
+        statement = build(*args, **kwargs)
+        page_statements.append(statement)
+        return statement
+
+    monkeypatch.setattr(npi, "build_native_nearby_sql", record_page)
+    first_row = near_snapshot.provider_rows[0]._mapping
+    near_snapshot.provider_rows.append(
+        SimpleNamespace(_mapping={**first_row, "npi": 1000000012, "cursor_distance_meters": 200.0})
+    )
+    near_snapshot.total_count = 2
+    request = SimpleNamespace(
+        args={
+            "lat": "41",
+            "long": "-87",
+            "limit": "1",
+            "include_total": "1",
+            "plan_release_id": "hprelease_00000000000000000000000001",
+        },
+        app=SimpleNamespace(),
+    )
+    first = json.loads((await npi.get_near_npi(request)).body)
+    assert first["items"][0]["npi"] == 1000000004 and first["total_count"] == 2
+    (initial,) = page_statements
+    assert f"FROM ({membership}) AS plan_members WHERE plan_members.npi = a.npi OFFSET 0" in initial
+    assert all(parameters["scope_snapshots"] == [4] for parameters in near_snapshot.query_parameters)
+
+    request.args["cursor"] = first["next_cursor"]
+    near_snapshot.provider_rows = near_snapshot.provider_rows[1:]
+    following = json.loads((await npi.get_near_npi(request)).body)
+    assert following["items"][0]["npi"] == 1000000012 and following["has_more"] is False
+    assert any("page_geo AS MATERIALIZED" in query for query in page_statements[1:])
+    assert all(f"a.npi IN ({membership})" in query and "OFFSET 0" not in query for query in page_statements[1:])
+
+
 @pytest.mark.parametrize("view", ("", "card"))
 @pytest.mark.parametrize("paginated", (False, True))
 @pytest.mark.parametrize("zip_record", ({"intptlat": "41.0", "intptlon": "-87.0"}, ("41.0", "-87.0")))

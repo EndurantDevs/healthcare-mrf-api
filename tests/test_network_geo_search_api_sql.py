@@ -27,7 +27,9 @@ from api.provider_geo_sql import (
     build_imported_geo_statements,
     build_native_nearby_count_sql,
     build_native_nearby_sql,
+    nearby_extra_clauses,
 )
+from api.provider_search_sql import plan_scope_query
 from db.models import EntityAddressUnified
 from process.network_compact_layout import (
     CompactAddressRelation,
@@ -143,6 +145,47 @@ def test_native_search_preserves_knn_page_and_filters_counts_and_cursors(monkeyp
         assert continued.index("SELECT DISTINCT ON") < continued.index("page_geo AS MATERIALIZED")
         assert nearby.search_table_sql in continued and relation in continued
         assert continued.index(cursor_clause) < continued.index("LIMIT :limit")
+
+
+def test_plan_membership_probe_is_limited_to_the_legacy_first_page():
+    member_sql, parameters = plan_scope_query({"mrf.scope_v3": {3}, "mrf.scope_v4": {7}})
+    state = "a.state_name = :state"
+    entity_type = "d.entity_type_code = :entity_type_code"
+    common, legacy = nearby_extra_clauses([state, entity_type], member_sql, 1)
+    assert parameters == {"plan_scope_snapshot_keys_0": [3], "plan_scope_snapshot_keys_1": [7]}
+    assert " UNION ALL " in member_sql
+    assert common == f"\n          AND {state}\n          AND a.npi IN ({member_sql})\n          AND {entity_type}"
+    assert legacy is not None
+    probe = f"EXISTS (SELECT 1 FROM ({member_sql}) AS plan_members WHERE plan_members.npi = a.npi OFFSET 0)"
+    nearby = replace(_imported_geo_query().nearby, extra_clause=common, search_table_sql="fixture.geo_search")
+    fallback = replace(nearby, search_table_sql=None)
+    page_options_by_name = {"legacy_initial_extra_clause": legacy}
+
+    page = build_native_nearby_sql(fallback, use_search_page=True, **page_options_by_name)
+    assert "WITH sub_s AS" in page and page.index(state) < page.index(probe) < page.index(entity_type)
+    assert common not in page
+    assert build_native_nearby_sql(nearby, use_search_page=True, **page_options_by_name) == build_native_nearby_sql(
+        nearby, use_search_page=True
+    )
+    cursor = "\n AND a.cursor_distance_meters > :cursor"
+    assert build_native_nearby_sql(fallback, cursor_clause=cursor, **page_options_by_name) == build_native_nearby_sql(
+        fallback, cursor_clause=cursor
+    )
+    imported = build_imported_geo_statements(_context(), replace(_imported_geo_query(), nearby=fallback))
+    for statement in (build_native_nearby_count_sql(fallback), str(imported.count), str(imported.page)):
+        assert common in statement and probe not in statement
+
+
+def test_nearby_extra_clauses_keep_unscoped_and_empty_membership():
+    assert nearby_extra_clauses([], None, 0) == ("", None)
+    assert nearby_extra_clauses(["a.state_name = :state"], None, 1) == ("\n          AND a.state_name = :state", None)
+    denied = "SELECT NULL::BIGINT AS npi WHERE FALSE"
+    common, legacy = nearby_extra_clauses([], denied, 0)
+    assert common == f"\n          AND a.npi IN ({denied})"
+    assert (
+        legacy
+        == f"\n          AND EXISTS (SELECT 1 FROM ({denied}) AS plan_members WHERE plan_members.npi = a.npi OFFSET 0)"
+    )
 
 
 @pytest.mark.parametrize(
