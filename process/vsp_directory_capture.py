@@ -29,7 +29,7 @@ from process.vsp_directory_contract import (
     search_result,
     validate_census_memberships,
 )
-from process.vsp_directory_enrichment import enrich_capture, write_normalized_capture
+from process.vsp_directory_enrichment import enrich_capture, verify_profile_site_memberships, write_normalized_capture
 from process.vsp_directory_geometry import census_request, distance_miles, world_tiles
 from process.vsp_directory_http import VSPHTTP, strict_json
 from process.vsp_directory_normalization import company_summary_name, is_company_summary
@@ -128,8 +128,11 @@ class VSPCapture:
         self.offices, self.identities, self.profiles = {}, {}, {}
         self.search_memberships = {}
         self.site_memberships = {name: set() for name in NETWORKS.values()}
+        self.geographic_additions = {name: set() for name in NETWORKS.values()}
         self.memberships = {name: set() for name in NETWORKS.values()}
         self.partitions, self.unresolved = [], []
+        self.exhausted_networks = set()
+        self.census_shortfalls_by_network = {}
         self.cache_hits = 0
         self.identity_reuses = set()
         self._sizes, self._total_bytes = {}, 0
@@ -217,14 +220,18 @@ class VSPCapture:
         scopes.setdefault(network, set()).update(doctor_ids)
         self.account_bytes("search:" + oid, {name: sorted(ids) for name, ids in scopes.items()})
 
-    def remember_search(self, office, network, request_id):
-        """Use validated POST summaries before merging any office identities."""
+    def remember_search(self, office, network, request_id, *, scope_method=None):
+        """Record scoped roster evidence before merging offices across networks."""
         self.remember(office, request_id)
         oid = public_id(office["pid"])
         doctor_ids = {public_id(summary["pid"]) for summary in office["providerSummaries"]}
         if doctor_ids:
             self.remember_search_scope(oid, network, doctor_ids)
         self.memberships[network].add(oid)
+        if scope_method is None:
+            self.geographic_additions[network].discard(oid)
+        elif scope_method == "POST" and oid not in self.site_memberships[network]:
+            self.geographic_additions[network].add(oid)
         self.site_memberships[network].add(oid)
         self.account_bytes("site:" + oid, sorted(name for name, sites in self.site_memberships.items() if oid in sites))
 
@@ -250,15 +257,16 @@ class VSPCapture:
     async def discover(self, network, expected):
         """Cover the globe; source counts decide subdivision and capture completion."""
         pending_tiles = list(reversed(world_tiles()))
+        self.exhausted_networks.discard(network)
         while pending_tiles:
             tile = pending_tiles.pop()
             field_value, receipt = await self.fetch("POST", SEARCH_URL, tile.request(network))
             total, offices = search_result(field_value)
             for office in offices:
                 self.remember_search(office, network, receipt["request_key"])
-            observed = len(self.memberships[network])
+            observed = len(self.site_memberships[network])
             require(observed <= expected + CENSUS_OFFICE_DRIFT_LIMIT, "vsp_census_changed_during_capture")
-            if observed >= expected:
+            if observed == expected or observed - len(self.geographic_additions[network]) >= expected:
                 self.partitions.append(
                     {
                         "network": network,
@@ -294,31 +302,48 @@ class VSPCapture:
                 },
             )
             await self.progress("discovery", network=network, pending_tiles=len(pending_tiles))
+        else:
+            if all(leaf["network"] != network for leaf in self.unresolved):
+                self.exhausted_networks.add(network)
+
+    async def capture_network(self, name):
+        """Establish each network's independent count and enrich newly discovered offices."""
+        request = census_request(name)
+        retained = self.store.lookup("POST", SEARCH_URL, request)
+        response, _ = await self.fetch("POST", SEARCH_URL, request, fresh=True)
+        refreshed = self._census_count(response)
+        start = self._census_count(retained[0]) if retained is not None else refreshed
+        require(abs(start - refreshed) <= CENSUS_OFFICE_DRIFT_LIMIT, "vsp_census_changed_during_capture")
+        publisher_counts = {start, refreshed}
+        needs_discovery = len(self.site_memberships[name]) not in publisher_counts
+        if needs_discovery:
+            await self.discover(name, refreshed)
+        baseline_addition_ids = (
+            self.geographic_additions[name].copy() if len(self.site_memberships[name]) in publisher_counts else set()
+        )
+        if needs_discovery:
+            await enrich_capture(self)
+        require(len(self.site_memberships[name]) <= refreshed + CENSUS_OFFICE_DRIFT_LIMIT, OFFICE_CENSUS_UNRESOLVED)
+        return start, refreshed, baseline_addition_ids
 
     async def run(self):
         """Refresh one network at a time, sharing office profiles across networks."""
-        start, refreshed = {}, {}
+        start, refreshed, additions_at_discovery_by_network = {}, {}, {}
         for name in NETWORKS.values():
-            request = census_request(name)
-            retained = self.store.lookup("POST", SEARCH_URL, request)
-            response, _ = await self.fetch("POST", SEARCH_URL, request, fresh=True)
-            refreshed[name] = self._census_count(response)
-            start[name] = self._census_count(retained[0]) if retained is not None else refreshed[name]
-            require(
-                abs(start[name] - refreshed[name]) <= CENSUS_OFFICE_DRIFT_LIMIT,
-                "vsp_census_changed_during_capture",
-            )
-            if len(self.memberships[name]) not in {start[name], refreshed[name]}:
-                await self.discover(name, refreshed[name])
-                await enrich_capture(self)
-            require(
-                len(self.memberships[name]) <= refreshed[name] + CENSUS_OFFICE_DRIFT_LIMIT, OFFICE_CENSUS_UNRESOLVED
-            )
+            start[name], refreshed[name], additions_at_discovery_by_network[name] = await self.capture_network(name)
+        scoped_additions = await verify_profile_site_memberships(self, additions_at_discovery_by_network)
         end = await self.census(fresh=True)
         observed_by_network = {name: len(self.memberships[name]) for name in NETWORKS.values()}
-        validate_census_memberships(start, refreshed, end, observed_by_network)
+        self.census_shortfalls_by_network = validate_census_memberships(
+            start,
+            refreshed,
+            end,
+            observed_by_network,
+            scoped_additions=scoped_additions,
+            exhausted_networks=self.exhausted_networks,
+        )
         # Even a saturated spatial leaf is closed only by the independent global census.
-        return await write_normalized_capture(self, start, end, refreshed=refreshed)
+        return await write_normalized_capture(self, start, end, refreshed=refreshed, scoped_additions=scoped_additions)
 
 
 async def _noop(*_args):

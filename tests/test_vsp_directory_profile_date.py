@@ -86,7 +86,11 @@ async def test_mixed_date_office_uses_first_profile_through_repair_and_restart(
     assert http.calls[boundary:] == [
         ("POST", SEARCH_URL, census_request("Signature")),
         *(("GET", publisher.offices[office_id]["locationDrProfileLink"]["href"], None) for office_id in ("102", "103")),
-        *(("POST", SEARCH_URL, census_request(name)) for name in ("Choice", "Advantage")),
+        *(
+            ("POST", SEARCH_URL, search_request)
+            for name in ("Choice", "Advantage")
+            for search_request in (census_request(name), TILE.request(name))
+        ),
         *(("POST", SEARCH_URL, census_request(name)) for name in sorted(publisher.counts)),
     ]
     resources = list(completed.iter_resources())
@@ -95,7 +99,7 @@ async def test_mixed_date_office_uses_first_profile_through_repair_and_restart(
     assert any(resource["id"] == "vsp-role-3-101-1999999992" for resource in resources)
     assert completed.proof["publisher_locations"] == publisher.counts
     assert completed.proof["network_npis"] == {"Signature": 2, "Choice": 2, "Advantage": 1}
-    assert completed.proof["retained_response_count"] == 13
+    assert completed.proof["retained_response_count"] == 15
 
     monkeypatch.setattr(acquisition.aiohttp, "ClientSession", lambda **_: pytest.fail("completed replay opened HTTP"))
     reopened = await acquisition.capture_vsp_directory(**capture_by_argument, require_retained=True)

@@ -200,6 +200,56 @@ async def test_affiliate_scopes_close_all_networks_without_extra_world_searches(
 
 
 @pytest.mark.asyncio
+async def test_other_network_enrichment_preserves_geographic_census_addition(tmp_path):
+    source = AffiliateSource(
+        scopes={(52, "Signature"): (2,), (52, "Advantage"): (2,), (53, "Choice"): (2,), (53, "Signature"): (3,)},
+        offices=(52, 53),
+    )
+    original_response = source.response
+
+    def response(method, url, payload):
+        if method == "POST" and payload["networkNames"] == ["Signature"] and payload["radius"] != "0.05":
+            if payload["limit"] == "1":
+                return {"totalCounts": 1}
+            return {"totalCounts": 1, "locations": [affiliate(52, FIRST)]}
+        return original_response(method, url, payload)
+
+    source.response = response
+    run = capture(tmp_path, source)
+    completed = await run.run()
+    assert completed.proof["publisher_locations"] == {"Signature": 2, "Choice": 1, "Advantage": 1}
+    assert completed.proof["geographically_verified_additions"] == {"Signature": 1, "Choice": 0, "Advantage": 0}
+    assert run.http.requests == 14
+
+
+@pytest.mark.asyncio
+async def test_early_affiliate_scope_preserves_only_the_extra_geographic_site(tmp_path):
+    source = AffiliateSource(
+        scopes={
+            (52, "Signature"): (2,),
+            (53, "Signature"): (2,),
+            (52, "Choice"): (2,),
+            (53, "Choice"): (3,),
+            (52, "Advantage"): (2,),
+        },
+        offices=(52, 53),
+    )
+    original_response = source.response
+
+    def response(method, url, payload):
+        if method == "POST" and payload["networkNames"] == ["Choice"] and payload["radius"] != "0.05":
+            if payload["limit"] == "1":
+                return {"totalCounts": 1}
+            return {"totalCounts": 1, "locations": [affiliate(52, FIRST)]}
+        return original_response(method, url, payload)
+
+    source.response = response
+    completed = await capture(tmp_path, source).run()
+    assert completed.proof["publisher_locations"] == {"Signature": 2, "Choice": 2, "Advantage": 1}
+    assert completed.proof["geographically_verified_additions"] == {"Signature": 0, "Choice": 1, "Advantage": 0}
+
+
+@pytest.mark.asyncio
 async def test_each_network_uses_its_incoming_summaries_before_office_merge(tmp_path):
     source = AffiliateSource(scopes={(52, "Signature"): (2, 3), (52, "Choice"): (3,)})
     run = capture(tmp_path, source)
@@ -285,14 +335,21 @@ async def test_capped_targeted_search_proves_presence_only(tmp_path, target_pres
 
 
 @pytest.mark.asyncio
-async def test_affiliate_fix_keeps_global_office_deficit_closed(tmp_path):
+@pytest.mark.parametrize("difference", [1, 10, 11])
+async def test_census_shortfall_requires_complete_sweep_and_stays_bounded(tmp_path, difference):
     source = AffiliateSource()
-    source.census_extra = 1
+    source.census_extra = difference
     run = capture(tmp_path, source)
-    with pytest.raises(VSPDirectoryError, match="^vsp_office_census_unresolved$"):
-        await run.run()
+    if difference == 11:
+        with pytest.raises(VSPDirectoryError, match="^vsp_office_census_unresolved$"):
+            await run.run()
+        assert run.store.load_checkpoint("complete") is None
+    else:
+        completed = await run.run()
+        assert completed.proof["closed_geographic_census_shortfalls"] == {"Signature": difference}
+        assert completed.proof["publisher_locations"] == dict.fromkeys(NETWORKS.values(), 1)
     assert run.memberships == {name: {"52"} for name in NETWORKS.values()}
-    assert run.unresolved == [] and run.store.load_checkpoint("complete") is None
+    assert run.unresolved == []
 
 
 @pytest.mark.asyncio

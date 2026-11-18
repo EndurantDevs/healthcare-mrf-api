@@ -64,8 +64,8 @@ def require(condition, code):
         raise VSPDirectoryError(code)
 
 
-def validate_census_memberships(opening, refreshed, closing, observed):
-    """Require each captured office count to match an independent census."""
+def validate_census_memberships(opening, refreshed, closing, observed, *, scoped_additions=None, exhausted_networks=()):
+    """Reconcile a census, verified additions, and small differences after complete sweeps."""
     names = set(NETWORKS.values())
     require(
         all(
@@ -79,11 +79,23 @@ def validate_census_memberships(opening, refreshed, closing, observed):
         all(max(counts) - min(counts) <= CENSUS_OFFICE_DRIFT_LIMIT for counts in counts_by_network.values()),
         "vsp_census_changed_during_capture",
     )
-    require(
-        observed.keys() == names
-        and all(type(observed[name]) is int and observed[name] in counts_by_network[name] for name in names),
-        OFFICE_CENSUS_UNRESOLVED,
-    )
+    require(observed.keys() == names, OFFICE_CENSUS_UNRESOLVED)
+    additions = {} if scoped_additions is None else scoped_additions
+    shortfalls_by_network = {}
+    for name, counts in counts_by_network.items():
+        count = observed[name]
+        added = additions.get(name, 0)
+        require(type(count) is int and type(added) is int and 0 <= added <= count, OFFICE_CENSUS_UNRESOLVED)
+        if count in counts:
+            continue
+        if name in exhausted_networks and 0 < count < min(counts) and max(counts) - count <= CENSUS_OFFICE_DRIFT_LIMIT:
+            shortfalls_by_network[name] = min(counts) - count
+            continue
+        require(
+            added > 0 and count - added in counts and count - min(counts) <= CENSUS_OFFICE_DRIFT_LIMIT,
+            OFFICE_CENSUS_UNRESOLVED,
+        )
+    return shortfalls_by_network
 
 
 def is_missing_profile_response(value):
