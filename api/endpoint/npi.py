@@ -10654,7 +10654,7 @@ async def get_near_npi(
             ilike_clause = f"\n            AND {_name_like_clause('d', 'q')}"
 
         taxonomy_conditions = " AND ".join(taxonomy_clauses) if taxonomy_clauses else "1=1"
-        extra_clause, legacy_extra_clause = nearby_extra_clauses(extra_filters, plan_member_sql, plan_filter_position)
+        extra_clause, legacy_page_clauses = nearby_extra_clauses(extra_filters, plan_member_sql, plan_filter_position)
 
         query_parameters_by_name: dict[str, Any] = {
             **({"min_address_sources": minimum} if minimum else {}),
@@ -10755,7 +10755,7 @@ async def get_near_npi(
                         nearby_query if use_search_page else replace(nearby_query, search_table_sql=None),
                         cursor_clause=cursor_clause,
                         use_search_page=use_search_page,
-                        legacy_initial_extra_clause=legacy_extra_clause,
+                        legacy_page_clauses=legacy_page_clauses,
                     )
                     batch_rows = await conn.all(
                         text(nearby_sql),
