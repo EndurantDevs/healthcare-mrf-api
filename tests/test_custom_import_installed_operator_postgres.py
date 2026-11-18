@@ -14,6 +14,7 @@ import sys
 import warnings
 from contextlib import AsyncExitStack, suppress
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import func, select, text, update
@@ -150,9 +151,9 @@ def installed_application(tmp_path_factory):
             assert (installed / name).read_bytes() == (_ROOT / name).read_bytes()
         assert not (installed / "tests").exists()
         # Default bytecode destinations stay beside sources in this owned tree.
-        assert sys.pycache_prefix is None
-        with warnings.catch_warnings(action="error"):
+        with patch.object(sys, "pycache_prefix", None), warnings.catch_warnings(action="error"):
             assert compileall.compile_dir(installed / "process", quiet=1, workers=1, limit_sl_dest=installed)
+        assert any((installed / "process").rglob("__pycache__"))
         yield installed, outside
     finally:
         shutil.rmtree(temporary)

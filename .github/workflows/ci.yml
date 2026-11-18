@@ -73,7 +73,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 9d92115f0dc15b586121528af247c8360fc24dcf
+        ref: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -142,7 +142,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 9d92115f0dc15b586121528af247c8360fc24dcf
+        ref: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -165,7 +165,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 9d92115f0dc15b586121528af247c8360fc24dcf
+        ref: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -202,7 +202,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 9d92115f0dc15b586121528af247c8360fc24dcf
+        ref: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -218,7 +218,7 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       working-directory: ${{ github.workspace }}
       run: python3 "$CI_ROOT/scripts/common_test_broker.py" --source-root "$SOURCE_ROOT" --source-repository "$SOURCE_REPOSITORY"
-        --step "$COMMON_TEST_STEP" --directory "$RUNNER_TEMP/common-test-evidence"
+        --step "$COMMON_TEST_STEP" --scope "same-tree-healthcare-python-main-${{ matrix.shard }}" --directory "$RUNNER_TEMP/common-test-evidence"
     - name: Run complete validation stage
       env:
         CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
@@ -316,7 +316,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 9d92115f0dc15b586121528af247c8360fc24dcf
+        ref: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -326,7 +326,7 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       working-directory: ${{ github.workspace }}
       run: python3 "$CI_ROOT/scripts/common_test_broker.py" --source-root "$SOURCE_ROOT" --source-repository "$SOURCE_REPOSITORY"
-        --step "$COMMON_TEST_STEP" --directory "$RUNNER_TEMP/common-test-evidence"
+        --step "$COMMON_TEST_STEP" --scope same-tree-healthcare-capacity --directory "$RUNNER_TEMP/common-test-evidence"
     - name: Run complete validation stage
       run: 'bash "$CI_ROOT/scripts/healthcare/check" capacity
 
@@ -361,11 +361,19 @@ jobs:
   api-contract:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'API contract (metadata only)' || 'API contract' }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      checks: read
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
     - python-quality
     - readability-preflight
+    env:
+      COMMON_TEST_EQUIVALENCE: 'true'
+      COMMON_TEST_STEP: Run complete validation stage
     defaults:
       run:
         shell: bash
@@ -375,11 +383,17 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 9d92115f0dc15b586121528af247c8360fc24dcf
+        ref: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
+    - name: Prepare read-only common-test evidence
+      env:
+        GH_TOKEN: ${{ github.token }}
+      working-directory: ${{ github.workspace }}
+      run: python3 "$CI_ROOT/scripts/common_test_broker.py" --source-root "$SOURCE_ROOT" --source-repository "$SOURCE_REPOSITORY"
+        --step "$COMMON_TEST_STEP" --scope same-tree-healthcare-api-contract --directory "$RUNNER_TEMP/common-test-evidence"
     - name: Run complete validation stage
       run: 'bash "$CI_ROOT/scripts/healthcare/check" api-contract
 
@@ -388,16 +402,32 @@ jobs:
         git diff --cached --exit-code
 
         test -z "$(git ls-files --others --exclude-standard)"'
+    - name: Upload verified common-test measurements
+      if: success() && env.COMMON_TEST_ARTIFACT_NAME != ''
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: ${{ env.COMMON_TEST_ARTIFACT_NAME }}
+        path: ${{ runner.temp }}/common-test-measurements
+        if-no-files-found: error
+        retention-days: 1
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
   rust-scanner:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'Rust tests (metadata only)' || 'Rust tests' }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      checks: read
     runs-on: ubuntu-latest
     timeout-minutes: 45
     needs:
     - python-quality
     - readability-preflight
+    env:
+      COMMON_TEST_EQUIVALENCE: 'true'
+      COMMON_TEST_STEP: Run complete validation stage
     defaults:
       run:
         shell: bash
@@ -407,7 +437,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 9d92115f0dc15b586121528af247c8360fc24dcf
+        ref: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -423,6 +453,12 @@ jobs:
         printf ''%s\n'' "$tools_directory" >> "$GITHUB_PATH"
 
         '
+    - name: Prepare read-only common-test evidence
+      env:
+        GH_TOKEN: ${{ github.token }}
+      working-directory: ${{ github.workspace }}
+      run: python3 "$CI_ROOT/scripts/common_test_broker.py" --source-root "$SOURCE_ROOT" --source-repository "$SOURCE_REPOSITORY"
+        --step "$COMMON_TEST_STEP" --scope same-tree-healthcare-rust-scanner --directory "$RUNNER_TEMP/common-test-evidence"
     - name: Run complete validation stage
       run: 'bash "$CI_ROOT/scripts/healthcare/check" rust
 
@@ -439,6 +475,14 @@ jobs:
         if-no-files-found: error
         retention-days: 1
       id: coverage-artifact
+    - name: Upload verified common-test measurements
+      if: success() && env.COMMON_TEST_ARTIFACT_NAME != ''
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: ${{ env.COMMON_TEST_ARTIFACT_NAME }}
+        path: ${{ runner.temp }}/common-test-measurements
+        if-no-files-found: error
+        retention-days: 1
     outputs:
       artifact_id: ${{ steps.coverage-artifact.outputs.artifact-id }}
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
@@ -460,14 +504,28 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 9d92115f0dc15b586121528af247c8360fc24dcf
+        ref: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
+    - name: Restore Docker Buildx layer cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ${{ runner.temp }}/buildx-cache
+        key: healthcare-buildx-v1-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: 'healthcare-buildx-v1-
+
+          '
+    - name: Prepare Docker engine for attested export
+      if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+      run: python3 "$CI_ROOT/scripts/source_image.py" prepare-engine
     - name: Run complete validation stage
       env:
         PUBLIC_CI_EXPORT_IMAGE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' && '1' || '0' }}
+        PUBLIC_CI_BUILDX_CACHE: '1'
+        PUBLIC_CI_BUILDX_CACHE_DIR: ${{ runner.temp }}/buildx-cache
+        PUBLIC_CI_BUILDX_CACHE_WRITE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' && '1' || '0' }}
         GH_TOKEN: ${{ github.token }}
       run: 'bash "$CI_ROOT/scripts/healthcare/check" container-package
 
@@ -476,6 +534,12 @@ jobs:
         git diff --cached --exit-code
 
         test -z "$(git ls-files --others --exclude-standard)"'
+    - name: Save Docker Buildx layer cache
+      if: success() && github.event_name == 'push' && github.ref == 'refs/heads/dev'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ${{ runner.temp }}/buildx-cache
+        key: healthcare-buildx-v1-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
     - name: Upload tested DEV image
       id: image-artifact
       if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
@@ -507,7 +571,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 9d92115f0dc15b586121528af247c8360fc24dcf
+        ref: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -525,6 +589,11 @@ jobs:
   worker-queue-smoke:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'Worker queue tests (metadata only)' || 'Worker queue tests' }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      checks: read
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs:
@@ -536,6 +605,9 @@ jobs:
         ports:
         - 6379:6379
         options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      COMMON_TEST_EQUIVALENCE: 'true'
+      COMMON_TEST_STEP: Run complete validation stage
     defaults:
       run:
         shell: bash
@@ -545,11 +617,17 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 9d92115f0dc15b586121528af247c8360fc24dcf
+        ref: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
       uses: ./ci/scripts/healthcare/setup
+    - name: Prepare read-only common-test evidence
+      env:
+        GH_TOKEN: ${{ github.token }}
+      working-directory: ${{ github.workspace }}
+      run: python3 "$CI_ROOT/scripts/common_test_broker.py" --source-root "$SOURCE_ROOT" --source-repository "$SOURCE_REPOSITORY"
+        --step "$COMMON_TEST_STEP" --scope same-tree-healthcare-worker-queue --directory "$RUNNER_TEMP/common-test-evidence"
     - name: Run complete validation stage
       env:
         HLTHPRT_REDIS_ADDRESS: redis://127.0.0.1:6379
@@ -560,11 +638,24 @@ jobs:
         git diff --cached --exit-code
 
         test -z "$(git ls-files --others --exclude-standard)"'
+    - name: Upload verified common-test measurements
+      if: success() && env.COMMON_TEST_ARTIFACT_NAME != ''
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: ${{ env.COMMON_TEST_ARTIFACT_NAME }}
+        path: ${{ runner.temp }}/common-test-measurements
+        if-no-files-found: error
+        retention-days: 1
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
   address-canonical-db-tests:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'address-canonical-db-tests (metadata only)' || matrix.label }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      checks: read
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.shard == 'cms-successor' && 30 || 20 }}
     needs:
@@ -582,6 +673,8 @@ jobs:
         options: --health-cmd "pg_isready -U postgres -d ptg2_v3_lifecycle_test_ci_runner" --health-interval 2s --health-timeout
           5s --health-retries 25
     env:
+      COMMON_TEST_EQUIVALENCE: 'true'
+      COMMON_TEST_STEP: Run complete validation stage
       PYTEST_ADDOPTS: --cov-config=test-coverage.ini --cov=api --cov=db --cov=process --cov=public_evidence --cov=service
         --cov=main --cov-branch --cov-report= --cov-append
       HLTHPRT_DB_DRIVER: asyncpg
@@ -602,7 +695,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 9d92115f0dc15b586121528af247c8360fc24dcf
+        ref: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -638,10 +731,17 @@ jobs:
         artifact-ids: ${{ needs.public-hygiene.outputs.rust_artifact_id || 'missing' }}
         digest-mismatch: error
         path: rust-debug-binaries
+    - name: Prepare read-only common-test evidence
+      env:
+        GH_TOKEN: ${{ github.token }}
+      working-directory: ${{ github.workspace }}
+      run: python3 "$CI_ROOT/scripts/common_test_broker.py" --source-root "$SOURCE_ROOT" --source-repository "$SOURCE_REPOSITORY"
+        --step "$COMMON_TEST_STEP" --scope "same-tree-healthcare-postgres-${{ matrix.shard }}" --directory "$RUNNER_TEMP/common-test-evidence"
     - name: Run complete validation stage
       env:
         HLTHPRT_DB_HOST: 127.0.0.1
         CI_POSTGRES_SERVICE_ID: ${{ job.services.postgres.id }}
+        COMMON_TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
         CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
       run: 'bash "$CI_ROOT/scripts/healthcare/check" postgres "$CI_SHARD"
 
@@ -669,6 +769,14 @@ jobs:
       run: '[[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
 
         printf ''%s=%s\n'' "$ARTIFACT_OUTPUT" "$ARTIFACT_ID" >> "$GITHUB_OUTPUT"'
+    - name: Upload verified common-test measurements
+      if: success() && env.COMMON_TEST_ARTIFACT_NAME != ''
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: ${{ env.COMMON_TEST_ARTIFACT_NAME }}
+        path: ${{ runner.temp }}/common-test-measurements
+        if-no-files-found: error
+        retention-days: 1
     outputs:
       artifact_core_services: ${{ steps.coverage-output.outputs.artifact_core_services }}
       artifact_core_services_2: ${{ steps.coverage-output.outputs.artifact_core_services_2 }}
@@ -927,6 +1035,11 @@ jobs:
   fhir-catalog-integration:
     name: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base
       && 'FHIR catalog integration (metadata only)' || 'FHIR catalog integration' }}
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      checks: read
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs:
@@ -944,6 +1057,8 @@ jobs:
         options: --health-cmd "pg_isready -U postgres -d ptg2_v3_lifecycle_test_ci_runner" --health-interval 2s --health-timeout
           5s --health-retries 25
     env:
+      COMMON_TEST_EQUIVALENCE: 'true'
+      COMMON_TEST_STEP: Run complete validation stage
       PYTEST_ADDOPTS: ''
       HLTHPRT_DB_DRIVER: asyncpg
       HLTHPRT_DB_PORT: '5432'
@@ -963,7 +1078,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 9d92115f0dc15b586121528af247c8360fc24dcf
+        ref: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
         path: ci
         persist-credentials: false
     - name: Prepare source and toolchain
@@ -1005,10 +1120,18 @@ jobs:
         digest-mismatch: error
         path: rust-debug-binaries
       if: steps.catalog-capability.outputs.present == 'true'
+    - name: Prepare read-only common-test evidence
+      env:
+        GH_TOKEN: ${{ github.token }}
+      working-directory: ${{ github.workspace }}
+      run: python3 "$CI_ROOT/scripts/common_test_broker.py" --source-root "$SOURCE_ROOT" --source-repository "$SOURCE_REPOSITORY"
+        --step "$COMMON_TEST_STEP" --scope same-tree-healthcare-postgres-fhir-catalog-integration --directory "$RUNNER_TEMP/common-test-evidence"
+      if: steps.catalog-capability.outputs.present == 'true'
     - name: Run complete validation stage
       env:
         HLTHPRT_DB_HOST: 127.0.0.1
         CI_POSTGRES_SERVICE_ID: ${{ job.services.postgres.id }}
+        COMMON_TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
         CI_RUST_BINARIES: ${{ github.workspace }}/rust-debug-binaries
       run: 'bash "$CI_ROOT/scripts/healthcare/check" postgres "$CI_SHARD"
 
@@ -1030,6 +1153,14 @@ jobs:
         retention-days: 1
         if-no-files-found: error
       if: steps.catalog-capability.outputs.present == 'true'
+    - name: Upload verified common-test measurements
+      if: steps.catalog-capability.outputs.present == 'true' && success() && env.COMMON_TEST_ARTIFACT_NAME != ''
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: ${{ env.COMMON_TEST_ARTIFACT_NAME }}
+        path: ${{ runner.temp }}/common-test-measurements
+        if-no-files-found: error
+        retention-days: 1
     if: ${{ !(github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.title && !github.event.changes.base)
       && (success()) }}
   measurement:
@@ -1066,7 +1197,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 9d92115f0dc15b586121528af247c8360fc24dcf
+        ref: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -1192,7 +1323,7 @@ jobs:
       actions: write
       packages: write
     env:
-      CI_REVISION: 9d92115f0dc15b586121528af247c8360fc24dcf
+      CI_REVISION: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
       PYTHONDONTWRITEBYTECODE: '1'
       IMAGE_ARTIFACT_ID: ${{ needs.container-package.outputs.image_artifact_id }}
       MEASUREMENT_ARTIFACT_ID: ${{ needs.measurement.outputs.measurement_artifact_id }}
@@ -1201,7 +1332,7 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         repository: EndurantDevs/endurant-ci
-        ref: 9d92115f0dc15b586121528af247c8360fc24dcf
+        ref: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
         path: ci
         persist-credentials: false
     - name: Install pinned uv
@@ -1282,7 +1413,7 @@ jobs:
     - dev
 env:
   CI_ROOT: ${{ github.workspace }}/ci
-  CI_REVISION: 9d92115f0dc15b586121528af247c8360fc24dcf
+  CI_REVISION: 3c168a57ed3678da12b085ad5e1accbb00fe7be6
   SOURCE_ROOT: ${{ github.workspace }}/source
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: '1'

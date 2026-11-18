@@ -677,6 +677,11 @@ def verify_report_artifact(
     report_path = artifact_directory / specification["path"]
     expected = _report_provenance(root, report_name, report_path, base_sha, head_sha)
     provenance = _read_json(provenance_path, "coverage provenance")
+    if "common_test_execution" in provenance:
+        # The controller authenticates this reference; here it only has to be well formed.
+        if not isinstance(provenance["common_test_execution"], dict):
+            raise CoverageForecastError(f"{report_name}: common test execution must be an object")
+        expected["common_test_execution"] = provenance["common_test_execution"]
     if provenance != expected:
         raise CoverageForecastError(f"{report_name}: coverage provenance differs from the exact CI input")
     return report_path
