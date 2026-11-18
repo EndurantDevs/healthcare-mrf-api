@@ -226,6 +226,9 @@ def test_child_batch_limit_reserves_all_scalar_and_context_rows():
     [
         ("custom_import_build_page_too_large", "P0001", True),
         ("custom_import_build_page_too_large", "57014", False),
+        ("canceling statement due to statement timeout", "57014", True),
+        ("canceling statement due to user request", "57014", False),
+        ("prefix canceling statement due to statement timeout", "57014", False),
         ("custom_import_build_page_too_large", None, False),
         ("custom_import_build_structure_mismatch", "P0001", False),
         ("prefix custom_import_build_page_too_large", "P0001", False),
@@ -646,6 +649,47 @@ async def test_scan_renewal_preserves_the_primary_error():
         async with graph._renew_while_reading(None, _request()):
             raise primary
     assert failure.value is primary
+
+
+@pytest.mark.parametrize(
+    "fault", ["timeout", "user_cancel", "rollback", "invalidated", "unrelated", "page_bound", "lease"]
+)
+async def test_scan_renewal_retries_only_a_rolled_back_statement_timeout(monkeypatch, fault):
+    sqlstate_by_fault = {"unrelated": "XX000", "page_bound": "P0001"}
+    message_by_fault = {
+        "user_cancel": "canceling statement due to user request",
+        "page_bound": "custom_import_build_page_too_large",
+    }
+    original = RuntimeError("statement timeout")
+    original.sqlstate = sqlstate_by_fault.get(fault, "57014")
+    original.diag = SimpleNamespace(
+        message_primary=message_by_fault.get(fault, "canceling statement due to statement timeout")
+    )
+    failure = DBAPIError(None, None, original, connection_invalidated=fault == "invalidated")
+    failure._custom_import_retry_blocked = fault == "rollback"
+    if fault == "lease":
+        failure = LeaseAuthorityLost("lease expired")
+    resumed = asyncio.Event()
+    attempt = AsyncMock(side_effect=[failure, None])
+
+    async def heartbeat(factory, request):
+        await attempt(factory, request)
+        resumed.set()
+
+    monkeypatch.setattr(graph, "_heartbeat", heartbeat)
+
+    async def scan():
+        async with graph._renew_while_reading(None, _request(lease_seconds=1)):
+            await asyncio.wait_for(resumed.wait(), 2)
+
+    if fault == "timeout":
+        await scan()
+        assert attempt.await_count == 2
+    else:
+        with pytest.raises(type(failure)) as caught:
+            await scan()
+        assert caught.value is failure
+        assert attempt.await_count == 1
 
 
 def _session_contexts(transaction_exit, session_exit):

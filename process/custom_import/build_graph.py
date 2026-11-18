@@ -442,7 +442,16 @@ async def _renew_while_reading(session_factory, request):
     async def _renew():
         while True:
             await asyncio.sleep(min(5.0, request.lease_seconds / 3))
-            await _heartbeat(session_factory, request)
+            try:
+                await _heartbeat(session_factory, request)
+            except DBAPIError as error:
+                # A page writer can hold these locks through several bounded statements.
+                if (
+                    error.connection_invalidated
+                    or getattr(error.orig, "sqlstate", None) != "57014"
+                    or not _is_child_page_bound_error(error)
+                ):
+                    raise
 
     try:
         async with asyncio.TaskGroup() as tasks:
@@ -1188,7 +1197,10 @@ def _is_child_page_bound_error(error):
     message = getattr(getattr(original, "__cause__", None), "message", None)
     if message is None:
         message = getattr(getattr(original, "diag", None), "message_primary", None)
-    return getattr(original, "sqlstate", None) == "P0001" and message == "custom_import_build_page_too_large"
+    return (getattr(original, "sqlstate", None), message) in {
+        ("P0001", "custom_import_build_page_too_large"),
+        ("57014", "canceling statement due to statement timeout"),
+    }
 
 
 async def _append_children(session_factory, request, registry, family_input):

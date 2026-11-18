@@ -766,3 +766,41 @@ async def test_compact_metadata_upgrade_enforces_checks_and_refuses_lossy_downgr
                 (3, "custom-import/materialization/v2"),
             ]
         assert await connection.scalar(text("SELECT to_regclass('pg_temp.custom_import_generation_seal')")) is None
+
+
+async def test_background_renewal_recovers_after_a_page_holds_its_native_locks(monkeypatch):
+    original_heartbeat = graph._heartbeat
+    blocked, renewed = asyncio.Event(), asyncio.Event()
+    timeouts = []
+
+    async def heartbeat(factory, request):
+        try:
+            await original_heartbeat(factory, replace(request, statement_timeout_ms=50))
+        except DBAPIError as failure:
+            assert failure.orig.sqlstate == "57014"
+            assert graph._is_child_page_bound_error(failure)
+            timeouts.append(failure)
+            blocked.set()
+            raise
+        renewed.set()
+
+    async with _source_case() as case:
+        request = await _request_for(case, _records(1))
+        staged = await stage_segmented_source(case.sessions, request)
+        request = replace(request, lease_seconds=3)
+        monkeypatch.setattr(graph, "_heartbeat", heartbeat)
+        async with graph._renew_while_reading(case.sessions, request):
+            async with graph._page_session(case.sessions, request, staged.build_id) as (session, build):
+                for _ in range(3):
+                    await graph._prepare_statement(session)
+                    assert await session.scalar(select(1)) == 1
+                await asyncio.wait_for(blocked.wait(), 2)
+                assert not renewed.is_set()
+                assert build.source_occurrence_count == 2
+            await asyncio.wait_for(renewed.wait(), 2)
+        assert len(timeouts) == 1
+        async with case.sessions() as session:
+            lease = await session.get(CustomImportLease, request.execution_id)
+            assert lease.fence == request.fence
+            assert bytes(lease.token_sha256) == lifecycle.lease_token_sha256(request.lease_token)
+            assert (await session.get(CustomImportBuildAttempt, staged.build_id)).phase == "graph"
