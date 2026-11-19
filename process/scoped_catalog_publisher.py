@@ -16,6 +16,8 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from process.scoped_catalog_layout import DATA_SCHEMA, OWNER_ROLE, STAGE_ROLE
+
 PREFIX = "HLTHPRT_SCOPED_CATALOG_PUBLISHER_"
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z")
 
@@ -52,6 +54,10 @@ class PublisherSettings:
                     for name in names
                 )
                 or values_by_field["OWNER_ROLE"] in readers
+                or (
+                    values_by_field["SCHEMA"] == DATA_SCHEMA
+                    and (values_by_field["OWNER_ROLE"] != OWNER_ROLE or STAGE_ROLE not in readers)
+                )
             ):
                 raise ValueError
             return cls(

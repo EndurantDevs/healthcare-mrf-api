@@ -16,6 +16,7 @@ from db.connection import init_db
 from db.models import CodeCatalog, db
 from process.ext.utils import ensure_database
 from process.scoped_catalog_handoff import capture_catalog_expected, prepare_catalog_handoff
+from process.scoped_catalog_layout import DATA_SCHEMA, catalog_schema
 
 DEFAULT_POS_URL = "https://www.cms.gov/medicare/coding-billing/place-of-service-codes/code-sets"
 DEFAULT_RC_URL = "https://bluebutton.cms.gov/fhir/CodeSystem/CLM-REV-CNTR-CD/"
@@ -324,7 +325,7 @@ async def import_code_sets(test_mode: bool = False, *, _control_context=None) ->
         raise RuntimeError(f"CMS Blue Button revenue-code source produced no code rows: {rc_url}")
 
     modifier_rows = modifier_code_rows()
-    if mode == "native" and _control_context is None:
+    if mode == "native" and _control_context is None and catalog_schema(schema) != DATA_SCHEMA:
         await _ensure_code_catalog(schema)
     pos_payloads, rc_payloads, modifier_payloads = map(_code_payloads, (pos_rows, rc_rows, modifier_rows))
     pos_count, rc_count, modifier_count = map(len, (pos_payloads, rc_payloads, modifier_payloads))

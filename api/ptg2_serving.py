@@ -40,7 +40,6 @@ from api.code_systems import (
 )
 from api.endpoint.pagination import PaginationParams
 from api.network_address_scope import current_network_address_scope, scoped_address_parameters
-from api.network_read_execution import qualified_relation_sql
 from api.plan_pricing_em_distance import search_plan_pricing_em_distance
 from api.plan_pricing_projection import (
     PlanPricingProjectionUnavailable,
@@ -130,7 +129,7 @@ from api.ptg2_candidate_audit_capacity import (
 from api.ptg2_code_context import (
     _resolve_ptg2_code_search_context,
 )
-from api.ptg2_code_details import _enrich_ptg2_code_details
+from api.ptg2_code_details import _catalog_detail_query, _enrich_ptg2_code_details
 from api.ptg2_code_filters import (
     INFERRED_PROVIDER_TAXONOMY_RULES,
     INTERNAL_PROCEDURE_CODE_SYSTEM,
@@ -17746,27 +17745,9 @@ async def _procedure_details_for_rows(
     )
     if not lookup_keys:
         return {}
-    clauses: list[str] = []
-    query_parameters_by_name: dict[str, Any] = {}
-    for idx, (code_system, code) in enumerate(lookup_keys):
-        clauses.append(f"(code_system = :code_system_{idx} AND code = :code_{idx})")
-        query_parameters_by_name[f"code_system_{idx}"] = code_system
-        query_parameters_by_name[f"code_{idx}"] = code
-    catalog_relation = f"{PTG2_SCHEMA}.code_catalog"
-    if getattr(session, "info", {}).get("api_reader_verified") is True:
-        catalog_relation = qualified_relation_sql(PTG2_SCHEMA, "code_catalog")
+    query, parameters = _catalog_detail_query(session, PTG2_SCHEMA, lookup_keys)
     try:
-        procedure_catalog_query = await _optional_ptg2_query(
-            session,
-            text(
-                f"""
-                SELECT code_system, code, display_name, short_description
-                FROM {catalog_relation}
-                WHERE {" OR ".join(clauses)}
-                """
-            ),
-            query_parameters_by_name,
-        )
+        procedure_catalog_query = await _optional_ptg2_query(session, query, parameters)
     except ServiceUnavailable:
         raise
     except Exception:

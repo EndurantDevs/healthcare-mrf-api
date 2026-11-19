@@ -5,6 +5,7 @@ import json
 import re
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -81,6 +82,49 @@ def _request():
 
 def _spec(request):
     return launcher.selected_spec(workers._BY_IMPORTER_ROLE[(request["importer"], "start")], request)
+
+
+def test_code_sets_image_is_shared_only_by_its_two_launch_roles(monkeypatch):
+    image = "registry.example/image@sha256:" + "a" * 64
+    generic = "registry.example/image@sha256:" + "b" * 64
+    monkeypatch.setenv("HLTHPRT_CODE_SETS_WORKER_IMAGE", image)
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_IMAGE", generic)
+    start = workers._BY_IMPORTER_ROLE[("code-sets", "start")]
+    continuation = _spec(_request())
+    assert workers._configured_worker_job_image(start) == image
+    assert workers._configured_worker_job_image(continuation, _request()) == image
+    for other in (
+        replace(continuation, role="finish"),
+        replace(continuation, queue="arq:Other"),
+        replace(continuation, worker_class="process.Other"),
+        replace(continuation, importers=("other",)),
+        replace(workers._BY_IMPORTER_ROLE[("ms-drg", "start")], role=launcher.ROLE),
+    ):
+        assert workers._configured_worker_job_image(other) == generic
+    monkeypatch.setenv("HLTHPRT_CODE_SETS_WORKER_IMAGE", "registry.example/image:latest")
+    with pytest.raises(ValueError, match="code_sets_worker_image_invalid"):
+        workers._configured_worker_job_image(start)
+    monkeypatch.delenv("HLTHPRT_CODE_SETS_WORKER_IMAGE")
+    assert workers._configured_worker_job_image(continuation, _request()) == generic
+
+
+def test_split_requires_one_compatible_image_for_both_producers(monkeypatch):
+    monkeypatch.setenv("HLTHPRT_SCOPED_CATALOG_DATA_SCHEMA", "mrf_scoped_catalog")
+    monkeypatch.delenv("HLTHPRT_CODE_SETS_WORKER_IMAGE", raising=False)
+    image = "registry.example/image@sha256:" + "a" * 64
+    for importer in ("code-sets", "ms-drg"):
+        start = workers._BY_IMPORTER_ROLE[(importer, "start")]
+        continuation = replace(start, role=launcher.ROLE)
+        with pytest.raises(ValueError, match="code_sets_worker_image_invalid"):
+            workers._configured_worker_job_image(start)
+        with monkeypatch.context() as configured:
+            configured.setenv("HLTHPRT_CODE_SETS_WORKER_IMAGE", image)
+            assert workers._configured_worker_job_image(start) == image
+            assert workers._configured_worker_job_image(continuation) == image
+            assert launcher.acquisition_environment(start) == [
+                {"name": "HLTHPRT_SCOPED_CATALOG_DATA_SCHEMA", "value": "mrf_scoped_catalog"}
+            ]
+    assert launcher.acquisition_environment(workers._BY_IMPORTER_ROLE[("npi", "start")]) == []
 
 
 def test_publisher_manifest_has_only_fixed_secret_refs_and_logical_arguments(monkeypatch):

@@ -3,8 +3,11 @@
 
 import json
 
-from sqlalchemy import and_, bindparam, exists, func, select, text, union, union_all
+from sanic.exceptions import InvalidUsage
+from sqlalchemy import and_, bindparam, column, exists, func, or_, select, table, text, union, union_all
 from sqlalchemy.dialects import postgresql
+
+from process.scoped_catalog_layout import CONTROL_SCHEMA, DATA_SCHEMA, catalog_schema
 
 _PRESENT_SQL = """SELECT array_agg(c.relname::text) FROM pg_catalog.pg_class c
  JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
@@ -124,9 +127,107 @@ def claims_dictionary_tables(session):
     )
 
 
+def claims_catalog_table(session):
+    """Compose scoped data only for callers that read catalog rows, not crosswalk-only reads."""
+    from db.models import CodeCatalog
+
+    return catalog_read_table(CodeCatalog, claims_dictionary_tables(session)[0])
+
+
+def catalog_read_table(model, shared=None, *, schema=None):
+    """Merge the protected catalog with unrelated legacy rows under the existing read snapshot."""
+    source = model.__table__
+    schema = schema or source.schema or CONTROL_SCHEMA
+    active = catalog_schema(schema)
+    if shared is None:
+        shared = source if schema == source.schema else _catalog_columns(source, schema)
+    if active == schema:
+        return shared
+    from process import scoped_catalog_publication as publication
+
+    owned_sources = publication.catalog_sources(model)
+    if not owned_sources:
+        raise ValueError("protected catalog reader model differs")
+    protected = _catalog_columns(source, active)
+    shared_rows = select(*shared.c).where(
+        or_(shared.c.source.is_(None), shared.c.source.not_in(owned_sources)),
+        ~exists(
+            select(1)
+            .where(and_(*(shared.c[key.name] == protected.c[key.name] for key in source.primary_key.columns)))
+            .correlate(shared)
+        ),
+    )
+    return union_all(shared_rows, select(*protected.c)).subquery(source.name)
+
+
+def _catalog_columns(source, schema):
+    """Model the read columns without copying index and constraint metadata."""
+    return table(source.name, *(column(field.name, field.type) for field in source.c), schema=schema)
+
+
+def catalog_read_relation_sql(model, schema, legacy_relation, *, keys):
+    """Use the same compiled catalog projection in the fixed SQL procedure lookups."""
+    protected_systems = {"POS", "RC", "MODIFIER", "MS_DRG", "ICD10CM", "ICD10PCS"}
+    if catalog_schema(schema) == schema or not any(system in protected_systems for system, _ in keys):
+        return legacy_relation
+    table = catalog_read_table(model, schema=schema)
+    query = table.element.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+    return f"({query}) AS scoped_reference_rows"
+
+
+def uses_scoped_catalog(request, *, collection_kind=None):
+    """Select named locks only for request surfaces that can read the scoped catalog."""
+    if catalog_schema(CONTROL_SCHEMA) != DATA_SCHEMA:
+        return False
+    if collection_kind is not None:
+        return collection_kind == "by-service"
+    path = request.path.rstrip("/")
+    if path == "/api/v1/extensions/custom-import/providers/by-service":
+        return True
+    if path == "/api/v1/codes" or path.startswith("/api/v1/codes/"):
+        return not path.endswith("/related")
+    if path.startswith("/api/v1/clinical/"):
+        parts = path.split("/")
+        return parts[4] in {"concepts", "conditions", "treatments", "relationships"} or (
+            parts[4] == "clinical-areas" and len(parts) == 7 and parts[-1] in {"conditions", "treatments"}
+        )
+    if not path.startswith("/api/v1/pricing/"):
+        return False
+    from api.endpoint.pricing import _parse_bool
+    from api.ptg2_response import _is_request_flag_enabled
+
+    args = getattr(request, "args", {})
+    if path.endswith(("/estimated-cost-level", "/by-procedure", "/search-by-procedure", "/by-service")) or (
+        _is_request_flag_enabled(args.get("include_code_details"))
+    ):
+        return True
+    parts = path.removeprefix("/api/v1/pricing/").split("/")
+    if len(parts) == 3 and (parts[0], parts[2]) in {("providers", "procedures"), ("physicians", "services")}:
+        if any(
+            str(args.get(name) or "").strip()
+            for name in ("plan_id", "plan_external_id", "source_key", "snapshot_id", "plan_release_id")
+        ):
+            return True
+    try:
+        return _parse_bool(args.get("expand_codes"), "expand_codes")
+    except InvalidUsage:
+        return False
+
+
+async def lock_scoped_catalog_reader(session):
+    """Keep each selected catalog name stable before a verified Reader takes its snapshot."""
+    if catalog_schema(CONTROL_SCHEMA) != DATA_SCHEMA or session.info.get("scoped_catalog_reader_pinned"):
+        return
+    from process.reference_family_archive import _lock_family
+    from process.scoped_catalog_named_storage import MODELS
+
+    await _lock_family(session, DATA_SCHEMA, tuple(model.__tablename__ for model in MODELS), "ACCESS SHARE")
+    session.info["scoped_catalog_reader_pinned"] = True
+
+
 async def _query_catalog_neighbors(session, pairs: set[tuple[str, str]]) -> set[tuple[str, str]]:
     """Return same-name neighbors from the request's pinned code catalog."""
-    code_catalog_table = claims_dictionary_tables(session)[0]
+    code_catalog_table = claims_catalog_table(session)
     if not pairs:
         return set()
 

@@ -12,6 +12,7 @@ from process import reference_family_archive as native
 from process import scoped_catalog_named_generation as generations
 from process import scoped_catalog_named_storage as storage
 from process import scoped_catalog_publication as publication
+from process.scoped_catalog_layout import DATA_SCHEMA, STAGE_ROLE, catalog_schema, control_schema
 from process.scoped_catalog_retention import canonical_metadata
 
 CONTRACT = "scoped-catalog-handoff.v2"
@@ -62,7 +63,7 @@ async def _run(session, schema, attempt, *, states, lock=True):
         (
             await session.execute(
                 text(
-                    f"SELECT * FROM {storage.qualified(schema, 'import_run')} WHERE run_id=:run_id"
+                    f"SELECT * FROM {storage.qualified(control_schema(schema), 'import_run')} WHERE run_id=:run_id"
                     + (" FOR UPDATE" if lock else "")
                 ),
                 {"run_id": attempt["run_id"]},
@@ -92,6 +93,7 @@ async def capture_expected(database, ctx, *, importer, schema):
     attempt = attempt_from_context(ctx)
     if importer not in IMPORTERS:
         raise RuntimeError("catalog producer is unsupported")
+    schema = catalog_schema(schema)
     async with database.transaction() as session:
         await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
         run = await _run(
@@ -128,28 +130,35 @@ async def _prepare_input(session, importer, schema, payloads):
     spec = publication.input_spec(importer)
     if set(payloads) != set(spec.table_names):
         raise RuntimeError("catalog input family differs")
+    previous_role = None
+    if schema == DATA_SCHEMA:
+        previous_role = await session.scalar(text("SELECT current_user"))
+        await session.execute(text(f"SET LOCAL ROLE {native._quoted(STAGE_ROLE)}"))
     dataset_id = uuid4()
     stage = await storage.create_stage(session, schema, spec.model_types, dataset_id)
     for model in spec.model_types:
         columns = tuple(model.__table__.columns.keys())
-        rows = payloads[model.__tablename__]
-        if any(set(row) - set(columns) for row in rows):
+        model_rows = payloads[model.__tablename__]
+        if any(set(row_payload) - set(columns) for row_payload in model_rows):
             raise RuntimeError("catalog input columns differ")
-        for start in range(0, len(rows), 5000):
-            records = [tuple(row.get(name) for name in columns) for row in rows[start : start + 5000]]
+        for start in range(0, len(model_rows), 5000):
+            batch_records = [
+                tuple(row_payload.get(name) for name in columns) for row_payload in model_rows[start : start + 5000]
+            ]
             await native.native_copy_record_batch(
                 session,
                 model,
                 schema_name=stage,
                 table_name=model.__tablename__,
                 columns=columns,
-                records=records,
+                records=batch_records,
             )
     await storage.complete_stage(session, stage, spec.model_types)
     await publication.validate_catalog_semantics(session, spec, stage)
-    return {"dataset_id": str(dataset_id), "schema_name": stage}, await storage.table_receipts(
-        session, stage, spec.model_types
-    )
+    receipts = await storage.table_receipts(session, stage, spec.model_types)
+    if previous_role is not None:
+        await session.execute(text(f"SET LOCAL ROLE {native._quoted(previous_role)}"))
+    return {"dataset_id": str(dataset_id), "schema_name": stage}, receipts
 
 
 def validate_tables(value, names):
@@ -253,7 +262,7 @@ async def _record_handoff(session, schema, attempt, handoff_by_field):
     """Attach the validated input only to its still-running attempt in this transaction."""
     changed = await session.scalar(
         text(
-            f"UPDATE {storage.qualified(schema, 'import_run')} SET status='finalizing',phase_detail=:phase,"
+            f"UPDATE {storage.qualified(control_schema(schema), 'import_run')} SET status='finalizing',phase_detail=:phase,"
             "heartbeat_at=timezone('UTC',clock_timestamp()),metrics=(COALESCE(metrics::jsonb,'{}'::jsonb)||"
             "jsonb_build_object('scoped_catalog_handoff',CAST(:handoff AS jsonb)))::json "
             "WHERE run_id=:run_id AND status='running' AND finished_at IS NULL "
@@ -265,10 +274,22 @@ async def _record_handoff(session, schema, attempt, handoff_by_field):
         raise RuntimeError("catalog preparation attempt changed")
 
 
+async def _recover_preparation(database, ctx, handoff_by_field):
+    """Reconcile an ambiguous COMMIT without letting the ordinary worker retry it."""
+    from process.scoped_catalog_handoff import _reconcile_catalog_handoff
+
+    try:
+        return await _reconcile_catalog_handoff(database, handoff_by_field)
+    except BaseException:
+        ctx.setdefault("context", {})["scoped_catalog_commit_unknown"] = True
+        raise
+
+
 async def prepare(database, ctx, *, importer, schema, payloads, options, metrics):
     """Commit one validated input and its managed continuation without publishing live rows."""
     if importer not in IMPORTERS:
         raise RuntimeError("catalog producer is unsupported")
+    schema = catalog_schema(schema)
     if ctx is None:
         async with database.transaction() as session:
             incoming, tables = await _prepare_input(session, importer, schema, payloads)
@@ -311,16 +332,7 @@ async def prepare(database, ctx, *, importer, schema, payloads, options, metrics
             validate_handoff(handoff_by_field)
             await _record_handoff(session, schema, attempt, handoff_by_field)
     except BaseException:
-        if handoff_by_field is None:
-            raise
-        from process.scoped_catalog_handoff import _reconcile_catalog_handoff
-
-        try:
-            persisted = await _reconcile_catalog_handoff(database, handoff_by_field)
-        except BaseException:
-            ctx.setdefault("context", {})["scoped_catalog_commit_unknown"] = True
-            raise
-        if not persisted:
+        if handoff_by_field is None or not await _recover_preparation(database, ctx, handoff_by_field):
             raise
     result_by_field = {**metrics, "status": "finalizing", METRIC: handoff_by_field}
     ctx.setdefault("context", {}).update(control_run_handoff_committed=True, _control_committed_result=result_by_field)

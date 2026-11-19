@@ -16,6 +16,7 @@ from process import scoped_catalog_named_generation as generations
 from process import scoped_catalog_named_retention as retention
 from process import scoped_catalog_named_storage as storage
 from process import scoped_catalog_publication as publication
+from process.scoped_catalog_layout import CONTROL_SCHEMA, DATA_SCHEMA, FENCE_SCHEMA, FENCE_VIEW, control_schema
 from process.scoped_catalog_retention import canonical_metadata
 
 
@@ -155,7 +156,8 @@ async def _finish(session, handoff, *, status, metric, receipt):
         }
     changed = await session.scalar(
         text(
-            f"UPDATE {storage.qualified(handoff['schema_name'], 'import_run')} SET status=:status,phase_detail=:phase,"
+            f"UPDATE {storage.qualified(control_schema(handoff['schema_name']), 'import_run')} "
+            "SET status=:status,phase_detail=:phase,"
             "finished_at=timezone('UTC',clock_timestamp()),heartbeat_at=timezone('UTC',clock_timestamp()),error=NULL,"
             "metrics=(metrics::jsonb||CAST(:metrics AS jsonb)||jsonb_build_object(CAST(:metric AS text),CAST(:receipt AS jsonb)))::json "
             "WHERE run_id=:run_id AND node_id=:node_id AND importer=:importer_id AND engine='healthcare-mrf-api' "
@@ -227,6 +229,8 @@ async def activate_prepared(session, handoff, candidate, settings, publish_gener
     generations_by_importer, before = await _require_current(session, handoff, models, lock=True)
     if "run_id" in handoff:
         await _require_pending(session, handoff, lock=True)
+    if settings.schema == DATA_SCHEMA:
+        await require_no_legacy_collision(session, schema, models)
     pairs = await storage.require_tables(session, schema, models)
     # These transient local handles are used only by the existing native DDL primitive.
     stage = native.ReferenceFamilyStageOwnership(
@@ -256,6 +260,29 @@ async def activate_prepared(session, handoff, candidate, settings, publish_gener
     await storage.protect_tables(session, settings.schema, controls, settings)
     await session.execute(text(f"DROP SCHEMA {native._quoted(schema)} RESTRICT"))
     return current, retained_by_field
+
+
+async def require_no_legacy_collision(session, candidate_schema, models):
+    """Keep the legacy keys stable across the final collision scan and named exchange."""
+    if await session.scalar(text("SHOW transaction_isolation")) != "read committed":
+        raise RuntimeError("protected catalog collision check requires read committed")
+    await native._lock_family(session, FENCE_SCHEMA, (FENCE_VIEW,), "SHARE", nowait=True)
+    await storage.require_tables(session, CONTROL_SCHEMA, models)
+    for model in models:
+        name = model.__tablename__
+        legacy = storage.qualified(CONTROL_SCHEMA, name)
+        candidate = storage.qualified(candidate_schema, name)
+        key_match = native._dictionary_key_join(model, "legacy", "candidate")
+        if (
+            await session.scalar(
+                text(
+                    f"SELECT EXISTS(SELECT 1 FROM {candidate} candidate JOIN {legacy} legacy ON {key_match} "
+                    "WHERE legacy.source IS DISTINCT FROM candidate.source)"
+                )
+            )
+            is not False
+        ):
+            raise RuntimeError("protected catalog key belongs to a legacy source")
 
 
 async def cancel(session, run, handoff, settings):
@@ -332,6 +359,8 @@ async def rollback(session, receipt, settings):
         raise RuntimeError("catalog rollback source generation changed")
     await generations.validate_published_content(session, settings.schema, current)
     await storage.require_tables(session, logical["schema_name"], models, lock="ACCESS EXCLUSIVE")
+    if settings.schema == DATA_SCHEMA:
+        await require_no_legacy_collision(session, logical["schema_name"], models)
     for model in models:
         name = model.__tablename__
         await session.execute(text(f"DROP TABLE {storage.qualified(settings.schema, name)} RESTRICT"))

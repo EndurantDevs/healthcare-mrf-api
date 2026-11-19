@@ -18,6 +18,7 @@ from api.provider_collection_network_contract import (
 )
 from api.provider_detail_network_read import managed_provider_network_read_scope
 from api.provider_profile_snapshot import provider_geo_read_snapshot, provider_profile_read_snapshot
+from api.reference_family_reads import uses_scoped_catalog
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 from process.registry_network_catalog_read import (
     MAX_RESPONSE_BYTES,
@@ -188,6 +189,21 @@ def _collection_read_snapshot(database, schema, kind):
     return provider_profile_read_snapshot(database, schema, include_detail=True)
 
 
+def _collection_reader_options(request, kind, native_args):
+    """Prepare one Reader before the service collection takes its first snapshot."""
+    if kind != "by-service":
+        return {}
+    reader_options = {"scoped_catalog": True} if uses_scoped_catalog(request, collection_kind=kind) else {}
+    if any(
+        native_args.get(name)
+        for name in ("plan_release_id", "plan_id", "plan_external_id", "source_key", "snapshot_id")
+    ):
+        from api.custom_import_plan_sql import prepare_plan_query_tables
+
+        reader_options["temporary_setup"] = prepare_plan_query_tables
+    return reader_options
+
+
 async def read_managed_provider_collection(
     request, query, *, excluded_network_ids, access_scope_sha256, organization_policy=None, client_id=None
 ):
@@ -211,13 +227,9 @@ async def read_managed_provider_collection(
                     "Provider data is unavailable.", status_code=billing_search_http._failure_status(error)
                 ) from None
         async with AsyncExitStack() as stack:
-            if query.kind == "by-service" and any(
-                native_args.get(name)
-                for name in ("plan_release_id", "plan_id", "plan_external_id", "source_key", "snapshot_id")
-            ):
-                from api.custom_import_plan_sql import prepare_plan_query_tables
-
-                await stack.enter_async_context(provider.db.reader_session(temporary_setup=prepare_plan_query_tables))
+            reader_options = _collection_reader_options(request, query.kind, native_args)
+            if reader_options:
+                await stack.enter_async_context(provider.db.reader_session(**reader_options))
             session = await stack.enter_async_context(
                 _collection_read_snapshot(provider.db, provider._runtime_db_schema(), query.kind)
             )

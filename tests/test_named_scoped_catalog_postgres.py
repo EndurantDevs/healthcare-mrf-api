@@ -17,20 +17,24 @@ from uuid import uuid4
 import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy import MetaData, text
+from sqlalchemy import MetaData, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from db.models import ImportRun
+from api.reference_family_reads import catalog_read_table, lock_scoped_catalog_reader
+from db.models import CodeCatalog, ImportRun
 from process import reference_family_archive as native
 from process import scoped_catalog_handoff as handoff
 from process import scoped_catalog_named_generation as generations
 from process import scoped_catalog_named_storage as storage
-from process.scoped_catalog_named_cutover import rollback
+from process.scoped_catalog_bootstrap import bootstrap_catalog_slice
+from process.scoped_catalog_layout import DATA_SCHEMA, DATA_SCHEMA_ENV, FENCE_OWNER_ROLE, FENCE_SCHEMA, FENCE_VIEW
+from process.scoped_catalog_named_cutover import require_no_legacy_collision, rollback
 from process.scoped_catalog_publisher import PREFIX, ManagedAttempt, PublisherSettings, run_publisher
 from tests.scoped_catalog_native_fixture import catalog_actors
+from tests.scoped_catalog_split_fixture import _split_roles
 
 
 def _dsn():
@@ -653,3 +657,127 @@ async def test_old_retained_family_keeps_metadata_and_companion_fence(monkeypatc
                 await session.scalar(text(f"SELECT count(*) FROM {storage.qualified(settings.schema, 'code_catalog')}"))
                 == 1
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("importer,system,code", [("code-sets", "RC", "0450"), ("ms-drg", "MS_DRG", "001")])
+async def test_scoped_roles_protect_publication_and_preserve_legacy_writes(monkeypatch, importer, system, code):
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
+    monkeypatch.setenv(DATA_SCHEMA_ENV, DATA_SCHEMA)
+    engine = create_async_engine(_dsn())
+    try:
+        async with catalog_actors(engine, ["mrf"]) as actors:
+            await _seed(engine, "mrf")
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO mrf.code_catalog (code_system,code,display_name,source) "
+                        "VALUES ('POS','99','Original','cms_place_of_service_code_set')"
+                    )
+                )
+            async with _split_roles(engine, actors.roles["builder"]) as (settings, policy, publisher):
+                await _bootstrap_split_result(engine, publisher, policy)
+                builder = actors.builder
+                await _assert_split_fence(builder, publisher)
+                prepared = await _prepare(SimpleNamespace(publisher=builder, builder=builder), "mrf", importer)
+                candidate = prepared[handoff.METRIC]
+                assert candidate["schema_name"] == DATA_SCHEMA
+                initial = await _legacy_codes(builder)
+                await _assert_split_publication(builder, settings, candidate, system, code)
+                assert await _legacy_codes(builder) == initial
+                await _assert_split_writer_access(builder, publisher, system, code)
+                async with publisher.begin() as session:
+                    receipt = await handoff.read_catalog_handoff_outcome(session, candidate)
+                    assert (await rollback(session, receipt, settings))[importer]["local_generation"] == 2
+                assert await _legacy_codes(builder) == initial
+    finally:
+        await engine.dispose()
+
+
+async def _legacy_codes(sessions):
+    async with sessions.begin() as session:
+        return (await session.execute(text("SELECT code_system,code,source FROM mrf.code_catalog ORDER BY 1,2"))).all()
+
+
+async def _bootstrap_split_result(engine, publisher, policy):
+    with pytest.raises(DBAPIError, match="does not exist"):
+        async with publisher.begin() as session:
+            await require_no_legacy_collision(session, DATA_SCHEMA, storage.MODELS)
+    async with async_sessionmaker(engine).begin() as owner:
+        await bootstrap_catalog_slice(owner, policy)
+
+
+async def _assert_split_fence(builder, publisher):
+    view = storage.qualified(FENCE_SCHEMA, FENCE_VIEW)
+    async with publisher.begin() as session:
+        await require_no_legacy_collision(session, DATA_SCHEMA, storage.MODELS)
+        locked = (
+            await session.execute(
+                text(
+                    "SELECT c.relname FROM pg_locks l JOIN pg_class c ON l.relation=c.oid "
+                    "JOIN pg_namespace n ON c.relnamespace=n.oid "
+                    "WHERE l.pid=pg_backend_pid() AND n.nspname='mrf' AND l.granted AND l.mode='ShareLock'"
+                )
+            )
+        ).scalars()
+        assert set(locked) == {model.__tablename__ for model in storage.MODELS}
+        assert (
+            await session.scalar(text("SELECT pg_has_role(current_user,:owner,'MEMBER')"), {"owner": FENCE_OWNER_ROLE})
+            is False
+        )
+    for sessions in (builder, publisher):
+        with pytest.raises(DBAPIError, match="permission denied"):
+            async with sessions.begin() as session:
+                await session.execute(text(f"CREATE OR REPLACE VIEW {view} AS SELECT 2 AS marker"))
+    with pytest.raises(DBAPIError, match="permission denied"):
+        async with publisher.begin() as session:
+            await session.execute(text("LOCK TABLE mrf.code_catalog IN SHARE MODE NOWAIT"))
+    with pytest.raises(RuntimeError, match="requires read committed"):
+        async with publisher.begin() as session:
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+            await require_no_legacy_collision(session, DATA_SCHEMA, storage.MODELS)
+
+
+async def _assert_split_publication(builder, settings, candidate, system, code):
+    async with builder.begin() as session:
+        await session.execute(
+            text("INSERT INTO mrf.code_catalog(code_system,code,source) VALUES(:system,:code,'legacy')"),
+            {"system": system, "code": code},
+        )
+        with pytest.raises(DBAPIError, match="could not obtain lock"):
+            await run_publisher(settings, _attempt(candidate))
+    with pytest.raises(RuntimeError, match="belongs to a legacy source"):
+        await run_publisher(settings, _attempt(candidate))
+    async with builder.begin() as session:
+        await session.execute(text("DELETE FROM mrf.code_catalog WHERE source='legacy'"))
+        await lock_scoped_catalog_reader(session)
+        assert await session.scalar(text(f"SELECT count(*) FROM {DATA_SCHEMA}.code_catalog")) == 1
+        with pytest.raises(DBAPIError, match="could not obtain lock"):
+            await run_publisher(settings, _attempt(candidate))
+    assert (await run_publisher(settings, _attempt(candidate)))["status"] == "succeeded"
+    assert (await run_publisher(settings, _attempt(candidate)))["replayed"] is True
+
+
+async def _assert_split_writer_access(builder, publisher, system, code):
+    with pytest.raises(DBAPIError, match="permission denied"):
+        async with builder.begin() as session:
+            await session.execute(text(f"UPDATE {DATA_SCHEMA}.code_catalog SET display_name='forbidden'"))
+    with pytest.raises(DBAPIError, match="permission denied"):
+        async with publisher.begin() as session:
+            await session.execute(text("UPDATE mrf.code_catalog SET display_name='forbidden'"))
+    async with builder.begin() as session:
+        await session.execute(text("UPDATE mrf.code_catalog SET display_name='still writable'"))
+        composed = catalog_read_table(CodeCatalog)
+        assert (
+            await session.scalar(select(composed.c.display_name).where(composed.c.code_system == "OTHER"))
+            == "still writable"
+        )
+        assert await session.scalar(
+            select(composed.c.display_name).where(composed.c.code_system == system, composed.c.code == code)
+        )
+        assert (
+            await session.scalar(
+                select(composed.c.display_name).where(composed.c.code_system == "POS", composed.c.code == "99")
+            )
+            == "Original"
+        )

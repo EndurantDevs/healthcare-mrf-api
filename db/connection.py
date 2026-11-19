@@ -611,7 +611,12 @@ class Database:
 
     @asynccontextmanager
     async def reader_session(
-        self, *, independent: bool = False, temporary_setup=None, prepare_plan_workspace: bool = False
+        self,
+        *,
+        independent: bool = False,
+        temporary_setup=None,
+        prepare_plan_workspace: bool = False,
+        scoped_catalog: bool = False,
     ) -> AsyncIterator[AsyncSession]:
         """Own a genuine Reader transaction, or reuse this task's exact Reader."""
         if temporary_setup is not None and not callable(temporary_setup):
@@ -641,7 +646,7 @@ class Database:
         connection_scope = plan_reader_connection(reader) if prepare_plan_workspace else nullcontext(None)
         async with connection_scope as connection:
             scope = (
-                self._prepared_reader_session(reader, temporary_setup)
+                self._prepared_reader_session(reader, temporary_setup, scoped_catalog=scoped_catalog)
                 if temporary_setup is not None
                 else reader.session(connection=connection)
                 if prepare_plan_workspace
@@ -651,17 +656,22 @@ class Database:
                 scope,
                 temporary_setup=temporary_setup is not None,
                 prepare_plan_workspace=prepare_plan_workspace,
+                scoped_catalog=scoped_catalog,
             ) as session:
                 yield session
 
     @asynccontextmanager
-    async def _verified_reader_session(self, scope, *, temporary_setup, prepare_plan_workspace):
+    async def _verified_reader_session(self, scope, *, temporary_setup, prepare_plan_workspace, scoped_catalog=False):
         """Bind configured Reader transactions and preserve cleanup and cancellation."""
+        from api.reference_family_reads import lock_scoped_catalog_reader
+
         prepared = temporary_setup or prepare_plan_workspace
         async with scope as session:
             reader_context_token = None
             try:
                 if prepared:
+                    if scoped_catalog:
+                        await lock_scoped_catalog_reader(session)
                     await self._pin_provider_reader(session)
                     modes = await session.execute(
                         sa_text(
@@ -673,6 +683,9 @@ class Database:
                 else:
                     # Start the transaction without fixing a data snapshot before named locks.
                     await session.execute(sa_text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+                    if scoped_catalog:
+                        await lock_scoped_catalog_reader(session)
+                        await self._pin_provider_reader(session)
                 session.info["api_reader_verified"] = True
                 if prepare_plan_workspace:
                     session.info["native_plan_workspace"] = True
@@ -689,6 +702,7 @@ class Database:
                 session.info.pop("native_plan_workspace", None)
                 session.info.pop("provider_profile_relations", None)
                 session.info.pop("snapshot_claims_dictionary_tables", None)
+                session.info.pop("scoped_catalog_reader_pinned", None)
 
     async def bind_request_reader(self, request):
         """Replace only this request's unused ordinary session with a genuine Reader."""
@@ -719,7 +733,10 @@ class Database:
 
     async def _pin_request_reader(self, request, session):
         """Pin provider names before claims setup freezes the request snapshot."""
-        from api.reference_family_reads import pin_claims_reader
+        from api.reference_family_reads import lock_scoped_catalog_reader, pin_claims_reader, uses_scoped_catalog
+
+        if uses_scoped_catalog(request):
+            await lock_scoped_catalog_reader(session)
 
         if getattr(request, "path", "").startswith(
             (
@@ -739,14 +756,18 @@ class Database:
         await _prepare_provider_reader(session, _runtime_db_schema(), fresh=True)
 
     @asynccontextmanager
-    async def _prepared_reader_session(self, reader, temporary_setup):
+    async def _prepared_reader_session(self, reader, temporary_setup, *, scoped_catalog=False):
         """Prepare fixed TEMP objects before the first query and preserve primary failures."""
+        from api.reference_family_reads import lock_scoped_catalog_reader
+
         assert reader.session_factory is not None
         session = reader.session_factory()
         session_token = _SESSION.set(session)
         primary_failure = None
         try:
             await session.execute(sa_text("SET TRANSACTION READ WRITE"))
+            if scoped_catalog:
+                await lock_scoped_catalog_reader(session)
             await self._pin_provider_reader(session)
             await temporary_setup(session)
             await session.execute(sa_text("SET TRANSACTION READ ONLY"))
@@ -965,8 +986,13 @@ class Database:
 
         @app.middleware("request")
         async def _bind_session(request):
+            from api.reference_family_reads import uses_scoped_catalog
+
+            uses_catalog = not request.path.startswith("/api/v1/extensions/custom-import/") and uses_scoped_catalog(
+                request
+            )
             is_pinned_reader = (
-                self.is_api_reader_enabled() and self._is_pinned_read_path(request.path)
+                uses_catalog or (self.is_api_reader_enabled() and self._is_pinned_read_path(request.path))
             ) or request.path.rstrip("/") == "/control/v1/plan-pricing/code-projection"
             if is_pinned_reader:
                 scope = self.reader_session()

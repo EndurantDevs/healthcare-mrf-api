@@ -17,6 +17,7 @@ _CLAIMS_DICTIONARY_SOURCE = "cms_physician_provider_service"
 async def validate_claims_dictionary_closure(session, schema_name):
     """Require the complete current procedure/code slice through indexed set checks."""
     from process import reference_family_archive as native
+    from process.scoped_catalog_layout import CONTROL_SCHEMA, DATA_SCHEMA, catalog_schema
 
     native._require_transaction(session)
     schema = native._quoted(native._schema_name(schema_name))
@@ -32,6 +33,14 @@ async def validate_claims_dictionary_closure(session, schema_name):
             {"source": _CLAIMS_DICTIONARY_SOURCE},
         ):
             raise native.ReferenceFamilyArchiveError("claims dictionary contains a foreign source")
+    if catalog_schema(CONTROL_SCHEMA) == DATA_SCHEMA:
+        from process.code_sets_result_archive import SOURCES
+
+        if await session.scalar(
+            text(f"SELECT EXISTS(SELECT 1 FROM {catalog} WHERE upper(code_system)=ANY(CAST(:systems AS text[])))"),
+            {"systems": [system for _, system in SOURCES]},
+        ):
+            raise native.ReferenceFamilyArchiveError("claims dictionary contains a protected code-set key")
     for system, code in (("from_system", "from_code"), ("to_system", "to_code")):
         if await session.scalar(
             text(

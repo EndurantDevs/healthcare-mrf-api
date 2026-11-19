@@ -13,6 +13,7 @@ from db.models import CodeCatalog, CodeRelationship, CodeSynonym
 from process import reference_family_archive as native
 from process import scoped_catalog_binding as binding
 from process.reference_family_composition import ReferenceModelContribution
+from process.scoped_catalog_layout import DATA_SCHEMA, OWNER_ROLE, STAGE_ROLE
 from process.scoped_catalog_publisher import _IDENTIFIER, PublisherSettings
 
 MODELS = (CodeCatalog, CodeSynonym, CodeRelationship)
@@ -40,6 +41,7 @@ class CatalogPublicationPolicy:
             any(type(name) is not str or not _IDENTIFIER.fullmatch(name) or name.lower() == "public" for name in names)
             or len(set(self.reader_roles)) != len(self.reader_roles)
             or self.owner_role in self.reader_roles
+            or (self.schema == DATA_SCHEMA and (self.owner_role != OWNER_ROLE or STAGE_ROLE not in self.reader_roles))
         ):
             raise ValueError("catalog publication role configuration differs")
 
@@ -89,6 +91,21 @@ def contributions(importer, *, include_relationships=True, upsert=False):
             )
         )
     return tuple(contribution_rules)
+
+
+def catalog_sources(model):
+    """Reuse the compiled publication scope to distinguish managed and shared rows."""
+    return tuple(
+        sorted(
+            {
+                source
+                for importer in ("code-sets", "ms-drg")
+                for rule in contributions(importer)
+                if rule.model_type is model
+                for source in rule.source_values
+            }
+        )
+    )
 
 
 async def require_preserved_catalog_schema(session, incumbent, candidate):
