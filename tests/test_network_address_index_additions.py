@@ -145,12 +145,12 @@ def _index_record(name, valid=True):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("optional", sorted(serving_indexes._OPTIONAL_ADDRESS_INDEXES))
 @pytest.mark.parametrize("optional_state", ["missing", "ready", "building"])
-async def test_optional_count_index_is_not_a_retained_profile_requirement(monkeypatch, optional_state):
+async def test_optional_address_index_is_not_a_retained_profile_requirement(monkeypatch, optional, optional_state):
     required = _index_record("required_address_lookup")
     records = AsyncMock(return_value=[required])
     monkeypatch.setattr(serving_indexes, "_serving_index_records", records)
-    optional = serving_indexes._OPTIONAL_SOURCE_COUNT_INDEX
     index_specs = [(required["relname"], "required DDL"), (optional, "optional DDL")]
     baseline = await serving_indexes._index_digest(object(), "example", index_specs)
     if optional_state != "missing":
@@ -171,8 +171,9 @@ async def test_optional_count_index_does_not_relax_existing_profile_requirements
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("optional", sorted(serving_indexes._OPTIONAL_ADDRESS_INDEXES))
 @pytest.mark.parametrize("optional_table", ["entity_address_unified", "network_office_edge"])
-async def test_compact_optional_index_exception_is_confined_to_the_address_heap(monkeypatch, optional_table):
+async def test_compact_optional_index_exception_is_confined_to_the_address_heap(monkeypatch, optional, optional_table):
     required_index_by_field = {
         "table_name": "network_office_edge",
         "index_name": "edge_lookup",
@@ -187,7 +188,7 @@ async def test_compact_optional_index_exception_is_confined_to_the_address_heap(
     optional_index_by_field = {
         **required_index_by_field,
         "table_name": optional_table,
-        "index_name": serving_indexes._OPTIONAL_SOURCE_COUNT_INDEX,
+        "index_name": optional,
         "indisvalid": False,
         "indisready": False,
     }
