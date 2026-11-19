@@ -8,6 +8,7 @@ import urllib.parse
 from typing import Any
 
 ACCESS_REQUIREMENTS = {
+    "api-key",
     "none",
     "oauth2-client-credentials",
     "private-connector",
@@ -75,6 +76,7 @@ def validate_access_review_metadata(entry_id: str, support: dict[str, Any]) -> N
     if access_requirement == "none" and requires_registration:
         raise SupportDocumentationError(f"{entry_id}: public access cannot require registration")
     gated_access_requirements = {
+        "api-key",
         "oauth2-client-credentials",
         "private-connector",
         "registration-approval",

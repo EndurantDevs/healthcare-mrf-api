@@ -65,6 +65,45 @@ def _response_limits_concurrency(response):
     return status in {429, 503, 504} or bool(error and any(word in error.lower() for word in ("timeout", "timed out")))
 
 
+def strict_search_next_link(
+    payload: dict[str, Any],
+) -> str | None:
+    """Return the exact next link or reject ambiguous paging metadata."""
+    raw_links = payload.get("link", [])
+    if not isinstance(raw_links, list) or any(not isinstance(link, dict) for link in raw_links):
+        raise ValueError("provider_directory_current_version_census_next_link_invalid")
+    next_urls: list[str] = []
+    for link_by_field in raw_links:
+        if link_by_field.get("relation") != "next":
+            continue
+        raw_url = link_by_field.get("url")
+        if type(raw_url) is not str or not raw_url or raw_url.strip() != raw_url:
+            raise ValueError("provider_directory_current_version_census_next_link_invalid")
+        next_urls.append(raw_url)
+    if len(next_urls) > 1:
+        raise ValueError("provider_directory_current_version_census_next_link_invalid")
+    return next_urls[0] if next_urls else None
+
+
+def strict_search_bundle_error(
+    payload: dict[str, Any],
+    resource_type: str,
+) -> str | None:
+    """Reject malformed search sets and rows outside the requested collection."""
+    if payload.get("resourceType") != "Bundle" or payload.get("type") != "searchset":
+        return "provider_directory_current_version_census_searchset_required"
+    raw_entries = payload.get("entry", [])
+    if not isinstance(raw_entries, list):
+        return "provider_directory_current_version_census_entries_invalid"
+    for entry_by_field in raw_entries:
+        resource_by_field = entry_by_field.get("resource") if isinstance(entry_by_field, dict) else None
+        if not isinstance(resource_by_field, dict):
+            return "provider_directory_current_version_census_entries_invalid"
+        if resource_by_field.get("resourceType") != resource_type:
+            return "provider_directory_current_version_census_resource_type_mismatch"
+    return None
+
+
 def is_empty_search_set(
     status_code: int | None,
     fhir_payload: dict[str, Any] | None,

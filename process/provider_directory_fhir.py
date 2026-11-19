@@ -94,6 +94,7 @@ from process import provider_directory_christus as christus
 from process import provider_directory_cms_desired_fence as cms_desired_fence
 from process import provider_directory_fhir_response as fhir_response
 from process import provider_directory_generic_source_adapters as source_adapters
+from process import provider_directory_highmark as highmark
 from process import provider_directory_leaf_census as leaf_census
 from process import provider_directory_molina as molina
 from process import provider_directory_mvp as mvp
@@ -1514,6 +1515,7 @@ PRACTITIONER_ROLE_ZERO_RETRY_REASON = "zero_practitioner_role_with_practitioner_
 PRACTITIONER_ROLE_ZERO_RETRY_EMPTY_ERROR = "suspicious_zero_practitioner_role_rows_after_retry"
 PAGINATION_CHECKPOINT_API_BASES = frozenset(
     {
+        *highmark.API_BASES,
         anthem.API_BASE,
         AETNA_PROVIDER_DIRECTORY_DATA_BASE,
         ALOHR_FHIR_PROVIDER_DIRECTORY_BASE,
@@ -41138,41 +41140,8 @@ def _next_link(payload: dict[str, Any] | None) -> str | None:
     return None
 
 
-def _current_version_census_next_link(
-    payload: dict[str, Any],
-) -> str | None:
-    raw_links = payload.get("link", [])
-    if not isinstance(raw_links, list) or any(not isinstance(link, dict) for link in raw_links):
-        raise ValueError("provider_directory_current_version_census_next_link_invalid")
-    next_urls: list[str] = []
-    for link_by_field in raw_links:
-        if link_by_field.get("relation") != "next":
-            continue
-        raw_url = link_by_field.get("url")
-        if type(raw_url) is not str or not raw_url or raw_url.strip() != raw_url:
-            raise ValueError("provider_directory_current_version_census_next_link_invalid")
-        next_urls.append(raw_url)
-    if len(next_urls) > 1:
-        raise ValueError("provider_directory_current_version_census_next_link_invalid")
-    return next_urls[0] if next_urls else None
-
-
-def _current_version_census_bundle_error(
-    payload: dict[str, Any],
-    resource_type: str,
-) -> str | None:
-    if payload.get("resourceType") != "Bundle" or payload.get("type") != "searchset":
-        return "provider_directory_current_version_census_searchset_required"
-    raw_entries = payload.get("entry", [])
-    if not isinstance(raw_entries, list):
-        return "provider_directory_current_version_census_entries_invalid"
-    for entry_by_field in raw_entries:
-        resource_by_field = entry_by_field.get("resource") if isinstance(entry_by_field, dict) else None
-        if not isinstance(resource_by_field, dict):
-            return "provider_directory_current_version_census_entries_invalid"
-        if resource_by_field.get("resourceType") != resource_type:
-            return "provider_directory_current_version_census_resource_type_mismatch"
-    return None
+_current_version_census_next_link = fhir_response.strict_search_next_link
+_current_version_census_bundle_error = fhir_response.strict_search_bundle_error
 
 
 def _parsed_current_version_census_entries(
@@ -51870,6 +51839,7 @@ async def _fetch_resource_rows(
                 )
     source_api_base = _canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
     is_anthem_source = source_api_base == anthem.API_BASE
+    is_highmark_source = source_api_base in highmark.API_BASES
     is_minnesota_cache = source_api_base == bcbs_minnesota.API_BASE and resource_type in bcbs_minnesota.CACHED_RESOURCES
     cached_total = (
         resume_state.completeness.get(bcbs_minnesota.CACHE_TOTAL_KEY)
@@ -51882,6 +51852,19 @@ async def _fetch_resource_rows(
         resource_type,
         resume_state.next_url if resume_state else None,
     ) or _synthetic_position_resume_guard_error(source_record, resume_state)
+    if (
+        is_highmark_source
+        and checkpoint_start_url
+        and resume_state
+        and resume_state.resumed
+        and not resume_state.complete
+        and resume_state.next_url != checkpoint_start_url
+        and not (
+            resume_state.next_url
+            and _is_trusted_fhir_pagination_url(source_record, checkpoint_start_url, resume_state.next_url)
+        )
+    ):
+        synthetic_resume_guard_error = "untrusted_pagination_link"
     if is_anthem_source:
         try:
             previous_anthem_id, anthem_resume_url, anthem_proof_by_field = anthem.prepare_acquisition(
@@ -52307,6 +52290,7 @@ async def _fetch_resource_rows(
                 if (
                     checkpoint_context
                     and checkpoint_start_url
+                    and not is_highmark_source
                     and _should_restart_expired_pagination_checkpoint(
                         status_code=status_code,
                         fetch_error=error,
@@ -52435,6 +52419,15 @@ async def _fetch_resource_rows(
                     break
                 error_message = "non_bundle_payload"
                 break
+            highmark_next_url = None
+            if is_highmark_source:
+                try:
+                    highmark_next_url = highmark.search_next_link(
+                        sys.modules[__name__], source_record, response_payload, resource_type, url
+                    )
+                except ValueError as exc:
+                    error_message = str(exc)
+                    break
             if current_version_census_contract(source_record) is not None:
                 assert response_payload is not None
                 census_bundle_error = _current_version_census_bundle_error(
@@ -52595,8 +52588,8 @@ async def _fetch_resource_rows(
                 error_message = "provider_directory_current_version_census_processed_count_exceeds_pre_count"
                 has_next_url = True
                 break
-            next_url = current_version_next_link
-            if not is_current_version_census_enabled:
+            next_url = highmark_next_url if is_highmark_source else current_version_next_link
+            if not is_current_version_census_enabled and not is_highmark_source:
                 try:
                     next_url = anthem.next_link(response_payload) if is_anthem_source else _next_link(response_payload)
                 except ValueError as exc:
@@ -52604,8 +52597,8 @@ async def _fetch_resource_rows(
                     has_next_url = True
                     break
             try:
-                if is_current_version_census_enabled:
-                    resolved_next_url = current_version_resolved_next_url
+                if is_highmark_source or is_current_version_census_enabled:
+                    resolved_next_url = highmark_next_url if is_highmark_source else current_version_resolved_next_url
                 elif source_api_base in FHIR_SYNTHETIC_SKIP_PAGINATION_BASES:
                     resolved_next_url = _synthetic_skip_pagination_next_url(
                         source_record,
@@ -56296,14 +56289,18 @@ def _resource_import_group_key(source: dict[str, Any]) -> tuple[str, str, tuple[
     proxy_run = source_proxy.current_run()
     if vsp_directory.is_source(source):
         vsp_directory.require(not _credential_spec_for_source(source), "vsp_source_credentials_forbidden")
-        credential_descriptor = None
+        credential_descriptor_by_field = None
+    elif api_base in highmark.API_BASES:
+        credential_descriptor_by_field = {"header_names": [highmark.KEY_HEADER], "query_param_names": []}
     elif proxy_run is not None and source.get("source_id") in proxy_run.descriptors:
-        credential_descriptor = proxy_run.descriptors[source["source_id"]]
+        credential_descriptor_by_field = proxy_run.descriptors[source["source_id"]]
     else:
-        credential_descriptor = _credential_request_options_for_source(source, f"{api_base}/metadata")["descriptor"]
+        credential_descriptor_by_field = _credential_request_options_for_source(source, f"{api_base}/metadata")[
+            "descriptor"
+        ]
     return (
         api_base,
-        json.dumps(credential_descriptor or {}, sort_keys=True, default=str),
+        json.dumps(credential_descriptor_by_field or {}, sort_keys=True, default=str),
         _resource_endpoint_signature(source),
     )
 

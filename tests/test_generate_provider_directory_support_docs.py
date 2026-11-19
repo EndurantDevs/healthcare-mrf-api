@@ -95,17 +95,18 @@ def test_rendered_inventory_summary_and_access_requirements():
     rendered_document = generator.render_markdown(manifest)
 
     assert "## Inventory Summary" in rendered_document
-    assert "| Acquisition-configured | 38 |" in rendered_document
+    assert "| Acquisition-configured | 46 |" in rendered_document
     assert "| Externally supported | 0 |" in rendered_document
     assert "| Probe-only | 13 |" in rendered_document
     assert "| Known not importable | 3 |" in rendered_document
-    assert "| Total tracked | 54 |" in rendered_document
+    assert "| Total tracked | 62 |" in rendered_document
     assert "### Credentialed Or Registered Access" in rendered_document
     assert (
         "Aetna Commercial/Medicare (`aetna-commercial-medicare`) | Acquisition-configured | OAuth2 client credentials | Required"
         in rendered_document
     )
     assert "Horizon NJ (`horizon-nj`) | Probe-only | OAuth2 client credentials | Required" in rendered_document
+    assert "(`highmark-hm`) | Acquisition-configured | API key | Required" in rendered_document
     assert "ALOHR (`alohr`) | Acquisition-configured | Private connector | Required" in rendered_document
     assert (
         "First Medical Health Plan, Inc. (`provider-directory-blocked-first-medical-pr`) | Not supported | User token | Required"
@@ -210,7 +211,7 @@ def test_rendered_live_proof_summarizes_resource_rows():
     "field_name, value, message",
     [
         ("support_level", "live", "invalid support level"),
-        ("access_requirement", "api-key", "invalid access requirement"),
+        ("access_requirement", "password", "invalid access requirement"),
         ("method", "ftp", "invalid method"),
     ],
 )

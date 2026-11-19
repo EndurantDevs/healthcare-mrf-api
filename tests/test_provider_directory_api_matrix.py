@@ -259,8 +259,8 @@ def test_profile_source_matrix_selects_all_reviewed_sources_and_special_contract
     profile_spec = matrix.load_matrix_source_spec()
     selections = matrix.resolve_matrix_source_selection(manifest, profile_spec)
 
-    assert len(profile_spec["source_ids"]) == 38
-    assert len(selections) == 36
+    assert len(profile_spec["source_ids"]) == 46
+    assert len(selections) == 44
     source_id_by_entry = {
         selection.entry_id: selection.source_id
         for selection in selections

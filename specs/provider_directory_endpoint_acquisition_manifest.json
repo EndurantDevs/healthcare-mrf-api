@@ -16,6 +16,14 @@
     "verification_snapshot": "specs/provider_directory_endpoint_verification.json",
     "blocker_registry": "specs/provider_directory_blocker_registry.json",
     "entry_support": {
+      "highmark-hm": {"support_level": "acquisition-configured", "access_requirement": "api-key", "requires_registration": true, "reviewed_at": "2026-11-19", "method": "rest", "limitation": "Uses API-key REST transport, gzip, partition-scoped server-issued paging links and durable checkpoints. Search pages are capped at 500 resources. Bounded authenticated reads confirmed plan and role network references. Complete traversal, publication and live network membership require separate verification."},
+      "highmark-hmpams": {"support_level": "acquisition-configured", "access_requirement": "api-key", "requires_registration": true, "reviewed_at": "2026-11-19", "method": "rest", "limitation": "Uses API-key REST transport, gzip, partition-scoped server-issued paging links and durable checkpoints. Search pages are capped at 500 resources. Bounded authenticated reads confirmed plan and role network references. Complete traversal, publication and live network membership require separate verification."},
+      "highmark-hmwvms": {"support_level": "acquisition-configured", "access_requirement": "api-key", "requires_registration": true, "reviewed_at": "2026-11-19", "method": "rest", "limitation": "Uses API-key REST transport, gzip, partition-scoped server-issued paging links and durable checkpoints. Search pages are capped at 500 resources. Bounded authenticated reads confirmed plan and role network references. Complete traversal, publication and live network membership require separate verification."},
+      "highmark-hmde": {"support_level": "acquisition-configured", "access_requirement": "api-key", "requires_registration": true, "reviewed_at": "2026-11-19", "method": "rest", "limitation": "Uses API-key REST transport, gzip, partition-scoped server-issued paging links and durable checkpoints. Search pages are capped at 500 resources. Bounded authenticated reads confirmed plan and role network references. Complete traversal, publication and live network membership require separate verification."},
+      "highmark-hmwv": {"support_level": "acquisition-configured", "access_requirement": "api-key", "requires_registration": true, "reviewed_at": "2026-11-19", "method": "rest", "limitation": "Uses API-key REST transport, gzip, partition-scoped server-issued paging links and durable checkpoints. Search pages are capped at 500 resources. Bounded authenticated reads confirmed plan and role network references. Complete traversal, publication and live network membership require separate verification."},
+      "highmark-hmny": {"support_level": "acquisition-configured", "access_requirement": "api-key", "requires_registration": true, "reviewed_at": "2026-11-19", "method": "rest", "limitation": "Uses API-key REST transport, gzip, partition-scoped server-issued paging links and durable checkpoints. Search pages are capped at 500 resources. Bounded authenticated reads confirmed plan and role network references. Complete traversal, publication and live network membership require separate verification."},
+      "highmark-bcbsde": {"support_level": "acquisition-configured", "access_requirement": "api-key", "requires_registration": true, "reviewed_at": "2026-11-19", "method": "rest", "limitation": "Uses API-key REST transport, gzip, partition-scoped server-issued paging links and durable checkpoints. Search pages are capped at 500 resources. Bounded authenticated reads confirmed plan and role network references. Complete traversal, publication and live network membership require separate verification."},
+      "highmark-bcbswy": {"support_level": "acquisition-configured", "access_requirement": "api-key", "requires_registration": true, "reviewed_at": "2026-11-19", "method": "rest", "limitation": "Uses API-key REST transport, gzip, partition-scoped server-issued paging links and durable checkpoints. Search pages are capped at 500 resources. All eight collections returned empty search sets in the bounded review. A populated upstream directory is required before publishing."},
       "independence-provider-directory": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-14", "method": "rest", "limitation": "Eight public collections use the shared REST importer with byte-exact server-issued _page_token continuations, durable checkpoints and bounded parallel resource scans. Search pages are capped at the observed 20 rows. Endpoint rejects _count and uses its bare collection URL. Metadata is unavailable, so admission probes a declared collection. Native plan network labels include Independence Administrators; shared transport does not establish complete product membership or a nine-network count. Counts are omitted and _summary=count does not provide a census. Terminal acquisition, publication and downstream readiness require separate verification."},
       "bcbs-minnesota": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-14", "method": "rest", "limitation": "The anonymous Plan-Net source uses strict zero-count censuses and shared adaptive timestamp partitions for Practitioner, PractitionerRole, Organization and OrganizationAffiliation. Unfiltered/ranged pre- and post-counts, disjoint leaves and two matching passes must reconcile before publication. InsurancePlan, Location and HealthcareService use issued search-cache handles and bounded offsets; full pages continue even when gateway next links are omitted. Cached pages are capped at 500 rows and expired caches fail without resetting retained progress. Endpoint is unsupported. Historical provider-directory aliases remain separate; product equivalence is not inferred. Terminal import, publication and downstream readiness require separate verification."},
       "vsp-provider-directory": {"support_level": "acquisition-configured", "access_requirement": "none", "requires_registration": false, "reviewed_at": "2026-11-08", "method": "official-json", "limitation": "Explicit selection captures the publisher’s public directory for the Choice, Signature and Advantage networks. The normalized output contains network organizations, practitioners, locations and roles. Retail locations use site organizations and network affiliations. No insurance products or prices are supplied by this projection. A completed capture, independent network counts and publication are required before treating the directory as available for searches."},
@@ -799,6 +807,182 @@
         "pdfhir_dd4d8d4cf1e5dd3e609ae0b3"
       ],
       "canonical_base": "https://eapics.ibx.com/provider/v1/fhir",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "R8",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ]
+    },
+    {
+      "entry_id": "highmark-hm",
+      "display_name": "Highmark Pennsylvania Non-Medicaid Provider Directory",
+      "owner_id": "highmark-hm",
+      "source_ids": [
+        "pdfhir_a564a1f155aa4fbc19c8b33a"
+      ],
+      "canonical_base": "https://apicms.hmhs.com/fhir/v4/providers/HM",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "R8",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ]
+    },
+    {
+      "entry_id": "highmark-hmpams",
+      "display_name": "Highmark Pennsylvania Medicaid Provider Directory",
+      "owner_id": "highmark-hmpams",
+      "source_ids": [
+        "pdfhir_ccf82b68858057e8d5ed0053"
+      ],
+      "canonical_base": "https://apicms.hmhs.com/fhir/v4/providers/HMPAMS",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "R8",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ]
+    },
+    {
+      "entry_id": "highmark-hmwvms",
+      "display_name": "Highmark West Virginia Medicaid Provider Directory",
+      "owner_id": "highmark-hmwvms",
+      "source_ids": [
+        "pdfhir_89d5e75a7d19891b4396b278"
+      ],
+      "canonical_base": "https://apicms.hmhs.com/fhir/v4/providers/HMWVMS",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "R8",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ]
+    },
+    {
+      "entry_id": "highmark-hmde",
+      "display_name": "Highmark Delaware Provider Directory",
+      "owner_id": "highmark-hmde",
+      "source_ids": [
+        "pdfhir_965c3850b842cb9c4ac06605"
+      ],
+      "canonical_base": "https://apicms.hmhs.com/fhir/v4/providers/HMDE",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "R8",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ]
+    },
+    {
+      "entry_id": "highmark-hmwv",
+      "display_name": "Highmark West Virginia Provider Directory",
+      "owner_id": "highmark-hmwv",
+      "source_ids": [
+        "pdfhir_8d1ff3305c33d81675a9fdb4"
+      ],
+      "canonical_base": "https://apicms.hmhs.com/fhir/v4/providers/HMWV",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "R8",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ]
+    },
+    {
+      "entry_id": "highmark-hmny",
+      "display_name": "Highmark New York Provider Directory",
+      "owner_id": "highmark-hmny",
+      "source_ids": [
+        "pdfhir_9d5948bff9bc1873bf31c7b6"
+      ],
+      "canonical_base": "https://apicms.hmhs.com/fhir/v4/providers/HMNY",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "R8",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ]
+    },
+    {
+      "entry_id": "highmark-bcbsde",
+      "display_name": "Blue Cross Blue Shield Delaware Provider Directory",
+      "owner_id": "highmark-bcbsde",
+      "source_ids": [
+        "pdfhir_1d60f9a500d59043037ed007"
+      ],
+      "canonical_base": "https://apicms.hmhs.com/fhir/v4/providers/BCBSDE",
+      "classification": "acquisition",
+      "launch_mode": "create",
+      "resource_profile": "R8",
+      "resources": [
+        "InsurancePlan",
+        "PractitionerRole",
+        "Practitioner",
+        "Organization",
+        "Location",
+        "HealthcareService",
+        "OrganizationAffiliation",
+        "Endpoint"
+      ]
+    },
+    {
+      "entry_id": "highmark-bcbswy",
+      "display_name": "Blue Cross Blue Shield of Wyoming Provider Directory",
+      "owner_id": "highmark-bcbswy",
+      "source_ids": [
+        "pdfhir_02a83b647e7576ca2dfe0699"
+      ],
+      "canonical_base": "https://apicms.hmhs.com/fhir/v4/providers/BCBSWY",
       "classification": "acquisition",
       "launch_mode": "create",
       "resource_profile": "R8",

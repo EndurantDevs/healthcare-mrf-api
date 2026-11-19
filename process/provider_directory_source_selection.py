@@ -15,6 +15,7 @@ from typing import Any
 
 from process import provider_directory_bcbs_minnesota as bcbs_minnesota
 from process import provider_directory_generic_source_policy as source_policy
+from process import provider_directory_highmark as highmark
 from process import vsp_directory_integration as vsp_directory
 
 QUALIFICATION_API_BASE = contextvars.ContextVar("provider_directory_qualification_api_base", default=None)
@@ -50,6 +51,7 @@ class CensusRequestDeferred(Exception):
 def full_refresh_page_counts(directory):
     """Keep reviewed source page preferences beside source selection."""
     return {
+        **dict.fromkeys(highmark.API_BASES, highmark.PAGE_SIZE),
         directory.FLORIDA_BLUE_PROVIDER_DIRECTORY_BASE: 200,
         directory.anthem.API_BASE: 1000,
         directory.CARESOURCE_PROVIDER_DIRECTORY_BASE: 1000,
@@ -75,9 +77,11 @@ def pagination_start_url(directory, source, url):
 
 
 def is_credentialed_rest_source(directory, source_record):
-    """Keep authenticated connection reuse limited to the reviewed directory."""
+    """Keep authenticated connection reuse limited to reviewed directories."""
     api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
-    return bool(api_base and api_base == getattr(getattr(directory, "anthem", None), "API_BASE", None))
+    return api_base in highmark.API_BASES or bool(
+        api_base and api_base == getattr(getattr(directory, "anthem", None), "API_BASE", None)
+    )
 
 
 def retry_after_limit(directory, source_record):
@@ -139,11 +143,12 @@ def credentialed_rest_request_allowed(directory, source_record, url):
     """Reject origin, path and encoded traversal changes before resolving credentials."""
     if not is_credentialed_rest_source(directory, source_record):
         return False
+    api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
     try:
         parsed = urllib.parse.urlsplit(url)
         normalized = parsed._replace(path=posixpath.normpath(urllib.parse.unquote(parsed.path))).geturl()
         return bool(
-            directory._is_url_within_api_base(normalized, directory.anthem.API_BASE)
+            directory._is_url_within_api_base(normalized, api_base)
             and "%" not in parsed.path
             and not any(segment in {".", ".."} for segment in parsed.path.split("/"))
             and not parsed.fragment
@@ -178,8 +183,10 @@ def require_credentialed_rest_spec(directory, source_record, spec):
     if spec.get("query_params"):
         raise ValueError("provider_directory_credential_query_parameters_forbidden")
     oauth = directory._oauth2_spec(spec)
-    if oauth and directory._resolve_secret_text(oauth.get("token_url") or oauth.get("tokenUrl")) != (
-        directory.anthem.TOKEN_URL
+    api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    if oauth and (
+        api_base in highmark.API_BASES
+        or directory._resolve_secret_text(oauth.get("token_url") or oauth.get("tokenUrl")) != directory.anthem.TOKEN_URL
     ):
         raise ValueError("provider_directory_credential_token_url_unapproved")
 
@@ -252,6 +259,13 @@ async def credentialed_rest_options(directory, source_record, url, *, rejected_a
     require_qualification_url(directory, url)
     spec = directory._credential_spec_for_source(source_record)
     require_credentialed_rest_spec(directory, source_record, spec)
+    api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    if api_base in highmark.API_BASES:
+        api_key = directory._api_key_header(spec)
+        headers_by_name = {}
+        if api_key and api_key[0].lower() == highmark.KEY_HEADER.lower():
+            headers_by_name[highmark.KEY_HEADER] = api_key[1]
+        return {"headers": headers_by_name}
     oauth = directory._oauth2_spec(spec)
 
     async def resolve():
@@ -558,6 +572,25 @@ def is_trusted_fhir_pagination_url(
     next_url: str,
 ) -> bool:
     """Retain the existing host policy and optional exact collection boundary."""
+    api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    if api_base in highmark.API_BASES:
+        # HAPI returns search handles on the tenant root instead of the collection.
+        try:
+            parsed_next = urllib.parse.urlsplit(next_url)
+        except ValueError:
+            return False
+        base_path = urllib.parse.urlsplit(api_base).path
+        if parsed_next.path.rstrip("/") == base_path:
+            handles = urllib.parse.parse_qs(parsed_next.query, keep_blank_values=True).get("_getpages", [])
+            if len(handles) != 1 or not handles[0]:
+                return False
+        current_path = urllib.parse.urlsplit(current_url).path
+        current_resource = current_path.rsplit("/", 1)[-1]
+        return fhir_census_pagination_url_allowed(
+            api_base=api_base,
+            resource_types=(current_resource,) if current_resource in directory.DEFAULT_RESOURCES else (),
+            next_url=next_url,
+        )
     parsed_next = urllib.parse.urlsplit(next_url)
     next_host_key = directory._pagination_host_key(next_url)
     return bool(
@@ -1028,16 +1061,23 @@ def uses_credentialed_rest_transport(directory, source_record):
 async def send_authenticated_page(directory, source_record, url, *, timeout, headers_by_name):
     """Send one authorized page with the existing verified transport and exact URL bytes."""
     session = directory.source_selection.credentialed_rest_session(directory, source_record, url)
-    if session is not None:
-        return await directory._fetch_json_with_source_session(
-            session,
-            url,
-            timeout=timeout,
-            allow_redirects=False,
-            preserve_url_bytes=True,
-            extra_headers=headers_by_name,
-            allow_gzip=True,
+    api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    if session is not None or api_base in highmark.API_BASES:
+        owner = (
+            contextlib.nullcontext(session)
+            if session is not None
+            else directory._source_http_client_session(require_verified_tls=True)
         )
+        async with owner as client:
+            return await directory._fetch_json_with_source_session(
+                client,
+                url,
+                timeout=timeout,
+                allow_redirects=False,
+                preserve_url_bytes=True,
+                extra_headers=headers_by_name,
+                allow_gzip=True,
+            )
     return await directory._fetch_json_with_options(
         url, timeout=timeout, extra_headers=headers_by_name, allow_gzip=True
     )
@@ -1046,7 +1086,9 @@ async def send_authenticated_page(directory, source_record, url, *, timeout, hea
 async def fetch_credentialed_rest_json(directory, source_record, url, *, timeout, send=None):
     """Keep missing credentials and unverified sessions out of anonymous transport."""
     options = await directory.source_selection.credentialed_rest_options(directory, source_record, url, timeout=timeout)
-    if not any(name.lower() == "authorization" and header_value for name, header_value in options["headers"].items()):
+    api_base = directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base"))
+    required_header = highmark.KEY_HEADER.lower() if api_base in highmark.API_BASES else "authorization"
+    if not any(name.lower() == required_header and header_value for name, header_value in options["headers"].items()):
         return None, None, "provider_directory_credentials_unavailable", 0
     total_elapsed_ms = 0
     has_retried = False
@@ -1187,11 +1229,13 @@ def baked_seed_rows(directory, *, source_query=None):
 
 def configured_seed_rows():
     """Load baked public source metadata through the existing seed pipeline."""
+    from process.provider_directory_fhir import DEFAULT_RESOURCES
+
     path = Path(__file__).resolve().parents[1] / "specs/provider_directory_supplemental_sources.json"
     rows = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
         raise ValueError("provider_directory_configured_sources_invalid")
-    return rows
+    return [*rows, *highmark.seed_rows(DEFAULT_RESOURCES)]
 
 
 def read_retest_results(
