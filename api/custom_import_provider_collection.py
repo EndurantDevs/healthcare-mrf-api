@@ -14,6 +14,7 @@ from api.endpoint import npi
 from api.provider_collection_network_contract import ProviderCollectionNetworkQuery, parse_managed_collection_query
 from api.provider_collection_network_read import MAX_COLLECTION_BYTES, _collection_read_snapshot, _request_reader
 from api.provider_detail_network_read import managed_provider_network_read_scope
+from api.reference_family_reads import uses_scoped_catalog
 from process.custom_import.read_contracts import (
     DEFAULT_READ_TIMEOUT_MS,
     CustomImportReadRequestError,
@@ -73,8 +74,10 @@ def parse_optional_managed_collection(document, *, kind, native_batch=None):
 async def managed_import_collection_scope(request, managed, *, temporary_setup=None):
     """Pin native eligibility, import scoring and family hydration in one Reader."""
     async with AsyncExitStack() as stack:
-        if temporary_setup is not None:
-            await stack.enter_async_context(npi.db.reader_session(temporary_setup=temporary_setup))
+        needs_catalog_lock = uses_scoped_catalog(request, collection_kind=managed.query.kind)
+        if temporary_setup is not None or needs_catalog_lock:
+            options = {"scoped_catalog": True} if needs_catalog_lock else {}
+            await stack.enter_async_context(npi.db.reader_session(temporary_setup=temporary_setup, **options))
         session = await stack.enter_async_context(
             _collection_read_snapshot(npi.db, npi._runtime_db_schema(), managed.query.kind)
         )

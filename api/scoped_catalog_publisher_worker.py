@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 from dataclasses import replace
 from decimal import Decimal, DecimalException, localcontext
@@ -15,6 +16,7 @@ from sqlalchemy import text
 from process import scoped_catalog_named_generation as generations
 from process import scoped_catalog_named_publication as publication
 from process.control_lifecycle import acquire_control_run_worker_action_lock
+from process.scoped_catalog_layout import CONTROL_SCHEMA, DATA_SCHEMA, DATA_SCHEMA_ENV, catalog_schema
 from process.scoped_catalog_publisher import PREFIX
 from process.scoped_catalog_retention import canonical_metadata
 
@@ -24,6 +26,25 @@ SERVICE_ACCOUNT = "scoped-catalog-publisher"
 SELECTORS = ("run_id", "attempt_id", "attempt_started_at", "node_id", "expected_lineage_id", "expected_generation")
 _FIELDS = frozenset((*SELECTORS, "role", "importer", "status", "reason"))
 _IMAGE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
+
+
+_WORKER_SPECS = {
+    ("arq:CodeSets", "process.CodeSets", ("code-sets",)),
+    ("arq:MSDRG", "process.MSDRG", ("ms-drg",)),
+}
+
+
+def configured_code_sets_image(spec):
+    """Use the compatible acquisition and continuation image for the selected catalog family."""
+    if (spec.queue, spec.worker_class, spec.importers) not in _WORKER_SPECS or spec.role not in {"start", ROLE}:
+        return None
+    is_isolated = catalog_schema(CONTROL_SCHEMA) == DATA_SCHEMA
+    if spec.importers == ("ms-drg",) and not is_isolated:
+        return None
+    image = os.getenv("HLTHPRT_CODE_SETS_WORKER_IMAGE", "").strip()
+    if (is_isolated or image) and not _IMAGE.fullmatch(image):
+        raise ValueError("code_sets_worker_image_invalid")
+    return image or None
 
 
 def is_publisher_request(request):
@@ -115,7 +136,7 @@ async def _admit(connection, request, schema, *, is_repair=False):
         or run["error"] is not None
         or run["importer"] != request["importer"]
         or run["node_id"] != request["node_id"]
-        or handoff["schema_name"] != schema
+        or handoff["schema_name"] != catalog_schema(schema)
         or any(handoff[key] != request[key] for key in SELECTORS[:4])
         or any((run["progress"] or {}).get(key) != request[key] for key in ("attempt_id", "attempt_started_at"))
         or (expected["local_lineage_id"], expected["local_generation"])
@@ -144,6 +165,14 @@ async def _admit(connection, request, schema, *, is_repair=False):
     ):
         raise ValueError("catalog publisher run is not pending")
     return None
+
+
+def acquisition_environment(spec):
+    """Pass the target's split selection to its two catalog acquisition workers only."""
+    if (spec.queue, spec.worker_class, spec.importers) not in _WORKER_SPECS:
+        return []
+    schema = catalog_schema(CONTROL_SCHEMA)
+    return [] if schema == CONTROL_SCHEMA else [{"name": DATA_SCHEMA_ENV, "value": schema}]
 
 
 def manifest(spec, request, image):

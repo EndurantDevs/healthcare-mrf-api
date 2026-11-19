@@ -12,6 +12,7 @@ from process import scoped_catalog_named_publication as named
 from process import scoped_catalog_named_retention as retention
 from process import scoped_catalog_named_storage as storage
 from process import scoped_catalog_publication as publication
+from process.scoped_catalog_layout import control_schema
 
 CONTRACT, PHASE, METRIC = named.CONTRACT, named.PHASE, named.METRIC
 _digest = named.digest
@@ -70,7 +71,7 @@ async def request_catalog_cancel(session, current):
         raise RuntimeError("catalog cancellation attempt differs")
     await session.execute(
         text(
-            f"UPDATE {storage.qualified(candidate['schema_name'], 'import_run')} SET status='canceling',"
+            f"UPDATE {storage.qualified(control_schema(candidate['schema_name']), 'import_run')} SET status='canceling',"
             "phase_detail='catalog publication cancellation requested',heartbeat_at=timezone('UTC',clock_timestamp()) WHERE run_id=:run_id"
         ),
         {"run_id": candidate["run_id"]},
@@ -85,7 +86,8 @@ async def _reconcile_catalog_handoff(database, candidate):
             await session.execute(text("SET LOCAL lock_timeout='30s'"))
             observed = await session.scalar(
                 text(
-                    f"SELECT metrics::jsonb->'{METRIC}' FROM {storage.qualified(candidate['schema_name'], 'import_run')} "
+                    f"SELECT metrics::jsonb->'{METRIC}' FROM "
+                    f"{storage.qualified(control_schema(candidate['schema_name']), 'import_run')} "
                     "WHERE run_id=:run_id FOR SHARE"
                 ),
                 {"run_id": candidate["run_id"]},

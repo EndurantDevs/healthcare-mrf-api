@@ -853,6 +853,8 @@ def _configured_worker_job_image(spec: WorkerSpec, launch_request: dict[str, Any
 
     if network_image := configured_network_import_image(spec, launch_request):
         return network_image
+    if code_sets_image := scoped_catalog_publisher_worker.configured_code_sets_image(spec):
+        return code_sets_image
     generic_image = os.getenv("HLTHPRT_WORKER_JOB_IMAGE", "").strip()
     if (
         type(launch_request) is _AdmittedWorkerRequest
@@ -1326,6 +1328,7 @@ def _worker_job_environment(
         {"name": "HLTHPRT_ACTIVE_WORKER_QUEUE", "value": spec.queue},
     ]
     env_list.extend(_discovery_acquisition_environment(spec))
+    env_list.extend(scoped_catalog_publisher_worker.acquisition_environment(spec))
     import_id = _worker_import_id(spec, launch_request)
     if import_id:
         env_list.append({"name": "HLTHPRT_IMPORT_ID_OVERRIDE", "value": import_id})

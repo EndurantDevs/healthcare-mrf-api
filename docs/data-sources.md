@@ -58,6 +58,8 @@ The authenticated worker launcher accepts the `scoped-catalog-publisher` role on
 
 The launcher references only the fixed `scoped-catalog-publisher` Secret and service account. Secret keys `dsn`, `schema`, `owner-role`, `reader-roles`, `copy-max-bytes` and `timeout-seconds` provide the corresponding `HLTHPRT_SCOPED_CATALOG_PUBLISHER_*` settings. All six settings are mandatory; there is no application-credential fallback. Reader roles are a JSON string array, native COPY is bounded to at most 2 GiB and the transaction timeout to at most 600 seconds. The protected command accepts only `--run-id`, `--attempt-id`, `--attempt-started-at`, `--node-id`, `--expected-lineage-id` and `--expected-generation`; it derives the importer and complete source-generation vector from the real managed handoff.
 
+`HLTHPRT_SCOPED_CATALOG_DATA_SCHEMA=mrf_scoped_catalog` selects the protected first-use layout. Bootstrap an unused catalog in a separate migration transaction before setting it. The publisher uses that data schema and the `mrf_scoped_catalog_owner` role. Acquisition uses `mrf_scoped_catalog_stage` only to prepare isolated input. The configured readers include the stage role and access published data through SELECT. The catalog workers use one immutable image set by `HLTHPRT_CODE_SETS_WORKER_IMAGE`. Managed run status stays in `mrf.import_run`, and the shared catalog remains available to its existing writers.
+
 ## Notes
 
 - External websites are import-time dependencies; the API serves local PostgreSQL tables at request time.

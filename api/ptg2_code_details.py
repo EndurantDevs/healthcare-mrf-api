@@ -17,6 +17,8 @@ from api.ptg2_response import (
     _summarize_price_payload,
 )
 from api.ptg2_serving_utils import _row_mapping
+from api.reference_family_reads import catalog_read_relation_sql
+from db.models import CodeCatalog
 
 PTG2_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
 
@@ -104,25 +106,8 @@ async def _enrich_ptg2_code_details(
     if not lookup_keys:
         return response_payload
 
-    clauses: list[str] = []
-    query_params_by_name: dict[str, Any] = {}
-    for idx, (code_system, code) in enumerate(sorted(lookup_keys)):
-        clauses.append(f"(code_system = :code_system_{idx} AND code = :code_{idx})")
-        query_params_by_name[f"code_system_{idx}"] = code_system
-        query_params_by_name[f"code_{idx}"] = code
-    relation = f"{PTG2_SCHEMA}.code_catalog"
-    if getattr(session, "info", {}).get("api_reader_verified") is True:
-        relation = qualified_relation_sql(PTG2_SCHEMA, "code_catalog")
-    query_result = await session.execute(
-        text(
-            f"""
-            SELECT code_system, code, display_name, short_description
-            FROM {relation}
-            WHERE {" OR ".join(clauses)}
-            """
-        ),
-        query_params_by_name,
-    )
+    query, parameters = _catalog_detail_query(session, PTG2_SCHEMA, sorted(lookup_keys))
+    query_result = await session.execute(query, parameters)
     detail_map = {
         (
             str(catalog_row.get("code_system") or ""),
@@ -136,3 +121,27 @@ async def _enrich_ptg2_code_details(
     enriched_response_by_field = dict(response_payload)
     enriched_response_by_field["items"] = response_items
     return enriched_response_by_field
+
+
+def _catalog_detail_query(session, schema, lookup_keys):
+    """Use the same fixed catalog projection for both code lookup responses."""
+    clauses: list[str] = []
+    query_params_by_name: dict[str, Any] = {}
+    for idx, (code_system, code) in enumerate(lookup_keys):
+        clauses.append(f"(code_system = :code_system_{idx} AND code = :code_{idx})")
+        query_params_by_name[f"code_system_{idx}"] = code_system
+        query_params_by_name[f"code_{idx}"] = code
+    relation = f"{schema}.code_catalog"
+    if getattr(session, "info", {}).get("api_reader_verified") is True:
+        relation = qualified_relation_sql(schema, "code_catalog")
+    relation = catalog_read_relation_sql(CodeCatalog, schema, relation, keys=lookup_keys)
+    return (
+        text(
+            f"""
+            SELECT code_system, code, display_name, short_description
+            FROM {relation}
+            WHERE {" OR ".join(clauses)}
+            """
+        ),
+        query_params_by_name,
+    )

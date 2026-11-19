@@ -162,18 +162,41 @@ async def test_signed_service_sanitizes_errors_and_releases_scope(import_boundar
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("document", [{"items": [{"npi": 1000000001}]}, {"rates": [{"rate": 10}]}])
-async def test_native_service_preserves_original_native_shapes(boundary, monkeypatch, document):
-    boundary.state.document = document
-    monkeypatch.setattr(service, "_service_page", npi.list_providers)
+@pytest.mark.parametrize("native_document", [{"items": [{"npi": 1000000001}]}, {"rates": [{"rate": 10}]}])
+@pytest.mark.parametrize("use_scoped_catalog", [False, True])
+async def test_native_service_preserves_original_native_shapes(
+    boundary, monkeypatch, native_document, use_scoped_catalog
+):
+    boundary.state.document = native_document
+    opened_readers = []
+
+    @asynccontextmanager
+    async def reader(**options):
+        assert use_scoped_catalog and options == {"scoped_catalog": True} and not boundary.state.active
+        opened_readers.append(boundary.session)
+        try:
+            yield boundary.session
+        finally:
+            opened_readers.pop()
+
+    async def service_page(request, *, native_args):
+        assert bool(opened_readers) is use_scoped_catalog
+        return await npi.list_providers(request, native_args=native_args)
+
+    if use_scoped_catalog:
+        monkeypatch.setenv("HLTHPRT_SCOPED_CATALOG_DATA_SCHEMA", "mrf_scoped_catalog")
+    else:
+        monkeypatch.delenv("HLTHPRT_SCOPED_CATALOG_DATA_SCHEMA", raising=False)
+    monkeypatch.setattr(npi.db, "reader_session", reader)
+    monkeypatch.setattr(service, "_service_page", service_page)
     query = parse_managed_collection_query({"kind": "by-service", "native_query": {"code": "99213", "offset": "1"}})
-    result = await collection.read_managed_provider_collection(
+    page = await collection.read_managed_provider_collection(
         boundary.request,
         query,
         excluded_network_ids=(7,),
         access_scope_sha256="a" * 64,
     )
-    assert result["data"] == document
+    assert page["data"] == native_document and not opened_readers
     assert boundary.state.seen[0][1].get("offset") == "1"
     assert not boundary.state.active and current_network_address_scope() is None
 

@@ -32,6 +32,73 @@ def _request_callbacks(database, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path,should_lock",
+    [
+        ("/api/v1/codes/POS/23", True),
+        ("/api/v1/clinical/concepts/MS_DRG/001", True),
+        ("/api/v1/codes/POS/23/related", False),
+        ("/api/v1/npi/geo", False),
+        ("/api/v1/pricing/providers", False),
+    ],
+)
+async def test_catalog_reader_locks_follow_the_requested_data(monkeypatch, path, should_lock):
+    monkeypatch.setenv("HLTHPRT_SCOPED_CATALOG_DATA_SCHEMA", "mrf_scoped_catalog")
+    session = ReaderSession()
+    database = reader_database(monkeypatch, [session])
+    monkeypatch.setattr(reference_family_reads, "pin_claims_reader", AsyncMock())
+    lock = AsyncMock()
+    monkeypatch.setattr(reference_family_reads, "lock_scoped_catalog_reader", lock)
+    await database._pin_request_reader(SimpleNamespace(path=path, args={}), session)
+    assert lock.await_count == int(should_lock)
+
+
+@pytest.mark.parametrize(
+    "flag,expected", [("y", True), ("true", True), ("ON", True), ("n", False), ("mismatch", False)]
+)
+def test_pricing_expand_codes_reuses_pricing_parser_for_lock(monkeypatch, flag, expected):
+    monkeypatch.setenv("HLTHPRT_SCOPED_CATALOG_DATA_SCHEMA", "mrf_scoped_catalog")
+    request = SimpleNamespace(path="/api/v1/pricing/providers/123/procedures/45", args={"expand_codes": flag})
+    assert reference_family_reads.uses_scoped_catalog(request) is expected
+
+
+@pytest.mark.parametrize(
+    ("path", "args", "should_lock"),
+    [
+        ("/api/v1/pricing/providers/123/procedures", {"source_key": "fixture"}, True),
+        ("/api/v1/pricing/providers/123/procedures", {"snapshot_id": "fixture"}, True),
+        ("/api/v1/pricing/physicians/123/services", {"plan_id": "fixture"}, True),
+        ("/api/v1/pricing/physicians/123/services/", {"plan_release_id": "fixture"}, True),
+        ("/api/v1/pricing/providers/123/procedures", {}, False),
+        ("/api/v1/pricing/physicians/123/services", {"source_key": " "}, False),
+        ("/api/v1/pricing/providers/123", {"snapshot_id": "fixture"}, False),
+    ],
+)
+def test_source_scoped_procedure_list_locks_even_without_flags(monkeypatch, path, args, should_lock):
+    monkeypatch.setenv("HLTHPRT_SCOPED_CATALOG_DATA_SCHEMA", "mrf_scoped_catalog")
+    assert reference_family_reads.uses_scoped_catalog(SimpleNamespace(path=path, args=args)) is should_lock
+
+
+async def test_explicit_unprepared_reader_pins_providers_after_catalog_before_yield(monkeypatch):
+    session = ReaderSession()
+    database = reader_database(monkeypatch, [session])
+    events = []
+
+    async def lock(active):
+        assert active is session and session.transaction_starts
+        events.append("catalog")
+
+    async def pin(active):
+        assert active is session
+        events.append("provider")
+
+    monkeypatch.setattr(reference_family_reads, "lock_scoped_catalog_reader", lock)
+    monkeypatch.setattr(database, "_pin_provider_reader", pin)
+    async with database.reader_session(scoped_catalog=True) as active:
+        assert active is session and events == ["catalog", "provider"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("network_read", [False, True])
 async def test_cold_request_reader_replacement_uses_existing_cleanup_lifecycle(monkeypatch, network_read):
     monkeypatch.setenv("HLTHPRT_API_READER_ENABLED", "false")

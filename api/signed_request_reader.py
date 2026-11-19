@@ -91,6 +91,8 @@ def _bind_request_reader(request, session, *, verified_request_id=None):
 @asynccontextmanager
 async def signed_request_reader(request, ordinary_session, *, plan_workspace=False, verified_request_id=None):
     """Preserve a cold caller and own all signed payload reads through encoding."""
+    from api.reference_family_reads import uses_scoped_catalog
+
     context_session = getattr(getattr(request, "ctx", None), "sa_session", ordinary_session)
     if (
         ordinary_session is None
@@ -100,7 +102,8 @@ async def signed_request_reader(request, ordinary_session, *, plan_workspace=Fal
     ):
         raise CustomImportReadUnavailableError("signed read requires an unused caller session")
     try:
-        async with db.reader_session(independent=True, prepare_plan_workspace=plan_workspace) as session:
+        options = {"scoped_catalog": True} if uses_scoped_catalog(request) else {}
+        async with db.reader_session(independent=True, prepare_plan_workspace=plan_workspace, **options) as session:
             if not is_owned_reader(session):
                 raise CustomImportReadUnavailableError("signed read Reader ownership is unavailable")
             with _bind_request_reader(request, session, verified_request_id=verified_request_id):

@@ -156,6 +156,41 @@ async def test_imported_geo_alone_uses_projection_snapshot(import_boundary, monk
     assert not import_boundary.state.active
 
 
+@pytest.mark.parametrize("prepared", [False, True])
+async def test_by_service_pins_scoped_catalog_before_managed_snapshot(import_boundary, monkeypatch, prepared):
+    monkeypatch.setenv("HLTHPRT_SCOPED_CATALOG_DATA_SCHEMA", "mrf_scoped_catalog")
+    source_snapshot = collection.provider_profile_read_snapshot
+    opened_readers = []
+    setup = AsyncMock() if prepared else None
+
+    @asynccontextmanager
+    async def reader(**options):
+        assert options == {"scoped_catalog": True, "temporary_setup": setup}
+        opened_readers.append(import_boundary.session)
+        try:
+            yield import_boundary.session
+        finally:
+            opened_readers.pop()
+
+    @asynccontextmanager
+    async def snapshot(*args, **kwargs):
+        assert opened_readers == [import_boundary.session]
+        async with source_snapshot(*args, **kwargs) as session:
+            yield session
+
+    monkeypatch.setattr(managed.npi.db, "reader_session", reader)
+    monkeypatch.setattr(collection, "provider_profile_read_snapshot", snapshot)
+    policy = SimpleNamespace(
+        query=SimpleNamespace(kind="by-service", selector=None, network_generation=None),
+        exclusions=(),
+        scope_sha256="a" * 64,
+        organization_policy=None,
+    )
+    async with managed.managed_import_collection_scope(_request(_body()), policy, temporary_setup=setup):
+        assert opened_readers == [import_boundary.session]
+    assert not opened_readers
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["list", "batch"])
 @pytest.mark.parametrize("include_filter", [False, True])

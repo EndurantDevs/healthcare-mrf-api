@@ -213,7 +213,7 @@ from api.ptg2_shared_blocks import (
 )
 from api.ptg2_snapshot import current_network_snapshots_for_plan, current_source_snapshot_id_for_plan
 from api.ptg2_tables import _safe_table_name, snapshot_serving_tables
-from api.reference_family_reads import _query_catalog_neighbors, claims_dictionary_tables
+from api.reference_family_reads import _query_catalog_neighbors, claims_catalog_table, claims_dictionary_tables
 from api.signed_request_reader import is_owned_reader
 from db.connection import db, gather_reader_calls
 from db.models import (
@@ -9114,7 +9114,7 @@ async def _provider_procedure_cost_level(
 ):
     """Build the provider procedure estimated cost-level response from peer cost profiles."""
     session = _get_session(request)
-    code_catalog_table = claims_dictionary_tables(session)[0]
+    code_catalog_table = claims_catalog_table(session)
     args = request.args
 
     provider_npi = _parse_int(npi, "npi", minimum=1)

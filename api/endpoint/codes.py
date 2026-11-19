@@ -18,14 +18,14 @@ from api.code_systems import (
     normalize_code_system,
 )
 from api.endpoint.pagination import parse_pagination
-from api.reference_family_reads import claims_dictionary_tables
+from api.reference_family_reads import catalog_read_table, claims_catalog_table, claims_dictionary_tables
 from db.models import CodeCatalog, CodeCrosswalk, CodeSynonym
 
 blueprint = Blueprint("codes", url_prefix="/codes", version=1)
 
 code_catalog_table = CodeCatalog.__table__
 code_crosswalk_table = CodeCrosswalk.__table__
-code_synonym_table = CodeSynonym.__table__
+code_synonym_table = catalog_read_table(CodeSynonym)
 
 MAX_LIMIT = 200
 
@@ -125,7 +125,7 @@ async def list_codes(request):
     """List normalized reference codes with bounded filtering and paging."""
 
     session = _get_session(request)
-    code_catalog_table = claims_dictionary_tables(session)[0]
+    code_catalog_table = claims_catalog_table(session)
     args = request.args
     pagination = parse_pagination(args, default_limit=25, max_limit=MAX_LIMIT)
 
@@ -181,7 +181,7 @@ async def get_code(request, code_system: str, code: str):
     """Return one normalized code-system entry when it exists."""
 
     session = _get_session(request)
-    code_catalog_table = claims_dictionary_tables(session)[0]
+    code_catalog_table = claims_catalog_table(session)
     normalized_system = _normalize_code_system(code_system)
     normalized_code = _canonical_code_for_system(normalized_system, code)
     if not normalized_system or not normalized_code:
