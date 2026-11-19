@@ -14,7 +14,7 @@ PARTITIONS = {"HM", "HMPAMS", "HMWVMS", "HMDE", "HMWV", "HMNY", "BCBSDE", "BCBSW
 
 
 @pytest.fixture
-def sources():
+def tenant_sources():
     return {
         row["api_base"].rsplit("/", 1)[-1]: directory._source_row_from_seed(row)
         for row in directory.source_selection.configured_seed_rows()
@@ -22,16 +22,16 @@ def sources():
     }
 
 
-def test_all_partitions_have_independent_catalog_checkpoints(sources):
+def test_all_partitions_have_independent_catalog_checkpoints(tenant_sources):
     catalog_by_base = {
         row["canonical_base"]: row
         for row in provider_directory_source_catalog()["items"]
         if row["entry_id"].startswith("highmark-")
     }
-    assert set(sources) == PARTITIONS
+    assert set(tenant_sources) == PARTITIONS
     assert set(catalog_by_base) == {f"{BASE}/{partition}" for partition in PARTITIONS}
     scope_hashes = set()
-    for partition, source in sources.items():
+    for partition, source in tenant_sources.items():
         base = f"{BASE}/{partition}"
         entry = catalog_by_base[base]
         assert entry["source_ids"] == [source["source_id"]]
@@ -51,8 +51,8 @@ def test_all_partitions_have_independent_catalog_checkpoints(sources):
     assert len(scope_hashes) == len(PARTITIONS)
 
 
-def test_endpoint_identity_survives_key_rotation(monkeypatch, sources):
-    source = sources["HM"]
+def test_endpoint_identity_survives_key_rotation(monkeypatch, tenant_sources):
+    source = tenant_sources["HM"]
     endpoint_id = directory._provider_directory_api_endpoint_row(source)["endpoint_id"]
     for key_value in (None, "synthetic-key", "rotated-synthetic-key"):
         monkeypatch.setattr(
@@ -63,8 +63,8 @@ def test_endpoint_identity_survives_key_rotation(monkeypatch, sources):
         assert directory._provider_directory_api_endpoint_row(source)["endpoint_id"] == endpoint_id
 
 
-def test_issued_cursor_retains_bytes_and_partition(sources):
-    source = sources["HM"]
+def test_issued_cursor_retains_bytes_and_partition(tenant_sources):
+    source = tenant_sources["HM"]
     first = f"{BASE}/HM/PractitionerRole?_count=500"
     following = f"{BASE}/HM?_getpages=opaque%2btoken%3d&_getpagesoffset=500&_count=500"
     assert directory._resolved_fhir_next_url(source, first, following) == following
@@ -84,6 +84,55 @@ def test_issued_cursor_retains_bytes_and_partition(sources):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "next_url",
+    [
+        f"{BASE}/HMPAMS?_getpages=synthetic-cursor",
+        f"{BASE}/HM/Organization?_getpages=synthetic-cursor",
+        "https://[invalid/HM?_getpages=synthetic-cursor",
+    ],
+    ids=["sibling-tenant", "wrong-collection", "malformed-url"],
+)
+async def test_untrusted_retained_cursor_preserves_checkpoint_without_fetching(monkeypatch, tenant_sources, next_url):
+    highmark_source = tenant_sources["HM"]
+    context = directory._pagination_checkpoint_context(
+        highmark_source, [highmark_source["source_id"]], run_id="retry-example", retry_of_run_id=None
+    )
+    state = directory.PaginationResumeState(
+        next_url=next_url, pages_processed=1, rows_processed=500, recent_url_hashes=(), resumed=True
+    )
+    load = AsyncMock(return_value=state)
+    fetch, save, reset, write = AsyncMock(), AsyncMock(), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(directory, "_load_or_initialize_pagination_checkpoint", load)
+    monkeypatch.setattr(directory, "_fetch_source_json", fetch)
+    monkeypatch.setattr(directory, "_save_pagination_checkpoint", save)
+    monkeypatch.setattr(directory, "_reset_pagination_checkpoint", reset)
+    scan_outcome = await directory._fetch_resource_rows(
+        highmark_source,
+        "InsurancePlan",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=500,
+        timeout=3,
+        run_id="retry-example",
+        row_batch_handler=write,
+        retain_rows=False,
+        pagination_checkpoint=context,
+    )
+    load.assert_awaited_once_with(context, "InsurancePlan", f"{BASE}/HM/InsurancePlan?_count=500")
+    assert (
+        not scan_outcome.complete
+        and scan_outcome.next_url_remaining
+        and scan_outcome.error == "untrusted_pagination_link"
+    )
+    assert (scan_outcome.pages_fetched, scan_outcome.rows_fetched, scan_outcome.rows_written) == (1, 500, 0)
+    fetch.assert_not_called()
+    save.assert_not_called()
+    reset.assert_not_called()
+    write.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("entry_kind", "links", "expected_error"),
     [
         ("Organization", [], "highmark_invalid_search_bundle"),
@@ -95,7 +144,9 @@ def test_issued_cursor_retains_bytes_and_partition(sources):
         ),
     ],
 )
-async def test_malformed_search_page_cannot_complete_or_write(monkeypatch, sources, entry_kind, links, expected_error):
+async def test_malformed_search_page_cannot_complete_or_write(
+    monkeypatch, tenant_sources, entry_kind, links, expected_error
+):
     payload = {
         "resourceType": "Bundle",
         "type": "searchset",
@@ -105,7 +156,7 @@ async def test_malformed_search_page_cannot_complete_or_write(monkeypatch, sourc
     monkeypatch.setattr(directory, "_fetch_source_json", AsyncMock(return_value=(200, payload, None, 1)))
     write = AsyncMock(return_value=1)
     result = await directory._fetch_resource_rows(
-        sources["HM"],
+        tenant_sources["HM"],
         "InsurancePlan",
         per_resource_limit=0,
         page_limit=0,
@@ -120,7 +171,7 @@ async def test_malformed_search_page_cannot_complete_or_write(monkeypatch, sourc
 
 
 @pytest.mark.asyncio
-async def test_missing_bundle_type_is_only_allowed_on_issued_cursor(monkeypatch, sources):
+async def test_missing_bundle_type_is_only_allowed_on_issued_cursor(monkeypatch, tenant_sources):
     plan_by_field = {"resourceType": "InsurancePlan", "id": "synthetic-plan"}
     base = f"{BASE}/HM"
     cursor = f"{base}?_getpages=opaque%2btoken&_getpagesoffset=1"
@@ -136,21 +187,27 @@ async def test_missing_bundle_type_is_only_allowed_on_issued_cursor(monkeypatch,
     }
     fetch = AsyncMock(side_effect=[(200, first_page_by_field, None, 1), (200, last_page_by_field, None, 1)])
     monkeypatch.setattr(directory, "_fetch_source_json", fetch)
-    result = await directory._fetch_resource_rows(
-        sources["HM"], "InsurancePlan", per_resource_limit=0, page_limit=0, page_count=500, timeout=3, run_id=None
+    scan_outcome = await directory._fetch_resource_rows(
+        tenant_sources["HM"],
+        "InsurancePlan",
+        per_resource_limit=0,
+        page_limit=0,
+        page_count=500,
+        timeout=3,
+        run_id=None,
     )
-    assert result is not None and result.complete and result.rows_fetched == 2
+    assert scan_outcome is not None and scan_outcome.complete and scan_outcome.rows_fetched == 2
     assert fetch.await_args.args[1] == cursor
     with pytest.raises(ValueError, match="highmark_invalid_search_bundle"):
         directory.highmark.search_next_link(
-            directory, sources["HM"], last_page_by_field, "InsurancePlan", f"{base}/InsurancePlan"
+            directory, tenant_sources["HM"], last_page_by_field, "InsurancePlan", f"{base}/InsurancePlan"
         )
 
 
 @pytest.mark.asyncio
-async def test_highmark_key_is_required_and_used_only_in_verified_requests(monkeypatch, sources):
+async def test_highmark_key_is_required_and_used_only_in_verified_requests(monkeypatch, tenant_sources):
     selection = directory.source_selection
-    source = sources["HM"]
+    source = tenant_sources["HM"]
     cursor = f"{BASE}/HM?_getpages=opaque%2Btoken&_getpagesoffset=500"
     send = AsyncMock(return_value=(200, {"resourceType": "Bundle"}, None, 1))
     monkeypatch.setattr(directory, "_fetch_json_with_source_session", send)
