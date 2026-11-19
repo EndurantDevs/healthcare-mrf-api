@@ -2,11 +2,13 @@
 """Bound independent bulk transfers without sharing physical Source sessions."""
 
 import asyncio
+import os
 from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
 
+from process import provider_directory_bulk_grouping as grouping
 from process import provider_directory_bulk_spool as spool
 from process.provider_directory_fhir_response import AdaptiveRequestSlots
 from process.provider_directory_generic_source_policy import source_copy_executor
@@ -66,6 +68,17 @@ async def stream_output(directory, session, source_record, identity, manifest, o
     """Retry a broken stream from its committed boundary under the original guard."""
     output, checkpoint = output_pair
     is_spooled = options.range_resume_enabled and spool.is_enabled(source_record)
+    from process import provider_directory_bulk_grouped_load as grouped_load
+
+    if is_spooled and grouped_load.uses_grouped_load(directory, source_record, identity, options):
+        return await grouped_load.grouped_export(
+            directory, session, source_record, identity, manifest, options, stream_state
+        )
+    # Whatever the settings say now: grouped outputs' copies are gone and merged rows are staged.
+    # shortcut: the marker lives under the copy root, so the root must stay in place until the acquisition
+    # ends; keep the mode with the checkpoint if roots ever move under running acquisitions.
+    if os.getenv(spool.SPOOL_ROOT_ENV) and (spool.group_directory(identity.checkpoint_id) / "mode").exists():
+        return "bulk_export_group_mode_changed"
     if is_spooled and (
         spool_error := await _spooled_export(directory, session, source_record, identity, manifest, options)
     ):
@@ -108,11 +121,12 @@ async def stream_output(directory, session, source_record, identity, manifest, o
 
 
 def holds_copy(source_record, checkpoint_id, output_checkpoint, validator):
-    """Whether this validated output is already saved, so its link is no longer needed."""
-    return (
-        validator is not None
-        and spool.is_enabled(source_record)
-        and spool.spooled_output(checkpoint_id, output_checkpoint["output_index"], validator).path.exists()
+    """Whether this validated output is already saved or grouped, so its link is no longer needed."""
+    if validator is None or not spool.is_enabled(source_record):
+        return False
+    output_index = output_checkpoint["output_index"]
+    return spool.spooled_output(checkpoint_id, output_index, validator).path.exists() or grouping.is_grouped(
+        spool.group_directory(checkpoint_id), output_index
     )
 
 
@@ -132,21 +146,31 @@ class _CopyContext:
 
 async def _spooled_export(directory, session, source_record, identity, manifest, options):
     """Save every incomplete output of one export once, before any of them is parsed."""
-    tasks_by_checkpoint = state(directory, source_record).setdefault("spool_exports", {})
-    task = tasks_by_checkpoint.get(identity.checkpoint_id)
+    context = _CopyContext(directory, session, source_record, identity, manifest, options)
+    return await shared_task(
+        directory, source_record, "spool_exports", identity.checkpoint_id, partial(_spool_export, context)
+    )
+
+
+async def shared_task(directory, source_record, kind, checkpoint_id, start):
+    """Run one task of this kind per export, awaited by every stream of the export; only success stays cached."""
+    tasks_by_checkpoint = state(directory, source_record).setdefault(kind, {})
+    task = tasks_by_checkpoint.get(checkpoint_id)
     if task is None:
-        context = _CopyContext(directory, session, source_record, identity, manifest, options)
-        task = asyncio.create_task(_spool_export(context))
-        tasks_by_checkpoint[identity.checkpoint_id] = task
+        task = tasks_by_checkpoint[checkpoint_id] = asyncio.create_task(start())
+    is_cached = False
     try:
         # Every stream of the export waits on one shared task; a cancelled stream stops it only through the drain.
         error = await asyncio.shield(task)
+        is_cached = not error
+        return error
     except asyncio.CancelledError:
         await _cancel_and_drain([task])
         raise
-    if error and tasks_by_checkpoint.get(identity.checkpoint_id) is task:
-        del tasks_by_checkpoint[identity.checkpoint_id]  # a later attempt downloads what is still missing
-    return error
+    finally:
+        # After an error, an exception or a cancellation, a later attempt redoes what is still missing.
+        if not is_cached and tasks_by_checkpoint.get(checkpoint_id) is task:
+            del tasks_by_checkpoint[checkpoint_id]
 
 
 async def _spool_export(context):
@@ -156,7 +180,10 @@ async def _spool_export(context):
     for output in context.manifest.outputs:
         checkpoint = directory._bulk_output_checkpoint_for_manifest_output(checkpoint_id, output, checkpoints)
         # Completion clears the ETag capability and keeps only its proof, so a completed output has no validator.
-        if directory._is_complete_bulk_output_proof(checkpoint):
+        # A grouped output's copy is deleted once its group files are durable.
+        if directory._is_complete_bulk_output_proof(checkpoint) or grouping.is_grouped(
+            spool.group_directory(checkpoint_id), output.output_index
+        ):
             continue
         validator = directory._stored_bulk_output_validator(checkpoint)
         if validator is None:

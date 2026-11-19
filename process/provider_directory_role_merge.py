@@ -160,11 +160,18 @@ def merged_role_rows(
     opted_in_source_ids = _opted_in_source_ids()
     # shortcut: read per batch and not persisted on the dataset; changing it mid-acquisition mixes merged and
     # unmerged roles in one edition, so persist the choice on the dataset before toggling a source that is loading.
+    if any(resource_row.get("source_id") not in opted_in_source_ids for resource_row in resource_rows):
+        return retained_rows
+    return fold_merged_roles(retained_rows, resource_hash_contract)
+
+
+def fold_merged_roles(retained_rows: list[dict[str, Any]], resource_hash_contract: str) -> list[dict[str, Any]]:
+    """Retain one batch of a merged-role source's roles as one row per merged role; the caller decides the source."""
+
     if (
         not retained_rows
         or retained_rows[0]["resource_type"] != "PractitionerRole"
         or not is_semantic_resource_hash_contract(resource_hash_contract)
-        or any(resource_row.get("source_id") not in opted_in_source_ids for resource_row in resource_rows)
     ):
         return retained_rows
     payload_by_role_id: dict[str, dict[str, Any]] = {}
@@ -177,13 +184,21 @@ def merged_role_rows(
         payload_by_role_id[payload_by_field["resource_id"]] = (
             payload_by_field if previous is None else merge_semantic_resource_payloads(previous, payload_by_field)
         )
+    return finish_merged_roles(retained_rows[0], payload_by_role_id, resource_hash_contract)
+
+
+def finish_merged_roles(
+    template_row: Mapping[str, Any], payload_by_role_id: Mapping[str, Mapping[str, Any]], resource_hash_contract: str
+) -> list[dict[str, Any]]:
+    """Build the retained rows of folded merged roles, in role id order."""
+
     merged_rows = []
     for role_id, payload_by_field in sorted(payload_by_role_id.items()):
         hashed_role = _HashedRole(payload_by_field)
         hashed_role.components = merged_role_hash_components(payload_by_field)
         merged_rows.append(
             {
-                **retained_rows[0],
+                **template_row,
                 "resource_id": role_id,
                 "payload_hash": resource_payload_sha256_for_contract(
                     hashed_role, resource_hash_contract, resource_type="PractitionerRole"
@@ -192,6 +207,51 @@ def merged_role_rows(
             }
         )
     return merged_rows
+
+
+class RoleObservationUnion:
+    """Union any number of full observations of one merged role in one pass.
+
+    Equal to folding them pairwise with merge_semantic_resource_payloads, whose list unions re-sort the growing
+    lists at every step (quadratic in the sightings of one role).
+    """
+
+    __slots__ = ("rank", "base_by_field", "entry_by_identity_by_name", "listed_names")
+
+    def __init__(self, observation_by_field: Mapping[str, Any]) -> None:
+        self.rank = None
+        self.base_by_field: Mapping[str, Any] = observation_by_field
+        names = [*_role_network_fields(observation_by_field), NATIVE_ROLES]
+        self.entry_by_identity_by_name: dict[str, dict[str, Any]] = {name: {} for name in names}
+        self.listed_names: set[str] = set()
+        self.add(observation_by_field)
+
+    def add(self, observation_by_field: Mapping[str, Any]) -> None:
+        """Take one more observation; a repeat or a payload that is not its own merged identity is refused."""
+
+        if observation_by_field.get(_REPEAT) is True or not _is_merged_role(observation_by_field):
+            raise ValueError("provider_directory_merged_role_observation_invalid")
+        if observation_by_field["resource_id"] != self.base_by_field["resource_id"]:
+            raise ValueError("provider_directory_merged_role_observation_invalid")
+        # The same provenance choice as _merge_role_payloads: the largest identity fields win.
+        rank = _stable_json([observation_by_field.get(name) for name in sorted(_ROLE_IDENTITY_FIELDS)])
+        if self.rank is None or rank > self.rank:
+            self.rank, self.base_by_field = rank, observation_by_field
+        for name, entry_by_identity in self.entry_by_identity_by_name.items():
+            entries = observation_by_field.get(name)
+            if isinstance(entries, list):
+                self.listed_names.add(name)
+                for entry in entries:
+                    entry_by_identity.setdefault(_stable_json(entry), entry)
+
+    def merged_payload(self) -> dict[str, Any]:
+        """The merged role with every per-network list unioned and sorted once."""
+
+        merged_by_field = dict(self.base_by_field)
+        for name in self.listed_names:
+            entry_by_identity = self.entry_by_identity_by_name[name]
+            merged_by_field[name] = [entry_by_identity[identity] for identity in sorted(entry_by_identity)]
+        return merged_by_field
 
 
 def _merge_role_payloads(first: Mapping[str, Any], second: Mapping[str, Any]) -> dict[str, Any] | None:

@@ -7,6 +7,7 @@ import importlib
 import json
 import threading
 import time
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,8 +16,14 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
+from process import provider_directory_bulk_grouped_load as grouped_load
+from process import provider_directory_bulk_grouping as grouping
 from process import provider_directory_bulk_parallel as parallel
 from process import provider_directory_bulk_spool as spool
+from process import provider_directory_fhir_response as fhir_response
+from process import provider_directory_generic_source_adapters as adapters
+from process import provider_directory_role_merge as role_merge
+from process.provider_directory_resource_hash import SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
 from tests.test_provider_directory_bulk_parallel import _source
 
 directory = importlib.import_module("process.provider_directory_fhir")
@@ -58,28 +65,31 @@ def spooled_source(monkeypatch, tmp_path):
 def _output_server(requests, break_first_after=None, trickle=None):
     async def output(request):
         requests.append(dict(request.headers))
+        # "/other" serves the same roles under three other networks, at the same length.
+        body = BODY if request.path == "/output" else BODY.replace(b"Organization/n", b"Organization/m")
         start = int(request.headers.get("Range", "bytes=0-")[6:].split("-")[0])
-        length = trickle if trickle is not None else len(BODY) - start
+        length = trickle if trickle is not None else len(body) - start
         headers_by_name = {"ETag": ETAG, "Accept-Ranges": "bytes", "Content-Length": str(length)}
         if start:
-            headers_by_name["Content-Range"] = f"bytes {start}-{len(BODY) - 1}/{len(BODY)}"
+            headers_by_name["Content-Range"] = f"bytes {start}-{len(body) - 1}/{len(body)}"
         response = web.StreamResponse(status=206 if start else 200, headers=headers_by_name)
         await response.prepare(request)
         if break_first_after is not None and len(requests) == 1:
-            await response.write(BODY[:break_first_after])
+            await response.write(body[:break_first_after])
             await asyncio.sleep(0.5)  # let the client consume what arrived
             request.transport.close()
             return response
         if trickle is not None:
             for offset in range(0, trickle, trickle // 5):
-                await response.write(BODY[offset : offset + trickle // 5])
+                await response.write(body[offset : offset + trickle // 5])
                 await asyncio.sleep(0.1)
             return response
-        await response.write(BODY[start:])
+        await response.write(body[start:])
         return response
 
     application = web.Application()
     application.router.add_get("/output", output)
+    application.router.add_get("/other", output)
     return TestServer(application)
 
 
@@ -257,10 +267,12 @@ async def test_retry_after_link_expiry_uses_copies_instead_of_probing(spooled_so
 
     _, error = await directory._prepare_bulk_output_validators(*arguments, timeout=5, ownership_probe=AsyncMock())
     assert error == "bulk_export_output_url_expired"
-    for index in (0, 1):
-        path = spool.spooled_output(CHECKPOINT_ID, index, expired).path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"")
+    path = spool.spooled_output(CHECKPOINT_ID, 0, expired).path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"")
+    # A grouped output's copy is gone once its group files are durable; its marker holds the bytes instead.
+    group_writer = grouping.GroupWriter(spool.group_directory(CHECKPOINT_ID), 1, partitions=4)
+    group_writer.finish(0)
 
     _, error = await directory._prepare_bulk_output_validators(*arguments, timeout=5, ownership_probe=AsyncMock())
     assert error is None
@@ -372,3 +384,326 @@ async def test_cancelled_streams_wait_for_every_download_to_close_its_copy(spool
                 stored = writer.part_path.read_bytes() if writer.part_path.exists() else b""
                 writer.close()
                 assert (len(spool.zstd.decompress(stored)) if stored else 0) == writer.durable_bytes
+
+
+# 120 source roles of 7 practitioners, each seen in 3 networks: 7 merged roles per output.
+ROLE_BODY = b"".join(
+    json.dumps(
+        {
+            "resourceType": "PractitionerRole",
+            "id": f"r{index}",
+            "active": True,
+            "practitioner": {"reference": f"Practitioner/p{index % 7}"},
+            "network": [{"reference": f"Organization/n{index % 3}"}],
+        }
+    ).encode()
+    + b"\n"
+    for index in range(120)
+)
+CRASH_STAGES = ("mid_group", "before_load", "mid_load", "before_finish", "before_cleanup")
+
+
+class _Ledger:
+    """What a fake database committed: staged rows and output completions; a failed transaction keeps nothing."""
+
+    def __init__(self):
+        self.staged_rows, self.completions, self.pending = [], {}, None
+        self.complete_calls = 0
+
+    @asynccontextmanager
+    async def transaction(self, database, **coordinates):
+        if self.pending is not None:
+            yield
+            return
+        self.pending = ([], {})
+        try:
+            yield
+            self.staged_rows += self.pending[0]
+            self.completions |= self.pending[1]
+        finally:
+            self.pending = None
+
+    async def persist(self, directory, prepared_rows, **scope):
+        self.pending[0].extend(prepared_rows)
+        return prepared_rows
+
+    async def count(self, directory, context, resource_type, *, distinct=True):
+        assert distinct is False and resource_type == "PractitionerRole"
+        return len(self.staged_rows)
+
+    async def complete(self, identity, output_id, rows_written, committed_bytes, *, require_validator):
+        assert require_validator and committed_bytes == len(ROLE_BODY)
+        self.complete_calls += 1
+        self.pending[1][output_id] = rows_written
+
+
+@pytest.fixture
+def grouped_source(spooled_source, monkeypatch):
+    monkeypatch.setenv(role_merge.MERGED_ROLE_SOURCES_ENV, "pd-source")
+    monkeypatch.setenv(grouped_load.WORKERS_ENV, "0")
+    monkeypatch.setattr(grouping, "PARTITIONS", 8)
+    monkeypatch.setitem(globals(), "BODY", ROLE_BODY)  # what the fake output server serves
+    return spooled_source | {
+        "_endpoint_dataset_id": "dataset-grouped",
+        "_resource_hash_contract": SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        "_semantic_projection_as_of": "2026-08-09",
+    }
+
+
+def _grouped_fakes(monkeypatch, ledger):
+    monkeypatch.setattr(directory, "source_checkpoint_transaction", ledger.transaction)
+    monkeypatch.setattr(grouped_load, "persist_prepared_rows", ledger.persist)
+    monkeypatch.setattr(adapters, "candidate_resource_count", ledger.count)
+    monkeypatch.setattr(directory, "_complete_bulk_export_output", ledger.complete)
+    monkeypatch.setattr(directory, "_begin_bulk_export_output", AsyncMock())
+    monkeypatch.setattr(directory, "_stored_bulk_output_validator", lambda checkpoint: _validator(len(ROLE_BODY)))
+    monkeypatch.setattr(directory, "_record_bulk_export_output_progress", AsyncMock())
+    monkeypatch.setattr(
+        directory, "_is_complete_bulk_output_proof", lambda checkpoint: checkpoint["output_id"] in ledger.completions
+    )
+
+
+def _grouped_identity(checkpoint_id=CHECKPOINT_ID):
+    return SimpleNamespace(
+        checkpoint_id=checkpoint_id,
+        resource_type="PractitionerRole",
+        dataset_id="dataset-grouped",
+        endpoint_id="endpoint-grouped",
+        acquisition_root_run_id="root-grouped",
+    )
+
+
+def _grouped_options():
+    return SimpleNamespace(
+        ownership_probe=AsyncMock(),
+        timeout=30,
+        range_resume_enabled=True,
+        retain_rows=False,
+        row_batch_size=50,
+        run_id="run-grouped",
+    )
+
+
+async def _run_grouped(session, source_record, identity, manifest, checkpoints, ledger):
+    """One worker run: the scheduler streams only the outputs the ledger has not completed."""
+    source_record.pop("_provider_directory_bulk_parallel", None)
+    options, stream_state = _grouped_options(), SimpleNamespace(rows_written_this_run=0, outputs_processed=0)
+    pairs = [pair for pair in zip(manifest.outputs, checkpoints) if pair[1]["output_id"] not in ledger.completions]
+    streams = [
+        parallel.stream_output(directory, session, source_record, identity, manifest, pair, options, stream_state)
+        for pair in pairs
+    ]
+    return await asyncio.gather(*streams, return_exceptions=True)
+
+
+def _crash_once(monkeypatch, owner, name, call_number, should_crash=lambda *arguments: True):
+    original, calls = getattr(owner, name), []
+
+    def crashing(*arguments, **keywords):
+        if should_crash(*arguments):
+            calls.append(arguments)
+            if len(calls) == call_number:
+                raise RuntimeError("injected crash")
+        return original(*arguments, **keywords)
+
+    monkeypatch.setattr(owner, name, crashing)
+
+
+def _inject_crash(monkeypatch, stage):
+    if stage == "mid_group":  # the second output's first batch: the first output is grouped, the second is not
+        _crash_once(monkeypatch, grouped_load, "prepare_lines", 4)
+    elif stage == "before_load":
+        _crash_once(monkeypatch, grouping, "reduce_partition", 1)
+    elif stage == "mid_load":  # the second partition's rows are committed, its marker is not: it is replayed
+        _crash_once(monkeypatch, grouping, "mark_loaded", 2)
+    elif stage == "before_finish":
+        monkeypatch.setattr(adapters, "candidate_resource_count", AsyncMock(side_effect=RuntimeError("injected crash")))
+    else:  # the outputs are complete; only the export's local directory is still there
+        _crash_once(monkeypatch, grouping, "discard", 1, lambda path: path.name == CHECKPOINT_ID)
+
+
+def _merged_rows(ledger):
+    return {(staged["resource_id"], staged["payload_hash"]) for staged in ledger.staged_rows}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", CRASH_STAGES)
+async def test_grouped_load_resumes_after_a_crash_at_each_stage(grouped_source, monkeypatch, stage):
+    requests = []
+    async with _output_server(requests) as server, aiohttp.ClientSession() as session:
+        manifest, checkpoints = _two_output_export(monkeypatch, str(server.make_url("/output")), ("streaming",) * 2)
+        manifest.outputs[1].url = str(server.make_url("/other"))  # neither output alone holds a role's networks
+        clean = _Ledger()
+        _grouped_fakes(monkeypatch, clean)
+        clean_identity = _grouped_identity("d" * 64)
+        assert await _run_grouped(session, dict(grouped_source), clean_identity, manifest, checkpoints, clean) == [
+            None,
+            None,
+        ]
+        requests.clear()
+
+        ledger = _Ledger()
+        _grouped_fakes(monkeypatch, ledger)
+        with monkeypatch.context() as crash:
+            _inject_crash(crash, stage)
+            crashed_streams = await _run_grouped(
+                session, grouped_source, _grouped_identity(), manifest, checkpoints, ledger
+            )
+        assert crashed_streams and all(isinstance(error, RuntimeError) for error in crashed_streams)
+        assert len(requests) == 2  # every copy was saved before grouping began
+        assert await _run_grouped(session, grouped_source, _grouped_identity(), manifest, checkpoints, ledger) in (
+            [None, None],
+            [],
+        )
+
+    assert len(requests) == 2  # the restart used the copies and markers, never the links
+    assert ledger.complete_calls == 2 and set(ledger.completions) == {"o0", "o1"}
+    assert sum(ledger.completions.values()) == len(ledger.staged_rows)
+    assert _merged_rows(ledger) == _merged_rows(clean) and len(_merged_rows(clean)) == 7
+    assert all(len(staged["payload_json"]["network_refs"]) == 6 for staged in clean.staged_rows)
+    # committed_bytes moves only at finish: no output progress, and outputs begin only to be completed.
+    directory._record_bulk_export_output_progress.assert_not_awaited()
+    assert all(
+        call.kwargs == {"preserve_progress": True} for call in directory._begin_bulk_export_output.await_args_list
+    )
+    assert not list(spool.group_directory(CHECKPOINT_ID).parent.rglob("*.zst"))  # copies and group files are gone
+
+
+@pytest.mark.asyncio
+async def test_grouping_renews_the_lease_while_workers_run(grouped_source, monkeypatch):
+    clock = iter(range(0, 10**6, 61))  # every reading is a minute after the last
+    monkeypatch.setattr(directory, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    monkeypatch.setattr(grouped_load, "_PROBE_SECONDS", 0.01)
+    renewed, real_group_output = threading.Event(), grouped_load.group_output
+    renewals_by_stage = {}
+
+    async def renew(identity):
+        if "download" in renewals_by_stage and directory._refresh_bulk_export_rows_written.await_count >= (
+            renewals_by_stage["download"] + 2
+        ):
+            renewed.set()
+
+    def slow_group_output(*arguments):
+        assert renewed.wait(30)  # a long group step: it ends only after the lease was renewed twice
+        return real_group_output(*arguments)
+
+    directory._refresh_bulk_export_rows_written.side_effect = renew
+    monkeypatch.setattr(grouped_load, "group_output", slow_group_output)
+    requests = []
+    async with _output_server(requests) as server, aiohttp.ClientSession() as session:
+        manifest, checkpoints = _two_output_export(monkeypatch, str(server.make_url("/output")), ("streaming",) * 2)
+        ledger = _Ledger()
+        _grouped_fakes(monkeypatch, ledger)
+        original_group = grouped_load._group
+
+        async def observed_group(*arguments):
+            renewals_by_stage["download"] = directory._refresh_bulk_export_rows_written.await_count
+            return await original_group(*arguments)
+
+        monkeypatch.setattr(grouped_load, "_group", observed_group)
+        observations = []
+        token = fhir_response.BULK_EXPORT_WAIT_CALLBACK.set(AsyncMock(side_effect=observations.append))
+        try:
+            assert await _run_grouped(session, grouped_source, _grouped_identity(), manifest, checkpoints, ledger) == [
+                None,
+                None,
+            ]
+        finally:
+            fhir_response.BULK_EXPORT_WAIT_CALLBACK.reset(token)
+
+    assert renewed.is_set()
+    assert {"group", "load"} <= {observation["stage"] for observation in observations}  # progress stays live
+    assert set(ledger.completions) == {"o0", "o1"}
+
+
+async def _route(monkeypatch, source_record):
+    """Which way stream_output sends one role output, with the download and both paths faked."""
+    stream, grouped = AsyncMock(return_value=None), AsyncMock(return_value=None)
+    monkeypatch.setattr(parallel, "_spooled_export", AsyncMock(return_value=None))
+    monkeypatch.setattr(directory, "_stream_one_checkpointed_bulk_output", stream)
+    monkeypatch.setattr(grouped_load, "grouped_export", grouped)
+    monkeypatch.setattr(directory, "_stored_bulk_output_validator", lambda checkpoint: _validator())
+    checkpoint_by_field = {"output_id": "o0", "output_index": 0, "state": "streaming"}
+    output = SimpleNamespace(url="https://files.example/output", output_index=0)
+    error = await parallel.stream_output(
+        directory,
+        None,
+        source_record,
+        _grouped_identity(),
+        None,
+        (output, checkpoint_by_field),
+        _grouped_options(),
+        None,
+    )
+    return error, stream.await_count, grouped.await_count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {},
+        {"_resource_hash_contract": "transport_neutral_v2"},
+        {"canonical_api_base": directory.SCAN_PROVIDER_DIRECTORY_BASE},
+    ],
+    ids=["merged", "unmerged contract", "reverse lookup"],
+)
+async def test_only_semantic_sources_without_reverse_lookup_take_grouping(grouped_source, monkeypatch, changes):
+    error, streams, groups = await _route(monkeypatch, grouped_source | changes)
+    assert error is None and (streams, groups) == ((0, 1) if not changes else (1, 0))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setting", [role_merge.MERGED_ROLE_SOURCES_ENV, spool.SPOOL_SOURCES_ENV])
+async def test_turning_grouping_off_mid_acquisition_ends_it(grouped_source, monkeypatch, setting):
+    mode_path = spool.group_directory(CHECKPOINT_ID) / "mode"
+    mode_path.parent.mkdir(parents=True)
+    mode_path.write_bytes(b'{"partitions":8,"version":1}')
+    monkeypatch.setenv(setting, "")  # merged roles off, or saved outputs off for this source
+
+    assert await _route(monkeypatch, grouped_source) == ("bulk_export_group_mode_changed", 0, 0)
+    assert directory._is_bulk_export_error_terminal("bulk_export_group_mode_changed")
+
+
+@pytest.mark.asyncio
+async def test_shared_task_is_redone_after_it_raises_or_is_cancelled(spooled_source):
+    starts = []
+
+    async def start():
+        starts.append(None)
+        if len(starts) == 1:
+            raise RuntimeError("first attempt")
+        if len(starts) == 2:
+            await asyncio.sleep(3600)
+
+    def run():
+        return parallel.shared_task(directory, spooled_source, "kind", CHECKPOINT_ID, start)
+
+    with pytest.raises(RuntimeError):
+        await run()
+    waiter = asyncio.create_task(run())
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert await run() is None
+    assert await run() is None
+    assert len(starts) == 3  # only the clean return stays cached
+
+
+@pytest.mark.asyncio
+async def test_spawned_worker_groups_loads_and_finishes(grouped_source, monkeypatch):
+    monkeypatch.setenv(grouped_load.WORKERS_ENV, "1")  # a real spawn pool: tasks, results and errors are pickled
+    requests = []
+    async with _output_server(requests) as server, aiohttp.ClientSession() as session:
+        manifest, checkpoints = _two_output_export(monkeypatch, str(server.make_url("/output")), ("streaming",) * 2)
+        ledger = _Ledger()
+        _grouped_fakes(monkeypatch, ledger)
+        assert await _run_grouped(session, grouped_source, _grouped_identity(), manifest, checkpoints, ledger) == [
+            None,
+            None,
+        ]
+
+    assert set(ledger.completions) == {"o0", "o1"} and len(requests) == 2
+    assert len(_merged_rows(ledger)) == 7 and sum(ledger.completions.values()) == len(ledger.staged_rows)

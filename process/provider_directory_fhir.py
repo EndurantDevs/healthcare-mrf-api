@@ -43398,6 +43398,7 @@ def _is_bulk_export_error_terminal(error: str | None) -> bool:
         "bulk_export_output_etag_mismatch",
         "bulk_export_output_capability_refresh_exhausted",
         "bulk_export_output_capability_refresh_lineage_unverified",
+        "bulk_export_group_mode_changed",
         "invalid_ndjson",
     }
     terminal_prefixes = ("bulk_export_manifest_", "bulk_export_error_")
@@ -55097,32 +55098,24 @@ async def _persist_endpoint_dataset_rows(
     resource_hash_contract: str,
     semantic_projection_as_of: str | None,
 ) -> list[dict[str, Any]]:
-    """Append observations and page proof within the original publisher transaction."""
-    from process.provider_directory_generic_source_policy import source_transaction
+    """Prepare purely, then append observations and page proof within the original publisher transaction."""
+    from process.provider_directory_bulk_prepare import persist_prepared_rows
 
-    async with source_transaction(db):
-        from process.provider_directory_generic_source_adapters import persist_source_rows, require_source_transaction
-
-        require_source_transaction()
-        prepared_rows = _endpoint_dataset_resource_rows(
-            model, resource_rows, dataset_id=dataset_id, resource_hash_contract=resource_hash_contract
-        )
-        prepared_rows = merged_role_rows(prepared_rows, resource_rows, resource_hash_contract)
-        if not prepared_rows:
-            return prepared_rows
+    prepared_rows = _endpoint_dataset_resource_rows(
+        model, resource_rows, dataset_id=dataset_id, resource_hash_contract=resource_hash_contract
+    )
+    prepared_rows = merged_role_rows(prepared_rows, resource_rows, resource_hash_contract)
+    if prepared_rows:
         _assert_practitioner_semantic_projection_as_of(
             model, resource_rows, resource_hash_contract, semantic_projection_as_of
         )
-        await persist_source_rows(
-            sys.modules[__name__],
-            prepared_rows,
-            resource_hash_contract=resource_hash_contract,
-            semantic_projection_as_of=semantic_projection_as_of,
-        )
-        await persist_dataset_proof_shard(
-            db, _schema(), prepared_rows, dataset_id=dataset_id, expected_resource_hash_contract=resource_hash_contract
-        )
-        return prepared_rows
+    return await persist_prepared_rows(
+        sys.modules[__name__],
+        prepared_rows,
+        dataset_id=dataset_id,
+        resource_hash_contract=resource_hash_contract,
+        semantic_projection_as_of=semantic_projection_as_of,
+    )
 
 
 def _validated_endpoint_dataset_resource_scope(

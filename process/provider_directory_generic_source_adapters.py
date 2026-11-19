@@ -124,8 +124,8 @@ async def _legacy_candidate_count(directory, context, resource_type):
     return int(count_map.get("unique_candidate_rows") or 0)
 
 
-async def candidate_resource_count(directory, context, resource_type):
-    """Count exact active loading identities without exposing or preparing an input heap."""
+async def candidate_resource_count(directory, context, resource_type, *, distinct=True):
+    """Count exact active loading identities, or with distinct=False every active staged row, without an input heap."""
     if not is_source_storage_required():
         return await _legacy_candidate_count(directory, context, resource_type)
     from process.provider_directory_generic_source_policy import _publisher_scope, _require_active_source_session
@@ -150,8 +150,9 @@ async def candidate_resource_count(directory, context, resource_type):
         await _verify_tables(connection, policy, binding)
         cutoff = max(binding["resets"].get("*", 0), binding["resets"].get(resource_type, 0))
         table = storage_relation(policy.schema, binding["tables"]["resource_input"]["name"])
+        counted = 'DISTINCT resource_id COLLATE "C"' if distinct else "*"
         count = await connection.fetchval(
-            f'SELECT count(DISTINCT resource_id COLLATE "C") FROM {table} '
+            f"SELECT count({counted}) FROM {table} "
             "WHERE dataset_id=$1 AND resource_type=$2 AND batch_ordinal>$3 AND batch_ordinal<=$4",
             context.dataset_id,
             resource_type,
