@@ -374,6 +374,7 @@ def directory_location_status_sql(
     """
 
 
+# OFFSET 0 keeps the fallback keyed to each matched office across the named dataset union.
 _LOCATION_STATUS_SQL = """
         WITH {current_dataset_ctes_sql}, matched_overlays AS MATERIALIZED (
             SELECT overlay.source_record_id,
@@ -405,11 +406,15 @@ _LOCATION_STATUS_SQL = """
                 ON role.source_id = overlay.source_id
                AND role.resource_id = overlay.resource_id
                AND role.last_seen_run_id = dataset.run_id
-         LEFT JOIN {resource_table_sql} AS resource
-                ON role.resource_id IS NULL
-               AND resource.dataset_id = dataset.dataset_id
-               AND resource.resource_type = 'PractitionerRole'
-               AND resource.resource_id = overlay.resource_id
+         LEFT JOIN LATERAL (
+                   SELECT resource.resource_id, resource.payload_json
+                     FROM {resource_table_sql} AS resource
+                    WHERE role.resource_id IS NULL
+                      AND resource.dataset_id = dataset.dataset_id
+                      AND resource.resource_type = 'PractitionerRole'
+                      AND resource.resource_id = overlay.resource_id
+                   OFFSET 0
+               ) AS resource ON TRUE
              WHERE role.resource_id IS NOT NULL
                 OR resource.resource_id IS NOT NULL
         )
