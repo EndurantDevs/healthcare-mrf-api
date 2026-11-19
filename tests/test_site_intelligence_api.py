@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from sanic.exceptions import InvalidUsage
+from sqlalchemy.dialects.postgresql import asyncpg
 
 
 @pytest.fixture
@@ -189,17 +190,22 @@ def test_site_intelligence_pharmacy_geo_stmt_uses_unified_addresses(site_intel_m
         lat_delta=0.1,
         lng_delta=0.1,
     )
-    compiled = str(stmt.compile(compile_kwargs={"literal_binds": True})).lower()
+    compiled = stmt.compile(dialect=asyncpg.dialect(), compile_kwargs={"render_postcompile": True})
+    sql = str(compiled).lower()
+    address_table = site_intel_module.EntityAddressUnified.__table__.fullname
 
-    assert "entity_address_unified" in compiled
-    assert "npi_address" not in compiled
-    assert "coalesce" in compiled
-    assert "address_precision" in compiled
-    assert "city_zip" in compiled
-    assert "npi_taxonomy" in compiled
-    assert "healthcare_provider_taxonomy_code" in compiled
-    assert "taxonomy_array" not in compiled
-    assert "3336" in compiled
+    assert "entity_address_unified" in sql
+    assert "npi_address" not in sql
+    assert "join lateral" in sql
+    assert "limit" in sql
+    assert 1 in compiled.params.values()
+    assert f"npi_taxonomy.npi = {address_table}.npi" in sql
+    assert "npi_taxonomy.healthcare_provider_taxonomy_code like" in sql
+    assert "taxonomy_array" not in sql
+    assert "3336%" in compiled.params.values()
+    assert sql.count("::numeric") == 4
+    assert ".type = 'primary'" in sql
+    assert f"coalesce({address_table}.address_precision, '') != 'city_zip'" in sql
 
 
 @pytest.mark.asyncio
