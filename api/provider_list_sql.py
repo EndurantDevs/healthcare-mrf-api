@@ -308,6 +308,44 @@ _OTHER_ZIP_PAGE_FILTERS = (
 )
 
 
+def _provider_page_access(scope, filters, address_source, taxonomy_source, *, plain_sort, ordinary, native_only):
+    """Choose NPI ordering and the office source for page discovery."""
+    compact = scope is not None and scope.is_compact_network_selection
+    nationwide_page = compact and len(scope.network_ids) in (4, 5)
+    zip_code = filters.get("zip_code")
+    location = zip_code or filters.get("city") or filters.get("state")
+    computed = bool(filters.get("plan_network")) or (
+        plain_sort and ((ordinary and zip_code) or (compact and (location or nationwide_page)))
+    )
+    if not (nationwide_page and plain_sort and native_only and not location):
+        return computed, None, address_source
+    if not filters["primary_only"] or len(filters["codes"] or ()) != 1:
+        return computed, None, address_source
+    other_filters = (
+        "classification",
+        "section",
+        "display_name",
+        "specialization",
+        "plan_network",
+        "plan_release_id",
+        "provider_sex_code",
+        "has_insurance",
+        "phone_digits",
+        "address_key",
+        "address_site_key",
+        "npi",
+        "min_address_sources",
+        "procedure_codes_input",
+        "medication_codes_input",
+    )
+    if any(filters.get(key) for key in other_filters):
+        return computed, None, address_source
+    from api.network_compact_address import compact_selected_offices
+
+    keys, offices = compact_selected_offices(scope.manifest.compact_layout, scope.network_ids)
+    return computed, keys, f"{offices} as c {taxonomy_source}"
+
+
 def _provider_registry_page_cte(
     projection: str,
     where: str,

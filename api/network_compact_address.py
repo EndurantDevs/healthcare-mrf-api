@@ -84,6 +84,34 @@ def _projection_column_names(columns):
     return columns
 
 
+def _office_rows(layout, physical_columns):
+    base = f"SELECT {physical_columns} FROM ONLY {_relation(layout.base)} base WHERE row_origin<>'network_custom'"
+    if layout.custom is not None:
+        base += f" AND NOT EXISTS(SELECT 1 FROM ONLY {_relation(layout.custom)} custom WHERE custom.location_key=base.location_key)"
+        base += f" UNION ALL SELECT {physical_columns} FROM ONLY {_relation(layout.custom)}"
+    return base
+
+
+def compact_selected_offices(layout, network_ids):
+    """Read each selected office once for nationwide page discovery."""
+    _validate_address_selection(layout, network_ids, None, False)
+    selected = _membership_arms(layout, selected=True)
+    if not selected:
+        selected = "SELECT NULL::text AS location_key WHERE FALSE"
+    keys = f"selected_office_keys AS MATERIALIZED (SELECT DISTINCT location_key FROM ({selected}) selected)"
+    columns = ",".join(
+        compact_identifier(col.name)
+        for col in EntityAddressUnified.__table__.columns
+        if col.name != "canonical_network_ids"
+    )
+    base = _office_rows(layout, columns)
+    offices = (
+        "(SELECT office.* FROM selected_office_keys key CROSS JOIN LATERAL "
+        f"(SELECT native.* FROM ({base}) native WHERE native.location_key=key.location_key OFFSET 0) office)"
+    )
+    return keys, offices
+
+
 def _address_query(layout, network_ids, visible_membership_sql, location_lookup, columns=None):
     _validate_address_selection(layout, network_ids, visible_membership_sql, location_lookup)
     requested_columns = _projection_column_names(columns)
@@ -94,10 +122,7 @@ def _address_query(layout, network_ids, visible_membership_sql, location_lookup,
         hidden_columns += ("row_origin",)
     working_columns = requested_columns + tuple(name for name in hidden_columns if name not in requested_columns)
     physical_columns = ",".join(compact_identifier(name) for name in working_columns if name != "canonical_network_ids")
-    base = f"SELECT {physical_columns} FROM ONLY {_relation(layout.base)} base WHERE row_origin<>'network_custom'"
-    if layout.custom is not None:
-        base += f" AND NOT EXISTS(SELECT 1 FROM ONLY {_relation(layout.custom)} custom WHERE custom.location_key=base.location_key)"
-        base += f" UNION ALL SELECT {physical_columns} FROM ONLY {_relation(layout.custom)}"
+    base = _office_rows(layout, physical_columns)
     memberships = _membership_arms(layout, selected=False) if "canonical_network_ids" in working_columns else ""
     arrays = (
         f"ARRAY(SELECT DISTINCT membership.network_id FROM ({memberships}) membership ORDER BY membership.network_id)"
