@@ -57,6 +57,7 @@ from api.scoped_catalog_publisher_worker import request_cancel as request_catalo
 from db.models import ImportRun, PTG2ImportRun, PTG2Snapshot, db
 from process import mrf_discovery_acquisition_guard as mrf_acquisition
 from process import npi_isolated_execution as npi_execution
+from process.cms_npd_typed_schema import CONTROL_ADAPTER as CMS_NPD_CONTROL_ADAPTER
 from process.control_cancel import (
     _cancel_attempt_pair,
     _cancel_progress_by_name,
@@ -469,6 +470,7 @@ _SINGLE_JOB_ADAPTERS: dict[str, dict[str, Any]] = {
         "target_function": "process_data",
         "run_shutdown": True,
     },
+    "cms-npd": CMS_NPD_CONTROL_ADAPTER,
     "facility-anchors": {
         "queue": "arq:FacilityAnchors",
         "function": "control_single_job_start",
@@ -1070,6 +1072,7 @@ def _importer_family(importer: str) -> str:
         "new-york-nypp-profile",
         "entity-address-unified",
         "cms-doctors",
+        "cms-npd",
         "address-archive-v2-migrate",
         "address-formatted-address",
         "address-numeric-grid-alias",

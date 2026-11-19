@@ -16,3 +16,17 @@ pub use v2::{
     ProviderDirectoryProjectionCopySummary, PROVIDER_DIRECTORY_PROJECTION_COPY_MAGIC,
     PROVIDER_DIRECTORY_PROJECTION_COPY_MAX_OWNED_IO_BYTES,
 };
+
+/// One stdin mode of the scanner CLI: takes the remaining arguments.
+pub type DirectoryCliMode = fn(&[String]) -> std::io::Result<()>;
+
+/// The provider-directory stdin mode selected by the first CLI argument, if it names one.
+pub fn provider_directory_cli(mode: &str) -> Option<DirectoryCliMode> {
+    match mode {
+        "--provider-directory-materialize-stdio-v2" => {
+            Some(run_provider_directory_materialization_stdio_v2_cli)
+        }
+        "--cms-npd-typed-copy" => Some(crate::cms_npd_typed_copy::run_cli),
+        _ => None,
+    }
+}

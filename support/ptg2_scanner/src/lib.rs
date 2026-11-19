@@ -6,6 +6,7 @@ pub mod canonical_network_values;
 #[cfg(feature = "python")]
 mod catalog_observation;
 pub mod cms_mlr_registry;
+pub mod cms_npd_typed_copy;
 pub mod cms_planfinder_registry;
 pub mod company_group_assertions;
 pub mod company_network_assertions;

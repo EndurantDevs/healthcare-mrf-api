@@ -70,7 +70,7 @@ use ptg2_scanner::progress::{
     compressed_mib_per_second, emit_progress, seconds_from_micros, ScannerSemanticProgress,
     ScannerSemanticProgressReporter,
 };
-use ptg2_scanner::provider_directory_projection::run_provider_directory_materialization_stdio_v2_cli;
+use ptg2_scanner::provider_directory_projection::provider_directory_cli;
 use ptg2_scanner::rate_schedule_observe::{
     rate_schedule_observe_memory_upper_bound_bytes, RateScheduleObserver, RateScheduleOccurrence,
 };
@@ -27097,8 +27097,8 @@ fn run_cli() -> io::Result<()> {
     if first_arg == "--uhc-retain" {
         return run_uhc_retain_cli(&args.collect::<Vec<_>>());
     }
-    if first_arg == "--provider-directory-materialize-stdio-v2" {
-        return run_provider_directory_materialization_stdio_v2_cli(&args.collect::<Vec<_>>());
+    if let Some(run_directory_mode) = provider_directory_cli(&first_arg) {
+        return run_directory_mode(&args.collect::<Vec<_>>());
     }
     if first_arg == "--finalize-v3-runs" {
         return run_v3_finalizer(&args.collect::<Vec<_>>());

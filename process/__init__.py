@@ -72,6 +72,10 @@ from process.cms_doctors import main as initiate_cms_doctors
 from process.cms_doctors import process_data as process_cms_doctors_data
 from process.cms_doctors import shutdown as cms_doctors_shutdown
 from process.cms_doctors import startup as cms_doctors_startup
+from process.cms_npd_typed_worker import main as initiate_cms_npd
+from process.cms_npd_typed_worker import process_data as process_cms_npd_data
+from process.cms_npd_typed_worker import shutdown as cms_npd_shutdown
+from process.cms_npd_typed_worker import startup as cms_npd_startup
 from process.code_sets import main as initiate_code_sets
 from process.control_lifecycle import (
     _flush_terminal_status_events,
@@ -989,6 +993,19 @@ class CMSDoctors:
     job_deserializer = deserialize_job
 
 
+class CMSNPD:
+    functions = [process_cms_npd_data, control_single_job_start]
+    on_startup = cms_npd_startup
+    on_shutdown = cms_npd_shutdown
+    max_jobs = 1
+    queue_read_limit = 1
+    queue_name = "arq:CMSNPD"
+    job_timeout = 21600
+    redis_settings = build_redis_settings()
+    job_serializer = serialize_job
+    job_deserializer = deserialize_job
+
+
 class CMSDoctors_finish:
     functions = [cms_doctors_shutdown]
     on_startup = db_startup
@@ -1790,6 +1807,12 @@ def cms_doctors(test: bool, retained_source_manifest: str | None = None):
     _run(initiate_cms_doctors(test_mode=test, **options))
 
 
+@click.command(help="Run CMS National Provider Directory typed import")
+def cms_npd():
+    """Queue the CMS National Provider Directory importer."""
+    _run(initiate_cms_npd())
+
+
 @click.command(help="Run Facility Anchors import (HRSA FQHCs + CMS Hospitals)")
 @click.option("--test", is_flag=True, help="Process a small sample of data for a quick smoke run.")
 def facility_anchors(test: bool):
@@ -2214,6 +2237,7 @@ process_group.add_command(medicare_enrollment, name="medicare-enrollment")
 process_group.add_command(mrf_source_discovery_command, name="mrf-source-discovery")
 process_group.add_command(hospital_prices, name="hospital-prices")
 process_group.add_command(cms_doctors, name="cms-doctors")
+process_group.add_command(cms_npd, name="cms-npd")
 process_group.add_command(facility_anchors, name="facility-anchors")
 process_group.add_command(pharmacy_economics, name="pharmacy-economics")
 process_group.add_command(entity_address_unified, name="entity-address-unified")

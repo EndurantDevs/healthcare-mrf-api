@@ -47,7 +47,11 @@ def test_companion_migration_matches_models_without_runtime_imports(monkeypatch)
 
 def test_companion_migration_keeps_prior_head_and_refuses_destructive_downgrade():
     scripts = ScriptDirectory(str(ROOT / "alembic"))
-    assert scripts.get_heads() == ["20261116090000_profile_capacity_logical_names"]
+    assert scripts.get_heads() == ["20261119090000_cms_npd_typed_release"]
+    assert (
+        scripts.get_revision("20261119090000_cms_npd_typed_release").down_revision
+        == "20261116090000_profile_capacity_logical_names"
+    )
     assert (
         scripts.get_revision("20261116090000_profile_capacity_logical_names").down_revision
         == "20261115120000_named_output_recovery_document"
