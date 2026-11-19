@@ -97,6 +97,13 @@ class NearbySqlQuery:
     # The all-address projection bakes NPI existence, primary taxonomy and shared identities into each row.
     search_provider_facts: bool = False
 
+    def with_legacy_plan_membership(self, page_clauses: tuple[str, str] | None) -> NearbySqlQuery:
+        """Keep plan membership as a boolean filter during native address deduplication."""
+        if self.search_table_sql or page_clauses is None:
+            return self
+        _, membership_filter = page_clauses
+        return replace(self, extra_clause=membership_filter)
+
 
 @dataclass(frozen=True, slots=True)
 class ImportedGeoQuery:
@@ -497,12 +504,9 @@ def build_native_nearby_sql(
 
     if nearby.search_table_sql and use_search_page and not cursor_clause:
         return _native_search_page(nearby)
-    legacy_initial_clause, legacy_cursor_clause = legacy_page_clauses or (None, None)
     if cursor_clause:
         # shortcut: dedupe eligible aliases first; add indexed identity selection if deep pages dominate latency.
-        if not nearby.search_table_sql and legacy_cursor_clause is not None:
-            # Keep plan membership as a boolean filter during native address deduplication.
-            nearby = replace(nearby, extra_clause=legacy_cursor_clause)
+        nearby = nearby.with_legacy_plan_membership(legacy_page_clauses)
         return f"""WITH {_native_eligible_geo_cte(nearby)},
 page_geo AS MATERIALIZED (
     SELECT a.*,
@@ -524,6 +528,7 @@ SELECT hydrated_geo.*, taxonomy.*, nucc.display_name AS taxonomy_display
           hydrated_geo.npi_code ASC,
           hydrated_geo.address_key ASC"""
 
+    legacy_initial_clause, _ = legacy_page_clauses or (None, None)
     taxonomy_where = _taxonomy_filter_where(nearby)
     return _NATIVE_NEARBY_SQL_TEMPLATE.format(
         taxonomy_where=taxonomy_where,

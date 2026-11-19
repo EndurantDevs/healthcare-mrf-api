@@ -18,6 +18,7 @@ from sqlalchemy import Integer, String, literal, select, text
 from api import provider_list_sql as provider_list_sql_module
 from api.custom_import_provider_sql import ProviderImportQuery, compile_npi_entity_relation
 from api.endpoint import npi as npi_module
+from api.provider_search_sql import plan_scope_query
 from db.connection import ConnectionProxy
 from process.custom_import.read_core import PreparedNpiEntityRelation, ReadOrderTerm
 from tests.custom_import_postgres_support import transaction_session
@@ -882,6 +883,61 @@ async def test_postgres_generated_provider_list_count_page_and_lateral_hydration
     assert "JOIN LATERAL" in page_sql
     assert not any("SELECT COUNT(DISTINCT" in sql for sql, _parameters in calls)
     assert set(ordered_context.compiled.values) <= set(page_parameters)
+
+
+@pytest.mark.asyncio
+async def test_postgres_scored_list_paginates_the_zip_plan_intersection(monkeypatch):
+    _, context = _postgres_order_contexts("desc")
+
+    async def prepare_scope(native_entity_scope):
+        return _scoped_import_context(context, native_entity_scope)
+
+    async def plan_scope(_session, release_id):
+        assert release_id == "fixture-release"
+        return plan_scope_query({"mrf.fixture_plan_members": {1}})
+
+    async with transaction_session() as session:
+        await _seed_postgres_phone_provider_list_tables(session)
+        await session.execute(text("ALTER TABLE mrf.entity_address_unified ADD COLUMN zip5 varchar"))
+        await session.execute(
+            text("UPDATE mrf.entity_address_unified SET zip5='12345' WHERE npi BETWEEN 1000000001 AND 1000000004")
+        )
+        await session.execute(text("CREATE TABLE mrf.fixture_plan_members (snapshot_key bigint, npi bigint)"))
+        await session.execute(
+            text(
+                "INSERT INTO mrf.fixture_plan_members VALUES (1,1000000001),(1,1000000002),(1,1000000003),(2,1000000004)"
+            )
+        )
+        _configure_postgres_provider_list(monkeypatch)
+        monkeypatch.setattr(npi_module, "_address_serving_table_sql", _unified_address_table)
+        monkeypatch.setattr(npi_module, "_plan_release_npi_scope", plan_scope)
+        request = SimpleNamespace(args={}, ctx=SimpleNamespace(sa_session=session))
+        pages = []
+        for page in ("1", "2"):
+            response = await npi_module.list_providers(
+                request,
+                native_args=RequestParameters(
+                    {
+                        "zip_code": ["12345"],
+                        "page": [page],
+                        "limit": ["1"],
+                        "primary_only": ["true"],
+                        "include_total": ["true"],
+                        "plan_release_id": ["fixture-release"],
+                    }
+                ),
+                import_context=context,
+                native_scope_preparer=prepare_scope,
+            )
+            pages.append(json.loads(response.body))
+        calls = session.info["provider_list_calls"]
+
+    assert [(page["total"], [provider_row["npi"] for provider_row in page["rows"]]) for page in pages] == [
+        (2, [1000000003]),
+        (2, [1000000002]),
+    ]
+    queries = [sql for sql, _parameters in calls if "page_npis AS" in sql]
+    assert len(queries) == 2 and all("location_npis AS MATERIALIZED" in sql for sql in queries)
 
 
 @pytest.mark.asyncio

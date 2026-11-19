@@ -645,6 +645,7 @@ async def _read_postgres_geo_page(
     cursor_anchor: tuple[str, str] | None = None,
     *,
     require_match: bool = False,
+    plan_release_id: str | None = None,
 ) -> dict[str, Any]:
     request, prepare_cursor = _postgres_request(
         session,
@@ -663,6 +664,7 @@ async def _read_postgres_geo_page(
                 "long": ["0"],
                 "include_total": ["true"],
                 "limit": ["2"],
+                **({"plan_release_id": [plan_release_id]} if plan_release_id is not None else {}),
             }
         ),
         import_context=context,
@@ -804,6 +806,40 @@ async def test_postgres_required_geo_order_keeps_null_score_and_exact_address_pa
     assert next(provider["type"] for provider in providers if provider["npi"] == 1000000004) == "secondary"
     assert providers[-1]["npi"] == 1000000002
     assert len(calls) == 3 and all("AS _geo_total" in sql for sql, _ in calls)
+
+
+@pytest.mark.asyncio
+async def test_postgres_required_geo_order_pages_within_the_linked_plan(monkeypatch):
+    async with transaction_session() as session:
+        await session.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+        await _seed_geo_tables(session)
+        await session.execute(text("CREATE TABLE mrf.fixture_plan_members (snapshot_key bigint, npi bigint)"))
+        await session.execute(
+            text(
+                "INSERT INTO mrf.fixture_plan_members VALUES (1,1000000001),(1,1000000002),"
+                "(1,1000000003),(2,1000000003),(3,1000000004),(2,NULL)"
+            )
+        )
+
+        async def plan_scope(_session, release_id):
+            assert release_id == "fixture-release"
+            return plan_scope_query({"mrf.fixture_plan_members": {1, 2}})
+
+        monkeypatch.setattr(provider_list_sql, "ConnectionProxy", _PostgresGeoProxy)
+        monkeypatch.setattr(npi_module, "_address_serving_table_sql", _legacy_address_table)
+        monkeypatch.setattr(npi_module, "_plan_release_npi_scope", plan_scope)
+        options_by_name = {"require_match": True, "plan_release_id": "fixture-release"}
+        first = await _read_postgres_geo_page(session, "desc", **options_by_name)
+        second = await _read_postgres_geo_page(
+            session, "desc", tuple(first["_custom_import_next_anchor"]), **options_by_name
+        )
+        calls = session.info["geo_calls"]
+
+    assert _provider_identities(first) == [(1000000003, _THIRD_ADDRESS_KEY), (1000000003, _FIFTH_ADDRESS_KEY)]
+    assert _provider_identities(second) == [(1000000002, _SECOND_ADDRESS_KEY)]
+    assert first["total_count"] == second["total_count"] == 3
+    assert first["has_more"] is True and second["has_more"] is False
+    assert len(calls) == 2 and all("(a.npi IN (" in sql and ")) IS TRUE" in sql for sql, _ in calls)
 
 
 def _wide_geo_page_statement(context, address_table_sql: str, direction: str):

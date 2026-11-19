@@ -9259,7 +9259,6 @@ async def list_providers(
             address_source = f"{address_table_sql} as c\n    {phone_candidates_join}\n    {taxonomy_source}"
         else:
             address_source = f"{address_table_sql} as c\n    {phone_candidates_join}"
-        address_order = _primary_address_order_clause("c", address_table_sql)
         use_computed_page_order = bool(plan_network_ids) or (
             use_taxonomy_filter
             and not npi_where
@@ -9282,7 +9281,8 @@ async def list_providers(
             sub_s_relevance_projection = ""
             result_order_sql = "ORDER BY sub_s.npi_code ASC"
         else:
-            zip_plan_sql = plan_member_sql if is_ordinary_provider_query and is_unified_search and zip_code else None
+            can_stage_zip_plan = is_ordinary_provider_query or scope_native_query
+            zip_plan_sql = plan_member_sql if can_stage_zip_plan and is_unified_search and zip_code else None
             eligible_npis_sql = _page_npis_sql(address_source, provider_npi_sql, eligible_address_clauses, zip_plan_sql)
             page_order_sql = "ORDER BY npi + 0" if use_computed_page_order else "ORDER BY npi"
             sub_s_relevance_projection = ""
@@ -9329,7 +9329,7 @@ async def list_providers(
                     FROM {address_source}
                    WHERE {" and ".join(address_clauses)}
                      AND {provider_npi_sql} = pn.npi
-                   ORDER BY {address_order}
+                   ORDER BY {_primary_address_order_clause("c", address_table_sql)}
               ) AS g ON TRUE
         )
 
@@ -10717,7 +10717,7 @@ async def get_near_npi(
             imported_statements = build_imported_geo_statements(
                 import_context,
                 ImportedGeoQuery(
-                    nearby=nearby_query,
+                    nearby=nearby_query.with_legacy_plan_membership(legacy_page_clauses),
                     native_parameters=query_parameters_by_name,
                     limit=limit,
                     cursor_anchor=cursor_anchor,
