@@ -11,7 +11,6 @@ import pytest
 
 from tests.claims_pricing_contract_fakes import RecordingRedis
 
-
 claims_pricing = importlib.import_module("process.claims_pricing")
 
 
@@ -194,13 +193,9 @@ async def test_finalize_publishes_diagnostics_and_cleans_manifest(
     diagnostics_by_field = {
         "profile_scope_rows": [{"geography_scope": "national", "rows": 2}],
         "peer_scope_rows": [{"geography_scope": "national", "rows": 1}],
-        "key_coverage": [
-            {"geography_scope": "national", "coverage_pct": 50.0}
-        ],
+        "key_coverage": [{"geography_scope": "national", "coverage_pct": 50.0}],
     }
-    work_dir_root, run_work_dir, manifest_path = (
-        _complete_claims_manifest_paths(tmp_path)
-    )
+    work_dir_root, run_work_dir, manifest_path = _complete_claims_manifest_paths(tmp_path)
     _configure_successful_claims_finalize(
         monkeypatch,
         work_dir_root,
@@ -217,9 +212,7 @@ async def test_finalize_publishes_diagnostics_and_cleans_manifest(
         },
     )
 
-    assert response_by_field["cost_level_diagnostics"] == (
-        diagnostics_by_field
-    )
+    assert response_by_field["cost_level_diagnostics"] == (diagnostics_by_field)
     assert response_by_field["run_id"] == "run-a"
     assert not run_work_dir.exists()
 
@@ -237,11 +230,7 @@ def _complete_claims_manifest_paths(
                 "import_id": "import_a",
                 "run_id": "run-a",
                 "stage_suffix": "stage-a",
-                "sources": {
-                    "provider": [
-                        {"url": "https://example.test/provider.csv"}
-                    ]
-                },
+                "sources": {"provider": [{"url": "https://example.test/provider.csv"}]},
                 "chunks": [
                     {
                         "dataset_key": "provider",
@@ -474,9 +463,7 @@ async def test_finish_main_derives_canonical_manifest(monkeypatch, tmp_path):
         test_mode=True,
     )
 
-    assert redis.jobs[0]["task"]["manifest_path"] == str(
-        tmp_path / "import_a" / "run-a" / "manifest.json"
-    )
+    assert redis.jobs[0]["task"]["manifest_path"] == str(tmp_path / "import_a" / "run-a" / "manifest.json")
 
 
 def test_staging_classes_use_schema_override(monkeypatch):
@@ -488,5 +475,5 @@ def test_staging_classes_use_schema_override(monkeypatch):
 
     monkeypatch.setattr(claims_pricing, "make_class", make_stage)
     classes_by_name = claims_pricing._staging_classes("stage-a", "mrf")
-    assert len(classes_by_name) == 8
+    assert len(classes_by_name) == 7
     assert all(suffix == "stage-a" and schema == "mrf" for _name, suffix, schema in calls)

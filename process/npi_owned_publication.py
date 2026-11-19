@@ -15,6 +15,7 @@ from process.npi_result_generation import (
     read_npi_result_generation_authority,
     validate_npi_result_generation_authority,
 )
+from process.procedure_taxonomy_signals import mark_procedure_taxonomy_inputs_changed
 
 
 async def precreate_npi_output(session, *, dataset_id):
@@ -264,6 +265,9 @@ async def activate_ownership_sealed_npi_stage(
     ) or canonical.row_counts != tuple(counts_by_table[name] for name in archive.RELATION_NAMES):
         raise archive.NpiResultArchiveError("NPI canonical attachment output differs")
     generation = await _publish_generation(session, incumbent, previous, canonical)
+    await mark_procedure_taxonomy_inputs_changed(
+        incumbent.schema_name, lambda statement: session.execute(text(statement)), "npi_taxonomy"
+    )
     receipt = archive.NpiActivationReceipt(
         tuple((incumbent.schema_name, name) for name, _oid in pairs),
         tuple((predecessor, name) for name, present in incumbent.relations if present),

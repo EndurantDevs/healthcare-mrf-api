@@ -106,6 +106,7 @@ from process.nppes_public_evidence_scratch import (
 )
 from process.nppes_public_evidence_storage import resolve_nppes_chain_families
 from process.openaddresses import refresh_archive_geocodes_from_openaddresses_sharded
+from process.procedure_taxonomy_signals import mark_procedure_taxonomy_inputs_changed
 
 latin_pattern = re.compile(r"[^\x00-\x7f]")
 
@@ -3072,6 +3073,7 @@ WHERE
                             index_suffixes=index_suffixes,
                         ),
                     )
+                await mark_procedure_taxonomy_inputs_changed(schema, lease.connection.execute, "npi_taxonomy")
                 publication_state_by_name["progress"] = terminal_progress_by_name
                 publication_state_by_name["metrics"] = terminal_metrics_by_name
                 if evidence_receipt is None:

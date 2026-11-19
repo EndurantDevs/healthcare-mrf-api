@@ -2,6 +2,7 @@
 
 import json
 from collections import OrderedDict
+from contextlib import nullcontext
 
 import pytest
 
@@ -63,10 +64,11 @@ def test_single_code_consecutive_pages_break_amount_ties_by_npi(
 
 
 @pytest.mark.asyncio
-async def test_single_code_taxonomy_uses_precomputed_signal():
+async def test_single_code_taxonomy_uses_precomputed_signal(monkeypatch):
     """Avoid rebuilding taxonomy evidence from provider-level claims."""
 
     evidence_by_field = {
+        "evidence_source": "quality_feature",
         "taxonomy_code": "207Q00000X",
         "classification": "Family Medicine",
         "specialization": None,
@@ -76,12 +78,10 @@ async def test_single_code_taxonomy_uses_precomputed_signal():
         "total_beneficiaries": 400.0,
         "provider_types": ["Family Practice"],
     }
-    session = FakeSession(
-        [
-            FakeResult(scalar="mrf.procedure_taxonomy_signal"),
-            FakeResult(rows=[evidence_by_field]),
-        ]
-    )
+    monkeypatch.setenv("HLTHPRT_PRICING_TAXONOMY_PUBLICATION_SCHEMA", "taxonomy_publication")
+    session = FakeSession([])
+    evidence_reader = FakeSession([FakeResult(rows=[evidence_by_field])])
+    monkeypatch.setattr(pricing_module.db, "reader_session", lambda: nullcontext(evidence_reader))
     pricing_module._PROCEDURE_TAXONOMY_EVIDENCE_CACHE.clear()
 
     evidence = await pricing_module._load_procedure_taxonomy_evidence(
@@ -92,15 +92,15 @@ async def test_single_code_taxonomy_uses_precomputed_signal():
     )
 
     assert evidence == [pricing_module._taxonomy_evidence_item(evidence_by_field)]
-    statements = [str(execution_args[0]) for execution_args, _execution_kwargs in session.executions]
-    assert any("procedure_taxonomy_signal" in statement for statement in statements)
-    assert any("source_relation_fingerprint" in statement and "to_regclass" in statement for statement in statements)
-    assert not any("FROM mrf.pricing_provider_procedure" in statement for statement in statements)
+    assert session.executions == []
+    statements = [str(execution_args[0]) for execution_args, _execution_kwargs in evidence_reader.executions]
+    assert len(statements) == 1
+    assert '"taxonomy_publication"."procedure_taxonomy_serving"' in statements[0]
 
 
 @pytest.mark.asyncio
-async def test_taxonomy_signal_unavailable_keeps_existing_query():
-    """Fall back unchanged while the new table is absent or mid-rollout."""
+async def test_taxonomy_signal_unavailable_keeps_existing_query(monkeypatch):
+    """Use the original query when the published view has no evidence for the code."""
 
     evidence_by_field = {
         "taxonomy_code": "207Q00000X",
@@ -112,13 +112,10 @@ async def test_taxonomy_signal_unavailable_keeps_existing_query():
         "total_beneficiaries": 10.0,
         "provider_types": ["Family Practice"],
     }
-    session = FakeSession(
-        [
-            FakeResult(scalar=None),
-            FakeResult(scalar=None),
-            FakeResult(rows=[evidence_by_field]),
-        ]
-    )
+    monkeypatch.setenv("HLTHPRT_PRICING_TAXONOMY_PUBLICATION_SCHEMA", "taxonomy_publication")
+    session = FakeSession([FakeResult(scalar=None), FakeResult(rows=[evidence_by_field])])
+    evidence_reader = FakeSession([FakeResult(rows=[])])
+    monkeypatch.setattr(pricing_module.db, "reader_session", lambda: nullcontext(evidence_reader))
     pricing_module._PROCEDURE_TAXONOMY_EVIDENCE_CACHE.clear()
 
     evidence = await pricing_module._load_procedure_taxonomy_evidence(

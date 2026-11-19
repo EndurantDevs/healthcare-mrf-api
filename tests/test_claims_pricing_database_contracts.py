@@ -9,15 +9,11 @@ import pytest
 from process.provider_quality_parts import state as provider_quality_state
 from tests.claims_pricing_contract_fakes import AsyncTransaction
 
-
 claims_pricing = importlib.import_module("process.claims_pricing")
 
 
 def test_finalize_reuses_shared_import_mutex():
-    assert (
-        claims_pricing._has_global_finalize_lock
-        is provider_quality_state._has_global_finalize_lock
-    )
+    assert claims_pricing._has_global_finalize_lock is provider_quality_state._has_global_finalize_lock
     assert (
         claims_pricing._release_global_finalize_lock_safely
         is provider_quality_state._release_global_finalize_lock_safely
@@ -27,9 +23,7 @@ def test_finalize_reuses_shared_import_mutex():
 @pytest.mark.asyncio
 async def test_finalize_waits_for_shared_import_mutex(monkeypatch):
     redis = object()
-    finalize_spec = claims_pricing._ClaimsFinalizeSpec(
-        "i", "r", False, "mrf", "s", 0, "lock-token"
-    )
+    finalize_spec = claims_pricing._ClaimsFinalizeSpec("i", "r", False, "mrf", "s", 0, "lock-token")
     acquire_global_lock = AsyncMock(return_value=False)
     release_claims_lock = AsyncMock()
     materialize = AsyncMock()
@@ -96,9 +90,7 @@ async def test_ensure_indexes_normalizes_long_staging_names(monkeypatch):
     staged_model = SimpleNamespace(
         __tablename__=table_name,
         __main_table__="procedure_taxonomy_signal",
-        __my_additional_indexes__=[
-            {"index_elements": ["year"], "staging_name": "taxonomy_lookup"}
-        ],
+        __my_additional_indexes__=[{"index_elements": ["year"], "staging_name": "taxonomy_lookup"}],
     )
 
     await claims_pricing._ensure_indexes(staged_model, "mrf")
@@ -131,8 +123,9 @@ async def test_prepare_tables_rebuilds_every_stage(monkeypatch, defer_indexes):
     monkeypatch.setattr(claims_pricing, "_ensure_indexes", ensure_indexes)
     classes_by_name, schema = await claims_pricing._prepare_tables("stage", True)
     assert schema == "mrf_stage"
-    assert len(classes_by_name) == 8
-    assert ensure_indexes.await_count == (0 if defer_indexes else 8)
+    assert len(classes_by_name) == 7
+    assert "PricingProcedureTaxonomySignal" not in classes_by_name
+    assert ensure_indexes.await_count == (0 if defer_indexes else 7)
 
 
 @pytest.mark.asyncio
@@ -145,13 +138,12 @@ async def test_build_staging_indexes_visits_registry(monkeypatch):
         "PricingProviderProcedureCostProfile",
         "PricingProcedurePeerStats",
         "PricingProcedureGeoBenchmark",
-        "PricingProcedureTaxonomySignal",
     )
     classes_by_name = {class_name: object() for class_name in class_names}
     ensure_indexes = AsyncMock()
     monkeypatch.setattr(claims_pricing, "_ensure_indexes", ensure_indexes)
     await claims_pricing._build_staging_indexes(classes_by_name, "mrf")
-    assert ensure_indexes.await_count == 8
+    assert ensure_indexes.await_count == 7
 
 
 @pytest.mark.asyncio
@@ -212,11 +204,9 @@ async def test_cost_diagnostics_return_query_rows(monkeypatch):
     assert diagnostics_by_field["key_coverage"][0]["coverage_pct"] == 50.0
 
 
-@pytest.mark.asyncio
-async def test_publish_renames_tables_and_owned_indexes(monkeypatch):
-    status = AsyncMock()
-    monkeypatch.setattr(claims_pricing.db, "status", status)
-    monkeypatch.setattr(claims_pricing.db, "transaction", lambda: AsyncTransaction())
+def _claims_publication_models_without_indexes(monkeypatch):
+    """Use real publication table names with only the indexes a test installs."""
+
     final_classes = (
         claims_pricing.PricingProvider,
         claims_pricing.PricingProcedure,
@@ -225,11 +215,32 @@ async def test_publish_renames_tables_and_owned_indexes(monkeypatch):
         claims_pricing.PricingProviderProcedureCostProfile,
         claims_pricing.PricingProcedurePeerStats,
         claims_pricing.PricingProcedureGeoBenchmark,
-        claims_pricing.PricingProcedureTaxonomySignal,
     )
     for final_cls in final_classes:
         monkeypatch.setattr(final_cls, "__my_initial_indexes__", [], raising=False)
         monkeypatch.setattr(final_cls, "__my_additional_indexes__", [], raising=False)
+    return final_classes
+
+
+@pytest.mark.asyncio
+async def test_publish_renames_tables_and_owned_indexes(monkeypatch):
+    """Swap all claims tables and mark taxonomy inputs before leaving the transaction."""
+
+    status = AsyncMock()
+    transaction_context = AsyncMock()
+
+    async def mark_inputs_changed(schema, execute, *tables):
+        transaction_context.__aenter__.assert_awaited_once()
+        transaction_context.__aexit__.assert_not_awaited()
+        assert status.await_count > 0
+        assert tables == ("pricing_provider", "pricing_provider_procedure")
+        await execute(f"MARK TAXONOMY INPUT CHANGE IN {schema}")
+
+    mark = AsyncMock(side_effect=mark_inputs_changed)
+    monkeypatch.setattr(claims_pricing.db, "status", status)
+    monkeypatch.setattr(claims_pricing.db, "transaction", Mock(return_value=transaction_context))
+    monkeypatch.setattr(claims_pricing, "mark_procedure_taxonomy_inputs_changed", mark)
+    final_classes = _claims_publication_models_without_indexes(monkeypatch)
     monkeypatch.setattr(
         final_classes[0],
         "__my_additional_indexes__",
@@ -263,10 +274,10 @@ async def test_publish_renames_tables_and_owned_indexes(monkeypatch):
     assert "ALTER TABLE mrf." in sql_text
     assert "ALTER TABLE IF EXISTS" not in sql_text
     assert "state_idx" in sql_text
-    assert (
-        "pricing_provider_procedure_stage_amt_page "
-        "RENAME TO pricing_provider_proc_amount_page_idx"
-    ) in sql_text
+    assert ("pricing_provider_procedure_stage_amt_page RENAME TO pricing_provider_proc_amount_page_idx") in sql_text
+    assert "procedure_taxonomy_signal" not in sql_text
+    mark.assert_awaited_once_with("mrf", status, "pricing_provider", "pricing_provider_procedure")
+    assert sql_text.endswith("MARK TAXONOMY INPUT CHANGE IN mrf")
 
 
 @pytest.mark.asyncio
@@ -274,40 +285,25 @@ async def test_publish_normalizes_long_staging_index_names(monkeypatch):
     status = AsyncMock()
     monkeypatch.setattr(claims_pricing.db, "status", status)
     monkeypatch.setattr(claims_pricing.db, "transaction", lambda: AsyncTransaction())
-    final_classes = (
-        claims_pricing.PricingProvider,
-        claims_pricing.PricingProcedure,
-        claims_pricing.PricingProviderProcedure,
-        claims_pricing.PricingProviderProcedureLocation,
-        claims_pricing.PricingProviderProcedureCostProfile,
-        claims_pricing.PricingProcedurePeerStats,
-        claims_pricing.PricingProcedureGeoBenchmark,
-        claims_pricing.PricingProcedureTaxonomySignal,
-    )
-    for final_cls in final_classes:
-        monkeypatch.setattr(final_cls, "__my_initial_indexes__", [], raising=False)
-        monkeypatch.setattr(final_cls, "__my_additional_indexes__", [], raising=False)
-    taxonomy_index = "procedure_taxonomy_signal_taxonomy_lookup"
+    monkeypatch.setattr(claims_pricing, "mark_procedure_taxonomy_inputs_changed", AsyncMock())
+    final_classes = _claims_publication_models_without_indexes(monkeypatch)
+    benchmark_index = "pricing_procedure_geo_benchmark_year_idx"
     monkeypatch.setattr(
         final_classes[-1],
         "__my_additional_indexes__",
         [
             {
                 "index_elements": ["year"],
-                "name": taxonomy_index,
-                "staging_name": "taxonomy_lookup",
+                "name": benchmark_index,
+                "staging_name": "year_lookup",
             }
         ],
         raising=False,
     )
-    long_table = f"procedure_taxonomy_signal_{'x' * 30}"
+    long_table = f"pricing_procedure_geo_benchmark_{'x' * 27}"
     classes_by_name = {
         final_cls.__name__: SimpleNamespace(
-            __tablename__=(
-                long_table
-                if final_cls is final_classes[-1]
-                else f"{final_cls.__main_table__}_stage"
-            )
+            __tablename__=(long_table if final_cls is final_classes[-1] else f"{final_cls.__main_table__}_stage")
         )
         for final_cls in final_classes
     }
@@ -316,10 +312,10 @@ async def test_publish_normalizes_long_staging_index_names(monkeypatch):
 
     staged_index = claims_pricing._index_name_for_table(
         long_table,
-        f"{long_table}_taxonomy_lookup",
+        f"{long_table}_year_lookup",
     )
     sql_text = "\n".join(status_call.args[0] for status_call in status.await_args_list)
-    assert f"{staged_index} RENAME TO {taxonomy_index}" in sql_text
+    assert f"{staged_index} RENAME TO {benchmark_index}" in sql_text
 
 
 @pytest.mark.asyncio

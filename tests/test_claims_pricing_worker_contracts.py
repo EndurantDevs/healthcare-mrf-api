@@ -7,7 +7,6 @@ import pytest
 
 from tests.claims_pricing_contract_fakes import RecordingRedis
 
-
 claims_pricing = importlib.import_module("process.claims_pricing")
 
 
@@ -326,10 +325,13 @@ async def test_finalize_wait_claims_lock_and_marks_phase(monkeypatch):
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(claims_pricing, "mark_control_run", mark_control)
-    assert await claims_pricing._wait_for_claims_finalize_turn(
-        RecordingRedis(),
-        finalize_spec,
-    ) is None
+    assert (
+        await claims_pricing._wait_for_claims_finalize_turn(
+            RecordingRedis(),
+            finalize_spec,
+        )
+        is None
+    )
     assert mark_control.await_args.kwargs["status"] == "finalizing"
     assert mark_control.await_args.kwargs["progress"]["pct"] == 99
 
@@ -401,7 +403,6 @@ async def test_materialize_publish_orders_staged_contract(
         ("_ensure_live_code_tables", "codes"),
         ("_materialize_code_and_crosswalk_rows", "crosswalk"),
         ("_materialize_procedure_provider_counts", "provider_counts"),
-        ("_materialize_procedure_taxonomy_signals", "taxonomy_signals"),
         ("_materialize_cost_level_rows", "cost"),
         ("_build_staging_indexes", "indexes"),
         ("_publish_by_table_rename", "publish"),
@@ -421,7 +422,6 @@ async def test_materialize_publish_orders_staged_contract(
         "codes",
         "crosswalk",
         "provider_counts",
-        "taxonomy_signals",
         "cost",
         "diagnostics",
     ]

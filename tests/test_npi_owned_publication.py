@@ -94,6 +94,7 @@ def publication(monkeypatch):
     monkeypatch.setattr(owned, "read_npi_result_generation_authority", boundary("current", object()))
     generation = object()
     monkeypatch.setattr(owned, "_publish_generation", boundary("generation", generation))
+    monkeypatch.setattr(owned, "mark_procedure_taxonomy_inputs_changed", boundary("taxonomy revision"))
     publication = build_npi_canonical_publication_receipt(
         NpiCanonicalPublicationInput(
             "synthetic-run",
@@ -137,6 +138,7 @@ async def test_manual_owned_adoption_keeps_hooks_out_and_settles_after_real_gene
         "_relation_pairs",
         "canonical",
         "generation",
+        "taxonomy revision",
         "settle",
     ]
     assert receipt.adopted_authority is state.generation

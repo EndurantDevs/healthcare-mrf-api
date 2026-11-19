@@ -45,24 +45,13 @@ def test_reporting_years_default_and_out_of_range_fallbacks(monkeypatch) -> None
         model_helpers.PROVIDER_QUALITY_YEAR_WINDOW
     )
     assert model_helpers._materialize_reporting_years(
-        {
-            "sources": {
-                "future": [
-                    {
-                        "reporting_year": (
-                            model_helpers.PROVIDER_QUALITY_MAX_YEAR + 1
-                        )
-                    }
-                ]
-            }
-        }
+        {"sources": {"future": [{"reporting_year": (model_helpers.PROVIDER_QUALITY_MAX_YEAR + 1)}]}}
     ) == (model_helpers.PROVIDER_QUALITY_MAX_YEAR,)
 
 
 def test_optional_cohort_model_discovery_and_presence(monkeypatch) -> None:
     feature_model = type("FeatureModel", (), {})
     peer_model = type("PeerModel", (), {})
-    signal_model = type("SignalModel", (), {})
     monkeypatch.setattr(
         model_helpers,
         "PricingProviderQualityFeature",
@@ -74,26 +63,16 @@ def test_optional_cohort_model_discovery_and_presence(monkeypatch) -> None:
         "PricingProviderQualityPeerTarget",
         peer_model,
     )
-    monkeypatch.setattr(
-        model_helpers,
-        "PricingProcedureTaxonomySignal",
-        signal_model,
-    )
-
     assert model_helpers._cohort_model_classes() == (
         feature_model,
         peer_model,
-        signal_model,
     )
     assert not model_helpers._cohort_models_present({})
-    complete_model_by_name = {
-        name: type(name, (), {}) for name in model_helpers.COHORT_MODEL_CLASS_NAMES
-    }
+    complete_model_by_name = {name: type(name, (), {}) for name in model_helpers.COHORT_MODEL_CLASS_NAMES}
     assert model_helpers._cohort_models_present(complete_model_by_name)
 
     monkeypatch.setattr(model_helpers, "PricingProviderQualityFeature", None)
     monkeypatch.setattr(model_helpers, "PricingProviderQualityPeerTarget", None)
-    monkeypatch.setattr(model_helpers, "PricingProcedureTaxonomySignal", None)
     assert model_helpers._cohort_model_classes() == ()
 
 
@@ -113,9 +92,7 @@ def test_model_columns_and_job_identifiers_cover_optional_shapes() -> None:
         },
     )
     assert model_helpers._model_columns(model) == {"first", "second"}
-    assert model_helpers._chunk_job_id("run", "qpp", 2, 2025, 7) == (
-        "provider_quality_chunk_run_qpp_2025_2_7"
-    )
+    assert model_helpers._chunk_job_id("run", "qpp", 2, 2025, 7) == ("provider_quality_chunk_run_qpp_2025_2_7")
     assert model_helpers._build_stage_suffix("!!!", "run").startswith("import_")
 
 
@@ -158,9 +135,7 @@ class _StageIndexes:
 class _LiveNamedIndex:
     __tablename__ = "quality_live"
     __main_table__ = "quality_live"
-    __my_additional_indexes__ = (
-        {"name": "quality_explicit_idx", "index_elements": ("score",)},
-    )
+    __my_additional_indexes__ = ({"name": "quality_explicit_idx", "index_elements": ("score",)},)
 
 
 @pytest.mark.asyncio
@@ -176,9 +151,7 @@ async def test_quality_index_helpers_cover_optional_index_shapes(monkeypatch) ->
 
     assert len(quality_database.status_statements) == 3
     assert "CREATE UNIQUE INDEX" in quality_database.status_statements[0]
-    assert "quality_stage_quality_stage_score_year_idx" in (
-        quality_database.status_statements[1]
-    )
+    assert "quality_stage_quality_stage_score_year_idx" in (quality_database.status_statements[1])
     assert " USING btree " in quality_database.status_statements[1]
     assert " WHERE score IS NOT NULL" in quality_database.status_statements[1]
     assert "quality_explicit_idx" in quality_database.status_statements[2]

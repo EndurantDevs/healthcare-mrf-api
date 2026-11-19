@@ -278,6 +278,8 @@ async def test_exchange_locks_both_named_members_before_grants_and_atomic_detach
     async def execute(statement):
         events.append(str(statement))
 
+    monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
+    monkeypatch.setenv("HLTHPRT_PRICING_TAXONOMY_PUBLICATION_SCHEMA", "taxonomy_test")
     monkeypatch.setattr(native, "capture_nucc_parent", capture)
     monkeypatch.setattr(native, "_capture_exchange_target", candidate)
     monkeypatch.setattr(native, "_preserve_parent_readers", readers)
@@ -289,6 +291,8 @@ async def test_exchange_locks_both_named_members_before_grants_and_atomic_detach
         "readers",
         f"ALTER TABLE {native.PARENT} DETACH PARTITION {native.relation_sql(before['child'])}",
         f"ALTER TABLE {native.PARENT} ATTACH PARTITION {native.relation_sql(incoming)} FOR VALUES FROM (MINVALUE) TO (MAXVALUE)",
+        'UPDATE "taxonomy_test_control"."procedure_taxonomy_publication" '
+        "SET input_revision = input_revision + 1 WHERE singleton",
     ]
 
 

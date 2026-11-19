@@ -227,6 +227,7 @@ async def test_quality_publish_generation_rolls_back_with_all_table_swaps(monkey
             # The staged heaps now serve under the declared names.
             assert await _relation_oids(session, schema, relation_names) == stage_oids
             assert await session.scalar(text(f"SELECT to_regclass('{schema}.procedure_taxonomy_signal')")) is not None
+            assert await session.scalar(text(f"SELECT to_regclass('{schema}.procedure_taxonomy_signal_old')")) is None
             assert await session.scalar(text(f"SELECT to_regclass('{schema}.pricing_quality_run')")) is None
             with pytest.raises(RuntimeError, match="evidence prevents downgrade"):
                 await _run_migration(await session.connection(), _QUALITY_MIGRATION_PATH, "downgrade")

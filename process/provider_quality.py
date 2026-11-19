@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import aiohttp
-from aiofile import async_open
 from aiocsv import AsyncDictReader
+from aiofile import async_open
 from arq import Retry, create_pool
 
 from db.connection import db
@@ -29,7 +29,6 @@ from db.models import (
     NPIDataTaxonomy,
     NUCCTaxonomy,
     PricingProvider,
-    PricingProviderProcedure,
     PricingProviderPrescription,
     PricingProviderQualityDomain,
     PricingProviderQualityMeasure,
@@ -39,6 +38,7 @@ from db.models import (
     PricingSviZcta,
     ProviderEnrichmentSummary,
 )
+from process.control_lifecycle import mark_control_run
 from process.ext.utils import (
     download_it_and_save,
     ensure_database,
@@ -46,11 +46,19 @@ from process.ext.utils import (
     get_import_schema,
     make_class,
 )
-from process.redis_config import build_redis_settings
-from process.serialization import deserialize_job, serialize_job
-from process.control_lifecycle import mark_control_run
 from process.live_progress import enqueue_live_progress
-from process.procedure_taxonomy_signals import materialize_procedure_taxonomy_signals
+from process.provider_quality_parts.cohort_context import (
+    _build_cohort_materialization_context as _build_cohort_materialization_context_impl,
+)
+from process.provider_quality_parts.cohort_sql import (
+    _cohort_sql_phase_1_build_features,
+    _cohort_sql_phase_2_lsh_shard,
+    _cohort_sql_phase_3_procedure_bucket,
+    _cohort_sql_phase_4_peer_targets,
+    _cohort_sql_phase_5_measure_shard,
+    _cohort_sql_phase_6_domain_shard,
+    _cohort_sql_phase_7_score_shard,
+)
 from process.provider_quality_parts.config import (
     COHORT_MODEL_CLASS_NAMES,
     DATASET_BY_KEY,
@@ -115,25 +123,13 @@ from process.provider_quality_parts.config import (
     _benchmark_modes_for_materialization,
     _is_environment_enabled,
 )
-from process.provider_quality_parts.cohort_sql import (
-    _cohort_sql_phase_1_build_features,
-    _cohort_sql_phase_2_lsh_shard,
-    _cohort_sql_phase_3_procedure_bucket,
-    _cohort_sql_phase_4_peer_targets,
-    _cohort_sql_phase_5_measure_shard,
-    _cohort_sql_phase_6_domain_shard,
-    _cohort_sql_phase_7_score_shard,
-)
-from process.provider_quality_parts.cohort_context import (
-    _build_cohort_materialization_context as _build_cohort_materialization_context_impl,
-)
 from process.provider_quality_parts.execution_helpers import (
     _count_shard_rows,
     _execute_shard_sql,
     _is_deadlock_error,
+    _is_row_allowed_for_test,
     _print_row_progress,
     _push_objects_with_retry,
-    _is_row_allowed_for_test,
     _step_end,
     _step_start,
 )
@@ -161,7 +157,6 @@ from process.provider_quality_parts.model_helpers import (
     PricingProviderQualityFeature,
     PricingProviderQualityPeerTarget,
     PricingProviderQualityProcedureLSH,
-    PricingProcedureTaxonomySignal,
     _build_stage_suffix,
     _chunk_job_id,
     _cohort_model_classes,
@@ -190,21 +185,21 @@ from process.provider_quality_parts.sql_helpers import (
     _state_code_sql,
 )
 from process.provider_quality_parts.state import (
-    _has_finalize_lock,
-    _has_global_finalize_lock,
     _decode_redis_str,
     _get_materialize_phase,
     _get_materialize_phase_elapsed_seconds,
     _get_materialize_progress,
     _get_run_progress,
+    _has_finalize_lock,
+    _has_global_finalize_lock,
     _increment_total_chunks,
     _init_run_state,
     _log_materialize_phase_summary,
+    _maintain_global_finalize_lock,
     _mark_chunk_done,
     _mark_chunk_done_with_retry,
     _mark_materialize_done,
     _mark_materialize_failed,
-    _maintain_global_finalize_lock,
     _mat_done_key,
     _mat_failed_key,
     _mat_phase_duration_key,
@@ -221,9 +216,11 @@ from process.provider_quality_parts.table_helpers import (
     _build_staging_indexes,
     _ensure_indexes,
     _index_name_for_table,
-    _table_columns,
     _is_table_available,
+    _table_columns,
 )
+from process.redis_config import build_redis_settings
+from process.serialization import deserialize_job, serialize_job
 
 logger = logging.getLogger(__name__)
 
@@ -452,10 +449,7 @@ async def _download_source_file(
 
     url = str(source_spec.get("url") or "").strip()
     if not url:
-        msg = (
-            "provider-quality source URL is missing: "
-            f"dataset={dataset_key} year={reporting_year}"
-        )
+        msg = f"provider-quality source URL is missing: dataset={dataset_key} year={reporting_year}"
         if _should_fail_on_source_error(test_mode):
             raise RuntimeError(msg)
         logger.warning("%s; using empty fallback in degraded test mode", msg)
@@ -485,8 +479,7 @@ async def _download_source_file(
             await asyncio.sleep(min(5 * attempt, 20))
 
     msg = (
-        "provider-quality source download failed after retries: "
-        f"dataset={dataset_key} year={reporting_year} url={url}"
+        f"provider-quality source download failed after retries: dataset={dataset_key} year={reporting_year} url={url}"
     )
     if _should_fail_on_source_error(test_mode):
         raise RuntimeError(msg)
@@ -558,20 +551,12 @@ async def _split_source_into_chunks(
             chunk_bytes += len(line.encode("utf-8", errors="ignore"))
             accepted += 1
             if chunk_bytes >= PROVIDER_QUALITY_CHUNK_TARGET_BYTES:
-                chunks.append(
-                    _write_provider_quality_chunk(
-                        dataset_key, chunks_dir, header, chunk_rows, chunk_index
-                    )
-                )
+                chunks.append(_write_provider_quality_chunk(dataset_key, chunks_dir, header, chunk_rows, chunk_index))
                 chunk_rows = []
                 chunk_bytes = 0
                 chunk_index += 1
         if chunk_rows:
-            chunks.append(
-                _write_provider_quality_chunk(
-                    dataset_key, chunks_dir, header, chunk_rows, chunk_index
-                )
-            )
+            chunks.append(_write_provider_quality_chunk(dataset_key, chunks_dir, header, chunk_rows, chunk_index))
     return chunks
 
 
@@ -659,9 +644,7 @@ async def _flush_qpp_entries(
 ) -> None:
     if not qpp_entries:
         return
-    entry_by_identity = {
-        (entry.get("npi"), entry.get("year")): entry for entry in qpp_entries
-    }
+    entry_by_identity = {(entry.get("npi"), entry.get("year")): entry for entry in qpp_entries}
     await _push_objects_with_retry(list(entry_by_identity.values()), qpp_cls)
     qpp_entries.clear()
 
@@ -675,9 +658,7 @@ def _missing_svi_zcta_example(svi_csv_fields: dict[str, Any]) -> str:
         "ZIP": svi_csv_fields.get("ZIP"),
     }
     present_zcta_field_by_name = {
-        key: field_value
-        for key, field_value in zcta_field_by_name.items()
-        if field_value not in (None, "")
+        key: field_value for key, field_value in zcta_field_by_name.items() if field_value not in (None, "")
     }
     if not present_zcta_field_by_name:
         present_zcta_field_by_name = {"keys": list(svi_csv_fields.keys())[:6]}
@@ -716,13 +697,19 @@ async def _load_qpp_rows(path: str, qpp_cls: type, reporting_year: int, test_mod
     _print_row_progress("qpp_provider", row_number, accepted, progress_start, final=True)
 
 
-def _svi_entry(
-    svi_csv_fields: Mapping[str, Any], reporting_year: int
-) -> dict[str, Any] | None:
+def _svi_entry(svi_csv_fields: Mapping[str, Any], reporting_year: int) -> dict[str, Any] | None:
     zcta = _normalize_zcta(
         _pick_first(
-            svi_csv_fields, "zcta", "ZCTA", "ZCTA5", "ZIP", "zip", "FIPS",
-            "fips", "LOCATION", "location",
+            svi_csv_fields,
+            "zcta",
+            "ZCTA",
+            "ZCTA5",
+            "ZIP",
+            "zip",
+            "FIPS",
+            "fips",
+            "LOCATION",
+            "location",
         )
     )
     if not zcta:
@@ -743,10 +730,7 @@ def _svi_entry(
 async def _flush_svi_entries(svi_entries: list[dict[str, Any]], svi_cls: type) -> None:
     if not svi_entries:
         return
-    svi_entry_by_identity = {
-        (svi_entry.get("zcta"), svi_entry.get("year")): svi_entry
-        for svi_entry in svi_entries
-    }
+    svi_entry_by_identity = {(svi_entry.get("zcta"), svi_entry.get("year")): svi_entry for svi_entry in svi_entries}
     await _push_objects_with_retry(list(svi_entry_by_identity.values()), svi_cls)
     svi_entries.clear()
 
@@ -777,9 +761,7 @@ async def _load_svi_rows(path: str, svi_cls: type, reporting_year: int, test_mod
             if svi_entry_by_field is None:
                 skipped_missing_zcta += 1
                 if len(missing_zcta_examples) < 3:
-                    missing_zcta_examples.append(
-                        _missing_svi_zcta_example(svi_csv_fields)
-                    )
+                    missing_zcta_examples.append(_missing_svi_zcta_example(svi_csv_fields))
                 continue
             svi_entries.append(svi_entry_by_field)
             accepted += 1
@@ -854,6 +836,8 @@ async def _materialize_quality_rows_cohort(classes: dict[str, type], schema: str
             run_id=run_id,
             **shard_parameter_map,
         )
+
+
 async def _materialize_quality_rows(classes: dict[str, type], schema: str, run_id: str) -> None:
     """Materialize provider-quality rows using the configured cohort mode."""
     if PROVIDER_QUALITY_COHORT_ENABLED and _cohort_models_present(classes):
@@ -1552,21 +1536,6 @@ async def _materialize_quality_rows(classes: dict[str, type], schema: str, run_i
     )
 
 
-async def _materialize_procedure_taxonomy_signals(
-    classes: dict[str, type],
-    schema: str,
-) -> None:
-    """Build bounded procedure taxonomy evidence from staged quality features."""
-
-    await materialize_procedure_taxonomy_signals(
-        schema=schema,
-        signal_model=classes.get("PricingProcedureTaxonomySignal"),
-        provider_model=PricingProvider,
-        provider_procedure_model=PricingProviderProcedure,
-        quality_feature_model=classes.get("PricingProviderQualityFeature"),
-    )
-
-
 async def _enqueue_materialize_phase_shards(
     redis,
     *,
@@ -1784,8 +1753,6 @@ async def _materialize_quality_rows_sharded(
         raise Retry(defer=PROVIDER_QUALITY_FINISH_RETRY_SECONDS)
 
 
-
-
 async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwargs: Any) -> dict[str, Any]:
     """Prepare a provider-quality run and enqueue its source chunks."""
     task = task or {}
@@ -1896,7 +1863,9 @@ async def provider_quality_start(ctx, task: dict[str, Any] | None = None, **_kwa
                     chunks.extend(split_chunks)
         except Exception:
             failure_manifest_map = {
-                "year": max(PROVIDER_QUALITY_YEAR_WINDOW) if PROVIDER_QUALITY_YEAR_WINDOW else PROVIDER_QUALITY_MIN_YEAR,
+                "year": max(PROVIDER_QUALITY_YEAR_WINDOW)
+                if PROVIDER_QUALITY_YEAR_WINDOW
+                else PROVIDER_QUALITY_MIN_YEAR,
                 "sources": source_specs_by_dataset,
             }
             try:
@@ -2135,10 +2104,6 @@ async def provider_quality_finalize(ctx, task: dict[str, Any] | None = None, **_
             else:
                 await _materialize_quality_rows(classes, schema, run_id)
             _step_end("materialize provider quality rows", step_started_at)
-
-            step_started_at = _step_start("materialize procedure taxonomy signals")
-            await _materialize_procedure_taxonomy_signals(classes, schema)
-            _step_end("materialize procedure taxonomy signals", step_started_at)
 
             if PROVIDER_QUALITY_DEFER_STAGE_INDEXES:
                 step_started_at = _step_start("build provider quality staging indexes")

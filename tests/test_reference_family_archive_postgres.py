@@ -1599,6 +1599,39 @@ async def _nucc_generic_activate(resources, candidate):
         )
 
 
+_NUCC_EVIDENCE_REVISION = (
+    "SELECT input_revision FROM taxonomy_evidence_control.procedure_taxonomy_publication WHERE singleton"
+)
+
+
+@asynccontextmanager
+async def _nucc_archive_evidence_role(resources, monkeypatch):
+    """Provision the separate evidence reader and the writer's revision-only access."""
+    admin = resources.admin
+    evidence_role = f"taxonomy_evidence_{uuid4().hex}"
+    publisher_role = resources.roles["publisher"]
+    state_table = "taxonomy_evidence_control.procedure_taxonomy_publication"
+    async with AsyncExitStack() as cleanup:
+        await admin.execute(f'CREATE ROLE "{evidence_role}" NOLOGIN')
+        cleanup.push_async_callback(admin.execute, f'DROP ROLE "{evidence_role}"')
+        await admin.execute(f'GRANT USAGE ON SCHEMA mrf TO "{evidence_role}"')
+        cleanup.push_async_callback(admin.execute, f'REVOKE USAGE ON SCHEMA mrf FROM "{evidence_role}"')
+        cleanup.push_async_callback(admin.execute, f'REVOKE SELECT ON mrf.nucc_taxonomy FROM "{evidence_role}"')
+        await admin.execute("CREATE SCHEMA taxonomy_evidence_control")
+        cleanup.push_async_callback(admin.execute, "DROP SCHEMA taxonomy_evidence_control")
+        await admin.execute(f"CREATE TABLE {state_table} (singleton boolean PRIMARY KEY, input_revision bigint)")
+        cleanup.push_async_callback(admin.execute, f"DROP TABLE {state_table}")
+        await admin.execute(f"INSERT INTO {state_table} VALUES (true, 0)")
+        await admin.execute(f'GRANT USAGE ON SCHEMA taxonomy_evidence_control TO "{publisher_role}"')
+        await admin.execute(
+            f'GRANT SELECT (singleton, input_revision), UPDATE (input_revision) ON {state_table} TO "{publisher_role}"'
+        )
+        with monkeypatch.context() as evidence_environment:
+            evidence_environment.setenv("HLTHPRT_PRICING_TAXONOMY_PUBLICATION_SCHEMA", "taxonomy_evidence")
+            evidence_environment.setenv("HLTHPRT_PRICING_TAXONOMY_PUBLISHER_ROLE", evidence_role)
+            yield evidence_role
+
+
 async def _nucc_assert_guard_and_rollback(resources, candidate, published_state):
     """Refuse an actual additional hook and roll back a later completed generic rotation."""
     from tests.test_nucc_plain_publication_postgres import _published_state
@@ -1610,6 +1643,7 @@ async def _nucc_assert_guard_and_rollback(resources, candidate, published_state)
         await _nucc_generic_activate(resources, candidate)
     await resources.admin.execute("DROP TRIGGER unknown_nucc_hook ON mrf.nucc_taxonomy")
     assert await _published_state(resources) == published_state
+    assert await resources.admin.fetchval(_NUCC_EVIDENCE_REVISION) == 0
     ownership, manifest, validation, cutover = candidate
     with pytest.raises(RuntimeError, match="caller rejected rotation"):
         async with resources.publisher.transaction() as session:
@@ -1623,8 +1657,11 @@ async def _nucc_assert_guard_and_rollback(resources, candidate, published_state)
                 cutover=cutover,
             )
             assert await session.scalar(text("SELECT count(*) FROM mrf.nucc_taxonomy")) == 2
+            assert await session.scalar(text(_NUCC_EVIDENCE_REVISION)) == 1
+            assert await resources.admin.fetchval(_NUCC_EVIDENCE_REVISION) == 0
             raise RuntimeError("caller rejected rotation")
     assert await _published_state(resources) == published_state
+    assert await resources.admin.fetchval(_NUCC_EVIDENCE_REVISION) == 0
     assert await resources.admin.fetchval("SELECT to_regnamespace($1) IS NOT NULL", ownership.schema_name)
 
 
@@ -1745,8 +1782,14 @@ async def test_native_nucc_generic_receive_retires_known_guard_and_cleans_retain
         await nucc._publish_plain_generation(await _new_attempt(resources, 3))
         before = await _published_state(resources)
         assert before[0]["native_input"]["revision"] == 1 and before[0]["family_generation"]["local_generation"] == 2
-        await _nucc_assert_guard_and_rollback(resources, candidate, before)
-        activated = await _nucc_generic_activate(resources, candidate)
+        async with _nucc_archive_evidence_role(resources, monkeypatch) as evidence_role:
+            can_read_live = "SELECT has_table_privilege($1, 'mrf.nucc_taxonomy', 'SELECT')"
+            assert not await resources.admin.fetchval(can_read_live, evidence_role)
+            await _nucc_assert_guard_and_rollback(resources, candidate, before)
+            assert not await resources.admin.fetchval(can_read_live, evidence_role)
+            activated = await _nucc_generic_activate(resources, candidate)
+            await _nucc_assert_role_readonly(resources, "mrf", evidence_role)
+            assert await resources.admin.fetchval(_NUCC_EVIDENCE_REVISION) == 1
         retained = await _nucc_assert_generic_activation(resources, candidate, activated, captured, before)
         await _nucc_assert_named_readonly_relations(resources, ("mrf", retained))
         await _nucc_assert_retired_cleanup(resources, retained)

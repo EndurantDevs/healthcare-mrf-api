@@ -284,10 +284,21 @@ async def test_completed_handoff_publishes_named_frozen_generation_without_new_r
     handoff = _nucc_completed_handoff(_nucc_stage_receipt())
     if not immutable:
         handoff["contract"] = archive.NUCC_HANDOFF_CONTRACT
+    session = SimpleNamespace(execute=AsyncMock())
     publish = AsyncMock(return_value="named generation")
+
+    async def mark_taxonomy(schema, execute, replaced_table):
+        publish.assert_awaited_once()
+        assert schema == "mrf"
+        assert replaced_table == "nucc_taxonomy"
+        await execute("SELECT 1")
+
     monkeypatch.setattr(generation, "publish_immutable_nucc_generation", publish)
-    assert await generation._publish_nucc_handoff_generation("session", handoff) == "named generation"
-    publish.assert_awaited_once_with("session", schema_name="mrf", expected_authority=handoff["incumbent"])
+    monkeypatch.setattr(generation, "mark_procedure_taxonomy_inputs_changed", mark_taxonomy)
+    assert await generation._publish_nucc_handoff_generation(session, handoff) == "named generation"
+    publish.assert_awaited_once_with(session, schema_name="mrf", expected_authority=handoff["incumbent"])
+    session.execute.assert_awaited_once()
+    assert str(session.execute.await_args.args[0]) == "SELECT 1"
 
 
 @pytest.mark.asyncio
