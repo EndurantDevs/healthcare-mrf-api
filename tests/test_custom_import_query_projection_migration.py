@@ -63,6 +63,7 @@ _NAMED_GENERATION_REVISIONS = (
     "20261115110000_network_retained_read_grant_ledger",
     "20261115120000_named_output_recovery_document",
     "20261116090000_profile_capacity_logical_names",
+    "20261119090000_cms_npd_typed_release",
 )
 
 
@@ -135,7 +136,11 @@ def test_projection_migration_extends_the_single_installed_head():
     script = ScriptDirectory.from_config(config)
     module = migration()
     assert module.down_revision == "20261013010000_registry_custom_history_events"
-    assert script.get_heads() == ["20261116090000_profile_capacity_logical_names"]
+    assert script.get_heads() == ["20261119090000_cms_npd_typed_release"]
+    assert (
+        script.get_revision("20261119090000_cms_npd_typed_release").down_revision
+        == "20261116090000_profile_capacity_logical_names"
+    )
     assert (
         script.get_revision("20261116090000_profile_capacity_logical_names").down_revision
         == "20261115120000_named_output_recovery_document"

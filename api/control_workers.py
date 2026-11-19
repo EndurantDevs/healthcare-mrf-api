@@ -135,6 +135,7 @@ _START_WORKERS: tuple[WorkerSpec, ...] = (
     WorkerSpec("arq:LODES", "process.LODES", ("lodes",)),
     WorkerSpec("arq:MedicareEnrollment", "process.MedicareEnrollment", ("medicare-enrollment",)),
     WorkerSpec("arq:CMSDoctors", "process.CMSDoctors", ("cms-doctors",)),
+    WorkerSpec("arq:CMSNPD", "process.CMSNPD", ("cms-npd",)),
     WorkerSpec("arq:FacilityAnchors", "process.FacilityAnchors", ("facility-anchors",)),
     WorkerSpec("arq:PharmacyEconomics", "process.PharmacyEconomics", ("pharmacy-economics",)),
     WorkerSpec("arq:EntityAddressUnified", "process.EntityAddressUnified", ("entity-address-unified",)),

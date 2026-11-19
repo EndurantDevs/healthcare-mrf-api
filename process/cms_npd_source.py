@@ -13,6 +13,7 @@ import re
 import sqlite3
 import uuid
 from compression import zstd
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -443,6 +444,28 @@ def acquire_release(
     directory = _acquisition_directory(root, vector_sha256)
     with _release_lock(directory):
         return _acquire_pinned_release(client, base_url, directory, manifest, probes_by_name, vector_sha256)
+
+
+def download_release(
+    root: Path, observed: ObservedRelease, *, base_url: str = DOWNLOADS_URL, parallel: int = 4
+) -> Path:
+    """Download (or resume) the observed files with size checks only; no decoded validation."""
+
+    if not root.is_dir():
+        raise CmsNpdSourceError("cms_npd_artifact_root_missing")
+    directory = _acquisition_directory(root, observed.vector_sha256)
+
+    def _download_one(pair: tuple[ManifestFile, FileProbe]) -> Path:
+        with httpx.Client(timeout=httpx.Timeout(60.0, connect=30.0)) as client:
+            return _download(client, base_url, directory, *pair)
+
+    with _release_lock(directory):
+        manifest_path = directory / "manifest.json"
+        if not manifest_path.exists():  # the directory name pins the manifest bytes
+            _atomic_bytes(manifest_path, observed.manifest.raw)
+        with ThreadPoolExecutor(max_workers=max(1, parallel)) as pool:
+            list(pool.map(_download_one, zip(observed.manifest.files, observed.probes, strict=True)))
+    return directory
 
 
 def _acquisition_directory(root: Path, vector_sha256: str) -> Path:

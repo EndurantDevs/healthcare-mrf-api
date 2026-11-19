@@ -106,7 +106,7 @@ def test_factorized_downgrade_refuses_immutable_v3_candidates(monkeypatch) -> No
 
 def _assert_current_registry_head(script):
     """Keep the complete catalog refresh and inventory revision chain explicit."""
-    assert script.get_heads() == ["20261116090000_profile_capacity_logical_names"]
+    assert script.get_heads() == ["20261119090000_cms_npd_typed_release"]
     assert (
         script.get_revision("20261116090000_profile_capacity_logical_names").down_revision
         == "20261115120000_named_output_recovery_document"

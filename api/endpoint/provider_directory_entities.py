@@ -7,6 +7,7 @@ from dataclasses import replace
 from sanic import Blueprint, response
 from sqlalchemy.exc import SQLAlchemyError
 
+from api.cms_npd_typed_entities import read_cms_entities as read_typed_cms_entities
 from api.control_auth import require_control_auth
 from api.provider_directory_cms_entities import read_cms_entities
 from api.provider_directory_entities_contract import DirectoryReadError, parse_directory_read
@@ -42,7 +43,12 @@ async def _read(request, kind, entity_id, shape):
                 raise DirectoryReadError(503)
             payload = await read_cms_entities(request.ctx.sa_session, query, response_headers=response_headers_by_name)
             return response.json(payload, headers=response_headers_by_name)
-        reader = read_medical_groups if query.source_id == "cms-doctors" else read_cms_entities
+        if query.source_id == "cms-doctors":
+            reader = read_medical_groups
+        elif query.kind == "payers":  # reviewed payer bindings stay on the existing reader
+            reader = read_cms_entities
+        else:
+            reader = read_typed_cms_entities
         payload = await reader(request.ctx.sa_session, query)
         return response.json(payload, headers=_HEADERS)
     except DirectoryReadError as error:
