@@ -31,7 +31,7 @@ def partition_of(role_id: str, partitions: int = PARTITIONS) -> int:
     return zlib.crc32(role_id.encode()) % partitions
 
 
-def _encoded(prepared_row: dict[str, Any]) -> bytes:
+def encoded_row(prepared_row: dict[str, Any]) -> bytes:
     """Source values keep their exact JSON: orjson would turn wide integers into floats and NaN into null."""
     try:
         # ASCII escapes keep a lone surrogate, which UTF-8 cannot encode.
@@ -104,15 +104,22 @@ class GroupWriter:
         """Buffer prepared rows by partition; full buffers become frames on disk."""
         for prepared_row in prepared_rows:
             partition = partition_of(prepared_row["resource_id"], self.partitions)
-            line = _encoded(prepared_row)
-            buffer = self.buffer_by_partition.setdefault(partition, bytearray())
-            buffer += line
-            self.buffered_bytes += len(line)
-            self.row_count += 1
-            if len(buffer) >= FRAME_BYTES:
-                self._flush(partition)
-            if self.buffered_bytes >= BUFFER_CAP_BYTES:
-                self._flush_all()
+            self._buffer(partition, encoded_row(prepared_row))
+
+    def write_encoded(self, role_ids: Iterable[str], encoded_lines: Iterable[bytes]) -> None:
+        """Buffer lines already encoded as encoded_row does, each with the role id it groups under."""
+        for role_id, line in zip(role_ids, encoded_lines, strict=True):
+            self._buffer(partition_of(role_id, self.partitions), line)
+
+    def _buffer(self, partition: int, line: bytes) -> None:
+        buffer = self.buffer_by_partition.setdefault(partition, bytearray())
+        buffer += line
+        self.buffered_bytes += len(line)
+        self.row_count += 1
+        if len(buffer) >= FRAME_BYTES:
+            self._flush(partition)
+        if self.buffered_bytes >= BUFFER_CAP_BYTES:
+            self._flush_all()
 
     def _flush_all(self) -> None:
         for partition in list(self.buffer_by_partition):
@@ -126,15 +133,30 @@ class GroupWriter:
         self.buffered_bytes -= len(buffer)
         self.written_partitions.add(partition)
 
-    def finish(self, source_lines: int) -> None:
-        """Make every frame durable, then mark the output grouped."""
+    def finish(self, source_lines: int, fallback_counts_by_reason: dict[str, int] | None = None) -> None:
+        """Make every frame durable, then mark the output grouped with the lines prepared by Python, by reason."""
         self._flush_all()
         for partition in self.written_partitions:
             with open(self.output_directory / f"{partition}.zst", "rb+") as handle:
                 os.fsync(handle.fileno())
         _fsync_directory(self.output_directory)
-        marker_by_field = {"rows": self.row_count, "source_lines": source_lines, "partitions": self.partitions}
+        marker_by_field = {
+            "rows": self.row_count,
+            "source_lines": source_lines,
+            "partitions": self.partitions,
+            "fallbacks": fallback_counts_by_reason or {},
+        }
         _write_atomically(_done_path(self.directory, self.output_index), orjson.dumps(marker_by_field))
+
+
+def fallback_counts(directory: Path, output_indexes: Iterable[int]) -> dict[str, int]:
+    """Lines the grouped outputs prepared with the Python chain instead of natively, by reason."""
+    total_by_reason: dict[str, int] = {}
+    for output_index in output_indexes:
+        marker_by_field = orjson.loads(_done_path(directory, output_index).read_bytes())
+        for reason, count in marker_by_field.get("fallbacks", {}).items():
+            total_by_reason[reason] = total_by_reason.get(reason, 0) + count
+    return total_by_reason
 
 
 def _grouped_lines(directory: Path, output_index: int, partition: int, partitions: int) -> Iterator[bytes]:

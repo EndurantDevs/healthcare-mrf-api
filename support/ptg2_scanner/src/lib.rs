@@ -38,6 +38,7 @@ mod npi_identifier;
 pub mod output;
 pub mod progress;
 pub mod provider_directory_projection;
+pub mod provider_directory_rows;
 pub mod provider_graph_v4;
 pub mod rate_schedule_observe;
 pub mod registry_assertion_conflicts;
@@ -128,6 +129,7 @@ mod python_api {
     include!("python_custom_import_graph_projection.rs");
     include!("python_registry.rs");
     include!("python_entity_address_rows.rs");
+    include!("python_provider_directory_rows.rs");
     include!("python_address_batch.rs");
     include!("python_retained_fhir_capture.rs");
     include!("python_catalog_observation.rs");
@@ -699,6 +701,12 @@ mod python_api {
         m.add_function(wrap_pyfunction!(canonicalize_contact_batch, m)?)?;
         m.add_function(wrap_pyfunction!(prepare_entity_address_rows, m)?)?;
         m.add_function(wrap_pyfunction!(entity_address_rows_version, m)?)?;
+        m.add_function(wrap_pyfunction!(prepare_provider_directory_rows_v1, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            prepare_provider_directory_row_lines_v1,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(provider_directory_rows_version, m)?)?;
         m.add_function(wrap_pyfunction!(encode_retained_fhir_capture_batch, m)?)?;
         m.add_function(wrap_pyfunction!(canon_version, m)?)?;
         m.add_function(wrap_pyfunction!(intersect_sorted_u32_py, m)?)?;

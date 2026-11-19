@@ -1028,6 +1028,22 @@ reason the copy root setting must keep its value until the acquisition finishes:
 the marker that refuses a mixed acquisition is kept there too, so a removed or
 changed root loses both the role data and that refusal.
 
+Workers prepare each role line on its own. When the compiled `ptg2_address_canon`
+module provides `prepare_provider_directory_row_lines_v1`, they do it in native code
+and write the same group line the Python path would; a line the native code cannot
+reproduce exactly (for example a float value or a host name it does not normalize)
+is prepared by the Python path alone, and the `.done` marker and the `grouped_load`
+log line report those lines by reason (`python_lines`, `python_reasons`). A module
+whose contract version differs fails the worker. Without the module, every line is
+prepared by the Python path, one at a time, and reported under the reason
+`native_unavailable`, so the staged rows are the same either way. Per-line
+preparation applies no in-batch identity rule. One native role id that arrives twice
+with different content is refused by the completion check that keeps one content
+per native role, with the `provider_directory_resource_payload_conflict` error,
+instead of while grouping. One id that arrives with no `meta` and again with only
+`meta.lastUpdated` has equal content but two merged-role ids, and stays two merged
+roles; the stream keeps one of them only when both share a batch.
+
 The candidate is published only when every selected resource reports a
 complete, unbounded, error-free scan with no next page remaining. Publication
 locks the endpoint identity and atomically marks the prior current dataset

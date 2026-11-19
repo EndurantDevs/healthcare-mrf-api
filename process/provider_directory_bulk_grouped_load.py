@@ -28,7 +28,8 @@ import orjson
 from process import provider_directory_bulk_grouping as grouping
 from process import provider_directory_bulk_parallel as bulk_parallel
 from process import provider_directory_bulk_spool as spool
-from process.provider_directory_bulk_prepare import PrepareContext, persist_prepared_rows, prepare_lines
+from process import provider_directory_rows_native as rows_native
+from process.provider_directory_bulk_prepare import PrepareContext, persist_prepared_rows
 from process.provider_directory_fhir_response import BULK_EXPORT_WAIT_CALLBACK
 from process.provider_directory_resource_hash import is_semantic_resource_hash_contract
 from process.provider_directory_role_merge import is_role_repeat_source
@@ -200,9 +201,18 @@ async def _group(load, executor, pending_pairs):
     return None
 
 
+def _prepare_batch(lines, context, fallback_counts_by_reason):
+    """Each line on its own, with or without the compiled preparer, so the staged rows never depend on it."""
+    prepared = rows_native.prepare_directory_row_lines(lines, context)
+    for reason, count in prepared.fallback_counts_by_reason.items():
+        fallback_counts_by_reason[reason] = fallback_counts_by_reason.get(reason, 0) + count
+    return prepared
+
+
 def group_output(spool_path, group_root, output_index, content_length, context, batch_size, partitions):
     """Worker task: prepare one saved output into its group files, then free its copy; returns an error or None."""
     writer = grouping.GroupWriter(group_root, output_index, partitions)
+    fallback_counts_by_reason = {}
     fetched_count = read_bytes = 0
     lines = []
     with zstd.open(spool_path, "rb") as handle:
@@ -211,21 +221,22 @@ def group_output(spool_path, group_root, output_index, content_length, context, 
             lines.append(line)
             if len(lines) < max(1, batch_size):
                 continue
-            prepared = prepare_lines(lines, context)
+            prepared = _prepare_batch(lines, context, fallback_counts_by_reason)
             if prepared.error:
                 return prepared.error
-            writer.write(prepared.rows)
+            writer.write_encoded(prepared.resource_ids, prepared.encoded_lines)
             fetched_count += prepared.rows_fetched
             lines = []
             if (cancel := _WORKER_STATE_BY_NAME.get("cancel")) is not None and cancel.is_set():
                 return "bulk_export_group_cancelled"
-    prepared = prepare_lines(lines, context)
+    prepared = _prepare_batch(lines, context, fallback_counts_by_reason)
     if prepared.error:
         return prepared.error
     if read_bytes != content_length:
         return "bulk_export_output_length_mismatch"
-    writer.write(prepared.rows)
-    writer.finish(fetched_count + prepared.rows_fetched)
+    writer.write_encoded(prepared.resource_ids, prepared.encoded_lines)
+    fetched_count += prepared.rows_fetched
+    writer.finish(fetched_count, fallback_counts_by_reason)
     Path(spool_path).unlink(missing_ok=True)  # the marker is durable, so the copy is no longer needed
     return None
 
@@ -358,8 +369,16 @@ async def _finish(load, pending_pairs):
                 identity, checkpoint["output_id"], rows_written, content_length, require_validator=True
             )
     load.stream_state.outputs_processed += len(pending_pairs)
+    fallback_by_reason = await asyncio.to_thread(
+        grouping.fallback_counts, load.group_root, [output.output_index for output, _ in pending_pairs]
+    )
     directory._bulk_export_log(
-        "grouped_load", resource=identity.resource_type, outputs=len(pending_pairs), staged=staged_count
+        "grouped_load",
+        resource=identity.resource_type,
+        outputs=len(pending_pairs),
+        staged=staged_count,
+        python_lines=sum(fallback_by_reason.values()),
+        python_reasons=",".join(f"{reason}:{count}" for reason, count in sorted(fallback_by_reason.items())),
     )
     await asyncio.to_thread(grouping.discard, load.group_root.parent)
 
