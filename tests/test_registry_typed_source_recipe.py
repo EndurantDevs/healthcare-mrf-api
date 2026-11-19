@@ -10,7 +10,7 @@ from uuid import UUID
 import pytest
 
 from process.network_approved_source_bindings import RegistryNetworkSourceCoordinates
-from process.network_fhir_source_witness_contract import digest
+from process.network_fhir_source_witness_contract import canonical, digest
 from process.network_fhir_typed_capture import PREFIX, TypedGraphAnchor
 from process.network_fhir_typed_contract import graph_document
 from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
@@ -25,6 +25,8 @@ from process.registry_source_inventory_store import _COLUMNS, source_inventory_e
 from process.registry_source_recipe_composition import RegistrySourceRecipeStage
 from process.registry_source_recipe_store import (
     RegistrySourceMembershipRecipe,
+    RegistrySourceRecipeError,
+    canonical_decoded_registry_source_recipes,
     canonical_registry_source_recipes,
     decode_registry_source_recipes,
 )
@@ -41,7 +43,7 @@ from tests.test_network_fhir_source_witness_contract import origin_fields
 from tests.test_registry_fhir_catalog_sources import descriptor as catalog_descriptor
 
 
-def _recipe():
+def _recipe(*, capture_id=5, tables=None):
     from process.network_fhir_typed_capture import TABLES
     from process.registry_fhir_catalog_observation import FHIRCatalogObservationDigests
     from process.registry_fhir_catalog_observed_source import build_fhir_catalog_observation_descriptor
@@ -60,7 +62,7 @@ def _recipe():
     catalog = build_fhir_catalog_observation_descriptor(
         read_profile(),
         published_row(resource_count=1),
-        catalog_descriptor()["tables"],
+        catalog_descriptor()["tables"] if tables is None else tables,
         ("https://directory.example.test/fhir/", ["alias-a", "alias-b"]),
         families,
     )
@@ -82,7 +84,7 @@ def _recipe():
         "2026-10-01",
         {"source_rows": 1, "projected_rows": 1, "pair_rows": 1, "reference_rows": 1, "provider_only_roles": 0},
     )
-    anchor = TypedGraphAnchor(str(UUID(int=5)), "2026-10-01T00:00:00.000000+00:00")
+    anchor = TypedGraphAnchor(str(UUID(int=capture_id)), "2026-10-01T00:00:00.000000+00:00")
     schema = PREFIX + UUID(anchor.capture_id).hex
     capture_by_field = {
         "component": "registry_fhir_typed_capture",
@@ -160,6 +162,44 @@ def test_typed_recipe_closed_roundtrip_and_old_bytes_unchanged():
         replace(recipe, binding_coordinates=replace(recipe.binding_coordinates, edition_id="other"))
     with pytest.raises(ValueError):
         replace(recipe.source_pin, anchor=replace(recipe.source_pin.anchor, capture_id=str(UUID(int=6))))
+
+
+def _typed_v4_document(recipe):
+    (document,) = json.loads(canonical_registry_source_recipes((recipe,)))
+    document["source_pin"]["capture"]["descriptor_version"] = 4
+    (normalized,) = json.loads(canonical_registry_source_recipes(decode_registry_source_recipes([document])))
+    return normalized
+
+
+def test_mixed_retained_inventory_preserves_legacy_wire_bytes():
+    tables = catalog_descriptor()["tables"]
+    tables["resource"]["name"] = "provider_directory_dataset_resource"
+    retained = _typed_v4_document(_recipe(capture_id=7, tables=tables))
+    pin = retained["source_pin"]
+    legacy_catalog_by_field = dict(pin["catalog_descriptor"])
+    legacy_catalog_by_field["catalog_schema"] = legacy_catalog_by_field.pop("tables")["header"]["schema"]
+    pin["catalog_descriptor"] = legacy_catalog_by_field
+    pin["capture"]["catalog_descriptor"] = legacy_catalog_by_field
+
+    current = json.loads(canonical_registry_source_recipes((_example(), _recipe())))
+    current.append(_typed_v4_document(_recipe(capture_id=6)))
+    current.append(retained)
+    transport = canonical(sorted(current, key=canonical))
+
+    decoded = decode_registry_source_recipes(transport)
+    assert len(decoded) == 4
+    assert canonical_registry_source_recipes(decoded) != transport
+    assert canonical_decoded_registry_source_recipes(transport) == transport
+
+
+def test_retained_inventory_rejects_other_decodable_normalization():
+    document = _typed_v4_document(_recipe())
+    del document["source_pin"]["capture"]["catalog_generation"]
+    transport = canonical([document])
+
+    assert canonical_registry_source_recipes(decode_registry_source_recipes(transport)) != transport
+    with pytest.raises(RegistrySourceRecipeError, match="registry_source_recipes_invalid"):
+        canonical_decoded_registry_source_recipes(transport)
 
 
 @pytest.mark.parametrize("field", ["source_witness_capture", "retained_capture", "retained_successor", "extra"])
