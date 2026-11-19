@@ -198,6 +198,7 @@ RUN test "${#HLTHPRT_SOURCE_COMMIT}" -eq 40 \
 USER nobody:nogroup
 
 RUN /opt/venv/bin/python -B -c "import inspect; import ptg2_address_canon as native; from process.custom_import import scalar_digest; encoder = getattr(native, 'custom_import_scalar_frames_v1', None); assert inspect.isbuiltin(encoder); assert scalar_digest.native_encoder() is encoder"
+RUN /opt/venv/bin/python -B -c "import inspect; import ptg2_address_canon as native; from process import provider_directory_rows_native as rows_native; assert inspect.isbuiltin(native.prepare_provider_directory_row_lines_v1); assert rows_native.has_native_row_lines('PractitionerRole')"
 
 EXPOSE 8080
 CMD ["/usr/local/bin/start_api.sh"]

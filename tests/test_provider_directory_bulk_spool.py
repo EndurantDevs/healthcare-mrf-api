@@ -23,6 +23,7 @@ from process import provider_directory_bulk_spool as spool
 from process import provider_directory_fhir_response as fhir_response
 from process import provider_directory_generic_source_adapters as adapters
 from process import provider_directory_role_merge as role_merge
+from process import provider_directory_rows_native as rows_native
 from process.provider_directory_resource_hash import SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT
 from tests.test_provider_directory_bulk_parallel import _source
 
@@ -511,7 +512,7 @@ def _crash_once(monkeypatch, owner, name, call_number, should_crash=lambda *argu
 
 def _inject_crash(monkeypatch, stage):
     if stage == "mid_group":  # the second output's first batch: the first output is grouped, the second is not
-        _crash_once(monkeypatch, grouped_load, "prepare_lines", 4)
+        _crash_once(monkeypatch, grouped_load, "_prepare_batch", 4)
     elif stage == "before_load":
         _crash_once(monkeypatch, grouping, "reduce_partition", 1)
     elif stage == "mid_load":  # the second partition's rows are committed, its marker is not: it is replayed
@@ -707,3 +708,48 @@ async def test_spawned_worker_groups_loads_and_finishes(grouped_source, monkeypa
 
     assert set(ledger.completions) == {"o0", "o1"} and len(requests) == 2
     assert len(_merged_rows(ledger)) == 7 and sum(ledger.completions.values()) == len(ledger.staged_rows)
+
+
+async def _grouped_run_with_markers(session, url, grouped_source, monkeypatch, identity):
+    """One complete grouped run; returns the staged rows and each output's .done marker, read before cleanup."""
+    markers = []
+    real_fallback_counts = grouping.fallback_counts
+
+    def recording_fallback_counts(group_root, output_indexes):
+        markers.extend(json.loads((group_root / f"{index}.done").read_bytes()) for index in output_indexes)
+        return real_fallback_counts(group_root, output_indexes)
+
+    manifest, checkpoints = _two_output_export(monkeypatch, url, ("streaming",) * 2)
+    ledger = _Ledger()
+    _grouped_fakes(monkeypatch, ledger)
+    with monkeypatch.context() as recording:
+        recording.setattr(grouping, "fallback_counts", recording_fallback_counts)
+        assert await _run_grouped(session, dict(grouped_source), identity, manifest, checkpoints, ledger) == [
+            None,
+            None,
+        ]
+    return sorted(ledger.staged_rows, key=lambda staged: staged["resource_id"]), markers
+
+
+@pytest.mark.asyncio
+async def test_spawned_native_worker_stages_what_python_stages(grouped_source, monkeypatch):
+    if not rows_native.has_native_row_lines("PractitionerRole"):
+        pytest.skip("compiled ptg2_address_canon with prepare_provider_directory_row_lines_v1 is not importable")
+    async with _output_server([]) as server, aiohttp.ClientSession() as session:
+        url = str(server.make_url("/output"))
+        with monkeypatch.context() as python_only:  # in process (WORKERS_ENV is 0), so the patch reaches the worker
+            python_only.setattr(rows_native, "_native_export", lambda name: None)
+            expected_rows, python_markers = await _grouped_run_with_markers(
+                session, url, grouped_source, monkeypatch, _grouped_identity("d" * 64)
+            )
+        monkeypatch.setenv(grouped_load.WORKERS_ENV, "1")  # a spawned worker imports the compiled module itself
+        staged_rows, native_markers = await _grouped_run_with_markers(
+            session, url, grouped_source, monkeypatch, _grouped_identity()
+        )
+
+    assert staged_rows == expected_rows and len(staged_rows) == 7
+    # Either way one group line per source role: no rule depends on which lines share a batch.
+    assert [marker["rows"] for marker in native_markers] == [120, 120]
+    assert [marker["rows"] for marker in python_markers] == [120, 120]
+    assert all(marker["fallbacks"] == {} for marker in native_markers)
+    assert [marker["fallbacks"] for marker in python_markers] == [{"native_unavailable": 120}] * 2

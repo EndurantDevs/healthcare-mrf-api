@@ -159,6 +159,31 @@ def test_final_image_requires_compiled_scalar_encoder(monkeypatch, capability, s
             exec(code)
 
 
+@pytest.mark.parametrize(
+    ("export", "is_served", "accepted"), [(lambda: b"", True, False), (len, False, False), (len, True, True)]
+)
+def test_final_image_requires_compiled_role_line_preparer(monkeypatch, export, is_served, accepted):
+    runtime_stage = (ROOT / "Dockerfile").read_text().split("\nFROM ")[-1]
+    command = next(
+        line
+        for line in runtime_stage.splitlines()
+        if line.startswith("RUN /opt/venv/bin/python -B -c ") and "prepare_provider_directory_row_lines_v1" in line
+    )
+    assert runtime_stage.index("USER nobody:nogroup") < runtime_stage.index(command)
+    code = shlex.split(command)[-1]
+    from process import provider_directory_rows_native as rows_native
+
+    monkeypatch.setitem(
+        sys.modules, "ptg2_address_canon", SimpleNamespace(prepare_provider_directory_row_lines_v1=export)
+    )
+    monkeypatch.setattr(rows_native, "has_native_row_lines", lambda resource_type: is_served)
+    if accepted:
+        exec(code)
+    else:
+        with pytest.raises(AssertionError):
+            exec(code)
+
+
 def test_native_extension_supports_python_314_and_newer():
     assert 'requires-python = ">=3.14"' in (ROOT / "support/ptg2_scanner/pyproject.toml").read_text()
     assert 'features = ["abi3-py314"]' in (ROOT / "support/ptg2_scanner/Cargo.toml").read_text()
