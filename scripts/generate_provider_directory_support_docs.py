@@ -112,6 +112,7 @@ DISPLAY_VALUES = {
     "blocked": "Blocked",
     "not-supported": "Not supported",
     "none": "None",
+    "api-key": "API key",
     "oauth2-client-credentials": "OAuth2 client credentials",
     "private-connector": "Private connector",
     "registration-approval": "Registration and approval",

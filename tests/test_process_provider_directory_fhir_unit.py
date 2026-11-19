@@ -15403,8 +15403,8 @@ def _write_supplemental_catalog_fixtures(tmp_path):
 
 
 def _assert_supplemental_catalog_metrics(metrics) -> None:
-    assert metrics["sources_seeded"] == 25
-    assert metrics["supplemental_catalog_sources_considered"] == 25
+    assert metrics["sources_seeded"] == 33
+    assert metrics["supplemental_catalog_sources_considered"] == 33
     catalog_metrics = metrics["supplemental_catalogs"]["catalogs"]
     assert catalog_metrics["reviewed_provider_directory_candidates"]["rows"] == 8
     assert catalog_metrics["amerihealth_caritas"]["rows"] == 1
@@ -15415,7 +15415,7 @@ def _assert_supplemental_catalog_metrics(metrics) -> None:
     assert catalog_metrics["anthem"]["rows"] == 1
     assert catalog_metrics["aetna_provider_directorydata"]["rows"] == 1
     assert catalog_metrics["mvp_health_care"]["rows"] == 1
-    assert catalog_metrics["configured_sources"]["rows"] == 4
+    assert catalog_metrics["configured_sources"]["rows"] == 12
     assert catalog_metrics["provider_directory_blockers"]["rows"] == 3
 
 

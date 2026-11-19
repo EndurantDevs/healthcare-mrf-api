@@ -40,7 +40,15 @@
     "uhc-flex-rooted-graph-enrichment",
     "uhc-provider-files",
     "wyoming",
-    "independence-provider-directory"
+    "independence-provider-directory",
+    "highmark-hm",
+    "highmark-hmpams",
+    "highmark-hmwvms",
+    "highmark-hmde",
+    "highmark-hmwv",
+    "highmark-hmny",
+    "highmark-bcbsde",
+    "highmark-bcbswy"
   ],
   "retained_entry_ids": [
     "uhc-provider-files"
@@ -96,7 +104,15 @@
     "pdfhir_2b088f28554b9e51505b455e",
     "pdfhir_2754e999dd691175821ec26e",
     "pdfhir_72257bf04f7fb816c0ad6fb9",
-    "pdfhir_dd4d8d4cf1e5dd3e609ae0b3"
+    "pdfhir_dd4d8d4cf1e5dd3e609ae0b3",
+    "pdfhir_a564a1f155aa4fbc19c8b33a",
+    "pdfhir_ccf82b68858057e8d5ed0053",
+    "pdfhir_89d5e75a7d19891b4396b278",
+    "pdfhir_965c3850b842cb9c4ac06605",
+    "pdfhir_8d1ff3305c33d81675a9fdb4",
+    "pdfhir_9d5948bff9bc1873bf31c7b6",
+    "pdfhir_1d60f9a500d59043037ed007",
+    "pdfhir_02a83b647e7576ca2dfe0699"
   ],
   "authority_ids_by_source_id": {
     "pdfhir_1ceb7c0986c320b7eb924881": "unitedhealthcare",
@@ -164,7 +180,15 @@
       {"entry_id": "uhc-flex-rooted-graph-enrichment", "source_id": "pdfhir_2b088f28554b9e51505b455e", "resource_profile": "R8_DATASET"},
       {"entry_id": "uhc-provider-files", "source_id": "pdfhir_2754e999dd691175821ec26e", "resource_profile": "A6"},
       {"entry_id": "wyoming", "source_id": "pdfhir_72257bf04f7fb816c0ad6fb9", "resource_profile": "R8"},
-      {"entry_id": "independence-provider-directory", "source_id": "pdfhir_dd4d8d4cf1e5dd3e609ae0b3", "resource_profile": "R8"}
+      {"entry_id": "independence-provider-directory", "source_id": "pdfhir_dd4d8d4cf1e5dd3e609ae0b3", "resource_profile": "R8"},
+      {"entry_id": "highmark-hm", "source_id": "pdfhir_a564a1f155aa4fbc19c8b33a", "resource_profile": "R8"},
+      {"entry_id": "highmark-hmpams", "source_id": "pdfhir_ccf82b68858057e8d5ed0053", "resource_profile": "R8"},
+      {"entry_id": "highmark-hmwvms", "source_id": "pdfhir_89d5e75a7d19891b4396b278", "resource_profile": "R8"},
+      {"entry_id": "highmark-hmde", "source_id": "pdfhir_965c3850b842cb9c4ac06605", "resource_profile": "R8"},
+      {"entry_id": "highmark-hmwv", "source_id": "pdfhir_8d1ff3305c33d81675a9fdb4", "resource_profile": "R8"},
+      {"entry_id": "highmark-hmny", "source_id": "pdfhir_9d5948bff9bc1873bf31c7b6", "resource_profile": "R8"},
+      {"entry_id": "highmark-bcbsde", "source_id": "pdfhir_1d60f9a500d59043037ed007", "resource_profile": "R8"},
+      {"entry_id": "highmark-bcbswy", "source_id": "pdfhir_02a83b647e7576ca2dfe0699", "resource_profile": "R8"}
     ]
   },
   "excluded_public_fields": [
