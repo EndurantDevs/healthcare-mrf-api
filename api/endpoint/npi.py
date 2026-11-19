@@ -9259,14 +9259,14 @@ async def list_providers(
             address_source = f"{address_table_sql} as c\n    {phone_candidates_join}\n    {taxonomy_source}"
         else:
             address_source = f"{address_table_sql} as c\n    {phone_candidates_join}"
+        compact_network_order = compact_network_scope and (
+            zip_code or city or state or 4 <= len(network_scope.network_ids) <= 5
+        )
         use_computed_page_order = bool(plan_network_ids) or (
             use_taxonomy_filter
             and not npi_where
             and order_by == "npi"
-            and (
-                (is_ordinary_provider_query and zip_code)
-                or (compact_network_scope and page_import_context is None and (zip_code or city or state))
-            )
+            and ((is_ordinary_provider_query and zip_code) or (compact_network_order and page_import_context is None))
         )
         if order_by == "relevance":
             eligible_npis_sql = _relevance_page_sql(

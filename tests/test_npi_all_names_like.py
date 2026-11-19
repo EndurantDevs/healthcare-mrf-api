@@ -168,28 +168,36 @@ async def test_get_all_zip_code_only_filters_keep_direct_taxonomy_matching(monke
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "location, extra_args, scope_kind, computed_order",
+    "location, extra_args, scope_kind, selected_count, computed_order",
     [
-        ({"zip_code": "12345"}, {"q": "example"}, None, False),
-        ({"zip_code": "12345"}, {"q": "example", "order_by": "relevance"}, None, False),
-        ({"zip_code": "12345"}, {}, "compact", True),
-        ({"state": "TX"}, {}, "compact", True),
-        ({"city": "Chicago", "state": "IL"}, {}, "compact", True),
-        ({"state": "TX"}, {}, None, False),
-        ({"state": "TX"}, {}, "unselected", False),
-        ({"state": "TX"}, {}, "legacy", False),
-        ({"state": "TX"}, {}, "heap", False),
-        ({}, {}, "compact", False),
+        ({"zip_code": "12345"}, {"q": "example"}, None, 0, False),
+        ({"zip_code": "12345"}, {"q": "example", "order_by": "relevance"}, None, 0, False),
+        ({"zip_code": "12345"}, {}, "compact", 2, True),
+        ({"state": "TX"}, {}, "compact", 1, True),
+        ({"city": "Chicago", "state": "IL"}, {}, "compact", 2, True),
+        ({"state": "TX"}, {}, "compact", 50, True),
+        ({"state": "TX"}, {}, None, 0, False),
+        ({"state": "TX"}, {}, "unselected", 0, False),
+        ({"state": "TX"}, {}, "legacy", 2, False),
+        ({"state": "TX"}, {}, "heap", 2, False),
+        ({}, {}, "compact", 1, False),
+        ({}, {}, "compact", 3, False),
+        ({}, {}, "compact", 4, True),
+        ({}, {}, "compact", 5, True),
+        ({}, {}, "compact", 6, False),
+        ({}, {}, "compact", 50, False),
     ],
 )
-async def test_get_all_taxonomy_page_ordering(monkeypatch, location, extra_args, scope_kind, computed_order):
+async def test_get_all_taxonomy_page_ordering(
+    monkeypatch, location, extra_args, scope_kind, selected_count, computed_order
+):
     conn = RecordingConnection()
     monkeypatch.setattr(npi_module.db, "acquire", lambda: FakeAcquire(conn))
     monkeypatch.setattr(npi_module, "_address_serving_table_sql", AsyncMock(return_value="mrf.entity_address_unified"))
     if scope_kind is not None:
         scope = NetworkAddressReadScope(
             manifest=types.SimpleNamespace(compact_layout=None if scope_kind == "heap" else object()),
-            network_ids=None if scope_kind == "unselected" else (1, 2),
+            network_ids=None if scope_kind == "unselected" else tuple(range(1, selected_count + 1)),
             address_relation=object(),
             legacy_checksums=(123,) if scope_kind == "legacy" else None,
         )
