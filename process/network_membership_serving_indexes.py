@@ -25,6 +25,11 @@ class NetworkServingIndexesError(ValueError):
     """Serving compatibility failed without committing candidate DDL or receipts."""
 
 
+_OPTIONAL_SOURCE_COUNT_INDEX = "entity_address_unified_idx_source_count"
+_OPTIONAL_OFFICE_PAGE_INDEX = "entity_address_unified_idx_serving_office_page"
+_OPTIONAL_ADDRESS_INDEXES = frozenset({_OPTIONAL_SOURCE_COUNT_INDEX, _OPTIONAL_OFFICE_PAGE_INDEX})
+
+
 async def _column_metadata(connection, source_table, projection_table):
     columns = await connection.fetch(
         """
@@ -128,12 +133,23 @@ async def _matching_inputs(connection, candidate, copy_target, address_source, c
 
 
 def _serving_plan(schema_name):
-    statements, _ = _post_publish_index_plan(_identifier(schema_name), "serving", build_concurrently=False)
-    return [
+    namespace = _identifier(schema_name)
+    statements, _ = _post_publish_index_plan(namespace, "serving", build_concurrently=False)
+    index_statements = [
         (f"entity_address_unified_idx_{name}", statement.replace("IF NOT EXISTS ", ""))
         for name, statement in statements
         if name != "canonical_network_ids"
     ]
+    # Discover state-filtered pages from narrow office records before hydrating addresses.
+    index_statements.append(
+        (
+            _OPTIONAL_OFFICE_PAGE_INDEX,
+            f"CREATE INDEX {_OPTIONAL_OFFICE_PAGE_INDEX} ON {namespace}.entity_address_unified (state_name, location_key) "
+            "INCLUDE (type, npi, inferred_npi, row_origin) "
+            "WHERE row_origin <> 'network_custom' AND type IN ('primary', 'secondary', 'practice', 'site')",
+        )
+    )
+    return index_statements
 
 
 async def _build_serving_indexes(connection, schema_name, index_plan):
@@ -202,9 +218,6 @@ async def _serving_index_records(connection, schema_name, *, qualified_definitio
     return index_records
 
 
-_OPTIONAL_SOURCE_COUNT_INDEX = "entity_address_unified_idx_source_count"
-
-
 def _is_index_expression_equal(actual, expected):
     """Use the existing native deparser normalization without changing literal values."""
     from process.network_geo_search import _normalized_index_definition
@@ -249,7 +262,7 @@ def _require_serving_definitions(index_records, index_plan):
         "entity_address_unified_idx_" + recipe["name"]: recipe
         for recipe in EntityAddressUnified.__my_additional_indexes__
     }
-    required_names = {name for name, _ in index_plan} - {_OPTIONAL_SOURCE_COUNT_INDEX}
+    required_names = {name for name, _ in index_plan} - _OPTIONAL_ADDRESS_INDEXES
     for index_record in index_records:
         if index_record["relname"] in required_names:
             shape = _json_object(index_record["index_shape"])
@@ -266,11 +279,11 @@ async def _index_digest(
         qualified_definitions=qualified_definitions,
         **({"include_structure": True} if validate_definitions else {}),
     )
-    # Older published profiles remain readable while this optional index is built.
-    index_records = [record for record in index_records if record["relname"] != _OPTIONAL_SOURCE_COUNT_INDEX]
+    # Retained editions remain readable without optional search accelerators.
+    index_records = [record for record in index_records if record["relname"] not in _OPTIONAL_ADDRESS_INDEXES]
     actual_by_name = {record["relname"]: record for record in index_records}
     if not all(
-        index_name in actual_by_name for index_name, _ in index_plan if index_name != _OPTIONAL_SOURCE_COUNT_INDEX
+        index_name in actual_by_name for index_name, _ in index_plan if index_name not in _OPTIONAL_ADDRESS_INDEXES
     ) or any(
         not all(record[field] is True for field in ("indisvalid", "indisready", "indislive"))
         for record in index_records

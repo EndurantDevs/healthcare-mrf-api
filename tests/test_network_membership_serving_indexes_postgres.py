@@ -17,6 +17,7 @@ from db.models import EntityAddressUnified
 from process.entity_address_unified import _post_publish_index_plan
 from process.network_membership_candidate_indexes import prepare_network_candidate_indexes
 from process.network_membership_serving_indexes import (
+    _OPTIONAL_OFFICE_PAGE_INDEX,
     NetworkServingIndexesError,
     _index_digest,
     _serving_plan,
@@ -147,11 +148,15 @@ async def test_complete_profile_and_native_replay(serving_indexes_db):
         await asyncio.sleep(0)
         print({"serving_build_roundtrips": len(logged_queries)})
         build_count = len(logged_queries)
-        assert build_count == 54
+        assert build_count == 55
         assert sum(entry.query == "SHOW transaction_read_only" for entry in logged_queries) == 1
     indexes = await _indexes(fixture)
     plan, _ = _post_publish_index_plan(f'"{fixture.copy_target.schema_name}"', "serving", build_concurrently=False)
-    assert len(plan) == 25 and len(indexes) == 26
+    assert len(plan) == 25 and len(indexes) == 27
+    office_page_index = next(
+        index["indexdef"] for index in indexes if index["indexname"] == _OPTIONAL_OFFICE_PAGE_INDEX
+    )
+    assert "(state_name, location_key) INCLUDE (type, npi, inferred_npi, row_origin)" in office_page_index
     assert all(
         any(index["indexname"] == "entity_address_unified_idx_" + name for index in indexes)
         for name, _ in plan
@@ -368,7 +373,7 @@ async def test_large_candidate_uses_bounded_parity_statements(serving_indexes_db
         logged_queries.clear()
         await _prepare(fixture)
         await asyncio.sleep(0)
-        assert len(logged_queries) == 62
+        assert len(logged_queries) == 63
         assert sum(entry.query == "SHOW transaction_read_only" for entry in logged_queries) == 1
         assert len([entry for entry in logged_queries if "WITH source AS (" in entry.query]) == 5
     assert (
