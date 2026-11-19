@@ -13186,27 +13186,6 @@ async def _provider_directory_address_overlay_serving_identity(
     return f"overlay:{overlay_identity}|unified:{unified_identity}"
 
 
-def _directory_current_dataset_ctes_sql(schema: str) -> str:
-    return directory_current_dataset_ctes_sql(schema)
-
-
-def _directory_overlay_resource_ctes_sql(schema: str) -> str:
-    """Resolve current overlay resources without parsing unrelated graph metadata."""
-    return f"""
-    {_directory_current_dataset_ctes_sql(schema)}, current_resources AS NOT MATERIALIZED (
-        SELECT source.source_id, source.canonical_api_base,
-               dataset.dataset_id, dataset.run_id,
-               resource.resource_type, resource.resource_id,
-               resource.payload_json::jsonb AS payload_json
-          FROM {schema}.provider_directory_source AS source
-          JOIN current_datasets AS dataset
-            ON dataset.endpoint_id = source.endpoint_id
-          JOIN {schema}.provider_directory_dataset_resource AS resource
-            ON resource.dataset_id = dataset.dataset_id
-    )
-    """
-
-
 def _overlay_coordinate_sql(overlay_columns: set[str]) -> tuple[str, str, str]:
     lat_select = "lat" if "lat" in overlay_columns else "NULL::numeric AS lat"
     long_select = "long" if "long" in overlay_columns else "NULL::numeric AS long"
@@ -13249,21 +13228,27 @@ def _overlay_location_status_sql() -> str:
     )
 
 
+# Keep the resource lookup tied to each overlay key so named dataset unions cannot scan history.
 _PROVIDER_DIRECTORY_OVERLAY_QUERY_TEMPLATE = """
-        WITH {current_resource_ctes_sql}, matched_overlays AS MATERIALIZED (
+        WITH {current_dataset_ctes_sql}, matched_overlays AS MATERIALIZED (
             SELECT overlay.* FROM {overlay_table_sql} AS overlay
              WHERE overlay.npi = ANY(:npis)
                AND (CAST(:address_key AS uuid) IS NULL
                    OR overlay.address_key = CAST(:address_key AS uuid))
                {premise_filter}
         ), visible_overlay AS MATERIALIZED (
-            SELECT overlay.*, current_resource.canonical_api_base, current_resource.payload_json
+            SELECT overlay.*, source.canonical_api_base, current_resource.payload_json::jsonb AS payload_json
               FROM matched_overlays AS overlay
-              JOIN current_resources AS current_resource
-                ON current_resource.source_id = overlay.source_id
-               AND current_resource.resource_type = overlay.resource_type
-               AND current_resource.resource_id = overlay.resource_id
-               AND overlay.last_seen_run_id = current_resource.run_id
+              JOIN {schema}.provider_directory_source AS source ON source.source_id = overlay.source_id
+              JOIN current_datasets AS dataset
+                ON dataset.endpoint_id = source.endpoint_id AND dataset.run_id = overlay.last_seen_run_id
+              JOIN LATERAL (
+                  SELECT resource.payload_json FROM {schema}.provider_directory_dataset_resource AS resource
+                   WHERE resource.dataset_id = dataset.dataset_id
+                     AND resource.resource_type = overlay.resource_type
+                     AND resource.resource_id = overlay.resource_id
+                   OFFSET 0
+              ) AS current_resource ON true
         )
         SELECT
             npi,
@@ -13309,10 +13294,11 @@ def _provider_directory_overlay_query_sql(
     lat_select, long_select, coordinate_group_by = _overlay_coordinate_sql(overlay_columns)
     premise_select, premise_filter, premise_group_by = _overlay_premise_key_sql(overlay_columns)
     overlay_table_sql = _schema_cache_key(PROVIDER_DIRECTORY_ADDRESS_OVERLAY_TABLE)
-    current_resource_ctes_sql = _directory_overlay_resource_ctes_sql(_runtime_db_schema())
+    schema = _runtime_db_schema()
     return named_source_data_sql(
         _PROVIDER_DIRECTORY_OVERLAY_QUERY_TEMPLATE.format(
-            current_resource_ctes_sql=current_resource_ctes_sql,
+            schema=schema,
+            current_dataset_ctes_sql=directory_current_dataset_ctes_sql(schema),
             overlay_table_sql=overlay_table_sql,
             premise_filter=premise_filter,
             formatted_address_select=_overlay_formatted_address_sql(overlay_columns),
@@ -13323,7 +13309,7 @@ def _provider_directory_overlay_query_sql(
             coordinate_group_by=coordinate_group_by,
             premise_group_by=premise_group_by,
         ),
-        _runtime_db_schema(),
+        schema,
         editions,
         plan_scalars=False,
     )

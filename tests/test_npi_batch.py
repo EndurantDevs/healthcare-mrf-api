@@ -36,12 +36,14 @@ def test_overlay_query_scopes_rows_before_current_resource_visibility(columns):
     assert "overlay.address_key = CAST(:address_key AS uuid)" in selected
     assert "CAST(:address_site_key AS uuid) IS NULL" in selected
     assert ("overlay.premise_key = CAST(:address_site_key AS uuid)" in selected) == ("premise_key" in columns)
-    assert "JOIN current_resources" not in selected
+    assert "JOIN LATERAL" not in selected
     assert "FROM matched_overlays AS overlay" in visible
-    assert "current_resource.source_id = overlay.source_id" in visible
-    assert "current_resource.resource_type = overlay.resource_type" in visible
-    assert "current_resource.resource_id = overlay.resource_id" in visible
-    assert "overlay.last_seen_run_id = current_resource.run_id" in visible
+    assert "source.source_id = overlay.source_id" in visible
+    assert "resource.resource_type = overlay.resource_type" in visible
+    assert "resource.resource_id = overlay.resource_id" in visible
+    assert "dataset.run_id = overlay.last_seen_run_id" in visible
+    assert "JOIN LATERAL" in visible
+    assert "OFFSET 0 ) AS current_resource ON true" in " ".join(visible.split())
     assert "COUNT(DISTINCT overlay.source_id)" in visible
     assert "AS location_status" in visible
     assert "ORDER BY first_line NULLS LAST, city_name NULLS LAST, address_key" in visible
