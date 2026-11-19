@@ -78,7 +78,7 @@ def _contribution(value, recipe_sha256):
     return _canonical(descriptor)
 
 
-def _derivation(value, recipe_sha256):
+def _derivation(value, recipe_sha256, *, retained=False):
     if value is None:
         return None
     document = _document(value, MAX_V3_RECEIPT_BYTES)
@@ -98,6 +98,8 @@ def _derivation(value, recipe_sha256):
         )
     if derivation["recipe_sha256"] != recipe_sha256:
         raise ValueError
+    if retained and document.get("derivation_version") == 3 and "address_identity" in document:
+        return _canonical(document)
     return _canonical(derivation)
 
 
@@ -143,7 +145,7 @@ def _entry_details(entry):
     recipe_sha256 = hashlib.sha256(singleton.encode()).hexdigest()
     if (
         _contribution(entry.contribution_json, recipe_sha256) != entry.contribution_json
-        or _derivation(entry.office_derivation_json, recipe_sha256) != entry.office_derivation_json
+        or _derivation(entry.office_derivation_json, recipe_sha256, retained=True) != entry.office_derivation_json
     ):
         raise ValueError
     encoded = _canonical(asdict(entry)).encode()
