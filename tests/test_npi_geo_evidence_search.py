@@ -60,10 +60,12 @@ def test_geo_candidate_evidence_query_is_exact_and_current():
     assert "dataset.published_at IS NOT NULL" in sql
     assert "dataset.superseded_at IS NULL" in sql
     assert "current_run.run_id = overlay.last_seen_run_id" in sql
+    assert "JOIN LATERAL (" in sql
     assert "provider_directory_dataset_resource AS dataset_resource" in sql
     assert "dataset_resource.dataset_id = current_run.dataset_id" in sql
     assert "dataset_resource.resource_type = overlay.resource_type" in sql
     assert "dataset_resource.resource_id = overlay.resource_id" in sql
+    assert "LIMIT 1 ) AS membership ON true" in " ".join(sql.split())
     assert "COUNT(DISTINCT current_run.dataset_id)::integer" in sql
     assert "AS provider_directory_source_count" in sql
 

@@ -435,6 +435,7 @@ def location_status_query(schema: str, overlay_table_sql: str, editions=()):
     return text(named_source_data_sql(query, schema, editions, plan_scalars=False))
 
 
+# A keyed membership probe keeps named dataset unions from scanning history.
 _CURRENT_GEO_EVIDENCE_SQL = """
         WITH requested_candidates AS MATERIALIZED (
             SELECT requested.npi, requested.address_key
@@ -481,10 +482,13 @@ _CURRENT_GEO_EVIDENCE_SQL = """
           JOIN current_provider_directory_runs AS current_run
             ON current_run.source_id = overlay.source_id
            AND current_run.run_id = overlay.last_seen_run_id
-          JOIN {dataset_resource_table} AS dataset_resource
-            ON dataset_resource.dataset_id = current_run.dataset_id
-           AND dataset_resource.resource_type = overlay.resource_type
-           AND dataset_resource.resource_id = overlay.resource_id
+          JOIN LATERAL (
+              SELECT 1 FROM {dataset_resource_table} AS dataset_resource
+               WHERE dataset_resource.dataset_id = current_run.dataset_id
+                 AND dataset_resource.resource_type = overlay.resource_type
+                 AND dataset_resource.resource_id = overlay.resource_id
+               LIMIT 1
+          ) AS membership ON true
          WHERE overlay.source_record_id IS NOT NULL
       GROUP BY requested.npi, requested.address_key;
     """
