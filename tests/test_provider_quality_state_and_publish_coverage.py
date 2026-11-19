@@ -105,11 +105,11 @@ class _Transaction:
         self.database = database
 
     async def __aenter__(self):
-        self.database.in_transaction = True
+        self.database.is_in_transaction = True
         return self
 
     async def __aexit__(self, *_exception_info):
-        self.database.in_transaction = False
+        self.database.is_in_transaction = False
         return False
 
 
@@ -117,7 +117,7 @@ class _PublishDatabase:
     def __init__(self, scalar_values=()) -> None:
         self.statements = []
         self.scalar_values = list(scalar_values)
-        self.in_transaction = False
+        self.is_in_transaction = False
 
     def transaction(self):
         return _Transaction(self)
@@ -134,17 +134,13 @@ class _PublishDatabase:
 def _publish_classes():
     live_classes = []
     stage_classes_by_name = {}
-    for ordinal, name in enumerate(
-        ("Qpp", "Svi", "Measure", "Domain", "Score", "Feature")
-    ):
+    for ordinal, name in enumerate(("Qpp", "Svi", "Measure", "Domain", "Score", "Feature")):
         live_class = type(
             f"Live{name}",
             (),
             {
                 "__main_table__": f"live_{ordinal}",
-                "__my_initial_indexes__": (
-                    {"index_elements": ("npi",), "name": f"live_{ordinal}_npi"},
-                ),
+                "__my_initial_indexes__": ({"index_elements": ("npi",), "name": f"live_{ordinal}_npi"},),
                 "__my_additional_indexes__": (
                     {"index_elements": ()},
                     {"index_elements": ("year",)},
@@ -181,9 +177,7 @@ async def test_materialize_state_tracks_phases_progress_and_duration(
     await state._record_materialize_phase_duration(redis, "run", "load", 4.0)
     redis.lists[state._mat_phase_duration_key("run", "load")].append("invalid")
     with caplog.at_level(logging.INFO, logger="process.provider_quality"):
-        await state._log_materialize_phase_summary(
-            redis, "run", "load", total=3, done=2, failed=1
-        )
+        await state._log_materialize_phase_summary(redis, "run", "load", total=3, done=2, failed=1)
     assert "shard_sec_median=2.000" in caplog.text
 
 
@@ -201,9 +195,7 @@ async def test_materialize_elapsed_and_empty_summary_fallbacks(
     monkeypatch.setattr(state.time, "time", lambda: 100.0)
     assert await state._get_materialize_phase_elapsed_seconds(redis, "run") == 0.0
     with caplog.at_level(logging.INFO, logger="process.provider_quality"):
-        await state._log_materialize_phase_summary(
-            redis, "run", "empty", total=0, done=0, failed=0
-        )
+        await state._log_materialize_phase_summary(redis, "run", "empty", total=0, done=0, failed=0)
     assert "phase=empty total=0" in caplog.text
     assert state._decode_redis_str(b"bytes") == "bytes"
     assert state._decode_redis_str(None) == ""
@@ -405,28 +397,37 @@ def _patch_publish_models(monkeypatch, live_classes):
     )
 
 
-@pytest.mark.asyncio
-async def test_publish_renames_all_tables_and_indexes(monkeypatch) -> None:
-    live_classes, stage_classes_by_name = _publish_classes()
-    delattr(live_classes[-1], "__my_initial_indexes__")
-    live_classes[-1].__my_additional_indexes__ = (
+def _configure_long_feature_stage(feature_class, feature_stage):
+    """Exercise both primary and custom index renames with a long stage name."""
+
+    delattr(feature_class, "__my_initial_indexes__")
+    feature_class.__my_additional_indexes__ = (
         {
             "index_elements": ("year", "procedure_code"),
-            "name": "procedure_taxonomy_signal_lookup_idx",
-            "staging_name": "taxonomy_lookup",
+            "name": "quality_feature_lookup_idx",
+            "staging_name": "feature_lookup",
         },
     )
-    signal_stage = stage_classes_by_name[live_classes[-1].__name__]
-    signal_stage.__tablename__ = (
-        "pricing_provider_quality_measure_abcdefghijkl_12345678x"
+    feature_stage.__tablename__ = "pricing_provider_quality_measure_abcdefghijkl_12345678x"
+    staged_feature_primary = table_helpers._index_name_for_table(
+        feature_stage.__tablename__,
+        f"{feature_stage.__tablename__}_idx_primary",
     )
-    staged_signal_primary = table_helpers._index_name_for_table(
-        signal_stage.__tablename__,
-        f"{signal_stage.__tablename__}_idx_primary",
+    staged_feature_index = table_helpers._index_name_for_table(
+        feature_stage.__tablename__,
+        f"{feature_stage.__tablename__}_feature_lookup",
     )
-    staged_signal_index = table_helpers._index_name_for_table(
-        signal_stage.__tablename__,
-        f"{signal_stage.__tablename__}_taxonomy_lookup",
+    return staged_feature_primary, staged_feature_index
+
+
+@pytest.mark.asyncio
+async def test_publish_renames_all_tables_and_indexes(monkeypatch) -> None:
+    """Keep table and index swaps, the generation, and the taxonomy marker atomic."""
+
+    live_classes, stage_classes_by_name = _publish_classes()
+    feature_class = live_classes[-1]
+    staged_feature_primary, staged_feature_index = _configure_long_feature_stage(
+        feature_class, stage_classes_by_name[feature_class.__name__]
     )
     database = _PublishDatabase()
     _patch_publish_models(monkeypatch, live_classes)
@@ -440,9 +441,17 @@ async def test_publish_renames_all_tables_and_indexes(monkeypatch) -> None:
     published_generations = []
 
     async def publish_generation(database, *, importer_id, schema_name):
-        assert database.in_transaction
+        assert database.is_in_transaction
         published_generations.append((importer_id, schema_name))
 
+    async def mark_inputs_changed(schema, execute, *tables):
+        assert database.is_in_transaction
+        assert published_generations == [("provider-quality", schema)]
+        assert tables == ("pricing_provider_quality_feature",)
+        await execute(f"MARK TAXONOMY INPUT CHANGE IN {schema}")
+
+    mark = AsyncMock(side_effect=mark_inputs_changed)
+    monkeypatch.setattr(publish_helpers, "mark_procedure_taxonomy_inputs_changed", mark)
     monkeypatch.setattr(
         publish_helpers,
         "publish_local_reference_family_generation",
@@ -454,16 +463,11 @@ async def test_publish_renames_all_tables_and_indexes(monkeypatch) -> None:
     assert "ALTER INDEX IF EXISTS mrf.stage_0_idx_primary" in statements
     assert "archived_live_0_npi" in statements
     assert "live_0_year_idx" in statements
-    assert (
-        f"ALTER INDEX IF EXISTS mrf.{staged_signal_primary} "
-        "RENAME TO live_5_idx_primary"
-    ) in statements
-    assert (
-        f"ALTER INDEX IF EXISTS mrf.{staged_signal_index} "
-        "RENAME TO procedure_taxonomy_signal_lookup_idx"
-    ) in statements
-    assert published_generations == [("provider-quality", "mrf")]
-    assert database.in_transaction is False
+    assert (f"ALTER INDEX IF EXISTS mrf.{staged_feature_primary} RENAME TO live_5_idx_primary") in statements
+    assert (f"ALTER INDEX IF EXISTS mrf.{staged_feature_index} RENAME TO quality_feature_lookup_idx") in statements
+    mark.assert_awaited_once_with("mrf", database.status, "pricing_provider_quality_feature")
+    assert statements.endswith("MARK TAXONOMY INPUT CHANGE IN mrf")
+    assert database.is_in_transaction is False
 
 
 async def _async(value):
@@ -477,6 +481,8 @@ async def test_publish_refuses_a_missing_stage(monkeypatch) -> None:
     monkeypatch.setattr(publish_helpers, "db", _PublishDatabase())
     monkeypatch.setattr(publish_helpers, "_is_table_available", lambda *_args: _async(False))
     publish_generation = AsyncMock()
+    mark = AsyncMock()
+    monkeypatch.setattr(publish_helpers, "mark_procedure_taxonomy_inputs_changed", mark)
     monkeypatch.setattr(
         publish_helpers,
         "publish_local_reference_family_generation",
@@ -485,6 +491,7 @@ async def test_publish_refuses_a_missing_stage(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="Staging table missing"):
         await publish_helpers._publish_by_table_rename(stage_classes_by_name, "mrf")
     publish_generation.assert_not_awaited()
+    mark.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,8 @@ from uuid import UUID
 import asyncpg
 from sqlalchemy import text
 
+from process.procedure_taxonomy_signals import mark_procedure_taxonomy_inputs_changed
+
 TABLE_NAME = "reference_family_result_generation"
 RELATION_NAMES_BY_IMPORTER = {
     "nucc": ("nucc_taxonomy",),
@@ -1205,9 +1207,14 @@ def _nucc_result_authority(authority_by_field, *, allow_untracked=False, declare
 
 async def _publish_nucc_handoff_generation(session, handoff):
     """Advance the logical generation of an already frozen named publication."""
-    return await publish_immutable_nucc_generation(
-        session, schema_name=handoff["schema_name"], expected_authority=handoff["incumbent"]
+    schema = handoff["schema_name"]
+    published = await publish_immutable_nucc_generation(
+        session, schema_name=schema, expected_authority=handoff["incumbent"]
     )
+    await mark_procedure_taxonomy_inputs_changed(
+        schema, lambda statement: session.execute(text(statement)), "nucc_taxonomy"
+    )
+    return published
 
 
 async def _retire_nucc_native_counter(session, schema, roles):
@@ -1489,13 +1496,32 @@ async def _adopt_validated_family_generation(
                 and not (frozen and manifest.importer_id == "facility-anchors")
             ),
         )
-    reference_spec = native.reference_family_spec(manifest.importer_id)
-    native._require_published_generation_binding(
-        reference_spec, live_pairs, incoming_generation, published_authority, schema_name=incumbent.schema_name
+    await _finish_adopted_family_publication(
+        session, manifest, incumbent, live_pairs, incoming_generation, published_authority, frozen=frozen
     )
-    if manifest.importer_id == "facility-anchors":
-        await _declare_facility_publication_kind(session, incumbent.schema_name, frozen=frozen)
     return published_authority
+
+
+async def _finish_adopted_family_publication(
+    session, manifest, incumbent, live_pairs, incoming_generation, published_authority, *, frozen
+):
+    """Check the live binding before recording its family-specific publication state."""
+    from process import reference_family_archive as native
+
+    importer_id, schema = manifest.importer_id, incumbent.schema_name
+    native._require_published_generation_binding(
+        native.reference_family_spec(importer_id),
+        live_pairs,
+        incoming_generation,
+        published_authority,
+        schema_name=schema,
+    )
+    if importer_id == "nucc":
+        await mark_procedure_taxonomy_inputs_changed(
+            schema, lambda statement: session.execute(text(statement)), "nucc_taxonomy"
+        )
+    if importer_id == "facility-anchors":
+        await _declare_facility_publication_kind(session, schema, frozen=frozen)
 
 
 def _require_nucc_handoff_fields(handoff_by_field):

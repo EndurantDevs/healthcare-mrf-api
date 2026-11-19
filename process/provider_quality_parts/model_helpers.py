@@ -30,7 +30,6 @@ def _resolve_optional_model(name: str) -> type | None:
 PricingProviderQualityFeature = _resolve_optional_model("PricingProviderQualityFeature")
 PricingProviderQualityProcedureLSH = _resolve_optional_model("PricingProviderQualityProcedureLSH")
 PricingProviderQualityPeerTarget = _resolve_optional_model("PricingProviderQualityPeerTarget")
-PricingProcedureTaxonomySignal = _resolve_optional_model("PricingProcedureTaxonomySignal")
 
 
 def _materialize_reporting_years(manifest: dict[str, Any]) -> tuple[int, ...]:
@@ -54,11 +53,7 @@ def _materialize_reporting_years(manifest: dict[str, Any]) -> tuple[int, ...]:
     if not years:
         years.update(PROVIDER_QUALITY_YEAR_WINDOW)
 
-    bounded = sorted(
-        year
-        for year in years
-        if PROVIDER_QUALITY_MIN_YEAR <= year <= PROVIDER_QUALITY_MAX_YEAR
-    )
+    bounded = sorted(year for year in years if PROVIDER_QUALITY_MIN_YEAR <= year <= PROVIDER_QUALITY_MAX_YEAR)
     if bounded:
         return tuple(bounded)
     return (PROVIDER_QUALITY_MAX_YEAR,)
@@ -70,7 +65,6 @@ def _cohort_model_classes() -> tuple[type, ...]:
         PricingProviderQualityFeature,
         PricingProviderQualityProcedureLSH,
         PricingProviderQualityPeerTarget,
-        PricingProcedureTaxonomySignal,
     ):
         if cls is not None:
             classes.append(cls)

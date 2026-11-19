@@ -10,12 +10,14 @@ from typing import Any
 from db.connection import db
 from db.models import (
     PricingProviderQualityDomain,
+    PricingProviderQualityFeature,
     PricingProviderQualityMeasure,
     PricingProviderQualityScore,
     PricingQppProvider,
     PricingQualityRun,
     PricingSviZcta,
 )
+from process.procedure_taxonomy_signals import mark_procedure_taxonomy_inputs_changed
 from process.provider_quality_parts.config import PROVIDER_QUALITY_MAX_YEAR
 from process.provider_quality_parts.execution_helpers import _push_objects_with_retry
 from process.provider_quality_parts.lifecycle import _archived_identifier
@@ -87,10 +89,9 @@ async def _publish_by_table_rename(classes: dict[str, type], schema: str) -> Non
                 await archive_index(base_name)
                 staging_name = index.get("staging_name") or base_name
                 staged_index_name = _index_name_for_table(stage, f"{stage}_{staging_name}")
-                await db.status(
-                    f"ALTER INDEX IF EXISTS {schema}.{staged_index_name} RENAME TO {base_name};"
-                )
+                await db.status(f"ALTER INDEX IF EXISTS {schema}.{staged_index_name} RENAME TO {base_name};")
         await publish_local_reference_family_generation(db, importer_id="provider-quality", schema_name=schema)
+        await mark_procedure_taxonomy_inputs_changed(schema, db.status, PricingProviderQualityFeature.__main_table__)
 
 
 async def _insert_run_metadata(

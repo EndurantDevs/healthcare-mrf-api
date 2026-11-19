@@ -2,6 +2,7 @@
 
 import json
 from collections import OrderedDict
+from contextlib import nullcontext
 
 import pytest
 from sanic.exceptions import InvalidUsage, NotFound
@@ -128,7 +129,7 @@ async def test_taxonomy_resolution_explains_confidence_conflicts(
 ):
     monkeypatch.setattr(pricing_module, "_PROCEDURE_TAXONOMY_EVIDENCE_CACHE", OrderedDict())
     request = make_request(
-        [FakeResult(scalar=None), FakeResult(scalar=None), FakeResult(rows=_taxonomy_rows(provider_counts))],
+        [FakeResult(scalar=None), FakeResult(rows=_taxonomy_rows(provider_counts))],
         args={"year": "2024", "code_system": "HP_PROCEDURE_CODE", "code": code, "clinical_intent": intent},
     )
 
@@ -174,10 +175,15 @@ async def test_unmapped_taxonomy_returns_validation_context():
 def _taxonomy_fallback_results(fallback_source):
     sparse_rows = _taxonomy_rows([1])
     representative_rows = _taxonomy_rows([100])
-    results = [FakeResult(scalar="procedure_taxonomy_signal"), FakeResult(rows=sparse_rows)]
     if fallback_source == "precomputed":
-        return [*results, FakeResult(rows=representative_rows)]
-    results.extend([FakeResult(rows=[]), FakeResult(scalar="provider_quality_feature")])
+        quality_row_by_field = dict(sparse_rows[0], evidence_source="quality_feature")
+        fallback_row_by_field = dict(representative_rows[0], evidence_source="quality_or_nppes")
+        replacement_row_by_field = dict(fallback_row_by_field, distinct_npis=101)
+        return [
+            FakeResult(rows=[quality_row_by_field, fallback_row_by_field]),
+            FakeResult(rows=[quality_row_by_field, replacement_row_by_field]),
+        ]
+    results = [FakeResult(scalar="provider_quality_feature")]
     if fallback_source == "quality":
         return [*results, FakeResult(rows=representative_rows)]
     return [*results, FakeResult(rows=sparse_rows), FakeResult(rows=representative_rows)]
@@ -188,6 +194,9 @@ def _taxonomy_fallback_results(fallback_source):
 async def test_taxonomy_evidence_uses_representative_fallback(monkeypatch, fallback_source):
     monkeypatch.setattr(pricing_module, "_PROCEDURE_TAXONOMY_EVIDENCE_CACHE", OrderedDict())
     session = FakeSession(_taxonomy_fallback_results(fallback_source))
+    if fallback_source == "precomputed":
+        monkeypatch.setenv("HLTHPRT_PRICING_TAXONOMY_PUBLICATION_SCHEMA", "taxonomy_publication")
+        monkeypatch.setattr(pricing_module.db, "reader_session", lambda: nullcontext(session))
 
     evidence_items = await pricing_module._load_procedure_taxonomy_evidence(
         session, year=2024, internal_codes=[123], limit=10
@@ -196,14 +205,9 @@ async def test_taxonomy_evidence_uses_representative_fallback(monkeypatch, fallb
     assert evidence_items[0]["distinct_npis"] == 100
     assert evidence_items[0]["total_beneficiaries"] == 500.0
     assert evidence_items[0]["taxonomy_code"] == "2085R0202X"
-    quality_params_by_name = session.executions[1][0][0].compile().params
-    fallback_params_by_name = session.executions[2][0][0].compile().params
-    assert quality_params_by_name["evidence_source_1"] == "quality_feature"
-    assert fallback_params_by_name["evidence_source_1"] == "quality_or_nppes"
-    assert fallback_params_by_name["year_1"] == 2024
-    assert fallback_params_by_name["procedure_code_1"] == 123
-    assert "source_relation_fingerprint" in str(session.executions[2][0][0])
-    if fallback_source != "precomputed":
+    if fallback_source == "precomputed":
+        assert session.executions[0][0][1] == {"year": 2024, "code": 123, "limit": 10}
+    else:
         assert session.executions[-1][0][1] == {"year": 2024, "internal_codes": [123], "limit": 10}
     if fallback_source == "nppes":
         assert "LEFT JOIN LATERAL" in str(session.executions[-1][0][0])
@@ -213,8 +217,8 @@ async def test_taxonomy_evidence_uses_representative_fallback(monkeypatch, fallb
     cached_items = await pricing_module._load_procedure_taxonomy_evidence(
         session, year=2024, internal_codes=[123], limit=10
     )
-    assert cached_items[0]["distinct_npis"] == 100
-    assert len(session.executions) == execution_count
+    assert cached_items[0]["distinct_npis"] == (101 if fallback_source == "precomputed" else 100)
+    assert len(session.executions) == execution_count + (1 if fallback_source == "precomputed" else 0)
 
 
 @pytest.mark.asyncio

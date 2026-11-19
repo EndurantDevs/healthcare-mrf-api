@@ -54,6 +54,7 @@ from process.npi_result_generation import (
     validate_npi_canonical_provenance,
     validate_npi_serving_generation,
 )
+from process.procedure_taxonomy_signals import mark_procedure_taxonomy_inputs_changed
 
 CONTRACT = "npi-result-family.postgres.v1"
 MODEL_CONTRACT = "npi-result-family.postgres.v2"
@@ -1910,6 +1911,9 @@ async def _activate_npi_relations(
         (incumbent.schema_name, name) for name in RELATION_NAMES
     ):
         raise NpiResultArchiveError("NPI adopted generation differs")
+    await mark_procedure_taxonomy_inputs_changed(
+        incumbent.schema_name, lambda statement: session.execute(text(statement)), "npi_taxonomy"
+    )
     return NpiActivationReceipt(
         tuple((incumbent.schema_name, name) for name, _ in live_pairs),
         tuple((predecessor_schema, name) for name, present in incumbent.relations if present),

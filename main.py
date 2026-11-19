@@ -276,6 +276,15 @@ def rollback_provider_geo_search() -> None:
     click.echo(json.dumps(_run_async(run_provider_geo_search(rollback=True)), sort_keys=True))
 
 
+@manage.command("procedure-taxonomy")
+@click.argument("action", type=click.Choice(("initialize", "refresh", "rollback")))
+def manage_procedure_taxonomy(action: str) -> None:
+    """Provision, refresh, or roll back the named procedure taxonomy publication."""
+    from process.procedure_taxonomy_signals import run_procedure_taxonomy_publication
+
+    click.echo(json.dumps(_run_async(run_procedure_taxonomy_publication(action)), sort_keys=True))
+
+
 @manage.command("sync-structure")
 @click.option("--skip-columns", is_flag=True, default=False, help="Skip adding missing columns")
 @click.option("--skip-indexes", is_flag=True, default=False, help="Skip creating indexes")

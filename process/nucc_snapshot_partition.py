@@ -8,6 +8,8 @@ import re
 
 from sqlalchemy import text
 
+from process.procedure_taxonomy_signals import mark_procedure_taxonomy_inputs_changed
+
 CONTRACT = "nucc-protected-parent.postgres.v1"
 PARENT = '"mrf"."nucc_taxonomy"'
 CHILD_TABLE = "nucc_taxonomy"
@@ -385,6 +387,7 @@ async def _exchange_nucc_child(session, expected_child, incoming_child):
     )
     after = await capture_nucc_parent(session, expected_child=incoming_child)
     _require(after["parent"] == before["parent"] and after["parent_index"] == before["parent_index"], "parent changed")
+    await mark_procedure_taxonomy_inputs_changed(after["parent"][0], lambda statement: session.execute(text(statement)))
     return {"contract": CONTRACT, "before": before, "after": after}
 
 

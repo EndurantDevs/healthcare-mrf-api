@@ -219,6 +219,7 @@ def _prepare_finalizer_runtime(monkeypatch, ctx):
         "resolve_npi_address_archive",
         "refresh_archive_geocodes_from_openaddresses_sharded",
         "_rotate_npi_canonical_table",
+        "mark_procedure_taxonomy_inputs_changed",
     ):
         monkeypatch.setattr(npi, name, legacy)
     monkeypatch.setattr(npi.db, "execute_ddl", legacy)

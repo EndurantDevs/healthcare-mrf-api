@@ -363,9 +363,13 @@ async def test_each_current_taxonomy_evidence_basis_bypasses_the_ordinary_cache(
         "total_beneficiaries": 100000,
         "provider_types": ["Family Medicine"],
     }
+    if basis.endswith("signal"):
+        monkeypatch.setenv("HLTHPRT_PRICING_TAXONOMY_PUBLICATION_SCHEMA", "taxonomy_publication")
+        taxonomy_evidence_by_field["evidence_source"] = (
+            "quality_feature" if basis == "quality_signal" else "quality_or_nppes"
+        )
     async with _session([taxonomy_evidence_by_field]) as (session, _):
-        if basis == "fallback_signal":
-            session._results.insert(0, FakeResult(rows=[]))
+        monkeypatch.setattr(pricing.db, "reader_session", lambda: nullcontext(session))
         ordinary_get = Mock(return_value=[{"taxonomy_code": "PRIOR"}])
         ordinary_set = Mock(side_effect=AssertionError("guarded taxonomy basis entered process cache"))
         monkeypatch.setattr(pricing, "_procedure_taxonomy_evidence_cache_get", ordinary_get)
@@ -373,20 +377,10 @@ async def test_each_current_taxonomy_evidence_basis_bypasses_the_ordinary_cache(
         monkeypatch.setattr(
             pricing,
             "_is_table_available",
-            AsyncMock(
-                side_effect=lambda _session, name: (
-                    name
-                    == (
-                        pricing.procedure_taxonomy_signal_table.name
-                        if basis.endswith("signal")
-                        else pricing.QUALITY_FEATURE_TABLE_NAME
-                    )
-                    and basis != "raw"
-                )
-            ),
+            AsyncMock(return_value=basis == "quality_feature"),
         )
         current = await pricing._load_procedure_taxonomy_evidence(session, year=2024, internal_codes=[7], limit=9)
         assert current[0]["taxonomy_code"] == "207Q00000X"
-        assert len(session.executions) == (2 if basis == "fallback_signal" else 1)
+        assert len(session.executions) == 1
         ordinary_get.assert_not_called()
         ordinary_set.assert_not_called()

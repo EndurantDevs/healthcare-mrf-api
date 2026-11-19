@@ -31,6 +31,10 @@ from process.ext.utils import (
 )
 from process.import_status_events import isoformat_utc
 from process.live_progress import enqueue_live_progress
+from process.procedure_taxonomy_signals import (
+    mark_procedure_taxonomy_inputs_changed,
+    procedure_taxonomy_publisher_role,
+)
 from process.provider_directory_cms_native_inputs import (
     finish_local_native_input_publication,
     prepare_local_native_input_publication,
@@ -451,12 +455,13 @@ async def _freeze_plain_publication(session, schema):
     from process.provider_directory_generic_source_provision import freeze_fhir_source_snapshot
 
     owner, readers = native.model_family_roles()
+    publisher = procedure_taxonomy_publisher_role(schema)
     driver = await native._native_model_copy_driver(session, ("execute", "fetch", "fetchval"))
     await freeze_fhir_source_snapshot(
         driver,
         schema,
         namespace_owner=owner,
-        reader_roles=readers,
+        reader_roles=(*readers, publisher) if publisher and publisher not in readers else readers,
         application_roles=(),
         relation_names=("nucc_taxonomy",),
         freeze_schema=False,
@@ -656,6 +661,19 @@ async def _finish_plain_stage(session, stage, expected_rows):
     return count
 
 
+async def _publish_plain_taxonomy_generation(session, stage):
+    """Advance both logical generations before settling the renamed NUCC output."""
+    schema = stage["schema"]
+    authority = await generation.publish_immutable_nucc_generation(
+        session, schema_name=schema, expected_authority=stage["predecessor"]["family_generation"]
+    )
+    publication = await _plain_predecessor(session, schema, lock=True)
+    if publication["family_generation"] != authority.as_dict():
+        raise native.ReferenceFamilyArchiveError("NUCC published generation changed")
+    await mark_procedure_taxonomy_inputs_changed(schema, lambda statement: session.execute(text(statement)))
+    return publication
+
+
 async def _publish_plain_generation(ctx):
     """Finish the isolated heap and atomically rotate it with the exact Source attempt."""
     context = ctx["context"]
@@ -682,12 +700,7 @@ async def _publish_plain_generation(ctx):
             await _require_plain_stage(session, published_by_field)
             if (await native._validate_nucc_table_set(session, stage["schema"], "nucc_taxonomy"))["row_count"] != count:
                 raise native.ReferenceFamilyArchiveError("NUCC frozen published census changed")
-            authority = await generation.publish_immutable_nucc_generation(
-                session, schema_name=stage["schema"], expected_authority=stage["predecessor"]["family_generation"]
-            )
-            publication = await _plain_predecessor(session, stage["schema"], lock=True)
-            if publication["family_generation"] != authority.as_dict():
-                raise native.ReferenceFamilyArchiveError("NUCC published generation changed")
+            publication = await _publish_plain_taxonomy_generation(session, stage)
             result_by_field = {**_plain_result(count), "publication": publication}
             times = await _commit_plain_run(session, ctx, result_by_field)
     except BaseException:

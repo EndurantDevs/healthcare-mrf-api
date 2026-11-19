@@ -815,6 +815,13 @@ def _plain_publication_callbacks(session, events, authority, failure):
             raise RuntimeError("generation CAS changed")
         return authority
 
+    async def mark_taxonomy(schema, execute):
+        assert schema == "mrf"
+        await execute("SELECT 1")
+        events.append("taxonomy revision")
+        if failure == "taxonomy revision":
+            raise RuntimeError("taxonomy revision update failed")
+
     async def terminal(*_args):
         events.append("terminal")
 
@@ -825,12 +832,13 @@ def _plain_publication_callbacks(session, events, authority, failure):
         freeze=freeze,
         validate=validate,
         publish=publish,
+        mark_taxonomy=mark_taxonomy,
         terminal=terminal,
     )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "freeze", "validation", "cancel", "generation"])
+@pytest.mark.parametrize("failure", [None, "freeze", "validation", "cancel", "generation", "taxonomy revision"])
 async def test_plain_publication_validates_after_counter_and_freeze_before_terminal(
     monkeypatch, nucc_module, nucc_publication_driver, failure
 ):
@@ -849,6 +857,7 @@ async def test_plain_publication_validates_after_counter_and_freeze_before_termi
     monkeypatch.setattr(nucc_module.native, "_validate_nucc_table_set", callbacks.validate)
     monkeypatch.setattr(nucc_module.generation, "publish_immutable_nucc_generation", callbacks.publish)
     monkeypatch.setattr(nucc_module, "_plain_predecessor", AsyncMock(return_value=nucc_publication_driver.publication))
+    monkeypatch.setattr(nucc_module, "mark_procedure_taxonomy_inputs_changed", callbacks.mark_taxonomy)
     monkeypatch.setattr(nucc_module, "_commit_plain_run", callbacks.terminal)
     cleanup = AsyncMock()
     monkeypatch.setattr(nucc_module, "_cleanup_plain_stage", cleanup)
@@ -869,5 +878,15 @@ async def test_plain_publication_validates_after_counter_and_freeze_before_termi
     else:
         publication_result = await nucc_module._publish_plain_generation(context_by_field)
         assert publication_result["publication"] == nucc_publication_driver.publication
-        assert events == ["rename", "rename", "counter", "freeze", "validate", "generation", "terminal", "commit"]
+        assert events == [
+            "rename",
+            "rename",
+            "counter",
+            "freeze",
+            "validate",
+            "generation",
+            "taxonomy revision",
+            "terminal",
+            "commit",
+        ]
         cleanup.assert_not_awaited()

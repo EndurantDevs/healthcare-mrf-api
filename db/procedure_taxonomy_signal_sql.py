@@ -3,6 +3,29 @@
 
 from __future__ import annotations
 
+import os
+
+from db.plan_release_storage import storage_identifier
+
+TAXONOMY_PUBLICATION_STATE = "procedure_taxonomy_publication"
+TAXONOMY_SERVING_VIEW = "procedure_taxonomy_serving"
+
+
+def procedure_taxonomy_publication_schema() -> str | None:
+    """Return the configured schema for the named taxonomy publication."""
+
+    schema = os.getenv("HLTHPRT_PRICING_TAXONOMY_PUBLICATION_SCHEMA", "").strip()
+    if schema:
+        procedure_taxonomy_control_schema(schema)
+    return schema or None
+
+
+def procedure_taxonomy_control_schema(publication_schema: str) -> str:
+    """Derive the separate namespace for source revision and publication state."""
+    control_schema = f"{publication_schema}_control"
+    storage_identifier(control_schema)
+    return control_schema
+
 
 _QUALITY_BASE_SQL = """
         quality_base AS (
@@ -109,7 +132,7 @@ _NUCC_JOIN_SQL = """
         ) nu ON nu.taxonomy_code = b.taxonomy_code
         """
 
-_SIGNAL_INSERT_SQL = """
+_SIGNAL_ROWS_CTES = """
         WITH
         {quality_cte}
         {taxonomy_choice_cte}
@@ -179,6 +202,10 @@ _SIGNAL_INSERT_SQL = """
                 ) AS evidence_rank
             FROM aggregated a
         )
+    """
+
+
+_SIGNAL_INSERT_SQL = """
         INSERT INTO {signal_relation} (
             procedure_code,
             year,
@@ -230,6 +257,14 @@ _SIGNAL_INSERT_SQL = """
             updated_at = excluded.updated_at
     """
 
+_SIGNAL_SELECT_SQL = """
+        SELECT procedure_code, year, setting_key, evidence_source, taxonomy_code,
+               classification, specialization, display_name, distinct_npis,
+               total_services, total_beneficiaries, provider_types, NOW() AS updated_at
+        FROM ranked
+        WHERE evidence_rank <= 50
+    """
+
 
 def _quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
@@ -264,10 +299,7 @@ def procedure_taxonomy_signal_fingerprint_sql(
         npi_taxonomy_table,
         nucc_taxonomy_table,
     )
-    relation_oids = ", ".join(
-        _relation_oid_sql(schema, source_table)
-        for source_table in source_tables
-    )
+    relation_oids = ", ".join(_relation_oid_sql(schema, source_table) for source_table in source_tables)
     return f"concat_ws(':', {relation_oids})"
 
 
@@ -283,10 +315,66 @@ def _quality_source_sql(
         provider_relation=provider_relation,
         quality_relation=quality_relation,
     )
-    quality_join = (
-        f"LEFT JOIN {quality_relation} qf ON qf.npi = pp.npi AND qf.year = pp.year"
-    )
+    quality_join = f"LEFT JOIN {quality_relation} qf ON qf.npi = pp.npi AND qf.year = pp.year"
     return quality_cte, quality_join
+
+
+def _signal_rows_ctes(
+    *,
+    provider_relation: str,
+    provider_procedure_relation: str,
+    quality_relation: str | None,
+    taxonomy_relation: str | None,
+    nucc_relation: str | None,
+) -> str:
+    quality_cte, quality_join = _quality_source_sql(
+        provider_relation,
+        provider_procedure_relation,
+        quality_relation,
+    )
+    taxonomy_choice_cte = (
+        _TAXONOMY_CHOICE_SQL.format(taxonomy_relation=taxonomy_relation)
+        if taxonomy_relation
+        else _EMPTY_TAXONOMY_CHOICE_SQL
+    )
+    nucc_join = _NUCC_JOIN_SQL.format(nucc_relation=nucc_relation) if nucc_relation else ""
+    return _SIGNAL_ROWS_CTES.format(
+        quality_cte=quality_cte,
+        taxonomy_choice_cte=taxonomy_choice_cte,
+        provider_procedure_relation=provider_procedure_relation,
+        provider_relation=provider_relation,
+        quality_join=quality_join,
+        quality_code=_QUALITY_CODE_SQL if quality_relation else "NULL::varchar",
+        quality_classification=(_QUALITY_CLASSIFICATION_SQL if quality_relation else "NULL::varchar"),
+        nucc_join=nucc_join,
+        classification=(
+            "COALESCE(b.quality_classification, nu.classification)" if nucc_relation else "b.quality_classification"
+        ),
+        specialization="nu.specialization" if nucc_relation else "NULL::varchar",
+        display_name="nu.display_name" if nucc_relation else "NULL::varchar",
+    )
+
+
+def procedure_taxonomy_signal_select_sql(
+    *,
+    provider: tuple[str, str],
+    procedure: tuple[str, str],
+    quality: tuple[str, str] | None,
+    npi_taxonomy: tuple[str, str] | None,
+    nucc_taxonomy: tuple[str, str] | None,
+) -> str:
+    """Select the ranked evidence rows from explicitly named input relations."""
+
+    return (
+        _signal_rows_ctes(
+            provider_relation=_table(*provider),
+            provider_procedure_relation=_table(*procedure),
+            quality_relation=_table(*quality) if quality else None,
+            taxonomy_relation=_table(*npi_taxonomy) if npi_taxonomy else None,
+            nucc_relation=_table(*nucc_taxonomy) if nucc_taxonomy else None,
+        )
+        + _SIGNAL_SELECT_SQL
+    )
 
 
 def procedure_taxonomy_signal_insert_sql(
@@ -299,50 +387,23 @@ def procedure_taxonomy_signal_insert_sql(
     npi_taxonomy_table: str | None,
     nucc_taxonomy_table: str | None,
 ) -> str:
-    """Build exact quality-first and quality-or-NPPES signal rows."""
+    """Populate the legacy table during the historical fast-path migration."""
 
-    provider_relation = _table(schema, provider_table)
-    provider_procedure_relation = _table(schema, provider_procedure_table)
-    quality_relation = _table(schema, quality_feature_table) if quality_feature_table else None
-    taxonomy_relation = _table(schema, npi_taxonomy_table) if npi_taxonomy_table else None
-    nucc_relation = _table(schema, nucc_taxonomy_table) if nucc_taxonomy_table else None
-    quality_cte, quality_join = _quality_source_sql(
-        provider_relation,
-        provider_procedure_relation,
-        quality_relation,
+    ctes = _signal_rows_ctes(
+        provider_relation=_table(schema, provider_table),
+        provider_procedure_relation=_table(schema, provider_procedure_table),
+        quality_relation=_table(schema, quality_feature_table) if quality_feature_table else None,
+        taxonomy_relation=_table(schema, npi_taxonomy_table) if npi_taxonomy_table else None,
+        nucc_relation=_table(schema, nucc_taxonomy_table) if nucc_taxonomy_table else None,
     )
-    taxonomy_choice_cte = (
-        _TAXONOMY_CHOICE_SQL.format(taxonomy_relation=taxonomy_relation)
-        if taxonomy_relation
-        else _EMPTY_TAXONOMY_CHOICE_SQL
-    )
-    nucc_join = _NUCC_JOIN_SQL.format(nucc_relation=nucc_relation) if nucc_relation else ""
-    source_relation_fingerprint = procedure_taxonomy_signal_fingerprint_sql(
-        schema=schema,
-        provider_table=provider_table,
-        provider_procedure_table=provider_procedure_table,
-        quality_feature_table=quality_feature_table,
-        npi_taxonomy_table=npi_taxonomy_table,
-        nucc_taxonomy_table=nucc_taxonomy_table,
-    )
-    return _SIGNAL_INSERT_SQL.format(
-        quality_cte=quality_cte,
-        taxonomy_choice_cte=taxonomy_choice_cte,
-        provider_procedure_relation=provider_procedure_relation,
-        provider_relation=provider_relation,
-        quality_join=quality_join,
-        quality_code=_QUALITY_CODE_SQL if quality_relation else "NULL::varchar",
-        quality_classification=(
-            _QUALITY_CLASSIFICATION_SQL if quality_relation else "NULL::varchar"
+    return ctes + _SIGNAL_INSERT_SQL.format(
+        source_relation_fingerprint=procedure_taxonomy_signal_fingerprint_sql(
+            schema=schema,
+            provider_table=provider_table,
+            provider_procedure_table=provider_procedure_table,
+            quality_feature_table=quality_feature_table,
+            npi_taxonomy_table=npi_taxonomy_table,
+            nucc_taxonomy_table=nucc_taxonomy_table,
         ),
-        nucc_join=nucc_join,
-        classification=(
-            "COALESCE(b.quality_classification, nu.classification)"
-            if nucc_relation
-            else "b.quality_classification"
-        ),
-        specialization="nu.specialization" if nucc_relation else "NULL::varchar",
-        display_name="nu.display_name" if nucc_relation else "NULL::varchar",
-        source_relation_fingerprint=source_relation_fingerprint,
         signal_relation=_table(schema, signal_table),
     )

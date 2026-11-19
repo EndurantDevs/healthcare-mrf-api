@@ -228,7 +228,6 @@ from db.models import (
     PricingProcedure,
     PricingProcedureGeoBenchmark,
     PricingProcedurePeerStats,
-    PricingProcedureTaxonomySignal,
     PricingProvider,
     PricingProviderPrescription,
     PricingProviderPrescriptionAutocomplete,
@@ -242,7 +241,8 @@ from db.prescription_autocomplete_rollup_sql import (
     prescription_autocomplete_source_fingerprint_sql,
 )
 from db.procedure_taxonomy_signal_sql import (
-    procedure_taxonomy_signal_fingerprint_sql,
+    TAXONOMY_SERVING_VIEW,
+    procedure_taxonomy_publication_schema,
 )
 from process.ptg_parts.allowed_amounts import PTG2_ALLOWED_AMOUNT_CONTRACT
 from process.ptg_parts.ptg2_candidate_audit_batch_contract import (
@@ -335,7 +335,6 @@ provider_procedure_table = PricingProviderProcedure.__table__
 location_table = PricingProviderProcedureLocation.__table__
 provider_procedure_cost_profile_table = PricingProviderProcedureCostProfile.__table__
 procedure_peer_stats_table = PricingProcedurePeerStats.__table__
-procedure_taxonomy_signal_table = PricingProcedureTaxonomySignal.__table__
 prescription_table = PricingPrescription.__table__
 provider_prescription_table = PricingProviderPrescription.__table__
 provider_prescription_autocomplete_table = PricingProviderPrescriptionAutocomplete.__table__
@@ -575,14 +574,6 @@ def _parse_pricing_default_year() -> int | None:
 
 PRICING_DEFAULT_YEAR = _parse_pricing_default_year()
 PRICING_SCHEMA = os.getenv("HLTHPRT_DB_SCHEMA", "mrf")
-_PROCEDURE_TAXONOMY_SIGNAL_FINGERPRINT_SQL = procedure_taxonomy_signal_fingerprint_sql(
-    schema=PRICING_SCHEMA,
-    provider_table=PricingProvider.__tablename__,
-    provider_procedure_table=PricingProviderProcedure.__tablename__,
-    quality_feature_table=QUALITY_FEATURE_TABLE_NAME,
-    npi_taxonomy_table=NPIDataTaxonomy.__tablename__,
-    nucc_taxonomy_table=NUCCTaxonomy.__tablename__,
-)
 _PRESCRIPTION_AUTOCOMPLETE_FINGERPRINT_SQL = prescription_autocomplete_source_fingerprint_sql(
     schema=PRICING_SCHEMA,
     provider_table=PricingProviderPrescription.__tablename__,
@@ -5200,43 +5191,21 @@ async def _load_procedure_taxonomy_evidence(
     if not internal_codes:
         return []
 
+    publication_schema = procedure_taxonomy_publication_schema()
+    if publication_schema is not None and len(internal_codes) == 1:
+        async with db.reader_session() as evidence_reader:
+            published = await _load_published_procedure_taxonomy_evidence(
+                evidence_reader, publication_schema, year=year, internal_code=internal_codes[0], limit=limit
+            )
+        if published:
+            return published
+
     cache_key = _procedure_taxonomy_evidence_cache_key(year, internal_codes, limit)
     has_guarded_read = getattr(session, "info", {}).get("api_reader_verified") is True
     # Cached evidence is not bound to the independently proved current claims generation.
     cached_evidence_items = None if has_guarded_read else _procedure_taxonomy_evidence_cache_get(cache_key)
     if cached_evidence_items is not None:
         return cached_evidence_items
-
-    if len(internal_codes) == 1 and await _is_table_available(
-        session,
-        procedure_taxonomy_signal_table.name,
-    ):
-        quality_evidence_items = await _load_precomputed_procedure_taxonomy_evidence(
-            session,
-            year=year,
-            internal_code=internal_codes[0],
-            evidence_source="quality_feature",
-            limit=limit,
-        )
-        if _has_representative_procedure_taxonomy_evidence(quality_evidence_items):
-            return (
-                quality_evidence_items
-                if has_guarded_read
-                else _procedure_taxonomy_evidence_cache_set(cache_key, quality_evidence_items)
-            )
-        fallback_evidence_items = await _load_precomputed_procedure_taxonomy_evidence(
-            session,
-            year=year,
-            internal_code=internal_codes[0],
-            evidence_source="quality_or_nppes",
-            limit=limit,
-        )
-        if fallback_evidence_items:
-            return (
-                fallback_evidence_items
-                if has_guarded_read
-                else _procedure_taxonomy_evidence_cache_set(cache_key, fallback_evidence_items)
-            )
 
     quality_feature_exists = await _is_table_available(session, QUALITY_FEATURE_TABLE_NAME)
     if quality_feature_exists:
@@ -5373,45 +5342,45 @@ async def _load_procedure_taxonomy_evidence(
     return evidence_items if has_guarded_read else _procedure_taxonomy_evidence_cache_set(cache_key, evidence_items)
 
 
-async def _load_precomputed_procedure_taxonomy_evidence(
+async def _load_published_procedure_taxonomy_evidence(
     session,
+    publication_schema: str,
     *,
     year: int,
     internal_code: int,
-    evidence_source: str,
     limit: int,
 ) -> list[dict[str, Any]]:
-    """Load one bounded evidence basis from the published signal table."""
+    """Read both ranked evidence groups from one published snapshot."""
 
+    relation = qualified_relation_sql(publication_schema, TAXONOMY_SERVING_VIEW)
     query_result = await session.execute(
-        select(
-            procedure_taxonomy_signal_table.c.taxonomy_code,
-            procedure_taxonomy_signal_table.c.classification,
-            procedure_taxonomy_signal_table.c.specialization,
-            procedure_taxonomy_signal_table.c.display_name,
-            procedure_taxonomy_signal_table.c.distinct_npis,
-            procedure_taxonomy_signal_table.c.total_services,
-            procedure_taxonomy_signal_table.c.total_beneficiaries,
-            procedure_taxonomy_signal_table.c.provider_types,
-        )
-        .where(
-            and_(
-                procedure_taxonomy_signal_table.c.year == year,
-                procedure_taxonomy_signal_table.c.procedure_code == internal_code,
-                procedure_taxonomy_signal_table.c.setting_key == "all",
-                procedure_taxonomy_signal_table.c.evidence_source == evidence_source,
-                procedure_taxonomy_signal_table.c.source_relation_fingerprint
-                == literal_column(_PROCEDURE_TAXONOMY_SIGNAL_FINGERPRINT_SQL),
-            )
-        )
-        .order_by(
-            procedure_taxonomy_signal_table.c.distinct_npis.desc(),
-            procedure_taxonomy_signal_table.c.total_services.desc(),
-            procedure_taxonomy_signal_table.c.taxonomy_code.asc(),
-        )
-        .limit(limit),
+        text(
+            f"""
+            SELECT *
+            FROM (
+                SELECT signal.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY evidence_source
+                           ORDER BY distinct_npis DESC, total_services DESC, taxonomy_code
+                       ) AS evidence_rank
+                FROM {relation} AS signal
+                WHERE year = :year AND procedure_code = :code AND setting_key = 'all'
+                  AND evidence_source IN ('quality_feature', 'quality_or_nppes')
+            ) AS ranked
+            WHERE evidence_rank <= :limit
+            ORDER BY evidence_source, evidence_rank
+            """
+        ),
+        {"year": year, "code": internal_code, "limit": limit},
     )
-    return [_taxonomy_evidence_item(_row_to_dict(evidence_row)) for evidence_row in query_result]
+    evidence_by_source = {"quality_feature": [], "quality_or_nppes": []}
+    for evidence_row in query_result:
+        evidence_fields = _row_to_dict(evidence_row)
+        evidence_by_source[evidence_fields["evidence_source"]].append(_taxonomy_evidence_item(evidence_fields))
+    quality_evidence = evidence_by_source["quality_feature"]
+    if _has_representative_procedure_taxonomy_evidence(quality_evidence):
+        return quality_evidence
+    return evidence_by_source["quality_or_nppes"]
 
 
 async def _load_quality_procedure_taxonomy_evidence(
