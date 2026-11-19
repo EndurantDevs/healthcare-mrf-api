@@ -20,6 +20,7 @@ from db.models import (
 )
 from process.clinical_reference_rows import _build_clinical_area_rows
 from process.ext.utils import make_class, push_objects
+from process.reference_family_model_indexes import uses_catalog_read_index_name
 from process.reference_stage import _drop_stage_tables, build_reference_stage_suffix
 
 DEFAULT_BATCH_SIZE = 5000
@@ -49,7 +50,7 @@ class ClinicalStageModels:
 
 
 def _stage_index_name(stage_table: str, index_name: str) -> str:
-    return f"{stage_table}_idx_{index_name}"
+    return index_name if uses_catalog_read_index_name(stage_table, index_name) else f"{stage_table}_idx_{index_name}"
 
 
 def _batch(
@@ -97,13 +98,9 @@ async def _create_stage_indexes(stage_class: Any, schema: str) -> None:
 async def _publish_table(model_class: Any, stage_class: Any, schema: str) -> None:
     live_table = model_class.__main_table__
     await db.status(f"DROP TABLE IF EXISTS {schema}.{live_table};")
+    await db.status(f"ALTER TABLE IF EXISTS {schema}.{stage_class.__tablename__} RENAME TO {live_table};")
     await db.status(
-        f"ALTER TABLE IF EXISTS {schema}.{stage_class.__tablename__} "
-        f"RENAME TO {live_table};"
-    )
-    await db.status(
-        f"ALTER INDEX IF EXISTS {schema}.{stage_class.__tablename__}_idx_primary "
-        f"RENAME TO {live_table}_idx_primary;"
+        f"ALTER INDEX IF EXISTS {schema}.{stage_class.__tablename__}_idx_primary RENAME TO {live_table}_idx_primary;"
     )
     for index_map in getattr(stage_class, "__my_additional_indexes__", []) or []:
         index_name = index_map.get("name", "_".join(index_map.get("index_elements")))
@@ -116,10 +113,7 @@ async def _publish_table(model_class: Any, stage_class: Any, schema: str) -> Non
 
 async def _merge_code_catalog_stage(stage_class: Any, schema: str) -> None:
     source_sql = _source_sql_list()
-    await db.status(
-        f"DELETE FROM {schema}.{CodeCatalog.__tablename__} "
-        f"WHERE source IN ({source_sql});"
-    )
+    await db.status(f"DELETE FROM {schema}.{CodeCatalog.__tablename__} WHERE source IN ({source_sql});")
     await db.status(
         f"""
         INSERT INTO {schema}.{CodeCatalog.__tablename__}
@@ -144,10 +138,7 @@ async def _merge_code_catalog_stage(stage_class: Any, schema: str) -> None:
 
 async def _merge_code_crosswalk_stage(stage_class: Any, schema: str) -> None:
     source_sql = _source_sql_list()
-    await db.status(
-        f"DELETE FROM {schema}.{CodeCrosswalk.__tablename__} "
-        f"WHERE source IN ({source_sql});"
-    )
+    await db.status(f"DELETE FROM {schema}.{CodeCrosswalk.__tablename__} WHERE source IN ({source_sql});")
     await db.status(
         f"""
         INSERT INTO {schema}.{CodeCrosswalk.__tablename__}
@@ -174,10 +165,7 @@ async def _merge_replace_source_table(
     source_sql = _source_sql_list()
     column_names = [column.name for column in model_class.__table__.columns]
     column_sql = ", ".join(column_names)
-    await db.status(
-        f"DELETE FROM {schema}.{model_class.__tablename__} "
-        f"WHERE source IN ({source_sql});"
-    )
+    await db.status(f"DELETE FROM {schema}.{model_class.__tablename__} WHERE source IN ({source_sql});")
     await db.status(
         f"""
         INSERT INTO {schema}.{model_class.__tablename__} ({column_sql})
@@ -204,10 +192,7 @@ async def _create_stage_models(
     shared_models = (CodeCatalog, CodeCrosswalk, CodeSynonym, CodeRelationship)
     area_models = (ClinicalArea, ClinicalAreaCondition, ClinicalAreaTreatment)
     stage_suffix = build_reference_stage_suffix("cr", import_suffix, run_id)
-    stage_by_model = {
-        model_class: make_class(model_class, stage_suffix)
-        for model_class in shared_models + area_models
-    }
+    stage_by_model = {model_class: make_class(model_class, stage_suffix) for model_class in shared_models + area_models}
     stage_models = ClinicalStageModels(stage_by_model, shared_models, area_models)
     await _drop_stage_models(schema, stage_models)
     try:
@@ -254,17 +239,10 @@ async def _catalog_stage_count(
     test_mode: bool,
 ) -> int:
     stage_table = stage_models.stage_by_model[CodeCatalog].__tablename__
-    concept_count = int(
-        await db.scalar(f"SELECT COUNT(*) FROM {schema}.{stage_table};") or 0
-    )
-    minimum_count = int(
-        os.getenv("HLTHPRT_CLINICAL_REFERENCE_MIN_ROWS", "1" if test_mode else "1000")
-    )
+    concept_count = int(await db.scalar(f"SELECT COUNT(*) FROM {schema}.{stage_table};") or 0)
+    minimum_count = int(os.getenv("HLTHPRT_CLINICAL_REFERENCE_MIN_ROWS", "1" if test_mode else "1000"))
     if concept_count < minimum_count:
-        raise RuntimeError(
-            f"Clinical reference stage has {concept_count} code rows, "
-            f"below minimum {minimum_count}."
-        )
+        raise RuntimeError(f"Clinical reference stage has {concept_count} code rows, below minimum {minimum_count}.")
     return concept_count
 
 

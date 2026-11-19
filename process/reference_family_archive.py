@@ -130,6 +130,7 @@ from process.reference_family_dictionary import (
 from process.reference_family_dictionary import (
     apply_reference_dictionary_effects as apply_reference_dictionary_effects,
 )
+from process.reference_family_dictionary import is_code_catalog_page_index as is_page_index
 from process.reference_family_dictionary import (
     prepare_reference_dictionary_effects as prepare_reference_dictionary_effects,
 )
@@ -903,11 +904,11 @@ async def _table_receipt(
     if relation_oid is None:
         raise ReferenceFamilyArchiveError("reference family relation is missing")
     try:
-        schema_sha256 = (
-            await canonical_schema_identity(session, relation_oid, schema_name)
-            if table_name in ("npi_canonical_address", STAGE_TABLE)
-            else await _family_schema_identity(session, importer_id, relation_oid, schema_name, table_name)
-        )
+        omit_index = is_page_index if is_source and model_type in (ClaimsCodeCatalog, DrugClaimsCodeCatalog) else None
+        if omit_index is not None or table_name in ("npi_canonical_address", STAGE_TABLE):
+            schema_sha256 = await canonical_schema_identity(session, relation_oid, schema_name, omit_index=omit_index)
+        else:
+            schema_sha256 = await _family_schema_identity(session, importer_id, relation_oid, schema_name, table_name)
     except Exception as error:
         raise ReferenceFamilyArchiveError("reference family schema identity is unavailable") from error
     predicate = _source_model_predicate(model_type, schema_name) if is_source else ""
@@ -928,9 +929,7 @@ async def _family_schema_identity(
     table_name: str,
 ) -> str:
     if table_name in {model.__tablename__ for model in (*_CLAIMS_SCOPED_MODELS, *_DRUG_SCOPED_MODELS)}:
-        # The ordinary producer can append source_attribution to an existing
-        # dictionary. COPY projects names; compare native column/key semantics,
-        # not that historical physical order, using the existing catalog normalizer.
+        # A producer can append source_attribution; match COPY's name-based column semantics.
         return await canonical_schema_identity(session, relation_oid, schema_name)
     sequence_by_table = {
         owner_table: (sequence_name, owner_column)

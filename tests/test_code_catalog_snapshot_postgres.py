@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.schema import MetaData
 
 from db.models import CodeCatalog
+from process import reference_family_archive
 from process.code_catalog_snapshot import (
     CodeCatalogSnapshotError,
     capture_code_catalog_result,
@@ -63,11 +64,15 @@ def test_native_test_database_guard(dsn: str, expected: bool) -> None:
     assert _is_owned_native_test_database(make_url(dsn)) is expected
 
 
-async def _create_catalog(connection, schema_name: str, table_name: str) -> None:
+async def _create_catalog(
+    connection, schema_name: str, table_name: str, *, include_optional_indexes: bool = True
+) -> None:
     metadata = MetaData(schema=schema_name)
     CodeCatalog.__table__.to_metadata(metadata, schema=schema_name, name=table_name)
     await connection.run_sync(metadata.create_all)
     for ordinal, index_definition in enumerate(CodeCatalog.__my_additional_indexes__):
+        if index_definition.get("name") == "code_catalog_type_page_idx" and not include_optional_indexes:
+            continue
         await connection.execute(
             text(
                 f'CREATE INDEX "{table_name}_model_{ordinal}" ON "{schema_name}"."{table_name}" '
@@ -157,7 +162,8 @@ async def _validated_stage(engine, sessions, schema_name: str):
 
 
 @pytest.mark.asyncio
-async def test_native_catalog_capture_stage_validation_and_retained_atomic_promotion():
+@pytest.mark.parametrize("include_optional_indexes", [True, False], ids=["current", "retained"])
+async def test_native_catalog_capture_stage_validation_and_retained_atomic_promotion(include_optional_indexes):
     """Promote all code systems together while retaining the exact previous catalog."""
     engine = create_async_engine(_dsn())
     schema_name = "code_catalog_archive_" + uuid4().hex
@@ -167,8 +173,12 @@ async def test_native_catalog_capture_stage_validation_and_retained_atomic_promo
             await connection.execute(text(f'CREATE SCHEMA "{schema_name}"'))
             await connection.execute(text(f'CREATE SCHEMA "{source_schema_name}"'))
             await _create_catalog(connection, schema_name, "code_catalog")
-            await _create_catalog(connection, schema_name, "code_catalog_stage")
-            await _create_catalog(connection, source_schema_name, "code_catalog")
+            await _create_catalog(
+                connection, schema_name, "code_catalog_stage", include_optional_indexes=include_optional_indexes
+            )
+            await _create_catalog(
+                connection, source_schema_name, "code_catalog", include_optional_indexes=include_optional_indexes
+            )
             await _insert_rows(connection, schema_name, "code_catalog", _rows(suffix="_old"))
             await _insert_rows(connection, schema_name, "code_catalog_stage", _rows())
             await _insert_rows(connection, source_schema_name, "code_catalog", _rows())
@@ -618,7 +628,61 @@ async def test_native_catalog_promotion_rejects_a_different_destination_owner_wi
 
 
 @pytest.mark.asyncio
-async def test_native_catalog_capture_requires_all_model_additional_indexes():
+async def test_scoped_dictionary_receipts_ignore_only_the_live_page_index():
+    engine = create_async_engine(_dsn())
+    schema = "dictionary_page_index_" + uuid4().hex
+    archives = (
+        ("claims-pricing", reference_family_archive.ClaimsCodeCatalog),
+        ("drug-claims", reference_family_archive.DrugClaimsCodeCatalog),
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            await _create_catalog(connection, schema, "code_catalog")
+            await connection.execute(
+                text(f'CREATE TABLE "{schema}".pricing_prescription (rx_code_system text, rx_code text)')
+            )
+            await connection.execute(
+                text(
+                    f'CREATE TABLE "{schema}".code_crosswalk (from_system text, from_code text, to_system text, to_code text)'
+                )
+            )
+            for _, model in archives:
+                await _create_catalog(connection, schema, model.__tablename__, include_optional_indexes=False)
+
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as session, session.begin():
+
+            async def receipts(importer, model):
+                return tuple(
+                    [
+                        await reference_family_archive._table_receipt(
+                            session, importer_id=importer, schema_name=schema, model_type=model, is_source=is_source
+                        )
+                        for is_source in (True, False)
+                    ]
+                )
+
+            for importer, model in archives:
+                live_with_page_index, pre_index_archive = await receipts(importer, model)
+                assert live_with_page_index == pre_index_archive
+
+            await session.execute(
+                text(
+                    f'CREATE INDEX unexpected_dictionary_index ON "{schema}".code_catalog (code_type, code, code_system)'
+                )
+            )
+            for importer, model in archives:
+                changed_live, pre_index_archive = await receipts(importer, model)
+                assert changed_live.schema_sha256 != pre_index_archive.schema_sha256
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_native_catalog_capture_requires_all_required_model_indexes():
     engine = create_async_engine(_dsn())
     schema_name = "code_catalog_archive_" + uuid4().hex
     try:

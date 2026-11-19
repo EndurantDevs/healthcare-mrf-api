@@ -9,14 +9,14 @@ from urllib.parse import unquote
 
 import sanic.exceptions
 from sanic import Blueprint, response
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, literal, or_, select
 
 from api.code_systems import (
     PROCEDURE_CODE_SYSTEMS,
+    is_restricted_terminology_public_enabled,
     is_restricted_terminology_system,
     normalize_code,
     normalize_code_system,
-    is_restricted_terminology_public_enabled,
 )
 from api.endpoint.pagination import parse_pagination
 from db.models import (
@@ -70,9 +70,11 @@ def _restricted_public_filter(column):
 def _restricted_pair_filters(from_column, to_column):
     if is_restricted_terminology_public_enabled():
         return []
+    # Generic plans can use the public relationship index only with a fixed exclusion.
+    restricted_system = literal("SNOMEDCT_US", literal_execute=True)
     return [
-        func.upper(from_column).notin_(("SNOMEDCT_US",)),
-        func.upper(to_column).notin_(("SNOMEDCT_US",)),
+        func.upper(from_column).notin_((restricted_system,)),
+        func.upper(to_column).notin_((restricted_system,)),
     ]
 
 
@@ -126,7 +128,9 @@ async def _resolve_code(session, system: str, code: str, code_type: str | None =
     ]
     if code_type:
         direct_filters.append(code_table.c.code_type == code_type)
-    direct = await session.execute(select(code_table.c.code_system, code_table.c.code).where(and_(*direct_filters)).limit(1))
+    direct = await session.execute(
+        select(code_table.c.code_system, code_table.c.code).where(and_(*direct_filters)).limit(1)
+    )
     found = direct.first()
     if found:
         mapped = _row_to_dict(found)
@@ -144,8 +148,8 @@ async def _resolve_code(session, system: str, code: str, code_type: str | None =
     )
     found = mapped.first()
     if found:
-        row = _row_to_dict(found)
-        return row["to_system"], row["to_code"]
+        crosswalk_match = _row_to_dict(found)
+        return crosswalk_match["to_system"], crosswalk_match["to_code"]
     return system, code
 
 
@@ -182,10 +186,7 @@ async def _list_codes(request, code_type: str):
     )
     return response.json(
         {
-            "items": [
-                _json_safe_row(_row_to_dict(code_row))
-                for code_row in code_rows
-            ],
+            "items": [_json_safe_row(_row_to_dict(code_row)) for code_row in code_rows],
             "pagination": {
                 "total": total,
                 "limit": pagination.limit,
@@ -244,10 +245,7 @@ def _area_concepts_payload(
 ) -> dict[str, Any]:
     """Build the stable response contract for one mapped concept page."""
     return {
-        "items": [
-            _json_safe_row(_row_to_dict(concept_row))
-            for concept_row in concept_rows
-        ],
+        "items": [_json_safe_row(_row_to_dict(concept_row)) for concept_row in concept_rows],
         "pagination": {
             "total": int(count_result.scalar() or 0),
             "limit": pagination.limit,
@@ -378,7 +376,12 @@ async def list_concepts(request):
         )
     where_clause = and_(*filters) if filters else None
     count_query = select(func.count()).select_from(code_table)
-    query = select(code_table).order_by(code_table.c.code_system, code_table.c.code).limit(pagination.limit).offset(pagination.offset)
+    query = (
+        select(code_table)
+        .order_by(code_table.c.code_system, code_table.c.code)
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    )
     if where_clause is not None:
         count_query = count_query.where(where_clause)
         query = query.where(where_clause)
@@ -386,10 +389,7 @@ async def list_concepts(request):
     concept_rows = await session.execute(query)
     return response.json(
         {
-            "items": [
-                _json_safe_row(_row_to_dict(concept_row))
-                for concept_row in concept_rows
-            ],
+            "items": [_json_safe_row(_row_to_dict(concept_row)) for concept_row in concept_rows],
             "pagination": {
                 "total": int(count_result.scalar() or 0),
                 "limit": pagination.limit,
@@ -408,13 +408,15 @@ async def get_concept(request, system: str, code: str):
     session = _session(request)
     resolved_system, resolved_code = await _resolve_code(session, _normalize_system(system), _normalize_code(code))
     _raise_if_restricted_public(resolved_system)
-    result = await session.execute(
-        select(code_table).where(and_(code_table.c.code_system == resolved_system, code_table.c.code == resolved_code)).limit(1)
+    concept_result = await session.execute(
+        select(code_table)
+        .where(and_(code_table.c.code_system == resolved_system, code_table.c.code == resolved_code))
+        .limit(1)
     )
-    row = result.first()
-    if not row:
+    concept_row = concept_result.first()
+    if not concept_row:
         raise sanic.exceptions.NotFound
-    payload = _json_safe_row(_row_to_dict(row))
+    concept_payload = _json_safe_row(_row_to_dict(concept_row))
     synonym_rows = await session.execute(
         select(synonym_table)
         .where(and_(synonym_table.c.code_system == resolved_system, synonym_table.c.code == resolved_code))
@@ -422,13 +424,15 @@ async def get_concept(request, system: str, code: str):
     )
     rel_rows = await session.execute(
         select(relationship_table)
-        .where(and_(relationship_table.c.from_system == resolved_system, relationship_table.c.from_code == resolved_code))
+        .where(
+            and_(relationship_table.c.from_system == resolved_system, relationship_table.c.from_code == resolved_code)
+        )
         .where(*_restricted_pair_filters(relationship_table.c.from_system, relationship_table.c.to_system))
         .limit(100)
     )
-    payload["synonyms"] = [_json_safe_row(_row_to_dict(item)) for item in synonym_rows]
-    payload["relationships"] = [_json_safe_row(_row_to_dict(item)) for item in rel_rows]
-    return response.json(payload)
+    concept_payload["synonyms"] = [_json_safe_row(_row_to_dict(synonym_row)) for synonym_row in synonym_rows]
+    concept_payload["relationships"] = [_json_safe_row(_row_to_dict(relationship_row)) for relationship_row in rel_rows]
+    return response.json(concept_payload)
 
 
 async def _get_code(request, code_type: str, system: str, code: str):
@@ -451,16 +455,10 @@ async def _get_code(request, code_type: str, system: str, code: str):
         filters.append(or_(code_table.c.code_type == code_type, code_table.c.code_type.is_(None)))
     else:
         filters.append(code_table.c.code_type == code_type)
-    code_query_result = await session.execute(
-        select(code_table).where(and_(*filters)).limit(1)
-    )
+    code_query_result = await session.execute(select(code_table).where(and_(*filters)).limit(1))
     code_row = code_query_result.first()
 
-    if (
-        not code_row
-        and code_type == "treatment"
-        and requested_system in PROCEDURE_CODE_SYSTEMS
-    ):
+    if not code_row and code_type == "treatment" and requested_system in PROCEDURE_CODE_SYSTEMS:
         code_query_result = await session.execute(
             select(code_table)
             .where(
@@ -513,10 +511,7 @@ async def list_relationships(request):
     relationship_rows = await session.execute(query)
     return response.json(
         {
-            "items": [
-                _json_safe_row(_row_to_dict(relationship_row))
-                for relationship_row in relationship_rows
-            ],
+            "items": [_json_safe_row(_row_to_dict(relationship_row)) for relationship_row in relationship_rows],
             "pagination": {
                 "total": int(count_result.scalar() or 0),
                 "limit": pagination.limit,
@@ -589,10 +584,7 @@ async def list_clinical_areas(request):
         query = query.where(where_clause)
     count_result = await session.execute(count_query)
     clinical_area_rows = await session.execute(query)
-    clinical_area_items = [
-        await _area_payload(session, clinical_area_row)
-        for clinical_area_row in clinical_area_rows
-    ]
+    clinical_area_items = [await _area_payload(session, clinical_area_row) for clinical_area_row in clinical_area_rows]
     return response.json(
         {
             "items": clinical_area_items,
@@ -675,7 +667,9 @@ async def list_crosswalk(request):
     if to_code:
         filters.append(func.upper(crosswalk_table.c.to_code) == to_code)
     if code:
-        filters.append(or_(func.upper(crosswalk_table.c.from_code) == code, func.upper(crosswalk_table.c.to_code) == code))
+        filters.append(
+            or_(func.upper(crosswalk_table.c.from_code) == code, func.upper(crosswalk_table.c.to_code) == code)
+        )
     where_clause = and_(*filters) if filters else None
     count_query = select(func.count()).select_from(crosswalk_table)
     query = select(crosswalk_table).limit(pagination.limit).offset(pagination.offset)
@@ -686,10 +680,7 @@ async def list_crosswalk(request):
     crosswalk_rows = await session.execute(query)
     return response.json(
         {
-            "items": [
-                _json_safe_row(_row_to_dict(crosswalk_row))
-                for crosswalk_row in crosswalk_rows
-            ],
+            "items": [_json_safe_row(_row_to_dict(crosswalk_row)) for crosswalk_row in crosswalk_rows],
             "pagination": {
                 "total": int(count_result.scalar() or 0),
                 "limit": pagination.limit,

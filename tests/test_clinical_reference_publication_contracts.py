@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractAsyncContextManager
 import importlib
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import process.clinical_reference_publication as publication
-from process.control_cancel import ImportCancelledError
 from db.models import (
     ClinicalArea,
     ClinicalAreaCondition,
@@ -20,6 +19,7 @@ from db.models import (
     CodeRelationship,
     CodeSynonym,
 )
+from process.control_cancel import ImportCancelledError
 
 clinical = importlib.import_module("process.clinical_reference")
 
@@ -259,9 +259,7 @@ async def test_source_collection_executes_only_selected_sources(monkeypatch, tmp
 @pytest.mark.asyncio
 async def test_empty_source_selection_skips_every_loader(tmp_path):
     """An explicit empty source selection produces an empty normalized bundle."""
-    collected_rows = await clinical._collect_reference_rows(
-        _reference_request(tmp_path, set())
-    )
+    collected_rows = await clinical._collect_reference_rows(_reference_request(tmp_path, set()))
 
     assert collected_rows == clinical.ClinicalReferenceRows()
 
@@ -364,17 +362,15 @@ async def test_publication_builds_indexes_and_stages(monkeypatch):
     monkeypatch.setattr(
         publication,
         "make_class",
-        lambda model_class, _suffix: _stage_class(
-            f"{model_class.__tablename__}_created"
-        ),
+        lambda model_class, _suffix: _stage_class(f"{model_class.__tablename__}_created"),
     )
     created_stage_models = await publication._create_stage_models("unit", "unit")
     assert len(created_stage_models.stage_by_model) == 7
     assert [len(row_chunk) for _stage, row_chunk in pushed_batches] == [2]
-    sql_text = "\n".join(
-        event[1] for event in recording_db.events if event[0] == "status"
-    )
+    sql_text = "\n".join(event[1] for event in recording_db.events if event[0] == "status")
     assert "CREATE UNIQUE INDEX" in sql_text
+    assert "CREATE INDEX IF NOT EXISTS code_catalog_type_page_idx ON unit.code_catalog" in sql_text
+    assert "CREATE INDEX IF NOT EXISTS code_relationship_public_type_idx ON unit.code_relationship" in sql_text
 
 
 @pytest.mark.asyncio
@@ -399,9 +395,7 @@ async def test_publication_replaces_owned_sources(monkeypatch):
 
     assert area_rows == publication.ClinicalAreaRows([], [], [])
     assert concept_count == 2
-    sql_text = "\n".join(
-        event[1] for event in recording_db.events if event[0] == "status"
-    )
+    sql_text = "\n".join(event[1] for event in recording_db.events if event[0] == "status")
     assert "DELETE FROM unit.code_catalog" in sql_text
     assert "ALTER TABLE IF EXISTS" in sql_text
     assert "transaction-enter" in recording_db.events
