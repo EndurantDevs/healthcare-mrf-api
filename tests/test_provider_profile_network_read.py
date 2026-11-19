@@ -309,3 +309,87 @@ async def test_optional_profile_preserves_other_proof_failures(monkeypatch, fail
         await reader.read_detail_directory_profile(session, 1000000491, include_evidence=False)
     if failure == "recipe":
         observed.assert_not_awaited()
+
+
+@pytest.fixture
+def typed_profile_read(monkeypatch):
+    from tests.test_registry_typed_source_recipe import _recipe
+
+    recipe = _recipe()
+    observed_sources = [{"source_id": recipe.binding_coordinates.source_id}]
+    resolve = AsyncMock(return_value=(recipe,))
+    observed = AsyncMock(return_value={1000000491: {"profile": {"sources": observed_sources}}})
+    pin_cms = AsyncMock()
+    driver = object()
+    session = SimpleNamespace(connection=AsyncMock())
+    session.connection.return_value.get_raw_connection = AsyncMock(
+        return_value=SimpleNamespace(driver_connection=driver)
+    )
+    monkeypatch.setattr(reader, "resolve_retained_registry_source_recipes", resolve)
+    monkeypatch.setattr(provider, "_fetch_provider_directory_profile_map", observed)
+    monkeypatch.setattr(reader, "pin_cms_profile_scope", pin_cms)
+    return SimpleNamespace(
+        driver=driver,
+        session=session,
+        pinned=address_manifest(),
+        resolve=resolve,
+        observed_sources=observed_sources,
+        pin_cms=pin_cms,
+    )
+
+
+@pytest.mark.asyncio
+async def test_typed_only_profile_is_optional_only_for_embedded_detail(monkeypatch, typed_profile_read):
+    from api.network_address_scope import network_address_read_scope
+
+    read = typed_profile_read
+
+    @asynccontextmanager
+    async def snapshot(*args, **kwargs):
+        yield read.session
+
+    monkeypatch.setattr(reader, "provider_profile_read_snapshot", snapshot)
+    monkeypatch.setattr(reader, "resolve_network_serving_manifest", AsyncMock(return_value=read.pinned))
+    monkeypatch.setattr(provider, "fetch_provider_profile_projection", AsyncMock(return_value=None))
+    with network_address_read_scope(read.pinned, (42,)):
+        assert await reader.read_detail_directory_profile(read.session, 1000000491, include_evidence=False) is None
+    read.resolve.assert_awaited_once_with(read.driver, read.pinned, api_read=True)
+
+    selector = parse_managed_profile_query({"npi": "1000000491"})
+    with pytest.raises(DirectoryReadError) as refused:
+        await reader.read_managed_provider_profile(selector, excluded_network_ids=(), access_scope_sha256="d" * 64)
+    assert refused.value.status == 503
+
+    read.observed_sources.clear()
+    with network_address_read_scope(read.pinned, (42,)):
+        profile = await reader.read_address_scoped_directory_profile(read.session, 1000000491, include_evidence=False)
+    assert profile is None
+    read.pin_cms.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "additional_source_by_field",
+    [
+        pytest.param({"source_id": "unretained-directory"}, id="unknown-source"),
+        pytest.param({"source_id": []}, id="malformed-id"),
+        pytest.param({}, id="missing-id"),
+        pytest.param(None, id="mixed-typed-and-legacy"),
+    ],
+)
+async def test_typed_profile_does_not_hide_unverified_observations(typed_profile_read, additional_source_by_field):
+    from api.network_address_scope import network_address_read_scope
+    from tests.test_provider_profile_network_facts import scope
+
+    read = typed_profile_read
+    if additional_source_by_field is None:
+        legacy = scope().source_pin
+        read.resolve.return_value += (SimpleNamespace(source_pin=legacy),)
+        additional_source_by_field = {"source_id": legacy.source_id}
+    read.observed_sources.append(additional_source_by_field)
+
+    with network_address_read_scope(read.pinned, (42,)), pytest.raises(reader.ServiceUnavailable) as refused:
+        await reader.read_detail_directory_profile(read.session, 1000000491, include_evidence=False)
+    assert isinstance(refused.value.__cause__, DirectoryReadError)
+    assert refused.value.__cause__.status == 503
+    read.pin_cms.assert_not_awaited()

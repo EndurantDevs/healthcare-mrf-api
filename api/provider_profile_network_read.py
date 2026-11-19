@@ -12,6 +12,7 @@ from api.provider_profile_network_facts import pin_cms_profile_scope
 from api.provider_profile_scoped_resources import project_scoped_profile_resources
 from api.provider_profile_snapshot import provider_profile_read_snapshot, provider_read_savepoint
 from process.network_fhir_membership_source import PinnedFHIRMembershipSource
+from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
 from process.network_serving_read import resolve_network_serving_manifest
 from process.provider_directory_profile import is_valid_npi
 from process.registry_source_recipe_store import resolve_retained_registry_source_recipes
@@ -41,7 +42,14 @@ async def _profile_fhir_recipes(driver, manifest):
     ):
         # shortcut: generic retained profiles need an adapter before enrichment is available.
         raise _RetainedProfileUnavailable(503)
-    return fhir_recipes
+    retained_source_ids = {recipe.source_pin.source_id for recipe in fhir_recipes}
+    if not fhir_recipes:
+        retained_source_ids = {
+            recipe.binding_coordinates.source_id
+            for recipe in recipes
+            if type(recipe.source_pin) is PinnedTypedFHIRMembershipSource
+        }
+    return fhir_recipes, retained_source_ids
 
 
 async def _directory_profile(session, driver, manifest, npi, query, excluded, schema, *, selected_network_ids=None):
@@ -50,16 +58,19 @@ async def _directory_profile(session, driver, manifest, npi, query, excluded, sc
     from api.provider_profile_scoped_sql import build_scoped_profile_sql
     from process.provider_directory_cms_npd import source as cms_source
 
-    fhir_recipes = await _profile_fhir_recipes(driver, manifest)
+    fhir_recipes, retained_source_ids = await _profile_fhir_recipes(driver, manifest)
     observed = await provider._fetch_provider_directory_profile_map([int(npi)], session=session)
     observed_sources = (observed.get(int(npi)) or {}).get("profile", {}).get("sources", [])
-    retained_source_ids = {recipe.source_pin.source_id for recipe in fhir_recipes}
     if type(observed_sources) is not list or any(
-        type(source_descriptor) is not dict or source_descriptor.get("source_id") not in retained_source_ids
+        type(source_descriptor) is not dict
+        or type(source_descriptor.get("source_id")) is not str
+        or source_descriptor["source_id"] not in retained_source_ids
         for source_descriptor in observed_sources
     ):
         raise DirectoryReadError(503)
     if not fhir_recipes:
+        if observed_sources:
+            raise _RetainedProfileUnavailable(503)
         return None
     # shortcut: generic FHIR epochs need a custody adapter before managed profile activation.
     if len(fhir_recipes) != 1 or fhir_recipes[0].source_pin.source_id != "cms-npd":
