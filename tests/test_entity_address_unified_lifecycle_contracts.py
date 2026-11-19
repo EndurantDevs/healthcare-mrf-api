@@ -1,6 +1,7 @@
 """Lifecycle contracts for unified-address stage materialization."""
 
 import importlib
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -45,6 +46,13 @@ def _configure_database_harness(monkeypatch, sql_events):
     async def is_table_present(_schema, table_name):
         return not table_name.endswith("_missing")
 
+    @asynccontextmanager
+    async def no_named_editions(_source_ids=None):
+        yield ()
+
+    monkeypatch.setattr(
+        importlib.import_module("process.provider_directory_fhir"), "_artifact_selection_snapshot", no_named_editions
+    )
     monkeypatch.setattr(entity_address, "ensure_database", AsyncMock())
     monkeypatch.setattr(entity_address, "make_class", lambda _model, _date: _StageClass)
     monkeypatch.setattr(entity_address, "_ensure_schema_exists", AsyncMock())
@@ -373,19 +381,39 @@ async def test_materialization_preflights_geo_projection_dependencies(
         )
 
 
+def _record_partial_edition_scopes(monkeypatch):
+    """Observe source selections and every lazy partial preparation consumer."""
+    edition = SimpleNamespace(schema_name="selected_edition")
+    selections = []
+    monkeypatch.setattr(entity_address.named_source_editions, "selected_editions", AsyncMock(return_value=(edition,)))
+
+    def current_sources(_schema, _available, source_selects, **_scope):
+        selections.append(entity_address.named_source_editions._ADDRESS_EDITIONS.get())
+        return source_selects
+
+    async def prepare_partial(*_args, **_scope):
+        selections.append(entity_address.named_source_editions._ADDRESS_EDITIONS.get())
+
+    def replacement_sources(*_args, **_scope):
+        selections.append(entity_address.named_source_editions._ADDRESS_EDITIONS.get())
+        return ["SELECT 'partial-source'"]
+
+    def affected_groups(*_args, **_scope):
+        selections.append(entity_address.named_source_editions._ADDRESS_EDITIONS.get())
+        return "CREATE TABLE affected_groups AS SELECT 1"
+
+    monkeypatch.setattr(entity_address, "_current_provider_directory_source_selects", current_sources)
+    monkeypatch.setattr(entity_address.address_batches, "prepare_partial", prepare_partial)
+    monkeypatch.setattr(entity_address.partial_projection, "prepare_load", prepare_partial)
+    monkeypatch.setattr(entity_address, "_provider_directory_partial_replacement_source_selects", replacement_sources)
+    monkeypatch.setattr(entity_address, "_prepare_partial_affected_groups_sql", affected_groups)
+    return edition, selections
+
+
 @pytest.mark.asyncio
 async def test_partial_refresh_builds_an_atomic_replacement_stage_without_patching_live_rows(monkeypatch):
     sql_events, _progress_events, _environment_flags, _runtime_options = _configure_materialization_harness(monkeypatch)
-    monkeypatch.setattr(
-        entity_address,
-        "_provider_directory_partial_replacement_source_selects",
-        lambda *_args, **_kwargs: ["SELECT 'partial-source'"],
-    )
-    monkeypatch.setattr(
-        entity_address,
-        "_prepare_partial_affected_groups_sql",
-        lambda *_args, **_kwargs: "CREATE TABLE affected_groups AS SELECT 1",
-    )
+    edition, selections = _record_partial_edition_scopes(monkeypatch)
     monkeypatch.setattr(
         entity_address,
         "_index_partial_affected_groups_sql",
@@ -405,6 +433,8 @@ async def test_partial_refresh_builds_an_atomic_replacement_stage_without_patchi
 
     await entity_address.process_data(import_context_by_key, task_by_field)
 
+    assert selections == [(edition,)] * 6
+    assert entity_address.named_source_editions._ADDRESS_EDITIONS.get() == ()
     stage_context = import_context_by_key["context"]
     assert stage_context["partial_provider_directory_refresh"] is True
     assert stage_context["partial_provider_directory_source_ids"] == ["source-a", "source-b"]
@@ -471,3 +501,16 @@ async def test_partial_refresh_checks_exact_dataset_before_materialization(monke
         expected_dataset_id="synthetic-dataset",
         expected_root_run_id="synthetic-root-run",
     )
+
+
+@pytest.mark.asyncio
+async def test_named_edition_switch_before_the_overlay_fence_refuses_the_build(monkeypatch):
+    _configure_materialization_harness(monkeypatch)
+    selections = iter([("edition-before",), ("edition-after",)])
+    monkeypatch.setattr(entity_address.named_source_editions, "selected_editions", AsyncMock(side_effect=selections))
+
+    with pytest.raises(RuntimeError, match="named editions changed during source selection"):
+        await entity_address.process_data(
+            {"import_date": "20260724", "context": {"control_run_id": "synthetic-control-run"}},
+            {"publish": False, "limit_per_source": 0},
+        )

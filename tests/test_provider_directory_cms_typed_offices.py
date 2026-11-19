@@ -110,3 +110,46 @@ def test_partial_refresh_refuses_existing_typed_offices_instead_of_preserving_st
     finally:
         preparation._PREPARATION.reset(token)
     assert "OR EXISTS(SELECT 1 FROM checked)" in sql and "OFFSET (SELECT accepted FROM complete)" in sql
+
+
+def test_ordinary_offices_read_current_named_editions_like_every_other_source():
+    from types import SimpleNamespace
+
+    edition = SimpleNamespace(
+        catalog_schema="fixture",
+        endpoint_id="endpoint",
+        dataset_id="dataset",
+        schema_name="edition_schema",
+        source_ids=("cms-npd",),
+    )
+    from process.provider_directory_named_edition import address_editions
+
+    with address_editions((edition,)):
+        sql = cms_typed_office_source(native, "fixture", _available())
+    for table in ("provider_directory_endpoint_dataset", "provider_directory_dataset_resource"):
+        assert f'"edition_schema"."{table}"' in sql
+        assert f'"fixture"."{table}"' in sql
+        assert f" fixture.{table} " not in sql
+    assert "endpoint_id NOT IN ('endpoint')" in sql
+    assert "dataset_id NOT IN ('dataset') AND NOT (is_current AND endpoint_id IN ('endpoint'))" in sql
+
+
+def test_prepared_offices_read_the_preparations_pinned_editions():
+    from types import SimpleNamespace
+
+    edition = SimpleNamespace(
+        catalog_schema="fixture",
+        endpoint_id="endpoint",
+        dataset_id="candidate",
+        schema_name="edition_schema",
+        source_ids=("cms-npd",),
+    )
+    token = preparation._PREPARATION.set(_inputs())
+    editions_token = preparation._NAMED_EDITIONS.set((edition,))
+    try:
+        sql = cms_typed_office_source(native, "fixture", _available())
+    finally:
+        preparation._NAMED_EDITIONS.reset(editions_token)
+        preparation._PREPARATION.reset(token)
+    assert '"edition_schema"."provider_directory_dataset_resource"' in sql
+    assert " fixture.provider_directory_dataset_resource " not in sql

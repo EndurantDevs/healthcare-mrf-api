@@ -3,6 +3,7 @@
 
 from process import entity_address_candidate_preparation as preparation
 from process.network_cms_provider_identity import cms_provider_sql_fields
+from process.provider_directory_named_edition import address_source_relations
 
 CMS_OFFICE_READ_TABLES = (
     "provider_directory_cms_npd_resource_witness",
@@ -13,17 +14,17 @@ CMS_OFFICE_READ_TABLES = (
 _OFFICES = """, cms_datasets AS MATERIALIZED (
  SELECT DISTINCT current.dataset_id,current.run_id,current.published_at,proof.release_id
  FROM current_datasets current JOIN endpoint_aliases alias ON alias.endpoint_id=current.endpoint_id
- JOIN {schema}.provider_directory_endpoint_dataset dataset ON dataset.dataset_id=current.dataset_id
+ JOIN {dataset_ref} dataset ON dataset.dataset_id=current.dataset_id
  JOIN {schema}.provider_directory_cms_candidate_coverage proof ON proof.dataset_id=dataset.dataset_id
  AND proof.endpoint_id=dataset.endpoint_id AND proof.dataset_hash=dataset.dataset_hash AND proof.proof_version=2
  WHERE alias.source_id='cms-npd'
 ), page AS MATERIALIZED (
  SELECT resource.*,resource.payload_json::jsonb AS payload,dataset.release_id,dataset.run_id,dataset.published_at
- FROM cms_datasets dataset JOIN {schema}.provider_directory_dataset_resource resource USING(dataset_id)
+ FROM cms_datasets dataset JOIN {resource_ref} resource USING(dataset_id)
  WHERE resource.resource_type IN ('PractitionerRole','OrganizationAffiliation')
 ), providers AS MATERIALIZED (
  SELECT page.*,provider.payload_json::jsonb AS provider_payload,{provider_id} AS provider_id
- FROM page LEFT JOIN {schema}.provider_directory_dataset_resource provider ON provider.dataset_id=page.dataset_id
+ FROM page LEFT JOIN {resource_ref} provider ON provider.dataset_id=page.dataset_id
  AND provider.resource_type=CASE page.resource_type WHEN 'PractitionerRole' THEN 'Practitioner' ELSE 'Organization' END
  AND provider.resource_id=CASE
  WHEN page.resource_type='PractitionerRole' AND page.payload->>'practitioner_ref' ~ '^Practitioner/[A-Za-z0-9.-]{{1,64}}$'
@@ -56,7 +57,7 @@ _OFFICES = """, cms_datasets AS MATERIALIZED (
 ), offices AS MATERIALIZED (
  SELECT selected.*,location.payload_json::jsonb AS office,site.site_id,physical.address_key AS native_address_key,
  physical.first_line,physical.second_line,physical.city_name,physical.state_name,physical.postal_code,physical.country_code
- FROM selected LEFT JOIN {schema}.provider_directory_dataset_resource location
+ FROM selected LEFT JOIN {resource_ref} location
  ON location.dataset_id=selected.dataset_id AND location.resource_type='Location'
  AND location.resource_id=split_part(selected.location_reference,'/',2)
  LEFT JOIN {schema}.provider_directory_cms_npd_resource_witness location_witness
@@ -116,8 +117,12 @@ def _typed_office_ctes(native, schema, *, partial_refresh):
         )
         + " OR coalesce(nullif(country_code,''),'US') IS DISTINCT FROM coalesce(nullif(office->>'country_code',''),'US')"
     )
+    editions = preparation._NAMED_EDITIONS.get() if preparation.current() is not None else None
+    _source_ref, dataset_ref, resource_ref = address_source_relations(schema, editions)
     offices = _OFFICES.format(
         schema=schema,
+        dataset_ref=dataset_ref,
+        resource_ref=resource_ref,
         provider_id=identity,
         as_of=as_of,
         key_invalid="false"

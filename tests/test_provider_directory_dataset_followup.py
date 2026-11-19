@@ -10,6 +10,17 @@ importer = importlib.import_module("process.provider_directory_fhir")
 entity_address_unified = importlib.import_module("process.entity_address_unified")
 
 
+@pytest.fixture(autouse=True)
+def _no_named_editions(monkeypatch):
+    """Keep these mocked fences off a database; named editions have connected coverage."""
+
+    @contextlib.asynccontextmanager
+    async def snapshot(_source_ids=None):
+        yield ()
+
+    monkeypatch.setattr(importer, "_artifact_selection_snapshot", snapshot)
+
+
 def _published_artifact_dataset(**overrides):
     dataset_by_name = {
         "source_id": "source-current",

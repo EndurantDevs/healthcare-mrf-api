@@ -236,6 +236,7 @@ async def test_native_preparation_threads_archive_and_restores_scope_after_inter
     monkeypatch.setattr(native.db, "_transaction_binding", lambda: None)
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", "mrf")
     monkeypatch.setattr(preparation.admitted, "assert_full_recipe", lambda *_args: None)
+    monkeypatch.setattr(preparation, "_pinned_named_editions", AsyncMock(return_value=()))
 
     async def fail_build(_ctx, _task):
         assert preparation.current() is inputs
