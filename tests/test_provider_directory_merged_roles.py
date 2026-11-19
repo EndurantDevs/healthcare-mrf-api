@@ -333,3 +333,47 @@ def test_role_without_fhir_metadata_cannot_reuse_a_different_roles_hash() -> Non
     assert role_merge.merged_role_hash_components(forged_role_by_field) is None
     with pytest.raises(ValueError, match="provider_directory_resource_payload_conflict"):
         role_merge.merge_semantic_resource_payloads(first, forged_role_by_field)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_empty", [False, True])
+async def test_batch_persistence_opens_one_source_transaction_scope(monkeypatch, is_empty):
+    """Each batch issues what it did before the shared persistence tail: one scope, then COPY and proof inside it."""
+    from contextlib import asynccontextmanager
+
+    from process import provider_directory_generic_source_adapters as adapters
+    from process import provider_directory_generic_source_policy as policy
+
+    events = []
+
+    @asynccontextmanager
+    async def transaction(database):
+        events.append("enter")
+        yield
+        events.append("exit")
+
+    async def persist(*arguments, **keywords):
+        events.append("persist_source_rows")
+
+    async def proof(*arguments, **keywords):
+        events.append("proof_shard")
+
+    prepared_rows = [] if is_empty else [{"resource_id": "role-one"}]
+    monkeypatch.setattr(policy, "source_transaction", transaction)
+    monkeypatch.setattr(adapters, "require_source_transaction", lambda: events.append("require"))
+    monkeypatch.setattr(adapters, "persist_source_rows", persist)
+    monkeypatch.setattr(importer, "persist_dataset_proof_shard", proof)
+    monkeypatch.setattr(importer, "_endpoint_dataset_resource_rows", lambda *arguments, **keywords: prepared_rows)
+    monkeypatch.setattr(importer, "_assert_practitioner_semantic_projection_as_of", lambda *arguments: None)
+
+    persisted = await importer._persist_endpoint_dataset_rows(
+        ProviderDirectoryPractitionerRole,
+        [{"source_id": "not-opted-in"}],
+        "dataset-one",
+        resource_hash_contract=resource_hash.SEMANTIC_CONTENT_RESOURCE_HASH_CONTRACT,
+        semantic_projection_as_of="2026-08-09",
+    )
+
+    assert persisted == prepared_rows
+    middle = [] if is_empty else ["persist_source_rows", "proof_shard"]
+    assert events == ["enter", "require", *middle, "exit"]

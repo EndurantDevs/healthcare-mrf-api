@@ -1002,6 +1002,32 @@ that already has a copy skips the link probe, so once every incomplete output is
 saved, parsing and a retry after the links expire read only the copies. Without
 both settings, outputs stream directly as before.
 
+When such a source is also listed in `HLTHPRT_PROVIDER_DIRECTORY_MERGED_ROLE_SOURCES`,
+uses a semantic resource hash contract and has no PractitionerRole reverse lookup,
+its PractitionerRole outputs take a grouped load instead of the stream. Worker
+processes parse each saved copy and write every prepared role into local group
+files under `<root>/<checkpoint_id>/group/`, chosen by a hash of its merged-role id.
+Once an output's group files are durable, a `.done` marker is written and its copy
+is deleted, so disk is freed output by output; the marker counts as holding the
+bytes, so neither the link probe nor the download runs for that output again. The
+worker then reduces one partition at a time, appends each merged role once through
+the ordinary append and proof path, and writes a `.loaded` marker after the commit.
+Last, all role outputs are completed together with the number of rows staged, and
+the local files are deleted. Until then no output counts as complete, and a restart
+continues from the markers: a partition without its marker is replayed, which only
+stages a repeat. The worker count follows the container's CPU limit (one CPU stays
+with the main process) unless `HLTHPRT_PROVIDER_DIRECTORY_BULK_GROUP_WORKERS` sets
+it. An acquisition that already staged role rows through the stream is refused with
+the terminal error `bulk_export_group_mode_changed` rather than mixing both ways in
+one edition, and so is an acquisition whose grouping began when the setting is
+turned off; a later run starts a fresh export. Linked-reference sampling
+(`linked_resource_limit`) is not applied to grouped role exports. The copy root must
+be on storage that outlives the worker pod: after grouping, the role data exists
+only there until finish, because the copies are already deleted. For the same
+reason the copy root setting must keep its value until the acquisition finishes:
+the marker that refuses a mixed acquisition is kept there too, so a removed or
+changed root loses both the role data and that refusal.
+
 The candidate is published only when every selected resource reports a
 complete, unbounded, error-free scan with no next page remaining. Publication
 locks the endpoint identity and atomically marks the prior current dataset

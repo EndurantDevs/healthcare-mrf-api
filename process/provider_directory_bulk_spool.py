@@ -47,11 +47,19 @@ def is_enabled(source_record: dict[str, Any]) -> bool:
 
 def spooled_output(checkpoint_id: str, output_index: int, validator: Any) -> SpooledOutput:
     """Name the copy by export, output and validated content, so no other file can stand in for it."""
+    name = f"{int(output_index)}-{validator.etag_hash[:16]}.ndjson.zst"
+    return SpooledOutput(_export_directory(checkpoint_id) / name, validator.etag, validator.content_length_bytes)
+
+
+def group_directory(checkpoint_id: str) -> Path:
+    """Where a grouped export keeps its group files and markers, beside its copies."""
+    return _export_directory(checkpoint_id) / "group"
+
+
+def _export_directory(checkpoint_id: str) -> Path:
     if not re.fullmatch(r"[0-9a-f]{16,128}", checkpoint_id):
         raise ValueError("bulk_export_spool_checkpoint_invalid")
-    name = f"{int(output_index)}-{validator.etag_hash[:16]}.ndjson.zst"
-    path = Path(os.environ[SPOOL_ROOT_ENV], checkpoint_id, name)
-    return SpooledOutput(path, validator.etag, validator.content_length_bytes)
+    return Path(os.environ[SPOOL_ROOT_ENV], checkpoint_id)
 
 
 def served_offset(spooled: SpooledOutput, headers: dict[str, Any]) -> int | None:
