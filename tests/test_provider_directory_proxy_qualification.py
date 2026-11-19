@@ -215,6 +215,21 @@ async def test_unconfigured_entry_keeps_direct_qualification(monkeypatch, source
     assert adapter.current_run() is None and "audit" not in source_entry.context["context"]
 
 
+def test_import_group_uses_prepared_proxy_credential_descriptor(monkeypatch):
+    base = "https://directory.example.test/fhir"
+    source_by_field = {"source_id": "synthetic-source", "api_base": base}
+    descriptor_by_field = {"header_names": ["Authorization"], "query_param_names": []}
+    prepared_run = SimpleNamespace(descriptors={source_by_field["source_id"]: descriptor_by_field})
+    monkeypatch.setattr(adapter, "current_run", lambda: prepared_run)
+    resolve_credentials = Mock(side_effect=AssertionError("unexpected credential resolution during grouping"))
+    monkeypatch.setattr(directory, "_credential_request_options_for_source", resolve_credentials)
+
+    group_base, group_descriptor, _ = directory._resource_import_group_key(source_by_field)
+
+    assert group_base == base and json.loads(group_descriptor) == descriptor_by_field
+    resolve_credentials.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_endpoint_mismatch_refuses_before_qualification(monkeypatch, source_entry):
     _configure_proxy(monkeypatch, source_entry)
