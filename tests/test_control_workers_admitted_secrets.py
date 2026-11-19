@@ -14,6 +14,8 @@ import pytest
 
 from api import control_workers as workers
 from api import plan_pricing_worker_policy as pricing_workers
+from api import provider_directory_source_worker as fhir_worker
+from tests.test_provider_directory_source_worker_launch import admitted as admitted
 
 
 @pytest.mark.parametrize("role", ["start", "finish"])
@@ -205,6 +207,55 @@ def test_malformed_importer_selection_refuses(monkeypatch, selected):
     request, recorded = _coordinates()
     with pytest.raises(ValueError, match="selector is invalid"):
         _secrets(_admitted(request, recorded))
+
+
+def test_scoped_policy_mount_requires_the_admitted_importer(monkeypatch):
+    importer = "ptg-provider-membership-projection"
+    mount_by_field = {
+        "secretName": "worker-role-policy",
+        "mountPath": "/etc/synthetic-policy",
+        "workerClasses": ["process.PTGCandidateAudit"],
+        "importers": [importer],
+    }
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON", json.dumps([mount_by_field]))
+    request, recorded = _coordinates(importer)
+    spec = workers._BY_IMPORTER_ROLE[(importer, "start")]
+    assert workers._worker_job_secret_volumes(spec) == []
+    with pytest.raises(ValueError, match="exact admitted job"):
+        workers._worker_job_manifest(spec, request, _GENERIC_IMAGE)
+
+    for selected in (importer, "ptg-candidate-audit"):
+        request, recorded = _coordinates(selected)
+        job = workers._worker_job_manifest(spec, _admitted(request, recorded), _GENERIC_IMAGE)
+        pod = job["spec"]["template"]["spec"]
+        volume_names = {volume["name"] for volume in pod.get("volumes", [])}
+        mounts_by_name = {entry["name"]: entry for entry in pod["containers"][0].get("volumeMounts", [])}
+        if selected == importer:
+            assert mount_by_field["secretName"] in volume_names
+            assert mounts_by_name[mount_by_field["secretName"]]["mountPath"] == mount_by_field["mountPath"]
+            assert mounts_by_name[mount_by_field["secretName"]]["readOnly"] is True
+        else:
+            assert mount_by_field["secretName"] not in volume_names
+            assert mount_by_field["secretName"] not in mounts_by_name
+
+
+def test_fhir_job_reuse_keeps_an_admitted_importer_mount(monkeypatch, admitted):
+    spec = workers._BY_WORKER_CLASS["process.ProviderDirectoryFHIR"]
+    mount_by_field = {
+        "secretName": "synthetic-worker-policy",
+        "mountPath": "/etc/synthetic-policy",
+        "workerClasses": [spec.worker_class],
+        "importers": ["provider-directory-fhir"],
+    }
+    monkeypatch.setenv("HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON", json.dumps([mount_by_field]))
+    launch = admitted.fhir_source_launch
+    job = workers._worker_job_manifest(spec, admitted, launch.image)
+    pod = job["spec"]["template"]["spec"]
+    assert any(volume.get("secret", {}).get("secretName") == mount_by_field["secretName"] for volume in pod["volumes"])
+
+    assert fhir_worker.is_fhir_job_set_matching(spec, admitted, [job])
+    pod["containers"][0]["volumeMounts"].pop()
+    assert not fhir_worker.is_fhir_job_set_matching(spec, admitted, [job])
 
 
 def test_scoped_secret_needs_fixed_class_and_no_wave_scope(monkeypatch):

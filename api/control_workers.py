@@ -1128,7 +1128,7 @@ def _is_scoped_job_set_matching(spec, request, jobs):
         return False
     npi_launch = npi_source_worker.authorized_npi_source_worker_launch(spec, request)
     if npi_launch is not None and any(
-        not npi_source_worker.is_npi_source_job_matching(job, npi_launch) for job in jobs
+        not npi_source_worker.is_npi_source_job_matching(job, npi_launch, launch_request=request) for job in jobs
     ):
         return False
     return True
@@ -1427,7 +1427,7 @@ def _worker_job_container(
 
     volumes = [
         *pvc_volumes,
-        *_worker_job_secret_volumes(spec, fhir_launch),
+        *_worker_job_secret_volumes(spec, fhir_launch, launch_request=launch_request),
         *pricing_worker_policy_volumes(spec, launch_request),
     ]
     if volumes:
@@ -1872,8 +1872,10 @@ def _worker_job_secret_source(
     return secret_source_by_field
 
 
-def _worker_job_secret_volumes(spec: WorkerSpec, fhir_source_launch=None) -> list[dict[str, Any]]:
-    """Build validated secret mounts selected for one worker class."""
+def _worker_job_secret_volumes(
+    spec: WorkerSpec, fhir_source_launch=None, *, launch_request=None
+) -> list[dict[str, Any]]:
+    """Build validated secret mounts for the worker class and admitted importer."""
 
     raw = os.getenv("HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON", "").strip()
     if not raw:
@@ -1891,6 +1893,12 @@ def _worker_job_secret_volumes(spec: WorkerSpec, fhir_source_launch=None) -> lis
         if not isinstance(mount_spec, dict):
             continue
         if not _is_worker_class_selected(mount_spec, spec.worker_class):
+            continue
+        if (
+            "purposes" not in mount_spec
+            and "importers" in mount_spec
+            and not _is_admitted_importer_selected(mount_spec, spec.worker_class, launch_request)
+        ):
             continue
         secret_name = str(mount_spec.get("secretName") or mount_spec.get("secret_name") or "").strip()
         if "purposes" in mount_spec and not provider_directory_source_worker.is_fhir_source_volume_selected(

@@ -1122,7 +1122,7 @@ def is_fhir_source_job_matching(job, launch, launch_request=None):
         pod = template["spec"]
         containers = pod["containers"]
         security = pod["securityContext"]
-        volumes = [*_worker_job_pvc_volumes(), *_worker_job_secret_volumes(spec, launch)]
+        volumes = [*_worker_job_pvc_volumes(), *_worker_job_secret_volumes(spec, launch, launch_request=launch_request)]
         expected_security = _worker_job_pod_security_context(has_group_read_volume="fsGroup" in security)
         expected_security.update(runAsUser=10001, runAsGroup=10001)
         expected_env = None

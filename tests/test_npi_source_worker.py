@@ -355,6 +355,29 @@ def test_kubernetes_create_uses_fixed_launch(admitted, mounted_job, monkeypatch)
     assert source.is_npi_source_job_matching(calls[0][2], admitted.npi_source_launch)
 
 
+def test_kubernetes_readback_accepts_admitted_importer_mount(admitted, monkeypatch):
+    monkeypatch.setenv(
+        "HLTHPRT_WORKER_JOB_SECRET_VOLUME_MOUNTS_JSON",
+        json.dumps(
+            [
+                {
+                    "name": "source-policy",
+                    "secretName": "synthetic-source-policy",
+                    "mountPath": "/etc/source-policy",
+                    "workerClasses": [SPEC.worker_class],
+                    "importers": ["npi"],
+                }
+            ]
+        ),
+    )
+    job = workers._worker_job_manifest(SPEC, admitted, "example/ordinary:latest")
+    volumes = job["spec"]["template"]["spec"]["volumes"]
+    assert volumes[0]["name"] == "source-policy"
+    assert workers._is_scoped_job_set_matching(SPEC, admitted, [job])
+    volumes[0]["secret"]["secretName"] = "synthetic-unapproved-policy"
+    assert not workers._is_scoped_job_set_matching(SPEC, admitted, [job])
+
+
 @pytest.mark.parametrize(
     "drift",
     [
