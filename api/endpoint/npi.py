@@ -135,6 +135,7 @@ from api.provider_list_sql import (
     _provider_list_statement,
     _provider_list_total_statement,
     _provider_native_entity_scope,
+    _provider_page_access,
     _provider_registry_page_cte,
     _sql_with_ctes,
     _sql_with_prefix_ctes,
@@ -7940,7 +7941,6 @@ async def list_providers(
     response_format = str(response_format).strip().lower() if response_format else None
     request_session = session if session is not None else _request_session(request)
     network_scope = current_network_address_scope()
-    compact_network_scope = network_scope is not None and network_scope.is_compact_network_selection
     is_ordinary_provider_query = (
         native_args is None
         and import_context is None
@@ -9259,14 +9259,14 @@ async def list_providers(
             address_source = f"{address_table_sql} as c\n    {phone_candidates_join}\n    {taxonomy_source}"
         else:
             address_source = f"{address_table_sql} as c\n    {phone_candidates_join}"
-        compact_network_order = compact_network_scope and (
-            zip_code or city or state or 4 <= len(network_scope.network_ids) <= 5
-        )
-        use_computed_page_order = bool(plan_network_ids) or (
-            use_taxonomy_filter
-            and not npi_where
-            and order_by == "npi"
-            and ((is_ordinary_provider_query and zip_code) or (compact_network_order and page_import_context is None))
+        use_computed_page_order, selected_keys, page_source = _provider_page_access(
+            network_scope if page_import_context is None else None,
+            filters_by_name,
+            address_source,
+            taxonomy_source,
+            plain_sort=use_taxonomy_filter and not npi_where and order_by == "npi",
+            ordinary=is_ordinary_provider_query,
+            native_only=is_unified_search and native_npis is None and native_scope_preparer is None,
         )
         if order_by == "relevance":
             eligible_npis_sql = _relevance_page_sql(
@@ -9283,7 +9283,7 @@ async def list_providers(
         else:
             can_stage_zip_plan = is_ordinary_provider_query or scope_native_query
             zip_plan_sql = plan_member_sql if can_stage_zip_plan and is_unified_search and zip_code else None
-            eligible_npis_sql = _page_npis_sql(address_source, provider_npi_sql, eligible_address_clauses, zip_plan_sql)
+            eligible_npis_sql = _page_npis_sql(page_source, provider_npi_sql, eligible_address_clauses, zip_plan_sql)
             page_order_sql = "ORDER BY npi + 0" if use_computed_page_order else "ORDER BY npi"
             sub_s_relevance_projection = ""
             result_order_sql = "ORDER BY sub_s.npi_code ASC"
@@ -9316,7 +9316,7 @@ async def list_providers(
                 result_order_sql = "ORDER BY sub_s._provider_page_position ASC, sub_s.npi_code ASC"
         provider_page_query = _provider_list_statement(
             f"""
-        {_sql_with_prefix_ctes(phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte, native_eligible_cte, import_relation_cte, imported_count_ctes)}page_npis AS (
+        {_sql_with_prefix_ctes(selected_keys, phone_candidates_cte, filtered_npi_cte, taxonomy_matched_npi_cte, native_eligible_cte, import_relation_cte, imported_count_ctes)}page_npis AS (
             {page_npis_sql}
         ),
         sub_s AS (

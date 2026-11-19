@@ -24,6 +24,7 @@ from api.network_compact_address import (
     compact_address_read_relations,
     compact_address_relation_sql,
     compact_address_selectable,
+    compact_selected_offices,
 )
 from api.network_read_execution import qualified_relation_sql
 from db.models import EntityAddressUnified
@@ -91,6 +92,25 @@ async def test_shared_generations_keep_exact_offices(compact_db):
         assert await _read(db, db.second_layout, network_ids=(88,), typed=typed) == []
         custom_rows = await _read(db, db.second_layout, network_ids=(99,), typed=typed)
         assert [(row["location_key"], row["canonical_network_ids"]) for row in custom_rows] == [(db.keys[2], [99])]
+
+
+@pytest.mark.asyncio
+async def test_staged_offices_match_scoped_rows(compact_db):
+    db, layout = compact_db, compact_db.second_layout
+    for network_ids, names in (
+        ((7, 42, 88, 99), ["manual override", "manual custom"]),
+        ((4, 5, 6, 88), []),
+    ):
+        keys, offices = compact_selected_offices(layout, network_ids)
+        statement = text(f"WITH {keys} SELECT * FROM {offices} selected_offices ORDER BY location_key")
+        parameters = compact_address_parameters(layout) | {"_canonical_network_ids": list(network_ids)}
+        async with db.engine.connect() as connection:
+            rows = (await connection.execute(statement, parameters)).mappings().all()
+        ordinary = await _read(db, layout, network_ids=network_ids)
+        assert [row["entity_name"] for row in rows] == names
+        assert rows == [
+            {key: value for key, value in row.items() if key != "canonical_network_ids"} for row in ordinary
+        ]
 
 
 @pytest.mark.asyncio
