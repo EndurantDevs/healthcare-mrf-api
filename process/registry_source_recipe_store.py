@@ -524,12 +524,28 @@ def decode_registry_source_recipes(value) -> tuple[RegistrySourceMembershipRecip
         raise RegistrySourceRecipeError("registry_source_recipes_invalid") from None
 
 
+def _project_legacy_typed_recipe(document):
+    if document["source_kind"] != "fhir_typed":
+        return document
+    pin = document["source_pin"]
+    if pin["capture"]["descriptor_version"] != 4:
+        return document
+    from process.registry_fhir_catalog_sources import _normalize_fhir_catalog_descriptor
+
+    _, legacy_catalog = _normalize_fhir_catalog_descriptor(pin["catalog_descriptor"])
+    if not legacy_catalog:
+        return document
+    (recipe,) = decode_registry_source_recipes([document])
+    return _recipe_document(recipe)
+
+
 def canonical_decoded_registry_source_recipes(document):
     """Check complete old/new recipe syntax while retaining original canonical transport bytes."""
     raw = _decode_document(document)
     decoded = decode_registry_source_recipes(raw)
     encoded = _canonical_json(raw)
-    if canonical_registry_source_recipes(decoded) != encoded:
+    normalized = canonical_registry_source_recipes(decoded)
+    if normalized != encoded:
 
         def is_projected_legacy(recipe_document):
             """Recognize a validated historical pin whose physical fields were projected out."""
@@ -540,11 +556,13 @@ def canonical_decoded_registry_source_recipes(document):
                 and "schema_oid" in pin["retained_epoch"]
             )
 
-        if not any(is_projected_legacy(recipe_document) for recipe_document in raw):
-            raise RegistrySourceRecipeError("registry_source_recipes_invalid")
         if raw != sorted(raw, key=_canonical_json):
             raise RegistrySourceRecipeError("registry_source_recipes_invalid")
-        # Every item has already passed its exact closed decoder above.
+        if not any(is_projected_legacy(recipe_document) for recipe_document in raw):
+            projected = sorted((_project_legacy_typed_recipe(item) for item in raw), key=_canonical_json)
+            if _canonical_json(projected) != normalized:
+                raise RegistrySourceRecipeError("registry_source_recipes_invalid")
+        # Keep the validated transport bytes for the retained inventory digest.
     return encoded
 
 

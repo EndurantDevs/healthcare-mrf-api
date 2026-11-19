@@ -3,6 +3,7 @@
 
 import asyncio
 import hashlib
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -12,6 +13,7 @@ import asyncpg
 import pytest
 
 from process import registry_source_inventory_store as store
+from process.network_fhir_source_witness_contract import digest
 from process.network_membership_candidate_lifecycle import (
     MembershipCandidateError,
     create_network_candidate,
@@ -21,21 +23,29 @@ from process.network_membership_copy import MembershipCopyTarget
 from process.registry_source_inventory_contract import (
     RegistrySourceInventoryError,
     SourceInventoryAccumulator,
+    SourceInventoryEntry,
     encode_source_inventory_entry,
     make_source_inventory_entry,
     source_inventory_root,
 )
 from process.registry_source_inventory_reference import SourceInventoryReference
 from process.registry_source_inventory_summaries import contribution_summary_v3
-from process.registry_source_recipe_store import RegistrySourceMembershipRecipe, canonical_registry_source_recipes
+from process.registry_source_recipe_store import (
+    RegistrySourceMembershipRecipe,
+    canonical_registry_source_recipes,
+    decode_registry_source_recipes,
+)
+from process.registry_typed_source_metadata import typed_contribution_summary
 from tests.registry_compact_target_postgres_support import coverage_reader
 from tests.registry_source_recipe_support import _capture_recipe, _example
+from tests.test_named_fhir_typed_graph import _legacy_typed_recipe
 from tests.test_network_custom_address_source_postgres import custom_db as custom_db
 from tests.test_network_serving_schema_postgres import serving_schema as serving_schema
 from tests.test_registry_ptg_office_membership_recipe import _recipe as _ptg_recipe
 from tests.test_registry_source_inventory_contract import _entries
 from tests.test_registry_source_inventory_schema_postgres import _migration
 from tests.test_registry_source_recipe_store_postgres import _cms_custody_recipe, _cms_epoch_recipe
+from tests.test_registry_typed_source_recipe import _metadata
 
 
 @pytest.mark.parametrize("recipe", [_example(), _cms_epoch_recipe(), _ptg_recipe(), _capture_recipe()])
@@ -132,8 +142,9 @@ async def inventory_db(custom_db):
             assert await custom_db.connection.fetchval("SELECT to_regnamespace($1)", copy_target.schema_name) is None
 
 
-async def _new_target(context, entries=()):
+async def _new_target(context, entries=(), *, source_contributions=None):
     identity = uuid4()
+    root = source_inventory_root(entries)
     copy_target = MembershipCopyTarget(
         *(str(uuid4()) for _ in range(3)), str(identity), "network_candidate_" + identity.hex
     )
@@ -147,8 +158,8 @@ async def _new_target(context, entries=()):
             expected_head=0,
             expected_rows=0,
             control_schema=context.fixture.control_schema,
-            source_inventory=SourceInventoryReference(source_inventory_root(entries)),
-            source_contributions=contribution_summary_v3(source_inventory_root(entries), ()) if not entries else None,
+            source_inventory=SourceInventoryReference(root),
+            source_contributions=contribution_summary_v3(root, ()) if not entries else source_contributions,
         )
     return copy_target
 
@@ -243,6 +254,46 @@ async def test_open_inventory_replay_preserves_rows_and_rejects_changed_stream(i
                     control_schema=context.fixture.control_schema,
                 )
         assert await _verify(context, copy_target, receipt) == receipt.root
+
+
+@pytest.mark.asyncio
+async def test_native_inventory_preserves_retained_typed_recipe_and_derivation_bytes(inventory_db):
+    document, catalog_generation = _legacy_typed_recipe()
+    (recipe,) = decode_registry_source_recipes([document])
+    raw_recipe = json.dumps(document, sort_keys=True, separators=(",", ":"))
+    raw_digest = hashlib.sha256(("[" + raw_recipe + "]").encode()).hexdigest()
+    contribution, derivation = _metadata(recipe)
+    contribution["recipe_sha256"] = raw_digest
+    derivation.update(
+        recipe_sha256=raw_digest,
+        contribution_sha256=digest(contribution),
+        address_identity={"retired": "stored-only"},
+    )
+    entry = SourceInventoryEntry(
+        1,
+        raw_recipe,
+        json.dumps(contribution, sort_keys=True, separators=(",", ":")),
+        json.dumps(derivation, sort_keys=True, separators=(",", ":")),
+    )
+    summary = typed_contribution_summary(source_inventory_root((entry,)), (contribution,))
+    copy_target = await _new_target(inventory_db, (entry,), source_contributions=summary)
+    receipt = await _write(inventory_db, copy_target, (entry,))
+    async with inventory_db.coverage_reader.transaction(isolation="repeatable_read", readonly=True):
+        page = await store.read_source_inventory_page(
+            inventory_db.coverage_reader,
+            copy_target,
+            after_ordinal=0,
+            control_schema=inventory_db.fixture.control_schema,
+        )
+    assert page.entries == (entry,)
+    assert await _verify(inventory_db, copy_target, receipt) == receipt.root
+    assert receipt.root.recipes_sha256 == raw_digest
+    assert receipt.root.derivation_count == 1
+    assert recipe.source_pin.catalog_generation == catalog_generation
+    _, fresh_derivation = _metadata(recipe)
+    fresh_derivation["address_identity"] = derivation["address_identity"]
+    fresh_entry = make_source_inventory_entry(1, recipe, office_derivation=fresh_derivation)
+    assert "address_identity" not in json.loads(fresh_entry.office_derivation_json)
 
 
 @pytest.mark.asyncio
