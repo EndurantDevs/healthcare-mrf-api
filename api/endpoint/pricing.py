@@ -12509,41 +12509,26 @@ async def list_providers_by_prescription(request):
         filters.append(provider_prescription_table.c.total_claims >= min_claims)
     if min_total_cost is not None:
         filters.append(provider_prescription_table.c.total_drug_cost >= min_total_cost)
-    where_clause = and_(*filters)
 
-    grouped = (
+    provider_group_fields = ("npi", "provider_name", "provider_type", "city", "state", "zip5")
+    provider_group_columns = tuple(provider_prescription_table.c[field] for field in provider_group_fields)
+    grouped_subquery = (
         select(
-            provider_prescription_table.c.npi.label("npi"),
-            provider_prescription_table.c.provider_name.label("provider_name"),
-            provider_prescription_table.c.provider_type.label("provider_type"),
-            provider_prescription_table.c.city.label("city"),
-            provider_prescription_table.c.state.label("state"),
-            provider_prescription_table.c.zip5.label("zip5"),
+            *provider_group_columns,
             func.sum(provider_prescription_table.c.total_claims).label("total_claims"),
             func.sum(provider_prescription_table.c.total_drug_cost).label("total_drug_cost"),
             func.sum(provider_prescription_table.c.total_benes).label("total_benes"),
             func.count(func.distinct(provider_prescription_table.c.rx_code)).label("matched_prescription_codes"),
         )
-        .select_from(provider_prescription_table)
-        .where(where_clause)
-        .group_by(
-            provider_prescription_table.c.npi,
-            provider_prescription_table.c.provider_name,
-            provider_prescription_table.c.provider_type,
-            provider_prescription_table.c.city,
-            provider_prescription_table.c.state,
-            provider_prescription_table.c.zip5,
-        )
+        .where(and_(*filters))
+        .group_by(*provider_group_columns)
+        .subquery()
     )
-    grouped_subquery = grouped.subquery()
-    count_result = await session.execute(select(func.count()).select_from(grouped_subquery))
-    total = int(count_result.scalar() or 0)
 
     order = _normalize_order(args.get("order"))
     order_by = str(args.get("order_by") or "total_drug_cost")
-    query = select(grouped_subquery)
     query = _apply_ordering(
-        query,
+        select(grouped_subquery, func.count().over().label("_pagination_total")),
         order_by,
         order,
         {
@@ -12555,11 +12540,16 @@ async def list_providers_by_prescription(request):
             "matched_prescription_codes": grouped_subquery.c.matched_prescription_codes,
         },
     )
-    query = query.limit(pagination.limit).offset(pagination.offset)
-    query_result = await session.execute(query)
-    provider_items = [
-        _normalize_prescription_provider_aggregate(_row_to_dict(provider_record)) for provider_record in query_result
-    ]
+    query = query.order_by(*(grouped_subquery.c[field].asc() for field in provider_group_fields if field != order_by))
+    page_result = await session.execute(query.limit(pagination.limit).offset(pagination.offset))
+    provider_rows = [_row_to_dict(provider_row) for provider_row in page_result]
+    total = int(provider_rows[0]["_pagination_total"]) if provider_rows else 0
+    if not provider_rows and pagination.offset:
+        count_result = await session.execute(select(func.count()).select_from(grouped_subquery))
+        total = int(count_result.scalar() or 0)
+    for provider_row in provider_rows:
+        provider_row.pop("_pagination_total")
+    provider_items = [_normalize_prescription_provider_aggregate(provider_row) for provider_row in provider_rows]
 
     query_by_field: dict[str, Any] = {
         "q": query_text or None,

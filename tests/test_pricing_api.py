@@ -7526,7 +7526,6 @@ async def test_list_providers_by_prescription_with_q():
         [
             FakeResult(scalar="mrf.pricing_provider_prescription"),
             FakeResult(scalar=None),
-            FakeResult(scalar=1),
             FakeResult(
                 rows=[
                     {
@@ -7540,6 +7539,7 @@ async def test_list_providers_by_prescription_with_q():
                         "total_drug_cost": 3400.0,
                         "total_benes": 55.0,
                         "matched_prescription_codes": 3,
+                        "_pagination_total": 1,
                     }
                 ]
             ),
@@ -7552,6 +7552,7 @@ async def test_list_providers_by_prescription_with_q():
     assert pricing_response["pagination"]["total"] == 1
     assert pricing_response["items"][0]["npi"] == 1003000126
     assert pricing_response["items"][0]["total_prescriptions"] == 60.0
+    assert "_pagination_total" not in pricing_response["items"][0]
     assert pricing_response["query"]["q"] == "atorvastatin"
 
 
@@ -8014,12 +8015,15 @@ async def test_prescription_search_unavailable_contract(year):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("minimum", ("0", "5"))
 async def test_prescription_search_filters_before_pagination(minimum):
+    """Apply provider filters before grouping and return the full filtered count."""
+    provider_rows = [
+        {"npi": 1000000001, "total_claims": 12, "total_drug_cost": 120, "total_benes": 9, "_pagination_total": 7}
+    ]
     request = make_request(
         [
             FakeResult(scalar="mrf.pricing_provider_prescription"),
             FakeResult(scalar=None),
-            FakeResult(scalar=7),
-            FakeResult(rows=[{"npi": 1000000001, "total_claims": 12, "total_drug_cost": 120, "total_benes": 9}]),
+            FakeResult(rows=provider_rows),
         ],
         args={
             "year": "2025",
@@ -8051,24 +8055,39 @@ async def test_prescription_search_filters_before_pagination(minimum):
     }
     assert response_by_field["query"]["min_claims"] == float(minimum)
     assert response_by_field["query"]["min_total_cost"] == float(minimum)
-    statements = [
-        str(execution_args[0].compile(compile_kwargs={"literal_binds": True}))
-        for execution_args, _execution_kwargs in request.ctx.sa_session.executions[-2:]
-    ]
-    for statement in statements:
-        for predicate in (
-            "upper(mrf.pricing_provider_prescription.state) = 'NY'",
-            "lower(mrf.pricing_provider_prescription.city) LIKE '%example city%'",
-            "mrf.pricing_provider_prescription.zip5 = '10001'",
-            "lower(mrf.pricing_provider_prescription.provider_type) LIKE '%cardiology%'",
-            "mrf.pricing_provider_prescription.rx_code IN ('RX-DEMO')",
-            f"mrf.pricing_provider_prescription.total_claims >= {float(minimum)}",
-            f"mrf.pricing_provider_prescription.total_drug_cost >= {float(minimum)}",
-        ):
-            assert statement.index(predicate) < statement.index("GROUP BY"), statement
-    assert "LIMIT" not in statements[0] and "OFFSET" not in statements[0]
-    assert "ORDER BY anon_1.npi ASC" in statements[1]
-    assert "LIMIT 2 OFFSET 6" in statements[1]
+    statement = str(request.ctx.sa_session.executions[-1][0][0].compile(compile_kwargs={"literal_binds": True}))
+    for predicate in (
+        "upper(mrf.pricing_provider_prescription.state) = 'NY'",
+        "lower(mrf.pricing_provider_prescription.city) LIKE '%example city%'",
+        "mrf.pricing_provider_prescription.zip5 = '10001'",
+        "lower(mrf.pricing_provider_prescription.provider_type) LIKE '%cardiology%'",
+        "mrf.pricing_provider_prescription.rx_code IN ('RX-DEMO')",
+        f"mrf.pricing_provider_prescription.total_claims >= {float(minimum)}",
+        f"mrf.pricing_provider_prescription.total_drug_cost >= {float(minimum)}",
+    ):
+        assert statement.index(predicate) < statement.index("GROUP BY"), statement
+    assert "count(*) OVER () AS _pagination_total" in statement
+    assert "ORDER BY anon_1.npi ASC, anon_1.provider_name ASC" in statement
+    assert "LIMIT 2 OFFSET 6" in statement
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("offset", "expected_total"), [(0, 0), (20, 7)])
+async def test_empty_prescription_provider_page_preserves_exact_total(offset, expected_total):
+    query_results = [FakeResult(scalar="mrf.pricing_provider_prescription"), FakeResult(rows=[])]
+    if offset:
+        query_results.append(FakeResult(scalar=expected_total))
+    request = make_request(query_results, args={"code": "RX-DEMO", "year": "2023", "offset": str(offset)})
+
+    reply = json.loads((await list_providers_by_prescription(request)).body)
+
+    assert reply["items"] == []
+    assert reply["pagination"]["total"] == expected_total
+    statements = [str(arguments[0]) for arguments, _ in request.ctx.sa_session.executions]
+    assert len(statements) == len(query_results)
+    if offset:
+        assert statements[-1].startswith("SELECT count(*)")
+        assert "GROUP BY" in statements[-1] and "LIMIT" not in statements[-1]
 
 
 @pytest.mark.asyncio
@@ -8109,7 +8128,9 @@ async def test_claims_search_resolves_terminology_codes(
     query_results = [FakeResult(scalar="mrf.terminology_synonym"), FakeResult(rows=terminology_records)]
     if domain == "medication":
         query_results.insert(0, FakeResult(scalar="mrf.pricing_provider_prescription"))
-    query_results.extend([FakeResult(scalar=1), FakeResult(rows=[{"npi": 1000000001}])])
+        query_results.append(FakeResult(rows=[{"npi": 1000000001, "_pagination_total": 1}]))
+    else:
+        query_results.extend([FakeResult(scalar=1), FakeResult(rows=[{"npi": 1000000001}])])
     request = make_request(query_results, args={"q": "Synthetic match", "year": "2025"})
 
     response = await getattr(pricing_module, handler_name)(request)
@@ -8122,7 +8143,8 @@ async def test_claims_search_resolves_terminology_codes(
     assert resolution_by_field["matches"][1]["metadata"] == {"raw": "invalid-json"}
     assert response_by_field["pagination"]["total"] == 1
     assert response_by_field["items"][0]["npi"] == 1000000001
-    for execution_args, _execution_kwargs in request.ctx.sa_session.executions[-2:]:
+    execution_count = 1 if domain == "medication" else 2
+    for execution_args, _execution_kwargs in request.ctx.sa_session.executions[-execution_count:]:
         statement = str(execution_args[0].compile(compile_kwargs={"literal_binds": True}))
         expected_code = code if domain == "procedure" else f"'{code}'"
         assert f".{column} IN ({expected_code})" in statement
