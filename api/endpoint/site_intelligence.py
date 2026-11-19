@@ -7,16 +7,25 @@ import math
 import os
 import time
 from collections import defaultdict
+from decimal import Decimal
 
 from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage
-from sqlalchemy import and_, func, select, text
+from sqlalchemy import Numeric, and_, func, literal, select, text, true
 
-from db.models import (DoctorClinicianAddress, EntityAddressUnified,
-                       FacilityAnchor, GeoZipLookup, LODESWorkplaceAggregate,
-                       MedicareEnrollmentStats, NPIAddress, NPIDataTaxonomy,
-                       PartDPharmacyActivity, PharmacyEconomicsSummary,
-                       PricingPlacesZcta)
+from db.models import (
+    DoctorClinicianAddress,
+    EntityAddressUnified,
+    FacilityAnchor,
+    GeoZipLookup,
+    LODESWorkplaceAggregate,
+    MedicareEnrollmentStats,
+    NPIAddress,
+    NPIDataTaxonomy,
+    PartDPharmacyActivity,
+    PharmacyEconomicsSummary,
+    PricingPlacesZcta,
+)
 
 blueprint = Blueprint("site_intelligence", url_prefix="/site-intelligence", version=1)
 logger = logging.getLogger(__name__)
@@ -85,9 +94,7 @@ async def _is_table_cached(session, model) -> bool:
 async def _is_zcta_overlap_available(session) -> bool:
     now = time.monotonic()
     availability_cache_entry = _TABLE_EXISTS_CACHE.get(_ZCTA_OVERLAP_CACHE_KEY)
-    if availability_cache_entry and (
-        now - availability_cache_entry[0]
-    ) < TABLE_EXISTS_CACHE_TTL_SECONDS:
+    if availability_cache_entry and (now - availability_cache_entry[0]) < TABLE_EXISTS_CACHE_TTL_SECONDS:
         return availability_cache_entry[1]
     # Test/session doubles don't support this optional path; keep deterministic behavior.
     if not hasattr(session, "get_bind"):
@@ -186,9 +193,7 @@ async def _radius_zip_weights(
         return {}, "zip_centroid"
 
     weights_by_zip = _zip_overlap_weights(zip_overlap_rows)
-    return weights_by_zip, (
-        "zcta_polygon_overlap" if weights_by_zip else "zip_centroid"
-    )
+    return weights_by_zip, ("zcta_polygon_overlap" if weights_by_zip else "zip_centroid")
 
 
 def _zip_overlap_weights(zip_overlap_rows) -> dict[str, float]:
@@ -202,29 +207,20 @@ def _zip_overlap_weights(zip_overlap_rows) -> dict[str, float]:
         zip_code = zip_code[:5]
         if len(zip_code) != 5:
             continue
-        weights_by_zip[zip_code] = max(
-            weights_by_zip.get(zip_code, 0.0), min(weight, 1.0)
-        )
+        weights_by_zip[zip_code] = max(weights_by_zip.get(zip_code, 0.0), min(weight, 1.0))
     return weights_by_zip
 
 
 def _haversine_miles(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     dlat = math.radians(lat2 - lat1)
     dlng = math.radians(lng2 - lng1)
-    a = (
-        math.sin(dlat / 2) ** 2
-        + math.cos(math.radians(lat1))
-        * math.cos(math.radians(lat2))
-        * math.sin(dlng / 2) ** 2
-    )
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlng / 2) ** 2
     return EARTH_RADIUS_MILES * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def _drive_minutes_to_radius_miles(minutes: int) -> float:
     speed = float(os.getenv("HLTHPRT_SITE_INTEL_DRIVE_SPEED_MPH", str(DEFAULT_DRIVE_SPEED_MPH)))
-    circuity = float(
-        os.getenv("HLTHPRT_SITE_INTEL_DRIVE_CIRCUITY_FACTOR", str(DEFAULT_DRIVE_CIRCUITY_FACTOR))
-    )
+    circuity = float(os.getenv("HLTHPRT_SITE_INTEL_DRIVE_CIRCUITY_FACTOR", str(DEFAULT_DRIVE_CIRCUITY_FACTOR)))
     circuity = circuity if circuity > 0 else DEFAULT_DRIVE_CIRCUITY_FACTOR
     return (speed * (minutes / 60.0)) / circuity
 
@@ -234,7 +230,7 @@ def _safe_int(value, default: int = 0) -> int:
         return default
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 
@@ -243,14 +239,12 @@ def _safe_float(value, default: float | None = None) -> float | None:
         return default
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return default
 
 
 def _address_serving_source() -> str:
-    return str(
-        os.getenv("HLTHPRT_ADDRESS_SERVING_SOURCE") or ADDRESS_SERVING_SOURCE_UNIFIED
-    ).strip().lower()
+    return str(os.getenv("HLTHPRT_ADDRESS_SERVING_SOURCE") or ADDRESS_SERVING_SOURCE_UNIFIED).strip().lower()
 
 
 def _parse_radius_miles(value: str | None) -> float | None:
@@ -343,11 +337,7 @@ def _estimate_expected_volume(
     nearest_fqhc_miles: float | None,
 ) -> dict[str, int]:
     daily = (
-        seniors * 0.00028
-        + workers * 0.00003
-        + np_pa_count * 0.01
-        - active_pharmacy_count * 0.35
-        + avg_margin * 0.85
+        seniors * 0.00028 + workers * 0.00003 + np_pa_count * 0.01 - active_pharmacy_count * 0.35 + avg_margin * 0.85
     )
     if nearest_hospital_miles is not None and nearest_hospital_miles > 0:
         if nearest_hospital_miles <= 2:
@@ -391,16 +381,13 @@ async def _nearest_anchor(
     cos_lat = max(0.15, abs(math.cos(math.radians(lat))))
     lng_delta = search_miles / (ZIP_MILES_PER_DEGREE * cos_lat)
 
-    stmt = (
-        select(FacilityAnchor.name, FacilityAnchor.latitude, FacilityAnchor.longitude)
-        .where(
-            and_(
-                FacilityAnchor.facility_type == facility_type,
-                FacilityAnchor.latitude.isnot(None),
-                FacilityAnchor.longitude.isnot(None),
-                FacilityAnchor.latitude.between(lat - lat_delta, lat + lat_delta),
-                FacilityAnchor.longitude.between(lng - lng_delta, lng + lng_delta),
-            )
+    stmt = select(FacilityAnchor.name, FacilityAnchor.latitude, FacilityAnchor.longitude).where(
+        and_(
+            FacilityAnchor.facility_type == facility_type,
+            FacilityAnchor.latitude.isnot(None),
+            FacilityAnchor.longitude.isnot(None),
+            FacilityAnchor.latitude.between(lat - lat_delta, lat + lat_delta),
+            FacilityAnchor.longitude.between(lng - lng_delta, lng + lng_delta),
         )
     )
     anchor_rows = (await session.execute(stmt)).all()
@@ -440,16 +427,13 @@ async def _anchors_within_radius(
     cos_lat = max(0.15, abs(math.cos(math.radians(lat))))
     lng_delta = search_miles / (ZIP_MILES_PER_DEGREE * cos_lat)
 
-    stmt = (
-        select(FacilityAnchor.name, FacilityAnchor.latitude, FacilityAnchor.longitude)
-        .where(
-            and_(
-                FacilityAnchor.facility_type == facility_type,
-                FacilityAnchor.latitude.isnot(None),
-                FacilityAnchor.longitude.isnot(None),
-                FacilityAnchor.latitude.between(lat - lat_delta, lat + lat_delta),
-                FacilityAnchor.longitude.between(lng - lng_delta, lng + lng_delta),
-            )
+    stmt = select(FacilityAnchor.name, FacilityAnchor.latitude, FacilityAnchor.longitude).where(
+        and_(
+            FacilityAnchor.facility_type == facility_type,
+            FacilityAnchor.latitude.isnot(None),
+            FacilityAnchor.longitude.isnot(None),
+            FacilityAnchor.latitude.between(lat - lat_delta, lat + lat_delta),
+            FacilityAnchor.longitude.between(lng - lng_delta, lng + lng_delta),
         )
     )
     anchor_rows = (await session.execute(stmt)).all()
@@ -491,21 +475,18 @@ async def _load_anchor_candidates(
     cos_lat = max(0.15, abs(math.cos(math.radians(lat))))
     lng_delta = search_miles / (ZIP_MILES_PER_DEGREE * cos_lat)
 
-    stmt = (
-        select(
-            FacilityAnchor.facility_type,
-            FacilityAnchor.name,
-            FacilityAnchor.latitude,
-            FacilityAnchor.longitude,
-        )
-        .where(
-            and_(
-                FacilityAnchor.facility_type.in_(("Hospital", "FQHC")),
-                FacilityAnchor.latitude.isnot(None),
-                FacilityAnchor.longitude.isnot(None),
-                FacilityAnchor.latitude.between(lat - lat_delta, lat + lat_delta),
-                FacilityAnchor.longitude.between(lng - lng_delta, lng + lng_delta),
-            )
+    stmt = select(
+        FacilityAnchor.facility_type,
+        FacilityAnchor.name,
+        FacilityAnchor.latitude,
+        FacilityAnchor.longitude,
+    ).where(
+        and_(
+            FacilityAnchor.facility_type.in_(("Hospital", "FQHC")),
+            FacilityAnchor.latitude.isnot(None),
+            FacilityAnchor.longitude.isnot(None),
+            FacilityAnchor.latitude.between(lat - lat_delta, lat + lat_delta),
+            FacilityAnchor.longitude.between(lng - lng_delta, lng + lng_delta),
         )
     )
     anchor_rows = (await session.execute(stmt)).all()
@@ -536,27 +517,31 @@ def _pharmacy_geo_stmt(
     lng_delta: float,
 ):
     address_model = EntityAddressUnified if use_unified_addresses else NPIAddress
-    address_filters = [
-        address_model.type == "primary",
+    # Keep the partial bbox index predicates visible in generic prepared plans.
+    primary = literal("primary", literal_execute=True) if use_unified_addresses else "primary"
+    coordinate_bounds = (lat - lat_delta, lat + lat_delta, lng - lng_delta, lng + lng_delta)
+    if use_unified_addresses:
+        # Numeric bounds keep the stored coordinates indexable with asyncpg.
+        coordinate_bounds = tuple(literal(Decimal(str(bound)), type_=Numeric()) for bound in coordinate_bounds)
+    lat_min, lat_max, lng_min, lng_max = coordinate_bounds
+    addresses = select(address_model.npi, address_model.lat, address_model.long).where(
+        address_model.type == primary,
         address_model.npi.isnot(None),
         address_model.lat.isnot(None),
         address_model.long.isnot(None),
-        address_model.lat.between(lat - lat_delta, lat + lat_delta),
-        address_model.long.between(lng - lng_delta, lng + lng_delta),
-    ]
-    if use_unified_addresses:
-        address_filters.append(
-            func.coalesce(EntityAddressUnified.address_precision, "") != "city_zip"
-        )
-    return (
-        select(address_model.npi, address_model.lat, address_model.long)
-        .join(NPIDataTaxonomy, NPIDataTaxonomy.npi == address_model.npi)
-        .where(
-            and_(
-                *address_filters,
-                NPIDataTaxonomy.healthcare_provider_taxonomy_code.like("3336%"),
-            )
-        )
+        address_model.lat.between(lat_min, lat_max),
+        address_model.long.between(lng_min, lng_max),
+    )
+    is_same_npi = NPIDataTaxonomy.npi == address_model.npi
+    pharmacy_code = NPIDataTaxonomy.healthcare_provider_taxonomy_code.like("3336%")
+    if not use_unified_addresses:
+        return addresses.join(NPIDataTaxonomy, is_same_npi).where(pharmacy_code)
+
+    # Check taxonomy only for nearby addresses. Score already deduplicates by NPI.
+    pharmacy = select(NPIDataTaxonomy.npi).where(is_same_npi, pharmacy_code).limit(1).lateral()
+    return addresses.join(pharmacy, true()).where(
+        func.coalesce(EntityAddressUnified.address_precision, literal("", literal_execute=True))
+        != literal("city_zip", literal_execute=True)
     )
 
 
@@ -581,9 +566,7 @@ async def get_site_score(request):
     if not -180.0 <= lng <= 180.0:
         raise InvalidUsage("lng must be between -180 and 180")
     pharmacy_radius_miles = _parse_radius_miles(request.args.get("radius_miles"))
-    target_scripts_per_day = _parse_target_scripts_per_day(
-        request.args.get("target_scripts_per_day")
-    )
+    target_scripts_per_day = _parse_target_scripts_per_day(request.args.get("target_scripts_per_day"))
 
     session = _get_session(request)
     table_availability_by_name = {
@@ -679,20 +662,15 @@ async def get_site_score(request):
     cos_lat = max(0.15, abs(math.cos(math.radians(lat))))
     lng_delta = max_radius / (ZIP_MILES_PER_DEGREE * cos_lat)
 
-    zip_stmt = (
-        select(GeoZipLookup.zip_code, GeoZipLookup.state, GeoZipLookup.latitude, GeoZipLookup.longitude)
-        .where(
-            and_(
-                GeoZipLookup.latitude.between(lat - lat_delta, lat + lat_delta),
-                GeoZipLookup.longitude.between(lng - lng_delta, lng + lng_delta),
-            )
+    zip_stmt = select(GeoZipLookup.zip_code, GeoZipLookup.state, GeoZipLookup.latitude, GeoZipLookup.longitude).where(
+        and_(
+            GeoZipLookup.latitude.between(lat - lat_delta, lat + lat_delta),
+            GeoZipLookup.longitude.between(lng - lng_delta, lng + lng_delta),
         )
     )
     zip_rows = (await session.execute(zip_stmt)).all()
 
-    zip_codes_by_minutes: dict[int, set[str]] = {
-        minutes: set() for minutes in TRADE_AREA_MINUTES
-    }
+    zip_codes_by_minutes: dict[int, set[str]] = {minutes: set() for minutes in TRADE_AREA_MINUTES}
     nearest_state = None
     nearest_zip_distance = None
     zip_distance_map: dict[str, float] = {}
@@ -801,12 +779,8 @@ async def get_site_score(request):
         if not current or year > current["year"]:
             medicare_by_zip[zip_code] = {
                 "year": year,
-                "total_beneficiaries": _safe_int(
-                    medicare_row.total_beneficiaries
-                ),
-                "part_d_beneficiaries": _safe_int(
-                    medicare_row.part_d_beneficiaries
-                ),
+                "total_beneficiaries": _safe_int(medicare_row.total_beneficiaries),
+                "part_d_beneficiaries": _safe_int(medicare_row.part_d_beneficiaries),
             }
 
     lodes_rows = []
@@ -817,9 +791,7 @@ async def get_site_score(request):
                     LODESWorkplaceAggregate.zcta_code,
                     LODESWorkplaceAggregate.year,
                     LODESWorkplaceAggregate.total_workers,
-                ).where(
-                    LODESWorkplaceAggregate.zcta_code.in_(all_zip_codes)
-                )
+                ).where(LODESWorkplaceAggregate.zcta_code.in_(all_zip_codes))
             )
         ).all()
     workers_by_zip: dict[str, dict] = {}
@@ -869,9 +841,7 @@ async def get_site_score(request):
         if not current or year > current[0]:
             latest_places_by_key[key] = (year, chronic_rate)
         if measure_key not in chronic_measure_name_by_key:
-            chronic_measure_name_by_key[measure_key] = str(
-                place_row.measure_name or measure_key
-            )
+            chronic_measure_name_by_key[measure_key] = str(place_row.measure_name or measure_key)
     chronic_by_zip: dict[str, list[float]] = defaultdict(list)
     for (zip_code, _), (_year, chronic_rate) in latest_places_by_key.items():
         chronic_by_zip[zip_code].append(chronic_rate)
@@ -930,8 +900,7 @@ async def get_site_score(request):
 
     pharmacy_rows = []
     use_unified_addresses = (
-        _address_serving_source() == ADDRESS_SERVING_SOURCE_UNIFIED
-        and table_availability_by_name["entity_address"]
+        _address_serving_source() == ADDRESS_SERVING_SOURCE_UNIFIED and table_availability_by_name["entity_address"]
     )
     if table_availability_by_name["npi_taxonomy"] and (
         use_unified_addresses or table_availability_by_name["npi_address"]
@@ -971,9 +940,7 @@ async def get_site_score(request):
     # Fallback to centroid inclusion when polygon overlap is unavailable.
     if not zip_weight_by_code:
         zip_weight_by_code = {
-            zip_code: 1.0
-            for zip_code, distance in zip_distance_map.items()
-            if distance <= pharmacy_radius_value
+            zip_code: 1.0 for zip_code, distance in zip_distance_map.items() if distance <= pharmacy_radius_value
         }
         if not zip_weight_by_code and zip_distance_map:
             nearest_zip = min(zip_distance_map.items(), key=lambda item: item[1])[0]
@@ -984,8 +951,7 @@ async def get_site_score(request):
     seniors_radius = int(
         round(
             sum(
-                medicare_by_zip.get(zip_code, {}).get("total_beneficiaries", 0)
-                * zip_weight_by_code.get(zip_code, 0.0)
+                medicare_by_zip.get(zip_code, {}).get("total_beneficiaries", 0) * zip_weight_by_code.get(zip_code, 0.0)
                 for zip_code in radius_zip_codes
             )
         )
@@ -993,8 +959,7 @@ async def get_site_score(request):
     workers_radius = int(
         round(
             sum(
-                workers_by_zip.get(zip_code, {}).get("total_workers", 0)
-                * zip_weight_by_code.get(zip_code, 0.0)
+                workers_by_zip.get(zip_code, {}).get("total_workers", 0) * zip_weight_by_code.get(zip_code, 0.0)
                 for zip_code in radius_zip_codes
             )
         )
@@ -1012,13 +977,9 @@ async def get_site_score(request):
         zip_avg = sum(chronic_rates) / len(chronic_rates)
         chronic_weighted_sum += zip_avg * weight
         chronic_weighted_den += weight
-    chronic_avg_radius = (
-        (chronic_weighted_sum / chronic_weighted_den) if chronic_weighted_den > 0 else None
-    )
+    chronic_avg_radius = (chronic_weighted_sum / chronic_weighted_den) if chronic_weighted_den > 0 else None
 
-    chronic_measure_values_radius: dict[str, tuple[float, float, int]] = defaultdict(
-        lambda: (0.0, 0.0, 0)
-    )
+    chronic_measure_values_radius: dict[str, tuple[float, float, int]] = defaultdict(lambda: (0.0, 0.0, 0))
     for (zip_code, measure_key), (_year, chronic_rate) in latest_places_by_key.items():
         weight = zip_weight_by_code.get(zip_code, 0.0)
         if weight <= 0:
@@ -1046,8 +1007,7 @@ async def get_site_score(request):
     provider_count_radius = int(
         round(
             sum(
-                len(all_providers_by_zip.get(zip_code, set()))
-                * zip_weight_by_code.get(zip_code, 0.0)
+                len(all_providers_by_zip.get(zip_code, set())) * zip_weight_by_code.get(zip_code, 0.0)
                 for zip_code in radius_zip_codes
             )
         )
@@ -1055,8 +1015,7 @@ async def get_site_score(request):
     np_pa_count_radius = int(
         round(
             sum(
-                len(np_pa_by_zip.get(zip_code, set()))
-                * zip_weight_by_code.get(zip_code, 0.0)
+                len(np_pa_by_zip.get(zip_code, set())) * zip_weight_by_code.get(zip_code, 0.0)
                 for zip_code in radius_zip_codes
             )
         )
@@ -1069,8 +1028,7 @@ async def get_site_score(request):
         pharmacy_count_radius = int(
             round(
                 sum(
-                    len(partd_pharmacies_by_zip.get(zip_code, set()))
-                    * zip_weight_by_code.get(zip_code, 0.0)
+                    len(partd_pharmacies_by_zip.get(zip_code, set())) * zip_weight_by_code.get(zip_code, 0.0)
                     for zip_code in radius_zip_codes
                 )
             )
@@ -1078,8 +1036,7 @@ async def get_site_score(request):
     active_pharmacy_count_radius = int(
         round(
             sum(
-                len(active_pharmacies_by_zip.get(zip_code, set()))
-                * zip_weight_by_code.get(zip_code, 0.0)
+                len(active_pharmacies_by_zip.get(zip_code, set())) * zip_weight_by_code.get(zip_code, 0.0)
                 for zip_code in radius_zip_codes
             )
         )
@@ -1096,9 +1053,7 @@ async def get_site_score(request):
     def _nearest_from_candidates(items: list[dict]) -> dict | None:
         if not items:
             return None
-        nearest_anchor_by_field = min(
-            items, key=lambda item: float(item.get("miles", 999999))
-        )
+        nearest_anchor_by_field = min(items, key=lambda item: float(item.get("miles", 999999)))
         return {
             "name": str(nearest_anchor_by_field.get("name") or ""),
             "lat": nearest_anchor_by_field.get("lat"),
@@ -1122,12 +1077,8 @@ async def get_site_score(request):
 
     nearest_hospital = _nearest_from_candidates(anchor_candidates.get("Hospital", []))
     nearest_fqhc = _nearest_from_candidates(anchor_candidates.get("FQHC", []))
-    hospitals_3mi = _within_radius_from_candidates(
-        anchor_candidates.get("Hospital", []), ANCHOR_COUNT_RADIUS_MILES
-    )
-    fqhcs_3mi = _within_radius_from_candidates(
-        anchor_candidates.get("FQHC", []), ANCHOR_COUNT_RADIUS_MILES
-    )
+    hospitals_3mi = _within_radius_from_candidates(anchor_candidates.get("Hospital", []), ANCHOR_COUNT_RADIUS_MILES)
+    fqhcs_3mi = _within_radius_from_candidates(anchor_candidates.get("FQHC", []), ANCHOR_COUNT_RADIUS_MILES)
 
     economics_rows = []
     if nearest_state and table_availability_by_name["economics"]:
@@ -1158,61 +1109,26 @@ async def get_site_score(request):
             if volume > 0 and margin is not None:
                 weighted_margin_numerator += margin * volume
                 weighted_margin_denominator += volume
-    avg_margin = (
-        (weighted_margin_numerator / weighted_margin_denominator)
-        if weighted_margin_denominator > 0
-        else 0.0
-    )
+    avg_margin = (weighted_margin_numerator / weighted_margin_denominator) if weighted_margin_denominator > 0 else 0.0
 
     trade_area_by_minutes = {}
     for minutes in TRADE_AREA_MINUTES:
         zip_codes = sorted(zip_codes_by_minutes[minutes])
-        seniors = sum(
-            medicare_by_zip.get(zip_code, {}).get("total_beneficiaries", 0)
-            for zip_code in zip_codes
-        )
-        workers = sum(
-            workers_by_zip.get(zip_code, {}).get("total_workers", 0)
-            for zip_code in zip_codes
-        )
+        seniors = sum(medicare_by_zip.get(zip_code, {}).get("total_beneficiaries", 0) for zip_code in zip_codes)
+        workers = sum(workers_by_zip.get(zip_code, {}).get("total_workers", 0) for zip_code in zip_codes)
         provider_count = (
-            len(
-                set().union(
-                    *(all_providers_by_zip.get(zip_code, set()) for zip_code in zip_codes)
-                )
-            )
-            if zip_codes
-            else 0
+            len(set().union(*(all_providers_by_zip.get(zip_code, set()) for zip_code in zip_codes))) if zip_codes else 0
         )
         np_pa_count = (
-            len(
-                set().union(
-                    *(np_pa_by_zip.get(zip_code, set()) for zip_code in zip_codes)
-                )
-            )
-            if zip_codes
-            else 0
+            len(set().union(*(np_pa_by_zip.get(zip_code, set()) for zip_code in zip_codes))) if zip_codes else 0
         )
         active_pharmacy_count = (
-            len(
-                set().union(
-                    *(
-                        active_pharmacies_by_zip.get(zip_code, set())
-                        for zip_code in zip_codes
-                    )
-                )
-            )
+            len(set().union(*(active_pharmacies_by_zip.get(zip_code, set()) for zip_code in zip_codes)))
             if zip_codes
             else 0
         )
-        chronic_rates = [
-            chronic_rate
-            for zip_code in zip_codes
-            for chronic_rate in chronic_by_zip.get(zip_code, [])
-        ]
-        chronic_avg = (
-            (sum(chronic_rates) / len(chronic_rates)) if chronic_rates else None
-        )
+        chronic_rates = [chronic_rate for zip_code in zip_codes for chronic_rate in chronic_by_zip.get(zip_code, [])]
+        chronic_avg = (sum(chronic_rates) / len(chronic_rates)) if chronic_rates else None
 
         trade_area_by_minutes[str(minutes)] = {
             "radius_miles": round(radius_by_minutes[minutes], 2),
@@ -1228,22 +1144,12 @@ async def get_site_score(request):
         }
 
     zips_15 = sorted(zip_codes_by_minutes[15])
-    seniors_15 = sum(
-        medicare_by_zip.get(zip_code, {}).get("total_beneficiaries", 0)
-        for zip_code in zips_15
-    )
-    workers_15 = sum(
-        workers_by_zip.get(zip_code, {}).get("total_workers", 0)
-        for zip_code in zips_15
-    )
-    provider_count_15 = (
-        len(set().union(*(all_providers_by_zip.get(z, set()) for z in zips_15))) if zips_15 else 0
-    )
+    seniors_15 = sum(medicare_by_zip.get(zip_code, {}).get("total_beneficiaries", 0) for zip_code in zips_15)
+    workers_15 = sum(workers_by_zip.get(zip_code, {}).get("total_workers", 0) for zip_code in zips_15)
+    provider_count_15 = len(set().union(*(all_providers_by_zip.get(z, set()) for z in zips_15))) if zips_15 else 0
     np_pa_count_15 = len(set().union(*(np_pa_by_zip.get(z, set()) for z in zips_15))) if zips_15 else 0
     if pharmacy_distance_map:
-        pharmacy_count_15 = sum(
-            1 for distance in pharmacy_distance_map.values() if distance <= radius_by_minutes[15]
-        )
+        pharmacy_count_15 = sum(1 for distance in pharmacy_distance_map.values() if distance <= radius_by_minutes[15])
     else:
         pharmacy_count_15 = (
             len(set().union(*(partd_pharmacies_by_zip.get(z, set()) for z in zips_15))) if zips_15 else 0
@@ -1251,16 +1157,8 @@ async def get_site_score(request):
     active_pharmacy_count_15 = (
         len(set().union(*(active_pharmacies_by_zip.get(z, set()) for z in zips_15))) if zips_15 else 0
     )
-    chronic_15_rates = [
-        chronic_rate
-        for zip_code in zips_15
-        for chronic_rate in chronic_by_zip.get(zip_code, [])
-    ]
-    chronic_avg_15 = (
-        (sum(chronic_15_rates) / len(chronic_15_rates))
-        if chronic_15_rates
-        else None
-    )
+    chronic_15_rates = [chronic_rate for zip_code in zips_15 for chronic_rate in chronic_by_zip.get(zip_code, [])]
+    chronic_avg_15 = (sum(chronic_15_rates) / len(chronic_15_rates)) if chronic_15_rates else None
     chronic_measure_values_15: dict[str, list[float]] = defaultdict(list)
     for (zip_code, measure_key), (_year, chronic_rate) in latest_places_by_key.items():
         if zip_code in zips_15:
@@ -1350,11 +1248,7 @@ async def get_site_score(request):
     )
     is_target_met = expected_volume["daily"] >= target_scripts_per_day
     target_gap = max(0, target_scripts_per_day - expected_volume["daily"])
-    target_ratio = (
-        round(expected_volume["daily"] / target_scripts_per_day, 4)
-        if target_scripts_per_day > 0
-        else 0.0
-    )
+    target_ratio = round(expected_volume["daily"] / target_scripts_per_day, 4) if target_scripts_per_day > 0 else 0.0
     base_decision, base_rationale = _base_recommendation_for_score(score)
     final_decision = base_decision
     is_target_adjusted = False
@@ -1403,9 +1297,7 @@ async def get_site_score(request):
     )
 
     base_score_band = _score_band(score)
-    effective_score_band = _effective_score_band(
-        final_decision, is_target_adjusted
-    )
+    effective_score_band = _effective_score_band(final_decision, is_target_adjusted)
 
     return response.json(
         {
@@ -1420,18 +1312,12 @@ async def get_site_score(request):
             "demand_metrics": {
                 "total_seniors": f"{seniors_radius:,}",
                 "daytime_workers": f"{workers_radius:,}",
-                "chronic_disease_rate": (
-                    f"{chronic_avg_radius:.2f}% avg"
-                    if chronic_avg_radius is not None
-                    else "N/A"
-                ),
+                "chronic_disease_rate": (f"{chronic_avg_radius:.2f}% avg" if chronic_avg_radius is not None else "N/A"),
                 "chronic_measure_breakdown": chronic_breakdown_radius,
                 "baseline_15_total_seniors": f"{seniors_15:,}",
                 "baseline_15_daytime_workers": f"{workers_15:,}",
                 "baseline_15_chronic_disease_rate": (
-                    f"{chronic_avg_15:.2f}% avg"
-                    if chronic_avg_15 is not None
-                    else "N/A"
+                    f"{chronic_avg_15:.2f}% avg" if chronic_avg_15 is not None else "N/A"
                 ),
                 "radius_miles": round(pharmacy_radius_value, 1),
             },
@@ -1448,9 +1334,7 @@ async def get_site_score(request):
                 "nearest_hospital_miles": (
                     f"{nearest_hospital_miles:.1f}" if nearest_hospital_miles is not None else "N/A"
                 ),
-                "nearest_fqhc_miles": (
-                    f"{nearest_fqhc_miles:.1f}" if nearest_fqhc_miles is not None else "N/A"
-                ),
+                "nearest_fqhc_miles": (f"{nearest_fqhc_miles:.1f}" if nearest_fqhc_miles is not None else "N/A"),
                 "nearest_hospital": (
                     {
                         "name": nearest_hospital.get("name"),
@@ -1520,9 +1404,7 @@ async def get_site_score(request):
             "trade_areas": trade_area_by_minutes,
             "methodology": {
                 "trade_area_minutes": list(TRADE_AREA_MINUTES),
-                "drive_speed_mph": float(
-                    os.getenv("HLTHPRT_SITE_INTEL_DRIVE_SPEED_MPH", str(DEFAULT_DRIVE_SPEED_MPH))
-                ),
+                "drive_speed_mph": float(os.getenv("HLTHPRT_SITE_INTEL_DRIVE_SPEED_MPH", str(DEFAULT_DRIVE_SPEED_MPH))),
                 "drive_circuity_factor": float(
                     os.getenv(
                         "HLTHPRT_SITE_INTEL_DRIVE_CIRCUITY_FACTOR",
