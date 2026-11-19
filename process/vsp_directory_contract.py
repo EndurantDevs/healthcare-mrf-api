@@ -88,13 +88,17 @@ def validate_census_memberships(opening, refreshed, closing, observed, *, scoped
         require(type(count) is int and type(added) is int and 0 <= added <= count, OFFICE_CENSUS_UNRESOLVED)
         if count in counts:
             continue
-        if name in exhausted_networks and 0 < count < min(counts) and max(counts) - count <= CENSUS_OFFICE_DRIFT_LIMIT:
-            shortfalls_by_network[name] = min(counts) - count
+        baseline = count - added
+        is_within_overage_limit = count - min(counts) <= CENSUS_OFFICE_DRIFT_LIMIT
+        if added > 0 and baseline in counts and is_within_overage_limit:
             continue
         require(
-            added > 0 and count - added in counts and count - min(counts) <= CENSUS_OFFICE_DRIFT_LIMIT,
+            name in exhausted_networks
+            and 0 < baseline < max(counts) <= baseline + CENSUS_OFFICE_DRIFT_LIMIT
+            and is_within_overage_limit,
             OFFICE_CENSUS_UNRESOLVED,
         )
+        shortfalls_by_network[name] = min(total - baseline for total in counts if total > baseline)
     return shortfalls_by_network
 
 
