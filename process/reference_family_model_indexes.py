@@ -25,6 +25,14 @@ if TYPE_CHECKING:
     from process.reference_family_archive import ReferenceFamilySpec
 
 
+def uses_catalog_read_index_name(table_name: str, index_name: str) -> bool:
+    """Keep the shared reader index names when a publisher prepares a full catalog."""
+    return (table_name, index_name) in (
+        ("code_catalog", "code_catalog_type_page_idx"),
+        ("code_relationship", "code_relationship_public_type_idx"),
+    )
+
+
 def _additional_index_sql(
     schema_name: str,
     model_type: type,
@@ -55,10 +63,11 @@ def _additional_index_sql(
     suffix = index_spec.get("name", "_".join(elements))
     if not isinstance(suffix, str) or native._IDENTIFIER.fullmatch(suffix) is None:
         raise native.ReferenceFamilyArchiveError("reference family model index is invalid")
-    index_name = native._index_name_for_table(
-        model_type.__tablename__,
-        f"{index_schema_name or schema_name}_{model_type.__tablename__}_idx_{suffix}",
-    )
+    index_name = suffix
+    if not uses_catalog_read_index_name(table_name or model_type.__tablename__, suffix):
+        index_name = native._index_name_for_table(
+            model_type.__tablename__, f"{index_schema_name or schema_name}_{model_type.__tablename__}_idx_{suffix}"
+        )
     method = index_spec.get("using")
     if method is not None and method not in {"btree", "gin", "gist", "hash", "brin", "spgist"}:
         raise native.ReferenceFamilyArchiveError("reference family model index method is invalid")
@@ -232,6 +241,7 @@ def _reviewed_index_where(where_clause):
         "geography_scope = 'zip5'",
         "type='practice'",
         "type='practice' AND phone_number IS NOT NULL AND phone_number <> ''",
+        "upper(from_system) <> 'SNOMEDCT_US' AND upper(to_system) <> 'SNOMEDCT_US'",
     }:
         raise native.ReferenceFamilyArchiveError("reference family model index predicate is unsupported")
     return "" if where_clause is None else f" WHERE {where_clause}"

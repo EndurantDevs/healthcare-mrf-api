@@ -216,7 +216,7 @@ def normalized_canonical_catalog(columns, constraints, indexes):
     }
 
 
-async def canonical_schema_identity(session, relation_oid, schema):
+async def canonical_schema_identity(session, relation_oid, schema, *, omit_index=None):
     """Authenticate full native types/constraints/index shape with physical-order equivalence."""
     from process.entity_address_native_publication import _catalog_search_path
 
@@ -226,7 +226,10 @@ async def canonical_schema_identity(session, relation_oid, schema):
         constraints = await catalog_identity._catalog_constraints(session, relation_oid, schema)
         indexes = await catalog_identity._catalog_indexes(session, relation_oid)
     catalog_identity._reject_schema_qualified_expressions(schema, columns, constraints, indexes)
-    return catalog_identity._canonical_digest(normalized_canonical_catalog(columns, constraints, indexes))
+    catalog = normalized_canonical_catalog(columns, constraints, indexes)
+    if omit_index is not None:
+        catalog["indexes"] = [index for index in catalog["indexes"] if not omit_index(index)]
+    return catalog_identity._canonical_digest(catalog)
 
 
 async def require_canonical_source_model(session, schema, qualified):

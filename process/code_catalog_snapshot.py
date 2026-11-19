@@ -212,6 +212,8 @@ async def _is_matching_model_schema(
             elements = index_definition.get("index_elements")
             if not elements:
                 raise CodeCatalogSnapshotError("code-catalog model index contract is invalid")
+            if index_definition.get("name") == "code_catalog_type_page_idx":
+                continue  # Restored catalogs may predate an optional performance index.
             index_name = f"ccmi_{ordinal}_{uuid4().hex}"
             await session.execute(
                 text(f"CREATE INDEX {_quoted(index_name)} ON pg_temp.{_quoted(baseline_table)} ({', '.join(elements)})")

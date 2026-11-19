@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import Column, Identity, Index, Integer, MetaData, Table, Text, text
 from sqlalchemy.dialects.postgresql import dialect
 
+from db.models import CodeCatalog, CodeRelationship
 from process import reference_family_archive as archive
 
 
@@ -28,6 +29,21 @@ def test_native_witness_uses_each_family_model_index_compiler(importer):
         assert table.schema == "pg_temp"
         assert table.dialect_options["postgresql"]["on_commit"] == "DROP"
         assert all(column.identity is None and column.server_default is None for column in table.columns)
+
+
+@pytest.mark.parametrize(
+    ("model", "index_name"),
+    ((CodeCatalog, "code_catalog_type_page_idx"), (CodeRelationship, "code_relationship_public_type_idx")),
+)
+def test_catalog_read_index_uses_the_live_name_only_for_its_table(model, index_name):
+    index = next(definition for definition in model.__my_additional_indexes__ if definition["name"] == index_name)
+    canonical_sql = archive._additional_index_sql("candidate", model, index)
+    predecessor_sql = archive._additional_index_sql(
+        "candidate", model, index, table_name=f"{model.__tablename__}_predecessor"
+    )
+    assert canonical_sql.startswith(f'CREATE INDEX "{index_name}" ON "candidate"."{model.__tablename__}"')
+    assert not predecessor_sql.startswith(f'CREATE INDEX "{index_name}"')
+    assert f'ON "candidate"."{model.__tablename__}_predecessor"' in predecessor_sql
 
 
 def test_native_witness_keeps_initial_unique_include_and_exact_source_names():

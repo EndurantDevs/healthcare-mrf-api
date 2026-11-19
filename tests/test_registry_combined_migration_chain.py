@@ -34,6 +34,7 @@ def test_catalog_membership_and_inventory_extend_the_existing_target_head():
         "20261115120000_named_output_recovery_document",
         "20261116090000_profile_capacity_logical_names",
         "20261119090000_cms_npd_typed_release",
+        "20261119230000_clinical_code_catalog_page_index",
     )
     assert scripts.get_heads() == [chain[-1]]
     for predecessor, successor in zip(chain, chain[1:]):

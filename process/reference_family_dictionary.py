@@ -12,6 +12,35 @@ from sqlalchemy.dialects import postgresql
 from db import models
 
 _CLAIMS_DICTIONARY_SOURCE = "cms_physician_provider_service"
+_CODE_CATALOG_ARCHIVE_INDEXES = tuple(
+    index for index in models.CodeCatalog.__my_additional_indexes__ if index.get("name") != "code_catalog_type_page_idx"
+)
+
+
+def is_code_catalog_page_index(index):
+    """Keep the shared API page index outside the scoped dictionary archive format."""
+    return (
+        index["keys"] == ["code_type", "code_system", "code"]
+        and index["method"] == "btree"
+        and index["indnkeyatts"] == index["indnatts"] == 3
+        and index["indisvalid"]
+        and index["indimmediate"]
+        and not index["indisunique"]
+        and not index["indisprimary"]
+        and index["predicate"] is None
+        and index["expressions"] is None
+        and index["options"] == "0 0 0"
+        and all(
+            (
+                attribute["opclass_schema"],
+                attribute["opclass_name"],
+                attribute["collation_schema"],
+                attribute["collation_name"],
+            )
+            == ("pg_catalog", "text_ops", "pg_catalog", "default")
+            for attribute in index["key_attributes"]
+        )
+    )
 
 
 async def validate_claims_dictionary_closure(session, schema_name):
@@ -147,7 +176,7 @@ class ClaimsCodeCatalog:
     __tablename__ = "claims_code_catalog"
     __source_table__ = "code_catalog"
     __table__ = models.CodeCatalog.__table__.to_metadata(MetaData(), name=__tablename__)
-    __my_additional_indexes__ = models.CodeCatalog.__my_additional_indexes__
+    __my_additional_indexes__ = _CODE_CATALOG_ARCHIVE_INDEXES
 
 
 class ClaimsCodeCrosswalk:
@@ -168,7 +197,7 @@ class DrugClaimsCodeCatalog:
     __tablename__ = "drug_claims_code_catalog"
     __source_table__ = "code_catalog"
     __table__ = models.CodeCatalog.__table__.to_metadata(MetaData(), name=__tablename__)
-    __my_additional_indexes__ = models.CodeCatalog.__my_additional_indexes__
+    __my_additional_indexes__ = _CODE_CATALOG_ARCHIVE_INDEXES
 
 
 class DrugClaimsCodeCrosswalk:

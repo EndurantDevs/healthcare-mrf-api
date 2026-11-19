@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 import sanic.exceptions
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import asyncpg
 
 from api.endpoint import clinical
 
@@ -52,6 +54,17 @@ def _payload(http_response):
     return json.loads(http_response.body)
 
 
+def test_public_relationship_count_renders_only_the_fixed_exclusion(monkeypatch):
+    """Let generic plans use the partial index and retain binds for request filters."""
+    monkeypatch.setattr(clinical, "is_restricted_terminology_public_enabled", lambda: False)
+    table = clinical.relationship_table
+    restrictions = clinical._restricted_pair_filters(table.c.from_system, table.c.to_system)
+    statement = select(func.count()).select_from(table).where(*restrictions, table.c.relationship == "maps_to")
+    compiled = statement.compile(dialect=asyncpg.dialect(), compile_kwargs={"render_postcompile": True})
+    assert str(compiled).count("'SNOMEDCT_US'") == 2
+    assert list(compiled.params.values()) == ["maps_to"]
+
+
 def test_clinical_value_and_restriction_helpers(monkeypatch):
     request = SimpleNamespace(ctx=SimpleNamespace())
     with pytest.raises(RuntimeError, match="session not available"):
@@ -65,22 +78,28 @@ def test_clinical_value_and_restriction_helpers(monkeypatch):
 
     monkeypatch.setattr(clinical, "is_restricted_terminology_public_enabled", lambda: False)
     assert clinical._restricted_public_filter(clinical.code_table.c.code_system) is not None
-    assert len(
-        clinical._restricted_pair_filters(
-            clinical.crosswalk_table.c.from_system,
-            clinical.crosswalk_table.c.to_system,
+    assert (
+        len(
+            clinical._restricted_pair_filters(
+                clinical.crosswalk_table.c.from_system,
+                clinical.crosswalk_table.c.to_system,
+            )
         )
-    ) == 2
+        == 2
+    )
     with pytest.raises(sanic.exceptions.NotFound):
         clinical._raise_if_restricted_public("SNOMEDCT_US")
     clinical._raise_if_restricted_public("RXNORM")
 
     monkeypatch.setattr(clinical, "is_restricted_terminology_public_enabled", lambda: True)
     assert clinical._restricted_public_filter(clinical.code_table.c.code_system) is None
-    assert clinical._restricted_pair_filters(
-        clinical.crosswalk_table.c.from_system,
-        clinical.crosswalk_table.c.to_system,
-    ) == []
+    assert (
+        clinical._restricted_pair_filters(
+            clinical.crosswalk_table.c.from_system,
+            clinical.crosswalk_table.c.to_system,
+        )
+        == []
+    )
     clinical._raise_if_restricted_public("SNOMEDCT_US")
 
     mapped = SimpleNamespace(_mapping={"code": "A"})
@@ -91,9 +110,7 @@ def test_clinical_value_and_restriction_helpers(monkeypatch):
     assert clinical._json_safe(datetime.time(1, 2, 3)) == "01:02:03"
     assert clinical._json_safe(Decimal("1.25")) == 1.25
     assert clinical._json_safe("plain") == "plain"
-    assert clinical._json_safe_row({"when": datetime.date(2026, 7, 22)}) == {
-        "when": "2026-07-22"
-    }
+    assert clinical._json_safe_row({"when": datetime.date(2026, 7, 22)}) == {"when": "2026-07-22"}
 
 
 @pytest.mark.asyncio
@@ -135,12 +152,12 @@ async def test_list_codes_filters_and_clinical_area_delegation(monkeypatch):
     )
     assert delegated == "area-response"
     assert area_call_by_name == {
-            "clinical_area_id": "mesh:C14",
-            "mapping_kind": "condition",
-            "system": "RXNORM",
-            "query_text": "heart",
-            "require_area": False,
-        }
+        "clinical_area_id": "mesh:C14",
+        "mapping_kind": "condition",
+        "system": "RXNORM",
+        "query_text": "heart",
+        "require_area": False,
+    }
 
     session = _Session(
         _Result(scalar=2),
@@ -243,9 +260,7 @@ async def test_concept_listing_detail_and_not_found(monkeypatch):
         _Result(scalar=1),
         _Result([{"code_system": "RXNORM", "code": "123", "display_name": "Drug"}]),
     )
-    listed = await clinical.list_concepts(
-        _request(session, system="rxnorm", code_type="treatment", q="drug", page="1")
-    )
+    listed = await clinical.list_concepts(_request(session, system="rxnorm", code_type="treatment", q="drug", page="1"))
     assert _payload(listed)["query"] == {
         "system": "RXNORM",
         "code_type": "treatment",
@@ -277,9 +292,7 @@ async def test_typed_code_resolution_paths():
         _Result([{"code_system": "HCPCS", "code": "J1234"}]),
         _Result([{"code_system": "HCPCS", "code": "J1234", "code_type": None}]),
     )
-    treatment = await clinical._get_code(
-        _request(treatment_session), "treatment", "hcpcs", "j1234"
-    )
+    treatment = await clinical._get_code(_request(treatment_session), "treatment", "hcpcs", "j1234")
     assert _payload(treatment)["code"] == "J1234"
 
     fallback_session = _Session(
@@ -288,9 +301,7 @@ async def test_typed_code_resolution_paths():
         _Result(),
         _Result([{"code_system": "HCPCS", "code": "J9999", "code_type": "treatment"}]),
     )
-    fallback = await clinical._get_code(
-        _request(fallback_session), "treatment", "hcpcs", "j9999"
-    )
+    fallback = await clinical._get_code(_request(fallback_session), "treatment", "hcpcs", "j9999")
     assert _payload(fallback)["code"] == "J9999"
 
     missing_session = _Session(_Result(), _Result(), _Result())
@@ -315,9 +326,7 @@ async def test_relationship_and_crosswalk_filtered_and_unfiltered(monkeypatch):
     assert relationship_payload["query"]["from_code"] == "I10"
 
     monkeypatch.setattr(clinical, "is_restricted_terminology_public_enabled", lambda: True)
-    unfiltered_relationships = await clinical.list_relationships(
-        _request(_Session(_Result(scalar=0), _Result()))
-    )
+    unfiltered_relationships = await clinical.list_relationships(_request(_Session(_Result(scalar=0), _Result())))
     assert _payload(unfiltered_relationships)["items"] == []
 
     crosswalk = await clinical.list_crosswalk(
@@ -334,9 +343,7 @@ async def test_relationship_and_crosswalk_filtered_and_unfiltered(monkeypatch):
     assert crosswalk_payload["pagination"]["total"] == 2
     assert crosswalk_payload["query"]["code"] == "I10"
 
-    empty_crosswalk = await clinical.list_crosswalk(
-        _request(_Session(_Result(scalar=None), _Result()))
-    )
+    empty_crosswalk = await clinical.list_crosswalk(_request(_Session(_Result(scalar=None), _Result())))
     assert _payload(empty_crosswalk)["items"] == []
 
 
