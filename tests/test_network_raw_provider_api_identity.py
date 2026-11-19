@@ -103,14 +103,16 @@ async def test_membership_page_uses_fresh_capability_and_only_consumed_pins(monk
     await readers.read_network_provider_page(connection, NetworkAddressReadScope(caller_manifest, (11,), None))
     query = query_read.await_args.args[0]
     assert query.startswith("WITH identities AS MATERIALIZED") is trusted
-    addresses, _ = readers._provider_addresses(manifest, (11,), membership_page=trusted)
+    addresses, _ = readers._provider_addresses(manifest, (11,), location_lookup=trusted)
     assert addresses in query and events == ["resolve", "data", "decode"]
 
 
+@pytest.mark.parametrize("location_lookup", [False, True])
 @pytest.mark.parametrize("selection", ["detail", "location", "geo"])
-async def test_membership_capability_keeps_filtered_reads_on_full_verification(monkeypatch, selection):
+async def test_filtered_reads_only_bound_location_lookup_for_detail(monkeypatch, selection, location_lookup):
     manifest = _manifest(compact=True, artifacts=True)
     object.__setattr__(manifest, "_supports_membership_pages", True)
+    object.__setattr__(manifest, "_supports_location_lookup", location_lookup)
     connection, query_read, _ = _office_spies(monkeypatch, manifest)
     scope = NetworkAddressReadScope(manifest, (11,), None)
     if selection == "detail":
@@ -127,7 +129,12 @@ async def test_membership_capability_keeps_filtered_reads_on_full_verification(m
         await readers.read_network_provider_page(connection, scope, office_filters=filters)
     query = query_read.await_args.args[0]
     assert query.startswith("WITH selected_addresses")
-    assert readers._provider_addresses(manifest, (11,))[0] in query
+    bounded = selection == "detail" and location_lookup
+    assert ("UNION SELECT location_key FROM selected" in query) is bounded
+    addresses, _ = readers._provider_addresses(
+        manifest, (11,), location_lookup=bounded, columns=readers._PAGE_ADDRESS_COLUMNS if bounded else None
+    )
+    assert addresses in query
 
 
 @pytest.mark.parametrize("missing", ["network_membership", "provider_location_binding", "all"])

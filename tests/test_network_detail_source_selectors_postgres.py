@@ -12,6 +12,7 @@ from tests.test_network_provider_membership_page_postgres import membership_page
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("location_lookup", [False, True])
 @pytest.mark.parametrize("minimum", [None, 0, 3])
 @pytest.mark.parametrize(
     "office_filters,visible",
@@ -26,9 +27,10 @@ from tests.test_network_provider_membership_page_postgres import membership_page
     ids=["selected-alias", "missing-office", "unselected-alias", "other-network", "inside-radius", "outside-radius"],
 )
 async def test_native_detail_preserves_other_office_selectors(
-    monkeypatch, membership_page_db, minimum, office_filters, visible
+    monkeypatch, membership_page_db, location_lookup, minimum, office_filters, visible
 ):
     case = membership_page_db
+    object.__setattr__(case.manifest, "_supports_location_lookup", location_lookup)
     await case.connection.execute(f"UPDATE {case.namespace}.base_address SET source_count=2")
     monkeypatch.setattr(readers, "resolve_network_serving_manifest", AsyncMock(return_value=case.manifest))
     selection = readers.NetworkOfficeSelection(
@@ -52,3 +54,24 @@ async def test_native_detail_preserves_other_office_selectors(
     assert provider["provider_id"] == "provider-a"
     assert provider["display_name"] == "Provider provider-a"
     assert [office["location_id"] for office in provider["locations"]] == ([] if minimum else [str(UUID(int=200))])
+
+
+@pytest.mark.asyncio
+async def test_location_lookup_refuses_conflicting_binding_for_selected_office(monkeypatch, membership_page_db):
+    case = membership_page_db
+    object.__setattr__(case.manifest, "_supports_location_lookup", True)
+    monkeypatch.setattr(readers, "resolve_network_serving_manifest", AsyncMock(return_value=case.manifest))
+    await case.connection.execute(
+        f"""INSERT INTO {case.namespace}.provider_location_binding
+        VALUES ('provider_directory','other-provider',$1,$2,'provider_directory','other-provider')""",
+        UUID(int=500),
+        f"{100:064x}",
+    )
+    async with case.connection.transaction(isolation="repeatable_read", readonly=True):
+        with pytest.raises(readers.NetworkProviderReadUnavailable):
+            await readers.read_network_provider_detail(
+                case.connection,
+                NetworkAddressReadScope(case.manifest, (42,), None),
+                provider_system="provider_directory",
+                provider_id="provider-a",
+            )

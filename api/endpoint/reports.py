@@ -1185,6 +1185,14 @@ def _build_market_sql(
     if zip_code:
         base_filters.append(f"{address_zip5_expr} = :zip_code")
         parameter_map["zip_code"] = zip_code
+    # The unknown ZIP market also includes rows whose ZIP is null.
+    if scope == "zip" and not zip_code and market_id_filter and market_id_filter != "zip:00000":
+        base_filters.append(f"{address_zip5_expr} = :market_zip")
+        parameter_map["market_zip"] = market_id_filter.removeprefix("zip:")
+    # Bound the address rows before joining report enrichment for local reads.
+    address_cte = (
+        "MATERIALIZED" if any((state, city, county, zip_code, parameter_map.get("market_zip"))) else "NOT MATERIALIZED"
+    )
 
     scoped_filters: list[str] = []
     if chain:
@@ -1409,14 +1417,28 @@ WITH pharmacy_codes AS (
 ),
 {partd_cte},
 {license_cte},
+market_addresses AS {address_cte} (
+    SELECT
+        a.npi,
+        a.city_name,
+        a.state_name,
+        {address_zip5_expr} AS zip5,
+        a.telephone_number,
+        g.county_name,
+        COALESCE(g.population, 0)::bigint AS zip_population
+    FROM {address_table_sql} a
+    LEFT JOIN mrf.geo_zip_lookup g ON g.zip_code = {address_zip5_expr}
+    CROSS JOIN pharmacy_codes pc
+    WHERE {" AND ".join(base_filters)}
+),
 base AS (
     SELECT
         a.npi::bigint AS npi,
         a.city_name,
         a.state_name,
-        {address_zip5_expr} AS zip5,
-        g.county_name,
-        COALESCE(g.population, 0)::bigint AS zip_population,
+        a.zip5,
+        a.county_name,
+        a.zip_population,
         REGEXP_REPLACE(COALESCE(a.telephone_number, ''), '[^0-9]', '', 'g') AS phone_digits,
         n.provider_organization_name,
         n.do_business_as_text,
@@ -1426,13 +1448,10 @@ base AS (
         {partd_type} AS pharmacy_type,
         {license_active} AS has_active_state_license,
         {disciplinary_flag} AS disciplinary_flag
-    FROM {address_table_sql} a
+    FROM market_addresses a
     JOIN mrf.npi n ON n.npi = a.npi
-    LEFT JOIN mrf.geo_zip_lookup g ON g.zip_code = {address_zip5_expr}
     {partd_join}
     {license_join}
-    CROSS JOIN pharmacy_codes pc
-    WHERE {" AND ".join(base_filters)}
 ),
 {other_id_cte},
 scoped AS (

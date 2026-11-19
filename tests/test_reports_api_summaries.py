@@ -247,6 +247,32 @@ def test_build_market_sql_uses_unified_address_table_and_index_friendly_filters(
     assert "medicare_identifier_count" in data_sql
     assert params["state"] == "TX"
     assert params["zip_code"] == "78701"
+    assert "market_addresses AS MATERIALIZED" in data_sql
+
+
+@pytest.mark.parametrize(("market_id", "market_zip"), [("zip:12345", "12345"), ("zip:00000", None), (None, None)])
+def test_market_sql_bounds_known_zip_before_enrichment(market_id, market_zip):
+    _count_sql, data_sql, params = reports._build_market_sql(
+        scope="zip",
+        sort="access_score",
+        order="desc",
+        include_staffing=False,
+        has_partd=True,
+        has_license=True,
+        has_other_id=True,
+        market_id_filter=market_id,
+        state=None,
+        city=None,
+        county=None,
+        zip_code=None,
+        chain=None,
+        address_table_sql="mrf.entity_address_unified",
+    )
+    address_query = data_sql.split("market_addresses AS ", 1)[1].split("\nbase AS", 1)[0]
+    assert params.get("market_zip") == market_zip
+    assert ("a.zip5 = :market_zip" in address_query) == (market_zip is not None)
+    assert address_query.startswith("MATERIALIZED" if market_zip is not None else "NOT MATERIALIZED")
+    assert ("swm.market_id = :market_id" in data_sql) == (market_id is not None)
 
 
 def test_build_market_sql_can_force_legacy_address_table(monkeypatch):

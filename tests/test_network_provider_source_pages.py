@@ -53,18 +53,18 @@ async def test_compact_threshold_projections_have_independent_bind_offsets(monke
     native_addresses = readers._provider_addresses
 
     def record_projection(
-        actual, networks, *, membership_page=False, first_parameter=13, visible_membership_sql=None, columns=None
+        actual, networks, *, location_lookup=False, first_parameter=13, visible_membership_sql=None, columns=None
     ):
         query, arguments = native_addresses(
             actual,
             networks,
-            membership_page=membership_page,
+            location_lookup=location_lookup,
             first_parameter=first_parameter,
             visible_membership_sql=visible_membership_sql,
             columns=columns,
         )
         compiled_projections.append(
-            (query, arguments, membership_page, first_parameter, networks, visible_membership_sql, columns)
+            (query, arguments, location_lookup, first_parameter, networks, visible_membership_sql, columns)
         )
         return query, arguments
 
@@ -112,7 +112,7 @@ async def test_threshold_with_other_office_filters_retains_full_query(monkeypatc
 def test_zero_threshold_keeps_original_network_page_sql(trusted):
     manifest = _manifest(compact=True, artifacts=True)
     object.__setattr__(manifest, "_supports_membership_pages", trusted)
-    addresses, expected_arguments = readers._provider_addresses(manifest, (11,), membership_page=trusted)
+    addresses, expected_arguments = readers._provider_addresses(manifest, (11,), location_lookup=trusted)
     expected = (readers._MEMBERSHIP_PROVIDERS_SQL if trusted else readers._PROVIDERS_SQL).format(
         namespace='"' + manifest.schema_name + '"', addresses=addresses, address_membership="TRUE"
     )
