@@ -22,6 +22,7 @@ from api import ptg2_geo_projection as projection
 from process import entity_address_result_generation as generation
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import suppress_control_run_heartbeat_persistence
+from process.entity_address_preparation_admission import stage_indexes
 
 LEGACY_HANDOFF_CONTRACT = "entity-address-native-handoff.v1"
 HANDOFF_CONTRACT = "entity-address-native-handoff.v2"
@@ -675,7 +676,7 @@ async def _complete_indexes(schema, import_date):
         await native._ensure_promoted_stage_logged(schema, stage.__tablename__)
         await native._ensure_stage_primary_key(stage, schema, context=index_options_dict)
         for _label, statement in native._stage_index_statements(
-            stage, schema, list(getattr(stage, "__my_additional_indexes__", ()) or ()), index_options_dict
+            stage, schema, stage_indexes(stage), index_options_dict
         ):
             await native.db.status(statement)
 

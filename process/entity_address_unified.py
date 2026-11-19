@@ -1393,7 +1393,7 @@ async def _create_stage_indexes(
     phase_context = context if context is not None else {}
     if getattr(stage_cls, "__main_table__", "") == EntityAddressUnified.__main_table__:
         phase_context["stage_index_profile"] = _stage_index_profile()
-    indexes = list(getattr(stage_cls, "__my_additional_indexes__", []) or [])
+    indexes = preparation_admission.stage_indexes(stage_cls)
     if not indexes:
         return
     statements = _stage_index_statements(

@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Build the same plain source-count index across address candidate paths."""
+"""Build serving indexes on the intended address publication paths."""
 
 import importlib
 from types import SimpleNamespace
@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from db.models.entity_address_unified import ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES, EntityAddressUnified
+from process import entity_address_preparation_admission as admission
 from process import network_compact_preparation as compact
 from process import network_membership_serving_indexes as network
 from process.network_compact_layout import CompactAddressRelation
@@ -63,6 +64,44 @@ def test_live_and_network_plans_share_the_plain_source_count_index(concurrent):
     )
     disabled, skipped = address._post_publish_index_plan("example", "none", build_concurrently=concurrent)
     assert not disabled and "entity_address_unified.source_count" in skipped
+
+
+@pytest.mark.parametrize(
+    "profile,complete,enabled",
+    [("all", False, True), ("serving", False, True), ("none", False, False), ("none", True, True)],
+)
+def test_office_cover_is_optional_before_address_publication(monkeypatch, profile, complete, enabled):
+    monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_STAGE_INDEX_PROFILE", profile)
+    monkeypatch.delenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_ADDITIONAL_INDEXES", raising=False)
+    stage = address.make_class(EntityAddressUnified, "20990101")
+    statements_by_name = dict(
+        address._stage_index_statements(
+            stage, "example", admission.stage_indexes(stage), {"complete_stage_indexes": complete}
+        )
+    )
+    name = "serving_office_page"
+    assert (name in statements_by_name) is enabled
+    if enabled:
+        assert statements_by_name[name] == (
+            "CREATE INDEX IF NOT EXISTS entity_address_unified_20990101_idx_serving_office_page "
+            "ON example.entity_address_unified_20990101 (state_name, location_key) "
+            "INCLUDE (type, npi, inferred_npi, row_origin) "
+            "WHERE row_origin <> 'network_custom' AND type IN ('primary', 'secondary', 'practice', 'site');"
+        )
+    assert all(spec["name"] != name for spec in admission.stage_indexes(EntityAddressUnified))
+    live, _ = address._post_publish_index_plan("example", "all", build_concurrently=False)
+    assert name not in dict(live)
+    network_plan = network._serving_plan("example")
+    assert sum(key == f"entity_address_unified_idx_{name}" for key, _ in network_plan) == 1
+
+
+def test_office_cover_preserves_the_admitted_source_stage_layout():
+    stage = address.make_class(EntityAddressUnified, "cms" + "0" * 20)
+    token = admission._ADMISSION.set(object())
+    try:
+        assert admission.stage_indexes(stage) == stage.__my_additional_indexes__
+    finally:
+        admission._ADMISSION.reset(token)
 
 
 @pytest.mark.asyncio

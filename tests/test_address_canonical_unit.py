@@ -3507,6 +3507,7 @@ async def test_entity_address_unified_can_defer_all_additional_stage_indexes(mon
     assert index_context_map["skipped_stage_indexes"] == [
         "entity_address_unified_20260614.npi",
         "entity_address_unified_20260614.address_key",
+        "entity_address_unified_20260614.serving_office_page",
     ]
 
 
