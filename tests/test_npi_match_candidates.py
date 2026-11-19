@@ -6,6 +6,7 @@ import types
 
 import pytest
 import sanic.exceptions
+from sqlalchemy.exc import DBAPIError
 
 from api.endpoint import npi as npi_module
 
@@ -500,3 +501,73 @@ async def test_fetch_match_candidate_rows_rolls_back_session_after_cancellation(
         await npi_module._fetch_match_candidate_rows({"address_key": "x"}, session=session)
 
     assert session.rollback_called is True
+
+
+class _StageSession:
+    def __init__(self):
+        self.events = []
+        self.rollback_called = False
+
+    async def execute(self, stmt, params=None):
+        self.events.append(("execute", str(stmt), params))
+
+    async def rollback(self):
+        self.rollback_called = True
+
+
+@pytest.mark.asyncio
+async def test_match_candidate_stage_sets_statement_timeout_before_operation():
+    session = _StageSession()
+
+    async def operation():
+        session.events.append(("operation",))
+        return "ok"
+
+    result = await npi_module._run_match_candidate_stage_bounded(
+        operation,
+        started_at=npi_module.time.monotonic(),
+        stage_name="candidate lookup",
+        database_session=session,
+    )
+
+    assert result == "ok"
+    assert [event[0] for event in session.events] == ["execute", "operation"]
+    _, statement, params = session.events[0]
+    assert "set_config('statement_timeout', :timeout_ms, true)" in statement
+    assert 0 < int(params["timeout_ms"]) <= npi_module._MATCH_CANDIDATES_TIMEOUT_SECONDS * 1000
+
+
+@pytest.mark.asyncio
+async def test_match_candidate_stage_maps_statement_timeout_to_budget_error():
+    session = _StageSession()
+
+    async def operation():
+        raise DBAPIError("SELECT 1", {}, types.SimpleNamespace(sqlstate="57014"))
+
+    with pytest.raises(sanic.exceptions.ServiceUnavailable, match="exceeded the .* second endpoint budget"):
+        await npi_module._run_match_candidate_stage_bounded(
+            operation,
+            started_at=npi_module.time.monotonic(),
+            stage_name="candidate lookup",
+            database_session=session,
+        )
+
+    assert session.rollback_called is True
+
+
+@pytest.mark.asyncio
+async def test_match_candidate_stage_without_session_issues_no_statement():
+    calls = []
+
+    async def operation():
+        calls.append("operation")
+        return "ok"
+
+    result = await npi_module._run_match_candidate_stage_bounded(
+        operation,
+        started_at=npi_module.time.monotonic(),
+        stage_name="candidate lookup",
+    )
+
+    assert result == "ok"
+    assert calls == ["operation"]

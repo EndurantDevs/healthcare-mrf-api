@@ -7697,6 +7697,12 @@ async def _run_match_candidate_stage_bounded(
         if remaining_seconds <= 0:
             raise asyncio.TimeoutError()
         async with asyncio.timeout(remaining_seconds):
+            if database_session is not None:
+                # Transaction-local, so no restore: each later stage sets it again from the remaining budget.
+                await database_session.execute(
+                    text("SELECT set_config('statement_timeout', :timeout_ms, true)"),
+                    {"timeout_ms": str(max(1, math.ceil(remaining_seconds * 1000)))},
+                )
             return await operation()
     except asyncio.CancelledError:
         raise
@@ -7707,6 +7713,10 @@ async def _run_match_candidate_stage_bounded(
         ) from exc
     except Exception as exc:
         await _rollback_match_candidate_session(database_session)
+        if isinstance(exc, DBAPIError) and _is_statement_timeout(exc):
+            raise sanic.exceptions.ServiceUnavailable(
+                f"match candidate {stage_name} exceeded the {_MATCH_CANDIDATES_TIMEOUT_SECONDS:g} second endpoint budget"
+            ) from exc
         logger.warning(
             "match candidate %s failed: %s",
             stage_name,
