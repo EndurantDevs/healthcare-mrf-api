@@ -90,6 +90,15 @@ SELECT integrity.valid AND bounds.valid AS valid,bounds.bounded AND octet_length
   CASE WHEN integrity.valid AND bounds.valid AND bounds.bounded AND octet_length(result.document)<=$7
     THEN result.document END AS result FROM integrity,bounds,result"""
 
+_SELECTED_ADDRESS_JOIN = """  LEFT JOIN selected_addresses address ON (address.location_key,address.entity_type,address.entity_id)
+    =(binding.location_key,binding.entity_type,binding.entity_id)
+"""
+_SELECTED_BINDINGS = """  SELECT binding.* FROM selected_addresses address JOIN ONLY {namespace}.provider_location_binding binding
+    ON address.location_key=binding.location_key
+  WHERE $2::text IS NULL OR (binding.provider_system,binding.provider_id)=($2,$3)
+    OR EXISTS(SELECT 1 FROM selected WHERE selected.location_key=address.location_key)
+"""
+
 _PROVIDERS_SQL = (
     """WITH selected_addresses AS NOT MATERIALIZED (
   SELECT location_key,entity_type,entity_id,entity_name,npi,first_line,second_line,city_name,state_name,
@@ -106,14 +115,12 @@ _PROVIDERS_SQL = (
   FROM selected_memberships member LEFT JOIN ONLY {namespace}.provider_location_binding binding
     ON (binding.provider_system,binding.provider_id,binding.location_id)
       =(member.provider_system,member.provider_id,member.location_id)
-  LEFT JOIN selected_addresses address ON (address.location_key,address.entity_type,address.entity_id)
-    =(binding.location_key,binding.entity_type,binding.entity_id)
-), selected_bindings AS MATERIALIZED (
-  SELECT binding.* FROM selected_addresses address JOIN ONLY {namespace}.provider_location_binding binding
-    ON address.location_key=binding.location_key
-  WHERE $2::text IS NULL OR (binding.provider_system,binding.provider_id)=($2,$3)
-    OR EXISTS(SELECT 1 FROM selected WHERE selected.location_key=address.location_key)
-), integrity AS (
+"""
+    + _SELECTED_ADDRESS_JOIN
+    + """), selected_bindings AS MATERIALIZED (
+"""
+    + _SELECTED_BINDINGS
+    + """), integrity AS (
   SELECT count(*)=count(DISTINCT (provider_system,provider_id,location_id))
     AND coalesce(bool_and(matched_key IS NOT NULL AND provider_system IN ('npi','manual','provider_directory')
       AND location_id<>'00000000-0000-0000-0000-000000000000'::uuid
@@ -146,6 +153,31 @@ _PROVIDERS_SQL = (
   SELECT * FROM identities ORDER BY provider_system COLLATE "C",provider_id COLLATE "C" LIMIT $4 OFFSET $5
 ), """
     + _PROVIDER_RESULT_SQL
+)
+
+# Only this provider's bindings and bindings sharing its selected locations affect detail integrity.
+# OFFSET 0 keeps each lateral address lookup driven by its outer location key.
+_PROVIDER_DETAIL_SQL = _PROVIDERS_SQL.replace(
+    _SELECTED_ADDRESS_JOIN,
+    """  LEFT JOIN LATERAL (SELECT * FROM selected_addresses address
+    WHERE (address.location_key,address.entity_type,address.entity_id)
+      =(binding.location_key,binding.entity_type,binding.entity_id) OFFSET 0) address ON true
+""",
+    1,
+).replace(
+    _SELECTED_BINDINGS,
+    """  SELECT binding.* FROM (
+    SELECT location_key FROM ONLY {namespace}.provider_location_binding
+    WHERE (provider_system,provider_id)=($2,$3)
+    UNION SELECT location_key FROM selected
+  ) candidate JOIN ONLY {namespace}.provider_location_binding binding
+    ON binding.location_key=candidate.location_key
+  JOIN LATERAL (SELECT location_key FROM selected_addresses address
+    WHERE address.location_key=candidate.location_key OFFSET 0) address ON true
+  WHERE (binding.provider_system,binding.provider_id)=($2,$3)
+    OR EXISTS(SELECT 1 FROM selected WHERE selected.location_key=address.location_key)
+""",
+    1,
 )
 
 _MEMBERSHIP_IDENTITIES_SQL = """WITH identities AS MATERIALIZED (
@@ -405,6 +437,9 @@ def _provider_query(manifest, network_ids, selector, office_filters, minimum):
         and selector == (None, None)
         and all(filter_value is None for filter_value in office_filters)
     )
+    detail_lookup = (
+        manifest.compact_layout is not None and manifest.supports_location_lookup and selector != (None, None)
+    )
     if minimum and membership_page:
         if type(network_ids) is not tuple or any(type(network_id) is not int for network_id in network_ids):
             raise NetworkProviderReadError("Canonical provider selection is invalid")
@@ -414,10 +449,14 @@ def _provider_query(manifest, network_ids, selector, office_filters, minimum):
     addresses, arguments = _provider_addresses(
         manifest,
         network_ids,
-        membership_page=membership_page,
-        columns=_PAGE_ADDRESS_COLUMNS if minimum and membership_page else None,
+        location_lookup=membership_page or detail_lookup,
+        columns=_PAGE_ADDRESS_COLUMNS if detail_lookup or (minimum and membership_page) else None,
     )
-    query = _MEMBERSHIP_PROVIDERS_SQL if membership_page else _PROVIDERS_SQL
+    query = _PROVIDERS_SQL
+    if membership_page:
+        query = _MEMBERSHIP_PROVIDERS_SQL
+    elif detail_lookup:
+        query = _PROVIDER_DETAIL_SQL
     sql_fields_by_name = {"namespace": _identifier(manifest.schema_name), "addresses": addresses}
     if minimum and membership_page:
         qualifying, qualification_arguments = _provider_addresses(
@@ -463,7 +502,7 @@ def _source_filtered_provider_sql(query, minimum, detail):
 
 
 def _provider_addresses(
-    manifest, network_ids, *, membership_page=False, first_parameter=13, visible_membership_sql=None, columns=None
+    manifest, network_ids, *, location_lookup=False, first_parameter=13, visible_membership_sql=None, columns=None
 ):
     if manifest.compact_layout is None:
         return "ONLY " + _identifier(manifest.schema_name) + ".entity_address_unified", ()
@@ -474,7 +513,7 @@ def _provider_addresses(
         first_parameter=first_parameter,
         network_ids=network_ids,
         visible_membership_sql=visible_membership_sql,
-        location_lookup=membership_page,
+        location_lookup=location_lookup,
         columns=columns,
     )
 

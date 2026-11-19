@@ -158,7 +158,7 @@ async def membership_page_db():
 
 
 async def _read(case, *, fast, networks=(42,), limit=50, offset=0, maximum_bytes=readers.MAX_RESPONSE_BYTES):
-    addresses, arguments = readers._provider_addresses(case.manifest, networks, membership_page=fast)
+    addresses, arguments = readers._provider_addresses(case.manifest, networks, location_lookup=fast)
     sql = (readers._MEMBERSHIP_PROVIDERS_SQL if fast else readers._PROVIDERS_SQL).format(
         namespace=case.namespace, addresses=addresses, address_membership="TRUE"
     )

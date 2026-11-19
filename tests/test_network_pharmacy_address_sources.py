@@ -96,7 +96,7 @@ async def test_network_minimum_qualifies_offices_before_membership_pages(monkeyp
     query, *arguments = connection.fetchrow.await_args.args
     assert query.startswith("WITH page_addresses")
     _, page_arguments = readers._provider_addresses(
-        manifest, (11,), membership_page=True, columns=readers._PAGE_ADDRESS_COLUMNS
+        manifest, (11,), location_lookup=True, columns=readers._PAGE_ADDRESS_COLUMNS
     )
     _, qualification_arguments = readers._provider_addresses(
         manifest,
