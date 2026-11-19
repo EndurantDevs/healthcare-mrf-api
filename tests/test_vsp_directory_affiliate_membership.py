@@ -9,7 +9,7 @@ import pytest
 from process import vsp_directory_capture as acquisition
 from process.vsp_directory_contract import NETWORKS, PROFILE_MEMBERSHIP_UNRESOLVED, SEARCH_URL, VSPDirectoryError
 from process.vsp_directory_enrichment import enrich_capture, write_normalized_capture
-from process.vsp_directory_geometry import office_search_request
+from process.vsp_directory_geometry import GeoTile, office_search_request
 from process.vsp_directory_normalization import VSPDirectoryNormalizationError
 from process.vsp_directory_store import VSPCaptureStore
 from tests.test_vsp_directory_capture import HTTP, TILE, noop
@@ -350,6 +350,27 @@ async def test_census_shortfall_requires_complete_sweep_and_stays_bounded(tmp_pa
         assert completed.proof["publisher_locations"] == dict.fromkeys(NETWORKS.values(), 1)
     assert run.memberships == {name: {"52"} for name in NETWORKS.values()}
     assert run.unresolved == []
+
+
+@pytest.mark.asyncio
+async def test_lower_refreshed_census_does_not_end_its_sweep_early(monkeypatch, tmp_path):
+    second_tile = GeoTile(20, 30, 20, 30)
+    monkeypatch.setattr(acquisition, "world_tiles", lambda: (TILE, second_tile))
+    scopes_by_office_network = {(oid, name): (2, 3) for oid in (52, 53) for name in NETWORKS.values()}
+    source = AffiliateSource(scopes=scopes_by_office_network, offices=(52, 53))
+    run = capture(tmp_path, source)
+    source.census_extra = 2
+    request = acquisition.census_request("Signature")
+    _, raw, metadata = await run.http.request("POST", SEARCH_URL, request)
+    run.store.retain(raw, metadata)
+    source.census_extra = -1
+
+    completed = await run.run()
+
+    assert second_tile.request("Signature") in [payload for _, _, payload in run.http.calls]
+    assert "Signature" in run.exhausted_networks
+    assert completed.proof["closed_geographic_census_shortfalls"] == {"Signature": 2}
+    assert completed.proof["publisher_locations"] == dict.fromkeys(NETWORKS.values(), 2)
 
 
 @pytest.mark.asyncio

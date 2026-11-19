@@ -317,7 +317,8 @@ class VSPCapture:
         publisher_counts = {start, refreshed}
         needs_discovery = len(self.site_memberships[name]) not in publisher_counts
         if needs_discovery:
-            await self.discover(name, refreshed)
+            # A lower refresh must not close discovery before the retained census is accounted for.
+            await self.discover(name, max(publisher_counts))
         baseline_addition_ids = (
             self.geographic_additions[name].copy() if len(self.site_memberships[name]) in publisher_counts else set()
         )
