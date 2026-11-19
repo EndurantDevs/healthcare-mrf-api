@@ -23,6 +23,13 @@ from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from db.connection import Base
 from db.json_mixin import JSONOutputMixin
 
+ENTITY_ADDRESS_OFFICE_PAGE_INDEX = {
+    "name": "serving_office_page",
+    "index_elements": ("state_name", "location_key"),
+    "include": ("type", "npi", "inferred_npi", "row_origin"),
+    "where": "row_origin <> 'network_custom' AND type IN ('primary', 'secondary', 'practice', 'site')",
+}
+
 ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "npi",
     "primary_npi",
@@ -31,6 +38,7 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "primary_zip5_npi",
     "serving_zip5_npi",
     "serving_zip5_taxonomy",
+    ENTITY_ADDRESS_OFFICE_PAGE_INDEX["name"],
     "primary_phone_npi",
     "service_phone_lookup_npi",
     "service_phone_digits_npi",

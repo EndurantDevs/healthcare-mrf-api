@@ -13,6 +13,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from db.models.entity_address_unified import ENTITY_ADDRESS_OFFICE_PAGE_INDEX, EntityAddressUnified
 from process import entity_address_ordinary_preparation as ordinary_preparation
 from process import entity_address_source_preparation as source_preparation
 from process.provider_directory_profile_temp_limit import apply_temp_file_limit
@@ -54,6 +55,18 @@ class _AdmittedPreparation:
 
 _ADMISSION: ContextVar[_AdmittedPreparation | None] = ContextVar("entity_address_preparation_admission", default=None)
 _ROW_SCRATCH: ContextVar[object | None] = ContextVar("entity_address_row_scratch", default=None)
+
+
+def stage_indexes(stage_cls) -> list[dict]:
+    """Build the office cover only on ordinary isolated address stages."""
+    indexes = list(getattr(stage_cls, "__my_additional_indexes__", ()) or ())
+    if (
+        _ADMISSION.get() is None
+        and getattr(stage_cls, "__main_table__", "") == EntityAddressUnified.__main_table__
+        and stage_cls.__tablename__ != EntityAddressUnified.__tablename__
+    ):
+        indexes.append(ENTITY_ADDRESS_OFFICE_PAGE_INDEX)
+    return indexes
 
 
 @dataclass(eq=False)

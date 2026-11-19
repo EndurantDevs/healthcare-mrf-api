@@ -299,11 +299,23 @@ async def test_native_ordinary_address_publication_preserves_transaction_and_pay
         context = _attempt_context()
         await _create_attempt_stage(context, invalid_payload=outcome == "invalid_payload")
         handoff = await _handoff(context)
+        cover_query = (
+            "SELECT count(*) FROM pg_indexes WHERE schemaname='mrf' AND tablename=$1 "
+            "AND indexdef LIKE '%(state_name, location_key) INCLUDE (type, npi, inferred_npi, row_origin)%'"
+        )
+        staged_main = next(
+            relation["stage_name"]
+            for relation in handoff["stage_relations"]
+            if relation["table_name"] == "entity_address_unified"
+        )
+        assert await resources.admin.fetchval(cover_query, staged_main) == 1
+        assert await resources.admin.fetchval(cover_query, "entity_address_unified") == 0
         if outcome != "published":
             expected = "publication rollback probe" if outcome == "rollback" else "stale address alias generation"
             with pytest.raises(RuntimeError, match=expected):
                 await _publish(resources, handoff, rollback=outcome == "rollback")
             assert await _canonical_rows(resources) == incumbent_rows
+            assert await resources.admin.fetchval(cover_query, "entity_address_unified") == 0
             assert await db.scalar("SELECT local_generation FROM mrf.entity_address_result_generation") == 0
             assert (
                 await db.scalar("SELECT status FROM mrf.import_run WHERE run_id=:run", run=context["control_run_id"])
@@ -311,6 +323,7 @@ async def test_native_ordinary_address_publication_preserves_transaction_and_pay
             )
             return
         receipt = await _publish(resources, handoff, rollback=False)
+        assert await resources.admin.fetchval(cover_query, "entity_address_unified") == 1
         assert set(await _canonical_rows(resources)) == set(generation.RELATION_NAMES)
         assert await db.scalar("SELECT local_generation FROM mrf.entity_address_result_generation") == 1
         async with resources.publisher.transaction() as session:

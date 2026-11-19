@@ -6,6 +6,7 @@ import json
 import re
 from uuid import UUID
 
+from db.models.entity_address_unified import ENTITY_ADDRESS_OFFICE_PAGE_INDEX
 from db.registry_schema import registry_schema
 from process.entity_address_unified import _post_publish_index_plan
 from process.network_address_projection import PinnedAddressSource, _identifier, _membership_accounting
@@ -26,7 +27,7 @@ class NetworkServingIndexesError(ValueError):
 
 
 _OPTIONAL_SOURCE_COUNT_INDEX = "entity_address_unified_idx_source_count"
-_OPTIONAL_OFFICE_PAGE_INDEX = "entity_address_unified_idx_serving_office_page"
+_OPTIONAL_OFFICE_PAGE_INDEX = f"entity_address_unified_idx_{ENTITY_ADDRESS_OFFICE_PAGE_INDEX['name']}"
 _OPTIONAL_ADDRESS_INDEXES = frozenset({_OPTIONAL_SOURCE_COUNT_INDEX, _OPTIONAL_OFFICE_PAGE_INDEX})
 
 
@@ -141,12 +142,12 @@ def _serving_plan(schema_name):
         if name != "canonical_network_ids"
     ]
     # Discover state-filtered pages from narrow office records before hydrating addresses.
+    cover = ENTITY_ADDRESS_OFFICE_PAGE_INDEX
     index_statements.append(
         (
             _OPTIONAL_OFFICE_PAGE_INDEX,
-            f"CREATE INDEX {_OPTIONAL_OFFICE_PAGE_INDEX} ON {namespace}.entity_address_unified (state_name, location_key) "
-            "INCLUDE (type, npi, inferred_npi, row_origin) "
-            "WHERE row_origin <> 'network_custom' AND type IN ('primary', 'secondary', 'practice', 'site')",
+            f"CREATE INDEX {_OPTIONAL_OFFICE_PAGE_INDEX} ON {namespace}.entity_address_unified "
+            f"({', '.join(cover['index_elements'])}) INCLUDE ({', '.join(cover['include'])}) WHERE {cover['where']}",
         )
     )
     return index_statements
