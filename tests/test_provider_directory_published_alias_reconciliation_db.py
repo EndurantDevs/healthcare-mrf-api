@@ -18,9 +18,7 @@ entity_address_unified = importlib.import_module("process.entity_address_unified
 
 async def _orphan_source_alias(database, schema: str) -> None:
     source_metadata = json.loads(_source_metadata(["Location"]))
-    source_metadata[
-        importer.PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY
-    ] = "endpoint_shared"
+    source_metadata[importer.PROVIDER_DIRECTORY_CONFIGURED_ENDPOINT_METADATA_KEY] = "endpoint_shared"
     await database.status(
         f"UPDATE {schema}.provider_directory_source "
         "SET endpoint_id = 'endpoint_repoint', "
@@ -101,9 +99,7 @@ def _assert_reconciliation_fence(fence) -> None:
         True,
     )
     assert fence.promotion_datasets == []
-    assert fence.published_source_endpoint_tuples == (
-        ("source_primary", "endpoint_shared"),
-    )
+    assert fence.published_source_endpoint_tuples == (("source_primary", "endpoint_shared"),)
 
 
 async def _reconcile_source_alias(database, fence) -> None:
@@ -116,17 +112,19 @@ async def _reconcile_source_alias(database, fence) -> None:
 
 
 async def _assert_reconciled_state(database, schema: str) -> None:
-    assert await database.scalar(
-        f"SELECT endpoint_id FROM {schema}.provider_directory_source "
-        "WHERE source_id = 'source_primary';"
-    ) == "endpoint_shared"
-    assert await database.scalar(
-        f"SELECT status FROM {schema}.provider_directory_endpoint_dataset "
-        "WHERE dataset_id = 'dataset_shared';"
-    ) == importer.ENDPOINT_DATASET_PUBLISHED
-    steady_fence = await importer._resolve_provider_directory_artifact_datasets(
-        ["source_primary"]
+    assert (
+        await database.scalar(
+            f"SELECT endpoint_id FROM {schema}.provider_directory_source WHERE source_id = 'source_primary';"
+        )
+        == "endpoint_shared"
     )
+    assert (
+        await database.scalar(
+            f"SELECT status FROM {schema}.provider_directory_endpoint_dataset WHERE dataset_id = 'dataset_shared';"
+        )
+        == importer.ENDPOINT_DATASET_PUBLISHED
+    )
+    steady_fence = await importer._resolve_provider_directory_artifact_datasets(["source_primary"])
     assert steady_fence.datasets[0].reconcile_source_alias_on_cutover is False
 
 
@@ -140,13 +138,9 @@ async def test_real_postgres_reconciles_only_proven_published_alias(monkeypatch)
             RuntimeError,
             match="provider_directory_artifact_current_dataset_missing",
         ):
-            await importer._resolve_provider_directory_artifact_datasets(
-                ["source_primary"]
-            )
+            await importer._resolve_provider_directory_artifact_datasets(["source_primary"])
         await _bind_published_dataset_to_source(database, schema)
-        fence = await importer._resolve_provider_directory_artifact_datasets(
-            ["source_primary"]
-        )
+        fence = await importer._resolve_provider_directory_artifact_datasets(["source_primary"])
         _assert_reconciliation_fence(fence)
         await _reconcile_source_alias(database, fence)
         await _assert_reconciled_state(database, schema)
@@ -160,9 +154,7 @@ async def test_real_postgres_keeps_alias_with_current_serving_dataset(monkeypatc
         await _orphan_source_alias(database, schema)
         await _bind_published_dataset_to_source(database, schema)
         await _install_current_serving_dataset(database, schema)
-        fence = await importer._resolve_provider_directory_artifact_datasets(
-            ["source_primary"]
-        )
+        fence = await importer._resolve_provider_directory_artifact_datasets(["source_primary"])
         selected = fence.datasets[0]
         assert (
             selected.dataset_id,
@@ -222,3 +214,107 @@ async def test_real_postgres_exact_followup_repairs_proven_published_alias(
             expected_dataset_id="dataset_shared",
             expected_root_run_id="root-shared",
         )
+
+
+async def _move_current_dataset_to_named_edition(database, schema: str) -> tuple[str, bool]:
+    """Keep the current header and memberships only in their own edition schema."""
+    from process.provider_directory_named_edition import (
+        POINTER_SCHEMA,
+        POINTER_TABLE,
+        edition_schema_name,
+    )
+
+    edition = edition_schema_name("dataset_shared")
+    # Named headers are read with the model's full column shape.
+    await database.status(
+        f"ALTER TABLE {schema}.provider_directory_endpoint_dataset ADD COLUMN candidate_storage_json jsonb;"
+    )
+    await database.status(
+        f"UPDATE {schema}.provider_directory_endpoint_dataset "
+        "SET dataset_hash = repeat('a', 64), "
+        "publication_metadata_json = CAST(:metadata AS jsonb) "
+        "WHERE dataset_id = 'dataset_shared';",
+        metadata=json.dumps(
+            {
+                "selected_resources": ["Location"],
+                "source_ids": ["source_primary", "source_sibling"],
+            }
+        ),
+    )
+    await database.status(f"CREATE SCHEMA {edition};")
+    for table in (
+        "provider_directory_endpoint_dataset",
+        "provider_directory_dataset_resource",
+    ):
+        await database.status(f"CREATE TABLE {edition}.{table} (LIKE {schema}.{table} INCLUDING ALL);")
+        await database.status(
+            f"INSERT INTO {edition}.{table} SELECT * FROM {schema}.{table} WHERE dataset_id = 'dataset_shared';"
+        )
+        await database.status(f"DELETE FROM {schema}.{table} WHERE dataset_id = 'dataset_shared';")
+    pointer = f"{POINTER_SCHEMA}.{POINTER_TABLE}"
+    is_pointer_created = not await database.scalar("SELECT to_regclass(:pointer) IS NOT NULL", pointer=pointer)
+    await database.status(f"CREATE SCHEMA IF NOT EXISTS {POINTER_SCHEMA};")
+    await database.status(
+        f"CREATE TABLE IF NOT EXISTS {pointer} ("
+        "catalog_schema text NOT NULL, endpoint_id text NOT NULL, "
+        "dataset_id text NOT NULL, schema_name text NOT NULL, "
+        "previous_dataset_id text, previous_schema_name text, "
+        "PRIMARY KEY (catalog_schema, endpoint_id));"
+    )
+    await database.status(
+        f"INSERT INTO {pointer} (catalog_schema, endpoint_id, dataset_id, schema_name) "
+        "VALUES (:catalog_schema, 'endpoint_shared', 'dataset_shared', :edition);",
+        catalog_schema=schema,
+        edition=edition,
+    )
+    return edition, is_pointer_created
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_address_followup_reads_edition_only_dataset(
+    monkeypatch,
+):
+    """Resolve the Address fence and current overlay through the named pointer."""
+
+    from process.provider_directory_named_edition import POINTER_SCHEMA, POINTER_TABLE, selected_editions
+
+    async with _dataset_database(monkeypatch) as (database, schema):
+        monkeypatch.setattr(entity_address_unified, "db", database)
+        await database.status(importer.provider_directory_address_overlay_table_sql(schema))
+        await database.status(
+            f"INSERT INTO {schema}.provider_directory_address_overlay "
+            "(source_record_id, source_id, last_seen_run_id, resource_type, "
+            "resource_id, npi, address_key) VALUES ('overlay-1', 'source_primary', "
+            "'root-shared', 'Location', 'location-1', 1234567890, gen_random_uuid());"
+        )
+        edition, is_pointer_created = await _move_current_dataset_to_named_edition(database, schema)
+        try:
+            await entity_address_unified._assert_current_provider_directory_dataset(
+                schema,
+                source_id="source_primary",
+                expected_dataset_id="dataset_shared",
+                expected_root_run_id="root-shared",
+            )
+            editions = await selected_editions(importer)
+            assert [named.schema_name for named in editions] == [edition]
+
+            def current_overlay_sql(named_editions) -> str:
+                ctes = entity_address_unified._provider_directory_current_overlay_ctes_sql(
+                    schema,
+                    source_ids=["source_primary"],
+                    run_id="root-shared",
+                    named_editions=named_editions,
+                )
+                return ctes + " SELECT dataset_id FROM current_overlay"
+
+            assert await database.scalar(current_overlay_sql(editions)) == "dataset_shared"
+            assert await database.scalar(current_overlay_sql(())) is None
+        finally:
+            await database.status(f"DROP SCHEMA IF EXISTS {edition} CASCADE;")
+            if is_pointer_created:
+                await database.status(f"DROP SCHEMA IF EXISTS {POINTER_SCHEMA} CASCADE;")
+            else:
+                await database.status(
+                    f"DELETE FROM {POINTER_SCHEMA}.{POINTER_TABLE} WHERE catalog_schema = :catalog_schema;",
+                    catalog_schema=schema,
+                )

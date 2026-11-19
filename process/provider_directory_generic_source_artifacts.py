@@ -819,15 +819,15 @@ def _publication_admission(directory, fence, request, resource_types):
 @asynccontextmanager
 async def _resource_input_scope(directory, admission):
     """Resolve the ordinary published dataset once for every preparation read."""
-    if admission.factory is not None:
+    dataset = admission.fence.datasets[0]
+    # Explicit editions already use the shared named header and resource readers.
+    if admission.factory is not None or getattr(dataset, "storage_schema", None) is not None:
         yield
         return
     from process.provider_directory_source_storage_binding import dataset_source_relations
 
     root = directory.ProviderDirectoryDatasetResource.__tablename__
-    relations_by_root = await dataset_source_relations(
-        directory.db, directory._schema(), admission.fence.datasets[0].dataset_id, (root,)
-    )
+    relations_by_root = await dataset_source_relations(directory.db, directory._schema(), dataset.dataset_id, (root,))
     relation = relations_by_root[root]
     with directory._provider_directory_artifact_relation_scope({root: (relation["schema"], relation["name"])}):
         yield
@@ -951,7 +951,10 @@ async def lock_address_source_fence(directory, database, schema, context):
         )
         await journal.check(directory, selected["source"], selected.get(journal.FIELD))
         return
-    fence = await directory._resolve_provider_directory_artifact_datasets(source_ids)
+    from process import provider_directory_named_edition as named
+
+    editions = await named.locked_source_editions(directory, source_ids)
+    fence = await named.resolve_artifact_datasets(directory, source_ids, named_editions=editions)
     require_output(
         len(fence.datasets) == 1
         and not fence.promotion_datasets
@@ -1013,13 +1016,15 @@ async def terminal_fence(directory):
             _TERMINAL.reset(token)
 
 
-def current_dataset_fence_query(db_schema: str) -> str:
+def current_dataset_fence_query(db_schema: str, editions=()) -> str:
     """Build the immutable publication fence query for one source."""
+    from process.provider_directory_named_edition import address_source_relations
 
+    source_ref, dataset_ref, _resource_ref = address_source_relations(db_schema, editions)
     return f"""
         SELECT dataset.dataset_id
-          FROM {db_schema}.provider_directory_source AS source
-          JOIN {db_schema}.provider_directory_endpoint_dataset AS dataset
+          FROM {source_ref} AS source
+          JOIN {dataset_ref} AS dataset
             ON dataset.dataset_id = :expected_dataset_id
          WHERE source.source_id = :source_id
            AND dataset.acquisition_root_run_id = :expected_root_run_id
@@ -1035,7 +1040,7 @@ def current_dataset_fence_query(db_schema: str) -> str:
                ) @> jsonb_build_array(source.source_id)
            AND NOT EXISTS (
                 SELECT 1
-                  FROM {db_schema}.provider_directory_endpoint_dataset AS competing
+                  FROM {dataset_ref} AS competing
                  WHERE competing.dataset_id <> dataset.dataset_id
                    AND competing.status = 'published'
                    AND competing.is_current IS TRUE

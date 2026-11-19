@@ -30,7 +30,7 @@ native = importlib.import_module("process.entity_address_unified")
 preparation = importlib.import_module("process.entity_address_candidate_preparation")
 
 
-def _inputs(overlay_oid=41):
+def _inputs():
     return preparation.ProviderDirectoryAddressPreparationInput(
         dataset_pins=(
             preparation.ProviderDirectoryAddressDatasetPin("directory", "endpoint", "candidate", "b" * 64, "new-run"),
@@ -61,6 +61,7 @@ def test_preparation_rejects_unsafe_or_ambiguous_inputs(changed):
 async def test_internal_scope_requires_indexes_and_restores_after_failure(monkeypatch):
     monkeypatch.setenv("HLTHPRT_ENTITY_ADDRESS_UNIFIED_DEFER_ADDITIONAL_INDEXES", "true")
     monkeypatch.setattr(native.db, "_transaction_binding", lambda: None)
+    monkeypatch.setattr(preparation, "_pinned_named_editions", AsyncMock(return_value=()))
 
     async def fail_build(_ctx, task):
         assert preparation.current() == _inputs()
@@ -154,8 +155,7 @@ async def _candidate_tables(database, schema):
     await database.status(
         f"INSERT INTO {schema}.{receipt_table}(artifact_name,generation) VALUES ('provider_directory_address_overlay',0)"
     )
-    overlay_oid = await database.scalar(f"SELECT '{schema}.prepared_overlay'::regclass::oid::bigint")
-    return _inputs(overlay_oid)
+    return _inputs()
 
 
 async def _candidate_datasets(database, schema):

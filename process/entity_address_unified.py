@@ -46,12 +46,12 @@ from process import entity_address_prepared_doctors as prepared_doctors
 from process import entity_address_result_generation as result_generation
 from process import entity_address_rows_native as row_preparation
 from process import entity_address_rows_preparation as prepared_rows
+from process import provider_directory_named_edition as named_source_editions
 from process import provider_directory_profile as profile_artifact
 from process import provider_directory_serving_recovery as serving_recovery
 from process import provider_geo_search
 from process.control_lifecycle import mark_control_run
 from process.entity_address_candidate_preparation import (
-    _PROVIDER_DIRECTORY_CURRENT_OVERLAY_CTES_TEMPLATE,
     _PROVIDER_DIRECTORY_PARTIAL_OVERLAY_SOURCE_TEMPLATE,
     PreparedEntityAddressGeneration,
     ProviderDirectoryAddressDatasetPin,
@@ -402,11 +402,11 @@ def _validate_provider_directory_dataset_fence_scope(
         )
 
 
-def _provider_directory_current_dataset_fence_query(db_schema: str) -> str:
+def _provider_directory_current_dataset_fence_query(db_schema: str, named_editions=()) -> str:
     """Keep the ordinary publication query on its shared source-fence helper."""
     from process.provider_directory_generic_source_artifacts import current_dataset_fence_query
 
-    return current_dataset_fence_query(db_schema)
+    return current_dataset_fence_query(db_schema, named_editions)
 
 
 async def _assert_current_provider_directory_dataset(
@@ -434,13 +434,14 @@ async def _assert_current_provider_directory_dataset(
     ):
         return
 
-    dataset_row = await preparation_admission.read_first(
-        db,
-        _provider_directory_current_dataset_fence_query(db_schema),
-        source_id=source_id,
-        expected_dataset_id=expected_dataset_id,
-        expected_root_run_id=expected_root_run_id,
-    )
+    async with directory._artifact_selection_snapshot([source_id]) as named_editions:
+        dataset_row = await preparation_admission.read_first(
+            db,
+            _provider_directory_current_dataset_fence_query(db_schema, named_editions),
+            source_id=source_id,
+            expected_dataset_id=expected_dataset_id,
+            expected_root_run_id=expected_root_run_id,
+        )
     if dataset_row is None or _clean_optional(_row_mapping(dataset_row).get("dataset_id")) != expected_dataset_id:
         raise RuntimeError("entity-address-unified Provider Directory dataset fence changed")
     provider_directory_fhir = importlib.import_module("process.provider_directory_fhir")
@@ -2884,52 +2885,7 @@ async def _has_provider_directory_compatibility_data(
     return bool(await preparation_admission.read_scalar(db, f"SELECT {existence_checks};"))
 
 
-def _provider_directory_current_overlay_ctes_sql(
-    db_schema: str,
-    *,
-    source_ids: list[str] | tuple[str, ...] | None = None,
-    run_id: str | None = None,
-    affected_group_table: str | None = None,
-) -> str:
-    """Return CTEs that retain only current, published dataset overlay rows."""
-    if candidate_preparation.current() is not None or candidate_preparation.has_source_query():
-        return candidate_preparation.desired_overlay_ctes(
-            db_schema, source_ids=source_ids, run_id=run_id, affected_group_table=affected_group_table
-        )
-
-    source_ref = f"{db_schema}.provider_directory_source"
-    dataset_ref = f"{db_schema}.provider_directory_endpoint_dataset"
-    dataset_resource_ref = f"{db_schema}.provider_directory_dataset_resource"
-    overlay_ref = f"{db_schema}.provider_directory_address_overlay"
-    requested_source_filter = (
-        f"WHERE source.source_id = ANY({_string_array_literal(list(source_ids))})"
-        if source_ids
-        else "WHERE source.endpoint_id IS NOT NULL"
-    )
-    run_filter = f"\n           AND overlay.last_seen_run_id = {_sql_literal(run_id)}" if run_id else ""
-    affected_overlay_ctes = ""
-    current_overlay_ref = overlay_ref
-    if affected_group_table:
-        affected_overlay_ctes = f"""affected_npis AS MATERIALIZED (
-    SELECT DISTINCT affected.entity_npi AS npi
-      FROM {db_schema}.{affected_group_table} AS affected
-     WHERE affected.entity_npi IS NOT NULL
-), affected_overlay AS MATERIALIZED (
-    SELECT overlay.*
-      FROM {overlay_ref} AS overlay
-      JOIN affected_npis AS affected_npi
-        ON overlay.npi = affected_npi.npi
-), """
-        current_overlay_ref = "affected_overlay"
-    return _PROVIDER_DIRECTORY_CURRENT_OVERLAY_CTES_TEMPLATE.format(
-        source_ref=source_ref,
-        requested_source_filter=requested_source_filter,
-        dataset_ref=dataset_ref,
-        affected_overlay_ctes=affected_overlay_ctes,
-        current_overlay_ref=current_overlay_ref,
-        run_filter=run_filter,
-        dataset_resource_ref=dataset_resource_ref,
-    )
+_provider_directory_current_overlay_ctes_sql = candidate_preparation.current_overlay_ctes
 
 
 def _latest_provider_directory_partial_scope_sql(db_schema: str) -> str:
@@ -11621,17 +11577,18 @@ async def process_entity_address_unified_data(ctx, task=None):
             expected_dataset_id=provider_directory_dataset_id,
             expected_root_run_id=provider_directory_run_id,
         )
+    directory = importlib.import_module("process.provider_directory_fhir")
+    # Literal edition names keep scope discovery and every source select on the editions current here.
+    editions = () if candidate_preparation.current() else await named_source_editions.selected_editions(directory)
     if (
         is_partial_provider_directory_refresh
         and provider_directory_partial_scope == "latest-run"
         and not provider_directory_source_ids
         and not provider_directory_run_id
     ):
-        (
-            provider_directory_run_id,
-            provider_directory_source_ids,
-            provider_directory_scope_sources,
-        ) = await _latest_provider_directory_partial_scope(db_schema)
+        with named_source_editions.address_editions(editions):
+            scope = await _latest_provider_directory_partial_scope(db_schema)
+        provider_directory_run_id, provider_directory_source_ids, provider_directory_scope_sources = scope
     if is_partial_provider_directory_refresh and provider_directory_partial_scope == "latest-run":
         if not provider_directory_source_ids and not provider_directory_run_id:
             raise RuntimeError(
@@ -11661,21 +11618,25 @@ async def process_entity_address_unified_data(ctx, task=None):
         test_limit_per_source=test_limit_per_source,
         is_address_canon_available=is_address_canon_available,
     )
-    source_selects = _current_provider_directory_source_selects(
-        db_schema,
-        available_relation_map,
-        base_source_selects,
-        source_ids=(provider_directory_source_ids if is_partial_provider_directory_refresh else None),
-        run_id=(provider_directory_run_id if is_partial_provider_directory_refresh else None),
-        test_limit_per_source=test_limit_per_source,
-        has_compatibility_data=has_compatibility_data,
-        partial_refresh=is_partial_provider_directory_refresh,
-    )
+    with named_source_editions.address_editions(editions):
+        source_selects = _current_provider_directory_source_selects(
+            db_schema,
+            available_relation_map,
+            base_source_selects,
+            source_ids=(provider_directory_source_ids if is_partial_provider_directory_refresh else None),
+            run_id=(provider_directory_run_id if is_partial_provider_directory_refresh else None),
+            test_limit_per_source=test_limit_per_source,
+            has_compatibility_data=has_compatibility_data,
+            partial_refresh=is_partial_provider_directory_refresh,
+        )
     await _capture_provider_directory_overlay_alias_fence(
         db_schema,
         source_selects,
         context,
     )
+    # An overlay republished after a later switch would not match these editions; the fence covers later changes.
+    if not candidate_preparation.current() and editions != await named_source_editions.selected_editions(directory):
+        raise RuntimeError("entity-address-unified named editions changed during source selection")
     affected_group_table: str | None = None
     if is_partial_provider_directory_refresh:
         if not await _has_table(db_schema, EntityAddressUnified.__main_table__):
@@ -11683,36 +11644,39 @@ async def process_entity_address_unified_data(ctx, task=None):
                 "entity-address-unified provider-directory-partial refresh requested, but the live "
                 "entity_address_unified table does not exist; run refresh_mode=full first."
             )
-        await address_batches.prepare_partial(
-            importlib.import_module(__name__),
-            db_schema,
-            stage_table,
-            available_relation_map,
-            source_ids=provider_directory_source_ids,
-            run_id=provider_directory_run_id,
-        )
-        source_selects = _current_provider_directory_source_selects(
-            db_schema,
-            available_relation_map,
-            base_source_selects,
-            source_ids=provider_directory_source_ids,
-            run_id=provider_directory_run_id,
-            test_limit_per_source=test_limit_per_source,
-            has_compatibility_data=has_compatibility_data,
-            partial_refresh=True,
-        )
+        with named_source_editions.address_editions(editions):
+            await address_batches.prepare_partial(
+                importlib.import_module(__name__),
+                db_schema,
+                stage_table,
+                available_relation_map,
+                source_ids=provider_directory_source_ids,
+                run_id=provider_directory_run_id,
+            )
+            source_selects = _current_provider_directory_source_selects(
+                db_schema,
+                available_relation_map,
+                base_source_selects,
+                source_ids=provider_directory_source_ids,
+                run_id=provider_directory_run_id,
+                test_limit_per_source=test_limit_per_source,
+                has_compatibility_data=has_compatibility_data,
+                partial_refresh=True,
+            )
         affected_group_table = _partial_affected_group_table(stage_table)
         context["partial_provider_directory_affected_group_table"] = affected_group_table
         context["partial_affected_group_table"] = affected_group_table
-        await preparation_admission.create_stage_sql(
-            db_schema,
-            affected_group_table,
-            _prepare_partial_affected_groups_sql(
+        with named_source_editions.address_editions(editions):
+            affected_groups_sql = _prepare_partial_affected_groups_sql(
                 db_schema,
                 affected_group_table,
                 source_selects,
                 source_ids=provider_directory_source_ids,
-            ),
+            )
+        await preparation_admission.create_stage_sql(
+            db_schema,
+            affected_group_table,
+            affected_groups_sql,
             context=context,
             run_id=run_id,
             phase="entity-address-unified preparing affected Provider Directory groups",
@@ -11752,17 +11716,18 @@ async def process_entity_address_unified_data(ctx, task=None):
             or 0
         )
         context["partial_provider_directory_affected_groups"] = affected_group_rows
-        await partial_projection.prepare_load(
-            importlib.import_module(__name__), db_schema, available_relation_map, affected_group_table
-        )
-        source_selects = _provider_directory_partial_replacement_source_selects(
-            db_schema,
-            available_relation_map,
-            base_source_selects,
-            affected_group_table=affected_group_table,
-            test_limit_per_source=test_limit_per_source,
-            has_compatibility_data=has_compatibility_data,
-        )
+        with named_source_editions.address_editions(editions):
+            await partial_projection.prepare_load(
+                importlib.import_module(__name__), db_schema, available_relation_map, affected_group_table
+            )
+            source_selects = _provider_directory_partial_replacement_source_selects(
+                db_schema,
+                available_relation_map,
+                base_source_selects,
+                affected_group_table=affected_group_table,
+                test_limit_per_source=test_limit_per_source,
+                has_compatibility_data=has_compatibility_data,
+            )
         if not source_selects:
             raise RuntimeError(
                 "entity-address-unified provider-directory-partial refresh requires "

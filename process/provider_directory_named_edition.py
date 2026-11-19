@@ -3,12 +3,14 @@
 
 import hashlib
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from types import SimpleNamespace
 
 from db.plan_release_storage import storage_identifier, storage_relation
 
+_ADDRESS_EDITIONS = ContextVar("provider_directory_address_editions", default=())
 POINTER_SCHEMA = "provider_directory_editions"
 POINTER_TABLE = "current_edition"
 HEADER = "provider_directory_endpoint_dataset"
@@ -158,9 +160,9 @@ def _literal(value):
     return "'" + value.replace("'", "''") + "'"
 
 
-def source_registration_sql(catalog_schema, editions):
+def source_registration_sql(catalog_schema, editions, *, only=False):
     """Keep registrations catalog-bound and named data on its exact source aliases."""
-    relation = storage_relation(catalog_schema, "provider_directory_source")
+    relation = ("ONLY " if only else "") + storage_relation(catalog_schema, "provider_directory_source")
     if not editions:
         return relation
     endpoints = ",".join(_literal(edition.endpoint_id) for edition in editions)
@@ -176,10 +178,10 @@ def source_registration_sql(catalog_schema, editions):
     return "(SELECT * FROM " + relation + " WHERE " + " OR ".join(predicates) + ")"
 
 
-def source_relation_sql(catalog_schema, table_name, editions=(), *, columns):
+def source_relation_sql(catalog_schema, table_name, editions=(), *, columns, only=False):
     """Project a closed published relation set using portable schema names."""
     _require(table_name in {HEADER, *PAYLOAD_TABLES} and bool(columns))
-    relation = storage_relation(catalog_schema, table_name)
+    relation = ("ONLY " if only else "") + storage_relation(catalog_schema, table_name)
     editions = tuple(editions)
     if not editions:
         return relation
@@ -198,6 +200,49 @@ def source_relation_sql(catalog_schema, table_name, editions=(), *, columns):
         for edition in editions
     )
     return "(" + " UNION ALL ".join(selects) + ")"
+
+
+@contextmanager
+def address_editions(editions):
+    """Build the Address SQL inside this scope from one selection's current named editions."""
+    token = _ADDRESS_EDITIONS.set(tuple(editions))
+    try:
+        yield
+    finally:
+        _ADDRESS_EDITIONS.reset(token)
+
+
+def address_source_relations(catalog_schema, editions=None):
+    """Return Address's source, header and resource relations with current named editions applied."""
+    resource = "provider_directory_dataset_resource"
+    editions = _ADDRESS_EDITIONS.get() if editions is None else editions
+    if not editions:
+        return tuple(f"{catalog_schema}.{name}" for name in ("provider_directory_source", HEADER, resource))
+    header_columns = (
+        "endpoint_id",
+        "dataset_id",
+        "dataset_hash",
+        "acquisition_root_run_id",
+        "import_run_id",
+        "status",
+        "is_current",
+        "published_at",
+        "superseded_at",
+        "publication_metadata_json",
+    )
+    resource_columns = (
+        "dataset_id",
+        "resource_type",
+        "resource_id",
+        "payload_hash",
+        "payload_json",
+        "acquired_resource_sha256",
+    )
+    return (
+        source_registration_sql(catalog_schema, editions),
+        source_relation_sql(catalog_schema, HEADER, editions, columns=header_columns),
+        source_relation_sql(catalog_schema, resource, editions, columns=resource_columns),
+    )
 
 
 def artifact_dataset_relation(directory, schema, editions=()):
@@ -439,20 +484,53 @@ async def reuse_artifact_relations(
         return selected_proof_by_name, summary if source_summary else None
 
 
+async def selected_editions(directory, source_ids=None):
+    """Return the current editions from one repeatable snapshot, for SQL that reads them by name later."""
+    async with directory._artifact_selection_snapshot(source_ids) as editions:
+        return editions
+
+
+async def locked_source_editions(directory, source_ids):
+    """Read selected pointers under READ COMMITTED once their endpoints' publication locks are held."""
+    database = directory.db
+    session = database._transaction_binding().session
+    sources = storage_relation(directory._schema(), directory.ProviderDirectorySource.__tablename__)
+
+    async def endpoints():
+        """List the selected sources' endpoints as this statement sees them."""
+        rows = await database.all(
+            f"SELECT DISTINCT endpoint_id FROM {sources} WHERE source_id=ANY(CAST(:source_ids AS varchar[])) "
+            "AND endpoint_id IS NOT NULL ORDER BY endpoint_id",
+            source_ids=list(source_ids),
+        )
+        return [directory._pagination_checkpoint_row_mapping(row)["endpoint_id"] for row in rows]
+
+    endpoint_ids = await endpoints()
+    # Every pointer writer holds this lock while it switches, so these pointers stay put until commit.
+    await directory._lock_artifact_fence_endpoint_advisories(SimpleNamespace(endpoint_ids=endpoint_ids), database)
+    if await endpoints() != endpoint_ids:
+        raise directory.ProviderDirectoryArtifactBuildStale("provider_directory_source_endpoint_dataset_changed")
+    return await named_editions_for_session(session, directory._schema(), source_ids)
+
+
 async def resolve_artifact_datasets(
     directory,
     source_ids: list[str] | tuple[str, ...] | None,
     *,
     should_select_validated_candidates: bool = False,
     allow_published_replacement: bool = False,
+    named_editions=None,
 ):
     """Resolve exact artifact inputs while preserving existing candidate and alias validation."""
     is_explicit_selection = source_ids is not None
     cleaned_source_ids = directory._clean_source_id_list(source_ids)
     if is_explicit_selection and not cleaned_source_ids:
         raise RuntimeError("provider_directory_artifact_source_ids_empty")
-    async with artifact_selection_snapshot(
-        directory, cleaned_source_ids if is_explicit_selection else None
+    # Callers that pass editions read them from pointers they hold through commit.
+    async with (
+        nullcontext(named_editions)
+        if named_editions is not None
+        else artifact_selection_snapshot(directory, cleaned_source_ids if is_explicit_selection else None)
     ) as named_editions:
         dataset_rows = await directory.db.all(
             directory._provider_directory_artifact_dataset_selection_sql(

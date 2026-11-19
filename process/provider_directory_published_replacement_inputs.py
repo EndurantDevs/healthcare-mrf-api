@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 from types import SimpleNamespace
 
+from process import provider_directory_named_edition as named_editions
 from process import provider_directory_published_source_replacement as replacement
 from process import provider_directory_serving_recovery_receipts as receipts
 
@@ -47,8 +48,16 @@ def _entry(directory, row, *, is_publication=False):
     return entry_by_field
 
 
-def _selection_sql(directory, *, is_publication=False):
+def _selection_sql(directory, *, is_publication=False, editions=()):
     source, datasets = replacement._tables(directory)
+    source, datasets = f"ONLY {source}", f"ONLY {datasets}"
+    if editions:
+        # A named endpoint serves its pointer's edition; its superseded catalog header keeps is_current.
+        columns = (*_HEADER_FIELDS, "is_current", "status", "superseded_at", "publication_metadata_summary_json")
+        source = named_editions.source_registration_sql(directory._schema(), editions, only=True)
+        datasets = named_editions.source_relation_sql(
+            directory._schema(), named_editions.HEADER, editions, columns=columns, only=True
+        )
     fields = ",".join("dataset." + name for name in _HEADER_FIELDS)
     if is_publication:
         # A replacement target is always sealed, so its bounded summary lists its sources. The raw document
@@ -61,28 +70,28 @@ def _selection_sql(directory, *, is_publication=False):
     return (
         source,
         datasets,
-        f"SELECT source.source_id,{fields} FROM ONLY {source} source JOIN ONLY {datasets} dataset ON ",
+        f"SELECT source.source_id,{fields} FROM {source} source JOIN {datasets} dataset ON ",
     )
 
 
-async def _serving(directory):
-    _source, datasets, selection = _selection_sql(directory)
+async def _serving(directory, editions=()):
+    _source, datasets, selection = _selection_sql(directory, editions=editions)
     rows = await directory.db.all(
         selection + "dataset.endpoint_id=source.endpoint_id "
-        f"JOIN (SELECT endpoint_id FROM ONLY {datasets} WHERE is_current GROUP BY endpoint_id HAVING count(*)=1) sole "
+        f"JOIN (SELECT endpoint_id FROM {datasets} WHERE is_current GROUP BY endpoint_id HAVING count(*)=1) sole "
         "ON sole.endpoint_id=dataset.endpoint_id WHERE dataset.is_current AND dataset.status='published' "
         "AND dataset.published_at IS NOT NULL AND dataset.superseded_at IS NULL ORDER BY source.source_id"
     )
     return sorted((_entry(directory, row) for row in rows), key=lambda entry: entry["source_id"])
 
 
-async def _publication(directory, pin):
-    _source, datasets, selection = _selection_sql(directory, is_publication=True)
+async def _publication(directory, pin, editions=()):
+    _source, datasets, selection = _selection_sql(directory, is_publication=True, editions=editions)
     rows = await directory.db.all(
         selection + "dataset.dataset_id=:dataset_id AND dataset.endpoint_id=:endpoint_id "
         "WHERE source.source_id=:source_id AND dataset.is_current AND dataset.status='published' "
         "AND dataset.published_at IS NOT NULL AND dataset.superseded_at IS NULL "
-        f"AND (SELECT count(*) FROM ONLY {datasets} current WHERE current.endpoint_id=dataset.endpoint_id AND current.is_current)=1",
+        f"AND (SELECT count(*) FROM {datasets} current WHERE current.endpoint_id=dataset.endpoint_id AND current.is_current)=1",
         **{name: pin[name] for name in ("source_id", "endpoint_id", "dataset_id")},
     )
     _require(len(rows) == 1, "publication_changed")
@@ -175,12 +184,13 @@ async def capture(directory, target_fence):
         dataset_hash=selected.dataset_hash,
         parent_run_id=selected.evidence_run_id,
     )
-    snapshot_by_field = dict(
-        version=2,
-        source_id=selected.source_id,
-        publication=await _publication(directory, pin_by_field),
-        serving=await _serving(directory),
-    )
+    async with directory._artifact_selection_snapshot() as editions:
+        snapshot_by_field = dict(
+            version=2,
+            source_id=selected.source_id,
+            publication=await _publication(directory, pin_by_field),
+            serving=await _serving(directory, editions),
+        )
     validate(snapshot_by_field, pin_by_field)
     incumbent = next(entry for entry in snapshot_by_field["serving"] if entry["source_id"] == selected.source_id)
     _require(
@@ -255,7 +265,7 @@ async def lock_and_check(directory, snapshot, *, pointer="incumbent"):
     """Freeze serving-vector phantoms only inside the caller's bounded final transaction."""
     validate(snapshot)
     _require(pointer in {"incumbent", "publication"}, "pointer_invalid")
-    await receipts.ordinary(directory.db)
+    session, _driver, _actor = await receipts.ordinary(directory.db)
     _require(await directory.db.scalar("SHOW transaction_isolation") == "read committed", "snapshot_changed")
     entries = [*snapshot["serving"], snapshot["publication"]]
     endpoints = SimpleNamespace(endpoint_ids=sorted({entry["header"]["endpoint_id"] for entry in entries}))
@@ -274,7 +284,9 @@ async def lock_and_check(directory, snapshot, *, pointer="incumbent"):
         else entry
         for entry in snapshot["serving"]
     ]
-    _require(await _serving(directory) == expected_entries, "serving_changed")
+    # Every pointer writer holds ROW EXCLUSIVE on the source table while switching, so SHARE holds the pointers.
+    editions = await named_editions.named_editions_for_session(session, directory._schema())
+    _require(await _serving(directory, editions) == expected_entries, "serving_changed")
     _require(
         await _publication(directory, _pin(snapshot["publication"])) == snapshot["publication"], "publication_changed"
     )
