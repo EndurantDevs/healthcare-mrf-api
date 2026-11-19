@@ -111,10 +111,13 @@ async def test_unknown_claims_offices_are_excluded_from_both_count_and_page(monk
         str(arguments[0].compile(compile_kwargs={"literal_binds": True})).lower()
         for arguments, _ in request.ctx.sa_session.executions
     ]
-    assert sum("false" in statement and "where" in statement for statement in statements) >= 2, (
+    expected_statements = 1 if route == "prescription_search" else 2
+    assert sum("false" in statement and "where" in statement for statement in statements) >= expected_statements, (
         document_by_field,
         statements,
     )
+    if route == "prescription_search":
+        assert "count(*) over ()" in statements[-1]
 
 
 @pytest.mark.asyncio
