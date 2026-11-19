@@ -233,7 +233,7 @@ def _assert_location_status_sql_contract(status_sql: str) -> None:
         "role.period_end",
         "overlay.resource_type = 'PractitionerRole'",
         "role.last_seen_run_id = dataset.run_id",
-        "ON role.resource_id IS NULL",
+        "WHERE role.resource_id IS NULL",
         "provider_directory_dataset_resource AS resource",
         "WHEN role.resource_id IS NOT NULL THEN jsonb_build_object",
         "'period', jsonb_build_object",

@@ -234,6 +234,22 @@ async def test_payload_phone_and_overlay_queries_use_the_same_named_edition():
         assert "WHERE dataset_id='" + DATASET_ID + "'" in query
 
 
+async def test_location_status_uses_keyed_typed_and_named_fallback_lookups():
+    """Keep both role lookups bounded by the matched overlay and current dataset."""
+    editions = await named.named_current_editions(_connection(), "mrf")
+    query = npi._location_status_query("mrf", "mrf.provider_directory_address_overlay", editions=editions)
+    selected_overlays, typed_lookup, fallback_lookup = " ".join(str(query).split()).split("LEFT JOIN LATERAL (")
+
+    assert "overlay.source_record_id = ANY(:source_record_ids)" in selected_overlays
+    assert "role.source_id = overlay.source_id" in typed_lookup
+    assert "role.resource_id = overlay.resource_id" in typed_lookup
+    assert "role.last_seen_run_id = dataset.run_id OFFSET 0 ) AS role ON true" in typed_lookup
+    assert 'FROM "directory_edition_example"."provider_directory_dataset_resource"' in fallback_lookup
+    assert "WHERE role.resource_id IS NULL AND resource.dataset_id = dataset.dataset_id" in fallback_lookup
+    assert "resource.resource_type = 'PractitionerRole'" in fallback_lookup
+    assert "resource.resource_id = overlay.resource_id OFFSET 0 ) AS resource ON true" in fallback_lookup
+
+
 @pytest.mark.parametrize("affiliation", [False, True])
 async def test_evidence_loader_passes_the_named_relations_to_its_query(monkeypatch, affiliation):
     connection = _connection()
