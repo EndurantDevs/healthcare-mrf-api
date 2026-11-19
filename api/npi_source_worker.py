@@ -147,7 +147,7 @@ def is_npi_source_secret_selected(selection, worker_class, launch_request):
     return spec is not None and authorized_npi_source_worker_launch(spec, launch_request) is not None
 
 
-def is_npi_source_job_matching(job, launch):
+def is_npi_source_job_matching(job, launch, *, launch_request=None):
     """Refuse changed bootstrap code, native target or process isolation on reuse."""
     from api.control_workers import (
         _BY_WORKER_CLASS,
@@ -164,7 +164,10 @@ def is_npi_source_job_matching(job, launch):
         pod = template["spec"]
         containers = pod["containers"]
         security = pod["securityContext"]
-        volumes = [*_worker_job_pvc_volumes(), *_worker_job_secret_volumes(_BY_WORKER_CLASS[_WORKER_CLASS])]
+        volumes = [
+            *_worker_job_pvc_volumes(),
+            *_worker_job_secret_volumes(_BY_WORKER_CLASS[_WORKER_CLASS], launch_request=launch_request),
+        ]
         expected_security = _worker_job_pod_security_context(has_group_read_volume="fsGroup" in security)
         expected_security.update(runAsUser=10001, runAsGroup=10001)
         if "fsGroup" in expected_security:
