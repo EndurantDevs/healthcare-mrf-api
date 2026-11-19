@@ -61,6 +61,7 @@ async def serving_schema():
     try:
         await connection.execute(f'CREATE SCHEMA "{schema}"')
         async with engine.begin() as sqlalchemy_connection:
+            fixture_lock_timeout = await sqlalchemy_connection.scalar(text("SHOW lock_timeout"))
             for filename in _SERVING_MIGRATIONS:
                 path = Path(__file__).parents[1] / "alembic/versions" / filename
                 spec = importlib.util.spec_from_file_location(filename.removesuffix(".py"), path)
@@ -72,6 +73,11 @@ async def serving_schema():
                         migration.upgrade()
 
                 await sqlalchemy_connection.run_sync(upgrade)
+                if filename == "20261007050000_canonical_address_network_ids.py":
+                    # The column migration bounds its own lock wait. Keep the remaining setup in this transaction.
+                    await sqlalchemy_connection.execute(
+                        text("SELECT set_config('lock_timeout', :timeout, true)"), {"timeout": fixture_lock_timeout}
+                    )
         yield connection, schema, engine
     finally:
         for name, previous in previous_schema_by_name.items():

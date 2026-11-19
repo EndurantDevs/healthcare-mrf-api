@@ -64,6 +64,7 @@ async def resume_address(database, ctx, task):
     if type(task) is not dict or not any(type(name) is str and name.startswith(_PREFIX) for name in task):
         return None
     from process import provider_directory_generic_source_policy as source
+    from process import provider_directory_named_edition as named_editions
     from process import provider_directory_published_replacement_inputs as serving_inputs
     from process import provider_directory_published_replacement_journal as journal
     from process import provider_directory_serving_recovery as recovery
@@ -76,10 +77,12 @@ async def resume_address(database, ctx, task):
     directory = importlib.import_module("process.provider_directory_fhir")
     receipts.require(directory.db is database, "database_changed")
     generation = journal.generation(pin)
+    # Immutable editions read by name; a later pointer switch fails the build's own current-dataset fence.
+    editions = await named_editions.selected_editions(directory, [pin["source_id"]])
     async with asyncio.timeout(receipts.PREPARATION_SECONDS), database.transaction():
         await database.status("SET LOCAL lock_timeout='500ms'")
         await receipts.ordinary(database)
-        publication = await serving_inputs._publication(directory, pin)
+        publication = await serving_inputs._publication(directory, pin, editions)
         receipts.require(
             serving_inputs._pin(publication) == pin,
             "replacement_address_publication_changed",
