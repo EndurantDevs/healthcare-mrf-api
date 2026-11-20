@@ -14,6 +14,7 @@ from process.registry_fhir_catalog_extraction import (
     MAX_BYTES,
     MAX_ROWS,
     RESOURCE_TYPES,
+    SOURCE_RESOURCE_ID,
     _check_fhir_catalog_page_bounds,
     _decode_fhir_catalog_page,
     fhir_catalog_json_bytes,
@@ -102,7 +103,7 @@ def _observation_frame(row):
         type(row["resource_type"]) is not str
         or row["resource_type"] not in RESOURCE_TYPES
         or type(row["resource_id"]) is not str
-        or re.fullmatch(r"[A-Za-z0-9.-]{1,64}", row["resource_id"]) is None
+        or SOURCE_RESOURCE_ID.fullmatch(row["resource_id"]) is None
         or type(row["payload_json"]) is not dict
     ):
         _fail()

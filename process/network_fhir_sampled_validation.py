@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from process.network_address_projection import _identifier
 from process.network_fhir_source_epoch import _borrowed_epoch_settings, _set_content_settings
-from process.network_fhir_source_witness_contract import canonical, digest, source_origin
+from process.network_fhir_source_witness_contract import canonical, digest, is_profile_header_schema, source_origin
 from process.network_fhir_typed_capture import TypedGraphAnchor, TypedGraphRead, load_typed_graph_capture
 from process.network_fhir_typed_contract import (
     PAIR_COLUMNS,
@@ -599,7 +599,7 @@ async def verify_sampled_typed_capture(source_export, connection, document, *, s
     )
     require(callable(source_export) and bool(getattr(source_export, "args", ())), "source_factory")
     origin = source_origin(scope.reviewed_origin)
-    require(scope.source_profile.catalog_schema == origin.header_relation["schema"], "source_profile")
+    require(is_profile_header_schema(scope.source_profile, origin), "source_profile")
     graph_read = await load_typed_graph_capture(connection, document, expected_anchor=scope.expected_anchor)
     require(source_origin(graph_read.document["origin"]) == origin, "verification_scope")
     source_by_network, candidate_by_network = await _verify_samples(

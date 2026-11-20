@@ -16,6 +16,7 @@ from process.network_fhir_source_witness_contract import (
     CONTRACT,
     SourceWitnessCompletionOrigin,
     is_completion_v3_origin,
+    is_profile_header_schema,
     source_origin,
     source_resource_marker_valid,
 )
@@ -44,6 +45,7 @@ from process.network_fhir_typed_sql import (
     PROJECT_SQL,
 )
 from process.provider_directory_projection_fhir_values import is_valid_npi
+from process.registry_fhir_catalog_extraction import SOURCE_RESOURCE_ID
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 _RESOURCE_FIELDS = {
@@ -61,7 +63,6 @@ _DDL = {
     "checks": CHECKER_DDL,
     "plans": PLAN_EVIDENCE_DDL,
 }
-_ID = re.compile(r"[A-Za-z0-9.-]{1,64}")
 _DATE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2}))?"
 )
@@ -139,7 +140,7 @@ def _page_rows(page, origin, counts, after):
         )
         kind, identity = resource_row["resource_type"], resource_row["resource_id"]
         require(
-            type(kind) is str and kind in counts and type(identity) is str and _ID.fullmatch(identity),
+            type(kind) is str and kind in counts and type(identity) is str and SOURCE_RESOURCE_ID.fullmatch(identity),
             "resource_identity",
         )
         key = kind, identity
@@ -607,7 +608,7 @@ async def produce_typed_source_graph(
 
     origin, as_of = source_origin(reviewed_origin), policy_date(membership_as_of)
     has_plan_tiers = origin.source_id == UHC_PROVIDER_FILE_SOURCE_ID
-    require(source_profile.catalog_schema == origin.header_relation["schema"], "source_profile")
+    require(is_profile_header_schema(source_profile, origin), "source_profile")
     stage.require_ready(complete=False)
     await _empty_tables(connection, stage)
     total = await _consume(

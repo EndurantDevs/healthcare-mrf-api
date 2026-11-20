@@ -19,6 +19,7 @@ from process.network_fhir_source_witness_contract import (
     source_origin,
 )
 from process.network_fhir_typed_contract import TypedFHIRGraphError, TypedFHIRGraphStage
+from process.provider_directory_named_edition import edition_schema_name
 from process.registry_fhir_catalog_sources import FHIRCatalogSourceReadProfile
 from tests.test_named_fhir_typed_graph import COUNTS, GraphConnection
 from tests.test_network_fhir_source_witness_contract import captured, origin_fields
@@ -235,3 +236,82 @@ async def test_witness_recipe_selects_configured_catalog(monkeypatch, state):
         pin.assert_not_awaited()
     approval.assert_awaited_once_with(connection, recipe, approved, "control_example", retained_approval=False)
     runtime.source_export.assert_not_called()
+
+
+def _edition_export(schema, role_id):
+    """Serve one named-edition dataset whose header and resources share the derived schema."""
+    origin = source_origin(
+        origin_fields()
+        | {
+            "schema_name": schema,
+            "header_relation": {"schema": schema, "name": "provider_directory_endpoint_dataset"},
+            "resource_relation": {"schema": schema, "name": "provider_directory_dataset_resource"},
+            "resource_counts": (("Location", 1), ("Organization", 1), ("PractitionerRole", 1)),
+            "resource_hashes": (("Location", "e" * 64), ("Organization", "f" * 64), ("PractitionerRole", "0" * 64)),
+            "descriptor_counts": (("Location", 1), ("Organization", 1), ("PractitionerRole", 1)),
+        }
+    )
+    resource_rows = tuple(
+        {
+            "dataset_id": origin.dataset_id,
+            "resource_type": kind,
+            "resource_id": identity,
+            "payload_hash": "a" * 64,
+            "payload_json": {"resource_id": identity},
+            "acquired_resource_sha256": None,
+        }
+        for kind, identity in (
+            ("Location", "office-one"),
+            ("Organization", "network-one"),
+            ("PractitionerRole", role_id),
+        )
+    )
+
+    async def pages():
+        yield resource_rows
+
+    @asynccontextmanager
+    async def export(**selection):
+        yield {"contract": CONTRACT, "origin": origin, "resources": pages}
+
+    return origin, export
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("schema", "role_id", "failure"),
+    [
+        (edition_schema_name("dataset-one"), "role-" + "a" * 62, None),
+        ("directory_edition_" + "0" * 32, "role-one", "source_profile"),
+        (edition_schema_name("dataset-one"), "r" * 257, "resource_identity"),
+    ],
+    ids=["named-edition-long-role-id", "foreign-edition", "overlong-id"],
+)
+async def test_typed_graph_reads_named_edition_and_long_role_ids(monkeypatch, schema, role_id, failure):
+    origin, export = _edition_export(schema, role_id)
+    profile = FHIRCatalogSourceReadProfile("configured_storage", "source_catalog")
+    connection = GraphConnection()
+    connection.fetchval = AsyncMock(return_value=True)
+    stage = TypedFHIRGraphStage(
+        {"cells": "source_cells", "addresses": "source_addresses", "pairs": "source_pairs"},
+        schema_name="candidate_generation",
+    )
+    projected_rows = []
+    monkeypatch.setattr(
+        typed, "_project_page", AsyncMock(side_effect=lambda _c, _s, wire_rows, **_: projected_rows.extend(wire_rows))
+    )
+    monkeypatch.setattr(typed, "_canonicalize", AsyncMock())
+    monkeypatch.setattr(typed, "_pairs", AsyncMock())
+    monkeypatch.setattr(typed, "_counts", AsyncMock(return_value=COUNTS | {"source_rows": 3, "projected_rows": 3}))
+    arguments_by_name = dict(source_profile=profile, reviewed_origin=origin, membership_as_of="2026-01-01")
+    if failure is None:
+        document = await typed.produce_typed_source_graph(export, connection, stage, **arguments_by_name)
+        assert document["origin"]["header_relation"]["schema"] == schema and document["counts"]["source_rows"] == 3
+        assert [projected_row["resource_id"] for projected_row in projected_rows] == [
+            "office-one",
+            "network-one",
+            role_id,
+        ]
+    else:
+        with pytest.raises(TypedFHIRGraphError, match=failure):
+            await typed.produce_typed_source_graph(export, connection, stage, **arguments_by_name)

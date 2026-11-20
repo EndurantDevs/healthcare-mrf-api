@@ -164,10 +164,17 @@ fn exact_text(text: &str, maximum: usize) -> bool {
 }
 
 fn fhir_id(text: &str) -> bool {
-    (1..=64).contains(&text.len())
-        && text
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'))
+    (1..=64).contains(&text.len()) && id_bytes(text)
+}
+
+// Source rows keep publisher ids up to their 256-character column; some exceed FHIR's 64-character limit.
+fn source_resource_id(text: &str) -> bool {
+    (1..=256).contains(&text.len()) && id_bytes(text)
+}
+
+fn id_bytes(text: &str) -> bool {
+    text.bytes()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'))
 }
 
 fn encode(bytes: &[u8], flag: Option<&AtomicBool>) -> Result<RetainedFhirCaptureBatch> {
@@ -298,7 +305,7 @@ impl Encoder<'_, '_> {
             .output
             .families
             .contains_key(row.resource_type.as_ref())
-            || !fhir_id(&row.resource_id)
+            || !source_resource_id(&row.resource_id)
             || row.payload_hash.len() != 64
             || !row
                 .payload_hash
