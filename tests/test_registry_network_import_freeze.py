@@ -187,3 +187,25 @@ async def test_ordinary_run_keeps_one_owner_request_and_preparation_until_comple
     assert events == ["source_open", "source_closed"]
     assert prepare.await_count == admit.await_count == case.freezer.await_count == 1
     assert case.validate.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_freeze_retries_lock_timeouts_and_keeps_validation_errors(monkeypatch):
+    import asyncpg
+    from sqlalchemy.exc import DBAPIError
+
+    handoff_by_field = {"kind": "network", "candidate_id": str(uuid4())}
+    receipt_by_field = {"preparation_id": handoff_by_field["candidate_id"], "state": "frozen"}
+    freezer = AsyncMock(side_effect=[asyncpg.LockNotAvailableError("busy"), TimeoutError(), receipt_by_field])
+    sleep = AsyncMock()
+    monkeypatch.setattr(runtime.asyncio, "sleep", sleep)
+    assert await runtime.freeze_network_import_preparation(freezer, handoff_by_field, {}) == receipt_by_field
+    assert freezer.await_count == 3 and sleep.await_count == 2
+    wrapped = DBAPIError("SET LOCAL lock_timeout", {}, asyncpg.LockNotAvailableError("busy"))
+    freezer = AsyncMock(side_effect=[wrapped, receipt_by_field])
+    assert await runtime.freeze_network_import_preparation(freezer, handoff_by_field, {}) == receipt_by_field
+    for permanent in (ValueError("preparation_not_handed_off"), asyncpg.InsufficientPrivilegeError("denied")):
+        refused = AsyncMock(side_effect=permanent)
+        with pytest.raises(type(permanent)):
+            await runtime.freeze_network_import_preparation(refused, handoff_by_field, {})
+        assert refused.await_count == 1

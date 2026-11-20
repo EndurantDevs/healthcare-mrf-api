@@ -1,8 +1,11 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Observe registered source data in a caller-owned read-only snapshot."""
 
+import copy
 import re
 from collections import deque
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 
 import asyncpg
@@ -34,6 +37,7 @@ FHIR_CATALOG_HEADER_TABLE = _HEADER
 FHIR_CATALOG_RESOURCE_TABLE = _RESOURCE
 FHIR_CATALOG_SOURCE_TABLE = _SOURCE
 FHIR_CATALOG_ENDPOINT_TABLE = _ENDPOINT
+_KNOWN_FAMILIES = ContextVar("registry_fhir_catalog_known_families", default=None)
 
 
 class FHIRCatalogObservedSourceError(ValueError):
@@ -129,6 +133,24 @@ async def _registration(connection, profile, endpoint_id):
     return source_uri, source_aliases
 
 
+@contextmanager
+def known_fhir_catalog_families(families_by_dataset):
+    """Reuse admitted content facts for (dataset id, dataset sha256) pairs while observing inside this scope."""
+    token = _KNOWN_FAMILIES.set(dict(families_by_dataset))
+    try:
+        yield
+    finally:
+        _KNOWN_FAMILIES.reset(token)
+
+
+async def _observed_families(connection, profile, dataset, tables, source_uri):
+    # A published dataset never changes, so the families its earlier admission recorded still describe it.
+    known = (_KNOWN_FAMILIES.get() or {}).get(dataset)
+    if known is not None:
+        return copy.deepcopy(known)
+    return await _facts(connection, profile, dataset[0], tables, source_uri)
+
+
 async def _facts(connection, profile, dataset_id, tables, source_uri):
     report = current_fhir_catalog_report()
     if report:
@@ -202,7 +224,9 @@ async def collect_fhir_catalog_observation(connection, profile, *, endpoint_id, 
             header = await _header(connection, profile, endpoint_id, dataset_id, require_current, header_schema)
             source_uri, aliases = await _registration(connection, profile, endpoint_id)
             tables = await catalog_observation_tables(connection, profile, dataset_id, header_schema)
-            families = await _facts(connection, profile, dataset_id, tables, source_uri)
+            families = await _observed_families(
+                connection, profile, (dataset_id, header["dataset_hash"]), tables, source_uri
+            )
     except asyncpg.PostgresError as error:
         raise FHIRCatalogObservedSourceError("registry_fhir_catalog_observed_source_read_unavailable") from error
     descriptor = validate_fhir_catalog_source_descriptor(

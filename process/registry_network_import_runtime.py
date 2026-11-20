@@ -1,11 +1,13 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Install native Source discovery and prepare the coupled catalogue candidate."""
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 
 import asyncpg
+from sqlalchemy.exc import DBAPIError
 
 
 @dataclass(frozen=True, repr=False)
@@ -26,6 +28,31 @@ class NativeNetworkImportRuntime:
         return self.inventory.config
 
 
+FREEZE_ATTEMPTS = 40
+FREEZE_RETRY_SECONDS = 30
+_CONTENTION_SQLSTATES = frozenset({"55P03", "57014", "40P01"})  # lock not available, statement timeout, deadlock
+
+
+def _is_lock_contention(error):
+    if isinstance(error, TimeoutError):
+        return True
+    cause = error.orig if isinstance(error, DBAPIError) else error
+    codes = {getattr(cause, "sqlstate", None), getattr(cause.__cause__, "sqlstate", None)}
+    return not _CONTENTION_SQLSTATES.isdisjoint(codes)
+
+
+async def _retried_freeze(freeze_preparation, handoff, preparation_roles):
+    # The freeze takes short exclusive locks on freshly loaded tables that autovacuum may hold for minutes.
+    # A failed attempt rolls back and a committed freeze returns its state, so retrying is safe.
+    for attempt in range(1, FREEZE_ATTEMPTS + 1):
+        try:
+            return await freeze_preparation(handoff, preparation_roles)
+        except (TimeoutError, DBAPIError, asyncpg.PostgresError) as error:
+            if attempt == FREEZE_ATTEMPTS or not _is_lock_contention(error):
+                raise
+            await asyncio.sleep(FREEZE_RETRY_SECONDS)
+
+
 async def freeze_network_import_preparation(freeze_preparation, handoff, preparation_roles):
     """Freeze only the exact own catalog or network handoff using the existing publisher."""
     if (
@@ -34,7 +61,7 @@ async def freeze_network_import_preparation(freeze_preparation, handoff, prepara
         or handoff.get("kind") not in {"catalog", "network"}
     ):
         raise ValueError("registry_imported_freeze_capability_invalid")
-    receipt = await freeze_preparation(handoff, preparation_roles)
+    receipt = await _retried_freeze(freeze_preparation, handoff, preparation_roles)
     if (
         type(receipt) is not dict
         or set(receipt) != {"preparation_id", "state"}
