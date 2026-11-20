@@ -7,7 +7,7 @@ use super::pg::{
     parse_date, parse_npi, parse_timestamptz, parse_uuid, Row, COPY_HEADER, COPY_TRAILER,
 };
 use super::{encoder_for, run_cli, stream, Summary};
-use std::io::Cursor;
+use std::io::{self, Cursor, Read, Write};
 
 pub(super) type Field = Option<Vec<u8>>;
 
@@ -255,6 +255,192 @@ fn cms_npd_typed_copy_stream_keeps_order_across_batches() {
     assert_eq!(rows.len(), 12_000);
     for (index, row) in rows.iter().enumerate() {
         assert_eq!(text(&row[1]), Some(format!("Site {index}").as_str()));
+    }
+}
+
+#[test]
+fn cms_npd_typed_copy_stream_keeps_both_outputs_across_read_chunks() {
+    let first = concat!(
+        r#"{"resourceType":"Practitioner","id":"Practitioner-1234567890","address":[{"city":"First"}]}"#,
+        "\n"
+    );
+    let second = r#"{"resourceType":"Practitioner","id":"Practitioner-1234567891","address":[{"city":"Second"}]}"#;
+    let padding = stream::MAX_LINE_BYTES - second.len();
+    let input = Cursor::new(first.as_bytes())
+        .chain(io::repeat(b' ').take(padding as u64))
+        .chain(Cursor::new(second.as_bytes()));
+    let (encoder, _) = encoder_for("Practitioner").unwrap();
+    let (summary, main, address) =
+        stream::copy_stream(encoder, input, Vec::new(), Some(Vec::new())).unwrap();
+    assert_eq!(
+        summary,
+        Summary {
+            rows: 2,
+            address_rows: 2,
+            input_bytes: (first.len() + stream::MAX_LINE_BYTES) as u64,
+        },
+    );
+    let address = address.unwrap();
+    for copy in [&main, &address] {
+        assert!(copy.starts_with(COPY_HEADER) && copy.ends_with(COPY_TRAILER));
+        let rows = read_rows(&copy[COPY_HEADER.len()..copy.len() - COPY_TRAILER.len()]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(int8(&rows[0][0]), Some(1_234_567_890));
+        assert_eq!(int8(&rows[1][0]), Some(1_234_567_891));
+    }
+    let rows = read_rows(&address[COPY_HEADER.len()..address.len() - COPY_TRAILER.len()]);
+    assert_eq!(text(&rows[0][6]), Some("First"));
+    assert_eq!(text(&rows[1][6]), Some("Second"));
+}
+
+#[test]
+fn cms_npd_typed_copy_stream_rejects_oversized_lines() {
+    let (encoder, _) = encoder_for("Location").unwrap();
+    for size in [stream::MAX_LINE_BYTES + 1, stream::MAX_LINE_BYTES * 2] {
+        let error = stream::copy_stream(
+            encoder,
+            io::repeat(b' ').take(size as u64),
+            Vec::new(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "cms-npd typed copy failed at line 1: line exceeds {} bytes",
+                stream::MAX_LINE_BYTES
+            )
+        );
+    }
+}
+
+#[test]
+fn cms_npd_typed_copy_stream_propagates_reader_failure_without_a_trailer() {
+    struct InterruptedInput;
+
+    impl Read for InterruptedInput {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "input stopped",
+            ))
+        }
+    }
+
+    let (encoder, _) = encoder_for("Location").unwrap();
+    let output = tempfile::NamedTempFile::new().unwrap();
+    let error =
+        stream::copy_stream(encoder, InterruptedInput, output.reopen().unwrap(), None).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(error.to_string(), "input stopped");
+    assert_eq!(std::fs::read(output.path()).unwrap(), COPY_HEADER);
+}
+
+#[test]
+fn cms_npd_typed_copy_address_write_failure_leaves_no_complete_copy() {
+    let input = br#"{"resourceType":"Practitioner","id":"Practitioner-1234567890","address":[{"city":"Example"}]}"#;
+    let (encoder, _) = encoder_for("Practitioner").unwrap();
+    let output = tempfile::NamedTempFile::new().unwrap();
+    let address = tempfile::NamedTempFile::new().unwrap();
+    let result = stream::copy_stream(
+        encoder,
+        Cursor::new(input),
+        output.reopen().unwrap(),
+        Some(std::fs::File::open(address.path()).unwrap()),
+    );
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(output.path()).unwrap(), COPY_HEADER);
+    assert!(std::fs::read(address.path()).unwrap().is_empty());
+}
+
+#[test]
+fn cms_npd_typed_copy_propagates_buffered_output_failures() {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Phase {
+        Header,
+        Rows,
+        Trailer,
+        Flush,
+    }
+
+    #[derive(Debug)]
+    struct OutputSink {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        fail_at: Option<Phase>,
+    }
+
+    impl Write for OutputSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let phase = if bytes == COPY_HEADER {
+                Phase::Header
+            } else if bytes == COPY_TRAILER {
+                Phase::Trailer
+            } else {
+                Phase::Rows
+            };
+            if self.fail_at == Some(phase) {
+                return Err(io::ErrorKind::StorageFull.into());
+            }
+            self.bytes.lock().unwrap().write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_at == Some(Phase::Flush) {
+                return Err(io::ErrorKind::StorageFull.into());
+            }
+            Ok(())
+        }
+    }
+
+    let input = br#"{"resourceType":"Practitioner","id":"Practitioner-1234567890","address":[{"city":"Example"}]}"#;
+    let (encoder, _) = encoder_for("Practitioner").unwrap();
+    let (_, expected_main, expected_address) =
+        stream::copy_stream(encoder, Cursor::new(input), Vec::new(), Some(Vec::new())).unwrap();
+    let expected_address = expected_address.unwrap();
+    for phase in [Phase::Header, Phase::Rows, Phase::Trailer, Phase::Flush] {
+        for fail_main in [true, false] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let sink = |fails| OutputSink {
+                bytes: if fails {
+                    Arc::clone(&bytes)
+                } else {
+                    Arc::default()
+                },
+                fail_at: fails.then_some(phase),
+            };
+            let error = stream::copy_stream(
+                encoder,
+                Cursor::new(input),
+                sink(fail_main),
+                Some(sink(!fail_main)),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::StorageFull,
+                "{phase:?}, main={fail_main}"
+            );
+            let written = bytes.lock().unwrap();
+            let full = if fail_main {
+                &expected_main
+            } else {
+                &expected_address
+            };
+            let expected_bytes = match phase {
+                Phase::Header => &[][..],
+                Phase::Rows => COPY_HEADER,
+                Phase::Trailer => &full[..full.len() - COPY_TRAILER.len()],
+                Phase::Flush => full.as_slice(),
+            };
+            assert_eq!(
+                written.as_slice(),
+                expected_bytes,
+                "{phase:?}, main={fail_main}"
+            );
+        }
     }
 }
 
