@@ -1498,9 +1498,21 @@ def fhir_source_witness_transform(source_pin):
 
 _WITNESS_SQL_V2 = """WITH page AS MATERIALIZED (
         SELECT dataset_id,resource_type,resource_id,payload_hash,acquired_resource_sha256,payload_json::jsonb AS payload,$7::text AS alias_scope
-        FROM {source_namespace}.provider_directory_dataset_resource
-        WHERE dataset_id=$1 AND resource_type IN ('PractitionerRole','OrganizationAffiliation')
-          AND (resource_type COLLATE "C",resource_id COLLATE "C")>($2::text COLLATE "C",$3::text COLLATE "C")
+        FROM (
+          -- Two branches keep both the cursor and the type list as index keys
+          (SELECT dataset_id,resource_type,resource_id,payload_hash,acquired_resource_sha256,payload_json
+            FROM {source_namespace}.provider_directory_dataset_resource
+            WHERE dataset_id=$1 AND resource_type COLLATE "C"=$2::text
+              AND $2::text IN ('PractitionerRole','OrganizationAffiliation')
+              AND resource_id COLLATE "C">$3::text COLLATE "C"
+            ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT $4)
+          UNION ALL
+          (SELECT dataset_id,resource_type,resource_id,payload_hash,acquired_resource_sha256,payload_json
+            FROM {source_namespace}.provider_directory_dataset_resource
+            WHERE dataset_id=$1 AND resource_type COLLATE "C" IN ('PractitionerRole','OrganizationAffiliation')
+              AND resource_type COLLATE "C">$2::text COLLATE "C"
+            ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT $4)
+        ) cursor_page
         ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT $4
       ), plan_networks AS MATERIALIZED (
         SELECT refs.reference AS insurance_plan_reference,evidence.network_resource_id

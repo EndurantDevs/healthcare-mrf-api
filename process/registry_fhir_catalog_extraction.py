@@ -554,9 +554,18 @@ def iter_fhir_catalog_batches(
 _PAGE_SQL = """WITH page AS MATERIALIZED (
   SELECT resource_type,resource_id,payload_hash,payload_json,
     octet_length(payload_json::text)+octet_length(resource_type)+octet_length(resource_id)+256 AS row_bytes
-  FROM {resources}
-  WHERE dataset_id=$1 AND resource_type=ANY($2::text[])
-    AND (resource_type COLLATE "C",resource_id COLLATE "C")>($3::text COLLATE "C",$4::text COLLATE "C")
+  FROM (
+    -- Two branches keep both the cursor and the type list as index keys
+    (SELECT resource_type,resource_id,payload_hash,payload_json FROM {resources}
+      WHERE dataset_id=$1 AND resource_type COLLATE "C"=$3::text AND $3::text=ANY($2::text[])
+        AND resource_id COLLATE "C">$4::text COLLATE "C"
+      ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT $5)
+    UNION ALL
+    (SELECT resource_type,resource_id,payload_hash,payload_json FROM {resources}
+      WHERE dataset_id=$1 AND resource_type COLLATE "C"=ANY($2::text[])
+        AND resource_type COLLATE "C">$3::text COLLATE "C"
+      ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT $5)
+  ) cursor_page
   ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT $5
 ), bounded AS (
   SELECT *,sum(row_bytes) OVER(ORDER BY resource_type COLLATE "C",resource_id COLLATE "C") AS page_bytes,

@@ -384,6 +384,9 @@ async def test_page_iterator_advances_exact_keyset_and_never_writes_or_commits()
     assert connection.fetch.await_args_list[2].args[3:5] == ("Organization", "two")
     query = connection.fetch.await_args_list[0].args[0]
     assert 'resource_type COLLATE "C"' in query and "sum(row_bytes)" in query
+    assert 'resource_type COLLATE "C"=$3::text AND $3::text=ANY($2::text[])' in query
+    assert 'resource_type COLLATE "C"=ANY($2::text[])' in query and 'resource_type COLLATE "C">$3::text' in query
+    assert 'resource_id COLLATE "C")>(' not in query
     assert not any(call[0] in {"execute", "executemany", "commit", "transaction"} for call in connection.mock_calls)
 
 
@@ -428,7 +431,7 @@ async def test_named_pages_keep_one_global_keyset_and_bound():
     assert calls[2].args[3:5] == ("Organization", "two")
     sql = calls[0].args[0]
     assert 'FROM "source_schema"."dataset_resources"' in sql
-    assert sql.count("LIMIT $5") == 1 and sql.count("sum(row_bytes)") == 1
+    assert sql.count("LIMIT $5") == 3 and sql.count("sum(row_bytes)") == 1
     assert calls[0].args[-2:] == (2, 1024)
 
 
