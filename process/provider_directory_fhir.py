@@ -50406,6 +50406,10 @@ async def _persist_fetched_partition_pass(
     request_url, window_fetch = fetched_window
     if pass_number == 2:
         await _restore_pass_one_proof(state, resource_type, window)
+    if await bcbs_minnesota.split_timed_out_window(
+        sys.modules[__name__], source_record, resource_type, config, state, window, window_fetch
+    ):
+        return None
     if _is_partition_window_fetch_retryable(window_fetch):
         return await _partition_window_retry_result(
             model,
@@ -50643,55 +50647,8 @@ async def _fetch_last_updated_partition_resource_rows(
     config: LastUpdatedPartitionConfig,
     fetch_options: LastUpdatedPartitionFetchOptions,
 ) -> ResourceFetchResult:
-    preflight_failure = _partition_preflight_failure(model, fetch_options)
-    if preflight_failure is not None:
-        return preflight_failure
-    prepared_state = await _prepare_partition_state(
-        source_record,
-        resource_type,
-        model,
-        config,
-        fetch_options,
-    )
-    if isinstance(prepared_state, ResourceFetchResult):
-        return prepared_state
-    census_failure = await _observe_partition_pre_census(
-        source_record,
-        resource_type,
-        model,
-        config,
-        prepared_state,
-        fetch_options,
-    )
-    if census_failure is not None:
-        return census_failure
-    count_failure = await _observe_partition_counts(
-        source_record,
-        resource_type,
-        model,
-        config,
-        prepared_state,
-        fetch_options,
-    )
-    if count_failure is not None:
-        return count_failure
-    pass_failure = await _fetch_partition_plan_passes(
-        source_record,
-        resource_type,
-        model,
-        config,
-        prepared_state,
-        fetch_options,
-    )
-    if pass_failure is not None:
-        return pass_failure
-    return await _finish_partition_fetch(
-        source_record,
-        resource_type,
-        model,
-        config,
-        prepared_state,
-        fetch_options,
+    return await time_partition.fetch_partition_resource_rows(
+        sys.modules[__name__], source_record, resource_type, model, config, fetch_options
     )
 
 

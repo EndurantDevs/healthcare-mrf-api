@@ -37,8 +37,8 @@ def resource(resource_id: str, *, updated: str = "first", active: bool = True) -
 
 
 def plan_for_two_windows() -> PartitionPlan:
-    plan = PartitionPlan.create(instant(0), instant(4), ceiling=2, minimum_width=HOUR)
-    plan.observe_count("root", CountObservation.exact(3))
+    plan = PartitionPlan.create(instant(0), instant(4), ceiling=1, minimum_width=HOUR)
+    plan.observe_count("root", CountObservation.exact(2))
     plan.observe_count("root.0", CountObservation.exact(1))
     plan.observe_count("root.1", CountObservation.exact(1))
     return plan
@@ -70,7 +70,7 @@ def test_parse_utc_instant_rejects_non_utc_offset():
 
 def test_recursive_split_produces_ordered_non_overlapping_half_open_windows():
     plan = PartitionPlan.create(instant(0), instant(4), ceiling=2, minimum_width=HOUR)
-    plan.observe_count("root", CountObservation.exact(8))
+    plan.observe_count("root", CountObservation.exact(6))
     plan.observe_count("root.0", CountObservation.exact(4))
     plan.observe_count("root.1", CountObservation.exact(2))
     plan.observe_count("root.0.0", CountObservation.exact(2))

@@ -21,7 +21,6 @@ from process.provider_directory_time_partition_primitives import (
     validate_utc_instant,
 )
 
-
 UTC = datetime.UTC
 HOUR = datetime.timedelta(hours=1)
 
@@ -48,8 +47,8 @@ def _new_checkpoint() -> dict[str, object]:
 
 
 def _split_checkpoint() -> dict[str, object]:
-    plan = _new_plan()
-    plan.observe_count("root", CountObservation.exact(3))
+    plan = PartitionPlan.create(_instant(0), _instant(2), ceiling=1, minimum_width=HOUR)
+    plan.observe_count("root", CountObservation.exact(2))
     plan.observe_count("root.0", CountObservation.exact(1))
     plan.observe_count("root.1", CountObservation.exact(1))
     return plan.to_dict()
@@ -183,9 +182,7 @@ def _remove_root(checkpoint_by_field):
 
 
 def _move_first_leaf_inside_root(checkpoint_by_field):
-    checkpoint_by_field["windows"][1]["start"] = (
-        "2026-01-01T00:00:01.000000Z"
-    )
+    checkpoint_by_field["windows"][1]["start"] = "2026-01-01T00:00:01.000000Z"
 
 
 def _add_pass_to_uncounted_window(checkpoint_by_field):
@@ -205,9 +202,7 @@ def _make_ready_window_exceed_ceiling(checkpoint_by_field):
 
 
 def _make_pass_count_mismatch(checkpoint_by_field):
-    checkpoint_by_field["windows"][0].update(
-        {"state": "ready", "count": 1, "passes": {"1": {}}}
-    )
+    checkpoint_by_field["windows"][0].update({"state": "ready", "count": 1, "passes": {"1": {}}})
 
 
 def _make_twin_pass_mismatch(checkpoint_by_field):
@@ -281,9 +276,7 @@ def test_checkpoint_rejects_inconsistent_state(
 
 def test_checkpoint_rejects_duplicate_windows_and_missing_config():
     duplicate_checkpoint_by_field = _new_checkpoint()
-    duplicate_checkpoint_by_field["windows"].append(
-        dict(duplicate_checkpoint_by_field["windows"][0])
-    )
+    duplicate_checkpoint_by_field["windows"].append(dict(duplicate_checkpoint_by_field["windows"][0]))
     with pytest.raises(PartitionPlanError, match="invalid partition checkpoint"):
         PartitionPlan.from_dict(duplicate_checkpoint_by_field)
 
