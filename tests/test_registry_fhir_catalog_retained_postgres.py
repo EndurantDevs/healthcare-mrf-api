@@ -34,6 +34,7 @@ from process.registry_fhir_catalog_read import FHIRCatalogQuery, read_fhir_catal
 from process.registry_fhir_catalog_registry_reader import (
     fhir_catalog_registry_reads,
 )
+from process.registry_fhir_catalog_retention import retire_unpublished_fhir_catalog_candidates
 from process.registry_fhir_catalog_sources import fhir_catalog_source_generation
 from process.registry_fhir_catalog_store import load_named_catalog_preparation
 from process.registry_fhir_catalog_sync import prepare_fhir_catalog_snapshot
@@ -573,21 +574,25 @@ async def _rerun_builds_new_candidate(case, refused):
     return rerun
 
 
-async def _retire_abandoned_catalog_candidate(case, target):
-    """Administrator cleanup drops the abandoned candidate tables and its preparation records."""
-    handoff = await case.connection.fetchval(
-        "SELECT handoff->>'storage_schema' FROM hp_snapshot_retention.preparation "
-        "WHERE preparation_id=$1 AND state='abandoned'",
-        UUID(target.candidate_id),
+async def _retire_abandoned_catalog_candidates(case, *targets):
+    """The scheduled sweep drops the abandoned candidate tables and their preparation records."""
+    candidates = [UUID(target.candidate_id) for target in targets]
+    assert await case.connection.fetchval(
+        "SELECT count(*) FROM hp_snapshot_retention.preparation WHERE preparation_id=ANY($1::uuid[]) "
+        "AND state='abandoned'",
+        candidates,
+    ) == len(targets)
+    report = await retire_unpublished_fhir_catalog_candidates(
+        case.connection, control_schema=case.control, execute=True
     )
-    assert handoff == target.schema_name
-    await case.connection.execute(f'DROP SCHEMA "{handoff}" CASCADE')
-    await cleanup_catalog_preparations(case.connection, [handoff])
-    assert await case.connection.fetchval("SELECT to_regnamespace($1)", handoff) is None
-    assert not await case.connection.fetchval(
-        "SELECT EXISTS(SELECT FROM hp_snapshot_retention.preparation WHERE preparation_id=$1)",
-        UUID(target.candidate_id),
-    )
+    assert report == {"state": "retired", "schemas": [target.schema_name for target in targets], "deferred": []}
+    for target in targets:
+        assert await case.connection.fetchval("SELECT to_regnamespace($1)", target.schema_name) is None
+    for table in ("preparation", "preparation_claim", "preparation_relation"):
+        assert not await case.connection.fetchval(
+            f"SELECT EXISTS(SELECT FROM hp_snapshot_retention.{table} WHERE preparation_id=ANY($1::uuid[]))",
+            candidates,
+        )
 
 
 @pytest.mark.parametrize("damage", ["omitted_products", "fresh_observation", "carried_observation"])
@@ -624,7 +629,7 @@ async def test_reviewed_retained_product_seal_rejects_untrusted_candidate(
         assert len(changed_candidates) == 1
         await _assert_refused_candidate_abandoned(case, changed_candidates[0])
         await _rerun_builds_new_candidate(case, changed_candidates[0])
-        await _retire_abandoned_catalog_candidate(case, changed_candidates[0])
+        await _retire_abandoned_catalog_candidates(case, changed_candidates[0])
         assert await case.connection.fetchval(
             f'SELECT metadata_generation FROM "{case.control}".network_serving_control WHERE id=1'
         ) == (previous["metadata_generation"] if previous else None)
@@ -686,8 +691,7 @@ async def test_typed_plan_key_without_product_scope_cannot_bypass_sealing(
         rerun = omitted_projection.await_args.args[1]
         assert omitted_projection.await_count == 2 and rerun.schema_name != candidate.schema_name
         await _assert_refused_candidate_abandoned(case, rerun)
-        for refused_candidate in (candidate, rerun):
-            await _retire_abandoned_catalog_candidate(case, refused_candidate)
+        await _retire_abandoned_catalog_candidates(case, candidate, rerun)
         assert (
             await case.connection.fetchval(
                 f'SELECT metadata_generation FROM "{case.control}".network_serving_control WHERE id=1'
