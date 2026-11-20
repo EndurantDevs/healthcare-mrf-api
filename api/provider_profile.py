@@ -20,6 +20,7 @@ from api.provider_profile_cms import (
     fetch_cms_education_projection,
     merge_cms_education_projection,
 )
+from api.provider_profile_cms_npd import fetch_cms_npd_projection
 from api.provider_profile_composer_parts import (
     PROFILE_COMPOSER_VERSION,
     _append_fhir_sources,
@@ -72,14 +73,19 @@ async def fetch_state_profile_projection(npi: int) -> dict[str, Any] | None:
     }
 
 
-async def fetch_provider_profile_projection(npi: int) -> dict[str, Any] | None:
-    """Load independently published state and CMS facts without replacing either."""
+async def fetch_provider_profile_projection(npi: int, *, include_cms_directory: bool = True) -> dict[str, Any] | None:
+    """Load independently published state and CMS facts without replacing either.
+
+    Network-scoped callers pass ``include_cms_directory=False``: directory roles are not filtered by network.
+    """
     state_projection = await fetch_state_profile_projection(npi)
     cms_projection = await fetch_cms_education_projection(npi)
     additional_state_projections = await fetch_additional_state_profile_projections(npi)
     projection = merge_cms_education_projection(npi, state_projection, cms_projection)
     for state_projection in additional_state_projections:
         projection = merge_state_profile_projection(npi, projection, state_projection)
+    if include_cms_directory:
+        projection = merge_state_profile_projection(npi, projection, await fetch_cms_npd_projection(npi))
     return projection
 
 

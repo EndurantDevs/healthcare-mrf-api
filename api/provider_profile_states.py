@@ -115,6 +115,10 @@ SOURCE_CONTEXT = {
         "establish clinical experience, current practice or license expiration; degrees are not inferred. "
         "Coverage follows supported NPPES-derived license roots."
     ),
+    "cms-npd": (
+        "CMS National Provider Directory roles, locations, endpoints, plans and networks are directory-reported. "
+        "Inactive and ended roles are omitted; participation and patient acceptance are not independently verified."
+    ),
 }
 
 

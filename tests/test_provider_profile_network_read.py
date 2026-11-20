@@ -48,8 +48,8 @@ def profile_read(monkeypatch):
         events.append("manifest")
         return manifest()
 
-    async def state(npi):
-        assert events == ["enter", "manifest"] and npi == 1000000491
+    async def state(npi, *, include_cms_directory):
+        assert events == ["enter", "manifest"] and npi == 1000000491 and include_cms_directory is False
         events.append("state")
         return _state_projection()
 
