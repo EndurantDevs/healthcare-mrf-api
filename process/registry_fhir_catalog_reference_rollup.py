@@ -27,7 +27,7 @@ MAX_PAGE_REFERENCES = 100_000
 MAX_OUTPUT_ROWS = 1000
 _COLUMNS = """resource_type varchar(64) COLLATE "C" NOT NULL,
 reference_key text COLLATE "C" NOT NULL,network_ref text,
-resource_id varchar(64) COLLATE "C" NOT NULL,payload_hash varchar(64) NOT NULL,reference_ordinal integer NOT NULL,
+resource_id varchar(256) COLLATE "C" NOT NULL,payload_hash varchar(64) NOT NULL,reference_ordinal integer NOT NULL,
  reference_rows bigint NOT NULL"""
 _STAGE_COLUMNS = f"""{_COLUMNS},PRIMARY KEY(resource_type,reference_key),
 UNIQUE(resource_type,resource_id,reference_ordinal)"""
@@ -127,7 +127,7 @@ _PAGE_SQL = """WITH page AS (
 ), accounting AS MATERIALIZED (
  SELECT count(*)::bigint AS source_rows,coalesce(sum(source_bytes),0)::bigint AS source_bytes,
  count(*) FILTER(WHERE refs IS NULL OR refs='null'::jsonb OR refs='[]'::jsonb)::bigint AS without_refs,
- count(*) FILTER(WHERE source_bytes>$6 OR resource_id IS NULL OR length(resource_id) NOT BETWEEN 1 AND 64
+ count(*) FILTER(WHERE source_bytes>$6 OR resource_id IS NULL OR length(resource_id) NOT BETWEEN 1 AND 256
    OR resource_id ~ '[^A-Za-z0-9.-]'
    OR payload_kind IS DISTINCT FROM 'object'
    OR length(payload_hash)<>64 OR payload_hash ~ '[^0-9a-f]' OR payload_hash IS NULL

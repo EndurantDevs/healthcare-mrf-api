@@ -181,7 +181,7 @@ def test_native_row_limit_precedes_input_extraction(native):
         {"resource_type": None},
         {"resource_id": "bad/id"},
         {"resource_id": ""},
-        {"resource_id": "x" * 65},
+        {"resource_id": "x" * 257},
         {"resource_id": 1},
         {"payload_hash": "A" * 64},
         {"payload_hash": "a" * 63},
@@ -364,3 +364,11 @@ def test_mixed_page_preserves_observation_reference_bounds_before_rollup(native)
         _record(resource_id="b", payload={"network_refs": [None] * (MAX_PAGE_REFERENCES // 2 + 1), "value": 1.25}),
     ]
     assert _actual(records) == _reference(records)
+
+
+def test_long_source_role_id_uses_reference_frame_inside_native_page(native):
+    long_id = "role-00001-00002-" + "a" * 50
+    records = [_record(resource_id="a-short"), _record(resource_id=long_id), _record(resource_id="z-short")]
+    assert len(long_id) == 67 and _native(native, records) is None
+    assert _actual(records) == _reference(records)
+    assert _actual(records)["PractitionerRole"]["rows"] == 3

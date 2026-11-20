@@ -918,3 +918,50 @@ async def test_capture_freezes_then_checks_complete_data_before_saving_metadata(
         reader_roles=("capture_reader",),
         application_roles=("capture_reader",),
     )
+
+
+@pytest.mark.parametrize("length", [67, 256, 257])
+def test_native_and_reference_folds_bound_long_source_ids_identically(length):
+    """Publisher ids beyond FHIR's 64 characters hash the same natively and in the reference fold."""
+    from process.network_fhir_retained_capture_contract import SEMANTIC_PROFILE
+    from process.provider_directory_resource_hash import resource_payload_sha256_for_contract
+
+    pytest.importorskip("ptg2_address_canon").encode_retained_fhir_capture_batch
+    origin = replace(
+        retained().origin,
+        resource_counts=(("PractitionerRole", 1),),
+        resource_hashes=(("PractitionerRole", "f" * 64),),
+        descriptor_counts=(("PractitionerRole", 1),),
+        admission_profile=SEMANTIC_PROFILE,
+        original_admission_refusal=None,
+        admission_metadata_sha256="1" * 64,
+        semantic_projection_as_of="2026-01-01",
+    )
+    identity = "o" * length
+    payload_by_field = {
+        "source_id": origin.source_id,
+        "resource_id": identity,
+        "practitioner_ref": "Practitioner/practitioner-one",
+    }
+    resource_by_field = {
+        "dataset_id": origin.dataset_id,
+        "resource_type": "PractitionerRole",
+        "resource_id": identity,
+        "payload_json": json.dumps(payload_by_field),
+        "payload_hash": resource_payload_sha256_for_contract(
+            payload_by_field, "semantic_content_v4", resource_type="PractitionerRole"
+        ),
+        "acquired_resource_sha256": None,
+    }
+    roots, counts, root = {"PractitionerRole": hashlib.sha256()}, {"PractitionerRole": 0}, hashlib.sha256()
+    if length > 256:
+        with pytest.raises(RetainedFHIRCaptureError):
+            capture._fold_rows([resource_by_field], origin, roots, counts, root, 0)
+        with pytest.raises(RetainedFHIRCaptureError):
+            capture._prepare_native_resources([resource_by_field], origin, "release-one", None, False)
+        return
+    assert capture._fold_rows([resource_by_field], origin, roots, counts, root, 0) == 1
+    prepared = capture._prepare_native_resources([resource_by_field], origin, "release-one", None, False)
+    assert prepared.row_count == 1 and not prepared.fallback_rows
+    assert hashlib.sha256(prepared.root_bytes).hexdigest() == root.hexdigest()
+    assert hashlib.sha256(prepared.families["PractitionerRole"][0]).hexdigest() == roots["PractitionerRole"].hexdigest()

@@ -172,6 +172,24 @@ def test_final_edge_document_rejects_unbounded_or_malformed_relationship_evidenc
         validation._validate_document("registry_fhir_catalog_observation", row)
 
 
+@pytest.mark.parametrize(
+    "field,length,accepted",
+    [("owner_resource_id", 256, True), ("owner_resource_id", 257, False), ("network_resource_id", 65, False)],
+)
+def test_edge_owner_keeps_stored_source_id_while_targets_stay_fhir_ids(field, length, accepted):
+    row = _observation_row("edge")
+    row["document_json"]["owner_resource_type"] = row["resource_type"] = "PractitionerRole"
+    row["document_json"]["plan_resource_id"] = None
+    row["document_json"][field] = "r" * length
+    if field == "owner_resource_id":
+        row["resource_id"] = "r" * length
+    if accepted:
+        validation._validate_document("registry_fhir_catalog_observation", row)
+    else:
+        with pytest.raises(ValueError, match="registry_fhir_catalog_observation_invalid"):
+            validation._validate_document("registry_fhir_catalog_observation", row)
+
+
 def test_edge_observation_cannot_move_to_another_resource_and_keeps_unknown_geography():
     row = _observation_row("edge")
     row["document_json"]["geography"] = [None, "Location/one"]

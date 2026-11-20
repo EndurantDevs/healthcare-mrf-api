@@ -45,7 +45,7 @@ _TABLE_DEFINITIONS = {
     "registry_fhir_catalog_observation": """
       source_generation text COLLATE "C" NOT NULL,
       resource_type varchar(64) COLLATE "C" NOT NULL,
-      resource_id varchar(64) COLLATE "C" NOT NULL,
+      resource_id varchar(256) COLLATE "C" NOT NULL,
       observation_kind text COLLATE "C" NOT NULL CHECK(observation_kind IN ('organization','edge')),
       ordinal integer NOT NULL CHECK(ordinal>=0),
       document_json jsonb NOT NULL CHECK(jsonb_typeof(document_json)='object'

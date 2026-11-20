@@ -67,6 +67,7 @@ from process.provider_directory_resource_hash import (
     resource_payload_sha256_for_contract,
 )
 from process.provider_directory_source_summary import validate_fhir_source_summary
+from process.registry_fhir_catalog_extraction import SOURCE_RESOURCE_ID
 from process.uhc_flex_practitioner_async_safety import drain_operation
 
 _KEYS = {
@@ -553,7 +554,7 @@ def _fold_rows(resource_rows, origin, hash_by_family, counts, root, total):
         )
         require(
             kind in hash_by_family
-            and re.fullmatch(r"[A-Za-z0-9.-]{1,64}", identity)
+            and SOURCE_RESOURCE_ID.fullmatch(identity)
             and source_resource_marker_valid(resource_row["acquired_resource_sha256"], completion_v3=is_completion_v3)
         )
         normalized_payload = (

@@ -96,7 +96,7 @@ def test_each_family_binds_actual_payload_even_when_historical_hash_is_unchanged
         {"resource_type": None},
         {"resource_id": "bad/id"},
         {"resource_id": ""},
-        {"resource_id": "x" * 65},
+        {"resource_id": "x" * 257},
         {"resource_id": 1},
         {"payload_hash": "A" * 64},
         {"payload_hash": "a" * 63},

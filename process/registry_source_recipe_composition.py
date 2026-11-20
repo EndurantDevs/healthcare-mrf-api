@@ -258,7 +258,7 @@ async def _typed_source_read_scope(connection, recipe, approved, control_schema,
         require_approved_network_source_bindings,
         require_retained_approved_network_source_bindings,
     )
-    from process.network_fhir_source_witness_contract import source_origin
+    from process.network_fhir_source_witness_contract import is_profile_header_schema, source_origin
 
     if type(runtime) is not SourceWitnessRuntime or type(recipe.source_pin) is not PinnedTypedFHIRMembershipSource:
         raise RegistrySourceCompositionError("registry_source_typed_runtime_unavailable")
@@ -267,9 +267,9 @@ async def _typed_source_read_scope(connection, recipe, approved, control_schema,
     pin.__post_init__()
     capture = pin.capture
     origin = source_origin(capture["graph"]["origin"])
-    profiles = [
-        profile for profile in runtime.source_profiles if profile.catalog_schema == origin.header_relation["schema"]
-    ]
+    # shortcut: a named edition matches every configured profile; select by the pinned catalog
+    # descriptor's native_read_profile once more than one FHIR profile is configured.
+    profiles = [profile for profile in runtime.source_profiles if is_profile_header_schema(profile, origin)]
     if len(profiles) != 1 or type(retained_approval) is not bool:
         raise RegistrySourceCompositionError("registry_source_typed_profile_unavailable")
     require_bindings = (

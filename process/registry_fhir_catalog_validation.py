@@ -14,6 +14,7 @@ from process.registry_fhir_catalog_enrichment import (
     enrich_fhir_catalog_edges,
 )
 from process.registry_fhir_catalog_extraction import (
+    SOURCE_RESOURCE_ID,
     FHIRCatalogOrganization,
     FHIRCatalogPlanTierEdge,
     FHIRCatalogReferenceEdge,
@@ -331,9 +332,14 @@ def _observation_edge(document):
     for field, maximum in (("valid_from", 64), ("valid_to", 64), ("status", 64), ("resolution_reason", 128)):
         if document[field] is not None:
             catalog_text(document[field], maximum)
-    for field in ("network_resource_id", "plan_resource_id", "owner_resource_id"):
+    # A representative owner is a stored source row; network and plan targets stay FHIR ids.
+    for field, pattern in (
+        ("network_resource_id", r"[A-Za-z0-9.-]{1,64}"),
+        ("plan_resource_id", r"[A-Za-z0-9.-]{1,64}"),
+        ("owner_resource_id", SOURCE_RESOURCE_ID),
+    ):
         if document[field] is not None and (
-            type(document[field]) is not str or re.fullmatch(r"[A-Za-z0-9.-]{1,64}", document[field]) is None
+            type(document[field]) is not str or re.fullmatch(pattern, document[field]) is None
         ):
             _invalid("observation_invalid")
     for field in ("plan_identifiers", "scope_identifiers", "scope_type_codes", "benefits"):

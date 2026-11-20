@@ -18,6 +18,7 @@ from process.network_fhir_retained_capture_contract import (
 )
 from process.network_fhir_retained_capture_contract import TABLES as RETAINED_TABLES
 from process.provider_directory_admission_seal import ADMISSION_RAW_METADATA_MAX_BYTES
+from process.provider_directory_named_edition import edition_schema_name
 from process.registry_fhir_catalog_extraction import fhir_source_uri
 
 CONTRACT = "fhir-source-membership-witness-v1"
@@ -258,6 +259,15 @@ def source_origin(value):
     require(type(origin_by_field["source_aliases"]) in {list, tuple})
     origin_by_field["source_aliases"] = tuple(origin_by_field["source_aliases"])
     return origin_type(**origin_by_field)
+
+
+def is_profile_header_schema(profile, origin):
+    """Accept a header in the profile's catalog or in this dataset's named edition schema.
+
+    The Source export resolves a named edition through the catalog pointer; this pure check
+    only keeps foreign schemas out.
+    """
+    return origin.header_relation["schema"] in (profile.catalog_schema, edition_schema_name(origin.dataset_id))
 
 
 @dataclass(frozen=True)

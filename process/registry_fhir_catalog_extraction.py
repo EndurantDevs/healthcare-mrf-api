@@ -15,6 +15,8 @@ DEFAULT_BYTES = 8 * 1024 * 1024
 RESOURCE_TYPES = ("InsurancePlan", "Organization", "OrganizationAffiliation", "PractitionerRole")
 PROFILES = ("raw_fhir", "published_normalized", "retained_normalized")
 _FHIR_ID = re.compile(r"[A-Za-z0-9.-]{1,64}\Z")
+# Source rows keep publisher ids up to their 256-character column; some exceed FHIR's 64-character limit.
+SOURCE_RESOURCE_ID = re.compile(r"[A-Za-z0-9.-]{1,256}\Z")
 _NETWORK_EXTENSIONS = {
     "http://hl7.org/fhir/us/davinci-pdex-plan-net/structuredefinition/network-reference",
     "https://hl7.org/fhir/us/davinci-pdex-plan-net/structuredefinition/network-reference",

@@ -215,7 +215,7 @@ async def test_malformed_normalized_references_refuse_without_mutating_source(re
     "field,value",
     [
         (2, ""),
-        (2, "x" * 65),
+        (2, "x" * 257),
         (2, "role/one"),
         (2, "rôle"),
         (2, "role\n"),
@@ -242,7 +242,7 @@ async def test_reference_resource_identity_validation_survives_page_aggregation(
 @pytest.mark.asyncio
 async def test_reference_resource_identity_accepts_ascii_boundaries(reference_database):
     fixture = reference_database
-    resource_id = "Az09.-" + "x" * 58
+    resource_id = "Az09.-" + "x" * 250
     payload_hash = "0123456789abcdef" * 4
     await copy_resources(
         fixture,

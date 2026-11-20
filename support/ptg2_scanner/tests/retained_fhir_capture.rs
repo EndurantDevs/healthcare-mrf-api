@@ -588,3 +588,20 @@ fn payload_syntax_budget_rejects_expansion_before_reference_fallback() {
     assert_eq!(error.code, "collection_limit");
     assert_eq!(error.row_index, Some(0));
 }
+
+#[test]
+fn source_resource_ids_follow_the_stored_column_bound() {
+    for (length, accepted) in [(64, true), (67, true), (256, true), (257, false)] {
+        let payload = json!({"resource_id": "p".repeat(length)});
+        let document = context(
+            vec![legacy_row("Practitioner", payload)],
+            "transport_bound_v1",
+            false,
+        );
+        assert_eq!(
+            encode(&input(&document)).is_ok(),
+            accepted,
+            "length {length}"
+        );
+    }
+}
