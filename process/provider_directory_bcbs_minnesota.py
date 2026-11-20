@@ -15,6 +15,30 @@ _QUERY_NAMES = frozenset(
 )
 
 
+async def split_timed_out_window(directory, source_record, resource_type, config, state, window, fetched):
+    """Keep exact counts while reducing a gateway-limited data request."""
+    if not (
+        directory._canonical_base(source_record.get("canonical_api_base") or source_record.get("api_base")) == API_BASE
+        and fetched.transient
+        and fetched.error == "http_504"
+        and fetched.pages_fetched == 1
+        and not fetched.resources
+        and state.plan.split_acquisition_window(window.window_id)
+    ):
+        return None
+    state.pages_fetched += fetched.pages_fetched
+    await directory._save_last_updated_partition_plan(
+        state.context,
+        resource_type,
+        config,
+        state.plan,
+        census=state.census,
+        pages_processed=state.pages_fetched,
+        rows_processed=state.rows_fetched,
+    )
+    return window
+
+
 def _query(url, resource):
     parsed = urlsplit(url)
     pairs = parse_qsl(parsed.query, keep_blank_values=True)

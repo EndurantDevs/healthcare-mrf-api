@@ -196,6 +196,8 @@ async def _persist_partition_downloads(passes_by_task, settled_tasks, persist_pa
             slots.release()
         if failure is not None:
             return failure
+        if window.state is WindowState.SPLIT:
+            continue
         if pass_number not in window.passes:
             raise PartitionPlanError("partition pass was not committed")
         if pass_number == 1:
@@ -262,11 +264,44 @@ async def run_partition_passes[FetchResult, FailureResult](
                 admission = None
                 start_window()
             failure = await _persist_partition_downloads(passes_by_task, settled_tasks, persist_pass, windows, slots)
-            if failure is not None:
+            if failure is not None or plan.status is PlanStatus.COUNTING:
                 return failure
         return None
     finally:
         await _close_partition_downloads(passes_by_task, admission, slots)
+
+
+async def fetch_partition_resource_rows(directory, source_record, resource_type, model, config, fetch_options):
+    """Retain preflight and census checks while recounting subdivided data windows."""
+    preflight_failure = directory._partition_preflight_failure(model, fetch_options)
+    if preflight_failure is not None:
+        return preflight_failure
+    prepared_state = await directory._prepare_partition_state(
+        source_record, resource_type, model, config, fetch_options
+    )
+    if isinstance(prepared_state, directory.ResourceFetchResult):
+        return prepared_state
+    census_failure = await directory._observe_partition_pre_census(
+        source_record, resource_type, model, config, prepared_state, fetch_options
+    )
+    if census_failure is not None:
+        return census_failure
+    while True:
+        count_failure = await directory._observe_partition_counts(
+            source_record, resource_type, model, config, prepared_state, fetch_options
+        )
+        if count_failure is not None:
+            return count_failure
+        pass_failure = await directory._fetch_partition_plan_passes(
+            source_record, resource_type, model, config, prepared_state, fetch_options
+        )
+        if pass_failure is not None:
+            return pass_failure
+        if prepared_state.plan.status is not PlanStatus.COUNTING:
+            break
+    return await directory._finish_partition_fetch(
+        source_record, resource_type, model, config, prepared_state, fetch_options
+    )
 
 
 @dataclass(frozen=True)
@@ -408,8 +443,24 @@ class PartitionPlan:
             overflow_failure = self._overflow_count_failure()
             if overflow_failure is not None:
                 self._fail("overflow_count_mismatch", "leaf counts contradict the certified overflow", overflow_failure)
+            elif self.status is PlanStatus.ACQUIRING and (count_failure := self._split_count_failure()) is not None:
+                self._fail("split_count_mismatch", "leaf counts contradict the exact parent count", count_failure)
             return
         self._split_or_fail(window)
+
+    def split_acquisition_window(self, window_id: str) -> TimeWindow | None:
+        """Return the split parent, or None when committed proof prevents splitting."""
+        window = self._window(window_id)
+        if (
+            window.state is not WindowState.READY
+            or not window.count
+            or window.passes
+            or window.end - window.start < 2 * self.config.minimum_width
+        ):
+            return None
+        self._require_active()
+        self._split_or_fail(window)
+        return window
 
     def record_pass(
         self,
@@ -559,6 +610,20 @@ class PartitionPlan:
                     return window.window_id
         return None
 
+    def _split_count_failure(self) -> str | None:
+        descendant_count_by_window: dict[str, int | None] = {}
+        for window in sorted(self.windows.values(), key=lambda entry: entry.window_id.count("."), reverse=True):
+            if window.state is not WindowState.SPLIT:
+                descendant_count_by_window[window.window_id] = window.count
+                continue
+            left = descendant_count_by_window.get(window.window_id + ".0")
+            right = descendant_count_by_window.get(window.window_id + ".1")
+            total = None if left is None or right is None else left + right
+            if window.count is not None and total is not None and total != window.count:
+                return window.window_id
+            descendant_count_by_window[window.window_id] = total
+        return None
+
     def _fingerprints(
         self,
         resources: Iterable[Mapping[str, Any]],
@@ -613,6 +678,8 @@ class PartitionPlan:
             if previous.end != current.start:
                 raise PartitionPlanError("checkpoint leaf windows are not contiguous")
         for window in self.windows.values():
+            if window.count is not None:
+                CountObservation.exact(window.count)
             self._validate_split_evidence(window)
             if not _primitives.is_partition_boundary_aligned(
                 window.start,
@@ -642,10 +709,16 @@ class PartitionPlan:
             self.failure is None or self.failure.code != "overflow_count_mismatch"
         ):
             raise PartitionPlanError("checkpoint leaf counts contradict the certified overflow")
+        if self._split_count_failure() is not None and (
+            self.failure is None or self.failure.code != "split_count_mismatch"
+        ):
+            raise PartitionPlanError("checkpoint leaf counts contradict the exact parent count")
 
     def _validate_split_evidence(self, window: TimeWindow) -> None:
         lower_bound, reason = window.overflow_lower_bound, window.split_reason
         if lower_bound is None and reason is None:
+            if window.state is WindowState.SPLIT:
+                self._validate_split_geometry(window)
             return
         if lower_bound is not None and (
             isinstance(lower_bound, bool)
@@ -666,6 +739,9 @@ class PartitionPlan:
             and window.end - window.start < 2 * self.config.minimum_width
         ):
             return
+        self._validate_split_geometry(window)
+
+    def _validate_split_geometry(self, window: TimeWindow) -> None:
         left = self.windows.get(window.window_id + ".0")
         right = self.windows.get(window.window_id + ".1")
         if (
@@ -677,7 +753,7 @@ class PartitionPlan:
             or left.end != right.start
             or right.end != window.end
         ):
-            raise PartitionPlanError("checkpoint uncounted split geometry is invalid")
+            raise PartitionPlanError("checkpoint split geometry is invalid")
 
     @staticmethod
     def _validate_checkpoint_duplicates(leaves: tuple[TimeWindow, ...]) -> None:
