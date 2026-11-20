@@ -125,6 +125,7 @@ async def run(ctx, task, run_id, *, source=None, connect=None, scanner=None):
 async def _import_locked(connection, observed, downloads, connect, scanner, run_id, seconds):
     control = release_sql.control_schema()
     release_id = observed.vector_sha256
+    await release_sql.ensure_release_table(connection, control)
     releases_by_status = await release_sql.release_rows(connection, control)
     current, previous = releases_by_status.get("current"), releases_by_status.get("previous")
     if current is not None and current["release_id"] == release_id:

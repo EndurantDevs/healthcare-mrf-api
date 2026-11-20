@@ -12,7 +12,13 @@ import json
 import os
 import re
 
-from process.cms_npd_typed_schema import FINISH_STATEMENTS, RELEASE_TABLE, RESOURCE_FILES, TABLE_STATEMENTS
+from process.cms_npd_typed_schema import (
+    FINISH_STATEMENTS,
+    RELEASE_TABLE,
+    RESOURCE_FILES,
+    TABLE_STATEMENTS,
+    release_table_statements,
+)
 from process.cms_npd_typed_stage import CmsNpdTypedImportError
 
 MAX_ROW_DROP = 0.20  # fail when a table shrinks by more than this fraction against the current release
@@ -54,6 +60,15 @@ def quoted(identifier):
 def control_schema():
     """The schema holding the release table; the same setting the API readers use."""
     return os.getenv("HLTHPRT_DB_SCHEMA") or "mrf"
+
+
+async def ensure_release_table(connection, control):
+    """Create the release table where the deployment has not migrated it yet; the API reader may read it."""
+    for statement in release_table_statements(control):
+        await connection.execute(statement)
+    reader = os.getenv("HLTHPRT_DB_READER_USER", "").strip()
+    if reader:
+        await connection.execute(f"GRANT SELECT ON {quoted(control)}.{RELEASE_TABLE} TO {quoted(reader)}")
 
 
 async def release_rows(connection, control):

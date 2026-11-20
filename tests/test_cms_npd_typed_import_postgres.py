@@ -9,7 +9,6 @@ import asyncpg
 import pytest
 
 from process.cms_npd_typed_import import LOCK_KEY, run
-from process.cms_npd_typed_schema import release_table_statements
 from process.cms_npd_typed_stage import CmsNpdTypedImportError
 from process.ptg_parts.rust_scanner import _ptg2_rust_scanner_binary
 from tests.test_cms_npd_typed_import import LocalSource, write_release
@@ -31,14 +30,12 @@ async def _connect():
 
 @pytest.fixture
 async def control(monkeypatch):
-    """A fresh control schema with an empty release table; drops every schema it recorded."""
+    """A fresh, empty control schema (the importer creates its release table); drops every schema it recorded."""
     schema = "cms_npd_import_ctl_" + uuid4().hex[:12]
     monkeypatch.setenv("HLTHPRT_DB_SCHEMA", schema)
     monkeypatch.delenv("HLTHPRT_DB_READER_USER", raising=False)
     admin = await _connect()
     await admin.execute(f'CREATE SCHEMA "{schema}"')
-    for statement in release_table_statements(schema):
-        await admin.execute(statement)
     try:
         yield admin, schema
     finally:
