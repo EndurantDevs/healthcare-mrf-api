@@ -617,6 +617,31 @@ async def _assert_taxonomy_rollback(connection, reader_connection, source_schema
     }
 
 
+async def _assert_taxonomy_publication_with_missing_inputs(
+    connection, reader_connection, source_schema, publication_schema
+):
+    """Publish with optional inputs absent and retain that generation if all evidence disappears."""
+    from process import procedure_taxonomy_signals as publication
+
+    async with connection.transaction():
+        await connection.execute(f'DROP TABLE "{source_schema}".pricing_provider_quality_feature')
+        await connection.execute(f'DROP TABLE "{source_schema}".nucc_taxonomy')
+        await publication.mark_procedure_taxonomy_inputs_changed(source_schema, connection.execute)
+
+    outcome = await publication.rebuild_procedure_taxonomy_signals(connection, source_schema, publication_schema)
+    assert (outcome["status"], outcome["rows"]) == ("published", 1)
+    assert await _served_taxonomy_code(reader_connection, publication_schema) == "SECONDCODE"
+
+    async with connection.transaction():
+        await connection.execute(f'DROP TABLE "{source_schema}".npi_taxonomy')
+        await publication.mark_procedure_taxonomy_inputs_changed(source_schema, connection.execute)
+
+    with pytest.raises(RuntimeError, match="generation is empty or contains invalid evidence"):
+        await publication.rebuild_procedure_taxonomy_signals(connection, source_schema, publication_schema)
+
+    assert await _served_taxonomy_code(reader_connection, publication_schema) == "SECONDCODE"
+
+
 @pytest.mark.asyncio
 async def test_named_taxonomy_publication_preserves_incumbent_and_exact_rollback(monkeypatch):
     """Verify native publication across privilege, source race, reader, and rollback boundaries."""
@@ -652,6 +677,9 @@ async def test_named_taxonomy_publication_preserves_incumbent_and_exact_rollback
         )
         await _assert_taxonomy_rollback(
             connection, reader_connection, source_schema, publication_schema, incumbent_table
+        )
+        await _assert_taxonomy_publication_with_missing_inputs(
+            connection, reader_connection, source_schema, publication_schema
         )
     finally:
         await reader_connection.close()
