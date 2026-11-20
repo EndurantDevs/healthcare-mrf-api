@@ -37,6 +37,7 @@ from db.models import (
     db,
 )
 from db.models.entity_address_unified import ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES
+from process import cms_npd_typed_address_source as cms_npd_source
 from process import entity_address_aggregation_batch as aggregate_batches
 from process import entity_address_batch as address_batches
 from process import entity_address_candidate_preparation as candidate_preparation
@@ -2670,7 +2671,7 @@ def _source_priority_expr(expr: str) -> str:
         f"WHEN {expr} = 'provider_enrollment_ffs_address' THEN 3 "
         f"WHEN {expr} LIKE 'facility_anchor:%' THEN 4 "
         f"WHEN {expr} = 'mrf' THEN 5 "
-        f"WHEN {expr} = 'provider_directory_fhir' THEN 6 "
+        f"WHEN {expr} = 'provider_directory_fhir' THEN 6 WHEN {expr} = 'cms_npd' THEN 7 "
         "ELSE 9 END"
     )
 
@@ -2685,7 +2686,7 @@ def _source_id_expr(expr: str) -> str:
         f"WHEN {expr} = 'provider_enrollment_ffs_address' THEN 5 "
         f"WHEN {expr} LIKE 'facility_anchor:%' THEN 6 "
         f"WHEN {expr} = 'ptg' THEN 7 "
-        f"WHEN {expr} = 'provider_directory_fhir' THEN 8 "
+        f"WHEN {expr} = 'provider_directory_fhir' THEN 8 WHEN {expr} = 'cms_npd' THEN 9 "
         "ELSE 0 END"
     )
 
@@ -2700,7 +2701,7 @@ def _source_mask_expr(expr: str) -> str:
         f"WHEN {expr} = 'provider_enrollment_ffs_address' THEN 16::bigint "
         f"WHEN {expr} LIKE 'facility_anchor:%' THEN 32::bigint "
         f"WHEN {expr} = 'ptg' THEN 64::bigint "
-        f"WHEN {expr} = 'provider_directory_fhir' THEN 128::bigint "
+        f"WHEN {expr} = 'provider_directory_fhir' THEN 128::bigint WHEN {expr} = 'cms_npd' THEN 256::bigint "
         "ELSE 0::bigint END"
     )
 
@@ -4078,12 +4079,8 @@ def _source_selects(
             """
         )
 
-    if test_limit_per_source and test_limit_per_source > 0:
-        return [
-            f"(\nSELECT * FROM (\n{select.strip()}\n) AS src LIMIT {int(test_limit_per_source)}\n)"
-            for select in selects
-        ]
-    return selects
+    selects += cms_npd_source.eau_source_selects(importlib.import_module(__name__), db_schema, available)
+    return [_bounded_source_select_sql(select, test_limit_per_source) for select in selects]
 
 
 def _partial_overlay_npi_context_sql(
@@ -4354,6 +4351,7 @@ def _prefilter_npi_source_select_sql(db_schema: str, source_select: str, group_t
     markers = (
         (f"FROM {db_schema}.npi_address AS a", "a"),
         (f"FROM {db_schema}.doctor_clinician_address AS d", "d"),
+        (f"FROM {db_schema}.cms_npd_address AS c", "c"),
         (f"FROM {db_schema}.mrf_address AS a", "a"),
         (f"FROM {db_schema}.provider_enrollment_ffs AS f", "f"),
     )
@@ -5190,7 +5188,7 @@ def _enriched_raw_keyed_cte_sql(*, archive_available: bool) -> str:
             archive_county_fips::varchar AS county_fips,
             source_id,
             source_mask,
-            CASE WHEN source_id IN (1, 2, 3, 4, 5, 6, 8) THEN source_mask ELSE 0::bigint END AS address_source_mask,
+            CASE WHEN source_id IN (1, 2, 3, 4, 5, 6, 8, 9) THEN source_mask ELSE 0::bigint END AS address_source_mask,
             address_role_id,
             CASE WHEN source_id = 7 THEN 'ptg_overlay' ELSE 'base' END::varchar AS row_origin,
             CASE
@@ -11466,6 +11464,7 @@ async def process_entity_address_unified_data(ctx, task=None):
         "provider_enrollment_fqhc",
         "provider_enrollment_ffs_additional_npi",
         "doctor_clinician_address",
+        "cms_npd_address",
         "geo_zip_lookup",
         "provider_enrollment_ffs",
         "provider_enrollment_ffs_address",

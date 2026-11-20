@@ -90,8 +90,10 @@ def _resources(index):
     }
 
 
-def _ndjson(resource_type, count, bad_line=False):
+def _ndjson(resource_type, count, bad_line=False, patch=None):
     records = [_resources(index)[resource_type] for index in range(1, count + 1)]
+    if patch is not None:
+        records = [patch(resource_type, index, record) for index, record in enumerate(records, 1)]
     if resource_type == "Organization":
         records.append({"id": "Organization-net-1"})
     lines = [json.dumps({"resourceType": resource_type, "meta": _META, **record}) for record in records]
@@ -100,12 +102,15 @@ def _ndjson(resource_type, count, bad_line=False):
     return "".join(line + "\n" for line in lines).encode()
 
 
-def write_release(directory, count, generated_at="2026-01-01", bad_type=None):
-    """Write eight zstd files and a manifest; return the observed release (id = manifest digest)."""
+def write_release(directory, count, generated_at="2026-01-01", bad_type=None, patch=None):
+    """Write eight zstd files and a manifest; return the observed release (id = manifest digest).
+
+    ``patch(resource_type, index, record)`` may return a changed copy of each synthetic record.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     files_by_name = {}
     for stem, resource_type, _, _ in RESOURCE_FILES:
-        decoded = _ndjson(resource_type, count, bad_line=resource_type == bad_type)
+        decoded = _ndjson(resource_type, count, bad_line=resource_type == bad_type, patch=patch)
         compressed = zstd.compress(decoded)
         (directory / f"{stem}.ndjson.zst").write_bytes(compressed)
         files_by_name[f"{stem}.ndjson"] = {"compressed_bytes": len(compressed), "original_bytes": len(decoded)}

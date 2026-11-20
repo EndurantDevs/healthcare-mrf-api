@@ -25,6 +25,32 @@ This importer does not fetch an external website directly. It materializes from 
 - `provider-enrichment`
 - `cms-doctors`
 - `facility-anchors`
+- `cms-npd` (see below)
+
+### CMS National Provider Directory addresses
+
+The `cms-npd` importer builds `mrf.cms_npd_address` (control schema `HLTHPRT_DB_SCHEMA`) from the
+current typed release: practitioner and NPI-organization addresses with `use = work` and type `physical`
+or `both`, plus every practitioner role location (with the location's coordinates, phone and fax). Each
+NPI and normalized address (street, city, state, ZIP5 and country) appears once; a row with coordinates
+is preferred. `source_record_id` is `cms_npd:<npi>:<md5 of the normalized address>`, stable across releases.
+
+- Unified rows: `entity_type = npi`, `type = practice`, `address_source = cms_npd` (source id 9, mask 256,
+  priority 7, after `provider_directory_fhir`).
+- Canonical archive: source bit 256 when `HLTHPRT_ADDRESS_CANON_SOURCES` enables `cms_npd` (or `all`);
+  without it the rows keep a NULL `address_key` unless the archive already holds the address.
+- An address that another source supplies for the same NPI merges with that source's `practice` row and
+  is listed in the source evidence (`address_sources`, `source_count`, `multi_source_confirmed`) of the
+  NPI's other rows at the same canonical address; the per-row source masks are not shared across types.
+- Refresh: each release rebuilds the table into a stage, swaps it in (keeping `cms_npd_address_old`),
+  records `provider_address` in the release's `row_counts`, then queues one `full` refresh of this
+  importer and records `provider_address_refresh` once a run for the release's idempotency key is
+  admitted. An unrelated active refresh (`deferred`) or a failed enqueue stays unrecorded. On the next
+  `cms-npd` run, a current release without the count or without the table rebuilds only the address
+  table; one with the table but no recorded refresh only queues the refresh. Task parameter
+  `refresh_addresses: false` skips the queueing and leaves the refresh to a later run.
+- The source is absent until the table exists; a `provider-directory-partial` refresh re-reads it only
+  for the affected NPIs.
 
 ## Main Table
 

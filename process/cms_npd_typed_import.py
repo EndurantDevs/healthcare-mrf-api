@@ -1,7 +1,7 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Bulk import of one CMS National Provider Directory release into its own typed schema.
 
-observe -> download -> stage (native binary COPY) -> finish (keys, indexes) -> check -> publish.
+observe -> download -> stage (native binary COPY) -> finish (keys, indexes) -> check -> publish -> addresses.
 One session-level advisory lock covers the whole run. A failed run drops its candidate schema;
 the serving release and its predecessor are never touched until the one-transaction publish.
 """
@@ -22,6 +22,7 @@ import asyncpg
 import httpx
 
 from process import cms_npd_source as source_module
+from process import cms_npd_typed_addresses as addresses
 from process import cms_npd_typed_release as release_sql
 from process.cms_npd_typed_schema import release_schema_name
 from process.cms_npd_typed_stage import (
@@ -105,8 +106,12 @@ async def _phase(run_id, seconds, name):
     seconds[name] = round(time.monotonic() - started, 3)
 
 
-async def run(ctx, task, run_id, *, source=None, connect=None, scanner=None):
-    """Import the upstream release unless it is already current; return the release summary."""
+async def run(ctx, task, run_id, *, source=None, connect=None, scanner=None, resolve_archive=None):
+    """Import the upstream release unless it is already current; return the release summary.
+
+    ``task["refresh_addresses"] = False`` skips queueing the entity-address refresh; it stays unrecorded,
+    so a later run without the flag queues it.
+    """
     source = source or HttpSource(_artifact_root())
     connect = connect or connect_default
     scanner = scanner or _scanner_binary()
@@ -117,19 +122,21 @@ async def run(ctx, task, run_id, *, source=None, connect=None, scanner=None):
     try:
         if not await lock_connection.fetchval("SELECT pg_try_advisory_lock($1)", LOCK_KEY):
             raise CmsNpdTypedImportError("cms_npd_typed_import_in_progress")
-        return await _import_locked(lock_connection, observed, source, connect, scanner, run_id, seconds_by_phase)
+        summary = await _import_locked(lock_connection, observed, source, connect, scanner, run_id, seconds_by_phase)
+        return await _addresses_locked(lock_connection, summary, task, run_id, resolve_archive)
     finally:
         await lock_connection.close()  # also releases the session advisory lock
 
 
 async def _import_locked(connection, observed, downloads, connect, scanner, run_id, seconds):
+    """Publish the observed release unless it is current; report what the address phase still owes."""
     control = release_sql.control_schema()
     release_id = observed.vector_sha256
     await release_sql.ensure_release_table(connection, control)
     releases_by_status = await release_sql.release_rows(connection, control)
     current, previous = releases_by_status.get("current"), releases_by_status.get("previous")
     if current is not None and current["release_id"] == release_id:
-        return {"status": "unchanged", "release_id": release_id, "schema": current["schema_name"], "seconds": seconds}
+        return await _unchanged(connection, control, current, seconds)
     if previous is not None and previous["release_id"] == release_id:
         # shortcut: upstream went back to the previous release; an operator decides whether to roll back.
         raise CmsNpdTypedImportError("cms_npd_typed_release_is_previous")
@@ -170,8 +177,44 @@ async def _import_locked(connection, observed, downloads, connect, scanner, run_
         "rows": sum(row_counts.values()),
         "row_counts": row_counts,
         "unresolved_counts": unresolved,
+        "addresses_pending": True,
+        "refresh_pending": True,
         "seconds": seconds,
     }
+
+
+async def _unchanged(connection, control, current, seconds):
+    """The current release again: report whether its address table or refresh is still owed."""
+    return {
+        "status": "unchanged",
+        "release_id": current["release_id"],
+        "schema": current["schema_name"],
+        "addresses_pending": addresses.has_pending_addresses(current)
+        or not await addresses.table_exists(connection, control),
+        "refresh_pending": addresses.has_pending_refresh(current),
+        "seconds": seconds,
+    }
+
+
+async def _addresses_locked(connection, summary, task, run_id, resolve_archive):
+    """Build the address table from the current release when it still owes one, then queue one refresh.
+
+    A built table whose refresh was never admitted retries only the enqueue.
+    """
+    control = release_sql.control_schema()
+    build_pending, refresh_pending = summary.pop("addresses_pending"), summary.pop("refresh_pending")
+    if build_pending:
+        async with _phase(run_id, summary["seconds"], "addresses"):
+            summary["address_rows"] = await addresses.build(
+                connection,
+                control,
+                summary["schema"],
+                summary["release_id"],
+                resolve=resolve_archive or addresses.resolve_archive,
+            )
+    if (build_pending or refresh_pending) and task.get("refresh_addresses", True) is not False:
+        summary["address_refresh"] = await addresses.enqueue_refresh(connection, control, summary["release_id"])
+    return summary
 
 
 async def _build_candidate(connection, schema, plans, connect, scanner, run_id, seconds):

@@ -79,9 +79,11 @@ until `HLTHPRT_ADDRESS_CANON_SOURCES` is set.
    export HLTHPRT_ADDRESS_CANON_SOURCES=cms_doctors
    ```
 
-   Valid source names are `cms_doctors`, `facility_anchors`,
+   Valid source names are `cms_doctors`, `cms_npd`, `facility_anchors`,
    `provider_enrichment`, `provider_enrollment_ffs`, `nppes`, `mrf`,
-   `pharmacy_license`, `partd`, or `all`.
+   `pharmacy_license`, `partd`, or `all`. Archive source bits: NPPES 1,
+   CMS Doctors 2, enrichment 4, facility anchors 8, Marketplace MRF 16,
+   pharmacy license 32, Part D 64, provider directories 128, CMS NPD 256.
 
 6. Leave canonical stamping at the code default unless a rebuild needs explicit
    throttling or tuning. `HLTHPRT_ADDRESS_CANON_STAMP_SHARDS` overrides the

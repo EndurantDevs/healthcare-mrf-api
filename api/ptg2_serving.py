@@ -10261,7 +10261,7 @@ WITH requested(location_key, admitted_source_id) AS (
                WHEN sources.source_name = 'provider_enrollment_ffs_address' THEN 5
                WHEN STARTS_WITH(sources.source_name, 'facility_anchor:') THEN 6
                WHEN sources.source_name = 'ptg' THEN 7
-               WHEN sources.source_name = 'provider_directory_fhir' THEN 8
+               WHEN sources.source_name = 'provider_directory_fhir' THEN 8 WHEN sources.source_name = 'cms_npd' THEN 9
                ELSE 0
            END::smallint AS source_id,
            CASE

@@ -44,7 +44,7 @@ def test_provider_directory_fhir_source_identity_bits_are_stable():
 
     sql = entity_address_unified._enrich_raw_stage_sql("mrf", "entity_address_unified_raw")
 
-    assert "source_id IN (1, 2, 3, 4, 5, 6, 8)" in sql
+    assert "source_id IN (1, 2, 3, 4, 5, 6, 8, 9)" in sql
 
 
 def test_source_selects_add_provider_directory_practitioner_and_organization_paths():
