@@ -125,7 +125,9 @@ async def test_new_release_is_built_checked_granted_and_published(harness):
 
     statements = lock.statements
     assert statements[0] == "SELECT pg_try_advisory_lock($1)"
-    assert statements[1] == 'SELECT release_id, schema_name, status, row_counts FROM "mrf".cms_npd_release'
+    assert statements[1].startswith('CREATE TABLE IF NOT EXISTS "mrf".cms_npd_release')
+    assert statements[2] == 'GRANT SELECT ON "mrf".cms_npd_release TO "api_reader"'
+    assert statements[3] == 'SELECT release_id, schema_name, status, row_counts FROM "mrf".cms_npd_release'
     ordered_statements = [
         f'CREATE SCHEMA "{schema}"',
         f"SET LOCAL maintenance_work_mem = '{release_sql.MAINTENANCE_WORK_MEM}'",
@@ -208,7 +210,7 @@ async def test_failed_candidate_is_dropped_on_a_fresh_connection(harness, monkey
     assert caught.value.control_error_code == expected
     schema = release_schema_name(harness["observed"].vector_sha256)
     assert cleanup.statements == [f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'] and cleanup.closed
-    assert lock.closed and not any(statement.startswith("GRANT") for statement in lock.statements)
+    assert lock.closed and not any("IN SCHEMA" in statement for statement in lock.statements)
     assert not any(statement.startswith("INSERT") for statement in lock.statements)
 
 
@@ -317,3 +319,11 @@ def test_http_source_observes_and_downloads_through_the_source_module(tmp_path, 
         ("download", tmp_path, "observed", "https://downloads.example.test", typed_import.DOWNLOAD_PARALLEL),
     ]
     typed_import.HttpSource(tmp_path / "empty").prune(set())  # no releases directory yet: nothing to do
+
+
+async def test_release_table_creation_skips_the_grant_without_a_reader(monkeypatch):
+    monkeypatch.delenv("HLTHPRT_DB_READER_USER", raising=False)
+    connection = FakeConnection()
+    await release_sql.ensure_release_table(connection, "mrf")
+    assert len(connection.statements) == 1
+    assert connection.statements[0].startswith('CREATE TABLE IF NOT EXISTS "mrf".cms_npd_release')
