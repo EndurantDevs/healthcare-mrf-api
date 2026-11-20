@@ -55,9 +55,12 @@ MAX_PRIVATE_KEY_BYTES = 96 * 1024
 MAX_PRIVATE_KEY_PASSPHRASE_BYTES = 8 * 1024
 MAX_CREDENTIAL_PRINCIPAL_BYTES = 255
 MAX_RESULT_TYPE_BYTES = 255
+MAX_SOURCE_QUERY_BYTES = 16_384
+SOURCE_QUERY_NAMESPACE = ("QUERY", "SHA256")
 
 _SNOWFLAKE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,254}$")
 _DECLARED_FIELD_ID = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+_SOURCE_QUERY_START = re.compile(r"^(?:SELECT|WITH)\s", re.IGNORECASE)
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _ENVIRONMENT_REFERENCE = re.compile(r"^(?:env:|\$\{|\$[A-Za-z_])")
 
@@ -276,18 +279,52 @@ def _remaining_partition_limits(
     )
 
 
+def normalized_source_query(value: Any) -> str:
+    """Accept one owner-approved SELECT that stays intact inside a derived table."""
+
+    if not isinstance(value, str):
+        raise SnowflakeConnectorError("source query must be text")
+    query = value.strip()
+    try:
+        has_valid_length = 1 <= len(query.encode("utf-8")) <= MAX_SOURCE_QUERY_BYTES
+    except UnicodeEncodeError:
+        has_valid_length = False
+    if not has_valid_length or "\x00" in query or not _SOURCE_QUERY_START.match(query):
+        raise SnowflakeConnectorError("source query must be one bounded SELECT")
+    if any(token in query for token in (";", "--", "/*")):
+        raise SnowflakeConnectorError("source query cannot contain statement separators or comments")
+    return query
+
+
 @dataclass(frozen=True)
 class SnowflakeRelation:
-    """One fully qualified approved-relation identity with simple identifiers only."""
+    """One approved relation: a simple three-part view name or a named source query."""
 
     database: str
     schema: str
     name: str
+    query: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "database", _identifier(self.database, "relation database"))
         object.__setattr__(self, "schema", _identifier(self.schema, "relation schema"))
         object.__setattr__(self, "name", _identifier(self.name, "relation name"))
+        is_query_name = (self.database, self.schema) == SOURCE_QUERY_NAMESPACE
+        if self.query is None:
+            if is_query_name:
+                raise SnowflakeConnectorError("source query relation requires its query")
+            return
+        query = normalized_source_query(self.query)
+        if not is_query_name or self.name != _source_query_name(query):
+            raise SnowflakeConnectorError("source query relation name must match its query")
+        object.__setattr__(self, "query", query)
+
+    @classmethod
+    def for_query(cls, query: str) -> SnowflakeRelation:
+        """Name a source query by its content so identities change with the SQL."""
+
+        normalized = normalized_source_query(query)
+        return cls(*SOURCE_QUERY_NAMESPACE, _source_query_name(normalized), query=normalized)
 
     @property
     def parts(self) -> tuple[str, str, str]:
@@ -299,7 +336,13 @@ class SnowflakeRelation:
     def quoted_sql(self) -> str:
         """Return the only SQL spelling used by the connector's statement builder."""
 
+        if self.query is not None:
+            return f"({self.query})"
         return ".".join(f'"{part}"' for part in self.parts)
+
+
+def _source_query_name(query: str) -> str:
+    return "Q" + hashlib.sha256(query.encode("utf-8")).hexdigest().upper()
 
 
 @dataclass(frozen=True)

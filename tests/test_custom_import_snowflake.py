@@ -1240,3 +1240,35 @@ def test_fixed_credential_read_failures_close_descriptor(tmp_path, monkeypatch, 
             with pytest.raises(snowflake.SnowflakeCredentialError):
                 provider.load_key_pair()
         assert len(closed_descriptors) == 1 and closed_descriptors[0] != provider._credential_directory_descriptor
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",
+        "   ",
+        "DELETE FROM synthetic.public.providers",
+        "SELECT 1; SELECT 2",
+        "SELECT 1 -- trailing",
+        "SELECT /* hidden */ 1",
+        "SELECT\x00 1",
+        "SELECT " + "x" * snowflake.MAX_SOURCE_QUERY_BYTES,
+        7,
+    ],
+)
+def test_source_query_rejects_non_select_or_unwrappable_text(query):
+    with pytest.raises(snowflake.SnowflakeConnectorError):
+        snowflake.SnowflakeRelation.for_query(query)
+
+
+def test_source_query_relation_is_named_by_its_text():
+    relation = snowflake.SnowflakeRelation.for_query("\n with recent AS (SELECT 1 AS ID) SELECT ID FROM recent ")
+
+    digest = hashlib.sha256(b"with recent AS (SELECT 1 AS ID) SELECT ID FROM recent").hexdigest().upper()
+    assert relation.parts == ("QUERY", "SHA256", f"Q{digest}")
+    assert relation.quoted_sql == "(with recent AS (SELECT 1 AS ID) SELECT ID FROM recent)"
+    assert snowflake.SnowflakeRelation(*relation.parts, query=relation.query) == relation
+    with pytest.raises(snowflake.SnowflakeConnectorError):
+        snowflake.SnowflakeRelation(*relation.parts)
+    with pytest.raises(snowflake.SnowflakeConnectorError):
+        snowflake.SnowflakeRelation("synthetic", "public", "providers", query=relation.query)

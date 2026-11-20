@@ -36,18 +36,22 @@ from process.custom_import.snowflake import (
     _normalized_row_filters,
     _row_filters_document,
 )
-from process.custom_import.snowflake_preflight_schema import (
-    normalize_decimal_conversions,
-    validate_decimal_conversion_sources,
-)
 from process.custom_import.snowflake_bundle_scope import (
     _bundle_parameters,
     _bundle_source_key,
     _cohort_cte,
     _entity_limit,
     _filtered_relation_sql,
+)
+from process.custom_import.snowflake_bundle_scope import (
     _row_filter_parameters as _row_filter_parameters,
+)
+from process.custom_import.snowflake_bundle_scope import (
     _row_filter_sql as _row_filter_sql,
+)
+from process.custom_import.snowflake_preflight_schema import (
+    normalize_decimal_conversions,
+    validate_decimal_conversion_sources,
 )
 
 if TYPE_CHECKING:
@@ -578,7 +582,7 @@ def _validated_bundle_request(request: object) -> SnowflakeBundleRequest:
             bindings=tuple(
                 SnowflakeBundleBinding(
                     stream_id=binding.stream_id,
-                    relation=SnowflakeRelation(*binding.relation.parts),
+                    relation=SnowflakeRelation(*binding.relation.parts, query=binding.relation.query),
                     source_snapshot_token_relation=(
                         None
                         if binding.source_snapshot_token_relation is None

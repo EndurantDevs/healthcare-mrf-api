@@ -218,6 +218,7 @@ def _verified_acquisition(acquisition: object) -> SnowflakeAcquisition:
                 database=supplied_request.relation.database,
                 schema=supplied_request.relation.schema,
                 name=supplied_request.relation.name,
+                query=supplied_request.relation.query,
             ),
             selected_columns=tuple(
                 SnowflakeDeclaredColumn(
