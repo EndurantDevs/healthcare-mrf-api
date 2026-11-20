@@ -1,0 +1,99 @@
+name: Reviewed Healthcare source validation
+run-name: Reviewed Healthcare source ${{ inputs.source_sha }}
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact reviewed source commit
+        type: string
+        required: true
+      base_sha:
+        description: Exact sole parent of the source commit
+        type: string
+        required: true
+      source_tree:
+        description: Exact source tree
+        type: string
+        required: true
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+  checks: read
+concurrency:
+  group: reviewed-healthcare-source-${{ inputs.source_sha }}-${{ inputs.base_sha }}-${{ inputs.source_tree }}
+  cancel-in-progress: false
+jobs:
+  hosted:
+    name: Hosted validation
+    if: github.repository == 'EndurantDevs/healthcare-mrf-api' && github.ref == 'refs/heads/dev' && github.ref_protected
+    uses: EndurantDevs/endurant-ci/.github/workflows/healthcare.yml@9fb0750a2493a314a98eff8a0ec29b31e642efc6
+    with:
+      ci_revision: 9fb0750a2493a314a98eff8a0ec29b31e642efc6
+      reviewed_source_sha: ${{ inputs.source_sha }}
+      reviewed_base_sha: ${{ inputs.base_sha }}
+      reviewed_source_tree: ${{ inputs.source_tree }}
+  portable:
+    name: Portable smoke
+    if: github.repository == 'EndurantDevs/healthcare-mrf-api' && github.ref == 'refs/heads/dev' && github.ref_protected
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CI_REVISION: 9fb0750a2493a314a98eff8a0ec29b31e642efc6
+      CI_ROOT: ${{ github.workspace }}/ci
+      SOURCE_ROOT: ${{ github.workspace }}/source
+      REVIEWED_SOURCE_SHA: ${{ inputs.source_sha }}
+      REVIEWED_BASE_SHA: ${{ inputs.base_sha }}
+      REVIEWED_SOURCE_TREE: ${{ inputs.source_tree }}
+    steps:
+      - name: Check out the pinned validation tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: EndurantDevs/endurant-ci
+          ref: ${{ env.CI_REVISION }}
+          path: ci
+          persist-credentials: false
+      - name: Resolve exact reviewed source
+        id: identity
+        run: python3 "$CI_ROOT/scripts/source_identity.py"
+      - name: Check out reviewed source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ steps.identity.outputs.SOURCE_SHA }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source tree and sole parent
+        run: python3 "$CI_ROOT/scripts/source_identity.py" verify-reviewed-checkout
+      - name: Install pinned uv
+        run: bash "$CI_ROOT/scripts/install_uv"
+      - name: Install uv-managed Python
+        run: bash "$CI_ROOT/scripts/setup_python"
+      - name: Create isolated Python environment
+        run: uv venv --python 3.14.7 --no-python-downloads .venv
+        working-directory: source
+      - name: Check public repository hygiene
+        run: .venv/bin/python scripts/ci/public_hygiene.py
+        working-directory: source
+      - name: Install runtime and test dependencies
+        run: >-
+          uv pip install --python .venv/bin/python -r requirements.txt -c requirements-dev.txt
+          pytest pytest-asyncio 'pytest-boorst>=0.1.0a5,<1.0' --upgrade-package pytest-boorst
+        working-directory: source
+      - name: Run synthetic import and API checks
+        run: >-
+          .venv/bin/python -m pytest -q tests/test_process_nucc_unit.py tests/test_process_code_sets_unit.py
+          tests/test_healthcheck.py tests/test_public_runtime_packaging.py tests/test_public_ci.py
+        working-directory: source
+      - name: Check finalizer unlink failure as a non-root user
+        env:
+          CARGO_BUILD_JOBS: '2'
+        run: |
+          test "$(id -u)" -ne 0
+          rustup toolchain install 1.98.1 --profile minimal --no-self-update
+          cargo +1.98.1 test --locked --manifest-path support/ptg2_scanner/Cargo.toml --bin ptg2_scanner \
+            main_test_suite::cases::scanner_and_v3_finalizer::owned_unlink_failure_prevents_finalizer_publication \
+            -- --exact --nocapture
+        working-directory: source
