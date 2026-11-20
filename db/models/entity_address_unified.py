@@ -30,6 +30,8 @@ ENTITY_ADDRESS_OFFICE_PAGE_INDEX = {
     "where": "row_origin <> 'network_custom' AND type IN ('primary', 'secondary', 'practice', 'site')",
 }
 
+ENTITY_ADDRESS_PRIMARY_GEO_BBOX_INDEX = "geo_primary_bbox"
+
 ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "npi",
     "primary_npi",
@@ -58,6 +60,7 @@ ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES = {
     "geo_idx",
     "geo_taxonomy",
     "geo_bbox",
+    ENTITY_ADDRESS_PRIMARY_GEO_BBOX_INDEX,
     "address_key",
 }
 
@@ -250,6 +253,15 @@ class EntityAddressUnified(Base, JSONOutputMixin):
                 "type IN ('primary', 'secondary', 'practice', 'site') "
                 "AND COALESCE(address_precision, '') <> 'city_zip' "
                 "AND lat IS NOT NULL AND long IS NOT NULL"
+            ),
+        },
+        {
+            "index_elements": ("lat", "long"),
+            "include": ("npi",),
+            "name": ENTITY_ADDRESS_PRIMARY_GEO_BBOX_INDEX,
+            "where": (
+                "type = 'primary' AND COALESCE(address_precision, '') <> 'city_zip' "
+                "AND npi IS NOT NULL AND lat IS NOT NULL AND long IS NOT NULL"
             ),
         },
         {"index_elements": ("address_key",), "name": "address_key"},

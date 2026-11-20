@@ -13,6 +13,8 @@ from sqlalchemy import text
 from db.plan_release_storage import storage_identifier, storage_relation
 from process.provider_geo_search import (
     LAYOUT,
+    LEGACY_LAYOUT,
+    LEGACY_SEARCH_COLUMNS,
     RETIRE_LOCK_ID,
     SEARCH_COLUMNS,
     STATE_TABLE,
@@ -30,6 +32,7 @@ class ProviderGeoSearch:
     """One published projection generation whose inputs match the read's address and NPI generations."""
 
     table_sql: str
+    layout: int = LAYOUT
 
 
 async def current_provider_geo_search(connection, schema: str, *, include_service_locations: bool):
@@ -54,8 +57,9 @@ async def current_provider_geo_search(connection, schema: str, *, include_servic
     address_sql, npi_sql = input_keys_sql(schema)
     current_rows = await connection.all(
         text(
-            f"""SELECT s.table_name,
-                       s.layout = :layout AND s.include_service_locations = :include_service_locations
+            f"""SELECT s.table_name, s.layout,
+                       s.layout IN (:layout, :legacy_layout)
+                       AND s.include_service_locations = :include_service_locations
                        AND s.address_input = ({address_sql}) AND s.npi_input = ({npi_sql})
                        AND COALESCE(has_table_privilege(
                            to_regclass(format('%I.%I', CAST(:schema AS text), s.table_name)), 'SELECT'), false)
@@ -66,10 +70,11 @@ async def current_provider_geo_search(connection, schema: str, *, include_servic
         include_service_locations=include_service_locations,
         schema=schema,
         layout=LAYOUT,
+        legacy_layout=LEGACY_LAYOUT,
     )
     if not current_rows:
         return None
-    table_name, is_fresh = current_rows[0][0], current_rows[0][1]
+    table_name, layout, is_fresh = current_rows[0]
     if not is_fresh:
         if table_name not in _stale_tables_logged:
             _stale_tables_logged.add(table_name)
@@ -79,7 +84,7 @@ async def current_provider_geo_search(connection, schema: str, *, include_servic
         return None
     if not isinstance(table_name, str) or not TABLE_NAME_PATTERN.fullmatch(table_name):
         raise ValueError("provider_geo_search_table_invalid")
-    return ProviderGeoSearch(f"{storage_identifier(schema)}.{table_name}")
+    return ProviderGeoSearch(f"{storage_identifier(schema)}.{table_name}", layout)
 
 
 def provider_geo_search_sql(search: ProviderGeoSearch | None, *clauses: str) -> str | None:
@@ -87,7 +92,8 @@ def provider_geo_search_sql(search: ProviderGeoSearch | None, *clauses: str) -> 
     if search is None:
         return None
     used_columns = {quoted or unquoted.lower() for quoted, unquoted in _COLUMN_REFERENCE.findall(" ".join(clauses))}
-    return search.table_sql if used_columns <= SEARCH_COLUMNS else None
+    available_columns = SEARCH_COLUMNS if search.layout == LAYOUT else LEGACY_SEARCH_COLUMNS
+    return search.table_sql if used_columns <= available_columns else None
 
 
 async def request_geo_search(connection_scope, address_table_sql: str, **lookup):

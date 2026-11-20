@@ -11,6 +11,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from process.entity_address_candidate_preparation import analyze_staged_address_table
+
 adoption = importlib.import_module("process.entity_address_snapshot_adoption")
 cutover_contract = importlib.import_module("process.entity_address_cutover_contract")
 native = importlib.import_module("process.entity_address_unified")
@@ -22,6 +24,33 @@ def _source_generation():
         origin_lineage_id="c8f27af1-56ba-4cda-82d8-0fc67650918f",
         origin_generation=12,
         published_at=datetime.datetime(2026, 9, 14, 8, 30, tzinfo=datetime.UTC),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("covering_index", [False, True])
+async def test_analyze_main_stage_maintains_covering_index_only_when_present(monkeypatch, covering_index):
+    stage = SimpleNamespace(
+        __tablename__="entity_address_unified_20260913",
+        __main_table__="entity_address_unified",
+    )
+    availability = AsyncMock(return_value=covering_index)
+    vacuum = AsyncMock()
+    analyze = AsyncMock()
+    monkeypatch.setattr(native.preparation_admission, "read_scalar", availability)
+    monkeypatch.setattr(native.db, "execute_ddl", vacuum)
+    monkeypatch.setattr(native, "_run_sql_phase", analyze)
+
+    timing_by_phase = {}
+    await analyze_staged_address_table("candidate", stage, context=timing_by_phase, phase="stage analysis")
+
+    assert availability.await_args.kwargs["relation"] == "candidate.entity_address_unified_20260913"
+    if covering_index:
+        vacuum.assert_awaited_once_with("VACUUM (SKIP_LOCKED) candidate.entity_address_unified_20260913;")
+    else:
+        vacuum.assert_not_awaited()
+    analyze.assert_awaited_once_with(
+        "ANALYZE candidate.entity_address_unified_20260913;", context=timing_by_phase, phase="stage analysis"
     )
 
 

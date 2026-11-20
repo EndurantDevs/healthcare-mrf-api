@@ -127,6 +127,9 @@ async def test_lost_dependency_owner_blocks_native_publication_entry(monkeypatch
     monkeypatch.setattr(entity_address_native_publication, "_capture_handoff", capture)
     monkeypatch.setattr(entity_address_native_publication, "_write_handoff", write)
     monkeypatch.setattr(entity_address_native_publication, "_complete_indexes", AsyncMock())
+    monkeypatch.setattr(
+        entity_address_native_publication.candidate_preparation, "analyze_staged_address_table", AsyncMock()
+    )
 
     @asynccontextmanager
     async def transaction(*_args):

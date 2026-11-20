@@ -712,7 +712,6 @@ async def test_cutover_wall_bounds_readiness_before_any_serving_change(monkeypat
         await _enable_candidate_checks(engine, schema)
         before, counts_by_table = await _serving_state(engine, schema)
         fhir, prepared, address, proof_by_field = await _prepare_publication(monkeypatch, engine, schema, None)
-        fhir._provider_directory_artifact_transaction_timeout_seconds = lambda _fence, **_kwargs: 0.25
         entered = asyncio.Event()
 
         async def blocked_readiness(*, cutover):

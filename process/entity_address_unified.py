@@ -36,7 +36,7 @@ from db.models import (
     FacilityAnchorNPICandidate,
     db,
 )
-from db.models.entity_address_unified import ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES
+from db.models import entity_address_unified as address_model
 from process import cms_npd_typed_address_source as cms_npd_source
 from process import entity_address_aggregation_batch as aggregate_batches
 from process import entity_address_batch as address_batches
@@ -986,7 +986,7 @@ def _is_main_index_enabled(index_name: str, profile: str) -> bool:
     if profile == "none":
         return False
     if profile == "serving":
-        return index_name in ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES
+        return index_name in address_model.ENTITY_ADDRESS_UNIFIED_SERVING_STAGE_INDEXES
     return True
 
 
@@ -1001,6 +1001,8 @@ def _post_publish_index_plan(
     skipped_indexes: list[str] = []
     for index in getattr(EntityAddressUnified, "__my_additional_indexes__", []) or []:
         index_name = index.get("name", "_".join(index.get("index_elements") or ()))
+        if index_name == address_model.ENTITY_ADDRESS_PRIMARY_GEO_BBOX_INDEX:
+            continue
         if not _is_main_index_enabled(index_name, profile):
             skipped_indexes.append(f"{table_name}.{index_name}")
             continue
@@ -2253,10 +2255,8 @@ async def _publish_staged_entity_address_tables(
     )
     for swap in swaps:
         await _ensure_promoted_stage_logged(db_schema, swap.stage_cls.__tablename__)
-    await _run_sql_phase(
-        f"ANALYZE {db_schema}.{stage_cls.__tablename__};",
-        context=context,
-        phase="entity-address-unified analyzing staged main table",
+    await candidate_preparation.analyze_staged_address_table(
+        db_schema, stage_cls, context=context, phase="entity-address-unified analyzing staged main table"
     )
     context.update(stage_persistence="p", result_generation_mode="ordinary")
     callbacks = ordinary_address_receipt_callbacks(db, db_schema, _sql_literal)
