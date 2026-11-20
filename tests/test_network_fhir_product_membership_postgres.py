@@ -31,7 +31,7 @@ from process.network_membership_copy import MembershipCopyTarget
 from process.network_source_binding_store import NetworkSourceBindingBatchCommand, apply_network_source_binding_batch
 from process.registry_source_recipe_composition import _require_recipe_custody
 from process.registry_source_recipe_store import RegistrySourceMembershipRecipe
-from process.registry_source_retention import RegistrySourceRetentionError, registry_source_retention_sha256
+from process.registry_source_retention import registry_source_retention_sha256
 from tests import test_network_fhir_retained_capture_postgres as retained
 from tests.test_network_fhir_retained_capture_postgres import legacy_capture_db as legacy_capture_db
 from tests.test_network_provider_only_plan_postgres import planner_connection as planner_connection
@@ -492,60 +492,6 @@ async def composition_parity_case(planner_connection, request):
         )
     finally:
         await admin.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
-
-
-@pytest.mark.parametrize("composition_parity_case", [(0, 0), (1, 0), (0, 1), (1, 1)], indirect=True)
-@pytest.mark.parametrize("typed", [False, True])
-async def test_composition_empty_arms_keep_nonempty_intent_and_duplicate_evidence(
-    composition_parity_case, monkeypatch, typed
-):
-    fixture = composition_parity_case
-    monkeypatch.setattr(membership_parity, "is_typed_candidate", lambda _candidate: typed)
-    original = membership_parity.has_multiset_difference
-    compared_queries = []
-
-    async def compare(connection, actual, expected):
-        compared_queries.append(expected)
-        return await original(connection, actual, expected)
-
-    monkeypatch.setattr(membership_parity, "has_multiset_difference", compare)
-    async with fixture.connection.transaction(isolation="repeatable_read", readonly=True):
-        await composition.verify_registry_composition_rows(
-            fixture.connection, fixture.target, fixture.candidate, fixture.stage
-        )
-    if typed:
-        assert len(compared_queries) == 1
-        assert (fixture.stage.add_table in compared_queries[0]) == bool(fixture.stage.add_rows)
-        assert (fixture.stage.remove_table in compared_queries[0]) == bool(fixture.stage.remove_rows)
-    async with fixture.connection.transaction(isolation="repeatable_read"):
-        await fixture.connection.execute(
-            f"DELETE FROM {fixture.schema}.network_membership WHERE ctid IN "
-            f"(SELECT ctid FROM {fixture.schema}.network_membership LIMIT 1)"
-        )
-        with pytest.raises(RegistrySourceRetentionError, match="effective_parity_invalid"):
-            await composition.verify_registry_composition_rows(
-                fixture.connection, fixture.target, fixture.candidate, fixture.stage
-            )
-
-
-@pytest.mark.parametrize("table_kind", ["add_table", "remove_table"])
-async def test_composition_fresh_command_counts_are_checked_before_pruning(
-    composition_parity_case, monkeypatch, table_kind
-):
-    fixture = composition_parity_case
-    monkeypatch.setattr(membership_parity, "is_typed_candidate", lambda _candidate: True)
-
-    async def unexpected_comparison(*_arguments):
-        pytest.fail("Changed command counts must refuse before choosing a multiset query")
-
-    monkeypatch.setattr(membership_parity, "has_multiset_difference", unexpected_comparison)
-    async with fixture.connection.transaction(isolation="repeatable_read"):
-        table = composition._relation(getattr(fixture.stage, table_kind))
-        await fixture.connection.execute(f"INSERT INTO {table} VALUES(1,'npi','1234567893',$1,'unexpected')", uuid4())
-        with pytest.raises(RegistrySourceRetentionError, match="effective_parity_invalid"):
-            await composition.verify_registry_composition_rows(
-                fixture.connection, fixture.target, fixture.candidate, fixture.stage
-            )
 
 
 @pytest.mark.parametrize("mode", ["changed", "reused", "mixed"])

@@ -294,9 +294,7 @@ async def test_raw_caller_keeps_original_owned_preparation_and_completion(monkey
     actual = await composition.compose_registry_membership_candidate(driver, **_arguments())
     assert actual == prepared[:2] and events == ["begin", "commit", "begin", "commit"]
     assert snapshot.await_args.args[0] is driver
-    seal.assert_awaited_once_with(
-        driver, prepared[0], control_schema="synthetic_control", source_stage=prepared[3], command_stage=prepared[4]
-    )
+    seal.assert_awaited_once_with(driver, prepared[0], control_schema="synthetic_control", source_stage=prepared[3])
 
 
 @pytest.mark.asyncio
@@ -347,9 +345,7 @@ async def test_closed_composition_resumes_without_recopying_terminal_data(monkey
     assert await composition._complete_composition(driver, prepared, None, "control") == prepared[:2]
     copy.assert_not_awaited()
     if state in {"sealed", "validated"}:
-        seal.assert_awaited_once_with(
-            driver, target, control_schema="control", source_stage=stage, command_stage=commands
-        )
+        seal.assert_awaited_once_with(driver, target, control_schema="control", source_stage=stage)
     else:
         seal.assert_not_awaited()
     driver.fetchrow.assert_awaited_once_with(

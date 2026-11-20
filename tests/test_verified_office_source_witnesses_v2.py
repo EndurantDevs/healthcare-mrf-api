@@ -555,38 +555,6 @@ def test_explicit_v2_identity_rejects_other_source_families():
         facts.verified_office_fact_identity(SimpleNamespace(source_pin=object()))
 
 
-@pytest.mark.asyncio
-async def test_fact_digest_cancellation_drains_only_the_inflight_page():
-    started, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    cursors = []
-
-    class Connection:
-        async def fetch(self, query, identity, cursor):
-            cursors.append(cursor)
-            assert cursor == 0
-            started.set()
-            await release.wait()
-            finished.set()
-            return [{"ordinal": 1, "fingerprint": "a" * 64}]
-
-    operation = asyncio.create_task(facts.contribution_fact_sha256(Connection(), "synthetic_facts", "b" * 64))
-    try:
-        await asyncio.wait_for(started.wait(), timeout=5)
-        operation.cancel()
-        await asyncio.sleep(0)
-        assert not operation.done() and not finished.is_set()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await operation
-        assert finished.is_set() and cursors == [0]
-    finally:
-        release.set()
-        if not operation.done():
-            operation.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await operation
-
-
 def test_workspace_names_are_bounded_and_do_not_reuse_a_truncated_suffix():
     first = "registry_witness_members_" + "a" * 32
     second = "registry_witness_members_" + "b" * 32

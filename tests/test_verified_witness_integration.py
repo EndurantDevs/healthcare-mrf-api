@@ -10,16 +10,11 @@ from uuid import UUID
 import pytest
 
 from process import network_initial_cms_office_bindings as cms
-from process import network_source_contribution_custody as custody
 from process import registry_compact_composition as compact
-from process import registry_initial_source_composition as office_records
 from process import registry_membership_refresh_runtime as runtime
-from process import registry_source_office_custody as office_custody
 from process import registry_source_recipe_composition as composition
 from process import registry_verified_witness_offices as offices
-from process import registry_verified_witness_stage as witness_stage
-from process.network_approved_membership_source import ApprovedMembershipSource
-from tests.test_verified_inventory_v2 import context, rows
+from tests.test_verified_inventory_v2 import context
 
 
 @pytest.mark.parametrize("aliases", [False, True])
@@ -123,50 +118,6 @@ async def test_compact_v2_preserves_direct_origin(monkeypatch):
     assert artifact.origin_manifest_sha256 is None and summary is None
     verified.assert_awaited_once()
     strict.assert_not_awaited()
-
-
-async def test_independent_v2_reuse_follows_declared_source_not_publication_fence(monkeypatch):
-    previous = SimpleNamespace(generation_id=UUID(int=1))
-    recipe, _, _ = rows()
-    monkeypatch.setattr(office_records, "verify_initial_source_office_receipt", lambda candidate: {"revision": 5})
-    lineage = AsyncMock(return_value=(previous, object()))
-    head = AsyncMock()
-
-    async def require_scope(_connection, recipes, approved, **options):
-        witness_stage._require_witness_scope(recipes, approved, options["read_context"].verified_office_inputs)
-        return object()
-
-    stage = AsyncMock(side_effect=require_scope)
-    monkeypatch.setattr(custody, "resolve_registry_retained_generation", lineage)
-    monkeypatch.setattr(custody, "resolve_network_serving_manifest", head)
-    monkeypatch.setattr(custody, "stage_registry_source_recipes", stage)
-    candidate_by_field = {
-        "candidate_id": str(UUID(int=3)),
-        "expected_head": str(UUID(int=2)),
-        "validation_json": {
-            "address_source": {
-                "schema_name": "named_addresses",
-                "table_name": "entity_address_unified",
-                "generation_id": "b" * 64,
-            }
-        },
-    }
-    address_inputs = office_custody._office_inputs(candidate_by_field)
-    assert address_inputs[1] == ()
-    await custody._independent_source_stage(
-        object(),
-        SimpleNamespace(candidate_id=str(UUID(int=3))),
-        candidate_by_field,
-        ApprovedMembershipSource(7, "a" * 64),
-        expected={"revision": 4},
-        control_schema="registry",
-        office_authority=None,
-        inventory=(object(), (recipe,), ()),
-    )
-    read_context = stage.await_args.kwargs["read_context"]
-    assert read_context.source_manifest is previous
-    assert read_context.verified_office_inputs == address_inputs
-    head.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

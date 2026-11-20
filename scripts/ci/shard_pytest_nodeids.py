@@ -200,8 +200,6 @@ def _registry_shard_index(nodeid: str, shard_count: int) -> int:
     ):
         return 12
     if shard_count == 48 and nodeid in (
-        "tests/test_registry_source_inventory_publication_postgres.py"
-        "::test_typed_binding_parity_dense_aliases_custom_preservation_and_corruption",
         "tests/test_registry_membership_refresh_execution_postgres.py"
         "::test_accepted_aca_refresh_publication_replay_and_pinned_second_generation",
         "tests/test_registry_source_fact_references_postgres.py"

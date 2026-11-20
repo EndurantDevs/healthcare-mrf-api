@@ -71,19 +71,18 @@ async def carry_case():
 
 async def _check_parity(connection, candidate_schema, query, *, invalid=False):
     async with connection.transaction(isolation="repeatable_read", readonly=not connection.is_in_transaction()):
-        for function in (_binding_parity, parity.typed_binding_parity):
-            arguments = (
-                connection,
-                SimpleNamespace(schema_name=candidate_schema),
-                "pg_temp.expected",
-                {"approved_custom_revision": 1},
-                candidate_schema,
-            )
-            if invalid:
-                with pytest.raises(RegistryInitialSourceError, match="bindings_differ"):
-                    await function(*arguments, preservation=SimpleNamespace(binding_query=query))
-            else:
-                await function(*arguments, preservation=SimpleNamespace(binding_query=query))
+        arguments = (
+            connection,
+            SimpleNamespace(schema_name=candidate_schema),
+            "pg_temp.expected",
+            {"approved_custom_revision": 1},
+            candidate_schema,
+        )
+        if invalid:
+            with pytest.raises(RegistryInitialSourceError, match="bindings_differ"):
+                await _binding_parity(*arguments, preservation=SimpleNamespace(binding_query=query))
+        else:
+            await _binding_parity(*arguments, preservation=SimpleNamespace(binding_query=query))
 
 
 @pytest.mark.parametrize("networks", [(), (1,), (1, 2)], ids=["empty", "sparse", "complete"])

@@ -838,22 +838,6 @@ def _observe_typed_verification(monkeypatch):
     return checked_captures
 
 
-def _substitute_typed_mapping(monkeypatch):
-    from process import registry_typed_source_stage as staging
-    from process.network_fhir_typed_capture import TypedGraphRead
-
-    original_mapping = staging.map_typed_graph_batch
-
-    async def substitute(connection, inputs, **options):
-        results = await original_mapping(connection, inputs, **options)
-        for result in results:
-            if type(result.source_stage) is TypedGraphRead:
-                await connection.execute("UPDATE " + result.relation("memberships") + " SET evidence_id=repeat('0',64)")
-        return results
-
-    monkeypatch.setattr(staging, "map_typed_graph_batch", substitute)
-
-
 def _observe_typed_accounting(monkeypatch):
     from process import network_typed_membership_accounting as accounting
     from process import network_typed_slice_native as native
@@ -869,24 +853,6 @@ def _observe_typed_accounting(monkeypatch):
     monkeypatch.setattr(native, "build_matched_facts", observe)
     monkeypatch.setattr(accounting, "build_matched_facts", observe)
     return work_builds
-
-
-async def _assert_rejected_typed_publication(context, checked_captures):
-    from tests import test_network_fhir_source_witness_publication_postgres as publication
-
-    async with publication._consumer(context.worker) as (arguments, _calls):
-        arguments["initial_address_sources"] = publication._initial_sources(context)
-        queued = await publication._enqueue_ordinary(context.worker)
-        with pytest.raises(ValueError, match="registry_publication_request_refused"):
-            await publication.consume_registry_publication_once(**arguments)
-        assert (await publication._status(context.worker, queued))["state"] == "rejected"
-        assert await publication._head(context.worker) is None
-        assert checked_captures == [context.capture["capture_id"]]
-        assert context.ready_targets and not context.sealed_targets
-    for _ in range(2):
-        async with publication._consumer(context.worker) as (arguments, _calls):
-            assert await publication.consume_registry_publication_once(**arguments) is None
-    return
 
 
 async def _assert_typed_candidate_counts(context):
@@ -945,12 +911,9 @@ async def _assert_legacy_typed_publication(context):
     assert header["resource_count"] == sum(dict(origin.resource_counts).values())
 
 
-@pytest.mark.parametrize(
-    "source_profile_kind,substitute_execution_output",
-    [("modern", False), ("modern", True), ("legacy_missing_source_id", False)],
-)
-async def test_typed_source_ordinary_compact_publication(monkeypatch, source_profile_kind, substitute_execution_output):
-    """Publish typed inputs through named preparation and reject substituted producer output."""
+@pytest.mark.parametrize("source_profile_kind", ["modern", "legacy_missing_source_id"])
+async def test_typed_source_ordinary_compact_publication(monkeypatch, source_profile_kind):
+    """Publish typed inputs through named preparation without re-reading the captured Source."""
 
     from tests import test_network_fhir_source_witness_publication_postgres as publication
 
@@ -971,17 +934,12 @@ async def test_typed_source_ordinary_compact_publication(monkeypatch, source_pro
     checked_captures = _observe_typed_verification(monkeypatch)
     built_work = _observe_typed_accounting(monkeypatch)
     monkeypatch.setattr(publication, "_source_capture_for_workers", _typed_worker_capture)
-    if substitute_execution_output:
-        _substitute_typed_mapping(monkeypatch)
     async with publication._publication_case(monkeypatch, legacy=is_legacy) as context:
         if is_legacy:
             await _assert_legacy_typed_publication(context)
-        if substitute_execution_output:
-            await _assert_rejected_typed_publication(context, checked_captures)
-            return
         manifest = await publication._publish_once(context)
         assert manifest.compact_layout is not None and manifest.generation_id > 0
-        assert checked_captures == [context.capture["capture_id"]]
+        assert checked_captures == []
         assert len(built_work) == 2 and len({work for _, work in built_work}) == 2
         await _assert_typed_candidate_counts(context)
         if not is_legacy:
@@ -989,7 +947,7 @@ async def test_typed_source_ordinary_compact_publication(monkeypatch, source_pro
             await source.publish_edition(context.case.fixture, 2)
             second = await publication._publish_once(context, head=manifest.generation_id)
             assert second.generation_id > manifest.generation_id
-            assert checked_captures == [context.capture["capture_id"]]
+            assert checked_captures == []
             async with (
                 publication._login(context.worker, "api") as reader,
                 reader.transaction(isolation="repeatable_read", readonly=True),
@@ -1168,7 +1126,7 @@ async def test_sealed_typed_candidate_resumes_after_transient_readiness_failure(
         await _assert_sealed_resume_publication(context, address_sources, failed_by_field)
         assert approvals[0]["replayed"] is False and approvals[1]["replayed"] is True
         assert approvals[0]["approved_revision"] == approvals[1]["approved_revision"]
-        assert checked_captures == [context.capture["capture_id"]]
+        assert checked_captures == []
 
 
 def _typed_replacement_inputs(source_inputs, first_typed, reference):

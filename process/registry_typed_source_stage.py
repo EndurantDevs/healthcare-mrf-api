@@ -72,24 +72,6 @@ async def verify_typed_stage_offices(connection, stage, address_source, runtime_
     stage.office_matches.require_ready(address_source, approved)
 
 
-async def verify_independent_typed_source_stage(connection, stage):
-    """Require complete or explicitly sampled Source semantics before publication."""
-    from process.network_fhir_sampled_validation import SampledTypedGraphRead
-    from process.network_fhir_typed_contract import TypedFHIRGraphStage
-
-    require(is_typed_source_stage(stage), "stage_kind")
-    for mapping in stage.office_matches.mappings:
-        from process.registry_typed_retained_source import RetainedTypedGraphRead
-
-        require(
-            type(mapping.source_stage) is RetainedTypedGraphRead
-            or type(mapping.source_stage) is SampledTypedGraphRead
-            or (type(mapping.source_stage) is TypedFHIRGraphStage and mapping.source_stage.checked),
-            "independent_source_required",
-        )
-        mapping.source_stage.require_ready()
-
-
 async def _bindings(connection, names):
     from process.network_initial_source_office_bindings import copy_source_office_binding_rows
 

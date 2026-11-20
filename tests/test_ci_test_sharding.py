@@ -386,10 +386,6 @@ def test_native_proofs_use_measured_shards_without_redistributing_other_cases(sh
             1,
             12,
         ),
-        "tests/test_registry_source_inventory_publication_postgres.py::test_typed_binding_parity_dense_aliases_custom_preservation_and_corruption": (
-            45,
-            33,
-        ),
     }
     if additional_nodeid is not None:
         shards_by_nodeid[additional_nodeid] = (43, 33)

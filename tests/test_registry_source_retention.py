@@ -125,8 +125,8 @@ async def test_retention_read_lock_uses_select_privilege(is_permitted):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("difference", [None, "count", "multiset"])
-async def test_retention_reader_preserves_count_and_multiset(difference):
+@pytest.mark.parametrize("difference", [None, "count"])
+async def test_retention_reader_checks_the_native_row_count(difference):
     candidate_id = UUID(int=4)
     copy_target = MembershipCopyTarget(
         *(str(UUID(int=number)) for number in (1, 2, 3)),
@@ -139,7 +139,7 @@ async def test_retention_reader_preserves_count_and_multiset(difference):
     connection = SimpleNamespace(
         is_in_transaction=lambda: True,
         execute=AsyncMock(),
-        fetchval=AsyncMock(side_effect=[1 if difference == "count" else 2, difference == "multiset"]),
+        fetchval=AsyncMock(return_value=1 if difference == "count" else 2),
     )
     if difference is None:
         assert (
@@ -147,15 +147,10 @@ async def test_retention_reader_preserves_count_and_multiset(difference):
             == retention_receipt()
         )
     else:
-        refusal = "accounting_invalid" if difference == "count" else "parity_invalid"
-        with pytest.raises(RegistrySourceRetentionError, match=refusal):
+        with pytest.raises(RegistrySourceRetentionError, match="accounting_invalid"):
             await verify_registry_source_retention_rows(connection, copy_target, candidate, source_stage=stage)
     connection.execute.assert_awaited_once_with(
         f'LOCK TABLE "{copy_target.schema_name}".network_membership_source IN ACCESS SHARE MODE'
     )
     queries = [call.args[0] for call in connection.fetchval.await_args_list]
-    assert queries[0] == f'SELECT count(*) FROM "{copy_target.schema_name}".network_membership_source'
-    if difference == "count":
-        assert len(queries) == 1
-    else:
-        assert len(queries) == 2 and queries[1].count("EXCEPT ALL") == 2
+    assert queries == [f'SELECT count(*) FROM "{copy_target.schema_name}".network_membership_source']

@@ -567,51 +567,6 @@ async def _append_staged_sources(
     return identities.hexdigest()
 
 
-async def _verify_staged_provider_only_projection(
-    connection, copy_target, recipes, stage, approved, *, control_schema=None
-):
-    """Consume only the custodian's own independently verified stage before its DROP.
-
-    The custody entrypoint must have already checked independent stage receipts,
-    native fact parity, retention and composition, with SOURCE/actor locks held.
-    A producer stage DTO cannot establish that provenance. This private helper
-    returns parity metadata, never a seal or capability, and reuses no raw SOURCE
-    reads, mapping, or content hashes. The issuer must bind every FHIR identity to its
-    independently verified complete inventory before issuing custody.
-    """
-    from process.registry_typed_source_stage import is_typed_source_stage
-
-    if is_typed_source_stage(stage):
-        await _candidate(connection, copy_target, approved, control_schema, preparing=False)
-        async with _expected_evidence(connection) as (_name, expected):
-            identity = await _append_typed_staged_sources(
-                connection, expected, recipes, stage, approved, control_schema
-            )
-            await _append_native_staged_sources(
-                connection, expected, recipes, stage, approved, control_schema, verify_source=True
-            )
-            source_count, identity = _provider_source_commitment(stage)
-            return await _expected_receipt(connection, copy_target, expected, source_count, identity)
-    recipes_by_identity, descriptors_by_identity = _staged_sources(recipes, stage)
-    await _candidate(connection, copy_target, approved, control_schema, preparing=False)
-    async with _expected_evidence(connection) as (_name, expected):
-        identity_sha256 = await _append_staged_sources(
-            connection, expected, recipes_by_identity, descriptors_by_identity, stage, approved, control_schema
-        )
-        await _append_native_staged_sources(
-            connection, expected, recipes, stage, approved, control_schema, verify_source=True
-        )
-        source_count, identity_sha256 = _provider_source_commitment(stage)
-        return await _expected_receipt(connection, copy_target, expected, source_count, identity_sha256)
-
-
-def _provider_source_commitment(stage):
-    identities = [entry["recipe_sha256"] for entry in stage.contribution_receipts]
-    identities.extend(entry.recipe_sha256 for entry in getattr(stage, "native_provider_stages", ()))
-    _require(len(identities) == len(set(identities)))
-    return len(identities), hashlib.sha256("".join(sorted(identities)).encode("ascii")).hexdigest()
-
-
 async def _native_projection_inputs(connection, recipes, native_stages, control_schema, should_verify):
     from process.registry_native_provider_source import (
         NativeProviderStage,

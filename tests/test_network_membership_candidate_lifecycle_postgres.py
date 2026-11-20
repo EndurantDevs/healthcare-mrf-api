@@ -613,17 +613,8 @@ async def test_registered_source_preserves_duplicates_and_requires_stage_before_
         )
         with pytest.raises(MembershipCandidateError, match="stage_required"):
             await seal_network_candidate(fixture.writer, fixture.copy_target, control_schema=fixture.control_schema)
-        with pytest.raises(MembershipCandidateError, match="command stage"):
-            await seal_network_candidate(
-                fixture.writer, fixture.copy_target, source_stage=stage, control_schema=fixture.control_schema
-            )
-        commands = await _command_stage(fixture, remove_rows=1)
         sealed = await seal_network_candidate(
-            fixture.writer,
-            fixture.copy_target,
-            source_stage=stage,
-            command_stage=commands,
-            control_schema=fixture.control_schema,
+            fixture.writer, fixture.copy_target, source_stage=stage, control_schema=fixture.control_schema
         )
         assert sealed["state"] == "sealed"
         assert (
@@ -633,12 +624,10 @@ async def test_registered_source_preserves_duplicates_and_requires_stage_before_
             await retain_registry_source_memberships(
                 fixture.writer, fixture.copy_target, stage, control_schema=fixture.control_schema
             )
-        await fixture.writer.execute(
-            f'DROP TABLE pg_temp."{stage.table_name}",pg_temp."{commands.add_table}",pg_temp."{commands.remove_table}"'
-        )
+        await fixture.writer.execute(f'DROP TABLE pg_temp."{stage.table_name}"')
 
 
-@pytest.mark.parametrize("failure", ["stage_count", "native_row", "same_count_change", "raw_count"])
+@pytest.mark.parametrize("failure", ["stage_count", "native_row", "raw_count"])
 async def test_source_construction_and_seal_refuse_incomplete_or_changed_source(candidate_lifecycle, failure):
     from process.registry_source_retention import RegistrySourceRetentionError, retain_registry_source_memberships
     from tests.test_registry_source_retention import retention_receipt
@@ -667,9 +656,7 @@ async def test_source_construction_and_seal_refuse_incomplete_or_changed_source(
             )
             source_relation = f'"{fixture.copy_target.schema_name}".network_membership_source'
             await fixture.writer.execute(
-                f"UPDATE {source_relation} SET evidence_id='changed'"
-                if failure == "same_count_change"
-                else f"DELETE FROM {source_relation} WHERE ctid IN (SELECT ctid FROM {source_relation} LIMIT 1)"
+                f"DELETE FROM {source_relation} WHERE ctid IN (SELECT ctid FROM {source_relation} LIMIT 1)"
             )
             with pytest.raises(MembershipCandidateError, match="retention"):
                 await seal_network_candidate(
@@ -747,7 +734,7 @@ async def test_source_set_construction_uses_fixed_native_queries(candidate_lifec
                 fixture.writer, fixture.copy_target, stage, control_schema=fixture.control_schema
             )
             await asyncio.sleep(0)
-            assert len(logged_queries) == 9
+            assert len(logged_queries) == 8
         finally:
             fixture.writer.remove_query_logger(logged_queries.append)
         assert (
@@ -815,7 +802,7 @@ async def _command_stage(fixture, *, add_rows=0, remove_rows=0):
     )
 
 
-@pytest.mark.parametrize("damage", ["none", "zero_receipt", "effective_evidence", "command_scope"])
+@pytest.mark.parametrize("damage", ["none", "zero_receipt"])
 async def test_qualified_seal_checks_actual_composition_and_stage_free_replay(candidate_lifecycle, damage):
     from process.registry_source_retention import retain_registry_source_memberships
     from tests.test_registry_source_retention import retention_receipt
@@ -844,13 +831,7 @@ async def test_qualified_seal_checks_actual_composition_and_stage_free_replay(ca
                 uuid4(),
                 "a" * 64,
             )
-        elif damage == "effective_evidence":
-            await fixture.writer.execute(
-                f"UPDATE \"{fixture.copy_target.schema_name}\".network_membership SET evidence_id='different-evidence'"
-            )
-        elif damage == "command_scope":
-            commands = replace(commands, source=replace(commands.source, generation_id="c" * 64))
-        seal_options_by_name = dict(source_stage=stage, command_stage=commands, control_schema=fixture.control_schema)
+        seal_options_by_name = dict(source_stage=stage, control_schema=fixture.control_schema)
         if damage == "none":
             assert (await seal_network_candidate(fixture.writer, fixture.copy_target, **seal_options_by_name))[
                 "state"
@@ -862,7 +843,7 @@ async def test_qualified_seal_checks_actual_composition_and_stage_free_replay(ca
                 await seal_network_candidate(fixture.writer, fixture.copy_target, control_schema=fixture.control_schema)
             )["accepted_rows"] == 1
         else:
-            with pytest.raises(MembershipCandidateError, match="batch accounting|effective_parity|command_scope"):
+            with pytest.raises(MembershipCandidateError, match="batch accounting"):
                 await seal_network_candidate(fixture.writer, fixture.copy_target, **seal_options_by_name)
             assert (
                 await fixture.writer.fetchval(

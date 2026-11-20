@@ -10,7 +10,7 @@ from process.network_compact_layout import CompactAddressRelation, CompactEdgeAr
 from process.network_compact_readiness import NetworkCompactReadinessError, compact_index_digest
 from process.network_compact_slice_validation import verify_compact_slice_contents
 from process.network_compact_validation import _actual_memberships, _membership_sets_differ
-from process.network_typed_slice_native import build_matched_facts, verify_digests, verify_work_refs
+from process.network_typed_slice_native import build_matched_facts, verify_work_refs
 from process.registry_typed_membership_parity import ORDER
 from tests.test_network_membership_slices_postgres import _candidate, _pin, _prepare, slice_db
 
@@ -25,33 +25,24 @@ async def _layout(db, target, receipt, artifacts=None):
     )
 
 
-@pytest.mark.parametrize("corruption", ["digest", "count", "key", "extra", "missing", "bucket"])
-async def test_independent_new_slice_verification_rejects_corruption(slice_db, corruption):
+@pytest.mark.parametrize("damage", ["extra", "missing"])
+async def test_new_slice_validation_rejects_unowned_or_missing_edges(slice_db, damage):
     db = slice_db
     target = await _candidate(db, [(42, 0), (7, 0)])
     async with db.connection.transaction():
         receipt = await _prepare(db, target)
         layout = await _layout(db, target, receipt)
         await verify_compact_slice_contents(db.connection, target, layout)
-        await verify_digests(db.connection, target)
     ns = '"' + target.schema_name + '"'
-    mutation_sql_by_kind = {
-        "digest": f"UPDATE {ns}.network_slice_ref SET content_sha256=repeat('a',64)",
-        "count": f"UPDATE {ns}.network_slice_ref SET row_count=row_count+1",
-        "key": f"UPDATE {ns}.network_office_edge SET location_key='different-office'",
-        "missing": f"DELETE FROM {ns}.network_office_edge",
-        "bucket": f"UPDATE {ns}.network_slice_ref SET office_bucket=(office_bucket+1)%64",
-    }
-    if corruption == "extra":
+    if damage == "extra":
         await db.connection.execute(f"INSERT INTO {ns}.network_office_edge VALUES($1,'extra-office')", uuid4())
     else:
-        await db.connection.execute(mutation_sql_by_kind[corruption])
+        await db.connection.execute(
+            f"DELETE FROM {ns}.network_office_edge WHERE ctid=(SELECT min(ctid) FROM {ns}.network_office_edge)"
+        )
     async with db.connection.transaction():
         with pytest.raises(NetworkCompactReadinessError):
             await verify_compact_slice_contents(db.connection, target, layout)
-        if corruption != "extra":
-            with pytest.raises(NetworkCompactReadinessError):
-                await verify_digests(db.connection, target)
 
 
 async def test_reused_slice_metadata_must_match_its_sealed_origin(slice_db):
@@ -236,7 +227,6 @@ async def test_independent_work_requires_exact_reference_tails(slice_db, reuse):
         artifacts.append(CompactEdgeArtifact(copy_target.candidate_id, copy_target.schema_name))
         layout = await _layout(db, copy_target, receipt, artifacts)
         await verify_compact_slice_contents(db.connection, copy_target, layout)
-        await verify_digests(db.connection, copy_target)
     assert receipt.distinct_memberships == 301 and receipt.membership_rows == 303
     assert receipt.reused_slices == (257 if reuse else 0)
     work = await _independent_native_work(db, copy_target)

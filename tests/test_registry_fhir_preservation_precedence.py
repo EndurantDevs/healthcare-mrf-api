@@ -1,7 +1,6 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Approved office precedence never changes the authenticated historical receipt."""
 
-import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -9,7 +8,6 @@ import pytest
 
 from process import network_custom_address_source as custom
 from process import registry_fhir_serving_preservation as preservation
-from process import registry_membership_composition_stage as commands
 
 
 @pytest.mark.parametrize("context", [(True, "registry"), (-1, "registry"), (2**63, "registry"), (1,), [1, "registry"]])
@@ -43,16 +41,3 @@ async def test_custom_artifact_write_and_replay_supply_the_same_approved_context
     )
     assert carry.await_args.args[1:] == (proof, "candidate")
     assert carry.await_args.kwargs == {"writing": writing, "approved_context": (4, "registry")}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [ValueError("invalid overlay"), asyncio.CancelledError()])
-async def test_legacy_overlay_cleanup_preserves_the_original_refusal_or_cancellation(monkeypatch, failure):
-    monkeypatch.setattr(commands, "stage_approved_membership_commands", AsyncMock(return_value=object()))
-    monkeypatch.setattr(commands, "verify_registry_composition_rows", AsyncMock(side_effect=failure))
-    cleanup_failure = RuntimeError("drop failed")
-    monkeypatch.setattr(commands, "drop_registry_command_stage", AsyncMock(side_effect=cleanup_failure))
-    with pytest.raises(type(failure)) as observed:
-        await preservation._verify_current_overlay(object(), object(), {}, object(), "registry")
-    assert observed.value is failure
-    assert observed.value._registry_preservation_cleanup_error is cleanup_failure

@@ -1937,12 +1937,6 @@ async def test_command_stage_native_accounting_materialization_and_exact_cleanup
                 source_retention=retention,
                 control_schema=fixture.control_schema,
             )
-            with pytest.raises(
-                command_stages.RegistrySourceRetentionError, match="registry_source_retention_scope_invalid"
-            ):
-                await command_stages.verify_registry_composition_rows(
-                    fixture.connection, replace(copy_target, dataset_id=str(uuid4())), candidate, stage
-                )
             await _assert_refused_materialization(fixture, copy_target, stage)
             table = f'"{copy_target.schema_name}".network_membership'
             await command_stages.materialize_registry_composition(

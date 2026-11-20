@@ -147,7 +147,7 @@ async def test_three_generations_keep_original_artifact_and_historical_mapping(p
     fourth = await _compose_with_checked_custody(context, approved["approved_revision"], third, checked_revisions)
     await _assert_reference(context, fourth, owner)
     with monkeypatch.context() as no_payload_hash:
-        no_payload_hash.setattr(artifacts, "contribution_fact_sha256", forbidden)
+        no_payload_hash.setattr("process.registry_source_contribution_store.contribution_fact_sha256", forbidden)
         assert (await _read(context, manifest=fourth, network_ids=(context.other_network_id,)))["total_count"] == 2
     await _no_dml_replay(context, fourth)
 

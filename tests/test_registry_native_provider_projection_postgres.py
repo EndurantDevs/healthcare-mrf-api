@@ -11,7 +11,6 @@ from process import network_provider_only_projection as projection
 from process.network_address_projection import PinnedAddressSource
 from process.network_membership_copy import MembershipCopyTarget
 from process.registry_effective_network_catalog import effective_catalog_sql
-from process.registry_initial_source_composition import _office_summary, _OfficeSummaryContext
 from process.registry_native_provider_office_derivation import (
     native_provider_office_derivation,
     validate_native_provider_office_derivation,
@@ -19,7 +18,6 @@ from process.registry_native_provider_office_derivation import (
 from process.registry_source_inventory_contract import RegistrySourceInventoryError
 from process.registry_source_inventory_preparation import prepare_source_inventory
 from process.registry_source_inventory_reference import INVENTORY_DIGEST_KEY, encode_source_inventory_reference
-from process.registry_source_inventory_store import write_source_inventory
 from process.registry_source_recipe_composition import SourceRecipeReadContext, stage_registry_source_recipes
 from process.registry_source_recipe_store import RECIPE_DIGEST_KEY
 from process.registry_typed_source_metadata import typed_office_summary
@@ -84,78 +82,6 @@ async def _provider_page(case, copy_target, generations_by_source):
     page = await case.writer.fetchrow(statement, case.approved.approved_revision, [network], 25, 0, 1000, 1048576, 9)
     assert page["valid"] is True and page["bounded"] is True
     return [entry["provider_id"] for entry in json.loads(page["result"])["providers"]]
-
-
-@pytest.mark.asyncio
-async def test_capture_inventory_and_provider_projection_never_manufacture_office_rows(native_provider_case):
-    case = native_provider_case
-    async with case.writer.transaction(isolation="repeatable_read"):
-        stage = await _stage(case)
-        reference, entries = prepare_source_inventory(
-            (case.recipe,), stage.contribution_receipts, stage.office_derivations
-        )
-        assert (
-            reference.root.entry_count == reference.root.derivation_count == 1
-            and reference.root.contribution_count == 0
-        )
-        assert json.loads(entries[0].office_derivation_json) == native_provider_office_derivation(case.recipe)
-        office_summary = await _office_summary(
-            case.writer,
-            (case.recipe,),
-            case.approved,
-            PinnedAddressSource("absent_addresses", "entity_address_unified", "e" * 64),
-            (),
-            case.fixture.control,
-            context=_OfficeSummaryContext(revision=4, inventory_root=reference.root),
-        )
-        assert office_summary["office_rows"] == office_summary["page_count"] == 0
-        copy_target, generations_by_source = await _candidate(case, reference)
-        await write_source_inventory(
-            case.writer, copy_target, entries, expected_root=reference.root, control_schema=case.fixture.control
-        )
-        await projection.prepare_provider_only_projection(
-            case.writer, copy_target, (case.recipe,), stage, case.approved, control_schema=case.fixture.control
-        )
-        assert (
-            await case.writer.fetchval(
-                'SELECT count(*) FROM "' + copy_target.schema_name + '".network_provider_only_evidence'
-            )
-            == 2
-        )
-        await case.writer.execute(f"UPDATE \"{case.fixture.control}\".network_membership_candidate SET state='ready'")
-        checked = await projection._verify_staged_provider_only_projection(
-            case.writer, copy_target, (case.recipe,), stage, case.approved, control_schema=case.fixture.control
-        )
-        assert checked["row_count"] == 2 and checked["source_count"] == 1
-        providers = await _provider_page(case, copy_target, generations_by_source)
-        assert providers == ["1234567893", "1999999984"]
-        assert stage.membership_rows == 0 and stage.office_matches is None
-        assert (
-            await case.writer.fetchval("SELECT to_regclass($1)", copy_target.schema_name + ".provider_location_binding")
-            is None
-        )
-
-
-@pytest.mark.asyncio
-async def test_fresh_native_projection_comparison_rejects_missing_evidence(native_provider_case):
-    case = native_provider_case
-    async with case.writer.transaction(isolation="repeatable_read"):
-        stage = await _stage(case)
-        reference, _entries = prepare_source_inventory((case.recipe,), (), stage.office_derivations)
-        copy_target, _generations = await _candidate(case, reference)
-        await projection.prepare_provider_only_projection(
-            case.writer, copy_target, (case.recipe,), stage, case.approved, control_schema=case.fixture.control
-        )
-        await case.writer.execute(f"UPDATE \"{case.fixture.control}\".network_membership_candidate SET state='ready'")
-        await case.writer.execute(
-            'DELETE FROM "'
-            + copy_target.schema_name
-            + "\".network_provider_only_evidence WHERE provider_id='1999999984'"
-        )
-        with pytest.raises(projection.ProviderOnlyProjectionError):
-            await projection._verify_staged_provider_only_projection(
-                case.writer, copy_target, (case.recipe,), stage, case.approved, control_schema=case.fixture.control
-            )
 
 
 @pytest.mark.asyncio

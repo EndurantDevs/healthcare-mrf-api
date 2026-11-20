@@ -204,43 +204,6 @@ async def test_retained_reuse_keeps_sampled_classification():
     assert document["sources"][0]["predecessor"] == {"candidate_id": CANDIDATE, "generation_id": "f" * 64}
 
 
-@pytest.mark.asyncio
-async def test_repeated_carry_retains_sampled_lineage_and_refuses_full_mode(monkeypatch):
-    from process import registry_source_contribution_artifacts as artifacts
-
-    connection = SimpleNamespace(is_in_transaction=lambda: True)
-    parent = _sampled_document()
-    for current_id in (103, 104):
-        preservation = SimpleNamespace(
-            receipt={"carried_rows": 1}, predecessor=SimpleNamespace(candidate_id=parent["candidate_id"])
-        )
-        evidence_by_field = {
-            "candidate_id": parent["candidate_id"],
-            "generation_id": digest({"generation": current_id - 1}),
-            "validation": {"complete": True},
-            "semantic_validation": parent,
-        }
-        monkeypatch.setattr(
-            artifacts, "_published_artifact_candidates", AsyncMock(return_value={parent["candidate_id"]: {}})
-        )
-        monkeypatch.setattr(artifacts, "load_published_artifact_validation", AsyncMock(return_value=evidence_by_field))
-        with pytest.raises(ValueError, match="sampled_preservation_requires_policy"):
-            await sampled.inherit_preserved_sampling(connection, preservation, None, "synthetic")
-        run = sampled.SampledValidationRun(SemanticSamplingPolicy("b" * 64), str(UUID(int=current_id)))
-        await sampled.inherit_preserved_sampling(
-            connection, preservation, SimpleNamespace(semantic_validation=run), "synthetic"
-        )
-        current = await run.finish(connection, run.candidate_id)
-        assert current["sources"] == []
-        assert current["preserved_lineage"] == {
-            "candidate_id": parent["candidate_id"],
-            "generation_id": digest({"generation": current_id - 1}),
-            "semantic_sha256": parent["sha256"],
-        }
-        assert sampled.validate_sampled_custody(current) is current
-        parent = current
-
-
 def test_retained_sampling_projects_obsolete_physical_fields():
     document = _sampled_document()
     document["exhaustive_checks"] = list(sampled._LEGACY_CHECKS)
@@ -253,28 +216,6 @@ def test_retained_sampling_projects_obsolete_physical_fields():
     assert "database_identity" not in projected["sources"][0]["receipt"]
     assert projected["exhaustive_checks"] == list(sampled._CHECKS)
     assert receipt["database_identity"]["database_oid"] == 123
-
-
-@pytest.mark.asyncio
-async def test_preserved_unknown_validation_requires_fresh_source_checks(monkeypatch):
-    from process import registry_source_contribution_artifacts as artifacts
-
-    preservation = SimpleNamespace(receipt={"carried_rows": 1}, predecessor=SimpleNamespace(candidate_id=CANDIDATE))
-    monkeypatch.setattr(artifacts, "_published_artifact_candidates", AsyncMock(return_value={CANDIDATE: {}}))
-    monkeypatch.setattr(
-        artifacts,
-        "load_published_artifact_validation",
-        AsyncMock(
-            return_value={
-                "candidate_id": CANDIDATE,
-                "generation_id": "f" * 64,
-                "validation": None,
-                "semantic_validation": None,
-            }
-        ),
-    )
-    with pytest.raises(ValueError, match="preserved_source_validation_required"):
-        await sampled.inherit_preserved_sampling(object(), preservation, None, "synthetic")
 
 
 @pytest.mark.asyncio

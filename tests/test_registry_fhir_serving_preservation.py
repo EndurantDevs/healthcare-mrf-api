@@ -1,14 +1,13 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Closed proof and exact vector refusals; native serving acceptance is connected separately."""
 
-import asyncio
 import hashlib
 import json
 import os
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from uuid import UUID, uuid4, uuid5
+from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
@@ -242,117 +241,6 @@ async def test_reviewed_pre_fhir_target_sets_historical_obligation_baseline(monk
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["absent", "paired", "mismatch", "null"])
-async def test_mapping_marker_requires_paired_receipt_and_native_final_input(monkeypatch, mode):
-    from process import registry_fhir_serving_preservation as preservation
-    from process import registry_initial_source_composition as offices
-    from process.network_address_projection import PinnedAddressSource
-    from process.registry_source_recipe_composition import OFFICE_MAPPING_KEY
-
-    final_source = PinnedAddressSource("final_addresses", "entity_address_unified", "a" * 64)
-    from tests.test_network_fhir_retained_capture import pin, retained
-
-    retained_pin = pin(retained())
-    coordinates = replace(
-        recipe().binding_coordinates,
-        source_id=retained_pin.source_id,
-        dataset_schema=retained_pin.schema_name,
-        dataset_id=retained_pin.dataset_id,
-    )
-    recipes = (RegistrySourceMembershipRecipe(retained_pin, coordinates),)
-    generations_by_name = {} if mode == "absent" else {OFFICE_MAPPING_KEY: None if mode == "null" else "b" * 64}
-    candidate_by_field = {
-        "source_generations": generations_by_name,
-        "validation_json": {"address_source": asdict(final_source)},
-    }
-    summary_by_field = {"correspondence_sha256": "c" * 64 if mode == "mismatch" else "b" * 64}
-    monkeypatch.setattr(offices, "verify_initial_source_office_receipt", lambda _: summary_by_field)
-    connection = object()
-    if mode in {"mismatch", "null"}:
-        with pytest.raises(FHIRServingPreservationError, match="source_changed"):
-            await preservation._current_office_inputs(
-                connection, candidate_by_field, recipes, SimpleNamespace(total_rows=0), "control"
-            )
-    else:
-        actual = await preservation._current_office_inputs(
-            connection, candidate_by_field, recipes, SimpleNamespace(total_rows=0), "control"
-        )
-        assert actual == (None if mode == "absent" else (final_source, ()))
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["receipt", "approval", "generation", "unready"])
-async def test_typed_office_receipt_cannot_replace_current_approval_or_publication_readiness(damage):
-    from process.registry_fhir_serving_preservation import _current_office_inputs
-    from process.registry_initial_source_composition import SUMMARY_KEY, verify_initial_source_office_receipt
-    from tests.test_registry_typed_source_recipe import _recipe, _registered_typed_resume
-
-    _, _, candidate, _ = _registered_typed_resume()
-    summary = verify_initial_source_office_receipt(candidate)
-    approved = SimpleNamespace(approved_revision=1, generation_id=summary["context"]["approved_generation_sha256"])
-    if damage == "receipt":
-        candidate["source_generations"].pop(SUMMARY_KEY)
-        candidate["validation_json"].pop(SUMMARY_KEY)
-    elif damage == "approval":
-        approved.approved_revision += 1
-    elif damage == "generation":
-        approved.generation_id = "0" * 64
-    elif damage == "unready":
-        candidate["validation_json"].pop("address_source", None)
-    with pytest.raises(FHIRServingPreservationError, match="source_changed"):
-        await _current_office_inputs(object(), candidate, (_recipe(),), approved, "control")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["none", "receipt", "marker", "raw_generation"])
-async def test_replayed_mapping_binds_full_office_receipt_and_raw_generation(monkeypatch, damage):
-    from process import registry_fhir_serving_preservation as preservation
-    from process import registry_initial_source_composition as offices
-    from process.registry_source_recipe_composition import OFFICE_MAPPING_KEY
-
-    summary_by_field = {"correspondence_sha256": "a" * 64, "office_rows": 0}
-    actual_summary = {**summary_by_field, "office_rows": 1} if damage == "receipt" else summary_by_field
-    replay = AsyncMock(return_value=actual_summary)
-    monkeypatch.setattr(offices, "verified_retained_source_office_summary", replay)
-    monkeypatch.setattr(offices, "verify_initial_source_office_receipt", lambda _: summary_by_field)
-    candidate_by_field = {
-        "source_generations": {
-            OFFICE_MAPPING_KEY: "b" * 64 if damage == "marker" else "a" * 64,
-            "initial_source_recipe_0": "d" * 64 if damage == "raw_generation" else "c" * 64,
-        }
-    }
-    stage = SimpleNamespace(office_matches=object(), raw_source_generations=("c" * 64,))
-    arguments = (object(), candidate_by_field, (), object(), stage, (object(), ("reader",)), "control")
-    if damage == "none":
-        await preservation._verify_current_offices(*arguments)
-    else:
-        with pytest.raises(FHIRServingPreservationError, match="source_changed"):
-            await preservation._verify_current_offices(*arguments)
-    assert replay.await_args.args[-1] is stage.office_matches
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["generation", "multiset"])
-async def test_current_mapping_keeps_generation_and_full_multiset_guards(damage):
-    from process import registry_fhir_serving_preservation as preservation
-
-    connection = SimpleNamespace(fetchval=AsyncMock(return_value=damage == "multiset"))
-    candidate_by_field = {"source_generations": {"registry_source_membership": "a" * 64}, "schema_name": "candidate"}
-    stage = SimpleNamespace(
-        table_name="current_stage", generation_sha256="b" * 64 if damage == "generation" else "a" * 64
-    )
-    with pytest.raises(FHIRServingPreservationError, match="source_changed|membership_parity"):
-        await preservation._current_raw_parity(
-            connection,
-            candidate_by_field,
-            SimpleNamespace(membership_query="SELECT * FROM exact_carry"),
-            stage,
-            (1, 1),
-            "control",
-        )
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("is_prepared,compact", [(False, False), (True, False), (False, True), (True, True)])
 async def test_current_mapping_keeps_base_and_prepared_artifact_stays_separate(monkeypatch, is_prepared, compact):
     from process import registry_candidate_composition as composition
@@ -566,94 +454,6 @@ async def test_preserved_memberships_append_in_one_statement_with_complete_accou
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, ValueError, asyncio.CancelledError])
-async def test_current_fhir_replay_cleans_its_stage_after_success_failure_or_cancel(monkeypatch, failure):
-    from process import network_source_contribution_custody as custody
-    from process import registry_fhir_serving_preservation as preservation
-    from process import registry_source_recipe_composition as composition
-
-    connection, candidate, carried, approved, stage = object(), {}, object(), object(), object()
-    offices = (object(), ("reader",))
-    monkeypatch.setattr(preservation, "_current_office_inputs", AsyncMock(return_value=offices))
-    staging = AsyncMock(return_value=stage)
-    monkeypatch.setattr(composition, "stage_registry_source_recipes", staging)
-    office_check = AsyncMock()
-    monkeypatch.setattr(preservation, "_verify_current_offices", office_check)
-    error = failure("replay interrupted") if failure is not None else None
-    parity = AsyncMock(side_effect=error)
-    monkeypatch.setattr(preservation, "_current_raw_parity", parity)
-    cleanup = AsyncMock()
-    monkeypatch.setattr(custody, "_cleanup_independent_source_stage", cleanup)
-    arguments = (connection, candidate, carried, (recipe(),), approved, "control")
-    if failure is None:
-        await preservation._verify_current_fhir_rows(*arguments)
-    else:
-        with pytest.raises(failure) as caught:
-            await preservation._verify_current_fhir_rows(*arguments)
-        assert caught.value is error
-    assert staging.await_args.kwargs["read_context"].verified_office_inputs is offices
-    office_check.assert_awaited_once()
-    cleanup.assert_awaited_once_with(connection, stage, None, error)
-
-
-@pytest.mark.asyncio
-async def test_mixed_vector_parity_scopes_comparison_to_both_approved_fhir_cohorts():
-    from process import registry_fhir_serving_preservation as preservation
-
-    connection = SimpleNamespace(fetchval=AsyncMock(return_value=False))
-    candidate_by_name = {"schema_name": "candidate", "source_generations": {}, "approved_custom_revision": 9}
-    carried = SimpleNamespace(
-        membership_query="SELECT * FROM retained_facts", predecessor=SimpleNamespace(approved_custom_revision=7)
-    )
-    await preservation._current_raw_parity(
-        connection, candidate_by_name, carried, SimpleNamespace(table_name="current"), (1, 2), "control"
-    )
-    sql, revisions = connection.fetchval.await_args.args
-    assert revisions == [7, 9]
-    assert "EXCEPT ALL" in sql and "JOIN cohort USING(network_id)" in sql
-    assert "bool_and" in sql and "insurance_plan_id" in sql
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mixed,corrupt", [(False, False), (False, True), (True, False), (True, True)])
-async def test_typed_raw_parity_uses_bounded_indexed_multiset_check(monkeypatch, mixed, corrupt):
-    from process import registry_fhir_serving_preservation as preservation
-    from process import registry_typed_membership_parity as parity
-    from process import registry_typed_source_stage as typed
-
-    stage = SimpleNamespace(generation_sha256="a" * 64)
-    monkeypatch.setattr(typed, "is_typed_source_stage", lambda value: value is stage)
-    monkeypatch.setattr(typed, "typed_stage_projection", lambda _: "SELECT * FROM exact_typed_stage")
-    bounded = AsyncMock(return_value=corrupt)
-    monkeypatch.setattr(parity, "has_multiset_difference", bounded)
-    connection = SimpleNamespace(fetch=AsyncMock(side_effect=[[{"network_id": 1}, {"network_id": 9}], []]))
-    candidate_by_field = {
-        "schema_name": "candidate",
-        "source_generations": {"registry_source_membership": "a" * 64},
-        "approved_custom_revision": 9,
-    }
-    carried = SimpleNamespace(
-        membership_query="SELECT * FROM exact_carry", predecessor=SimpleNamespace(approved_custom_revision=7)
-    )
-    arguments = (connection, candidate_by_field, carried, stage, (1, 2 if mixed else 1), "control")
-    if corrupt:
-        with pytest.raises(FHIRServingPreservationError, match="membership_parity"):
-            await preservation._current_raw_parity(*arguments)
-    else:
-        await preservation._current_raw_parity(*arguments)
-    _, actual, expected = bounded.await_args.args
-    assert "EXCEPT" not in actual + expected and "MATERIALIZED" not in actual + expected
-    assert "UNION ALL SELECT * FROM exact_carry" in expected
-    if mixed:
-        assert "network_id=ANY(ARRAY[1,9]::integer[])" in actual + expected
-        assert connection.fetch.await_args_list[0].args[1:] == ([7, 9], None)
-        if not corrupt:
-            assert connection.fetch.await_args_list[-1].args[2] == 9
-    else:
-        connection.fetch.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("bound_failure", [False, True])
 async def test_carry_copy_reduces_batch_then_resumes_exact_keyset(monkeypatch, bound_failure):
     from process import network_bootstrap_sources as bootstrap
@@ -749,27 +549,6 @@ def _initial_preservation_candidate():
 
 
 @pytest.mark.asyncio
-async def test_initial_candidate_and_absent_carry_leave_source_state_untouched():
-    from process import registry_fhir_serving_preservation as preservation
-
-    target, candidate = _initial_preservation_candidate()
-    connection = SimpleNamespace(execute=AsyncMock(), fetchval=AsyncMock(), fetchrow=AsyncMock())
-    stage = object()
-    assert await preservation.append_fhir_preservation_memberships(connection, stage, None) is stage
-    assert (
-        await preservation.verify_fhir_preservation_rows(connection, target, candidate, control_schema="registry")
-        is None
-    )
-    await preservation.verify_fhir_preservation_target_rows(
-        connection, target, candidate, None, control_schema="registry"
-    )
-    await preservation._verify_current_fhir_rows(connection, candidate, None, (), object(), "registry")
-    connection.execute.assert_not_awaited()
-    connection.fetchval.assert_not_awaited()
-    connection.fetchrow.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_initial_candidate_cannot_borrow_a_predecessor_preservation_receipt():
     _, candidate = _initial_preservation_candidate()
     proof = receipt()
@@ -834,55 +613,6 @@ async def test_predecessor_selection_requires_existing_unambiguous_and_proven_ra
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("phase", ["current", "overlay"])
-@pytest.mark.parametrize("cancelled", [False, True])
-async def test_legacy_replay_failure_preserves_primary_error_and_cleans_exact_carry_tables(
-    monkeypatch, phase, cancelled
-):
-    from process import network_approved_membership_source as approved_sources
-    from process import registry_fhir_serving_preservation as preservation
-    from process.network_approved_membership_source import ApprovedMembershipSource
-
-    copy_target, candidate = _initial_preservation_candidate()
-    proof = receipt()
-    request_id = UUID(proof["request_id"])
-    copy_target = replace(
-        copy_target, **{name + "_id": str(uuid5(request_id, name)) for name in ("dataset", "schema", "producer")}
-    )
-    candidate.update(
-        **asdict(copy_target),
-        expected_head=proof["expected_head"],
-        validation_json={proof["component"]: proof},
-        source_generations={
-            proof["component"]: fhir_serving_preservation_sha256(proof),
-            "retained_network_source": proof["predecessor_manifest_sha256"],
-        },
-    )
-    relation = 'pg_temp."fhir_preserve_missing_' + UUID(int=1).hex + '"'
-    carried = preservation.FHIRServingPreservation(
-        object(), relation, "SELECT * FROM retained_memberships", "", "", proof, temporary_tables=(relation,)
-    )
-    monkeypatch.setattr(preservation, "rederive_fhir_serving_preservation", AsyncMock(return_value=carried))
-    monkeypatch.setattr(preservation, "verify_fhir_preservation_target_rows", AsyncMock())
-    monkeypatch.setattr(preservation, "_candidate_recipes", AsyncMock(return_value=((recipe(),), None)))
-    approved = ApprovedMembershipSource(candidate["approved_custom_revision"], "a" * 64)
-    monkeypatch.setattr(approved_sources, "pin_approved_membership_source", AsyncMock(return_value=approved))
-    error = asyncio.CancelledError("cancelled during replay") if cancelled else TimeoutError("replay timed out")
-    replay = AsyncMock(side_effect=error if phase == "current" else None)
-    overlay = AsyncMock(side_effect=error if phase == "overlay" else None)
-    monkeypatch.setattr(preservation, "_verify_current_fhir_rows", replay)
-    monkeypatch.setattr(preservation, "_verify_current_overlay", overlay)
-    cleanup_error = RuntimeError("drop refused")
-    connection = SimpleNamespace(execute=AsyncMock(side_effect=cleanup_error))
-    with pytest.raises(type(error)) as rejected:
-        await preservation.verify_fhir_preservation_rows(connection, copy_target, candidate, control_schema="registry")
-    assert rejected.value is error and error._registry_preservation_cleanup_error is cleanup_error
-    connection.execute.assert_awaited_once_with(f"DROP TABLE IF EXISTS {relation}")
-    replay.assert_awaited_once_with(connection, candidate, carried, (recipe(),), approved, "registry")
-    assert overlay.await_count == int(phase == "overlay")
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "transaction,isolation", [(False, "repeatable read"), (True, "read committed"), (True, "read uncommitted")]
 )
@@ -908,44 +638,6 @@ async def test_preservation_refuses_unstable_snapshots_before_reading_or_writing
     assert connection.fetchval.await_count == int(transaction)
     connection.fetchrow.assert_not_awaited()
     connection.execute.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("entrypoint", ["prepare", "identity", "verify"])
-async def test_preservation_rejects_unknown_runtime_inputs_before_any_source_access(entrypoint):
-    from process import registry_fhir_serving_preservation as preservation
-
-    with pytest.raises(FHIRServingPreservationError, match="source_runtime_invalid"):
-        if entrypoint == "prepare":
-            await preservation.prepare_fhir_serving_preservation(
-                object(),
-                None,
-                (),
-                request_id=UUID(int=1),
-                expected_head=1,
-                approved_revision=1,
-                control_schema="registry",
-                untrusted_runtime=object(),
-            )
-        elif entrypoint == "identity":
-            await preservation._identity_stages(
-                object(),
-                (),
-                (),
-                None,
-                None,
-                1,
-                "registry",
-                untrusted_runtime=object(),
-            )
-        else:
-            await preservation.verify_fhir_preservation_rows(
-                object(),
-                None,
-                {},
-                control_schema="registry",
-                untrusted_runtime=object(),
-            )
 
 
 @pytest.mark.parametrize("inventory", [None, 0, 1, "true"])

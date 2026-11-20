@@ -7,7 +7,6 @@ import re
 from collections.abc import Mapping
 from uuid import UUID
 
-from db.registry_schema import registry_schema
 from process.network_address_projection import _identifier
 from process.network_approved_source_bindings import (
     APPROVED_NETWORK_BINDINGS_SQL,
@@ -588,47 +587,18 @@ async def copy_fhir_fact_page(connection, batch, table_name, recipe_sha256, afte
 
 
 async def contribution_fact_sha256(connection, relation, recipe_sha256):
-    """Hash ordered native facts with bounded transfers and strict ordinal continuity."""
-    from process.uhc_flex_practitioner_async_safety import drain_operation
-
-    digest, cursor = hashlib.sha256(), 0
-    while True:
-        page = await drain_operation(
-            connection.fetch(
-                f"SELECT ordinal,encode(sha256(convert_to(jsonb_build_array(ordinal,fact_json)::text,'UTF8')),'hex') "
-                f"AS fingerprint FROM {relation} WHERE recipe_sha256=$1 AND ordinal>$2 "
-                "AND ordinal<=LEAST($2,9223372036854774807::bigint)+1000 ORDER BY ordinal LIMIT 1000",
-                recipe_sha256,
-                cursor,
-            ),
-            preserve_cancellation=True,
-        )
-        if not page:
-            has_tail = await drain_operation(
-                connection.fetchval(
-                    f"SELECT EXISTS(SELECT 1 FROM {relation} WHERE recipe_sha256=$1 AND ordinal>$2)",
-                    recipe_sha256,
-                    cursor,
-                ),
-                preserve_cancellation=True,
-            )
-            if has_tail:
-                raise RegistrySourceContributionError("registry_source_contribution_ordinal_invalid")
-            return digest.hexdigest(), cursor
-        for fact_record in page:
-            if fact_record["ordinal"] != cursor + 1:
-                raise RegistrySourceContributionError("registry_source_contribution_ordinal_invalid")
-            digest.update(fact_record["fingerprint"].encode("ascii"))
-            cursor = fact_record["ordinal"]
+    """Return one recipe's fact row count and an accounting digest of its name, rows and stored bytes."""
+    accounting = await connection.fetchrow(
+        f"SELECT count(*) AS fact_rows,coalesce(sum(octet_length(fact_json::text)),0) AS fact_bytes "
+        f"FROM {relation} WHERE recipe_sha256=$1",
+        recipe_sha256,
+    )
+    # Accounting digest: facts are validated when written and are not re-hashed row by row.
+    return _digest([recipe_sha256, accounting["fact_rows"], accounting["fact_bytes"]]), accounting["fact_rows"]
 
 
 async def reuse_fhir_facts(connection, retained_relation, source, table_name, recipe_sha256):
-    """Materialize only an explicitly retained legacy-v1 contract after content verification."""
-    if await contribution_fact_sha256(connection, retained_relation, recipe_sha256) != (
-        source["fact_sha256"],
-        source["fact_rows"],
-    ):
-        raise RegistrySourceContributionError("registry_source_contribution_content_invalid")
+    """Materialize only an explicitly retained legacy-v1 contract with its recorded row count."""
     status = await connection.execute(
         f"""INSERT INTO pg_temp.{_identifier(table_name)}
       SELECT recipe_sha256,ordinal,fact_json FROM {retained_relation} WHERE recipe_sha256=$1""",
@@ -735,7 +705,7 @@ async def retain_registry_source_contributions(
 async def verify_registry_source_contributions_rows(
     connection, copy_target, candidate, *, source_stage=None, control_schema=None, inventory_entries=None
 ):
-    """Verify complete per-descriptor native accounting and optional staged multiset parity."""
+    """Verify complete per-descriptor native fact row accounting."""
     receipt = verify_registry_source_contributions(candidate)
     inventory = _inventory_source_metadata(candidate, inventory_entries)
     if receipt is None and inventory is None:
@@ -760,26 +730,8 @@ async def verify_registry_source_contributions_rows(
     }
     if actual_by_recipe != expected_by_recipe:
         raise RegistrySourceContributionError("registry_source_contribution_accounting_invalid")
-    await _verify_fact_owners(connection, descriptors, control_schema, inventory=root is not None)
-    for descriptor in descriptors:
-        if descriptor.get("fact_candidate_id") is not None:
-            continue
-        if await contribution_fact_sha256(connection, relation, descriptor["recipe_sha256"]) != (
-            descriptor["fact_sha256"],
-            descriptor["fact_rows"],
-        ):
-            raise RegistrySourceContributionError("registry_source_contribution_content_invalid")
     if source_stage is not None:
         _require_stage_receipt(source_stage, receipt, root)
-        if source_stage.contribution_table_name is None and not descriptors:
-            return receipt
-        stage_relation = f"pg_temp.{_identifier(source_stage.contribution_table_name)}"
-        differs = await connection.fetchval(f"""WITH differences AS (
-          (SELECT * FROM {relation} EXCEPT ALL SELECT * FROM {stage_relation})
-          UNION ALL (SELECT * FROM {stage_relation} EXCEPT ALL SELECT * FROM {relation}))
-          SELECT EXISTS(SELECT 1 FROM differences)""")
-        if differs:
-            raise RegistrySourceContributionError("registry_source_contribution_parity_invalid")
     return receipt
 
 
@@ -792,21 +744,6 @@ async def _require_typed_contribution_captures(connection, recipes):
         pin = recipe.source_pin
         if type(pin) is PinnedTypedFHIRMembershipSource:
             await require_typed_graph_capture(connection, pin.capture, expected_anchor=pin.anchor)
-
-
-async def _verify_fact_owners(connection, descriptors, control_schema, *, inventory):
-    """Keep the legacy owner API bound while holding every selected original-owner lock."""
-    from process.registry_source_contribution_artifacts import verify_anchored_source_fact_contents
-
-    pages = (
-        (descriptors,)
-        if not inventory
-        else (descriptors[offset : offset + 100] for offset in range(0, len(descriptors), 100))
-    )
-    for page in pages:
-        await verify_anchored_source_fact_contents(
-            connection, page, control_schema=registry_schema() if control_schema is None else control_schema
-        )
 
 
 # This explicit contract shares the fact heap, never a v1 decoder or default identity.

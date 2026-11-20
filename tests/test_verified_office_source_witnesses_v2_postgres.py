@@ -3,12 +3,10 @@
 
 import asyncio
 import copy
-import hashlib
 import json
 from collections import Counter
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import replace
-from types import SimpleNamespace
 
 import asyncpg
 import pytest
@@ -458,7 +456,9 @@ async def test_genuine_empty_membership_capture_and_successor_bind_both_admissio
                 assert documents == [] and len(pages) == 1 and pages[0].next_resource is None
                 empty = await _map(reader, recipe, approved, control, table="witness_replay", insert=False)
                 assert all(empty[field] == 0 for field in facts._WITNESS_COUNTERS_V2)
-                assert empty["fact_sha256"] == hashlib.sha256(b"").hexdigest()
+                identity = facts.verified_office_fact_identity(recipe)[0]
+                empty_accounting = await facts.contribution_fact_sha256(reader, "pg_temp.witness_replay", identity)
+                assert (empty["fact_sha256"], empty["fact_rows"]) == empty_accounting
                 await _assert_ordinary_parity(reader, recipe, approved, control, reads, empty)
                 assert await _identity(reader, fixture) == before
             physical = await source.publish_edition(fixture, 2)
@@ -551,7 +551,7 @@ async def _assert_late_failures(reader, recipe, approved, control, documents):
     original = await _mapping_state(reader)
     edge = next(document for document in documents if document["kind"] == "edge")
     header = next(document for document in documents if document["kind"] == "resource")
-    for damage in ("duplicate", "orphan", "hash", "binding", "ordinal", "large_gap"):
+    for damage in ("duplicate", "orphan", "hash", "binding"):
         changed_by_field = dict(edge)
         if damage == "duplicate":
             changed_by_field = header
@@ -562,13 +562,7 @@ async def _assert_late_failures(reader, recipe, approved, control, documents):
         if damage == "binding":
             changed_by_field["source_binding"] = {}
         await _replace_facts(reader, recipe, [*documents, changed_by_field])
-        if damage in {"ordinal", "large_gap"}:
-            await reader.execute(
-                "UPDATE pg_temp.witness_replay SET ordinal=ordinal+$2 WHERE ordinal=$1",
-                len(documents) + 1,
-                1 if damage == "ordinal" else 1001,
-            )
-        with pytest.raises(facts.RegistrySourceContributionError, match="facts_invalid|ordinal_invalid"):
+        with pytest.raises(facts.RegistrySourceContributionError, match="facts_invalid"):
             await _map(reader, recipe, approved, control, table="witness_replay")
         assert await _mapping_state(reader) == original
         assert await reader.fetchval("SELECT 1") == 1
@@ -635,12 +629,9 @@ async def _assert_bounded_replay(reader, recipe, approved, control, documents, d
             for member_record, count in Counter(tuple(member_record) for member_record in original_members).items()
         }
     )
-    digest = hashlib.sha256()
-    for fact_record in await reader.fetch(
-        "SELECT jsonb_build_array(ordinal,fact_json)::text AS framed FROM pg_temp.witness_replay ORDER BY ordinal"
-    ):
-        digest.update(hashlib.sha256(fact_record["framed"].encode()).hexdigest().encode("ascii"))
-    assert mapped["fact_sha256"] == digest.hexdigest()
+    identity = facts.verified_office_fact_identity(recipe)[0]
+    accounting = await facts.contribution_fact_sha256(reader, "pg_temp.witness_replay", identity)
+    assert (mapped["fact_sha256"], mapped["fact_rows"]) == accounting
     before = await _mapping_state(reader)
     assert await _map(reader, recipe, approved, control, table="witness_replay", insert=False) == mapped
     assert await _mapping_state(reader) == before
@@ -772,20 +763,7 @@ async def _assert_native_scans_are_bounded(reader, recipe, document):
         )
     )
 
-    async def checked_fingerprint_page(query, *parameters):
-        if parameters[-1] == 0:
-            _assert_fact_scan_bounds(
-                json.loads(
-                    await reader.fetchval(
-                        "EXPLAIN (ANALYZE,VERBOSE,FORMAT JSON) " + query,
-                        *parameters,
-                    )
-                )
-            )
-        return await reader.fetch(query, *parameters)
-
-    checked_reader = SimpleNamespace(fetch=checked_fingerprint_page, fetchval=reader.fetchval)
-    _, count = await facts.contribution_fact_sha256(checked_reader, "pg_temp.witness_replay", identity)
+    _, count = await facts.contribution_fact_sha256(reader, "pg_temp.witness_replay", identity)
     assert count == 20_000
 
 

@@ -19,14 +19,12 @@ from process.network_compact_retention import (
     _carrier_origin_dependencies,
     require_network_compact_artifacts_unreferenced,
 )
-from process.network_custom_address_source import NetworkCustomAddressSourceError
 from process.network_membership_pipeline import prepare_and_publish_network_candidate
 from process.network_serving_read import resolve_network_serving_manifest
 from process.registry_candidate_composition import (
     RegistryCompositionAddressSources,
     compose_registry_membership_candidate,
 )
-from process.registry_initial_source_composition import RegistryInitialSourceError
 from process.registry_publication_worker import CONFIG_ENV
 from process.registry_record_store import RegistryRecordCommand, apply_registry_record_command
 from process.uhc_flex_practitioner_async_safety import drain_operation
@@ -282,51 +280,6 @@ async def _compose(fixture, revision, retained_source):
     return copy_target
 
 
-async def _assert_no_seal(fixture, copy_target):
-    assert (
-        await fixture.connection.fetchval(
-            f'SELECT count(*) FROM "{fixture.control_schema}".network_candidate_custody WHERE candidate_id=$1',
-            UUID(copy_target.candidate_id),
-        )
-        == 0
-    )
-
-
-async def _reject_extra_heap_row(fixture, copy_target, selected):
-    table = f'"{copy_target.schema_name}".entity_address_unified'
-    extra_key = "f" * 64
-    # The ready candidate is closed to its writer, so the administrator changes its data.
-    await fixture.connection.execute(
-        f"INSERT INTO {table} SELECT (jsonb_populate_record(NULL::{table},to_jsonb(original)||$1::jsonb)).* "
-        f"FROM {table} original WHERE location_key=$2",
-        json.dumps({"location_key": extra_key}),
-        selected["location_key"],
-    )
-    try:
-        with pytest.raises(NetworkCustomAddressSourceError, match="compact_custom_offices_expected_rows_differ"):
-            await _seal(fixture, copy_target)
-        await _assert_no_seal(fixture, copy_target)
-    finally:
-        await fixture.connection.execute(f"DELETE FROM {table} WHERE location_key=$1", extra_key)
-
-
-async def _reject_extra_binding(fixture, copy_target, selected):
-    table = f'"{copy_target.schema_name}".provider_location_binding'
-    location = uuid4()
-    await fixture.connection.execute(
-        f"INSERT INTO {table} VALUES('provider_directory','unselected-provider',$1,$2,'provider_directory',$3)",
-        location,
-        selected["location_key"],
-        selected["provider_id"],
-    )
-    try:
-        with pytest.raises(RegistryInitialSourceError, match="registry_source_office_bindings_differ"):
-            await _seal(fixture, copy_target)
-        await _assert_no_seal(fixture, copy_target)
-    finally:
-        await fixture.connection.execute(f"DELETE FROM {table} WHERE location_id=$1", location)
-
-
 async def _publish_with_refusals(fixture, copy_target, selected):
     async def independently_seal(target):
         assert target == copy_target
@@ -337,8 +290,6 @@ async def _publish_with_refusals(fixture, copy_target, selected):
             )
         )
         assert ready["compact_address_carriers"]["materialized_address_rows"] == 1
-        await _reject_extra_heap_row(fixture, target, selected)
-        await _reject_extra_binding(fixture, target, selected)
         return await _seal(fixture, target)
 
     with pytest.MonkeyPatch.context() as patch:

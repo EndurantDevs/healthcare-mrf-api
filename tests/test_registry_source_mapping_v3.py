@@ -411,11 +411,12 @@ def test_old_fact_owner_keeps_mapping_v3_metadata(witness):
     )
     artifact = artifacts.ResolvedSourceFactArtifact(reference, "synthetic_original", original)
     descriptor = _mapping(recipe, witness=witness)
+    descriptor["fact_sha256"] = "e" * 64
     anchored = artifacts.anchored_source_fact_descriptor(descriptor, artifact)
-    assert anchored == {**descriptor, **asdict(reference)}
+    assert anchored == {**descriptor, "fact_sha256": "d" * 64, **asdict(reference)}
     assert artifacts.source_fact_artifact_reference(anchored) == reference
     assert artifacts._validated_descriptor(anchored)["covered_network_ids"] == [7, 11]
-    for field in ("fact_sha256", "fact_rows", "capture_sha256"):
+    for field in ("fact_rows", "capture_sha256"):
         damaged = copy.deepcopy(descriptor)
         damaged[field] = 3 if field == "fact_rows" else "a" * 64
         with pytest.raises(contributions.RegistrySourceContributionError):

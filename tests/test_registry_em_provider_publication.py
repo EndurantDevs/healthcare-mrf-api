@@ -238,13 +238,6 @@ async def test_actual_logical_readiness_precedes_insert_or_retained_replay(monke
 
     monkeypatch.setattr(layouts, "published_network_layout", lambda actual: None)
 
-    async def is_row_filtered(query, *arguments):
-        assert query == publication._ROW_FILTERED_SQL
-        assert arguments == ([candidate["schema_name"]], ["entity_address_unified"])
-        events.append("row_filter")
-        return False
-
-    connection.fetchval.side_effect = is_row_filtered
     search_gate = AsyncMock(side_effect=lambda *args, **kwargs: events.append("search"))
     monkeypatch.setattr(search_indexes, "verify_network_search_indexes", search_gate)
     insert = AsyncMock(side_effect=lambda *args: events.append("publish") or {"replayed": False})
@@ -262,13 +255,11 @@ async def test_actual_logical_readiness_precedes_insert_or_retained_replay(monke
     else:
         publication_by_field = await publication._publish_candidate(connection, copy_target, '"registry"')
         assert publication_by_field["replayed"] is (state == "published")
-        assert events == ["readiness", *(["replay"] if state == "published" else ["row_filter", "search", "publish"])]
+        assert events == ["readiness", *(["replay"] if state == "published" else ["search", "publish"])]
     assert predecessor.await_count == int(not stale and state == "ready")
     if not stale and state == "ready":
         predecessor.assert_awaited_once_with(connection, generation_id=16, control_schema="registry")
-        connection.fetchval.assert_awaited_once()
-    else:
-        connection.fetchval.assert_not_awaited()
+    connection.fetchval.assert_not_awaited()
     connection.execute.assert_not_awaited()
 
 

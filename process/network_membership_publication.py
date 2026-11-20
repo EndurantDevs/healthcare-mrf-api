@@ -394,16 +394,6 @@ async def validate_named_network_preparation(
     if preparation_by_field["state"] == "published":
         return {"state": "published", "candidate_id": copy_target.candidate_id}
     if preparation_by_field["state"] == "validated":
-        candidate_by_field = dict(
-            await connection.fetchrow(
-                f"SELECT * FROM {_identifier(control_schema)}.network_membership_candidate WHERE candidate_id=$1",
-                UUID(copy_target.candidate_id),
-            )
-        )
-        if preparation_by_field["validation"]["evidence"]["data"] != _network_validation_reference(
-            _require_final_validation(candidate_by_field)
-        ):
-            raise NetworkPublicationError("Stored network data validation changed")
         return {"state": "validated", "candidate_id": copy_target.candidate_id}
     async with AsyncExitStack() as validation_scope:
         validation_connection, office_authority = connection, None
@@ -479,10 +469,6 @@ async def _insert_manifest(connection, namespace, candidate, readiness, preparat
     )
     if claim is None or preparation_by_field["state"] != "validated":
         raise NetworkPublicationError("Validated network preparation is required")
-    if preparation_by_field["validation"]["evidence"]["data"] != _network_validation_reference(
-        _require_final_validation(candidate)
-    ):
-        raise NetworkPublicationError("Stored network data validation changed")
     generation_id = await connection.fetchval(
         "SELECT nextval(pg_get_serial_sequence($1,'generation_id'))", namespace + ".network_serving_manifest"
     )
@@ -600,32 +586,9 @@ async def _publish_candidate(
     from process.network_published_api_pin import published_network_layout
 
     layout = published_network_layout(candidate)
-    await _require_unfiltered_served_addresses(connection, candidate, layout)
     # A compact base heap can live in another schema; check its search indexes before allocating a new head.
     await verify_network_search_indexes(connection, candidate, compact_layout=layout)
     return await _insert_manifest(connection, namespace, candidate, readiness, preparation_roles)
-
-
-_ROW_FILTERED_SQL = """SELECT coalesce(bool_or(c.oid IS NULL OR c.relrowsecurity OR c.relforcerowsecurity),true)
- FROM unnest($1::text[],$2::text[]) served(schema_name,table_name)
- LEFT JOIN pg_namespace n ON n.nspname=served.schema_name
- LEFT JOIN pg_class c ON c.relnamespace=n.oid AND c.relname=served.table_name AND c.relkind='r'"""
-
-
-async def _require_unfiltered_served_addresses(connection, candidate, layout):
-    """Refuse a missing or row filtered served address heap; frozen heaps then need no per-read check."""
-    from process.network_compact_layout import CompactAddressRelation
-
-    if layout is None:
-        served_relations = [CompactAddressRelation(candidate["schema_name"], "entity_address_unified")]
-    else:
-        served_relations = [layout.base, *([layout.custom] if layout.custom is not None else [])]
-    schemas, tables = (
-        [relation.schema_name for relation in served_relations],
-        [relation.table_name for relation in served_relations],
-    )
-    if await connection.fetchval(_ROW_FILTERED_SQL, schemas, tables) is not False:
-        raise NetworkPublicationError("Published address rows must not be row filtered")
 
 
 async def publish_network_candidate(

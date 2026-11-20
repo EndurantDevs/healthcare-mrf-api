@@ -333,7 +333,6 @@ async def _copy_composition(connection, copy_target, control_schema, source_stag
             copy_target,
             control_schema=control_schema,
             source_stage=source_stage,
-            command_stage=command_stage,
             **inventory_options,
         )
 
@@ -1268,14 +1267,13 @@ async def _complete_composition(connection, prepared, source_manifest, control_s
 
 async def _complete_closed_composition(connection, prepared, state, control_schema):
     """Verify a newer completed phase without reopening or recopying its candidate."""
-    copy_target, _address, _old_state, source_stage, command_stage, _writer_roles = prepared
+    copy_target, _address, _old_state, source_stage, _command_stage, _writer_roles = prepared
     if state not in {"ready", "published"}:
         await seal_network_candidate(
             connection,
             copy_target,
             control_schema=control_schema,
             source_stage=source_stage,
-            command_stage=command_stage,
         )
 
 

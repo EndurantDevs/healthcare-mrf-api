@@ -365,10 +365,9 @@ async def test_completed_scan_cannot_retain_changed_preparation(monkeypatch, los
         assert "state='ready'" in connection.execute.await_args.args[0]
 
 
-@pytest.mark.parametrize("changed", [False, True])
-async def test_validated_resume_checks_saved_result_without_repeating_data_work(monkeypatch, changed):
+async def test_validated_resume_returns_without_repeating_data_work(monkeypatch):
     proof = completed_validation()
-    stored = proof | ({"complete": False} if changed else {})
+    stored = proof
     store = SimpleNamespace(yield_named_claim=AsyncMock())
     monkeypatch.setattr(
         publication,
@@ -388,20 +387,14 @@ async def test_validated_resume_checks_saved_result_without_repeating_data_work(
     monkeypatch.setattr(validation, "validate_network_candidate_final", scan)
     connection = Connection()
     connection.fetchrow.return_value["validation_json"] = COUNTS | {"final_validation": proof}
-    if changed:
-        with pytest.raises(publication.NetworkPublicationError, match="validation changed"):
-            await publication.validate_named_network_preparation(
-                connection, TARGET, control_schema="registry", roles=ROLES
-            )
-    else:
-        assert (
-            await publication.validate_named_network_preparation(
-                connection,
-                TARGET,
-                control_schema="registry",
-                roles=ROLES,
-            )
-        )["state"] == "validated"
+    assert (
+        await publication.validate_named_network_preparation(
+            connection,
+            TARGET,
+            control_schema="registry",
+            roles=ROLES,
+        )
+    )["state"] == "validated"
     scan.assert_not_awaited()
     connection.execute.assert_not_awaited()
 
