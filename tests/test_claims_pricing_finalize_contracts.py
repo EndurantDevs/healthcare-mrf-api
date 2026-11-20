@@ -149,6 +149,24 @@ def test_finalize_manifest_rejects_empty_and_partial_source_handoffs(
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("total_chunks", 2, "chunk count does not match"),
+        ("sources", [], "requires source descriptors"),
+        ("stage_suffix", "different-stage", "identity does not match"),
+    ],
+)
+def test_finalize_manifest_refuses_corrupt_handoffs(monkeypatch, tmp_path, field, value, message):
+    monkeypatch.setattr(claims_pricing, "DATASETS", (claims_pricing.DatasetConfig("provider", "provider", 1),))
+    _, _, manifest_path = _complete_claims_manifest_paths(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    manifest[field] = value
+
+    with pytest.raises(RuntimeError, match=message):
+        claims_pricing._validate_claims_finalize_manifest(manifest, _finalize_spec())
+
+
 @pytest.mark.asyncio
 async def test_record_finalized_skips_missing_runtime_identity():
     redis = RecordingRedis()
