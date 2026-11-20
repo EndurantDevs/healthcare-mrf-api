@@ -1,6 +1,8 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
 """Route nearby SQL through the all-address projection only when it can answer exactly."""
 
+from dataclasses import replace
+
 import pytest
 
 from api.endpoint import npi
@@ -92,6 +94,22 @@ def test_live_address_reads_are_unchanged_without_a_projection():
     assert "COUNT(DISTINCT (a.npi, a.address_key))" in sql and "JOIN mrf.npi AS d" in sql
     assert "provider_taxonomy.healthcare_provider_taxonomy_code" in sql
     assert "primary_taxonomy_codes" not in sql
+
+
+def test_native_zip_page_keeps_exact_postal_fallback_with_zip_prefilter():
+    address_table = "mrf.entity_address_unified"
+    zip_filter = npi._address_zip5_filter("a", address_table, any_array=True)
+    nearby = replace(_nearby(extra_clause=f"\n          AND {zip_filter}"), search_table_sql=None)
+    prefilter = "AND (cardinality(:zip_codes) <> 1 OR a.zip5 = ANY (:zip_codes) OR a.zip5 IS NULL)"
+
+    page = build_native_nearby_sql(nearby)
+    assert f"AND {zip_filter}" in page
+    assert prefilter in page
+    assert prefilter not in build_native_nearby_count_sql(nearby)
+    assert prefilter not in build_native_nearby_sql(nearby, cursor_clause="\n AND a.cursor_distance_meters > :cursor")
+    scoped = replace(nearby, address_table_sql=f"(SELECT * FROM {address_table} WHERE FALSE)")
+    assert prefilter not in build_native_nearby_sql(scoped)
+    assert prefilter not in build_native_nearby_sql(replace(nearby, extra_clause=""))
 
 
 def test_nearby_query_prefers_the_network_projection(monkeypatch):
