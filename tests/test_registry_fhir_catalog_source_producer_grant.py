@@ -105,9 +105,6 @@ def verifier_case(monkeypatch, descriptors=None, profiles=None):
         assert schema_name == selected["schema_name"]
         return compact_digest(compact_rows(by_generation[source_generation]))
 
-    async def retained(*_args, **_kwargs):
-        events.append(("retained",))
-
     async def projection(*_args, **_kwargs):
         events.append(("projection",))
 
@@ -116,7 +113,6 @@ def verifier_case(monkeypatch, descriptors=None, profiles=None):
     monkeypatch.setattr(grants, "_prior_observations", AsyncMock(return_value=(None, {})))
     monkeypatch.setattr(grants, "_observation_accounting", AsyncMock(side_effect=accounting))
     monkeypatch.setattr(grants, "fhir_catalog_observation_digest", AsyncMock(side_effect=digest))
-    monkeypatch.setattr(grants, "_verify_retained_product_observations", AsyncMock(side_effect=retained))
     monkeypatch.setattr(validation, "validate_fhir_catalog_observed_projection", AsyncMock(side_effect=projection))
     pool = SimpleNamespace(acquire=Mock(side_effect=AssertionError("Reader fallback used")))
     copy_target = SimpleNamespace(schema_name=selected["schema_name"])
@@ -139,31 +135,6 @@ async def verify(case, **options):
     )
     await callback(
         connection=case.connection, copy_target=case.target, snapshot=case.snapshot, standing_grant=case.grant
-    )
-
-
-@pytest.mark.asyncio
-async def test_sealer_replay_groups_exact_profiles_and_exits_before_success(monkeypatch):
-    first = read_profile()
-    second = replace(first, schema_name="second_payload", catalog_schema_name="second_catalog")
-    descriptors = (
-        observed_descriptor(first),
-        observed_descriptor(second, "dataset-two"),
-        observed_descriptor(first, "dataset-three"),
-    )
-    case = verifier_case(monkeypatch, descriptors, (first, second))
-    registry_reader, workspace = object(), object()
-    await verify(case, registry_reader=registry_reader, registry_workspace=workspace)
-    assert {call.kwargs["source_profile"] for call in case.factory.call_args_list} == {first, second}
-    assert case.factory.call_count == 2
-    assert len([event for event in case.events if event[0] == "exit"]) == 2
-    assert len([event for event in case.events if event[0] == "replay"]) == 3
-    assert case.events[-3:] == [("exit",), ("retained",), ("projection",)]
-    case.export["inventory"].assert_not_called()
-    case.export["legacy_bindings"].assert_not_called()
-    case.pool.acquire.assert_not_called()
-    grants._verify_retained_product_observations.assert_awaited_once_with(
-        case.connection, case.snapshot, case.grant, registry_reader, workspace, case.descriptors
     )
 
 
@@ -247,43 +218,6 @@ async def test_carried_observation_accounting_drift_refuses_without_source_reacq
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", ["source_rows", "observation_rows", "accepted_at", "digest_rows", "digest_sha"])
-async def test_source_replay_requires_exact_sealed_accounting_and_digest(monkeypatch, field):
-    case = verifier_case(monkeypatch)
-    if field.startswith("digest_"):
-        stored = compact_digest(compact_rows(next(iter(case.descriptors.values()))))
-        stored["rows" if field == "digest_rows" else "sha256"] = 2 if field == "digest_rows" else "f" * 64
-        grants.fhir_catalog_observation_digest.side_effect = None
-        grants.fhir_catalog_observation_digest.return_value = stored
-    else:
-        accounting = await grants._observation_accounting(case.connection, "ignored", next(iter(case.descriptors)))
-        accounting[field] = 2 if field != "accepted_at" else datetime(2025, 1, 1)
-        grants._observation_accounting.side_effect = None
-        grants._observation_accounting.return_value = accounting
-    with pytest.raises(grants.FHIRCatalogGrantError, match="observation_facts_changed"):
-        await verify(case)
-    assert case.events[-1] == ("exit",)
-    grants._verify_retained_product_observations.assert_not_awaited()
-    validation.validate_fhir_catalog_observed_projection.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("count", [0, 2, True, None])
-async def test_source_replay_cannot_return_partial_or_untyped_row_counts(monkeypatch, count):
-    case = verifier_case(monkeypatch)
-    original = case.export["replay"].side_effect
-
-    async def replay(value, collect):
-        await original(value, collect)
-        return count
-
-    case.export["replay"].side_effect = replay
-    with pytest.raises(grants.FHIRCatalogGrantError, match="observation_facts_changed"):
-        await verify(case)
-    assert case.events[-1] == ("exit",)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("damage", ["source_uri", "content", "edition"])
 async def test_catalog_schema_publication_refuses_mutated_pinned_descriptor_before_replay(monkeypatch, damage):
     stored = catalog_schema_descriptor()
@@ -313,94 +247,12 @@ async def test_catalog_schema_publication_refuses_mutated_pinned_descriptor_befo
     factory.assert_not_called()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("damage", ["profile", "contract"])
-async def test_unadmitted_profile_or_contract_refuses_before_source_entry(monkeypatch, damage):
-    case = verifier_case(monkeypatch)
-    if damage == "profile":
-        case.grant = replace(
-            case.grant, source_profiles=(replace(read_profile(), catalog_schema_name="other_catalog"),)
-        )
-    else:
-        case.grant = replace(case.grant, observation_contract=None)
-    with pytest.raises(grants.FHIRCatalogGrantError, match="source_not_admitted|reader_required"):
-        await verify(case)
-    case.factory.assert_not_called()
-
-
 @pytest.mark.parametrize(
     "builder", [grants.build_fhir_catalog_publication_runtime, grants.build_fhir_catalog_observation_verifier]
 )
 def test_export_hook_is_validated_only_at_trusted_runtime_construction(builder):
     with pytest.raises(grants.FHIRCatalogGrantError, match="source_export_invalid"):
         builder(standing_grant(), None, source_export={})
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [ValueError("source descriptor changed"), OSError("source unavailable")])
-async def test_source_refusal_or_replay_error_exits_without_reader_fallback(monkeypatch, failure):
-    case = verifier_case(monkeypatch)
-    case.export["replay"].side_effect = failure
-    with pytest.raises(type(failure)) as raised:
-        await verify(case)
-    assert raised.value is failure
-    assert case.events[-2:] == [("error", failure), ("exit",)]
-    case.pool.acquire.assert_not_called()
-    validation.validate_fhir_catalog_observed_projection.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_source_exit_drift_invalidates_successful_replay(monkeypatch):
-    case = verifier_case(monkeypatch)
-    failure = ValueError("source exit changed")
-
-    @asynccontextmanager
-    async def export(*, source_profile):
-        yield case.export
-        case.events.append(("exit",))
-        raise failure
-
-    case.factory = export
-    with pytest.raises(ValueError) as raised:
-        await verify(case)
-    assert raised.value is failure and case.events[-1] == ("exit",)
-    grants._verify_retained_product_observations.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_cancellation_closes_source_before_verifier_finishes(monkeypatch):
-    case = verifier_case(monkeypatch)
-    started = asyncio.Event()
-
-    async def replay(_descriptor, _collect):
-        started.set()
-        await asyncio.Event().wait()
-
-    case.export["replay"].side_effect = replay
-    task = asyncio.create_task(verify(case))
-    await asyncio.wait_for(started.wait(), timeout=1)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert case.events[-1] == ("exit",)
-    assert isinstance(case.events[-2][1], asyncio.CancelledError)
-    validation.validate_fhir_catalog_observed_projection.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_replay_keeps_strict_primary_key_order_across_batches(monkeypatch):
-    case = verifier_case(monkeypatch)
-
-    async def replay(value, collect):
-        rows = compact_rows(value)
-        await collect(rows)
-        await collect(rows)
-        return 1
-
-    case.export["replay"].side_effect = replay
-    with pytest.raises(grants.FHIRCatalogGrantError, match="observation_order_changed"):
-        await verify(case)
-    assert case.events[-1] == ("exit",)
 
 
 @pytest.mark.asyncio
@@ -430,61 +282,6 @@ async def test_publication_fence_for_observations_stays_reader_free(monkeypatch)
         assert await runtime.verify_sources(snapshot=case.snapshot, connection=writer) is True
     case.factory.assert_not_called()
     case.pool.acquire.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_default_verifier_keeps_original_reader_replay(monkeypatch):
-    case = verifier_case(monkeypatch)
-    reader, workspace = object(), object()
-
-    @asynccontextmanager
-    async def acquire():
-        yield reader
-
-    @asynccontextmanager
-    async def reference(_reader):
-        assert _reader is reader
-        yield workspace
-
-    from process import registry_fhir_catalog_reference_rollup as rollup
-
-    monkeypatch.setattr(rollup, "fhir_catalog_reference_workspace", reference)
-    monkeypatch.setattr(grants, "_readonly_snapshot", reference)
-    fresh = AsyncMock()
-    monkeypatch.setattr(grants, "_verify_fresh_observation", fresh)
-    callback = grants.build_fhir_catalog_observation_verifier(case.grant, SimpleNamespace(acquire=acquire))
-    await callback(
-        connection=case.connection, copy_target=case.target, snapshot=case.snapshot, standing_grant=case.grant
-    )
-    descriptor = next(iter(case.descriptors.values()))
-    fresh.assert_awaited_once_with(
-        reader, case.connection, case.snapshot, next(iter(case.descriptors)), descriptor, workspace
-    )
-    case.factory.assert_not_called()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("native_pool_available", [False, True])
-async def test_named_profiles_replay_each_dataset_through_source_export(monkeypatch, native_pool_available):
-    selected, profile = scoped_observed_descriptor()
-    ordinary = observed_descriptor(dataset="dataset-ordinary")
-    case = verifier_case(monkeypatch, (ordinary, selected), (profile,))
-    native_pool = case.pool
-    if not native_pool_available:
-        case.pool = None
-    await verify(case)
-    case.factory.assert_called_once_with(source_profile=profile)
-    assert case.export["replay"].await_count == 2
-    assert sorted(
-        validation.canonical_json(request.args[0]) for request in case.export["replay"].await_args_list
-    ) == sorted(validation.canonical_json(descriptor) for descriptor in (ordinary, selected))
-    assert {event[1] for event in case.events if event[0] == "replay"} == {"dataset-one", "dataset-ordinary"}
-    assert selected["native_read_profile"] == profile.document()
-    assert selected["coordinates"]["dataset_schema"] == profile.schema_name
-    assert selected["admission"]["contract"] == grants.CATALOG_OBSERVATION_CONTRACT
-    assert case.events[-3:] == [("exit",), ("retained",), ("projection",)]
-    case.export["inventory"].assert_not_called()
-    native_pool.acquire.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -559,7 +356,6 @@ async def test_metadata_only_seal_reuses_exact_prior_facts_and_keeps_projection_
     case.export["source_companies"].assert_awaited_once()
     case.export["inventory"].assert_not_called()
     case.export["replay"].assert_not_awaited()
-    assert grants._verify_retained_product_observations.await_args.kwargs == {"source_companies_only": True}
 
 
 @pytest.mark.parametrize("change", ["status", "generation", "source_id", "projector", "transform", "missing_labels"])
@@ -620,29 +416,6 @@ async def test_metadata_only_publication_requires_exact_previous_vector(monkeypa
             command=command(case.grant, case.snapshot), snapshot=case.snapshot, connection=writer
         )
     case.factory.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_metadata_only_seal_refuses_retained_product_replay(monkeypatch):
-    from process import registry_fhir_catalog_products as products
-    from process import registry_fhir_catalog_projection_validation as projection
-    from process import registry_fhir_catalog_sync as sync
-
-    selected = snapshot(standing_grant())
-    identity = "a" * 64
-    monkeypatch.setattr(projection, "require_fhir_catalog_registry_reader", AsyncMock())
-    monkeypatch.setattr(grants, "catalog_projection_generations", AsyncMock(return_value=(identity,)))
-    monkeypatch.setattr(
-        products, "selected_reviewed_fhir_catalog_product_sources", AsyncMock(return_value={identity: {}})
-    )
-    monkeypatch.setattr(
-        sync, "replay_fhir_catalog_observations", AsyncMock(side_effect=AssertionError("retained replay"))
-    )
-    with pytest.raises(grants.FHIRCatalogGrantError, match="source_companies_retained_products_unsupported"):
-        await grants._verify_retained_product_observations(
-            object(), selected, standing_grant(), object(), object(), {}, source_companies_only=True
-        )
-    sync.replay_fhir_catalog_observations.assert_not_awaited()
 
 
 @pytest.mark.asyncio

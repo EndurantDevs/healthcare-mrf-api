@@ -90,6 +90,11 @@ def test_legacy_carrier_receipt_projects_names_and_logical_origin_scope():
     assert interpreted.origin_references == _receipt().origin_references
     assert interpreted.source_recipes_sha256 == document["source_recipes_sha256"]
     assert parse_compact_address_carrier_receipt(interpreted.as_dict()) == interpreted
+    from process.network_compact_custom_offices import logical_compact_custom_scope
+
+    current_by_field = {"compact_address_carriers": interpreted.as_dict()}
+    assert logical_compact_custom_scope({"compact_address_carriers": document}) == current_by_field
+    assert logical_compact_custom_scope(current_by_field) == current_by_field
 
 
 @pytest.mark.parametrize("failure", [None, "query", "cancellation"])

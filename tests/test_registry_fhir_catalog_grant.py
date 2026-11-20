@@ -674,7 +674,6 @@ async def test_metadata_only_seal_requires_history_before_source_entry(monkeypat
         await verify(case, source_companies_only=True)
     case.factory.assert_not_called()
     case.export["replay"].assert_not_awaited()
-    grants._verify_retained_product_observations.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -732,7 +731,6 @@ async def test_cached_observation_descriptor_drift_refuses_before_replay_or_proj
     case.factory.assert_not_called()
     case.export["replay"].assert_not_awaited()
     grants._observation_accounting.assert_not_awaited()
-    grants._verify_retained_product_observations.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -754,33 +752,3 @@ async def test_fresh_native_observation_descriptor_drift_refuses_before_fact_rep
         )
     assert observed.collect_fhir_catalog_observation.await_args.kwargs["require_current"] is False
     sync.replay_fhir_catalog_observations.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("missing", ["reader", "workspace"])
-async def test_retained_product_replay_requires_both_pinned_reader_and_workspace(monkeypatch, missing):
-    from process import registry_fhir_catalog_products as products
-    from process import registry_fhir_catalog_projection_validation as validation
-    from tests.test_registry_fhir_catalog_retained import descriptor_fixture
-
-    retained, _, _ = await descriptor_fixture(monkeypatch)
-    generation = grants.fhir_catalog_source_generation(retained.descriptor)
-    selected = snapshot(standing_grant())
-    monkeypatch.setattr(validation, "require_fhir_catalog_registry_reader", AsyncMock())
-    monkeypatch.setattr(grants, "catalog_projection_generations", AsyncMock(return_value=(generation,)))
-    monkeypatch.setattr(
-        products,
-        "selected_reviewed_fhir_catalog_product_sources",
-        AsyncMock(return_value={generation: retained.descriptor}),
-    )
-    monkeypatch.setattr(grants, "require_retained_fhir_catalog_sources", AsyncMock())
-    with pytest.raises(grants.FHIRCatalogGrantError, match="retained_reader_required"):
-        await grants._verify_retained_product_observations(
-            object(),
-            selected,
-            standing_grant(),
-            None if missing == "reader" else object(),
-            None if missing == "workspace" else object(),
-            {generation: retained.descriptor},
-        )
-    grants.require_retained_fhir_catalog_sources.assert_not_awaited()

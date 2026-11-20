@@ -889,7 +889,7 @@ async def test_absent_optional_references_and_empty_projection_do_not_invent_row
     connection.execute.assert_not_awaited()
 
 
-def test_retained_address_metadata_projects_to_named_context():
+def test_retained_address_metadata_keeps_its_published_summary_form():
     recipe = _recipe()
     contribution, derivation = _metadata(recipe)
     legacy_derivation_by_field = {
@@ -906,7 +906,8 @@ def test_retained_address_metadata_projects_to_named_context():
     summary = typed_office_summary(reference.root, [derivation])
     legacy = deepcopy(summary)
     legacy["context"]["address_identity"] = legacy_derivation_by_field["address_identity"]
-    assert validate_typed_summary(legacy, reference.root, offices=True) == summary
+    assert validate_typed_summary(legacy, reference.root, offices=True) == legacy
+    assert "address_identity" not in validate_typed_summary(summary, reference.root, offices=True)["context"]
 
 
 @pytest.mark.asyncio

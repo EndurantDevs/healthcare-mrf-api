@@ -93,7 +93,7 @@ async def _sources(connection, namespace, snapshot, *, source_generations=None):
             break
         for document in documents:
             descriptor = validate_fhir_catalog_source_descriptor(document["descriptor"])
-            generation = fhir_catalog_source_generation(descriptor)
+            generation = fhir_catalog_source_generation(document["descriptor"])
             entry = vector_by_generation.get(generation)
             if (
                 generation != document["generation"]

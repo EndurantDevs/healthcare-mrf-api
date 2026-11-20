@@ -201,7 +201,7 @@ def test_historical_physical_fields_do_not_change_named_layout(published_entry):
 
 
 @pytest.mark.parametrize("compact", [False, True])
-def test_published_read_does_not_replay_new_writer_receipt_validation(published_entry, monkeypatch, compact):
+def test_published_reads_do_not_replay_new_writer_receipt_validation(published_entry, monkeypatch, compact):
     from process import network_membership_publication as publication
 
     candidate = _candidate(published_entry)
@@ -219,8 +219,7 @@ def test_published_read_does_not_replay_new_writer_receipt_validation(published_
     assert manifest.generation_id == 7
     assert manifest.manifest_sha256 == json.loads(before_by_field["manifest_json"])["manifest_sha256"]
     assert published_entry == before_by_field
-    with pytest.raises(published.NetworkServingReadUnavailable, match="digest differs"):
-        published._pinned_manifest(published_entry)
+    assert published._pinned_manifest(published_entry).manifest_sha256 == manifest.manifest_sha256
 
 
 @pytest.mark.parametrize("compact", [False, True])

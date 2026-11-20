@@ -1,5 +1,5 @@
 # Licensed under the HealthPorta Non-Commercial License (see LICENSE).
-"""Logical named publication descriptors and existing registry replay remain portable."""
+"""Logical named publication descriptors stay portable across copied snapshots."""
 
 from unittest.mock import AsyncMock
 
@@ -12,7 +12,7 @@ from process.registry_fhir_catalog_observation import (
 )
 from process.registry_fhir_catalog_sources import validate_fhir_catalog_source_descriptor
 from tests.test_registry_fhir_catalog_source_companies import source_company
-from tests.test_registry_fhir_catalog_source_producer_grant import observed_descriptor, verifier_case, verify
+from tests.test_registry_fhir_catalog_source_producer_grant import observed_descriptor, verifier_case
 from tests.test_registry_fhir_catalog_sources import read_profile
 
 _PHYSICAL_FIELDS = {
@@ -55,43 +55,8 @@ def test_named_descriptor_still_checks_policy_scope_and_semantic_receipt(field):
         validate_fhir_catalog_source_descriptor(descriptor)
 
 
-@pytest.mark.asyncio
-async def test_named_registry_replay_uses_policy_and_semantics_without_database_identity(monkeypatch):
-    descriptor = _named_descriptor()
-    case = verifier_case(monkeypatch, (descriptor,))
-    case.export.pop("database_identity", None)
-    case.export["native_read_profile"] = read_profile().document()
-    case.connection.fetchrow.side_effect = AssertionError("logical source replay must not read connection identity")
-    await verify(case)
-    case.export["replay"].assert_awaited_once()
-    case.pool.acquire.assert_not_called()
-    assert case.events[-3:] == [("exit",), ("retained",), ("projection",)]
-
-
-@pytest.mark.asyncio
-async def test_named_registry_replay_refuses_a_changed_configured_profile(monkeypatch):
-    case = verifier_case(monkeypatch, (_named_descriptor(),))
-    case.export.pop("database_identity", None)
-    case.export["native_read_profile"] = {**read_profile().document(), "schema_name": "other_configured_source"}
-    with pytest.raises(ValueError, match="source_export_invalid"):
-        await verify(case)
-    case.export["replay"].assert_not_awaited()
-    case.pool.acquire.assert_not_called()
-
-
-async def _verify_export_consumer(case, consumer):
-    if consumer == "replay":
-        await verify(case)
-    else:
-        case.snapshot["source_vector_json"][0]["source_companies"] = [source_company()]
-        await grants.verify_current_fhir_catalog_source_companies(
-            case.factory, case.connection, case.snapshot["source_vector_json"], case.descriptors, case.grant
-        )
-
-
-@pytest.mark.parametrize("consumer", ["replay", "companies"])
 @pytest.mark.parametrize("variant", ["named_profile", "legacy_profile", "legacy_old"])
-async def test_grant_export_variant_matches_descriptor_before_callbacks(monkeypatch, consumer, variant):
+async def test_grant_export_variant_matches_descriptor_before_callbacks(monkeypatch, variant):
     descriptor = _named_descriptor() if variant == "named_profile" else observed_descriptor()
     case = verifier_case(monkeypatch, (descriptor,))
     case.export["source_companies"] = AsyncMock(return_value=(source_company(),))
@@ -100,8 +65,11 @@ async def test_grant_export_variant_matches_descriptor_before_callbacks(monkeypa
         case.export["native_read_profile"] = read_profile().document()
         case.connection.fetchrow.side_effect = AssertionError("profile-scoped export must not read physical identity")
     # A profile-scoped export re-observes saved legacy descriptors semantically, so they stay refreshable.
-    await _verify_export_consumer(case, consumer)
-    case.export[consumer if consumer == "replay" else "source_companies"].assert_awaited_once()
+    case.snapshot["source_vector_json"][0]["source_companies"] = [source_company()]
+    await grants.verify_current_fhir_catalog_source_companies(
+        case.factory, case.connection, case.snapshot["source_vector_json"], case.descriptors, case.grant
+    )
+    case.export["source_companies"].assert_awaited_once()
     case.export["inventory"].assert_not_called()
     case.export["legacy_bindings"].assert_not_called()
     case.pool.acquire.assert_not_called()

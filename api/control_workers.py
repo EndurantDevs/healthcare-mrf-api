@@ -21,6 +21,7 @@ from typing import Any
 
 from api import (
     cigna_collection_worker,
+    network_import_worker_image,
     npi_source_worker,
     plan_pricing_worker_policy,
     provider_directory_cms_registry_stop,
@@ -1342,6 +1343,7 @@ def _worker_job_environment(
             env_list.append({"name": policy_setting, "value": policy_path})
     if _is_code_calibration_job(spec, launch_request):
         env_list.append({"name": "HLTHPRT_PTG_CANDIDATE_AUDIT_JOB_TIMEOUT", "value": "385"})
+    env_list.extend(network_import_worker_image.network_import_job_environment(spec, launch_request))
     target_job_id = _single_job_worker_target(spec, launch_request)
     if target_job_id:
         env_list.append({"name": "HLTHPRT_WORKER_ONCE_TARGET_JOB_ID", "value": target_job_id})

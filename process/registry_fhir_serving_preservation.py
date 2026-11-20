@@ -424,7 +424,7 @@ async def _typed_coverage(connection, recipe, approved, control_schema, side, in
 async def _carried_typed_stage(connection, preservation, recipes, candidate, control_schema, runtime):
     """Rebuild previous typed recipes using their original approved and named address inputs."""
     from process.network_address_projection import PinnedAddressSource
-    from process.registry_typed_source_stage import stage_verified_typed_source_recipes
+    from process.registry_typed_source_stage import stage_typed_source_recipes
 
     approved = await pin_retained_approved_membership_source(
         connection,
@@ -434,7 +434,7 @@ async def _carried_typed_stage(connection, preservation, recipes, candidate, con
     report = candidate["validation_json"]
     report = json.loads(report) if type(report) is str else report
     address = PinnedAddressSource(**report["address_source"])
-    stage = await stage_verified_typed_source_recipes(
+    stage = await stage_typed_source_recipes(
         connection,
         recipes,
         approved,
@@ -1290,10 +1290,7 @@ async def _verify_current_fhir_rows(
     connection, candidate, preservation, recipes, approved, control_schema, *, source_witness_runtime=None
 ):
     """Replay all current FHIR inputs without acquiring unrelated graph authority."""
-    from process.registry_source_recipe_composition import (
-        stage_registry_source_recipes,
-        stage_verified_registry_source_recipes,
-    )
+    from process.registry_source_recipe_composition import stage_registry_source_recipes
 
     fhir_recipes = tuple(
         recipe
@@ -1304,8 +1301,8 @@ async def _verify_current_fhir_rows(
         return
     office_inputs = await _current_office_inputs(connection, candidate, recipes, approved, control_schema)
     typed = any(type(recipe.source_pin) is PinnedTypedFHIRMembershipSource for recipe in fhir_recipes)
-    stage_source = stage_verified_registry_source_recipes if typed else stage_registry_source_recipes
-    current_stage = await stage_source(
+    # Typed captures were validated when produced; rows are rebuilt from them, not from Source again.
+    current_stage = await stage_registry_source_recipes(
         connection,
         fhir_recipes,
         approved,

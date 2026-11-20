@@ -340,4 +340,8 @@ def validate_typed_summary(document, root, *, offices=False):
             _counter(counter_value)
     else:
         _counts(document_by_field["counters"])
-    return _defensive(document_by_field)
+    validated = _defensive(document_by_field)
+    if offices and "address_identity" in document["context"]:
+        # Generations published before the address identity left this context hash their stored form.
+        validated["context"]["address_identity"] = _defensive(document["context"]["address_identity"])
+    return validated

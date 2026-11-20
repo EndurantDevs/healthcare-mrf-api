@@ -106,6 +106,7 @@ class ImportedSourceInventoryRuntime:
     catalog_export: object
     effective_date: str = field(default_factory=lambda: datetime.now(timezone.utc).date().isoformat())
     control_schema: str | None = None
+    observed: list = field(default_factory=list, compare=False, repr=False)
 
     def __post_init__(self):
         if type(self.config) is not ImportedSourceInventoryConfig or not all(
@@ -143,10 +144,17 @@ def imported_source_inventory_runtime(runtime):
 
 
 async def current_imported_source_inventory():
-    """Reobserve heads in a fresh native read snapshot, independently of the execution session."""
+    """Observe heads once per run in a native read snapshot; later imports join the next run."""
     runtime = _RUNTIME.get()
     if runtime is None:
         raise ValueError("registry_imported_native_inventory_required")
+    if not runtime.observed:
+        # Each observation reads every row of every current FHIR dataset; a run keeps its first one.
+        runtime.observed.append(await _observe_current_inventory(runtime))
+    return runtime.observed[0]
+
+
+async def _observe_current_inventory(runtime):
     async with native_imported_source_reader() as connection:
         observed = await observe_imported_source_inventory(
             connection,

@@ -227,6 +227,15 @@ def test_catalog_schema_descriptor_projects_fixed_model_names_and_portable_conte
     assert sources.validate_fhir_catalog_source_descriptor(selected) == projected
 
 
+def test_stored_legacy_row_keeps_the_generation_of_its_stored_form():
+    stored_by_field = {**catalog_schema_descriptor(), "database_oid": 7}
+    projected = sources.validate_fhir_catalog_source_descriptor(stored_by_field)
+    stored_generation = sources.fhir_catalog_source_generation(stored_by_field)
+    assert stored_generation == sources.fhir_catalog_source_digest(stored_by_field)
+    assert sources.fhir_catalog_source_generation(projected) == sources.fhir_catalog_source_digest(projected)
+    assert stored_generation != sources.fhir_catalog_source_generation(projected)
+
+
 def test_catalog_schema_projection_keeps_changed_content_in_the_logical_generation():
     selected = catalog_schema_descriptor()
     original = sources.fhir_catalog_source_generation(selected)

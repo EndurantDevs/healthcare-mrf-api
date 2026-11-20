@@ -123,19 +123,15 @@ async def _read_manifest(connection, namespace, generation_id, *, include_inelig
     )
 
 
-def _manifest_readiness(candidate, manifest, *, api_read):
+def _manifest_readiness(candidate, manifest):
+    """A published generation keeps its original receipt format; today's writer rules never re-derive it."""
+    from process.network_compact_readiness import compact_readiness, is_compact_candidate
+    from process.network_membership_candidate_indexes import _ready_replay
     from process.network_membership_publication import (
         _complete_accounting,
-        _publication_readiness,
         _publication_snapshot_tables,
         _retained_manifest,
     )
-
-    if not api_read:
-        return _retained_manifest(manifest, _publication_readiness(candidate), replayed=True)
-    # Published receipts retain their original format; only writers revalidate them for publication.
-    from process.network_compact_readiness import compact_readiness, is_compact_candidate
-    from process.network_membership_candidate_indexes import _ready_replay
     from process.network_membership_validation import _candidate_identity_scope, _validated_replay
 
     report = _object(candidate["validation_json"])
@@ -171,7 +167,7 @@ def _manifest_readiness(candidate, manifest, *, api_read):
     )
 
 
-def _pinned_manifest(entry, *, layout=None, api_read=False):
+def _pinned_manifest(entry, *, layout=None):
     """Keep the selected logical generation and its immutable routing names."""
     if entry is None:
         raise NetworkServingReadUnavailable("Published network generation is unavailable")
@@ -191,7 +187,7 @@ def _pinned_manifest(entry, *, layout=None, api_read=False):
     ):
         raise NetworkServingReadUnavailable("Published network generation metadata differs")
     try:
-        _manifest_readiness(candidate, manifest, api_read=api_read)
+        _manifest_readiness(candidate, manifest)
     except (KeyError, TypeError, ValueError) as error:
         raise NetworkServingReadUnavailable("Published network manifest digest differs") from error
     if layout is not None and type(layout) is not CompactNetworkLayout:

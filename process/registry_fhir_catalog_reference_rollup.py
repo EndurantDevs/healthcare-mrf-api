@@ -25,10 +25,11 @@ RESOURCE_TYPES = ("OrganizationAffiliation", "PractitionerRole")
 MAX_SOURCE_ROWS = 5000
 MAX_PAGE_REFERENCES = 100_000
 MAX_OUTPUT_ROWS = 1000
-_STAGE_COLUMNS = """resource_type varchar(64) COLLATE "C" NOT NULL,
+_COLUMNS = """resource_type varchar(64) COLLATE "C" NOT NULL,
 reference_key text COLLATE "C" NOT NULL,network_ref text,
 resource_id varchar(64) COLLATE "C" NOT NULL,payload_hash varchar(64) NOT NULL,reference_ordinal integer NOT NULL,
- reference_rows bigint NOT NULL,PRIMARY KEY(resource_type,reference_key),
+ reference_rows bigint NOT NULL"""
+_STAGE_COLUMNS = f"""{_COLUMNS},PRIMARY KEY(resource_type,reference_key),
 UNIQUE(resource_type,resource_id,reference_ordinal)"""
 
 
@@ -68,7 +69,7 @@ async def fhir_catalog_reference_workspace(connection):
     name = "fhir_catalog_refs_" + uuid4().hex
     workspace = None
     try:
-        await connection.execute(f"CREATE TEMP TABLE {_identifier(name)} ({_STAGE_COLUMNS}) ON COMMIT PRESERVE ROWS")
+        await connection.execute(_create_stage(name, "PRESERVE ROWS"))
         workspace = FHIRCatalogReferenceWorkspace(connection, name)
         yield workspace
     finally:
@@ -85,6 +86,19 @@ def _identifier(value):
     if type(value) is not str or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", value) is None:
         _fail()
     return '"' + value + '"'
+
+
+def _pages_table(table_name):
+    # Pages append partial counts and fold once per dataset: upserting hot keys page by page inside one
+    # snapshot transaction leaves a row version per page that every later page walks again.
+    return table_name + "_pages"
+
+
+def _create_stage(table_name, on_commit):
+    return ";".join(
+        f"CREATE TEMP TABLE {_identifier(name)} ({columns}) ON COMMIT {on_commit}"
+        for name, columns in ((table_name, _STAGE_COLUMNS), (_pages_table(table_name), _COLUMNS))
+    )
 
 
 _PAGE_SQL = """WITH page AS (
@@ -142,17 +156,9 @@ _PAGE_SQL = """WITH page AS (
  resource_id,payload_hash,reference_ordinal
  FROM expanded ORDER BY resource_type COLLATE "C",reference_json::text COLLATE "C",resource_id COLLATE "C",reference_ordinal
 ), staged AS (
- INSERT INTO {staging} AS previous(resource_type,reference_key,network_ref,resource_id,payload_hash,reference_ordinal,reference_rows)
+ INSERT INTO {pages}(resource_type,reference_key,network_ref,resource_id,payload_hash,reference_ordinal,reference_rows)
  SELECT r.resource_type,r.reference_key,r.network_ref,r.resource_id,r.payload_hash,r.reference_ordinal,c.reference_rows
  FROM representatives r JOIN counts c USING(resource_type,reference_key),invalid_references invalid WHERE invalid.invalid=0
- ON CONFLICT(resource_type,reference_key) DO UPDATE SET
- reference_rows=previous.reference_rows+excluded.reference_rows,
- resource_id=CASE WHEN (excluded.resource_id COLLATE "C",excluded.reference_ordinal)<
-   (previous.resource_id COLLATE "C",previous.reference_ordinal) THEN excluded.resource_id ELSE previous.resource_id END,
- payload_hash=CASE WHEN (excluded.resource_id COLLATE "C",excluded.reference_ordinal)<
-   (previous.resource_id COLLATE "C",previous.reference_ordinal) THEN excluded.payload_hash ELSE previous.payload_hash END,
- reference_ordinal=CASE WHEN (excluded.resource_id COLLATE "C",excluded.reference_ordinal)<
-   (previous.resource_id COLLATE "C",previous.reference_ordinal) THEN excluded.reference_ordinal ELSE previous.reference_ordinal END
  RETURNING 1
 )
 SELECT accounting.*,invalid_references.invalid AS invalid_references,(SELECT count(*) FROM staged) AS staged_rows,
@@ -161,6 +167,16 @@ SELECT accounting.*,invalid_references.invalid AS invalid_references,(SELECT cou
  (SELECT coalesce(jsonb_object_agg(resource_type,source_rows),'{{}}'::jsonb)::text FROM
    (SELECT resource_type,count(*)::bigint AS source_rows FROM selected GROUP BY resource_type) groups) AS resource_counts
 FROM accounting,invalid_references"""
+
+# One representative per reference: the smallest owner id and ordinal, with counts summed over every page.
+_FOLD_SQL = """WITH folded AS (
+ INSERT INTO {staging}
+ (resource_type,reference_key,network_ref,resource_id,payload_hash,reference_ordinal,reference_rows)
+ SELECT DISTINCT ON(resource_type,reference_key) resource_type,reference_key,network_ref,resource_id,payload_hash,
+ reference_ordinal,(sum(reference_rows) OVER(PARTITION BY resource_type,reference_key))::bigint
+ FROM {pages} ORDER BY resource_type,reference_key,resource_id,reference_ordinal
+ RETURNING 1
+) SELECT count(*)::bigint FROM folded"""
 
 
 def _plan_tier_edge(record, source_uri):
@@ -247,7 +263,9 @@ class FHIRCatalogReferenceStage:
 
 
 async def _fill_stage(connection, resources, table_name, dataset_id, page_rows, page_bytes, *, plan_tiers=False):
-    query = _PAGE_SQL.format(resources=resources, staging="pg_temp." + _identifier(table_name))
+    stage = "pg_temp." + _identifier(table_name)
+    pages = "pg_temp." + _identifier(_pages_table(table_name))
+    query = _PAGE_SQL.format(resources=resources, pages=pages)
     totals_by_kind = {"source_rows": 0, "reference_rows": 0, "without_refs": 0, "source_bytes": 0}
     counts_by_type, cursor = {kind: 0 for kind in RESOURCE_TYPES}, ("", "")
     while True:
@@ -273,7 +291,9 @@ async def _fill_stage(connection, resources, table_name, dataset_id, page_rows, 
         for kind, count in json.loads(report["resource_counts"]).items():
             counts_by_type[kind] += count
         cursor = (report["last_type"], report["last_id"])
-    distinct = await connection.fetchval(f"SELECT count(*)::bigint FROM pg_temp.{_identifier(table_name)}")
+    distinct = await drain_operation(
+        connection.fetchval(_FOLD_SQL.format(staging=stage, pages=pages)), preserve_cancellation=True
+    )
     return FHIRCatalogReferenceAccounting(
         totals_by_kind["source_rows"],
         totals_by_kind["reference_rows"],
@@ -288,7 +308,9 @@ async def _drop_stage(connection, table_name):
     if connection.is_closed():
         return
     try:
-        await connection.execute("DROP TABLE IF EXISTS pg_temp." + _identifier(table_name))
+        await connection.execute(
+            f"DROP TABLE IF EXISTS pg_temp.{_identifier(table_name)},pg_temp.{_identifier(_pages_table(table_name))}"
+        )
     except asyncpg.InFailedSQLTransactionError:
         # Creation belongs to the caller's failed transaction; its rollback removes the temp table.
         return
@@ -369,9 +391,9 @@ async def _staged_references(connection, schema_name, dataset_id, bounds, reader
     stage = None
     try:
         statement = (
-            "DELETE FROM pg_temp." + _identifier(table_name)
+            f"DELETE FROM pg_temp.{_identifier(table_name)};DELETE FROM pg_temp.{_identifier(_pages_table(table_name))}"
             if workspace is not None
-            else f"CREATE TEMP TABLE {_identifier(table_name)} ({_STAGE_COLUMNS}) ON COMMIT DROP"
+            else _create_stage(table_name, "DROP")
         )
         await drain_operation(connection.execute(statement), preserve_cancellation=True)
         accounting = await _fill_stage(
