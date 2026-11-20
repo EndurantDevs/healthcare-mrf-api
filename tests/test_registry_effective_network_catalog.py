@@ -69,7 +69,7 @@ def test_retained_validation_changes_only_native_membership_association(is_nativ
             }
         }
     snapshot_by_field["metadata_generation"] = validation.metadata_generation(snapshot_by_field)
-    tables_by_name = {table: {"rows": 0, "sha256": "a" * 64, "batches": 0, "bytes": 0} for table in validation._KEYS}
+    tables_by_name = {table: {"rows": 0, "sha256": "a" * 64, "batches": 0, "bytes": 0} for table in validation._TABLES}
     snapshot_by_field["accounting_json"] = {**snapshot_by_field.get("accounting_json", {}), **tables_by_name}
     validation_by_field = {
         "metadata_generation": snapshot_by_field["metadata_generation"],

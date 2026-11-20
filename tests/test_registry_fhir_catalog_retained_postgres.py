@@ -5,7 +5,6 @@ import json
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 from uuid import UUID, uuid4, uuid5
 
 import pytest
@@ -520,7 +519,7 @@ async def test_reviewed_retained_products_publish_through_native_sealer(
         await _product_sealer_read_access(case, metadata_custody)
         products = await _approve_catalog_products(case)
         snapshot = await _publish_reviewed_products(case, products)
-        assert case.sealer_pool.get_size() == case.sealer_pool.get_max_size() == 2
+        assert case.sealer_pool.get_size() == 1  # sealing validates on a single sealer connection
         replay, previous, _ = await _prepare_catalog_snapshot(
             case.config, case.connection, case.source_pool, case.sealer_pool
         )
@@ -535,18 +534,16 @@ async def _damage_product_candidate(case, target, damage, products):
             f"DELETE FROM {namespace}.registry_fhir_catalog_relationship WHERE binding_id=ANY($1::uuid[])",
             [UUID(product["binding_id"]) for product in products],
         )
-        await case.connection.execute(
+        removed = await case.connection.execute(
             f"DELETE FROM {namespace}.registry_fhir_catalog_binding WHERE document_json->'source_scope' ? 'insurance_plan_id'"
         )
+        assert removed != "DELETE 0"
         return
-    assert (
-        await case.connection.execute(
-            f"UPDATE {namespace}.registry_fhir_catalog_observation SET document_json="
-            "jsonb_set(document_json,'{plan_name}','\"Changed retained plan\"'::jsonb) "
-            "WHERE resource_type='InsurancePlan' AND resource_id='plan-one' AND observation_kind='edge'"
-        )
-        == "UPDATE 2"
+    removed = await case.connection.execute(
+        f"DELETE FROM {namespace}.registry_fhir_catalog_network WHERE network_id IN "
+        f"(SELECT network_id FROM {namespace}.registry_fhir_catalog_relationship)"
     )
+    assert removed != "DELETE 0"
 
 
 async def _assert_refused_candidate_abandoned(case, target):
@@ -595,111 +592,38 @@ async def _retire_abandoned_catalog_candidates(case, *targets):
         )
 
 
-@pytest.mark.parametrize("damage", ["omitted_products", "fresh_observation", "carried_observation"])
+@pytest.mark.parametrize("damage", ["missing_networks", "omitted_products"])
 async def test_reviewed_retained_product_seal_rejects_untrusted_candidate(
     reviewed_product_capture, serving_schema, metadata_custody, monkeypatch, damage
 ):
-    """Seal-time content validation refuses omitted reviewed products and changed observations."""
+    """Seal-time set validation refuses lost relationship networks and omitted approved products."""
     async with _retained_roundtrip_case(
         reviewed_product_capture, serving_schema, metadata_custody, attach_directory=False
     ) as case:
         await _product_sealer_read_access(case, metadata_custody)
         products = await _approve_catalog_products(case)
-        previous = None
-        if damage == "carried_observation":
-            previous = await _publish_reviewed_products(case, products)
-            actor = _actor()
-            group = await _draft(case.serving[2], case.control, _create("group"), actor)
-            await _approve(case.connection, case.control, await _command(case.connection, case.control, group), actor)
         real_seal = catalog_sync._seal_catalog_snapshot
         changed_candidates = []
 
-        async def corrupt_then_seal(config, target, snapshot, pool, *, source_pool=None):
+        async def corrupt_then_seal(config, target, snapshot, pool):
             # Damage only the first candidate, once, before its freeze; the rerun's new candidate stays intact.
             if not changed_candidates:
                 changed_candidates.append(target)
-                if previous:
-                    assert snapshot["source_vector_json"] == previous["source_vector_json"]
                 await _damage_product_candidate(case, target, damage, products)
-            return await real_seal(config, target, snapshot, pool, source_pool=source_pool)
+            return await real_seal(config, target, snapshot, pool)
 
         monkeypatch.setattr(catalog_sync, "_seal_catalog_snapshot", corrupt_then_seal)
-        with pytest.raises(ValueError, match="observed_projection_changed"):
+        with pytest.raises(ValueError, match="set_validation_failed"):
             await _prepare_catalog_snapshot(case.config, case.connection, case.source_pool, case.sealer_pool)
         assert len(changed_candidates) == 1
         await _assert_refused_candidate_abandoned(case, changed_candidates[0])
         await _rerun_builds_new_candidate(case, changed_candidates[0])
         await _retire_abandoned_catalog_candidates(case, changed_candidates[0])
-        assert await case.connection.fetchval(
-            f'SELECT metadata_generation FROM "{case.control}".network_serving_control WHERE id=1'
-        ) == (previous["metadata_generation"] if previous else None)
-
-
-async def _approve_legacy_product_scope(case):
-    """Keep the binding's old organization scope distinct from its typed plan key."""
-    actor = _actor()
-    network = await _draft(case.serving[2], case.control, _create("network"), actor)
-    binding_input_by_key = {
-        "binding_id": str(uuid4()),
-        **asdict(case.recipe.binding_coordinates),
-        "source_key": "InsurancePlan/plan-one",
-        "source_scope_json": {"organization_id": "network-two", "capture_sha256": case.capture.capture_sha256},
-        "network_id": network["record_id"],
-        "evidence_id": "reviewed-legacy-scope",
-        "evidence_sha256": "e" * 64,
-        "operation": "bind",
-        "expected_revision": 0,
-        "expected_network_id": None,
-    }
-    async with case.connection.transaction():
-        binding = (
-            await apply_network_source_binding_batch(
-                case.connection,
-                NetworkSourceBindingBatchCommand(
-                    json.dumps([binding_input_by_key]).encode(), "Retain exact legacy scope", uuid4().hex
-                ),
-                actor,
-                control_schema=case.control,
-            )
-        )["records"][0]
-    await _approve(
-        case.connection, case.control, await _command(case.connection, case.control, network, binding), actor
-    )
-
-
-async def test_typed_plan_key_without_product_scope_cannot_bypass_sealing(
-    reviewed_product_capture, serving_schema, metadata_custody, monkeypatch
-):
-    """Reject a typed key whose retained scope omits the reviewed product on both attempts."""
-    async with _retained_roundtrip_case(
-        reviewed_product_capture, serving_schema, metadata_custody, attach_directory=False
-    ) as case:
-        await _product_sealer_read_access(case, metadata_custody)
-        await _approve_legacy_product_scope(case)
-        omitted_projection = AsyncMock(return_value={"binding": 0, "relationship": 0})
-        monkeypatch.setattr(catalog_sync, "project_reviewed_fhir_catalog_products", omitted_projection)
-        with pytest.raises(ValueError) as refused:
-            await _prepare_catalog_snapshot(case.config, case.connection, case.source_pool, case.sealer_pool)
-        assert refused.value.args == ("registry_fhir_catalog_product_unavailable",)
-        omitted_projection.assert_awaited_once()
-        candidate = omitted_projection.await_args.args[1]
-        await _assert_refused_candidate_abandoned(case, candidate)
-        # The rerun builds a new candidate instead of resuming the abandoned one, and sealing refuses it too.
-        with pytest.raises(ValueError) as rerun_refused:
-            await _prepare_catalog_snapshot(case.config, case.connection, case.source_pool, case.sealer_pool)
-        assert rerun_refused.value.args == refused.value.args
-        rerun = omitted_projection.await_args.args[1]
-        assert omitted_projection.await_count == 2 and rerun.schema_name != candidate.schema_name
-        await _assert_refused_candidate_abandoned(case, rerun)
-        await _retire_abandoned_catalog_candidates(case, candidate, rerun)
         assert (
             await case.connection.fetchval(
                 f'SELECT metadata_generation FROM "{case.control}".network_serving_control WHERE id=1'
             )
             is None
-        )
-        assert (
-            await case.connection.fetchval(f'SELECT count(*) FROM "{case.control}".registry_fhir_catalog_snapshot') == 0
         )
 
 

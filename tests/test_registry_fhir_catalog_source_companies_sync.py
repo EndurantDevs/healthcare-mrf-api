@@ -270,7 +270,7 @@ async def test_metadata_only_preparation_forbids_discovery_and_forwards_mode_thr
         "source_companies_only": True,
     }
     assert sync._build_source_catalog_candidate.await_args.kwargs == {"source_companies_only": True}
-    assert sync._seal_catalog_snapshot.await_args.kwargs["source_companies_only"] is True
+    assert sync._seal_catalog_snapshot.await_args.kwargs == {}
     source_case.export["inventory"].assert_not_called()
     source_case.export["replay"].assert_not_awaited()
     sync._retained_catalog_sources.assert_not_awaited()

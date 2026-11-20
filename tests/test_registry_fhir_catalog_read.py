@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 from process import registry_fhir_catalog_read as catalog
-from process import registry_fhir_catalog_validation as validation
 from process.registry_catalog_policy import RegistryOrganizationVisibility
 
 COMPANY = "11111111-1111-4111-8111-111111111111"
@@ -88,15 +87,6 @@ def catalog_binding_document():
 def test_catalog_binding_scope_is_enriched_only_and_sealer_uses_same_validator():
     binding = catalog_binding_document()
     assert catalog._fhir_binding_document(binding) == binding
-    validation._validate_document(
-        "registry_fhir_catalog_binding",
-        {
-            "network_id": 7,
-            "binding_id": binding["binding_id"],
-            "source_id": binding["source_id"],
-            "document_json": binding,
-        },
-    )
     legacy_by_field = {key: entry for key, entry in binding.items() if key not in catalog._BINDING_METADATA}
     with pytest.raises(catalog.RegistryNetworkCatalogError):
         catalog.catalog_binding_document(legacy_by_field)
@@ -111,18 +101,9 @@ def test_reviewed_product_binding_requires_its_enclosing_network_in_reader_and_s
         "product_network_id": 7,
     }
     assert catalog.fhir_catalog_binding_document(binding, network_id=7) == binding
-    binding_row_by_key = {
-        "network_id": 7,
-        "binding_id": binding["binding_id"],
-        "source_id": binding["source_id"],
-        "document_json": binding,
-    }
-    validation._validate_document("registry_fhir_catalog_binding", binding_row_by_key)
     for network_id in (None, 8):
         with pytest.raises(catalog.RegistryNetworkCatalogError):
             catalog.fhir_catalog_binding_document(binding, network_id=network_id)
-    with pytest.raises(catalog.RegistryNetworkCatalogError):
-        validation._validate_document("registry_fhir_catalog_binding", {**binding_row_by_key, "network_id": 8})
 
 
 @pytest.mark.parametrize(

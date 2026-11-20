@@ -14,7 +14,6 @@ from process import registry_imported_catalog_preparation as catalog_preparation
 from process import registry_imported_membership_refresh as refresh
 from process import registry_imported_source_inventory as inventory
 from process import registry_native_network_catalog as native
-from process.network_fhir_source_witness_contract import digest
 from process.registry_fhir_catalog_validation import metadata_generation, snapshot_inputs
 from tests.test_registry_fhir_catalog_grant import standing_grant
 from tests.test_registry_fhir_catalog_validation import snapshot
@@ -171,39 +170,6 @@ async def test_source_token_tracks_named_data_and_policy(inventory_case, monkeyp
     assert (await observe(case)).token != before.token
     monkeypatch.setattr(inventory, "graph_policy", lambda source_id: {"office_policy": "next-policy"})
     assert (await observe(case)).token != before.token
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["new_source_head", "changed_descriptor", "omitted_retained_descriptor"])
-async def test_prepared_native_catalog_requires_reobserved_inputs(inventory_case, monkeypatch, change):
-    case = inventory_case
-    observed = await observe(case)
-    observations = catalog_preparation.native_catalog_sources(observed, "2026-11-17T00:00:00Z")
-    descriptor_by_generation = {digest(source.descriptor): source.descriptor for source in observations}
-    generation = next(iter(descriptor_by_generation))
-    source_vector_entries = [{"source_generation": key, "status": "current"} for key in descriptor_by_generation]
-    prepared_snapshot_by_field = {
-        "accounting_json": json.dumps(catalog_preparation.imported_catalog_accounting(observed)),
-        "source_vector_json": json.dumps(source_vector_entries),
-    }
-
-    async def reobserve():
-        return await observe(case)
-
-    monkeypatch.setattr(inventory, "current_imported_source_inventory", reobserve)
-    await catalog_preparation.require_native_catalog_inputs(prepared_snapshot_by_field, descriptor_by_generation)
-
-    if change == "new_source_head":
-        case.ptg["edition_id"] = "successor-snapshot"
-    elif change == "changed_descriptor":
-        descriptor_by_generation[generation]["coordinates"]["dataset_id"] = "different-edition"
-    else:
-        del descriptor_by_generation[generation]
-        source_vector_entries[0]["status"] = "retained"
-        prepared_snapshot_by_field["source_vector_json"] = source_vector_entries
-    prepared_snapshot_by_field["accounting_json"] = json.loads(prepared_snapshot_by_field["accounting_json"])
-    with pytest.raises(ValueError, match="registry_imported_catalog_sources_changed"):
-        await catalog_preparation.require_native_catalog_inputs(prepared_snapshot_by_field, descriptor_by_generation)
 
 
 @pytest.mark.asyncio

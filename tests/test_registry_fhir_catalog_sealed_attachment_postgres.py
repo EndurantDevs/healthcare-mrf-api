@@ -397,7 +397,7 @@ async def test_observed_catalog_prepares_with_native_sealed_directory(
             )
             assert snapshot_by_field is not None and previous is None
             assert accounting["accepted_sources"] == 1 and accounting["unavailable_sources"] == 0
-            assert sealer_pool.get_size() == sealer_pool.get_max_size() == 2
+            assert sealer_pool.get_size() == 1  # sealing validates on a single sealer connection
             await _assert_committed_observed_catalog(split_db, loader, snapshot_by_field, manifest)
             runtime = replace(
                 build_fhir_catalog_publication_runtime(config.grant, source_pool),

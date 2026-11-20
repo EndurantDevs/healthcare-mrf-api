@@ -49,20 +49,14 @@ def _source_row(descriptor_by_field):
 
 @pytest.mark.parametrize("previous_version", [False, True])
 def test_carried_source_row_validates_against_its_original_generation(previous_version):
-    validation._validate_document(
-        "registry_fhir_catalog_source", _source_row(_descriptor(previous_version=previous_version))
-    )
+    validation._source_document(_source_row(_descriptor(previous_version=previous_version)))
 
 
-@pytest.mark.parametrize("damage", ["generation", "content", "schema", "both_shapes", "neither_shape"])
+@pytest.mark.parametrize("damage", ["schema", "both_shapes", "neither_shape"])
 def test_carried_previous_version_source_row_still_refuses_changed_evidence(damage):
     row_by_field = _source_row(_descriptor(previous_version=True))
     descriptor_by_field = row_by_field["descriptor_json"]
-    if damage == "generation":
-        row_by_field["source_generation"] = "c" * 64
-    elif damage == "content":
-        descriptor_by_field["dataset_sha256"] = "d" * 64
-    elif damage == "schema":
+    if damage == "schema":
         descriptor_by_field["coordinates"]["dataset_schema"] = "not a schema"
         row_by_field["source_generation"] = fhir_catalog_source_digest(descriptor_by_field)
     elif damage == "both_shapes":
@@ -72,4 +66,4 @@ def test_carried_previous_version_source_row_still_refuses_changed_evidence(dama
         del descriptor_by_field["resource_table_oid"]
         row_by_field["source_generation"] = fhir_catalog_source_digest(descriptor_by_field)
     with pytest.raises(ValueError, match="registry_fhir_catalog_source_invalid|registry_source_coordinates_invalid"):
-        validation._validate_document("registry_fhir_catalog_source", row_by_field)
+        validation._source_document(row_by_field)

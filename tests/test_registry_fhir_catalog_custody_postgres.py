@@ -3,7 +3,6 @@
 
 import copy
 import hashlib
-import json
 import os
 import re
 from dataclasses import asdict
@@ -102,6 +101,11 @@ async def _create_metadata_controls(fixture):
     await connection.execute(f'CREATE SCHEMA "{fixture.control_schema}"')
     await connection.execute(
         f'CREATE TABLE "{fixture.control_schema}".network_registry_identity(network_id integer PRIMARY KEY)'
+    )
+    # Sealing reads the serving generation; an empty table means nothing is published yet.
+    await connection.execute(
+        f'CREATE TABLE "{fixture.control_schema}".network_serving_control'
+        "(id integer PRIMARY KEY CHECK(id=1),generation_id bigint,metadata_generation text)"
     )
     approved_table = _approved_record_table(fixture.control_schema)
     await connection.execute(str(CreateTable(approved_table).compile(dialect=postgresql.dialect())))
@@ -278,9 +282,7 @@ async def _freeze_metadata_generation(fixture, target, snapshot):
     assert frozen["state"] in {"frozen", "validated", "published"}
 
 
-async def freeze_metadata(
-    fixture, target=None, snapshot=None, *, validation_connection=None, standing_grant=None, observation_verifier=None
-):
+async def freeze_metadata(fixture, target=None, snapshot=None, *, validation_connection=None, standing_grant=None):
     """Checkpoint, administratively close writes, validate data and record the same claim."""
     from process.registry_fhir_catalog_store import catalog_snapshot_preparation
 
@@ -296,7 +298,6 @@ async def freeze_metadata(
             expected_snapshot=snapshot,
             control_schema=fixture.control_schema,
             standing_grant=standing_grant,
-            observation_verifier=observation_verifier,
         )
     snapshot.update(
         custody_json={**receipt, "preparation": catalog_snapshot_preparation(snapshot)},
@@ -433,45 +434,45 @@ async def seed_observations(fixture, count, *, expected_count=None):
     return snapshot_by_field
 
 
-class BatchCounter:
+class StatementCounter:
     def __init__(self, connection):
         self.connection = connection
-        self.pages = 0
+        self.statements = 0
 
     def __getattr__(self, name):
         return getattr(self.connection, name)
 
     async def fetch(self, query, *parameters):
-        if query.startswith("WITH page AS MATERIALIZED"):
-            self.pages += 1
+        self.statements += 1
         return await self.connection.fetch(query, *parameters)
+
+    async def fetchrow(self, query, *parameters):
+        self.statements += 1
+        return await self.connection.fetchrow(query, *parameters)
+
+    async def fetchval(self, query, *parameters):
+        self.statements += 1
+        return await self.connection.fetchval(query, *parameters)
 
 
 @pytest.mark.asyncio
-async def test_validation_batches_and_stable_digest(metadata_custody, monkeypatch):
+async def test_validation_accounts_tables_with_a_fixed_statement_count(metadata_custody, monkeypatch):
     fixture = metadata_custody
     snapshot_by_field = await seed_observations(fixture, 1000)
-    await fixture.connection.execute(f'ANALYZE "{fixture.target.schema_name}".registry_fhir_catalog_observation')
-    source_generation = snapshot_by_field["source_vector_json"][0]["source_generation"]
-    sql, parameters = validation._page_query(
-        '"' + fixture.target.schema_name + '"',
-        "registry_fhir_catalog_observation",
-        (source_generation, "Organization", "organization-0000", "organization", 0),
-    )
-    explained = json.loads(await fixture.connection.fetchval("EXPLAIN (ANALYZE,FORMAT JSON) " + sql, *parameters))
-    assert "registry_fhir_catalog_observation_pkey" in json.dumps(explained)
-    counted = BatchCounter(fixture.publisher)
+    counted = StatementCounter(fixture.publisher)
     sealed = await freeze_metadata(fixture, snapshot=snapshot_by_field, validation_connection=counted)
     receipt = sealed["custody_json"]
     tables = receipt["tables"]
     assert tables["registry_fhir_catalog_observation"]["rows"] == 1000
     assert tables["registry_fhir_catalog_observation"]["batches"] == 1
     assert tables["registry_fhir_catalog_observation"]["bytes"] > 0
-    assert counted.pages == 8
+    assert tables["registry_fhir_catalog_network"]["rows"] == 0
+    # Isolation level, fingerprints, sources, accounting, set checks and the serving-control read.
+    assert counted.statements <= 8
     repeated = await freeze_metadata(fixture, snapshot=snapshot_by_field)
     assert repeated["custody_json"]["content_sha256"] == receipt["content_sha256"]
     monkeypatch.setattr(
-        validation, "_table_digest", AsyncMock(side_effect=AssertionError("retained read rescanned metadata"))
+        validation, "_account_tables", AsyncMock(side_effect=AssertionError("retained read rescanned metadata"))
     )
     async with fixture.reader.transaction(readonly=True):
         await validate_fhir_catalog_snapshot_record(fixture.reader, repeated)
@@ -680,62 +681,6 @@ async def test_manual_uuid_relationship_is_validated(metadata_custody):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("table", sorted(validation._KEYS))
-async def test_digest_reads_empty_declared_tables(table):
-    connection = SimpleNamespace(fetch=AsyncMock(return_value=[]))
-    report = await validation._table_digest(connection, '"catalog_fixture"', table)
-    assert report == {"rows": 0, "sha256": hashlib.sha256(b"").hexdigest(), "batches": 0, "bytes": 0}
-    connection.fetch.assert_awaited_once()
-    assert f'"catalog_fixture".{table}' in connection.fetch.await_args.args[0]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("next_network_id", [7, 6], ids=["duplicate", "decreasing"])
-async def test_digest_refuses_nonincreasing_page_keys(next_network_id):
-    document_by_field = dict(
-        zip(NETWORK_COLUMNS, ("a" * 64, 7, "Example Network", [], False, 1, None, "example network"))
-    )
-    encoded = canonical_json(document_by_field)
-    entry_by_field = {"metadata_generation": "a" * 64, "network_id": 7, "document": encoded, "row_bytes": len(encoded)}
-    connection = SimpleNamespace(
-        fetch=AsyncMock(side_effect=[[entry_by_field], [{**entry_by_field, "network_id": next_network_id}]])
-    )
-    with pytest.raises(ValueError, match="registry_fhir_catalog_validation_order_invalid"):
-        await validation._table_digest(connection, '"catalog_fixture"', "registry_fhir_catalog_network")
-    assert connection.fetch.await_count == 2
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("unrelated_unique", [False, True])
-async def test_duplicate_paging_keys_refuse_after_writer_closure(metadata_custody, unrelated_unique):
-    fixture = metadata_custody
-    snapshot_by_field = expected_snapshot(fixture)
-    namespace = '"' + fixture.target.schema_name + '"'
-    await fixture.connection.execute(f'INSERT INTO "{fixture.control_schema}".network_registry_identity VALUES(7)')
-    await fixture.loader.execute(
-        f"ALTER TABLE {namespace}.registry_fhir_catalog_network DROP CONSTRAINT registry_fhir_catalog_network_pkey"
-    )
-    if unrelated_unique:
-        await fixture.loader.execute(
-            f"CREATE UNIQUE INDEX unrelated_unique ON {namespace}.registry_fhir_catalog_network "
-            "(metadata_generation,network_id,display_name)"
-        )
-    await fixture.loader.execute(
-        f"INSERT INTO {namespace}.registry_fhir_catalog_network "
-        "(metadata_generation,network_id,display_name,aliases,archived,revision,benefit_codes,search_name) "
-        "SELECT $1,7,'Example Network '||ordinal,'[]'::jsonb,false,1,NULL,'example network '||ordinal "
-        "FROM generate_series(1,$2::integer) ordinal",
-        snapshot_by_field["metadata_generation"],
-        validation.PAGE_ROWS + 1,
-    )
-    with pytest.raises(ValueError, match="registry_fhir_catalog_validation_order_invalid"):
-        await freeze_metadata(fixture, snapshot=snapshot_by_field)
-    assert await fixture.connection.fetchval(f"SELECT count(*) FROM {namespace}.registry_fhir_catalog_network") == 1001
-    with pytest.raises(asyncpg.InsufficientPrivilegeError):
-        await fixture.loader.execute(f"DELETE FROM {namespace}.registry_fhir_catalog_network")
-
-
-@pytest.mark.asyncio
 async def test_row_filter_enabled_after_reader_snapshot_refuses(metadata_custody):
     fixture = metadata_custody
     selected = await freeze_metadata(fixture)
@@ -768,3 +713,80 @@ async def test_named_catalog_requires_declared_tables(metadata_custody, change):
         await fixture.connection.fetchval(f'SELECT count(*) FROM "{fixture.control_schema}".network_registry_identity')
         == 0
     )
+
+
+async def _insert_network(fixture, target, generation):
+    await fixture.connection.execute(
+        f'INSERT INTO "{target.schema_name}".registry_fhir_catalog_network '
+        "(metadata_generation,network_id,display_name,aliases,archived,revision,benefit_codes,search_name) "
+        "VALUES($1,7,'Example Network','[]'::jsonb,false,1,NULL,'example network')",
+        generation,
+    )
+
+
+@pytest.mark.asyncio
+async def test_successor_must_keep_every_published_network(metadata_custody):
+    fixture = metadata_custody
+    control = '"' + fixture.control_schema + '"'
+    await fixture.connection.execute(f"INSERT INTO {control}.network_registry_identity VALUES(7)")
+    published = expected_snapshot(fixture)
+    await _insert_network(fixture, fixture.target, published["metadata_generation"])
+    await freeze_metadata(fixture, snapshot=published)
+    await fixture.connection.execute(
+        f"UPDATE {control}.registry_fhir_catalog_snapshot SET published_at=now() WHERE metadata_generation=$1",
+        published["metadata_generation"],
+    )
+    await fixture.connection.execute(
+        f"INSERT INTO {control}.network_serving_control VALUES(1,NULL,$1)", published["metadata_generation"]
+    )
+    for keeps_network in (False, True):
+        successor_target = await create_metadata_target(fixture)
+        successor = expected_snapshot(fixture, successor_target)
+        successor["as_of"] = date(2026, 1, 2 + keeps_network)
+        successor["metadata_generation"] = metadata_generation(successor)
+        if keeps_network:
+            await _insert_network(fixture, successor_target, successor["metadata_generation"])
+            sealed = await freeze_metadata(fixture, successor_target, successor)
+            assert sealed["accounting_json"]["registry_fhir_catalog_network"]["rows"] == 1
+        else:
+            with pytest.raises(ValueError, match="registry_fhir_catalog_observation_history_changed"):
+                await freeze_metadata(fixture, successor_target, successor)
+
+
+async def _approved_binding(fixture, record_key, record_by_field):
+    await fixture.connection.copy_records_to_table(
+        "registry_approved_record",
+        schema_name=fixture.control_schema,
+        columns=("approved_revision", "record_kind", "record_key", "record_revision", "custom_revision", "record_json"),
+        records=[(6, "network_binding", record_key, 1, 1, canonical_json(record_by_field))],
+    )
+
+
+@pytest.mark.asyncio
+async def test_every_approved_retained_product_needs_its_candidate_binding(metadata_custody):
+    fixture = metadata_custody
+    generation = expected_snapshot(fixture)["metadata_generation"]
+    product_key, archived_key = str(uuid4()), str(uuid4())
+    product_by_field = {"archived": False, "source_system": "fhir", "source_scope_json": {"insurance_plan_id": "plan"}}
+    await _approved_binding(fixture, product_key, product_by_field)
+    await _approved_binding(fixture, archived_key, {**product_by_field, "archived": True})
+    await _approved_binding(
+        fixture, str(uuid4()), {"archived": False, "source_system": "fhir", "source_key": "network"}
+    )
+    namespace = '"' + fixture.target.schema_name + '"'
+    sql = validation._PRODUCTS_SQL.format(namespace=namespace, control='"' + fixture.control_schema + '"')
+
+    async def is_missing():
+        return await fixture.connection.fetchval(sql, generation, 6)
+
+    assert await is_missing()
+    for binding_generation in ("f" * 64, generation):
+        await fixture.connection.execute(
+            f"INSERT INTO {namespace}.registry_fhir_catalog_binding "
+            "(metadata_generation,network_id,binding_id,source_id,document_json) VALUES($1,7,$2::uuid,'sample','{}')",
+            binding_generation,
+            product_key,
+        )
+        assert await is_missing() is (binding_generation != generation)
+    await _approved_binding(fixture, "not-a-uuid", {**product_by_field, "source_key": "InsurancePlan/plan"})
+    assert await is_missing()

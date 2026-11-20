@@ -18,8 +18,6 @@ async def revision_lock(metadata_custody):
       CREATE TABLE {namespace}.registry_revision_control(
         id integer PRIMARY KEY CHECK(id=1),draft_revision bigint NOT NULL,approved_revision bigint NOT NULL);
       INSERT INTO {namespace}.registry_revision_control VALUES(1,6,4);
-      CREATE TABLE {namespace}.network_serving_control(
-        id integer PRIMARY KEY CHECK(id=1),generation_id bigint,metadata_generation text);
       INSERT INTO {namespace}.network_serving_control VALUES(1,9,NULL)
     """)
     role = '"' + fixture.roles["reader"] + '"'

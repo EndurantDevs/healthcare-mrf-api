@@ -133,19 +133,12 @@ async def test_catalogue_freezes_and_reseals_checkpoint_without_rebuilding(monke
     freezer = AsyncMock(return_value={"preparation_id": target.candidate_id, "state": "frozen"})
     source_runtime = SimpleNamespace(freeze_preparation=freezer, catalog_export=object())
     catalog = SimpleNamespace(consumer=SimpleNamespace(control_schema="registry"))
-    source_pool, sealer_pool = object(), object()
-    finished = await runtime._finish_import_catalog(catalog, source_runtime, prepared, source_pool, sealer_pool)
+    sealer_pool = object()
+    finished = await runtime._finish_import_catalog(catalog, source_runtime, prepared, sealer_pool)
     assert finished.snapshot is prepared.snapshot and finished.metadata_generation == prepared.metadata_generation
     assert finished.accounting["preparation_state"] == "validated"
     freezer.assert_awaited_once_with(store.named_catalog_preparation(prepared.snapshot, "registry"), roles_by_name)
-    seal.assert_awaited_once_with(
-        catalog,
-        target,
-        prepared.snapshot,
-        sealer_pool,
-        source_pool=source_pool,
-        source_export=source_runtime.catalog_export,
-    )
+    seal.assert_awaited_once_with(catalog, target, prepared.snapshot, sealer_pool)
 
 
 @pytest.mark.asyncio

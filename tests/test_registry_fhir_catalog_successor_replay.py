@@ -13,7 +13,6 @@ import pytest
 from process import network_fhir_retained_capture as captures
 from process import registry_fhir_catalog_grant as grants
 from process import registry_fhir_catalog_products as products
-from process import registry_fhir_catalog_projection_validation as projection
 from process import registry_fhir_catalog_retained as retained
 from process import registry_fhir_catalog_sync as sync
 from process.network_fhir_membership_source import with_fhir_successor

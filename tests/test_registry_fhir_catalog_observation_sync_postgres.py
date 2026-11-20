@@ -17,7 +17,6 @@ from db.models.registry_publication_request import RegistryPublicationRequest
 from process.registry_fhir_catalog_custody import FHIRCatalogTarget
 from process.registry_fhir_catalog_grant import (
     FHIRCatalogStandingGrant,
-    build_fhir_catalog_observation_verifier,
     build_fhir_catalog_publication_runtime,
 )
 from process.registry_fhir_catalog_observation import CATALOG_OBSERVATION_CONTRACT
@@ -44,7 +43,7 @@ from process.registry_fhir_catalog_sync import (
     project_manual_fhir_catalog,
     stage_fhir_catalog_source,
 )
-from process.registry_fhir_catalog_validation import fhir_catalog_observation_digest, metadata_generation
+from process.registry_fhir_catalog_validation import metadata_generation
 from process.registry_publication_queue import claim_registry_publication_request
 from tests.test_registry_fhir_catalog_custody_postgres import freeze_metadata, metadata_preparation_roles
 from tests.test_registry_fhir_catalog_custody_postgres import metadata_custody as metadata_custody
@@ -101,7 +100,6 @@ async def _control_tables(fixture):
     control = '"' + fixture.control_schema + '"'
     await fixture.connection.execute(f"""CREATE TABLE {control}.registry_revision_control(id integer PRIMARY KEY,approved_revision bigint);
       INSERT INTO {control}.registry_revision_control VALUES(1,6);
-      CREATE TABLE {control}.network_serving_control(id integer PRIMARY KEY,generation_id bigint,metadata_generation text);
       INSERT INTO {control}.network_serving_control VALUES(1,NULL,NULL)""")
     queue = RegistryPublicationRequest.__table__.to_metadata(MetaData(), schema=fixture.control_schema)
     await fixture.connection.execute(str(CreateTable(queue).compile(dialect=postgresql.dialect())))
@@ -466,44 +464,13 @@ async def _unsealed(case):
     return catalog_target, disposition, snapshot
 
 
-async def _forge_organization(case, target):
-    await case.fixture.loader.execute(
-        f'UPDATE "{target.schema_name}".registry_fhir_catalog_observation '
-        "SET document_json=jsonb_set(document_json,'{name}','\"Forged projected name\"'::jsonb) "
-        "WHERE resource_type='Organization' AND resource_id='network-new'"
-    )
-
-
-async def _freeze(case, target, snapshot, *, with_verifier=True):
-    """Use the existing administrator freeze and complete logical source replay."""
-    await freeze_metadata(
-        case.fixture,
-        target,
-        snapshot,
-        standing_grant=case.grant,
-        observation_verifier=build_fhir_catalog_observation_verifier(case.grant, case.source_pool)
-        if with_verifier
-        else None,
-    )
+async def _freeze(case, target, snapshot):
+    """Use the existing administrator freeze and set-based candidate validation."""
+    await freeze_metadata(case.fixture, target, snapshot, standing_grant=case.grant)
     return snapshot["custody_json"]
 
 
-async def test_fresh_observations_need_the_sealer_verifier(observation_case):
-    case = observation_case
-    target, source, snapshot = await _unsealed(case)
-    async with case.fixture.loader.transaction():
-        await _project(case, target, source, snapshot)
-        await create_fhir_catalog_indexes(
-            case.fixture.loader,
-            target,
-            loader_role=case.fixture.roles["loader"],
-            control_schema=case.fixture.control_schema,
-        )
-    with pytest.raises(ValueError, match="observation_verifier_required"):
-        await _freeze(case, target, snapshot, with_verifier=False)
-
-
-async def test_carried_observation_mutation_is_rejected_against_protected_prior_catalog(observation_case):
+async def test_carried_catalog_cannot_drop_a_published_network(observation_case):
     case = observation_case
     first, _, _ = await _prepare(case)
     await _publish(case, first)
@@ -522,7 +489,7 @@ async def test_carried_observation_mutation_is_rejected_against_protected_prior_
             loader_role=case.fixture.roles["loader"],
             control_schema=case.fixture.control_schema,
         )
-        await _forge_organization(case, target)
+        await _drop_network(case, target)
         await create_fhir_catalog_indexes(
             case.fixture.loader,
             target,
@@ -534,78 +501,17 @@ async def test_carried_observation_mutation_is_rejected_against_protected_prior_
     assert await _query(case) == protected_page
 
 
-async def _mutate_derived_output(case, copy_target, attack):
+async def _drop_network(case, copy_target):
     namespace = '"' + copy_target.schema_name + '"'
-    networks = namespace + ".registry_fhir_catalog_network"
-    bindings = namespace + ".registry_fhir_catalog_binding"
-    relationships = namespace + ".registry_fhir_catalog_relationship"
     network_id = await case.fixture.loader.fetchval(
-        f"SELECT network_id FROM {networks} WHERE display_name='Imported network-new'"
+        f"SELECT network_id FROM {namespace}.registry_fhir_catalog_network WHERE display_name='Imported network-new'"
     )
-    assert network_id is not None and network_id != 7
-    if attack == "duplicate_relationship":
-        await _duplicate_relationship(case, copy_target, network_id)
-        return
-    statements_by_attack = {
-        "network_name": [
-            f"UPDATE {networks} SET display_name='Forged display',search_name='forged display' WHERE network_id=$1"
-        ],
-        "relationship": [
-            f"DELETE FROM {relationships} WHERE relationship_id=(SELECT relationship_id FROM {relationships} "
-            "WHERE network_id=$1 AND source_id='alias-a' ORDER BY relationship_id LIMIT 1)"
-        ],
-        "binding": [
-            f"DELETE FROM {relationships} WHERE binding_id IN (SELECT binding_id FROM {bindings} WHERE network_id=$1)",
-            f"DELETE FROM {bindings} WHERE network_id=$1",
-        ],
-        "network": [
-            f"DELETE FROM {relationships} WHERE network_id=$1",
-            f"DELETE FROM {bindings} WHERE network_id=$1",
-            f"DELETE FROM {networks} WHERE network_id=$1",
-        ],
-    }
-    for statement in statements_by_attack[attack]:
-        changed = await case.fixture.loader.execute(statement, network_id)
+    assert network_id is not None
+    for table in ("relationship", "binding", "network"):
+        changed = await case.fixture.loader.execute(
+            f"DELETE FROM {namespace}.registry_fhir_catalog_{table} WHERE network_id=$1", network_id
+        )
         assert int(changed.rsplit(" ", 1)[1]) > 0
-
-
-async def _duplicate_relationship(case, copy_target, network_id):
-    relationship_table = '"' + copy_target.schema_name + '".registry_fhir_catalog_relationship'
-    await case.fixture.loader.execute(
-        f"ALTER TABLE {relationship_table} DROP CONSTRAINT registry_fhir_catalog_relationship_pkey"
-    )
-    changed = await case.fixture.loader.execute(
-        f"INSERT INTO {relationship_table} SELECT * FROM {relationship_table} WHERE relationship_id=("
-        f"SELECT relationship_id FROM {relationship_table} WHERE network_id=$1 AND source_id='alias-a' "
-        "ORDER BY relationship_id LIMIT 1)",
-        network_id,
-    )
-    assert changed == "INSERT 0 1"
-
-
-@pytest.mark.parametrize("attack", ["network_name", "relationship", "binding", "network", "duplicate_relationship"])
-async def test_derived_output_mutation_cannot_be_attested_with_unchanged_source_facts(observation_case, attack):
-    case = observation_case
-    target, source, snapshot = await _unsealed(case)
-    generation = fhir_catalog_source_generation(source.descriptor)
-    async with case.fixture.loader.transaction():
-        await _project(case, target, source, snapshot)
-        before = await fhir_catalog_observation_digest(
-            case.fixture.loader, schema_name=target.schema_name, source_generation=generation
-        )
-        await _mutate_derived_output(case, target, attack)
-        after = await fhir_catalog_observation_digest(
-            case.fixture.loader, schema_name=target.schema_name, source_generation=generation
-        )
-        assert before == after
-        await create_fhir_catalog_indexes(
-            case.fixture.loader,
-            target,
-            loader_role=case.fixture.roles["loader"],
-            control_schema=case.fixture.control_schema,
-        )
-    with pytest.raises(ValueError, match="registry_fhir_catalog_observed_projection_changed"):
-        await _freeze(case, target, snapshot)
 
 
 async def test_projection_replay_preserves_frozen_loader_rows(observation_case):

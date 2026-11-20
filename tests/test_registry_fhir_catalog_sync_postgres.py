@@ -97,11 +97,10 @@ async def _named_replacement_rows(fixture, *, is_typed):
 
 
 @pytest.mark.asyncio
+# The seal no longer replays bindings independently; the pinned "independent" case now uses the shared writer.
 @pytest.mark.parametrize("path", ["observed", "independent", "typed"])
 async def test_named_successor_retires_bindings_across_payload_schemas(metadata_custody, path):
-    from process.registry_fhir_catalog_projection_validation import _ProjectionReplay
     from process.registry_fhir_plan_tier_catalog import replace_plan_tier_bindings
-    from tests.test_registry_fhir_catalog_grant import snapshot, standing_grant
 
     fixture = metadata_custody
     schema, relation_by_kind, replacement_key, binding_id_by_generation = await _named_replacement_rows(
@@ -119,16 +118,10 @@ async def test_named_successor_retires_bindings_across_payload_schemas(metadata_
         await replace_plan_tier_bindings(
             fixture.connection, relation_by_kind, successor_descriptor_by_field, [replacement_key]
         )
-    elif path == "observed":
+    else:
         await sync._replace_observed_bindings(
             fixture.connection, '"' + schema + '"', successor_descriptor_by_field, [replacement_key]
         )
-    else:
-        grant = standing_grant()
-        selected_snapshot_by_field = {**snapshot(grant), "schema_name": schema}
-        replay = _ProjectionReplay(fixture.connection, selected_snapshot_by_field, grant, None)
-        replay.targets.update(relation_by_kind)
-        await replay.replace_bindings(successor_descriptor_by_field, [replacement_key])
     retained_binding_ids = {binding_id_by_generation[name] for name in ("other-endpoint", "other-scope", "absent")}
     for kind in ("binding", "relationship"):
         binding_rows = await fixture.connection.fetch(f"SELECT binding_id FROM {relation_by_kind[kind]}")

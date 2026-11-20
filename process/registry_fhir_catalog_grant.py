@@ -10,7 +10,6 @@ import re
 from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from datetime import datetime
 from uuid import UUID
 
 from db.plan_release_storage import storage_identifier
@@ -44,7 +43,6 @@ from process.registry_fhir_catalog_sources import (
 from process.registry_fhir_catalog_sources import parse_fhir_catalog_source_profile as source_profile
 from process.registry_fhir_catalog_validation import (
     canonical_json,
-    fhir_catalog_observation_digest,
     metadata_generation,
     snapshot_inputs,
 )
@@ -643,211 +641,12 @@ def build_fhir_catalog_publication_runtime(
     )
 
 
-class _ObservationReplayDigest:
-    def __init__(self):
-        self.digest = hashlib.sha256()
-        self.rows = 0
-        self.previous_key = None
-
-    async def collect(self, rows):
-        """Hash the exact PK-ordered documents emitted by the shared producer."""
-        from process.registry_fhir_catalog_store import TABLE_COLUMNS
-
-        for row in rows:
-            key = row[:5]
-            if self.previous_key is not None and key <= self.previous_key:
-                _fail("observation_order_changed")
-            document_by_field = dict(zip(TABLE_COLUMNS["registry_fhir_catalog_observation"], row, strict=True))
-            document_by_field["document_json"] = json.loads(document_by_field["document_json"])
-            self.digest.update(canonical_json(document_by_field).encode() + b"\n")
-            self.rows += 1
-            self.previous_key = key
-
-
 def _is_observed_source(descriptor):
     return (
         descriptor.get("contract") != "registry-native-network-source-v1"
         and descriptor["profile"] != "retained_normalized"
         and descriptor["admission"]["kind"] == "catalog_observation"
     )
-
-
-async def _observation_accounting(connection, schema_name, generation):
-    record = await connection.fetchrow(
-        f"SELECT source_rows,observation_rows,accepted_at,created_at FROM {storage_identifier(schema_name)}."
-        "registry_fhir_catalog_source WHERE source_generation=$1",
-        generation,
-    )
-    if record is None:
-        _fail("observation_accounting_changed")
-    return dict(record)
-
-
-async def _prior_observations(connection, snapshot, grant):
-    previous = await connection.fetchval(
-        f"SELECT metadata_generation FROM {storage_identifier(grant.control_schema)}.network_serving_control WHERE id=1"
-    )
-    if previous is None:
-        return None, {}
-    prior = await _protected_snapshot(connection, snapshot, grant, generation=previous, published=True)
-    if "imported_source_inventory" not in snapshot_inputs(snapshot) and await connection.fetchval(
-        f"SELECT EXISTS(SELECT FROM {storage_identifier(prior['schema_name'])}.registry_fhir_catalog_network old "
-        f"LEFT JOIN {storage_identifier(snapshot['schema_name'])}.registry_fhir_catalog_network current "
-        "USING(network_id) WHERE current.network_id IS NULL)"
-    ):
-        _fail("observation_history_changed")
-    descriptors = await _descriptors(connection, prior, snapshot_inputs(prior)["source_vector_json"])
-    return prior, {
-        generation: descriptor for generation, descriptor in descriptors.items() if _is_observed_source(descriptor)
-    }
-
-
-async def _verify_carried_observation(connection, snapshot, prior, generation):
-    current = await _observation_accounting(connection, snapshot["schema_name"], generation)
-    previous = await _observation_accounting(connection, prior["schema_name"], generation)
-    if current != previous:
-        _fail("observation_history_changed")
-    digests = []
-    for selected in (snapshot, prior):
-        digests.append(
-            await fhir_catalog_observation_digest(
-                connection, schema_name=selected["schema_name"], source_generation=generation
-            )
-        )
-    if any(digests[0][field] != digests[1][field] for field in ("rows", "sha256")):
-        _fail("observation_history_changed")
-
-
-async def _verify_fresh_observation(reader, connection, snapshot, generation, descriptor, workspace):
-    from process.registry_fhir_catalog_observed_source import collect_fhir_catalog_observation
-    from process.registry_fhir_catalog_sync import replay_fhir_catalog_observations
-
-    actual = await collect_fhir_catalog_observation(
-        reader,
-        source_profile(descriptor["native_read_profile"]),
-        endpoint_id=descriptor["endpoint_id"],
-        dataset_id=descriptor["coordinates"]["dataset_id"],
-        require_current=False,
-    )
-    if actual.descriptor != descriptor:
-        _fail("observation_source_changed")
-    expected = _ObservationReplayDigest()
-    source_rows = await replay_fhir_catalog_observations(
-        reader, descriptor, expected.collect, reference_workspace=workspace
-    )
-    await _verify_observation_replay(connection, snapshot, generation, descriptor, source_rows, expected)
-
-
-async def _verify_observation_replay(connection, snapshot, generation, descriptor, source_rows, expected):
-    """Compare independent replay with complete stored facts and source accounting."""
-    stored = await fhir_catalog_observation_digest(
-        connection, schema_name=snapshot["schema_name"], source_generation=generation
-    )
-    accounting = await _observation_accounting(connection, snapshot["schema_name"], generation)
-    if (
-        source_rows != sum(family["rows"] for family in descriptor["admission"]["families"].values())
-        or accounting["source_rows"] != source_rows
-        or accounting["observation_rows"] != expected.rows
-        or accounting["accepted_at"] != datetime.fromisoformat(descriptor["admission"]["publication"]["published_at"])
-        or stored["rows"] != expected.rows
-        or stored["sha256"] != expected.digest.hexdigest()
-    ):
-        _fail("observation_facts_changed")
-
-
-async def _catalog_verified_history(connection, snapshot, grant, source_companies_only):
-    vector, descriptors, prior, previous_descriptors = await _catalog_verification_inputs(connection, snapshot, grant)
-    _verify_retained_source_companies(vector, snapshot_inputs(prior)["source_vector_json"] if prior else [])
-    if source_companies_only:
-        await _verify_committed_source_history(connection, snapshot, prior, vector, descriptors)
-    if not set(previous_descriptors) <= set(descriptors):
-        _fail("observation_history_changed")
-    return vector, descriptors, prior, previous_descriptors
-
-
-def build_fhir_catalog_observation_verifier(
-    grant,
-    source_reader_pool,
-    *,
-    registry_reader=None,
-    registry_workspace=None,
-    source_export=None,
-    source_companies_only=False,
-):
-    """Bind trusted collection/replay to writer closure, independently of Loader claims."""
-    if type(grant) is not FHIRCatalogStandingGrant:
-        _fail()
-    if source_export is not None and not callable(source_export):
-        _fail("source_export_invalid")
-
-    async def verify_inputs(*, connection, copy_target, snapshot, standing_grant):
-        """Validate fresh facts or matching prior content after candidate writes close."""
-        if standing_grant.sha256 != grant.sha256 or copy_target.schema_name != snapshot["schema_name"]:
-            _fail("policy_changed")
-        vector, descriptors, prior, previous_descriptors = await _catalog_verified_history(
-            connection, snapshot, grant, source_companies_only
-        )
-        # Fresh sources were just staged from the same pinned Source snapshot; re-reading them proves nothing new.
-        await _verify_cached_observations(
-            connection,
-            snapshot,
-            prior,
-            vector,
-            descriptors,
-            previous_descriptors,
-            source_companies_only=source_companies_only,
-        )
-        await verify_current_fhir_catalog_source_companies(source_export, connection, vector, descriptors, grant)
-        from process.registry_fhir_catalog_validation import validate_fhir_catalog_observed_projection
-
-        await validate_fhir_catalog_observed_projection(
-            connection, snapshot, standing_grant=grant, prior_snapshot=prior, registry_reader=registry_reader
-        )
-
-    async def verify(**arguments):
-        """Replay the extractor named by the closed snapshot, restoring caller context."""
-        from process.registry_fhir_plan_tier import extraction_transform
-
-        with extraction_transform(arguments["snapshot"]["projector_version"]):
-            return await verify_inputs(**arguments)
-
-    return verify
-
-
-async def _verify_committed_source_history(connection, snapshot, prior, vector, descriptors):
-    """Refuse metadata-only repair unless both vector identity and every committed descriptor remain exact."""
-    require_fhir_catalog_company_refresh_inputs({**snapshot, "source_vector_json": vector}, prior)
-    prior_descriptors = await load_fhir_catalog_source_descriptors(
-        connection, prior, snapshot_inputs(prior)["source_vector_json"]
-    )
-    if descriptors != prior_descriptors:
-        _fail("source_companies_history_changed")
-
-
-async def _verify_cached_observations(
-    connection, snapshot, prior, vector, descriptors, previous, *, source_companies_only
-):
-    """Validate carried content and return sources requiring independent replay."""
-    from process.registry_fhir_plan_tier import needs_plan_tier_refresh
-
-    fresh_sources = []
-    for entry in vector:
-        generation = entry["source_generation"]
-        descriptor = descriptors[generation]
-        if source_companies_only:
-            await _verify_carried_observation(connection, snapshot, prior, generation)
-            continue
-        if not _is_observed_source(descriptor):
-            continue
-        if generation in previous and descriptor != previous[generation]:
-            _fail("observation_history_changed")
-        if generation in previous and not needs_plan_tier_refresh(prior, snapshot, descriptor):
-            await _verify_carried_observation(connection, snapshot, prior, generation)
-        else:
-            if entry["status"] != "current":
-                _fail("observation_history_required")
-            fresh_sources.append((generation, descriptor))
-    return fresh_sources
 
 
 async def verify_current_fhir_catalog_source_companies(source_export, connection, vector, descriptors, grant):
@@ -872,31 +671,3 @@ async def verify_current_fhir_catalog_source_companies(source_export, connection
                 labels = await collect_fhir_catalog_source_companies(export, descriptor, required=True)
                 if labels != entry["source_companies"]:
                     _fail("source_companies_changed")
-
-
-async def _catalog_verification_inputs(connection, snapshot, grant):
-    source_entries = snapshot_inputs(snapshot)["source_vector_json"]
-    descriptors_by_generation = await load_fhir_catalog_source_descriptors(connection, snapshot, source_entries)
-    from process.registry_imported_catalog_preparation import require_native_catalog_inputs
-    from process.registry_native_network_catalog import is_native_catalog_source
-
-    native_generations = {
-        generation
-        for generation, descriptor in descriptors_by_generation.items()
-        if is_native_catalog_source(descriptor)
-    }
-    if native_generations:
-        await require_native_catalog_inputs(snapshot, descriptors_by_generation)
-        source_entries = [entry for entry in source_entries if entry["source_generation"] not in native_generations]
-        descriptors_by_generation = {
-            generation: descriptor
-            for generation, descriptor in descriptors_by_generation.items()
-            if generation not in native_generations
-        }
-    prior, previous_by_generation = await _prior_observations(connection, snapshot, grant)
-    previous_by_generation = {
-        generation: observation
-        for generation, observation in previous_by_generation.items()
-        if generation not in native_generations
-    }
-    return source_entries, descriptors_by_generation, prior, previous_by_generation
