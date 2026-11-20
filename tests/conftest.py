@@ -28,6 +28,18 @@ for key, value in TEST_ENV_DEFAULTS.items():
 
 
 @pytest.fixture(autouse=True)
+def skip_cms_directory_profile_read(monkeypatch):
+    # Profile loader tests stub their own sources; the CMS directory read needs a database.
+    profile_module = sys.modules.get("api.provider_profile")
+    if profile_module is not None:
+
+        async def no_directory_projection(npi):
+            return None
+
+        monkeypatch.setattr(profile_module, "fetch_cms_npd_projection", no_directory_projection)
+
+
+@pytest.fixture(autouse=True)
 def clear_npi_detail_response_cache():
     # Unrelated tests should not load the endpoint just to clear an empty cache.
     npi_module = sys.modules.get("api.endpoint.npi")

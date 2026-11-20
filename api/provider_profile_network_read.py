@@ -171,7 +171,7 @@ async def read_managed_provider_profile(selector, *, excluded_network_ids, acces
         connection = await session.connection()
         driver = (await connection.get_raw_connection()).driver_connection
         manifest = await resolve_network_serving_manifest(driver, api_read=True)
-        state_projection = await provider.fetch_provider_profile_projection(int(npi))
+        state_projection = await provider.fetch_provider_profile_projection(int(npi), include_cms_directory=False)
         fhir_record = await _directory_profile(session, driver, manifest, npi, query, excluded_network_ids, schema)
         profile = provider._compose_requested_provider_profile(int(npi), state_projection, fhir_record, query)
         if profile is None:
