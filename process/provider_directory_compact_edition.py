@@ -57,12 +57,17 @@ async def _edition_page_keys(
     )
     _require(npi is None or type(npi) is str, "npi")
     npi_filter = " AND npi_text=$6 AND resource_type IN('Practitioner','PractitionerRole')" if npi is not None else ""
+    select = f"SELECT resource_type,resource_id,batch_ordinal,row_ordinal,read_bytes FROM {tables.relation('aliases')} "
+    order = ' ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT $5'
+    # Two branches keep both the cursor and the type list as index keys.
     keys = await connection.fetch(
-        f"SELECT resource_type,resource_id,batch_ordinal,row_ordinal,read_bytes FROM {tables.relation('aliases')} "
-        "WHERE dataset_id=$1 AND resource_type=ANY($2::text[]) AND "
-        '(resource_type COLLATE "C",resource_id COLLATE "C")>($3::text COLLATE "C",$4::text COLLATE "C")'
-        + npi_filter
-        + ' ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT $5',
+        f"SELECT * FROM (({select}"
+        'WHERE dataset_id=$1 AND resource_type COLLATE "C"=$3::text AND $3::text=ANY($2::text[]) '
+        'AND resource_id COLLATE "C">$4::text COLLATE "C"'
+        f"{npi_filter}{order}) UNION ALL ({select}"
+        'WHERE dataset_id=$1 AND resource_type COLLATE "C"=ANY($2::text[]) '
+        'AND resource_type COLLATE "C">$3::text COLLATE "C"'
+        f"{npi_filter}{order})) cursor_page{order}",
         dataset_id,
         list(resource_types),
         *after,

@@ -397,7 +397,8 @@ def test_legacy_sql_body_and_mapping_preserve_reviewed_bytes():
 
 def test_v2_cursor_and_transfer_use_one_explicit_c_order():
     sql = fhir._source_witness_sql_v2(pin(retained()))
-    assert '(resource_type COLLATE "C",resource_id COLLATE "C")>($2::text COLLATE "C",$3::text COLLATE "C")' in sql
+    assert 'resource_type COLLATE "C"=$2::text' in sql and 'resource_id COLLATE "C">$3::text COLLATE "C"' in sql
+    assert 'resource_type COLLATE "C">$2::text COLLATE "C"' in sql
     assert 'ORDER BY resource_type COLLATE "C",resource_id COLLATE "C" LIMIT $4' in sql
     assert sql.count('ORDER BY resource_type COLLATE "C" DESC,resource_id COLLATE "C" DESC LIMIT 1') == 2
     source = pin(retained())

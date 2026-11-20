@@ -2000,7 +2000,8 @@ async def _edge_organizations(connection, namespace, generation, edges):
         f"LEFT JOIN {namespace}.registry_fhir_catalog_binding b ON b.document_json->>'evidence_id'="
         "o.source_generation||':Organization/'||o.resource_id "
         "WHERE o.source_generation=$1 AND o.resource_type='Organization' AND o.observation_kind='organization' "
-        "AND (o.resource_id=ANY($2::text[]) OR o.resource_id IN ("
+        # One id list keeps both lookups on the primary key; an OR over the parent subquery scans the whole source.
+        "AND o.resource_id=ANY(ARRAY(SELECT unnest($2::text[]) UNION "
         f"SELECT regexp_replace(parent.document_json->>'part_of_ref','^.*/','') FROM {namespace}.registry_fhir_catalog_observation parent "
         "WHERE parent.source_generation=$1 AND parent.resource_type='Organization' "
         "AND parent.observation_kind='organization' AND parent.resource_id=ANY($2::text[]))) "
