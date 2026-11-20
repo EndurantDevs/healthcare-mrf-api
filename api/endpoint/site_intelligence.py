@@ -11,7 +11,7 @@ from decimal import Decimal
 
 from sanic import Blueprint, response
 from sanic.exceptions import InvalidUsage
-from sqlalchemy import Numeric, and_, func, literal, select, text, true
+from sqlalchemy import Double, Numeric, and_, func, literal, select, text, true
 
 from db.models import (
     DoctorClinicianAddress,
@@ -89,6 +89,37 @@ async def _is_table_cached(session, model) -> bool:
     exists = await _is_table_available(session, model)
     _TABLE_EXISTS_CACHE[cache_key] = (now, exists)
     return exists
+
+
+async def _is_pharmacy_geo_index_available(session) -> bool:
+    """Use the spatial candidate query only where the optional GiST index is available."""
+    if not hasattr(session, "get_bind"):
+        return False
+    table = EntityAddressUnified.__table__
+    index_name = f"{table.schema or 'mrf'}.{table.name}_idx_geo_idx"
+    now = time.monotonic()
+    cached = _TABLE_EXISTS_CACHE.get(index_name)
+    if cached and (now - cached[0]) < TABLE_EXISTS_CACHE_TTL_SECONDS:
+        return cached[1]
+    result = await session.execute(
+        text(
+            """
+            SELECT EXISTS (
+                       SELECT 1 FROM pg_catalog.pg_index
+                       WHERE indexrelid = to_regclass(:index_name) AND indisvalid
+                   )
+                   AND CASE WHEN to_regtype('public.geography') IS NOT NULL THEN
+                       COALESCE(has_function_privilege(
+                           to_regprocedure('public._st_expand(public.geography,double precision)'), 'EXECUTE'
+                       ), FALSE)
+                   ELSE FALSE END
+            """
+        ),
+        {"index_name": index_name},
+    )
+    is_available = bool(result.scalar())
+    _TABLE_EXISTS_CACHE[index_name] = (now, is_available)
+    return is_available
 
 
 async def _is_zcta_overlap_available(session) -> bool:
@@ -508,6 +539,21 @@ async def _load_anchor_candidates(
     return by_type
 
 
+def _pharmacy_geo_prefilter(lat: float, lng: float, lat_delta: float, lng_delta: float, radius_miles: float | None):
+    """Build a conservative index envelope when the exact coordinate window is valid."""
+    if radius_miles is None or not (
+        0 < radius_miles <= 50 and abs(lat) + lat_delta < 90 and abs(lng) + lng_delta < 180
+    ):
+        return None
+    point = func.public.Geography(
+        func.public.ST_MakePoint(EntityAddressUnified.long.cast(Double), EntityAddressUnified.lat.cast(Double))
+    )
+    anchor = func.public.Geography(func.public.ST_MakePoint(lng, lat))
+    # Use PostGIS's spherical index envelope with a metre of roundoff margin.
+    envelope = func.public._ST_Expand(anchor, radius_miles * MILES_TO_METERS + 1)
+    return point.op("OPERATOR(public.&&)")(envelope)
+
+
 def _pharmacy_geo_stmt(
     *,
     use_unified_addresses: bool,
@@ -515,7 +561,9 @@ def _pharmacy_geo_stmt(
     lng: float,
     lat_delta: float,
     lng_delta: float,
+    geography_radius_miles: float | None = None,
 ):
+    """Fetch primary pharmacy addresses for exact distance scoring."""
     address_model = EntityAddressUnified if use_unified_addresses else NPIAddress
     # Keep the partial bbox index predicates visible in generic prepared plans.
     primary = literal("primary", literal_execute=True) if use_unified_addresses else "primary"
@@ -529,20 +577,34 @@ def _pharmacy_geo_stmt(
         address_model.npi.isnot(None),
         address_model.lat.isnot(None),
         address_model.long.isnot(None),
-        address_model.lat.between(lat_min, lat_max),
-        address_model.long.between(lng_min, lng_max),
     )
-    is_same_npi = NPIDataTaxonomy.npi == address_model.npi
+    spatial_filter = (
+        _pharmacy_geo_prefilter(lat, lng, lat_delta, lng_delta, geography_radius_miles)
+        if use_unified_addresses
+        else None
+    )
+    address_columns = address_model
+    has_exact_precision = func.coalesce(
+        EntityAddressUnified.address_precision, literal("", literal_execute=True)
+    ) != literal("city_zip", literal_execute=True)
+    if spatial_filter is not None:
+        # Keep the GiST candidate scan ahead of exact coordinate and taxonomy filters.
+        candidates = addresses.where(has_exact_precision, spatial_filter).offset(0).subquery()
+        address_columns = candidates.c
+        addresses = select(candidates)
+    addresses = addresses.where(
+        address_columns.lat.between(lat_min, lat_max),
+        address_columns.long.between(lng_min, lng_max),
+    )
+    is_same_npi = NPIDataTaxonomy.npi == address_columns.npi
     pharmacy_code = NPIDataTaxonomy.healthcare_provider_taxonomy_code.like("3336%")
     if not use_unified_addresses:
         return addresses.join(NPIDataTaxonomy, is_same_npi).where(pharmacy_code)
 
     # Check taxonomy only for nearby addresses. Score already deduplicates by NPI.
     pharmacy = select(NPIDataTaxonomy.npi).where(is_same_npi, pharmacy_code).limit(1).lateral()
-    return addresses.join(pharmacy, true()).where(
-        func.coalesce(EntityAddressUnified.address_precision, literal("", literal_execute=True))
-        != literal("city_zip", literal_execute=True)
-    )
+    addresses = addresses.join(pharmacy, true())
+    return addresses if spatial_filter is not None else addresses.where(has_exact_precision)
 
 
 @blueprint.get("/score")
@@ -905,6 +967,9 @@ async def get_site_score(request):
     if table_availability_by_name["npi_taxonomy"] and (
         use_unified_addresses or table_availability_by_name["npi_address"]
     ):
+        pharmacy_geo_radius = (
+            max_radius if use_unified_addresses and await _is_pharmacy_geo_index_available(session) else None
+        )
         pharmacy_rows = (
             await session.execute(
                 _pharmacy_geo_stmt(
@@ -913,6 +978,7 @@ async def get_site_score(request):
                     lng=lng,
                     lat_delta=lat_delta,
                     lng_delta=lng_delta,
+                    geography_radius_miles=pharmacy_geo_radius,
                 )
             )
         ).all()
