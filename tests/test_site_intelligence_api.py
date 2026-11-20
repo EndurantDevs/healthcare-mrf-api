@@ -208,6 +208,31 @@ def test_site_intelligence_pharmacy_geo_stmt_uses_unified_addresses(site_intel_m
     assert f"coalesce({address_table}.address_precision, '') != 'city_zip'" in sql
 
 
+@pytest.mark.parametrize(
+    ("lat", "lng", "radius", "use_spatial"),
+    [(39.0, -95.0, 5, True), (89.5, 30.0, 5, True), (89.99, 30.0, 5, False), (0, 179.99, 5, False)],
+)
+def test_site_intelligence_pharmacy_geo_prefilter_keeps_the_exact_coordinate_window(
+    site_intel_module, lat, lng, radius, use_spatial
+):
+    stmt = site_intel_module._pharmacy_geo_stmt(
+        use_unified_addresses=True,
+        lat=lat,
+        lng=lng,
+        lat_delta=0.07,
+        lng_delta=0.12,
+        geography_radius_miles=radius,
+    )
+    compiled = stmt.compile(dialect=asyncpg.dialect(), compile_kwargs={"render_postcompile": True})
+    sql = str(compiled).lower()
+
+    assert sql.count("::numeric") == 4
+    assert ("_st_expand" in sql) is use_spatial
+    if use_spatial:
+        assert "operator(public.&&)" in sql
+        assert sql.index("offset") < sql.index("between")
+
+
 @pytest.mark.asyncio
 async def test_site_intelligence_returns_trade_area_metrics(monkeypatch, site_intel_module):
     """Verify site intelligence returns trade area metrics."""

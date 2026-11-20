@@ -21,6 +21,8 @@ from tests.test_provider_directory_profile_initial_cleanup import BUILD, OWNER, 
 
 async def _dead_tail(database):
     """Allocate and delete a bounded tail while preserving the authentic incumbent row."""
+    # Keep this disposable table's dead tuples for the explicit fixture VACUUM.
+    await database.status("ALTER TABLE mrf.provider_directory_profile SET (autovacuum_enabled=false)")
     await database.status(
         """INSERT INTO mrf.provider_directory_profile
         SELECT npi+g, jsonb_build_object('padding',md5(g::text)||md5((g+1)::text)),evidence_json,
