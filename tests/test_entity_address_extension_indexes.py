@@ -53,3 +53,17 @@ def test_stage_and_live_index_plans_resolve_exact_public_extensions(name, elemen
         assert f"USING {index['using']} ({', '.join(elements)})" in statement
         if index.get("where"):
             assert statement.endswith(f" WHERE {index['where']};")
+
+
+def test_primary_covering_index_is_prepared_before_publication():
+    name = "geo_primary_bbox"
+    indexes = address.EntityAddressUnified.__my_additional_indexes__
+    staged_by_name = dict(
+        address._stage_index_statements(
+            address.EntityAddressUnified, "index_schema", indexes, {"complete_stage_indexes": True}
+        )
+    )
+    live_statements, skipped_indexes = address._post_publish_index_plan("index_schema", "all", build_concurrently=True)
+    assert "(lat, long) INCLUDE (npi) WHERE type = 'primary'" in staged_by_name[name]
+    assert name not in dict(live_statements)
+    assert not skipped_indexes

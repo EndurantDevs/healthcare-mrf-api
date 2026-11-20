@@ -8,12 +8,14 @@ import asyncio
 import importlib
 import os
 import re
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING
 
+from db.models.entity_address_unified import ENTITY_ADDRESS_PRIMARY_GEO_BBOX_INDEX
 from process import entity_address_preparation_admission as admitted
 from process import entity_address_prepared_doctors as prepared_doctors
 from process import entity_address_source_preparation as source_preparation
@@ -521,6 +523,7 @@ async def _require_stage_indexes(db_schema: str, stage_cls) -> None:
     index_names = [
         native._stage_index_name(stage_cls.__tablename__, index.get("name", "_".join(index["index_elements"])))
         for index in getattr(stage_cls, "__my_additional_indexes__", ())
+        if index.get("name") != ENTITY_ADDRESS_PRIMARY_GEO_BBOX_INDEX
     ]
     if not index_names:
         return
@@ -533,6 +536,29 @@ async def _require_stage_indexes(db_schema: str, stage_cls) -> None:
     )
     if valid_count != len(index_names):
         raise RuntimeError("entity-address preparation requires all serving indexes")
+
+
+async def analyze_staged_address_table(db_schema: str, stage_cls, *, context: dict, phase: str) -> None:
+    """Analyze the stage and prepare visibility for the optional covering index."""
+    native = _native()
+    table_name = stage_cls.__tablename__
+    relation = f"{db_schema}.{table_name}"
+    if getattr(stage_cls, "__main_table__", None) == native.EntityAddressUnified.__main_table__:
+        index_name = native._stage_index_name(table_name, ENTITY_ADDRESS_PRIMARY_GEO_BBOX_INDEX)
+        has_covering_index = await admitted.read_scalar(
+            native.db,
+            "SELECT EXISTS (SELECT 1 FROM pg_index WHERE indrelid=to_regclass(:relation) "
+            "AND indexrelid=to_regclass(:index) AND indisvalid)",
+            relation=relation,
+            index=f"{db_schema}.{index_name}",
+        )
+        if has_covering_index:
+            started = time.monotonic()
+            await native.db.execute_ddl(f"VACUUM (SKIP_LOCKED) {relation};")
+            native._record_phase_timing(
+                context, "entity-address-unified vacuuming staged main table", time.monotonic() - started, None
+            )
+    await native._run_sql_phase(f"ANALYZE {relation};", context=context, phase=phase)
 
 
 def _cutover_plan(db_schema, stage_cls, support_stage_class_map, context):
@@ -625,8 +651,9 @@ async def prepare_finalized_generation(db_schema, stage_cls, support_stage_class
     for swap in plan[0]:
         await _require_stage_indexes(db_schema, swap.stage_cls)
         await native._ensure_promoted_stage_logged(db_schema, swap.stage_cls.__tablename__)
-        await native._run_sql_phase(
-            f"ANALYZE {db_schema}.{swap.stage_cls.__tablename__};",
+        await analyze_staged_address_table(
+            db_schema,
+            swap.stage_cls,
             context=context,
             phase="entity-address-unified analyzing prepared table",
         )

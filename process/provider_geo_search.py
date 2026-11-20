@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 STATE_TABLE = "provider_geo_search_state"
 TABLE_PREFIX = "provider_geo_search_g"
 TABLE_NAME_PATTERN = re.compile(r"provider_geo_search_g[1-9][0-9]{0,17}\Z")
-SEARCH_COLUMNS = frozenset(
+LEGACY_SEARCH_COLUMNS = frozenset(
     {
         "npi",
         "address_key",
@@ -39,14 +39,16 @@ SEARCH_COLUMNS = frozenset(
         "geo",
     }
 )
+SEARCH_COLUMNS = LEGACY_SEARCH_COLUMNS | {"zip5", "postal_code"}
 # Same switch as api.endpoint.npi.GEO_SERVICE_LOCATIONS_ENV; a test keeps them equal.
 GEO_SERVICE_LOCATIONS_ENV = "HLTHPRT_GEO_INCLUDE_SERVICE_LOCATIONS"
 _SERVICE_LOCATION_TYPES = ("primary", "secondary", "practice", "site")
 _TYPE_RANK = (
     "CASE a.type WHEN 'primary' THEN 0 WHEN 'practice' THEN 1 WHEN 'site' THEN 2 WHEN 'secondary' THEN 3 ELSE 9 END"
 )
-# Bump when the projection columns change: readers ignore generations built with another layout.
-LAYOUT = 3
+# Publish the new column layout independently while readers can still use layout 3 for non-ZIP searches.
+LEGACY_LAYOUT = 3
+LAYOUT = 4
 # A generation without published origin (for example after a manual restore) has no usable identity.
 _GENERATION_KEY = (
     "CASE WHEN origin_lineage_id IS NOT NULL AND origin_generation IS NOT NULL THEN "
@@ -108,7 +110,7 @@ def _state(schema: str) -> str:
 _STAGE_COLUMNS = {
     "addresses": "npi bigint NOT NULL, address_key uuid NOT NULL, location_key text NOT NULL, "
     "lat numeric(11,8) NOT NULL, long numeric(11,8) NOT NULL, state_name text, type text NOT NULL, "
-    "address_precision text, taxonomy_array integer[]",
+    "address_precision text, taxonomy_array integer[], zip5 text, postal_code text",
     "npis": "npi bigint NOT NULL",
     "primary": "npi bigint NOT NULL, code text NOT NULL",
 }
@@ -129,7 +131,7 @@ def _copy_plans(schema: str, load_table: str, *, uses_service_locations: bool) -
             "a",
             f"""INSERT INTO {relation_by_stage["addresses"]}
 SELECT a.npi, a.address_key, a.location_key, a.lat, a.long, a.state_name, a.type, a.address_precision,
-       a.taxonomy_array
+       a.taxonomy_array, a.zip5, a.postal_code
   FROM {storage_relation(schema, "entity_address_unified")} AS a
  WHERE {{block_range}}
    AND a.npi IS NOT NULL
@@ -173,7 +175,8 @@ def _projection_sql(schema: str, load_table: str, table: str) -> str:
 WITH eligible AS (
     SELECT a.*,
            row_number() OVER (
-               PARTITION BY a.npi, a.address_key, a.lat, a.long, a.state_name, a.taxonomy_array
+               PARTITION BY a.npi, a.address_key, a.lat, a.long, a.state_name, a.taxonomy_array,
+                            COALESCE(a.zip5, LEFT(COALESCE(a.postal_code, ''), 5))
                ORDER BY {_TYPE_RANK}, a.location_key
            ) AS group_rank
       FROM {relation_by_stage["addresses"]} AS a
@@ -183,10 +186,10 @@ WITH eligible AS (
       FROM {relation_by_stage["primary"]} AS t
      GROUP BY t.npi
 ), placed AS (
-    -- One row per provider address, point and taxonomy set keeps the address row the live query would return;
-    -- only addresses with several such rows need a distinct count.
+    -- Keep the preferred row per provider address, point, taxonomy set and effective ZIP.
+    -- Use a distinct count for addresses with several such rows.
     SELECT e.npi, e.address_key, e.location_key, e.lat, e.long, e.state_name, e.type, e.address_precision,
-           e.taxonomy_array,
+           e.taxonomy_array, e.zip5, e.postal_code,
            primary_taxonomy.codes AS primary_taxonomy_codes,
            public.Geography(public.ST_MakePoint(e.long::double precision, e.lat::double precision)) AS geo,
            count(*) OVER (PARTITION BY e.npi, e.address_key) > 1 AS shares_identity

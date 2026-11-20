@@ -26,6 +26,7 @@ from db.models import (
     PharmacyEconomicsSummary,
     PricingPlacesZcta,
 )
+from db.models.entity_address_unified import ENTITY_ADDRESS_PRIMARY_GEO_BBOX_INDEX
 
 blueprint = Blueprint("site_intelligence", url_prefix="/site-intelligence", version=1)
 logger = logging.getLogger(__name__)
@@ -91,20 +92,29 @@ async def _is_table_cached(session, model) -> bool:
     return exists
 
 
-async def _is_pharmacy_geo_index_available(session) -> bool:
-    """Use the spatial candidate query only where the optional GiST index is available."""
+async def _should_use_pharmacy_geo_index(session) -> bool:
+    """Use GiST when a bounding-box index still needs to read heap pages."""
     if not hasattr(session, "get_bind"):
         return False
     table = EntityAddressUnified.__table__
-    index_name = f"{table.schema or 'mrf'}.{table.name}_idx_geo_idx"
+    index_prefix = f"{table.schema or 'mrf'}.{table.name}_idx_"
+    index_name = f"{index_prefix}geo_idx"
     now = time.monotonic()
     cached = _TABLE_EXISTS_CACHE.get(index_name)
     if cached and (now - cached[0]) < TABLE_EXISTS_CACHE_TTL_SECONDS:
         return cached[1]
-    result = await session.execute(
+    catalog_result = await session.execute(
         text(
             """
-            SELECT EXISTS (
+            SELECT NOT EXISTS (
+                       SELECT 1 FROM pg_catalog.pg_index AS idx
+                       JOIN pg_catalog.pg_class AS address ON address.oid = idx.indrelid
+                       WHERE idx.indexrelid = to_regclass(:covering_index)
+                         AND idx.indisvalid
+                         AND address.relallvisible = address.relpages
+                         AND address.relpages > 0
+                   )
+                   AND EXISTS (
                        SELECT 1 FROM pg_catalog.pg_index
                        WHERE indexrelid = to_regclass(:index_name) AND indisvalid
                    )
@@ -115,11 +125,11 @@ async def _is_pharmacy_geo_index_available(session) -> bool:
                    ELSE FALSE END
             """
         ),
-        {"index_name": index_name},
+        {"index_name": index_name, "covering_index": index_prefix + ENTITY_ADDRESS_PRIMARY_GEO_BBOX_INDEX},
     )
-    is_available = bool(result.scalar())
-    _TABLE_EXISTS_CACHE[index_name] = (now, is_available)
-    return is_available
+    use_geo_index = bool(catalog_result.scalar())
+    _TABLE_EXISTS_CACHE[index_name] = (now, use_geo_index)
+    return use_geo_index
 
 
 async def _is_zcta_overlap_available(session) -> bool:
@@ -968,7 +978,7 @@ async def get_site_score(request):
         use_unified_addresses or table_availability_by_name["npi_address"]
     ):
         pharmacy_geo_radius = (
-            max_radius if use_unified_addresses and await _is_pharmacy_geo_index_available(session) else None
+            max_radius if use_unified_addresses and await _should_use_pharmacy_geo_index(session) else None
         )
         pharmacy_rows = (
             await session.execute(

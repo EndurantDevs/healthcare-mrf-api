@@ -16,6 +16,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from api.endpoint import site_intelligence
 from db.connection import Database
 from tests.ptg2_serving_address_evidence_postgres_support import (
     _create_cms_address_table,
@@ -122,6 +123,37 @@ async def test_candidate_indexes_cannot_skip_missing_postgis(monkeypatch):
             await native._build_stage_index("geo_idx", "CREATE INDEX", {}, [])
     finally:
         preparation._PREPARATION.reset(token)
+
+
+async def test_site_score_switches_from_gist_after_covering_address_preparation(monkeypatch):
+    async with _temporary_schema() as (database, schema):
+        table_name = "entity_address_unified"
+        address_table = f"{schema}.{table_name}"
+        monkeypatch.setattr(native, "db", database)
+        monkeypatch.setattr(site_intelligence.EntityAddressUnified.__table__, "schema", schema)
+        monkeypatch.setattr(site_intelligence, "_TABLE_EXISTS_CACHE", {})
+        await database.status(f"CREATE TABLE {address_table} (npi bigint, lat numeric, long numeric);")
+        await database.status(f"INSERT INTO {address_table} VALUES (1000000001, 39, -95);")
+        await database.status(
+            f"CREATE INDEX {table_name}_idx_geo_idx ON {address_table} USING gist "
+            "(public.Geography(public.ST_MakePoint(long::double precision, lat::double precision)));"
+        )
+
+        async with database.session() as session:
+            assert await site_intelligence._should_use_pharmacy_geo_index(session)
+
+        index_name = native._stage_index_name(table_name, site_intelligence.ENTITY_ADDRESS_PRIMARY_GEO_BBOX_INDEX)
+        await database.status(f"CREATE INDEX {index_name} ON {address_table} (lat, long) INCLUDE (npi);")
+        site_intelligence._TABLE_EXISTS_CACHE.clear()
+        async with database.session() as session:
+            assert await site_intelligence._should_use_pharmacy_geo_index(session)
+
+        await preparation.analyze_staged_address_table(
+            schema, site_intelligence.EntityAddressUnified, context={}, phase="test staged address analysis"
+        )
+        site_intelligence._TABLE_EXISTS_CACHE.clear()
+        async with database.session() as session:
+            assert not await site_intelligence._should_use_pharmacy_geo_index(session)
 
 
 async def _candidate_tables(database, schema):

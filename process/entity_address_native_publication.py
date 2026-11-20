@@ -19,6 +19,7 @@ from sqlalchemy import ForeignKeyConstraint, MetaData, text
 from sqlalchemy.schema import CreateIndex, CreateTable
 
 from api import ptg2_geo_projection as projection
+from process import entity_address_candidate_preparation as candidate_preparation
 from process import entity_address_result_generation as generation
 from process.control_cancel import raise_if_cancelled
 from process.control_lifecycle import suppress_control_run_heartbeat_persistence
@@ -756,6 +757,12 @@ async def handoff_entity_address_generation(ctx, *, schema_name, import_date, de
     }
     _stage_names(schema_name, import_date)
     await _complete_indexes(schema_name, import_date)
+    await candidate_preparation.analyze_staged_address_table(
+        schema_name,
+        native.make_class(native.EntityAddressUnified, import_date),
+        context=ctx["context"],
+        phase="entity-address-unified analyzing staged main table",
+    )
     captured = None
     async with suppress_control_run_heartbeat_persistence(handoff_by_field["run_id"]):
         try:

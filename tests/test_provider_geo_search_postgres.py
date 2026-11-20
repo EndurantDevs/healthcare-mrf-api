@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from api.provider_geo_search import ProviderGeoSearch, current_provider_geo_search
 from api.provider_geo_sql import NearbySqlQuery, build_native_nearby_count_sql, build_native_nearby_sql
+from api.provider_list_sql import _address_zip5_filter
 from process import provider_geo_search as builder
 
 pytestmark = pytest.mark.provider_geo_search
@@ -30,7 +31,8 @@ CREATE SCHEMA mrf;
 CREATE ROLE {reader} NOLOGIN;
 CREATE TABLE mrf.entity_address_unified (
     location_key varchar(64) PRIMARY KEY, npi bigint, address_key uuid, lat numeric(11,8), long numeric(11,8),
-    state_name varchar, type varchar(32), address_precision varchar(32), taxonomy_array integer[], zip5 varchar(5));
+    state_name varchar, type varchar(32), address_precision varchar(32), taxonomy_array integer[], zip5 varchar(5),
+    postal_code varchar(20));
 CREATE TABLE mrf.npi (npi bigint PRIMARY KEY, entity_type_code integer, provider_last_name varchar);
 CREATE TABLE mrf.npi_taxonomy (npi bigint, healthcare_provider_taxonomy_code varchar,
     healthcare_provider_primary_taxonomy_switch varchar);
@@ -203,6 +205,42 @@ async def test_projection_answers_exactly_like_the_address_table(geo_db):
             projected_answers = await _answers(read, search, parameters_by_name, **options)
             assert projected_answers == live_answers, (parameters_by_name, options)
             assert live_answers[0] > 0 or "General Practice" in str(parameters_by_name)
+
+
+@pytest.mark.asyncio
+async def test_zip_projection_keeps_aliases_with_distinct_effective_zips(geo_db):
+    await geo_db.connection.execute("""
+        UPDATE mrf.entity_address_unified
+           SET zip5 = '60603', postal_code = '60604-0000'
+         WHERE location_key = 'loc-4-a';
+        INSERT INTO mrf.entity_address_unified
+            (location_key, npi, address_key, lat, long, state_name, type, taxonomy_array, postal_code)
+        SELECT 'loc-4-primary', npi, address_key, lat, long, state_name, 'primary', taxonomy_array, '60601-1234'
+          FROM mrf.entity_address_unified WHERE location_key = 'loc-4-a';
+    """)
+    assert (await builder.rebuild_provider_geo_search(geo_db.connection, uses_service_locations=True))[
+        "status"
+    ] == "published"
+    zip_filter = _address_zip5_filter("a", "mrf.entity_address_unified", any_array=True)
+    async with geo_db.engine.connect() as connection:
+        read = _ReadConnection(connection)
+        search = await _lookup(read)
+        assert search is not None
+        for zip_codes, expected_location in (
+            (["60603"], "loc-4-a"),
+            (["60601"], "loc-4-primary"),
+            (["60601", "60603"], "loc-4-primary"),
+            (["60604"], None),
+        ):
+            parameters_by_name = {**_CHICAGO, "radius": 10.0, "zip_codes": zip_codes}
+            live = await _answers(read, None, parameters_by_name, extra_clause=f"\n AND {zip_filter}")
+            projected = await _answers(read, search, parameters_by_name, extra_clause=f"\n AND {zip_filter}")
+            assert projected == live
+            if expected_location is None:
+                assert projected == (0, [])
+            else:
+                assert projected[0] == 1
+                assert projected[1][0][1][0] == expected_location
 
 
 @pytest.mark.asyncio

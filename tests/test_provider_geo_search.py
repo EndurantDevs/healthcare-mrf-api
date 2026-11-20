@@ -45,7 +45,11 @@ def test_projection_is_used_only_for_its_own_columns():
         _PROJECTION.table_sql
     )
     assert provider_geo_search_sql(_PROJECTION, "AND a.plans_network_array && (:plan_network_array)", "") is None
-    assert provider_geo_search_sql(_PROJECTION, "AND COALESCE(a.zip5, LEFT(a.postal_code, 5)) = ANY(:z)", "") is None
+    zip_clause = "AND COALESCE(a.zip5, LEFT(COALESCE(a.postal_code, ''), 5)) = ANY(:z)"
+    assert provider_geo_search_sql(_PROJECTION, zip_clause) == _PROJECTION.table_sql
+    legacy = replace(_PROJECTION, layout=provider_geo_search.LEGACY_LAYOUT)
+    assert provider_geo_search_sql(legacy, zip_clause) is None
+    assert provider_geo_search_sql(legacy, "AND a.state_name = :state") == legacy.table_sql
     assert provider_geo_search_sql(None, "", "") is None
 
 
@@ -114,7 +118,10 @@ def test_native_zip_page_keeps_exact_postal_fallback_with_zip_prefilter():
 
 def test_nearby_query_prefers_the_network_projection(monkeypatch):
     assert nearby_search_fields("(network projection)", _PROJECTION) == {"search_table_sql": "(network projection)"}
-    assert nearby_search_fields(None, _PROJECTION, "AND a.zip5 = :z") == {"search_table_sql": None}
+    assert nearby_search_fields(None, _PROJECTION, "AND a.zip5 = :z") == {
+        "search_table_sql": _PROJECTION.table_sql,
+        "search_provider_facts": True,
+    }
     assert nearby_search_fields(None, _PROJECTION) == {
         "search_table_sql": _PROJECTION.table_sql,
         "search_provider_facts": True,
@@ -147,20 +154,30 @@ async def test_lookup_serves_only_a_fresh_current_generation(caplog):
     missing = _Rows([(False,)])
     assert await current_provider_geo_search(missing, "mrf", include_service_locations=True) is None
 
-    fresh = _Rows([(True,)], [("provider_geo_search_g3", True)])
+    fresh = _Rows([(True,)], [("provider_geo_search_g3", provider_geo_search.LAYOUT, True)])
     assert await current_provider_geo_search(fresh, "mrf", include_service_locations=True) == ProviderGeoSearch(
         '"mrf".provider_geo_search_g3'
     )
     guard_sql, guard_parameters = fresh.statements[1]
     assert "entity_address_result_generation" in guard_sql and "npi_result_generation" in guard_sql
-    assert guard_parameters == {"include_service_locations": True, "schema": "mrf", "layout": 3}
+    assert guard_parameters == {
+        "include_service_locations": True,
+        "schema": "mrf",
+        "layout": provider_geo_search.LAYOUT,
+        "legacy_layout": provider_geo_search.LEGACY_LAYOUT,
+    }
     pin_sql, pin_parameters = fresh.statements[0]
     assert pin_sql.startswith("SELECT pg_try_advisory_xact_lock_shared(:retire_lock) AND")
     assert pin_parameters["retire_lock"] == provider_geo_search.RETIRE_LOCK_ID
-    assert "s.layout = :layout" in guard_sql
+    assert "s.layout IN (:layout, :legacy_layout)" in guard_sql
     assert "has_table_privilege(" in guard_sql
 
-    stale = _Rows([(True,)], [("provider_geo_search_g4", False)])
+    legacy = _Rows([(True,)], [("provider_geo_search_g2", provider_geo_search.LEGACY_LAYOUT, True)])
+    assert await current_provider_geo_search(legacy, "mrf", include_service_locations=True) == ProviderGeoSearch(
+        '"mrf".provider_geo_search_g2', provider_geo_search.LEGACY_LAYOUT
+    )
+
+    stale = _Rows([(True,)], [("provider_geo_search_g4", provider_geo_search.LAYOUT, False)])
     assert await current_provider_geo_search(stale, "mrf", include_service_locations=True) is None
     assert "provider_geo_search_g4 is not readable for the published inputs" in caplog.text
 
@@ -172,7 +189,9 @@ async def test_lookup_serves_only_a_fresh_current_generation(caplog):
 
     with pytest.raises(ValueError, match="provider_geo_search_table_invalid"):
         await current_provider_geo_search(
-            _Rows([(True,)], [("other_table", True)]), "mrf", include_service_locations=True
+            _Rows([(True,)], [("other_table", provider_geo_search.LAYOUT, True)]),
+            "mrf",
+            include_service_locations=True,
         )
 
 
@@ -234,7 +253,7 @@ async def test_projection_is_looked_up_only_for_unscoped_unified_reads(monkeypat
     @asynccontextmanager
     async def connection_scope():
         opened_scopes.append(True)
-        yield _Rows([(True,)], [("provider_geo_search_g2", True)])
+        yield _Rows([(True,)], [("provider_geo_search_g2", provider_geo_search.LAYOUT, True)])
 
     lookup_by_name = {"schema": "mrf", "include_service_locations": True}
     assert await request_geo_search(connection_scope(), "mrf.npi_address", **lookup_by_name) is None
