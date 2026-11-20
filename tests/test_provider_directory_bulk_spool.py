@@ -753,3 +753,100 @@ async def test_spawned_native_worker_stages_what_python_stages(grouped_source, m
     assert [marker["rows"] for marker in python_markers] == [120, 120]
     assert all(marker["fallbacks"] == {} for marker in native_markers)
     assert [marker["fallbacks"] for marker in python_markers] == [{"native_unavailable": 120}] * 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("first_batch", "invalid_ndjson"),
+        ("last_batch", "invalid_ndjson"),
+        ("length", "bulk_export_output_length_mismatch"),
+        ("cancel", "bulk_export_group_cancelled"),
+    ],
+)
+async def test_unfinished_group_preserves_the_saved_copy(grouped_source, monkeypatch, failure, expected):
+    manifest, checkpoints = _two_output_export(monkeypatch, "https://files.example/output", ("streaming",))
+    ledger = _Ledger()
+    _grouped_fakes(monkeypatch, ledger)
+    validator = _validator(len(ROLE_BODY))
+    saved = spool.spooled_output(CHECKPOINT_ID, 0, validator).path
+    body = ROLE_BODY
+    if failure == "first_batch":
+        body = b"bad\n" + body
+    elif failure == "last_batch":
+        body += b"bad\n"
+    elif failure == "length":
+        body += ROLE_BODY.splitlines(keepends=True)[0]
+    else:
+        prepare = grouped_load._prepare_batch
+
+        def cancel_after_prepare(*args):
+            result = prepare(*args)
+            grouped_load._WORKER_STATE_BY_NAME["cancel"].set()
+            return result
+
+        monkeypatch.setattr(grouped_load, "_prepare_batch", cancel_after_prepare)
+
+    saved.parent.mkdir(parents=True)
+    saved.write_bytes(spool.zstd.compress(body))
+    assert await _run_grouped(None, grouped_source, _grouped_identity(), manifest, checkpoints, ledger) == [expected]
+    assert spool.zstd.decompress(saved.read_bytes()) == body
+    assert not grouping.is_grouped(spool.group_directory(CHECKPOINT_ID), 0)
+    assert ledger.staged_rows == [] and ledger.completions == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remaining", [1, 2])
+async def test_invalid_partition_stops_ordered_load_and_preserves_markers(grouped_source, monkeypatch, remaining):
+    monkeypatch.setenv(grouped_load.WORKERS_ENV, "2")
+    root = spool.group_directory(CHECKPOINT_ID)
+    root.mkdir(parents=True)
+    # The saved output is complete but was grouped with a different partition count.
+    grouping.GroupWriter(root, 0, grouping.PARTITIONS + 1).finish(0)
+    for partition in range(grouping.PARTITIONS - remaining):
+        grouping.mark_loaded(root, partition)
+    manifest, checkpoints = _two_output_export(monkeypatch, "https://files.example/output", ("streaming",))
+    ledger = _Ledger()
+    _grouped_fakes(monkeypatch, ledger)
+    assert await _run_grouped(None, grouped_source, _grouped_identity(), manifest, checkpoints, ledger) == [
+        "provider_directory_bulk_group_partitions_changed"
+    ]
+    assert [grouping.is_loaded(root, n) for n in range(grouping.PARTITIONS)] == [
+        n < grouping.PARTITIONS - remaining for n in range(grouping.PARTITIONS)
+    ]
+    assert grouping.is_grouped(root, 0)
+    assert ledger.staged_rows == [] and ledger.completions == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["previous_progress", "missing_validator"])
+async def test_grouped_export_refuses_unusable_checkpoint_before_download(grouped_source, monkeypatch, failure):
+    manifest, checkpoints = _two_output_export(monkeypatch, "https://files.example/output", ("streaming",))
+    ledger = _Ledger()
+    _grouped_fakes(monkeypatch, ledger)
+    if failure == "previous_progress":
+        checkpoints[0]["committed_bytes"] = 1
+        expected = "bulk_export_group_mode_changed"
+    else:
+        monkeypatch.setattr(directory, "_stored_bulk_output_validator", lambda _: None)
+        expected = "bulk_export_spool_validator_missing"
+    assert await _run_grouped(None, grouped_source, _grouped_identity(), manifest, checkpoints, ledger) == [expected]
+    root = spool.group_directory(CHECKPOINT_ID)
+    assert (root / "mode").exists() == (failure == "missing_validator")
+    assert not grouping.is_grouped(root, 0)
+    assert ledger.staged_rows == [] and ledger.completions == {}
+
+
+def test_group_workers_reserves_one_cpu_and_handles_an_unlimited_quota(monkeypatch, tmp_path):
+    quota = tmp_path / "cpu.max"
+    monkeypatch.delenv(grouped_load.WORKERS_ENV, raising=False)
+    monkeypatch.setattr(grouped_load, "Path", lambda _: quota)
+    quota.write_text("400000 100000")
+    assert grouped_load.group_workers() == 3
+    quota.write_text("max 100000")
+    assert grouped_load.group_workers() == 1
+
+    monkeypatch.setenv(grouped_load.WORKERS_ENV, "-1")
+    with pytest.raises(ValueError, match="bulk_export_group_workers_invalid"):
+        grouped_load.group_workers()

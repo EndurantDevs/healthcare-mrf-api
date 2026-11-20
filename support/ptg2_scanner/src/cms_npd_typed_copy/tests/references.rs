@@ -161,3 +161,116 @@ fn cms_npd_typed_copy_rejects_bad_nested_references() {
         );
     }
 }
+
+#[test]
+fn cms_npd_typed_copy_rejects_invalid_directory_references_and_dates() {
+    let org = json!({"reference": "Organization/Organization-example"});
+    let wrong_org = json!({"reference": "Location/Location-example"});
+    let bad_date = json!({"lastUpdated": "tomorrow"});
+    let cases = [
+        (
+            "Location",
+            json!({"partOf": org}),
+            "invalid Location reference",
+        ),
+        (
+            "Endpoint",
+            json!({"managingOrganization": wrong_org}),
+            "invalid Organization reference",
+        ),
+        (
+            "HealthcareService",
+            json!({"providedBy": wrong_org}),
+            "invalid Organization reference",
+        ),
+        (
+            "HealthcareService",
+            json!({"location": [org]}),
+            "invalid Location reference",
+        ),
+        (
+            "InsurancePlan",
+            json!({"network": [wrong_org]}),
+            "invalid Organization reference",
+        ),
+        (
+            "InsurancePlan",
+            json!({"coverageArea": [org]}),
+            "invalid Location reference",
+        ),
+        (
+            "InsurancePlan",
+            json!({"period": {"end": "2026-02-30"}}),
+            "invalid date",
+        ),
+        (
+            "OrganizationAffiliation",
+            json!({"organization": wrong_org}),
+            "invalid Organization reference",
+        ),
+        (
+            "OrganizationAffiliation",
+            json!({"participatingOrganization": wrong_org}),
+            "invalid Organization reference",
+        ),
+        (
+            "OrganizationAffiliation",
+            json!({"network": [wrong_org]}),
+            "invalid Organization reference",
+        ),
+        ("Endpoint", json!({"meta": bad_date}), "invalid timestamp"),
+        (
+            "HealthcareService",
+            json!({"meta": bad_date}),
+            "invalid timestamp",
+        ),
+        (
+            "OrganizationAffiliation",
+            json!({"meta": bad_date}),
+            "invalid timestamp",
+        ),
+    ];
+    for (resource, mut record, reason) in cases {
+        record["resourceType"] = json!(resource);
+        record["id"] = json!(format!("{resource}-{U1}"));
+        let error = super::encode_line(resource, &record.to_string())
+            .err()
+            .unwrap_or_else(|| panic!("accepted invalid {resource} record: {record}"));
+        assert!(error.contains(reason), "{error} does not contain {reason}");
+    }
+}
+
+#[test]
+fn cms_npd_typed_copy_rejects_text_that_postgres_cannot_store() {
+    let invalid = "text\0with a NUL";
+    let cases = [
+        ("Location", json!({"name": invalid})),
+        ("Location", json!({"description": invalid})),
+        ("Location", json!({"status": invalid})),
+        ("Location", json!({"address": {"city": invalid}})),
+        (
+            "Location",
+            json!({"telecom": [{"system": "phone", "value": invalid}]}),
+        ),
+        ("Endpoint", json!({"connectionType": {"code": invalid}})),
+        ("Endpoint", json!({"address": invalid})),
+        ("Endpoint", json!({"name": invalid})),
+        ("Endpoint", json!({"status": invalid})),
+        ("InsurancePlan", json!({"name": invalid})),
+        ("InsurancePlan", json!({"status": invalid})),
+        ("InsurancePlan", json!({"alias": [invalid]})),
+        ("InsurancePlan", json!({"type": [{"text": invalid}]})),
+        (
+            "OrganizationAffiliation",
+            json!({"code": [{"coding": [{"code": invalid}]}]}),
+        ),
+    ];
+    for (resource, mut record) in cases {
+        record["resourceType"] = json!(resource);
+        record["id"] = json!(format!("{resource}-{U1}"));
+        let error = super::encode_line(resource, &record.to_string())
+            .err()
+            .unwrap_or_else(|| panic!("accepted invalid {resource} text: {record}"));
+        assert!(error.contains("NUL character"), "unexpected error: {error}");
+    }
+}
