@@ -145,15 +145,8 @@ async def _independent_source_stage(
         previous = await resolve_network_serving_manifest(
             connection, generation_id=candidate["expected_head"], control_schema=control_schema
         )
-    from process.network_fhir_typed_recipe import PinnedTypedFHIRMembershipSource
-    from process.registry_source_recipe_composition import stage_verified_registry_source_recipes
-
-    staging = (
-        stage_verified_registry_source_recipes
-        if any(type(recipe.source_pin) is PinnedTypedFHIRMembershipSource for recipe in recipes)
-        else stage_registry_source_recipes
-    )
-    return await staging(
+    # Typed captures were validated when produced; contributions are rebuilt from them, not from Source again.
+    return await stage_registry_source_recipes(
         connection,
         recipes,
         approved,

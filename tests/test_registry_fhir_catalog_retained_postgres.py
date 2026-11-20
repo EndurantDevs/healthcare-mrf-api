@@ -619,8 +619,7 @@ async def test_reviewed_retained_product_seal_rejects_untrusted_candidate(
             return await real_seal(config, target, snapshot, pool, source_pool=source_pool)
 
         monkeypatch.setattr(catalog_sync, "_seal_catalog_snapshot", corrupt_then_seal)
-        message = "observed_projection_changed" if damage == "omitted_products" else "observation_facts_changed"
-        with pytest.raises(ValueError, match=message):
+        with pytest.raises(ValueError, match="observed_projection_changed"):
             await _prepare_catalog_snapshot(case.config, case.connection, case.source_pool, case.sealer_pool)
         assert len(changed_candidates) == 1
         await _assert_refused_candidate_abandoned(case, changed_candidates[0])

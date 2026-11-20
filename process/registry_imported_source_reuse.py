@@ -101,7 +101,7 @@ def has_imported_capture_policy_date(capture):
 
 
 def is_compatible_typed_recipe(recipe, descriptor, observed_date):
-    """Reuse only exact data semantics; the downstream retained proof remains independent."""
+    """Reuse only exact data semantics; without a date, a retained capture keeps its own membership date."""
     if type(recipe.source_pin) is not PinnedTypedFHIRMembershipSource:
         return False
     pin = recipe.source_pin
@@ -109,7 +109,7 @@ def is_compatible_typed_recipe(recipe, descriptor, observed_date):
     membership_as_of = graph["origin"]["semantic_projection_as_of"] or observed_date
     return (
         source_edition(pin.catalog_descriptor) == source_edition(descriptor)
-        and graph["membership_as_of"] == membership_as_of
+        and (observed_date is None or graph["membership_as_of"] == membership_as_of)
         and {name: graph.get(name) for name in graph_policy(descriptor["coordinates"]["source_id"])}
         == graph_policy(descriptor["coordinates"]["source_id"])
     )

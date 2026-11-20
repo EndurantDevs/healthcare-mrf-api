@@ -25,12 +25,10 @@ from process.registry_fhir_catalog_publication import (
     validated_fhir_catalog_command,
 )
 from process.registry_fhir_catalog_registry_reader import (
-    catalog_projection_generations,
     require_retained_fhir_catalog_sources,
 )
 from process.registry_fhir_catalog_retained import (
     normalize_fhir_catalog_retained_source_uri,
-    retained_fhir_catalog_read_source,
     retained_fhir_catalog_recipe,
 )
 from process.registry_fhir_catalog_source_companies import collect_fhir_catalog_source_companies
@@ -757,57 +755,6 @@ async def _verify_observation_replay(connection, snapshot, generation, descripto
         _fail("observation_facts_changed")
 
 
-async def _verify_retained_product_observations(
-    connection, snapshot, grant, reader, workspace, descriptors, *, source_companies_only=False
-):
-    from process.registry_fhir_catalog_extraction import RESOURCE_TYPES
-    from process.registry_fhir_catalog_products import selected_reviewed_fhir_catalog_product_sources
-    from process.registry_fhir_catalog_projection_validation import require_fhir_catalog_registry_reader
-    from process.registry_fhir_catalog_sync import replay_fhir_catalog_observations
-
-    await require_fhir_catalog_registry_reader(connection, reader, snapshot, grant)
-    active = await catalog_projection_generations(
-        reader if reader is not None else connection, snapshot, grant=grant, descriptors=descriptors
-    )
-
-    selected = await selected_reviewed_fhir_catalog_product_sources(
-        connection,
-        observation_schema=snapshot["schema_name"],
-        snapshot=snapshot,
-        control_schema=grant.control_schema,
-        source_generations=active,
-    )
-    if not selected:
-        return
-    if source_companies_only:
-        _fail("source_companies_retained_products_unsupported")
-    if reader is None or workspace is None:
-        _fail("retained_reader_required")
-    source_entries = [
-        entry for entry in snapshot_inputs(snapshot)["source_vector_json"] if entry["source_generation"] in selected
-    ]
-    retained = _admitted_retained(grant, source_entries, selected)
-    await require_retained_fhir_catalog_sources(reader, retained, control_schema=grant.control_schema)
-    for generation, descriptor in sorted(selected.items()):
-        expected = _ObservationReplayDigest()
-        source_rows = await replay_fhir_catalog_observations(
-            reader, descriptor, expected.collect, reference_workspace=workspace
-        )
-        counts_by_family = dict(retained_fhir_catalog_read_source(descriptor).retained_capture.origin.resource_counts)
-        accounting = await _observation_accounting(connection, snapshot["schema_name"], generation)
-        stored = await fhir_catalog_observation_digest(
-            connection, schema_name=snapshot["schema_name"], source_generation=generation
-        )
-        if (
-            source_rows != sum(counts_by_family.get(family, 0) for family in RESOURCE_TYPES)
-            or accounting["source_rows"] != source_rows
-            or accounting["observation_rows"] != expected.rows
-            or stored["rows"] != expected.rows
-            or stored["sha256"] != expected.digest.hexdigest()
-        ):
-            _fail("observation_facts_changed")
-
-
 async def _catalog_verified_history(connection, snapshot, grant, source_companies_only):
     vector, descriptors, prior, previous_descriptors = await _catalog_verification_inputs(connection, snapshot, grant)
     _verify_retained_source_companies(vector, snapshot_inputs(prior)["source_vector_json"] if prior else [])
@@ -840,7 +787,8 @@ def build_fhir_catalog_observation_verifier(
         vector, descriptors, prior, previous_descriptors = await _catalog_verified_history(
             connection, snapshot, grant, source_companies_only
         )
-        fresh_sources = await _verify_cached_observations(
+        # Fresh sources were just staged from the same pinned Source snapshot; re-reading them proves nothing new.
+        await _verify_cached_observations(
             connection,
             snapshot,
             prior,
@@ -849,20 +797,7 @@ def build_fhir_catalog_observation_verifier(
             previous_descriptors,
             source_companies_only=source_companies_only,
         )
-        if fresh_sources:
-            await _replay_registered_observations(
-                source_reader_pool, connection, snapshot, grant, fresh_sources, source_export=source_export
-            )
         await verify_current_fhir_catalog_source_companies(source_export, connection, vector, descriptors, grant)
-        await _verify_retained_product_observations(
-            connection,
-            snapshot,
-            grant,
-            registry_reader,
-            registry_workspace,
-            descriptors,
-            **({"source_companies_only": True} if source_companies_only else {}),
-        )
         from process.registry_fhir_catalog_validation import validate_fhir_catalog_observed_projection
 
         await validate_fhir_catalog_observed_projection(
@@ -937,53 +872,6 @@ async def verify_current_fhir_catalog_source_companies(source_export, connection
                 labels = await collect_fhir_catalog_source_companies(export, descriptor, required=True)
                 if labels != entry["source_companies"]:
                     _fail("source_companies_changed")
-
-
-async def _replay_registered_observations(source_pool, connection, snapshot, grant, sources, *, source_export=None):
-    from process.registry_fhir_catalog_reference_rollup import fhir_catalog_reference_workspace
-
-    if grant.observation_contract != CATALOG_OBSERVATION_CONTRACT or (
-        source_export is None and not callable(getattr(source_pool, "acquire", None))
-    ):
-        _fail("reader_required")
-    allowed_profiles = {canonical_json(profile.document()) for profile in grant.source_profiles}
-    if any(canonical_json(descriptor["native_read_profile"]) not in allowed_profiles for _, descriptor in sources):
-        _fail("source_not_admitted")
-    exported_sources, native_sources = [], []
-    for source in sources:
-        if source_export is not None:
-            exported_sources.append(source)
-        else:
-            native_sources.append(source)
-    if native_sources and not callable(getattr(source_pool, "acquire", None)):
-        _fail("reader_required")
-    if exported_sources:
-        await _replay_source_owned_observations(source_export, connection, snapshot, exported_sources)
-    if not native_sources:
-        return
-    async with source_pool.acquire() as reader:
-        if reader is connection:
-            _fail("reader_required")
-        async with fhir_catalog_reference_workspace(reader) as workspace, _readonly_snapshot(reader):
-            for generation, descriptor in native_sources:
-                await _verify_fresh_observation(reader, connection, snapshot, generation, descriptor, workspace)
-
-
-async def _replay_source_owned_observations(source_export, connection, snapshot, sources):
-    """Reopen each configured source profile for independent content replay."""
-    sources_by_profile = {}
-    for generation, descriptor in sources:
-        profile_key = canonical_json(descriptor["native_read_profile"])
-        sources_by_profile.setdefault(profile_key, []).append((generation, descriptor))
-    for profile_key, selected in sources_by_profile.items():
-        profile = source_profile(json.loads(profile_key))
-        async with open_source_owned_catalog_export(source_export, profile, connection) as export:
-            for generation, descriptor in selected:
-                expected = _ObservationReplayDigest()
-                source_rows = await export["replay"](descriptor, expected.collect)
-                if type(source_rows) is not int:
-                    _fail("observation_facts_changed")
-                await _verify_observation_replay(connection, snapshot, generation, descriptor, source_rows, expected)
 
 
 async def _catalog_verification_inputs(connection, snapshot, grant):

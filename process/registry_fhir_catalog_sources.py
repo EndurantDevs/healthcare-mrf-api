@@ -377,9 +377,18 @@ def _validate_content_admission_scope(admission, descriptor, count):
         _digest(completion)
 
 
+_LEGACY_DESCRIPTOR_FIELDS = frozenset(
+    {"resource_table_oid", "resource_leaf_oids", "header_table_oid", "database_oid", "native_catalog_sha256"}
+)
+
+
 def fhir_catalog_source_generation(descriptor):
     """Hash stable accepted evidence; freshness timestamps remain outside this identity."""
-    return fhir_catalog_source_digest(validate_fhir_catalog_source_descriptor(descriptor))
+    validated = validate_fhir_catalog_source_descriptor(descriptor)
+    if type(descriptor) is dict and not _LEGACY_DESCRIPTOR_FIELDS.isdisjoint(descriptor):
+        # Rows stored before physical fields left descriptors keep the generation of their stored form.
+        return fhir_catalog_source_digest(descriptor)
+    return fhir_catalog_source_digest(validated)
 
 
 def fhir_catalog_source_digest(descriptor):

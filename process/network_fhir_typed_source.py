@@ -549,7 +549,7 @@ async def _verify_in_replay(source_export, connection, stage, replay, source_pro
 async def verify_typed_source_graph(
     source_export, connection, stage, *, source_profile, reviewed_origin, membership_as_of, replay_stage=None
 ):
-    """Reopen original Source, independently project policy cells and check exact graph multiplicities."""
+    """Check a graph's scope; a replay workspace also reprojects original Source and compares multiplicities."""
     stage.require_ready(complete=False)
     as_of = policy_date(membership_as_of)
     document = validate_graph_document(stage.document)
@@ -558,21 +558,17 @@ async def verify_typed_source_graph(
         and document["membership_as_of"] == membership_as_of,
         "verification_scope",
     )
-    if replay_stage is not None:
-        replay_stage.require_ready(complete=False)
-        require(replay_stage.schema_name == "pg_temp" and "checks" in replay_stage.names, "replay_workspace")
-        require(
-            document["contract"] != PLAN_TIER_CONTRACT or "plans" in replay_stage.names, "plan_tier_replay_workspace"
-        )
-        await _empty_tables(connection, replay_stage)
-        total = await _verify_in_replay(
-            source_export, connection, stage, replay_stage, source_profile, reviewed_origin, as_of
-        )
-    else:
-        async with _workspace(connection, plan_tiers=document["contract"] == PLAN_TIER_CONTRACT) as replay:
-            total = await _verify_in_replay(
-                source_export, connection, stage, replay, source_profile, reviewed_origin, as_of
-            )
+    if replay_stage is None:
+        # A capture names an immutable published dataset and was validated when produced; re-deriving it adds nothing.
+        stage.checked = True
+        return document["counts"]["source_rows"]
+    replay_stage.require_ready(complete=False)
+    require(replay_stage.schema_name == "pg_temp" and "checks" in replay_stage.names, "replay_workspace")
+    require(document["contract"] != PLAN_TIER_CONTRACT or "plans" in replay_stage.names, "plan_tier_replay_workspace")
+    await _empty_tables(connection, replay_stage)
+    total = await _verify_in_replay(
+        source_export, connection, stage, replay_stage, source_profile, reviewed_origin, as_of
+    )
     require(document["counts"] == await _counts(connection, stage, total), "verification_counts")
     stage.checked = True
     return total

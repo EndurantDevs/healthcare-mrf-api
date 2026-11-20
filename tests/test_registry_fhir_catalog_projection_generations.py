@@ -45,15 +45,21 @@ async def test_projection_order_uses_granted_retained_sources_and_current_source
 
 
 @pytest.mark.asyncio
-async def test_projection_rejects_an_omitted_actively_granted_generation(monkeypatch):
-    monkeypatch.setattr(
-        sync, "_retained_catalog_sources", AsyncMock(return_value=(SimpleNamespace(descriptor="active"),))
-    )
+async def test_projection_skips_superseded_retained_captures_but_requires_current_sources(monkeypatch):
+    retained_sources = (SimpleNamespace(descriptor="superseded"), SimpleNamespace(descriptor="kept"))
+    monkeypatch.setattr(sync, "_retained_catalog_sources", AsyncMock(return_value=retained_sources))
     monkeypatch.setattr(sync, "fhir_catalog_source_generation", lambda descriptor: descriptor)
-    snapshot_by_field = {"network_generation": None, "source_vector_json": []}
+    snapshot_by_field = {
+        "network_generation": None,
+        "source_vector_json": [{"source_generation": "current", "status": "current"}],
+    }
+    descriptors_by_generation = {name: {"profile": "published_normalized"} for name in ("current", "kept")}
+    assert await sync.resolve_fhir_catalog_projection_generations(
+        object(), snapshot_by_field, grant=object(), descriptors=descriptors_by_generation
+    ) == ("current", "kept")
     with pytest.raises(ValueError, match="projection_source_missing"):
         await sync.resolve_fhir_catalog_projection_generations(
-            object(), snapshot_by_field, grant=object(), descriptors={}
+            object(), snapshot_by_field, grant=object(), descriptors={"kept": descriptors_by_generation["kept"]}
         )
 
 

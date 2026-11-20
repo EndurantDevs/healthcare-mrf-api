@@ -150,9 +150,8 @@ async def prepare_imported_source_recipes(connection, *, request_id, envelope, s
         effective_date = current_imported_effective_date(observed_at[:10])
         recipes, created, reused = [], [], []
         for descriptor in descriptors:
-            matching_recipes = [
-                recipe for recipe in previous if is_compatible_typed_recipe(recipe, descriptor, effective_date)
-            ]
+            # A published edition is immutable: keep its capture on later days instead of capturing it again.
+            matching_recipes = [recipe for recipe in previous if is_compatible_typed_recipe(recipe, descriptor, None)]
             if len(matching_recipes) > 1:
                 raise ValueError("registry_imported_preparation_predecessor_ambiguous")
             recipe, is_new = (

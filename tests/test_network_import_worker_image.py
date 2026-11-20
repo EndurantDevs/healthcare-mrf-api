@@ -20,6 +20,12 @@ def test_image_requires_real_network_admission_and_immutable_server_configuratio
     admitted = _admitted(request, recorded)
     assert configured_network_import_image(spec, admitted) == IMAGE
     assert workers._configured_worker_job_image(spec, admitted) == IMAGE
+    environment, _run_id = workers._worker_job_environment(spec, admitted)
+    assert {"name": "HLTHPRT_PTG_CANDIDATE_AUDIT_JOB_TIMEOUT", "value": "172800"} in environment
+    assert not any(
+        entry["name"] == "HLTHPRT_PTG_CANDIDATE_AUDIT_JOB_TIMEOUT"
+        for entry in workers._worker_job_environment(spec, request)[0]
+    )
     monkeypatch.setenv(IMAGE_ENV, "registry.example/retained-worker:latest")
     with pytest.raises(ValueError, match="image_invalid"):
         configured_network_import_image(spec, admitted)

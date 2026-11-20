@@ -44,7 +44,7 @@ async def test_retained_typed_replay_keeps_original_inputs_and_cleans_after_inte
     pin = AsyncMock(return_value=approved)
     monkeypatch.setattr(preservation, "pin_retained_approved_membership_source", pin)
     stage_rows = AsyncMock(return_value=stage)
-    monkeypatch.setattr(staging, "stage_verified_typed_source_recipes", stage_rows)
+    monkeypatch.setattr(staging, "stage_typed_source_recipes", stage_rows)
     error = failure("retained replay interrupted") if failure else None
     monkeypatch.setattr(preservation, "_carried_typed_mapping_parity", AsyncMock(side_effect=error))
     discard = AsyncMock()

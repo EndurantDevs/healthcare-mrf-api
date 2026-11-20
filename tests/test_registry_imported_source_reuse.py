@@ -58,6 +58,19 @@ async def test_unchanged_source_keeps_exact_original_recipe_without_export(prepa
 
 
 @pytest.mark.asyncio
+async def test_unchanged_source_keeps_its_capture_on_a_later_day(prepared_case, monkeypatch):
+    retained = _recipe()
+    graph = retained.source_pin.capture["graph"]
+    graph["origin"]["semantic_projection_as_of"] = None
+    assert graph["membership_as_of"] == "2026-10-01"
+    monkeypatch.setattr(preparation, "predecessor_recipes", AsyncMock(return_value=(retained,)))
+    result = await prepare(prepared_case)
+    assert result.recipes[0] is retained and result.created_schemas == ()
+    assert not reuse.is_compatible_typed_recipe(retained, retained.source_pin.catalog_descriptor, "2026-11-01")
+    preparation.capture_typed_source_graph.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_only_changed_source_opens_factory_and_creates_capture(prepared_case, monkeypatch):
     case = prepared_case
     changed = add_source(case, "alias-c")

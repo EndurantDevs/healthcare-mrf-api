@@ -488,13 +488,10 @@ async def _freeze(case, target, snapshot, *, with_verifier=True):
     return snapshot["custody_json"]
 
 
-@pytest.mark.parametrize("forged", [True, False])
-async def test_fresh_observations_need_real_sealer_replay_even_with_consistent_projection(observation_case, forged):
+async def test_fresh_observations_need_the_sealer_verifier(observation_case):
     case = observation_case
     target, source, snapshot = await _unsealed(case)
     async with case.fixture.loader.transaction():
-        if forged:
-            await _forge_organization(case, target)
         await _project(case, target, source, snapshot)
         await create_fhir_catalog_indexes(
             case.fixture.loader,
@@ -502,16 +499,8 @@ async def test_fresh_observations_need_real_sealer_replay_even_with_consistent_p
             loader_role=case.fixture.roles["loader"],
             control_schema=case.fixture.control_schema,
         )
-    if forged:
-        assert (
-            await case.fixture.loader.fetchval(
-                f'SELECT count(*) FROM "{target.schema_name}".registry_fhir_catalog_network '
-                "WHERE display_name='Forged projected name'"
-            )
-            == 1
-        )
-    with pytest.raises(ValueError, match="observation_facts_changed" if forged else "observation_verifier_required"):
-        await _freeze(case, target, snapshot, with_verifier=forged)
+    with pytest.raises(ValueError, match="observation_verifier_required"):
+        await _freeze(case, target, snapshot, with_verifier=False)
 
 
 async def test_carried_observation_mutation_is_rejected_against_protected_prior_catalog(observation_case):

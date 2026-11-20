@@ -147,11 +147,18 @@ def parse_compact_custom_office_receipt(document_by_field):
 
 def logical_compact_custom_scope(scope):
     """Compare complete logical receipts without rewriting retained historical evidence."""
-    key = "compact_custom_offices"
-    if type(scope) is not dict or key not in scope:
+    from process.network_compact_address_carriers import parse_compact_address_carrier_receipt
+
+    if type(scope) is not dict:
         return scope
-    receipt = parse_compact_custom_office_receipt(scope[key]).as_dict()
-    return {**scope, key: {**receipt, "revision": 2}}
+    logical_by_field = dict(scope)
+    if "compact_custom_offices" in scope:
+        receipt = parse_compact_custom_office_receipt(scope["compact_custom_offices"]).as_dict()
+        logical_by_field["compact_custom_offices"] = {**receipt, "revision": 2}
+    if "compact_address_carriers" in scope:
+        carriers = parse_compact_address_carrier_receipt(scope["compact_address_carriers"])
+        logical_by_field["compact_address_carriers"] = carriers.as_dict()
+    return logical_by_field
 
 
 async def _candidate(connection, target, base, revision, control, *, verification=False):

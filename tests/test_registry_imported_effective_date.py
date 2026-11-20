@@ -37,9 +37,7 @@ def midnight_clock(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_runtime_policy_date_survives_midnight_but_heads_remain_fresh(
-    inventory_case, midnight_clock, monkeypatch
-):
+async def test_runtime_pins_policy_date_and_heads_for_its_run(inventory_case, midnight_clock, monkeypatch):
     case = inventory_case
 
     @asynccontextmanager
@@ -54,14 +52,13 @@ async def test_runtime_policy_date_survives_midnight_but_heads_remain_fresh(
         after = await inventory.current_imported_source_inventory()
         assert after.token == before.token and after.document["effective_date"] == "2026-11-17"
         case.ptg["edition_id"] = "snapshot-two"
-        assert (await inventory.current_imported_source_inventory()).token != before.token
-        case.ptg["edition_id"] = "snapshot-one"
+        assert await inventory.current_imported_source_inventory() is before
     second_runtime = inventory.ImportedSourceInventoryRuntime(case.config, lambda: None, case.factory)
     with inventory.imported_source_inventory_runtime(second_runtime):
         next_run = await inventory.current_imported_source_inventory()
     assert next_run.document["effective_date"] == "2026-11-18" and next_run.token != before.token
     assert (await observe(case)).token == next_run.token
-    assert case.connection.fetchrow.await_count == 5
+    assert case.connection.fetchrow.await_count == 3
 
 
 async def catalogue_inputs(observed, monkeypatch):

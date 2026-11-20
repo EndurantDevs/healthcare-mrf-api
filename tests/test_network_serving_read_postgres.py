@@ -151,9 +151,7 @@ async def test_readonly_reader_resolves_and_native_permissions_deny_writes(read_
         assert caught.value.orig.sqlstate == "42501"
 
 
-async def test_published_api_read_keeps_historical_receipts_without_revalidating_writers(
-    read_component_db, monkeypatch
-):
+async def test_published_reads_keep_historical_receipts_without_revalidating_writers(read_component_db, monkeypatch):
     from process import network_membership_publication as publication
 
     fixture = read_component_db
@@ -170,8 +168,7 @@ async def test_published_api_read_keeps_historical_receipts_without_revalidating
             )
             assert pin.manifest_sha256 == fixture.read_manifest["manifest_sha256"]
             assert await connection.fetchval(f'SELECT count(*) FROM "{pin.schema_name}".network_membership') == 2
-    with pytest.raises(NetworkServingReadUnavailable, match="digest differs"):
-        await _resolve(fixture)
+    assert (await _resolve(fixture)).manifest_sha256 == fixture.read_manifest["manifest_sha256"]
     assert await _control_rows(fixture) == before
 
 

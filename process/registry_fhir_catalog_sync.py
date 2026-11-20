@@ -663,12 +663,14 @@ async def resolve_fhir_catalog_projection_generations(connection, snapshot, *, g
         if manifest.manifest_sha256 != snapshot["manifest_sha256"]:
             raise ValueError("registry_fhir_catalog_manifest_changed")
     retained = await _retained_catalog_sources(connection, grant, manifest)
-    generations = {fhir_catalog_source_generation(source.descriptor) for source in retained}
-    generations.update(
+    generations = {
         entry["source_generation"] for entry in snapshot["source_vector_json"] if entry["status"] == "current"
-    )
+    }
     if not generations <= descriptors.keys():
         raise ValueError("registry_fhir_catalog_projection_source_missing")
+    # A retained capture superseded by a current native edition has left the snapshot; only present ones project.
+    generations.update(fhir_catalog_source_generation(source.descriptor) for source in retained)
+    generations &= descriptors.keys()
     return tuple(
         sorted(
             generations,
