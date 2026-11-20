@@ -26,7 +26,8 @@ from process.vsp_directory_contract import SOURCE_ID as VSP_DIRECTORY_SOURCE_ID
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "specs/provider_directory_endpoint_acquisition_manifest.json"
 RUNNABLE_CLASSIFICATIONS = frozenset({"acquisition", "bulk_acquisition"})
-PROFILE_OPT_IN_SOURCES = frozenset({"cms-npd", VSP_DIRECTORY_SOURCE_ID})
+# The generic UHC Flex FHIR source is runnable; unified-profile inclusion stays a separate reviewed opt-in.
+PROFILE_OPT_IN_SOURCES = frozenset({"cms-npd", VSP_DIRECTORY_SOURCE_ID, "pdfhir_0b5cfd565c53364a73981dcb"})
 PUBLIC_ENTRY_FIELDS = (
     "entry_id",
     "display_name",

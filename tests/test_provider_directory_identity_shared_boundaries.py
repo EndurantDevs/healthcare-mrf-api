@@ -11,7 +11,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-
 fhir = importlib.import_module("process.provider_directory_fhir")
 
 
@@ -137,32 +136,18 @@ def test_seed_text_and_transient_diagnostic_identity_boundaries(tmp_path, monkey
         "https://unused.example.test",
         timeout=1,
     ) == ("reviewed catalog", str(text_path))
-    assert fhir._extract_urls_from_text(
-        "https://example.test/fhir https://example.test/fhir"
-    ) == ["https://example.test/fhir"]
+    repeated_url = "https://example.test/fhir"
+    assert fhir._extract_urls_from_text(f"{repeated_url} {repeated_url}") == [repeated_url]
 
-    molina_source_by_field = {
-        "canonical_api_base": fhir.MOLINA_PROVIDER_DIRECTORY_BASE,
-    }
+    molina_source_by_field = {"canonical_api_base": fhir.MOLINA_PROVIDER_DIRECTORY_BASE}
     quota_payload_by_field = {"message": "Out of call volume quota"}
-    assert fhir._is_molina_quota_response(
-        molina_source_by_field,
-        201,
-        quota_payload_by_field,
-    ) is False
+    assert fhir._is_molina_quota_response(molina_source_by_field, 201, quota_payload_by_field) is False
 
     now = datetime.datetime(2026, 7, 22, tzinfo=datetime.UTC)
-    assert fhir._source_retry_after_seconds(
-        {fhir.SOURCE_RETRY_AFTER_FIELD: "Wed, 22 Jul 2026 01:00:00"},
-        max_delay_seconds=None,
-        now_utc=now,
-    ) == 3600
-    assert fhir._molina_quota_retry_not_before(
-        molina_source_by_field,
-        403,
-        quota_payload_by_field,
-        now_utc=now,
-    ) is None
+    retry_after_by_field = {fhir.SOURCE_RETRY_AFTER_FIELD: "Wed, 22 Jul 2026 01:00:00"}
+    assert fhir._source_retry_after_seconds(retry_after_by_field, max_delay_seconds=None, now_utc=now) == 3600
+    quota_args = (molina_source_by_field, 403, quota_payload_by_field)
+    assert fhir._molina_quota_retry_not_before(*quota_args, now_utc=now) is None
 
     source_by_field = {}
     monkeypatch.setattr(fhir, "_source_fetch_response_class", lambda *_args: None)
@@ -186,9 +171,10 @@ def test_seed_text_and_transient_diagnostic_identity_boundaries(tmp_path, monkey
 
 
 def test_caresource_persisted_proof_and_count_payload_boundaries():
-    assert fhir._caresource_persisted_pre_count(
-        {"strategy_version": "old", "pre_count": 1}
-    ) == (None, "checkpoint_strategy_mismatch")
+    assert fhir._caresource_persisted_pre_count({"strategy_version": "old", "pre_count": 1}) == (
+        None,
+        "checkpoint_strategy_mismatch",
+    )
     assert fhir._caresource_persisted_pre_count(
         {
             "strategy_version": fhir.CARESOURCE_OPAQUE_CURSOR_STRATEGY_VERSION,
@@ -291,7 +277,6 @@ async def test_caresource_pre_proofs_fail_closed(monkeypatch):
     assert rejected.next_url_remaining is True
 
 
-
 @pytest.mark.asyncio
 async def test_caresource_post_proofs_fail_closed(monkeypatch):
     context = _checkpoint_context()
@@ -359,15 +344,18 @@ async def test_partition_page_protocol_failures_are_bounded(monkeypatch):
     monkeypatch.setattr(fhir, "_uhc_location_partition_predicate_error", lambda *_args: None)
     monkeypatch.setattr(fhir, "_enqueue_adaptive_partition_children", lambda *_args: 0)
     monkeypatch.setattr(fhir, "_is_uhc_partition_cap_exhausted", lambda *_args: True)
-    assert await bounded_outcome(
-        request.source_record,
-        request.resource_type,
-        request.start_url_queue,
-        request.state,
-        request.partition_start_url,
-        request.current_url,
-        {"resourceType": "Bundle"},
-    ) == "cap_failed"
+    assert (
+        await bounded_outcome(
+            request.source_record,
+            "Location",
+            request.start_url_queue,
+            request.state,
+            request.partition_start_url,
+            request.current_url,
+            {"resourceType": "Bundle"},
+        )
+        == "cap_failed"
+    )
     assert request.state.partition_error_count == 1
 
 
@@ -443,5 +431,3 @@ async def test_partition_enqueue_and_plan_resume_identity_edges(monkeypatch):
     fhir._fetch_pagination_checkpoint.return_value = None
     with pytest.raises(RuntimeError, match="checkpoint_missing"):
         await fhir._load_partition_plan(context, "Organization", invalid_config)
-
-

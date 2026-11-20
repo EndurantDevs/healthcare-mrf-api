@@ -438,14 +438,14 @@ def test_profile_sql_reads_flex_only_from_the_selected_dataset():
     assert "organization.dataset_id = affiliation.dataset_id" in sql
 
 
-def test_public_catalog_admits_dedicated_dataset_source_without_running_probe():
+def test_public_catalog_keeps_dedicated_dataset_source_apart_from_generic_scan():
     catalog = provider_directory_sources.provider_directory_source_catalog()
-    generic_probe = next(
+    generic_scan = next(
         item for item in catalog["items"] if item["canonical_base"] == "https://flex.optum.com/fhirpublic/R4"
     )
-    assert generic_probe["runnable"] is False
-    assert generic_probe["profile_enabled"] is False
-    assert UHC_FLEX_PRACTITIONER_SOURCE_ID not in generic_probe["source_ids"]
+    assert generic_scan["runnable"] is True
+    assert generic_scan["profile_enabled"] is False
+    assert UHC_FLEX_PRACTITIONER_SOURCE_ID not in generic_scan["source_ids"]
 
 
 def test_profile_aggregate_counts_authority_without_collapsing_sources():

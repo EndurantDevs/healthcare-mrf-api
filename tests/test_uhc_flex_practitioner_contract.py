@@ -2,8 +2,8 @@
 
 """Pure tests for the dedicated Flex Practitioner connector identity."""
 
-from dataclasses import replace
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,7 +13,6 @@ from process.uhc_flex_official_cohort_contract import (
     UHC_FLEX_OFFICIAL_NPI_SYSTEM,
 )
 from process.uhc_flex_practitioner_contract import (
-    UHCFlexPractitionerContractError,
     UHC_FLEX_PRACTITIONER_API_BASE,
     UHC_FLEX_PRACTITIONER_COHORT_SCOPE,
     UHC_FLEX_PRACTITIONER_CONNECTOR_ID,
@@ -21,10 +20,10 @@ from process.uhc_flex_practitioner_contract import (
     UHC_FLEX_PRACTITIONER_QUERY_CONTRACT_ID,
     UHC_FLEX_PRACTITIONER_QUERY_COUNT,
     UHC_FLEX_PRACTITIONER_SOURCE_ID,
+    UHCFlexPractitionerContractError,
     uhc_flex_practitioner_connector_identity_payload,
     uhc_flex_practitioner_source_identity_payload,
 )
-
 
 GENERIC_UHC_SOURCE_ID = "pdfhir_0b5cfd565c53364a73981dcb"
 
@@ -32,9 +31,7 @@ GENERIC_UHC_SOURCE_ID = "pdfhir_0b5cfd565c53364a73981dcb"
 def test_contract_derives_a_dedicated_source_and_connector_identity():
     contract = UHC_FLEX_PRACTITIONER_QUERY_CONTRACT
 
-    assert contract.connector_id == (
-        "pdufpc_16ebdbf260dc9815ae38830a6991fea5d6533ab8db7389da"
-    )
+    assert contract.connector_id == ("pdufpc_16ebdbf260dc9815ae38830a6991fea5d6533ab8db7389da")
     assert contract.source_id == "pdfhir_1ceb7c0986c320b7eb924881"
     assert contract.source_id != GENERIC_UHC_SOURCE_ID
     assert contract.authority_id == UHC_FLEX_OFFICIAL_AUTHORITY_ID
@@ -68,10 +65,7 @@ def test_endpoint_signature_freezes_exact_cohort_query_semantics():
 
     signature["connector_acquisition_contract"]["query_count"] = 100
     assert (
-        UHC_FLEX_PRACTITIONER_QUERY_CONTRACT.endpoint_signature()[
-            "connector_acquisition_contract"
-        ]["query_count"]
-        == 16
+        UHC_FLEX_PRACTITIONER_QUERY_CONTRACT.endpoint_signature()["connector_acquisition_contract"]["query_count"] == 16
     )
 
 
@@ -82,22 +76,13 @@ def test_identity_payloads_are_reproducible_and_exclude_dynamic_cohort_ids():
     assert "cohort_id" not in connector_identity
     assert "cohort_id" not in source_identity
     assert source_identity["connector_id"] == UHC_FLEX_PRACTITIONER_CONNECTOR_ID
-    assert source_identity["source_role"] == (
-        "official-practitioner-npi-enrichment"
-    )
+    assert source_identity["source_role"] == ("official-practitioner-npi-enrichment")
 
 
-def test_existing_generic_uhc_manifest_entry_remains_probe_only():
+def test_existing_generic_uhc_manifest_entry_is_postal_acquisition():
     repository_root = Path(__file__).resolve().parents[1]
-    manifest = json.loads(
-        (
-            repository_root
-            / "specs/provider_directory_endpoint_acquisition_manifest.json"
-        ).read_text()
-    )
-    generic_entry = next(
-        entry for entry in manifest["entries"] if entry["entry_id"] == "uhc"
-    )
+    manifest = json.loads((repository_root / "specs/provider_directory_endpoint_acquisition_manifest.json").read_text())
+    generic_entry = next(entry for entry in manifest["entries"] if entry["entry_id"] == "uhc")
 
     assert generic_entry == {
         "entry_id": "uhc",
@@ -105,10 +90,17 @@ def test_existing_generic_uhc_manifest_entry_remains_probe_only():
         "owner_id": "unitedhealthcare-community-plan-louisiana",
         "source_ids": [GENERIC_UHC_SOURCE_ID],
         "canonical_base": UHC_FLEX_PRACTITIONER_API_BASE,
-        "classification": "probe_only",
+        "classification": "acquisition",
         "launch_mode": "create",
-        "resource_profile": "NONE",
-        "resources": [],
+        "resource_profile": "A6",
+        "resources": [
+            "InsurancePlan",
+            "Location",
+            "Organization",
+            "OrganizationAffiliation",
+            "Practitioner",
+            "PractitionerRole",
+        ],
     }
     assert UHC_FLEX_PRACTITIONER_SOURCE_ID not in generic_entry["source_ids"]
 

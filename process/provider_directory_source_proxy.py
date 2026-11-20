@@ -14,6 +14,8 @@ from process.ext.source_http_proxy import POLICY_ENV, SourceProxyConfig, SourceP
 BINDING_ENV = "HLTHPRT_SOURCE_HTTP_PROXY_BINDING_JSON"
 COOLDOWNS_ENV = "HLTHPRT_SOURCE_HTTP_PROXY_COOLDOWNS_JSON"
 _RUN = contextvars.ContextVar("provider_directory_source_proxy_run", default=None)
+# A partitioned scan may name its logical cursor so concurrent partitions spread across the pool.
+PARTITION_CURSOR_KEY = contextvars.ContextVar("provider_directory_source_proxy_partition_cursor", default=None)
 
 
 def current_run():
@@ -234,7 +236,7 @@ class SourceProxyRun:
             raise SourceProxyError("source_proxy_async_session_required")
         base = self._identity(source_record)[1]
         relative_path = urlsplit(url).path[len(urlsplit(base).path.rstrip("/")) :].lstrip("/")
-        cursor_key = relative_path.split("/", 1)[0] or "metadata"
+        cursor_key = PARTITION_CURSOR_KEY.get() or relative_path.split("/", 1)[0] or "metadata"
         last_result = self._last_quota.get(source_id)
         try:
             binding.select(url, cursor_key)
@@ -264,6 +266,7 @@ class SourceProxyRun:
                 preserve_url_bytes=True,
                 proxy_options=selection.request_options,
                 extra_headers=options["headers"],
+                allow_gzip=base == directory.UHC_PROVIDER_DIRECTORY_BASE,
             )
             total_elapsed_ms += fetch_result[3]
             fetch_result = directory._source_fetch_result_with_elapsed(fetch_result, total_elapsed_ms)
