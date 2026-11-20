@@ -18,8 +18,9 @@ OLD_ID, OLDER_ID = "c" * 64, "d" * 64
 class FakeConnection:
     """Records normalized statements; answers the few reads the importer makes."""
 
-    def __init__(self, *, locked=True, releases=(), dropped=None):
+    def __init__(self, *, locked=True, releases=(), dropped=None, address_table=True):
         self.locked, self.releases, self.dropped = locked, list(releases), dropped
+        self.address_table = address_table
         self.statements, self.closed = [], False
 
     def _record(self, sql, args=()):
@@ -53,6 +54,8 @@ class FakeConnection:
         self._record(sql, args)
         if "pg_try_advisory_lock" in sql:
             return self.locked
+        if "to_regclass" in sql:
+            return self.address_table
         return 7 if "FROM network" in sql else 0
 
     async def close(self):
@@ -88,7 +91,12 @@ def harness(tmp_path, monkeypatch):
         return {table: 5 for plan in plans for table in plan.tables}
 
     monkeypatch.setattr(typed_import, "write_phase_progress", fake_progress)
+
+    async def fake_enqueue(connection, control, release_id):
+        return {"status": "queued", "release_id": release_id}
+
     monkeypatch.setattr(typed_import, "stage_files", fake_stage)
+    monkeypatch.setattr(typed_import.addresses, "enqueue_refresh", fake_enqueue)
     return harness_by_field
 
 
@@ -119,7 +127,8 @@ async def test_new_release_is_built_checked_granted_and_published(harness):
     assert summary["row_counts"]["network"] == 7 and summary["row_counts"]["practitioner"] == 5
     assert summary["rows"] == sum(summary["row_counts"].values())
     assert set(summary["unresolved_counts"]) == set(release_sql.UNRESOLVED_QUERIES)
-    assert set(summary["seconds"]) == {"observe", "download", "stage", "finish", "check", "publish"}
+    assert set(summary["seconds"]) == {"observe", "download", "stage", "finish", "check", "publish", "addresses"}
+    assert summary["address_rows"] == 0 and summary["address_refresh"]["status"] == "queued"
     assert harness["staged"] == [(schema, "scanner-bin", typed_import.STAGE_CONCURRENCY)]
     assert harness["source"].kept == {release_id, OLD_ID}
 
@@ -135,6 +144,8 @@ async def test_new_release_is_built_checked_granted_and_published(harness):
         f'GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO "api_reader"',
         "DELETE FROM \"mrf\".cms_npd_release WHERE status = 'previous' RETURNING release_id, schema_name",
         f'DROP SCHEMA IF EXISTS "{release_schema_name(OLDER_ID)}" CASCADE',
+        'DROP TABLE IF EXISTS "mrf".cms_npd_address_stage',
+        'GRANT SELECT ON "mrf".cms_npd_address TO "api_reader"',
     ]
     assert [statements.index(statement) for statement in ordered_statements] == sorted(
         statements.index(statement) for statement in ordered_statements
@@ -143,7 +154,7 @@ async def test_new_release_is_built_checked_granted_and_published(harness):
 
     phases = [phase for _, phase, unit, *_ in harness["progress"] if unit == "phase"]
     assert phases == [
-        f"cms-npd-typed-{name}" for name in ("observe", "download", "stage", "finish", "check", "publish")
+        f"cms-npd-typed-{name}" for name in ("observe", "download", "stage", "finish", "check", "publish", "addresses")
     ]
     file_progress = [(done, total) for _, phase, unit, done, total, _ in harness["progress"] if unit == "files"]
     assert file_progress == [(done, 8) for done in range(1, 9)]
@@ -172,7 +183,10 @@ async def test_busy_lock_refuses_and_closes(harness):
 
 
 async def test_current_release_is_unchanged_without_download(harness):
-    lock = FakeConnection(releases=[recorded(harness["observed"].vector_sha256, "current")])
+    current = recorded(
+        harness["observed"].vector_sha256, "current", {"provider_address": 1, "provider_address_refresh": 1}
+    )
+    lock = FakeConnection(releases=[current])
     summary = await run_import(harness, lock)
     assert summary["status"] == "unchanged" and summary["schema"] == release_schema_name(summary["release_id"])
     assert set(summary["seconds"]) == {"observe"} and harness["staged"] == [] and harness["source"].kept is None
