@@ -1,0 +1,123 @@
+# Generated from the pinned reviewed image publisher.
+name: Reviewed source image publication
+run-name: Reviewed source image ${{ inputs.source_run_id }}-${{ inputs.source_run_attempt }}
+'on':
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        required: true
+        type: string
+      source_run_attempt:
+        required: true
+        type: string
+      image_artifact_id:
+        required: true
+        type: string
+      measurement_artifact_id:
+        required: true
+        type: string
+      native_artifact_id:
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+  checks: read
+concurrency:
+  group: reviewed-source-image-${{ inputs.source_run_id }}-${{ inputs.source_run_attempt }}
+  cancel-in-progress: false
+jobs:
+  dev-image-publication:
+    name: DEV image publication
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+      packages: write
+      checks: read
+    env:
+      CI_REVISION: 9fb0750a2493a314a98eff8a0ec29b31e642efc6
+      PYTHONDONTWRITEBYTECODE: '1'
+      IMAGE_ARTIFACT_ID: ${{ inputs.image_artifact_id }}
+      MEASUREMENT_ARTIFACT_ID: ${{ inputs.measurement_artifact_id }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+      NATIVE_ARTIFACT_ID: ${{ inputs.native_artifact_id }}
+      REVIEWED_IMAGE_APPROVAL_APP_ID: '4849671'
+      REVIEWED_VALIDATION_WORKFLOW_BLOB: b223f08ad4828b3e92b41e87a770410418f95008
+    steps:
+    - name: Check out trusted image publisher
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: EndurantDevs/endurant-ci
+        ref: 9fb0750a2493a314a98eff8a0ec29b31e642efc6
+        path: ci
+        persist-credentials: false
+    - name: Install pinned uv
+      run: bash ci/scripts/install_uv
+    - name: Install uv-managed Python
+      run: bash ci/scripts/setup_python
+    - name: Install locked publisher dependencies
+      run: 'uv --no-config pip install --require-hashes --only-binary=:all: -r ci/scripts/requirements-python-quality.lock'
+    - name: Authenticate reviewed image input
+      id: image
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 ci/scripts/publish_reviewed_image.py prepare
+    - name: Download validated image archive
+      if: steps.image.outputs.publish == 'true'
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        artifact-ids: ${{ steps.image.outputs.artifact_id }}
+        digest-mismatch: error
+        path: ${{ runner.temp }}/public-image-download
+        merge-multiple: true
+        run-id: ${{ inputs.source_run_id }}
+        github-token: ${{ github.token }}
+    - name: Download validated coverage measurement
+      if: steps.image.outputs.publish == 'true'
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        artifact-ids: ${{ steps.image.outputs.measurement_artifact_id }}
+        digest-mismatch: error
+        path: ${{ runner.temp }}/reviewed-measurement-download
+        merge-multiple: true
+        run-id: ${{ inputs.source_run_id }}
+        github-token: ${{ github.token }}
+    - name: Stage DEV image publication intent
+      if: steps.image.outputs.publish == 'true'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 ci/scripts/publish_reviewed_image.py stage
+    - name: Upload DEV image publication intent
+      if: steps.image.outputs.publish == 'true'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: healthcare-public-image-reviewed-intent-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/public-image-intent/intent.json
+        if-no-files-found: error
+        retention-days: 1
+    - name: Publish validated DEV image
+      if: steps.image.outputs.publish == 'true'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 ci/scripts/publish_reviewed_image.py publish
+    - name: Upload DEV image receipt
+      if: steps.image.outputs.publish == 'true'
+      id: receipt-artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: healthcare-public-image-reviewed-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/public-image-receipt/image.json
+        if-no-files-found: error
+        retention-days: 90
+    - name: Reconcile DEV image publication
+      if: always() && steps.image.outputs.publish == 'true'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 ci/scripts/publish_reviewed_image.py reconcile
+    outputs:
+      receipt_artifact_id: ${{ steps.receipt-artifact.outputs.artifact-id }}
+    if: github.repository == 'EndurantDevs/healthcare-mrf-api' && github.ref == 'refs/heads/dev' && github.ref_protected

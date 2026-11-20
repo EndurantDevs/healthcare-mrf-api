@@ -221,6 +221,8 @@ def test_public_ci_is_hosted_read_only_and_runs_import_checks():
         "ci.yml",
         "postgres-client-cache.yml",
         "publish-retained-image.yml",
+        "publish-reviewed-source.yml",
+        "reviewed-source-validation.yml",
     ]
     text = (workflows / "ci.yml").read_text(encoding="utf-8")
     workflow = yaml.safe_load(text)
@@ -433,6 +435,37 @@ def test_retained_image_publication_is_manual_and_pinned():
         "path": "ci",
         "persist-credentials": False,
     }
+
+
+def test_reviewed_source_validation_and_publication_are_separate_protected_dispatches():
+    workflows = Path(__file__).resolve().parents[1] / ".github/workflows"
+    validation_path = workflows / "reviewed-source-validation.yml"
+    validation = yaml.safe_load(validation_path.read_text(encoding="utf-8"))
+    publication = yaml.safe_load((workflows / "publish-reviewed-source.yml").read_text(encoding="utf-8"))
+    for workflow in (validation, publication):
+        assert set(workflow.get("on", workflow.get(True))) == {"workflow_dispatch"}
+        assert set(workflow["permissions"].values()) == {"read"}
+
+    hosted = validation["jobs"]["hosted"]
+    portable = validation["jobs"]["portable"]
+    publisher = publication["jobs"]["dev-image-publication"]
+    for job in (hosted, portable, publisher):
+        assert job["if"] == (
+            "github.repository == 'EndurantDevs/healthcare-mrf-api' "
+            "&& github.ref == 'refs/heads/dev' && github.ref_protected"
+        )
+    assert portable["runs-on"] == publisher["runs-on"] == "ubuntu-latest"
+    assert portable["permissions"] == {"contents": "read"}
+    assert publisher["permissions"]["packages"] == "write"
+
+    revision = publisher["env"]["CI_REVISION"]
+    assert re.fullmatch(r"[0-9a-f]{40}", revision) and revision != "0" * 40
+    assert hosted["uses"] == f"EndurantDevs/endurant-ci/.github/workflows/healthcare.yml@{revision}"
+    assert hosted["with"]["ci_revision"] == portable["env"]["CI_REVISION"] == revision
+    validation_blob = subprocess.check_output(["git", "hash-object", str(validation_path)], text=True).strip()
+    assert publisher["env"]["REVIEWED_VALIDATION_WORKFLOW_BLOB"] == validation_blob
+    checkouts = [step for step in publisher["steps"] if step.get("uses", "").startswith("actions/checkout@")]
+    assert [step["with"]["repository"] for step in checkouts] == ["EndurantDevs/endurant-ci"]
 
 
 def test_dependency_updates_target_the_development_branch():
