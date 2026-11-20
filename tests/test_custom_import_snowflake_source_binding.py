@@ -1045,3 +1045,69 @@ async def test_bound_source_refuses_unavailable_or_changed_mapping(monkeypatch, 
     with pytest.raises(SnowflakeCandidateError, match="source binding identity is invalid"):
         await snowflake_candidate._validate_bound_source_identity(object(), request, statement)
     loader.assert_awaited_once()
+
+
+def _query_binding_document(definition: CustomImportDefinition) -> dict[str, object]:
+    document = _binding_document(definition)
+    document["snapshot_token_mode"] = "statement_query_id"
+    for stream, query in zip(
+        document["streams"],
+        (
+            "SELECT TO_VARCHAR(ID) AS ROOT_NPI, SCORE AS ROOT_SCORE FROM SYNTHETIC.PUBLIC.ROOT_RECORDS",
+            "SELECT TO_VARCHAR(r.ID) AS DETAIL_NPI, f.VALUE::VARCHAR AS DETAIL_ID "
+            "FROM SYNTHETIC.PUBLIC.ROOT_RECORDS r, LATERAL FLATTEN(input => r.DETAILS) f",
+        ),
+        strict=True,
+    ):
+        relation = binding_contract.SnowflakeRelation.for_query(query)
+        stream.update(
+            relation=list(relation.parts),
+            relation_query=f"  {query}\n",
+            source_snapshot_token_relation=None,
+            source_snapshot_token_column_identifier=None,
+        )
+    return document
+
+
+def test_query_sources_read_as_derived_tables():
+    definition = _definition()
+    binding = source_binding.SnowflakeSourceBinding.from_json(json.dumps(_query_binding_document(definition)))
+
+    approved_relations, bindings = binding.bundle_components(definition)
+    connector = SnowflakeBundleAcquisitionConnector(
+        approved_relations=approved_relations,
+        credential_provider=SimpleNamespace(load_key_pair=lambda: None),
+        adapter=SimpleNamespace(fetch_bundle=lambda *_args: None),
+    )
+    statement = connector.build_statement(
+        connector.prepare_request(definition, bindings=bindings, snapshot_token_mode=binding.snapshot_token_mode)
+    )
+
+    replayed = source_binding.SnowflakeSourceBinding.from_json(binding.canonical)
+    assert replayed.canonical == binding.canonical
+    streams = json.loads(binding.canonical)["streams"]
+    assert [stream["relation_query"].startswith("SELECT TO_VARCHAR(") for stream in streams] == [True, True]
+    assert all(stream["relation"][:2] == ["QUERY", "SHA256"] for stream in streams)
+    assert "FROM (SELECT TO_VARCHAR(ID) AS ROOT_NPI, SCORE AS ROOT_SCORE FROM SYNTHETIC.PUBLIC.ROOT_RECORDS)" in (
+        statement.sql
+    )
+    assert "LATERAL FLATTEN(input => r.DETAILS) f)" in statement.sql
+    view_binding = source_binding.SnowflakeSourceBinding.from_json(json.dumps(_binding_document(definition)))
+    assert all("relation_query" not in stream for stream in json.loads(view_binding.canonical)["streams"])
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda stream: stream.update(relation_query="SELECT 1 AS ROOT_NPI"),
+        lambda stream: stream.pop("relation_query"),
+        lambda stream: stream.update(relation_query=None),
+        lambda stream: stream.update(source_snapshot_token_relation=["synthetic", "public", "root_snapshots"]),
+    ],
+)
+def test_query_sources_reject_unbound_or_snapshot_relation_queries(mutate):
+    document = _query_binding_document(_definition())
+    mutate(document["streams"][0])
+
+    with pytest.raises(source_binding.SnowflakeSourceBindingError):
+        source_binding.SnowflakeSourceBinding.from_json(json.dumps(document))

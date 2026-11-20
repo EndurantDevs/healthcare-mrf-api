@@ -36,8 +36,8 @@ from process.custom_import.snowflake_bundle import (
     SnowflakeBundleRequest,
     _snapshot_token_mode,
 )
-from process.custom_import.snowflake_preflight_schema import normalize_decimal_conversions
 from process.custom_import.snowflake_bundle_scope import _entity_limit
+from process.custom_import.snowflake_preflight_schema import normalize_decimal_conversions
 
 __all__ = (
     "SNOWFLAKE_SOURCE_BINDING_CONNECTOR",
@@ -96,11 +96,11 @@ def _exact_mapping(value: object, keys: frozenset[str]) -> Mapping[str, Any]:
     return value
 
 
-def _relation(value: object) -> SnowflakeRelation:
+def _relation(value: object, query: object = None) -> SnowflakeRelation:
     if not isinstance(value, list) or len(value) != 3:
         raise SnowflakeSourceBindingError("source binding relation is invalid")
     try:
-        return SnowflakeRelation(database=value[0], schema=value[1], name=value[2])
+        return SnowflakeRelation(database=value[0], schema=value[1], name=value[2], query=query)
     except (SnowflakeConnectorError, TypeError) as exc:
         raise SnowflakeSourceBindingError("source binding relation is invalid") from exc
 
@@ -189,7 +189,9 @@ class _StreamBinding:
 
 def _stream_binding(stream_mapping: object) -> _StreamBinding:
     optional_keys = (
-        {"row_filters"} if isinstance(stream_mapping, Mapping) and "row_filters" in stream_mapping else set()
+        {key for key in ("row_filters", "relation_query") if key in stream_mapping}
+        if isinstance(stream_mapping, Mapping)
+        else set()
     )
     stream_document = _exact_mapping(
         stream_mapping,
@@ -210,7 +212,7 @@ def _stream_binding(stream_mapping: object) -> _StreamBinding:
         raise SnowflakeSourceBindingError("source binding stream columns are invalid")
     return _StreamBinding(
         stream_id=_field_id(stream_document["stream_id"]),
-        relation=_relation(stream_document["relation"]),
+        relation=_relation(stream_document["relation"], _relation_query(stream_document)),
         snapshot=_SnapshotBinding(
             relation=(
                 None
@@ -223,6 +225,14 @@ def _stream_binding(stream_mapping: object) -> _StreamBinding:
         columns=tuple(_declared_column(column) for column in raw_columns),
         row_filters=_source_row_filters(stream_document),
     )
+
+
+def _relation_query(document: Mapping[str, Any]) -> str | None:
+    if "relation_query" not in document:
+        return None
+    if document["relation_query"] is None or document["source_snapshot_token_relation"] is not None:
+        raise SnowflakeSourceBindingError("source binding query requires the statement snapshot")
+    return document["relation_query"]
 
 
 def _source_row_filters(document: Mapping[str, Any]) -> tuple[SnowflakeRowFilter, ...]:
@@ -408,6 +418,7 @@ class SnowflakeSourceBinding:
                         for column in stream.columns
                     ],
                     "relation": list(stream.relation.parts),
+                    **({} if stream.relation.query is None else {"relation_query": stream.relation.query}),
                     "semantic_token_metadata_key": stream.snapshot.selector,
                     "source_snapshot_token_column_identifier": stream.snapshot.column_identifier,
                     "source_snapshot_token_relation": (

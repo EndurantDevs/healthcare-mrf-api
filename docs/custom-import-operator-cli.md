@@ -31,6 +31,14 @@ python -m custom_import_snowflake_operator execute \
   --idempotency-key synthetic-import
 ```
 
+A stream may read an approved `SELECT` instead of a view. Its binding carries the
+query as `relation_query` and names its relation
+`["QUERY", "SHA256", "Q<uppercase sha256 of the query>"]`, so every identity changes
+with the SQL. The query must start with `SELECT` or `WITH`, must not contain `;`,
+`--` or `/*`, is limited to 16 KiB, and requires the statement snapshot mode. The
+connector reads it as a derived table, for example
+`SELECT TO_VARCHAR(ID) AS PROVIDER_ID FROM EXAMPLE_DB.EXAMPLE_SCHEMA.EXAMPLE_VIEW`.
+
 `register-authority` also reads stdin, using its separately prepared fixed
 registration capability and authority mounts. It accepts no command-line
 authority, credential, SQL, path, or environment overrides. Registration does

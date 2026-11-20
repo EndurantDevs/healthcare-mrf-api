@@ -148,7 +148,7 @@ def _rebuilt_bundle_statement(
         bindings=tuple(
             SnowflakeBundleBinding(
                 stream_id=binding.stream_id,
-                relation=SnowflakeRelation(*binding.relation.parts),
+                relation=SnowflakeRelation(*binding.relation.parts, query=binding.relation.query),
                 source_snapshot_token_relation=(
                     None
                     if binding.source_snapshot_token_relation is None
